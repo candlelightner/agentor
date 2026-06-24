@@ -44,6 +44,32 @@ const workerLabelById = computed(() => {
   return map;
 });
 
+// Mappings are grouped by their owning worker so the list stays readable as the
+// number of mappings grows. Each group is independently collapsible.
+const groupedMappings = computed(() => {
+  const groups = new Map<string, typeof mappings.value>();
+  for (const m of mappings.value) {
+    const arr = groups.get(m.workerId);
+    if (arr) arr.push(m);
+    else groups.set(m.workerId, [m]);
+  }
+  return [...groups.entries()]
+    .map(([workerId, items]) => ({
+      workerId,
+      label: workerLabelById.value.get(workerId) || shortName(workerId),
+      mappings: items,
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+});
+
+const collapsedGroups = ref<Set<string>>(new Set());
+function toggleGroup(workerId: string) {
+  const s = collapsedGroups.value;
+  if (s.has(workerId)) s.delete(workerId);
+  else s.add(workerId);
+  collapsedGroups.value = new Set(s);
+}
+
 // O(1) lookup of a base domain's TLS challenge config, rebuilt only when the
 // status changes (avoids a linear scan per call, and each mapping row calls
 // these several times per render).
@@ -380,50 +406,68 @@ function downloadCaCert() {
       </UButton>
     </div>
 
-    <!-- Mappings list -->
+    <!-- Mappings list, grouped by worker -->
     <div v-if="mappings.length === 0 && !showForm" class="text-gray-400 dark:text-gray-500 text-xs text-center py-1">
       No active domain mappings
     </div>
-    <div
-      v-for="m in mappings"
-      :key="m.id"
-      class="flex items-center gap-1.5 text-xs bg-gray-100 dark:bg-gray-800 rounded px-2 py-1 min-w-0"
-    >
-      <span
-        class="px-1 rounded text-[10px] font-medium shrink-0"
-        :class="protocolColors[m.protocol]"
-      >
-        {{ m.protocol }}
-      </span>
-      <span
-        class="px-1 rounded text-[10px] shrink-0"
-        :class="challengeColors[getChallengeType(m.baseDomain)]"
-        :title="getDnsProvider(m.baseDomain) ? `dns:${getDnsProvider(m.baseDomain)}` : getChallengeType(m.baseDomain)"
-      >
-        {{ getChallengeType(m.baseDomain) === 'dns' ? getDnsProvider(m.baseDomain) : getChallengeType(m.baseDomain) === 'selfsigned' ? 'self' : getChallengeType(m.baseDomain) }}
-      </span>
-      <span
-        v-if="m.wildcard"
-        class="px-1 rounded text-[10px] font-medium shrink-0 bg-indigo-100 dark:bg-indigo-900 text-indigo-700 dark:text-indigo-300"
-        title="Also matches any single-label subdomain of this host"
-      >
-        wildcard
-      </span>
-      <span class="text-gray-700 dark:text-gray-300 font-mono truncate min-w-0">{{ m.wildcard ? '*.' : '' }}{{ m.subdomain ? `${m.subdomain}.${m.baseDomain}` : m.baseDomain }}{{ m.path || '' }}</span>
-      <UIcon
-        v-if="m.basicAuth"
-        name="i-lucide-lock"
-        class="size-3 text-amber-500 shrink-0"
-      />
-      <span class="text-gray-400 dark:text-gray-600 shrink-0">&rarr;</span>
-      <span class="text-gray-500 dark:text-gray-400 truncate min-w-0 flex-1">{{ workerLabelById.get(m.workerId) || shortName(m.workerId) }}:{{ m.internalPort }}</span>
+    <div v-for="g in groupedMappings" :key="g.workerId" class="flex flex-col gap-1">
       <button
-        class="text-gray-400 dark:text-gray-500 hover:text-red-500 dark:hover:text-red-400 transition-colors shrink-0 p-0.5"
-        title="Remove mapping"
-        @click="removeMapping(m.id)"
+        type="button"
+        class="flex items-center gap-1.5 w-full text-left text-xs font-medium text-gray-600 dark:text-gray-300 hover:text-gray-900 dark:hover:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-800/60 rounded px-1 py-1 transition-colors min-w-0"
+        @click="toggleGroup(g.workerId)"
       >
-        <UIcon name="i-lucide-x" class="size-3" />
+        <UIcon
+          :name="collapsedGroups.has(g.workerId) ? 'i-lucide-chevron-right' : 'i-lucide-chevron-down'"
+          class="size-3.5 shrink-0 text-gray-400 dark:text-gray-500"
+        />
+        <span class="truncate min-w-0 flex-1" :title="g.label">{{ g.label }}</span>
+        <span class="shrink-0 text-[10px] text-gray-500 dark:text-gray-400 bg-gray-200 dark:bg-gray-700 rounded-full px-1.5 leading-4 tabular-nums">
+          {{ g.mappings.length }}
+        </span>
       </button>
+      <div v-if="!collapsedGroups.has(g.workerId)" class="flex flex-col gap-1 pl-2">
+        <div
+          v-for="m in g.mappings"
+          :key="m.id"
+          class="flex items-center gap-1.5 text-xs bg-gray-100 dark:bg-gray-800 rounded px-2 py-1 min-w-0"
+        >
+          <span
+            class="px-1 rounded text-[10px] font-medium shrink-0"
+            :class="protocolColors[m.protocol]"
+          >
+            {{ m.protocol }}
+          </span>
+          <span
+            class="px-1 rounded text-[10px] shrink-0"
+            :class="challengeColors[getChallengeType(m.baseDomain)]"
+            :title="getDnsProvider(m.baseDomain) ? `dns:${getDnsProvider(m.baseDomain)}` : getChallengeType(m.baseDomain)"
+          >
+            {{ getChallengeType(m.baseDomain) === 'dns' ? getDnsProvider(m.baseDomain) : getChallengeType(m.baseDomain) === 'selfsigned' ? 'self' : getChallengeType(m.baseDomain) }}
+          </span>
+          <span
+            v-if="m.wildcard"
+            class="px-1 rounded text-[10px] font-medium shrink-0 bg-indigo-100 dark:bg-indigo-900 text-indigo-700 dark:text-indigo-300"
+            title="Also matches any single-label subdomain of this host"
+          >
+            wildcard
+          </span>
+          <span class="text-gray-700 dark:text-gray-300 font-mono truncate min-w-0">{{ m.wildcard ? '*.' : '' }}{{ m.subdomain ? `${m.subdomain}.${m.baseDomain}` : m.baseDomain }}{{ m.path || '' }}</span>
+          <UIcon
+            v-if="m.basicAuth"
+            name="i-lucide-lock"
+            class="size-3 text-amber-500 shrink-0"
+          />
+          <span class="text-gray-400 dark:text-gray-600 shrink-0">&rarr;</span>
+          <span class="text-gray-500 dark:text-gray-400 font-mono shrink-0">:{{ m.internalPort }}</span>
+          <button
+            class="text-gray-400 dark:text-gray-500 hover:text-red-500 dark:hover:text-red-400 transition-colors shrink-0 p-0.5 ml-auto"
+            title="Remove mapping"
+            @click="removeMapping(m.id)"
+          >
+            <UIcon name="i-lucide-x" class="size-3" />
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 </template>

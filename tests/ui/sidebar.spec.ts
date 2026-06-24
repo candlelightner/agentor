@@ -275,7 +275,7 @@ test.describe('Sidebar', () => {
 
   test.describe('Tab Bar Overflow', () => {
     test('More button is hidden when every tab fits', async ({ page }) => {
-      // 1500px is well above the 6 sidebar tabs combined width (each tab is
+      // 1500px is well above the 7 sidebar tabs combined width (each tab is
       // roughly 70-100px), so none should overflow at this width.
       await loadDashboardWithSidebarWidth(page, 1500);
       await page.waitForSelector('aside .sidebar-tab-bar .sidebar-tab');

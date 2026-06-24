@@ -40,6 +40,13 @@ Web-native tab bar inside the terminal pane — each tab represents a tmux windo
 - Click an already-active tab to inline-rename it (input replaces label, Enter to confirm, Escape to cancel)
 - 10k scrollback per terminal, Alt+scroll for fast scrolling
 
+## Sidebar Worker Tabs & Mapping Groups
+
+**Worker tabs** (`AppSidebar.vue`): the active workers are split across two mutually-exclusive tabs, mirroring how archived workers get their own tab.
+- **Workers** lists every container whose `status !== 'stopped'` (running / creating / error / removing); **Stopped** lists `status === 'stopped'` containers. The Stopped tab sits between Workers and Archived. Both render the same `ContainerCard` (which already adapts to the stopped state — Restart instead of Stop, view/workspace buttons hidden), driven by a single `currentWorkerList` computed that selects the source list from `activeTab`. Tab badges count each list independently. Stopping a running worker moves it Workers → Stopped; restarting moves it back. The filtered lists are `activeContainers` / `stoppedContainers` computeds over the full `containers` prop — the mapping panels still receive the **full** list (for label resolution + the running-only worker dropdown).
+
+**Mapping groups** (`PortMappingsPanel.vue`, `DomainMappingsPanel.vue`): both panels group their mappings by owning worker. A `groupedMappings` computed buckets `mappings` by `m.workerId`, resolves each group's label via `workerLabelById` (live containers + archived workers, fallback `shortName`), and sorts groups by label. Each group renders a collapsible header (chevron + label + count badge) over its indented rows; a component-local `collapsedGroups` `Set<string>` of worker ids toggled by `toggleGroup(workerId)` drives `v-if` on the rows (so collapsing detaches them from the DOM). Groups default to expanded; collapse state is not persisted (resets on reload). Because the worker label now lives in the group header, the individual rows drop the per-row worker label and show only the internal port target (`:<port>`).
+
 ## Worker Settings Modal
 
 A worker's editable configuration lives in a single **Worker Settings modal** (`ContainerDetailModal.vue`) — there is no read-only detail view. Worker-related settings are split into two tiers; environment-specific settings (CPU/memory, network, Docker, capabilities, instructions, setup script, env vars, exposed APIs) are **not** shown here — they belong to the Environments modal.

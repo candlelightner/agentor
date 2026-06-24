@@ -55,6 +55,16 @@ function metricFor(containerId: string) {
   return metricByWorkerId.value.get(containerId);
 }
 
+// Stopped workers get their own tab; the Workers tab lists everything else
+// (running / creating / error / removing). Mutually exclusive, mirroring how
+// archived workers live in their own tab.
+const activeContainers = computed(() =>
+  props.containers.filter((c) => c.status !== 'stopped'),
+);
+const stoppedContainers = computed(() =>
+  props.containers.filter((c) => c.status === 'stopped'),
+);
+
 const { data: domainMapperStatus } = useFetch<{ enabled: boolean }>('/api/domain-mapper/status', {
   default: () => ({ enabled: false }),
 });
@@ -68,7 +78,8 @@ interface SidebarTabDef {
 
 const visibleTabs = computed<SidebarTabDef[]>(() => {
   const items: SidebarTabDef[] = [
-    { id: 'workers', label: 'Workers', icon: 'i-lucide-server', badge: props.containers.length || undefined },
+    { id: 'workers', label: 'Workers', icon: 'i-lucide-server', badge: activeContainers.value.length || undefined },
+    { id: 'stopped', label: 'Stopped', icon: 'i-lucide-circle-pause', badge: stoppedContainers.value.length || undefined },
     { id: 'archived', label: 'Archived', icon: 'i-lucide-archive', badge: props.archivedWorkers.length || undefined },
     { id: 'ports', label: 'Ports', icon: 'i-lucide-plug', badge: portMappings.value.length || undefined },
   ];
@@ -90,6 +101,12 @@ const activeTab = computed(() => {
     ? uiState.value.sidebar.activeTab
     : 'workers';
 });
+
+// The Workers and Stopped tabs share the same ContainerCard list, differing
+// only in which workers they show and the empty-state copy.
+const currentWorkerList = computed(() =>
+  activeTab.value === 'stopped' ? stoppedContainers.value : activeContainers.value,
+);
 
 function selectTab(id: string) {
   setActiveTab(id);
@@ -327,14 +344,14 @@ function isContainerActive(containerId: string, tabs: Tab[], activeTabId: string
 
     <!-- Tab content -->
     <div class="flex-1 overflow-y-auto min-h-0">
-      <!-- Workers -->
-      <div v-if="activeTab === 'workers'" class="p-3">
-        <div v-if="containers.length === 0" class="text-gray-400 dark:text-gray-500 text-sm text-center py-8">
-          No workers yet.
+      <!-- Workers / Stopped (same card list, different source + empty copy) -->
+      <div v-if="activeTab === 'workers' || activeTab === 'stopped'" class="p-3">
+        <div v-if="currentWorkerList.length === 0" class="text-gray-400 dark:text-gray-500 text-sm text-center py-8">
+          {{ activeTab === 'stopped' ? 'No stopped workers.' : 'No workers yet.' }}
         </div>
         <div class="space-y-2">
           <ContainerCard
-            v-for="c in containers"
+            v-for="c in currentWorkerList"
             :key="c.id"
             :container="c"
             :is-active="isContainerActive(c.id, tabs, activeTabId)"

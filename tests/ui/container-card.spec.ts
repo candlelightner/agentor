@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { goToDashboard, acceptNextConfirm, findButtonByTooltip, hasButtonWithTooltip } from '../helpers/ui-helpers';
+import { goToDashboard, acceptNextConfirm, findButtonByTooltip, hasButtonWithTooltip, selectSidebarTab } from '../helpers/ui-helpers';
 import { createWorker, cleanupWorker } from '../helpers/worker-lifecycle';
 import { ApiClient } from '../helpers/api-client';
 
@@ -104,14 +104,19 @@ test.describe.serial('Container Card', () => {
     await expect(card.locator('text=running')).toBeVisible({ timeout: 60_000 });
     const stopBtn = await findButtonByTooltip(card, page, 'Stop');
     await stopBtn.click();
-    await expect(card.locator('text=stopped')).toBeVisible({ timeout: 30_000 });
+    // Stopping moves the worker out of the Workers tab into the Stopped tab.
+    await selectSidebarTab(page, 'Stopped');
+    const stoppedCard = page.locator('.rounded-lg').filter({ hasText: displayName }).first();
+    await expect(stoppedCard.getByText('stopped', { exact: true })).toBeVisible({ timeout: 30_000 });
   });
 
   test('after stop, view buttons (Terminal, Desktop, Editor, Apps) are hidden', async ({ page }) => {
     await goToDashboard(page);
+    // The worker is stopped from the previous test → it lives in the Stopped tab.
+    await selectSidebarTab(page, 'Stopped');
     const card = page.locator('.rounded-lg').filter({ hasText: displayName }).first();
     await expect(card).toBeVisible({ timeout: 15_000 });
-    await expect(card.locator('text=stopped')).toBeVisible({ timeout: 15_000 });
+    await expect(card.getByText('stopped', { exact: true })).toBeVisible({ timeout: 15_000 });
     // Container is stopped from previous test; view + workspace buttons (Terminal,
     // Desktop, Upload, etc.) are hidden (v-if="isRunning") but action buttons remain
     const iconButtons = card.locator('button');
@@ -124,9 +129,10 @@ test.describe.serial('Container Card', () => {
 
   test('Restart button appears when stopped', async ({ page }) => {
     await goToDashboard(page);
+    await selectSidebarTab(page, 'Stopped');
     const card = page.locator('.rounded-lg').filter({ hasText: displayName }).first();
     await expect(card).toBeVisible({ timeout: 15_000 });
-    await expect(card.locator('text=stopped')).toBeVisible({ timeout: 15_000 });
+    await expect(card.getByText('stopped', { exact: true })).toBeVisible({ timeout: 15_000 });
     expect(await hasButtonWithTooltip(card, page, 'Restart')).toBe(true);
     // Stop button should be hidden when stopped
     expect(await hasButtonWithTooltip(card, page, 'Stop')).toBe(false);
@@ -134,14 +140,18 @@ test.describe.serial('Container Card', () => {
 
   test('Restart restarts container (status changes to "running")', async ({ page }) => {
     await goToDashboard(page);
+    await selectSidebarTab(page, 'Stopped');
     const card = page.locator('.rounded-lg').filter({ hasText: displayName }).first();
-    await expect(card.locator('text=stopped')).toBeVisible({ timeout: 15_000 });
+    await expect(card.getByText('stopped', { exact: true })).toBeVisible({ timeout: 15_000 });
     const restartBtn = await findButtonByTooltip(card, page, 'Restart');
     await restartBtn.click();
-    await expect(card.locator('text=running')).toBeVisible({ timeout: 60_000 });
+    // Restarting moves the worker back to the Workers tab.
+    await selectSidebarTab(page, 'Workers');
+    const runningCard = page.locator('.rounded-lg').filter({ hasText: displayName }).first();
+    await expect(runningCard.locator('text=running')).toBeVisible({ timeout: 60_000 });
     // After restart, Stop should be back and Restart should be gone
-    expect(await hasButtonWithTooltip(card, page, 'Stop')).toBe(true);
-    expect(await hasButtonWithTooltip(card, page, 'Restart')).toBe(false);
+    expect(await hasButtonWithTooltip(runningCard, page, 'Stop')).toBe(true);
+    expect(await hasButtonWithTooltip(runningCard, page, 'Restart')).toBe(false);
   });
 
   // ─── 5. Detail Modal ────────────────────────────────────────

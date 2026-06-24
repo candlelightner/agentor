@@ -127,7 +127,8 @@ Every user-facing feature of the Agentor web dashboard, organized by category. T
 - The Capabilities / Instructions / Init Scripts trio sits on one row while the sidebar is wide; once the sidebar is narrower than ~280px the row stacks the three buttons vertically so their labels never get truncated
 
 ### 1.4 Sidebar Sections (all collapsible with chevron toggle)
-- **Workers** — list of active container cards
+- **Workers** — list of non-stopped container cards (running / creating / error / removing). Badge counts non-stopped workers only.
+- **Stopped** — list of `status === 'stopped'` container cards; sits between Workers and Archived. Mutually exclusive with Workers (a stopped worker shows here, not in Workers), mirroring Archived. Uses the same `ContainerCard` (Restart button instead of Stop, view/workspace buttons hidden). Empty-state copy "No stopped workers."; badge counts stopped workers. Restarting a stopped worker moves it back to the Workers tab; stopping a running worker moves it here.
 - **Archived** — collapsed by default, only shown when archived workers exist, shows count
 - **Port Mappings** — always visible
 - **Domain Mappings** — only visible when domain mapper is enabled (BASE_DOMAINS configured)
@@ -136,7 +137,7 @@ Every user-facing feature of the Agentor web dashboard, organized by category. T
 - **Settings** — always visible, contains "Logs" button, "System Settings" button, and "API Docs" link
 
 ### 1.5 Sidebar Tab Bar Overflow
-- All tab buttons (Workers / Archived / Ports / Domains / Usage / System) are rendered in a horizontally scrollable row
+- All tab buttons (Workers / Stopped / Archived / Ports / Domains / Usage / System) are rendered in a horizontally scrollable row
 - The scrollbar itself is hidden for a clean look; scrolling still works via mouse wheel (vertical wheel is converted to horizontal scroll), trackpad, and keyboard
 - When one or more tabs have less than 20% of their width visible inside the scroll viewport, a "More" chevron button pins to the right edge with a gradient fade and opens a dropdown listing those (mostly) hidden tabs
 - A tab with at least 20% of its width visible stays out of the dropdown — this gives a small hysteresis zone so tabs don't pop in and out while scrolling past them
@@ -422,7 +423,8 @@ The worker "detail" view is a fully editable **Worker Settings modal** (no more 
 - "Cancel" button (hides form)
 
 ### 12.3 Mapping List
-- Per-mapping row: type badge (blue "internal" / orange "external") + external port (monospace) + arrow + worker label:internal port + remove (X) button. The worker label is resolved from the live container list by `containerName` to show the worker's `displayName` (fallback `shortName(m.workerId)`); the raw UUID `workerId` is not printed.
+- Mappings are **grouped by their owning worker**. Each group is a collapsible section: a header button (chevron + worker label + count badge) followed by the group's mapping rows. The worker label is resolved from the live container list / archived workers by id (`displayName`, fallback `shortName(m.workerId)`); the raw UUID is not printed. Groups default to **expanded**; clicking a header toggles its rows (collapse/expand) — the header stays visible while collapsed. Collapse state is per-group and component-local (resets on reload). Groups are sorted by worker label.
+- Per-mapping row (indented under its group): type badge (blue "internal" / orange "external") + external port (monospace, `:<port>`) + arrow + internal port (monospace, `:<port>`) + remove (X) button. The worker label is shown once in the group header, not repeated per row.
 - Delete removes mapping immediately
 
 ---
@@ -454,7 +456,8 @@ The worker "detail" view is a fully editable **Worker Settings modal** (no more 
 - "Cancel" and "Add" buttons
 
 ### 13.4 Mapping List
-- Per-mapping row: protocol badge (blue=http, green=https, purple=tcp) + challenge type badge + optional indigo `wildcard` badge + full domain with path (if set) + lock icon (if basic auth) + arrow + worker label:port + remove button. The worker label is resolved from the live container list by `containerName` to show the worker's `displayName` (fallback `shortName(m.workerId)`); the raw UUID `workerId` is not printed.
+- Mappings are **grouped by their owning worker**, identical to the Port Mappings panel (§12.3): a collapsible header (chevron + worker label + count badge) per worker, default expanded, click to toggle, sorted by worker label, collapse state component-local.
+- Per-mapping row (indented under its group): protocol badge (blue=http, green=https, purple=tcp) + challenge type badge + optional indigo `wildcard` badge + full domain with path (if set) + lock icon (if basic auth) + arrow + internal port (`:<port>`) + remove button. The worker label is shown once in the group header, not repeated per row.
 - Wildcard mappings display the host with a `*.` prefix in the list
 - Challenge type badges: none (gray), http (emerald), dns (cyan), selfsigned/self (amber)
 

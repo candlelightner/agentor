@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { goToDashboard, acceptNextConfirm, dismissNextConfirm, findButtonByTooltip, hasButtonWithTooltip } from '../helpers/ui-helpers';
+import { goToDashboard, acceptNextConfirm, dismissNextConfirm, findButtonByTooltip, hasButtonWithTooltip, selectSidebarTab } from '../helpers/ui-helpers';
 import { createWorker, cleanupWorker } from '../helpers/worker-lifecycle';
 import { ApiClient } from '../helpers/api-client';
 
@@ -32,8 +32,10 @@ test.describe('Rebuild Worker UI', () => {
     await new Promise(r => setTimeout(r, 1000));
 
     await goToDashboard(page);
-    const card = page.locator('.rounded-lg').filter({ hasText: displayName }).first();
-    await expect(card.locator('text=stopped')).toBeVisible({ timeout: 15_000 });
+    // Stopped workers live in the Stopped tab, not the default Workers tab.
+    await selectSidebarTab(page, 'Stopped');
+    const card = page.locator('aside .rounded-lg').filter({ hasText: displayName }).first();
+    await expect(card.getByText('stopped', { exact: true })).toBeVisible({ timeout: 15_000 });
     expect(await hasButtonWithTooltip(card, page, 'Rebuild')).toBe(true);
 
     // Restart for subsequent tests

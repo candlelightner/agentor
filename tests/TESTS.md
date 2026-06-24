@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **~1366 tests** across 100 test files (~830 API + ~536 UI)
+- **~1372 tests** across 101 test files (~830 API + ~542 UI)
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -99,7 +99,7 @@ tests/
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
   api/                     # API endpoint tests (~778 tests across 56 files)
-  ui/                      # UI interaction tests (~535 tests across 43 files)
+  ui/                      # UI interaction tests (~541 tests across 44 files)
 ```
 
 ## Test Categories
@@ -166,7 +166,7 @@ tests/
 | `github-repos.spec.ts` | 3 | `GET /api/github/repos`: requires auth; a fresh user with no token → `tokenConfigured:false` + empty repos; a configured-but-bogus token → `tokenConfigured:true` with a surfaced `error` (regression for the old "any failure looks like no token" masking). Uses isolated test users. |
 | `ssh-auth.spec.ts` | 4 | SSH app end-to-end: starting the SSH app allocates a `22000–22999` external port mapping; a remote `whoami` over ssh with the user-supplied pubkey returns `agent`; ssh auth fails with a wrong key; a public-key update (`PUT /api/account/ssh-key`) propagates live to a running worker. (Live E2E — inherently timing-sensitive; relies on Playwright retries.) |
 
-### UI Tests (~536 tests, 43 files)
+### UI Tests (~542 tests, 44 files)
 
 | File | Tests | Coverage |
 |------|-------|----------|
@@ -181,6 +181,7 @@ tests/
 | `create-worker-modal.spec.ts` | 31 | Open/close, form fields, free-form **Display name** input (placeholder is the `generate-name` suggestion; no keystroke sanitization; client sends only `{ displayName }`, never `name`), add repo/mount, environment dropdown, init preset dropdown, Create action, dropdown populates newly created environments, selecting a preset populates init-script textarea |
 | `cross-modal-navigation.spec.ts` | 6 | Manage button navigation between modals |
 | `container-card.spec.ts` | 16 | Display name, status, buttons, icons, stop/restart/archive, Restart hidden when running, archive action hides card after confirmation, icon-only action buttons, compact card design, **Settings pencil opens the Worker Settings modal and renames via the display-name field + Save (no recreation; old label gone, new label persists)** |
+| `stopped-workers.spec.ts` | 4 | Stopped tab exists in the sidebar and sits before Archived; a stopped worker appears in the Stopped tab and is absent from the Workers tab (mutually exclusive lists); restarting from the Stopped tab moves the worker back to Workers |
 | `rebuild.spec.ts` | 6 | Rebuild button visibility (running + stopped), confirm dialog dismiss cancels, rebuild state transition, display name preserved, new container ID after rebuild |
 | `container-detail-modal.spec.ts` | 17 | Editable Worker Settings modal: opens via name + Settings pencil, header shows `<displayName> — Settings`, read-only **Worker** identity section (Worker ID = the worker UUID `container.id` in monospace, Container ID = the Docker `containerId`, Image = `imageName`, Image ID, Created), editable **Settings** section exposes Display name/Environment/Repositories/Volume Mounts/Init Script with `no rebuild needed` vs `requires rebuild` tags, display-name field pre-filled, Save disabled when unchanged, environment-specific sections (CPU/Memory/Network/Setup Script/Exposed APIs) are absent, close (Escape + overlay) + re-open, custom environment reflected in the Environment selector |
 | `worker-settings-modal.spec.ts` | 3 | Behavioural: a pure display-name change does not offer "Save & Rebuild" and shows no pending badge (persists across reload); editing the init script reveals "Save & Rebuild" + the rebuild hint, plain Save flags the card `rebuild pending` and the re-opened modal shows the pending banner + "Rebuild now"; "Save & Rebuild" applies the change and clears the pending state |
@@ -194,8 +195,8 @@ tests/
 | `init-scripts-crud.spec.ts` | 8 | Init scripts CRUD operations via UI |
 | `init-preset-selector.spec.ts` | 6 | Default None, textarea, Custom/None sync |
 | `settings-modal.spec.ts` | 10 | Settings modal content, sections, expand/collapse |
-| `port-mappings-panel.spec.ts` | 13 | Section, button, API-created mappings, type labels (local + ext), delete button, form open/close, form fields (type selector, worker dropdown, port inputs), delete interaction, create-via-UI form submission flow |
-| `domain-mappings-panel.spec.ts` | 48 | Status API, section visibility, form open/close, protocol selector, basic auth checkbox, TCP protocol hides auth, auth checkbox shows username/password inputs, base domain display, API-created mapping display, protocol badge, path input visibility, TCP hides path, path display in mapping list, wildcard checkbox visibility and enabled state, wildcard live match preview, wildcard mapping list display (`*.host` prefix + `wildcard` badge), wildcard checkbox remains visible/enabled when TCP is selected, TCP wildcard mapping list display (tcp + wildcard badges), TCP form shows explanatory hint in place of Basic auth |
+| `port-mappings-panel.spec.ts` | 14 | Section, button, API-created mappings, type labels (local + ext), delete button, form open/close, form fields (type selector, worker dropdown, port inputs), delete interaction, create-via-UI form submission flow, **grouped-by-worker collapsible group header (chevron + display name + count badge), default expanded, click to collapse/expand rows** |
+| `domain-mappings-panel.spec.ts` | 49 | Status API, section visibility, form open/close, protocol selector, basic auth checkbox, TCP protocol hides auth, auth checkbox shows username/password inputs, base domain display, API-created mapping display, protocol badge, path input visibility, TCP hides path, path display in mapping list, wildcard checkbox visibility and enabled state, wildcard live match preview, wildcard mapping list display (`*.host` prefix + `wildcard` badge), wildcard checkbox remains visible/enabled when TCP is selected, TCP wildcard mapping list display (tcp + wildcard badges), TCP form shows explanatory hint in place of Basic auth, **grouped-by-worker collapsible group header (collapse/expand rows)** |
 | `domain-mappings-panel-advanced.spec.ts` | 27 | Advanced domain mapping panel interactions, TCP-to-HTTP restores path input |
 | `selfsigned-ca-cert.spec.ts` | 8 | Self-signed CA certificate download UI |
 | `service-panes.spec.ts` | 12 | Desktop and editor service panes |

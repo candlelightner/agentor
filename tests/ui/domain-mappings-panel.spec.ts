@@ -489,4 +489,50 @@ test.describe('Domain Mappings Panel', () => {
     }
   });
 
+  test('mappings render under a collapsible worker group header', async ({ page, request }) => {
+    const api = new ApiClient(request);
+    const { body: mapperStatus } = await api.getDomainMapperStatus();
+    test.skip(!mapperStatus.enabled, 'Domain mapping not enabled');
+
+    const { createWorker, cleanupWorker } = await import('../helpers/worker-lifecycle');
+    const displayName = `DomGroup-${Date.now()}`;
+    const container = await createWorker(request, { displayName });
+    const uniqueSub = `uigroup-${Date.now()}`;
+
+    try {
+      const { body: mapping } = await api.createDomainMapping({
+        subdomain: uniqueSub,
+        baseDomain: mapperStatus.baseDomains[0],
+        protocol: 'http',
+        workerId: container.id,
+        internalPort: 8080,
+      });
+
+      try {
+        await goToDashboard(page);
+        await selectSidebarTab(page, 'Domains');
+        const aside = page.locator('aside');
+
+        // Group header labelled with the worker's display name.
+        const header = aside.locator('button', { hasText: displayName }).first();
+        await expect(header).toBeVisible({ timeout: 15_000 });
+        // Row visible while expanded (default).
+        await expect(aside.locator(`text=${uniqueSub}`)).toBeVisible({ timeout: 15_000 });
+
+        // Collapsing the group hides the mapping row but keeps the header.
+        await header.click();
+        await expect(aside.locator(`text=${uniqueSub}`)).toBeHidden({ timeout: 10_000 });
+        await expect(header).toBeVisible();
+
+        // Expanding restores it.
+        await header.click();
+        await expect(aside.locator(`text=${uniqueSub}`)).toBeVisible({ timeout: 10_000 });
+      } finally {
+        await api.deleteDomainMapping(mapping.id);
+      }
+    } finally {
+      await cleanupWorker(request, container.id);
+    }
+  });
+
 });

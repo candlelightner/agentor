@@ -262,4 +262,54 @@ test.describe('Port Mappings Panel', () => {
       await expect(aside.getByText(`:${TEST_INTERNAL_PORT}`)).toBeVisible();
     });
   });
+
+  test.describe.serial('Grouped by worker', () => {
+    let containerId: string;
+    let displayName: string;
+    const ports = [19610, 19611];
+
+    test.beforeAll(async ({ request }) => {
+      displayName = `PortGroup-${Date.now()}`;
+      const container = await createWorker(request, { displayName });
+      containerId = container.id;
+      const api = new ApiClient(request);
+      for (const p of ports) {
+        await api.createPortMapping({ externalPort: p, type: 'localhost', workerId: containerId, internalPort: 3000 });
+      }
+    });
+
+    test.afterAll(async ({ request }) => {
+      const api = new ApiClient(request);
+      for (const p of ports) {
+        try { await api.deletePortMapping(p); } catch { /* ignore */ }
+      }
+      await cleanupWorker(request, containerId);
+    });
+
+    test('mappings render under a collapsible worker group header with a count', async ({ page }) => {
+      await goToDashboard(page);
+      await selectSidebarTab(page, 'Ports');
+      const aside = page.locator('aside');
+
+      // The group header is a button labelled with the worker's display name.
+      const header = aside.locator('button', { hasText: displayName }).first();
+      await expect(header).toBeVisible({ timeout: 15_000 });
+      // Count badge shows the number of mappings in the group.
+      await expect(header.getByText(String(ports.length), { exact: true })).toBeVisible();
+
+      // Both rows are visible (groups default to expanded).
+      await expect(aside.getByText(`:${ports[0]}`)).toBeVisible({ timeout: 15_000 });
+      await expect(aside.getByText(`:${ports[1]}`)).toBeVisible();
+
+      // Collapsing the group hides its rows.
+      await header.click();
+      await expect(aside.getByText(`:${ports[0]}`)).toBeHidden({ timeout: 10_000 });
+      // The header itself stays visible.
+      await expect(header).toBeVisible();
+
+      // Expanding again brings the rows back.
+      await header.click();
+      await expect(aside.getByText(`:${ports[0]}`)).toBeVisible({ timeout: 10_000 });
+    });
+  });
 });
