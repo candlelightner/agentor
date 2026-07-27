@@ -10,6 +10,9 @@ const props = defineProps<{
 
 const containerIdRef = toRef(props, 'containerId');
 const { appTypes, instances, createInstance, stopInstance } = useApps(containerIdRef as Ref<string>);
+const { openTab } = useSplitPanes();
+const toast = useToast();
+const startingTypes = ref<Set<string>>(new Set());
 
 // Resolve the real Docker container name (`agentor-worker-<id>`) for the
 // app-row network hostname tooltip. `containerId` is the worker UUID, not the
@@ -18,6 +21,10 @@ const { containers } = useContainers();
 const containerName = computed(
   () => containers.value.find((c) => c.id === props.containerId)?.containerName ?? '',
 );
+const containerDisplayName = computed(() => {
+  const container = containers.value.find((c) => c.id === props.containerId);
+  return container?.displayName || shortName(container?.id || props.containerId.slice(0, 12));
+});
 
 function instancesForType(appTypeId: string) {
   return instances.value.filter((i) => i.appType === appTypeId);
@@ -33,13 +40,27 @@ function rowComponentFor(appType: AppTypeInfo) {
 }
 
 async function handleStart(appTypeId: string) {
+  if (startingTypes.value.has(appTypeId)) return;
+  startingTypes.value = new Set(startingTypes.value).add(appTypeId);
   try {
     await createInstance(appTypeId);
+    if (appTypeId === 'vscode-desktop') {
+      openTab(props.containerId, containerDisplayName.value, 'desktop');
+    }
   } catch (err: any) {
     // Best-effort: ignore 409 (already running) — the poll will pick it up.
     if (err?.statusCode !== 409 && err?.response?.status !== 409) {
       console.error(`[apps] start ${appTypeId} failed`, err);
+      toast.add({
+        title: 'Failed to start app',
+        description: err?.data?.statusMessage || err?.data?.message || err?.message || `Could not start ${appTypeId}`,
+        color: 'error',
+      });
     }
+  } finally {
+    const next = new Set(startingTypes.value);
+    next.delete(appTypeId);
+    startingTypes.value = next;
   }
 }
 </script>
@@ -70,6 +91,8 @@ async function handleStart(appTypeId: string) {
             color="primary"
             variant="solid"
             :data-testid="`start-${at.id}`"
+            :loading="startingTypes.has(at.id)"
+            :disabled="startingTypes.has(at.id)"
             @click="handleStart(at.id)"
           >
             Start

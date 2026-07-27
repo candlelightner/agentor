@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **~1397 tests** across 102 test files (~854 API + ~543 UI)
+- **~1398 tests** across 102 test files (~854 API + ~544 UI)
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -99,7 +99,7 @@ tests/
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
   api/                     # API endpoint tests (~854 tests across 58 files)
-  ui/                      # UI interaction tests (~543 tests across 44 files)
+  ui/                      # UI interaction tests (~544 tests across 44 files)
 ```
 
 ## Test Categories
@@ -167,7 +167,7 @@ tests/
 | `github-repos.spec.ts` | 3 | `GET /api/github/repos`: requires auth; a fresh user with no token → `tokenConfigured:false` + empty repos; a configured-but-bogus token → `tokenConfigured:true` with a surfaced `error` (regression for the old "any failure looks like no token" masking). Uses isolated test users. |
 | `ssh-auth.spec.ts` | 4 | SSH app end-to-end: starting the SSH app allocates a `22000–22999` external port mapping; a remote `whoami` over ssh with the user-supplied pubkey returns `agent`; ssh auth fails with a wrong key; a public-key update (`PUT /api/account/ssh-key`) propagates live to a running worker. (Live E2E — inherently timing-sensitive; relies on Playwright retries.) |
 
-### UI Tests (~543 tests, 44 files)
+### UI Tests (~544 tests, 44 files)
 
 | File | Tests | Coverage |
 |------|-------|----------|
@@ -201,7 +201,7 @@ tests/
 | `domain-mappings-panel-advanced.spec.ts` | 28 | Advanced domain mapping panel interactions, TCP-to-HTTP restores path input |
 | `selfsigned-ca-cert.spec.ts` | 8 | Self-signed CA certificate download UI |
 | `service-panes.spec.ts` | 12 | Desktop and editor service panes |
-| `apps-pane.spec.ts` | 10 | Apps pane for container, plus VS Code Tunnel and SSH singleton app types render with `Start` buttons and "Not running" empty state, and the Persistent VS Code singleton app renders its row (Start launches the Chromium app-mode client, no exposed port, no external viewer port) |
+| `apps-pane.spec.ts` | 11 | Apps pane for container, plus VS Code Tunnel and SSH singleton app types render with `Start` buttons and "Not running" empty state; Persistent VS Code renders its row and a successful Start opens the Desktop pane (Chromium app-mode client, no exposed port) |
 | `workspace-upload.spec.ts` | 8 | Upload button, modal, drop zone, close |
 | `terminal-pane.spec.ts` | 9 | Terminal open, tmux tabs, xterm rows, create button, new tab creation, non-default tab has close button, main tab no close button, clicking Terminal twice opens two independent terminal tabs for the same worker and closing one leaves the other intact, keyboard typing produces WebSocket output |
 | `tmux-tabs.spec.ts` | 9 | Tmux tab bar interactions |

@@ -476,14 +476,15 @@ export class DockerService {
     for (const line of trimmed.split(/\r?\n/)) {
       const clean = line.trim();
       if (!clean || clean[0] !== '{') continue;
+      let parsed: { status?: string; message?: string };
       try {
-        const parsed = JSON.parse(clean) as { status?: string; message?: string };
-        if (parsed.status === 'error') {
-          throw new Error(parsed.message || `app manage failed: ${context}`);
-        }
-      } catch (err) {
-        if (err instanceof Error && err.message.startsWith('app manage failed')) throw err;
+        parsed = JSON.parse(clean) as { status?: string; message?: string };
+      } catch {
         // Non-JSON line or parse error — ignore (likely stderr noise).
+        continue;
+      }
+      if (parsed.status === 'error') {
+        throw new Error(parsed.message || `app manage failed: ${context}`);
       }
     }
   }

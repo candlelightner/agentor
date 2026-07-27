@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { goToDashboard } from '../helpers/ui-helpers';
 import { createWorker, cleanupWorker } from '../helpers/worker-lifecycle';
+import { ApiClient } from '../helpers/api-client';
 
 test.describe.serial('Apps Pane — UI', () => {
   let containerId: string;
@@ -154,6 +155,24 @@ test.describe.serial('Apps Pane — UI', () => {
 
     // Singleton apps show "Not running".
     await expect(page.locator('main').getByText('Not running')).toHaveCount(3);
+  });
+
+  test('starting Persistent VS Code opens the Desktop pane', async ({ page, request }) => {
+    await goToDashboard(page);
+    const card = page.locator('.rounded-lg').filter({ hasText: displayName }).first();
+    await expect(card.locator('text=running')).toBeVisible({ timeout: 60_000 });
+    await card.locator('button').nth(3).click();
+    await expect(page.locator('main').getByRole('heading', { name: 'Apps', exact: true })).toBeVisible({ timeout: 15_000 });
+
+    try {
+      const start = page.locator('main [data-testid="start-vscode-desktop"]');
+      await expect(start).toBeVisible({ timeout: 10_000 });
+      await start.click();
+      await expect(page.locator('main').getByText(`${displayName} - Desktop`)).toBeVisible({ timeout: 30_000 });
+    } finally {
+      const api = new ApiClient(request);
+      await api.stopApp(containerId, 'vscode-desktop', 'vscode-desktop').catch(() => {});
+    }
   });
 
   test('VS Code tunnel Start surfaces a GitHub device code in the row within 60s', async ({ page }) => {
