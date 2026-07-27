@@ -170,7 +170,9 @@ test.describe.serial('Kilo Code — same-user sharing & per-worker code-server d
   let w1Id: string | undefined;
   let w2Id: string | undefined;
   const configMarker = `kilo-cfg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-  const authMarker = `kilo-auth-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const authProvider = `kilo-auth-provider-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const authToken = `kilo-auth-token-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const dataMarker = `kilo-data-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   const csMarker1 = `cs-ud-w1-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   const csMarker2 = `cs-ud-w2-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
@@ -184,39 +186,77 @@ test.describe.serial('Kilo Code — same-user sharing & per-worker code-server d
     if (user) await cleanupUser(user);
   });
 
-  test('two same-user workers share writes under canonical ~/.config/kilo', async () => {
+  test('the Kilo shared-data directory is symlinked to ~/.local/share/kilo (shared-data, not .kilo/data)', async () => {
     test.setTimeout(240_000);
     const w1 = await createWorker(user.ctx, { displayName: `kilo-share-w1-${Date.now()}` });
     w1Id = w1.id;
     const w2 = await createWorker(user.ctx, { displayName: `kilo-share-w2-${Date.now()}` });
     w2Id = w2.id;
 
+    // The entrypoint symlinks ~/.local/share/kilo → .agent-data/.kilo/shared-data
+    // (the per-user shared-data directory bind). The legacy .kilo/data target is
+    // gone — it is migrated into shared-data and removed.
+    for (const id of [w1Id, w2Id]) {
+      const link = await captureStdout(id!, `readlink ~/.local/share/kilo`);
+      expect(link.trim()).toBe('/home/agent/.agent-data/.kilo/shared-data');
+      // Legacy per-worker .kilo/data must NOT exist after migration.
+      const legacy = await captureStdout(id!, `test -e ~/.agent-data/.kilo/data && echo LEGACY_PRESENT || echo LEGACY_GONE`);
+      expect(legacy.trim()).toBe('LEGACY_GONE');
+    }
+  });
+
+  test('two same-user workers share writes under canonical ~/.config/kilo', async () => {
     // The orchestrator bind-mounts the user's shared global Kilo config dir over
     // /home/agent/.agent-data/.kilo/config, and the entrypoint symlinks
     // ~/.config/kilo → .agent-data/.kilo/config. A write through the canonical
     // path on worker 1 must be visible on worker 2.
     await execInWorker(
-      w1Id,
+      w1Id!,
       `mkdir -p ~/.config/kilo && printf '%s\\n' '${configMarker}' > ~/.config/kilo/shared-test.json`,
     );
 
-    const seen = await captureStdout(w2Id, `cat ~/.config/kilo/shared-test.json 2>/dev/null`);
+    const seen = await captureStdout(w2Id!, `cat ~/.config/kilo/shared-test.json 2>/dev/null`);
     expect(seen.trim()).toBe(configMarker);
   });
 
-  test('two same-user workers share writes under canonical ~/.local/share/kilo/auth.json', async () => {
-    // The per-user Kilo OAuth credential file is bind-mounted at
-    // /home/agent/.agent-data/.kilo/data/auth.json, which the entrypoint
-    // surfaces at the canonical ~/.local/share/kilo/auth.json via symlink
-    // (.local/share/kilo → .agent-data/.kilo/data). A write on worker 1 must
-    // be visible on worker 2 — this is the live-credential-sharing guarantee.
+  test('Kilo atomic (temp+rename) auth writes on worker A are live on worker B via the shared-data directory bind', async () => {
+    // Kilo rewrites auth.json atomically via a temp file + rename. The old
+    // per-file bind at .kilo/data/auth.json broke this (the rename replaced the
+    // inode the bind pointed at, hiding the new content from other workers).
+    // The shared-data DIRECTORY bind survives the atomic replace, so a write
+    // on worker A is immediately visible on worker B. We reproduce Kilo's real
+    // write pattern here: build the new content in a sibling temp file and `mv`
+    // it over the canonical auth.json on worker A, then read it on worker B.
+    // This test must fail under the old file-bind implementation.
+    const payload = JSON.stringify({ provider: authProvider, token: authToken });
+    // `printf %s` keeps the JSON on one line and avoids shell quoting issues.
     await execInWorker(
       w1Id!,
-      `mkdir -p ~/.local/share/kilo && printf '%s\\n' '${authMarker}' > ~/.local/share/kilo/auth.json`,
+      `tmp=$(mktemp ~/.local/share/kilo/auth.json.XXXXXX) && printf '%s' '${payload.replace(/'/g, `'\\''`)}' > "$tmp" && mv -f "$tmp" ~/.local/share/kilo/auth.json`,
     );
 
     const seen = await captureStdout(w2Id!, `cat ~/.local/share/kilo/auth.json 2>/dev/null`);
-    expect(seen.trim()).toBe(authMarker);
+    // Worker B sees the provider marker live — proving the directory bind
+    // surfaces the renamed file (not a stale inode).
+    expect(seen).toContain(authProvider);
+    expect(seen).toContain(authToken);
+    // The auth file must remain a regular file (not a symlink), inside the
+    // shared-data directory.
+    const type = await captureStdout(w2Id!, `readlink -f ~/.local/share/kilo/auth.json`);
+    expect(type.trim()).toBe('/home/agent/.agent-data/.kilo/shared-data/auth.json');
+  });
+
+  test('a non-auth data marker under ~/.local/share/kilo is shared same-user', async () => {
+    // The shared-data directory carries auth.json plus Kilo's SQLite
+    // session/history DBs — all shared across that user's workers. A marker
+    // written next to auth.json on worker A must be visible on worker B.
+    await execInWorker(
+      w1Id!,
+      `printf '%s\\n' '${dataMarker}' > ~/.local/share/kilo/shared-data-marker.txt`,
+    );
+
+    const seen = await captureStdout(w2Id!, `cat ~/.local/share/kilo/shared-data-marker.txt 2>/dev/null`);
+    expect(seen.trim()).toBe(dataMarker);
   });
 
   test('code-server user-data markers are per-worker, not shared between same-user workers', async () => {
@@ -326,6 +366,8 @@ test.describe.serial('Kilo Code — persistence across rebuild', () => {
   let user: { ctx: APIRequestContext; api: ApiClient; email: string; password: string; id: string };
   let containerId: string | undefined;
   const sharedCfgMarker = `kilo-rebuild-cfg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const sharedAuthProvider = `kilo-rebuild-auth-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const sharedDataMarker = `kilo-rebuild-data-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   const csMarker = `kilo-rebuild-cs-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
   test.beforeAll(async () => {
@@ -337,7 +379,7 @@ test.describe.serial('Kilo Code — persistence across rebuild', () => {
     if (user) await cleanupUser(user);
   });
 
-  test('writes shared Kilo config and per-worker code-server marker before rebuild', async () => {
+  test('writes shared Kilo config/auth/data and a per-worker code-server marker before rebuild', async () => {
     test.setTimeout(180_000);
     const container = await createWorker(user.ctx, { displayName: `kilo-rebuild-${Date.now()}` });
     containerId = container.id;
@@ -347,6 +389,17 @@ test.describe.serial('Kilo Code — persistence across rebuild', () => {
       containerId,
       `mkdir -p ~/.config/kilo && printf '%s\\n' '${sharedCfgMarker}' > ~/.config/kilo/rebuild-test.json`,
     );
+    // Shared (per-user) Kilo auth write via the canonical path (directory bind
+    // survives rebuild). Use a JSON object so it looks like real Kilo auth.
+    await execInWorker(
+      containerId,
+      `printf '%s' '{"provider":"${sharedAuthProvider}"}' > ~/.local/share/kilo/auth.json`,
+    );
+    // Shared (per-user) non-auth data marker alongside auth.json in shared-data.
+    await execInWorker(
+      containerId,
+      `printf '%s\\n' '${sharedDataMarker}' > ~/.local/share/kilo/rebuild-data.txt`,
+    );
     // Per-worker code-server user-data marker — must survive rebuild (volume).
     await execInWorker(
       containerId,
@@ -354,7 +407,7 @@ test.describe.serial('Kilo Code — persistence across rebuild', () => {
     );
   });
 
-  test('shared Kilo config and per-worker code-server marker survive rebuild', async ({ request }) => {
+  test('shared Kilo config/auth/data and per-worker code-server marker survive rebuild', async ({ request }) => {
     test.setTimeout(240_000);
     const api = new ApiClient(user.ctx);
     const { status, body } = await api.rebuildContainer(containerId!);
@@ -367,11 +420,113 @@ test.describe.serial('Kilo Code — persistence across rebuild', () => {
     const cfg = await captureStdout(rebuiltId, `cat ~/.config/kilo/rebuild-test.json 2>/dev/null`);
     expect(cfg.trim()).toBe(sharedCfgMarker);
 
+    // Shared per-user Kilo auth (directory bind) survives rebuild.
+    const auth = await captureStdout(rebuiltId, `cat ~/.local/share/kilo/auth.json 2>/dev/null`);
+    expect(auth).toContain(sharedAuthProvider);
+
+    // Shared per-user Kilo data marker (next to auth in shared-data) survives.
+    const data = await captureStdout(rebuiltId, `cat ~/.local/share/kilo/rebuild-data.txt 2>/dev/null`);
+    expect(data.trim()).toBe(sharedDataMarker);
+
     // Per-worker code-server user-data (agent-data volume) survives rebuild.
     const cs = await captureStdout(
       rebuiltId,
       `cat ~/.agent-data/.code-server/User/rebuild-marker.txt 2>/dev/null`,
     );
     expect(cs.trim()).toBe(csMarker);
+  });
+});
+
+// ─── One-time legacy .kilo/data → shared-data migration (serial) ────────
+
+test.describe.serial('Kilo Code — legacy .kilo/data migration', () => {
+  let user: { ctx: APIRequestContext; api: ApiClient; email: string; password: string; id: string };
+  let containerId: string | undefined;
+  // Random marker values (no real keys) — distinguish the legacy-only and
+  // shared-pre-existing auth entries so the merge semantics are unambiguous.
+  const legacyAuthProvider = `kilo-mig-legacy-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const sharedAuthProvider = `kilo-mig-shared-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const legacyDataMarker = `kilo-mig-data-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+  test.beforeAll(async () => {
+    user = await createUserAndSignIn('kilo-migrate');
+  });
+
+  test.afterAll(async () => {
+    if (containerId) await cleanupWorker(user.ctx, containerId).catch(() => {});
+    if (user) await cleanupUser(user);
+  });
+
+  test('seed a pre-existing shared provider before forcing legacy migration', async () => {
+    test.setTimeout(240_000);
+    const container = await createWorker(user.ctx, { displayName: `kilo-migrate-${Date.now()}` });
+    containerId = container.id;
+
+    // Pre-populate the shared auth file with an existing provider that must
+    // NOT be overwritten by the legacy merge. Writing through the canonical
+    // symlink lands in the per-user shared-data bind.
+    await execInWorker(
+      containerId,
+      `printf '%s' '{"existing":"${sharedAuthProvider}"}' > ~/.local/share/kilo/auth.json`,
+    );
+
+    // Plant a legacy per-worker .kilo/data dir directly inside the per-worker
+    // agent-data volume. This simulates a pre-shared-data worker that still
+    // carries its old auth + DB/history. The entrypoint migration block will
+    // copy non-auth entries verbatim and merge auth.json (adding missing keys
+    // only). auth.json here carries a DIFFERENT provider than the shared one.
+    await execInWorker(
+      containerId,
+      `mkdir -p ~/.agent-data/.kilo/data && printf '%s' '{"legacy":"${legacyAuthProvider}"}' > ~/.agent-data/.kilo/data/auth.json && printf '%s\\n' '${legacyDataMarker}' > ~/.agent-data/.kilo/data/legacy-only.txt`,
+    );
+
+    // Remove this worker's shared migration marker so the next boot re-runs
+    // the migration. The marker lives in the per-user shared-data dir keyed by
+    // the stable worker id (the container's UUID, sourced from $WORKER.id).
+    await execInWorker(
+      containerId,
+      `rm -f ~/.agent-data/.kilo/shared-data/.migrated-worker-${containerId}`,
+    );
+  });
+
+  test('restart migrates missing legacy auth/data without overwriting the shared provider and removes .kilo/data', async () => {
+    test.setTimeout(240_000);
+    const api = new ApiClient(user.ctx);
+    await api.stopContainer(containerId!);
+    await new Promise((r) => setTimeout(r, 2000));
+    await api.restartContainer(containerId!);
+    await waitForWorkerRunning(user.ctx, containerId!, 90_000);
+
+    // The legacy auth entry was MISSING in shared auth → merged in.
+    const auth = await captureStdout(containerId!, `cat ~/.local/share/kilo/auth.json 2>/dev/null`);
+    expect(auth).toContain(legacyAuthProvider);
+    // The pre-existing shared entry was NOT overwritten.
+    expect(auth).toContain(sharedAuthProvider);
+
+    // The legacy-only data file was copied into shared-data.
+    const data = await captureStdout(containerId!, `cat ~/.local/share/kilo/legacy-only.txt 2>/dev/null`);
+    expect(data.trim()).toBe(legacyDataMarker);
+
+    // The legacy per-worker .kilo/data dir is removed (no stale secret copy).
+    const legacy = await captureStdout(
+      containerId!,
+      `test -e ~/.agent-data/.kilo/data && echo LEGACY_PRESENT || echo LEGACY_GONE`,
+    );
+    expect(legacy.trim()).toBe('LEGACY_GONE');
+
+    // The migration marker now exists for this worker id.
+    const marker = await captureStdout(
+      containerId!,
+      `test -f ~/.agent-data/.kilo/shared-data/.migrated-worker-${containerId} && echo MARKER_SET || echo MARKER_MISSING`,
+    );
+    expect(marker.trim()).toBe('MARKER_SET');
+
+    // Cleanup the shared markers we touched so this user's shared-data is left
+    // in a clean state for any other test that might reuse the user (best
+    // effort — the user is torn down in afterAll anyway).
+    await execInWorker(
+      containerId!,
+      `rm -f ~/.local/share/kilo/legacy-only.txt ~/.agent-data/.kilo/shared-data/.migrated-worker-${containerId}`,
+    ).catch(() => {});
   });
 });

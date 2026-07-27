@@ -79,12 +79,14 @@ test.describe.serial('Apps Pane — UI', () => {
     const newInstanceButtons = page.locator('main').getByText('+ New Instance');
     await expect(newInstanceButtons).toHaveCount(2, { timeout: 10_000 });
 
-    // Two singleton apps (vscode, ssh) → two "Start" buttons while stopped.
+    // Three singleton apps (vscode, vscode-desktop, ssh) → three "Start"
+    // buttons while stopped.
     await expect(page.locator('main [data-testid="start-vscode"]')).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator('main [data-testid="start-vscode-desktop"]')).toBeVisible({ timeout: 10_000 });
     await expect(page.locator('main [data-testid="start-ssh"]')).toBeVisible({ timeout: 10_000 });
   });
 
-  test('Apps pane lists VS Code Tunnel and SSH as singleton app types', async ({ page }) => {
+  test('Apps pane lists VS Code Tunnel, Persistent VS Code, and SSH as singleton app types', async ({ page }) => {
     await goToDashboard(page);
     const card = page.locator('.rounded-lg').filter({ hasText: displayName }).first();
     await expect(card.locator('text=running')).toBeVisible({ timeout: 60_000 });
@@ -94,6 +96,7 @@ test.describe.serial('Apps Pane — UI', () => {
     await expect(page.locator('main').getByRole('heading', { name: 'Apps', exact: true })).toBeVisible({ timeout: 15_000 });
 
     await expect(page.locator('main').getByText('VS Code Tunnel', { exact: true })).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator('main').getByText('Persistent VS Code', { exact: true })).toBeVisible({ timeout: 10_000 });
     await expect(page.locator('main').getByText('SSH Server', { exact: true })).toBeVisible({ timeout: 10_000 });
   });
 
@@ -115,6 +118,11 @@ test.describe.serial('Apps Pane — UI', () => {
     // SOCKS5 description
     await expect(
       page.locator('main').getByText('Lightweight SOCKS5 proxy via microsocks'),
+    ).toBeVisible({ timeout: 30_000 });
+
+    // Persistent VS Code description
+    await expect(
+      page.locator('main').getByText('Persistent code-server VS Code client in a noVNC-attached Chromium window'),
     ).toBeVisible({ timeout: 30_000 });
   });
 
@@ -145,7 +153,7 @@ test.describe.serial('Apps Pane — UI', () => {
     await expect(page.locator('main').getByText('No running instances')).toHaveCount(2);
 
     // Singleton apps show "Not running".
-    await expect(page.locator('main').getByText('Not running')).toHaveCount(2);
+    await expect(page.locator('main').getByText('Not running')).toHaveCount(3);
   });
 
   test('VS Code tunnel Start surfaces a GitHub device code in the row within 60s', async ({ page }) => {

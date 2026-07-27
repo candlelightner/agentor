@@ -53,15 +53,16 @@ test.describe.serial('Agent data persistence — mount verification', () => {
 
   test('Kilo canonical XDG paths are symlinked to .agent-data/.kilo subdirs', async () => {
     // The entrypoint symlinks each Kilo XDG path at the corresponding per-worker
-    // .agent-data/.kilo/<dir>. config is overlaid by the per-user shared bind,
-    // but the symlink target is still the .agent-data path (the bind mounts on
-    // top of the symlink-resolved directory).
+    // .agent-data/.kilo/<dir>. config and shared-data are overlaid by per-user
+    // shared binds (global config + auth/sessions/history shared across this
+    // user's workers); state/cache stay per-worker. The symlink target is still
+    // the .agent-data path (the binds mount on top of the symlink-resolved dir).
     const output = await execInWorker(
       containerId,
       'readlink ~/.config/kilo && readlink ~/.local/share/kilo && readlink ~/.local/state/kilo && readlink ~/.cache/kilo',
     );
     expect(output).toContain('/home/agent/.agent-data/.kilo/config');
-    expect(output).toContain('/home/agent/.agent-data/.kilo/data');
+    expect(output).toContain('/home/agent/.agent-data/.kilo/shared-data');
     expect(output).toContain('/home/agent/.agent-data/.kilo/state');
     expect(output).toContain('/home/agent/.agent-data/.kilo/cache');
   });
@@ -72,10 +73,13 @@ test.describe.serial('Agent data persistence — mount verification', () => {
   });
 
   test('credential files are the per-user bind mount (regular files, not symlinks)', async () => {
-    // Each credential file is bind-mounted from <DATA_DIR>/users/<userId>/credentials/<file>.json
-    // directly at the CLI's expected path inside the agent-data volume. Writes go straight
-    // to the host file and every worker the user owns sees the same credentials.
-    // Kilo's auth.json is the newest member of this set (regular bind file, not a symlink).
+    // Claude/Codex/Gemini credential files are bind-mounted from
+    // <DATA_DIR>/users/<userId>/credentials/<file>.json directly at the CLI's
+    // expected path inside the agent-data volume — regular files, not symlinks.
+    // Kilo's auth.json is surfaced through the per-user shared-data directory
+    // bind (`.agent-data/.kilo/shared-data`, symlinked to ~/.local/share/kilo).
+    // It is a regular file whose canonical resolved path lives inside
+    // `.kilo/shared-data`, NOT a symlink itself.
     const output = await execInWorker(
       containerId,
       'stat -c "%F" ~/.claude/.credentials.json ~/.codex/auth.json ~/.gemini/oauth_creds.json ~/.local/share/kilo/auth.json 2>/dev/null',
@@ -85,6 +89,17 @@ test.describe.serial('Agent data persistence — mount verification', () => {
     const regularCount = (output.match(/regular file/g) ?? []).length;
     expect(regularCount).toBe(4);
     expect(output).not.toContain('symbolic link');
+
+    // Kilo's auth.json resolves inside the shared-data directory (not the
+    // legacy .kilo/data).
+    const resolved = await execInWorker(containerId, 'readlink -f ~/.local/share/kilo/auth.json');
+    expect(resolved.trim()).toBe('/home/agent/.agent-data/.kilo/shared-data/auth.json');
+    // The legacy per-worker .kilo/data is gone (migrated + removed on boot).
+    const legacy = await execInWorker(
+      containerId,
+      'test -e ~/.agent-data/.kilo/data && echo LEGACY_PRESENT || echo LEGACY_GONE',
+    );
+    expect(legacy.trim()).toBe('LEGACY_GONE');
   });
 
   test('claude settings.json exists with expected keys', async () => {

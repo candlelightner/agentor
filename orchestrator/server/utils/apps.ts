@@ -66,6 +66,15 @@ export const APP_REGISTRY: Record<string, AppType> = {
     manageScript: 'vscode-tunnel/manage.sh',
     singleton: true,
   },
+  'vscode-desktop': {
+    id: 'vscode-desktop',
+    displayName: 'Persistent VS Code',
+    description: 'Persistent code-server VS Code client in a noVNC-attached Chromium window',
+    ports: [],
+    maxInstances: 1,
+    manageScript: 'vscode-desktop/manage.sh',
+    singleton: true,
+  },
   ssh: {
     id: 'ssh',
     displayName: 'SSH Server',

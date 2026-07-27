@@ -20,10 +20,10 @@ All agents are installed in a single unified worker image. Start any agent via i
 
 - **User authentication & RBAC** — email/password/passkey login powered by [better-auth](https://www.better-auth.com/) with admin and user roles; admins create and manage other users, each user sees only their own workers/mappings/environments/etc. First-run setup creates the initial admin.
 - **Live terminal** — xterm.js WebSocket terminal with tmux session management
-- **VS Code editor** — code-server (VS Code in the browser) per worker, with Kilo Code preinstalled and per-user config/auth shared across that user's workers
+- **VS Code editor** — code-server per worker with Kilo Code preinstalled and per-user config, provider keys, login, and Kilo sessions shared across that user's workers
 - **Virtual desktop** — Xvfb + fluxbox + noVNC, accessible in-browser
 - **Multi-repo cloning** — clone one or more git repos into each worker at startup
-- **App system** — launch Chromium (with CDP), SOCKS5 proxy, VS Code Tunnel (native VS Code client via Microsoft's relay, GitHub device-code auth), or OpenSSH server (port 22, public-key auth from each user's Account settings; Start auto-allocates an external `22xxx` port mapping) from the Apps pane
+- **App system** — launch Chromium (with CDP), Persistent VS Code (a noVNC-hosted client that stays alive when the viewer disconnects), SOCKS5 proxy, VS Code Tunnel (native VS Code client via Microsoft's relay), or OpenSSH server from the Apps pane
 - **Port & domain mapping** — unified Traefik reverse proxy handling both TCP port forwarding (localhost- or network-bound) and subdomain-based HTTP/HTTPS/TCP routing with TLS (Let's Encrypt HTTP-01/DNS-01 or self-signed CA), optional HTTP basic auth
 - **Auto-updates** — per-image or bulk image updates in production mode with registry-agnostic digest comparison (GHCR + Docker Hub), orchestrator self-replaces
 - **Resource limits** — per-environment CPU and memory constraints applied to every worker on that environment (plus a global default)
@@ -132,7 +132,7 @@ Log in once inside any of your workers — the agent CLI writes its OAuth token 
 > [!IMPORTANT]
 > OAuth refresh tokens rotate on use. **Always** log in inside a worker — never copy tokens from your local machine, or both copies will desync and break authentication on both sides.
 
-Tokens live at `<DATA_DIR>/users/<your-user-id>/credentials/{claude,codex,gemini,kilo}.json`. To force a fresh login, click **Reset** next to the agent in **Account → Agent OAuth credentials**. (Kilo is a fourth Account credential row; it has no usage monitoring and no separately installed Kilo CLI — the Kilo Code experience is delivered via the `kilocode.kilo-code@7.4.16` code-server extension preinstalled in the worker image.)
+Tokens live at `<DATA_DIR>/users/<your-user-id>/credentials/{claude,codex,gemini}.json` (and Kilo's shared auth at `<DATA_DIR>/users/<your-user-id>/kilo/data/auth.json`). To force a fresh login, click **Reset** next to the agent in **Account → Agent OAuth credentials**. (Kilo is a fourth Account credential row; it has no usage monitoring and no separately installed Kilo CLI — the Kilo Code experience is delivered via the `kilocode.kilo-code@7.4.16` code-server extension preinstalled in the worker image. Kilo's complete `~/.local/share/kilo` data directory — login, provider API keys configured through Kilo's VS Code UI, and Kilo SQLite sessions/history — is shared per user across that user's workers via a directory bind, which is required because Kilo atomically temp+renames `auth.json`.)
 
 ### API keys
 

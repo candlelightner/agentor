@@ -288,6 +288,87 @@ test.describe('Apps API', () => {
     });
   });
 
+  test.describe('VS Code Desktop singleton app (noVNC-attached code-server Chromium)', () => {
+    // The app launches Chromium in app mode against the local code-server on
+    // DISPLAY=:99. It is singleton (id fixed to "vscode-desktop"), exposes no
+    // ports, and stays running once started. We do NOT assert any browser
+    // render — CI's test runner lacks a VNC client and the Chromium window is
+    // only observable via noVNC; the API + manage.sh status is the contract.
+    test.afterEach(async ({ request }) => {
+      const api = new ApiClient(request);
+      await api.stopApp(containerId, 'vscode-desktop', 'vscode-desktop').catch(() => {});
+    });
+
+    test('vscode-desktop is listed in app-types as a singleton with no ports', async ({ request }) => {
+      const res = await request.get('/api/app-types');
+      const types = await res.json();
+      const vscodeDesktop = types.find((t: { id: string }) => t.id === 'vscode-desktop');
+      expect(vscodeDesktop).toBeTruthy();
+      expect(vscodeDesktop.singleton).toBe(true);
+      expect(vscodeDesktop.maxInstances).toBe(1);
+      expect(vscodeDesktop.ports.length).toBe(0);
+      expect(vscodeDesktop.autoPortMapping).toBeUndefined();
+      expect(vscodeDesktop.fixedInternalPort).toBeUndefined();
+    });
+
+    test('starting vscode-desktop returns 201 with id "vscode-desktop" and port 0', async ({ request }) => {
+      const api = new ApiClient(request);
+      const { status, body } = await api.startApp(containerId, 'vscode-desktop');
+      expect(status).toBe(201);
+      expect(body.id).toBe('vscode-desktop');
+      expect(body.port).toBe(0);
+      // No auto port mapping → no externalPort field.
+      expect(body.externalPort).toBeUndefined();
+    });
+
+    test('starting vscode-desktop twice returns 409', async ({ request }) => {
+      const api = new ApiClient(request);
+      const first = await api.startApp(containerId, 'vscode-desktop');
+      expect(first.status).toBe(201);
+      const second = await api.startApp(containerId, 'vscode-desktop');
+      expect(second.status).toBe(409);
+    });
+
+    test('list returns vscode-desktop with status running', async ({ request }) => {
+      const api = new ApiClient(request);
+      await api.startApp(containerId, 'vscode-desktop');
+      // Give the Chromium process a moment to be confirmed alive by manage.sh.
+      await new Promise(r => setTimeout(r, 1500));
+      const { body: apps } = await api.listAppsByType(containerId, 'vscode-desktop');
+      expect(apps.length).toBeGreaterThan(0);
+      const vscodeDesktop = apps[0];
+      expect(vscodeDesktop.id).toBe('vscode-desktop');
+      expect(vscodeDesktop.status).toBe('running');
+      expect(vscodeDesktop.port).toBe(0);
+    });
+
+    test('vscode-desktop stays running after a short interval', async ({ request }) => {
+      // The singleton must remain running (not crash/exit) over a short window.
+      // We start it, wait, list, wait again, and assert it is still running.
+      const api = new ApiClient(request);
+      await api.startApp(containerId, 'vscode-desktop');
+      await new Promise(r => setTimeout(r, 2000));
+      const first = await api.listAppsByType(containerId, 'vscode-desktop');
+      expect(first.body.length).toBeGreaterThan(0);
+      expect(first.body[0].status).toBe('running');
+      await new Promise(r => setTimeout(r, 3000));
+      const second = await api.listAppsByType(containerId, 'vscode-desktop');
+      expect(second.body.length).toBeGreaterThan(0);
+      expect(second.body[0].status).toBe('running');
+    });
+
+    test('stop vscode-desktop returns ok and clears the instance', async ({ request }) => {
+      const api = new ApiClient(request);
+      await api.startApp(containerId, 'vscode-desktop');
+      await new Promise(r => setTimeout(r, 1500));
+      const { status, body } = await api.stopApp(containerId, 'vscode-desktop', 'vscode-desktop');
+      expect(status).toBe(200);
+      expect(body.ok).toBe(true);
+      const { body: apps } = await api.listAppsByType(containerId, 'vscode-desktop');
+      expect(apps.length).toBe(0);
+    });
+  });
+
   test.describe('SSH singleton app with auto port mapping', () => {
     test.afterEach(async ({ request }) => {
       const api = new ApiClient(request);

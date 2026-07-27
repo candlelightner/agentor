@@ -23,19 +23,29 @@ function assertSafeUserId(userId: string): void {
  * pre-creates empty mountpoint files. Docker Desktop's virtiofs refuses to
  * nest a file bind mount inside a directory bind mount unless the target
  * already exists on the host, so we touch these files before starting the
- * container and then bind the per-user credential file on top. */
+ * container and then bind the per-user credential file on top.
+ *
+ * Kilo is deliberately absent: its auth file lives under a per-user shared
+ * directory bind (`.kilo/shared-data`, see SHARED_DIRECTORY_MOUNT_POINTS)
+ * rather than a per-file bind, because Kilo rewrites `auth.json` atomically
+ * via temp+rename which breaks a file bind. See `getKiloSharedDataBind`. */
 const CREDENTIAL_MOUNT_POINTS = [
   '.claude/.credentials.json',
   '.codex/auth.json',
   '.gemini/oauth_creds.json',
-  '.kilo/data/auth.json',
 ];
 
 /** Relative directory paths inside a worker's agents directory that receive a
  * nested bind mount. Pre-creating them avoids Docker Desktop virtiofs treating
- * a missing directory target inconsistently with native Docker. */
+ * a missing directory target inconsistently with native Docker.
+ *
+ * These are also the shared per-user directories whose contents must be stripped
+ * from worker exports (secrets belong to the account, not the portable worker)
+ * — `worker-export.ts` derives its exclude list from this registry so the two
+ * can never drift. */
 export const SHARED_DIRECTORY_MOUNT_POINTS = [
   '.kilo/config',
+  '.kilo/shared-data',
 ];
 
 export class StorageManager {
@@ -265,6 +275,33 @@ export class StorageManager {
     }
     const hostDir = join(this.getUserHostDir(userId), 'kilo', 'config');
     return `${hostDir}:/home/agent/.agent-data/.kilo/config`;
+  }
+
+  /** Ensure the per-user Kilo shared-data directory (the writable source for
+   * Kilo's `~/.local/share/kilo`) exists with correct ownership in both
+   * storage modes. Holds `auth.json` (provider keys + login) plus Kilo's
+   * SQLite session/history DBs — all shared across that user's workers. */
+  async ensureUserKiloSharedDataDir(userId: string): Promise<void> {
+    const kiloDir = join(this.getUserDir(userId), 'kilo');
+    const sharedDir = join(kiloDir, 'data');
+    await mkdir(sharedDir, { recursive: true, mode: 0o700 });
+    await chmod(kiloDir, 0o700);
+    await chmod(sharedDir, 0o700);
+    await this.chownDir(kiloDir);
+    await this.chownDir(sharedDir);
+  }
+
+  /** Bind string for the user's writable Kilo shared-data directory, mounted
+   * at `.agent-data/.kilo/shared-data` (distinct from the legacy per-worker
+   * `.kilo/data`) so the entrypoint can migrate old per-worker data into it.
+   * A directory bind survives Kilo's atomic temp+rename of `auth.json`, unlike
+   * a per-file bind. */
+  getKiloSharedDataBind(userId: string): string {
+    if (!this.dataHostPath) {
+      throw new Error('[storage] dataHostPath not resolved — cannot build Kilo shared-data bind');
+    }
+    const hostDir = join(this.getUserHostDir(userId), 'kilo', 'data');
+    return `${hostDir}:/home/agent/.agent-data/.kilo/shared-data`;
   }
 
   /** In-container path of a user's private data directory (`/data/users/<userId>/`). */

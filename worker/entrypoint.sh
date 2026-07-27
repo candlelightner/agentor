@@ -97,11 +97,12 @@ if [ -d "$AGENT_DATA" ]; then
     sudo chown -R agent:agent "$AGENT_DATA"
 
     # Ensure subdirectories exist in the per-worker volume. Kilo's config and
-    # auth file are overlaid by per-user bind mounts; its remaining data stays
-    # private to this worker.
+    # shared-data are overlaid by per-user bind mounts (config = global config,
+    # shared-data = auth + sessions + history shared across this user's
+    # workers). state/cache stay private to this worker.
     mkdir -p "$AGENT_DATA"/{.claude,.gemini,.codex,.agents,.vscode,.code-server}
-    mkdir -p "$AGENT_DATA/.kilo"/{config,data,state,cache}
-    chmod 700 "$AGENT_DATA/.code-server" "$AGENT_DATA/.kilo" "$AGENT_DATA/.kilo"/{config,data,state,cache}
+    mkdir -p "$AGENT_DATA/.kilo"/{config,shared-data,state,cache}
+    chmod 700 "$AGENT_DATA/.code-server" "$AGENT_DATA/.kilo" "$AGENT_DATA/.kilo"/{config,shared-data,state,cache}
 
     # Symlink agent config dirs to persistent volume
     for dir in .claude .gemini .codex .agents .vscode; do
@@ -112,12 +113,115 @@ if [ -d "$AGENT_DATA" ]; then
         ln -sfn "$AGENT_DATA/$dir" "$target"
     done
 
-    # Kilo follows XDG paths. Point each canonical path at the corresponding
-    # per-worker directory (except config, which the orchestrator overlays with
-    # the user's shared global config directory).
+    # --- One-time migration of legacy per-worker `.kilo/data` into the shared
+    # --- `.kilo/shared-data` bind. The first worker to start under a user
+    # --- populates the shared auth + DB/history; later legacy workers only add
+    # --- missing top-level entries to auth.json without overwriting what is
+    # --- already shared. A marker records a completed migration so it does not
+    # --- run again once shared-data is canonical. Guarded by a flock inside the
+    # --- shared-data dir so concurrent worker starts do not race. Malformed
+    # --- legacy JSON is left in place (no marker) so the next boot retries;
+    # --- worker startup never aborts on it (the whole block is wrapped so any
+    # --- unexpected error degrades to a warning, not a failed boot).
+    KILO_SHARED="$AGENT_DATA/.kilo/shared-data"
+    KILO_LEGACY="$AGENT_DATA/.kilo/data"
+    KILO_WORKER_JSON="${WORKER:-}"
+    [ -n "$KILO_WORKER_JSON" ] || KILO_WORKER_JSON='{}'
+    KILO_WORKER_ID=$(printf '%s' "$KILO_WORKER_JSON" | jq -r '.id // "legacy"' 2>/dev/null || echo legacy)
+    [[ "$KILO_WORKER_ID" =~ ^[a-zA-Z0-9_-]+$ ]] || KILO_WORKER_ID=legacy
+    KILO_MIGRATE_MARKER="$KILO_SHARED/.migrated-worker-$KILO_WORKER_ID"
+    (
+        set +e
+        flock -x 9 || { echo "[kilo] WARNING: migration lock failed — skipping"; exit 0; }
+        if [ -e "$KILO_MIGRATE_MARKER" ]; then
+            : # this worker's legacy data was already migrated
+        elif [ -d "$KILO_LEGACY" ]; then
+            _log "Kilo: migrating per-worker .kilo/data into shared-data"
+            # Copy DB/history/session files that are not auth.json verbatim.
+            # These are preserved from the first migrating worker only; later
+            # legacy workers may still carry them but shared-data already owns
+            # them, so we do not overwrite.
+            find "$KILO_LEGACY" -mindepth 1 -maxdepth 1 \
+                ! -name auth.json ! -name .migrate.lock ! -name '.migrated-worker-*' -print0 2>/dev/null \
+                | while IFS= read -r -d '' entry; do
+                    name=$(basename "$entry")
+                    if [ ! -e "$KILO_SHARED/$name" ]; then
+                        cp -a "$entry" "$KILO_SHARED/$name" 2>/dev/null || true
+                    fi
+                done
+
+            # Merge auth.json: take the shared file as the base and add any
+            # top-level keys from the legacy file that are missing. Never
+            # overwrite an existing shared entry. Returns 0 on success, 2 on
+            # malformed JSON (legacy or shared). Safe against malformed JSON.
+            merge_auth() {
+                if [ ! -f "$KILO_LEGACY/auth.json" ]; then
+                    return 0
+                fi
+                if [ ! -f "$KILO_SHARED/auth.json" ]; then
+                    echo '{}' > "$KILO_SHARED/auth.json"
+                    chmod 600 "$KILO_SHARED/auth.json"
+                fi
+                python3 - "$KILO_LEGACY/auth.json" "$KILO_SHARED/auth.json" <<'PY'
+import json, sys, os
+legacy_path, shared_path = sys.argv[1], sys.argv[2]
+def load(p):
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            raw = f.read().strip()
+        if not raw:
+            return {}
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return None  # malformed — refuse to touch shared
+legacy = load(legacy_path)
+if legacy is None:
+    sys.exit(2)  # malformed legacy — leave shared untouched
+shared = load(shared_path)
+if shared is None:
+    sys.exit(2)  # malformed shared — do not overwrite
+changed = False
+for k, v in legacy.items():
+    if k not in shared:
+        shared[k] = v
+        changed = True
+if changed:
+    tmp = shared_path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(shared, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, shared_path)
+PY
+            }
+
+            if merge_auth; then
+                chmod 600 "$KILO_SHARED/auth.json" 2>/dev/null || true
+                # Remove the legacy per-worker Kilo data so secret/export leakage
+                # cannot happen via the leftover per-worker copy.
+                rm -rf "$KILO_LEGACY" 2>/dev/null || true
+                touch "$KILO_MIGRATE_MARKER"
+                chmod 600 "$KILO_MIGRATE_MARKER" 2>/dev/null || true
+                _log "Kilo: migration complete"
+            else
+                # Malformed JSON or another merge failure — leave the legacy
+                # dir in place so secrets are not lost; do not set the marker
+                # so the next boot retries. Shared auth is untouched.
+                _log "Kilo: auth.json merge failed — legacy data preserved, will retry next boot"
+            fi
+        else
+            touch "$KILO_MIGRATE_MARKER"
+            chmod 600 "$KILO_MIGRATE_MARKER" 2>/dev/null || true
+        fi
+    ) 9>"$KILO_SHARED/.migrate.lock"
+    chmod 600 "$KILO_SHARED/.migrate.lock" 2>/dev/null || true
+
+    # Kilo follows XDG paths. config is overlaid by the shared global config
+    # bind; shared-data carries auth + sessions + history (shared per user);
+    # state/cache stay per-worker.
     for mapping in \
         ".config/kilo:config" \
-        ".local/share/kilo:data" \
+        ".local/share/kilo:shared-data" \
         ".local/state/kilo:state" \
         ".cache/kilo:cache"; do
         target="/home/agent/${mapping%%:*}"

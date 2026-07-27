@@ -1,5 +1,7 @@
-import { test, expect, request as playwrightRequest } from '@playwright/test';
+import { test, expect, request as playwrightRequest, type APIRequestContext } from '@playwright/test';
 import { ApiClient } from '../helpers/api-client';
+import { createWorker, cleanupWorker, waitForWorkerRunning } from '../helpers/worker-lifecycle';
+import { TerminalWsClient } from '../helpers/terminal-ws';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -48,6 +50,43 @@ async function cleanupUser(u: { ctx: import('@playwright/test').APIRequestContex
     // ignore
   } finally {
     await adminCtx.dispose();
+  }
+}
+
+/** Connect to a worker's terminal, wait for a prompt, run `command`, and
+ * return the ANSI-stripped output buffer up to (and including) the trailing
+ * sentinel marker. */
+async function execInWorker(containerId: string, command: string, timeoutMs = 30_000): Promise<string> {
+  const ws = new TerminalWsClient(containerId);
+  try {
+    await ws.connect();
+    await ws.waitForOutput(/[\$#>]\s*$/, 30_000);
+    ws.clearBuffer();
+    const marker = `END_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    ws.sendLine(`${command}; echo ${marker}`);
+    await ws.waitForOutput(new RegExp(`\\n${marker}\\n`), timeoutMs);
+    return ws.getBuffer();
+  } finally {
+    ws.close();
+  }
+}
+
+/** Run `command` and capture only the OUTPUT between two sentinels. */
+async function captureStdout(containerId: string, command: string, timeoutMs = 30_000): Promise<string> {
+  const ws = new TerminalWsClient(containerId);
+  try {
+    await ws.connect();
+    await ws.waitForOutput(/[\$#>]\s*$/, 30_000);
+    ws.clearBuffer();
+    const start = `CAP_START_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const end = `CAP_END_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    ws.sendLine(`echo ${start}; { ${command}; } ; echo ${end}`);
+    await ws.waitForOutput(new RegExp(`\\n${end}\\n`), timeoutMs);
+    const buf = ws.getBuffer();
+    const m = new RegExp(`${start}\\n([\\s\\S]*?)\\n${end}`).exec(buf);
+    return m ? m[1]! : '';
+  } finally {
+    ws.close();
   }
 }
 
@@ -125,6 +164,55 @@ test.describe('Account agent credentials (per-user) API', () => {
     } finally {
       await cleanupUser(a);
       await cleanupUser(b);
+    }
+  });
+
+  test('DELETE kilo clears the live canonical auth file visible in a running worker', async () => {
+    // Kilo's auth file lives inside the per-user shared-data directory bind
+    // (the external `fileName` stays `kilo.json` for backwards-compatible API
+    // shape). A reset must write `{}` to the live shared auth.json — which a
+    // running worker sees through its ~/.local/share/kilo/auth.json symlink.
+    test.setTimeout(240_000);
+    const u = await createUserAndSignIn('cred-kilo-live');
+    let containerId: string | undefined;
+    try {
+      const container = await createWorker(u.ctx, { displayName: `cred-kilo-live-${Date.now()}` });
+      containerId = container.id;
+
+      // The fresh shared auth.json is seeded as `{}`. Plant a marker through the
+      // canonical in-worker symlink so we can detect a real reset (not a no-op).
+      const marker = `kilo-cred-live-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      await execInWorker(
+        containerId,
+        `printf '%s' '{"provider":"${marker}"}' > ~/.local/share/kilo/auth.json`,
+      );
+      const before = await captureStdout(containerId, `cat ~/.local/share/kilo/auth.json 2>/dev/null`);
+      expect(before).toContain(marker);
+
+      // Listing must now show Kilo as configured.
+      const listBefore = await u.api.listAccountAgentCredentials();
+      const kiloBefore = listBefore.body.find((c: { agentId: string }) => c.agentId === 'kilo');
+      expect(kiloBefore.configured).toBe(true);
+
+      // DELETE clears the live canonical auth file (writes `{}`).
+      const { status, body } = await u.api.resetAccountAgentCredential('kilo');
+      expect(status).toBe(200);
+      expect(body.ok).toBe(true);
+
+      // The running worker sees the cleared file immediately — no rebuild
+      // or restart needed because the reset writes the shared auth.json the
+      // directory bind surfaces.
+      const after = await captureStdout(containerId, `cat ~/.local/share/kilo/auth.json 2>/dev/null`);
+      expect(after.trim()).toBe('{}');
+      expect(after).not.toContain(marker);
+
+      // Listing reflects the cleared state.
+      const listAfter = await u.api.listAccountAgentCredentials();
+      const kiloAfter = listAfter.body.find((c: { agentId: string }) => c.agentId === 'kilo');
+      expect(kiloAfter.configured).toBe(false);
+    } finally {
+      if (containerId) await cleanupWorker(u.ctx, containerId).catch(() => {});
+      await cleanupUser(u);
     }
   });
 });

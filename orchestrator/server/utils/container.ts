@@ -116,6 +116,7 @@ export class ContainerManager {
     if (this.storageManager && userId) {
       await this.storageManager.ensureUserSshDir(userId);
       await this.storageManager.ensureUserKiloConfigDir(userId);
+      await this.storageManager.ensureUserKiloSharedDataDir(userId);
       try {
         credentialBinds.push(this.storageManager.getSshAuthorizedKeysBind(userId));
       } catch (err) {
@@ -128,6 +129,13 @@ export class ContainerManager {
       } catch (err) {
         useLogger().warn(
           `[container] unable to build Kilo config bind for user ${userId}: ${err instanceof Error ? err.message : err}`,
+        );
+      }
+      try {
+        credentialBinds.push(this.storageManager.getKiloSharedDataBind(userId));
+      } catch (err) {
+        useLogger().warn(
+          `[container] unable to build Kilo shared-data bind for user ${userId}: ${err instanceof Error ? err.message : err}`,
         );
       }
     }

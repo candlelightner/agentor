@@ -69,24 +69,50 @@ test.describe('Worker export', () => {
     expect(text).not.toContain('rootfs.tar.gz');
   });
 
-  test('export strips shared Kilo config while retaining per-worker Kilo data', async ({ request }) => {
-    const secretMarker = `KILO_SHARED_SECRET_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  test('export strips shared Kilo shared-data and legacy .kilo/data/auth.json while retaining per-worker Kilo state', async ({ request }) => {
+    // Shared per-user directories (.kilo/config and .kilo/shared-data) are
+    // stripped from the agents tar — secrets belong to the account, not the
+    // portable worker. The legacy per-worker .kilo/data/auth.json is also
+    // stripped (no longer a bind target, but legacy artifacts may carry it).
+    // Per-worker Kilo state (.kilo/state) survives. A non-shared per-worker
+    // marker under the agents volume must remain present.
+    const sharedSecret = `KILO_SHARED_SECRET_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const sharedDataMarker = `KILO_SHARED_DATA_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const legacyAuthSecret = `KILO_LEGACY_AUTH_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const stateMarker = `KILO_WORKER_STATE_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const perWorkerMarker = `KILO_PERWORKER_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     try {
       await execInWorker(
         workerId,
-        `mkdir -p ~/.config/kilo ~/.local/state/kilo && printf '%s' '${secretMarker}' > ~/.config/kilo/export-secret.json && printf '%s' '${stateMarker}' > ~/.local/state/kilo/export-state.txt`,
+        `mkdir -p ~/.config/kilo ~/.local/state/kilo ~/.agent-data/.kilo/data ~/.agent-data/.vscode-desktop-profile \
+         && printf '%s' '${sharedSecret}' > ~/.config/kilo/export-secret.json \
+         && printf '%s' '${sharedDataMarker}' > ~/.local/share/kilo/export-data-secret.json \
+         && printf '%s' '${legacyAuthSecret}' > ~/.agent-data/.kilo/data/auth.json \
+         && printf '%s' '${stateMarker}' > ~/.local/state/kilo/export-state.txt \
+         && printf '%s\\n' '${perWorkerMarker}' > ~/.agent-data/.vscode-desktop-profile/per-worker.txt`,
       );
       const api = new ApiClient(request);
       const exported = await api.exportWorker(workerId, false);
       expect(exported.status).toBe(200);
-      const agentsGz = readTarEntry(Buffer.from(exported.body), 'agents.tar.gz');
-      const agentsTar = zlib.gunzipSync(agentsGz).toString('latin1');
+      const agentsTar = zlib.gunzipSync(readTarEntry(Buffer.from(exported.body), 'agents.tar.gz')).toString('latin1');
+      // Per-worker state and a non-shared per-worker marker survive.
       expect(agentsTar).toContain(stateMarker);
-      expect(agentsTar).not.toContain(secretMarker);
+      expect(agentsTar).toContain(perWorkerMarker);
+      // Shared per-user secrets are stripped.
+      expect(agentsTar).not.toContain(sharedSecret);
       expect(agentsTar).not.toContain('.kilo/config/export-secret.json');
+      expect(agentsTar).not.toContain(sharedDataMarker);
+      expect(agentsTar).not.toContain('.kilo/shared-data/export-data-secret.json');
+      // Legacy per-worker .kilo/data/auth.json is stripped too.
+      expect(agentsTar).not.toContain(legacyAuthSecret);
+      expect(agentsTar).not.toContain('.kilo/data/auth.json');
     } finally {
-      await execInWorker(workerId, 'rm -f ~/.config/kilo/export-secret.json ~/.local/state/kilo/export-state.txt').catch(() => {});
+      await execInWorker(
+        workerId,
+        'rm -f ~/.config/kilo/export-secret.json ~/.local/share/kilo/export-data-secret.json ~/.agent-data/.kilo/data/auth.json ~/.local/state/kilo/export-state.txt ~/.agent-data/.vscode-desktop-profile/per-worker.txt',
+      ).catch(() => {});
+      // Remove the legacy dir we created so it does not leak into other tests.
+      await execInWorker(workerId, 'rmdir ~/.agent-data/.kilo/data 2>/dev/null || true').catch(() => {});
     }
   });
 

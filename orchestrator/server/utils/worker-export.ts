@@ -41,9 +41,18 @@ export const CREDENTIAL_EXCLUDE_SUFFIXES = AGENT_CREDENTIAL_MAPPINGS.map((m) =>
     : m.containerPath,
 );
 
+/** The pre-shared-data Kilo auth path (`.kilo/data/auth.json`) is no longer a
+ * bind mount target, but legacy per-worker volumes / export artifacts may
+ * still carry it. Keep it stripped so an imported legacy agents tar never
+ * resurrects a stale secret copy. */
+export const LEGACY_KILO_AUTH_EXCLUDE_SUFFIX = '.kilo/data/auth.json';
+
 /** Per-user directories bind-mounted inside the agents volume. Their contents
  * may contain secrets and belong to the account, not to one portable worker. */
-export const SHARED_DATA_EXCLUDE_PREFIXES = [...SHARED_DIRECTORY_MOUNT_POINTS];
+export const SHARED_DATA_EXCLUDE_PREFIXES = [
+  ...SHARED_DIRECTORY_MOUNT_POINTS,
+  LEGACY_KILO_AUTH_EXCLUDE_SUFFIX,
+];
 
 /** File names inside the outer bundle tar. */
 export const BUNDLE_FILES = {

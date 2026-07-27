@@ -43,18 +43,20 @@ List endpoints merge the `defaults/` store and the caller's per-user store: admi
 Kilo Code is a fourth Account credential/reset row alongside Claude/Codex/Gemini, but with two deliberate limitations:
 
 - **No usage monitoring.** The orchestrator's agent usage monitoring (see @docs/production.md) covers only Claude, Codex, and Gemini — Kilo has no usage endpoint and is not polled by `UsageChecker`. Do not imply Kilo usage monitoring.
-- **No separately installed Kilo CLI.** The worker image does not install a standalone Kilo CLI; the Kilo Code experience is delivered via the code-server extension (`kilocode.kilo-code@7.4.16`) preinstalled in the image-level extension directory. The orchestrator only manages Kilo's shared config/auth files.
+- **No separately installed Kilo CLI.** The worker image does not install a standalone Kilo CLI; the Kilo Code experience is delivered via the code-server extension (`kilocode.kilo-code@7.4.16`) preinstalled in the image-level extension directory. The orchestrator only manages Kilo's shared config/auth/data files. No Kilo source was patched and no desktop VS Code package was installed.
 
 Per-user Kilo paths:
 
 | Resource | Storage | Scope |
 |----------|---------|-------|
-| Kilo OAuth auth | `users/<userId>/credentials/kilo.json` | per user — bind-mounted into every one of that user's workers (canonical in-worker path `~/.local/share/kilo/auth.json`); shared across all that user's workers/new workers |
+| Kilo shared data (login, provider API keys, SQLite sessions/history) | `users/<userId>/kilo/data` | per user — **directory**-bound into every one of that user's workers at `.agent-data/.kilo/shared-data` (surfaces at `~/.local/share/kilo`); shared across all that user's workers/new workers. A directory bind is required because Kilo atomically temp+renames `auth.json`, which breaks a file-level bind. |
 | Kilo global config | `users/<userId>/kilo/config` | per user — bind-mounted over `.agent-data/.kilo/config` (surfaces at `~/.config/kilo`); shared across all that user's workers/new workers |
-| Kilo session DB/data beyond auth | `agents/<id>/.kilo/{state,cache,…}` (per-worker `.agent-data`) | per worker — survives restart/rebuild/archive; NOT shared across workers and no shared SQLite/session state is implied |
+| Kilo state / cache | `agents/<id>/.kilo/{state,cache,…}` (per-worker `.agent-data`) | per worker — survives restart/rebuild/archive; NOT shared across workers |
 | code-server user/UI state | `agents/<id>/.code-server` (per-worker `.agent-data`) | per worker — survives restart/rebuild/archive; NOT shared across workers |
 
-A background orphan sweeper (`server/utils/orphan-sweeper.ts`) runs at startup and every 10 minutes: it reads the auth DB's `user` table and, for any candidate `userId` present in any per-user store whose row is no longer in the auth DB, drops that user from every in-memory store and recursively removes `<DATA_DIR>/users/<userId>/` — taking workspaces, agent dirs, credentials, the per-user Kilo config dir, and every per-user JSON file with it.
+**Migration:** existing legacy per-user auth at `users/<userId>/credentials/kilo.json` and any per-worker `.kilo/data` migrate into the shared data directory on the next worker start/rebuild — missing auth providers merge **without overwriting** entries already present in shared storage, and the first available DB/history file wins when several workers contribute candidates. Account **Reset** targets the live shared auth (it empties the shared `auth.json`, not a per-worker copy). Worker export strips `.kilo/config`, `.kilo/shared-data`, and the legacy `.kilo/data/auth.json` so an export never leaks account-level Kilo secrets, sessions, or configuration.
+
+A background orphan sweeper (`server/utils/orphan-sweeper.ts`) runs at startup and every 10 minutes: it reads the auth DB's `user` table and, for any candidate `userId` present in any per-user store whose row is no longer in the auth DB, drops that user from every in-memory store and recursively removes `<DATA_DIR>/users/<userId>/` — taking workspaces, agent dirs, credentials, the per-user Kilo config + shared data dirs, and every per-user JSON file with it.
 
 ## Architecture
 

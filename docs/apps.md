@@ -10,7 +10,7 @@ Every entry in `APP_REGISTRY` has:
 - **`ports: AppPort[]`** — zero or more port-range definitions. Entry `0` drives the port selector / label in the UI. For apps with `fixedInternalPort` the range is collapsed to a single port.
 - **`maxInstances`** — upper bound for non-singleton apps (e.g. chromium caps at 10). Ignored when `singleton: true`.
 - **`manageScript`** — path relative to `/home/agent/apps/` inside the worker.
-- **`singleton?: boolean`** — only one instance can run; the instance id is always the app-type id (`'vscode'`, `'ssh'`) so restarts reuse the same row + port mapping. Starting while one is running returns HTTP **409**.
+- **`singleton?: boolean`** — only one instance can run; the instance id is always the app-type id (`'vscode'`, `'vscode-desktop'`, `'ssh'`) so restarts reuse the same row + port mapping. Starting while one is running returns HTTP **409**.
 - **`fixedInternalPort?: number`** — when set, the orchestrator skips the port-range scan and always passes this port to `manage.sh start`. Used by the SSH app (internal port is hard-coded to 22).
 - **`autoPortMapping?: { type, externalPortStart, externalPortEnd }`** — when set, starting the app also allocates a port mapping in `[externalPortStart, externalPortEnd]` and writes it to the port-mapping store with `appType` + `instanceId`. If the store already has a matching `(containerName, appType, instanceId)` mapping, it is reused — external port stays stable across stop/start/restart/rebuild.
 
@@ -38,6 +38,7 @@ Optional per-app fields on `list`:
 | `socks5`   | multi (max 10) | 1080–1180 | — | — |
 | `vscode`   | singleton      | — (`0`)   | — | Microsoft tunnel name (userId-prefixed, ≤ 20 chars) |
 | `ssh`      | singleton      | 22 (fixed) | ext 22000–22999 (`type: external`) | — |
+| `vscode-desktop` | singleton | — (`0`) | — | — |
 
 The VS Code tunnel and SSH apps used to be separate features with dedicated UI and API routes; they are now regular apps rendered in the Apps pane via specialised row components (`VsCodeAppRow.vue`, `SshAppRow.vue`).
 
@@ -54,3 +55,12 @@ The VS Code tunnel and SSH apps used to be separate features with dedicated UI a
 - Uses `openssh-server` with `StrictModes no` (bind-mount file ownership is irrelevant) and `PubkeyAuthentication yes`, `PasswordAuthentication no`. Only the `agent` user is allowed in.
 - The authorized_keys file comes from the worker owner's **Account → SSH Access** textarea. The key is NOT an env var — it is managed via the dedicated `GET`/`PUT /api/account/ssh-key` endpoint pair (backed by `StorageManager.readSshAuthorizedKeys`/`writeSshAuthorizedKeys`), which writes it to `<DATA_DIR>/users/<userId>/ssh/authorized_keys` (its only home). Every worker bind-mounts that file read-only at `/home/agent/.ssh/authorized_keys` — so updating the key in the dashboard is visible to every running SSH instance immediately.
 - Port mapping is created on Start (type `external`, external port in `22000–22999`) and kept across stop/start/rebuild/archive/unarchive. It is only removed when the worker is permanently deleted.
+
+## Persistent VS Code app details
+
+- A singleton app (`vscode-desktop`) that launches a Chromium **app-mode** client pointed at the local code-server (already running on port 8443) under the existing Xvfb/noVNC display stack. It exposes **no container or external port** — it is only reachable by opening the **Desktop** pane.
+- It uses a persistent browser profile stored in the agent-data volume so browser cookies/preferences survive restarts; code-server extension/UI state persists separately in its per-worker user-data directory.
+- It reuses code-server + the existing Chromium — **no Kilo source is patched and no desktop VS Code package is installed**.
+- **Disconnecting the viewer is non-destructive:** closing the external browser tab or the noVNC Desktop pane only disconnects the *viewer* — the Chromium client, the in-browser VS Code client, the Kilo panel, and any active Kilo agent work all keep running. This is the key difference from the regular Editor iframe pane, where by Kilo's design **disposing/closing Kilo's VS Code panel can abort active Kilo sessions**.
+- **What stops the persistent client:** an explicit app **Stop**, closing its X window on the desktop, worker stop/rebuild/archive/delete, a client crash, or a VPS restart.
+- It is **not auto-started** — the operator starts it explicitly from the Apps pane (singleton `Start` button shown when no instance is running, Stop lives on the row once running).
