@@ -145,6 +145,65 @@ Open the sidebar footer, click your name, then **Account → API keys & tokens**
 
 You can also add arbitrary `KEY=value` pairs in **Custom environment variables** — these get exported into every worker you create.
 
+### Custom OpenAI-compatible Codex endpoint
+
+Codex can use a self-hosted gateway, proxy, or load balancer that implements the OpenAI **Responses API**. Codex's user-level `~/.codex/config.toml` is per-worker, so use a custom Environment setup script to distribute the same provider configuration while keeping the API key in the owning user's Account variables.
+
+1. Open **Environments**, click **New** (the built-in Default environment is read-only), and give the environment a name.
+2. Paste the script below into **Setup Script**. Replace only `CODEX_MODEL`, `CODEX_BASE_URL`, and optionally `CODEX_API_KEY_ENV`.
+3. Under **Account → API keys & tokens**, add the variable named by `CODEX_API_KEY_ENV` with the secret as its value.
+4. Select the custom Environment when creating a worker. For an existing worker, assign the Environment and rebuild it.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+CODEX_MODEL="your-model-id-or-stable-alias"
+CODEX_BASE_URL="https://api.example.com/v1"
+CODEX_API_KEY_ENV="CUSTOM_CODEX_API_KEY"
+
+install -d -m 700 "$HOME/.codex"
+
+tmp_file=$(mktemp "$HOME/.codex/config.toml.XXXXXX")
+trap 'rm -f "$tmp_file"' EXIT
+
+cat > "$tmp_file" <<EOF
+model = "$CODEX_MODEL"
+model_provider = "custom_endpoint"
+
+# Enable only when the endpoint supports the Responses API hosted web-search tool.
+web_search = "disabled"
+
+[model_providers.custom_endpoint]
+name = "Custom OpenAI-compatible endpoint"
+base_url = "$CODEX_BASE_URL"
+env_key = "$CODEX_API_KEY_ENV"
+wire_api = "responses"
+request_max_retries = 4
+stream_idle_timeout_ms = 300000
+
+[projects."/workspace"]
+trust_level = "trusted"
+
+[mcp_servers.playwright]
+command = "npx"
+args = ["-y", "@playwright/mcp@latest"]
+
+[mcp_servers.chrome-devtools]
+command = "npx"
+args = ["-y", "chrome-devtools-mcp@latest"]
+EOF
+
+chmod 600 "$tmp_file"
+mv "$tmp_file" "$HOME/.codex/config.toml"
+trap - EXIT
+```
+
+The endpoint must support `/v1/responses`, streaming response events, and tool calls; a Chat-Completions-only endpoint is not sufficient. Custom providers authenticated through `env_key` are not automatically populated from `/v1/models`, so configure a stable model ID or gateway alias. Set `web_search = "live"` only when the endpoint implements the hosted web-search tool; otherwise add a search MCP such as Tavily. For restricted-network Environments, add the endpoint hostname (and any MCP API hostname) to the allowed domains.
+
+> [!NOTE]
+> The setup script intentionally manages the complete Codex config on every worker start and retains Agentor's workspace trust plus Playwright and Chrome DevTools MCP defaults. Account variable changes require rebuilding existing workers because container environment variables are fixed at creation time.
+
 ---
 
 ## Storage
