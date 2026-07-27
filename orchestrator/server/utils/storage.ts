@@ -34,7 +34,7 @@ const CREDENTIAL_MOUNT_POINTS = [
 /** Relative directory paths inside a worker's agents directory that receive a
  * nested bind mount. Pre-creating them avoids Docker Desktop virtiofs treating
  * a missing directory target inconsistently with native Docker. */
-const SHARED_DIRECTORY_MOUNT_POINTS = [
+export const SHARED_DIRECTORY_MOUNT_POINTS = [
   '.kilo/config',
 ];
 

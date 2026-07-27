@@ -10,6 +10,7 @@ import type { PortMapping } from './port-mapping-store';
 import type { DomainMapping } from './domain-mapping-store';
 import type { RepoConfig, MountConfig } from '../../shared/types';
 import { AGENT_CREDENTIAL_MAPPINGS } from './user-credentials';
+import { SHARED_DIRECTORY_MOUNT_POINTS } from './storage';
 
 /** Bumped when the bundle layout changes incompatibly. */
 export const WORKER_EXPORT_VERSION = 1;
@@ -42,9 +43,7 @@ export const CREDENTIAL_EXCLUDE_SUFFIXES = AGENT_CREDENTIAL_MAPPINGS.map((m) =>
 
 /** Per-user directories bind-mounted inside the agents volume. Their contents
  * may contain secrets and belong to the account, not to one portable worker. */
-export const SHARED_DATA_EXCLUDE_PREFIXES = [
-  '.kilo/config',
-];
+export const SHARED_DATA_EXCLUDE_PREFIXES = [...SHARED_DIRECTORY_MOUNT_POINTS];
 
 /** File names inside the outer bundle tar. */
 export const BUNDLE_FILES = {
