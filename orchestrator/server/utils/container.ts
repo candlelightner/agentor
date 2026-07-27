@@ -13,7 +13,7 @@ import { zeroUserEnvVars } from './user-env-store';
 import {
   WORKER_EXPORT_VERSION, BUNDLE_FILES,
   EXPORT_WORKSPACE_PATH, EXPORT_AGENTS_PATH, RESTORE_WORKSPACE_PARENT, RESTORE_AGENTS_PARENT,
-  CREDENTIAL_EXCLUDE_SUFFIXES, writeManifest, writeGzipFile, writeFilteredAgentsGz, packBundle, extractBundle,
+  CREDENTIAL_EXCLUDE_SUFFIXES, SHARED_DATA_EXCLUDE_PREFIXES, writeManifest, writeGzipFile, writeFilteredAgentsGz, packBundle, extractBundle,
 } from './worker-export';
 import type { WorkerExportManifest } from './worker-export';
 import type { AppInstanceInfo, TmuxWindow } from '../../shared/types';
@@ -115,11 +115,19 @@ export class ContainerManager {
     }
     if (this.storageManager && userId) {
       await this.storageManager.ensureUserSshDir(userId);
+      await this.storageManager.ensureUserKiloConfigDir(userId);
       try {
         credentialBinds.push(this.storageManager.getSshAuthorizedKeysBind(userId));
       } catch (err) {
         useLogger().warn(
           `[container] unable to build ssh authorized_keys bind for user ${userId}: ${err instanceof Error ? err.message : err}`,
+        );
+      }
+      try {
+        credentialBinds.push(this.storageManager.getKiloConfigBind(userId));
+      } catch (err) {
+        useLogger().warn(
+          `[container] unable to build Kilo config bind for user ${userId}: ${err instanceof Error ? err.message : err}`,
         );
       }
     }
@@ -982,7 +990,12 @@ export class ContainerManager {
       files.push({ name: BUNDLE_FILES.workspace, path: join(tmpDir, BUNDLE_FILES.workspace) });
 
       const agSrc = await this.dockerService.getArchive(info.containerId, EXPORT_AGENTS_PATH);
-      await writeFilteredAgentsGz(agSrc, join(tmpDir, BUNDLE_FILES.agents), CREDENTIAL_EXCLUDE_SUFFIXES);
+      await writeFilteredAgentsGz(
+        agSrc,
+        join(tmpDir, BUNDLE_FILES.agents),
+        CREDENTIAL_EXCLUDE_SUFFIXES,
+        SHARED_DATA_EXCLUDE_PREFIXES,
+      );
       files.push({ name: BUNDLE_FILES.agents, path: join(tmpDir, BUNDLE_FILES.agents) });
 
       if (opts.includeRootfs) {

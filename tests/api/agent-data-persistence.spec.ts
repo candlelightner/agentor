@@ -51,6 +51,21 @@ test.describe.serial('Agent data persistence — mount verification', () => {
     expect(output).toContain('/home/agent/.agent-data/.agents');
   });
 
+  test('Kilo canonical XDG paths are symlinked to .agent-data/.kilo subdirs', async () => {
+    // The entrypoint symlinks each Kilo XDG path at the corresponding per-worker
+    // .agent-data/.kilo/<dir>. config is overlaid by the per-user shared bind,
+    // but the symlink target is still the .agent-data path (the bind mounts on
+    // top of the symlink-resolved directory).
+    const output = await execInWorker(
+      containerId,
+      'readlink ~/.config/kilo && readlink ~/.local/share/kilo && readlink ~/.local/state/kilo && readlink ~/.cache/kilo',
+    );
+    expect(output).toContain('/home/agent/.agent-data/.kilo/config');
+    expect(output).toContain('/home/agent/.agent-data/.kilo/data');
+    expect(output).toContain('/home/agent/.agent-data/.kilo/state');
+    expect(output).toContain('/home/agent/.agent-data/.kilo/cache');
+  });
+
   test('~/.claude.json is symlinked to .agent-data volume', async () => {
     const output = await execInWorker(containerId, 'readlink ~/.claude.json');
     expect(output).toContain('/home/agent/.agent-data/.claude.json');
@@ -60,14 +75,15 @@ test.describe.serial('Agent data persistence — mount verification', () => {
     // Each credential file is bind-mounted from <DATA_DIR>/users/<userId>/credentials/<file>.json
     // directly at the CLI's expected path inside the agent-data volume. Writes go straight
     // to the host file and every worker the user owns sees the same credentials.
+    // Kilo's auth.json is the newest member of this set (regular bind file, not a symlink).
     const output = await execInWorker(
       containerId,
-      'stat -c "%F" ~/.claude/.credentials.json ~/.codex/auth.json ~/.gemini/oauth_creds.json 2>/dev/null',
+      'stat -c "%F" ~/.claude/.credentials.json ~/.codex/auth.json ~/.gemini/oauth_creds.json ~/.local/share/kilo/auth.json 2>/dev/null',
     );
     // Terminal echoes the command line before the output, so line counting is
     // fragile — count occurrences of each file type in the buffer instead.
     const regularCount = (output.match(/regular file/g) ?? []).length;
-    expect(regularCount).toBe(3);
+    expect(regularCount).toBe(4);
     expect(output).not.toContain('symbolic link');
   });
 
@@ -152,6 +168,7 @@ test.describe.serial('Agent data persistence — mount verification', () => {
 test.describe.serial('Agent data persistence — restart', () => {
   let containerId: string;
   const MARKER = `restart-persist-${Date.now()}`;
+  const CS_MARKER = `restart-cs-${Date.now()}`;
 
   test.beforeAll(async ({ request }) => {
     const container = await createWorker(request, { displayName: `Restart-${Date.now()}` });
@@ -167,6 +184,17 @@ test.describe.serial('Agent data persistence — restart', () => {
     expect(output).toContain(MARKER);
   });
 
+  test('write code-server user-data marker to per-worker volume', async () => {
+    // code-server runs with --user-data-dir $AGENT_DATA/.code-server (the
+    // per-worker agent-data volume), so a marker written there must persist
+    // across restart like the agent config markers above.
+    const output = await execInWorker(
+      containerId,
+      `mkdir -p ~/.agent-data/.code-server/User && echo "${CS_MARKER}" > ~/.agent-data/.code-server/User/test-marker.txt && cat ~/.agent-data/.code-server/User/test-marker.txt`,
+    );
+    expect(output).toContain(CS_MARKER);
+  });
+
   test('marker file persists after container restart', async ({ request }) => {
     const api = new ApiClient(request);
     await api.stopContainer(containerId);
@@ -176,6 +204,20 @@ test.describe.serial('Agent data persistence — restart', () => {
 
     const output = await execInWorker(containerId, `cat ~/.claude/test-marker.txt`);
     expect(output).toContain(MARKER);
+  });
+
+  test('code-server user-data marker persists after container restart', async ({ request }) => {
+    const api = new ApiClient(request);
+    await api.stopContainer(containerId);
+    await new Promise(r => setTimeout(r, 2000));
+    await api.restartContainer(containerId);
+    await waitForWorkerRunning(request, containerId, 90_000);
+
+    const output = await execInWorker(
+      containerId,
+      `cat ~/.agent-data/.code-server/User/test-marker.txt`,
+    );
+    expect(output).toContain(CS_MARKER);
   });
 });
 

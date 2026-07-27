@@ -20,7 +20,7 @@ Automatic image update detection and per-image or bulk updates for production de
 
 ## Agent Usage Monitoring
 
-Polls agent usage APIs to show each user's remaining capacity in the sidebar. Works for OAuth-authenticated agents (per-user credential files at `<DATA_DIR>/users/<userId>/credentials/{claude,codex,gemini}.json`, or the per-user `CLAUDE_CODE_OAUTH_TOKEN` set in the Account modal). API key auth has no usage endpoints.
+Polls agent usage APIs to show each user's remaining capacity in the sidebar. Works for OAuth-authenticated agents (per-user credential files at `<DATA_DIR>/users/<userId>/credentials/{claude,codex,gemini,kilo}.json`, or the per-user `CLAUDE_CODE_OAUTH_TOKEN` set in the Account modal). API key auth has no usage endpoints. **Kilo is a fourth Account credential/reset row** (its per-user auth file is `credentials/kilo.json`), but it has **no usage-monitoring endpoint** and is not polled by `UsageChecker` — usage monitoring covers only Claude, Codex, and Gemini.
 
 **Architecture:**
 - `UsageChecker` (`usage-checker.ts`): Singleton + 5min polling. State is per-user — `Map<userId, Map<agentId, AgentState>>` — persisted to `usage.json` in the data directory. Each user's agents track their own fetch time and backoff independently. On restart, serves persisted results immediately; only re-fetches agents whose data is stale. Reads each user's credential files via `UserCredentialManager`, detects auth type per agent (OAuth > API key > none) per-user, fetches usage in parallel.
@@ -57,7 +57,7 @@ Download a complete, portable snapshot of a worker and restore it as a brand-new
 
 **Export** (`GET /api/containers/:id/export`, `ContainerManager.exportWorker`) streams a single `.tar` bundle, materialised to a temp dir then packed (sizes known, no buffering):
 - `manifest.json` — the worker's own config + the **embedded environment definition** + its port/domain mappings (so it restores where that environment doesn't exist).
-- `workspace.tar.gz`, `agents.tar.gz` — the two persistent volumes (the per-user OAuth credential files inside the agents dir are **stripped** so an export never leaks another user's tokens).
+- `workspace.tar.gz`, `agents.tar.gz` — the two persistent volumes (per-user OAuth credential files and the shared Kilo config directory inside the agents dir are **stripped** so an export never leaks account-level secrets/configuration).
 - `rootfs.tar.gz` — a `docker export` of the container filesystem (captures non-volume changes). Included by default; `?includeRootfs=false` omits it (much smaller/faster — used by the test suite).
 
 **Import** (`POST /api/containers/import`, raw `.tar` body streamed to disk, `ContainerManager.importWorker`): mints a fresh UUID worker, resolves/recreates the environment, `docker import`s the rootfs into a per-worker image (`agentor-import-<id>`, replicating the standard image's entrypoint/env so it boots — falls back to the standard image on any failure), creates the container **stopped**, restores the volumes via `putArchive`, starts it, then recreates the mappings (skipping conflicts / base domains not configured locally). The per-worker image link (`importedImage` on the `WorkerRecord`) survives rebuild/unarchive and is removed on permanent delete.

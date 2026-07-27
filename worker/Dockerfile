@@ -170,6 +170,14 @@ EXPOSE 6080 8443
 
 USER agent
 
+# Kilo Code (pinned Open VSX extension, installed into code-server's image-level
+# extension directory as the runtime user)
+ARG KILO_CODE_VERSION=7.4.16
+RUN code-server --extensions-dir /home/agent/.local/share/code-server/extensions \
+    --install-extension "kilocode.kilo-code@${KILO_CODE_VERSION}" && \
+    code-server --extensions-dir /home/agent/.local/share/code-server/extensions \
+    --list-extensions --show-versions | grep -Fx "kilocode.kilo-code@${KILO_CODE_VERSION}"
+
 # Agent CLIs (installed as agent user so auto-updates work)
 RUN curl -fsSL https://claude.ai/install.sh | bash
 RUN npm config set prefix ~/.local && npm install -g @openai/codex @google/gemini-cli

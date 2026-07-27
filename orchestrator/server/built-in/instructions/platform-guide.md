@@ -40,7 +40,7 @@ The orchestrator also exposes session-authenticated routes under `$ORCHESTRATOR_
 ### Installed tools
 
 - **Languages:** Node.js 22 LTS (npm, npx), Python 3 (pip), build-essential (gcc, make)
-- **Editors:** neovim, vim, nano, plus VS Code in the browser (code-server) and a VS Code Tunnel app for connecting from a local VS Code via Microsoft's Remote - Tunnels
+- **Editors:** neovim, vim, nano, plus VS Code in the browser (code-server, with the Kilo Code extension `kilocode.kilo-code@7.4.16` preinstalled in the image-level extension directory) and a VS Code Tunnel app for connecting from a local VS Code via Microsoft's Remote - Tunnels
 - **VCS:** git (pre-configured with the operator's name and email — agent-authored commits add a `Co-authored-by` trailer), gh (GitHub CLI)
 - **Search:** ripgrep (rg), fd-find (fd)
 - **Terminal:** tmux (your session is named `main` — you're already inside it)
@@ -72,10 +72,10 @@ Network access depends on your environment's configuration. Some environments al
 
 Three things survive container restarts, rebuilds, and archive/unarchive cycles:
 - Your `/workspace` directory
-- Your agent configuration (under `~/.claude`, `~/.codex`, `~/.gemini`, `~/.agents`, `~/.claude.json`, `~/.vscode` — symlinked from a persistent volume)
+- Your agent configuration (under `~/.claude`, `~/.codex`, `~/.gemini`, `~/.agents`, `~/.claude.json`, `~/.vscode`, and the Kilo XDG paths `~/.config/kilo`, `~/.local/share/kilo`, `~/.local/state/kilo`, `~/.cache/kilo` — symlinked from a persistent volume)
 - DinD data (when Docker is enabled)
 
-OAuth credential files for Claude / Codex / Gemini are bind-mounted from the operator's per-user host storage — logging in once with any agent CLI propagates the token to every worker that user owns.
+OAuth credential files for Claude / Codex / Gemini / Kilo are bind-mounted from the operator's per-user host storage — logging in once with any agent CLI propagates the token to every worker that user owns. Kilo's global config (`~/.config/kilo`) is also shared per user across all that user's workers (bind-mounted from `<DATA_DIR>/users/<userId>/kilo/config`); Kilo session DB/data beyond auth, plus code-server user/UI state, stay per-worker in `.agent-data` and are not shared across workers.
 
 A permanent `delete` (not `archive`) wipes `/workspace` and the agent config volume. Archive keeps both intact for unarchiving later.
 

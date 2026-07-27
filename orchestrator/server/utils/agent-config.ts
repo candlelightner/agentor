@@ -49,6 +49,15 @@ const AGENT_CONFIGS: AgentConfig[] = [
     ],
   },
   {
+    id: 'kilo',
+    displayName: 'Kilo Code',
+    apiDomains: [
+      'api.kilo.ai',
+      'app.kilo.ai',
+      'kilo.ai',
+    ],
+  },
+  {
     // Matches the app registry id (`apps.ts` → `vscode`) so the same component
     // isn't referred to by two different identifiers across files.
     id: 'vscode',

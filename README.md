@@ -1,6 +1,6 @@
 # Agentor: Agent Orchestrator
 
-[![Build and Push Docker Images](https://github.com/lonetis/agentor/actions/workflows/docker-build.yml/badge.svg?branch=main)](https://github.com/lonetis/agentor/actions/workflows/docker-build.yml)
+[![Build and Push Docker Images](https://github.com/candlelightner/agentor/actions/workflows/docker-build.yml/badge.svg?branch=main)](https://github.com/candlelightner/agentor/actions/workflows/docker-build.yml)
 
 Self-hosted alternative to Claude Code Web, Codex in the Cloud, and similar managed agent environments. Spawns isolated AI coding agent workers in Docker containers, each with a live terminal, VS Code editor (browser + native tunnel), virtual desktop, TCP port + domain mapping, and GitHub integration, all managed through a web dashboard. Full control over the runtime environment.
 
@@ -20,7 +20,7 @@ All agents are installed in a single unified worker image. Start any agent via i
 
 - **User authentication & RBAC** — email/password/passkey login powered by [better-auth](https://www.better-auth.com/) with admin and user roles; admins create and manage other users, each user sees only their own workers/mappings/environments/etc. First-run setup creates the initial admin.
 - **Live terminal** — xterm.js WebSocket terminal with tmux session management
-- **VS Code editor** — code-server (VS Code in the browser) per worker, accessible in a split pane
+- **VS Code editor** — code-server (VS Code in the browser) per worker, with Kilo Code preinstalled and per-user config/auth shared across that user's workers
 - **Virtual desktop** — Xvfb + fluxbox + noVNC, accessible in-browser
 - **Multi-repo cloning** — clone one or more git repos into each worker at startup
 - **App system** — launch Chromium (with CDP), SOCKS5 proxy, VS Code Tunnel (native VS Code client via Microsoft's relay, GitHub device-code auth), or OpenSSH server (port 22, public-key auth from each user's Account settings; Start auto-allocates an external `22xxx` port mapping) from the Apps pane
@@ -46,7 +46,7 @@ All agents are installed in a single unified worker image. Start any agent via i
 No need to clone the repo — all images are pulled from GHCR.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lonetis/agentor/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/candlelightner/agentor/main/install.sh | bash
 ```
 
 This downloads `docker-compose.yml` and `.env` into the current directory. Then:
@@ -108,7 +108,7 @@ docker compose -f docker-compose.prod.yml up -d
 Open **http://localhost:3000**
 
 > [!NOTE]
-> The production compose file sets `WORKER_IMAGE_PREFIX=ghcr.io/lonetis/` so the orchestrator pulls worker images from GHCR automatically. Docker will pull images on first container creation.
+> The production compose file sets `WORKER_IMAGE_PREFIX=ghcr.io/candlelightner/` so the orchestrator pulls this fork's worker image from GHCR automatically. Docker will pull images on first container creation.
 
 > [!NOTE]
 > The Traefik reverse proxy (`agentor-traefik`) is managed automatically by the orchestrator and handles both port mappings and domain mappings on the same container. It is created when the first port/domain mapping is added (or the dashboard subdomain is configured) and removed when all of those are gone. Mapped ports are arbitrary — no fixed ranges — but `80`/`443` are reserved when domain routing is active.
@@ -132,7 +132,7 @@ Log in once inside any of your workers — the agent CLI writes its OAuth token 
 > [!IMPORTANT]
 > OAuth refresh tokens rotate on use. **Always** log in inside a worker — never copy tokens from your local machine, or both copies will desync and break authentication on both sides.
 
-Tokens live at `<DATA_DIR>/users/<your-user-id>/credentials/{claude,codex,gemini}.json`. To force a fresh login, click **Reset** next to the agent in **Account → Agent OAuth credentials**.
+Tokens live at `<DATA_DIR>/users/<your-user-id>/credentials/{claude,codex,gemini,kilo}.json`. To force a fresh login, click **Reset** next to the agent in **Account → Agent OAuth credentials**. (Kilo is a fourth Account credential row; it has no usage monitoring and no separately installed Kilo CLI — the Kilo Code experience is delivered via the `kilocode.kilo-code@7.4.16` code-server extension preinstalled in the worker image.)
 
 ### API keys
 

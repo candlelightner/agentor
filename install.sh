@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-REPO="lonetis/agentor"
+REPO="candlelightner/agentor"
 BRANCH="main"
 BASE="https://raw.githubusercontent.com/$REPO/$BRANCH"
 

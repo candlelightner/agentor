@@ -59,7 +59,7 @@
 - `orchestrator/server/utils/worker-export.ts` - Worker export/import helpers (WorkerExportManifest type, tar bundle pack/extract, credential-stripping agents-tar filter)
 - `orchestrator/server/utils/environments.ts` - EnvironmentStore class, network mode types, package manager domains list
 - `orchestrator/server/utils/worker-store.ts` - WorkerStore class (persistent worker metadata for archive/unarchive)
-- `orchestrator/server/utils/user-credentials.ts` - UserCredentialManager class (per-user OAuth credential files at `<DATA_DIR>/users/<userId>/credentials/{claude,codex,gemini}.json`, ensures dirs/files, generates per-user bind strings, statusList + reset) + AGENT_CREDENTIAL_MAPPINGS registry
+- `orchestrator/server/utils/user-credentials.ts` - UserCredentialManager class (per-user OAuth credential files at `<DATA_DIR>/users/<userId>/credentials/{claude,codex,gemini,kilo}.json`, ensures dirs/files, generates per-user bind strings, statusList + reset) + AGENT_CREDENTIAL_MAPPINGS registry
 - `orchestrator/server/utils/user-env-store.ts` - UserEnvVarStore class (one file per user at `<DATA_DIR>/users/<userId>/env-vars.json` holding a uniform `envVars: [{ key, value }]` list — no hardcoded fields and no SSH handling; provides the `renderUserEnvVars` helper and a `getUserEnvVar(env, key)` lookup used e.g. for the GitHub token)
 - `orchestrator/server/utils/user-scoped-store.ts` - UserScopedJsonStore<K, V> base class. Loads from `<DATA_DIR>/users/*/<filename>` and keeps `Map<userId, Map<K, V>>` in memory; each user's file is persisted independently. Used by WorkerStore, PortMappingStore, DomainMappingStore, and the user half of the built-in-plus-user stores (Environments, Capabilities, Instructions, InitScripts).
 - `orchestrator/server/utils/defaults-store.ts` - DefaultsStore<V> base class. Single-file JSON store at `<DATA_DIR>/defaults/<filename>` holding built-in, platform-seeded entries. Written by `seedBuiltIns()`; never mutated by user-facing APIs.
@@ -194,7 +194,7 @@
 - `tests/helpers/ui-helpers.ts` - Page navigation and interaction helpers
 - `tests/helpers/test-users.ts` - Create/sign-in/delete test users via the admin API (used by passkey + authorization tests)
 - `tests/helpers/webauthn.ts` - Install/dispose Chrome DevTools virtual WebAuthn authenticator for end-to-end passkey tests (`installVirtualAuthenticator(page)`)
-- `tests/api/*.spec.ts` - API integration tests (56 files; incl. worker-metrics, worker-export-import, github-repos)
-- `tests/ui/*.spec.ts` - UI integration tests (43 files; incl. worker-card-actions, import-worker-modal, github-autocomplete-refresh)
+- `tests/api/*.spec.ts` - API integration tests (58 files; incl. worker-metrics, worker-export-import, github-repos, kilo-code)
+- `tests/ui/*.spec.ts` - UI integration tests (44 files; incl. worker-card-actions, import-worker-modal, github-autocomplete-refresh)
 - `tests/FEATURES.md` - Feature inventory driving test coverage
 - `tests/TESTS.md` - Test suite documentation with counts per file

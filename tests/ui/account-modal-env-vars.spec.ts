@@ -56,16 +56,22 @@ test.describe('Account modal — env vars', () => {
       await expect(predefined.getByText(key, { exact: true })).toBeVisible();
     }
 
-    // Agent OAuth credentials section: 3 agents, all "Not logged in" for a fresh user.
+    // Agent OAuth credentials section: 4 agents (claude, codex, gemini, kilo),
+    // all "Not logged in" for a fresh user. The row label is the agentId with
+    // CSS `capitalize`, so `kilo` renders as "Kilo".
     const claude = page.locator('[data-testid="agent-cred-claude"]');
     const codex = page.locator('[data-testid="agent-cred-codex"]');
     const gemini = page.locator('[data-testid="agent-cred-gemini"]');
+    const kilo = page.locator('[data-testid="agent-cred-kilo"]');
     await expect(claude).toBeVisible();
     await expect(codex).toBeVisible();
     await expect(gemini).toBeVisible();
+    await expect(kilo).toBeVisible();
     await expect(claude).toContainText(/Not logged in/i);
     await expect(codex).toContainText(/Not logged in/i);
     await expect(gemini).toContainText(/Not logged in/i);
+    await expect(kilo).toContainText(/Not logged in/i);
+    await expect(kilo).toContainText('Kilo');
   });
 
   test('saves a predefined env var and persists across reload of the modal', async ({ page, context }) => {

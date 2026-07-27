@@ -30,7 +30,7 @@ User-owned resources carry a `userId` field populated from the authenticated ses
 | Custom init scripts | `users/<userId>/init-scripts.json` | `InitScript.userId` |
 | Env vars | `users/<userId>/env-vars.json` | file path is the owner id |
 | Usage state | `users/<userId>/usage.json` | file path is the owner id |
-| OAuth credentials | `users/<userId>/credentials/{claude,codex,gemini}.json` | file path is the owner id |
+| OAuth credentials | `users/<userId>/credentials/{claude,codex,gemini,kilo}.json` | file path is the owner id |
 | Worker workspace (dir mode) | `users/<userId>/workspaces/<name>/` | owned by the worker |
 | Worker agent data (dir mode) | `users/<userId>/agents/<name>/` | owned by the worker |
 
@@ -38,7 +38,23 @@ Built-in, platform-seeded resources live separately at `<DATA_DIR>/defaults/{env
 
 List endpoints merge the `defaults/` store and the caller's per-user store: admins see every user's data plus built-ins, regular users see their own rows plus `userId === null`. Single-resource endpoints (GET/PUT/DELETE) verify ownership (`user.id === resource.userId` or admin role) and return 403 for unauthorized access.
 
-A background orphan sweeper (`server/utils/orphan-sweeper.ts`) runs at startup and every 10 minutes: it reads the auth DB's `user` table and, for any candidate `userId` present in any per-user store whose row is no longer in the auth DB, drops that user from every in-memory store and recursively removes `<DATA_DIR>/users/<userId>/` — taking workspaces, agent dirs, credentials, and every per-user JSON file with it.
+### Kilo Code credentials (fourth Account row)
+
+Kilo Code is a fourth Account credential/reset row alongside Claude/Codex/Gemini, but with two deliberate limitations:
+
+- **No usage monitoring.** The orchestrator's agent usage monitoring (see @docs/production.md) covers only Claude, Codex, and Gemini — Kilo has no usage endpoint and is not polled by `UsageChecker`. Do not imply Kilo usage monitoring.
+- **No separately installed Kilo CLI.** The worker image does not install a standalone Kilo CLI; the Kilo Code experience is delivered via the code-server extension (`kilocode.kilo-code@7.4.16`) preinstalled in the image-level extension directory. The orchestrator only manages Kilo's shared config/auth files.
+
+Per-user Kilo paths:
+
+| Resource | Storage | Scope |
+|----------|---------|-------|
+| Kilo OAuth auth | `users/<userId>/credentials/kilo.json` | per user — bind-mounted into every one of that user's workers (canonical in-worker path `~/.local/share/kilo/auth.json`); shared across all that user's workers/new workers |
+| Kilo global config | `users/<userId>/kilo/config` | per user — bind-mounted over `.agent-data/.kilo/config` (surfaces at `~/.config/kilo`); shared across all that user's workers/new workers |
+| Kilo session DB/data beyond auth | `agents/<id>/.kilo/{state,cache,…}` (per-worker `.agent-data`) | per worker — survives restart/rebuild/archive; NOT shared across workers and no shared SQLite/session state is implied |
+| code-server user/UI state | `agents/<id>/.code-server` (per-worker `.agent-data`) | per worker — survives restart/rebuild/archive; NOT shared across workers |
+
+A background orphan sweeper (`server/utils/orphan-sweeper.ts`) runs at startup and every 10 minutes: it reads the auth DB's `user` table and, for any candidate `userId` present in any per-user store whose row is no longer in the auth DB, drops that user from every in-memory store and recursively removes `<DATA_DIR>/users/<userId>/` — taking workspaces, agent dirs, credentials, the per-user Kilo config dir, and every per-user JSON file with it.
 
 ## Architecture
 

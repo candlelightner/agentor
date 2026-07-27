@@ -2,6 +2,7 @@ import { test, expect, request as playwrightRequest } from '@playwright/test';
 import zlib from 'node:zlib';
 import { ApiClient } from '../helpers/api-client';
 import { createWorker, cleanupWorker, waitForWorkerRunning } from '../helpers/worker-lifecycle';
+import { TerminalWsClient } from '../helpers/terminal-ws';
 
 const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
 const UNAUTH_OPTS = {
@@ -9,6 +10,35 @@ const UNAUTH_OPTS = {
   extraHTTPHeaders: { Origin: BASE_URL },
   storageState: { cookies: [], origins: [] },
 };
+
+async function execInWorker(containerId: string, command: string): Promise<void> {
+  const ws = new TerminalWsClient(containerId);
+  try {
+    await ws.connect();
+    await ws.waitForOutput(/[\$#>]\s*$/, 30_000);
+    ws.clearBuffer();
+    const marker = `END_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    ws.sendLine(`${command}; echo ${marker}`);
+    await ws.waitForOutput(new RegExp(`\\n${marker}\\n`), 30_000);
+  } finally {
+    ws.close();
+  }
+}
+
+function readTarEntry(archive: Buffer, wantedName: string): Buffer {
+  let offset = 0;
+  while (offset + 512 <= archive.length) {
+    const header = archive.subarray(offset, offset + 512);
+    const name = header.subarray(0, 100).toString('utf8').replace(/\0.*$/, '');
+    if (!name) break;
+    const sizeText = header.subarray(124, 136).toString('ascii').replace(/\0.*$/, '').trim();
+    const size = parseInt(sizeText || '0', 8);
+    const dataStart = offset + 512;
+    if (name === wantedName) return archive.subarray(dataStart, dataStart + size);
+    offset = dataStart + Math.ceil(size / 512) * 512;
+  }
+  throw new Error(`Tar entry not found: ${wantedName}`);
+}
 
 test.describe('Worker export', () => {
   let workerId: string;
@@ -37,6 +67,27 @@ test.describe('Worker export', () => {
     expect(text).toContain('agents.tar.gz');
     // includeRootfs=false omits the filesystem snapshot.
     expect(text).not.toContain('rootfs.tar.gz');
+  });
+
+  test('export strips shared Kilo config while retaining per-worker Kilo data', async ({ request }) => {
+    const secretMarker = `KILO_SHARED_SECRET_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const stateMarker = `KILO_WORKER_STATE_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    try {
+      await execInWorker(
+        workerId,
+        `mkdir -p ~/.config/kilo ~/.local/state/kilo && printf '%s' '${secretMarker}' > ~/.config/kilo/export-secret.json && printf '%s' '${stateMarker}' > ~/.local/state/kilo/export-state.txt`,
+      );
+      const api = new ApiClient(request);
+      const exported = await api.exportWorker(workerId, false);
+      expect(exported.status).toBe(200);
+      const agentsGz = readTarEntry(Buffer.from(exported.body), 'agents.tar.gz');
+      const agentsTar = zlib.gunzipSync(agentsGz).toString('latin1');
+      expect(agentsTar).toContain(stateMarker);
+      expect(agentsTar).not.toContain(secretMarker);
+      expect(agentsTar).not.toContain('.kilo/config/export-secret.json');
+    } finally {
+      await execInWorker(workerId, 'rm -f ~/.config/kilo/export-secret.json ~/.local/state/kilo/export-state.txt').catch(() => {});
+    }
   });
 
   test('export 404 for an unknown worker', async ({ request }) => {

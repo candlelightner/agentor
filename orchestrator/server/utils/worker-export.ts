@@ -40,6 +40,12 @@ export const CREDENTIAL_EXCLUDE_SUFFIXES = AGENT_CREDENTIAL_MAPPINGS.map((m) =>
     : m.containerPath,
 );
 
+/** Per-user directories bind-mounted inside the agents volume. Their contents
+ * may contain secrets and belong to the account, not to one portable worker. */
+export const SHARED_DATA_EXCLUDE_PREFIXES = [
+  '.kilo/config',
+];
+
 /** File names inside the outer bundle tar. */
 export const BUNDLE_FILES = {
   manifest: 'manifest.json',
@@ -81,18 +87,24 @@ export async function writeGzipFile(src: NodeJS.ReadableStream, dest: string): P
   return (await stat(dest)).size;
 }
 
-/** Re-pack an agents tar, dropping per-user credential files, then gzip to a
+/** Re-pack an agents tar, dropping per-user files/directories, then gzip to a
  * file. Returns the written size. */
 export async function writeFilteredAgentsGz(
   src: NodeJS.ReadableStream,
   dest: string,
   excludeSuffixes: string[],
+  excludePrefixes: string[] = [],
 ): Promise<number> {
   const extract = tar.extract();
   const pack = tar.pack();
 
   extract.on('entry', (header, stream, next) => {
-    if (excludeSuffixes.some((s) => header.name.endsWith(s))) {
+    const relativeName = header.name
+      .replace(/^\.?\//, '')
+      .replace(/^\.agent-data\/?/, '');
+    const excluded = excludeSuffixes.some((s) => relativeName.endsWith(s))
+      || excludePrefixes.some((prefix) => relativeName === prefix || relativeName.startsWith(`${prefix}/`));
+    if (excluded) {
       stream.on('end', next);
       stream.resume();
       return;

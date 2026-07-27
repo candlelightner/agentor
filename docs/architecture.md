@@ -76,9 +76,12 @@ Switch modes by changing one line in the compose file — no env vars needed. `S
     ├── credentials/
     │   ├── claude.json             ← bind-mounted into every worker this user owns
     │   ├── codex.json
-    │   └── gemini.json
+    │   ├── gemini.json
+    │   └── kilo.json               ← Kilo OAuth auth (4th Account credential row)
+    ├── kilo/
+    │   └── config/                 ← per-user Kilo global config, bind-mounted into every worker this user owns (shared across all that user's workers)
     ├── workspaces/<id>/            ← per-worker workspace (directory mode, keyed by the worker UUID)
-    └── agents/<id>/                 ← per-worker agent config (`.claude`, `.gemini`, `.codex`, `.agents`, `.claude.json`)
+    └── agents/<id>/                 ← per-worker agent config (`.claude`, `.gemini`, `.codex`, `.agents`, `.claude.json`, `.kilo`, `.code-server`)
 ```
 
 Every user-scoped store writes to `users/<userId>/<file>.json`. Built-in, platform-seeded entries (default environment, built-in capabilities / instructions / init scripts) are re-seeded to `defaults/<file>.json` on every startup from `orchestrator/server/built-in/`. The source filename (without extension) is the entry's `name`; its `id` is a **stable UUID deterministically derived from that slug** (RFC 4122 v5, via `builtInId()` in `built-in-content.ts`) — constant across the every-startup re-seed, so stored references (a worker's `environmentId`, an environment's `enabledCapabilityIds`) survive. User customs carry the owner's `userId` and a random UUID id; built-ins carry `userId: null`. The public `list()` on each store merges both views.
@@ -92,11 +95,12 @@ DinD data always uses Docker named volumes (`<containerName>-docker`) regardless
 | Data (Traefik) | `<volumeName>:/data:ro` | `<hostPath>:/data:ro` |
 | Worker workspace | `<containerName>-workspace:/workspace` | `<hostPath>/users/<userId>/workspaces/<id>:/workspace` |
 | Worker agents | `<containerName>-agents:/home/agent/.agent-data` | `<hostPath>/users/<userId>/agents/<id>:/home/agent/.agent-data` |
-| Worker per-user creds (×3) | `<dataHostPath>/users/<userId>/credentials/{claude,codex,gemini}.json:/home/agent/.agent-data/{.claude/.credentials.json,.codex/auth.json,.gemini/oauth_creds.json}` | same, with `<hostPath>` in front of `/users/...`. Directory mode pre-creates these mountpoints on the host so Docker Desktop's virtiofs accepts the nested file bind. |
+| Worker per-user creds (×4) | `<dataHostPath>/users/<userId>/credentials/{claude,codex,gemini,kilo}.json:/home/agent/.agent-data/{.claude/.credentials.json,.codex/auth.json,.gemini/oauth_creds.json,.kilo/data/auth.json}` | same, with `<hostPath>` in front of `/users/...`. Directory mode pre-creates these mountpoints on the host so Docker Desktop's virtiofs accepts the nested file bind. |
+| Worker per-user Kilo config | `<dataHostPath>/users/<userId>/kilo/config:/home/agent/.agent-data/.kilo/config` | same, with `<hostPath>` in front of `/users/...`. Shared per user across all that user's workers (surfaces at `~/.config/kilo` via symlink). |
 | Worker DinD | `<containerName>-docker:/var/lib/docker` | `<containerName>-docker:/var/lib/docker` (always named volume) |
 | Traefik certs | `agentor-traefik-certs:/letsencrypt` | `<hostPath>/traefik-certs:/letsencrypt` |
 
-`<dataHostPath>` is resolved by `StorageManager` at startup via Docker self-inspection (in volume mode, Docker reports the volume's `_data` directory as the mount source). Only the worker owner's three credential files are bind-mounted into each container — different users' credentials are never visible to one another.
+`<dataHostPath>` is resolved by `StorageManager` at startup via Docker self-inspection (in volume mode, Docker reports the volume's `_data` directory as the mount source). Only the worker owner's four credential files (claude/codex/gemini/kilo) and the per-user Kilo config directory are bind-mounted into each container — different users' credentials/config are never visible to one another.
 
 ### Cleanup
 
@@ -124,13 +128,13 @@ Port and domain mappings are keyed by the stable `containerName`, so they surviv
 
 ### Export / Import
 
-A worker can be **exported** to a single portable `.tar` bundle (`ContainerManager.exportWorker`) — `manifest.json` (the worker's config + embedded environment definition + its port/domain mappings), `workspace.tar.gz`, `agents.tar.gz` (with the per-user OAuth credential files stripped), and optionally `rootfs.tar.gz` (a `docker export` of the container filesystem). **Import** (`ContainerManager.importWorker`) restores the bundle as a brand-new worker (fresh UUID): it resolves/recreates the environment, `docker import`s the rootfs into a per-worker image (replicating the standard image's entrypoint/env; falls back to the standard image on failure), creates the container stopped, restores the two volumes via `putArchive`, starts it, and recreates the mappings. A worker restored with a captured filesystem stores its per-worker image reference in `WorkerRecord.importedImage` (the one Docker-image field that *is* persisted, since it is a per-worker config choice, not discoverable from a label) — reused across rebuild/unarchive and removed on permanent delete. See @docs/production.md for the full flow.
+A worker can be **exported** to a single portable `.tar` bundle (`ContainerManager.exportWorker`) — `manifest.json` (the worker's config + embedded environment definition + its port/domain mappings), `workspace.tar.gz`, `agents.tar.gz` (with per-user OAuth credential files and the shared Kilo config directory stripped), and optionally `rootfs.tar.gz` (a `docker export` of the container filesystem). **Import** (`ContainerManager.importWorker`) restores the bundle as a brand-new worker (fresh UUID): it resolves/recreates the environment, `docker import`s the rootfs into a per-worker image (replicating the standard image's entrypoint/env; falls back to the standard image on failure), creates the container stopped, restores the two volumes via `putArchive`, starts it, and recreates the mappings. A worker restored with a captured filesystem stores its per-worker image reference in `WorkerRecord.importedImage` (the one Docker-image field that *is* persisted, since it is a per-worker config choice, not discoverable from a label) — reused across rebuild/unarchive and removed on permanent delete. See @docs/production.md for the full flow.
 
 ### Workspace, Agents & DinD Storage
 
 Each worker gets persistent storage mounted at `/workspace`, `/home/agent/.agent-data`, and (when DinD is enabled) `/var/lib/docker`. In **volume mode**, these are Docker named volumes (`<containerName>-workspace`, `<containerName>-agents`, `<containerName>-docker`). In **directory mode**, workspace and agents live under the owner's user directory keyed by the worker UUID (`<dataDir>/users/<userId>/workspaces/<id>/`, `<dataDir>/users/<userId>/agents/<id>/`). All survive container stops, restarts, and archiving. On archive, only the container is removed — workspace, agents, and DinD data persist for unarchiving. On permanent delete, all are removed.
 
-The agents volume stores agent CLI configuration directories (`claude/`, `gemini/`, `codex/`, `agents/`, `claude.json`). The entrypoint symlinks these to their expected home directory paths (`~/.claude`, `~/.gemini`, `~/.codex`, `~/.agents`, `~/.claude.json`). This preserves MCP server configs, conversation history, auto-memory, installed plugins/extensions, custom commands, and other agent state across container lifecycle events. Credential files (OAuth tokens) are bind-mounted on top of the agents volume — Docker processes the volume mount first, then overlays the individual file bind mounts.
+The agents volume stores agent CLI configuration directories (`claude/`, `gemini/`, `codex/`, `agents/`, `claude.json/`, `kilo/`, `code-server/`). The entrypoint symlinks these to their expected home directory paths (`~/.claude`, `~/.gemini`, `~/.codex`, `~/.agents`, `~/.claude.json`, and the Kilo XDG paths `~/.config/kilo`, `~/.local/share/kilo`, `~/.local/state/kilo`, `~/.cache/kilo`). This preserves MCP server configs, conversation history, auto-memory, installed plugins/extensions, custom commands, and other agent state across container lifecycle events. Credential files (OAuth tokens) are bind-mounted on top of the agents volume — Docker processes the volume mount first, then overlays the individual file bind mounts. The per-user Kilo **config** directory (`<DATA_DIR>/users/<userId>/kilo/config`) is also bind-mounted over `.agent-data/.kilo/config` so the Kilo global config is shared per user across all their workers; Kilo session DB/data beyond auth, plus code-server user/UI state, stay per-worker in `.agent-data` and are NOT shared.
 
 ### WorkerStore
 

@@ -1,6 +1,6 @@
 services:
   orchestrator:
-    image: ghcr.io/lonetis/agentor-orchestrator:latest
+    image: ghcr.io/candlelightner/agentor-orchestrator:latest
     restart: unless-stopped
     container_name: agentor-orchestrator
     ports:
@@ -14,7 +14,7 @@ services:
       #   Volume mode (Docker named volume):  agentor-data:/data
       - ./data:/data
     environment:
-      - WORKER_IMAGE_PREFIX=ghcr.io/lonetis/
+      - WORKER_IMAGE_PREFIX=ghcr.io/candlelightner/
     env_file: .env
 
 networks:

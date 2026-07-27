@@ -92,14 +92,14 @@ Three-way color mode toggle (Default/White/Dark) in the sidebar header, powered 
 
 ## VS Code Editor (code-server)
 
-Browser-based VS Code editor integrated into each worker container via [code-server](https://github.com/coder/code-server). Runs on port 8443 with no authentication (`--auth none`), accessible through the orchestrator's HTTP/WebSocket proxy.
+Browser-based VS Code editor integrated into each worker container via [code-server](https://github.com/coder/code-server). Runs on port 8443 with no authentication (`--auth none`), accessible through the orchestrator's HTTP/WebSocket proxy. The worker image preinstalls the Kilo Code code-server extension (`kilocode.kilo-code`) pinned at **7.4.16** in the image-level extension directory (`/home/agent/.local/share/code-server/extensions`) — no per-worker manual install is needed, and existing workers only pick it up after the worker image is updated and they are rebuilt.
 
 **Architecture:**
 - `ServicePane.vue`: unified iframe-based pane for both desktop (noVNC) and editor (code-server), parameterized by endpoint, label, icon, and URL
 - `useContainerServiceStatus.ts`: polls service status endpoint for a container
 - `editor/[containerId]/index.ts`: Combined HTTP+WS handler for bare editor path (h3 `defineEventHandler({ handler, websocket })`)
 - `editor/[containerId]/[...path].ts`: Combined HTTP+WS handler for sub-paths (same pattern, strips `/editor/{id}` prefix for WS relay)
-- Worker entrypoint starts code-server in Phase 3b (after display stack, before git auth)
+- Worker entrypoint starts code-server in Phase 3b (after display stack, before git auth) with `--user-data-dir $AGENT_DATA/.code-server`, so code-server user/UI state is per-worker (lives in the `.agent-data` volume) and survives restart/rebuild/archive — it is NOT shared across same-user workers
 - Default workspace folder: `/workspace`
 
 ## UI State Persistence

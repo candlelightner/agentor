@@ -20,13 +20,14 @@ export const AGENT_CREDENTIAL_MAPPINGS: AgentCredentialMapping[] = [
   { agentId: 'claude', fileName: 'claude.json', containerPath: '/home/agent/.agent-data/.claude/.credentials.json' },
   { agentId: 'codex', fileName: 'codex.json', containerPath: '/home/agent/.agent-data/.codex/auth.json' },
   { agentId: 'gemini', fileName: 'gemini.json', containerPath: '/home/agent/.agent-data/.gemini/oauth_creds.json' },
+  { agentId: 'kilo', fileName: 'kilo.json', containerPath: '/home/agent/.agent-data/.kilo/data/auth.json' },
 ];
 
 const AGENT_UID = 1000;
 const AGENT_GID = 1000;
 
 /** Manages per-user OAuth credential files stored under
- * `<DATA_DIR>/users/<userId>/credentials/{claude,codex,gemini}.json` and
+ * `<DATA_DIR>/users/<userId>/credentials/{claude,codex,gemini,kilo}.json` and
  * bind-mounted into that user's workers. */
 export class UserCredentialManager {
   private storage: StorageManager;

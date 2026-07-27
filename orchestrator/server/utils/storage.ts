@@ -1,5 +1,5 @@
 import Docker from 'dockerode';
-import { mkdir, rm, chown, stat, writeFile, readFile } from 'node:fs/promises';
+import { mkdir, rm, chmod, chown, stat, writeFile, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { Config } from './config';
 
@@ -28,6 +28,14 @@ const CREDENTIAL_MOUNT_POINTS = [
   '.claude/.credentials.json',
   '.codex/auth.json',
   '.gemini/oauth_creds.json',
+  '.kilo/data/auth.json',
+];
+
+/** Relative directory paths inside a worker's agents directory that receive a
+ * nested bind mount. Pre-creating them avoids Docker Desktop virtiofs treating
+ * a missing directory target inconsistently with native Docker. */
+const SHARED_DIRECTORY_MOUNT_POINTS = [
+  '.kilo/config',
 ];
 
 export class StorageManager {
@@ -135,8 +143,8 @@ export class StorageManager {
   }
 
   /** Ensure workspace and agents directories exist with correct ownership,
-   * and pre-create the credential mountpoint files so Docker Desktop's virtiofs
-   * can layer per-user credential file binds on top (directory mode only). */
+   * and pre-create nested directory/file mountpoints so Docker Desktop's
+   * virtiofs can layer per-user binds on top (directory mode only). */
   async ensureWorkerDirs(userId: string, name: string): Promise<void> {
     if (this.mode !== 'directory') return;
 
@@ -153,6 +161,13 @@ export class StorageManager {
     const agentsDir = join(userDir, 'agents', name);
     await mkdir(agentsDir, { recursive: true, mode: 0o700 });
     await this.chownDir(agentsDir);
+
+    for (const relPath of SHARED_DIRECTORY_MOUNT_POINTS) {
+      const mountpoint = join(agentsDir, relPath);
+      await mkdir(mountpoint, { recursive: true, mode: 0o700 });
+      await chmod(mountpoint, 0o700);
+      await this.chownDir(mountpoint);
+    }
 
     for (const relPath of CREDENTIAL_MOUNT_POINTS) {
       const mountpoint = join(agentsDir, relPath);
@@ -194,6 +209,18 @@ export class StorageManager {
     }
   }
 
+  /** Ensure the per-user Kilo global-config directory exists and is writable by
+   * the worker's unprivileged agent user in both storage modes. */
+  async ensureUserKiloConfigDir(userId: string): Promise<void> {
+    const kiloDir = join(this.getUserDir(userId), 'kilo');
+    const configDir = join(kiloDir, 'config');
+    await mkdir(configDir, { recursive: true, mode: 0o700 });
+    await chmod(kiloDir, 0o700);
+    await chmod(configDir, 0o700);
+    await this.chownDir(kiloDir);
+    await this.chownDir(configDir);
+  }
+
   /** Read the user's `authorized_keys` content for the Account UI (the field is
    * 1:1 with this file). Returns '' if not configured. Trailing whitespace is
    * trimmed so the value round-trips with what the UI submitted. */
@@ -229,6 +256,15 @@ export class StorageManager {
     }
     const hostFile = join(this.getUserHostDir(userId), 'ssh', 'authorized_keys');
     return `${hostFile}:/home/agent/.ssh/authorized_keys:ro`;
+  }
+
+  /** Bind string for the user's writable Kilo global-config directory. */
+  getKiloConfigBind(userId: string): string {
+    if (!this.dataHostPath) {
+      throw new Error('[storage] dataHostPath not resolved — cannot build Kilo config bind');
+    }
+    const hostDir = join(this.getUserHostDir(userId), 'kilo', 'config');
+    return `${hostDir}:/home/agent/.agent-data/.kilo/config`;
   }
 
   /** In-container path of a user's private data directory (`/data/users/<userId>/`). */

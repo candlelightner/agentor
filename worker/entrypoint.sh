@@ -96,8 +96,12 @@ if [ -d "$AGENT_DATA" ]; then
     # Fix ownership (Docker may create subdirs as root for credential bind mounts)
     sudo chown -R agent:agent "$AGENT_DATA"
 
-    # Ensure subdirectories exist in the volume (named same as home dir targets)
-    mkdir -p "$AGENT_DATA"/{.claude,.gemini,.codex,.agents,.vscode}
+    # Ensure subdirectories exist in the per-worker volume. Kilo's config and
+    # auth file are overlaid by per-user bind mounts; its remaining data stays
+    # private to this worker.
+    mkdir -p "$AGENT_DATA"/{.claude,.gemini,.codex,.agents,.vscode,.code-server}
+    mkdir -p "$AGENT_DATA/.kilo"/{config,data,state,cache}
+    chmod 700 "$AGENT_DATA/.code-server" "$AGENT_DATA/.kilo" "$AGENT_DATA/.kilo"/{config,data,state,cache}
 
     # Symlink agent config dirs to persistent volume
     for dir in .claude .gemini .codex .agents .vscode; do
@@ -106,6 +110,23 @@ if [ -d "$AGENT_DATA" ]; then
             rm -rf "$target"
         fi
         ln -sfn "$AGENT_DATA/$dir" "$target"
+    done
+
+    # Kilo follows XDG paths. Point each canonical path at the corresponding
+    # per-worker directory (except config, which the orchestrator overlays with
+    # the user's shared global config directory).
+    for mapping in \
+        ".config/kilo:config" \
+        ".local/share/kilo:data" \
+        ".local/state/kilo:state" \
+        ".cache/kilo:cache"; do
+        target="/home/agent/${mapping%%:*}"
+        kilo_dir="${mapping#*:}"
+        mkdir -p "$(dirname "$target")"
+        if [ -e "$target" ] && [ ! -L "$target" ]; then
+            rm -rf "$target"
+        fi
+        ln -sfn "$AGENT_DATA/.kilo/$kilo_dir" "$target"
     done
 
     # ~/.claude.json (MCP servers, preferences — separate file outside ~/.claude/)
@@ -248,7 +269,10 @@ fi
 # ==========================================================================
 _step editor "Code editor"
 _log "Code-server: starting..."
-( code-server --auth none --bind-addr 0.0.0.0:8443 --disable-telemetry /workspace 2>&1 | stdbuf -oL -eL sed -u 's/^/[code-server] /' | tee -a /tmp/code-server.log ) &
+( code-server --auth none --bind-addr 0.0.0.0:8443 --disable-telemetry \
+    --user-data-dir "$AGENT_DATA/.code-server" \
+    --extensions-dir /home/agent/.local/share/code-server/extensions \
+    /workspace 2>&1 | stdbuf -oL -eL sed -u 's/^/[code-server] /' | tee -a /tmp/code-server.log ) &
 if wait_for_port 8443; then
     _done editor "Code editor"
     _log "Code-server: ready"
