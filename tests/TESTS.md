@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **~1510 tests** across 106 test files (~920 API across 60 files + ~590 UI across 46 files)
+- **~1511 tests** across 106 test files (~920 API across 60 files + ~591 UI across 46 files)
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -99,7 +99,7 @@ tests/
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
   api/                     # API endpoint tests (~920 tests across 60 files)
-  ui/                      # UI interaction tests (~590 tests across 46 files)
+  ui/                      # UI interaction tests (~591 tests across 46 files)
 ```
 
 ## Test Categories
@@ -169,7 +169,7 @@ tests/
 | `workspace-files.spec.ts` | 52 | Workspace file manager `/api/containers/:id/files/*` routes (running-worker only, session-auth + owner-scoped, no host-path access, execute as uid 1000 `agent`, lexical + in-container realpath/lstat containment): list (one-level, dirs-first; symlink `linkTarget`/`linkEscapes`; breadcrumbs/metadata), upload (multipart, relative folder paths, conflict overwrite vs `overwrite=false` 409, 100 MiB / 1000-entry caps → 413, tar entries uid/gid 1000), download (single raw file vs true ZIP for folder/multi, hidden files included, symlinks stored not followed, escaping symlinks rejected), mkdir (idempotent, `mkdir -p`, file-blocks-path 409, escaping-parent rejected), rename (same-parent, no-overwrite 409), move (into existing dir incl. root, full conflict list on `overwrite=false` 409, `overwrite=true` replaces files or directories, escaping symlinks rejected up front), delete (root blocked via `allowRoot:false`, missing paths idempotent, escaping symlinks rejected before any deletion), auth/ownership/running-state ordering (checks before body), traversal/`..`/absolute/backslash/NUL rejection, worker-self/worker-id resolution |
 | `clipboard.spec.ts` | 14 | `POST /api/containers/:id/clipboard` (set worker X11 CLIPBOARD): auth/ownership/running checks BEFORE body (401/403/404/409), 415 unsupported MIME (only `image/png` + `text/plain`), 400 empty body, 413 over 16 MiB image / 1 MiB text caps, 415 bad PNG signature/IHDR/dimensions, 415 invalid UTF-8 (fatal TextDecoder), 200 returns `{ ok, type, width?, height? }` and NEVER clipboard contents, text uses UTF8_STRING X target, helper failure mapped by exit code, cross-user 403, stopped worker 409 |
 
-### UI Tests (~590 tests, 46 files)
+### UI Tests (~591 tests, 46 files)
 
 | File | Tests | Coverage |
 |------|-------|----------|
@@ -218,7 +218,7 @@ tests/
 | `import-worker-modal.spec.ts` | 2 | Import Worker modal opens from the sidebar Import button with file + name inputs and a disabled Import button; choosing a `.tar` file enables Import and shows the file name |
 | `github-autocomplete-refresh.spec.ts` | 1 | Regression: saving env vars in the Account modal refetches `/api/git-providers` (so the repo autocomplete gate updates without a page reload); env-vars PUT is stubbed so no real account state is mutated |
 | `workspace-files-modal.spec.ts` | 39 | Workspace Files popup on a running worker card (optional, additive — existing quick Upload/Download/Export remain): opens via the Files button (tooltip "Files", `i-lucide-folder-tree`); breadcrumbs rooted at `/workspace`; one-level lazy browse (dirs-first, metadata/hidden/symlink warnings incl. escaping-symlink indicator); multi-select (per-dir, select-all, clear); upload (exact-current-directory multi-file/folder via FileDropZone Browse files/Browse folder, conflict overwrite confirm); download (direct single-file vs ZIP for folder/multi); mkdir; rename (same-parent, no-overwrite); move (incl. into root); confirmed delete; error/loading/stopped states (popup closed when worker stops); keyboard + mobile usability |
-| `clipboard-paste.spec.ts` | 7 | Keyboard-transparent Ctrl/Cmd+V bridge: terminal target swallows the key only when the async Clipboard API is available, POSTs image/png to `/api/containers/:id/clipboard` and replays raw Ctrl+V (`\x16`) so Codex/GUI apps read the synced X clipboard, pastes text through xterm's normal bracketed-paste path (no X clipboard hit); desktop noVNC sibling page uses `agentor.html` (upstream `vnc.html` untouched) and loads the `agentor-clipboard.js` module; unsupported/denied/error fall back to prior behaviour; no clipboard contents logged |
+| `clipboard-paste.spec.ts` | 8 | Keyboard-transparent Ctrl/Cmd+V bridge: terminal target uses the async Clipboard API when available and Firefox's `ClipboardEvent.clipboardData` image fallback otherwise, POSTs image/png to `/api/containers/:id/clipboard` and replays raw Ctrl+V (`\x16`) so Codex/GUI apps read the synced X clipboard, pastes text through xterm's normal bracketed-paste path (no X clipboard hit); desktop noVNC sibling page uses `agentor.html` (upstream `vnc.html` untouched) and loads the `agentor-clipboard.js` module; unsupported/denied/error fall back to prior behaviour; no clipboard contents logged |
 
 ## Design Decisions
 

@@ -159,6 +159,37 @@ export async function readClipboardForPaste(): Promise<ClipboardReadResult> {
   return { kind: 'error' };
 }
 
+/** Read a synchronous browser paste event. Firefox exposes clipboard images
+ * through ClipboardEvent.clipboardData even when navigator.clipboard.read() is
+ * unavailable. The event itself is the user gesture, so no permission prompt
+ * or asynchronous clipboard read is required. */
+export async function readDataTransferForPaste(data: DataTransfer): Promise<ClipboardReadResult> {
+  for (const item of Array.from(data.items)) {
+    if (item.kind !== 'file' || !item.type.startsWith('image/')) continue;
+    const blob = item.getAsFile();
+    if (!blob) continue;
+    if (item.type === 'image/png') {
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      if (bytes.length === 0 || bytes.length > MAX_IMAGE_BYTES) return { kind: 'error' };
+      const dims = parsePngDims(bytes);
+      if (!dims) return { kind: 'error' };
+      return { kind: 'image', bytes, width: dims.width, height: dims.height };
+    }
+    const png = await blobToPng(blob);
+    if (!png || png.length === 0 || png.length > MAX_IMAGE_BYTES) return { kind: 'error' };
+    const dims = parsePngDims(png);
+    if (!dims) return { kind: 'error' };
+    return { kind: 'image', bytes: png, width: dims.width, height: dims.height };
+  }
+
+  const text = data.getData('text/plain');
+  if (text !== '') {
+    if (new TextEncoder().encode(text).length > MAX_TEXT_BYTES) return { kind: 'error' };
+    return { kind: 'text', text };
+  }
+  return { kind: 'error' };
+}
+
 /** Parse PNG width/height from a Uint8Array (signature + IHDR). Returns null
  *  on any malformation. Mirrors the server-side validation. */
 function parsePngDims(buf: Uint8Array): { width: number; height: number } | null {
@@ -209,10 +240,10 @@ export function useClipboardPaste() {
    *  clipboard, POST any image to the worker X clipboard, and return a result
    *  the xterm caller acts on (replay raw Ctrl+V for image, paste text for
    *  text, replay original on unsupported/denied/error). Guarded per target. */
-  async function bridgeTerminalPaste(
+  async function bridgeTerminalRead(
     containerId: string,
+    read: ClipboardReadResult,
   ): Promise<{ replayCtrlV: boolean; text?: string }> {
-    const read = await readClipboardForPaste();
     if (read.kind === 'image') {
       try {
         await postClipboard(containerId, 'image/png', read.bytes);
@@ -234,6 +265,19 @@ export function useClipboardPaste() {
     return { replayCtrlV: true };
   }
 
+  async function bridgeTerminalPaste(
+    containerId: string,
+  ): Promise<{ replayCtrlV: boolean; text?: string }> {
+    return bridgeTerminalRead(containerId, await readClipboardForPaste());
+  }
+
+  async function bridgeTerminalPasteEvent(
+    containerId: string,
+    data: DataTransfer,
+  ): Promise<{ replayCtrlV: boolean; text?: string }> {
+    return bridgeTerminalRead(containerId, await readDataTransferForPaste(data));
+  }
+
   /** Run a paste flow under the per-target concurrency guard. */
   function runGuarded<T>(target: ClipboardTarget, fn: () => Promise<T>): Promise<T> {
     const existing = inflight.get(target);
@@ -251,6 +295,7 @@ export function useClipboardPaste() {
 
   return {
     bridgeTerminalPaste,
+    bridgeTerminalPasteEvent,
     runGuarded,
     isPasteInFlight,
     toastClipboardError,

@@ -120,6 +120,36 @@ test.describe.serial('Clipboard paste bridge — Agentor Terminal (xterm)', () =
     await expect(page.locator('.xterm')).toBeVisible();
   });
 
+  test('Firefox paste-event fallback POSTs an image when clipboard.read is unavailable', async ({ page, request }) => {
+    await openTerminal(page);
+    let posted = false;
+    await page.route(`**/api/containers/${containerId}/clipboard`, async (route) => {
+      posted = route.request().headers()['content-type']?.includes('image/png') === true;
+      await route.continue();
+    });
+
+    await page.evaluate((pngBase64) => {
+      Object.defineProperty(navigator.clipboard, 'read', { value: undefined, configurable: true });
+      const bytes = Uint8Array.from(atob(pngBase64), (c) => c.charCodeAt(0));
+      const file = new File([bytes], 'clipboard.png', { type: 'image/png' });
+      const transfer = new DataTransfer();
+      transfer.items.add(file);
+      const textarea = document.querySelector<HTMLTextAreaElement>('.xterm-helper-textarea');
+      if (!textarea) throw new Error('xterm helper textarea not found');
+      textarea.focus();
+      textarea.dispatchEvent(new ClipboardEvent('paste', {
+        clipboardData: transfer,
+        bubbles: true,
+        cancelable: true,
+      }));
+    }, PNG.toString('base64'));
+
+    await expect.poll(async () => posted, { timeout: 15_000 }).toBe(true);
+    const readBack = await readWorkerClipboard(request, containerId, 'image/png');
+    expect(readBack).not.toBeNull();
+    expect(readBack!.equals(PNG)).toBe(true);
+  });
+
   test('text Ctrl+V follows xterm text paste with no clipboard POST', async ({ page }) => {
     await openTerminal(page);
 

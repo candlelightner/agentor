@@ -581,7 +581,7 @@ Every pane type supports **multiple simultaneous instances**. Clicking the Termi
 - Auto-resize on container element resize (ResizeObserver)
 - Theme-reactive (dark/light mode switching)
 - Native text selection override (Mac: altKey, others: shiftKey)
-- **Keyboard-transparent clipboard paste** (§20b): Ctrl/Cmd+V is intercepted when the async Clipboard API is available; images are POSTed to the worker's X11 CLIPBOARD and the raw Ctrl+V (`\x16`) is replayed so Codex/GUI apps paste from the synced selection, text goes through xterm's normal bracketed-paste path, and unsupported/denied/error replays the original key.
+- **Keyboard-transparent clipboard paste** (§20b): Ctrl/Cmd+V uses the async Clipboard API when available and Firefox's synchronous paste-event image data otherwise; images are POSTed to the worker's X11 CLIPBOARD and the raw Ctrl+V (`\x16`) is replayed so Codex/GUI apps paste from the synced selection, text goes through xterm's normal bracketed-paste path, and unsupported/denied/error replays the original key.
 
 ### 17.2 Tmux Tab Bar (inner tab bar, 30px)
 - Per-window tab: name (max 120px, truncated) + close button (hidden for main window)
@@ -731,7 +731,7 @@ An optional, additive **Workspace Files** popup (`WorkspaceFilesModal.vue`) open
 A keyboard-transparent Ctrl/Cmd+V bridge lets the host browser clipboard reach GUI apps (and the agent CLI) inside a worker without the user leaving the keyboard. It works in the **Agentor Terminal** (xterm.js) and in the **noVNC Desktop** / **Persistent VS Code** viewer.
 
 ### 20b.1 Terminal target (Agentor Terminal)
-- On a real Ctrl/Cmd+V keydown, xterm's custom key handler **synchronously swallows the key only when the async Clipboard API is available** (so existing xterm-local paste still works where it isn't), then bridges asynchronously:
+- On a real Ctrl/Cmd+V keydown, xterm prefers `navigator.clipboard.read()`; where Firefox exposes images only through the native paste event, a capture-phase `ClipboardEvent.clipboardData` fallback synchronises the image before replay:
   - **Image** — reads the host clipboard, normalises non-PNG browser-decodable images to PNG, POSTs the raw bytes to `POST /api/containers/:id/clipboard`, then replays exactly one raw Ctrl+V (`\x16`) over the terminal WebSocket so Codex (and any GUI app reading the X clipboard) pastes the now-synced X11 CLIPBOARD.
   - **Text** — pasted through xterm's normal `term.paste()` / bracketed-paste path (does NOT hit the X clipboard in the terminal).
   - **Unsupported / denied / error** — replays the original Ctrl+V so existing behaviour is no worse.
@@ -750,7 +750,7 @@ A keyboard-transparent Ctrl/Cmd+V bridge lets the host browser clipboard reach G
 - **Ordering**: auth, ownership, and running-state checks run BEFORE the body is read (so an unauthenticated / non-owning / stopped-worker caller can never trigger body parsing or worker-side work).
 
 ### 20b.4 Requirements & fallback
-- Requires an **HTTPS secure context** + a modern Chromium/Firefox async Clipboard API (`navigator.clipboard.read()`). WebAuthn-style secure-context gating applies.
+- Requires an **HTTPS secure context** and either `navigator.clipboard.read()` or standard `ClipboardEvent.clipboardData` image items. Chromium uses the async API; Firefox can use the paste-event fallback.
 - Unsupported (no API) → the bridge lets the existing xterm-local / noVNC paste behaviour run. Denied (NotAllowedError/SecurityError) or error → the original key is replayed once so behaviour is no worse than before.
 - **Kilo / Codex are not patched** — the bridge only syncs the worker's X11 CLIPBOARD and replays the paste key; the agent reads the synced selection itself.
 

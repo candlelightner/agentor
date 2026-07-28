@@ -47,7 +47,7 @@ const LIGHT_THEME: ITheme = {
 export function useTerminal() {
   const colorMode = useColorMode();
   const activeTerminal = shallowRef<TerminalState | null>(null);
-  const { bridgeTerminalPaste, runGuarded, isPasteInFlight } = useClipboardPaste();
+  const { bridgeTerminalPaste, bridgeTerminalPasteEvent, runGuarded, isPasteInFlight } = useClipboardPaste();
 
   function getTheme(): ITheme {
     return colorMode.value === 'dark' ? DARK_THEME : LIGHT_THEME;
@@ -115,10 +115,12 @@ export function useTerminal() {
     for (const type of eventTypes) {
       containerEl.addEventListener(type, overrideKey, { capture: true });
     }
+    let pasteCleanup = () => {};
     const eventCleanup = () => {
       for (const type of eventTypes) {
         containerEl.removeEventListener(type, overrideKey, { capture: true });
       }
+      pasteCleanup();
     };
 
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -174,6 +176,34 @@ export function useTerminal() {
       term.write('\r\n\x1b[31m[Connection closed]\x1b[0m\r\n');
     };
 
+    let nativePastePending = false;
+    let nativePasteTimer: ReturnType<typeof setTimeout> | null = null;
+    const applyPasteResult = (res: { replayCtrlV: boolean; text?: string }) => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      if (res.replayCtrlV) ws.send('\x16');
+      else if (res.text !== undefined) term.paste(res.text);
+    };
+    const onNativePaste = (event: ClipboardEvent) => {
+      const data = event.clipboardData;
+      if (!data) return;
+      const hasImage = Array.from(data.items).some((item) => item.kind === 'file' && item.type.startsWith('image/'));
+      // Preserve xterm's native text paste unless this event follows a keydown
+      // we deliberately held while waiting for Firefox's paste event.
+      if (!hasImage && !nativePastePending) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      nativePastePending = false;
+      if (nativePasteTimer) clearTimeout(nativePasteTimer);
+      nativePasteTimer = null;
+      if (isPasteInFlight('terminal')) return;
+      runGuarded('terminal', () => bridgeTerminalPasteEvent(containerId, data)).then(applyPasteResult);
+    };
+    containerEl.addEventListener('paste', onNativePaste, { capture: true });
+    pasteCleanup = () => {
+      containerEl.removeEventListener('paste', onNativePaste, { capture: true });
+      if (nativePasteTimer) clearTimeout(nativePasteTimer);
+    };
+
     // Shift+Enter → send CSI u encoded Shift+Enter so agents (Claude Code,
     // Codex, etc.) can distinguish it from plain Enter and insert a newline.
     // tmux extended-keys (csi-u format) passes this through to the application.
@@ -202,19 +232,24 @@ export function useTerminal() {
       const isCtrlOrCmd = event.ctrlKey || event.metaKey;
       if (isPasteKey && isCtrlOrCmd && !event.altKey) {
         const hasClipboard = clipboardReadAvailable();
-        if (!hasClipboard) return true; // no API → let xterm paste locally
+        if (!hasClipboard) {
+          if (event.type === 'keydown') {
+            nativePastePending = true;
+            if (nativePasteTimer) clearTimeout(nativePasteTimer);
+            // If Firefox does not dispatch a paste event, preserve the old raw
+            // Ctrl+V behavior rather than swallowing the key indefinitely.
+            nativePasteTimer = setTimeout(() => {
+              nativePastePending = false;
+              if (ws.readyState === WebSocket.OPEN) ws.send('\x16');
+            }, 500);
+          }
+          return false;
+        }
         if (event.type === 'keydown') {
           if (isPasteInFlight('terminal')) return false;
           // Swallow synchronously, then bridge asynchronously. The bridge
           // decides whether to replay \x16 (image/denied/error) or paste text.
-          runGuarded('terminal', () => bridgeTerminalPaste(containerId)).then((res) => {
-            if (ws.readyState !== WebSocket.OPEN) return;
-            if (res.replayCtrlV) {
-              ws.send('\x16');
-            } else if (res.text !== undefined) {
-              term.paste(res.text);
-            }
-          });
+          runGuarded('terminal', () => bridgeTerminalPaste(containerId)).then(applyPasteResult);
         }
         return false;
       }

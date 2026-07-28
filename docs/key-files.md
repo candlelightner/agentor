@@ -216,6 +216,6 @@
 - `tests/helpers/test-users.ts` - Create/sign-in/delete test users via the admin API (used by passkey + authorization tests)
 - `tests/helpers/webauthn.ts` - Install/dispose Chrome DevTools virtual WebAuthn authenticator for end-to-end passkey tests (`installVirtualAuthenticator(page)`)
 - `tests/api/*.spec.ts` - API integration tests (60 files; incl. workspace-files, clipboard, worker-metrics, worker-export-import, github-repos, kilo-code — ~920 tests)
-- `tests/ui/*.spec.ts` - UI integration tests (46 files; incl. workspace-files-modal, clipboard-paste, worker-card-actions, import-worker-modal, github-autocomplete-refresh — ~590 tests)
+- `tests/ui/*.spec.ts` - UI integration tests (46 files; incl. workspace-files-modal, clipboard-paste, worker-card-actions, import-worker-modal, github-autocomplete-refresh — ~591 tests)
 - `tests/FEATURES.md` - Feature inventory driving test coverage
-- `tests/TESTS.md` - Test suite documentation with counts per file (~1510 total tests)
+- `tests/TESTS.md` - Test suite documentation with counts per file (~1511 total tests)
