@@ -617,10 +617,27 @@ export class DockerService {
     // Falls back to raw passthrough on stdout if the stream is not framed.
     container.modem.demuxStream(stream, stdout, stderr);
 
+    // docker-modem's demuxStream only forwards `data`; it does not close the
+    // destination streams when the Docker attach stream ends. Close them here
+    // so capture promises cannot wait forever after a successful exec.
+    let captureEnded = false;
+    const finishCapture = (err?: Error) => {
+      if (captureEnded) return;
+      captureEnded = true;
+      if (err) {
+        stdout.destroy(err);
+        stderr.destroy(err);
+      } else {
+        stdout.end();
+        stderr.end();
+      }
+    };
+    stream.once('end', () => finishCapture());
+    stream.once('close', () => finishCapture());
+    stream.once('error', (err) => finishCapture(err));
+
     if (opts.stdin) {
       stream.write(opts.stdin);
-    }
-    if (opts.stdin || (stream as any).writable) {
       try { stream.end(); } catch { /* already ended */ }
     }
 
@@ -633,18 +650,13 @@ export class DockerService {
       this.streamToBuffer(stdout),
       this.streamToBuffer(stderr),
     ]);
-    // Drain any trailing stream events before inspecting the exit code. The
-    // demuxer ends stdout/stderr when the underlying stream ends, but the
-    // exec's ExitCode is only finalised after the engine records completion.
-    await new Promise<void>((resolve) => {
-      const done = () => resolve();
-      stream.once('end', done);
-      stream.once('error', done);
-      // If the stream already ended (demux finished), resolve immediately.
-      if ((stream as any).readableEnded) resolve();
-    });
-
-    const info = await exec.inspect();
+    // Capture completion means the attach stream ended/closed. Docker normally
+    // records ExitCode synchronously, but allow a brief propagation window.
+    let info = await exec.inspect();
+    for (let attempt = 0; info.ExitCode == null && attempt < 20; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      info = await exec.inspect();
+    }
     return { stdout: stdoutBuf, stderr: stderrBuf, exitCode: info.ExitCode ?? 0 };
   }
 
