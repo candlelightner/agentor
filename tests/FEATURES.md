@@ -213,6 +213,7 @@ Every user-facing feature of the Agentor web dashboard, organized by category. T
 - Upload button (tooltip) — opens upload modal
 - Download button (tooltip) — downloads workspace as .tar.gz
 - Export button (tooltip "Export worker", icon `i-lucide-package`) — sits in the **workspace** group right next to Download Workspace (so running-only). While the bundle is being prepared it shows a spinner and is disabled (tooltip reads "Preparing export…"), then downloads a full worker export bundle (see §28)
+- Files button (tooltip "Files", icon `i-lucide-folder-tree`) — opens the optional **Workspace Files** popup (§20a). Additive: the existing quick Upload/Download/Export actions above remain unchanged.
 
 ### 4.2a Action row layout
 - All action buttons are **left-aligned** (no right-side spacer) and organised into logical groups separated by thin vertical divider lines: **views** (terminal/editor/desktop/apps) | **workspace** (upload/download/export) | **lifecycle** (settings/restart-or-stop/rebuild) | **destructive** (archive/remove). The views + workspace groups appear only when running; lifecycle + destructive are always present (no dangling leading/trailing dividers).
@@ -580,6 +581,7 @@ Every pane type supports **multiple simultaneous instances**. Clicking the Termi
 - Auto-resize on container element resize (ResizeObserver)
 - Theme-reactive (dark/light mode switching)
 - Native text selection override (Mac: altKey, others: shiftKey)
+- **Keyboard-transparent clipboard paste** (§20b): Ctrl/Cmd+V is intercepted when the async Clipboard API is available; images are POSTed to the worker's X11 CLIPBOARD and the raw Ctrl+V (`\x16`) is replayed so Codex/GUI apps paste from the synced selection, text goes through xterm's normal bracketed-paste path, and unsupported/denied/error replays the original key.
 
 ### 17.2 Tmux Tab Bar (inner tab bar, 30px)
 - Per-window tab: name (max 120px, truncated) + close button (hidden for main window)
@@ -604,6 +606,7 @@ Every pane type supports **multiple simultaneous instances**. Clicking the Termi
 - Starting state: large icon + "Desktop is starting..." text
 - Running state: green pulsing dot + "Desktop running" + "Open in tab" link + full iframe
 - Service status polled every 5 seconds
+- The Desktop iframe points at `/desktop/<id>/agentor.html` (an Agentor-built sibling of the upstream noVNC `vnc.html`, which differs only by an injected clipboard-bridge module — see §20b). The upstream `vnc.html` is left untouched.
 
 ### 18.2 Editor (code-server)
 - Same pattern as Desktop
@@ -645,20 +648,135 @@ Every pane type supports **multiple simultaneous instances**. Clicking the Termi
 - **Disconnecting the viewer is non-destructive:** closing the external browser tab or the noVNC Desktop pane only disconnects the *viewer* — the Chromium client, the in-browser VS Code client, the Kilo panel, and any active Kilo agent work all keep running. This is the key difference from the regular Editor iframe pane: by Kilo's design, **disposing/closing Kilo's VS Code panel in the regular Editor iframe can abort active Kilo sessions**, whereas the persistent client keeps Kilo alive after the viewer is closed.
 - **What does stop the persistent client:** an explicit app **Stop**, closing its X window on the desktop, worker stop/rebuild/archive/delete, a client crash, or a VPS restart.
 - It is **not auto-started** — the operator starts it explicitly from the Apps pane (singleton `Start` button shown when no instance is running, Stop lives on the row once running).
+- Persistent VS Code continues to use noVNC and now benefits from the keyboard-transparent clipboard paste bridge (§20b): because a successful Start auto-opens the Desktop pane (which loads `agentor.html`), host-clipboard images/text reach the in-desktop VS Code via the same X11 CLIPBOARD sync + key replay.
 
 ---
 
-## 20. Workspace Upload/Download
+## 20. Workspace Upload/Download (quick actions)
+
+The container card's **workspace** group keeps the original quick actions: Upload (modal), Download (.tar.gz of `/workspace`), and Export (worker bundle). They are unchanged.
 
 ### 20.1 Upload Modal
 - Opens from upload icon button on container card
 - Title "Upload to Workspace" + target path description
-- FileDropZone: drag files/folders, click to browse (folder mode), file list with remove/clear
+- FileDropZone: drag files/folders, click to **Browse files** or **Browse folder** (two explicit buttons; the whole zone is still a drop target), file list with remove/clear
 - "Upload (N files)" button (disabled when empty, loading during upload)
 - Auto-closes on success
 
 ### 20.2 Download
 - Download button on container card triggers .tar.gz download of /workspace
+
+### 20.2a FileDropZone browse split
+- The drop zone exposes two buttons instead of a single click-to-browse: **Browse files** (native multi-file picker) and **Browse folder** (native `webkitdirectory` picker). Both feed the same file list. The whole dashed zone remains a drag-and-drop target.
+
+---
+
+## 20a. Workspace Files Popup (additive file manager)
+
+An optional, additive **Workspace Files** popup (`WorkspaceFilesModal.vue`) opened from the running worker card's **Files** button (tooltip "Files", `i-lucide-folder-tree`). It is a full per-worker file manager for `/workspace`; the quick Upload/Download/Export actions (§20) remain. It is **only available while the worker is running** — the popup closes (and the button is hidden) when the worker stops.
+
+### 20a.1 Browsing
+- Lazy one-level directory listing via `GET /api/containers/:id/files?path=`, rooted at `/workspace` (`` for the root). Entries are sorted directories-first, then by name.
+- Breadcrumb bar rooted at `/workspace`; each crumb navigates to that relative path. Navigating reloads the listing.
+- Each entry shows an icon (folder / file / symlink, with `i-lucide-link-2-off` for an escaping symlink), name, size (files only), and mtime (locale-formatted).
+- Hidden entries (dotfiles) are listed; symlinks carry metadata warnings: a symlink shows its raw `linkTarget`, and an **escaping** symlink (resolves outside `/workspace`) is flagged with `linkEscapes: true` and a broken-link icon. Selecting an escaping symlink disables destructive ops on that selection.
+- Loading and error states render inline (error message + retry); an empty directory shows an empty-state message.
+- Keyboard: Escape clears an open action panel before closing the modal; the listing is keyboard-navigable. Mobile: the layout is responsive and the action panels stack.
+
+### 20a.2 Selection
+- Multi-select within the current directory (click toggles; select-all / clear controls). Selection is per-directory and resets on navigation.
+- Selecting both a directory and its descendant is de-duplicated for download/move on the server (ancestor wins) so archives/moves never duplicate entries.
+
+### 20a.3 Upload
+- Upload panel (inline) lets the user add files/folders via the same `FileDropZone` (Browse files / Browse folder, drag-and-drop). Files carry their relative folder path in `file.name`, preserving dropped/selected directory trees.
+- Upload targets the **exact current directory** shown by the breadcrumbs (path sent as the `path` form field). Multi-file and whole-folder uploads are supported.
+- First attempt uses `overwrite=false`; on 409 the conflict list is surfaced and the user can confirm a retry with `overwrite=true` (conflict overwrite).
+- Caps: total request data 100 MiB, 1000 tar entries — both return 413. Tar entries are written uid/gid 1000 (`agent`).
+
+### 20a.4 Download
+- **Direct single-file download**: when exactly one regular file is selected, the response is the raw file bytes (safe `Content-Disposition` filename).
+- **True ZIP** for a folder and/or multiple selections: a real ZIP archive is streamed (via `archiver`), preserving relative names, including hidden files, and storing symlinks without following external targets. Escaping symlinks are rejected.
+- The archive is streamed with backpressure; an early client disconnect tears down the underlying streams. No host path is ever exposed (the Docker `getArchive` tar is consumed and only the file/ZIP payload is emitted).
+
+### 20a.5 Mkdir
+- Create directory (and any missing parents) via `POST /files/mkdir`. Idempotent when the directory already exists; 409 when a non-directory file already blocks the path. An escaping symlink on the path is rejected before `mkdir -p`.
+
+### 20a.6 Rename
+- Same-parent rename via `POST /files/rename` (new basename only, no path). No overwrite: 409 when the target name already exists.
+
+### 20a.7 Move
+- Move one or more selected entries into an existing destination directory via `POST /files/move`. The destination may be the workspace root. With `overwrite=false` (default) the full conflict list is returned via 409 before any move; `overwrite=true` replaces conflicting targets. Escaping symlinks/parents and escaping targets are rejected up front.
+
+### 20a.8 Delete
+- Delete one or more entries via `DELETE /files` (JSON `{ paths }`). The **workspace root is never deletable** (`allowRoot:false` rejects it). Missing paths are ignored (idempotent). Escaping symlinks are rejected before any deletion. A confirmation step guards the destructive action in the UI.
+
+### 20a.9 Stopped / error / loading behaviour
+- The Files button is hidden and an open popup is closed when the worker stops (the file APIs require a running worker). Loading and error states are shown inline; toasts report success/failure (never clipboard or file contents beyond the user's own action).
+
+### 20a.10 Security model (full APIs)
+- All `/api/containers/:id/files/*` routes are **session-authenticated and owner-scoped** (ownership checked via `requireContainerAccess` BEFORE the request body is read — 401 unauth, 403 cross-user, 404 unknown worker).
+- **Running-worker only**: every op returns 409 when the worker is not running.
+- **No host-path access**: every operation runs through Docker `exec`/`getArchive`/`putArchive` against the running container. The orchestrator never touches the host workspace path.
+- **Execute as uid 1000** (`agent`): all in-container commands run as the `agent` user (`{ user: 'agent' }`), not root.
+- **Lexical + in-container containment**: client paths are lexically validated first (no `..`, absolute paths, backslashes, NUL/control chars; depth/length caps) in `workspace-path.ts`, then a second **in-container** realpath/lstat containment check runs via an audited Python probe (`workspace-probe.ts`) executed as uid 1000. The realpath of every entry type must equal `/workspace` or live under `/workspace/`; a regular file reached through an intermediate escaping symlink is rejected. For a missing target (upload/move/delete pre-checks) the probe walks up to the nearest existing ancestor and requires that ancestor's containment.
+- **Traversal / intermediate-symlink escape protection**: escaping symlinks are rejected before any mutation (upload, mkdir, rename, move, delete) and before any read (download).
+- **Root delete blocked**: the workspace root is not a deletable target.
+- **Upload caps**: 100 MiB total request data and 1000 tar entries (both 413). Multipart framing overhead is bounded; owner-only chunked multipart requests that don't declare a Content-Length are still subject to the post-parse cap (a defence-in-depth pre-check rejects oversized fixed-length requests before H3 buffers them, while chunked requests are capped after parse).
+- **Conflict overwrite** is explicit and confirmed in the UI; the server returns the full conflict list on `overwrite=false` before any byte is written/moved.
+
+---
+
+## 20b. Keyboard-transparent Clipboard Paste Bridge
+
+A keyboard-transparent Ctrl/Cmd+V bridge lets the host browser clipboard reach GUI apps (and the agent CLI) inside a worker without the user leaving the keyboard. It works in the **Agentor Terminal** (xterm.js) and in the **noVNC Desktop** / **Persistent VS Code** viewer.
+
+### 20b.1 Terminal target (Agentor Terminal)
+- On a real Ctrl/Cmd+V keydown, xterm's custom key handler **synchronously swallows the key only when the async Clipboard API is available** (so existing xterm-local paste still works where it isn't), then bridges asynchronously:
+  - **Image** — reads the host clipboard, normalises non-PNG browser-decodable images to PNG, POSTs the raw bytes to `POST /api/containers/:id/clipboard`, then replays exactly one raw Ctrl+V (`\x16`) over the terminal WebSocket so Codex (and any GUI app reading the X clipboard) pastes the now-synced X11 CLIPBOARD.
+  - **Text** — pasted through xterm's normal `term.paste()` / bracketed-paste path (does NOT hit the X clipboard in the terminal).
+  - **Unsupported / denied / error** — replays the original Ctrl+V so existing behaviour is no worse.
+- Per-target concurrency guard prevents racing rapid presses.
+
+### 20b.2 Desktop target (noVNC / Persistent VS Code)
+- The worker builds an **`agentor.html`** sibling of the upstream noVNC `vnc.html` (the upstream `vnc.html` is left untouched) that differs only by a single injected `<script type="module" src="app/agentor-clipboard.js">` before `</body>`. The Desktop iframe URL now points at `/desktop/<id>/agentor.html` (was `/desktop/<id>/vnc.html`).
+- The injected `agentor-clipboard.js` module capture-intercepts Ctrl/Cmd+V (and Ctrl+Alt+V) in the noVNC iframe BEFORE noVNC sends the key to the remote VNC server. On a real user gesture (display focused) it reads the host clipboard, normalises images to PNG, POSTs to `POST /api/containers/:id/clipboard` (with credentials), then replays Linux Ctrl+V to the VNC session via `UI.rfb.sendKey` (numeric X11 keysyms + physical key codes) — translating host Cmd+V correctly and only after the 200 (the helper verified X selection ownership). On denied/error it replays Ctrl+V once to preserve paste behaviour. Concurrent pastes are guarded.
+- For text in the desktop, the bridge syncs the X clipboard and replays the key (the remote GUI app reads the synced X selection). noVNC text syncs the X clipboard.
+- **No mouse / button interaction** — the bridge is keyboard-only; it never simulates mouse clicks.
+
+### 20b.3 Privacy & caps
+- **No clipboard contents are logged or persisted** by the orchestrator. The clipboard route response is `{ ok, type, width?, height? }` (never the payload); the helper script and the bridge module never `cat`/`echo` clipboard bytes; the composable's error toast never includes contents.
+- **Caps**: image 16 MiB, text 1 MiB (enforced server-side, in the worker helper as defence-in-depth, and client-side before POST).
+- **MIME**: only `image/png` and UTF-8 `text/plain` are accepted server-side; PNG is validated (signature + IHDR + sane nonzero dimensions); text is strictly UTF-8 validated (fatal `TextDecoder`).
+- **Ordering**: auth, ownership, and running-state checks run BEFORE the body is read (so an unauthenticated / non-owning / stopped-worker caller can never trigger body parsing or worker-side work).
+
+### 20b.4 Requirements & fallback
+- Requires an **HTTPS secure context** + a modern Chromium/Firefox async Clipboard API (`navigator.clipboard.read()`). WebAuthn-style secure-context gating applies.
+- Unsupported (no API) → the bridge lets the existing xterm-local / noVNC paste behaviour run. Denied (NotAllowedError/SecurityError) or error → the original key is replayed once so behaviour is no worse than before.
+- **Kilo / Codex are not patched** — the bridge only syncs the worker's X11 CLIPBOARD and replays the paste key; the agent reads the synced selection itself.
+
+### 20b.5 Deployment
+- The clipboard bridge needs a **worker-image update + worker rebuild** (it installs `xclip`, copies `worker/clipboard/set.sh`, and builds `agentor.html` + injects `agentor-clipboard.js` under `/usr/share/novnc/`) AND an **orchestrator update** (new `POST /api/containers/:id/clipboard` route + UI bridge composables + the Desktop iframe URL change). Existing workers require the worker-image update/rebuild; the orchestrator update provides the API and UI.
+- Persistent VS Code continues to use noVNC and now benefits from the same bridge (the Desktop pane is what Persistent VS Code auto-opens).
+
+---
+
+## 20c. Workspace Files API endpoints
+
+See §20a for the UI and the full security model. All routes are session-authenticated, owner-scoped, running-worker only, and execute as uid 1000 with lexical + in-container realpath/lstat containment.
+
+- `GET /api/containers/:id/files?path=` — one-level directory listing (dirs first). Returns `{ path, entries: [{ name, path, type, size, mtime, linkTarget?, linkEscapes? }] }`. 401/403/404/409 (not running or not a directory).
+- `POST /api/containers/:id/files/upload` (multipart) — upload one or more files (with optional relative folder paths) into a destination directory. Form fields: `path` (dest dir, default root), `overwrite` (`"true"`/`"false"`), one or more `file` parts. 409 on `overwrite=false` conflicts; 413 over 100 MiB / 1000 entries; tar entries uid/gid 1000.
+- `POST /api/containers/:id/files/download` (JSON `{ paths }`) — single regular file → raw bytes (safe Content-Disposition); folder/multi → a true ZIP stream (hidden files included, symlinks stored not followed, escaping symlinks rejected).
+- `POST /api/containers/:id/files/mkdir` (JSON `{ path }`) — create directory + parents. Idempotent; 409 when a file blocks the path.
+- `POST /api/containers/:id/files/rename` (JSON `{ path, newName }`) — same-parent rename, no overwrite (409 on existing target).
+- `POST /api/containers/:id/files/move` (JSON `{ paths, destination, overwrite }`) — move entries into an existing destination dir (root allowed). 409 with `{ conflicts }` on `overwrite=false`; `overwrite=true` replaces. Escaping symlinks/parents rejected up front.
+- `DELETE /api/containers/:id/files` (JSON `{ paths }`) — delete entries. Root blocked; missing paths idempotent; escaping symlinks rejected before any deletion.
+
+## 20d. Clipboard API endpoint
+
+See §20b for the bridge. The endpoint sets the worker's X11 CLIPBOARD selection.
+
+- `POST /api/containers/:id/clipboard` — raw body. `Content-Type: image/png` (≤16 MiB) or `text/plain` (≤1 MiB, UTF-8). Auth/ownership/running checked BEFORE the body is read (401/403/404/409). 400 empty, 413 oversized, 415 unsupported MIME / bad PNG / invalid UTF-8, 422 helper failure. Returns `{ ok, type, width?, height? }` — never the contents. The worker helper (`worker/clipboard/set.sh`) offers the X11 CLIPBOARD selection via `xclip` (image/png or UTF8_STRING for text) and verifies ownership before returning.
 
 ---
 
@@ -686,9 +804,9 @@ Every pane type supports **multiple simultaneous instances**. Clicking the Termi
 
 ### 22.1 Drop Zone
 - Dashed-border area with cloud-upload icon
-- "Drop files or folders here" + "or click to browse folders"
+- "Drop files or folders here" + two explicit buttons: **Browse files** (native multi-file picker) and **Browse folder** (native `webkitdirectory` picker)
 - Blue highlight on dragover
-- Recursive folder processing via FileSystemEntry API
+- Recursive folder processing via FileSystemEntry API (drag-and-drop); the folder button uses `webkitdirectory`
 
 ### 22.2 File List
 - Count + total size summary
@@ -780,6 +898,15 @@ Every pane type supports **multiple simultaneous instances**. Clicking the Termi
 - `POST /api/containers/import` — restore a worker from an export bundle (raw `.tar` request body, `Content-Type: application/x-tar`). `?displayName=` overrides the restored label. Returns 201 + the new `ContainerInfo` (fresh UUID id). 400 on an invalid bundle, 401 unauth. See §28.
 - `GET /api/containers/:id/desktop/status` — desktop service status
 - `GET /api/containers/:id/editor/status` — editor service status
+- **Workspace file manager** (`/api/containers/:id/files/*`, running-worker only, session-auth + owner-scoped, no host-path access, execute as uid 1000, lexical + in-container realpath/lstat containment, traversal/intermediate-symlink escape protection, root delete blocked, 100 MiB / 1000-entry upload caps) — see §20a / §20c:
+  - `GET /files?path=` — one-level directory listing (dirs first; symlink `linkTarget`/`linkEscapes`).
+  - `POST /files/upload` (multipart: `path`, `overwrite`, `file[]`) — upload into the exact current directory; `overwrite=false` → 409 conflict list; 413 over caps; tar entries uid/gid 1000.
+  - `POST /files/download` (JSON `{ paths }`) — single regular file → raw bytes; folder/multi → true ZIP (hidden files included, symlinks stored not followed, escaping symlinks rejected).
+  - `POST /files/mkdir` (JSON `{ path }`) — create dir + parents; idempotent; 409 when a file blocks the path.
+  - `POST /files/rename` (JSON `{ path, newName }`) — same-parent rename, no overwrite (409 on existing target).
+  - `POST /files/move` (JSON `{ paths, destination, overwrite }`) — move into an existing dir (root allowed); 409 `{ conflicts }` on `overwrite=false`; `overwrite=true` replaces.
+  - `DELETE /files` (JSON `{ paths }`) — delete entries; root blocked; missing idempotent; escaping symlinks rejected before any deletion.
+- **Worker clipboard** — `POST /api/containers/:id/clipboard` — set the worker's X11 CLIPBOARD from a raw `image/png` (≤16 MiB) or UTF-8 `text/plain` (≤1 MiB) body. Auth/ownership/running checked BEFORE the body (401/403/404/409). 400 empty, 413 oversized, 415 unsupported MIME / bad PNG / invalid UTF-8, 422 helper failure. Returns `{ ok, type, width?, height? }` (never contents). See §20b / §20d.
 - VS Code tunnel and SSH are managed through the generic apps endpoints below (`appType='vscode'` / `appType='ssh'`); no dedicated routes exist for them.
 
 ### 24.3 Tmux Panes

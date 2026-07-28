@@ -315,3 +315,119 @@ export interface LogEntry {
   sourceName?: string;
   message: string;
 }
+
+// ---------------------------------------------------------------------------
+// Workspace file manager — shared typed models.
+//
+// All client-supplied paths in these models are POSIX paths RELATIVE to the
+// worker's `/workspace` root (e.g. `src/index.ts`, `docs/`). The empty string
+// denotes the workspace root itself. The server normalises + lexically
+// validates every client path (see `server/utils/workspace-path.ts`) and then
+// re-checks containment in-container via realpath/lstat so a symlink can never
+// redirect an operation outside `/workspace`. Host workspace paths are never
+// used — every operation runs through Docker exec/getArchive/putArchive against
+// the running worker container as uid 1000 (`agent`).
+// ---------------------------------------------------------------------------
+
+/** A single filesystem entry type inside a worker's `/workspace`. */
+export type FileEntryType = 'file' | 'directory' | 'symlink';
+
+/** Metadata for one filesystem entry, as returned by the file manager listing
+ *  and stat endpoints. `path` is relative to `/workspace` (POSIX, no leading
+ *  slash; `` for the root). */
+export interface FileEntry {
+  /** Basename of the entry (`.` for the workspace root). */
+  name: string;
+  /** POSIX path relative to `/workspace` (no leading slash; `` for root). */
+  path: string;
+  type: FileEntryType;
+  /** Size in bytes. `0` for directories and symlinks. */
+  size: number;
+  /** ISO 8601 modification time (UTC). */
+  mtime: string;
+  /** Raw symlink target (the value `readlink` returns), only for symlinks. */
+  linkTarget?: string;
+  /** True when a symlink's resolved target escapes `/workspace`. Such entries
+   *  are reported for visibility but cannot be traversed/operated through. */
+  linkEscapes?: boolean;
+}
+
+/** Result of a one-level directory listing. Entries are sorted directories
+ *  first, then by name (case-insensitive). */
+export interface FileListing {
+  /** POSIX path relative to `/workspace` that was listed (`` for root). */
+  path: string;
+  entries: FileEntry[];
+}
+
+/** `POST /api/containers/:id/files/mkdir` body. `path` is relative to
+ *  `/workspace`. Parents are created as needed; idempotent when the directory
+ *  already exists; `409` when a non-directory file blocks the path. */
+export interface MkdirRequest {
+  path: string;
+}
+
+/** `POST /api/containers/:id/files/rename` body. Same-directory rename only —
+ *  `path` is the existing entry and `newName` its replacement basename within
+ *  the same parent. No overwrite: a `409` is returned if the target exists. */
+export interface RenameRequest {
+  path: string;
+  newName: string;
+}
+
+/** `POST /api/containers/:id/files/move` body. Moves every `paths` entry into
+ *  the existing destination directory `destination` (relative to `/workspace`).
+ *  When `overwrite` is false (the default) a `409` is returned with the list of
+ *  conflicting target names before any move is performed. */
+export interface MoveRequest {
+  paths: string[];
+  destination: string;
+  overwrite?: boolean;
+}
+
+/** A single conflict reported by `move` when `overwrite` is false. `source` is
+ *  the relative path being moved; `target` the relative path that already
+ *  exists inside the destination. */
+export interface MoveConflict {
+  source: string;
+  target: string;
+}
+
+/** `409` body for `move` when conflicts are present and `overwrite` is false. */
+export interface MoveConflictResponse {
+  conflicts: MoveConflict[];
+}
+
+/** Result of a successful `move`. */
+export interface MoveResult {
+  moved: number;
+}
+
+/** `DELETE /api/containers/:id/files` body. Every `paths` entry is deleted
+ *  (files, directories, symlinks). The workspace root is never deletable.
+ *  Missing paths are ignored (idempotent); escaping symlinks/parents are
+ *  rejected up front. */
+export interface DeleteFilesRequest {
+  paths: string[];
+}
+
+/** Result of a successful multi-delete. `deleted` counts the paths that
+ *  existed and were removed (missing paths are not counted). */
+export interface DeleteFilesResult {
+  deleted: number;
+}
+
+/** `POST /api/containers/:id/files/download` body. When `paths` contains exactly
+ *  one regular file the response is the raw file bytes; otherwise a true ZIP
+ *  archive is streamed containing every selected file/folder (relative names
+ *  preserved, hidden files included, symlinks stored without following
+ *  external targets). */
+export interface DownloadFilesRequest {
+  paths: string[];
+}
+
+/** `POST /api/containers/:id/files/upload` result. `uploaded` is the number of
+ *  tar entries written into the workspace. */
+export interface UploadFilesResult {
+  uploaded: number;
+}

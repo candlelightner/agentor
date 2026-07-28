@@ -21,7 +21,8 @@ All agents are installed in a single unified worker image. Start any agent via i
 - **User authentication & RBAC** — email/password/passkey login powered by [better-auth](https://www.better-auth.com/) with admin and user roles; admins create and manage other users, each user sees only their own workers/mappings/environments/etc. First-run setup creates the initial admin.
 - **Live terminal** — xterm.js WebSocket terminal with tmux session management
 - **VS Code editor** — code-server per worker with Kilo Code preinstalled and per-user config, provider keys, login, and Kilo sessions shared across that user's workers
-- **Virtual desktop** — Xvfb + fluxbox + noVNC, accessible in-browser
+- **Virtual desktop** — Xvfb + fluxbox + noVNC, accessible in-browser, with a keyboard-transparent Ctrl/Cmd+V clipboard bridge (host-clipboard images/text synced to the worker's X11 CLIPBOARD, then the paste key is replayed so GUI apps and Codex paste the synced content)
+- **Workspace file manager** — an optional Files popup on each running worker card to browse `/workspace`, upload/download (single file or true ZIP), mkdir, rename, move, and delete with symlink-escape protection (the quick Upload/Download/Export card actions remain)
 - **Multi-repo cloning** — clone one or more git repos into each worker at startup
 - **App system** — launch Chromium (with CDP), Persistent VS Code (a noVNC-hosted client that stays alive when the viewer disconnects), SOCKS5 proxy, VS Code Tunnel (native VS Code client via Microsoft's relay), or OpenSSH server from the Apps pane
 - **Port & domain mapping** — unified Traefik reverse proxy handling both TCP port forwarding (localhost- or network-bound) and subdomain-based HTTP/HTTPS/TCP routing with TLS (Let's Encrypt HTTP-01/DNS-01 or self-signed CA), optional HTTP basic auth

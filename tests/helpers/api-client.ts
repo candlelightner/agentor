@@ -135,6 +135,107 @@ export class ApiClient {
     return { status: res.status(), body: await res.json() };
   }
 
+  // ─── Workspace File Manager (/api/containers/:id/files/*) ──────────────
+  //
+  // The typed helpers below mirror the file-manager routes. Every method
+  // returns `{ status, body }` (or `{ status, headers, body }` for the
+  // streaming download endpoint) so callers can assert on both. Paths are
+  // POSIX paths relative to the worker's `/workspace` (`` for the root).
+
+  /** `GET /files?path=` — one-level directory listing (dirs first, then name). */
+  async listFiles(id: string, path = '') {
+    const url = path
+      ? `${BASE_URL}/api/containers/${id}/files?path=${encodeURIComponent(path)}`
+      : `${BASE_URL}/api/containers/${id}/files`;
+    const res = await this.request.get(url);
+    return { status: res.status(), body: await res.json().catch(() => ({})) };
+  }
+
+  /**
+   * `POST /files/upload` (multipart). `files` carry their relative folder path
+   * in `name` (preserving dropped/selected directory trees). `dest` is the
+   * destination directory relative to `/workspace` (defaults to the root).
+   * `overwrite` defaults to false; a 409 with `{ conflicts: string[] }` is
+   * returned when `overwrite=false` and existing paths would be replaced.
+   */
+  async uploadFiles(
+    id: string,
+    files: { name: string; content: Buffer; mimeType?: string }[],
+    opts: { dest?: string; overwrite?: boolean } = {},
+  ) {
+    const form = new FormData();
+    form.append('path', opts.dest ?? '');
+    form.append('overwrite', opts.overwrite ? 'true' : 'false');
+    for (const f of files) {
+      const blob = new Blob([new Uint8Array(f.content)], { type: f.mimeType || 'application/octet-stream' });
+      const file = new File([blob], f.name, { type: f.mimeType || 'application/octet-stream' });
+      form.append('file', file, f.name);
+    }
+    const res = await this.request.post(`${BASE_URL}/api/containers/${id}/files/upload`, {
+      multipart: form,
+    });
+    return { status: res.status(), body: await res.json().catch(() => ({})) };
+  }
+
+  /** `POST /files/mkdir` — create `path` (and parents); idempotent. */
+  async mkdirFiles(id: string, path: string) {
+    const res = await this.request.post(`${BASE_URL}/api/containers/${id}/files/mkdir`, {
+      data: { path },
+    });
+    return { status: res.status(), body: await res.json().catch(() => ({})) };
+  }
+
+  /** `POST /files/rename` — same-directory rename, no overwrite. */
+  async renameFile(id: string, path: string, newName: string) {
+    const res = await this.request.post(`${BASE_URL}/api/containers/${id}/files/rename`, {
+      data: { path, newName },
+    });
+    return { status: res.status(), body: await res.json().catch(() => ({})) };
+  }
+
+  /** `POST /files/move` — move `paths` into the existing `destination`. */
+  async moveFiles(id: string, paths: string[], destination: string, overwrite = false) {
+    const res = await this.request.post(`${BASE_URL}/api/containers/${id}/files/move`, {
+      data: { paths, destination, overwrite },
+    });
+    return { status: res.status(), body: await res.json().catch(() => ({})) };
+  }
+
+  /** `DELETE /files` with JSON `{ paths }`. Missing paths are ignored. */
+  async deleteFiles(id: string, paths: string[]) {
+    const res = await this.request.delete(`${BASE_URL}/api/containers/${id}/files`, {
+      data: { paths },
+    });
+    return { status: res.status(), body: await res.json().catch(() => ({})) };
+  }
+
+  /**
+   * `POST /files/download` (JSON `{ paths }`). Streams a raw single file
+   * (Content-Type `application/octet-stream`, Content-Length set) or a true
+   * ZIP archive (Content-Type `application/zip`). Returns the raw body bytes
+   * plus response headers so callers can assert on signature/disposition.
+   */
+  async downloadFiles(id: string, paths: string[]) {
+    const res = await this.request.post(`${BASE_URL}/api/containers/${id}/files/download`, {
+      data: { paths },
+    });
+    return { status: res.status(), headers: res.headers(), body: await res.body() };
+  }
+
+  /**
+   * POST a raw clipboard payload (image/png or UTF-8 text/plain) to the worker
+   * clipboard route. `body` is sent verbatim with the given MIME Content-Type.
+   * Returns `{ status, body }` where `body` is the JSON metadata
+   * (`{ ok, type, width?, height? }`) on success — never clipboard contents.
+   */
+  async setClipboard(id: string, mime: 'image/png' | 'text/plain', body: Buffer) {
+    const res = await this.request.post(`${BASE_URL}/api/containers/${id}/clipboard`, {
+      headers: { 'Content-Type': mime },
+      data: body,
+    });
+    return { status: res.status(), body: await res.json().catch(() => ({})) };
+  }
+
   // ─── Tmux Panes ───────────────────────────────────────────────
   async listPanes(containerId: string) {
     const res = await this.request.get(`${BASE_URL}/api/containers/${containerId}/panes`);

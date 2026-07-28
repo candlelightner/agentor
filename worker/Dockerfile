@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y \
     x11vnc \
     novnc \
     websockify \
+    xclip \
     procps \
     fonts-liberation \
     fonts-dejavu-core \
@@ -161,6 +162,26 @@ COPY --chmod=755 memfd-exec.py /home/agent/memfd-exec.py
 COPY --chmod=755 setup.sh /home/agent/setup.sh
 COPY --chmod=755 init.sh /home/agent/init.sh
 COPY --chmod=755 apps/ /home/agent/apps/
+COPY --chmod=755 clipboard/ /home/agent/clipboard/
+
+# noVNC clipboard bridge: an ES module that capture-intercepts Ctrl/Cmd+V (and
+# Ctrl+Alt+V) in the desktop iframe, normalises the browser clipboard to PNG
+# (or text), POSTs it to the orchestrator, then replays the raw key to the VNC
+# session so the remote GUI app reads the synced X11 CLIPBOARD. Copied under
+# /usr/share/novnc/app/ so it resolves `./ui.js` (the apt-installed noVNC UI).
+COPY --chmod=644 novnc/agentor-clipboard.js /usr/share/novnc/app/agentor-clipboard.js
+
+# Build /usr/share/novnc/agentor.html from the apt-installed vnc.html by
+# injecting a single module <script> tag before </body>. The upstream
+# vnc.html is left untouched; agentor.html is a separate page that differs
+# only by this one injection (everything else — the noVNC UI bootstrap script,
+# styles, assets — is identical and still served from the same directory).
+RUN set -e && \
+    cp /usr/share/novnc/vnc.html /usr/share/novnc/agentor.html && \
+    sed -i 's#</body>#<script type="module" src="app/agentor-clipboard.js"></script>\n</body>#' \
+      /usr/share/novnc/agentor.html && \
+    grep -q 'agentor-clipboard.js' /usr/share/novnc/agentor.html && \
+    grep -q '</body>' /usr/share/novnc/agentor.html
 
 RUN mkdir -p /workspace /home/agent/pids /home/agent/profiles /home/agent/.ssh && \
     chown -R agent:agent /workspace /home/agent/pids /home/agent/profiles /home/agent/.ssh && \

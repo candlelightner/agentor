@@ -58,7 +58,9 @@ Apps you can start from the dashboard's Apps pane (operator-controlled, but you 
 - **VS Code Tunnel** (singleton) — opens a Microsoft Remote - Tunnels session so the operator can attach a local VS Code to this worker
 - **SSH server** (singleton) — `sshd` on internal port 22, exposed via an auto-allocated external host port in `22000–22999`. Public-key auth only; the public key comes from the operator's **Account → SSH Access** field
 
-A browser-based VS Code editor (code-server, port 8443) and a noVNC desktop view (port 6080) are always running for the dashboard's Editor / Desktop tabs.
+A browser-based VS Code editor (code-server, port 8443) and a noVNC desktop view (port 6080) are always running for the dashboard's Editor / Desktop tabs. The Desktop iframe loads an Agentor-built `agentor.html` page (a sibling of the upstream noVNC `vnc.html`) that wires a keyboard-transparent clipboard bridge: Ctrl/Cmd+V in the desktop reads the host browser clipboard, syncs it to this worker's X11 CLIPBOARD via `xclip`, then replays the paste key so GUI apps (and Codex) paste the synced image/text. The same bridge works in the dashboard Terminal for Codex/GUI paste. No clipboard contents are logged. (Requires an HTTPS secure context + a modern Chromium/Firefox Clipboard API; unsupported/denied falls back to prior behaviour. The bridge needs the worker-image update + rebuild and the orchestrator update.)
+
+The operator can also manage `/workspace` files from the dashboard via the per-worker **Files** popup (the Files button on a running worker card) — browse, upload, download (single file or true ZIP), mkdir, rename, move, and confirmed delete — all running as you (uid 1000) inside this container with symlink-escape protection. The quick Upload/Download/Export card actions remain.
 
 ### Docker-in-Docker
 

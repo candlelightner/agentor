@@ -8,13 +8,17 @@ Docker orchestrator that spawns isolated AI coding agent workers, each in its ow
 Worker (curl)            <--HTTP/JSON--> Orchestrator (/api/worker-self/*, identified by Docker source IP)
 Browser (Vue 3/Nuxt UI) <--HTTP/JSON--> Orchestrator (Nuxt 3/Nitro) <--dockerode exec--> Worker (tmux/agent)
 Browser (xterm.js)       <--WebSocket--> Nitro (crossws)             <--docker stream--> Worker (tmux)
-Browser (noVNC iframe)   <--HTTP/WS----> Nitro (proxy)               <--HTTP/WS-------> Worker (websockify <--> x11vnc <--> Xvfb)
+Browser (noVNC iframe)   <--HTTP/WS----> Nitro (proxy)               <--HTTP/WS-------> Worker (websockify <--> x11vnc <--> Xvfb)  [Desktop iframe loads /desktop/<id>/agentor.html — an Agentor sibling of upstream vnc.html that injects a Ctrl/Cmd+V clipboard bridge]
 Browser (code-server)    <--HTTP/WS----> Nitro (proxy)               <--HTTP/WS-------> Worker (code-server on port 8443)
 Local VS Code            <--tunnel-----> Microsoft Relay              <--tunnel--------> Worker (vscode app → code tunnel)
 Local ssh client         <--TCP--------> Traefik (ext :22xxx)         <--TCP-----------> Worker (ssh app → sshd :22)
 Orchestrator             <--docker exec-> apps/*/manage.sh (start/stop/list app instances in worker)
 Orchestrator (TraefikManager) <--dockerode--> Traefik container (unified reverse proxy: port mappings + domain routing, TLS)
 ```
+
+Two additive, opt-in bridges run over the existing proxied terminal/desktop channels (no new topology):
+- **Workspace file manager** — `/api/containers/:id/files/*` (list/upload/download/mkdir/rename/move/delete). Session-auth + owner-scoped, running-worker only, no host-path access (every op runs through Docker exec/getArchive/putArchive as uid 1000), with lexical + in-container realpath/lstat containment, traversal/intermediate-symlink escape protection, root delete blocked, 100 MiB / 1000-entry upload caps. Backs the optional **Files** popup on a running worker card (`WorkspaceFilesModal.vue`); the quick Upload/Download/Export card actions remain.
+- **Keyboard-transparent clipboard paste** — `POST /api/containers/:id/clipboard` sets the worker's X11 CLIPBOARD via `xclip`. The terminal (`useClipboardPasteBridge`) and the noVNC desktop (`agentor.html` + `agentor-clipboard.js`) intercept Ctrl/Cmd+V, POST the host-clipboard payload (image/png or UTF-8 text/plain; 16 MiB / 1 MiB caps), then replay the paste key so the agent/GUI app reads the synced X selection. No clipboard contents are logged or persisted. Requires an HTTPS secure context + a modern Chromium/Firefox async Clipboard API; unsupported/denied falls back to prior behaviour. Needs a worker-image update + rebuild (installs `xclip`, `worker/clipboard/set.sh`, builds `agentor.html` + injects `agentor-clipboard.js`) AND an orchestrator update (route + UI). Kilo/Codex are not patched.
 
 Three managed containers:
 - **Orchestrator**: Nuxt 3 app (SPA mode) with Nitro server, serving dashboard + managing workers and the Traefik container via Docker socket
@@ -47,7 +51,7 @@ Three managed containers:
 - Terminal: xterm.js 5 (@xterm/xterm + @xterm/addon-fit)
 - Auth: better-auth 1.6 + admin plugin (user management, RBAC) + @better-auth/passkey (WebAuthn passwordless), better-sqlite3 (SQLite database for users/sessions/passkeys)
 - Backend: dockerode 4, nanoid 5, crossws (WebSocket, bundled with Nitro), ws (WebSocket client for noVNC proxy), tar-stream (archive packing)
-- Workers: Ubuntu 24.04, agent CLI (varies), tmux, git, Docker CE (opt-in DinD), Xvfb, fluxbox, x11vnc, noVNC (port 6080), code-server (port 8443), VS Code CLI (tunnel), Chromium, microsocks, dnsmasq, ipset, iptables
+- Workers: Ubuntu 24.04, agent CLI (varies), tmux, git, Docker CE (opt-in DinD), Xvfb, fluxbox, x11vnc, noVNC (port 6080, with an Agentor `agentor.html` clipboard-bridge sibling of upstream `vnc.html`), xclip (X11 CLIPBOARD), code-server (port 8443), VS Code CLI (tunnel), Chromium, microsocks, dnsmasq, ipset, iptables
 
 ## Dev Commands
 

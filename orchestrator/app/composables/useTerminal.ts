@@ -1,5 +1,6 @@
 import type { Terminal, ITheme } from '@xterm/xterm';
 import type { FitAddon } from '@xterm/addon-fit';
+import { clipboardReadAvailable, useClipboardPaste } from './useClipboardPasteBridge';
 
 interface TerminalState {
   containerId: string;
@@ -46,6 +47,7 @@ const LIGHT_THEME: ITheme = {
 export function useTerminal() {
   const colorMode = useColorMode();
   const activeTerminal = shallowRef<TerminalState | null>(null);
+  const { bridgeTerminalPaste, runGuarded, isPasteInFlight } = useClipboardPaste();
 
   function getTheme(): ITheme {
     return colorMode.value === 'dark' ? DARK_THEME : LIGHT_THEME;
@@ -175,6 +177,17 @@ export function useTerminal() {
     // Shift+Enter → send CSI u encoded Shift+Enter so agents (Claude Code,
     // Codex, etc.) can distinguish it from plain Enter and insert a newline.
     // tmux extended-keys (csi-u format) passes this through to the application.
+    //
+    // Ctrl/Cmd+V → keyboard-transparent host clipboard paste. On keydown we
+    // synchronously swallow the key ONLY when the async Clipboard API is
+    // available (so existing xterm-local paste still works where it isn't),
+    // then bridge asynchronously: image → POST PNG to the worker X clipboard
+    // and replay exactly one raw Ctrl+V (\x16) over the terminal WebSocket so
+    // Codex reads the X clipboard; text → paste through xterm's normal
+    // bracketed-paste path (term.paste), not Ctrl+V; denied/error → replay the
+    // original Ctrl+V so existing behaviour is no worse. Per-target concurrency
+    // guard prevents racing rapid presses. Existing Shift+Enter and all other
+    // keys are preserved.
     term.attachCustomKeyEventHandler((event) => {
       if (event.key === 'Enter' && event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey) {
         if (event.type === 'keydown' && ws.readyState === WebSocket.OPEN) {
@@ -182,6 +195,30 @@ export function useTerminal() {
         }
         return false;
       }
+
+      // Ctrl+V (non-Mac) or Cmd+V (Mac). Match the keydown only; keyup is
+      // swallowed too so xterm never performs its own paste.
+      const isPasteKey = event.key === 'v' || event.key === 'V';
+      const isCtrlOrCmd = event.ctrlKey || event.metaKey;
+      if (isPasteKey && isCtrlOrCmd && !event.altKey) {
+        const hasClipboard = clipboardReadAvailable();
+        if (!hasClipboard) return true; // no API → let xterm paste locally
+        if (event.type === 'keydown') {
+          if (isPasteInFlight('terminal')) return false;
+          // Swallow synchronously, then bridge asynchronously. The bridge
+          // decides whether to replay \x16 (image/denied/error) or paste text.
+          runGuarded('terminal', () => bridgeTerminalPaste(containerId)).then((res) => {
+            if (ws.readyState !== WebSocket.OPEN) return;
+            if (res.replayCtrlV) {
+              ws.send('\x16');
+            } else if (res.text !== undefined) {
+              term.paste(res.text);
+            }
+          });
+        }
+        return false;
+      }
+
       return true;
     });
 

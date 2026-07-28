@@ -26,6 +26,7 @@ const toast = useToast();
 
 const showDetail = ref(false);
 const showUpload = ref(false);
+const showFiles = ref(false);
 
 // Export is slow (the server materialises the bundle — incl. a docker export of
 // the filesystem — before the download starts), so drive it with fetch and show
@@ -198,6 +199,16 @@ function onHScrollWheel(e: WheelEvent) {
           <UTooltip :text="exporting ? 'Preparing export…' : 'Export worker'">
             <UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-package" :loading="exporting" :disabled="exporting" @click="doExport" />
           </UTooltip>
+          <UTooltip text="Files">
+            <UButton
+              size="xs"
+              color="neutral"
+              variant="subtle"
+              icon="i-lucide-folder-tree"
+              aria-label="Files"
+              @click="showFiles = true"
+            />
+          </UTooltip>
         </div>
 
         <span class="w-px h-4 bg-gray-300 dark:bg-gray-600 flex-shrink-0" />
@@ -236,6 +247,11 @@ function onHScrollWheel(e: WheelEvent) {
       v-model:open="showUpload"
       :container-id="container.id"
       :container-name="displayLabel"
+    />
+
+    <WorkspaceFilesModal
+      v-model:open="showFiles"
+      :container="container"
     />
 
     <ContainerDetailModal

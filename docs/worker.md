@@ -20,7 +20,8 @@ Individual env vars that CLIs read directly are populated **from the worker owne
 
 The unified worker image (`worker/`) provides:
 - Ubuntu 24.04, Node.js 22 LTS, git, tmux, curl, build-essential, python3, ripgrep, fd-find, jq, sudo, locale
-- Display stack: Xvfb, fluxbox, x11vnc, noVNC/websockify (port 6080)
+- Display stack: Xvfb, fluxbox, x11vnc, noVNC/websockify (port 6080), `xclip` (X11 CLIPBOARD selection owner for the clipboard paste bridge)
+- noVNC clipboard bridge: an `agentor.html` sibling of the upstream `vnc.html` (left untouched) is built at image time by injecting a single `<script type="module" src="app/agentor-clipboard.js">` before `</body>`; the `agentor-clipboard.js` module capture-intercepts Ctrl/Cmd+V in the desktop iframe, POSTs the host clipboard to `POST /api/containers/:id/clipboard`, and replays the paste key. The Desktop iframe URL points at `/desktop/<id>/agentor.html`.
 - Code editor: code-server (VS Code in browser, port 8443) with the Kilo Code extension (`kilocode.kilo-code@7.4.16`) preinstalled in the image-level code-server extension directory (`/home/agent/.local/share/code-server/extensions`) — no per-worker manual install; existing workers need the worker image update plus a rebuild to pick it up
 - Browsers: Chromium (from Debian bookworm repo), Playwright (with bundled Chromium + Firefox)
 - microsocks (SOCKS5 proxy)
@@ -31,7 +32,7 @@ The unified worker image (`worker/`) provides:
 - App management scripts in `/home/agent/apps/` (chromium/manage.sh, socks5/manage.sh, vscode-tunnel/manage.sh, vscode-desktop/manage.sh, ssh/manage.sh). Every app exposes the same `start <id> <port> [extraArgs…]` / `stop <id>` / `list` interface and emits NDJSON on stdout.
 - OpenSSH server (`openssh-server`, port 22, pubkey-only via `StrictModes no` + bind-mounted `/home/agent/.ssh/authorized_keys`)
 - Shared `agent` user (uid 1000) with passwordless sudo
-- Helper scripts: `memfd-exec.py` (memfd script executor), `setup.sh` (setup script runner), `init.sh` (init script runner)
+- Helper scripts: `memfd-exec.py` (memfd script executor), `setup.sh` (setup script runner), `init.sh` (init script runner), `clipboard/set.sh` (X11 CLIPBOARD setter used by `POST /api/containers/:id/clipboard`)
 - Common entrypoint: tmux session, env var export, agent setups (+ platform files), docker daemon, display stack, code-server, git identity + auth, repo clone, network firewall, setup script (memfd), init script (memfd), launch. The VS Code tunnel and SSH server are apps (started via the Apps pane) — not auto-started by the entrypoint.
 
 ### Pre-installed Agents

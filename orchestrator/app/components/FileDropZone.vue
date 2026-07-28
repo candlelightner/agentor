@@ -9,12 +9,16 @@ const emit = defineEmits<{
 
 const isDragOver = ref(false);
 const fileInputRef = ref<HTMLInputElement | null>(null);
+const folderInputRef = ref<HTMLInputElement | null>(null);
 
 // Reset native file input when files are cleared externally (e.g., modal close)
 // so re-uploading the same files will trigger the change event again
 watch(() => props.modelValue, (val) => {
   if (val.length === 0 && fileInputRef.value) {
     fileInputRef.value.value = '';
+  }
+  if (val.length === 0 && folderInputRef.value) {
+    folderInputRef.value.value = '';
   }
 });
 
@@ -122,15 +126,21 @@ const totalSize = computed(() => props.modelValue.reduce((sum, f) => sum + f.siz
 <template>
   <div>
     <div
-      class="border-2 border-dashed rounded-lg p-4 text-center transition-colors cursor-pointer"
+      class="border-2 border-dashed rounded-lg p-4 text-center transition-colors"
       :class="isDragOver ? 'border-blue-500 bg-blue-500/10' : 'border-gray-300 dark:border-gray-700 hover:border-gray-400 dark:hover:border-gray-600'"
       @dragover="onDragOver"
       @dragleave="onDragLeave"
       @drop="onDrop"
-      @click="fileInputRef?.click()"
     >
       <input
         ref="fileInputRef"
+        type="file"
+        multiple
+        class="hidden"
+        @change="onFileInput"
+      />
+      <input
+        ref="folderInputRef"
         type="file"
         multiple
         webkitdirectory
@@ -141,9 +151,10 @@ const totalSize = computed(() => props.modelValue.reduce((sum, f) => sum + f.siz
       <p class="text-sm text-gray-500 dark:text-gray-400">
         Drop files or folders here
       </p>
-      <p class="text-xs text-gray-400 dark:text-gray-500 mt-0.5">
-        or click to browse folders
-      </p>
+      <div class="flex flex-wrap items-center justify-center gap-2 mt-2">
+        <UButton size="xs" color="neutral" variant="outline" @click.stop="fileInputRef?.click()">Browse files</UButton>
+        <UButton size="xs" color="neutral" variant="outline" @click.stop="folderInputRef?.click()">Browse folder</UButton>
+      </div>
     </div>
 
     <div v-if="modelValue.length > 0" class="mt-2">

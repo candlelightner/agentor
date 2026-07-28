@@ -30,6 +30,19 @@ export type {
   LogLevel,
   LogSource,
   LogEntry,
+  FileEntryType,
+  FileEntry,
+  FileListing,
+  MkdirRequest,
+  RenameRequest,
+  MoveRequest,
+  MoveConflict,
+  MoveConflictResponse,
+  MoveResult,
+  DeleteFilesRequest,
+  DeleteFilesResult,
+  DownloadFilesRequest,
+  UploadFilesResult,
 } from '../../shared/types';
 
 // Client-local API view types. PortMapping, DomainMapping, and EnvironmentInfo

@@ -7,6 +7,7 @@ import { createReadStream } from 'node:fs';
 import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
+import * as tar from 'tar-stream';
 import { DockerService } from './docker';
 import type { EnvironmentJsonPayload, CapabilityJsonEntry, InstructionJsonEntry, WorkerJsonPayload, ImageConfigOverride } from './docker';
 import { zeroUserEnvVars } from './user-env-store';
@@ -16,7 +17,7 @@ import {
   CREDENTIAL_EXCLUDE_SUFFIXES, SHARED_DATA_EXCLUDE_PREFIXES, writeManifest, writeGzipFile, writeFilteredAgentsGz, packBundle, extractBundle,
 } from './worker-export';
 import type { WorkerExportManifest } from './worker-export';
-import type { AppInstanceInfo, TmuxWindow } from '../../shared/types';
+import type { AppInstanceInfo, TmuxWindow, FileEntry, FileListing, MoveConflict } from '../../shared/types';
 import { getAllGitCloneDomains } from './git-providers';
 import { getAllAgentApiDomains } from './agent-config';
 import { getPackageManagerDomains, DEFAULT_ENVIRONMENT_ID } from './environments';
@@ -29,6 +30,12 @@ import type { CapabilityStore } from './capability-store';
 import type { InstructionStore } from './instruction-store';
 import type { StorageManager } from './storage';
 import type { ExposeApis, ServiceStatus, ContainerInfo, ContainerStatus, CreateContainerRequest, UpdateContainerSettingsRequest, RepoConfig, MountConfig, UserEnvVars } from '../../shared/types';
+import {
+  normalizeClientPath, normalizeClientPathList, validateName, toContainerPath, parentRelPath, baseName,
+  MAX_UPLOAD_TOTAL_BYTES, MAX_UPLOAD_ENTRIES,
+} from './workspace-path';
+import { probeLstat, probeList, runProbeCheckMany } from './workspace-probe-runner';
+import { buildWorkspaceZip, demuxSingleFileFromTar } from './workspace-zip';
 
 
 interface ResolvedEnvConfig {
@@ -483,6 +490,481 @@ export class ContainerManager {
   async downloadWorkspace(id: string): Promise<NodeJS.ReadableStream> {
     const info = this.assertRunning(id);
     return this.dockerService.getWorkspaceArchive(info.containerId);
+  }
+
+  // --- Full /workspace file manager ---
+  //
+  // All methods below operate ONLY through Docker exec/getArchive/putArchive
+  // against the running worker, as uid 1000 (`agent`). Client paths are
+  // lexically validated (workspace-path.ts) and re-checked in-container via
+  // realpath/lstat containment (workspace-probe.ts) so a symlink can never
+  // redirect an operation outside /workspace. Host workspace paths are never
+  // used. Errors carry `statusCode` so `rethrowAsHttpError` preserves them.
+
+  /** Resolve a worker id to its container id, throwing a 409-tagged error when
+   *  the worker is not running (so the route maps it to 409, not 500). */
+  private dockerIdForFiles(id: string): string {
+    const info = this.containers.get(id);
+    if (!info) {
+      const err = new Error('Container not found') as Error & { statusCode?: number };
+      err.statusCode = 404;
+      throw err;
+    }
+    if (info.status !== 'running') {
+      const err = new Error('Worker container is not running') as Error & { statusCode?: number };
+      err.statusCode = 409;
+      throw err;
+    }
+    return info.containerId;
+  }
+
+  /** `GET /api/containers/:id/files?path=` — lazy one-level directory listing
+   *  (dirs first, then by name) with symlink-escape metadata. `path` defaults
+   *  to the workspace root. */
+  async listFiles(id: string, path: string): Promise<FileListing> {
+    const containerId = this.dockerIdForFiles(id);
+    const rel = normalizeClientPath(path, { allowRoot: true });
+    return probeList(this.dockerService, containerId, rel);
+  }
+
+  /**
+   * `POST /api/containers/:id/files/upload` — extract uploaded files into the
+   *  destination directory `destRel` (relative to /workspace). `entries` are
+   *  the multipart parts already sanitised to relative paths with their data.
+   *  Escaping targets (incl. nested paths whose parent is an escaping symlink)
+   *  are rejected via check_many BEFORE any byte is written, regardless of
+   *  `overwrite`. When `overwrite` is false, conflicting existing targets are
+   *  additionally reported via 409. Total bytes/entries are capped (413). Tar
+   *  entries are written uid/gid 1000 with directory/file modes.
+   */
+  async uploadFiles(
+    id: string,
+    destRel: string,
+    entries: { rel: string; data: Buffer; isDir?: boolean }[],
+    overwrite: boolean,
+  ): Promise<{ uploaded: number }> {
+    const containerId = this.dockerIdForFiles(id);
+    const dest = normalizeClientPath(destRel, { allowRoot: true });
+
+    // Destination must exist and be a directory contained in /workspace.
+    const destEntry = await probeLstat(this.dockerService, containerId, dest);
+    if (destEntry.type !== 'directory') {
+      const err = new Error('Upload destination is not a directory') as Error & { statusCode?: number };
+      err.statusCode = 409;
+      throw err;
+    }
+
+    if (entries.length === 0) {
+      const err = new Error('No files provided') as Error & { statusCode?: number };
+      err.statusCode = 400;
+      throw err;
+    }
+    if (entries.length > MAX_UPLOAD_ENTRIES) {
+      const err = new Error(`Upload exceeds the ${MAX_UPLOAD_ENTRIES} entry limit`) as Error & { statusCode?: number };
+      err.statusCode = 413;
+      throw err;
+    }
+
+    // Compute target relative paths (under /workspace) and enforce the total
+    // byte cap before packing anything.
+    const targets: { rel: string; data: Buffer; isDir?: boolean }[] = [];
+    let totalBytes = 0;
+    const seenTargets = new Set<string>();
+    for (const e of entries) {
+      // Each part's own relative path is validated here (defence in depth —
+      // the route also validates). Empty/`.`/`..`/backslash/absolute are rejected.
+      const partRel = normalizeClientPath(e.rel, { allowRoot: false });
+      const targetRel = dest === '' ? partRel : `${dest}/${partRel}`;
+      if (seenTargets.has(targetRel)) continue;
+      seenTargets.add(targetRel);
+      if (!e.isDir) totalBytes += e.data.length;
+      if (totalBytes > MAX_UPLOAD_TOTAL_BYTES) {
+        const err = new Error(`Upload exceeds the ${MAX_UPLOAD_TOTAL_BYTES} byte limit`) as Error & { statusCode?: number };
+        err.statusCode = 413;
+        throw err;
+      }
+      targets.push({ rel: targetRel, data: e.data, isDir: e.isDir });
+    }
+
+    // ALWAYS run check_many: it is the primary escape gate (it walks to the
+    // nearest existing ancestor for each target, so a nested upload path whose
+    // parent is an escaping symlink is rejected here — even when overwrite is
+    // true). With overwrite=false it also surfaces conflicts.
+    const { existing, escaping } = await runProbeCheckMany(this.dockerService, containerId, targets.map((t) => t.rel));
+    if (escaping.length > 0) {
+      const err = new Error('Upload target escapes the workspace root') as Error & { statusCode?: number };
+      err.statusCode = 400;
+      throw err;
+    }
+    if (!overwrite && existing.length > 0) {
+      const err = new Error('Upload conflicts with existing paths') as Error & { statusCode?: number; conflicts?: string[] };
+      err.statusCode = 409;
+      (err as any).conflicts = existing.map((p) => p.replace(/^\/workspace\/?/, ''));
+      throw err;
+    }
+
+    // Pack a tar whose entry names are the full relative paths under /workspace;
+    // putArchive into /workspace lands each entry at the right place (Docker
+    // creates missing parent directories). uid/gid 1000, sensible modes.
+    const pack = tar.pack();
+    let count = 0;
+    for (const t of targets) {
+      if (t.isDir) {
+        pack.entry({ name: t.rel, type: 'directory', mode: 0o755, uid: 1000, gid: 1000 });
+        count++;
+      } else {
+        pack.entry({ name: t.rel, size: t.data.length, mode: 0o644, uid: 1000, gid: 1000 }, t.data);
+        count++;
+      }
+    }
+    pack.finalize();
+
+    const chunks: Buffer[] = [];
+    for await (const chunk of pack) chunks.push(chunk as Buffer);
+    const tarBuffer = Buffer.concat(chunks);
+
+    await this.dockerService.putArchive(containerId, tarBuffer, '/workspace');
+    return { uploaded: count };
+  }
+
+  /** `POST /api/containers/:id/files/mkdir` — create `rel` (and parents)
+   *  idempotently; 409 if a non-directory file blocks the path. The nearest
+   *  existing ancestor's realpath must be contained in /workspace (so an
+   *  escaping symlink on the path is rejected before `mkdir -p`). Implemented
+   *  with `mkdir -p` as the `agent` user via positional argv (no shell). */
+  async mkdirFiles(id: string, rel: string): Promise<{ ok: true }> {
+    const containerId = this.dockerIdForFiles(id);
+    const target = normalizeClientPath(rel, { allowRoot: false });
+    const full = toContainerPath(target);
+
+    // If the path already exists, honour idempotency (dir) or 409 (file).
+    // probeLstat also enforces containment (realpath) for the existing path.
+    try {
+      const entry = await probeLstat(this.dockerService, containerId, target);
+      if (entry.type === 'directory') return { ok: true };
+      const err = new Error('A file already exists at that path') as Error & { statusCode?: number };
+      err.statusCode = 409;
+      throw err;
+    } catch (err: any) {
+      // 404 (not found) is expected — proceed to create. Re-throw other errors
+      // (incl. 400 escapes from probeLstat).
+      if (err?.statusCode !== 404) throw err;
+    }
+
+    // Validate the nearest existing ancestor's containment before creating —
+    // a `mkdir -p` under an escaping symlink would otherwise create outside
+    // /workspace. check_many walks to the nearest existing ancestor for a
+    // missing path and reports it as escaping when that ancestor escapes.
+    const { escaping } = await runProbeCheckMany(this.dockerService, containerId, [target]);
+    if (escaping.length > 0) {
+      const err = new Error('mkdir target escapes the workspace root') as Error & { statusCode?: number };
+      err.statusCode = 400;
+      throw err;
+    }
+
+    const res = await this.dockerService.execCapture(containerId, ['mkdir', '-p', full], { user: 'agent' });
+    if (res.exitCode !== 0) {
+      // mkdir -p fails (e.g. a file blocks an intermediate segment) -> 409.
+      const err = new Error(`mkdir failed: ${res.stderr.toString('utf8').trim() || 'unknown error'}`) as Error & { statusCode?: number };
+      err.statusCode = 409;
+      throw err;
+    }
+    return { ok: true };
+  }
+
+  /** `POST /api/containers/:id/files/rename` — same-directory rename, no
+   *  overwrite. Both source and target are validated; the target must not
+   *  exist (409) and must not escape /workspace. Uses GNU `mv --no-target-
+   *  directory --no-clobber` (exact target, no-clobber) as the `agent` user via
+   *  positional argv, then verifies the source disappeared and the target
+   *  exists — GNU `mv -n` can exit 0 on a skip, so success is confirmed by the
+   *  post-move filesystem state, not the exit code alone. */
+  async renameFile(id: string, rel: string, newName: string): Promise<{ ok: true }> {
+    const containerId = this.dockerIdForFiles(id);
+    const src = normalizeClientPath(rel, { allowRoot: false });
+    const name = validateName(newName, 'newName');
+    const parent = parentRelPath(src);
+    const targetRel = parent === '' ? name : `${parent}/${name}`;
+
+    // Source must exist and be contained.
+    await probeLstat(this.dockerService, containerId, src);
+
+    // Target must not exist (no overwrite) and must not escape /workspace.
+    // check_many reports a missing target as escaping when its nearest existing
+    // ancestor escapes (e.g. renaming into a path under an escaping symlink).
+    const { existing, escaping } = await runProbeCheckMany(this.dockerService, containerId, [targetRel]);
+    if (escaping.length > 0) {
+      const err = new Error('Rename target escapes the workspace root') as Error & { statusCode?: number };
+      err.statusCode = 400;
+      throw err;
+    }
+    if (existing.length > 0) {
+      const err = new Error('A file or directory with that name already exists') as Error & { statusCode?: number };
+      err.statusCode = 409;
+      throw err;
+    }
+
+    const srcFull = toContainerPath(src);
+    const targetFull = toContainerPath(targetRel);
+    // --no-target-directory (-T): treat the target as a file, not "move into dir".
+    // --no-clobber (-n): never overwrite an existing target. Both via argv.
+    const res = await this.dockerService.execCapture(
+      containerId,
+      ['mv', '--no-target-directory', '--no-clobber', srcFull, targetFull],
+      { user: 'agent' },
+    );
+    // GNU `mv -n` exits 0 even when it skipped because the target existed. We
+    // already ruled out an existing target above, but a race could still cause a
+    // skip — confirm the move actually happened by the post-move state.
+    const postSrc = await this.dockerService.execCapture(containerId, ['test', '-e', srcFull], { user: 'agent' });
+    const postTarget = await this.dockerService.execCapture(containerId, ['test', '-e', targetFull], { user: 'agent' });
+    if (postSrc.exitCode === 0 || postTarget.exitCode !== 0) {
+      // Source still present or target missing — the move did not happen.
+      const err = new Error(`rename failed: ${res.stderr.toString('utf8').trim() || 'source was not moved'}`) as Error & { statusCode?: number };
+      err.statusCode = 409;
+      throw err;
+    }
+    return { ok: true };
+  }
+
+  /**
+   * `POST /api/containers/:id/files/move` — move every `srcRels` entry into the
+   *  existing destination directory `destRel` (`` for the workspace root). When
+   *  `overwrite` is false, the full conflict list is returned via a 409 BEFORE
+   *  any move. Escaping symlinks/parents and escaping targets are rejected up
+   *  front. Uses GNU `mv --no-target-directory` (exact target semantics) with
+   *  `--no-clobber` (overwrite=false) or `--force` (overwrite=true) as the
+   *  `agent` user via positional argv, then verifies each move by the post-move
+   *  filesystem state (GNU `mv -n` can exit 0 on a skip).
+   */
+  async moveFiles(id: string, srcRels: string[], destRel: string, overwrite: boolean): Promise<{ moved: number; conflicts?: MoveConflict[] }> {
+    const containerId = this.dockerIdForFiles(id);
+    const srcs = normalizeClientPathList(srcRels, { allowRoot: false });
+    // The destination may be the workspace root itself.
+    const dest = normalizeClientPath(destRel, { allowRoot: true });
+
+    // Destination must exist and be a directory.
+    const destEntry = await probeLstat(this.dockerService, containerId, dest);
+    if (destEntry.type !== 'directory') {
+      const err = new Error('Move destination is not a directory') as Error & { statusCode?: number };
+      err.statusCode = 409;
+      throw err;
+    }
+
+    // Each source must exist and be contained; compute its target inside dest.
+    const moves: { src: string; targetRel: string }[] = [];
+    for (const src of srcs) {
+      await probeLstat(this.dockerService, containerId, src);
+      const base = baseName(src);
+      const targetRel = dest === '' ? base : `${dest}/${base}`;
+      if (targetRel === src) continue; // already in the requested destination
+      if (targetRel.startsWith(`${src}/`)) {
+        const err = new Error('Cannot move a directory into itself or its descendant') as Error & { statusCode?: number };
+        err.statusCode = 409;
+        throw err;
+      }
+      moves.push({ src, targetRel });
+    }
+    if (moves.length === 0) return { moved: 0 };
+
+    // Always check_many on the targets: it is the escape gate (walks to the
+    // nearest existing ancestor for a missing target, so a move into a path
+    // under an escaping symlink is rejected) and, with overwrite=false, also
+    // surfaces the conflict list.
+    const { existing, escaping } = await runProbeCheckMany(this.dockerService, containerId, moves.map((m) => m.targetRel));
+    if (escaping.length > 0) {
+      const err = new Error('Move target escapes the workspace root') as Error & { statusCode?: number };
+      err.statusCode = 400;
+      throw err;
+    }
+    if (!overwrite && existing.length > 0) {
+      const existingSet = new Set(existing);
+      const conflicts: MoveConflict[] = [];
+      for (const m of moves) {
+        if (existingSet.has(toContainerPath(m.targetRel))) {
+          conflicts.push({ source: m.src, target: m.targetRel });
+        }
+      }
+      const err = new Error('Move conflicts with existing paths') as Error & { statusCode?: number; conflicts?: MoveConflict[] };
+      err.statusCode = 409;
+      (err as any).conflicts = conflicts;
+      throw err;
+    }
+
+    if (overwrite) {
+      const existingSet = new Set(existing);
+      for (const m of moves) {
+        if (existingSet.has(toContainerPath(m.targetRel)) && m.src.startsWith(`${m.targetRel}/`)) {
+          const err = new Error('Cannot replace a destination that contains the move source') as Error & { statusCode?: number };
+          err.statusCode = 409;
+          throw err;
+        }
+      }
+    }
+
+    // Move each entry with exact-target semantics. --no-target-directory (-T)
+    // treats the target as the exact destination (never "move into a same-named
+    // dir"). --no-clobber (-n) for overwrite=false; --force (-f) for
+    // overwrite=true. Then verify by post-move state because GNU `mv -n` can
+    // exit 0 on a skip.
+    let moved = 0;
+    for (const m of moves) {
+      const srcFull = toContainerPath(m.src);
+      const targetFull = toContainerPath(m.targetRel);
+      if (overwrite && existing.includes(targetFull)) {
+        const removeTarget = await this.dockerService.execCapture(containerId, ['rm', '-rf', '--', targetFull], { user: 'agent' });
+        if (removeTarget.exitCode !== 0) {
+          const err = new Error(`move failed for '${m.src}': could not replace destination`) as Error & { statusCode?: number };
+          err.statusCode = 409;
+          throw err;
+        }
+      }
+      const mvArgs = ['mv', '--no-target-directory', ...(overwrite ? ['--force'] : ['--no-clobber']), srcFull, targetFull];
+      const res = await this.dockerService.execCapture(containerId, mvArgs, { user: 'agent' });
+      // Verify the move actually happened (defeats the mv -n exit-0-on-skip race).
+      const postSrc = await this.dockerService.execCapture(containerId, ['test', '-e', srcFull], { user: 'agent' });
+      const postTarget = await this.dockerService.execCapture(containerId, ['test', '-e', targetFull], { user: 'agent' });
+      if (postTarget.exitCode === 0 && postSrc.exitCode !== 0) {
+        moved++;
+        continue;
+      }
+      const msg = res.stderr.toString('utf8').trim();
+      // Source vanished (race) and target absent — treat as skipped, not failed.
+      if (postSrc.exitCode !== 0 && postTarget.exitCode !== 0) continue;
+      const err = new Error(`move failed for '${m.src}': ${msg || 'source was not moved'}`) as Error & { statusCode?: number };
+      err.statusCode = 409;
+      throw err;
+    }
+    return { moved };
+  }
+
+  /** `DELETE /api/containers/:id/files` — delete every `rels` entry (files,
+   *  directories, symlinks). The workspace root is never deletable. Missing
+   *  paths are ignored (idempotent). Escaping symlinks/parents are rejected up
+   *  front. Uses `rm -rf` on each entry as the `agent` user via positional
+   *  argv. */
+  async deleteFiles(id: string, rels: string[]): Promise<{ deleted: number }> {
+    const containerId = this.dockerIdForFiles(id);
+    const targets = normalizeClientPathList(rels, { allowRoot: false });
+
+    // Probe existence (and containment) in one call so escaping symlinks are
+    // rejected before any deletion, and missing paths are skipped idempotently.
+    const { existing, escaping } = await runProbeCheckMany(this.dockerService, containerId, targets);
+    if (escaping.length > 0) {
+      const err = new Error('Refusing to delete through a symlink that escapes the workspace') as Error & { statusCode?: number };
+      err.statusCode = 400;
+      throw err;
+    }
+    const existingSet = new Set(existing);
+
+    let deleted = 0;
+    for (const rel of targets) {
+      if (!existingSet.has(toContainerPath(rel))) continue;
+      const res = await this.dockerService.execCapture(containerId, ['rm', '-rf', '--', toContainerPath(rel)], { user: 'agent' });
+      if (res.exitCode === 0) {
+        deleted++;
+      } else {
+        const msg = res.stderr.toString('utf8').trim();
+        if (/No such file or directory/.test(msg)) continue;
+        const err = new Error(`delete failed for '${rel}': ${msg || 'unknown error'}`) as Error & { statusCode?: number };
+        err.statusCode = 409;
+        throw err;
+      }
+    }
+    return { deleted };
+  }
+
+  /**
+   * `POST /api/containers/:id/files/download` — when `rels` is exactly one
+   *  regular file, return `{ kind: 'file', stream, entry }` so the route can
+   *  stream raw bytes with a safe Content-Disposition. Otherwise return
+   *  `{ kind: 'zip', stream }` for a true ZIP archive (relative names
+   *  preserved, hidden files included, symlinks stored without following
+   *  external targets), streamed with backpressure. Escaping symlinks are
+   *  rejected. The returned stream is a Node Readable; the route wires
+   *  client-close cleanup.
+   */
+  async downloadFiles(
+    id: string,
+    rels: string[],
+  ): Promise<
+    | { kind: 'file'; stream: Readable; entry: FileEntry }
+    | { kind: 'zip'; stream: Readable }
+  > {
+    const containerId = this.dockerIdForFiles(id);
+    const targets = normalizeClientPathList(rels, { allowRoot: false });
+
+    // Resolve every target's metadata (existence + containment). Escaping
+    // symlinks are rejected outright (probeLstat enforces realpath containment
+    // for all types, so a regular file reached through an escaping symlink is
+    // rejected here too).
+    const entries: FileEntry[] = [];
+    for (const rel of targets) {
+      const entry = await probeLstat(this.dockerService, containerId, rel);
+      entries.push(entry);
+    }
+
+    // Single regular file -> raw byte stream via Docker getArchive, demuxed
+    // from the tar envelope into a plain file stream.
+    if (entries.length === 1 && entries[0]!.type === 'file') {
+      const entry = entries[0]!;
+      const tarStream = await this.dockerService.getArchive(containerId, toContainerPath(entry.path));
+      const fileStream = demuxSingleFileFromTar(tarStream, entry.size);
+      return { kind: 'file', stream: fileStream, entry };
+    }
+
+    // Otherwise build a true ZIP from the Docker tar archives of each target.
+    // buildWorkspaceZip returns its output stream immediately and runs the
+    // sequential append/finalize detached so output backpressure cannot
+    // deadlock; redundant descendant selections are filtered inside it.
+    const zipStream = buildWorkspaceZip(this.dockerService, containerId, entries);
+    return { kind: 'zip', stream: zipStream };
+  }
+
+  /**
+   * `POST /api/containers/:id/clipboard` — set the worker's X11 CLIPBOARD
+   *  selection from a raw `image/png` or UTF-8 `text/plain` payload. The route
+   *  has already validated the MIME, size caps, PNG signature/IHDR/dimensions,
+   *  and UTF-8 well-formedness; this method streams the (already-validated)
+   *  bytes to the audited `/home/agent/clipboard/set.sh` helper inside the
+   *  worker as the `agent` user via Docker exec (non-TTY, stdin wired through
+   *  `execCapture`). The helper owns the X CLIPBOARD selection via xclip and
+   *  returns only after the owner is serving, so no arbitrary delay is needed.
+   *
+   *  Helper failure is mapped precisely by exit code to an HTTP status — the
+   *  helper's stderr is NEVER returned to the client (it is internal only and
+   *  never contains clipboard contents), so a failure never echoes clipboard
+   *  data. `mime` is passed as a positional argv element (never interpolated
+   *  into a shell), and `bytes` flows over stdin (never argv), so the payload
+   *  cannot inject commands.
+   *
+   *  Returns `{ ok: true }` on success. Throws an Error carrying `statusCode`
+   *  on failure (400/409/422/500) so `rethrowAsHttpError` preserves it.
+   */
+  async setClipboard(id: string, mime: 'image/png' | 'text/plain', bytes: Buffer): Promise<{ ok: true }> {
+    const containerId = this.dockerIdForFiles(id);
+    const res = await this.dockerService.execCapture(
+      containerId,
+      ['/home/agent/clipboard/set.sh', mime],
+      { stdin: bytes, user: 'agent' },
+    );
+    if (res.exitCode === 0) return { ok: true };
+
+    // Map the helper's documented exit codes to HTTP statuses. Messages are
+    // fixed strings here (not the helper's stderr) so the response can never
+    // leak clipboard data or internal diagnostics.
+    const map: Record<number, { statusCode: number; statusMessage: string }> = {
+      2: { statusCode: 415, statusMessage: 'Unsupported clipboard type' },
+      3: { statusCode: 400, statusMessage: 'Empty clipboard payload' },
+      4: { statusCode: 413, statusMessage: 'Clipboard payload exceeds the size limit' },
+      5: { statusCode: 415, statusMessage: 'Invalid PNG payload' },
+      6: { statusCode: 500, statusMessage: 'Clipboard helper unavailable' },
+      7: { statusCode: 422, statusMessage: 'Failed to set clipboard selection' },
+    };
+    const mapped = map[res.exitCode] ?? { statusCode: 500, statusMessage: 'Clipboard helper failed' };
+    const err = new Error(mapped.statusMessage) as Error & { statusCode?: number };
+    err.statusCode = mapped.statusCode;
+    throw err;
   }
 
   async stop(id: string): Promise<void> {

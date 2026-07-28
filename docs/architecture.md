@@ -12,6 +12,10 @@ Orchestrator             <--docker exec-> apps/*/manage.sh (start/stop/list app 
 Orchestrator (TraefikManager) <--dockerode--> Traefik container (unified proxy: port mappings + domain routing, TLS)
 ```
 
+Two additive, opt-in bridges run over the existing proxied terminal/desktop channels (no new topology):
+- **Workspace file manager** — `/api/containers/:id/files/*` (list/upload/download/mkdir/rename/move/delete). All ops run through Docker `exec`/`getArchive`/`putArchive` against the running container as uid 1000, with lexical + in-container realpath/lstat containment; the orchestrator never touches the host workspace path.
+- **Keyboard-transparent clipboard paste** — `POST /api/containers/:id/clipboard` sets the worker's X11 CLIPBOARD (via `xclip` in the worker). The terminal (`useClipboardPasteBridge`) and the noVNC desktop (`agentor.html` + `agentor-clipboard.js`) intercept Ctrl/Cmd+V, POST the host-clipboard payload, then replay the paste key so the agent/GUI app reads the synced X selection. No clipboard contents are logged or persisted.
+
 Three managed containers:
 - **Orchestrator**: Nuxt 3 app (SPA mode) with Nitro server, serving dashboard + managing workers and the Traefik container via Docker socket
 - **Traefik**: Unified reverse proxy for both TCP port mappings (one dedicated entrypoint per mapping) and HTTP/HTTPS/TCP domain routing with Let's Encrypt TLS. Managed by the orchestrator — created when any port mapping, domain mapping, or dashboard subdomain is configured, removed when empty. Domain routing requires `BASE_DOMAINS`; port mappings work without it.

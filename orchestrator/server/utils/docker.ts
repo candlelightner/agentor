@@ -1,10 +1,12 @@
 import Docker from 'dockerode';
+import { PassThrough } from 'node:stream';
 import type { Duplex } from 'node:stream';
 import type { Config } from './config';
 import { getAppType } from './apps';
 import { renderUserEnvVars } from './user-env-store';
-import type { MountConfig, TmuxWindow, AppInstanceInfo, NetworkMode, ExposeApis, UserEnvVars } from '../../shared/types';
+import type { MountConfig, TmuxWindow, AppInstanceInfo, NetworkMode, ExposeApis, UserEnvVars, FileEntry } from '../../shared/types';
 import type { StorageManager } from './storage';
+import type { ExecCaptureResult } from './workspace-probe';
 
 export interface EnvironmentJsonPayload {
   networkMode: string;
@@ -571,6 +573,88 @@ export class DockerService {
     } catch {
       // Image may not exist or still be in use — ignore.
     }
+  }
+
+  // --- Workspace file manager (in-container, as uid 1000 / agent) ---
+  //
+  // These methods implement the secure full `/workspace` file manager. They
+  // NEVER touch host workspace paths: every operation runs through Docker
+  // exec/getArchive/putArchive against the running worker container, executed
+  // as the `agent` user (uid 1000). Path arguments are always normalised,
+  // lexically-validated relative paths (see `workspace-path.ts`) converted to
+  // in-container absolute paths; an in-container realpath/lstat containment
+  // check (see `workspace-probe.ts`) defeats symlink traversal so an operation
+  // can never escape `/workspace`.
+
+  /**
+   * Run a command inside a container as the `agent` user (uid 1000), capturing
+   * demuxed stdout/stderr and the exit code. Non-TTY so stdout/stderr are
+   * separate clean streams (no 8-byte framing on the captured buffers). When
+   * `stdin` is supplied it is written to the exec's stdin before the stream is
+   * ended. The command is passed as an argv array — never interpolated into a
+   * shell — so caller-supplied data (paths, payloads) cannot inject code.
+   */
+  async execCapture(
+    containerId: string,
+    cmd: string[],
+    opts: { stdin?: Buffer; user?: string; workdir?: string } = {},
+  ): Promise<ExecCaptureResult> {
+    const container = this.docker.getContainer(containerId);
+    const exec = await container.exec({
+      Cmd: cmd,
+      AttachStdin: !!opts.stdin,
+      AttachStdout: true,
+      AttachStderr: true,
+      Tty: false,
+      ...(opts.user ? { User: opts.user } : {}),
+      ...(opts.workdir ? { WorkingDir: opts.workdir } : {}),
+    });
+    const stream = (await exec.start({ Detach: false, Tty: false, stdin: !!opts.stdin })) as Duplex;
+
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    // Demux the multiplexed Docker stream into separate stdout/stderr buffers.
+    // Falls back to raw passthrough on stdout if the stream is not framed.
+    container.modem.demuxStream(stream, stdout, stderr);
+
+    if (opts.stdin) {
+      stream.write(opts.stdin);
+    }
+    if (opts.stdin || (stream as any).writable) {
+      try { stream.end(); } catch { /* already ended */ }
+    }
+
+    // Consume stdout AND stderr concurrently. Awaiting them sequentially can
+    // deadlock the demuxer: if stderr's internal buffer fills while we are
+    // still awaiting stdout (or vice versa), the multiplexed stream stops
+    // being drained and neither side ever ends. Promise.all drains both sides
+    // in parallel so backpressure never stalls the other half.
+    const [stdoutBuf, stderrBuf] = await Promise.all([
+      this.streamToBuffer(stdout),
+      this.streamToBuffer(stderr),
+    ]);
+    // Drain any trailing stream events before inspecting the exit code. The
+    // demuxer ends stdout/stderr when the underlying stream ends, but the
+    // exec's ExitCode is only finalised after the engine records completion.
+    await new Promise<void>((resolve) => {
+      const done = () => resolve();
+      stream.once('end', done);
+      stream.once('error', done);
+      // If the stream already ended (demux finished), resolve immediately.
+      if ((stream as any).readableEnded) resolve();
+    });
+
+    const info = await exec.inspect();
+    return { stdout: stdoutBuf, stderr: stderrBuf, exitCode: info.ExitCode ?? 0 };
+  }
+
+  private streamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      stream.on('data', (c: Buffer) => chunks.push(c));
+      stream.on('end', () => resolve(Buffer.concat(chunks)));
+      stream.on('error', reject);
+    });
   }
 
   // --- Resource metrics ---

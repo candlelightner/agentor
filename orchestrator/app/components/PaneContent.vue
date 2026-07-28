@@ -43,7 +43,7 @@ watch(() => props.group.tabs, (tabs) => {
           endpoint="desktop"
           label="Desktop"
           icon-name="i-lucide-monitor"
-          :url="`/desktop/${tab.containerId}/vnc.html?autoconnect=true&resize=scale&quality=9&compression=0&reconnect=true&reconnect_delay=2000&path=ws/desktop/${tab.containerId}`"
+          :url="`/desktop/${tab.containerId}/agentor.html?autoconnect=true&resize=scale&quality=9&compression=0&reconnect=true&reconnect_delay=2000&path=ws/desktop/${tab.containerId}`"
         />
         <AppsPane
           v-else-if="tab.type === 'apps'"

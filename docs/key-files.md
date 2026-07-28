@@ -10,7 +10,7 @@
 - `orchestrator/app.config.ts` - App-level configuration
 
 ## Orchestrator — Shared
-- `orchestrator/shared/types.ts` - Shared TypeScript interfaces used by both server and client (RepoConfig, MountConfig, TmuxWindow, AppInstanceInfo, NetworkMode, ServiceStatus, ContainerInfo, ContainerStatus, CreateContainerRequest, ImageUpdateInfo, UpdateStatus, ApplyResult, PruneResult, AgentAuthType, UsageWindow, AgentUsageInfo, AgentUsageStatus, WorkerMetrics, WorkerMetricsStatus, ExposeApis, CapabilityInfo, InstructionInfo, InitScriptInfo, CredentialInfo, UserEnvVar, UserEnvVars, UserEnvVarsInput, UserSshKey, PREDEFINED_ENV_VAR_KEYS, UpdatableImage, LogLevel, LogSource, LogEntry). `UserEnvVars` is `{ userId, createdAt, updatedAt, envVars: UserEnvVar[] }` (`UserEnvVar = { key, value }` — a uniform list, no hardcoded fields); `UserEnvVarsInput = { envVars? }`; `UserSshKey = { sshPublicKey }`; `PREDEFINED_ENV_VAR_KEYS` is the predefined-key UI affordance list (`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`, `GEMINI_API_KEY`) — extend it to add a predefined input. All user-owned resource types now carry a `userId` field (required for Container/Worker/PortMapping/DomainMapping, nullable for Capability/Instruction/InitScript/Environment where `null` = built-in/global).
+- `orchestrator/shared/types.ts` - Shared TypeScript interfaces used by both server and client (RepoConfig, MountConfig, TmuxWindow, AppInstanceInfo, NetworkMode, ServiceStatus, ContainerInfo, ContainerStatus, CreateContainerRequest, ImageUpdateInfo, UpdateStatus, ApplyResult, PruneResult, AgentAuthType, UsageWindow, AgentUsageInfo, AgentUsageStatus, WorkerMetrics, WorkerMetricsStatus, ExposeApis, CapabilityInfo, InstructionInfo, InitScriptInfo, CredentialInfo, UserEnvVar, UserEnvVars, UserEnvVarsInput, UserSshKey, PREDEFINED_ENV_VAR_KEYS, UpdatableImage, LogLevel, LogSource, LogEntry, FileEntryType, FileEntry, FileListing, MkdirRequest, RenameRequest, MoveRequest, MoveConflict, MoveConflictResponse, MoveResult, DeleteFilesRequest, DeleteFilesResult, DownloadFilesRequest, UploadFilesResult). `UserEnvVars` is `{ userId, createdAt, updatedAt, envVars: UserEnvVar[] }` (`UserEnvVar = { key, value }` — a uniform list, no hardcoded fields); `UserEnvVarsInput = { envVars? }`; `UserSshKey = { sshPublicKey }`; `PREDEFINED_ENV_VAR_KEYS` is the predefined-key UI affordance list (`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`, `GEMINI_API_KEY`) — extend it to add a predefined input. The workspace file-manager types (`FileEntry`/`FileListing`/`MkdirRequest`/`RenameRequest`/`MoveRequest`/`MoveConflict`/`MoveConflictResponse`/`MoveResult`/`DeleteFilesRequest`/`DeleteFilesResult`/`DownloadFilesRequest`/`UploadFilesResult`, with `FileEntryType = 'file' | 'directory' | 'symlink'`) back the `/api/containers/:id/files/*` routes and the Files popup. All user-owned resource types now carry a `userId` field (required for Container/Worker/PortMapping/DomainMapping, nullable for Capability/Instruction/InitScript/Environment where `null` = built-in/global).
 
 ## Orchestrator — Server
 - `orchestrator/Dockerfile` - Multi-stage Node 22 Alpine build (includes python3/make/g++ for better-sqlite3 native build)
@@ -89,6 +89,20 @@
 - `orchestrator/server/api/containers/[id]/metrics.get.ts` - Single worker's metrics (ownership-checked)
 - `orchestrator/server/api/containers/[id]/export.get.ts` - Worker export (streams the `.tar` bundle; `?includeRootfs=`)
 - `orchestrator/server/api/containers/import.post.ts` - Worker import (raw `.tar` body streamed to disk → `importWorker`)
+- `orchestrator/server/api/containers/[id]/files/index.get.ts` - Workspace file manager: one-level directory listing (defines the OpenAPI `FileEntry`/`FileListing` + mutation schemas for the group). Running-worker only, owner-scoped, no host-path access, executes as uid 1000.
+- `orchestrator/server/api/containers/[id]/files/upload.post.ts` - Multipart upload into a destination dir (relative folder paths preserved; `overwrite=false` → 409 conflict list; 100 MiB / 1000-entry caps → 413; tar entries uid/gid 1000).
+- `orchestrator/server/api/containers/[id]/files/download.post.ts` - Single regular file → raw bytes; folder/multi → true ZIP stream (hidden files included, symlinks stored not followed, escaping symlinks rejected).
+- `orchestrator/server/api/containers/[id]/files/mkdir.post.ts` - Create dir + parents (idempotent; 409 when a file blocks the path).
+- `orchestrator/server/api/containers/[id]/files/rename.post.ts` - Same-parent rename, no overwrite (409 on existing target).
+- `orchestrator/server/api/containers/[id]/files/move.post.ts` - Move entries into an existing dir (root allowed); 409 `{ conflicts }` on `overwrite=false`, `overwrite=true` replaces.
+- `orchestrator/server/api/containers/[id]/files/index.delete.ts` - Delete entries (root blocked; missing idempotent; escaping symlinks rejected before any deletion).
+- `orchestrator/server/api/containers/[id]/clipboard.post.ts` - Set the worker X11 CLIPBOARD from a raw `image/png` (≤16 MiB) or UTF-8 `text/plain` (≤1 MiB) body. Auth/ownership/running checked BEFORE the body; returns `{ ok, type, width?, height? }` (never contents).
+- `orchestrator/server/utils/files-route-helpers.ts` - Shared preamble for every `/api/containers/:id/files/*` route: authenticate + ownership-check the worker BEFORE the body is read.
+- `orchestrator/server/utils/workspace-path.ts` - Lexical validation + normalisation of client workspace paths (the first chokepoint: rejects `..`/absolute/backslash/NUL/control, depth/length caps; `toContainerPath`/`parentRelPath`/`baseName`/`filterRedundantDescendants` helpers; upload caps `MAX_UPLOAD_TOTAL_BYTES`/`MAX_UPLOAD_ENTRIES`).
+- `orchestrator/server/utils/workspace-probe.ts` - A single audited Python probe executed in the worker as uid 1000 for in-container realpath/lstat containment checks + one-level directory listings of `/workspace` (the second chokepoint that defeats symlink traversal; output contract documented inline).
+- `orchestrator/server/utils/workspace-probe-runner.ts` - `probeLstat`/`probeList`/`runProbeCheckMany` — runs the workspace-probe script via Docker exec and maps its JSON exit contract to typed results / h3 errors.
+- `orchestrator/server/utils/workspace-zip.ts` - Streaming workspace archive assembly: `demuxSingleFileFromTar` (raw single-file download from a Docker tar envelope) + `buildWorkspaceZip` (true ZIP via `archiver`, streamed with backpressure; symlinks stored not followed; host paths never exposed).
+- `orchestrator/server/types/archiver.d.ts` - Ambient module declaration for the `archiver` ZIP library.
 - `orchestrator/server/api/` - REST API routes (file-based, JSON only)
 - `orchestrator/server/routes/desktop/` - HTTP reverse proxy for noVNC static files (per-container)
 - `orchestrator/server/routes/editor/` - Combined HTTP+WS proxy for code-server (per-container, h3 combined handler + ws-utils relay)
@@ -142,7 +156,10 @@
 - `orchestrator/app/components/SshAppRow.vue` - Apps-pane row for the `ssh` app type (ssh command with external port, missing-public-key warning, Stop button)
 - `orchestrator/app/components/UsagePanel.vue` - Agent usage monitoring panel (progress bars, auth badges, reset times)
 - `orchestrator/app/components/ImportWorkerModal.vue` - Import a worker from an export bundle (file picker + optional display name)
-- `orchestrator/app/components/UploadModal.vue` - Modal for workspace file uploads
+- `orchestrator/app/components/UploadModal.vue` - Modal for workspace file uploads (the quick Upload action; uses `FileDropZone` with Browse files / Browse folder)
+- `orchestrator/app/components/WorkspaceFilesModal.vue` - Optional additive Workspace Files popup on a running worker card (lazy `/workspace` browse, breadcrumbs, multi-select, upload/download/mkdir/rename/move/confirmed-delete; the quick Upload/Download/Export actions remain). Backed by `useWorkspaceFiles`.
+- `orchestrator/app/composables/useWorkspaceFiles.ts` - Client for the `/api/containers/:id/files/*` routes (list/mkdir/rename/move/upload/download) with typed conflict results + toast conventions.
+- `orchestrator/app/composables/useClipboardPasteBridge.ts` - Keyboard-transparent host → worker clipboard bridge for the terminal target: feature-detects the secure async Clipboard API, reads/normalises images to PNG, caps payloads, POSTs to `/api/containers/:id/clipboard`; per-target concurrency guard; never logs contents.
 - `orchestrator/app/composables/useApps.ts` - App CRUD + polling
 - `orchestrator/app/composables/useArchivedWorkers.ts` - Archived workers list + polling
 - `orchestrator/app/composables/useContainers.ts` - Container CRUD + polling
@@ -183,6 +200,8 @@
 - `worker/apps/vscode-tunnel/manage.sh` - VS Code tunnel app manager (start/stop/list via docker exec; NDJSON)
 - `worker/apps/vscode-desktop/manage.sh` - Persistent noVNC-hosted code-server client manager (Chromium app mode; start/stop/list via docker exec; NDJSON)
 - `worker/apps/ssh/manage.sh` - SSH server app manager (start/stop/list via docker exec; NDJSON; sshd on port 22 with public-key auth from bind-mounted authorized_keys)
+- `worker/clipboard/set.sh` - Worker X11 CLIPBOARD setter (reads stdin to a temp file, validates PNG signature/IHDR/dimensions, offers the selection via `xclip` as `image/png` or `UTF8_STRING`, verifies ownership before returning; never logs contents; defence-in-depth local caps matching the server).
+- `worker/novnc/agentor-clipboard.js` - noVNC clipboard bridge module: capture-intercepts Ctrl/Cmd+V (+Ctrl+Alt+V) in the desktop iframe, reads the host clipboard, normalises images to PNG, POSTs to `/api/containers/:id/clipboard`, then replays Linux Ctrl+V via `UI.rfb.sendKey` (including for host Cmd+V); no clipboard contents logged. Imported once by `agentor.html`.
 - `worker/agents/claude/setup.sh` - Claude auth + config + capabilities/instructions writing (reads CAPABILITIES/INSTRUCTIONS JSON env vars)
 - `worker/agents/codex/setup.sh` - Codex auth + config + capabilities/instructions writing
 - `worker/agents/gemini/setup.sh` - Gemini auth + config + capabilities/instructions writing
@@ -193,9 +212,10 @@
 - `tests/helpers/worker-lifecycle.ts` - Container create/cleanup helpers with timeouts
 - `tests/helpers/terminal-ws.ts` - WebSocket terminal client with ANSI stripping
 - `tests/helpers/ui-helpers.ts` - Page navigation and interaction helpers
+- `tests/helpers/clipboard.ts` - Clipboard-paste bridge test helpers (build a host clipboard payload, POST to `/api/containers/:id/clipboard`, parse the X-selection response) for the terminal/desktop bridge specs.
 - `tests/helpers/test-users.ts` - Create/sign-in/delete test users via the admin API (used by passkey + authorization tests)
 - `tests/helpers/webauthn.ts` - Install/dispose Chrome DevTools virtual WebAuthn authenticator for end-to-end passkey tests (`installVirtualAuthenticator(page)`)
-- `tests/api/*.spec.ts` - API integration tests (58 files; incl. worker-metrics, worker-export-import, github-repos, kilo-code — ~854 tests)
-- `tests/ui/*.spec.ts` - UI integration tests (44 files; incl. worker-card-actions, import-worker-modal, github-autocomplete-refresh — ~544 tests)
+- `tests/api/*.spec.ts` - API integration tests (60 files; incl. workspace-files, clipboard, worker-metrics, worker-export-import, github-repos, kilo-code — ~920 tests)
+- `tests/ui/*.spec.ts` - UI integration tests (46 files; incl. workspace-files-modal, clipboard-paste, worker-card-actions, import-worker-modal, github-autocomplete-refresh — ~590 tests)
 - `tests/FEATURES.md` - Feature inventory driving test coverage
-- `tests/TESTS.md` - Test suite documentation with counts per file (~1398 total tests)
+- `tests/TESTS.md` - Test suite documentation with counts per file (~1510 total tests)

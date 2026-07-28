@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **~1398 tests** across 102 test files (~854 API + ~544 UI)
+- **~1510 tests** across 106 test files (~920 API across 60 files + ~590 UI across 46 files)
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -98,13 +98,13 @@ tests/
     worker-lifecycle.ts    # Container create/cleanup utilities
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
-  api/                     # API endpoint tests (~854 tests across 58 files)
-  ui/                      # UI interaction tests (~544 tests across 44 files)
+  api/                     # API endpoint tests (~920 tests across 60 files)
+  ui/                      # UI interaction tests (~590 tests across 46 files)
 ```
 
 ## Test Categories
 
-### API Tests (~854 tests, 58 files)
+### API Tests (~920 tests, 60 files)
 
 | File | Tests | Coverage |
 |------|-------|----------|
@@ -166,8 +166,10 @@ tests/
 | `worker-export-import.spec.ts` | 10 | Export streams a `.tar` bundle (content-type/disposition; manifest + workspace.tar.gz + agents.tar.gz present, rootfs.tar.gz absent with `includeRootfs=false`), strips `.kilo/config`, the shared `.kilo/shared-data` directory, and the legacy `.kilo/data/auth.json` from `agents.tar.gz` while retaining per-worker Kilo state, export 404/401; import rejects a garbage bundle (400) + 401 unauth; **round-trip**: upload a marker file → export → import (fresh UUID id, `agentor-worker-<id>` name, displayName override) → boot → download workspace and confirm the marker file restored; and port-mapping recreation for the imported worker (export with a mapping, remove source, import, assert mapping re-created on the new containerName). Round-trip uses `includeRootfs=false` for speed — the docker-export rootfs path is exercised via the default-on UI export, not in CI. |
 | `github-repos.spec.ts` | 3 | `GET /api/github/repos`: requires auth; a fresh user with no token → `tokenConfigured:false` + empty repos; a configured-but-bogus token → `tokenConfigured:true` with a surfaced `error` (regression for the old "any failure looks like no token" masking). Uses isolated test users. |
 | `ssh-auth.spec.ts` | 4 | SSH app end-to-end: starting the SSH app allocates a `22000–22999` external port mapping; a remote `whoami` over ssh with the user-supplied pubkey returns `agent`; ssh auth fails with a wrong key; a public-key update (`PUT /api/account/ssh-key`) propagates live to a running worker. (Live E2E — inherently timing-sensitive; relies on Playwright retries.) |
+| `workspace-files.spec.ts` | 52 | Workspace file manager `/api/containers/:id/files/*` routes (running-worker only, session-auth + owner-scoped, no host-path access, execute as uid 1000 `agent`, lexical + in-container realpath/lstat containment): list (one-level, dirs-first; symlink `linkTarget`/`linkEscapes`; breadcrumbs/metadata), upload (multipart, relative folder paths, conflict overwrite vs `overwrite=false` 409, 100 MiB / 1000-entry caps → 413, tar entries uid/gid 1000), download (single raw file vs true ZIP for folder/multi, hidden files included, symlinks stored not followed, escaping symlinks rejected), mkdir (idempotent, `mkdir -p`, file-blocks-path 409, escaping-parent rejected), rename (same-parent, no-overwrite 409), move (into existing dir incl. root, full conflict list on `overwrite=false` 409, `overwrite=true` replaces files or directories, escaping symlinks rejected up front), delete (root blocked via `allowRoot:false`, missing paths idempotent, escaping symlinks rejected before any deletion), auth/ownership/running-state ordering (checks before body), traversal/`..`/absolute/backslash/NUL rejection, worker-self/worker-id resolution |
+| `clipboard.spec.ts` | 14 | `POST /api/containers/:id/clipboard` (set worker X11 CLIPBOARD): auth/ownership/running checks BEFORE body (401/403/404/409), 415 unsupported MIME (only `image/png` + `text/plain`), 400 empty body, 413 over 16 MiB image / 1 MiB text caps, 415 bad PNG signature/IHDR/dimensions, 415 invalid UTF-8 (fatal TextDecoder), 200 returns `{ ok, type, width?, height? }` and NEVER clipboard contents, text uses UTF8_STRING X target, helper failure mapped by exit code, cross-user 403, stopped worker 409 |
 
-### UI Tests (~544 tests, 44 files)
+### UI Tests (~590 tests, 46 files)
 
 | File | Tests | Coverage |
 |------|-------|----------|
@@ -215,6 +217,8 @@ tests/
 | `worker-card-actions.spec.ts` | 4 | Refactored worker card: the running card exposes the Export button (tooltip), the action row is a horizontally-scrollable strip (`overflow-x: auto`), and per-worker live metrics (`data-testid="worker-metrics"`) render CPU%/RAM% from a stubbed `/api/worker-metrics` |
 | `import-worker-modal.spec.ts` | 2 | Import Worker modal opens from the sidebar Import button with file + name inputs and a disabled Import button; choosing a `.tar` file enables Import and shows the file name |
 | `github-autocomplete-refresh.spec.ts` | 1 | Regression: saving env vars in the Account modal refetches `/api/git-providers` (so the repo autocomplete gate updates without a page reload); env-vars PUT is stubbed so no real account state is mutated |
+| `workspace-files-modal.spec.ts` | 39 | Workspace Files popup on a running worker card (optional, additive — existing quick Upload/Download/Export remain): opens via the Files button (tooltip "Files", `i-lucide-folder-tree`); breadcrumbs rooted at `/workspace`; one-level lazy browse (dirs-first, metadata/hidden/symlink warnings incl. escaping-symlink indicator); multi-select (per-dir, select-all, clear); upload (exact-current-directory multi-file/folder via FileDropZone Browse files/Browse folder, conflict overwrite confirm); download (direct single-file vs ZIP for folder/multi); mkdir; rename (same-parent, no-overwrite); move (incl. into root); confirmed delete; error/loading/stopped states (popup closed when worker stops); keyboard + mobile usability |
+| `clipboard-paste.spec.ts` | 7 | Keyboard-transparent Ctrl/Cmd+V bridge: terminal target swallows the key only when the async Clipboard API is available, POSTs image/png to `/api/containers/:id/clipboard` and replays raw Ctrl+V (`\x16`) so Codex/GUI apps read the synced X clipboard, pastes text through xterm's normal bracketed-paste path (no X clipboard hit); desktop noVNC sibling page uses `agentor.html` (upstream `vnc.html` untouched) and loads the `agentor-clipboard.js` module; unsupported/denied/error fall back to prior behaviour; no clipboard contents logged |
 
 ## Design Decisions
 
