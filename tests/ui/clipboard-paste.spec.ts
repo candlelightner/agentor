@@ -134,10 +134,10 @@ test.describe.serial('Clipboard paste bridge — Agentor Terminal (xterm)', () =
       const file = new File([bytes], 'clipboard.png', { type: 'image/png' });
       const transfer = new DataTransfer();
       transfer.items.add(file);
-      const textarea = document.querySelector<HTMLTextAreaElement>('.xterm-helper-textarea');
-      if (!textarea) throw new Error('xterm helper textarea not found');
-      textarea.focus();
-      textarea.dispatchEvent(new ClipboardEvent('paste', {
+      const catcher = document.querySelector<HTMLTextAreaElement>('[data-agentor-paste-catcher="true"]');
+      if (!catcher) throw new Error('Agentor paste catcher not found');
+      catcher.focus();
+      catcher.dispatchEvent(new ClipboardEvent('paste', {
         clipboardData: transfer,
         bubbles: true,
         cancelable: true,

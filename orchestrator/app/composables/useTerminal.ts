@@ -178,7 +178,14 @@ export function useTerminal() {
 
     let nativePastePending = false;
     let nativePasteTimer: ReturnType<typeof setTimeout> | null = null;
+    const pasteCatcher = document.createElement('textarea');
+    pasteCatcher.dataset.agentorPasteCatcher = 'true';
+    pasteCatcher.tabIndex = -1;
+    pasteCatcher.setAttribute('aria-hidden', 'true');
+    pasteCatcher.style.cssText = 'position:fixed;left:-10000px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;';
+    containerEl.appendChild(pasteCatcher);
     const applyPasteResult = (res: { replayCtrlV: boolean; text?: string }) => {
+      term.focus();
       if (ws.readyState !== WebSocket.OPEN) return;
       if (res.replayCtrlV) ws.send('\x16');
       else if (res.text !== undefined) term.paste(res.text);
@@ -195,12 +202,16 @@ export function useTerminal() {
       nativePastePending = false;
       if (nativePasteTimer) clearTimeout(nativePasteTimer);
       nativePasteTimer = null;
+      term.focus();
       if (isPasteInFlight('terminal')) return;
       runGuarded('terminal', () => bridgeTerminalPasteEvent(containerId, data)).then(applyPasteResult);
     };
     containerEl.addEventListener('paste', onNativePaste, { capture: true });
+    pasteCatcher.addEventListener('paste', onNativePaste);
     pasteCleanup = () => {
       containerEl.removeEventListener('paste', onNativePaste, { capture: true });
+      pasteCatcher.removeEventListener('paste', onNativePaste);
+      pasteCatcher.remove();
       if (nativePasteTimer) clearTimeout(nativePasteTimer);
     };
 
@@ -232,14 +243,18 @@ export function useTerminal() {
       const isCtrlOrCmd = event.ctrlKey || event.metaKey;
       if (isPasteKey && isCtrlOrCmd && !event.altKey) {
         const hasClipboard = clipboardReadAvailable();
-        if (!hasClipboard) {
+        const preferNativePaste = /firefox/i.test(navigator.userAgent) || !hasClipboard;
+        if (preferNativePaste) {
           if (event.type === 'keydown') {
             nativePastePending = true;
             if (nativePasteTimer) clearTimeout(nativePasteTimer);
+            pasteCatcher.value = '';
+            pasteCatcher.focus({ preventScroll: true });
             // If Firefox does not dispatch a paste event, preserve the old raw
             // Ctrl+V behavior rather than swallowing the key indefinitely.
             nativePasteTimer = setTimeout(() => {
               nativePastePending = false;
+              term.focus();
               if (ws.readyState === WebSocket.OPEN) ws.send('\x16');
             }, 500);
           }
