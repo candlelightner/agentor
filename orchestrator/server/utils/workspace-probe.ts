@@ -191,7 +191,9 @@ def cmd_check_many(args):
     # symlink.
     if len(args) != 0:
         _fail("bad_args", code=64)
-    raw = sys.stdin.read()
+    # One newline-framed JSON record avoids depending on EOF propagation over
+    # Docker's hijacked exec socket.
+    raw = sys.stdin.readline()
     try:
         paths = json.loads(raw) if raw else []
     except Exception:

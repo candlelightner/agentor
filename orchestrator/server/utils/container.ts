@@ -945,7 +945,11 @@ export class ContainerManager {
     const containerId = this.dockerIdForFiles(id);
     const res = await this.dockerService.execCapture(
       containerId,
-      ['/home/agent/clipboard/set.sh', mime],
+      [
+        'sh', '-c',
+        'head -c "$1" | /home/agent/clipboard/set.sh "$2"',
+        'agentor-clipboard', String(bytes.length), mime,
+      ],
       { stdin: bytes, user: 'agent' },
     );
     if (res.exitCode === 0) return { ok: true };

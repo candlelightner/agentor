@@ -590,9 +590,9 @@ export class DockerService {
    * Run a command inside a container as the `agent` user (uid 1000), capturing
    * demuxed stdout/stderr and the exit code. Non-TTY so stdout/stderr are
    * separate clean streams (no 8-byte framing on the captured buffers). When
-   * `stdin` is supplied it is written to the exec's stdin before the stream is
-   * ended. The command is passed as an argv array — never interpolated into a
-   * shell — so caller-supplied data (paths, payloads) cannot inject code.
+   * `stdin` is supplied it is written without relying on half-close/EOF (Docker
+   * hijacked sockets do not propagate it reliably); stdin consumers must use a
+   * framed record or explicit byte count. Commands are passed as argv arrays.
    */
   async execCapture(
     containerId: string,
@@ -638,7 +638,6 @@ export class DockerService {
 
     if (opts.stdin) {
       stream.write(opts.stdin);
-      try { stream.end(); } catch { /* already ended */ }
     }
 
     // Consume stdout AND stderr concurrently. Awaiting them sequentially can

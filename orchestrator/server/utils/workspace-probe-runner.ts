@@ -43,7 +43,7 @@ export async function runProbeCheckMany(
   rels: string[],
 ): Promise<{ existing: string[]; escaping: string[] }> {
   const absPaths = rels.map(toContainerPath);
-  const stdin = Buffer.from(JSON.stringify(absPaths));
+  const stdin = Buffer.from(`${JSON.stringify(absPaths)}\n`);
   const res = await docker.execCapture(containerId, ['python3', '-c', WORKSPACE_PROBE_SCRIPT, 'check_many'], {
     user: 'agent',
     stdin,
