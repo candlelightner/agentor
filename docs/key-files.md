@@ -57,6 +57,7 @@
 - `orchestrator/server/utils/usage-checker.ts` - UsageChecker class (agent usage API polling, OAuth token refresh for Codex)
 - `orchestrator/server/utils/resource-monitor.ts` - ResourceMonitor class (in-memory singleton poller; PER-WORKER ONLY, all via the Docker API — cpu/mem/net from dockerode `container.stats` at 3s, disk = writable layer `SizeRw` + `du` of volumes at 60s; no host metrics, no persistence)
 - `orchestrator/server/utils/worker-export.ts` - Worker export/import helpers (WorkerExportManifest type, tar bundle pack/extract, credential-stripping agents-tar filter — strips per-user OAuth creds, `.kilo/config`, `.kilo/shared-data`, and the legacy `.kilo/data/auth.json`)
+- `orchestrator/server/utils/export-job-store.ts` / `export-jobs.ts` - durable owner-scoped export metadata, bounded execution queue, progress/cancellation/restart recovery, artifact retention and cleanup
 - `orchestrator/server/utils/environments.ts` - EnvironmentStore class, network mode types, package manager domains list
 - `orchestrator/server/utils/worker-store.ts` - WorkerStore class (persistent worker metadata for archive/unarchive)
 - `orchestrator/server/utils/user-credentials.ts` - UserCredentialManager class (per-user OAuth credential files at `<DATA_DIR>/users/<userId>/credentials/{claude,codex,gemini}.json` — Kilo's auth moved to the shared per-user data dir `<DATA_DIR>/users/<userId>/kilo/data`), ensures dirs/files, generates per-user bind strings (including the Kilo shared-data **directory** bind), statusList + reset) + AGENT_CREDENTIAL_MAPPINGS registry
@@ -87,7 +88,8 @@
 - `orchestrator/server/api/log-sources.get.ts` - List known container log sources
 - `orchestrator/server/api/worker-metrics/index.get.ts` + `refresh.post.ts` - Per-worker metrics list + forced re-sample (caller-owned; admins see all; defines the WorkerMetrics/WorkerMetricsStatus OpenAPI schemas)
 - `orchestrator/server/api/containers/[id]/metrics.get.ts` - Single worker's metrics (ownership-checked)
-- `orchestrator/server/api/containers/[id]/export.get.ts` - Worker export (streams the `.tar` bundle; `?includeRootfs=`)
+- `orchestrator/server/api/containers/[id]/export-jobs.post.ts` + `orchestrator/server/api/export-jobs/*` - create/status/cancel/authenticated streamed-download endpoints for durable worker exports
+- `orchestrator/server/api/containers/[id]/export.get.ts` - legacy synchronous compatibility export (workspace-only default; `?includeRootfs=true` is advanced)
 - `orchestrator/server/api/containers/import.post.ts` - Worker import (raw `.tar` body streamed to disk → `importWorker`)
 - `orchestrator/server/api/containers/[id]/files/index.get.ts` - Workspace file manager: one-level directory listing (defines the OpenAPI `FileEntry`/`FileListing` + mutation schemas for the group). Running-worker only, owner-scoped, no host-path access, executes as uid 1000.
 - `orchestrator/server/api/containers/[id]/files/upload.post.ts` - Multipart upload into a destination dir (relative folder paths preserved; `overwrite=false` → 409 conflict list; 100 MiB / 1000-entry caps → 413; tar entries uid/gid 1000).
@@ -102,6 +104,15 @@
 - `orchestrator/server/utils/workspace-probe.ts` - A single audited Python probe executed in the worker as uid 1000 for in-container realpath/lstat containment checks + one-level directory listings of `/workspace` (the second chokepoint that defeats symlink traversal; output contract documented inline).
 - `orchestrator/server/utils/workspace-probe-runner.ts` - `probeLstat`/`probeList`/`runProbeCheckMany` — runs the workspace-probe script via Docker exec and maps its JSON exit contract to typed results / h3 errors.
 - `orchestrator/server/utils/workspace-zip.ts` - Streaming workspace archive assembly: `demuxSingleFileFromTar` (raw single-file download from a Docker tar envelope) + `buildWorkspaceZip` (true ZIP via `archiver`, streamed with backpressure; symlinks stored not followed; host paths never exposed).
+- `orchestrator/server/utils/workspace-inventory.ts` / `workspace-access.ts` - runtime-independent, owner-scoped workspace inventory and hardened read-only helper access for directory and named-volume storage
+- `orchestrator/server/utils/worker-config-store.ts` / `worker-config-crypto.ts` / `worker-config-response.ts` - versioned worker-local desired/applied configuration, encrypted write-only values, precedence preview, and sanitized API projection
+- `orchestrator/server/api/workspaces/` - offline list, metadata, bounded preview/search, and browser/API streaming download routes
+- `orchestrator/server/utils/backup-manager.ts` / `backup-provider.ts` / `backup-crypto.ts` / `backup-bundle.ts` - durable encrypted multi-workspace backup scheduling, resumable providers (including Google Drive), verification, retention, cancellation, and restore orchestration
+- `orchestrator/server/utils/image-catalog.ts` - constrained local image definitions, async controlled builds, immutable versions, promotion/defaults, and cleanup
+- `orchestrator/server/utils/git-image-*.ts` / `orchestrator/server/api/image-catalog/git/` - versioned GitHub catalog format, encrypted credentials, optimistic sync, Actions/GHCR metadata, and recovery
+- `orchestrator/server/utils/admin-workspace-runtime.ts` / `admin-workspace-store.ts` - trusted persistent administrative overlay, service registration, red identity, control representation, and management-network boundary
+- `orchestrator/server/utils/management-mcp-store.ts` / `management-mcp-transport.ts` - internal authenticated MCP transport, live group policy, sanitized audit, domain tools, and proposal/approval/application state
+- `orchestrator/server/utils/workspace-tombstones.ts` - durable owner-scoped deleted-workspace inventory records
 - `orchestrator/server/types/archiver.d.ts` - Ambient module declaration for the `archiver` ZIP library.
 - `orchestrator/server/api/` - REST API routes (file-based, JSON only)
 - `orchestrator/server/routes/desktop/` - HTTP reverse proxy for noVNC static files (per-container)
@@ -156,9 +167,12 @@
 - `orchestrator/app/components/SshAppRow.vue` - Apps-pane row for the `ssh` app type (ssh command with external port, missing-public-key warning, Stop button)
 - `orchestrator/app/components/UsagePanel.vue` - Agent usage monitoring panel (progress bars, auth badges, reset times)
 - `orchestrator/app/components/ImportWorkerModal.vue` - Import a worker from an export bundle (file picker + optional display name)
+- `orchestrator/app/components/ExportWorkerModal.vue` / `orchestrator/app/composables/useExportJob.ts` - durable export progress, cancellation, reload recovery, advanced rootfs choice, browser-native streamed download
 - `orchestrator/app/components/UploadModal.vue` - Modal for workspace file uploads (the quick Upload action; uses `FileDropZone` with Browse files / Browse folder)
 - `orchestrator/app/components/WorkspaceFilesModal.vue` - Optional additive Workspace Files popup on a running worker card (lazy `/workspace` browse, breadcrumbs, multi-select, upload/download/mkdir/rename/move/confirmed-delete; the quick Upload/Download/Export actions remain). Backed by `useWorkspaceFiles`.
 - `orchestrator/app/composables/useWorkspaceFiles.ts` - Client for the `/api/containers/:id/files/*` routes (list/mkdir/rename/move/upload/download) with typed conflict results + toast conventions.
+- `orchestrator/app/components/WorkspaceInventoryModal.vue` / `WorkspaceBrowserModal.vue` / `composables/useWorkspaces.ts` - runtime-independent storage inventory and read-only browser UI
+- `orchestrator/app/components/WorkerConfigurationEditor.vue` - create/settings editor for variables, masked secrets, tmpfs secret files, dotenv import, and effective scope preview
 - `orchestrator/app/composables/useClipboardPasteBridge.ts` - Keyboard-transparent host → worker clipboard bridge for the terminal target: feature-detects the secure async Clipboard API, reads/normalises images to PNG, caps payloads, POSTs to `/api/containers/:id/clipboard`; per-target concurrency guard; never logs contents.
 - `orchestrator/app/composables/useApps.ts` - App CRUD + polling
 - `orchestrator/app/composables/useArchivedWorkers.ts` - Archived workers list + polling

@@ -772,6 +772,21 @@ See §20a for the UI and the full security model. All routes are session-authent
 - `POST /api/containers/:id/files/move` (JSON `{ paths, destination, overwrite }`) — move entries into an existing destination dir (root allowed). 409 with `{ conflicts }` on `overwrite=false`; `overwrite=true` replaces. Escaping symlinks/parents rejected up front.
 - `DELETE /api/containers/:id/files` (JSON `{ paths }`) — delete entries. Root blocked; missing paths idempotent; escaping symlinks rejected before any deletion.
 
+### 20c.1 Offline workspace storage
+
+- The sidebar **Workspace storage** action opens an owner-scoped inventory independent of worker runtime, showing workspace/worker ID, owner, backend, running/stopped/archived/orphaned state, timestamps, size availability, backup status, and capability-aware actions.
+- Running, stopped, and archived workspaces open in a read-only browser with breadcrumbs, one-level navigation, metadata, safe UTF-8 text and structurally validated image previews, path-scoped bounded filename search, raw file download, and streamed directory ZIP download.
+- Regular users only see and access their own workspaces. Admins can inventory all workspaces and physical orphans; orphan content access is denied until a separate adoption flow establishes ownership. Public responses never expose backing volume names, helper IDs, Docker socket details, or host paths.
+- Both directory and named-volume backends use one-shot helpers resolved to an immutable approved image ID, mounted read-only and run as uid 1000 with no network, ports, credentials, capabilities, or logs; read-only rootfs, no-new-privileges, PID/CPU/memory/time limits, request cleanup, disconnect cleanup, and startup stale-helper cleanup apply.
+- `GET /api/workspaces`, `GET /api/workspaces/:id`, and `GET /api/workspaces/:id/{files,metadata,preview,search}` provide metadata/content access. `POST .../download` accepts JSON for API clients; cookie-authenticated `GET .../download?path=` enables native browser streaming without Blob buffering. Preview/download responses are `private, no-store` and `nosniff`.
+
+### 20c.2 Worker-local variables and secrets
+
+- Worker creation and Settings provide distinct worker-local variables, write-only masked secrets, and secret files, plus bulk `.env`/`KEY=value` import and an effective source-aware preview.
+- Precedence is orchestrator → user-global → environment → worker-local. Duplicate, invalid, reserved, oversized, traversal, and cross-type-collision names fail closed. Changes set `pendingRebuild`; a restart retains the last applied configuration, while rebuild applies the desired revision.
+- Secret values use versioned AES-256-GCM records with per-entry authenticated context and a dedicated persisted 0600 master key. APIs return only configured/masked/encrypted-at-rest metadata. Secret files are decrypted directly into `/run/agentor-secrets` tmpfs after create/rebuild/restart and never enter workspace, image layers, exports, clones, or backups.
+- Clone copies workspace data and non-secret worker variables, returning omitted secret names only. Export jobs similarly report missing names without values.
+
 ## 20d. Clipboard API endpoint
 
 See §20b for the bridge. The endpoint sets the worker's X11 CLIPBOARD selection.
@@ -1097,6 +1112,30 @@ The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/ap
 - Write-once: user modifications to config files are preserved on restart/rebuild
 - MCP packages are downloaded via `npx -y` on first agent use
 
+### 26.2 Platform Storage, Images, Backups, and Administration
+
+#### 26.2.1 Durable exports and offline storage
+
+- Worker exports are owner-scoped asynchronous jobs with durable state, bounded concurrency, progress/bytes/phases, cancellation, expiry, restart recovery, streamed downloads, and partial cleanup.
+- Workspace-only is the default; root-filesystem capture is an explicit warned advanced mode. Imports and stopped/large/rootfs round trips preserve the existing format while excluding credentials and secret values.
+- Storage inventory is independent of runtime and reports running, stopped, archived, deleted-tombstone, and orphan metadata with size/latest-backup where available. Directory and named-volume browsing is read-only, owner checked, traversal/symlink safe, and helper hardened.
+
+#### 26.2.2 Backups and scoped secrets
+
+- Worker-local variables, masked secrets, and secret files follow orchestrator → user → environment → worker precedence. Secrets are encrypted at rest, delivered over exec stdin, and materialized in tmpfs without entering Docker Env, exports, clones, backups, logs, or API responses.
+- Backups support manual/all/selected exact-minute schedules, durable next-run state, multi-workspace encrypted bundles, retention deletion tombstones, progress, cancellation, same-ciphertext resumable retry, integrity verification, archived workspaces, rollback-clean new restores, and stopped-original staged restore.
+- Providers include local, gated deterministic fake, and production Google Drive with independent OAuth state, encrypted tokens, refresh, chunked resumable upload, disconnect, download, and delete.
+
+#### 26.2.3 Controlled and Git-backed images
+
+- Custom definitions use approved Agentor bases, constrained Dockerfile fragments, canonical bounded context files, async controlled builds, live redacted logs, cancellation/recovery, immutable image IDs, versions, test workers, promotion/rollback/defaults/rebuild, selection, usage, and cleanup.
+- Optional GitHub recovery defines a versioned credential-free repository format, public/private repos, encrypted fine-grained PATs, GitHub App installation tokens, optimistic conflict-safe direct/branch/PR sync, Actions dispatch, optional immutable GHCR references, metadata recovery, and disconnect erasure. It is explicitly separate from workspace backups.
+
+#### 26.2.4 Trusted administration and management MCP
+
+- The persistent digest-pinned `ADMIN / ORCHESTRATOR` overlay reuses terminal/editor/desktop, persistent storage, red identity markers, explicit privileged confirmation, and a generated non-secret control representation. It has no raw Docker socket, host binds, privilege, or published ports.
+- The MCP listens only on an internal management network, uses refreshed short-lived workspace identity, rechecks a fail-closed live group allowlist, omits unsafe log bodies, audits every success/failure without args/results, and requires immutable proposal → trusted dashboard approval → apply for configuration mutation.
+
 ---
 
 ## 27. Git Identity
@@ -1115,11 +1154,17 @@ The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/ap
 ## 28. Worker Export / Import
 
 ### 28.1 Export
-- The worker card's **Export** button (in the workspace group, running-only) downloads a single `.tar` bundle (`<displayName>-worker-export.tar`) via `GET /api/containers/:id/export`. The button uses `fetch` (not a bare anchor) so it can show a spinner + disable while the server materialises the bundle (which is slow when the `docker export` rootfs is included), then saves the response via a blob URL.
-- Bundle layout (outer uncompressed tar): `manifest.json` + `workspace.tar.gz` + `agents.tar.gz`, and (when `includeRootfs` is true — the default) `rootfs.tar.gz` (a `docker export` of the container filesystem, gzipped).
-- The manifest embeds the worker's own config (displayName, repos, mounts, initScript), the **full environment definition** (so it restores on another machine), and the worker's port + domain mappings (stripped of identity).
+- The worker card's **Export** button is available for running and stopped workers and opens a durable export modal. Closing the modal or reloading the page does not lose the active/completed job.
+- **Start export** sends `POST /api/containers/:id/export-jobs` and returns a job ID quickly. The modal polls `GET /api/export-jobs/:jobId` and shows queued/running/succeeded/failed/cancelled status, phase, progress, bytes, errors, and expiry. Active jobs can be cancelled with `DELETE /api/export-jobs/:jobId`.
+- Workspace-only is the default. **Include container root filesystem** is an explicit advanced option with a size/time warning.
+- Completed artifacts download through the authenticated `/api/export-jobs/:jobId/download` endpoint using browser-native streaming; archive bytes are never buffered into a JavaScript Blob.
+- Jobs are owner-scoped and durably persisted. Work interrupted by restart is marked failed safely; completed artifacts expire after 24 hours and failed/cancelled records after one hour. A bounded queue, one active job per worker, free-space preflight, size limits, abortable archive pipelines, and startup/periodic cleanup protect temporary storage.
+- Bundle layout (outer uncompressed tar): `manifest.json` + `workspace.tar.gz` + `agents.tar.gz`, and only when explicitly requested, `rootfs.tar.gz` (a gzipped `docker export`).
+- Automated round-trip coverage verifies both the default workspace path and explicit rootfs capture, including a non-volume filesystem marker restored into the imported worker.
+- The manifest embeds the worker's own config, a non-secret environment definition, and non-secret port/domain mappings. Environment variable values and domain basic-auth credentials are never exported.
 - Per-user OAuth credential files (`.claude/.credentials.json`, `.codex/auth.json`, `.gemini/oauth_creds.json`), the shared `.kilo/config/` directory, the shared `.kilo/shared-data/` directory (Kilo login, provider API keys, SQLite sessions/history), and the legacy `.kilo/data/auth.json` are all **stripped** from `agents.tar.gz` — an export never carries another user's tokens, Kilo sessions/history, or account-level Kilo configuration.
-- Validation: 401 unauth, 403 cross-user, 404 unknown worker; the worker must be running or stopped (archived workers have no container to export).
+- Validation: 400 invalid options, 401 unauthenticated, 403 cross-user, 404 unknown job/worker, 409 invalid worker state or duplicate active worker export, 429 per-user queue limit. Archived workers have no container and cannot use this export path.
+- The legacy synchronous `GET /api/containers/:id/export` remains for API compatibility but defaults to workspace-only; new clients use jobs.
 
 ### 28.2 Import
 - The sidebar **Import worker** button opens the Import Worker modal: a file picker for the `.tar` bundle (`data-testid="import-file"`), an optional Display name (`data-testid="import-name"`), and an **Import** button (`data-testid="import-submit"`, disabled until a file is chosen).
@@ -1127,6 +1172,7 @@ The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/ap
 - Restore steps: resolve/create the environment (built-in reused by id; a user's same-named env reused; otherwise the embedded definition is recreated as a new custom env) → import `rootfs.tar.gz` into a per-worker image (`agentor-import-<id>`) when present, replicating the standard image's entrypoint/env so it boots — **falls back to the standard worker image if the rootfs import fails** → create the container stopped → restore the workspace + agent-data volumes via `putArchive` → start → recreate port/domain mappings (skipping conflicts and base domains not configured on this machine).
 - A worker restored with a captured filesystem persists its per-worker image link (`importedImage` on the WorkerRecord) so the rootfs survives rebuild/unarchive; the image is removed on permanent delete.
 - Validation: 400 on an invalid/garbage bundle, 401 unauth. The displayName override (`?displayName=`) sets the restored worker's label.
+- Import admits one active upload per user, enforces declared and streamed outer-size limits, checks temporary free space, rejects unknown/duplicate/non-file outer entries and invalid manifests, and bounds expanded inner-tar bytes/entries while rejecting traversal paths before Docker is mutated.
 
 ---
 

@@ -23,6 +23,8 @@ All agents are installed in a single unified worker image. Start any agent via i
 - **VS Code editor** — code-server per worker with Kilo Code preinstalled and per-user config, provider keys, login, and Kilo sessions shared across that user's workers
 - **Virtual desktop** — Xvfb + fluxbox + noVNC, accessible in-browser, with a keyboard-transparent Ctrl/Cmd+V clipboard bridge (host-clipboard images/text synced to the worker's X11 CLIPBOARD, then the paste key is replayed so GUI apps and Codex paste the synced content)
 - **Workspace file manager** — an optional Files popup on each running worker card to browse `/workspace`, upload/download (single file or true ZIP), mkdir, rename, move, and delete with symlink-escape protection (the quick Upload/Download/Export card actions remain)
+- **Offline workspace storage** — an owner-scoped inventory and read-only browser for running, stopped, and archived workspaces, with safe text/image preview, bounded search, metadata, and browser-streamed file/directory downloads
+- **Worker-local configuration** — source-aware variables, encrypted write-only secrets, and ephemeral secret files with orchestrator/user/environment/worker precedence and explicit rebuild application
 - **Multi-repo cloning** — clone one or more git repos into each worker at startup
 - **App system** — launch Chromium (with CDP), Persistent VS Code (a noVNC-hosted client that stays alive when the viewer disconnects), SOCKS5 proxy, VS Code Tunnel (native VS Code client via Microsoft's relay), or OpenSSH server from the Apps pane
 - **Port & domain mapping** — unified Traefik reverse proxy handling both TCP port forwarding (localhost- or network-bound) and subdomain-based HTTP/HTTPS/TCP routing with TLS (Let's Encrypt HTTP-01/DNS-01 or self-signed CA), optional HTTP basic auth
@@ -35,7 +37,11 @@ All agents are installed in a single unified worker image. Start any agent via i
 - **Docker-in-Docker** — opt-in per-environment, full Docker daemon inside workers (build, run, compose)
 - **Usage monitoring** — real-time usage/rate limit indicators for OAuth-authenticated agents (Claude, Codex, Gemini)
 - **Per-worker resource monitoring** — live CPU / RAM / disk / network metrics on each worker card, sourced entirely from the Docker API (OS-independent)
-- **Worker export/import** — download a worker as a portable `.tar` bundle (settings, environment, mappings, workspace + agent data, and an optional `docker export` of the filesystem) and restore it as a new worker, even on another machine
+- **Durable worker export/import** — background jobs with progress, cancellation, expiry, and browser-streamed downloads produce portable `.tar` bundles; workspace-only is fast/default and rootfs capture is an explicit advanced option
+- **Encrypted backup and restore** — manual or exact-minute scheduled multi-workspace backups, retention, retry/resume/cancel, integrity verification, safe original/new-worker restore, local/fake providers, and independently linked Google Drive OAuth
+- **Controlled custom images** — approved-base Dockerfile fragments and bounded uploaded contexts build asynchronously into immutable digest-pinned catalog versions with test workers, promotion/rollback, defaults, usage cleanup, and worker selection
+- **Git-backed image recovery** — optional public/private GitHub catalog sync with conflict preservation, fine-grained PAT or short-lived GitHub App authentication, branch/PR workflows, Actions dispatch, and immutable GHCR recovery references
+- **Administrative workspace and internal MCP** — a persistent red `ADMIN / ORCHESTRATOR` terminal/editor/desktop workspace, isolated management network, short-lived workload identity, live fail-closed tool policy, audited calls, and dashboard-approved immutable configuration proposals
 - **Centralized logging** — collects logs from all containers (orchestrator, workers, traefik) with NDJSON storage, log rotation, and a live-streaming log viewer in the dashboard
 - **Theme toggle** — switch between system default, light, and dark mode
 - **API docs** — auto-generated OpenAPI 3.1.0 spec with interactive Scalar UI at `/api/docs`

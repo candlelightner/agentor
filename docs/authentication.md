@@ -29,10 +29,11 @@ User-owned resources carry a `userId` field populated from the authenticated ses
 | Custom instructions | `users/<userId>/instructions.json` | `Instruction.userId` |
 | Custom init scripts | `users/<userId>/init-scripts.json` | `InitScript.userId` |
 | Env vars | `users/<userId>/env-vars.json` | file path is the owner id |
+| Worker-local configuration | `users/<userId>/worker-configurations.json` | owner + immutable worker id; secret values encrypted with `<DATA_DIR>/worker-config.key` |
 | Usage state | `users/<userId>/usage.json` | file path is the owner id |
 | OAuth credentials | `users/<userId>/credentials/{claude,codex,gemini,kilo}.json` | file path is the owner id |
-| Worker workspace (dir mode) | `users/<userId>/workspaces/<name>/` | owned by the worker |
-| Worker agent data (dir mode) | `users/<userId>/agents/<name>/` | owned by the worker |
+| Worker workspace (dir mode) | `users/<userId>/workspaces/<worker-id>/` | owned by the worker |
+| Worker agent data (dir mode) | `users/<userId>/agents/<worker-id>/` | owned by the worker |
 
 Built-in, platform-seeded resources live separately at `<DATA_DIR>/defaults/{environments,capabilities,instructions,init-scripts}.json` with `userId: null`. They are re-seeded on every orchestrator startup from `server/built-in/` and are globally visible; mutation attempts (update/delete) return 400.
 
@@ -270,3 +271,11 @@ better-auth rejects any POST to `/api/auth/*` without an `Origin` or `Referer` h
 4. Anything listed in `BETTER_AUTH_TRUSTED_ORIGINS` (comma-separated)
 
 If you see `[Better Auth]: Invalid origin: https://foo.example.com` in the orchestrator logs, that origin isn't in the list — either set it via `BETTER_AUTH_URL` / `DASHBOARD_SUBDOMAIN` + `DASHBOARD_BASE_DOMAIN` or add it explicitly to `BETTER_AUTH_TRUSTED_ORIGINS`.
+
+## Provider and workload credentials
+
+Google Drive backup authorization is separate from Agentor authentication. The callback still requires the linking user's Agentor session and validates an expiring owner-scoped OAuth state before exchanging the code with the server-owned Google client. Google access and refresh tokens are encrypted and never returned by provider/status APIs.
+
+Git image-catalog credentials are also separate from the account-level `GITHUB_TOKEN` used for ordinary repository cloning. A catalog connection accepts a repository-scoped fine-grained PAT as a write-only value, a public no-token mode, or GitHub App/installation IDs. GitHub App installation tokens are minted on demand with a nine-minute lifetime from a server-mounted private key. None of these values are copied into workers, image contexts, logs, sync output, or recovery metadata.
+
+The administrative MCP does not use a dashboard session or permanent workspace bearer token. The orchestrator issues a short-lived credential bound to the one administrative workspace, places it in that container's tmpfs, prunes expired identities, and rechecks live tool-group policy on every call. Network placement is only an additional boundary; authentication and authorization remain mandatory. Dashboard sessions—not MCP workload identities—perform proposal approval.
