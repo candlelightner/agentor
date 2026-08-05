@@ -1,0 +1,2 @@
+defineRouteMeta({openAPI:{tags:['Backups'],summary:'List backup jobs and artifacts',operationId:'listBackupJobs',responses:{200:{description:'Caller backup data'},401:{description:'Unauthorized'}}}});
+import {requireAuth} from '../../../utils/auth-helpers';import {useBackupManager} from '../../../utils/backup-manager';export default defineEventHandler(async(event)=>useBackupManager().list(requireAuth(event).user.id));
