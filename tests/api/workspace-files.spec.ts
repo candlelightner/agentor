@@ -730,38 +730,47 @@ test.describe.serial('Workspace file manager API', () => {
     const api = new ApiClient(request);
     const stamp = Date.now();
     const dest = `mvc-${stamp}`;
+    // The source basename must collide with an existing entry inside `dest`
+    // for a real conflict; the whole batch is then rejected up front.
+    const coll = `collide-${stamp}.txt`;
     await api.mkdirFiles(workerId, dest);
     await api.uploadFiles(workerId, [
-      { name: `${dest}/a.txt`, content: Buffer.from('dest-orig') },
-      { name: `mva-${stamp}.txt`, content: Buffer.from('src-orig') },
+      { name: `${dest}/${coll}`, content: Buffer.from('dest-orig') },
+      { name: coll, content: Buffer.from('src-orig') },
     ]);
-    const { status, body } = await api.moveFiles(workerId, [`mva-${stamp}.txt`], dest);
+    const { status, body } = await api.moveFiles(workerId, [coll], dest);
     expect(status).toBe(409);
-    const conflicts = (body as { conflicts?: { source: string; target: string }[] }).conflicts ?? [];
-    // The conflict is on `a.txt` (the destination already has it); the source
-    // `mva-*.txt` would move cleanly but the whole batch is rejected up front.
-    expect(conflicts.some((c) => c.target.endsWith('a.txt'))).toBe(true);
+    const conflicts =
+      (body as { conflicts?: { source: string; target: string }[] }).conflicts ??
+      ((body as { data?: { conflicts?: { source: string; target: string }[] } }).data?.conflicts ?? []);
+    expect(conflicts.some((c) => c.target.endsWith(coll))).toBe(true);
     // Neither file was moved/overwritten.
-    const dl = await api.downloadFiles(workerId, [`${dest}/a.txt`]);
+    const dl = await api.downloadFiles(workerId, [`${dest}/${coll}`]);
     expect(Buffer.from(dl.body).toString('utf8')).toBe('dest-orig');
     const { body: root } = await api.listFiles(workerId);
-    expect(namesOf(root as FileListing)).toContain(`mva-${stamp}.txt`);
+    expect(namesOf(root as FileListing)).toContain(coll);
   });
 
   test('move with overwrite=true replaces conflicting targets', async ({ request }) => {
     const api = new ApiClient(request);
     const stamp = Date.now();
     const dest = `mvo-${stamp}`;
+    // The source basename collides with an existing entry in `dest` so
+    // overwrite=true actually replaces it.
+    const coll = `collide-${stamp}.txt`;
     await api.mkdirFiles(workerId, dest);
     await api.uploadFiles(workerId, [
-      { name: `${dest}/a.txt`, content: Buffer.from('dest-orig') },
-      { name: `mvo-src-${stamp}.txt`, content: Buffer.from('src-new') },
+      { name: `${dest}/${coll}`, content: Buffer.from('dest-orig') },
+      { name: coll, content: Buffer.from('src-new') },
     ]);
-    const { status, body } = await api.moveFiles(workerId, [`mvo-src-${stamp}.txt`], dest, true);
+    const { status, body } = await api.moveFiles(workerId, [coll], dest, true);
     expect(status).toBe(200);
     expect((body as { moved: number }).moved).toBe(1);
-    const dl = await api.downloadFiles(workerId, [`${dest}/a.txt`]);
+    const dl = await api.downloadFiles(workerId, [`${dest}/${coll}`]);
     expect(Buffer.from(dl.body).toString('utf8')).toBe('src-new');
+    // The source is gone from its original location.
+    const { body: rootList } = await api.listFiles(workerId);
+    expect(namesOf(rootList as FileListing)).not.toContain(coll);
 
     // Directory targets are replaced as a whole after explicit overwrite.
     const sourceParent = `mvo-parent-${stamp}`;
