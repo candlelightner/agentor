@@ -22,46 +22,10 @@ const emit = defineEmits<{
   downloadWorkspace: [id: string];
 }>();
 
-const toast = useToast();
-
 const showDetail = ref(false);
 const showUpload = ref(false);
 const showFiles = ref(false);
-
-// Export is slow (the server materialises the bundle — incl. a docker export of
-// the filesystem — before the download starts), so drive it with fetch and show
-// a spinner on the button until the bundle is ready, then save it. Handled here
-// (not via an anchor) precisely so the button can reflect the in-progress state.
-const exporting = ref(false);
-async function doExport() {
-  if (exporting.value) return;
-  exporting.value = true;
-  try {
-    const res = await fetch(`/api/containers/${props.container.id}/export`);
-    if (!res.ok) throw new Error(`Export failed (${res.status})`);
-    const blob = await res.blob();
-    const cd = res.headers.get('Content-Disposition') || '';
-    const filename = cd.match(/filename="?([^"]+)"?/)?.[1] || `${displayLabel.value}-worker-export.tar`;
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 10_000);
-  } catch (err) {
-    console.error('[export] failed', err);
-    toast.add({
-      title: 'Export failed',
-      description: err instanceof Error ? err.message : 'Could not export this worker.',
-      color: 'error',
-      icon: 'i-lucide-alert-circle',
-    });
-  } finally {
-    exporting.value = false;
-  }
-}
+const showExport = ref(false);
 
 const displayLabel = computed(() => props.container.displayName || shortName(props.container.id));
 
@@ -191,13 +155,13 @@ function onHScrollWheel(e: WheelEvent) {
         <!-- Workspace (running only): upload, download, export -->
         <div class="flex items-center gap-0.5 flex-shrink-0">
           <UTooltip text="Upload to Workspace">
-            <UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-upload" @click="showUpload = true" />
+            <UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-upload" @click="() => { showUpload = true; }" />
           </UTooltip>
           <UTooltip text="Download Workspace">
             <UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-download" @click="emit('downloadWorkspace', container.id)" />
           </UTooltip>
-          <UTooltip :text="exporting ? 'Preparing export…' : 'Export worker'">
-            <UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-package" :loading="exporting" :disabled="exporting" @click="doExport" />
+          <UTooltip text="Export worker">
+            <UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-package" aria-label="Export worker" @click="() => { showExport = true; }" />
           </UTooltip>
           <UTooltip text="Files">
             <UButton
@@ -206,7 +170,7 @@ function onHScrollWheel(e: WheelEvent) {
               variant="subtle"
               icon="i-lucide-folder-tree"
               aria-label="Files"
-              @click="showFiles = true"
+              @click="() => { showFiles = true; }"
             />
           </UTooltip>
         </div>
@@ -216,8 +180,11 @@ function onHScrollWheel(e: WheelEvent) {
 
       <!-- Lifecycle -->
       <div class="flex items-center gap-0.5 flex-shrink-0">
+        <UTooltip v-if="isStopped" text="Export worker">
+          <UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-package" aria-label="Export worker" @click="() => { showExport = true; }" />
+        </UTooltip>
         <UTooltip text="Settings">
-          <UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-pencil" @click="showDetail = true" />
+          <UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-pencil" @click="() => { showDetail = true; }" />
         </UTooltip>
         <UTooltip v-if="isStopped" text="Restart">
           <UButton size="xs" color="success" variant="subtle" icon="i-lucide-refresh-cw" @click="emit('restart', container.id)" />
@@ -252,6 +219,12 @@ function onHScrollWheel(e: WheelEvent) {
     <WorkspaceFilesModal
       v-model:open="showFiles"
       :container="container"
+    />
+
+    <ExportWorkerModal
+      v-model:open="showExport"
+      :worker-id="container.id"
+      :worker-name="displayLabel"
     />
 
     <ContainerDetailModal

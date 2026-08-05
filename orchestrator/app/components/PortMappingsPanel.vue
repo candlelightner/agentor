@@ -126,12 +126,12 @@ async function handleCreate() {
         </UButton>
       </div>
       <p v-if="formError" class="text-red-500 dark:text-red-400 text-[11px]">{{ formError }}</p>
-      <UButton size="xs" color="neutral" variant="ghost" class="self-end" @click="showForm = false">
+      <UButton size="xs" color="neutral" variant="ghost" class="self-end" @click="() => { showForm = false; }">
         Cancel
       </UButton>
     </div>
 
-    <UButton v-if="!showForm" size="xs" color="primary" variant="solid" class="self-start" @click="showForm = true">
+    <UButton v-if="!showForm" size="xs" color="primary" variant="solid" class="self-start" @click="() => { showForm = true; }">
       + Map
     </UButton>
 

@@ -447,7 +447,7 @@ async function handleDeletePasskey(p: PasskeyRow) {
       <div class="p-6 space-y-6 max-h-[90vh] overflow-y-auto">
         <div class="flex items-center justify-between">
           <h2 class="text-lg font-semibold text-gray-900 dark:text-white">Account settings</h2>
-          <UButton size="sm" color="neutral" variant="ghost" @click="open = false">Close</UButton>
+          <UButton size="sm" color="neutral" variant="ghost" @click="() => { open = false; }">Close</UButton>
         </div>
 
         <!-- Profile section -->

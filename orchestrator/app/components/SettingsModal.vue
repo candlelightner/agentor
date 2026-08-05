@@ -176,7 +176,7 @@ function statusColor(value: string): BadgeColor {
 
         <!-- Footer -->
         <div class="flex justify-end pt-2">
-          <UButton color="neutral" variant="outline" size="sm" @click="open = false">
+          <UButton color="neutral" variant="outline" size="sm" @click="() => { open = false; }">
             Close
           </UButton>
         </div>

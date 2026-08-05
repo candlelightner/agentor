@@ -55,6 +55,7 @@ const form = reactive({
   mounts: [] as MountConfig[],
   initScript: '',
 });
+const workerConfiguration = ref<CreateContainerRequest['workerConfiguration']>({ variables: [], secrets: [], secretFiles: [] });
 
 const { initScripts } = useInitScripts();
 
@@ -177,6 +178,7 @@ function submit() {
   if (form.initScript.trim()) {
     request.initScript = form.initScript;
   }
+  request.workerConfiguration = workerConfiguration.value;
   emit('create', request);
   reset();
   open.value = false;
@@ -193,6 +195,7 @@ function reset() {
   creatingRepo.clear();
   repoRowIds.clear();
   rowCounter = 0;
+  workerConfiguration.value = { variables: [], secrets: [], secretFiles: [] };
 }
 </script>
 
@@ -223,6 +226,11 @@ function reset() {
             </UButton>
           </div>
         </UFormField>
+
+        <details class="rounded-md border border-gray-200 dark:border-gray-700 p-3">
+          <summary class="cursor-pointer text-sm font-medium">Worker-local variables and secrets</summary>
+          <div class="mt-3"><WorkerConfigurationEditor v-model="workerConfiguration" /></div>
+        </details>
 
         <UFormField label="Repositories">
           <div class="space-y-2">

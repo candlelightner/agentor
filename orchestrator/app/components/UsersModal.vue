@@ -144,7 +144,7 @@ async function handleResetPassword(u: UserRow) {
           <h2 class="text-lg font-semibold text-gray-900 dark:text-white">Users</h2>
           <div class="flex gap-2">
             <UButton v-if="!creating" size="sm" @click="startCreate">New</UButton>
-            <UButton size="sm" color="neutral" variant="ghost" @click="open = false">Close</UButton>
+            <UButton size="sm" color="neutral" variant="ghost" @click="() => { open = false; }">Close</UButton>
           </div>
         </div>
 

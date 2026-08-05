@@ -94,7 +94,7 @@ function handleDelete(id: string) {
             <UButton v-if="!showEditor" size="sm" @click="startCreate">
               New
             </UButton>
-            <UButton size="sm" color="neutral" variant="ghost" @click="open = false">
+            <UButton size="sm" color="neutral" variant="ghost" @click="() => { open = false; }">
               Close
             </UButton>
           </div>

@@ -327,8 +327,13 @@ const formattedCreatedAt = computed(() => {
                 Changes require a rebuild to take effect.
               </span>
               <div class="flex-1" />
-              <UButton color="neutral" variant="outline" @click="open = false">Close</UButton>
+              <UButton color="neutral" variant="outline" @click="() => { open = false; }">Close</UButton>
             </div>
+          </section>
+
+          <section class="space-y-3">
+            <h3 class="text-[10px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider">Worker-local variables and secrets</h3>
+            <WorkerConfigurationEditor :worker-id="container.id" />
           </section>
 
           <!-- Port Mappings (read-only) -->

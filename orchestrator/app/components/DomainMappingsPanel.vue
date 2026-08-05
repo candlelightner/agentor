@@ -380,7 +380,7 @@ function downloadCaCert() {
         <span class="flex-1 min-w-0">{{ formError }}</span>
       </p>
       <div class="flex gap-1.5 justify-end">
-        <UButton size="xs" color="neutral" variant="ghost" @click="showForm = false">
+        <UButton size="xs" color="neutral" variant="ghost" @click="() => { showForm = false; }">
           Cancel
         </UButton>
         <UButton size="xs" color="primary" variant="solid" @click="handleCreate">
@@ -390,7 +390,7 @@ function downloadCaCert() {
     </div>
 
     <div v-if="!showForm" class="flex gap-1.5 items-center">
-      <UButton size="xs" color="primary" variant="solid" @click="showForm = true">
+      <UButton size="xs" color="primary" variant="solid" @click="() => { showForm = true; }">
         + Map
       </UButton>
       <UButton
