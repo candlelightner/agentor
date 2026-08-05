@@ -70,7 +70,8 @@ def _entry(name, full, rel):
         escapes = True
     size = 0 if typ in ("directory", "symlink") else st.st_size
     mtime = datetime.datetime.utcfromtimestamp(st.st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
-    e = {"name": name, "path": rel, "type": typ, "size": size, "mtime": mtime}
+    e = {"name": name, "path": rel, "type": typ, "size": size, "mtime": mtime,
+         "mode": format(st.st_mode & 0o7777, "04o"), "owner": str(st.st_uid), "group": str(st.st_gid)}
     if link_target is not None:
         e["linkTarget"] = link_target
     if escapes:

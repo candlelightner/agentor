@@ -42,7 +42,7 @@ export interface AppInstanceInfo {
   appType: string;
   /** Internal container port the app is listening on. `0` when the app does not expose a port (e.g. vscode tunnel). */
   port: number;
-  status: 'running' | 'stopped' | 'auth_required';
+  status: "running" | "stopped" | "auth_required";
   /** Externally reachable port from the auto-created port mapping, if any (e.g. ssh). */
   externalPort?: number;
   /** VS Code tunnel machine name once the tunnel has connected. */
@@ -53,14 +53,16 @@ export interface AppInstanceInfo {
   authCode?: string;
 }
 
-export type NetworkMode = 'block-all' | 'block' | 'package-managers' | 'full' | 'custom';
+export type NetworkMode =
+  "block-all" | "block" | "package-managers" | "full" | "custom";
 
 export interface ServiceStatus {
   running: boolean;
   containerId?: string;
 }
 
-export type ContainerStatus = 'creating' | 'running' | 'stopped' | 'removing' | 'error';
+export type ContainerStatus =
+  "creating" | "running" | "stopped" | "removing" | "error";
 
 /** A worker. `id` is the worker's stable UUID identity (immutable across
  * rebuild/unarchive); `containerId`/`containerName` describe the current Docker
@@ -101,6 +103,10 @@ export interface ContainerInfo extends UserOwnedResource {
    * filesystem. The per-worker imported image the worker runs (reused across
    * rebuild/unarchive). Unset for normal workers running the standard image. */
   importedImage?: string;
+  imageDefinitionId?: string;
+  imageVersion?: string;
+  imageDigest?: string;
+  imageRuntimeReference?: string;
 }
 
 export interface CreateContainerRequest {
@@ -118,6 +124,21 @@ export interface CreateContainerRequest {
   /** Populated server-side from the authenticated session — never sent by clients.
    * The owner; the worker's git identity is resolved live from this user. */
   userId?: string;
+  workerConfiguration?: WorkerConfigurationInput;
+  /** Catalog fields are resolved and ownership-checked by the server. */
+  imageDefinitionId?: string;
+  imageVersion?: string;
+  imageDigest?: string;
+  imageRuntimeReference?: string;
+}
+
+export interface WorkerConfigurationInput {
+  variables?: Array<{ key: string; value: string }>;
+  secrets?: Array<{ key: string; value: string }>;
+  secretFiles?: Array<{ name: string; path: string; content: string }>;
+  envFile?: string;
+  deleteSecrets?: string[];
+  deleteSecretFiles?: string[];
 }
 
 /** Partial worker-settings update accepted by `PATCH /api/containers/:id`. Every
@@ -142,7 +163,7 @@ export interface ImageUpdateInfo {
   error?: string;
 }
 
-export type UpdatableImage = 'orchestrator' | 'worker' | 'traefik';
+export type UpdatableImage = "orchestrator" | "worker" | "traefik";
 
 export interface UpdateStatus {
   orchestrator: ImageUpdateInfo | null;
@@ -164,7 +185,7 @@ export interface PruneResult {
   spaceReclaimed: number;
 }
 
-export type AgentAuthType = 'oauth' | 'api-key' | 'none';
+export type AgentAuthType = "oauth" | "api-key" | "none";
 
 export interface UsageWindow {
   label: string;
@@ -248,11 +269,11 @@ export type UserEnvVarsInput = { envVars?: UserEnvVar[] };
  * order). Storage treats them identically to any other env var — this list is
  * only a UI affordance and is trivially extensible by adding a key. */
 export const PREDEFINED_ENV_VAR_KEYS = [
-  'GITHUB_TOKEN',
-  'ANTHROPIC_API_KEY',
-  'CLAUDE_CODE_OAUTH_TOKEN',
-  'OPENAI_API_KEY',
-  'GEMINI_API_KEY',
+  "GITHUB_TOKEN",
+  "ANTHROPIC_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "OPENAI_API_KEY",
+  "GEMINI_API_KEY",
 ] as const;
 
 /** The user's SSH public key(s) — NOT an env var. Stored only in
@@ -304,8 +325,8 @@ export interface WorkerMetricsStatus {
   workers: WorkerMetrics[];
 }
 
-export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
-export type LogSource = 'orchestrator' | 'worker' | 'traefik';
+export type LogLevel = "debug" | "info" | "warn" | "error";
+export type LogSource = "orchestrator" | "worker" | "traefik";
 
 export interface LogEntry {
   timestamp: string;
@@ -330,7 +351,7 @@ export interface LogEntry {
 // ---------------------------------------------------------------------------
 
 /** A single filesystem entry type inside a worker's `/workspace`. */
-export type FileEntryType = 'file' | 'directory' | 'symlink';
+export type FileEntryType = "file" | "directory" | "symlink";
 
 /** Metadata for one filesystem entry, as returned by the file manager listing
  *  and stat endpoints. `path` is relative to `/workspace` (POSIX, no leading
@@ -345,6 +366,11 @@ export interface FileEntry {
   size: number;
   /** ISO 8601 modification time (UTC). */
   mtime: string;
+  /** POSIX permission bits, formatted as a four-digit octal string. */
+  mode?: string;
+  /** Numeric owning uid/gid as observed in the workspace mount. */
+  owner?: string;
+  group?: string;
   /** Raw symlink target (the value `readlink` returns), only for symlinks. */
   linkTarget?: string;
   /** True when a symlink's resolved target escapes `/workspace`. Such entries

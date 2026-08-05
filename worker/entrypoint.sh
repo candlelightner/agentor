@@ -276,6 +276,40 @@ while IFS= read -r line; do
     [[ "$trimmed" == *=* ]] && export "$trimmed" && tmux set-environment -g "${trimmed%%=*}" "${trimmed#*=}"
 done <<< "$ENV_VARS"
 
+# Worker-local values are baked into the container only on create/rebuild and
+# intentionally applied after broader environment values, so the documented
+# precedence is orchestrator < user < environment < worker. The payload is
+# base64 JSON to preserve whitespace and '=' without shell parsing ambiguity.
+if [[ -n "${WORKER_LOCAL_ENV:-}" ]]; then
+    while IFS= read -r encoded; do
+        key=$(printf '%s' "$encoded" | base64 -d | jq -r '.key')
+        value=$(printf '%s' "$encoded" | base64 -d | jq -r '.value')
+        export "$key=$value"
+        tmux set-environment -g "$key" "$value"
+    done < <(printf '%s' "$WORKER_LOCAL_ENV" | base64 -d | jq -r '.[] | @base64')
+fi
+
+# Secret-bearing workers fail closed until the orchestrator has delivered
+# write-only values over Docker exec stdin and populated the tmpfs. The daemon
+# restart policy is disabled for these workers, so this bounded wait is only
+# entered during an orchestrator-controlled create/rebuild/restart.
+if [[ "${WORKER_SECRET_HANDSHAKE:-}" == "1" ]]; then
+    for _ in $(seq 1 300); do
+        if [[ -f /run/agentor-secrets/.ready ]] \
+          && [[ "$(stat -c '%u:%a' /run/agentor-secrets/.ready 2>/dev/null)" == "0:444" ]] \
+          && [[ "$(cat /run/agentor-secrets/.ready 2>/dev/null)" == "agentor-secret-bootstrap-v1" ]]; then
+            break
+        fi
+        sleep 0.1
+    done
+    if [[ ! -f /run/agentor-secrets/.ready ]] \
+      || [[ "$(stat -c '%u:%a' /run/agentor-secrets/.ready 2>/dev/null)" != "0:444" ]] \
+      || [[ "$(cat /run/agentor-secrets/.ready 2>/dev/null)" != "agentor-secret-bootstrap-v1" ]]; then
+        echo "[agent] ERROR: worker secret bootstrap did not complete" >&2
+        exit 70
+    fi
+fi
+
 # ==========================================================================
 # Phase 1: Agent setup
 # Each setup script creates config files only if they don't exist yet.

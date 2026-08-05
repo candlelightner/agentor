@@ -22,6 +22,7 @@ import { LogStore } from './log-store';
 import { LogBroadcaster } from './log-broadcaster';
 import { Logger } from './logger';
 import { LogCollector } from './log-collector';
+import { ExportJobManager } from './export-jobs';
 
 function singleton<T>(factory: () => T): () => T {
   let instance: T | undefined;
@@ -70,6 +71,7 @@ export const useOrphanSweeper = singleton(
     useCapabilityStore(),
     useInstructionStore(),
     useInitScriptStore(),
+    useExportJobManager(),
   ),
 );
 export const useCapabilityStore = singleton(() => new CapabilityStore(useConfig().dataDir));
@@ -79,6 +81,11 @@ export const useLogStore = singleton(() => new LogStore(useConfig()));
 export const useLogBroadcaster = singleton(() => new LogBroadcaster());
 export const useLogger = singleton(() => new Logger(useConfig(), useLogStore(), useLogBroadcaster()));
 export const useLogCollector = singleton(() => new LogCollector(useConfig(), useLogStore(), useLogBroadcaster()));
+export const useExportJobManager = singleton(() => new ExportJobManager(
+  useConfig().dataDir,
+  (workerId, opts) => useContainerManager().exportWorker(workerId, opts),
+  (message) => useLogger().error(message),
+));
 
 /**
  * Removes all port and domain mappings for a worker (keyed by its globally

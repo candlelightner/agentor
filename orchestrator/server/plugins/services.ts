@@ -1,6 +1,14 @@
-import { useDockerService, useContainerManager, usePortMappingStore, useDomainMappingStore, useTraefikManager, useEnvironmentStore, useWorkerStore, useUpdateChecker, useUsageChecker, useResourceMonitor, useUserCredentialManager, useUserEnvStore, useOrphanSweeper, useStorageManager, useCapabilityStore, useInstructionStore, useInitScriptStore, useLogStore, useLogger, useLogCollector } from '../utils/services';
+import { useConfig, useDockerService, useContainerManager, usePortMappingStore, useDomainMappingStore, useTraefikManager, useEnvironmentStore, useWorkerStore, useUpdateChecker, useUsageChecker, useResourceMonitor, useUserCredentialManager, useUserEnvStore, useOrphanSweeper, useStorageManager, useCapabilityStore, useInstructionStore, useInitScriptStore, useLogStore, useLogger, useLogCollector, useExportJobManager } from '../utils/services';
 import { loadBuiltInCapabilities, loadBuiltInInstructions, loadBuiltInInitScripts, loadBuiltInEnvironments } from '../utils/built-in-content';
 import { migrateAuth, getAuthDb } from '../utils/auth';
+import { cleanupWorkspaceHelpers } from '../utils/workspace-access';
+import { useBackupManager } from '../utils/backup-manager';
+import { useImageCatalogManager } from '../utils/image-catalog';
+import { useAdminWorkspaceStore } from '../utils/admin-workspace-store';
+import { DockerAdminWorkspaceRuntime } from '../utils/admin-workspace-runtime';
+import { useManagementMcpStore } from '../utils/management-mcp-store';
+import { ManagementMcpTransport } from '../utils/management-mcp-transport';
+import { useGitImageCatalogManager } from '../utils/git-image-manager';
 
 export default defineNitroPlugin(async (nitroApp) => {
   // Initialize logging infrastructure first
@@ -36,8 +44,9 @@ export default defineNitroPlugin(async (nitroApp) => {
   // builds (and memoizes) the auth instance internally, so no standalone
   // `useAuth()` is needed here.
   const dockerService = useDockerService();
-  await Promise.all([migrateAuth(), dockerService.ensureNetwork()]);
+  const [, , staleWorkspaceHelpers] = await Promise.all([migrateAuth(), dockerService.ensureNetwork(), cleanupWorkspaceHelpers()]);
   logger.info('[agentor] auth initialized');
+  if (staleWorkspaceHelpers > 0) logger.info(`[agentor] removed ${staleWorkspaceHelpers} stale workspace helper container(s)`);
 
   // Storage manager must finish before any store init — stores resolve paths
   // via `<DATA_DIR>/...` and seedBuiltIns writes into `<DATA_DIR>/defaults/`.
@@ -86,6 +95,12 @@ export default defineNitroPlugin(async (nitroApp) => {
     workerStore.init(),
     portMappingStore.init(),
     domainMappingStore.init(),
+    useExportJobManager().init(),
+    useBackupManager().init(),
+    useImageCatalogManager().init(),
+    useGitImageCatalogManager().init(),
+    useAdminWorkspaceStore().init(),
+    useManagementMcpStore().init(),
     containerManager.sync(),
   ]);
 
@@ -94,6 +109,31 @@ export default defineNitroPlugin(async (nitroApp) => {
   containerManager.setInstructionStore(instructionStore);
   containerManager.setWorkerStore(workerStore);
   await containerManager.reconcileWorkers();
+
+  // The administrative workspace uses a separate, generated Docker boundary:
+  // its image/mount/network inputs are not accepted from dashboard requests.
+  // The MCP listener binds only to the orchestrator's address on the internal
+  // management network and still authenticates + authorizes every JSON-RPC
+  // call through ManagementMcpStore.
+  const adminRuntime = new DockerAdminWorkspaceRuntime(useConfig());
+  const adminWorkspace = useAdminWorkspaceStore();
+  adminWorkspace.setRuntimeAdapter(adminRuntime);
+  await adminRuntime.initializeBoundary();
+  const managementMcp = new ManagementMcpTransport(useManagementMcpStore());
+  await managementMcp.start(await adminRuntime.managementAddress());
+  let adminIdentityTimer: NodeJS.Timeout | undefined;
+  const refreshAdminIdentity = async () => {
+    try {
+      const workspace = await adminWorkspace.ensure();
+      const identity = await useManagementMcpStore().issue(workspace.id, 60);
+      await adminRuntime.materializeCredential(identity.credential);
+    } catch (error) {
+      logger.error(`[agentor] administrative workspace identity refresh failed: ${error instanceof Error ? error.message : error}`);
+    }
+  };
+  await refreshAdminIdentity();
+  adminIdentityTimer = setInterval(() => void refreshAdminIdentity(), 45_000);
+  adminIdentityTimer.unref?.();
 
   // Mappings survive stop/archive/unarchive/rebuild, so the cleanup set
   // includes BOTH active containers and archived workers (matched by containerName).
@@ -124,6 +164,10 @@ export default defineNitroPlugin(async (nitroApp) => {
   // Start the orphan sweeper — on a 10-minute interval, prunes per-user
   // data for users that no longer exist in the auth DB. Uses a timer rather
   // than a middleware to avoid ever touching better-auth's request pipeline.
+  useOrphanSweeper().addCleanupHook((userId) => useBackupManager().forgetUser(userId));
+  useOrphanSweeper().addCandidateSource(() => useBackupManager().ownerIds());
+  useOrphanSweeper().addCleanupHook((userId) => useImageCatalogManager().forgetOwner(userId));
+  useOrphanSweeper().addCandidateSource(() => useImageCatalogManager().ownerIds());
   useOrphanSweeper().start();
 
   logger.info(`[agentor] Synced ${containerManager.list().length} containers, ${workerStore.listArchived().length} archived, ${environmentStore.list().length} environments, ${capabilityStore.list().length} capabilities, ${instructionStore.list().length} instructions, ${initScriptStore.list().length} init scripts, ${portMappingStore.list().length} port mappings, ${domainMappingStore.list().length} domain mappings`);
@@ -144,6 +188,10 @@ export default defineNitroPlugin(async (nitroApp) => {
     try { useUpdateChecker().stop?.(); } catch {}
     try { useUsageChecker().stop?.(); } catch {}
     try { useResourceMonitor().stop?.(); } catch {}
+    try { useExportJobManager().stop(); } catch {}
+    try { useBackupManager().stop(); } catch {}
+    try { if (adminIdentityTimer) clearInterval(adminIdentityTimer); } catch {}
+    try { await managementMcp.stop(); } catch {}
     try { useLogCollector().detachAll(); } catch {}
     try { await useLogStore().destroy(); } catch {}
     try { getAuthDb().close(); } catch {}

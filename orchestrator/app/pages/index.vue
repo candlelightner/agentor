@@ -1,11 +1,28 @@
 <script setup lang="ts">
-import type { ContainerInfo, CreateContainerRequest, UpdateContainerSettingsRequest } from '~/types';
-
-useHead({ title: 'Agentor' });
+import type {
+  ContainerInfo,
+  CreateContainerRequest,
+  UpdateContainerSettingsRequest,
+} from "~/types";
 
 const { gitProviders } = useGitProviders();
-const { containers, refresh: refreshContainers, createContainer, stopContainer, restartContainer, rebuildContainer, removeContainer, updateContainerSettings } = useContainers();
-const { archivedWorkers, refresh: refreshArchived, archiveWorker, unarchiveWorker, deleteArchivedWorker } = useArchivedWorkers();
+const {
+  containers,
+  refresh: refreshContainers,
+  createContainer,
+  stopContainer,
+  restartContainer,
+  rebuildContainer,
+  removeContainer,
+  updateContainerSettings,
+} = useContainers();
+const {
+  archivedWorkers,
+  refresh: refreshArchived,
+  archiveWorker,
+  unarchiveWorker,
+  deleteArchivedWorker,
+} = useArchivedWorkers();
 const {
   rootNode,
   focusedNodeId,
@@ -24,6 +41,11 @@ const {
 
 const showCreateModal = ref(false);
 const showImportModal = ref(false);
+const showWorkspaceStorageModal = ref(false);
+const showBackupManagementModal = ref(false);
+const showImageCatalogModal = ref(false);
+const showAdminWorkspaceModal = ref(false);
+const showManagementMcpModal = ref(false);
 const showEnvironmentsModal = ref(false);
 const showCapabilitiesModal = ref(false);
 const showInstructionsModal = ref(false);
@@ -31,17 +53,48 @@ const showInitScriptsModal = ref(false);
 const showSettingsModal = ref(false);
 const showUsersModal = ref(false);
 const showAccountModal = ref(false);
+const adminServiceActive = computed(() => {
+  const active = tabs.value.find((tab) => tab.id === activeTabId.value);
+  return active?.containerName === "ADMIN / ORCHESTRATOR";
+});
 
-const { sidebarWidth, isDragging, isCollapsed, isMobile, startDrag, toggleCollapse } = useSidebarResize();
+useHead({
+  title: computed(() =>
+    showAdminWorkspaceModal.value || adminServiceActive.value
+      ? "ADMIN / ORCHESTRATOR — Agentor"
+      : "Agentor",
+  ),
+});
+
+const {
+  sidebarWidth,
+  isDragging,
+  isCollapsed,
+  isMobile,
+  startDrag,
+  toggleCollapse,
+} = useSidebarResize();
 
 function handleOpenLogs() {
-  openTab('__logs__', 'Logs', 'logs');
+  openTab("__logs__", "Logs", "logs");
 }
 
-function handleOpenTab(containerId: string, type: 'terminal' | 'desktop' | 'apps' | 'editor') {
+function handleOpenTab(
+  containerId: string,
+  type: "terminal" | "desktop" | "apps" | "editor",
+) {
   const container = containers.value.find((c) => c.id === containerId);
-  const name = container?.displayName || shortName(container?.id || containerId.slice(0, 12));
+  const name =
+    container?.displayName ||
+    shortName(container?.id || containerId.slice(0, 12));
   openTab(containerId, name, type);
+}
+
+function handleAdminService(workspaceId: string, service: string) {
+  if (service !== "terminal" && service !== "desktop" && service !== "editor")
+    return;
+  openTab(workspaceId, "ADMIN / ORCHESTRATOR", service);
+  showAdminWorkspaceModal.value = false;
 }
 
 async function handleCreate(request: CreateContainerRequest) {
@@ -49,13 +102,13 @@ async function handleCreate(request: CreateContainerRequest) {
   if (!container) return;
 
   // Auto-open terminal tab immediately — the container is already starting
-  handleOpenTab(container.id, 'terminal');
+  handleOpenTab(container.id, "terminal");
 }
 
 function handleDownloadWorkspace(id: string) {
-  const link = document.createElement('a');
+  const link = document.createElement("a");
   link.href = `/api/containers/${id}/workspace`;
-  link.download = '';
+  link.download = "";
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
@@ -63,33 +116,52 @@ function handleDownloadWorkspace(id: string) {
 
 async function onWorkerImported(container: ContainerInfo) {
   await refreshContainers();
-  if (container) handleOpenTab(container.id, 'terminal');
+  if (container) handleOpenTab(container.id, "terminal");
 }
 
 async function handleRebuild(id: string) {
-  if (!confirm('Rebuild this worker? The container will be destroyed and recreated with the latest image. Workspace data is preserved.')) return;
+  if (
+    !confirm(
+      "Rebuild this worker? The container will be destroyed and recreated with the latest image. Workspace data is preserved.",
+    )
+  )
+    return;
   closeTabsForContainer(id);
   const rebuilt = await rebuildContainer(id);
   if (rebuilt) {
-    handleOpenTab(rebuilt.id, 'terminal');
+    handleOpenTab(rebuilt.id, "terminal");
   }
 }
 
 async function handleRemove(id: string) {
-  if (!confirm('Remove this container and delete all workspace data? This cannot be undone.')) return;
+  if (
+    !confirm(
+      "Remove this container and delete all workspace data? This cannot be undone.",
+    )
+  )
+    return;
   closeTabsForContainer(id);
   await removeContainer(id);
   await refreshArchived();
 }
 
 async function handleArchive(id: string) {
-  if (!confirm('Archive this worker? The container will be removed but workspace data will be preserved.')) return;
+  if (
+    !confirm(
+      "Archive this worker? The container will be removed but workspace data will be preserved.",
+    )
+  )
+    return;
   closeTabsForContainer(id);
   await archiveWorker(id);
   await refreshContainers();
 }
 
-async function handleUpdate(id: string, patch: UpdateContainerSettingsRequest, rebuild: boolean) {
+async function handleUpdate(
+  id: string,
+  patch: UpdateContainerSettingsRequest,
+  rebuild: boolean,
+) {
   const updated = await updateContainerSettings(id, patch);
   // Open tab labels are captured at open time — refresh them in place when the
   // display name (a live edit) changed.
@@ -101,7 +173,7 @@ async function handleUpdate(id: string, patch: UpdateContainerSettingsRequest, r
   if (rebuild) {
     closeTabsForContainer(id);
     const rebuilt = await rebuildContainer(id);
-    if (rebuilt) handleOpenTab(rebuilt.id, 'terminal');
+    if (rebuilt) handleOpenTab(rebuilt.id, "terminal");
   }
 }
 
@@ -111,7 +183,12 @@ async function handleUnarchive(name: string) {
 }
 
 async function handleDeleteArchived(name: string) {
-  if (!confirm('Permanently delete this archived worker? All workspace data will be lost.')) return;
+  if (
+    !confirm(
+      "Permanently delete this archived worker? All workspace data will be lost.",
+    )
+  )
+    return;
   await deleteArchivedWorker(name);
 }
 
@@ -119,29 +196,40 @@ async function handleDeleteArchived(name: string) {
 // current modal and queue a follow-up modal to open once the exit transition
 // finishes (UModal emits `after:leave` when that is safe). Setting the next
 // modal before the transition completes would stack their backdrops.
-const pendingModalAfterCreateClose = ref<'environments' | 'initScripts' | null>(null);
+const pendingModalAfterCreateClose = ref<"environments" | "initScripts" | null>(
+  null,
+);
 
 function openEnvironmentsFromModal() {
-  pendingModalAfterCreateClose.value = 'environments';
+  pendingModalAfterCreateClose.value = "environments";
   showCreateModal.value = false;
 }
 
 function openInitScriptsFromModal() {
-  pendingModalAfterCreateClose.value = 'initScripts';
+  pendingModalAfterCreateClose.value = "initScripts";
   showCreateModal.value = false;
 }
 
 function onCreateModalClosed() {
   const next = pendingModalAfterCreateClose.value;
   pendingModalAfterCreateClose.value = null;
-  if (next === 'environments') showEnvironmentsModal.value = true;
-  else if (next === 'initScripts') showInitScriptsModal.value = true;
+  if (next === "environments") showEnvironmentsModal.value = true;
+  else if (next === "initScripts") showInitScriptsModal.value = true;
 }
-
 </script>
 
 <template>
-  <div class="flex h-screen bg-white dark:bg-gray-950 text-gray-800 dark:text-gray-200">
+  <div
+    class="relative flex h-screen bg-white text-gray-800 dark:bg-gray-950 dark:text-gray-200"
+    :class="{ 'ring-4 ring-inset ring-red-600': adminServiceActive }"
+  >
+    <div
+      v-if="adminServiceActive"
+      class="pointer-events-none fixed right-3 top-3 z-50 rounded border-2 border-red-200 bg-red-700 px-3 py-1.5 text-xs font-black tracking-widest text-white shadow-xl"
+      data-testid="admin-service-marker"
+    >
+      ADMIN / ORCHESTRATOR
+    </div>
     <!-- Mobile backdrop -->
     <div
       v-if="isMobile && !isCollapsed"
@@ -166,6 +254,11 @@ function onCreateModalClosed() {
       :archived-workers="archivedWorkers"
       @new-worker="showCreateModal = true"
       @import-worker="showImportModal = true"
+      @open-workspace-storage="showWorkspaceStorageModal = true"
+      @open-backup-management="showBackupManagementModal = true"
+      @open-image-catalog="showImageCatalogModal = true"
+      @open-admin-workspace="showAdminWorkspaceModal = true"
+      @open-management-mcp="showManagementMcpModal = true"
       @manage-environments="showEnvironmentsModal = true"
       @manage-capabilities="showCapabilitiesModal = true"
       @manage-instructions="showInstructionsModal = true"
@@ -236,9 +329,24 @@ function onCreateModalClosed() {
       @imported="onWorkerImported"
     />
 
-    <EnvironmentsModal
-      v-model:open="showEnvironmentsModal"
+    <WorkspaceInventoryModal v-model:open="showWorkspaceStorageModal" />
+    <BackupManagementModal
+      v-model:open="showBackupManagementModal"
+      @changed="() => {}"
+      @restored="() => refreshContainers()"
     />
+    <ImageCatalogModal
+      v-model:open="showImageCatalogModal"
+      @changed="() => {}"
+      @test-worker="() => refreshContainers()"
+    />
+    <AdminWorkspaceModal
+      v-model:open="showAdminWorkspaceModal"
+      @service="handleAdminService"
+    />
+    <ManagementMcpModal v-model:open="showManagementMcpModal" />
+
+    <EnvironmentsModal v-model:open="showEnvironmentsModal" />
 
     <CapabilitiesModal v-model:open="showCapabilitiesModal" />
     <InstructionsModal v-model:open="showInstructionsModal" />

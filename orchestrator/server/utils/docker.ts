@@ -151,6 +151,9 @@ export class DockerService {
     /** Per-user env vars (agent API keys, GitHub token, custom). Already
      * resolved against the worker owner's account by the container manager. */
     userEnv: UserEnvVars;
+    /** Decrypted only at the final container-creation boundary. Values are
+     * never logged; secret files are materialized into an ephemeral tmpfs. */
+    workerConfig?: Array<{ kind: 'variable' | 'secret' | 'secretFile'; key: string; value: string; fileName?: string }>;
     /** Image to run. Defaults to the standard worker image; set to a per-worker
      * imported image (from `docker import`) for restored workers. */
     image?: string;
@@ -178,6 +181,11 @@ export class DockerService {
     // via `renderUserEnvVars`. CustomEnvVars entries can override well-known
     // slots using the same KEY.
     for (const line of renderUserEnvVars(opts.userEnv)) env.push(line);
+
+    const localEnv = (opts.workerConfig ?? []).filter((entry) => entry.kind === 'variable').map(({ key, value }) => ({ key, value }));
+    if (localEnv.length) env.push(`WORKER_LOCAL_ENV=${Buffer.from(JSON.stringify(localEnv)).toString('base64')}`);
+    const hasSensitiveWorkerConfig = (opts.workerConfig ?? []).some((entry) => entry.kind !== 'variable');
+    if (hasSensitiveWorkerConfig) env.push('WORKER_SECRET_HANDSHAKE=1');
 
     env.push('ORCHESTRATOR_URL=http://agentor-orchestrator:3000');
     env.push(`WORKER_CONTAINER_NAME=${opts.containerName}`);
@@ -257,13 +265,26 @@ export class DockerService {
         ...(capAdd.length > 0 ? { CapAdd: capAdd } : {}),
         ...(opts.dockerEnabled ? { Privileged: true } : {}),
         Init: true,
-        RestartPolicy: { Name: 'unless-stopped' },
+        // A Docker-daemon-only restart cannot repopulate ephemeral secrets.
+        // Keep secret-bearing workers stopped until the orchestrator can run
+        // the authenticated bootstrap handshake; non-secret workers retain the
+        // existing automatic restart behavior.
+        RestartPolicy: { Name: hasSensitiveWorkerConfig ? 'no' : 'unless-stopped' },
         ShmSize: 512 * 1024 * 1024,
         Binds: binds.length > 0 ? binds : undefined,
+        Tmpfs: { '/run/agentor-secrets': 'rw,nosuid,nodev,noexec,mode=0711,uid=0,gid=0,size=16777216' },
       },
     });
 
-    if (opts.start !== false) await container.start();
+    if (opts.start !== false) {
+      try {
+        await container.start();
+        await this.materializeWorkerSecretFiles(container.id, opts.workerConfig ?? []);
+      } catch (err) {
+        await container.remove({ force: true }).catch(() => {});
+        throw err;
+      }
+    }
     useLogger().info(`[docker] created container ${opts.containerName}${opts.image ? ` (image ${opts.image})` : ''}`);
     return container;
   }
@@ -406,6 +427,43 @@ export class DockerService {
   async restartContainer(containerId: string): Promise<void> {
     const container = this.docker.getContainer(containerId);
     await container.restart();
+  }
+
+  async materializeWorkerSecretFiles(containerId: string, config: Array<{ kind: string; key: string; value: string; fileName?: string }>): Promise<void> {
+    const files = config.filter((entry) => entry.kind === 'secretFile').map((entry) => ({ name: entry.fileName, content: Buffer.from(entry.value).toString('base64') }));
+    const secrets = config.filter((entry) => entry.kind === 'secret').map((entry) => ({ key: entry.key, value: entry.value }));
+    if (!files.length && !secrets.length) return;
+    const script = String.raw`import sys,json,base64,os
+root='/run/agentor-secrets'
+rootfd=os.open(root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+for item in json.loads(sys.stdin.readline()):
+ name=item['name']
+ if not isinstance(name,str) or not name or '\\' in name or any(part in ('','.','..') for part in name.split('/')): raise ValueError('invalid secret file name')
+ parts=name.split('/'); parentfd=os.dup(rootfd)
+ for part in parts[:-1]:
+  try: os.mkdir(part,0o711,dir_fd=parentfd)
+  except FileExistsError: pass
+  nextfd=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parentfd)
+  os.close(parentfd); parentfd=nextfd
+ fd=os.open(parts[-1],os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600,dir_fd=parentfd)
+ try: os.write(fd,base64.b64decode(item['content'],validate=True)); os.fchmod(fd,0o600); os.fchown(fd,1000,1000)
+ finally: os.close(fd); os.close(parentfd)
+os.close(rootfd)
+`;
+    if (files.length) {
+      const result = await this.execCapture(containerId, ['python3', '-c', script], { user: 'root', stdin: Buffer.from(`${JSON.stringify(files)}\n`) });
+      if (result.exitCode !== 0) throw new Error('Failed to materialize worker secret files');
+    }
+    const envScript = String.raw`import sys,json,subprocess
+for item in json.loads(sys.stdin.readline()):
+ subprocess.run(['tmux','set-environment','-g',item['key'],item['value']],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+`;
+    if (secrets.length) {
+      const result = await this.execCapture(containerId, ['python3', '-c', envScript], { user: 'agent', stdin: Buffer.from(`${JSON.stringify(secrets)}\n`) });
+      if (result.exitCode !== 0) throw new Error('Failed to apply worker secrets');
+    }
+    const ready = await this.execCapture(containerId, ['python3', '-c', "import os; fd=os.open('/run/agentor-secrets/.ready',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o444); os.write(fd,b'agentor-secret-bootstrap-v1\\n'); os.fchmod(fd,0o444); os.close(fd)"], { user: 'root' });
+    if (ready.exitCode !== 0) throw new Error('Failed to complete worker secret handshake');
   }
 
   // --- Generic app instance management (runs in worker container) ---

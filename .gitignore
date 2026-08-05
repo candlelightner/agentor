@@ -33,3 +33,9 @@ orchestrator/coverage/
 .vscode/
 *.swp
 *.swo
+
+# Session handoff / agent scratch files (not part of the platform)
+SESSION_HANDOFF.md
+HANDOFF.md
+*.session-handoff.md
+/agentor-*.txt

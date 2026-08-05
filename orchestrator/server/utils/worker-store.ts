@@ -1,5 +1,9 @@
-import { UserScopedJsonStore } from './user-scoped-store';
-import type { RepoConfig, MountConfig, UserOwnedResource } from '../../shared/types';
+import { UserScopedJsonStore } from "./user-scoped-store";
+import type {
+  RepoConfig,
+  MountConfig,
+  UserOwnedResource,
+} from "../../shared/types";
 
 /** Persisted worker metadata — intentionally minimal. It stores ONLY what cannot
  * be discovered from Docker at runtime: the worker's identity, owner, editable
@@ -18,7 +22,7 @@ export interface WorkerRecord extends UserOwnedResource {
    * `archived` = the container was removed but the worker's volumes + config are
    * kept for unarchiving. (For archived workers the record is the only evidence
    * the worker exists, since no container remains to discover it from.) */
-  status: 'active' | 'archived';
+  status: "active" | "archived";
   archivedAt?: string;
   /** Foreign key to the assigned environment — the only environment data stored
    * on the worker. The environment's config (CPU/memory/network/docker/setup
@@ -38,11 +42,15 @@ export interface WorkerRecord extends UserOwnedResource {
    * — reused across rebuild/unarchive so the captured rootfs survives. Unset for
    * normal workers (which run the shared standard worker image). */
   importedImage?: string;
+  imageDefinitionId?: string;
+  imageVersion?: string;
+  imageDigest?: string;
+  imageRuntimeReference?: string;
 }
 
 export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
   constructor(dataDir: string) {
-    super(dataDir, 'workers.json', (w) => w.id);
+    super(dataDir, "workers.json", (w) => w.id);
   }
 
   /** Flat list of every worker across every user, sorted by the immutable UUID
@@ -53,17 +61,19 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
 
   override listForUser(userId: string): WorkerRecord[] {
     // Sort by the user-facing label (the UUID `id` is meaningless to sort on).
-    return super.listForUser(userId).sort((a, b) =>
-      (a.displayName || a.id).localeCompare(b.displayName || b.id),
-    );
+    return super
+      .listForUser(userId)
+      .sort((a, b) =>
+        (a.displayName || a.id).localeCompare(b.displayName || b.id),
+      );
   }
 
   listArchived(): WorkerRecord[] {
-    return this.list().filter((w) => w.status === 'archived');
+    return this.list().filter((w) => w.status === "archived");
   }
 
   listActive(): WorkerRecord[] {
-    return this.list().filter((w) => w.status === 'active');
+    return this.list().filter((w) => w.status === "active");
   }
 
   /** Find a worker by its UUID `id` across all users. Used to resolve the
@@ -78,7 +88,9 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     await this.setItem(worker.userId, worker);
     const label = worker.displayName || worker.id;
     if (isNew) {
-      useLogger().info(`[worker-store] registered worker ${label} (status=${worker.status})`);
+      useLogger().info(
+        `[worker-store] registered worker ${label} (status=${worker.status})`,
+      );
     } else {
       useLogger().debug(`[worker-store] updated worker ${label}`);
     }
@@ -87,33 +99,43 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
   async archive(userId: string, id: string): Promise<void> {
     const worker = this.get(userId, id);
     if (!worker) {
-      useLogger().warn(`[worker-store] archive failed — worker not found: ${userId}/${id}`);
+      useLogger().warn(
+        `[worker-store] archive failed — worker not found: ${userId}/${id}`,
+      );
       throw new Error(`Worker not found: ${id}`);
     }
-    worker.status = 'archived';
+    worker.status = "archived";
     worker.archivedAt = new Date().toISOString();
     worker.updatedAt = worker.archivedAt;
     await this.setItem(userId, worker);
-    useLogger().info(`[worker-store] archived worker ${worker.displayName || worker.id}`);
+    useLogger().info(
+      `[worker-store] archived worker ${worker.displayName || worker.id}`,
+    );
   }
 
   async unarchive(userId: string, id: string): Promise<void> {
     const worker = this.get(userId, id);
     if (!worker) {
-      useLogger().warn(`[worker-store] unarchive failed — worker not found: ${userId}/${id}`);
+      useLogger().warn(
+        `[worker-store] unarchive failed — worker not found: ${userId}/${id}`,
+      );
       throw new Error(`Worker not found: ${id}`);
     }
-    worker.status = 'active';
+    worker.status = "active";
     worker.archivedAt = undefined;
     worker.updatedAt = new Date().toISOString();
     await this.setItem(userId, worker);
-    useLogger().info(`[worker-store] unarchived worker ${worker.displayName || worker.id}`);
+    useLogger().info(
+      `[worker-store] unarchived worker ${worker.displayName || worker.id}`,
+    );
   }
 
   async delete(userId: string, id: string): Promise<void> {
     const existed = await this.deleteItem(userId, id);
     if (!existed) {
-      useLogger().warn(`[worker-store] delete failed — worker not found: ${userId}/${id}`);
+      useLogger().warn(
+        `[worker-store] delete failed — worker not found: ${userId}/${id}`,
+      );
       throw new Error(`Worker not found: ${id}`);
     }
     useLogger().info(`[worker-store] deleted worker ${userId}/${id}`);

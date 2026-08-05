@@ -1,5 +1,10 @@
 <script setup lang="ts">
-import type { ContainerInfo, Tab, ArchivedWorker, UpdateContainerSettingsRequest } from '~/types';
+import type {
+  ContainerInfo,
+  Tab,
+  ArchivedWorker,
+  UpdateContainerSettingsRequest,
+} from "~/types";
 
 const props = defineProps<{
   containers: ContainerInfo[];
@@ -11,6 +16,11 @@ const props = defineProps<{
 const emit = defineEmits<{
   newWorker: [];
   importWorker: [];
+  openWorkspaceStorage: [];
+  openBackupManagement: [];
+  openImageCatalog: [];
+  openAdminWorkspace: [];
+  openManagementMcp: [];
   manageEnvironments: [];
   manageCapabilities: [];
   manageInstructions: [];
@@ -24,7 +34,11 @@ const emit = defineEmits<{
   rebuildContainer: [id: string];
   removeContainer: [id: string];
   archiveContainer: [id: string];
-  updateContainer: [id: string, patch: UpdateContainerSettingsRequest, rebuild: boolean];
+  updateContainer: [
+    id: string,
+    patch: UpdateContainerSettingsRequest,
+    rebuild: boolean,
+  ];
   downloadWorkspace: [id: string];
   unarchiveWorker: [name: string];
   deleteArchivedWorker: [name: string];
@@ -59,15 +73,18 @@ function metricFor(containerId: string) {
 // (running / creating / error / removing). Mutually exclusive, mirroring how
 // archived workers live in their own tab.
 const activeContainers = computed(() =>
-  props.containers.filter((c) => c.status !== 'stopped'),
+  props.containers.filter((c) => c.status !== "stopped"),
 );
 const stoppedContainers = computed(() =>
-  props.containers.filter((c) => c.status === 'stopped'),
+  props.containers.filter((c) => c.status === "stopped"),
 );
 
-const { data: domainMapperStatus } = useFetch<{ enabled: boolean }>('/api/domain-mapper/status', {
-  default: () => ({ enabled: false }),
-});
+const { data: domainMapperStatus } = useFetch<{ enabled: boolean }>(
+  "/api/domain-mapper/status",
+  {
+    default: () => ({ enabled: false }),
+  },
+);
 
 interface SidebarTabDef {
   id: string;
@@ -78,19 +95,44 @@ interface SidebarTabDef {
 
 const visibleTabs = computed<SidebarTabDef[]>(() => {
   const items: SidebarTabDef[] = [
-    { id: 'workers', label: 'Workers', icon: 'i-lucide-server', badge: activeContainers.value.length || undefined },
-    { id: 'stopped', label: 'Stopped', icon: 'i-lucide-circle-pause', badge: stoppedContainers.value.length || undefined },
-    { id: 'archived', label: 'Archived', icon: 'i-lucide-archive', badge: props.archivedWorkers.length || undefined },
-    { id: 'ports', label: 'Ports', icon: 'i-lucide-plug', badge: portMappings.value.length || undefined },
+    {
+      id: "workers",
+      label: "Workers",
+      icon: "i-lucide-server",
+      badge: activeContainers.value.length || undefined,
+    },
+    {
+      id: "stopped",
+      label: "Stopped",
+      icon: "i-lucide-circle-pause",
+      badge: stoppedContainers.value.length || undefined,
+    },
+    {
+      id: "archived",
+      label: "Archived",
+      icon: "i-lucide-archive",
+      badge: props.archivedWorkers.length || undefined,
+    },
+    {
+      id: "ports",
+      label: "Ports",
+      icon: "i-lucide-plug",
+      badge: portMappings.value.length || undefined,
+    },
   ];
   if (domainMapperStatus.value.enabled) {
-    items.push({ id: 'domains', label: 'Domains', icon: 'i-lucide-globe', badge: domainMappings.value.length || undefined });
+    items.push({
+      id: "domains",
+      label: "Domains",
+      icon: "i-lucide-globe",
+      badge: domainMappings.value.length || undefined,
+    });
   }
-  items.push({ id: 'usage', label: 'Usage', icon: 'i-lucide-activity' });
+  items.push({ id: "usage", label: "Usage", icon: "i-lucide-activity" });
   // System tab (Images + Logs + System Settings + Users) is admin-only —
   // every action inside it calls an admin-only endpoint.
   if (isAdmin.value) {
-    items.push({ id: 'system', label: 'System', icon: 'i-lucide-settings' });
+    items.push({ id: "system", label: "System", icon: "i-lucide-settings" });
   }
   return items;
 });
@@ -99,13 +141,15 @@ const activeTab = computed(() => {
   const validIds = visibleTabs.value.map((t) => t.id);
   return validIds.includes(uiState.value.sidebar.activeTab)
     ? uiState.value.sidebar.activeTab
-    : 'workers';
+    : "workers";
 });
 
 // The Workers and Stopped tabs share the same ContainerCard list, differing
 // only in which workers they show and the empty-state copy.
 const currentWorkerList = computed(() =>
-  activeTab.value === 'stopped' ? stoppedContainers.value : activeContainers.value,
+  activeTab.value === "stopped"
+    ? stoppedContainers.value
+    : activeContainers.value,
 );
 
 function selectTab(id: string) {
@@ -127,7 +171,9 @@ const overflowingIds = ref<Set<string>>(new Set());
 const overflowingTabs = computed(() =>
   visibleTabs.value.filter((t) => overflowingIds.value.has(t.id)),
 );
-const activeInOverflow = computed(() => overflowingIds.value.has(activeTab.value));
+const activeInOverflow = computed(() =>
+  overflowingIds.value.has(activeTab.value),
+);
 
 function setsEqual(a: Set<string>, b: Set<string>) {
   if (a.size !== b.size) return false;
@@ -153,7 +199,9 @@ function recalcOverflow() {
   const viewLeft = bar.scrollLeft;
   const viewRight = viewLeft + bar.clientWidth;
   const next = new Set<string>();
-  const children = Array.from(bar.querySelectorAll<HTMLElement>('[data-tab-id]'));
+  const children = Array.from(
+    bar.querySelectorAll<HTMLElement>("[data-tab-id]"),
+  );
   // A tab is listed in the overflow dropdown only if LESS THAN 20% of its
   // width is currently visible inside the scroll viewport. A tab with 20% or
   // more visible stays out of the dropdown — this gives a small hysteresis
@@ -204,16 +252,19 @@ function onTabBarWheel(e: WheelEvent) {
 }
 
 function onClickOutside(e: MouseEvent) {
-  if (moreContainerRef.value && !moreContainerRef.value.contains(e.target as Node)) {
+  if (
+    moreContainerRef.value &&
+    !moreContainerRef.value.contains(e.target as Node)
+  ) {
     moreOpen.value = false;
   }
 }
 
 watch(moreOpen, (open) => {
   if (open) {
-    document.addEventListener('mousedown', onClickOutside);
+    document.addEventListener("mousedown", onClickOutside);
   } else {
-    document.removeEventListener('mousedown', onClickOutside);
+    document.removeEventListener("mousedown", onClickOutside);
   }
 });
 
@@ -230,12 +281,16 @@ onMounted(() => {
 onUnmounted(() => {
   resizeObs?.disconnect();
   if (scrollRaf) cancelAnimationFrame(scrollRaf);
-  document.removeEventListener('mousedown', onClickOutside);
+  document.removeEventListener("mousedown", onClickOutside);
 });
 
 watch(visibleTabs, () => nextTick(recalcOverflow));
 
-function isContainerActive(containerId: string, tabs: Tab[], activeTabId: string | null): boolean {
+function isContainerActive(
+  containerId: string,
+  tabs: Tab[],
+  activeTabId: string | null,
+): boolean {
   if (!activeTabId) return false;
   const tab = tabs.find((t) => t.id === activeTabId);
   return tab?.containerId === containerId;
@@ -243,9 +298,13 @@ function isContainerActive(containerId: string, tabs: Tab[], activeTabId: string
 </script>
 
 <template>
-  <aside class="relative bg-gray-50 dark:bg-gray-900 border-r border-gray-200 dark:border-gray-800 flex flex-col flex-shrink-0 min-w-0">
+  <aside
+    class="relative bg-gray-50 dark:bg-gray-900 border-r border-gray-200 dark:border-gray-800 flex flex-col flex-shrink-0 min-w-0"
+  >
     <!-- Header -->
-    <div class="p-4 border-b border-gray-200 dark:border-gray-800 flex-shrink-0">
+    <div
+      class="p-4 border-b border-gray-200 dark:border-gray-800 flex-shrink-0"
+    >
       <div class="flex items-center justify-between">
         <h1 class="text-lg font-bold text-gray-900 dark:text-white">Agentor</h1>
         <div class="flex items-center gap-1">
@@ -273,19 +332,103 @@ function isContainerActive(containerId: string, tabs: Tab[], activeTabId: string
             @click="emit('importWorker')"
           />
         </UTooltip>
+        <UTooltip text="Workspace storage">
+          <UButton
+            color="neutral"
+            variant="outline"
+            icon="i-lucide-database"
+            aria-label="Workspace storage"
+            @click="emit('openWorkspaceStorage')"
+          />
+        </UTooltip>
       </div>
-      <UButton class="w-full mt-2" color="neutral" variant="outline" size="sm" @click="emit('manageEnvironments')">
+      <UButton
+        class="w-full mt-2"
+        color="neutral"
+        variant="outline"
+        size="sm"
+        @click="emit('manageEnvironments')"
+      >
         Environments
       </UButton>
+      <div class="grid grid-cols-2 gap-2 mt-2">
+        <UButton
+          color="neutral"
+          variant="outline"
+          size="sm"
+          icon="i-lucide-cloud-upload"
+          @click="emit('openBackupManagement')"
+        >
+          Backup management
+        </UButton>
+        <UButton
+          color="neutral"
+          variant="outline"
+          size="sm"
+          icon="i-lucide-box"
+          @click="emit('openImageCatalog')"
+        >
+          Image catalog
+        </UButton>
+      </div>
+      <div
+        v-if="isAdmin"
+        class="mt-2 overflow-hidden rounded-lg border-2 border-red-600 bg-red-950 text-red-50 shadow-sm"
+        data-testid="admin-orchestrator-controls"
+      >
+        <div
+          class="flex items-center gap-2 border-b border-red-700 bg-red-700 px-3 py-1.5 text-xs font-black uppercase tracking-wider"
+        >
+          <UIcon name="i-lucide-shield-alert" class="size-4" />
+          <span>ADMIN / ORCHESTRATOR</span>
+        </div>
+        <div class="grid grid-cols-2 gap-1 p-1.5">
+          <button
+            class="flex items-center justify-center gap-1.5 rounded px-1.5 py-1.5 text-xs font-semibold transition-colors hover:bg-red-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300"
+            @click="emit('openAdminWorkspace')"
+          >
+            <UIcon
+              name="i-lucide-terminal-square"
+              class="size-3.5 flex-shrink-0"
+            />
+            Admin workspace
+          </button>
+          <button
+            class="flex items-center justify-center gap-1.5 rounded px-1.5 py-1.5 text-xs font-semibold transition-colors hover:bg-red-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300"
+            @click="emit('openManagementMcp')"
+          >
+            <UIcon
+              name="i-lucide-shield-check"
+              class="size-3.5 flex-shrink-0"
+            />
+            Management MCP
+          </button>
+        </div>
+      </div>
       <div class="sidebar-btn-row-3-container mt-2">
         <div class="sidebar-btn-row-3">
-          <UButton color="neutral" variant="outline" size="sm" @click="emit('manageCapabilities')">
+          <UButton
+            color="neutral"
+            variant="outline"
+            size="sm"
+            @click="emit('manageCapabilities')"
+          >
             Capabilities
           </UButton>
-          <UButton color="neutral" variant="outline" size="sm" @click="emit('manageInstructions')">
+          <UButton
+            color="neutral"
+            variant="outline"
+            size="sm"
+            @click="emit('manageInstructions')"
+          >
             Instructions
           </UButton>
-          <UButton color="neutral" variant="outline" size="sm" @click="emit('manageInitScripts')">
+          <UButton
+            color="neutral"
+            variant="outline"
+            size="sm"
+            @click="emit('manageInitScripts')"
+          >
             Init Scripts
           </UButton>
         </div>
@@ -293,7 +436,11 @@ function isContainerActive(containerId: string, tabs: Tab[], activeTabId: string
     </div>
 
     <!-- Tab bar area -->
-    <div ref="moreContainerRef" class="sidebar-tab-bar-wrap" :class="{ 'has-overflow': hasOverflow }">
+    <div
+      ref="moreContainerRef"
+      class="sidebar-tab-bar-wrap"
+      :class="{ 'has-overflow': hasOverflow }"
+    >
       <nav
         ref="tabBarRef"
         class="sidebar-tab-bar"
@@ -311,7 +458,9 @@ function isContainerActive(containerId: string, tabs: Tab[], activeTabId: string
         >
           <UIcon :name="tab.icon" class="size-3.5 flex-shrink-0" />
           <span class="sidebar-tab-label">{{ tab.label }}</span>
-          <span v-if="tab.badge" class="sidebar-tab-badge">{{ tab.badge }}</span>
+          <span v-if="tab.badge" class="sidebar-tab-badge">{{
+            tab.badge
+          }}</span>
         </button>
       </nav>
 
@@ -327,7 +476,10 @@ function isContainerActive(containerId: string, tabs: Tab[], activeTabId: string
       </button>
 
       <!-- Dropdown lists only tabs not currently visible in the scroll viewport. -->
-      <div v-if="moreOpen && hasOverflow && overflowingTabs.length > 0" class="sidebar-tab-dropdown">
+      <div
+        v-if="moreOpen && hasOverflow && overflowingTabs.length > 0"
+        class="sidebar-tab-dropdown"
+      >
         <button
           v-for="tab in overflowingTabs"
           :key="tab.id"
@@ -337,7 +489,9 @@ function isContainerActive(containerId: string, tabs: Tab[], activeTabId: string
         >
           <UIcon :name="tab.icon" class="size-3.5 flex-shrink-0" />
           <span>{{ tab.label }}</span>
-          <span v-if="tab.badge" class="sidebar-tab-dropdown-badge">{{ tab.badge }}</span>
+          <span v-if="tab.badge" class="sidebar-tab-dropdown-badge">{{
+            tab.badge
+          }}</span>
         </button>
       </div>
     </div>
@@ -345,9 +499,17 @@ function isContainerActive(containerId: string, tabs: Tab[], activeTabId: string
     <!-- Tab content -->
     <div class="flex-1 overflow-y-auto min-h-0">
       <!-- Workers / Stopped (same card list, different source + empty copy) -->
-      <div v-if="activeTab === 'workers' || activeTab === 'stopped'" class="p-3">
-        <div v-if="currentWorkerList.length === 0" class="text-gray-400 dark:text-gray-500 text-sm text-center py-8">
-          {{ activeTab === 'stopped' ? 'No stopped workers.' : 'No workers yet.' }}
+      <div
+        v-if="activeTab === 'workers' || activeTab === 'stopped'"
+        class="p-3"
+      >
+        <div
+          v-if="currentWorkerList.length === 0"
+          class="text-gray-400 dark:text-gray-500 text-sm text-center py-8"
+        >
+          {{
+            activeTab === "stopped" ? "No stopped workers." : "No workers yet."
+          }}
         </div>
         <div class="space-y-2">
           <ContainerCard
@@ -365,7 +527,10 @@ function isContainerActive(containerId: string, tabs: Tab[], activeTabId: string
             @rebuild="(id) => emit('rebuildContainer', id)"
             @remove="(id) => emit('removeContainer', id)"
             @archive="(id) => emit('archiveContainer', id)"
-            @update="(id, patch, rebuild) => emit('updateContainer', id, patch, rebuild)"
+            @update="
+              (id, patch, rebuild) =>
+                emit('updateContainer', id, patch, rebuild)
+            "
             @download-workspace="(id) => emit('downloadWorkspace', id)"
           />
         </div>
@@ -373,7 +538,10 @@ function isContainerActive(containerId: string, tabs: Tab[], activeTabId: string
 
       <!-- Archived -->
       <div v-if="activeTab === 'archived'" class="p-3">
-        <div v-if="archivedWorkers.length === 0" class="text-gray-400 dark:text-gray-500 text-sm text-center py-8">
+        <div
+          v-if="archivedWorkers.length === 0"
+          class="text-gray-400 dark:text-gray-500 text-sm text-center py-8"
+        >
           No archived workers.
         </div>
         <div class="space-y-2">
@@ -389,12 +557,18 @@ function isContainerActive(containerId: string, tabs: Tab[], activeTabId: string
 
       <!-- Port Mappings -->
       <div v-if="activeTab === 'ports'" class="p-3">
-        <PortMappingsPanel :containers="containers" :archived-workers="archivedWorkers" />
+        <PortMappingsPanel
+          :containers="containers"
+          :archived-workers="archivedWorkers"
+        />
       </div>
 
       <!-- Domain Mappings -->
       <div v-if="activeTab === 'domains'" class="p-3">
-        <DomainMappingsPanel :containers="containers" :archived-workers="archivedWorkers" />
+        <DomainMappingsPanel
+          :containers="containers"
+          :archived-workers="archivedWorkers"
+        />
       </div>
 
       <!-- Usage -->
@@ -412,8 +586,12 @@ function isContainerActive(containerId: string, tabs: Tab[], activeTabId: string
               :disabled="usageRefreshing"
               @click="usageRefresh()"
             >
-              <UIcon name="i-lucide-refresh-cw" class="size-3.5 flex-shrink-0" :class="{ 'animate-spin': usageRefreshing }" />
-              {{ usageRefreshing ? 'Refreshing...' : 'Refresh usage' }}
+              <UIcon
+                name="i-lucide-refresh-cw"
+                class="size-3.5 flex-shrink-0"
+                :class="{ 'animate-spin': usageRefreshing }"
+              />
+              {{ usageRefreshing ? "Refreshing..." : "Refresh usage" }}
             </button>
           </div>
         </div>
@@ -439,18 +617,18 @@ function isContainerActive(containerId: string, tabs: Tab[], activeTabId: string
             <span>Quick Links</span>
           </div>
           <div class="p-1.5">
-            <button
-              class="system-card-link"
-              @click="emit('openLogs')"
-            >
-              <UIcon name="i-lucide-scroll-text" class="size-3.5 flex-shrink-0" />
+            <button class="system-card-link" @click="emit('openLogs')">
+              <UIcon
+                name="i-lucide-scroll-text"
+                class="size-3.5 flex-shrink-0"
+              />
               Logs
             </button>
-            <button
-              class="system-card-link"
-              @click="emit('openSettings')"
-            >
-              <UIcon name="i-lucide-sliders-horizontal" class="size-3.5 flex-shrink-0" />
+            <button class="system-card-link" @click="emit('openSettings')">
+              <UIcon
+                name="i-lucide-sliders-horizontal"
+                class="size-3.5 flex-shrink-0"
+              />
               System Settings
             </button>
             <button
@@ -461,23 +639,23 @@ function isContainerActive(containerId: string, tabs: Tab[], activeTabId: string
               <UIcon name="i-lucide-users" class="size-3.5 flex-shrink-0" />
               Users
             </button>
-            <a
-              href="/api/docs"
-              target="_blank"
-              class="system-card-link"
-            >
+            <a href="/api/docs" target="_blank" class="system-card-link">
               <UIcon name="i-lucide-book-open" class="size-3.5 flex-shrink-0" />
               API Docs
-              <UIcon name="i-lucide-external-link" class="size-3 flex-shrink-0 ml-auto opacity-40" />
+              <UIcon
+                name="i-lucide-external-link"
+                class="size-3 flex-shrink-0 ml-auto opacity-40"
+              />
             </a>
           </div>
         </div>
-
       </div>
     </div>
 
     <!-- Signed-in user card — pinned to the bottom of the sidebar -->
-    <div class="flex-shrink-0 border-t border-gray-200 dark:border-gray-800 p-3">
+    <div
+      class="flex-shrink-0 border-t border-gray-200 dark:border-gray-800 p-3"
+    >
       <div class="flex items-center gap-2 min-w-0">
         <button
           type="button"
@@ -486,13 +664,17 @@ function isContainerActive(containerId: string, tabs: Tab[], activeTabId: string
           title="Account settings"
           @click="emit('openAccount')"
         >
-          <div class="flex items-center justify-center size-8 rounded-full bg-gray-200 dark:bg-gray-800 text-gray-600 dark:text-gray-300 flex-shrink-0">
+          <div
+            class="flex items-center justify-center size-8 rounded-full bg-gray-200 dark:bg-gray-800 text-gray-600 dark:text-gray-300 flex-shrink-0"
+          >
             <UIcon name="i-lucide-user" class="size-4" />
           </div>
           <div class="min-w-0 flex-1">
             <div class="flex items-center gap-1.5">
-              <span class="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">
-                {{ currentUser?.name || 'User' }}
+              <span
+                class="text-sm font-medium text-gray-900 dark:text-gray-100 truncate"
+              >
+                {{ currentUser?.name || "User" }}
               </span>
               <UBadge v-if="isAdmin" size="xs" color="warning">admin</UBadge>
             </div>

@@ -9,6 +9,9 @@ import type { EnvironmentStore } from './environments';
 import type { CapabilityStore } from './capability-store';
 import type { InstructionStore } from './instruction-store';
 import type { InitScriptStore } from './init-script-store';
+import type { ExportJobManager } from './export-jobs';
+import { listWorkspaceTombstones, removeWorkspaceTombstonesForUser } from './workspace-tombstones';
+import { useGitImageCatalogManager } from './git-image-manager';
 
 /** Remove per-user data whose owning user has been deleted from the auth DB.
  * Called once at startup and on a 10-minute interval so orphaned per-user
@@ -18,6 +21,8 @@ import type { InitScriptStore } from './init-script-store';
  * better-auth's body parsing on the delete-user endpoint. */
 export class OrphanSweeper {
   private timer: ReturnType<typeof setInterval> | null = null;
+  private cleanupHooks: Array<(userId: string) => Promise<void>> = [];
+  private candidateSources: Array<() => string[] | Promise<string[]>> = [];
 
   constructor(
     private envStore: UserEnvVarStore,
@@ -30,7 +35,11 @@ export class OrphanSweeper {
     private capabilityStore: CapabilityStore,
     private instructionStore: InstructionStore,
     private initScriptStore: InitScriptStore,
+    private exportJobs: ExportJobManager,
   ) {}
+
+  addCleanupHook(hook: (userId: string) => Promise<void>) { this.cleanupHooks.push(hook); }
+  addCandidateSource(source: () => string[] | Promise<string[]>) { this.candidateSources.push(source); }
 
   start(intervalMs = 10 * 60 * 1000): void {
     this.sweep().catch((err) => {
@@ -65,6 +74,9 @@ export class OrphanSweeper {
     // we clean up even if a user was created but never saved env vars.
     const candidates = new Set<string>();
     for (const entry of this.envStore.list()) candidates.add(entry.userId);
+    for (const entry of await listWorkspaceTombstones()) candidates.add(entry.userId);
+    for (const userId of useGitImageCatalogManager().ownerIds()) candidates.add(userId);
+    for (const source of this.candidateSources) for (const userId of await source()) candidates.add(userId);
     for (const store of [
       this.workerStore,
       this.portStore,
@@ -73,6 +85,7 @@ export class OrphanSweeper {
       this.capabilityStore,
       this.instructionStore,
       this.initScriptStore,
+      this.exportJobs,
     ]) {
       for (const userId of store.listUserIds()) candidates.add(userId);
     }
@@ -88,6 +101,10 @@ export class OrphanSweeper {
       await this.capabilityStore.removeForUser(userId).catch(() => {});
       await this.instructionStore.removeForUser(userId).catch(() => {});
       await this.initScriptStore.removeForUser(userId).catch(() => {});
+      await this.exportJobs.removeForUser(userId).catch(() => {});
+      await removeWorkspaceTombstonesForUser(userId).catch(() => {});
+      await useGitImageCatalogManager().forgetOwner(userId).catch(() => {});
+      for (const hook of this.cleanupHooks) await hook(userId).catch(() => {});
       await this.usage.forgetUser(userId).catch(() => {});
       // Removing the user's top-level dir cleans up any remaining files
       // (workspaces/, agents/, credentials/) that the stores don't manage.
