@@ -77,7 +77,7 @@ test.describe('Create Worker Modal', () => {
     await goToDashboard(page);
     await openCreateWorkerModal(page);
     const dialog = page.locator('[role="dialog"]');
-    await expect(dialog.locator('textarea')).toBeVisible();
+    await expect(dialog.getByPlaceholder(/#!\/bin\/bash/)).toBeVisible();
   });
 
   test('has Environment selector with Default option', async ({ page }) => {
@@ -147,7 +147,7 @@ test.describe('Create Worker Modal', () => {
     // The init preset area should have "None" visible
     await expect(dialog.getByText('None')).toBeVisible();
     // The textarea for init script should exist
-    await expect(dialog.locator('textarea')).toBeVisible();
+    await expect(dialog.getByPlaceholder(/#!\/bin\/bash/)).toBeVisible();
   });
 
   test('creates a worker when clicking Create', async ({ page, request }) => {
@@ -414,7 +414,7 @@ test.describe('Create Worker Modal', () => {
       if (await claudeOption.isVisible().catch(() => false)) {
         await claudeOption.click();
         // The textarea should now contain 'claude'
-        const textarea = dialog.locator('textarea').first();
+        const textarea = dialog.getByPlaceholder(/#!\/bin\/bash/);
         await page.waitForTimeout(500);
         const value = await textarea.inputValue();
         expect(value.toLowerCase()).toContain('claude');

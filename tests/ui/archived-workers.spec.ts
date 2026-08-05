@@ -62,7 +62,7 @@ test.describe('Archived Workers UI', () => {
       await selectSidebarTab(page, 'Archived');
       await page.waitForTimeout(500);
 
-      const archivedCard = page.locator('aside .rounded-lg').first();
+      const archivedCard = page.locator('aside .rounded-lg').filter({ hasText: container.displayName }).first();
       expect(await hasButtonWithTooltip(archivedCard, page, 'Unarchive')).toBe(true);
 
       await api.deleteArchivedWorker(container.id);
@@ -77,7 +77,7 @@ test.describe('Archived Workers UI', () => {
       await selectSidebarTab(page, 'Archived');
       await page.waitForTimeout(500);
 
-      const archivedCard = page.locator('aside .rounded-lg').first();
+      const archivedCard = page.locator('aside .rounded-lg').filter({ hasText: container.displayName }).first();
       expect(await hasButtonWithTooltip(archivedCard, page, 'Delete')).toBe(true);
 
       await api.deleteArchivedWorker(container.id);

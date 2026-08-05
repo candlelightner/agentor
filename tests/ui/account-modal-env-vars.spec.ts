@@ -71,7 +71,7 @@ test.describe('Account modal — env vars', () => {
     await expect(codex).toContainText(/Not logged in/i);
     await expect(gemini).toContainText(/Not logged in/i);
     await expect(kilo).toContainText(/Not logged in/i);
-    await expect(kilo).toContainText('Kilo');
+    await expect(kilo).toContainText(/kilo/i);
   });
 
   test('saves a predefined env var and persists across reload of the modal', async ({ page, context }) => {

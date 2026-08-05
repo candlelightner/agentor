@@ -511,8 +511,14 @@ test.describe.serial('Workspace file manager API', () => {
     expect((body as { uploaded: number }).uploaded).toBe(3);
     const { body: top } = await api.listFiles(workerId, dest);
     expect(namesOf(top as FileListing).sort()).toEqual(['docs', 'root.txt']);
+    const docsEntry = findEntry(top as FileListing, 'docs')!;
+    expect(docsEntry.owner).toBe('1000');
+    expect(docsEntry.group).toBe('1000');
     const { body: docs } = await api.listFiles(workerId, `${dest}/docs`);
     expect(namesOf(docs as FileListing).sort()).toEqual(['nested', 'readme.md']);
+    const nestedEntry = findEntry(docs as FileListing, 'nested')!;
+    expect(nestedEntry.owner).toBe('1000');
+    expect(nestedEntry.group).toBe('1000');
     const { body: deep } = await api.listFiles(workerId, `${dest}/docs/nested`);
     expect(namesOf(deep as FileListing)).toEqual(['deep.txt']);
   });
@@ -581,7 +587,10 @@ test.describe.serial('Workspace file manager API', () => {
       { name: 'b.txt', content: Buffer.from('bb') },
     ], { dest });
     expect(status).toBe(409);
-    const conflicts = (body as { conflicts?: string[] }).conflicts ?? [];
+    const conflicts =
+      (body as { conflicts?: string[] }).conflicts ??
+      (body as { data?: { conflicts?: string[] } }).data?.conflicts ??
+      [];
     expect(conflicts.length).toBe(1);
     expect(conflicts[0]).toContain('a.txt');
     // The original content survived (no byte was written).

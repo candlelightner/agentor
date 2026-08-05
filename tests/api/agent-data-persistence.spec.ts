@@ -19,11 +19,14 @@ async function execInWorker(containerId: string, command: string, timeoutMs = 30
     await ws.waitForOutput(/[\$#>]\s*$/, 30_000);
     ws.clearBuffer();
 
+    const start = `START_${Date.now()}_MK`;
     const marker = `END_${Date.now()}_MK`;
-    ws.sendLine(`${command}; echo ${marker}`);
+    ws.sendLine(`printf '%s\\n' '${start}'; { ${command}; }; printf '\\n%s\\n' '${marker}'`);
     await ws.waitForOutput(new RegExp(`\\n${marker}\\n`), timeoutMs);
-
-    return ws.getBuffer();
+    const match = new RegExp(`${start}\\n([\\s\\S]*?)\\n${marker}`).exec(
+      ws.getBuffer(),
+    );
+    return match?.[1] ?? '';
   } finally {
     ws.close();
   }

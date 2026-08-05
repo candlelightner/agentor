@@ -63,7 +63,7 @@ async function execInWorker(containerId: string, command: string, timeoutMs = 30
     await ws.waitForOutput(/[\$#>]\s*$/, 30_000);
     ws.clearBuffer();
     const marker = `END_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    ws.sendLine(`${command}; echo ${marker}`);
+    ws.sendLine(`${command}; printf '\\n%s\\n' '${marker}'`);
     await ws.waitForOutput(new RegExp(`\\n${marker}\\n`), timeoutMs);
     return ws.getBuffer();
   } finally {
@@ -80,7 +80,7 @@ async function captureStdout(containerId: string, command: string, timeoutMs = 3
     ws.clearBuffer();
     const start = `CAP_START_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const end = `CAP_END_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    ws.sendLine(`echo ${start}; { ${command}; } ; echo ${end}`);
+    ws.sendLine(`printf '%s\\n' '${start}'; { ${command}; } ; printf '\\n%s\\n' '${end}'`);
     await ws.waitForOutput(new RegExp(`\\n${end}\\n`), timeoutMs);
     const buf = ws.getBuffer();
     const m = new RegExp(`${start}\\n([\\s\\S]*?)\\n${end}`).exec(buf);

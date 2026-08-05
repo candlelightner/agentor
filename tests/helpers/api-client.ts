@@ -625,6 +625,27 @@ export class ApiClient {
   }
 
   // ─── Worker Export / Import ────────────────────────────────────
+  async createExportJob(id: string, includeRootfs?: boolean) {
+    const data = includeRootfs === undefined ? {} : { includeRootfs };
+    const res = await this.request.post(`${BASE_URL}/api/containers/${id}/export-jobs`, { data });
+    return { status: res.status(), body: await res.json().catch(() => ({})) };
+  }
+
+  async getExportJob(jobId: string) {
+    const res = await this.request.get(`${BASE_URL}/api/export-jobs/${jobId}`);
+    return { status: res.status(), body: await res.json().catch(() => ({})) };
+  }
+
+  async cancelExportJob(jobId: string) {
+    const res = await this.request.delete(`${BASE_URL}/api/export-jobs/${jobId}`);
+    return { status: res.status(), body: await res.json().catch(() => ({})) };
+  }
+
+  async downloadExportJob(jobId: string) {
+    const res = await this.request.get(`${BASE_URL}/api/export-jobs/${jobId}/download`);
+    return { status: res.status(), headers: res.headers(), body: await res.body() };
+  }
+
   /** Download a worker export bundle. Returns the raw `.tar` body + headers.
    * `includeRootfs` defaults to false in tests to keep bundles small/fast. */
   async exportWorker(id: string, includeRootfs = false) {

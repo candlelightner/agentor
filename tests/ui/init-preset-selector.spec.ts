@@ -18,7 +18,7 @@ test.describe('Init Preset Selector', () => {
     await openCreateWorkerModal(page);
     const dialog = page.locator('[role="dialog"]');
     // The textarea for init script should be present with a placeholder
-    const textarea = dialog.locator('textarea');
+    const textarea = dialog.getByPlaceholder(/#!\/bin\/bash/);
     await expect(textarea).toBeVisible();
     const placeholder = await textarea.getAttribute('placeholder');
     expect(placeholder).toContain('#!/bin/bash');
@@ -28,7 +28,7 @@ test.describe('Init Preset Selector', () => {
     await goToDashboard(page);
     await openCreateWorkerModal(page);
     const dialog = page.locator('[role="dialog"]');
-    const textarea = dialog.locator('textarea');
+    const textarea = dialog.getByPlaceholder(/#!\/bin\/bash/);
     await expect(textarea).toBeVisible();
     const value = await textarea.inputValue();
     expect(value).toBe('');
@@ -38,7 +38,7 @@ test.describe('Init Preset Selector', () => {
     await goToDashboard(page);
     await openCreateWorkerModal(page);
     const dialog = page.locator('[role="dialog"]');
-    const textarea = dialog.locator('textarea');
+    const textarea = dialog.getByPlaceholder(/#!\/bin\/bash/);
     await expect(textarea).toBeVisible();
     // Type a custom script
     await textarea.fill('#!/bin/bash\necho "hello"');
@@ -52,7 +52,7 @@ test.describe('Init Preset Selector', () => {
     await goToDashboard(page);
     await openCreateWorkerModal(page);
     const dialog = page.locator('[role="dialog"]');
-    const textarea = dialog.locator('textarea');
+    const textarea = dialog.getByPlaceholder(/#!\/bin\/bash/);
     await expect(textarea).toBeVisible();
     // Type something first
     await textarea.fill('#!/bin/bash\necho "test"');

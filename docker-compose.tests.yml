@@ -19,6 +19,9 @@ services:
       - test-runner-docker:/var/lib/docker
       # Source for building the agentor images inside the inner dockerd.
       - ./orchestrator:/src/orchestrator:ro
+      # Provider boundary tests import the same TypeScript modules directly;
+      # mirror the repository-relative path they use outside Docker.
+      - ./orchestrator:/work/orchestrator:ro
       - ./worker:/src/worker:ro
       # Test source. Read-write so playwright can write reports / .auth
       # back to the host for inspection.

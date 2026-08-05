@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { createWorker, cleanupWorker } from '../helpers/worker-lifecycle';
-import { goToDashboard, hasButtonWithTooltip, findButtonByTooltip } from '../helpers/ui-helpers';
+import { goToDashboard, hasButtonWithTooltip, findButtonByTooltip, selectSidebarTab } from '../helpers/ui-helpers';
+import { ApiClient } from '../helpers/api-client';
 
 test.describe('Worker card actions', () => {
   let workerId: string;
@@ -23,34 +24,50 @@ test.describe('Worker card actions', () => {
     expect(await hasButtonWithTooltip(card, page, 'Export worker')).toBe(true);
   });
 
-  test('Export shows a loading state while preparing, then downloads', async ({ page }) => {
-    // Simulate the slow server-side bundle materialisation so the button's
-    // in-progress state is observable before the download triggers.
-    await page.route('**/api/containers/*/export*', async (route) => {
-      await new Promise((r) => setTimeout(r, 1200));
-      await route.fulfill({
-        status: 200,
-        headers: {
-          'content-type': 'application/x-tar',
-          'content-disposition': 'attachment; filename="card-worker-export.tar"',
-        },
-        body: 'dummy-tar-bundle',
-      });
+  test('Export modal defaults to workspace-only, polls progress, and streams the download', async ({ page }) => {
+    let requestedBody: unknown;
+    let statusPolls = 0;
+    await page.route('**/api/containers/*/export-jobs', async (route) => {
+      requestedBody = route.request().postDataJSON();
+      await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({
+        id: 'ui-export-job', workerId, includeRootfs: false, status: 'queued', phase: 'queued',
+        progress: 0, bytesProcessed: 0, downloadReady: false,
+      }) });
+    });
+    await page.route(/\/api\/export-jobs\/ui-export-job(?:\?.*)?$/, async (route) => {
+      statusPolls++;
+      const done = statusPolls > 1;
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+        id: 'ui-export-job', workerId, includeRootfs: false,
+        status: done ? 'succeeded' : 'running', phase: done ? 'complete' : 'workspace',
+        progress: done ? 100 : 40, bytesProcessed: done ? 2048 : 1024, downloadReady: done,
+      }) });
+    });
+    await page.route('**/api/export-jobs/ui-export-job/download', async (route) => {
+      await route.fulfill({ status: 200, headers: {
+        'content-type': 'application/x-tar',
+        'content-disposition': 'attachment; filename="card-worker-export.tar"',
+      }, body: 'streamed-tar' });
     });
 
     await goToDashboard(page);
     const card = page.locator('.rounded-lg').filter({ hasText: displayName }).first();
     await expect(card).toBeVisible({ timeout: 15_000 });
     const exportBtn = await findButtonByTooltip(card, page, 'Export worker');
+    await exportBtn.click();
+    const modal = page.locator('[data-testid="export-worker-modal"]');
+    await expect(modal).toBeVisible();
+    await expect(modal).toContainText('Workspace-only is the recommended default');
+    await expect(modal.locator('[data-testid="export-rootfs"]')).not.toBeChecked();
+    await modal.locator('[data-testid="export-start"]').click();
+    expect(requestedBody).toEqual({ includeRootfs: false });
+    await expect(modal).toContainText('workspace');
+    await expect(modal).toContainText('succeeded', { timeout: 5_000 });
 
     const downloadPromise = page.waitForEvent('download');
-    await exportBtn.click();
-    // While the bundle is being prepared the button is disabled (spinner shown).
-    await expect(exportBtn).toBeDisabled();
-    const download = await downloadPromise;
-    expect(download.suggestedFilename()).toContain('worker-export.tar');
-    // Re-enabled once the download has been triggered.
-    await expect(exportBtn).toBeEnabled({ timeout: 5_000 });
+    await modal.locator('[data-testid="export-download"]').click();
+    await downloadPromise;
+    expect(statusPolls).toBeGreaterThan(1);
   });
 
   test('the action row is horizontally scrollable (no wrap)', async ({ page }) => {
@@ -98,5 +115,22 @@ test.describe('Worker card actions', () => {
     await expect(metrics).toContainText('42%');
     await expect(metrics).toContainText('1.0 GB'); // memory used
     await expect(metrics).toContainText('2.0 GB'); // disk used
+  });
+
+  test('a stopped worker can open the export modal', async ({ page, request }) => {
+    const stoppedName = `Stopped-export-${Date.now()}`;
+    const stopped = await createWorker(request, { displayName: stoppedName });
+    try {
+      expect((await new ApiClient(request).stopContainer(stopped.id)).status).toBe(200);
+      await goToDashboard(page);
+      await selectSidebarTab(page, 'Stopped');
+      const card = page.locator('aside .rounded-lg').filter({ hasText: stoppedName }).first();
+      await expect(card).toBeVisible({ timeout: 15_000 });
+      const exportBtn = await findButtonByTooltip(card, page, 'Export worker');
+      await exportBtn.click();
+      await expect(page.locator('[data-testid="export-worker-modal"]')).toBeVisible();
+    } finally {
+      await cleanupWorker(request, stopped.id);
+    }
   });
 });
