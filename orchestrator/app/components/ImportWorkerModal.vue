@@ -75,7 +75,7 @@ async function doImport() {
           <UButton class="flex-1" :loading="importing" :disabled="!file" data-testid="import-submit" @click="doImport">
             Import
           </UButton>
-          <UButton color="neutral" variant="outline" @click="open = false">Cancel</UButton>
+          <UButton color="neutral" variant="outline" @click="() => { open = false; }">Cancel</UButton>
         </div>
       </div>
     </template>

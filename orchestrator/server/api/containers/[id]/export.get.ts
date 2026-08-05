@@ -3,11 +3,11 @@ defineRouteMeta({
     tags: ['Containers'],
     summary: 'Export a worker',
     description:
-      'Streams a complete worker export bundle (`.tar`) — manifest (settings, environment, port/domain mappings), the workspace and agent-data volumes, and (by default) a `docker export` of the container filesystem. Pass `?includeRootfs=false` to omit the filesystem snapshot (much smaller/faster). The worker must be running or stopped.',
+      'Legacy synchronous worker export. Streams a bundle containing settings, workspace, and agent data. Root filesystem capture is opt-in with `?includeRootfs=true`. New clients should use the asynchronous export-jobs endpoint.',
     operationId: 'exportWorker',
     parameters: [
       { name: 'id', in: 'path', required: true, schema: { type: 'string' }, description: 'Worker UUID' },
-      { name: 'includeRootfs', in: 'query', required: false, schema: { type: 'boolean', default: true }, description: 'Include a docker-export snapshot of the container filesystem' },
+      { name: 'includeRootfs', in: 'query', required: false, schema: { type: 'boolean', default: false }, description: 'Include a docker-export snapshot of the container filesystem (advanced and potentially slow)' },
     ],
     responses: {
       200: { description: 'Worker export bundle (tar stream)', content: { 'application/x-tar': { schema: { type: 'string', format: 'binary' } } } },
@@ -30,8 +30,9 @@ export default defineEventHandler(async (event) => {
   requireContainerAccess(event, info);
 
   const q = getQuery(event);
-  // Default to including the full filesystem snapshot (the user-chosen behavior).
-  const includeRootfs = q.includeRootfs !== 'false' && q.includeRootfs !== '0';
+  // Keep this compatibility endpoint, but make the safe/fast workspace-focused
+  // bundle the default. Rootfs capture is now an explicit advanced option.
+  const includeRootfs = q.includeRootfs === 'true' || q.includeRootfs === '1';
 
   // Materialise the bundle before streaming — a bad-state worker throws a 409
   // here (mapped from the manager's statusCode-tagged error) rather than a 500.

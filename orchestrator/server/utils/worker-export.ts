@@ -1,9 +1,9 @@
-import { createGzip } from 'node:zlib';
+import { createGzip, createGunzip } from 'node:zlib';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { stat, mkdir, writeFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
-import type { Readable } from 'node:stream';
+import { Transform, type Readable } from 'node:stream';
 import * as tar from 'tar-stream';
 import type { Environment } from './environments';
 import type { PortMapping } from './port-mapping-store';
@@ -70,8 +70,17 @@ export type ExportedPortMapping = Pick<
 
 export type ExportedDomainMapping = Pick<
   DomainMapping,
-  'subdomain' | 'baseDomain' | 'path' | 'protocol' | 'wildcard' | 'internalPort' | 'basicAuth'
+  'subdomain' | 'baseDomain' | 'path' | 'protocol' | 'wildcard' | 'internalPort'
 >;
+
+/** Import limits apply to the outer (already-compressed) bundle. They prevent a
+ * hostile upload from creating arbitrary files or exhausting the data volume
+ * before Docker ever sees it. Large legitimate worker exports remain supported. */
+export const MAX_BUNDLE_ENTRY_BYTES = 20 * 1024 * 1024 * 1024;
+export const MAX_BUNDLE_TOTAL_BYTES = 40 * 1024 * 1024 * 1024;
+export const MAX_MANIFEST_BYTES = 1024 * 1024;
+export const MAX_INNER_ARCHIVE_BYTES = 100 * 1024 * 1024 * 1024;
+export const MAX_INNER_ARCHIVE_ENTRIES = 1_000_000;
 
 export interface WorkerExportManifest {
   version: number;
@@ -87,11 +96,13 @@ export interface WorkerExportManifest {
   domainMappings: ExportedDomainMapping[];
   /** Which payloads the bundle contains. */
   contents: { rootfs: boolean; workspace: boolean; agents: boolean };
+  /** Names only of worker-local secrets/files excluded from this bundle. */
+  missingSecrets?: string[];
 }
 
 /** Pipe a readable through gzip into a file; return the written size in bytes. */
-export async function writeGzipFile(src: NodeJS.ReadableStream, dest: string): Promise<number> {
-  await pipeline(src, createGzip(), createWriteStream(dest));
+export async function writeGzipFile(src: NodeJS.ReadableStream, dest: string, signal?: AbortSignal): Promise<number> {
+  await pipeline(src, createGzip(), createWriteStream(dest), { signal });
   return (await stat(dest)).size;
 }
 
@@ -102,6 +113,7 @@ export async function writeFilteredAgentsGz(
   dest: string,
   excludeSuffixes: string[],
   excludePrefixes: string[] = [],
+  signal?: AbortSignal,
 ): Promise<number> {
   const extract = tar.extract();
   const pack = tar.pack();
@@ -123,11 +135,11 @@ export async function writeFilteredAgentsGz(
   extract.on('finish', () => pack.finalize());
   extract.on('error', (err) => pack.destroy(err));
 
-  const writeDone = pipeline(pack, createGzip(), createWriteStream(dest));
+  const writeDone = pipeline(pack, createGzip(), createWriteStream(dest), { signal });
   // Drive src → extract with pipeline (not a bare .pipe) so a src error tears
   // down extract → pack and rejects, instead of hanging forever waiting for an
   // 'end'/'finish' that never comes.
-  await Promise.all([pipeline(src, extract), writeDone]);
+  await Promise.all([pipeline(src, extract, { signal }), writeDone]);
   return (await stat(dest)).size;
 }
 
@@ -150,7 +162,17 @@ export function packBundle(files: { name: string; path: string }[]): Readable {
 
 /** Write the manifest JSON to a file. */
 export async function writeManifest(manifest: WorkerExportManifest, dest: string): Promise<void> {
-  await writeFile(dest, JSON.stringify(manifest, null, 2));
+  // Domain basic-auth passwords are runtime credentials, not portable worker
+  // configuration. Sanitize at the serialization boundary as defense in depth:
+  // callers compiled against an older type cannot accidentally export them.
+  const safeManifest = {
+    ...manifest,
+    domainMappings: manifest.domainMappings.map((mapping) => {
+      const { basicAuth: _secret, ...safe } = mapping as ExportedDomainMapping & { basicAuth?: unknown };
+      return safe;
+    }),
+  } as WorkerExportManifest;
+  await writeFile(dest, JSON.stringify(safeManifest, null, 2));
 }
 
 export interface ExtractedBundle {
@@ -161,22 +183,81 @@ export interface ExtractedBundle {
   agentsPath?: string;
 }
 
+/** Scan a compressed tar before Docker extracts/imports it. Compressed-size
+ * limits alone do not stop gzip bombs, so bound expanded bytes and entries and
+ * reject paths that could escape an extraction root. */
+export async function validateGzipTarPayload(
+  filePath: string,
+  maxExpandedBytes = MAX_INNER_ARCHIVE_BYTES,
+  maxEntries = MAX_INNER_ARCHIVE_ENTRIES,
+): Promise<void> {
+  let expandedBytes = 0;
+  let entries = 0;
+  const counter = new Transform({
+    transform(chunk, _encoding, callback) {
+      expandedBytes += Buffer.byteLength(chunk);
+      if (expandedBytes > maxExpandedBytes) {
+        callback(new Error('Invalid worker export: expanded archive exceeds the size limit'));
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+  const extract = tar.extract();
+  extract.on('entry', (header, stream, next) => {
+    entries += 1;
+    const name = header.name.replace(/\\/g, '/');
+    const unsafe = name.includes('\0') || name.startsWith('/') || name.split('/').includes('..');
+    if (entries > maxEntries || unsafe) {
+      stream.resume();
+      extract.destroy(new Error(
+        entries > maxEntries
+          ? 'Invalid worker export: archive contains too many entries'
+          : 'Invalid worker export: archive contains an unsafe path',
+      ));
+      return;
+    }
+    stream.on('end', next);
+    stream.resume();
+  });
+  await pipeline(createReadStream(filePath), createGunzip(), counter, extract);
+}
+
 /** Extract the outer bundle tar into `destDir`, returning the parsed manifest
  * and the paths of any extracted payloads. */
 export async function extractBundle(bundlePath: string, destDir: string): Promise<ExtractedBundle> {
   await mkdir(destDir, { recursive: true });
   const known = new Set<string>(Object.values(BUNDLE_FILES));
   const present = new Set<string>();
+  let totalBytes = 0;
   const extract = tar.extract();
 
   await new Promise<void>((resolve, reject) => {
     extract.on('entry', (header, stream, next) => {
-      const name = header.name.replace(/^\.?\//, '');
+      const name = header.name;
       if (!known.has(name)) {
-        stream.on('end', next);
-        stream.resume();
+        reject(new Error(`Invalid worker export: unexpected bundle entry "${name}"`));
+        extract.destroy();
         return;
       }
+      if (header.type !== 'file') {
+        reject(new Error(`Invalid worker export: bundle entry "${name}" must be a regular file`));
+        extract.destroy();
+        return;
+      }
+      if (present.has(name)) {
+        reject(new Error(`Invalid worker export: duplicate bundle entry "${name}"`));
+        extract.destroy();
+        return;
+      }
+      const size = header.size ?? 0;
+      const limit = name === BUNDLE_FILES.manifest ? MAX_MANIFEST_BYTES : MAX_BUNDLE_ENTRY_BYTES;
+      if (!Number.isSafeInteger(size) || size < 0 || size > limit || totalBytes + size > MAX_BUNDLE_TOTAL_BYTES) {
+        reject(new Error(`Invalid worker export: bundle entry "${name}" exceeds the size limit`));
+        extract.destroy();
+        return;
+      }
+      totalBytes += size;
       present.add(name);
       pipeline(stream, createWriteStream(join(destDir, name)))
         .then(() => next())
@@ -191,18 +272,32 @@ export async function extractBundle(bundlePath: string, destDir: string): Promis
     throw new Error('Invalid worker export: manifest.json missing');
   }
   const manifestRaw = await readFile(join(destDir, BUNDLE_FILES.manifest), 'utf8');
-  const manifest = JSON.parse(manifestRaw) as WorkerExportManifest;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(manifestRaw);
+  } catch {
+    throw new Error('Invalid worker export: manifest.json is not valid JSON');
+  }
+  assertValidManifest(parsed);
+  const manifest = parsed;
 
   // Enforce the version gate the constant promises: reject a bundle produced by
   // a newer, incompatible exporter rather than silently restoring it with
   // mismatched semantics. Older versions (<= current) are still accepted.
-  if (typeof manifest.version !== 'number') {
-    throw new Error('Invalid worker export: manifest.version is missing or not a number');
-  }
   if (manifest.version > WORKER_EXPORT_VERSION) {
     throw new Error(
       `Unsupported worker export: bundle version ${manifest.version} is newer than supported version ${WORKER_EXPORT_VERSION}`,
     );
+  }
+
+  for (const [key, file] of [
+    ['rootfs', BUNDLE_FILES.rootfs],
+    ['workspace', BUNDLE_FILES.workspace],
+    ['agents', BUNDLE_FILES.agents],
+  ] as const) {
+    if (manifest.contents[key] !== present.has(file)) {
+      throw new Error(`Invalid worker export: manifest contents.${key} does not match bundle payloads`);
+    }
   }
 
   return {
@@ -211,4 +306,73 @@ export async function extractBundle(bundlePath: string, destDir: string): Promis
     workspacePath: present.has(BUNDLE_FILES.workspace) ? join(destDir, BUNDLE_FILES.workspace) : undefined,
     agentsPath: present.has(BUNDLE_FILES.agents) ? join(destDir, BUNDLE_FILES.agents) : undefined,
   };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string';
+}
+
+/** Validate fields consumed by import before any Docker/container operation.
+ * Unknown manifest fields remain tolerated for forward-compatible metadata,
+ * while credentials from legacy exports are discarded below. */
+function assertValidManifest(value: unknown): asserts value is WorkerExportManifest {
+  if (!isRecord(value) || !Number.isInteger(value.version) || (value.version as number) < 1) {
+    throw new Error('Invalid worker export: manifest.version is missing or invalid');
+  }
+  if (!isString(value.exportedAt) || !Number.isFinite(Date.parse(value.exportedAt))) {
+    throw new Error('Invalid worker export: manifest.exportedAt is missing or invalid');
+  }
+  const source = value.source;
+  const worker = value.worker;
+  const contents = value.contents;
+  if (!isRecord(source) || !['id', 'displayName', 'containerName', 'imageName'].every((k) => isString(source[k]))) {
+    throw new Error('Invalid worker export: manifest.source is invalid');
+  }
+  if (!isRecord(worker) || !isString(worker.displayName) || !isString(worker.initScript)
+      || !Array.isArray(worker.repos) || !Array.isArray(worker.mounts)) {
+    throw new Error('Invalid worker export: manifest.worker is invalid');
+  }
+  if (!worker.repos.every((repo) => isRecord(repo) && isString(repo.provider) && isString(repo.url)
+      && (repo.branch === undefined || isString(repo.branch)))) {
+    throw new Error('Invalid worker export: manifest.worker.repos is invalid');
+  }
+  if (!worker.mounts.every((mount) => isRecord(mount) && isString(mount.source) && isString(mount.target)
+      && (mount.readOnly === undefined || typeof mount.readOnly === 'boolean'))) {
+    throw new Error('Invalid worker export: manifest.worker.mounts is invalid');
+  }
+  if (!isRecord(value.environment) || !isString(value.environment.id) || !isString(value.environment.name)) {
+    throw new Error('Invalid worker export: manifest.environment is invalid');
+  }
+  if (!Array.isArray(value.portMappings) || !Array.isArray(value.domainMappings)) {
+    throw new Error('Invalid worker export: manifest mappings are invalid');
+  }
+  if (!value.portMappings.every((mapping) => isRecord(mapping)
+      && Number.isInteger(mapping.externalPort) && Number.isInteger(mapping.internalPort)
+      && (mapping.type === 'localhost' || mapping.type === 'external')
+      && (mapping.appType === undefined || isString(mapping.appType))
+      && (mapping.instanceId === undefined || isString(mapping.instanceId)))) {
+    throw new Error('Invalid worker export: port mapping is invalid');
+  }
+  if (!isRecord(contents) || !['rootfs', 'workspace', 'agents'].every((k) => typeof contents[k] === 'boolean')) {
+    throw new Error('Invalid worker export: manifest.contents is invalid');
+  }
+  if (value.missingSecrets !== undefined && (!Array.isArray(value.missingSecrets) || value.missingSecrets.length > 500 || value.missingSecrets.some((name) => typeof name !== 'string' || name.length < 1 || name.length > 255))) {
+    throw new Error('Invalid worker export: manifest.missingSecrets is invalid');
+  }
+
+  // Older bundles may contain basic-auth credentials. Preserve import
+  // compatibility but never propagate those credentials to restored mappings.
+  value.domainMappings = value.domainMappings.map((mapping) => {
+    if (!isRecord(mapping) || !isString(mapping.subdomain) || !isString(mapping.baseDomain)
+        || !isString(mapping.path) || !['http', 'https', 'tcp'].includes(String(mapping.protocol))
+        || typeof mapping.wildcard !== 'boolean' || !Number.isInteger(mapping.internalPort)) {
+      throw new Error('Invalid worker export: domain mapping is invalid');
+    }
+    const { basicAuth: _secret, ...safe } = mapping;
+    return safe;
+  });
 }
