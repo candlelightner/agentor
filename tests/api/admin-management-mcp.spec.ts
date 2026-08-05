@@ -1,0 +1,455 @@
+import {
+  test,
+  expect,
+  request as playwrightRequest,
+  type APIRequestContext,
+  type APIResponse,
+} from "@playwright/test";
+import { ApiClient } from "../helpers/api-client";
+import { createWorker, cleanupWorker } from "../helpers/worker-lifecycle";
+import {
+  createTestUser,
+  deleteTestUser,
+  type CreatedUser,
+} from "../helpers/test-users";
+
+const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
+const EMPTY_AUTH = {
+  baseURL: BASE_URL,
+  extraHTTPHeaders: { Origin: BASE_URL },
+  storageState: { cookies: [], origins: [] },
+};
+const SECRET_SENTINEL = `mcp-secret-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+async function body(res: APIResponse): Promise<any> {
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+async function invoke(
+  request: APIRequestContext,
+  credential: string,
+  tool: string,
+  args: Record<string, unknown> = {},
+) {
+  return request.post("/api/admin/management-mcp/diagnostics/invoke", {
+    data: { credential, tool, arguments: args },
+  });
+}
+
+test.describe.serial("Internal management MCP security", () => {
+  let regular: CreatedUser;
+  let regularCtx: APIRequestContext;
+  let anonymous: APIRequestContext;
+  let normalWorker = "";
+  let adminWorkspaceId = "";
+  let credential = "";
+
+  test.beforeAll(async ({ request }) => {
+    regular = await createTestUser("Management MCP Isolation");
+    regularCtx = await playwrightRequest.newContext(EMPTY_AUTH);
+    expect(
+      (
+        await new ApiClient(regularCtx).signInEmail(
+          regular.email,
+          regular.password,
+        )
+      ).status,
+    ).toBe(200);
+    normalWorker = (
+      await createWorker(regularCtx, {
+        displayName: `mcp-normal-${Date.now()}`,
+      })
+    ).id;
+    anonymous = await playwrightRequest.newContext(EMPTY_AUTH);
+    const workspace = await (
+      await request.post("/api/admin/workspace", { data: {} })
+    ).json();
+    adminWorkspaceId = workspace.id;
+    const resetPolicy = await request.put(
+      "/api/admin/management-mcp/policy",
+      {
+        data: {
+          groups: {
+            "read-only-status": true,
+            logs: true,
+            "volume-browsing": true,
+            "configuration-inspection": true,
+            "worker-lifecycle": false,
+            exports: false,
+            backups: false,
+            "image-builds": false,
+            "configuration-proposals": false,
+            "configuration-application": false,
+          },
+        },
+      },
+    );
+    expect(resetPolicy.status()).toBe(200);
+    const identity = await request.post(
+      "/api/admin/management-mcp/diagnostics/issue-identity",
+      { data: { workspaceId: adminWorkspaceId, ttlSeconds: 60 } },
+    );
+    expect(identity.status()).toBe(201);
+    credential = (await identity.json()).credential;
+  });
+
+  test.afterAll(async () => {
+    if (normalWorker)
+      await cleanupWorker(regularCtx, normalWorker).catch(() => {});
+    await regularCtx?.dispose();
+    await anonymous?.dispose();
+    if (regular) await deleteTestUser(regular.id).catch(() => {});
+  });
+
+  test("dashboard policy and diagnostic endpoints are admin-only", async () => {
+    for (const ctx of [anonymous, regularCtx]) {
+      const expected = ctx === anonymous ? 401 : 403;
+      expect((await ctx.get("/api/admin/management-mcp/policy")).status()).toBe(
+        expected,
+      );
+      expect(
+        (
+          await ctx.get("/api/admin/management-mcp/diagnostics/network")
+        ).status(),
+      ).toBe(expected);
+      expect(
+        (
+          await ctx.post(
+            "/api/admin/management-mcp/diagnostics/issue-identity",
+            { data: { workspaceId: adminWorkspaceId } },
+          )
+        ).status(),
+      ).toBe(expected);
+    }
+  });
+
+  test("MCP has an internal-only network with no host port or Traefik route", async ({
+    request,
+  }) => {
+    const res = await request.get(
+      "/api/admin/management-mcp/diagnostics/network",
+    );
+    expect(res.status()).toBe(200);
+    const network = await res.json();
+    expect(network).toMatchObject({
+      network: "agentor-management",
+      internal: true,
+      publishedPorts: [],
+      traefikRoutes: [],
+      rawDockerSocket: false,
+      attachedWorkspaceIds: [adminWorkspaceId],
+      normalWorkerIds: [],
+      unexpectedMembers: [],
+      orchestratorAttached: true,
+    });
+    expect(network.members).toHaveLength(2);
+  });
+
+  test("workspace identity is short-lived, workspace-bound, and not persisted in workspace storage", async ({
+    request,
+  }) => {
+    const metadata = await request.post(
+      "/api/admin/management-mcp/diagnostics/introspect-identity",
+      { data: { credential } },
+    );
+    expect(metadata.status()).toBe(200);
+    const result = await metadata.json();
+    expect(result).toMatchObject({
+      workspaceId: adminWorkspaceId,
+      audience: "agentor-management-mcp",
+      persistedInWorkspace: false,
+    });
+    expect(
+      new Date(result.expiresAt).getTime() - Date.now(),
+    ).toBeLessThanOrEqual(60_000);
+    const wrong = await request.post(
+      "/api/admin/management-mcp/diagnostics/introspect-identity",
+      { data: { credential, workspaceId: normalWorker } },
+    );
+    expect(wrong.status()).toBe(403);
+  });
+
+  test("expired and malformed workload identities fail closed", async ({
+    request,
+  }) => {
+    const expired = await request.post(
+      "/api/admin/management-mcp/diagnostics/issue-identity",
+      { data: { workspaceId: adminWorkspaceId, ttlSeconds: -1 } },
+    );
+    expect(expired.status()).toBe(201);
+    expect(
+      (
+        await invoke(
+          request,
+          (await expired.json()).credential,
+          "status.system",
+        )
+      ).status(),
+    ).toBe(401);
+    expect(
+      (
+        await invoke(request, "not-a-valid-credential", "status.system")
+      ).status(),
+    ).toBe(401);
+  });
+
+  test("tool groups use an explicit fail-closed allowlist and mutating groups default off", async ({
+    request,
+  }) => {
+    const policy = await (
+      await request.get("/api/admin/management-mcp/policy")
+    ).json();
+    expect(policy.default).toBe("deny");
+    expect(policy.groups["read-only-status"].enabled).toBe(true);
+    expect(policy.groups.logs.enabled).toBe(true);
+    expect(policy.groups["volume-browsing"].enabled).toBe(true);
+    expect(policy.groups["configuration-inspection"].enabled).toBe(true);
+    for (const group of [
+      "worker-lifecycle",
+      "exports",
+      "backups",
+      "image-builds",
+      "configuration-application",
+    ]) {
+      expect(policy.groups[group].enabled).toBe(false);
+    }
+    expect(
+      (
+        await invoke(request, credential, "worker.stop", {
+          workerId: normalWorker,
+        })
+      ).status(),
+    ).toBe(403);
+    expect(
+      (
+        await invoke(request, credential, "unknown.equivalent_privileged_route")
+      ).status(),
+    ).toBe(403);
+  });
+
+  test("policy changes take effect on every call and disabling removes equivalent access", async ({
+    request,
+  }) => {
+    expect(
+      (
+        await request.put("/api/admin/management-mcp/policy", {
+          data: { groups: { "read-only-status": false } },
+        })
+      ).status(),
+    ).toBe(200);
+    expect((await invoke(request, credential, "status.system")).status()).toBe(
+      403,
+    );
+    expect((await invoke(request, credential, "workers.list")).status()).toBe(
+      403,
+    );
+    expect(
+      (
+        await request.put("/api/admin/management-mcp/policy", {
+          data: { groups: { "read-only-status": true } },
+        })
+      ).status(),
+    ).toBe(200);
+    expect((await invoke(request, credential, "status.system")).status()).toBe(
+      200,
+    );
+    expect(
+      (
+        await request.put("/api/admin/management-mcp/policy", {
+          data: { groups: { logs: false } },
+        })
+      ).status(),
+    ).toBe(200);
+    expect(
+      (
+        await invoke(request, credential, "logs.read", {
+          workerId: normalWorker,
+        })
+      ).status(),
+    ).toBe(403);
+    expect(
+      (
+        await invoke(request, credential, "workers.inspect", {
+          workerId: normalWorker,
+        })
+      ).status(),
+    ).toBe(200);
+    expect(
+      (
+        await request.put("/api/admin/management-mcp/policy", {
+          data: { groups: { logs: true, "volume-browsing": false } },
+        })
+      ).status(),
+    ).toBe(200);
+    expect(
+      (
+        await invoke(request, credential, "logs.read", {
+          workerId: normalWorker,
+        })
+      ).status(),
+    ).toBe(200);
+    expect((await invoke(request, credential, "volumes.list")).status()).toBe(
+      403,
+    );
+    expect(
+      (
+        await request.put("/api/admin/management-mcp/policy", {
+          data: { groups: { "volume-browsing": true } },
+        })
+      ).status(),
+    ).toBe(200);
+  });
+
+  test("MCP responses and errors never return existing secret values", async ({
+    request,
+  }) => {
+    await request.put(`/api/containers/${adminWorkspaceId}/configuration`, {
+      data: { secrets: [{ key: "MCP_TEST_SECRET", value: SECRET_SENTINEL }] },
+    });
+    for (const tool of [
+      "configuration.inspect",
+      "logs.read",
+      "workers.inspect",
+    ]) {
+      const res = await invoke(request, credential, tool, {
+        workspaceId: adminWorkspaceId,
+        query: SECRET_SENTINEL,
+      });
+      expect(JSON.stringify(await body(res))).not.toContain(SECRET_SENTINEL);
+    }
+    const logs = await invoke(request, credential, "logs.read", {
+      workerId: normalWorker,
+      tail: 1000,
+    });
+    expect(logs.status()).toBe(200);
+    expect(await logs.json()).toMatchObject({
+      workerId: normalWorker,
+      logsOmitted: true,
+    });
+  });
+
+  test("dangerous changes require immutable dashboard-approved proposals", async ({
+    request,
+  }) => {
+    await request.put("/api/admin/management-mcp/policy", {
+      data: {
+        groups: {
+          "configuration-proposals": true,
+          "configuration-application": true,
+        },
+      },
+    });
+    const proposed = await invoke(
+      request,
+      credential,
+      "configuration.propose",
+      { patch: { logLevel: "debug" } },
+    );
+    expect(proposed.status()).toBe(200);
+    const proposal = await proposed.json();
+    expect(proposal).toMatchObject({
+      id: expect.any(String),
+      immutable: true,
+      status: "pending-dashboard-approval",
+      diff: expect.any(Object),
+    });
+    expect(
+      (
+        await invoke(request, credential, "configuration.apply", {
+          proposalId: proposal.id,
+        })
+      ).status(),
+    ).toBe(403);
+    expect(
+      (
+        await invoke(request, credential, "configuration.approve", {
+          proposalId: proposal.id,
+        })
+      ).status(),
+    ).toBe(403);
+    expect(
+      (
+        await request.post(
+          `/api/admin/management-mcp/proposals/${proposal.id}/approve`,
+          { data: {} },
+        )
+      ).status(),
+    ).toBe(200);
+    expect(
+      (
+        await request.put(
+          `/api/admin/management-mcp/proposals/${proposal.id}`,
+          { data: { patch: { logLevel: "trace" } } },
+        )
+      ).status(),
+    ).toBe(409);
+    expect(
+      (
+        await invoke(request, credential, "configuration.apply", {
+          proposalId: proposal.id,
+        })
+      ).status(),
+    ).toBe(200);
+    expect(
+      (
+        await invoke(request, credential, "configuration.apply", {
+          proposalId: proposal.id,
+        })
+      ).status(),
+    ).toBe(409);
+  });
+
+  test("every successful and failed invocation is audited without arguments, credentials, or secrets", async ({
+    request,
+  }) => {
+    expect((await invoke(request, credential, "status.system")).status()).toBe(
+      200,
+    );
+    expect(
+      (
+        await invoke(request, credential, "unknown.audit-test", {
+          value: SECRET_SENTINEL,
+        })
+      ).status(),
+    ).toBe(403);
+    const audit = await request.get(
+      "/api/admin/management-mcp/audit?limit=200",
+    );
+    expect(audit.status()).toBe(200);
+    const entries = (await audit.json()) as Array<{
+      action: string;
+      outcome: string;
+      details?: Record<string, unknown>;
+    }>;
+    const invocations = entries.filter(
+      (entry) => entry.action === "tool.invoked",
+    );
+    expect(invocations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          outcome: "success",
+          details: expect.objectContaining({ tool: "status.system" }),
+        }),
+        expect.objectContaining({
+          outcome: "failure",
+          details: expect.objectContaining({ tool: "unknown.audit-test" }),
+        }),
+      ]),
+    );
+    const serialized = JSON.stringify(entries);
+    for (const action of [
+      "authorization.denied",
+      "policy.changed",
+      "proposal.approved",
+      "proposal.applied",
+    ])
+      expect(serialized).toContain(action);
+    expect(serialized).not.toContain(SECRET_SENTINEL);
+    expect(serialized).not.toContain(credential);
+  });
+});
