@@ -1,7 +1,7 @@
 import { test, expect, request as playwrightRequest, type APIRequestContext } from '@playwright/test';
 import { ApiClient } from '../helpers/api-client';
 import { createWorker, cleanupWorker, waitForWorkerRunning } from '../helpers/worker-lifecycle';
-import { TerminalWsClient } from '../helpers/terminal-ws';
+import { captureCommandOutput as execInWorker, captureCommandOutput as captureStdout } from '../helpers/terminal-ws';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -56,68 +56,6 @@ async function cleanupUser(u: { ctx: APIRequestContext; id: string }): Promise<v
     // ignore
   } finally {
     await adminCtx.dispose();
-  }
-}
-
-/**
- * Connect to a worker's terminal, wait for a shell prompt, run `command`, and
- * return the ANSI-stripped output buffer up to (and including) the trailing
- * sentinel marker.
- *
- * The sentinel is emitted by the command itself (`echo <sentinel>`) and is
- * anchored with newlines on both sides so it only matches the OUTPUT of echo,
- * never the shell's echo-back of the typed command line (which has the
- * sentinel preceded by a space). Without this anchor a `waitForOutput` call
- * would return immediately when the command is typed, before it has run.
- *
- * The admin project's storage state (tests/.auth/admin-api.json) is used for
- * the WebSocket Cookie header so the connection authenticates as admin and
- * passes the `requireContainerAccess` ownership check (admin bypasses the
- * user-ownership gate, so this works for workers owned by either test user).
- */
-async function execInWorker(containerId: string, command: string, timeoutMs = 30_000): Promise<string> {
-  const ws = new TerminalWsClient(containerId);
-  try {
-    await ws.connect();
-    await ws.waitForOutput(/[\$#>]\s*$/, 30_000);
-    ws.clearBuffer();
-
-    const marker = `END_${Date.now()}_${Math.random().toString(36).slice(2, 7)}_MK`;
-    ws.sendLine(`${command}; printf '\\n%s\\n' '${marker}'`);
-    await ws.waitForOutput(new RegExp(`\\n${marker}\\n`), timeoutMs);
-
-    return ws.getBuffer();
-  } finally {
-    ws.close();
-  }
-}
-
-/**
- * Run `command` and capture only the OUTPUT between two sentinels — excluding
- * the shell's echo-back of the typed command line. This is essential for
- * assertions that would otherwise be satisfied by the echoed command text
- * (e.g. grepping for a literal `kilocode.kilo-code@7.4.16` that appears in the
- * command itself). The command is expected to print its result to stdout; we
- * wrap it so the captured slice is exactly the command's stdout.
- */
-async function captureStdout(containerId: string, command: string, timeoutMs = 30_000): Promise<string> {
-  const ws = new TerminalWsClient(containerId);
-  try {
-    await ws.connect();
-    await ws.waitForOutput(/[\$#>]\s*$/, 30_000);
-    ws.clearBuffer();
-
-    const start = `CAP_START_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const end = `CAP_END_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    // Quote the command so the start/end sentinels bracket ONLY its stdout.
-    ws.sendLine(`printf '%s\\n' '${start}'; { ${command}; } ; printf '\\n%s\\n' '${end}'`);
-    await ws.waitForOutput(new RegExp(`\\n${end}\\n`), timeoutMs);
-
-    const buf = ws.getBuffer();
-    const m = new RegExp(`${start}\\n([\\s\\S]*?)\\n${end}`).exec(buf);
-    return m ? m[1]! : '';
-  } finally {
-    ws.close();
   }
 }
 
@@ -343,7 +281,10 @@ test.describe.serial('Kilo Code — cross-user isolation', () => {
       `cat ~/.local/share/kilo/auth.json 2>/dev/null || echo NONE`,
     );
     expect(bobSeesAliceCfg.trim()).toBe('NONE');
-    expect(bobSeesAliceAuth.trim()).toBe('NONE');
+    // Bob's shared auth.json is seeded as `{}` (his own per-user store), so it
+    // is present but must NOT carry Alice's marker — that is the real
+    // isolation invariant, not file absence.
+    expect(bobSeesAliceAuth).not.toContain(aliceAuth);
 
     // Alice must NOT see Bob's config marker.
     const aliceSeesBobCfg = await captureStdout(

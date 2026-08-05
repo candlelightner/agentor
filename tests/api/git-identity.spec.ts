@@ -1,27 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { ApiClient } from '../helpers/api-client';
 import { createWorker, cleanupWorker, waitForWorkerRunning } from '../helpers/worker-lifecycle';
-import { TerminalWsClient } from '../helpers/terminal-ws';
-
-/**
- * Helper: connect to terminal, run a command, return output.
- */
-async function execInWorker(containerId: string, command: string, timeoutMs = 30_000): Promise<string> {
-  const ws = new TerminalWsClient(containerId);
-  try {
-    await ws.connect();
-    await ws.waitForOutput(/[\$#>]\s*$/, 30_000);
-    ws.clearBuffer();
-
-    const marker = `END_${Date.now()}_MK`;
-    ws.sendLine(`${command}; echo ${marker}`);
-    await ws.waitForOutput(new RegExp(`\\n${marker}\\n`), timeoutMs);
-
-    return ws.getBuffer();
-  } finally {
-    ws.close();
-  }
-}
+import { captureCommandOutput as execInWorker } from '../helpers/terminal-ws';
 
 test.describe.serial('Git identity — user-based config', () => {
   let containerId: string;

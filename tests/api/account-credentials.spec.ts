@@ -1,7 +1,7 @@
 import { test, expect, request as playwrightRequest, type APIRequestContext } from '@playwright/test';
 import { ApiClient } from '../helpers/api-client';
 import { createWorker, cleanupWorker, waitForWorkerRunning } from '../helpers/worker-lifecycle';
-import { TerminalWsClient } from '../helpers/terminal-ws';
+import { runCommandInWorker as execInWorker, captureCommandOutput as captureStdout } from '../helpers/terminal-ws';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -50,43 +50,6 @@ async function cleanupUser(u: { ctx: import('@playwright/test').APIRequestContex
     // ignore
   } finally {
     await adminCtx.dispose();
-  }
-}
-
-/** Connect to a worker's terminal, wait for a prompt, run `command`, and
- * return the ANSI-stripped output buffer up to (and including) the trailing
- * sentinel marker. */
-async function execInWorker(containerId: string, command: string, timeoutMs = 30_000): Promise<string> {
-  const ws = new TerminalWsClient(containerId);
-  try {
-    await ws.connect();
-    await ws.waitForOutput(/[\$#>]\s*$/, 30_000);
-    ws.clearBuffer();
-    const marker = `END_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    ws.sendLine(`${command}; printf '\\n%s\\n' '${marker}'`);
-    await ws.waitForOutput(new RegExp(`\\n${marker}\\n`), timeoutMs);
-    return ws.getBuffer();
-  } finally {
-    ws.close();
-  }
-}
-
-/** Run `command` and capture only the OUTPUT between two sentinels. */
-async function captureStdout(containerId: string, command: string, timeoutMs = 30_000): Promise<string> {
-  const ws = new TerminalWsClient(containerId);
-  try {
-    await ws.connect();
-    await ws.waitForOutput(/[\$#>]\s*$/, 30_000);
-    ws.clearBuffer();
-    const start = `CAP_START_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const end = `CAP_END_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    ws.sendLine(`printf '%s\\n' '${start}'; { ${command}; } ; printf '\\n%s\\n' '${end}'`);
-    await ws.waitForOutput(new RegExp(`\\n${end}\\n`), timeoutMs);
-    const buf = ws.getBuffer();
-    const m = new RegExp(`${start}\\n([\\s\\S]*?)\\n${end}`).exec(buf);
-    return m ? m[1]! : '';
-  } finally {
-    ws.close();
   }
 }
 

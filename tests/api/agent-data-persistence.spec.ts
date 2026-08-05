@@ -1,36 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { ApiClient } from '../helpers/api-client';
 import { createWorker, cleanupWorker, waitForWorkerRunning } from '../helpers/worker-lifecycle';
-import { TerminalWsClient } from '../helpers/terminal-ws';
-
-/**
- * Helper: connect to terminal, wait for prompt, run a command, return output.
- *
- * The marker is anchored with newlines on both sides so it only matches
- * the OUTPUT of `echo`, never the shell's echo-back of the typed command
- * line (which has the marker preceded by a space). Without this anchor,
- * `waitForOutput` returns immediately when the command is typed, before
- * it has actually run.
- */
-async function execInWorker(containerId: string, command: string, timeoutMs = 30_000): Promise<string> {
-  const ws = new TerminalWsClient(containerId);
-  try {
-    await ws.connect();
-    await ws.waitForOutput(/[\$#>]\s*$/, 30_000);
-    ws.clearBuffer();
-
-    const start = `START_${Date.now()}_MK`;
-    const marker = `END_${Date.now()}_MK`;
-    ws.sendLine(`printf '%s\\n' '${start}'; { ${command}; }; printf '\\n%s\\n' '${marker}'`);
-    await ws.waitForOutput(new RegExp(`\\n${marker}\\n`), timeoutMs);
-    const match = new RegExp(`${start}\\n([\\s\\S]*?)\\n${marker}`).exec(
-      ws.getBuffer(),
-    );
-    return match?.[1] ?? '';
-  } finally {
-    ws.close();
-  }
-}
+import { captureCommandOutput as execInWorker } from '../helpers/terminal-ws';
 
 // -- Symlink and mount verification (single worker, serial) --
 

@@ -2,7 +2,7 @@ import { test, expect, request as playwrightRequest } from '@playwright/test';
 import zlib from 'node:zlib';
 import { ApiClient } from '../helpers/api-client';
 import { createWorker, cleanupWorker, waitForWorkerRunning } from '../helpers/worker-lifecycle';
-import { TerminalWsClient } from '../helpers/terminal-ws';
+import { runCommandInWorker as execInWorker } from '../helpers/terminal-ws';
 
 const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
 const UNAUTH_OPTS = {
@@ -10,20 +10,6 @@ const UNAUTH_OPTS = {
   extraHTTPHeaders: { Origin: BASE_URL },
   storageState: { cookies: [], origins: [] },
 };
-
-async function execInWorker(containerId: string, command: string): Promise<void> {
-  const ws = new TerminalWsClient(containerId);
-  try {
-    await ws.connect();
-    await ws.waitForOutput(/[\$#>]\s*$/, 30_000);
-    ws.clearBuffer();
-    const marker = `END_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    ws.sendLine(`${command}; echo ${marker}`);
-    await ws.waitForOutput(new RegExp(`\\n${marker}\\n`), 30_000);
-  } finally {
-    ws.close();
-  }
-}
 
 function readTarEntry(archive: Buffer, wantedName: string): Buffer {
   let offset = 0;

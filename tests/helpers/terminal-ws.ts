@@ -294,3 +294,88 @@ export async function runInFreshWindow(
     await api.deletePane(containerId, windowIndex).catch(() => {});
   }
 }
+
+/**
+ * Run `command` in the worker's MAIN terminal window and return its merged
+ * stdout+stderr.
+ *
+ * This is the robust replacement for the per-spec `printf 'START'\n…\n'END'`
+ * sentinel pattern. That pattern anchored the end sentinel with surrounding
+ * newlines (`\n${end}\n`) so the shell's echo-back of the typed command (which
+ * contains the literal sentinel) would not match. But terminal pty streams
+ * intermittently drop/coalesce those newlines, so the anchor can fail to match
+ * (timeout) or match late, letting the next command's echo bleed into the
+ * captured slice. It also makes the captured value depend on exact newline
+ * framing — fragile for `.toBe('DIR_OK')`-style assertions.
+ *
+ * The technique here (already proven by `readWorkerClipboard`):
+ *  - The sentinel is split across two shell variables (`$MA`, `$MB`). The pty
+ *    echoes the typed command as `MA='COxx'; MB='END_yy'; …`, so the
+ *    concatenated sentinel `COxxEND_yy` never appears as a literal in the echo.
+ *    Waiting for `COxxEND_yy=` therefore only ever matches the real `printf`
+ *    output, never the echo-back — no newline anchor needed.
+ *  - The payload is base64-encoded (`base64 -w0`, single line), so internal
+ *    newlines, whitespace, and wrapping quirks cannot break extraction.
+ *  - `$(…)` command substitution strips trailing newlines (callers `.trim()`
+ *    anyway), and `2>&1` preserves the prior "capture stdout+stderr between
+ *    markers" semantics.
+ */
+export async function captureCommandOutput(
+  containerId: string,
+  command: string,
+  timeoutMs = 30_000,
+): Promise<string> {
+  const ws = new TerminalWsClient(containerId);
+  try {
+    await ws.connect();
+    await ws.waitForOutput(/[\$#>]\s*$/, 30_000);
+    ws.clearBuffer();
+
+    const tag = Math.random().toString(36).slice(2, 10);
+    const ma = `CO${tag.slice(0, 4)}`;
+    const mb = `END_${tag.slice(4)}`;
+    const fullMarker = `${ma}${mb}`;
+    const cmd =
+      `MA='${ma}'; MB='${mb}'; ` +
+      `OUT=$({ ${command}; } 2>&1); ` +
+      `printf '%s=%s\\n' "$MA$MB" "$(printf '%s' "$OUT" | base64 -w0)"`;
+    ws.sendLine(cmd);
+    await ws.waitForOutput(new RegExp(`${fullMarker}=`), timeoutMs);
+
+    const buf = ws.getBuffer();
+    const m = new RegExp(`${fullMarker}=([A-Za-z0-9+/=]*)`).exec(buf);
+    if (!m || !m[1]) return '';
+    return Buffer.from(m[1], 'base64').toString('utf-8');
+  } finally {
+    ws.close();
+  }
+}
+
+/**
+ * Run `command` in the worker's MAIN terminal window and wait for it to
+ * finish, discarding its output. Same split-marker technique as
+ * {@link captureCommandOutput} so completion detection never depends on
+ * newline framing and the echoed command line can never false-match the
+ * sentinel. Use this for side-effecting commands whose stdout is irrelevant.
+ */
+export async function runCommandInWorker(
+  containerId: string,
+  command: string,
+  timeoutMs = 30_000,
+): Promise<void> {
+  const ws = new TerminalWsClient(containerId);
+  try {
+    await ws.connect();
+    await ws.waitForOutput(/[\$#>]\s*$/, 30_000);
+    ws.clearBuffer();
+
+    const tag = Math.random().toString(36).slice(2, 10);
+    const ma = `RN${tag.slice(0, 4)}`;
+    const mb = `DONE_${tag.slice(4)}`;
+    const fullMarker = `${ma}${mb}`;
+    ws.sendLine(`MA='${ma}'; MB='${mb}'; { ${command}; }; printf '%s\\n' "$MA$MB"`);
+    await ws.waitForOutput(new RegExp(fullMarker), timeoutMs);
+  } finally {
+    ws.close();
+  }
+}
