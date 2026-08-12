@@ -211,6 +211,13 @@ The endpoint must support `/v1/responses`, streaming response events, and tool c
 > [!NOTE]
 > The setup script intentionally manages the complete Codex config on every worker start and retains Agentor's workspace trust plus Playwright and Chrome DevTools MCP defaults. Account variable changes require rebuilding existing workers because container environment variables are fixed at creation time.
 
+### Reference routed-agent workflow
+
+For a credential-safe, reproducible example using the exact Codex-LB, OmniRoute,
+and Tavily MCP upstreams, see [Reference routed-agent workflow](docs/reference-agent-workflow.md).
+It distinguishes automated Agentor setup from the third-party login steps that
+only the account holder can complete.
+
 ---
 
 ## Storage
