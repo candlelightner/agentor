@@ -159,7 +159,7 @@ The trusted `agentor-admin-worker` overlay is generated only by the orchestrator
 
 The MCP transport listens only on the orchestrator's management-network address. Authentication uses a workspace-bound, short-lived credential held in admin tmpfs and refreshed atomically by the orchestrator. The administrative worker preconfigures Codex with a local stdio bridge; the bridge reads the current credential for every request and forwards only to the internal Docker DNS endpoint. Every call rechecks the current explicit allowlist, disabled groups disappear from discovery, and a sanitized success/failure audit event is recorded. Configuration proposals remain immutable and may be reviewed in the dashboard, but dashboard approval is optional: confirmation policy belongs to the invoking harness while Agentor enforces workload identity and capability policy.
 
-The console capability opens bounded linked-tmux sessions inside a selected running worker. It has no host-command target, bounds input and retained output, redacts exact managed worker-secret values, expires idle sessions, and cleans the linked session on close, stream failure, or expiry.
+The console capability opens bounded linked-tmux sessions inside a selected running worker and binds each session to its creating administrative workspace. It has no host-command target, bounds input and retained output, redacts exact managed worker-local secret values in returned output, expires idle sessions, and cleans the linked session on close, stream failure, or expiry. Console redaction is best effort, not a general secret-transformation detector or a guarantee for account/environment values; treat console access as privileged.
 
 ### Workspace, Agents & DinD Storage
 

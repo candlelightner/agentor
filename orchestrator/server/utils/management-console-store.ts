@@ -5,6 +5,8 @@ import { useWorkerConfigStore } from "./worker-config-store";
 
 interface ConsoleSession {
   id: string;
+  /** Management workspace which created this linked tmux session. */
+  workspaceId: string;
   workerId: string;
   dockerContainerId: string;
   tmuxSession: string;
@@ -28,7 +30,7 @@ const IDLE_MS = 15 * 60_000;
 export class ManagementConsoleStore {
   private readonly sessions = new Map<string, ConsoleSession>();
 
-  async open(workerId: string, windowIndex = 0) {
+  async open(workspaceId: string, workerId: string, windowIndex = 0) {
     this.sweep();
     if (this.sessions.size >= MAX_SESSIONS)
       throw statusError(429, "Too many management console sessions");
@@ -43,6 +45,7 @@ export class ManagementConsoleStore {
     );
     const session: ConsoleSession = {
       id: randomUUID(),
+      workspaceId,
       workerId,
       dockerContainerId: worker.containerId,
       tmuxSession: attached.tmuxSession,
@@ -66,8 +69,8 @@ export class ManagementConsoleStore {
     return this.public(session);
   }
 
-  async read(id: string, from?: number) {
-    const session = this.get(id);
+  async read(workspaceId: string, id: string, from?: number) {
+    const session = this.get(workspaceId, id);
     const requested = Number.isInteger(from) ? Math.max(0, Number(from)) : session.offset;
     const start = Math.max(requested, session.offset);
     const index = start - session.offset;
@@ -93,8 +96,8 @@ export class ManagementConsoleStore {
     };
   }
 
-  write(id: string, input: string) {
-    const session = this.get(id);
+  write(workspaceId: string, id: string, input: string) {
+    const session = this.get(workspaceId, id);
     if (session.state !== "open") throw statusError(409, "Console session is closed");
     if (typeof input !== "string" || Buffer.byteLength(input) > 64 * 1024)
       throw statusError(400, "Console input must be at most 64 KiB");
@@ -103,12 +106,12 @@ export class ManagementConsoleStore {
     return { id, workerId: session.workerId, acceptedBytes: Buffer.byteLength(input) };
   }
 
-  interrupt(id: string) {
-    return this.write(id, "\x03");
+  interrupt(workspaceId: string, id: string) {
+    return this.write(workspaceId, id, "\x03");
   }
 
-  async close(id: string) {
-    const session = this.get(id);
+  async close(workspaceId: string, id: string) {
+    const session = this.get(workspaceId, id);
     this.sessions.delete(id);
     if (session.idleTimer) clearTimeout(session.idleTimer);
     session.state = "closed";
@@ -121,13 +124,18 @@ export class ManagementConsoleStore {
   }
 
   async closeAll() {
-    await Promise.allSettled([...this.sessions].map(([id]) => this.close(id)));
+    await Promise.allSettled([...this.sessions.values()].map((session) => this.close(session.workspaceId, session.id)));
   }
 
-  private get(id: string) {
+  private get(workspaceId: string, id: string) {
     this.sweep();
     const session = this.sessions.get(id);
     if (!session) throw statusError(404, "Console session not found");
+    // Do not reveal whether a valid session exists to another administrative
+    // workspace. This remains useful if Agentor ever supports more than its
+    // current singleton trusted workspace.
+    if (session.workspaceId !== workspaceId)
+      throw statusError(404, "Console session not found");
     return session;
   }
 
@@ -145,14 +153,14 @@ export class ManagementConsoleStore {
     const expired = [...this.sessions.values()].filter(
       (session) => Date.now() - session.touchedAt > IDLE_MS,
     );
-    for (const session of expired) void this.close(session.id).catch(() => {});
+    for (const session of expired) void this.close(session.workspaceId, session.id).catch(() => {});
   }
 
   private touch(session: ConsoleSession) {
     session.touchedAt = Date.now();
     if (session.idleTimer) clearTimeout(session.idleTimer);
     session.idleTimer = setTimeout(
-      () => void this.close(session.id).catch(() => {}),
+      () => void this.close(session.workspaceId, session.id).catch(() => {}),
       IDLE_MS,
     );
     session.idleTimer.unref?.();
