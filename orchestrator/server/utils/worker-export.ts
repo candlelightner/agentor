@@ -1,9 +1,10 @@
 import { createGzip, createGunzip, constants as zlibConstants } from 'node:zlib';
-import { createReadStream, createWriteStream } from 'node:fs';
+import { createReadStream, createWriteStream, existsSync } from 'node:fs';
 import { stat, mkdir, writeFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Transform, type Readable } from 'node:stream';
+import { spawn } from 'node:child_process';
 import * as tar from 'tar-stream';
 import type { Environment } from './environments';
 import type { PortMapping } from './port-mapping-store';
@@ -13,7 +14,7 @@ import { AGENT_CREDENTIAL_MAPPINGS } from './user-credentials';
 import { SHARED_DIRECTORY_MOUNT_POINTS } from './storage';
 
 /** Bumped when the bundle layout changes incompatibly. */
-export const WORKER_EXPORT_VERSION = 2;
+export const WORKER_EXPORT_VERSION = 3;
 
 /** Container paths whose contents are exported as separate volume tars (their
  * data lives in volumes, which `docker export` deliberately omits). */
@@ -50,8 +51,8 @@ export const SHARED_DATA_EXCLUDE_PREFIXES = [...SHARED_DIRECTORY_MOUNT_POINTS, L
 /** File names inside the outer bundle tar. */
 export const BUNDLE_FILES = {
   manifest: 'manifest.json',
-  rootfs: 'rootfs.tar',
-  legacyRootfs: 'rootfs.tar.gz',
+  rootfs: 'rootfs.tar.gz',
+  legacyRootfs: 'rootfs.tar',
   workspace: 'workspace.tar.gz',
   agents: 'agents.tar.gz',
 } as const;
@@ -105,12 +106,24 @@ export async function writeGzipFile(src: NodeJS.ReadableStream, dest: string, si
   // standard worker image. Level 1 keeps the same portable gzip/tar format and
   // import path while making the explicit advanced capture operationally
   // usable; disk limits still bound the resulting (slightly larger) artifact.
-  await pipeline(src, createGzip({ level: zlibConstants.Z_BEST_SPEED }), createWriteStream(dest), { signal });
-  return (await stat(dest)).size;
-}
-
-export async function writeStreamFile(src: NodeJS.ReadableStream, dest: string, signal?: AbortSignal): Promise<number> {
-  await pipeline(src, createWriteStream(dest), { signal });
+  if (existsSync('/usr/bin/pigz')) {
+    const gzip = spawn('/usr/bin/pigz', ['-1', '-c'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      signal,
+    });
+    let stderr = '';
+    gzip.stderr.setEncoding('utf8');
+    gzip.stderr.on('data', (chunk) => {
+      stderr = `${stderr}${chunk}`.slice(-4096);
+    });
+    const exited = new Promise<void>((resolve, reject) => {
+      gzip.once('error', reject);
+      gzip.once('close', (code, childSignal) => (code === 0 ? resolve() : reject(new Error(`Parallel gzip failed${childSignal ? ` (${childSignal})` : ''}${stderr.trim() ? `: ${stderr.trim()}` : ''}`))));
+    });
+    await Promise.all([pipeline(src, gzip.stdin, { signal }), pipeline(gzip.stdout, createWriteStream(dest), { signal }), exited]);
+  } else {
+    await pipeline(src, createGzip({ level: zlibConstants.Z_BEST_SPEED }), createWriteStream(dest), { signal });
+  }
   return (await stat(dest)).size;
 }
 
@@ -314,7 +327,7 @@ export async function extractBundle(bundlePath: string, destDir: string): Promis
 
   const rootfsFile = present.has(BUNDLE_FILES.rootfs) ? BUNDLE_FILES.rootfs : present.has(BUNDLE_FILES.legacyRootfs) ? BUNDLE_FILES.legacyRootfs : undefined;
   if (present.has(BUNDLE_FILES.rootfs) && present.has(BUNDLE_FILES.legacyRootfs)) throw new Error('Invalid worker export: duplicate root filesystem payload');
-  if (rootfsFile && ((manifest.version === 1 && rootfsFile !== BUNDLE_FILES.legacyRootfs) || (manifest.version >= 2 && rootfsFile !== BUNDLE_FILES.rootfs))) throw new Error(`Invalid worker export: root filesystem payload does not match bundle version ${manifest.version}`);
+  if (rootfsFile && ((manifest.version === 2 && rootfsFile !== BUNDLE_FILES.legacyRootfs) || (manifest.version !== 2 && rootfsFile !== BUNDLE_FILES.rootfs))) throw new Error(`Invalid worker export: root filesystem payload does not match bundle version ${manifest.version}`);
   for (const [key, filePresent] of [
     ['rootfs', Boolean(rootfsFile)],
     ['workspace', present.has(BUNDLE_FILES.workspace)],
@@ -328,7 +341,7 @@ export async function extractBundle(bundlePath: string, destDir: string): Promis
   return {
     manifest,
     rootfsPath: rootfsFile ? join(destDir, rootfsFile) : undefined,
-    rootfsCompressed: rootfsFile === BUNDLE_FILES.legacyRootfs,
+    rootfsCompressed: rootfsFile === BUNDLE_FILES.rootfs,
     workspacePath: present.has(BUNDLE_FILES.workspace) ? join(destDir, BUNDLE_FILES.workspace) : undefined,
     agentsPath: present.has(BUNDLE_FILES.agents) ? join(destDir, BUNDLE_FILES.agents) : undefined,
   };

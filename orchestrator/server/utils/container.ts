@@ -11,7 +11,7 @@ import * as tar from 'tar-stream';
 import { DockerService } from './docker';
 import type { EnvironmentJsonPayload, CapabilityJsonEntry, InstructionJsonEntry, WorkerJsonPayload, ImageConfigOverride } from './docker';
 import { zeroUserEnvVars } from './user-env-store';
-import { WORKER_EXPORT_VERSION, BUNDLE_FILES, EXPORT_WORKSPACE_PATH, EXPORT_AGENTS_PATH, RESTORE_WORKSPACE_PARENT, RESTORE_AGENTS_PARENT, CREDENTIAL_EXCLUDE_SUFFIXES, SHARED_DATA_EXCLUDE_PREFIXES, writeManifest, writeGzipFile, writeStreamFile, writeFilteredAgentsGz, packBundle, extractBundle, validateGzipTarPayload, validateTarPayload } from './worker-export';
+import { WORKER_EXPORT_VERSION, BUNDLE_FILES, EXPORT_WORKSPACE_PATH, EXPORT_AGENTS_PATH, RESTORE_WORKSPACE_PARENT, RESTORE_AGENTS_PARENT, CREDENTIAL_EXCLUDE_SUFFIXES, SHARED_DATA_EXCLUDE_PREFIXES, writeManifest, writeGzipFile, writeFilteredAgentsGz, packBundle, extractBundle, validateGzipTarPayload, validateTarPayload } from './worker-export';
 import { recordWorkspaceTombstone } from './workspace-tombstones';
 import type { WorkerExportManifest } from './worker-export';
 import type { AppInstanceInfo, TmuxWindow, FileEntry, FileListing, MoveConflict } from '../../shared/types';
@@ -1704,10 +1704,9 @@ export class ContainerManager {
       if (opts.includeRootfs) {
         opts.signal?.throwIfAborted();
         const rootfsSrc = await this.dockerService.exportContainer(info.containerId);
-        // Docker export is already a tar stream. Preserve it verbatim so the
-        // advanced capture does not spend tens of minutes compressing and then
-        // decompressing the immutable base filesystem during a round trip.
-        bytesProcessed += await writeStreamFile(rootfsSrc, join(tmpDir, BUNDLE_FILES.rootfs), opts.signal);
+        // Parallel level-1 gzip avoids the historical single-core compression
+        // bottleneck while keeping artifacts and import staging bounded.
+        bytesProcessed += await writeGzipFile(rootfsSrc, join(tmpDir, BUNDLE_FILES.rootfs), opts.signal);
         files.push({
           name: BUNDLE_FILES.rootfs,
           path: join(tmpDir, BUNDLE_FILES.rootfs),

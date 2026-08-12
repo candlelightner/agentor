@@ -11,6 +11,7 @@ RUN npx nuxt build
 FROM node:22-alpine
 
 WORKDIR /app
+RUN apk add --no-cache pigz
 COPY --from=builder /app/.output/ .output/
 
 EXPOSE 3000
