@@ -69,7 +69,14 @@ export class ManagedNetworkManager {
   async remove(network: ManagedNetwork) {
     this.assertSafe(network);
     try {
-      await this.docker.getNetwork(network.dockerName).remove();
+      const target=this.docker.getNetwork(network.dockerName);
+      const inspection=await target.inspect();
+      // Docker refuses to remove a bridge with attached endpoints. A managed
+      // delete is explicitly the detach+remove operation, and this network has
+      // already passed the Agentor label/name boundary above.
+      for(const containerId of Object.keys(inspection.Containers||{}))
+        await target.disconnect({Container:containerId,Force:true});
+      await target.remove();
     } catch (error: any) {
       if (error?.statusCode === 404) return;
       throw createError({ statusCode: 409, statusMessage: `Network removal failed: ${safeMessage(error)}` });

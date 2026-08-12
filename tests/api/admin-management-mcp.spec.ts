@@ -178,10 +178,14 @@ test.describe.serial("Internal management MCP security", () => {
         20_000,
       );
 
-    const config = await captureCommandOutput(
-      adminWorkspaceId,
-      "grep -A1 '^\\[mcp_servers\\.agentor-management\\]$' /home/agent/.codex/config.toml",
-    );
+    let config='';
+    await expect.poll(async()=>{
+      config=await captureCommandOutput(
+        adminWorkspaceId,
+        "grep -A1 '^\\[mcp_servers\\.agentor-management\\]$' /home/agent/.codex/config.toml 2>/dev/null || true",
+      );
+      return config;
+    },{timeout:30_000,intervals:[500,1000,2000]}).toContain('[mcp_servers.agentor-management]');
     expect(config).toContain("[mcp_servers.agentor-management]");
     expect(config).toContain('command = "/usr/local/bin/agentor-management-mcp"');
 
