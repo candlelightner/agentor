@@ -1,6 +1,7 @@
 import type { CreateContainerRequest, UpdateContainerSettingsRequest } from "../../shared/types";
 import {
   useContainerManager,
+  useImageCatalogManager,
   useWorkerGroupStore,
   useWorkerStore,
 } from "./services";
@@ -27,7 +28,7 @@ const read = { readOnlyHint: true, destructiveHint: false, idempotentHint: true,
 export class ManagementWorkerDomain {
   tools(): ManagementDomainTool[] {
     const names: Array<[string, ManagementDomainTool["group"], string, Record<string, unknown>, Record<string, boolean | string>]> = [
-      ["workers.create", "worker-lifecycle", "Create a worker for an explicit owner.", { type:"object", required:["userId"], properties:{ userId:{type:"string"}, displayName:{type:"string"}, environmentId:{type:"string"} } }, mutation],
+      ["workers.create", "worker-lifecycle", "Create a worker for an explicit owner from the approved base or a built catalog version.", { type:"object", required:["userId"], properties:{ userId:{type:"string"}, displayName:{type:"string"}, environmentId:{type:"string"}, imageDefinitionId:{type:"string"}, imageVersion:{type:"string"} } }, mutation],
       ["workers.update", "worker-lifecycle", "Update material worker settings; protected workers require lockPassword.", objectWithWorker(), mutation],
       ["workers.restart", "worker-lifecycle", "Restart a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
       ["workers.rebuild", "worker-lifecycle", "Rebuild a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
@@ -53,7 +54,9 @@ export class ManagementWorkerDomain {
     const cm = useContainerManager(); const locks = useWorkerProtectionLockStore();
     if (name === "workers.create") {
       const userId = required(args.userId, "userId");
-      const request: CreateContainerRequest = { userId, displayName: optionalString(args.displayName), environmentId: optionalString(args.environmentId), initScript: optionalString(args.initScript), repos: array(args.repos), mounts: array(args.mounts), workerConfiguration: configInput(args.configuration) } as CreateContainerRequest;
+      const catalog=useImageCatalogManager(); await catalog.init();
+      const selection=catalog.resolveSelection(userId,optionalString(args.imageDefinitionId),optionalString(args.imageVersion));
+      const request: CreateContainerRequest = { userId, displayName: optionalString(args.displayName), environmentId: optionalString(args.environmentId), initScript: optionalString(args.initScript), repos: array(args.repos), mounts: array(args.mounts), workerConfiguration: configInput(args.configuration), imageDefinitionId:selection?.definitionId, imageVersion:selection?.version, imageDigest:selection?.digest, imageRuntimeReference:selection?.runtimeReference } as CreateContainerRequest;
       return { handled:true, result: await cm.create(request) };
     }
     if (name.startsWith("groups.")) return { handled:true, result: await this.groups(name,args) };

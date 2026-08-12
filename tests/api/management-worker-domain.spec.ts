@@ -8,4 +8,8 @@ test('management worker domain declares bounded worker, configuration, group, an
   expect(tools.find(tool => tool.name === 'locks.set')?.inputSchema).toMatchObject({ type:'object', required:['workerId'] });
   expect(tools.find(tool => tool.name === 'workers.delete')?.annotations).toMatchObject({ destructiveHint:true, readOnlyHint:false });
   expect(tools.find(tool => tool.name === 'configuration.get')?.annotations).toMatchObject({ readOnlyHint:true });
+  expect((tools.find(tool => tool.name === 'workers.create')?.inputSchema as any).properties).toMatchObject({
+    imageDefinitionId:{type:'string'},
+    imageVersion:{type:'string'},
+  });
 });
