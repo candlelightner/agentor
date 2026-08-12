@@ -22,6 +22,10 @@ import {
 import { OfflineWorkspaceAccess } from "./workspace-access";
 import { workerConfigurationResponse } from "./worker-config-response";
 import { useWorkerConfigStore } from "./worker-config-store";
+import { useManagementConsoleStore } from "./management-console-store";
+import { ManagementWorkerDomain } from "./management-worker-domain";
+import { workspaceMcpTools, executeWorkspaceMcpTool } from "./management-mcp-workspace-adapter";
+import { ManagementImageBackupDomain } from "./management-image-backup-domain";
 
 const GROUPS = [
   "read-only-status",
@@ -29,6 +33,12 @@ const GROUPS = [
   "volume-browsing",
   "configuration-inspection",
   "worker-lifecycle",
+  "console",
+  "storage",
+  "configuration",
+  "groups",
+  "locks",
+  "images",
   "exports",
   "backups",
   "image-builds",
@@ -36,6 +46,8 @@ const GROUPS = [
   "configuration-application",
 ] as const;
 type Group = (typeof GROUPS)[number];
+const workerDomain = new ManagementWorkerDomain();
+const imageBackupDomain = new ManagementImageBackupDomain();
 interface Policy {
   schemaVersion: 1;
   default: "deny";
@@ -88,6 +100,11 @@ const TOOL_GROUP: Record<string, Group> = {
   "configuration.inspect": "configuration-inspection",
   "worker.stop": "worker-lifecycle",
   "worker.start": "worker-lifecycle",
+  "console.open": "console",
+  "console.read": "console",
+  "console.write": "console",
+  "console.interrupt": "console",
+  "console.close": "console",
   "exports.create": "exports",
   "exports.status": "exports",
   "exports.cancel": "exports",
@@ -100,6 +117,9 @@ const TOOL_GROUP: Record<string, Group> = {
   "configuration.propose": "configuration-proposals",
   "configuration.apply": "configuration-application",
 };
+for (const tool of workerDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
+for (const tool of workspaceMcpTools) TOOL_GROUP[tool.name] = tool.group as Group;
+for (const tool of imageBackupDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 const sensitive =
   /secret|token|credential|password|authorization|cookie|cipher|key/i;
 function clean(value: unknown, depth = 0): any {
@@ -184,12 +204,20 @@ export class ManagementMcpStore {
     await this.init();
     return structuredClone(this.state.policy);
   }
-  listTools() {
-    return Object.keys(TOOL_GROUP).map((name) => ({
+  async listTools() {
+    await this.init();
+    return Object.keys(TOOL_GROUP)
+      .filter((name) => this.state.policy.groups[TOOL_GROUP[name]!]!.enabled)
+      .map((name) => {
+      const domain = workerDomain.tools().find((tool) => tool.name === name);
+      const workspace = workspaceMcpTools.find((tool) => tool.name === name);
+      const imageBackup = imageBackupDomain.tools().find((tool) => tool.name === name);
+      return {
       name,
-      description: `Agentor management tool (${TOOL_GROUP[name]})`,
-      inputSchema: { type: "object", additionalProperties: true },
-    }));
+      description: domain?.description || workspace?.description || imageBackup?.description || `Agentor management tool (${TOOL_GROUP[name]})`,
+      inputSchema: domain?.inputSchema || workspace?.inputSchema || imageBackup?.inputSchema || toolInputSchema(name),
+      annotations: domain?.annotations || workspace?.annotations || imageBackup?.annotations || toolAnnotations(name),
+    }});
   }
   async updatePolicy(groups: Record<string, unknown>, actor: string) {
     await this.init();
@@ -333,15 +361,10 @@ export class ManagementMcpStore {
           throw Object.assign(new Error("Proposal already applied"), {
             statusCode: 409,
           });
-        if (p.status !== "approved") {
-          await this.audit("authorization.denied", "failure", {
-            tool: name,
-            proposalId: p.id,
-          });
-          throw Object.assign(new Error("Dashboard approval required"), {
-            statusCode: 403,
-          });
-        }
+        // Dashboard review remains available as a useful optional workflow,
+        // but an authorized harness may apply its own immutable proposal
+        // directly. Confirmation belongs to the harness; Agentor's actual
+        // boundaries are workload identity and the live capability policy.
         const patch = p.diff as any;
         let appliedTarget: Record<string, unknown>;
         if (typeof patch.logLevel === "string") {
@@ -372,6 +395,7 @@ export class ManagementMcpStore {
           appliedTarget = { workerId: worker.id };
         }
         p.status = "applied";
+        if (!p.approvedAt) p.approvedAt = new Date().toISOString();
         p.appliedAt = new Date().toISOString();
         await this.audit("proposal.applied", "success", {
           proposalId: p.id,
@@ -411,6 +435,12 @@ export class ManagementMcpStore {
     args: Record<string, unknown>,
     workspaceId: string,
   ): Promise<any> {
+    const domain = await workerDomain.execute(name, args);
+    if (domain.handled) return domain.result;
+    const imageBackup = await imageBackupDomain.execute(name, args);
+    if (imageBackup.handled) return imageBackup.result;
+    if (workspaceMcpTools.some((tool) => tool.name === name))
+      return executeWorkspaceMcpTool(name, args);
     const workerId = typeof args.workerId === "string" ? args.workerId : "";
     const worker = workerId
       ? (useContainerManager().get(workerId) ??
@@ -463,6 +493,21 @@ export class ManagementMcpStore {
       if (name === "worker.stop") await useContainerManager().stop(worker.id);
       else await useContainerManager().restart(worker.id);
       return { workerId: worker.id, requested: name };
+    }
+    if (name.startsWith("console.")) {
+      const consoles = useManagementConsoleStore();
+      if (name === "console.open") {
+        if (!worker) throw statusError(404, "Worker not found");
+        return consoles.open(worker.id, Number(args.windowIndex ?? 0));
+      }
+      const sessionId = String(args.sessionId || "");
+      if (!sessionId) throw statusError(400, "sessionId required");
+      if (name === "console.read")
+        return consoles.read(sessionId, Number.isInteger(args.from) ? Number(args.from) : undefined);
+      if (name === "console.write")
+        return consoles.write(sessionId, typeof args.input === "string" ? args.input : "");
+      if (name === "console.interrupt") return consoles.interrupt(sessionId);
+      if (name === "console.close") return consoles.close(sessionId);
     }
     if (name === "exports.create") {
       if (!worker) throw statusError(404, "Worker not found");
@@ -573,6 +618,47 @@ export function useManagementMcpStore() {
 
 function statusError(statusCode: number, message: string) {
   return Object.assign(new Error(message), { statusCode });
+}
+function toolAnnotations(name: string) {
+  const readOnly = /(?:\.list|\.inspect|\.status|\.read|list-files|validate|build-status)$/.test(name) || name === "status.system";
+  const destructive = /(?:\.delete|\.cancel|\.remove|\.rollback|console\.close)$/.test(name);
+  return {
+    title: name,
+    readOnlyHint: readOnly,
+    destructiveHint: destructive,
+    idempotentHint: readOnly,
+    openWorldHint: false,
+  };
+}
+function toolInputSchema(name: string) {
+  if (name === "console.open")
+    return {
+      type: "object",
+      additionalProperties: false,
+      required: ["workerId"],
+      properties: {
+        workerId: { type: "string", description: "Target Agentor worker UUID" },
+        windowIndex: { type: "integer", minimum: 0, default: 0 },
+      },
+    };
+  if (name === "console.write")
+    return {
+      type: "object",
+      additionalProperties: false,
+      required: ["sessionId", "input"],
+      properties: { sessionId: { type: "string" }, input: { type: "string", maxLength: 65536 } },
+    };
+  if (["console.read", "console.interrupt", "console.close"].includes(name))
+    return {
+      type: "object",
+      additionalProperties: false,
+      required: ["sessionId"],
+      properties: {
+        sessionId: { type: "string" },
+        ...(name === "console.read" ? { from: { type: "integer", minimum: 0 } } : {}),
+      },
+    };
+  return { type: "object", additionalProperties: true };
 }
 function publicWorker(worker: any) {
   return {

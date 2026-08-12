@@ -1147,7 +1147,7 @@ The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/ap
 #### 26.2.4 Trusted administration and management MCP
 
 - The persistent digest-pinned `ADMIN / ORCHESTRATOR` overlay reuses terminal/editor/desktop, persistent storage, red identity markers, explicit privileged confirmation, and a generated non-secret control representation. It has no raw Docker socket, host binds, privilege, or published ports.
-- The MCP listens only on an internal management network, uses refreshed short-lived workspace identity, rechecks a fail-closed live group allowlist, omits unsafe log bodies, audits every success/failure without args/results, and requires immutable proposal → trusted dashboard approval → apply for configuration mutation.
+- The MCP listens only on an internal management network, is preconfigured in the administrative Codex environment through a rotating-credential stdio bridge, rechecks a fail-closed live group allowlist, omits disabled groups from discovery, audits every success/failure without args/results, and supports bounded/redacted linked-tmux console sessions inside selected workers. Immutable configuration proposals retain optional dashboard review; the invoking harness controls confirmation while Agentor enforces identity and capabilities.
 
 ---
 

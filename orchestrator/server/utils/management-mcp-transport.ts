@@ -74,7 +74,7 @@ export class ManagementMcpTransport {
       }
       if (body.method === "tools/list") {
         await this.authenticate(credential, "tools.list");
-        return this.rpc(response, id, { tools: this.store.listTools() });
+        return this.rpc(response, id, { tools: await this.store.listTools() });
       }
       if (body.method === "tools/call") {
         const name = body.params?.name;

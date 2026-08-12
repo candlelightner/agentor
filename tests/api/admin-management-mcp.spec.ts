@@ -80,6 +80,7 @@ test.describe.serial("Internal management MCP security", () => {
             "volume-browsing": true,
             "configuration-inspection": true,
             "worker-lifecycle": false,
+            console: false,
             exports: false,
             backups: false,
             "image-builds": false,
@@ -211,6 +212,7 @@ test.describe.serial("Internal management MCP security", () => {
     expect(policy.groups["configuration-inspection"].enabled).toBe(true);
     for (const group of [
       "worker-lifecycle",
+      "console",
       "exports",
       "backups",
       "image-builds",
@@ -305,6 +307,19 @@ test.describe.serial("Internal management MCP security", () => {
     ).toBe(200);
   });
 
+  test("disabled capability groups disappear from MCP discovery", async ({
+    request,
+  }) => {
+    const listed = await request.post("/api/admin/management-mcp/diagnostics/list-tools", {
+      data: { credential },
+    });
+    expect(listed.status()).toBe(200);
+    const names = (await listed.json()).map((tool: { name: string }) => tool.name);
+    expect(names).toContain("status.system");
+    expect(names).not.toContain("worker.stop");
+    expect(names).not.toContain("console.open");
+  });
+
   test("MCP responses and errors never return existing secret values", async ({
     request,
   }) => {
@@ -333,7 +348,58 @@ test.describe.serial("Internal management MCP security", () => {
     });
   });
 
-  test("dangerous changes require immutable dashboard-approved proposals", async ({
+  test("MCP console attaches to the selected worker, accepts input, redacts managed secrets, and closes", async ({
+    request,
+  }) => {
+    await request.put("/api/admin/management-mcp/policy", {
+      data: { groups: { console: true } },
+    });
+    const managedSecret = `console-managed-${Date.now()}`;
+    expect(
+      (
+        await regularCtx.put(`/api/containers/${normalWorker}/configuration`, {
+          data: { secrets: [{ key: "CONSOLE_MANAGED_SECRET", value: managedSecret }] },
+        })
+      ).status(),
+    ).toBe(200);
+    const opened = await invoke(request, credential, "console.open", {
+      workerId: normalWorker,
+      windowIndex: 0,
+    });
+    expect(opened.status()).toBe(200);
+    const sessionId = (await opened.json()).id;
+    expect(sessionId).toEqual(expect.any(String));
+    const marker = `mcp-console-${Date.now()}`;
+    expect(
+      (
+        await invoke(request, credential, "console.write", {
+          sessionId,
+          input: `printf '${marker}:%s:${managedSecret}\\n' \"$(printf '%s' \"$WORKER\" | jq -r .id)\"\n`,
+        })
+      ).status(),
+    ).toBe(200);
+    let output = "";
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const read = await invoke(request, credential, "console.read", { sessionId, from: 0 });
+      expect(read.status()).toBe(200);
+      output = (await read.json()).output;
+      if (output.includes(marker)) break;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    expect(output).toContain(`${marker}:${normalWorker}:[REDACTED]`);
+    expect(output).not.toContain(managedSecret);
+    expect(
+      (await invoke(request, credential, "console.interrupt", { sessionId })).status(),
+    ).toBe(200);
+    expect(
+      (await invoke(request, credential, "console.close", { sessionId })).status(),
+    ).toBe(200);
+    expect(
+      (await invoke(request, credential, "console.read", { sessionId })).status(),
+    ).toBe(404);
+  });
+
+  test("authorized harnesses may apply immutable proposals without mandatory dashboard approval", async ({
     request,
   }) => {
     await request.put("/api/admin/management-mcp/policy", {
@@ -364,7 +430,7 @@ test.describe.serial("Internal management MCP security", () => {
           proposalId: proposal.id,
         })
       ).status(),
-    ).toBe(403);
+    ).toBe(200);
     expect(
       (
         await invoke(request, credential, "configuration.approve", {
@@ -379,7 +445,7 @@ test.describe.serial("Internal management MCP security", () => {
           { data: {} },
         )
       ).status(),
-    ).toBe(200);
+    ).toBe(409);
     expect(
       (
         await request.put(
@@ -388,13 +454,6 @@ test.describe.serial("Internal management MCP security", () => {
         )
       ).status(),
     ).toBe(409);
-    expect(
-      (
-        await invoke(request, credential, "configuration.apply", {
-          proposalId: proposal.id,
-        })
-      ).status(),
-    ).toBe(200);
     expect(
       (
         await invoke(request, credential, "configuration.apply", {
@@ -445,7 +504,6 @@ test.describe.serial("Internal management MCP security", () => {
     for (const action of [
       "authorization.denied",
       "policy.changed",
-      "proposal.approved",
       "proposal.applied",
     ])
       expect(serialized).toContain(action);

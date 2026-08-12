@@ -107,5 +107,5 @@ function optionalString(v:unknown){return typeof v==="string"?v:undefined;}
 function array(v:unknown){return Array.isArray(v)?v:undefined;}
 function strings(v:unknown,n:string){if(!Array.isArray(v)||v.some(x=>typeof x!=="string"))throw status(400,`${n} must be strings`);return [...new Set(v as string[])];}
 function settings(a:Record<string,unknown>):UpdateContainerSettingsRequest { const result:any={}; for(const k of ["displayName","environmentId","initScript","repos","mounts"]){if(a[k]!==undefined)result[k]=a[k];} return result; }
-function configInput(a:Record<string,unknown>){const result:any={};for(const k of ["variables","secrets","secretFiles","envFile","deleteSecrets","deleteSecretFiles"]){if(a[k]!==undefined)result[k]=a[k];}return result;}
+function configInput(value:unknown){const a=value && typeof value==="object"&&!Array.isArray(value)?value as Record<string,unknown>:{};const result:any={};for(const k of ["variables","secrets","secretFiles","envFile","deleteSecrets","deleteSecretFiles"]){if(a[k]!==undefined)result[k]=a[k];}return result;}
 function status(statusCode:number,message:string){return Object.assign(new Error(message),{statusCode});}

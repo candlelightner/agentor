@@ -58,7 +58,7 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
       Cmd: [
         "sh",
         "-c",
-        "umask 077; tee /run/agentor-management/credential >/dev/null",
+        "umask 077; tee /run/agentor-management/.credential.tmp >/dev/null && mv /run/agentor-management/.credential.tmp /run/agentor-management/credential",
       ],
       AttachStdin: true,
       AttachStdout: false,
@@ -270,6 +270,7 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
         `WORKER=${JSON.stringify(worker)}`,
         "AGENTOR_ADMIN_WORKSPACE=1",
         "AGENTOR_ADMIN_BANNER=ADMIN / ORCHESTRATOR",
+        "AGENTOR_MANAGEMENT_MCP_URL=http://agentor-orchestrator:3099/mcp",
         "ORCHESTRATOR_URL=http://agentor-orchestrator:3000",
         `WORKER_CONTAINER_NAME=${ADMIN_CONTAINER}`,
       ],

@@ -324,6 +324,27 @@ for setup_script in /home/agent/agents/*/setup.sh; do
     fi
 done
 
+# The trusted administrative overlay is the only worker attached to the
+# management network. Advertise its internal MCP to Codex through a stdio
+# bridge which reads the current short-lived credential from tmpfs on every
+# request. Preserve all user-owned Codex configuration and add only this
+# generated section when it is absent.
+if [[ "${AGENTOR_ADMIN_WORKSPACE:-}" == "1" ]]; then
+    CODEX_CONFIG="/home/agent/.codex/config.toml"
+    mkdir -p "$(dirname "$CODEX_CONFIG")"
+    touch "$CODEX_CONFIG"
+    if ! grep -q '^\[mcp_servers\.agentor-management\]$' "$CODEX_CONFIG"; then
+        cat >> "$CODEX_CONFIG" <<'EOF'
+
+# Generated for the trusted Agentor administrative workspace.
+[mcp_servers.agentor-management]
+command = "/usr/local/bin/agentor-management-mcp"
+EOF
+    fi
+    tmux set-environment -g AGENTOR_MANAGEMENT_MCP_URL \
+      "${AGENTOR_MANAGEMENT_MCP_URL:-http://agentor-orchestrator:3099/mcp}"
+fi
+
 _done agents "Agent setup"
 _log "Agent setup: done"
 

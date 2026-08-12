@@ -45,6 +45,8 @@ The dashboard's **Workspace storage** view is runtime-independent. Durable worke
 
 Worker-local configuration is a versioned per-user store keyed by immutable worker ID. Plain variables coexist with AES-256-GCM secret records authenticated to owner/worker/type/name; a dedicated 0600 `worker-config.key` is created under the data directory and is intentionally separate from dashboard authentication. The desired and last-applied encrypted revisions are tracked independently, so restart can recreate ephemeral secret files without applying pending edits. Environment values are applied in increasing specificity, and secret files are written only into a capped `/run/agentor-secrets` tmpfs. Permanent worker deletion removes its configuration; clone/export copy names or non-secret values only.
 
+Workers may additionally be protected with a separate password lock. Agentor stores only a salted scrypt verifier in `worker-protection-locks.v1.json` (0600); neither the password nor verifier is returned by APIs, UI state, logs, exports, or backups. Protected workers require the password for material lifecycle/configuration changes (settings, local configuration, archive/unarchive, rebuild, permanent deletion); start and stop intentionally remain available for recoverability. There is no password-recovery bypass: the owner or an Agentor administrator must supply the current password to change or remove a lock.
+
 The orchestrator supports two storage modes, auto-detected from how `/data` is mounted:
 
 | Mode | Mount type | Detection | Worker data storage |
@@ -155,7 +157,9 @@ The optional Git image catalog is a separate disaster-recovery channel, not a wo
 
 The trusted `agentor-admin-worker` overlay is generated only by the orchestrator from the official worker base and then pinned by immutable image ID. It has persistent workspace/agent-data volumes, the normal terminal/editor/desktop services, red identity markers, and an orchestrator-generated non-secret control representation. It receives no Docker socket, host bind, published port, privilege, or user-selected image. It joins the ordinary service network for the existing UI proxies and the internal `agentor-management` network for MCP; ordinary workers never join the latter.
 
-The MCP transport listens only on the orchestrator's management-network address. Authentication uses a workspace-bound, short-lived credential held in admin tmpfs and refreshed by the orchestrator. Every call rechecks the current explicit allowlist, records a sanitized success/failure audit event, and never returns secret values (logs are metadata-only). Mutating configuration follows proposal → trusted dashboard approval → apply; the MCP identity cannot approve its own proposal.
+The MCP transport listens only on the orchestrator's management-network address. Authentication uses a workspace-bound, short-lived credential held in admin tmpfs and refreshed atomically by the orchestrator. The administrative worker preconfigures Codex with a local stdio bridge; the bridge reads the current credential for every request and forwards only to the internal Docker DNS endpoint. Every call rechecks the current explicit allowlist, disabled groups disappear from discovery, and a sanitized success/failure audit event is recorded. Configuration proposals remain immutable and may be reviewed in the dashboard, but dashboard approval is optional: confirmation policy belongs to the invoking harness while Agentor enforces workload identity and capability policy.
+
+The console capability opens bounded linked-tmux sessions inside a selected running worker. It has no host-command target, bounds input and retained output, redacts exact managed worker-secret values, expires idle sessions, and cleans the linked session on close, stream failure, or expiry.
 
 ### Workspace, Agents & DinD Storage
 

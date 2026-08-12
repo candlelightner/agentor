@@ -13,16 +13,18 @@ const groupDescriptions: Record<string, string> = {
   "volume-browsing": "Volume metadata and read-only workspace browsing.",
   "configuration-inspection": "Sanitized worker configuration inspection.",
   "worker-lifecycle": "Start and stop workers.",
+  console: "Open bounded interactive terminal sessions inside selected workers.",
   exports: "Create, inspect, and cancel export jobs.",
   backups: "Create, inspect, and cancel backup jobs.",
   "image-builds": "Validate image definitions and run controlled builds.",
   "configuration-proposals":
     "Create immutable non-secret configuration proposals.",
   "configuration-application":
-    "Apply a proposal only after trusted dashboard approval.",
+    "Apply an immutable proposal. The invoking harness controls confirmation.",
 };
 const dangerousGroups = new Set([
   "worker-lifecycle",
+  "console",
   "exports",
   "backups",
   "image-builds",
@@ -123,8 +125,9 @@ const sourceFor = (name: string) =>
           role="alert"
         >
           This MCP is restricted to the administrative workspace. Policy is
-          re-checked on every call; disabled or unknown tools are denied. The AI
-          cannot approve its own proposals.
+          re-checked on every call; disabled or unknown tools are denied.
+          Confirmation prompts are controlled by the invoking agent harness;
+          dashboard proposal review remains optional.
         </div>
         <p
           v-if="mcp.error.value"
