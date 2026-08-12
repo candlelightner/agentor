@@ -1,0 +1,2 @@
+import {test,expect} from '@playwright/test';import {ManagementConfigurationCatalogDomain} from '../../orchestrator/server/utils/management-configuration-catalog-domain';
+test('catalog domain declares isolated CRUD tool surface',()=>{const names=new ManagementConfigurationCatalogDomain().tools().map((x:any)=>x.name);expect(names).toContain('catalog.environments.create');expect(names).toContain('catalog.capabilities.delete');expect(names).toContain('catalog.instructions.update');expect(names).toContain('catalog.init-scripts.list')});
