@@ -26,6 +26,7 @@ import { useManagementConsoleStore } from "./management-console-store";
 import { ManagementWorkerDomain } from "./management-worker-domain";
 import { workspaceMcpTools, executeWorkspaceMcpTool } from "./management-mcp-workspace-adapter";
 import { ManagementImageBackupDomain } from "./management-image-backup-domain";
+import { ManagementPlatformDomain } from "./management-platform-domain";
 
 const GROUPS = [
   "read-only-status",
@@ -39,6 +40,8 @@ const GROUPS = [
   "groups",
   "locks",
   "images",
+  "networking",
+  "storage-maintenance",
   "exports",
   "backups",
   "image-builds",
@@ -48,6 +51,7 @@ const GROUPS = [
 type Group = (typeof GROUPS)[number];
 const workerDomain = new ManagementWorkerDomain();
 const imageBackupDomain = new ManagementImageBackupDomain();
+const platformDomain = new ManagementPlatformDomain();
 interface Policy {
   schemaVersion: 1;
   default: "deny";
@@ -119,7 +123,8 @@ const TOOL_GROUP: Record<string, Group> = {
 };
 for (const tool of workerDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 for (const tool of workspaceMcpTools) TOOL_GROUP[tool.name] = tool.group as Group;
-for (const tool of imageBackupDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
+for (const tool of imageBackupDomain.tools()) TOOL_GROUP[tool.name] ??= tool.group;
+for (const tool of platformDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 const sensitive =
   /secret|token|credential|password|authorization|cookie|cipher|key/i;
 function clean(value: unknown, depth = 0): any {
@@ -212,11 +217,12 @@ export class ManagementMcpStore {
       const domain = workerDomain.tools().find((tool) => tool.name === name);
       const workspace = workspaceMcpTools.find((tool) => tool.name === name);
       const imageBackup = imageBackupDomain.tools().find((tool) => tool.name === name);
+      const platform = platformDomain.tools().find((tool) => tool.name === name);
       return {
       name,
-      description: domain?.description || workspace?.description || imageBackup?.description || `Agentor management tool (${TOOL_GROUP[name]})`,
-      inputSchema: domain?.inputSchema || workspace?.inputSchema || imageBackup?.inputSchema || toolInputSchema(name),
-      annotations: domain?.annotations || workspace?.annotations || imageBackup?.annotations || toolAnnotations(name),
+      description: domain?.description || workspace?.description || imageBackup?.description || platform?.description || `Agentor management tool (${TOOL_GROUP[name]})`,
+      inputSchema: domain?.inputSchema || workspace?.inputSchema || imageBackup?.inputSchema || platform?.inputSchema || toolInputSchema(name),
+      annotations: domain?.annotations || workspace?.annotations || imageBackup?.annotations || platform?.annotations || toolAnnotations(name),
     }});
   }
   async updatePolicy(groups: Record<string, unknown>, actor: string) {
@@ -437,8 +443,10 @@ export class ManagementMcpStore {
   ): Promise<any> {
     const domain = await workerDomain.execute(name, args);
     if (domain.handled) return domain.result;
-    const imageBackup = await imageBackupDomain.execute(name, args);
+    const imageBackup = await imageBackupDomain.execute(name, await compatibleDomainArguments(name, args));
     if (imageBackup.handled) return imageBackup.result;
+    const platform = await platformDomain.execute(name, args);
+    if (platform.handled) return platform.result;
     if (workspaceMcpTools.some((tool) => tool.name === name))
       return executeWorkspaceMcpTool(name, args);
     const workerId = typeof args.workerId === "string" ? args.workerId : "";
@@ -618,6 +626,24 @@ export function useManagementMcpStore() {
 
 function statusError(statusCode: number, message: string) {
   return Object.assign(new Error(message), { statusCode });
+}
+async function compatibleDomainArguments(name: string, args: Record<string, unknown>) {
+  if (args.ownerId || (!name.startsWith("images.") && !name.startsWith("backups."))) return args;
+  if (name.startsWith("images.") && typeof args.definitionId === "string") {
+    const catalog = useImageCatalogManager();
+    await catalog.init();
+    const definition = catalog.list("", true).find((item) => item.id === args.definitionId);
+    if (definition) return { ...args, ownerId: definition.ownerId };
+  }
+  if (name === "backups.create" && Array.isArray(args.workspaceIds)) {
+    const first = useContainerManager().get(String(args.workspaceIds[0] || ""));
+    if (first) return { ...args, ownerId: first.userId };
+  }
+  if (typeof args.jobId === "string") {
+    const job = await useBackupManager().getJob(args.jobId);
+    if (job) return { ...args, ownerId: job.userId };
+  }
+  return args;
 }
 function toolAnnotations(name: string) {
   const readOnly = /(?:\.list|\.inspect|\.status|\.read|list-files|validate|build-status)$/.test(name) || name === "status.system";
