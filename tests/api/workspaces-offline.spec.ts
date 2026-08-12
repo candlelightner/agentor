@@ -110,7 +110,7 @@ test.describe.serial("Offline workspace inventory and browser security", () => {
     ).id;
     await exec(
       adminWorker,
-      "mkdir -p /workspace/docs /workspace/images && printf 'offline sentinel text\\nsecond line\\n' > /workspace/docs/readme.txt && printf '<script>alert(1)</script>' > /workspace/docs/unsafe.html && printf '\\211PNG\\r\\n\\032\\n' > /workspace/images/tiny.png && ln -s /etc/passwd /workspace/escape-link",
+      "mkdir -p /workspace/docs /workspace/images && printf 'offline sentinel text\\nsecond line\\n' > /workspace/docs/readme.txt && printf '<script>alert(1)</script>' > /workspace/docs/unsafe.html && printf '\\211PNG\\r\\n\\032\\n' > /workspace/images/tiny.png && ln -s /etc/passwd /workspace/escape-link && ln -s /etc /workspace/escape-dir",
     );
     expect(
       (await new ApiClient(request).stopContainer(adminWorker)).status,
@@ -271,6 +271,21 @@ test.describe.serial("Offline workspace inventory and browser security", () => {
     );
     expect([400, 409, 415]).toContain(preview.status());
     expect(await preview.text()).not.toContain("root:x:0:0");
+  });
+
+  test("an intermediate escaping symlink never permits an offline realpath escape", async ({
+    request,
+  }) => {
+    const metadata = await request.get(
+      `/api/workspaces/${adminWorkspace}/metadata?path=escape-dir/passwd`,
+    );
+    expect(metadata.status()).toBe(400);
+    expect(await metadata.text()).not.toContain("root:x:0:0");
+    const download = await request.get(
+      `/api/workspaces/${adminWorkspace}/download?path=escape-dir/passwd`,
+    );
+    expect(download.status()).toBe(400);
+    expect(await download.text()).not.toContain("root:x:0:0");
   });
 
   test("text preview is bounded, no-store, and returns safe text", async ({

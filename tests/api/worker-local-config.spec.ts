@@ -357,6 +357,13 @@ test.describe.serial("Worker-local configuration security", () => {
     const config = await getConfig(request, workerB);
     assertSecretAbsent(config.body, secretValue, secretFileValue);
     expect(JSON.stringify(config.body)).not.toContain("WORKER_LOCAL_SECRET");
+    expect(
+      await shellValue(
+        request,
+        workerB,
+        "$(cat /run/agentor-secrets/nested/service-token 2>/dev/null || printf absent)",
+      ),
+    ).toBe("absent");
   });
 
   test("worker-local configuration never crosses user boundaries", async () => {
