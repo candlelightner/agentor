@@ -39,6 +39,7 @@ import { useContainerManager, useEnvironmentStore, useConfig } from '../../../ut
 import { MAX_DISPLAY_NAME_LENGTH } from '../../../utils/validation';
 import { validateMounts } from '../../../utils/docker';
 import { requireContainerAccess } from '../../../utils/auth-helpers';
+import { useWorkerProtectionLockStore } from '../../../utils/worker-protection-lock';
 
 function bad(message: string): never {
   throw createError({ statusCode: 400, statusMessage: message });
@@ -73,6 +74,7 @@ export default defineEventHandler(async (event) => {
   requireContainerAccess(event, container);
 
   const body = (await readBody(event)) ?? {};
+  await useWorkerProtectionLockStore().verify(id, (body as any).lockPassword);
 
   const patch: UpdateContainerSettingsRequest = {};
 

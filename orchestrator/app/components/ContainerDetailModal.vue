@@ -100,7 +100,8 @@ function buildPatch(): UpdateContainerSettingsRequest {
     mounts: form.mounts
       .filter((m) => m.source && m.target)
       .map((m) => ({ source: m.source, target: m.target, ...(m.readOnly ? { readOnly: true } : {}) })),
-  };
+    ...(protection.value.protected && lockCurrentPassword.value ? { lockPassword: lockCurrentPassword.value } : {}),
+  } as UpdateContainerSettingsRequest;
 }
 
 function save(rebuild: boolean) {
@@ -119,10 +120,25 @@ const portMappings = ref<PortMapping[]>([]);
 const domainMappings = ref<DomainMapping[]>([]);
 const appInstances = ref<AppInstanceInfo[]>([]);
 const loaded = ref(false);
+const protection = ref<{ protected: boolean }>({ protected: false });
+const lockPassword = ref('');
+const lockCurrentPassword = ref('');
+const lockError = ref('');
+async function loadProtection() { try { protection.value = await $fetch(`/api/containers/${props.container.id}/protection`); } catch { /* optional lock status */ } }
+async function saveProtection(remove = false) {
+  lockError.value = '';
+  try {
+    protection.value = remove
+      ? await $fetch(`/api/containers/${props.container.id}/protection`, { method: 'DELETE', body: { password: lockCurrentPassword.value } })
+      : await $fetch(`/api/containers/${props.container.id}/protection`, { method: 'PUT', body: { password: lockPassword.value, currentPassword: lockCurrentPassword.value || undefined } });
+    lockPassword.value = ''; lockCurrentPassword.value = '';
+  } catch (error: any) { lockError.value = error?.data?.statusMessage || 'Could not update protection lock.'; }
+}
 
 async function loadDetails() {
   if (loaded.value) return;
   loaded.value = true;
+  void loadProtection();
 
   const fetches: Promise<void>[] = [];
 
@@ -328,6 +344,21 @@ const formattedCreatedAt = computed(() => {
               </span>
               <div class="flex-1" />
               <UButton color="neutral" variant="outline" @click="() => { open = false; }">Close</UButton>
+            </div>
+          </section>
+
+          <section class="space-y-2" data-testid="worker-protection-lock">
+            <div class="flex items-center justify-between">
+              <h3 class="text-[10px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider">Protection lock</h3>
+              <UBadge :color="protection.protected ? 'warning' : 'neutral'" variant="subtle" size="xs">{{ protection.protected ? 'protected' : 'off' }}</UBadge>
+            </div>
+            <p class="text-xs text-gray-500">A protected worker requires its separate lock password before settings, configuration, archive, rebuild, or deletion. Start and stop stay available. Enter it here before saving settings. The password cannot be recovered; an Agentor administrator may remove the lock only by supplying it.</p>
+            <UInput v-if="protection.protected" v-model="lockCurrentPassword" type="password" placeholder="current lock password" aria-label="Current lock password" />
+            <UInput v-else v-model="lockPassword" type="password" placeholder="new lock password (8+ characters)" aria-label="New lock password" />
+            <p v-if="lockError" class="text-xs text-red-500">{{ lockError }}</p>
+            <div class="flex gap-2">
+              <UButton v-if="!protection.protected" size="xs" :disabled="lockPassword.length < 8" @click="saveProtection()">Protect worker</UButton>
+              <UButton v-else size="xs" color="warning" variant="outline" :disabled="!lockCurrentPassword" @click="saveProtection(true)">Remove protection</UButton>
             </div>
           </section>
 

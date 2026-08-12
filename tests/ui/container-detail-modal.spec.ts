@@ -123,6 +123,19 @@ test.describe.serial('Worker Settings Modal', () => {
     await expect(dialog.getByRole('button', { name: 'Save', exact: true })).toBeDisabled();
   });
 
+  test('sets and removes the optional protection lock without rendering its password', async ({ page }) => {
+    const dialog = await openModal(page);
+    const lock = dialog.locator('[data-testid="worker-protection-lock"]');
+    await expect(lock).toContainText('off');
+    await lock.getByLabel('New lock password').fill('ui-protection-password');
+    await lock.getByRole('button', { name: 'Protect worker' }).click();
+    await expect(lock).toContainText('protected');
+    await expect(lock).not.toContainText('ui-protection-password');
+    await lock.getByLabel('Current lock password').fill('ui-protection-password');
+    await lock.getByRole('button', { name: 'Remove protection' }).click();
+    await expect(lock).toContainText('off');
+  });
+
   test('does NOT show environment-specific sections', async ({ page }) => {
     const dialog = await openModal(page);
     // CPU/Memory/Docker/Network/Capabilities/etc. belong to the environment modal

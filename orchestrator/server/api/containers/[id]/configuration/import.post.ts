@@ -10,12 +10,14 @@ import { requireContainerAccess } from '../../../../utils/auth-helpers';
 import { useContainerManager, useWorkerStore } from '../../../../utils/services';
 import { useWorkerConfigStore } from '../../../../utils/worker-config-store';
 import { workerConfigurationResponse } from '../../../../utils/worker-config-response';
+import { useWorkerProtectionLockStore } from '../../../../utils/worker-protection-lock';
 
 export default defineEventHandler(async (event) => {
   const id = getRouterParam(event, 'id')!;
   const worker = useContainerManager().get(id) ?? useWorkerStore().findById(id);
   requireContainerAccess(event, worker);
   const body = await readBody<{ content?: unknown; kind?: unknown }>(event);
+  await useWorkerProtectionLockStore().verify(id, (body as any)?.lockPassword);
   if (typeof body?.content !== 'string' || (body.kind !== undefined && body.kind !== 'variable' && body.kind !== 'secret')) throw createError({ statusCode: 400, statusMessage: 'content must be text and kind must be variable or secret' });
   const store = useWorkerConfigStore();
   try {

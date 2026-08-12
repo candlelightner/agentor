@@ -17,6 +17,7 @@ defineRouteMeta({
 
 import { useContainerManager, useWorkerStore } from '../../../utils/services';
 import { requireContainerAccess } from '../../../utils/auth-helpers';
+import { useWorkerProtectionLockStore } from '../../../utils/worker-protection-lock';
 
 export default defineEventHandler(async (event) => {
   const id = getRouterParam(event, 'id')!;
@@ -29,5 +30,7 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 404, statusMessage: 'Archived worker not found' });
   }
   requireContainerAccess(event, worker);
+  const body = await readBody<any>(event);
+  await useWorkerProtectionLockStore().verify(id, body?.lockPassword);
   return useContainerManager().unarchive(worker.userId, id);
 });

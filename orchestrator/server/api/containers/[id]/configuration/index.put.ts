@@ -10,6 +10,7 @@ import { requireContainerAccess } from '../../../../utils/auth-helpers';
 import { useContainerManager, useWorkerStore } from '../../../../utils/services';
 import { useWorkerConfigStore } from '../../../../utils/worker-config-store';
 import { workerConfigurationResponse } from '../../../../utils/worker-config-response';
+import { useWorkerProtectionLockStore } from '../../../../utils/worker-protection-lock';
 
 export default defineEventHandler(async (event) => {
   const id = getRouterParam(event, 'id')!;
@@ -17,6 +18,7 @@ export default defineEventHandler(async (event) => {
   requireContainerAccess(event, worker);
   const body = await readBody<{ variables?: Array<{key:string;value:string}>; secrets?: Array<{key:string;value:string}>; secretFiles?: Array<{name:string;path:string;content:string}>; envFile?: string; deleteSecrets?: string[]; deleteSecretFiles?: string[] }>(event);
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw createError({ statusCode: 400, statusMessage: 'Request body must be an object' });
+  await useWorkerProtectionLockStore().verify(id, (body as any).lockPassword);
   const store = useWorkerConfigStore();
   try {
     await store.patch(worker!.userId, id, body);

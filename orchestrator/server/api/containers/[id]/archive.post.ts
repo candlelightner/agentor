@@ -15,12 +15,15 @@ defineRouteMeta({
 import { useContainerManager } from '../../../utils/services';
 import { requireContainerAccess } from '../../../utils/auth-helpers';
 import { rethrowAsHttpError } from '../../../utils/http-errors';
+import { useWorkerProtectionLockStore } from '../../../utils/worker-protection-lock';
 
 export default defineEventHandler(async (event) => {
   const id = getRouterParam(event, 'id')!;
   try {
     const cm = useContainerManager();
     requireContainerAccess(event, cm.get(id));
+    const body = await readBody<any>(event);
+    await useWorkerProtectionLockStore().verify(id, body?.lockPassword);
     await cm.archive(id);
     return { ok: true };
   } catch (err) {
