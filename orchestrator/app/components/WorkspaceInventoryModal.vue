@@ -8,10 +8,30 @@ const { workspaces, loading, error, refresh } = useWorkspaces();
 const toast = useToast();
 const cloning = ref<string | null>(null);
 const backingUp = ref<string | null>(null);
+const { isAdmin } = useAuth();
+const storage = ref<any>(null);
+const storageLoading = ref(false);
+const storageError = ref('');
+const cleaning = ref('');
 
 watch(open, (shown) => {
-  if (shown) void refresh();
+  if (shown) { void refresh(); if (isAdmin.value) void refreshStorage(); }
 });
+async function refreshStorage() {
+  storageLoading.value = true; storageError.value = '';
+  try { storage.value = await $fetch('/api/admin/storage'); }
+  catch (error: any) { storageError.value = error?.data?.statusMessage || 'Could not load storage inventory.'; }
+  finally { storageLoading.value = false; }
+}
+async function cleanupStorage(kind: string) {
+  cleaning.value = kind;
+  try {
+    const result: any = await $fetch('/api/admin/storage/cleanup', { method: 'POST', body: { [kind]: true } });
+    storage.value = result.inventory;
+    toast.add({ title: 'Storage cleanup complete', description: `Reclaimed ${formatBytes(result.reclaimedBytes || 0)}.`, color: 'success' });
+  } catch (error: any) { toast.add({ title: 'Storage cleanup failed', description: error?.data?.statusMessage || error?.message || 'Could not complete cleanup.', color: 'error' }); }
+  finally { cleaning.value = ''; }
+}
 
 function ownerLabel(item: WorkspaceInventoryItem) {
   if (typeof item.owner === 'string') return item.owner;
@@ -65,6 +85,12 @@ async function backupWorkspace(item: WorkspaceInventoryItem) {
           </div>
         </div>
         <p v-if="error" class="text-sm text-red-600 dark:text-red-400" role="alert">{{ error }}</p>
+
+        <section v-if="isAdmin" class="rounded border p-4 space-y-3" data-testid="storage-management">
+          <div class="flex items-center justify-between gap-2"><div><h3 class="font-medium">Agentor disk storage</h3><p class="text-xs text-gray-500">Only safe cleanup targets are offered; referenced images and active artifacts are never deleted.</p></div><UButton size="xs" variant="outline" :loading="storageLoading" @click="refreshStorage">Refresh</UButton></div>
+          <p v-if="storageError" role="alert" class="text-xs text-red-600">{{ storageError }}</p>
+          <template v-if="storage"><p :class="storage.disk.warning === 'critical' ? 'text-red-600' : storage.disk.warning === 'warning' ? 'text-amber-600' : 'text-xs text-gray-500'" class="text-sm">{{ storage.disk.warning === 'ok' ? 'Disk capacity healthy' : `Disk space ${storage.disk.warning}` }} · {{ formatBytes(storage.disk.freeBytes) }} free of {{ formatBytes(storage.disk.totalBytes) }}</p><div class="grid gap-2 text-xs md:grid-cols-3"><span>Workspaces: {{ storage.workspaces.count }} · {{ storage.workspaces.bytes === null ? 'size unavailable' : formatBytes(storage.workspaces.bytes) }}</span><span>Docker images: {{ storage.docker.imagesBytes === null ? 'unavailable' : formatBytes(storage.docker.imagesBytes) }}</span><span>Build cache: {{ storage.docker.buildCacheBytes === null ? 'unavailable' : formatBytes(storage.docker.buildCacheBytes) }}</span></div><div class="flex flex-wrap gap-2"><UButton size="xs" variant="outline" :loading="cleaning === 'danglingImages'" @click="cleanupStorage('danglingImages')">Prune dangling images</UButton><UButton size="xs" variant="outline" :loading="cleaning === 'buildCache'" @click="cleanupStorage('buildCache')">Prune build cache</UButton><UButton size="xs" variant="outline" :loading="cleaning === 'staleHelpers'" @click="cleanupStorage('staleHelpers')">Remove stale helpers ({{ storage.helpers.stale }})</UButton><UButton size="xs" variant="outline" :loading="cleaning === 'staleStaging'" @click="cleanupStorage('staleStaging')">Clean old staging</UButton></div><ul class="text-xs text-gray-500"><li v-for="item in storage.staging" :key="item.id">{{ item.label }}: {{ formatBytes(item.bytes) }}</li></ul></template>
+        </section>
 
         <div class="overflow-x-auto border border-gray-200 dark:border-gray-700 rounded-md">
           <table class="w-full text-sm">

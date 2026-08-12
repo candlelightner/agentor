@@ -1131,6 +1131,7 @@ The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/ap
 - Worker exports are owner-scoped asynchronous jobs with durable state, bounded concurrency, progress/bytes/phases, cancellation, expiry, restart recovery, streamed downloads, and partial cleanup.
 - Workspace-only is the default; root-filesystem capture is an explicit warned advanced mode. Imports and stopped/large/rootfs round trips preserve the existing format while excluding credentials and secret values.
 - Storage inventory is independent of runtime and reports running, stopped, archived, deleted-tombstone, and orphan metadata with size/latest-backup where available. Directory and named-volume browsing is read-only, owner checked, traversal/symlink safe, and helper hardened.
+- Administrators additionally see practical disk free-space warnings, workspace/Docker/build-cache/staging totals, and only conservative cleanup controls for dangling images/cache, exited Agentor helpers, and aged Agentor staging directories. Referenced images and active artifacts are excluded.
 
 #### 26.2.2 Backups and scoped secrets
 

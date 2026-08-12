@@ -25,6 +25,9 @@ const docsEntries = [
 ];
 
 async function mockWorkspaceApi(page: Page) {
+  const storage = { disk: { freeBytes: 10_000_000, totalBytes: 100_000_000, warning: 'warning' }, workspaces: { count: 1, bytes: 12_345 }, docker: { imagesBytes: 4096, buildCacheBytes: 2048 }, staging: [{ id: 'tmp', label: 'Backup/export staging', bytes: 1024, cleanup: true }], helpers: { total: 2, stale: 1 } };
+  await page.route('**/api/admin/storage/cleanup', (route) => route.fulfill({ json: { reclaimedBytes: 1024, actions: ['stale-staging'], inventory: storage } }));
+  await page.route('**/api/admin/storage', (route) => route.fulfill({ json: storage }));
   await page.route('**/api/workspaces', (route) => route.fulfill({
     status: 200,
     contentType: 'application/json',
@@ -95,6 +98,11 @@ test('sidebar opens inventory and renders the storage contract with unavailable 
   await expect(inventory).toContainText('12 KB');
   await expect(inventory.getByRole('button', { name: 'Back up' })).toBeDisabled();
   await expect(inventory.getByRole('button', { name: 'Clone' })).toBeDisabled();
+});
+test('administrator sees disk warning and conservative cleanup actions', async ({ page }) => {
+  await openInventory(page); const panel = page.locator('[data-testid="storage-management"]');
+  await expect(panel).toContainText('Disk space warning'); await expect(panel).toContainText('Docker images');
+  await panel.getByRole('button', { name: 'Clean old staging' }).click(); await expect(panel).toContainText('Backup/export staging');
 });
 
 test('browse, search result names, clear, and breadcrumb navigation stay coherent', async ({ page }) => {
