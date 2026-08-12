@@ -1,15 +1,16 @@
 defineRouteMeta({ openAPI: { tags: ['Managed networks'], summary: 'Create a managed bridge network', operationId: 'createManagedNetwork', responses: { 201: { description: 'Created and reconciled' }, 400: { description: 'Invalid scope or group' }, 409: { description: 'Docker reconciliation failed' } } } });
 import { requireAuth } from '../../utils/auth-helpers';
-import { useManagedNetworkStore, useWorkerGroupStore } from '../../utils/services';
+import { useManagedNetworkStore, useWorkerGroupStore, useWorkerStore } from '../../utils/services';
 import { useManagedNetworkManager } from '../../utils/managed-network-manager';
 import { verifyWorkerMutationUnlocks } from '../../utils/worker-protection-lock';
 export default defineEventHandler(async event => {
   const { user } = requireAuth(event); const body: any = await readBody(event);
   if (typeof body?.name !== 'string' || !body.name.trim() || body.name.length > 100 || !['all', 'selected', 'group'].includes(body.scope)) throw createError({ statusCode: 400, statusMessage: 'Valid name and scope are required' });
   if (body.scope === 'group' && (typeof body.groupId !== 'string' || !useWorkerGroupStore().get(user.id, body.groupId))) throw createError({ statusCode: 400, statusMessage: 'Group not found' });
-  const affected = body.scope === 'selected' ? body.workerIds || [] : body.scope === 'group' ? useWorkerGroupStore().get(user.id, body.groupId)?.workerIds || [] : [];
+  if(body.scope==='selected'){if(!Array.isArray(body.workerIds)||body.workerIds.some((id:any)=>typeof id!=='string'||!useWorkerStore().get(user.id,id)))throw createError({statusCode:400,statusMessage:'Selected workers must belong to the network owner'});}
+  const affected = body.scope === 'selected' ? body.workerIds || [] : body.scope === 'group' ? useWorkerGroupStore().get(user.id, body.groupId)?.workerIds || [] : useWorkerStore().listForUser(user.id).map(worker=>worker.id);
   await verifyWorkerMutationUnlocks(affected, body.lockPasswords);
-  const store = useManagedNetworkStore(); const network = await store.create(user.id, body.name, body.scope, body.scope === 'group' ? body.groupId : undefined);
+  const store = useManagedNetworkStore(); let network = await store.create(user.id, body.name, body.scope, body.scope === 'group' ? body.groupId : undefined); if(body.scope==='selected')network=await store.update(user.id,network.id,{workerIds:body.workerIds});
   try {
     const reconciliation = await useManagedNetworkManager().reconcile(network);
     if (reconciliation.partialFailures.length) throw new Error(reconciliation.partialFailures.join('; '));

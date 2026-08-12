@@ -25,6 +25,16 @@ test.describe.serial('Worker protection locks', () => {
     expect((await request.post(`/api/archived/${workerId}/unarchive`, { data: { lockPassword: password } })).status()).toBe(200);
   });
 
+  test('enforces the lock when managed-network membership changes indirectly', async ({ request }) => {
+    expect((await request.post('/api/managed-networks',{data:{name:`locked-all-${Date.now()}`,scope:'all'}})).status()).toBe(423);
+    const created=await request.post('/api/managed-networks',{data:{name:`locked-selected-${Date.now()}`,scope:'selected',workerIds:[workerId],lockPasswords:{[workerId]:password}}});
+    expect(created.status()).toBe(201);
+    const network=await created.json();
+    expect(network.workerIds).toEqual([workerId]);
+    expect((await request.patch(`/api/managed-networks/${network.id}`,{data:{scope:'selected',workerIds:[]}})).status()).toBe(423);
+    expect((await request.delete(`/api/managed-networks/${network.id}`,{data:{lockPasswords:{[workerId]:password}}})).status()).toBe(204);
+  });
+
   test('enforces the same lock on stop and restart lifecycle aliases', async ({ request }) => {
     expect((await request.post(`/api/containers/${workerId}/stop`, { data: {} })).status()).toBe(423);
     expect((await request.post(`/api/containers/${workerId}/stop`, { data: { lockPassword: password } })).status()).toBe(200);

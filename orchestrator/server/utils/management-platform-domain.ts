@@ -56,7 +56,8 @@ export class ManagementPlatformDomain {
         if (!group) throw error(400, "Group not found for network owner");
       }
       validateWorkers(ownerId, args.workerIds);
-      await verifyWorkerMutationUnlocks(strings(args.workerIds), args.lockPasswords);
+      const prospective={userId:ownerId,scope,groupId,workerIds:strings(args.workerIds)};
+      await verifyWorkerMutationUnlocks(await affectedWorkerIds(prospective), args.lockPasswords);
       const network = await store.create(ownerId, label, scope as any, groupId);
       if (scope === "selected")
         await store.update(ownerId, network.id, { workerIds: strings(args.workerIds) });
