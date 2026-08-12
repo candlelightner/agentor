@@ -41,7 +41,7 @@ All agents are installed in a single unified worker image. Start any agent via i
 - **Encrypted backup and restore** — manual or exact-minute scheduled multi-workspace backups, retention, retry/resume/cancel, integrity verification, safe original/new-worker restore, local/fake providers, and independently linked Google Drive OAuth (administrator-configured in the dashboard with a write-only encrypted client secret)
 - **Controlled custom images** — approved-base Dockerfile fragments and bounded uploaded contexts build asynchronously into immutable digest-pinned catalog versions with test workers, promotion/rollback, defaults, usage cleanup, and worker selection
 - **Git-backed image recovery** — optional public/private GitHub catalog sync with conflict preservation, fine-grained PAT or short-lived GitHub App authentication, branch/PR workflows, Actions dispatch, and immutable GHCR recovery references
-- **Administrative workspace and internal MCP** — a persistent red `ADMIN / ORCHESTRATOR` terminal/editor/desktop workspace, isolated management network, short-lived workload identity, live fail-closed tool policy, audited calls, and dashboard-approved immutable configuration proposals
+- **Administrative workspace and internal MCP** — a persistent red `ADMIN / ORCHESTRATOR` terminal/editor/desktop workspace, isolated management network, Codex auto-discovery with rotating short-lived workload identity, live fail-closed tool policy, audited calls, worker-console access, and optional dashboard review of immutable configuration proposals
 - **Centralized logging** — collects logs from all containers (orchestrator, workers, traefik) with NDJSON storage, log rotation, and a live-streaming log viewer in the dashboard
 - **Theme toggle** — switch between system default, light, and dark mode
 - **API docs** — auto-generated OpenAPI 3.1.0 spec with interactive Scalar UI at `/api/docs`
@@ -237,4 +237,8 @@ The storage mode is auto-detected from the mount type — no env var changes nee
 
 ## License
 
-MIT
+Agentor has mixed provenance. Upstream work remains MIT-licensed and retains
+its original notice; downstream Agentor-specific work is intended for Elastic
+License 2.0 where the applicable rights holder has authority to grant it.
+Previously released MIT grants are not revoked. See [LICENSING.md](LICENSING.md),
+[LICENSE](LICENSE), and [LICENSE-ELASTIC-2.0](LICENSE-ELASTIC-2.0).
