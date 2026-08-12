@@ -371,6 +371,61 @@ test.describe.serial("Internal management MCP security", () => {
     expect(names).not.toContain("console.open");
   });
 
+  test("MCP exposure and app tools share worker ownership, apply mappings, and obey live capability policy", async ({
+    request,
+  }) => {
+    // Both groups are off by default and deny all aliases before dispatch.
+    expect((await invoke(request, credential, "port-mappings.list")).status()).toBe(403);
+    expect((await invoke(request, credential, "apps.types")).status()).toBe(403);
+    expect(
+      (
+        await request.put("/api/admin/management-mcp/policy", {
+          data: { groups: { networking: true, apps: true } },
+        })
+      ).status(),
+    ).toBe(200);
+
+    const discovered = await request.post("/api/admin/management-mcp/diagnostics/list-tools", {
+      data: { credential },
+    });
+    const tools = await discovered.json();
+    expect(tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "port-mappings.create", annotations: expect.objectContaining({ readOnlyHint: false }) }),
+      expect.objectContaining({ name: "domain-mappings.list", annotations: expect.objectContaining({ readOnlyHint: true }) }),
+      expect.objectContaining({ name: "apps.stop", annotations: expect.objectContaining({ destructiveHint: true }) }),
+    ]));
+
+    const port = 35000 + Math.floor(Math.random() * 2000);
+    const created = await invoke(request, credential, "port-mappings.create", {
+      workerId: normalWorker,
+      externalPort: port,
+      internalPort: 8080,
+      type: "localhost",
+    });
+    expect(created.status()).toBe(200);
+    expect(await created.json()).toMatchObject({
+      externalPort: port,
+      workerId: normalWorker,
+      userId: regular.id,
+    });
+    const scoped = await invoke(request, credential, "port-mappings.list", { userId: regular.id });
+    expect(scoped.status()).toBe(200);
+    expect((await scoped.json())).toEqual(expect.arrayContaining([expect.objectContaining({ externalPort: port, workerId: normalWorker, userId: regular.id })]));
+    expect((await invoke(request, credential, "apps.types")).status()).toBe(200);
+    expect((await invoke(request, credential, "apps.list", { workerId: normalWorker })).status()).toBe(200);
+    expect((await invoke(request, credential, "port-mappings.delete", { externalPort: port })).status()).toBe(200);
+
+    expect(
+      (
+        await request.put("/api/admin/management-mcp/policy", {
+          data: { groups: { networking: false, apps: false } },
+        })
+      ).status(),
+    ).toBe(200);
+    expect((await invoke(request, credential, "port-mappings.list")).status()).toBe(403);
+    expect((await invoke(request, credential, "apps.types")).status()).toBe(403);
+  });
+
   test("MCP responses and errors never return existing secret values", async ({
     request,
   }) => {

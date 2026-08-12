@@ -28,6 +28,7 @@ import { workspaceMcpTools, executeWorkspaceMcpTool } from "./management-mcp-wor
 import { ManagementImageBackupDomain } from "./management-image-backup-domain";
 import { ManagementPlatformDomain } from "./management-platform-domain";
 import { ManagementConfigurationCatalogDomain } from "./management-configuration-catalog-domain";
+import { ManagementExposureDomain } from "./management-exposure-domain";
 
 const GROUPS = [
   "read-only-status",
@@ -42,6 +43,7 @@ const GROUPS = [
   "locks",
   "images",
   "networking",
+  "apps",
   "storage-maintenance",
   "catalogs",
   "exports",
@@ -55,6 +57,7 @@ const workerDomain = new ManagementWorkerDomain();
 const imageBackupDomain = new ManagementImageBackupDomain();
 const platformDomain = new ManagementPlatformDomain();
 const catalogDomain = new ManagementConfigurationCatalogDomain();
+const exposureDomain = new ManagementExposureDomain();
 interface Policy {
   schemaVersion: 1;
   default: "deny";
@@ -129,6 +132,7 @@ for (const tool of workspaceMcpTools) TOOL_GROUP[tool.name] = tool.group as Grou
 for (const tool of imageBackupDomain.tools()) TOOL_GROUP[tool.name] ??= tool.group;
 for (const tool of platformDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 for (const tool of catalogDomain.tools()) TOOL_GROUP[tool.name] = tool.group as Group;
+for (const tool of exposureDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 const sensitive =
   /secret|token|credential|password|authorization|cookie|cipher|key/i;
 function clean(value: unknown, depth = 0): any {
@@ -223,11 +227,12 @@ export class ManagementMcpStore {
       const imageBackup = imageBackupDomain.tools().find((tool) => tool.name === name);
       const platform = platformDomain.tools().find((tool) => tool.name === name);
       const catalog = catalogDomain.tools().find((tool) => tool.name === name);
+      const exposure = exposureDomain.tools().find((tool) => tool.name === name);
       return {
       name,
-      description: domain?.description || workspace?.description || imageBackup?.description || platform?.description || catalog?.description || `Agentor management tool (${TOOL_GROUP[name]})`,
-      inputSchema: domain?.inputSchema || workspace?.inputSchema || imageBackup?.inputSchema || platform?.inputSchema || catalog?.inputSchema || toolInputSchema(name),
-      annotations: domain?.annotations || workspace?.annotations || imageBackup?.annotations || platform?.annotations || catalog?.annotations || toolAnnotations(name),
+      description: domain?.description || workspace?.description || imageBackup?.description || platform?.description || catalog?.description || exposure?.description || `Agentor management tool (${TOOL_GROUP[name]})`,
+      inputSchema: domain?.inputSchema || workspace?.inputSchema || imageBackup?.inputSchema || platform?.inputSchema || catalog?.inputSchema || exposure?.inputSchema || toolInputSchema(name),
+      annotations: domain?.annotations || workspace?.annotations || imageBackup?.annotations || platform?.annotations || catalog?.annotations || exposure?.annotations || toolAnnotations(name),
     }});
   }
   async updatePolicy(groups: Record<string, unknown>, actor: string) {
@@ -454,6 +459,8 @@ export class ManagementMcpStore {
     if (platform.handled) return platform.result;
     const catalog = await catalogDomain.execute(name, args);
     if (catalog.handled) return catalog.result;
+    const exposure = await exposureDomain.execute(name, args);
+    if (exposure.handled) return exposure.result;
     if (workspaceMcpTools.some((tool) => tool.name === name))
       return executeWorkspaceMcpTool(name, args);
     const workerId = typeof args.workerId === "string" ? args.workerId : "";
