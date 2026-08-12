@@ -33,11 +33,14 @@ All agents are installed in a single unified worker image. Start any agent via i
 - **Volume mounts** — bind-mount host directories into workers
 - **Persistent workspaces** — workspace data survives container stops, restarts, and archiving via named Docker volumes
 - **Worker archiving** — archive workers to free resources while preserving workspace data; unarchive to restore
+- **Worker groups and managed networks** — organize related experiments, create all/group/selected-worker bridge networks, and keep the internal management network unavailable to ordinary workers
+- **Worker protection locks** — optional write-only per-worker passwords protect material changes, rebuilds, archive/unarchive, and deletion across UI, API, and MCP routes
 - **File upload/download** — upload files/folders to running workers or during creation, download workspace as `.tar.gz`
 - **Docker-in-Docker** — opt-in per-environment, full Docker daemon inside workers (build, run, compose)
 - **Usage monitoring** — real-time usage/rate limit indicators for OAuth-authenticated agents (Claude, Codex, Gemini)
 - **Per-worker resource monitoring** — live CPU / RAM / disk / network metrics on each worker card, sourced entirely from the Docker API (OS-independent)
 - **Durable worker export/import** — background jobs with progress, cancellation, expiry, and browser-streamed downloads produce portable `.tar` bundles; workspace-only is fast/default and rootfs capture is an explicit advanced option
+- **Storage visibility and cleanup** — administrator disk inventory covers workspace, images, cache, staging, and helpers, with conservative cleanup that preserves referenced images, active jobs, workspaces, and retained artifacts
 - **Encrypted backup and restore** — manual or exact-minute scheduled multi-workspace backups, retention, retry/resume/cancel, integrity verification, safe original/new-worker restore, local/fake providers, and independently linked Google Drive OAuth (administrator-configured in the dashboard with a write-only encrypted client secret)
 - **Controlled custom images** — approved-base Dockerfile fragments and bounded uploaded contexts build asynchronously into immutable digest-pinned catalog versions with test workers, promotion/rollback, defaults, usage cleanup, and worker selection
 - **Git-backed image recovery** — optional public/private GitHub catalog sync with conflict preservation, fine-grained PAT or short-lived GitHub App authentication, branch/PR workflows, Actions dispatch, and immutable GHCR recovery references

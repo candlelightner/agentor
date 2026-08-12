@@ -13,7 +13,18 @@ async function mockManagementMcp(page: Page) {
       logs: { enabled: true },
       "volume-browsing": { enabled: true },
       "configuration-inspection": { enabled: true },
+      storage: { enabled: false },
+      "running-files": { enabled: false },
       "worker-lifecycle": { enabled: false },
+      console: { enabled: false },
+      configuration: { enabled: false },
+      groups: { enabled: false },
+      locks: { enabled: false },
+      images: { enabled: false },
+      networking: { enabled: false },
+      apps: { enabled: false },
+      "storage-maintenance": { enabled: false },
+      catalogs: { enabled: false },
       exports: { enabled: false },
       backups: { enabled: false },
       "image-builds": { enabled: false },
@@ -97,6 +108,10 @@ test("shows internal-only fail-closed policy, effective source, and current deci
   await expect(modal.getByLabel("Allow logs")).toBeChecked();
   await expect(modal.getByLabel("Allow volume-browsing")).toBeChecked();
   await expect(modal.getByLabel("Allow worker-lifecycle")).not.toBeChecked();
+  await expect(modal.getByLabel("Allow networking")).not.toBeChecked();
+  await expect(modal).toContainText("Manage worker networks and port or domain mappings");
+  await expect(modal).toContainText("Manage files in a running worker workspace");
+  await expect(modal.getByText("Mutating")).toHaveCount(17);
 });
 
 test("updates live group policy explicitly while preserving default deny", async ({

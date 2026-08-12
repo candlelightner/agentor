@@ -34,6 +34,12 @@ or an interactive third-party login into a live-account verification.
 | Worker apps | Apps pane; `/api/containers/:id/apps/*` | `apps.types`, `apps.list`, `apps.start`, `apps.stop` | `admin-management-mcp.spec.ts` plus app API/type suites |
 | Storage visibility and conservative cleanup | Storage modal; `/api/admin/storage` | `storage.status`, `storage.cleanup` | Storage visibility API/UI tests; cleanup is intentionally restricted to named conservative actions |
 | MCP policy, tool discovery, audit | Management MCP modal/admin APIs | Policy is administered by dashboard APIs; agent sees only enabled tools through MCP discovery | `management-mcp.spec.ts`, `admin-management-mcp.spec.ts`; disabled groups are absent and calls fail closed |
+| Account profile, password, passkeys, global environment variables, SSH key, agent-credential reset | Account modal; `/api/account/*` and auth routes | No MCP equivalent | Deliberate current exclusion: these are personal identity/account-credential controls rather than administrative worker management; secret values remain non-retrievable |
+| User administration | Users modal; `/api/auth/admin/*` | No MCP equivalent | Deliberate current exclusion pending a dedicated user-administration authority model |
+| GitHub repository discovery/create/branches | Repository picker; `/api/github/*` | No MCP equivalent | Deliberate current exclusion; Git provider credentials are not exposed to the MCP |
+| Usage and per-worker metrics | Usage cards; `/api/usage/*`, `/api/worker-metrics/*` | No MCP equivalent | Current limitation: status inspection does not include rate-limit refresh or live metrics tools |
+| Orchestrator image updates | System UI; `/api/updates/*` | No MCP equivalent | Deliberate current exclusion: update/apply is an installation-level operation |
+| Clipboard and tmux pane management | Worker UI; clipboard and `/api/containers/:id/panes/*` | No MCP equivalent | Current limitation: MCP console exposes the selected worker's existing tmux session only |
 
 ## Deliberate boundaries and remaining gaps
 
@@ -55,6 +61,9 @@ or an interactive third-party login into a live-account verification.
   separate MCP tools.** The agent can inspect/reconcile managed topology and
   use a target worker console, but it cannot request an unrestricted network or
   host probe.
+- **Account, user administration, GitHub, metrics, updates, clipboard, and
+  tmux-pane controls have no MCP equivalents today.** They are listed above so
+  absence is explicit rather than mistaken for parity.
 
 ## Capability policy and harness confirmation
 
