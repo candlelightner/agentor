@@ -508,10 +508,16 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
         );
       }
     }
+    const base = `${this.config.workerImagePrefix}${this.config.workerImage}`;
+    await useDockerService().ensureImage(base);
+    const baseDigest = normalizeDigest(
+      (await this.docker.getImage(base).inspect()).Id,
+      base,
+    );
     if (!force) {
       try {
         const existing = await this.docker.getImage(this.image).inspect();
-        if (isTrustedOverlay(existing))
+        if (isTrustedOverlay(existing) && existing.Config?.Labels?.["agentor.admin.base"] === baseDigest)
           return {
             name: this.image,
             digest: normalizeDigest(existing.Id, this.image),
@@ -522,12 +528,6 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
         if (error?.statusCode !== 404) throw error;
       }
     }
-    const base = `${this.config.workerImagePrefix}${this.config.workerImage}`;
-    await useDockerService().ensureImage(base);
-    const baseDigest = normalizeDigest(
-      (await this.docker.getImage(base).inspect()).Id,
-      base,
-    );
     // Dockerfile FROM does not reliably resolve a raw local image ID as a
     // build stage. Give that immutable ID a private digest-derived tag; unlike
     // the configured mutable base tag, this name cannot select different
