@@ -11,12 +11,14 @@ defineRouteMeta({
 });
 import { requireAuth } from "../../../../utils/auth-helpers";
 import { useBackupManager } from "../../../../utils/backup-manager";
+import { useGoogleBackupOAuthConfigStore } from "../../../../utils/google-backup-oauth-config";
 export default defineEventHandler(async (e) => {
   const u = requireAuth(e).user,
     b = await readBody<{ redirectUri?: string }>(e);
   const fakeAllowed = process.env.NODE_ENV !== "production" || process.env.ALLOW_FAKE_BACKUP_PROVIDER === "true";
-  const clientId = process.env.GOOGLE_BACKUP_CLIENT_ID || (fakeAllowed ? "fake-test-client" : "");
-  const redirectUri = process.env.GOOGLE_BACKUP_REDIRECT_URI || (fakeAllowed ? b?.redirectUri : "") || "";
+  const installation = await useGoogleBackupOAuthConfigStore().credentials();
+  const clientId = installation?.clientId || process.env.GOOGLE_BACKUP_CLIENT_ID || (fakeAllowed ? "fake-test-client" : "");
+  const redirectUri = installation?.redirectUri || process.env.GOOGLE_BACKUP_REDIRECT_URI || (fakeAllowed ? b?.redirectUri : "") || "";
   if (!clientId || !redirectUri) throw createError({ statusCode: 503, statusMessage: "Google Drive backup OAuth is not configured" });
   const x = await useBackupManager().beginGoogleOAuth(u.id, clientId, redirectUri);
   return {

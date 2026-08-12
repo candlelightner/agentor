@@ -221,6 +221,13 @@ export class GoogleDriveBackupProvider implements BackupProvider {
       userId: string,
       token: GoogleDriveToken,
     ) => Promise<void>,
+    private getOAuthCredentials: () => Promise<
+      { clientId: string; clientSecret: string } | undefined
+    > = async () => {
+      const clientId = process.env.GOOGLE_BACKUP_CLIENT_ID || "";
+      const clientSecret = process.env.GOOGLE_BACKUP_CLIENT_SECRET || "";
+      return clientId && clientSecret ? { clientId, clientSecret } : undefined;
+    },
     private transport: BackupHttpTransport = fetch,
     private retryDelay: (
       milliseconds: number,
@@ -236,9 +243,8 @@ export class GoogleDriveBackupProvider implements BackupProvider {
       return token.access_token;
     if (!token.refresh_token)
       throw new Error("Google Drive backup account is not linked");
-    const clientId = process.env.GOOGLE_BACKUP_CLIENT_ID || "";
-    const clientSecret = process.env.GOOGLE_BACKUP_CLIENT_SECRET || "";
-    if (!clientId || !clientSecret)
+    const credentials = await this.getOAuthCredentials();
+    if (!credentials)
       throw new Error("Google Drive backup OAuth is not configured");
     const response = await this.transport(
       "https://oauth2.googleapis.com/token",
@@ -246,8 +252,8 @@ export class GoogleDriveBackupProvider implements BackupProvider {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
-          client_id: clientId,
-          client_secret: clientSecret,
+          client_id: credentials.clientId,
+          client_secret: credentials.clientSecret,
           refresh_token: token.refresh_token,
           grant_type: "refresh_token",
         }),

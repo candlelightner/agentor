@@ -7,6 +7,14 @@ export interface BackupProviderStatus {
   testMode?: boolean;
   tokenEncrypted?: boolean;
 }
+export interface GoogleBackupOAuthInstallationStatus {
+  configured: boolean;
+  source: "installation" | "environment" | "none";
+  clientId?: string;
+  redirectUri?: string;
+  clientSecretConfigured: boolean;
+  updatedAt?: string;
+}
 export interface BackupSettings {
   providerId: string;
   enabled: boolean;
@@ -51,7 +59,8 @@ const message = (e: any, fallback: string) =>
 export function useBackups() {
   const artifacts = ref<BackupArtifact[]>([]),
     jobs = ref<BackupJob[]>([]),
-    providers = ref<BackupProviderStatus[]>([]);
+    providers = ref<BackupProviderStatus[]>([]),
+    googleOAuthInstallation = ref<GoogleBackupOAuthInstallationStatus | null>(null);
   const settings = ref<BackupSettings>({
     providerId: "local",
     enabled: false,
@@ -87,6 +96,14 @@ export function useBackups() {
       jobs.value = data.jobs;
       providers.value = providerData;
       settings.value = settingsData;
+      try {
+        googleOAuthInstallation.value = await $fetch<GoogleBackupOAuthInstallationStatus>(
+          "/api/admin/backup-providers/google-oauth",
+        );
+      } catch {
+        // Installation OAuth configuration is intentionally administrator-only.
+        googleOAuthInstallation.value = null;
+      }
     } catch (e) {
       error.value = message(e, "Could not load backup management.");
     } finally {
@@ -165,6 +182,17 @@ export function useBackups() {
     );
     location.assign(result.authorizationUrl);
   }
+  async function configureGoogleInstallation(input: {
+    clientId: string;
+    redirectUri: string;
+    clientSecret: string;
+  }) {
+    googleOAuthInstallation.value = await $fetch<GoogleBackupOAuthInstallationStatus>(
+      "/api/admin/backup-providers/google-oauth",
+      { method: "PUT", body: input },
+    );
+    return googleOAuthInstallation.value;
+  }
   async function disconnectGoogle() {
     await $fetch("/api/backup-providers/google", { method: "DELETE" });
     await refresh();
@@ -173,6 +201,7 @@ export function useBackups() {
     artifacts,
     jobs,
     providers,
+    googleOAuthInstallation,
     settings,
     activeJobs,
     loading,
@@ -186,6 +215,7 @@ export function useBackups() {
     restore,
     remove,
     linkGoogle,
+    configureGoogleInstallation,
     disconnectGoogle,
   };
 }

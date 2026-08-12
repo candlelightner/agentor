@@ -1128,7 +1128,7 @@ The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/ap
 
 - Worker-local variables, masked secrets, and secret files follow orchestrator → user → environment → worker precedence. Secrets are encrypted at rest, delivered over exec stdin, and materialized in tmpfs without entering Docker Env, exports, clones, backups, logs, or API responses.
 - Backups support manual/all/selected exact-minute schedules, durable next-run state, multi-workspace encrypted bundles, retention deletion tombstones, progress, cancellation, same-ciphertext resumable retry, integrity verification, archived workspaces, rollback-clean new restores, and stopped-original staged restore.
-- Providers include local, gated deterministic fake, and production Google Drive with independent OAuth state, encrypted tokens, refresh, chunked resumable upload, disconnect, download, and delete.
+- Providers include local, gated deterministic fake, and production Google Drive with independent OAuth state, encrypted tokens, refresh, chunked resumable upload, disconnect, download, and delete. Administrators can configure the installation Google OAuth client in Backup management; its client secret is write-only and encrypted at rest, while existing `GOOGLE_BACKUP_*` environment variables remain a backward-compatible fallback.
 
 #### 26.2.3 Controlled and Git-backed images
 

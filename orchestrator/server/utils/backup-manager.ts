@@ -39,6 +39,7 @@ import {
 import { packWorkspaceBackups, unpackWorkspaceBackups } from "./backup-bundle";
 import { extractBundle } from "./worker-export";
 import { replaceStoppedWorkspace } from "./backup-restore-helper";
+import { useGoogleBackupOAuthConfigStore } from "./google-backup-oauth-config";
 import Docker from "dockerode";
 import {
   useDockerService,
@@ -86,6 +87,13 @@ export class BackupManager {
       new GoogleDriveBackupProvider(
         (userId) => this.loadGoogleToken(userId),
         (userId, token) => this.saveGoogleToken(userId, token),
+        async () => {
+          const credentials = await useGoogleBackupOAuthConfigStore().credentials();
+          return credentials && {
+            clientId: credentials.clientId,
+            clientSecret: credentials.clientSecret,
+          };
+        },
       ),
     ],
   ]);
@@ -1008,8 +1016,8 @@ export class BackupManager {
         expires_at: Date.now() + 3600_000,
       };
     } else {
-      const clientSecret = process.env.GOOGLE_BACKUP_CLIENT_SECRET || "";
-      if (!google.clientId || !clientSecret || !google.redirectUri)
+      const credentials = await useGoogleBackupOAuthConfigStore().credentials();
+      if (!google.clientId || !credentials?.clientSecret || !google.redirectUri)
         throw new Error("Google Drive backup OAuth is not configured");
       let previousToken: GoogleDriveToken | undefined;
       if (google.token) {
@@ -1024,7 +1032,7 @@ export class BackupManager {
       token = await exchangeGoogleAuthorizationCode({
         code,
         clientId: google.clientId,
-        clientSecret,
+        clientSecret: credentials.clientSecret,
         redirectUri: google.redirectUri,
         previousToken,
       });

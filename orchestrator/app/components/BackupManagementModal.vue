@@ -2,6 +2,7 @@
 const open = defineModel<boolean>("open", { default: false });
 const emit = defineEmits<{ changed: []; restored: [jobId: string] }>();
 const api = useBackups(),
+  { isAdmin } = useAuth(),
   draft = reactive({
     providerId: "local",
     enabled: false,
@@ -16,6 +17,7 @@ const busy = ref(""),
   restoreName = ref(""),
   confirmOverwrite = ref(false),
   actionError = ref("");
+const googleDraft = reactive({ clientId: "", redirectUri: "", clientSecret: "" });
 watch(open, async (shown) => {
   if (shown) {
     await api.refresh();
@@ -62,6 +64,12 @@ async function backup() {
   await run("backup", async () => {
     await api.startBackup(draft.selection, workspaceIds());
     emit("changed");
+  });
+}
+async function configureGoogle() {
+  await run("google-config", async () => {
+    await api.configureGoogleInstallation({ ...googleDraft });
+    googleDraft.clientSecret = "";
   });
 }
 async function restore() {
@@ -206,6 +214,26 @@ function cancelRestore() {
               >Disconnect Google Drive</UButton
             >
           </div>
+          <section
+            v-if="isAdmin && api.providers.value.some((p) => p.type === 'google-drive')"
+            class="rounded border bg-gray-50 p-3 space-y-2 dark:bg-gray-900"
+            data-testid="google-oauth-installation"
+          >
+            <div>
+              <h4 class="text-sm font-medium">Google Drive OAuth installation</h4>
+              <p class="text-xs text-gray-500">
+                {{ api.googleOAuthInstallation.value?.configured
+                  ? `Configured from ${api.googleOAuthInstallation.value.source}. Client secret is write-only.`
+                  : "Configure this installation before linking Google Drive. The client secret is write-only and encrypted at rest." }}
+              </p>
+            </div>
+            <div class="grid gap-2 md:grid-cols-3">
+              <label class="text-xs">Client ID<input v-model="googleDraft.clientId" class="block w-full border rounded p-2" autocomplete="off" /></label>
+              <label class="text-xs">Redirect URI<input v-model="googleDraft.redirectUri" class="block w-full border rounded p-2" placeholder="https://…/api/backup-providers/google/oauth/callback" /></label>
+              <label class="text-xs">Client secret<input v-model="googleDraft.clientSecret" type="password" class="block w-full border rounded p-2" autocomplete="new-password" /></label>
+            </div>
+            <UButton size="xs" :loading="busy === 'google-config'" @click="configureGoogle">Save Google OAuth configuration</UButton>
+          </section>
           <label v-if="draft.selection === 'selected'"
             >Workspace IDs (comma separated)<input
               v-model="draft.workspaceText"
