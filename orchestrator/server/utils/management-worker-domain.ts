@@ -2,12 +2,13 @@ import type { CreateContainerRequest, UpdateContainerSettingsRequest } from "../
 import {
   useContainerManager,
   useImageCatalogManager,
+  useManagedNetworkStore,
   useWorkerGroupStore,
   useWorkerStore,
 } from "./services";
 import { useWorkerConfigStore } from "./worker-config-store";
 import { workerConfigurationResponse } from "./worker-config-response";
-import { useWorkerProtectionLockStore } from "./worker-protection-lock";
+import { useWorkerProtectionLockStore, verifyWorkerMutationUnlocks } from "./worker-protection-lock";
 import { findWorkspaceInventory } from "./workspace-inventory";
 import { OfflineWorkspaceAccess } from "./workspace-access";
 
@@ -100,7 +101,7 @@ export class ManagementWorkerDomain {
     const group=store.findById(required(args.groupId,"groupId")); if(!group) throw status(404,"Worker group not found");
     if(name==="groups.delete") { await store.remove(group.userId,group.id); return {id:group.id,deleted:true}; }
     const patch:{name?:string;workerIds?:string[]}={}; if(args.name!==undefined){const label=required(args.name,"name").trim();if(!label||label.length>100)throw status(400,"Invalid group name");patch.name=label;}
-    if(args.workerIds!==undefined){const ids=strings(args.workerIds,"workerIds");for(const id of ids){const worker=useWorkerStore().findById(id);if(!worker||worker.userId!==group.userId)throw status(400,"All workers must belong to group owner");}patch.workerIds=ids;}
+    if(args.workerIds!==undefined){const ids=strings(args.workerIds,"workerIds");for(const id of ids){const worker=useWorkerStore().findById(id);if(!worker||worker.userId!==group.userId)throw status(400,"All workers must belong to group owner");}if(useManagedNetworkStore().listForUser(group.userId).some(network=>network.scope==="group"&&network.groupId===group.id))await verifyWorkerMutationUnlocks([...group.workerIds,...ids],args.lockPasswords);patch.workerIds=ids;}
     return store.update(group.userId,group.id,patch);
   }
 }
