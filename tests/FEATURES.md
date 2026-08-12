@@ -2,6 +2,10 @@
 
 Every user-facing feature of the Agentor web dashboard, organized by category. This document drives the Playwright test suite — every item below must have test coverage.
 
+## Worker groups
+
+- Per-user worker groups can be created, renamed, deleted without deleting member workers, and assigned workers owned by the same user. The dashboard’s **Worker groups** action provides membership editing; the API is `/api/worker-groups`.
+
 ---
 
 ## 0. Authentication & Authorization

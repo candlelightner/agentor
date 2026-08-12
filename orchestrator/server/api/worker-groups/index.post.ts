@@ -1,0 +1,3 @@
+defineRouteMeta({ openAPI: { tags: ['Worker groups'], summary: 'Create worker group', operationId: 'createWorkerGroup', responses: { 201: { description: 'Created group' }, 400: { description: 'Invalid name' } } } });
+import { requireAuth } from '../../utils/auth-helpers'; import { useWorkerGroupStore } from '../../utils/services';
+export default defineEventHandler(async (event) => { const { user } = requireAuth(event); const { name } = await readBody(event); if (typeof name !== 'string' || !name.trim() || name.trim().length > 100) throw createError({ statusCode: 400, statusMessage: 'A group name of at most 100 characters is required' }); setResponseStatus(event, 201); return useWorkerGroupStore().create(user.id, name); });

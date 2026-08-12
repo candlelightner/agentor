@@ -1,4 +1,4 @@
-import { useConfig, useDockerService, useContainerManager, usePortMappingStore, useDomainMappingStore, useTraefikManager, useEnvironmentStore, useWorkerStore, useUpdateChecker, useUsageChecker, useResourceMonitor, useUserCredentialManager, useUserEnvStore, useOrphanSweeper, useStorageManager, useCapabilityStore, useInstructionStore, useInitScriptStore, useLogStore, useLogger, useLogCollector, useExportJobManager } from '../utils/services';
+import { useConfig, useDockerService, useContainerManager, usePortMappingStore, useDomainMappingStore, useTraefikManager, useEnvironmentStore, useWorkerStore, useWorkerGroupStore, useUpdateChecker, useUsageChecker, useResourceMonitor, useUserCredentialManager, useUserEnvStore, useOrphanSweeper, useStorageManager, useCapabilityStore, useInstructionStore, useInitScriptStore, useLogStore, useLogger, useLogCollector, useExportJobManager } from '../utils/services';
 import { loadBuiltInCapabilities, loadBuiltInInstructions, loadBuiltInInitScripts, loadBuiltInEnvironments } from '../utils/built-in-content';
 import { migrateAuth, getAuthDb } from '../utils/auth';
 import { cleanupWorkspaceHelpers } from '../utils/workspace-access';
@@ -93,6 +93,7 @@ export default defineNitroPlugin(async (nitroApp) => {
       await initScriptStore.seedBuiltIns(await loadBuiltInInitScripts());
     })(),
     workerStore.init(),
+    useWorkerGroupStore().init(),
     portMappingStore.init(),
     domainMappingStore.init(),
     useExportJobManager().init(),

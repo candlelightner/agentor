@@ -4,13 +4,15 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **1512 tests** across 121 test files (950 API across 69 files + 562 UI across 52 files)
+- **1515 tests** across 123 test files (952 API across 70 files + 563 UI across 53 files)
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
 - Parallel execution with up to 8 workers (configurable)
 - All tests independent and self-cleaning
 - **All tests run pre-authenticated as an admin user** via Playwright's `globalSetup` (see `tests/global-setup.ts`). The session cookies are saved to `tests/.auth/admin-api.json` and `tests/.auth/admin-ui.json`, referenced by the API and UI project `storageState` respectively.
+
+Worker-group coverage is in `api/worker-groups.spec.ts` (2 API tests) and `ui/worker-groups.spec.ts` (1 UI test): CRUD, owner-scoped membership validation, and deletion that retains workers.
 
 ## Prerequisites
 

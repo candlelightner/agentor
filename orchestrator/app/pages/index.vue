@@ -46,6 +46,7 @@ const showBackupManagementModal = ref(false);
 const showImageCatalogModal = ref(false);
 const showAdminWorkspaceModal = ref(false);
 const showManagementMcpModal = ref(false);
+const showWorkerGroupsModal = ref(false);
 const showEnvironmentsModal = ref(false);
 const showCapabilitiesModal = ref(false);
 const showInstructionsModal = ref(false);
@@ -259,6 +260,7 @@ function onCreateModalClosed() {
       @open-image-catalog="showImageCatalogModal = true"
       @open-admin-workspace="showAdminWorkspaceModal = true"
       @open-management-mcp="showManagementMcpModal = true"
+      @manage-worker-groups="showWorkerGroupsModal = true"
       @manage-environments="showEnvironmentsModal = true"
       @manage-capabilities="showCapabilitiesModal = true"
       @manage-instructions="showInstructionsModal = true"
@@ -345,6 +347,7 @@ function onCreateModalClosed() {
       @service="handleAdminService"
     />
     <ManagementMcpModal v-model:open="showManagementMcpModal" />
+    <WorkerGroupsModal v-model:open="showWorkerGroupsModal" :containers="containers" />
 
     <EnvironmentsModal v-model:open="showEnvironmentsModal" />
 

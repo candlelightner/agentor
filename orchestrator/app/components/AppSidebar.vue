@@ -21,6 +21,7 @@ const emit = defineEmits<{
   openImageCatalog: [];
   openAdminWorkspace: [];
   openManagementMcp: [];
+  manageWorkerGroups: [];
   manageEnvironments: [];
   manageCapabilities: [];
   manageInstructions: [];
@@ -371,6 +372,7 @@ function isContainerActive(
           Image catalog
         </UButton>
       </div>
+      <UButton class="w-full mt-2" color="neutral" variant="outline" size="sm" icon="i-lucide-folder-kanban" @click="emit('manageWorkerGroups')">Worker groups</UButton>
       <div
         v-if="isAdmin"
         class="mt-2 overflow-hidden rounded-lg border-2 border-red-600 bg-red-950 text-red-50 shadow-sm"

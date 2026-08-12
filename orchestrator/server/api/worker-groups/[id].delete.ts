@@ -1,0 +1,3 @@
+defineRouteMeta({ openAPI: { tags: ['Worker groups'], summary: 'Delete worker group', description: 'Deletes only the group; member workers are retained.', operationId: 'deleteWorkerGroup' } });
+import { requireResourceAccess } from '../../utils/auth-helpers'; import { useWorkerGroupStore } from '../../utils/services';
+export default defineEventHandler(async (event) => { const id=getRouterParam(event,'id')!, store=useWorkerGroupStore(), group=store.findById(id); requireResourceAccess(event,group,{allowGlobal:false}); await store.remove(group!.userId,id); setResponseStatus(event,204); return null; });
