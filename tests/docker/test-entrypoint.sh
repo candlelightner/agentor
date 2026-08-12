@@ -7,6 +7,15 @@
 # run all tests, a single file, or pass --project=api, etc.
 set -euo pipefail
 
+# The inner Docker data volume is intentionally persistent for build cache but
+# cannot be opened by two dockerd processes. Hold a volume-scoped lock for the
+# entire run and fail clearly instead of racing/corrupting containerd metadata.
+exec 9>/var/lib/docker/.agentor-test-runner.lock
+if ! flock -n 9; then
+    echo -e '\033[1;31m[test-runner]\033[0m Another isolated test runner is already using the Docker cache volume.' >&2
+    exit 1
+fi
+
 log() { echo -e "\033[1;36m[test-runner]\033[0m $*"; }
 err() { echo -e "\033[1;31m[test-runner]\033[0m $*" >&2; }
 
