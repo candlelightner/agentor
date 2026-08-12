@@ -1,11 +1,11 @@
 import type { CreateContainerRequest, UpdateContainerSettingsRequest } from "../../shared/types";
 import {
   useContainerManager,
-  useImageCatalogManager,
   useManagedNetworkStore,
   useWorkerGroupStore,
   useWorkerStore,
 } from "./services";
+import { useImageCatalogManager } from "./image-catalog";
 import { useWorkerConfigStore } from "./worker-config-store";
 import { workerConfigurationResponse } from "./worker-config-response";
 import { useWorkerProtectionLockStore, verifyWorkerMutationUnlocks } from "./worker-protection-lock";
