@@ -7,6 +7,7 @@ import {
 } from "@playwright/test";
 import { ApiClient } from "../helpers/api-client";
 import { createWorker, cleanupWorker } from "../helpers/worker-lifecycle";
+import { captureCommandOutput } from "../helpers/terminal-ws";
 import {
   createTestUser,
   deleteTestUser,
@@ -150,6 +151,56 @@ test.describe.serial("Internal management MCP security", () => {
     });
     expect(network.members).toHaveLength(2);
   });
+
+  test("an ordinary worker has no TCP route to the management MCP listener", async () => {
+    // This deliberately attempts a TCP connection rather than asserting DNS or
+    // Docker metadata alone. A normal worker can resolve the orchestrator for
+    // its ordinary API, but port 3099 is bound solely to its management-network
+    // address and must not be reachable through that worker-facing route.
+    const output = await captureCommandOutput(
+      normalWorker,
+      `node -e 'const net=require("net"); const socket=net.connect({host:"agentor-orchestrator",port:3099}); const done=(value)=>{console.log(value); process.exit(0)}; socket.setTimeout(2500,()=>done("TCP_DENIED_TIMEOUT")); socket.on("connect",()=>{console.log("TCP_UNEXPECTEDLY_CONNECTED"); process.exit(1)}); socket.on("error",()=>done("TCP_DENIED"));'`,
+      15_000,
+    );
+    expect(output).toMatch(/TCP_DENIED/);
+    expect(output).not.toContain("TCP_UNEXPECTEDLY_CONNECTED");
+  });
+
+  test("the administrative Codex stdio bridge discovers only enabled MCP tools across credential rotation", async () => {
+    const requests = [
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+      '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}',
+    ];
+    const invokeProxy = () =>
+      captureCommandOutput(
+        adminWorkspaceId,
+        `printf '%s\\n' ${requests.map((line) => `'${line}'`).join(" ")} | /usr/local/bin/agentor-management-mcp`,
+        20_000,
+      );
+
+    const config = await captureCommandOutput(
+      adminWorkspaceId,
+      "grep -A1 '^\\[mcp_servers\\.agentor-management\\]$' /home/agent/.codex/config.toml",
+    );
+    expect(config).toContain("[mcp_servers.agentor-management]");
+    expect(config).toContain('command = "/usr/local/bin/agentor-management-mcp"');
+
+    const first = await invokeProxy();
+    expect(first).toContain('"id":1');
+    expect(first).toContain('"agentor-management"');
+    expect(first).toContain('"id":2');
+    expect(first).toContain("status.system");
+    expect(first).not.toContain("worker.stop");
+
+    // The runtime replaces the tmpfs identity every 45 seconds. A second
+    // request after that boundary proves the bridge reads the credential file
+    // for each request instead of retaining an expiring bearer in Codex.
+    await new Promise((resolve) => setTimeout(resolve, 47_000));
+    const rotated = await invokeProxy();
+    expect(rotated).toContain('"agentor-management"');
+    expect(rotated).toContain("status.system");
+    expect(rotated).not.toContain("worker.stop");
+  }, 90_000);
 
   test("workspace identity is short-lived, workspace-bound, and not persisted in workspace storage", async ({
     request,
@@ -399,7 +450,7 @@ test.describe.serial("Internal management MCP security", () => {
     ).toBe(404);
   });
 
-  test("authorized harnesses may apply immutable proposals without mandatory dashboard approval", async ({
+  test("authorized harnesses may apply immutable proposals without a dashboard approval gate", async ({
     request,
   }) => {
     await request.put("/api/admin/management-mcp/policy", {
