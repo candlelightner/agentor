@@ -163,19 +163,29 @@ async function handleUpdate(
   id: string,
   patch: UpdateContainerSettingsRequest,
   rebuild: boolean,
+  complete: (error?: string) => void,
 ) {
-  const updated = await updateContainerSettings(id, patch);
-  // Open tab labels are captured at open time — refresh them in place when the
-  // display name (a live edit) changed.
-  if (patch.displayName && updated) {
-    renameContainerTabs(id, updated.displayName || patch.displayName);
-  }
-  // Rebuild-requiring edits only take effect after a rebuild. When the user
-  // chose "Save & Rebuild", apply them now (no confirm — the choice is explicit).
-  if (rebuild) {
-    closeTabsForContainer(id);
-    const rebuilt = await rebuildContainer(id);
-    if (rebuilt) handleOpenTab(rebuilt.id, "terminal");
+  try {
+    const updated = await updateContainerSettings(id, patch);
+    // Open tab labels are captured at open time — refresh them in place when the
+    // display name (a live edit) changed.
+    if (patch.displayName && updated) {
+      renameContainerTabs(id, updated.displayName || patch.displayName);
+    }
+    // Rebuild-requiring edits only take effect after a rebuild. When the user
+    // chose "Save & Rebuild", apply them now (no confirm — the choice is explicit).
+    if (rebuild) {
+      closeTabsForContainer(id);
+      const rebuilt = await rebuildContainer(id);
+      if (rebuilt) handleOpenTab(rebuilt.id, "terminal");
+    }
+    complete();
+  } catch (error: any) {
+    complete(
+      error?.data?.statusMessage ||
+        error?.data?.message ||
+        "Could not update worker settings.",
+    );
   }
 }
 

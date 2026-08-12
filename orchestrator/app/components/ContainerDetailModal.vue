@@ -10,7 +10,12 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  update: [id: string, patch: UpdateContainerSettingsRequest, rebuild: boolean];
+  update: [
+    id: string,
+    patch: UpdateContainerSettingsRequest,
+    rebuild: boolean,
+    complete: (error?: string) => void,
+  ];
   rebuild: [id: string];
 }>();
 
@@ -104,10 +109,22 @@ function buildPatch(): UpdateContainerSettingsRequest {
   } as UpdateContainerSettingsRequest;
 }
 
+const saving = ref(false);
+const settingsError = ref('');
+
 function save(rebuild: boolean) {
-  if (!canSave.value) return;
-  emit('update', props.container.id, buildPatch(), rebuild);
-  open.value = false;
+  if (!canSave.value || saving.value) return;
+  saving.value = true;
+  settingsError.value = '';
+  emit('update', props.container.id, buildPatch(), rebuild, (error) => {
+    saving.value = false;
+    if (error) {
+      settingsError.value = error;
+      return;
+    }
+    lockCurrentPassword.value = '';
+    open.value = false;
+  });
 }
 
 function rebuildNow() {
@@ -167,6 +184,8 @@ async function loadDetails() {
 
 watch(open, (isOpen) => {
   if (isOpen) {
+    saving.value = false;
+    settingsError.value = '';
     resetFormFromContainer();
     loadDetails();
   }
@@ -327,14 +346,17 @@ const formattedCreatedAt = computed(() => {
             </div>
 
             <!-- Save actions -->
+            <p v-if="settingsError" role="alert" class="text-xs text-red-500">
+              {{ settingsError }}
+            </p>
             <div class="flex items-center gap-2 pt-1">
-              <UButton :disabled="!canSave" @click="save(false)">Save</UButton>
+              <UButton :disabled="!canSave || saving" :loading="saving" @click="save(false)">Save</UButton>
               <UButton
                 v-if="rebuildDirty"
                 color="warning"
                 variant="solid"
                 icon="i-lucide-hammer"
-                :disabled="!canSave"
+                :disabled="!canSave || saving"
                 @click="save(true)"
               >
                 Save &amp; Rebuild

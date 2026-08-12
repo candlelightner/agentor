@@ -140,11 +140,15 @@ test.describe.serial('Worker Settings Modal', () => {
 
     await lock.getByLabel('Current lock password').fill(password);
     await dialog.getByRole('button', { name: 'Save', exact: true }).click();
-    await expect(dialog.getByPlaceholder('Worker label')).toHaveValue(renamed);
+    await expect(dialog).toBeHidden();
 
-    await lock.getByLabel('Current lock password').fill(password);
-    await lock.getByRole('button', { name: 'Remove protection' }).click();
-    await expect(lock).toContainText('off');
+    displayName = renamed;
+    const reopened = await openModal(page);
+    await expect(reopened.getByPlaceholder('Worker label')).toHaveValue(renamed);
+    const reopenedLock = reopened.locator('[data-testid="worker-protection-lock"]');
+    await reopenedLock.getByLabel('Current lock password').fill(password);
+    await reopenedLock.getByRole('button', { name: 'Remove protection' }).click();
+    await expect(reopenedLock).toContainText('off');
   });
 
   test('does NOT show environment-specific sections', async ({ page }) => {

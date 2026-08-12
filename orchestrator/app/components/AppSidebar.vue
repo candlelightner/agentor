@@ -40,6 +40,7 @@ const emit = defineEmits<{
     id: string,
     patch: UpdateContainerSettingsRequest,
     rebuild: boolean,
+    complete: (error?: string) => void,
   ];
   downloadWorkspace: [id: string];
   unarchiveWorker: [name: string];
@@ -532,8 +533,8 @@ function isContainerActive(
             @remove="(id) => emit('removeContainer', id)"
             @archive="(id) => emit('archiveContainer', id)"
             @update="
-              (id, patch, rebuild) =>
-                emit('updateContainer', id, patch, rebuild)
+              (id, patch, rebuild, complete) =>
+                emit('updateContainer', id, patch, rebuild, complete)
             "
             @download-workspace="(id) => emit('downloadWorkspace', id)"
           />

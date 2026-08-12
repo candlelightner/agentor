@@ -18,7 +18,12 @@ const emit = defineEmits<{
   rebuild: [id: string];
   remove: [id: string];
   archive: [id: string];
-  update: [id: string, patch: UpdateContainerSettingsRequest, rebuild: boolean];
+  update: [
+    id: string,
+    patch: UpdateContainerSettingsRequest,
+    rebuild: boolean,
+    complete: (error?: string) => void,
+  ];
   downloadWorkspace: [id: string];
 }>();
 
@@ -231,7 +236,7 @@ function onHScrollWheel(e: WheelEvent) {
       v-model:open="showDetail"
       :container="container"
       :status-color="statusColor"
-      @update="(id, patch, rebuild) => emit('update', id, patch, rebuild)"
+      @update="(id, patch, rebuild, complete) => emit('update', id, patch, rebuild, complete)"
       @rebuild="(id) => emit('rebuild', id)"
     />
   </div>
