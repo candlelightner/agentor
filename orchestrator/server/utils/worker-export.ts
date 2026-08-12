@@ -13,7 +13,7 @@ import { AGENT_CREDENTIAL_MAPPINGS } from './user-credentials';
 import { SHARED_DIRECTORY_MOUNT_POINTS } from './storage';
 
 /** Bumped when the bundle layout changes incompatibly. */
-export const WORKER_EXPORT_VERSION = 1;
+export const WORKER_EXPORT_VERSION = 2;
 
 /** Container paths whose contents are exported as separate volume tars (their
  * data lives in volumes, which `docker export` deliberately omits). */
@@ -35,11 +35,7 @@ export const RESTORE_AGENTS_PARENT = '/home/agent';
  * `/home/agent/.agent-data/.claude/.credentials.json` → `.claude/.credentials.json`.
  * The export tars `/home/agent/.agent-data`, so tar entries are prefixed with
  * the `.agent-data/` basename and these suffixes match via `endsWith`. */
-export const CREDENTIAL_EXCLUDE_SUFFIXES = AGENT_CREDENTIAL_MAPPINGS.map((m) =>
-  m.containerPath.startsWith(`${EXPORT_AGENTS_PATH}/`)
-    ? m.containerPath.slice(EXPORT_AGENTS_PATH.length + 1)
-    : m.containerPath,
-);
+export const CREDENTIAL_EXCLUDE_SUFFIXES = AGENT_CREDENTIAL_MAPPINGS.map((m) => (m.containerPath.startsWith(`${EXPORT_AGENTS_PATH}/`) ? m.containerPath.slice(EXPORT_AGENTS_PATH.length + 1) : m.containerPath));
 
 /** The pre-shared-data Kilo auth path (`.kilo/data/auth.json`) is no longer a
  * bind mount target, but legacy per-worker volumes / export artifacts may
@@ -49,29 +45,21 @@ export const LEGACY_KILO_AUTH_EXCLUDE_SUFFIX = '.kilo/data/auth.json';
 
 /** Per-user directories bind-mounted inside the agents volume. Their contents
  * may contain secrets and belong to the account, not to one portable worker. */
-export const SHARED_DATA_EXCLUDE_PREFIXES = [
-  ...SHARED_DIRECTORY_MOUNT_POINTS,
-  LEGACY_KILO_AUTH_EXCLUDE_SUFFIX,
-];
+export const SHARED_DATA_EXCLUDE_PREFIXES = [...SHARED_DIRECTORY_MOUNT_POINTS, LEGACY_KILO_AUTH_EXCLUDE_SUFFIX];
 
 /** File names inside the outer bundle tar. */
 export const BUNDLE_FILES = {
   manifest: 'manifest.json',
-  rootfs: 'rootfs.tar.gz',
+  rootfs: 'rootfs.tar',
+  legacyRootfs: 'rootfs.tar.gz',
   workspace: 'workspace.tar.gz',
   agents: 'agents.tar.gz',
 } as const;
 
 /** What a port mapping looks like once stripped of identity for re-creation. */
-export type ExportedPortMapping = Pick<
-  PortMapping,
-  'externalPort' | 'type' | 'internalPort' | 'appType' | 'instanceId'
->;
+export type ExportedPortMapping = Pick<PortMapping, 'externalPort' | 'type' | 'internalPort' | 'appType' | 'instanceId'>;
 
-export type ExportedDomainMapping = Pick<
-  DomainMapping,
-  'subdomain' | 'baseDomain' | 'path' | 'protocol' | 'wildcard' | 'internalPort'
->;
+export type ExportedDomainMapping = Pick<DomainMapping, 'subdomain' | 'baseDomain' | 'path' | 'protocol' | 'wildcard' | 'internalPort'>;
 
 /** Import limits apply to the outer (already-compressed) bundle. They prevent a
  * hostile upload from creating arbitrary files or exhausting the data volume
@@ -86,9 +74,19 @@ export interface WorkerExportManifest {
   version: number;
   exportedAt: string;
   /** Identity of the source worker (informational; not reused on import). */
-  source: { id: string; displayName: string; containerName: string; imageName: string };
+  source: {
+    id: string;
+    displayName: string;
+    containerName: string;
+    imageName: string;
+  };
   /** The worker's own rebuild-time config, restored onto the new worker. */
-  worker: { displayName: string; repos: RepoConfig[]; mounts: MountConfig[]; initScript: string };
+  worker: {
+    displayName: string;
+    repos: RepoConfig[];
+    mounts: MountConfig[];
+    initScript: string;
+  };
   /** Full environment definition, embedded so the worker restores on a machine
    * that does not have the same environment. Matched/created on import. */
   environment: Environment;
@@ -111,24 +109,20 @@ export async function writeGzipFile(src: NodeJS.ReadableStream, dest: string, si
   return (await stat(dest)).size;
 }
 
+export async function writeStreamFile(src: NodeJS.ReadableStream, dest: string, signal?: AbortSignal): Promise<number> {
+  await pipeline(src, createWriteStream(dest), { signal });
+  return (await stat(dest)).size;
+}
+
 /** Re-pack an agents tar, dropping per-user files/directories, then gzip to a
  * file. Returns the written size. */
-export async function writeFilteredAgentsGz(
-  src: NodeJS.ReadableStream,
-  dest: string,
-  excludeSuffixes: string[],
-  excludePrefixes: string[] = [],
-  signal?: AbortSignal,
-): Promise<number> {
+export async function writeFilteredAgentsGz(src: NodeJS.ReadableStream, dest: string, excludeSuffixes: string[], excludePrefixes: string[] = [], signal?: AbortSignal): Promise<number> {
   const extract = tar.extract();
   const pack = tar.pack();
 
   extract.on('entry', (header, stream, next) => {
-    const relativeName = header.name
-      .replace(/^\.?\//, '')
-      .replace(/^\.agent-data\/?/, '');
-    const excluded = excludeSuffixes.some((s) => relativeName.endsWith(s))
-      || excludePrefixes.some((prefix) => relativeName === prefix || relativeName.startsWith(`${prefix}/`));
+    const relativeName = header.name.replace(/^\.?\//, '').replace(/^\.agent-data\/?/, '');
+    const excluded = excludeSuffixes.some((s) => relativeName.endsWith(s)) || excludePrefixes.some((prefix) => relativeName === prefix || relativeName.startsWith(`${prefix}/`));
     if (excluded) {
       stream.on('end', next);
       stream.resume();
@@ -140,7 +134,9 @@ export async function writeFilteredAgentsGz(
   extract.on('finish', () => pack.finalize());
   extract.on('error', (err) => pack.destroy(err));
 
-  const writeDone = pipeline(pack, createGzip(), createWriteStream(dest), { signal });
+  const writeDone = pipeline(pack, createGzip(), createWriteStream(dest), {
+    signal,
+  });
   // Drive src → extract with pipeline (not a bare .pipe) so a src error tears
   // down extract → pack and rejects, instead of hanging forever waiting for an
   // 'end'/'finish' that never comes.
@@ -184,6 +180,7 @@ export interface ExtractedBundle {
   manifest: WorkerExportManifest;
   /** Absolute paths to the extracted part files that were present. */
   rootfsPath?: string;
+  rootfsCompressed?: boolean;
   workspacePath?: string;
   agentsPath?: string;
 }
@@ -191,11 +188,7 @@ export interface ExtractedBundle {
 /** Scan a compressed tar before Docker extracts/imports it. Compressed-size
  * limits alone do not stop gzip bombs, so bound expanded bytes and entries and
  * reject paths that could escape an extraction root. */
-export async function validateGzipTarPayload(
-  filePath: string,
-  maxExpandedBytes = MAX_INNER_ARCHIVE_BYTES,
-  maxEntries = MAX_INNER_ARCHIVE_ENTRIES,
-): Promise<void> {
+export async function validateGzipTarPayload(filePath: string, maxExpandedBytes = MAX_INNER_ARCHIVE_BYTES, maxEntries = MAX_INNER_ARCHIVE_ENTRIES): Promise<void> {
   let expandedBytes = 0;
   let entries = 0;
   const counter = new Transform({
@@ -214,18 +207,44 @@ export async function validateGzipTarPayload(
     const name = header.name.replace(/\\/g, '/');
     const unsafe = name.includes('\0') || name.startsWith('/') || name.split('/').includes('..');
     if (entries > maxEntries || unsafe) {
+      const error = new Error(entries > maxEntries ? 'Invalid worker export: archive contains too many entries' : 'Invalid worker export: archive contains an unsafe path');
+      stream.on('end', () => next(error));
       stream.resume();
-      extract.destroy(new Error(
-        entries > maxEntries
-          ? 'Invalid worker export: archive contains too many entries'
-          : 'Invalid worker export: archive contains an unsafe path',
-      ));
       return;
     }
     stream.on('end', next);
     stream.resume();
   });
   await pipeline(createReadStream(filePath), createGunzip(), counter, extract);
+}
+
+/** Validate an uncompressed tar payload. Version 2 stores Docker's already
+ * streamed export verbatim: recompressing a multi-GiB base filesystem added
+ * tens of minutes and substantial staging I/O without improving correctness. */
+export async function validateTarPayload(filePath: string, maxExpandedBytes = MAX_INNER_ARCHIVE_BYTES, maxEntries = MAX_INNER_ARCHIVE_ENTRIES): Promise<void> {
+  let expandedBytes = 0;
+  let entries = 0;
+  const counter = new Transform({
+    transform(chunk, _encoding, callback) {
+      expandedBytes += Buffer.byteLength(chunk);
+      callback(expandedBytes > maxExpandedBytes ? new Error('Invalid worker export: expanded archive exceeds the size limit') : null, chunk);
+    },
+  });
+  const extract = tar.extract();
+  extract.on('entry', (header, stream, next) => {
+    entries += 1;
+    const name = header.name.replace(/\\/g, '/');
+    const unsafe = name.includes('\0') || name.startsWith('/') || name.split('/').includes('..');
+    if (entries > maxEntries || unsafe) {
+      const error = new Error(entries > maxEntries ? 'Invalid worker export: archive contains too many entries' : 'Invalid worker export: archive contains an unsafe path');
+      stream.on('end', () => next(error));
+      stream.resume();
+      return;
+    }
+    stream.on('end', next);
+    stream.resume();
+  });
+  await pipeline(createReadStream(filePath), counter, extract);
 }
 
 /** Extract the outer bundle tar into `destDir`, returning the parsed manifest
@@ -290,24 +309,26 @@ export async function extractBundle(bundlePath: string, destDir: string): Promis
   // a newer, incompatible exporter rather than silently restoring it with
   // mismatched semantics. Older versions (<= current) are still accepted.
   if (manifest.version > WORKER_EXPORT_VERSION) {
-    throw new Error(
-      `Unsupported worker export: bundle version ${manifest.version} is newer than supported version ${WORKER_EXPORT_VERSION}`,
-    );
+    throw new Error(`Unsupported worker export: bundle version ${manifest.version} is newer than supported version ${WORKER_EXPORT_VERSION}`);
   }
 
-  for (const [key, file] of [
-    ['rootfs', BUNDLE_FILES.rootfs],
-    ['workspace', BUNDLE_FILES.workspace],
-    ['agents', BUNDLE_FILES.agents],
+  const rootfsFile = present.has(BUNDLE_FILES.rootfs) ? BUNDLE_FILES.rootfs : present.has(BUNDLE_FILES.legacyRootfs) ? BUNDLE_FILES.legacyRootfs : undefined;
+  if (present.has(BUNDLE_FILES.rootfs) && present.has(BUNDLE_FILES.legacyRootfs)) throw new Error('Invalid worker export: duplicate root filesystem payload');
+  if (rootfsFile && ((manifest.version === 1 && rootfsFile !== BUNDLE_FILES.legacyRootfs) || (manifest.version >= 2 && rootfsFile !== BUNDLE_FILES.rootfs))) throw new Error(`Invalid worker export: root filesystem payload does not match bundle version ${manifest.version}`);
+  for (const [key, filePresent] of [
+    ['rootfs', Boolean(rootfsFile)],
+    ['workspace', present.has(BUNDLE_FILES.workspace)],
+    ['agents', present.has(BUNDLE_FILES.agents)],
   ] as const) {
-    if (manifest.contents[key] !== present.has(file)) {
+    if (manifest.contents[key] !== filePresent) {
       throw new Error(`Invalid worker export: manifest contents.${key} does not match bundle payloads`);
     }
   }
 
   return {
     manifest,
-    rootfsPath: present.has(BUNDLE_FILES.rootfs) ? join(destDir, BUNDLE_FILES.rootfs) : undefined,
+    rootfsPath: rootfsFile ? join(destDir, rootfsFile) : undefined,
+    rootfsCompressed: rootfsFile === BUNDLE_FILES.legacyRootfs,
     workspacePath: present.has(BUNDLE_FILES.workspace) ? join(destDir, BUNDLE_FILES.workspace) : undefined,
     agentsPath: present.has(BUNDLE_FILES.agents) ? join(destDir, BUNDLE_FILES.agents) : undefined,
   };
@@ -337,16 +358,13 @@ function assertValidManifest(value: unknown): asserts value is WorkerExportManif
   if (!isRecord(source) || !['id', 'displayName', 'containerName', 'imageName'].every((k) => isString(source[k]))) {
     throw new Error('Invalid worker export: manifest.source is invalid');
   }
-  if (!isRecord(worker) || !isString(worker.displayName) || !isString(worker.initScript)
-      || !Array.isArray(worker.repos) || !Array.isArray(worker.mounts)) {
+  if (!isRecord(worker) || !isString(worker.displayName) || !isString(worker.initScript) || !Array.isArray(worker.repos) || !Array.isArray(worker.mounts)) {
     throw new Error('Invalid worker export: manifest.worker is invalid');
   }
-  if (!worker.repos.every((repo) => isRecord(repo) && isString(repo.provider) && isString(repo.url)
-      && (repo.branch === undefined || isString(repo.branch)))) {
+  if (!worker.repos.every((repo) => isRecord(repo) && isString(repo.provider) && isString(repo.url) && (repo.branch === undefined || isString(repo.branch)))) {
     throw new Error('Invalid worker export: manifest.worker.repos is invalid');
   }
-  if (!worker.mounts.every((mount) => isRecord(mount) && isString(mount.source) && isString(mount.target)
-      && (mount.readOnly === undefined || typeof mount.readOnly === 'boolean'))) {
+  if (!worker.mounts.every((mount) => isRecord(mount) && isString(mount.source) && isString(mount.target) && (mount.readOnly === undefined || typeof mount.readOnly === 'boolean'))) {
     throw new Error('Invalid worker export: manifest.worker.mounts is invalid');
   }
   if (!isRecord(value.environment) || !isString(value.environment.id) || !isString(value.environment.name)) {
@@ -355,11 +373,7 @@ function assertValidManifest(value: unknown): asserts value is WorkerExportManif
   if (!Array.isArray(value.portMappings) || !Array.isArray(value.domainMappings)) {
     throw new Error('Invalid worker export: manifest mappings are invalid');
   }
-  if (!value.portMappings.every((mapping) => isRecord(mapping)
-      && Number.isInteger(mapping.externalPort) && Number.isInteger(mapping.internalPort)
-      && (mapping.type === 'localhost' || mapping.type === 'external')
-      && (mapping.appType === undefined || isString(mapping.appType))
-      && (mapping.instanceId === undefined || isString(mapping.instanceId)))) {
+  if (!value.portMappings.every((mapping) => isRecord(mapping) && Number.isInteger(mapping.externalPort) && Number.isInteger(mapping.internalPort) && (mapping.type === 'localhost' || mapping.type === 'external') && (mapping.appType === undefined || isString(mapping.appType)) && (mapping.instanceId === undefined || isString(mapping.instanceId)))) {
     throw new Error('Invalid worker export: port mapping is invalid');
   }
   if (!isRecord(contents) || !['rootfs', 'workspace', 'agents'].every((k) => typeof contents[k] === 'boolean')) {
@@ -372,9 +386,7 @@ function assertValidManifest(value: unknown): asserts value is WorkerExportManif
   // Older bundles may contain basic-auth credentials. Preserve import
   // compatibility but never propagate those credentials to restored mappings.
   value.domainMappings = value.domainMappings.map((mapping) => {
-    if (!isRecord(mapping) || !isString(mapping.subdomain) || !isString(mapping.baseDomain)
-        || !isString(mapping.path) || !['http', 'https', 'tcp'].includes(String(mapping.protocol))
-        || typeof mapping.wildcard !== 'boolean' || !Number.isInteger(mapping.internalPort)) {
+    if (!isRecord(mapping) || !isString(mapping.subdomain) || !isString(mapping.baseDomain) || !isString(mapping.path) || !['http', 'https', 'tcp'].includes(String(mapping.protocol)) || typeof mapping.wildcard !== 'boolean' || !Number.isInteger(mapping.internalPort)) {
       throw new Error('Invalid worker export: domain mapping is invalid');
     }
     const { basicAuth: _secret, ...safe } = mapping;

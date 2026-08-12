@@ -11,11 +11,7 @@ import * as tar from 'tar-stream';
 import { DockerService } from './docker';
 import type { EnvironmentJsonPayload, CapabilityJsonEntry, InstructionJsonEntry, WorkerJsonPayload, ImageConfigOverride } from './docker';
 import { zeroUserEnvVars } from './user-env-store';
-import {
-  WORKER_EXPORT_VERSION, BUNDLE_FILES,
-  EXPORT_WORKSPACE_PATH, EXPORT_AGENTS_PATH, RESTORE_WORKSPACE_PARENT, RESTORE_AGENTS_PARENT,
-  CREDENTIAL_EXCLUDE_SUFFIXES, SHARED_DATA_EXCLUDE_PREFIXES, writeManifest, writeGzipFile, writeFilteredAgentsGz, packBundle, extractBundle, validateGzipTarPayload,
-} from './worker-export';
+import { WORKER_EXPORT_VERSION, BUNDLE_FILES, EXPORT_WORKSPACE_PATH, EXPORT_AGENTS_PATH, RESTORE_WORKSPACE_PARENT, RESTORE_AGENTS_PARENT, CREDENTIAL_EXCLUDE_SUFFIXES, SHARED_DATA_EXCLUDE_PREFIXES, writeManifest, writeGzipFile, writeStreamFile, writeFilteredAgentsGz, packBundle, extractBundle, validateGzipTarPayload, validateTarPayload } from './worker-export';
 import { recordWorkspaceTombstone } from './workspace-tombstones';
 import type { WorkerExportManifest } from './worker-export';
 import type { AppInstanceInfo, TmuxWindow, FileEntry, FileListing, MoveConflict } from '../../shared/types';
@@ -31,14 +27,10 @@ import type { CapabilityStore } from './capability-store';
 import type { InstructionStore } from './instruction-store';
 import type { StorageManager } from './storage';
 import type { ExposeApis, ServiceStatus, ContainerInfo, ContainerStatus, CreateContainerRequest, UpdateContainerSettingsRequest, RepoConfig, MountConfig, UserEnvVars } from '../../shared/types';
-import {
-  normalizeClientPath, normalizeClientPathList, validateName, toContainerPath, parentRelPath, baseName,
-  MAX_UPLOAD_TOTAL_BYTES, MAX_UPLOAD_ENTRIES,
-} from './workspace-path';
+import { normalizeClientPath, normalizeClientPathList, validateName, toContainerPath, parentRelPath, baseName, MAX_UPLOAD_TOTAL_BYTES, MAX_UPLOAD_ENTRIES } from './workspace-path';
 import { probeLstat, probeList, runProbeCheckMany } from './workspace-probe-runner';
 import { buildWorkspaceZip, demuxSingleFileFromTar } from './workspace-zip';
 import { useWorkerConfigStore, parseDotEnv, type WorkerConfigInputEntry } from './worker-config-store';
-
 
 interface ResolvedEnvConfig {
   cpuLimit?: number;
@@ -57,9 +49,22 @@ function normalizeWorkerConfiguration(input: NonNullable<CreateContainerRequest[
     variables.set(entry.key, entry.value);
   }
   return [
-    ...[...variables].map(([key, value]) => ({ kind: 'variable' as const, key, value })),
-    ...(input.secrets ?? []).map(({ key, value }) => ({ kind: 'secret' as const, key, value })),
-    ...(input.secretFiles ?? []).map(({ name, path, content }) => ({ kind: 'secretFile' as const, key: name, fileName: path, value: content })),
+    ...[...variables].map(([key, value]) => ({
+      kind: 'variable' as const,
+      key,
+      value,
+    })),
+    ...(input.secrets ?? []).map(({ key, value }) => ({
+      kind: 'secret' as const,
+      key,
+      value,
+    })),
+    ...(input.secretFiles ?? []).map(({ name, path, content }) => ({
+      kind: 'secretFile' as const,
+      key: name,
+      fileName: path,
+      value: content,
+    })),
   ];
 }
 
@@ -76,7 +81,10 @@ export class ContainerManager {
    * inspectable/reconcilable rather than leaving a half-created worker. */
   private async reconcileManagedNetworksForWorker(userId: string) {
     const [{ useManagedNetworkStore }, { useManagedNetworkManager }] = await Promise.all([import('./services'), import('./managed-network-manager')]);
-    for (const network of useManagedNetworkStore().listForUser(userId)) await useManagedNetworkManager().reconcile(network).catch((error) => useLogger().warn(`[container] managed network reconcile failed: ${error instanceof Error ? error.message : error}`));
+    for (const network of useManagedNetworkStore().listForUser(userId))
+      await useManagedNetworkManager()
+        .reconcile(network)
+        .catch((error) => useLogger().warn(`[container] managed network reconcile failed: ${error instanceof Error ? error.message : error}`));
   }
   /** Keyed by the worker's UUID `id` (stable across rebuild/unarchive). */
   private containers: Map<string, ContainerInfo> = new Map();
@@ -150,23 +158,17 @@ export class ContainerManager {
       try {
         credentialBinds.push(this.storageManager.getSshAuthorizedKeysBind(userId));
       } catch (err) {
-        useLogger().warn(
-          `[container] unable to build ssh authorized_keys bind for user ${userId}: ${err instanceof Error ? err.message : err}`,
-        );
+        useLogger().warn(`[container] unable to build ssh authorized_keys bind for user ${userId}: ${err instanceof Error ? err.message : err}`);
       }
       try {
         credentialBinds.push(this.storageManager.getKiloConfigBind(userId));
       } catch (err) {
-        useLogger().warn(
-          `[container] unable to build Kilo config bind for user ${userId}: ${err instanceof Error ? err.message : err}`,
-        );
+        useLogger().warn(`[container] unable to build Kilo config bind for user ${userId}: ${err instanceof Error ? err.message : err}`);
       }
       try {
         credentialBinds.push(this.storageManager.getKiloSharedDataBind(userId));
       } catch (err) {
-        useLogger().warn(
-          `[container] unable to build Kilo shared-data bind for user ${userId}: ${err instanceof Error ? err.message : err}`,
-        );
+        useLogger().warn(`[container] unable to build Kilo shared-data bind for user ${userId}: ${err instanceof Error ? err.message : err}`);
       }
     }
     return { userEnv, credentialBinds };
@@ -175,7 +177,10 @@ export class ContainerManager {
   /** Resolve the worker's git identity live from the owning user. The worker
    * references the owner by `userId` only — name/email are never snapshotted onto
    * the worker record, so they always reflect the user's current profile. */
-  private resolveGitIdentity(userId: string): { gitName: string; gitEmail: string } {
+  private resolveGitIdentity(userId: string): {
+    gitName: string;
+    gitEmail: string;
+  } {
     const user = getUserById(userId);
     return { gitName: user?.name ?? '', gitEmail: user?.email ?? '' };
   }
@@ -184,13 +189,14 @@ export class ContainerManager {
     enabledCapabilityIds: string[] | null | undefined,
     enabledInstructionIds: string[] | null | undefined,
     exposeApis: ExposeApis,
-  ): { capabilitiesJson: CapabilityJsonEntry[]; instructionsJson: InstructionJsonEntry[] } {
+  ): {
+    capabilitiesJson: CapabilityJsonEntry[];
+    instructionsJson: InstructionJsonEntry[];
+  } {
     const instructionsJson: InstructionJsonEntry[] = [];
     if (this.instructionStore) {
       const allEntries = this.instructionStore.list();
-      const enabledEntries = enabledInstructionIds === null || enabledInstructionIds === undefined
-        ? allEntries
-        : allEntries.filter((i) => enabledInstructionIds!.includes(i.id));
+      const enabledEntries = enabledInstructionIds === null || enabledInstructionIds === undefined ? allEntries : allEntries.filter((i) => enabledInstructionIds!.includes(i.id));
 
       for (const entry of enabledEntries) {
         instructionsJson.push({ name: entry.name, content: entry.content });
@@ -200,9 +206,7 @@ export class ContainerManager {
     const capabilitiesJson: CapabilityJsonEntry[] = [];
     if (this.capabilityStore) {
       const allCapabilities = this.capabilityStore.list();
-      let enabledCapabilities = enabledCapabilityIds === null || enabledCapabilityIds === undefined
-        ? allCapabilities
-        : allCapabilities.filter((s) => enabledCapabilityIds!.includes(s.id));
+      let enabledCapabilities = enabledCapabilityIds === null || enabledCapabilityIds === undefined ? allCapabilities : allCapabilities.filter((s) => enabledCapabilityIds!.includes(s.id));
 
       // Keyed by the built-in capability's slug, which is its `name` (the id is
       // now a derived UUID). Gated on `builtIn` so a user's custom capability
@@ -210,7 +214,7 @@ export class ContainerManager {
       const apiCapabilityFilter: Record<string, keyof ExposeApis> = {
         'port-mapping': 'portMappings',
         'domain-mapping': 'domainMappings',
-        'usage': 'usage',
+        usage: 'usage',
       };
       enabledCapabilities = enabledCapabilities.filter((s) => {
         const apiKey = s.builtIn ? apiCapabilityFilter[s.name] : undefined;
@@ -218,7 +222,10 @@ export class ContainerManager {
       });
 
       for (const capability of enabledCapabilities) {
-        capabilitiesJson.push({ name: capability.name, content: capability.content });
+        capabilitiesJson.push({
+          name: capability.name,
+          content: capability.content,
+        });
       }
     }
 
@@ -226,7 +233,11 @@ export class ContainerManager {
   }
 
   private resolveEnvironmentConfig(environmentId?: string): ResolvedEnvConfig {
-    const defaultExposeApis: ExposeApis = { portMappings: true, domainMappings: true, usage: true };
+    const defaultExposeApis: ExposeApis = {
+      portMappings: true,
+      domainMappings: true,
+      usage: true,
+    };
 
     if (!this.environmentStore) {
       const { capabilitiesJson, instructionsJson } = this.resolveCapabilitiesAndInstructions(null, null, defaultExposeApis);
@@ -259,14 +270,12 @@ export class ContainerManager {
     }
 
     if (env.networkMode !== 'full' && env.networkMode !== 'block-all') {
-      domains.push(...(getAllAgentApiDomains()));
+      domains.push(...getAllAgentApiDomains());
       domains.push(...getAllGitCloneDomains());
     }
 
     const exposeApis: ExposeApis = env.exposeApis ?? defaultExposeApis;
-    const { capabilitiesJson, instructionsJson } = this.resolveCapabilitiesAndInstructions(
-      env.enabledCapabilityIds, env.enabledInstructionIds, exposeApis,
-    );
+    const { capabilitiesJson, instructionsJson } = this.resolveCapabilitiesAndInstructions(env.enabledCapabilityIds, env.enabledInstructionIds, exposeApis);
 
     const dockerEnabled = env.dockerEnabled ?? true;
 
@@ -291,7 +300,11 @@ export class ContainerManager {
    * resolved environment config, falling back to the orchestrator defaults.
    * Identical across create/rebuild/unarchive/import — extracted so the four
    * lifecycle paths can never drift. */
-  private deriveLimits(env: ResolvedEnvConfig): { cpuLimit?: number; memoryLimit?: string; dockerEnabled: boolean } {
+  private deriveLimits(env: ResolvedEnvConfig): {
+    cpuLimit?: number;
+    memoryLimit?: string;
+    dockerEnabled: boolean;
+  } {
     return {
       cpuLimit: env.cpuLimit ?? this.config.defaultCpuLimit ?? undefined,
       memoryLimit: env.memoryLimit || this.config.defaultMemoryLimit || undefined,
@@ -449,27 +462,29 @@ export class ContainerManager {
 
     const { userEnv, credentialBinds } = await this.resolveUserEnvAndBinds(userId);
 
-    const container = await this.dockerService.createWorkerContainer({
-      userId,
-      id,
-      containerName,
-      cpuLimit,
-      memoryLimit,
-      mounts: request.mounts,
-      dockerEnabled,
-      credentialBinds,
-      environmentJson: envConfig.environmentJson,
-      capabilitiesJson: envConfig.capabilitiesJson,
-      instructionsJson: envConfig.instructionsJson,
-      workerJson,
-      storageManager: this.storageManager,
-      userEnv,
-      workerConfig,
-      image: request.imageRuntimeReference,
-    }).catch(async (err) => {
-      await workerConfigStore.remove(userId, id).catch(() => {});
-      throw err;
-    });
+    const container = await this.dockerService
+      .createWorkerContainer({
+        userId,
+        id,
+        containerName,
+        cpuLimit,
+        memoryLimit,
+        mounts: request.mounts,
+        dockerEnabled,
+        credentialBinds,
+        environmentJson: envConfig.environmentJson,
+        capabilitiesJson: envConfig.capabilitiesJson,
+        instructionsJson: envConfig.instructionsJson,
+        workerJson,
+        storageManager: this.storageManager,
+        userEnv,
+        workerConfig,
+        image: request.imageRuntimeReference,
+      })
+      .catch(async (err) => {
+        await workerConfigStore.remove(userId, id).catch(() => {});
+        throw err;
+      });
 
     const imageName = request.imageRuntimeReference || this.config.workerImagePrefix + this.config.workerImage;
     const now = new Date().toISOString();
@@ -523,7 +538,9 @@ export class ContainerManager {
     }
 
     // Attach log collector to the new container
-    useLogCollector().attach(containerName, container.id, 'worker', displayName).catch(() => {});
+    useLogCollector()
+      .attach(containerName, container.id, 'worker', displayName)
+      .catch(() => {});
 
     useLogger().info(`[container] created worker ${containerName} (${container.id.slice(0, 12)})`);
     await this.reconcileManagedNetworksForWorker(userId);
@@ -563,12 +580,16 @@ export class ContainerManager {
   private dockerIdForFiles(id: string): string {
     const info = this.containers.get(id);
     if (!info) {
-      const err = new Error('Container not found') as Error & { statusCode?: number };
+      const err = new Error('Container not found') as Error & {
+        statusCode?: number;
+      };
       err.statusCode = 404;
       throw err;
     }
     if (info.status !== 'running') {
-      const err = new Error('Worker container is not running') as Error & { statusCode?: number };
+      const err = new Error('Worker container is not running') as Error & {
+        statusCode?: number;
+      };
       err.statusCode = 409;
       throw err;
     }
@@ -594,12 +615,7 @@ export class ContainerManager {
    *  additionally reported via 409. Total bytes/entries are capped (413). Tar
    *  entries are written uid/gid 1000 with directory/file modes.
    */
-  async uploadFiles(
-    id: string,
-    destRel: string,
-    entries: { rel: string; data: Buffer; isDir?: boolean }[],
-    overwrite: boolean,
-  ): Promise<{ uploaded: number }> {
+  async uploadFiles(id: string, destRel: string, entries: { rel: string; data: Buffer; isDir?: boolean }[], overwrite: boolean): Promise<{ uploaded: number }> {
     const containerId = this.dockerIdForFiles(id);
     const dest = normalizeClientPath(destRel, { allowRoot: true });
 
@@ -612,7 +628,9 @@ export class ContainerManager {
     }
 
     if (entries.length === 0) {
-      const err = new Error('No files provided') as Error & { statusCode?: number };
+      const err = new Error('No files provided') as Error & {
+        statusCode?: number;
+      };
       err.statusCode = 400;
       throw err;
     }
@@ -647,14 +665,21 @@ export class ContainerManager {
     // nearest existing ancestor for each target, so a nested upload path whose
     // parent is an escaping symlink is rejected here — even when overwrite is
     // true). With overwrite=false it also surfaces conflicts.
-    const { existing, escaping } = await runProbeCheckMany(this.dockerService, containerId, targets.map((t) => t.rel));
+    const { existing, escaping } = await runProbeCheckMany(
+      this.dockerService,
+      containerId,
+      targets.map((t) => t.rel),
+    );
     if (escaping.length > 0) {
       const err = new Error('Upload target escapes the workspace root') as Error & { statusCode?: number };
       err.statusCode = 400;
       throw err;
     }
     if (!overwrite && existing.length > 0) {
-      const err = new Error('Upload conflicts with existing paths') as Error & { statusCode?: number; conflicts?: string[] };
+      const err = new Error('Upload conflicts with existing paths') as Error & {
+        statusCode?: number;
+        conflicts?: string[];
+      };
       err.statusCode = 409;
       (err as any).conflicts = existing.map((p) => p.replace(/^\/workspace\/?/, ''));
       throw err;
@@ -676,9 +701,7 @@ export class ContainerManager {
         directoryEntries.add(segments.slice(0, i).join('/'));
       }
     }
-    for (const name of [...directoryEntries].sort(
-      (a, b) => a.split('/').length - b.split('/').length,
-    )) {
+    for (const name of [...directoryEntries].sort((a, b) => a.split('/').length - b.split('/').length)) {
       pack.entry({
         name,
         type: 'directory',
@@ -691,7 +714,16 @@ export class ContainerManager {
       if (t.isDir) {
         count++;
       } else {
-        pack.entry({ name: t.rel, size: t.data.length, mode: 0o644, uid: 1000, gid: 1000 }, t.data);
+        pack.entry(
+          {
+            name: t.rel,
+            size: t.data.length,
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+          },
+          t.data,
+        );
         count++;
       }
     }
@@ -720,7 +752,9 @@ export class ContainerManager {
     try {
       const entry = await probeLstat(this.dockerService, containerId, target);
       if (entry.type === 'directory') return { ok: true };
-      const err = new Error('A file already exists at that path') as Error & { statusCode?: number };
+      const err = new Error('A file already exists at that path') as Error & {
+        statusCode?: number;
+      };
       err.statusCode = 409;
       throw err;
     } catch (err: any) {
@@ -786,11 +820,7 @@ export class ContainerManager {
     const targetFull = toContainerPath(targetRel);
     // --no-target-directory (-T): treat the target as a file, not "move into dir".
     // --no-clobber (-n): never overwrite an existing target. Both via argv.
-    const res = await this.dockerService.execCapture(
-      containerId,
-      ['mv', '--no-target-directory', '--no-clobber', srcFull, targetFull],
-      { user: 'agent' },
-    );
+    const res = await this.dockerService.execCapture(containerId, ['mv', '--no-target-directory', '--no-clobber', srcFull, targetFull], { user: 'agent' });
     // GNU `mv -n` exits 0 even when it skipped because the target existed. We
     // already ruled out an existing target above, but a race could still cause a
     // skip — confirm the move actually happened by the post-move state.
@@ -824,7 +854,9 @@ export class ContainerManager {
     // Destination must exist and be a directory.
     const destEntry = await probeLstat(this.dockerService, containerId, dest);
     if (destEntry.type !== 'directory') {
-      const err = new Error('Move destination is not a directory') as Error & { statusCode?: number };
+      const err = new Error('Move destination is not a directory') as Error & {
+        statusCode?: number;
+      };
       err.statusCode = 409;
       throw err;
     }
@@ -849,7 +881,11 @@ export class ContainerManager {
     // nearest existing ancestor for a missing target, so a move into a path
     // under an escaping symlink is rejected) and, with overwrite=false, also
     // surfaces the conflict list.
-    const { existing, escaping } = await runProbeCheckMany(this.dockerService, containerId, moves.map((m) => m.targetRel));
+    const { existing, escaping } = await runProbeCheckMany(
+      this.dockerService,
+      containerId,
+      moves.map((m) => m.targetRel),
+    );
     if (escaping.length > 0) {
       const err = new Error('Move target escapes the workspace root') as Error & { statusCode?: number };
       err.statusCode = 400;
@@ -863,7 +899,10 @@ export class ContainerManager {
           conflicts.push({ source: m.src, target: m.targetRel });
         }
       }
-      const err = new Error('Move conflicts with existing paths') as Error & { statusCode?: number; conflicts?: MoveConflict[] };
+      const err = new Error('Move conflicts with existing paths') as Error & {
+        statusCode?: number;
+        conflicts?: MoveConflict[];
+      };
       err.statusCode = 409;
       (err as any).conflicts = conflicts;
       throw err;
@@ -898,7 +937,9 @@ export class ContainerManager {
         }
       }
       const mvArgs = ['mv', '--no-target-directory', ...(overwrite ? ['--force'] : ['--no-clobber']), srcFull, targetFull];
-      const res = await this.dockerService.execCapture(containerId, mvArgs, { user: 'agent' });
+      const res = await this.dockerService.execCapture(containerId, mvArgs, {
+        user: 'agent',
+      });
       // Verify the move actually happened (defeats the mv -n exit-0-on-skip race).
       const postSrc = await this.dockerService.execCapture(containerId, ['test', '-e', srcFull], { user: 'agent' });
       const postTarget = await this.dockerService.execCapture(containerId, ['test', '-e', targetFull], { user: 'agent' });
@@ -962,13 +1003,7 @@ export class ContainerManager {
    *  rejected. The returned stream is a Node Readable; the route wires
    *  client-close cleanup.
    */
-  async downloadFiles(
-    id: string,
-    rels: string[],
-  ): Promise<
-    | { kind: 'file'; stream: Readable; entry: FileEntry }
-    | { kind: 'zip'; stream: Readable }
-  > {
+  async downloadFiles(id: string, rels: string[]): Promise<{ kind: 'file'; stream: Readable; entry: FileEntry } | { kind: 'zip'; stream: Readable }> {
     const containerId = this.dockerIdForFiles(id);
     const targets = normalizeClientPathList(rels, { allowRoot: false });
 
@@ -1021,15 +1056,7 @@ export class ContainerManager {
    */
   async setClipboard(id: string, mime: 'image/png' | 'text/plain', bytes: Buffer): Promise<{ ok: true }> {
     const containerId = this.dockerIdForFiles(id);
-    const res = await this.dockerService.execCapture(
-      containerId,
-      [
-        'sh', '-c',
-        'head -c "$1" | /home/agent/clipboard/set.sh "$2"',
-        'agentor-clipboard', String(bytes.length), mime,
-      ],
-      { stdin: bytes, user: 'agent' },
-    );
+    const res = await this.dockerService.execCapture(containerId, ['sh', '-c', 'head -c "$1" | /home/agent/clipboard/set.sh "$2"', 'agentor-clipboard', String(bytes.length), mime], { stdin: bytes, user: 'agent' });
     if (res.exitCode === 0) return { ok: true };
 
     // Map the helper's documented exit codes to HTTP statuses. Messages are
@@ -1038,13 +1065,24 @@ export class ContainerManager {
     const map: Record<number, { statusCode: number; statusMessage: string }> = {
       2: { statusCode: 415, statusMessage: 'Unsupported clipboard type' },
       3: { statusCode: 400, statusMessage: 'Empty clipboard payload' },
-      4: { statusCode: 413, statusMessage: 'Clipboard payload exceeds the size limit' },
+      4: {
+        statusCode: 413,
+        statusMessage: 'Clipboard payload exceeds the size limit',
+      },
       5: { statusCode: 415, statusMessage: 'Invalid PNG payload' },
       6: { statusCode: 500, statusMessage: 'Clipboard helper unavailable' },
-      7: { statusCode: 422, statusMessage: 'Failed to set clipboard selection' },
+      7: {
+        statusCode: 422,
+        statusMessage: 'Failed to set clipboard selection',
+      },
     };
-    const mapped = map[res.exitCode] ?? { statusCode: 500, statusMessage: 'Clipboard helper failed' };
-    const err = new Error(mapped.statusMessage) as Error & { statusCode?: number };
+    const mapped = map[res.exitCode] ?? {
+      statusCode: 500,
+      statusMessage: 'Clipboard helper failed',
+    };
+    const err = new Error(mapped.statusMessage) as Error & {
+      statusCode?: number;
+    };
     err.statusCode = mapped.statusCode;
     throw err;
   }
@@ -1069,16 +1107,30 @@ export class ContainerManager {
     await this.dockerService.materializeWorkerSecretFiles(info.containerId, await useWorkerConfigStore().resolveAppliedValues(info.userId, id));
     info.status = 'running';
     info.updatedAt = new Date().toISOString();
-    useLogCollector().attach(info.containerName, info.containerId, 'worker', info.displayName).catch(() => {});
+    useLogCollector()
+      .attach(info.containerName, info.containerId, 'worker', info.displayName)
+      .catch(() => {});
     useLogger().info(`[container] restarted ${info.containerName}`);
   }
 
   private static normRepos(repos: RepoConfig[] | undefined): string {
-    return JSON.stringify((repos ?? []).map((r) => ({ provider: r.provider, url: r.url, branch: r.branch || '' })));
+    return JSON.stringify(
+      (repos ?? []).map((r) => ({
+        provider: r.provider,
+        url: r.url,
+        branch: r.branch || '',
+      })),
+    );
   }
 
   private static normMounts(mounts: MountConfig[] | undefined): string {
-    return JSON.stringify((mounts ?? []).map((m) => ({ source: m.source, target: m.target, readOnly: !!m.readOnly })));
+    return JSON.stringify(
+      (mounts ?? []).map((m) => ({
+        source: m.source,
+        target: m.target,
+        readOnly: !!m.readOnly,
+      })),
+    );
   }
 
   /** Update a worker's editable settings without forcing a recreation.
@@ -1145,7 +1197,11 @@ export class ContainerManager {
     if (patch.repos !== undefined) {
       const cleaned = patch.repos
         .filter((r) => r && r.url)
-        .map((r) => ({ provider: r.provider, url: r.url, ...(r.branch ? { branch: r.branch } : {}) }));
+        .map((r) => ({
+          provider: r.provider,
+          url: r.url,
+          ...(r.branch ? { branch: r.branch } : {}),
+        }));
       const next = cleaned.length > 0 ? cleaned : undefined;
       if (ContainerManager.normRepos(next) !== ContainerManager.normRepos(info.repos)) {
         info.repos = next;
@@ -1157,7 +1213,11 @@ export class ContainerManager {
     if (patch.mounts !== undefined) {
       const cleaned = patch.mounts
         .filter((m) => m && m.source && m.target)
-        .map((m) => ({ source: m.source, target: m.target, ...(m.readOnly ? { readOnly: true } : {}) }));
+        .map((m) => ({
+          source: m.source,
+          target: m.target,
+          ...(m.readOnly ? { readOnly: true } : {}),
+        }));
       const next = cleaned.length > 0 ? cleaned : undefined;
       if (ContainerManager.normMounts(next) !== ContainerManager.normMounts(info.mounts)) {
         info.mounts = next;
@@ -1188,9 +1248,14 @@ export class ContainerManager {
         // Each cleanup is best-effort: one failure (e.g. EACCES on a directory-mode
         // rm -rf, an in-use image) must not abort the rest or leave a half-removed
         // worker in memory. Log and continue.
-        const warn = (what: string) => (err: unknown) =>
-          useLogger().warn(`[container] remove ${info.containerName}: ${what} failed: ${err instanceof Error ? err.message : err}`);
-        await recordWorkspaceTombstone({ workerId: info.id, userId: info.userId, displayName: info.displayName || info.id, backend: this.storageManager?.mode ?? 'volume', createdAt: info.createdAt }).catch(warn('workspace tombstone'));
+        const warn = (what: string) => (err: unknown) => useLogger().warn(`[container] remove ${info.containerName}: ${what} failed: ${err instanceof Error ? err.message : err}`);
+        await recordWorkspaceTombstone({
+          workerId: info.id,
+          userId: info.userId,
+          displayName: info.displayName || info.id,
+          backend: this.storageManager?.mode ?? 'volume',
+          createdAt: info.createdAt,
+        }).catch(warn('workspace tombstone'));
         await cleanupWorkerMappings(info.containerName).catch(warn('mapping cleanup'));
         if (this.storageManager) {
           await this.storageManager.removeWorkerDocker(info.containerName).catch(warn('docker volume'));
@@ -1279,9 +1344,7 @@ export class ContainerManager {
 
     // Imported workers reuse their per-worker image (captured rootfs) across
     // rebuilds; falls back to the standard image if that image is gone.
-    const imageOpts = info.importedImage
-      ? await this.resolveImageOpts(info.importedImage)
-      : { image: info.imageRuntimeReference, imageConfig: undefined };
+    const imageOpts = info.importedImage ? await this.resolveImageOpts(info.importedImage) : { image: info.imageRuntimeReference, imageConfig: undefined };
 
     const container = await this.dockerService.createWorkerContainer({
       userId: info.userId,
@@ -1344,7 +1407,9 @@ export class ContainerManager {
       useLogger().error(`[container] rebuild ${info.containerName}: traefik reconcile failed: ${err instanceof Error ? err.message : err}`);
     });
 
-    useLogCollector().attach(info.containerName, container.id, 'worker', info.displayName).catch(() => {});
+    useLogCollector()
+      .attach(info.containerName, container.id, 'worker', info.displayName)
+      .catch(() => {});
 
     useLogger().info(`[container] rebuilt ${info.containerName} (${container.id.slice(0, 12)})`);
     await this.reconcileManagedNetworksForWorker(info.userId);
@@ -1388,9 +1453,7 @@ export class ContainerManager {
     const { userEnv, credentialBinds } = await this.resolveUserEnvAndBinds(worker.userId);
     const workerConfig = await useWorkerConfigStore().resolveValues(worker.userId, worker.id);
 
-    const imageOpts = worker.importedImage
-      ? await this.resolveImageOpts(worker.importedImage)
-      : { image: worker.imageRuntimeReference, imageConfig: undefined };
+    const imageOpts = worker.importedImage ? await this.resolveImageOpts(worker.importedImage) : { image: worker.imageRuntimeReference, imageConfig: undefined };
 
     const container = await this.dockerService.createWorkerContainer({
       userId: worker.userId,
@@ -1449,7 +1512,9 @@ export class ContainerManager {
       useLogger().error(`[container] unarchive ${containerName}: traefik reconcile failed: ${err instanceof Error ? err.message : err}`);
     });
 
-    useLogCollector().attach(containerName, container.id, 'worker', worker.displayName).catch(() => {});
+    useLogCollector()
+      .attach(containerName, container.id, 'worker', worker.displayName)
+      .catch(() => {});
 
     useLogger().info(`[container] unarchived ${containerName} (${container.id.slice(0, 12)})`);
     await this.reconcileManagedNetworksForWorker(worker.userId);
@@ -1470,9 +1535,14 @@ export class ContainerManager {
 
     // Best-effort cleanups — one failure must not block the others or the final
     // store delete (which is the source of truth for "this worker is gone").
-    const warn = (what: string) => (err: unknown) =>
-      useLogger().warn(`[container] deleteArchived ${containerName}: ${what} failed: ${err instanceof Error ? err.message : err}`);
-    await recordWorkspaceTombstone({ workerId: worker.id, userId: worker.userId, displayName: worker.displayName || worker.id, backend: this.storageManager?.mode ?? 'volume', createdAt: worker.createdAt }).catch(warn('workspace tombstone'));
+    const warn = (what: string) => (err: unknown) => useLogger().warn(`[container] deleteArchived ${containerName}: ${what} failed: ${err instanceof Error ? err.message : err}`);
+    await recordWorkspaceTombstone({
+      workerId: worker.id,
+      userId: worker.userId,
+      displayName: worker.displayName || worker.id,
+      backend: this.storageManager?.mode ?? 'volume',
+      createdAt: worker.createdAt,
+    }).catch(warn('workspace tombstone'));
     await cleanupWorkerMappings(containerName).catch(warn('mapping cleanup'));
     if (this.storageManager) {
       await this.storageManager.removeWorkerWorkspace(worker.userId, worker.id, containerName).catch(warn('workspace'));
@@ -1517,11 +1587,14 @@ export class ContainerManager {
   /** Stream a complete worker export bundle (manifest + workspace + agents, and
    * optionally a `docker export` of the container filesystem). The worker must
    * have a container (running or stopped). Returns a tar stream + filename. */
-  async exportWorker(id: string, opts: {
-    includeRootfs: boolean;
-    signal?: AbortSignal;
-    onProgress?: (update: { phase: string; progress: number; bytesProcessed: number }) => void | Promise<void>;
-  }): Promise<{ stream: Readable; filename: string }> {
+  async exportWorker(
+    id: string,
+    opts: {
+      includeRootfs: boolean;
+      signal?: AbortSignal;
+      onProgress?: (update: { phase: string; progress: number; bytesProcessed: number }) => void | Promise<void>;
+    },
+  ): Promise<{ stream: Readable; filename: string }> {
     const info = this.containers.get(id);
     if (!info) throw new Error('Container not found');
     if (info.status !== 'running' && info.status !== 'stopped') {
@@ -1532,11 +1605,11 @@ export class ContainerManager {
       throw err;
     }
 
-    const env = this.environmentStore?.getById(info.environmentId || DEFAULT_ENVIRONMENT_ID)
-      || this.environmentStore?.getById(DEFAULT_ENVIRONMENT_ID);
+    const env = this.environmentStore?.getById(info.environmentId || DEFAULT_ENVIRONMENT_ID) || this.environmentStore?.getById(DEFAULT_ENVIRONMENT_ID);
     if (!env) throw new Error('Environment not found for export');
 
-    const portMappings = usePortMappingStore().list()
+    const portMappings = usePortMappingStore()
+      .list()
       .filter((m) => m.containerName === info.containerName)
       .map((m) => ({
         externalPort: m.externalPort,
@@ -1545,7 +1618,8 @@ export class ContainerManager {
         ...(m.appType ? { appType: m.appType } : {}),
         ...(m.instanceId ? { instanceId: m.instanceId } : {}),
       }));
-    const domainMappings = useDomainMappingStore().list()
+    const domainMappings = useDomainMappingStore()
+      .list()
       .filter((m) => m.containerName === info.containerName)
       .map((m) => ({
         subdomain: m.subdomain,
@@ -1562,7 +1636,7 @@ export class ContainerManager {
 
     // Single-shot temp-dir cleanup — fires on stream end/close/error, and runs
     // immediately if materialising the bundle throws before streaming starts
-    // (otherwise a multi-GB rootfs.tar.gz would leak in `<dataDir>/tmp`).
+    // (otherwise a multi-GB rootfs payload would leak in `<dataDir>/tmp`).
     let cleaned = false;
     const cleanup = () => {
       if (cleaned) return;
@@ -1579,7 +1653,12 @@ export class ContainerManager {
       const manifest: WorkerExportManifest = {
         version: WORKER_EXPORT_VERSION,
         exportedAt: new Date().toISOString(),
-        source: { id: info.id, displayName: info.displayName, containerName: info.containerName, imageName: info.imageName },
+        source: {
+          id: info.id,
+          displayName: info.displayName,
+          containerName: info.containerName,
+          imageName: info.imageName,
+        },
         worker: {
           displayName: info.displayName,
           repos: info.repos ?? [],
@@ -1594,37 +1673,45 @@ export class ContainerManager {
         portMappings,
         domainMappings,
         contents: { rootfs: opts.includeRootfs, workspace: true, agents: true },
-        missingSecrets: (await useWorkerConfigStore().resolveValues(info.userId, info.id))
-          .filter((entry) => entry.kind !== 'variable').map((entry) => entry.key),
+        missingSecrets: (await useWorkerConfigStore().resolveValues(info.userId, info.id)).filter((entry) => entry.kind !== 'variable').map((entry) => entry.key),
       };
       await writeManifest(manifest, join(tmpDir, BUNDLE_FILES.manifest));
       await report('manifest', 5);
 
       const files: { name: string; path: string }[] = [
-        { name: BUNDLE_FILES.manifest, path: join(tmpDir, BUNDLE_FILES.manifest) },
+        {
+          name: BUNDLE_FILES.manifest,
+          path: join(tmpDir, BUNDLE_FILES.manifest),
+        },
       ];
 
       const wsSrc = await this.dockerService.getArchive(info.containerId, EXPORT_WORKSPACE_PATH);
       bytesProcessed += await writeGzipFile(wsSrc, join(tmpDir, BUNDLE_FILES.workspace), opts.signal);
-      files.push({ name: BUNDLE_FILES.workspace, path: join(tmpDir, BUNDLE_FILES.workspace) });
+      files.push({
+        name: BUNDLE_FILES.workspace,
+        path: join(tmpDir, BUNDLE_FILES.workspace),
+      });
       await report('workspace', opts.includeRootfs ? 30 : 45);
 
       const agSrc = await this.dockerService.getArchive(info.containerId, EXPORT_AGENTS_PATH);
-      bytesProcessed += await writeFilteredAgentsGz(
-        agSrc,
-        join(tmpDir, BUNDLE_FILES.agents),
-        CREDENTIAL_EXCLUDE_SUFFIXES,
-        SHARED_DATA_EXCLUDE_PREFIXES,
-        opts.signal,
-      );
-      files.push({ name: BUNDLE_FILES.agents, path: join(tmpDir, BUNDLE_FILES.agents) });
+      bytesProcessed += await writeFilteredAgentsGz(agSrc, join(tmpDir, BUNDLE_FILES.agents), CREDENTIAL_EXCLUDE_SUFFIXES, SHARED_DATA_EXCLUDE_PREFIXES, opts.signal);
+      files.push({
+        name: BUNDLE_FILES.agents,
+        path: join(tmpDir, BUNDLE_FILES.agents),
+      });
       await report('agent-data', opts.includeRootfs ? 55 : 85);
 
       if (opts.includeRootfs) {
         opts.signal?.throwIfAborted();
         const rootfsSrc = await this.dockerService.exportContainer(info.containerId);
-        bytesProcessed += await writeGzipFile(rootfsSrc, join(tmpDir, BUNDLE_FILES.rootfs), opts.signal);
-        files.push({ name: BUNDLE_FILES.rootfs, path: join(tmpDir, BUNDLE_FILES.rootfs) });
+        // Docker export is already a tar stream. Preserve it verbatim so the
+        // advanced capture does not spend tens of minutes compressing and then
+        // decompressing the immutable base filesystem during a round trip.
+        bytesProcessed += await writeStreamFile(rootfsSrc, join(tmpDir, BUNDLE_FILES.rootfs), opts.signal);
+        files.push({
+          name: BUNDLE_FILES.rootfs,
+          path: join(tmpDir, BUNDLE_FILES.rootfs),
+        });
         await report('root-filesystem', 85);
       }
 
@@ -1653,7 +1740,7 @@ export class ContainerManager {
 
     const workDir = join(this.config.dataDir, 'tmp', `import-${randomUUID()}`);
     try {
-      const { manifest, rootfsPath, workspacePath, agentsPath } = await extractBundle(bundlePath, workDir);
+      const { manifest, rootfsPath, rootfsCompressed, workspacePath, agentsPath } = await extractBundle(bundlePath, workDir);
       if (!manifest || typeof manifest.version !== 'number') {
         throw new Error('Invalid worker export bundle');
       }
@@ -1661,9 +1748,10 @@ export class ContainerManager {
       // Validate every compressed inner tar before any Docker image/container
       // mutation. This catches gzip bombs, unsafe paths, and excessive entry
       // counts while cleanup can still discard the entire import scratch dir.
-      for (const payload of [workspacePath, agentsPath, rootfsPath]) {
+      for (const payload of [workspacePath, agentsPath]) {
         if (payload) await validateGzipTarPayload(payload);
       }
+      if (rootfsPath) await (rootfsCompressed ? validateGzipTarPayload(rootfsPath) : validateTarPayload(rootfsPath));
 
       const environmentId = await this.resolveImportEnvironment(userId, manifest.environment);
 
@@ -1677,7 +1765,14 @@ export class ContainerManager {
       const envConfig = this.resolveEnvironmentConfig(environmentId);
       const { cpuLimit, memoryLimit, dockerEnabled } = this.deriveLimits(envConfig);
       const { gitName, gitEmail } = this.resolveGitIdentity(userId);
-      const workerJson: WorkerJsonPayload = { id, displayName, repos, initScript, gitName, gitEmail };
+      const workerJson: WorkerJsonPayload = {
+        id,
+        displayName,
+        repos,
+        initScript,
+        gitName,
+        gitEmail,
+      };
       const { userEnv, credentialBinds } = await this.resolveUserEnvAndBinds(userId);
       const workerConfig = await useWorkerConfigStore().resolveValues(userId, id);
 
@@ -1773,10 +1868,15 @@ export class ContainerManager {
 
       await this.recreateImportedMappings(userId, id, containerName, manifest);
 
-      useLogCollector().attach(containerName, container.id, 'worker', displayName).catch(() => {});
+      useLogCollector()
+        .attach(containerName, container.id, 'worker', displayName)
+        .catch(() => {});
       useLogger().info(`[container] imported worker ${containerName} (${container.id.slice(0, 12)})${importedImage ? ' with captured rootfs' : ''}`);
 
-      return { ...containerInfo, ...(manifest.missingSecrets?.length ? { missingSecrets: manifest.missingSecrets } : {}) };
+      return {
+        ...containerInfo,
+        ...(manifest.missingSecrets?.length ? { missingSecrets: manifest.missingSecrets } : {}),
+      };
     } finally {
       await rm(workDir, { recursive: true, force: true }).catch(() => {});
     }
@@ -1818,12 +1918,7 @@ export class ContainerManager {
   /** Recreate the bundle's port + domain mappings for the new worker, rewriting
    * identity (new owner, container name, worker id). Conflicting or
    * non-applicable mappings are skipped, not fatal. */
-  private async recreateImportedMappings(
-    userId: string,
-    workerId: string,
-    containerName: string,
-    manifest: WorkerExportManifest,
-  ): Promise<void> {
+  private async recreateImportedMappings(userId: string, workerId: string, containerName: string, manifest: WorkerExportManifest): Promise<void> {
     let changed = false;
     for (const m of manifest.portMappings ?? []) {
       try {
@@ -1982,10 +2077,7 @@ export class ContainerManager {
   /** AppCreateResult — returned by createAppInstance. `externalPort` is set for
    * apps with `autoPortMapping` (e.g. ssh) so the UI can render the connect
    * string immediately. */
-  async createAppInstance(
-    id: string,
-    appTypeId: string,
-  ): Promise<{ id: string; port: number; externalPort?: number }> {
+  async createAppInstance(id: string, appTypeId: string): Promise<{ id: string; port: number; externalPort?: number }> {
     const info = this.assertRunning(id);
 
     const appType = getAppType(appTypeId);
@@ -2019,7 +2111,10 @@ export class ContainerManager {
       const usedPorts = new Set(existing.map((i) => i.port));
       let found: number | null = null;
       for (let p = portDef.internalPortStart; p <= portDef.internalPortEnd; p++) {
-        if (!usedPorts.has(p)) { found = p; break; }
+        if (!usedPorts.has(p)) {
+          found = p;
+          break;
+        }
       }
       if (found === null) throw new Error(`No available ports for ${appType.displayName}`);
       port = found;
@@ -2045,15 +2140,14 @@ export class ContainerManager {
 
     await this.dockerService.startAppInstance(info.containerId, appTypeId, instanceId, port, extraArgs);
 
-    return { id: instanceId, port, ...(externalPort !== undefined ? { externalPort } : {}) };
+    return {
+      id: instanceId,
+      port,
+      ...(externalPort !== undefined ? { externalPort } : {}),
+    };
   }
 
-  private async ensureAutoPortMapping(
-    info: ContainerInfo,
-    appType: NonNullable<ReturnType<typeof getAppType>>,
-    instanceId: string,
-    internalPort: number,
-  ): Promise<number> {
+  private async ensureAutoPortMapping(info: ContainerInfo, appType: NonNullable<ReturnType<typeof getAppType>>, instanceId: string, internalPort: number): Promise<number> {
     const cfg = appType.autoPortMapping!;
     const store = usePortMappingStore();
     const traefik = useTraefikManager();
@@ -2072,9 +2166,7 @@ export class ContainerManager {
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       const externalPort = store.findFreeExternalPort(cfg.externalPortStart, cfg.externalPortEnd, tried);
       if (externalPort === null) {
-        throw new Error(
-          `No available external ports for ${appType.displayName} in ${cfg.externalPortStart}-${cfg.externalPortEnd}`,
-        );
+        throw new Error(`No available external ports for ${appType.displayName} in ${cfg.externalPortStart}-${cfg.externalPortEnd}`);
       }
       tried.add(externalPort);
       await store.add({
@@ -2092,14 +2184,10 @@ export class ContainerManager {
         return externalPort;
       } catch (err) {
         await store.remove(externalPort).catch(() => {});
-        useLogger().warn(
-          `[container] auto port mapping :${externalPort} for ${appType.displayName} could not be bound (${err instanceof Error ? err.message : err}) — trying next port`,
-        );
+        useLogger().warn(`[container] auto port mapping :${externalPort} for ${appType.displayName} could not be bound (${err instanceof Error ? err.message : err}) — trying next port`);
       }
     }
-    throw new Error(
-      `Could not allocate a bindable external port for ${appType.displayName} after ${MAX_ATTEMPTS} attempts`,
-    );
+    throw new Error(`Could not allocate a bindable external port for ${appType.displayName} after ${MAX_ATTEMPTS} attempts`);
   }
 
   async stopAppInstance(id: string, appTypeId: string, instanceId: string): Promise<void> {

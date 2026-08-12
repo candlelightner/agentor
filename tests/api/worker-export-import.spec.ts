@@ -53,6 +53,7 @@ test.describe('Worker export', () => {
     expect(text).toContain('agents.tar.gz');
     // includeRootfs=false omits the filesystem snapshot.
     expect(text).not.toContain('rootfs.tar.gz');
+    expect(text).not.toContain('rootfs.tar');
   });
 
   test('export strips shared Kilo shared-data and legacy .kilo/data/auth.json while retaining per-worker Kilo state', async ({ request }) => {
@@ -93,10 +94,7 @@ test.describe('Worker export', () => {
       expect(agentsTar).not.toContain(legacyAuthSecret);
       expect(agentsTar).not.toContain('.kilo/data/auth.json');
     } finally {
-      await execInWorker(
-        workerId,
-        'rm -f ~/.config/kilo/export-secret.json ~/.local/share/kilo/export-data-secret.json ~/.agent-data/.kilo/data/auth.json ~/.local/state/kilo/export-state.txt ~/.agent-data/.vscode-desktop-profile/per-worker.txt',
-      ).catch(() => {});
+      await execInWorker(workerId, 'rm -f ~/.config/kilo/export-secret.json ~/.local/share/kilo/export-data-secret.json ~/.agent-data/.kilo/data/auth.json ~/.local/state/kilo/export-state.txt ~/.agent-data/.vscode-desktop-profile/per-worker.txt').catch(() => {});
       // Remove the legacy dir we created so it does not leak into other tests.
       await execInWorker(workerId, 'rmdir ~/.agent-data/.kilo/data 2>/dev/null || true').catch(() => {});
     }
@@ -215,7 +213,12 @@ test.describe.serial('Worker export/import round-trip', () => {
     try {
       // Add a port mapping, then export.
       const ext = 40000 + Math.floor(Math.random() * 20000);
-      const pm = await api.createPortMapping({ externalPort: ext, internalPort: 8080, type: 'localhost', workerId: src.id });
+      const pm = await api.createPortMapping({
+        externalPort: ext,
+        internalPort: 8080,
+        type: 'localhost',
+        workerId: src.id,
+      });
       expect(pm.status).toBe(201);
 
       const exported = await api.exportWorker(src.id, false);
@@ -233,8 +236,7 @@ test.describe.serial('Worker export/import round-trip', () => {
 
       // The exported mapping is recreated for the new worker (same external port).
       const { body: mappings } = await api.listPortMappings();
-      const recreated = mappings.find((m: { externalPort: number; containerName: string }) =>
-        m.externalPort === ext && m.containerName === `agentor-worker-${importedId}`);
+      const recreated = mappings.find((m: { externalPort: number; containerName: string }) => m.externalPort === ext && m.containerName === `agentor-worker-${importedId}`);
       expect(recreated).toBeTruthy();
     } finally {
       if (mappedPort) await api.deletePortMapping(mappedPort).catch(() => {});
