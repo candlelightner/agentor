@@ -109,12 +109,21 @@ rm -f /var/run/docker.sock 2>/dev/null || true
 dockerd > /var/log/dockerd.log 2>&1 &
 DOCKERD_PID=$!
 
-# Wait up to 30s for the socket to appear.
+# Wait up to 60s for the daemon API to answer. The socket appears before
+# dockerd finishes initialization, and treating mere socket existence as ready
+# caused the immediately following cleanup/build commands to fail intermittently.
 for _ in $(seq 1 300); do
-    [ -S /var/run/docker.sock ] && break
-    sleep 0.1
+    if [ -S /var/run/docker.sock ] && docker info > /dev/null 2>&1; then
+        break
+    fi
+    if ! kill -0 "$DOCKERD_PID" 2>/dev/null; then
+        err "dockerd exited during startup. Last 50 lines of log:"
+        tail -n 50 /var/log/dockerd.log >&2 || true
+        exit 1
+    fi
+    sleep 0.2
 done
-if [ ! -S /var/run/docker.sock ]; then
+if ! docker info > /dev/null 2>&1; then
     err "dockerd failed to start within 30s. Last 50 lines of log:"
     tail -n 50 /var/log/dockerd.log >&2 || true
     exit 1
