@@ -1,4 +1,4 @@
-import { createGzip, createGunzip } from 'node:zlib';
+import { createGzip, createGunzip, constants as zlibConstants } from 'node:zlib';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { stat, mkdir, writeFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -102,7 +102,12 @@ export interface WorkerExportManifest {
 
 /** Pipe a readable through gzip into a file; return the written size in bytes. */
 export async function writeGzipFile(src: NodeJS.ReadableStream, dest: string, signal?: AbortSignal): Promise<number> {
-  await pipeline(src, createGzip(), createWriteStream(dest), { signal });
+  // Root filesystem exports are routinely several GiB. The default level 6
+  // made an otherwise-streaming export spend 30+ minutes compressing the
+  // standard worker image. Level 1 keeps the same portable gzip/tar format and
+  // import path while making the explicit advanced capture operationally
+  // usable; disk limits still bound the resulting (slightly larger) artifact.
+  await pipeline(src, createGzip({ level: zlibConstants.Z_BEST_SPEED }), createWriteStream(dest), { signal });
   return (await stat(dest)).size;
 }
 
