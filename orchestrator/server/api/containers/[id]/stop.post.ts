@@ -22,7 +22,7 @@ export default defineEventHandler(async (event) => {
   try {
     const cm = useContainerManager();
     requireContainerAccess(event, cm.get(id));
-    const body = await readBody<{ lockPassword?: unknown }>(event).catch(() => ({}));
+    const body: { lockPassword?: unknown } = await readBody(event).catch(() => ({}));
     await useWorkerProtectionLockStore().verify(id, body?.lockPassword);
     await cm.stop(id);
     return { ok: true };

@@ -527,16 +527,16 @@ export class ManagementMcpStore {
       const consoles = useManagementConsoleStore();
       if (name === "console.open") {
         if (!worker) throw statusError(404, "Worker not found");
-        return consoles.open(identity.workspaceId, worker.id, Number(args.windowIndex ?? 0));
+        return consoles.open(workspaceId, worker.id, Number(args.windowIndex ?? 0));
       }
       const sessionId = String(args.sessionId || "");
       if (!sessionId) throw statusError(400, "sessionId required");
       if (name === "console.read")
-        return consoles.read(identity.workspaceId, sessionId, Number.isInteger(args.from) ? Number(args.from) : undefined);
+        return consoles.read(workspaceId, sessionId, Number.isInteger(args.from) ? Number(args.from) : undefined);
       if (name === "console.write")
-        return consoles.write(identity.workspaceId, sessionId, typeof args.input === "string" ? args.input : "");
-      if (name === "console.interrupt") return consoles.interrupt(identity.workspaceId, sessionId);
-      if (name === "console.close") return consoles.close(identity.workspaceId, sessionId);
+        return consoles.write(workspaceId, sessionId, typeof args.input === "string" ? args.input : "");
+      if (name === "console.interrupt") return consoles.interrupt(workspaceId, sessionId);
+      if (name === "console.close") return consoles.close(workspaceId, sessionId);
     }
     if (name === "exports.create") {
       if (!worker) throw statusError(404, "Worker not found");

@@ -42,7 +42,7 @@ export default defineEventHandler(async (event) => {
   try {
     const cm = useContainerManager();
     requireContainerAccess(event, cm.get(id));
-    const body = await readBody<{ lockPassword?: unknown }>(event).catch(() => ({}));
+    const body: { lockPassword?: unknown } = await readBody(event).catch(() => ({}));
     await useWorkerProtectionLockStore().verify(id, body?.lockPassword);
     const result = await cm.createAppInstance(id, appType);
     setResponseStatus(event, 201);

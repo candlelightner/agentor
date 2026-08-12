@@ -28,8 +28,8 @@ export default defineEventHandler(async (event) => {
   if (user.role !== 'admin' && existing.userId !== user.id) {
     throw createError({ statusCode: 403, statusMessage: 'Forbidden' });
   }
-  const body = await readBody<{ lockPassword?: unknown }>(event).catch(() => ({}));
-  await useWorkerProtectionLockStore().verify(existing.workerId, body?.lockPassword);
+  const body: { lockPassword?: unknown } = await readBody(event).catch(() => ({}));
+  await useWorkerProtectionLockStore().verify(existing.item.workerId, body.lockPassword);
 
   const removed = await store.remove(id);
   if (removed) {
