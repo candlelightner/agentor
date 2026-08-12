@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **1515 tests** across 123 test files (952 API across 70 files + 563 UI across 53 files)
+- **1517 tests** across 124 test files (953 API across 71 files + 564 UI across 53 files)
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -13,6 +13,8 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 - **All tests run pre-authenticated as an admin user** via Playwright's `globalSetup` (see `tests/global-setup.ts`). The session cookies are saved to `tests/.auth/admin-api.json` and `tests/.auth/admin-ui.json`, referenced by the API and UI project `storageState` respectively.
 
 Worker-group coverage is in `api/worker-groups.spec.ts` (2 API tests) and `ui/worker-groups.spec.ts` (1 UI test): CRUD, owner-scoped membership validation, and deletion that retains workers.
+
+Managed-network coverage is in `api/managed-networks.spec.ts` (bridge create/topology/delete and validation rejection).
 
 ## Prerequisites
 
@@ -106,7 +108,9 @@ tests/
 
 ## Test Categories
 
-### API Tests (950 tests, 69 files)
+### API Tests (953 tests, 70 files)
+
+| `worker-protection-lock.spec.ts` | 3 | Password-verifier-only worker locks: set/change/remove validation, no password/hash disclosure, required lock credentials on settings/configuration/archive/unarchive alternate lifecycle paths, and correct-password recovery. |
 
 | File                              | Tests | Coverage                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | --------------------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

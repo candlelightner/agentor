@@ -6,6 +6,14 @@ Every user-facing feature of the Agentor web dashboard, organized by category. T
 
 - Per-user worker groups can be created, renamed, deleted without deleting member workers, and assigned workers owned by the same user. The dashboard’s **Worker groups** action provides membership editing; the API is `/api/worker-groups`.
 
+## Managed worker networks
+
+- Owner-scoped managed bridge networks attach selected workers through the orchestrator Docker boundary. Management/internal networks are rejected; topology and membership validation are available through `/api/managed-networks`.
+
+## Worker protection locks
+
+- A worker can have an optional separate password-based protection lock. The lock password is a one-way verifier and is never returned. While protected, settings and worker-local configuration edits, archive/unarchive, rebuild, and permanent deletion require the correct `lockPassword`; start/stop remains deliberately available. The Worker Settings dialog can set or remove the lock, and `/api/containers/:id/protection` supports state, set/change, remove, and verify operations.
+
 ---
 
 ## 0. Authentication & Authorization
