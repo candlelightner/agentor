@@ -123,15 +123,26 @@ test.describe.serial('Worker Settings Modal', () => {
     await expect(dialog.getByRole('button', { name: 'Save', exact: true })).toBeDisabled();
   });
 
-  test('sets and removes the optional protection lock without rendering its password', async ({ page }) => {
+  test('sets a lock, rejects an unlocked settings mutation, then applies it with the current password', async ({ page }) => {
     const dialog = await openModal(page);
     const lock = dialog.locator('[data-testid="worker-protection-lock"]');
+    const password = `ui-protection-${Date.now()}-password`;
+    const renamed = `Detail-locked-${Date.now()}`;
     await expect(lock).toContainText('off');
-    await lock.getByLabel('New lock password').fill('ui-protection-password');
+    await lock.getByLabel('New lock password').fill(password);
     await lock.getByRole('button', { name: 'Protect worker' }).click();
     await expect(lock).toContainText('protected');
-    await expect(lock).not.toContainText('ui-protection-password');
-    await lock.getByLabel('Current lock password').fill('ui-protection-password');
+    await expect(lock).not.toContainText(password);
+
+    await dialog.getByPlaceholder('Worker label').fill(renamed);
+    await dialog.getByRole('button', { name: 'Save', exact: true }).click();
+    await expect(dialog).toContainText(/protected|correct lock password/i);
+
+    await lock.getByLabel('Current lock password').fill(password);
+    await dialog.getByRole('button', { name: 'Save', exact: true }).click();
+    await expect(dialog.getByPlaceholder('Worker label')).toHaveValue(renamed);
+
+    await lock.getByLabel('Current lock password').fill(password);
     await lock.getByRole('button', { name: 'Remove protection' }).click();
     await expect(lock).toContainText('off');
   });
