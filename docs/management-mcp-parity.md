@@ -23,6 +23,7 @@ or an interactive third-party login into a live-account verification.
 | Worker groups | Worker Groups UI; `/api/worker-groups` | `groups.list`, `groups.create`, `groups.update`, `groups.delete` | `worker-groups.spec.ts` and worker-domain tests |
 | Protection locks | Worker Settings; `/api/containers/:id/protection` | `locks.get`, `locks.set`, `locks.remove` | `worker-protection-lock.spec.ts`; verifier/password is write-only |
 | Workspace inventory and offline browse | Storage inventory/browser; `/api/workspaces/*` | `workspaces.list`, `workspaces.files`, `workspaces.preview`, `workspaces.download`, `workspaces.clone` | `management-mcp-workspace-adapter.spec.ts`, storage API/UI tests; offline access remains read-only |
+| Running-worker file management | Worker Files modal; `/api/containers/:id/files/*` | `files.list`, `files.upload`, `files.mkdir`, `files.rename`, `files.move`, `files.delete` | Existing hardened container file manager is reused; upload is one base64 file capped at 1 MiB, mutations honor worker protection locks |
 | File and directory downloads | Authenticated streaming workspace endpoints | Small regular files via `workspaces.download`; larger files/directories return authenticated download location | Intentional transport limit: MCP never buffers directory archives or files above 256 KiB |
 | Worker export/import | Export modal/jobs; export/import APIs | `exports.create`, `exports.status`, `exports.cancel`, `exports.download` | Export-job and workspace-adapter tests; download is intentionally authenticated streaming, not embedded archive bytes. **Binary worker import has no MCP tool yet.** |
 | Image catalog and controlled builds | Image Catalog UI/API | `images.list/get/create/validate/delete/build/build-status/build-logs/build-cancel/promote/rollback/default/cleanup/git-status/git-sync` | Image catalog/Git catalog tests and MCP image adapter; logs are sanitized |
@@ -57,7 +58,7 @@ or an interactive third-party login into a live-account verification.
 
 ## Capability policy and harness confirmation
 
-Capability groups include read-only status, logs, storage, worker lifecycle,
+Capability groups include read-only status, logs, storage, running files, worker lifecycle,
 console, configuration, groups, locks, images, networking, apps, backups, and
 catalogs. New mutating groups default disabled. A disabled group is removed
 from tool discovery and denied at invocation; aliases registered in that group
