@@ -45,6 +45,31 @@ async function inventory(
   return { status: res.status(), body: res.ok() ? await res.json() : [] };
 }
 
+/** Aggregate lifecycle evidence without exposing Docker ids, mount paths, or
+ * helper configuration through the workspace API. */
+async function helperCount(ctx: APIRequestContext): Promise<number> {
+  const response = await ctx.get("/api/admin/storage");
+  expect(response.status()).toBe(200);
+  const body = await response.json();
+  expect(typeof body.helpers?.total).toBe("number");
+  return body.helpers.total;
+}
+
+async function waitForHelpersToReturn(
+  ctx: APIRequestContext,
+  baseline: number,
+): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  let current = await helperCount(ctx);
+  while (current > baseline && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    current = await helperCount(ctx);
+  }
+  // Parallel tests may finish their own helper while this poll runs, so a
+  // lower count is valid. A leaked lease from this request is not.
+  expect(current).toBeLessThanOrEqual(baseline);
+}
+
 function workspaceFor(items: Workspace[], workerId: string): Workspace {
   const found = items.find(
     (item) => item.workerId === workerId || item.id === workerId,
@@ -358,6 +383,20 @@ test.describe.serial("Offline workspace inventory and browser security", () => {
     expect(native.headers()["content-disposition"]).toContain("readme.txt");
     expect(native.headers()["cache-control"]).toContain("no-store");
     expect(await native.text()).toContain("offline sentinel text");
+  });
+
+  test("a consumed offline download reclaims its read-only helper", async ({
+    request,
+  }) => {
+    const baseline = await helperCount(request);
+    const response = await request.get(
+      `/api/workspaces/${adminWorkspace}/download?path=${encodeURIComponent("docs/readme.txt")}`,
+    );
+    expect(response.status()).toBe(200);
+    // Fully consuming the controlled HTTP stream exercises the lease's
+    // end/close cleanup path rather than merely asserting an endpoint exists.
+    expect(await response.text()).toContain("offline sentinel text");
+    await waitForHelpersToReturn(request, baseline);
   });
 
   test("archived workspace remains browsable without recreating the worker", async ({
