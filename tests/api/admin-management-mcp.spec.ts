@@ -71,26 +71,23 @@ test.describe.serial("Internal management MCP security", () => {
       await request.post("/api/admin/workspace", { data: {} })
     ).json();
     adminWorkspaceId = workspace.id;
-    const resetPolicy = await request.put(
-      "/api/admin/management-mcp/policy",
-      {
-        data: {
-          groups: {
-            "read-only-status": true,
-            logs: true,
-            "volume-browsing": true,
-            "configuration-inspection": true,
-            "worker-lifecycle": false,
-            console: false,
-            exports: false,
-            backups: false,
-            "image-builds": false,
-            "configuration-proposals": false,
-            "configuration-application": false,
-          },
+    const resetPolicy = await request.put("/api/admin/management-mcp/policy", {
+      data: {
+        groups: {
+          "read-only-status": true,
+          logs: true,
+          "volume-browsing": true,
+          "configuration-inspection": true,
+          "worker-lifecycle": false,
+          console: false,
+          exports: false,
+          backups: false,
+          "image-builds": false,
+          "configuration-proposals": false,
+          "configuration-application": false,
         },
       },
-    );
+    });
     expect(resetPolicy.status()).toBe(200);
     const identity = await request.post(
       "/api/admin/management-mcp/diagnostics/issue-identity",
@@ -171,28 +168,36 @@ test.describe.serial("Internal management MCP security", () => {
       '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
       '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}',
     ];
+    const summarize =
+      'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const m=d.trim().split(/\\n+/).map(JSON.parse);console.log(JSON.stringify({ids:m.map(x=>x.id),server:m[0]?.result?.serverInfo?.name,tools:m[1]?.result?.tools?.map(x=>x.name)}))})';
     const invokeProxy = () =>
       captureCommandOutput(
         adminWorkspaceId,
-        `printf '%s\\n' ${requests.map((line) => `'${line}'`).join(" ")} | /usr/local/bin/agentor-management-mcp`,
+        `printf '%s\\n' ${requests.map((line) => `'${line}'`).join(" ")} | /usr/local/bin/agentor-management-mcp | node -e '${summarize}'`,
         20_000,
       );
 
-    let config='';
-    await expect.poll(async()=>{
-      config=await captureCommandOutput(
-        adminWorkspaceId,
-        "grep -A1 '^\\[mcp_servers\\.agentor-management\\]$' /home/agent/.codex/config.toml 2>/dev/null || true",
-      );
-      return config;
-    },{timeout:30_000,intervals:[500,1000,2000]}).toContain('[mcp_servers.agentor-management]');
+    let config = "";
+    await expect
+      .poll(
+        async () => {
+          config = await captureCommandOutput(
+            adminWorkspaceId,
+            "grep -A1 '^\\[mcp_servers\\.agentor-management\\]$' /home/agent/.codex/config.toml 2>/dev/null || true",
+          );
+          return config;
+        },
+        { timeout: 30_000, intervals: [500, 1000, 2000] },
+      )
+      .toContain("[mcp_servers.agentor-management]");
     expect(config).toContain("[mcp_servers.agentor-management]");
-    expect(config).toContain('command = "/usr/local/bin/agentor-management-mcp"');
+    expect(config).toContain(
+      'command = "/usr/local/bin/agentor-management-mcp"',
+    );
 
     const first = await invokeProxy();
-    expect(first).toContain('"id":1');
-    expect(first).toContain('"agentor-management"');
-    expect(first).toContain('"id":2');
+    expect(first).toContain('"ids":[1,2]');
+    expect(first).toContain('"server":"agentor-management"');
     expect(first).toContain("status.system");
     expect(first).not.toContain("worker.stop");
 
@@ -201,7 +206,7 @@ test.describe.serial("Internal management MCP security", () => {
     // for each request instead of retaining an expiring bearer in Codex.
     await new Promise((resolve) => setTimeout(resolve, 47_000));
     const rotated = await invokeProxy();
-    expect(rotated).toContain('"agentor-management"');
+    expect(rotated).toContain('"server":"agentor-management"');
     expect(rotated).toContain("status.system");
     expect(rotated).not.toContain("worker.stop");
   }, 90_000);
@@ -365,11 +370,16 @@ test.describe.serial("Internal management MCP security", () => {
   test("disabled capability groups disappear from MCP discovery", async ({
     request,
   }) => {
-    const listed = await request.post("/api/admin/management-mcp/diagnostics/list-tools", {
-      data: { credential },
-    });
+    const listed = await request.post(
+      "/api/admin/management-mcp/diagnostics/list-tools",
+      {
+        data: { credential },
+      },
+    );
     expect(listed.status()).toBe(200);
-    const names = (await listed.json()).map((tool: { name: string }) => tool.name);
+    const names = (await listed.json()).map(
+      (tool: { name: string }) => tool.name,
+    );
     expect(names).toContain("status.system");
     expect(names).not.toContain("worker.stop");
     expect(names).not.toContain("console.open");
@@ -379,8 +389,12 @@ test.describe.serial("Internal management MCP security", () => {
     request,
   }) => {
     // Both groups are off by default and deny all aliases before dispatch.
-    expect((await invoke(request, credential, "port-mappings.list")).status()).toBe(403);
-    expect((await invoke(request, credential, "apps.types")).status()).toBe(403);
+    expect(
+      (await invoke(request, credential, "port-mappings.list")).status(),
+    ).toBe(403);
+    expect((await invoke(request, credential, "apps.types")).status()).toBe(
+      403,
+    );
     expect(
       (
         await request.put("/api/admin/management-mcp/policy", {
@@ -389,15 +403,29 @@ test.describe.serial("Internal management MCP security", () => {
       ).status(),
     ).toBe(200);
 
-    const discovered = await request.post("/api/admin/management-mcp/diagnostics/list-tools", {
-      data: { credential },
-    });
+    const discovered = await request.post(
+      "/api/admin/management-mcp/diagnostics/list-tools",
+      {
+        data: { credential },
+      },
+    );
     const tools = await discovered.json();
-    expect(tools).toEqual(expect.arrayContaining([
-      expect.objectContaining({ name: "port-mappings.create", annotations: expect.objectContaining({ readOnlyHint: false }) }),
-      expect.objectContaining({ name: "domain-mappings.list", annotations: expect.objectContaining({ readOnlyHint: true }) }),
-      expect.objectContaining({ name: "apps.stop", annotations: expect.objectContaining({ destructiveHint: true }) }),
-    ]));
+    expect(tools).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "port-mappings.create",
+          annotations: expect.objectContaining({ readOnlyHint: false }),
+        }),
+        expect.objectContaining({
+          name: "domain-mappings.list",
+          annotations: expect.objectContaining({ readOnlyHint: true }),
+        }),
+        expect.objectContaining({
+          name: "apps.stop",
+          annotations: expect.objectContaining({ destructiveHint: true }),
+        }),
+      ]),
+    );
 
     const port = 35000 + Math.floor(Math.random() * 2000);
     const created = await invoke(request, credential, "port-mappings.create", {
@@ -412,12 +440,36 @@ test.describe.serial("Internal management MCP security", () => {
       workerId: normalWorker,
       userId: regular.id,
     });
-    const scoped = await invoke(request, credential, "port-mappings.list", { userId: regular.id });
+    const scoped = await invoke(request, credential, "port-mappings.list", {
+      userId: regular.id,
+    });
     expect(scoped.status()).toBe(200);
-    expect((await scoped.json())).toEqual(expect.arrayContaining([expect.objectContaining({ externalPort: port, workerId: normalWorker, userId: regular.id })]));
-    expect((await invoke(request, credential, "apps.types")).status()).toBe(200);
-    expect((await invoke(request, credential, "apps.list", { workerId: normalWorker })).status()).toBe(200);
-    expect((await invoke(request, credential, "port-mappings.delete", { externalPort: port })).status()).toBe(200);
+    expect(await scoped.json()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          externalPort: port,
+          workerId: normalWorker,
+          userId: regular.id,
+        }),
+      ]),
+    );
+    expect((await invoke(request, credential, "apps.types")).status()).toBe(
+      200,
+    );
+    expect(
+      (
+        await invoke(request, credential, "apps.list", {
+          workerId: normalWorker,
+        })
+      ).status(),
+    ).toBe(200);
+    expect(
+      (
+        await invoke(request, credential, "port-mappings.delete", {
+          externalPort: port,
+        })
+      ).status(),
+    ).toBe(200);
 
     expect(
       (
@@ -426,8 +478,12 @@ test.describe.serial("Internal management MCP security", () => {
         })
       ).status(),
     ).toBe(200);
-    expect((await invoke(request, credential, "port-mappings.list")).status()).toBe(403);
-    expect((await invoke(request, credential, "apps.types")).status()).toBe(403);
+    expect(
+      (await invoke(request, credential, "port-mappings.list")).status(),
+    ).toBe(403);
+    expect((await invoke(request, credential, "apps.types")).status()).toBe(
+      403,
+    );
   });
 
   test("MCP responses and errors never return existing secret values", async ({
@@ -468,7 +524,9 @@ test.describe.serial("Internal management MCP security", () => {
     expect(
       (
         await regularCtx.put(`/api/containers/${normalWorker}/configuration`, {
-          data: { secrets: [{ key: "CONSOLE_MANAGED_SECRET", value: managedSecret }] },
+          data: {
+            secrets: [{ key: "CONSOLE_MANAGED_SECRET", value: managedSecret }],
+          },
         })
       ).status(),
     ).toBe(200);
@@ -490,7 +548,10 @@ test.describe.serial("Internal management MCP security", () => {
     ).toBe(200);
     let output = "";
     for (let attempt = 0; attempt < 30; attempt++) {
-      const read = await invoke(request, credential, "console.read", { sessionId, from: 0 });
+      const read = await invoke(request, credential, "console.read", {
+        sessionId,
+        from: 0,
+      });
       expect(read.status()).toBe(200);
       output = (await read.json()).output;
       if (output.includes(marker)) break;
@@ -499,13 +560,19 @@ test.describe.serial("Internal management MCP security", () => {
     expect(output).toContain(`${marker}:${normalWorker}:[REDACTED]`);
     expect(output).not.toContain(managedSecret);
     expect(
-      (await invoke(request, credential, "console.interrupt", { sessionId })).status(),
+      (
+        await invoke(request, credential, "console.interrupt", { sessionId })
+      ).status(),
     ).toBe(200);
     expect(
-      (await invoke(request, credential, "console.close", { sessionId })).status(),
+      (
+        await invoke(request, credential, "console.close", { sessionId })
+      ).status(),
     ).toBe(200);
     expect(
-      (await invoke(request, credential, "console.read", { sessionId })).status(),
+      (
+        await invoke(request, credential, "console.read", { sessionId })
+      ).status(),
     ).toBe(404);
   });
 

@@ -13,6 +13,11 @@ import type {
 } from "./admin-workspace-store";
 
 const MANAGEMENT_NETWORK = "agentor-management";
+// Bump this whenever the trusted overlay/base contract changes in a way that
+// must be materialized for existing persistent administrative workspaces.
+// The workspace volume remains untouched; only its disposable compute image
+// is refreshed.
+const ADMIN_OVERLAY_VERSION = "2";
 const ADMIN_CONTAINER = "agentor-admin-workspace";
 const ADMIN_WORKSPACE_VOLUME = "agentor-admin-workspace-data";
 const ADMIN_AGENTS_VOLUME = "agentor-admin-agent-data";
@@ -96,8 +101,10 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
       await container.start();
     if (record.status === "stopped" && status.State.Running)
       await container.stop({ t: 15 });
+    if (record.status === "running") await this.waitForReady(container);
     await this.ensureAdminAttached(container);
-    await this.syncControlRepresentation(container);
+    if (record.status === "running")
+      await this.syncControlRepresentation(container);
     await this.registerServices(record, container);
     await this.reconcileManagementNetwork(container.id);
     return image;
@@ -107,7 +114,9 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     await this.ensure(record);
     const container = this.docker.getContainer(ADMIN_CONTAINER);
     if (!(await container.inspect()).State.Running) await container.start();
+    await this.waitForReady(container);
     await this.ensureAdminAttached(container);
+    await this.syncControlRepresentation(container);
     await this.registerServices(record, container);
   }
 
@@ -133,10 +142,34 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     const image = await this.ensureOverlayImage(true);
     const container = await this.create(record, image.digest);
     await container.start();
+    await this.waitForReady(container);
     await this.ensureAdminAttached(container);
     await this.syncControlRepresentation(container);
     await this.registerServices(record, container);
+    await this.reconcileManagementNetwork(container.id);
     return image;
+  }
+
+  private async waitForReady(container: Docker.Container): Promise<void> {
+    const deadline = Date.now() + 90_000;
+    while (Date.now() < deadline) {
+      const inspection = await container.inspect();
+      const state = inspection.State;
+      if (!state.Running)
+        throw new Error(
+          `Administrative workspace stopped during startup${state.Error ? `: ${state.Error}` : ""}`,
+        );
+      if (!inspection.Config?.Healthcheck && !state.Health) return;
+      if (state.Health?.Status === "healthy") return;
+      if (state.Health?.Status === "unhealthy")
+        throw new Error(
+          "Administrative workspace failed its startup health check",
+        );
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw new Error(
+      "Administrative workspace did not become ready within 90 seconds",
+    );
   }
 
   async security(workerId?: string) {
@@ -500,12 +533,19 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
           throw new Error(
             "Pinned administrative image failed the trusted-overlay provenance check; explicit rebuild is required",
           );
-        return { name: this.image, digest: pinnedDigest };
+        if (
+          pinned.Config?.Labels?.["agentor.admin.overlay-version"] ===
+          ADMIN_OVERLAY_VERSION
+        )
+          return { name: this.image, digest: pinnedDigest };
+        // Persistent records pin the last known-good runtime image. Older
+        // overlays predate required admin-workspace integrations (including
+        // management MCP discovery), so refresh disposable compute while
+        // retaining the persistent workspace and agent-data volumes.
       } catch (error: any) {
         if (error?.statusCode !== 404) throw error;
-        throw new Error(
-          "Pinned administrative image is unavailable; explicit rebuild is required",
-        );
+        // A missing or superseded generated overlay is recoverable from the
+        // approved Agentor worker base below.
       }
     }
     const base = `${this.config.workerImagePrefix}${this.config.workerImage}`;
@@ -517,7 +557,12 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     if (!force) {
       try {
         const existing = await this.docker.getImage(this.image).inspect();
-        if (isTrustedOverlay(existing) && existing.Config?.Labels?.["agentor.admin.base"] === baseDigest)
+        if (
+          isTrustedOverlay(existing) &&
+          existing.Config?.Labels?.["agentor.admin.base"] === baseDigest &&
+          existing.Config?.Labels?.["agentor.admin.overlay-version"] ===
+            ADMIN_OVERLAY_VERSION
+        )
           return {
             name: this.image,
             digest: normalizeDigest(existing.Id, this.image),
@@ -533,8 +578,13 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     // the configured mutable base tag, this name cannot select different
     // content without explicit Docker-level authority.
     const baseRepo = "agentor-admin-approved-base";
-    const baseVersion = baseDigest.slice("sha256:".length, "sha256:".length + 32);
-    await this.docker.getImage(baseDigest).tag({ repo: baseRepo, tag: baseVersion });
+    const baseVersion = baseDigest.slice(
+      "sha256:".length,
+      "sha256:".length + 32,
+    );
+    await this.docker
+      .getImage(baseDigest)
+      .tag({ repo: baseRepo, tag: baseVersion });
     const pinnedBase = `${baseRepo}:${baseVersion}`;
     const context = pack();
     const dockerfile = [
@@ -557,6 +607,7 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
       forcerm: true,
       labels: {
         "agentor.admin.overlay": "true",
+        "agentor.admin.overlay-version": ADMIN_OVERLAY_VERSION,
         "agentor.admin.base": baseDigest,
         "agentor.admin.configured-base": base,
       },
@@ -565,7 +616,8 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
       let buildError: Error | undefined;
       this.docker.modem.followProgress(
         output,
-        (error: Error | null) => error || buildError ? reject(error || buildError) : resolve(),
+        (error: Error | null) =>
+          error || buildError ? reject(error || buildError) : resolve(),
         (event: { error?: string; errorDetail?: { message?: string } }) => {
           const message = event.errorDetail?.message || event.error;
           if (message) buildError = new Error(message);
