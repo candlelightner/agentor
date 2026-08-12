@@ -1,4 +1,143 @@
-import Docker from 'dockerode'; import { useConfig,useContainerManager,useWorkerGroupStore,useWorkerStore } from './services'; import type { ManagedNetwork } from './managed-network-store';
-const forbidden=(name:string)=>name==='agentor-management'||/management|internal/i.test(name);
-export class ManagedNetworkManager { private docker=new Docker({socketPath:'/var/run/docker.sock'}); async members(network:ManagedNetwork){const ids=network.scope==='group'&&network.groupId?useWorkerGroupStore().get(network.userId,network.groupId)?.workerIds??[]:network.workerIds; return [...new Set(ids)].filter(id=>useWorkerStore().get(network.userId,id));} async reconcile(network:ManagedNetwork){if(forbidden(network.dockerName))throw createError({statusCode:400,statusMessage:'Management networks cannot be managed or attached'}); let dockerNetwork;try{dockerNetwork=await this.docker.getNetwork(network.dockerName).inspect()}catch{await this.docker.createNetwork({Name:network.dockerName,Driver:'bridge',Internal:false,Labels:{'agentor.managed-network':'true','agentor.owner':network.userId}});dockerNetwork=await this.docker.getNetwork(network.dockerName).inspect()}const target=new Set(await this.members(network)), failures:string[]=[],cm=useContainerManager();for(const id of target){const c=cm.get(id);if(c)await this.docker.getNetwork(network.dockerName).connect({Container:c.containerId}).catch((e:any)=>failures.push(`attach ${id}: ${e.message}`))}for(const c of Object.values(dockerNetwork.Containers||{})){const worker=cm.findByContainerName((c as any).Name);if(worker&&!target.has(worker.id))await this.docker.getNetwork(network.dockerName).disconnect({Container:(c as any).Name,Force:true}).catch((e:any)=>failures.push(`detach ${worker.id}: ${e.message}`))}return {workerIds:[...target],partialFailures:failures}} async remove(network:ManagedNetwork){if(forbidden(network.dockerName))throw createError({statusCode:400,statusMessage:'Management networks cannot be removed'});await this.docker.getNetwork(network.dockerName).remove().catch((e:any)=>{throw createError({statusCode:409,statusMessage:`Network removal failed: ${e.message}`})})} async topology(network:ManagedNetwork){const inspection=await this.docker.getNetwork(network.dockerName).inspect().catch(()=>null);return {network,containers:Object.values(inspection?.Containers||{}).map((x:any)=>({name:x.Name,id:x.Name}))}} async validate(network:ManagedNetwork){const topology=await this.topology(network), expected=await this.members(network), names=new Set(topology.containers.map((x:any)=>x.name));const missing=expected.filter(id=>{const c=useContainerManager().get(id);return c&&!names.has(c.containerName)});return {ok:missing.length===0,missingWorkerIds:missing,actual:topology.containers};} }
-export const useManagedNetworkManager=()=>new ManagedNetworkManager();
+import Docker from "dockerode";
+import {
+  useContainerManager,
+  useManagedNetworkStore,
+  useWorkerGroupStore,
+  useWorkerStore,
+} from "./services";
+import type { ManagedNetwork } from "./managed-network-store";
+
+const forbidden = (name: string) =>
+  name === "agentor-management" || /management|internal/i.test(name);
+
+export class ManagedNetworkManager {
+  private readonly docker = new Docker({ socketPath: "/var/run/docker.sock" });
+
+  async members(network: ManagedNetwork) {
+    let ids: string[];
+    if (network.scope === "all")
+      ids = useWorkerStore()
+        .listForUser(network.userId)
+        .filter((worker) => worker.status !== "archived")
+        .map((worker) => worker.id);
+    else if (network.scope === "group" && network.groupId)
+      ids = useWorkerGroupStore().get(network.userId, network.groupId)?.workerIds ?? [];
+    else ids = network.workerIds;
+    return [...new Set(ids)].filter((id) => useWorkerStore().get(network.userId, id));
+  }
+
+  async reconcile(network: ManagedNetwork) {
+    this.assertSafe(network);
+    const dockerNetwork = await this.ensure(network);
+    const target = new Set(await this.members(network));
+    const failures: string[] = [];
+    const manager = useContainerManager();
+    const currentByName = new Map(
+      Object.entries(dockerNetwork.Containers || {}).map(([id, member]) => [
+        member.Name,
+        id,
+      ]),
+    );
+    for (const id of target) {
+      const worker = manager.get(id);
+      if (!worker || !worker.containerId || currentByName.has(worker.containerName)) continue;
+      await this.docker
+        .getNetwork(network.dockerName)
+        .connect({ Container: worker.containerId })
+        .catch((error: any) => failures.push(`attach ${id}: ${safeMessage(error)}`));
+    }
+    for (const [name, containerId] of currentByName) {
+      const worker = manager.findByContainerName(name);
+      // A managed bridge is only for its selected Agentor workers. Do not let
+      // a manually attached container quietly become a peer on that network.
+      if (worker && target.has(worker.id)) continue;
+      await this.docker
+        .getNetwork(network.dockerName)
+        .disconnect({ Container: containerId, Force: true })
+        .catch((error: any) => failures.push(`detach ${worker?.id || name}: ${safeMessage(error)}`));
+    }
+    return { workerIds: [...target], partialFailures: failures };
+  }
+
+  async reconcileOwner(userId: string) {
+    const results = [];
+    for (const network of useManagedNetworkStore().listForUser(userId))
+      results.push({ networkId: network.id, ...(await this.reconcile(network)) });
+    return results;
+  }
+
+  async remove(network: ManagedNetwork) {
+    this.assertSafe(network);
+    try {
+      await this.docker.getNetwork(network.dockerName).remove();
+    } catch (error: any) {
+      if (error?.statusCode === 404) return;
+      throw createError({ statusCode: 409, statusMessage: `Network removal failed: ${safeMessage(error)}` });
+    }
+  }
+
+  async topology(network: ManagedNetwork) {
+    this.assertSafe(network);
+    const inspection = await this.docker.getNetwork(network.dockerName).inspect().catch(() => null);
+    return {
+      network,
+      exists: Boolean(inspection),
+      containers: Object.entries(inspection?.Containers || {}).map(([id, member]) => ({
+        id,
+        name: member.Name,
+        ipv4Address: member.IPv4Address,
+      })),
+    };
+  }
+
+  async validate(network: ManagedNetwork) {
+    const topology = await this.topology(network);
+    const expected = await this.members(network);
+    const names = new Set(topology.containers.map((container) => container.name));
+    const missingWorkerIds = expected.filter((id) => {
+      const worker = useContainerManager().get(id);
+      return worker && !names.has(worker.containerName);
+    });
+    const unexpected = topology.containers.filter((container) => {
+      const worker = useContainerManager().findByContainerName(container.name);
+      return !worker || !expected.includes(worker.id);
+    });
+    return { ok: topology.exists && missingWorkerIds.length === 0 && unexpected.length === 0, missingWorkerIds, unexpected, actual: topology.containers };
+  }
+
+  private assertSafe(network: ManagedNetwork) {
+    if (forbidden(network.dockerName))
+      throw createError({ statusCode: 400, statusMessage: "Management networks cannot be managed or attached" });
+  }
+
+  private async ensure(network: ManagedNetwork) {
+    try {
+      const existing = await this.docker.getNetwork(network.dockerName).inspect();
+      if (
+        existing.Driver !== "bridge" ||
+        existing.Internal ||
+        existing.Labels?.["agentor.managed-network"] !== "true" ||
+        existing.Labels?.["agentor.owner"] !== network.userId
+      )
+        throw createError({ statusCode: 409, statusMessage: "Existing Docker network fails Agentor ownership policy" });
+      return existing;
+    } catch (error: any) {
+      if (error?.statusCode !== 404) throw error;
+    }
+    await this.docker.createNetwork({
+      Name: network.dockerName,
+      Driver: "bridge",
+      Internal: false,
+      CheckDuplicate: true,
+      Labels: { "agentor.managed-network": "true", "agentor.owner": network.userId },
+    });
+    return this.docker.getNetwork(network.dockerName).inspect();
+  }
+}
+
+function safeMessage(error: unknown) {
+  return error instanceof Error ? error.message.slice(0, 300) : "Docker operation failed";
+}
+
+let singleton: ManagedNetworkManager | undefined;
+export const useManagedNetworkManager = () => (singleton ??= new ManagedNetworkManager());

@@ -24,6 +24,7 @@ import { Logger } from './logger';
 import { LogCollector } from './log-collector';
 import { ExportJobManager } from './export-jobs';
 import { WorkerGroupStore } from './worker-group-store';
+import { ManagedNetworkStore } from './managed-network-store';
 
 function singleton<T>(factory: () => T): () => T {
   let instance: T | undefined;
@@ -52,6 +53,7 @@ export const useTraefikManager = singleton(() => new TraefikManager(
 export const useEnvironmentStore = singleton(() => new EnvironmentStore(useConfig().dataDir));
 export const useWorkerStore = singleton(() => new WorkerStore(useConfig().dataDir));
 export const useWorkerGroupStore = singleton(() => new WorkerGroupStore(useConfig().dataDir));
+export const useManagedNetworkStore = singleton(() => new ManagedNetworkStore(useConfig().dataDir));
 export const useUpdateChecker = singleton(() => new UpdateChecker(useConfig()));
 export const useUsageChecker = singleton(() => new UsageChecker(useConfig()));
 export const useResourceMonitor = singleton(

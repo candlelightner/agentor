@@ -1,4 +1,4 @@
-import { useConfig, useDockerService, useContainerManager, usePortMappingStore, useDomainMappingStore, useTraefikManager, useEnvironmentStore, useWorkerStore, useWorkerGroupStore, useUpdateChecker, useUsageChecker, useResourceMonitor, useUserCredentialManager, useUserEnvStore, useOrphanSweeper, useStorageManager, useCapabilityStore, useInstructionStore, useInitScriptStore, useLogStore, useLogger, useLogCollector, useExportJobManager } from '../utils/services';
+import { useConfig, useDockerService, useContainerManager, usePortMappingStore, useDomainMappingStore, useTraefikManager, useEnvironmentStore, useWorkerStore, useWorkerGroupStore, useManagedNetworkStore, useUpdateChecker, useUsageChecker, useResourceMonitor, useUserCredentialManager, useUserEnvStore, useOrphanSweeper, useStorageManager, useCapabilityStore, useInstructionStore, useInitScriptStore, useLogStore, useLogger, useLogCollector, useExportJobManager } from '../utils/services';
 import { loadBuiltInCapabilities, loadBuiltInInstructions, loadBuiltInInitScripts, loadBuiltInEnvironments } from '../utils/built-in-content';
 import { migrateAuth, getAuthDb } from '../utils/auth';
 import { cleanupWorkspaceHelpers } from '../utils/workspace-access';
@@ -94,6 +94,7 @@ export default defineNitroPlugin(async (nitroApp) => {
     })(),
     workerStore.init(),
     useWorkerGroupStore().init(),
+    useManagedNetworkStore().init(),
     portMappingStore.init(),
     domainMappingStore.init(),
     useExportJobManager().init(),
@@ -110,6 +111,14 @@ export default defineNitroPlugin(async (nitroApp) => {
   containerManager.setInstructionStore(instructionStore);
   containerManager.setWorkerStore(workerStore);
   await containerManager.reconcileWorkers();
+  // Restore desired managed-network membership after a daemon/orchestrator
+  // restart. Keep worker startup available if a user-created bridge is broken;
+  // validation/UI will expose the failed network instead of hiding it.
+  const { useManagedNetworkManager } = await import('../utils/managed-network-manager');
+  for (const userId of useManagedNetworkStore().listUserIds())
+    await useManagedNetworkManager().reconcileOwner(userId).catch((error) =>
+      logger.warn(`[agentor] managed network reconciliation failed for ${userId}: ${error instanceof Error ? error.message : error}`),
+    );
 
   // The administrative workspace uses a separate, generated Docker boundary:
   // its image/mount/network inputs are not accepted from dashboard requests.

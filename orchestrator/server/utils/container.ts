@@ -71,6 +71,13 @@ const WORKER_ID_LABEL = 'agentor.id';
 const IMPORT_IMAGE_PREFIX = 'agentor-import-';
 
 export class ContainerManager {
+  /** Reattach a freshly created/rebuilt worker to owner-managed networks. Failure
+   * is logged only: the worker lifecycle succeeded and the network remains
+   * inspectable/reconcilable rather than leaving a half-created worker. */
+  private async reconcileManagedNetworksForWorker(userId: string) {
+    const [{ useManagedNetworkStore }, { useManagedNetworkManager }] = await Promise.all([import('./services'), import('./managed-network-manager')]);
+    for (const network of useManagedNetworkStore().listForUser(userId)) await useManagedNetworkManager().reconcile(network).catch((error) => useLogger().warn(`[container] managed network reconcile failed: ${error instanceof Error ? error.message : error}`));
+  }
   /** Keyed by the worker's UUID `id` (stable across rebuild/unarchive). */
   private containers: Map<string, ContainerInfo> = new Map();
   private dockerService: DockerService;
@@ -519,6 +526,7 @@ export class ContainerManager {
     useLogCollector().attach(containerName, container.id, 'worker', displayName).catch(() => {});
 
     useLogger().info(`[container] created worker ${containerName} (${container.id.slice(0, 12)})`);
+    await this.reconcileManagedNetworksForWorker(userId);
 
     return containerInfo;
   }
@@ -1339,6 +1347,7 @@ export class ContainerManager {
     useLogCollector().attach(info.containerName, container.id, 'worker', info.displayName).catch(() => {});
 
     useLogger().info(`[container] rebuilt ${info.containerName} (${container.id.slice(0, 12)})`);
+    await this.reconcileManagedNetworksForWorker(info.userId);
 
     return containerInfo;
   }
@@ -1443,6 +1452,7 @@ export class ContainerManager {
     useLogCollector().attach(containerName, container.id, 'worker', worker.displayName).catch(() => {});
 
     useLogger().info(`[container] unarchived ${containerName} (${container.id.slice(0, 12)})`);
+    await this.reconcileManagedNetworksForWorker(worker.userId);
 
     return containerInfo;
   }
