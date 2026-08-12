@@ -48,6 +48,14 @@ All agents are installed in a single unified worker image. Start any agent via i
 
 ---
 
+## Management MCP parity
+
+The internal administrative MCP's current UI/API parity, intentional secret and
+streaming boundaries, capability policy, and remaining gaps are documented in
+[Management MCP parity](docs/management-mcp-parity.md).
+
+---
+
 ## Quick Start
 
 No need to clone the repo — all images are pulled from GHCR.
