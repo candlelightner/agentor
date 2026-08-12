@@ -35,6 +35,7 @@ defineRouteMeta({
 
 import { useDomainMappingStore, useTraefikManager, useContainerManager, useConfig } from '../../utils/services';
 import { requireContainerAccess } from '../../utils/auth-helpers';
+import { useWorkerProtectionLockStore } from '../../utils/worker-protection-lock';
 
 export default defineEventHandler(async (event) => {
   const body = await readBody(event);
@@ -148,6 +149,7 @@ export default defineEventHandler(async (event) => {
   }
 
   requireContainerAccess(event, containerInfo);
+  await useWorkerProtectionLockStore().verify(containerInfo.id, body.lockPassword);
 
   const hasUser = !!body.basicAuth?.username;
   const hasPass = !!body.basicAuth?.password;

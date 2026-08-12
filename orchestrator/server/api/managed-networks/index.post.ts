@@ -2,10 +2,13 @@ defineRouteMeta({ openAPI: { tags: ['Managed networks'], summary: 'Create a mana
 import { requireAuth } from '../../utils/auth-helpers';
 import { useManagedNetworkStore, useWorkerGroupStore } from '../../utils/services';
 import { useManagedNetworkManager } from '../../utils/managed-network-manager';
+import { verifyWorkerMutationUnlocks } from '../../utils/worker-protection-lock';
 export default defineEventHandler(async event => {
   const { user } = requireAuth(event); const body: any = await readBody(event);
   if (typeof body?.name !== 'string' || !body.name.trim() || body.name.length > 100 || !['all', 'selected', 'group'].includes(body.scope)) throw createError({ statusCode: 400, statusMessage: 'Valid name and scope are required' });
   if (body.scope === 'group' && (typeof body.groupId !== 'string' || !useWorkerGroupStore().get(user.id, body.groupId))) throw createError({ statusCode: 400, statusMessage: 'Group not found' });
+  const affected = body.scope === 'selected' ? body.workerIds || [] : body.scope === 'group' ? useWorkerGroupStore().get(user.id, body.groupId)?.workerIds || [] : [];
+  await verifyWorkerMutationUnlocks(affected, body.lockPasswords);
   const store = useManagedNetworkStore(); const network = await store.create(user.id, body.name, body.scope, body.scope === 'group' ? body.groupId : undefined);
   try {
     const reconciliation = await useManagedNetworkManager().reconcile(network);

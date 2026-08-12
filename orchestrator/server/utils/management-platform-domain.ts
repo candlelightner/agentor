@@ -5,6 +5,7 @@ import {
   useWorkerStore,
 } from "./services";
 import { useStorageVisibilityManager } from "./storage-visibility";
+import { verifyWorkerMutationUnlocks } from "./worker-protection-lock";
 
 export interface ManagementPlatformTool {
   name: string;
@@ -55,6 +56,7 @@ export class ManagementPlatformDomain {
         if (!group) throw error(400, "Group not found for network owner");
       }
       validateWorkers(ownerId, args.workerIds);
+      await verifyWorkerMutationUnlocks(strings(args.workerIds), args.lockPasswords);
       const network = await store.create(ownerId, label, scope as any, groupId);
       if (scope === "selected")
         await store.update(ownerId, network.id, { workerIds: strings(args.workerIds) });
@@ -75,12 +77,15 @@ export class ManagementPlatformDomain {
     if (name === "networks.inspect")
       return { handled: true, result: { ...(await manager.topology(network)), validation: await manager.validate(network) } };
     if (name === "networks.delete") {
+      await verifyWorkerMutationUnlocks(await affectedWorkerIds(network), args.lockPasswords);
       await manager.remove(network);
       await store.remove(network.userId, id);
       return { handled: true, result: { id, deleted: true } };
     }
     if (name === "networks.reconcile")
+      { await verifyWorkerMutationUnlocks(await affectedWorkerIds(network), args.lockPasswords);
       return { handled: true, result: await manager.reconcile(network) };
+      }
     const patch: any = {};
     if (args.name !== undefined) {
       const label = required(args.name, "name").trim();
@@ -96,6 +101,7 @@ export class ManagementPlatformDomain {
       validateWorkers(network.userId, args.workerIds);
       patch.workerIds = strings(args.workerIds);
     }
+    await verifyWorkerMutationUnlocks([...await affectedWorkerIds(network), ...strings(args.workerIds)], args.lockPasswords);
     if (args.groupId !== undefined) {
       const groupId = optional(args.groupId);
       if (groupId && !useWorkerGroupStore().get(network.userId, groupId)) throw error(400, "Group not found");
@@ -104,6 +110,12 @@ export class ManagementPlatformDomain {
     const updated = await store.update(network.userId, id, patch);
     return { handled: true, result: { ...updated, reconciliation: await manager.reconcile(updated) } };
   }
+}
+
+async function affectedWorkerIds(network: any): Promise<string[]> {
+  if (network.scope === "selected") return network.workerIds || [];
+  if (network.scope === "group") return useWorkerGroupStore().get(network.userId, network.groupId)?.workerIds || [];
+  return useWorkerStore().listForUser(network.userId).map((worker: any) => worker.id);
 }
 
 function tool(name: string, group: ManagementPlatformTool["group"], description: string, annotations: Record<string, boolean>): ManagementPlatformTool {

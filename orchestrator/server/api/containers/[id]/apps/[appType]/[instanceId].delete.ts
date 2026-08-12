@@ -19,6 +19,7 @@ defineRouteMeta({
 import { useContainerManager } from '../../../../../utils/services';
 import { requireContainerAccess } from '../../../../../utils/auth-helpers';
 import { rethrowAsHttpError } from '../../../../../utils/http-errors';
+import { useWorkerProtectionLockStore } from '../../../../../utils/worker-protection-lock';
 
 export default defineEventHandler(async (event) => {
   const id = getRouterParam(event, 'id')!;
@@ -27,6 +28,8 @@ export default defineEventHandler(async (event) => {
   try {
     const cm = useContainerManager();
     requireContainerAccess(event, cm.get(id));
+    const body = await readBody<{ lockPassword?: unknown }>(event).catch(() => ({}));
+    await useWorkerProtectionLockStore().verify(id, body?.lockPassword);
     await cm.stopAppInstance(id, appType, instanceId);
     return { ok: true };
   } catch (err) {

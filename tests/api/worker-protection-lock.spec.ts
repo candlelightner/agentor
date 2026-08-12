@@ -25,6 +25,13 @@ test.describe.serial('Worker protection locks', () => {
     expect((await request.post(`/api/archived/${workerId}/unarchive`, { data: { lockPassword: password } })).status()).toBe(200);
   });
 
+  test('enforces the same lock on stop and restart lifecycle aliases', async ({ request }) => {
+    expect((await request.post(`/api/containers/${workerId}/stop`, { data: {} })).status()).toBe(423);
+    expect((await request.post(`/api/containers/${workerId}/stop`, { data: { lockPassword: password } })).status()).toBe(200);
+    expect((await request.post(`/api/containers/${workerId}/restart`, { data: {} })).status()).toBe(423);
+    expect((await request.post(`/api/containers/${workerId}/restart`, { data: { lockPassword: password } })).status()).toBe(200);
+  });
+
   test('removes protection with the correct password', async ({ request }) => {
     const result = await request.delete(`/api/containers/${workerId}/protection`, { data: { password } });
     expect(result.status()).toBe(200); expect(await result.json()).toEqual({ workerId, protected: false });

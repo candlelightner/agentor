@@ -29,7 +29,7 @@ export class ManagementWorkerDomain {
     const names: Array<[string, ManagementDomainTool["group"], string, Record<string, unknown>, Record<string, boolean | string>]> = [
       ["workers.create", "worker-lifecycle", "Create a worker for an explicit owner.", { type:"object", required:["userId"], properties:{ userId:{type:"string"}, displayName:{type:"string"}, environmentId:{type:"string"} } }, mutation],
       ["workers.update", "worker-lifecycle", "Update material worker settings; protected workers require lockPassword.", objectWithWorker(), mutation],
-      ["workers.restart", "worker-lifecycle", "Restart a worker.", objectWithWorker(), mutation],
+      ["workers.restart", "worker-lifecycle", "Restart a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
       ["workers.rebuild", "worker-lifecycle", "Rebuild a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
       ["workers.archive", "worker-lifecycle", "Archive a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
       ["workers.unarchive", "worker-lifecycle", "Unarchive a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
@@ -70,7 +70,7 @@ export class ManagementWorkerDomain {
       worker.pendingRebuild=true; const stored=useWorkerStore().findById(workerId); if(stored){stored.pendingRebuild=true;stored.updatedAt=new Date().toISOString();await useWorkerStore().upsert(stored);}
       return { handled:true,result: await workerConfigurationResponse(worker) };
     }
-    if (name === "workers.restart") { await cm.restart(workerId); return {handled:true,result:{workerId,status:"running"}}; }
+    if (name === "workers.restart") { await locks.verify(workerId,args.lockPassword); await cm.restart(workerId); return {handled:true,result:{workerId,status:"running"}}; }
     await locks.verify(workerId,args.lockPassword);
     if (name === "workers.update") return {handled:true,result:await cm.updateSettings(workerId, settings(args))};
     if (name === "workers.rebuild") return {handled:true,result:await cm.rebuild(workerId)};

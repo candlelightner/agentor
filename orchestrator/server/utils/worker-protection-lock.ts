@@ -58,5 +58,14 @@ export async function requireWorkerMutationUnlock(event: H3Event, workerId: stri
   return body || {};
 }
 
+/** Verify every protected worker affected by a bulk mutation.  Callers pass a
+ * transient workerId -> password map; it is deliberately never persisted. */
+export async function verifyWorkerMutationUnlocks(workerIds: Iterable<string>, passwords: unknown) {
+  const supplied = passwords && typeof passwords === "object" && !Array.isArray(passwords)
+    ? passwords as Record<string, unknown> : {};
+  const locks = useWorkerProtectionLockStore();
+  for (const id of new Set(workerIds)) await locks.verify(id, supplied[id]);
+}
+
 let singleton: WorkerProtectionLockStore | undefined;
 export function useWorkerProtectionLockStore() { return (singleton ??= new WorkerProtectionLockStore(useConfig().dataDir)); }

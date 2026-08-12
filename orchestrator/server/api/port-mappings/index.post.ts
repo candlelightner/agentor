@@ -34,6 +34,7 @@ defineRouteMeta({
 import { usePortMappingStore, useTraefikManager, useContainerManager } from '../../utils/services';
 import { TraefikPortConflictError } from '../../utils/traefik-manager';
 import { requireContainerAccess } from '../../utils/auth-helpers';
+import { useWorkerProtectionLockStore } from '../../utils/worker-protection-lock';
 
 export default defineEventHandler(async (event) => {
   const body = await readBody(event);
@@ -83,6 +84,7 @@ export default defineEventHandler(async (event) => {
   }
 
   requireContainerAccess(event, containerInfo);
+  await useWorkerProtectionLockStore().verify(containerInfo.id, body.lockPassword);
 
   const traefik = useTraefikManager();
 
