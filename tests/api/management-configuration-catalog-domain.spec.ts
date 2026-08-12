@@ -19,12 +19,8 @@ test('catalog adapter delete calls the store with the entry id', async()=>{
     create:async()=>item,
     delete:async(id:string)=>{deleted.push(id)},
   };
-  (globalThis as any).useCapabilityStore=()=>store;
-  try {
-    const result=await new ManagementConfigurationCatalogDomain().execute('catalog.capabilities.delete',{ownerId:'owner-id',id:'entry-id'});
-    expect(result).toEqual({handled:true,result:{id:'entry-id',deleted:true}});
-    expect(deleted).toEqual(['entry-id']);
-  } finally {
-    delete (globalThis as any).useCapabilityStore;
-  }
+  const domain=new ManagementConfigurationCatalogDomain({capabilities:()=>store});
+  const result=await domain.execute('catalog.capabilities.delete',{ownerId:'owner-id',id:'entry-id'});
+  expect(result).toEqual({handled:true,result:{id:'entry-id',deleted:true}});
+  expect(deleted).toEqual(['entry-id']);
 });
