@@ -5,11 +5,7 @@ function domain(overrides: Partial<ConstructorParameters<typeof ManagementLogsDo
   return new ManagementLogsDomain({
     findWorker: id => id === 'worker-a' ? { id, userId: 'owner-a' } : undefined,
     readLogs: async (_id, tail) => `tail=${tail} token=super-secret file=also-secret`,
-    managedSecretValues: async () => [
-      { kind: 'secret', value: 'super-secret' },
-      { kind: 'secretFile', value: 'also-secret' },
-      { kind: 'variable', value: 'not-a-secret' },
-    ],
+    managedSecretValues: async () => ['super-secret', 'also-secret'],
     ...overrides,
   });
 }
@@ -28,7 +24,6 @@ test('management logs domain limits tail and redacts configured secrets without 
   expect(result.result.logs).toContain('[REDACTED]');
   expect(result.result.logs).not.toContain('super-secret');
   expect(result.result.logs).not.toContain('also-secret');
-  expect(result.result.logs).not.toContain('not-a-secret');
 });
 
 test('management logs domain rejects cross-owner, missing, malformed, and arbitrary tool requests', async () => {
@@ -40,7 +35,7 @@ test('management logs domain rejects cross-owner, missing, malformed, and arbitr
 });
 
 test('redaction handles overlapping literals and output is byte bounded', () => {
-  expect(redactLogs('abc123 abc', ['abc', 'abc123'])).toEqual({ logs: '[REDACTED] [REDACTED]', redacted: 2 });
+  expect(redactLogs('abcd123 abcd', ['abcd', 'abcd123'])).toEqual({ logs: '[REDACTED] [REDACTED]', redacted: 2 });
   const bounded = boundBytes('é'.repeat(100), 40);
   expect(bounded.truncated).toBe(true);
   expect(Buffer.byteLength(bounded.text, 'utf8')).toBeLessThanOrEqual(40);

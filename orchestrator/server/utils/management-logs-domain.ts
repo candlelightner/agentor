@@ -1,15 +1,15 @@
 import { useContainerManager, useWorkerStore } from "./services";
-import { useWorkerConfigStore } from "./worker-config-store";
+import { redactManagedOutput, workerOutputRedactionValues } from "./worker-output-redaction";
 
 const MAX_TAIL = 1_000;
 const MAX_BYTES = 256 * 1024;
 const readOnly = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 
-type Worker = { id: string; userId: string };
+type Worker = { id: string; userId: string; environmentId?: string };
 type Dependencies = {
   findWorker: (id: string) => Worker | undefined;
   readLogs: (id: string, tail: number) => Promise<string>;
-  managedSecretValues: (userId: string, workerId: string) => Promise<Array<{ kind: string; value: string }>>;
+  managedSecretValues: (worker: Worker) => Promise<string[]>;
 };
 
 /** A deliberately narrow management-MCP adapter for worker output.  It can
@@ -41,9 +41,7 @@ export class ManagementLogsDomain {
     if (worker.userId !== ownerId) throw failure(404, "Worker not found");
     const tail = boundedTail(args.tail);
     const raw = await this.deps.readLogs(worker.id, tail);
-    const secretValues = (await this.deps.managedSecretValues(worker.userId, worker.id))
-      .filter(entry => entry.kind !== "variable" && entry.value.length > 0)
-      .map(entry => entry.value);
+    const secretValues = await this.deps.managedSecretValues(worker);
     const redaction = redactLogs(raw, secretValues);
     const bounded = boundBytes(redaction.logs, MAX_BYTES);
     return { handled: true, result: {
@@ -58,18 +56,8 @@ export class ManagementLogsDomain {
 }
 
 export function redactLogs(logs: string, values: string[]) {
-  let result = logs;
-  let redacted = 0;
-  // Longer literals first prevents a short secret from partially masking one.
-  for (const value of [...new Set(values)].sort((a, b) => b.length - a.length)) {
-    if (!value) continue;
-    const parts = result.split(value);
-    if (parts.length > 1) {
-      redacted += parts.length - 1;
-      result = parts.join("[REDACTED]");
-    }
-  }
-  return { logs: result, redacted };
+  const result = redactManagedOutput(logs, values);
+  return { logs: result.output, redacted: result.redacted };
 }
 
 export function boundBytes(text: string, limit: number) {
@@ -85,7 +73,7 @@ function defaultDependencies(): Dependencies {
   return {
     findWorker: id => useContainerManager().get(id) ?? useWorkerStore().findById(id),
     readLogs: (id, tail) => useContainerManager().logs(id, tail),
-    managedSecretValues: (userId, workerId) => useWorkerConfigStore().resolveValues(userId, workerId),
+    managedSecretValues: worker => workerOutputRedactionValues(worker),
   };
 }
 function required(value: unknown, name: string) { if (typeof value !== "string" || !value.trim()) throw failure(400, `${name} is required`); return value; }

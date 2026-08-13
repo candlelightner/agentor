@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { Duplex } from "node:stream";
 import { useContainerManager, useDockerService } from "./services";
-import { useWorkerConfigStore } from "./worker-config-store";
+import {
+  redactManagedBufferSlice,
+  workerOutputRedactionValues,
+} from "./worker-output-redaction";
 
 interface ConsoleSession {
   id: string;
@@ -73,26 +76,26 @@ export class ManagementConsoleStore {
     const session = this.get(workspaceId, id);
     const requested = Number.isInteger(from) ? Math.max(0, Number(from)) : session.offset;
     const start = Math.max(requested, session.offset);
-    const index = start - session.offset;
     this.touch(session);
-    let output = session.output.subarray(index).toString("utf8");
+    let slice = {
+      output: session.output.subarray(start - session.offset).toString("utf8"),
+      start: start - session.offset,
+      safeEnd: session.output.length,
+    };
     const worker = useContainerManager().get(session.workerId);
     if (worker) {
-      const configured = await useWorkerConfigStore().resolveValues(
-        worker.userId,
-        worker.id,
+      slice = redactManagedBufferSlice(
+        session.output,
+        start - session.offset,
+        await workerOutputRedactionValues(worker),
       );
-      for (const item of configured) {
-        if (item.kind === "variable" || item.value.length < 4) continue;
-        output = output.split(item.value).join("[REDACTED]");
-      }
     }
     return {
       ...this.public(session),
-      from: start,
-      nextOffset: session.offset + session.output.length,
+      from: session.offset + slice.start,
+      nextOffset: session.offset + slice.safeEnd,
       truncated: requested < session.offset,
-      output,
+      output: slice.output,
     };
   }
 
