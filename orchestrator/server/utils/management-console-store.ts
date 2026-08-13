@@ -26,6 +26,24 @@ interface ConsoleSession {
 const MAX_OUTPUT = 1024 * 1024;
 const MAX_SESSIONS = 16;
 const IDLE_MS = 15 * 60_000;
+/** Docker exec/attach calls can wait forever when a worker is being rebuilt.
+ * Keep MCP requests bounded so stale workers produce a useful error. */
+const DOCKER_OPERATION_TIMEOUT_MS = 15_000;
+
+async function withTimeout<T>(operation: Promise<T>, message: string, timeoutMs = DOCKER_OPERATION_TIMEOUT_MS): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(statusError(504, message)), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 /** Interactive console sessions for the management MCP. Sessions attach to a
  * linked tmux session inside one resolved worker; they never execute on the
@@ -42,9 +60,9 @@ export class ManagementConsoleStore {
       throw statusError(409, "Target worker is not running");
     if (!Number.isSafeInteger(windowIndex) || windowIndex < 0)
       throw statusError(400, "windowIndex must be a non-negative integer");
-    const attached = await useDockerService().execAttachTmuxWindow(
-      worker.containerId,
-      windowIndex,
+    const attached = await withTimeout(
+      useDockerService().execAttachTmuxWindow(worker.containerId, windowIndex),
+      "Opening console session timed out; verify the worker is running and retry.",
     );
     const session: ConsoleSession = {
       id: randomUUID(),
@@ -120,10 +138,11 @@ export class ManagementConsoleStore {
     if (session.idleTimer) clearTimeout(session.idleTimer);
     session.state = "closed";
     session.stream.end();
-    await useDockerService().killTmuxSession(
-      session.dockerContainerId,
-      session.tmuxSession,
-    );
+    await withTimeout(
+      useDockerService().killTmuxSession(session.dockerContainerId, session.tmuxSession),
+      "Closing console session timed out; it may already be stale.",
+      5_000,
+    ).catch(() => undefined);
     return { id, workerId: session.workerId, state: "closed" as const };
   }
 
