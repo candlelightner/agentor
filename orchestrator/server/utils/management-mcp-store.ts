@@ -34,6 +34,10 @@ import { ManagementLogsDomain } from "./management-logs-domain";
 import { ManagementStatusDomain } from "./management-status-domain";
 import { ManagementGlobalConfigurationDomain } from "./management-global-configuration-domain";
 import { ManagementImportDomain } from "./management-import-domain";
+import {
+  ManagementDownloadDomain,
+  type OpenedManagementDownload,
+} from "./management-download-domain";
 import { useWorkerProtectionLockStore } from "./worker-protection-lock";
 import { validateManagementOwnerArguments } from "./management-owner";
 import type { Readable } from "node:stream";
@@ -72,6 +76,7 @@ const logsDomain = new ManagementLogsDomain();
 const statusDomain = new ManagementStatusDomain();
 const globalConfigurationDomain = new ManagementGlobalConfigurationDomain();
 const importDomain = new ManagementImportDomain();
+const downloadDomain = new ManagementDownloadDomain();
 interface Policy {
   schemaVersion: 1;
   default: "deny";
@@ -494,6 +499,51 @@ export class ManagementMcpStore {
       throw error;
     }
   }
+  async openDownload(
+    credential: unknown,
+    token: string,
+  ): Promise<OpenedManagementDownload> {
+    let identity: IdentityMetadata;
+    try {
+      identity = await this.introspect(credential);
+    } catch (error) {
+      await this.auditAuthorizationFailure("download.open");
+      throw error;
+    }
+    try {
+      await this.init();
+      const opened = await downloadDomain.open(
+        identity.workspaceId,
+        token,
+        (group) => {
+          // Handoffs can outlive the MCP call that prepared them, so consult
+          // the authoritative policy again at redemption time.
+          if (!this.state.policy.groups[group]?.enabled)
+            throw Object.assign(new Error("Tool denied by policy"), {
+              statusCode: 403,
+            });
+        },
+      );
+      await this.audit("download.opened", "success", {
+        ...opened.audit,
+      });
+      return opened;
+    } catch (error: any) {
+      await this.audit("download.opened", "failure", {
+        workspaceId: identity.workspaceId,
+        statusCode: Number.isInteger(error?.statusCode)
+          ? error.statusCode
+          : 500,
+      });
+      throw error;
+    }
+  }
+  async auditDownloadTransfer(
+    audit: OpenedManagementDownload["audit"],
+    outcome: "success" | "failure",
+  ) {
+    await this.audit("download.transferred", outcome, audit);
+  }
   private async executeTool(
     name: string,
     args: Record<string, unknown>,
@@ -519,6 +569,8 @@ export class ManagementMcpStore {
     if (globalConfiguration.handled) return globalConfiguration.result;
     const imported = await importDomain.execute(name, args, workspaceId);
     if (imported.handled) return imported.result;
+    const download = await downloadDomain.execute(name, args, workspaceId);
+    if (download.handled) return download.result;
     if (workspaceMcpTools.some((tool) => tool.name === name))
       return executeWorkspaceMcpTool(name, args);
     const workerId = typeof args.workerId === "string" ? args.workerId : "";

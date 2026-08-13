@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **1589 tests** across 145 test files (1017 API across 89 files + 572 UI across 56 files)
+- **1597 tests** across 147 test files (1025 API across 91 files + 572 UI across 56 files)
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -102,13 +102,13 @@ tests/
     worker-lifecycle.ts    # Container create/cleanup utilities
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
-  api/                     # API endpoint tests (1017 tests across 89 files)
+  api/                     # API endpoint tests (1025 tests across 91 files)
   ui/                      # UI interaction tests (572 tests across 56 files)
 ```
 
 ## Test Categories
 
-### API Tests (1017 tests, 89 files)
+### API Tests (1025 tests, 91 files)
 
 | `worker-protection-lock.spec.ts` | 6 | Password-verifier-only worker locks: set/change/remove validation, no password/hash disclosure, required lock credentials on settings/configuration/archive/unarchive, running-workspace file mutations, managed-network membership, stop/restart alternate lifecycle paths, and correct-password recovery. |
 
@@ -187,6 +187,8 @@ tests/
 | `management-status-domain.spec.ts` | 3 | Read-only usage and worker-metric tool declarations, owner filtering, sanitized provider/Docker errors, utilization clamping, and missing-resource validation. |
 | `management-global-configuration-domain.spec.ts` | 4 | User-global plain-variable MCP list/effective-safe/set/delete behavior, masking sensitive-looking names without falsely exposing secrets, owner isolation, and validation. |
 | `management-import-domain.spec.ts` | 6 | `imports.prepare` capability metadata and owner validation; workspace-bound one-use private tar upload handoff; media-type/length enforcement; streamed transport forwarding; empty/malformed/disconnected/oversize cleanup; and staging-cleanup eligibility. |
+| `management-download-domain.spec.ts` | 6 | Private one-use download token identity/expiry/replay behavior, exact normalized workspace paths and owner recheck, completed export-job owner binding, live capability authorization, unexpected source-error sanitization, streamed content headers without a session cookie, and disconnect source cleanup/auditing. |
+| `management-download-handoff.spec.ts` | 2 | Real admin-workspace/private-listener integration for a file above the former inline ceiling, directory ZIP and completed export tar streaming, invalid-credential/replay denial, and policy disable/re-enable checks at token redemption. |
 | `management-running-files-domain.spec.ts` | 1 | Bounded running-workspace MCP file CRUD surface, read/destructive annotations, and write-only protection-lock input. |
 | `provider-http.spec.ts`           | 6     | Provider HTTP boundary behavior for chunked/resumable transfer, retry and safe error normalization without credential or response-body leakage.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `github-repos.spec.ts`            | 3     | `GET /api/github/repos`: requires auth; a fresh user with no token → `tokenConfigured:false` + empty repos; a configured-but-bogus token → `tokenConfigured:true` with a surfaced `error` (regression for the old "any failure looks like no token" masking). Uses isolated test users.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |

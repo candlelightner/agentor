@@ -4,6 +4,7 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
+import { pipeline } from "node:stream/promises";
 import type { ManagementMcpStore } from "./management-mcp-store";
 
 const MAX_BODY = 1024 * 1024;
@@ -44,6 +45,56 @@ export class ManagementMcpTransport {
   private async handle(request: IncomingMessage, response: ServerResponse) {
     response.setHeader("Cache-Control", "no-store");
     response.setHeader("X-Content-Type-Options", "nosniff");
+    const downloadMatch = request.url?.match(
+      /^\/downloads\/([0-9a-f-]{36})$/i,
+    );
+    if (request.method === "GET" && downloadMatch) {
+      const authorization = request.headers.authorization || "";
+      const credential = authorization.startsWith("Bearer ")
+        ? authorization.slice(7)
+        : undefined;
+      let opened: Awaited<ReturnType<ManagementMcpStore["openDownload"]>>;
+      try {
+        opened = await this.store.openDownload(
+          credential,
+          downloadMatch[1]!,
+        );
+      } catch (error: any) {
+        const status = httpStatus(error);
+        return this.send(response, status, {
+          error: status >= 500 ? "Download failed" : error.message,
+        });
+      }
+
+      response.statusCode = 200;
+      response.setHeader("Content-Type", opened.contentType);
+      response.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${safeAttachmentName(opened.filename)}"`,
+      );
+      if (Number.isSafeInteger(opened.size) && opened.size! >= 0)
+        response.setHeader("Content-Length", String(opened.size));
+
+      const disconnect = () => {
+        if (!response.writableEnded)
+          opened.stream.destroy(new Error("Download client disconnected"));
+      };
+      response.once("close", disconnect);
+      try {
+        // pipeline preserves source backpressure and destroys both sides on a
+        // disconnect. No archive or file content is accumulated in memory.
+        await pipeline(opened.stream, response);
+        await this.store.auditDownloadTransfer(opened.audit, "success");
+      } catch {
+        await this.store
+          .auditDownloadTransfer(opened.audit, "failure")
+          .catch(() => {});
+        if (!response.destroyed) response.destroy();
+      } finally {
+        response.off("close", disconnect);
+      }
+      return;
+    }
     const importMatch = request.url?.match(/^\/imports\/([0-9a-f-]{36})$/i);
     if (request.method === "PUT" && importMatch) {
       const authorization = request.headers.authorization || "";
@@ -146,6 +197,19 @@ export class ManagementMcpTransport {
     response.setHeader("Content-Type", "application/json; charset=utf-8");
     response.end(JSON.stringify(value));
   }
+}
+
+function httpStatus(error: any): number {
+  const status = error?.statusCode;
+  return Number.isInteger(status) && status >= 400 && status <= 599
+    ? status
+    : 400;
+}
+
+function safeAttachmentName(value: unknown): string {
+  return typeof value === "string"
+    ? value.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 200) || "download"
+    : "download";
 }
 
 export function parseImportUploadHeaders(headers: IncomingMessage["headers"]) {

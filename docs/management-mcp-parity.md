@@ -28,10 +28,10 @@ or an interactive third-party login into a live-account verification.
 | User environments, capabilities, instructions, init scripts | Sidebar catalog dialogs and catalog APIs | `catalog.{environments,capabilities,instructions,init-scripts}.{list,get,create,update,delete}` | Catalog adapter tests; built-ins stay immutable and owner is explicit |
 | Worker groups | Worker Groups UI; `/api/worker-groups` | `groups.list`, `groups.create`, `groups.update`, `groups.delete` | `worker-groups.spec.ts` exercises API↔MCP parity against real Docker topology: membership updates reconcile every dependent group network, locks cover old/new members, and referenced-group deletion fails without losing state |
 | Protection locks | Worker Settings; `/api/containers/:id/protection` | `locks.get`, `locks.set`, `locks.remove` | `worker-protection-lock.spec.ts`; verifier/password is write-only, and `admin-management-mcp.spec.ts` verifies every legacy lifecycle/configuration, app, and exposure-mapping mutation alias requires it |
-| Workspace inventory and offline browse | Storage inventory/browser; `/api/workspaces/*` | `workspaces.list`, `workspaces.files`, `workspaces.preview`, `workspaces.download`, `workspaces.clone` | `management-mcp-workspace-adapter.spec.ts`, storage API/UI tests; offline access remains read-only |
+| Workspace inventory and offline browse | Storage inventory/browser; `/api/workspaces/*` | `workspaces.list`, `workspaces.files`, `workspaces.preview`, `workspaces.download`, `workspaces.clone` | `management-mcp-workspace-adapter.spec.ts`, `management-download-domain.spec.ts`, `management-download-handoff.spec.ts`, and storage API/UI tests; offline access remains read-only |
 | Running-worker file management | Worker Files modal; `/api/containers/:id/files/*` | `files.list`, `files.upload`, `files.mkdir`, `files.rename`, `files.move`, `files.delete` | Existing hardened container file manager is reused; upload is one base64 file capped at 1 MiB, mutations honor worker protection locks |
-| File and directory downloads | Authenticated streaming workspace endpoints | Small regular files via `workspaces.download`; larger files/directories return authenticated download location | Intentional transport limit: MCP never buffers directory archives or files above 256 KiB |
-| Worker export/import | Export modal/jobs; export/import APIs | `exports.create`, `exports.status`, `exports.cancel`, `exports.download`, `imports.prepare` | Export-job, workspace-adapter, and `management-import-domain.spec.ts` coverage. `imports.prepare` returns a short-lived, one-use, workspace-bound private `PUT` handoff for a streamed `application/x-tar` bundle; it is under the `exports` capability and never base64-buffers an archive in MCP JSON. |
+| File and directory downloads | Authenticated streaming workspace endpoints | `workspaces.download` returns a private one-use streaming handoff | No session cookie or public route is required. The normalized path selection and owner are fixed at preparation, ownership is rechecked at redemption, directory ZIPs and files stream with backpressure, and disconnects destroy the offline helper source. |
+| Worker export/import | Export modal/jobs; export/import APIs | `exports.create`, `exports.status`, `exports.cancel`, `exports.download`, `imports.prepare` | Export-job, download-handoff, workspace-adapter, and import-domain coverage. `exports.download` and `imports.prepare` return short-lived, one-use, workspace-bound private handoffs using the current management credential. Neither direction base64-buffers an archive in MCP JSON. |
 | Image catalog and controlled builds | Image Catalog UI/API | `images.list/get/create/validate/delete/delete-version/usage/build/build-status/build-logs/build-cancel/promote/rollback/default/cleanup/git-status/git-sync` | Image catalog/Git catalog tests and MCP image adapter; logs and Git sync responses are sanitized |
 | Image test worker / image selection | Image Catalog test-worker/default/worker creation controls | `images.test-worker`; catalog-aware `workers.create` | Both paths resolve the same immutable digest/runtime image through the shared catalog model |
 | Backups, restore, provider status/settings | Backup UI/API | `backups.list/providers/settings/create/status/cancel/retry/delete/restore` | Backup, Google OAuth installation, and MCP image/backup tests. Original-worker API/UI restore verifies a protected source's transient password before job creation; MCP restore creates a new worker and therefore does not mutate the source. Provider credentials/tokens are intentionally non-retrievable; Google login remains human/external boundary |
@@ -59,11 +59,14 @@ or an interactive third-party login into a live-account verification.
 - **No automatic human OAuth.** Google Drive, GitHub, Codex-LB/OmniRoute, Tavily,
   and other providers may require an account holder to complete external login.
   See [the routed-agent reference workflow](reference-agent-workflow.md).
-- **Streaming/binary boundaries.** Browser-authenticated download endpoints are
-  used for large files, directory archives, and export artifacts. The one
-  exception is `imports.prepare`, which returns a private, one-use streamed tar
-  upload handoff rather than carrying binary data in an MCP response. MCP does
-  not provide arbitrary file/archive buffering.
+- **Streaming/binary boundaries.** `workspaces.download`, `exports.download`,
+  and `imports.prepare` return opaque private-management-listener paths rather
+  than browser/session URLs or binary JSON. Each path is short-lived, one-use,
+  bound to the administrative workspace and exact owner/resource, requires the
+  current rotating management bearer credential, and rechecks its live
+  capability at redemption. File, ZIP, tar download, and tar upload bodies
+  preserve stream backpressure; client disconnects tear down their sources.
+  The credential itself is never placed in the URL.
 - **Logs are deliberately bounded.** `logs.read` is restricted to the selected
   owner's worker Docker logs, a 1–1000-line/256-KiB ceiling, and literal
   redaction of managed worker-local secrets/secret files plus sensitive-named
