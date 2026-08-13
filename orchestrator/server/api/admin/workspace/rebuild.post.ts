@@ -1,8 +1,8 @@
 import { requireAdmin } from "../../../utils/auth-helpers";
 import { useAdminWorkspaceStore } from "../../../utils/admin-workspace-store";
 export default defineEventHandler(async (e) => {
-  requireAdmin(e);
-  return useAdminWorkspaceStore().rebuild();
+  const admin = requireAdmin(e);
+  return useAdminWorkspaceStore().rebuild(admin.user.id);
 });
 defineRouteMeta({
   openAPI: {

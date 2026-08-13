@@ -4,7 +4,12 @@ import { hostname } from "node:os";
 import { pack } from "tar-stream";
 import type { Config } from "./config";
 import type { ContainerInfo } from "../../shared/types";
-import { useContainerManager, useDockerService } from "./services";
+import {
+  useContainerManager,
+  useDockerService,
+  useUserEnvStore,
+} from "./services";
+import { renderUserEnvVars } from "./user-env-store";
 import { useImageCatalogManager } from "./image-catalog";
 import type {
   AdministrativeWorkspaceRecord,
@@ -13,11 +18,12 @@ import type {
 } from "./admin-workspace-store";
 
 const MANAGEMENT_NETWORK = "agentor-management";
+const EGRESS_NETWORK = "agentor-admin-egress-v1";
 // Bump this whenever the trusted overlay/base contract changes in a way that
 // must be materialized for existing persistent administrative workspaces.
 // The workspace volume remains untouched; only its disposable compute image
 // is refreshed.
-const ADMIN_OVERLAY_VERSION = "2";
+const ADMIN_OVERLAY_VERSION = "3";
 const ADMIN_CONTAINER = "agentor-admin-workspace";
 const ADMIN_WORKSPACE_VOLUME = "agentor-admin-workspace-data";
 const ADMIN_AGENTS_VOLUME = "agentor-admin-agent-data";
@@ -25,8 +31,8 @@ const ADMIN_LABEL = "agentor.administrative";
 
 /** Docker boundary for the singleton administrative workspace. Every Docker
  * input is generated here; requests cannot choose images, mounts, commands,
- * networks, or capabilities. No account credentials or Docker socket enter
- * this container. */
+ * networks, or capabilities. Only the owning administrator's standard worker
+ * environment enters the container; no Docker socket or host bind does. */
 export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter {
   private readonly docker = new Docker({ socketPath: "/var/run/docker.sock" });
   private readonly image: string;
@@ -37,8 +43,10 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
 
   async initializeBoundary(): Promise<void> {
     await this.ensureManagementNetwork();
+    await this.ensureEgressNetwork();
     await this.attachOrchestrator();
     await this.reconcileManagementNetwork();
+    await this.reconcileEgressNetwork();
   }
 
   async managementAddress(): Promise<string> {
@@ -306,6 +314,9 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
         "AGENTOR_MANAGEMENT_MCP_URL=http://agentor-orchestrator:3099/mcp",
         "ORCHESTRATOR_URL=http://agentor-orchestrator:3000",
         `WORKER_CONTAINER_NAME=${ADMIN_CONTAINER}`,
+        ...(record.ownerId
+          ? renderUserEnvVars(useUserEnvStore().getOrDefault(record.ownerId))
+          : []),
       ],
       Tty: true,
       OpenStdin: true,
@@ -444,6 +455,58 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     }
   }
 
+  private async ensureEgressNetwork() {
+    const existing = await this.docker.listNetworks({
+      filters: { name: [EGRESS_NETWORK] },
+    });
+    const network = existing.find(
+      (candidate) => candidate.Name === EGRESS_NETWORK,
+    );
+    if (!network) {
+      await this.docker.createNetwork({
+        Name: EGRESS_NETWORK,
+        Driver: "bridge",
+        Internal: false,
+        CheckDuplicate: true,
+        Labels: { "agentor.admin-egress": "true" },
+      });
+      return;
+    }
+    const inspection = await this.docker.getNetwork(network.Id).inspect();
+    if (
+      inspection.Internal ||
+      inspection.Driver !== "bridge" ||
+      inspection.Labels?.["agentor.admin-egress"] !== "true"
+    )
+      throw new Error(
+        "Existing admin egress network does not satisfy the isolated outbound-network policy",
+      );
+  }
+
+  private async reconcileEgressNetwork(adminContainerId?: string) {
+    const network = this.docker.getNetwork(EGRESS_NETWORK);
+    const inspection = await network.inspect();
+    if (inspection.Internal || inspection.Driver !== "bridge")
+      throw new Error("Admin egress network is not an outbound bridge");
+    if (!adminContainerId) {
+      try {
+        adminContainerId = (
+          await this.docker.getContainer(ADMIN_CONTAINER).inspect()
+        ).Id;
+      } catch {
+        /* not provisioned yet */
+      }
+    } else {
+      adminContainerId = (
+        await this.docker.getContainer(adminContainerId).inspect()
+      ).Id;
+    }
+    for (const containerId of Object.keys(inspection.Containers || {})) {
+      if (containerId === adminContainerId) continue;
+      await network.disconnect({ Container: containerId, Force: true });
+    }
+  }
+
   private async attachOrchestrator() {
     const self = this.docker.getContainer(process.env.HOSTNAME || hostname());
     try {
@@ -506,20 +569,26 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
       await this.docker
         .getNetwork(MANAGEMENT_NETWORK)
         .connect({ Container: inspection.Id });
+    if (!inspection.NetworkSettings?.Networks?.[EGRESS_NETWORK])
+      await this.docker
+        .getNetwork(EGRESS_NETWORK)
+        .connect({ Container: inspection.Id });
 
     // Docker permits secondary network attachments after creation. Remove any
     // such attachment rather than relying on the create-time NetworkMode
     // alone, so the invariant also holds after daemon restarts and manual
-    // operator intervention. MANAGEMENT_NETWORK is the only permitted
-    // endpoint for this container.
+    // operator intervention. Only the private management plane and the
+    // admin-only outbound bridge are permitted.
     for (const networkName of Object.keys(
       (await container.inspect()).NetworkSettings?.Networks || {},
     )) {
-      if (networkName === MANAGEMENT_NETWORK) continue;
+      if (networkName === MANAGEMENT_NETWORK || networkName === EGRESS_NETWORK)
+        continue;
       await this.docker
         .getNetwork(networkName)
         .disconnect({ Container: inspection.Id, Force: true });
     }
+    await this.reconcileEgressNetwork(inspection.Id);
   }
 
   private async ensureOverlayImage(

@@ -14,6 +14,8 @@ export interface AdministrativeWorkspaceRecord {
   updatedAt: string;
   imageName?: string;
   imageDigest?: string;
+  /** Account whose worker environment variables are injected on recreation. */
+  ownerId?: string;
 }
 
 export interface AdminWorkspaceRuntimeImage {
@@ -24,8 +26,9 @@ export interface AdminWorkspaceRuntimeImage {
 /**
  * Narrow integration boundary for the real container implementation. The
  * durable control-plane record remains authoritative; an adapter must only
- * provision the pinned image and management-network attachment described by
- * the supplied record. It must never accept an image or mounts from a request.
+ * provision the pinned image and fixed network attachments described by the
+ * supplied record. It must never accept an image, mount, or network from a
+ * request.
  */
 export interface AdminWorkspaceRuntimeAdapter {
   ensure(
@@ -114,8 +117,12 @@ export class AdminWorkspaceStore {
     await this.save();
     return this.publicRecord();
   }
-  async rebuild() {
+  async rebuild(ownerId?: string) {
     await this.ensure();
+    if (ownerId && this.record!.ownerId !== ownerId) {
+      this.record!.ownerId = ownerId;
+      await this.save();
+    }
     if (!this.runtime)
       throw Object.assign(
         new Error("Administrative workspace runtime is unavailable"),
@@ -152,6 +159,7 @@ export class AdminWorkspaceStore {
       throw new Error("Administrative workspace not initialized");
     return {
       ...this.record,
+      ownerId: undefined,
       marker: undefined,
       image: {
         name: this.record.imageName || ADMIN_IMAGE,
@@ -193,7 +201,7 @@ export class AdminWorkspaceStore {
       managedWorker: true,
       administrative: true,
       managementNetworkAttached: true,
-      networks: ["agentor-management"],
+      networks: ["agentor-management", "agentor-admin-egress-v1"],
       publishedPorts: [],
       rawDockerSocket: false,
       hostExecution: false,

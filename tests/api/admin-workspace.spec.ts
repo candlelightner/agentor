@@ -111,6 +111,10 @@ test.describe.serial('Persistent administrative workspace', () => {
     expect(res.status()).toBe(200);
     const security = await res.json();
     expect(security.managementNetworkAttached).toBe(true);
+    expect(security.networks).toEqual(
+      expect.arrayContaining(['agentor-management', 'agentor-admin-egress-v1']),
+    );
+    expect(security.networks).not.toContain('agentor-net');
     expect(security.publishedPorts).toEqual([]);
     expect(security.rawDockerSocket).toBe(false);
     expect(security.hostExecution).toBe(false);
