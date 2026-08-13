@@ -108,6 +108,10 @@ export class BackupManager {
     for (const user of this.store.all())
       for (const job of user.jobs)
         if (job.status === "queued" || job.status === "running") {
+          // The process that owned an interrupted provider transfer is gone.
+          // Remove deterministic per-job scratch before publishing failure so
+          // a hard restart cannot strand large encrypted/decrypted archives.
+          await cleanupInterruptedBackupStaging(useConfig().dataDir, job.id);
           job.status = "failed";
           job.phase = "failed";
           job.error = "Backup interrupted by orchestrator restart";
@@ -1272,6 +1276,13 @@ export class BackupManager {
       });
     }
   }
+}
+
+export async function cleanupInterruptedBackupStaging(dataDir: string, jobId: string) {
+  await Promise.all([
+    rm(join(dataDir, "tmp", `backup-${jobId}`), { recursive: true, force: true }),
+    rm(join(dataDir, "tmp", `restore-${jobId}`), { recursive: true, force: true }),
+  ]);
 }
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, Math.floor(n)));

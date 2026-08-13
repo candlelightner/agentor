@@ -88,7 +88,7 @@ export class StorageVisibilityManager {
   }
 }
 export function isCleanupEligibleStaging(name: string) {
-  return /^(backup|export|management-import)-/.test(name);
+  return /^(backup|restore|export|management-import)-/.test(name);
 }
 async function directoryBytes(path: string): Promise<number> {
   const info = await stat(path).catch(() => undefined); if (!info) return 0;

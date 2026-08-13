@@ -50,6 +50,7 @@ test("management import transport accepts only canonical tar uploads", () => {
 
 test("management import staging participates in conservative stale cleanup", () => {
   expect(isCleanupEligibleStaging("management-import-4c489aec")).toBe(true);
+  expect(isCleanupEligibleStaging("restore-4c489aec")).toBe(true);
   expect(isCleanupEligibleStaging("unrelated-user-directory")).toBe(false);
 });
 
