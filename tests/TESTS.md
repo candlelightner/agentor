@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **1597 tests** across 147 test files (1025 API across 91 files + 572 UI across 56 files)
+- **1600 tests** across 147 test files (1027 API across 91 files + 573 UI across 56 files)
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -102,13 +102,13 @@ tests/
     worker-lifecycle.ts    # Container create/cleanup utilities
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
-  api/                     # API endpoint tests (1025 tests across 91 files)
-  ui/                      # UI interaction tests (572 tests across 56 files)
+  api/                     # API endpoint tests (1027 tests across 91 files)
+  ui/                      # UI interaction tests (573 tests across 56 files)
 ```
 
 ## Test Categories
 
-### API Tests (1025 tests, 91 files)
+### API Tests (1027 tests, 91 files)
 
 | `worker-protection-lock.spec.ts` | 6 | Password-verifier-only worker locks: set/change/remove validation, no password/hash disclosure, required lock credentials on settings/configuration/archive/unarchive, running-workspace file mutations, managed-network membership, stop/restart alternate lifecycle paths, and correct-password recovery. |
 
@@ -196,7 +196,7 @@ tests/
 | `workspace-files.spec.ts`         | 52    | Workspace file manager `/api/containers/:id/files/*` routes (running-worker only, session-auth + owner-scoped, no host-path access, execute as uid 1000 `agent`, lexical + in-container realpath/lstat containment): list (one-level, dirs-first; symlink `linkTarget`/`linkEscapes`; breadcrumbs/metadata), upload (multipart, relative folder paths, conflict overwrite vs `overwrite=false` 409, 100 MiB / 1000-entry caps → 413, tar entries uid/gid 1000), download (single raw file vs true ZIP for folder/multi, hidden files included, symlinks stored not followed, escaping symlinks rejected), mkdir (idempotent, `mkdir -p`, file-blocks-path 409, escaping-parent rejected), rename (same-parent, no-overwrite 409), move (into existing dir incl. root, full conflict list on `overwrite=false` 409, `overwrite=true` replaces files or directories, escaping symlinks rejected up front), delete (root blocked via `allowRoot:false`, missing paths idempotent, escaping symlinks rejected before any deletion), auth/ownership/running-state ordering (checks before body), traversal/`..`/absolute/backslash/NUL rejection, worker-self/worker-id resolution                                                                                                                                                                                                                     |
 | `clipboard.spec.ts`               | 14    | `POST /api/containers/:id/clipboard` (set worker X11 CLIPBOARD): auth/ownership/running checks BEFORE body (401/403/404/409), 415 unsupported MIME (only `image/png` + `text/plain`), 400 empty body, 413 over 16 MiB image / 1 MiB text caps, 415 bad PNG signature/IHDR/dimensions, 415 invalid UTF-8 (fatal TextDecoder), 200 returns `{ ok, type, width?, height? }` and NEVER clipboard contents, text uses UTF8_STRING X target, helper failure mapped by exit code, cross-user 403, stopped worker 409                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
-### UI Tests (572 tests, 56 files)
+### UI Tests (573 tests, 56 files)
 
 | File                                     | Tests | Coverage                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ---------------------------------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
