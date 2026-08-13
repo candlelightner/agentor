@@ -6,6 +6,7 @@ import { TerminalWsClient } from '../helpers/terminal-ws';
 test.describe.serial('Terminal Pane', () => {
   let containerId: string;
   let displayName: string;
+  const lockPassword = `terminal-pane-lock-${Date.now()}`;
 
   test.beforeAll(async ({ request }) => {
     displayName = `Term-${Date.now()}`;
@@ -14,6 +15,7 @@ test.describe.serial('Terminal Pane', () => {
   });
 
   test.afterAll(async ({ request }) => {
+    await request.delete(`/api/containers/${containerId}/protection`, { data: { password: lockPassword } }).catch(() => undefined);
     await cleanupWorker(request, containerId);
   });
 
@@ -178,5 +180,29 @@ test.describe.serial('Terminal Pane', () => {
     } finally {
       ws.close();
     }
+  });
+
+  test('protected worker pane mutations accept a transient lock password and surface failures', async ({ page, request }) => {
+    expect((await request.put(`/api/containers/${containerId}/protection`, { data: { password: lockPassword } })).status()).toBe(200);
+
+    await goToDashboard(page);
+    const card = page.locator('.rounded-lg').filter({ hasText: displayName }).first();
+    await expect(card.locator('text=running')).toBeVisible({ timeout: 60_000 });
+    await card.locator('button').first().click();
+    await expect(page.locator('.xterm')).toBeVisible({ timeout: 15_000 });
+
+    const password = page.getByLabel('Terminal worker lock password');
+    await expect(password).toBeVisible();
+    await password.fill('incorrect-lock-password');
+    await page.locator('.tmux-create-btn').click();
+    await expect(page.getByRole('alert')).toContainText('Check the worker lock password');
+
+    const before = await page.locator('.tmux-tab').count();
+    await password.fill(lockPassword);
+    await page.locator('.tmux-create-btn').click();
+    await expect(page.locator('.tmux-tab')).toHaveCount(before + 1, { timeout: 15_000 });
+    await expect(page.locator('body')).not.toContainText(lockPassword);
+
+    expect((await request.delete(`/api/containers/${containerId}/protection`, { data: { password: lockPassword } })).status()).toBe(200);
   });
 });

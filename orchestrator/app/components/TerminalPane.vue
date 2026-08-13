@@ -6,6 +6,9 @@ const props = defineProps<{
 const { $Terminal, $FitAddon } = useNuxtApp();
 
 const containerIdRef = toRef(props, 'containerId');
+const protection = ref<{ protected: boolean }>({ protected: false });
+const lockPassword = ref('');
+const paneMutationError = ref('');
 
 const {
   windows,
@@ -73,7 +76,17 @@ function resetTerminal(windowIndex: number) {
 }
 
 async function onRename(windowIndex: number, newName: string) {
-  await renameWindow(windowIndex, newName);
+  paneMutationError.value = '';
+  if (!await renameWindow(windowIndex, newName, lockPassword.value)) {
+    paneMutationError.value = 'Unable to rename terminal. Check the worker lock password.';
+  }
+}
+
+async function onClose(windowIndex: number) {
+  paneMutationError.value = '';
+  if (!await closeWindow(windowIndex, lockPassword.value)) {
+    paneMutationError.value = 'Unable to close terminal. Check the worker lock password.';
+  }
 }
 
 // Track known window indices to detect externally-created windows
@@ -83,7 +96,10 @@ let skipReconnect = false;
 // Wrap createWindow to suppress reconnection for UI-initiated creates
 async function handleCreate(name?: string) {
   skipReconnect = true;
-  await createWindow(name);
+  paneMutationError.value = '';
+  if (!await createWindow(name, lockPassword.value)) {
+    paneMutationError.value = 'Unable to create terminal. Check the worker lock password.';
+  }
   await nextTick();
   skipReconnect = false;
 }
@@ -155,6 +171,9 @@ watch(activeWindowIndex, (index) => {
 // ResizeObserver for all resize scenarios
 let resizeObserver: ResizeObserver | null = null;
 onMounted(() => {
+  $fetch<{ protected: boolean }>(`/api/containers/${props.containerId}/protection`)
+    .then((value) => { protection.value = value; })
+    .catch(() => { /* The server remains authoritative. */ });
   if (!terminalsContainer.value) return;
   resizeObserver = new ResizeObserver(() => {
     if (activeWindowIndex.value == null) return;
@@ -165,6 +184,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  lockPassword.value = '';
   resizeObserver?.disconnect();
   resizeObserver = null;
   for (const index of [...terminals.keys()]) {
@@ -181,10 +201,24 @@ onUnmounted(() => {
       :active-window-index="activeWindowIndex"
       :default-window-index="defaultWindowIndex"
       @activate="activateWindow"
-      @close="closeWindow"
+      @close="onClose"
       @create="handleCreate"
       @rename="onRename"
     />
+
+    <div v-if="protection.protected" class="flex items-center gap-2 border-b border-amber-700/40 bg-amber-950/30 px-2 py-1">
+      <label class="flex min-w-0 flex-1 items-center gap-2 text-xs text-amber-200">
+        Worker lock password
+        <input
+          v-model="lockPassword"
+          type="password"
+          autocomplete="current-password"
+          aria-label="Terminal worker lock password"
+          class="min-w-0 flex-1 rounded border border-amber-700/50 bg-black/30 px-2 py-1 text-white"
+        >
+      </label>
+      <span v-if="paneMutationError" role="alert" class="text-xs text-red-300">{{ paneMutationError }}</span>
+    </div>
 
     <div ref="terminalsContainer" class="relative flex-1 min-h-0">
       <div

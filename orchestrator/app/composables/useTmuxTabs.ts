@@ -67,11 +67,11 @@ export function useTmuxTabs(containerId: Ref<string>) {
     }
   }
 
-  async function createWindow(name?: string): Promise<TmuxWindow | null> {
+  async function createWindow(name?: string, lockPassword?: string): Promise<TmuxWindow | null> {
     try {
       const window = await $fetch<TmuxWindow>(
         `/api/containers/${containerId.value}/panes`,
-        { method: 'POST', body: name ? { name } : undefined },
+        { method: 'POST', body: { ...(name ? { name } : {}), ...(lockPassword ? { lockPassword } : {}) } },
       );
       await fetchWindows();
       activeWindowIndex.value = window.index;
@@ -82,11 +82,11 @@ export function useTmuxTabs(containerId: Ref<string>) {
     }
   }
 
-  async function renameWindow(windowIndex: number, newName: string): Promise<boolean> {
+  async function renameWindow(windowIndex: number, newName: string, lockPassword?: string): Promise<boolean> {
     try {
       await $fetch(`/api/containers/${containerId.value}/panes/${windowIndex}`, {
         method: 'PUT',
-        body: { newName },
+        body: { newName, ...(lockPassword ? { lockPassword } : {}) },
       });
 
       // Update windows array
@@ -99,13 +99,14 @@ export function useTmuxTabs(containerId: Ref<string>) {
     }
   }
 
-  async function closeWindow(windowIndex: number) {
+  async function closeWindow(windowIndex: number, lockPassword?: string): Promise<boolean> {
     try {
       await $fetch(`/api/containers/${containerId.value}/panes/${windowIndex}`, {
         method: 'DELETE',
+        body: lockPassword ? { lockPassword } : undefined,
       });
     } catch {
-      // Window may already be gone
+      return false;
     }
     windows.value = windows.value.filter((w) => w.index !== windowIndex);
     if (activeWindowIndex.value === windowIndex) {
@@ -114,6 +115,7 @@ export function useTmuxTabs(containerId: Ref<string>) {
     if (activeWindowIndex.value != null) {
       setTmuxActiveWindow(containerId.value, activeWindowIndex.value);
     }
+    return true;
   }
 
   function activateWindow(windowIndex: number) {
