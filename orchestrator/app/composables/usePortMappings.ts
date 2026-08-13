@@ -31,8 +31,16 @@ async function createMapping(opts: {
 }
 
 async function removeMapping(port: number) {
-  await $fetch(`/api/port-mappings/${port}`, { method: 'DELETE' });
-  await fetchMappings();
+  // Removing a mapping can wait for Traefik reconciliation, which need not
+  // finish before the server has persisted the delete.  Hide it immediately
+  // so the sidebar represents the requested state, then restore authoritative
+  // data if the request is rejected (for example by a protection lock).
+  mappings.value = mappings.value.filter((mapping) => mapping.externalPort !== port);
+  try {
+    await $fetch(`/api/port-mappings/${port}`, { method: 'DELETE' });
+  } finally {
+    await fetchMappings();
+  }
 }
 
 export function usePortMappings() {
