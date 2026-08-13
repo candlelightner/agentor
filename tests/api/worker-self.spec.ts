@@ -136,7 +136,7 @@ test.describe.serial('Worker-self API', () => {
       expect(arr.find((m: { externalPort: number }) => m.externalPort === port)).toBeTruthy();
 
       const del = await curlInside(ws, `/api/worker-self/port-mappings/${port}`, { method: 'DELETE' });
-      expect(del.status).toBe(200);
+      expect(del.status, del.body).toBe(200);
     } finally {
       ws.close();
       // Belt-and-suspenders cleanup via the admin API in case the in-worker DELETE failed
@@ -267,6 +267,39 @@ test.describe.serial('Worker-self API', () => {
       expect(del.status).toBe(400);
     } finally {
       ws.close();
+    }
+  });
+
+  test('worker-self exposure mutations require the protected worker credential while reads remain available', async ({ request }) => {
+    const lockPassword = `worker-self-lock-${Date.now()}-password`, wrong = 'wrong-worker-self-lock-password', port = uniquePort();
+    const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    let domainId = '', batchDomainId = '';
+    expect((await request.put(`/api/containers/${workerId}/protection`, { data: { password: lockPassword } })).status()).toBe(200);
+    const ws = new TerminalWsClient(containerId);
+    try {
+      await ws.connect(); await ws.waitForOutput(/[\$#>]\s*$/, 15_000);
+      expect((await curlInside(ws, '/api/worker-self/port-mappings')).status).toBe(200);
+      const portArgs = { externalPort: port, type: 'localhost', internalPort: 9123 };
+      for (const data of [portArgs, { ...portArgs, lockPassword: wrong }]) expect((await curlInside(ws, '/api/worker-self/port-mappings', { method: 'POST', data })).status).toBe(423);
+      expect((await curlInside(ws, '/api/worker-self/port-mappings', { method: 'POST', data: { ...portArgs, lockPassword } })).status).toBe(201);
+      for (const data of [undefined, { lockPassword: wrong }]) expect((await curlInside(ws, `/api/worker-self/port-mappings/${port}`, { method: 'DELETE', data })).status).toBe(423);
+      expect((await curlInside(ws, `/api/worker-self/port-mappings/${port}`, { method: 'DELETE', data: { lockPassword } })).status).toBe(200);
+      const domainArgs = { baseDomain: 'docker.localhost', subdomain: `self-lock-${suffix}`, protocol: 'http', internalPort: 9123 };
+      for (const data of [domainArgs, { ...domainArgs, lockPassword: wrong }]) expect((await curlInside(ws, '/api/worker-self/domain-mappings', { method: 'POST', data })).status).toBe(423);
+      const domain = await curlInside(ws, '/api/worker-self/domain-mappings', { method: 'POST', data: { ...domainArgs, lockPassword } });
+      expect(domain.status).toBe(201); domainId = JSON.parse(domain.body).id; expect(domain.body).not.toContain(lockPassword);
+      expect((await curlInside(ws, `/api/worker-self/domain-mappings/${domainId}`, { method: 'DELETE' })).status).toBe(423);
+      expect((await curlInside(ws, `/api/worker-self/domain-mappings/${domainId}`, { method: 'DELETE', data: { lockPassword } })).status).toBe(200); domainId = '';
+      const items = [{ ...domainArgs, subdomain: `self-batch-lock-${suffix}` }];
+      expect((await curlInside(ws, '/api/worker-self/domain-mappings/batch', { method: 'POST', data: { items } })).status).toBe(423);
+      const batch = await curlInside(ws, '/api/worker-self/domain-mappings/batch', { method: 'POST', data: { items, lockPassword } });
+      expect(batch.status).toBe(201); batchDomainId = JSON.parse(batch.body)[0].id; expect(batch.body).not.toContain(lockPassword);
+      expect((await curlInside(ws, `/api/worker-self/domain-mappings/${batchDomainId}`, { method: 'DELETE', data: { lockPassword } })).status).toBe(200); batchDomainId = '';
+    } finally {
+      ws.close(); const api = new ApiClient(request); await api.deletePortMapping(port).catch(() => undefined);
+      if (domainId) await api.deleteDomainMapping(domainId).catch(() => undefined);
+      if (batchDomainId) await api.deleteDomainMapping(batchDomainId).catch(() => undefined);
+      await request.delete(`/api/containers/${workerId}/protection`, { data: { password: lockPassword } });
     }
   });
 

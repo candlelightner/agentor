@@ -301,6 +301,43 @@ test.describe.serial("Internal management MCP security", () => {
     ).toBe(403);
   });
 
+  test("explicit owner selectors require a traversal-safe real user while preserving cross-user administration", async ({
+    request,
+  }) => {
+    // The administrative workspace is allowed to inspect another real user's
+    // status. Cross-user administration is intentional; invented owner
+    // namespaces and path-shaped ids are not.
+    expect(
+      (
+        await invoke(request, credential, "usage.get", {
+          userId: regular.id,
+        })
+      ).status(),
+    ).toBe(200);
+
+    expect(
+      (
+        await invoke(request, credential, "usage.get", {
+          userId: "missing-safe-owner",
+        })
+      ).status(),
+    ).toBe(404);
+
+    for (const userId of [
+      "../admin",
+      "/absolute",
+      "owner/child",
+      "owner\\child",
+      "%2e%2e%2fadmin",
+      "owner%2Fchild",
+    ]) {
+      const response = await invoke(request, credential, "usage.get", {
+        userId,
+      });
+      expect(response.status(), userId).toBe(400);
+    }
+  });
+
   test("policy changes take effect on every call and disabling removes equivalent access", async ({
     request,
   }) => {
@@ -495,6 +532,251 @@ test.describe.serial("Internal management MCP security", () => {
     );
   });
 
+  test("every legacy lifecycle, configuration, app, and exposure MCP alias enforces worker protection without leaking its credential", async ({
+    request,
+  }) => {
+    const lockPassword = `mcp-alias-lock-${Date.now()}-password`;
+    const wrongPassword = "wrong-mcp-alias-lock-password";
+    const port = 37000 + Math.floor(Math.random() * 1000);
+    const subdomain = `mcp-lock-${Date.now()}`;
+    let appId = "";
+    let domainId = "";
+    let locked = false;
+    try {
+      expect(
+        (
+          await regularCtx.put(`/api/containers/${normalWorker}/protection`, {
+            data: { password: lockPassword },
+          })
+        ).status(),
+      ).toBe(200);
+      locked = true;
+      expect(
+        (
+          await request.put("/api/admin/management-mcp/policy", {
+            data: {
+              groups: {
+                "worker-lifecycle": true,
+                "configuration-proposals": true,
+                "configuration-application": true,
+                networking: true,
+                apps: true,
+              },
+            },
+          })
+        ).status(),
+      ).toBe(200);
+
+      const tools = await (
+        await request.post(
+          "/api/admin/management-mcp/diagnostics/list-tools",
+          { data: { credential } },
+        )
+      ).json();
+      for (const name of [
+        "worker.stop",
+        "worker.start",
+        "configuration.apply",
+        "apps.start",
+        "apps.stop",
+        "port-mappings.create",
+        "port-mappings.delete",
+        "domain-mappings.create",
+        "domain-mappings.delete",
+      ])
+        expect(
+          tools.find((tool: any) => tool.name === name)?.inputSchema?.properties
+            ?.lockPassword,
+        ).toMatchObject({ type: "string", writeOnly: true });
+
+      const proposed = await invoke(
+        request,
+        credential,
+        "configuration.propose",
+        {
+          patch: {
+            workerId: normalWorker,
+            variables: [{ key: "MCP_LOCK_GUARD", value: "applied" }],
+          },
+        },
+      );
+      expect(proposed.status()).toBe(200);
+      const proposalId = (await proposed.json()).id;
+
+      const assertLocked = async (
+        tool: string,
+        args: Record<string, unknown>,
+      ) => {
+        for (const password of [undefined, wrongPassword]) {
+          const denied = await invoke(request, credential, tool, {
+            ...args,
+            ...(password ? { lockPassword: password } : {}),
+          });
+          expect(denied.status(), `${tool} must require the worker lock`).toBe(
+            423,
+          );
+          expect(JSON.stringify(await body(denied))).not.toContain(lockPassword);
+        }
+      };
+
+      await assertLocked("configuration.apply", { proposalId });
+      const applied = await invoke(
+        request,
+        credential,
+        "configuration.apply",
+        { proposalId, lockPassword },
+      );
+      expect(applied.status()).toBe(200);
+      expect(JSON.stringify(await applied.json())).not.toContain(lockPassword);
+
+      await assertLocked("port-mappings.create", {
+        workerId: normalWorker,
+        externalPort: port,
+        internalPort: 8080,
+        type: "localhost",
+      });
+      expect(
+        (
+          await invoke(request, credential, "port-mappings.create", {
+            workerId: normalWorker,
+            externalPort: port,
+            internalPort: 8080,
+            type: "localhost",
+            lockPassword,
+          })
+        ).status(),
+      ).toBe(200);
+      await assertLocked("port-mappings.delete", { externalPort: port });
+      expect(
+        (
+          await invoke(request, credential, "port-mappings.delete", {
+            externalPort: port,
+            lockPassword,
+          })
+        ).status(),
+      ).toBe(200);
+
+      await assertLocked("domain-mappings.create", {
+        workerId: normalWorker,
+        baseDomain: "docker.localhost",
+        subdomain,
+        protocol: "http",
+        internalPort: 8080,
+      });
+      const domain = await invoke(
+        request,
+        credential,
+        "domain-mappings.create",
+        {
+          workerId: normalWorker,
+          baseDomain: "docker.localhost",
+          subdomain,
+          protocol: "http",
+          internalPort: 8080,
+          lockPassword,
+        },
+      );
+      expect(domain.status()).toBe(200);
+      domainId = (await domain.json()).id;
+      await assertLocked("domain-mappings.delete", { mappingId: domainId });
+      expect(
+        (
+          await invoke(request, credential, "domain-mappings.delete", {
+            mappingId: domainId,
+            lockPassword,
+          })
+        ).status(),
+      ).toBe(200);
+      domainId = "";
+
+      // Mapping reconciliation can be slow on loaded Docker hosts. Refresh the
+      // deliberately short-lived diagnostic identity without weakening its
+      // production 60-second ceiling before exercising the remaining aliases.
+      const refreshed = await request.post(
+        "/api/admin/management-mcp/diagnostics/issue-identity",
+        { data: { workspaceId: adminWorkspaceId, ttlSeconds: 60 } },
+      );
+      expect(refreshed.status()).toBe(201);
+      credential = (await refreshed.json()).credential;
+
+      await assertLocked("apps.start", {
+        workerId: normalWorker,
+        appType: "socks5",
+      });
+      const app = await invoke(request, credential, "apps.start", {
+        workerId: normalWorker,
+        appType: "socks5",
+        lockPassword,
+      });
+      expect(app.status()).toBe(200);
+      appId = (await app.json()).id;
+      await assertLocked("apps.stop", {
+        workerId: normalWorker,
+        appType: "socks5",
+        instanceId: appId,
+      });
+      expect(
+        (
+          await invoke(request, credential, "apps.stop", {
+            workerId: normalWorker,
+            appType: "socks5",
+            instanceId: appId,
+            lockPassword,
+          })
+        ).status(),
+      ).toBe(200);
+      appId = "";
+
+      await assertLocked("worker.stop", { workerId: normalWorker });
+      expect(
+        (
+          await invoke(request, credential, "worker.stop", {
+            workerId: normalWorker,
+            lockPassword,
+          })
+        ).status(),
+      ).toBe(200);
+      await assertLocked("worker.start", { workerId: normalWorker });
+      expect(
+        (
+          await invoke(request, credential, "worker.start", {
+            workerId: normalWorker,
+            lockPassword,
+          })
+        ).status(),
+      ).toBe(200);
+
+      const audit = JSON.stringify(
+        await (
+          await request.get("/api/admin/management-mcp/audit?limit=500")
+        ).json(),
+      );
+      expect(audit).not.toContain(lockPassword);
+    } finally {
+      if (appId)
+        await invoke(request, credential, "apps.stop", {
+          workerId: normalWorker,
+          appType: "socks5",
+          instanceId: appId,
+          lockPassword,
+        }).catch(() => {});
+      if (domainId)
+        await invoke(request, credential, "domain-mappings.delete", {
+          mappingId: domainId,
+          lockPassword,
+        }).catch(() => {});
+      await invoke(request, credential, "port-mappings.delete", {
+        externalPort: port,
+        lockPassword,
+      }).catch(() => {});
+      if (locked)
+        await regularCtx.delete(
+          `/api/containers/${normalWorker}/protection`,
+          { data: { password: lockPassword } },
+        );
+    }
+  });
+
   test("MCP responses and errors never return existing secret values", async ({
     request,
   }) => {
@@ -550,6 +832,22 @@ test.describe.serial("Internal management MCP security", () => {
     expect(opened.status()).toBe(200);
     const sessionId = (await opened.json()).id;
     expect(sessionId).toEqual(expect.any(String));
+    // A newly-created worker can still be rendering its full-screen startup
+    // status when the tmux attachment opens. Sending shell input during that
+    // phase feeds the status program and is intentionally not queued. Wait for
+    // the actual shell prompt before exercising console input.
+    let readyOutput = "";
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const read = await invoke(request, credential, "console.read", {
+        sessionId,
+        from: 0,
+      });
+      expect(read.status()).toBe(200);
+      readyOutput = (await read.json()).output;
+      if (/agent@[^\r\n]*\$\s/.test(readyOutput)) break;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    expect(readyOutput).toMatch(/agent@[^\r\n]*\$\s/);
     const marker = `mcp-console-${Date.now()}`;
     expect(
       (
@@ -567,7 +865,9 @@ test.describe.serial("Internal management MCP security", () => {
       });
       expect(read.status()).toBe(200);
       output = (await read.json()).output;
-      if (output.includes(marker)) break;
+      // The attached PTY echoes the command before executing it. Wait for the
+      // expanded worker id, not merely the marker embedded in that echo.
+      if (output.includes(`${marker}:${normalWorker}:[REDACTED]`)) break;
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
     expect(output).toContain(`${marker}:${normalWorker}:[REDACTED]`);

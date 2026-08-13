@@ -7,11 +7,12 @@ defineRouteMeta({
     parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' }, description: 'Container ID' }],
     requestBody: {
       required: true,
-      content: { 'multipart/form-data': { schema: { type: 'object', properties: { file: { type: 'string', format: 'binary' } } } } },
+      content: { 'multipart/form-data': { schema: { type: 'object', properties: { file: { type: 'string', format: 'binary' }, lockPassword: { type: 'string', writeOnly: true } } } } },
     },
     responses: {
       200: { description: 'Upload result', content: { 'application/json': { schema: { $ref: '#/components/schemas/SuccessResponse' } } } },
       404: { description: 'Container not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+      423: { description: 'Correct worker lock password required' },
     },
   },
 });
@@ -19,6 +20,7 @@ defineRouteMeta({
 import * as tar from 'tar-stream';
 import { useContainerManager } from '../../../utils/services';
 import { requireContainerAccess } from '../../../utils/auth-helpers';
+import { useWorkerProtectionLockStore } from '../../../utils/worker-protection-lock';
 
 export default defineEventHandler(async (event) => {
   const id = getRouterParam(event, 'id')!;
@@ -32,8 +34,13 @@ export default defineEventHandler(async (event) => {
 
   const pack = tar.pack();
   let fileCount = 0;
+  let lockPassword: string | undefined;
 
   for (const part of formData) {
+    if (!part.filename && part.name === 'lockPassword') {
+      lockPassword = part.data?.toString('utf8') ?? '';
+      continue;
+    }
     if (!part.filename || !part.data) continue;
 
     // Sanitize path: strip leading slashes, reject traversal
@@ -54,6 +61,7 @@ export default defineEventHandler(async (event) => {
   }
   const tarBuffer = Buffer.concat(chunks);
 
+  await useWorkerProtectionLockStore().verify(id, lockPassword);
   await containerManager.uploadToWorkspace(id, tarBuffer);
 
   return { uploaded: fileCount };

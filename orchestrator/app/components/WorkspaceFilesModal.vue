@@ -67,6 +67,8 @@ type Panel = 'none' | 'upload' | 'mkdir' | 'rename' | 'move' | 'delete';
 const panel = ref<Panel>('none');
 const panelError = ref<string>('');
 const panelBusy = ref(false);
+const protection = ref<{ protected: boolean }>({ protected: false });
+const lockPassword = ref('');
 
 // Upload panel
 const uploadFiles = ref<File[]>([]);
@@ -178,6 +180,7 @@ function clearPanel() {
   renameTarget.value = null;
   moveDest.value = '';
   moveConflict.value = null;
+  lockPassword.value = '';
 }
 
 function openPanel(p: Panel) {
@@ -204,7 +207,7 @@ async function doUpload(overwrite: boolean) {
   panelError.value = '';
   uploadConflict.value = null;
   try {
-    const result = await upload(cwd.value, uploadFiles.value, overwrite);
+    const result = await upload(cwd.value, uploadFiles.value, overwrite, lockPassword.value);
     if (!result.ok) {
       uploadConflict.value = result.conflict.conflicts as string[];
       panelError.value = result.message;
@@ -236,7 +239,7 @@ async function doMkdir() {
   panelBusy.value = true;
   panelError.value = '';
   try {
-    await mkdir(rel);
+    await mkdir(rel, lockPassword.value);
     toastSuccess('Folder created', newName.value.trim());
     clearPanel();
     await refresh();
@@ -259,7 +262,7 @@ async function doRename() {
   panelBusy.value = true;
   panelError.value = '';
   try {
-    await rename(renameTarget.value.path, newName.value.trim());
+    await rename(renameTarget.value.path, newName.value.trim(), lockPassword.value);
     toastSuccess('Renamed', `${renameTarget.value.name} → ${newName.value.trim()}`);
     // Keep the renamed entry selected under its new path.
     const parent = renameTarget.value.path.includes('/')
@@ -306,7 +309,7 @@ async function doMove(overwrite: boolean) {
   moveConflict.value = null;
   const paths = selectedEntries.value.map((e) => e.path);
   try {
-    const result = await move(paths, moveDest.value.trim(), overwrite);
+    const result = await move(paths, moveDest.value.trim(), overwrite, lockPassword.value);
     if (!result.ok) {
       moveConflict.value = result.conflict.conflicts as { source: string; target: string }[];
       panelError.value = result.message;
@@ -331,7 +334,7 @@ async function doDelete() {
   panelBusy.value = true;
   panelError.value = '';
   try {
-    const res = await remove(paths);
+    const res = await remove(paths, lockPassword.value);
     toastSuccess('Deleted', `${res.deleted} entr${res.deleted === 1 ? 'y' : 'ies'} removed`);
     clearPanel();
     clearSelection();
@@ -419,12 +422,19 @@ function onModalKeydown(e: KeyboardEvent) {
 }
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────
-watch(open, (isOpen) => {
+watch(open, async (isOpen) => {
   if (isOpen) {
     cwd.value = '';
     clearSelection();
     clearPanel();
     focusedPath.value = null;
+    protection.value = { protected: false };
+    try {
+      protection.value = await $fetch(`/api/containers/${props.container.id}/protection`);
+    } catch {
+      // Listing remains usable if optional protection-state discovery fails;
+      // the server still enforces every mutation fail-closed.
+    }
     refresh();
   } else {
     // Tear down state so a re-open is clean.
@@ -596,6 +606,10 @@ watch(
 
         <!-- Inline action panels -->
         <div v-if="panel !== 'none'" class="px-4 py-3 border-b border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-900/50">
+          <label v-if="protection.protected" class="mb-3 block text-xs text-amber-700 dark:text-amber-300">
+            Protected worker lock password
+            <UInput v-model="lockPassword" type="password" autocomplete="current-password" class="mt-1" />
+          </label>
           <!-- Upload -->
           <div v-if="panel === 'upload'" class="space-y-3" data-testid="workspace-upload-panel">
             <div class="flex items-center justify-between gap-2">

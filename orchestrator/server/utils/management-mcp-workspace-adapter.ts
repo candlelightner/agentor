@@ -10,7 +10,7 @@ const MAX_INLINE = 256 * 1024;
 const workspaceToolEntries: Array<[string, string]> = [
   ['workspaces.list','List offline workspaces'],['workspaces.files','List files in a workspace'],['workspaces.preview','Preview safe text/image metadata'],['workspaces.download','Prepare a download; only small regular files are returned inline'],['workspaces.clone','Clone a workspace into a new worker'],['exports.create','Create durable worker export'],['exports.status','Read export job status'],['exports.cancel','Cancel export job'],['exports.download','Describe the authenticated streaming download']
 ];
-export const workspaceMcpTools = workspaceToolEntries.map(([name,description])=>({name,group:(name.startsWith('exports.')?'exports':'storage') as 'exports'|'storage',description,inputSchema:{type:'object',properties:{workspaceId:{type:'string'},workerId:{type:'string'},displayName:{type:'string'},path:{type:'string'},paths:{type:'array',items:{type:'string'}},jobId:{type:'string'},includeRootfs:{type:'boolean'}}},annotations:{readOnlyHint:/\.(list|files|preview|download|status)$/.test(name),destructiveHint:name==='exports.cancel',idempotentHint:/\.(list|files|preview|download|status)$/.test(name),openWorldHint:false}}));
+export const workspaceMcpTools = workspaceToolEntries.map(([name,description])=>({name,group:(name.startsWith('exports.')?'exports':'storage') as 'exports'|'storage',description,inputSchema:{type:'object',properties:{workspaceId:{type:'string'},workerId:{type:'string'},displayName:{type:'string'},lockPassword:{type:'string',writeOnly:true,description:'Required when cloning a protected source worker'},path:{type:'string'},paths:{type:'array',items:{type:'string'}},jobId:{type:'string'},includeRootfs:{type:'boolean'}}},annotations:{readOnlyHint:/\.(list|files|preview|download|status)$/.test(name),destructiveHint:name==='exports.cancel',idempotentHint:/\.(list|files|preview|download|status)$/.test(name),openWorldHint:false}}));
 
 function workspace(id:unknown){ return listWorkspaceInventory(true).then(all=>{const item=all.find(x=>x.id===id);if(!item||item.state==='orphaned'||item.state==='deleted')throw Object.assign(new Error('Workspace unavailable'),{statusCode:404});return item}) }
 export async function executeWorkspaceMcpTool(name:string,args:Record<string,any>) : Promise<any> {
@@ -22,7 +22,7 @@ export async function executeWorkspaceMcpTool(name:string,args:Record<string,any
     const item=await workspace(args.workspaceId);
     const worker=item.workerId ? useWorkerStore().findById(item.workerId) : undefined;
     if(!worker)throw Object.assign(new Error('Clone requires an existing worker record'),{statusCode:409});
-    const executed=await new ManagementWorkerDomain().execute('workers.clone',{workerId:worker.id,displayName:args.displayName});
+    const executed=await new ManagementWorkerDomain().execute('workers.clone',{workerId:worker.id,displayName:args.displayName,lockPassword:args.lockPassword});
     if(!executed.handled)throw Object.assign(new Error('Workspace clone unavailable'),{statusCode:501});
     return executed.result;
   }

@@ -50,7 +50,7 @@ export class ManagementMcpTransport {
       const credential = authorization.startsWith("Bearer ") ? authorization.slice(7) : undefined;
       try {
         const upload = parseImportUploadHeaders(request.headers);
-        const result = await this.store.uploadImport(credential, importMatch[1], request, upload.declaredLength);
+        const result = await this.store.uploadImport(credential, importMatch[1]!, request, upload.declaredLength);
         return this.send(response, 201, result);
       } catch (error: any) {
         const status = Number.isInteger(error?.statusCode) ? error.statusCode : 400;

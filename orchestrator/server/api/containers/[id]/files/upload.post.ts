@@ -15,6 +15,7 @@ defineRouteMeta({
             properties: {
               path: { type: 'string', description: 'Destination directory relative to /workspace (defaults to the root).' },
               overwrite: { type: 'string', enum: ['true', 'false'], default: 'false' },
+              lockPassword: { type: 'string', writeOnly: true },
               file: { type: 'array', items: { type: 'string', format: 'binary' } },
             },
           },
@@ -29,6 +30,7 @@ defineRouteMeta({
       404: { description: 'Worker or destination not found' },
       409: { description: 'Worker not running, destination not a directory, or overwrite=false conflicts', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
       413: { description: 'Upload exceeds the total size or entry cap' },
+      423: { description: 'Correct worker lock password required' },
     },
   },
 });
@@ -36,6 +38,7 @@ defineRouteMeta({
 import { resolveFilesAccess } from '../../../../utils/files-route-helpers';
 import { rethrowAsHttpError } from '../../../../utils/http-errors';
 import { normalizeClientPath, MAX_UPLOAD_TOTAL_BYTES } from '../../../../utils/workspace-path';
+import { useWorkerProtectionLockStore } from '../../../../utils/worker-protection-lock';
 
 export default defineEventHandler(async (event) => {
   const { cm, id } = resolveFilesAccess(event);
@@ -54,6 +57,7 @@ export default defineEventHandler(async (event) => {
 
   let destRaw = '';
   let overwrite = false;
+  let lockPassword: string | undefined;
   const entries: { rel: string; data: Buffer; isDir?: boolean }[] = [];
   let totalBytes = 0;
 
@@ -64,6 +68,7 @@ export default defineEventHandler(async (event) => {
       const value = part.data?.toString('utf8') ?? '';
       if (name === 'path') destRaw = value;
       else if (name === 'overwrite') overwrite = value === 'true' || value === '1';
+      else if (name === 'lockPassword') lockPassword = value;
       continue;
     }
 
@@ -80,6 +85,7 @@ export default defineEventHandler(async (event) => {
   }
 
   try {
+    await useWorkerProtectionLockStore().verify(id, lockPassword);
     return await cm.uploadFiles(id, destRaw, entries, overwrite);
   } catch (err: any) {
     // Surface the conflict list on 409 (set by the manager) as the response body.

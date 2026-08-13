@@ -391,6 +391,7 @@ export interface FileListing {
  *  already exists; `409` when a non-directory file blocks the path. */
 export interface MkdirRequest {
   path: string;
+  lockPassword?: string;
 }
 
 /** `POST /api/containers/:id/files/rename` body. Same-directory rename only —
@@ -399,6 +400,7 @@ export interface MkdirRequest {
 export interface RenameRequest {
   path: string;
   newName: string;
+  lockPassword?: string;
 }
 
 /** `POST /api/containers/:id/files/move` body. Moves every `paths` entry into
@@ -409,6 +411,7 @@ export interface MoveRequest {
   paths: string[];
   destination: string;
   overwrite?: boolean;
+  lockPassword?: string;
 }
 
 /** A single conflict reported by `move` when `overwrite` is false. `source` is
@@ -435,6 +438,7 @@ export interface MoveResult {
  *  rejected up front. */
 export interface DeleteFilesRequest {
   paths: string[];
+  lockPassword?: string;
 }
 
 /** Result of a successful multi-delete. `deleted` counts the paths that

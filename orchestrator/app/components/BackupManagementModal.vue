@@ -15,6 +15,7 @@ const busy = ref(""),
   restoreItem = ref<any>(null),
   restoreTarget = ref<"new" | "original">("new"),
   restoreName = ref(""),
+  restoreLockPassword = ref(""),
   confirmOverwrite = ref(false),
   actionError = ref("");
 const googleDraft = reactive({ clientId: "", redirectUri: "", clientSecret: "" });
@@ -25,7 +26,10 @@ watch(open, async (shown) => {
       ...api.settings.value,
       workspaceText: api.settings.value.workspaceIds.join(", "),
     });
-  } else api.stop();
+  } else {
+    api.stop();
+    restoreLockPassword.value = "";
+  }
 });
 onBeforeUnmount(api.stop);
 const workspaceIds = () =>
@@ -80,11 +84,13 @@ async function restore() {
       restoreTarget.value,
       restoreName.value,
       confirmOverwrite.value,
+      restoreLockPassword.value,
     ),
   );
   if (result) {
     emit("restored", result.jobId);
     restoreItem.value = null;
+    restoreLockPassword.value = "";
   }
 }
 const fmt = (n?: number) => (n == null ? "—" : formatBytes(n)),
@@ -94,9 +100,11 @@ function close() {
 }
 function selectRestore(item: any) {
   restoreItem.value = item;
+  restoreLockPassword.value = "";
 }
 function cancelRestore() {
   restoreItem.value = null;
+  restoreLockPassword.value = "";
 }
 </script>
 <template>
@@ -352,6 +360,13 @@ function cancelRestore() {
             ><input v-model="confirmOverwrite" type="checkbox" /> Original
             worker is stopped; overwrite its workspace</label
           >
+          <label v-if="restoreTarget === 'original'" class="block text-sm"
+            >Worker lock password (if protected)<input
+              v-model="restoreLockPassword"
+              type="password"
+              autocomplete="current-password"
+              class="block border rounded p-2"
+          /></label>
           <div>
             <UButton
               :disabled="restoreTarget === 'original' && !confirmOverwrite"

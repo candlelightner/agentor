@@ -160,10 +160,19 @@ export function useBackups() {
     target: "new" | "original",
     displayName = "",
     confirmOverwrite = false,
+    lockPassword = "",
   ) {
     return $fetch<{ jobId: string }>(
       `/api/backups/${encodeURIComponent(id)}/restore`,
-      { method: "POST", body: { target, displayName, confirmOverwrite } },
+      {
+        method: "POST",
+        body: {
+          target,
+          displayName,
+          confirmOverwrite,
+          ...(target === "original" && lockPassword ? { lockPassword } : {}),
+        },
+      },
     );
   }
   async function remove(id: string) {

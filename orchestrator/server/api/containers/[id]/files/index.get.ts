@@ -43,7 +43,7 @@ defineRouteMeta({
           },
           MkdirRequest: {
             type: 'object',
-            properties: { path: { type: 'string', description: 'Directory to create, relative to /workspace.' } },
+            properties: { path: { type: 'string', description: 'Directory to create, relative to /workspace.' }, lockPassword: { type: 'string', writeOnly: true } },
             required: ['path'],
           },
           RenameRequest: {
@@ -51,6 +51,7 @@ defineRouteMeta({
             properties: {
               path: { type: 'string', description: 'Existing entry, relative to /workspace.' },
               newName: { type: 'string', description: 'Replacement basename within the same parent.' },
+              lockPassword: { type: 'string', writeOnly: true },
             },
             required: ['path', 'newName'],
           },
@@ -60,6 +61,7 @@ defineRouteMeta({
               paths: { type: 'array', items: { type: 'string' }, description: 'Source entries to move, relative to /workspace.' },
               destination: { type: 'string', description: 'Existing destination directory, relative to /workspace.' },
               overwrite: { type: 'boolean', default: false },
+              lockPassword: { type: 'string', writeOnly: true },
             },
             required: ['paths', 'destination'],
           },
@@ -83,7 +85,7 @@ defineRouteMeta({
           },
           DeleteFilesRequest: {
             type: 'object',
-            properties: { paths: { type: 'array', items: { type: 'string' } } },
+            properties: { paths: { type: 'array', items: { type: 'string' } }, lockPassword: { type: 'string', writeOnly: true } },
             required: ['paths'],
           },
           DeleteFilesResult: {

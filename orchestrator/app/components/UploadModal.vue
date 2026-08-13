@@ -9,11 +9,18 @@ const open = defineModel<boolean>('open', { default: false });
 const files = ref<File[]>([]);
 const isUploading = ref(false);
 const uploadError = ref('');
+const protection = ref<{ protected: boolean }>({ protected: false });
+const lockPassword = ref('');
 
-watch(open, (isOpen) => {
+watch(open, async (isOpen) => {
+  if (isOpen) {
+    protection.value = { protected: false };
+    try { protection.value = await $fetch(`/api/containers/${props.containerId}/protection`); } catch { /* server still enforces */ }
+  }
   if (!isOpen) {
     files.value = [];
     uploadError.value = '';
+    lockPassword.value = '';
   }
 });
 
@@ -24,6 +31,7 @@ async function upload() {
   uploadError.value = '';
   try {
     const formData = new FormData();
+    if (lockPassword.value) formData.append('lockPassword', lockPassword.value);
     for (const file of files.value) {
       formData.append('files', file, file.name);
     }
@@ -53,6 +61,11 @@ async function upload() {
         </p>
 
         <FileDropZone v-model="files" />
+
+        <label v-if="protection.protected" class="block text-xs text-amber-700 dark:text-amber-300">
+          Protected worker lock password
+          <UInput v-model="lockPassword" type="password" autocomplete="current-password" class="mt-1" />
+        </label>
 
         <p v-if="uploadError" class="text-red-500 dark:text-red-400 text-xs">{{ uploadError }}</p>
 

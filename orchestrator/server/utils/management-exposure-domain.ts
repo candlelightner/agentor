@@ -1,27 +1,29 @@
 import { listAppTypes } from "./apps";
 import { useConfig, useContainerManager, useDomainMappingStore, usePortMappingStore, useTraefikManager } from "./services";
 import { TraefikPortConflictError } from "./traefik-manager";
+import { useWorkerProtectionLockStore } from "./worker-protection-lock";
 
 type Group = "networking" | "apps";
 type Tool = { name: string; group: Group; description: string; inputSchema: Record<string, unknown>; annotations: Record<string, boolean> };
 const read = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 const mutation = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
 const worker = { type: "object", required: ["workerId"], properties: { workerId: { type: "string" } } };
+const lockPassword = { lockPassword: { type: "string", writeOnly: true, description: "Required when the affected worker is protected" } };
 
 /** MCP adapter over the dashboard's existing stores, Traefik reconciler, and
  * ContainerManager. It deliberately exposes no Docker handle or auth secret. */
 export class ManagementExposureDomain {
   tools(): Tool[] { return [
     tool("port-mappings.list", "networking", "List controlled TCP port mappings.", { type: "object", properties: { userId: { type: "string" } } }, read),
-    tool("port-mappings.create", "networking", "Create a TCP mapping for a running worker.", { type: "object", required: ["workerId", "externalPort", "internalPort", "type"], properties: { ...worker.properties, externalPort: portSchema(), internalPort: portSchema(), type: { enum: ["localhost", "external"] }, appType: { type: "string" }, instanceId: { type: "string" } } }, mutation),
-    tool("port-mappings.delete", "networking", "Remove a TCP mapping by external port.", { type: "object", required: ["externalPort"], properties: { externalPort: portSchema() } }, { ...mutation, destructiveHint: true }),
+    tool("port-mappings.create", "networking", "Create a TCP mapping for a running worker; protected workers require lockPassword.", { type: "object", required: ["workerId", "externalPort", "internalPort", "type"], properties: { ...worker.properties, ...lockPassword, externalPort: portSchema(), internalPort: portSchema(), type: { enum: ["localhost", "external"] }, appType: { type: "string" }, instanceId: { type: "string" } } }, mutation),
+    tool("port-mappings.delete", "networking", "Remove a TCP mapping by external port; protected workers require lockPassword.", { type: "object", required: ["externalPort"], properties: { externalPort: portSchema(), ...lockPassword } }, { ...mutation, destructiveHint: true }),
     tool("domain-mappings.list", "networking", "List domain mappings without basic-auth passwords.", { type: "object", properties: { userId: { type: "string" } } }, read),
-    tool("domain-mappings.create", "networking", "Create a domain mapping for a running worker.", { type: "object", required: ["workerId", "baseDomain", "protocol", "internalPort"], properties: { ...worker.properties, baseDomain: { type: "string" }, subdomain: { type: "string" }, path: { type: "string" }, protocol: { enum: ["http", "https", "tcp"] }, wildcard: { type: "boolean" }, internalPort: portSchema(), basicAuth: { type: "object", properties: { username: { type: "string" }, password: { type: "string", writeOnly: true } } } } }, mutation),
-    tool("domain-mappings.delete", "networking", "Remove a domain mapping by id.", { type: "object", required: ["mappingId"], properties: { mappingId: { type: "string" } } }, { ...mutation, destructiveHint: true }),
+    tool("domain-mappings.create", "networking", "Create a domain mapping for a running worker; protected workers require lockPassword.", { type: "object", required: ["workerId", "baseDomain", "protocol", "internalPort"], properties: { ...worker.properties, ...lockPassword, baseDomain: { type: "string" }, subdomain: { type: "string" }, path: { type: "string" }, protocol: { enum: ["http", "https", "tcp"] }, wildcard: { type: "boolean" }, internalPort: portSchema(), basicAuth: { type: "object", properties: { username: { type: "string" }, password: { type: "string", writeOnly: true } } } } }, mutation),
+    tool("domain-mappings.delete", "networking", "Remove a domain mapping by id; protected workers require lockPassword.", { type: "object", required: ["mappingId"], properties: { mappingId: { type: "string" }, ...lockPassword } }, { ...mutation, destructiveHint: true }),
     tool("apps.types", "apps", "List supported worker application types.", { type: "object" }, read),
     tool("apps.list", "apps", "List application instances on a running worker.", worker, read),
-    tool("apps.start", "apps", "Start a supported application inside a running worker.", { type: "object", required: ["workerId", "appType"], properties: { ...worker.properties, appType: { type: "string" } } }, mutation),
-    tool("apps.stop", "apps", "Stop an application instance inside a running worker.", { type: "object", required: ["workerId", "appType", "instanceId"], properties: { ...worker.properties, appType: { type: "string" }, instanceId: { type: "string" } } }, { ...mutation, destructiveHint: true }),
+    tool("apps.start", "apps", "Start a supported application inside a running worker; protected workers require lockPassword.", { type: "object", required: ["workerId", "appType"], properties: { ...worker.properties, ...lockPassword, appType: { type: "string" } } }, mutation),
+    tool("apps.stop", "apps", "Stop an application instance inside a running worker; protected workers require lockPassword.", { type: "object", required: ["workerId", "appType", "instanceId"], properties: { ...worker.properties, ...lockPassword, appType: { type: "string" }, instanceId: { type: "string" } } }, { ...mutation, destructiveHint: true }),
   ]; }
 
   async execute(name: string, args: Record<string, unknown>) {
@@ -29,14 +31,14 @@ export class ManagementExposureDomain {
     const cm = useContainerManager();
     if (name === "apps.types") return { handled: true, result: listAppTypes() };
     if (name === "apps.list") return { handled: true, result: await this.listApps(req(args.workerId, "workerId")) };
-    if (name === "apps.start") return { handled: true, result: await cm.createAppInstance(req(args.workerId, "workerId"), req(args.appType, "appType")) };
-    if (name === "apps.stop") { await cm.stopAppInstance(req(args.workerId, "workerId"), req(args.appType, "appType"), req(args.instanceId, "instanceId")); return { handled: true, result: { ok: true } }; }
+    if (name === "apps.start") { const id = req(args.workerId, "workerId"); this.running(id); await useWorkerProtectionLockStore().verify(id, args.lockPassword); return { handled: true, result: await cm.createAppInstance(id, req(args.appType, "appType")) }; }
+    if (name === "apps.stop") { const id = req(args.workerId, "workerId"); this.running(id); await useWorkerProtectionLockStore().verify(id, args.lockPassword); await cm.stopAppInstance(id, req(args.appType, "appType"), req(args.instanceId, "instanceId")); return { handled: true, result: { ok: true } }; }
     if (name === "port-mappings.list") return { handled: true, result: owned(usePortMappingStore().list(), optional(args.userId)).map((item) => ({ ...item })) };
     if (name === "port-mappings.create") return { handled: true, result: await this.createPort(args) };
-    if (name === "port-mappings.delete") return { handled: true, result: await this.removePort(port(args.externalPort, "externalPort")) };
+    if (name === "port-mappings.delete") return { handled: true, result: await this.removePort(port(args.externalPort, "externalPort"), args.lockPassword) };
     if (name === "domain-mappings.list") return { handled: true, result: owned(useDomainMappingStore().list(), optional(args.userId)).map(publicDomain) };
     if (name === "domain-mappings.create") return { handled: true, result: publicDomain(await this.createDomain(args)) };
-    if (name === "domain-mappings.delete") return { handled: true, result: await this.removeDomain(req(args.mappingId, "mappingId")) };
+    if (name === "domain-mappings.delete") return { handled: true, result: await this.removeDomain(req(args.mappingId, "mappingId"), args.lockPassword) };
     return { handled: false };
   }
 
@@ -46,12 +48,13 @@ export class ManagementExposureDomain {
     const externalPort = port(args.externalPort, "externalPort"), internalPort = port(args.internalPort, "internalPort"), type = req(args.type, "type");
     if (type !== "localhost" && type !== "external") throw fail(400, 'type must be "localhost" or "external"');
     const target = this.running(req(args.workerId, "workerId"));
+    await useWorkerProtectionLockStore().verify(target.id, args.lockPassword);
     try { useTraefikManager().assertPortAcceptable(externalPort); } catch (e) { if (e instanceof TraefikPortConflictError) throw fail(409, e.message); throw e; }
     const store = usePortMappingStore(); let created: any;
     try { created = await store.add({ externalPort, internalPort, type, workerId: target.id, containerName: target.containerName, userId: target.userId, ...(optional(args.appType) ? { appType: optional(args.appType) } : {}), ...(optional(args.instanceId) ? { instanceId: optional(args.instanceId) } : {}) }); await useTraefikManager().reconcileStrict(); return { ...created }; }
     catch (e) { if (created) await store.remove(externalPort).catch(() => {}); throw normalized(e, "Port mapping could not be applied"); }
   }
-  private async removePort(externalPort: number) { const store = usePortMappingStore(); if (!store.findByPort(externalPort)) return { ok: true }; await store.remove(externalPort); await useTraefikManager().reconcile(); return { ok: true }; }
+  private async removePort(externalPort: number, password: unknown) { const store = usePortMappingStore(); const existing = store.findByPort(externalPort); if (!existing) return { ok: true }; await useWorkerProtectionLockStore().verify(existing.item.workerId, password); await store.remove(externalPort); await useTraefikManager().reconcile(); return { ok: true }; }
   private async createDomain(args: Record<string, unknown>) {
     const config = useConfig(), baseDomain = req(args.baseDomain, "baseDomain"), protocol = req(args.protocol, "protocol");
     if (!config.baseDomains.length) throw fail(400, "Domain mapping is not enabled (BASE_DOMAINS not set)");
@@ -64,10 +67,11 @@ export class ManagementExposureDomain {
     let path = optional(args.path) || ""; if (path === "/") path = ""; if (path) { if (protocol === "tcp") throw fail(400, "path is not supported for TCP protocol"); if (!/^\/[a-zA-Z0-9\/_.-]+$/.test(path)) throw fail(400, "path must be a safe URL prefix"); path = path.replace(/\/+$/, "") || ""; }
     const auth = object(args.basicAuth), username = optional(auth?.username), password = optional(auth?.password); if (Boolean(username) !== Boolean(password)) throw fail(400, "basicAuth requires both username and password");
     const target = this.running(req(args.workerId, "workerId")); const store = useDomainMappingStore(); let created: any;
+    await useWorkerProtectionLockStore().verify(target.id, args.lockPassword);
     try { created = await store.add({ subdomain, baseDomain, path, protocol: protocol as any, wildcard, internalPort: port(args.internalPort, "internalPort"), workerId: target.id, containerName: target.containerName, userId: target.userId, ...(username && password ? { basicAuth: { username, password } } : {}) }); await useTraefikManager().reconcileStrict(); return created; }
     catch (e) { if (created) await store.remove(created.id).catch(() => {}); throw normalized(e, "Domain mapping could not be applied"); }
   }
-  private async removeDomain(id: string) { const store = useDomainMappingStore(); if (!store.findById(id)) return { ok: true }; await store.remove(id); await useTraefikManager().reconcile(); return { ok: true }; }
+  private async removeDomain(id: string, password: unknown) { const store = useDomainMappingStore(); const existing = store.findById(id); if (!existing) return { ok: true }; await useWorkerProtectionLockStore().verify(existing.item.workerId, password); await store.remove(id); await useTraefikManager().reconcile(); return { ok: true }; }
 }
 function tool(name: string, group: Group, description: string, inputSchema: Record<string, unknown>, annotations: Record<string, boolean>): Tool { return { name, group, description, inputSchema, annotations }; }
 function portSchema() { return { type: "integer", minimum: 1, maximum: 65535 }; }

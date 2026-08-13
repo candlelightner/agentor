@@ -63,14 +63,14 @@ export function useWorkspaceFiles(containerId: MaybeRefOrGetter<string>) {
   }
 
   /** `POST /files/mkdir` — create a directory (and parents). Idempotent. */
-  async function mkdir(path: string): Promise<void> {
-    const body: MkdirRequest = { path };
+  async function mkdir(path: string, lockPassword?: string): Promise<void> {
+    const body: MkdirRequest = { path, ...(lockPassword ? { lockPassword } : {}) };
     await $fetch(`${base()}/mkdir`, { method: 'POST', body });
   }
 
   /** `POST /files/rename` — same-directory rename, no overwrite. */
-  async function rename(path: string, newName: string): Promise<void> {
-    const body: RenameRequest = { path, newName };
+  async function rename(path: string, newName: string, lockPassword?: string): Promise<void> {
+    const body: RenameRequest = { path, newName, ...(lockPassword ? { lockPassword } : {}) };
     await $fetch(`${base()}/rename`, { method: 'POST', body });
   }
 
@@ -81,8 +81,9 @@ export function useWorkspaceFiles(containerId: MaybeRefOrGetter<string>) {
     paths: string[],
     destination: string,
     overwrite = false,
+    lockPassword?: string,
   ): Promise<WorkspaceFilesMutationResult> {
-    const body: MoveRequest = { paths, destination, overwrite };
+    const body: MoveRequest = { paths, destination, overwrite, ...(lockPassword ? { lockPassword } : {}) };
     try {
       const data = await $fetch<MoveResult>(`${base()}/move`, { method: 'POST', body });
       return { ok: true, data };
@@ -101,10 +102,10 @@ export function useWorkspaceFiles(containerId: MaybeRefOrGetter<string>) {
   }
 
   /** `DELETE /files` with JSON `{ paths }`. Missing paths are ignored. */
-  async function remove(paths: string[]): Promise<DeleteFilesResult> {
+  async function remove(paths: string[], lockPassword?: string): Promise<DeleteFilesResult> {
     return await $fetch<DeleteFilesResult>(`${base()}`, {
       method: 'DELETE',
-      body: { paths },
+      body: { paths, ...(lockPassword ? { lockPassword } : {}) },
     });
   }
 
@@ -117,10 +118,12 @@ export function useWorkspaceFiles(containerId: MaybeRefOrGetter<string>) {
     path: string,
     files: File[],
     overwrite = false,
+    lockPassword?: string,
   ): Promise<WorkspaceFilesMutationResult> {
     const formData = new FormData();
     formData.append('path', path);
     formData.append('overwrite', overwrite ? 'true' : 'false');
+    if (lockPassword) formData.append('lockPassword', lockPassword);
     for (const file of files) {
       // `file.name` already carries the relative folder path (FileDropZone /
       // webkitRelativePath preservation), so appending with the name keeps the

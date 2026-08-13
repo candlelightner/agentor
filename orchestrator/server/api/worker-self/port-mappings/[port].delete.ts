@@ -5,11 +5,13 @@ defineRouteMeta({
     description: 'Removes a port mapping by its external port. Mapping must belong to the calling worker.',
     operationId: 'workerSelfDeletePortMapping',
     parameters: [{ name: 'port', in: 'path', required: true, schema: { type: 'integer' }, description: 'External port number' }],
+    requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { lockPassword: { type: 'string', writeOnly: true } } } } } },
     responses: {
       200: { description: 'Port mapping deleted (idempotent)' },
       400: { description: 'Invalid port number' },
       401: { description: 'Caller IP did not resolve to a managed worker' },
       403: { description: 'Mapping is owned by a different worker, or the environment does not expose the port-mappings API' },
+      423: { description: 'Correct worker lock password required' },
     },
   },
 });
@@ -19,6 +21,7 @@ import { DEFAULT_ENVIRONMENT_ID } from '../../../utils/environments';
 import { requireWorkerSelf } from '../../../utils/worker-auth';
 import type { ExposeApis } from '../../../../shared/types';
 import type { WorkerSelfContext } from '../../../utils/worker-auth';
+import { useWorkerProtectionLockStore } from '../../../utils/worker-protection-lock';
 
 // exposeApis gate — see port-mappings/index.post.ts for the full rationale.
 function requireExposedApi(ctx: WorkerSelfContext, api: keyof ExposeApis): void {
@@ -50,6 +53,8 @@ export default defineEventHandler(async (event) => {
   if (existing.item.containerName !== ctx.containerName) {
     throw createError({ statusCode: 403, statusMessage: 'Forbidden: mapping is owned by a different worker' });
   }
+  const body = await readBody<{ lockPassword?: unknown }>(event).catch(() => undefined);
+  await useWorkerProtectionLockStore().verify(ctx.container.id, body?.lockPassword);
 
   const removed = await store.remove(port);
   if (removed) {

@@ -17,6 +17,7 @@ defineRouteMeta({
               internalPort: { type: 'integer', description: 'Worker internal port (1-65535)' },
               appType: { type: 'string', description: 'Optional app type reference' },
               instanceId: { type: 'string', description: 'Optional app instance ID' },
+              lockPassword: { type: 'string', writeOnly: true, description: 'Required when this worker is protected' },
             },
           },
         },
@@ -28,6 +29,7 @@ defineRouteMeta({
       401: { description: 'Caller IP did not resolve to a managed worker' },
       403: { description: 'Worker environment does not expose the port-mappings API' },
       409: { description: 'External port already mapped' },
+      423: { description: 'Correct worker lock password required' },
     },
   },
 });
@@ -38,6 +40,7 @@ import { DEFAULT_ENVIRONMENT_ID } from '../../../utils/environments';
 import { requireWorkerSelf } from '../../../utils/worker-auth';
 import type { ExposeApis } from '../../../../shared/types';
 import type { WorkerSelfContext } from '../../../utils/worker-auth';
+import { useWorkerProtectionLockStore } from '../../../utils/worker-protection-lock';
 
 // Enforces the worker environment's `exposeApis` gate. `requireWorkerSelf` only
 // proves WHICH worker is calling — it does not consult the environment. This
@@ -61,6 +64,7 @@ export default defineEventHandler(async (event) => {
   const ctx = await requireWorkerSelf(event);
   requireExposedApi(ctx, 'portMappings');
   const body = await readBody(event);
+  await useWorkerProtectionLockStore().verify(ctx.container.id, body?.lockPassword);
 
   if (!body.externalPort || !body.type || !body.internalPort) {
     throw createError({

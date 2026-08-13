@@ -499,7 +499,9 @@ test.describe
     await cleanupWorker(ownerCtx, job.workerId);
   });
 
-  test("original-worker restore requires an explicit safety decision and reports missing secrets by name only", async () => {
+  test("original-worker restore requires safety confirmation and the protected worker credential without leaking it", async () => {
+    const lockPassword = `backup-restore-lock-${Date.now()}-password`;
+    let locked = false;
     expect(
       (
         await new ApiClient(ownerCtx).uploadToWorkspace(workspaceA, [
@@ -519,27 +521,93 @@ test.describe
       /running|stop|confirm|safe/i,
     );
 
-    expect(
-      (await new ApiClient(ownerCtx).stopContainer(workspaceA)).status,
-    ).toBe(200);
-    const accepted = await ownerCtx.post(
-      `/api/backups/${successfulBackupId}/restore`,
-      { data: { target: "original", confirmOverwrite: true } },
-    );
-    expect(accepted.status()).toBe(202);
-    const job = await waitForJob(ownerCtx, (await accepted.json()).jobId);
-    expect(job.status).toBe("succeeded");
-    for (const sentinel of SECRET_SENTINELS)
-      expect(JSON.stringify(job)).not.toContain(sentinel);
-    const restored = await ownerCtx.get(
-      `/api/workspaces/${workspaceA}/download?path=roundtrip.txt`,
-    );
-    expect(restored.status()).toBe(200);
-    expect(await restored.text()).toContain("backup round trip marker");
-    const removed = await ownerCtx.get(
-      `/api/workspaces/${workspaceA}/download?path=after-backup.txt`,
-    );
-    expect(removed.status()).toBe(404);
+    try {
+      expect(
+        (
+          await ownerCtx.put(`/api/containers/${workspaceA}/protection`, {
+            data: { password: lockPassword },
+          })
+        ).status(),
+      ).toBe(200);
+      locked = true;
+      expect(
+        (
+          await ownerCtx.post(`/api/containers/${workspaceA}/stop`, {
+            data: { lockPassword },
+          })
+        ).status(),
+      ).toBe(200);
+
+      // A protected source may still be restored as a separate new worker:
+      // that operation does not mutate the protected original.
+      const separate = await ownerCtx.post(
+        `/api/backups/${successfulBackupId}/restore`,
+        { data: { target: "new", displayName: "locked-source-copy" } },
+      );
+      expect(separate.status()).toBe(202);
+      const separateJob = await waitForJob(
+        ownerCtx,
+        (await separate.json()).jobId,
+      );
+      expect(separateJob.status).toBe("succeeded");
+      await cleanupWorker(ownerCtx, separateJob.workerId);
+
+      const jobsBeforeDeniedRestore = (
+        await (await ownerCtx.get("/api/backups")).json()
+      ).jobs.length;
+
+      for (const data of [
+        { target: "original", confirmOverwrite: true },
+        {
+          target: "original",
+          confirmOverwrite: true,
+          lockPassword: "wrong-backup-restore-password",
+        },
+      ]) {
+        const denied = await ownerCtx.post(
+          `/api/backups/${successfulBackupId}/restore`,
+          { data },
+        );
+        expect(denied.status()).toBe(423);
+        expect(JSON.stringify(await body(denied))).not.toContain(lockPassword);
+      }
+      expect((await (await ownerCtx.get("/api/backups")).json()).jobs).toHaveLength(
+        jobsBeforeDeniedRestore,
+      );
+
+      const accepted = await ownerCtx.post(
+        `/api/backups/${successfulBackupId}/restore`,
+        {
+          data: {
+            target: "original",
+            confirmOverwrite: true,
+            lockPassword,
+          },
+        },
+      );
+      expect(accepted.status()).toBe(202);
+      const acceptedBody = await accepted.json();
+      expect(JSON.stringify(acceptedBody)).not.toContain(lockPassword);
+      const job = await waitForJob(ownerCtx, acceptedBody.jobId);
+      expect(job.status).toBe("succeeded");
+      expect(JSON.stringify(job)).not.toContain(lockPassword);
+      for (const sentinel of SECRET_SENTINELS)
+        expect(JSON.stringify(job)).not.toContain(sentinel);
+      const restored = await ownerCtx.get(
+        `/api/workspaces/${workspaceA}/download?path=roundtrip.txt`,
+      );
+      expect(restored.status()).toBe(200);
+      expect(await restored.text()).toContain("backup round trip marker");
+      const removed = await ownerCtx.get(
+        `/api/workspaces/${workspaceA}/download?path=after-backup.txt`,
+      );
+      expect(removed.status()).toBe(404);
+    } finally {
+      if (locked)
+        await ownerCtx.delete(`/api/containers/${workspaceA}/protection`, {
+          data: { password: lockPassword },
+        });
+    }
   });
 
   test("Google OAuth validates state and stores tokens encrypted without exposing them", async () => {

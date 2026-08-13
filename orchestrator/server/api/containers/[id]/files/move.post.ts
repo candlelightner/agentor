@@ -20,12 +20,14 @@ defineRouteMeta({
         description: 'Worker not running, destination not a directory, or overwrite=false conflicts',
         content: { 'application/json': { schema: { $ref: '#/components/schemas/MoveConflictResponse' } } },
       },
+      423: { description: 'Correct worker lock password required' },
     },
   },
 });
 
 import { resolveFilesAccess } from '../../../../utils/files-route-helpers';
 import { rethrowAsHttpError } from '../../../../utils/http-errors';
+import { useWorkerProtectionLockStore } from '../../../../utils/worker-protection-lock';
 
 export default defineEventHandler(async (event) => {
   const { cm, id } = resolveFilesAccess(event);
@@ -34,6 +36,7 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 400, statusMessage: 'destination must be a string' });
   }
   try {
+    await useWorkerProtectionLockStore().verify(id, body.lockPassword);
     return await cm.moveFiles(
       id,
       Array.isArray(body.paths) ? body.paths : [],

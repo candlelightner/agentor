@@ -34,7 +34,7 @@ All agents are installed in a single unified worker image. Start any agent via i
 - **Persistent workspaces** — workspace data survives container stops, restarts, and archiving via named Docker volumes
 - **Worker archiving** — archive workers to free resources while preserving workspace data; unarchive to restore
 - **Worker groups and managed networks** — organize related experiments, create all/group/selected-worker bridge networks, and keep the internal management network unavailable to ordinary workers
-- **Worker protection locks** — optional write-only per-worker passwords protect material changes, rebuilds, archive/unarchive, and deletion across UI, API, and MCP routes
+- **Worker protection locks** — optional write-only per-worker passwords protect lifecycle/configuration, running-workspace file changes, apps/exposure mappings, rebuilds, archive/unarchive, in-place restore, and deletion across UI, API, and MCP routes
 - **File upload/download** — upload files/folders to running workers or during creation, download workspace as `.tar.gz`
 - **Docker-in-Docker** — opt-in per-environment, full Docker daemon inside workers (build, run, compose)
 - **Usage monitoring** — real-time usage/rate limit indicators for OAuth-authenticated agents (Claude, Codex, Gemini)

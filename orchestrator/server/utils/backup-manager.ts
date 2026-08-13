@@ -39,6 +39,7 @@ import {
 import { packWorkspaceBackups, unpackWorkspaceBackups } from "./backup-bundle";
 import { extractBundle } from "./worker-export";
 import { replaceStoppedWorkspace } from "./backup-restore-helper";
+import { useWorkerProtectionLockStore } from "./worker-protection-lock";
 import { useGoogleBackupOAuthConfigStore } from "./google-backup-oauth-config";
 import Docker from "dockerode";
 import {
@@ -61,6 +62,7 @@ import {
   writeManifest,
   type WorkerExportManifest,
 } from "./worker-export";
+import { assertSafeUserId } from "./user-id";
 
 export class BackupManager {
   private store = new BackupStore(useConfig().dataDir);
@@ -388,7 +390,13 @@ export class BackupManager {
     artifact: BackupArtifact,
     target: "new" | "original",
     displayName?: string,
+    lockPassword?: unknown,
   ): Promise<BackupJob> {
+    if (target === "original")
+      await useWorkerProtectionLockStore().verify(
+        artifact.sourceWorkerId ?? artifact.workspaceId,
+        lockPassword,
+      );
     const now = new Date().toISOString();
     const job: BackupJob = {
       schemaVersion: 1,
@@ -472,6 +480,7 @@ export class BackupManager {
     destination: string,
     signal: AbortSignal,
   ) {
+    assertSafeUserId(userId);
     const live = useContainerManager().get(id);
     // Archived records remain visible through ContainerManager, but they no
     // longer have a Docker container. Only take the native export path when

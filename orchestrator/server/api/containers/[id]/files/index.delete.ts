@@ -21,17 +21,20 @@ defineRouteMeta({
       403: { description: 'Forbidden — not the worker owner' },
       404: { description: 'Worker not found' },
       409: { description: 'Worker not running, or a deletion failed' },
+      423: { description: 'Correct worker lock password required' },
     },
   },
 });
 
 import { resolveFilesAccess } from '../../../../utils/files-route-helpers';
 import { rethrowAsHttpError } from '../../../../utils/http-errors';
+import { useWorkerProtectionLockStore } from '../../../../utils/worker-protection-lock';
 
 export default defineEventHandler(async (event) => {
   const { cm, id } = resolveFilesAccess(event);
   const body = await readBody(event);
   try {
+    await useWorkerProtectionLockStore().verify(id, body?.lockPassword);
     return await cm.deleteFiles(id, Array.isArray(body?.paths) ? body.paths : []);
   } catch (err) {
     rethrowAsHttpError(err);

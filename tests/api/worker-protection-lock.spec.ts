@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { createWorker, cleanupWorker } from '../helpers/worker-lifecycle';
+import { ApiClient } from '../helpers/api-client';
 
 test.describe.serial('Worker protection locks', () => {
   let workerId = '';
@@ -40,6 +41,25 @@ test.describe.serial('Worker protection locks', () => {
     expect((await request.post(`/api/containers/${workerId}/stop`, { data: { lockPassword: password } })).status()).toBe(200);
     expect((await request.post(`/api/containers/${workerId}/restart`, { data: {} })).status()).toBe(423);
     expect((await request.post(`/api/containers/${workerId}/restart`, { data: { lockPassword: password } })).status()).toBe(200);
+  });
+
+  test('enforces the lock on every running-workspace file mutation without returning the credential', async ({ request }) => {
+    const api = new ApiClient(request), wrong = 'wrong-workspace-lock-password';
+    expect((await api.uploadToWorkspace(workerId,[{name:'legacy-locked.txt',content:Buffer.from('protected')}])).status).toBe(423);
+    expect((await api.uploadToWorkspace(workerId,[{name:'legacy-locked.txt',content:Buffer.from('protected')}],password)).status).toBe(200);
+    for (const result of [
+      await api.uploadFiles(workerId,[{name:'locked-file.txt',content:Buffer.from('protected')}]),
+      await api.uploadFiles(workerId,[{name:'locked-file.txt',content:Buffer.from('protected')}],{lockPassword:wrong}),
+    ]) { expect(result.status).toBe(423); expect(JSON.stringify(result.body)).not.toContain(password); }
+    expect((await api.uploadFiles(workerId,[{name:'locked-file.txt',content:Buffer.from('protected')}],{lockPassword:password})).status).toBe(200);
+    expect((await api.mkdirFiles(workerId,'locked-dir')).status).toBe(423);
+    expect((await api.mkdirFiles(workerId,'locked-dir',password)).status).toBe(200);
+    expect((await api.renameFile(workerId,'locked-file.txt','renamed.txt')).status).toBe(423);
+    expect((await api.renameFile(workerId,'locked-file.txt','renamed.txt',password)).status).toBe(200);
+    expect((await api.moveFiles(workerId,['renamed.txt'],'locked-dir')).status).toBe(423);
+    expect((await api.moveFiles(workerId,['renamed.txt'],'locked-dir',false,password)).status).toBe(200);
+    expect((await api.deleteFiles(workerId,['locked-dir/renamed.txt'],wrong)).status).toBe(423);
+    const deleted=await api.deleteFiles(workerId,['locked-dir'],password);expect(deleted.status).toBe(200);expect(JSON.stringify(deleted.body)).not.toContain(password);
   });
 
   test('removes protection with the correct password', async ({ request }) => {

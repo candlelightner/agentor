@@ -516,6 +516,28 @@ test.describe.serial("Workspace Files Modal", () => {
     await expect(panel.getByRole("button", { name: "Create" })).toBeDisabled();
   });
 
+  test("protected worker file mutations use a transient password field and do not render its value", async ({ page, request }) => {
+    const lockPassword = `files-ui-lock-${Date.now()}-password`;
+    const folder = `protected-ui-${Date.now()}`;
+    const api = new ApiClient(request);
+    expect((await request.put(`/api/containers/${containerId}/protection`, { data: { password: lockPassword } })).status()).toBe(200);
+    try {
+      const modal = await openFilesModal(page, displayName);
+      await modal.getByRole("button", { name: "New Folder" }).click();
+      const panel = page.locator('[data-testid="workspace-mkdir-panel"]');
+      await expect(panel).toBeVisible();
+      await panel.getByPlaceholder("folder name").fill(folder);
+      await page.getByLabel(/Protected worker lock password/).fill(lockPassword);
+      await panel.getByRole("button", { name: "Create" }).click();
+      await expect(rowByPath(page, folder)).toBeVisible();
+      await expect(page.getByLabel(/Protected worker lock password/)).toHaveCount(0);
+      await expect(modal).not.toContainText(lockPassword);
+      expect((await api.deleteFiles(containerId, [folder], lockPassword)).status).toBe(200);
+    } finally {
+      await request.delete(`/api/containers/${containerId}/protection`, { data: { password: lockPassword } });
+    }
+  });
+
   // ─── Rename ────────────────────────────────────────────────────────────────
 
   test("Rename renames a single selected entry", async ({ page }) => {

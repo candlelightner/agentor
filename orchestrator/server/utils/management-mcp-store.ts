@@ -34,6 +34,8 @@ import { ManagementLogsDomain } from "./management-logs-domain";
 import { ManagementStatusDomain } from "./management-status-domain";
 import { ManagementGlobalConfigurationDomain } from "./management-global-configuration-domain";
 import { ManagementImportDomain } from "./management-import-domain";
+import { useWorkerProtectionLockStore } from "./worker-protection-lock";
+import { validateManagementOwnerArguments } from "./management-owner";
 import type { Readable } from "node:stream";
 
 const GROUPS = [
@@ -369,6 +371,7 @@ export class ManagementMcpStore {
           statusCode: 403,
         });
       }
+      await validateManagementOwnerArguments(args);
       let result: unknown;
       if (name === "configuration.propose") {
         const patch = validateConfigurationProposal(args.patch);
@@ -420,6 +423,10 @@ export class ManagementMcpStore {
             throw Object.assign(new Error("Worker not found"), {
               statusCode: 404,
             });
+          await useWorkerProtectionLockStore().verify(
+            worker.id,
+            args.lockPassword,
+          );
           await useWorkerConfigStore().patch(worker.userId, worker.id, {
             variables: patch.variables,
           });
@@ -551,6 +558,7 @@ export class ManagementMcpStore {
     }
     if (name === "worker.stop" || name === "worker.start") {
       if (!worker) throw statusError(404, "Worker not found");
+      await useWorkerProtectionLockStore().verify(worker.id, args.lockPassword);
       if (name === "worker.stop") await useContainerManager().stop(worker.id);
       else await useContainerManager().restart(worker.id);
       return { workerId: worker.id, requested: name };
@@ -710,6 +718,34 @@ function toolAnnotations(name: string) {
   };
 }
 function toolInputSchema(name: string) {
+  if (name === "configuration.apply")
+    return {
+      type: "object",
+      additionalProperties: false,
+      required: ["proposalId"],
+      properties: {
+        proposalId: { type: "string" },
+        lockPassword: {
+          type: "string",
+          writeOnly: true,
+          description: "Required when a proposal changes a protected worker",
+        },
+      },
+    };
+  if (name === "worker.stop" || name === "worker.start")
+    return {
+      type: "object",
+      additionalProperties: false,
+      required: ["workerId"],
+      properties: {
+        workerId: { type: "string" },
+        lockPassword: {
+          type: "string",
+          writeOnly: true,
+          description: "Required when the target worker is protected",
+        },
+      },
+    };
   if (name === "console.open")
     return {
       type: "object",

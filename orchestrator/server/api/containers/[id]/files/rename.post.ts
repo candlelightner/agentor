@@ -17,12 +17,14 @@ defineRouteMeta({
       403: { description: 'Forbidden — not the worker owner' },
       404: { description: 'Worker or source path not found' },
       409: { description: 'Worker not running, or target name already exists' },
+      423: { description: 'Correct worker lock password required' },
     },
   },
 });
 
 import { resolveFilesAccess } from '../../../../utils/files-route-helpers';
 import { rethrowAsHttpError } from '../../../../utils/http-errors';
+import { useWorkerProtectionLockStore } from '../../../../utils/worker-protection-lock';
 
 export default defineEventHandler(async (event) => {
   const { cm, id } = resolveFilesAccess(event);
@@ -34,6 +36,7 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 400, statusMessage: 'newName must be a string' });
   }
   try {
+    await useWorkerProtectionLockStore().verify(id, body.lockPassword);
     return await cm.renameFile(id, body.path, body.newName);
   } catch (err) {
     rethrowAsHttpError(err);

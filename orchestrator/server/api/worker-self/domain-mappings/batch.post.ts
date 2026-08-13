@@ -24,10 +24,11 @@ defineRouteMeta({
                     protocol: { type: 'string', enum: ['http', 'https', 'tcp'] },
                     wildcard: { type: 'boolean' },
                     internalPort: { type: 'integer' },
-                    basicAuth: { type: 'object', properties: { username: { type: 'string' }, password: { type: 'string' } } },
+                    basicAuth: { type: 'object', properties: { username: { type: 'string' }, password: { type: 'string', writeOnly: true } } },
                   },
                 },
               },
+              lockPassword: { type: 'string', writeOnly: true, description: 'Required when this worker is protected' },
             },
           },
         },
@@ -38,6 +39,7 @@ defineRouteMeta({
       400: { description: 'Validation error' },
       401: { description: 'Caller IP did not resolve to a managed worker' },
       409: { description: 'Subdomain conflict' },
+      423: { description: 'Correct worker lock password required' },
     },
   },
 });
@@ -47,6 +49,7 @@ import { DEFAULT_ENVIRONMENT_ID } from '../../../utils/environments';
 import { requireWorkerSelf } from '../../../utils/worker-auth';
 import type { ExposeApis } from '../../../../shared/types';
 import type { WorkerSelfContext } from '../../../utils/worker-auth';
+import { useWorkerProtectionLockStore } from '../../../utils/worker-protection-lock';
 
 // exposeApis gate — see port-mappings/index.post.ts for the full rationale.
 function requireExposedApi(ctx: WorkerSelfContext, api: keyof ExposeApis): void {
@@ -63,6 +66,7 @@ export default defineEventHandler(async (event) => {
   const ctx = await requireWorkerSelf(event);
   requireExposedApi(ctx, 'domainMappings');
   const body = await readBody(event);
+  await useWorkerProtectionLockStore().verify(ctx.container.id, body?.lockPassword);
   const config = useConfig();
 
   if (config.baseDomains.length === 0) {

@@ -121,9 +121,10 @@ export class ApiClient {
     return { status: res.status(), headers: res.headers(), body: await res.body() };
   }
 
-  async uploadToWorkspace(id: string, files: { name: string; content: Buffer; mimeType?: string }[]) {
+  async uploadToWorkspace(id: string, files: { name: string; content: Buffer; mimeType?: string }[], lockPassword?: string) {
     // Use FormData (the recommended way in Playwright for file uploads)
     const form = new FormData();
+    if (lockPassword) form.append('lockPassword', lockPassword);
     for (const f of files) {
       const blob = new Blob([new Uint8Array(f.content)], { type: f.mimeType || 'application/octet-stream' });
       const file = new File([blob], f.name, { type: f.mimeType || 'application/octet-stream' });
@@ -161,11 +162,12 @@ export class ApiClient {
   async uploadFiles(
     id: string,
     files: { name: string; content: Buffer; mimeType?: string }[],
-    opts: { dest?: string; overwrite?: boolean } = {},
+    opts: { dest?: string; overwrite?: boolean; lockPassword?: string } = {},
   ) {
     const form = new FormData();
     form.append('path', opts.dest ?? '');
     form.append('overwrite', opts.overwrite ? 'true' : 'false');
+    if (opts.lockPassword) form.append('lockPassword', opts.lockPassword);
     for (const f of files) {
       const blob = new Blob([new Uint8Array(f.content)], { type: f.mimeType || 'application/octet-stream' });
       const file = new File([blob], f.name, { type: f.mimeType || 'application/octet-stream' });
@@ -178,33 +180,33 @@ export class ApiClient {
   }
 
   /** `POST /files/mkdir` — create `path` (and parents); idempotent. */
-  async mkdirFiles(id: string, path: string) {
+  async mkdirFiles(id: string, path: string, lockPassword?: string) {
     const res = await this.request.post(`${BASE_URL}/api/containers/${id}/files/mkdir`, {
-      data: { path },
+      data: { path, ...(lockPassword ? { lockPassword } : {}) },
     });
     return { status: res.status(), body: await res.json().catch(() => ({})) };
   }
 
   /** `POST /files/rename` — same-directory rename, no overwrite. */
-  async renameFile(id: string, path: string, newName: string) {
+  async renameFile(id: string, path: string, newName: string, lockPassword?: string) {
     const res = await this.request.post(`${BASE_URL}/api/containers/${id}/files/rename`, {
-      data: { path, newName },
+      data: { path, newName, ...(lockPassword ? { lockPassword } : {}) },
     });
     return { status: res.status(), body: await res.json().catch(() => ({})) };
   }
 
   /** `POST /files/move` — move `paths` into the existing `destination`. */
-  async moveFiles(id: string, paths: string[], destination: string, overwrite = false) {
+  async moveFiles(id: string, paths: string[], destination: string, overwrite = false, lockPassword?: string) {
     const res = await this.request.post(`${BASE_URL}/api/containers/${id}/files/move`, {
-      data: { paths, destination, overwrite },
+      data: { paths, destination, overwrite, ...(lockPassword ? { lockPassword } : {}) },
     });
     return { status: res.status(), body: await res.json().catch(() => ({})) };
   }
 
   /** `DELETE /files` with JSON `{ paths }`. Missing paths are ignored. */
-  async deleteFiles(id: string, paths: string[]) {
+  async deleteFiles(id: string, paths: string[], lockPassword?: string) {
     const res = await this.request.delete(`${BASE_URL}/api/containers/${id}/files`, {
-      data: { paths },
+      data: { paths, ...(lockPassword ? { lockPassword } : {}) },
     });
     return { status: res.status(), body: await res.json().catch(() => ({})) };
   }

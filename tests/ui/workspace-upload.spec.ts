@@ -117,4 +117,24 @@ test.describe.serial('Workspace Upload Modal', () => {
     await page.keyboard.press('Escape');
     await expect(page.locator('[role="dialog"]')).toBeHidden({ timeout: 10_000 });
   });
+
+  test('protected worker upload uses a password input that is cleared on close', async ({ page, request }) => {
+    const lockPassword = `upload-ui-lock-${Date.now()}-password`;
+    expect((await request.put(`/api/containers/${containerId}/protection`, { data: { password: lockPassword } })).status()).toBe(200);
+    try {
+      await goToDashboard(page);
+      const card = page.locator('.rounded-lg').filter({ hasText: displayName }).first();
+      await expect(card.locator('text=running')).toBeVisible({ timeout: 60_000 });
+      await card.locator('button').nth(4).click();
+      const input = page.getByLabel(/Protected worker lock password/);
+      await expect(input).toBeVisible();
+      await input.fill(lockPassword);
+      await page.getByRole('button', { name: 'Cancel' }).click();
+      await card.locator('button').nth(4).click();
+      await expect(page.getByLabel(/Protected worker lock password/)).toHaveValue('');
+      await expect(page.locator('[role="dialog"]')).not.toContainText(lockPassword);
+    } finally {
+      await request.delete(`/api/containers/${containerId}/protection`, { data: { password: lockPassword } });
+    }
+  });
 });
