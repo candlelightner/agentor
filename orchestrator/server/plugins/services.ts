@@ -62,10 +62,10 @@ export default defineNitroPlugin(async (nitroApp) => {
   containerManager.setUserCredentialManager(userCredentialManager);
 
   // All stores load independently; built-in seeding also writes to a separate
-  // defaults/ file per store, so we fan them out. `containerManager.sync()` is
-  // a Docker API roundtrip and is independent of store state (it only reads
-  // workers via optional chaining); it runs in parallel here and
-  // `reconcileWorkers()` below re-upserts once the worker store is ready.
+  // defaults/ file per store, so we fan them out. Docker synchronization must
+  // run only after WorkerStore is loaded and attached: resolving an
+  // `agentor.id` label to its authoritative owner/config is required before a
+  // ContainerInfo can safely enter the user-scoped reconciliation path.
   const environmentStore = useEnvironmentStore();
   const capabilityStore = useCapabilityStore();
   const instructionStore = useInstructionStore();
@@ -103,13 +103,13 @@ export default defineNitroPlugin(async (nitroApp) => {
     useGitImageCatalogManager().init(),
     useAdminWorkspaceStore().init(),
     useManagementMcpStore().init(),
-    containerManager.sync(),
   ]);
 
   containerManager.setEnvironmentStore(environmentStore);
   containerManager.setCapabilityStore(capabilityStore);
   containerManager.setInstructionStore(instructionStore);
   containerManager.setWorkerStore(workerStore);
+  await containerManager.sync();
   await containerManager.reconcileWorkers();
   // Restore desired managed-network membership after a daemon/orchestrator
   // restart. Keep worker startup available if a user-created bridge is broken;
