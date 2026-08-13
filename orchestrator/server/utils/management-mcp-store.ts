@@ -794,6 +794,18 @@ function toolAnnotations(name: string) {
   };
 }
 function toolInputSchema(name: string) {
+  if (name === "configuration.inspect")
+    return { type: "object", additionalProperties: false, required: ["workerId"], properties: { workerId: { type: "string", minLength: 1 } } };
+  if (name === "status.system" || name === "workers.list" || name === "volumes.list")
+    return { type: "object", additionalProperties: false, properties: {} };
+  if (name === "workers.inspect")
+    return { type: "object", additionalProperties: false, required: ["workerId"], properties: { workerId: { type: "string", minLength: 1 } } };
+  if (name === "volumes.list-files")
+    return { type: "object", additionalProperties: false, required: ["workspaceId"], properties: { workspaceId: { type: "string", minLength: 1 }, path: { type: "string" } } };
+  if (name === "exports.create")
+    return { type: "object", additionalProperties: false, required: ["workerId"], properties: { workerId: { type: "string", minLength: 1 }, includeRootfs: { type: "boolean" } } };
+  if (name === "exports.status" || name === "exports.cancel")
+    return { type: "object", additionalProperties: false, required: ["jobId"], properties: { jobId: { type: "string", minLength: 1 } } };
   if (name === "configuration.apply")
     return {
       type: "object",
