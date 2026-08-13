@@ -549,6 +549,10 @@ export class ManagementMcpStore {
     args: Record<string, unknown>,
     workspaceId: string,
   ): Promise<any> {
+    // Validate the MCP envelope before entering any domain manager. In
+    // particular, missing ownerId must not trigger backup/image store
+    // initialization or compatibility lookups that can take minutes.
+    validateToolArguments(name, args);
     const domain = await workerDomain.execute(name, args);
     if (domain.handled) return domain.result;
     const imageBackup = await imageBackupDomain.execute(name, await compatibleDomainArguments(name, args));
@@ -744,6 +748,21 @@ export function useManagementMcpStore() {
 
 function statusError(statusCode: number, message: string) {
   return Object.assign(new Error(message), { statusCode });
+}
+function validateToolArguments(name: string, args: Record<string, unknown>) {
+  const definitions = [
+    ...workerDomain.tools(), ...workspaceMcpTools, ...imageBackupDomain.tools(),
+    ...platformDomain.tools(), ...catalogDomain.tools(), ...exposureDomain.tools(),
+    ...runningFilesDomain.tools(), ...logsDomain.tools(), ...statusDomain.tools(),
+    ...globalConfigurationDomain.tools(), ...importDomain.tools(),
+  ];
+  const schema = definitions.find((tool) => tool.name === name)?.inputSchema || toolInputSchema(name);
+  const required = Array.isArray((schema as any)?.required) ? (schema as any).required : [];
+  for (const key of required) {
+    const value = args[key];
+    if (value === undefined || value === null || value === "")
+      throw statusError(400, `${name}: ${key} is required`);
+  }
 }
 async function compatibleDomainArguments(name: string, args: Record<string, unknown>) {
   if (args.ownerId || (!name.startsWith("images.") && !name.startsWith("backups."))) return args;
