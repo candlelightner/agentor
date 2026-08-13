@@ -48,7 +48,7 @@ pins before a later rebuild.
   "name": "routed-codex-tools",
   "description": "Codex-LB and OmniRoute combined experiment; credentials are injected per worker at runtime.",
   "baseImage": "agentor-worker:approved-latest",
-  "dockerfileFragment": "RUN python3 -m pip install --no-cache-dir --break-system-packages uv==0.12.3 && uv python install 3.13 && UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python 3.13 codex-lb==1.23.0 && npm install --global omniroute@3.8.49\n",
+  "dockerfileFragment": "RUN python3 -m pip install --no-cache-dir --break-system-packages uv==0.12.3 && UV_PYTHON_INSTALL_DIR=/opt/uv-python uv python install 3.13 && UV_PYTHON_INSTALL_DIR=/opt/uv-python UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python 3.13 codex-lb==1.23.0 && npm install --global omniroute@3.8.49\n",
   "contextFiles": []
 }
 ```
@@ -62,7 +62,10 @@ needed. Keep it empty for this example.
 Codex-LB is a Python application. Its upstream supported local command is
 `uvx codex-lb`; the combined definition installs the same package as a pinned uv
 tool so it can run beside OmniRoute in one test worker as required by Stage A.
-Its `~/.codex-lb` data is inside persistent agent storage. The upstream also
+Before first launch, create `/workspace/.codex-lb` and symlink
+`~/.codex-lb` to it; `/workspace` is Agentor-persistent whereas an arbitrary
+home directory is not. Run the installed pinned `codex-lb` command—not an
+unpinned `uvx codex-lb` resolution. The upstream also
 publishes `ghcr.io/soju06/codex-lb:latest`, but this workflow deliberately does
 not pull an unpinned external base or bypass Agentor's approved-base boundary.
 
@@ -79,7 +82,7 @@ For local development the upstream entry points are:
 
 | Project | Install/run | Dashboard | Client API |
 | --- | --- | --- | --- |
-| Codex-LB | `uvx codex-lb` | `http://127.0.0.1:2455` | `http://127.0.0.1:2455/backend-api/codex` for Codex; `/v1` for generic OpenAI clients |
+| Codex-LB | `mkdir -p /workspace/.codex-lb; ln -sfn /workspace/.codex-lb ~/.codex-lb; codex-lb` | `http://127.0.0.1:2455` | `http://127.0.0.1:2455/backend-api/codex` for Codex; `/v1` for generic OpenAI clients |
 | OmniRoute | `omniroute` after `npm install --global omniroute@3.8.49` | `http://127.0.0.1:20128` | `http://127.0.0.1:20128/v1` |
 
 Open Firefox through the worker's Desktop/noVNC view and visit the appropriate
@@ -182,6 +185,30 @@ then promote the tested immutable digest. Verify from the test worker that
 entry, and the effective configuration reports the two key names as masked.
 The live OmniRoute/Tavily connectivity checks remain blocked until the user
 supplies those external credentials; promotion does not weaken that boundary.
+
+An exact Stage D definition can keep the image itself credential-free:
+
+```json
+{
+  "name": "omniroute-tavily-codex-client",
+  "description": "Codex client routed through OmniRoute with Tavily MCP; runtime secrets are worker-local.",
+  "baseImage": "agentor-worker:approved-latest",
+  "dockerfileFragment": "RUN npm install --global omniroute@3.8.49 tavily-mcp@0.2.22 && mkdir -p /opt/agentor-templates\nCOPY --chown=agent:agent codex-tavily.toml /opt/agentor-templates/codex-tavily.toml\n",
+  "contextFiles": [
+    {
+      "path": "codex-tavily.toml",
+      "contentBase64": "W21jcF9zZXJ2ZXJzLnRhdmlseV0KY29tbWFuZCA9ICJ0YXZpbHktbWNwIgplbnZfdmFycyA9IFsiVEFWSUxZX0FQSV9LRVkiXQo="
+    }
+  ]
+}
+```
+
+The context file contains only the Tavily command and `env_vars` name. Copy
+`/opt/agentor-templates/codex-tavily.toml` from the built image
+into the worker's persistent `~/.codex/config.toml` during worker setup, then
+launch Codex with `omniroute launch-codex --remote "$OMNIROUTE_URL"`. Verify
+the pinned Tavily version before rebuilding; `0.2.22` was current on
+2026-08-13.
 
 ## What is automated and what is not
 
