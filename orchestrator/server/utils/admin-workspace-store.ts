@@ -56,6 +56,7 @@ export class AdminWorkspaceStore {
   private readonly path: string;
   private loading?: Promise<void>;
   private runtime?: AdminWorkspaceRuntimeAdapter;
+  private runtimeTail: Promise<void> = Promise.resolve();
   constructor(dataDir = process.env.DATA_DIR || "/data") {
     this.path = join(dataDir, "admin", "workspace.v1.json");
   }
@@ -87,6 +88,14 @@ export class AdminWorkspaceStore {
     });
     await rename(temp, this.path);
   }
+  private runRuntime<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.runtimeTail.then(operation, operation);
+    this.runtimeTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
   async ensure() {
     await this.init();
     if (!this.record) {
@@ -103,15 +112,19 @@ export class AdminWorkspaceStore {
       await this.save();
     }
     if (this.runtime)
-      await this.applyRuntimeImage(await this.runtime.ensure(this.record));
+      await this.runRuntime(async () =>
+        this.applyRuntimeImage(await this.runtime!.ensure(this.record!)),
+      );
     return this.publicRecord();
   }
   async setStatus(status: "running" | "stopped") {
     await this.ensure();
     if (this.runtime)
-      await (status === "running"
-        ? this.runtime.start(this.record!)
-        : this.runtime.stop(this.record!));
+      await this.runRuntime(() =>
+        status === "running"
+          ? this.runtime!.start(this.record!)
+          : this.runtime!.stop(this.record!),
+      );
     this.record!.status = status;
     this.record!.updatedAt = new Date().toISOString();
     await this.save();
@@ -128,7 +141,9 @@ export class AdminWorkspaceStore {
         new Error("Administrative workspace runtime is unavailable"),
         { statusCode: 503 },
       );
-    await this.applyRuntimeImage(await this.runtime.rebuild(this.record!));
+    await this.runRuntime(async () =>
+      this.applyRuntimeImage(await this.runtime!.rebuild(this.record!)),
+    );
     this.record!.status = "running";
     this.record!.updatedAt = new Date().toISOString();
     await this.save();

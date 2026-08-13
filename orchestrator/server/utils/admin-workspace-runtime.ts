@@ -50,17 +50,15 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
   }
 
   async managementAddress(): Promise<string> {
-    try {
-      const inspection = await this.docker
-        .getContainer(process.env.HOSTNAME || hostname())
-        .inspect();
-      return (
-        inspection.NetworkSettings?.Networks?.[MANAGEMENT_NETWORK]?.IPAddress ||
-        "127.0.0.1"
+    const inspection = await this.orchestratorInspection();
+    if (!inspection) return "127.0.0.1";
+    const address =
+      inspection.NetworkSettings?.Networks?.[MANAGEMENT_NETWORK]?.IPAddress;
+    if (!address)
+      throw new Error(
+        "Orchestrator is not attached to the management network",
       );
-    } catch {
-      return "127.0.0.1";
-    }
+    return address;
   }
 
   async materializeCredential(credential: string): Promise<void> {
@@ -508,16 +506,38 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
   }
 
   private async attachOrchestrator() {
-    const self = this.docker.getContainer(process.env.HOSTNAME || hostname());
-    try {
-      const inspection = await self.inspect();
-      if (!inspection.NetworkSettings?.Networks?.[MANAGEMENT_NETWORK])
-        await this.docker
-          .getNetwork(MANAGEMENT_NETWORK)
-          .connect({ Container: inspection.Id });
-    } catch {
-      /* direct-host development has no orchestrator container */
+    const inspection = await this.orchestratorInspection();
+    if (!inspection) return; // direct-host development
+    if (!inspection.NetworkSettings?.Networks?.[MANAGEMENT_NETWORK])
+      await this.docker
+        .getNetwork(MANAGEMENT_NETWORK)
+        .connect({ Container: inspection.Id });
+    const attached = await this.docker.getContainer(inspection.Id).inspect();
+    if (!attached.NetworkSettings?.Networks?.[MANAGEMENT_NETWORK])
+      throw new Error(
+        "Docker did not attach the orchestrator to the management network",
+      );
+  }
+
+  /** Resolve the current orchestrator even when Docker/Compose gives it a
+   * hostname that differs from its stable container name. Only 404 is treated
+   * as a candidate miss; operational Docker errors must remain visible. */
+  private async orchestratorInspection(): Promise<Docker.ContainerInspectInfo | undefined> {
+    const candidates = [
+      process.env.HOSTNAME,
+      hostname(),
+      "agentor-orchestrator",
+    ].filter((value, index, all): value is string =>
+      Boolean(value) && all.indexOf(value) === index,
+    );
+    for (const candidate of candidates) {
+      try {
+        return await this.docker.getContainer(candidate).inspect();
+      } catch (error: any) {
+        if (error?.statusCode !== 404) throw error;
+      }
     }
+    return undefined;
   }
 
   private async reconcileManagementNetwork(adminContainerId?: string) {
@@ -525,16 +545,7 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     const inspection = await network.inspect();
     if (!inspection.Internal || inspection.Driver !== "bridge")
       throw new Error("Management network is not an internal bridge");
-    let selfId: string | undefined;
-    try {
-      selfId = (
-        await this.docker
-          .getContainer(process.env.HOSTNAME || hostname())
-          .inspect()
-      ).Id;
-    } catch {
-      /* direct-host development */
-    }
+    const selfId = (await this.orchestratorInspection())?.Id;
     if (adminContainerId) {
       // Dockerode containers obtained by name keep that name in `.id`; the
       // network membership map is keyed by the full immutable container ID.
