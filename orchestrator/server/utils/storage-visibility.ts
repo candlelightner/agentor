@@ -35,7 +35,7 @@ export class StorageVisibilityManager {
     const containers = await this.docker.listContainers({ all: true, filters: { label: HELPER_LABELS.map((label) => `${label}=true`) } }).catch(() => []);
     const staging = await Promise.all([
       this.directory("export-artifacts", "Export artifacts", false),
-      this.directory("tmp", "Backup/export staging", true),
+      this.directory("tmp", "Backup/export/import staging", true),
       this.directory("backup-objects", "Local backup objects", false),
     ]);
     return {
@@ -79,13 +79,16 @@ export class StorageVisibilityManager {
   private async removeStaleStaging() {
     const root = join(useConfig().dataDir, "tmp"); let reclaimed = 0;
     for (const name of await readdir(root).catch(() => [] as string[])) {
-      if (!/^(backup|export)-/.test(name)) continue;
+      if (!isCleanupEligibleStaging(name)) continue;
       const path = join(root, name); const info = await stat(path).catch(() => undefined);
       if (!info || Date.now() - info.mtimeMs < STALE_TEMP_MS) continue;
       reclaimed += await directoryBytes(path); await rm(path, { recursive: true, force: true });
     }
     return reclaimed;
   }
+}
+export function isCleanupEligibleStaging(name: string) {
+  return /^(backup|export|management-import)-/.test(name);
 }
 async function directoryBytes(path: string): Promise<number> {
   const info = await stat(path).catch(() => undefined); if (!info) return 0;

@@ -44,6 +44,19 @@ export class ManagementMcpTransport {
   private async handle(request: IncomingMessage, response: ServerResponse) {
     response.setHeader("Cache-Control", "no-store");
     response.setHeader("X-Content-Type-Options", "nosniff");
+    const importMatch = request.url?.match(/^\/imports\/([0-9a-f-]{36})$/i);
+    if (request.method === "PUT" && importMatch) {
+      const authorization = request.headers.authorization || "";
+      const credential = authorization.startsWith("Bearer ") ? authorization.slice(7) : undefined;
+      try {
+        const upload = parseImportUploadHeaders(request.headers);
+        const result = await this.store.uploadImport(credential, importMatch[1], request, upload.declaredLength);
+        return this.send(response, 201, result);
+      } catch (error: any) {
+        const status = Number.isInteger(error?.statusCode) ? error.statusCode : 400;
+        return this.send(response, status, { error: status >= 500 ? "Worker import failed" : error.message });
+      }
+    }
     if (request.method !== "POST" || request.url !== "/mcp")
       return this.send(response, 404, { error: "Not found" });
     const authorization = request.headers.authorization || "";
@@ -133,6 +146,18 @@ export class ManagementMcpTransport {
     response.setHeader("Content-Type", "application/json; charset=utf-8");
     response.end(JSON.stringify(value));
   }
+}
+
+export function parseImportUploadHeaders(headers: IncomingMessage["headers"]) {
+  const contentType = Array.isArray(headers["content-type"]) ? headers["content-type"][0] : headers["content-type"];
+  if ((contentType || "").split(";", 1)[0].trim().toLowerCase() !== "application/x-tar")
+    throw Object.assign(new Error("Content-Type must be application/x-tar"), { statusCode: 415 });
+  const raw = headers["content-length"];
+  if (raw === undefined) return { declaredLength: undefined };
+  if (Array.isArray(raw) || !/^\d+$/.test(raw)) throw Object.assign(new Error("Invalid Content-Length"), { statusCode: 400 });
+  const declaredLength = Number(raw);
+  if (!Number.isSafeInteger(declaredLength)) throw Object.assign(new Error("Invalid Content-Length"), { statusCode: 400 });
+  return { declaredLength };
 }
 
 async function readJson(request: IncomingMessage): Promise<any> {

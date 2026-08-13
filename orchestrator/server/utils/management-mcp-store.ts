@@ -33,6 +33,8 @@ import { ManagementRunningFilesDomain } from "./management-running-files-domain"
 import { ManagementLogsDomain } from "./management-logs-domain";
 import { ManagementStatusDomain } from "./management-status-domain";
 import { ManagementGlobalConfigurationDomain } from "./management-global-configuration-domain";
+import { ManagementImportDomain } from "./management-import-domain";
+import type { Readable } from "node:stream";
 
 const GROUPS = [
   "read-only-status",
@@ -67,6 +69,7 @@ const runningFilesDomain = new ManagementRunningFilesDomain();
 const logsDomain = new ManagementLogsDomain();
 const statusDomain = new ManagementStatusDomain();
 const globalConfigurationDomain = new ManagementGlobalConfigurationDomain();
+const importDomain = new ManagementImportDomain();
 interface Policy {
   schemaVersion: 1;
   default: "deny";
@@ -146,6 +149,7 @@ for (const tool of runningFilesDomain.tools()) TOOL_GROUP[tool.name] = tool.grou
 for (const tool of logsDomain.tools()) TOOL_GROUP[tool.name] = tool.group as Group;
 for (const tool of statusDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 for (const tool of globalConfigurationDomain.tools()) TOOL_GROUP[tool.name] = tool.group as Group;
+for (const tool of importDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 const sensitive =
   /secret|token|credential|password|authorization|cookie|cipher|key/i;
 function clean(value: unknown, depth = 0): any {
@@ -245,11 +249,12 @@ export class ManagementMcpStore {
       const logs = logsDomain.tools().find((tool) => tool.name === name);
       const status = statusDomain.tools().find((tool) => tool.name === name);
       const globalConfiguration = globalConfigurationDomain.tools().find((tool) => tool.name === name);
+      const imports = importDomain.tools().find((tool) => tool.name === name);
       return {
       name,
-      description: domain?.description || workspace?.description || imageBackup?.description || platform?.description || catalog?.description || exposure?.description || runningFiles?.description || logs?.description || status?.description || globalConfiguration?.description || `Agentor management tool (${TOOL_GROUP[name]})`,
-      inputSchema: domain?.inputSchema || workspace?.inputSchema || imageBackup?.inputSchema || platform?.inputSchema || catalog?.inputSchema || exposure?.inputSchema || runningFiles?.inputSchema || logs?.inputSchema || status?.inputSchema || globalConfiguration?.inputSchema || toolInputSchema(name),
-      annotations: domain?.annotations || workspace?.annotations || imageBackup?.annotations || platform?.annotations || catalog?.annotations || exposure?.annotations || runningFiles?.annotations || logs?.annotations || status?.annotations || globalConfiguration?.annotations || toolAnnotations(name),
+      description: domain?.description || workspace?.description || imageBackup?.description || platform?.description || catalog?.description || exposure?.description || runningFiles?.description || logs?.description || status?.description || globalConfiguration?.description || imports?.description || `Agentor management tool (${TOOL_GROUP[name]})`,
+      inputSchema: domain?.inputSchema || workspace?.inputSchema || imageBackup?.inputSchema || platform?.inputSchema || catalog?.inputSchema || exposure?.inputSchema || runningFiles?.inputSchema || logs?.inputSchema || status?.inputSchema || globalConfiguration?.inputSchema || imports?.inputSchema || toolInputSchema(name),
+      annotations: domain?.annotations || workspace?.annotations || imageBackup?.annotations || platform?.annotations || catalog?.annotations || exposure?.annotations || runningFiles?.annotations || logs?.annotations || status?.annotations || globalConfiguration?.annotations || imports?.annotations || toolAnnotations(name),
     }});
   }
   async updatePolicy(groups: Record<string, unknown>, actor: string) {
@@ -463,6 +468,25 @@ export class ManagementMcpStore {
       throw error;
     }
   }
+  async uploadImport(credential: unknown, token: string, source: Readable, declaredLength?: number) {
+    let identity;
+    try {
+      identity = await this.introspect(credential);
+    } catch (error) {
+      await this.auditAuthorizationFailure("import.upload");
+      throw error;
+    }
+    try {
+      await this.init();
+      if (!this.state.policy.groups.exports.enabled) throw Object.assign(new Error("Tool denied by policy"), { statusCode: 403 });
+      const result = await importDomain.upload(identity.workspaceId, token, source, declaredLength);
+      await this.audit("import.uploaded", "success", { workspaceId: identity.workspaceId });
+      return result;
+    } catch (error: any) {
+      await this.audit("import.uploaded", "failure", { workspaceId: identity.workspaceId, statusCode: error?.statusCode || 500 });
+      throw error;
+    }
+  }
   private async executeTool(
     name: string,
     args: Record<string, unknown>,
@@ -486,6 +510,8 @@ export class ManagementMcpStore {
     if (status.handled) return status.result;
     const globalConfiguration = await globalConfigurationDomain.execute(name, args);
     if (globalConfiguration.handled) return globalConfiguration.result;
+    const imported = await importDomain.execute(name, args, workspaceId);
+    if (imported.handled) return imported.result;
     if (workspaceMcpTools.some((tool) => tool.name === name))
       return executeWorkspaceMcpTool(name, args);
     const workerId = typeof args.workerId === "string" ? args.workerId : "";
