@@ -17,7 +17,7 @@ or an interactive third-party login into a live-account verification.
 | Worker create, settings, restart, rebuild, archive, unarchive, delete | Worker dialogs; container lifecycle API | `workers.create`, `workers.update`, `workers.restart`, `workers.rebuild`, `workers.archive`, `workers.unarchive`, `workers.delete` | MCP domain tests plus lifecycle/lock API tests; lock password applies where required |
 | Clone worker/workspace | Worker clone API and storage UI | `workers.clone`, `workspaces.clone` | Workspace adapter and worker-domain coverage; secret values are not copied and names can be reported |
 | Running-worker console | Terminal panes/WebSocket | `console.open`, `console.read`, `console.write`, `console.interrupt`, `console.close` | `admin-management-mcp.spec.ts`; targets worker tmux, never host shell |
-| Worker logs | Dashboard log viewer | `logs.read` metadata only | Intentional exclusion: unbounded attacker-controlled logs could contain bare secret values; MCP reports omission rather than log bytes |
+| Worker logs | Dashboard log viewer | `logs.read` | `management-logs-domain.spec.ts`; owner-checked Docker-log tail (1–1000 lines, at most 256 KiB) redacts configured worker-local secret and secret-file literals. It does not expose arbitrary host paths or unbounded terminal output. |
 | Worker-local variables, secrets, secret files | Worker Settings / configuration API | `configuration.get`, `configuration.set` | MCP security and worker-configuration tests; existing secret values are never returned |
 | User environments, capabilities, instructions, init scripts | Sidebar catalog dialogs and catalog APIs | `catalog.{environments,capabilities,instructions,init-scripts}.{list,get,create,update,delete}` | Catalog adapter tests; built-ins stay immutable and owner is explicit |
 | Worker groups | Worker Groups UI; `/api/worker-groups` | `groups.list`, `groups.create`, `groups.update`, `groups.delete` | `worker-groups.spec.ts` and worker-domain tests |
@@ -25,7 +25,7 @@ or an interactive third-party login into a live-account verification.
 | Workspace inventory and offline browse | Storage inventory/browser; `/api/workspaces/*` | `workspaces.list`, `workspaces.files`, `workspaces.preview`, `workspaces.download`, `workspaces.clone` | `management-mcp-workspace-adapter.spec.ts`, storage API/UI tests; offline access remains read-only |
 | Running-worker file management | Worker Files modal; `/api/containers/:id/files/*` | `files.list`, `files.upload`, `files.mkdir`, `files.rename`, `files.move`, `files.delete` | Existing hardened container file manager is reused; upload is one base64 file capped at 1 MiB, mutations honor worker protection locks |
 | File and directory downloads | Authenticated streaming workspace endpoints | Small regular files via `workspaces.download`; larger files/directories return authenticated download location | Intentional transport limit: MCP never buffers directory archives or files above 256 KiB |
-| Worker export/import | Export modal/jobs; export/import APIs | `exports.create`, `exports.status`, `exports.cancel`, `exports.download` | Export-job and workspace-adapter tests; download is intentionally authenticated streaming, not embedded archive bytes. **Binary worker import has no MCP tool yet.** |
+| Worker export/import | Export modal/jobs; export/import APIs | `exports.create`, `exports.status`, `exports.cancel`, `exports.download`, `imports.prepare` | Export-job, workspace-adapter, and `management-import-domain.spec.ts` coverage. `imports.prepare` returns a short-lived, one-use, workspace-bound private `PUT` handoff for a streamed `application/x-tar` bundle; it is under the `exports` capability and never base64-buffers an archive in MCP JSON. |
 | Image catalog and controlled builds | Image Catalog UI/API | `images.list/get/create/validate/delete/delete-version/usage/build/build-status/build-logs/build-cancel/promote/rollback/default/cleanup/git-status/git-sync` | Image catalog/Git catalog tests and MCP image adapter; logs and Git sync responses are sanitized |
 | Image test worker / image selection | Image Catalog test-worker/default/worker creation controls | `images.test-worker`; catalog-aware `workers.create` | Both paths resolve the same immutable digest/runtime image through the shared catalog model |
 | Backups, restore, provider status/settings | Backup UI/API | `backups.list/providers/settings/create/status/cancel/retry/delete/restore` | Backup, Google OAuth installation, and MCP image/backup tests. Provider credentials/tokens are intentionally non-retrievable; Google login remains human/external boundary |
@@ -34,10 +34,11 @@ or an interactive third-party login into a live-account verification.
 | Worker apps | Apps pane; `/api/containers/:id/apps/*` | `apps.types`, `apps.list`, `apps.start`, `apps.stop` | `admin-management-mcp.spec.ts` plus app API/type suites |
 | Storage visibility and conservative cleanup | Storage modal; `/api/admin/storage` | `storage.status`, `storage.cleanup` | Storage visibility API/UI tests; cleanup is intentionally restricted to named conservative actions |
 | MCP policy, tool discovery, audit | Management MCP modal/admin APIs | Policy is administered by dashboard APIs; agent sees only enabled tools through MCP discovery | `management-mcp.spec.ts`, `admin-management-mcp.spec.ts`; disabled groups are absent and calls fail closed |
-| Account profile, password, passkeys, global environment variables, SSH key, agent-credential reset | Account modal; `/api/account/*` and auth routes | No MCP equivalent | Deliberate current exclusion: these are personal identity/account-credential controls rather than administrative worker management; secret values remain non-retrievable |
+| Account profile, password, passkeys, SSH key, agent-credential reset | Account modal; `/api/account/*` and auth routes | No MCP equivalent | Deliberate current exclusion: these are personal identity/account-credential controls rather than administrative worker management; secret values remain non-retrievable |
 | User administration | Users modal; `/api/auth/admin/*` | No MCP equivalent | Deliberate current exclusion pending a dedicated user-administration authority model |
 | GitHub repository discovery/create/branches | Repository picker; `/api/github/*` | No MCP equivalent | Deliberate current exclusion; Git provider credentials are not exposed to the MCP |
-| Usage and per-worker metrics | Usage cards; `/api/usage/*`, `/api/worker-metrics/*` | No MCP equivalent | Current limitation: status inspection does not include rate-limit refresh or live metrics tools |
+| Usage and per-worker metrics | Usage cards; `/api/usage/*`, `/api/worker-metrics/*` | `usage.get`, `workers.metrics`, `workers.metrics.get` | `management-status-domain.spec.ts`; read-only, owner-filtered snapshots sanitize provider/Docker errors. The MCP deliberately has no provider-refresh action. |
+| User-global plain variables | Account environment-variable UI/API | `configuration.global.list`, `configuration.global.effective-safe`, `configuration.global.set`, `configuration.global.delete` | `management-global-configuration-domain.spec.ts`; this pre-existing scope stores plain variables, not encrypted managed secrets. Sensitive-looking names are masked on reads; true write-only secrets remain worker-local configuration. |
 | Orchestrator image updates | System UI; `/api/updates/*` | No MCP equivalent | Deliberate current exclusion: update/apply is an installation-level operation |
 | Clipboard and tmux pane management | Worker UI; clipboard and `/api/containers/:id/panes/*` | No MCP equivalent | Current limitation: MCP console exposes the selected worker's existing tmux session only |
 
@@ -53,17 +54,23 @@ or an interactive third-party login into a live-account verification.
   and other providers may require an account holder to complete external login.
   See [the routed-agent reference workflow](reference-agent-workflow.md).
 - **Streaming/binary boundaries.** Browser-authenticated download endpoints are
-  used for large files, directory archives, and export artifacts. There is no
-  MCP worker-import tool for uploading a binary bundle.
-- **Logs are intentionally metadata-only** through MCP until a safe bounded
-  redaction design exists for arbitrary terminal output.
+  used for large files, directory archives, and export artifacts. The one
+  exception is `imports.prepare`, which returns a private, one-use streamed tar
+  upload handoff rather than carrying binary data in an MCP response. MCP does
+  not provide arbitrary file/archive buffering.
+- **Logs are deliberately bounded.** `logs.read` is restricted to the selected
+  owner's worker Docker logs, a 1–1000-line/256-KiB ceiling, and literal
+  redaction of configured worker-local secrets and secret files. It is not a
+  generic host-log or terminal-history reader.
 - **Network connectivity probes and every UI-only convenience action are not
   separate MCP tools.** The agent can inspect/reconcile managed topology and
   use a target worker console, but it cannot request an unrestricted network or
   host probe.
-- **Account, user administration, GitHub, metrics, updates, clipboard, and
-  tmux-pane controls have no MCP equivalents today.** They are listed above so
-  absence is explicit rather than mistaken for parity.
+- **Account identity, user administration, GitHub discovery, installation
+  updates, clipboard, and tmux-pane conveniences have no MCP equivalents
+  today.** They are listed above so absence is explicit rather than mistaken
+  for parity. Usage and worker metrics are available as sanitized read-only
+  MCP snapshots.
 
 ## Capability policy and harness confirmation
 

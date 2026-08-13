@@ -16,7 +16,7 @@ documentation is current.
 | Volume inventory/offline browsing | Implemented; dual-storage focused verification pending | Running/stopped/archived/deleted/orphan inventory, bounded size, latest backup, owner-scoped hardened browse/preview/search/metadata/streamed download, backup, and clone cover directory and named-volume abstractions. Orphans remain deliberately non-browsable until a separately audited adoption workflow exists. |
 | Worker-local variables/secrets | Implemented; current-image focused verification pending | Worker create/settings, precedence preview, encrypted write-only secrets, tmpfs secret files, desired/applied rebuild semantics, clone/export/backup omission, and isolation are implemented. |
 | Administrative workspace | Implemented; current-image focused verification pending | Trusted digest-pinned overlay, persistent storage, existing terminal/editor/desktop service registration, red identity, privileged confirmations, non-secret control representation, and hardened Docker runtime are integrated. |
-| Internal management MCP | Implemented; current-image focused verification pending | Internal-only listener/network, short-lived workspace identity, live fail-closed groups, domain tools, metadata-only logs, complete invocation audit, and immutable dashboard approval/apply are implemented. |
+| Internal management MCP | Implemented; current-image focused verification pending | Internal-only listener/network, short-lived workspace identity, live fail-closed groups, bounded owner-checked/redacted logs, sanitized usage/worker-metric snapshots, user-global plain-variable management, one-use private streaming worker-import handoffs, and complete invocation audit are implemented. Dashboard proposal review is optional; harness confirmation is not a platform boundary. |
 | Git-backed image recovery | Implemented; current-image focused verification pending | Versioned format, public/private GitHub, encrypted PAT and GitHub App paths, conflict-safe direct/branch/PR sync, Actions dispatch, GHCR digest recovery, credential erasure, API/UI, and fake integration tests are implemented. |
 
 ## Delivery order and dependencies
@@ -40,8 +40,9 @@ documentation is current.
    immutable digests behind a narrow builder boundary, then test/promote,
    rollback, defaults, quotas, and cleanup.
 6. **Administrative workspace and management MCP.** Create the trusted overlay
-   and dedicated internal network/workload identity before exposing narrow
-   tools. Mutations use immutable proposals and dashboard-only approval.
+   and dedicated internal network/workload identity before exposing controlled
+   tools. Mutations remain subject to Agentor ownership, secret, lock, and
+   capability controls; a harness decides whether to request confirmation.
 7. **Git-backed image recovery.** Build on completed image definitions and job
    execution, using a dedicated encrypted repository credential and
    conflict-preserving synchronization.
