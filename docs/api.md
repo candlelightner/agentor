@@ -45,4 +45,4 @@ The **Worker Self** group contains the unauthenticated, source-IP-identified rou
 
 ## All API Routes
 
-All API routes return JSON. Full interactive reference at `/api/docs` (Scalar UI) and raw spec at `/api/docs/openapi.json`.
+API routes return JSON unless their OpenAPI metadata explicitly documents a streaming or binary response/body (for example worker import, export artifacts, and workspace downloads). Full interactive reference is at `/api/docs` (Scalar UI) and raw spec at `/api/docs/openapi.json`.

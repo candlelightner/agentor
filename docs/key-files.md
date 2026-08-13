@@ -111,10 +111,11 @@
 - `orchestrator/server/utils/image-catalog.ts` - constrained local image definitions, async controlled builds, immutable versions, promotion/defaults, and cleanup
 - `orchestrator/server/utils/git-image-*.ts` / `orchestrator/server/api/image-catalog/git/` - versioned GitHub catalog format, encrypted credentials, optimistic sync, Actions/GHCR metadata, and recovery
 - `orchestrator/server/utils/admin-workspace-runtime.ts` / `admin-workspace-store.ts` - trusted persistent administrative overlay, service registration, red identity, control representation, and management-network boundary
-- `orchestrator/server/utils/management-mcp-store.ts` / `management-mcp-transport.ts` - internal authenticated MCP transport, live group policy, sanitized audit, domain tools, and proposal/approval/application state
+- `orchestrator/server/utils/management-mcp-store.ts` / `management-mcp-transport.ts` - internal authenticated MCP transport, live group policy, sanitized audit, domain registration, and proposal/approval/application state
+- `orchestrator/server/utils/management-import-domain.ts` / `management-logs-domain.ts` / `management-status-domain.ts` / `management-global-configuration-domain.ts` - bounded private streamed worker-import handoff, redacted worker logs, sanitized usage/worker metrics, and user-global plain-variable MCP domains
 - `orchestrator/server/utils/workspace-tombstones.ts` - durable owner-scoped deleted-workspace inventory records
 - `orchestrator/server/types/archiver.d.ts` - Ambient module declaration for the `archiver` ZIP library.
-- `orchestrator/server/api/` - REST API routes (file-based, JSON only)
+- `orchestrator/server/api/` - REST API routes (file-based; primarily JSON, with documented streaming/binary import and download endpoints)
 - `orchestrator/server/routes/desktop/` - HTTP reverse proxy for noVNC static files (per-container)
 - `orchestrator/server/routes/editor/` - Combined HTTP+WS proxy for code-server (per-container, h3 combined handler + ws-utils relay)
 - `orchestrator/server/routes/ws/desktop/` - WebSocket relay for VNC protocol (per-container, crossws + ws)
@@ -229,7 +230,7 @@
 - `tests/helpers/clipboard.ts` - Clipboard-paste bridge test helpers (build a host clipboard payload, POST to `/api/containers/:id/clipboard`, parse the X-selection response) for the terminal/desktop bridge specs.
 - `tests/helpers/test-users.ts` - Create/sign-in/delete test users via the admin API (used by passkey + authorization tests)
 - `tests/helpers/webauthn.ts` - Install/dispose Chrome DevTools virtual WebAuthn authenticator for end-to-end passkey tests (`installVirtualAuthenticator(page)`)
-- `tests/api/*.spec.ts` - API integration tests (60 files; incl. workspace-files, clipboard, worker-metrics, worker-export-import, github-repos, kilo-code — ~920 tests)
-- `tests/ui/*.spec.ts` - UI integration tests (46 files; incl. workspace-files-modal, clipboard-paste, worker-card-actions, import-worker-modal, github-autocomplete-refresh — ~591 tests)
+- `tests/api/*.spec.ts` - API integration tests (85 files; incl. workspace-files, clipboard, worker-metrics, worker-export-import, management MCP domains, github-repos, kilo-code — 998 tests)
+- `tests/ui/*.spec.ts` - UI integration tests (56 files; incl. workspace-files-modal, clipboard-paste, worker-card-actions, import-worker-modal, github-autocomplete-refresh — 570 tests)
 - `tests/FEATURES.md` - Feature inventory driving test coverage
-- `tests/TESTS.md` - Test suite documentation with counts per file (~1511 total tests)
+- `tests/TESTS.md` - Test suite documentation with counts per file (1568 total tests)
