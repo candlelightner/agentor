@@ -5,6 +5,7 @@ import type { AgentUsageInfo, AgentUsageStatus, AgentAuthType } from '../../shar
 import { getUserEnvVar } from './user-env-store';
 import type { UserEnvVarStore } from './user-env-store';
 import type { UserCredentialManager } from './user-credentials';
+import { assertSafeUserId, isSafeUserId } from './user-id';
 
 const POLL_INTERVAL_MS = 300_000;
 const USAGE_FILENAME = 'usage.json';
@@ -109,6 +110,7 @@ export class UsageChecker {
   }
 
   async refresh(userId: string): Promise<AgentUsageStatus> {
+    assertSafeUserId(userId);
     await this.fetchUser(userId);
     return this.getStatus(userId);
   }
@@ -129,6 +131,7 @@ export class UsageChecker {
 
   /** Clear persisted state for a user (called on user deletion). */
   async forgetUser(userId: string): Promise<void> {
+    assertSafeUserId(userId);
     this.userStates.delete(userId);
     for (const key of [...this.rateLimitBackoff.keys()]) {
       if (key.startsWith(`${userId}:`)) this.rateLimitBackoff.delete(key);
@@ -174,7 +177,7 @@ export class UsageChecker {
   }
 
   private async doFetchUser(userId: string): Promise<void> {
-    if (!userId) return;
+    assertSafeUserId(userId);
     const now = Date.now();
     const existing = this.userStates.get(userId) ?? new Map<string, AgentState>();
 
@@ -205,6 +208,7 @@ export class UsageChecker {
   // ─── Persistence ────────────────────────────────────────────
 
   private stateFilePath(userId: string): string {
+    assertSafeUserId(userId);
     return join(this.config.dataDir, 'users', userId, USAGE_FILENAME);
   }
 
@@ -220,7 +224,7 @@ export class UsageChecker {
     const now = Date.now();
     await Promise.all(
       userIds
-        .filter((userId) => !userId.startsWith('.'))
+        .filter(isSafeUserId)
         .map((userId) => this.loadUserState(userId, now)),
     );
   }

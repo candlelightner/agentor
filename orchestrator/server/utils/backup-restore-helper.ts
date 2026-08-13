@@ -4,6 +4,7 @@ import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { useConfig, useContainerManager, useDockerService, useStorageManager } from './services';
+import { assertSafeUserId } from './user-id';
 
 const STAGE='.agentor-restore-stage';const ROLLBACK='.agentor-restore-rollback';
 const PREPARE=`import os,sys
@@ -41,6 +42,7 @@ except BaseException:
 
 /** Same-filesystem staged replacement for a stopped worker workspace. */
 export async function replaceStoppedWorkspace(userId:string,workerId:string,workspaceArchive:string):Promise<void>{
+ assertSafeUserId(userId);
  const cm=useContainerManager(),worker=cm.get(workerId);if(!worker||worker.userId!==userId||worker.status!=='stopped')throw new Error('Original worker must be stopped for safe restore');
  const storage=useStorageManager(),config=useConfig(),source=storage.mode==='directory'?join(storage.dataRef,'users',userId,'workspaces',workerId):`${cm.buildContainerName(workerId)}-workspace`;
  const docker=new Docker({socketPath:'/var/run/docker.sock'});

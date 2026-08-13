@@ -7,6 +7,7 @@ import {
   encryptWorkerValue,
   type EncryptedWorkerValue,
 } from "./worker-config-crypto";
+import { assertSafeUserId, isSafeUserId } from "./user-id";
 import { useConfig } from "./services";
 
 export type WorkerConfigKind = "variable" | "secret" | "secretFile";
@@ -464,8 +465,7 @@ export class WorkerConfigStore {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
       throw err;
     }
-    for (const userId of users) {
-      if (!SAFE_ID_RE.test(userId)) continue;
+    for (const userId of users.filter(isSafeUserId)) {
       try {
         const parsed = JSON.parse(
           await readFile(join(usersDir, userId, FILE), "utf8"),
@@ -503,6 +503,7 @@ export class WorkerConfigStore {
   }
 
   private persist(userId: string): Promise<void> {
+    assertSafeUserId(userId);
     const previous = this.queues.get(userId) ?? Promise.resolve();
     const next = previous.then(async () => {
       const dir = join(this.config.dataDir, "users", userId);

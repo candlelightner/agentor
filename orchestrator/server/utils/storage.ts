@@ -2,22 +2,12 @@ import Docker from 'dockerode';
 import { mkdir, rm, chmod, chown, stat, writeFile, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { Config } from './config';
+import { assertSafeUserId } from './user-id';
 
 type StorageMode = 'volume' | 'directory';
 
 const AGENT_UID = 1000;
 const AGENT_GID = 1000;
-
-/** A `userId` is always a better-auth-minted UUID (no path separators). Assert
- * its shape before it is interpolated into a filesystem path so the destructive
- * `removeUserDir` (and every per-user path builder) can never traverse outside
- * the `users/` tree via a `../`-laced id. */
-const SAFE_USER_ID_RE = /^[a-zA-Z0-9_-]+$/;
-function assertSafeUserId(userId: string): void {
-  if (typeof userId !== 'string' || !SAFE_USER_ID_RE.test(userId)) {
-    throw new Error(`[storage] unsafe userId: ${JSON.stringify(userId)}`);
-  }
-}
 
 /** Relative paths inside a worker's agents directory where the orchestrator
  * pre-creates empty mountpoint files. Docker Desktop's virtiofs refuses to

@@ -1,5 +1,6 @@
 import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { assertSafeUserId, isSafeUserId } from './user-id';
 
 /**
  * JSON store partitioned per user. Each user's items live in their own file at
@@ -37,7 +38,7 @@ export class UserScopedJsonStore<K, V> {
     // quarantine (log + skip) any that fail rather than rejecting the boot.
     const results = await Promise.allSettled(
       userIds
-        .filter((userId) => !userId.startsWith('.'))
+        .filter(isSafeUserId)
         .map((userId) => this.loadUser(userId)),
     );
     for (const result of results) {
@@ -53,6 +54,7 @@ export class UserScopedJsonStore<K, V> {
    * mid-run by some other subsystem. A corrupt (unparseable) file is logged and
    * skipped rather than thrown, so one bad file never blocks the rest. */
   async loadUser(userId: string): Promise<void> {
+    assertSafeUserId(userId);
     const filePath = this.filePathForUser(userId);
     let raw: string;
     try {
@@ -72,7 +74,23 @@ export class UserScopedJsonStore<K, V> {
       return;
     }
     const map = new Map<K, V>();
-    for (const item of parsed) map.set(this.keyFn(item), item);
+    for (const item of parsed) {
+      // Never trust an embedded owner that disagrees with the directory
+      // partition. Callers commonly use item.userId for later workspace paths
+      // and Docker mounts, so accepting a mismatch would bypass path checks.
+      if (
+        item &&
+        typeof item === 'object' &&
+        'userId' in item &&
+        (item as { userId?: unknown }).userId !== userId
+      ) {
+        useLogger().error(
+          `[user-scoped-store] quarantined ${this.filename} item with mismatched owner in ${userId}`,
+        );
+        continue;
+      }
+      map.set(this.keyFn(item), item);
+    }
     if (map.size > 0) this.items.set(userId, map);
   }
 
@@ -114,6 +132,17 @@ export class UserScopedJsonStore<K, V> {
   }
 
   protected async setItem(userId: string, item: V): Promise<void> {
+    assertSafeUserId(userId);
+    if (
+      item &&
+      typeof item === 'object' &&
+      'userId' in item &&
+      (item as { userId?: unknown }).userId !== userId
+    ) {
+      throw Object.assign(new Error('Persisted resource owner mismatch'), {
+        statusCode: 400,
+      });
+    }
     let map = this.items.get(userId);
     if (!map) {
       map = new Map<K, V>();
@@ -124,6 +153,7 @@ export class UserScopedJsonStore<K, V> {
   }
 
   protected async deleteItem(userId: string, key: K): Promise<boolean> {
+    assertSafeUserId(userId);
     const map = this.items.get(userId);
     if (!map || !map.has(key)) return false;
     map.delete(key);
@@ -154,6 +184,7 @@ export class UserScopedJsonStore<K, V> {
   /** Remove every item for a user and delete their file. Called by the orphan
    * sweeper (user deletion) and similar admin paths. */
   async removeForUser(userId: string): Promise<number> {
+    assertSafeUserId(userId);
     const map = this.items.get(userId);
     const count = map?.size ?? 0;
     this.items.delete(userId);
@@ -166,6 +197,7 @@ export class UserScopedJsonStore<K, V> {
   }
 
   private filePathForUser(userId: string): string {
+    assertSafeUserId(userId);
     return join(this.dataDir, 'users', userId, this.filename);
   }
 

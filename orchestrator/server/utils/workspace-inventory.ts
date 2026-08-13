@@ -3,6 +3,7 @@ import { opendir, readdir, lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { useConfig, useContainerManager, useStorageManager, useWorkerStore } from './services';
 import { listWorkspaceTombstones } from './workspace-tombstones';
+import { isSafeUserId } from './user-id';
 
 export type WorkspaceState = 'running' | 'stopped' | 'archived' | 'deleted' | 'orphaned';
 
@@ -114,7 +115,7 @@ export async function listWorkspaceInventory(includeOrphans: boolean): Promise<W
     }
   } else {
     const usersDir = join(storage.dataDir, 'users');
-    for (const userId of await safeReadDir(usersDir)) {
+    for (const userId of (await safeReadDir(usersDir)).filter(isSafeUserId)) {
       const root = join(usersDir, userId, 'workspaces');
       for (const id of await safeReadDir(root)) {
         if (!UUID_RE.test(id)) continue;

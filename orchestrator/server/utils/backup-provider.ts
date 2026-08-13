@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
+import { assertSafePathId, assertSafeUserId } from "./user-id";
 
 export type BackupHttpTransport = (
   input: string | URL | Request,
@@ -75,6 +76,8 @@ export class FakeBackupProvider implements BackupProvider {
     return upload?.ownerId === userId ? upload.diagnostic : undefined;
   }
   private path(userId: string, id: string) {
+    assertSafeUserId(userId);
+    assertSafePathId(id, "artifactId");
     return join(this.root, userId, `${id}.backup`);
   }
   async upload(
@@ -85,6 +88,8 @@ export class FakeBackupProvider implements BackupProvider {
     signal?: AbortSignal,
     resumeUploadId?: string,
   ): Promise<UploadResult> {
+    assertSafeUserId(userId);
+    assertSafePathId(artifactId, "artifactId");
     await mkdir(join(this.root, userId), { recursive: true, mode: 0o700 });
     const prior = resumeUploadId ? this.uploads.get(resumeUploadId) : undefined;
     if (prior && (prior.ownerId !== userId || prior.artifactId !== artifactId))
@@ -172,6 +177,8 @@ export class LocalBackupProvider implements BackupProvider {
   kind = "local";
   constructor(private root: string) {}
   private path(u: string, id: string) {
+    assertSafeUserId(u);
+    assertSafePathId(id, "artifactId");
     return join(this.root, u, `${id}.backup`);
   }
   async upload(
@@ -181,6 +188,8 @@ export class LocalBackupProvider implements BackupProvider {
     p: (n: number) => void,
     signal?: AbortSignal,
   ) {
+    assertSafeUserId(u);
+    assertSafePathId(id, "artifactId");
     await mkdir(join(this.root, u), { recursive: true, mode: 0o700 });
     let n = 0;
     const t = new (await import("node:stream")).Transform({

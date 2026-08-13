@@ -1,6 +1,7 @@
 import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { UserEnvVars, UserEnvVarsInput, UserEnvVar } from '../../shared/types';
+import { assertSafeUserId, isSafeUserId } from './user-id';
 
 export const USER_ENV_KEY_RE = /^[A-Z_][A-Z0-9_]*$/;
 
@@ -78,7 +79,7 @@ export class UserEnvVarStore {
     // crash the boot for everyone else (mirrors UserScopedJsonStore.init).
     const results = await Promise.allSettled(
       userIds
-        .filter((userId) => !userId.startsWith('.'))
+        .filter(isSafeUserId)
         .map((userId) => this.loadUser(userId)),
     );
     for (const result of results) {
@@ -91,6 +92,7 @@ export class UserEnvVarStore {
   }
 
   async loadUser(userId: string): Promise<void> {
+    assertSafeUserId(userId);
     const filePath = this.filePath(userId);
     let raw: string;
     try {
@@ -130,6 +132,7 @@ export class UserEnvVarStore {
   }
 
   async upsert(userId: string, input: UserEnvVarsInput): Promise<UserEnvVars> {
+    assertSafeUserId(userId);
     const existing = this.items.get(userId) ?? zeroUserEnvVars(userId);
     const envVars = input.envVars !== undefined
       ? sanitizeEnvVars(input.envVars)
@@ -150,6 +153,7 @@ export class UserEnvVarStore {
   }
 
   async delete(userId: string): Promise<void> {
+    assertSafeUserId(userId);
     if (!this.items.has(userId)) return;
     this.items.delete(userId);
     try {
@@ -161,6 +165,7 @@ export class UserEnvVarStore {
   }
 
   private filePath(userId: string): string {
+    assertSafeUserId(userId);
     return join(this.dataDir, 'users', userId, FILENAME);
   }
 
