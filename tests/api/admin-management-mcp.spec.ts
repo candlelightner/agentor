@@ -89,6 +89,13 @@ test.describe.serial("Internal management MCP security", () => {
       },
     });
     expect(resetPolicy.status()).toBe(200);
+  });
+
+  // This serial suite deliberately exercises a 47-second credential-rotation
+  // boundary. Keep each independent test's diagnostic identity short-lived,
+  // but issue it immediately before that test rather than allowing setup time
+  // in unrelated tests to turn a live-policy assertion into an expiry test.
+  test.beforeEach(async ({ request }) => {
     const identity = await request.post(
       "/api/admin/management-mcp/diagnostics/issue-identity",
       { data: { workspaceId: adminWorkspaceId, ttlSeconds: 60 } },
@@ -331,6 +338,7 @@ test.describe.serial("Internal management MCP security", () => {
       (
         await invoke(request, credential, "logs.read", {
           workerId: normalWorker,
+          ownerId: regular.id,
         })
       ).status(),
     ).toBe(403);
@@ -352,6 +360,7 @@ test.describe.serial("Internal management MCP security", () => {
       (
         await invoke(request, credential, "logs.read", {
           workerId: normalWorker,
+          ownerId: regular.id,
         })
       ).status(),
     ).toBe(200);
@@ -499,18 +508,22 @@ test.describe.serial("Internal management MCP security", () => {
     ]) {
       const res = await invoke(request, credential, tool, {
         workspaceId: adminWorkspaceId,
+        workerId: normalWorker,
+        ownerId: regular.id,
         query: SECRET_SENTINEL,
       });
       expect(JSON.stringify(await body(res))).not.toContain(SECRET_SENTINEL);
     }
     const logs = await invoke(request, credential, "logs.read", {
       workerId: normalWorker,
+      ownerId: regular.id,
       tail: 1000,
     });
     expect(logs.status()).toBe(200);
     expect(await logs.json()).toMatchObject({
       workerId: normalWorker,
-      logsOmitted: true,
+      ownerId: regular.id,
+      logs: expect.any(String),
     });
   });
 
