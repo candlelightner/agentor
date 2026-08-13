@@ -19,7 +19,7 @@ or an interactive third-party login into a live-account verification.
 
 | User capability | Dashboard/API implementation | MCP equivalent | Tested evidence / limitation |
 | --- | --- | --- | --- |
-| System and worker inspection | Dashboard worker cards; `/api/containers`, worker status | `status.system`, `workers.list`, `workers.inspect` | `admin-management-mcp.spec.ts`; worker lifecycle tests |
+| System and worker inspection | Dashboard worker cards; `/api/containers`, worker status | `status.system`, `workers.list`, `workers.inspect` | `admin-management-mcp.spec.ts`; worker lifecycle tests; `workers.list` includes active and archived records so unarchive targets are discoverable |
 | Worker create, settings, restart, rebuild, archive, unarchive, delete | Worker dialogs; container lifecycle API | `workers.create`, `workers.update`, `workers.restart`, `workers.rebuild`, `workers.archive`, `workers.unarchive`, `workers.delete` | MCP domain tests plus lifecycle/lock API tests; lock password applies where required |
 | Clone worker/workspace | Worker clone API and storage UI | `workers.clone`, `workspaces.clone` | Workspace adapter and worker-domain coverage; secret values are not copied and names can be reported |
 | Running-worker console | Terminal panes/WebSocket | `console.open`, `console.read`, `console.write`, `console.interrupt`, `console.close` | `admin-management-mcp.spec.ts`; targets worker tmux, never host shell |

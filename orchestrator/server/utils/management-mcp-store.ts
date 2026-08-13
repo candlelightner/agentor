@@ -585,7 +585,12 @@ export class ManagementMcpStore {
         archived: useWorkerStore().listArchived().length,
       };
     if (name === "workers.list")
-      return { workers: useContainerManager().list().map(publicWorker) };
+      return {
+        workers: [
+          ...useContainerManager().list(),
+          ...useWorkerStore().listArchived(),
+        ].map(publicWorker),
+      };
     if (name === "workers.inspect") {
       if (!worker) throw statusError(404, "Worker not found");
       return publicWorker(worker);

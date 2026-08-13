@@ -104,6 +104,22 @@ test.describe.serial("Internal management MCP security", () => {
     credential = (await identity.json()).credential;
   });
 
+  test("workers.list makes archived workers discoverable for unarchive", async ({ request }) => {
+    const archived = await createWorker(request, { displayName: `mcp-archived-${Date.now()}` });
+    const api = new ApiClient(request);
+    try {
+      expect((await api.stopContainer(archived.id)).status).toBe(200);
+      expect((await api.archiveContainer(archived.id)).status).toBe(200);
+      const listed = await invoke(request, credential, "workers.list");
+      expect(listed.status()).toBe(200);
+      expect((await listed.json()).workers).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: archived.id, status: "archived" }),
+      ]));
+    } finally {
+      await api.deleteArchivedWorker(archived.id).catch(() => {});
+    }
+  });
+
   test.afterAll(async () => {
     if (normalWorker)
       await cleanupWorker(regularCtx, normalWorker).catch(() => {});
