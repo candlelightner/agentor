@@ -88,6 +88,8 @@ Backups are encrypted before leaving the orchestrator. Set a high-entropy `BACKU
 
 Google backup linking uses a separate OAuth client and is unrelated to Agentor login. An administrator can configure the client ID, client secret, and exact registered redirect URI ending in `/api/backup-providers/google/oauth/callback` in **Backup management**, then start the link flow without editing the orchestrator environment. The client secret is write-only and AES-GCM encrypted at rest; status never returns it. Existing `GOOGLE_BACKUP_CLIENT_ID`, `GOOGLE_BACKUP_CLIENT_SECRET`, and `GOOGLE_BACKUP_REDIRECT_URI` remain a backward-compatible fallback when no dashboard configuration exists; `GOOGLE_BACKUP_FOLDER_ID` remains optional. OAuth state is one-time and expires after ten minutes. Tokens are AES-GCM encrypted at rest and refreshed by the provider. Tests use the explicitly gated fake provider and never require a real Google account.
 
+See [Google Drive backup setup](google-drive-backups.md) for the current Google Auth Platform screens, required scope, test-user setup, exact callback configuration, linking, verification, and troubleshooting.
+
 The scheduler stores exact minutes and a durable next-run timestamp. `all` resolves durable worker records, including archived workspaces. Archived reads use a read-only networkless helper. Retention keeps deletion-pending metadata when a provider delete fails so cleanup can be retried instead of silently forgetting a remote object.
 
 ## Controlled image builds and Git recovery
