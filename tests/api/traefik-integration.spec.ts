@@ -38,9 +38,10 @@ function tlsSniHandshake(servername: string, port = 443): Promise<{
  * Retry a TLS SNI handshake while Traefik's file provider catches up with a
  * newly-written router. When no TCP router matches the incoming SNI, Traefik
  * closes the connection immediately — Node surfaces that as "Client network
- * socket disconnected before secure TLS connection was established" or
- * ECONNRESET. Both are treated as "not ready yet" and retried until the
- * deadline; every other error (including DNS failure) is re-thrown on the spot.
+ * socket disconnected before secure TLS connection was established",
+ * ECONNRESET, or ECONNREFUSED while Traefik is being recreated. Those are
+ * treated as "not ready yet" and retried until the deadline; every other
+ * error (including DNS failure) is re-thrown on the spot.
  */
 async function waitForTlsSni(
   servername: string,
@@ -56,7 +57,7 @@ async function waitForTlsSni(
       lastErr = err;
       const msg = err instanceof Error ? err.message : String(err);
       const transient =
-        /disconnected before secure TLS|ECONNRESET|EPIPE|socket hang up|handshake timeout/i.test(msg);
+        /disconnected before secure TLS|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|handshake timeout/i.test(msg);
       if (!transient) throw err;
       await new Promise(r => setTimeout(r, 500));
     }
