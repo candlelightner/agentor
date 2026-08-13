@@ -108,6 +108,11 @@ export function useImageCatalog() {
     if (["queued", "running"].includes(b.status)) {
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => void poll(id), 1000);
+    } else {
+      // Terminal build state changes the definition's immutable version list
+      // and storage accounting. Refresh those views before enabling version
+      // actions such as smoke-test and promotion.
+      await refresh();
     }
     return b;
   }

@@ -105,6 +105,7 @@ export class ImageCatalogManager {
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
   private buildStreams = new Map<string, Readable>();
   private definitionBuilds = new Map<string, Promise<void>>();
+  private deletingDefinitions = new Set<string>();
   private buildSettlers = new Map<string, () => void>();
   private docker = new Docker({ socketPath: "/var/run/docker.sock" });
   constructor(private dataDir: string) {}
@@ -287,31 +288,56 @@ export class ImageCatalogManager {
   async removeDefinition(id: string, ownerId: string, admin: boolean) {
     const item = this.definition(id, ownerId, admin);
     if (
+      this.definitionBuilds.has(id) ||
+      this.state.builds.some(
+        (build) =>
+          build.definitionId === id &&
+          (build.status === "queued" || build.status === "running"),
+      ) ||
       Object.values(this.state.userDefaults).some(
         (d) => d.definitionId === id,
       ) ||
-      this.state.systemDefault?.definitionId === id ||
-      (
-        await Promise.all(
-          item.versions.map((version) =>
-            this.workerUsesVersion(id, version.version),
-          ),
-        )
-      ).some(Boolean)
+      this.state.systemDefault?.definitionId === id
     )
       httpError(409, "Image definition is referenced");
-    await Promise.all(
-      item.versions.map((version) =>
-        version.artifactTag || version.runtimeImage
-          ? this.docker
-              .getImage(version.artifactTag || version.runtimeImage!)
-              .remove({ force: true })
-              .catch(() => {})
-          : Promise.resolve(),
-      ),
-    );
-    this.state.definitions = this.state.definitions.filter((d) => d.id !== id);
-    await this.persist();
+    // Close the start/delete interleaving before the first asynchronous
+    // reference check or Docker mutation. startBuild() rejects while this
+    // marker is held, and it is always released if deletion fails.
+    this.deletingDefinitions.add(id);
+    try {
+      if (
+        (
+          await Promise.all(
+            item.versions.map((version) =>
+              this.workerUsesVersion(id, version.version),
+            ),
+          )
+        ).some(Boolean) ||
+        this.definitionBuilds.has(id) ||
+        this.state.builds.some(
+          (build) =>
+            build.definitionId === id &&
+            (build.status === "queued" || build.status === "running"),
+        )
+      )
+        httpError(409, "Image definition is referenced");
+      await Promise.all(
+        item.versions.map((version) =>
+          version.artifactTag || version.runtimeImage
+            ? this.docker
+                .getImage(version.artifactTag || version.runtimeImage!)
+                .remove({ force: true })
+                .catch(() => {})
+            : Promise.resolve(),
+        ),
+      );
+      this.state.definitions = this.state.definitions.filter(
+        (d) => d.id !== id,
+      );
+      await this.persist();
+    } finally {
+      this.deletingDefinitions.delete(id);
+    }
   }
 
   async startBuild(
@@ -320,6 +346,8 @@ export class ImageCatalogManager {
     admin: boolean,
     input: any = {},
   ) {
+    if (this.deletingDefinitions.has(id))
+      httpError(409, "Image definition is being deleted");
     const definition = this.definition(id, ownerId, admin);
     const builder = input.builder ?? "controlled";
     if (builder !== "fake" && builder !== "controlled")
@@ -395,6 +423,16 @@ export class ImageCatalogManager {
       build.phase = "building";
       build.updatedAt = now();
       await this.persist();
+      const daemonInfo = await this.docker.info();
+      const supportsMemoryLimit = daemonInfo.MemoryLimit !== false;
+      const supportsCpuQuota = daemonInfo.CPUCfsQuota !== false;
+      const supportsConfiguredLimits = supportsMemoryLimit && supportsCpuQuota;
+      if (!supportsConfiguredLimits) {
+        build.logs.push(
+          "Builder host cannot apply the configured cgroup limits; using the controlled platform boundary without cgroup limits.",
+        );
+        await this.persist();
+      }
       const runBuild = async (resourceLimits: boolean) => {
         // A build context is a one-shot stream. Recreate it for a controlled
         // retry rather than reusing an already-consumed tar stream.
@@ -411,8 +449,11 @@ export class ImageCatalogManager {
           rm: true,
           forcerm: true,
           networkmode: "default",
-          ...(resourceLimits
-            ? { memory: 2 * 1024 * 1024 * 1024, cpuquota: 100000 }
+          ...(resourceLimits && supportsConfiguredLimits
+            ? { memory: 2 * 1024 * 1024 * 1024 }
+            : {}),
+          ...(resourceLimits && supportsConfiguredLimits
+            ? { cpuquota: 100000 }
             : {}),
           labels: {
             "agentor.image-definition": definition.id,
@@ -632,6 +673,10 @@ export class ImageCatalogManager {
     await this.persist();
     this.buildSettlers.get(id)?.();
     this.buildSettlers.delete(id);
+    // Cancellation is not complete until the underlying fake timer or Docker
+    // build stream has unwound and its finally cleanup has run. This keeps a
+    // following definition deletion from racing live build work.
+    await this.definitionBuilds.get(b.definitionId)?.catch(() => undefined);
     return publicBuild(b);
   }
   logs(id: string, ownerId: string, admin: boolean, after = 0) {

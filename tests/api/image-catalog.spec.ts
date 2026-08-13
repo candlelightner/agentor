@@ -540,6 +540,66 @@ test.describe.serial("Custom worker image builder and catalog", () => {
     expect(definitionDelete.status()).toBe(409);
   });
 
+  test("definition deletion waits for an active build, then permits cleanup after cancellation", async () => {
+    const transient = await createDefinition(ownerCtx, "active-delete");
+    const build = await startBuild(ownerCtx, transient.id, {
+      fakeDurationMs: 10_000,
+    });
+
+    const whileBuilding = await ownerCtx.delete(
+      `/api/image-catalog/definitions/${transient.id}`,
+    );
+    expect(whileBuilding.status()).toBe(409);
+
+    const cancelled = await ownerCtx.delete(`/api/image-builds/${build.id}`);
+    expect(cancelled.status()).toBe(200);
+    expect((await cancelled.json()).status).toBe("cancelled");
+
+    const deleted = await ownerCtx.delete(
+      `/api/image-catalog/definitions/${transient.id}`,
+    );
+    expect(deleted.status()).toBe(204);
+    expect(
+      (
+        await ownerCtx.get(`/api/image-catalog/definitions/${transient.id}`)
+      ).status(),
+    ).toBe(404);
+  });
+
+  test("definition start and deletion are atomic against one another", async () => {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const transient = await createDefinition(
+        ownerCtx,
+        `atomic-delete-${attempt}`,
+      );
+      const [deletion, start] = await Promise.all([
+        ownerCtx.delete(`/api/image-catalog/definitions/${transient.id}`),
+        ownerCtx.post(`/api/image-catalog/definitions/${transient.id}/builds`, {
+          data: { builder: "fake", fakeDurationMs: 200 },
+        }),
+      ]);
+      expect(
+        [deletion.status(), start.status()].filter((status) =>
+          [200, 202, 204].includes(status),
+        ),
+      ).toHaveLength(1);
+      expect([409, 404]).toContain(
+        deletion.status() >= 400 ? deletion.status() : start.status(),
+      );
+      if (start.status() === 202) {
+        const build = await start.json();
+        await ownerCtx.delete(`/api/image-builds/${build.id}`);
+        expect(
+          (
+            await ownerCtx.delete(
+              `/api/image-catalog/definitions/${transient.id}`,
+            )
+          ).status(),
+        ).toBe(204);
+      }
+    }
+  });
+
   test("builder diagnostics prove no raw Docker socket, host execution, account secrets, or persisted build secrets", async () => {
     const diagnostics = await ownerCtx.get("/api/image-builder/diagnostics");
     expect(diagnostics.status()).toBe(200);

@@ -94,6 +94,15 @@ The scheduler stores exact minutes and a durable next-run timestamp. `all` resol
 
 Controlled builds run only from approved aliases. `agentor-worker:approved-latest` maps to the configured official worker image; additional aliases come from `AGENTOR_APPROVED_IMAGE_BASES` JSON and should use immutable trusted references. Contexts and Dockerfile fragments are bounded and policy checked. The orchestrator is the sole Docker API consumer; workers, the admin workspace, contexts, and build steps receive no Docker socket or account credentials. Production UI builds select the controlled builder; fake builders/providers require explicit test-only gates.
 
+The builder requests a 2 GiB memory ceiling and CPU quota when the Docker host
+reports support for the complete configured cgroup limit set. Some nested or
+threaded-cgroup Docker hosts cannot apply those legacy build flags; on those
+hosts Agentor records a visible degraded-mode build log and retains the
+approved-base, bounded-context, Dockerfile-policy, ownership, and controlled
+daemon boundaries without cgroup limits. Operators running untrusted or very
+large build definitions should use a Docker host with memory and CPU quota
+support; disk visibility and image cleanup remain important in either mode.
+
 For Git recovery, optionally set `GIT_IMAGE_CATALOG_ENCRYPTION_KEY` or preserve the generated 0600 key file. GitHub App mode also requires a server-mounted PEM at `GITHUB_APP_PRIVATE_KEY_FILE`; the PEM never enters persistent workspace storage. Fine-grained PATs should be scoped to one selected repository. Public no-token repositories, direct/branch/pull-request sync, existing-workflow Actions dispatch, optional GHCR digest metadata, and disconnect/credential erasure are supported. Catalog recovery restores image metadata and digest-pinned GHCR references only—it is not a workspace backup.
 
 ## Administrative boundary
