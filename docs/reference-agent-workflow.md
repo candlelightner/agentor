@@ -48,7 +48,7 @@ pins before a later rebuild.
   "name": "routed-codex-tools",
   "description": "Codex-LB and OmniRoute combined experiment; credentials are injected per worker at runtime.",
   "baseImage": "agentor-worker:approved-latest",
-  "dockerfileFragment": "RUN python3 -m pip install --no-cache-dir --break-system-packages uv==0.12.3 && UV_PYTHON_INSTALL_DIR=/opt/uv-python uv python install 3.13 && UV_PYTHON_INSTALL_DIR=/opt/uv-python UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python 3.13 codex-lb==1.23.0 && npm install --global omniroute@3.8.49\n",
+  "dockerfileFragment": "RUN python3 -m pip install --no-cache-dir --break-system-packages uv==0.12.3 && UV_PYTHON_INSTALL_DIR=/opt/uv-python uv python install 3.13 && curl --fail --location --silent --show-error https://github.com/Soju06/codex-lb/releases/download/v1.23.0/codex_lb-1.23.0-py3-none-any.whl -o /tmp/codex_lb-1.23.0-py3-none-any.whl && echo '8c566151f442a1a13ce8701ed66d694508035fcd2c1a4e321552f23dcf0f167a  /tmp/codex_lb-1.23.0-py3-none-any.whl' > /tmp/codex-lb.sha256 && sha256sum --check --strict /tmp/codex-lb.sha256 && UV_PYTHON_INSTALL_DIR=/opt/uv-python UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python 3.13 /tmp/codex_lb-1.23.0-py3-none-any.whl && rm /tmp/codex_lb-1.23.0-py3-none-any.whl /tmp/codex-lb.sha256 && npm install --global omniroute@3.8.49\n",
   "contextFiles": []
 }
 ```
@@ -60,8 +60,11 @@ canonical base64 `contentBase64` when a harmless config or launcher is genuinely
 needed. Keep it empty for this example.
 
 Codex-LB is a Python application. Its upstream supported local command is
-`uvx codex-lb`; the combined definition installs the same package as a pinned uv
-tool so it can run beside OmniRoute in one test worker as required by Stage A.
+`uvx codex-lb`; the combined definition instead installs the `v1.23.0` release
+wheel as a pinned uv tool and verifies the release asset's published SHA-256
+digest. This matters because the package was not discoverable through the
+default Python package index when reverified on 2026-08-13. It can run beside
+OmniRoute in one test worker as required by Stage A.
 Before first launch, create `/workspace/.codex-lb` and symlink
 `~/.codex-lb` to it; `/workspace` is Agentor-persistent whereas an arbitrary
 home directory is not. Run the installed pinned `codex-lb` command—not an

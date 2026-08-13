@@ -40,6 +40,8 @@ services:
       # serially by default. Independent focused suites may opt into parallelism.
       - TEST_WORKERS=${TEST_WORKERS:-1}
       - CI=${CI:-}
+      # Opt-in live-package reference acceptance; unset for deterministic CI.
+      - RUN_REFERENCE_WORKFLOW=${RUN_REFERENCE_WORKFLOW:-}
 
 volumes:
   test-runner-docker:
