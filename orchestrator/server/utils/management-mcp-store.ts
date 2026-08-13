@@ -30,6 +30,9 @@ import { ManagementPlatformDomain } from "./management-platform-domain";
 import { ManagementConfigurationCatalogDomain } from "./management-configuration-catalog-domain";
 import { ManagementExposureDomain } from "./management-exposure-domain";
 import { ManagementRunningFilesDomain } from "./management-running-files-domain";
+import { ManagementLogsDomain } from "./management-logs-domain";
+import { ManagementStatusDomain } from "./management-status-domain";
+import { ManagementGlobalConfigurationDomain } from "./management-global-configuration-domain";
 
 const GROUPS = [
   "read-only-status",
@@ -61,6 +64,9 @@ const platformDomain = new ManagementPlatformDomain();
 const catalogDomain = new ManagementConfigurationCatalogDomain();
 const exposureDomain = new ManagementExposureDomain();
 const runningFilesDomain = new ManagementRunningFilesDomain();
+const logsDomain = new ManagementLogsDomain();
+const statusDomain = new ManagementStatusDomain();
+const globalConfigurationDomain = new ManagementGlobalConfigurationDomain();
 interface Policy {
   schemaVersion: 1;
   default: "deny";
@@ -137,6 +143,9 @@ for (const tool of platformDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 for (const tool of catalogDomain.tools()) TOOL_GROUP[tool.name] = tool.group as Group;
 for (const tool of exposureDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 for (const tool of runningFilesDomain.tools()) TOOL_GROUP[tool.name] = tool.group as Group;
+for (const tool of logsDomain.tools()) TOOL_GROUP[tool.name] = tool.group as Group;
+for (const tool of statusDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
+for (const tool of globalConfigurationDomain.tools()) TOOL_GROUP[tool.name] = tool.group as Group;
 const sensitive =
   /secret|token|credential|password|authorization|cookie|cipher|key/i;
 function clean(value: unknown, depth = 0): any {
@@ -233,11 +242,14 @@ export class ManagementMcpStore {
       const catalog = catalogDomain.tools().find((tool) => tool.name === name);
       const exposure = exposureDomain.tools().find((tool) => tool.name === name);
       const runningFiles = runningFilesDomain.tools().find((tool) => tool.name === name);
+      const logs = logsDomain.tools().find((tool) => tool.name === name);
+      const status = statusDomain.tools().find((tool) => tool.name === name);
+      const globalConfiguration = globalConfigurationDomain.tools().find((tool) => tool.name === name);
       return {
       name,
-      description: domain?.description || workspace?.description || imageBackup?.description || platform?.description || catalog?.description || exposure?.description || runningFiles?.description || `Agentor management tool (${TOOL_GROUP[name]})`,
-      inputSchema: domain?.inputSchema || workspace?.inputSchema || imageBackup?.inputSchema || platform?.inputSchema || catalog?.inputSchema || exposure?.inputSchema || runningFiles?.inputSchema || toolInputSchema(name),
-      annotations: domain?.annotations || workspace?.annotations || imageBackup?.annotations || platform?.annotations || catalog?.annotations || exposure?.annotations || runningFiles?.annotations || toolAnnotations(name),
+      description: domain?.description || workspace?.description || imageBackup?.description || platform?.description || catalog?.description || exposure?.description || runningFiles?.description || logs?.description || status?.description || globalConfiguration?.description || `Agentor management tool (${TOOL_GROUP[name]})`,
+      inputSchema: domain?.inputSchema || workspace?.inputSchema || imageBackup?.inputSchema || platform?.inputSchema || catalog?.inputSchema || exposure?.inputSchema || runningFiles?.inputSchema || logs?.inputSchema || status?.inputSchema || globalConfiguration?.inputSchema || toolInputSchema(name),
+      annotations: domain?.annotations || workspace?.annotations || imageBackup?.annotations || platform?.annotations || catalog?.annotations || exposure?.annotations || runningFiles?.annotations || logs?.annotations || status?.annotations || globalConfiguration?.annotations || toolAnnotations(name),
     }});
   }
   async updatePolicy(groups: Record<string, unknown>, actor: string) {
@@ -468,6 +480,12 @@ export class ManagementMcpStore {
     if (exposure.handled) return exposure.result;
     const runningFiles = await runningFilesDomain.execute(name, args);
     if (runningFiles.handled) return runningFiles.result;
+    const logs = await logsDomain.execute(name, args);
+    if (logs.handled) return logs.result;
+    const status = await statusDomain.execute(name, args);
+    if (status.handled) return status.result;
+    const globalConfiguration = await globalConfigurationDomain.execute(name, args);
+    if (globalConfiguration.handled) return globalConfiguration.result;
     if (workspaceMcpTools.some((tool) => tool.name === name))
       return executeWorkspaceMcpTool(name, args);
     const workerId = typeof args.workerId === "string" ? args.workerId : "";
@@ -486,18 +504,6 @@ export class ManagementMcpStore {
     if (name === "workers.inspect") {
       if (!worker) throw statusError(404, "Worker not found");
       return publicWorker(worker);
-    }
-    if (name === "logs.read") {
-      if (!worker) throw statusError(404, "Worker not found");
-      // Worker output is attacker-controlled and may contain a bare secret with
-      // no key/name prefix. Pattern redaction cannot make that stream safe, and
-      // decrypting every configured secret solely to redact it broadens secret
-      // exposure inside the control plane. Return metadata only.
-      return {
-        workerId: worker.id,
-        logsOmitted: true,
-        reason: "Worker log content is unavailable through management MCP",
-      };
     }
     if (name === "volumes.list")
       return {
