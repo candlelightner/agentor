@@ -65,7 +65,8 @@ import {
 import { assertSafeUserId } from "./user-id";
 
 export class BackupManager {
-  private store = new BackupStore(useConfig().dataDir);
+  private readonly dataDir: string;
+  private store: BackupStore;
   private initialized?: Promise<void>;
   private scheduleTimer?: NodeJS.Timeout;
   private active = 0;
@@ -74,50 +75,60 @@ export class BackupManager {
   private accepting = true;
   private controllers = new Map<string, AbortController>();
   private forgottenUsers = new Set<string>();
-  private fake = new FakeBackupProvider(
-    join(useConfig().dataDir, "backup-fake"),
-  );
+  private fake: FakeBackupProvider;
   private fakeUsers = new Set<string>();
-  private providers = new Map<BackupProviderKind, BackupProvider>([
-    [
-      "local",
-      new LocalBackupProvider(join(useConfig().dataDir, "backup-objects")),
-    ],
-    ["fake", this.fake],
-    [
-      "google-drive",
-      new GoogleDriveBackupProvider(
-        (userId) => this.loadGoogleToken(userId),
-        (userId, token) => this.saveGoogleToken(userId, token),
-        async () => {
-          const credentials = await useGoogleBackupOAuthConfigStore().credentials();
-          return credentials && {
-            clientId: credentials.clientId,
-            clientSecret: credentials.clientSecret,
-          };
-        },
-      ),
-    ],
-  ]);
+  private providers: Map<BackupProviderKind, BackupProvider>;
+  /** Dependency injection keeps restart recovery testable against the same
+   * persisted files and provider boundary used by the production manager. */
+  constructor(options: {
+    dataDir?: string;
+    providers?: Partial<Record<BackupProviderKind, BackupProvider>>;
+  } = {}) {
+    this.dataDir = options.dataDir ?? useConfig().dataDir;
+    this.store = new BackupStore(this.dataDir);
+    this.fake = new FakeBackupProvider(join(this.dataDir, "backup-fake"));
+    this.providers = new Map<BackupProviderKind, BackupProvider>([
+      ["local", new LocalBackupProvider(join(this.dataDir, "backup-objects"))],
+      ["fake", this.fake],
+      [
+        "google-drive",
+        new GoogleDriveBackupProvider(
+          (userId) => this.loadGoogleToken(userId),
+          (userId, token) => this.saveGoogleToken(userId, token),
+          async () => {
+            const credentials = await useGoogleBackupOAuthConfigStore().credentials();
+            return credentials && {
+              clientId: credentials.clientId,
+              clientSecret: credentials.clientSecret,
+            };
+          },
+        ),
+      ],
+    ]);
+    for (const [kind, provider] of Object.entries(options.providers ?? {}))
+      if (provider) this.providers.set(kind as BackupProviderKind, provider);
+  }
   init() {
     return (this.initialized ??= this.initialize());
   }
   private async initialize() {
     await this.store.init();
-    await mkdir(join(useConfig().dataDir, "tmp"), { recursive: true });
+    await mkdir(join(this.dataDir, "tmp"), { recursive: true });
     for (const user of this.store.all())
       for (const job of user.jobs)
         if (job.status === "queued" || job.status === "running") {
           // The process that owned an interrupted provider transfer is gone.
           // Remove deterministic per-job scratch before publishing failure so
           // a hard restart cannot strand large encrypted/decrypted archives.
-          await cleanupInterruptedBackupStaging(useConfig().dataDir, job.id);
+          await cleanupInterruptedBackupStaging(this.dataDir, job.id);
           if (job.pendingProviderObjectId && (job.provider === "local" || job.provider === "fake"))
             await this.providers.get(job.provider)?.delete(job.userId, job.pendingProviderObjectId).catch(() => {});
           job.pendingProviderObjectId = undefined;
           job.status = "failed";
           job.phase = "failed";
-          job.error = "Backup interrupted by orchestrator restart";
+          job.error = job.target
+            ? "Restore interrupted by orchestrator restart"
+            : "Backup interrupted by orchestrator restart";
           job.completedAt = job.updatedAt = new Date().toISOString();
           await this.store.save(job.userId, user);
         }
@@ -376,7 +387,7 @@ export class BackupManager {
       throw new Error(
         "In-place restore is not safe while identity-preserving volume replacement is unavailable; restore into a new worker",
       );
-    const dir = join(useConfig().dataDir, "tmp", `restore-${randomUUID()}`);
+    const dir = join(this.dataDir, "tmp", `restore-${randomUUID()}`);
     await mkdir(dir, { recursive: true, mode: 0o700 });
     const encrypted = join(dir, "archive.enc");
     const plain = join(dir, "worker.tar");
@@ -433,7 +444,7 @@ export class BackupManager {
     artifact: BackupArtifact,
     displayName?: string,
   ) {
-    const dir = join(useConfig().dataDir, "tmp", `restore-${job.id}`);
+    const dir = join(this.dataDir, "tmp", `restore-${job.id}`);
     try {
       await mkdir(dir, { recursive: true, mode: 0o700 });
       job.status = "running";
@@ -579,7 +590,7 @@ export class BackupManager {
     };
     let helper = await docker.createContainer(helperOptions);
     const temp = join(
-      useConfig().dataDir,
+      this.dataDir,
       "tmp",
       `offline-backup-${randomUUID()}`,
     );
@@ -689,7 +700,7 @@ export class BackupManager {
   private async runV2(job: BackupJob) {
     if (job.status === "cancelled") return;
     const started = Date.now(),
-      dir = join(useConfig().dataDir, "tmp", `backup-${job.id}`);
+      dir = join(this.dataDir, "tmp", `backup-${job.id}`);
     const controller = new AbortController();
     this.controllers.set(job.id, controller);
     let pendingArtifactId: string | undefined;
@@ -892,7 +903,7 @@ export class BackupManager {
     artifact: BackupArtifact,
     displayName?: string,
   ) {
-    const dir = join(useConfig().dataDir, "tmp", `restore-${job.id}`);
+    const dir = join(this.dataDir, "tmp", `restore-${job.id}`);
     const createdWorkers: string[] = [];
     try {
       await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -1094,7 +1105,7 @@ export class BackupManager {
   }
   private async run(job: BackupJob) {
     const started = Date.now();
-    const dir = join(useConfig().dataDir, "tmp", `backup-${job.id}`);
+    const dir = join(this.dataDir, "tmp", `backup-${job.id}`);
     try {
       await mkdir(dir, { recursive: true, mode: 0o700 });
       job.status = "running";
