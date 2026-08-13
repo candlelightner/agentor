@@ -23,3 +23,12 @@ test('partial failures roll back and incomplete rollback is surfaced', async () 
   })).rejects.toMatchObject({statusCode:500,message:'Managed network update failed and rollback was incomplete'});
   expect(reconcileCalls).toBe(2);
 });
+
+test('topology rollback still runs when desired-state restoration throws', async () => {
+  let updates=0; const reconciled:string[]=[];
+  await expect(updateManagedNetworkAtomically(original,{name:'after'}, {
+    update: async (_owner,_id,patch) => { updates++; if(updates===2)throw new Error('disk write failed'); return {...original,...patch}; },
+    reconcile: async network => { reconciled.push(network.name); if(network.name==='after')throw new Error('Docker update failed'); return {workerIds:network.workerIds,partialFailures:[]}; },
+  })).rejects.toMatchObject({statusCode:500,message:'Managed network update failed and rollback was incomplete'});
+  expect(reconciled).toEqual(['after','before']);
+});

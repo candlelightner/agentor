@@ -23,6 +23,8 @@ export async function updateManagedNetworkAtomically(
     }
     return { ...updated, reconciliation };
   } catch (forwardError: any) {
+    let persistenceRollbackError: unknown;
+    let topologyRollbackError: unknown;
     try {
       await dependencies.update(current.userId, current.id, {
         name: current.name,
@@ -30,13 +32,23 @@ export async function updateManagedNetworkAtomically(
         groupId: current.groupId ?? '',
         workerIds: current.workerIds,
       });
+    } catch (error) {
+      persistenceRollbackError = error;
+    }
+    // Topology rollback is independent of persistence. Always attempt it even
+    // when restoring the JSON store failed, matching the group coordinator's
+    // fail-recoverable semantics.
+    try {
       const rollback = await dependencies.reconcile(current);
       if (rollback.partialFailures.length)
         throw new Error(rollback.partialFailures.join('; '));
-    } catch (rollbackError) {
+    } catch (error) {
+      topologyRollbackError = error;
+    }
+    if (persistenceRollbackError || topologyRollbackError) {
       throw Object.assign(new Error('Managed network update failed and rollback was incomplete'), {
         statusCode: 500,
-        cause: { forwardError, rollbackError },
+        cause: { forwardError, persistenceRollbackError, topologyRollbackError },
       });
     }
     throw forwardError;
