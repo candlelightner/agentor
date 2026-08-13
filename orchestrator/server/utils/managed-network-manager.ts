@@ -26,10 +26,10 @@ export class ManagedNetworkManager {
     return [...new Set(ids)].filter((id) => useWorkerStore().get(network.userId, id));
   }
 
-  async reconcile(network: ManagedNetwork) {
+  async reconcile(network: ManagedNetwork, workerIds?: Iterable<string>) {
     this.assertSafe(network);
     const dockerNetwork = await this.ensure(network);
-    const target = new Set(await this.members(network));
+    const target = new Set(workerIds === undefined ? await this.members(network) : workerIds);
     const failures: string[] = [];
     const manager = useContainerManager();
     const currentByName = new Map(

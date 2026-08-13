@@ -6,6 +6,35 @@ Layer 7 + TCP Layer 4 via SNI) for all managed workers. There is no separate
 port-mapper container — each port mapping becomes a dedicated Traefik entrypoint
 on the same container. The orchestrator manages Traefik's lifecycle via dockerode.
 
+## Managed Worker Networks
+
+Managed worker networks are owner-scoped Docker bridge networks controlled by
+the orchestrator. They are separate from Traefik routing and can derive desired
+membership from all active workers, an explicit worker list, or a worker group.
+The internal `agentor-management` network is a privileged special case and is
+never selectable through these APIs or management MCP tools.
+
+Group membership is live desired state. Updating a group reconciles **every**
+managed network that references it, attaching new members and detaching former
+members before the API or MCP operation succeeds. If any dependent reconcile
+fails, Agentor restores the previous group definition and makes a best-effort
+topology rollback, returning 409 with a bounded error. Protection locks apply
+to the union of old and new workers because a group edit can both detach and
+attach protected containers.
+
+Group mutations and managed-network reference mutations share an owner-scoped
+serialization queue. A concurrent network create/update cannot pass its group
+check while that group is being deleted, or vice versa; unrelated owners remain
+independent. Group persistence swaps immutable records and restores in-memory
+state on an atomic-write failure. A failed membership reconcile always attempts
+an explicit old-membership topology rollback even if the storage rollback also
+fails.
+
+A group referenced by any managed network cannot be deleted. Both the regular
+API and management MCP return 409 and preserve the group/network records; delete
+or reconfigure the dependent network first. Deleting a group never deletes its
+member workers.
+
 ## Port Mappings
 
 Port mappings are persisted to `<DATA_DIR>/port-mappings.json` and survive
