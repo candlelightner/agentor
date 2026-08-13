@@ -88,6 +88,7 @@ export class ManagementConsoleStore {
         session.output,
         start - session.offset,
         await workerOutputRedactionValues(worker),
+        session.offset > 0,
       );
     }
     return {

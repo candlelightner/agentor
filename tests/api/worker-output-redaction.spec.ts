@@ -67,3 +67,11 @@ test("console slices cannot start inside a complete secret", () => {
   expect(result).toMatchObject({ output: "[REDACTED]:after", start: 7, safeEnd: 25, redacted: 1 });
   expect(result.output).not.toContain("ret-value");
 });
+
+test("console ring-buffer trimming redacts a retained secret suffix", () => {
+  const result = redactManagedBufferSlice(
+    Buffer.from("ret-value:after"), 0, ["secret-value"], true,
+  );
+  expect(result.output).toBe("[REDACTED]:after");
+  expect(result.output).not.toContain("ret-value");
+});

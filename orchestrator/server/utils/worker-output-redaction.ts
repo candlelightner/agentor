@@ -69,6 +69,7 @@ export function redactManagedBufferSlice(
   buffer: Buffer,
   requestedIndex: number,
   values: string[],
+  bufferMayStartMidValue = false,
 ) {
   const secrets = normalizedValues(values).map((value) => ({
     value,
@@ -89,6 +90,18 @@ export function redactManagedBufferSlice(
     }
   }
   let start = Math.min(Math.max(0, requestedIndex), safeEnd);
+  let leadingSecretSuffix = 0;
+  if (bufferMayStartMidValue) {
+    for (const { bytes } of secrets) {
+      for (let length = Math.min(bytes.length - 1, safeEnd); length >= 4; length--) {
+        if (buffer.subarray(0, length).equals(bytes.subarray(bytes.length - length))) {
+          leadingSecretSuffix = Math.max(leadingSecretSuffix, length);
+          break;
+        }
+      }
+    }
+    if (start < leadingSecretSuffix) start = 0;
+  }
   for (const { bytes } of secrets) {
     let occurrence = buffer.indexOf(bytes);
     while (occurrence >= 0 && occurrence < safeEnd) {
@@ -97,8 +110,11 @@ export function redactManagedBufferSlice(
       occurrence = buffer.indexOf(bytes, occurrence + 1);
     }
   }
+  const text = start === 0 && leadingSecretSuffix
+    ? `[REDACTED]${buffer.subarray(leadingSecretSuffix, safeEnd).toString("utf8")}`
+    : buffer.subarray(start, safeEnd).toString("utf8");
   const result = redactManagedOutput(
-    buffer.subarray(start, safeEnd).toString("utf8"),
+    text,
     secrets.map(({ value }) => value),
   );
   return { ...result, start, safeEnd };
@@ -112,8 +128,14 @@ function normalizedValues(values: string[]) {
 
 function defaults(): Dependencies {
   return {
-    localValues: (userId, workerId) =>
-      useWorkerConfigStore().resolveValues(userId, workerId),
+    localValues: async (userId, workerId) => {
+      const store = useWorkerConfigStore();
+      const [desired, applied] = await Promise.all([
+        store.resolveValues(userId, workerId),
+        store.resolveAppliedValues(userId, workerId),
+      ]);
+      return [...desired, ...applied];
+    },
     userValues: (userId) => useUserEnvStore().getOrDefault(userId).envVars,
     environmentText: (environmentId) =>
       useEnvironmentStore().getById(environmentId)?.envVars,
