@@ -133,7 +133,22 @@ async function affectedWorkerIds(network: any): Promise<string[]> {
 }
 
 function tool(name: string, group: ManagementPlatformTool["group"], description: string, annotations: Record<string, boolean>): ManagementPlatformTool {
-  return { name, group, description, annotations, inputSchema: { type: "object", additionalProperties: true } };
+  const properties: Record<string, unknown> = {
+    ownerId: { type: "string", minLength: 1 },
+    networkId: { type: "string", minLength: 1 },
+    name: { type: "string", minLength: 1, maxLength: 100 },
+    scope: { type: "string", enum: ["all", "selected", "group"] },
+    groupId: { type: "string", minLength: 1 },
+    workerIds: { type: "array", items: { type: "string" } },
+    lockPasswords: { type: "object", additionalProperties: { type: "string", writeOnly: true } },
+    action: { type: "string", enum: ["dangling-images", "build-cache", "stale-helpers", "stale-staging"] },
+  };
+  let required: string[] = [];
+  if (name === "networks.inspect" || name === "networks.update" || name === "networks.reconcile" || name === "networks.delete") required = ["networkId"];
+  if (name === "networks.create") required = ["ownerId", "name", "scope"];
+  if (name === "storage.cleanup") required = ["action"];
+  if (name === "networks.list") properties.ownerId = { type: "string", minLength: 1 };
+  return { name, group, description, annotations, inputSchema: { type: "object", additionalProperties: false, properties, ...(required.length ? { required } : {}) } };
 }
 function required(value: unknown, name: string) {
   if (typeof value !== "string" || !value.trim()) throw error(400, `${name} is required`);
