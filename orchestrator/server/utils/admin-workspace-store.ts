@@ -41,6 +41,7 @@ export interface AdminWorkspaceRuntimeAdapter {
   ): Promise<AdminWorkspaceRuntimeImage | void>;
   security?(workerId?: string): Promise<Record<string, unknown> | undefined>;
   managementNetworkSecurity?(): Promise<Record<string, unknown>>;
+  setClipboard?(mime: "image/png" | "text/plain", bytes: Buffer): Promise<void>;
 }
 
 const ADMIN_IMAGE =
@@ -62,6 +63,10 @@ export class AdminWorkspaceStore {
   }
   setRuntimeAdapter(runtime: AdminWorkspaceRuntimeAdapter) {
     this.runtime = runtime;
+  }
+  async setClipboard(mime: "image/png" | "text/plain", bytes: Buffer) {
+    if (!this.runtime?.setClipboard) throw Object.assign(new Error("Administrative clipboard unavailable"), { statusCode: 503 });
+    await this.runtime.setClipboard(mime, bytes);
   }
   async init() {
     if (this.loading) return this.loading;

@@ -106,6 +106,9 @@ async function readCappedBody(event: Parameters<Parameters<typeof defineEventHan
 export default defineEventHandler(async (event) => {
   const id = getRouterParam(event, 'id')!;
   const containerManager = useContainerManager();
+  const adminWorkspace = useAdminWorkspaceStore();
+  const adminRecord = await adminWorkspace.ensure();
+  const isAdministrative = id === adminRecord.id;
 
   // Ownership/404/401/403 checks BEFORE the body is read, so an unauthenticated
   // or non-owning caller can never trigger body parsing or worker-side work.
@@ -113,8 +116,11 @@ export default defineEventHandler(async (event) => {
   // for an owner mismatch; it returns the auth context, so re-fetch the
   // container info to assert the running state (409) before reading the body.
   const containerInfo = containerManager.get(id);
-  requireContainerAccess(event, containerInfo);
-  if (!containerInfo || containerInfo.status !== 'running') {
+  if (isAdministrative) {
+    const auth = requireAuth(event);
+    if (auth.user.role !== 'admin') throw createError({ statusCode: 403, statusMessage: 'Forbidden' });
+  } else requireContainerAccess(event, containerInfo);
+  if ((!isAdministrative && !containerInfo) || (!isAdministrative && containerInfo!.status !== 'running') || (isAdministrative && adminRecord.status !== 'running')) {
     throw createError({ statusCode: 409, statusMessage: 'Worker container is not running' });
   }
 
@@ -151,7 +157,8 @@ export default defineEventHandler(async (event) => {
   }
 
   try {
-    await containerManager.setClipboard(id, mime, bytes);
+    if (isAdministrative) await adminWorkspace.setClipboard(mime, bytes);
+    else await containerManager.setClipboard(id, mime, bytes);
   } catch (err: any) {
     rethrowAsHttpError(err);
   }

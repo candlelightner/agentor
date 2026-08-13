@@ -41,6 +41,25 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
       process.env.AGENTOR_ADMIN_WORKER_IMAGE || "agentor-admin-worker:latest";
   }
 
+  async setClipboard(mime: "image/png" | "text/plain", bytes: Buffer): Promise<void> {
+    const container = this.docker.getContainer(ADMIN_CONTAINER);
+    const inspection = await container.inspect();
+    if (!inspection.State.Running) throw Object.assign(new Error("Administrative workspace is not running"), { statusCode: 409 });
+    const execution = await container.exec({
+      Cmd: ["sh", "-c", 'head -c "$1" | /home/agent/clipboard/set.sh "$2"', "agentor-clipboard", String(bytes.length), mime],
+      AttachStdin: true, AttachStdout: false, AttachStderr: false, User: "agent",
+    });
+    const stream = await execution.start({ hijack: true, stdin: true });
+    stream.end(bytes);
+    let result = await execution.inspect();
+    for (let attempt = 0; result.Running && attempt < 40; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      result = await execution.inspect();
+    }
+    if (result.Running) throw Object.assign(new Error("Administrative clipboard helper timed out"), { statusCode: 504 });
+    if (result.ExitCode !== 0) throw Object.assign(new Error("Failed to set administrative clipboard"), { statusCode: 422 });
+  }
+
   async initializeBoundary(): Promise<void> {
     await this.ensureManagementNetwork();
     await this.ensureEgressNetwork();
