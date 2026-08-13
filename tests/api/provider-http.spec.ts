@@ -114,6 +114,7 @@ test.describe.serial("Provider HTTP boundaries", () => {
         async (_user, token) => {
           stored = token;
         },
+        async () => ({ clientId: "test-client", clientSecret: "test-secret" }),
         transport,
         async () => {},
       );
@@ -162,6 +163,7 @@ test.describe.serial("Provider HTTP boundaries", () => {
         expires_at: Date.now() + 3600_000,
       }),
       async () => {},
+      async () => ({ clientId: "test-client", clientSecret: "test-secret" }),
       transport,
       async () => {},
     );
@@ -226,6 +228,7 @@ test.describe.serial("Provider HTTP boundaries", () => {
         expires_at: Date.now() + 3600_000,
       }),
       async () => {},
+      async () => ({ clientId: "test-client", clientSecret: "test-secret" }),
       transport,
       async () => {},
     );

@@ -85,6 +85,8 @@ test.describe.serial("Internal management MCP security", () => {
           "image-builds": false,
           "configuration-proposals": false,
           "configuration-application": false,
+          networking: false,
+          apps: false,
         },
       },
     });
@@ -104,17 +106,23 @@ test.describe.serial("Internal management MCP security", () => {
     credential = (await identity.json()).credential;
   });
 
-  test("workers.list makes archived workers discoverable for unarchive", async ({ request }) => {
-    const archived = await createWorker(request, { displayName: `mcp-archived-${Date.now()}` });
+  test("workers.list makes archived workers discoverable for unarchive", async ({
+    request,
+  }) => {
+    const archived = await createWorker(request, {
+      displayName: `mcp-archived-${Date.now()}`,
+    });
     const api = new ApiClient(request);
     try {
       expect((await api.stopContainer(archived.id)).status).toBe(200);
       expect((await api.archiveContainer(archived.id)).status).toBe(200);
       const listed = await invoke(request, credential, "workers.list");
       expect(listed.status()).toBe(200);
-      expect((await listed.json()).workers).toEqual(expect.arrayContaining([
-        expect.objectContaining({ id: archived.id, status: "archived" }),
-      ]));
+      expect((await listed.json()).workers).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: archived.id, status: "archived" }),
+        ]),
+      );
     } finally {
       await api.deleteArchivedWorker(archived.id).catch(() => {});
     }
@@ -584,10 +592,9 @@ test.describe.serial("Internal management MCP security", () => {
       ).toBe(200);
 
       const tools = await (
-        await request.post(
-          "/api/admin/management-mcp/diagnostics/list-tools",
-          { data: { credential } },
-        )
+        await request.post("/api/admin/management-mcp/diagnostics/list-tools", {
+          data: { credential },
+        })
       ).json();
       for (const name of [
         "worker.stop",
@@ -631,17 +638,17 @@ test.describe.serial("Internal management MCP security", () => {
           expect(denied.status(), `${tool} must require the worker lock`).toBe(
             423,
           );
-          expect(JSON.stringify(await body(denied))).not.toContain(lockPassword);
+          expect(JSON.stringify(await body(denied))).not.toContain(
+            lockPassword,
+          );
         }
       };
 
       await assertLocked("configuration.apply", { proposalId });
-      const applied = await invoke(
-        request,
-        credential,
-        "configuration.apply",
-        { proposalId, lockPassword },
-      );
+      const applied = await invoke(request, credential, "configuration.apply", {
+        proposalId,
+        lockPassword,
+      });
       expect(applied.status()).toBe(200);
       expect(JSON.stringify(await applied.json())).not.toContain(lockPassword);
 
@@ -786,10 +793,9 @@ test.describe.serial("Internal management MCP security", () => {
         lockPassword,
       }).catch(() => {});
       if (locked)
-        await regularCtx.delete(
-          `/api/containers/${normalWorker}/protection`,
-          { data: { password: lockPassword } },
-        );
+        await regularCtx.delete(`/api/containers/${normalWorker}/protection`, {
+          data: { password: lockPassword },
+        });
     }
   });
 
