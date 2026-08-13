@@ -587,8 +587,6 @@ test.describe('Containers API', () => {
         envVars: 'MY_VAR=hello\nANOTHER=world',
         exposeApis: { portMappings: false, domainMappings: true, usage: false },
         dockerEnabled: false,
-        cpuLimit: 2,
-        memoryLimit: '2g',
       });
       expect(envStatus).toBe(201);
 

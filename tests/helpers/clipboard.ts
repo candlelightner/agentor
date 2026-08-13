@@ -113,13 +113,15 @@ export async function readWorkerClipboard(
   const ma = `CB${tag.slice(0, 4)}`;
   const mb = `64_${tag.slice(4)}_END`;
   const fullMarker = `${ma}${mb}`;
-  const noneMarker = `NONE${tag}_END`;
+  const na = `NONE${tag.slice(0, 4)}`;
+  const nb = `${tag.slice(4)}_END`;
+  const noneMarker = `${na}${nb}`;
   const cmd =
-    `MA='${ma}'; MB='${mb}'; NM='NONE${tag}_END'; ` +
+    `MA='${ma}'; MB='${mb}'; NA='${na}'; NB='${nb}'; ` +
     `TMP=$(mktemp); ` +
     `if DISPLAY=:99 timeout 3 xclip -selection clipboard -t '${target}' -o > "$TMP" 2>/dev/null; then ` +
     `printf '%s=%s\\n' "$MA$MB" "$(base64 -w0 < "$TMP")"; ` +
-    `else printf '%s\\n' "$NM"; fi; ` +
+    `else printf '%s\\n' "$NA$NB"; fi; ` +
     `rm -f "$TMP"`;
   const out = await runInFreshWindow(request, containerId, cmd, new RegExp(`${fullMarker}=|${noneMarker}`), 30_000);
   if (new RegExp(noneMarker).test(out)) return null;

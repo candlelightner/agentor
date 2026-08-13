@@ -75,6 +75,7 @@ test.describe.serial('Clipboard paste bridge — Agentor Terminal (xterm)', () =
     // Intercept the clipboard POST so we can assert it fires with image/png.
     let posted = false;
     let postedType = '';
+    let postedBody: Buffer | null = null;
     await page.route(`**/api/containers/${containerId}/clipboard`, async (route) => {
       const req = route.request();
       postedType = req.headers()['content-type'] || '';
@@ -84,6 +85,7 @@ test.describe.serial('Clipboard paste bridge — Agentor Terminal (xterm)', () =
       const body = req.postDataBuffer();
       if (body && body.length > 8 && body[0] === 0x89 && body[1] === 0x50) {
         posted = true;
+        postedBody = Buffer.from(body);
       }
       await route.continue();
     });
@@ -112,7 +114,8 @@ test.describe.serial('Clipboard paste bridge — Agentor Terminal (xterm)', () =
     // worker X clipboard now holds the PNG. Read it back and confirm.
     const readBack = await readWorkerClipboard(request, containerId, 'image/png');
     expect(readBack).not.toBeNull();
-    expect(readBack!.equals(PNG)).toBe(true);
+    expect(postedBody).not.toBeNull();
+    expect(readBack!.equals(postedBody!)).toBe(true);
 
     // The terminal must remain usable after the paste bridge ran: the raw
     // Ctrl+V replay (\x16) should not have wedged xterm. Verify the xterm
@@ -303,11 +306,15 @@ test.describe.serial('Clipboard paste bridge — noVNC Desktop (agentor.html)', 
     // /api/containers/<id>/clipboard with credentials, same origin).
     let posted = false;
     let postedType = '';
+    let postedBody: Buffer | null = null;
     await page.route(`**/api/containers/${containerId}/clipboard`, async (route) => {
       const req = route.request();
       postedType = req.headers()['content-type'] || '';
       const body = req.postDataBuffer();
-      if (body && body.length > 8 && body[0] === 0x89 && body[1] === 0x50) posted = true;
+      if (body && body.length > 8 && body[0] === 0x89 && body[1] === 0x50) {
+        posted = true;
+        postedBody = Buffer.from(body);
+      }
       await route.continue();
     });
 
@@ -332,6 +339,7 @@ test.describe.serial('Clipboard paste bridge — noVNC Desktop (agentor.html)', 
     expect(postedType).toContain('image/png');
     const readBack = await readWorkerClipboard(request, containerId, 'image/png');
     expect(readBack).not.toBeNull();
-    expect(readBack!.equals(PNG)).toBe(true);
+    expect(postedBody).not.toBeNull();
+    expect(readBack!.equals(postedBody!)).toBe(true);
   });
 });
