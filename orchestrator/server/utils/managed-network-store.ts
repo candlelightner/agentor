@@ -51,13 +51,16 @@ export class ManagedNetworkStore extends UserScopedJsonStore<string, ManagedNetw
     const item = this.get(userId, id);
     if (!item)
       throw createError({ statusCode: 404, statusMessage: "Managed network not found" });
-    if (patch.name !== undefined) item.name = patch.name.trim();
-    if (patch.scope !== undefined) item.scope = patch.scope;
-    if (patch.groupId !== undefined) item.groupId = patch.groupId || undefined;
-    if (patch.workerIds !== undefined) item.workerIds = [...new Set(patch.workerIds)];
-    item.updatedAt = new Date().toISOString();
-    await this.setItem(userId, item);
-    return item;
+    const updated: ManagedNetwork = {
+      ...item,
+      ...(patch.name !== undefined ? { name: patch.name.trim() } : {}),
+      ...(patch.scope !== undefined ? { scope: patch.scope } : {}),
+      ...(patch.groupId !== undefined ? { groupId: patch.groupId || undefined } : {}),
+      ...(patch.workerIds !== undefined ? { workerIds: [...new Set(patch.workerIds)] } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+    await this.setItem(userId, updated);
+    return updated;
   }
   async remove(userId: string, id: string) {
     if (!(await this.deleteItem(userId, id)))

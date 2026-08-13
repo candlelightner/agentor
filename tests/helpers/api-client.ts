@@ -244,21 +244,21 @@ export class ApiClient {
     return { status: res.status(), body: await res.json() };
   }
 
-  async createPane(containerId: string, name?: string) {
-    const data = name ? { name } : {};
+  async createPane(containerId: string, name?: string, lockPassword?: string) {
+    const data = { ...(name ? { name } : {}), ...(lockPassword ? { lockPassword } : {}) };
     const res = await this.request.post(`${BASE_URL}/api/containers/${containerId}/panes`, { data });
     return { status: res.status(), body: await res.json() };
   }
 
-  async renamePane(containerId: string, windowIndex: number, newName: string) {
+  async renamePane(containerId: string, windowIndex: number, newName: string, lockPassword?: string) {
     const res = await this.request.put(`${BASE_URL}/api/containers/${containerId}/panes/${windowIndex}`, {
-      data: { newName },
+      data: { newName, ...(lockPassword ? { lockPassword } : {}) },
     });
     return { status: res.status(), body: await res.json() };
   }
 
-  async deletePane(containerId: string, windowIndex: number) {
-    const res = await this.request.delete(`${BASE_URL}/api/containers/${containerId}/panes/${windowIndex}`);
+  async deletePane(containerId: string, windowIndex: number, lockPassword?: string) {
+    const res = await this.request.delete(`${BASE_URL}/api/containers/${containerId}/panes/${windowIndex}`, { data: lockPassword ? { lockPassword } : {} });
     return { status: res.status(), body: await res.json() };
   }
 

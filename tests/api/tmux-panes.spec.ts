@@ -31,6 +31,24 @@ test.describe.serial('Tmux Panes API', () => {
     await cleanupWorker(request, containerId);
   });
 
+  test('protected workers require the transient password for pane mutations', async ({ request }) => {
+    const api = new ApiClient(request);
+    const password = `tmux-lock-${Date.now()}-password`;
+    expect((await request.put(`/api/containers/${containerId}/protection`, { data: { password } })).status()).toBe(200);
+    try {
+      expect((await api.createPane(containerId, 'locked-pane')).status).toBe(423);
+      expect((await api.createPane(containerId, 'locked-pane', 'wrong-password')).status).toBe(423);
+      const created = await api.createPane(containerId, 'locked-pane', password);
+      expect(created.status).toBe(201);
+      expect((await api.renamePane(containerId, created.body.index, 'locked-renamed')).status).toBe(423);
+      expect((await api.renamePane(containerId, created.body.index, 'locked-renamed', password)).status).toBe(200);
+      expect((await api.deletePane(containerId, created.body.index)).status).toBe(423);
+      expect((await api.deletePane(containerId, created.body.index, password)).status).toBe(200);
+    } finally {
+      await request.delete(`/api/containers/${containerId}/protection`, { data: { password } });
+    }
+  });
+
   test.describe('GET /api/containers/:id/panes', () => {
     test('lists tmux windows', async ({ request }) => {
       const api = new ApiClient(request);

@@ -121,7 +121,9 @@ export class ManagementPlatformDomain {
       if(prospective.scope==="group"&&(!prospective.groupId||!useWorkerGroupStore().get(current.userId,prospective.groupId)))throw error(400,"Group not found");
       await verifyWorkerMutationUnlocks([...await affectedWorkerIds(current), ...await affectedWorkerIds(prospective)], args.lockPasswords);
       const updated = await store.update(current.userId, id, patch);
-      return { ...updated, reconciliation: await manager.reconcile(updated) };
+      const reconciliation=await manager.reconcile(updated);
+      if(reconciliation.partialFailures.length){await store.update(current.userId,id,{name:current.name,scope:current.scope,groupId:current.groupId||'',workerIds:current.workerIds}).catch(()=>{});await manager.reconcile(current).catch(()=>{});throw error(409,reconciliation.partialFailures.join('; '));}
+      return { ...updated, reconciliation };
     }) };
   }
 }

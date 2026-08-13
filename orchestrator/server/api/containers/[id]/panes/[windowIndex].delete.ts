@@ -8,6 +8,7 @@ defineRouteMeta({
       { name: 'id', in: 'path', required: true, schema: { type: 'string' }, description: 'Container ID' },
       { name: 'windowIndex', in: 'path', required: true, schema: { type: 'integer' }, description: 'Tmux window index to delete' },
     ],
+    requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { lockPassword: { type: 'string', writeOnly: true } } } } } },
     responses: {
       200: { description: 'Window deleted', content: { 'application/json': { schema: { $ref: '#/components/schemas/SuccessResponse' } } } },
       404: { description: 'Window not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
@@ -17,6 +18,7 @@ defineRouteMeta({
 
 import { useContainerManager } from '../../../../utils/services';
 import { requireContainerAccess } from '../../../../utils/auth-helpers';
+import { useWorkerProtectionLockStore } from '../../../../utils/worker-protection-lock';
 
 export default defineEventHandler(async (event) => {
   const id = getRouterParam(event, 'id')!;
@@ -28,6 +30,8 @@ export default defineEventHandler(async (event) => {
   if (Number.isNaN(windowIndex) || windowIndex < 0) {
     throw createError({ statusCode: 400, statusMessage: 'windowIndex must be a non-negative integer' });
   }
+  const body = await readBody<{ lockPassword?: unknown }>(event).catch(() => undefined);
+  await useWorkerProtectionLockStore().verify(id, body?.lockPassword);
 
   try {
     await containerManager.killTmuxWindow(id, windowIndex);

@@ -17,6 +17,7 @@ defineRouteMeta({
             required: ['newName'],
             properties: {
               newName: { type: 'string', description: 'New window name' },
+              lockPassword: { type: 'string', writeOnly: true },
             },
           },
         },
@@ -35,6 +36,7 @@ defineRouteMeta({
 import { useContainerManager } from '../../../../utils/services';
 import { requireContainerAccess } from '../../../../utils/auth-helpers';
 import { WINDOW_NAME_RE } from '../../../../utils/validation';
+import { useWorkerProtectionLockStore } from '../../../../utils/worker-protection-lock';
 
 export default defineEventHandler(async (event) => {
   const id = getRouterParam(event, 'id')!;
@@ -47,6 +49,7 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 400, statusMessage: 'windowIndex must be a non-negative integer' });
   }
   const body = await readBody(event);
+  await useWorkerProtectionLockStore().verify(id, body?.lockPassword);
 
   const newName = typeof body?.newName === 'string' ? body.newName.trim() : '';
   if (!newName) {

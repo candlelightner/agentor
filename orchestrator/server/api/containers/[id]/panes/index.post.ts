@@ -12,6 +12,7 @@ defineRouteMeta({
             type: 'object',
             properties: {
               name: { type: 'string', description: 'Window name (auto-generated if omitted)' },
+              lockPassword: { type: 'string', writeOnly: true },
             },
           },
         },
@@ -27,6 +28,7 @@ defineRouteMeta({
 import { useContainerManager } from '../../../../utils/services';
 import { requireContainerAccess } from '../../../../utils/auth-helpers';
 import { WINDOW_NAME_RE } from '../../../../utils/validation';
+import { useWorkerProtectionLockStore } from '../../../../utils/worker-protection-lock';
 
 export default defineEventHandler(async (event) => {
   const id = getRouterParam(event, 'id')!;
@@ -35,6 +37,7 @@ export default defineEventHandler(async (event) => {
   requireContainerAccess(event, containerManager.get(id));
 
   const body = await readBody(event);
+  await useWorkerProtectionLockStore().verify(id, body?.lockPassword);
 
   const name = typeof body?.name === 'string' ? body.name.trim() : undefined;
   if (name && !WINDOW_NAME_RE.test(name)) {

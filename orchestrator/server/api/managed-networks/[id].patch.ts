@@ -11,5 +11,8 @@ export default defineEventHandler(async event => { const id = getRouterParam(eve
   const affected=(value:any)=>value.scope==='selected'?(value.workerIds||[]):value.scope==='group'?(useWorkerGroupStore().get(value.userId,value.groupId)?.workerIds||[]):useWorkerStore().listForUser(value.userId).map(worker=>worker.id);
   const proposed={...network,scope,groupId,workerIds:scope==='selected'?(body?.workerIds??network!.workerIds):[]};
   await verifyWorkerMutationUnlocks([...affected(network),...affected(proposed)],body?.lockPasswords);
-  const updated = await store.update(network.userId, id, { name: body?.name, scope, groupId, workerIds: scope === 'selected' ? body?.workerIds : [] }); return { ...updated, reconciliation: await useManagedNetworkManager().reconcile(updated) };
+  const updated = await store.update(network.userId, id, { name: body?.name, scope, groupId, workerIds: scope === 'selected' ? body?.workerIds : [] });
+  const manager=useManagedNetworkManager();const reconciliation=await manager.reconcile(updated);
+  if(reconciliation.partialFailures.length){await store.update(network.userId,id,{name:network.name,scope:network.scope,groupId:network.groupId||'',workerIds:network.workerIds}).catch(()=>{});await manager.reconcile(network).catch(()=>{});throw createError({statusCode:409,statusMessage:reconciliation.partialFailures.join('; ')});}
+  return { ...updated, reconciliation };
 });});
