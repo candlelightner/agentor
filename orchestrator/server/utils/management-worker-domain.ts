@@ -1,16 +1,16 @@
 import type { CreateContainerRequest, UpdateContainerSettingsRequest } from "../../shared/types";
 import {
   useContainerManager,
-  useManagedNetworkStore,
   useWorkerGroupStore,
   useWorkerStore,
 } from "./services";
 import { useImageCatalogManager } from "./image-catalog";
 import { useWorkerConfigStore } from "./worker-config-store";
 import { workerConfigurationResponse } from "./worker-config-response";
-import { useWorkerProtectionLockStore, verifyWorkerMutationUnlocks } from "./worker-protection-lock";
+import { useWorkerProtectionLockStore } from "./worker-protection-lock";
 import { findWorkspaceInventory } from "./workspace-inventory";
 import { OfflineWorkspaceAccess } from "./workspace-access";
+import { deleteWorkerGroup, updateWorkerGroupWithNetworks, withWorkerNetworkMutation } from "./worker-group-manager";
 
 export interface ManagementDomainTool {
   name: string;
@@ -41,11 +41,11 @@ export class ManagementWorkerDomain {
       ["configuration.set", "configuration", "Replace worker-local variables/secrets/files; secrets are write-only.", objectWithWorker(), mutation],
       ["groups.list", "groups", "List groups for an owner or all groups.", { type:"object", properties:{userId:{type:"string"}} }, read],
       ["groups.create", "groups", "Create a worker group for an explicit owner.", { type:"object", required:["userId","name"], properties:{userId:{type:"string"},name:{type:"string"}} }, mutation],
-      ["groups.update", "groups", "Rename a group or replace same-owner membership.", { type:"object", required:["groupId"], properties:{groupId:{type:"string"},name:{type:"string"},workerIds:{type:"array",items:{type:"string"}}} }, mutation],
-      ["groups.delete", "groups", "Delete a group without deleting workers.", { type:"object", required:["groupId"], properties:{groupId:{type:"string"}} }, { ...mutation, destructiveHint:true }],
+      ["groups.update", "groups", "Rename a group or replace same-owner membership, reconciling every dependent managed network. Protected workers in the previous or requested membership require lockPasswords.", { type:"object", required:["groupId"], properties:{groupId:{type:"string"},name:{type:"string"},workerIds:{type:"array",items:{type:"string"}},lockPasswords:{type:"object",additionalProperties:{type:"string",writeOnly:true}}} }, mutation],
+      ["groups.delete", "groups", "Delete a group without deleting workers. Groups referenced by managed networks must be reconfigured first.", { type:"object", required:["groupId"], properties:{groupId:{type:"string"}} }, { ...mutation, destructiveHint:true }],
       ["locks.get", "locks", "Get worker protection state without password/verifier.", objectWithWorker(), read],
-      ["locks.set", "locks", "Set/change a worker protection password; values are write-only.", objectWithWorker(), mutation],
-      ["locks.remove", "locks", "Remove protection with its current password.", objectWithWorker(), { ...mutation, destructiveHint:true }],
+      ["locks.set", "locks", "Set/change a worker protection password; values are write-only.", lockSetInput(), mutation],
+      ["locks.remove", "locks", "Remove protection with its current password.", lockRemoveInput(), { ...mutation, destructiveHint:true }],
     ];
     return names.map(([name, group, description, inputSchema, annotations]) => ({ name, group, description, inputSchema, annotations }));
   }
@@ -97,15 +97,17 @@ export class ManagementWorkerDomain {
   private async groups(name:string,args:Record<string,unknown>) {
     const store=useWorkerGroupStore();
     if(name==="groups.list") return args.userId ? store.listForUser(required(args.userId,"userId")) : store.list();
-    if(name==="groups.create") { const userId=required(args.userId,"userId"), label=required(args.name,"name").trim(); if(!label||label.length>100) throw status(400,"Invalid group name"); return store.create(userId,label); }
+    if(name==="groups.create") { const userId=required(args.userId,"userId"), label=required(args.name,"name").trim(); if(!label||label.length>100) throw status(400,"Invalid group name"); return withWorkerNetworkMutation(userId,()=>store.create(userId,label)); }
     const group=store.findById(required(args.groupId,"groupId")); if(!group) throw status(404,"Worker group not found");
-    if(name==="groups.delete") { await store.remove(group.userId,group.id); return {id:group.id,deleted:true}; }
+    if(name==="groups.delete") { await deleteWorkerGroup(group.userId,group.id); return {id:group.id,deleted:true}; }
     const patch:{name?:string;workerIds?:string[]}={}; if(args.name!==undefined){const label=required(args.name,"name").trim();if(!label||label.length>100)throw status(400,"Invalid group name");patch.name=label;}
-    if(args.workerIds!==undefined){const ids=strings(args.workerIds,"workerIds");for(const id of ids){const worker=useWorkerStore().findById(id);if(!worker||worker.userId!==group.userId)throw status(400,"All workers must belong to group owner");}if(useManagedNetworkStore().listForUser(group.userId).some(network=>network.scope==="group"&&network.groupId===group.id))await verifyWorkerMutationUnlocks([...group.workerIds,...ids],args.lockPasswords);patch.workerIds=ids;}
-    return store.update(group.userId,group.id,patch);
+    if(args.workerIds!==undefined){const ids=strings(args.workerIds,"workerIds");for(const id of ids){const worker=useWorkerStore().findById(id);if(!worker||worker.userId!==group.userId)throw status(400,"All workers must belong to group owner");}patch.workerIds=ids;}
+    return updateWorkerGroupWithNetworks(group.userId,group.id,patch,args.lockPasswords);
   }
 }
 function objectWithWorker(){return {type:"object",required:["workerId"],properties:{workerId:{type:"string"},lockPassword:{type:"string",writeOnly:true}}};}
+function lockSetInput(){return {type:"object",required:["workerId","password"],properties:{workerId:{type:"string"},password:{type:"string",writeOnly:true},currentPassword:{type:"string",writeOnly:true}}};}
+function lockRemoveInput(){return {type:"object",required:["workerId","password"],properties:{workerId:{type:"string"},password:{type:"string",writeOnly:true}}};}
 function required(v:unknown,n:string){if(typeof v!=="string"||!v.trim())throw status(400,`${n} is required`);return v;}
 function optionalString(v:unknown){return typeof v==="string"?v:undefined;}
 function array(v:unknown){return Array.isArray(v)?v:undefined;}

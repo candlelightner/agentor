@@ -6,6 +6,7 @@ import {
 } from "./services";
 import { useStorageVisibilityManager } from "./storage-visibility";
 import { verifyWorkerMutationUnlocks } from "./worker-protection-lock";
+import { withWorkerNetworkMutation } from "./worker-group-manager";
 
 export interface ManagementPlatformTool {
   name: string;
@@ -46,6 +47,7 @@ export class ManagementPlatformDomain {
     }
     if (name === "networks.create") {
       const ownerId = required(args.ownerId, "ownerId");
+      return { handled: true, result: await withWorkerNetworkMutation(ownerId, async () => {
       const label = required(args.name, "name").trim();
       const scope = required(args.scope, "scope");
       if (!label || label.length > 100 || !["all", "selected", "group"].includes(scope))
@@ -65,12 +67,13 @@ export class ManagementPlatformDomain {
       try {
         const reconciliation = await manager.reconcile(saved);
         if (reconciliation.partialFailures.length) throw error(409, reconciliation.partialFailures.join("; "));
-        return { handled: true, result: { ...saved, reconciliation } };
+        return { ...saved, reconciliation };
       } catch (cause) {
         await manager.remove(saved).catch(() => {});
         await store.remove(ownerId, saved.id).catch(() => {});
         throw cause;
       }
+      }) };
     }
     const id = required(args.networkId, "networkId");
     const network = store.findById(id);
@@ -78,38 +81,48 @@ export class ManagementPlatformDomain {
     if (name === "networks.inspect")
       return { handled: true, result: { ...(await manager.topology(network)), validation: await manager.validate(network) } };
     if (name === "networks.delete") {
-      await verifyWorkerMutationUnlocks(await affectedWorkerIds(network), args.lockPasswords);
-      await manager.remove(network);
-      await store.remove(network.userId, id);
-      return { handled: true, result: { id, deleted: true } };
+      return { handled: true, result: await withWorkerNetworkMutation(network.userId, async () => {
+        const current=store.findById(id);if(!current||current.userId!==network.userId)throw error(404,"Managed network not found");
+        await verifyWorkerMutationUnlocks(await affectedWorkerIds(current), args.lockPasswords);
+        await manager.remove(current);
+        await store.remove(current.userId, id);
+        return { id, deleted: true };
+      }) };
     }
     if (name === "networks.reconcile")
-      { await verifyWorkerMutationUnlocks(await affectedWorkerIds(network), args.lockPasswords);
-      return { handled: true, result: await manager.reconcile(network) };
+      return { handled: true, result: await withWorkerNetworkMutation(network.userId, async () => {
+        const current=store.findById(id);if(!current||current.userId!==network.userId)throw error(404,"Managed network not found");
+        await verifyWorkerMutationUnlocks(await affectedWorkerIds(current), args.lockPasswords);
+        return manager.reconcile(current);
+      }) };
+    return { handled: true, result: await withWorkerNetworkMutation(network.userId, async () => {
+      const current=store.findById(id);if(!current||current.userId!==network.userId)throw error(404,"Managed network not found");
+      const patch: any = {};
+      if (args.name !== undefined) {
+        const label = required(args.name, "name").trim();
+        if (!label || label.length > 100) throw error(400, "Invalid network name");
+        patch.name = label;
       }
-    const patch: any = {};
-    if (args.name !== undefined) {
-      const label = required(args.name, "name").trim();
-      if (!label || label.length > 100) throw error(400, "Invalid network name");
-      patch.name = label;
-    }
-    if (args.scope !== undefined) {
-      const scope = required(args.scope, "scope");
-      if (!["all", "selected", "group"].includes(scope)) throw error(400, "Invalid network scope");
-      patch.scope = scope;
-    }
-    if (args.workerIds !== undefined) {
-      validateWorkers(network.userId, args.workerIds);
-      patch.workerIds = strings(args.workerIds);
-    }
-    await verifyWorkerMutationUnlocks([...await affectedWorkerIds(network), ...strings(args.workerIds)], args.lockPasswords);
-    if (args.groupId !== undefined) {
-      const groupId = optional(args.groupId);
-      if (groupId && !useWorkerGroupStore().get(network.userId, groupId)) throw error(400, "Group not found");
-      patch.groupId = groupId;
-    }
-    const updated = await store.update(network.userId, id, patch);
-    return { handled: true, result: { ...updated, reconciliation: await manager.reconcile(updated) } };
+      if (args.scope !== undefined) {
+        const scope = required(args.scope, "scope");
+        if (!["all", "selected", "group"].includes(scope)) throw error(400, "Invalid network scope");
+        patch.scope = scope;
+      }
+      if (args.workerIds !== undefined) {
+        validateWorkers(current.userId, args.workerIds);
+        patch.workerIds = strings(args.workerIds);
+      }
+      if (args.groupId !== undefined) {
+        const groupId = optional(args.groupId);
+        if (groupId && !useWorkerGroupStore().get(current.userId, groupId)) throw error(400, "Group not found");
+        patch.groupId = groupId;
+      }
+      const prospective={...current,...patch};
+      if(prospective.scope==="group"&&(!prospective.groupId||!useWorkerGroupStore().get(current.userId,prospective.groupId)))throw error(400,"Group not found");
+      await verifyWorkerMutationUnlocks([...await affectedWorkerIds(current), ...await affectedWorkerIds(prospective)], args.lockPasswords);
+      const updated = await store.update(current.userId, id, patch);
+      return { ...updated, reconciliation: await manager.reconcile(updated) };
+    }) };
   }
 }
 
