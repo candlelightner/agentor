@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test';
 import { goToDashboard } from '../helpers/ui-helpers';
+import { captureCommandOutput } from '../helpers/terminal-ws';
 
 test('real browser creates, builds, and promotes an approved-base image', async ({ page, request }) => {
   test.setTimeout(300_000);
@@ -13,7 +14,9 @@ test('real browser creates, builds, and promotes an approved-base image', async 
     await modal.getByPlaceholder('Definition name').fill(name);
     await modal.getByPlaceholder('Description').fill('Real browser controlled-build proof');
     await modal.getByPlaceholder('RUN apt-get update…').fill('RUN printf agentor-image-proof > /etc/agentor-image-proof');
+    const createResponse = page.waitForResponse(response => response.url().endsWith('/api/image-catalog/definitions') && response.request().method() === 'POST');
     await modal.getByRole('button', { name: 'Create definition' }).click();
+    definitionId = (await (await createResponse).json()).id;
     const article = modal.locator('article').filter({ hasText: name });
     await expect(article).toBeVisible();
     await article.getByRole('button', { name: 'Build', exact: true }).click();
@@ -24,13 +27,19 @@ test('real browser creates, builds, and promotes an approved-base image', async 
     await article.getByRole('button', { name: 'Create test worker' }).click();
     testWorkerId = (await (await testWorkerResponse).json()).workerId;
     expect(testWorkerId).toBeTruthy();
+    await expect.poll(async () => (await request.get(`/api/containers/${testWorkerId}`)).status(), { timeout: 60_000 }).toBe(200);
+    expect(await captureCommandOutput(testWorkerId, 'cat /etc/agentor-image-proof', 30_000)).toContain('agentor-image-proof');
     await article.getByRole('button', { name: 'Promote' }).click();
     await expect(article).toContainText('promoted');
 
-    const definitions = await (await request.get('/api/image-catalog/definitions')).json();
-    definitionId = definitions.find((candidate: any) => candidate.name === name)?.id || '';
   } finally {
-    if (testWorkerId) await request.delete(`/api/containers/${testWorkerId}`).catch(() => {});
-    if (definitionId) await request.delete(`/api/image-catalog/definitions/${definitionId}`).catch(() => {});
+    if (testWorkerId) {
+      const deleted = await request.delete(`/api/containers/${testWorkerId}`);
+      expect(deleted.ok()).toBe(true);
+    }
+    if (definitionId) {
+      const deleted = await request.delete(`/api/image-catalog/definitions/${definitionId}`);
+      expect(deleted.status()).toBe(204);
+    }
   }
 });

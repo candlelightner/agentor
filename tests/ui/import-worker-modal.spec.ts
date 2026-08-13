@@ -2,6 +2,7 @@ import { test, expect } from '@playwright/test';
 import { goToDashboard } from '../helpers/ui-helpers';
 import { ApiClient } from '../helpers/api-client';
 import { createWorker, cleanupWorker } from '../helpers/worker-lifecycle';
+import { captureCommandOutput } from '../helpers/terminal-ws';
 
 test.describe('Import worker modal', () => {
   test('opens from the sidebar Import button with file + name inputs', async ({ page }) => {
@@ -39,8 +40,10 @@ test.describe('Import worker modal', () => {
     test.setTimeout(240_000);
     const source = await createWorker(request, { displayName: `Import-source-${Date.now()}` });
     const importedName = `Import-browser-${Date.now()}`;
+    const marker = `IMPORT_BROWSER_${Date.now()}`;
     let importedId = '';
     try {
+      await captureCommandOutput(source.id, `printf %s ${marker} > /workspace/import-browser-marker`, 30_000);
       const api = new ApiClient(request);
       const created = await api.createExportJob(source.id, false);
       expect(created.status).toBe(202);
@@ -63,6 +66,7 @@ test.describe('Import worker modal', () => {
       const workers = await (await request.get('/api/containers')).json();
       importedId = workers.find((worker: any) => worker.displayName === importedName)?.id || '';
       expect(importedId).toBeTruthy();
+      expect(await captureCommandOutput(importedId, 'cat /workspace/import-browser-marker', 30_000)).toContain(marker);
     } finally {
       if (importedId) await cleanupWorker(request, importedId).catch(() => {});
       await cleanupWorker(request, source.id);

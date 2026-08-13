@@ -287,7 +287,6 @@ export class ImageCatalogManager {
   async removeDefinition(id: string, ownerId: string, admin: boolean) {
     const item = this.definition(id, ownerId, admin);
     if (
-      item.promotedVersion ||
       Object.values(this.state.userDefaults).some(
         (d) => d.definitionId === id,
       ) ||
