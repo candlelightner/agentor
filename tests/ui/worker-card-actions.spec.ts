@@ -70,6 +70,22 @@ test.describe('Worker card actions', () => {
     expect(statusPolls).toBeGreaterThan(1);
   });
 
+  test('real browser export reaches the durable API and downloads its artifact', async ({ page }) => {
+    test.setTimeout(180_000);
+    await goToDashboard(page);
+    const card = page.locator('.rounded-lg').filter({ hasText: displayName }).first();
+    const exportBtn = await findButtonByTooltip(card, page, 'Export worker');
+    await exportBtn.click();
+    const modal = page.locator('[data-testid="export-worker-modal"]');
+    await modal.locator('[data-testid="export-start"]').click();
+    await expect(modal).toContainText('succeeded', { timeout: 120_000 });
+    const downloadPromise = page.waitForEvent('download');
+    await modal.locator('[data-testid="export-download"]').click();
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toMatch(/worker-export\.tar$/);
+    expect((await download.createReadStream())).toBeTruthy();
+  });
+
   test('the action row is horizontally scrollable (no wrap)', async ({ page }) => {
     await goToDashboard(page);
     const card = page.locator('.rounded-lg').filter({ hasText: displayName }).first();
