@@ -36,9 +36,9 @@ services:
       # Self-signed CA cert isn't installed in the runner's trust store —
       # rejecting it would break the Traefik-specific tests' fetch().
       - NODE_TLS_REJECT_UNAUTHORIZED=0
-      # 8 workers by default. Override with `TEST_WORKERS=N` for ad-hoc
-      # tuning (e.g. `TEST_WORKERS=1` to debug serially).
-      - TEST_WORKERS=${TEST_WORKERS:-8}
+      # The broad suite shares installation-wide Docker/Traefik state and runs
+      # serially by default. Independent focused suites may opt into parallelism.
+      - TEST_WORKERS=${TEST_WORKERS:-1}
       - CI=${CI:-}
 
 volumes:

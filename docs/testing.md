@@ -5,8 +5,11 @@
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
-- Parallel execution with up to 8 workers (`TEST_WORKERS` env var overrides; CI forces 1)
-- All tests independent and self-cleaning
+- Reliable broad-suite default of one worker because lifecycle/network tests
+  intentionally exercise shared installation-wide Docker and Traefik state;
+  independent focused suites can opt into parallelism with `TEST_WORKERS`
+- Tests are self-cleaning; user/worker fixtures are isolated, while explicit
+  platform-management suites may share global policy or network state
 
 Per-file test counts are tracked in [`tests/TESTS.md`](../tests/TESTS.md).
 

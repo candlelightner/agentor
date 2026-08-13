@@ -11,10 +11,10 @@ export default defineConfig({
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: 2,
-  // 8 parallel workers by default on both host and the dockerized runner.
-  // `TEST_WORKERS` overrides for ad-hoc tuning (e.g. `TEST_WORKERS=1` to
-  // debug a flaky test serially); CI forces 1.
-  workers: process.env.CI ? 1 : (process.env.TEST_WORKERS ? Number(process.env.TEST_WORKERS) : 8),
+  // The complete suite mutates installation-wide Docker/Traefik and management
+  // policy state, so its reliable default is one worker. Focused suites whose
+  // files do not share global state may opt into parallelism with TEST_WORKERS.
+  workers: process.env.CI ? 1 : (process.env.TEST_WORKERS ? Number(process.env.TEST_WORKERS) : 1),
   globalSetup: './global-setup.ts',
   reporter: [
     ['html', { open: 'never' }],
