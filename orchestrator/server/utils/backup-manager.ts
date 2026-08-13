@@ -112,6 +112,9 @@ export class BackupManager {
           // Remove deterministic per-job scratch before publishing failure so
           // a hard restart cannot strand large encrypted/decrypted archives.
           await cleanupInterruptedBackupStaging(useConfig().dataDir, job.id);
+          if (job.pendingProviderObjectId && (job.provider === "local" || job.provider === "fake"))
+            await this.providers.get(job.provider)?.delete(job.userId, job.pendingProviderObjectId).catch(() => {});
+          job.pendingProviderObjectId = undefined;
           job.status = "failed";
           job.phase = "failed";
           job.error = "Backup interrupted by orchestrator restart";
@@ -759,6 +762,8 @@ export class BackupManager {
       job.progress = 60;
       await this.saveJob(job);
       pendingArtifactId = artifactId;
+      job.pendingProviderObjectId = artifactId;
+      await this.saveJob(job);
       resumableState = { artifactId, sha256: crypt.sha256, size: crypt.size };
       const uploaded = await this.providers.get(job.provider)!.upload(
         job.userId,
@@ -820,6 +825,7 @@ export class BackupManager {
       const data = this.store.get(job.userId);
       data.artifacts.push(artifact);
       pendingArtifactId = undefined;
+      job.pendingProviderObjectId = undefined;
       job.status = "succeeded";
       job.phase = "complete";
       job.progress = 100;

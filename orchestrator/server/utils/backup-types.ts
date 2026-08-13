@@ -16,6 +16,8 @@ export interface BackupJob {
   artifactId?: string; size?: number; durationMs?: number; sha256?: string; attempt: number;
   ownerId?: string; workspaceIds?: string[]; backupId?: string; sizeBytes?: number;
   encrypted?: boolean; integrityVerified?: boolean; providerUploadId?: string; resumedFromChunk?: number;
+  /** Durable cleanup marker set before a local/fake provider upload begins. */
+  pendingProviderObjectId?: string;
   consistency?: {workerState:string;strategy:string;warning:string}; target?:'new'|'original';workerId?:string;
   missingSecrets?: Array<{name:string;type:string}>;
 }
