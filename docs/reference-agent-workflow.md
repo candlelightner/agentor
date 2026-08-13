@@ -36,16 +36,19 @@ the service worker's network address or an intentionally exposed service URL.
 Create an image definition from the Image Catalog UI or the administrative
 MCP's image-definition capability. Use an approved base alias configured by the
 installation; `agentor-worker:approved-latest` is the built-in alias. The
-following JSON is the actual image-catalog definition shape. It uses the
-OmniRoute version available from npm at the time this document was verified
-(`3.8.49`); review and intentionally update that pin before a later rebuild.
+following JSON is the actual image-catalog definition shape. It is the combined
+Stage A image: Codex-LB `1.23.0`, uv `0.12.3`, and OmniRoute `3.8.49` were the
+current upstream releases when reverified on 2026-08-13. Codex-LB now requires
+Python 3.13, so uv installs that interpreter into the derived image without
+changing Agentor's system Python. Review and intentionally update all three
+pins before a later rebuild.
 
 ```json
 {
   "name": "routed-codex-tools",
-  "description": "Codex and OmniRoute tools; credentials are injected per worker at runtime.",
+  "description": "Codex-LB and OmniRoute combined experiment; credentials are injected per worker at runtime.",
   "baseImage": "agentor-worker:approved-latest",
-  "dockerfileFragment": "RUN npm install --global omniroute@3.8.49\n",
+  "dockerfileFragment": "RUN python3 -m pip install --no-cache-dir --break-system-packages uv==0.12.3 && uv python install 3.13 && UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python 3.13 codex-lb==1.23.0 && npm install --global omniroute@3.8.49\n",
   "contextFiles": []
 }
 ```
@@ -57,12 +60,11 @@ canonical base64 `contentBase64` when a harmless config or launcher is genuinely
 needed. Keep it empty for this example.
 
 Codex-LB is a Python application. Its upstream supported local command is
-`uvx codex-lb`; its supported container image is
-`ghcr.io/soju06/codex-lb:latest`. Do not blindly add an unpinned `latest` pull to
-an image definition. Prefer a separately managed service/test worker and pin a
-reviewed release or immutable image digest before turning it into a reusable
-definition. Its data must be on persistent worker storage (`~/.codex-lb` for a
-local `uvx` run, or `/var/lib/codex-lb` for its upstream container).
+`uvx codex-lb`; the combined definition installs the same package as a pinned uv
+tool so it can run beside OmniRoute in one test worker as required by Stage A.
+Its `~/.codex-lb` data is inside persistent agent storage. The upstream also
+publishes `ghcr.io/soju06/codex-lb:latest`, but this workflow deliberately does
+not pull an unpinned external base or bypass Agentor's approved-base boundary.
 
 Build asynchronously, inspect its job status and sanitized logs, then create a
 test worker from the immutable built version. Test it before promoting it as a
@@ -71,7 +73,8 @@ version is preferred; they do not make a mutable tag an image identity.
 
 ## 2. Start the routing services and complete the human login
 
-From the test worker's terminal/console, start the chosen service arrangement.
+From the test worker's terminal/console, start both services in that combined
+worker.
 For local development the upstream entry points are:
 
 | Project | Install/run | Dashboard | Client API |
@@ -161,6 +164,24 @@ also supports a URL key, Bearer authentication, and OAuth, but a local stdio
 server with `env_vars` avoids placing a key in a URL or serialized configuration.
 If the worker uses a restricted outbound-network environment, allow the Tavily
 API/MCP host through that environment's normal domain policy.
+
+## 5. Promote the routed worker template
+
+After the human login and endpoint checks succeed, create a second reusable
+approved-base definition for client workers. Its non-secret launcher should run
+`omniroute launch-codex --remote "$OMNIROUTE_URL"`; its Codex configuration may
+contain the Tavily stdio block above. The template declares only the names
+`OMNIROUTE_URL`, `OMNIROUTE_API_KEY`, and `TAVILY_API_KEY`. Set the URL as a
+worker-local variable and both keys as worker-local secrets when each worker is
+created. Do not put their values in the definition, context, template metadata,
+or launcher arguments.
+
+Build and test this definition through the same catalog job used for Stage A,
+then promote the tested immutable digest. Verify from the test worker that
+`omniroute` and `npx tavily-mcp` are discoverable, Codex sees the Tavily MCP
+entry, and the effective configuration reports the two key names as masked.
+The live OmniRoute/Tavily connectivity checks remain blocked until the user
+supplies those external credentials; promotion does not weaken that boundary.
 
 ## What is automated and what is not
 
