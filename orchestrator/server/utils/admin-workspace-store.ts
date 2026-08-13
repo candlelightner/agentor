@@ -116,8 +116,12 @@ export class AdminWorkspaceStore {
   }
   async rebuild() {
     await this.ensure();
-    if (this.runtime)
-      await this.applyRuntimeImage(await this.runtime.rebuild(this.record!));
+    if (!this.runtime)
+      throw Object.assign(
+        new Error("Administrative workspace runtime is unavailable"),
+        { statusCode: 503 },
+      );
+    await this.applyRuntimeImage(await this.runtime.rebuild(this.record!));
     this.record!.status = "running";
     this.record!.updatedAt = new Date().toISOString();
     await this.save();

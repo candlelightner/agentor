@@ -331,9 +331,16 @@ export class ContainerManager {
       // The worker UUID `id` is the only identifying label; resolve the
       // authoritative record (with userId + config) from the WorkerStore.
       const labelId = labels[WORKER_ID_LABEL] ?? '';
+      // DockerService also discovers Agentor-owned auxiliary containers (for
+      // example the persistent administrative workspace).  They deliberately
+      // have no ordinary-worker identity and must never be projected into the
+      // user-scoped WorkerStore.  Besides corrupting the inventory, doing so
+      // supplies an empty owner id and can abort the services plugin during an
+      // orchestrator restart before the administrative runtime is registered.
+      if (!labelId) continue;
       const worker = labelId ? this.workerStore?.findById(labelId) : undefined;
 
-      const id = worker?.id ?? labelId ?? dc.Id;
+      const id = worker?.id ?? labelId;
       const now = new Date().toISOString();
 
       this.containers.set(id, {
