@@ -95,6 +95,8 @@ async function streamExportIntoImport(
 }
 
 test.describe.serial('Asynchronous worker exports', () => {
+  // Retrying this serial group would repeat the multi-gigabyte rootfs proof.
+  test.describe.configure({ retries: 0 });
   let workerId = '';
 
   test.beforeAll(async ({ request }) => {
@@ -162,7 +164,14 @@ test.describe.serial('Asynchronous worker exports', () => {
   });
 
   test('explicit rootfs capture survives an export/import round trip', async ({ request }) => {
-    test.setTimeout(1_200_000);
+    // The standard worker image is intentionally feature-rich and a complete
+    // docker export + validated docker import can take more than 30 minutes on
+    // the nested-Docker CI host. This is the explicit advanced path: export is
+    // asynchronous and both directions stream, so the duration is not a UI or
+    // in-memory buffering timeout. Run the costly proof once, with headroom,
+    // instead of retrying the entire multi-gigabyte round trip.
+    test.info().annotations.push({ type: 'slow-path', description: 'Full rootfs Docker export/import round trip' });
+    test.setTimeout(2_700_000);
     const api = new ApiClient(request);
     const marker = `ROOTFS_EXPORT_${Date.now()}`;
     let importedId = '';
