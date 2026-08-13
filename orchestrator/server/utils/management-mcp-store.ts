@@ -849,7 +849,10 @@ function toolInputSchema(name: string) {
         ...(name === "console.read" ? { from: { type: "integer", minimum: 0 } } : {}),
       },
     };
-  return { type: "object", additionalProperties: true };
+  // Unknown tools must not advertise an unconstrained payload. Every supported
+  // tool should be declared by a domain; this fail-closed fallback prevents
+  // clients from inventing arguments for an unimplemented operation.
+  return { type: "object", additionalProperties: false, properties: {} };
 }
 function publicWorker(worker: any) {
   return {
