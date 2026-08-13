@@ -1,6 +1,9 @@
 import type { ManagedNetwork } from './managed-network-store';
 
 type Reconciliation = { workerIds: string[]; partialFailures: string[] };
+type ManagedNetworkPatch = Partial<
+  Pick<ManagedNetwork, 'name' | 'scope' | 'groupId' | 'workerIds'>
+>;
 
 /** Persist and reconcile a managed-network update as one recoverable unit.
  * Docker cannot provide a transaction, so every unsuccessful forward
@@ -9,9 +12,9 @@ type Reconciliation = { workerIds: string[]; partialFailures: string[] };
  * silently swallowed because desired/actual state may then require repair. */
 export async function updateManagedNetworkAtomically(
   current: ManagedNetwork,
-  patch: Partial<Pick<ManagedNetwork, 'name' | 'scope' | 'groupId' | 'workerIds'>>,
+  patch: ManagedNetworkPatch,
   dependencies: {
-    update: (userId: string, id: string, patch: typeof patch) => Promise<ManagedNetwork>;
+    update: (userId: string, id: string, patch: ManagedNetworkPatch) => Promise<ManagedNetwork>;
     reconcile: (network: ManagedNetwork) => Promise<Reconciliation>;
   },
 ): Promise<ManagedNetwork & { reconciliation: Reconciliation }> {
