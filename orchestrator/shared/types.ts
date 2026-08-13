@@ -54,7 +54,11 @@ export interface AppInstanceInfo {
 }
 
 export type NetworkMode =
-  "block-all" | "block" | "package-managers" | "full" | "custom";
+  | "block-all"
+  | "block"
+  | "package-managers"
+  | "full"
+  | "custom";
 
 export interface ServiceStatus {
   running: boolean;
@@ -62,13 +66,19 @@ export interface ServiceStatus {
 }
 
 export type ContainerStatus =
-  "creating" | "running" | "stopped" | "removing" | "error";
+  | "creating"
+  | "running"
+  | "stopped"
+  | "removing"
+  | "error";
 
 /** A worker. `id` is the worker's stable UUID identity (immutable across
  * rebuild/unarchive); `containerId`/`containerName` describe the current Docker
  * container (the `containerId` changes on every rebuild). Extends
  * `UserOwnedResource` so it carries `id`/`userId`/`createdAt`/`updatedAt`. */
 export interface ContainerInfo extends UserOwnedResource {
+  /** Trusted orchestrator-managed workspace; never eligible for ordinary worker lifecycle mutations. */
+  administrativeKind?: "platform" | "group";
   /** Current Docker container ID (64-hex; the short form is the in-container
    * hostname). Changes on every rebuild/unarchive — never use it as the worker's
    * identity (use `id`). */

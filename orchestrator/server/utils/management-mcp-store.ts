@@ -7,10 +7,12 @@ import {
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { useAdminWorkspaceStore } from "./admin-workspace-store";
+import { useGroupAdminWorkspaceStore } from "./group-admin-workspace-store";
 import {
   useConfig,
   useContainerManager,
   useExportJobManager,
+  useWorkerGroupStore,
   useWorkerStore,
 } from "./services";
 import { useBackupManager } from "./backup-manager";
@@ -24,7 +26,10 @@ import { workerConfigurationResponse } from "./worker-config-response";
 import { useWorkerConfigStore } from "./worker-config-store";
 import { useManagementConsoleStore } from "./management-console-store";
 import { ManagementWorkerDomain } from "./management-worker-domain";
-import { workspaceMcpTools, executeWorkspaceMcpTool } from "./management-mcp-workspace-adapter";
+import {
+  workspaceMcpTools,
+  executeWorkspaceMcpTool,
+} from "./management-mcp-workspace-adapter";
 import { ManagementImageBackupDomain } from "./management-image-backup-domain";
 import { ManagementPlatformDomain } from "./management-platform-domain";
 import { ManagementConfigurationCatalogDomain } from "./management-configuration-catalog-domain";
@@ -65,6 +70,60 @@ const GROUPS = [
   "configuration-proposals",
   "configuration-application",
 ] as const;
+/** Group principals expose only operations whose targets can be proven to be
+ * current group members. Platform/global catalog, policy, group mutation and
+ * import operations are intentionally absent. */
+const GROUP_ADMIN_TOOLS = new Set([
+  "status.system",
+  "workers.list",
+  "workers.inspect",
+  "workers.metrics.get",
+  "logs.read",
+  "volumes.list",
+  "volumes.list-files",
+  "configuration.inspect",
+  "worker.stop",
+  "worker.start",
+  "workers.update",
+  "workers.restart",
+  "workers.rebuild",
+  "workers.archive",
+  "workers.unarchive",
+  "workers.delete",
+  "configuration.get",
+  "configuration.set",
+  "console.open",
+  "console.read",
+  "console.write",
+  "console.interrupt",
+  "console.close",
+  "exports.create",
+  "exports.status",
+  "exports.cancel",
+  "exports.download",
+  "backups.create",
+  "backups.status",
+  "backups.cancel",
+  "locks.get",
+  "locks.set",
+  "locks.remove",
+  "apps.types",
+  "apps.list",
+  "apps.start",
+  "apps.stop",
+  "files.list",
+  "files.upload",
+  "files.mkdir",
+  "files.rename",
+  "files.move",
+  "files.delete",
+  "port-mappings.create",
+  "domain-mappings.create",
+  "workspaces.list",
+  "workspaces.files",
+  "workspaces.preview",
+  "workspaces.download",
+]);
 type Group = (typeof GROUPS)[number];
 const workerDomain = new ManagementWorkerDomain();
 const imageBackupDomain = new ManagementImageBackupDomain();
@@ -111,12 +170,17 @@ interface Identity {
   hash: string;
   workspaceId: string;
   expiresAt: number;
+  groupId?: string;
+  ownerId?: string;
 }
 interface IdentityMetadata {
   workspaceId: string;
   audience: "agentor-management-mcp";
   expiresAt: string;
   persistedInWorkspace: false;
+  scope: "platform" | "group";
+  groupId?: string;
+  ownerId?: string;
 }
 
 const TOOL_GROUP: Record<string, Group> = {
@@ -147,15 +211,21 @@ const TOOL_GROUP: Record<string, Group> = {
   "configuration.apply": "configuration-application",
 };
 for (const tool of workerDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
-for (const tool of workspaceMcpTools) TOOL_GROUP[tool.name] = tool.group as Group;
-for (const tool of imageBackupDomain.tools()) TOOL_GROUP[tool.name] ??= tool.group;
+for (const tool of workspaceMcpTools)
+  TOOL_GROUP[tool.name] = tool.group as Group;
+for (const tool of imageBackupDomain.tools())
+  TOOL_GROUP[tool.name] ??= tool.group;
 for (const tool of platformDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
-for (const tool of catalogDomain.tools()) TOOL_GROUP[tool.name] = tool.group as Group;
+for (const tool of catalogDomain.tools())
+  TOOL_GROUP[tool.name] = tool.group as Group;
 for (const tool of exposureDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
-for (const tool of runningFilesDomain.tools()) TOOL_GROUP[tool.name] = tool.group as Group;
-for (const tool of logsDomain.tools()) TOOL_GROUP[tool.name] = tool.group as Group;
+for (const tool of runningFilesDomain.tools())
+  TOOL_GROUP[tool.name] = tool.group as Group;
+for (const tool of logsDomain.tools())
+  TOOL_GROUP[tool.name] = tool.group as Group;
 for (const tool of statusDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
-for (const tool of globalConfigurationDomain.tools()) TOOL_GROUP[tool.name] = tool.group as Group;
+for (const tool of globalConfigurationDomain.tools())
+  TOOL_GROUP[tool.name] = tool.group as Group;
 for (const tool of importDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 const sensitive =
   /secret|token|credential|password|authorization|cookie|cipher|key/i;
@@ -241,28 +311,80 @@ export class ManagementMcpStore {
     await this.init();
     return structuredClone(this.state.policy);
   }
-  async listTools() {
+  async listTools(identity?: IdentityMetadata) {
     await this.init();
     return Object.keys(TOOL_GROUP)
       .filter((name) => this.state.policy.groups[TOOL_GROUP[name]!]!.enabled)
+      .filter(
+        (name) => identity?.scope !== "group" || GROUP_ADMIN_TOOLS.has(name),
+      )
       .map((name) => {
-      const domain = workerDomain.tools().find((tool) => tool.name === name);
-      const workspace = workspaceMcpTools.find((tool) => tool.name === name);
-      const imageBackup = imageBackupDomain.tools().find((tool) => tool.name === name);
-      const platform = platformDomain.tools().find((tool) => tool.name === name);
-      const catalog = catalogDomain.tools().find((tool) => tool.name === name);
-      const exposure = exposureDomain.tools().find((tool) => tool.name === name);
-      const runningFiles = runningFilesDomain.tools().find((tool) => tool.name === name);
-      const logs = logsDomain.tools().find((tool) => tool.name === name);
-      const status = statusDomain.tools().find((tool) => tool.name === name);
-      const globalConfiguration = globalConfigurationDomain.tools().find((tool) => tool.name === name);
-      const imports = importDomain.tools().find((tool) => tool.name === name);
-      return {
-      name,
-      description: domain?.description || workspace?.description || imageBackup?.description || platform?.description || catalog?.description || exposure?.description || runningFiles?.description || logs?.description || status?.description || globalConfiguration?.description || imports?.description || `Agentor management tool (${TOOL_GROUP[name]})`,
-      inputSchema: domain?.inputSchema || workspace?.inputSchema || imageBackup?.inputSchema || platform?.inputSchema || catalog?.inputSchema || exposure?.inputSchema || runningFiles?.inputSchema || logs?.inputSchema || status?.inputSchema || globalConfiguration?.inputSchema || imports?.inputSchema || toolInputSchema(name),
-      annotations: domain?.annotations || workspace?.annotations || imageBackup?.annotations || platform?.annotations || catalog?.annotations || exposure?.annotations || runningFiles?.annotations || logs?.annotations || status?.annotations || globalConfiguration?.annotations || imports?.annotations || toolAnnotations(name),
-    }});
+        const domain = workerDomain.tools().find((tool) => tool.name === name);
+        const workspace = workspaceMcpTools.find((tool) => tool.name === name);
+        const imageBackup = imageBackupDomain
+          .tools()
+          .find((tool) => tool.name === name);
+        const platform = platformDomain
+          .tools()
+          .find((tool) => tool.name === name);
+        const catalog = catalogDomain
+          .tools()
+          .find((tool) => tool.name === name);
+        const exposure = exposureDomain
+          .tools()
+          .find((tool) => tool.name === name);
+        const runningFiles = runningFilesDomain
+          .tools()
+          .find((tool) => tool.name === name);
+        const logs = logsDomain.tools().find((tool) => tool.name === name);
+        const status = statusDomain.tools().find((tool) => tool.name === name);
+        const globalConfiguration = globalConfigurationDomain
+          .tools()
+          .find((tool) => tool.name === name);
+        const imports = importDomain.tools().find((tool) => tool.name === name);
+        return {
+          name,
+          description:
+            domain?.description ||
+            workspace?.description ||
+            imageBackup?.description ||
+            platform?.description ||
+            catalog?.description ||
+            exposure?.description ||
+            runningFiles?.description ||
+            logs?.description ||
+            status?.description ||
+            globalConfiguration?.description ||
+            imports?.description ||
+            `Agentor management tool (${TOOL_GROUP[name]})`,
+          inputSchema:
+            domain?.inputSchema ||
+            workspace?.inputSchema ||
+            imageBackup?.inputSchema ||
+            platform?.inputSchema ||
+            catalog?.inputSchema ||
+            exposure?.inputSchema ||
+            runningFiles?.inputSchema ||
+            logs?.inputSchema ||
+            status?.inputSchema ||
+            globalConfiguration?.inputSchema ||
+            imports?.inputSchema ||
+            toolInputSchema(name),
+          annotations:
+            domain?.annotations ||
+            workspace?.annotations ||
+            imageBackup?.annotations ||
+            platform?.annotations ||
+            catalog?.annotations ||
+            exposure?.annotations ||
+            runningFiles?.annotations ||
+            logs?.annotations ||
+            status?.annotations ||
+            globalConfiguration?.annotations ||
+            imports?.annotations ||
+            toolAnnotations(name),
+        };
+      });
   }
   async updatePolicy(groups: Record<string, unknown>, actor: string) {
     await this.init();
@@ -279,7 +401,9 @@ export class ManagementMcpStore {
   async issue(workspaceId: string, ttlSeconds = 60) {
     this.pruneExpiredIdentities();
     const workspace = await useAdminWorkspaceStore().ensure();
-    if (workspace.id !== workspaceId)
+    const groupWorkspace =
+      useGroupAdminWorkspaceStore().findByWorkspaceId(workspaceId);
+    if (workspace.id !== workspaceId && !groupWorkspace)
       throw Object.assign(
         new Error("Identity is restricted to the administrative workspace"),
         { statusCode: 403 },
@@ -289,13 +413,23 @@ export class ManagementMcpStore {
     const expiresAt =
       Date.now() +
       Math.min(60, Number.isFinite(ttlSeconds) ? ttlSeconds : 60) * 1000;
-    this.identities.set(hash, { hash, workspaceId, expiresAt });
+    this.identities.set(hash, {
+      hash,
+      workspaceId,
+      expiresAt,
+      groupId: groupWorkspace?.groupId,
+      ownerId: groupWorkspace?.ownerId,
+    });
     return {
       credential: `mcp1.${raw}`,
       workspaceId,
       audience: "agentor-management-mcp",
       expiresAt: new Date(expiresAt).toISOString(),
       persistedInWorkspace: false,
+      scope: groupWorkspace ? "group" : "platform",
+      ...(groupWorkspace
+        ? { groupId: groupWorkspace.groupId, ownerId: groupWorkspace.ownerId }
+        : {}),
     };
   }
   private find(credential: unknown) {
@@ -330,11 +464,23 @@ export class ManagementMcpStore {
       throw Object.assign(new Error("Workload identity binding mismatch"), {
         statusCode: 403,
       });
+    if (id.groupId) {
+      const live = useGroupAdminWorkspaceStore().findByWorkspaceId(
+        id.workspaceId,
+      );
+      if (!live || live.groupId !== id.groupId)
+        throw Object.assign(
+          new Error("Group administrative workspace is no longer authorized"),
+          { statusCode: 403 },
+        );
+    }
     return {
       workspaceId: id.workspaceId,
       audience: "agentor-management-mcp",
       expiresAt: new Date(id.expiresAt).toISOString(),
       persistedInWorkspace: false,
+      scope: id.groupId ? "group" : "platform",
+      ...(id.groupId ? { groupId: id.groupId, ownerId: id.ownerId } : {}),
     };
   }
   async auditAuthorizationFailure(operation: string) {
@@ -377,6 +523,8 @@ export class ManagementMcpStore {
         });
       }
       await validateManagementOwnerArguments(args);
+      if (identity.scope === "group")
+        await this.authorizeGroupInvocation(identity, name, args);
       let result: unknown;
       if (name === "configuration.propose") {
         const patch = validateConfigurationProposal(args.patch);
@@ -458,7 +606,12 @@ export class ManagementMcpStore {
           pendingRebuild: true,
         };
       } else {
-        result = await this.executeTool(name, args, identity.workspaceId);
+        result = await this.executeTool(
+          name,
+          args,
+          identity.workspaceId,
+          identity,
+        );
       }
       await this.audit("tool.invoked", "success", {
         workspaceId: identity.workspaceId,
@@ -480,7 +633,12 @@ export class ManagementMcpStore {
       throw error;
     }
   }
-  async uploadImport(credential: unknown, token: string, source: Readable, declaredLength?: number) {
+  async uploadImport(
+    credential: unknown,
+    token: string,
+    source: Readable,
+    declaredLength?: number,
+  ) {
     let identity;
     try {
       identity = await this.introspect(credential);
@@ -490,12 +648,25 @@ export class ManagementMcpStore {
     }
     try {
       await this.init();
-      if (!this.state.policy.groups.exports.enabled) throw Object.assign(new Error("Tool denied by policy"), { statusCode: 403 });
-      const result = await importDomain.upload(identity.workspaceId, token, source, declaredLength);
-      await this.audit("import.uploaded", "success", { workspaceId: identity.workspaceId });
+      if (!this.state.policy.groups.exports.enabled)
+        throw Object.assign(new Error("Tool denied by policy"), {
+          statusCode: 403,
+        });
+      const result = await importDomain.upload(
+        identity.workspaceId,
+        token,
+        source,
+        declaredLength,
+      );
+      await this.audit("import.uploaded", "success", {
+        workspaceId: identity.workspaceId,
+      });
       return result;
     } catch (error: any) {
-      await this.audit("import.uploaded", "failure", { workspaceId: identity.workspaceId, statusCode: error?.statusCode || 500 });
+      await this.audit("import.uploaded", "failure", {
+        workspaceId: identity.workspaceId,
+        statusCode: error?.statusCode || 500,
+      });
       throw error;
     }
   }
@@ -515,13 +686,38 @@ export class ManagementMcpStore {
       const opened = await downloadDomain.open(
         identity.workspaceId,
         token,
-        (group) => {
+        async (prepared) => {
           // Handoffs can outlive the MCP call that prepared them, so consult
           // the authoritative policy again at redemption time.
-          if (!this.state.policy.groups[group]?.enabled)
+          if (!this.state.policy.groups[prepared.capability]?.enabled)
             throw Object.assign(new Error("Tool denied by policy"), {
               statusCode: 403,
             });
+          if (identity.scope === "group") {
+            const ids = this.groupWorkerIds(identity);
+            if (prepared.kind === "workspace") {
+              if (!ids.has(prepared.workspaceId))
+                throw Object.assign(
+                  new Error(
+                    "Download target is outside the administrative group scope",
+                  ),
+                  { statusCode: 403 },
+                );
+            } else {
+              const job = await useExportJobManager().get(prepared.jobId);
+              if (
+                !job ||
+                !ids.has(job.workerId) ||
+                job.userId !== identity.ownerId
+              )
+                throw Object.assign(
+                  new Error(
+                    "Download target is outside the administrative group scope",
+                  ),
+                  { statusCode: 403 },
+                );
+            }
+          }
         },
       );
       await this.audit("download.opened", "success", {
@@ -548,6 +744,7 @@ export class ManagementMcpStore {
     name: string,
     args: Record<string, unknown>,
     workspaceId: string,
+    identity?: IdentityMetadata,
   ): Promise<any> {
     // Validate the MCP envelope before entering any domain manager. In
     // particular, missing ownerId must not trigger backup/image store
@@ -555,7 +752,10 @@ export class ManagementMcpStore {
     validateToolArguments(name, args);
     const domain = await workerDomain.execute(name, args);
     if (domain.handled) return domain.result;
-    const imageBackup = await imageBackupDomain.execute(name, await compatibleDomainArguments(name, args));
+    const imageBackup = await imageBackupDomain.execute(
+      name,
+      await compatibleDomainArguments(name, args),
+    );
     if (imageBackup.handled) return imageBackup.result;
     const platform = await platformDomain.execute(name, args);
     if (platform.handled) return platform.result;
@@ -569,31 +769,47 @@ export class ManagementMcpStore {
     if (logs.handled) return logs.result;
     const status = await statusDomain.execute(name, args);
     if (status.handled) return status.result;
-    const globalConfiguration = await globalConfigurationDomain.execute(name, args);
+    const globalConfiguration = await globalConfigurationDomain.execute(
+      name,
+      args,
+    );
     if (globalConfiguration.handled) return globalConfiguration.result;
     const imported = await importDomain.execute(name, args, workspaceId);
     if (imported.handled) return imported.result;
     const download = await downloadDomain.execute(name, args, workspaceId);
     if (download.handled) return download.result;
-    if (workspaceMcpTools.some((tool) => tool.name === name))
-      return executeWorkspaceMcpTool(name, args);
+    if (workspaceMcpTools.some((tool) => tool.name === name)) {
+      const result = await executeWorkspaceMcpTool(name, args);
+      if (name === "workspaces.list" && identity?.scope === "group") {
+        const ids = this.groupWorkerIds(identity);
+        return {
+          workspaces: result.workspaces.filter((item: any) => ids.has(item.id)),
+        };
+      }
+      return result;
+    }
     const workerId = typeof args.workerId === "string" ? args.workerId : "";
     const worker = workerId
       ? (useContainerManager().get(workerId) ??
         useWorkerStore().findById(workerId))
       : undefined;
+    const visibleWorkers = () =>
+      identity?.scope === "group"
+        ? this.groupWorkers(identity)
+        : [...useContainerManager().list(), ...useWorkerStore().listArchived()];
     if (name === "status.system")
       return {
         status: "ok",
-        workers: useContainerManager().list().length,
-        archived: useWorkerStore().listArchived().length,
+        workers: visibleWorkers().filter(
+          (item: any) => item.status !== "archived",
+        ).length,
+        archived: visibleWorkers().filter(
+          (item: any) => item.status === "archived" || item.archivedAt,
+        ).length,
       };
     if (name === "workers.list")
       return {
-        workers: [
-          ...useContainerManager().list(),
-          ...useWorkerStore().listArchived(),
-        ].map(publicWorker),
+        workers: [...visibleWorkers()].map(publicWorker),
       };
     if (name === "workers.inspect") {
       if (!worker) throw statusError(404, "Worker not found");
@@ -601,9 +817,13 @@ export class ManagementMcpStore {
     }
     if (name === "volumes.list")
       return {
-        workspaces: (await listWorkspaceInventory(true)).map(
-          publicWorkspaceInventoryItem,
-        ),
+        workspaces: (await listWorkspaceInventory(true))
+          .filter(
+            (item) =>
+              identity?.scope !== "group" ||
+              this.groupWorkerIds(identity).has(item.id),
+          )
+          .map(publicWorkspaceInventoryItem),
       };
     if (name === "volumes.list-files") {
       const item = (await listWorkspaceInventory(true)).find(
@@ -628,16 +848,30 @@ export class ManagementMcpStore {
       const consoles = useManagementConsoleStore();
       if (name === "console.open") {
         if (!worker) throw statusError(404, "Worker not found");
-        return consoles.open(workspaceId, worker.id, Number(args.windowIndex ?? 0));
+        return consoles.open(
+          workspaceId,
+          worker.id,
+          Number(args.windowIndex ?? 0),
+        );
       }
       const sessionId = String(args.sessionId || "");
       if (!sessionId) throw statusError(400, "sessionId required");
       if (name === "console.read")
-        return consoles.read(workspaceId, sessionId, Number.isInteger(args.from) ? Number(args.from) : undefined);
+        return consoles.read(
+          workspaceId,
+          sessionId,
+          Number.isInteger(args.from) ? Number(args.from) : undefined,
+        );
       if (name === "console.write")
-        return consoles.write(workspaceId, sessionId, typeof args.input === "string" ? args.input : "");
-      if (name === "console.interrupt") return consoles.interrupt(workspaceId, sessionId);
-      if (name === "console.close") return consoles.close(workspaceId, sessionId);
+        return consoles.write(
+          workspaceId,
+          sessionId,
+          typeof args.input === "string" ? args.input : "",
+        );
+      if (name === "console.interrupt")
+        return consoles.interrupt(workspaceId, sessionId);
+      if (name === "console.close")
+        return consoles.close(workspaceId, sessionId);
     }
     if (name === "exports.create") {
       if (!worker) throw statusError(404, "Worker not found");
@@ -690,6 +924,102 @@ export class ManagementMcpStore {
       return catalog.publicBuild(String(args.buildId || ""), "", true);
     }
     return { result: "redacted", workspaceId };
+  }
+  private groupWorkerIds(identity: IdentityMetadata) {
+    const group = identity.groupId
+      ? useWorkerGroupStore().findById(identity.groupId)
+      : undefined;
+    if (!group || group.userId !== identity.ownerId)
+      throw Object.assign(new Error("Group scope is no longer valid"), {
+        statusCode: 403,
+      });
+    const owned = new Set(
+      [...useContainerManager().list(), ...useWorkerStore().listArchived()]
+        .filter((worker) => worker.userId === identity.ownerId)
+        .map((worker) => worker.id),
+    );
+    return new Set(group.workerIds.filter((id) => owned.has(id)));
+  }
+  private groupWorkers(identity: IdentityMetadata) {
+    const ids = this.groupWorkerIds(identity);
+    return [
+      ...useContainerManager().list(),
+      ...useWorkerStore().listArchived(),
+    ].filter(
+      (worker) => ids.has(worker.id) && worker.userId === identity.ownerId,
+    );
+  }
+  private async authorizeGroupInvocation(
+    identity: IdentityMetadata,
+    name: string,
+    args: Record<string, unknown>,
+  ) {
+    if (!GROUP_ADMIN_TOOLS.has(name))
+      throw Object.assign(
+        new Error("Tool is unavailable to group administrative workspaces"),
+        { statusCode: 403 },
+      );
+    if (args.ownerId !== undefined && args.ownerId !== identity.ownerId)
+      throw Object.assign(
+        new Error("Owner is outside the administrative group scope"),
+        { statusCode: 403 },
+      );
+    const ids = this.groupWorkerIds(identity);
+    if (
+      ["exports.status", "exports.cancel", "exports.download"].includes(name)
+    ) {
+      const job = await useExportJobManager().get(String(args.jobId || ""));
+      if (!job || !ids.has(job.workerId))
+        throw Object.assign(
+          new Error("Export job is outside the administrative group scope"),
+          { statusCode: 403 },
+        );
+    }
+    if (["backups.status", "backups.cancel"].includes(name)) {
+      const job = await useBackupManager().getJob(String(args.jobId || ""));
+      const targets =
+        job?.workspaceIds ?? (job?.workspaceId ? [job.workspaceId] : []);
+      if (!job || !targets.length || targets.some((id) => !ids.has(id)))
+        throw Object.assign(
+          new Error("Backup job is outside the administrative group scope"),
+          { statusCode: 403 },
+        );
+    }
+    if (name.startsWith("console.") && name !== "console.open") {
+      const sessionId =
+        typeof args.sessionId === "string" ? args.sessionId : "";
+      const target = useManagementConsoleStore().target(
+        identity.workspaceId,
+        sessionId,
+      );
+      if (!target || !ids.has(target)) {
+        if (target)
+          void useManagementConsoleStore()
+            .close(identity.workspaceId, sessionId)
+            .catch(() => undefined);
+        throw Object.assign(
+          new Error("Console target is outside the administrative group scope"),
+          { statusCode: 403 },
+        );
+      }
+    }
+    for (const key of ["workerId", "workspaceId"] as const)
+      if (typeof args[key] === "string" && !ids.has(args[key] as string))
+        throw Object.assign(
+          new Error("Worker is outside the administrative group scope"),
+          { statusCode: 403 },
+        );
+    for (const key of ["workerIds", "workspaceIds"] as const)
+      if (
+        Array.isArray(args[key]) &&
+        (args[key] as unknown[]).some(
+          (value) => typeof value !== "string" || !ids.has(value),
+        )
+      )
+        throw Object.assign(
+          new Error("Worker is outside the administrative group scope"),
+          { statusCode: 403 },
+        );
   }
   async approve(id: string, actor: string) {
     await this.init();
@@ -751,25 +1081,45 @@ function statusError(statusCode: number, message: string) {
 }
 function validateToolArguments(name: string, args: Record<string, unknown>) {
   const definitions = [
-    ...workerDomain.tools(), ...workspaceMcpTools, ...imageBackupDomain.tools(),
-    ...platformDomain.tools(), ...catalogDomain.tools(), ...exposureDomain.tools(),
-    ...runningFilesDomain.tools(), ...logsDomain.tools(), ...statusDomain.tools(),
-    ...globalConfigurationDomain.tools(), ...importDomain.tools(),
+    ...workerDomain.tools(),
+    ...workspaceMcpTools,
+    ...imageBackupDomain.tools(),
+    ...platformDomain.tools(),
+    ...catalogDomain.tools(),
+    ...exposureDomain.tools(),
+    ...runningFilesDomain.tools(),
+    ...logsDomain.tools(),
+    ...statusDomain.tools(),
+    ...globalConfigurationDomain.tools(),
+    ...importDomain.tools(),
   ];
-  const schema = definitions.find((tool) => tool.name === name)?.inputSchema || toolInputSchema(name);
-  const required = Array.isArray((schema as any)?.required) ? (schema as any).required : [];
+  const schema =
+    definitions.find((tool) => tool.name === name)?.inputSchema ||
+    toolInputSchema(name);
+  const required = Array.isArray((schema as any)?.required)
+    ? (schema as any).required
+    : [];
   for (const key of required) {
     const value = args[key];
     if (value === undefined || value === null || value === "")
       throw statusError(400, `${name}: ${key} is required`);
   }
 }
-async function compatibleDomainArguments(name: string, args: Record<string, unknown>) {
-  if (args.ownerId || (!name.startsWith("images.") && !name.startsWith("backups."))) return args;
+async function compatibleDomainArguments(
+  name: string,
+  args: Record<string, unknown>,
+) {
+  if (
+    args.ownerId ||
+    (!name.startsWith("images.") && !name.startsWith("backups."))
+  )
+    return args;
   if (name.startsWith("images.") && typeof args.definitionId === "string") {
     const catalog = useImageCatalogManager();
     await catalog.init();
-    const definition = catalog.list("", true).find((item) => item.id === args.definitionId);
+    const definition = catalog
+      .list("", true)
+      .find((item) => item.id === args.definitionId);
     if (definition) return { ...args, ownerId: definition.ownerId };
   }
   if (name === "backups.create" && Array.isArray(args.workspaceIds)) {
@@ -783,8 +1133,12 @@ async function compatibleDomainArguments(name: string, args: Record<string, unkn
   return args;
 }
 function toolAnnotations(name: string) {
-  const readOnly = /(?:\.list|\.inspect|\.status|\.read|list-files|validate|build-status)$/.test(name) || name === "status.system";
-  const destructive = /(?:\.delete|\.cancel|\.remove|\.rollback|console\.close)$/.test(name);
+  const readOnly =
+    /(?:\.list|\.inspect|\.status|\.read|list-files|validate|build-status)$/.test(
+      name,
+    ) || name === "status.system";
+  const destructive =
+    /(?:\.delete|\.cancel|\.remove|\.rollback|console\.close)$/.test(name);
   return {
     title: name,
     readOnlyHint: readOnly,
@@ -795,17 +1149,52 @@ function toolAnnotations(name: string) {
 }
 function toolInputSchema(name: string) {
   if (name === "configuration.inspect")
-    return { type: "object", additionalProperties: false, required: ["workerId"], properties: { workerId: { type: "string", minLength: 1 } } };
-  if (name === "status.system" || name === "workers.list" || name === "volumes.list")
+    return {
+      type: "object",
+      additionalProperties: false,
+      required: ["workerId"],
+      properties: { workerId: { type: "string", minLength: 1 } },
+    };
+  if (
+    name === "status.system" ||
+    name === "workers.list" ||
+    name === "volumes.list"
+  )
     return { type: "object", additionalProperties: false, properties: {} };
   if (name === "workers.inspect")
-    return { type: "object", additionalProperties: false, required: ["workerId"], properties: { workerId: { type: "string", minLength: 1 } } };
+    return {
+      type: "object",
+      additionalProperties: false,
+      required: ["workerId"],
+      properties: { workerId: { type: "string", minLength: 1 } },
+    };
   if (name === "volumes.list-files")
-    return { type: "object", additionalProperties: false, required: ["workspaceId"], properties: { workspaceId: { type: "string", minLength: 1 }, path: { type: "string" } } };
+    return {
+      type: "object",
+      additionalProperties: false,
+      required: ["workspaceId"],
+      properties: {
+        workspaceId: { type: "string", minLength: 1 },
+        path: { type: "string" },
+      },
+    };
   if (name === "exports.create")
-    return { type: "object", additionalProperties: false, required: ["workerId"], properties: { workerId: { type: "string", minLength: 1 }, includeRootfs: { type: "boolean" } } };
+    return {
+      type: "object",
+      additionalProperties: false,
+      required: ["workerId"],
+      properties: {
+        workerId: { type: "string", minLength: 1 },
+        includeRootfs: { type: "boolean" },
+      },
+    };
   if (name === "exports.status" || name === "exports.cancel")
-    return { type: "object", additionalProperties: false, required: ["jobId"], properties: { jobId: { type: "string", minLength: 1 } } };
+    return {
+      type: "object",
+      additionalProperties: false,
+      required: ["jobId"],
+      properties: { jobId: { type: "string", minLength: 1 } },
+    };
   if (name === "configuration.apply")
     return {
       type: "object",
@@ -849,7 +1238,10 @@ function toolInputSchema(name: string) {
       type: "object",
       additionalProperties: false,
       required: ["sessionId", "input"],
-      properties: { sessionId: { type: "string" }, input: { type: "string", maxLength: 65536 } },
+      properties: {
+        sessionId: { type: "string" },
+        input: { type: "string", maxLength: 65536 },
+      },
     };
   if (["console.read", "console.interrupt", "console.close"].includes(name))
     return {
@@ -858,7 +1250,9 @@ function toolInputSchema(name: string) {
       required: ["sessionId"],
       properties: {
         sessionId: { type: "string" },
-        ...(name === "console.read" ? { from: { type: "integer", minimum: 0 } } : {}),
+        ...(name === "console.read"
+          ? { from: { type: "integer", minimum: 0 } }
+          : {}),
       },
     };
   // Unknown tools must not advertise an unconstrained payload. Every supported
@@ -987,7 +1381,10 @@ export function normalizeManagementMcpState(
   )
     ? {
         logLevel: input.appliedConfiguration.logLevel as
-          "debug" | "info" | "warn" | "error",
+          | "debug"
+          | "info"
+          | "warn"
+          | "error",
       }
     : undefined;
   const state: State = {

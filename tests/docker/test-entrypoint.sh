@@ -248,5 +248,14 @@ fi
 log "Tearing down inner agentor stack..."
 docker compose -f /opt/test-stack/stack.yml -p agentor-test down -v --remove-orphans 2>/dev/null || true
 
+# Playwright runs as root inside this privileged runner. Return generated
+# artifacts to the bind-mount owner so local follow-up commands can replace or
+# inspect them without sudo after either a passing or failing Dockerized run.
+ARTIFACT_UID=$(stat -c '%u' /work/tests/package.json)
+ARTIFACT_GID=$(stat -c '%g' /work/tests/package.json)
+for artifact in /work/tests/.auth /work/tests/test-results /work/tests/playwright-report; do
+    [ ! -e "$artifact" ] || chown -R "$ARTIFACT_UID:$ARTIFACT_GID" "$artifact"
+done
+
 log "Done. Exit code: $EXIT"
 exit $EXIT

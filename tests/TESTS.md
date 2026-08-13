@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **1614 tests** across 153 test files (1036 API across 94 files + 578 UI across 59 files)
+- **1621 tests** across 154 test files (1043 API across 95 files + 578 UI across 59 files)
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -12,7 +12,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 - All tests independent and self-cleaning
 - **All tests run pre-authenticated as an admin user** via Playwright's `globalSetup` (see `tests/global-setup.ts`). The session cookies are saved to `tests/.auth/admin-api.json` and `tests/.auth/admin-ui.json`, referenced by the API and UI project `storageState` respectively.
 
-Worker-group coverage is in `api/worker-groups.spec.ts` (3 API tests) and `ui/worker-groups.spec.ts` (1 UI test): CRUD, owner-scoped membership validation, deletion that retains workers, API/MCP parity for protected old/new membership, real Docker reconciliation of every dependent network, and 409 state preservation while a network still references the group.
+Worker-group coverage is in `api/worker-groups.spec.ts` (3 API tests), `api/group-admin-management-mcp.spec.ts` (7 API tests), and `ui/worker-groups.spec.ts` (1 UI test): CRUD, owner-scoped membership validation, deletion that retains workers, API/MCP parity for protected old/new membership, real Docker reconciliation of every dependent network, group-admin lifecycle/private-network identity and real MCP reachability, filtered discovery, immediate membership grant/revocation (including prepared downloads), real lifecycle side effects, and dashboard controls.
 
 Managed-network coverage is in `api/managed-networks.spec.ts` (bridge create/topology/delete and validation rejection) plus the multi-network group reconciliation and API/MCP parity flow in `api/worker-groups.spec.ts`.
 
@@ -102,13 +102,13 @@ tests/
     worker-lifecycle.ts    # Container create/cleanup utilities
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
-  api/                     # API endpoint tests (1036 tests across 94 files)
+  api/                     # API endpoint tests (1043 tests across 95 files)
   ui/                      # UI interaction tests (578 tests across 59 files)
 ```
 
 ## Test Categories
 
-### API Tests (1036 tests, 94 files)
+### API Tests (1043 tests, 95 files)
 
 | `worker-protection-lock.spec.ts` | 6 | Password-verifier-only worker locks: set/change/remove validation, no password/hash disclosure, required lock credentials on settings/configuration/archive/unarchive, running-workspace file mutations, managed-network membership, stop/restart alternate lifecycle paths, and correct-password recovery. |
 

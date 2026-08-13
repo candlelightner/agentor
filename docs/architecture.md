@@ -163,6 +163,49 @@ The MCP transport listens only on the orchestrator's management-network address.
 
 The console capability opens bounded linked-tmux sessions inside a selected running worker and binds each session to its creating administrative workspace. It has no host-command target, bounds input and retained output, redacts exact managed worker-local secret values in returned output, expires idle sessions, and cleans the linked session on close, stream failure, or expiry. Console redaction is best effort, not a general secret-transformation detector or a guarantee for account/environment values; treat console access as privileged.
 
+### Per-group administrative workspaces
+
+A worker group may have one trusted **group administrative workspace**. It uses
+the same digest-pinned overlay, persistent workspace/agent storage, local
+stdio bridge, and rotating tmpfs credential model as the
+platform administrative workspace, but its workload identity is bound to one
+specific group and its owner. It is not an ordinary member worker and it is not
+itself a group-management target.
+
+Each group workspace has its own internal
+`agentor-management-group-<groupId>` network shared only with the orchestrator,
+plus its own `agentor-admin-egress-group-<groupId>` outbound bridge. It never
+joins the singleton admin networks or the ordinary worker network.
+
+The group workspace's authority is the group's **live** membership, not a
+snapshot captured when the workspace is created. Before discovery, invocation,
+console use, and private-download redemption, the management layer resolves
+the current group and checks that every target worker is both owned by the
+group's owner and currently present in that group. Out-of-group worker IDs are
+omitted from discovery and direct requests using a known ID fail closed.
+Membership removal therefore revokes access immediately; adding a member makes
+it eligible immediately. Deleting the group, or removing/replacing its
+administrative workspace, invalidates its rotating credential and associated
+console and one-use download handoffs. Those handoffs also bind
+the originating workspace and exact target resource, so a token minted for one
+group workspace cannot be redeemed by another.
+
+Group administrative workspaces cannot create, edit, or delete worker groups,
+and cannot add, remove, or otherwise alter their own group's membership. This
+prevents a scoped principal from expanding its authority. They remain subject
+to normal management-MCP capability policy and worker protection locks; the
+scope check is an additional mandatory boundary, not a replacement for either.
+They expose only operations whose target can be proven from an explicit member
+worker/workspace ID (plus filtered status and inventory lists). Platform-wide
+imports, image/catalog and managed-network administration, global
+configuration/policy, worker creation/clone, and indirect mapping list/delete
+are intentionally unavailable.
+The dashboard/API lifecycle family is
+`/api/worker-groups/:id/admin-workspace`: `GET` reads state, `POST` provisions
+the workspace, and `POST` to `/start`, `/stop`, or `/rebuild` performs the
+corresponding lifecycle action. These routes are owner-scoped and are separate
+from the global administrator workspace routes.
+
 ### Workspace, Agents & DinD Storage
 
 Each worker gets persistent storage mounted at `/workspace`, `/home/agent/.agent-data`, and (when DinD is enabled) `/var/lib/docker`. In **volume mode**, these are Docker named volumes (`<containerName>-workspace`, `<containerName>-agents`, `<containerName>-docker`). In **directory mode**, workspace and agents live under the owner's user directory keyed by the worker UUID (`<dataDir>/users/<userId>/workspaces/<id>/`, `<dataDir>/users/<userId>/agents/<id>/`). All survive container stops, restarts, and archiving. On archive, only the container is removed — workspace, agents, and DinD data persist for unarchiving. On permanent delete, all are removed.

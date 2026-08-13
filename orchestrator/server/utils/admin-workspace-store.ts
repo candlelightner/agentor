@@ -6,7 +6,7 @@ import { useContainerManager } from "./services";
 export interface AdministrativeWorkspaceRecord {
   schemaVersion: 1;
   id: string;
-  kind: "administrative";
+  kind: "administrative" | "group-administrative";
   trusted: true;
   status: "running" | "stopped";
   marker?: string;
@@ -39,6 +39,7 @@ export interface AdminWorkspaceRuntimeAdapter {
   rebuild(
     record: Readonly<AdministrativeWorkspaceRecord>,
   ): Promise<AdminWorkspaceRuntimeImage | void>;
+  remove?(record: Readonly<AdministrativeWorkspaceRecord>): Promise<void>;
   security?(workerId?: string): Promise<Record<string, unknown> | undefined>;
   managementNetworkSecurity?(): Promise<Record<string, unknown>>;
   setClipboard?(mime: "image/png" | "text/plain", bytes: Buffer): Promise<void>;
@@ -65,7 +66,10 @@ export class AdminWorkspaceStore {
     this.runtime = runtime;
   }
   async setClipboard(mime: "image/png" | "text/plain", bytes: Buffer) {
-    if (!this.runtime?.setClipboard) throw Object.assign(new Error("Administrative clipboard unavailable"), { statusCode: 503 });
+    if (!this.runtime?.setClipboard)
+      throw Object.assign(new Error("Administrative clipboard unavailable"), {
+        statusCode: 503,
+      });
     await this.runtime.setClipboard(mime, bytes);
   }
   async init() {

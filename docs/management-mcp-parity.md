@@ -1,10 +1,13 @@
 # Management MCP parity matrix
 
-The management MCP is the administrative workspace's internal control surface.
+The management MCP is an administrative workspace's internal control surface.
 It is not a public HTTP API and it is not a Docker socket. The administrative
 Codex bridge receives a short-lived, workspace-bound credential; every call is
-checked against the current capability policy. The dashboard and MCP share the
-underlying manager/store layer where an equivalent exists.
+checked against the current capability policy. A platform administrator has the
+existing platform-wide authority. A group administrative workspace carries an
+additional group principal: every discovery result and invocation is filtered
+against the group's current same-owner membership. The dashboard and MCP share
+the underlying manager/store layer where an equivalent exists.
 
 Explicit `ownerId`/`userId` selectors preserve administrative cross-user
 operation, but must identify a real Better Auth user and use Agentor's
@@ -17,6 +20,13 @@ every dashboard widget can be mechanically replayed through MCP. `Tested` means
 the listed focused automated evidence exists; it does not turn a mocked provider
 or an interactive third-party login into a live-account verification.
 
+For a group principal, the MCP equivalents below are further reduced to
+member-targetable worker inspection/metrics, lifecycle, configuration/locks,
+console/logs, files/workspaces (excluding clone), exports, backups, apps, and
+mapping creation with an explicit member ID. Platform/global tools—including
+group mutation, worker creation/clone, imports, images/catalogs, managed
+networks, global configuration/policy, and mapping list/delete—are omitted.
+
 | User capability | Dashboard/API implementation | MCP equivalent | Tested evidence / limitation |
 | --- | --- | --- | --- |
 | System and worker inspection | Dashboard worker cards; `/api/containers`, worker status | `status.system`, `workers.list`, `workers.inspect` | `admin-management-mcp.spec.ts`; worker lifecycle tests; `workers.list` includes active and archived records so unarchive targets are discoverable |
@@ -26,7 +36,7 @@ or an interactive third-party login into a live-account verification.
 | Worker logs | Dashboard log viewer | `logs.read` | `management-logs-domain.spec.ts` and `worker-output-redaction.spec.ts`; owner-checked Docker-log tail (1–1000 lines, at most 256 KiB) redacts exact managed literals from worker-local secrets/secret files and sensitive-named local, user-global, and environment variables. It does not expose arbitrary host paths or unbounded terminal output. |
 | Worker-local variables, secrets, secret files | Worker Settings / configuration API | `configuration.get`, `configuration.set` | MCP security and worker-configuration tests; existing secret values are never returned |
 | User environments, capabilities, instructions, init scripts | Sidebar catalog dialogs and catalog APIs | `catalog.{environments,capabilities,instructions,init-scripts}.{list,get,create,update,delete}` | Catalog adapter tests; built-ins stay immutable and owner is explicit |
-| Worker groups | Worker Groups UI; `/api/worker-groups` | `groups.list`, `groups.create`, `groups.update`, `groups.delete` | `worker-groups.spec.ts` exercises API↔MCP parity against real Docker topology: membership updates reconcile every dependent group network, locks cover old/new members, and referenced-group deletion fails without losing state |
+| Worker groups | Worker Groups UI; `/api/worker-groups`; group workspace lifecycle at `/api/worker-groups/:id/admin-workspace` (`GET`, `POST`, and `/start`, `/stop`, `/rebuild` `POST`s) | Platform principal: `groups.list`, `groups.create`, `groups.update`, `groups.delete`; group principal: group inspection only, with no group/membership mutation | `worker-groups.spec.ts` and group-workspace API/UI E2E exercise real Docker topology and scope: membership updates reconcile dependent networks, a group workspace sees and acts only on current members, known out-of-group IDs fail, and it cannot expand membership or mutate group administration |
 | Protection locks | Worker Settings; `/api/containers/:id/protection` | `locks.get`, `locks.set`, `locks.remove` | `worker-protection-lock.spec.ts`; verifier/password is write-only, and `admin-management-mcp.spec.ts` verifies every legacy lifecycle/configuration, app, and exposure-mapping mutation alias requires it |
 | Workspace inventory and offline browse | Storage inventory/browser; `/api/workspaces/*` | `workspaces.list`, `workspaces.files`, `workspaces.preview`, `workspaces.download`, `workspaces.clone` | `management-mcp-workspace-adapter.spec.ts`, `management-download-domain.spec.ts`, `management-download-handoff.spec.ts`, and storage API/UI tests; offline access remains read-only |
 | Running-worker file management | Worker Files modal; `/api/containers/:id/files/*` | `files.list`, `files.upload`, `files.mkdir`, `files.rename`, `files.move`, `files.delete` | Existing hardened container file manager is reused; upload is one base64 file capped at 1 MiB, mutations honor worker protection locks |
@@ -49,6 +59,16 @@ or an interactive third-party login into a live-account verification.
 | Clipboard and tmux pane management | Worker UI; clipboard and `/api/containers/:id/panes/*` | No MCP equivalent | Current limitation: MCP console exposes the selected worker's existing tmux session only |
 
 ## Deliberate boundaries and remaining gaps
+
+- **A group administrative workspace is not a delegated platform
+  administrator.** Its scope is re-evaluated from live membership for every
+  tool call and private handoff redemption. Removing a member revokes existing
+  console sessions and one-use tokens; group deletion or workspace retirement
+  revokes its credential and all associated sessions/tokens. No cached target
+  list, direct UUID, alias, or token can bypass this check.
+- **Group principals cannot administer groups.** They cannot create, edit, or
+  delete groups, nor change their group's membership. The restriction is
+  central authorization, rather than merely hiding tools from discovery.
 
 - **No raw Docker or host command tool.** Console operations are scoped to the
   selected worker's tmux session. Managed networking and image operations go

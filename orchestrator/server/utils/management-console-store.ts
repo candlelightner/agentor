@@ -30,7 +30,11 @@ const IDLE_MS = 15 * 60_000;
  * Keep MCP requests bounded so stale workers produce a useful error. */
 const DOCKER_OPERATION_TIMEOUT_MS = 15_000;
 
-async function withTimeout<T>(operation: Promise<T>, message: string, timeoutMs = DOCKER_OPERATION_TIMEOUT_MS): Promise<T> {
+async function withTimeout<T>(
+  operation: Promise<T>,
+  message: string,
+  timeoutMs = DOCKER_OPERATION_TIMEOUT_MS,
+): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
@@ -92,7 +96,9 @@ export class ManagementConsoleStore {
 
   async read(workspaceId: string, id: string, from?: number) {
     const session = this.get(workspaceId, id);
-    const requested = Number.isInteger(from) ? Math.max(0, Number(from)) : session.offset;
+    const requested = Number.isInteger(from)
+      ? Math.max(0, Number(from))
+      : session.offset;
     const start = Math.max(requested, session.offset);
     this.touch(session);
     let slice = {
@@ -120,12 +126,17 @@ export class ManagementConsoleStore {
 
   write(workspaceId: string, id: string, input: string) {
     const session = this.get(workspaceId, id);
-    if (session.state !== "open") throw statusError(409, "Console session is closed");
+    if (session.state !== "open")
+      throw statusError(409, "Console session is closed");
     if (typeof input !== "string" || Buffer.byteLength(input) > 64 * 1024)
       throw statusError(400, "Console input must be at most 64 KiB");
     session.stream.write(input);
     this.touch(session);
-    return { id, workerId: session.workerId, acceptedBytes: Buffer.byteLength(input) };
+    return {
+      id,
+      workerId: session.workerId,
+      acceptedBytes: Buffer.byteLength(input),
+    };
   }
 
   interrupt(workspaceId: string, id: string) {
@@ -139,7 +150,10 @@ export class ManagementConsoleStore {
     session.state = "closed";
     session.stream.end();
     await withTimeout(
-      useDockerService().killTmuxSession(session.dockerContainerId, session.tmuxSession),
+      useDockerService().killTmuxSession(
+        session.dockerContainerId,
+        session.tmuxSession,
+      ),
       "Closing console session timed out; it may already be stale.",
       5_000,
     ).catch(() => undefined);
@@ -147,7 +161,15 @@ export class ManagementConsoleStore {
   }
 
   async closeAll() {
-    await Promise.allSettled([...this.sessions.values()].map((session) => this.close(session.workspaceId, session.id)));
+    await Promise.allSettled(
+      [...this.sessions.values()].map((session) =>
+        this.close(session.workspaceId, session.id),
+      ),
+    );
+  }
+  target(workspaceId: string, id: string): string | undefined {
+    const session = this.sessions.get(id);
+    return session?.workspaceId === workspaceId ? session.workerId : undefined;
   }
 
   private get(workspaceId: string, id: string) {
@@ -176,7 +198,8 @@ export class ManagementConsoleStore {
     const expired = [...this.sessions.values()].filter(
       (session) => Date.now() - session.touchedAt > IDLE_MS,
     );
-    for (const session of expired) void this.close(session.workspaceId, session.id).catch(() => {});
+    for (const session of expired)
+      void this.close(session.workspaceId, session.id).catch(() => {});
   }
 
   private touch(session: ConsoleSession) {

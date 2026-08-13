@@ -1,36 +1,98 @@
-import { randomUUID } from 'node:crypto';
-import { nanoid } from 'nanoid';
-import { uniqueNamesGenerator, adjectives, animals } from 'unique-names-generator';
-import type { Config } from './config';
-import { getAppType } from './apps';
-import { createReadStream } from 'node:fs';
-import { mkdir, rm } from 'node:fs/promises';
-import { join } from 'node:path';
-import type { Readable } from 'node:stream';
-import * as tar from 'tar-stream';
-import { DockerService } from './docker';
-import type { EnvironmentJsonPayload, CapabilityJsonEntry, InstructionJsonEntry, WorkerJsonPayload, ImageConfigOverride } from './docker';
-import { zeroUserEnvVars } from './user-env-store';
-import { WORKER_EXPORT_VERSION, BUNDLE_FILES, EXPORT_WORKSPACE_PATH, EXPORT_AGENTS_PATH, RESTORE_WORKSPACE_PARENT, RESTORE_AGENTS_PARENT, CREDENTIAL_EXCLUDE_SUFFIXES, SHARED_DATA_EXCLUDE_PREFIXES, writeManifest, writeGzipFile, writeFilteredAgentsGz, packBundle, extractBundle, validateGzipTarPayload, validateTarPayload } from './worker-export';
-import { recordWorkspaceTombstone } from './workspace-tombstones';
-import type { WorkerExportManifest } from './worker-export';
-import type { AppInstanceInfo, TmuxWindow, FileEntry, FileListing, MoveConflict } from '../../shared/types';
-import { getAllGitCloneDomains } from './git-providers';
-import { getAllAgentApiDomains } from './agent-config';
-import { getPackageManagerDomains, DEFAULT_ENVIRONMENT_ID } from './environments';
-import { getUserById } from './auth';
-import type { EnvironmentStore, Environment } from './environments';
-import type { WorkerStore, WorkerRecord } from './worker-store';
-import type { UserCredentialManager } from './user-credentials';
-import type { UserEnvVarStore } from './user-env-store';
-import type { CapabilityStore } from './capability-store';
-import type { InstructionStore } from './instruction-store';
-import type { StorageManager } from './storage';
-import type { ExposeApis, ServiceStatus, ContainerInfo, ContainerStatus, CreateContainerRequest, UpdateContainerSettingsRequest, RepoConfig, MountConfig, UserEnvVars } from '../../shared/types';
-import { normalizeClientPath, normalizeClientPathList, validateName, toContainerPath, parentRelPath, baseName, MAX_UPLOAD_TOTAL_BYTES, MAX_UPLOAD_ENTRIES } from './workspace-path';
-import { probeLstat, probeList, runProbeCheckMany } from './workspace-probe-runner';
-import { buildWorkspaceZip, demuxSingleFileFromTar } from './workspace-zip';
-import { useWorkerConfigStore, parseDotEnv, type WorkerConfigInputEntry } from './worker-config-store';
+import { randomUUID } from "node:crypto";
+import { nanoid } from "nanoid";
+import {
+  uniqueNamesGenerator,
+  adjectives,
+  animals,
+} from "unique-names-generator";
+import type { Config } from "./config";
+import { getAppType } from "./apps";
+import { createReadStream } from "node:fs";
+import { mkdir, rm } from "node:fs/promises";
+import { join } from "node:path";
+import type { Readable } from "node:stream";
+import * as tar from "tar-stream";
+import { DockerService } from "./docker";
+import type {
+  EnvironmentJsonPayload,
+  CapabilityJsonEntry,
+  InstructionJsonEntry,
+  WorkerJsonPayload,
+  ImageConfigOverride,
+} from "./docker";
+import { zeroUserEnvVars } from "./user-env-store";
+import {
+  WORKER_EXPORT_VERSION,
+  BUNDLE_FILES,
+  EXPORT_WORKSPACE_PATH,
+  EXPORT_AGENTS_PATH,
+  RESTORE_WORKSPACE_PARENT,
+  RESTORE_AGENTS_PARENT,
+  CREDENTIAL_EXCLUDE_SUFFIXES,
+  SHARED_DATA_EXCLUDE_PREFIXES,
+  writeManifest,
+  writeGzipFile,
+  writeFilteredAgentsGz,
+  packBundle,
+  extractBundle,
+  validateGzipTarPayload,
+  validateTarPayload,
+} from "./worker-export";
+import { recordWorkspaceTombstone } from "./workspace-tombstones";
+import type { WorkerExportManifest } from "./worker-export";
+import type {
+  AppInstanceInfo,
+  TmuxWindow,
+  FileEntry,
+  FileListing,
+  MoveConflict,
+} from "../../shared/types";
+import { getAllGitCloneDomains } from "./git-providers";
+import { getAllAgentApiDomains } from "./agent-config";
+import {
+  getPackageManagerDomains,
+  DEFAULT_ENVIRONMENT_ID,
+} from "./environments";
+import { getUserById } from "./auth";
+import type { EnvironmentStore, Environment } from "./environments";
+import type { WorkerStore, WorkerRecord } from "./worker-store";
+import type { UserCredentialManager } from "./user-credentials";
+import type { UserEnvVarStore } from "./user-env-store";
+import type { CapabilityStore } from "./capability-store";
+import type { InstructionStore } from "./instruction-store";
+import type { StorageManager } from "./storage";
+import type {
+  ExposeApis,
+  ServiceStatus,
+  ContainerInfo,
+  ContainerStatus,
+  CreateContainerRequest,
+  UpdateContainerSettingsRequest,
+  RepoConfig,
+  MountConfig,
+  UserEnvVars,
+} from "../../shared/types";
+import {
+  normalizeClientPath,
+  normalizeClientPathList,
+  validateName,
+  toContainerPath,
+  parentRelPath,
+  baseName,
+  MAX_UPLOAD_TOTAL_BYTES,
+  MAX_UPLOAD_ENTRIES,
+} from "./workspace-path";
+import {
+  probeLstat,
+  probeList,
+  runProbeCheckMany,
+} from "./workspace-probe-runner";
+import { buildWorkspaceZip, demuxSingleFileFromTar } from "./workspace-zip";
+import {
+  useWorkerConfigStore,
+  parseDotEnv,
+  type WorkerConfigInputEntry,
+} from "./worker-config-store";
 
 interface ResolvedEnvConfig {
   cpuLimit?: number;
@@ -41,26 +103,31 @@ interface ResolvedEnvConfig {
   instructionsJson: InstructionJsonEntry[];
 }
 
-function normalizeWorkerConfiguration(input: NonNullable<CreateContainerRequest['workerConfiguration']>): WorkerConfigInputEntry[] {
+function normalizeWorkerConfiguration(
+  input: NonNullable<CreateContainerRequest["workerConfiguration"]>,
+): WorkerConfigInputEntry[] {
   const variables = new Map<string, string>();
-  if (input.envFile !== undefined) for (const entry of parseDotEnv(input.envFile)) variables.set(entry.key, entry.value);
+  if (input.envFile !== undefined)
+    for (const entry of parseDotEnv(input.envFile))
+      variables.set(entry.key, entry.value);
   for (const entry of input.variables ?? []) {
-    if (variables.has(entry.key) && input.envFile === undefined) throw new Error(`Duplicate configuration name: "${entry.key}"`);
+    if (variables.has(entry.key) && input.envFile === undefined)
+      throw new Error(`Duplicate configuration name: "${entry.key}"`);
     variables.set(entry.key, entry.value);
   }
   return [
     ...[...variables].map(([key, value]) => ({
-      kind: 'variable' as const,
+      kind: "variable" as const,
       key,
       value,
     })),
     ...(input.secrets ?? []).map(({ key, value }) => ({
-      kind: 'secret' as const,
+      kind: "secret" as const,
       key,
       value,
     })),
     ...(input.secretFiles ?? []).map(({ name, path, content }) => ({
-      kind: 'secretFile' as const,
+      kind: "secretFile" as const,
       key: name,
       fileName: path,
       value: content,
@@ -71,20 +138,28 @@ function normalizeWorkerConfiguration(input: NonNullable<CreateContainerRequest[
 /** The worker's UUID `id` — the only identifying label on a worker container.
  * Everything else (userId, config) lives in the WorkerStore record. The
  * `agentor.managed` label string is owned by `docker.ts` (read/written there). */
-const WORKER_ID_LABEL = 'agentor.id';
+const WORKER_ID_LABEL = "agentor.id";
 /** Repo prefix for per-worker images created by `docker import` on restore. */
-const IMPORT_IMAGE_PREFIX = 'agentor-import-';
+const IMPORT_IMAGE_PREFIX = "agentor-import-";
 
 export class ContainerManager {
   /** Reattach a freshly created/rebuilt worker to owner-managed networks. Failure
    * is logged only: the worker lifecycle succeeded and the network remains
    * inspectable/reconcilable rather than leaving a half-created worker. */
   private async reconcileManagedNetworksForWorker(userId: string) {
-    const [{ useManagedNetworkStore }, { useManagedNetworkManager }] = await Promise.all([import('./services'), import('./managed-network-manager')]);
+    const [{ useManagedNetworkStore }, { useManagedNetworkManager }] =
+      await Promise.all([
+        import("./services"),
+        import("./managed-network-manager"),
+      ]);
     for (const network of useManagedNetworkStore().listForUser(userId))
       await useManagedNetworkManager()
         .reconcile(network)
-        .catch((error) => useLogger().warn(`[container] managed network reconcile failed: ${error instanceof Error ? error.message : error}`));
+        .catch((error) =>
+          useLogger().warn(
+            `[container] managed network reconcile failed: ${error instanceof Error ? error.message : error}`,
+          ),
+        );
   }
   /** Keyed by the worker's UUID `id` (stable across rebuild/unarchive). */
   private containers: Map<string, ContainerInfo> = new Map();
@@ -144,31 +219,44 @@ export class ContainerManager {
     return `${shortId}-${workerId}`.slice(0, 20);
   }
 
-  private async resolveUserEnvAndBinds(userId: string): Promise<{ userEnv: UserEnvVars; credentialBinds: string[] }> {
-    const userEnv = this.userEnvStore?.getOrDefault(userId) ?? zeroUserEnvVars(userId);
+  private async resolveUserEnvAndBinds(
+    userId: string,
+  ): Promise<{ userEnv: UserEnvVars; credentialBinds: string[] }> {
+    const userEnv =
+      this.userEnvStore?.getOrDefault(userId) ?? zeroUserEnvVars(userId);
     const credentialBinds: string[] = [];
     if (this.userCredentialManager && userId) {
       await this.userCredentialManager.ensureUserDir(userId);
-      credentialBinds.push(...this.userCredentialManager.getBindMountsForUser(userId));
+      credentialBinds.push(
+        ...this.userCredentialManager.getBindMountsForUser(userId),
+      );
     }
     if (this.storageManager && userId) {
       await this.storageManager.ensureUserSshDir(userId);
       await this.storageManager.ensureUserKiloConfigDir(userId);
       await this.storageManager.ensureUserKiloSharedDataDir(userId);
       try {
-        credentialBinds.push(this.storageManager.getSshAuthorizedKeysBind(userId));
+        credentialBinds.push(
+          this.storageManager.getSshAuthorizedKeysBind(userId),
+        );
       } catch (err) {
-        useLogger().warn(`[container] unable to build ssh authorized_keys bind for user ${userId}: ${err instanceof Error ? err.message : err}`);
+        useLogger().warn(
+          `[container] unable to build ssh authorized_keys bind for user ${userId}: ${err instanceof Error ? err.message : err}`,
+        );
       }
       try {
         credentialBinds.push(this.storageManager.getKiloConfigBind(userId));
       } catch (err) {
-        useLogger().warn(`[container] unable to build Kilo config bind for user ${userId}: ${err instanceof Error ? err.message : err}`);
+        useLogger().warn(
+          `[container] unable to build Kilo config bind for user ${userId}: ${err instanceof Error ? err.message : err}`,
+        );
       }
       try {
         credentialBinds.push(this.storageManager.getKiloSharedDataBind(userId));
       } catch (err) {
-        useLogger().warn(`[container] unable to build Kilo shared-data bind for user ${userId}: ${err instanceof Error ? err.message : err}`);
+        useLogger().warn(
+          `[container] unable to build Kilo shared-data bind for user ${userId}: ${err instanceof Error ? err.message : err}`,
+        );
       }
     }
     return { userEnv, credentialBinds };
@@ -182,7 +270,7 @@ export class ContainerManager {
     gitEmail: string;
   } {
     const user = getUserById(userId);
-    return { gitName: user?.name ?? '', gitEmail: user?.email ?? '' };
+    return { gitName: user?.name ?? "", gitEmail: user?.email ?? "" };
   }
 
   private resolveCapabilitiesAndInstructions(
@@ -196,7 +284,10 @@ export class ContainerManager {
     const instructionsJson: InstructionJsonEntry[] = [];
     if (this.instructionStore) {
       const allEntries = this.instructionStore.list();
-      const enabledEntries = enabledInstructionIds === null || enabledInstructionIds === undefined ? allEntries : allEntries.filter((i) => enabledInstructionIds!.includes(i.id));
+      const enabledEntries =
+        enabledInstructionIds === null || enabledInstructionIds === undefined
+          ? allEntries
+          : allEntries.filter((i) => enabledInstructionIds!.includes(i.id));
 
       for (const entry of enabledEntries) {
         instructionsJson.push({ name: entry.name, content: entry.content });
@@ -206,15 +297,18 @@ export class ContainerManager {
     const capabilitiesJson: CapabilityJsonEntry[] = [];
     if (this.capabilityStore) {
       const allCapabilities = this.capabilityStore.list();
-      let enabledCapabilities = enabledCapabilityIds === null || enabledCapabilityIds === undefined ? allCapabilities : allCapabilities.filter((s) => enabledCapabilityIds!.includes(s.id));
+      let enabledCapabilities =
+        enabledCapabilityIds === null || enabledCapabilityIds === undefined
+          ? allCapabilities
+          : allCapabilities.filter((s) => enabledCapabilityIds!.includes(s.id));
 
       // Keyed by the built-in capability's slug, which is its `name` (the id is
       // now a derived UUID). Gated on `builtIn` so a user's custom capability
       // that happens to share the name is never auto-filtered.
       const apiCapabilityFilter: Record<string, keyof ExposeApis> = {
-        'port-mapping': 'portMappings',
-        'domain-mapping': 'domainMappings',
-        usage: 'usage',
+        "port-mapping": "portMappings",
+        "domain-mapping": "domainMappings",
+        usage: "usage",
       };
       enabledCapabilities = enabledCapabilities.filter((s) => {
         const apiKey = s.builtIn ? apiCapabilityFilter[s.name] : undefined;
@@ -240,14 +334,15 @@ export class ContainerManager {
     };
 
     if (!this.environmentStore) {
-      const { capabilitiesJson, instructionsJson } = this.resolveCapabilitiesAndInstructions(null, null, defaultExposeApis);
+      const { capabilitiesJson, instructionsJson } =
+        this.resolveCapabilitiesAndInstructions(null, null, defaultExposeApis);
       return {
         environmentJson: {
-          networkMode: 'full',
+          networkMode: "full",
           allowedDomains: [],
           dockerEnabled: true,
-          setupScript: '',
-          envVars: '',
+          setupScript: "",
+          envVars: "",
           exposeApis: defaultExposeApis,
         },
         capabilitiesJson,
@@ -260,22 +355,27 @@ export class ContainerManager {
     if (!env) throw new Error(`Environment not found: ${resolvedId}`);
 
     let domains: string[] = [];
-    if (env.networkMode === 'package-managers') {
+    if (env.networkMode === "package-managers") {
       domains = [...getPackageManagerDomains()];
-    } else if (env.networkMode === 'custom') {
+    } else if (env.networkMode === "custom") {
       domains = [...env.allowedDomains];
       if (env.includePackageManagerDomains) {
         domains.push(...getPackageManagerDomains());
       }
     }
 
-    if (env.networkMode !== 'full' && env.networkMode !== 'block-all') {
+    if (env.networkMode !== "full" && env.networkMode !== "block-all") {
       domains.push(...getAllAgentApiDomains());
       domains.push(...getAllGitCloneDomains());
     }
 
     const exposeApis: ExposeApis = env.exposeApis ?? defaultExposeApis;
-    const { capabilitiesJson, instructionsJson } = this.resolveCapabilitiesAndInstructions(env.enabledCapabilityIds, env.enabledInstructionIds, exposeApis);
+    const { capabilitiesJson, instructionsJson } =
+      this.resolveCapabilitiesAndInstructions(
+        env.enabledCapabilityIds,
+        env.enabledInstructionIds,
+        exposeApis,
+      );
 
     const dockerEnabled = env.dockerEnabled ?? true;
 
@@ -284,11 +384,11 @@ export class ContainerManager {
       memoryLimit: env.memoryLimit || undefined,
       dockerEnabled,
       environmentJson: {
-        networkMode: env.networkMode || 'full',
+        networkMode: env.networkMode || "full",
         allowedDomains: domains,
         dockerEnabled,
-        setupScript: env.setupScript || '',
-        envVars: env.envVars || '',
+        setupScript: env.setupScript || "",
+        envVars: env.envVars || "",
         exposeApis,
       },
       capabilitiesJson,
@@ -307,17 +407,18 @@ export class ContainerManager {
   } {
     return {
       cpuLimit: env.cpuLimit ?? this.config.defaultCpuLimit ?? undefined,
-      memoryLimit: env.memoryLimit || this.config.defaultMemoryLimit || undefined,
+      memoryLimit:
+        env.memoryLimit || this.config.defaultMemoryLimit || undefined,
       dockerEnabled: env.dockerEnabled ?? true,
     };
   }
 
   private static readonly STATE_MAP: Record<string, ContainerStatus> = {
-    running: 'running',
-    exited: 'stopped',
-    created: 'creating',
-    dead: 'error',
-    removing: 'removing',
+    running: "running",
+    exited: "stopped",
+    created: "creating",
+    dead: "error",
+    removing: "removing",
   };
 
   async sync(): Promise<void> {
@@ -326,11 +427,12 @@ export class ContainerManager {
     this.containers.clear();
 
     for (const dc of dockerContainers) {
-      const containerName = dc.Names[0]?.replace(/^\//, '') || dc.Id.slice(0, 12);
+      const containerName =
+        dc.Names[0]?.replace(/^\//, "") || dc.Id.slice(0, 12);
       const labels = dc.Labels ?? {};
       // The worker UUID `id` is the only identifying label; resolve the
       // authoritative record (with userId + config) from the WorkerStore.
-      const labelId = labels[WORKER_ID_LABEL] ?? '';
+      const labelId = labels[WORKER_ID_LABEL] ?? "";
       // DockerService also discovers Agentor-owned auxiliary containers (for
       // example the persistent administrative workspace).  They deliberately
       // have no ordinary-worker identity and must never be projected into the
@@ -345,7 +447,7 @@ export class ContainerManager {
 
       this.containers.set(id, {
         id,
-        userId: worker?.userId ?? '',
+        userId: worker?.userId ?? "",
         createdAt: worker?.createdAt ?? now,
         updatedAt: worker?.updatedAt ?? now,
         containerId: dc.Id,
@@ -353,7 +455,7 @@ export class ContainerManager {
         displayName: worker?.displayName ?? containerName,
         imageName: dc.Image,
         imageId: dc.ImageID,
-        status: ContainerManager.STATE_MAP[dc.State] || 'error',
+        status: ContainerManager.STATE_MAP[dc.State] || "error",
         repos: worker?.repos,
         mounts: worker?.mounts,
         initScript: worker?.initScript,
@@ -379,9 +481,14 @@ export class ContainerManager {
   registerExternal(info: ContainerInfo): void {
     this.containers.set(info.id, info);
   }
+  unregisterExternal(id: string): void {
+    this.containers.delete(id);
+  }
   private assertOrdinaryMutation(info: ContainerInfo) {
-    if (info.userId === '__agentor_admin__') {
-      const error = new Error('Administrative workspace lifecycle requires the dedicated confirmed admin API') as Error & { statusCode?: number };
+    if (info.administrativeKind || info.userId === "__agentor_admin__") {
+      const error = new Error(
+        "Administrative workspace lifecycle requires the dedicated confirmed admin API",
+      ) as Error & { statusCode?: number };
       error.statusCode = 409;
       throw error;
     }
@@ -396,7 +503,7 @@ export class ContainerManager {
    * calls). Throws if the worker is unknown. */
   private dockerIdFor(id: string): string {
     const info = this.containers.get(id);
-    if (!info) throw new Error('Container not found');
+    if (!info) throw new Error("Container not found");
     return info.containerId;
   }
 
@@ -415,7 +522,8 @@ export class ContainerManager {
   suggestDisplayName(userId: string): string {
     const taken = new Set<string>();
     for (const c of this.containers.values()) {
-      if (c.userId === userId && c.displayName) taken.add(c.displayName.toLowerCase());
+      if (c.userId === userId && c.displayName)
+        taken.add(c.displayName.toLowerCase());
     }
     for (const w of this.workerStore?.listForUser(userId) ?? []) {
       if (w.displayName) taken.add(w.displayName.toLowerCase());
@@ -423,8 +531,8 @@ export class ContainerManager {
     for (let attempt = 0; attempt < 8; attempt++) {
       const candidate = uniqueNamesGenerator({
         dictionaries: [adjectives, animals],
-        separator: '-',
-        style: 'lowerCase',
+        separator: "-",
+        style: "lowerCase",
       });
       if (!taken.has(candidate)) return candidate;
     }
@@ -432,8 +540,8 @@ export class ContainerManager {
   }
 
   async create(request: CreateContainerRequest): Promise<ContainerInfo> {
-    const userId = request.userId ?? '';
-    if (!userId) throw new Error('create: userId is required');
+    const userId = request.userId ?? "";
+    if (!userId) throw new Error("create: userId is required");
 
     const envConfig = this.resolveEnvironmentConfig(request.environmentId);
 
@@ -442,18 +550,24 @@ export class ContainerManager {
     // the user provides none). The Docker container is described by the separate
     // `containerId` (assigned by Docker) and `containerName` (`<prefix>-<id>`).
     const id = randomUUID();
-    const displayName = request.displayName?.trim() || this.suggestDisplayName(userId);
+    const displayName =
+      request.displayName?.trim() || this.suggestDisplayName(userId);
     const containerName = this.buildContainerName(id);
     const workerConfigStore = useWorkerConfigStore();
     if (request.workerConfiguration) {
-      await workerConfigStore.replace(userId, id, normalizeWorkerConfiguration(request.workerConfiguration));
+      await workerConfigStore.replace(
+        userId,
+        id,
+        normalizeWorkerConfiguration(request.workerConfiguration),
+      );
     }
     const workerConfig = await workerConfigStore.resolveValues(userId, id);
 
     const repos = request.repos?.filter((r) => r.url) || [];
 
     // Resource limits are an environment property (no per-worker override).
-    const { cpuLimit, memoryLimit, dockerEnabled } = this.deriveLimits(envConfig);
+    const { cpuLimit, memoryLimit, dockerEnabled } =
+      this.deriveLimits(envConfig);
 
     // Git identity resolved live from the owner — never stored on the worker.
     const { gitName, gitEmail } = this.resolveGitIdentity(userId);
@@ -462,12 +576,13 @@ export class ContainerManager {
       id,
       displayName,
       repos,
-      initScript: request.initScript?.trim() || '',
+      initScript: request.initScript?.trim() || "",
       gitName,
       gitEmail,
     };
 
-    const { userEnv, credentialBinds } = await this.resolveUserEnvAndBinds(userId);
+    const { userEnv, credentialBinds } =
+      await this.resolveUserEnvAndBinds(userId);
 
     const container = await this.dockerService
       .createWorkerContainer({
@@ -493,7 +608,9 @@ export class ContainerManager {
         throw err;
       });
 
-    const imageName = request.imageRuntimeReference || this.config.workerImagePrefix + this.config.workerImage;
+    const imageName =
+      request.imageRuntimeReference ||
+      this.config.workerImagePrefix + this.config.workerImage;
     const now = new Date().toISOString();
 
     const mounts = request.mounts?.length ? request.mounts : undefined;
@@ -508,8 +625,8 @@ export class ContainerManager {
       containerName,
       displayName,
       imageName,
-      imageId: request.imageDigest || '',
-      status: 'running',
+      imageId: request.imageDigest || "",
+      status: "running",
       repos: repos.length > 0 ? repos : undefined,
       mounts,
       initScript,
@@ -529,7 +646,9 @@ export class ContainerManager {
     // leak an orphan worker the store doesn't know about. Mirrors importWorker.
     try {
       if (this.workerStore) {
-        await this.workerStore.upsert(this.containerInfoToWorkerRecord(containerInfo));
+        await this.workerStore.upsert(
+          this.containerInfoToWorkerRecord(containerInfo),
+        );
       }
       await workerConfigStore.markApplied(userId, id);
     } catch (err) {
@@ -537,19 +656,28 @@ export class ContainerManager {
       await workerConfigStore.remove(userId, id).catch(() => {});
       await this.dockerService.removeContainer(container.id).catch(() => {});
       if (this.storageManager) {
-        await this.storageManager.removeWorkerWorkspace(userId, id, containerName).catch(() => {});
-        await this.storageManager.removeWorkerAgents(userId, id, containerName).catch(() => {});
-        if (dockerEnabled) await this.storageManager.removeWorkerDocker(containerName).catch(() => {});
+        await this.storageManager
+          .removeWorkerWorkspace(userId, id, containerName)
+          .catch(() => {});
+        await this.storageManager
+          .removeWorkerAgents(userId, id, containerName)
+          .catch(() => {});
+        if (dockerEnabled)
+          await this.storageManager
+            .removeWorkerDocker(containerName)
+            .catch(() => {});
       }
       throw err;
     }
 
     // Attach log collector to the new container
     useLogCollector()
-      .attach(containerName, container.id, 'worker', displayName)
+      .attach(containerName, container.id, "worker", displayName)
       .catch(() => {});
 
-    useLogger().info(`[container] created worker ${containerName} (${container.id.slice(0, 12)})`);
+    useLogger().info(
+      `[container] created worker ${containerName} (${container.id.slice(0, 12)})`,
+    );
     await this.reconcileManagedNetworksForWorker(userId);
 
     return containerInfo;
@@ -557,8 +685,8 @@ export class ContainerManager {
 
   private assertRunning(id: string): ContainerInfo {
     const info = this.containers.get(id);
-    if (!info || info.status !== 'running') {
-      throw new Error('Worker container is not running');
+    if (!info || info.status !== "running") {
+      throw new Error("Worker container is not running");
     }
     return info;
   }
@@ -587,14 +715,14 @@ export class ContainerManager {
   private dockerIdForFiles(id: string): string {
     const info = this.containers.get(id);
     if (!info) {
-      const err = new Error('Container not found') as Error & {
+      const err = new Error("Container not found") as Error & {
         statusCode?: number;
       };
       err.statusCode = 404;
       throw err;
     }
-    if (info.status !== 'running') {
-      const err = new Error('Worker container is not running') as Error & {
+    if (info.status !== "running") {
+      const err = new Error("Worker container is not running") as Error & {
         statusCode?: number;
       };
       err.statusCode = 409;
@@ -622,27 +750,36 @@ export class ContainerManager {
    *  additionally reported via 409. Total bytes/entries are capped (413). Tar
    *  entries are written uid/gid 1000 with directory/file modes.
    */
-  async uploadFiles(id: string, destRel: string, entries: { rel: string; data: Buffer; isDir?: boolean }[], overwrite: boolean): Promise<{ uploaded: number }> {
+  async uploadFiles(
+    id: string,
+    destRel: string,
+    entries: { rel: string; data: Buffer; isDir?: boolean }[],
+    overwrite: boolean,
+  ): Promise<{ uploaded: number }> {
     const containerId = this.dockerIdForFiles(id);
     const dest = normalizeClientPath(destRel, { allowRoot: true });
 
     // Destination must exist and be a directory contained in /workspace.
     const destEntry = await probeLstat(this.dockerService, containerId, dest);
-    if (destEntry.type !== 'directory') {
-      const err = new Error('Upload destination is not a directory') as Error & { statusCode?: number };
+    if (destEntry.type !== "directory") {
+      const err = new Error(
+        "Upload destination is not a directory",
+      ) as Error & { statusCode?: number };
       err.statusCode = 409;
       throw err;
     }
 
     if (entries.length === 0) {
-      const err = new Error('No files provided') as Error & {
+      const err = new Error("No files provided") as Error & {
         statusCode?: number;
       };
       err.statusCode = 400;
       throw err;
     }
     if (entries.length > MAX_UPLOAD_ENTRIES) {
-      const err = new Error(`Upload exceeds the ${MAX_UPLOAD_ENTRIES} entry limit`) as Error & { statusCode?: number };
+      const err = new Error(
+        `Upload exceeds the ${MAX_UPLOAD_ENTRIES} entry limit`,
+      ) as Error & { statusCode?: number };
       err.statusCode = 413;
       throw err;
     }
@@ -656,12 +793,14 @@ export class ContainerManager {
       // Each part's own relative path is validated here (defence in depth —
       // the route also validates). Empty/`.`/`..`/backslash/absolute are rejected.
       const partRel = normalizeClientPath(e.rel, { allowRoot: false });
-      const targetRel = dest === '' ? partRel : `${dest}/${partRel}`;
+      const targetRel = dest === "" ? partRel : `${dest}/${partRel}`;
       if (seenTargets.has(targetRel)) continue;
       seenTargets.add(targetRel);
       if (!e.isDir) totalBytes += e.data.length;
       if (totalBytes > MAX_UPLOAD_TOTAL_BYTES) {
-        const err = new Error(`Upload exceeds the ${MAX_UPLOAD_TOTAL_BYTES} byte limit`) as Error & { statusCode?: number };
+        const err = new Error(
+          `Upload exceeds the ${MAX_UPLOAD_TOTAL_BYTES} byte limit`,
+        ) as Error & { statusCode?: number };
         err.statusCode = 413;
         throw err;
       }
@@ -678,17 +817,21 @@ export class ContainerManager {
       targets.map((t) => t.rel),
     );
     if (escaping.length > 0) {
-      const err = new Error('Upload target escapes the workspace root') as Error & { statusCode?: number };
+      const err = new Error(
+        "Upload target escapes the workspace root",
+      ) as Error & { statusCode?: number };
       err.statusCode = 400;
       throw err;
     }
     if (!overwrite && existing.length > 0) {
-      const err = new Error('Upload conflicts with existing paths') as Error & {
+      const err = new Error("Upload conflicts with existing paths") as Error & {
         statusCode?: number;
         conflicts?: string[];
       };
       err.statusCode = 409;
-      (err as any).conflicts = existing.map((p) => p.replace(/^\/workspace\/?/, ''));
+      (err as any).conflicts = existing.map((p) =>
+        p.replace(/^\/workspace\/?/, ""),
+      );
       throw err;
     }
 
@@ -702,16 +845,18 @@ export class ContainerManager {
     let count = 0;
     const directoryEntries = new Set<string>();
     for (const target of targets) {
-      const segments = target.rel.split('/').filter(Boolean);
+      const segments = target.rel.split("/").filter(Boolean);
       const parentLength = target.isDir ? segments.length : segments.length - 1;
       for (let i = 1; i <= parentLength; i++) {
-        directoryEntries.add(segments.slice(0, i).join('/'));
+        directoryEntries.add(segments.slice(0, i).join("/"));
       }
     }
-    for (const name of [...directoryEntries].sort((a, b) => a.split('/').length - b.split('/').length)) {
+    for (const name of [...directoryEntries].sort(
+      (a, b) => a.split("/").length - b.split("/").length,
+    )) {
       pack.entry({
         name,
-        type: 'directory',
+        type: "directory",
         mode: 0o755,
         uid: 1000,
         gid: 1000,
@@ -740,7 +885,7 @@ export class ContainerManager {
     for await (const chunk of pack) chunks.push(chunk as Buffer);
     const tarBuffer = Buffer.concat(chunks);
 
-    await this.dockerService.putArchive(containerId, tarBuffer, '/workspace');
+    await this.dockerService.putArchive(containerId, tarBuffer, "/workspace");
     return { uploaded: count };
   }
 
@@ -758,8 +903,8 @@ export class ContainerManager {
     // probeLstat also enforces containment (realpath) for the existing path.
     try {
       const entry = await probeLstat(this.dockerService, containerId, target);
-      if (entry.type === 'directory') return { ok: true };
-      const err = new Error('A file already exists at that path') as Error & {
+      if (entry.type === "directory") return { ok: true };
+      const err = new Error("A file already exists at that path") as Error & {
         statusCode?: number;
       };
       err.statusCode = 409;
@@ -774,17 +919,29 @@ export class ContainerManager {
     // a `mkdir -p` under an escaping symlink would otherwise create outside
     // /workspace. check_many walks to the nearest existing ancestor for a
     // missing path and reports it as escaping when that ancestor escapes.
-    const { escaping } = await runProbeCheckMany(this.dockerService, containerId, [target]);
+    const { escaping } = await runProbeCheckMany(
+      this.dockerService,
+      containerId,
+      [target],
+    );
     if (escaping.length > 0) {
-      const err = new Error('mkdir target escapes the workspace root') as Error & { statusCode?: number };
+      const err = new Error(
+        "mkdir target escapes the workspace root",
+      ) as Error & { statusCode?: number };
       err.statusCode = 400;
       throw err;
     }
 
-    const res = await this.dockerService.execCapture(containerId, ['mkdir', '-p', full], { user: 'agent' });
+    const res = await this.dockerService.execCapture(
+      containerId,
+      ["mkdir", "-p", full],
+      { user: "agent" },
+    );
     if (res.exitCode !== 0) {
       // mkdir -p fails (e.g. a file blocks an intermediate segment) -> 409.
-      const err = new Error(`mkdir failed: ${res.stderr.toString('utf8').trim() || 'unknown error'}`) as Error & { statusCode?: number };
+      const err = new Error(
+        `mkdir failed: ${res.stderr.toString("utf8").trim() || "unknown error"}`,
+      ) as Error & { statusCode?: number };
       err.statusCode = 409;
       throw err;
     }
@@ -798,12 +955,16 @@ export class ContainerManager {
    *  positional argv, then verifies the source disappeared and the target
    *  exists — GNU `mv -n` can exit 0 on a skip, so success is confirmed by the
    *  post-move filesystem state, not the exit code alone. */
-  async renameFile(id: string, rel: string, newName: string): Promise<{ ok: true }> {
+  async renameFile(
+    id: string,
+    rel: string,
+    newName: string,
+  ): Promise<{ ok: true }> {
     const containerId = this.dockerIdForFiles(id);
     const src = normalizeClientPath(rel, { allowRoot: false });
-    const name = validateName(newName, 'newName');
+    const name = validateName(newName, "newName");
     const parent = parentRelPath(src);
-    const targetRel = parent === '' ? name : `${parent}/${name}`;
+    const targetRel = parent === "" ? name : `${parent}/${name}`;
 
     // Source must exist and be contained.
     await probeLstat(this.dockerService, containerId, src);
@@ -811,14 +972,22 @@ export class ContainerManager {
     // Target must not exist (no overwrite) and must not escape /workspace.
     // check_many reports a missing target as escaping when its nearest existing
     // ancestor escapes (e.g. renaming into a path under an escaping symlink).
-    const { existing, escaping } = await runProbeCheckMany(this.dockerService, containerId, [targetRel]);
+    const { existing, escaping } = await runProbeCheckMany(
+      this.dockerService,
+      containerId,
+      [targetRel],
+    );
     if (escaping.length > 0) {
-      const err = new Error('Rename target escapes the workspace root') as Error & { statusCode?: number };
+      const err = new Error(
+        "Rename target escapes the workspace root",
+      ) as Error & { statusCode?: number };
       err.statusCode = 400;
       throw err;
     }
     if (existing.length > 0) {
-      const err = new Error('A file or directory with that name already exists') as Error & { statusCode?: number };
+      const err = new Error(
+        "A file or directory with that name already exists",
+      ) as Error & { statusCode?: number };
       err.statusCode = 409;
       throw err;
     }
@@ -827,15 +996,29 @@ export class ContainerManager {
     const targetFull = toContainerPath(targetRel);
     // --no-target-directory (-T): treat the target as a file, not "move into dir".
     // --no-clobber (-n): never overwrite an existing target. Both via argv.
-    const res = await this.dockerService.execCapture(containerId, ['mv', '--no-target-directory', '--no-clobber', srcFull, targetFull], { user: 'agent' });
+    const res = await this.dockerService.execCapture(
+      containerId,
+      ["mv", "--no-target-directory", "--no-clobber", srcFull, targetFull],
+      { user: "agent" },
+    );
     // GNU `mv -n` exits 0 even when it skipped because the target existed. We
     // already ruled out an existing target above, but a race could still cause a
     // skip — confirm the move actually happened by the post-move state.
-    const postSrc = await this.dockerService.execCapture(containerId, ['test', '-e', srcFull], { user: 'agent' });
-    const postTarget = await this.dockerService.execCapture(containerId, ['test', '-e', targetFull], { user: 'agent' });
+    const postSrc = await this.dockerService.execCapture(
+      containerId,
+      ["test", "-e", srcFull],
+      { user: "agent" },
+    );
+    const postTarget = await this.dockerService.execCapture(
+      containerId,
+      ["test", "-e", targetFull],
+      { user: "agent" },
+    );
     if (postSrc.exitCode === 0 || postTarget.exitCode !== 0) {
       // Source still present or target missing — the move did not happen.
-      const err = new Error(`rename failed: ${res.stderr.toString('utf8').trim() || 'source was not moved'}`) as Error & { statusCode?: number };
+      const err = new Error(
+        `rename failed: ${res.stderr.toString("utf8").trim() || "source was not moved"}`,
+      ) as Error & { statusCode?: number };
       err.statusCode = 409;
       throw err;
     }
@@ -852,7 +1035,12 @@ export class ContainerManager {
    *  `agent` user via positional argv, then verifies each move by the post-move
    *  filesystem state (GNU `mv -n` can exit 0 on a skip).
    */
-  async moveFiles(id: string, srcRels: string[], destRel: string, overwrite: boolean): Promise<{ moved: number; conflicts?: MoveConflict[] }> {
+  async moveFiles(
+    id: string,
+    srcRels: string[],
+    destRel: string,
+    overwrite: boolean,
+  ): Promise<{ moved: number; conflicts?: MoveConflict[] }> {
     const containerId = this.dockerIdForFiles(id);
     const srcs = normalizeClientPathList(srcRels, { allowRoot: false });
     // The destination may be the workspace root itself.
@@ -860,8 +1048,8 @@ export class ContainerManager {
 
     // Destination must exist and be a directory.
     const destEntry = await probeLstat(this.dockerService, containerId, dest);
-    if (destEntry.type !== 'directory') {
-      const err = new Error('Move destination is not a directory') as Error & {
+    if (destEntry.type !== "directory") {
+      const err = new Error("Move destination is not a directory") as Error & {
         statusCode?: number;
       };
       err.statusCode = 409;
@@ -873,10 +1061,12 @@ export class ContainerManager {
     for (const src of srcs) {
       await probeLstat(this.dockerService, containerId, src);
       const base = baseName(src);
-      const targetRel = dest === '' ? base : `${dest}/${base}`;
+      const targetRel = dest === "" ? base : `${dest}/${base}`;
       if (targetRel === src) continue; // already in the requested destination
       if (targetRel.startsWith(`${src}/`)) {
-        const err = new Error('Cannot move a directory into itself or its descendant') as Error & { statusCode?: number };
+        const err = new Error(
+          "Cannot move a directory into itself or its descendant",
+        ) as Error & { statusCode?: number };
         err.statusCode = 409;
         throw err;
       }
@@ -894,7 +1084,9 @@ export class ContainerManager {
       moves.map((m) => m.targetRel),
     );
     if (escaping.length > 0) {
-      const err = new Error('Move target escapes the workspace root') as Error & { statusCode?: number };
+      const err = new Error(
+        "Move target escapes the workspace root",
+      ) as Error & { statusCode?: number };
       err.statusCode = 400;
       throw err;
     }
@@ -906,7 +1098,7 @@ export class ContainerManager {
           conflicts.push({ source: m.src, target: m.targetRel });
         }
       }
-      const err = new Error('Move conflicts with existing paths') as Error & {
+      const err = new Error("Move conflicts with existing paths") as Error & {
         statusCode?: number;
         conflicts?: MoveConflict[];
       };
@@ -918,8 +1110,13 @@ export class ContainerManager {
     if (overwrite) {
       const existingSet = new Set(existing);
       for (const m of moves) {
-        if (existingSet.has(toContainerPath(m.targetRel)) && m.src.startsWith(`${m.targetRel}/`)) {
-          const err = new Error('Cannot replace a destination that contains the move source') as Error & { statusCode?: number };
+        if (
+          existingSet.has(toContainerPath(m.targetRel)) &&
+          m.src.startsWith(`${m.targetRel}/`)
+        ) {
+          const err = new Error(
+            "Cannot replace a destination that contains the move source",
+          ) as Error & { statusCode?: number };
           err.statusCode = 409;
           throw err;
         }
@@ -936,28 +1133,50 @@ export class ContainerManager {
       const srcFull = toContainerPath(m.src);
       const targetFull = toContainerPath(m.targetRel);
       if (overwrite && existing.includes(targetFull)) {
-        const removeTarget = await this.dockerService.execCapture(containerId, ['rm', '-rf', '--', targetFull], { user: 'agent' });
+        const removeTarget = await this.dockerService.execCapture(
+          containerId,
+          ["rm", "-rf", "--", targetFull],
+          { user: "agent" },
+        );
         if (removeTarget.exitCode !== 0) {
-          const err = new Error(`move failed for '${m.src}': could not replace destination`) as Error & { statusCode?: number };
+          const err = new Error(
+            `move failed for '${m.src}': could not replace destination`,
+          ) as Error & { statusCode?: number };
           err.statusCode = 409;
           throw err;
         }
       }
-      const mvArgs = ['mv', '--no-target-directory', ...(overwrite ? ['--force'] : ['--no-clobber']), srcFull, targetFull];
+      const mvArgs = [
+        "mv",
+        "--no-target-directory",
+        ...(overwrite ? ["--force"] : ["--no-clobber"]),
+        srcFull,
+        targetFull,
+      ];
       const res = await this.dockerService.execCapture(containerId, mvArgs, {
-        user: 'agent',
+        user: "agent",
       });
       // Verify the move actually happened (defeats the mv -n exit-0-on-skip race).
-      const postSrc = await this.dockerService.execCapture(containerId, ['test', '-e', srcFull], { user: 'agent' });
-      const postTarget = await this.dockerService.execCapture(containerId, ['test', '-e', targetFull], { user: 'agent' });
+      const postSrc = await this.dockerService.execCapture(
+        containerId,
+        ["test", "-e", srcFull],
+        { user: "agent" },
+      );
+      const postTarget = await this.dockerService.execCapture(
+        containerId,
+        ["test", "-e", targetFull],
+        { user: "agent" },
+      );
       if (postTarget.exitCode === 0 && postSrc.exitCode !== 0) {
         moved++;
         continue;
       }
-      const msg = res.stderr.toString('utf8').trim();
+      const msg = res.stderr.toString("utf8").trim();
       // Source vanished (race) and target absent — treat as skipped, not failed.
       if (postSrc.exitCode !== 0 && postTarget.exitCode !== 0) continue;
-      const err = new Error(`move failed for '${m.src}': ${msg || 'source was not moved'}`) as Error & { statusCode?: number };
+      const err = new Error(
+        `move failed for '${m.src}': ${msg || "source was not moved"}`,
+      ) as Error & { statusCode?: number };
       err.statusCode = 409;
       throw err;
     }
@@ -975,9 +1194,15 @@ export class ContainerManager {
 
     // Probe existence (and containment) in one call so escaping symlinks are
     // rejected before any deletion, and missing paths are skipped idempotently.
-    const { existing, escaping } = await runProbeCheckMany(this.dockerService, containerId, targets);
+    const { existing, escaping } = await runProbeCheckMany(
+      this.dockerService,
+      containerId,
+      targets,
+    );
     if (escaping.length > 0) {
-      const err = new Error('Refusing to delete through a symlink that escapes the workspace') as Error & { statusCode?: number };
+      const err = new Error(
+        "Refusing to delete through a symlink that escapes the workspace",
+      ) as Error & { statusCode?: number };
       err.statusCode = 400;
       throw err;
     }
@@ -986,13 +1211,19 @@ export class ContainerManager {
     let deleted = 0;
     for (const rel of targets) {
       if (!existingSet.has(toContainerPath(rel))) continue;
-      const res = await this.dockerService.execCapture(containerId, ['rm', '-rf', '--', toContainerPath(rel)], { user: 'agent' });
+      const res = await this.dockerService.execCapture(
+        containerId,
+        ["rm", "-rf", "--", toContainerPath(rel)],
+        { user: "agent" },
+      );
       if (res.exitCode === 0) {
         deleted++;
       } else {
-        const msg = res.stderr.toString('utf8').trim();
+        const msg = res.stderr.toString("utf8").trim();
         if (/No such file or directory/.test(msg)) continue;
-        const err = new Error(`delete failed for '${rel}': ${msg || 'unknown error'}`) as Error & { statusCode?: number };
+        const err = new Error(
+          `delete failed for '${rel}': ${msg || "unknown error"}`,
+        ) as Error & { statusCode?: number };
         err.statusCode = 409;
         throw err;
       }
@@ -1010,7 +1241,13 @@ export class ContainerManager {
    *  rejected. The returned stream is a Node Readable; the route wires
    *  client-close cleanup.
    */
-  async downloadFiles(id: string, rels: string[]): Promise<{ kind: 'file'; stream: Readable; entry: FileEntry } | { kind: 'zip'; stream: Readable }> {
+  async downloadFiles(
+    id: string,
+    rels: string[],
+  ): Promise<
+    | { kind: "file"; stream: Readable; entry: FileEntry }
+    | { kind: "zip"; stream: Readable }
+  > {
     const containerId = this.dockerIdForFiles(id);
     const targets = normalizeClientPathList(rels, { allowRoot: false });
 
@@ -1026,19 +1263,26 @@ export class ContainerManager {
 
     // Single regular file -> raw byte stream via Docker getArchive, demuxed
     // from the tar envelope into a plain file stream.
-    if (entries.length === 1 && entries[0]!.type === 'file') {
+    if (entries.length === 1 && entries[0]!.type === "file") {
       const entry = entries[0]!;
-      const tarStream = await this.dockerService.getArchive(containerId, toContainerPath(entry.path));
+      const tarStream = await this.dockerService.getArchive(
+        containerId,
+        toContainerPath(entry.path),
+      );
       const fileStream = demuxSingleFileFromTar(tarStream, entry.size);
-      return { kind: 'file', stream: fileStream, entry };
+      return { kind: "file", stream: fileStream, entry };
     }
 
     // Otherwise build a true ZIP from the Docker tar archives of each target.
     // buildWorkspaceZip returns its output stream immediately and runs the
     // sequential append/finalize detached so output backpressure cannot
     // deadlock; redundant descendant selections are filtered inside it.
-    const zipStream = buildWorkspaceZip(this.dockerService, containerId, entries);
-    return { kind: 'zip', stream: zipStream };
+    const zipStream = buildWorkspaceZip(
+      this.dockerService,
+      containerId,
+      entries,
+    );
+    return { kind: "zip", stream: zipStream };
   }
 
   /**
@@ -1061,31 +1305,46 @@ export class ContainerManager {
    *  Returns `{ ok: true }` on success. Throws an Error carrying `statusCode`
    *  on failure (400/409/422/500) so `rethrowAsHttpError` preserves it.
    */
-  async setClipboard(id: string, mime: 'image/png' | 'text/plain', bytes: Buffer): Promise<{ ok: true }> {
+  async setClipboard(
+    id: string,
+    mime: "image/png" | "text/plain",
+    bytes: Buffer,
+  ): Promise<{ ok: true }> {
     const containerId = this.dockerIdForFiles(id);
-    const res = await this.dockerService.execCapture(containerId, ['sh', '-c', 'head -c "$1" | /home/agent/clipboard/set.sh "$2"', 'agentor-clipboard', String(bytes.length), mime], { stdin: bytes, user: 'agent' });
+    const res = await this.dockerService.execCapture(
+      containerId,
+      [
+        "sh",
+        "-c",
+        'head -c "$1" | /home/agent/clipboard/set.sh "$2"',
+        "agentor-clipboard",
+        String(bytes.length),
+        mime,
+      ],
+      { stdin: bytes, user: "agent" },
+    );
     if (res.exitCode === 0) return { ok: true };
 
     // Map the helper's documented exit codes to HTTP statuses. Messages are
     // fixed strings here (not the helper's stderr) so the response can never
     // leak clipboard data or internal diagnostics.
     const map: Record<number, { statusCode: number; statusMessage: string }> = {
-      2: { statusCode: 415, statusMessage: 'Unsupported clipboard type' },
-      3: { statusCode: 400, statusMessage: 'Empty clipboard payload' },
+      2: { statusCode: 415, statusMessage: "Unsupported clipboard type" },
+      3: { statusCode: 400, statusMessage: "Empty clipboard payload" },
       4: {
         statusCode: 413,
-        statusMessage: 'Clipboard payload exceeds the size limit',
+        statusMessage: "Clipboard payload exceeds the size limit",
       },
-      5: { statusCode: 415, statusMessage: 'Invalid PNG payload' },
-      6: { statusCode: 500, statusMessage: 'Clipboard helper unavailable' },
+      5: { statusCode: 415, statusMessage: "Invalid PNG payload" },
+      6: { statusCode: 500, statusMessage: "Clipboard helper unavailable" },
       7: {
         statusCode: 422,
-        statusMessage: 'Failed to set clipboard selection',
+        statusMessage: "Failed to set clipboard selection",
       },
     };
     const mapped = map[res.exitCode] ?? {
       statusCode: 500,
-      statusMessage: 'Clipboard helper failed',
+      statusMessage: "Clipboard helper failed",
     };
     const err = new Error(mapped.statusMessage) as Error & {
       statusCode?: number;
@@ -1096,26 +1355,29 @@ export class ContainerManager {
 
   async stop(id: string): Promise<void> {
     const info = this.containers.get(id);
-    if (!info) throw new Error('Container not found');
+    if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
     useLogCollector().detach(info.containerId);
     await this.dockerService.stopContainer(info.containerId);
-    info.status = 'stopped';
+    info.status = "stopped";
     info.updatedAt = new Date().toISOString();
     useLogger().info(`[container] stopped ${info.containerName}`);
   }
 
   async restart(id: string): Promise<void> {
     const info = this.containers.get(id);
-    if (!info) throw new Error('Container not found');
+    if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
     useLogCollector().detach(info.containerId);
     await this.dockerService.restartContainer(info.containerId);
-    await this.dockerService.materializeWorkerSecretFiles(info.containerId, await useWorkerConfigStore().resolveAppliedValues(info.userId, id));
-    info.status = 'running';
+    await this.dockerService.materializeWorkerSecretFiles(
+      info.containerId,
+      await useWorkerConfigStore().resolveAppliedValues(info.userId, id),
+    );
+    info.status = "running";
     info.updatedAt = new Date().toISOString();
     useLogCollector()
-      .attach(info.containerName, info.containerId, 'worker', info.displayName)
+      .attach(info.containerName, info.containerId, "worker", info.displayName)
       .catch(() => {});
     useLogger().info(`[container] restarted ${info.containerName}`);
   }
@@ -1125,7 +1387,7 @@ export class ContainerManager {
       (repos ?? []).map((r) => ({
         provider: r.provider,
         url: r.url,
-        branch: r.branch || '',
+        branch: r.branch || "",
       })),
     );
   }
@@ -1156,9 +1418,12 @@ export class ContainerManager {
    *
    * Only the keys present in `patch` are touched. Returns the updated
    * ContainerInfo. */
-  async updateSettings(id: string, patch: UpdateContainerSettingsRequest): Promise<ContainerInfo> {
+  async updateSettings(
+    id: string,
+    patch: UpdateContainerSettingsRequest,
+  ): Promise<ContainerInfo> {
     const info = this.containers.get(id);
-    if (!info) throw new Error('Container not found');
+    if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
 
     let liveChanged = false;
@@ -1172,7 +1437,9 @@ export class ContainerManager {
     // resolves to the built-in `default` environment, so treat `undefined` and the
     // default-env id as the same assignment — otherwise a pure display-name save
     // (which round-trips the form's default-env id) would spuriously flag a rebuild.
-    const envChanged = patch.environmentId !== undefined && patch.environmentId !== (info.environmentId || DEFAULT_ENVIRONMENT_ID);
+    const envChanged =
+      patch.environmentId !== undefined &&
+      patch.environmentId !== (info.environmentId || DEFAULT_ENVIRONMENT_ID);
     if (envChanged) this.resolveEnvironmentConfig(patch.environmentId!); // throws → 400 on a bad id
 
     // Display name — applied immediately (no rebuild).
@@ -1210,7 +1477,10 @@ export class ContainerManager {
           ...(r.branch ? { branch: r.branch } : {}),
         }));
       const next = cleaned.length > 0 ? cleaned : undefined;
-      if (ContainerManager.normRepos(next) !== ContainerManager.normRepos(info.repos)) {
+      if (
+        ContainerManager.normRepos(next) !==
+        ContainerManager.normRepos(info.repos)
+      ) {
         info.repos = next;
         rebuildChanged = true;
       }
@@ -1226,7 +1496,10 @@ export class ContainerManager {
           ...(m.readOnly ? { readOnly: true } : {}),
         }));
       const next = cleaned.length > 0 ? cleaned : undefined;
-      if (ContainerManager.normMounts(next) !== ContainerManager.normMounts(info.mounts)) {
+      if (
+        ContainerManager.normMounts(next) !==
+        ContainerManager.normMounts(info.mounts)
+      ) {
         info.mounts = next;
         rebuildChanged = true;
       }
@@ -1239,7 +1512,9 @@ export class ContainerManager {
       if (this.workerStore) {
         await this.workerStore.upsert(this.containerInfoToWorkerRecord(info));
       }
-      useLogger().info(`[container] updated settings for ${info.containerName}${rebuildChanged ? ' (pending rebuild)' : ''}`);
+      useLogger().info(
+        `[container] updated settings for ${info.containerName}${rebuildChanged ? " (pending rebuild)" : ""}`,
+      );
     }
 
     return info;
@@ -1255,28 +1530,45 @@ export class ContainerManager {
         // Each cleanup is best-effort: one failure (e.g. EACCES on a directory-mode
         // rm -rf, an in-use image) must not abort the rest or leave a half-removed
         // worker in memory. Log and continue.
-        const warn = (what: string) => (err: unknown) => useLogger().warn(`[container] remove ${info.containerName}: ${what} failed: ${err instanceof Error ? err.message : err}`);
+        const warn = (what: string) => (err: unknown) =>
+          useLogger().warn(
+            `[container] remove ${info.containerName}: ${what} failed: ${err instanceof Error ? err.message : err}`,
+          );
         await recordWorkspaceTombstone({
           workerId: info.id,
           userId: info.userId,
           displayName: info.displayName || info.id,
-          backend: this.storageManager?.mode ?? 'volume',
+          backend: this.storageManager?.mode ?? "volume",
           createdAt: info.createdAt,
-        }).catch(warn('workspace tombstone'));
-        await cleanupWorkerMappings(info.containerName).catch(warn('mapping cleanup'));
+        }).catch(warn("workspace tombstone"));
+        await cleanupWorkerMappings(info.containerName).catch(
+          warn("mapping cleanup"),
+        );
         if (this.storageManager) {
-          await this.storageManager.removeWorkerDocker(info.containerName).catch(warn('docker volume'));
-          await this.storageManager.removeWorkerWorkspace(info.userId, info.id, info.containerName).catch(warn('workspace'));
-          await this.storageManager.removeWorkerAgents(info.userId, info.id, info.containerName).catch(warn('agents'));
+          await this.storageManager
+            .removeWorkerDocker(info.containerName)
+            .catch(warn("docker volume"));
+          await this.storageManager
+            .removeWorkerWorkspace(info.userId, info.id, info.containerName)
+            .catch(warn("workspace"));
+          await this.storageManager
+            .removeWorkerAgents(info.userId, info.id, info.containerName)
+            .catch(warn("agents"));
         }
         // Per-worker imported image (from restore) is owned by this worker — drop it.
         if (info.importedImage?.startsWith(IMPORT_IMAGE_PREFIX)) {
-          await this.dockerService.removeImage(info.importedImage).catch(warn('imported image'));
+          await this.dockerService
+            .removeImage(info.importedImage)
+            .catch(warn("imported image"));
         }
         if (this.workerStore) {
-          await this.workerStore.delete(info.userId, info.id).catch(warn('worker record'));
+          await this.workerStore
+            .delete(info.userId, info.id)
+            .catch(warn("worker record"));
         }
-        await useWorkerConfigStore().remove(info.userId, info.id).catch(warn('worker-local configuration'));
+        await useWorkerConfigStore()
+          .remove(info.userId, info.id)
+          .catch(warn("worker-local configuration"));
         useLogger().info(`[container] removed ${info.containerName}`);
       }
     } finally {
@@ -1287,12 +1579,12 @@ export class ContainerManager {
 
   async archive(id: string): Promise<void> {
     const info = this.containers.get(id);
-    if (!info) throw new Error('Container not found');
+    if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
 
     useLogCollector().detach(info.containerId);
 
-    if (info.status === 'running') {
+    if (info.status === "running") {
       await this.dockerService.stopContainer(info.containerId);
     }
 
@@ -1309,14 +1601,14 @@ export class ContainerManager {
 
   async rebuild(id: string): Promise<ContainerInfo> {
     const info = this.containers.get(id);
-    if (!info) throw new Error('Container not found');
+    if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
 
     useLogCollector().detach(info.containerId);
 
     // Stop and remove the old container — workspace, agents, and DinD volumes
     // are preserved (rebuild behaves identically to archive + unarchive).
-    if (info.status === 'running') {
+    if (info.status === "running") {
       await this.dockerService.stopContainer(info.containerId);
     }
     await this.dockerService.removeContainer(info.containerId);
@@ -1333,25 +1625,33 @@ export class ContainerManager {
       envConfig = this.resolveEnvironmentConfig(undefined); // deleted env → default
     }
 
-    const { cpuLimit, memoryLimit, dockerEnabled } = this.deriveLimits(envConfig);
+    const { cpuLimit, memoryLimit, dockerEnabled } =
+      this.deriveLimits(envConfig);
 
     const { gitName, gitEmail } = this.resolveGitIdentity(info.userId);
 
     const workerJson: WorkerJsonPayload = {
       id: info.id,
-      displayName: info.displayName || '',
+      displayName: info.displayName || "",
       repos: info.repos || [],
-      initScript: info.initScript || '',
+      initScript: info.initScript || "",
       gitName,
       gitEmail,
     };
 
-    const { userEnv, credentialBinds } = await this.resolveUserEnvAndBinds(info.userId);
-    const workerConfig = await useWorkerConfigStore().resolveValues(info.userId, info.id);
+    const { userEnv, credentialBinds } = await this.resolveUserEnvAndBinds(
+      info.userId,
+    );
+    const workerConfig = await useWorkerConfigStore().resolveValues(
+      info.userId,
+      info.id,
+    );
 
     // Imported workers reuse their per-worker image (captured rootfs) across
     // rebuilds; falls back to the standard image if that image is gone.
-    const imageOpts = info.importedImage ? await this.resolveImageOpts(info.importedImage) : { image: info.imageRuntimeReference, imageConfig: undefined };
+    const imageOpts = info.importedImage
+      ? await this.resolveImageOpts(info.importedImage)
+      : { image: info.imageRuntimeReference, imageConfig: undefined };
 
     const container = await this.dockerService.createWorkerContainer({
       userId: info.userId,
@@ -1373,7 +1673,9 @@ export class ContainerManager {
       imageConfig: imageOpts.imageConfig,
     });
 
-    const imageName = imageOpts.image || this.config.workerImagePrefix + this.config.workerImage;
+    const imageName =
+      imageOpts.image ||
+      this.config.workerImagePrefix + this.config.workerImage;
     const containerInfo: ContainerInfo = {
       id: info.id,
       userId: info.userId,
@@ -1383,8 +1685,8 @@ export class ContainerManager {
       containerName: info.containerName,
       displayName: info.displayName,
       imageName,
-      imageId: info.imageDigest || '',
-      status: 'running',
+      imageId: info.imageDigest || "",
+      status: "running",
       repos: info.repos,
       mounts: info.mounts,
       initScript: info.initScript,
@@ -1402,7 +1704,9 @@ export class ContainerManager {
     this.containers.set(info.id, containerInfo);
 
     if (this.workerStore) {
-      await this.workerStore.upsert(this.containerInfoToWorkerRecord(containerInfo));
+      await this.workerStore.upsert(
+        this.containerInfoToWorkerRecord(containerInfo),
+      );
     }
     await useWorkerConfigStore().markApplied(info.userId, info.id);
 
@@ -1411,25 +1715,29 @@ export class ContainerManager {
     // Best-effort: the rebuild already succeeded, so a transient Traefik error
     // must not turn it into a 500 (routing self-heals on the next reconcile).
     await reassignWorkerMappings(info.containerName).catch((err) => {
-      useLogger().error(`[container] rebuild ${info.containerName}: traefik reconcile failed: ${err instanceof Error ? err.message : err}`);
+      useLogger().error(
+        `[container] rebuild ${info.containerName}: traefik reconcile failed: ${err instanceof Error ? err.message : err}`,
+      );
     });
 
     useLogCollector()
-      .attach(info.containerName, container.id, 'worker', info.displayName)
+      .attach(info.containerName, container.id, "worker", info.displayName)
       .catch(() => {});
 
-    useLogger().info(`[container] rebuilt ${info.containerName} (${container.id.slice(0, 12)})`);
+    useLogger().info(
+      `[container] rebuilt ${info.containerName} (${container.id.slice(0, 12)})`,
+    );
     await this.reconcileManagedNetworksForWorker(info.userId);
 
     return containerInfo;
   }
 
   async unarchive(userId: string, id: string): Promise<ContainerInfo> {
-    if (!this.workerStore) throw new Error('WorkerStore not available');
+    if (!this.workerStore) throw new Error("WorkerStore not available");
 
     const worker = this.workerStore.get(userId, id);
-    if (!worker || worker.status !== 'archived') {
-      throw new Error('Archived worker not found');
+    if (!worker || worker.status !== "archived") {
+      throw new Error("Archived worker not found");
     }
 
     // containerName is derived from the stable UUID `id`, not stored on the record.
@@ -1444,23 +1752,31 @@ export class ContainerManager {
       envConfig = this.resolveEnvironmentConfig(undefined); // deleted env → default
     }
 
-    const { cpuLimit, memoryLimit, dockerEnabled } = this.deriveLimits(envConfig);
+    const { cpuLimit, memoryLimit, dockerEnabled } =
+      this.deriveLimits(envConfig);
 
     const { gitName, gitEmail } = this.resolveGitIdentity(worker.userId);
 
     const workerJson: WorkerJsonPayload = {
       id: worker.id,
-      displayName: worker.displayName || '',
+      displayName: worker.displayName || "",
       repos: worker.repos || [],
-      initScript: worker.initScript || '',
+      initScript: worker.initScript || "",
       gitName,
       gitEmail,
     };
 
-    const { userEnv, credentialBinds } = await this.resolveUserEnvAndBinds(worker.userId);
-    const workerConfig = await useWorkerConfigStore().resolveValues(worker.userId, worker.id);
+    const { userEnv, credentialBinds } = await this.resolveUserEnvAndBinds(
+      worker.userId,
+    );
+    const workerConfig = await useWorkerConfigStore().resolveValues(
+      worker.userId,
+      worker.id,
+    );
 
-    const imageOpts = worker.importedImage ? await this.resolveImageOpts(worker.importedImage) : { image: worker.imageRuntimeReference, imageConfig: undefined };
+    const imageOpts = worker.importedImage
+      ? await this.resolveImageOpts(worker.importedImage)
+      : { image: worker.imageRuntimeReference, imageConfig: undefined };
 
     const container = await this.dockerService.createWorkerContainer({
       userId: worker.userId,
@@ -1485,7 +1801,9 @@ export class ContainerManager {
     await this.workerStore.unarchive(worker.userId, worker.id);
     await useWorkerConfigStore().markApplied(worker.userId, worker.id);
 
-    const imageName = imageOpts.image || this.config.workerImagePrefix + this.config.workerImage;
+    const imageName =
+      imageOpts.image ||
+      this.config.workerImagePrefix + this.config.workerImage;
     const containerInfo: ContainerInfo = {
       id: worker.id,
       userId: worker.userId,
@@ -1495,8 +1813,8 @@ export class ContainerManager {
       containerName,
       displayName: worker.displayName,
       imageName,
-      imageId: worker.imageDigest || '',
-      status: 'running',
+      imageId: worker.imageDigest || "",
+      status: "running",
       repos: worker.repos,
       mounts: worker.mounts,
       initScript: worker.initScript,
@@ -1516,25 +1834,29 @@ export class ContainerManager {
     // Best-effort Traefik refresh — unarchive already succeeded; a reconcile
     // blip must not fail it (routing self-heals on the next reconcile).
     await reassignWorkerMappings(containerName).catch((err) => {
-      useLogger().error(`[container] unarchive ${containerName}: traefik reconcile failed: ${err instanceof Error ? err.message : err}`);
+      useLogger().error(
+        `[container] unarchive ${containerName}: traefik reconcile failed: ${err instanceof Error ? err.message : err}`,
+      );
     });
 
     useLogCollector()
-      .attach(containerName, container.id, 'worker', worker.displayName)
+      .attach(containerName, container.id, "worker", worker.displayName)
       .catch(() => {});
 
-    useLogger().info(`[container] unarchived ${containerName} (${container.id.slice(0, 12)})`);
+    useLogger().info(
+      `[container] unarchived ${containerName} (${container.id.slice(0, 12)})`,
+    );
     await this.reconcileManagedNetworksForWorker(worker.userId);
 
     return containerInfo;
   }
 
   async deleteArchived(userId: string, id: string): Promise<void> {
-    if (!this.workerStore) throw new Error('WorkerStore not available');
+    if (!this.workerStore) throw new Error("WorkerStore not available");
 
     const worker = this.workerStore.get(userId, id);
-    if (!worker || worker.status !== 'archived') {
-      throw new Error('Archived worker not found');
+    if (!worker || worker.status !== "archived") {
+      throw new Error("Archived worker not found");
     }
 
     // containerName is derived from the stable UUID `id`, not stored on the record.
@@ -1542,25 +1864,38 @@ export class ContainerManager {
 
     // Best-effort cleanups — one failure must not block the others or the final
     // store delete (which is the source of truth for "this worker is gone").
-    const warn = (what: string) => (err: unknown) => useLogger().warn(`[container] deleteArchived ${containerName}: ${what} failed: ${err instanceof Error ? err.message : err}`);
+    const warn = (what: string) => (err: unknown) =>
+      useLogger().warn(
+        `[container] deleteArchived ${containerName}: ${what} failed: ${err instanceof Error ? err.message : err}`,
+      );
     await recordWorkspaceTombstone({
       workerId: worker.id,
       userId: worker.userId,
       displayName: worker.displayName || worker.id,
-      backend: this.storageManager?.mode ?? 'volume',
+      backend: this.storageManager?.mode ?? "volume",
       createdAt: worker.createdAt,
-    }).catch(warn('workspace tombstone'));
-    await cleanupWorkerMappings(containerName).catch(warn('mapping cleanup'));
+    }).catch(warn("workspace tombstone"));
+    await cleanupWorkerMappings(containerName).catch(warn("mapping cleanup"));
     if (this.storageManager) {
-      await this.storageManager.removeWorkerWorkspace(worker.userId, worker.id, containerName).catch(warn('workspace'));
-      await this.storageManager.removeWorkerDocker(containerName).catch(warn('docker volume'));
-      await this.storageManager.removeWorkerAgents(worker.userId, worker.id, containerName).catch(warn('agents'));
+      await this.storageManager
+        .removeWorkerWorkspace(worker.userId, worker.id, containerName)
+        .catch(warn("workspace"));
+      await this.storageManager
+        .removeWorkerDocker(containerName)
+        .catch(warn("docker volume"));
+      await this.storageManager
+        .removeWorkerAgents(worker.userId, worker.id, containerName)
+        .catch(warn("agents"));
     }
     if (worker.importedImage?.startsWith(IMPORT_IMAGE_PREFIX)) {
-      await this.dockerService.removeImage(worker.importedImage).catch(warn('imported image'));
+      await this.dockerService
+        .removeImage(worker.importedImage)
+        .catch(warn("imported image"));
     }
     await this.workerStore.delete(worker.userId, worker.id);
-    await useWorkerConfigStore().remove(worker.userId, worker.id).catch(warn('worker-local configuration'));
+    await useWorkerConfigStore()
+      .remove(worker.userId, worker.id)
+      .catch(warn("worker-local configuration"));
   }
 
   // --- Worker export / import ---
@@ -1570,10 +1905,14 @@ export class ContainerManager {
    * For imported workers, returns the per-worker image plus the standard image's
    * runtime config (entrypoint/env), falling back to the standard image if the
    * imported image no longer exists. */
-  private async resolveImageOpts(importedImage?: string): Promise<{ image?: string; imageConfig?: ImageConfigOverride }> {
+  private async resolveImageOpts(
+    importedImage?: string,
+  ): Promise<{ image?: string; imageConfig?: ImageConfigOverride }> {
     if (!importedImage) return {};
     if (!(await this.dockerService.imageExists(importedImage))) {
-      useLogger().warn(`[container] imported image ${importedImage} missing — using standard worker image`);
+      useLogger().warn(
+        `[container] imported image ${importedImage} missing — using standard worker image`,
+      );
       return {};
     }
     const standard = this.config.workerImagePrefix + this.config.workerImage;
@@ -1586,7 +1925,9 @@ export class ContainerManager {
       // it without the replicated standard-image config produces an unbootable
       // worker. If we can't read that config, fall back to the standard image
       // (loses the captured rootfs but boots) — mirroring the import path.
-      useLogger().warn(`[container] could not read standard image config for imported worker — using standard image: ${err instanceof Error ? err.message : err}`);
+      useLogger().warn(
+        `[container] could not read standard image config for imported worker — using standard image: ${err instanceof Error ? err.message : err}`,
+      );
       return {};
     }
   }
@@ -1599,21 +1940,30 @@ export class ContainerManager {
     opts: {
       includeRootfs: boolean;
       signal?: AbortSignal;
-      onProgress?: (update: { phase: string; progress: number; bytesProcessed: number }) => void | Promise<void>;
+      onProgress?: (update: {
+        phase: string;
+        progress: number;
+        bytesProcessed: number;
+      }) => void | Promise<void>;
     },
   ): Promise<{ stream: Readable; filename: string }> {
     const info = this.containers.get(id);
-    if (!info) throw new Error('Container not found');
-    if (info.status !== 'running' && info.status !== 'stopped') {
+    if (!info) throw new Error("Container not found");
+    if (info.status !== "running" && info.status !== "stopped") {
       // A worker that is creating/removing/error has no exportable container —
       // surface this as a client error (409), not a 500.
-      const err = new Error('Worker must be running or stopped to export') as Error & { statusCode?: number };
+      const err = new Error(
+        "Worker must be running or stopped to export",
+      ) as Error & { statusCode?: number };
       err.statusCode = 409;
       throw err;
     }
 
-    const env = this.environmentStore?.getById(info.environmentId || DEFAULT_ENVIRONMENT_ID) || this.environmentStore?.getById(DEFAULT_ENVIRONMENT_ID);
-    if (!env) throw new Error('Environment not found for export');
+    const env =
+      this.environmentStore?.getById(
+        info.environmentId || DEFAULT_ENVIRONMENT_ID,
+      ) || this.environmentStore?.getById(DEFAULT_ENVIRONMENT_ID);
+    if (!env) throw new Error("Environment not found for export");
 
     const portMappings = usePortMappingStore()
       .list()
@@ -1638,7 +1988,7 @@ export class ContainerManager {
         ...(m.basicAuth ? { basicAuth: m.basicAuth } : {}),
       }));
 
-    const tmpDir = join(this.config.dataDir, 'tmp', `export-${randomUUID()}`);
+    const tmpDir = join(this.config.dataDir, "tmp", `export-${randomUUID()}`);
     await mkdir(tmpDir, { recursive: true });
 
     // Single-shot temp-dir cleanup — fires on stream end/close/error, and runs
@@ -1670,20 +2020,24 @@ export class ContainerManager {
           displayName: info.displayName,
           repos: info.repos ?? [],
           mounts: info.mounts ?? [],
-          initScript: info.initScript ?? '',
+          initScript: info.initScript ?? "",
         },
         // Environment values can contain API keys and other credentials. The
         // portable definition retains non-secret behavior but never exports
         // those values; the importer recreates the environment with an empty
         // value set and the owner must re-enter any required configuration.
-        environment: { ...env, envVars: '' },
+        environment: { ...env, envVars: "" },
         portMappings,
         domainMappings,
         contents: { rootfs: opts.includeRootfs, workspace: true, agents: true },
-        missingSecrets: (await useWorkerConfigStore().resolveValues(info.userId, info.id)).filter((entry) => entry.kind !== 'variable').map((entry) => entry.key),
+        missingSecrets: (
+          await useWorkerConfigStore().resolveValues(info.userId, info.id)
+        )
+          .filter((entry) => entry.kind !== "variable")
+          .map((entry) => entry.key),
       };
       await writeManifest(manifest, join(tmpDir, BUNDLE_FILES.manifest));
-      await report('manifest', 5);
+      await report("manifest", 5);
 
       const files: { name: string; path: string }[] = [
         {
@@ -1692,43 +2046,70 @@ export class ContainerManager {
         },
       ];
 
-      const wsSrc = await this.dockerService.getArchive(info.containerId, EXPORT_WORKSPACE_PATH);
-      bytesProcessed += await writeGzipFile(wsSrc, join(tmpDir, BUNDLE_FILES.workspace), opts.signal);
+      const wsSrc = await this.dockerService.getArchive(
+        info.containerId,
+        EXPORT_WORKSPACE_PATH,
+      );
+      bytesProcessed += await writeGzipFile(
+        wsSrc,
+        join(tmpDir, BUNDLE_FILES.workspace),
+        opts.signal,
+      );
       files.push({
         name: BUNDLE_FILES.workspace,
         path: join(tmpDir, BUNDLE_FILES.workspace),
       });
-      await report('workspace', opts.includeRootfs ? 30 : 45);
+      await report("workspace", opts.includeRootfs ? 30 : 45);
 
-      const agSrc = await this.dockerService.getArchive(info.containerId, EXPORT_AGENTS_PATH);
-      bytesProcessed += await writeFilteredAgentsGz(agSrc, join(tmpDir, BUNDLE_FILES.agents), CREDENTIAL_EXCLUDE_SUFFIXES, SHARED_DATA_EXCLUDE_PREFIXES, opts.signal);
+      const agSrc = await this.dockerService.getArchive(
+        info.containerId,
+        EXPORT_AGENTS_PATH,
+      );
+      bytesProcessed += await writeFilteredAgentsGz(
+        agSrc,
+        join(tmpDir, BUNDLE_FILES.agents),
+        CREDENTIAL_EXCLUDE_SUFFIXES,
+        SHARED_DATA_EXCLUDE_PREFIXES,
+        opts.signal,
+      );
       files.push({
         name: BUNDLE_FILES.agents,
         path: join(tmpDir, BUNDLE_FILES.agents),
       });
-      await report('agent-data', opts.includeRootfs ? 55 : 85);
+      await report("agent-data", opts.includeRootfs ? 55 : 85);
 
       if (opts.includeRootfs) {
         opts.signal?.throwIfAborted();
-        const rootfsSrc = await this.dockerService.exportContainer(info.containerId);
+        const rootfsSrc = await this.dockerService.exportContainer(
+          info.containerId,
+        );
         // Parallel level-1 gzip avoids the historical single-core compression
         // bottleneck while keeping artifacts and import staging bounded.
-        bytesProcessed += await writeGzipFile(rootfsSrc, join(tmpDir, BUNDLE_FILES.rootfs), opts.signal);
+        bytesProcessed += await writeGzipFile(
+          rootfsSrc,
+          join(tmpDir, BUNDLE_FILES.rootfs),
+          opts.signal,
+        );
         files.push({
           name: BUNDLE_FILES.rootfs,
           path: join(tmpDir, BUNDLE_FILES.rootfs),
         });
-        await report('root-filesystem', 85);
+        await report("root-filesystem", 85);
       }
 
       opts.signal?.throwIfAborted();
       const stream = packBundle(files);
-      stream.on('end', cleanup);
-      stream.on('close', cleanup);
-      stream.on('error', cleanup);
+      stream.on("end", cleanup);
+      stream.on("close", cleanup);
+      stream.on("error", cleanup);
 
-      const safe = (info.displayName || info.id.slice(0, 12)).replace(/[^a-zA-Z0-9_-]/g, '_');
-      useLogger().info(`[container] exporting worker ${info.containerName}${opts.includeRootfs ? ' (with rootfs)' : ''}`);
+      const safe = (info.displayName || info.id.slice(0, 12)).replace(
+        /[^a-zA-Z0-9_-]/g,
+        "_",
+      );
+      useLogger().info(
+        `[container] exporting worker ${info.containerName}${opts.includeRootfs ? " (with rootfs)" : ""}`,
+      );
       return { stream, filename: `${safe}-worker-export.tar` };
     } catch (err) {
       cleanup();
@@ -1741,14 +2122,24 @@ export class ContainerManager {
    * recreates port/domain mappings. When the bundle carries a captured rootfs it
    * is imported into a per-worker image; on any failure there it falls back to
    * the standard worker image (config + volumes are still restored). */
-  async importWorker(userId: string, bundlePath: string, opts: { displayName?: string }): Promise<ContainerInfo & { missingSecrets?: string[] }> {
-    if (!userId) throw new Error('import: userId is required');
+  async importWorker(
+    userId: string,
+    bundlePath: string,
+    opts: { displayName?: string },
+  ): Promise<ContainerInfo & { missingSecrets?: string[] }> {
+    if (!userId) throw new Error("import: userId is required");
 
-    const workDir = join(this.config.dataDir, 'tmp', `import-${randomUUID()}`);
+    const workDir = join(this.config.dataDir, "tmp", `import-${randomUUID()}`);
     try {
-      const { manifest, rootfsPath, rootfsCompressed, workspacePath, agentsPath } = await extractBundle(bundlePath, workDir);
-      if (!manifest || typeof manifest.version !== 'number') {
-        throw new Error('Invalid worker export bundle');
+      const {
+        manifest,
+        rootfsPath,
+        rootfsCompressed,
+        workspacePath,
+        agentsPath,
+      } = await extractBundle(bundlePath, workDir);
+      if (!manifest || typeof manifest.version !== "number") {
+        throw new Error("Invalid worker export bundle");
       }
 
       // Validate every compressed inner tar before any Docker image/container
@@ -1757,19 +2148,30 @@ export class ContainerManager {
       for (const payload of [workspacePath, agentsPath]) {
         if (payload) await validateGzipTarPayload(payload);
       }
-      if (rootfsPath) await (rootfsCompressed ? validateGzipTarPayload(rootfsPath) : validateTarPayload(rootfsPath));
+      if (rootfsPath)
+        await (rootfsCompressed
+          ? validateGzipTarPayload(rootfsPath)
+          : validateTarPayload(rootfsPath));
 
-      const environmentId = await this.resolveImportEnvironment(userId, manifest.environment);
+      const environmentId = await this.resolveImportEnvironment(
+        userId,
+        manifest.environment,
+      );
 
       const id = randomUUID();
-      const displayName = (opts.displayName?.trim() || manifest.worker?.displayName || 'imported worker').slice(0, 100);
+      const displayName = (
+        opts.displayName?.trim() ||
+        manifest.worker?.displayName ||
+        "imported worker"
+      ).slice(0, 100);
       const containerName = this.buildContainerName(id);
       const repos = (manifest.worker?.repos ?? []).filter((r) => r.url);
       const mounts = manifest.worker?.mounts ?? [];
-      const initScript = manifest.worker?.initScript || '';
+      const initScript = manifest.worker?.initScript || "";
 
       const envConfig = this.resolveEnvironmentConfig(environmentId);
-      const { cpuLimit, memoryLimit, dockerEnabled } = this.deriveLimits(envConfig);
+      const { cpuLimit, memoryLimit, dockerEnabled } =
+        this.deriveLimits(envConfig);
       const { gitName, gitEmail } = this.resolveGitIdentity(userId);
       const workerJson: WorkerJsonPayload = {
         id,
@@ -1779,8 +2181,12 @@ export class ContainerManager {
         gitName,
         gitEmail,
       };
-      const { userEnv, credentialBinds } = await this.resolveUserEnvAndBinds(userId);
-      const workerConfig = await useWorkerConfigStore().resolveValues(userId, id);
+      const { userEnv, credentialBinds } =
+        await this.resolveUserEnvAndBinds(userId);
+      const workerConfig = await useWorkerConfigStore().resolveValues(
+        userId,
+        id,
+      );
 
       // Import the captured rootfs into a per-worker image (best-effort).
       let importedImage: string | undefined;
@@ -1788,12 +2194,19 @@ export class ContainerManager {
       if (rootfsPath && manifest.contents?.rootfs) {
         try {
           const repo = `${IMPORT_IMAGE_PREFIX}${id}`;
-          importedImage = await this.dockerService.importImage(createReadStream(rootfsPath), repo, 'latest');
-          const standard = this.config.workerImagePrefix + this.config.workerImage;
+          importedImage = await this.dockerService.importImage(
+            createReadStream(rootfsPath),
+            repo,
+            "latest",
+          );
+          const standard =
+            this.config.workerImagePrefix + this.config.workerImage;
           await this.dockerService.ensureImage(standard);
           imageConfig = await this.dockerService.inspectImageConfig(standard);
         } catch (err) {
-          useLogger().warn(`[container] import: rootfs import failed, using standard image: ${err instanceof Error ? err.message : err}`);
+          useLogger().warn(
+            `[container] import: rootfs import failed, using standard image: ${err instanceof Error ? err.message : err}`,
+          );
           importedImage = undefined;
           imageConfig = undefined;
         }
@@ -1827,25 +2240,46 @@ export class ContainerManager {
       // so a failed import doesn't leak an orphan container/image/volumes.
       try {
         if (workspacePath) {
-          await this.dockerService.putArchive(container.id, createReadStream(workspacePath), RESTORE_WORKSPACE_PARENT);
+          await this.dockerService.putArchive(
+            container.id,
+            createReadStream(workspacePath),
+            RESTORE_WORKSPACE_PARENT,
+          );
         }
         if (agentsPath) {
-          await this.dockerService.putArchive(container.id, createReadStream(agentsPath), RESTORE_AGENTS_PARENT);
+          await this.dockerService.putArchive(
+            container.id,
+            createReadStream(agentsPath),
+            RESTORE_AGENTS_PARENT,
+          );
         }
         await container.start();
-        await this.dockerService.materializeWorkerSecretFiles(container.id, workerConfig);
+        await this.dockerService.materializeWorkerSecretFiles(
+          container.id,
+          workerConfig,
+        );
       } catch (err) {
         await this.dockerService.removeContainer(container.id).catch(() => {});
         if (this.storageManager) {
-          await this.storageManager.removeWorkerWorkspace(userId, id, containerName).catch(() => {});
-          await this.storageManager.removeWorkerAgents(userId, id, containerName).catch(() => {});
-          if (dockerEnabled) await this.storageManager.removeWorkerDocker(containerName).catch(() => {});
+          await this.storageManager
+            .removeWorkerWorkspace(userId, id, containerName)
+            .catch(() => {});
+          await this.storageManager
+            .removeWorkerAgents(userId, id, containerName)
+            .catch(() => {});
+          if (dockerEnabled)
+            await this.storageManager
+              .removeWorkerDocker(containerName)
+              .catch(() => {});
         }
-        if (importedImage) await this.dockerService.removeImage(importedImage).catch(() => {});
+        if (importedImage)
+          await this.dockerService.removeImage(importedImage).catch(() => {});
         throw err;
       }
 
-      const imageName = importedImage || this.config.workerImagePrefix + this.config.workerImage;
+      const imageName =
+        importedImage ||
+        this.config.workerImagePrefix + this.config.workerImage;
       const now = new Date().toISOString();
       const containerInfo: ContainerInfo = {
         id,
@@ -1856,8 +2290,8 @@ export class ContainerManager {
         containerName,
         displayName,
         imageName,
-        imageId: '',
-        status: 'running',
+        imageId: "",
+        status: "running",
         repos: repos.length > 0 ? repos : undefined,
         mounts: mounts.length > 0 ? mounts : undefined,
         initScript: initScript || undefined,
@@ -1869,19 +2303,25 @@ export class ContainerManager {
       await useWorkerConfigStore().markApplied(userId, id);
 
       if (this.workerStore) {
-        await this.workerStore.upsert(this.containerInfoToWorkerRecord(containerInfo));
+        await this.workerStore.upsert(
+          this.containerInfoToWorkerRecord(containerInfo),
+        );
       }
 
       await this.recreateImportedMappings(userId, id, containerName, manifest);
 
       useLogCollector()
-        .attach(containerName, container.id, 'worker', displayName)
+        .attach(containerName, container.id, "worker", displayName)
         .catch(() => {});
-      useLogger().info(`[container] imported worker ${containerName} (${container.id.slice(0, 12)})${importedImage ? ' with captured rootfs' : ''}`);
+      useLogger().info(
+        `[container] imported worker ${containerName} (${container.id.slice(0, 12)})${importedImage ? " with captured rootfs" : ""}`,
+      );
 
       return {
         ...containerInfo,
-        ...(manifest.missingSecrets?.length ? { missingSecrets: manifest.missingSecrets } : {}),
+        ...(manifest.missingSecrets?.length
+          ? { missingSecrets: manifest.missingSecrets }
+          : {}),
       };
     } finally {
       await rm(workDir, { recursive: true, force: true }).catch(() => {});
@@ -1891,12 +2331,19 @@ export class ContainerManager {
   /** Resolve the environment to assign an imported worker. Built-in envs are
    * reused by id; a user's own env with a matching name is reused; otherwise the
    * embedded definition is recreated as a new custom env for the importer. */
-  private async resolveImportEnvironment(userId: string, env: Environment | undefined): Promise<string> {
+  private async resolveImportEnvironment(
+    userId: string,
+    env: Environment | undefined,
+  ): Promise<string> {
     if (!this.environmentStore || !env) return DEFAULT_ENVIRONMENT_ID;
     if (env.builtIn) {
-      return this.environmentStore.getById(env.id) ? env.id : DEFAULT_ENVIRONMENT_ID;
+      return this.environmentStore.getById(env.id)
+        ? env.id
+        : DEFAULT_ENVIRONMENT_ID;
     }
-    const existing = this.environmentStore.list().find((e) => e.userId === userId && e.name === env.name);
+    const existing = this.environmentStore
+      .list()
+      .find((e) => e.userId === userId && e.name === env.name);
     if (existing) return existing.id;
     try {
       const created = await this.environmentStore.create({
@@ -1916,7 +2363,9 @@ export class ContainerManager {
       });
       return created.id;
     } catch (err) {
-      useLogger().warn(`[container] import: could not recreate environment '${env.name}', using default: ${err instanceof Error ? err.message : err}`);
+      useLogger().warn(
+        `[container] import: could not recreate environment '${env.name}', using default: ${err instanceof Error ? err.message : err}`,
+      );
       return DEFAULT_ENVIRONMENT_ID;
     }
   }
@@ -1924,7 +2373,12 @@ export class ContainerManager {
   /** Recreate the bundle's port + domain mappings for the new worker, rewriting
    * identity (new owner, container name, worker id). Conflicting or
    * non-applicable mappings are skipped, not fatal. */
-  private async recreateImportedMappings(userId: string, workerId: string, containerName: string, manifest: WorkerExportManifest): Promise<void> {
+  private async recreateImportedMappings(
+    userId: string,
+    workerId: string,
+    containerName: string,
+    manifest: WorkerExportManifest,
+  ): Promise<void> {
     let changed = false;
     for (const m of manifest.portMappings ?? []) {
       try {
@@ -1940,13 +2394,17 @@ export class ContainerManager {
         });
         changed = true;
       } catch (err) {
-        useLogger().warn(`[container] import: skipped port mapping :${m.externalPort} (${err instanceof Error ? err.message : err})`);
+        useLogger().warn(
+          `[container] import: skipped port mapping :${m.externalPort} (${err instanceof Error ? err.message : err})`,
+        );
       }
     }
     const baseDomains = new Set(this.config.baseDomains);
     for (const m of manifest.domainMappings ?? []) {
       if (!baseDomains.has(m.baseDomain)) {
-        useLogger().warn(`[container] import: skipped domain mapping ${m.subdomain ? `${m.subdomain}.` : ''}${m.baseDomain} (base domain not configured here)`);
+        useLogger().warn(
+          `[container] import: skipped domain mapping ${m.subdomain ? `${m.subdomain}.` : ""}${m.baseDomain} (base domain not configured here)`,
+        );
         continue;
       }
       try {
@@ -1963,14 +2421,18 @@ export class ContainerManager {
         });
         changed = true;
       } catch (err) {
-        useLogger().warn(`[container] import: skipped domain mapping ${m.baseDomain} (${err instanceof Error ? err.message : err})`);
+        useLogger().warn(
+          `[container] import: skipped domain mapping ${m.baseDomain} (${err instanceof Error ? err.message : err})`,
+        );
       }
     }
     if (changed) {
       try {
         await useTraefikManager().reconcile();
       } catch (err) {
-        useLogger().error(`[container] import: traefik reconcile failed: ${err instanceof Error ? err.message : err}`);
+        useLogger().error(
+          `[container] import: traefik reconcile failed: ${err instanceof Error ? err.message : err}`,
+        );
       }
     }
   }
@@ -1986,7 +2448,7 @@ export class ContainerManager {
     for (const [, info] of this.containers) {
       activeContainerNames.add(info.containerName);
       const existing = this.workerStore.get(info.userId, info.id);
-      if (!existing || existing.status === 'active') {
+      if (!existing || existing.status === "active") {
         await this.workerStore.upsert(this.containerInfoToWorkerRecord(info));
       }
     }
@@ -2008,7 +2470,7 @@ export class ContainerManager {
       createdAt: info.createdAt,
       updatedAt: info.updatedAt,
       displayName: info.displayName,
-      status: 'active',
+      status: "active",
       environmentId: info.environmentId,
       repos: info.repos,
       mounts: info.mounts,
@@ -2033,47 +2495,76 @@ export class ContainerManager {
   async createTmuxWindow(id: string, name?: string): Promise<TmuxWindow> {
     const containerId = this.dockerIdFor(id);
     const windowName = name || `shell-${nanoid(4)}`;
-    await this.dockerService.execTmux(containerId, ['new-window', '-t', 'main:', '-n', windowName]);
+    await this.dockerService.execTmux(containerId, [
+      "new-window",
+      "-t",
+      "main:",
+      "-n",
+      windowName,
+    ]);
     const windows = await this.dockerService.execListTmuxWindows(containerId);
     const created = windows.findLast((w) => w.name === windowName);
     if (!created) {
-      throw new Error('Failed to find newly created tmux window');
+      throw new Error("Failed to find newly created tmux window");
     }
     return created;
   }
 
-  async renameTmuxWindow(id: string, windowIndex: number, newName: string): Promise<void> {
-    await this.dockerService.execTmux(this.dockerIdFor(id), ['rename-window', '-t', `main:${windowIndex}`, newName]);
+  async renameTmuxWindow(
+    id: string,
+    windowIndex: number,
+    newName: string,
+  ): Promise<void> {
+    await this.dockerService.execTmux(this.dockerIdFor(id), [
+      "rename-window",
+      "-t",
+      `main:${windowIndex}`,
+      newName,
+    ]);
   }
 
   async killTmuxWindow(id: string, windowIndex: number): Promise<void> {
     if (windowIndex === 0) {
-      throw new Error('Cannot kill the main tmux window');
+      throw new Error("Cannot kill the main tmux window");
     }
-    await this.dockerService.execTmux(this.dockerIdFor(id), ['kill-window', '-t', `main:${windowIndex}`]);
+    await this.dockerService.execTmux(this.dockerIdFor(id), [
+      "kill-window",
+      "-t",
+      `main:${windowIndex}`,
+    ]);
   }
 
   getServiceStatus(id: string): ServiceStatus {
     const info = this.containers.get(id);
     return {
-      running: info?.status === 'running',
+      running: info?.status === "running",
       containerId: info?.containerId,
     };
   }
 
   // --- Generic app instance methods ---
 
-  async listAppInstances(id: string, appTypeId: string): Promise<AppInstanceInfo[]> {
+  async listAppInstances(
+    id: string,
+    appTypeId: string,
+  ): Promise<AppInstanceInfo[]> {
     const info = this.containers.get(id);
-    if (!info || info.status !== 'running') return [];
-    const instances = await this.dockerService.listAppInstances(info.containerId, appTypeId);
+    if (!info || info.status !== "running") return [];
+    const instances = await this.dockerService.listAppInstances(
+      info.containerId,
+      appTypeId,
+    );
 
     // Enrich instances with their externally mapped port (if any) so the UI
     // can render SSH connection strings etc. without a second round-trip.
     const appType = getAppType(appTypeId);
     if (appType?.autoPortMapping) {
       for (const inst of instances) {
-        const mapping = usePortMappingStore().findByWorkerAndAppType(info.containerName, appTypeId, inst.id);
+        const mapping = usePortMappingStore().findByWorkerAndAppType(
+          info.containerName,
+          appTypeId,
+          inst.id,
+        );
         if (mapping) inst.externalPort = mapping.externalPort;
       }
     }
@@ -2083,7 +2574,10 @@ export class ContainerManager {
   /** AppCreateResult — returned by createAppInstance. `externalPort` is set for
    * apps with `autoPortMapping` (e.g. ssh) so the UI can render the connect
    * string immediately. */
-  async createAppInstance(id: string, appTypeId: string): Promise<{ id: string; port: number; externalPort?: number }> {
+  async createAppInstance(
+    id: string,
+    appTypeId: string,
+  ): Promise<{ id: string; port: number; externalPort?: number }> {
     const info = this.assertRunning(id);
 
     const appType = getAppType(appTypeId);
@@ -2091,17 +2585,26 @@ export class ContainerManager {
       throw new Error(`Unknown app type: ${appTypeId}`);
     }
 
-    const existing = await this.dockerService.listAppInstances(info.containerId, appTypeId);
+    const existing = await this.dockerService.listAppInstances(
+      info.containerId,
+      appTypeId,
+    );
 
     if (appType.singleton) {
-      const alreadyRunning = existing.find((i) => i.status === 'running' || i.status === 'auth_required');
+      const alreadyRunning = existing.find(
+        (i) => i.status === "running" || i.status === "auth_required",
+      );
       if (alreadyRunning) {
-        const err = new Error(`${appType.displayName} is already running`) as Error & { statusCode?: number };
+        const err = new Error(
+          `${appType.displayName} is already running`,
+        ) as Error & { statusCode?: number };
         err.statusCode = 409;
         throw err;
       }
     } else if (existing.length >= appType.maxInstances) {
-      throw new Error(`Maximum ${appType.displayName} instances reached (${appType.maxInstances})`);
+      throw new Error(
+        `Maximum ${appType.displayName} instances reached (${appType.maxInstances})`,
+      );
     }
 
     // Allocate an internal port. Apps without a port range (`ports: []`) use
@@ -2116,23 +2619,30 @@ export class ContainerManager {
       const portDef = appType.ports[0]!;
       const usedPorts = new Set(existing.map((i) => i.port));
       let found: number | null = null;
-      for (let p = portDef.internalPortStart; p <= portDef.internalPortEnd; p++) {
+      for (
+        let p = portDef.internalPortStart;
+        p <= portDef.internalPortEnd;
+        p++
+      ) {
         if (!usedPorts.has(p)) {
           found = p;
           break;
         }
       }
-      if (found === null) throw new Error(`No available ports for ${appType.displayName}`);
+      if (found === null)
+        throw new Error(`No available ports for ${appType.displayName}`);
       port = found;
     }
 
     // Allocate an instance id. For singletons the id is fixed to the app type id
     // so restarts reuse the same identifier (and the same port mapping).
-    const instanceId = appType.singleton ? appTypeId : `${appTypeId}-${Date.now().toString(36)}`;
+    const instanceId = appType.singleton
+      ? appTypeId
+      : `${appTypeId}-${Date.now().toString(36)}`;
 
     // Compose any app-type-specific extra args for `manage.sh start`.
     const extraArgs: string[] = [];
-    if (appTypeId === 'vscode') {
+    if (appTypeId === "vscode") {
       extraArgs.push(this.buildTunnelName(info.userId, info.id));
     }
 
@@ -2141,10 +2651,21 @@ export class ContainerManager {
     // remove it manually if needed).
     let externalPort: number | undefined;
     if (appType.autoPortMapping) {
-      externalPort = await this.ensureAutoPortMapping(info, appType, instanceId, port);
+      externalPort = await this.ensureAutoPortMapping(
+        info,
+        appType,
+        instanceId,
+        port,
+      );
     }
 
-    await this.dockerService.startAppInstance(info.containerId, appTypeId, instanceId, port, extraArgs);
+    await this.dockerService.startAppInstance(
+      info.containerId,
+      appTypeId,
+      instanceId,
+      port,
+      extraArgs,
+    );
 
     return {
       id: instanceId,
@@ -2153,11 +2674,20 @@ export class ContainerManager {
     };
   }
 
-  private async ensureAutoPortMapping(info: ContainerInfo, appType: NonNullable<ReturnType<typeof getAppType>>, instanceId: string, internalPort: number): Promise<number> {
+  private async ensureAutoPortMapping(
+    info: ContainerInfo,
+    appType: NonNullable<ReturnType<typeof getAppType>>,
+    instanceId: string,
+    internalPort: number,
+  ): Promise<number> {
     const cfg = appType.autoPortMapping!;
     const store = usePortMappingStore();
     const traefik = useTraefikManager();
-    const existing = store.findByWorkerAndAppType(info.containerName, appType.id, instanceId);
+    const existing = store.findByWorkerAndAppType(
+      info.containerName,
+      appType.id,
+      instanceId,
+    );
     if (existing) {
       return existing.externalPort;
     }
@@ -2170,9 +2700,15 @@ export class ContainerManager {
     const tried = new Set<number>();
     const MAX_ATTEMPTS = 20;
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      const externalPort = store.findFreeExternalPort(cfg.externalPortStart, cfg.externalPortEnd, tried);
+      const externalPort = store.findFreeExternalPort(
+        cfg.externalPortStart,
+        cfg.externalPortEnd,
+        tried,
+      );
       if (externalPort === null) {
-        throw new Error(`No available external ports for ${appType.displayName} in ${cfg.externalPortStart}-${cfg.externalPortEnd}`);
+        throw new Error(
+          `No available external ports for ${appType.displayName} in ${cfg.externalPortStart}-${cfg.externalPortEnd}`,
+        );
       }
       tried.add(externalPort);
       await store.add({
@@ -2190,14 +2726,26 @@ export class ContainerManager {
         return externalPort;
       } catch (err) {
         await store.remove(externalPort).catch(() => {});
-        useLogger().warn(`[container] auto port mapping :${externalPort} for ${appType.displayName} could not be bound (${err instanceof Error ? err.message : err}) — trying next port`);
+        useLogger().warn(
+          `[container] auto port mapping :${externalPort} for ${appType.displayName} could not be bound (${err instanceof Error ? err.message : err}) — trying next port`,
+        );
       }
     }
-    throw new Error(`Could not allocate a bindable external port for ${appType.displayName} after ${MAX_ATTEMPTS} attempts`);
+    throw new Error(
+      `Could not allocate a bindable external port for ${appType.displayName} after ${MAX_ATTEMPTS} attempts`,
+    );
   }
 
-  async stopAppInstance(id: string, appTypeId: string, instanceId: string): Promise<void> {
+  async stopAppInstance(
+    id: string,
+    appTypeId: string,
+    instanceId: string,
+  ): Promise<void> {
     const info = this.assertRunning(id);
-    await this.dockerService.stopAppInstance(info.containerId, appTypeId, instanceId);
+    await this.dockerService.stopAppInstance(
+      info.containerId,
+      appTypeId,
+      instanceId,
+    );
   }
 }

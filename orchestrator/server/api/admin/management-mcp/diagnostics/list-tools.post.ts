@@ -4,8 +4,8 @@ import { useManagementMcpStore } from "../../../../utils/management-mcp-store";
 export default defineEventHandler(async (event) => {
   requireAdmin(event);
   const body = await readBody<{ credential?: unknown }>(event);
-  await useManagementMcpStore().introspect(body?.credential);
-  return useManagementMcpStore().listTools();
+  const identity = await useManagementMcpStore().introspect(body?.credential);
+  return useManagementMcpStore().listTools(identity);
 });
 
 defineRouteMeta({

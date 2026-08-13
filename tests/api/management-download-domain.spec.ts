@@ -55,7 +55,7 @@ test("workspace handoffs bind identity, owner, and exact normalized paths", asyn
   expect(JSON.stringify(prepared.result)).not.toMatch(/\/api\/workspaces|base64|cookie/i);
   const token = prepared.result.downloadPath.split("/").pop();
   await expect(domain.open("other-workspace", token, () => {})).rejects.toMatchObject({ statusCode: 404 });
-  const download = await domain.open("admin-workspace", token, (capability) => expect(capability).toBe("storage"));
+  const download = await domain.open("admin-workspace", token, (prepared) => expect(prepared.capability).toBe("storage"));
   expect(download).toMatchObject({ contentType: "application/octet-stream", filename: "large_payload.bin", size: 4_000_000,
     audit: { workspaceId: "admin-workspace", kind: "workspace", resourceId: "workspace-a", ownerId: "owner-a" } });
   expect(opened).toEqual([{ owner: "owner-a", paths: ["folder/file.bin"] }]);
@@ -106,7 +106,7 @@ test("completed export handoffs recheck job ownership", async () => {
   expect(prepared.result).toMatchObject({ ready: true, method: "GET", filename: "worker_export.tar" });
   current = { ...current, userId: "owner-b" };
   await expect(domain.open("admin-workspace", prepared.result.downloadPath.split("/").pop(),
-    (capability) => expect(capability).toBe("exports"))).rejects.toMatchObject({ statusCode: 404 });
+    (prepared) => expect(prepared.capability).toBe("exports"))).rejects.toMatchObject({ statusCode: 404 });
   expect(artifactOpens).toBe(0);
 });
 

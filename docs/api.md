@@ -22,7 +22,23 @@ The **Backups** API uses `/api/backups`, `/api/backup-jobs`, `/api/backup-settin
 
 The **Image catalog** API uses `/api/image-catalog`, `/api/image-builds`, and `/api/image-builder`. It covers constrained validation, asynchronous controlled builds/logs/cancel, immutable versions, promotion/rollback/defaults/test workers/cleanup, plus optional `/api/image-catalog/git/*` connection/sync/recovery. Git credentials are write-only. Fake build/Git diagnostics are test-gated.
 
-The **Admin workspace** and **Management MCP** APIs are administrator-only. Workspace lifecycle uses dedicated routes so ordinary container lifecycle endpoints cannot mutate the trusted runtime. MCP policy, audit, and optional proposal-review routes expose sanitized records; diagnostic identity/invocation/network routes return 404 unless explicitly enabled for tests or diagnostics. The MCP transport itself has no public HTTP/Traefik route. Enabled tools include harness annotations, disabled capability groups are omitted from discovery, and worker console sessions target linked tmux sessions inside the selected worker rather than a host shell.
+The **Admin workspace** and **Management MCP** APIs are administrator-only.
+Workspace lifecycle uses dedicated routes so ordinary container lifecycle
+endpoints cannot mutate a trusted runtime. A worker-group owner can additionally
+manage that group's one scoped workspace through
+`/api/worker-groups/:id/admin-workspace`: `GET` reads status, `POST` provisions,
+and `POST /start`, `POST /stop`, and `POST /rebuild` control its lifecycle.
+This does not expose the global administrator workspace. A credential issued to
+the group workspace is bound to that group and is checked against live,
+same-owner membership on every management-MCP call, console operation, and
+private handoff redemption; group-scoped principals cannot mutate groups or
+membership. MCP policy, audit, and optional proposal-review routes expose
+sanitized records; diagnostic identity/invocation/network routes return 404
+unless explicitly enabled for tests or diagnostics. The MCP transport itself
+has no public HTTP/Traefik route. Enabled tools include harness annotations,
+disabled capability groups are omitted from discovery, and worker console
+sessions target linked tmux sessions inside the selected worker rather than a
+host shell.
 
 The administrator-only **storage** API at `/api/admin/storage` reports bounded installation disk visibility and `/api/admin/storage/cleanup` performs only conservative cleanup of dangling images/build cache, exited Agentor helpers, and old Agentor staging directories. It never selects referenced images, active jobs, workspaces, or retained artifacts for deletion.
 

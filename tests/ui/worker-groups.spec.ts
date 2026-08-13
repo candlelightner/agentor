@@ -47,8 +47,15 @@ test.describe.serial("Worker groups dashboard", () => {
         return persisted?.workerIds || [];
       })
       .toEqual([workerId]);
-    await group.getByRole("button", { name: "Delete" }).click();
-    await expect(group).toBeHidden();
+    await group.getByRole("button", { name: "Provision group admin" }).click();
+    await expect(group.getByText("running", { exact: true })).toBeVisible({ timeout: 120_000 });
+    await expect.poll(async () => (await request.get(`/api/worker-groups/${groupId}/admin-workspace`)).status(), { timeout: 120_000 }).toBe(200);
+    await group.getByRole("button", { name: "Open terminal" }).click();
+    await expect(page.getByText("GROUP ADMIN - Terminal", { exact: true })).toBeVisible({ timeout: 30_000 });
+    await page.getByRole("button", { name: "Worker groups" }).click();
+    const reopened = page.getByRole("dialog", { name: "Worker groups" }).locator("section").filter({ hasText: groupName });
+    await reopened.getByRole("button", { name: "Delete" }).click();
+    await expect(reopened).toBeHidden();
     groupId = "";
     expect((await request.get(`/api/containers/${workerId}`)).status()).toBe(
       200,

@@ -1,14 +1,45 @@
-import { useConfig, useDockerService, useContainerManager, usePortMappingStore, useDomainMappingStore, useTraefikManager, useEnvironmentStore, useWorkerStore, useWorkerGroupStore, useManagedNetworkStore, useUpdateChecker, useUsageChecker, useResourceMonitor, useUserCredentialManager, useUserEnvStore, useOrphanSweeper, useStorageManager, useCapabilityStore, useInstructionStore, useInitScriptStore, useLogStore, useLogger, useLogCollector, useExportJobManager } from '../utils/services';
-import { loadBuiltInCapabilities, loadBuiltInInstructions, loadBuiltInInitScripts, loadBuiltInEnvironments } from '../utils/built-in-content';
-import { migrateAuth, getAuthDb } from '../utils/auth';
-import { cleanupWorkspaceHelpers } from '../utils/workspace-access';
-import { useBackupManager } from '../utils/backup-manager';
-import { useImageCatalogManager } from '../utils/image-catalog';
-import { useAdminWorkspaceStore } from '../utils/admin-workspace-store';
-import { DockerAdminWorkspaceRuntime } from '../utils/admin-workspace-runtime';
-import { useManagementMcpStore } from '../utils/management-mcp-store';
-import { ManagementMcpTransport } from '../utils/management-mcp-transport';
-import { useGitImageCatalogManager } from '../utils/git-image-manager';
+import {
+  useConfig,
+  useDockerService,
+  useContainerManager,
+  usePortMappingStore,
+  useDomainMappingStore,
+  useTraefikManager,
+  useEnvironmentStore,
+  useWorkerStore,
+  useWorkerGroupStore,
+  useManagedNetworkStore,
+  useUpdateChecker,
+  useUsageChecker,
+  useResourceMonitor,
+  useUserCredentialManager,
+  useUserEnvStore,
+  useOrphanSweeper,
+  useStorageManager,
+  useCapabilityStore,
+  useInstructionStore,
+  useInitScriptStore,
+  useLogStore,
+  useLogger,
+  useLogCollector,
+  useExportJobManager,
+} from "../utils/services";
+import {
+  loadBuiltInCapabilities,
+  loadBuiltInInstructions,
+  loadBuiltInInitScripts,
+  loadBuiltInEnvironments,
+} from "../utils/built-in-content";
+import { migrateAuth, getAuthDb } from "../utils/auth";
+import { cleanupWorkspaceHelpers } from "../utils/workspace-access";
+import { useBackupManager } from "../utils/backup-manager";
+import { useImageCatalogManager } from "../utils/image-catalog";
+import { useAdminWorkspaceStore } from "../utils/admin-workspace-store";
+import { useGroupAdminWorkspaceStore } from "../utils/group-admin-workspace-store";
+import { DockerAdminWorkspaceRuntime } from "../utils/admin-workspace-runtime";
+import { useManagementMcpStore } from "../utils/management-mcp-store";
+import { ManagementMcpTransport } from "../utils/management-mcp-transport";
+import { useGitImageCatalogManager } from "../utils/git-image-manager";
 
 export default defineNitroPlugin(async (nitroApp) => {
   // Initialize logging infrastructure first
@@ -22,12 +53,21 @@ export default defineNitroPlugin(async (nitroApp) => {
   // dev-mode hot reload doesn't stack duplicate listeners.
   if (!(globalThis as any).__agentorProcessHandlers) {
     (globalThis as any).__agentorProcessHandlers = true;
-    process.on('unhandledRejection', (reason: unknown) => {
-      const msg = reason instanceof Error ? (reason.stack || reason.message) : String(reason);
-      try { useLogger().error(`[process] unhandledRejection: ${msg}`); } catch {}
+    process.on("unhandledRejection", (reason: unknown) => {
+      const msg =
+        reason instanceof Error
+          ? reason.stack || reason.message
+          : String(reason);
+      try {
+        useLogger().error(`[process] unhandledRejection: ${msg}`);
+      } catch {}
     });
-    process.on('uncaughtException', (err: Error) => {
-      try { useLogger().error(`[process] uncaughtException: ${err.stack || err.message}`); } catch {}
+    process.on("uncaughtException", (err: Error) => {
+      try {
+        useLogger().error(
+          `[process] uncaughtException: ${err.stack || err.message}`,
+        );
+      } catch {}
     });
   }
 
@@ -44,9 +84,16 @@ export default defineNitroPlugin(async (nitroApp) => {
   // builds (and memoizes) the auth instance internally, so no standalone
   // `useAuth()` is needed here.
   const dockerService = useDockerService();
-  const [, , staleWorkspaceHelpers] = await Promise.all([migrateAuth(), dockerService.ensureNetwork(), cleanupWorkspaceHelpers()]);
-  logger.info('[agentor] auth initialized');
-  if (staleWorkspaceHelpers > 0) logger.info(`[agentor] removed ${staleWorkspaceHelpers} stale workspace helper container(s)`);
+  const [, , staleWorkspaceHelpers] = await Promise.all([
+    migrateAuth(),
+    dockerService.ensureNetwork(),
+    cleanupWorkspaceHelpers(),
+  ]);
+  logger.info("[agentor] auth initialized");
+  if (staleWorkspaceHelpers > 0)
+    logger.info(
+      `[agentor] removed ${staleWorkspaceHelpers} stale workspace helper container(s)`,
+    );
 
   // Storage manager must finish before any store init — stores resolve paths
   // via `<DATA_DIR>/...` and seedBuiltIns writes into `<DATA_DIR>/defaults/`.
@@ -114,11 +161,17 @@ export default defineNitroPlugin(async (nitroApp) => {
   // Restore desired managed-network membership after a daemon/orchestrator
   // restart. Keep worker startup available if a user-created bridge is broken;
   // validation/UI will expose the failed network instead of hiding it.
-  const { useManagedNetworkManager } = await import('../utils/managed-network-manager');
+  const { useManagedNetworkManager } = await import(
+    "../utils/managed-network-manager"
+  );
   for (const userId of useManagedNetworkStore().listUserIds())
-    await useManagedNetworkManager().reconcileOwner(userId).catch((error) =>
-      logger.warn(`[agentor] managed network reconciliation failed for ${userId}: ${error instanceof Error ? error.message : error}`),
-    );
+    await useManagedNetworkManager()
+      .reconcileOwner(userId)
+      .catch((error) =>
+        logger.warn(
+          `[agentor] managed network reconciliation failed for ${userId}: ${error instanceof Error ? error.message : error}`,
+        ),
+      );
 
   // The administrative workspace uses a separate, generated Docker boundary:
   // its image/mount/network inputs are not accepted from dashboard requests.
@@ -126,10 +179,17 @@ export default defineNitroPlugin(async (nitroApp) => {
   // management network and still authenticates + authorizes every JSON-RPC
   // call through ManagementMcpStore.
   const adminRuntime = new DockerAdminWorkspaceRuntime(useConfig());
+  const managementMcp = new ManagementMcpTransport(useManagementMcpStore());
+  adminRuntime.setManagementListener((host) => managementMcp.start(host));
   const adminWorkspace = useAdminWorkspaceStore();
   adminWorkspace.setRuntimeAdapter(adminRuntime);
+  const groupAdminWorkspaces = useGroupAdminWorkspaceStore();
+  groupAdminWorkspaces.setRuntimeAdapter(adminRuntime);
+  groupAdminWorkspaces.setIdentityMaterializer(async (record) => {
+    const identity = await useManagementMcpStore().issue(record.id, 60);
+    await adminRuntime.materializeCredential(identity.credential, record);
+  });
   await adminRuntime.initializeBoundary();
-  const managementMcp = new ManagementMcpTransport(useManagementMcpStore());
   await managementMcp.start(await adminRuntime.managementAddress());
   let adminIdentityTimer: NodeJS.Timeout | undefined;
   const refreshAdminIdentity = async () => {
@@ -137,8 +197,14 @@ export default defineNitroPlugin(async (nitroApp) => {
       const workspace = await adminWorkspace.ensure();
       const identity = await useManagementMcpStore().issue(workspace.id, 60);
       await adminRuntime.materializeCredential(identity.credential);
+      for (const group of useWorkerGroupStore().list()) {
+        if (!group.adminWorkspace) continue;
+        await groupAdminWorkspaces.ensure(group.id);
+      }
     } catch (error) {
-      logger.error(`[agentor] administrative workspace identity refresh failed: ${error instanceof Error ? error.message : error}`);
+      logger.error(
+        `[agentor] administrative workspace identity refresh failed: ${error instanceof Error ? error.message : error}`,
+      );
     }
   };
   await refreshAdminIdentity();
@@ -148,16 +214,22 @@ export default defineNitroPlugin(async (nitroApp) => {
   // Mappings survive stop/archive/unarchive/rebuild, so the cleanup set
   // includes BOTH active containers and archived workers (matched by containerName).
   const knownContainerNames = new Set<string>();
-  for (const c of containerManager.list()) knownContainerNames.add(c.containerName);
+  for (const c of containerManager.list())
+    knownContainerNames.add(c.containerName);
   // Archived workers have no live container — derive their stable name from the id.
-  for (const w of workerStore.list()) knownContainerNames.add(containerManager.buildContainerName(w.id));
+  for (const w of workerStore.list())
+    knownContainerNames.add(containerManager.buildContainerName(w.id));
 
   const [staleCount, staleDomainCount] = await Promise.all([
     portMappingStore.cleanupStaleContainers(knownContainerNames),
     domainMappingStore.cleanupStaleContainers(knownContainerNames),
   ]);
-  if (staleCount > 0) logger.info(`[agentor] cleaned up ${staleCount} stale port mapping(s)`);
-  if (staleDomainCount > 0) logger.info(`[agentor] cleaned up ${staleDomainCount} stale domain mapping(s)`);
+  if (staleCount > 0)
+    logger.info(`[agentor] cleaned up ${staleCount} stale port mapping(s)`);
+  if (staleDomainCount > 0)
+    logger.info(
+      `[agentor] cleaned up ${staleDomainCount} stale domain mapping(s)`,
+    );
 
   // Traefik reads the mapping stores; init it once they are clean.
   const traefikManager = useTraefikManager();
@@ -169,18 +241,30 @@ export default defineNitroPlugin(async (nitroApp) => {
   usageChecker.setCredentialManager(userCredentialManager);
   // ResourceMonitor enumerates running workers, so init it after reconcile.
   const resourceMonitor = useResourceMonitor();
-  await Promise.all([updateChecker.init(), usageChecker.init(), resourceMonitor.init()]);
+  await Promise.all([
+    updateChecker.init(),
+    usageChecker.init(),
+    resourceMonitor.init(),
+  ]);
 
   // Start the orphan sweeper — on a 10-minute interval, prunes per-user
   // data for users that no longer exist in the auth DB. Uses a timer rather
   // than a middleware to avoid ever touching better-auth's request pipeline.
-  useOrphanSweeper().addCleanupHook((userId) => useBackupManager().forgetUser(userId));
+  useOrphanSweeper().addCleanupHook((userId) =>
+    useBackupManager().forgetUser(userId),
+  );
   useOrphanSweeper().addCandidateSource(() => useBackupManager().ownerIds());
-  useOrphanSweeper().addCleanupHook((userId) => useImageCatalogManager().forgetOwner(userId));
-  useOrphanSweeper().addCandidateSource(() => useImageCatalogManager().ownerIds());
+  useOrphanSweeper().addCleanupHook((userId) =>
+    useImageCatalogManager().forgetOwner(userId),
+  );
+  useOrphanSweeper().addCandidateSource(() =>
+    useImageCatalogManager().ownerIds(),
+  );
   useOrphanSweeper().start();
 
-  logger.info(`[agentor] Synced ${containerManager.list().length} containers, ${workerStore.listArchived().length} archived, ${environmentStore.list().length} environments, ${capabilityStore.list().length} capabilities, ${instructionStore.list().length} instructions, ${initScriptStore.list().length} init scripts, ${portMappingStore.list().length} port mappings, ${domainMappingStore.list().length} domain mappings`);
+  logger.info(
+    `[agentor] Synced ${containerManager.list().length} containers, ${workerStore.listArchived().length} archived, ${environmentStore.list().length} environments, ${capabilityStore.list().length} capabilities, ${instructionStore.list().length} instructions, ${initScriptStore.list().length} init scripts, ${portMappingStore.list().length} port mappings, ${domainMappingStore.list().length} domain mappings`,
+  );
 
   // Mark logger as ready (flushes buffered entries) and start collecting
   // logs from worker + traefik containers. Self-attach already ran at the
@@ -193,17 +277,39 @@ export default defineNitroPlugin(async (nitroApp) => {
   // resources so the SQLite WAL isn't left mid-write and the in-flight log
   // write-queue flushes its last buffered lines. Nitro fires `close` on
   // SIGTERM/SIGINT.
-  nitroApp.hooks.hook('close', async () => {
-    try { useOrphanSweeper().stop(); } catch {}
-    try { useUpdateChecker().stop?.(); } catch {}
-    try { useUsageChecker().stop?.(); } catch {}
-    try { useResourceMonitor().stop?.(); } catch {}
-    try { useExportJobManager().stop(); } catch {}
-    try { useBackupManager().stop(); } catch {}
-    try { if (adminIdentityTimer) clearInterval(adminIdentityTimer); } catch {}
-    try { await managementMcp.stop(); } catch {}
-    try { useLogCollector().detachAll(); } catch {}
-    try { await useLogStore().destroy(); } catch {}
-    try { getAuthDb().close(); } catch {}
+  nitroApp.hooks.hook("close", async () => {
+    try {
+      useOrphanSweeper().stop();
+    } catch {}
+    try {
+      useUpdateChecker().stop?.();
+    } catch {}
+    try {
+      useUsageChecker().stop?.();
+    } catch {}
+    try {
+      useResourceMonitor().stop?.();
+    } catch {}
+    try {
+      useExportJobManager().stop();
+    } catch {}
+    try {
+      useBackupManager().stop();
+    } catch {}
+    try {
+      if (adminIdentityTimer) clearInterval(adminIdentityTimer);
+    } catch {}
+    try {
+      await managementMcp.stop();
+    } catch {}
+    try {
+      useLogCollector().detachAll();
+    } catch {}
+    try {
+      await useLogStore().destroy();
+    } catch {}
+    try {
+      getAuthDb().close();
+    } catch {}
   });
 });

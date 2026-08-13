@@ -98,6 +98,12 @@ function handleAdminService(workspaceId: string, service: string) {
   openTab(workspaceId, "ADMIN / ORCHESTRATOR", service);
   showAdminWorkspaceModal.value = false;
 }
+function handleGroupAdminService(workspaceId: string, service: string) {
+  if (service === "terminal" || service === "desktop" || service === "editor") {
+    openTab(workspaceId, "GROUP ADMIN", service);
+    showWorkerGroupsModal.value = false;
+  }
+}
 
 async function handleCreate(request: CreateContainerRequest) {
   const container = await createContainer(request);
@@ -359,8 +365,15 @@ function onCreateModalClosed() {
       @service="handleAdminService"
     />
     <ManagementMcpModal v-model:open="showManagementMcpModal" />
-    <WorkerGroupsModal v-model:open="showWorkerGroupsModal" :containers="containers" />
-    <ManagedNetworksModal v-model:open="showManagedNetworksModal" :containers="containers" />
+    <WorkerGroupsModal
+      v-model:open="showWorkerGroupsModal"
+      :containers="containers"
+      @service="handleGroupAdminService"
+    />
+    <ManagedNetworksModal
+      v-model:open="showManagedNetworksModal"
+      :containers="containers"
+    />
 
     <EnvironmentsModal v-model:open="showEnvironmentsModal" />
 

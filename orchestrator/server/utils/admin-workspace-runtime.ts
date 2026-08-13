@@ -33,21 +33,69 @@ const ADMIN_LABEL = "agentor.administrative";
  * input is generated here; requests cannot choose images, mounts, commands,
  * networks, or capabilities. Only the owning administrator's standard worker
  * environment enters the container; no Docker socket or host bind does. */
-export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter {
+export class DockerAdminWorkspaceRuntime
+  implements AdminWorkspaceRuntimeAdapter
+{
   private readonly docker = new Docker({ socketPath: "/var/run/docker.sock" });
   private readonly image: string;
+  private managementListener?: (host: string) => Promise<void>;
   constructor(private readonly config: Config) {
     this.image =
       process.env.AGENTOR_ADMIN_WORKER_IMAGE || "agentor-admin-worker:latest";
   }
 
-  async setClipboard(mime: "image/png" | "text/plain", bytes: Buffer): Promise<void> {
+  private resources(record: Readonly<AdministrativeWorkspaceRecord>) {
+    const groupId =
+      record.kind === "group-administrative"
+        ? ((record as any).groupId as string)
+        : undefined;
+    const suffix = groupId ? `group-${groupId}` : "workspace";
+    return {
+      groupId,
+      container: groupId ? `agentor-admin-${suffix}` : ADMIN_CONTAINER,
+      workspaceVolume: groupId
+        ? `agentor-admin-${suffix}-data`
+        : ADMIN_WORKSPACE_VOLUME,
+      agentsVolume: groupId
+        ? `agentor-admin-${suffix}-agent-data`
+        : ADMIN_AGENTS_VOLUME,
+      displayName: groupId ? "GROUP ADMIN" : "ADMIN / ORCHESTRATOR",
+      managementNetwork: groupId
+        ? `agentor-management-group-${groupId}`
+        : MANAGEMENT_NETWORK,
+      egressNetwork: groupId
+        ? `agentor-admin-egress-group-${groupId}`
+        : EGRESS_NETWORK,
+    };
+  }
+  setManagementListener(listener: (host: string) => Promise<void>) {
+    this.managementListener = listener;
+  }
+
+  async setClipboard(
+    mime: "image/png" | "text/plain",
+    bytes: Buffer,
+  ): Promise<void> {
     const container = this.docker.getContainer(ADMIN_CONTAINER);
     const inspection = await container.inspect();
-    if (!inspection.State.Running) throw Object.assign(new Error("Administrative workspace is not running"), { statusCode: 409 });
+    if (!inspection.State.Running)
+      throw Object.assign(
+        new Error("Administrative workspace is not running"),
+        { statusCode: 409 },
+      );
     const execution = await container.exec({
-      Cmd: ["sh", "-c", 'head -c "$1" | /home/agent/clipboard/set.sh "$2"', "agentor-clipboard", String(bytes.length), mime],
-      AttachStdin: true, AttachStdout: false, AttachStderr: false, User: "agent",
+      Cmd: [
+        "sh",
+        "-c",
+        'head -c "$1" | /home/agent/clipboard/set.sh "$2"',
+        "agentor-clipboard",
+        String(bytes.length),
+        mime,
+      ],
+      AttachStdin: true,
+      AttachStdout: false,
+      AttachStderr: false,
+      User: "agent",
     });
     const stream = await execution.start({ hijack: true, stdin: true });
     stream.end(bytes);
@@ -56,8 +104,15 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
       await new Promise((resolve) => setTimeout(resolve, 50));
       result = await execution.inspect();
     }
-    if (result.Running) throw Object.assign(new Error("Administrative clipboard helper timed out"), { statusCode: 504 });
-    if (result.ExitCode !== 0) throw Object.assign(new Error("Failed to set administrative clipboard"), { statusCode: 422 });
+    if (result.Running)
+      throw Object.assign(
+        new Error("Administrative clipboard helper timed out"),
+        { statusCode: 504 },
+      );
+    if (result.ExitCode !== 0)
+      throw Object.assign(new Error("Failed to set administrative clipboard"), {
+        statusCode: 422,
+      });
   }
 
   async initializeBoundary(): Promise<void> {
@@ -68,20 +123,23 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     await this.reconcileEgressNetwork();
   }
 
-  async managementAddress(): Promise<string> {
+  async managementAddress(networkName = MANAGEMENT_NETWORK): Promise<string> {
     const inspection = await this.orchestratorInspection();
     if (!inspection) return "127.0.0.1";
     const address =
-      inspection.NetworkSettings?.Networks?.[MANAGEMENT_NETWORK]?.IPAddress;
+      inspection.NetworkSettings?.Networks?.[networkName]?.IPAddress;
     if (!address)
-      throw new Error(
-        "Orchestrator is not attached to the management network",
-      );
+      throw new Error("Orchestrator is not attached to the management network");
     return address;
   }
 
-  async materializeCredential(credential: string): Promise<void> {
-    const container = this.docker.getContainer(ADMIN_CONTAINER);
+  async materializeCredential(
+    credential: string,
+    record?: Readonly<AdministrativeWorkspaceRecord>,
+  ): Promise<void> {
+    const container = this.docker.getContainer(
+      record ? this.resources(record).container : ADMIN_CONTAINER,
+    );
     const inspection = await container.inspect();
     if (!inspection.State.Running) return;
     const execution = await container.exec({
@@ -101,9 +159,16 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
   async ensure(
     record: Readonly<AdministrativeWorkspaceRecord>,
   ): Promise<AdminWorkspaceRuntimeImage> {
-    await this.initializeBoundary();
+    const resources = this.resources(record);
+    await this.ensureManagementNetwork(resources.managementNetwork);
+    await this.ensureEgressNetwork(resources.egressNetwork);
+    await this.attachOrchestrator(resources.managementNetwork);
+    if (this.managementListener)
+      await this.managementListener(
+        await this.managementAddress(resources.managementNetwork),
+      );
     const image = await this.ensureOverlayImage(false, record.imageDigest);
-    let container = this.docker.getContainer(ADMIN_CONTAINER);
+    let container = this.docker.getContainer(resources.container);
     try {
       const inspection = await container.inspect();
       if (
@@ -112,7 +177,7 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
         // NetworkMode is immutable. Recreate legacy administrative containers
         // whose primary network was the ordinary worker network rather than
         // silently retaining that privilege boundary violation on restart.
-        inspection.HostConfig?.NetworkMode !== MANAGEMENT_NETWORK
+        inspection.HostConfig?.NetworkMode !== resources.managementNetwork
       ) {
         await container.remove({ force: true });
         container = await this.create(record, image.digest);
@@ -127,27 +192,34 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     if (record.status === "stopped" && status.State.Running)
       await container.stop({ t: 15 });
     if (record.status === "running") await this.waitForReady(container);
-    await this.ensureAdminAttached(container);
+    await this.ensureAdminAttached(container, record);
     if (record.status === "running")
-      await this.syncControlRepresentation(container);
+      await this.syncControlRepresentation(container, record);
     await this.registerServices(record, container);
-    await this.reconcileManagementNetwork(container.id);
+    await this.reconcileManagementNetwork(
+      resources.managementNetwork,
+      container.id,
+    );
     return image;
   }
 
   async start(record: Readonly<AdministrativeWorkspaceRecord>): Promise<void> {
     await this.ensure(record);
-    const container = this.docker.getContainer(ADMIN_CONTAINER);
+    const container = this.docker.getContainer(
+      this.resources(record).container,
+    );
     if (!(await container.inspect()).State.Running) await container.start();
     await this.waitForReady(container);
-    await this.ensureAdminAttached(container);
-    await this.syncControlRepresentation(container);
+    await this.ensureAdminAttached(container, record);
+    await this.syncControlRepresentation(container, record);
     await this.registerServices(record, container);
   }
 
   async stop(_record: Readonly<AdministrativeWorkspaceRecord>): Promise<void> {
     try {
-      const container = this.docker.getContainer(ADMIN_CONTAINER);
+      const container = this.docker.getContainer(
+        this.resources(_record).container,
+      );
       if ((await container.inspect()).State.Running)
         await container.stop({ t: 15 });
       await this.registerServices(_record, container);
@@ -160,7 +232,9 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     record: Readonly<AdministrativeWorkspaceRecord>,
   ): Promise<AdminWorkspaceRuntimeImage> {
     try {
-      await this.docker.getContainer(ADMIN_CONTAINER).remove({ force: true });
+      await this.docker
+        .getContainer(this.resources(record).container)
+        .remove({ force: true });
     } catch (error: any) {
       if (error?.statusCode !== 404) throw error;
     }
@@ -168,11 +242,49 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     const container = await this.create(record, image.digest);
     await container.start();
     await this.waitForReady(container);
-    await this.ensureAdminAttached(container);
-    await this.syncControlRepresentation(container);
+    await this.ensureAdminAttached(container, record);
+    await this.syncControlRepresentation(container, record);
     await this.registerServices(record, container);
-    await this.reconcileManagementNetwork(container.id);
+    await this.reconcileManagementNetwork(
+      this.resources(record).managementNetwork,
+      container.id,
+    );
     return image;
+  }
+
+  async remove(record: Readonly<AdministrativeWorkspaceRecord>): Promise<void> {
+    const resources = this.resources(record);
+    try {
+      await this.docker
+        .getContainer(resources.container)
+        .remove({ force: true });
+    } catch (error: any) {
+      if (error?.statusCode !== 404) throw error;
+    }
+    for (const volume of [resources.workspaceVolume, resources.agentsVolume]) {
+      try {
+        await this.docker.getVolume(volume).remove();
+      } catch (error: any) {
+        if (error?.statusCode !== 404) throw error;
+      }
+    }
+    for (const networkName of [
+      resources.managementNetwork,
+      resources.egressNetwork,
+    ]) {
+      if (networkName === MANAGEMENT_NETWORK || networkName === EGRESS_NETWORK)
+        continue;
+      try {
+        const network = this.docker.getNetwork(networkName);
+        const inspection = await network.inspect();
+        for (const containerId of Object.keys(inspection.Containers || {}))
+          await network.disconnect({ Container: containerId, Force: true });
+        await network.remove();
+      } catch (error: any) {
+        if (error?.statusCode !== 404) throw error;
+      }
+    }
+    useContainerManager().unregisterExternal?.(record.id);
   }
 
   private async waitForReady(container: Docker.Container): Promise<void> {
@@ -206,13 +318,11 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     if (!target) return undefined;
     const inspection = await this.docker.getContainer(target).inspect();
     let controlRepresentation = false;
-    if (!workerId || workerId === adminId) {
+    if (inspection.Config?.Labels?.[ADMIN_LABEL] === "true") {
       try {
-        const stream = await this.docker
-          .getContainer(ADMIN_CONTAINER)
-          .getArchive({
-            path: "/workspace/agentor-control/image-definitions.json",
-          });
+        const stream = await this.docker.getContainer(target).getArchive({
+          path: "/workspace/agentor-control/image-definitions.json",
+        });
         controlRepresentation = true;
         (stream as any).destroy?.();
       } catch {
@@ -227,8 +337,12 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     return {
       managedWorker: true,
       administrative: inspection.Config?.Labels?.[ADMIN_LABEL] === "true",
-      managementNetworkAttached: Boolean(
-        inspection.NetworkSettings?.Networks?.[MANAGEMENT_NETWORK],
+      managementNetworkAttached: Object.keys(
+        inspection.NetworkSettings?.Networks || {},
+      ).some(
+        (name) =>
+          name === MANAGEMENT_NETWORK ||
+          name.startsWith("agentor-management-group-"),
       ),
       networks: Object.keys(inspection.NetworkSettings?.Networks || {}),
       publishedPorts: Object.values(inspection.NetworkSettings?.Ports || {})
@@ -241,7 +355,7 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
       ),
       hostExecution: Boolean(
         inspection.HostConfig?.Privileged ||
-        inspection.HostConfig?.PidMode === "host",
+          inspection.HostConfig?.PidMode === "host",
       ),
       hostFilesystemMounts: mounts.filter((mount) => mount.type === "bind"),
       mounts,
@@ -261,7 +375,15 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
         ipv4Address: member.IPv4Address,
       }),
     );
-    const admin = members.find((member) => member.name === ADMIN_CONTAINER);
+    const admins = [] as typeof members;
+    for (const member of members) {
+      const candidate = await this.docker
+        .getContainer(member.containerId)
+        .inspect();
+      if (candidate.Config?.Labels?.[ADMIN_LABEL] === "true")
+        admins.push(member);
+    }
+    const admin = admins.find((member) => member.name === ADMIN_CONTAINER);
     const orchestratorName = process.env.HOSTNAME || hostname();
     const orchestrator = members.find(
       (member) =>
@@ -274,12 +396,20 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
       publishedPorts: [],
       traefikRoutes: [],
       rawDockerSocket: false,
-      attachedWorkspaceIds: admin ? [await this.adminId()].filter(Boolean) : [],
+      attachedWorkspaceIds: (
+        await Promise.all(
+          admins.map(
+            async (member) =>
+              (await this.docker.getContainer(member.containerId).inspect())
+                .Config?.Labels?.["agentor.admin.workspace-id"],
+          ),
+        )
+      ).filter(Boolean),
       normalWorkerIds: [],
       members,
       orchestratorAttached: Boolean(orchestrator),
       unexpectedMembers: members.filter(
-        (member) => member !== admin && member !== orchestrator,
+        (member) => !admins.includes(member) && member !== orchestrator,
       ),
     };
   }
@@ -310,9 +440,10 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
         tmux: false,
       },
     };
+    const resources = this.resources(record);
     const worker = {
       id: record.id,
-      displayName: "ADMIN / ORCHESTRATOR",
+      displayName: resources.displayName,
       repos: [],
       initScript: "",
       gitName: "Agentor Administrator",
@@ -320,17 +451,23 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     };
     const container = await this.docker.createContainer({
       Image: imageDigest,
-      name: ADMIN_CONTAINER,
+      name: resources.container,
       Env: [
         `ENVIRONMENT=${JSON.stringify(environment)}`,
         "CAPABILITIES=[]",
         "INSTRUCTIONS=[]",
         `WORKER=${JSON.stringify(worker)}`,
         "AGENTOR_ADMIN_WORKSPACE=1",
-        "AGENTOR_ADMIN_BANNER=ADMIN / ORCHESTRATOR",
+        `AGENTOR_ADMIN_BANNER=${resources.displayName}`,
+        ...(resources.groupId
+          ? [
+              `AGENTOR_GROUP_ADMIN_WORKSPACE=1`,
+              `AGENTOR_GROUP_ID=${resources.groupId}`,
+            ]
+          : []),
         "AGENTOR_MANAGEMENT_MCP_URL=http://agentor-orchestrator:3099/mcp",
         "ORCHESTRATOR_URL=http://agentor-orchestrator:3000",
-        `WORKER_CONTAINER_NAME=${ADMIN_CONTAINER}`,
+        `WORKER_CONTAINER_NAME=${resources.container}`,
         ...(record.ownerId
           ? renderUserEnvVars(useUserEnvStore().getOrDefault(record.ownerId))
           : []),
@@ -340,6 +477,9 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
       Labels: {
         [ADMIN_LABEL]: "true",
         "agentor.admin.workspace-id": record.id,
+        ...(resources.groupId
+          ? { "agentor.admin.group-id": resources.groupId }
+          : {}),
         "agentor.managed": "false",
       },
       HostConfig: {
@@ -347,10 +487,10 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
         // configuration. A secondary network attachment made before first
         // start can be discarded by some Docker daemons (notably nested
         // dockerd); using it as the primary network keeps the boundary stable.
-        NetworkMode: MANAGEMENT_NETWORK,
+        NetworkMode: resources.managementNetwork,
         Binds: [
-          `${ADMIN_WORKSPACE_VOLUME}:/workspace`,
-          `${ADMIN_AGENTS_VOLUME}:/home/agent/.agent-data`,
+          `${resources.workspaceVolume}:/workspace`,
+          `${resources.agentsVolume}:/home/agent/.agent-data`,
         ],
         Init: true,
         RestartPolicy: { Name: "unless-stopped" },
@@ -367,7 +507,10 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     // terminal/editor/desktop routes from there, so a second attachment is
     // neither needed nor safe: it would let every ordinary worker on
     // dockerNetwork address this privileged workspace directly.
-    await this.reconcileManagementNetwork(container.id);
+    await this.reconcileManagementNetwork(
+      resources.managementNetwork,
+      container.id,
+    );
     return container;
   }
 
@@ -376,14 +519,16 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     container: Docker.Container,
   ) {
     const inspection = await container.inspect();
+    const resources = this.resources(record);
     const info: ContainerInfo = {
+      administrativeKind: resources.groupId ? "group" : "platform",
       id: record.id,
-      userId: "__agentor_admin__",
+      userId: record.ownerId || "__agentor_admin__",
       createdAt: record.createdAt,
       updatedAt: record.updatedAt,
       containerId: inspection.Id,
-      containerName: ADMIN_CONTAINER,
-      displayName: "ADMIN / ORCHESTRATOR",
+      containerName: resources.container,
+      displayName: resources.displayName,
       imageName: this.image,
       imageId: inspection.Image,
       imageDigest: inspection.Image,
@@ -393,11 +538,18 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     useContainerManager().registerExternal(info);
   }
 
-  private async syncControlRepresentation(container: Docker.Container) {
+  private async syncControlRepresentation(
+    container: Docker.Container,
+    record: Readonly<AdministrativeWorkspaceRecord>,
+  ) {
+    const resources = this.resources(record);
     const catalog = useImageCatalogManager();
     await catalog.init();
     const definitions = catalog
-      .list("__agentor_admin__", true)
+      .list(
+        resources.groupId ? record.ownerId || "" : "__agentor_admin__",
+        !resources.groupId,
+      )
       .map((definition) => ({
         id: definition.id,
         ownerId: definition.ownerId,
@@ -430,7 +582,9 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     const archive = pack();
     archive.entry(
       { name: "agentor-control/README.md", mode: 0o444 },
-      "# ADMIN / ORCHESTRATOR\n\nThis directory is an orchestrator-generated, read-only-in-intent representation of image definitions and runtime topology. Use the management MCP proposal/approval workflow for changes. It never contains account credentials or worker secret values.\n",
+      resources.groupId
+        ? `# GROUP ADMIN\n\nThis workspace is restricted to worker group ${resources.groupId}. Its management identity is checked against live membership on every call.\n`
+        : "# ADMIN / ORCHESTRATOR\n\nThis directory is an orchestrator-generated, read-only-in-intent representation of image definitions and runtime topology. Use the management MCP proposal/approval workflow for changes. It never contains account credentials or worker secret values.\n",
     );
     archive.entry(
       { name: "agentor-control/image-definitions.json", mode: 0o444 },
@@ -438,22 +592,22 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     );
     archive.entry(
       { name: "agentor-control/runtime.json", mode: 0o444 },
-      `${JSON.stringify({ schemaVersion: 1, managementNetwork: MANAGEMENT_NETWORK, workerNetwork: this.config.dockerNetwork, adminImage: this.image }, null, 2)}\n`,
+      `${JSON.stringify({ schemaVersion: 1, managementNetwork: resources.managementNetwork, adminImage: this.image, ...(resources.groupId ? { groupId: resources.groupId } : { workerNetwork: this.config.dockerNetwork }) }, null, 2)}\n`,
     );
     archive.finalize();
     await container.putArchive(archive as any, { path: "/workspace" });
   }
 
-  private async ensureManagementNetwork() {
+  private async ensureManagementNetwork(networkName = MANAGEMENT_NETWORK) {
     const existing = await this.docker.listNetworks({
-      filters: { name: [MANAGEMENT_NETWORK] },
+      filters: { name: [networkName] },
     });
     const network = existing.find(
-      (candidate) => candidate.Name === MANAGEMENT_NETWORK,
+      (candidate) => candidate.Name === networkName,
     );
     if (!network)
       await this.docker.createNetwork({
-        Name: MANAGEMENT_NETWORK,
+        Name: networkName,
         Driver: "bridge",
         Internal: true,
         CheckDuplicate: true,
@@ -472,16 +626,16 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     }
   }
 
-  private async ensureEgressNetwork() {
+  private async ensureEgressNetwork(networkName = EGRESS_NETWORK) {
     const existing = await this.docker.listNetworks({
-      filters: { name: [EGRESS_NETWORK] },
+      filters: { name: [networkName] },
     });
     const network = existing.find(
-      (candidate) => candidate.Name === EGRESS_NETWORK,
+      (candidate) => candidate.Name === networkName,
     );
     if (!network) {
       await this.docker.createNetwork({
-        Name: EGRESS_NETWORK,
+        Name: networkName,
         Driver: "bridge",
         Internal: false,
         CheckDuplicate: true,
@@ -500,8 +654,11 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
       );
   }
 
-  private async reconcileEgressNetwork(adminContainerId?: string) {
-    const network = this.docker.getNetwork(EGRESS_NETWORK);
+  private async reconcileEgressNetwork(
+    networkName = EGRESS_NETWORK,
+    adminContainerId?: string,
+  ) {
+    const network = this.docker.getNetwork(networkName);
     const inspection = await network.inspect();
     if (inspection.Internal || inspection.Driver !== "bridge")
       throw new Error("Admin egress network is not an outbound bridge");
@@ -518,21 +675,24 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
         await this.docker.getContainer(adminContainerId).inspect()
       ).Id;
     }
+    const administrativeIds = new Set<string>(
+      adminContainerId ? [adminContainerId] : [],
+    );
     for (const containerId of Object.keys(inspection.Containers || {})) {
-      if (containerId === adminContainerId) continue;
+      if (administrativeIds.has(containerId)) continue;
       await network.disconnect({ Container: containerId, Force: true });
     }
   }
 
-  private async attachOrchestrator() {
+  private async attachOrchestrator(networkName = MANAGEMENT_NETWORK) {
     const inspection = await this.orchestratorInspection();
     if (!inspection) return; // direct-host development
-    if (!inspection.NetworkSettings?.Networks?.[MANAGEMENT_NETWORK])
+    if (!inspection.NetworkSettings?.Networks?.[networkName])
       await this.docker
-        .getNetwork(MANAGEMENT_NETWORK)
+        .getNetwork(networkName)
         .connect({ Container: inspection.Id });
     const attached = await this.docker.getContainer(inspection.Id).inspect();
-    if (!attached.NetworkSettings?.Networks?.[MANAGEMENT_NETWORK])
+    if (!attached.NetworkSettings?.Networks?.[networkName])
       throw new Error(
         "Docker did not attach the orchestrator to the management network",
       );
@@ -541,13 +701,16 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
   /** Resolve the current orchestrator even when Docker/Compose gives it a
    * hostname that differs from its stable container name. Only 404 is treated
    * as a candidate miss; operational Docker errors must remain visible. */
-  private async orchestratorInspection(): Promise<Docker.ContainerInspectInfo | undefined> {
+  private async orchestratorInspection(): Promise<
+    Docker.ContainerInspectInfo | undefined
+  > {
     const candidates = [
       process.env.HOSTNAME,
       hostname(),
       "agentor-orchestrator",
-    ].filter((value, index, all): value is string =>
-      Boolean(value) && all.indexOf(value) === index,
+    ].filter(
+      (value, index, all): value is string =>
+        Boolean(value) && all.indexOf(value) === index,
     );
     for (const candidate of candidates) {
       try {
@@ -559,8 +722,11 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     return undefined;
   }
 
-  private async reconcileManagementNetwork(adminContainerId?: string) {
-    const network = this.docker.getNetwork(MANAGEMENT_NETWORK);
+  private async reconcileManagementNetwork(
+    networkName = MANAGEMENT_NETWORK,
+    adminContainerId?: string,
+  ) {
+    const network = this.docker.getNetwork(networkName);
     const inspection = await network.inspect();
     if (!inspection.Internal || inspection.Driver !== "bridge")
       throw new Error("Management network is not an internal bridge");
@@ -593,15 +759,19 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     }
   }
 
-  private async ensureAdminAttached(container: Docker.Container) {
+  private async ensureAdminAttached(
+    container: Docker.Container,
+    record: Readonly<AdministrativeWorkspaceRecord>,
+  ) {
+    const resources = this.resources(record);
     const inspection = await container.inspect();
-    if (!inspection.NetworkSettings?.Networks?.[MANAGEMENT_NETWORK])
+    if (!inspection.NetworkSettings?.Networks?.[resources.managementNetwork])
       await this.docker
-        .getNetwork(MANAGEMENT_NETWORK)
+        .getNetwork(resources.managementNetwork)
         .connect({ Container: inspection.Id });
-    if (!inspection.NetworkSettings?.Networks?.[EGRESS_NETWORK])
+    if (!inspection.NetworkSettings?.Networks?.[resources.egressNetwork])
       await this.docker
-        .getNetwork(EGRESS_NETWORK)
+        .getNetwork(resources.egressNetwork)
         .connect({ Container: inspection.Id });
 
     // Docker permits secondary network attachments after creation. Remove any
@@ -612,13 +782,16 @@ export class DockerAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter
     for (const networkName of Object.keys(
       (await container.inspect()).NetworkSettings?.Networks || {},
     )) {
-      if (networkName === MANAGEMENT_NETWORK || networkName === EGRESS_NETWORK)
+      if (
+        networkName === resources.managementNetwork ||
+        networkName === resources.egressNetwork
+      )
         continue;
       await this.docker
         .getNetwork(networkName)
         .disconnect({ Container: inspection.Id, Force: true });
     }
-    await this.reconcileEgressNetwork(inspection.Id);
+    await this.reconcileEgressNetwork(resources.egressNetwork, inspection.Id);
   }
 
   private async ensureOverlayImage(

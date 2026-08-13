@@ -13,7 +13,7 @@ const MAX_BODY = 1024 * 1024;
  * the internal management network only; Docker/Traefik publish no port. Every
  * tool call still passes through workload-identity and live-policy checks. */
 export class ManagementMcpTransport {
-  private server?: Server;
+  private servers = new Map<string, Server>();
   constructor(
     private readonly store: ManagementMcpStore,
     private readonly port = Number(
@@ -22,32 +22,35 @@ export class ManagementMcpTransport {
   ) {}
 
   async start(host: string): Promise<void> {
-    if (this.server) return;
-    this.server = createServer(
+    if (this.servers.has(host)) return;
+    const server = createServer(
       (request, response) => void this.handle(request, response),
     );
     await new Promise<void>((resolve, reject) => {
-      this.server!.once("error", reject);
-      this.server!.listen(this.port, host, () => {
-        this.server!.off("error", reject);
+      server.once("error", reject);
+      server.listen(this.port, host, () => {
+        server.off("error", reject);
+        this.servers.set(host, server);
         resolve();
       });
     });
   }
 
   async stop(): Promise<void> {
-    const server = this.server;
-    this.server = undefined;
-    if (server)
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+    const servers = [...this.servers.values()];
+    this.servers.clear();
+    await Promise.all(
+      servers.map(
+        (server) =>
+          new Promise<void>((resolve) => server.close(() => resolve())),
+      ),
+    );
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse) {
     response.setHeader("Cache-Control", "no-store");
     response.setHeader("X-Content-Type-Options", "nosniff");
-    const downloadMatch = request.url?.match(
-      /^\/downloads\/([0-9a-f-]{36})$/i,
-    );
+    const downloadMatch = request.url?.match(/^\/downloads\/([0-9a-f-]{36})$/i);
     if (request.method === "GET" && downloadMatch) {
       const authorization = request.headers.authorization || "";
       const credential = authorization.startsWith("Bearer ")
@@ -55,10 +58,7 @@ export class ManagementMcpTransport {
         : undefined;
       let opened: Awaited<ReturnType<ManagementMcpStore["openDownload"]>>;
       try {
-        opened = await this.store.openDownload(
-          credential,
-          downloadMatch[1]!,
-        );
+        opened = await this.store.openDownload(credential, downloadMatch[1]!);
       } catch (error: any) {
         const status = httpStatus(error);
         return this.send(response, status, {
@@ -98,14 +98,25 @@ export class ManagementMcpTransport {
     const importMatch = request.url?.match(/^\/imports\/([0-9a-f-]{36})$/i);
     if (request.method === "PUT" && importMatch) {
       const authorization = request.headers.authorization || "";
-      const credential = authorization.startsWith("Bearer ") ? authorization.slice(7) : undefined;
+      const credential = authorization.startsWith("Bearer ")
+        ? authorization.slice(7)
+        : undefined;
       try {
         const upload = parseImportUploadHeaders(request.headers);
-        const result = await this.store.uploadImport(credential, importMatch[1]!, request, upload.declaredLength);
+        const result = await this.store.uploadImport(
+          credential,
+          importMatch[1]!,
+          request,
+          upload.declaredLength,
+        );
         return this.send(response, 201, result);
       } catch (error: any) {
-        const status = Number.isInteger(error?.statusCode) ? error.statusCode : 400;
-        return this.send(response, status, { error: status >= 500 ? "Worker import failed" : error.message });
+        const status = Number.isInteger(error?.statusCode)
+          ? error.statusCode
+          : 400;
+        return this.send(response, status, {
+          error: status >= 500 ? "Worker import failed" : error.message,
+        });
       }
     }
     if (request.method !== "POST" || request.url !== "/mcp")
@@ -139,8 +150,10 @@ export class ManagementMcpTransport {
         return this.send(response, 202, null);
       }
       if (body.method === "tools/list") {
-        await this.authenticate(credential, "tools.list");
-        return this.rpc(response, id, { tools: await this.store.listTools() });
+        const identity = await this.authenticate(credential, "tools.list");
+        return this.rpc(response, id, {
+          tools: await this.store.listTools(identity),
+        });
       }
       if (body.method === "tools/call") {
         const name = body.params?.name;
@@ -170,7 +183,11 @@ export class ManagementMcpTransport {
         return this.rpc(response, rpcId, undefined, {
           code: -32000,
           message: error?.message || "Management tool failed",
-          data: { statusCode: Number.isInteger(error?.statusCode) ? error.statusCode : 500 },
+          data: {
+            statusCode: Number.isInteger(error?.statusCode)
+              ? error.statusCode
+              : 500,
+          },
         });
       return this.send(response, status, {
         jsonrpc: "2.0",
@@ -225,14 +242,27 @@ function safeAttachmentName(value: unknown): string {
 }
 
 export function parseImportUploadHeaders(headers: IncomingMessage["headers"]) {
-  const contentType = Array.isArray(headers["content-type"]) ? headers["content-type"][0] : headers["content-type"];
-  if ((contentType || "").split(";", 1)[0].trim().toLowerCase() !== "application/x-tar")
-    throw Object.assign(new Error("Content-Type must be application/x-tar"), { statusCode: 415 });
+  const contentType = Array.isArray(headers["content-type"])
+    ? headers["content-type"][0]
+    : headers["content-type"];
+  if (
+    (contentType || "").split(";", 1)[0].trim().toLowerCase() !==
+    "application/x-tar"
+  )
+    throw Object.assign(new Error("Content-Type must be application/x-tar"), {
+      statusCode: 415,
+    });
   const raw = headers["content-length"];
   if (raw === undefined) return { declaredLength: undefined };
-  if (Array.isArray(raw) || !/^\d+$/.test(raw)) throw Object.assign(new Error("Invalid Content-Length"), { statusCode: 400 });
+  if (Array.isArray(raw) || !/^\d+$/.test(raw))
+    throw Object.assign(new Error("Invalid Content-Length"), {
+      statusCode: 400,
+    });
   const declaredLength = Number(raw);
-  if (!Number.isSafeInteger(declaredLength)) throw Object.assign(new Error("Invalid Content-Length"), { statusCode: 400 });
+  if (!Number.isSafeInteger(declaredLength))
+    throw Object.assign(new Error("Invalid Content-Length"), {
+      statusCode: 400,
+    });
   return { declaredLength };
 }
 

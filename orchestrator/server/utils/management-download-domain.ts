@@ -38,7 +38,10 @@ type PreparedDownload = PreparedWorkspaceDownload | PreparedExportDownload;
 
 export interface OpenedManagementDownload {
   stream: Readable;
-  contentType: "application/octet-stream" | "application/zip" | "application/x-tar";
+  contentType:
+    | "application/octet-stream"
+    | "application/zip"
+    | "application/x-tar";
   filename: string;
   size?: number;
   audit: {
@@ -161,14 +164,14 @@ export class ManagementDownloadDomain {
   async open(
     workspaceIdentity: string,
     token: string,
-    authorize: (capability: ManagementDownloadCapability) => void,
+    authorize: (prepared: Readonly<PreparedDownload>) => void | Promise<void>,
   ): Promise<OpenedManagementDownload> {
     this.expire();
     const prepared = this.prepared.get(token);
     if (!prepared || prepared.workspaceIdentity !== workspaceIdentity)
       throw fail(404, "Download not found or expired");
 
-    authorize(prepared.capability);
+    await authorize(prepared);
     // Consume before opening a Docker helper or artifact file. Concurrent and
     // replay requests therefore fail closed even while the first stream runs.
     this.prepared.delete(token);
@@ -188,7 +191,9 @@ export class ManagementDownloadDomain {
       )
         throw fail(404, "Workspace unavailable");
 
-      let opened: Awaited<ReturnType<DownloadDependencies["downloadWorkspace"]>>;
+      let opened: Awaited<
+        ReturnType<DownloadDependencies["downloadWorkspace"]>
+      >;
       try {
         opened = await this.deps.downloadWorkspace(item, prepared.paths);
       } catch (error: any) {
@@ -230,7 +235,9 @@ export class ManagementDownloadDomain {
       throw fail(404, "Export job not found");
     if (job.status !== "succeeded")
       throw fail(409, "Export artifact is not ready");
-    let artifact: Awaited<ReturnType<DownloadDependencies["openExportArtifact"]>>;
+    let artifact: Awaited<
+      ReturnType<DownloadDependencies["openExportArtifact"]>
+    >;
     try {
       artifact = await this.deps.openExportArtifact(job);
     } catch {
