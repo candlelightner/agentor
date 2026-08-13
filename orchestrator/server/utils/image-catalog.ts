@@ -1013,7 +1013,7 @@ function validateDefinition(input: any) {
     dockerfileFragment.length > 256 * 1024 ||
     FORBIDDEN_FRAGMENT.test(dockerfileFragment)
   )
-    httpError(400, "Dockerfile fragment violates build policy");
+    httpError(400, "Dockerfile fragment violates build policy: use only safe RUN/WORKDIR/COPY instructions; do not include FROM, USER, ENTRYPOINT, CMD, ENV/ARG secrets, EXPOSE, VOLUME, network downloads, curl|sh, wget|sh, Docker socket mounts, or privilege changes");
   if (!Array.isArray(input.contextFiles))
     httpError(400, "contextFiles must be an array");
   const seen = new Set<string>();
