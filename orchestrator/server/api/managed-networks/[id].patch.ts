@@ -1,6 +1,7 @@
 defineRouteMeta({ openAPI: { tags: ['Managed networks'], summary: 'Update managed network membership', description: 'Serializes group references with worker-group mutation and reconciles actual Docker membership.', operationId: 'updateManagedNetwork', responses: { 200: { description: 'Updated reconciliation' }, 400: { description: 'Invalid scope, group, or workers' }, 409: { description: 'Docker reconciliation conflict' }, 423: { description: 'A worker affected by the membership change is protected' } } } });
 import { requireResourceAccess } from '../../utils/auth-helpers'; import { useManagedNetworkStore, useWorkerGroupStore, useWorkerStore } from '../../utils/services'; import { useManagedNetworkManager } from '../../utils/managed-network-manager'; import { verifyWorkerMutationUnlocks } from '../../utils/worker-protection-lock';
 import { withWorkerNetworkMutation } from '../../utils/worker-group-manager';
+import { updateManagedNetworkAtomically } from '../../utils/managed-network-update';
 export default defineEventHandler(async event => { const id = getRouterParam(event, 'id')!, store = useManagedNetworkStore(), found = store.findById(id); requireResourceAccess(event, found, { allowGlobal: false }); const body: any = await readBody(event); return withWorkerNetworkMutation(found!.userId,async()=>{const network=store.findById(id);if(!network||network.userId!==found!.userId)throw createError({statusCode:404,statusMessage:'Managed network not found'});const scope = body?.scope === undefined ? network.scope : body.scope;
   if (!['all', 'selected', 'group'].includes(scope)) throw createError({ statusCode: 400, statusMessage: 'Invalid managed network scope' });
   if (body?.groupId !== undefined && typeof body.groupId !== 'string') throw createError({ statusCode: 400, statusMessage: 'groupId must be a string' });
@@ -11,8 +12,6 @@ export default defineEventHandler(async event => { const id = getRouterParam(eve
   const affected=(value:any)=>value.scope==='selected'?(value.workerIds||[]):value.scope==='group'?(useWorkerGroupStore().get(value.userId,value.groupId)?.workerIds||[]):useWorkerStore().listForUser(value.userId).map(worker=>worker.id);
   const proposed={...network,scope,groupId,workerIds:scope==='selected'?(body?.workerIds??network!.workerIds):[]};
   await verifyWorkerMutationUnlocks([...affected(network),...affected(proposed)],body?.lockPasswords);
-  const updated = await store.update(network.userId, id, { name: body?.name, scope, groupId, workerIds: scope === 'selected' ? body?.workerIds : [] });
-  const manager=useManagedNetworkManager();const reconciliation=await manager.reconcile(updated);
-  if(reconciliation.partialFailures.length){await store.update(network.userId,id,{name:network.name,scope:network.scope,groupId:network.groupId||'',workerIds:network.workerIds}).catch(()=>{});await manager.reconcile(network).catch(()=>{});throw createError({statusCode:409,statusMessage:reconciliation.partialFailures.join('; ')});}
-  return { ...updated, reconciliation };
+  const manager=useManagedNetworkManager();
+  return updateManagedNetworkAtomically(network,{ name: body?.name, scope, groupId, workerIds: scope === 'selected' ? body?.workerIds : [] },{update:(userId,networkId,patch)=>store.update(userId,networkId,patch),reconcile:value=>manager.reconcile(value)});
 });});

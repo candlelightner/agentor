@@ -7,6 +7,7 @@ import {
 import { useStorageVisibilityManager } from "./storage-visibility";
 import { verifyWorkerMutationUnlocks } from "./worker-protection-lock";
 import { withWorkerNetworkMutation } from "./worker-group-manager";
+import { updateManagedNetworkAtomically } from "./managed-network-update";
 
 export interface ManagementPlatformTool {
   name: string;
@@ -120,10 +121,7 @@ export class ManagementPlatformDomain {
       const prospective={...current,...patch};
       if(prospective.scope==="group"&&(!prospective.groupId||!useWorkerGroupStore().get(current.userId,prospective.groupId)))throw error(400,"Group not found");
       await verifyWorkerMutationUnlocks([...await affectedWorkerIds(current), ...await affectedWorkerIds(prospective)], args.lockPasswords);
-      const updated = await store.update(current.userId, id, patch);
-      const reconciliation=await manager.reconcile(updated);
-      if(reconciliation.partialFailures.length){await store.update(current.userId,id,{name:current.name,scope:current.scope,groupId:current.groupId||'',workerIds:current.workerIds}).catch(()=>{});await manager.reconcile(current).catch(()=>{});throw error(409,reconciliation.partialFailures.join('; '));}
-      return { ...updated, reconciliation };
+      return updateManagedNetworkAtomically(current,patch,{update:(userId,networkId,value)=>store.update(userId,networkId,value),reconcile:value=>manager.reconcile(value)});
     }) };
   }
 }
