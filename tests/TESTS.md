@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **1609 tests** across 152 test files (1031 API across 93 files + 578 UI across 59 files)
+- **1610 tests** across 152 test files (1032 API across 93 files + 578 UI across 59 files)
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -102,13 +102,13 @@ tests/
     worker-lifecycle.ts    # Container create/cleanup utilities
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
-  api/                     # API endpoint tests (1031 tests across 93 files)
+  api/                     # API endpoint tests (1032 tests across 93 files)
   ui/                      # UI interaction tests (578 tests across 59 files)
 ```
 
 ## Test Categories
 
-### API Tests (1031 tests, 93 files)
+### API Tests (1032 tests, 93 files)
 
 | `worker-protection-lock.spec.ts` | 6 | Password-verifier-only worker locks: set/change/remove validation, no password/hash disclosure, required lock credentials on settings/configuration/archive/unarchive, running-workspace file mutations, managed-network membership, stop/restart alternate lifecycle paths, and correct-password recovery. |
 
