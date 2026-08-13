@@ -203,10 +203,21 @@ An exact Stage D definition can keep the image itself credential-free:
 }
 ```
 
-The context file contains only the Tavily command and `env_vars` name. Copy
-`/opt/agentor-templates/codex-tavily.toml` from the built image
-into the worker's persistent `~/.codex/config.toml` during worker setup, then
-launch Codex with `omniroute launch-codex --remote "$OMNIROUTE_URL"`. Verify
+The context file contains only the Tavily command and `env_vars` name. The
+image-definition model deliberately has no implicit first-run hook. From the
+test worker's MCP console, materialize the non-secret template without
+overwriting an existing Codex configuration:
+
+```bash
+mkdir -p ~/.codex
+test -f ~/.codex/config.toml || \
+  cp /opt/agentor-templates/codex-tavily.toml ~/.codex/config.toml
+```
+
+The direct `tavily-mcp` command intentionally uses the pinned global
+`tavily-mcp@0.2.22` installation from the definition; it does not resolve an
+unpinned `@latest` package at worker startup. Then launch Codex with
+`omniroute launch-codex --remote "$OMNIROUTE_URL"`. Verify
 the pinned Tavily version before rebuilding; `0.2.22` was current on
 2026-08-13.
 
