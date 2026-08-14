@@ -14,6 +14,8 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 Worker-group coverage is in `api/worker-groups.spec.ts` (3 API tests), `api/group-admin-management-mcp.spec.ts` (8 API tests), and `ui/worker-groups.spec.ts` (1 UI test): CRUD, owner-scoped membership validation, deletion that retains workers, API/MCP parity for protected old/new membership, real Docker reconciliation of every dependent network, group-admin lifecycle/private-network identity and real MCP reachability, editor/desktop readiness plus noVNC HTTP proxy survival across ordinary inventory refreshes, group-admin PNG clipboard targeting and metadata, filtered discovery, indistinguishable prompt out-of-group/unknown denial across every delegated target family, stdio response correlation, immediate membership grant/revocation (including prepared downloads), identity-derived evaluation-worker creation, real lifecycle side effects, and dashboard controls. `worker/management-mcp-proxy.test.mjs` adds 12 isolated bridge regressions for correlated valid/error responses, 401/403/404, empty or malformed JSON, absent/mismatched ids, connection failure, timeout, notifications, and timeout bounds.
 
+`worker/clipboard/set.test.mjs` verifies that the X11 clipboard helper falls through a stale configured/x11vnc display and selects the validated live Xvfb display instead of assuming `:99`.
+
 Managed-network coverage is in `api/managed-networks.spec.ts` (bridge create/topology/delete and validation rejection) plus the multi-network group reconciliation and API/MCP parity flow in `api/worker-groups.spec.ts`.
 
 ## Prerequisites

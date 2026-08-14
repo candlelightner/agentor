@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Agentor worker clipboard setter.
 #
-# Sets the X11 CLIPBOARD selection on DISPLAY=:99 from bytes read on stdin.
+# Sets the X11 CLIPBOARD selection on the display currently exported through
+# noVNC. The normal worker display is :99, but restored/persistent desktop
+# processes may move the live X server to another display.
 # argv[1] MUST be exactly one of: image/png | text/plain
 #
 # Design notes:
@@ -31,9 +33,6 @@ set -u
 umask 077
 
 MIME="${1:-}"
-DISPLAY=:99
-export DISPLAY
-
 IMG_CAP=$((16 * 1024 * 1024))   # 16 MiB
 TXT_CAP=$((1 * 1024 * 1024))    # 1 MiB
 
@@ -95,13 +94,38 @@ fi
 TARGET="$MIME"
 [ "$MIME" = "text/plain" ] && TARGET="UTF8_STRING"
 
+# Prefer the display x11vnc is actually exporting. Fall back to the configured
+# DISPLAY and then live Xvfb processes. Validate every candidate before use so
+# process text can never become an xclip option or shell fragment.
+CANDIDATES="$(
+  ps -eo args= 2>/dev/null |
+    sed -n 's/.*[x]11vnc.*-display[[:space:]]\{1,\}\(:[0-9][0-9]*\(\.[0-9][0-9]*\)\{0,1\}\).*/\1/p'
+)"
+CANDIDATES="$CANDIDATES ${DISPLAY:-:99} $(
+  ps -eo args= 2>/dev/null |
+    sed -n 's/.*[X]vfb[[:space:]]\{1,\}\(:[0-9][0-9]*\(\.[0-9][0-9]*\)\{0,1\}\).*/\1/p'
+)"
+
+SELECTED_DISPLAY=""
+for candidate in $CANDIDATES; do
+  case "$candidate" in
+    :[0-9]*|:[0-9]*.[0-9]*) ;;
+    *) continue ;;
+  esac
+  # Invalid lookalikes such as :99foo are rejected after the cheap case match.
+  printf '%s' "$candidate" | grep -Eq '^:[0-9]+(\.[0-9]+)?$' || continue
+  if DISPLAY="$candidate" xclip -selection clipboard -t "$TARGET" -i "$TMP" >/dev/null 2>&1; then
+    SELECTED_DISPLAY="$candidate"
+    break
+  fi
+done
+[ -n "$SELECTED_DISPLAY" ] || die 7 "xclip failed to take ownership"
+DISPLAY="$SELECTED_DISPLAY"
+export DISPLAY
+
 # xclip forks its selection owner by default and returns only after reading the
 # complete input. The owner retains the bytes in memory, so removing TMP on this
 # script's exit is safe.
-if ! xclip -selection clipboard -t "$TARGET" -i "$TMP" >/dev/null 2>&1; then
-  die 7 "xclip failed to take ownership"
-fi
-
 # Verify the exact target is available. This read is bounded so a broken X
 # server cannot hang the API request.
 if ! timeout 2 xclip -selection clipboard -t "$TARGET" -o >/dev/null 2>&1; then
