@@ -132,6 +132,18 @@ test.describe('Worker groups API', () => {
       })).status()).toBe(200);
       await expectNetworkMembers(request, networkIds, [first.containerName]);
 
+      // A platform administrator can compose the normal group-membership
+      // operation with the group-admin lifecycle without a browser session.
+      // The returned workspace remains tied to this group rather than either
+      // selected worker.
+      const provisioned = await invoke(request, credential, 'groups.admin-workspace.provision', { groupId });
+      expect(provisioned.status()).toBe(200);
+      const groupWorkspace = await provisioned.json();
+      expect(groupWorkspace).toMatchObject({ groupId, userId: ownerId, status: 'running' });
+      expect((await invoke(request, credential, 'groups.admin-workspace.get', { groupId })).status()).toBe(200);
+      expect((await invoke(request, credential, 'groups.admin-workspace.stop', { groupId })).status()).toBe(200);
+      expect((await invoke(request, credential, 'groups.admin-workspace.start', { groupId })).status()).toBe(200);
+
       // Neither transport may erase a group while a network still derives its
       // membership from it, and failed deletion leaves both records intact.
       expect((await request.delete(`/api/worker-groups/${groupId}`)).status()).toBe(409);

@@ -11,6 +11,7 @@ import { useWorkerProtectionLockStore } from "./worker-protection-lock";
 import { findWorkspaceInventory } from "./workspace-inventory";
 import { OfflineWorkspaceAccess } from "./workspace-access";
 import { deleteWorkerGroup, updateWorkerGroupWithNetworks, withWorkerNetworkMutation } from "./worker-group-manager";
+import { useGroupAdminWorkspaceStore } from "./group-admin-workspace-store";
 
 export interface ManagementDomainTool {
   name: string;
@@ -22,6 +23,21 @@ export interface ManagementDomainTool {
 
 const mutation = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
 const read = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+const GROUP_ADMIN_LIFECYCLE_TIMEOUT_DEFAULT_SECONDS = 120;
+const GROUP_ADMIN_LIFECYCLE_TIMEOUT_MAX_SECONDS = 300;
+const groupAdminLifecycleInput = {
+  type: "object",
+  required: ["groupId"],
+  properties: {
+    groupId: { type: "string" },
+    timeoutSeconds: {
+      type: "integer",
+      minimum: 1,
+      maximum: GROUP_ADMIN_LIFECYCLE_TIMEOUT_MAX_SECONDS,
+      description: `Server-side operation deadline in seconds (default ${GROUP_ADMIN_LIFECYCLE_TIMEOUT_DEFAULT_SECONDS}; 1-${GROUP_ADMIN_LIFECYCLE_TIMEOUT_MAX_SECONDS}).`,
+    },
+  },
+};
 
 /** MCP domain adapter for ordinary worker administration. It is deliberately
  * transport-free: ManagementMcpStore can register these definitions/dispatch
@@ -43,6 +59,11 @@ export class ManagementWorkerDomain {
       ["groups.create", "groups", "Create a worker group for an explicit owner.", { type:"object", required:["userId","name"], properties:{userId:{type:"string"},name:{type:"string"}} }, mutation],
       ["groups.update", "groups", "Rename a group or replace same-owner membership, reconciling every dependent managed network. Protected workers in the previous or requested membership require lockPasswords.", { type:"object", required:["groupId"], properties:{groupId:{type:"string"},name:{type:"string"},workerIds:{type:"array",items:{type:"string"}},lockPasswords:{type:"object",additionalProperties:{type:"string",writeOnly:true}}} }, mutation],
       ["groups.delete", "groups", "Delete a group without deleting workers. Groups referenced by managed networks must be reconfigured first.", { type:"object", required:["groupId"], properties:{groupId:{type:"string"}} }, { ...mutation, destructiveHint:true }],
+      ["groups.admin-workspace.get", "groups", "Get and reconcile the persistent administrative workspace for a worker group; returns 404 if none was provisioned. The server operation deadline defaults to 120 seconds.", groupAdminLifecycleInput, read],
+      ["groups.admin-workspace.provision", "groups", "Provision or return the one persistent trusted administrative workspace for a worker group. The server operation deadline defaults to 120 seconds.", groupAdminLifecycleInput, mutation],
+      ["groups.admin-workspace.start", "groups", "Provision if needed, then start a worker-group administrative workspace. The server operation deadline defaults to 120 seconds.", groupAdminLifecycleInput, mutation],
+      ["groups.admin-workspace.stop", "groups", "Provision if needed, then stop a worker-group administrative workspace without deleting its workspace data. The server operation deadline defaults to 120 seconds.", groupAdminLifecycleInput, mutation],
+      ["groups.admin-workspace.rebuild", "groups", "Provision if needed, then rebuild and start a worker-group administrative workspace while retaining its group binding and data. The server operation deadline defaults to 120 seconds.", groupAdminLifecycleInput, mutation],
       ["locks.get", "locks", "Get worker protection state without password/verifier.", objectWithWorker(), read],
       ["locks.set", "locks", "Set/change a worker protection password; values are write-only.", lockSetInput(), mutation],
       ["locks.remove", "locks", "Remove protection with its current password.", lockRemoveInput(), { ...mutation, destructiveHint:true }],
@@ -99,6 +120,18 @@ export class ManagementWorkerDomain {
     if(name==="groups.list") return args.userId ? store.listForUser(required(args.userId,"userId")) : store.list();
     if(name==="groups.create") { const userId=required(args.userId,"userId"), label=required(args.name,"name").trim(); if(!label||label.length>100) throw status(400,"Invalid group name"); return withWorkerNetworkMutation(userId,()=>store.create(userId,label)); }
     const group=store.findById(required(args.groupId,"groupId")); if(!group) throw status(404,"Worker group not found");
+    if(name.startsWith("groups.admin-workspace.")) {
+      const workspaces=useGroupAdminWorkspaceStore();
+      const deadline=groupAdminLifecycleTimeoutSeconds(args.timeoutSeconds);
+      if(name==="groups.admin-workspace.get") {
+        if(!group.adminWorkspace) throw status(404,"Group administrative workspace not provisioned");
+        return withinGroupAdminLifecycleDeadline(() => workspaces.ensure(group.id,group.userId), deadline);
+      }
+      if(name==="groups.admin-workspace.provision") return withinGroupAdminLifecycleDeadline(() => workspaces.ensure(group.id,group.userId), deadline);
+      if(name==="groups.admin-workspace.start") return withinGroupAdminLifecycleDeadline(() => workspaces.setStatus(group.id,"running"), deadline);
+      if(name==="groups.admin-workspace.stop") return withinGroupAdminLifecycleDeadline(() => workspaces.setStatus(group.id,"stopped"), deadline);
+      if(name==="groups.admin-workspace.rebuild") return withinGroupAdminLifecycleDeadline(() => workspaces.rebuild(group.id,group.userId), deadline);
+    }
     if(name==="groups.delete") { await deleteWorkerGroup(group.userId,group.id); return {id:group.id,deleted:true}; }
     const patch:{name?:string;workerIds?:string[]}={}; if(args.name!==undefined){const label=required(args.name,"name").trim();if(!label||label.length>100)throw status(400,"Invalid group name");patch.name=label;}
     if(args.workerIds!==undefined){const ids=strings(args.workerIds,"workerIds");for(const id of ids){const worker=useWorkerStore().findById(id);if(!worker||worker.userId!==group.userId)throw status(400,"All workers must belong to group owner");}patch.workerIds=ids;}
@@ -115,3 +148,20 @@ function strings(v:unknown,n:string){if(!Array.isArray(v)||v.some(x=>typeof x!==
 function settings(a:Record<string,unknown>):UpdateContainerSettingsRequest { const result:any={}; for(const k of ["displayName","environmentId","initScript","repos","mounts"]){if(a[k]!==undefined)result[k]=a[k];} return result; }
 function configInput(value:unknown){const a=value && typeof value==="object"&&!Array.isArray(value)?value as Record<string,unknown>:{};const result:any={};for(const k of ["variables","secrets","secretFiles","envFile","deleteSecrets","deleteSecretFiles"]){if(a[k]!==undefined)result[k]=a[k];}return result;}
 function status(statusCode:number,message:string){return Object.assign(new Error(message),{statusCode});}
+function groupAdminLifecycleTimeoutSeconds(value: unknown) {
+  if (value === undefined) return GROUP_ADMIN_LIFECYCLE_TIMEOUT_DEFAULT_SECONDS;
+  if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > GROUP_ADMIN_LIFECYCLE_TIMEOUT_MAX_SECONDS)
+    throw status(400, `timeoutSeconds must be an integer between 1 and ${GROUP_ADMIN_LIFECYCLE_TIMEOUT_MAX_SECONDS}`);
+  return value as number;
+}
+/** Bounds only the MCP caller's wait. Dockerode does not expose cancellable
+ * lifecycle operations, so a timed-out operation remains serialized by the
+ * workspace store and may still finish; no later request can bypass it. */
+export function withinGroupAdminLifecycleDeadline<T>(operation: () => Promise<T>, timeoutSeconds: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return new Promise<T>((resolve, reject) => {
+    timer = setTimeout(() => reject(status(504, `Group administrative workspace operation exceeded ${timeoutSeconds} seconds`)), timeoutSeconds * 1000);
+    timer.unref?.();
+    void operation().then(resolve, reject);
+  }).finally(() => { if (timer) clearTimeout(timer); });
+}
