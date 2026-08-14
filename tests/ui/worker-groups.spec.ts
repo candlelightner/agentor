@@ -5,6 +5,10 @@ import { goToDashboard } from "../helpers/ui-helpers";
 test.describe.serial("Worker groups dashboard", () => {
   let workerId = "";
   let workerName = "";
+  let ungroupedWorkerId = "";
+  let ungroupedWorkerName = "";
+  let secondWorkerId = "";
+  let secondWorkerName = "";
   let groupId = "";
 
   test.beforeAll(async ({ request }) => {
@@ -13,12 +17,24 @@ test.describe.serial("Worker groups dashboard", () => {
     });
     workerId = worker.id;
     workerName = String(worker.displayName);
+    const ungroupedWorker = await createWorker(request, {
+      displayName: `group-ui-worker-ungrouped-${Date.now()}`,
+    });
+    ungroupedWorkerId = ungroupedWorker.id;
+    ungroupedWorkerName = String(ungroupedWorker.displayName);
+    const secondWorker = await createWorker(request, {
+      displayName: `group-ui-worker-second-${Date.now()}`,
+    });
+    secondWorkerId = secondWorker.id;
+    secondWorkerName = String(secondWorker.displayName);
   });
 
   test.afterAll(async ({ request }) => {
     if (groupId)
       await request.delete(`/api/worker-groups/${groupId}`).catch(() => {});
     if (workerId) await cleanupWorker(request, workerId);
+    if (ungroupedWorkerId) await cleanupWorker(request, ungroupedWorkerId);
+    if (secondWorkerId) await cleanupWorker(request, secondWorkerId);
   });
 
   test("creates a group, changes real worker membership, and deletes only the group", async ({
@@ -36,6 +52,7 @@ test.describe.serial("Worker groups dashboard", () => {
     await expect(group).toBeVisible();
     const membership = group.getByRole("checkbox", { name: workerName });
     await membership.check();
+    await group.getByRole("checkbox", { name: secondWorkerName }).check();
     await expect(membership).toBeChecked();
     await expect
       .poll(async () => {
@@ -46,7 +63,16 @@ test.describe.serial("Worker groups dashboard", () => {
         groupId = persisted?.id || "";
         return persisted?.workerIds || [];
       })
-      .toEqual([workerId]);
+      .toEqual([workerId, secondWorkerId]);
+    const workerGroupCards = page.getByTestId(`worker-group-cards-${groupId}`);
+    await expect(workerGroupCards).toBeVisible();
+    await expect(workerGroupCards.getByText(groupName, { exact: true })).toBeVisible();
+    await expect(workerGroupCards.getByText(workerName, { exact: true })).toBeVisible();
+    await expect(workerGroupCards.getByText(secondWorkerName, { exact: true })).toBeVisible();
+    await expect(workerGroupCards.locator("h3")).toHaveCount(2);
+    await expect(
+      workerGroupCards.getByText(ungroupedWorkerName, { exact: true }),
+    ).toHaveCount(0);
     await group.getByRole("button", { name: "Provision group admin" }).click();
     await expect(group.getByText("running", { exact: true })).toBeVisible({ timeout: 120_000 });
     await expect.poll(async () => (await request.get(`/api/worker-groups/${groupId}/admin-workspace`)).status(), { timeout: 120_000 }).toBe(200);

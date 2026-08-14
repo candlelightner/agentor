@@ -5,6 +5,7 @@ import type {
   ArchivedWorker,
   UpdateContainerSettingsRequest,
 } from "~/types";
+import type { WorkerGroup } from "~/composables/useWorkerGroups";
 
 const props = defineProps<{
   containers: ContainerInfo[];
@@ -59,6 +60,7 @@ const { refreshing: usageRefreshing, refresh: usageRefresh } = useUsage();
 const { workers: workerMetrics } = useWorkerMetrics();
 const { mappings: portMappings } = usePortMappings();
 const { mappings: domainMappings } = useDomainMappings();
+const { groups: workerGroups } = useWorkerGroups();
 
 // O(1) lookup of a worker's metrics, rebuilt only when the metrics list changes
 // (avoids a linear scan per card per render in the worker v-for).
@@ -154,6 +156,49 @@ const currentWorkerList = computed(() =>
     ? stoppedContainers.value
     : activeContainers.value,
 );
+
+type WorkerListItem =
+  | { kind: "worker"; worker: ContainerInfo }
+  | { kind: "group"; group: WorkerGroup; workers: ContainerInfo[] };
+
+// Keep every visible member of a worker group in one list item.  Building the
+// sections in the source-list order means ungrouped workers otherwise retain
+// their familiar order, while a group's first visible member determines where
+// the shared box appears.
+const groupedCurrentWorkerList = computed<WorkerListItem[]>(() => {
+  const groupsByWorkerId = new Map<string, WorkerGroup>();
+  for (const group of workerGroups.value) {
+    for (const workerId of group.workerIds) {
+      // A worker can be present in more than one saved group. Render it in the
+      // first group returned by the API so the dashboard stays unambiguous.
+      if (!groupsByWorkerId.has(workerId)) groupsByWorkerId.set(workerId, group);
+    }
+  }
+
+  const workersByGroupId = new Map<string, ContainerInfo[]>();
+  for (const worker of currentWorkerList.value) {
+    const group = groupsByWorkerId.get(worker.id);
+    if (!group) continue;
+    const members = workersByGroupId.get(group.id) ?? [];
+    members.push(worker);
+    workersByGroupId.set(group.id, members);
+  }
+
+  const renderedGroups = new Set<string>();
+  return currentWorkerList.value.flatMap((worker) => {
+    const group = groupsByWorkerId.get(worker.id);
+    if (!group) return [{ kind: "worker" as const, worker }];
+    if (renderedGroups.has(group.id)) return [];
+    renderedGroups.add(group.id);
+    return [
+      {
+        kind: "group" as const,
+        group,
+        workers: workersByGroupId.get(group.id) ?? [],
+      },
+    ];
+  });
+});
 
 function selectTab(id: string) {
   setActiveTab(id);
@@ -517,27 +562,57 @@ function isContainerActive(
           }}
         </div>
         <div class="space-y-2">
-          <ContainerCard
-            v-for="c in currentWorkerList"
-            :key="c.id"
-            :container="c"
-            :is-active="isContainerActive(c.id, tabs, activeTabId)"
-            :metric="metricFor(c.id)"
-            @open-terminal="(cid) => emit('openTerminal', cid)"
-            @open-desktop="(cid) => emit('openDesktop', cid)"
-            @open-apps="(cid) => emit('openApps', cid)"
-            @open-editor="(cid) => emit('openEditor', cid)"
-            @stop="(id) => emit('stopContainer', id)"
-            @restart="(id) => emit('restartContainer', id)"
-            @rebuild="(id) => emit('rebuildContainer', id)"
-            @remove="(id) => emit('removeContainer', id)"
-            @archive="(id) => emit('archiveContainer', id)"
-            @update="
-              (id, patch, rebuild, complete) =>
-                emit('updateContainer', id, patch, rebuild, complete)
-            "
-            @download-workspace="(id) => emit('downloadWorkspace', id)"
-          />
+          <template v-for="item in groupedCurrentWorkerList" :key="item.kind === 'group' ? item.group.id : item.worker.id">
+            <section
+              v-if="item.kind === 'group'"
+              class="rounded-xl border-2 border-primary-300/70 bg-primary-50/40 p-2 dark:border-primary-700/70 dark:bg-primary-950/20"
+              :aria-label="`Worker group: ${item.group.name}`"
+              :data-testid="`worker-group-cards-${item.group.id}`"
+            >
+              <div class="mb-2 flex items-center gap-1.5 px-1 text-xs font-semibold text-primary-700 dark:text-primary-300">
+                <UIcon name="i-lucide-folder-kanban" class="size-3.5" />
+                <span>{{ item.group.name }}</span>
+                <span class="text-primary-600/70 dark:text-primary-400/70">{{ item.workers.length }} worker{{ item.workers.length === 1 ? '' : 's' }}</span>
+              </div>
+              <div class="space-y-2">
+                <ContainerCard
+                  v-for="c in item.workers"
+                  :key="c.id"
+                  :container="c"
+                  :is-active="isContainerActive(c.id, tabs, activeTabId)"
+                  :metric="metricFor(c.id)"
+                  @open-terminal="(cid) => emit('openTerminal', cid)"
+                  @open-desktop="(cid) => emit('openDesktop', cid)"
+                  @open-apps="(cid) => emit('openApps', cid)"
+                  @open-editor="(cid) => emit('openEditor', cid)"
+                  @stop="(id) => emit('stopContainer', id)"
+                  @restart="(id) => emit('restartContainer', id)"
+                  @rebuild="(id) => emit('rebuildContainer', id)"
+                  @remove="(id) => emit('removeContainer', id)"
+                  @archive="(id) => emit('archiveContainer', id)"
+                  @update="(id, patch, rebuild, complete) => emit('updateContainer', id, patch, rebuild, complete)"
+                  @download-workspace="(id) => emit('downloadWorkspace', id)"
+                />
+              </div>
+            </section>
+            <ContainerCard
+              v-else
+              :container="item.worker"
+              :is-active="isContainerActive(item.worker.id, tabs, activeTabId)"
+              :metric="metricFor(item.worker.id)"
+              @open-terminal="(cid) => emit('openTerminal', cid)"
+              @open-desktop="(cid) => emit('openDesktop', cid)"
+              @open-apps="(cid) => emit('openApps', cid)"
+              @open-editor="(cid) => emit('openEditor', cid)"
+              @stop="(id) => emit('stopContainer', id)"
+              @restart="(id) => emit('restartContainer', id)"
+              @rebuild="(id) => emit('rebuildContainer', id)"
+              @remove="(id) => emit('removeContainer', id)"
+              @archive="(id) => emit('archiveContainer', id)"
+              @update="(id, patch, rebuild, complete) => emit('updateContainer', id, patch, rebuild, complete)"
+              @download-workspace="(id) => emit('downloadWorkspace', id)"
+            />
+          </template>
         </div>
       </div>
 
