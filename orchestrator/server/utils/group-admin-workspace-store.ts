@@ -18,7 +18,7 @@ export class GroupAdminWorkspaceStore {
   private identityMaterializer?: (
     record: GroupAdministrativeWorkspaceRecord,
   ) => Promise<void>;
-  private tails = new Map<string, Promise<void>>();
+  private running = new Set<string>();
   setRuntimeAdapter(runtime: AdminWorkspaceRuntimeAdapter) {
     this.runtime = runtime;
   }
@@ -56,17 +56,23 @@ export class GroupAdminWorkspaceStore {
       adminWorkspace: record,
     });
   }
-  private run<T>(groupId: string, operation: () => Promise<T>): Promise<T> {
-    const tail = this.tails.get(groupId) ?? Promise.resolve();
-    const result = tail.then(operation, operation);
-    this.tails.set(
-      groupId,
-      result.then(
-        () => undefined,
-        () => undefined,
-      ),
-    );
-    return result;
+  private async run<T>(groupId: string, operation: () => Promise<T>): Promise<T> {
+    // Lifecycle operations can rebuild images and take longer than an HTTP
+    // proxy timeout. Never queue retries behind an operation whose client has
+    // disconnected: a burst of clicks/MCP retries would otherwise destroy and
+    // recreate the same workspace repeatedly long after the first rebuild
+    // completed. Callers receive a prompt, retryable conflict instead.
+    if (this.running.has(groupId))
+      throw Object.assign(
+        new Error("Group administrative workspace operation already in progress"),
+        { statusCode: 409 },
+      );
+    this.running.add(groupId);
+    try {
+      return await operation();
+    } finally {
+      this.running.delete(groupId);
+    }
   }
   async ensure(groupId: string, _ownerId?: string) {
     const group = this.group(groupId);

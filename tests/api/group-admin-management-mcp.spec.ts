@@ -96,7 +96,11 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     // record.  A rebuild must retain the immutable workspace/group binding.
     expect((await ownerRequest.post(`/api/worker-groups/${groupId}/admin-workspace/stop`)).status()).toBe(200);
     expect((await ownerRequest.post(`/api/worker-groups/${groupId}/admin-workspace/start`)).status()).toBe(200);
-    expect((await ownerRequest.post(`/api/worker-groups/${groupId}/admin-workspace/rebuild`)).status()).toBe(200);
+    const rebuildStatuses = await Promise.all([
+      ownerRequest.post(`/api/worker-groups/${groupId}/admin-workspace/rebuild`).then((response) => response.status()),
+      ownerRequest.post(`/api/worker-groups/${groupId}/admin-workspace/rebuild`).then((response) => response.status()),
+    ]);
+    expect(rebuildStatuses.sort((a, b) => a - b)).toEqual([200, 409]);
     await expect.poll(async () => (await ownerRequest.get(`/api/worker-groups/${groupId}/admin-workspace`)).status()).toBe(200);
     expect(await (await ownerRequest.get(`/api/worker-groups/${groupId}/admin-workspace`)).json()).toMatchObject({ id: workspaceId, groupId });
 
