@@ -99,6 +99,19 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     await expect.poll(async () => (await ownerRequest.get(`/api/worker-groups/${groupId}/admin-workspace`)).status()).toBe(200);
     expect(await (await ownerRequest.get(`/api/worker-groups/${groupId}/admin-workspace`)).json()).toMatchObject({ id: workspaceId, groupId });
 
+    // A normal inventory refresh must not erase the externally registered
+    // administrative runtime. The dashboard polls these endpoints every five
+    // seconds and previously fell back to "Desktop is starting..." after any
+    // GET /api/containers refresh cleared the registration.
+    expect((await ownerRequest.get("/api/containers")).status()).toBe(200);
+    const desktopStatus = await ownerRequest.get(`/api/containers/${workspaceId}/desktop/status`);
+    expect(desktopStatus.status()).toBe(200);
+    expect(await desktopStatus.json()).toMatchObject({ running: true });
+    const editorStatus = await ownerRequest.get(`/api/containers/${workspaceId}/editor/status`);
+    expect(editorStatus.status()).toBe(200);
+    expect(await editorStatus.json()).toMatchObject({ running: true });
+    expect((await ownerRequest.get(`/desktop/${workspaceId}/agentor.html`)).status()).toBe(200);
+
     await issueCredential(request);
   });
 

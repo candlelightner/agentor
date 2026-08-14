@@ -424,6 +424,20 @@ export class ContainerManager {
   async sync(): Promise<void> {
     const dockerContainers = await this.dockerService.listContainers();
 
+    // Administrative workspaces are registered explicitly by their dedicated
+    // runtime and intentionally do not carry the ordinary `agentor.id` worker
+    // label. Preserve those external registrations across inventory refreshes;
+    // otherwise the clear below makes terminal/editor/desktop routes forget a
+    // healthy admin workspace until its runtime happens to register it again.
+    // The dedicated runtime remains authoritative for start/stop/rebuild/remove
+    // and updates or unregisters these entries explicitly. `listContainers()`
+    // only returns `agentor.managed=true`; administrative containers are
+    // deliberately `agentor.managed=false`, so they cannot be reconciled from
+    // this filtered inventory.
+    const external = Array.from(this.containers.values()).filter(
+      (info) => Boolean(info.administrativeKind),
+    );
+
     this.containers.clear();
 
     for (const dc of dockerContainers) {
@@ -468,6 +482,8 @@ export class ContainerManager {
         imageRuntimeReference: worker?.imageRuntimeReference,
       });
     }
+
+    for (const info of external) this.containers.set(info.id, info);
 
     useLogger().debug(`[container] synced ${this.containers.size} containers`);
   }
