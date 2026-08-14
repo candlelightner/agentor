@@ -26,6 +26,7 @@ import { workerConfigurationResponse } from "./worker-config-response";
 import { useWorkerConfigStore } from "./worker-config-store";
 import { useManagementConsoleStore } from "./management-console-store";
 import { ManagementWorkerDomain } from "./management-worker-domain";
+import { addWorkerToGroupWithNetworks } from "./worker-group-manager";
 import {
   workspaceMcpTools,
   executeWorkspaceMcpTool,
@@ -77,6 +78,7 @@ const GROUP_ADMIN_TOOLS = new Set([
   "status.system",
   "workers.list",
   "workers.inspect",
+  "workers.create",
   "workers.metrics.get",
   "logs.read",
   "volumes.list",
@@ -124,6 +126,80 @@ const GROUP_ADMIN_TOOLS = new Set([
   "workspaces.preview",
   "workspaces.download",
 ]);
+const GROUP_ADMIN_TARGET_FREE_TOOLS = new Set([
+  "status.system",
+  "workers.list",
+  "volumes.list",
+  "apps.types",
+  "workspaces.list",
+]);
+const GROUP_ADMIN_DIRECT_TARGET_TOOLS = new Set([
+  "workers.inspect",
+  "workers.metrics.get",
+  "logs.read",
+  "volumes.list-files",
+  "configuration.inspect",
+  "worker.stop",
+  "worker.start",
+  "workers.update",
+  "workers.restart",
+  "workers.rebuild",
+  "workers.archive",
+  "workers.unarchive",
+  "workers.delete",
+  "configuration.get",
+  "configuration.set",
+  "console.open",
+  "exports.create",
+  "backups.create",
+  "locks.get",
+  "locks.set",
+  "locks.remove",
+  "apps.list",
+  "apps.start",
+  "apps.stop",
+  "files.list",
+  "files.upload",
+  "files.mkdir",
+  "files.rename",
+  "files.move",
+  "files.delete",
+  "port-mappings.create",
+  "domain-mappings.create",
+  "workspaces.files",
+  "workspaces.preview",
+  "workspaces.download",
+]);
+const GROUP_ADMIN_EXPORT_JOB_TOOLS = new Set([
+  "exports.status",
+  "exports.cancel",
+  "exports.download",
+]);
+const GROUP_ADMIN_BACKUP_JOB_TOOLS = new Set([
+  "backups.status",
+  "backups.cancel",
+]);
+const GROUP_ADMIN_CONSOLE_SESSION_TOOLS = new Set([
+  "console.read",
+  "console.write",
+  "console.interrupt",
+  "console.close",
+]);
+
+// Tool discovery is an allowlist, and target resolution is a second,
+// exhaustive allowlist. A newly delegated tool cannot silently become
+// owner-wide merely because its identifier uses a field we do not recognize.
+for (const name of GROUP_ADMIN_TOOLS) {
+  if (
+    name !== "workers.create" &&
+    !GROUP_ADMIN_TARGET_FREE_TOOLS.has(name) &&
+    !GROUP_ADMIN_DIRECT_TARGET_TOOLS.has(name) &&
+    !GROUP_ADMIN_EXPORT_JOB_TOOLS.has(name) &&
+    !GROUP_ADMIN_BACKUP_JOB_TOOLS.has(name) &&
+    !GROUP_ADMIN_CONSOLE_SESSION_TOOLS.has(name)
+  )
+    throw new Error(`Group administrative tool has no target policy: ${name}`);
+}
 type Group = (typeof GROUPS)[number];
 const workerDomain = new ManagementWorkerDomain();
 const imageBackupDomain = new ManagementImageBackupDomain();
@@ -345,6 +421,9 @@ export class ManagementMcpStore {
         return {
           name,
           description:
+            (identity?.scope === "group" && name === "workers.create"
+              ? "Create an evaluation worker owned by and atomically enrolled in this administrative group. The owner and group are derived from the workspace identity."
+              : undefined) ||
             domain?.description ||
             workspace?.description ||
             imageBackup?.description ||
@@ -358,6 +437,9 @@ export class ManagementMcpStore {
             imports?.description ||
             `Agentor management tool (${TOOL_GROUP[name]})`,
           inputSchema:
+            (identity?.scope === "group" && name === "workers.create"
+              ? groupWorkerCreateInputSchema()
+              : undefined) ||
             domain?.inputSchema ||
             workspace?.inputSchema ||
             imageBackup?.inputSchema ||
@@ -521,6 +603,14 @@ export class ManagementMcpStore {
         throw Object.assign(new Error("Tool denied by policy"), {
           statusCode: 403,
         });
+      }
+      if (identity.scope === "group" && name === "workers.create") {
+        // A group principal never selects an owner or group. Both are derived
+        // from its live workload identity, closing owner-wide confused-deputy
+        // paths even when invoke() is reached outside normal schema validation.
+        if (args.userId !== undefined || args.ownerId !== undefined || args.groupId !== undefined)
+          throw groupResourceNotFound();
+        args = { ...args, userId: identity.ownerId };
       }
       await validateManagementOwnerArguments(args);
       if (identity.scope === "group")
@@ -750,6 +840,8 @@ export class ManagementMcpStore {
     // particular, missing ownerId must not trigger backup/image store
     // initialization or compatibility lookups that can take minutes.
     validateToolArguments(name, args);
+    if (identity?.scope === "group" && name === "workers.create")
+      return this.createGroupWorker(identity, args);
     const domain = await workerDomain.execute(name, args);
     if (domain.handled) return domain.result;
     const imageBackup = await imageBackupDomain.execute(
@@ -925,6 +1017,45 @@ export class ManagementMcpStore {
     }
     return { result: "redacted", workspaceId };
   }
+  private async createGroupWorker(
+    identity: IdentityMetadata,
+    args: Record<string, unknown>,
+  ) {
+    if (!identity.groupId || !identity.ownerId) throw groupResourceNotFound();
+    // Re-read the live group before creation and again while enrolling it.
+    // The normal group/network coordinator serializes membership changes and
+    // reconciles dependent networks before this call returns.
+    const group = useWorkerGroupStore().findById(identity.groupId);
+    if (!group || group.userId !== identity.ownerId) throw groupResourceNotFound();
+    const created = await workerDomain.execute("workers.create", args);
+    const worker = created.result as { id?: string } | undefined;
+    if (!created.handled || !worker?.id)
+      throw statusError(500, "Group worker creation failed");
+    try {
+      await addWorkerToGroupWithNetworks(
+        identity.ownerId,
+        identity.groupId,
+        worker.id,
+        args.lockPasswords,
+      );
+      return worker;
+    } catch (error) {
+      // Never leave a successfully-created owner-wide worker behind when its
+      // mandatory group enrollment/reconciliation did not complete.
+      let cleanupFailure: unknown;
+      try {
+        await useContainerManager().remove(worker.id);
+      } catch (cleanupError) {
+        cleanupFailure = cleanupError;
+      }
+      if (cleanupFailure)
+        throw statusError(
+          500,
+          `Group worker enrollment failed and rollback requires operator cleanup: ${worker.id}`,
+        );
+      throw error;
+    }
+  }
   private groupWorkerIds(identity: IdentityMetadata) {
     const group = identity.groupId
       ? useWorkerGroupStore().findById(identity.groupId)
@@ -959,33 +1090,29 @@ export class ManagementMcpStore {
         new Error("Tool is unavailable to group administrative workspaces"),
         { statusCode: 403 },
       );
-    if (args.ownerId !== undefined && args.ownerId !== identity.ownerId)
-      throw Object.assign(
-        new Error("Owner is outside the administrative group scope"),
-        { statusCode: 403 },
-      );
-    const ids = this.groupWorkerIds(identity);
     if (
-      ["exports.status", "exports.cancel", "exports.download"].includes(name)
-    ) {
+      (args.ownerId !== undefined && args.ownerId !== identity.ownerId) ||
+      (args.userId !== undefined && args.userId !== identity.ownerId)
+    )
+      throw groupResourceNotFound();
+    const ids = this.groupWorkerIds(identity);
+    if (name === "workers.create" || GROUP_ADMIN_TARGET_FREE_TOOLS.has(name))
+      return;
+    if (GROUP_ADMIN_EXPORT_JOB_TOOLS.has(name)) {
       const job = await useExportJobManager().get(String(args.jobId || ""));
       if (!job || !ids.has(job.workerId))
-        throw Object.assign(
-          new Error("Export job is outside the administrative group scope"),
-          { statusCode: 403 },
-        );
+        throw groupResourceNotFound();
+      return;
     }
-    if (["backups.status", "backups.cancel"].includes(name)) {
+    if (GROUP_ADMIN_BACKUP_JOB_TOOLS.has(name)) {
       const job = await useBackupManager().getJob(String(args.jobId || ""));
       const targets =
         job?.workspaceIds ?? (job?.workspaceId ? [job.workspaceId] : []);
       if (!job || !targets.length || targets.some((id) => !ids.has(id)))
-        throw Object.assign(
-          new Error("Backup job is outside the administrative group scope"),
-          { statusCode: 403 },
-        );
+        throw groupResourceNotFound();
+      return;
     }
-    if (name.startsWith("console.") && name !== "console.open") {
+    if (GROUP_ADMIN_CONSOLE_SESSION_TOOLS.has(name)) {
       const sessionId =
         typeof args.sessionId === "string" ? args.sessionId : "";
       const target = useManagementConsoleStore().target(
@@ -997,18 +1124,15 @@ export class ManagementMcpStore {
           void useManagementConsoleStore()
             .close(identity.workspaceId, sessionId)
             .catch(() => undefined);
-        throw Object.assign(
-          new Error("Console target is outside the administrative group scope"),
-          { statusCode: 403 },
-        );
+        throw groupResourceNotFound();
       }
+      return;
     }
+    if (!GROUP_ADMIN_DIRECT_TARGET_TOOLS.has(name))
+      throw Object.assign(new Error("Tool is unavailable"), { statusCode: 403 });
     for (const key of ["workerId", "workspaceId"] as const)
       if (typeof args[key] === "string" && !ids.has(args[key] as string))
-        throw Object.assign(
-          new Error("Worker is outside the administrative group scope"),
-          { statusCode: 403 },
-        );
+        throw groupResourceNotFound();
     for (const key of ["workerIds", "workspaceIds"] as const)
       if (
         Array.isArray(args[key]) &&
@@ -1016,10 +1140,7 @@ export class ManagementMcpStore {
           (value) => typeof value !== "string" || !ids.has(value),
         )
       )
-        throw Object.assign(
-          new Error("Worker is outside the administrative group scope"),
-          { statusCode: 403 },
-        );
+        throw groupResourceNotFound();
   }
   async approve(id: string, actor: string) {
     await this.init();
@@ -1078,6 +1199,27 @@ export function useManagementMcpStore() {
 
 function statusError(statusCode: number, message: string) {
   return Object.assign(new Error(message), { statusCode });
+}
+function groupResourceNotFound() {
+  return statusError(404, "Resource not found");
+}
+function groupWorkerCreateInputSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      displayName: { type: "string" },
+      environmentId: { type: "string" },
+      imageDefinitionId: { type: "string" },
+      imageVersion: { type: "string" },
+      lockPasswords: {
+        type: "object",
+        additionalProperties: { type: "string", writeOnly: true },
+        description:
+          "Passwords for protected existing group members when a dependent managed network must be reconciled.",
+      },
+    },
+  };
 }
 function validateToolArguments(name: string, args: Record<string, unknown>) {
   const definitions = [

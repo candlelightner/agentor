@@ -56,11 +56,41 @@ export class WorkerGroupNetworkCoordinator {
     patch: WorkerGroupPatch,
     lockPasswords?: unknown,
   ) {
-    return this.withOwner(userId, async () => {
+    return this.withOwner(userId, () =>
+      this.updateLocked(userId, groupId, () => patch, lockPasswords),
+    );
+  }
+
+  /** Add one worker using the membership snapshot read inside the owner queue. */
+  addWorker(
+    userId: string,
+    groupId: string,
+    workerId: string,
+    lockPasswords?: unknown,
+  ) {
+    return this.withOwner(userId, () =>
+      this.updateLocked(
+        userId,
+        groupId,
+        (current) => ({
+          workerIds: [...new Set([...current.workerIds, workerId])],
+        }),
+        lockPasswords,
+      ),
+    );
+  }
+
+  private async updateLocked(
+    userId: string,
+    groupId: string,
+    resolvePatch: (current: WorkerGroup) => WorkerGroupPatch,
+    lockPasswords?: unknown,
+  ) {
       const { groups } = this.dependencies;
       const existing = groups.get(userId, groupId);
       if (!existing)
         throw createError({ statusCode: 404, statusMessage: "Worker group not found" });
+      const patch = resolvePatch(existing);
       const previous = { name: existing.name, workerIds: [...existing.workerIds] };
       const networks = patch.workerIds === undefined
         ? []
@@ -105,7 +135,6 @@ export class WorkerGroupNetworkCoordinator {
         statusCode: 409,
         statusMessage: `Worker group network reconciliation failed: ${failures.join("; ")}. ${details}`,
       });
-    });
   }
 
   delete(userId: string, groupId: string) {
@@ -179,6 +208,20 @@ export function updateWorkerGroupWithNetworks(
   lockPasswords?: unknown,
 ) {
   return useWorkerGroupNetworkCoordinator().update(userId, groupId, patch, lockPasswords);
+}
+
+export function addWorkerToGroupWithNetworks(
+  userId: string,
+  groupId: string,
+  workerId: string,
+  lockPasswords?: unknown,
+) {
+  return useWorkerGroupNetworkCoordinator().addWorker(
+    userId,
+    groupId,
+    workerId,
+    lockPasswords,
+  );
 }
 
 export function deleteWorkerGroup(userId: string, groupId: string) {

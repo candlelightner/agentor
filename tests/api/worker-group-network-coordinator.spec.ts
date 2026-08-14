@@ -55,6 +55,29 @@ test("owner queue closes network-reference create versus group-delete races", as
   expect(networks).toEqual([network]);
 });
 
+test("queued group worker enrollment derives membership inside the owner lock", async () => {
+  let current = group();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const service = new WorkerGroupNetworkCoordinator(dependencies({
+    group: () => current,
+    update: async (_userId, _groupId, patch) => {
+      current = { ...current, ...patch, workerIds: patch.workerIds ?? current.workerIds };
+      return current;
+    },
+  }));
+
+  const concurrentMembershipChange = service.withOwner(ownerId, async () => {
+    await held;
+    current = { ...current, workerIds: ["concurrent-worker"] };
+  });
+  const enrollment = service.addWorker(ownerId, groupId, "new-worker");
+  release();
+  await concurrentMembershipChange;
+  await enrollment;
+  expect(current.workerIds).toEqual(["concurrent-worker", "new-worker"]);
+});
+
 test("reconciliation failure restores topology even when group storage rollback fails", async () => {
   let current = group();
   let updates = 0;

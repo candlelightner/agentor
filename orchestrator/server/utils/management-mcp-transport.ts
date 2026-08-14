@@ -126,10 +126,16 @@ export class ManagementMcpTransport {
       ? authorization.slice(7)
       : undefined;
     let rpcId: unknown = null;
+    let hasRpcId = false;
     try {
       const body = await readJson(request);
       const id = body?.id ?? null;
       rpcId = id;
+      hasRpcId =
+        typeof body === "object" &&
+        body !== null &&
+        !Array.isArray(body) &&
+        Object.hasOwn(body, "id");
       if (body?.jsonrpc !== "2.0" || typeof body?.method !== "string") {
         await this.authenticate(credential, "invalid-request");
         return this.rpc(response, id, undefined, {
@@ -173,28 +179,46 @@ export class ManagementMcpTransport {
         message: "Method not found",
       });
     } catch (error: any) {
-      const status =
-        error?.statusCode === 401 ? 401 : error?.statusCode === 403 ? 403 : 400;
+      const status = Number.isInteger(error?.statusCode)
+        ? error.statusCode
+        : 500;
       // Once a JSON-RPC request has been parsed, tool/application failures are
       // JSON-RPC errors, not HTTP transport failures. Returning HTTP 400 with
       // id:null caused the stdio bridge to wait for the original request until
       // its client-side timeout instead of surfacing validation errors.
-      if (rpcId !== null && status !== 401 && status !== 403)
+      // A parsed JSON-RPC request must always receive a response carrying the
+      // same id.  In particular, never turn authentication/authorization
+      // failures into id:null responses: stdio MCP clients quite correctly
+      // ignore those as unrelated and would leave the original call pending.
+      if (hasRpcId)
         return this.rpc(response, rpcId, undefined, {
           code: -32000,
-          message: error?.message || "Management tool failed",
+          message:
+            status === 404
+              ? "Resource not found"
+              : status === 401
+                ? "Unauthorized"
+                : status === 403
+                  ? "Forbidden"
+                  : error?.message || "Management tool failed",
           data: {
-            statusCode: Number.isInteger(error?.statusCode)
-              ? error.statusCode
-              : 500,
+            statusCode: status,
           },
         });
-      return this.send(response, status, {
+      const httpStatus = [400, 401, 403, 404].includes(status) ? status : 500;
+      return this.send(response, httpStatus, {
         jsonrpc: "2.0",
         id: null,
         error: {
           code: status === 401 ? -32001 : -32003,
-          message: status === 400 ? "Invalid MCP request" : error.message,
+          message:
+            httpStatus === 400
+              ? "Invalid MCP request"
+              : httpStatus === 401
+                ? "Unauthorized"
+                : httpStatus === 404
+                  ? "Resource not found"
+                  : "Forbidden",
         },
       });
     }

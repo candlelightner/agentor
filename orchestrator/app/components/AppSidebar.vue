@@ -185,19 +185,21 @@ const groupedCurrentWorkerList = computed<WorkerListItem[]>(() => {
   }
 
   const renderedGroups = new Set<string>();
-  return currentWorkerList.value.flatMap((worker) => {
+  return currentWorkerList.value.reduce<WorkerListItem[]>((items, worker) => {
     const group = groupsByWorkerId.get(worker.id);
-    if (!group) return [{ kind: "worker" as const, worker }];
-    if (renderedGroups.has(group.id)) return [];
+    if (!group) {
+      items.push({ kind: "worker", worker });
+      return items;
+    }
+    if (renderedGroups.has(group.id)) return items;
     renderedGroups.add(group.id);
-    return [
-      {
-        kind: "group" as const,
-        group,
-        workers: workersByGroupId.get(group.id) ?? [],
-      },
-    ];
-  });
+    items.push({
+      kind: "group",
+      group,
+      workers: workersByGroupId.get(group.id) ?? [],
+    });
+    return items;
+  }, []);
 });
 
 function selectTab(id: string) {
