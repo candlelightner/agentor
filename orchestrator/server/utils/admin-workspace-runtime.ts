@@ -75,8 +75,11 @@ export class DockerAdminWorkspaceRuntime
   async setClipboard(
     mime: "image/png" | "text/plain",
     bytes: Buffer,
+    record?: Readonly<AdministrativeWorkspaceRecord>,
   ): Promise<void> {
-    const container = this.docker.getContainer(ADMIN_CONTAINER);
+    const container = this.docker.getContainer(
+      record ? this.resources(record).container : ADMIN_CONTAINER,
+    );
     const inspection = await container.inspect();
     if (!inspection.State.Running)
       throw Object.assign(

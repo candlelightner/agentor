@@ -42,7 +42,11 @@ export interface AdminWorkspaceRuntimeAdapter {
   remove?(record: Readonly<AdministrativeWorkspaceRecord>): Promise<void>;
   security?(workerId?: string): Promise<Record<string, unknown> | undefined>;
   managementNetworkSecurity?(): Promise<Record<string, unknown>>;
-  setClipboard?(mime: "image/png" | "text/plain", bytes: Buffer): Promise<void>;
+  setClipboard?(
+    mime: "image/png" | "text/plain",
+    bytes: Buffer,
+    record?: Readonly<AdministrativeWorkspaceRecord>,
+  ): Promise<void>;
 }
 
 const ADMIN_IMAGE =

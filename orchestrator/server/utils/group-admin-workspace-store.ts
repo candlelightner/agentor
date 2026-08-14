@@ -27,6 +27,17 @@ export class GroupAdminWorkspaceStore {
   ) {
     this.identityMaterializer = materializer;
   }
+  async setClipboard(
+    record: GroupAdministrativeWorkspaceRecord,
+    mime: "image/png" | "text/plain",
+    bytes: Buffer,
+  ) {
+    if (!this.runtime?.setClipboard)
+      throw Object.assign(new Error("Administrative clipboard unavailable"), {
+        statusCode: 503,
+      });
+    await this.runtime.setClipboard(mime, bytes, record);
+  }
   private group(groupId: string) {
     const group = useWorkerGroupStore().findById(groupId);
     if (!group)

@@ -50,6 +50,7 @@ defineRouteMeta({
 import { useContainerManager } from '../../../utils/services';
 import { requireContainerAccess } from '../../../utils/auth-helpers';
 import { rethrowAsHttpError } from '../../../utils/http-errors';
+import { useGroupAdminWorkspaceStore } from '../../../utils/group-admin-workspace-store';
 
 const MAX_IMAGE_BYTES = 16 * 1024 * 1024; // 16 MiB
 const MAX_TEXT_BYTES = 1 * 1024 * 1024;   // 1 MiB
@@ -107,8 +108,10 @@ export default defineEventHandler(async (event) => {
   const id = getRouterParam(event, 'id')!;
   const containerManager = useContainerManager();
   const adminWorkspace = useAdminWorkspaceStore();
+  const groupAdminWorkspaces = useGroupAdminWorkspaceStore();
   const adminRecord = await adminWorkspace.ensure();
   const isAdministrative = id === adminRecord.id;
+  const groupAdminRecord = groupAdminWorkspaces.findByWorkspaceId(id);
 
   // Ownership/404/401/403 checks BEFORE the body is read, so an unauthenticated
   // or non-owning caller can never trigger body parsing or worker-side work.
@@ -120,7 +123,7 @@ export default defineEventHandler(async (event) => {
     const auth = requireAuth(event);
     if (auth.user.role !== 'admin') throw createError({ statusCode: 403, statusMessage: 'Forbidden' });
   } else requireContainerAccess(event, containerInfo);
-  if ((!isAdministrative && !containerInfo) || (!isAdministrative && containerInfo!.status !== 'running') || (isAdministrative && adminRecord.status !== 'running')) {
+  if ((!isAdministrative && !containerInfo) || (!isAdministrative && containerInfo!.status !== 'running') || (isAdministrative && adminRecord.status !== 'running') || (groupAdminRecord && groupAdminRecord.status !== 'running')) {
     throw createError({ statusCode: 409, statusMessage: 'Worker container is not running' });
   }
 
@@ -158,6 +161,7 @@ export default defineEventHandler(async (event) => {
 
   try {
     if (isAdministrative) await adminWorkspace.setClipboard(mime, bytes);
+    else if (groupAdminRecord) await groupAdminWorkspaces.setClipboard(groupAdminRecord, mime, bytes);
     else await containerManager.setClipboard(id, mime, bytes);
   } catch (err: any) {
     rethrowAsHttpError(err);

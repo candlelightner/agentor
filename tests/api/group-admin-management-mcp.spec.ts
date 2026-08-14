@@ -4,6 +4,7 @@ import { ApiClient } from "../helpers/api-client";
 import { cleanupWorker, createWorker, waitForWorkerRunning } from "../helpers/worker-lifecycle";
 import { createTestUser, deleteTestUser, type CreatedUser } from "../helpers/test-users";
 import { captureCommandOutput, TerminalWsClient } from "../helpers/terminal-ws";
+import { buildPng } from "../helpers/clipboard";
 
 /**
  * These tests intentionally use the administrator-only diagnostic transport to
@@ -111,6 +112,12 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     expect(editorStatus.status()).toBe(200);
     expect(await editorStatus.json()).toMatchObject({ running: true });
     expect((await ownerRequest.get(`/desktop/${workspaceId}/agentor.html`)).status()).toBe(200);
+    const clipboard = await ownerRequest.post(`/api/containers/${workspaceId}/clipboard`, {
+      headers: { "Content-Type": "image/png" },
+      data: buildPng(2, 2),
+    });
+    expect(clipboard.status()).toBe(200);
+    expect(await clipboard.json()).toMatchObject({ ok: true, type: "image/png", width: 2, height: 2 });
 
     await issueCredential(request);
   });
