@@ -55,6 +55,7 @@ const shortImageId = computed(() => {
 
 const isRunning = computed(() => props.container.status === 'running');
 const isStopped = computed(() => props.container.status === 'stopped');
+const isPlatformAdmin = computed(() => props.container.administrativeKind === 'platform');
 
 function metricColor(p: number) {
   return p >= 80
@@ -80,7 +81,11 @@ function onHScrollWheel(e: WheelEvent) {
   <div
     class="rounded-lg p-3 border transition-colors overflow-hidden"
     :class="[
-      isActive ? 'bg-blue-50/60 dark:bg-gray-800/60 border-blue-500/50 shadow-lg shadow-blue-500/10' : 'bg-gray-100/60 dark:bg-gray-800/40 border-gray-300/50 dark:border-gray-700/50',
+      isPlatformAdmin
+        ? 'bg-red-50/80 dark:bg-red-950/35 border-red-400/70 dark:border-red-700/70 shadow-sm shadow-red-500/10'
+        : isActive
+          ? 'bg-blue-50/60 dark:bg-gray-800/60 border-blue-500/50 shadow-lg shadow-blue-500/10'
+          : 'bg-gray-100/60 dark:bg-gray-800/40 border-gray-300/50 dark:border-gray-700/50',
     ]"
   >
     <!-- Name + image ID + status (clickable for settings): non-wrapping,

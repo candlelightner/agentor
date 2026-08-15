@@ -70,6 +70,8 @@ test.describe.serial('Worker groups dashboard', () => {
       timeout: 120_000,
     });
     await expect.poll(async () => (await request.get(`/api/worker-groups/${groupId}/admin-workspace`)).status(), { timeout: 120_000 }).toBe(200);
+    await expect(workerGroupCards.getByText('GROUP ADMIN', { exact: true })).toBeVisible();
+    await expect(workerGroupCards.locator('h3')).toHaveCount(3);
     await group.getByRole('button', { name: 'Files', exact: true }).click();
     await expect(page.getByTestId('workspace-files-modal')).toBeVisible();
     await expect(page.getByTestId('workspace-files-modal')).toContainText('Group administrator');

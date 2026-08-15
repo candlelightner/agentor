@@ -173,6 +173,11 @@ const groupedCurrentWorkerList = computed<WorkerListItem[]>(() => {
       // first group returned by the API so the dashboard stays unambiguous.
       if (!groupsByWorkerId.has(workerId)) groupsByWorkerId.set(workerId, group);
     }
+    // The administrative runtime belongs visually to its group even though it
+    // is intentionally not part of workerIds (management scope membership).
+    if (group.adminWorkspace) {
+      groupsByWorkerId.set(group.adminWorkspace.id, group);
+    }
   }
 
   const workersByGroupId = new Map<string, ContainerInfo[]>();
@@ -574,7 +579,7 @@ function isContainerActive(
               <div class="mb-2 flex items-center gap-1.5 px-1 text-xs font-semibold text-primary-700 dark:text-primary-300">
                 <UIcon name="i-lucide-folder-kanban" class="size-3.5" />
                 <span>{{ item.group.name }}</span>
-                <span class="text-primary-600/70 dark:text-primary-400/70">{{ item.workers.length }} worker{{ item.workers.length === 1 ? '' : 's' }}</span>
+                <span class="text-primary-600/70 dark:text-primary-400/70">{{ item.workers.filter((worker) => worker.administrativeKind !== 'group').length }} worker{{ item.workers.filter((worker) => worker.administrativeKind !== 'group').length === 1 ? '' : 's' }}</span>
               </div>
               <div class="space-y-2">
                 <ContainerCard

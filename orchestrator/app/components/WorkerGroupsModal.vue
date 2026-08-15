@@ -58,6 +58,15 @@ function openFiles(workspace: GroupAdminWorkspace) {
   filesWorkspace.value = workspace;
   showFiles.value = true;
 }
+function serviceIcon(service: string) {
+  return service === 'terminal'
+    ? 'i-lucide-terminal'
+    : service === 'editor'
+      ? 'i-lucide-code'
+      : service === 'desktop'
+        ? 'i-lucide-monitor'
+        : 'i-lucide-layout-grid';
+}
 </script>
 <template>
   <UModal v-model:open="open" title="Worker groups" data-testid="worker-groups"
@@ -135,31 +144,16 @@ function openFiles(workspace: GroupAdminWorkspace) {
               >Provision group admin</UButton
             >
             <template v-else
-              ><UButton
-                v-if="group.adminWorkspace.status === 'stopped'"
-                size="xs"
-                @click="admin(group, 'start')"
-                >Start</UButton
-              ><UButton v-else size="xs" @click="admin(group, 'stop')"
-                >Stop</UButton
-              ><UButton
-                size="xs"
-                variant="outline"
-                @click="admin(group, 'rebuild')"
-                >Rebuild</UButton
-              ><UButton
-                size="xs"
-                variant="ghost"
-                :disabled="group.adminWorkspace.status !== 'running'"
-                @click="openFiles(group.adminWorkspace)"
-                >Files</UButton
-              ><UButton
-                v-for="service in group.adminWorkspace.services"
-                :key="service"
-                size="xs"
-                variant="ghost"
-                @click="openService(group.adminWorkspace!, service)"
-                >Open {{ service }}</UButton
+              ><UTooltip v-if="group.adminWorkspace.status === 'stopped'" text="Start"
+                ><UButton size="xs" color="success" variant="subtle" icon="i-lucide-refresh-cw" aria-label="Start" @click="admin(group, 'start')" /></UTooltip
+              ><UTooltip v-else text="Stop"
+                ><UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-square" aria-label="Stop" @click="admin(group, 'stop')" /></UTooltip
+              ><UTooltip text="Rebuild"
+                ><UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-hammer" aria-label="Rebuild" @click="admin(group, 'rebuild')" /></UTooltip
+              ><UTooltip text="Files"
+                ><UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-folder-tree" aria-label="Files" :disabled="group.adminWorkspace.status !== 'running'" @click="openFiles(group.adminWorkspace)" /></UTooltip
+              ><UTooltip v-for="service in group.adminWorkspace.services" :key="service" :text="`Open ${service}`"
+                ><UButton size="xs" color="neutral" variant="subtle" :icon="serviceIcon(service)" :aria-label="`Open ${service}`" @click="openService(group.adminWorkspace!, service)" /></UTooltip
               ></template
             >
           </div>
