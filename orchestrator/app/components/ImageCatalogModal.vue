@@ -2,6 +2,7 @@
 const open = defineModel<boolean>("open", { default: false });
 const emit = defineEmits<{ changed: []; testWorker: [workerId: string] }>();
 const api = useImageCatalog();
+const { groups: workerGroups } = useWorkerGroups();
 const form = reactive({
   name: "",
   description: "",
@@ -74,6 +75,11 @@ async function connectGit() {
   git.token = "";
 }
 const fmt = (n: number) => formatBytes(n);
+function catalogScope(groupId?: string) {
+  if (!groupId) return "Global catalog";
+  const group = workerGroups.value.find((item) => item.id === groupId);
+  return group ? `Worker group: ${group.name}` : `Worker group: ${groupId}`;
+}
 function close() { open.value = false; }
 </script>
 <template>
@@ -185,7 +191,13 @@ function close() { open.value = false; }
             >
               <div class="flex justify-between">
                 <div>
-                  <b>{{ d.name }}</b>
+                  <div class="flex flex-wrap items-center gap-2">
+                    <b>{{ d.name }}</b>
+                    <span
+                      class="rounded bg-gray-100 px-2 py-0.5 text-xs text-gray-600"
+                      data-testid="image-catalog-scope"
+                    >{{ catalogScope(d.groupId) }}</span>
+                  </div>
                   <p class="text-xs">{{ d.description }} · {{ d.baseImage }}</p>
                 </div>
                 <div>

@@ -334,7 +334,7 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     expect((await invoke(request, credential, "images.promote", { definitionId: groupImageId, version: "v1" })).status()).toBe(200);
 
     const ownerCatalog = await ownerRequest.get("/api/image-catalog/definitions");
-    expect((await ownerCatalog.json()).map((item: { id: string }) => item.id)).not.toContain(groupImageId);
+    expect((await ownerCatalog.json()).find((item: { id: string }) => item.id === groupImageId)).toMatchObject({ groupId });
     expect((await invoke(request, credential, "images.build", { definitionId: globalImageId, builder: "fake" })).status()).toBe(404);
 
     // Catalog builds can refresh Docker inventory. Reconcile the persistent

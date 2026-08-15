@@ -170,7 +170,10 @@ export class ManagementMcpTransport {
         );
         return this.rpc(response, id, {
           content: [{ type: "text", text: JSON.stringify(result) }],
-          structuredContent: result,
+          // MCP structured content must be a JSON object. Several list tools
+          // return arrays from their service layer; wrap those results so MCP
+          // clients such as Hermes can validate the response consistently.
+          structuredContent: structuredContent(result),
         });
       }
       await this.authenticate(credential, "unknown-method");
@@ -250,6 +253,12 @@ export class ManagementMcpTransport {
     response.setHeader("Content-Type", "application/json; charset=utf-8");
     response.end(JSON.stringify(value));
   }
+}
+
+function structuredContent(result: unknown): Record<string, unknown> {
+  if (result !== null && typeof result === "object" && !Array.isArray(result))
+    return result as Record<string, unknown>;
+  return Array.isArray(result) ? { items: result } : { result };
 }
 
 function httpStatus(error: any): number {

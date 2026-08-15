@@ -7,6 +7,8 @@ export interface CatalogVersion {
 }
 export interface ImageDefinition {
   id: string;
+  /** Undefined for an owner/global catalog definition. */
+  groupId?: string;
   name: string;
   description: string;
   baseImage: string;

@@ -17,6 +17,12 @@ const definition = {
     },
   ],
 };
+const groupDefinition = {
+  ...definition,
+  id: "def-group-1",
+  name: "Group-only tools",
+  groupId: "group-1",
+};
 async function mock(page: Page) {
   await page.route("**/api/image-catalog/definitions", async (r) =>
     r.fulfill({
@@ -29,8 +35,11 @@ async function mock(page: Page) {
               id: "def-2",
               versions: [],
             }
-          : [definition],
+          : [definition, groupDefinition],
     }),
+  );
+  await page.route("**/api/worker-groups", (r) =>
+    r.fulfill({ json: [{ id: "group-1", name: "Evaluation team", workerIds: [] }] }),
   );
   await page.route("**/api/image-catalog/usage", (r) =>
     r.fulfill({
@@ -113,15 +122,20 @@ test("exposes test, promotion, rollback, defaults, base rebuild and usage contro
   const m = await open(page);
   await expect(m).toContainText("sha256:abc");
   await expect(
-    m.getByRole("button", { name: "Create test worker" }),
+    m.getByRole("button", { name: "Create test worker" }).first(),
   ).toBeVisible();
-  await expect(m.getByRole("button", { name: "Promote" })).toBeVisible();
-  await expect(m.getByRole("button", { name: "Rollback" })).toBeVisible();
-  await expect(m.getByRole("button", { name: "Set my default" })).toBeVisible();
+  await expect(m.getByRole("button", { name: "Promote" }).first()).toBeVisible();
+  await expect(m.getByRole("button", { name: "Rollback" }).first()).toBeVisible();
+  await expect(m.getByRole("button", { name: "Set my default" }).first()).toBeVisible();
   await expect(
-    m.getByRole("button", { name: "Rebuild newer base" }),
+    m.getByRole("button", { name: "Rebuild newer base" }).first(),
   ).toBeVisible();
-  await expect(m.getByRole("button", { name: "Delete version" })).toBeVisible();
+  await expect(m.getByRole("button", { name: "Delete version" }).first()).toBeVisible();
+});
+test("shows whether each image belongs to the global catalog or a worker group", async ({ page }) => {
+  const m = await open(page);
+  await expect(m.getByTestId("image-catalog-scope").filter({ hasText: "Global catalog" })).toBeVisible();
+  await expect(m.getByTestId("image-catalog-scope").filter({ hasText: "Worker group: Evaluation team" })).toBeVisible();
 });
 test("connects, syncs, recovers, and disconnects an optional GitHub catalog without conflating workspace backups", async ({ page }) => {
   const m = await open(page);

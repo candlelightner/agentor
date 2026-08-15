@@ -317,6 +317,26 @@ test.describe.serial("Custom worker image builder and catalog", () => {
     expect(recovered.recovery).toBeTruthy();
   });
 
+  test("controlled setup failures retain a sanitized diagnostic instead of an empty log", async () => {
+    const unavailable = await createDefinition(ownerCtx, `unavailable-${Date.now()}`, {
+      baseImage: `agentor-worker:approved-unconfigured-${Date.now()}`,
+      dockerfileFragment: "RUN true",
+      contextFiles: [],
+    });
+    const started = await ownerCtx.post(
+      `/api/image-catalog/definitions/${unavailable.id}/builds`,
+      { data: { builder: "controlled" } },
+    );
+    expect(started.status()).toBe(202);
+    const failed = await waitForBuild(ownerCtx, (await started.json()).id);
+    expect(failed).toMatchObject({
+      status: "failed",
+      error: expect.stringContaining("Approved image base is unavailable"),
+    });
+    const logs = await ownerCtx.get(`/api/image-builds/${failed.id}/logs`);
+    expect(await logs.text()).toContain("Approved image base is unavailable");
+  });
+
   test("promotion, test worker, rollback, and image selection use immutable catalog versions", async () => {
     const fakeTestWorker = await ownerCtx.post(
       `/api/image-catalog/definitions/${definitionId}/versions/${promotedVersion}/test-worker`,
@@ -328,7 +348,7 @@ test.describe.serial("Custom worker image builder and catalog", () => {
       ownerCtx,
       `runnable-${Date.now()}`,
       {
-        baseImage: "agentor-worker:approved-latest",
+        baseImage: "agentor-worker:approved-default",
         dockerfileFragment:
           "RUN printf catalog-smoke-test > /opt/agentor-image-smoke",
         contextFiles: [],

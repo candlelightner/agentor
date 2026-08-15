@@ -94,7 +94,7 @@ The scheduler stores exact minutes and a durable next-run timestamp. `all` resol
 
 ## Controlled image builds and Git recovery
 
-Controlled builds run only from approved aliases. `agentor-worker:approved-latest` maps to the configured official worker image; additional aliases come from `AGENTOR_APPROVED_IMAGE_BASES` JSON and should use immutable trusted references. Contexts and Dockerfile fragments are bounded and policy checked. The orchestrator is the sole Docker API consumer; workers, the admin workspace, contexts, and build steps receive no Docker socket or account credentials. Production UI builds select the controlled builder; fake builders/providers require explicit test-only gates.
+Controlled builds run only from approved aliases. `agentor-worker:approved-default` and the backwards-compatible `agentor-worker:approved-latest` map to the configured official worker image; additional aliases come from `AGENTOR_APPROVED_IMAGE_BASES` JSON and should use immutable trusted references. Contexts and Dockerfile fragments are bounded and policy checked. The orchestrator is the sole Docker API consumer; workers, the admin workspace, contexts, and build steps receive no Docker socket or account credentials. Production UI builds select the controlled builder; fake builders/providers require explicit test-only gates. Any setup failure before Docker starts is recorded as a sanitized build log and build error.
 
 The builder requests a 2 GiB memory ceiling and CPU quota when the Docker host
 reports support for the complete configured cgroup limit set. Some nested or

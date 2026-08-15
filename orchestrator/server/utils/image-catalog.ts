@@ -91,6 +91,16 @@ function safeLog(value: string): string {
         : match,
     );
 }
+function safeBuildDiagnostic(error: unknown): string {
+  const message =
+    error instanceof Error ? error.message : String(error || "Unknown builder error");
+  // Docker errors can contain multi-line transport details. Keep the useful
+  // first line bounded and redact it before it becomes durable metadata.
+  return (
+    safeLog(message.replace(/[\r\n]+/g, " ").trim()).slice(0, 500) ||
+    "Unknown builder error"
+  );
+}
 function publicBuild(build: ImageBuild) {
   const { logs: _logs, ...result } = build;
   return result;
@@ -151,7 +161,10 @@ export class ImageCatalogManager {
 
   list(ownerId: string, admin: boolean) {
     return this.state.definitions.filter(
-      (d) => admin || (d.ownerId === ownerId && !d.groupId),
+      // The owner dashboard must be able to inventory its group-private
+      // definitions too. Group-admin credentials never call this method:
+      // their MCP path is listForGroup(), which remains group-bound.
+      (d) => admin || d.ownerId === ownerId,
     );
   }
   listForGroup(ownerId: string, groupId: string) {
@@ -608,15 +621,22 @@ export class ImageCatalogManager {
         cache: { enabled: true, hits: definition.versions.length > 1 ? 1 : 0 },
       });
       await this.persist();
-    } catch {
+    } catch (error) {
       await this.docker
         .getImage(tag)
         .remove({ force: true })
         .catch(() => {});
       if (build.status !== "cancelled") {
+        // Failures before Docker accepts the context (such as an unknown
+        // approved-base alias) emit no progress event. Preserve a sanitized
+        // diagnostic so this cannot look like an empty Dockerfile failure.
+        const diagnostic = safeBuildDiagnostic(error);
+        build.logs.push(`[builder] ${diagnostic}`);
+        if (build.logs.length > 2000)
+          build.logs.splice(0, build.logs.length - 2000);
         build.status = "failed";
         build.phase = "failed";
-        build.error = "Controlled image build failed.";
+        build.error = `Controlled image build failed: ${diagnostic}`;
         build.completedAt = build.updatedAt = now();
         build.durationMs = Date.now() - started;
         await this.persist();
@@ -1062,7 +1082,12 @@ function findVersion(definition: ImageDefinition, version: string) {
   return item;
 }
 function resolveControlledBase(alias: string): string {
-  if (alias === "agentor-worker:approved-latest")
+  // `approved-default` is the stable spelling used by existing catalogs;
+  // `approved-latest` remains compatible with the original UI default.
+  if (
+    alias === "agentor-worker:approved-latest" ||
+    alias === "agentor-worker:approved-default"
+  )
     return `${process.env.WORKER_IMAGE_PREFIX || ""}${process.env.WORKER_IMAGE || "agentor-worker:latest"}`;
   let configured: Record<string, string> = {};
   try {
