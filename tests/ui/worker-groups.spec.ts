@@ -10,6 +10,8 @@ test.describe.serial('Worker groups dashboard', () => {
   let secondWorkerId = '';
   let secondWorkerName = '';
   let groupId = '';
+  let treeRootId = '';
+  let treeChildId = '';
 
   test.beforeAll(async ({ request }) => {
     const worker = await createWorker(request, {
@@ -31,6 +33,8 @@ test.describe.serial('Worker groups dashboard', () => {
 
   test.afterAll(async ({ request }) => {
     if (groupId) await request.delete(`/api/worker-groups/${groupId}`).catch(() => {});
+    if (treeChildId) await request.delete(`/api/worker-groups/${treeChildId}`).catch(() => {});
+    if (treeRootId) await request.delete(`/api/worker-groups/${treeRootId}`).catch(() => {});
     if (workerId) await cleanupWorker(request, workerId);
     if (ungroupedWorkerId) await cleanupWorker(request, ungroupedWorkerId);
     if (secondWorkerId) await cleanupWorker(request, secondWorkerId);
@@ -44,7 +48,10 @@ test.describe.serial('Worker groups dashboard', () => {
     await expect(modal).toBeVisible();
     await modal.getByLabel('Group name').fill(groupName);
     await modal.getByRole('button', { name: 'Create group' }).click();
-    const group = modal.locator('section').filter({ hasText: groupName });
+    const group = modal
+      .locator('strong')
+      .filter({ hasText: new RegExp(`^${groupName}$`) })
+      .locator('xpath=ancestor::section[1]');
     await expect(group).toBeVisible();
     const membership = group.getByRole('checkbox', { name: workerName });
     await membership.check();
@@ -79,10 +86,75 @@ test.describe.serial('Worker groups dashboard', () => {
     await group.getByRole('button', { name: 'Open terminal' }).click();
     await expect(page.getByText('GROUP ADMIN - Terminal', { exact: true })).toBeVisible({ timeout: 30_000 });
     await page.getByRole('button', { name: 'Worker groups' }).click();
-    const reopened = page.getByRole('dialog', { name: 'Worker groups' }).locator('section').filter({ hasText: groupName });
+    const reopened = page
+      .getByRole('dialog', { name: 'Worker groups' })
+      .locator('strong')
+      .filter({ hasText: new RegExp(`^${groupName}$`) })
+      .locator('xpath=ancestor::section[1]');
+    // Recursive groups are deliberately non-destructive: an occupied group
+    // must be emptied before it can be deleted. Removing membership must not
+    // remove the workers themselves.
+    await reopened.getByRole('checkbox', { name: workerName }).uncheck();
+    await reopened.getByRole('checkbox', { name: secondWorkerName }).uncheck();
+    await expect.poll(async () => {
+      const persisted = await (await request.get(`/api/worker-groups/${groupId}`)).json();
+      return persisted.workerIds;
+    }).toEqual([]);
     await reopened.getByRole('button', { name: 'Delete' }).click();
     await expect(reopened).toBeHidden();
     groupId = '';
     expect((await request.get(`/api/containers/${workerId}`)).status()).toBe(200);
+  });
+
+  test('renders child groups recursively and offers only legal parent moves', async ({ page, request }) => {
+    const stamp = Date.now();
+    const root = await (await request.post('/api/worker-groups', { data: { name: `Tree root ${stamp}` } })).json();
+    treeRootId = root.id;
+    const child = await (await request.post('/api/worker-groups', { data: { name: `Tree child ${stamp}`, parentId: treeRootId } })).json();
+    treeChildId = child.id;
+    expect((await request.put('/api/worker-groups/assignment', { data: { workerId: ungroupedWorkerId, groupId: treeChildId } })).ok()).toBeTruthy();
+
+    await goToDashboard(page);
+    const rootBox = page.getByTestId(`worker-group-cards-${treeRootId}`);
+    const childBox = page.getByTestId(`worker-group-cards-${treeChildId}`);
+    await expect(rootBox).toBeVisible();
+    await expect(childBox).toBeVisible();
+    await expect(rootBox.locator(`[data-testid="worker-group-cards-${treeChildId}"]`)).toBeVisible();
+    await expect(childBox.getByText(ungroupedWorkerName, { exact: true })).toBeVisible();
+
+    await page.getByRole('button', { name: 'Worker groups' }).click();
+    const modal = page.getByRole('dialog', { name: 'Worker groups' });
+    const childSection = modal.getByTestId(`worker-group-${treeChildId}`);
+    await expect(childSection).toHaveAttribute('data-depth', '1');
+    await expect(childSection).toContainText(`Tree root ${stamp} / Tree child ${stamp}`);
+    await expect(modal.getByLabel(`Parent for Tree root ${stamp}`).locator(`option[value="${treeChildId}"]`)).toHaveCount(0);
+
+    await request.put('/api/worker-groups/assignment', { data: { workerId: ungroupedWorkerId, groupId: null } });
+  });
+
+  test('manages write-only group variables and descendant inheritance by name', async ({ page }) => {
+    await goToDashboard(page);
+    await page.getByRole('button', { name: 'Worker groups' }).click();
+    let modal = page.getByRole('dialog', { name: 'Worker groups' });
+    const root = modal.getByTestId(`worker-group-${treeRootId}`);
+    await root.getByText('Group variables', { exact: true }).click();
+    await root.getByLabel('Group variable name').fill('ROOT_SHARED_TOKEN');
+    const secret = root.getByLabel('Group variable value');
+    await expect(secret).toHaveAttribute('type', 'password');
+    await secret.fill('write-only-group-value');
+    await root.getByRole('button', { name: 'Add or replace' }).click();
+    await expect(root).toContainText('ROOT_SHARED_TOKEN · configured');
+    expect(await root.textContent()).not.toContain('write-only-group-value');
+
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: 'Worker groups' }).click();
+    modal = page.getByRole('dialog', { name: 'Worker groups' });
+    const child = modal.getByTestId(`worker-group-${treeChildId}`);
+    await child.getByText('Group variables', { exact: true }).click();
+    const inherited = child.getByLabel('Inherit ancestor ROOT_SHARED_TOKEN');
+    await expect(inherited).toBeChecked();
+    await inherited.uncheck();
+    await child.getByRole('button', { name: 'Save inherited selection' }).click();
+    await expect(inherited).not.toBeChecked();
   });
 });

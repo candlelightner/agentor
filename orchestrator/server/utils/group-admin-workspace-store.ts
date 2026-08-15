@@ -150,6 +150,13 @@ export class GroupAdminWorkspaceStore {
     if (record && this.runtime?.remove)
       await this.run(groupId, () => this.runtime!.remove!(record));
   }
+  /** Recreate the runtime removed during a group-delete attempt whose final
+   * group-store persistence failed. The group record (including workspace
+   * identity and volumes) has already been restored by WorkerGroupStore. */
+  async restoreAfterFailedGroupDelete(groupId:string,status:"running"|"stopped"|"error"|"creating"="running") {
+    await this.ensure(groupId);
+    if(status==="stopped") await this.setStatus(groupId,"stopped");
+  }
   private async applyImage(
     record: GroupAdministrativeWorkspaceRecord,
     image: any,

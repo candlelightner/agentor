@@ -30,6 +30,9 @@ export interface WorkerRecord extends UserOwnedResource {
    * EnvironmentStore and is resolved live at build time. Git identity is resolved
    * live from `userId`. */
   environmentId?: string;
+  /** Account env-var names intentionally excluded; absent legacy value means []. */
+  excludedGlobalEnvVarKeys?: string[];
+  excludedGroupEnvVarKeys?: string[];
   repos?: RepoConfig[];
   mounts?: MountConfig[];
   initScript?: string;

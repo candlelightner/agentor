@@ -6,7 +6,9 @@ Codex bridge receives a short-lived, workspace-bound credential; every call is
 checked against the current capability policy. A platform administrator has the
 existing platform-wide authority. A group administrative workspace carries an
 additional group principal: every discovery result and invocation is filtered
-against the group's current same-owner membership. The dashboard and MCP share
+against the group's current same-owner descendant subtree. Parent admins may
+manage descendants and their admin workspaces; child admins cannot inspect
+ancestors, siblings, or unrelated branches. The dashboard and MCP share
 the underlying manager/store layer where an equivalent exists.
 
 Explicit `ownerId`/`userId` selectors preserve administrative cross-user
@@ -38,7 +40,7 @@ networks, global configuration/policy, and mapping list/delete—are omitted.
 | Worker logs | Dashboard log viewer | `logs.read` | `management-logs-domain.spec.ts` and `worker-output-redaction.spec.ts`; owner-checked Docker-log tail (1–1000 lines, at most 256 KiB) redacts exact managed literals from worker-local secrets/secret files and sensitive-named local, user-global, and environment variables. It does not expose arbitrary host paths or unbounded terminal output. |
 | Worker-local variables, secrets, secret files | Worker Settings / configuration API | `configuration.get`, `configuration.set` | MCP security and worker-configuration tests; existing secret values are never returned |
 | User environments, capabilities, instructions, init scripts | Sidebar catalog dialogs and catalog APIs | `catalog.{environments,capabilities,instructions,init-scripts}.{list,get,create,update,delete}` | Catalog adapter tests; built-ins stay immutable and owner is explicit |
-| Worker groups | Worker Groups UI; `/api/worker-groups`; group workspace lifecycle at `/api/worker-groups/:id/admin-workspace` (`GET`, `POST`, and `/start`, `/stop`, `/rebuild` `POST`s) | Platform principal: `groups.list`, `groups.create`, `groups.update`, `groups.delete`, plus `groups.admin-workspace.get`, `.provision`, `.start`, `.stop`, and `.rebuild`; group principal: live member inspection/management and identity-derived evaluation-worker creation, with no direct group/membership mutation | `worker-groups.spec.ts` and group-workspace API/UI E2E exercise real Docker topology and scope: membership updates reconcile dependent networks, a platform principal can provision and control the resulting group workspace, a group workspace sees and acts only on current members, out-of-group and unknown IDs return the same generic 404, and newly created evaluation workers are enrolled before being returned |
+| Recursive worker groups | Nested Worker Groups UI; `/api/worker-groups`, `/assignment`, and `/validation`; group workspace lifecycle at `/api/worker-groups/:id/admin-workspace` | Platform principal: `groups.list/create/update/assign-worker/delete` and admin-workspace lifecycle; group principal: create/reparent/manage descendants within its subtree, descendant admin lifecycle, and identity-derived worker creation | Hierarchy/API/UI tests cover legacy roots, arbitrary depth, cycle/cross-owner rejection, overlap diagnostics, atomic moves, recursive network reconciliation/rollback, live ancestor authority, sibling/parent denial, and descendant enrollment |
 | Protection locks | Worker Settings; `/api/containers/:id/protection` | `locks.get`, `locks.set`, `locks.remove` | `worker-protection-lock.spec.ts`; verifier/password is write-only, and `admin-management-mcp.spec.ts` verifies every legacy lifecycle/configuration, app, and exposure-mapping mutation alias requires it |
 | Workspace inventory and offline browse | Storage inventory/browser; `/api/workspaces/*` | `workspaces.list`, `workspaces.files`, `workspaces.preview`, `workspaces.download`, `workspaces.clone` | `management-mcp-workspace-adapter.spec.ts`, `management-download-domain.spec.ts`, `management-download-handoff.spec.ts`, and storage API/UI tests; offline access remains read-only |
 | Running-worker file management | Worker Files modal; `/api/containers/:id/files/*` | `files.list`, `files.upload`, `files.mkdir`, `files.rename`, `files.move`, `files.delete` | Existing hardened container file manager is reused; upload is one base64 file capped at 1 MiB, mutations honor worker protection locks |
@@ -64,7 +66,7 @@ networks, global configuration/policy, and mapping list/delete—are omitted.
 
 - **A group administrative workspace is not a delegated platform
   administrator.** Its scope is re-evaluated from live membership for every
-  tool call and private handoff redemption. Removing a member revokes existing
+  tool call, queued group/network/image mutation, and private handoff redemption. Removing a member revokes existing
   console sessions and one-use tokens; group deletion or workspace retirement
   revokes its credential and all associated sessions/tokens. No cached target
   list, direct UUID, alias, or token can bypass this check.
@@ -73,9 +75,18 @@ networks, global configuration/policy, and mapping list/delete—are omitted.
   and tool failures. The stdio proxy independently bounds upstream I/O and
   converts non-success HTTP responses, empty/malformed JSON, mismatched ids,
   connection failures, and timeouts into one safe structured error.
-- **Group principals cannot administer groups.** They cannot create, edit, or
-  delete groups, nor change their group's membership. The restriction is
-  central authorization, rather than merely hiding tools from discovery.
+- **Every tool call is a complete `CallToolResult`.** Successful calls include
+  `isError: false`; application and authorization failures return correlated,
+  sanitized `isError: true` results with object-shaped `structuredContent`.
+  This preserves ordinary MCP semantics and compatibility with clients such as
+  Hermes that access `isError` unconditionally.
+- **Group principals administer only their live subtree.** They may create and
+  reparent descendants, move workers already in that subtree, manage descendant
+  administrative workspaces and group-scoped networks, and manage descendant
+  image categories. They cannot move or delete their authority root, ungroup or
+  import workers, reach parent/sibling branches, mutate global images/defaults,
+  or use owner-wide network scopes. Central authorization rechecks these bounds
+  at the serialized mutation boundary rather than relying on discovery alone.
 
 - **No raw Docker or host command tool.** Console operations are scoped to the
   selected worker's tmux session. Managed networking and image operations go

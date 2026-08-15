@@ -8,6 +8,7 @@ import { useStorageVisibilityManager } from "./storage-visibility";
 import { verifyWorkerMutationUnlocks } from "./worker-protection-lock";
 import { withWorkerNetworkMutation } from "./worker-group-manager";
 import { updateManagedNetworkAtomically } from "./managed-network-update";
+import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 
 export interface ManagementPlatformTool {
   name: string;
@@ -49,6 +50,7 @@ export class ManagementPlatformDomain {
     if (name === "networks.create") {
       const ownerId = required(args.ownerId, "ownerId");
       return { handled: true, result: await withWorkerNetworkMutation(ownerId, async () => {
+      scopeAuthorize(args);
       const label = required(args.name, "name").trim();
       const scope = required(args.scope, "scope");
       if (!label || label.length > 100 || !["all", "selected", "group"].includes(scope))
@@ -83,6 +85,7 @@ export class ManagementPlatformDomain {
       return { handled: true, result: { ...(await manager.topology(network)), validation: await manager.validate(network) } };
     if (name === "networks.delete") {
       return { handled: true, result: await withWorkerNetworkMutation(network.userId, async () => {
+        scopeAuthorize(args);
         const current=store.findById(id);if(!current||current.userId!==network.userId)throw error(404,"Managed network not found");
         await verifyWorkerMutationUnlocks(await affectedWorkerIds(current), args.lockPasswords);
         await manager.remove(current);
@@ -92,11 +95,13 @@ export class ManagementPlatformDomain {
     }
     if (name === "networks.reconcile")
       return { handled: true, result: await withWorkerNetworkMutation(network.userId, async () => {
+        scopeAuthorize(args);
         const current=store.findById(id);if(!current||current.userId!==network.userId)throw error(404,"Managed network not found");
         await verifyWorkerMutationUnlocks(await affectedWorkerIds(current), args.lockPasswords);
         return manager.reconcile(current);
       }) };
     return { handled: true, result: await withWorkerNetworkMutation(network.userId, async () => {
+      scopeAuthorize(args);
       const current=store.findById(id);if(!current||current.userId!==network.userId)throw error(404,"Managed network not found");
       const patch: any = {};
       if (args.name !== undefined) {
@@ -128,12 +133,15 @@ export class ManagementPlatformDomain {
 
 async function affectedWorkerIds(network: any): Promise<string[]> {
   if (network.scope === "selected") return network.workerIds || [];
-  if (network.scope === "group") return useWorkerGroupStore().get(network.userId, network.groupId)?.workerIds || [];
+  if (network.scope === "group") {
+    const store = useWorkerGroupStore();
+    return new WorkerGroupHierarchy(store).subtreeWorkerIds(network.userId, network.groupId);
+  }
   return useWorkerStore().listForUser(network.userId).map((worker: any) => worker.id);
 }
 
 function tool(name: string, group: ManagementPlatformTool["group"], description: string, annotations: Record<string, boolean>): ManagementPlatformTool {
-  const properties: Record<string, unknown> = {
+  const all: Record<string, unknown> = {
     ownerId: { type: "string", minLength: 1 },
     networkId: { type: "string", minLength: 1 },
     name: { type: "string", minLength: 1, maxLength: 100 },
@@ -143,11 +151,21 @@ function tool(name: string, group: ManagementPlatformTool["group"], description:
     lockPasswords: { type: "object", additionalProperties: { type: "string", writeOnly: true } },
     action: { type: "string", enum: ["dangling-images", "build-cache", "stale-helpers", "stale-staging"] },
   };
+  const fields: Record<string, string[]> = {
+    "networks.list": ["ownerId"],
+    "networks.inspect": ["networkId"],
+    "networks.create": ["ownerId", "name", "scope", "groupId", "workerIds", "lockPasswords"],
+    "networks.update": ["networkId", "name", "scope", "groupId", "workerIds", "lockPasswords"],
+    "networks.reconcile": ["networkId", "lockPasswords"],
+    "networks.delete": ["networkId", "lockPasswords"],
+    "storage.status": [],
+    "storage.cleanup": ["action"],
+  };
+  const properties = Object.fromEntries((fields[name] ?? []).map((key) => [key, all[key]]));
   let required: string[] = [];
   if (name === "networks.inspect" || name === "networks.update" || name === "networks.reconcile" || name === "networks.delete") required = ["networkId"];
   if (name === "networks.create") required = ["ownerId", "name", "scope"];
   if (name === "storage.cleanup") required = ["action"];
-  if (name === "networks.list") properties.ownerId = { type: "string", minLength: 1 };
   return { name, group, description, annotations, inputSchema: { type: "object", additionalProperties: false, properties, ...(required.length ? { required } : {}) } };
 }
 function required(value: unknown, name: string) {
@@ -155,6 +173,7 @@ function required(value: unknown, name: string) {
   return value;
 }
 function optional(value: unknown) { return typeof value === "string" && value ? value : undefined; }
+function scopeAuthorize(args:Record<string,unknown>){if(typeof args.__scopeAuthorize==="function")(args.__scopeAuthorize as ()=>void)();}
 function strings(value: unknown) {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw error(400, "workerIds must be strings");

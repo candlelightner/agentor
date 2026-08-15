@@ -10,6 +10,7 @@ export interface WorkerGroup {
   userId: string;
   name: string;
   workerIds: string[];
+  parentId?: string;
   adminWorkspace?: GroupAdminWorkspace;
   createdAt: string;
   updatedAt: string;
@@ -19,17 +20,19 @@ export function useWorkerGroups() {
     "/api/worker-groups",
     { default: () => [] },
   );
-  const create = async (name: string) => {
+  const create = async (name: string, parentId?: string) => {
     const group = await $fetch<WorkerGroup>("/api/worker-groups", {
       method: "POST",
-      body: { name },
+      body: { name, ...(parentId ? { parentId } : {}) },
     });
     await refresh();
     return group;
   };
   const update = async (
     id: string,
-    patch: Partial<Pick<WorkerGroup, "name" | "workerIds">>,
+    patch: Partial<Pick<WorkerGroup, "name" | "workerIds">> & {
+      parentId?: string | null;
+    },
   ) => {
     const group = await $fetch<WorkerGroup>(`/api/worker-groups/${id}`, {
       method: "PATCH",
@@ -40,6 +43,13 @@ export function useWorkerGroups() {
   };
   const remove = async (id: string) => {
     await $fetch(`/api/worker-groups/${id}`, { method: "DELETE" });
+    await refresh();
+  };
+  const assignWorker = async (workerId: string, groupId: string | null) => {
+    await $fetch("/api/worker-groups/assignment", {
+      method: "PUT",
+      body: { workerId, groupId },
+    });
     await refresh();
   };
   const adminAction = async (
@@ -56,5 +66,5 @@ export function useWorkerGroups() {
     if (group) group.adminWorkspace = result;
     return result;
   };
-  return { groups, refresh, create, update, remove, adminAction };
+  return { groups, refresh, create, update, remove, assignWorker, adminAction };
 }

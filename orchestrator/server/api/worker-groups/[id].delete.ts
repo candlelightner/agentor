@@ -22,8 +22,11 @@ export default defineEventHandler(async (event) => {
     store = useWorkerGroupStore(),
     group = store.findById(id);
   requireResourceAccess(event, group, { allowGlobal: false });
-  await useGroupAdminWorkspaceStore().remove(id);
-  await deleteWorkerGroup(group!.userId, id);
+  const workspaceStatus=group!.adminWorkspace?.status;
+  await deleteWorkerGroup(group!.userId, id, async () => {
+    const workspaces=useGroupAdminWorkspaceStore();try{await workspaces.remove(id);}catch(error){await workspaces.restoreAfterFailedGroupDelete(id,workspaceStatus).catch(()=>undefined);throw error;}
+    return async()=>workspaces.restoreAfterFailedGroupDelete(id,workspaceStatus);
+  });
   setResponseStatus(event, 204);
   return null;
 });

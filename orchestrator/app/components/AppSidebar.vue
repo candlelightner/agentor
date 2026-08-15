@@ -6,6 +6,7 @@ import type {
   UpdateContainerSettingsRequest,
 } from "~/types";
 import type { WorkerGroup } from "~/composables/useWorkerGroups";
+import type { WorkerGroupSidebarTreeNode } from "~/components/WorkerGroupSidebarNode.vue";
 
 const props = defineProps<{
   containers: ContainerInfo[];
@@ -159,7 +160,7 @@ const currentWorkerList = computed(() =>
 
 type WorkerListItem =
   | { kind: "worker"; worker: ContainerInfo }
-  | { kind: "group"; group: WorkerGroup; workers: ContainerInfo[] };
+  | { kind: "group"; node: WorkerGroupSidebarTreeNode };
 
 // Keep every visible member of a worker group in one list item.  Building the
 // sections in the source-list order means ungrouped workers otherwise retain
@@ -189,20 +190,36 @@ const groupedCurrentWorkerList = computed<WorkerListItem[]>(() => {
     workersByGroupId.set(group.id, members);
   }
 
-  const renderedGroups = new Set<string>();
+  const nodes = new Map<string, WorkerGroupSidebarTreeNode>();
+  for (const group of workerGroups.value) {
+    nodes.set(group.id, { group, workers: workersByGroupId.get(group.id) ?? [], children: [] });
+  }
+  const roots: WorkerGroupSidebarTreeNode[] = [];
+  for (const node of nodes.values()) {
+    const parent = node.group.parentId ? nodes.get(node.group.parentId) : undefined;
+    if (parent) parent.children.push(node);
+    else roots.push(node);
+  }
+  const visible = (node: WorkerGroupSidebarTreeNode): boolean =>
+    node.workers.length > 0 || node.children.some(visible);
+  const rootByGroupId = new Map<string, WorkerGroupSidebarTreeNode>();
+  const index = (node: WorkerGroupSidebarTreeNode, root: WorkerGroupSidebarTreeNode) => {
+    rootByGroupId.set(node.group.id, root);
+    node.children.forEach((child) => index(child, root));
+  };
+  roots.forEach((root) => index(root, root));
+
+  const renderedRoots = new Set<string>();
   return currentWorkerList.value.reduce<WorkerListItem[]>((items, worker) => {
     const group = groupsByWorkerId.get(worker.id);
     if (!group) {
       items.push({ kind: "worker", worker });
       return items;
     }
-    if (renderedGroups.has(group.id)) return items;
-    renderedGroups.add(group.id);
-    items.push({
-      kind: "group",
-      group,
-      workers: workersByGroupId.get(group.id) ?? [],
-    });
+    const root = rootByGroupId.get(group.id) ?? nodes.get(group.id)!;
+    if (renderedRoots.has(root.group.id)) return items;
+    renderedRoots.add(root.group.id);
+    if (visible(root)) items.push({ kind: "group", node: root });
     return items;
   }, []);
 });
@@ -569,39 +586,18 @@ function isContainerActive(
           }}
         </div>
         <div class="space-y-2">
-          <template v-for="item in groupedCurrentWorkerList" :key="item.kind === 'group' ? item.group.id : item.worker.id">
-            <section
+          <template v-for="item in groupedCurrentWorkerList" :key="item.kind === 'group' ? item.node.group.id : item.worker.id">
+            <WorkerGroupSidebarNode
               v-if="item.kind === 'group'"
-              class="rounded-xl border-2 border-primary-300/70 bg-primary-50/40 p-2 dark:border-primary-700/70 dark:bg-primary-950/20"
-              :aria-label="`Worker group: ${item.group.name}`"
-              :data-testid="`worker-group-cards-${item.group.id}`"
-            >
-              <div class="mb-2 flex items-center gap-1.5 px-1 text-xs font-semibold text-primary-700 dark:text-primary-300">
-                <UIcon name="i-lucide-folder-kanban" class="size-3.5" />
-                <span>{{ item.group.name }}</span>
-                <span class="text-primary-600/70 dark:text-primary-400/70">{{ item.workers.filter((worker) => worker.administrativeKind !== 'group').length }} worker{{ item.workers.filter((worker) => worker.administrativeKind !== 'group').length === 1 ? '' : 's' }}</span>
-              </div>
-              <div class="space-y-2">
-                <ContainerCard
-                  v-for="c in item.workers"
-                  :key="c.id"
-                  :container="c"
-                  :is-active="isContainerActive(c.id, tabs, activeTabId)"
-                  :metric="metricFor(c.id)"
-                  @open-terminal="(cid) => emit('openTerminal', cid)"
-                  @open-desktop="(cid) => emit('openDesktop', cid)"
-                  @open-apps="(cid) => emit('openApps', cid)"
-                  @open-editor="(cid) => emit('openEditor', cid)"
-                  @stop="(id) => emit('stopContainer', id)"
-                  @restart="(id) => emit('restartContainer', id)"
-                  @rebuild="(id) => emit('rebuildContainer', id)"
-                  @remove="(id) => emit('removeContainer', id)"
-                  @archive="(id) => emit('archiveContainer', id)"
-                  @update="(id, patch, rebuild, complete) => emit('updateContainer', id, patch, rebuild, complete)"
-                  @download-workspace="(id) => emit('downloadWorkspace', id)"
-                />
-              </div>
-            </section>
+              :node="item.node" :tabs="tabs" :active-tab-id="activeTabId" :metric-for="metricFor"
+              @open-terminal="(id) => emit('openTerminal', id)" @open-desktop="(id) => emit('openDesktop', id)"
+              @open-apps="(id) => emit('openApps', id)" @open-editor="(id) => emit('openEditor', id)"
+              @stop-container="(id) => emit('stopContainer', id)" @restart-container="(id) => emit('restartContainer', id)"
+              @rebuild-container="(id) => emit('rebuildContainer', id)" @remove-container="(id) => emit('removeContainer', id)"
+              @archive-container="(id) => emit('archiveContainer', id)"
+              @update-container="(id, patch, rebuild, complete) => emit('updateContainer', id, patch, rebuild, complete)"
+              @download-workspace="(id) => emit('downloadWorkspace', id)"
+            />
             <ContainerCard
               v-else
               :container="item.worker"

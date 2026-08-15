@@ -15,6 +15,8 @@ const worker = {
   createdAt: "2026-01-01T00:00:00.000Z",
   updatedAt: "2026-01-01T00:00:00.000Z",
   pendingRebuild: false,
+  excludedGlobalEnvVarKeys: ["CUSTOM_DISABLED"],
+  excludedGroupEnvVarKeys: ["GROUP_DISABLED"],
 };
 
 const forbiddenSecret = "NEVER_RETURN_THIS_SECRET_VALUE";
@@ -63,6 +65,11 @@ const configurationResponse = {
 };
 
 async function mockDashboard(page: Page) {
+  // Match both create-time discovery and worker-scoped discovery with a query
+  // string. Playwright's exact glob does not include `?workerId=...`.
+  await page.route(/\/api\/account\/env-var-keys(?:\?.*)?$/, (route) =>
+    route.fulfill({ json: { keys: ["OPENAI_API_KEY", "CUSTOM_ENABLED", "CUSTOM_DISABLED"], predefinedKeys: ["OPENAI_API_KEY"], customKeys: ["CUSTOM_ENABLED", "CUSTOM_DISABLED"], groupKeys: route.request().url().includes("workerId=") ? ["GROUP_ENABLED", "GROUP_DISABLED"] : [] } }),
+  );
   await page.route("**/api/containers", async (route) => {
     if (route.request().method() === "POST") return route.fallback();
     return route.fulfill({
@@ -150,6 +157,46 @@ async function openSettingsConfiguration(page: Page) {
 
 test.beforeEach(async ({ page }) => {
   await mockDashboard(page);
+});
+
+test("create selects account variables by default and submits only excluded key names", async ({ page }) => {
+  let createBody: any;
+  await page.route("**/api/containers", async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    createBody = route.request().postDataJSON();
+    return route.fulfill({ status: 201, json: worker });
+  });
+  await goToDashboard(page);
+  await page.getByRole("button", { name: /New Worker/i }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByText("Predefined", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("Custom", { exact: true })).toBeVisible();
+  await expect(dialog.getByLabel("Inherit OPENAI_API_KEY")).toBeChecked();
+  await expect(dialog.getByLabel("Inherit CUSTOM_ENABLED")).toBeChecked();
+  await dialog.getByLabel("Inherit CUSTOM_ENABLED").uncheck();
+  await dialog.getByRole("button", { name: "Create", exact: true }).click();
+  expect(createBody.excludedGlobalEnvVarKeys).toEqual(["CUSTOM_ENABLED"]);
+  expect(JSON.stringify(createBody)).not.toContain("NEVER_RETURN_THIS_SECRET_VALUE");
+});
+
+test("settings reflects saved exclusions and submits changed key names", async ({ page }) => {
+  let patchBody: any;
+  await page.route(`**/api/containers/${workerId}`, async (route) => {
+    if (route.request().method() !== "PATCH") return route.fallback();
+    patchBody = route.request().postDataJSON();
+    return route.fulfill({ json: { ...worker, ...patchBody, pendingRebuild: true } });
+  });
+  const { dialog } = await openSettingsConfiguration(page);
+  await expect(dialog.getByLabel("Inherit CUSTOM_DISABLED")).not.toBeChecked();
+  await expect(dialog.getByLabel("Inherit OPENAI_API_KEY")).toBeChecked();
+  await expect(dialog.getByLabel("Inherit group GROUP_DISABLED")).not.toBeChecked();
+  await expect(dialog.getByLabel("Inherit group GROUP_ENABLED")).toBeChecked();
+  await dialog.getByLabel("Inherit OPENAI_API_KEY").uncheck();
+  await dialog.getByLabel("Inherit group GROUP_ENABLED").uncheck();
+  await expect(dialog.getByRole("button", { name: "Save & Rebuild" })).toBeVisible();
+  await dialog.getByRole("button", { name: "Save", exact: true }).click();
+  expect(patchBody.excludedGlobalEnvVarKeys).toEqual(["CUSTOM_DISABLED", "OPENAI_API_KEY"]);
+  expect(patchBody.excludedGroupEnvVarKeys).toEqual(["GROUP_DISABLED", "GROUP_ENABLED"]);
 });
 
 test("create modal exposes bulk variables, masked secrets, secret files, and the safe root explanation", async ({

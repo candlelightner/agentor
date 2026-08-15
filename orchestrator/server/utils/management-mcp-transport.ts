@@ -127,6 +127,7 @@ export class ManagementMcpTransport {
       : undefined;
     let rpcId: unknown = null;
     let hasRpcId = false;
+    let isToolCall = false;
     try {
       const body = await readJson(request);
       const id = body?.id ?? null;
@@ -162,6 +163,7 @@ export class ManagementMcpTransport {
         });
       }
       if (body.method === "tools/call") {
+        isToolCall = true;
         const name = body.params?.name;
         const result = await this.store.invoke(
           credential,
@@ -174,6 +176,9 @@ export class ManagementMcpTransport {
           // return arrays from their service layer; wrap those results so MCP
           // clients such as Hermes can validate the response consistently.
           structuredContent: structuredContent(result),
+          // Although optional in the MCP schema, some clients (notably
+          // Hermes) access this attribute unconditionally on CallToolResult.
+          isError: false,
         });
       }
       await this.authenticate(credential, "unknown-method");
@@ -193,6 +198,14 @@ export class ManagementMcpTransport {
       // same id.  In particular, never turn authentication/authorization
       // failures into id:null responses: stdio MCP clients quite correctly
       // ignore those as unrelated and would leave the original call pending.
+      if (hasRpcId && isToolCall) {
+        const message = safeToolErrorMessage(status, error);
+        return this.rpc(response, rpcId, {
+          content: [{ type: "text", text: message }],
+          structuredContent: { error: { message, statusCode: status } },
+          isError: true,
+        });
+      }
       if (hasRpcId)
         return this.rpc(response, rpcId, undefined, {
           code: -32000,
@@ -253,6 +266,15 @@ export class ManagementMcpTransport {
     response.setHeader("Content-Type", "application/json; charset=utf-8");
     response.end(JSON.stringify(value));
   }
+}
+
+function safeToolErrorMessage(status: number, error: any): string {
+  if (status === 404) return "Resource not found";
+  if (status === 401) return "Unauthorized";
+  if (status === 403) return "Forbidden";
+  return typeof error?.message === "string" && error.message
+    ? error.message.slice(0, 500)
+    : "Management tool failed";
 }
 
 function structuredContent(result: unknown): Record<string, unknown> {

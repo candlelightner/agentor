@@ -104,6 +104,10 @@ export interface ContainerInfo extends UserOwnedResource {
    * live from the EnvironmentStore by this id when the container is built. The
    * git identity is likewise resolved live from the owning `userId`. */
   environmentId?: string;
+  /** Account-level custom variable names intentionally not inherited by this worker. */
+  excludedGlobalEnvVarKeys?: string[];
+  /** Effective inherited worker-group variable names intentionally omitted. */
+  excludedGroupEnvVarKeys?: string[];
   /** True when the worker's stored config carries rebuild-requiring edits
    * (environment, repos, mounts, or init script) that have not yet been applied
    * to the running container. Live edits (display name) never set this. Cleared
@@ -130,6 +134,12 @@ export interface CreateContainerRequest {
    * worker is built with. Resource limits are an environment property — there is
    * no per-worker limit override. */
   environmentId?: string;
+  excludedGlobalEnvVarKeys?: string[];
+  excludedGroupEnvVarKeys?: string[];
+  /** Internal, authorization-checked group used to resolve inherited group
+   * environment variables during creation. Never accepted directly from an
+   * untrusted client request. */
+  targetWorkerGroupId?: string;
   initScript?: string;
   /** Populated server-side from the authenticated session — never sent by clients.
    * The owner; the worker's git identity is resolved live from this user. */
@@ -162,6 +172,8 @@ export interface UpdateContainerSettingsRequest {
   initScript?: string;
   repos?: RepoConfig[];
   mounts?: MountConfig[];
+  excludedGlobalEnvVarKeys?: string[];
+  excludedGroupEnvVarKeys?: string[];
 }
 
 export interface ImageUpdateInfo {

@@ -177,29 +177,36 @@ Each group workspace has its own internal
 plus its own `agentor-admin-egress-group-<groupId>` outbound bridge. It never
 joins the singleton admin networks or the ordinary worker network.
 
-The group workspace's authority is the group's **live** membership, not a
-snapshot captured when the workspace is created. Before discovery, invocation,
-console use, and private-download redemption, the management layer resolves
-the current group and checks that every target worker is both owned by the
-group's owner and currently present in that group. Out-of-group worker IDs are
-omitted from discovery and direct requests using a known ID fail closed.
-Membership removal therefore revokes access immediately; adding a member makes
-it eligible immediately. Deleting the group, or removing/replacing its
+The group workspace's authority is its bound group's **live descendant
+subtree**, not a snapshot captured when the workspace is created. Before
+discovery, invocation, queued mutation execution, console use, and
+private-download redemption, the management layer resolves the current tree
+and checks that every target worker/resource is owned by the same owner and
+still belongs to the authorized subtree. Out-of-scope IDs are omitted from
+discovery and direct requests using a known ID fail with the same generic 404
+as an unknown ID. Membership removal or reparenting therefore revokes access
+immediately; adding a member/descendant makes it eligible immediately. Deleting
+the group, or removing/replacing its
 administrative workspace, invalidates its rotating credential and associated
 console and one-use download handoffs. Those handoffs also bind
 the originating workspace and exact target resource, so a token minted for one
 group workspace cannot be redeemed by another.
 
-Group administrative workspaces cannot create, edit, or delete worker groups,
-and cannot add, remove, or otherwise alter their own group's membership. This
-prevents a scoped principal from expanding its authority. They remain subject
-to normal management-MCP capability policy and worker protection locks; the
-scope check is an additional mandatory boundary, not a replacement for either.
-They expose only operations whose target can be proven from an explicit member
-worker/workspace ID (plus filtered status and inventory lists). Platform-wide
-imports, image/catalog and managed-network administration, global
-configuration/policy, worker creation/clone, and indirect mapping list/delete
-are intentionally unavailable.
+An ancestor group workspace can create, rename, reparent, or delete descendant
+groups; move workers that are already inside its subtree between authorized
+groups; manage descendant administrative workspaces and group-scoped networks;
+and create/manage image definitions owned by its group or descendants. Global
+and ancestor images are visible/use-only. It cannot move/delete its own
+authority root, ungroup or import workers, reach parent/sibling branches,
+select owner-wide networks, or mutate global images/defaults. Evaluation-worker
+creation derives the owner from workload identity and atomically enrolls the
+worker into the selected authorized group. The scope check is revalidated
+inside the serialized mutation boundary, so a queued operation cannot execute
+after a concurrent reparent revokes authority. Normal management-MCP capability
+policy and worker protection locks remain additional mandatory boundaries.
+Platform-wide imports, global configuration/policy, Git image synchronization,
+owner-wide network scopes, worker clone, and indirect mapping list/delete stay
+unavailable.
 The dashboard/API lifecycle family is
 `/api/worker-groups/:id/admin-workspace`: `GET` reads state, `POST` provisions
 the workspace, and `POST` to `/start`, `/stop`, or `/rebuild` performs the

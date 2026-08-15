@@ -28,6 +28,11 @@ defineRouteMeta({
                 type: "string",
                 description: "Environment configuration ID",
               },
+              excludedGlobalEnvVarKeys: {
+                type: "array",
+                items: { type: "string" },
+                description: "Account environment variable names not inherited by this worker. Predefined names may be selected even when currently unset; values are never accepted here.",
+              },
               initScript: {
                 type: "string",
                 description: "Init script to run on startup",
@@ -143,6 +148,7 @@ export default defineEventHandler(async (event) => {
     repos: parsedRepos,
     mounts: parsedMounts,
     environmentId: body.environmentId || undefined,
+    excludedGlobalEnvVarKeys: body.excludedGlobalEnvVarKeys,
     initScript: body.initScript || undefined,
     workerConfiguration: body.workerConfiguration || undefined,
     imageDefinitionId: imageSelection?.definitionId,

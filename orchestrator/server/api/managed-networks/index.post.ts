@@ -4,13 +4,14 @@ import { useManagedNetworkStore, useWorkerGroupStore, useWorkerStore } from '../
 import { useManagedNetworkManager } from '../../utils/managed-network-manager';
 import { verifyWorkerMutationUnlocks } from '../../utils/worker-protection-lock';
 import { withWorkerNetworkMutation } from '../../utils/worker-group-manager';
+import { WorkerGroupHierarchy } from '../../utils/worker-group-hierarchy';
 export default defineEventHandler(async event => {
   const { user } = requireAuth(event); const body: any = await readBody(event);
   return withWorkerNetworkMutation(user.id, async () => {
   if (typeof body?.name !== 'string' || !body.name.trim() || body.name.length > 100 || !['all', 'selected', 'group'].includes(body.scope)) throw createError({ statusCode: 400, statusMessage: 'Valid name and scope are required' });
   if (body.scope === 'group' && (typeof body.groupId !== 'string' || !useWorkerGroupStore().get(user.id, body.groupId))) throw createError({ statusCode: 400, statusMessage: 'Group not found' });
   if(body.scope==='selected'){if(!Array.isArray(body.workerIds)||body.workerIds.some((id:any)=>typeof id!=='string'||!useWorkerStore().get(user.id,id)))throw createError({statusCode:400,statusMessage:'Selected workers must belong to the network owner'});}
-  const affected = body.scope === 'selected' ? body.workerIds || [] : body.scope === 'group' ? useWorkerGroupStore().get(user.id, body.groupId)?.workerIds || [] : useWorkerStore().listForUser(user.id).map(worker=>worker.id);
+  const affected = body.scope === 'selected' ? body.workerIds || [] : body.scope === 'group' ? new WorkerGroupHierarchy(useWorkerGroupStore()).subtreeWorkerIds(user.id, body.groupId) : useWorkerStore().listForUser(user.id).map(worker=>worker.id);
   await verifyWorkerMutationUnlocks(affected, body.lockPasswords);
   const store = useManagedNetworkStore(); let network = await store.create(user.id, body.name, body.scope, body.scope === 'group' ? body.groupId : undefined); if(body.scope==='selected')network=await store.update(user.id,network.id,{workerIds:body.workerIds});
   try {

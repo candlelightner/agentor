@@ -2,6 +2,7 @@ defineRouteMeta({ openAPI: { tags: ['Managed networks'], summary: 'Update manage
 import { requireResourceAccess } from '../../utils/auth-helpers'; import { useManagedNetworkStore, useWorkerGroupStore, useWorkerStore } from '../../utils/services'; import { useManagedNetworkManager } from '../../utils/managed-network-manager'; import { verifyWorkerMutationUnlocks } from '../../utils/worker-protection-lock';
 import { withWorkerNetworkMutation } from '../../utils/worker-group-manager';
 import { updateManagedNetworkAtomically } from '../../utils/managed-network-update';
+import { WorkerGroupHierarchy } from '../../utils/worker-group-hierarchy';
 export default defineEventHandler(async event => { const id = getRouterParam(event, 'id')!, store = useManagedNetworkStore(), found = store.findById(id); requireResourceAccess(event, found, { allowGlobal: false }); const body: any = await readBody(event); return withWorkerNetworkMutation(found!.userId,async()=>{const network=store.findById(id);if(!network||network.userId!==found!.userId)throw createError({statusCode:404,statusMessage:'Managed network not found'});const scope = body?.scope === undefined ? network.scope : body.scope;
   if (!['all', 'selected', 'group'].includes(scope)) throw createError({ statusCode: 400, statusMessage: 'Invalid managed network scope' });
   if (body?.groupId !== undefined && typeof body.groupId !== 'string') throw createError({ statusCode: 400, statusMessage: 'groupId must be a string' });
@@ -9,7 +10,7 @@ export default defineEventHandler(async event => { const id = getRouterParam(eve
   if (scope === 'group' && (!groupId || !useWorkerGroupStore().get(network.userId, groupId))) throw createError({ statusCode: 400, statusMessage: 'Group not found' });
   if (body?.workerIds !== undefined) { if (!Array.isArray(body.workerIds)) throw createError({ statusCode: 400, statusMessage: 'workerIds must be an array' }); for (const workerId of body.workerIds) if (typeof workerId !== 'string' || !useWorkerStore().get(network.userId, workerId)) throw createError({ statusCode: 400, statusMessage: 'Workers must belong to network owner' }); }
   if (body?.name !== undefined && (typeof body.name !== 'string' || !body.name.trim() || body.name.length > 100)) throw createError({ statusCode: 400, statusMessage: 'Valid name required' });
-  const affected=(value:any)=>value.scope==='selected'?(value.workerIds||[]):value.scope==='group'?(useWorkerGroupStore().get(value.userId,value.groupId)?.workerIds||[]):useWorkerStore().listForUser(value.userId).map(worker=>worker.id);
+  const affected=(value:any)=>value.scope==='selected'?(value.workerIds||[]):value.scope==='group'?new WorkerGroupHierarchy(useWorkerGroupStore()).subtreeWorkerIds(value.userId,value.groupId):useWorkerStore().listForUser(value.userId).map(worker=>worker.id);
   const proposed={...network,scope,groupId,workerIds:scope==='selected'?(body?.workerIds??network!.workerIds):[]};
   await verifyWorkerMutationUnlocks([...affected(network),...affected(proposed)],body?.lockPasswords);
   const manager=useManagedNetworkManager();

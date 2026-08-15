@@ -24,6 +24,7 @@ const groupDefinition = {
   groupId: "group-1",
 };
 async function mock(page: Page) {
+  await page.route("**/api/image-builds", (route) => route.fulfill({ json: [] }));
   await page.route("**/api/image-catalog/definitions", async (r) =>
     r.fulfill({
       status: r.request().method() === "POST" ? 201 : 200,
@@ -115,6 +116,41 @@ test("creates a constrained definition and follows asynchronous build logs", asy
   await expect(m.locator('[data-testid="image-build"]')).toContainText(
     "safe build log",
   );
+});
+test("a double-click submits only one image build", async ({ page }) => {
+  let requests = 0;
+  await page.route("**/api/image-catalog/definitions/def-1/builds", async (route) => {
+    requests++;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await route.fulfill({ status: 202, json: { id: "build-1", definitionId: "def-1", status: "running", phase: "building" } });
+  });
+  const modal = await open(page);
+  await modal.getByRole("button", { name: "Build", exact: true }).first().dblclick();
+  await expect.poll(() => requests).toBe(1);
+});
+test("discovers builds and versions created externally while open", async ({ page }) => {
+  let buildPosts = 0;
+  let buildPolls = 0;
+  let catalogPolls = 0;
+  page.on("request", (request) => {
+    if (request.method() === "POST" && request.url().endsWith("/builds")) buildPosts++;
+  });
+  await page.route("**/api/image-builds", (route) => {
+    // The first refresh must expose the externally-started build; the next
+    // regular UI poll completes it. Request counts avoid coupling this test to
+    // dashboard/navigation speed on a busy CI runner.
+    const complete = ++buildPolls > 1;
+    return route.fulfill({ json: [{ id: "external-build", definitionId: "def-1", status: complete ? "succeeded" : "running", phase: complete ? "complete" : "building", ...(complete ? { version: "v2", digest: "sha256:external" } : {}) }] });
+  });
+  await page.route("**/api/image-builds/external-build/logs", (route) => route.fulfill({ body: "[builder] external build" }));
+  await page.route("**/api/image-catalog/definitions", (route) => {
+    const complete = ++catalogPolls > 1;
+    return route.fulfill({ json: [{ ...definition, versions: complete ? [...definition.versions, { version: "v2", digest: "sha256:external", baseImage: definition.baseImage, createdAt: "2026-01-02" }] : definition.versions }, groupDefinition] });
+  });
+  const modal = await open(page);
+  await expect(modal.getByTestId("image-build")).toContainText("running");
+  await expect(modal.getByText("v2", { exact: true })).toBeVisible({ timeout: 5000 });
+  expect(buildPosts).toBe(0);
 });
 test("exposes test, promotion, rollback, defaults, base rebuild and usage controls", async ({
   page,

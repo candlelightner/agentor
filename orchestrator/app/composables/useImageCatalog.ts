@@ -58,25 +58,42 @@ export function useImageCatalog() {
     gitSyncResult = ref<any>(null),
     loading = ref(false),
     error = ref("");
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  const pollTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  let liveTimer: ReturnType<typeof setInterval> | undefined;
   async function refresh() {
+    if (loading.value) return;
     loading.value = true;
     error.value = "";
     try {
-      [definitions.value, usage.value, effectiveDefault.value, gitConnection.value, gitRecovery.value] =
+      const [nextDefinitions, nextUsage, nextDefault, nextGit, nextRecovery, recentBuilds] =
         await Promise.all([
           $fetch<ImageDefinition[]>("/api/image-catalog/definitions"),
           $fetch<CatalogUsage>("/api/image-catalog/usage"),
           $fetch<any>("/api/image-catalog/defaults/effective"),
           $fetch<GitCatalogConnection>("/api/image-catalog/git/connection"),
           $fetch<any>("/api/image-catalog/git/recovery"),
+          $fetch<ImageBuild[]>("/api/image-builds"),
         ]);
+      definitions.value = nextDefinitions;
+      usage.value = nextUsage;
+      effectiveDefault.value = nextDefault;
+      gitConnection.value = nextGit;
+      gitRecovery.value = nextRecovery;
+      builds.value = Object.fromEntries(recentBuilds.map((build: ImageBuild) => [build.id, build]));
+      await Promise.all(recentBuilds.map(async (build: ImageBuild) => {
+        logs.value[build.id] = await $fetch<string>(`/api/image-builds/${build.id}/logs`).catch(() => logs.value[build.id] || "");
+      }));
     } catch (e: any) {
       error.value =
         e?.data?.statusMessage || e?.message || "Could not load image catalog.";
     } finally {
       loading.value = false;
     }
+  }
+  function start() {
+    stop();
+    void refresh();
+    liveTimer = setInterval(() => void refresh(), 2000);
   }
   async function create(
     input: Omit<ImageDefinition, "id" | "versions" | "promotedVersion">,
@@ -108,9 +125,13 @@ export function useImageCatalog() {
     builds.value[id] = b;
     logs.value[id] = await $fetch<string>(`/api/image-builds/${id}/logs`);
     if (["queued", "running"].includes(b.status)) {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(() => void poll(id), 1000);
+      const previous = pollTimers.get(id);
+      if (previous) clearTimeout(previous);
+      pollTimers.set(id, setTimeout(() => void poll(id), 1000));
     } else {
+      const previous = pollTimers.get(id);
+      if (previous) clearTimeout(previous);
+      pollTimers.delete(id);
       // Terminal build state changes the definition's immutable version list
       // and storage accounting. Refresh those views before enabling version
       // actions such as smoke-test and promotion.
@@ -174,8 +195,10 @@ export function useImageCatalog() {
     return gitSyncResult.value;
   }
   function stop() {
-    if (timer) clearTimeout(timer);
-    timer = undefined;
+    if (liveTimer) clearInterval(liveTimer);
+    liveTimer = undefined;
+    for (const timer of pollTimers.values()) clearTimeout(timer);
+    pollTimers.clear();
   }
   return {
     definitions,
@@ -189,6 +212,7 @@ export function useImageCatalog() {
     loading,
     error,
     refresh,
+    start,
     create,
     startBuild,
     poll,

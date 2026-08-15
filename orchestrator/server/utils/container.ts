@@ -20,7 +20,7 @@ import type {
   WorkerJsonPayload,
   ImageConfigOverride,
 } from "./docker";
-import { zeroUserEnvVars } from "./user-env-store";
+import { normalizeExcludedGlobalEnvVarKeys, zeroUserEnvVars } from "./user-env-store";
 import {
   WORKER_EXPORT_VERSION,
   BUNDLE_FILES,
@@ -221,9 +221,27 @@ export class ContainerManager {
 
   private async resolveUserEnvAndBinds(
     userId: string,
-  ): Promise<{ userEnv: UserEnvVars; credentialBinds: string[] }> {
-    const userEnv =
+    excludedKeys: unknown = [],
+    workerId?: string,
+    excludedGroupKeys: unknown = [],
+    targetGroupId?: string,
+  ): Promise<{ userEnv: UserEnvVars; credentialBinds: string[]; groupSecrets: Array<{kind:"secret";key:string;value:string}> }> {
+    const source =
       this.userEnvStore?.getOrDefault(userId) ?? zeroUserEnvVars(userId);
+    const excluded = new Set(normalizeExcludedGlobalEnvVarKeys(source, excludedKeys));
+    const merged = new Map(source.envVars.filter(({ key }) => !excluded.has(key)).map((entry) => [entry.key, entry.value]));
+    const groupSecrets: Array<{kind:"secret";key:string;value:string}>=[];
+    if (workerId) {
+      const [{ useWorkerGroupStore }, { resolveGroupEnv }] = await Promise.all([import("./services"), import("./worker-group-env")]);
+      const memberships = targetGroupId ? [useWorkerGroupStore().get(userId,targetGroupId)].filter(Boolean) : useWorkerGroupStore().listForUser(userId).filter((group) => group.workerIds.includes(workerId));
+      if (memberships.length > 1) throw Object.assign(new Error("Worker has conflicting group memberships"), { statusCode: 409 });
+      if (memberships[0]) {
+        const groupExcluded = new Set(Array.isArray(excludedGroupKeys) ? excludedGroupKeys.filter((key): key is string => typeof key === "string") : []);
+        const groupEnv = await resolveGroupEnv(userId, memberships[0].id);
+        for (const { key, value } of groupEnv.entries) if (!groupExcluded.has(key)) groupSecrets.push({kind:"secret",key,value});
+      }
+    }
+    const userEnv = { ...source, envVars: [...merged].map(([key,value])=>({key,value})) };
     const credentialBinds: string[] = [];
     if (this.userCredentialManager && userId) {
       await this.userCredentialManager.ensureUserDir(userId);
@@ -259,7 +277,7 @@ export class ContainerManager {
         );
       }
     }
-    return { userEnv, credentialBinds };
+    return { userEnv, credentialBinds, groupSecrets };
   }
 
   /** Resolve the worker's git identity live from the owning user. The worker
@@ -474,6 +492,8 @@ export class ContainerManager {
         mounts: worker?.mounts,
         initScript: worker?.initScript,
         environmentId: worker?.environmentId,
+        excludedGlobalEnvVarKeys: worker?.excludedGlobalEnvVarKeys ?? [],
+        excludedGroupEnvVarKeys: worker?.excludedGroupEnvVarKeys ?? [],
         pendingRebuild: worker?.pendingRebuild,
         importedImage: worker?.importedImage,
         imageDefinitionId: worker?.imageDefinitionId,
@@ -570,14 +590,6 @@ export class ContainerManager {
       request.displayName?.trim() || this.suggestDisplayName(userId);
     const containerName = this.buildContainerName(id);
     const workerConfigStore = useWorkerConfigStore();
-    if (request.workerConfiguration) {
-      await workerConfigStore.replace(
-        userId,
-        id,
-        normalizeWorkerConfiguration(request.workerConfiguration),
-      );
-    }
-    const workerConfig = await workerConfigStore.resolveValues(userId, id);
 
     const repos = request.repos?.filter((r) => r.url) || [];
 
@@ -597,8 +609,36 @@ export class ContainerManager {
       gitEmail,
     };
 
-    const { userEnv, credentialBinds } =
-      await this.resolveUserEnvAndBinds(userId);
+    const accountEnv = this.userEnvStore?.getOrDefault(userId) ?? zeroUserEnvVars(userId);
+    const excludedGlobalEnvVarKeys = normalizeExcludedGlobalEnvVarKeys(accountEnv, request.excludedGlobalEnvVarKeys);
+    if (request.excludedGroupEnvVarKeys !== undefined &&
+        (!Array.isArray(request.excludedGroupEnvVarKeys) || request.excludedGroupEnvVarKeys.some((key) => typeof key !== "string")))
+      throw Object.assign(new Error("excludedGroupEnvVarKeys must be an array of strings"), { statusCode: 400 });
+    const excludedGroupEnvVarKeys = [...new Set(request.excludedGroupEnvVarKeys ?? [])].sort();
+    if (excludedGroupEnvVarKeys.length) {
+      if (!request.targetWorkerGroupId)
+        throw Object.assign(new Error("Group environment exclusions require an authorized target worker group"), { statusCode: 400 });
+      const [{ useWorkerGroupStore }, { publicGroupEnvKeys }] = await Promise.all([
+        import("./services"),
+        import("./worker-group-env"),
+      ]);
+      const group = useWorkerGroupStore().get(userId, request.targetWorkerGroupId);
+      if (!group)
+        throw Object.assign(new Error("Worker group not found"), { statusCode: 404 });
+      const allowed = new Set((await publicGroupEnvKeys(userId, group.id)).effectiveKeys);
+      if (excludedGroupEnvVarKeys.some((key) => !allowed.has(key)))
+        throw Object.assign(new Error("Unknown group environment variable key"), { statusCode: 400 });
+    }
+    const { userEnv, credentialBinds, groupSecrets } =
+      await this.resolveUserEnvAndBinds(userId, excludedGlobalEnvVarKeys, id, excludedGroupEnvVarKeys, request.targetWorkerGroupId);
+    if (request.workerConfiguration) {
+      await workerConfigStore.replace(
+        userId,
+        id,
+        normalizeWorkerConfiguration(request.workerConfiguration),
+      );
+    }
+    const workerConfig = await workerConfigStore.resolveValues(userId, id);
 
     const container = await this.dockerService
       .createWorkerContainer({
@@ -616,7 +656,7 @@ export class ContainerManager {
         workerJson,
         storageManager: this.storageManager,
         userEnv,
-        workerConfig,
+        workerConfig: [...groupSecrets, ...workerConfig],
         image: request.imageRuntimeReference,
       })
       .catch(async (err) => {
@@ -647,6 +687,8 @@ export class ContainerManager {
       mounts,
       initScript,
       environmentId: request.environmentId,
+      excludedGlobalEnvVarKeys,
+      excludedGroupEnvVarKeys,
       pendingRebuild: false,
       imageDefinitionId: request.imageDefinitionId,
       imageVersion: request.imageVersion,
@@ -1457,6 +1499,19 @@ export class ContainerManager {
       patch.environmentId !== undefined &&
       patch.environmentId !== (info.environmentId || DEFAULT_ENVIRONMENT_ID);
     if (envChanged) this.resolveEnvironmentConfig(patch.environmentId!); // throws → 400 on a bad id
+    const accountEnv = this.userEnvStore?.getOrDefault(info.userId) ?? zeroUserEnvVars(info.userId);
+    const nextExcluded = patch.excludedGlobalEnvVarKeys === undefined
+      ? info.excludedGlobalEnvVarKeys ?? []
+      : normalizeExcludedGlobalEnvVarKeys(accountEnv, patch.excludedGlobalEnvVarKeys);
+    const excludedChanged = JSON.stringify(nextExcluded) !== JSON.stringify(info.excludedGlobalEnvVarKeys ?? []);
+    const nextGroupExcluded = patch.excludedGroupEnvVarKeys === undefined ? info.excludedGroupEnvVarKeys ?? [] : [...new Set(patch.excludedGroupEnvVarKeys)].sort();
+    const groupExcludedChanged = JSON.stringify(nextGroupExcluded) !== JSON.stringify(info.excludedGroupEnvVarKeys ?? []);
+    if (groupExcludedChanged) {
+      const [{useWorkerGroupStore},{publicGroupEnvKeys}]=await Promise.all([import("./services"),import("./worker-group-env")]);
+      const memberships=useWorkerGroupStore().listForUser(info.userId).filter(group=>group.workerIds.includes(info.id));
+      if(memberships.length!==1&&nextGroupExcluded.length)throw Object.assign(new Error("Worker has no unambiguous worker group"),{statusCode:400});
+      if(memberships[0]){const allowed=new Set((await publicGroupEnvKeys(info.userId,memberships[0].id)).effectiveKeys);if(nextGroupExcluded.some(key=>!allowed.has(key)))throw Object.assign(new Error("Unknown group environment variable key"),{statusCode:400});}
+    }
 
     // Display name — applied immediately (no rebuild).
     if (patch.displayName !== undefined) {
@@ -1473,6 +1528,11 @@ export class ContainerManager {
       info.environmentId = patch.environmentId;
       rebuildChanged = true;
     }
+    if (excludedChanged) {
+      info.excludedGlobalEnvVarKeys = nextExcluded;
+      rebuildChanged = true;
+    }
+    if (groupExcludedChanged) { info.excludedGroupEnvVarKeys=nextGroupExcluded;rebuildChanged=true; }
 
     // Init script — rebuild.
     if (patch.initScript !== undefined) {
@@ -1655,8 +1715,11 @@ export class ContainerManager {
       gitEmail,
     };
 
-    const { userEnv, credentialBinds } = await this.resolveUserEnvAndBinds(
+    const { userEnv, credentialBinds, groupSecrets } = await this.resolveUserEnvAndBinds(
       info.userId,
+      info.excludedGlobalEnvVarKeys ?? [],
+      info.id,
+      info.excludedGroupEnvVarKeys ?? [],
     );
     const workerConfig = await useWorkerConfigStore().resolveValues(
       info.userId,
@@ -1684,7 +1747,7 @@ export class ContainerManager {
       workerJson,
       storageManager: this.storageManager,
       userEnv,
-      workerConfig,
+      workerConfig: [...groupSecrets, ...workerConfig],
       image: imageOpts.image,
       imageConfig: imageOpts.imageConfig,
     });
@@ -1707,6 +1770,8 @@ export class ContainerManager {
       mounts: info.mounts,
       initScript: info.initScript,
       environmentId: info.environmentId,
+      excludedGlobalEnvVarKeys: info.excludedGlobalEnvVarKeys ?? [],
+      excludedGroupEnvVarKeys: info.excludedGroupEnvVarKeys ?? [],
       // Rebuild applies any pending settings edits, so the flag is cleared.
       pendingRebuild: false,
       // Keep the imported-image link only while that image still exists.
@@ -1782,8 +1847,11 @@ export class ContainerManager {
       gitEmail,
     };
 
-    const { userEnv, credentialBinds } = await this.resolveUserEnvAndBinds(
+    const { userEnv, credentialBinds, groupSecrets } = await this.resolveUserEnvAndBinds(
       worker.userId,
+      worker.excludedGlobalEnvVarKeys ?? [],
+      worker.id,
+      worker.excludedGroupEnvVarKeys ?? [],
     );
     const workerConfig = await useWorkerConfigStore().resolveValues(
       worker.userId,
@@ -1809,7 +1877,7 @@ export class ContainerManager {
       workerJson,
       storageManager: this.storageManager,
       userEnv,
-      workerConfig,
+      workerConfig: [...groupSecrets, ...workerConfig],
       image: imageOpts.image,
       imageConfig: imageOpts.imageConfig,
     });
@@ -1835,6 +1903,8 @@ export class ContainerManager {
       mounts: worker.mounts,
       initScript: worker.initScript,
       environmentId: worker.environmentId,
+      excludedGlobalEnvVarKeys: worker.excludedGlobalEnvVarKeys ?? [],
+      excludedGroupEnvVarKeys: worker.excludedGroupEnvVarKeys ?? [],
       // Unarchive recreates the container from the stored config, applying any
       // pending settings edits, so the flag is cleared.
       pendingRebuild: false,
@@ -2488,6 +2558,8 @@ export class ContainerManager {
       displayName: info.displayName,
       status: "active",
       environmentId: info.environmentId,
+      excludedGlobalEnvVarKeys: info.excludedGlobalEnvVarKeys ?? [],
+      excludedGroupEnvVarKeys: info.excludedGroupEnvVarKeys ?? [],
       repos: info.repos,
       mounts: info.mounts,
       initScript: info.initScript,

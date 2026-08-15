@@ -55,6 +55,16 @@ test("owner queue closes network-reference create versus group-delete races", as
   expect(networks).toEqual([network]);
 });
 
+test("failed group persistence invokes dependent-state deletion compensation", async () => {
+  let restored=false;
+  const service=new WorkerGroupNetworkCoordinator(dependencies({
+    group:()=>group([]),
+    remove:async()=>{throw new Error("injected group persistence failure");},
+  }));
+  await expect(service.delete(ownerId,groupId,async()=>async()=>{restored=true;})).rejects.toThrow("injected group persistence failure");
+  expect(restored).toBe(true);
+});
+
 test("queued group worker enrollment derives membership inside the owner lock", async () => {
   let current = group();
   let release!: () => void;
@@ -76,6 +86,71 @@ test("queued group worker enrollment derives membership inside the owner lock", 
   await concurrentMembershipChange;
   await enrollment;
   expect(current.workerIds).toEqual(["concurrent-worker", "new-worker"]);
+});
+
+test("scope authorization is rechecked inside the owner mutation queue", async () => {
+  let current = group();
+  let updates = 0;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const service = new WorkerGroupNetworkCoordinator(dependencies({
+    group: () => current,
+    update: async (_userId, _groupId, patch) => {
+      updates++;
+      current = { ...current, ...patch, workerIds: patch.workerIds ?? current.workerIds };
+      return current;
+    },
+  }));
+
+  const precedingMutation = service.withOwner(ownerId, async () => held);
+  const scopedUpdate = service.update(
+    ownerId,
+    groupId,
+    { name: "must-not-apply" },
+    undefined,
+    () => { throw Object.assign(new Error("Resource not found"), { statusCode: 404 }); },
+  );
+  release();
+  await precedingMutation;
+  await expect(scopedUpdate).rejects.toMatchObject({ statusCode: 404 });
+  expect(updates).toBe(0);
+  expect(current.name).toBe("group");
+});
+
+test("queued group deletion rechecks live scope immediately before removal", async () => {
+  let current = group([]);
+  let removals = 0;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const service = new WorkerGroupNetworkCoordinator(dependencies({
+    group: () => current,
+    remove: async () => {
+      removals++;
+      current = undefined as unknown as WorkerGroup;
+    },
+  }));
+  const preceding = service.withOwner(ownerId, () => held);
+  let authorized = true;
+  const deletion = service.delete(ownerId, groupId, async () => {
+    if (!authorized)
+      throw Object.assign(new Error("Resource not found"), { statusCode: 404 });
+  });
+
+  authorized = false;
+  release();
+  await preceding;
+  await expect(deletion).rejects.toMatchObject({ statusCode: 404 });
+  expect(removals).toBe(0);
+  expect(current.id).toBe(groupId);
+});
+
+test("group deletion rejects direct workers and child groups", async () => {
+  const direct = new WorkerGroupNetworkCoordinator(dependencies());
+  expect(() => direct.assertCanDelete(ownerId, groupId)).toThrow(/direct workers/);
+  const root = group([]);
+  const child = { ...group([]), id: "child", parentId: groupId };
+  const nested = new WorkerGroupNetworkCoordinator(dependencies({ groups: () => [root, child] }));
+  expect(() => nested.assertCanDelete(ownerId, groupId)).toThrow(/child groups/);
 });
 
 test("reconciliation failure restores topology even when group storage rollback fails", async () => {
@@ -104,6 +179,65 @@ test("reconciliation failure restores topology even when group storage rollback 
   expect(reconciliations).toEqual([undefined, ["old-worker"]]);
 });
 
+test("direct membership changes reconcile the group and every ancestor network", async () => {
+  let groups = [
+    { ...group([]), id: "root" },
+    { ...group(["old-worker"]), id: "child", parentId: "root" },
+  ];
+  const networks = [
+    { ...network, id: "root-network", groupId: "root" },
+    { ...network, id: "child-network", groupId: "child" },
+  ];
+  const reconciled: string[] = [];
+  const service = new WorkerGroupNetworkCoordinator(dependencies({
+    groups: () => groups,
+    networks: () => networks,
+    update: async (_userId, id, patch) => {
+      const current = groups.find((candidate) => candidate.id === id)!;
+      const updated = { ...current, ...patch } as WorkerGroup;
+      groups = groups.map((candidate) => candidate.id === id ? updated : candidate);
+      return updated;
+    },
+    reconcile: async (candidate) => {
+      reconciled.push(candidate.id);
+      return { workerIds: [], partialFailures: [] };
+    },
+  }));
+
+  await service.update(ownerId, "child", { workerIds: ["new-worker"] });
+  expect(new Set(reconciled)).toEqual(new Set(["root-network", "child-network"]));
+});
+
+test("reparenting reconciles both old and new ancestor networks", async () => {
+  let groups = [
+    { ...group([]), id: "old-root" },
+    { ...group([]), id: "new-root" },
+    { ...group(["moved-worker"]), id: "child", parentId: "old-root" },
+  ];
+  const networks = [
+    { ...network, id: "old-network", groupId: "old-root" },
+    { ...network, id: "new-network", groupId: "new-root" },
+  ];
+  const reconciled: string[] = [];
+  const service = new WorkerGroupNetworkCoordinator(dependencies({
+    groups: () => groups,
+    networks: () => networks,
+    update: async (_userId, id, patch) => {
+      const current = groups.find((candidate) => candidate.id === id)!;
+      const updated = { ...current, ...patch } as WorkerGroup;
+      groups = groups.map((candidate) => candidate.id === id ? updated : candidate);
+      return updated;
+    },
+    reconcile: async (candidate) => {
+      reconciled.push(candidate.id);
+      return { workerIds: [], partialFailures: [] };
+    },
+  }));
+
+  await service.update(ownerId, "child", { parentId: "new-root" });
+  expect(new Set(reconciled)).toEqual(new Set(["old-network", "new-network"]));
+});
+
 test("worker group persistence failure leaves the in-memory record unchanged", async () => {
   class FailingStore extends WorkerGroupStore {
     fail = false;
@@ -122,6 +256,7 @@ test("worker group persistence failure leaves the in-memory record unchanged", a
 
 function dependencies(overrides: {
   group?: () => WorkerGroup | undefined;
+  groups?: () => WorkerGroup[];
   networks?: () => ManagedNetwork[];
   update?: WorkerGroupNetworkDependencies["groups"]["update"];
   remove?: WorkerGroupNetworkDependencies["groups"]["remove"];
@@ -129,7 +264,16 @@ function dependencies(overrides: {
 } = {}): WorkerGroupNetworkDependencies {
   return {
     groups: {
-      get: () => overrides.group?.() ?? group(),
+      listForUser: () => overrides.groups?.() ?? (() => {
+        const candidate = overrides.group?.() ?? group();
+        return candidate ? [candidate] : [];
+      })(),
+      get: (_userId, id) => {
+        if (overrides.groups)
+          return overrides.groups().find((candidate) => candidate.id === id);
+        const candidate = overrides.group?.() ?? group();
+        return candidate?.id === id ? candidate : undefined;
+      },
       update: overrides.update ?? (async (_userId, _groupId, patch) => ({ ...group(), ...patch })),
       remove: overrides.remove ?? (async () => undefined),
     },

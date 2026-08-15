@@ -20,6 +20,8 @@ defineRouteMeta({
               initScript: { type: 'string', description: 'New init script (empty string clears it). Requires rebuild.' },
               repos: { type: 'array', items: { $ref: '#/components/schemas/RepoConfig' }, description: 'Replacement repository list. Requires rebuild.' },
               mounts: { type: 'array', items: { $ref: '#/components/schemas/MountConfig' }, description: 'Replacement host bind-mount list. Requires rebuild.' },
+              excludedGlobalEnvVarKeys: { type: 'array', items: { type: 'string' }, description: 'Complete names-only replacement list of account environment variables omitted after rebuild.' },
+              excludedGroupEnvVarKeys: { type: 'array', items: { type: 'string' }, description: 'Complete names-only replacement list of effective inherited worker-group variables omitted after rebuild.' },
             },
           },
         },
@@ -77,6 +79,17 @@ export default defineEventHandler(async (event) => {
   await useWorkerProtectionLockStore().verify(id, (body as any).lockPassword);
 
   const patch: UpdateContainerSettingsRequest = {};
+
+  if (body.excludedGlobalEnvVarKeys !== undefined && body.excludedGlobalEnvVarKeys !== null) {
+    const keys = parseArray(body.excludedGlobalEnvVarKeys, 'excludedGlobalEnvVarKeys');
+    if (keys.some((key) => typeof key !== 'string')) bad('excludedGlobalEnvVarKeys must contain only strings');
+    patch.excludedGlobalEnvVarKeys = keys as string[];
+  }
+  if (body.excludedGroupEnvVarKeys !== undefined && body.excludedGroupEnvVarKeys !== null) {
+    const keys = parseArray(body.excludedGroupEnvVarKeys, 'excludedGroupEnvVarKeys');
+    if (keys.some((key) => typeof key !== 'string')) bad('excludedGroupEnvVarKeys must contain only strings');
+    patch.excludedGroupEnvVarKeys = keys as string[];
+  }
 
   // --- displayName (live) ---
   if (body.displayName !== undefined && body.displayName !== null) {

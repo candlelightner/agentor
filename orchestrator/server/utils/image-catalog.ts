@@ -11,6 +11,8 @@ export interface ImageVersion {
   version: string;
   digest: string;
   baseImage: string;
+  /** Content-addressed base actually used by the controlled build. */
+  baseDigest?: string;
   createdAt: string;
   promoted?: boolean;
   /** Immutable runtime reference returned by the controlled builder. Fake test
@@ -47,6 +49,7 @@ export interface ImageBuild {
   completedAt?: string;
   durationMs?: number;
   digest?: string;
+  baseDigest?: string;
   version?: string;
   error?: string;
   recovery?: string;
@@ -69,6 +72,9 @@ const APPROVED_BASE_RE = /^agentor-worker:approved-[a-zA-Z0-9._-]+$/;
 const SAFE_PATH_RE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[a-zA-Z0-9._/-]+$/;
 const MAX_CONTEXT_FILE = 100 * 1024 * 1024;
 const MAX_CONTEXT_TOTAL = 250 * 1024 * 1024;
+const DEFAULT_BUILD_TIMEOUT_MS = 30 * 60 * 1000;
+const MIN_BUILD_TIMEOUT_MS = 1_000;
+const MAX_BUILD_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const FORBIDDEN_FRAGMENT =
   /(^|\n)\s*(?:FROM|USER|ENTRYPOINT|CMD|ONBUILD|STOPSIGNAL|HEALTHCHECK|VOLUME|EXPOSE)\s|\bADD\s+https?:|docker\.sock|--mount\s*=\s*type=(?:bind|secret|ssh)|\bcurl\b.*\|\s*(?:sh|bash)|\bwget\b.*\|\s*(?:sh|bash)|\b(?:ENV|ARG)\b[^\n]*(?:TOKEN|SECRET|PASSWORD|API_KEY)|\$\{?[^\s}]*?(?:TOKEN|SECRET|PASSWORD|API_KEY)/i;
 const REDACT =
@@ -100,6 +106,55 @@ function safeBuildDiagnostic(error: unknown): string {
     safeLog(message.replace(/[\r\n]+/g, " ").trim()).slice(0, 500) ||
     "Unknown builder error"
   );
+}
+function controlledBuildTimeoutMs() {
+  const configured = Number(process.env.IMAGE_BUILD_TIMEOUT_MS);
+  if (!Number.isFinite(configured)) return DEFAULT_BUILD_TIMEOUT_MS;
+  return Math.min(MAX_BUILD_TIMEOUT_MS, Math.max(MIN_BUILD_TIMEOUT_MS, configured));
+}
+function withBuildTimeout<T>(promise: Promise<T>, operation: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`${operation} timed out`));
+    }, controlledBuildTimeoutMs());
+    promise.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        reject(error);
+      },
+    );
+  });
+}
+function followDockerProgressBounded(
+  docker: Docker,
+  stream: NodeJS.ReadableStream,
+  operation: string,
+) {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      error ? reject(error) : resolve();
+    };
+    const timeout = setTimeout(() => {
+      (stream as Readable).destroy();
+      finish(new Error(`${operation} timed out`));
+    }, controlledBuildTimeoutMs());
+    docker.modem.followProgress(stream, finish);
+  });
 }
 function publicBuild(build: ImageBuild) {
   const { logs: _logs, ...result } = build;
@@ -171,6 +226,18 @@ export class ImageCatalogManager {
     return this.state.definitions.filter(
       (d) => d.ownerId === ownerId && d.groupId === groupId,
     );
+  }
+  listForGroupHierarchy(ownerId: string, visibleGroupIds: Iterable<string>, manageableGroupIds: Iterable<string>) {
+    const visible = new Set(visibleGroupIds);
+    const manageable = new Set(manageableGroupIds);
+    return this.state.definitions
+      .filter((d) => d.ownerId === ownerId && (!d.groupId || visible.has(d.groupId)))
+      .map((definition) => ({ ...definition, access: {
+        readable: true,
+        usable: true,
+        manageable: !!definition.groupId && manageable.has(definition.groupId),
+        owningGroupId: definition.groupId,
+      }}));
   }
   ownerIds() {
     return [
@@ -489,9 +556,11 @@ export class ImageCatalogManager {
       build.phase = "validating";
       build.startedAt = build.updatedAt = now();
       await this.persist();
-      const base = resolveControlledBase(snapshot.baseImage);
+      const configuredBase = resolveControlledBase(snapshot.baseImage);
+      const pinnedBase = await this.resolvePinnedBase(configuredBase);
+      build.baseDigest = pinnedBase.digest;
       const dockerfile = [
-        `FROM ${base}`,
+        `FROM ${pinnedBase.reference}`,
         "USER root",
         snapshot.dockerfileFragment || "# no additional image steps",
         "USER agent",
@@ -500,7 +569,10 @@ export class ImageCatalogManager {
       build.phase = "building";
       build.updatedAt = now();
       await this.persist();
-      const daemonInfo = await this.docker.info();
+      const daemonInfo = await withBuildTimeout(
+        this.docker.info(),
+        "Docker builder information",
+      );
       const supportsMemoryLimit = daemonInfo.MemoryLimit !== false;
       const supportsCpuQuota = daemonInfo.CPUCfsQuota !== false;
       const supportsConfiguredLimits = supportsMemoryLimit && supportsCpuQuota;
@@ -539,14 +611,27 @@ export class ImageCatalogManager {
               .digest("hex"),
           },
         };
-        const stream = await this.docker.buildImage(context as any, options);
+        const stream = await withBuildTimeout(
+          this.docker.buildImage(context as any, options),
+          "Docker build startup",
+        );
         this.buildStreams.set(build.id, stream as unknown as Readable);
         await new Promise<void>((resolve, reject) => {
           let daemonError: Error | undefined;
+          let settled = false;
+          const finish = (error?: Error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            error ? reject(error) : resolve();
+          };
+          const timeout = setTimeout(() => {
+            (stream as unknown as Readable).destroy();
+            finish(new Error("Controlled image build timed out"));
+          }, controlledBuildTimeoutMs());
           this.docker.modem.followProgress(
             stream,
-            (error: Error | null) =>
-              error || daemonError ? reject(error || daemonError) : resolve(),
+            (error: Error | null) => finish(error || daemonError),
             (event: any) => {
               const daemonMessage = String(
                 event?.errorDetail?.message || event?.error || "",
@@ -574,26 +659,23 @@ export class ImageCatalogManager {
         // builds functional there. Do not weaken limits for ordinary failures.
         if (!/cannot enter cgroupv2|cgroup configuration/i.test(String(error)))
           throw error;
-        await this.docker
-          .getImage(tag)
-          .remove({ force: true })
-          .catch(() => {});
+        await this.removeControlledArtifact(tag);
         build.logs.push(
           "Builder host cannot apply legacy cgroup limits; retrying with platform defaults.",
         );
         await runBuild(false);
       }
       if ((build.status as ImageBuildStatus) === "cancelled") {
-        await this.docker
-          .getImage(tag)
-          .remove({ force: true })
-          .catch(() => {});
+        await this.removeControlledArtifact(tag);
         return;
       }
       build.phase = "recording-digest";
       build.updatedAt = now();
       await this.persist();
-      const image = await this.docker.getImage(tag).inspect();
+      const image = await withBuildTimeout(
+        this.docker.getImage(tag).inspect(),
+        "Built image inspection",
+      );
       const digest = /^sha256:[0-9a-f]{64}$/.test(image.Id)
         ? image.Id
         : `sha256:${createHash("sha256")
@@ -606,6 +688,7 @@ export class ImageCatalogManager {
         runtimeImage: digest,
         artifactTag: tag,
         baseImage: snapshot.baseImage,
+        baseDigest: pinnedBase.digest,
         createdAt: stamp,
       });
       definition.baseImage = snapshot.baseImage;
@@ -622,10 +705,7 @@ export class ImageCatalogManager {
       });
       await this.persist();
     } catch (error) {
-      await this.docker
-        .getImage(tag)
-        .remove({ force: true })
-        .catch(() => {});
+      await this.removeControlledArtifact(tag);
       if (build.status !== "cancelled") {
         // Failures before Docker accepts the context (such as an unknown
         // approved-base alias) emit no progress event. Preserve a sanitized
@@ -644,6 +724,44 @@ export class ImageCatalogManager {
     } finally {
       this.buildStreams.delete(build.id);
     }
+  }
+  private async resolvePinnedBase(configuredReference: string) {
+    let image: Docker.ImageInspectInfo;
+    try {
+      image = await withBuildTimeout(
+        this.docker.getImage(configuredReference).inspect(),
+        "Approved base inspection",
+      );
+    } catch {
+      let stream: NodeJS.ReadableStream;
+      try {
+        stream = await withBuildTimeout(
+          this.docker.pull(configuredReference),
+          "Approved base pull startup",
+        );
+        await followDockerProgressBounded(
+          this.docker,
+          stream,
+          "Approved base pull",
+        );
+        image = await withBuildTimeout(
+          this.docker.getImage(configuredReference).inspect(),
+          "Approved base inspection",
+        );
+      } catch {
+        httpError(500, "Approved image base could not be pinned safely");
+      }
+    }
+    const digest = String(image.Id || "");
+    if (!/^sha256:[0-9a-f]{64}$/.test(digest))
+      httpError(500, "Approved image base could not be pinned safely");
+    return { reference: digest, digest };
+  }
+  private async removeControlledArtifact(reference: string) {
+    await withBuildTimeout(
+      this.docker.getImage(reference).remove({ force: true }),
+      "Controlled build artifact cleanup",
+    ).catch(() => {});
   }
   private advance(
     build: ImageBuild,
@@ -781,6 +899,13 @@ export class ImageCatalogManager {
   }
   publicBuild(id: string, ownerId: string, admin: boolean) {
     return publicBuild(this.build(id, ownerId, admin));
+  }
+  publicBuilds(ownerId: string, admin: boolean) {
+    return this.state.builds
+      .filter((build) => admin || build.ownerId === ownerId)
+      .slice(-50)
+      .reverse()
+      .map(publicBuild);
   }
 
   async promote(id: string, version: string, ownerId: string, admin: boolean) {
@@ -921,6 +1046,15 @@ export class ImageCatalogManager {
       digest: built.digest,
       runtimeImage: built.runtimeImage,
     };
+  }
+  resolveSelectionForGroupHierarchy(ownerId: string, allowedGroupIds: Iterable<string>, definitionId?: string, version?: string) {
+    if (!definitionId) return this.resolveSelection(ownerId);
+    const allowed = new Set(allowedGroupIds);
+    const definition = this.state.definitions.find((candidate) => candidate.id === definitionId && candidate.ownerId === ownerId && (!candidate.groupId || allowed.has(candidate.groupId)));
+    if (!definition) httpError(404, "Image definition not found");
+    const built = findVersion(definition, version || definition.promotedVersion || "");
+    if (built.recovered && !built.runtimeImage) httpError(409, "Recovered image metadata has no runnable immutable reference");
+    return { definitionId: definition.id, version: built.version, digest: built.digest, runtimeImage: built.runtimeImage };
   }
   async setFault(ownerId: string, fault: any) {
     this.state.faults[ownerId] = {

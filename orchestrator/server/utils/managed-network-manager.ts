@@ -6,6 +6,7 @@ import {
   useWorkerStore,
 } from "./services";
 import type { ManagedNetwork } from "./managed-network-store";
+import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 
 const forbidden = (name: string) =>
   name === "agentor-management" || /management|internal/i.test(name);
@@ -20,8 +21,12 @@ export class ManagedNetworkManager {
         .listForUser(network.userId)
         .filter((worker) => worker.status !== "archived")
         .map((worker) => worker.id);
-    else if (network.scope === "group" && network.groupId)
-      ids = useWorkerGroupStore().get(network.userId, network.groupId)?.workerIds ?? [];
+    else if (network.scope === "group" && network.groupId) {
+      const groups = useWorkerGroupStore();
+      ids = groups.get(network.userId, network.groupId)
+        ? new WorkerGroupHierarchy(groups).subtreeWorkerIds(network.userId, network.groupId)
+        : [];
+    }
     else ids = network.workerIds;
     return [...new Set(ids)].filter((id) => useWorkerStore().get(network.userId, id));
   }

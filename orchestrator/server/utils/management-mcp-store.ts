@@ -12,6 +12,7 @@ import {
   useConfig,
   useContainerManager,
   useExportJobManager,
+  useManagedNetworkStore,
   useWorkerGroupStore,
   useWorkerStore,
 } from "./services";
@@ -25,8 +26,8 @@ import { OfflineWorkspaceAccess } from "./workspace-access";
 import { workerConfigurationResponse } from "./worker-config-response";
 import { useWorkerConfigStore } from "./worker-config-store";
 import { useManagementConsoleStore } from "./management-console-store";
-import { ManagementWorkerDomain } from "./management-worker-domain";
-import { addWorkerToGroupWithNetworks } from "./worker-group-manager";
+import { ManagementWorkerDomain, managementFailFastTimeoutSeconds, withinManagementFailFastDeadline } from "./management-worker-domain";
+import { addWorkerToGroupWithNetworks, assignWorkerToGroupWithNetworks, withWorkerNetworkMutation } from "./worker-group-manager";
 import {
   workspaceMcpTools,
   executeWorkspaceMcpTool,
@@ -47,6 +48,7 @@ import {
 import { useWorkerProtectionLockStore } from "./worker-protection-lock";
 import { validateManagementOwnerArguments } from "./management-owner";
 import type { Readable } from "node:stream";
+import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 
 const GROUPS = [
   "read-only-status",
@@ -78,6 +80,7 @@ const GROUP_ADMIN_TOOLS = new Set([
   "status.system",
   "workers.list",
   "workers.inspect",
+  "workers.env-keys",
   "workers.create",
   "workers.metrics.get",
   "logs.read",
@@ -138,6 +141,18 @@ const GROUP_ADMIN_TOOLS = new Set([
   "images.build-cancel",
   "images.promote",
   "images.rollback",
+  "networks.list",
+  "networks.inspect",
+  "networks.create",
+  "networks.update",
+  "networks.reconcile",
+  "networks.delete",
+  "groups.list", "groups.create", "groups.update", "groups.delete",
+  "groups.assign-worker",
+  "groups.env.list", "groups.env.update",
+  "groups.admin-workspace.get", "groups.admin-workspace.provision",
+  "groups.admin-workspace.start", "groups.admin-workspace.stop",
+  "groups.admin-workspace.rebuild",
 ]);
 const GROUP_ADMIN_IMAGE_TOOLS = new Set(
   [...GROUP_ADMIN_TOOLS].filter((name) => name.startsWith("images.")),
@@ -149,9 +164,23 @@ const GROUP_ADMIN_TARGET_FREE_TOOLS = new Set([
   "apps.types",
   "workspaces.list",
   ...GROUP_ADMIN_IMAGE_TOOLS,
+  "networks.list",
+  "networks.create",
+  "groups.list",
+  "groups.create",
 ]);
+const GROUP_ADMIN_NETWORK_TOOLS = new Set([
+  "networks.inspect", "networks.update", "networks.reconcile", "networks.delete",
+]);
+const GROUP_ADMIN_GROUP_TOOLS = new Set([
+  "groups.update", "groups.delete", "groups.env.list", "groups.env.update", "groups.admin-workspace.get",
+  "groups.admin-workspace.provision", "groups.admin-workspace.start",
+  "groups.admin-workspace.stop", "groups.admin-workspace.rebuild",
+]);
+const GROUP_ADMIN_ASSIGN_TOOLS = new Set(["groups.assign-worker"]);
 const GROUP_ADMIN_DIRECT_TARGET_TOOLS = new Set([
   "workers.inspect",
+  "workers.env-keys",
   "workers.metrics.get",
   "logs.read",
   "volumes.list-files",
@@ -214,6 +243,9 @@ for (const name of GROUP_ADMIN_TOOLS) {
     !GROUP_ADMIN_EXPORT_JOB_TOOLS.has(name) &&
     !GROUP_ADMIN_BACKUP_JOB_TOOLS.has(name) &&
     !GROUP_ADMIN_CONSOLE_SESSION_TOOLS.has(name)
+    && !GROUP_ADMIN_NETWORK_TOOLS.has(name)
+    && !GROUP_ADMIN_GROUP_TOOLS.has(name)
+    && !GROUP_ADMIN_ASSIGN_TOOLS.has(name)
   )
     throw new Error(`Group administrative tool has no target policy: ${name}`);
 }
@@ -440,9 +472,13 @@ export class ManagementMcpStore {
           name,
           description:
             (identity?.scope === "group" && name === "workers.create"
-              ? "Create an evaluation worker owned by and atomically enrolled in this administrative group. The owner and group are derived from the workspace identity."
+              ? "Create an evaluation worker owned by and atomically enrolled in this administrative group. The owner and group are derived from the workspace identity; timeoutSeconds bounds the MCP wait while safe enrollment or rollback remains serialized."
               : identity?.scope === "group" && GROUP_ADMIN_IMAGE_TOOLS.has(name)
-                ? `${imageBackup?.description || "Manage an image"} in this worker group's private image catalog. Global and other-group image definitions are not visible or mutable.`
+                ? `${imageBackup?.description || "Manage an image"} in the authorized image hierarchy. Global and ancestor images are read/use-only; this group and descendant images are manageable.`
+              : identity?.scope === "group" && name.startsWith("networks.")
+                ? groupNetworkDescription(name)
+              : identity?.scope === "group" && name.startsWith("groups.")
+                ? groupStructuralDescription(name)
               : undefined) ||
             domain?.description ||
             workspace?.description ||
@@ -461,6 +497,10 @@ export class ManagementMcpStore {
               ? groupWorkerCreateInputSchema()
               : identity?.scope === "group" && GROUP_ADMIN_IMAGE_TOOLS.has(name)
                 ? groupImageInputSchema(name)
+              : identity?.scope === "group" && name.startsWith("networks.")
+                ? groupNetworkInputSchema(name)
+              : identity?.scope === "group" && name.startsWith("groups.")
+                ? groupStructuralInputSchema(name)
               : undefined) ||
             domain?.inputSchema ||
             workspace?.inputSchema ||
@@ -638,6 +678,16 @@ export class ManagementMcpStore {
         if (args.ownerId !== undefined || args.groupId !== undefined)
           throw groupResourceNotFound();
         args = { ...args, ownerId: identity.ownerId };
+      }
+      if (identity.scope === "group" && name.startsWith("networks.")) {
+        if (args.ownerId !== undefined) throw groupResourceNotFound();
+        args = { ...args, ownerId: identity.ownerId };
+      }
+      if (identity.scope === "group" && name.startsWith("groups.")) {
+        if (args.userId !== undefined || args.ownerId !== undefined) throw groupResourceNotFound();
+        args = { ...args, userId: identity.ownerId };
+        if (name === "groups.create" && args.parentId === undefined)
+          args.parentId = identity.groupId;
       }
       await validateManagementOwnerArguments(args);
       if (identity.scope === "group")
@@ -868,18 +918,93 @@ export class ManagementMcpStore {
     // initialization or compatibility lookups that can take minutes.
     validateToolArguments(name, args);
     if (identity?.scope === "group" && name === "workers.create")
-      return this.createGroupWorker(identity, args);
+      // The caller is released at its explicit deadline, while the serialized
+      // create/enrol/rollback workflow continues to completion so a timeout
+      // can never strand an owner-wide worker outside the authorized group.
+      return withinManagementFailFastDeadline(
+        () => this.createGroupWorker(identity, args),
+        managementFailFastTimeoutSeconds(args.timeoutSeconds),
+        name,
+      );
+    if (identity?.scope === "group" && name === "groups.assign-worker") {
+      const ownerId = identity.ownerId!;
+      const authorityGroupId = identity.groupId!;
+      return withinManagementFailFastDeadline(() => assignWorkerToGroupWithNetworks(
+        ownerId,
+        String(args.workerId),
+        String(args.targetGroupId),
+        args.lockPasswords,
+        (sourceGroupId, targetGroupId) => {
+          const hierarchy = new WorkerGroupHierarchy(useWorkerGroupStore());
+          if (!sourceGroupId || !targetGroupId ||
+              !hierarchy.canAdminister(ownerId, authorityGroupId, sourceGroupId) ||
+              !hierarchy.canAdminister(ownerId, authorityGroupId, targetGroupId))
+            throw groupResourceNotFound();
+        },
+      ), managementFailFastTimeoutSeconds(args.timeoutSeconds), name);
+    }
     if (identity?.scope === "group" && GROUP_ADMIN_IMAGE_TOOLS.has(name))
       return this.executeGroupImageTool(identity, name, args);
+    if (identity?.scope === "group" && (name === "groups.update" || name === "groups.create" || name === "groups.delete" || name === "groups.env.list" || name === "groups.env.update")) {
+      const ownerId = identity.ownerId!;
+      const authorityGroupId = identity.groupId!;
+      const targetGroupId = name === "groups.create" ? undefined : String(args.groupId);
+      const requestedParent = args.parentId;
+      args.__scopeAuthorize = () => {
+        const hierarchy = new WorkerGroupHierarchy(useWorkerGroupStore());
+        if ((targetGroupId && !hierarchy.canAdminister(ownerId, authorityGroupId, targetGroupId)) ||
+            (requestedParent !== undefined &&
+              (targetGroupId === authorityGroupId || typeof requestedParent !== "string" ||
+               !hierarchy.canAdminister(ownerId, authorityGroupId, requestedParent))))
+          throw groupResourceNotFound();
+      };
+    }
+    if (identity?.scope === "group" && GROUP_ADMIN_NETWORK_TOOLS.has(name) &&
+        !["networks.list", "networks.inspect"].includes(name)) {
+      const ownerId = identity.ownerId!;
+      const authorityGroupId = identity.groupId!;
+      args.__scopeAuthorize = () => {
+        const hierarchy = new WorkerGroupHierarchy(useWorkerGroupStore());
+        if (name === "networks.create") {
+          if (args.scope !== "group" || typeof args.groupId !== "string" ||
+              !hierarchy.canAdminister(ownerId, authorityGroupId, args.groupId))
+            throw groupResourceNotFound();
+          return;
+        }
+        const network = useManagedNetworkStore().findById(String(args.networkId || ""));
+        if (!network || network.userId !== ownerId || network.scope !== "group" ||
+            !network.groupId || !hierarchy.canAdminister(ownerId, authorityGroupId, network.groupId))
+          throw groupResourceNotFound();
+        const prospectiveGroupId = typeof args.groupId === "string" ? args.groupId : network.groupId;
+        const prospectiveScope = typeof args.scope === "string" ? args.scope : network.scope;
+        if (prospectiveScope !== "group" ||
+            !hierarchy.canAdminister(ownerId, authorityGroupId, prospectiveGroupId))
+          throw groupResourceNotFound();
+      };
+    }
     const domain = await workerDomain.execute(name, args);
-    if (domain.handled) return domain.result;
+    if (domain.handled) {
+      if (identity?.scope === "group" && name === "groups.list") {
+        const hierarchy = new WorkerGroupHierarchy(useWorkerGroupStore());
+        const allowed = new Set(hierarchy.descendants(identity.ownerId!, identity.groupId!, true).map((group) => group.id));
+        return (domain.result as any[]).filter((group) => allowed.has(group.id));
+      }
+      return domain.result;
+    }
     const imageBackup = await imageBackupDomain.execute(
       name,
       await compatibleDomainArguments(name, args),
     );
     if (imageBackup.handled) return imageBackup.result;
     const platform = await platformDomain.execute(name, args);
-    if (platform.handled) return platform.result;
+    if (platform.handled) {
+      if (identity?.scope === "group" && name === "networks.list") {
+        const hierarchy = new WorkerGroupHierarchy(useWorkerGroupStore());
+        const allowed = new Set(hierarchy.descendants(identity.ownerId!, identity.groupId!, true).map((group) => group.id));
+        return (platform.result as any[]).filter((network) => network.scope === "group" && allowed.has(network.groupId));
+      }
+      return platform.result;
+    }
     const catalog = await catalogDomain.execute(name, args);
     if (catalog.handled) return catalog.result;
     const exposure = await exposureDomain.execute(name, args);
@@ -1054,11 +1179,24 @@ export class ManagementMcpStore {
     // Re-read the live group before creation and again while enrolling it.
     // The normal group/network coordinator serializes membership changes and
     // reconciles dependent networks before this call returns.
-    const group = useWorkerGroupStore().findById(identity.groupId);
-    if (!group || group.userId !== identity.ownerId) throw groupResourceNotFound();
+    const groups = useWorkerGroupStore();
+    const hierarchy = new WorkerGroupHierarchy(groups);
+    const targetGroupId = typeof args.targetGroupId === "string" ? args.targetGroupId : identity.groupId;
+    if (!hierarchy.canAdminister(identity.ownerId, identity.groupId, targetGroupId)) throw groupResourceNotFound();
+    const group = groups.get(identity.ownerId, targetGroupId);
+    if (!group) throw groupResourceNotFound();
+    if (args.excludedGroupEnvVarKeys !== undefined) {
+      const { publicGroupEnvKeys } = await import("./worker-group-env");
+      const allowed = new Set((await publicGroupEnvKeys(identity.ownerId,targetGroupId)).effectiveKeys);
+      if (!Array.isArray(args.excludedGroupEnvVarKeys) || args.excludedGroupEnvVarKeys.some((key)=>typeof key!=="string"||!allowed.has(key)))
+        throw statusError(400,"Unknown group environment variable key");
+    }
+    const usableImageGroups = hierarchy.ancestors(identity.ownerId, targetGroupId, true).map((item) => item.id);
     const created = await workerDomain.execute("workers.create", {
       ...args,
-      imageCatalogGroupId: identity.groupId,
+      targetGroupId: undefined,
+      __targetWorkerGroupId: targetGroupId,
+      imageCatalogGroupIds: usableImageGroups,
     });
     const worker = created.result as { id?: string } | undefined;
     if (!created.handled || !worker?.id)
@@ -1066,9 +1204,14 @@ export class ManagementMcpStore {
     try {
       await addWorkerToGroupWithNetworks(
         identity.ownerId,
-        identity.groupId,
+        targetGroupId,
         worker.id,
         args.lockPasswords,
+        () => {
+          const liveHierarchy = new WorkerGroupHierarchy(useWorkerGroupStore());
+          if (!liveHierarchy.canAdminister(identity.ownerId!, identity.groupId!, targetGroupId))
+            throw groupResourceNotFound();
+        },
       );
       return worker;
     } catch (error) {
@@ -1092,33 +1235,88 @@ export class ManagementMcpStore {
     identity: IdentityMetadata,
     name: string,
     args: Record<string, unknown>,
-  ) {
+    serialized = false,
+  ): Promise<any> {
     if (!identity.ownerId || !identity.groupId) throw groupResourceNotFound();
-    const liveGroup = useWorkerGroupStore().findById(identity.groupId);
+    const mutations = new Set([
+      "images.create", "images.update", "images.delete", "images.delete-version",
+      "images.build", "images.build-cancel", "images.promote", "images.rollback",
+    ]);
+    if (!serialized && mutations.has(name))
+      return withGroupImageMutationBoundary(identity.ownerId, () =>
+        this.executeGroupImageTool(identity, name, args, true));
+    const groups = useWorkerGroupStore();
+    const liveGroup = groups.findById(identity.groupId);
     if (!liveGroup || liveGroup.userId !== identity.ownerId)
       throw groupResourceNotFound();
     const catalog = useImageCatalogManager();
     await catalog.init();
     const ownerId = identity.ownerId;
-    const groupId = identity.groupId;
+    const hierarchy = new WorkerGroupHierarchy(groups);
+    const manageableIds = new Set(hierarchy.descendants(ownerId, identity.groupId, true).map((group) => group.id));
+    const ancestorIds = hierarchy.ancestors(ownerId, identity.groupId).map((group) => group.id);
+    const groupId = typeof args.targetGroupId === "string" ? args.targetGroupId : identity.groupId;
+    if (!manageableIds.has(groupId)) throw groupResourceNotFound();
     const definitionId = String(args.definitionId || "");
     const buildId = String(args.buildId || "");
-    if (name === "images.list") return catalog.listForGroup(ownerId, groupId);
+    if (name === "images.list")
+      return catalog
+        .listForGroupHierarchy(ownerId, [...ancestorIds, ...manageableIds], manageableIds)
+        .map((definition) => ({
+          ...definition,
+          access: {
+            ...definition.access,
+            owningGroupPath: definition.groupId
+              ? hierarchy
+                  .ancestors(ownerId, definition.groupId, true)
+                  .reverse()
+                  .map((group) => ({ id: group.id, name: group.name }))
+              : [],
+          },
+        }));
     if (name === "images.validate") return catalog.validate(args.definition);
     if (name === "images.create")
       return catalog.createForGroup(ownerId, groupId, args.definition);
-    if (name === "images.get")
-      return catalog.definitionForGroup(definitionId, ownerId, groupId);
-    if (name === "images.update")
-      return catalog.updateForGroup(definitionId, ownerId, groupId, args.definition);
+    const visibleIds = new Set([...ancestorIds, ...manageableIds]);
+    const readableDefinition = () => {
+      const definition = catalog.list(ownerId, true).find((item) =>
+        item.id === definitionId && item.ownerId === ownerId &&
+        (!item.groupId || visibleIds.has(item.groupId)));
+      if (!definition) throw groupResourceNotFound();
+      return definition;
+    };
+    const manageableDefinition = () => {
+      const definition = readableDefinition();
+      if (!definition.groupId || !manageableIds.has(definition.groupId)) throw groupResourceNotFound();
+      return definition;
+    };
+    if (name === "images.get") {
+      const visible = catalog.listForGroupHierarchy(ownerId, [...ancestorIds, ...manageableIds], manageableIds);
+      const definition = visible.find((item) => item.id === definitionId);
+      if (!definition) throw groupResourceNotFound();
+      return {
+        ...definition,
+        access: {
+          ...definition.access,
+          owningGroupPath: definition.groupId
+            ? hierarchy.ancestors(ownerId, definition.groupId, true).reverse().map((group) => ({ id: group.id, name: group.name }))
+            : [],
+        },
+      };
+    }
+    if (name === "images.update") {
+      const definition = manageableDefinition();
+      return catalog.updateForGroup(definitionId, ownerId, definition.groupId!, args.definition);
+    }
     if (["images.build-status", "images.build-logs", "images.build-cancel"].includes(name)) {
-      catalog.buildForGroup(buildId, ownerId, groupId);
+      const build = catalog.build(buildId, ownerId, true);
+      if (!build.groupId || !manageableIds.has(build.groupId)) throw groupResourceNotFound();
       if (name === "images.build-status") return catalog.publicBuild(buildId, ownerId, true);
       if (name === "images.build-logs")
         return { logs: catalog.logs(buildId, ownerId, true, Number(args.after || 0)) };
       return catalog.cancelBuild(buildId, ownerId, true);
     }
-    catalog.definitionForGroup(definitionId, ownerId, groupId);
+    manageableDefinition();
     if (name === "images.build")
       return catalog.startBuild(definitionId, ownerId, true, {
         builder: args.builder === "fake" ? "fake" : "controlled",
@@ -1152,7 +1350,8 @@ export class ManagementMcpStore {
         .filter((worker) => worker.userId === identity.ownerId)
         .map((worker) => worker.id),
     );
-    return new Set(group.workerIds.filter((id) => owned.has(id)));
+    const hierarchy = new WorkerGroupHierarchy(useWorkerGroupStore());
+    return new Set(hierarchy.subtreeWorkerIds(identity.ownerId!, group.id).filter((id) => owned.has(id)));
   }
   private groupWorkers(identity: IdentityMetadata) {
     const ids = this.groupWorkerIds(identity);
@@ -1179,6 +1378,45 @@ export class ManagementMcpStore {
     )
       throw groupResourceNotFound();
     const ids = this.groupWorkerIds(identity);
+    if (name === "groups.create") {
+      const parentId = typeof args.parentId === "string" ? args.parentId : "";
+      const hierarchy = new WorkerGroupHierarchy(useWorkerGroupStore());
+      if (!hierarchy.canAdminister(identity.ownerId!, identity.groupId!, parentId)) throw groupResourceNotFound();
+      return;
+    }
+    if (GROUP_ADMIN_GROUP_TOOLS.has(name)) {
+      const targetId = String(args.groupId || "");
+      const hierarchy = new WorkerGroupHierarchy(useWorkerGroupStore());
+      if (!hierarchy.canAdminister(identity.ownerId!, identity.groupId!, targetId)) throw groupResourceNotFound();
+      if (name === "groups.delete" && targetId === identity.groupId) throw groupResourceNotFound();
+      // Direct membership replacement is an owner-wide primitive: accepting
+      // arbitrary same-owner IDs here would let a subtree principal enroll a
+      // sibling/ungrouped worker and thereby grant itself access. Group
+      // principals must use groups.assign-worker, whose source and target are
+      // both scope checked.
+      if (name === "groups.update" && args.workerIds !== undefined) throw groupResourceNotFound();
+      if (args.parentId !== undefined && (targetId === identity.groupId || typeof args.parentId !== "string" || !hierarchy.canAdminister(identity.ownerId!, identity.groupId!, args.parentId))) throw groupResourceNotFound();
+      return;
+    }
+    if (GROUP_ADMIN_ASSIGN_TOOLS.has(name)) {
+      const hierarchy = new WorkerGroupHierarchy(useWorkerGroupStore());
+      if (!ids.has(String(args.workerId || "")) || typeof args.targetGroupId !== "string" || !hierarchy.canAdminister(identity.ownerId!, identity.groupId!, args.targetGroupId)) throw groupResourceNotFound();
+      return;
+    }
+    if (name === "networks.create") {
+      const targetGroupId = typeof args.groupId === "string" ? args.groupId : "";
+      const hierarchy = new WorkerGroupHierarchy(useWorkerGroupStore());
+      if (args.scope !== "group" || !hierarchy.canAdminister(identity.ownerId!, identity.groupId!, targetGroupId)) throw groupResourceNotFound();
+      return;
+    }
+    if (GROUP_ADMIN_NETWORK_TOOLS.has(name)) {
+      const network = useManagedNetworkStore().findById(String(args.networkId || ""));
+      const hierarchy = new WorkerGroupHierarchy(useWorkerGroupStore());
+      if (!network || network.userId !== identity.ownerId || network.scope !== "group" || !network.groupId || !hierarchy.canAdminister(identity.ownerId!, identity.groupId!, network.groupId)) throw groupResourceNotFound();
+      if (args.scope !== undefined && args.scope !== "group") throw groupResourceNotFound();
+      if (typeof args.groupId === "string" && !hierarchy.canAdminister(identity.ownerId!, identity.groupId!, args.groupId)) throw groupResourceNotFound();
+      return;
+    }
     if (name === "workers.create" || GROUP_ADMIN_TARGET_FREE_TOOLS.has(name))
       return;
     if (GROUP_ADMIN_EXPORT_JOB_TOOLS.has(name)) {
@@ -1286,6 +1524,12 @@ function statusError(statusCode: number, message: string) {
 function groupResourceNotFound() {
   return statusError(404, "Resource not found");
 }
+/** Shares the owner hierarchy-mutation queue so a group image operation can
+ * rebuild and authorize its live subtree only after earlier reparenting has
+ * settled. Exported for deterministic queue-boundary regression coverage. */
+export function withGroupImageMutationBoundary<T>(ownerId:string,operation:()=>Promise<T>):Promise<T>{
+  return withWorkerNetworkMutation(ownerId,operation);
+}
 function groupWorkerCreateInputSchema() {
   return {
     type: "object",
@@ -1295,6 +1539,15 @@ function groupWorkerCreateInputSchema() {
       environmentId: { type: "string" },
       imageDefinitionId: { type: "string" },
       imageVersion: { type: "string" },
+      targetGroupId: { type: "string", description: "This administrative group or one of its descendants. Defaults to this group." },
+      excludedGlobalEnvVarKeys: { type:"array",items:{type:"string"},description:"Names-only account variable exclusions." },
+      excludedGroupEnvVarKeys: { type:"array",items:{type:"string"},description:"Names-only effective group variable exclusions." },
+      timeoutSeconds: {
+        type: "integer",
+        minimum: 1,
+        maximum: 120,
+        description: "Server-side fail-fast deadline in seconds (default 30; 1-120). Returns a structured 504 MCP error when exceeded; safe enrollment or rollback continues serialized in the background.",
+      },
       lockPasswords: {
         type: "object",
         additionalProperties: { type: "string", writeOnly: true },
@@ -1332,10 +1585,65 @@ function groupImageInputSchema(name: string): Record<string, unknown> {
   if (schema.properties) {
     delete schema.properties.ownerId;
     delete schema.properties.system;
+    if (name === "images.create")
+      schema.properties.targetGroupId = {
+        type: "string",
+        description: "The group that will own this image: this administrative group or one of its descendants. Defaults to this group.",
+      };
   }
   schema.description =
-    "This operation is restricted to the calling administrative workspace's private worker-group image catalog. Global and other-group definitions are never addressable.";
+    "This operation is scoped by the calling administrative workspace. Global and ancestor images are readable/use-only; images owned by this group or descendants are manageable. Sibling and unrelated definitions are never addressable.";
   return schema;
+}
+function groupNetworkInputSchema(name: string): Record<string, unknown> {
+  const source = platformDomain.tools().find((tool) => tool.name === name)?.inputSchema as any;
+  const schema = structuredClone(source || { type: "object", properties: {} });
+  schema.required = (schema.required || []).filter((key: string) => key !== "ownerId");
+  if (schema.properties) delete schema.properties.ownerId;
+  schema.description = groupNetworkDescription(name);
+  return schema;
+}
+function groupNetworkDescription(name: string): string {
+  const action = name === "networks.list" ? "List"
+    : name === "networks.inspect" ? "Inspect"
+    : name === "networks.create" ? "Create"
+    : name === "networks.update" ? "Update"
+    : name === "networks.reconcile" ? "Reconcile"
+    : name === "networks.delete" ? "Delete"
+    : "Manage";
+  return `${action} only group-scoped managed networks belonging to the bound administrative group or a live descendant.`;
+}
+function groupStructuralInputSchema(name: string): Record<string, unknown> {
+  const source = workerDomain.tools().find((tool) => tool.name === name)?.inputSchema as any;
+  const schema = structuredClone(source || { type: "object", properties: {} });
+  schema.required = (schema.required || []).filter((key: string) => key !== "userId");
+  if (schema.properties) delete schema.properties.userId;
+  if (name === "groups.update" && schema.properties)
+    delete schema.properties.workerIds;
+  if (name === "groups.assign-worker") {
+    schema.required = ["workerId", "targetGroupId"];
+    schema.properties.targetGroupId = { type: "string", description: "This administrative group or a descendant; group admins cannot ungroup workers." };
+  }
+  schema.description = groupStructuralDescription(name);
+  return schema;
+}
+function groupStructuralDescription(name: string): string {
+  const descriptions: Record<string, string> = {
+    "groups.list": "List only the bound administrative group and its live descendants.",
+    "groups.create": "Create a child group beneath the bound administrative group or one of its live descendants. parentId defaults to the bound group.",
+    "groups.update": "Rename an authorized group or reparent a descendant within the authorized subtree. Direct membership replacement is intentionally unavailable; use groups.assign-worker. The bound administrative group itself cannot be moved.",
+    "groups.delete": "Delete an empty descendant group. The bound administrative group itself cannot be deleted.",
+    "groups.assign-worker": "Move a worker already inside the authorized subtree into the bound administrative group or one of its descendants. Group administrators cannot import outside workers or leave workers ungrouped.",
+    "groups.env.list": "List names-only own, inherited, excluded, and effective environment keys for the bound administrative group or a descendant. Values are never returned.",
+    "groups.env.update": "Manage write-only variables and inherited-key exclusions for the bound administrative group or a descendant. Values are never returned or written to audit output.",
+    "groups.admin-workspace.get": "Get and reconcile an existing administrative workspace for the bound group or a descendant.",
+    "groups.admin-workspace.provision": "Provision or return the administrative workspace for the bound group or a descendant.",
+    "groups.admin-workspace.start": "Provision if needed, then start the administrative workspace for the bound group or a descendant.",
+    "groups.admin-workspace.stop": "Provision if needed, then stop the administrative workspace for the bound group or a descendant without deleting its data.",
+    "groups.admin-workspace.rebuild": "Provision if needed, then rebuild and start the administrative workspace for the bound group or a descendant while retaining its data and group binding.",
+  };
+  return descriptions[name] ||
+    "Restricted to the bound administrative group and its live descendant subtree.";
 }
 function validateToolArguments(name: string, args: Record<string, unknown>) {
   const definitions = [
@@ -1359,7 +1667,10 @@ function validateToolArguments(name: string, args: Record<string, unknown>) {
     : [];
   for (const key of required) {
     const value = args[key];
-    if (value === undefined || value === null || value === "")
+    const declaredType = (schema as any)?.properties?.[key]?.type;
+    const permitsNull = declaredType === "null" ||
+      (Array.isArray(declaredType) && declaredType.includes("null"));
+    if (value === undefined || (value === null && !permitsNull) || value === "")
       throw statusError(400, `${name}: ${key} is required`);
   }
 }

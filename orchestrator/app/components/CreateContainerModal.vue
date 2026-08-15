@@ -56,6 +56,7 @@ const form = reactive({
   initScript: '',
 });
 const workerConfiguration = ref<CreateContainerRequest['workerConfiguration']>({ variables: [], secrets: [], secretFiles: [] });
+const excludedGlobalEnvVarKeys = ref<string[]>([]);
 
 const { initScripts } = useInitScripts();
 
@@ -164,6 +165,7 @@ function submit() {
     displayName: customName || generatedName.value,
   };
   if (form.environmentId) request.environmentId = form.environmentId;
+  request.excludedGlobalEnvVarKeys = [...excludedGlobalEnvVarKeys.value];
   const validRepos = form.repos.filter((r) => r.url);
   if (validRepos.length > 0) {
     request.repos = validRepos.map((r) => ({
@@ -196,6 +198,7 @@ function reset() {
   repoRowIds.clear();
   rowCounter = 0;
   workerConfiguration.value = { variables: [], secrets: [], secretFiles: [] };
+  excludedGlobalEnvVarKeys.value = [];
 }
 </script>
 
@@ -226,6 +229,8 @@ function reset() {
             </UButton>
           </div>
         </UFormField>
+
+        <AccountEnvInheritancePicker v-model:excluded-keys="excludedGlobalEnvVarKeys" />
 
         <details class="rounded-md border border-gray-200 dark:border-gray-700 p-3">
           <summary class="cursor-pointer text-sm font-medium">Worker-local variables and secrets</summary>

@@ -15,7 +15,7 @@ const selected = ref(""),
   actionError = ref(""),
   rebuildBase = ref("agentor-worker:approved-latest");
 const git = reactive({ repository: "", visibility: "private" as "public" | "private", authType: "pat" as "none" | "pat" | "github-app", token: "", appId: "", installationId: "", workflow: "pull-request" as "direct" | "branch" | "pull-request", buildMode: "local" as "local" | "github-actions", publishGhcr: false });
-watch(open, (shown) => (shown ? api.refresh() : api.stop()));
+watch(open, (shown) => (shown ? api.start() : api.stop()));
 onBeforeUnmount(api.stop);
 const current = computed(
   () =>
@@ -23,6 +23,9 @@ const current = computed(
     api.definitions.value[0],
 );
 async function run(key: string, fn: () => Promise<any>) {
+  // Vue updates the loading state on the next render. Guard synchronously as
+  // well so a double-click cannot enqueue two builds before the button disables.
+  if (busy.value) return;
   busy.value = key;
   actionError.value = "";
   try {
@@ -77,8 +80,20 @@ async function connectGit() {
 const fmt = (n: number) => formatBytes(n);
 function catalogScope(groupId?: string) {
   if (!groupId) return "Global catalog";
-  const group = workerGroups.value.find((item) => item.id === groupId);
-  return group ? `Worker group: ${group.name}` : `Worker group: ${groupId}`;
+  const byId = new Map(workerGroups.value.map((item) => [item.id, item]));
+  const group = byId.get(groupId);
+  if (!group) return `Worker group: ${groupId}`;
+  const path = [group.name];
+  const seen = new Set([group.id]);
+  let parentId = group.parentId;
+  while (parentId && !seen.has(parentId)) {
+    seen.add(parentId);
+    const parent = byId.get(parentId);
+    if (!parent) break;
+    path.unshift(parent.name);
+    parentId = parent.parentId;
+  }
+  return `Worker group: ${path.join(" / ")}`;
 }
 function close() { open.value = false; }
 </script>
@@ -202,6 +217,7 @@ function close() { open.value = false; }
                 </div>
                 <div>
                   <UButton
+                    type="button"
                     size="xs"
                     :loading="busy === d.id"
                     @click="run(d.id, () => api.startBuild(d.id))"

@@ -38,6 +38,8 @@ const form = reactive({
   repos: [] as RepoConfig[],
   mounts: [] as MountConfig[],
   initScript: '',
+  excludedGlobalEnvVarKeys: [] as string[],
+  excludedGroupEnvVarKeys: [] as string[],
 });
 
 const { selectedPreset, presetOptions } = useInitScriptSync(initScripts, toRef(form, 'initScript'));
@@ -51,6 +53,8 @@ function resetFormFromContainer() {
   form.repos = (props.container.repos || []).map((r) => ({ ...r }));
   form.mounts = (props.container.mounts || []).map((m) => ({ ...m }));
   form.initScript = props.container.initScript || '';
+  form.excludedGlobalEnvVarKeys = [...(props.container.excludedGlobalEnvVarKeys || [])];
+  form.excludedGroupEnvVarKeys = [...(props.container.excludedGroupEnvVarKeys || [])];
 }
 
 function addRepo() {
@@ -82,7 +86,9 @@ const envDirty = computed(() => form.environmentId !== (props.container.environm
 const initDirty = computed(() => (form.initScript.trim() || '') !== (props.container.initScript || ''));
 const reposDirty = computed(() => normRepos(form.repos) !== normRepos(props.container.repos));
 const mountsDirty = computed(() => normMounts(form.mounts) !== normMounts(props.container.mounts));
-const rebuildDirty = computed(() => envDirty.value || initDirty.value || reposDirty.value || mountsDirty.value);
+const inheritedEnvDirty = computed(() => JSON.stringify([...form.excludedGlobalEnvVarKeys].sort()) !== JSON.stringify([...(props.container.excludedGlobalEnvVarKeys || [])].sort()));
+const groupEnvDirty = computed(() => JSON.stringify([...form.excludedGroupEnvVarKeys].sort()) !== JSON.stringify([...(props.container.excludedGroupEnvVarKeys || [])].sort()));
+const rebuildDirty = computed(() => envDirty.value || initDirty.value || reposDirty.value || mountsDirty.value || inheritedEnvDirty.value || groupEnvDirty.value);
 const anyDirty = computed(() => liveDirty.value || rebuildDirty.value);
 
 const nameValid = computed(() => {
@@ -105,6 +111,8 @@ function buildPatch(): UpdateContainerSettingsRequest {
     mounts: form.mounts
       .filter((m) => m.source && m.target)
       .map((m) => ({ source: m.source, target: m.target, ...(m.readOnly ? { readOnly: true } : {}) })),
+    excludedGlobalEnvVarKeys: [...form.excludedGlobalEnvVarKeys],
+    excludedGroupEnvVarKeys: [...form.excludedGroupEnvVarKeys],
     ...(protection.value.protected && lockCurrentPassword.value ? { lockPassword: lockCurrentPassword.value } : {}),
   } as UpdateContainerSettingsRequest;
 }
@@ -290,6 +298,9 @@ const formattedCreatedAt = computed(() => {
               </div>
               <USelect v-model="form.environmentId" :items="environmentOptions" class="w-full" />
             </div>
+
+            <!-- Repositories (rebuild) -->
+            <AccountEnvInheritancePicker v-model:excluded-keys="form.excludedGlobalEnvVarKeys" v-model:excluded-group-keys="form.excludedGroupEnvVarKeys" :worker-id="container.id" />
 
             <!-- Repositories (rebuild) -->
             <div>

@@ -61,6 +61,7 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     const delegatedGroups = [
       "worker-lifecycle", "configuration", "console", "exports", "backups",
       "locks", "apps", "running-files", "networking", "storage", "images", "image-builds",
+      "groups",
     ];
     const enabled: Record<string, boolean> = {};
     for (const name of delegatedGroups) {
@@ -83,17 +84,23 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
       await ownerRequest.delete(`/api/image-catalog/definitions/${globalImageId}`).catch(() => {});
     if (Object.keys(previousDelegatedPolicy).length)
       await request.put("/api/admin/management-mcp/policy", { data: { groups: previousDelegatedPolicy } }).catch(() => {});
-    if (groupId) await ownerRequest.delete(`/api/worker-groups/${groupId}`).catch(() => {});
+    if (groupId)
+      await ownerRequest.patch(`/api/worker-groups/${groupId}`, { data: { workerIds: [] } }).catch(() => {});
     for (const workerId of [memberId, addedMemberId, outsiderId, createdByGroupId, groupImageWorkerId]) {
       if (workerId) await cleanupWorker(ownerRequest, workerId).catch(() => {});
     }
+    // Group deletion removes its two private administrative networks. It must
+    // run after worker cleanup because non-empty groups deliberately reject
+    // deletion; doing it first leaked networks across Playwright retries and
+    // could exhaust Docker's subnet allocator.
+    if (groupId) await ownerRequest.delete(`/api/worker-groups/${groupId}`).catch(() => {});
     await ownerRequest?.dispose();
     if (owner) await deleteTestUser(owner.id).catch(() => {});
   });
 
   test("provisions one persistent group-admin workspace and keeps its lifecycle group-bound", { timeout: 180_000 }, async ({ request }) => {
     const first = await ownerRequest.post(`/api/worker-groups/${groupId}/admin-workspace`, { data: {} });
-    expect([200, 201]).toContain(first.status());
+    expect([200, 201], await first.text()).toContain(first.status());
     const workspace = await first.json();
     workspaceId = workspace.id;
     expect(workspace).toMatchObject({ id: expect.any(String), groupId, userId: owner.id });
@@ -172,7 +179,8 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     const discoveredTools = await discovery.json() as Array<{ name: string; description: string; inputSchema: { required?: string[]; properties?: Record<string, unknown> } }>;
     const toolNames=discoveredTools.map((tool)=>tool.name);
     expect(toolNames).toContain("workers.inspect");
-    expect(toolNames).not.toContain("groups.update");
+    expect(toolNames).toEqual(expect.arrayContaining(["workers.env-keys", "groups.env.list", "groups.env.update"]));
+    expect(toolNames).toEqual(expect.arrayContaining(["groups.list", "groups.create", "groups.update", "groups.delete", "groups.assign-worker"]));
     expect(toolNames).toContain("workers.create");
     expect(toolNames).not.toContain("port-mappings.list");
     expect(toolNames).toEqual(expect.arrayContaining(["workspaces.list", "workspaces.files", "workspaces.preview", "workspaces.download"]));
@@ -182,12 +190,36 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
       "images.build-logs", "images.build-cancel", "images.promote", "images.rollback",
     ]));
     for (const tool of discoveredTools.filter((item) => item.name.startsWith("images."))) {
-      expect(tool.description).toContain("private image catalog");
+      expect(tool.description).toContain("authorized image hierarchy");
       expect(tool.inputSchema.required || []).not.toContain("ownerId");
       expect(tool.inputSchema.properties || {}).not.toHaveProperty("ownerId");
       expect(tool.inputSchema.properties || {}).not.toHaveProperty("groupId");
+      if (tool.name === "images.create")
+        expect(tool.inputSchema.properties || {}).toHaveProperty("targetGroupId");
+      else
+        expect(tool.inputSchema.properties || {}).not.toHaveProperty("targetGroupId");
     }
-    for (const unavailable of ["workspaces.clone", "imports.prepare", "images.default", "images.git-sync", "networks.create"])
+    const schemas = new Map(discoveredTools.map((tool) => [tool.name, tool.inputSchema]));
+    expect((schemas.get("workers.create")?.properties as any)?.timeoutSeconds).toMatchObject({
+      type: "integer", minimum: 1, maximum: 120,
+    });
+    expect(discoveredTools.find((tool) => tool.name === "workers.create")?.description).toContain("timeoutSeconds");
+    expect(Object.keys(schemas.get("networks.list")?.properties || {})).toEqual([]);
+    expect(Object.keys(schemas.get("networks.inspect")?.properties || {})).toEqual(["networkId"]);
+    expect(Object.keys(schemas.get("networks.reconcile")?.properties || {}).sort()).toEqual(["lockPasswords", "networkId"]);
+    expect(Object.keys(schemas.get("networks.delete")?.properties || {}).sort()).toEqual(["lockPasswords", "networkId"]);
+    expect(Object.keys(schemas.get("networks.create")?.properties || {}).sort()).toEqual(["groupId", "lockPasswords", "name", "scope", "workerIds"]);
+    for (const name of toolNames.filter((candidate) => candidate.startsWith("networks.")))
+      expect(discoveredTools.find((tool) => tool.name === name)?.description).toContain("bound administrative group");
+    expect(Object.keys(schemas.get("groups.update")?.properties || {})).not.toContain("workerIds");
+    expect(schemas.get("groups.assign-worker")).toMatchObject({ required: ["workerId", "targetGroupId"] });
+    expect((schemas.get("groups.env.update")?.properties as any)?.entries?.items?.properties?.value).toMatchObject({ writeOnly: true });
+    for (const name of toolNames.filter((candidate) => candidate.startsWith("groups."))) {
+      const description = discoveredTools.find((tool) => tool.name === name)?.description || "";
+      expect(description).toContain("bound");
+      expect(description).not.toContain("explicit owner");
+    }
+    for (const unavailable of ["workspaces.clone", "imports.prepare", "images.default", "images.git-sync"])
       expect(toolNames).not.toContain(unavailable);
     const listed = await invoke(request, credential, "workers.list");
     expect(listed.status()).toBe(200);
@@ -202,6 +234,15 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     expect(denied.status()).toBe(404);
     expect(unknown.status()).toBe(404);
     expect(await denied.json()).toEqual(await unknown.json());
+    const names = await invoke(request, credential, "workers.env-keys", { workerId: memberId });
+    expect(names.status()).toBe(200);
+    const namesBody = await names.json();
+    expect(namesBody).toMatchObject({ predefinedKeys: expect.any(Array), customKeys: expect.any(Array), keys: expect.any(Array), groupKeys: expect.any(Array) });
+    expect(JSON.stringify(namesBody)).not.toContain('"value"');
+    const deniedNames = await invoke(request, credential, "workers.env-keys", { workerId: outsiderId });
+    const unknownNames = await invoke(request, credential, "workers.env-keys", { workerId: randomUUID() });
+    expect(deniedNames.status()).toBe(404);
+    expect(await deniedNames.json()).toEqual(await unknownNames.json());
 
     const outsiderExport = await ownerRequest.post(`/api/containers/${outsiderId}/export-jobs`, {
       data: { includeRootfs: false },
@@ -286,6 +327,27 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     expect(deniedBridge).not.toContain(outsiderId);
   });
 
+  test("group environment values are write-only and audit-safe", async ({ request }) => {
+    await issueCredential(request);
+    const secret = `must-not-leak-${randomUUID()}`;
+    const updated = await invoke(request, credential, "groups.env.update", {
+      groupId,
+      entries: [{ key: "GROUP_MCP_SECRET", value: secret }],
+    });
+    expect(updated.status()).toBe(200);
+    const body = await updated.json();
+    expect(body.ownKeys).toContain("GROUP_MCP_SECRET");
+    expect(JSON.stringify(body)).not.toContain(secret);
+    expect(JSON.stringify(body)).not.toContain('"value"');
+    const listed = await invoke(request, credential, "groups.env.list", { groupId });
+    expect(listed.status()).toBe(200);
+    expect(JSON.stringify(await listed.json())).not.toContain(secret);
+    const audit = await request.get("/api/admin/management-mcp/audit?limit=25");
+    expect(audit.status()).toBe(200);
+    expect(await audit.text()).not.toContain(secret);
+    expect((await invoke(request, credential, "groups.env.update", { groupId, deleteKeys: ["GROUP_MCP_SECRET"] })).status()).toBe(200);
+  });
+
   test("manages a private group image catalog without exposing the owner catalog", async ({ request }) => {
     await issueCredential(request);
     const definition = {
@@ -307,11 +369,15 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     globalImageId = (await globalCreated.json()).id;
 
     const listed = await invoke(request, credential, "images.list");
-    expect((await listed.json()).map((item: { id: string }) => item.id)).toEqual([groupImageId]);
+    const listedImages = await listed.json();
+    expect(listedImages.map((item: { id: string }) => item.id)).toEqual(expect.arrayContaining([groupImageId, globalImageId]));
+    expect(listedImages.find((item: { id: string }) => item.id === groupImageId).access).toMatchObject({ manageable: true, owningGroupId: groupId });
+    expect(listedImages.find((item: { id: string }) => item.id === globalImageId).access).toMatchObject({ manageable: false, usable: true });
     expect((await invoke(request, credential, "images.list", { ownerId: owner.id })).status()).toBe(404);
     expect((await invoke(request, credential, "images.list", { groupId })).status()).toBe(404);
     expect((await invoke(request, credential, "images.get", { definitionId: groupImageId })).status()).toBe(200);
-    const denied = await invoke(request, credential, "images.get", { definitionId: globalImageId });
+    expect((await invoke(request, credential, "images.get", { definitionId: globalImageId })).status()).toBe(200);
+    const denied = await invoke(request, credential, "images.update", { definitionId: globalImageId, definition });
     const unknown = await invoke(request, credential, "images.get", { definitionId: randomUUID() });
     expect(denied.status()).toBe(404);
     expect(await denied.json()).toEqual(await unknown.json());
@@ -360,6 +426,29 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     expect((await invoke(request, credential, "workers.inspect", { workerId: addedMemberId })).status()).toBe(200);
   });
 
+  test("cannot use group replacement to enroll workers outside its subtree", async ({ request }) => {
+    await issueCredential(request);
+    const beforeResponse = await ownerRequest.get(`/api/worker-groups/${groupId}`);
+    expect(beforeResponse.status()).toBe(200);
+    const before = await beforeResponse.json();
+
+    const siblingAttempt = await invoke(request, credential, "groups.update", {
+      groupId,
+      workerIds: [...before.workerIds, outsiderId],
+    });
+    const randomAttempt = await invoke(request, credential, "groups.update", {
+      groupId,
+      workerIds: [...before.workerIds, randomUUID()],
+    });
+    expect(siblingAttempt.status()).toBe(404);
+    expect(randomAttempt.status()).toBe(404);
+    expect(await siblingAttempt.json()).toEqual(await randomAttempt.json());
+
+    const after = await (await ownerRequest.get(`/api/worker-groups/${groupId}`)).json();
+    expect(after.workerIds).toEqual(before.workerIds);
+    expect(after.workerIds).not.toContain(outsiderId);
+  });
+
   test("prepared private downloads recheck live group membership", async ({ request }) => {
     await issueCredential(request);
     const listed = await invoke(request, credential, "workspaces.list");
@@ -391,14 +480,36 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
 
   test("creates evaluation workers directly into the bound group and manages only there", { timeout: 180_000 }, async ({ request }) => {
     await issueCredential(request);
+    const inheritedSecret = `initial-group-secret-${randomUUID()}`;
+    expect((await invoke(request, credential, "groups.env.update", {
+      groupId,
+      entries: [
+        { key: "GROUP_INITIAL_VISIBLE", value: inheritedSecret },
+        { key: "GROUP_INITIAL_BLOCKED", value: "must-not-be-injected" },
+      ],
+    })).status()).toBe(200);
+    expect((await invoke(request, credential, "workers.create", {
+      displayName: "invalid-group-exclusion",
+      excludedGroupEnvVarKeys: ["UNKNOWN_GROUP_KEY"],
+    })).status()).toBe(400);
     const displayName = `group-created-evaluation-${Date.now()}`;
-    const created = await invoke(request, credential, "workers.create", { displayName });
+    const created = await invoke(request, credential, "workers.create", {
+      displayName,
+      excludedGroupEnvVarKeys: ["GROUP_INITIAL_BLOCKED"],
+    });
     expect(created.status()).toBe(200);
     const worker = await created.json();
     createdByGroupId = worker.id;
     expect(worker).toMatchObject({ id: expect.any(String), userId: owner.id });
     const group = await (await ownerRequest.get(`/api/worker-groups/${groupId}`)).json();
     expect(group.workerIds).toContain(createdByGroupId);
+    await waitForWorkerRunning(ownerRequest, createdByGroupId, 90_000);
+    const inheritedEnvironment = await captureCommandOutput(
+      createdByGroupId,
+      `printf 'visible=%s\\nblocked=%s' "$GROUP_INITIAL_VISIBLE" "${"${GROUP_INITIAL_BLOCKED+present}"}"`,
+      60_000,
+    );
+    expect(inheritedEnvironment).toBe(`visible=${inheritedSecret}\nblocked=`);
     expect((await invoke(request, credential, "workers.inspect", { workerId: createdByGroupId })).status()).toBe(200);
     const renamed = `${displayName}-managed`;
     expect((await invoke(request, credential, "workers.update", { workerId: createdByGroupId, displayName: renamed })).status()).toBe(200);
@@ -417,5 +528,9 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     expect(workerFromImage.status()).toBe(200);
     groupImageWorkerId = (await workerFromImage.json()).id;
     expect((await (await ownerRequest.get(`/api/worker-groups/${groupId}`)).json()).workerIds).toContain(groupImageWorkerId);
+    expect((await invoke(request, credential, "groups.env.update", {
+      groupId,
+      deleteKeys: ["GROUP_INITIAL_VISIBLE", "GROUP_INITIAL_BLOCKED"],
+    })).status()).toBe(200);
   });
 });

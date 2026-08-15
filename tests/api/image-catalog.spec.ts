@@ -243,6 +243,9 @@ test.describe.serial("Custom worker image builder and catalog", () => {
 
     const build = await waitForBuild(ownerCtx, created.id);
     expect(build.status).toBe("succeeded");
+    const recentBuilds = await ownerCtx.get("/api/image-builds");
+    expect(recentBuilds.status()).toBe(200);
+    expect((await recentBuilds.json()).filter((item: any) => item.id === created.id)).toHaveLength(1);
     expect(build.observedPhases).toEqual(
       expect.arrayContaining(["validating", "building"]),
     );
@@ -364,6 +367,15 @@ test.describe.serial("Custom worker image builder and catalog", () => {
       (await controlledStart.json()).id,
     );
     expect(controlled.status).toBe("succeeded");
+    expect(controlled.baseDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    const pinnedDefinition = await (
+      await ownerCtx.get(`/api/image-catalog/definitions/${runnableDefinition.id}`)
+    ).json();
+    expect(pinnedDefinition.baseImage).toBe("agentor-worker:approved-default");
+    expect(pinnedDefinition.versions[0]).toMatchObject({
+      baseImage: "agentor-worker:approved-default",
+      baseDigest: controlled.baseDigest,
+    });
     const testWorker = await ownerCtx.post(
       `/api/image-catalog/definitions/${runnableDefinition.id}/versions/${controlled.version}/test-worker`,
       { data: { displayName: "image-smoke-test" } },

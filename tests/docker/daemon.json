@@ -2,6 +2,9 @@
     "storage-driver": "overlay2",
     "iptables": true,
     "ip-forward": true,
+    "default-address-pools": [
+        { "base": "10.64.0.0/10", "size": 24 }
+    ],
     "log-driver": "json-file",
     "log-opts": { "max-size": "10m", "max-file": "3" }
 }

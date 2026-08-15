@@ -6,6 +6,10 @@ export interface WorkerGroup {
   userId: string;
   name: string;
   workerIds: string[];
+  /** Direct parent. Missing on legacy records means an owner-scoped root. */
+  parentId?: string;
+  /** Names suppressed from ancestors before this group's own entries apply. */
+  excludedInheritedEnvVarKeys?: string[];
   adminWorkspace?: Record<string, any>;
   createdAt: string;
   updatedAt: string;
@@ -14,13 +18,14 @@ export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
   constructor(dataDir: string) {
     super(dataDir, "worker-groups.json", (group) => group.id);
   }
-  async create(userId: string, name: string): Promise<WorkerGroup> {
+  async create(userId: string, name: string, parentId?: string): Promise<WorkerGroup> {
     const stamp = new Date().toISOString();
     const group = {
       id: randomUUID(),
       userId,
       name: name.trim(),
       workerIds: [],
+      ...(parentId ? { parentId } : {}),
       createdAt: stamp,
       updatedAt: stamp,
     };
@@ -33,6 +38,8 @@ export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
     patch: {
       name?: string;
       workerIds?: string[];
+      parentId?: string | null;
+      excludedInheritedEnvVarKeys?: string[];
       adminWorkspace?: Record<string, any>;
     },
   ): Promise<WorkerGroup> {
@@ -50,6 +57,12 @@ export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
     if (patch.name !== undefined) group.name = patch.name.trim();
     if (patch.workerIds !== undefined)
       group.workerIds = [...new Set(patch.workerIds)];
+    if (patch.parentId !== undefined) {
+      if (patch.parentId === null) delete group.parentId;
+      else group.parentId = patch.parentId;
+    }
+    if (patch.excludedInheritedEnvVarKeys !== undefined)
+      group.excludedInheritedEnvVarKeys = [...new Set(patch.excludedInheritedEnvVarKeys)].sort();
     if (patch.adminWorkspace !== undefined)
       group.adminWorkspace = structuredClone(patch.adminWorkspace);
     await this.swap(userId, id, group);

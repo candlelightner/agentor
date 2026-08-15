@@ -20,6 +20,7 @@ import {
 import { useManagedNetworkManager } from "../../utils/managed-network-manager";
 import { verifyWorkerMutationUnlocks } from "../../utils/worker-protection-lock";
 import { withWorkerNetworkMutation } from "../../utils/worker-group-manager";
+import { WorkerGroupHierarchy } from "../../utils/worker-group-hierarchy";
 export default defineEventHandler(async (e) => {
   const id = getRouterParam(e, "id")!,
     s = useManagedNetworkStore(),
@@ -33,7 +34,7 @@ export default defineEventHandler(async (e) => {
     current.scope === "selected"
       ? current.workerIds
       : current.scope === "group"
-        ? useWorkerGroupStore().get(current.userId, current.groupId!)?.workerIds || []
+        ? new WorkerGroupHierarchy(useWorkerGroupStore()).subtreeWorkerIds(current.userId, current.groupId!)
         : useWorkerStore()
             .listForUser(current.userId)
             .map((w: any) => w.id);

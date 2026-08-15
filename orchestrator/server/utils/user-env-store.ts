@@ -1,6 +1,6 @@
 import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { UserEnvVars, UserEnvVarsInput, UserEnvVar } from '../../shared/types';
+import { PREDEFINED_ENV_VAR_KEYS, type UserEnvVars, type UserEnvVarsInput, type UserEnvVar } from '../../shared/types';
 import { assertSafeUserId, isSafeUserId } from './user-id';
 
 export const USER_ENV_KEY_RE = /^[A-Z_][A-Z0-9_]*$/;
@@ -35,6 +35,7 @@ const RESERVED_KEYS = new Set<string>([
   'PATH',
   'USER',
 ]);
+export function isAllowedUserEnvKey(key:string){return USER_ENV_KEY_RE.test(key)&&!RESERVED_KEYS.has(key);}
 
 export function zeroUserEnvVars(userId: string): UserEnvVars {
   return {
@@ -48,6 +49,19 @@ export function zeroUserEnvVars(userId: string): UserEnvVars {
 /** Look up a single env var's value by name (empty string if unset). */
 export function getUserEnvVar(env: UserEnvVars, key: string): string {
   return env.envVars.find((e) => e.key === key)?.value ?? '';
+}
+
+/** Validate a names-only worker exclusion list. Predefined keys remain legal
+ * even when currently unset; custom keys must exist in the owner's account. */
+export function normalizeExcludedGlobalEnvVarKeys(env: UserEnvVars, value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((key) => typeof key !== 'string'))
+    throw Object.assign(new Error('excludedGlobalEnvVarKeys must be an array of strings'), { statusCode: 400 });
+  const allowed = new Set<string>([...PREDEFINED_ENV_VAR_KEYS, ...env.envVars.map(({ key }) => key)]);
+  const result = [...new Set(value as string[])].sort();
+  const unknown = result.filter((key) => !allowed.has(key));
+  if (unknown.length) throw Object.assign(new Error(`Unknown account environment variable key: ${unknown.join(', ')}`), { statusCode: 400 });
+  return result;
 }
 
 const FILENAME = 'env-vars.json';
