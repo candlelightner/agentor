@@ -2,6 +2,9 @@ import { test, expect, request as playwrightRequest, type APIRequestContext, typ
 import { ApiClient } from '../helpers/api-client';
 import { createWorker, cleanupWorker } from '../helpers/worker-lifecycle';
 import { createTestUser, deleteTestUser, type CreatedUser } from '../helpers/test-users';
+import { captureCommandOutput } from '../helpers/terminal-ws';
+
+const GLOBAL_ADMIN_ROLE_SKILL_SHA256 = 'e502f6e894263e4f7e8369a49c0bd36a564783e59f979a91e326e73494f1ec41';
 
 const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
 const EMPTY_AUTH = { baseURL: BASE_URL, extraHTTPHeaders: { Origin: BASE_URL }, storageState: { cookies: [], origins: [] } };
@@ -95,6 +98,48 @@ test.describe.serial('Persistent administrative workspace', () => {
     const read = await request.get('/api/admin/workspace/diagnostics/read-marker');
     expect(read.status()).toBe(200);
     expect(await read.json()).toMatchObject({ marker });
+  });
+
+  test('platform admin receives only its role skill and reconciles stale roles without deleting user skills', async ({ request }) => {
+    const initial = await captureCommandOutput(adminWorkspaceId, `
+      printf 'CLAUDE_SHA=%s\\n' "$(sha256sum ~/.claude/skills/agentor-global-administration/SKILL.md | cut -d' ' -f1)"
+      printf 'CODEX_SHA=%s\\n' "$(sha256sum ~/.agents/skills/agentor-global-administration/SKILL.md | cut -d' ' -f1)"
+      test ! -e ~/.claude/skills/agentor-group-administration && test ! -e ~/.claude/skills/agentor-worker-runtime && printf 'CLAUDE_ISOLATED=1\\n'
+      test ! -e ~/.agents/skills/agentor-group-administration && test ! -e ~/.agents/skills/agentor-worker-runtime && printf 'CODEX_ISOLATED=1\\n'
+      test ! -e ~/.gemini/commands/agentor-group-administration.toml && test ! -e ~/.gemini/commands/agentor-worker-runtime.toml && printf 'GEMINI_ISOLATED=1\\n'
+    `.trim().replace(/\n\s*/g, '; '));
+    expect(initial).toContain(`CLAUDE_SHA=${GLOBAL_ADMIN_ROLE_SKILL_SHA256}`);
+    expect(initial).toContain(`CODEX_SHA=${GLOBAL_ADMIN_ROLE_SKILL_SHA256}`);
+    expect(initial).toContain('CLAUDE_ISOLATED=1');
+    expect(initial).toContain('CODEX_ISOLATED=1');
+    expect(initial).toContain('GEMINI_ISOLATED=1');
+
+    await captureCommandOutput(adminWorkspaceId, `
+      mkdir -p ~/.claude/skills/agentor-worker-runtime ~/.claude/skills/user-kept
+      mkdir -p ~/.agents/skills/agentor-group-administration ~/.agents/skills/user-kept
+      printf stale > ~/.claude/skills/agentor-worker-runtime/SKILL.md
+      printf stale > ~/.agents/skills/agentor-group-administration/SKILL.md
+      printf keep > ~/.claude/skills/user-kept/SKILL.md
+      printf keep > ~/.agents/skills/user-kept/SKILL.md
+      printf stale > ~/.gemini/commands/agentor-worker-runtime.toml
+    `.trim().replace(/\n\s*/g, '; '));
+    expect((await request.post('/api/admin/workspace/stop', { data: {} })).status()).toBe(200);
+    expect((await request.post('/api/admin/workspace/start', { data: {} })).status()).toBe(200);
+
+    const reconciled = await captureCommandOutput(adminWorkspaceId, `
+      printf 'CLAUDE_SHA=%s\\n' "$(sha256sum ~/.claude/skills/agentor-global-administration/SKILL.md | cut -d' ' -f1)"
+      printf 'CODEX_SHA=%s\\n' "$(sha256sum ~/.agents/skills/agentor-global-administration/SKILL.md | cut -d' ' -f1)"
+      test ! -e ~/.claude/skills/agentor-group-administration && test ! -e ~/.claude/skills/agentor-worker-runtime && printf 'CLAUDE_ISOLATED=1\\n'
+      test ! -e ~/.agents/skills/agentor-group-administration && test ! -e ~/.agents/skills/agentor-worker-runtime && printf 'CODEX_ISOLATED=1\\n'
+      test ! -e ~/.gemini/commands/agentor-group-administration.toml && test ! -e ~/.gemini/commands/agentor-worker-runtime.toml && printf 'GEMINI_ISOLATED=1\\n'
+      printf 'USER_SKILLS=%s\\n' "$(cat ~/.claude/skills/user-kept/SKILL.md ~/.agents/skills/user-kept/SKILL.md)"
+    `.trim().replace(/\n\s*/g, '; '));
+    expect(reconciled).toContain(`CLAUDE_SHA=${GLOBAL_ADMIN_ROLE_SKILL_SHA256}`);
+    expect(reconciled).toContain(`CODEX_SHA=${GLOBAL_ADMIN_ROLE_SKILL_SHA256}`);
+    expect(reconciled).toContain('CLAUDE_ISOLATED=1');
+    expect(reconciled).toContain('CODEX_ISOLATED=1');
+    expect(reconciled).toContain('GEMINI_ISOLATED=1');
+    expect(reconciled).toContain('USER_SKILLS=keepkeep');
   });
 
   test('normal workers never gain administrative trust or management-network attachment', async ({ request }) => {

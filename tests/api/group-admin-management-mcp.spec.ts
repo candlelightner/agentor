@@ -6,6 +6,8 @@ import { createTestUser, deleteTestUser, type CreatedUser } from "../helpers/tes
 import { captureCommandOutput, TerminalWsClient } from "../helpers/terminal-ws";
 import { buildPng } from "../helpers/clipboard";
 
+const GROUP_ADMIN_ROLE_SKILL_SHA256 = "7af4f061b894c3e0eb9ba453fe2cd9c4d371fd87e865b6fe43bf27f4429e1cf4";
+
 /**
  * These tests intentionally use the administrator-only diagnostic transport to
  * exercise the credential that is installed in a group-admin workspace.  The
@@ -116,6 +118,27 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     // record.  A rebuild must retain the immutable workspace/group binding.
     expect((await ownerRequest.post(`/api/worker-groups/${groupId}/admin-workspace/stop`)).status()).toBe(200);
     expect((await ownerRequest.post(`/api/worker-groups/${groupId}/admin-workspace/start`)).status()).toBe(200);
+    const initialRole = await captureCommandOutput(workspaceId, `
+      printf 'CLAUDE_SHA=%s\\n' "$(sha256sum ~/.claude/skills/agentor-group-administration/SKILL.md | cut -d' ' -f1)"
+      printf 'CODEX_SHA=%s\\n' "$(sha256sum ~/.agents/skills/agentor-group-administration/SKILL.md | cut -d' ' -f1)"
+      test ! -e ~/.claude/skills/agentor-global-administration && test ! -e ~/.claude/skills/agentor-worker-runtime && printf 'CLAUDE_ISOLATED=1\\n'
+      test ! -e ~/.agents/skills/agentor-global-administration && test ! -e ~/.agents/skills/agentor-worker-runtime && printf 'CODEX_ISOLATED=1\\n'
+      test ! -e ~/.gemini/commands/agentor-global-administration.toml && test ! -e ~/.gemini/commands/agentor-worker-runtime.toml && printf 'GEMINI_ISOLATED=1\\n'
+    `.trim().replace(/\n\s*/g, '; '));
+    expect(initialRole).toContain(`CLAUDE_SHA=${GROUP_ADMIN_ROLE_SKILL_SHA256}`);
+    expect(initialRole).toContain(`CODEX_SHA=${GROUP_ADMIN_ROLE_SKILL_SHA256}`);
+    expect(initialRole).toContain('CLAUDE_ISOLATED=1');
+    expect(initialRole).toContain('CODEX_ISOLATED=1');
+    expect(initialRole).toContain('GEMINI_ISOLATED=1');
+    await captureCommandOutput(workspaceId, `
+      mkdir -p ~/.claude/skills/agentor-global-administration ~/.claude/skills/user-kept
+      mkdir -p ~/.agents/skills/agentor-worker-runtime ~/.agents/skills/user-kept
+      printf stale > ~/.claude/skills/agentor-global-administration/SKILL.md
+      printf stale > ~/.agents/skills/agentor-worker-runtime/SKILL.md
+      printf keep > ~/.claude/skills/user-kept/SKILL.md
+      printf keep > ~/.agents/skills/user-kept/SKILL.md
+      printf stale > ~/.gemini/commands/agentor-global-administration.toml
+    `.trim().replace(/\n\s*/g, '; '));
     const rebuildStatuses = await Promise.all([
       ownerRequest.post(`/api/worker-groups/${groupId}/admin-workspace/rebuild`).then((response) => response.status()),
       ownerRequest.post(`/api/worker-groups/${groupId}/admin-workspace/rebuild`).then((response) => response.status()),
@@ -123,6 +146,20 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     expect(rebuildStatuses.sort((a, b) => a - b)).toEqual([200, 409]);
     await expect.poll(async () => (await ownerRequest.get(`/api/worker-groups/${groupId}/admin-workspace`)).status()).toBe(200);
     expect(await (await ownerRequest.get(`/api/worker-groups/${groupId}/admin-workspace`)).json()).toMatchObject({ id: workspaceId, groupId });
+    const rebuiltRole = await captureCommandOutput(workspaceId, `
+      printf 'CLAUDE_SHA=%s\\n' "$(sha256sum ~/.claude/skills/agentor-group-administration/SKILL.md | cut -d' ' -f1)"
+      printf 'CODEX_SHA=%s\\n' "$(sha256sum ~/.agents/skills/agentor-group-administration/SKILL.md | cut -d' ' -f1)"
+      test ! -e ~/.claude/skills/agentor-global-administration && test ! -e ~/.claude/skills/agentor-worker-runtime && printf 'CLAUDE_ISOLATED=1\\n'
+      test ! -e ~/.agents/skills/agentor-global-administration && test ! -e ~/.agents/skills/agentor-worker-runtime && printf 'CODEX_ISOLATED=1\\n'
+      test ! -e ~/.gemini/commands/agentor-global-administration.toml && test ! -e ~/.gemini/commands/agentor-worker-runtime.toml && printf 'GEMINI_ISOLATED=1\\n'
+      printf 'USER_SKILLS=%s\\n' "$(cat ~/.claude/skills/user-kept/SKILL.md ~/.agents/skills/user-kept/SKILL.md)"
+    `.trim().replace(/\n\s*/g, '; '));
+    expect(rebuiltRole).toContain(`CLAUDE_SHA=${GROUP_ADMIN_ROLE_SKILL_SHA256}`);
+    expect(rebuiltRole).toContain(`CODEX_SHA=${GROUP_ADMIN_ROLE_SKILL_SHA256}`);
+    expect(rebuiltRole).toContain('CLAUDE_ISOLATED=1');
+    expect(rebuiltRole).toContain('CODEX_ISOLATED=1');
+    expect(rebuiltRole).toContain('GEMINI_ISOLATED=1');
+    expect(rebuiltRole).toContain('USER_SKILLS=keepkeep');
 
     // A normal inventory refresh must not erase the externally registered
     // administrative runtime. The dashboard polls these endpoints every five

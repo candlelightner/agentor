@@ -180,7 +180,13 @@ export class DockerService {
     // sourced from the worker owner's per-user account in a single pass
     // via `renderUserEnvVars`. CustomEnvVars entries can override well-known
     // slots using the same KEY.
-    for (const line of renderUserEnvVars(opts.userEnv)) env.push(line);
+    for (const line of renderUserEnvVars(opts.userEnv)) {
+      // Reserved internal identity is supplied below by this trusted creation
+      // path. Do not permit a duplicate account variable whose ordering could
+      // be interpreted differently by an OCI runtime or process launcher.
+      if (line.startsWith('AGENTOR_RUNTIME_ROLE=')) continue;
+      env.push(line);
+    }
 
     const localEnv = (opts.workerConfig ?? []).filter((entry) => entry.kind === 'variable').map(({ key, value }) => ({ key, value }));
     if (localEnv.length) env.push(`WORKER_LOCAL_ENV=${Buffer.from(JSON.stringify(localEnv)).toString('base64')}`);
@@ -189,6 +195,10 @@ export class DockerService {
 
     env.push('ORCHESTRATOR_URL=http://agentor-orchestrator:3000');
     env.push(`WORKER_CONTAINER_NAME=${opts.containerName}`);
+    // Internal authoritative runtime identity. This method provisions only
+    // ordinary workers; append after all account/worker values so custom
+    // environment data cannot select a privileged guidance role.
+    env.push('AGENTOR_RUNTIME_ROLE=worker');
 
     const memBytes = opts.memoryLimit ? this.parseMemoryLimit(opts.memoryLimit) : 0;
     const nanoCpus = opts.cpuLimit ? Math.floor(opts.cpuLimit * 1e9) : 0;

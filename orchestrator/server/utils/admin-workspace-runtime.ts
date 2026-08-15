@@ -23,7 +23,7 @@ const EGRESS_NETWORK = "agentor-admin-egress-v1";
 // must be materialized for existing persistent administrative workspaces.
 // The workspace volume remains untouched; only its disposable compute image
 // is refreshed.
-const ADMIN_OVERLAY_VERSION = "3";
+const ADMIN_OVERLAY_VERSION = "4";
 const ADMIN_CONTAINER = "agentor-admin-workspace";
 const ADMIN_WORKSPACE_VOLUME = "agentor-admin-workspace-data";
 const ADMIN_AGENTS_VOLUME = "agentor-admin-agent-data";
@@ -472,8 +472,15 @@ export class DockerAdminWorkspaceRuntime
         "ORCHESTRATOR_URL=http://agentor-orchestrator:3000",
         `WORKER_CONTAINER_NAME=${resources.container}`,
         ...(record.ownerId
-          ? renderUserEnvVars(useUserEnvStore().getOrDefault(record.ownerId))
+          ? renderUserEnvVars(
+              useUserEnvStore().getOrDefault(record.ownerId),
+            ).filter((line) => !line.startsWith("AGENTOR_RUNTIME_ROLE="))
           : []),
+        // Derived from the authoritative administrative workspace record,
+        // never from request-controlled worker or environment data. Appending
+        // after owner env prevents a same-named custom variable from choosing
+        // another role.
+        `AGENTOR_RUNTIME_ROLE=${resources.groupId ? "group-admin" : "platform-admin"}`,
       ],
       Tty: true,
       OpenStdin: true,

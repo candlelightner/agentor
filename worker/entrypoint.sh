@@ -45,6 +45,19 @@ _ready() {
     echo "READY|" >> /tmp/worker-events
 }
 
+# Capture the server-provisioned runtime role before ENVIRONMENT.envVars or
+# worker-local values are exported. Only these three internal values exist;
+# missing or invalid values fail closed to the ordinary-worker role.
+case "${AGENTOR_RUNTIME_ROLE:-worker}" in
+    platform-admin|group-admin|worker)
+        AGENTOR_TRUSTED_RUNTIME_ROLE="$AGENTOR_RUNTIME_ROLE"
+        ;;
+    *)
+        AGENTOR_TRUSTED_RUNTIME_ROLE="worker"
+        ;;
+esac
+readonly AGENTOR_TRUSTED_RUNTIME_ROLE
+
 # --- Helper: wait for file/socket to appear ---
 wait_for_file() {
     local path="$1" max_tries="${2:-100}"
@@ -273,6 +286,9 @@ ENV_VARS=$(echo "$ENVIRONMENT" | jq -r '.envVars // ""')
 while IFS= read -r line; do
     trimmed=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
+    case "${trimmed%%=*}" in
+        AGENTOR_RUNTIME_ROLE|AGENTOR_TRUSTED_RUNTIME_ROLE) continue ;;
+    esac
     [[ "$trimmed" == *=* ]] && export "$trimmed" && tmux set-environment -g "${trimmed%%=*}" "${trimmed#*=}"
 done <<< "$ENV_VARS"
 
@@ -284,6 +300,9 @@ if [[ -n "${WORKER_LOCAL_ENV:-}" ]]; then
     while IFS= read -r encoded; do
         key=$(printf '%s' "$encoded" | base64 -d | jq -r '.key')
         value=$(printf '%s' "$encoded" | base64 -d | jq -r '.value')
+        case "$key" in
+            AGENTOR_RUNTIME_ROLE|AGENTOR_TRUSTED_RUNTIME_ROLE) continue ;;
+        esac
         export "$key=$value"
         tmux set-environment -g "$key" "$value"
     done < <(printf '%s' "$WORKER_LOCAL_ENV" | base64 -d | jq -r '.[] | @base64')
@@ -323,6 +342,14 @@ for setup_script in /home/agent/agents/*/setup.sh; do
         "$setup_script" || echo "[agent] Warning: $AGENT_NAME setup failed, continuing"
     fi
 done
+
+# Role guidance is Agentor-owned and reconciled on every boot. This is
+# intentionally separate from environment-selectable capabilities: only the
+# current role is installed, stale cross-role files are removed, and all other
+# skills remain untouched.
+source /home/agent/agents/common.sh
+reconcile_role_skill "$AGENTOR_TRUSTED_RUNTIME_ROLE" \
+    || echo "[agent] Warning: runtime role skill setup failed, continuing"
 
 # The trusted administrative overlay is the only worker attached to the
 # management network. Advertise its internal MCP to Codex through a stdio

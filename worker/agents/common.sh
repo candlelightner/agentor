@@ -91,3 +91,91 @@ ${escaped}
 TOMLEOF
     done < <(echo "$CAPABILITIES" | jq -c '.[]')
 }
+
+# Reconcile Agentor's reserved runtime-role skill without touching generic
+# capabilities or user-owned skills. The role is selected by trusted container
+# provisioning and captured by entrypoint.sh before request-configured
+# environment values are exported.
+# Usage: reconcile_role_skill worker|platform-admin|group-admin
+reconcile_role_skill() {
+    local role="${1:-worker}" skill_name
+    case "$role" in
+        platform-admin) skill_name="agentor-global-administration" ;;
+        group-admin) skill_name="agentor-group-administration" ;;
+        worker) skill_name="agentor-worker-runtime" ;;
+        *) skill_name="agentor-worker-runtime" ;;
+    esac
+
+    local source="/home/agent/agents/role-skills/${skill_name}.md"
+    local base reserved destination stage
+    if [ ! -f "$source" ]; then
+        # Missing trusted content must never leave a stale privileged role in
+        # place. Remove only the three reserved role entries and fail closed.
+        for base in "/home/agent/.claude/skills" "/home/agent/.agents/skills"; do
+            for reserved in \
+                agentor-global-administration \
+                agentor-group-administration \
+                agentor-worker-runtime; do
+                rm -rf -- "${base}/${reserved}"
+            done
+        done
+        for reserved in \
+            agentor-global-administration \
+            agentor-group-administration \
+            agentor-worker-runtime; do
+            rm -f -- "/home/agent/.gemini/commands/${reserved}.toml"
+        done
+        echo "[agent] Warning: built-in role skill is missing; stale role skills were removed" >&2
+        return 1
+    fi
+
+    for base in "/home/agent/.claude/skills" "/home/agent/.agents/skills"; do
+        mkdir -p "$base" || return 1
+        stage=$(mktemp -d "${base}/.agentor-role-skill.XXXXXX") || return 1
+        install -m 0644 "$source" "$stage/SKILL.md" || {
+            rm -rf -- "$stage"
+            return 1
+        }
+        for reserved in \
+            agentor-global-administration \
+            agentor-group-administration \
+            agentor-worker-runtime; do
+            destination="${base}/${reserved}"
+            [ "$reserved" = "$skill_name" ] || rm -rf -- "$destination"
+        done
+        destination="${base}/${skill_name}"
+        rm -rf -- "$destination"
+        mv -- "$stage" "$destination" || {
+            rm -rf -- "$stage"
+            return 1
+        }
+    done
+
+    # Gemini exposes the equivalent guidance as a generated command. Keep its
+    # representation role-isolated as well while preserving every other command.
+    local commands="/home/agent/.gemini/commands"
+    local command_path description body
+    mkdir -p "$commands" || return 1
+    for reserved in \
+        agentor-global-administration \
+        agentor-group-administration \
+        agentor-worker-runtime; do
+        command_path="${commands}/${reserved}.toml"
+        [ "$reserved" = "$skill_name" ] || rm -f -- "$command_path"
+    done
+    description=$(sed -n 's/^description: //p' "$source" | head -n 1)
+    body=$(awk '/^---$/{markers++; next} markers >= 2 {print}' "$source" | sed 's/\\/\\\\/g')
+    stage=$(mktemp "${commands}/.agentor-role-skill.XXXXXX") || return 1
+    {
+        printf 'description = "%s"\n' "$description"
+        printf 'prompt = """\n%s\n"""\n' "$body"
+    } > "$stage" || {
+        rm -f -- "$stage"
+        return 1
+    }
+    chmod 0644 "$stage" || return 1
+    mv -- "$stage" "${commands}/${skill_name}.toml" || {
+        rm -f -- "$stage"
+        return 1
+    }
+}

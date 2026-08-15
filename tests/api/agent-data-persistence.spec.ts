@@ -3,6 +3,8 @@ import { ApiClient } from '../helpers/api-client';
 import { createWorker, cleanupWorker, waitForWorkerRunning } from '../helpers/worker-lifecycle';
 import { captureCommandOutput as execInWorker } from '../helpers/terminal-ws';
 
+const WORKER_ROLE_SKILL_SHA256 = '74c26bf91bd0c457c2d403935f0504cefe79c1ed65696bd540f975eb5c8117ad';
+
 // -- Symlink and mount verification (single worker, serial) --
 
 test.describe.serial('Agent data persistence — mount verification', () => {
@@ -150,6 +152,21 @@ test.describe.serial('Agent data persistence — mount verification', () => {
     expect(head).toContain('---');
     expect(head.toLowerCase()).toContain('name:');
   });
+
+  test('ordinary workers receive only the authoritative worker-runtime role skill', async () => {
+    const output = await execInWorker(containerId, `
+      printf 'CLAUDE_SHA=%s\\n' "$(sha256sum ~/.claude/skills/agentor-worker-runtime/SKILL.md | cut -d' ' -f1)"
+      printf 'CODEX_SHA=%s\\n' "$(sha256sum ~/.agents/skills/agentor-worker-runtime/SKILL.md | cut -d' ' -f1)"
+      printf 'CLAUDE_RESERVED=%s\\n' "$(find ~/.claude/skills -mindepth 1 -maxdepth 1 -printf '%f\\n' | grep -E '^(agentor-(global|group)-administration|agentor-worker-runtime)$' | sort | paste -sd, -)"
+      printf 'CODEX_RESERVED=%s\\n' "$(find ~/.agents/skills -mindepth 1 -maxdepth 1 -printf '%f\\n' | grep -E '^(agentor-(global|group)-administration|agentor-worker-runtime)$' | sort | paste -sd, -)"
+      printf 'GEMINI_RESERVED=%s\\n' "$(find ~/.gemini/commands -mindepth 1 -maxdepth 1 -printf '%f\\n' | grep -E '^(agentor-(global|group)-administration|agentor-worker-runtime)\\.toml$' | sort | paste -sd, -)"
+    `.trim().replace(/\n\s*/g, '; '));
+    expect(output).toContain(`CLAUDE_SHA=${WORKER_ROLE_SKILL_SHA256}`);
+    expect(output).toContain(`CODEX_SHA=${WORKER_ROLE_SKILL_SHA256}`);
+    expect(output).toContain('CLAUDE_RESERVED=agentor-worker-runtime');
+    expect(output).toContain('CODEX_RESERVED=agentor-worker-runtime');
+    expect(output).toContain('GEMINI_RESERVED=agentor-worker-runtime.toml');
+  });
 });
 
 // -- Persistence across restart (serial, single worker) --
@@ -230,6 +247,20 @@ test.describe.serial('Agent data persistence — rebuild', () => {
     expect(output).toContain(MARKER);
   });
 
+  test('seed stale privileged role files and an unrelated user skill before rebuild', async () => {
+    const output = await execInWorker(containerId, `
+      mkdir -p ~/.claude/skills/agentor-global-administration ~/.claude/skills/user-kept
+      mkdir -p ~/.agents/skills/agentor-group-administration ~/.agents/skills/user-kept
+      printf stale > ~/.claude/skills/agentor-global-administration/SKILL.md
+      printf stale > ~/.agents/skills/agentor-group-administration/SKILL.md
+      printf keep > ~/.claude/skills/user-kept/SKILL.md
+      printf keep > ~/.agents/skills/user-kept/SKILL.md
+      printf stale > ~/.gemini/commands/agentor-global-administration.toml
+      printf 'SEEDED=%s\\n' "$(cat ~/.claude/skills/user-kept/SKILL.md ~/.agents/skills/user-kept/SKILL.md)"
+    `.trim().replace(/\n\s*/g, '; '));
+    expect(output).toContain('SEEDED=keepkeep');
+  });
+
   test('marker file persists after container rebuild', async ({ request }) => {
     const api = new ApiClient(request);
     const { status, body } = await api.rebuildContainer(containerId);
@@ -240,6 +271,21 @@ test.describe.serial('Agent data persistence — rebuild', () => {
 
     const output = await execInWorker(containerId, `cat ~/.gemini/test-marker.txt`);
     expect(output).toContain(MARKER);
+
+    const role = await execInWorker(containerId, `
+      printf 'CLAUDE_SHA=%s\\n' "$(sha256sum ~/.claude/skills/agentor-worker-runtime/SKILL.md | cut -d' ' -f1)"
+      printf 'CODEX_SHA=%s\\n' "$(sha256sum ~/.agents/skills/agentor-worker-runtime/SKILL.md | cut -d' ' -f1)"
+      test ! -e ~/.claude/skills/agentor-global-administration && test ! -e ~/.claude/skills/agentor-group-administration && printf 'CLAUDE_ISOLATED=1\\n'
+      test ! -e ~/.agents/skills/agentor-global-administration && test ! -e ~/.agents/skills/agentor-group-administration && printf 'CODEX_ISOLATED=1\\n'
+      test ! -e ~/.gemini/commands/agentor-global-administration.toml && test ! -e ~/.gemini/commands/agentor-group-administration.toml && printf 'GEMINI_ISOLATED=1\\n'
+      printf 'USER_SKILLS=%s\\n' "$(cat ~/.claude/skills/user-kept/SKILL.md ~/.agents/skills/user-kept/SKILL.md)"
+    `.trim().replace(/\n\s*/g, '; '));
+    expect(role).toContain(`CLAUDE_SHA=${WORKER_ROLE_SKILL_SHA256}`);
+    expect(role).toContain(`CODEX_SHA=${WORKER_ROLE_SKILL_SHA256}`);
+    expect(role).toContain('CLAUDE_ISOLATED=1');
+    expect(role).toContain('CODEX_ISOLATED=1');
+    expect(role).toContain('GEMINI_ISOLATED=1');
+    expect(role).toContain('USER_SKILLS=keepkeep');
   });
 });
 
@@ -357,6 +403,9 @@ test.describe.serial('Capability exposeApis filtering (worker-level)', () => {
     const { body: env } = await api.createEnvironment({
       name: `CapFilter-${Date.now()}`,
       networkMode: 'full',
+      // Request-controlled environment data must not select either privileged
+      // role; entrypoint captures only the server-provisioned worker identity.
+      envVars: 'AGENTOR_RUNTIME_ROLE=platform-admin\nAGENTOR_TRUSTED_RUNTIME_ROLE=group-admin',
       exposeApis: { portMappings: false, domainMappings: true, usage: true },
       enabledCapabilityIds: null, // all built-ins
     });
@@ -377,5 +426,8 @@ test.describe.serial('Capability exposeApis filtering (worker-level)', () => {
     expect(out).toContain('agentor-domain-mapping');   // domainMappings:true → present
     expect(out).toContain('agentor-usage');            // usage:true → present
     expect(out).toContain('agentor-tmux');             // never API-filtered
+    expect(out).toContain('agentor-worker-runtime');
+    expect(out).not.toContain('agentor-global-administration');
+    expect(out).not.toContain('agentor-group-administration');
   });
 });
