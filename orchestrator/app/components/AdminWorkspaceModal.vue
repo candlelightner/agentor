@@ -7,6 +7,7 @@ const emit = defineEmits<{
 const admin = useAdminWorkspace();
 const acknowledged = ref(false);
 const pendingAction = ref<"start" | "stop" | "rebuild" | "">("");
+const showFiles = ref(false);
 
 watch(open, async (shown) => {
   acknowledged.value = false;
@@ -222,6 +223,17 @@ function openService(service: string) {
               </p>
               <div class="grid gap-3 sm:grid-cols-3">
                 <button
+                  type="button"
+                  class="rounded border-2 border-red-400 bg-red-800 p-4 text-left font-bold hover:bg-red-700 disabled:opacity-50"
+                  :disabled="admin.workspace.value.status !== 'running'"
+                  @click="showFiles = true"
+                >
+                  <span class="block text-lg">Files</span>
+                  <span class="text-xs font-normal text-red-200"
+                    >Manage privileged /workspace files</span
+                  >
+                </button>
+                <button
                   v-for="service in admin.workspace.value.services"
                   :key="service"
                   type="button"
@@ -283,4 +295,13 @@ function openService(service: string) {
       </div>
     </template>
   </UModal>
+  <WorkspaceFilesModal
+    v-if="admin.workspace.value"
+    v-model:open="showFiles"
+    :container="{
+      id: admin.workspace.value.id,
+      displayName: 'ADMIN / ORCHESTRATOR',
+      status: admin.workspace.value.status,
+    }"
+  />
 </template>

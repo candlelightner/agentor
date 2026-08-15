@@ -41,6 +41,14 @@ async function mockAdminWorkspace(page: Page) {
       await route.fulfill({ json: state });
     });
   }
+  await page.route(
+    `**/api/containers/${workspace.id}/files**`,
+    async (route) => {
+      await route.fulfill({
+        json: { path: "", entries: [], protection: { protected: false } },
+      });
+    },
+  );
 }
 async function openAdminWorkspace(page: Page) {
   await goToDashboard(page);
@@ -75,6 +83,19 @@ test("shows persistent lifecycle, trusted immutable image identity, and existing
     await expect(
       modal.getByRole("button", { name: new RegExp(service, "i") }),
     ).toBeVisible();
+});
+
+test("opens the workspace file picker for the global administrator", async ({
+  page,
+}) => {
+  const modal = await openAdminWorkspace(page);
+  await modal.getByRole("button", { name: /Files/ }).click();
+  const files = page.getByTestId("workspace-files-modal");
+  await expect(files).toBeVisible();
+  await expect(files).toContainText("ADMIN / ORCHESTRATOR");
+  await expect(files.getByTestId("workspace-breadcrumb")).toContainText(
+    "/workspace",
+  );
 });
 
 test("requires explicit warning acknowledgement before lifecycle changes", async ({

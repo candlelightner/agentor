@@ -2,7 +2,7 @@
 import type { ContainerInfo, FileEntry, FileListing } from '~/types';
 
 const props = defineProps<{
-  container: ContainerInfo;
+  container: Pick<ContainerInfo, 'id' | 'status'> & { displayName?: string };
 }>();
 
 const open = defineModel<boolean>('open', { default: false });
@@ -10,17 +10,7 @@ const open = defineModel<boolean>('open', { default: false });
 const displayLabel = computed(() => props.container.displayName || shortName(props.container.id));
 const isRunning = computed(() => props.container.status === 'running');
 
-const {
-  list,
-  mkdir,
-  rename,
-  move,
-  remove,
-  upload,
-  download,
-  toastSuccess,
-  toastError,
-} = useWorkspaceFiles(() => props.container.id);
+const { list, mkdir, rename, move, remove, upload, download, toastSuccess, toastError } = useWorkspaceFiles(() => props.container.id);
 
 // ─── Current directory state ──────────────────────────────────────────────
 // `cwd` is a POSIX path relative to `/workspace` (`` for the root). The
@@ -47,18 +37,12 @@ const breadcrumbs = computed(() => {
 // for symlinks-to-dirs which the API reports as `symlink`).
 const sortedEntries = computed(() => [...entries.value]);
 
-const allSelected = computed(
-  () => entries.value.length > 0 && selection.value.size === entries.value.length,
-);
+const allSelected = computed(() => entries.value.length > 0 && selection.value.size === entries.value.length);
 const someSelected = computed(() => selection.value.size > 0);
-const selectedEntries = computed(() =>
-  entries.value.filter((e) => selection.value.has(e.path)),
-);
+const selectedEntries = computed(() => entries.value.filter((e) => selection.value.has(e.path)));
 
 // Any escaping symlink in the current selection disables destructive ops.
-const selectionHasEscaping = computed(() =>
-  selectedEntries.value.some((e) => e.type === 'symlink' && e.linkEscapes),
-);
+const selectionHasEscaping = computed(() => selectedEntries.value.some((e) => e.type === 'symlink' && e.linkEscapes));
 
 // ─── Action panel state ───────────────────────────────────────────────────
 // A single inline panel replaces the listing toolbar actions. Only one panel
@@ -197,9 +181,7 @@ function openPanel(p: Panel) {
 }
 
 // ─── Upload ──────────────────────────────────────────────────────────────
-const uploadDestinationLabel = computed(() =>
-  cwd.value ? `/workspace/${cwd.value}` : '/workspace',
-);
+const uploadDestinationLabel = computed(() => (cwd.value ? `/workspace/${cwd.value}` : '/workspace'));
 
 async function doUpload(overwrite: boolean) {
   if (uploadFiles.value.length === 0) return;
@@ -265,9 +247,7 @@ async function doRename() {
     await rename(renameTarget.value.path, newName.value.trim(), lockPassword.value);
     toastSuccess('Renamed', `${renameTarget.value.name} → ${newName.value.trim()}`);
     // Keep the renamed entry selected under its new path.
-    const parent = renameTarget.value.path.includes('/')
-      ? renameTarget.value.path.slice(0, renameTarget.value.path.lastIndexOf('/'))
-      : '';
+    const parent = renameTarget.value.path.includes('/') ? renameTarget.value.path.slice(0, renameTarget.value.path.lastIndexOf('/')) : '';
     const newPath = parent ? `${parent}/${newName.value.trim()}` : newName.value.trim();
     clearPanel();
     await refresh();
@@ -298,9 +278,7 @@ const moveSelfTarget = computed(() => {
   });
 });
 
-const moveCanSubmit = computed(
-  () => someSelected.value && moveDestValid.value && !moveSelfTarget.value && !selectionHasEscaping.value,
-);
+const moveCanSubmit = computed(() => someSelected.value && moveDestValid.value && !moveSelfTarget.value && !selectionHasEscaping.value);
 
 async function doMove(overwrite: boolean) {
   if (!moveCanSubmit.value) return;
@@ -311,7 +289,10 @@ async function doMove(overwrite: boolean) {
   try {
     const result = await move(paths, moveDest.value.trim(), overwrite, lockPassword.value);
     if (!result.ok) {
-      moveConflict.value = result.conflict.conflicts as { source: string; target: string }[];
+      moveConflict.value = result.conflict.conflicts as {
+        source: string;
+        target: string;
+      }[];
       panelError.value = result.message;
     } else {
       toastSuccess('Move complete', `${(result.data as { moved: number }).moved} moved`);
@@ -461,17 +442,9 @@ watch(
 </script>
 
 <template>
-  <UModal
-    v-model:open="open"
-    :ui="{ content: 'sm:max-w-4xl w-full', body: 'p-0 sm:p-0' }"
-    @keydown="onModalKeydown"
-  >
+  <UModal v-model:open="open" :ui="{ content: 'sm:max-w-4xl w-full', body: 'p-0 sm:p-0' }" @keydown="onModalKeydown">
     <template #content>
-      <div
-        class="flex flex-col max-h-[90vh] w-full"
-        data-testid="workspace-files-modal"
-        @keydown="onModalKeydown"
-      >
+      <div class="flex flex-col max-h-[90vh] w-full" data-testid="workspace-files-modal" @keydown="onModalKeydown">
         <!-- Header: worker name + refresh -->
         <div class="flex items-center justify-between gap-3 px-4 py-3 border-b border-gray-200 dark:border-gray-800">
           <div class="min-w-0">
@@ -481,16 +454,7 @@ watch(
             </h2>
           </div>
           <div class="flex items-center gap-1.5 shrink-0">
-            <UButton
-              size="xs"
-              color="neutral"
-              variant="subtle"
-              icon="i-lucide-rotate-cw"
-              :loading="loading"
-              :disabled="!isRunning"
-              aria-label="Refresh listing"
-              @click="refresh"
-            >
+            <UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-rotate-cw" :loading="loading" :disabled="!isRunning" aria-label="Refresh listing" @click="refresh">
               <span class="hidden sm:inline">Refresh</span>
             </UButton>
             <UButton
@@ -499,33 +463,24 @@ watch(
               variant="ghost"
               icon="i-lucide-x"
               aria-label="Close"
-              @click="() => { open = false }"
+              @click="
+                () => {
+                  open = false;
+                }
+              "
             />
           </div>
         </div>
 
         <!-- Breadcrumb (horizontally scrollable on mobile) -->
-        <div
-          class="flex items-center gap-0.5 px-4 py-2 border-b border-gray-200 dark:border-gray-800 overflow-x-auto whitespace-nowrap"
-          data-testid="workspace-breadcrumb"
-        >
-          <UButton
-            size="xs"
-            color="neutral"
-            variant="ghost"
-            icon="i-lucide-corner-left-up"
-            :disabled="!cwd"
-            aria-label="Up one level"
-            @click="goUp"
-          />
+        <div class="flex items-center gap-0.5 px-4 py-2 border-b border-gray-200 dark:border-gray-800 overflow-x-auto whitespace-nowrap" data-testid="workspace-breadcrumb">
+          <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-corner-left-up" :disabled="!cwd" aria-label="Up one level" @click="goUp" />
           <template v-for="(crumb, idx) in breadcrumbs" :key="crumb.path">
             <span v-if="idx > 0" class="text-gray-400 dark:text-gray-600">/</span>
             <button
               type="button"
               class="px-1.5 py-0.5 rounded text-xs hover:bg-gray-100 dark:hover:bg-gray-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
-              :class="idx === breadcrumbs.length - 1
-                ? 'text-gray-900 dark:text-white font-medium'
-                : 'text-blue-600 dark:text-blue-400'"
+              :class="idx === breadcrumbs.length - 1 ? 'text-gray-900 dark:text-white font-medium' : 'text-blue-600 dark:text-blue-400'"
               @click="navigateTo(crumb.path)"
             >
               {{ crumb.label }}
@@ -535,26 +490,8 @@ watch(
 
         <!-- Toolbar -->
         <div class="flex flex-wrap items-center gap-1.5 px-4 py-2 border-b border-gray-200 dark:border-gray-800">
-          <UButton
-            size="xs"
-            color="neutral"
-            variant="subtle"
-            icon="i-lucide-upload"
-            :disabled="!isRunning || panel === 'upload'"
-            @click="openPanel('upload')"
-          >
-            Upload
-          </UButton>
-          <UButton
-            size="xs"
-            color="neutral"
-            variant="subtle"
-            icon="i-lucide-folder-plus"
-            :disabled="!isRunning || panel !== 'none'"
-            @click="openPanel('mkdir')"
-          >
-            New Folder
-          </UButton>
+          <UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-upload" :disabled="!isRunning || panel === 'upload'" @click="openPanel('upload')"> Upload </UButton>
+          <UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-folder-plus" :disabled="!isRunning || panel !== 'none'" @click="openPanel('mkdir')"> New Folder </UButton>
           <UButton
             size="xs"
             color="neutral"
@@ -586,22 +523,13 @@ watch(
           >
             Rename
           </UButton>
-          <UButton
-            size="xs"
-            color="error"
-            variant="subtle"
-            icon="i-lucide-trash-2"
-            :disabled="!isRunning || !someSelected || selectionHasEscaping || panel !== 'none'"
-            @click="openPanel('delete')"
-          >
+          <UButton size="xs" color="error" variant="subtle" icon="i-lucide-trash-2" :disabled="!isRunning || !someSelected || selectionHasEscaping || panel !== 'none'" @click="openPanel('delete')">
             Delete
           </UButton>
 
           <div class="flex-1" />
 
-          <span v-if="someSelected" class="text-xs text-gray-500 dark:text-gray-400">
-            {{ selection.size }} selected
-          </span>
+          <span v-if="someSelected" class="text-xs text-gray-500 dark:text-gray-400"> {{ selection.size }} selected </span>
         </div>
 
         <!-- Inline action panels -->
@@ -616,9 +544,7 @@ watch(
               <h3 class="text-sm font-medium text-gray-900 dark:text-white">Upload to {{ uploadDestinationLabel }}</h3>
               <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-x" aria-label="Cancel upload" @click="clearPanel" />
             </div>
-            <p class="text-xs text-gray-500 dark:text-gray-400">
-              Files and folders are uploaded into the current directory, preserving their relative paths.
-            </p>
+            <p class="text-xs text-gray-500 dark:text-gray-400">Files and folders are uploaded into the current directory, preserving their relative paths.</p>
             <FileDropZone v-model="uploadFiles" />
             <div
               v-if="uploadConflict && uploadConflict.length > 0"
@@ -627,29 +553,18 @@ watch(
             >
               <p class="font-medium mb-1">Conflicts — these paths already exist:</p>
               <ul class="list-disc list-inside space-y-0.5 max-h-24 overflow-y-auto">
-                <li v-for="c in uploadConflict" :key="c" class="font-mono truncate">{{ c }}</li>
+                <li v-for="c in uploadConflict" :key="c" class="font-mono truncate">
+                  {{ c }}
+                </li>
               </ul>
               <p class="mt-1.5">Retry with overwrite to replace them.</p>
             </div>
-            <p v-if="panelError && !(uploadConflict && uploadConflict.length)" class="text-red-500 dark:text-red-400 text-xs">{{ panelError }}</p>
+            <p v-if="panelError && !(uploadConflict && uploadConflict.length)" class="text-red-500 dark:text-red-400 text-xs">
+              {{ panelError }}
+            </p>
             <div class="flex flex-wrap items-center gap-2">
-              <UButton
-                size="xs"
-                :loading="panelBusy"
-                :disabled="uploadFiles.length === 0"
-                @click="doUpload(false)"
-              >
-                Upload{{ uploadFiles.length > 0 ? ` (${uploadFiles.length})` : '' }}
-              </UButton>
-              <UButton
-                v-if="uploadConflict && uploadConflict.length > 0"
-                size="xs"
-                color="warning"
-                variant="solid"
-                :loading="panelBusy"
-                :disabled="uploadFiles.length === 0"
-                @click="doUpload(true)"
-              >
+              <UButton size="xs" :loading="panelBusy" :disabled="uploadFiles.length === 0" @click="doUpload(false)"> Upload{{ uploadFiles.length > 0 ? ` (${uploadFiles.length})` : '' }} </UButton>
+              <UButton v-if="uploadConflict && uploadConflict.length > 0" size="xs" color="warning" variant="solid" :loading="panelBusy" :disabled="uploadFiles.length === 0" @click="doUpload(true)">
                 Overwrite &amp; retry
               </UButton>
               <UButton size="xs" color="neutral" variant="outline" @click="clearPanel">Cancel</UButton>
@@ -662,18 +577,11 @@ watch(
               <h3 class="text-sm font-medium text-gray-900 dark:text-white">New folder in {{ uploadDestinationLabel }}</h3>
               <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-x" aria-label="Cancel" @click="clearPanel" />
             </div>
-            <UInput
-              v-model="newName"
-              placeholder="folder name"
-              class="w-full"
-              autofocus
-              @keydown.enter="doMkdir"
-              @keydown.escape="clearPanel"
-            />
-            <p v-if="newName && !mkdirValid" class="text-xs text-red-500 dark:text-red-400">
-              Name must not contain slashes or be empty.
+            <UInput v-model="newName" placeholder="folder name" class="w-full" autofocus @keydown.enter="doMkdir" @keydown.escape="clearPanel" />
+            <p v-if="newName && !mkdirValid" class="text-xs text-red-500 dark:text-red-400">Name must not contain slashes or be empty.</p>
+            <p v-if="panelError" class="text-red-500 dark:text-red-400 text-xs">
+              {{ panelError }}
             </p>
-            <p v-if="panelError" class="text-red-500 dark:text-red-400 text-xs">{{ panelError }}</p>
             <div class="flex items-center gap-2">
               <UButton size="xs" :loading="panelBusy" :disabled="!mkdirValid" @click="doMkdir">Create</UButton>
               <UButton size="xs" color="neutral" variant="outline" @click="clearPanel">Cancel</UButton>
@@ -684,22 +592,16 @@ watch(
           <div v-else-if="panel === 'rename'" class="space-y-3" data-testid="workspace-rename-panel">
             <div class="flex items-center justify-between gap-2">
               <h3 class="text-sm font-medium text-gray-900 dark:text-white">
-                Rename <span class="font-mono text-gray-500 dark:text-gray-400">{{ renameTarget?.name }}</span>
+                Rename
+                <span class="font-mono text-gray-500 dark:text-gray-400">{{ renameTarget?.name }}</span>
               </h3>
               <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-x" aria-label="Cancel" @click="clearPanel" />
             </div>
-            <UInput
-              v-model="newName"
-              placeholder="new name"
-              class="w-full"
-              autofocus
-              @keydown.enter="doRename"
-              @keydown.escape="clearPanel"
-            />
-            <p v-if="newName && !renameValid" class="text-xs text-red-500 dark:text-red-400">
-              Name must differ, contain no slashes, and not be empty.
+            <UInput v-model="newName" placeholder="new name" class="w-full" autofocus @keydown.enter="doRename" @keydown.escape="clearPanel" />
+            <p v-if="newName && !renameValid" class="text-xs text-red-500 dark:text-red-400">Name must differ, contain no slashes, and not be empty.</p>
+            <p v-if="panelError" class="text-red-500 dark:text-red-400 text-xs">
+              {{ panelError }}
             </p>
-            <p v-if="panelError" class="text-red-500 dark:text-red-400 text-xs">{{ panelError }}</p>
             <div class="flex items-center gap-2">
               <UButton size="xs" :loading="panelBusy" :disabled="!renameValid" @click="doRename">Rename</UButton>
               <UButton size="xs" color="neutral" variant="outline" @click="clearPanel">Cancel</UButton>
@@ -709,27 +611,14 @@ watch(
           <!-- Move -->
           <div v-else-if="panel === 'move'" class="space-y-3" data-testid="workspace-move-panel">
             <div class="flex items-center justify-between gap-2">
-              <h3 class="text-sm font-medium text-gray-900 dark:text-white">
-                Move {{ selection.size }} item{{ selection.size === 1 ? '' : 's' }}
-              </h3>
+              <h3 class="text-sm font-medium text-gray-900 dark:text-white">Move {{ selection.size }} item{{ selection.size === 1 ? '' : 's' }}</h3>
               <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-x" aria-label="Cancel" @click="clearPanel" />
             </div>
             <UFormField label="Destination" hint="Relative to /workspace; empty = root">
-              <UInput
-                v-model="moveDest"
-                placeholder="e.g. docs or (empty for /workspace)"
-                class="w-full font-mono text-xs"
-                autofocus
-                @keydown.enter="doMove(false)"
-                @keydown.escape="clearPanel"
-              />
+              <UInput v-model="moveDest" placeholder="e.g. docs or (empty for /workspace)" class="w-full font-mono text-xs" autofocus @keydown.enter="doMove(false)" @keydown.escape="clearPanel" />
             </UFormField>
-            <p v-if="moveSelfTarget" class="text-xs text-red-500 dark:text-red-400">
-              Cannot move a folder into itself or one of its descendants.
-            </p>
-            <p v-if="moveDest && !moveDestValid" class="text-xs text-red-500 dark:text-red-400">
-              Destination must be relative to /workspace (no leading slash, no backslash, no ..).
-            </p>
+            <p v-if="moveSelfTarget" class="text-xs text-red-500 dark:text-red-400">Cannot move a folder into itself or one of its descendants.</p>
+            <p v-if="moveDest && !moveDestValid" class="text-xs text-red-500 dark:text-red-400">Destination must be relative to /workspace (no leading slash, no backslash, no ..).</p>
             <div
               v-if="moveConflict && moveConflict.length > 0"
               class="rounded-md border border-amber-500/40 bg-amber-50 dark:bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
@@ -737,24 +626,16 @@ watch(
             >
               <p class="font-medium mb-1">Conflicts at the destination:</p>
               <ul class="list-disc list-inside space-y-0.5 max-h-24 overflow-y-auto">
-                <li v-for="c in moveConflict" :key="c.source" class="font-mono truncate">
-                  {{ c.source }} → {{ c.target }}
-                </li>
+                <li v-for="c in moveConflict" :key="c.source" class="font-mono truncate">{{ c.source }} → {{ c.target }}</li>
               </ul>
               <p class="mt-1.5">Retry with overwrite to replace them.</p>
             </div>
-            <p v-if="panelError && !(moveConflict && moveConflict.length)" class="text-red-500 dark:text-red-400 text-xs">{{ panelError }}</p>
+            <p v-if="panelError && !(moveConflict && moveConflict.length)" class="text-red-500 dark:text-red-400 text-xs">
+              {{ panelError }}
+            </p>
             <div class="flex flex-wrap items-center gap-2">
               <UButton size="xs" :loading="panelBusy" :disabled="!moveCanSubmit" @click="doMove(false)">Move</UButton>
-              <UButton
-                v-if="moveConflict && moveConflict.length > 0"
-                size="xs"
-                color="warning"
-                variant="solid"
-                :loading="panelBusy"
-                :disabled="!moveCanSubmit"
-                @click="doMove(true)"
-              >
+              <UButton v-if="moveConflict && moveConflict.length > 0" size="xs" color="warning" variant="solid" :loading="panelBusy" :disabled="!moveCanSubmit" @click="doMove(true)">
                 Overwrite &amp; retry
               </UButton>
               <UButton size="xs" color="neutral" variant="outline" @click="clearPanel">Cancel</UButton>
@@ -768,19 +649,19 @@ watch(
               <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-x" aria-label="Cancel" @click="clearPanel" />
             </div>
             <p class="text-xs text-gray-500 dark:text-gray-400">
-              This permanently removes the following from <code class="font-mono">{{ uploadDestinationLabel }}</code>. This cannot be undone.
+              This permanently removes the following from
+              <code class="font-mono">{{ uploadDestinationLabel }}</code
+              >. This cannot be undone.
             </p>
             <ul class="max-h-40 overflow-y-auto rounded-md border border-gray-200 dark:border-gray-800 divide-y divide-gray-100 dark:divide-gray-800">
-              <li
-                v-for="e in selectedEntries"
-                :key="e.path"
-                class="flex items-center gap-2 px-2 py-1 text-xs"
-              >
+              <li v-for="e in selectedEntries" :key="e.path" class="flex items-center gap-2 px-2 py-1 text-xs">
                 <UIcon :name="iconFor(e)" class="size-3.5 text-gray-400 dark:text-gray-500 shrink-0" />
                 <span class="truncate text-gray-700 dark:text-gray-300" :title="e.path">{{ e.name }}</span>
               </li>
             </ul>
-            <p v-if="panelError" class="text-red-500 dark:text-red-400 text-xs">{{ panelError }}</p>
+            <p v-if="panelError" class="text-red-500 dark:text-red-400 text-xs">
+              {{ panelError }}
+            </p>
             <div class="flex items-center gap-2">
               <UButton size="xs" color="error" variant="solid" icon="i-lucide-trash-2" :loading="panelBusy" @click="doDelete">
                 Delete {{ selection.size }} item{{ selection.size === 1 ? '' : 's' }}
@@ -793,32 +674,23 @@ watch(
         <!-- Listing -->
         <div class="flex-1 overflow-y-auto min-h-0">
           <!-- Error / stopped banner -->
-          <div
-            v-if="error"
-            class="m-4 rounded-md border border-red-500/40 bg-red-50 dark:bg-red-500/10 px-3 py-2 text-sm text-red-700 dark:text-red-300"
-            data-testid="workspace-files-error"
-          >
+          <div v-if="error" class="m-4 rounded-md border border-red-500/40 bg-red-50 dark:bg-red-500/10 px-3 py-2 text-sm text-red-700 dark:text-red-300" data-testid="workspace-files-error">
             <p>{{ error }}</p>
             <UButton size="xs" color="neutral" variant="outline" class="mt-2" :loading="loading" @click="refresh">Retry</UButton>
           </div>
 
           <div v-else-if="loading && entries.length === 0" class="flex items-center justify-center py-12 text-sm text-gray-400 dark:text-gray-500">
-            <UIcon name="i-lucide-loader-2" class="size-4 animate-spin mr-2" /> Loading…
+            <UIcon name="i-lucide-loader-2" class="size-4 animate-spin mr-2" />
+            Loading…
           </div>
 
-          <div v-else-if="entries.length === 0" class="py-12 text-center text-sm text-gray-400 dark:text-gray-500">
-            This folder is empty.
-          </div>
+          <div v-else-if="entries.length === 0" class="py-12 text-center text-sm text-gray-400 dark:text-gray-500">This folder is empty.</div>
 
           <table v-else class="w-full text-sm" data-testid="workspace-files-list">
             <thead class="sticky top-0 bg-gray-50 dark:bg-gray-900 text-[10px] uppercase tracking-wider text-gray-400 dark:text-gray-500">
               <tr>
                 <th class="w-8 px-3 py-1.5">
-                  <UCheckbox
-                    :model-value="allSelected"
-                    aria-label="Select all"
-                    @update:model-value="toggleSelectAll(!!$event)"
-                  />
+                  <UCheckbox :model-value="allSelected" aria-label="Select all" @update:model-value="toggleSelectAll(!!$event)" />
                 </th>
                 <th class="text-left px-2 py-1.5 font-medium">Name</th>
                 <th class="text-left px-2 py-1.5 font-medium hidden sm:table-cell">Size</th>
@@ -837,42 +709,24 @@ watch(
                 @keydown="onRowKeydown($event, entry)"
               >
                 <td class="px-3 py-1.5 align-middle">
-                  <UCheckbox
-                    :model-value="selection.has(entry.path)"
-                    :aria-label="`Select ${entry.name}`"
-                    @update:model-value="toggleSelect(entry, !!$event)"
-                    @click.stop
-                  />
+                  <UCheckbox :model-value="selection.has(entry.path)" :aria-label="`Select ${entry.name}`" @update:model-value="toggleSelect(entry, !!$event)" @click.stop />
                 </td>
                 <td class="px-2 py-1.5">
                   <button
                     type="button"
                     class="flex items-center gap-2 min-w-0 text-left w-full focus-visible:outline-none"
                     :disabled="entry.type === 'symlink' && entry.linkEscapes"
-                    :title="entry.type === 'symlink' && entry.linkEscapes
-                      ? `Symlink escapes /workspace: ${entry.linkTarget}`
-                      : entry.type === 'symlink'
-                        ? `Symlink → ${entry.linkTarget}`
-                        : entry.name"
+                    :title="entry.type === 'symlink' && entry.linkEscapes ? `Symlink escapes /workspace: ${entry.linkTarget}` : entry.type === 'symlink' ? `Symlink → ${entry.linkTarget}` : entry.name"
                     @dblclick="openEntry(entry)"
                     @click="focusRow(entry)"
                   >
                     <UIcon
                       :name="iconFor(entry)"
                       class="size-4 shrink-0"
-                      :class="isDir(entry)
-                        ? 'text-blue-500 dark:text-blue-400'
-                        : entry.type === 'symlink' && entry.linkEscapes
-                          ? 'text-red-500 dark:text-red-400'
-                          : 'text-gray-400 dark:text-gray-500'"
+                      :class="isDir(entry) ? 'text-blue-500 dark:text-blue-400' : entry.type === 'symlink' && entry.linkEscapes ? 'text-red-500 dark:text-red-400' : 'text-gray-400 dark:text-gray-500'"
                     />
                     <span class="truncate text-gray-900 dark:text-white">{{ entry.name }}</span>
-                    <UIcon
-                      v-if="entry.type === 'symlink' && entry.linkEscapes"
-                      name="i-lucide-alert-triangle"
-                      class="size-3.5 text-amber-500 dark:text-amber-400 shrink-0"
-                      aria-hidden="true"
-                    />
+                    <UIcon v-if="entry.type === 'symlink' && entry.linkEscapes" name="i-lucide-alert-triangle" class="size-3.5 text-amber-500 dark:text-amber-400 shrink-0" aria-hidden="true" />
                   </button>
                 </td>
                 <td class="px-2 py-1.5 hidden sm:table-cell text-xs text-gray-500 dark:text-gray-400 font-mono">
@@ -888,10 +742,18 @@ watch(
 
         <!-- Footer -->
         <div class="flex items-center justify-between gap-2 px-4 py-2 border-t border-gray-200 dark:border-gray-800 text-xs text-gray-500 dark:text-gray-400">
-          <span class="truncate">
-            <UIcon name="i-lucide-folder" class="size-3.5 mr-1 align-text-bottom" />{{ uploadDestinationLabel }}
-          </span>
-          <UButton size="xs" color="neutral" variant="ghost" @click="() => { open = false }">Close</UButton>
+          <span class="truncate"> <UIcon name="i-lucide-folder" class="size-3.5 mr-1 align-text-bottom" />{{ uploadDestinationLabel }} </span>
+          <UButton
+            size="xs"
+            color="neutral"
+            variant="ghost"
+            @click="
+              () => {
+                open = false;
+              }
+            "
+            >Close</UButton
+          >
         </div>
       </div>
     </template>

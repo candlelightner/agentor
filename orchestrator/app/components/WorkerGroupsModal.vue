@@ -11,6 +11,8 @@ const { groups, create, update, remove, adminAction } = useWorkerGroups();
 const name = ref("");
 const error = ref("");
 const busy = ref("");
+const filesWorkspace = ref<GroupAdminWorkspace | null>(null);
+const showFiles = ref(false);
 async function run(key: string, operation: () => Promise<unknown>) {
   busy.value = key;
   error.value = "";
@@ -51,6 +53,10 @@ async function admin(
 function openService(workspace: GroupAdminWorkspace, service: string) {
   emit("service", workspace.id, service);
   open.value = false;
+}
+function openFiles(workspace: GroupAdminWorkspace) {
+  filesWorkspace.value = workspace;
+  showFiles.value = true;
 }
 </script>
 <template>
@@ -142,6 +148,12 @@ function openService(workspace: GroupAdminWorkspace, service: string) {
                 @click="admin(group, 'rebuild')"
                 >Rebuild</UButton
               ><UButton
+                size="xs"
+                variant="ghost"
+                :disabled="group.adminWorkspace.status !== 'running'"
+                @click="openFiles(group.adminWorkspace)"
+                >Files</UButton
+              ><UButton
                 v-for="service in group.adminWorkspace.services"
                 :key="service"
                 size="xs"
@@ -155,4 +167,13 @@ function openService(workspace: GroupAdminWorkspace, service: string) {
       </section>
     </template></UModal
   >
+  <WorkspaceFilesModal
+    v-if="filesWorkspace"
+    v-model:open="showFiles"
+    :container="{
+      id: filesWorkspace.id,
+      displayName: 'Group administrator',
+      status: filesWorkspace.status,
+    }"
+  />
 </template>
