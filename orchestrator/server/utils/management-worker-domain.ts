@@ -77,7 +77,10 @@ export class ManagementWorkerDomain {
     if (name === "workers.create") {
       const userId = required(args.userId, "userId");
       const catalog=useImageCatalogManager(); await catalog.init();
-      const selection=catalog.resolveSelection(userId,optionalString(args.imageDefinitionId),optionalString(args.imageVersion));
+      const imageCatalogGroupId=optionalString(args.imageCatalogGroupId);
+      const selection=imageCatalogGroupId
+        ? catalog.resolveSelectionForGroup(userId,imageCatalogGroupId,optionalString(args.imageDefinitionId),optionalString(args.imageVersion))
+        : catalog.resolveSelection(userId,optionalString(args.imageDefinitionId),optionalString(args.imageVersion));
       const request: CreateContainerRequest = { userId, displayName: optionalString(args.displayName), environmentId: optionalString(args.environmentId), initScript: optionalString(args.initScript), repos: array(args.repos), mounts: array(args.mounts), workerConfiguration: configInput(args.configuration), imageDefinitionId:selection?.definitionId, imageVersion:selection?.version, imageDigest:selection?.digest, imageRuntimeReference:selection?.runtimeImage } as CreateContainerRequest;
       return { handled:true, result: await cm.create(request) };
     }

@@ -33,6 +33,9 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
   let createdByGroupId = "";
   let workspaceId = "";
   let credential = "";
+  let groupImageId = "";
+  let globalImageId = "";
+  let groupImageWorkerId = "";
   const previousDelegatedPolicy: Record<string, boolean> = {};
 
   async function issueCredential(request: APIRequestContext) {
@@ -57,7 +60,7 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     const policy = await (await request.get("/api/admin/management-mcp/policy")).json();
     const delegatedGroups = [
       "worker-lifecycle", "configuration", "console", "exports", "backups",
-      "locks", "apps", "running-files", "networking", "storage",
+      "locks", "apps", "running-files", "networking", "storage", "images", "image-builds",
     ];
     const enabled: Record<string, boolean> = {};
     for (const name of delegatedGroups) {
@@ -68,10 +71,20 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
   });
 
   test.afterAll(async ({ request }) => {
+    if (groupImageWorkerId) {
+      await cleanupWorker(ownerRequest, groupImageWorkerId).catch(() => {});
+      groupImageWorkerId = "";
+    }
+    if (groupImageId && workspaceId) {
+      await issueCredential(request).catch(() => {});
+      await invoke(request, credential, "images.delete", { definitionId: groupImageId }).catch(() => {});
+    }
+    if (globalImageId)
+      await ownerRequest.delete(`/api/image-catalog/definitions/${globalImageId}`).catch(() => {});
     if (Object.keys(previousDelegatedPolicy).length)
       await request.put("/api/admin/management-mcp/policy", { data: { groups: previousDelegatedPolicy } }).catch(() => {});
     if (groupId) await ownerRequest.delete(`/api/worker-groups/${groupId}`).catch(() => {});
-    for (const workerId of [memberId, addedMemberId, outsiderId, createdByGroupId]) {
+    for (const workerId of [memberId, addedMemberId, outsiderId, createdByGroupId, groupImageWorkerId]) {
       if (workerId) await cleanupWorker(ownerRequest, workerId).catch(() => {});
     }
     await ownerRequest?.dispose();
@@ -156,13 +169,25 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     await issueCredential(request);
     const discovery=await request.post("/api/admin/management-mcp/diagnostics/list-tools",{data:{credential}});
     expect(discovery.status()).toBe(200);
-    const toolNames=(await discovery.json()).map((tool:{name:string})=>tool.name);
+    const discoveredTools = await discovery.json() as Array<{ name: string; description: string; inputSchema: { required?: string[]; properties?: Record<string, unknown> } }>;
+    const toolNames=discoveredTools.map((tool)=>tool.name);
     expect(toolNames).toContain("workers.inspect");
     expect(toolNames).not.toContain("groups.update");
     expect(toolNames).toContain("workers.create");
     expect(toolNames).not.toContain("port-mappings.list");
     expect(toolNames).toEqual(expect.arrayContaining(["workspaces.list", "workspaces.files", "workspaces.preview", "workspaces.download"]));
-    for (const unavailable of ["workspaces.clone", "imports.prepare", "images.build", "networks.create"])
+    expect(toolNames).toEqual(expect.arrayContaining([
+      "images.list", "images.get", "images.create", "images.update", "images.validate",
+      "images.delete", "images.delete-version", "images.build", "images.build-status",
+      "images.build-logs", "images.build-cancel", "images.promote", "images.rollback",
+    ]));
+    for (const tool of discoveredTools.filter((item) => item.name.startsWith("images."))) {
+      expect(tool.description).toContain("private image catalog");
+      expect(tool.inputSchema.required || []).not.toContain("ownerId");
+      expect(tool.inputSchema.properties || {}).not.toHaveProperty("ownerId");
+      expect(tool.inputSchema.properties || {}).not.toHaveProperty("groupId");
+    }
+    for (const unavailable of ["workspaces.clone", "imports.prepare", "images.default", "images.git-sync", "networks.create"])
       expect(toolNames).not.toContain(unavailable);
     const listed = await invoke(request, credential, "workers.list");
     expect(listed.status()).toBe(200);
@@ -261,6 +286,65 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     expect(deniedBridge).not.toContain(outsiderId);
   });
 
+  test("manages a private group image catalog without exposing the owner catalog", async ({ request }) => {
+    await issueCredential(request);
+    const definition = {
+      name: `group-private-${Date.now()}`,
+      description: "group private image",
+      baseImage: "agentor-worker:approved-test",
+      dockerfileFragment: "RUN echo group-private",
+      contextFiles: [],
+    };
+    const created = await invoke(request, credential, "images.create", { definition });
+    expect(created.status()).toBe(200);
+    const groupImage = await created.json();
+    groupImageId = groupImage.id;
+    expect(groupImage).toMatchObject({ ownerId: owner.id, groupId });
+    expect((await ownerRequest.delete(`/api/worker-groups/${groupId}`)).status()).toBe(409);
+
+    const globalCreated = await ownerRequest.post("/api/image-catalog/definitions", { data: { ...definition, name: `${definition.name}-global` } });
+    expect(globalCreated.status()).toBe(201);
+    globalImageId = (await globalCreated.json()).id;
+
+    const listed = await invoke(request, credential, "images.list");
+    expect((await listed.json()).map((item: { id: string }) => item.id)).toEqual([groupImageId]);
+    expect((await invoke(request, credential, "images.list", { ownerId: owner.id })).status()).toBe(404);
+    expect((await invoke(request, credential, "images.list", { groupId })).status()).toBe(404);
+    expect((await invoke(request, credential, "images.get", { definitionId: groupImageId })).status()).toBe(200);
+    const denied = await invoke(request, credential, "images.get", { definitionId: globalImageId });
+    const unknown = await invoke(request, credential, "images.get", { definitionId: randomUUID() });
+    expect(denied.status()).toBe(404);
+    expect(await denied.json()).toEqual(await unknown.json());
+
+    const updated = await invoke(request, credential, "images.update", {
+      definitionId: groupImageId,
+      definition: { ...definition, description: "updated in group only" },
+    });
+    expect(updated.status()).toBe(200);
+    expect((await updated.json()).description).toBe("updated in group only");
+
+    const build = await invoke(request, credential, "images.build", { definitionId: groupImageId, builder: "fake" });
+    expect(build.status()).toBe(200);
+    const buildId = (await build.json()).id;
+    await expect.poll(async () => {
+      const response = await invoke(request, credential, "images.build-status", { buildId });
+      return (await response.json()).status;
+    }, { timeout: 10_000 }).toBe("succeeded");
+    expect((await invoke(request, credential, "images.build-logs", { buildId })).status()).toBe(200);
+    expect((await invoke(request, credential, "images.promote", { definitionId: groupImageId, version: "v1" })).status()).toBe(200);
+
+    const ownerCatalog = await ownerRequest.get("/api/image-catalog/definitions");
+    expect((await ownerCatalog.json()).map((item: { id: string }) => item.id)).not.toContain(groupImageId);
+    expect((await invoke(request, credential, "images.build", { definitionId: globalImageId, builder: "fake" })).status()).toBe(404);
+
+    // Catalog builds can refresh Docker inventory. Reconcile the persistent
+    // external admin runtime before later tests exercise its terminal.
+    const reconciled = await ownerRequest.post(`/api/worker-groups/${groupId}/admin-workspace`, { data: {} });
+    expect(reconciled.status()).toBe(200);
+    expect((await reconciled.json()).id).toBe(workspaceId);
+
+  });
+
   test("membership changes grant and revoke MCP authority immediately", async ({ request }) => {
     await issueCredential(request);
     const opened = await invoke(request, credential, "console.open", { workerId: memberId });
@@ -324,5 +408,14 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     // known: those bindings always come from the workload identity.
     expect((await invoke(request, credential, "workers.create", { displayName: "forbidden", userId: owner.id })).status()).toBe(404);
     expect((await invoke(request, credential, "workers.create", { displayName: "forbidden", groupId })).status()).toBe(404);
+
+    const workerFromImage = await invoke(request, credential, "workers.create", {
+      displayName: `group-image-worker-${Date.now()}`,
+      imageDefinitionId: groupImageId,
+      imageVersion: "v1",
+    });
+    expect(workerFromImage.status()).toBe(200);
+    groupImageWorkerId = (await workerFromImage.json()).id;
+    expect((await (await ownerRequest.get(`/api/worker-groups/${groupId}`)).json()).workerIds).toContain(groupImageWorkerId);
   });
 });

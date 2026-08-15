@@ -22,6 +22,8 @@ export interface ImageVersion {
 export interface ImageDefinition {
   id: string;
   ownerId: string;
+  /** Absent for the owner/global catalog; set for a group-private catalog. */
+  groupId?: string;
   name: string;
   description: string;
   baseImage: string;
@@ -36,6 +38,7 @@ export interface ImageBuild {
   id: string;
   definitionId: string;
   ownerId: string;
+  groupId?: string;
   status: ImageBuildStatus;
   phase: string;
   createdAt: string;
@@ -147,7 +150,14 @@ export class ImageCatalogManager {
   }
 
   list(ownerId: string, admin: boolean) {
-    return this.state.definitions.filter((d) => admin || d.ownerId === ownerId);
+    return this.state.definitions.filter(
+      (d) => admin || (d.ownerId === ownerId && !d.groupId),
+    );
+  }
+  listForGroup(ownerId: string, groupId: string) {
+    return this.state.definitions.filter(
+      (d) => d.ownerId === ownerId && d.groupId === groupId,
+    );
   }
   ownerIds() {
     return [
@@ -224,6 +234,49 @@ export class ImageCatalogManager {
       versions: [],
     };
     this.state.definitions.push(item);
+    await this.persist();
+    return item;
+  }
+  async update(id: string, ownerId: string, admin: boolean, input: any) {
+    const item = this.definition(id, ownerId, admin);
+    if (item.groupId) httpError(404, "Image definition not found");
+    const cleaned = validateDefinition(input);
+    Object.assign(item, cleaned, { updatedAt: now() });
+    await this.persist();
+    return item;
+  }
+  async createForGroup(ownerId: string, groupId: string, input: any) {
+    const cleaned = validateDefinition(input);
+    const stamp = now();
+    const item: ImageDefinition = {
+      id: randomUUID(),
+      ownerId,
+      groupId,
+      ...cleaned,
+      createdAt: stamp,
+      updatedAt: stamp,
+      versions: [],
+    };
+    this.state.definitions.push(item);
+    await this.persist();
+    return item;
+  }
+  definitionForGroup(id: string, ownerId: string, groupId: string) {
+    const item = this.state.definitions.find(
+      (d) => d.id === id && d.ownerId === ownerId && d.groupId === groupId,
+    );
+    if (!item) httpError(404, "Image definition not found");
+    return item;
+  }
+  async updateForGroup(
+    id: string,
+    ownerId: string,
+    groupId: string,
+    input: any,
+  ) {
+    const item = this.definitionForGroup(id, ownerId, groupId);
+    const cleaned = validateDefinition(input);
+    Object.assign(item, cleaned, { updatedAt: now() });
     await this.persist();
     return item;
   }
@@ -331,8 +384,18 @@ export class ImageCatalogManager {
             : Promise.resolve(),
         ),
       );
+      await Promise.all(
+        this.state.builds
+          .filter((build) => build.definitionId === id && build.artifactTag)
+          .map((build) =>
+            this.docker.getImage(build.artifactTag!).remove({ force: true }).catch(() => {}),
+          ),
+      );
       this.state.definitions = this.state.definitions.filter(
         (d) => d.id !== id,
+      );
+      this.state.builds = this.state.builds.filter(
+        (build) => build.definitionId !== id,
       );
       await this.persist();
     } finally {
@@ -367,6 +430,7 @@ export class ImageCatalogManager {
       id: randomUUID(),
       definitionId: id,
       ownerId: definition.ownerId,
+      groupId: definition.groupId,
       status: "queued",
       phase: "queued",
       createdAt: stamp,
@@ -662,6 +726,16 @@ export class ImageCatalogManager {
     if (!admin && b.ownerId !== ownerId) httpError(403, "Forbidden");
     return b;
   }
+  buildForGroup(id: string, ownerId: string, groupId: string) {
+    const build = this.state.builds.find(
+      (candidate) =>
+        candidate.id === id &&
+        candidate.ownerId === ownerId &&
+        candidate.groupId === groupId,
+    );
+    if (!build) httpError(404, "Build not found");
+    return build;
+  }
   async cancelBuild(id: string, ownerId: string, admin: boolean) {
     const b = this.build(id, ownerId, admin);
     if (!["queued", "running"].includes(b.status)) return publicBuild(b);
@@ -733,6 +807,7 @@ export class ImageCatalogManager {
 
   async setUserDefault(ownerId: string, definitionId: string, version: string) {
     const d = this.definition(definitionId, ownerId, false);
+    if (d.groupId) httpError(404, "Image definition not found");
     const v = findVersion(d, version);
     this.state.userDefaults[ownerId] = { definitionId, version };
     await this.persist();
@@ -744,6 +819,7 @@ export class ImageCatalogManager {
     ownerId: string,
   ) {
     const d = this.definition(definitionId, ownerId, true);
+    if (d.groupId) httpError(404, "Image definition not found");
     const v = findVersion(d, version);
     this.state.systemDefault = { definitionId, version };
     await this.persist();
@@ -792,6 +868,33 @@ export class ImageCatalogManager {
         409,
         "Recovered image metadata has no pullable immutable GHCR reference; rebuild this version locally",
       );
+    return {
+      definitionId: definition.id,
+      version: built.version,
+      digest: built.digest,
+      runtimeImage: built.runtimeImage,
+    };
+  }
+  resolveSelectionForGroup(
+    ownerId: string,
+    groupId: string,
+    definitionId?: string,
+    version?: string,
+  ) {
+    if (!definitionId) return this.resolveSelection(ownerId);
+    const definition = this.state.definitions.find(
+      (candidate) =>
+        candidate.id === definitionId &&
+        candidate.ownerId === ownerId &&
+        (!candidate.groupId || candidate.groupId === groupId),
+    );
+    if (!definition) httpError(404, "Image definition not found");
+    const built = findVersion(
+      definition,
+      version || definition.promotedVersion || "",
+    );
+    if (built.recovered && !built.runtimeImage)
+      httpError(409, "Recovered image metadata has no runnable immutable reference");
     return {
       definitionId: definition.id,
       version: built.version,

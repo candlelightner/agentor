@@ -5,6 +5,7 @@ import {
   useManagedNetworkStore,
   useWorkerGroupStore,
 } from "./services";
+import { useImageCatalogManager } from "./image-catalog";
 import type { WorkerGroup } from "./worker-group-store";
 import { verifyWorkerMutationUnlocks } from "./worker-protection-lock";
 
@@ -224,7 +225,15 @@ export function addWorkerToGroupWithNetworks(
   );
 }
 
-export function deleteWorkerGroup(userId: string, groupId: string) {
+export async function deleteWorkerGroup(userId: string, groupId: string) {
+  const catalog = useImageCatalogManager();
+  await catalog.init();
+  if (catalog.listForGroup(userId, groupId).length)
+    throw createError({
+      statusCode: 409,
+      statusMessage:
+        "Worker group has private image definitions. Delete them before deleting the group.",
+    });
   return useWorkerGroupNetworkCoordinator().delete(userId, groupId);
 }
 

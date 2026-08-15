@@ -125,13 +125,30 @@ const GROUP_ADMIN_TOOLS = new Set([
   "workspaces.files",
   "workspaces.preview",
   "workspaces.download",
+  "images.list",
+  "images.get",
+  "images.create",
+  "images.update",
+  "images.validate",
+  "images.delete",
+  "images.delete-version",
+  "images.build",
+  "images.build-status",
+  "images.build-logs",
+  "images.build-cancel",
+  "images.promote",
+  "images.rollback",
 ]);
+const GROUP_ADMIN_IMAGE_TOOLS = new Set(
+  [...GROUP_ADMIN_TOOLS].filter((name) => name.startsWith("images.")),
+);
 const GROUP_ADMIN_TARGET_FREE_TOOLS = new Set([
   "status.system",
   "workers.list",
   "volumes.list",
   "apps.types",
   "workspaces.list",
+  ...GROUP_ADMIN_IMAGE_TOOLS,
 ]);
 const GROUP_ADMIN_DIRECT_TARGET_TOOLS = new Set([
   "workers.inspect",
@@ -281,6 +298,7 @@ const TOOL_GROUP: Record<string, Group> = {
   "backups.status": "backups",
   "backups.cancel": "backups",
   "images.validate": "image-builds",
+  "images.update": "image-builds",
   "images.build": "image-builds",
   "images.build-status": "image-builds",
   "configuration.propose": "configuration-proposals",
@@ -423,6 +441,8 @@ export class ManagementMcpStore {
           description:
             (identity?.scope === "group" && name === "workers.create"
               ? "Create an evaluation worker owned by and atomically enrolled in this administrative group. The owner and group are derived from the workspace identity."
+              : identity?.scope === "group" && GROUP_ADMIN_IMAGE_TOOLS.has(name)
+                ? `${imageBackup?.description || "Manage an image"} in this worker group's private image catalog. Global and other-group image definitions are not visible or mutable.`
               : undefined) ||
             domain?.description ||
             workspace?.description ||
@@ -439,6 +459,8 @@ export class ManagementMcpStore {
           inputSchema:
             (identity?.scope === "group" && name === "workers.create"
               ? groupWorkerCreateInputSchema()
+              : identity?.scope === "group" && GROUP_ADMIN_IMAGE_TOOLS.has(name)
+                ? groupImageInputSchema(name)
               : undefined) ||
             domain?.inputSchema ||
             workspace?.inputSchema ||
@@ -611,6 +633,11 @@ export class ManagementMcpStore {
         if (args.userId !== undefined || args.ownerId !== undefined || args.groupId !== undefined)
           throw groupResourceNotFound();
         args = { ...args, userId: identity.ownerId };
+      }
+      if (identity.scope === "group" && GROUP_ADMIN_IMAGE_TOOLS.has(name)) {
+        if (args.ownerId !== undefined || args.groupId !== undefined)
+          throw groupResourceNotFound();
+        args = { ...args, ownerId: identity.ownerId };
       }
       await validateManagementOwnerArguments(args);
       if (identity.scope === "group")
@@ -842,6 +869,8 @@ export class ManagementMcpStore {
     validateToolArguments(name, args);
     if (identity?.scope === "group" && name === "workers.create")
       return this.createGroupWorker(identity, args);
+    if (identity?.scope === "group" && GROUP_ADMIN_IMAGE_TOOLS.has(name))
+      return this.executeGroupImageTool(identity, name, args);
     const domain = await workerDomain.execute(name, args);
     if (domain.handled) return domain.result;
     const imageBackup = await imageBackupDomain.execute(
@@ -1027,7 +1056,10 @@ export class ManagementMcpStore {
     // reconciles dependent networks before this call returns.
     const group = useWorkerGroupStore().findById(identity.groupId);
     if (!group || group.userId !== identity.ownerId) throw groupResourceNotFound();
-    const created = await workerDomain.execute("workers.create", args);
+    const created = await workerDomain.execute("workers.create", {
+      ...args,
+      imageCatalogGroupId: identity.groupId,
+    });
     const worker = created.result as { id?: string } | undefined;
     if (!created.handled || !worker?.id)
       throw statusError(500, "Group worker creation failed");
@@ -1055,6 +1087,57 @@ export class ManagementMcpStore {
         );
       throw error;
     }
+  }
+  private async executeGroupImageTool(
+    identity: IdentityMetadata,
+    name: string,
+    args: Record<string, unknown>,
+  ) {
+    if (!identity.ownerId || !identity.groupId) throw groupResourceNotFound();
+    const liveGroup = useWorkerGroupStore().findById(identity.groupId);
+    if (!liveGroup || liveGroup.userId !== identity.ownerId)
+      throw groupResourceNotFound();
+    const catalog = useImageCatalogManager();
+    await catalog.init();
+    const ownerId = identity.ownerId;
+    const groupId = identity.groupId;
+    const definitionId = String(args.definitionId || "");
+    const buildId = String(args.buildId || "");
+    if (name === "images.list") return catalog.listForGroup(ownerId, groupId);
+    if (name === "images.validate") return catalog.validate(args.definition);
+    if (name === "images.create")
+      return catalog.createForGroup(ownerId, groupId, args.definition);
+    if (name === "images.get")
+      return catalog.definitionForGroup(definitionId, ownerId, groupId);
+    if (name === "images.update")
+      return catalog.updateForGroup(definitionId, ownerId, groupId, args.definition);
+    if (["images.build-status", "images.build-logs", "images.build-cancel"].includes(name)) {
+      catalog.buildForGroup(buildId, ownerId, groupId);
+      if (name === "images.build-status") return catalog.publicBuild(buildId, ownerId, true);
+      if (name === "images.build-logs")
+        return { logs: catalog.logs(buildId, ownerId, true, Number(args.after || 0)) };
+      return catalog.cancelBuild(buildId, ownerId, true);
+    }
+    catalog.definitionForGroup(definitionId, ownerId, groupId);
+    if (name === "images.build")
+      return catalog.startBuild(definitionId, ownerId, true, {
+        builder: args.builder === "fake" ? "fake" : "controlled",
+        baseImage: args.baseImage,
+      });
+    if (name === "images.delete") {
+      await catalog.removeDefinition(definitionId, ownerId, true);
+      return { deleted: true };
+    }
+    const version = String(args.version || "");
+    if (name === "images.delete-version") {
+      await catalog.deleteVersion(definitionId, version, ownerId, true);
+      return { deleted: true };
+    }
+    if (name === "images.promote")
+      return catalog.promote(definitionId, version, ownerId, true);
+    if (name === "images.rollback")
+      return catalog.rollback(definitionId, version, ownerId, true);
+    throw statusError(403, "Tool is unavailable to group administrative workspaces");
   }
   private groupWorkerIds(identity: IdentityMetadata) {
     const group = identity.groupId
@@ -1220,6 +1303,39 @@ function groupWorkerCreateInputSchema() {
       },
     },
   };
+}
+function groupImageInputSchema(name: string): Record<string, unknown> {
+  const source = imageBackupDomain.tools().find((tool) => tool.name === name)
+    ?.inputSchema as any;
+  if (name === "images.update") {
+    const create = imageBackupDomain.tools().find(
+      (tool) => tool.name === "images.create",
+    )?.inputSchema as any;
+    return {
+      ...structuredClone(create),
+      required: ["definitionId", "definition"],
+      properties: {
+        ...structuredClone(create?.properties || {}),
+        ownerId: undefined,
+        definitionId: {
+          type: "string",
+          minLength: 1,
+          description: "A definition in this worker group's private image catalog.",
+        },
+      },
+    };
+  }
+  const schema = structuredClone(source || { type: "object", properties: {} });
+  schema.required = (schema.required || []).filter(
+    (key: string) => key !== "ownerId",
+  );
+  if (schema.properties) {
+    delete schema.properties.ownerId;
+    delete schema.properties.system;
+  }
+  schema.description =
+    "This operation is restricted to the calling administrative workspace's private worker-group image catalog. Global and other-group definitions are never addressable.";
+  return schema;
 }
 function validateToolArguments(name: string, args: Record<string, unknown>) {
   const definitions = [
