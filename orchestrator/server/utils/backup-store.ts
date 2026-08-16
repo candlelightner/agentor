@@ -31,7 +31,8 @@ function normalizeStoredUserBackupData(userId: string, value: any): UserBackupDa
     ? value.jobs.filter((job: any): job is BackupJob =>
         validOwnedRecord(userId, job) && validProvider(job.provider) &&
         validPathId(job.workspaceId) && validOptionalPathIds(job, ['artifactId', 'backupId', 'workerId']) &&
-        validOptionalPathIdArray(job.workspaceIds))
+        validOptionalPathIdArray(job.workspaceIds) && validOptionalPathIdArray(job.artifactWorkspaceIds) &&
+        validOptionalPathIdArray(job.selectedWorkspaceIds))
     : [];
   const artifacts = Array.isArray(value.artifacts)
     ? value.artifacts.filter((artifact: any): artifact is BackupArtifact =>

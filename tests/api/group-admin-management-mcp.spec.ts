@@ -221,6 +221,17 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     const discoveredTools = await discovery.json() as Array<{ name: string; description: string; inputSchema: { required?: string[]; properties?: Record<string, unknown> } }>;
     const toolNames=discoveredTools.map((tool)=>tool.name);
     expect(toolNames).toContain("workers.inspect");
+    // A group principal cannot restore a multi-worker artifact: new workers
+    // would otherwise be created outside its authoritative group assignment.
+    expect(toolNames).not.toContain("backups.restore");
+    const restoreDeniedAt = Date.now();
+    const directRestore = await invoke(request, credential, "backups.restore", {
+      artifactId: randomUUID(),
+      workspaceIds: [memberId],
+    });
+    expect(directRestore.status()).toBe(403);
+    expect(Date.now() - restoreDeniedAt).toBeLessThan(2_000);
+    expect(JSON.stringify(await directRestore.json())).not.toContain(memberId);
     expect(toolNames).toEqual(expect.arrayContaining(["workers.env-keys", "groups.env.list", "groups.env.update"]));
     expect(toolNames).toEqual(expect.arrayContaining([
       "admin-workspace.startup-script.get", "admin-workspace.startup-script.set",

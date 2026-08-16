@@ -72,6 +72,7 @@ test.describe
   let workspaceA = "";
   let workspaceB = "";
   let successfulBackupId = "";
+  let multiWorkspaceBackupId = "";
 
   test.beforeAll(async () => {
     owner = await createTestUser("Backup API Owner");
@@ -228,6 +229,7 @@ test.describe
       });
       const job = await waitForJob(ownerCtx, created.id);
       expect(job.status).toBe("succeeded");
+      multiWorkspaceBackupId = job.backupId;
       expect(job.workspaceIds).toEqual(
         expect.arrayContaining([workspaceA, workspaceB, archived]),
       );
@@ -266,6 +268,185 @@ test.describe
         .deleteArchivedWorker(archived)
         .catch(() => {});
     }
+  });
+
+  test("an existing multi-workspace artifact restores an explicit new-worker subset and defaults to every omitted workspace", async () => {
+    expect(multiWorkspaceBackupId).toBeTruthy();
+    const subsetResponse = await ownerCtx.post(
+      `/api/backups/${multiWorkspaceBackupId}/restore`,
+      { data: { target: "new", workspaceIds: [workspaceB] } },
+    );
+    expect(subsetResponse.status()).toBe(202);
+    const subset = await waitForJob(
+      ownerCtx,
+      (await subsetResponse.json()).jobId,
+    );
+    try {
+      expect(subset).toMatchObject({
+        status: "succeeded",
+        target: "new",
+        artifactWorkspaceIds: expect.arrayContaining([workspaceA, workspaceB]),
+        selectedWorkspaceIds: [workspaceB],
+        workerIds: [expect.any(String)],
+      });
+      expect(subset.workerIds).toHaveLength(1);
+      const restored = gunzipSync(
+        (await new ApiClient(ownerCtx).downloadWorkspace(subset.workerIds[0]))
+          .body,
+      ).toString("utf8");
+      expect(restored).toContain("workspace-b.txt");
+      expect(restored).not.toContain("roundtrip.txt");
+    } finally {
+      for (const id of subset.workerIds ?? [])
+        await cleanupWorker(ownerCtx, id).catch(() => {});
+    }
+
+    const allResponse = await ownerCtx.post(
+      `/api/backups/${multiWorkspaceBackupId}/restore`,
+      { data: { target: "new" } },
+    );
+    expect(allResponse.status()).toBe(202);
+    const all = await waitForJob(ownerCtx, (await allResponse.json()).jobId);
+    try {
+      expect(all).toMatchObject({
+        status: "succeeded",
+        artifactWorkspaceIds: expect.arrayContaining([workspaceA, workspaceB]),
+        selectedWorkspaceIds: expect.arrayContaining([workspaceA, workspaceB]),
+      });
+      expect(all.workerIds).toHaveLength(all.selectedWorkspaceIds.length);
+    } finally {
+      for (const id of all.workerIds ?? [])
+        await cleanupWorker(ownerCtx, id).catch(() => {});
+    }
+  });
+
+  test("the legacy synchronous artifact route restores the same exact subset", async () => {
+    expect(multiWorkspaceBackupId).toBeTruthy();
+    const response = await ownerCtx.post(
+      `/api/backups/artifacts/${multiWorkspaceBackupId}/restore`,
+      {
+        data: {
+          mode: "new",
+          workspaceIds: [workspaceB],
+          displayName: `legacy-subset-${Date.now()}`,
+        },
+        timeout: 120_000,
+      },
+    );
+    expect(response.status()).toBe(201);
+    const restored = await response.json();
+    try {
+      expect(restored.id).toEqual(expect.any(String));
+      const archive = gunzipSync(
+        (await new ApiClient(ownerCtx).downloadWorkspace(restored.id)).body,
+      ).toString("utf8");
+      expect(archive).toContain("workspace-b.txt");
+      expect(archive).not.toContain("roundtrip.txt");
+    } finally {
+      if (restored?.id)
+        await cleanupWorker(ownerCtx, restored.id).catch(() => {});
+    }
+  });
+
+  test("selective restore rejects empty, duplicate, and non-member workspace lists before creating a job", async () => {
+    const jobsBefore = (await (await ownerCtx.get("/api/backups")).json()).jobs
+      .length;
+    for (const workspaceIds of [
+      [],
+      [workspaceA, workspaceA],
+      ["not-in-artifact"],
+      workspaceA,
+    ]) {
+      const rejected = await ownerCtx.post(
+        `/api/backups/${multiWorkspaceBackupId}/restore`,
+        { data: { target: "new", workspaceIds } },
+      );
+      expect(rejected.status()).toBe(400);
+    }
+    expect((await (await ownerCtx.get("/api/backups")).json()).jobs).toHaveLength(
+      jobsBefore,
+    );
+  });
+
+  test("original-worker restore accepts one selected non-first artifact member and rejects multiple members", async () => {
+    expect(
+      (
+        await new ApiClient(ownerCtx).uploadToWorkspace(workspaceA, [
+          {
+            name: "workspace-a-after-multi-backup.txt",
+            content: Buffer.from("workspace A must remain untouched"),
+          },
+        ])
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await new ApiClient(ownerCtx).uploadToWorkspace(workspaceB, [
+          {
+            name: "workspace-b-after-multi-backup.txt",
+            content: Buffer.from("workspace B mutation must be removed"),
+          },
+        ])
+      ).status,
+    ).toBe(200);
+    expect(
+      (await ownerCtx.post(`/api/containers/${workspaceB}/stop`)).status(),
+    ).toBe(200);
+    const jobsBefore = (await (await ownerCtx.get("/api/backups")).json()).jobs
+      .length;
+    const multiple = await ownerCtx.post(
+      `/api/backups/${multiWorkspaceBackupId}/restore`,
+      {
+        data: {
+          target: "original",
+          confirmOverwrite: true,
+          workspaceIds: [workspaceA, workspaceB],
+        },
+      },
+    );
+    expect(multiple.status()).toBe(400);
+    expect((await (await ownerCtx.get("/api/backups")).json()).jobs).toHaveLength(
+      jobsBefore,
+    );
+
+    const single = await ownerCtx.post(
+      `/api/backups/${multiWorkspaceBackupId}/restore`,
+      {
+        data: {
+          target: "original",
+          confirmOverwrite: true,
+          workspaceIds: [workspaceB],
+        },
+      },
+    );
+    expect(single.status()).toBe(202);
+    const restore = await waitForJob(ownerCtx, (await single.json()).jobId);
+    expect(restore).toMatchObject({
+      status: "succeeded",
+      target: "original",
+      selectedWorkspaceIds: [workspaceB],
+      workerId: workspaceB,
+    });
+    const restoredB = await ownerCtx.get(
+      `/api/workspaces/${workspaceB}/download?path=workspace-b.txt`,
+    );
+    expect(restoredB.status()).toBe(200);
+    expect(await restoredB.text()).toContain("second workspace marker");
+    expect(
+      (
+        await ownerCtx.get(
+          `/api/workspaces/${workspaceB}/download?path=workspace-b-after-multi-backup.txt`,
+        )
+      ).status(),
+    ).toBe(404);
+    const untouchedA = await ownerCtx.get(
+      `/api/workspaces/${workspaceA}/download?path=workspace-a-after-multi-backup.txt`,
+    );
+    expect(untouchedA.status()).toBe(200);
+    expect(await untouchedA.text()).toContain("workspace A must remain untouched");
+    expect((await ownerCtx.post(`/api/containers/${workspaceB}/restart`)).status()).toBe(
+      200,
+    );
   });
 
   test("running workspace backup reports consistency strategy and warning", async () => {

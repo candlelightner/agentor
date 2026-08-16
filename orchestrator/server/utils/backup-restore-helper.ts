@@ -1,4 +1,5 @@
 import Docker from 'dockerode';
+import { withWorkerLifecycleMutation } from './worker-lifecycle-coordinator';
 import { createReadStream } from 'node:fs';
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -42,6 +43,7 @@ except BaseException:
 
 /** Same-filesystem staged replacement for a stopped worker workspace. */
 export async function replaceStoppedWorkspace(userId:string,workerId:string,workspaceArchive:string):Promise<void>{
+ return withWorkerLifecycleMutation(workerId,async()=>{
  assertSafeUserId(userId);
  const cm=useContainerManager(),worker=cm.get(workerId);if(!worker||worker.userId!==userId||worker.status!=='stopped')throw new Error('Original worker must be stopped for safe restore');
  const storage=useStorageManager(),config=useConfig(),source=storage.mode==='directory'?join(storage.dataRef,'users',userId,'workspaces',workerId):`${cm.buildContainerName(workerId)}-workspace`;
@@ -60,6 +62,7 @@ export async function replaceStoppedWorkspace(userId:string,workerId:string,work
   }
   let result=await useDockerService().execCapture(helper.id,['python3','-c',PREPARE],{user:'agent'});if(result.exitCode!==0)throw new Error('Restore staging area could not be prepared');await useDockerService().putArchive(helper.id,createReadStream(workspaceArchive),`/target/${STAGE}`);result=await useDockerService().execCapture(helper.id,['python3','-c',COMMIT],{user:'agent'});if(result.exitCode!==0)throw new Error('Workspace replacement failed and was rolled back');
  }finally{await helper.remove({force:true}).catch(()=>{});}
+ });
 }
 
 function isThreadedCgroupLimitError(error: unknown): boolean {

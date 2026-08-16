@@ -15,10 +15,14 @@ export interface BackupJob {
   createdAt: string; updatedAt: string; startedAt?: string; completedAt?: string; error?: string;
   artifactId?: string; size?: number; durationMs?: number; sha256?: string; attempt: number;
   ownerId?: string; workspaceIds?: string[]; backupId?: string; sizeBytes?: number;
+  /** Restore-only provenance and the exact selected artifact subset. */
+  artifactWorkspaceIds?: string[]; selectedWorkspaceIds?: string[];
   encrypted?: boolean; integrityVerified?: boolean; providerUploadId?: string; resumedFromChunk?: number;
   /** Durable cleanup marker set before a local/fake provider upload begins. */
   pendingProviderObjectId?: string;
-  consistency?: {workerState:string;strategy:string;warning:string}; target?:'new'|'original';workerId?:string;
+  consistency?: {workerState:string;strategy:string;warning:string}; target?:'new'|'original';workerId?:string;workerIds?:string[];
+  /** Restore display name is retained so an interrupted restore can retry safely. */
+  displayName?: string;
   missingSecrets?: Array<{name:string;type:string}>;
 }
 export interface BackupArtifact {

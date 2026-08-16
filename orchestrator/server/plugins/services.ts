@@ -250,7 +250,7 @@ export default defineNitroPlugin(async (nitroApp) => {
   // Start the orphan sweeper — on a 10-minute interval, prunes per-user
   // data for users that no longer exist in the auth DB. Uses a timer rather
   // than a middleware to avoid ever touching better-auth's request pipeline.
-  useOrphanSweeper().addCleanupHook((userId) =>
+  useOrphanSweeper().addPreCleanupHook((userId) =>
     useBackupManager().forgetUser(userId),
   );
   useOrphanSweeper().addCandidateSource(() => useBackupManager().ownerIds());

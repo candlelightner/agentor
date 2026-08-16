@@ -7,4 +7,12 @@ test('image and backup MCP domain exposes bounded tool surface and safe hints', 
   for (const name of ['images.list','images.create','images.update','images.build','images.build-logs','images.promote','images.rollback','images.delete-version','images.usage','images.test-worker','images.git-sync','backups.list','backups.providers','backups.create','backups.cancel','backups.retry','backups.delete','backups.restore']) expect(names).toContain(name);
   expect(tools.find(tool => tool.name === 'images.build-logs')?.annotations).toMatchObject({ readOnlyHint:true });
   expect(tools.find(tool => tool.name === 'backups.delete')?.annotations).toMatchObject({ destructiveHint:true });
+  const restore = tools.find(tool => tool.name === 'backups.restore');
+  expect(restore?.inputSchema).toMatchObject({
+    required: ['ownerId', 'artifactId'],
+    properties: {
+      workspaceIds: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 } },
+    },
+  });
+  expect(restore?.description).toContain('exact non-empty workspaceIds subset');
 });

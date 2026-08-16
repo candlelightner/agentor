@@ -42,6 +42,22 @@ async function invoke(
   });
 }
 
+async function waitForBackupJob(
+  request: APIRequestContext,
+  jobId: string,
+  timeout = 180_000,
+) {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    const response = await request.get(`/api/backup-jobs/${jobId}`);
+    expect(response.status()).toBe(200);
+    const job = await response.json();
+    if (["succeeded", "failed", "cancelled"].includes(job.status)) return job;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(`Backup job ${jobId} did not become terminal`);
+}
+
 test.describe.serial("Internal management MCP security", () => {
   let regular: CreatedUser;
   let regularCtx: APIRequestContext;
@@ -125,6 +141,115 @@ test.describe.serial("Internal management MCP security", () => {
       );
     } finally {
       await api.deleteArchivedWorker(archived.id).catch(() => {});
+    }
+  });
+
+  test("global-admin MCP restores only the selected member of a multi-workspace backup", { timeout: 360_000 }, async ({ request }) => {
+    const api = new ApiClient(regularCtx);
+    const second = await createWorker(regularCtx, {
+      displayName: `mcp-backup-second-${Date.now()}`,
+    });
+    let backupId = "";
+    let restoredWorkerId = "";
+    const marker = `MCP_SELECTIVE_RESTORE_${Date.now()}`;
+    try {
+      expect(
+        (
+          await regularCtx.post("/api/backup-providers/fake/connect", {
+            data: { testMode: true },
+          })
+        ).status(),
+      ).toBe(201);
+      expect(
+        (
+          await api.uploadToWorkspace(normalWorker, [
+            { name: "not-selected.txt", content: Buffer.from(`${marker}-A`) },
+          ])
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await api.uploadToWorkspace(second.id, [
+            { name: "selected.txt", content: Buffer.from(`${marker}-B`) },
+          ])
+        ).status,
+      ).toBe(200);
+      const backupResponse = await regularCtx.post("/api/backups", {
+        data: {
+          workspaceIds: [normalWorker, second.id],
+          providerId: "fake",
+        },
+      });
+      expect(backupResponse.status()).toBe(202);
+      const backup = await waitForBackupJob(
+        regularCtx,
+        (await backupResponse.json()).id,
+      );
+      expect(backup.status).toBe("succeeded");
+      backupId = backup.backupId;
+
+      // Backup/export can take most of the diagnostic identity's short TTL in
+      // nested Docker. Mint the credential immediately before the MCP call.
+      const identity = await request.post(
+        "/api/admin/management-mcp/diagnostics/issue-identity",
+        { data: { workspaceId: adminWorkspaceId, ttlSeconds: 60 } },
+      );
+      expect(identity.status()).toBe(201);
+      credential = (await identity.json()).credential;
+
+      expect(
+        (
+          await request.put("/api/admin/management-mcp/policy", {
+            data: { groups: { backups: true } },
+          })
+        ).status(),
+      ).toBe(200);
+      const restoreResponse = await invoke(request, credential, "backups.restore", {
+        ownerId: regular.id,
+        artifactId: backupId,
+        workspaceIds: [second.id],
+        displayName: `mcp-selected-${Date.now()}`,
+      });
+      expect(restoreResponse.status(), await restoreResponse.text()).toBe(200);
+      const queued = await restoreResponse.json();
+      expect(queued).toMatchObject({
+        artifactWorkspaceIds: expect.arrayContaining([normalWorker, second.id]),
+        selectedWorkspaceIds: [second.id],
+        workspaceIds: [second.id],
+        target: "new",
+      });
+      const pinnedDelete = await invoke(request, credential, "backups.delete", {
+        ownerId: regular.id,
+        artifactId: backupId,
+      });
+      expect(pinnedDelete.status()).toBe(409);
+      expect(JSON.stringify(await pinnedDelete.json())).not.toContain(marker);
+      const restored = await waitForBackupJob(regularCtx, queued.id);
+      expect(restored).toMatchObject({
+        status: "succeeded",
+        selectedWorkspaceIds: [second.id],
+        workerIds: [expect.any(String)],
+      });
+      restoredWorkerId = restored.workerIds[0];
+      expect(restored.workerIds).toHaveLength(1);
+      const output = await captureCommandOutput(
+        restoredWorkerId,
+        "test -f /workspace/selected.txt && test ! -e /workspace/not-selected.txt && cat /workspace/selected.txt",
+        30_000,
+      );
+      expect(output).toContain(`${marker}-B`);
+      expect(output).not.toContain(`${marker}-A`);
+    } finally {
+      await request
+        .put("/api/admin/management-mcp/policy", {
+          data: { groups: { backups: false } },
+        })
+        .catch(() => {});
+      if (restoredWorkerId)
+        await cleanupWorker(regularCtx, restoredWorkerId).catch(() => {});
+      if (backupId)
+        await regularCtx.delete(`/api/backups/${backupId}`).catch(() => {});
+      await cleanupWorker(regularCtx, second.id).catch(() => {});
     }
   });
 

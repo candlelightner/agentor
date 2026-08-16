@@ -51,6 +51,12 @@ export interface BackupArtifact {
   size?: number;
   integrityVerified?: boolean;
   missingSecrets?: string[];
+  /** Member labels are present on newer multi-worker backup artifacts. */
+  workspaceMembers?: BackupWorkspaceMember[];
+}
+export interface BackupWorkspaceMember {
+  id: string;
+  displayName?: string;
 }
 
 const message = (e: any, fallback: string) =>
@@ -161,6 +167,7 @@ export function useBackups() {
     displayName = "",
     confirmOverwrite = false,
     lockPassword = "",
+    workspaceIds?: string[],
   ) {
     return $fetch<{ jobId: string }>(
       `/api/backups/${encodeURIComponent(id)}/restore`,
@@ -170,6 +177,7 @@ export function useBackups() {
           target,
           displayName,
           confirmOverwrite,
+          ...(workspaceIds === undefined ? {} : { workspaceIds }),
           ...(target === "original" && lockPassword ? { lockPassword } : {}),
         },
       },

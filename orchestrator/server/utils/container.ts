@@ -47,6 +47,7 @@ import type {
   FileListing,
   MoveConflict,
 } from "../../shared/types";
+import { withWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
 import { getAllGitCloneDomains } from "./git-providers";
 import { getAllAgentApiDomains } from "./agent-config";
 import {
@@ -1412,6 +1413,10 @@ export class ContainerManager {
   }
 
   async stop(id: string): Promise<void> {
+    return withWorkerLifecycleMutation(id, () => this.stopUnlocked(id));
+  }
+
+  private async stopUnlocked(id: string): Promise<void> {
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
@@ -1423,6 +1428,10 @@ export class ContainerManager {
   }
 
   async restart(id: string): Promise<void> {
+    return withWorkerLifecycleMutation(id, () => this.restartUnlocked(id));
+  }
+
+  private async restartUnlocked(id: string): Promise<void> {
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
@@ -1597,6 +1606,10 @@ export class ContainerManager {
   }
 
   async remove(id: string): Promise<void> {
+    return withWorkerLifecycleMutation(id, () => this.removeUnlocked(id));
+  }
+
+  private async removeUnlocked(id: string): Promise<void> {
     const info = this.containers.get(id);
     if (info) this.assertOrdinaryMutation(info);
     if (info) useLogCollector().detach(info.containerId);
@@ -1654,6 +1667,10 @@ export class ContainerManager {
   }
 
   async archive(id: string): Promise<void> {
+    return withWorkerLifecycleMutation(id, () => this.archiveUnlocked(id));
+  }
+
+  private async archiveUnlocked(id: string): Promise<void> {
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
@@ -1676,6 +1693,10 @@ export class ContainerManager {
   }
 
   async rebuild(id: string): Promise<ContainerInfo> {
+    return withWorkerLifecycleMutation(id, () => this.rebuildUnlocked(id));
+  }
+
+  private async rebuildUnlocked(id: string): Promise<ContainerInfo> {
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
@@ -1814,6 +1835,15 @@ export class ContainerManager {
   }
 
   async unarchive(userId: string, id: string): Promise<ContainerInfo> {
+    return withWorkerLifecycleMutation(id, () =>
+      this.unarchiveUnlocked(userId, id),
+    );
+  }
+
+  private async unarchiveUnlocked(
+    userId: string,
+    id: string,
+  ): Promise<ContainerInfo> {
     if (!this.workerStore) throw new Error("WorkerStore not available");
 
     const worker = this.workerStore.get(userId, id);
@@ -1938,6 +1968,15 @@ export class ContainerManager {
   }
 
   async deleteArchived(userId: string, id: string): Promise<void> {
+    return withWorkerLifecycleMutation(id, () =>
+      this.deleteArchivedUnlocked(userId, id),
+    );
+  }
+
+  private async deleteArchivedUnlocked(
+    userId: string,
+    id: string,
+  ): Promise<void> {
     if (!this.workerStore) throw new Error("WorkerStore not available");
 
     const worker = this.workerStore.get(userId, id);

@@ -14,6 +14,8 @@ const api = useBackups(),
 const busy = ref(""),
   restoreItem = ref<any>(null),
   restoreTarget = ref<"new" | "original">("new"),
+  restoreWorkspaceIds = ref<string[]>([]),
+  workspaceNames = ref<Record<string, string>>({}),
   restoreName = ref(""),
   restoreLockPassword = ref(""),
   confirmOverwrite = ref(false),
@@ -22,6 +24,7 @@ const googleDraft = reactive({ clientId: "", redirectUri: "", clientSecret: "" }
 watch(open, async (shown) => {
   if (shown) {
     await api.refresh();
+    await refreshWorkspaceNames();
     Object.assign(draft, {
       ...api.settings.value,
       workspaceText: api.settings.value.workspaceIds.join(", "),
@@ -77,7 +80,7 @@ async function configureGoogle() {
   });
 }
 async function restore() {
-  if (!restoreItem.value) return;
+  if (!restoreItem.value || !restoreWorkspaceIds.value.length) return;
   const result = await run("restore", () =>
     api.restore(
       restoreItem.value.id,
@@ -85,12 +88,12 @@ async function restore() {
       restoreName.value,
       confirmOverwrite.value,
       restoreLockPassword.value,
+      restoreWorkspaceIds.value,
     ),
   );
   if (result) {
     emit("restored", result.jobId);
-    restoreItem.value = null;
-    restoreLockPassword.value = "";
+    cancelRestore();
   }
 }
 const fmt = (n?: number) => (n == null ? "—" : formatBytes(n)),
@@ -100,12 +103,67 @@ function close() {
 }
 function selectRestore(item: any) {
   restoreItem.value = item;
+  restoreTarget.value = "new";
+  restoreWorkspaceIds.value = restoreMembers(item).map((member) => member.id);
+  restoreName.value = "";
+  confirmOverwrite.value = false;
   restoreLockPassword.value = "";
 }
 function cancelRestore() {
   restoreItem.value = null;
+  restoreWorkspaceIds.value = [];
+  restoreName.value = "";
+  confirmOverwrite.value = false;
   restoreLockPassword.value = "";
 }
+function restoreMembers(item = restoreItem.value): Array<{ id: string; displayName?: string }> {
+  if (!item) return [];
+  if (Array.isArray(item.workspaceMembers) && item.workspaceMembers.length)
+    return item.workspaceMembers;
+  const workspaceIds: string[] = Array.isArray(item.workspaceIds)
+    ? item.workspaceIds.filter((id: unknown): id is string => typeof id === "string")
+    : typeof item.workspaceId === "string"
+      ? [item.workspaceId]
+      : [];
+  return [...new Set(workspaceIds)]
+    .filter(Boolean)
+    .map((id: string) => ({ id, displayName: workspaceNames.value[id] }));
+}
+async function refreshWorkspaceNames() {
+  try {
+    const workers = await $fetch<Array<{ id: string; displayName?: string }>>(
+      "/api/containers",
+    );
+    workspaceNames.value = Object.fromEntries(
+      workers.map((worker) => [worker.id, worker.displayName || worker.id]),
+    );
+  } catch {
+    // Artifact IDs remain usable when a source worker has since been removed.
+    workspaceNames.value = {};
+  }
+}
+function memberLabel(member: { id: string; displayName?: string }) {
+  return member.displayName && member.displayName !== member.id
+    ? `${member.displayName} (${member.id})`
+    : member.id;
+}
+function resetRestoreSelection() {
+  const members = restoreMembers();
+  restoreWorkspaceIds.value =
+    restoreTarget.value === "new"
+      ? members.map((member) => member.id)
+      : members.slice(0, 1).map((member) => member.id);
+}
+function selectOriginalWorkspace(id: string) {
+  restoreWorkspaceIds.value = [id];
+}
+watch(restoreTarget, (target) => {
+  if (!restoreItem.value) return;
+  const members = restoreMembers();
+  if (target === "original" && restoreWorkspaceIds.value.length !== 1)
+    restoreWorkspaceIds.value = members.slice(0, 1).map((member) => member.id);
+  if (target === "new" && !restoreWorkspaceIds.value.length) resetRestoreSelection();
+});
 </script>
 <template>
   <UModal v-model:open="open" :ui="{ content: 'max-w-6xl' }"
@@ -310,7 +368,7 @@ function cancelRestore() {
             class="border rounded p-3 mb-2 flex items-center justify-between gap-3"
           >
             <div>
-              <b>{{ (a.workspaceIds || [a.workspaceId]).join(", ") }}</b>
+              <b>{{ restoreMembers(a).map(memberLabel).join(", ") }}</b>
               <p class="text-xs text-gray-500">
                 {{ date(a.createdAt) }} · {{ fmt(a.sizeBytes ?? a.size) }} ·
                 {{ a.provider }} ·
@@ -342,19 +400,65 @@ function cancelRestore() {
           data-testid="restore-backup"
         >
           <h3 class="font-medium">Restore backup</h3>
-          <label
-            ><input v-model="restoreTarget" type="radio" value="new" /> New
-            worker</label
-          >
-          <label
-            ><input v-model="restoreTarget" type="radio" value="original" />
-            Original worker</label
-          ><input
-            v-if="restoreTarget === 'new'"
-            v-model="restoreName"
-            class="block border rounded p-2"
-            placeholder="New worker display name"
-          /><label
+          <fieldset class="space-y-1">
+            <legend class="text-sm font-medium">Restore target</legend>
+            <label
+              ><input
+                v-model="restoreTarget"
+                name="restore-target"
+                type="radio"
+                value="new"
+              /> New worker</label
+            >
+            <label
+              ><input
+                v-model="restoreTarget"
+                name="restore-target"
+                type="radio"
+                value="original"
+              /> Original worker</label
+            >
+          </fieldset>
+          <fieldset class="rounded border p-3 space-y-1">
+            <legend class="px-1 text-sm font-medium">
+              Workspaces to restore
+            </legend>
+            <p class="text-xs text-gray-500">
+              {{ restoreTarget === "new"
+                ? "Choose one or more workspaces to restore as new workers."
+                : "Choose the single original workspace to overwrite." }}
+            </p>
+            <label
+              v-for="member in restoreMembers()"
+              :key="member.id"
+              class="block"
+            >
+              <input
+                v-if="restoreTarget === 'new'"
+                v-model="restoreWorkspaceIds"
+                type="checkbox"
+                :value="member.id"
+              />
+              <input
+                v-else
+                type="radio"
+                name="restore-original-workspace"
+                :checked="restoreWorkspaceIds[0] === member.id"
+                :value="member.id"
+                @change="selectOriginalWorkspace(member.id)"
+              />
+              {{ memberLabel(member) }}
+            </label>
+            <UButton size="xs" variant="ghost" color="neutral" @click="resetRestoreSelection">
+              Reset selection
+            </UButton>
+          </fieldset>
+          <label v-if="restoreTarget === 'new'" class="block text-sm"
+            >Display name (applies only to the first selected workspace)<input
+              v-model="restoreName"
+              class="block border rounded p-2"
+              placeholder="New worker display name"
+          /></label><label
             v-if="restoreTarget === 'original'"
             class="block text-red-600"
             ><input v-model="confirmOverwrite" type="checkbox" /> Original
@@ -369,7 +473,7 @@ function cancelRestore() {
           /></label>
           <div>
             <UButton
-              :disabled="restoreTarget === 'original' && !confirmOverwrite"
+              :disabled="!restoreWorkspaceIds.length || (restoreTarget === 'original' && !confirmOverwrite)"
               :loading="busy === 'restore'"
               @click="restore"
               >Start restore</UButton

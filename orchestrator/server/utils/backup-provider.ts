@@ -31,6 +31,7 @@ export interface BackupProvider {
     userId: string,
     objectId: string,
     destination: string,
+    signal?: AbortSignal,
   ): Promise<void>;
   delete(userId: string, objectId: string): Promise<void>;
   abortUpload?(
@@ -158,10 +159,16 @@ export class FakeBackupProvider implements BackupProvider {
       resumedFromChunk,
     };
   }
-  async download(userId: string, id: string, dest: string) {
+  async download(
+    userId: string,
+    id: string,
+    dest: string,
+    signal?: AbortSignal,
+  ) {
     await pipeline(
       createReadStream(this.path(userId, id)),
       createWriteStream(dest, { mode: 0o600 }),
+      { signal },
     );
   }
   async delete(userId: string, id: string) {
@@ -212,10 +219,11 @@ export class LocalBackupProvider implements BackupProvider {
       resumedFromChunk: 0,
     };
   }
-  async download(u: string, id: string, d: string) {
+  async download(u: string, id: string, d: string, signal?: AbortSignal) {
     await pipeline(
       createReadStream(this.path(u, id)),
       createWriteStream(d, { mode: 0o600 }),
+      { signal },
     );
   }
   async delete(u: string, id: string) {
@@ -243,7 +251,10 @@ export class GoogleDriveBackupProvider implements BackupProvider {
       signal?: AbortSignal,
     ) => Promise<void> = abortableDelay,
   ) {}
-  private async access(userId: string): Promise<string> {
+  private async access(
+    userId: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
     const token = await this.getStoredToken(userId);
     if (
       token.access_token &&
@@ -259,6 +270,7 @@ export class GoogleDriveBackupProvider implements BackupProvider {
       "https://oauth2.googleapis.com/token",
       {
         method: "POST",
+        signal,
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
           client_id: credentials.clientId,
@@ -288,7 +300,7 @@ export class GoogleDriveBackupProvider implements BackupProvider {
     signal?: AbortSignal,
     resumeUploadId?: string,
   ): Promise<UploadResult> {
-    const access = await this.access(userId);
+    const access = await this.access(userId, signal);
     const size = (await stat(source)).size;
     let session = resumeUploadId;
     let offset = 0;
@@ -406,16 +418,21 @@ export class GoogleDriveBackupProvider implements BackupProvider {
     userId: string,
     objectId: string,
     destination: string,
+    signal?: AbortSignal,
   ): Promise<void> {
     const response = await this.transport(
       `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(objectId)}?alt=media`,
-      { headers: { Authorization: `Bearer ${await this.access(userId)}` } },
+      {
+        signal,
+        headers: { Authorization: `Bearer ${await this.access(userId, signal)}` },
+      },
     );
     if (!response.ok || !response.body)
       throw new Error("Google Drive backup download failed");
     await pipeline(
       createReadStreamFromWeb(response.body),
       createWriteStream(destination, { mode: 0o600 }),
+      { signal },
     );
   }
   async delete(userId: string, objectId: string): Promise<void> {

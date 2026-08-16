@@ -21,6 +21,7 @@ import { useGitImageCatalogManager } from './git-image-manager';
  * better-auth's body parsing on the delete-user endpoint. */
 export class OrphanSweeper {
   private timer: ReturnType<typeof setInterval> | null = null;
+  private preCleanupHooks: Array<(userId: string) => Promise<void>> = [];
   private cleanupHooks: Array<(userId: string) => Promise<void>> = [];
   private candidateSources: Array<() => string[] | Promise<string[]>> = [];
 
@@ -38,6 +39,7 @@ export class OrphanSweeper {
     private exportJobs: ExportJobManager,
   ) {}
 
+  addPreCleanupHook(hook: (userId: string) => Promise<void>) { this.preCleanupHooks.push(hook); }
   addCleanupHook(hook: (userId: string) => Promise<void>) { this.cleanupHooks.push(hook); }
   addCandidateSource(source: () => string[] | Promise<string[]>) { this.candidateSources.push(source); }
 
@@ -93,6 +95,22 @@ export class OrphanSweeper {
     let removed = 0;
     for (const userId of candidates) {
       if (existingIds.has(userId)) continue;
+      let cleanupFenced = true;
+      for (const hook of this.preCleanupHooks) {
+        try {
+          await hook(userId);
+        } catch (error) {
+          cleanupFenced = false;
+          useLogger().warn(
+            `[orphan-sweeper] deferred cleanup for ${userId}: ${error instanceof Error ? error.message : error}`,
+          );
+          break;
+        }
+      }
+      // A pre-cleanup hook is a mutation barrier, not best-effort cleanup. If
+      // an active restore cannot drain by its deadline, retain all owner state
+      // and retry on the next sweep rather than creating a post-cleanup worker.
+      if (!cleanupFenced) continue;
       await this.envStore.delete(userId).catch(() => {});
       await this.workerStore.removeForUser(userId).catch(() => {});
       await this.portStore.removeForUser(userId).catch(() => {});

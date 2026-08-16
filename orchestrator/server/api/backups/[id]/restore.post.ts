@@ -12,6 +12,7 @@ defineRouteMeta({
             properties: {
               target: { type: "string", enum: ["new", "original"] },
               displayName: { type: "string" },
+              workspaceIds: { type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true, description: "Optional non-empty, duplicate-free exact subset of artifact workspaces; omit to restore all members" } as any,
               confirmOverwrite: { type: "boolean" },
               lockPassword: {
                 type: "string",
@@ -53,27 +54,46 @@ export default defineEventHandler(async (event) => {
     displayName?: string;
     confirmOverwrite?: boolean;
     lockPassword?: unknown;
+    workspaceIds?: string[];
   }>(event);
   const target = body?.target ?? "new";
   if (target !== "new" && target !== "original")
     throw createError({ statusCode: 400, statusMessage: "Invalid restore target" });
+  if (body?.displayName !== undefined && typeof body.displayName !== "string")
+    throw createError({ statusCode: 400, statusMessage: "Invalid display name" });
+  if (body?.confirmOverwrite !== undefined && typeof body.confirmOverwrite !== "boolean")
+    throw createError({ statusCode: 400, statusMessage: "Invalid overwrite confirmation" });
   if (target === "original") {
-    const worker = useContainerManager().get(
-      artifact.sourceWorkerId ?? artifact.workspaceId,
-    );
-    if (worker?.status === "running" || !body?.confirmOverwrite)
+    const artifactWorkspaceIds = artifact.workspaceIds ?? [artifact.workspaceId];
+    const selected = body?.workspaceIds ?? artifactWorkspaceIds;
+    if (!Array.isArray(selected) || selected.length !== 1 || typeof selected[0] !== "string" || !artifactWorkspaceIds.includes(selected[0]))
+      throw createError({ statusCode: 400, statusMessage: "Original restore requires selecting exactly one backup workspace" });
+    const source = selected[0]!;
+    const worker = useContainerManager().get(source);
+    if (!worker || worker.userId !== artifact.userId || worker.status !== "stopped" || !body?.confirmOverwrite)
       throw createError({
         statusCode: 409,
         statusMessage: "Stop the original worker and confirm safe overwrite",
       });
   }
-  const job = await manager.createRestore(
-    artifact.userId,
-    artifact,
-    target,
-    body?.displayName,
-    body?.lockPassword,
-  );
+  let job;
+  try {
+    job = await manager.createRestore(
+      artifact.userId,
+      artifact,
+      target,
+      body?.displayName,
+      body?.lockPassword,
+      body?.workspaceIds,
+    );
+  } catch (error: any) {
+    if (typeof error?.statusCode === "number") throw error;
+    throw createError({
+      statusCode: 400,
+      statusMessage:
+        error instanceof Error ? error.message : "Invalid restore request",
+    });
+  }
   setResponseStatus(event, 202);
   return { jobId: job.id };
 });

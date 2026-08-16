@@ -64,6 +64,13 @@ import {
 } from "./worker-export";
 import { assertSafeUserId } from "./user-id";
 
+interface RestoreExecution {
+  controller: AbortController;
+  completed: Promise<void>;
+  finish: () => void;
+  jobId?: string;
+}
+
 export class BackupManager {
   private readonly dataDir: string;
   private store: BackupStore;
@@ -74,7 +81,11 @@ export class BackupManager {
   private readonly maxConcurrent = 2;
   private accepting = true;
   private controllers = new Map<string, AbortController>();
+  private restoreExecutions = new Map<string, Set<RestoreExecution>>();
+  private restorePins = new Map<string, number>();
+  private artifactDeletions = new Set<string>();
   private forgottenUsers = new Set<string>();
+  private readonly restoreCleanupTimeoutMs: number;
   private fake: FakeBackupProvider;
   private fakeUsers = new Set<string>();
   private providers: Map<BackupProviderKind, BackupProvider>;
@@ -83,8 +94,13 @@ export class BackupManager {
   constructor(options: {
     dataDir?: string;
     providers?: Partial<Record<BackupProviderKind, BackupProvider>>;
+    restoreCleanupTimeoutMs?: number;
   } = {}) {
     this.dataDir = options.dataDir ?? useConfig().dataDir;
+    this.restoreCleanupTimeoutMs = Math.max(
+      1,
+      options.restoreCleanupTimeoutMs ?? 30_000,
+    );
     this.store = new BackupStore(this.dataDir);
     this.fake = new FakeBackupProvider(join(this.dataDir, "backup-fake"));
     this.providers = new Map<BackupProviderKind, BackupProvider>([
@@ -147,7 +163,39 @@ export class BackupManager {
     await this.init();
     this.forgottenUsers.add(userId);
     const data = this.store.get(userId);
-    for (const job of data.jobs) this.controllers.get(job.id)?.abort();
+    for (const job of data.jobs) {
+      if (job.status === "queued" || job.status === "running") {
+        job.status = "cancelled";
+        job.phase = "cancelled";
+        job.completedAt = job.updatedAt = new Date().toISOString();
+      }
+      this.controllers.get(job.id)?.abort();
+    }
+    const executions = [...(this.restoreExecutions.get(userId) ?? [])];
+    for (const execution of executions) execution.controller.abort();
+    // Account/orphan cleanup must not race an import or in-place commit. Every
+    // built-in provider download observes the controller, and later restore
+    // phases check it between each mutation before this barrier resolves.
+    await this.drainRestoreExecutions(executions);
+    const residualRestoreWorkers = [
+      ...new Set(
+        data.jobs
+          .filter(
+            (job) =>
+              job.target === "new" && job.phase === "rollback-failed",
+          )
+          .flatMap((job) => job.workerIds ?? (job.workerId ? [job.workerId] : []))
+          .filter(
+            (workerId) =>
+              useContainerManager().get(workerId)?.userId === userId,
+          ),
+      ),
+    ];
+    const survivingRestoreWorkers = await rollbackRestoredWorkers(
+      residualRestoreWorkers,
+    );
+    if (survivingRestoreWorkers.length)
+      throw restoreRollbackFailure(survivingRestoreWorkers);
     await Promise.allSettled(
       data.artifacts.map((artifact) =>
         this.providers
@@ -341,18 +389,44 @@ export class BackupManager {
   async retry(job: BackupJob) {
     if (job.status !== "failed")
       throw new Error("Only failed jobs can be retried");
-    job.attempt += 1;
-    job.status = "queued";
-    job.phase = "retrying";
-    job.error = undefined;
-    job.completedAt = undefined;
-    job.updatedAt = new Date().toISOString();
-    await this.saveJob(job);
-    this.enqueue(() => this.runV2(job));
-    return job;
+    let restoreArtifact: BackupArtifact | undefined;
+    if (job.target) {
+      if (job.target === "original")
+        throw new Error("Original-worker restores cannot be retried; submit a new restore with the worker lock password");
+      restoreArtifact = job.artifactId ? await this.getArtifact(job.artifactId) : undefined;
+      if (!restoreArtifact || restoreArtifact.userId !== job.userId)
+        throw new Error("The restore artifact is no longer available");
+      this.selectRestoreWorkspaceIds(this.artifactWorkspaceIds(restoreArtifact), job.selectedWorkspaceIds ?? job.workspaceIds);
+      this.pinArtifact(restoreArtifact);
+    }
+    try {
+      job.attempt += 1;
+      job.status = "queued";
+      job.phase = "retrying";
+      job.error = undefined;
+      job.workerId = undefined;
+      job.workerIds = undefined;
+      job.missingSecrets = undefined;
+      job.integrityVerified = undefined;
+      job.completedAt = undefined;
+      job.updatedAt = new Date().toISOString();
+      await this.saveJob(job);
+      if (job.target) {
+        this.enqueue(() => this.runRestoreV2(job, restoreArtifact!, job.displayName));
+      } else this.enqueue(() => this.runV2(job));
+      return job;
+    } catch (error) {
+      if (restoreArtifact) this.unpinArtifact(restoreArtifact);
+      throw error;
+    }
   }
   async cancel(job: BackupJob) {
     if (job.status === "queued" || job.status === "running") {
+      if (job.target === "original")
+        throw Object.assign(
+          new Error("An in-place restore cannot be cancelled safely"),
+          { statusCode: 409 },
+        );
       job.status = "cancelled";
       job.phase = "cancelled";
       job.completedAt = job.updatedAt = new Date().toISOString();
@@ -381,26 +455,70 @@ export class BackupManager {
     artifact: BackupArtifact,
     mode: "new" | "original",
     displayName?: string,
+    selectedWorkspaceIds?: string[],
   ) {
     await this.init();
+    if (this.forgottenUsers.has(userId))
+      throw new Error("Backup owner is no longer available");
+    const currentArtifact = this.store.findArtifact(artifact.id);
+    if (
+      !currentArtifact ||
+      currentArtifact.userId !== userId ||
+      currentArtifact.providerObjectId !== artifact.providerObjectId
+    )
+      throw new Error("Backup artifact not found");
+    artifact = currentArtifact;
     if (mode === "original")
       throw new Error(
         "In-place restore is not safe while identity-preserving volume replacement is unavailable; restore into a new worker",
       );
     const dir = join(this.dataDir, "tmp", `restore-${randomUUID()}`);
-    await mkdir(dir, { recursive: true, mode: 0o700 });
     const encrypted = join(dir, "archive.enc");
     const plain = join(dir, "worker.tar");
+    const createdWorkers: string[] = [];
+    this.pinArtifact(artifact);
+    const execution = this.beginRestoreExecution(userId);
+    const assertActive = () =>
+      this.assertRestoreActive(userId, execution.controller.signal);
     try {
+      assertActive();
+      await mkdir(dir, { recursive: true, mode: 0o700 });
       await this.providers
         .get(artifact.provider)!
-        .download(userId, artifact.providerObjectId, encrypted);
+        .download(
+          userId,
+          artifact.providerObjectId,
+          encrypted,
+          execution.controller.signal,
+        );
+      assertActive();
       await decryptBackup(useConfig(), encrypted, plain, artifact.sha256);
-      return await useContainerManager().importWorker(userId, plain, {
-        displayName,
-      });
+      assertActive();
+      const artifactWorkspaceIds = this.artifactWorkspaceIds(artifact);
+      const selected = this.selectRestoreWorkspaceIds(artifactWorkspaceIds, selectedWorkspaceIds);
+      const bundles = await unpackWorkspaceBackups(plain, artifactWorkspaceIds, selected, join(dir, "workspaces"));
+      assertActive();
+      const workers = [];
+      for (const [index, bundle] of bundles.entries()) {
+        assertActive();
+        const worker = await useContainerManager().importWorker(userId, bundle.path, { displayName: index === 0 ? displayName : undefined });
+        workers.push(worker);
+        createdWorkers.push(worker.id);
+        assertActive();
+      }
+      return workers.length === 1 ? workers[0] : workers;
+    } catch (error) {
+      const survivingWorkers = await rollbackRestoredWorkers(createdWorkers);
+      if (survivingWorkers.length)
+        throw restoreRollbackFailure(survivingWorkers);
+      throw error;
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      try {
+        await rm(dir, { recursive: true, force: true });
+      } finally {
+        this.unpinArtifact(artifact);
+        execution.finish();
+      }
     }
   }
   async createRestore(
@@ -409,20 +527,46 @@ export class BackupManager {
     target: "new" | "original",
     displayName?: string,
     lockPassword?: unknown,
+    selectedWorkspaceIds?: string[],
   ): Promise<BackupJob> {
-    if (target === "original")
-      await useWorkerProtectionLockStore().verify(
-        artifact.sourceWorkerId ?? artifact.workspaceId,
-        lockPassword,
-      );
-    const now = new Date().toISOString();
-    const job: BackupJob = {
+    await this.init();
+    if (this.forgottenUsers.has(userId))
+      throw new Error("Backup owner is no longer available");
+    const currentArtifact = this.store.findArtifact(artifact.id);
+    if (
+      !currentArtifact ||
+      currentArtifact.userId !== userId ||
+      currentArtifact.providerObjectId !== artifact.providerObjectId
+    )
+      throw new Error("Backup artifact not found");
+    artifact = currentArtifact;
+    const artifactWorkspaceIds = this.artifactWorkspaceIds(artifact);
+    const selected = this.selectRestoreWorkspaceIds(artifactWorkspaceIds, selectedWorkspaceIds);
+    const source = selected[0]!;
+    if (target === "original" && selected.length !== 1)
+      throw new Error("Original restore requires selecting exactly one backup workspace");
+    this.pinArtifact(artifact);
+    const admission = this.beginRestoreExecution(userId);
+    try {
+      this.assertRestoreActive(userId, admission.controller.signal);
+      if (target === "original") {
+        const worker = useContainerManager().get(source);
+        if (!worker || worker.userId !== userId || worker.status !== "stopped")
+          throw new Error("Selected original worker must be stopped for safe restore");
+        await useWorkerProtectionLockStore().verify(source, lockPassword);
+        this.assertRestoreActive(userId, admission.controller.signal);
+      }
+      const now = new Date().toISOString();
+      const job: BackupJob = {
       schemaVersion: 1,
       id: randomUUID(),
       userId,
       ownerId: userId,
       workspaceId: artifact.workspaceId,
-      workspaceIds: artifact.workspaceIds ?? [artifact.workspaceId],
+      workspaceIds: selected,
+      artifactWorkspaceIds,
+      selectedWorkspaceIds: selected,
+      artifactId: artifact.id,
       provider: artifact.provider,
       status: "queued",
       phase: "queued",
@@ -432,12 +576,20 @@ export class BackupManager {
       updatedAt: now,
       attempt: 1,
       target,
-    };
-    const data = this.store.get(userId);
-    data.jobs.push(job);
-    await this.store.save(userId, data);
-    this.enqueue(() => this.runRestoreV2(job, artifact, displayName));
-    return job;
+      displayName,
+      };
+      const data = this.store.get(userId);
+      data.jobs.push(job);
+      await this.store.save(userId, data);
+      this.assertRestoreActive(userId, admission.controller.signal, job);
+      this.enqueue(() => this.runRestoreV2(job, artifact, displayName));
+      return job;
+    } catch (error) {
+      this.unpinArtifact(artifact);
+      throw error;
+    } finally {
+      admission.finish();
+    }
   }
   private async runRestore(
     job: BackupJob,
@@ -805,7 +957,12 @@ export class BackupManager {
         verifyPlain = join(dir, "verify.tar");
       await this.providers
         .get(job.provider)!
-        .download(job.userId, uploaded.objectId, verifyEnc);
+        .download(
+          job.userId,
+          uploaded.objectId,
+          verifyEnc,
+          controller.signal,
+        );
       await decryptBackup(useConfig(), verifyEnc, verifyPlain, crypt.sha256);
       if ((job.status as BackupJob["status"]) === "cancelled") {
         await this.providers
@@ -905,7 +1062,16 @@ export class BackupManager {
   ) {
     const dir = join(this.dataDir, "tmp", `restore-${job.id}`);
     const createdWorkers: string[] = [];
+    const execution = this.beginRestoreExecution(job.userId, job.id);
+    const assertActive = () => {
+      this.assertRestoreActive(
+        job.userId,
+        execution.controller.signal,
+        job,
+      );
+    };
     try {
+      assertActive();
       await mkdir(dir, { recursive: true, mode: 0o700 });
       job.status = "running";
       job.phase = "downloading";
@@ -915,31 +1081,39 @@ export class BackupManager {
         plain = join(dir, "bundle.tar");
       await this.providers
         .get(artifact.provider)!
-        .download(job.userId, artifact.providerObjectId, enc);
+        .download(
+          job.userId,
+          artifact.providerObjectId,
+          enc,
+          execution.controller.signal,
+        );
+      assertActive();
       job.phase = "verifying";
       job.progress = 55;
       await this.saveJob(job);
       await decryptBackup(useConfig(), enc, plain, artifact.sha256);
+      assertActive();
       job.integrityVerified = true;
-      const bundles = await unpackWorkspaceBackups(
-        plain,
-        artifact.workspaceIds ?? [artifact.workspaceId],
-        join(dir, "workspaces"),
-      );
+      const artifactWorkspaceIds = job.artifactWorkspaceIds ?? this.artifactWorkspaceIds(artifact);
+      const selectedWorkspaceIds = job.selectedWorkspaceIds ?? job.workspaceIds ?? artifactWorkspaceIds;
+      const bundles = await unpackWorkspaceBackups(plain, artifactWorkspaceIds, selectedWorkspaceIds, join(dir, "workspaces"));
+      assertActive();
       if (job.target === "new") {
         for (const [index, bundle] of bundles.entries()) {
+          assertActive();
           const worker = await useContainerManager().importWorker(
             job.userId,
             bundle.path,
             { displayName: index === 0 ? displayName : undefined },
           );
           createdWorkers.push(worker.id);
+          assertActive();
         }
         job.workerId = createdWorkers[0];
         (job as BackupJob & { workerIds?: string[] }).workerIds =
           createdWorkers;
       } else {
-        const source = artifact.sourceWorkerId ?? artifact.workspaceId;
+        const source = selectedWorkspaceIds[0]!;
         const selected = bundles.find((b) => b.id === source);
         if (!selected)
           throw new Error("Original workspace is absent from backup");
@@ -949,6 +1123,7 @@ export class BackupManager {
         );
         if (!extracted.workspacePath)
           throw new Error("Backup workspace payload is missing");
+        assertActive();
         await replaceStoppedWorkspace(
           job.userId,
           source,
@@ -966,27 +1141,61 @@ export class BackupManager {
       job.completedAt = job.updatedAt = new Date().toISOString();
       await this.saveJob(job);
     } catch {
-      for (const workerId of createdWorkers.reverse())
-        await useContainerManager()
-          .remove(workerId)
-          .catch(() => {});
-      job.status = "failed";
-      job.phase = "failed";
-      job.error = "Restore failed. No secret values were restored.";
+      const survivingWorkers = await rollbackRestoredWorkers(createdWorkers);
+      if (survivingWorkers.length) {
+        job.status = "failed";
+        job.phase = "rollback-failed";
+        job.workerId = survivingWorkers[0];
+        job.workerIds = survivingWorkers;
+        job.error =
+          "Restore failed and some newly created workers require manual cleanup.";
+      } else if (job.status !== "cancelled") {
+        job.status = "failed";
+        job.phase = "failed";
+        job.workerId = undefined;
+        job.workerIds = undefined;
+        job.error = "Restore failed. No secret values were restored.";
+      }
       job.completedAt = job.updatedAt = new Date().toISOString();
       await this.saveJob(job);
-      useLogger().error(`[backup] restore job ${job.id} failed`);
+      if (job.status === "failed")
+        useLogger().error(`[backup] restore job ${job.id} failed`);
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      try {
+        await rm(dir, { recursive: true, force: true });
+      } finally {
+        this.unpinArtifact(artifact);
+        execution.finish();
+      }
     }
   }
   async deleteArtifact(artifact: BackupArtifact) {
-    await this.providers
-      .get(artifact.provider)!
-      .delete(artifact.userId, artifact.providerObjectId);
-    const data = this.store.get(artifact.userId);
-    data.artifacts = data.artifacts.filter((x) => x.id !== artifact.id);
-    await this.store.save(artifact.userId, data);
+    await this.init();
+    const currentArtifact = this.store.findArtifact(artifact.id);
+    if (
+      !currentArtifact ||
+      currentArtifact.userId !== artifact.userId ||
+      currentArtifact.providerObjectId !== artifact.providerObjectId
+    )
+      throw Object.assign(new Error("Backup artifact not found"), {
+        statusCode: 404,
+      });
+    artifact = currentArtifact;
+    if (!this.beginArtifactDeletion(artifact))
+      throw Object.assign(
+        new Error("Backup artifact is in use by a restore job"),
+        { statusCode: 409 },
+      );
+    try {
+      await this.providers
+        .get(artifact.provider)!
+        .delete(artifact.userId, artifact.providerObjectId);
+      const data = this.store.get(artifact.userId);
+      data.artifacts = data.artifacts.filter((x) => x.id !== artifact.id);
+      await this.store.save(artifact.userId, data);
+    } finally {
+      this.endArtifactDeletion(artifact);
+    }
   }
   async beginGoogleOAuth(
     userId: string,
@@ -1212,6 +1421,121 @@ export class BackupManager {
     if (i >= 0) data.jobs[i] = job;
     await this.store.save(job.userId, data);
   }
+  private beginRestoreExecution(
+    userId: string,
+    jobId?: string,
+  ): RestoreExecution {
+    const controller = new AbortController();
+    let resolveCompleted!: () => void;
+    const completed = new Promise<void>((resolve) => {
+      resolveCompleted = resolve;
+    });
+    let finished = false;
+    const execution: RestoreExecution = {
+      controller,
+      completed,
+      jobId,
+      finish: () => {
+        if (finished) return;
+        finished = true;
+        if (jobId && this.controllers.get(jobId) === controller)
+          this.controllers.delete(jobId);
+        const active = this.restoreExecutions.get(userId);
+        active?.delete(execution);
+        if (active?.size === 0) this.restoreExecutions.delete(userId);
+        resolveCompleted();
+      },
+    };
+    const active = this.restoreExecutions.get(userId) ?? new Set();
+    active.add(execution);
+    this.restoreExecutions.set(userId, active);
+    if (jobId) this.controllers.set(jobId, controller);
+    if (this.forgottenUsers.has(userId)) controller.abort();
+    return execution;
+  }
+  private async drainRestoreExecutions(
+    executions: readonly RestoreExecution[],
+  ): Promise<void> {
+    if (!executions.length) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled(
+          executions.map((execution) => execution.completed),
+        ).then(() => undefined),
+        new Promise<void>((_resolve, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(
+                Object.assign(
+                  new Error(
+                    "Active restores did not stop before the cleanup deadline",
+                  ),
+                  { code: "RESTORE_CLEANUP_TIMEOUT" },
+                ),
+              ),
+            this.restoreCleanupTimeoutMs,
+          );
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+  private assertRestoreActive(
+    userId: string,
+    signal: AbortSignal,
+    job?: BackupJob,
+  ): void {
+    if (
+      signal.aborted ||
+      this.forgottenUsers.has(userId) ||
+      job?.status === "cancelled"
+    )
+      throw Object.assign(new Error("Restore cancelled"), {
+        name: "AbortError",
+      });
+  }
+  private artifactWorkspaceIds(artifact: BackupArtifact): string[] {
+    const ids = artifact.workspaceIds ?? [artifact.workspaceId];
+    if (!ids.length || new Set(ids).size !== ids.length)
+      throw new Error("Backup artifact has invalid workspace membership");
+    return ids;
+  }
+  private artifactPinKey(artifact: BackupArtifact): string {
+    return `${artifact.userId}:${artifact.id}`;
+  }
+  private pinArtifact(artifact: BackupArtifact): void {
+    const key = this.artifactPinKey(artifact);
+    if (this.artifactDeletions.has(key))
+      throw Object.assign(new Error("Backup artifact is being deleted"), {
+        statusCode: 409,
+      });
+    this.restorePins.set(key, (this.restorePins.get(key) ?? 0) + 1);
+  }
+  private unpinArtifact(artifact: BackupArtifact): void {
+    const key = this.artifactPinKey(artifact);
+    const remaining = (this.restorePins.get(key) ?? 1) - 1;
+    if (remaining > 0) this.restorePins.set(key, remaining);
+    else this.restorePins.delete(key);
+  }
+  private beginArtifactDeletion(artifact: BackupArtifact): boolean {
+    const key = this.artifactPinKey(artifact);
+    if (this.restorePins.has(key) || this.artifactDeletions.has(key))
+      return false;
+    this.artifactDeletions.add(key);
+    return true;
+  }
+  private endArtifactDeletion(artifact: BackupArtifact): void {
+    this.artifactDeletions.delete(this.artifactPinKey(artifact));
+  }
+  private selectRestoreWorkspaceIds(artifactWorkspaceIds: string[], selectedWorkspaceIds?: string[]): string[] {
+    if (selectedWorkspaceIds === undefined) return [...artifactWorkspaceIds];
+    if (!Array.isArray(selectedWorkspaceIds) || !selectedWorkspaceIds.length || new Set(selectedWorkspaceIds).size !== selectedWorkspaceIds.length || selectedWorkspaceIds.some(id => typeof id !== "string" || !artifactWorkspaceIds.includes(id)))
+      throw new Error("Select a non-empty subset of backup workspaces");
+    return [...selectedWorkspaceIds];
+  }
   private async applyRetention(
     data: ReturnType<BackupStore["get"]>,
     userId: string,
@@ -1221,6 +1545,7 @@ export class BackupManager {
       b.createdAt.localeCompare(a.createdAt),
     );
     for (const old of sorted.slice(keep)) {
+      if (!this.beginArtifactDeletion(old)) continue;
       try {
         await this.providers
           .get(old.provider)!
@@ -1229,6 +1554,8 @@ export class BackupManager {
       } catch {
         old.deletionPending = true;
         old.deletionErrorAt = new Date().toISOString();
+      } finally {
+        this.endArtifactDeletion(old);
       }
     }
   }
@@ -1300,6 +1627,35 @@ export async function cleanupInterruptedBackupStaging(dataDir: string, jobId: st
     rm(join(dataDir, "tmp", `backup-${jobId}`), { recursive: true, force: true }),
     rm(join(dataDir, "tmp", `restore-${jobId}`), { recursive: true, force: true }),
   ]);
+}
+export async function rollbackRestoredWorkers(
+  workerIds: readonly string[],
+  removeWorker: (workerId: string) => Promise<void> = (workerId) =>
+    useContainerManager().remove(workerId),
+): Promise<string[]> {
+  const survivingWorkers: string[] = [];
+  for (const workerId of [...workerIds].reverse()) {
+    try {
+      await removeWorker(workerId);
+    } catch {
+      survivingWorkers.push(workerId);
+    }
+  }
+  return survivingWorkers;
+}
+export function restoreRollbackFailure(workerIds: readonly string[]) {
+  return Object.assign(
+    new Error(
+      "Restore failed and some newly created workers require manual cleanup.",
+    ),
+    {
+      statusCode: 500,
+      data: {
+        code: "RESTORE_ROLLBACK_FAILED",
+        workerIds: [...workerIds],
+      },
+    },
+  );
 }
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, Math.floor(n)));
