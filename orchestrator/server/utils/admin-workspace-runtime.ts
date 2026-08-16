@@ -1,6 +1,7 @@
 import Docker from "dockerode";
 import { createHash } from "node:crypto";
 import { hostname } from "node:os";
+import { PassThrough } from "node:stream";
 import { pack } from "tar-stream";
 import type { Config } from "./config";
 import type { ContainerInfo } from "../../shared/types";
@@ -15,7 +16,9 @@ import type {
   AdministrativeWorkspaceRecord,
   AdminWorkspaceRuntimeAdapter,
   AdminWorkspaceRuntimeImage,
+  AdminWorkspaceStartupScriptRuntimeStatus,
 } from "./admin-workspace-store";
+import { normalizedRevision } from "./admin-workspace-store";
 
 const MANAGEMENT_NETWORK = "agentor-management";
 const EGRESS_NETWORK = "agentor-admin-egress-v1";
@@ -28,6 +31,10 @@ const ADMIN_CONTAINER = "agentor-admin-workspace";
 const ADMIN_WORKSPACE_VOLUME = "agentor-admin-workspace-data";
 const ADMIN_AGENTS_VOLUME = "agentor-admin-agent-data";
 const ADMIN_LABEL = "agentor.administrative";
+const STARTUP_REVISION_LABEL = "agentor.admin.startup-script-revision";
+const STARTUP_STATUS_PATH =
+  "/home/agent/.agent-data/.agentor/admin-startup-script-status.json";
+const STARTUP_STATUS_DIR = "/home/agent/.agent-data/.agentor";
 
 /** Docker boundary for the singleton administrative workspace. Every Docker
  * input is generated here; requests cannot choose images, mounts, commands,
@@ -159,8 +166,9 @@ export class DockerAdminWorkspaceRuntime
     stream.end(`${credential}\n`);
   }
 
-  async ensure(
+  private async ensureContainer(
     record: Readonly<AdministrativeWorkspaceRecord>,
+    reconcileDesiredStatus: boolean,
   ): Promise<AdminWorkspaceRuntimeImage> {
     const resources = this.resources(record);
     await this.ensureManagementNetwork(resources.managementNetwork);
@@ -190,32 +198,59 @@ export class DockerAdminWorkspaceRuntime
       container = await this.create(record, image.digest);
     }
     const status = await container.inspect();
-    if (record.status === "running" && !status.State.Running)
-      await container.start();
-    if (record.status === "stopped" && status.State.Running)
-      await container.stop({ t: 15 });
-    if (record.status === "running") await this.waitForReady(container);
+    if (reconcileDesiredStatus) {
+      if (record.status === "running" && !status.State.Running)
+        await container.start();
+      if (record.status === "stopped" && status.State.Running)
+        await container.stop({ t: 15 });
+      if (record.status === "running") await this.waitForReady(container);
+    }
+    const current = await container.inspect();
     await this.ensureAdminAttached(container, record);
-    if (record.status === "running")
+    if (current.State.Running)
       await this.syncControlRepresentation(container, record);
     await this.registerServices(record, container);
     await this.reconcileManagementNetwork(
       resources.managementNetwork,
       container.id,
     );
-    return image;
+    return this.runtimeImage(image, current);
   }
 
-  async start(record: Readonly<AdministrativeWorkspaceRecord>): Promise<void> {
-    await this.ensure(record);
-    const container = this.docker.getContainer(
+  async ensure(
+    record: Readonly<AdministrativeWorkspaceRecord>,
+  ): Promise<AdminWorkspaceRuntimeImage> {
+    return this.ensureContainer(record, true);
+  }
+
+  async start(
+    record: Readonly<AdministrativeWorkspaceRecord>,
+  ): Promise<AdminWorkspaceRuntimeImage> {
+    // An explicit start is also the application boundary for a pending script.
+    // Prepare the container without reconciling a persisted `running` state;
+    // otherwise a stopped legacy container could briefly execute the previous
+    // revision before it is replaced below.
+    const image = await this.ensureContainer(record, false);
+    let container = this.docker.getContainer(
       this.resources(record).container,
     );
+    const before = await container.inspect();
+    if (
+      this.appliedStartupScriptRevision(before) !==
+      normalizedRevision(record.startupScriptRevision)
+    ) {
+      // Docker Env is immutable. An explicit start is the application boundary
+      // for a pending script: replace disposable compute while retaining both
+      // persistent volumes and the stable administrative workspace identity.
+      await container.remove({ force: true });
+      container = await this.create(record, image.digest);
+    }
     if (!(await container.inspect()).State.Running) await container.start();
     await this.waitForReady(container);
     await this.ensureAdminAttached(container, record);
     await this.syncControlRepresentation(container, record);
     await this.registerServices(record, container);
+    return this.runtimeImage(image, await container.inspect());
   }
 
   async stop(_record: Readonly<AdministrativeWorkspaceRecord>): Promise<void> {
@@ -252,7 +287,106 @@ export class DockerAdminWorkspaceRuntime
       this.resources(record).managementNetwork,
       container.id,
     );
-    return image;
+    return this.runtimeImage(image, await container.inspect());
+  }
+
+  async startupScriptStatus(
+    record: Readonly<AdministrativeWorkspaceRecord>,
+  ): Promise<AdminWorkspaceStartupScriptRuntimeStatus> {
+    if (!record.startupScript) return { state: "not-configured" };
+    if (
+      normalizedRevision(record.startupScriptRevision) !==
+      normalizedRevision(record.appliedStartupScriptRevision)
+    )
+      return {
+        state: "pending-rebuild",
+        revision: normalizedRevision(record.startupScriptRevision),
+      };
+    const container = this.docker.getContainer(this.resources(record).container);
+    const inspection = await container.inspect();
+    if (!inspection.State.Running)
+      return {
+        state: "unavailable",
+        revision: normalizedRevision(record.appliedStartupScriptRevision),
+      };
+    const execution = await container.exec({
+      Cmd: [
+        "timeout",
+        "1",
+        "sh",
+        "-c",
+        `status='${STARTUP_STATUS_PATH}'; if [ -L "$status" ] || [ ! -f "$status" ]; then exit 0; fi; size=$(wc -c < "$status") || exit 0; [ "$size" -le 16384 ] || exit 0; head -c 16384 -- "$status"`,
+      ],
+      AttachStdout: true,
+      AttachStderr: true,
+      Tty: false,
+      User: "agent",
+    });
+    const stream = await execution.start({ hijack: true, stdin: false });
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const output: Buffer[] = [];
+    let outputBytes = 0;
+    stdout.on("data", (chunk) => {
+      outputBytes += chunk.length;
+      if (outputBytes <= 16_384) output.push(Buffer.from(chunk));
+    });
+    stderr.resume();
+    const completion = new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const settle = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        stream.removeListener("end", onEnd);
+        stream.removeListener("close", onEnd);
+        stream.removeListener("error", onError);
+        if (error) reject(error);
+        else resolve();
+      };
+      const onEnd = () => settle();
+      const onError = (error: Error) => settle(error);
+      const timer = setTimeout(() => {
+        // The command has its own one-second bound. Destroy the hijacked
+        // attachment as well so a broken daemon/stream cannot accumulate
+        // listeners or buffered output after the API request has settled.
+        stream.destroy();
+        settle(new Error("Administrative startup status timed out"));
+      }, 2_000);
+      timer.unref?.();
+      stream.once("end", onEnd);
+      stream.once("close", onEnd);
+      stream.once("error", onError);
+    });
+    this.docker.modem.demuxStream(stream, stdout, stderr);
+    await completion;
+    const raw = Buffer.concat(output).toString("utf8").trim();
+    if (!raw)
+      return {
+        state: "starting",
+        revision: normalizedRevision(record.appliedStartupScriptRevision),
+      };
+    const parsed = JSON.parse(raw);
+    if (
+      !parsed ||
+      !["running", "succeeded", "failed"].includes(parsed.state) ||
+      parsed.revision !== normalizedRevision(record.appliedStartupScriptRevision)
+    )
+      return {
+        state: "starting",
+        revision: normalizedRevision(record.appliedStartupScriptRevision),
+      };
+    return {
+      state: parsed.state,
+      revision: parsed.revision,
+      ...(typeof parsed.startedAt === "string"
+        ? { startedAt: parsed.startedAt }
+        : {}),
+      ...(typeof parsed.finishedAt === "string"
+        ? { finishedAt: parsed.finishedAt }
+        : {}),
+      ...(Number.isInteger(parsed.exitCode) ? { exitCode: parsed.exitCode } : {}),
+    };
   }
 
   async remove(record: Readonly<AdministrativeWorkspaceRecord>): Promise<void> {
@@ -448,7 +582,7 @@ export class DockerAdminWorkspaceRuntime
       id: record.id,
       displayName: resources.displayName,
       repos: [],
-      initScript: "",
+      initScript: renderAdministrativeStartupScript(record),
       gitName: "Agentor Administrator",
       gitEmail: "admin@agentor.internal",
     };
@@ -491,6 +625,9 @@ export class DockerAdminWorkspaceRuntime
           ? { "agentor.admin.group-id": resources.groupId }
           : {}),
         "agentor.managed": "false",
+        [STARTUP_REVISION_LABEL]: String(
+          normalizedRevision(record.startupScriptRevision),
+        ),
       },
       HostConfig: {
         // Make the restricted network part of the immutable container
@@ -522,6 +659,26 @@ export class DockerAdminWorkspaceRuntime
       container.id,
     );
     return container;
+  }
+
+  private appliedStartupScriptRevision(
+    inspection: Docker.ContainerInspectInfo,
+  ) {
+    const parsed = Number(
+      inspection.Config?.Labels?.[STARTUP_REVISION_LABEL] ?? 0,
+    );
+    return normalizedRevision(parsed);
+  }
+
+  private runtimeImage(
+    image: AdminWorkspaceRuntimeImage,
+    inspection: Docker.ContainerInspectInfo,
+  ): AdminWorkspaceRuntimeImage {
+    return {
+      ...image,
+      appliedStartupScriptRevision:
+        this.appliedStartupScriptRevision(inspection),
+    };
   }
 
   private async registerServices(
@@ -925,4 +1082,36 @@ function isTrustedOverlay(inspection: Docker.ImageInspectInfo): boolean {
     labels["agentor.admin.overlay"] === "true" &&
     /^sha256:[0-9a-f]{64}$/.test(labels["agentor.admin.base"] || "")
   );
+}
+
+/** Wrap the user-authored script without interpolating its contents into shell
+ * syntax. The nested memfd execution preserves the ordinary worker init-script
+ * semantics, while the small status file exposes only revision/timing/exit
+ * metadata. A foreground service remains `running`; a completed script leaves
+ * a clean interactive shell. Neither outcome can block container readiness. */
+function renderAdministrativeStartupScript(
+  record: Readonly<AdministrativeWorkspaceRecord>,
+) {
+  const script = record.startupScript || "";
+  if (!script) return "";
+  const revision = normalizedRevision(record.startupScriptRevision);
+  const encoded = Buffer.from(script, "utf8").toString("base64");
+  return [
+    "#!/bin/bash",
+    "set +e",
+    `status_dir='${STARTUP_STATUS_DIR}'`,
+    `status_file='${STARTUP_STATUS_PATH}'`,
+    `revision=${revision}`,
+    "mkdir -p \"$status_dir\"",
+    "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+    "status_tmp=\"$status_file.$$\"",
+    "printf '{\"state\":\"running\",\"revision\":%s,\"startedAt\":\"%s\"}\\n' \"$revision\" \"$started_at\" >\"$status_tmp\" && mv \"$status_tmp\" \"$status_file\"",
+    `printf '%s' '${encoded}' | base64 -d | python3 /home/agent/memfd-exec.py`,
+    "exit_code=$?",
+    "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+    "if [ \"$exit_code\" -eq 0 ]; then final_state=succeeded; else final_state=failed; fi",
+    "printf '{\"state\":\"%s\",\"revision\":%s,\"startedAt\":\"%s\",\"finishedAt\":\"%s\",\"exitCode\":%s}\\n' \"$final_state\" \"$revision\" \"$started_at\" \"$finished_at\" \"$exit_code\" >\"$status_tmp\" && mv \"$status_tmp\" \"$status_file\"",
+    "if [ \"$exit_code\" -ne 0 ]; then printf '[admin startup] script exited with status %s\\n' \"$exit_code\" >&2; fi",
+    "exec bash",
+  ].join("\n");
 }

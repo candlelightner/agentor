@@ -26,6 +26,28 @@ const workspace = {
 
 async function mockAdminWorkspace(page: Page) {
   let state = structuredClone(workspace);
+  let startup = {
+    script: "",
+    configured: false,
+    revision: 0,
+    appliedRevision: 0,
+    pendingRebuild: false,
+    runtime: { state: "not-configured" },
+  };
+  await page.route("**/api/admin/workspace/startup-script", async (route) => {
+    if (route.request().method() === "PUT") {
+      const body = route.request().postDataJSON();
+      startup = {
+        ...startup,
+        script: body.startupScript,
+        configured: Boolean(body.startupScript),
+        revision: startup.revision + 1,
+        pendingRebuild: true,
+        runtime: { state: "pending-rebuild" },
+      };
+    }
+    await route.fulfill({ json: startup });
+  });
   await page.route("**/api/admin/workspace", async (route) => {
     if (route.request().method() === "POST")
       state = { ...state, status: "running" };
@@ -129,4 +151,26 @@ test("requires the same privileged confirmation before rebuilding the trusted ov
   await confirmation.getByLabel(/I understand this is an ADMIN/).check();
   await confirmation.getByRole("button", { name: "Confirm rebuild" }).click();
   await expect(confirmation).toBeHidden();
+});
+
+test("edits the platform-admin startup script without interrupting the workspace", async ({
+  page,
+}) => {
+  const modal = await openAdminWorkspace(page);
+  await modal.getByText("Platform-admin startup script", { exact: true }).click();
+  const editor = modal.getByTestId("admin-startup-script-editor");
+  const input = editor.getByLabel("Platform-admin startup script");
+  await expect(input).toBeVisible();
+  await input.fill("#!/bin/bash\necho dashboard-admin-startup");
+  const saved = page.waitForRequest((request) =>
+    request.url().endsWith("/api/admin/workspace/startup-script") &&
+    request.method() === "PUT",
+  );
+  await editor.getByRole("button", { name: "Save startup script" }).click();
+  expect((await saved).postDataJSON()).toEqual({
+    startupScript: "#!/bin/bash\necho dashboard-admin-startup",
+  });
+  await expect(editor).toContainText("rebuild pending");
+  await expect(editor).toContainText("desired revision 1");
+  await expect(modal).toContainText("running");
 });

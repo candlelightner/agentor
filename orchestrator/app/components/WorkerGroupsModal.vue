@@ -213,6 +213,12 @@ function serviceIcon(service: string) {
               ></template
             >
           </div>
+          <AdminStartupScriptEditor
+            v-if="entry.group.adminWorkspace"
+            class="mt-3"
+            :endpoint="`/api/worker-groups/${entry.group.id}/admin-workspace/startup-script`"
+            :label="`${entry.group.name} admin startup script`"
+          />
         </div>
         <WorkerGroupEnvEditor :group-id="entry.group.id" />
         </template>

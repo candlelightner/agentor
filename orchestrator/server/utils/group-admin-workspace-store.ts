@@ -1,7 +1,13 @@
 import { randomUUID } from "node:crypto";
 import type {
   AdminWorkspaceRuntimeAdapter,
+  AdminWorkspaceStartupScriptRuntimeStatus,
   AdministrativeWorkspaceRecord,
+} from "./admin-workspace-store";
+import {
+  normalizedRevision,
+  publicStartupScriptStatus,
+  validateAdminWorkspaceStartupScript,
 } from "./admin-workspace-store";
 import { useWorkerGroupStore } from "./services";
 
@@ -105,14 +111,17 @@ export class GroupAdminWorkspaceStore {
     return this.publicRecord(record);
   }
   async setStatus(groupId: string, status: "running" | "stopped") {
-    await this.ensure(groupId);
+    // Avoid ensure() for an existing record: it reconciles the persisted
+    // running state and could execute an old startup-script revision before
+    // the explicit start operation replaces the container.
+    if (!this.record(groupId)) await this.ensure(groupId);
     const record = this.record(groupId)!;
     if (this.runtime)
-      await this.run(groupId, () =>
-        status === "running"
-          ? this.runtime!.start(record)
-          : this.runtime!.stop(record),
-      );
+      await this.run(groupId, async () => {
+        if (status === "running")
+          await this.applyImage(record, await this.runtime!.start(record));
+        else await this.runtime!.stop(record);
+      });
     record.status = status;
     record.updatedAt = new Date().toISOString();
     await this.save(record);
@@ -121,7 +130,9 @@ export class GroupAdminWorkspaceStore {
     return this.publicRecord(record);
   }
   async rebuild(groupId: string, ownerId?: string) {
-    await this.ensure(groupId, ownerId);
+    // Rebuild must not first auto-start stale disposable compute. Provisioning
+    // is still retained for a genuinely new administrative workspace.
+    if (!this.record(groupId)) await this.ensure(groupId, ownerId);
     const record = this.record(groupId)!;
     if (!this.runtime)
       throw Object.assign(
@@ -145,6 +156,60 @@ export class GroupAdminWorkspaceStore {
       if (record?.id === workspaceId) return record;
     }
   }
+  async getStartupScript(groupId: string) {
+    const record = this.record(groupId);
+    if (!record)
+      throw Object.assign(
+        new Error("Group administrative workspace not provisioned"),
+        { statusCode: 404 },
+      );
+    return this.startupScriptRecord(record);
+  }
+  async setStartupScript(groupId: string, value: unknown) {
+    const record = this.record(groupId);
+    if (!record)
+      throw Object.assign(
+        new Error("Group administrative workspace not provisioned"),
+        { statusCode: 404 },
+      );
+    const script = validateAdminWorkspaceStartupScript(value);
+    if ((record.startupScript || "") !== script) {
+      record.startupScript = script;
+      record.startupScriptRevision =
+        normalizedRevision(record.startupScriptRevision) + 1;
+      record.updatedAt = new Date().toISOString();
+      await this.save(record);
+    }
+    return this.startupScriptRecord(record);
+  }
+  private async startupScriptRecord(record: GroupAdministrativeWorkspaceRecord) {
+    const revision = normalizedRevision(record.startupScriptRevision);
+    const appliedRevision = normalizedRevision(
+      record.appliedStartupScriptRevision,
+    );
+    let runtime: AdminWorkspaceStartupScriptRuntimeStatus = {
+      state: record.startupScript
+        ? revision === appliedRevision
+          ? ("unavailable" as const)
+          : ("pending-rebuild" as const)
+        : ("not-configured" as const),
+      revision,
+    };
+    if (revision === appliedRevision && record.startupScript && this.runtime?.startupScriptStatus)
+      runtime = await this.runtime.startupScriptStatus(record).catch(() => ({
+        state: "unavailable" as const,
+        revision,
+      }));
+    return {
+      script: record.startupScript || "",
+      configured: Boolean(record.startupScript),
+      revision,
+      appliedRevision,
+      pendingRebuild: revision !== appliedRevision,
+      lastAppliedAt: record.startupScriptLastAppliedAt,
+      runtime,
+    };
+  }
   async remove(groupId: string) {
     const record = this.record(groupId);
     if (record && this.runtime?.remove)
@@ -161,21 +226,38 @@ export class GroupAdminWorkspaceStore {
     record: GroupAdministrativeWorkspaceRecord,
     image: any,
   ) {
+    if (!image) return;
+    let changed = false;
+    if (record.imageName !== image.name || record.imageDigest !== image.digest) {
+      record.imageName = image.name;
+      record.imageDigest = image.digest;
+      changed = true;
+    }
     if (
-      !image ||
-      (record.imageName === image.name && record.imageDigest === image.digest)
-    )
-      return;
-    record.imageName = image.name;
-    record.imageDigest = image.digest;
-    record.updatedAt = new Date().toISOString();
-    await this.save(record);
+      image.appliedStartupScriptRevision !== undefined &&
+      normalizedRevision(record.appliedStartupScriptRevision) !==
+        image.appliedStartupScriptRevision
+    ) {
+      record.appliedStartupScriptRevision =
+        image.appliedStartupScriptRevision;
+      record.startupScriptLastAppliedAt = new Date().toISOString();
+      changed = true;
+    }
+    if (changed) {
+      record.updatedAt = new Date().toISOString();
+      await this.save(record);
+    }
   }
   private publicRecord(record: GroupAdministrativeWorkspaceRecord) {
     return {
       ...record,
       userId: record.ownerId,
       ownerId: undefined,
+      startupScript: undefined,
+      startupScriptRevision: undefined,
+      appliedStartupScriptRevision: undefined,
+      startupScriptLastAppliedAt: undefined,
+      startupScriptStatus: publicStartupScriptStatus(record),
       image: {
         name: record.imageName,
         digest: record.imageDigest,

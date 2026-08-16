@@ -250,6 +250,11 @@ function openService(service: string) {
                 </button>
               </div>
             </section>
+
+            <AdminStartupScriptEditor
+              endpoint="/api/admin/workspace/startup-script"
+              label="Platform-admin startup script"
+            />
           </template>
         </div>
 

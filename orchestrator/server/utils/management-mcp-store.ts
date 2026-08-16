@@ -153,6 +153,10 @@ const GROUP_ADMIN_TOOLS = new Set([
   "groups.admin-workspace.get", "groups.admin-workspace.provision",
   "groups.admin-workspace.start", "groups.admin-workspace.stop",
   "groups.admin-workspace.rebuild",
+  "groups.admin-workspace.startup-script.get",
+  "groups.admin-workspace.startup-script.set",
+  "admin-workspace.startup-script.get",
+  "admin-workspace.startup-script.set",
 ]);
 const GROUP_ADMIN_IMAGE_TOOLS = new Set(
   [...GROUP_ADMIN_TOOLS].filter((name) => name.startsWith("images.")),
@@ -168,6 +172,8 @@ const GROUP_ADMIN_TARGET_FREE_TOOLS = new Set([
   "networks.create",
   "groups.list",
   "groups.create",
+  "admin-workspace.startup-script.get",
+  "admin-workspace.startup-script.set",
 ]);
 const GROUP_ADMIN_NETWORK_TOOLS = new Set([
   "networks.inspect", "networks.update", "networks.reconcile", "networks.delete",
@@ -176,6 +182,8 @@ const GROUP_ADMIN_GROUP_TOOLS = new Set([
   "groups.update", "groups.delete", "groups.env.list", "groups.env.update", "groups.admin-workspace.get",
   "groups.admin-workspace.provision", "groups.admin-workspace.start",
   "groups.admin-workspace.stop", "groups.admin-workspace.rebuild",
+  "groups.admin-workspace.startup-script.get",
+  "groups.admin-workspace.startup-script.set",
 ]);
 const GROUP_ADMIN_ASSIGN_TOOLS = new Set(["groups.assign-worker"]);
 const GROUP_ADMIN_DIRECT_TARGET_TOOLS = new Set([
@@ -335,6 +343,8 @@ const TOOL_GROUP: Record<string, Group> = {
   "images.build-status": "image-builds",
   "configuration.propose": "configuration-proposals",
   "configuration.apply": "configuration-application",
+  "admin-workspace.startup-script.get": "groups",
+  "admin-workspace.startup-script.set": "groups",
 };
 for (const tool of workerDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 for (const tool of workspaceMcpTools)
@@ -480,6 +490,7 @@ export class ManagementMcpStore {
               : identity?.scope === "group" && name.startsWith("groups.")
                 ? groupStructuralDescription(name)
               : undefined) ||
+            adminStartupScriptToolDescription(name) ||
             domain?.description ||
             workspace?.description ||
             imageBackup?.description ||
@@ -917,6 +928,30 @@ export class ManagementMcpStore {
     // particular, missing ownerId must not trigger backup/image store
     // initialization or compatibility lookups that can take minutes.
     validateToolArguments(name, args);
+    if (
+      name === "admin-workspace.startup-script.get" ||
+      name === "admin-workspace.startup-script.set"
+    ) {
+      if (!identity) throw statusError(401, "Administrative identity required");
+      const operation = async () => {
+        if (identity.scope === "group") {
+          const store = useGroupAdminWorkspaceStore();
+          const groupId = identity.groupId!;
+          return name.endsWith(".get")
+            ? store.getStartupScript(groupId)
+            : store.setStartupScript(groupId, args.startupScript);
+        }
+        const store = useAdminWorkspaceStore();
+        return name.endsWith(".get")
+          ? store.getStartupScript()
+          : store.setStartupScript(args.startupScript);
+      };
+      return withinManagementFailFastDeadline(
+        operation,
+        managementFailFastTimeoutSeconds(args.timeoutSeconds),
+        name,
+      );
+    }
     if (identity?.scope === "group" && name === "workers.create")
       // The caller is released at its explicit deadline, while the serialized
       // create/enrol/rollback workflow continues to completion so a timeout
@@ -1641,6 +1676,8 @@ function groupStructuralDescription(name: string): string {
     "groups.admin-workspace.start": "Provision if needed, then start the administrative workspace for the bound group or a descendant.",
     "groups.admin-workspace.stop": "Provision if needed, then stop the administrative workspace for the bound group or a descendant without deleting its data.",
     "groups.admin-workspace.rebuild": "Provision if needed, then rebuild and start the administrative workspace for the bound group or a descendant while retaining its data and group binding.",
+    "groups.admin-workspace.startup-script.get": "Read the non-secret startup script and bounded runtime status for an existing administrative workspace in the bound group or a descendant.",
+    "groups.admin-workspace.startup-script.set": "Set or clear the non-secret startup script for an existing administrative workspace in the bound group or a descendant. A running workspace is not interrupted; the next explicit start or rebuild applies it.",
   };
   return descriptions[name] ||
     "Restricted to the bound administrative group and its live descendant subtree.";
@@ -1667,10 +1704,16 @@ function validateToolArguments(name: string, args: Record<string, unknown>) {
     : [];
   for (const key of required) {
     const value = args[key];
-    const declaredType = (schema as any)?.properties?.[key]?.type;
+    const property = (schema as any)?.properties?.[key] || {};
+    const declaredType = property.type;
     const permitsNull = declaredType === "null" ||
       (Array.isArray(declaredType) && declaredType.includes("null"));
-    if (value === undefined || (value === null && !permitsNull) || value === "")
+    const permitsEmpty = property.minLength === 0;
+    if (
+      value === undefined ||
+      (value === null && !permitsNull) ||
+      (value === "" && !permitsEmpty)
+    )
       throw statusError(400, `${name}: ${key} is required`);
   }
 }
@@ -1705,7 +1748,7 @@ function toolAnnotations(name: string) {
   const readOnly =
     /(?:\.list|\.inspect|\.status|\.read|list-files|validate|build-status)$/.test(
       name,
-    ) || name === "status.system";
+    ) || name === "status.system" || name.endsWith(".get");
   const destructive =
     /(?:\.delete|\.cancel|\.remove|\.rollback|console\.close)$/.test(name);
   return {
@@ -1716,7 +1759,43 @@ function toolAnnotations(name: string) {
     openWorldHint: false,
   };
 }
+function adminStartupScriptToolDescription(name: string) {
+  if (name === "admin-workspace.startup-script.get")
+    return "Read the calling administrative workspace's non-secret startup script, desired/applied revisions, pending-rebuild flag, and bounded runtime status. The server derives the target from the authenticated workload identity; no workspace or group identifier is accepted. timeoutSeconds bounds the request.";
+  if (name === "admin-workspace.startup-script.set")
+    return "Set or clear the calling administrative workspace's non-secret startup script. The server derives the target from the authenticated workload identity; no workspace or group identifier is accepted. Saving never interrupts a running workspace; the next explicit start or rebuild applies it. timeoutSeconds bounds the request.";
+  return "";
+}
 function toolInputSchema(name: string) {
+  if (
+    name === "admin-workspace.startup-script.get" ||
+    name === "admin-workspace.startup-script.set"
+  )
+    return {
+      type: "object",
+      additionalProperties: false,
+      ...(name.endsWith(".set") ? { required: ["startupScript"] } : {}),
+      properties: {
+        ...(name.endsWith(".set")
+          ? {
+              startupScript: {
+                type: "string",
+                minLength: 0,
+                maxLength: 65_536,
+                description:
+                  "Non-secret shell script launched after each start. Empty disables it; changes apply on the next explicit start or rebuild.",
+              },
+            }
+          : {}),
+        timeoutSeconds: {
+          type: "integer",
+          minimum: 1,
+          maximum: 120,
+          description:
+            "Server-side fail-fast deadline in seconds (default 30; 1-120). Returns a structured 504 error when exceeded.",
+        },
+      },
+    };
   if (name === "configuration.inspect")
     return {
       type: "object",

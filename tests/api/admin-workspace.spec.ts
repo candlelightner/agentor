@@ -45,6 +45,8 @@ test.describe.serial('Persistent administrative workspace', () => {
       expect((await ctx.get('/api/admin/workspace')).status()).toBe(expected);
       expect((await ctx.post('/api/admin/workspace', { data: {} })).status()).toBe(expected);
       expect((await ctx.post('/api/admin/workspace/rebuild', { data: {} })).status()).toBe(expected);
+      expect((await ctx.get('/api/admin/workspace/startup-script')).status()).toBe(expected);
+      expect((await ctx.put('/api/admin/workspace/startup-script', { data: { startupScript: 'echo denied' } })).status()).toBe(expected);
     }
   });
 
@@ -98,6 +100,78 @@ test.describe.serial('Persistent administrative workspace', () => {
     const read = await request.get('/api/admin/workspace/diagnostics/read-marker');
     expect(read.status()).toBe(200);
     expect(await read.json()).toMatchObject({ marker });
+  });
+
+  test('startup script persists, runs after every start and rebuild, and reports failures without blocking readiness', { timeout: 360_000 }, async ({ request }) => {
+    const marker = `/workspace/.admin-startup-${Date.now()}`;
+    const preserved = `/workspace/.admin-preserved-${Date.now()}`;
+    const script = `#!/bin/bash\nprintf 'run\\n' >> '${marker}'`;
+    const initial = await (await request.get('/api/admin/workspace/startup-script')).json();
+    const firstRevision = initial.revision + 1;
+    const saved = await request.put('/api/admin/workspace/startup-script', {
+      data: { startupScript: script },
+    });
+    expect(saved.status()).toBe(200);
+    expect(await saved.json()).toMatchObject({
+      script,
+      configured: true,
+      revision: firstRevision,
+      appliedRevision: initial.appliedRevision,
+      pendingRebuild: true,
+      runtime: { state: 'pending-rebuild' },
+    });
+    const publicWorkspace = await (await request.get('/api/admin/workspace')).json();
+    expect(JSON.stringify(publicWorkspace)).not.toContain(script);
+    expect(publicWorkspace.startupScriptStatus).toMatchObject({ configured: true, pendingRebuild: true });
+
+    await captureCommandOutput(adminWorkspaceId, `printf keep > '${preserved}'`);
+    expect((await request.post('/api/admin/workspace/stop', { data: {} })).status()).toBe(200);
+    expect((await request.post('/api/admin/workspace/start', { data: {} })).status()).toBe(200);
+    await expect.poll(async () =>
+      (await captureCommandOutput(adminWorkspaceId, `wc -l < '${marker}'`)).trim(),
+      { timeout: 30_000 },
+    ).toContain('1');
+    await expect.poll(async () =>
+      (await (await request.get('/api/admin/workspace/startup-script')).json()).runtime,
+      { timeout: 10_000 },
+    ).toMatchObject({ state: 'succeeded', exitCode: 0, revision: firstRevision });
+
+    // The runtime status path is deliberately worker-writable. A malicious
+    // symlink must be treated as unreadable rather than following an endless
+    // source and leaving the API/Docker exec hanging.
+    await captureCommandOutput(
+      adminWorkspaceId,
+      "rm -f ~/.agent-data/.agentor/admin-startup-script-status.json && ln -s /dev/zero ~/.agent-data/.agentor/admin-startup-script-status.json",
+    );
+    const statusStartedAt = Date.now();
+    const protectedStatus = await request.get('/api/admin/workspace/startup-script');
+    expect(protectedStatus.status()).toBe(200);
+    expect(Date.now() - statusStartedAt).toBeLessThan(2_500);
+    expect(await protectedStatus.json()).toMatchObject({ runtime: { state: 'starting' } });
+
+    expect((await request.post('/api/admin/workspace/stop', { data: {} })).status()).toBe(200);
+    expect((await request.post('/api/admin/workspace/start', { data: {} })).status()).toBe(200);
+    await expect.poll(async () =>
+      (await captureCommandOutput(adminWorkspaceId, `wc -l < '${marker}'`)).trim(),
+      { timeout: 30_000 },
+    ).toContain('2');
+
+    const failing = '#!/bin/bash\nexit 23';
+    expect((await request.put('/api/admin/workspace/startup-script', { data: { startupScript: failing } })).status()).toBe(200);
+    expect((await request.post('/api/admin/workspace/rebuild', { data: {} })).status()).toBe(200);
+    await expect.poll(async () =>
+      (await (await request.get('/api/admin/workspace/startup-script')).json()).runtime,
+      { timeout: 30_000 },
+    ).toMatchObject({ state: 'failed', exitCode: 23, revision: firstRevision + 1 });
+    expect(await captureCommandOutput(adminWorkspaceId, `cat '${preserved}'`)).toContain('keep');
+
+    const cleared = await request.put('/api/admin/workspace/startup-script', { data: { startupScript: '' } });
+    expect(cleared.status()).toBe(200);
+    expect(await cleared.json()).toMatchObject({ configured: false, pendingRebuild: true });
+    expect((await request.post('/api/admin/workspace/rebuild', { data: {} })).status()).toBe(200);
+    expect(await request.get('/api/admin/workspace/startup-script').then((response) => response.json())).toMatchObject({
+      script: '', configured: false, pendingRebuild: false, runtime: { state: 'not-configured' },
+    });
   });
 
   test('platform admin receives only its role skill and reconciles stale roles without deleting user skills', async ({ request }) => {

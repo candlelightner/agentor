@@ -22,7 +22,14 @@ The **Backups** API uses `/api/backups`, `/api/backup-jobs`, `/api/backup-settin
 
 The **Image catalog** API uses `/api/image-catalog`, `/api/image-builds`, and `/api/image-builder`. It covers constrained validation, asynchronous controlled builds/logs/cancel, immutable versions, promotion/rollback/defaults/test workers/cleanup, plus optional `/api/image-catalog/git/*` connection/sync/recovery. Git credentials are write-only. Fake build/Git diagnostics are test-gated.
 
-The **Admin workspace** and **Management MCP** APIs are administrator-only.
+The platform **Admin workspace** API is administrator-only, including
+`GET`/`PUT /api/admin/workspace/startup-script`. Group owners (and platform
+administrators) use `GET`/`PUT
+/api/worker-groups/:id/admin-workspace/startup-script` for a provisioned group
+workspace. Saving a script is non-disruptive and reports a pending desired
+revision; explicit start/rebuild applies it. Equivalent management-MCP tools
+derive self targets from workload identity and authorize explicit group targets
+against the live descendant hierarchy.
 Workspace lifecycle uses dedicated routes so ordinary container lifecycle
 endpoints cannot mutate a trusted runtime. A worker-group owner can additionally
 manage that group's one scoped workspace through

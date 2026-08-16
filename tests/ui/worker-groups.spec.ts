@@ -77,6 +77,17 @@ test.describe.serial('Worker groups dashboard', () => {
       timeout: 120_000,
     });
     await expect.poll(async () => (await request.get(`/api/worker-groups/${groupId}/admin-workspace`)).status(), { timeout: 120_000 }).toBe(200);
+    await group.getByText(`${groupName} admin startup script`, { exact: true }).click();
+    const startupEditor = group.getByTestId('admin-startup-script-editor');
+    await startupEditor.getByLabel(`${groupName} admin startup script`).fill('#!/bin/bash\necho group-admin-startup');
+    await startupEditor.getByRole('button', { name: 'Save startup script' }).click();
+    await expect(startupEditor).toContainText('rebuild pending');
+    const startupStatus = await request.get(`/api/worker-groups/${groupId}/admin-workspace/startup-script`);
+    expect(startupStatus.status()).toBe(200);
+    expect(await startupStatus.json()).toMatchObject({
+      script: '#!/bin/bash\necho group-admin-startup',
+      pendingRebuild: true,
+    });
     await expect(workerGroupCards.getByText('GROUP ADMIN', { exact: true })).toBeVisible();
     await expect(workerGroupCards.locator('h3')).toHaveCount(3);
     await group.getByRole('button', { name: 'Files', exact: true }).click();

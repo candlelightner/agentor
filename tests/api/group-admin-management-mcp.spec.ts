@@ -34,6 +34,9 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
   let outsiderId = "";
   let createdByGroupId = "";
   let workspaceId = "";
+  let childGroupId = "";
+  let childWorkspaceId = "";
+  let siblingGroupId = "";
   let credential = "";
   let groupImageId = "";
   let globalImageId = "";
@@ -95,6 +98,8 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     // run after worker cleanup because non-empty groups deliberately reject
     // deletion; doing it first leaked networks across Playwright retries and
     // could exhaust Docker's subnet allocator.
+    if (childGroupId) await ownerRequest.delete(`/api/worker-groups/${childGroupId}`).catch(() => {});
+    if (siblingGroupId) await ownerRequest.delete(`/api/worker-groups/${siblingGroupId}`).catch(() => {});
     if (groupId) await ownerRequest.delete(`/api/worker-groups/${groupId}`).catch(() => {});
     await ownerRequest?.dispose();
     if (owner) await deleteTestUser(owner.id).catch(() => {});
@@ -217,6 +222,10 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     const toolNames=discoveredTools.map((tool)=>tool.name);
     expect(toolNames).toContain("workers.inspect");
     expect(toolNames).toEqual(expect.arrayContaining(["workers.env-keys", "groups.env.list", "groups.env.update"]));
+    expect(toolNames).toEqual(expect.arrayContaining([
+      "admin-workspace.startup-script.get", "admin-workspace.startup-script.set",
+      "groups.admin-workspace.startup-script.get", "groups.admin-workspace.startup-script.set",
+    ]));
     expect(toolNames).toEqual(expect.arrayContaining(["groups.list", "groups.create", "groups.update", "groups.delete", "groups.assign-worker"]));
     expect(toolNames).toContain("workers.create");
     expect(toolNames).not.toContain("port-mappings.list");
@@ -251,6 +260,9 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     expect(Object.keys(schemas.get("groups.update")?.properties || {})).not.toContain("workerIds");
     expect(schemas.get("groups.assign-worker")).toMatchObject({ required: ["workerId", "targetGroupId"] });
     expect((schemas.get("groups.env.update")?.properties as any)?.entries?.items?.properties?.value).toMatchObject({ writeOnly: true });
+    expect(Object.keys(schemas.get("admin-workspace.startup-script.get")?.properties || {})).toEqual(["timeoutSeconds"]);
+    expect(Object.keys(schemas.get("admin-workspace.startup-script.set")?.properties || {}).sort()).toEqual(["startupScript", "timeoutSeconds"]);
+    expect((schemas.get("admin-workspace.startup-script.set")?.properties as any)?.startupScript).toMatchObject({ type: "string", maxLength: 65_536 });
     for (const name of toolNames.filter((candidate) => candidate.startsWith("groups."))) {
       const description = discoveredTools.find((tool) => tool.name === name)?.description || "";
       expect(description).toContain("bound");
@@ -362,6 +374,102 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     expect(deniedBridge).toContain('"id":42');
     expect(deniedBridge).toContain('"statusCode":404');
     expect(deniedBridge).not.toContain(outsiderId);
+  });
+
+  test("self, parent, and platform identities manage only authorized administrative startup scripts", { timeout: 360_000 }, async ({ request }) => {
+    await issueCredential(request);
+    const initial = await invoke(request, credential, "admin-workspace.startup-script.get");
+    expect(initial.status()).toBe(200);
+    const initialSettings = await initial.json();
+    const marker = `/workspace/.group-admin-startup-${Date.now()}`;
+    const startupScript = `#!/bin/bash\nprintf 'run\\n' >> '${marker}'`;
+    const saved = await invoke(request, credential, "admin-workspace.startup-script.set", { startupScript });
+    expect(saved.status()).toBe(200);
+    expect(await saved.json()).toMatchObject({
+      script: startupScript,
+      configured: true,
+      revision: initialSettings.revision + 1,
+      pendingRebuild: true,
+      runtime: { state: "pending-rebuild" },
+    });
+    expect((await invoke(request, credential, "groups.admin-workspace.stop", { groupId })).status()).toBe(200);
+    expect((await invoke(request, credential, "groups.admin-workspace.start", { groupId })).status()).toBe(200);
+    await expect.poll(async () =>
+      (await captureCommandOutput(workspaceId, `wc -l < '${marker}'`)).trim(),
+      { timeout: 30_000 },
+    ).toContain("1");
+    await expect.poll(async () =>
+      (await (await invoke(request, credential, "admin-workspace.startup-script.get")).json()).runtime,
+      { timeout: 10_000 },
+    ).toMatchObject({ state: "succeeded", exitCode: 0 });
+
+    const child = await ownerRequest.post("/api/worker-groups", {
+      data: { name: `startup-child-${Date.now()}`, parentId: groupId },
+    });
+    expect(child.status()).toBe(201);
+    childGroupId = (await child.json()).id;
+    const childWorkspace = await ownerRequest.post(
+      `/api/worker-groups/${childGroupId}/admin-workspace`,
+      { data: {} },
+    );
+    expect([200, 201]).toContain(childWorkspace.status());
+    childWorkspaceId = (await childWorkspace.json()).id;
+    const sibling = await ownerRequest.post("/api/worker-groups", {
+      data: { name: `startup-sibling-${Date.now()}` },
+    });
+    expect(sibling.status()).toBe(201);
+    siblingGroupId = (await sibling.json()).id;
+
+    await issueCredential(request);
+    const childScript = "#!/bin/bash\necho managed-by-parent";
+    const parentSet = await invoke(
+      request,
+      credential,
+      "groups.admin-workspace.startup-script.set",
+      { groupId: childGroupId, startupScript: childScript },
+    );
+    expect(parentSet.status()).toBe(200);
+    expect(await parentSet.json()).toMatchObject({ script: childScript, pendingRebuild: true });
+    const siblingDenied = await invoke(
+      request,
+      credential,
+      "groups.admin-workspace.startup-script.set",
+      { groupId: siblingGroupId, startupScript: "echo forbidden" },
+    );
+    const unknownDenied = await invoke(
+      request,
+      credential,
+      "groups.admin-workspace.startup-script.set",
+      { groupId: randomUUID(), startupScript: "echo forbidden" },
+    );
+    expect(siblingDenied.status()).toBe(404);
+    expect(await siblingDenied.json()).toEqual(await unknownDenied.json());
+
+    const platformWorkspace = await (await request.get("/api/admin/workspace")).json();
+    const platformIdentity = await request.post(
+      "/api/admin/management-mcp/diagnostics/issue-identity",
+      { data: { workspaceId: platformWorkspace.id, ttlSeconds: 60 } },
+    );
+    expect(platformIdentity.status()).toBe(201);
+    const platformCredential = (await platformIdentity.json()).credential;
+    const globalScript = "#!/bin/bash\necho managed-by-global";
+    const globalSet = await invoke(
+      request,
+      platformCredential,
+      "groups.admin-workspace.startup-script.set",
+      { groupId: childGroupId, startupScript: globalScript },
+    );
+    expect(globalSet.status()).toBe(200);
+    expect(await globalSet.json()).toMatchObject({ script: globalScript, pendingRebuild: true });
+    expect(childWorkspaceId).toEqual(expect.any(String));
+
+    await issueCredential(request);
+    expect((await invoke(request, credential, "admin-workspace.startup-script.set", { startupScript: "" })).status()).toBe(200);
+    expect((await invoke(request, credential, "groups.admin-workspace.rebuild", { groupId })).status()).toBe(200);
+    expect(await (await invoke(request, credential, "admin-workspace.startup-script.get")).json()).toMatchObject({
+      script: "", configured: false, pendingRebuild: false, runtime: { state: "not-configured" },
+    });
+    expect((await invoke(request, credential, "groups.admin-workspace.startup-script.set", { groupId: childGroupId, startupScript: "" })).status()).toBe(200);
   });
 
   test("group environment values are write-only and audit-safe", async ({ request }) => {

@@ -35,6 +35,8 @@ const MANAGEMENT_FAIL_FAST_TOOLS = new Set([
   "workers.env-keys",
   "groups.list", "groups.create", "groups.update", "groups.delete",
   "groups.assign-worker", "groups.env.list", "groups.env.update",
+  "groups.admin-workspace.startup-script.get",
+  "groups.admin-workspace.startup-script.set",
 ]);
 const failFastTimeoutSchema = {
   type: "integer",
@@ -56,6 +58,29 @@ const groupAdminLifecycleInput = {
     },
   },
 };
+const groupAdminStartupScriptInput = (write: boolean) => ({
+  type: "object",
+  additionalProperties: false,
+  required: write ? ["groupId", "startupScript"] : ["groupId"],
+  properties: {
+    groupId: {
+      type: "string",
+      description: "Target worker group. Group-admin callers are restricted to their bound group and descendants.",
+    },
+    ...(write
+      ? {
+          startupScript: {
+            type: "string",
+            minLength: 0,
+            maxLength: 65_536,
+            description:
+              "Non-secret shell script launched after each administrative workspace start. Empty disables it; changes apply on the next explicit start or rebuild.",
+          },
+        }
+      : {}),
+    timeoutSeconds: failFastTimeoutSchema,
+  },
+});
 
 /** MCP domain adapter for ordinary worker administration. It is deliberately
  * transport-free: ManagementMcpStore can register these definitions/dispatch
@@ -86,6 +111,8 @@ export class ManagementWorkerDomain {
       ["groups.admin-workspace.start", "groups", "Provision if needed, then start a worker-group administrative workspace. The server operation deadline defaults to 120 seconds.", groupAdminLifecycleInput, mutation],
       ["groups.admin-workspace.stop", "groups", "Provision if needed, then stop a worker-group administrative workspace without deleting its workspace data. The server operation deadline defaults to 120 seconds.", groupAdminLifecycleInput, mutation],
       ["groups.admin-workspace.rebuild", "groups", "Provision if needed, then rebuild and start a worker-group administrative workspace while retaining its group binding and data. The server operation deadline defaults to 120 seconds.", groupAdminLifecycleInput, mutation],
+      ["groups.admin-workspace.startup-script.get", "groups", "Read the non-secret startup script and bounded runtime status for an existing group-administrative workspace. The target must be an authorized group; timeoutSeconds bounds the request.", groupAdminStartupScriptInput(false), read],
+      ["groups.admin-workspace.startup-script.set", "groups", "Set or clear the non-secret startup script for an existing group-administrative workspace. The target must be an authorized group. A running workspace is not interrupted; the next explicit start or rebuild applies the revision. timeoutSeconds bounds the request.", groupAdminStartupScriptInput(true), mutation],
       ["locks.get", "locks", "Get worker protection state without password/verifier.", objectWithWorker(), read],
       ["locks.set", "locks", "Set/change a worker protection password; values are write-only.", lockSetInput(), mutation],
       ["locks.remove", "locks", "Remove protection with its current password.", lockRemoveInput(), { ...mutation, destructiveHint:true }],
@@ -181,6 +208,8 @@ export class ManagementWorkerDomain {
     });
     if(name.startsWith("groups.admin-workspace.")) {
       const workspaces=useGroupAdminWorkspaceStore();
+      if(name==="groups.admin-workspace.startup-script.get") return workspaces.getStartupScript(group.id);
+      if(name==="groups.admin-workspace.startup-script.set") return workspaces.setStartupScript(group.id,args.startupScript);
       const deadline=groupAdminLifecycleTimeoutSeconds(args.timeoutSeconds);
       if(name==="groups.admin-workspace.get") {
         if(!group.adminWorkspace) throw status(404,"Group administrative workspace not provisioned");

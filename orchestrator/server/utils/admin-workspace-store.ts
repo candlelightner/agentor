@@ -16,11 +16,33 @@ export interface AdministrativeWorkspaceRecord {
   imageDigest?: string;
   /** Account whose worker environment variables are injected on recreation. */
   ownerId?: string;
+  /** User-authored, non-secret shell launched in the admin tmux pane. */
+  startupScript?: string;
+  /** Monotonic desired/applied revisions keep Docker's immutable Env explicit. */
+  startupScriptRevision?: number;
+  appliedStartupScriptRevision?: number;
+  startupScriptLastAppliedAt?: string;
 }
 
 export interface AdminWorkspaceRuntimeImage {
   name: string;
   digest: string;
+  appliedStartupScriptRevision?: number;
+}
+
+export interface AdminWorkspaceStartupScriptRuntimeStatus {
+  state:
+    | "not-configured"
+    | "pending-rebuild"
+    | "starting"
+    | "running"
+    | "succeeded"
+    | "failed"
+    | "unavailable";
+  revision?: number;
+  startedAt?: string;
+  finishedAt?: string;
+  exitCode?: number;
 }
 
 /**
@@ -34,12 +56,17 @@ export interface AdminWorkspaceRuntimeAdapter {
   ensure(
     record: Readonly<AdministrativeWorkspaceRecord>,
   ): Promise<AdminWorkspaceRuntimeImage | void>;
-  start(record: Readonly<AdministrativeWorkspaceRecord>): Promise<void>;
+  start(
+    record: Readonly<AdministrativeWorkspaceRecord>,
+  ): Promise<AdminWorkspaceRuntimeImage | void>;
   stop(record: Readonly<AdministrativeWorkspaceRecord>): Promise<void>;
   rebuild(
     record: Readonly<AdministrativeWorkspaceRecord>,
   ): Promise<AdminWorkspaceRuntimeImage | void>;
   remove?(record: Readonly<AdministrativeWorkspaceRecord>): Promise<void>;
+  startupScriptStatus?(
+    record: Readonly<AdministrativeWorkspaceRecord>,
+  ): Promise<AdminWorkspaceStartupScriptRuntimeStatus>;
   security?(workerId?: string): Promise<Record<string, unknown> | undefined>;
   managementNetworkSecurity?(): Promise<Record<string, unknown>>;
   setClipboard?(
@@ -131,20 +158,28 @@ export class AdminWorkspaceStore {
     return this.publicRecord();
   }
   async setStatus(status: "running" | "stopped") {
-    await this.ensure();
+    await this.init();
+    // Lifecycle calls on an existing workspace must reach the runtime
+    // operation directly. Calling ensure() here could auto-start a crashed
+    // container from the persisted `running` state before start() has a chance
+    // to replace a pending startup-script revision (or before stop()).
+    if (!this.record) await this.ensure();
     if (this.runtime)
-      await this.runRuntime(() =>
-        status === "running"
-          ? this.runtime!.start(this.record!)
-          : this.runtime!.stop(this.record!),
-      );
+      await this.runRuntime(async () => {
+        if (status === "running")
+          await this.applyRuntimeImage(await this.runtime!.start(this.record!));
+        else await this.runtime!.stop(this.record!);
+      });
     this.record!.status = status;
     this.record!.updatedAt = new Date().toISOString();
     await this.save();
     return this.publicRecord();
   }
   async rebuild(ownerId?: string) {
-    await this.ensure();
+    await this.init();
+    // Rebuild itself is the application boundary; do not auto-start stale
+    // disposable compute first merely to ensure the durable record exists.
+    if (!this.record) await this.ensure();
     if (ownerId && this.record!.ownerId !== ownerId) {
       this.record!.ownerId = ownerId;
       await this.save();
@@ -182,6 +217,57 @@ export class AdminWorkspaceStore {
     await this.ensure();
     return { marker: this.record!.marker ?? null };
   }
+  async getStartupScript() {
+    await this.init();
+    if (!this.record)
+      throw Object.assign(new Error("Administrative workspace not provisioned"), {
+        statusCode: 404,
+      });
+    return this.startupScriptRecord(this.record);
+  }
+  async setStartupScript(value: unknown) {
+    await this.init();
+    if (!this.record)
+      throw Object.assign(new Error("Administrative workspace not provisioned"), {
+        statusCode: 404,
+      });
+    const script = validateAdminWorkspaceStartupScript(value);
+    if ((this.record.startupScript || "") !== script) {
+      this.record.startupScript = script;
+      this.record.startupScriptRevision =
+        normalizedRevision(this.record.startupScriptRevision) + 1;
+      this.record.updatedAt = new Date().toISOString();
+      await this.save();
+    }
+    return this.startupScriptRecord(this.record);
+  }
+  private async startupScriptRecord(record: AdministrativeWorkspaceRecord) {
+    const revision = normalizedRevision(record.startupScriptRevision);
+    const appliedRevision = normalizedRevision(
+      record.appliedStartupScriptRevision,
+    );
+    let runtime: AdminWorkspaceStartupScriptRuntimeStatus = {
+      state: record.startupScript
+        ? revision === appliedRevision
+          ? "unavailable"
+          : "pending-rebuild"
+        : "not-configured",
+    };
+    if (revision === appliedRevision && record.startupScript && this.runtime?.startupScriptStatus)
+      runtime = await this.runtime.startupScriptStatus(record).catch(() => ({
+        state: "unavailable" as const,
+        revision,
+      }));
+    return {
+      script: record.startupScript || "",
+      configured: Boolean(record.startupScript),
+      revision,
+      appliedRevision,
+      pendingRebuild: revision !== appliedRevision,
+      lastAppliedAt: record.startupScriptLastAppliedAt,
+      runtime,
+    };
+  }
   publicRecord() {
     if (!this.record)
       throw new Error("Administrative workspace not initialized");
@@ -189,6 +275,11 @@ export class AdminWorkspaceStore {
       ...this.record,
       ownerId: undefined,
       marker: undefined,
+      startupScript: undefined,
+      startupScriptRevision: undefined,
+      appliedStartupScriptRevision: undefined,
+      startupScriptLastAppliedAt: undefined,
+      startupScriptStatus: publicStartupScriptStatus(this.record),
       image: {
         name: this.record.imageName || ADMIN_IMAGE,
         digest: this.record.imageDigest || ADMIN_DIGEST,
@@ -246,18 +337,70 @@ export class AdminWorkspaceStore {
     return this.runtime.managementNetworkSecurity();
   }
   private async applyRuntimeImage(image: AdminWorkspaceRuntimeImage | void) {
+    if (!image || !this.record) return;
+    let changed = false;
     if (
-      !image ||
-      !this.record ||
-      (this.record.imageName === image.name &&
-        this.record.imageDigest === image.digest)
-    )
-      return;
-    this.record.imageName = image.name;
-    this.record.imageDigest = image.digest;
-    this.record.updatedAt = new Date().toISOString();
-    await this.save();
+      this.record.imageName !== image.name ||
+      this.record.imageDigest !== image.digest
+    ) {
+      this.record.imageName = image.name;
+      this.record.imageDigest = image.digest;
+      changed = true;
+    }
+    if (
+      image.appliedStartupScriptRevision !== undefined &&
+      normalizedRevision(this.record.appliedStartupScriptRevision) !==
+        image.appliedStartupScriptRevision
+    ) {
+      this.record.appliedStartupScriptRevision =
+        image.appliedStartupScriptRevision;
+      this.record.startupScriptLastAppliedAt = new Date().toISOString();
+      changed = true;
+    }
+    if (changed) {
+      this.record.updatedAt = new Date().toISOString();
+      await this.save();
+    }
   }
+}
+
+export function validateAdminWorkspaceStartupScript(value: unknown) {
+  if (typeof value !== "string")
+    throw Object.assign(new Error("startupScript must be a string"), {
+      statusCode: 400,
+    });
+  if (value.includes("\0"))
+    throw Object.assign(new Error("startupScript must not contain NUL bytes"), {
+      statusCode: 400,
+    });
+  if (Buffer.byteLength(value, "utf8") > 65_536)
+    throw Object.assign(
+      new Error("startupScript must not exceed 65536 UTF-8 bytes"),
+      { statusCode: 400 },
+    );
+  return value;
+}
+
+export function normalizedRevision(value: unknown) {
+  return Number.isSafeInteger(value) && (value as number) >= 0
+    ? (value as number)
+    : 0;
+}
+
+export function publicStartupScriptStatus(
+  record: Readonly<AdministrativeWorkspaceRecord>,
+) {
+  const revision = normalizedRevision(record.startupScriptRevision);
+  const appliedRevision = normalizedRevision(
+    record.appliedStartupScriptRevision,
+  );
+  return {
+    configured: Boolean(record.startupScript),
+    revision,
+    appliedRevision,
+    pendingRebuild: revision !== appliedRevision,
+    lastAppliedAt: record.startupScriptLastAppliedAt,
+  };
 }
 
 let singleton: AdminWorkspaceStore | undefined;

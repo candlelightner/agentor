@@ -4,6 +4,13 @@ export interface GroupAdminWorkspace {
   userId: string;
   status: "running" | "stopped";
   services: string[];
+  startupScriptStatus?: {
+    configured: boolean;
+    revision: number;
+    appliedRevision: number;
+    pendingRebuild: boolean;
+    lastAppliedAt?: string;
+  };
 }
 export interface WorkerGroup {
   id: string;

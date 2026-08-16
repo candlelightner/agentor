@@ -21,6 +21,13 @@ export interface AdminWorkspace {
     warningBeforePrivilegedActions: boolean;
   };
   services: Array<"terminal" | "editor" | "desktop" | string>;
+  startupScriptStatus?: {
+    configured: boolean;
+    revision: number;
+    appliedRevision: number;
+    pendingRebuild: boolean;
+    lastAppliedAt?: string;
+  };
 }
 
 function adminError(error: any, fallback: string) {
