@@ -577,7 +577,7 @@ watch(
               <h3 class="text-sm font-medium text-gray-900 dark:text-white">New folder in {{ uploadDestinationLabel }}</h3>
               <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-x" aria-label="Cancel" @click="clearPanel" />
             </div>
-            <UInput v-model="newName" placeholder="folder name" class="w-full" autofocus @keydown.enter="doMkdir" @keydown.escape="clearPanel" />
+            <UInput v-model="newName" placeholder="folder name" class="w-full" autofocus @keydown.enter="doMkdir" />
             <p v-if="newName && !mkdirValid" class="text-xs text-red-500 dark:text-red-400">Name must not contain slashes or be empty.</p>
             <p v-if="panelError" class="text-red-500 dark:text-red-400 text-xs">
               {{ panelError }}
@@ -597,7 +597,7 @@ watch(
               </h3>
               <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-x" aria-label="Cancel" @click="clearPanel" />
             </div>
-            <UInput v-model="newName" placeholder="new name" class="w-full" autofocus @keydown.enter="doRename" @keydown.escape="clearPanel" />
+            <UInput v-model="newName" placeholder="new name" class="w-full" autofocus @keydown.enter="doRename" />
             <p v-if="newName && !renameValid" class="text-xs text-red-500 dark:text-red-400">Name must differ, contain no slashes, and not be empty.</p>
             <p v-if="panelError" class="text-red-500 dark:text-red-400 text-xs">
               {{ panelError }}
@@ -615,7 +615,7 @@ watch(
               <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-x" aria-label="Cancel" @click="clearPanel" />
             </div>
             <UFormField label="Destination" hint="Relative to /workspace; empty = root">
-              <UInput v-model="moveDest" placeholder="e.g. docs or (empty for /workspace)" class="w-full font-mono text-xs" autofocus @keydown.enter="doMove(false)" @keydown.escape="clearPanel" />
+              <UInput v-model="moveDest" placeholder="e.g. docs or (empty for /workspace)" class="w-full font-mono text-xs" autofocus @keydown.enter="doMove(false)" />
             </UFormField>
             <p v-if="moveSelfTarget" class="text-xs text-red-500 dark:text-red-400">Cannot move a folder into itself or one of its descendants.</p>
             <p v-if="moveDest && !moveDestValid" class="text-xs text-red-500 dark:text-red-400">Destination must be relative to /workspace (no leading slash, no backslash, no ..).</p>

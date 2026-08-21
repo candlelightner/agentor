@@ -253,6 +253,9 @@ export default defineNitroPlugin(async (nitroApp) => {
   useOrphanSweeper().addPreCleanupHook((userId) =>
     useBackupManager().forgetUser(userId),
   );
+  useOrphanSweeper().addLifecycleCleanupHook((userId) =>
+    useContainerManager().removeWorkersForDeletedOwner(userId),
+  );
   useOrphanSweeper().addCandidateSource(() => useBackupManager().ownerIds());
   useOrphanSweeper().addCleanupHook((userId) =>
     useImageCatalogManager().forgetOwner(userId),

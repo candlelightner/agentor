@@ -638,8 +638,14 @@ for item in json.loads(sys.stdin.readline()):
     try {
       await this.docker.getImage(image).remove({ force: true });
       useLogger().debug(`[docker] removed image ${image}`);
-    } catch {
-      // Image may not exist or still be in use — ignore.
+    } catch (error) {
+      // Missing is already the requested state. Surface daemon/in-use failures
+      // so transactional import rollback can retain its authoritative handles
+      // and report cleanup that still needs operator attention. Normal delete
+      // callers deliberately catch, log, and continue.
+      const status = (error as { statusCode?: number; status?: number })
+        ?.statusCode ?? (error as { status?: number })?.status;
+      if (status !== 404) throw error;
     }
   }
 

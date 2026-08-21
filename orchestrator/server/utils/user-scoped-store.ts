@@ -17,6 +17,7 @@ export class UserScopedJsonStore<K, V> {
   protected filename: string;
   protected keyFn: (item: V) => K;
   private saveQueues = new Map<string, Promise<void>>();
+  private unavailableUsers = new Set<string>();
 
   constructor(dataDir: string, filename: string, keyFn: (item: V) => K) {
     this.dataDir = dataDir;
@@ -51,8 +52,8 @@ export class UserScopedJsonStore<K, V> {
   }
 
   /** Load (or reload) a single user's file. Useful after a user dir is created
-   * mid-run by some other subsystem. A corrupt (unparseable) file is logged and
-   * skipped rather than thrown, so one bad file never blocks the rest. */
+   * mid-run by some other subsystem. Invalid input quarantines that owner and
+   * rejects this load; init() isolates the rejection so other owners still load. */
   async loadUser(userId: string): Promise<void> {
     assertSafeUserId(userId);
     const filePath = this.filePathForUser(userId);
@@ -60,7 +61,12 @@ export class UserScopedJsonStore<K, V> {
     try {
       raw = await readFile(filePath, 'utf-8');
     } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        this.unavailableUsers.delete(userId);
+        this.items.delete(userId);
+        return;
+      }
+      this.unavailableUsers.add(userId);
       useLogger().error(`[user-scoped-store] failed to load ${filePath}: ${err instanceof Error ? err.message : err}`);
       throw err;
     }
@@ -70,35 +76,55 @@ export class UserScopedJsonStore<K, V> {
     } catch (err: unknown) {
       // Corrupt JSON (e.g. a truncated write from a hard kill). Quarantine the
       // user (log + skip) instead of crashing every user's load.
+      this.unavailableUsers.add(userId);
       useLogger().error(`[user-scoped-store] corrupt ${filePath} — skipping this user: ${err instanceof Error ? err.message : err}`);
-      return;
+      throw err;
+    }
+    if (!Array.isArray(parsed)) {
+      this.unavailableUsers.add(userId);
+      const error = new Error(`${filePath} must contain an array`);
+      useLogger().error(`[user-scoped-store] corrupt ${filePath} — skipping this user: ${error.message}`);
+      throw error;
     }
     const map = new Map<K, V>();
-    for (const item of parsed) {
-      // Never trust an embedded owner that disagrees with the directory
-      // partition. Callers commonly use item.userId for later workspace paths
-      // and Docker mounts, so accepting a mismatch would bypass path checks.
-      if (
-        item &&
-        typeof item === 'object' &&
-        'userId' in item &&
-        (item as { userId?: unknown }).userId !== userId
-      ) {
-        useLogger().error(
-          `[user-scoped-store] quarantined ${this.filename} item with mismatched owner in ${userId}`,
-        );
-        continue;
+    try {
+      for (const item of parsed) {
+        // One invalid record makes the source snapshot unsafe to rewrite. If it
+        // were merely skipped, the next otherwise-valid mutation would commit
+        // the partial in-memory map and silently erase the quarantined bytes.
+        if (
+          item &&
+          typeof item === 'object' &&
+          'userId' in item &&
+          (item as { userId?: unknown }).userId !== userId
+        ) {
+          throw new Error('Persisted resource owner mismatch');
+        }
+        const key = this.keyFn(item);
+        if (map.has(key)) throw new Error('Duplicate persisted resource key');
+        map.set(key, structuredClone(item));
       }
-      map.set(this.keyFn(item), item);
+    } catch (err) {
+      // keyFn is supplied by subclasses and commonly dereferences required
+      // fields. Treat both an explicit validation failure and a thrown keyFn as
+      // corruption of this owner partition, rather than failing open.
+      this.unavailableUsers.add(userId);
+      useLogger().error(
+        `[user-scoped-store] corrupt ${filePath} — skipping this user: ${err instanceof Error ? err.message : err}`,
+      );
+      throw err;
     }
+    this.unavailableUsers.delete(userId);
     if (map.size > 0) this.items.set(userId, map);
+    else this.items.delete(userId);
   }
 
   /** Flat list of every item across every user. */
   list(): V[] {
     const out: V[] = [];
-    for (const map of this.items.values()) {
-      for (const v of map.values()) out.push(v);
+    for (const [userId, map] of this.items) {
+      if (this.unavailableUsers.has(userId)) continue;
+      for (const v of map.values()) out.push(structuredClone(v));
     }
     return out;
   }
@@ -106,26 +132,34 @@ export class UserScopedJsonStore<K, V> {
   /** User ids that currently have at least one item in this store. Cheaper
    * than iterating the whole dataset when the caller only needs the key set. */
   listUserIds(): string[] {
-    return Array.from(this.items.keys());
+    return [...new Set([...this.items.keys(), ...this.unavailableUsers])];
   }
 
   listForUser(userId: string): V[] {
-    return Array.from(this.items.get(userId)?.values() ?? []);
+    this.assertAvailable(userId);
+    return Array.from(this.items.get(userId)?.values() ?? [], (item) =>
+      structuredClone(item),
+    );
   }
 
   get(userId: string, key: K): V | undefined {
-    return this.items.get(userId)?.get(key);
+    this.assertAvailable(userId);
+    const item = this.items.get(userId)?.get(key);
+    return item === undefined ? undefined : structuredClone(item);
   }
 
   has(userId: string, key: K): boolean {
+    this.assertAvailable(userId);
     return this.items.get(userId)?.has(key) ?? false;
   }
 
   /** Find the first item across all users matching a predicate, along with its owner. */
   findWithOwner(predicate: (item: V) => boolean): { userId: string; item: V } | undefined {
     for (const [userId, map] of this.items) {
+      if (this.unavailableUsers.has(userId)) continue;
       for (const item of map.values()) {
-        if (predicate(item)) return { userId, item };
+        const snapshot = structuredClone(item);
+        if (predicate(snapshot)) return { userId, item: snapshot };
       }
     }
     return undefined;
@@ -143,41 +177,80 @@ export class UserScopedJsonStore<K, V> {
         statusCode: 400,
       });
     }
-    let map = this.items.get(userId);
-    if (!map) {
-      map = new Map<K, V>();
-      this.items.set(userId, map);
-    }
-    map.set(this.keyFn(item), item);
-    await this.persistUser(userId);
+    // The store owns its in-memory values. Without an ingress copy, a caller
+    // could mutate its original object after a successful write and change the
+    // apparent durable state without another transaction.
+    const ownedItem = structuredClone(item);
+    const key = this.keyFn(ownedItem);
+    await this.withUserMutation(userId, async () => {
+      let map = this.items.get(userId);
+      const createdMap = !map;
+      if (!map) {
+        map = new Map<K, V>();
+        this.items.set(userId, map);
+      }
+      const previous = map.get(key);
+      map.set(key, ownedItem);
+      try {
+        await this.persistUser(userId);
+      } catch (error) {
+        if (previous !== undefined) map.set(key, previous);
+        else map.delete(key);
+        if (createdMap && map.size === 0) this.items.delete(userId);
+        throw error;
+      }
+    });
   }
 
   protected async deleteItem(userId: string, key: K): Promise<boolean> {
     assertSafeUserId(userId);
-    const map = this.items.get(userId);
-    if (!map || !map.has(key)) return false;
-    map.delete(key);
-    if (map.size === 0) this.items.delete(userId);
-    await this.persistUser(userId);
-    return true;
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId);
+      if (!map || !map.has(key)) return false;
+      const previous = map.get(key)!;
+      map.delete(key);
+      if (map.size === 0) this.items.delete(userId);
+      try {
+        await this.persistUser(userId);
+      } catch (error) {
+        // Persistence is the commit point. Restore the in-memory handle so the
+        // exact deletion can be retried instead of falsely succeeding while a
+        // stale record remains on disk.
+        this.items.set(userId, map);
+        map.set(key, previous);
+        throw error;
+      }
+      return true;
+    });
   }
 
   protected async removeWhere(predicate: (item: V) => boolean): Promise<number> {
     let count = 0;
-    const dirty = new Set<string>();
-    for (const [userId, map] of this.items) {
-      const toRemove: K[] = [];
-      for (const [key, item] of map) {
-        if (predicate(item)) toRemove.push(key);
-      }
-      for (const key of toRemove) map.delete(key);
-      if (toRemove.length > 0) {
-        dirty.add(userId);
-        count += toRemove.length;
+    for (const userId of this.listUserIds()) {
+      if (this.unavailableUsers.has(userId)) continue;
+      count += await this.withUserMutation(userId, async () => {
+        const map = this.items.get(userId);
+        if (!map) return 0;
+        const entries = [...map].filter(([, item]) =>
+          predicate(structuredClone(item)),
+        );
+        if (!entries.length) return 0;
+        for (const [key] of entries) map.delete(key);
         if (map.size === 0) this.items.delete(userId);
-      }
+        try {
+          await this.persistUser(userId);
+        } catch (error) {
+          let rollback = this.items.get(userId);
+          if (!rollback) {
+            rollback = new Map<K, V>();
+            this.items.set(userId, rollback);
+          }
+          for (const [key, item] of entries) rollback.set(key, item);
+          throw error;
+        }
+        return entries.length;
+      });
     }
-    for (const userId of dirty) await this.persistUser(userId);
     return count;
   }
 
@@ -185,15 +258,21 @@ export class UserScopedJsonStore<K, V> {
    * sweeper (user deletion) and similar admin paths. */
   async removeForUser(userId: string): Promise<number> {
     assertSafeUserId(userId);
-    const map = this.items.get(userId);
-    const count = map?.size ?? 0;
-    this.items.delete(userId);
-    try {
-      await rm(this.filePathForUser(userId), { force: true });
-    } catch {
-      // best effort — the containing dir may already be gone
-    }
-    return count;
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId);
+      const count = map?.size ?? 0;
+      this.items.delete(userId);
+      try {
+        await rm(this.filePathForUser(userId), { force: true });
+      } catch (error) {
+        // A failed unlink is not a committed deletion. Retain the owner as an
+        // in-process sweeper candidate and make the failure visible to callers.
+        if (map) this.items.set(userId, map);
+        throw error;
+      }
+      this.unavailableUsers.delete(userId);
+      return count;
+    }, true);
   }
 
   private filePathForUser(userId: string): string {
@@ -201,13 +280,32 @@ export class UserScopedJsonStore<K, V> {
     return join(this.dataDir, 'users', userId, this.filename);
   }
 
-  /** Serialize writes per user so concurrent `setItem` calls do not clobber
-   * each other on disk. */
-  protected persistUser(userId: string): Promise<void> {
+  /** Serialize the complete in-memory mutation + persistence transaction. */
+  protected withUserMutation<T>(
+    userId: string,
+    operation: () => Promise<T>,
+    allowUnavailable = false,
+  ): Promise<T> {
     const prev = this.saveQueues.get(userId) ?? Promise.resolve();
-    const next = prev.then(() => this.writeUser(userId));
-    this.saveQueues.set(userId, next.catch(() => {}));
+    const next = prev.then(() => {
+      if (!allowUnavailable) this.assertAvailable(userId);
+      return operation();
+    });
+    this.saveQueues.set(userId, next.then(() => undefined, () => undefined));
     return next;
+  }
+
+  private assertAvailable(userId: string): void {
+    if (!this.unavailableUsers.has(userId)) return;
+    throw Object.assign(
+      new Error(`Stored ${this.filename} data is unavailable for this owner`),
+      { statusCode: 503 },
+    );
+  }
+
+  /** Persist the current per-user snapshot. Call only from withUserMutation. */
+  protected persistUser(userId: string): Promise<void> {
+    return this.writeUser(userId);
   }
 
   private async writeUser(userId: string): Promise<void> {

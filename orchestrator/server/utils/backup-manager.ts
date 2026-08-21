@@ -71,36 +71,67 @@ interface RestoreExecution {
   jobId?: string;
 }
 
+interface RestoreArtifactPin {
+  artifact: BackupArtifact;
+}
+
+interface BackupQueueEntry {
+  jobId: string;
+  ownerId: string;
+  task: () => Promise<void>;
+  cancel?: (error: Error) => void;
+}
+
 export class BackupManager {
   private readonly dataDir: string;
   private store: BackupStore;
   private initialized?: Promise<void>;
   private scheduleTimer?: NodeJS.Timeout;
   private active = 0;
-  private pending: Array<() => Promise<void>> = [];
+  private pending: BackupQueueEntry[] = [];
   private readonly maxConcurrent = 2;
   private accepting = true;
   private controllers = new Map<string, AbortController>();
+  private cancelledJobs = new Set<string>();
+  private activeTasks = new Map<string, Set<Promise<void>>>();
   private restoreExecutions = new Map<string, Set<RestoreExecution>>();
   private restorePins = new Map<string, number>();
+  private restoreJobPins = new Map<string, RestoreArtifactPin>();
+  private retryClaims = new Set<string>();
   private artifactDeletions = new Set<string>();
   private forgottenUsers = new Set<string>();
   private readonly restoreCleanupTimeoutMs: number;
+  private readonly providerCleanupTimeoutMs: number;
+  private readonly prepareRestoreDirectory: (path: string) => Promise<void>;
+  private tickInFlight?: Promise<void>;
   private fake: FakeBackupProvider;
   private fakeUsers = new Set<string>();
   private providers: Map<BackupProviderKind, BackupProvider>;
   /** Dependency injection keeps restart recovery testable against the same
    * persisted files and provider boundary used by the production manager. */
-  constructor(options: {
-    dataDir?: string;
-    providers?: Partial<Record<BackupProviderKind, BackupProvider>>;
-    restoreCleanupTimeoutMs?: number;
-  } = {}) {
+  constructor(
+    options: {
+      dataDir?: string;
+      providers?: Partial<Record<BackupProviderKind, BackupProvider>>;
+      restoreCleanupTimeoutMs?: number;
+      providerCleanupTimeoutMs?: number;
+      prepareRestoreDirectory?: (path: string) => Promise<void>;
+    } = {},
+  ) {
     this.dataDir = options.dataDir ?? useConfig().dataDir;
     this.restoreCleanupTimeoutMs = Math.max(
       1,
       options.restoreCleanupTimeoutMs ?? 30_000,
     );
+    this.providerCleanupTimeoutMs = Math.max(
+      1,
+      options.providerCleanupTimeoutMs ?? 10_000,
+    );
+    this.prepareRestoreDirectory =
+      options.prepareRestoreDirectory ??
+      (async (path) => {
+        await mkdir(path, { recursive: true, mode: 0o700 });
+      });
     this.store = new BackupStore(this.dataDir);
     this.fake = new FakeBackupProvider(join(this.dataDir, "backup-fake"));
     this.providers = new Map<BackupProviderKind, BackupProvider>([
@@ -112,11 +143,14 @@ export class BackupManager {
           (userId) => this.loadGoogleToken(userId),
           (userId, token) => this.saveGoogleToken(userId, token),
           async () => {
-            const credentials = await useGoogleBackupOAuthConfigStore().credentials();
-            return credentials && {
-              clientId: credentials.clientId,
-              clientSecret: credentials.clientSecret,
-            };
+            const credentials =
+              await useGoogleBackupOAuthConfigStore().credentials();
+            return (
+              credentials && {
+                clientId: credentials.clientId,
+                clientSecret: credentials.clientSecret,
+              }
+            );
           },
         ),
       ],
@@ -127,6 +161,13 @@ export class BackupManager {
   init() {
     return (this.initialized ??= this.initialize());
   }
+  private assertOwnerAvailable(userId: string): void {
+    if (!this.forgottenUsers.has(userId)) return;
+    throw Object.assign(new Error("Backup owner is no longer available"), {
+      statusCode: 409,
+      code: "BACKUP_OWNER_UNAVAILABLE",
+    });
+  }
   private async initialize() {
     await this.store.init();
     await mkdir(join(this.dataDir, "tmp"), { recursive: true });
@@ -136,21 +177,40 @@ export class BackupManager {
           // The process that owned an interrupted provider transfer is gone.
           // Remove deterministic per-job scratch before publishing failure so
           // a hard restart cannot strand large encrypted/decrypted archives.
-          await cleanupInterruptedBackupStaging(this.dataDir, job.id);
-          if (job.pendingProviderObjectId && (job.provider === "local" || job.provider === "fake"))
-            await this.providers.get(job.provider)?.delete(job.userId, job.pendingProviderObjectId).catch(() => {});
-          job.pendingProviderObjectId = undefined;
+          const resumable = job.target
+            ? undefined
+            : await readInterruptedBackupResume(this.dataDir, job.id);
+          if (resumable) {
+            await rm(join(this.dataDir, "tmp", `restore-${job.id}`), {
+              recursive: true,
+              force: true,
+            });
+            // resume.json owns these identifiers until the retry starts. A
+            // terminal cleanup sweep must not delete the resumable transfer.
+            job.pendingProviderObjectId = undefined;
+            job.pendingProviderArtifactId = undefined;
+          } else {
+            await cleanupInterruptedBackupStaging(this.dataDir, job.id);
+          }
           job.status = "failed";
           job.phase = "failed";
           job.error = job.target
             ? "Restore interrupted by orchestrator restart"
-            : "Backup interrupted by orchestrator restart";
+            : resumable
+              ? "Backup interrupted by orchestrator restart. Retry is available."
+              : "Backup interrupted by orchestrator restart";
           job.completedAt = job.updatedAt = new Date().toISOString();
-          await this.store.save(job.userId, user);
+          await this.store.update(job.userId, (data) => {
+            const index = data.jobs.findIndex(
+              (candidate) => candidate.id === job.id,
+            );
+            if (index >= 0) data.jobs[index] = structuredClone(job);
+          });
         }
-    this.scheduleTimer = setInterval(() => void this.tickSchedules(), 60_000);
+    await this.retryPendingProviderDeletes();
+    this.scheduleTimer = setInterval(() => this.triggerScheduleTick(), 60_000);
     this.scheduleTimer.unref?.();
-    setImmediate(() => void this.tickSchedules());
+    setImmediate(() => this.triggerScheduleTick());
   }
   async getConfig(userId: string) {
     await this.init();
@@ -162,29 +222,52 @@ export class BackupManager {
   async forgetUser(userId: string) {
     await this.init();
     this.forgottenUsers.add(userId);
-    const data = this.store.get(userId);
-    for (const job of data.jobs) {
-      if (job.status === "queued" || job.status === "running") {
-        job.status = "cancelled";
-        job.phase = "cancelled";
-        job.completedAt = job.updatedAt = new Date().toISOString();
-      }
-      this.controllers.get(job.id)?.abort();
+    const activeJobIds = this.store
+      .get(userId)
+      .jobs.filter((job) => job.status === "queued" || job.status === "running")
+      .map((job) => job.id);
+    for (const jobId of activeJobIds) this.cancelledJobs.add(jobId);
+    let transitionError: unknown;
+    try {
+      await this.store.update(userId, (data) => {
+        const now = new Date().toISOString();
+        for (const job of data.jobs) {
+          if (!activeJobIds.includes(job.id)) continue;
+          job.status = "cancelled";
+          job.phase = "cancelled";
+          job.completedAt = job.updatedAt = now;
+        }
+      });
+    } catch (error) {
+      transitionError = error;
     }
+    for (const jobId of activeJobIds) this.controllers.get(jobId)?.abort();
+    this.cancelPending(
+      (candidate) => candidate.ownerId === userId,
+      Object.assign(new Error("Restore cancelled"), { name: "AbortError" }),
+    );
     const executions = [...(this.restoreExecutions.get(userId) ?? [])];
+    const activeTasks = [...(this.activeTasks.get(userId) ?? [])];
     for (const execution of executions) execution.controller.abort();
     // Account/orphan cleanup must not race an import or in-place commit. Every
     // built-in provider download observes the controller, and later restore
     // phases check it between each mutation before this barrier resolves.
     await this.drainRestoreExecutions(executions);
+    await this.drainActiveBackupTasks(activeTasks);
+    if (transitionError) throw transitionError;
+    for (const [pinOwner, pin] of this.restoreJobPins)
+      if (pin.artifact.userId === userId)
+        this.releaseRestoreArtifactPin(pinOwner);
+    const data = this.store.get(userId);
     const residualRestoreWorkers = [
       ...new Set(
         data.jobs
           .filter(
-            (job) =>
-              job.target === "new" && job.phase === "rollback-failed",
+            (job) => job.target === "new" && job.phase === "rollback-failed",
           )
-          .flatMap((job) => job.workerIds ?? (job.workerId ? [job.workerId] : []))
+          .flatMap(
+            (job) => job.workerIds ?? (job.workerId ? [job.workerId] : []),
+          )
           .filter(
             (workerId) =>
               useContainerManager().get(workerId)?.userId === userId,
@@ -196,14 +279,42 @@ export class BackupManager {
     );
     if (survivingRestoreWorkers.length)
       throw restoreRollbackFailure(survivingRestoreWorkers);
-    await Promise.allSettled(
-      data.artifacts.map((artifact) =>
+    const cleanupFailures: string[] = [];
+    for (const job of data.jobs) {
+      if (job.pendingProviderUploadId)
+        await this.abortPendingProviderUpload(job).catch((error) => {
+          cleanupFailures.push(
+            `upload ${job.id}: ${error instanceof Error ? error.message : error}`,
+          );
+        });
+      if (job.pendingProviderObjectId)
+        await this.deletePendingProviderObject(
+          job,
+          job.pendingProviderObjectId,
+        ).catch((error) => {
+          cleanupFailures.push(
+            `object ${job.id}: ${error instanceof Error ? error.message : error}`,
+          );
+        });
+    }
+    for (const artifact of data.artifacts)
+      await this.runProviderCleanup("owner backup artifact deletion", (signal) =>
         this.providers
           .get(artifact.provider)!
-          .delete(userId, artifact.providerObjectId),
-      ),
-    );
-    this.store.forget(userId);
+          .delete(userId, artifact.providerObjectId, signal),
+      ).catch((error) => {
+        cleanupFailures.push(
+          `artifact ${artifact.id}: ${error instanceof Error ? error.message : error}`,
+        );
+      });
+    if (cleanupFailures.length)
+      throw Object.assign(
+        new Error(
+          `Backup owner cleanup is incomplete: ${cleanupFailures.join("; ")}`,
+        ),
+        { code: "BACKUP_OWNER_CLEANUP_INCOMPLETE" },
+      );
+    await this.store.forget(userId);
   }
   async setConfig(
     userId: string,
@@ -219,54 +330,56 @@ export class BackupManager {
     >,
   ) {
     await this.init();
-    const data = this.store.get(userId);
+    this.assertOwnerAvailable(userId);
     const now = new Date().toISOString();
-    const old = data.config;
-    data.config = {
-      schemaVersion: 1,
-      userId,
-      provider: input.provider ?? old?.provider ?? "local",
-      enabled: input.enabled ?? old?.enabled ?? false,
-      intervalMinutes: clamp(
-        input.intervalMinutes ?? configIntervalMinutes(old),
-        1,
-        525_600,
-      ),
-      retentionCount: clamp(
-        input.retentionCount ?? old?.retentionCount ?? 7,
-        1,
-        100,
-      ),
-      selectedWorkspaceIds:
-        input.selectedWorkspaceIds === undefined
-          ? (old?.selectedWorkspaceIds ?? null)
-          : input.selectedWorkspaceIds,
-      createdAt: old?.createdAt ?? now,
-      updatedAt: now,
-      nextRunAt:
-        (input.enabled ?? old?.enabled ?? false)
-          ? input.intervalMinutes !== undefined ||
-            input.enabled === true ||
-            !old?.nextRunAt
-            ? new Date(
-                Date.now() +
-                  clamp(
-                    input.intervalMinutes ?? configIntervalMinutes(old),
-                    1,
-                    525_600,
-                  ) *
-                    60_000,
-              ).toISOString()
-            : old.nextRunAt
-          : null,
-      google: old?.google,
-      lastAttemptAt: old?.lastAttemptAt,
-      lastSuccessAt: old?.lastSuccessAt,
-      lastError: old?.lastError,
-      consecutiveFailures: old?.consecutiveFailures ?? 0,
-    };
-    await this.store.save(userId, data);
-    return sanitizeConfig(data.config);
+    const config = await this.store.update(userId, (data) => {
+      const old = data.config;
+      data.config = {
+        schemaVersion: 1,
+        userId,
+        provider: input.provider ?? old?.provider ?? "local",
+        enabled: input.enabled ?? old?.enabled ?? false,
+        intervalMinutes: clamp(
+          input.intervalMinutes ?? configIntervalMinutes(old),
+          1,
+          525_600,
+        ),
+        retentionCount: clamp(
+          input.retentionCount ?? old?.retentionCount ?? 7,
+          1,
+          100,
+        ),
+        selectedWorkspaceIds:
+          input.selectedWorkspaceIds === undefined
+            ? (old?.selectedWorkspaceIds ?? null)
+            : input.selectedWorkspaceIds,
+        createdAt: old?.createdAt ?? now,
+        updatedAt: now,
+        nextRunAt:
+          (input.enabled ?? old?.enabled ?? false)
+            ? input.intervalMinutes !== undefined ||
+              input.enabled === true ||
+              !old?.nextRunAt
+              ? new Date(
+                  Date.now() +
+                    clamp(
+                      input.intervalMinutes ?? configIntervalMinutes(old),
+                      1,
+                      525_600,
+                    ) *
+                      60_000,
+                ).toISOString()
+              : old.nextRunAt
+            : null,
+        google: old?.google,
+        lastAttemptAt: old?.lastAttemptAt,
+        lastSuccessAt: old?.lastSuccessAt,
+        lastError: old?.lastError,
+        consecutiveFailures: old?.consecutiveFailures ?? 0,
+      };
+      return structuredClone(data.config);
+    });
+    return sanitizeConfig(config);
   }
   async create(userId: string, workspaceId: string) {
     return this.createMany(userId, [workspaceId]);
@@ -279,6 +392,7 @@ export class BackupManager {
     resumed = 0,
   ): Promise<BackupJob> {
     await this.init();
+    this.assertOwnerAvailable(userId);
     const unique = [...new Set(workspaceIds)];
     if (!unique.length) throw new Error("At least one workspace is required");
     for (const id of unique) {
@@ -330,28 +444,41 @@ export class BackupManager {
       resumedFromChunk: resumed,
       consistency,
     };
-    const data = this.store.get(userId);
-    data.jobs.push(job);
-    await this.store.save(userId, data);
-    this.enqueue(() => this.runV2(job));
-    return job;
+    await this.store.update(userId, (data) => {
+      data.jobs.push(structuredClone(job));
+    });
+    this.enqueue(job.id, job.userId, () => this.runV2(job));
+    return sanitizeJob(job);
   }
   async getJob(id: string) {
     await this.init();
-    return this.store.findJob(id);
+    const job = this.store.findJob(id);
+    return job ? sanitizeJob(job) : undefined;
   }
   async getArtifact(id: string) {
     await this.init();
     return this.store.findArtifact(id);
   }
   connectFake(userId: string, chunkSize?: number) {
+    this.assertOwnerAvailable(userId);
     this.fakeUsers.add(userId);
     return this.fake.connect(userId, chunkSize);
   }
   setFakeFault(userId: string, chunk: number, count: number) {
+    this.assertOwnerAvailable(userId);
     this.fake.setFault(userId, chunk, count);
   }
   fakeDiagnostic(userId: string, id: string) {
+    // Public jobs intentionally omit opaque provider upload/cleanup handles.
+    // Let the test-only diagnostic surface resolve the stable, owner-scoped job
+    // id instead, while retaining direct upload-id lookup for older callers.
+    const job = this.store.findJob(id);
+    if (
+      job?.userId === userId &&
+      job.provider === "fake" &&
+      job.providerUploadId
+    )
+      return this.fake.diagnostic(userId, job.providerUploadId);
     return this.fake.diagnostic(userId, id);
   }
   providersStatus(userId: string) {
@@ -377,29 +504,48 @@ export class BackupManager {
   }
   async disconnectGoogle(userId: string) {
     await this.init();
-    const data = this.store.get(userId);
-    if (data.config) {
+    this.assertOwnerAvailable(userId);
+    await this.store.update(userId, (data) => {
+      if (!data.config) return;
       data.config.google = undefined;
       if (data.config.provider === "google-drive")
         data.config.provider = "local";
       data.config.updatedAt = new Date().toISOString();
-      await this.store.save(userId, data);
-    }
+    });
   }
   async retry(job: BackupJob) {
+    await this.init();
+    this.assertOwnerAvailable(job.userId);
+    const current = this.store.findJob(job.id);
+    if (!current || current.userId !== job.userId)
+      throw new Error("Backup job not found");
+    job = current;
     if (job.status !== "failed")
       throw new Error("Only failed jobs can be retried");
+    if (this.retryClaims.has(job.id))
+      throw new Error("A retry is already being queued for this job");
+    this.retryClaims.add(job.id);
     let restoreArtifact: BackupArtifact | undefined;
-    if (job.target) {
-      if (job.target === "original")
-        throw new Error("Original-worker restores cannot be retried; submit a new restore with the worker lock password");
-      restoreArtifact = job.artifactId ? await this.getArtifact(job.artifactId) : undefined;
-      if (!restoreArtifact || restoreArtifact.userId !== job.userId)
-        throw new Error("The restore artifact is no longer available");
-      this.selectRestoreWorkspaceIds(this.artifactWorkspaceIds(restoreArtifact), job.selectedWorkspaceIds ?? job.workspaceIds);
-      this.pinArtifact(restoreArtifact);
-    }
+    let restorePinOwner: string | undefined;
     try {
+      if (job.target) {
+        if (job.target === "original")
+          throw new Error(
+            "Original-worker restores cannot be retried; submit a new restore with the worker lock password",
+          );
+        restoreArtifact = job.artifactId
+          ? await this.getArtifact(job.artifactId)
+          : undefined;
+        if (!restoreArtifact || restoreArtifact.userId !== job.userId)
+          throw new Error("The restore artifact is no longer available");
+        this.selectRestoreWorkspaceIds(
+          this.artifactWorkspaceIds(restoreArtifact),
+          job.selectedWorkspaceIds ?? job.workspaceIds,
+        );
+        restorePinOwner = this.restorePinOwner(job.id, job.attempt + 1);
+        this.pinRestoreArtifact(restorePinOwner, restoreArtifact);
+      }
+      this.cancelledJobs.delete(job.id);
       job.attempt += 1;
       job.status = "queued";
       job.phase = "retrying";
@@ -412,41 +558,79 @@ export class BackupManager {
       job.updatedAt = new Date().toISOString();
       await this.saveJob(job);
       if (job.target) {
-        this.enqueue(() => this.runRestoreV2(job, restoreArtifact!, job.displayName));
-      } else this.enqueue(() => this.runV2(job));
-      return job;
+        this.enqueue(job.id, job.userId, () =>
+          this.runRestoreV2(
+            job,
+            restoreArtifact!,
+            job.displayName,
+            restorePinOwner!,
+          ),
+        );
+      } else this.enqueue(job.id, job.userId, () => this.runV2(job));
+      return sanitizeJob(job);
     } catch (error) {
-      if (restoreArtifact) this.unpinArtifact(restoreArtifact);
+      if (restorePinOwner) this.releaseRestoreArtifactPin(restorePinOwner);
       throw error;
+    } finally {
+      this.retryClaims.delete(job.id);
     }
   }
   async cancel(job: BackupJob) {
+    await this.init();
+    this.assertOwnerAvailable(job.userId);
+    const current = this.store.findJob(job.id);
+    if (!current || current.userId !== job.userId)
+      throw new Error("Backup job not found");
+    job = current;
     if (job.status === "queued" || job.status === "running") {
-      if (job.target === "original")
+      const queued = job.status === "queued";
+      if (job.target === "original" && !queued)
         throw Object.assign(
           new Error("An in-place restore cannot be cancelled safely"),
           { statusCode: 409 },
         );
       job.status = "cancelled";
+      this.cancelledJobs.add(job.id);
       job.phase = "cancelled";
       job.completedAt = job.updatedAt = new Date().toISOString();
-      await this.saveJob(job);
-      this.controllers.get(job.id)?.abort();
+      try {
+        await this.saveJob(job);
+      } finally {
+        // Persistence failure must not leave a cancelled in-memory job with
+        // executable queued work or a source-artifact pin. The API still
+        // reports the write failure, while runtime cancellation completes and
+        // restart recovery fails any stale queued/running durable record.
+        if (queued)
+          this.cancelPending(
+            (candidate) => candidate.jobId === job.id,
+            Object.assign(new Error("Backup job cancelled"), {
+              name: "AbortError",
+            }),
+          );
+        if (queued && job.target)
+          this.releaseRestoreArtifactPin(
+            this.restorePinOwner(job.id, job.attempt),
+          );
+        this.controllers.get(job.id)?.abort();
+      }
     }
-    return job;
+    return sanitizeJob(job);
   }
   stop() {
     this.accepting = false;
     if (this.scheduleTimer) clearInterval(this.scheduleTimer);
     this.scheduleTimer = undefined;
-    this.pending = [];
+    this.cancelPending(
+      () => true,
+      new Error("Backup manager is shutting down"),
+    );
   }
   async list(userId: string) {
     await this.init();
     const d = this.store.get(userId);
     return {
       config: d.config ? sanitizeConfig(d.config) : undefined,
-      jobs: d.jobs,
+      jobs: d.jobs.map(sanitizeJob),
       artifacts: d.artifacts,
     };
   }
@@ -458,8 +642,7 @@ export class BackupManager {
     selectedWorkspaceIds?: string[],
   ) {
     await this.init();
-    if (this.forgottenUsers.has(userId))
-      throw new Error("Backup owner is no longer available");
+    this.assertOwnerAvailable(userId);
     const currentArtifact = this.store.findArtifact(artifact.id);
     if (
       !currentArtifact ||
@@ -472,17 +655,38 @@ export class BackupManager {
       throw new Error(
         "In-place restore is not safe while identity-preserving volume replacement is unavailable; restore into a new worker",
       );
+    const restoreTaskId = `legacy-restore:${randomUUID()}`;
+    this.pinRestoreArtifact(restoreTaskId, artifact);
+    try {
+      return await this.enqueueAndWait(restoreTaskId, userId, () =>
+        this.runLegacyRestore(
+          userId,
+          artifact,
+          displayName,
+          selectedWorkspaceIds,
+        ),
+      );
+    } finally {
+      this.releaseRestoreArtifactPin(restoreTaskId);
+    }
+  }
+  private async runLegacyRestore(
+    userId: string,
+    artifact: BackupArtifact,
+    displayName?: string,
+    selectedWorkspaceIds?: string[],
+  ) {
     const dir = join(this.dataDir, "tmp", `restore-${randomUUID()}`);
     const encrypted = join(dir, "archive.enc");
     const plain = join(dir, "worker.tar");
     const createdWorkers: string[] = [];
-    this.pinArtifact(artifact);
     const execution = this.beginRestoreExecution(userId);
     const assertActive = () =>
       this.assertRestoreActive(userId, execution.controller.signal);
     try {
       assertActive();
       await mkdir(dir, { recursive: true, mode: 0o700 });
+      assertActive();
       await this.providers
         .get(artifact.provider)!
         .download(
@@ -495,13 +699,25 @@ export class BackupManager {
       await decryptBackup(useConfig(), encrypted, plain, artifact.sha256);
       assertActive();
       const artifactWorkspaceIds = this.artifactWorkspaceIds(artifact);
-      const selected = this.selectRestoreWorkspaceIds(artifactWorkspaceIds, selectedWorkspaceIds);
-      const bundles = await unpackWorkspaceBackups(plain, artifactWorkspaceIds, selected, join(dir, "workspaces"));
+      const selected = this.selectRestoreWorkspaceIds(
+        artifactWorkspaceIds,
+        selectedWorkspaceIds,
+      );
+      const bundles = await unpackWorkspaceBackups(
+        plain,
+        artifactWorkspaceIds,
+        selected,
+        join(dir, "workspaces"),
+      );
       assertActive();
       const workers = [];
       for (const [index, bundle] of bundles.entries()) {
         assertActive();
-        const worker = await useContainerManager().importWorker(userId, bundle.path, { displayName: index === 0 ? displayName : undefined });
+        const worker = await useContainerManager().importWorker(
+          userId,
+          bundle.path,
+          { displayName: index === 0 ? displayName : undefined },
+        );
         workers.push(worker);
         createdWorkers.push(worker.id);
         assertActive();
@@ -516,7 +732,6 @@ export class BackupManager {
       try {
         await rm(dir, { recursive: true, force: true });
       } finally {
-        this.unpinArtifact(artifact);
         execution.finish();
       }
     }
@@ -530,8 +745,7 @@ export class BackupManager {
     selectedWorkspaceIds?: string[],
   ): Promise<BackupJob> {
     await this.init();
-    if (this.forgottenUsers.has(userId))
-      throw new Error("Backup owner is no longer available");
+    this.assertOwnerAvailable(userId);
     const currentArtifact = this.store.findArtifact(artifact.id);
     if (
       !currentArtifact ||
@@ -541,51 +755,62 @@ export class BackupManager {
       throw new Error("Backup artifact not found");
     artifact = currentArtifact;
     const artifactWorkspaceIds = this.artifactWorkspaceIds(artifact);
-    const selected = this.selectRestoreWorkspaceIds(artifactWorkspaceIds, selectedWorkspaceIds);
+    const selected = this.selectRestoreWorkspaceIds(
+      artifactWorkspaceIds,
+      selectedWorkspaceIds,
+    );
     const source = selected[0]!;
     if (target === "original" && selected.length !== 1)
-      throw new Error("Original restore requires selecting exactly one backup workspace");
-    this.pinArtifact(artifact);
+      throw new Error(
+        "Original restore requires selecting exactly one backup workspace",
+      );
+    const jobId = randomUUID();
+    const restorePinOwner = this.restorePinOwner(jobId, 1);
+    this.pinRestoreArtifact(restorePinOwner, artifact);
     const admission = this.beginRestoreExecution(userId);
     try {
       this.assertRestoreActive(userId, admission.controller.signal);
       if (target === "original") {
         const worker = useContainerManager().get(source);
         if (!worker || worker.userId !== userId || worker.status !== "stopped")
-          throw new Error("Selected original worker must be stopped for safe restore");
+          throw new Error(
+            "Selected original worker must be stopped for safe restore",
+          );
         await useWorkerProtectionLockStore().verify(source, lockPassword);
         this.assertRestoreActive(userId, admission.controller.signal);
       }
       const now = new Date().toISOString();
       const job: BackupJob = {
-      schemaVersion: 1,
-      id: randomUUID(),
-      userId,
-      ownerId: userId,
-      workspaceId: artifact.workspaceId,
-      workspaceIds: selected,
-      artifactWorkspaceIds,
-      selectedWorkspaceIds: selected,
-      artifactId: artifact.id,
-      provider: artifact.provider,
-      status: "queued",
-      phase: "queued",
-      progress: 0,
-      bytesProcessed: 0,
-      createdAt: now,
-      updatedAt: now,
-      attempt: 1,
-      target,
-      displayName,
+        schemaVersion: 1,
+        id: jobId,
+        userId,
+        ownerId: userId,
+        workspaceId: artifact.workspaceId,
+        workspaceIds: selected,
+        artifactWorkspaceIds,
+        selectedWorkspaceIds: selected,
+        artifactId: artifact.id,
+        provider: artifact.provider,
+        status: "queued",
+        phase: "queued",
+        progress: 0,
+        bytesProcessed: 0,
+        createdAt: now,
+        updatedAt: now,
+        attempt: 1,
+        target,
+        displayName,
       };
-      const data = this.store.get(userId);
-      data.jobs.push(job);
-      await this.store.save(userId, data);
+      await this.store.update(userId, (data) => {
+        data.jobs.push(structuredClone(job));
+      });
       this.assertRestoreActive(userId, admission.controller.signal, job);
-      this.enqueue(() => this.runRestoreV2(job, artifact, displayName));
-      return job;
+      this.enqueue(job.id, job.userId, () =>
+        this.runRestoreV2(job, artifact, displayName, restorePinOwner),
+      );
+      return sanitizeJob(job);
     } catch (error) {
-      this.unpinArtifact(artifact);
+      this.releaseRestoreArtifactPin(restorePinOwner);
       throw error;
     } finally {
       admission.finish();
@@ -741,11 +966,7 @@ export class BackupManager {
       },
     };
     let helper = await docker.createContainer(helperOptions);
-    const temp = join(
-      this.dataDir,
-      "tmp",
-      `offline-backup-${randomUUID()}`,
-    );
+    const temp = join(this.dataDir, "tmp", `offline-backup-${randomUUID()}`);
     try {
       await mkdir(temp, { recursive: true, mode: 0o700 });
       try {
@@ -850,31 +1071,26 @@ export class BackupManager {
     }
   }
   private async runV2(job: BackupJob) {
-    if (job.status === "cancelled") return;
     const started = Date.now(),
       dir = join(this.dataDir, "tmp", `backup-${job.id}`);
     const controller = new AbortController();
     this.controllers.set(job.id, controller);
+    const cancelled = () =>
+      job.status === "cancelled" ||
+      this.cancelledJobs.has(job.id) ||
+      controller.signal.aborted;
     let pendingArtifactId: string | undefined;
     let interruptedUploadId: string | undefined;
     let keepForResume = false;
     let resumableState:
       { artifactId: string; sha256: string; size: number } | undefined;
     try {
+      if (cancelled()) return;
       await mkdir(dir, { recursive: true, mode: 0o700 });
+      if (cancelled()) return;
       const encrypted = join(dir, "archive.enc");
       const resumePath = join(dir, "resume.json");
-      const resume = await readFile(resumePath, "utf8")
-        .then(
-          (text) =>
-            JSON.parse(text) as {
-              artifactId: string;
-              uploadId: string;
-              sha256: string;
-              size: number;
-            },
-        )
-        .catch(() => undefined);
+      const resume = await readInterruptedBackupResume(this.dataDir, job.id);
       let crypt: { sha256: string; size: number };
       let artifactId: string;
       let resumeUploadId: string | undefined;
@@ -882,6 +1098,7 @@ export class BackupManager {
       job.startedAt ||= new Date().toISOString();
       job.updatedAt = new Date().toISOString();
       await this.recordAttempt(job.userId);
+      if (cancelled()) return;
       if (resume) {
         crypt = { sha256: resume.sha256, size: resume.size };
         artifactId = resume.artifactId;
@@ -894,7 +1111,7 @@ export class BackupManager {
         await this.saveJob(job);
         const exports: Array<{ id: string; path: string }> = [];
         for (const id of job.workspaceIds ?? [job.workspaceId]) {
-          if ((job.status as BackupJob["status"]) === "cancelled") return;
+          if (cancelled()) return;
           const path = join(dir, `${id}.worker.tar`);
           await this.exportWorkspaceBundle(
             job.userId,
@@ -906,7 +1123,7 @@ export class BackupManager {
         }
         const plain = join(dir, "bundle.tar");
         await packWorkspaceBackups(exports, plain);
-        if ((job.status as BackupJob["status"]) === "cancelled") return;
+        if (cancelled()) return;
         job.phase = "encrypting";
         job.progress = 35;
         await this.saveJob(job);
@@ -920,12 +1137,16 @@ export class BackupManager {
         );
         artifactId = randomUUID();
       }
-      if ((job.status as BackupJob["status"]) === "cancelled") return;
+      if (cancelled()) return;
       job.phase = "uploading";
       job.progress = 60;
       await this.saveJob(job);
+      // The stable Agentor artifact id is persisted before upload. Providers
+      // with opaque object ids can reconcile it through object metadata if the
+      // process dies after remote commit but before the actual id is saved.
       pendingArtifactId = artifactId;
       job.pendingProviderObjectId = artifactId;
+      job.pendingProviderArtifactId = artifactId;
       await this.saveJob(job);
       resumableState = { artifactId, sha256: crypt.sha256, size: crypt.size };
       const uploaded = await this.providers.get(job.provider)!.upload(
@@ -938,11 +1159,15 @@ export class BackupManager {
         controller.signal,
         resumeUploadId,
       );
-      if ((job.status as BackupJob["status"]) === "cancelled") {
-        await this.providers
-          .get(job.provider)!
-          .delete(job.userId, uploaded.objectId)
-          .catch(() => {});
+      // Persist the provider's authoritative object id before verification so
+      // cancellation or verification failure never deletes an Agentor UUID in
+      // place of an opaque provider object.
+      pendingArtifactId = recordUploadedProviderObject(job, uploaded.objectId);
+      await this.saveJob(job);
+      if (cancelled()) {
+        await this.deletePendingProviderObject(job, uploaded.objectId).catch(
+          () => {},
+        );
         return;
       }
       job.providerUploadId = uploaded.uploadId;
@@ -957,18 +1182,12 @@ export class BackupManager {
         verifyPlain = join(dir, "verify.tar");
       await this.providers
         .get(job.provider)!
-        .download(
-          job.userId,
-          uploaded.objectId,
-          verifyEnc,
-          controller.signal,
-        );
+        .download(job.userId, uploaded.objectId, verifyEnc, controller.signal);
       await decryptBackup(useConfig(), verifyEnc, verifyPlain, crypt.sha256);
-      if ((job.status as BackupJob["status"]) === "cancelled") {
-        await this.providers
-          .get(job.provider)!
-          .delete(job.userId, uploaded.objectId)
-          .catch(() => {});
+      if (cancelled()) {
+        await this.deletePendingProviderObject(job, uploaded.objectId).catch(
+          () => {},
+        );
         return;
       }
       const missing = new Set<string>();
@@ -990,10 +1209,6 @@ export class BackupManager {
         sourceWorkerId: job.workspaceId,
         missingSecrets: [...missing],
       };
-      const data = this.store.get(job.userId);
-      data.artifacts.push(artifact);
-      pendingArtifactId = undefined;
-      job.pendingProviderObjectId = undefined;
       job.status = "succeeded";
       job.phase = "complete";
       job.progress = 100;
@@ -1004,17 +1219,13 @@ export class BackupManager {
       job.integrityVerified = true;
       job.completedAt = job.updatedAt = new Date().toISOString();
       job.durationMs = Date.now() - started;
-      await this.applyRetention(data, job.userId);
-      if (data.config) {
-        data.config.lastSuccessAt = job.completedAt;
-        data.config.lastError = undefined;
-        data.config.consecutiveFailures = 0;
-      }
-      await this.store.save(job.userId, data);
+      if (!(await this.commitCompletedBackup(job, artifact))) return;
+      pendingArtifactId = undefined;
+      await this.applyRetention(job.userId);
     } catch (error: any) {
       if (typeof error?.uploadId === "string")
         interruptedUploadId = error.uploadId;
-      if ((job.status as BackupJob["status"]) !== "cancelled") {
+      if (!cancelled()) {
         if (resumableState && typeof error?.uploadId === "string") {
           await writeFile(
             join(dir, "resume.json"),
@@ -1023,56 +1234,77 @@ export class BackupManager {
           );
           keepForResume = true;
           pendingArtifactId = undefined;
+          // This transfer is intentionally retained for same-ciphertext
+          // resume, not pending deletion. The resume file now owns the remote
+          // artifact/upload identifiers until retry or stale-staging cleanup.
+          job.pendingProviderObjectId = undefined;
+          job.pendingProviderArtifactId = undefined;
         }
         job.status = "failed";
         job.phase = "failed";
         job.error = "Backup failed. Retry is available.";
         job.completedAt = job.updatedAt = new Date().toISOString();
         job.durationMs = Date.now() - started;
-        await this.saveJob(job);
-        await this.recordFailure(job.userId, job.error);
+        await this.commitFailedJob(job);
         useLogger().error(`[backup] job ${job.id} failed`);
       }
     } finally {
+      const cleanupFailures: string[] = [];
+      const attemptCleanup = async (
+        label: string,
+        operation: () => Promise<void>,
+      ) => {
+        try {
+          await operation();
+        } catch (error) {
+          cleanupFailures.push(
+            `${label}: ${error instanceof Error ? error.message : error}`,
+          );
+        }
+      };
       if (
-        (job.status as BackupJob["status"]) === "cancelled" &&
+        cancelled() &&
         interruptedUploadId
-      )
-        await this.providers
-          .get(job.provider)!
-          .abortUpload?.(
-            job.userId,
-            interruptedUploadId,
-            pendingArtifactId || "",
-          )
-          .catch(() => {});
+      ) {
+        job.pendingProviderUploadId = interruptedUploadId;
+        await attemptCleanup("persist upload-abort marker", () =>
+          this.saveJob(job),
+        );
+        await attemptCleanup("abort provider upload", () =>
+          this.abortPendingProviderUpload(job),
+        );
+      }
       if (pendingArtifactId)
-        await this.providers
-          .get(job.provider)!
-          .delete(job.userId, pendingArtifactId)
-          .catch(() => {});
+        await attemptCleanup("delete pending provider object", () =>
+          this.deletePendingProviderObject(job, pendingArtifactId!),
+        );
       this.controllers.delete(job.id);
-      if (!keepForResume) await rm(dir, { recursive: true, force: true });
+      if (!keepForResume)
+        await attemptCleanup("remove backup staging", () =>
+          rm(dir, { recursive: true, force: true }),
+        );
+      if (cleanupFailures.length)
+        useLogger().warn(
+          `[backup] job ${job.id} cleanup incomplete: ${cleanupFailures.join("; ")}`,
+        );
     }
   }
   private async runRestoreV2(
     job: BackupJob,
     artifact: BackupArtifact,
     displayName?: string,
+    restorePinOwner = this.restorePinOwner(job.id, job.attempt),
   ) {
     const dir = join(this.dataDir, "tmp", `restore-${job.id}`);
     const createdWorkers: string[] = [];
     const execution = this.beginRestoreExecution(job.userId, job.id);
     const assertActive = () => {
-      this.assertRestoreActive(
-        job.userId,
-        execution.controller.signal,
-        job,
-      );
+      this.assertRestoreActive(job.userId, execution.controller.signal, job);
     };
     try {
       assertActive();
-      await mkdir(dir, { recursive: true, mode: 0o700 });
+      await this.prepareRestoreDirectory(dir);
+      assertActive();
       job.status = "running";
       job.phase = "downloading";
       job.progress = 20;
@@ -1094,9 +1326,16 @@ export class BackupManager {
       await decryptBackup(useConfig(), enc, plain, artifact.sha256);
       assertActive();
       job.integrityVerified = true;
-      const artifactWorkspaceIds = job.artifactWorkspaceIds ?? this.artifactWorkspaceIds(artifact);
-      const selectedWorkspaceIds = job.selectedWorkspaceIds ?? job.workspaceIds ?? artifactWorkspaceIds;
-      const bundles = await unpackWorkspaceBackups(plain, artifactWorkspaceIds, selectedWorkspaceIds, join(dir, "workspaces"));
+      const artifactWorkspaceIds =
+        job.artifactWorkspaceIds ?? this.artifactWorkspaceIds(artifact);
+      const selectedWorkspaceIds =
+        job.selectedWorkspaceIds ?? job.workspaceIds ?? artifactWorkspaceIds;
+      const bundles = await unpackWorkspaceBackups(
+        plain,
+        artifactWorkspaceIds,
+        selectedWorkspaceIds,
+        join(dir, "workspaces"),
+      );
       assertActive();
       if (job.target === "new") {
         for (const [index, bundle] of bundles.entries()) {
@@ -1149,12 +1388,18 @@ export class BackupManager {
         job.workerIds = survivingWorkers;
         job.error =
           "Restore failed and some newly created workers require manual cleanup.";
-      } else if (job.status !== "cancelled") {
+      } else if (
+        job.status !== "cancelled" &&
+        !this.cancelledJobs.has(job.id)
+      ) {
         job.status = "failed";
         job.phase = "failed";
         job.workerId = undefined;
         job.workerIds = undefined;
         job.error = "Restore failed. No secret values were restored.";
+      } else {
+        job.status = "cancelled";
+        job.phase = "cancelled";
       }
       job.completedAt = job.updatedAt = new Date().toISOString();
       await this.saveJob(job);
@@ -1164,13 +1409,14 @@ export class BackupManager {
       try {
         await rm(dir, { recursive: true, force: true });
       } finally {
-        this.unpinArtifact(artifact);
+        this.releaseRestoreArtifactPin(restorePinOwner);
         execution.finish();
       }
     }
   }
   async deleteArtifact(artifact: BackupArtifact) {
     await this.init();
+    this.assertOwnerAvailable(artifact.userId);
     const currentArtifact = this.store.findArtifact(artifact.id);
     if (
       !currentArtifact ||
@@ -1187,12 +1433,32 @@ export class BackupManager {
         { statusCode: 409 },
       );
     try {
-      await this.providers
-        .get(artifact.provider)!
-        .delete(artifact.userId, artifact.providerObjectId);
-      const data = this.store.get(artifact.userId);
-      data.artifacts = data.artifacts.filter((x) => x.id !== artifact.id);
-      await this.store.save(artifact.userId, data);
+      await this.store.update(artifact.userId, (data) => {
+        const current = data.artifacts.find(
+          (candidate) => candidate.id === artifact.id,
+        );
+        if (!current) throw new Error("Backup artifact not found");
+        current.deletionPending = true;
+        current.deletionErrorAt = undefined;
+      });
+      await this.runProviderCleanup("backup artifact deletion", (signal) =>
+        this.providers
+          .get(artifact.provider)!
+          .delete(artifact.userId, artifact.providerObjectId, signal),
+      );
+      await this.store.update(artifact.userId, (data) => {
+        data.artifacts = data.artifacts.filter((x) => x.id !== artifact.id);
+      });
+    } catch (error) {
+      await this.store
+        .update(artifact.userId, (data) => {
+          const current = data.artifacts.find((x) => x.id === artifact.id);
+          if (!current) return;
+          current.deletionPending = true;
+          current.deletionErrorAt = new Date().toISOString();
+        })
+        .catch(() => {});
+      throw error;
     } finally {
       this.endArtifactDeletion(artifact);
     }
@@ -1202,33 +1468,37 @@ export class BackupManager {
     clientId: string,
     redirectUri: string,
   ) {
+    await this.init();
+    this.assertOwnerAvailable(userId);
     const state = randomBytes(32).toString("base64url");
-    const data = this.store.get(userId);
     const now = new Date().toISOString();
-    data.config ??= {
-      schemaVersion: 1,
-      userId,
-      provider: "google-drive",
-      enabled: false,
-      intervalMinutes: 1440,
-      retentionCount: 7,
-      selectedWorkspaceIds: null,
-      createdAt: now,
-      updatedAt: now,
-    };
-    data.config.google = {
-      ...data.config.google,
-      clientId,
-      redirectUri,
-      oauthPending: {
-        stateHash: createHash("sha256").update(state).digest("hex"),
-        expiresAt: Date.now() + 10 * 60_000,
-      },
-    };
-    await this.store.save(userId, data);
+    await this.store.update(userId, (data) => {
+      data.config ??= {
+        schemaVersion: 1,
+        userId,
+        provider: "google-drive",
+        enabled: false,
+        intervalMinutes: 1440,
+        retentionCount: 7,
+        selectedWorkspaceIds: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      data.config.google = {
+        ...data.config.google,
+        clientId,
+        redirectUri,
+        oauthPending: {
+          stateHash: createHash("sha256").update(state).digest("hex"),
+          expiresAt: Date.now() + 10 * 60_000,
+        },
+      };
+    });
     return { state };
   }
   async completeGoogleOAuth(userId: string, state: string, code: string) {
+    await this.init();
+    this.assertOwnerAvailable(userId);
     const data = this.store.get(userId);
     const pending = data.config?.google?.oauthPending;
     const actual = Buffer.from(
@@ -1276,16 +1546,23 @@ export class BackupManager {
         previousToken,
       });
     }
-    data.config!.google!.token = await encryptWorkerValue(
+    const encryptedToken = await encryptWorkerValue(
       useConfig(),
       JSON.stringify(token),
       `backup-google\0${userId}`,
     );
-    data.config!.provider = "google-drive";
-    data.config!.google!.oauthPending = undefined;
-    data.config!.updatedAt = new Date().toISOString();
-    await this.store.save(userId, data);
-    return sanitizeConfig(data.config!);
+    this.assertOwnerAvailable(userId);
+    const config = await this.store.update(userId, (currentData) => {
+      const currentPending = currentData.config?.google?.oauthPending;
+      if (!currentPending || currentPending.stateHash !== pending.stateHash)
+        throw new Error("OAuth state was replaced before completion");
+      currentData.config!.google!.token = encryptedToken;
+      currentData.config!.provider = "google-drive";
+      currentData.config!.google!.oauthPending = undefined;
+      currentData.config!.updatedAt = new Date().toISOString();
+      return structuredClone(currentData.config!);
+    });
+    return sanitizeConfig(config);
   }
   private async loadGoogleToken(userId: string): Promise<GoogleDriveToken> {
     const encrypted = this.store.get(userId).config?.google?.token as
@@ -1301,16 +1578,19 @@ export class BackupManager {
     ) as GoogleDriveToken;
   }
   private async saveGoogleToken(userId: string, token: GoogleDriveToken) {
-    const data = this.store.get(userId);
-    if (!data.config?.google)
-      throw new Error("Google Drive backup account is not linked");
-    data.config.google.token = await encryptWorkerValue(
+    this.assertOwnerAvailable(userId);
+    const encryptedToken = await encryptWorkerValue(
       useConfig(),
       JSON.stringify(token),
       `backup-google\0${userId}`,
     );
-    data.config.updatedAt = new Date().toISOString();
-    await this.store.save(userId, data);
+    this.assertOwnerAvailable(userId);
+    await this.store.update(userId, (data) => {
+      if (!data.config?.google)
+        throw new Error("Google Drive backup account is not linked");
+      data.config.google.token = encryptedToken;
+      data.config.updatedAt = new Date().toISOString();
+    });
   }
   private async run(job: BackupJob) {
     const started = Date.now();
@@ -1386,8 +1666,6 @@ export class BackupManager {
         sourceWorkerId: job.workspaceId,
         missingSecrets: missing,
       };
-      const data = this.store.get(job.userId);
-      data.artifacts.push(artifact);
       job.status = "succeeded";
       job.phase = "complete";
       job.progress = 100;
@@ -1400,8 +1678,15 @@ export class BackupManager {
       job.integrityVerified = true;
       job.completedAt = job.updatedAt = new Date().toISOString();
       job.durationMs = Date.now() - started;
-      await this.applyRetention(data, job.userId);
-      await this.store.save(job.userId, data);
+      await this.store.update(job.userId, (data) => {
+        if (!data.artifacts.some((candidate) => candidate.id === artifact.id))
+          data.artifacts.push(structuredClone(artifact));
+        const index = data.jobs.findIndex(
+          (candidate) => candidate.id === job.id,
+        );
+        if (index >= 0) data.jobs[index] = structuredClone(job);
+      });
+      await this.applyRetention(job.userId);
     } catch (err) {
       job.error = safeError(err);
       job.durationMs = Date.now() - started;
@@ -1416,10 +1701,41 @@ export class BackupManager {
   }
   private async saveJob(job: BackupJob) {
     if (this.forgottenUsers.has(job.userId)) return;
-    const data = this.store.get(job.userId);
-    const i = data.jobs.findIndex((x) => x.id === job.id);
-    if (i >= 0) data.jobs[i] = job;
-    await this.store.save(job.userId, data);
+    await this.store.update(job.userId, (data) => {
+      const i = data.jobs.findIndex((x) => x.id === job.id);
+      if (i < 0) return;
+      const current = data.jobs[i]!;
+      // Cancellation is an absorbing durable state. An admitted execution may
+      // still hold a stale queued/running snapshot when cancellation wins the
+      // store race; never let that snapshot resurrect the job. Updating the
+      // live object also makes the caller stop at its next cancellation check.
+      if (current.status === "cancelled" && job.status !== "cancelled") {
+        Object.assign(job, structuredClone(current));
+        return;
+      }
+      data.jobs[i] = structuredClone(job);
+    });
+  }
+
+  /** Persist terminal failure and its scheduler diagnostics together so a
+   * caller cannot observe a failed job before the matching failure state. */
+  private async commitFailedJob(job: BackupJob): Promise<void> {
+    if (this.forgottenUsers.has(job.userId)) return;
+    await this.store.update(job.userId, (data) => {
+      const index = data.jobs.findIndex((candidate) => candidate.id === job.id);
+      if (index < 0) return;
+      const current = data.jobs[index]!;
+      if (current.status === "cancelled") {
+        Object.assign(job, structuredClone(current));
+        return;
+      }
+      data.jobs[index] = structuredClone(job);
+      if (!data.config) return;
+      data.config.lastError = job.error;
+      data.config.consecutiveFailures =
+        (data.config.consecutiveFailures ?? 0) + 1;
+      data.config.updatedAt = job.updatedAt;
+    });
   }
   private beginRestoreExecution(
     userId: string,
@@ -1483,6 +1799,34 @@ export class BackupManager {
       if (timer) clearTimeout(timer);
     }
   }
+  private async drainActiveBackupTasks(
+    tasks: readonly Promise<void>[],
+  ): Promise<void> {
+    if (!tasks.length) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled(tasks).then(() => undefined),
+        new Promise<void>((_resolve, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(
+                Object.assign(
+                  new Error(
+                    "Active backup jobs did not stop before the cleanup deadline",
+                  ),
+                  { code: "BACKUP_CLEANUP_TIMEOUT" },
+                ),
+              ),
+            this.restoreCleanupTimeoutMs,
+          );
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
   private assertRestoreActive(
     userId: string,
     signal: AbortSignal,
@@ -1491,6 +1835,7 @@ export class BackupManager {
     if (
       signal.aborted ||
       this.forgottenUsers.has(userId) ||
+      (job ? this.cancelledJobs.has(job.id) : false) ||
       job?.status === "cancelled"
     )
       throw Object.assign(new Error("Restore cancelled"), {
@@ -1507,6 +1852,14 @@ export class BackupManager {
     return `${artifact.userId}:${artifact.id}`;
   }
   private pinArtifact(artifact: BackupArtifact): void {
+    // A durable deletion tombstone is authoritative across restarts even when
+    // the in-memory deletion lock no longer exists. Treat it exactly like a
+    // missing artifact so neither legacy restore, durable restore, nor retry
+    // can race or resurrect provider data pending deletion.
+    if (artifact.deletionPending)
+      throw Object.assign(new Error("Backup artifact not found"), {
+        statusCode: 404,
+      });
     const key = this.artifactPinKey(artifact);
     if (this.artifactDeletions.has(key))
       throw Object.assign(new Error("Backup artifact is being deleted"), {
@@ -1520,6 +1873,27 @@ export class BackupManager {
     if (remaining > 0) this.restorePins.set(key, remaining);
     else this.restorePins.delete(key);
   }
+  private restorePinOwner(jobId: string, attempt: number): string {
+    return `${jobId}:${attempt}`;
+  }
+  private pinRestoreArtifact(pinOwner: string, artifact: BackupArtifact): void {
+    const existing = this.restoreJobPins.get(pinOwner);
+    if (existing) {
+      if (
+        this.artifactPinKey(existing.artifact) !== this.artifactPinKey(artifact)
+      )
+        throw new Error("Restore job pin ownership conflict");
+      return;
+    }
+    this.pinArtifact(artifact);
+    this.restoreJobPins.set(pinOwner, { artifact });
+  }
+  private releaseRestoreArtifactPin(pinOwner: string): void {
+    const pin = this.restoreJobPins.get(pinOwner);
+    if (!pin) return;
+    this.restoreJobPins.delete(pinOwner);
+    this.unpinArtifact(pin.artifact);
+  }
   private beginArtifactDeletion(artifact: BackupArtifact): boolean {
     const key = this.artifactPinKey(artifact);
     if (this.restorePins.has(key) || this.artifactDeletions.has(key))
@@ -1530,16 +1904,24 @@ export class BackupManager {
   private endArtifactDeletion(artifact: BackupArtifact): void {
     this.artifactDeletions.delete(this.artifactPinKey(artifact));
   }
-  private selectRestoreWorkspaceIds(artifactWorkspaceIds: string[], selectedWorkspaceIds?: string[]): string[] {
+  private selectRestoreWorkspaceIds(
+    artifactWorkspaceIds: string[],
+    selectedWorkspaceIds?: string[],
+  ): string[] {
     if (selectedWorkspaceIds === undefined) return [...artifactWorkspaceIds];
-    if (!Array.isArray(selectedWorkspaceIds) || !selectedWorkspaceIds.length || new Set(selectedWorkspaceIds).size !== selectedWorkspaceIds.length || selectedWorkspaceIds.some(id => typeof id !== "string" || !artifactWorkspaceIds.includes(id)))
+    if (
+      !Array.isArray(selectedWorkspaceIds) ||
+      !selectedWorkspaceIds.length ||
+      new Set(selectedWorkspaceIds).size !== selectedWorkspaceIds.length ||
+      selectedWorkspaceIds.some(
+        (id) => typeof id !== "string" || !artifactWorkspaceIds.includes(id),
+      )
+    )
       throw new Error("Select a non-empty subset of backup workspaces");
     return [...selectedWorkspaceIds];
   }
-  private async applyRetention(
-    data: ReturnType<BackupStore["get"]>,
-    userId: string,
-  ) {
+  private async applyRetention(userId: string) {
+    const data = this.store.get(userId);
     const keep = data.config?.retentionCount ?? 7;
     const sorted = [...data.artifacts].sort((a, b) =>
       b.createdAt.localeCompare(a.createdAt),
@@ -1547,19 +1929,42 @@ export class BackupManager {
     for (const old of sorted.slice(keep)) {
       if (!this.beginArtifactDeletion(old)) continue;
       try {
-        await this.providers
-          .get(old.provider)!
-          .delete(userId, old.providerObjectId);
-        data.artifacts = data.artifacts.filter((x) => x.id !== old.id);
+        await this.store.update(userId, (currentData) => {
+          const current = currentData.artifacts.find(
+            (candidate) => candidate.id === old.id,
+          );
+          if (!current) return;
+          current.deletionPending = true;
+          current.deletionErrorAt = undefined;
+        });
+        await this.runProviderCleanup("backup retention deletion", (signal) =>
+          this.providers
+            .get(old.provider)!
+            .delete(userId, old.providerObjectId, signal),
+        );
+        await this.store.update(userId, (currentData) => {
+          currentData.artifacts = currentData.artifacts.filter(
+            (candidate) => candidate.id !== old.id,
+          );
+        });
       } catch {
-        old.deletionPending = true;
-        old.deletionErrorAt = new Date().toISOString();
+        await this.store
+          .update(userId, (currentData) => {
+            const current = currentData.artifacts.find(
+              (candidate) => candidate.id === old.id,
+            );
+            if (!current) return;
+            current.deletionPending = true;
+            current.deletionErrorAt = new Date().toISOString();
+          })
+          .catch(() => {});
       } finally {
         this.endArtifactDeletion(old);
       }
     }
   }
   private async tickSchedules() {
+    await this.retryPendingProviderDeletes();
     const now = Date.now();
     for (const data of this.store.all()) {
       const c = data.config;
@@ -1571,62 +1976,362 @@ export class BackupManager {
           .list()
           .filter((worker) => worker.userId === c.userId)
           .map((worker) => worker.id);
+      let scheduleError: string | undefined;
       try {
         await this.createMany(c.userId, selected);
       } catch (error) {
-        c.lastAttemptAt = new Date().toISOString();
-        c.lastError = safeError(error);
-        c.consecutiveFailures = (c.consecutiveFailures ?? 0) + 1;
+        scheduleError = safeError(error);
         useLogger().error(
           `[backup] scheduled backup could not be queued for user ${c.userId}`,
         );
       } finally {
-        c.nextRunAt = new Date(
-          now + configIntervalMinutes(c) * 60_000,
-        ).toISOString();
-        c.updatedAt = new Date().toISOString();
-        await this.store.save(c.userId, data);
+        await this.store.update(c.userId, (currentData) => {
+          const current = currentData.config;
+          if (!current) return;
+          if (scheduleError) {
+            current.lastAttemptAt = new Date().toISOString();
+            current.lastError = scheduleError;
+            current.consecutiveFailures =
+              (current.consecutiveFailures ?? 0) + 1;
+          }
+          current.nextRunAt = new Date(
+            now + configIntervalMinutes(current) * 60_000,
+          ).toISOString();
+          current.updatedAt = new Date().toISOString();
+        });
       }
     }
   }
+
+  private triggerScheduleTick(): void {
+    if (this.tickInFlight) return;
+    this.tickInFlight = this.tickSchedules()
+      .catch((error) => {
+        useLogger().error(
+          `[backup] schedule tick failed: ${error instanceof Error ? error.message : error}`,
+        );
+      })
+      .finally(() => {
+        this.tickInFlight = undefined;
+      });
+  }
+
+  private async commitCompletedBackup(
+    job: BackupJob,
+    artifact: BackupArtifact,
+  ): Promise<boolean> {
+    let committed = false;
+    await this.store.update(job.userId, (data) => {
+      const index = data.jobs.findIndex((candidate) => candidate.id === job.id);
+      if (index < 0) return;
+      const current = data.jobs[index]!;
+      if (current.status === "cancelled") {
+        Object.assign(job, structuredClone(current));
+        return;
+      }
+      if (!data.artifacts.some((candidate) => candidate.id === artifact.id))
+        data.artifacts.push(structuredClone(artifact));
+      const completedJob = structuredClone(job);
+      delete completedJob.pendingProviderObjectId;
+      delete completedJob.pendingProviderArtifactId;
+      data.jobs[index] = completedJob;
+      if (data.config) {
+        data.config.lastSuccessAt = job.completedAt;
+        data.config.lastError = undefined;
+        data.config.consecutiveFailures = 0;
+      }
+      committed = true;
+    });
+    if (!committed) return false;
+    // Retain cleanup handles on the live attempt until the artifact and
+    // completed job commit atomically. A rejected commit then still leaves
+    // catch/finally able to delete the already-uploaded provider object.
+    job.pendingProviderObjectId = undefined;
+    job.pendingProviderArtifactId = undefined;
+    return true;
+  }
+
+  /** Retry every durable provider-object cleanup marker, including failed and
+   * cancelled jobs. Clear a marker only after both provider deletion and the
+   * updated job record are committed. */
+  private async retryPendingProviderDeletes() {
+    for (const data of this.store.all()) {
+      for (const job of data.jobs) {
+        if (job.pendingProviderUploadId) {
+          await this.abortPendingProviderUpload(job).catch((error) => {
+            useLogger().warn(
+              `[backup] deferred provider upload abort for job ${job.id}: ${error instanceof Error ? error.message : error}`,
+            );
+          });
+        }
+        if (
+          !job.pendingProviderObjectId ||
+          (job.status !== "failed" && job.status !== "cancelled")
+        )
+          continue;
+        await this.deletePendingProviderObject(
+          job,
+          job.pendingProviderObjectId,
+        ).catch((error) => {
+          useLogger().warn(
+            `[backup] deferred provider cleanup for job ${job.id}: ${error instanceof Error ? error.message : error}`,
+          );
+        });
+      }
+      for (const artifact of [...data.artifacts]) {
+        if (!artifact.deletionPending) continue;
+        if (!this.beginArtifactDeletion(artifact)) continue;
+        try {
+          await this.runProviderCleanup("deferred artifact deletion", (signal) =>
+            this.providers
+              .get(artifact.provider)!
+              .delete(artifact.userId, artifact.providerObjectId, signal),
+          );
+          await this.store.update(artifact.userId, (currentData) => {
+            currentData.artifacts = currentData.artifacts.filter(
+              (candidate) => candidate.id !== artifact.id,
+            );
+          });
+        } catch (error) {
+          await this.store
+            .update(artifact.userId, (currentData) => {
+              const current = currentData.artifacts.find(
+                (candidate) => candidate.id === artifact.id,
+              );
+              if (!current) return;
+              current.deletionPending = true;
+              current.deletionErrorAt = new Date().toISOString();
+            })
+            .catch(() => {});
+          useLogger().warn(
+            `[backup] deferred artifact cleanup for ${artifact.id}: ${error instanceof Error ? error.message : error}`,
+          );
+        } finally {
+          this.endArtifactDeletion(artifact);
+        }
+      }
+    }
+  }
+
+  private async deletePendingProviderObject(
+    job: BackupJob,
+    objectId: string,
+  ): Promise<void> {
+    const provider = this.providers.get(job.provider)!;
+    const artifactId = job.pendingProviderArtifactId ?? objectId;
+    await this.runProviderCleanup(
+      "pending provider object deletion",
+      async (signal) => {
+        if (!provider.deleteByArtifactId || objectId !== artifactId)
+          await provider.delete(job.userId, objectId, signal);
+        await provider.deleteByArtifactId?.(job.userId, artifactId, signal);
+      },
+    );
+    if (job.pendingProviderObjectId !== objectId) return;
+    job.pendingProviderObjectId = undefined;
+    job.pendingProviderArtifactId = undefined;
+    job.updatedAt = new Date().toISOString();
+    try {
+      await this.saveJob(job);
+    } catch (error) {
+      job.pendingProviderObjectId = objectId;
+      job.pendingProviderArtifactId = artifactId;
+      throw error;
+    }
+  }
+
+  private async abortPendingProviderUpload(job: BackupJob): Promise<void> {
+    const uploadId = job.pendingProviderUploadId;
+    if (!uploadId) return;
+    const provider = this.providers.get(job.provider)!;
+    if (!provider.abortUpload)
+      throw new Error("Backup provider cannot confirm upload cancellation");
+    await this.runProviderCleanup("pending provider upload cancellation", (signal) =>
+      provider.abortUpload!(
+        job.userId,
+        uploadId,
+        job.pendingProviderObjectId || "",
+        signal,
+      ),
+    );
+    job.pendingProviderUploadId = undefined;
+    job.updatedAt = new Date().toISOString();
+    try {
+      await this.saveJob(job);
+    } catch (error) {
+      job.pendingProviderUploadId = uploadId;
+      throw error;
+    }
+  }
+  private async runProviderCleanup(
+    label: string,
+    operation: (signal: AbortSignal) => Promise<void>,
+  ): Promise<void> {
+    const controller = new AbortController();
+    let deadlineExceeded = false;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const running = operation(controller.signal).catch((error) => {
+        // Once the deadline owns the public result, keep the provider
+        // rejection observed without allowing it to replace the structured
+        // timeout or become an unhandled rejection.
+        if (deadlineExceeded) return new Promise<void>(() => {});
+        throw error;
+      });
+      await Promise.race([
+        running,
+        new Promise<void>((_resolve, reject) => {
+          timer = setTimeout(
+            () => {
+              deadlineExceeded = true;
+              const error = Object.assign(
+                new Error(`${label} exceeded the cleanup deadline`),
+                { code: "BACKUP_PROVIDER_CLEANUP_TIMEOUT" },
+              );
+              reject(error);
+              controller.abort(error);
+            },
+            this.providerCleanupTimeoutMs,
+          );
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
   private async recordAttempt(userId: string) {
-    const data = this.store.get(userId);
-    if (!data.config) return;
-    data.config.lastAttemptAt = new Date().toISOString();
-    data.config.updatedAt = data.config.lastAttemptAt;
-    await this.store.save(userId, data);
+    await this.store.update(userId, (data) => {
+      if (!data.config) return;
+      data.config.lastAttemptAt = new Date().toISOString();
+      data.config.updatedAt = data.config.lastAttemptAt;
+    });
   }
-  private async recordFailure(userId: string, error: string) {
-    const data = this.store.get(userId);
-    if (!data.config) return;
-    data.config.lastError = error;
-    data.config.consecutiveFailures =
-      (data.config.consecutiveFailures ?? 0) + 1;
-    data.config.updatedAt = new Date().toISOString();
-    await this.store.save(userId, data);
-  }
-  private enqueue(task: () => Promise<void>) {
+  private enqueue(jobId: string, ownerId: string, task: () => Promise<void>) {
     if (!this.accepting) throw new Error("Backup manager is shutting down");
-    this.pending.push(task);
+    this.pending.push({ jobId, ownerId, task });
     this.pump();
+  }
+  private enqueueAndWait<T>(
+    jobId: string,
+    ownerId: string,
+    task: () => Promise<T>,
+  ): Promise<T> {
+    if (!this.accepting)
+      return Promise.reject(new Error("Backup manager is shutting down"));
+    return new Promise<T>((resolve, reject) => {
+      this.pending.push({
+        jobId,
+        ownerId,
+        cancel: reject,
+        task: async () => {
+          try {
+            resolve(await task());
+          } catch (error) {
+            reject(error);
+          }
+        },
+      });
+      this.pump();
+    });
+  }
+  private cancelPending(
+    shouldCancel: (candidate: BackupQueueEntry) => boolean,
+    error: Error,
+  ): void {
+    const retained: BackupQueueEntry[] = [];
+    for (const candidate of this.pending) {
+      if (shouldCancel(candidate)) candidate.cancel?.(error);
+      else retained.push(candidate);
+    }
+    this.pending = retained;
   }
   private pump() {
     while (this.active < this.maxConcurrent && this.pending.length) {
-      const task = this.pending.shift()!;
+      const entry = this.pending.shift()!;
       this.active++;
-      void task().finally(() => {
-        this.active--;
-        this.pump();
-      });
+      const task = Promise.resolve().then(entry.task);
+      const ownerTasks = this.activeTasks.get(entry.ownerId) ?? new Set();
+      ownerTasks.add(task);
+      this.activeTasks.set(entry.ownerId, ownerTasks);
+      void task
+        .catch((error) => {
+          useLogger().error(
+            `[backup] queued task ${entry.jobId} failed: ${error instanceof Error ? error.message : error}`,
+          );
+        })
+        .finally(() => {
+          ownerTasks.delete(task);
+          if (!ownerTasks.size) this.activeTasks.delete(entry.ownerId);
+          this.active--;
+          this.pump();
+        });
     }
   }
 }
 
-export async function cleanupInterruptedBackupStaging(dataDir: string, jobId: string) {
+export async function cleanupInterruptedBackupStaging(
+  dataDir: string,
+  jobId: string,
+) {
+  assertSafeUserId(jobId, "jobId");
   await Promise.all([
-    rm(join(dataDir, "tmp", `backup-${jobId}`), { recursive: true, force: true }),
-    rm(join(dataDir, "tmp", `restore-${jobId}`), { recursive: true, force: true }),
+    rm(join(dataDir, "tmp", `backup-${jobId}`), {
+      recursive: true,
+      force: true,
+    }),
+    rm(join(dataDir, "tmp", `restore-${jobId}`), {
+      recursive: true,
+      force: true,
+    }),
   ]);
+}
+export async function readInterruptedBackupResume(
+  dataDir: string,
+  jobId: string,
+): Promise<
+  | { artifactId: string; uploadId: string; sha256: string; size: number }
+  | undefined
+> {
+  assertSafeUserId(jobId, "jobId");
+  try {
+    const value = JSON.parse(
+      await readFile(
+        join(dataDir, "tmp", `backup-${jobId}`, "resume.json"),
+        "utf8",
+      ),
+    ) as Record<string, unknown>;
+    if (
+      typeof value.artifactId !== "string" ||
+      !/^[A-Za-z0-9_-]+$/.test(value.artifactId) ||
+      typeof value.uploadId !== "string" ||
+      !value.uploadId ||
+      value.uploadId.length > 4096 ||
+      /[\0\r\n]/.test(value.uploadId) ||
+      typeof value.sha256 !== "string" ||
+      !/^[a-f0-9]{64}$/i.test(value.sha256) ||
+      typeof value.size !== "number" ||
+      !Number.isSafeInteger(value.size) ||
+      value.size < 0
+    )
+      return undefined;
+    return {
+      artifactId: value.artifactId,
+      uploadId: value.uploadId,
+      sha256: value.sha256,
+      size: value.size,
+    };
+  } catch {
+    return undefined;
+  }
+}
+export function recordUploadedProviderObject(
+  job: BackupJob,
+  providerObjectId: string,
+): string {
+  job.pendingProviderArtifactId ??= job.pendingProviderObjectId;
+  job.pendingProviderObjectId = providerObjectId;
+  return providerObjectId;
 }
 export async function rollbackRestoredWorkers(
   workerIds: readonly string[],
@@ -1687,6 +2392,14 @@ function sanitizeConfig(c: BackupConfig) {
       ? { clientId: c.google.clientId, linked: !!c.google.token }
       : undefined,
   };
+}
+function sanitizeJob(job: BackupJob): BackupJob {
+  const publicJob = structuredClone(job);
+  delete publicJob.pendingProviderObjectId;
+  delete publicJob.pendingProviderArtifactId;
+  delete publicJob.pendingProviderUploadId;
+  delete publicJob.providerUploadId;
+  return publicJob;
 }
 let singleton: BackupManager | undefined;
 export function useBackupManager() {

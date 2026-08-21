@@ -18,6 +18,13 @@ export type PublicExportJob = Omit<ExportJobRecord, 'userId'> & {
   downloadReady: boolean;
 };
 
+export interface ExportJobManagerOptions {
+  store?: ExportJobStore;
+  removeArtifact?: (path: string) => Promise<void>;
+  resolveMissingSecrets?: (userId: string, workerId: string) => Promise<string[]>;
+  ownerCleanupTimeoutMs?: number;
+}
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -31,6 +38,15 @@ function safeFailure(err: unknown): string {
   return 'Export failed. Check server logs for details.';
 }
 
+async function readDirIfExists(path: string): Promise<string[]> {
+  try {
+    return await readdir(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
 export class ExportJobManager {
   private readonly store: ExportJobStore;
   private readonly artifactsDir: string;
@@ -38,7 +54,14 @@ export class ExportJobManager {
   private activeStreams = new Map<string, Readable>();
   private controllers = new Map<string, AbortController>();
   private runningJobs = new Set<string>();
+  private activeTasks = new Map<string, Promise<void>>();
+  private ownerQueues = new Map<string, Promise<void>>();
+  private jobQueues = new Map<string, Promise<void>>();
+  private closedOwners = new Set<string>();
   private cleanupTimer?: NodeJS.Timeout;
+  private readonly artifactRemover: (path: string) => Promise<void>;
+  private readonly resolveMissingSecrets: (userId: string, workerId: string) => Promise<string[]>;
+  private readonly ownerCleanupTimeoutMs: number;
 
   constructor(
     dataDir: string,
@@ -48,9 +71,15 @@ export class ExportJobManager {
       onProgress?: (update: { phase: string; progress: number; bytesProcessed: number }) => void | Promise<void>;
     }) => Promise<{ stream: Readable; filename: string }>,
     private readonly logError: (message: string) => void,
+    options: ExportJobManagerOptions = {},
   ) {
-    this.store = new ExportJobStore(dataDir);
+    this.store = options.store ?? new ExportJobStore(dataDir);
     this.artifactsDir = join(dataDir, 'export-artifacts');
+    this.artifactRemover = options.removeArtifact ?? ((path) => rm(path, { force: true }));
+    this.ownerCleanupTimeoutMs = Math.max(1, options.ownerCleanupTimeoutMs ?? 30_000);
+    this.resolveMissingSecrets = options.resolveMissingSecrets ?? (async (userId, workerId) =>
+      (await useWorkerConfigStore().resolveValues(userId, workerId))
+        .filter((entry) => entry.kind !== 'variable').map((entry) => entry.key));
   }
 
   async init(): Promise<void> {
@@ -63,17 +92,17 @@ export class ExportJobManager {
     await this.store.init();
 
     const knownArtifactIds = new Set(this.store.list().map((job) => `${job.id}.tar`));
-    for (const name of await readdir(this.artifactsDir).catch(() => [] as string[])) {
+    for (const name of await readDirIfExists(this.artifactsDir)) {
       if (name.endsWith('.tar') && !knownArtifactIds.has(name)) {
-        await rm(join(this.artifactsDir, name), { force: true }).catch(() => {});
+        await this.artifactRemover(join(this.artifactsDir, name));
       }
     }
 
     // A hard kill cannot run ContainerManager's stream cleanup handlers. Sweep
     // only its uniquely-prefixed export scratch directories on startup.
     const tmpDir = join(this.artifactsDir, '..', 'tmp');
-    for (const name of await readdir(tmpDir).catch(() => [] as string[])) {
-      if (name.startsWith('export-')) await rm(join(tmpDir, name), { recursive: true, force: true }).catch(() => {});
+    for (const name of await readDirIfExists(tmpDir)) {
+      if (name.startsWith('export-')) await rm(join(tmpDir, name), { recursive: true, force: true });
     }
 
     // Work cannot safely resume inside ContainerManager after a process restart.
@@ -81,61 +110,54 @@ export class ExportJobManager {
     for (const job of this.store.list()) {
       if (job.status === 'queued' || job.status === 'running') {
         const stamp = now();
-        job.status = 'failed';
-        job.phase = 'failed';
-        job.error = 'Export was interrupted by an orchestrator restart. Start a new export.';
-        job.updatedAt = stamp;
-        job.completedAt = stamp;
-        job.expiresAt = new Date(Date.now() + TERMINAL_RETENTION_MS).toISOString();
+        const failed: ExportJobRecord = {
+          ...job,
+          status: 'failed', phase: 'failed',
+          error: 'Export was interrupted by an orchestrator restart. Start a new export.',
+          updatedAt: stamp, completedAt: stamp,
+          expiresAt: new Date(Date.now() + TERMINAL_RETENTION_MS).toISOString(),
+        };
         await this.removeArtifact(job.id);
-        await this.store.save(job);
+        await this.store.save(failed);
       }
     }
     await this.cleanupExpired();
-    this.cleanupTimer = setInterval(() => void this.cleanupExpired(), 15 * 60 * 1000);
+    this.cleanupTimer = setInterval(() => {
+      void this.cleanupExpired().catch((error) =>
+        this.logError(`[export-jobs] cleanup failed: ${error instanceof Error ? error.message : error}`),
+      );
+    }, 15 * 60 * 1000);
     this.cleanupTimer.unref?.();
   }
 
   async create(userId: string, workerId: string, includeRootfs = false): Promise<PublicExportJob> {
     await this.init();
-    const pending = this.store.listForUser(userId)
-      .filter((item) => item.status === 'queued' || item.status === 'running');
-    if (pending.some((item) => item.workerId === workerId)) {
-      const err = new Error('An export is already active for this worker') as Error & { statusCode?: number };
-      err.statusCode = 409;
-      throw err;
-    }
-    if (pending.length >= MAX_PENDING_PER_USER) {
-      const err = new Error('Too many export jobs are queued') as Error & { statusCode?: number };
-      err.statusCode = 429;
-      throw err;
-    }
-    const stamp = now();
-    const job: ExportJobRecord = {
-      id: randomUUID(),
-      userId,
-      workerId,
-      includeRootfs,
-      status: 'queued',
-      phase: 'queued',
-      progress: 0,
-      bytesProcessed: 0,
-      createdAt: stamp,
-      updatedAt: stamp,
-      missingSecrets: (await useWorkerConfigStore().resolveValues(userId, workerId))
-        .filter((entry) => entry.kind !== 'variable').map((entry) => entry.key),
-    };
-    try {
+    return this.withOwner(userId, async () => {
+      this.assertOwnerOpen(userId);
+      const pending = this.store.listForUser(userId)
+        .filter((item) => item.status === 'queued' || item.status === 'running');
+      if (pending.some((item) => item.workerId === workerId)) {
+        const err = new Error('An export is already active for this worker') as Error & { statusCode?: number };
+        err.statusCode = 409;
+        throw err;
+      }
+      if (pending.length >= MAX_PENDING_PER_USER) {
+        const err = new Error('Too many export jobs are queued') as Error & { statusCode?: number };
+        err.statusCode = 429;
+        throw err;
+      }
+      const missingSecrets = await this.resolveMissingSecrets(userId, workerId);
+      this.assertOwnerOpen(userId);
+      const stamp = now();
+      const job: ExportJobRecord = {
+        id: randomUUID(), userId, workerId, includeRootfs,
+        status: 'queued', phase: 'queued', progress: 0, bytesProcessed: 0,
+        createdAt: stamp, updatedAt: stamp, missingSecrets,
+      };
       await this.store.save(job);
-    } catch (err) {
-      this.store.discard(userId, job.id);
-      throw err;
-    }
-
-    // Do not await materialisation: the create endpoint returns after the small
-    // metadata write, while the expensive Docker archive work runs in-process.
-    setImmediate(() => this.dispatch());
-    return this.toPublic(job);
+      setImmediate(() => this.dispatch());
+      return this.toPublic(job);
+    });
   }
 
   async get(id: string): Promise<ExportJobRecord | undefined> {
@@ -146,21 +168,27 @@ export class ExportJobManager {
 
   async cancel(job: ExportJobRecord): Promise<PublicExportJob> {
     await this.init();
-    if (job.status === 'succeeded' || job.status === 'failed' || job.status === 'cancelled') {
-      return this.toPublic(job);
-    }
-    const stamp = now();
-    job.status = 'cancelled';
-    job.phase = 'cancelled';
-    job.updatedAt = stamp;
-    job.completedAt = stamp;
-    job.expiresAt = new Date(Date.now() + TERMINAL_RETENTION_MS).toISOString();
-    this.controllers.get(job.id)?.abort(new Error('Export cancelled'));
-    this.activeStreams.get(job.id)?.destroy(new Error('Export cancelled'));
-    await this.removeArtifact(job.id);
-    await this.store.save(job);
-    this.dispatch();
-    return this.toPublic(job);
+    return this.withJob(job.id, async () => {
+      const current = this.store.findById(job.id);
+      if (!current) throw new Error('Export job not found');
+      if (current.status === 'succeeded' || current.status === 'failed')
+        return this.toPublic(current);
+      if (current.status !== 'cancelled') {
+        const stamp = now();
+        const cancelled: ExportJobRecord = {
+          ...current,
+          status: 'cancelled', phase: 'cancelled', updatedAt: stamp,
+          completedAt: stamp,
+          expiresAt: new Date(Date.now() + TERMINAL_RETENTION_MS).toISOString(),
+        };
+        await this.store.save(cancelled);
+      }
+      this.controllers.get(job.id)?.abort(new Error('Export cancelled'));
+      this.activeStreams.get(job.id)?.destroy(new Error('Export cancelled'));
+      await this.removeArtifact(job.id);
+      this.dispatch();
+      return this.toPublic(this.store.findById(job.id)!);
+    });
   }
 
   async openArtifact(job: ExportJobRecord): Promise<{ stream: Readable; size: number; filename: string }> {
@@ -180,14 +208,21 @@ export class ExportJobManager {
   }
 
   async removeForUser(userId: string): Promise<number> {
+    this.closedOwners.add(userId);
     await this.init();
-    const jobs = this.store.listForUser(userId);
-    for (const job of jobs) {
-      this.controllers.get(job.id)?.abort(new Error('Export owner removed'));
-      this.activeStreams.get(job.id)?.destroy(new Error('Export owner removed'));
-      await this.removeArtifact(job.id);
-    }
-    return this.store.removeForUser(userId);
+    return this.withOwner(userId, async () => {
+      const jobs = this.store.listForUser(userId);
+      for (const job of jobs) {
+        this.controllers.get(job.id)?.abort(new Error('Export owner removed'));
+        this.activeStreams.get(job.id)?.destroy(new Error('Export owner removed'));
+      }
+      await this.drainOwnerTasks(
+        jobs.map((job) => this.activeTasks.get(job.id)).filter((task): task is Promise<void> => Boolean(task)),
+      );
+      for (const job of jobs)
+        await this.withJob(job.id, () => this.removeArtifact(job.id));
+      return this.store.removeForUser(userId);
+    });
   }
 
   toPublic(job: ExportJobRecord): PublicExportJob {
@@ -203,34 +238,39 @@ export class ExportJobManager {
         .filter((workerId): workerId is string => Boolean(workerId)),
     );
     const next = this.store.list().find((candidate) =>
-      candidate.status === 'queued' && !runningWorkers.has(candidate.workerId));
+      candidate.status === 'queued' && !this.closedOwners.has(candidate.userId) &&
+      !runningWorkers.has(candidate.workerId));
     if (!next) return;
     this.runningJobs.add(next.id);
-    void this.run(next.id).catch((err) => {
+    const task = this.run(next.id).catch((err) => {
       this.logError(`[export-jobs] unexpected runner failure for job ${next.id}: ${err instanceof Error ? err.message : err}`);
     }).finally(() => {
       this.runningJobs.delete(next.id);
+      this.activeTasks.delete(next.id);
       this.controllers.delete(next.id);
       this.dispatch();
     });
+    this.activeTasks.set(next.id, task);
     if (this.runningJobs.size < MAX_RUNNING_JOBS) this.dispatch();
   }
 
   private async run(id: string): Promise<void> {
-    const job = this.store.findById(id);
-    if (!job || job.status !== 'queued') return;
+    const queued = this.store.findById(id);
+    if (!queued || queued.status !== 'queued' || this.closedOwners.has(queued.userId)) return;
     // Register cancellation before the first await or published running state;
     // DELETE can now abort every preparation phase without a race window.
     const controller = new AbortController();
-    this.controllers.set(job.id, controller);
+    this.controllers.set(queued.id, controller);
     try {
       const startedAt = now();
-      job.status = 'running';
-      job.phase = 'preparing';
-      job.startedAt = startedAt;
-      job.updatedAt = startedAt;
-      job.progress = 1;
-      await this.store.save(job);
+      const job = await this.transition(id, (current) => {
+        if (current.status !== 'queued') return;
+        Object.assign(current, {
+          status: 'running', phase: 'preparing', startedAt,
+          updatedAt: startedAt, progress: 1,
+        });
+      });
+      if (!job || job.status !== 'running') return;
       const fsInfo = await statfs(this.artifactsDir);
       const freeBytes = fsInfo.bavail * fsInfo.bsize;
       if (!Number.isFinite(freeBytes) || freeBytes < MIN_FREE_BYTES) {
@@ -241,41 +281,48 @@ export class ExportJobManager {
         includeRootfs: job.includeRootfs,
         signal: controller.signal,
         onProgress: async (update) => {
-          if (this.store.findById(id)?.status === 'cancelled') return;
-          job.phase = update.phase as ExportJobRecord['phase'];
-          job.progress = update.progress;
-          job.bytesProcessed = update.bytesProcessed;
-          job.updatedAt = now();
-          await this.store.save(job);
+          await this.transition(id, (current) => {
+            if (current.status !== 'running') return;
+            current.phase = update.phase as ExportJobRecord['phase'];
+            current.progress = update.progress;
+            current.bytesProcessed = update.bytesProcessed;
+            current.updatedAt = now();
+          });
         },
       });
-      if (this.store.findById(id)?.status === 'cancelled') {
+      if (controller.signal.aborted || this.closedOwners.has(job.userId) || this.store.findById(id)?.status === 'cancelled') {
         result.stream.destroy();
         return;
       }
 
-      job.phase = 'writing-artifact';
-      job.progress = 90;
-      job.filename = result.filename;
-      job.updatedAt = now();
-      await this.store.save(job);
+      await this.transition(id, (current) => {
+        if (current.status !== 'running') return;
+        current.phase = 'writing-artifact';
+        current.progress = 90;
+        current.filename = result.filename;
+        current.updatedAt = now();
+      });
 
       this.activeStreams.set(job.id, result.stream);
       let artifactBytes = 0;
-      let bytesAtLastPersist = job.bytesProcessed;
+      let bytesProcessed = this.store.findById(id)?.bytesProcessed ?? 0;
+      let bytesAtLastPersist = bytesProcessed;
       const counter = new Transform({
         transform: (chunk, _encoding, callback) => {
           const length = Buffer.byteLength(chunk);
           artifactBytes += length;
-          job.bytesProcessed += length;
+          bytesProcessed += length;
           if (artifactBytes > MAX_ARTIFACT_BYTES) {
             callback(new Error('Export artifact exceeds the size limit'));
             return;
           }
-          if (job.bytesProcessed - bytesAtLastPersist >= 64 * 1024 * 1024) {
-            bytesAtLastPersist = job.bytesProcessed;
-            job.updatedAt = now();
-            this.store.save(job).then(() => callback(null, chunk), callback);
+          if (bytesProcessed - bytesAtLastPersist >= 64 * 1024 * 1024) {
+            bytesAtLastPersist = bytesProcessed;
+            this.transition(id, (current) => {
+              if (current.status !== 'running') return;
+              current.bytesProcessed = bytesProcessed;
+              current.updatedAt = now();
+            }).then(() => callback(null, chunk), callback);
             return;
           }
           callback(null, chunk);
@@ -289,27 +336,37 @@ export class ExportJobManager {
       }
 
       const completedAt = now();
-      job.status = 'succeeded';
-      job.phase = 'complete';
-      job.progress = 100;
-      job.updatedAt = completedAt;
-      job.completedAt = completedAt;
-      job.expiresAt = new Date(Date.now() + SUCCESS_RETENTION_MS).toISOString();
-      await this.store.save(job);
+      await this.transition(id, (current) => {
+        if (current.status !== 'running') return;
+        Object.assign(current, {
+          status: 'succeeded', phase: 'complete', progress: 100,
+          bytesProcessed, updatedAt: completedAt, completedAt,
+          expiresAt: new Date(Date.now() + SUCCESS_RETENTION_MS).toISOString(),
+        });
+      });
     } catch (err) {
-      this.activeStreams.delete(job.id);
-      await this.removeArtifact(job.id);
-      if (this.store.findById(id)?.status === 'cancelled') return;
+      this.activeStreams.delete(id);
+      let cleanupError: unknown;
+      try {
+        await this.removeArtifact(id);
+      } catch (error) {
+        cleanupError = error;
+      }
+      if (this.store.findById(id)?.status === 'cancelled') {
+        if (cleanupError) throw cleanupError;
+        return;
+      }
       const completedAt = now();
-      job.status = 'failed';
-      job.phase = 'failed';
-      job.progress = 0;
-      job.error = safeFailure(err);
-      job.updatedAt = completedAt;
-      job.completedAt = completedAt;
-      job.expiresAt = new Date(Date.now() + TERMINAL_RETENTION_MS).toISOString();
-      await this.store.save(job);
-      this.logError(`[export-jobs] job ${job.id} failed for worker ${job.workerId}: ${err instanceof Error ? err.message : err}`);
+      const failed = await this.transition(id, (current) => {
+        if (current.status === 'cancelled') return;
+        Object.assign(current, {
+          status: 'failed', phase: 'failed', progress: 0,
+          error: safeFailure(err), updatedAt: completedAt, completedAt,
+          expiresAt: new Date(Date.now() + TERMINAL_RETENTION_MS).toISOString(),
+        });
+      });
+      this.logError(`[export-jobs] job ${id} failed for worker ${failed?.workerId ?? queued.workerId}: ${err instanceof Error ? err.message : err}`);
+      if (cleanupError) throw cleanupError;
     }
   }
 
@@ -318,18 +375,86 @@ export class ExportJobManager {
   }
 
   private async removeArtifact(id: string): Promise<void> {
-    await rm(this.artifactPath(id), { force: true }).catch(() => {});
+    await this.artifactRemover(this.artifactPath(id));
+  }
+
+  private async drainOwnerTasks(tasks: Promise<void>[]): Promise<void> {
+    if (!tasks.length) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled(tasks).then(() => undefined),
+        new Promise<void>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(Object.assign(
+              new Error('Export owner cleanup exceeded the deadline'),
+              { statusCode: 503, code: 'EXPORT_OWNER_CLEANUP_TIMEOUT' },
+            )),
+            this.ownerCleanupTimeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private async cleanupExpired(): Promise<void> {
     const cutoff = Date.now();
     for (const job of this.store.list()) {
       if (!job.expiresAt || Date.parse(job.expiresAt) > cutoff) continue;
-      this.activeStreams.get(job.id)?.destroy();
-      this.activeStreams.delete(job.id);
-      await this.removeArtifact(job.id);
-      await this.store.remove(job.userId, job.id);
+      await this.withJob(job.id, async () => {
+        const current = this.store.findById(job.id);
+        if (!current?.expiresAt || Date.parse(current.expiresAt) > Date.now()) return;
+        this.activeStreams.get(job.id)?.destroy();
+        this.activeStreams.delete(job.id);
+        await this.removeArtifact(job.id);
+        await this.store.remove(current.userId, current.id);
+      });
     }
+  }
+
+  private assertOwnerOpen(userId: string): void {
+    if (this.closedOwners.has(userId))
+      throw Object.assign(new Error('Export owner is no longer available'), { statusCode: 409 });
+  }
+
+  private withOwner<T>(userId: string, operation: () => Promise<T>): Promise<T> {
+    return this.withQueue(this.ownerQueues, userId, operation);
+  }
+
+  private withJob<T>(jobId: string, operation: () => Promise<T>): Promise<T> {
+    return this.withQueue(this.jobQueues, jobId, operation);
+  }
+
+  private withQueue<T>(
+    queues: Map<string, Promise<void>>,
+    key: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = queues.get(key) ?? Promise.resolve();
+    const result = previous.then(operation);
+    const tail = result.then(() => undefined, () => undefined);
+    queues.set(key, tail);
+    void tail.finally(() => {
+      if (queues.get(key) === tail) queues.delete(key);
+    });
+    return result;
+  }
+
+  private transition(
+    id: string,
+    operation: (job: ExportJobRecord) => void,
+  ): Promise<ExportJobRecord | undefined> {
+    return this.withJob(id, async () => {
+      const current = this.store.findById(id);
+      if (!current) return undefined;
+      const next = structuredClone(current);
+      operation(next);
+      if (JSON.stringify(next) === JSON.stringify(current)) return current;
+      await this.store.save(next);
+      return next;
+    });
   }
 
   stop(): void {

@@ -112,7 +112,9 @@ test.describe.serial('Worker groups dashboard', () => {
       return persisted.workerIds;
     }).toEqual([]);
     await reopened.getByRole('button', { name: 'Delete' }).click();
-    await expect(reopened).toBeHidden();
+    // Deleting the group also removes its real administrative container and
+    // can exceed the generic UI assertion timeout on a cold Docker daemon.
+    await expect(reopened).toBeHidden({ timeout: 60_000 });
     groupId = '';
     expect((await request.get(`/api/containers/${workerId}`)).status()).toBe(200);
   });
@@ -141,6 +143,23 @@ test.describe.serial('Worker groups dashboard', () => {
     await expect(modal.getByLabel(`Parent for Tree root ${stamp}`).locator(`option[value="${treeChildId}"]`)).toHaveCount(0);
 
     await request.put('/api/worker-groups/assignment', { data: { workerId: ungroupedWorkerId, groupId: null } });
+  });
+
+  test('refreshes externally changed membership without reloading the dashboard', async ({ page, request }) => {
+    await goToDashboard(page);
+    const childBox = page.getByTestId(`worker-group-cards-${treeChildId}`);
+    await expect(childBox.getByText(ungroupedWorkerName, { exact: true })).toHaveCount(0);
+
+    expect((await request.put('/api/worker-groups/assignment', {
+      data: { workerId: ungroupedWorkerId, groupId: treeChildId },
+    })).ok()).toBeTruthy();
+
+    await expect(childBox.getByText(ungroupedWorkerName, { exact: true })).toBeVisible({
+      timeout: 20_000,
+    });
+    await request.put('/api/worker-groups/assignment', {
+      data: { workerId: ungroupedWorkerId, groupId: null },
+    });
   });
 
   test('manages write-only group variables and descendant inheritance by name', async ({ page }) => {

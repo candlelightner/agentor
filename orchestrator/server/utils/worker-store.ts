@@ -24,6 +24,9 @@ export interface WorkerRecord extends UserOwnedResource {
    * the worker exists, since no container remains to discover it from.) */
   status: "active" | "archived";
   archivedAt?: string;
+  /** Internal fail-closed marker: Docker is already gone, but permanent
+   * resource cleanup must be retried. Such a record cannot be unarchived. */
+  deletionPending?: boolean;
   /** Foreign key to the assigned environment — the only environment data stored
    * on the worker. The environment's config (CPU/memory/network/docker/setup
    * script/env vars/exposed APIs/capabilities/instructions) lives in the
@@ -45,6 +48,10 @@ export interface WorkerRecord extends UserOwnedResource {
    * — reused across rebuild/unarchive so the captured rootfs survives. Unset for
    * normal workers (which run the shared standard worker image). */
   importedImage?: string;
+  /** Internal ownership marker for a custom environment created implicitly by
+   * this import. The environment is removed with its final owning worker unless
+   * another worker adopted it. Never projected into the public worker response. */
+  importCreatedEnvironmentId?: string;
   imageDefinitionId?: string;
   imageVersion?: string;
   imageDigest?: string;
@@ -99,6 +106,34 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     }
   }
 
+  /** Atomically mark an existing worker for rebuild without ever creating it.
+   * The lookup happens inside the same per-owner store transaction as the
+   * write, so a queued environment/configuration update cannot reinsert a
+   * worker that was deleted while the caller held a stale record reference. */
+  async markPendingRebuild(
+    userId: string,
+    id: string,
+  ): Promise<WorkerRecord | undefined> {
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId);
+      const previous = map?.get(id);
+      if (!map || !previous) return undefined;
+      const next: WorkerRecord = {
+        ...previous,
+        pendingRebuild: true,
+        updatedAt: new Date().toISOString(),
+      };
+      map.set(id, next);
+      try {
+        await this.persistUser(userId);
+      } catch (error) {
+        map.set(id, previous);
+        throw error;
+      }
+      return structuredClone(next);
+    });
+  }
+
   async archive(userId: string, id: string): Promise<void> {
     const worker = this.get(userId, id);
     if (!worker) {
@@ -107,13 +142,34 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
       );
       throw new Error(`Worker not found: ${id}`);
     }
-    worker.status = "archived";
-    worker.archivedAt = new Date().toISOString();
-    worker.updatedAt = worker.archivedAt;
-    await this.setItem(userId, worker);
+    const updatedAt = new Date().toISOString();
+    const archivedAt = worker.archivedAt ?? updatedAt;
+    await this.setItem(userId, {
+      ...worker,
+      status: "archived",
+      // Once destructive deletion has begun, no generic archive/reconcile path
+      // may silently make the record unarchivable again.
+      deletionPending: worker.deletionPending === true,
+      archivedAt,
+      updatedAt,
+    });
     useLogger().info(
       `[worker-store] archived worker ${worker.displayName || worker.id}`,
     );
+  }
+
+  async markDeletionPending(userId: string, id: string): Promise<void> {
+    const worker = this.get(userId, id);
+    if (!worker) throw new Error(`Worker not found: ${id}`);
+    const updatedAt = new Date().toISOString();
+    const archivedAt = worker.archivedAt ?? updatedAt;
+    await this.setItem(userId, {
+      ...worker,
+      status: "archived",
+      deletionPending: true,
+      archivedAt,
+      updatedAt,
+    });
   }
 
   async unarchive(userId: string, id: string): Promise<void> {
@@ -124,10 +180,19 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
       );
       throw new Error(`Worker not found: ${id}`);
     }
-    worker.status = "active";
-    worker.archivedAt = undefined;
-    worker.updatedAt = new Date().toISOString();
-    await this.setItem(userId, worker);
+    if (worker.deletionPending) {
+      throw Object.assign(
+        new Error("Worker deletion cleanup is still pending"),
+        { statusCode: 409 },
+      );
+    }
+    await this.setItem(userId, {
+      ...worker,
+      status: "active",
+      archivedAt: undefined,
+      deletionPending: false,
+      updatedAt: new Date().toISOString(),
+    });
     useLogger().info(
       `[worker-store] unarchived worker ${worker.displayName || worker.id}`,
     );

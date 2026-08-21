@@ -3,7 +3,11 @@
 # Built on the Playwright base image (Node 22 + Chromium preinstalled),
 # with Docker Engine layered on top so the runner can boot a fresh
 # agentor stack inside its own dockerd (DinD).
-FROM mcr.microsoft.com/playwright:v1.59.1-noble
+ARG PLAYWRIGHT_BASE_VERSION=v1.59.1-noble
+FROM mcr.microsoft.com/playwright:${PLAYWRIGHT_BASE_VERSION}
+ARG PLAYWRIGHT_BASE_VERSION
+ENV AGENTOR_TEST_RUNNER_BASE_VERSION=${PLAYWRIGHT_BASE_VERSION}
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Install Docker Engine + compose plugin + a few utilities.
 # get.docker.com is the official upstream installer.
@@ -24,8 +28,7 @@ COPY stack.yml /opt/test-stack/stack.yml
 
 # Test runner entrypoint — boots dockerd, builds images, brings up the
 # inner stack, runs playwright with passthrough args, tears down on exit.
-COPY test-entrypoint.sh /usr/local/bin/test-entrypoint.sh
-RUN chmod +x /usr/local/bin/test-entrypoint.sh
+COPY --chmod=755 test-entrypoint.sh /usr/local/bin/test-entrypoint.sh
 
 # Workdir for the playwright invocation. The host bind-mount lands here.
 WORKDIR /work/tests

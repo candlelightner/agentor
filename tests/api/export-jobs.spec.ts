@@ -5,8 +5,158 @@ import { ApiClient } from '../helpers/api-client';
 import { createWorker, cleanupWorker, waitForWorkerRunning } from '../helpers/worker-lifecycle';
 import { createTestUser, deleteTestUser } from '../helpers/test-users';
 import { TerminalWsClient } from '../helpers/terminal-ws';
+import { mkdtemp, rm as removePath } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { PassThrough, Readable } from 'node:stream';
+import { ExportJobManager } from '../../orchestrator/server/utils/export-jobs';
+import { ExportJobStore, type ExportJobRecord } from '../../orchestrator/server/utils/export-job-store';
 
 const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
+
+async function unitExportManager(
+  exportWorker: ConstructorParameters<typeof ExportJobManager>[1] = async () => ({
+    stream: Readable.from([Buffer.from('export')]),
+    filename: 'worker.tar',
+  }),
+  options: ConstructorParameters<typeof ExportJobManager>[3] = {},
+) {
+  const directory = await mkdtemp(join(tmpdir(), 'agentor-export-manager-'));
+  const errors: string[] = [];
+  const manager = new ExportJobManager(directory, exportWorker, (message) => errors.push(message), {
+    resolveMissingSecrets: async () => [],
+    ...options,
+  });
+  await manager.init();
+  return { directory, manager, errors };
+}
+
+test('export manager atomically rejects duplicate same-worker admission', async () => {
+  const fixture = await unitExportManager();
+  try {
+    const results = await Promise.allSettled([
+      fixture.manager.create('owner', 'worker'),
+      fixture.manager.create('owner', 'worker'),
+    ]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')!;
+    expect(rejected.reason).toMatchObject({ statusCode: 409 });
+  } finally {
+    await fixture.manager.removeForUser('owner').catch(() => {});
+    fixture.manager.stop();
+    await removePath(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('owner removal fences an in-flight admission and permanently closes new exports', async () => {
+  let entered!: () => void;
+  let release!: () => void;
+  const admissionEntered = new Promise<void>((resolve) => { entered = resolve; });
+  const admissionGate = new Promise<void>((resolve) => { release = resolve; });
+  const fixture = await unitExportManager(undefined, {
+    resolveMissingSecrets: async () => { entered(); await admissionGate; return []; },
+  });
+  try {
+    const create = fixture.manager.create('deleted-owner', 'worker');
+    await admissionEntered;
+    const removal = fixture.manager.removeForUser('deleted-owner');
+    release();
+    await expect(create).rejects.toMatchObject({ statusCode: 409 });
+    await expect(removal).resolves.toBe(0);
+    await expect(fixture.manager.create('deleted-owner', 'worker')).rejects.toMatchObject({ statusCode: 409 });
+  } finally {
+    fixture.manager.stop();
+    await removePath(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('owner removal drains an active export and retains durable retry state when artifact cleanup fails', async () => {
+  let started!: () => void;
+  const exportStarted = new Promise<void>((resolve) => { started = resolve; });
+  let failCleanup = true;
+  const fixture = await unitExportManager(async (_workerId, options) => {
+    started();
+    const stream = new PassThrough();
+    options.signal?.addEventListener('abort', () => stream.destroy(), { once: true });
+    return { stream, filename: 'worker.tar' };
+  }, {
+    removeArtifact: async (path) => {
+      if (failCleanup) throw new Error('injected artifact cleanup failure');
+      await removePath(path, { force: true });
+    },
+  });
+  try {
+    const created = await fixture.manager.create('owner', 'worker');
+    await exportStarted;
+    await expect(fixture.manager.removeForUser('owner')).rejects.toThrow('injected artifact cleanup failure');
+    expect(await fixture.manager.get(created.id)).toBeDefined();
+    failCleanup = false;
+    await expect(fixture.manager.removeForUser('owner')).resolves.toBe(1);
+    expect(await fixture.manager.get(created.id)).toBeUndefined();
+  } finally {
+    fixture.manager.stop();
+    await removePath(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('owner removal times out a non-cooperative export without deleting its retry state', async () => {
+  let started!: () => void;
+  let release!: () => void;
+  const exportStarted = new Promise<void>((resolve) => { started = resolve; });
+  const exportGate = new Promise<void>((resolve) => { release = resolve; });
+  const fixture = await unitExportManager(async () => {
+    started();
+    await exportGate;
+    return { stream: Readable.from([Buffer.from('late-export')]), filename: 'worker.tar' };
+  }, { ownerCleanupTimeoutMs: 20 });
+  try {
+    const created = await fixture.manager.create('owner', 'worker');
+    await exportStarted;
+    const began = Date.now();
+    await expect(fixture.manager.removeForUser('owner')).rejects.toMatchObject({
+      statusCode: 503,
+      code: 'EXPORT_OWNER_CLEANUP_TIMEOUT',
+    });
+    expect(Date.now() - began).toBeLessThan(1_000);
+    expect(await fixture.manager.get(created.id)).toBeDefined();
+    await expect(fixture.manager.create('owner', 'worker')).rejects.toMatchObject({ statusCode: 409 });
+
+    release();
+    await expect.poll(() => (fixture.manager as any).activeTasks.size).toBe(0);
+    await expect(fixture.manager.removeForUser('owner')).resolves.toBe(1);
+    expect(await fixture.manager.get(created.id)).toBeUndefined();
+  } finally {
+    release();
+    fixture.manager.stop();
+    await removePath(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('cancel persistence rejection leaves the durable queued export unchanged and retryable', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agentor-export-transaction-'));
+  class FailingStore extends ExportJobStore {
+    fail = false;
+    override async save(job: ExportJobRecord) {
+      if (this.fail) throw new Error('injected export state failure');
+      await super.save(job);
+    }
+  }
+  const store = new FailingStore(directory);
+  const manager = new ExportJobManager(directory, async () => ({
+    stream: new PassThrough(), filename: 'worker.tar',
+  }), () => {}, { store, resolveMissingSecrets: async () => [] });
+  try {
+    await manager.init();
+    const created = await manager.create('owner', 'worker');
+    const job = await manager.get(created.id);
+    store.fail = true;
+    await expect(manager.cancel(job!)).rejects.toThrow('injected export state failure');
+    expect(await manager.get(created.id)).toMatchObject({ status: 'queued', phase: 'queued' });
+  } finally {
+    manager.stop();
+    await removePath(directory, { recursive: true, force: true });
+  }
+});
 
 async function waitForTerminal(api: ApiClient, jobId: string, timeout = 90_000) {
   const started = Date.now();

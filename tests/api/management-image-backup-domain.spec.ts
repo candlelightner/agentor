@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { ManagementImageBackupDomain } from '../../orchestrator/server/utils/management-image-backup-domain';
+import { ManagementImageBackupDomain, sanitizeManagementBackupPayload } from '../../orchestrator/server/utils/management-image-backup-domain';
 
 test('image and backup MCP domain exposes bounded tool surface and safe hints', () => {
   const tools = new ManagementImageBackupDomain().tools();
@@ -15,4 +15,20 @@ test('image and backup MCP domain exposes bounded tool surface and safe hints', 
     },
   });
   expect(restore?.description).toContain('exact non-empty workspaceIds subset');
+});
+
+test('backup MCP payloads redact internal provider cleanup and upload handles', () => {
+  expect(sanitizeManagementBackupPayload({
+    providerUploadId: 'session',
+    pendingProviderUploadId: 'pending-session',
+    pendingProviderObjectId: 'object',
+    pendingProviderArtifactId: 'artifact',
+    status: 'failed',
+  })).toEqual({
+    providerUploadId: '[REDACTED]',
+    pendingProviderUploadId: '[REDACTED]',
+    pendingProviderObjectId: '[REDACTED]',
+    pendingProviderArtifactId: '[REDACTED]',
+    status: 'failed',
+  });
 });

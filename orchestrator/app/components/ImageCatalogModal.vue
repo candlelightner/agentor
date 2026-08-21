@@ -259,7 +259,7 @@ function close() { open.value = false; }
                       <UButton
                         size="xs"
                         variant="ghost"
-                        @click="run('test', () => testWorker(d.id, v.version))"
+                        @click="testWorker(d.id, v.version)"
                         >Create test worker</UButton
                       ><UButton
                         size="xs"

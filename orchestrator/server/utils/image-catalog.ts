@@ -35,6 +35,13 @@ export interface ImageDefinition {
   updatedAt: string;
   versions: ImageVersion[];
   promotedVersion?: string;
+  /** Durable server-minted provenance used only to reconcile a Git import
+   * whose independent GitImageStore commit failed afterwards. */
+  gitRecovery?: {
+    connectionId: string;
+    remoteId: string;
+    hash: string;
+  };
 }
 export interface ImageBuild {
   id: string;
@@ -66,6 +73,16 @@ interface State {
   userDefaults: Record<string, { definitionId: string; version: string }>;
   systemDefault?: { definitionId: string; version: string };
   faults: Record<string, { failPhase?: string; message?: string }>;
+  deletions: ImageDeletion[];
+}
+interface ImageDeletion {
+  id: string;
+  kind: "definition" | "version";
+  definitionId: string;
+  ownerId: string;
+  version?: string;
+  references: string[];
+  createdAt: string;
 }
 
 const APPROVED_BASE_RE = /^agentor-worker:approved-[a-zA-Z0-9._-]+$/;
@@ -73,6 +90,7 @@ const SAFE_PATH_RE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[a-zA-Z0-9._/-]+$/;
 const MAX_CONTEXT_FILE = 100 * 1024 * 1024;
 const MAX_CONTEXT_TOTAL = 250 * 1024 * 1024;
 const DEFAULT_BUILD_TIMEOUT_MS = 30 * 60 * 1000;
+const DEFAULT_IMAGE_DELETE_TIMEOUT_MS = 30_000;
 const MIN_BUILD_TIMEOUT_MS = 1_000;
 const MAX_BUILD_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const FORBIDDEN_FRAGMENT =
@@ -99,7 +117,9 @@ function safeLog(value: string): string {
 }
 function safeBuildDiagnostic(error: unknown): string {
   const message =
-    error instanceof Error ? error.message : String(error || "Unknown builder error");
+    error instanceof Error
+      ? error.message
+      : String(error || "Unknown builder error");
   // Docker errors can contain multi-line transport details. Keep the useful
   // first line bounded and redact it before it becomes durable metadata.
   return (
@@ -110,9 +130,15 @@ function safeBuildDiagnostic(error: unknown): string {
 function controlledBuildTimeoutMs() {
   const configured = Number(process.env.IMAGE_BUILD_TIMEOUT_MS);
   if (!Number.isFinite(configured)) return DEFAULT_BUILD_TIMEOUT_MS;
-  return Math.min(MAX_BUILD_TIMEOUT_MS, Math.max(MIN_BUILD_TIMEOUT_MS, configured));
+  return Math.min(
+    MAX_BUILD_TIMEOUT_MS,
+    Math.max(MIN_BUILD_TIMEOUT_MS, configured),
+  );
 }
-function withBuildTimeout<T>(promise: Promise<T>, operation: string): Promise<T> {
+function withBuildTimeout<T>(
+  promise: Promise<T>,
+  operation: string,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let settled = false;
     const timeout = setTimeout(() => {
@@ -135,6 +161,45 @@ function withBuildTimeout<T>(promise: Promise<T>, operation: string): Promise<T>
       },
     );
   });
+}
+function withImageDeleteTimeout<T>(promise: Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error("Docker image cleanup timed out"));
+    }, DEFAULT_IMAGE_DELETE_TIMEOUT_MS);
+    promise.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        reject(error);
+      },
+    );
+  });
+}
+function isDockerNotFound(error: unknown) {
+  const candidate = error as {
+    statusCode?: number;
+    status?: number;
+    reason?: string;
+    message?: string;
+  };
+  return (
+    candidate?.statusCode === 404 ||
+    candidate?.status === 404 ||
+    /(?:no such image|image not found)/i.test(
+      `${candidate?.reason || ""} ${candidate?.message || ""}`,
+    )
+  );
 }
 function followDockerProgressBounded(
   docker: Docker,
@@ -167,16 +232,19 @@ export class ImageCatalogManager {
     builds: [],
     userDefaults: {},
     faults: {},
+    deletions: [],
   };
   private initialized?: Promise<void>;
-  private saveChain = Promise.resolve();
+  private mutationChain = Promise.resolve();
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
   private buildStreams = new Map<string, Readable>();
   private definitionBuilds = new Map<string, Promise<void>>();
-  private deletingDefinitions = new Set<string>();
   private buildSettlers = new Map<string, () => void>();
   private docker = new Docker({ socketPath: "/var/run/docker.sock" });
-  constructor(private dataDir: string) {}
+  constructor(
+    private dataDir: string,
+    private readonly stateWriter?: (state: unknown) => Promise<void>,
+  ) {}
 
   init(): Promise<void> {
     return (this.initialized ??= this.load());
@@ -187,31 +255,79 @@ export class ImageCatalogManager {
       this.state = normalizeState(
         JSON.parse(await readFile(this.path(), "utf8")),
       );
-    } catch {
-      /* first boot/corrupt file: empty fail-closed catalog */
+    } catch (error: any) {
+      // A missing file is the only empty-catalog case. Treating a corrupt or
+      // transiently unreadable catalog as empty would let the recovery write
+      // below overwrite the last durable inventory and orphan built images.
+      if (error?.code !== "ENOENT") throw error;
     }
-    for (const build of this.state.builds)
-      if (build.status === "queued" || build.status === "running") {
-        build.status = "failed";
-        build.phase = "failed";
-        build.error = "Build interrupted by orchestrator restart.";
-        build.recovery = "restart-failed-safe";
-        build.completedAt = build.updatedAt = now();
-      }
-    await this.persist();
+    await this.mutate(() => {
+      for (const build of this.state.builds)
+        if (build.status === "queued" || build.status === "running") {
+          build.status = "failed";
+          build.phase = "failed";
+          build.error = "Build interrupted by orchestrator restart.";
+          build.recovery = "restart-failed-safe";
+          build.completedAt = build.updatedAt = now();
+        }
+    });
+    for (const deletion of [...this.state.deletions])
+      await this.finalizeDeletion(deletion.id);
   }
   private path() {
     return join(this.dataDir, "image-catalog.json");
   }
-  private persist() {
-    this.saveChain = this.saveChain.then(async () => {
-      const tmp = `${this.path()}.tmp.${process.pid}`;
-      await writeFile(tmp, JSON.stringify(this.state, null, 2), {
-        mode: 0o600,
-      });
-      await rename(tmp, this.path());
+  private async writeState() {
+    if (this.stateWriter) {
+      await this.stateWriter(structuredClone(this.state));
+      return;
+    }
+    const tmp = `${this.path()}.tmp.${process.pid}`;
+    await writeFile(tmp, JSON.stringify(this.state, null, 2), {
+      mode: 0o600,
     });
-    return this.saveChain;
+    await rename(tmp, this.path());
+  }
+  private mutate<T>(operation: () => Promise<T> | T): Promise<T> {
+    const result = this.mutationChain.then(async () => {
+      const previous = structuredClone(this.state);
+      try {
+        const value = await operation();
+        await this.writeState();
+        return value;
+      } catch (error) {
+        this.restoreState(previous);
+        throw error;
+      }
+    });
+    this.mutationChain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+  private restoreState(previous: State) {
+    const restoreObjects = <T extends { id: string }>(
+      current: T[],
+      saved: T[],
+    ) =>
+      saved.map((value) => {
+        const existing = current.find((candidate) => candidate.id === value.id);
+        if (!existing) return structuredClone(value);
+        for (const key of Object.keys(existing) as Array<keyof T>)
+          delete existing[key];
+        Object.assign(existing, structuredClone(value));
+        return existing;
+      });
+    this.state.definitions = restoreObjects(
+      this.state.definitions,
+      previous.definitions,
+    );
+    this.state.builds = restoreObjects(this.state.builds, previous.builds);
+    this.state.userDefaults = structuredClone(previous.userDefaults);
+    this.state.systemDefault = structuredClone(previous.systemDefault);
+    this.state.faults = structuredClone(previous.faults);
+    this.state.deletions = structuredClone(previous.deletions);
   }
 
   list(ownerId: string, admin: boolean) {
@@ -227,17 +343,27 @@ export class ImageCatalogManager {
       (d) => d.ownerId === ownerId && d.groupId === groupId,
     );
   }
-  listForGroupHierarchy(ownerId: string, visibleGroupIds: Iterable<string>, manageableGroupIds: Iterable<string>) {
+  listForGroupHierarchy(
+    ownerId: string,
+    visibleGroupIds: Iterable<string>,
+    manageableGroupIds: Iterable<string>,
+  ) {
     const visible = new Set(visibleGroupIds);
     const manageable = new Set(manageableGroupIds);
     return this.state.definitions
-      .filter((d) => d.ownerId === ownerId && (!d.groupId || visible.has(d.groupId)))
-      .map((definition) => ({ ...definition, access: {
-        readable: true,
-        usable: true,
-        manageable: !!definition.groupId && manageable.has(definition.groupId),
-        owningGroupId: definition.groupId,
-      }}));
+      .filter(
+        (d) => d.ownerId === ownerId && (!d.groupId || visible.has(d.groupId)),
+      )
+      .map((definition) => ({
+        ...definition,
+        access: {
+          readable: true,
+          usable: true,
+          manageable:
+            !!definition.groupId && manageable.has(definition.groupId),
+          owningGroupId: definition.groupId,
+        },
+      }));
   }
   ownerIds() {
     return [
@@ -247,105 +373,168 @@ export class ImageCatalogManager {
     ];
   }
   async forgetOwner(ownerId: string) {
-    const definitions = this.state.definitions.filter(
-      (definition) => definition.ownerId === ownerId,
-    );
-    const ids = new Set(definitions.map((definition) => definition.id));
-    for (const build of this.state.builds.filter(
+    const deletionIds = await this.mutate(() => {
+      const definitions = this.state.definitions.filter(
+        (definition) => definition.ownerId === ownerId,
+      );
+      const ids = new Set(definitions.map((definition) => definition.id));
+      for (const build of this.state.builds.filter(
+        (candidate) => candidate.ownerId === ownerId,
+      )) {
+        if (build.status === "queued" || build.status === "running") {
+          build.status = "cancelled";
+          build.phase = "cancelled";
+          build.completedAt = build.updatedAt = now();
+        }
+      }
+      delete this.state.userDefaults[ownerId];
+      for (const [userId, value] of Object.entries(this.state.userDefaults))
+        if (ids.has(value.definitionId)) delete this.state.userDefaults[userId];
+      if (
+        this.state.systemDefault &&
+        ids.has(this.state.systemDefault.definitionId)
+      )
+        this.state.systemDefault = undefined;
+      delete this.state.faults[ownerId];
+      const pending: string[] = [];
+      for (const definition of definitions) {
+        const existing = this.definitionDeletion(definition.id);
+        if (existing) {
+          pending.push(existing.id);
+          continue;
+        }
+        const references = [
+          ...definition.versions.map(
+            (version) =>
+              version.artifactTag ||
+              (version.runtimeImage &&
+              !version.runtimeImage.startsWith("ghcr.io/")
+                ? version.runtimeImage
+                : undefined),
+          ),
+          ...this.state.builds
+            .filter((build) => build.definitionId === definition.id)
+            .map((build) => build.artifactTag),
+        ].filter((value): value is string => Boolean(value));
+        const deletion: ImageDeletion = {
+          id: randomUUID(),
+          kind: "definition",
+          definitionId: definition.id,
+          ownerId,
+          references: [...new Set(references)],
+          createdAt: now(),
+        };
+        this.state.deletions.push(deletion);
+        pending.push(deletion.id);
+      }
+      return pending;
+    });
+    const builds = this.state.builds.filter(
       (candidate) => candidate.ownerId === ownerId,
-    )) {
+    );
+    for (const build of builds) {
       const timer = this.timers.get(build.id);
       if (timer) clearTimeout(timer);
       this.timers.delete(build.id);
       this.buildStreams.get(build.id)?.destroy();
       this.buildStreams.delete(build.id);
+      this.buildSettlers.get(build.id)?.();
+      this.buildSettlers.delete(build.id);
     }
     await Promise.all(
-      definitions
-        .flatMap((definition) => definition.versions)
-        .map(
-          (version) =>
-            version.artifactTag ||
-            (version.runtimeImage &&
-            !version.runtimeImage.startsWith("ghcr.io/")
-              ? version.runtimeImage
-              : undefined),
-        )
-        .filter(Boolean)
-        .map((image) =>
-          this.docker
-            .getImage(image!)
-            .remove({ force: true })
-            .catch(() => {}),
-        ),
+      [...new Set(builds.map((build) => build.definitionId))].map((id) =>
+        this.definitionBuilds.get(id)?.catch(() => undefined),
+      ),
     );
-    this.state.definitions = this.state.definitions.filter(
-      (definition) => definition.ownerId !== ownerId,
-    );
-    this.state.builds = this.state.builds.filter(
-      (build) => build.ownerId !== ownerId,
-    );
-    delete this.state.userDefaults[ownerId];
-    for (const [userId, value] of Object.entries(this.state.userDefaults))
-      if (ids.has(value.definitionId)) delete this.state.userDefaults[userId];
-    if (
-      this.state.systemDefault &&
-      ids.has(this.state.systemDefault.definitionId)
-    )
-      this.state.systemDefault = undefined;
-    delete this.state.faults[ownerId];
-    await this.persist();
+    for (const deletionId of deletionIds)
+      await this.finalizeDeletion(deletionId);
+    await this.mutate(() => {
+      this.state.builds = this.state.builds.filter(
+        (build) => build.ownerId !== ownerId,
+      );
+    });
   }
-  definition(id: string, ownerId: string, admin: boolean) {
+  private definitionRecord(id: string, ownerId: string, admin: boolean) {
     const item = this.state.definitions.find((d) => d.id === id);
     if (!item) httpError(404, "Image definition not found");
     if (!admin && item.ownerId !== ownerId) httpError(403, "Forbidden");
     return item;
   }
-  async create(ownerId: string, input: any) {
-    const cleaned = validateDefinition(input);
-    const stamp = now();
-    const item: ImageDefinition = {
-      id: randomUUID(),
-      ownerId,
-      ...cleaned,
-      createdAt: stamp,
-      updatedAt: stamp,
-      versions: [],
-    };
-    this.state.definitions.push(item);
-    await this.persist();
+  private definitionDeletion(id: string) {
+    return this.state.deletions.find(
+      (deletion) =>
+        deletion.kind === "definition" && deletion.definitionId === id,
+    );
+  }
+  private versionDeletion(id: string, version: string) {
+    return this.state.deletions.find(
+      (deletion) =>
+        deletion.kind === "version" &&
+        deletion.definitionId === id &&
+        deletion.version === version,
+    );
+  }
+  private assertDefinitionAvailable(id: string) {
+    if (this.definitionDeletion(id))
+      httpError(409, "Image definition is being deleted");
+  }
+  private assertVersionAvailable(id: string, version: string) {
+    this.assertDefinitionAvailable(id);
+    if (this.versionDeletion(id, version))
+      httpError(409, "Image version is being deleted");
+  }
+  definition(id: string, ownerId: string, admin: boolean) {
+    const item = this.definitionRecord(id, ownerId, admin);
+    this.assertDefinitionAvailable(id);
     return item;
+  }
+  async create(ownerId: string, input: any) {
+    return this.mutate(() => {
+      const cleaned = validateDefinition(input);
+      const stamp = now();
+      const item: ImageDefinition = {
+        id: randomUUID(),
+        ownerId,
+        ...cleaned,
+        createdAt: stamp,
+        updatedAt: stamp,
+        versions: [],
+      };
+      this.state.definitions.push(item);
+      return item;
+    });
   }
   async update(id: string, ownerId: string, admin: boolean, input: any) {
-    const item = this.definition(id, ownerId, admin);
-    if (item.groupId) httpError(404, "Image definition not found");
-    const cleaned = validateDefinition(input);
-    Object.assign(item, cleaned, { updatedAt: now() });
-    await this.persist();
-    return item;
+    return this.mutate(() => {
+      const item = this.definition(id, ownerId, admin);
+      if (item.groupId) httpError(404, "Image definition not found");
+      Object.assign(item, validateDefinition(input), { updatedAt: now() });
+      return item;
+    });
   }
   async createForGroup(ownerId: string, groupId: string, input: any) {
-    const cleaned = validateDefinition(input);
-    const stamp = now();
-    const item: ImageDefinition = {
-      id: randomUUID(),
-      ownerId,
-      groupId,
-      ...cleaned,
-      createdAt: stamp,
-      updatedAt: stamp,
-      versions: [],
-    };
-    this.state.definitions.push(item);
-    await this.persist();
-    return item;
+    return this.mutate(() => {
+      const cleaned = validateDefinition(input);
+      const stamp = now();
+      const item: ImageDefinition = {
+        id: randomUUID(),
+        ownerId,
+        groupId,
+        ...cleaned,
+        createdAt: stamp,
+        updatedAt: stamp,
+        versions: [],
+      };
+      this.state.definitions.push(item);
+      return item;
+    });
   }
   definitionForGroup(id: string, ownerId: string, groupId: string) {
     const item = this.state.definitions.find(
       (d) => d.id === id && d.ownerId === ownerId && d.groupId === groupId,
     );
     if (!item) httpError(404, "Image definition not found");
+    this.assertDefinitionAvailable(id);
     return item;
   }
   async updateForGroup(
@@ -354,14 +543,21 @@ export class ImageCatalogManager {
     groupId: string,
     input: any,
   ) {
-    const item = this.definitionForGroup(id, ownerId, groupId);
-    const cleaned = validateDefinition(input);
-    Object.assign(item, cleaned, { updatedAt: now() });
-    await this.persist();
-    return item;
+    return this.mutate(() => {
+      const item = this.definitionForGroup(id, ownerId, groupId);
+      Object.assign(item, validateDefinition(input), { updatedAt: now() });
+      return item;
+    });
   }
-  async importRecovered(ownerId: string, input: any) {
+  async importRecovered(
+    ownerId: string,
+    input: any,
+    gitRecoveryInput?: ImageDefinition["gitRecovery"],
+  ) {
     const cleaned = validateDefinition(input);
+    const gitRecovery = normalizeGitRecovery(gitRecoveryInput);
+    if (gitRecoveryInput && !gitRecovery)
+      httpError(500, "Git recovery provenance is invalid");
     const versions: ImageVersion[] = (
       Array.isArray(input.versions) ? input.versions : []
     ).map((value: any) => {
@@ -410,77 +606,61 @@ export class ImageCatalogManager {
       updatedAt: stamp,
       versions,
       promotedVersion,
+      ...(gitRecovery ? { gitRecovery } : {}),
     };
-    this.state.definitions.push(item);
-    await this.persist();
-    return item;
+    return this.mutate(() => {
+      this.state.definitions.push(item);
+      return item;
+    });
   }
   validate(input: unknown) {
     return { valid: true, definition: validateDefinition(input) };
   }
   async removeDefinition(id: string, ownerId: string, admin: boolean) {
-    const item = this.definition(id, ownerId, admin);
-    if (
-      this.definitionBuilds.has(id) ||
-      this.state.builds.some(
-        (build) =>
-          build.definitionId === id &&
-          (build.status === "queued" || build.status === "running"),
-      ) ||
-      Object.values(this.state.userDefaults).some(
-        (d) => d.definitionId === id,
-      ) ||
-      this.state.systemDefault?.definitionId === id
-    )
-      httpError(409, "Image definition is referenced");
-    // Close the start/delete interleaving before the first asynchronous
-    // reference check or Docker mutation. startBuild() rejects while this
-    // marker is held, and it is always released if deletion fails.
-    this.deletingDefinitions.add(id);
-    try {
+    const deletion = await this.mutate(async () => {
+      const item = this.definitionRecord(id, ownerId, admin);
+      const pending = this.definitionDeletion(id);
+      if (pending) return pending;
       if (
+        this.definitionBuilds.has(id) ||
+        this.state.builds.some(
+          (build) =>
+            build.definitionId === id &&
+            (build.status === "queued" || build.status === "running"),
+        ) ||
+        Object.values(this.state.userDefaults).some(
+          (value) => value.definitionId === id,
+        ) ||
+        this.state.systemDefault?.definitionId === id ||
         (
           await Promise.all(
             item.versions.map((version) =>
               this.workerUsesVersion(id, version.version),
             ),
           )
-        ).some(Boolean) ||
-        this.definitionBuilds.has(id) ||
-        this.state.builds.some(
-          (build) =>
-            build.definitionId === id &&
-            (build.status === "queued" || build.status === "running"),
-        )
+        ).some(Boolean)
       )
         httpError(409, "Image definition is referenced");
-      await Promise.all(
-        item.versions.map((version) =>
-          version.artifactTag || version.runtimeImage
-            ? this.docker
-                .getImage(version.artifactTag || version.runtimeImage!)
-                .remove({ force: true })
-                .catch(() => {})
-            : Promise.resolve(),
+      const references = [
+        ...item.versions.map(
+          (version) => version.artifactTag || version.runtimeImage,
         ),
-      );
-      await Promise.all(
-        this.state.builds
-          .filter((build) => build.definitionId === id && build.artifactTag)
-          .map((build) =>
-            this.docker.getImage(build.artifactTag!).remove({ force: true }).catch(() => {}),
-          ),
-      );
-      this.state.definitions = this.state.definitions.filter(
-        (d) => d.id !== id,
-      );
-      this.state.builds = this.state.builds.filter(
-        (build) => build.definitionId !== id,
-      );
-      await this.persist();
-    } finally {
-      this.deletingDefinitions.delete(id);
-    }
+        ...this.state.builds
+          .filter((build) => build.definitionId === id)
+          .map((build) => build.artifactTag),
+      ].filter((value): value is string => Boolean(value));
+      const intent: ImageDeletion = {
+        id: randomUUID(),
+        kind: "definition",
+        definitionId: id,
+        ownerId: item.ownerId,
+        references: [...new Set(references)],
+        createdAt: now(),
+      };
+      this.state.deletions.push(intent);
+      return intent;
+    });
+    await this.finalizeDeletion(deletion.id);
   }
 
   async startBuild(
@@ -489,9 +669,6 @@ export class ImageCatalogManager {
     admin: boolean,
     input: any = {},
   ) {
-    if (this.deletingDefinitions.has(id))
-      httpError(409, "Image definition is being deleted");
-    const definition = this.definition(id, ownerId, admin);
     const builder = input.builder ?? "controlled";
     if (builder !== "fake" && builder !== "controlled")
       httpError(400, "Unknown image builder");
@@ -501,31 +678,36 @@ export class ImageCatalogManager {
       process.env.ALLOW_FAKE_IMAGE_BUILDER !== "true"
     )
       httpError(403, "Fake builder is disabled in production");
-    const requestedBase =
-      input.baseImage === undefined
-        ? definition.baseImage
-        : validateBaseImage(input.baseImage);
-    const stamp = now();
-    const build: ImageBuild = {
-      id: randomUUID(),
-      definitionId: id,
-      ownerId: definition.ownerId,
-      groupId: definition.groupId,
-      status: "queued",
-      phase: "queued",
-      createdAt: stamp,
-      updatedAt: stamp,
-      logs: [],
-      builder,
-    };
-    this.state.builds.push(build);
-    await this.persist();
-    const snapshot: ImageDefinition = {
-      ...definition,
-      baseImage: requestedBase,
-      contextFiles: definition.contextFiles.map((file) => ({ ...file })),
-      versions: definition.versions.map((version) => ({ ...version })),
-    };
+    const { build, definition, snapshot } = await this.mutate(() => {
+      if (this.definitionDeletion(id))
+        httpError(409, "Image definition is being deleted");
+      const definition = this.definition(id, ownerId, admin);
+      const requestedBase =
+        input.baseImage === undefined
+          ? definition.baseImage
+          : validateBaseImage(input.baseImage);
+      const stamp = now();
+      const build: ImageBuild = {
+        id: randomUUID(),
+        definitionId: id,
+        ownerId: definition.ownerId,
+        groupId: definition.groupId,
+        status: "queued",
+        phase: "queued",
+        createdAt: stamp,
+        updatedAt: stamp,
+        logs: [],
+        builder,
+      };
+      this.state.builds.push(build);
+      const snapshot: ImageDefinition = {
+        ...definition,
+        baseImage: requestedBase,
+        contextFiles: definition.contextFiles.map((file) => ({ ...file })),
+        versions: definition.versions.map((version) => ({ ...version })),
+      };
+      return { build, definition, snapshot };
+    });
     const previous = this.definitionBuilds.get(id) ?? Promise.resolve();
     const execution = previous
       .catch(() => undefined)
@@ -548,17 +730,21 @@ export class ImageCatalogManager {
     snapshot: ImageDefinition,
   ) {
     const started = Date.now();
+    const pendingProgressLogs: string[] = [];
     const version = `v${definition.versions.length + 1}`;
     const tag = `agentor-custom-${createHash("sha256").update(definition.ownerId).digest("hex").slice(0, 12)}-${definition.id.slice(0, 12)}:${version}-${build.id.slice(0, 8)}`;
     try {
-      build.artifactTag = tag;
-      build.status = "running";
-      build.phase = "validating";
-      build.startedAt = build.updatedAt = now();
-      await this.persist();
+      await this.mutate(() => {
+        build.artifactTag = tag;
+        build.status = "running";
+        build.phase = "validating";
+        build.startedAt = build.updatedAt = now();
+      });
       const configuredBase = resolveControlledBase(snapshot.baseImage);
       const pinnedBase = await this.resolvePinnedBase(configuredBase);
-      build.baseDigest = pinnedBase.digest;
+      await this.mutate(() => {
+        build.baseDigest = pinnedBase.digest;
+      });
       const dockerfile = [
         `FROM ${pinnedBase.reference}`,
         "USER root",
@@ -566,9 +752,10 @@ export class ImageCatalogManager {
         "USER agent",
         "WORKDIR /workspace",
       ].join("\n");
-      build.phase = "building";
-      build.updatedAt = now();
-      await this.persist();
+      await this.mutate(() => {
+        build.phase = "building";
+        build.updatedAt = now();
+      });
       const daemonInfo = await withBuildTimeout(
         this.docker.info(),
         "Docker builder information",
@@ -577,10 +764,11 @@ export class ImageCatalogManager {
       const supportsCpuQuota = daemonInfo.CPUCfsQuota !== false;
       const supportsConfiguredLimits = supportsMemoryLimit && supportsCpuQuota;
       if (!supportsConfiguredLimits) {
-        build.logs.push(
-          "Builder host cannot apply the configured cgroup limits; using the controlled platform boundary without cgroup limits.",
-        );
-        await this.persist();
+        await this.mutate(() => {
+          build.logs.push(
+            "Builder host cannot apply the configured cgroup limits; using the controlled platform boundary without cgroup limits.",
+          );
+        });
       }
       const runBuild = async (resourceLimits: boolean) => {
         // A build context is a one-shot stream. Recreate it for a controlled
@@ -640,11 +828,7 @@ export class ImageCatalogManager {
               const line = safeLog(
                 String(event?.stream || event?.status || "").trim(),
               );
-              if (line) {
-                build.logs.push(line);
-                if (build.logs.length > 2000)
-                  build.logs.splice(0, build.logs.length - 2000);
-              }
+              if (line) pendingProgressLogs.push(line);
             },
           );
         });
@@ -660,18 +844,27 @@ export class ImageCatalogManager {
         if (!/cannot enter cgroupv2|cgroup configuration/i.test(String(error)))
           throw error;
         await this.removeControlledArtifact(tag);
-        build.logs.push(
-          "Builder host cannot apply legacy cgroup limits; retrying with platform defaults.",
-        );
+        await this.mutate(() => {
+          build.logs.push(...pendingProgressLogs.splice(0));
+          build.logs.push(
+            "Builder host cannot apply legacy cgroup limits; retrying with platform defaults.",
+          );
+          if (build.logs.length > 2000)
+            build.logs.splice(0, build.logs.length - 2000);
+        });
         await runBuild(false);
       }
       if ((build.status as ImageBuildStatus) === "cancelled") {
         await this.removeControlledArtifact(tag);
         return;
       }
-      build.phase = "recording-digest";
-      build.updatedAt = now();
-      await this.persist();
+      await this.mutate(() => {
+        build.logs.push(...pendingProgressLogs.splice(0));
+        if (build.logs.length > 2000)
+          build.logs.splice(0, build.logs.length - 2000);
+        build.phase = "recording-digest";
+        build.updatedAt = now();
+      });
       const image = await withBuildTimeout(
         this.docker.getImage(tag).inspect(),
         "Built image inspection",
@@ -682,28 +875,32 @@ export class ImageCatalogManager {
             .update(image.Id || tag)
             .digest("hex")}`;
       const stamp = now();
-      definition.versions.push({
-        version,
-        digest,
-        runtimeImage: digest,
-        artifactTag: tag,
-        baseImage: snapshot.baseImage,
-        baseDigest: pinnedBase.digest,
-        createdAt: stamp,
+      await this.mutate(() => {
+        definition.versions.push({
+          version,
+          digest,
+          runtimeImage: digest,
+          artifactTag: tag,
+          baseImage: snapshot.baseImage,
+          baseDigest: pinnedBase.digest,
+          createdAt: stamp,
+        });
+        definition.baseImage = snapshot.baseImage;
+        definition.updatedAt = stamp;
+        Object.assign(build, {
+          status: "succeeded",
+          phase: "complete",
+          digest,
+          version,
+          completedAt: stamp,
+          updatedAt: stamp,
+          durationMs: Date.now() - started,
+          cache: {
+            enabled: true,
+            hits: definition.versions.length > 1 ? 1 : 0,
+          },
+        });
       });
-      definition.baseImage = snapshot.baseImage;
-      definition.updatedAt = stamp;
-      Object.assign(build, {
-        status: "succeeded",
-        phase: "complete",
-        digest,
-        version,
-        completedAt: stamp,
-        updatedAt: stamp,
-        durationMs: Date.now() - started,
-        cache: { enabled: true, hits: definition.versions.length > 1 ? 1 : 0 },
-      });
-      await this.persist();
     } catch (error) {
       await this.removeControlledArtifact(tag);
       if (build.status !== "cancelled") {
@@ -711,15 +908,26 @@ export class ImageCatalogManager {
         // approved-base alias) emit no progress event. Preserve a sanitized
         // diagnostic so this cannot look like an empty Dockerfile failure.
         const diagnostic = safeBuildDiagnostic(error);
-        build.logs.push(`[builder] ${diagnostic}`);
-        if (build.logs.length > 2000)
-          build.logs.splice(0, build.logs.length - 2000);
-        build.status = "failed";
-        build.phase = "failed";
-        build.error = `Controlled image build failed: ${diagnostic}`;
-        build.completedAt = build.updatedAt = now();
-        build.durationMs = Date.now() - started;
-        await this.persist();
+        const terminalize = () => {
+          build.logs.push(...pendingProgressLogs.splice(0));
+          build.logs.push(`[builder] ${diagnostic}`);
+          if (build.logs.length > 2000)
+            build.logs.splice(0, build.logs.length - 2000);
+          build.status = "failed";
+          build.phase = "failed";
+          build.error = `Controlled image build failed: ${diagnostic}`;
+          build.completedAt = build.updatedAt = now();
+          build.durationMs = Date.now() - started;
+        };
+        try {
+          await this.mutate(terminalize);
+        } catch {
+          // Persistence can fail while recording the terminal state. Never
+          // leave the live execution running or the per-definition queue
+          // wedged; restart recovery will fail the last durable running record.
+          terminalize();
+          build.recovery = "persistence-failed-safe";
+        }
       }
     } finally {
       this.buildStreams.delete(build.id);
@@ -777,85 +985,134 @@ export class ImageCatalogManager {
     let index = 0;
     const started = Date.now();
     return new Promise<void>((resolve) => {
-      this.buildSettlers.set(build.id, resolve);
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        const timer = this.timers.get(build.id);
+        if (timer) clearTimeout(timer);
+        this.timers.delete(build.id);
+        this.buildSettlers.delete(build.id);
+        resolve();
+      };
+      const terminalize = async (error: unknown) => {
+        try {
+          await this.mutate(() => {
+            if (build.status === "cancelled") return;
+            const stamp = now();
+            build.status = "failed";
+            build.phase = "failed";
+            build.error = "Controlled image build failed.";
+            build.logs.push(
+              safeLog(error instanceof Error ? error.message : String(error)),
+            );
+            build.completedAt = build.updatedAt = stamp;
+            build.durationMs = Date.now() - started;
+          });
+        } catch {
+          // The state writer may remain unavailable. The execution still has
+          // to unwind so cancellation/deletion cannot wait forever; the last
+          // durable queued/running record is failed safely during restart.
+          if (build.status !== "cancelled") {
+            const stamp = now();
+            build.status = "failed";
+            build.phase = "failed";
+            build.error = "Controlled image build failed.";
+            build.recovery = "persistence-failed-safe";
+            build.completedAt = build.updatedAt = stamp;
+            build.durationMs = Date.now() - started;
+          }
+        } finally {
+          finish();
+        }
+      };
+      const schedule = (delay: number) => {
+        this.timers.set(
+          build.id,
+          setTimeout(() => void step().catch(terminalize), delay),
+        );
+      };
+      this.buildSettlers.set(build.id, finish);
       const step = async () => {
         if (["cancelled", "failed"].includes(build.status)) {
-          this.buildSettlers.delete(build.id);
-          resolve();
+          finish();
           return;
         }
         if (input.fakePauseUntilRestart) {
-          build.status = "running";
-          build.phase = "building";
-          build.updatedAt = now();
-          await this.persist();
-          this.timers.set(
-            build.id,
-            setTimeout(() => void step(), 100),
-          );
+          await this.mutate(() => {
+            build.status = "running";
+            build.phase = "building";
+            build.updatedAt = now();
+          });
+          schedule(100);
           return;
         }
         const phase = phases[index++];
-        build.status = "running";
-        build.phase = phase!;
-        build.startedAt ||= now();
-        build.updatedAt = now();
-        build.logs.push(safeLog(`[fake-builder] ${phase}`));
         const fault = this.state.faults[build.ownerId];
-        if (fault?.failPhase === phase) {
-          const failureMessage = fault?.message;
-          delete this.state.faults[build.ownerId];
-          build.status = "failed";
-          build.phase = "failed";
-          build.error = "Controlled image build failed.";
-          build.logs.push(safeLog(failureMessage || "failure"));
-          build.completedAt = build.updatedAt = now();
-          build.durationMs = Date.now() - started;
-          await this.persist();
-          this.buildSettlers.delete(build.id);
-          resolve();
+        if (fault && fault.failPhase === phase) {
+          const failureMessage = fault.message;
+          await this.mutate(() => {
+            build.status = "running";
+            build.phase = phase!;
+            build.startedAt ||= now();
+            build.updatedAt = now();
+            build.logs.push(safeLog(`[fake-builder] ${phase}`));
+            delete this.state.faults[build.ownerId];
+            build.status = "failed";
+            build.phase = "failed";
+            build.error = "Controlled image build failed.";
+            build.logs.push(safeLog(failureMessage || "failure"));
+            build.completedAt = build.updatedAt = now();
+            build.durationMs = Date.now() - started;
+          });
+          finish();
           return;
         }
         if (index < phases.length) {
-          await this.persist();
-          this.timers.set(
-            build.id,
-            setTimeout(() => void step(), duration / phases.length),
-          );
+          await this.mutate(() => {
+            build.status = "running";
+            build.phase = phase!;
+            build.startedAt ||= now();
+            build.updatedAt = now();
+            build.logs.push(safeLog(`[fake-builder] ${phase}`));
+          });
+          schedule(duration / phases.length);
           return;
         }
         const digest = `sha256:${createHash("sha256").update(`${definition.id}:${snapshot.baseImage}:${snapshot.dockerfileFragment}:${now()}`).digest("hex")}`;
         const version = `v${definition.versions.length + 1}`;
         const stamp = now();
-        definition.versions.push({
-          version,
-          digest,
-          baseImage: snapshot.baseImage,
-          createdAt: stamp,
+        await this.mutate(() => {
+          build.status = "running";
+          build.phase = phase!;
+          build.startedAt ||= now();
+          build.updatedAt = now();
+          build.logs.push(safeLog(`[fake-builder] ${phase}`));
+          definition.versions.push({
+            version,
+            digest,
+            baseImage: snapshot.baseImage,
+            createdAt: stamp,
+          });
+          definition.baseImage = snapshot.baseImage;
+          definition.updatedAt = stamp;
+          Object.assign(build, {
+            status: "succeeded",
+            phase: "complete",
+            digest,
+            version,
+            completedAt: stamp,
+            updatedAt: stamp,
+            durationMs: Date.now() - started,
+            cache: {
+              enabled: true,
+              hits: definition.versions.length > 1 ? 1 : 0,
+            },
+          });
         });
-        definition.baseImage = snapshot.baseImage;
-        definition.updatedAt = stamp;
-        Object.assign(build, {
-          status: "succeeded",
-          phase: "complete",
-          digest,
-          version,
-          completedAt: stamp,
-          updatedAt: stamp,
-          durationMs: Date.now() - started,
-          cache: {
-            enabled: true,
-            hits: definition.versions.length > 1 ? 1 : 0,
-          },
-        });
-        await this.persist();
-        this.buildSettlers.delete(build.id);
-        resolve();
+        finish();
       };
-      this.timers.set(
-        build.id,
-        setTimeout(() => void step(), 0),
-      );
+      schedule(0);
     });
   }
   build(id: string, ownerId: string, admin: boolean) {
@@ -875,14 +1132,17 @@ export class ImageCatalogManager {
     return build;
   }
   async cancelBuild(id: string, ownerId: string, admin: boolean) {
-    const b = this.build(id, ownerId, admin);
-    if (!["queued", "running"].includes(b.status)) return publicBuild(b);
-    clearTimeout(this.timers.get(id));
-    this.buildStreams.get(id)?.destroy();
-    b.status = "cancelled";
-    b.phase = "cancelled";
-    b.completedAt = b.updatedAt = now();
-    await this.persist();
+    const b = await this.mutate(() => {
+      const build = this.build(id, ownerId, admin);
+      if (!["queued", "running"].includes(build.status)) return build;
+      clearTimeout(this.timers.get(id));
+      this.buildStreams.get(id)?.destroy();
+      build.status = "cancelled";
+      build.phase = "cancelled";
+      build.completedAt = build.updatedAt = now();
+      return build;
+    });
+    if (!["cancelled"].includes(b.status)) return publicBuild(b);
     this.buildSettlers.get(id)?.();
     this.buildSettlers.delete(id);
     // Cancellation is not complete until the underlying fake timer or Docker
@@ -909,12 +1169,14 @@ export class ImageCatalogManager {
   }
 
   async promote(id: string, version: string, ownerId: string, admin: boolean) {
-    const d = this.definition(id, ownerId, admin);
-    const v = findVersion(d, version);
-    d.promotedVersion = version;
-    for (const item of d.versions) item.promoted = item.version === version;
-    await this.persist();
-    return { promotedVersion: version, promotedDigest: v.digest };
+    return this.mutate(() => {
+      const d = this.definition(id, ownerId, admin);
+      this.assertVersionAvailable(id, version);
+      const v = findVersion(d, version);
+      d.promotedVersion = version;
+      for (const item of d.versions) item.promoted = item.version === version;
+      return { promotedVersion: version, promotedDigest: v.digest };
+    });
   }
   async rollback(id: string, version: string, ownerId: string, admin: boolean) {
     return this.promote(id, version, ownerId, admin);
@@ -925,50 +1187,65 @@ export class ImageCatalogManager {
     ownerId: string,
     admin: boolean,
   ) {
-    const d = this.definition(id, ownerId, admin);
-    findVersion(d, version);
-    if (
-      d.promotedVersion === version ||
-      Object.values(this.state.userDefaults).some(
-        (x) => x.definitionId === id && x.version === version,
-      ) ||
-      (this.state.systemDefault?.definitionId === id &&
-        this.state.systemDefault.version === version) ||
-      (await this.workerUsesVersion(id, version))
-    )
-      httpError(409, "Image version is referenced");
-    const removed = findVersion(d, version);
-    if (removed.artifactTag || removed.runtimeImage)
-      await this.docker
-        .getImage(removed.artifactTag || removed.runtimeImage!)
-        .remove({ force: true })
-        .catch(() => {});
-    d.versions = d.versions.filter((v) => v.version !== version);
-    await this.persist();
+    const deletion = await this.mutate(async () => {
+      const d = this.definitionRecord(id, ownerId, admin);
+      this.assertDefinitionAvailable(id);
+      const pending = this.versionDeletion(id, version);
+      if (pending) return pending;
+      const removed = findVersion(d, version);
+      if (
+        d.promotedVersion === version ||
+        Object.values(this.state.userDefaults).some(
+          (value) => value.definitionId === id && value.version === version,
+        ) ||
+        (this.state.systemDefault?.definitionId === id &&
+          this.state.systemDefault.version === version) ||
+        (await this.workerUsesVersion(id, version))
+      )
+        httpError(409, "Image version is referenced");
+      const reference = removed.artifactTag || removed.runtimeImage;
+      const intent: ImageDeletion = {
+        id: randomUUID(),
+        kind: "version",
+        definitionId: id,
+        ownerId: d.ownerId,
+        version,
+        references: reference ? [reference] : [],
+        createdAt: now(),
+      };
+      this.state.deletions.push(intent);
+      return intent;
+    });
+    await this.finalizeDeletion(deletion.id);
   }
   version(id: string, version: string, ownerId: string, admin: boolean) {
+    this.assertVersionAvailable(id, version);
     return findVersion(this.definition(id, ownerId, admin), version);
   }
 
   async setUserDefault(ownerId: string, definitionId: string, version: string) {
-    const d = this.definition(definitionId, ownerId, false);
-    if (d.groupId) httpError(404, "Image definition not found");
-    const v = findVersion(d, version);
-    this.state.userDefaults[ownerId] = { definitionId, version };
-    await this.persist();
-    return { source: "user", definitionId, version, digest: v.digest };
+    return this.mutate(() => {
+      const d = this.definition(definitionId, ownerId, false);
+      if (d.groupId) httpError(404, "Image definition not found");
+      this.assertVersionAvailable(definitionId, version);
+      const v = findVersion(d, version);
+      this.state.userDefaults[ownerId] = { definitionId, version };
+      return { source: "user", definitionId, version, digest: v.digest };
+    });
   }
   async setSystemDefault(
     definitionId: string,
     version: string,
     ownerId: string,
   ) {
-    const d = this.definition(definitionId, ownerId, true);
-    if (d.groupId) httpError(404, "Image definition not found");
-    const v = findVersion(d, version);
-    this.state.systemDefault = { definitionId, version };
-    await this.persist();
-    return { source: "system", definitionId, version, digest: v.digest };
+    return this.mutate(() => {
+      const d = this.definition(definitionId, ownerId, true);
+      if (d.groupId) httpError(404, "Image definition not found");
+      this.assertVersionAvailable(definitionId, version);
+      const v = findVersion(d, version);
+      this.state.systemDefault = { definitionId, version };
+      return { source: "system", definitionId, version, digest: v.digest };
+    });
   }
   effectiveDefault(ownerId: string) {
     const value = this.state.userDefaults[ownerId] ?? this.state.systemDefault;
@@ -1004,10 +1281,9 @@ export class ImageCatalogManager {
       ownerId,
       systemSelection,
     );
-    const built = findVersion(
-      definition,
-      selectedVersion || definition.promotedVersion || "",
-    );
+    const resolvedVersion = selectedVersion || definition.promotedVersion || "";
+    this.assertVersionAvailable(definition.id, resolvedVersion);
+    const built = findVersion(definition, resolvedVersion);
     if (built.recovered && !built.runtimeImage)
       httpError(
         409,
@@ -1034,12 +1310,15 @@ export class ImageCatalogManager {
         (!candidate.groupId || candidate.groupId === groupId),
     );
     if (!definition) httpError(404, "Image definition not found");
-    const built = findVersion(
-      definition,
-      version || definition.promotedVersion || "",
-    );
+    this.assertDefinitionAvailable(definition.id);
+    const resolvedVersion = version || definition.promotedVersion || "";
+    this.assertVersionAvailable(definition.id, resolvedVersion);
+    const built = findVersion(definition, resolvedVersion);
     if (built.recovered && !built.runtimeImage)
-      httpError(409, "Recovered image metadata has no runnable immutable reference");
+      httpError(
+        409,
+        "Recovered image metadata has no runnable immutable reference",
+      );
     return {
       definitionId: definition.id,
       version: built.version,
@@ -1047,37 +1326,61 @@ export class ImageCatalogManager {
       runtimeImage: built.runtimeImage,
     };
   }
-  resolveSelectionForGroupHierarchy(ownerId: string, allowedGroupIds: Iterable<string>, definitionId?: string, version?: string) {
+  resolveSelectionForGroupHierarchy(
+    ownerId: string,
+    allowedGroupIds: Iterable<string>,
+    definitionId?: string,
+    version?: string,
+  ) {
     if (!definitionId) return this.resolveSelection(ownerId);
     const allowed = new Set(allowedGroupIds);
-    const definition = this.state.definitions.find((candidate) => candidate.id === definitionId && candidate.ownerId === ownerId && (!candidate.groupId || allowed.has(candidate.groupId)));
+    const definition = this.state.definitions.find(
+      (candidate) =>
+        candidate.id === definitionId &&
+        candidate.ownerId === ownerId &&
+        (!candidate.groupId || allowed.has(candidate.groupId)),
+    );
     if (!definition) httpError(404, "Image definition not found");
-    const built = findVersion(definition, version || definition.promotedVersion || "");
-    if (built.recovered && !built.runtimeImage) httpError(409, "Recovered image metadata has no runnable immutable reference");
-    return { definitionId: definition.id, version: built.version, digest: built.digest, runtimeImage: built.runtimeImage };
+    this.assertDefinitionAvailable(definition.id);
+    const resolvedVersion = version || definition.promotedVersion || "";
+    this.assertVersionAvailable(definition.id, resolvedVersion);
+    const built = findVersion(definition, resolvedVersion);
+    if (built.recovered && !built.runtimeImage)
+      httpError(
+        409,
+        "Recovered image metadata has no runnable immutable reference",
+      );
+    return {
+      definitionId: definition.id,
+      version: built.version,
+      digest: built.digest,
+      runtimeImage: built.runtimeImage,
+    };
   }
   async setFault(ownerId: string, fault: any) {
-    this.state.faults[ownerId] = {
-      failPhase: String(fault.failPhase || ""),
-      message: safeLog(String(fault.message || "")),
-    };
-    await this.persist();
-    return { configured: true };
+    return this.mutate(() => {
+      this.state.faults[ownerId] = {
+        failPhase: String(fault.failPhase || ""),
+        message: safeLog(String(fault.message || "")),
+      };
+      return { configured: true };
+    });
   }
   async simulateRestart() {
-    for (const b of this.state.builds)
-      if (b.status === "queued" || b.status === "running") {
-        clearTimeout(this.timers.get(b.id));
-        b.status = "failed";
-        b.phase = "failed";
-        b.error = "Build interrupted by orchestrator restart.";
-        b.recovery = "restart-failed-safe";
-        b.completedAt = b.updatedAt = now();
-        this.buildSettlers.get(b.id)?.();
-        this.buildSettlers.delete(b.id);
-      }
-    await this.persist();
-    return { recovered: true };
+    return this.mutate(() => {
+      for (const b of this.state.builds)
+        if (b.status === "queued" || b.status === "running") {
+          clearTimeout(this.timers.get(b.id));
+          b.status = "failed";
+          b.phase = "failed";
+          b.error = "Build interrupted by orchestrator restart.";
+          b.recovery = "restart-failed-safe";
+          b.completedAt = b.updatedAt = now();
+          this.buildSettlers.get(b.id)?.();
+          this.buildSettlers.delete(b.id);
+        }
+      return { recovered: true };
+    });
   }
   async usage(ownerId: string, admin: boolean) {
     const visible = this.list(ownerId, admin);
@@ -1114,41 +1417,55 @@ export class ImageCatalogManager {
     };
   }
   async cleanup(ownerId: string, admin: boolean, input: any = {}) {
-    const visible = this.list(ownerId, admin);
-    const visibleIds = new Set(visible.map((definition) => definition.id));
-    let partialArtifactsRemoved = 0,
-      bytesReclaimed = 0,
-      unusedVersionsRemoved = 0;
+    let partialArtifactsRemoved = 0;
+    let bytesReclaimed = 0;
+    let unusedVersionsRemoved = 0;
     if (input.failedBuilds)
-      for (const build of this.state.builds) {
+      await this.mutate(async () => {
+        const visible = this.list(ownerId, admin);
+        const visibleIds = new Set(visible.map((definition) => definition.id));
+        for (const build of this.state.builds) {
+          if (
+            !visibleIds.has(build.definitionId) ||
+            !["failed", "cancelled"].includes(build.status) ||
+            !build.artifactTag
+          )
+            continue;
+          bytesReclaimed += await this.imageSize(build.artifactTag);
+          if (await this.removeImage(build.artifactTag))
+            partialArtifactsRemoved++;
+          build.artifactTag = undefined;
+        }
+      });
+    if (input.unusedArtifacts) {
+      const candidates = this.list(ownerId, admin).flatMap((definition) =>
+        definition.versions.map((version) => ({
+          definitionId: definition.id,
+          ownerId: definition.ownerId,
+          version: version.version,
+          reference: version.artifactTag || version.runtimeImage,
+        })),
+      );
+      for (const candidate of candidates) {
         if (
-          !visibleIds.has(build.definitionId) ||
-          !["failed", "cancelled"].includes(build.status) ||
-          !build.artifactTag
+          this.definitionDeletion(candidate.definitionId) ||
+          this.versionDeletion(candidate.definitionId, candidate.version) ||
+          (await this.versionReferenced(
+            candidate.definitionId,
+            candidate.version,
+          ))
         )
           continue;
-        bytesReclaimed += await this.imageSize(build.artifactTag);
-        if (await this.removeImage(build.artifactTag))
-          partialArtifactsRemoved++;
-        build.artifactTag = undefined;
+        bytesReclaimed += await this.imageSize(candidate.reference);
+        await this.deleteVersion(
+          candidate.definitionId,
+          candidate.version,
+          candidate.ownerId,
+          admin,
+        );
+        unusedVersionsRemoved++;
       }
-    if (input.unusedArtifacts)
-      for (const definition of visible) {
-        const retained: ImageVersion[] = [];
-        for (const version of definition.versions) {
-          if (await this.versionReferenced(definition.id, version.version)) {
-            retained.push(version);
-            continue;
-          }
-          bytesReclaimed += await this.imageSize(
-            version.artifactTag || version.runtimeImage,
-          );
-          await this.removeImage(version.artifactTag || version.runtimeImage);
-          unusedVersionsRemoved++;
-        }
-        definition.versions = retained;
-      }
-    await this.persist();
+    }
     return { partialArtifactsRemoved, unusedVersionsRemoved, bytesReclaimed };
   }
   diagnostics() {
@@ -1162,6 +1479,48 @@ export class ImageCatalogManager {
       cancellation:
         "best-effort Docker build-stream abort followed by artifact cleanup",
     };
+  }
+
+  private async finalizeDeletion(id: string) {
+    const deletion = this.state.deletions.find((item) => item.id === id);
+    if (!deletion) return;
+    for (const reference of deletion.references) {
+      try {
+        await withImageDeleteTimeout(
+          this.docker.getImage(reference).remove({ force: true }),
+        );
+      } catch (error) {
+        if (isDockerNotFound(error)) continue;
+        const failure = new Error("Docker image cleanup failed") as Error & {
+          statusCode?: number;
+        };
+        failure.statusCode = 502;
+        throw failure;
+      }
+    }
+    await this.mutate(() => {
+      const current = this.state.deletions.find((item) => item.id === id);
+      if (!current) return;
+      if (current.kind === "definition") {
+        this.state.definitions = this.state.definitions.filter(
+          (definition) => definition.id !== current.definitionId,
+        );
+        this.state.builds = this.state.builds.filter(
+          (build) => build.definitionId !== current.definitionId,
+        );
+      } else {
+        const definition = this.state.definitions.find(
+          (item) => item.id === current.definitionId,
+        );
+        if (definition)
+          definition.versions = definition.versions.filter(
+            (version) => version.version !== current.version,
+          );
+      }
+      this.state.deletions = this.state.deletions.filter(
+        (item) => item.id !== id,
+      );
+    });
   }
 
   private async versionReferenced(definitionId: string, version: string) {
@@ -1193,7 +1552,11 @@ export class ImageCatalogManager {
     if (!reference) return 0;
     try {
       return Number(
-        (await this.docker.getImage(reference).inspect()).Size || 0,
+        (
+          await withImageDeleteTimeout(
+            this.docker.getImage(reference).inspect(),
+          )
+        ).Size || 0,
       );
     } catch {
       return 0;
@@ -1202,7 +1565,9 @@ export class ImageCatalogManager {
   private async removeImage(reference?: string) {
     if (!reference) return false;
     try {
-      await this.docker.getImage(reference).remove({ force: true });
+      await withImageDeleteTimeout(
+        this.docker.getImage(reference).remove({ force: true }),
+      );
       return true;
     } catch {
       return false;
@@ -1250,11 +1615,13 @@ function normalizeState(value: any): State {
           contextFiles: Array.isArray(item.contextFiles)
             ? item.contextFiles
             : [],
+          gitRecovery: normalizeGitRecovery(item.gitRecovery),
         }))
     : [];
+  const builds = Array.isArray(value?.builds) ? value.builds : [];
   return {
     definitions,
-    builds: Array.isArray(value?.builds) ? value.builds : [],
+    builds,
     userDefaults:
       value?.userDefaults && typeof value.userDefaults === "object"
         ? value.userDefaults
@@ -1262,7 +1629,86 @@ function normalizeState(value: any): State {
     systemDefault: value?.systemDefault,
     faults:
       value?.faults && typeof value.faults === "object" ? value.faults : {},
+    deletions: normalizeDeletions(value?.deletions, definitions, builds),
   };
+}
+function normalizeDeletions(
+  value: unknown,
+  definitions: ImageDefinition[],
+  builds: ImageBuild[],
+): ImageDeletion[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item): ImageDeletion => {
+    if (!item || typeof item !== "object")
+      throw new Error("Image deletion journal is invalid");
+    const candidate = item as Record<string, unknown>;
+    const id = String(candidate.id || "");
+    const definitionId = String(candidate.definitionId || "");
+    const ownerId = String(candidate.ownerId || "");
+    const kind = candidate.kind;
+    const version =
+      candidate.version === undefined ? undefined : String(candidate.version);
+    if (
+      !/^[0-9a-f-]{36}$/i.test(id) ||
+      !ownerId ||
+      (kind !== "definition" && kind !== "version") ||
+      (kind === "version" && !version) ||
+      !Number.isFinite(Date.parse(String(candidate.createdAt)))
+    )
+      throw new Error("Image deletion journal is invalid");
+    const definition = definitions.find((entry) => entry.id === definitionId);
+    if (!definition || definition.ownerId !== ownerId)
+      throw new Error("Image deletion journal is invalid");
+    const allowedReferences = new Set(
+      kind === "definition"
+        ? [
+            ...definition.versions.map(
+              (entry) => entry.artifactTag || entry.runtimeImage,
+            ),
+            ...builds
+              .filter((entry) => entry.definitionId === definitionId)
+              .map((entry) => entry.artifactTag),
+          ].filter((entry): entry is string => Boolean(entry))
+        : [
+            definition.versions.find((entry) => entry.version === version)
+              ?.artifactTag ||
+              definition.versions.find((entry) => entry.version === version)
+                ?.runtimeImage,
+          ].filter((entry): entry is string => Boolean(entry)),
+    );
+    const references = Array.isArray(candidate.references)
+      ? [...new Set(candidate.references.map(String).filter(Boolean))]
+      : [];
+    if (references.some((reference) => !allowedReferences.has(reference)))
+      throw new Error("Image deletion journal is invalid");
+    return {
+      id,
+      kind,
+      definitionId,
+      ownerId,
+      ...(version ? { version } : {}),
+      references,
+      createdAt: new Date(String(candidate.createdAt)).toISOString(),
+    };
+  });
+}
+function normalizeGitRecovery(
+  value: unknown,
+): ImageDefinition["gitRecovery"] | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = value as Record<string, unknown>,
+    connectionId = String(candidate.connectionId || ""),
+    remoteId = String(candidate.remoteId || ""),
+    hash = String(candidate.hash || "").toLowerCase();
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      connectionId,
+    ) ||
+    !/^[a-zA-Z0-9._-]{1,100}$/.test(remoteId) ||
+    !/^[0-9a-f]{64}$/.test(hash)
+  )
+    return undefined;
+  return { connectionId, remoteId, hash };
 }
 function validateDefinition(input: any) {
   if (!input || typeof input !== "object")
@@ -1275,7 +1721,10 @@ function validateDefinition(input: any) {
     dockerfileFragment.length > 256 * 1024 ||
     FORBIDDEN_FRAGMENT.test(dockerfileFragment)
   )
-    httpError(400, "Dockerfile fragment violates build policy: safe package downloads with apt, pip, npm, or similar tools are allowed; do not include FROM, USER, ENTRYPOINT, CMD, ENV/ARG secrets, EXPOSE, VOLUME, remote ADD, curl|sh, wget|sh, Docker socket mounts, or privilege changes");
+    httpError(
+      400,
+      "Dockerfile fragment violates build policy: safe package downloads with apt, pip, npm, or similar tools are allowed; do not include FROM, USER, ENTRYPOINT, CMD, ENV/ARG secrets, EXPOSE, VOLUME, remote ADD, curl|sh, wget|sh, Docker socket mounts, or privilege changes",
+    );
   if (!Array.isArray(input.contextFiles))
     httpError(400, "contextFiles must be an array");
   const seen = new Set<string>();

@@ -12,6 +12,7 @@ import {
   useConfig,
   useContainerManager,
   useExportJobManager,
+  useLogger,
   useManagedNetworkStore,
   useWorkerGroupStore,
   useWorkerStore,
@@ -49,6 +50,7 @@ import { useWorkerProtectionLockStore } from "./worker-protection-lock";
 import { validateManagementOwnerArguments } from "./management-owner";
 import type { Readable } from "node:stream";
 import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
+import { withOwnerWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
 
 const GROUPS = [
   "read-only-status",
@@ -239,6 +241,15 @@ const GROUP_ADMIN_CONSOLE_SESSION_TOOLS = new Set([
   "console.interrupt",
   "console.close",
 ]);
+const GROUP_ADMIN_DIRECT_SCOPE_BOUNDARY_TOOLS = new Set([
+  ...GROUP_ADMIN_DIRECT_TARGET_TOOLS,
+  ...GROUP_ADMIN_EXPORT_JOB_TOOLS,
+  ...GROUP_ADMIN_BACKUP_JOB_TOOLS,
+  ...GROUP_ADMIN_CONSOLE_SESSION_TOOLS,
+  // Network mutations already own the queue. Inspection does not, so it uses
+  // the same direct-resource boundary without introducing reentrancy.
+  "networks.inspect",
+]);
 
 // Tool discovery is an allowlist, and target resolution is a second,
 // exhaustive allowlist. A newly delegated tool cannot silently become
@@ -364,22 +375,27 @@ for (const tool of globalConfigurationDomain.tools())
   TOOL_GROUP[tool.name] = tool.group as Group;
 for (const tool of importDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 const sensitive =
-  /secret|token|credential|password|authorization|cookie|cipher|key/i;
-function clean(value: unknown, depth = 0): any {
+  /secret|token|credential|password|authorization|cookie|cipher|key|providerUploadId|pendingProvider(?:Object|Artifact|Upload)Id/i;
+export function cleanManagementAuditDetails(value: unknown, depth = 0): any {
   if (depth > 5) return "[REDACTED]";
   if (typeof value === "string")
     return value.length > 128 ? "[REDACTED]" : value;
   if (Array.isArray(value))
-    return value.slice(0, 50).map((v) => clean(v, depth + 1));
+    return value
+      .slice(0, 50)
+      .map((v) => cleanManagementAuditDetails(v, depth + 1));
   if (value && typeof value === "object")
     return Object.fromEntries(
       Object.entries(value as any).map(([k, v]) => [
         k,
-        sensitive.test(k) ? "[REDACTED]" : clean(v, depth + 1),
+        sensitive.test(k)
+          ? "[REDACTED]"
+          : cleanManagementAuditDetails(v, depth + 1),
       ]),
     );
   return value;
 }
+const clean = cleanManagementAuditDetails;
 function initialPolicy(): Policy {
   return {
     schemaVersion: 1,
@@ -402,6 +418,96 @@ function initialPolicy(): Policy {
   };
 }
 
+function appendAudit(
+  state: State,
+  action: string,
+  outcome: string,
+  details?: Record<string, unknown>,
+) {
+  state.audit.push({
+    id: randomUUID(),
+    at: new Date().toISOString(),
+    action,
+    outcome,
+    details: clean(details),
+  });
+  if (state.audit.length > 5000)
+    state.audit.splice(0, state.audit.length - 5000);
+}
+
+export interface ManagementConfigurationApplyDependencies {
+  getLogLevel(): ReturnType<typeof useConfig>["logLevel"];
+  setLogLevel(value: ReturnType<typeof useConfig>["logLevel"]): void;
+  verifyWorkerVariables(workerId: string, lockPassword: unknown): Promise<void>;
+  applyWorkerVariables(
+    workerId: string,
+    variables: Array<{ key: string; value: string }>,
+    lockPassword: unknown,
+  ): Promise<{ workerId: string }>;
+}
+
+function productionConfigurationApplyDependencies(): ManagementConfigurationApplyDependencies {
+  return {
+    getLogLevel: () => useConfig().logLevel,
+    setLogLevel: (value) => {
+      useConfig().logLevel = value;
+    },
+    verifyWorkerVariables: async (workerId, lockPassword) => {
+      const containers = useContainerManager();
+      const workers = useWorkerStore();
+      const snapshot = containers.get(workerId) ?? workers.findById(workerId);
+      if (!snapshot)
+        throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
+      await withOwnerWorkerLifecycleMutation(snapshot.userId, workerId, async () => {
+        const live = containers.get(workerId);
+        const stored = workers.get(snapshot.userId, workerId);
+        if ((!live && !stored) || (live && live.userId !== snapshot.userId))
+          throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
+        await useWorkerProtectionLockStore().verify(workerId, lockPassword);
+      });
+    },
+    applyWorkerVariables: async (workerId, variables, lockPassword) => {
+      const containers = useContainerManager();
+      const workers = useWorkerStore();
+      const snapshot = containers.get(workerId) ?? workers.findById(workerId);
+      if (!snapshot)
+        throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
+      return withOwnerWorkerLifecycleMutation(snapshot.userId, workerId, async () => {
+        const live = containers.get(workerId);
+        const stored = workers.get(snapshot.userId, workerId);
+        if ((!live && !stored) || (live && live.userId !== snapshot.userId))
+          throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
+        if (!stored)
+          throw Object.assign(new Error("Worker metadata is unavailable"), {
+            statusCode: 409,
+          });
+        await useWorkerProtectionLockStore().verify(workerId, lockPassword);
+        // The desired variables assignment and rebuild marker are idempotent.
+        // A durable approved proposal therefore remains safely retryable if a
+        // crash or a later store write interrupts this cross-store sequence.
+        await useWorkerConfigStore().patch(snapshot.userId, workerId, {
+          variables,
+        });
+        let persisted;
+        try {
+          persisted = await workers.markPendingRebuild(snapshot.userId, workerId);
+          if (!persisted) throw new Error("Worker not found");
+        } catch (error) {
+          throw Object.assign(
+            new Error("Worker rebuild state could not be committed"),
+            { configurationEffectMayHaveApplied: true, cause: error },
+          );
+        }
+        if (live) {
+          live.pendingRebuild = true;
+          live.updatedAt = persisted.updatedAt;
+        }
+        return { workerId };
+      });
+    },
+  };
+}
+
 export class ManagementMcpStore {
   private state: State = {
     schemaVersion: 1,
@@ -413,7 +519,12 @@ export class ManagementMcpStore {
   private path: string;
   private loading?: Promise<void>;
   private writes = Promise.resolve();
-  constructor(dataDir = process.env.DATA_DIR || "/data") {
+  private mutations = Promise.resolve();
+  constructor(
+    dataDir = process.env.DATA_DIR || "/data",
+    private readonly stateWriter?: (state: unknown) => Promise<void>,
+    private readonly configurationApply = productionConfigurationApplyDependencies(),
+  ) {
     this.path = join(dataDir, "admin", "management-mcp.v1.json");
   }
   async init() {
@@ -432,16 +543,35 @@ export class ManagementMcpStore {
       })();
     return this.loading;
   }
-  private persist() {
-    this.writes = this.writes.then(async () => {
+  private persistState(state: State) {
+    const next = this.writes.then(async () => {
+      if (this.stateWriter) {
+        await this.stateWriter(structuredClone(state));
+        return;
+      }
       await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
       const tmp = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
-      await writeFile(tmp, `${JSON.stringify(this.state, null, 2)}\n`, {
+      await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, {
         mode: 0o600,
       });
       await rename(tmp, this.path);
     });
-    return this.writes;
+    this.writes = next.then(() => undefined, () => undefined);
+    return next;
+  }
+  private persist() {
+    return this.persistState(structuredClone(this.state));
+  }
+  private mutate<T>(operation: (draft: State) => T): Promise<T> {
+    const result = this.mutations.then(async () => {
+      const draft = structuredClone(this.state);
+      const value = operation(draft);
+      await this.persistState(draft);
+      this.state = draft;
+      return value;
+    });
+    this.mutations = result.then(() => undefined, () => undefined);
+    return result;
   }
   async getPolicy() {
     await this.init();
@@ -546,12 +676,15 @@ export class ManagementMcpStore {
     for (const [name, value] of Object.entries(groups || {})) {
       if (!GROUPS.includes(name as Group) || typeof value !== "boolean")
         throw new Error(`Unknown or invalid policy group: ${name}`);
-      this.state.policy.groups[name as Group].enabled = value;
     }
-    this.state.policy.revision++;
-    this.state.policy.updatedAt = new Date().toISOString();
-    await this.audit("policy.changed", "success", { actor, groups });
-    return this.getPolicy();
+    return this.mutate((state) => {
+      for (const [name, value] of Object.entries(groups || {}))
+        state.policy.groups[name as Group].enabled = value as boolean;
+      state.policy.revision++;
+      state.policy.updatedAt = new Date().toISOString();
+      appendAudit(state, "policy.changed", "success", { actor, groups });
+      return structuredClone(state.policy);
+    });
   }
   async issue(workspaceId: string, ttlSeconds = 60) {
     this.pruneExpiredIdentities();
@@ -639,7 +772,7 @@ export class ManagementMcpStore {
     };
   }
   async auditAuthorizationFailure(operation: string) {
-    await this.audit("authorization.denied", "failure", {
+    await this.auditSafely("authorization.denied", "failure", {
       operation,
       reason: "identity",
     });
@@ -654,10 +787,10 @@ export class ManagementMcpStore {
     try {
       identity = await this.introspect(credential);
     } catch (e) {
-      await this.audit("authorization.denied", "failure", {
+      await this.auditSafely("authorization.denied", "failure", {
         reason: "identity",
       });
-      await this.audit("tool.invoked", "failure", {
+      await this.auditSafely("tool.invoked", "failure", {
         tool: name,
         reason: "identity",
       });
@@ -669,7 +802,7 @@ export class ManagementMcpStore {
       // decision is cached in an identity or MCP session.
       const group = TOOL_GROUP[name];
       if (!group || !this.state.policy.groups[group]?.enabled) {
-        await this.audit("authorization.denied", "failure", {
+        await this.auditSafely("authorization.denied", "failure", {
           workspaceId: identity.workspaceId,
           tool: name,
         });
@@ -720,78 +853,26 @@ export class ManagementMcpStore {
           diff: patch,
           createdAt: new Date().toISOString(),
         };
-        this.state.proposals.push(proposal);
-        await this.persist();
-        result = proposal;
-      } else if (name === "configuration.apply") {
-        const p = this.state.proposals.find((x) => x.id === args.proposalId);
-        if (!p)
-          throw Object.assign(new Error("Proposal not found"), {
-            statusCode: 404,
-          });
-        if (p.status === "applied")
-          throw Object.assign(new Error("Proposal already applied"), {
-            statusCode: 409,
-          });
-        // Dashboard review remains available as a useful optional workflow,
-        // but an authorized harness may apply its own immutable proposal
-        // directly. Confirmation belongs to the harness; Agentor's actual
-        // boundaries are workload identity and the live capability policy.
-        const patch = p.diff as any;
-        let appliedTarget: Record<string, unknown>;
-        if (typeof patch.logLevel === "string") {
-          useConfig().logLevel = patch.logLevel;
-          this.state.appliedConfiguration = {
-            ...this.state.appliedConfiguration,
-            logLevel: patch.logLevel,
-          };
-          appliedTarget = { setting: "logLevel" };
-        } else {
-          const worker =
-            useContainerManager().get(patch.workerId) ??
-            useWorkerStore().findById(patch.workerId);
-          if (!worker)
-            throw Object.assign(new Error("Worker not found"), {
-              statusCode: 404,
-            });
-          await useWorkerProtectionLockStore().verify(
-            worker.id,
-            args.lockPassword,
-          );
-          await useWorkerConfigStore().patch(worker.userId, worker.id, {
-            variables: patch.variables,
-          });
-          worker.pendingRebuild = true;
-          const stored = useWorkerStore().findById(worker.id);
-          if (stored) {
-            stored.pendingRebuild = true;
-            stored.updatedAt = new Date().toISOString();
-            await useWorkerStore().upsert(stored);
-          }
-          appliedTarget = { workerId: worker.id };
-        }
-        p.status = "applied";
-        if (!p.approvedAt) p.approvedAt = new Date().toISOString();
-        p.appliedAt = new Date().toISOString();
-        await this.audit("proposal.applied", "success", {
-          proposalId: p.id,
-          ...appliedTarget,
+        result = await this.mutate((state) => {
+          state.proposals.push(proposal);
+          return structuredClone(proposal);
         });
-        result = {
-          id: p.id,
-          status: p.status,
-          applied: true,
-          pendingRebuild: true,
-        };
+      } else if (name === "configuration.apply") {
+        result = await this.applyConfigurationProposal(args);
       } else {
-        result = await this.executeTool(
-          name,
-          args,
-          identity.workspaceId,
-          identity,
-        );
+        const execute = () =>
+          this.executeTool(name, args, identity.workspaceId, identity);
+        result =
+          identity.scope === "group" &&
+          GROUP_ADMIN_DIRECT_SCOPE_BOUNDARY_TOOLS.has(name)
+            ? await withGroupScopeAuthorizationBoundary(
+                identity.ownerId!,
+                () => this.authorizeGroupInvocation(identity, name, args),
+                execute,
+              )
+            : await execute();
       }
-      await this.audit("tool.invoked", "success", {
+      await this.auditSafely("tool.invoked", "success", {
         workspaceId: identity.workspaceId,
         tool: name,
         group,
@@ -799,7 +880,7 @@ export class ManagementMcpStore {
       });
       return result;
     } catch (error: any) {
-      await this.audit("tool.invoked", "failure", {
+      await this.auditSafely("tool.invoked", "failure", {
         workspaceId: identity.workspaceId,
         tool: name,
         group: TOOL_GROUP[name],
@@ -809,6 +890,144 @@ export class ManagementMcpStore {
           : 500,
       });
       throw error;
+    }
+  }
+  private async applyConfigurationProposal(args: Record<string, unknown>) {
+    const proposalId = typeof args.proposalId === "string" ? args.proposalId : "";
+    const stored = this.state.proposals.find((candidate) => candidate.id === proposalId);
+    if (!stored)
+      throw Object.assign(new Error("Proposal not found"), { statusCode: 404 });
+    if (stored.status === "applied")
+      throw Object.assign(new Error("Proposal already applied"), {
+        statusCode: 409,
+      });
+
+    const requestedPatch = stored.diff as {
+      logLevel?: ReturnType<typeof useConfig>["logLevel"];
+      workerId?: string;
+      variables?: Array<{ key: string; value: string }>;
+    };
+    // Protection locks are authorization, not an application side effect. Do
+    // this preflight before converting a pending proposal into durable intent;
+    // the fenced execution below verifies again immediately before mutation.
+    if (!requestedPatch.logLevel)
+      await this.configurationApply.verifyWorkerVariables(
+        requestedPatch.workerId!,
+        args.lockPassword,
+      );
+
+    // Direct harness application is still permitted, but approval becomes the
+    // durable intent record before another store or live configuration is
+    // touched. A rejected intent write has no side effect; once it commits,
+    // the exact immutable assignment is safe to retry after any later failure.
+    const proposal = stored.status === "pending-dashboard-approval"
+      ? await this.mutate((state) => {
+          const current = state.proposals.find(
+            (candidate) => candidate.id === proposalId,
+          );
+          if (!current)
+            throw Object.assign(new Error("Proposal not found"), {
+              statusCode: 404,
+            });
+          if (current.status === "applied")
+            throw Object.assign(new Error("Proposal already applied"), {
+              statusCode: 409,
+            });
+          if (current.status === "pending-dashboard-approval") {
+            current.status = "approved";
+            current.approvedAt = new Date().toISOString();
+          }
+          return structuredClone(current);
+        })
+      : structuredClone(stored);
+
+    const patch = proposal.diff as {
+      logLevel?: ReturnType<typeof useConfig>["logLevel"];
+      workerId?: string;
+      variables?: Array<{ key: string; value: string }>;
+    };
+    let previousLogLevel: ReturnType<typeof useConfig>["logLevel"] | undefined;
+    let appliedTarget: Record<string, unknown>;
+    let workerEffectCompleted = false;
+    try {
+      if (patch.logLevel) {
+        previousLogLevel = this.configurationApply.getLogLevel();
+        this.configurationApply.setLogLevel(patch.logLevel);
+        appliedTarget = { setting: "logLevel" };
+      } else {
+        const applied = await this.configurationApply.applyWorkerVariables(
+          patch.workerId!,
+          patch.variables!,
+          args.lockPassword,
+        );
+        appliedTarget = applied;
+        workerEffectCompleted = true;
+      }
+
+      return await this.mutate((state) => {
+        const current = state.proposals.find(
+          (candidate) => candidate.id === proposal.id,
+        );
+        if (!current || current.status === "applied")
+          throw Object.assign(new Error("Proposal already applied"), {
+            statusCode: 409,
+          });
+        if (patch.logLevel)
+          state.appliedConfiguration = {
+            ...state.appliedConfiguration,
+            logLevel: patch.logLevel,
+          };
+        current.status = "applied";
+        current.approvedAt ??= new Date().toISOString();
+        current.appliedAt = new Date().toISOString();
+        appendAudit(state, "proposal.applied", "success", {
+          proposalId: current.id,
+          ...appliedTarget,
+        });
+        return {
+          id: current.id,
+          status: current.status,
+          applied: true,
+          pendingRebuild: patch.logLevel ? false : true,
+        };
+      });
+    } catch (error) {
+      if (patch.logLevel && previousLogLevel !== undefined)
+        this.configurationApply.setLogLevel(previousLogLevel);
+      // The proposal remains durably approved. Worker-variable application is
+      // an exact replacement plus an idempotent rebuild marker, so retrying the
+      // same immutable proposal completes rather than duplicating a mutation.
+      if (!patch.logLevel &&
+          (workerEffectCompleted || (error as any)?.configurationEffectMayHaveApplied === true) &&
+          this.state.proposals.some(
+        (candidate) => candidate.id === proposal.id && candidate.status === "approved",
+      ))
+        throw Object.assign(
+          new Error("Configuration application is incomplete; retry the same proposal"),
+          {
+            statusCode: 503,
+            code: "CONFIGURATION_APPLICATION_RETRY_REQUIRED",
+            cause: error,
+          },
+        );
+      throw error;
+    }
+  }
+
+  private async auditSafely(
+    action: string,
+    outcome: string,
+    details?: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      await this.audit(action, outcome, details);
+    } catch (error) {
+      // Audit durability is important operationally, but it is not the commit
+      // point of the already completed management operation. Returning an
+      // error here would invite a retry of a non-idempotent mutation.
+      useLogger().error(
+        `[management-mcp] audit persistence failed after ${action}: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
   async uploadImport(
@@ -836,12 +1055,12 @@ export class ManagementMcpStore {
         source,
         declaredLength,
       );
-      await this.audit("import.uploaded", "success", {
+      await this.auditSafely("import.uploaded", "success", {
         workspaceId: identity.workspaceId,
       });
       return result;
     } catch (error: any) {
-      await this.audit("import.uploaded", "failure", {
+      await this.auditSafely("import.uploaded", "failure", {
         workspaceId: identity.workspaceId,
         statusCode: error?.statusCode || 500,
       });
@@ -898,12 +1117,12 @@ export class ManagementMcpStore {
           }
         },
       );
-      await this.audit("download.opened", "success", {
+      await this.auditSafely("download.opened", "success", {
         ...opened.audit,
       });
       return opened;
     } catch (error: any) {
-      await this.audit("download.opened", "failure", {
+      await this.auditSafely("download.opened", "failure", {
         workspaceId: identity.workspaceId,
         statusCode: Number.isInteger(error?.statusCode)
           ? error.statusCode
@@ -916,7 +1135,7 @@ export class ManagementMcpStore {
     audit: OpenedManagementDownload["audit"],
     outcome: "success" | "failure",
   ) {
-    await this.audit("download.transferred", outcome, audit);
+    await this.auditSafely("download.transferred", outcome, audit);
   }
   private async executeTool(
     name: string,
@@ -980,7 +1199,10 @@ export class ManagementMcpStore {
     }
     if (identity?.scope === "group" && GROUP_ADMIN_IMAGE_TOOLS.has(name))
       return this.executeGroupImageTool(identity, name, args);
-    if (identity?.scope === "group" && (name === "groups.update" || name === "groups.create" || name === "groups.delete" || name === "groups.env.list" || name === "groups.env.update")) {
+    if (
+      identity?.scope === "group" &&
+      (name === "groups.create" || GROUP_ADMIN_GROUP_TOOLS.has(name))
+    ) {
       const ownerId = identity.ownerId!;
       const authorityGroupId = identity.groupId!;
       const targetGroupId = name === "groups.create" ? undefined : String(args.groupId);
@@ -994,8 +1216,11 @@ export class ManagementMcpStore {
           throw groupResourceNotFound();
       };
     }
-    if (identity?.scope === "group" && GROUP_ADMIN_NETWORK_TOOLS.has(name) &&
-        !["networks.list", "networks.inspect"].includes(name)) {
+    if (
+      identity?.scope === "group" &&
+      (name === "networks.create" ||
+        (GROUP_ADMIN_NETWORK_TOOLS.has(name) && name !== "networks.inspect"))
+    ) {
       const ownerId = identity.ownerId!;
       const authorityGroupId = identity.groupId!;
       args.__scopeAuthorize = () => {
@@ -1500,17 +1725,19 @@ export class ManagementMcpStore {
   }
   async approve(id: string, actor: string) {
     await this.init();
-    const p = this.state.proposals.find((x) => x.id === id);
-    if (!p)
-      throw Object.assign(new Error("Proposal not found"), { statusCode: 404 });
-    if (p.status !== "pending-dashboard-approval")
-      throw Object.assign(new Error("Proposal is not pending"), {
-        statusCode: 409,
-      });
-    p.status = "approved";
-    p.approvedAt = new Date().toISOString();
-    await this.audit("proposal.approved", "success", { proposalId: id, actor });
-    return structuredClone(p);
+    return this.mutate((state) => {
+      const p = state.proposals.find((x) => x.id === id);
+      if (!p)
+        throw Object.assign(new Error("Proposal not found"), { statusCode: 404 });
+      if (p.status !== "pending-dashboard-approval")
+        throw Object.assign(new Error("Proposal is not pending"), {
+          statusCode: 409,
+        });
+      p.status = "approved";
+      p.approvedAt = new Date().toISOString();
+      appendAudit(state, "proposal.approved", "success", { proposalId: id, actor });
+      return structuredClone(p);
+    });
   }
   async immutableUpdate(id: string) {
     await this.init();
@@ -1532,20 +1759,15 @@ export class ManagementMcpStore {
     details?: Record<string, unknown>,
   ) {
     await this.init();
-    this.state.audit.push({
-      id: randomUUID(),
-      at: new Date().toISOString(),
-      action,
-      outcome,
-      details: clean(details),
+    await this.mutate((state) => {
+      appendAudit(state, action, outcome, details);
     });
-    if (this.state.audit.length > 5000)
-      this.state.audit.splice(0, this.state.audit.length - 5000);
-    await this.persist();
   }
   async listAudit(limit = 100) {
     await this.init();
-    return this.state.audit.slice(-Math.max(1, Math.min(500, limit))).reverse();
+    return structuredClone(
+      this.state.audit.slice(-Math.max(1, Math.min(500, limit))).reverse(),
+    );
   }
 }
 let singleton: ManagementMcpStore | undefined;
@@ -1564,6 +1786,20 @@ function groupResourceNotFound() {
  * settled. Exported for deterministic queue-boundary regression coverage. */
 export function withGroupImageMutationBoundary<T>(ownerId:string,operation:()=>Promise<T>):Promise<T>{
   return withWorkerNetworkMutation(ownerId,operation);
+}
+/** Direct worker/resource operations share the hierarchy mutation queue and
+ * re-authorize only after all earlier reparenting or membership changes have
+ * settled. Group/image/network mutation paths are deliberately excluded
+ * because their domain managers already acquire this non-reentrant queue. */
+export function withGroupScopeAuthorizationBoundary<T>(
+  ownerId: string,
+  authorize: () => void | Promise<void>,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return withWorkerNetworkMutation(ownerId, async () => {
+    await authorize();
+    return operation();
+  });
 }
 function groupWorkerCreateInputSchema() {
   return {

@@ -22,13 +22,14 @@ const formattedDate = computed(() => {
       <h3 class="text-xs font-medium text-gray-500 dark:text-gray-400 truncate" :title="worker.displayName || shortName(worker.id)">
         {{ worker.displayName || shortName(worker.id) }}
       </h3>
-      <p class="text-[10px] text-gray-400 dark:text-gray-600 leading-tight">{{ formattedDate }}</p>
+      <p v-if="worker.deletionPending" class="text-[10px] text-amber-600 dark:text-amber-400 leading-tight">Cleanup pending</p>
+      <p v-else class="text-[10px] text-gray-400 dark:text-gray-600 leading-tight">{{ formattedDate }}</p>
     </div>
     <div class="flex items-center gap-1 shrink-0">
       <UTooltip text="Unarchive">
-        <UButton size="xs" color="primary" variant="subtle" icon="i-lucide-archive-restore" @click="emit('unarchive', worker.id)" />
+        <UButton size="xs" color="primary" variant="subtle" icon="i-lucide-archive-restore" :disabled="worker.deletionPending" @click="emit('unarchive', worker.id)" />
       </UTooltip>
-      <UTooltip text="Delete">
+      <UTooltip :text="worker.deletionPending ? 'Retry cleanup' : 'Delete'">
         <UButton size="xs" color="error" variant="subtle" icon="i-lucide-trash-2" @click="emit('delete', worker.id)" />
       </UTooltip>
     </div>

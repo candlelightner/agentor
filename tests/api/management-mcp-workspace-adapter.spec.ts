@@ -9,13 +9,16 @@ test('workspace MCP adapter declares private streaming download, clone, and dura
 });
 
 test('group-admin lifecycle tools declare bounded deadlines and return a timeout instead of hanging', async () => {
-  const tools = new ManagementWorkerDomain().tools().filter(tool => tool.name.startsWith('groups.admin-workspace.'));
-  expect(tools.map(tool => tool.name)).toEqual([
+  const lifecycleToolNames = [
     'groups.admin-workspace.get',
     'groups.admin-workspace.provision',
     'groups.admin-workspace.start',
     'groups.admin-workspace.stop',
     'groups.admin-workspace.rebuild',
+  ];
+  const tools = new ManagementWorkerDomain().tools().filter(tool => lifecycleToolNames.includes(tool.name));
+  expect(tools.map(tool => tool.name)).toEqual([
+    ...lifecycleToolNames,
   ]);
   for (const tool of tools) {
     expect(tool.inputSchema).toMatchObject({ required: ['groupId'], properties: { groupId: { type: 'string' }, timeoutSeconds: { type: 'integer', minimum: 1, maximum: 300 } } });

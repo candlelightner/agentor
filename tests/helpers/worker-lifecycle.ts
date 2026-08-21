@@ -88,8 +88,9 @@ export async function cleanupWorker(
 ): Promise<void> {
   const api = new ApiClient(request);
   try {
+    // The stop endpoint resolves only after Docker has stopped the container;
+    // removal is force-capable as well, so no fixed settling delay is needed.
     await api.stopContainer(containerId);
-    await new Promise(r => setTimeout(r, 500));
   } catch {
     // Already stopped
   }

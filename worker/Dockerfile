@@ -1,5 +1,9 @@
 FROM ubuntu:24.04
 
+# Every download pipeline must fail when its producer fails; plain /bin/sh
+# otherwise reports only the final consumer's exit code.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Basic packages + desktop dependencies
@@ -95,20 +99,14 @@ RUN install -d -m 0755 /etc/apt/keyrings && \
     apt-get update && apt-get install -y --no-install-recommends firefox && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# microsocks (SOCKS5 proxy)
-RUN apt-get update && apt-get install -y --no-install-recommends microsocks && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# OpenSSH server (public-key auth only, launched by the `ssh` app)
-RUN apt-get update && apt-get install -y --no-install-recommends openssh-server && \
+# Runtime services: SOCKS5 proxy, OpenSSH, and the DNS/network firewall.
+# Install them together so cold builds need only one apt index transaction.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      microsocks openssh-server dnsmasq ipset iptables && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     mkdir -p /run/sshd /etc/ssh/sshd_config.d && \
     printf 'Port 22\nPermitRootLogin no\nPasswordAuthentication no\nChallengeResponseAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nStrictModes no\nAllowUsers agent\nAuthorizedKeysFile /home/agent/.ssh/authorized_keys\nUsePAM no\nX11Forwarding yes\nPrintMotd no\nAcceptEnv LANG LC_*\n' > /etc/ssh/sshd_config.d/10-agentor.conf && \
-    systemctl disable ssh.service 2>/dev/null || true
-
-# Network firewall: dnsmasq (DNS filtering + ipset integration) + ipset + iptables
-RUN apt-get update && apt-get install -y --no-install-recommends dnsmasq ipset iptables && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    (systemctl disable ssh.service 2>/dev/null || true)
 
 # Docker Engine (for Docker-in-Docker support, opt-in per environment)
 RUN curl -fsSL https://get.docker.com | sh && \
@@ -157,6 +155,39 @@ RUN userdel -r ubuntu 2>/dev/null || true && \
 RUN printf 'Xft.dpi: 96\nXft.antialias: true\nXft.hinting: true\nXft.hintstyle: hintslight\nXft.rgba: rgb\nXft.lcdfilter: lcddefault\n' > /home/agent/.Xresources && \
     chown agent:agent /home/agent/.Xresources
 
+RUN mkdir -p /workspace /home/agent/pids /home/agent/profiles /home/agent/.ssh && \
+    chown -R agent:agent /workspace /home/agent/pids /home/agent/profiles /home/agent/.ssh && \
+    chmod 700 /home/agent/.ssh
+
+EXPOSE 6080 8443
+
+USER agent
+
+# Kilo Code (pinned Open VSX extension, installed into code-server's image-level
+# extension directory as the runtime user)
+ARG KILO_CODE_VERSION=7.4.16
+RUN code-server --extensions-dir /home/agent/.local/share/code-server/extensions \
+    --install-extension "kilocode.kilo-code@${KILO_CODE_VERSION}" && \
+    code-server --extensions-dir /home/agent/.local/share/code-server/extensions \
+    --list-extensions --show-versions | grep -Fx "kilocode.kilo-code@${KILO_CODE_VERSION}"
+
+# Agent CLI target versions are pinned so a cache miss does not silently install
+# whichever "latest" happens to be current. The vendor-hosted Claude installer
+# remains an upstream mutable bootstrap (as before); its explicit version target
+# and the npm package versions still make the installed CLI baseline deliberate.
+# Runtime self-updates continue to work; bump these args when refreshing it.
+ARG CLAUDE_CODE_VERSION=2.1.233
+RUN curl -fsSL https://claude.ai/install.sh | bash -s -- "${CLAUDE_CODE_VERSION}"
+ARG CODEX_VERSION=0.147.0
+ARG GEMINI_CLI_VERSION=0.55.1
+RUN npm config set prefix ~/.local && npm install -g \
+      "@openai/codex@${CODEX_VERSION}" \
+      "@google/gemini-cli@${GEMINI_CLI_VERSION}"
+ENV PATH="/home/agent/.local/bin:${PATH}"
+
+# Keep frequently edited worker sources after the expensive extension/CLI
+# installs. A script-only change can now reuse those network-heavy layers.
+USER root
 COPY --chmod=755 entrypoint.sh /home/agent/entrypoint.sh
 COPY --chmod=755 loading-screen.sh /home/agent/loading-screen.sh
 COPY --chmod=755 memfd-exec.py /home/agent/memfd-exec.py
@@ -185,31 +216,11 @@ RUN set -e && \
     grep -q 'agentor-clipboard.js' /usr/share/novnc/agentor.html && \
     grep -q '</body>' /usr/share/novnc/agentor.html
 
-RUN mkdir -p /workspace /home/agent/pids /home/agent/profiles /home/agent/.ssh && \
-    chown -R agent:agent /workspace /home/agent/pids /home/agent/profiles /home/agent/.ssh && \
-    chmod 700 /home/agent/.ssh
-
-EXPOSE 6080 8443
-
-USER agent
-
-# Kilo Code (pinned Open VSX extension, installed into code-server's image-level
-# extension directory as the runtime user)
-ARG KILO_CODE_VERSION=7.4.16
-RUN code-server --extensions-dir /home/agent/.local/share/code-server/extensions \
-    --install-extension "kilocode.kilo-code@${KILO_CODE_VERSION}" && \
-    code-server --extensions-dir /home/agent/.local/share/code-server/extensions \
-    --list-extensions --show-versions | grep -Fx "kilocode.kilo-code@${KILO_CODE_VERSION}"
-
-# Agent CLIs (installed as agent user so auto-updates work)
-RUN curl -fsSL https://claude.ai/install.sh | bash
-RUN npm config set prefix ~/.local && npm install -g @openai/codex @google/gemini-cli
-ENV PATH="/home/agent/.local/bin:${PATH}"
-
 # Agent setup/start scripts
 COPY --chown=agent:agent agents/ /home/agent/agents/
 RUN chmod +x /home/agent/agents/*/setup.sh
 
+USER agent
 WORKDIR /workspace
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=120s CMD tmux has-session 2>/dev/null || exit 1

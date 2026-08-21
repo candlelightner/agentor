@@ -128,6 +128,19 @@ test("a double-click submits only one image build", async ({ page }) => {
   await modal.getByRole("button", { name: "Build", exact: true }).first().dblclick();
   await expect.poll(() => requests).toBe(1);
 });
+test("creating a test worker submits exactly one request", async ({ page }) => {
+  let requests = 0;
+  page.on("request", (request) => {
+    if (
+      request.method() === "POST" &&
+      request.url().includes("/test-worker")
+    )
+      requests++;
+  });
+  const modal = await open(page);
+  await modal.getByRole("button", { name: "Create test worker" }).first().click();
+  await expect.poll(() => requests).toBe(1);
+});
 test("discovers builds and versions created externally while open", async ({ page }) => {
   let buildPosts = 0;
   let buildPolls = 0;

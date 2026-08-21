@@ -382,8 +382,13 @@ export class StorageManager {
     try {
       const volume = this.docker.getVolume(volumeName);
       await volume.remove();
-    } catch {
-      // Volume may not exist — ignore
+    } catch (error) {
+      // Absence is idempotent success. Propagate daemon, permission, and
+      // in-use failures so rollback callers can report incomplete cleanup;
+      // ordinary deletion paths already log and continue explicitly.
+      const status = (error as { statusCode?: number; status?: number })
+        ?.statusCode ?? (error as { status?: number })?.status;
+      if (status !== 404) throw error;
     }
   }
 

@@ -225,9 +225,37 @@ fi
 # Phase 5: run playwright tests
 # ---------------------------------------------------------------------------
 cd /work/tests
-if [ ! -d node_modules ]; then
+DEPENDENCY_MARKER="node_modules/.agentor-dependencies.sha256"
+DEPENDENCY_KEY=$(
+    {
+        sha256sum package.json package-lock.json
+        node --version
+        npm --version
+        uname -m
+        printf '%s\n' "${AGENTOR_TEST_RUNNER_BASE_VERSION:-unknown-runner}"
+    } | sha256sum | awk '{print $1}'
+)
+INSTALLED_DEPENDENCY_KEY=$(cat "$DEPENDENCY_MARKER" 2>/dev/null || true)
+
+# The tests directory is bind-mounted, so node_modules normally survives
+# runner invocations. Reuse it only when both manifests, the Node ABI/arch, and
+# the Playwright runner base are unchanged. npm ci intentionally has no
+# `npm install` fallback: a package/lock mismatch must fail reproducibly rather
+# than mutate the bind-mounted lockfile and bless an unreviewed dependency set.
+if [ ! -d node_modules ] || [ ! -x node_modules/.bin/playwright ] || [ "$DEPENDENCY_KEY" != "$INSTALLED_DEPENDENCY_KEY" ]; then
     log "Installing test dependencies..."
-    npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+    npm ci --no-audit --no-fund
+    printf '%s\n' "$DEPENDENCY_KEY" > "$DEPENDENCY_MARKER"
+fi
+
+INSTALLED_PLAYWRIGHT_VERSION=$(node -p "require('@playwright/test/package.json').version")
+RUNNER_PLAYWRIGHT_VERSION=$(
+    printf '%s\n' "${AGENTOR_TEST_RUNNER_BASE_VERSION:-}" |
+        sed -E 's/^v//; s/-.*$//'
+)
+if [ -z "$RUNNER_PLAYWRIGHT_VERSION" ] || [ "$INSTALLED_PLAYWRIGHT_VERSION" != "$RUNNER_PLAYWRIGHT_VERSION" ]; then
+    err "Playwright package ${INSTALLED_PLAYWRIGHT_VERSION} does not match runner browsers ${RUNNER_PLAYWRIGHT_VERSION:-unknown}."
+    exit 1
 fi
 
 log "Running playwright tests: $*"

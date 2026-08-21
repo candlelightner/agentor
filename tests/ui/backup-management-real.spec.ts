@@ -84,11 +84,13 @@ test("real browser configures fake provider, backs up, and starts restore", asyn
       .poll(
         async () => {
           const workers = await (await request.get("/api/containers")).json();
-          restoredWorkerId =
-            workers.find(
-              (candidate: any) => candidate.displayName === restoreName,
-            )?.id || "";
-          return Boolean(restoredWorkerId);
+          const restoredWorker = workers.find(
+            (candidate: any) => candidate.displayName === restoreName,
+          );
+          if (!restoredWorker || restoredWorker.status !== "running")
+            return false;
+          restoredWorkerId = restoredWorker.id;
+          return true;
         },
         { timeout: 120_000 },
       )

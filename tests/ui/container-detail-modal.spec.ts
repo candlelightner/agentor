@@ -109,8 +109,8 @@ test.describe.serial('Worker Settings Modal', () => {
   test('fields are tagged no-rebuild vs requires-rebuild', async ({ page }) => {
     const dialog = await openModal(page);
     await expect(dialog.getByText('no rebuild needed', { exact: true })).toBeVisible();
-    // environment, repos, mounts, init script each carry a "requires rebuild" tag
-    await expect(dialog.getByText('requires rebuild')).toHaveCount(4);
+    // environment, inherited env exclusions, repos, mounts, and init script require a rebuild
+    await expect(dialog.getByText('requires rebuild')).toHaveCount(5);
   });
 
   test('display name field is pre-filled with the current label', async ({ page }) => {

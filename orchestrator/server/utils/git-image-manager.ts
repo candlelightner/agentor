@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { getUserById } from "./auth";
 import type { ImageCatalogManager, ImageDefinition } from "./image-catalog";
 import {
   decryptGitImageCredential,
@@ -24,7 +25,9 @@ import {
   GitImageStore,
   type GitImageConnection,
   type GitImageLink,
+  type GitImageRecovery,
 } from "./git-image-store";
+import { withOwnerLifecycleMutation } from "./worker-lifecycle-coordinator";
 
 function fail(statusCode: number, message: string): never {
   throw Object.assign(new Error(message), { statusCode });
@@ -47,6 +50,51 @@ function parseCatalog(files: GitFileMap) {
     if (error?.statusCode) throw error;
     fail(400, "Remote image catalog failed validation");
   }
+}
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value))
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  if (value && typeof value === "object")
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+      .join(",")}}`;
+  return JSON.stringify(value) ?? "null";
+}
+function canonicalCatalogFile(path: string, value: string) {
+  if (path !== ".agentor/image-catalog.v1.json") return value;
+  const manifest = JSON.parse(value);
+  // generatedAt is intentionally nondeterministic and does not describe
+  // catalog content. Every other field remains part of reconciliation.
+  delete manifest.generatedAt;
+  return canonicalJson(manifest);
+}
+function equivalentCatalogFiles(left: GitFileMap, right: GitFileMap) {
+  const leftKeys = Object.keys(left).sort();
+  const rightKeys = Object.keys(right).sort();
+  if (
+    leftKeys.length !== rightKeys.length ||
+    leftKeys.some((key, index) => key !== rightKeys[index])
+  )
+    return false;
+  try {
+    return leftKeys.every(
+      (key) =>
+        canonicalCatalogFile(key, left[key]!) ===
+        canonicalCatalogFile(key, right[key]!),
+    );
+  } catch {
+    return false;
+  }
+}
+function catalogBranch(files: GitFileMap) {
+  const canonical = Object.keys(files)
+    .sort()
+    .map((path) => [path, canonicalCatalogFile(path, files[path]!)]);
+  return `agentor/catalog-${createHash("sha256")
+    .update(JSON.stringify(canonical))
+    .digest("hex")
+    .slice(0, 20)}`;
 }
 function repository(value: unknown) {
   const result = String(value || "").trim();
@@ -91,7 +139,30 @@ function publicConnection(connection: GitImageConnection) {
 }
 
 export class GitImageCatalogManager {
-  constructor(private store = new GitImageStore()) {}
+  private ownerQueues = new Map<string, Promise<void>>();
+  constructor(
+    private store = new GitImageStore(),
+    private ownerExists: (ownerId: string) => boolean | Promise<boolean> = () =>
+      true,
+  ) {}
+
+  private withOwner<T>(
+    ownerId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.ownerQueues.get(ownerId) ?? Promise.resolve();
+    const result = previous.catch(() => undefined).then(operation);
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.ownerQueues.set(ownerId, tail);
+    void tail.finally(() => {
+      if (this.ownerQueues.get(ownerId) === tail)
+        this.ownerQueues.delete(ownerId);
+    });
+    return result;
+  }
   init() {
     return this.store.init();
   }
@@ -99,10 +170,15 @@ export class GitImageCatalogManager {
     return this.store.state.connections.map((connection) => connection.ownerId);
   }
   async forgetOwner(ownerId: string) {
-    this.store.state.connections = this.store.state.connections.filter((connection) => connection.ownerId !== ownerId);
-    delete this.store.state.links[ownerId];
-    delete this.store.state.recovery[ownerId];
-    await this.store.persist();
+    await this.withOwner(ownerId, () =>
+      this.store.transaction(() => {
+        this.store.state.connections = this.store.state.connections.filter(
+          (connection) => connection.ownerId !== ownerId,
+        );
+        delete this.store.state.links[ownerId];
+        delete this.store.state.recovery[ownerId];
+      }),
+    );
   }
   format() {
     return GIT_IMAGE_CATALOG_FORMAT;
@@ -133,6 +209,15 @@ export class GitImageCatalogManager {
     return value;
   }
   async connect(ownerId: string, input: any) {
+    return withOwnerLifecycleMutation(ownerId, () =>
+      this.withOwner(ownerId, async () => {
+        if (!(await this.ownerExists(ownerId)))
+          fail(404, "Owner not found");
+        return this.connectUnlocked(ownerId, input);
+      }),
+    );
+  }
+  private async connectUnlocked(ownerId: string, input: any) {
     const prior = this.store.state.connections.find(
       (c) => c.ownerId === ownerId,
     );
@@ -200,27 +285,45 @@ export class GitImageCatalogManager {
         createdAt: stamp,
         updatedAt: stamp,
       };
-    this.store.state.connections.push(connection);
-    this.store.state.links[ownerId] = [];
-    await this.store.persist();
+    await this.store.transaction(() => {
+      if (
+        this.store.state.connections.some(
+          (candidate) => candidate.ownerId === ownerId,
+        )
+      )
+        fail(
+          409,
+          "Disconnect the existing Git image catalog before replacing it",
+        );
+      this.store.state.connections.push(connection);
+      this.store.state.links[ownerId] = [];
+    });
     return publicConnection(connection);
   }
   async disconnect(ownerId: string) {
-    const connection = this.get(ownerId);
-    try {
-      await (await this.provider(connection)).revoke?.();
-    } catch {}
-    this.store.state.connections = this.store.state.connections.filter(
-      (c) => c !== connection,
-    );
-    delete this.store.state.links[ownerId];
-    delete this.store.state.recovery[ownerId];
-    await this.store.persist();
-    return {
-      disconnected: true,
-      credentialErased: true,
-      remoteRepositoryUnchanged: true,
-    };
+    return this.withOwner(ownerId, async () => {
+      const connection = await this.store.read(() =>
+        structuredClone(this.get(ownerId)),
+      );
+      try {
+        await (await this.provider(connection)).revoke?.();
+      } catch {}
+      await this.store.transaction(() => {
+        const live = this.get(ownerId);
+        if (live.id !== connection.id)
+          fail(409, "Git image catalog connection changed concurrently");
+        this.store.state.connections = this.store.state.connections.filter(
+          (candidate) => candidate.id !== connection.id,
+        );
+        delete this.store.state.links[ownerId];
+        delete this.store.state.recovery[ownerId];
+      });
+      return {
+        disconnected: true,
+        credentialErased: true,
+        remoteRepositoryUnchanged: true,
+      };
+    });
   }
   private async provider(
     connection: GitImageConnection,
@@ -250,7 +353,46 @@ export class GitImageCatalogManager {
     return new GitHubRestProvider(token);
   }
   async sync(ownerId: string, catalog: ImageCatalogManager, input: any = {}) {
-    const connection = this.get(ownerId),
+    return this.withOwner(ownerId, async () => {
+      const working = await this.store.read(() => {
+        const connection = structuredClone(this.get(ownerId));
+        return {
+          connection,
+          links: structuredClone(this.store.state.links[ownerId] ?? []),
+          recovery: structuredClone(this.store.state.recovery[ownerId]),
+        };
+      });
+      const result = await this.syncUnlocked(ownerId, catalog, input, working);
+      await this.store.transaction(() => {
+        const live = this.get(ownerId);
+        if (live.id !== working.connection.id)
+          fail(409, "Git image catalog connection changed concurrently");
+        const index = this.store.state.connections.findIndex(
+          (candidate) => candidate.id === live.id,
+        );
+        this.store.state.connections[index] = structuredClone(
+          working.connection,
+        );
+        this.store.state.links[ownerId] = structuredClone(working.links);
+        if (working.recovery)
+          this.store.state.recovery[ownerId] = structuredClone(
+            working.recovery,
+          );
+      });
+      return result;
+    });
+  }
+  private async syncUnlocked(
+    ownerId: string,
+    catalog: ImageCatalogManager,
+    input: any,
+    working: {
+      connection: GitImageConnection;
+      links: GitImageLink[];
+      recovery?: GitImageRecovery;
+    },
+  ) {
+    const connection = working.connection,
       direction = input.direction === "pull" ? "pull" : "push",
       provider = await this.provider(connection),
       workflow = (input.workflow ??
@@ -259,9 +401,7 @@ export class GitImageCatalogManager {
       fail(400, "Invalid Git workflow");
     const target = connection.defaultBranch,
       remote = await provider.read(connection.repository, target),
-      links =
-        this.store.state.links[ownerId] ??
-        (this.store.state.links[ownerId] = []),
+      links = working.links,
       local = catalog.list(ownerId, false),
       conflicts: Array<{ remoteId: string; localId?: string; reason: string }> =
         [],
@@ -292,10 +432,18 @@ export class GitImageCatalogManager {
               });
               continue;
             }
-            const copy = await catalog.importRecovered(ownerId, {
-              ...entry.definition,
-              name: `${entry.definition.name} (Git recovery)`,
-            });
+            const copy = await catalog.importRecovered(
+              ownerId,
+              {
+                ...entry.definition,
+                name: `${entry.definition.name} (Git recovery)`,
+              },
+              {
+                connectionId: connection.id,
+                remoteId: entry.remoteId,
+                hash: entry.hash,
+              },
+            );
             imported.push(copy.id);
             links.push(
               this.link(
@@ -314,6 +462,32 @@ export class GitImageCatalogManager {
           const nameCollision = local.find(
             (x) => x.name === entry.definition.name,
           );
+          // A previous pull can durably import into the catalog and then lose
+          // only its independent Git-store link commit. Re-adopt exclusively
+          // from server-minted provenance for this exact connection/entry;
+          // content similarity alone must not turn a deliberate reconnect
+          // into an implicit recovery merge.
+          const recovered = local.find(
+            (candidate) =>
+              !links.some((existing) => existing.localId === candidate.id) &&
+              candidate.gitRecovery?.connectionId === connection.id &&
+              candidate.gitRecovery.remoteId === entry.remoteId &&
+              candidate.gitRecovery.hash === entry.hash &&
+              hashDefinition(candidate) === entry.hash,
+          );
+          if (recovered) {
+            imported.push(recovered.id);
+            links.push(
+              this.link(
+                entry.remoteId,
+                recovered,
+                entry.hash,
+                remote.revision,
+                entry.definition.versions,
+              ),
+            );
+            continue;
+          }
           if (nameCollision && input.resolution !== "remote-copy") {
             conflicts.push({
               remoteId: entry.remoteId,
@@ -322,12 +496,20 @@ export class GitImageCatalogManager {
             });
             continue;
           }
-          const created = await catalog.importRecovered(ownerId, {
-            ...entry.definition,
-            name: nameCollision
-              ? `${entry.definition.name} (Git recovery)`
-              : entry.definition.name,
-          });
+          const created = await catalog.importRecovered(
+            ownerId,
+            {
+              ...entry.definition,
+              name: nameCollision
+                ? `${entry.definition.name} (Git recovery)`
+                : entry.definition.name,
+            },
+            {
+              connectionId: connection.id,
+              remoteId: entry.remoteId,
+              hash: entry.hash,
+            },
+          );
           imported.push(created.id);
           links.push(
             this.link(
@@ -344,7 +526,7 @@ export class GitImageCatalogManager {
         pullable = entries
           .flatMap((x) => x.definition.versions)
           .filter((v: any) => v.ghcr?.reference).length;
-      this.store.state.recovery[ownerId] = {
+      working.recovery = {
         state: conflicts.length ? "conflict" : "recovered",
         checkedAt: now(),
         catalogEntries: entries.length,
@@ -355,19 +537,83 @@ export class GitImageCatalogManager {
       };
       connection.lastRemoteRevision = remote.revision;
       connection.lastSyncAt = connection.updatedAt = now();
-      await this.store.persist();
       return {
         direction,
         revision: remote.revision,
         imported,
         conflicts,
-        recovery: this.recovery(ownerId),
+        recovery: working.recovery,
       };
     }
     const changed = local.filter((def) => {
       const link = links.find((x) => x.localId === def.id);
       return !link || hashDefinition(def) !== link.baseHash;
     });
+    const files = serializeCatalog(local, {
+      buildMode: connection.buildMode,
+      workflow: connection.actionsWorkflow,
+      publishGhcr: connection.publishGhcr,
+      ghcrByDigest: input.ghcrByDigest,
+    });
+    if (connection.auth.type === "pat") {
+      const credential = await decryptGitImageCredential(
+        connection.auth.token,
+        gitImageCredentialAad(ownerId, connection.id, "pat"),
+      );
+      if (Object.values(files).some((value) => value.includes(credential)))
+        fail(400, "Catalog content contains the configured GitHub credential");
+    }
+    const message = String(input.message || "Sync Agentor image catalog"),
+      syncBranch =
+        workflow === "direct"
+          ? target
+          : branch(input.branch, catalogBranch(files));
+    if (workflow !== "direct" && syncBranch === target)
+      fail(400, "Review branch must differ from the default branch");
+    const reviewSnapshot =
+      workflow === "direct"
+        ? undefined
+        : await provider.read(connection.repository, syncBranch);
+    if (
+      reviewSnapshot &&
+      reviewSnapshot.revision !== null &&
+      !equivalentCatalogFiles(reviewSnapshot.files, files)
+    ) {
+      return {
+        direction,
+        revision: remote.revision,
+        branch: syncBranch,
+        conflicts: [
+          {
+            remoteId: "catalog",
+            reason: "review-branch-already-exists-with-different-content",
+          },
+        ],
+        written: false,
+      };
+    }
+    if (
+      workflow === "direct" &&
+      remote.revision !== null &&
+      equivalentCatalogFiles(remote.files, files)
+    ) {
+      // This also covers a first-ever push whose remote commit (and optional
+      // Actions dispatch) succeeded before the initial local state write
+      // failed, when no lastRemoteRevision existed to reveal the split commit.
+      this.updatePushLinks(links, local, remote.revision);
+      connection.lastRemoteRevision = remote.revision;
+      connection.lastSyncAt = connection.updatedAt = now();
+      delete connection.lastError;
+      return {
+        direction,
+        written: true,
+        reconciled: true,
+        revision: remote.revision,
+        branch: target,
+        workflowDispatched: false,
+        conflicts: [],
+      };
+    }
     if (
       connection.lastRemoteRevision !== undefined &&
       remote.revision !== connection.lastRemoteRevision
@@ -383,7 +629,6 @@ export class GitImageCatalogManager {
           remoteId: "catalog",
           reason: "remote-changed-since-last-sync",
         });
-      await this.store.persist();
       return {
         direction,
         revision: remote.revision,
@@ -391,59 +636,75 @@ export class GitImageCatalogManager {
         written: false,
       };
     }
-    const files = serializeCatalog(local, {
-      buildMode: connection.buildMode,
-      workflow: connection.actionsWorkflow,
-      publishGhcr: connection.publishGhcr,
-      ghcrByDigest: input.ghcrByDigest,
-    });
-    if (connection.auth.type === "pat") {
-      const credential = await decryptGitImageCredential(
-        connection.auth.token,
-        gitImageCredentialAad(ownerId, connection.id, "pat"),
-      );
-      if (Object.values(files).some((value) => value.includes(credential)))
-        fail(400, "Catalog content contains the configured GitHub credential");
-    }
-    const syncBranch =
-        workflow === "direct"
-          ? target
-          : branch(input.branch, `agentor/catalog-${Date.now()}`),
-      result = await provider.write(connection.repository, {
+    if (reviewSnapshot && reviewSnapshot.revision !== null) {
+      let pullRequest;
+      let workflowDispatched = false;
+      if (workflow === "pull-request") {
+        if (!provider.ensurePullRequest)
+          fail(400, "Git pull-request workflow is not available");
+        const ensured = await provider.ensurePullRequest(
+          connection.repository,
+          {
+            branch: syncBranch,
+            targetBranch: target,
+            title: message,
+          },
+        );
+        pullRequest = ensured.pullRequest;
+        // A matching existing PR is the reconciliation point for an earlier
+        // successful push whose local state commit failed. GitHub's workflow
+        // dispatch endpoint has no idempotency key, so dispatch only when this
+        // retry had to create the missing PR.
+        if (ensured.created && connection.buildMode === "github-actions") {
+          if (!connection.actionsWorkflow || !provider.dispatchWorkflow)
+            fail(400, "GitHub Actions build workflow is not available");
+          await provider.dispatchWorkflow(
+            connection.repository,
+            connection.actionsWorkflow,
+            syncBranch,
+          );
+          workflowDispatched = true;
+        }
+      }
+      this.updatePushLinks(links, local, reviewSnapshot.revision);
+      connection.lastRemoteRevision = remote.revision;
+      connection.lastSyncAt = connection.updatedAt = now();
+      delete connection.lastError;
+      return {
+        direction,
+        written: true,
+        reconciled: true,
+        revision: reviewSnapshot.revision,
         branch: syncBranch,
-        targetBranch: target,
-        expectedRevision: remote.revision,
-        files,
-        message: String(input.message || "Sync Agentor image catalog"),
-        workflow,
-      });
+        pullRequest,
+        workflowDispatched,
+        conflicts: [],
+      };
+    }
+    const result = await provider.write(connection.repository, {
+      branch: syncBranch,
+      targetBranch: target,
+      expectedRevision: remote.revision,
+      files,
+      message,
+      workflow,
+    });
     let workflowDispatched = false;
     if (connection.buildMode === "github-actions") {
       if (!connection.actionsWorkflow || !provider.dispatchWorkflow)
         fail(400, "GitHub Actions build workflow is not available");
-      await provider.dispatchWorkflow(connection.repository, connection.actionsWorkflow, result.branch);
+      await provider.dispatchWorkflow(
+        connection.repository,
+        connection.actionsWorkflow,
+        result.branch,
+      );
       workflowDispatched = true;
     }
-    for (const def of local) {
-      const hash = hashDefinition(def),
-        existing = links.find((x) => x.localId === def.id);
-      if (existing) {
-        existing.baseHash = hash;
-        existing.remoteRevision = result.revision;
-      } else
-        links.push({
-          remoteId: def.id,
-          localId: def.id,
-          baseHash: hash,
-          remoteRevision: result.revision,
-          recoveredVersions: [],
-        });
-    }
+    this.updatePushLinks(links, local, result.revision);
     connection.lastRemoteRevision =
       workflow === "direct" ? result.revision : remote.revision;
     connection.lastSyncAt = connection.updatedAt = now();
     delete connection.lastError;
-    await this.store.persist();
     return {
       direction,
       written: true,
@@ -453,6 +714,30 @@ export class GitImageCatalogManager {
       workflowDispatched,
       conflicts: [],
     };
+  }
+  private updatePushLinks(
+    links: GitImageLink[],
+    definitions: ImageDefinition[],
+    revision: string | null,
+  ) {
+    for (const definition of definitions) {
+      const hash = hashDefinition(definition);
+      const existing = links.find(
+        (candidate) => candidate.localId === definition.id,
+      );
+      if (existing) {
+        existing.baseHash = hash;
+        existing.remoteRevision = revision;
+      } else {
+        links.push({
+          remoteId: definition.id,
+          localId: definition.id,
+          baseHash: hash,
+          remoteRevision: revision,
+          recoveredVersions: [],
+        });
+      }
+    }
   }
   private link(
     remoteId: string,
@@ -501,5 +786,8 @@ export class GitImageCatalogManager {
 
 let singleton: GitImageCatalogManager | undefined;
 export function useGitImageCatalogManager() {
-  return (singleton ??= new GitImageCatalogManager());
+  return (singleton ??= new GitImageCatalogManager(
+    undefined,
+    (ownerId) => getUserById(ownerId) !== null,
+  ));
 }

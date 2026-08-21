@@ -39,8 +39,15 @@ export class GoogleBackupOAuthConfigStore {
   private value?: StoredGoogleBackupOAuthConfig;
   private writes = Promise.resolve();
 
+  constructor(
+    private readonly dataDir = useConfig().dataDir,
+    private readonly stateWriter?: (
+      value: StoredGoogleBackupOAuthConfig,
+    ) => Promise<void>,
+  ) {}
+
   private get path() {
-    return join(useConfig().dataDir, "backup-google-oauth.v1.json");
+    return join(this.dataDir, "backup-google-oauth.v1.json");
   }
 
   private async init() {
@@ -115,7 +122,7 @@ export class GoogleBackupOAuthConfigStore {
     if (!clientId || !clientSecretValue(input.clientSecret) || !validRedirectUri(redirectUri))
       throw new Error("A client ID, HTTPS redirect URI, and client secret are required");
     await this.init();
-    this.value = {
+    const nextValue: StoredGoogleBackupOAuthConfig = {
       schemaVersion: 1,
       clientId,
       redirectUri,
@@ -126,18 +133,25 @@ export class GoogleBackupOAuthConfigStore {
       ),
       updatedAt: new Date().toISOString(),
     };
-    await this.persist();
+    await this.persist(nextValue);
     return this.status();
   }
 
-  private async persist() {
-    this.writes = this.writes.then(async () => {
+  private async persist(value: StoredGoogleBackupOAuthConfig) {
+    const next = this.writes.then(async () => {
+      if (this.stateWriter) {
+        await this.stateWriter(structuredClone(value));
+        this.value = value;
+        return;
+      }
       await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
       const temp = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
-      await writeFile(temp, `${JSON.stringify(this.value)}\n`, { mode: 0o600 });
+      await writeFile(temp, `${JSON.stringify(value)}\n`, { mode: 0o600 });
       await rename(temp, this.path);
+      this.value = value;
     });
-    await this.writes;
+    this.writes = next.then(() => undefined, () => undefined);
+    await next;
   }
 }
 

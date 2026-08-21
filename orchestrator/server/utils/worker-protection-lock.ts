@@ -29,10 +29,12 @@ export class WorkerProtectionLockStore {
     const plain = validatePassword(password);
     const salt = randomUUID(); const hash = (await derive(plain, salt)).toString("hex"); const stamp = new Date().toISOString();
     const record: LockRecord = { workerId, salt, hash, createdAt: existing?.createdAt || stamp, updatedAt: stamp };
-    this.state.locks = [...this.state.locks.filter(x => x.workerId !== workerId), record];
-    await this.persist(); return this.public(workerId);
+    const previous = this.state.locks;
+    this.state.locks = [...previous.filter(x => x.workerId !== workerId), record];
+    try { await this.persist(); } catch (error) { this.state.locks = previous; throw error; }
+    return this.public(workerId);
   }
-  async remove(workerId: string, password: unknown) { await this.verify(workerId, password); this.state.locks = this.state.locks.filter(x => x.workerId !== workerId); await this.persist(); return this.public(workerId); }
+  async remove(workerId: string, password: unknown) { await this.verify(workerId, password); const previous = this.state.locks; this.state.locks = previous.filter(x => x.workerId !== workerId); try { await this.persist(); } catch (error) { this.state.locks = previous; throw error; } return this.public(workerId); }
   async verify(workerId: string, password: unknown) {
     await this.init(); const record = this.state.locks.find(x => x.workerId === workerId);
     if (!record) return true;
@@ -41,7 +43,7 @@ export class WorkerProtectionLockStore {
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) throw locked();
     return true;
   }
-  async removeForDeletedWorker(workerId: string) { await this.init(); if (!this.state.locks.some(x => x.workerId === workerId)) return; this.state.locks = this.state.locks.filter(x => x.workerId !== workerId); await this.persist(); }
+  async removeForDeletedWorker(workerId: string) { await this.init(); if (!this.state.locks.some(x => x.workerId === workerId)) return; const previous = this.state.locks; this.state.locks = previous.filter(x => x.workerId !== workerId); try { await this.persist(); } catch (error) { this.state.locks = previous; throw error; } }
   private async load() { try { const parsed = JSON.parse(await readFile(this.path, "utf8")); if (parsed?.schemaVersion === 1 && Array.isArray(parsed.locks)) this.state = { schemaVersion: 1, locks: parsed.locks.filter(valid) }; } catch (error: any) { if (error?.code !== "ENOENT") throw error; } }
   private async persist() { await mkdir(dirname(this.path), { recursive: true, mode: 0o700 }); const tmp = `${this.path}.${process.pid}.tmp`; await writeFile(tmp, JSON.stringify(this.state), { mode: 0o600 }); await rename(tmp, this.path); }
 }

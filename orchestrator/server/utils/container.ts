@@ -47,7 +47,11 @@ import type {
   FileListing,
   MoveConflict,
 } from "../../shared/types";
-import { withWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
+import {
+  withOwnerLifecycleMutation,
+  withOwnerWorkerLifecycleMutation,
+  withWorkerLifecycleMutation,
+} from "./worker-lifecycle-coordinator";
 import { getAllGitCloneDomains } from "./git-providers";
 import { getAllAgentApiDomains } from "./agent-config";
 import {
@@ -143,7 +147,208 @@ const WORKER_ID_LABEL = "agentor.id";
 /** Repo prefix for per-worker images created by `docker import` on restore. */
 const IMPORT_IMAGE_PREFIX = "agentor-import-";
 
+export interface FailedImportRollbackActions {
+  removeFromMemory: () => void;
+  removeMappings: () => Promise<void>;
+  removeWorkerRecord: () => Promise<void>;
+  removeWorkerConfiguration: () => Promise<void>;
+  removeContainer: () => Promise<void>;
+  removeWorkspace: () => Promise<void>;
+  removeAgents: () => Promise<void>;
+  removeDocker?: () => Promise<void>;
+  removeImportedImage?: () => Promise<void>;
+}
+
+/** Docker delete is idempotent at the control-plane boundary. A missing
+ * container is already in the requested state, including after an ambiguous
+ * network failure where Docker completed the first delete but its response was
+ * lost. Other daemon failures remain retryable errors. */
+export async function removeDockerContainerIdempotently(
+  remove: () => Promise<void>,
+): Promise<void> {
+  try {
+    await remove();
+  } catch (error) {
+    const status = (error as { statusCode?: number; status?: number })
+      ?.statusCode ?? (error as { status?: number })?.status;
+    if (status !== 404) throw error;
+  }
+}
+
+/** Gracefully stop a running worker while making ambiguous retries safe.
+ * Docker reports an already-stopped container as 304; some compatible daemons
+ * expose only the equivalent message. Both mean the requested state has
+ * already been reached. Update the in-memory state immediately after the stop
+ * settles so a later remove/persistence failure cannot make the next lifecycle
+ * retry stop the same container again. */
+export async function stopWorkerContainerIdempotently(
+  info: ContainerInfo,
+  stop: () => Promise<void>,
+): Promise<void> {
+  if (info.status !== "running") return;
+  try {
+    await stop();
+  } catch (error) {
+    const status = (error as { statusCode?: number; status?: number })
+      ?.statusCode ?? (error as { status?: number })?.status;
+    const message = error instanceof Error ? error.message : String(error);
+    if (
+      status !== 304 &&
+      !/already (?:is )?stopped|container .* is not running/i.test(message)
+    ) {
+      throw error;
+    }
+  }
+  info.status = "stopped";
+  info.updatedAt = new Date().toISOString();
+}
+
+/** Remove a custom environment created exclusively for an import that failed.
+ * Keep it while a failed Docker rollback leaves the provisional worker alive,
+ * because that retryable worker still references the environment. */
+export async function rollbackCreatedImportEnvironment(
+  createdEnvironmentId: string | undefined,
+  retainedContainer: boolean,
+  removeEnvironment: (id: string) => Promise<void>,
+): Promise<void> {
+  if (!createdEnvironmentId || retainedContainer) return;
+  await removeEnvironment(createdEnvironmentId);
+}
+
+export async function removeImportEnvironmentIdempotently(
+  environmentId: string,
+  exists: (id: string) => boolean,
+  remove: (id: string) => Promise<void>,
+): Promise<void> {
+  if (exists(environmentId)) await remove(environmentId);
+}
+
+/** A failed rollback must retain the import-created environment while either
+ * the container or its durable WorkerStore reference survives. */
+export function importRollbackRetainsEnvironment(error: unknown): boolean {
+  const rollback = error as { code?: string; failures?: unknown };
+  return (
+    rollback?.code === "IMPORT_ROLLBACK_CONTAINER_RETAINED" ||
+    rollback?.code === "IMPORT_ROLLBACK_INCOMPLETE"
+  );
+}
+
+export function importEnvironmentReferenced(
+  userId: string,
+  environmentId: string,
+  liveWorkers: Iterable<Pick<ContainerInfo, "userId" | "environmentId">>,
+  durableWorkers: Iterable<Pick<WorkerRecord, "userId" | "environmentId">>,
+  exceptWorkerId?: string,
+): boolean {
+  for (const worker of liveWorkers)
+    if (
+      (exceptWorkerId === undefined ||
+        (worker as { id?: string }).id !== exceptWorkerId) &&
+      worker.userId === userId &&
+      worker.environmentId === environmentId
+    )
+      return true;
+  for (const worker of durableWorkers)
+    if (
+      (exceptWorkerId === undefined ||
+        (worker as { id?: string }).id !== exceptWorkerId) &&
+      worker.userId === userId &&
+      worker.environmentId === environmentId
+    )
+      return true;
+  return false;
+}
+
+/** Complete every compensating action after a post-create import failure.
+ * Container removal is the first gate. After it succeeds, run every external
+ * resource cleanup while retaining both in-memory and durable identities. Only
+ * after those succeed may the durable record and then the in-memory handle be
+ * dropped, so every partial failure remains retryable immediately and after an
+ * orchestrator restart. */
+export async function rollbackFailedWorkerImport(
+  actions: FailedImportRollbackActions,
+): Promise<void> {
+  try {
+    await actions.removeContainer();
+  } catch (cause) {
+    throw Object.assign(
+      new Error("Worker import rollback could not remove the container"),
+      { code: "IMPORT_ROLLBACK_CONTAINER_RETAINED", cause },
+    );
+  }
+  const failures: string[] = [];
+  const attempt = async (name: string, action?: () => Promise<void>) => {
+    if (!action) return;
+    try {
+      await action();
+    } catch {
+      failures.push(name);
+    }
+  };
+  await attempt("mappings", actions.removeMappings);
+  await attempt("worker configuration", actions.removeWorkerConfiguration);
+  await attempt("workspace", actions.removeWorkspace);
+  await attempt("agent data", actions.removeAgents);
+  await attempt("Docker data", actions.removeDocker);
+  await attempt("imported image", actions.removeImportedImage);
+  if (failures.length) {
+    throw Object.assign(
+      new Error(`Worker import rollback incomplete: ${failures.join(", ")}`),
+      { code: "IMPORT_ROLLBACK_INCOMPLETE", failures: [...failures] },
+    );
+  }
+  try {
+    await actions.removeWorkerRecord();
+  } catch {
+    throw Object.assign(
+      new Error("Worker import rollback incomplete: worker record"),
+      {
+        code: "IMPORT_ROLLBACK_INCOMPLETE",
+        failures: ["worker record"],
+      },
+    );
+  }
+  actions.removeFromMemory();
+}
+
+/** Run every independent deletion action and return stable operator-facing
+ * labels for the ones that failed. Callers retain the durable worker handle
+ * until this returns an empty list, making partial cleanup retryable. */
+export async function collectWorkerCleanupFailures(
+  actions: Array<readonly [name: string, action: () => Promise<void>]>,
+): Promise<string[]> {
+  const failures: string[] = [];
+  for (const [name, action] of actions) {
+    try {
+      await action();
+    } catch {
+      failures.push(name);
+    }
+  }
+  return failures;
+}
+
+/** A failed Docker import may still have installed its deterministic tag. Never
+ * hide a daemon failure while removing it: the tag in this structured error is
+ * the operator's recovery handle. */
+export async function removeFailedImportedImage(
+  candidateImage: string,
+  remove: () => Promise<void>,
+): Promise<void> {
+  try {
+    await remove();
+  } catch (cause) {
+    throw Object.assign(
+      new Error(`Failed rootfs image cleanup: ${candidateImage}`),
+      { code: "ROOTFS_IMPORT_CLEANUP_FAILED", candidateImage, cause },
+    );
+  }
+}
+
 export class ContainerManager {
+  /** Restart-persistent ownership handles for custom environments created
+   * implicitly by imports. */
+  private importCreatedEnvironments = new Map<string, string>();
   /** Reattach a freshly created/rebuilt worker to owner-managed networks. Failure
    * is logged only: the worker lifecycle succeeded and the network remains
    * inspectable/reconcilable rather than leaving a half-created worker. */
@@ -458,6 +663,15 @@ export class ContainerManager {
     );
 
     this.containers.clear();
+    this.importCreatedEnvironments.clear();
+    for (const worker of this.workerStore?.list() ?? []) {
+      if (worker.importCreatedEnvironmentId) {
+        this.importCreatedEnvironments.set(
+          worker.id,
+          worker.importCreatedEnvironmentId,
+        );
+      }
+    }
 
     for (const dc of dockerContainers) {
       const containerName =
@@ -475,32 +689,44 @@ export class ContainerManager {
       if (!labelId) continue;
       const worker = labelId ? this.workerStore?.findById(labelId) : undefined;
 
-      const id = worker?.id ?? labelId;
+      // The label is only an identifier; ownership and configuration must
+      // come from the durable WorkerStore. If that owner partition is corrupt
+      // or unavailable, never invent an empty owner and later persist it as a
+      // new record. Leave the runtime untouched and inaccessible until its
+      // authoritative metadata can be recovered.
+      if (!worker) {
+        useLogger().error(
+          `[container] quarantined managed container ${containerName}: authoritative worker record ${labelId} is unavailable`,
+        );
+        continue;
+      }
+
+      const id = worker.id;
       const now = new Date().toISOString();
 
       this.containers.set(id, {
         id,
-        userId: worker?.userId ?? "",
-        createdAt: worker?.createdAt ?? now,
-        updatedAt: worker?.updatedAt ?? now,
+        userId: worker.userId,
+        createdAt: worker.createdAt ?? now,
+        updatedAt: worker.updatedAt ?? now,
         containerId: dc.Id,
         containerName,
-        displayName: worker?.displayName ?? containerName,
+        displayName: worker.displayName ?? containerName,
         imageName: dc.Image,
         imageId: dc.ImageID,
         status: ContainerManager.STATE_MAP[dc.State] || "error",
-        repos: worker?.repos,
-        mounts: worker?.mounts,
-        initScript: worker?.initScript,
-        environmentId: worker?.environmentId,
-        excludedGlobalEnvVarKeys: worker?.excludedGlobalEnvVarKeys ?? [],
-        excludedGroupEnvVarKeys: worker?.excludedGroupEnvVarKeys ?? [],
-        pendingRebuild: worker?.pendingRebuild,
-        importedImage: worker?.importedImage,
-        imageDefinitionId: worker?.imageDefinitionId,
-        imageVersion: worker?.imageVersion,
-        imageDigest: worker?.imageDigest,
-        imageRuntimeReference: worker?.imageRuntimeReference,
+        repos: worker.repos,
+        mounts: worker.mounts,
+        initScript: worker.initScript,
+        environmentId: worker.environmentId,
+        excludedGlobalEnvVarKeys: worker.excludedGlobalEnvVarKeys ?? [],
+        excludedGroupEnvVarKeys: worker.excludedGroupEnvVarKeys ?? [],
+        pendingRebuild: worker.pendingRebuild,
+        importedImage: worker.importedImage,
+        imageDefinitionId: worker.imageDefinitionId,
+        imageVersion: worker.imageVersion,
+        imageDigest: worker.imageDigest,
+        imageRuntimeReference: worker.imageRuntimeReference,
       });
     }
 
@@ -529,6 +755,34 @@ export class ContainerManager {
       error.statusCode = 409;
       throw error;
     }
+  }
+
+  private assertOwnerExists(userId: string): void {
+    if (!getUserById(userId)) {
+      throw Object.assign(new Error("Worker owner not found"), {
+        statusCode: 404,
+      });
+    }
+  }
+
+  /** Serialize every ordinary lifecycle mutation owner-first, then worker.
+   * Re-read both owner and worker after acquiring the fences so a request that
+   * was authorized before account deletion cannot recreate removed state. */
+  private withExistingWorkerLifecycleMutation<T>(
+    id: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const snapshot = this.containers.get(id);
+    if (!snapshot) return Promise.reject(new Error("Container not found"));
+    this.assertOrdinaryMutation(snapshot);
+    return withOwnerWorkerLifecycleMutation(snapshot.userId, id, () => {
+      this.assertOwnerExists(snapshot.userId);
+      const current = this.containers.get(id);
+      if (!current || current.userId !== snapshot.userId) {
+        throw new Error("Container not found");
+      }
+      return operation();
+    });
   }
 
   /** Look up a worker by its UUID `id`. */
@@ -577,6 +831,20 @@ export class ContainerManager {
   }
 
   async create(request: CreateContainerRequest): Promise<ContainerInfo> {
+    const userId = request.userId ?? "";
+    if (!userId) throw new Error("create: userId is required");
+    return withOwnerLifecycleMutation(userId, () => {
+      if (!getUserById(userId))
+        throw Object.assign(new Error("Worker owner not found"), {
+          statusCode: 404,
+        });
+      return this.createForOwner(request);
+    });
+  }
+
+  private async createForOwner(
+    request: CreateContainerRequest,
+  ): Promise<ContainerInfo> {
     const userId = request.userId ?? "";
     if (!userId) throw new Error("create: userId is required");
 
@@ -632,17 +900,90 @@ export class ContainerManager {
     }
     const { userEnv, credentialBinds, groupSecrets } =
       await this.resolveUserEnvAndBinds(userId, excludedGlobalEnvVarKeys, id, excludedGroupEnvVarKeys, request.targetWorkerGroupId);
-    if (request.workerConfiguration) {
-      await workerConfigStore.replace(
-        userId,
-        id,
-        normalizeWorkerConfiguration(request.workerConfiguration),
-      );
-    }
-    const workerConfig = await workerConfigStore.resolveValues(userId, id);
+    // Validate request-controlled worker configuration before publishing any
+    // identity, but persist it only after the provisional WorkerStore handle is
+    // durable so a crypto/read/persistence failure has a restart-safe rollback
+    // target.
+    const requestedWorkerConfiguration = request.workerConfiguration
+      ? normalizeWorkerConfiguration(request.workerConfiguration)
+      : undefined;
 
-    const container = await this.dockerService
-      .createWorkerContainer({
+    const imageName =
+      request.imageRuntimeReference ||
+      this.config.workerImagePrefix + this.config.workerImage;
+    const now = new Date().toISOString();
+
+    const mounts = request.mounts?.length ? request.mounts : undefined;
+    const initScript = request.initScript?.trim() || undefined;
+
+    const containerInfo: ContainerInfo = {
+      id,
+      userId,
+      createdAt: now,
+      updatedAt: now,
+      // The deterministic name is a valid Docker removal target if creation
+      // fails after Docker accepted the request but before returning its id.
+      containerId: containerName,
+      containerName,
+      displayName,
+      imageName,
+      imageId: request.imageDigest || "",
+      status: "creating",
+      repos: repos.length > 0 ? repos : undefined,
+      mounts,
+      initScript,
+      environmentId: request.environmentId,
+      excludedGlobalEnvVarKeys,
+      excludedGroupEnvVarKeys,
+      pendingRebuild: false,
+      imageDefinitionId: request.imageDefinitionId,
+      imageVersion: request.imageVersion,
+      imageDigest: request.imageDigest,
+      imageRuntimeReference: request.imageRuntimeReference,
+    };
+
+    // Publish and persist the provisional UUID before the first Docker
+    // mutation. Any ambiguous create/rollback failure therefore remains
+    // retryable by stable worker id, including after an orchestrator restart.
+    this.containers.set(id, containerInfo);
+    try {
+      if (this.workerStore) {
+        await this.workerStore.upsert(
+          this.containerInfoToWorkerRecord(containerInfo),
+        );
+      }
+    } catch (err) {
+      // setItem is transactional: a rejected first upsert has restored the
+      // previous WorkerStore state, and worker-local config has not been
+      // persisted yet.
+      this.containers.delete(id);
+      throw err;
+    }
+
+    const workerConfig = await (async () => {
+      try {
+        if (requestedWorkerConfiguration) {
+          await workerConfigStore.replace(
+            userId,
+            id,
+            requestedWorkerConfiguration,
+          );
+        }
+        return await workerConfigStore.resolveValues(userId, id);
+      } catch (err) {
+        await this.rollbackFailedProvisionedWorker({
+          id,
+          userId,
+          containerId: containerName,
+          containerName,
+          dockerEnabled,
+        });
+        throw err;
+      }
+    })();
+
+    try {
+      const container = await this.dockerService.createWorkerContainer({
         userId,
         id,
         containerName,
@@ -659,83 +1000,49 @@ export class ContainerManager {
         userEnv,
         workerConfig: [...groupSecrets, ...workerConfig],
         image: request.imageRuntimeReference,
-      })
-      .catch(async (err) => {
-        await workerConfigStore.remove(userId, id).catch(() => {});
-        throw err;
       });
+      containerInfo.containerId = container.id;
+      containerInfo.status = "running";
+      containerInfo.updatedAt = new Date().toISOString();
+    } catch (err) {
+      await this.rollbackFailedProvisionedWorker({
+        id,
+        userId,
+        containerId: containerName,
+        containerName,
+        dockerEnabled,
+      });
+      throw err;
+    }
 
-    const imageName =
-      request.imageRuntimeReference ||
-      this.config.workerImagePrefix + this.config.workerImage;
-    const now = new Date().toISOString();
-
-    const mounts = request.mounts?.length ? request.mounts : undefined;
-    const initScript = request.initScript?.trim() || undefined;
-
-    const containerInfo: ContainerInfo = {
-      id,
-      userId,
-      createdAt: now,
-      updatedAt: now,
-      containerId: container.id,
-      containerName,
-      displayName,
-      imageName,
-      imageId: request.imageDigest || "",
-      status: "running",
-      repos: repos.length > 0 ? repos : undefined,
-      mounts,
-      initScript,
-      environmentId: request.environmentId,
-      excludedGlobalEnvVarKeys,
-      excludedGroupEnvVarKeys,
-      pendingRebuild: false,
-      imageDefinitionId: request.imageDefinitionId,
-      imageVersion: request.imageVersion,
-      imageDigest: request.imageDigest,
-      imageRuntimeReference: request.imageRuntimeReference,
-    };
-
-    this.containers.set(id, containerInfo);
-
-    // If persisting the record fails (disk full, EACCES on the per-user
-    // workers.json, …), the container is already created + started — roll it
-    // back (container, in-memory entry, volumes) so a failed create doesn't
-    // leak an orphan worker the store doesn't know about. Mirrors importWorker.
+    // Final persistence/secret-state failure after Docker started uses the same
+    // gated rollback. The provisional identity is retained if Docker removal
+    // fails, rather than converting a live worker into an untracked orphan.
     try {
+      await workerConfigStore.markApplied(userId, id);
       if (this.workerStore) {
         await this.workerStore.upsert(
           this.containerInfoToWorkerRecord(containerInfo),
         );
       }
-      await workerConfigStore.markApplied(userId, id);
     } catch (err) {
-      this.containers.delete(id);
-      await workerConfigStore.remove(userId, id).catch(() => {});
-      await this.dockerService.removeContainer(container.id).catch(() => {});
-      if (this.storageManager) {
-        await this.storageManager
-          .removeWorkerWorkspace(userId, id, containerName)
-          .catch(() => {});
-        await this.storageManager
-          .removeWorkerAgents(userId, id, containerName)
-          .catch(() => {});
-        if (dockerEnabled)
-          await this.storageManager
-            .removeWorkerDocker(containerName)
-            .catch(() => {});
-      }
+      await this.rollbackFailedProvisionedWorker({
+        id,
+        userId,
+        containerId: containerInfo.containerId,
+        containerName,
+        dockerEnabled,
+      });
       throw err;
     }
 
     // Attach log collector to the new container
     useLogCollector()
-      .attach(containerName, container.id, "worker", displayName)
+      .attach(containerName, containerInfo.containerId, "worker", displayName)
       .catch(() => {});
 
     useLogger().info(
-      `[container] created worker ${containerName} (${container.id.slice(0, 12)})`,
+      `[container] created worker ${containerName} (${containerInfo.containerId.slice(0, 12)})`,
     );
     await this.reconcileManagedNetworksForWorker(userId);
 
@@ -1413,7 +1720,9 @@ export class ContainerManager {
   }
 
   async stop(id: string): Promise<void> {
-    return withWorkerLifecycleMutation(id, () => this.stopUnlocked(id));
+    return this.withExistingWorkerLifecycleMutation(id, () =>
+      this.stopUnlocked(id),
+    );
   }
 
   private async stopUnlocked(id: string): Promise<void> {
@@ -1421,14 +1730,16 @@ export class ContainerManager {
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
     useLogCollector().detach(info.containerId);
-    await this.dockerService.stopContainer(info.containerId);
-    info.status = "stopped";
-    info.updatedAt = new Date().toISOString();
+    await stopWorkerContainerIdempotently(info, () =>
+      this.dockerService.stopContainer(info.containerId),
+    );
     useLogger().info(`[container] stopped ${info.containerName}`);
   }
 
   async restart(id: string): Promise<void> {
-    return withWorkerLifecycleMutation(id, () => this.restartUnlocked(id));
+    return this.withExistingWorkerLifecycleMutation(id, () =>
+      this.restartUnlocked(id),
+    );
   }
 
   private async restartUnlocked(id: string): Promise<void> {
@@ -1489,9 +1800,22 @@ export class ContainerManager {
     id: string,
     patch: UpdateContainerSettingsRequest,
   ): Promise<ContainerInfo> {
+    return this.withExistingWorkerLifecycleMutation(id, () =>
+      this.updateSettingsForOwner(id, patch),
+    );
+  }
+
+  private async updateSettingsForOwner(
+    id: string,
+    patch: UpdateContainerSettingsRequest,
+  ): Promise<ContainerInfo> {
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    // WorkerStore persistence is the commit point. Keep an exact snapshot so
+    // a failed write cannot leave uncommitted desired settings active in the
+    // live inventory until the next orchestrator restart.
+    const previousInfo = structuredClone(info);
 
     let liveChanged = false;
     let rebuildChanged = false;
@@ -1594,8 +1918,21 @@ export class ContainerManager {
 
     if (liveChanged || rebuildChanged) {
       info.updatedAt = new Date().toISOString();
-      if (this.workerStore) {
-        await this.workerStore.upsert(this.containerInfoToWorkerRecord(info));
+      try {
+        if (this.workerStore) {
+          await this.workerStore.upsert(this.containerInfoToWorkerRecord(info));
+        }
+      } catch (error) {
+        // Restore in place so any in-flight holder of this ContainerInfo sees
+        // the durable state too. Delete fields introduced by the failed patch
+        // before copying the prior snapshot back.
+        const current = info as unknown as Record<string, unknown>;
+        const previous = previousInfo as unknown as Record<string, unknown>;
+        for (const key of Object.keys(current)) {
+          if (!(key in previous)) delete current[key];
+        }
+        Object.assign(current, previous);
+        throw error;
       }
       useLogger().info(
         `[container] updated settings for ${info.containerName}${rebuildChanged ? " (pending rebuild)" : ""}`,
@@ -1606,68 +1943,148 @@ export class ContainerManager {
   }
 
   async remove(id: string): Promise<void> {
-    return withWorkerLifecycleMutation(id, () => this.removeUnlocked(id));
+    return this.withExistingWorkerLifecycleMutation(id, () =>
+      this.removeUnlocked(id),
+    );
   }
 
   private async removeUnlocked(id: string): Promise<void> {
     const info = this.containers.get(id);
-    if (info) this.assertOrdinaryMutation(info);
-    if (info) useLogCollector().detach(info.containerId);
-    try {
-      await this.dockerService.removeContainer(info?.containerId ?? id);
-      if (info) {
-        // Each cleanup is best-effort: one failure (e.g. EACCES on a directory-mode
-        // rm -rf, an in-use image) must not abort the rest or leave a half-removed
-        // worker in memory. Log and continue.
-        const warn = (what: string) => (err: unknown) =>
-          useLogger().warn(
-            `[container] remove ${info.containerName}: ${what} failed: ${err instanceof Error ? err.message : err}`,
-          );
-        await recordWorkspaceTombstone({
-          workerId: info.id,
-          userId: info.userId,
-          displayName: info.displayName || info.id,
-          backend: this.storageManager?.mode ?? "volume",
-          createdAt: info.createdAt,
-        }).catch(warn("workspace tombstone"));
-        await cleanupWorkerMappings(info.containerName).catch(
-          warn("mapping cleanup"),
-        );
-        if (this.storageManager) {
-          await this.storageManager
-            .removeWorkerDocker(info.containerName)
-            .catch(warn("docker volume"));
-          await this.storageManager
-            .removeWorkerWorkspace(info.userId, info.id, info.containerName)
-            .catch(warn("workspace"));
-          await this.storageManager
-            .removeWorkerAgents(info.userId, info.id, info.containerName)
-            .catch(warn("agents"));
+    if (!info) throw new Error("Container not found");
+    this.assertOrdinaryMutation(info);
+    // Keep the authoritative entry when Docker removal fails. Dropping it in a
+    // finally block made a retry resolve the stable worker UUID as though it
+    // were a Docker container id, leaving the real container untracked and
+    // preventing restore/account-cleanup rollback from retrying it.
+    await removeDockerContainerIdempotently(() =>
+      this.dockerService.removeContainer(info.containerId),
+    );
+    useLogCollector().detach(info.containerId);
+    info.status = "removing";
+    info.updatedAt = new Date().toISOString();
+    let deletionStateError: unknown;
+    if (this.workerStore) {
+      try {
+        const existing = this.workerStore.get(info.userId, info.id);
+        if (existing) {
+          await this.workerStore.markDeletionPending(info.userId, info.id);
+        } else {
+          // Initial provisioning can fail before its first WorkerStore write.
+          // Create the retry handle when possible, but never let a second
+          // persistence failure prevent best-effort cleanup of the published
+          // in-memory provisional worker.
+          await this.workerStore.upsert({
+            ...this.containerInfoToWorkerRecord(info),
+            status: "archived",
+            deletionPending: true,
+            archivedAt: new Date().toISOString(),
+          });
         }
-        // Per-worker imported image (from restore) is owned by this worker — drop it.
-        if (info.importedImage?.startsWith(IMPORT_IMAGE_PREFIX)) {
-          await this.dockerService
-            .removeImage(info.importedImage)
-            .catch(warn("imported image"));
-        }
-        if (this.workerStore) {
-          await this.workerStore
-            .delete(info.userId, info.id)
-            .catch(warn("worker record"));
-        }
-        await useWorkerConfigStore()
-          .remove(info.userId, info.id)
-          .catch(warn("worker-local configuration"));
-        useLogger().info(`[container] removed ${info.containerName}`);
+        // The archived deletion-pending record is now the single authoritative
+        // retry handle. Avoid rendering a duplicate live card while cleanup is
+        // retried.
+        this.containers.delete(id);
+      } catch (error) {
+        deletionStateError = error;
       }
-    } finally {
-      // Always drop the in-memory entry so the UI never shows a removed worker.
-      this.containers.delete(id);
     }
+
+    const actions: Array<readonly [string, () => Promise<void>]> = [
+      [
+        "workspace tombstone",
+        () =>
+          recordWorkspaceTombstone({
+            workerId: info.id,
+            userId: info.userId,
+            displayName: info.displayName || info.id,
+            backend: this.storageManager?.mode ?? "volume",
+            createdAt: info.createdAt,
+          }),
+      ],
+      ["mapping cleanup", () => cleanupWorkerMappings(info.containerName)],
+    ];
+    if (this.storageManager) {
+      actions.push(
+        [
+          "Docker data",
+          () => this.storageManager!.removeWorkerDocker(info.containerName),
+        ],
+        [
+          "workspace",
+          () =>
+            this.storageManager!.removeWorkerWorkspace(
+              info.userId,
+              info.id,
+              info.containerName,
+            ),
+        ],
+        [
+          "agent data",
+          () =>
+            this.storageManager!.removeWorkerAgents(
+              info.userId,
+              info.id,
+              info.containerName,
+            ),
+        ],
+      );
+    }
+    if (info.importedImage?.startsWith(IMPORT_IMAGE_PREFIX)) {
+      actions.push([
+        "imported image",
+        () => this.dockerService.removeImage(info.importedImage!),
+      ]);
+    }
+    actions.push(
+      [
+        "import-created environment",
+        () => this.cleanupImportCreatedEnvironment(info.userId, info.id),
+      ],
+      [
+        "worker-local configuration",
+        () => useWorkerConfigStore().remove(info.userId, info.id),
+      ],
+    );
+    const failures = await collectWorkerCleanupFailures(actions);
+    if (failures.length && deletionStateError) {
+      failures.unshift("worker deletion state");
+    }
+    if (failures.length) {
+      throw Object.assign(
+        new Error(`Worker deletion cleanup incomplete: ${failures.join(", ")}`),
+        { code: "WORKER_DELETE_CLEANUP_INCOMPLETE", failures },
+      );
+    }
+
+    if (this.workerStore?.get(info.userId, info.id)) {
+      try {
+        await this.workerStore.delete(info.userId, info.id);
+      } catch (error) {
+        // Keep the in-memory provisional handle when the durable record cannot
+        // be removed. If deletionPending was committed, the archived record is
+        // already the authoritative retry handle and no duplicate is exposed.
+        if (!this.workerStore.get(info.userId, info.id)?.deletionPending) {
+          this.containers.set(id, info);
+        }
+        throw Object.assign(
+          new Error("Worker deletion cleanup incomplete: worker record"),
+          {
+            code: "WORKER_DELETE_CLEANUP_INCOMPLETE",
+            failures: ["worker record"],
+            cause: error,
+          },
+        );
+      }
+    }
+    this.containers.delete(id);
+    this.importCreatedEnvironments.delete(id);
+    useLogger().info(`[container] removed ${info.containerName}`);
   }
 
   async archive(id: string): Promise<void> {
-    return withWorkerLifecycleMutation(id, () => this.archiveUnlocked(id));
+    return this.withExistingWorkerLifecycleMutation(id, () =>
+      this.archiveUnlocked(id),
+    );
   }
 
   private async archiveUnlocked(id: string): Promise<void> {
@@ -1677,14 +2094,29 @@ export class ContainerManager {
 
     useLogCollector().detach(info.containerId);
 
-    if (info.status === "running") {
-      await this.dockerService.stopContainer(info.containerId);
-    }
+    await stopWorkerContainerIdempotently(info, () =>
+      this.dockerService.stopContainer(info.containerId),
+    );
 
-    await this.dockerService.removeContainer(info.containerId);
+    await removeDockerContainerIdempotently(() =>
+      this.dockerService.removeContainer(info.containerId),
+    );
+
+    // Docker is gone. Keep a deterministic removal target and a retry-safe
+    // runtime state before persisting the archive transition. If persistence
+    // fails, the next archive attempt skips stop and treats Docker 404 as the
+    // already-achieved removal state.
+    info.containerId = info.containerName;
+    info.status = "error";
+    info.updatedAt = new Date().toISOString();
 
     if (this.workerStore) {
-      await this.workerStore.upsert(this.containerInfoToWorkerRecord(info));
+      // Preserve an existing durable transition (especially
+      // deletionPending). Only legacy/unregistered live workers need an
+      // initial record before they can be archived.
+      if (!this.workerStore.get(info.userId, info.id)) {
+        await this.workerStore.upsert(this.containerInfoToWorkerRecord(info));
+      }
       await this.workerStore.archive(info.userId, info.id);
     }
 
@@ -1693,7 +2125,9 @@ export class ContainerManager {
   }
 
   async rebuild(id: string): Promise<ContainerInfo> {
-    return withWorkerLifecycleMutation(id, () => this.rebuildUnlocked(id));
+    return this.withExistingWorkerLifecycleMutation(id, () =>
+      this.rebuildUnlocked(id),
+    );
   }
 
   private async rebuildUnlocked(id: string): Promise<ContainerInfo> {
@@ -1705,11 +2139,27 @@ export class ContainerManager {
 
     // Stop and remove the old container — workspace, agents, and DinD volumes
     // are preserved (rebuild behaves identically to archive + unarchive).
-    if (info.status === "running") {
-      await this.dockerService.stopContainer(info.containerId);
-    }
-    await this.dockerService.removeContainer(info.containerId);
+    await stopWorkerContainerIdempotently(info, () =>
+      this.dockerService.stopContainer(info.containerId),
+    );
+    await removeDockerContainerIdempotently(() =>
+      this.dockerService.removeContainer(info.containerId),
+    );
 
+    // A failed archive transition must not leave a stale "running" handle
+    // that retries stop against a container Docker has already removed.
+    info.containerId = info.containerName;
+    info.status = "error";
+    info.updatedAt = new Date().toISOString();
+
+    // Docker is gone. Persist the safe archive state before doing any work
+    // that can fail so restart/account cleanup always retains the worker.
+    if (this.workerStore) {
+      if (!this.workerStore.get(info.userId, info.id)) {
+        await this.workerStore.upsert(this.containerInfoToWorkerRecord(info));
+      }
+      await this.workerStore.archive(info.userId, info.id);
+    }
     this.containers.delete(id);
 
     // Re-resolve the environment config LIVE from the FK. If the referenced
@@ -1753,26 +2203,6 @@ export class ContainerManager {
       ? await this.resolveImageOpts(info.importedImage)
       : { image: info.imageRuntimeReference, imageConfig: undefined };
 
-    const container = await this.dockerService.createWorkerContainer({
-      userId: info.userId,
-      id: info.id,
-      containerName: info.containerName,
-      cpuLimit,
-      memoryLimit,
-      mounts: info.mounts,
-      dockerEnabled,
-      credentialBinds,
-      environmentJson: envConfig.environmentJson,
-      capabilitiesJson: envConfig.capabilitiesJson,
-      instructionsJson: envConfig.instructionsJson,
-      workerJson,
-      storageManager: this.storageManager,
-      userEnv,
-      workerConfig: [...groupSecrets, ...workerConfig],
-      image: imageOpts.image,
-      imageConfig: imageOpts.imageConfig,
-    });
-
     const imageName =
       imageOpts.image ||
       this.config.workerImagePrefix + this.config.workerImage;
@@ -1781,12 +2211,12 @@ export class ContainerManager {
       userId: info.userId,
       createdAt: info.createdAt,
       updatedAt: new Date().toISOString(),
-      containerId: container.id,
+      containerId: info.containerName,
       containerName: info.containerName,
       displayName: info.displayName,
       imageName,
       imageId: info.imageDigest || "",
-      status: "running",
+      status: "creating",
       repos: info.repos,
       mounts: info.mounts,
       initScript: info.initScript,
@@ -1803,14 +2233,52 @@ export class ContainerManager {
       imageRuntimeReference: info.imageRuntimeReference,
     };
 
+    // Publish a single active provisional identity before Docker mutation.
+    // Failed recreation rolls this back to the already-persisted archive.
+    if (this.workerStore) await this.workerStore.unarchive(info.userId, info.id);
     this.containers.set(info.id, containerInfo);
 
-    if (this.workerStore) {
-      await this.workerStore.upsert(
-        this.containerInfoToWorkerRecord(containerInfo),
+    try {
+      const container = await this.dockerService.createWorkerContainer({
+        userId: info.userId,
+        id: info.id,
+        containerName: info.containerName,
+        cpuLimit,
+        memoryLimit,
+        mounts: info.mounts,
+        dockerEnabled,
+        credentialBinds,
+        environmentJson: envConfig.environmentJson,
+        capabilitiesJson: envConfig.capabilitiesJson,
+        instructionsJson: envConfig.instructionsJson,
+        workerJson,
+        storageManager: this.storageManager,
+        userEnv,
+        workerConfig: [...groupSecrets, ...workerConfig],
+        image: imageOpts.image,
+        imageConfig: imageOpts.imageConfig,
+      });
+      containerInfo.containerId = container.id;
+      containerInfo.status = "running";
+      containerInfo.updatedAt = new Date().toISOString();
+    } catch (error) {
+      await this.rollbackFailedRecreation(containerInfo, info.containerName, error);
+    }
+
+    try {
+      if (this.workerStore) {
+        await this.workerStore.upsert(
+          this.containerInfoToWorkerRecord(containerInfo),
+        );
+      }
+      await useWorkerConfigStore().markApplied(info.userId, info.id);
+    } catch (error) {
+      await this.rollbackFailedRecreation(
+        containerInfo,
+        containerInfo.containerId,
+        error,
       );
     }
-    await useWorkerConfigStore().markApplied(info.userId, info.id);
 
     // Refresh Traefik config so the new container is picked up by DNS (no
     // restart needed — hot-reloaded via the file provider when mappings exist).
@@ -1823,11 +2291,11 @@ export class ContainerManager {
     });
 
     useLogCollector()
-      .attach(info.containerName, container.id, "worker", info.displayName)
+      .attach(info.containerName, containerInfo.containerId, "worker", info.displayName)
       .catch(() => {});
 
     useLogger().info(
-      `[container] rebuilt ${info.containerName} (${container.id.slice(0, 12)})`,
+      `[container] rebuilt ${info.containerName} (${containerInfo.containerId.slice(0, 12)})`,
     );
     await this.reconcileManagedNetworksForWorker(info.userId);
 
@@ -1835,9 +2303,10 @@ export class ContainerManager {
   }
 
   async unarchive(userId: string, id: string): Promise<ContainerInfo> {
-    return withWorkerLifecycleMutation(id, () =>
-      this.unarchiveUnlocked(userId, id),
-    );
+    return withOwnerWorkerLifecycleMutation(userId, id, () => {
+      this.assertOwnerExists(userId);
+      return this.unarchiveUnlocked(userId, id);
+    });
   }
 
   private async unarchiveUnlocked(
@@ -1849,6 +2318,12 @@ export class ContainerManager {
     const worker = this.workerStore.get(userId, id);
     if (!worker || worker.status !== "archived") {
       throw new Error("Archived worker not found");
+    }
+    if (worker.deletionPending) {
+      throw Object.assign(
+        new Error("Worker deletion cleanup is still pending"),
+        { statusCode: 409 },
+      );
     }
 
     // containerName is derived from the stable UUID `id`, not stored on the record.
@@ -1892,29 +2367,6 @@ export class ContainerManager {
       ? await this.resolveImageOpts(worker.importedImage)
       : { image: worker.imageRuntimeReference, imageConfig: undefined };
 
-    const container = await this.dockerService.createWorkerContainer({
-      userId: worker.userId,
-      id: worker.id,
-      containerName,
-      cpuLimit,
-      memoryLimit,
-      mounts: worker.mounts,
-      dockerEnabled,
-      credentialBinds,
-      environmentJson: envConfig.environmentJson,
-      capabilitiesJson: envConfig.capabilitiesJson,
-      instructionsJson: envConfig.instructionsJson,
-      workerJson,
-      storageManager: this.storageManager,
-      userEnv,
-      workerConfig: [...groupSecrets, ...workerConfig],
-      image: imageOpts.image,
-      imageConfig: imageOpts.imageConfig,
-    });
-
-    await this.workerStore.unarchive(worker.userId, worker.id);
-    await useWorkerConfigStore().markApplied(worker.userId, worker.id);
-
     const imageName =
       imageOpts.image ||
       this.config.workerImagePrefix + this.config.workerImage;
@@ -1923,12 +2375,12 @@ export class ContainerManager {
       userId: worker.userId,
       createdAt: worker.createdAt,
       updatedAt: new Date().toISOString(),
-      containerId: container.id,
+      containerId: containerName,
       containerName,
       displayName: worker.displayName,
       imageName,
       imageId: worker.imageDigest || "",
-      status: "running",
+      status: "creating",
       repos: worker.repos,
       mounts: worker.mounts,
       initScript: worker.initScript,
@@ -1945,7 +2397,43 @@ export class ContainerManager {
       imageRuntimeReference: worker.imageRuntimeReference,
     };
 
+    // Make the active provisional identity authoritative before asking Docker
+    // to create anything. This closes the post-create/pre-persistence leak.
+    await this.workerStore.unarchive(worker.userId, worker.id);
     this.containers.set(worker.id, containerInfo);
+
+    try {
+      const container = await this.dockerService.createWorkerContainer({
+        userId: worker.userId,
+        id: worker.id,
+        containerName,
+        cpuLimit,
+        memoryLimit,
+        mounts: worker.mounts,
+        dockerEnabled,
+        credentialBinds,
+        environmentJson: envConfig.environmentJson,
+        capabilitiesJson: envConfig.capabilitiesJson,
+        instructionsJson: envConfig.instructionsJson,
+        workerJson,
+        storageManager: this.storageManager,
+        userEnv,
+        workerConfig: [...groupSecrets, ...workerConfig],
+        image: imageOpts.image,
+        imageConfig: imageOpts.imageConfig,
+      });
+      containerInfo.containerId = container.id;
+      containerInfo.status = "running";
+      containerInfo.updatedAt = new Date().toISOString();
+      await this.workerStore.upsert(this.containerInfoToWorkerRecord(containerInfo));
+      await useWorkerConfigStore().markApplied(worker.userId, worker.id);
+    } catch (error) {
+      await this.rollbackFailedRecreation(
+        containerInfo,
+        containerInfo.containerId,
+        error,
+      );
+    }
 
     // Best-effort Traefik refresh — unarchive already succeeded; a reconcile
     // blip must not fail it (routing self-heals on the next reconcile).
@@ -1956,11 +2444,11 @@ export class ContainerManager {
     });
 
     useLogCollector()
-      .attach(containerName, container.id, "worker", worker.displayName)
+      .attach(containerName, containerInfo.containerId, "worker", worker.displayName)
       .catch(() => {});
 
     useLogger().info(
-      `[container] unarchived ${containerName} (${container.id.slice(0, 12)})`,
+      `[container] unarchived ${containerName} (${containerInfo.containerId.slice(0, 12)})`,
     );
     await this.reconcileManagedNetworksForWorker(worker.userId);
 
@@ -1968,9 +2456,10 @@ export class ContainerManager {
   }
 
   async deleteArchived(userId: string, id: string): Promise<void> {
-    return withWorkerLifecycleMutation(id, () =>
-      this.deleteArchivedUnlocked(userId, id),
-    );
+    return withOwnerWorkerLifecycleMutation(userId, id, () => {
+      this.assertOwnerExists(userId);
+      return this.deleteArchivedUnlocked(userId, id);
+    });
   }
 
   private async deleteArchivedUnlocked(
@@ -1979,48 +2468,200 @@ export class ContainerManager {
   ): Promise<void> {
     if (!this.workerStore) throw new Error("WorkerStore not available");
 
-    const worker = this.workerStore.get(userId, id);
+    let worker = this.workerStore.get(userId, id);
     if (!worker || worker.status !== "archived") {
       throw new Error("Archived worker not found");
     }
 
+    // This is the commit point before the first destructive operation. A
+    // partial failure must never leave an apparently safe, unarchivable record.
+    await this.workerStore.markDeletionPending(userId, id);
+    worker = this.workerStore.get(userId, id)!;
+
     // containerName is derived from the stable UUID `id`, not stored on the record.
     const containerName = this.buildContainerName(worker.id);
 
-    // Best-effort cleanups — one failure must not block the others or the final
-    // store delete (which is the source of truth for "this worker is gone").
-    const warn = (what: string) => (err: unknown) =>
-      useLogger().warn(
-        `[container] deleteArchived ${containerName}: ${what} failed: ${err instanceof Error ? err.message : err}`,
-      );
-    await recordWorkspaceTombstone({
-      workerId: worker.id,
-      userId: worker.userId,
-      displayName: worker.displayName || worker.id,
-      backend: this.storageManager?.mode ?? "volume",
-      createdAt: worker.createdAt,
-    }).catch(warn("workspace tombstone"));
-    await cleanupWorkerMappings(containerName).catch(warn("mapping cleanup"));
+    const actions: Array<readonly [string, () => Promise<void>]> = [
+      [
+        "workspace tombstone",
+        () =>
+          recordWorkspaceTombstone({
+            workerId: worker.id,
+            userId: worker.userId,
+            displayName: worker.displayName || worker.id,
+            backend: this.storageManager?.mode ?? "volume",
+            createdAt: worker.createdAt,
+          }),
+      ],
+      ["mapping cleanup", () => cleanupWorkerMappings(containerName)],
+    ];
     if (this.storageManager) {
-      await this.storageManager
-        .removeWorkerWorkspace(worker.userId, worker.id, containerName)
-        .catch(warn("workspace"));
-      await this.storageManager
-        .removeWorkerDocker(containerName)
-        .catch(warn("docker volume"));
-      await this.storageManager
-        .removeWorkerAgents(worker.userId, worker.id, containerName)
-        .catch(warn("agents"));
+      actions.push(
+        [
+          "workspace",
+          () =>
+            this.storageManager!.removeWorkerWorkspace(
+              worker.userId,
+              worker.id,
+              containerName,
+            ),
+        ],
+        [
+          "Docker data",
+          () => this.storageManager!.removeWorkerDocker(containerName),
+        ],
+        [
+          "agent data",
+          () =>
+            this.storageManager!.removeWorkerAgents(
+              worker.userId,
+              worker.id,
+              containerName,
+            ),
+        ],
+      );
     }
     if (worker.importedImage?.startsWith(IMPORT_IMAGE_PREFIX)) {
-      await this.dockerService
-        .removeImage(worker.importedImage)
-        .catch(warn("imported image"));
+      actions.push([
+        "imported image",
+        () => this.dockerService.removeImage(worker.importedImage!),
+      ]);
+    }
+    actions.push(
+      [
+        "import-created environment",
+        () => this.cleanupImportCreatedEnvironment(worker.userId, worker.id),
+      ],
+      [
+        "worker-local configuration",
+        () => useWorkerConfigStore().remove(worker.userId, worker.id),
+      ],
+    );
+    const failures = await collectWorkerCleanupFailures(actions);
+    if (failures.length) {
+      throw Object.assign(
+        new Error(`Archived worker cleanup incomplete: ${failures.join(", ")}`),
+        { code: "WORKER_DELETE_CLEANUP_INCOMPLETE", failures },
+      );
     }
     await this.workerStore.delete(worker.userId, worker.id);
-    await useWorkerConfigStore()
-      .remove(worker.userId, worker.id)
-      .catch(warn("worker-local configuration"));
+    this.importCreatedEnvironments.delete(worker.id);
+  }
+
+  /** Remove every ordinary runtime and archived worker for an auth user that no
+   * longer exists. OrphanSweeper calls this while holding the owner lifecycle
+   * fence; each worker fence is then acquired in the canonical owner→worker
+   * order. Any cleanup failure aborts durable owner-store deletion so the next
+   * sweep retains enough identity to retry. */
+  async removeWorkersForDeletedOwner(userId: string): Promise<void> {
+    const liveIds = this.list()
+      .filter(
+        (worker) =>
+          worker.userId === userId && !worker.administrativeKind,
+      )
+      .map((worker) => worker.id);
+    for (const id of liveIds) {
+      await withWorkerLifecycleMutation(id, () => this.removeUnlocked(id));
+    }
+
+    for (const worker of this.workerStore?.listForUser(userId) ?? []) {
+      if (liveIds.includes(worker.id)) continue;
+      await withWorkerLifecycleMutation(worker.id, async () => {
+        if (worker.status === "archived") {
+          await this.deleteArchivedUnlocked(userId, worker.id);
+          return;
+        }
+        // A crash or failed recreation can leave a durable active record whose
+        // deterministic Docker container was not loaded into the live map.
+        // Rehydrate a recovery handle so ordinary idempotent deletion removes
+        // the container (if present), volumes, images and configuration.
+        const containerName = this.buildContainerName(worker.id);
+        this.containers.set(worker.id, {
+          id: worker.id,
+          userId: worker.userId,
+          createdAt: worker.createdAt,
+          updatedAt: worker.updatedAt,
+          containerId: containerName,
+          containerName,
+          displayName: worker.displayName,
+          imageName: worker.imageRuntimeReference ||
+            this.config.workerImagePrefix + this.config.workerImage,
+          imageId: worker.imageDigest || "",
+          status: "error",
+          repos: worker.repos,
+          mounts: worker.mounts,
+          initScript: worker.initScript,
+          environmentId: worker.environmentId,
+          excludedGlobalEnvVarKeys: worker.excludedGlobalEnvVarKeys ?? [],
+          excludedGroupEnvVarKeys: worker.excludedGroupEnvVarKeys ?? [],
+          pendingRebuild: worker.pendingRebuild,
+          importedImage: worker.importedImage,
+          imageDefinitionId: worker.imageDefinitionId,
+          imageVersion: worker.imageVersion,
+          imageDigest: worker.imageDigest,
+          imageRuntimeReference: worker.imageRuntimeReference,
+        });
+        await this.removeUnlocked(worker.id);
+      });
+    }
+  }
+
+  /** Roll a failed rebuild/unarchive back to a durable archived worker without
+   * deleting persistent workspace, agent, DinD, image or configuration data.
+   * If Docker cannot remove the replacement, retain both an in-memory and
+   * durable active error handle for an explicit lifecycle retry. */
+  private async rollbackFailedRecreation(
+    info: ContainerInfo,
+    containerId: string,
+    cause: unknown,
+  ): Promise<never> {
+    try {
+      await removeDockerContainerIdempotently(() =>
+        this.dockerService.removeContainer(containerId),
+      );
+      useLogCollector().detach(containerId);
+    } catch (removalError) {
+      info.status = "error";
+      info.updatedAt = new Date().toISOString();
+      this.containers.set(info.id, info);
+      let persistenceError: unknown;
+      try {
+        await this.workerStore?.upsert(this.containerInfoToWorkerRecord(info));
+      } catch (error) {
+        persistenceError = error;
+      }
+      throw Object.assign(
+        new Error(`Worker recreation rollback retained container ${info.containerName}`),
+        {
+          code: "WORKER_RECREATE_CONTAINER_RETAINED",
+          cause,
+          removalError,
+          ...(persistenceError ? { persistenceError } : {}),
+        },
+      );
+    }
+
+    try {
+      const record = this.workerStore?.get(info.userId, info.id);
+      if (record && record.status !== "archived") {
+        await this.workerStore!.archive(info.userId, info.id);
+      }
+      this.containers.delete(info.id);
+    } catch (persistenceError) {
+      info.containerId = info.containerName;
+      info.status = "error";
+      info.updatedAt = new Date().toISOString();
+      this.containers.set(info.id, info);
+      throw Object.assign(
+        new Error(`Worker recreation rollback could not persist archive ${info.containerName}`),
+        {
+          code: "WORKER_RECREATE_ROLLBACK_INCOMPLETE",
+          cause,
+          persistenceError,
+        },
+      );
+    }
+    throw cause;
   }
 
   // --- Worker export / import ---
@@ -2253,8 +2894,26 @@ export class ContainerManager {
     opts: { displayName?: string },
   ): Promise<ContainerInfo & { missingSecrets?: string[] }> {
     if (!userId) throw new Error("import: userId is required");
+    // Environment recreation is visible owner-wide. Share the owner mutation
+    // fence with ordinary worker creation/settings and orphan cleanup so the
+    // reference check plus any rollback deletion is atomic for that owner.
+    return withOwnerLifecycleMutation(userId, () => {
+      if (!getUserById(userId))
+        throw Object.assign(new Error("Worker owner not found"), {
+          statusCode: 404,
+        });
+      return this.importWorkerForOwner(userId, bundlePath, opts);
+    });
+  }
 
+  private async importWorkerForOwner(
+    userId: string,
+    bundlePath: string,
+    opts: { displayName?: string },
+  ): Promise<ContainerInfo & { missingSecrets?: string[] }> {
     const workDir = join(this.config.dataDir, "tmp", `import-${randomUUID()}`);
+    let createdImportEnvironmentId: string | undefined;
+    let provisionalWorkerId: string | undefined;
     try {
       const {
         manifest,
@@ -2278,12 +2937,23 @@ export class ContainerManager {
           ? validateGzipTarPayload(rootfsPath)
           : validateTarPayload(rootfsPath));
 
-      const environmentId = await this.resolveImportEnvironment(
+      const environment = await this.resolveImportEnvironment(
         userId,
         manifest.environment,
       );
+      const environmentId = environment.id;
+      if (environment.created) createdImportEnvironmentId = environment.id;
 
       const id = randomUUID();
+      provisionalWorkerId = id;
+      if (createdImportEnvironmentId) {
+        this.importCreatedEnvironments.set(id, createdImportEnvironmentId);
+      }
+      // Once the provisional identity becomes externally visible, use the
+      // same per-worker lifecycle queue as DELETE/archive/rebuild. A deletion
+      // that arrives during import must run after import settles and must never
+      // be followed by the import resurrecting the worker.
+      return await withWorkerLifecycleMutation(id, async () => {
       const displayName = (
         opts.displayName?.trim() ||
         manifest.worker?.displayName ||
@@ -2317,8 +2987,9 @@ export class ContainerManager {
       let importedImage: string | undefined;
       let imageConfig: ImageConfigOverride | undefined;
       if (rootfsPath && manifest.contents?.rootfs) {
+        const repo = `${IMPORT_IMAGE_PREFIX}${id}`;
+        const candidateImage = `${repo}:latest`;
         try {
-          const repo = `${IMPORT_IMAGE_PREFIX}${id}`;
           importedImage = await this.dockerService.importImage(
             createReadStream(rootfsPath),
             repo,
@@ -2329,6 +3000,12 @@ export class ContainerManager {
           await this.dockerService.ensureImage(standard);
           imageConfig = await this.dockerService.inspectImageConfig(standard);
         } catch (err) {
+          // Docker can create the tagged image before its progress stream
+          // reports a later error. Remove the deterministic candidate even
+          // when importImage rejected before returning its reference.
+          await removeFailedImportedImage(candidateImage, () =>
+            this.dockerService.removeImage(candidateImage),
+          );
           useLogger().warn(
             `[container] import: rootfs import failed, using standard image: ${err instanceof Error ? err.message : err}`,
           );
@@ -2337,32 +3014,101 @@ export class ContainerManager {
         }
       }
 
+      // Register the deterministic identity before asking Docker to create the
+      // container. If creation/start/restore fails and Docker cannot confirm
+      // removal, this provisional entry is the authoritative handle that lets
+      // the owner retry deletion by stable worker UUID instead of leaving only
+      // an operator-facing Docker name behind.
+      const imageName =
+        importedImage ||
+        this.config.workerImagePrefix + this.config.workerImage;
+      const now = new Date().toISOString();
+      const containerInfo: ContainerInfo = {
+        id,
+        userId,
+        createdAt: now,
+        updatedAt: now,
+        containerId: containerName,
+        containerName,
+        displayName,
+        imageName,
+        imageId: "",
+        status: "creating",
+        repos: repos.length > 0 ? repos : undefined,
+        mounts: mounts.length > 0 ? mounts : undefined,
+        initScript: initScript || undefined,
+        environmentId,
+        pendingRebuild: false,
+        ...(importedImage ? { importedImage } : {}),
+      };
+      this.containers.set(id, containerInfo);
+
+      // Persist the provisional identity before the first container mutation.
+      // If the orchestrator restarts after an ambiguous Docker failure, sync()
+      // can still resolve the container label to its owner; if Docker never
+      // created it, startup reconciliation archives the record for retryable
+      // cleanup through the normal archived-worker path.
+      try {
+        if (this.workerStore) {
+          await this.workerStore.upsert(
+            this.containerInfoToWorkerRecord(containerInfo),
+          );
+        }
+      } catch (err) {
+        await this.rollbackFailedProvisionedWorker({
+          id,
+          userId,
+          containerId: containerName,
+          containerName,
+          dockerEnabled,
+          importedImage,
+        });
+        throw err;
+      }
+
       // Create the container stopped so volumes can be populated before the
       // entrypoint runs, then restore the volume tars, then start.
-      const container = await this.dockerService.createWorkerContainer({
-        userId,
-        id,
-        containerName,
-        cpuLimit,
-        memoryLimit,
-        mounts,
-        dockerEnabled,
-        credentialBinds,
-        environmentJson: envConfig.environmentJson,
-        capabilitiesJson: envConfig.capabilitiesJson,
-        instructionsJson: envConfig.instructionsJson,
-        workerJson,
-        storageManager: this.storageManager,
-        userEnv,
-        workerConfig,
-        image: importedImage,
-        imageConfig,
-        start: false,
-      });
+      let container: Awaited<ReturnType<DockerService["createWorkerContainer"]>>;
+      try {
+        container = await this.dockerService.createWorkerContainer({
+          userId,
+          id,
+          containerName,
+          cpuLimit,
+          memoryLimit,
+          mounts,
+          dockerEnabled,
+          credentialBinds,
+          environmentJson: envConfig.environmentJson,
+          capabilitiesJson: envConfig.capabilitiesJson,
+          instructionsJson: envConfig.instructionsJson,
+          workerJson,
+          storageManager: this.storageManager,
+          userEnv,
+          workerConfig,
+          image: importedImage,
+          imageConfig,
+          start: false,
+        });
+        containerInfo.containerId = container.id;
+        containerInfo.imageId = (await container.inspect()).Image || "";
+      } catch (err) {
+        // createWorkerContainer may already have created persistent storage
+        // before image/container creation fails. The deterministic container
+        // name is also a valid Docker removal target if creation got that far.
+        await this.rollbackFailedProvisionedWorker({
+          id,
+          userId,
+          containerId: containerName,
+          containerName,
+          dockerEnabled,
+          importedImage,
+        });
+        throw err;
+      }
 
-      // Restore the volumes and start. If anything here fails, the container was
-      // created but never registered — roll it back (and the per-worker image)
-      // so a failed import doesn't leak an orphan container/image/volumes.
+      // Restore the volumes and start. If anything here fails, roll back the
+      // container and every resource it created.
       try {
         if (workspacePath) {
           await this.dockerService.putArchive(
@@ -2383,57 +3129,42 @@ export class ContainerManager {
           container.id,
           workerConfig,
         );
+        containerInfo.status = "running";
+        containerInfo.updatedAt = new Date().toISOString();
       } catch (err) {
-        await this.dockerService.removeContainer(container.id).catch(() => {});
-        if (this.storageManager) {
-          await this.storageManager
-            .removeWorkerWorkspace(userId, id, containerName)
-            .catch(() => {});
-          await this.storageManager
-            .removeWorkerAgents(userId, id, containerName)
-            .catch(() => {});
-          if (dockerEnabled)
-            await this.storageManager
-              .removeWorkerDocker(containerName)
-              .catch(() => {});
-        }
-        if (importedImage)
-          await this.dockerService.removeImage(importedImage).catch(() => {});
+        await this.rollbackFailedProvisionedWorker({
+          id,
+          userId,
+          containerId: container.id,
+          containerName,
+          dockerEnabled,
+          importedImage,
+        });
         throw err;
       }
 
-      const imageName =
-        importedImage ||
-        this.config.workerImagePrefix + this.config.workerImage;
-      const now = new Date().toISOString();
-      const containerInfo: ContainerInfo = {
-        id,
-        userId,
-        createdAt: now,
-        updatedAt: now,
-        containerId: container.id,
-        containerName,
-        displayName,
-        imageName,
-        imageId: "",
-        status: "running",
-        repos: repos.length > 0 ? repos : undefined,
-        mounts: mounts.length > 0 ? mounts : undefined,
-        initScript: initScript || undefined,
-        environmentId,
-        pendingRebuild: false,
-        ...(importedImage ? { importedImage } : {}),
-      };
-      this.containers.set(id, containerInfo);
-      await useWorkerConfigStore().markApplied(userId, id);
-
-      if (this.workerStore) {
-        await this.workerStore.upsert(
-          this.containerInfoToWorkerRecord(containerInfo),
-        );
+      // A record write can fail after the container has started and entered the
+      // in-memory map. Roll it back just like a volume-restore failure so the
+      // caller never loses the only handle to a live imported worker.
+      try {
+        await useWorkerConfigStore().markApplied(userId, id);
+        if (this.workerStore) {
+          await this.workerStore.upsert(
+            this.containerInfoToWorkerRecord(containerInfo),
+          );
+        }
+        await this.recreateImportedMappings(userId, id, containerName, manifest);
+      } catch (err) {
+        await this.rollbackFailedProvisionedWorker({
+          id,
+          userId,
+          containerId: container.id,
+          containerName,
+          dockerEnabled,
+          importedImage,
+        });
+        throw err;
       }
-
-      await this.recreateImportedMappings(userId, id, containerName, manifest);
 
       useLogCollector()
         .attach(containerName, container.id, "worker", displayName)
@@ -2448,8 +3179,166 @@ export class ContainerManager {
           ? { missingSecrets: manifest.missingSecrets }
           : {}),
       };
+      });
+    } catch (error) {
+      const rollbackDebtRetainsEnvironment =
+        importRollbackRetainsEnvironment(error);
+      const rollbackRetainsEnvironment =
+        rollbackDebtRetainsEnvironment ||
+        (!!createdImportEnvironmentId &&
+          this.importEnvironmentIsReferenced(
+            userId,
+            createdImportEnvironmentId,
+          ));
+      const environmentStore = this.environmentStore;
+      if (createdImportEnvironmentId && environmentStore) {
+        try {
+          await rollbackCreatedImportEnvironment(
+            createdImportEnvironmentId,
+            rollbackRetainsEnvironment,
+            (environmentId) => environmentStore.delete(environmentId),
+          );
+          if (!rollbackDebtRetainsEnvironment && provisionalWorkerId) {
+            this.importCreatedEnvironments.delete(provisionalWorkerId);
+          }
+        } catch (cleanupError) {
+          useLogger().error(
+            `[container] import environment rollback incomplete for ${createdImportEnvironmentId}: ${cleanupError instanceof Error ? cleanupError.message : cleanupError}`,
+          );
+          throw Object.assign(
+            new Error(
+              `Imported environment cleanup requires operator attention: ${createdImportEnvironmentId}`,
+            ),
+            { cause: cleanupError },
+          );
+        }
+      }
+      throw error;
     } finally {
       await rm(workDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  /** A recreated import environment stops being exclusively owned by the
+   * failing import as soon as any durable or live worker references it. Keep it
+   * in that case: deleting it would make a later rebuild silently fall back to
+   * the default (potentially less restrictive) network policy. */
+  private importEnvironmentIsReferenced(
+    userId: string,
+    environmentId: string,
+    exceptWorkerId?: string,
+  ): boolean {
+    return importEnvironmentReferenced(
+      userId,
+      environmentId,
+      this.containers.values(),
+      this.workerStore?.listForUser(userId) ?? [],
+      exceptWorkerId,
+    );
+  }
+
+  /** Delete an import-created environment only when the provisional worker is
+   * its final reference. The caller holds the owner lifecycle fence, so no
+   * create/settings request can adopt it between this check and deletion. */
+  private async cleanupImportCreatedEnvironment(
+    userId: string,
+    workerId: string,
+  ): Promise<void> {
+    const environmentId =
+      this.importCreatedEnvironments.get(workerId) ??
+      this.workerStore?.get(userId, workerId)?.importCreatedEnvironmentId;
+    if (!environmentId) return;
+    if (
+      !this.importEnvironmentIsReferenced(userId, environmentId, workerId) &&
+      this.environmentStore
+    ) {
+      // A previous cleanup attempt may already have removed it before a later
+      // independent action failed. Absence is the desired state, so retries
+      // must not wedge a deletion-pending worker forever.
+      await removeImportEnvironmentIdempotently(
+        environmentId,
+        (id) => Boolean(this.environmentStore?.getById(id)),
+        (id) => this.environmentStore!.delete(id),
+      );
+    }
+    this.importCreatedEnvironments.delete(workerId);
+  }
+
+  /** Best-effort rollback for every mutation made after import container
+   * creation. Keep this separate from the public remove() path: the worker may
+   * not have persisted successfully, yet its container and volumes already
+   * exist and must not survive as an untracked orphan. */
+  private async rollbackFailedProvisionedWorker(input: {
+    id: string;
+    userId: string;
+    containerId: string;
+    containerName: string;
+    dockerEnabled: boolean;
+    importedImage?: string;
+  }): Promise<void> {
+    const { id, userId, containerId, containerName, dockerEnabled, importedImage } =
+      input;
+    try {
+      await rollbackFailedWorkerImport({
+        removeFromMemory: () => this.containers.delete(id),
+        removeMappings: () => cleanupWorkerMappings(containerName),
+        removeWorkerRecord: async () => {
+          const store = this.workerStore;
+          if (!store?.get(userId, id)) return;
+          await store.delete(userId, id);
+        },
+        removeWorkerConfiguration: () =>
+          useWorkerConfigStore().remove(userId, id),
+        // A create failure may occur before Docker materializes the named
+        // container. Absence is the desired rollback state.
+        removeContainer: () =>
+          removeDockerContainerIdempotently(() =>
+            this.dockerService.removeContainer(containerId),
+          ),
+        removeWorkspace: () =>
+          this.storageManager?.removeWorkerWorkspace(
+            userId,
+            id,
+            containerName,
+          ) ?? Promise.resolve(),
+        removeAgents: () =>
+          this.storageManager?.removeWorkerAgents(userId, id, containerName) ??
+          Promise.resolve(),
+        ...(dockerEnabled && this.storageManager
+          ? {
+              removeDocker: () =>
+                this.storageManager!.removeWorkerDocker(containerName),
+            }
+          : {}),
+        ...(importedImage
+          ? {
+              removeImportedImage: () =>
+                this.dockerService.removeImage(importedImage),
+            }
+          : {}),
+      });
+    } catch (error) {
+      useLogger().error(
+        `[container] worker provisioning rollback incomplete for ${containerName}: ${error instanceof Error ? error.message : error}`,
+      );
+      throw Object.assign(
+        new Error(
+          `Imported worker cleanup requires operator attention: ${containerName}`,
+        ),
+        {
+          cause: error,
+          ...((error as { code?: string })?.code
+            ? { code: (error as { code: string }).code }
+            : {}),
+          ...(Array.isArray((error as { failures?: unknown })?.failures)
+            ? {
+                failures: [
+                  ...((error as { failures: string[] }).failures),
+                ],
+              }
+            : {}),
+        },
+      );
     }
   }
 
@@ -2459,17 +3348,21 @@ export class ContainerManager {
   private async resolveImportEnvironment(
     userId: string,
     env: Environment | undefined,
-  ): Promise<string> {
-    if (!this.environmentStore || !env) return DEFAULT_ENVIRONMENT_ID;
+  ): Promise<{ id: string; created: boolean }> {
+    if (!this.environmentStore || !env)
+      return { id: DEFAULT_ENVIRONMENT_ID, created: false };
     if (env.builtIn) {
-      return this.environmentStore.getById(env.id)
-        ? env.id
-        : DEFAULT_ENVIRONMENT_ID;
+      return {
+        id: this.environmentStore.getById(env.id)
+          ? env.id
+          : DEFAULT_ENVIRONMENT_ID,
+        created: false,
+      };
     }
     const existing = this.environmentStore
       .list()
       .find((e) => e.userId === userId && e.name === env.name);
-    if (existing) return existing.id;
+    if (existing) return { id: existing.id, created: false };
     try {
       const created = await this.environmentStore.create({
         name: env.name,
@@ -2486,12 +3379,12 @@ export class ContainerManager {
         enabledInstructionIds: env.enabledInstructionIds,
         userId,
       });
-      return created.id;
+      return { id: created.id, created: true };
     } catch (err) {
       useLogger().warn(
         `[container] import: could not recreate environment '${env.name}', using default: ${err instanceof Error ? err.message : err}`,
       );
-      return DEFAULT_ENVIRONMENT_ID;
+      return { id: DEFAULT_ENVIRONMENT_ID, created: false };
     }
   }
 
@@ -2563,7 +3456,10 @@ export class ContainerManager {
   }
 
   listArchived(): WorkerRecord[] {
-    return this.workerStore?.listArchived() ?? [];
+    return (this.workerStore?.listArchived() ?? []).map((record) => {
+      const { importCreatedEnvironmentId: _internal, ...publicRecord } = record;
+      return publicRecord;
+    });
   }
 
   async reconcileWorkers(): Promise<void> {
@@ -2604,6 +3500,7 @@ export class ContainerManager {
       initScript: info.initScript,
       pendingRebuild: info.pendingRebuild,
       importedImage: info.importedImage,
+      importCreatedEnvironmentId: this.importCreatedEnvironments.get(info.id),
       imageDefinitionId: info.imageDefinitionId,
       imageVersion: info.imageVersion,
       imageDigest: info.imageDigest,

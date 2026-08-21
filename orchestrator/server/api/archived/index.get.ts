@@ -32,6 +32,10 @@ defineRouteMeta({
               createdAt: { type: 'string', format: 'date-time' },
               updatedAt: { type: 'string', format: 'date-time' },
               archivedAt: { type: 'string', format: 'date-time' },
+              deletionPending: {
+                type: 'boolean',
+                description: 'True when permanent resource cleanup failed and must be retried; such a worker cannot be unarchived.',
+              },
               repos: { type: 'array', items: { $ref: '#/components/schemas/RepoConfig' } },
               mounts: { type: 'array', items: { $ref: '#/components/schemas/MountConfig' } },
               initScript: { type: 'string' },

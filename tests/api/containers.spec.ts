@@ -450,15 +450,20 @@ test.describe('Containers API', () => {
   });
 
   test.describe('State transitions', () => {
-    test('stopping already-stopped container returns error', async ({ request }) => {
+    test('stopping already-stopped container succeeds idempotently', async ({ request }) => {
       const container = await createWorker(request);
       createdContainerIds.push(container.id);
 
       const api = new ApiClient(request);
       await api.stopContainer(container.id);
-      // Stop again — Docker rejects stopping an already-stopped container
-      const { status } = await api.stopContainer(container.id);
-      expect(status).toBeGreaterThanOrEqual(400);
+      // The control plane treats a repeated stop as an idempotent success.
+      const { status, body } = await api.stopContainer(container.id);
+      expect(status).toBe(200);
+      expect(body.ok).toBe(true);
+
+      const { body: containers } = await api.listContainers();
+      const found = containers.find((candidate: { id: string }) => candidate.id === container.id);
+      expect(found?.status).toBe('stopped');
     });
 
     test('restarting a running container succeeds', async ({ request }) => {

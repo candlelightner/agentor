@@ -75,6 +75,7 @@ export class UserEnvVarStore {
   private items = new Map<string, UserEnvVars>();
   private dataDir: string;
   private saveQueues = new Map<string, Promise<void>>();
+  private unavailableUsers = new Set<string>();
 
   constructor(dataDir: string) {
     this.dataDir = dataDir;
@@ -112,70 +113,107 @@ export class UserEnvVarStore {
     try {
       raw = await readFile(filePath, 'utf-8');
     } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        this.unavailableUsers.delete(userId);
+        this.items.delete(userId);
+        return;
+      }
+      this.unavailableUsers.add(userId);
       useLogger().error(`[user-env-store] failed to load ${filePath}: ${err instanceof Error ? err.message : err}`);
       throw err;
     }
-    let parsed: Partial<UserEnvVars>;
+    let parsed: unknown;
     try {
-      parsed = JSON.parse(raw) as Partial<UserEnvVars>;
+      parsed = JSON.parse(raw) as unknown;
     } catch (err: unknown) {
-      // Corrupt JSON (e.g. truncated write). Quarantine (log + skip) rather than
-      // crash the load for every other user.
+      this.unavailableUsers.add(userId);
       useLogger().error(`[user-env-store] corrupt ${filePath} — skipping this user: ${err instanceof Error ? err.message : err}`);
-      return;
+      throw err;
     }
-    const now = new Date().toISOString();
-    // Tolerate a (valid-JSON) file that predates the uniform `envVars` list — a
-    // missing/non-array `envVars` loads as an empty list rather than breaking the
-    // renderer. `userId` is always taken from the directory name, not the file.
-    this.items.set(userId, {
-      userId,
-      createdAt: parsed.createdAt ?? now,
-      updatedAt: parsed.updatedAt ?? now,
-      envVars: Array.isArray(parsed.envVars) ? parsed.envVars : [],
-    });
+    try {
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+        throw new Error('Environment variable state must be an object');
+      const value = parsed as Partial<UserEnvVars>;
+      if (value.userId !== userId)
+        throw new Error('Persisted environment variable owner mismatch');
+      if (value.createdAt !== undefined && typeof value.createdAt !== 'string')
+        throw new Error('Invalid environment variable createdAt');
+      if (value.updatedAt !== undefined && typeof value.updatedAt !== 'string')
+        throw new Error('Invalid environment variable updatedAt');
+      if (value.envVars !== undefined && !Array.isArray(value.envVars))
+        throw new Error('Persisted envVars must be an array');
+      const now = new Date().toISOString();
+      this.items.set(userId, {
+        userId,
+        createdAt: value.createdAt ?? now,
+        updatedAt: value.updatedAt ?? now,
+        envVars: validatePersistedEnvVars(value.envVars ?? []),
+      });
+      this.unavailableUsers.delete(userId);
+    } catch (err) {
+      this.unavailableUsers.add(userId);
+      useLogger().error(
+        `[user-env-store] corrupt ${filePath} — skipping this user: ${err instanceof Error ? err.message : err}`,
+      );
+      throw err;
+    }
   }
 
   list(): UserEnvVars[] {
-    return Array.from(this.items.values());
+    return Array.from(this.items, ([userId, item]) =>
+      this.unavailableUsers.has(userId) ? undefined : structuredClone(item),
+    ).filter((item): item is UserEnvVars => item !== undefined);
   }
 
   getOrDefault(userId: string): UserEnvVars {
-    return this.items.get(userId) ?? zeroUserEnvVars(userId);
+    this.assertAvailable(userId);
+    return structuredClone(this.items.get(userId) ?? zeroUserEnvVars(userId));
   }
 
   async upsert(userId: string, input: UserEnvVarsInput): Promise<UserEnvVars> {
     assertSafeUserId(userId);
-    const existing = this.items.get(userId) ?? zeroUserEnvVars(userId);
-    const envVars = input.envVars !== undefined
-      ? sanitizeEnvVars(input.envVars)
-      : existing.envVars;
+    return this.withUserMutation(userId, async () => {
+      const previous = this.items.get(userId);
+      const existing = previous ?? zeroUserEnvVars(userId);
+      const envVars = input.envVars !== undefined
+        ? sanitizeEnvVars(input.envVars)
+        : existing.envVars;
 
-    const merged: UserEnvVars = {
-      userId,
-      createdAt: existing.createdAt && existing.createdAt !== new Date(0).toISOString()
-        ? existing.createdAt
-        : new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      envVars,
-    };
-    this.items.set(userId, merged);
-    await this.persist(userId);
-    useLogger().debug(`[user-env-store] upserted env vars for user ${userId}`);
-    return merged;
+      const merged: UserEnvVars = {
+        userId,
+        createdAt: existing.createdAt && existing.createdAt !== new Date(0).toISOString()
+          ? existing.createdAt
+          : new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        envVars,
+      };
+      this.items.set(userId, merged);
+      try {
+        await this.write(userId);
+      } catch (error) {
+        if (previous) this.items.set(userId, previous);
+        else this.items.delete(userId);
+        throw error;
+      }
+      useLogger().debug(`[user-env-store] upserted env vars for user ${userId}`);
+      return structuredClone(merged);
+    });
   }
 
   async delete(userId: string): Promise<void> {
     assertSafeUserId(userId);
-    if (!this.items.has(userId)) return;
-    this.items.delete(userId);
-    try {
-      await rm(this.filePath(userId), { force: true });
-    } catch {
-      // best effort — directory may already be gone
-    }
-    useLogger().info(`[user-env-store] removed env vars for user ${userId}`);
+    return this.withUserMutation(userId, async () => {
+      const previous = this.items.get(userId);
+      this.items.delete(userId);
+      try {
+        await rm(this.filePath(userId), { force: true });
+      } catch (error) {
+        if (previous) this.items.set(userId, previous);
+        throw error;
+      }
+      this.unavailableUsers.delete(userId);
+      useLogger().info(`[user-env-store] removed env vars for user ${userId}`);
+    }, true);
   }
 
   private filePath(userId: string): string {
@@ -183,11 +221,26 @@ export class UserEnvVarStore {
     return join(this.dataDir, 'users', userId, FILENAME);
   }
 
-  private persist(userId: string): Promise<void> {
+  private withUserMutation<T>(
+    userId: string,
+    operation: () => Promise<T>,
+    allowUnavailable = false,
+  ): Promise<T> {
     const prev = this.saveQueues.get(userId) ?? Promise.resolve();
-    const next = prev.then(() => this.write(userId));
-    this.saveQueues.set(userId, next.catch(() => {}));
+    const next = prev.then(() => {
+      if (!allowUnavailable) this.assertAvailable(userId);
+      return operation();
+    });
+    this.saveQueues.set(userId, next.then(() => undefined, () => undefined));
     return next;
+  }
+
+  private assertAvailable(userId: string): void {
+    if (!this.unavailableUsers.has(userId)) return;
+    throw Object.assign(
+      new Error(`Stored ${FILENAME} data is unavailable for this owner`),
+      { statusCode: 503 },
+    );
   }
 
   private async write(userId: string): Promise<void> {
@@ -233,6 +286,23 @@ function sanitizeEnvVars(input: UserEnvVar[]): UserEnvVar[] {
     out.push({ key, value: entry.value });
   }
   return out;
+}
+
+/** Disk input is not an interactive form: dropping malformed rows would make
+ * the next save silently destroy evidence and potentially remove credentials. */
+function validatePersistedEnvVars(input: UserEnvVar[]): UserEnvVar[] {
+  for (const entry of input) {
+    if (
+      !entry ||
+      typeof entry !== 'object' ||
+      typeof entry.key !== 'string' ||
+      !entry.key.trim() ||
+      typeof entry.value !== 'string'
+    ) {
+      throw new Error('Invalid persisted environment variable entry');
+    }
+  }
+  return sanitizeEnvVars(input);
 }
 
 /** Render user env vars as a list of `KEY=VALUE` strings, skipping empty values.

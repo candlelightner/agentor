@@ -11,13 +11,25 @@ import type { WorkerGroup } from "./worker-group-store";
 import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 import { verifyWorkerMutationUnlocks } from "./worker-protection-lock";
 
-type WorkerGroupPatch = Pick<Partial<WorkerGroup>, "name" | "workerIds"> & { parentId?: string | null };
+type WorkerGroupPatch = Pick<Partial<WorkerGroup>, "name" | "workerIds"> & {
+  parentId?: string | null;
+};
 type Reconciliation = { workerIds: string[]; partialFailures: string[] };
 
 interface GroupStoreLike {
   listForUser(userId: string): WorkerGroup[];
   get(userId: string, groupId: string): WorkerGroup | undefined;
-  update(userId: string, groupId: string, patch: WorkerGroupPatch): Promise<WorkerGroup>;
+  update(
+    userId: string,
+    groupId: string,
+    patch: WorkerGroupPatch,
+  ): Promise<WorkerGroup>;
+  assignWorker(
+    userId: string,
+    workerId: string,
+    expectedSourceId: string | undefined,
+    targetGroupId: string | null,
+  ): Promise<WorkerGroup | null>;
   remove(userId: string, groupId: string): Promise<void>;
 }
 interface NetworkStoreLike {
@@ -25,7 +37,10 @@ interface NetworkStoreLike {
   get(userId: string, networkId: string): ManagedNetwork | undefined;
 }
 interface NetworkManagerLike {
-  reconcile(network: ManagedNetwork, workerIds?: Iterable<string>): Promise<Reconciliation>;
+  reconcile(
+    network: ManagedNetwork,
+    workerIds?: Iterable<string>,
+  ): Promise<Reconciliation>;
 }
 export interface WorkerGroupNetworkDependencies {
   groups: GroupStoreLike;
@@ -40,12 +55,17 @@ export interface WorkerGroupNetworkDependencies {
 export class WorkerGroupNetworkCoordinator {
   private queues = new Map<string, Promise<void>>();
 
-  constructor(private readonly dependencies: WorkerGroupNetworkDependencies = productionDependencies()) {}
+  constructor(
+    private readonly dependencies: WorkerGroupNetworkDependencies = productionDependencies(),
+  ) {}
 
   withOwner<T>(userId: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.queues.get(userId) ?? Promise.resolve();
     const result = previous.catch(() => undefined).then(operation);
-    const tail = result.then(() => undefined, () => undefined);
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
     this.queues.set(userId, tail);
     void tail.finally(() => {
       if (this.queues.get(userId) === tail) this.queues.delete(userId);
@@ -88,15 +108,32 @@ export class WorkerGroupNetworkCoordinator {
     });
   }
 
-  assignWorker(userId: string, workerId: string, targetGroupId: string | null, lockPasswords?: unknown, authorize?: (sourceGroupId?: string, targetGroupId?: string) => void) {
+  assignWorker(
+    userId: string,
+    workerId: string,
+    targetGroupId: string | null,
+    lockPasswords?: unknown,
+    authorize?: (sourceGroupId?: string, targetGroupId?: string) => void,
+  ) {
     return this.withOwner(userId, async () => {
       const { groups } = this.dependencies;
-      const containing = this.dependencies.groups.listForUser(userId)
+      const containing = this.dependencies.groups
+        .listForUser(userId)
         .filter((group) => group.workerIds.includes(workerId));
-      if (containing.length > 1) throw createError({ statusCode: 409, statusMessage: "Worker has conflicting direct group memberships" });
+      if (containing.length > 1)
+        throw createError({
+          statusCode: 409,
+          statusMessage: "Worker has conflicting direct group memberships",
+        });
       const source = containing[0];
-      const target = targetGroupId ? this.dependencies.groups.get(userId, targetGroupId) : undefined;
-      if (targetGroupId && !target) throw createError({ statusCode: 404, statusMessage: "Worker group not found" });
+      const target = targetGroupId
+        ? this.dependencies.groups.get(userId, targetGroupId)
+        : undefined;
+      if (targetGroupId && !target)
+        throw createError({
+          statusCode: 404,
+          statusMessage: "Worker group not found",
+        });
       authorize?.(source?.id, target?.id);
       if (source?.id === targetGroupId) return source;
       await this.dependencies.verify([workerId], lockPasswords);
@@ -109,40 +146,23 @@ export class WorkerGroupNetworkCoordinator {
           affectedGroups.add(item.id);
       }
       const networkIds = this.networkIdsForGroups(userId, affectedGroups);
-      const previousTopology = this.networkMembershipSnapshot(userId, networkIds);
-      let sourceUpdated = false;
-      let targetUpdated = false;
-      try {
-        if (source) {
-          await groups.update(userId, source.id, {
-            workerIds: source.workerIds.filter((id) => id !== workerId),
-          });
-          sourceUpdated = true;
-        }
-        if (target) {
-          await groups.update(userId, target.id, {
-            workerIds: [...new Set([...target.workerIds, workerId])],
-          });
-          targetUpdated = true;
-        }
-      } catch (error) {
-        if (targetUpdated && target)
-          await groups.update(userId, target.id, { workerIds: target.workerIds }).catch(() => undefined);
-        if (sourceUpdated && source)
-          await groups.update(userId, source.id, { workerIds: source.workerIds }).catch(() => undefined);
-        throw error;
-      }
+      const previousTopology = this.networkMembershipSnapshot(
+        userId,
+        networkIds,
+      );
+      await groups.assignWorker(userId, workerId, source?.id, targetGroupId);
 
       const failures = await this.reconcileAll(userId, networkIds);
       if (!failures.length) return target ?? null;
       const rollbackFailures: string[] = [];
-      if (target && targetUpdated)
-        await groups.update(userId, target.id, { workerIds: target.workerIds })
-          .catch((error) => rollbackFailures.push(`target membership: ${safeMessage(error)}`));
-      if (source && sourceUpdated)
-        await groups.update(userId, source.id, { workerIds: source.workerIds })
-          .catch((error) => rollbackFailures.push(`source membership: ${safeMessage(error)}`));
-      rollbackFailures.push(...await this.reconcileSnapshot(userId, previousTopology));
+      await groups
+        .assignWorker(userId, workerId, target?.id, source?.id ?? null)
+        .catch((error) =>
+          rollbackFailures.push(`membership: ${safeMessage(error)}`),
+        );
+      rollbackFailures.push(
+        ...(await this.reconcileSnapshot(userId, previousTopology)),
+      );
       throw createError({
         statusCode: 409,
         statusMessage: `Worker group network reconciliation failed: ${failures.join("; ")}. ${rollbackFailures.length ? `Rollback failed: ${rollbackFailures.join("; ")}` : "Previous memberships and topology restored."}`,
@@ -156,86 +176,116 @@ export class WorkerGroupNetworkCoordinator {
     resolvePatch: (current: WorkerGroup) => WorkerGroupPatch,
     lockPasswords?: unknown,
   ) {
-      const { groups } = this.dependencies;
-      const existing = groups.get(userId, groupId);
-      if (!existing)
-        throw createError({ statusCode: 404, statusMessage: "Worker group not found" });
-      const patch = resolvePatch(existing);
-      const hierarchy = new WorkerGroupHierarchy(groups);
-      if (patch.parentId !== undefined) hierarchy.validateParent(userId, groupId, patch.parentId);
-      if (patch.workerIds !== undefined) hierarchy.assertMembershipAvailable(userId, groupId, patch.workerIds);
-      const previous = { name: existing.name, workerIds: [...existing.workerIds], parentId: existing.parentId ?? null };
-      const affectedGroups = new Set<string>();
-      if (patch.workerIds !== undefined || patch.parentId !== undefined)
-        for (const item of hierarchy.ancestors(userId, groupId, true))
-          affectedGroups.add(item.id);
-      if (patch.parentId !== undefined && patch.parentId)
-        for (const item of hierarchy.ancestors(userId, patch.parentId, true))
-          affectedGroups.add(item.id);
-      const networkIds = this.networkIdsForGroups(userId, affectedGroups);
-      const previousTopology = this.networkMembershipSnapshot(userId, networkIds);
-
-      if (networkIds.length)
-        await this.dependencies.verify(
-          patch.parentId !== undefined
-            ? hierarchy.subtreeWorkerIds(userId, groupId)
-            : [...new Set([...previous.workerIds, ...(patch.workerIds ?? [])])],
-          lockPasswords,
-        );
-
-      const updated = await groups.update(userId, groupId, patch);
-      if (!networkIds.length) return updated;
-
-      const failures = await this.reconcileAll(userId, networkIds);
-      if (!failures.length) return updated;
-
-      let storageRollbackFailure = "";
-      try {
-        await groups.update(userId, groupId, previous);
-      } catch (error) {
-        storageRollbackFailure = safeMessage(error);
-      }
-      // Restore the exact pre-mutation topology even if persisting the group
-      // rollback itself failed. Each ancestor network has its own snapshot.
-      const topologyRollbackFailures = await this.reconcileSnapshot(userId, previousTopology);
-      const details = [
-        storageRollbackFailure
-          ? `group storage rollback failed: ${storageRollbackFailure}`
-          : "previous group membership restored",
-        topologyRollbackFailures.length
-          ? `topology rollback failed: ${topologyRollbackFailures.join("; ")}`
-          : "previous topology restored",
-      ].join("; ");
+    const { groups } = this.dependencies;
+    const existing = groups.get(userId, groupId);
+    if (!existing)
       throw createError({
-        statusCode: 409,
-        statusMessage: `Worker group network reconciliation failed: ${failures.join("; ")}. ${details}`,
+        statusCode: 404,
+        statusMessage: "Worker group not found",
       });
+    const patch = resolvePatch(existing);
+    const hierarchy = new WorkerGroupHierarchy(groups);
+    if (patch.parentId !== undefined)
+      hierarchy.validateParent(userId, groupId, patch.parentId);
+    if (patch.workerIds !== undefined)
+      hierarchy.assertMembershipAvailable(userId, groupId, patch.workerIds);
+    const previous = {
+      name: existing.name,
+      workerIds: [...existing.workerIds],
+      parentId: existing.parentId ?? null,
+    };
+    const affectedGroups = new Set<string>();
+    if (patch.workerIds !== undefined || patch.parentId !== undefined)
+      for (const item of hierarchy.ancestors(userId, groupId, true))
+        affectedGroups.add(item.id);
+    if (patch.parentId !== undefined && patch.parentId)
+      for (const item of hierarchy.ancestors(userId, patch.parentId, true))
+        affectedGroups.add(item.id);
+    const networkIds = this.networkIdsForGroups(userId, affectedGroups);
+    const previousTopology = this.networkMembershipSnapshot(userId, networkIds);
+
+    if (networkIds.length)
+      await this.dependencies.verify(
+        patch.parentId !== undefined
+          ? hierarchy.subtreeWorkerIds(userId, groupId)
+          : [...new Set([...previous.workerIds, ...(patch.workerIds ?? [])])],
+        lockPasswords,
+      );
+
+    const updated = await groups.update(userId, groupId, patch);
+    if (!networkIds.length) return updated;
+
+    const failures = await this.reconcileAll(userId, networkIds);
+    if (!failures.length) return updated;
+
+    let storageRollbackFailure = "";
+    try {
+      await groups.update(userId, groupId, previous);
+    } catch (error) {
+      storageRollbackFailure = safeMessage(error);
+    }
+    // Restore the exact pre-mutation topology even if persisting the group
+    // rollback itself failed. Each ancestor network has its own snapshot.
+    const topologyRollbackFailures = await this.reconcileSnapshot(
+      userId,
+      previousTopology,
+    );
+    const details = [
+      storageRollbackFailure
+        ? `group storage rollback failed: ${storageRollbackFailure}`
+        : "previous group membership restored",
+      topologyRollbackFailures.length
+        ? `topology rollback failed: ${topologyRollbackFailures.join("; ")}`
+        : "previous topology restored",
+    ].join("; ");
+    throw createError({
+      statusCode: 409,
+      statusMessage: `Worker group network reconciliation failed: ${failures.join("; ")}. ${details}`,
+    });
   }
 
-  delete(userId: string, groupId: string, beforeRemove?: () => Promise<void | (() => Promise<void>)>) {
+  delete(
+    userId: string,
+    groupId: string,
+    beforeRemove?: () => Promise<void | (() => Promise<void>)>,
+  ) {
     return this.withOwner(userId, async () => {
       this.assertCanDelete(userId, groupId);
       const rollback = await beforeRemove?.();
-      try { await this.dependencies.groups.remove(userId, groupId); }
-      catch (error) { await rollback?.().catch(() => undefined); throw error; }
+      try {
+        await this.dependencies.groups.remove(userId, groupId);
+      } catch (error) {
+        await rollback?.().catch(() => undefined);
+        throw error;
+      }
     });
   }
 
   managedNetworksForGroup(userId: string, groupId: string) {
     return this.dependencies.networks
       .listForUser(userId)
-      .filter((network) => network.scope === "group" && network.groupId === groupId);
+      .filter(
+        (network) => network.scope === "group" && network.groupId === groupId,
+      );
   }
 
   private networkIdsForGroups(userId: string, groupIds: Iterable<string>) {
     const ids = new Set(groupIds);
     return this.dependencies.networks
       .listForUser(userId)
-      .filter((network) => network.scope === "group" && !!network.groupId && ids.has(network.groupId))
+      .filter(
+        (network) =>
+          network.scope === "group" &&
+          !!network.groupId &&
+          ids.has(network.groupId),
+      )
       .map((network) => network.id);
   }
 
-  private networkMembershipSnapshot(userId: string, networkIds: Iterable<string>) {
+  private networkMembershipSnapshot(
+    userId: string,
+    networkIds: Iterable<string>,
+  ) {
     const hierarchy = new WorkerGroupHierarchy(this.dependencies.groups);
     const snapshot = new Map<string, string[]>();
     for (const networkId of networkIds) {
@@ -249,17 +299,29 @@ export class WorkerGroupNetworkCoordinator {
     return snapshot;
   }
 
-  private async reconcileSnapshot(userId: string, snapshot: Map<string, string[]>) {
+  private async reconcileSnapshot(
+    userId: string,
+    snapshot: Map<string, string[]>,
+  ) {
     const failures: string[] = [];
     for (const [networkId, workerIds] of snapshot) {
       const network = this.dependencies.networks.get(userId, networkId);
       if (!network) {
-        failures.push(`${networkId}: managed network disappeared during rollback`);
+        failures.push(
+          `${networkId}: managed network disappeared during rollback`,
+        );
         continue;
       }
       try {
-        const result = await this.dependencies.manager.reconcile(network, workerIds);
-        failures.push(...result.partialFailures.map((failure) => `${network.name}: ${failure}`));
+        const result = await this.dependencies.manager.reconcile(
+          network,
+          workerIds,
+        );
+        failures.push(
+          ...result.partialFailures.map(
+            (failure) => `${network.name}: ${failure}`,
+          ),
+        );
       } catch (error) {
         failures.push(`${network.name}: ${safeMessage(error)}`);
       }
@@ -270,11 +332,23 @@ export class WorkerGroupNetworkCoordinator {
   assertCanDelete(userId: string, groupId: string) {
     const hierarchy = new WorkerGroupHierarchy(this.dependencies.groups);
     const group = this.dependencies.groups.get(userId, groupId);
-    if (!group) throw createError({ statusCode: 404, statusMessage: "Worker group not found" });
+    if (!group)
+      throw createError({
+        statusCode: 404,
+        statusMessage: "Worker group not found",
+      });
     if (hierarchy.descendants(userId, groupId).length)
-      throw createError({ statusCode: 409, statusMessage: "Worker group has child groups. Move or delete them first." });
+      throw createError({
+        statusCode: 409,
+        statusMessage:
+          "Worker group has child groups. Move or delete them first.",
+      });
     if (group.workerIds.length)
-      throw createError({ statusCode: 409, statusMessage: "Worker group has direct workers. Move or unassign them first." });
+      throw createError({
+        statusCode: 409,
+        statusMessage:
+          "Worker group has direct workers. Move or unassign them first.",
+      });
     const references = this.managedNetworksForGroup(userId, groupId);
     if (!references.length) return;
     const labels = references.map((network) => network.name).join(", ");
@@ -293,12 +367,21 @@ export class WorkerGroupNetworkCoordinator {
     for (const networkId of networkIds) {
       const network = this.dependencies.networks.get(userId, networkId);
       if (!network) {
-        failures.push(`${networkId}: managed network disappeared during reconciliation`);
+        failures.push(
+          `${networkId}: managed network disappeared during reconciliation`,
+        );
         continue;
       }
       try {
-        const result = await this.dependencies.manager.reconcile(network, workerIds);
-        failures.push(...result.partialFailures.map((failure) => `${network.name}: ${failure}`));
+        const result = await this.dependencies.manager.reconcile(
+          network,
+          workerIds,
+        );
+        failures.push(
+          ...result.partialFailures.map(
+            (failure) => `${network.name}: ${failure}`,
+          ),
+        );
       } catch (error) {
         failures.push(`${network.name}: ${safeMessage(error)}`);
       }
@@ -321,7 +404,10 @@ export function useWorkerGroupNetworkCoordinator() {
   return (singleton ??= new WorkerGroupNetworkCoordinator());
 }
 
-export function withWorkerNetworkMutation<T>(userId: string, operation: () => Promise<T>) {
+export function withWorkerNetworkMutation<T>(
+  userId: string,
+  operation: () => Promise<T>,
+) {
   return useWorkerGroupNetworkCoordinator().withOwner(userId, operation);
 }
 
@@ -332,7 +418,15 @@ export function updateWorkerGroupWithNetworks(
   lockPasswords?: unknown,
   authorize?: () => void,
 ) {
-  return useWorkerGroupNetworkCoordinator().update(userId, groupId, patch, lockPasswords, authorize).then(async result=>{if(patch.parentId!==undefined){const {markGroupEnvPending}=await import("./worker-group-env");await markGroupEnvPending(userId,groupId);}return result;});
+  return useWorkerGroupNetworkCoordinator()
+    .update(userId, groupId, patch, lockPasswords, authorize)
+    .then(async (result) => {
+      if (patch.parentId !== undefined) {
+        const { markGroupEnvPending } = await import("./worker-group-env");
+        await markGroupEnvPending(userId, groupId);
+      }
+      return result;
+    });
 }
 
 export function addWorkerToGroupWithNetworks(
@@ -360,7 +454,13 @@ export function assignWorkerToGroupWithNetworks(
   lockPasswords?: unknown,
   authorize?: (sourceGroupId?: string, targetGroupId?: string) => void,
 ) {
-  return useWorkerGroupNetworkCoordinator().assignWorker(userId, workerId, targetGroupId, lockPasswords, authorize).then(async result=>{const {markWorkersEnvPending}=await import("./worker-group-env");await markWorkersEnvPending(userId,[workerId]);return result;});
+  return useWorkerGroupNetworkCoordinator()
+    .assignWorker(userId, workerId, targetGroupId, lockPasswords, authorize)
+    .then(async (result) => {
+      const { markWorkersEnvPending } = await import("./worker-group-env");
+      await markWorkersEnvPending(userId, [workerId]);
+      return result;
+    });
 }
 
 export async function deleteWorkerGroup(
@@ -370,22 +470,45 @@ export async function deleteWorkerGroup(
 ) {
   const catalog = useImageCatalogManager();
   await catalog.init();
-  const envStore=useWorkerGroupEnvStore();let removedEnv:Awaited<ReturnType<typeof envStore.take>>=undefined;
-  try { await useWorkerGroupNetworkCoordinator().delete(userId, groupId, async () => {
-    // Evaluate all deletion guards immediately before removal. Cleanup runs
-    // while the group still exists because the administrative workspace store
-    // resolves its record through the group.
-    if (catalog.listForGroup(userId, groupId).length)
-      throw createError({
-        statusCode: 409,
-        statusMessage:
-          "Worker group has private image definitions. Delete them before deleting the group.",
-      });
-    removedEnv=await envStore.take(userId,groupId);
-    try{const rollbackExternal=await beforeRemove?.();return async()=>{await envStore.restore(userId,removedEnv);removedEnv=undefined;await rollbackExternal?.();};}catch(error){await envStore.restore(userId,removedEnv);removedEnv=undefined;throw error;}
-  }); } catch(error) { await envStore.restore(userId,removedEnv).catch(()=>undefined); throw error; }
+  const envStore = useWorkerGroupEnvStore();
+  let removedEnv: Awaited<ReturnType<typeof envStore.take>> = undefined;
+  try {
+    await useWorkerGroupNetworkCoordinator().delete(
+      userId,
+      groupId,
+      async () => {
+        // Evaluate all deletion guards immediately before removal. Cleanup runs
+        // while the group still exists because the administrative workspace store
+        // resolves its record through the group.
+        if (catalog.listForGroup(userId, groupId).length)
+          throw createError({
+            statusCode: 409,
+            statusMessage:
+              "Worker group has private image definitions. Delete them before deleting the group.",
+          });
+        removedEnv = await envStore.take(userId, groupId);
+        try {
+          const rollbackExternal = await beforeRemove?.();
+          return async () => {
+            await envStore.restore(userId, removedEnv);
+            removedEnv = undefined;
+            await rollbackExternal?.();
+          };
+        } catch (error) {
+          await envStore.restore(userId, removedEnv);
+          removedEnv = undefined;
+          throw error;
+        }
+      },
+    );
+  } catch (error) {
+    await envStore.restore(userId, removedEnv).catch(() => undefined);
+    throw error;
+  }
 }
 
 function safeMessage(error: unknown) {
-  return error instanceof Error ? error.message.slice(0, 300) : "Docker reconciliation failed";
+  return error instanceof Error
+    ? error.message.slice(0, 300)
+    : "Docker reconciliation failed";
 }

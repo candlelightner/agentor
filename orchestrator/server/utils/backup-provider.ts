@@ -33,11 +33,16 @@ export interface BackupProvider {
     destination: string,
     signal?: AbortSignal,
   ): Promise<void>;
-  delete(userId: string, objectId: string): Promise<void>;
+  delete(userId: string, objectId: string, signal?: AbortSignal): Promise<void>;
+  /** Reconcile an upload that committed remotely before its opaque object id
+   * could be persisted locally. Providers with non-deterministic ids can use
+   * the stable Agentor artifact id embedded in object metadata. */
+  deleteByArtifactId?(userId: string, artifactId: string, signal?: AbortSignal): Promise<void>;
   abortUpload?(
     userId: string,
     uploadId: string,
     artifactId: string,
+    signal?: AbortSignal,
   ): Promise<void>;
 }
 export interface FakeUploadDiagnostic {
@@ -171,13 +176,17 @@ export class FakeBackupProvider implements BackupProvider {
       { signal },
     );
   }
-  async delete(userId: string, id: string) {
+  async delete(userId: string, id: string, signal?: AbortSignal) {
+    signal?.throwIfAborted();
     await rm(this.path(userId, id), { force: true });
+    signal?.throwIfAborted();
   }
-  async abortUpload(userId: string, uploadId: string, artifactId: string) {
+  async abortUpload(userId: string, uploadId: string, artifactId: string, signal?: AbortSignal) {
+    signal?.throwIfAborted();
     const upload = this.uploads.get(uploadId);
     if (upload?.ownerId === userId) this.uploads.delete(uploadId);
     await rm(this.path(userId, artifactId), { force: true });
+    signal?.throwIfAborted();
   }
 }
 export class LocalBackupProvider implements BackupProvider {
@@ -226,8 +235,10 @@ export class LocalBackupProvider implements BackupProvider {
       { signal },
     );
   }
-  async delete(u: string, id: string) {
+  async delete(u: string, id: string, signal?: AbortSignal) {
+    signal?.throwIfAborted();
     await rm(this.path(u, id), { force: true });
+    signal?.throwIfAborted();
   }
 }
 export class GoogleDriveBackupProvider implements BackupProvider {
@@ -251,10 +262,7 @@ export class GoogleDriveBackupProvider implements BackupProvider {
       signal?: AbortSignal,
     ) => Promise<void> = abortableDelay,
   ) {}
-  private async access(
-    userId: string,
-    signal?: AbortSignal,
-  ): Promise<string> {
+  private async access(userId: string, signal?: AbortSignal): Promise<string> {
     const token = await this.getStoredToken(userId);
     if (
       token.access_token &&
@@ -289,7 +297,9 @@ export class GoogleDriveBackupProvider implements BackupProvider {
       access_token: refreshed.access_token,
       expires_at: Date.now() + Number(refreshed.expires_in || 3600) * 1000,
     };
+    signal?.throwIfAborted();
     await this.saveStoredToken(userId, next);
+    signal?.throwIfAborted();
     return next.access_token;
   }
   async upload(
@@ -300,119 +310,152 @@ export class GoogleDriveBackupProvider implements BackupProvider {
     signal?: AbortSignal,
     resumeUploadId?: string,
   ): Promise<UploadResult> {
-    const access = await this.access(userId, signal);
-    const size = (await stat(source)).size;
     let session = resumeUploadId;
-    let offset = 0;
-    if (session) {
-      if (!isGoogleUploadSession(session))
-        throw new Error("Invalid Google Drive resumable upload session");
-      const probe = await this.transport(session, {
-        method: "PUT",
-        signal,
-        headers: {
-          Authorization: `Bearer ${access}`,
-          "Content-Length": "0",
-          "Content-Range": `bytes */${size}`,
-        },
-      });
-      if (probe.status === 308) {
-        offset = parseGoogleRange(probe.headers.get("range"));
-        if (offset < 0 || offset > size)
-          throw new Error("Google Drive returned an invalid resumable offset");
-      } else if (!probe.ok) session = undefined;
-      else {
-        const complete = (await probe.json()) as any;
-        return {
-          objectId: String(complete.id || ""),
-          size,
-          uploadId: "completed",
-          resumedFromChunk: Math.ceil(size / (8 * 1024 * 1024)),
-        };
-      }
-    }
-    if (!session) {
-      const metadata: Record<string, unknown> = {
-        name: `agentor-${artifactId}.backup`,
-        appProperties: { agentorBackup: "v1", artifactId },
-      };
-      if (process.env.GOOGLE_BACKUP_FOLDER_ID)
-        metadata.parents = [process.env.GOOGLE_BACKUP_FOLDER_ID];
-      const begin = await this.transport(
-        "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,size",
-        {
-          method: "POST",
+    try {
+      const access = await this.access(userId, signal);
+      const size = (await stat(source)).size;
+      let offset = 0;
+      if (session) {
+        if (!isGoogleUploadSession(session))
+          throw new Error("Invalid Google Drive resumable upload session");
+        const probe = await this.transport(session, {
+          method: "PUT",
           signal,
           headers: {
             Authorization: `Bearer ${access}`,
-            "Content-Type": "application/json",
-            "X-Upload-Content-Type": "application/octet-stream",
-            "X-Upload-Content-Length": String(size),
+            "Content-Length": "0",
+            "Content-Range": `bytes */${size}`,
           },
-          body: JSON.stringify(metadata),
-        },
-      );
-      if (!begin.ok)
-        throw new Error("Google Drive resumable upload could not start");
-      session = begin.headers.get("location") || undefined;
-      if (!session)
-        throw new Error("Google Drive did not return an upload session");
-      if (!isGoogleUploadSession(session))
-        throw new Error("Google Drive returned an invalid upload session");
-    }
-    const resumedFromChunk = Math.floor(offset / (8 * 1024 * 1024));
-    const file = await open(source, "r");
-    const chunkSize = 8 * 1024 * 1024;
-    let objectId = "";
-    try {
-      while (offset < size) {
-        if (signal?.aborted)
-          throw Object.assign(new Error("Backup upload cancelled"), {
-            name: "AbortError",
-          });
-        const length = Math.min(chunkSize, size - offset);
-        const chunk = Buffer.allocUnsafe(length);
-        const { bytesRead } = await file.read(chunk, 0, length, offset);
-        if (bytesRead !== length)
-          throw new Error("Backup archive changed during upload");
-        const request = () =>
-          this.transport(session!, {
-            method: "PUT",
+        });
+        if (probe.status === 308) {
+          offset = parseGoogleRange(probe.headers.get("range"));
+          if (offset < 0 || offset > size)
+            throw new Error(
+              "Google Drive returned an invalid resumable offset",
+            );
+        } else if (!probe.ok) {
+          // Google documents 404/410 as terminal resumable-session loss. Auth,
+          // throttling, and server failures are not proof that the existing
+          // partial upload disappeared; preserve its URL for a safe retry and
+          // manager-side cancellation instead of starting a duplicate object.
+          if (probe.status === 404 || probe.status === 410) session = undefined;
+          else
+            throw new Error(
+              `Google Drive resumable upload probe failed (${probe.status})`,
+            );
+        }
+        else {
+          const complete = (await probe.json()) as any;
+          const objectId =
+            typeof complete.id === "string" ? complete.id.trim() : "";
+          if (!objectId)
+            throw new Error(
+              "Google Drive upload completed without an object id",
+            );
+          return {
+            objectId,
+            size,
+            uploadId: "completed",
+            resumedFromChunk: Math.ceil(size / (8 * 1024 * 1024)),
+          };
+        }
+      }
+      if (!session) {
+        const metadata: Record<string, unknown> = {
+          name: `agentor-${artifactId}.backup`,
+          appProperties: { agentorBackup: "v1", artifactId },
+        };
+        if (process.env.GOOGLE_BACKUP_FOLDER_ID)
+          metadata.parents = [process.env.GOOGLE_BACKUP_FOLDER_ID];
+        const begin = await this.transport(
+          "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,size",
+          {
+            method: "POST",
             signal,
             headers: {
               Authorization: `Bearer ${access}`,
-              "Content-Length": String(length),
-              "Content-Range": `bytes ${offset}-${offset + length - 1}/${size}`,
+              "Content-Type": "application/json",
+              "X-Upload-Content-Type": "application/octet-stream",
+              "X-Upload-Content-Length": String(size),
             },
-            body: chunk as any,
-          });
-        let response: Response;
-        try {
-          response = await this.retryChunk(request, signal);
-        } catch (error) {
-          throw Object.assign(
-            error instanceof Error
-              ? error
-              : new Error("Google Drive resumable upload failed"),
-            { uploadId: session },
-          );
-        }
-        if (response.status !== 308 && !response.ok)
-          throw Object.assign(
-            new Error("Google Drive resumable upload failed"),
-            { uploadId: session },
-          );
-        offset += length;
-        onProgress(offset);
-        if (response.ok)
-          objectId = String(((await response.json()) as any).id || "");
+            body: JSON.stringify(metadata),
+          },
+        );
+        if (!begin.ok)
+          throw new Error("Google Drive resumable upload could not start");
+        session = begin.headers.get("location") || undefined;
+        if (!session)
+          throw new Error("Google Drive did not return an upload session");
+        if (!isGoogleUploadSession(session))
+          throw new Error("Google Drive returned an invalid upload session");
       }
-    } finally {
-      await file.close();
+      const resumedFromChunk = Math.floor(offset / (8 * 1024 * 1024));
+      const file = await open(source, "r");
+      const chunkSize = 8 * 1024 * 1024;
+      let objectId = "";
+      try {
+        while (offset < size) {
+          if (signal?.aborted)
+            throw Object.assign(new Error("Backup upload cancelled"), {
+              name: "AbortError",
+            });
+          const length = Math.min(chunkSize, size - offset);
+          const chunk = Buffer.allocUnsafe(length);
+          const { bytesRead } = await file.read(chunk, 0, length, offset);
+          if (bytesRead !== length)
+            throw new Error("Backup archive changed during upload");
+          const request = () =>
+            this.transport(session!, {
+              method: "PUT",
+              signal,
+              headers: {
+                Authorization: `Bearer ${access}`,
+                "Content-Length": String(length),
+                "Content-Range": `bytes ${offset}-${offset + length - 1}/${size}`,
+              },
+              body: chunk as any,
+            });
+          let response: Response;
+          try {
+            response = await this.retryChunk(request, signal);
+          } catch (error) {
+            throw Object.assign(
+              error instanceof Error
+                ? error
+                : new Error("Google Drive resumable upload failed"),
+              { uploadId: session },
+            );
+          }
+          if (response.status !== 308 && !response.ok)
+            throw Object.assign(
+              new Error("Google Drive resumable upload failed"),
+              { uploadId: session },
+            );
+          offset += length;
+          onProgress(offset);
+          if (response.ok)
+            objectId = String(((await response.json()) as any).id || "");
+        }
+      } finally {
+        await file.close();
+      }
+      if (!objectId)
+        throw new Error("Google Drive upload completed without an object id");
+      return { objectId, size, uploadId: objectId, resumedFromChunk };
+    } catch (error) {
+      // Once a resumable session exists, every failure path must carry it to
+      // the manager so restart/cancellation cleanup can durably abort it. This
+      // includes token refresh, resume probes, file open/read, and pre-request
+      // cancellation—not only chunk transport failures.
+      if (session && isGoogleUploadSession(session))
+        throw Object.assign(
+          error instanceof Error
+            ? error
+            : new Error("Google Drive resumable upload failed"),
+          { uploadId: session },
+        );
+      throw error;
     }
-    if (!objectId)
-      throw new Error("Google Drive upload completed without an object id");
-    return { objectId, size, uploadId: objectId, resumedFromChunk };
   }
   async download(
     userId: string,
@@ -424,7 +467,9 @@ export class GoogleDriveBackupProvider implements BackupProvider {
       `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(objectId)}?alt=media`,
       {
         signal,
-        headers: { Authorization: `Bearer ${await this.access(userId, signal)}` },
+        headers: {
+          Authorization: `Bearer ${await this.access(userId, signal)}`,
+        },
       },
     );
     if (!response.ok || !response.body)
@@ -435,23 +480,46 @@ export class GoogleDriveBackupProvider implements BackupProvider {
       { signal },
     );
   }
-  async delete(userId: string, objectId: string): Promise<void> {
+  async delete(userId: string, objectId: string, signal?: AbortSignal): Promise<void> {
     const response = await this.transport(
       `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(objectId)}`,
       {
         method: "DELETE",
-        headers: { Authorization: `Bearer ${await this.access(userId)}` },
+        signal,
+        headers: { Authorization: `Bearer ${await this.access(userId, signal)}` },
       },
     );
     if (!response.ok && response.status !== 404)
       throw new Error("Google Drive backup deletion failed");
   }
-  async abortUpload(userId: string, uploadId: string): Promise<void> {
-    if (!isGoogleUploadSession(uploadId)) return;
-    await this.transport(uploadId, {
+  async deleteByArtifactId(userId: string, artifactId: string, signal?: AbortSignal): Promise<void> {
+    assertSafePathId(artifactId, "artifactId");
+    const access = await this.access(userId, signal);
+    const query = `appProperties has { key='artifactId' and value='${artifactId}' } and trashed = false`;
+    const response = await this.transport(
+      `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)&pageSize=100`,
+      { signal, headers: { Authorization: `Bearer ${access}` } },
+    );
+    if (!response.ok)
+      throw new Error("Google Drive backup reconciliation failed");
+    const body = (await response.json()) as { files?: Array<{ id?: unknown }> };
+    const objectIds = (body.files ?? [])
+      .map((file) => file.id)
+      .filter((id): id is string => typeof id === "string" && !!id);
+    for (const objectId of objectIds) await this.delete(userId, objectId, signal);
+  }
+  async abortUpload(userId: string, uploadId: string, _artifactId?: string, signal?: AbortSignal): Promise<void> {
+    if (!isGoogleUploadSession(uploadId))
+      throw new Error("Invalid Google Drive resumable upload session");
+    const response = await this.transport(uploadId, {
       method: "DELETE",
-      headers: { Authorization: `Bearer ${await this.access(userId)}` },
-    }).catch(() => undefined);
+      signal,
+      headers: { Authorization: `Bearer ${await this.access(userId, signal)}` },
+    });
+    // Cancellation is idempotent: an expired or already-removed upload session
+    // is terminal. Every other failure must retain the durable abort marker.
+    if (!response.ok && response.status !== 404 && response.status !== 410)
+      throw new Error("Google Drive resumable upload cancellation failed");
   }
 
   private async retryChunk(

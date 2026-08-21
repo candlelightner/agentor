@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ApiClient } from "../helpers/api-client";
 import { createTestUser, deleteTestUser } from "../helpers/test-users";
+import { GoogleBackupOAuthConfigStore } from "../../orchestrator/server/utils/google-backup-oauth-config";
 
 const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
 const ADMIN_STORAGE = resolve(dirname(fileURLToPath(import.meta.url)), "..", ".auth", "admin-api.json");
@@ -34,4 +35,39 @@ test.describe.serial("Installation Google backup OAuth configuration", () => {
       await admin.dispose(); await user.dispose(); await deleteTestUser(regular.id);
     }
   });
+});
+
+test("Google OAuth configuration hides a rejected write while a newer queued configuration commits", async () => {
+  const previousKey = process.env.WORKER_CONFIG_ENCRYPTION_KEY;
+  process.env.WORKER_CONFIG_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
+  try {
+    let attempt = 0;
+    let firstEntered!: () => void;
+    let releaseFirst!: () => void;
+    let secondEntered!: () => void;
+    let releaseSecond!: () => void;
+    const firstWrite = new Promise<void>((resolve) => { firstEntered = resolve; });
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const secondWrite = new Promise<void>((resolve) => { secondEntered = resolve; });
+    const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const store = new GoogleBackupOAuthConfigStore('/unused', async () => {
+      if (attempt++ === 0) {
+        firstEntered(); await firstGate; throw new Error('injected oauth write failure');
+      }
+      secondEntered(); await secondGate;
+    });
+    const configure = (clientId: string) => store.configure({ clientId, redirectUri: 'https://example.test/callback', clientSecret: 'secret-value' });
+    const failed = configure('failed-client');
+    await firstWrite;
+    const succeeding = configure('good-client');
+    releaseFirst();
+    await expect(failed).rejects.toThrow('injected oauth write failure');
+    await secondWrite;
+    expect((await store.status()).source).not.toBe('installation');
+    releaseSecond();
+    await expect(succeeding).resolves.toMatchObject({ source: 'installation', clientId: 'good-client' });
+  } finally {
+    if (previousKey === undefined) delete process.env.WORKER_CONFIG_ENCRYPTION_KEY;
+    else process.env.WORKER_CONFIG_ENCRYPTION_KEY = previousKey;
+  }
 });

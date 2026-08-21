@@ -18,7 +18,11 @@ export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
   constructor(dataDir: string) {
     super(dataDir, "worker-groups.json", (group) => group.id);
   }
-  async create(userId: string, name: string, parentId?: string): Promise<WorkerGroup> {
+  async create(
+    userId: string,
+    name: string,
+    parentId?: string,
+  ): Promise<WorkerGroup> {
     const stamp = new Date().toISOString();
     const group = {
       id: randomUUID(),
@@ -43,30 +47,99 @@ export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
       adminWorkspace?: Record<string, any>;
     },
   ): Promise<WorkerGroup> {
-    const current = this.get(userId, id);
-    if (!current)
-      throw createError({
-        statusCode: 404,
-        statusMessage: "Worker group not found",
-      });
-    const group: WorkerGroup = {
-      ...current,
-      workerIds: [...current.workerIds],
-      updatedAt: new Date().toISOString(),
-    };
-    if (patch.name !== undefined) group.name = patch.name.trim();
-    if (patch.workerIds !== undefined)
-      group.workerIds = [...new Set(patch.workerIds)];
-    if (patch.parentId !== undefined) {
-      if (patch.parentId === null) delete group.parentId;
-      else group.parentId = patch.parentId;
-    }
-    if (patch.excludedInheritedEnvVarKeys !== undefined)
-      group.excludedInheritedEnvVarKeys = [...new Set(patch.excludedInheritedEnvVarKeys)].sort();
-    if (patch.adminWorkspace !== undefined)
-      group.adminWorkspace = structuredClone(patch.adminWorkspace);
-    await this.swap(userId, id, group);
-    return group;
+    return this.withUserMutation(userId, async () => {
+      // Derive the patch only after entering the per-owner transaction. If two
+      // callers read before queuing, the later whole-record write would
+      // otherwise silently discard unrelated fields committed by the first.
+      const current = this.get(userId, id);
+      if (!current)
+        throw createError({
+          statusCode: 404,
+          statusMessage: "Worker group not found",
+        });
+      const group: WorkerGroup = {
+        ...current,
+        workerIds: [...current.workerIds],
+        updatedAt: new Date().toISOString(),
+      };
+      if (patch.name !== undefined) group.name = patch.name.trim();
+      if (patch.workerIds !== undefined)
+        group.workerIds = [...new Set(patch.workerIds)];
+      if (patch.parentId !== undefined) {
+        if (patch.parentId === null) delete group.parentId;
+        else group.parentId = patch.parentId;
+      }
+      if (patch.excludedInheritedEnvVarKeys !== undefined)
+        group.excludedInheritedEnvVarKeys = [
+          ...new Set(patch.excludedInheritedEnvVarKeys),
+        ].sort();
+      if (patch.adminWorkspace !== undefined)
+        group.adminWorkspace = structuredClone(patch.adminWorkspace);
+      const map = this.items.get(userId)!;
+      map.set(id, group);
+      try {
+        await this.persistUser(userId);
+      } catch (error) {
+        map.set(id, current);
+        throw error;
+      }
+      return structuredClone(group);
+    });
+  }
+  /** Move one direct worker membership with a single owner-file commit. The
+   * expected source closes stale coordinator snapshots; persistence failure
+   * restores both records together. */
+  async assignWorker(
+    userId: string,
+    workerId: string,
+    expectedSourceId: string | undefined,
+    targetId: string | null,
+  ): Promise<WorkerGroup | null> {
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId);
+      const containing = [...(map?.values() ?? [])].filter((group) =>
+        group.workerIds.includes(workerId),
+      );
+      if (containing.length > 1 || containing[0]?.id !== expectedSourceId)
+        throw createError({
+          statusCode: 409,
+          statusMessage: "Worker group membership changed concurrently",
+        });
+      const source = containing[0];
+      const target = targetId ? map?.get(targetId) : undefined;
+      if (targetId && !target)
+        throw createError({
+          statusCode: 404,
+          statusMessage: "Worker group not found",
+        });
+      if (source?.id === targetId) return structuredClone(source);
+
+      const stamp = new Date().toISOString();
+      const nextSource = source
+        ? {
+            ...source,
+            workerIds: source.workerIds.filter((id) => id !== workerId),
+            updatedAt: stamp,
+          }
+        : undefined;
+      const nextTarget = target
+        ? {
+            ...target,
+            workerIds: [...new Set([...target.workerIds, workerId])],
+            updatedAt: stamp,
+          }
+        : undefined;
+      if (nextSource) map!.set(nextSource.id, nextSource);
+      if (nextTarget) map!.set(nextTarget.id, nextTarget);
+      try {
+        await this.persistUser(userId);
+      } catch (error) {
+        if (source) map!.set(source.id, source);
+        if (target) map!.set(target.id, target);
+        throw error;
+      }
+      return nextTarget ? structuredClone(nextTarget) : null;
+    });
   }
   async remove(userId: string, id: string) {
     const current = this.get(userId, id);
@@ -85,32 +158,34 @@ export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
     id: string,
     next: WorkerGroup | undefined,
   ) {
-    let map = this.items.get(userId);
-    const previous = map?.get(id);
-    if (!map && next) {
-      map = new Map();
-      this.items.set(userId, map);
-    }
-    if (next) map!.set(id, next);
-    else {
-      map!.delete(id);
-      if (map!.size === 0) this.items.delete(userId);
-    }
-    try {
-      await this.persistUser(userId);
-    } catch (error) {
-      if (previous) {
-        let rollback = this.items.get(userId);
-        if (!rollback) {
-          rollback = new Map();
-          this.items.set(userId, rollback);
-        }
-        rollback.set(id, previous);
-      } else {
-        this.items.get(userId)?.delete(id);
-        if (this.items.get(userId)?.size === 0) this.items.delete(userId);
+    await this.withUserMutation(userId, async () => {
+      let map = this.items.get(userId);
+      const previous = map?.get(id);
+      if (!map && next) {
+        map = new Map();
+        this.items.set(userId, map);
       }
-      throw error;
-    }
+      if (next) map!.set(id, next);
+      else {
+        map!.delete(id);
+        if (map!.size === 0) this.items.delete(userId);
+      }
+      try {
+        await this.persistUser(userId);
+      } catch (error) {
+        if (previous) {
+          let rollback = this.items.get(userId);
+          if (!rollback) {
+            rollback = new Map();
+            this.items.set(userId, rollback);
+          }
+          rollback.set(id, previous);
+        } else {
+          this.items.get(userId)?.delete(id);
+          if (this.items.get(userId)?.size === 0) this.items.delete(userId);
+        }
+        throw error;
+      }
+    });
   }
 }

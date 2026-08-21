@@ -176,6 +176,8 @@ export interface ArchivedWorker {
   createdAt: string;
   updatedAt: string;
   archivedAt?: string;
+  /** Permanent deletion removed Docker but some external cleanup must retry. */
+  deletionPending?: boolean;
   // Normalized: only the environment FK is stored; env config + git identity are
   // resolved live at build time, never snapshotted onto the worker.
   environmentId?: string;

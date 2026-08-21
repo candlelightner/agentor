@@ -1,13 +1,33 @@
 import { expect,test,request as playwrightRequest } from "@playwright/test";
 import { normalizeExcludedGlobalEnvVarKeys } from "../../orchestrator/server/utils/user-env-store";
 import { ManagementWorkerDomain } from "../../orchestrator/server/utils/management-worker-domain";
-import { mergeGroupEnvLevels } from "../../orchestrator/server/utils/worker-group-env";
+import { markWorkerEnvPending,mergeGroupEnvLevels } from "../../orchestrator/server/utils/worker-group-env";
 import { createTestUser,deleteTestUser } from "../helpers/test-users";
 import { ApiClient } from "../helpers/api-client";
 import { WorkerGroupEnvStore } from "../../orchestrator/server/utils/worker-group-env-store";
 import { mkdtemp,readFile,rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { WorkerStore } from "../../orchestrator/server/utils/worker-store";
+
+class GatedWorkerStore extends WorkerStore {
+  private blockOnce?: { entered: () => void; wait: Promise<void> };
+
+  gateNextPersist() {
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const wait = new Promise<void>((resolve) => { release = resolve; });
+    this.blockOnce = { entered: () => entered(), wait };
+    return { entered: enteredPromise, release };
+  }
+
+  protected override async persistUser(userId:string):Promise<void>{
+    const gate=this.blockOnce;
+    if(gate){this.blockOnce=undefined;gate.entered();await gate.wait;}
+    await super.persistUser(userId);
+  }
+}
 
 const env={userId:"owner",createdAt:"",updatedAt:"",envVars:[{key:"CUSTOM_KEY",value:"never-serialize-this"}]};
 
@@ -27,6 +47,25 @@ test("group inheritance applies exclusions, nearest overrides, and ignores stale
 test("group values are encrypted, names-only reads do not leak, and concurrent owner writes settle",async()=>{
   const dir=await mkdtemp(join(tmpdir(),"agentor-group-env-"));const store=new WorkerGroupEnvStore({dataDir:dir} as any);
   try{await Promise.all([store.set("owner","root",[{key:"ROOT_KEY",value:"root-secret"}]),store.set("owner","child",[{key:"CHILD_KEY",value:"child-secret"}])]);expect(await store.publicList("owner","root")).toEqual([{key:"ROOT_KEY",configured:true}]);expect(await store.resolve("owner","child")).toEqual([{key:"CHILD_KEY",value:"child-secret"}]);const disk=await readFile(join(dir,"users","owner","worker-group-env.json"),"utf8");expect(disk).not.toContain("root-secret");expect(disk).not.toContain("child-secret");}finally{await rm(dir,{recursive:true,force:true});}
+});
+
+test("group environment rebuild marking queued behind deletion cannot resurrect the worker",async()=>{
+  (globalThis as any).useLogger=()=>({error(){},warn(){},info(){},debug(){}});
+  const dir=await mkdtemp(join(tmpdir(),"agentor-worker-env-race-"));
+  const store=new GatedWorkerStore(dir);
+  const live={userId:"owner",pendingRebuild:false,updatedAt:"before"};
+  try{
+    await store.upsert({id:"worker-1",userId:"owner",displayName:"worker",status:"active",createdAt:"2026-01-01T00:00:00.000Z",updatedAt:"2026-01-01T00:00:00.000Z"});
+    const gate=store.gateNextPersist();
+    const deletion=store.delete("owner","worker-1");
+    await gate.entered;
+    const marking=markWorkerEnvPending("owner","worker-1",store,{get:()=>live});
+    gate.release();
+    await deletion;
+    await expect(marking).resolves.toBe(false);
+    expect(store.get("owner","worker-1")).toBeUndefined();
+    expect(live).toMatchObject({pendingRebuild:false,updatedAt:"before"});
+  }finally{await rm(dir,{recursive:true,force:true});}
 });
 
 test("MCP publishes names-only worker exclusions and write-only group values",()=>{

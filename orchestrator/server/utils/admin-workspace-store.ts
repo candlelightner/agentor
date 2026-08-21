@@ -89,8 +89,17 @@ export class AdminWorkspaceStore {
   private readonly path: string;
   private loading?: Promise<void>;
   private runtime?: AdminWorkspaceRuntimeAdapter;
-  private runtimeTail: Promise<void> = Promise.resolve();
-  constructor(dataDir = process.env.DATA_DIR || "/data") {
+  private operationTail: Promise<void> = Promise.resolve();
+  private pendingCommit?: {
+    operation: string;
+    record: AdministrativeWorkspaceRecord;
+  };
+  constructor(
+    dataDir = process.env.DATA_DIR || "/data",
+    private readonly recordWriter?: (
+      record: Readonly<AdministrativeWorkspaceRecord>,
+    ) => Promise<void>,
+  ) {
     this.path = join(dataDir, "admin", "workspace.v1.json");
   }
   setRuntimeAdapter(runtime: AdminWorkspaceRuntimeAdapter) {
@@ -120,27 +129,66 @@ export class AdminWorkspaceStore {
     })();
     return this.loading;
   }
-  private async save() {
+  private async save(record: Readonly<AdministrativeWorkspaceRecord>) {
+    if (this.recordWriter) {
+      await this.recordWriter(structuredClone(record));
+      return;
+    }
     await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     const temp = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
-    await writeFile(temp, `${JSON.stringify(this.record, null, 2)}\n`, {
+    await writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, {
       mode: 0o600,
     });
     await rename(temp, this.path);
   }
-  private runRuntime<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.runtimeTail.then(operation, operation);
-    this.runtimeTail = result.then(
+  private exclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.operationTail.then(operation, operation);
+    this.operationTail = result.then(
       () => undefined,
       () => undefined,
     );
     return result;
   }
+  private async flushPendingCommit(operation: string) {
+    if (!this.pendingCommit) return false;
+    const pending = this.pendingCommit;
+    await this.save(pending.record);
+    this.record = structuredClone(pending.record);
+    this.pendingCommit = undefined;
+    return pending.operation === operation;
+  }
+  private async commit(record: AdministrativeWorkspaceRecord) {
+    await this.save(record);
+    this.record = structuredClone(record);
+  }
+  private async commitExternal(
+    operation: string,
+    record: AdministrativeWorkspaceRecord,
+  ) {
+    try {
+      await this.commit(record);
+    } catch (error) {
+      // Docker already accepted the operation. Retain the exact resulting
+      // record so a retry first persists it instead of repeating a rebuild,
+      // start, or stop whose caller merely lost the durable acknowledgement.
+      this.record = structuredClone(record);
+      this.pendingCommit = {
+        operation,
+        record: structuredClone(record),
+      };
+      throw error;
+    }
+  }
   async ensure() {
+    return this.exclusive(() => this.ensureLocked());
+  }
+  private async ensureLocked() {
     await this.init();
-    if (!this.record) {
+    if (await this.flushPendingCommit("ensure")) return this.publicRecord();
+    let candidate = this.record ? structuredClone(this.record) : undefined;
+    if (!candidate) {
       const now = new Date().toISOString();
-      this.record = {
+      candidate = {
         schemaVersion: 1,
         id: randomUUID(),
         kind: "administrative",
@@ -149,53 +197,63 @@ export class AdminWorkspaceStore {
         createdAt: now,
         updatedAt: now,
       };
-      await this.save();
+      // Persist the stable workspace identity before provisioning compute.
+      await this.commit(candidate);
     }
-    if (this.runtime)
-      await this.runRuntime(async () =>
-        this.applyRuntimeImage(await this.runtime!.ensure(this.record!)),
-      );
-    return this.publicRecord();
+    if (this.runtime) {
+      const image = await this.runtime.ensure(structuredClone(candidate));
+      if (this.applyRuntimeImage(candidate, image))
+        await this.commitExternal("ensure", candidate);
+    }
+    return this.publicRecord(candidate);
   }
   async setStatus(status: "running" | "stopped") {
-    await this.init();
-    // Lifecycle calls on an existing workspace must reach the runtime
-    // operation directly. Calling ensure() here could auto-start a crashed
-    // container from the persisted `running` state before start() has a chance
-    // to replace a pending startup-script revision (or before stop()).
-    if (!this.record) await this.ensure();
-    if (this.runtime)
-      await this.runRuntime(async () => {
+    return this.exclusive(async () => {
+      await this.init();
+      const operation = `status:${status}`;
+      if (await this.flushPendingCommit(operation)) return this.publicRecord();
+      // Lifecycle calls on an existing workspace must reach the runtime
+      // operation directly. Provision only when no durable identity exists.
+      if (!this.record) await this.ensureLocked();
+      const candidate = structuredClone(this.record!);
+      if (this.runtime) {
         if (status === "running")
-          await this.applyRuntimeImage(await this.runtime!.start(this.record!));
-        else await this.runtime!.stop(this.record!);
-      });
-    this.record!.status = status;
-    this.record!.updatedAt = new Date().toISOString();
-    await this.save();
-    return this.publicRecord();
+          this.applyRuntimeImage(
+            candidate,
+            await this.runtime.start(structuredClone(candidate)),
+          );
+        else await this.runtime.stop(structuredClone(candidate));
+      }
+      candidate.status = status;
+      candidate.updatedAt = new Date().toISOString();
+      if (this.runtime) await this.commitExternal(operation, candidate);
+      else await this.commit(candidate);
+      return this.publicRecord(candidate);
+    });
   }
   async rebuild(ownerId?: string) {
-    await this.init();
-    // Rebuild itself is the application boundary; do not auto-start stale
-    // disposable compute first merely to ensure the durable record exists.
-    if (!this.record) await this.ensure();
-    if (ownerId && this.record!.ownerId !== ownerId) {
-      this.record!.ownerId = ownerId;
-      await this.save();
-    }
-    if (!this.runtime)
-      throw Object.assign(
-        new Error("Administrative workspace runtime is unavailable"),
-        { statusCode: 503 },
+    return this.exclusive(async () => {
+      await this.init();
+      if (await this.flushPendingCommit("rebuild")) return this.publicRecord();
+      // Rebuild itself is the application boundary; do not auto-start stale
+      // disposable compute first merely to ensure the durable record exists.
+      if (!this.record) await this.ensureLocked();
+      const candidate = structuredClone(this.record!);
+      if (ownerId) candidate.ownerId = ownerId;
+      if (!this.runtime)
+        throw Object.assign(
+          new Error("Administrative workspace runtime is unavailable"),
+          { statusCode: 503 },
+        );
+      this.applyRuntimeImage(
+        candidate,
+        await this.runtime.rebuild(structuredClone(candidate)),
       );
-    await this.runRuntime(async () =>
-      this.applyRuntimeImage(await this.runtime!.rebuild(this.record!)),
-    );
-    this.record!.status = "running";
-    this.record!.updatedAt = new Date().toISOString();
-    await this.save();
-    return this.publicRecord();
+      candidate.status = "running";
+      candidate.updatedAt = new Date().toISOString();
+      await this.commitExternal("rebuild", candidate);
+      return this.publicRecord(candidate);
+    });
   }
   async writeMarker(marker: unknown) {
     if (
@@ -207,39 +265,51 @@ export class AdminWorkspaceStore {
       throw new Error(
         "Marker must be a printable string of at most 512 characters",
       );
-    await this.ensure();
-    this.record!.marker = marker;
-    this.record!.updatedAt = new Date().toISOString();
-    await this.save();
-    return { marker };
+    return this.exclusive(async () => {
+      await this.init();
+      await this.flushPendingCommit("marker");
+      if (!this.record) await this.ensureLocked();
+      const candidate = structuredClone(this.record!);
+      candidate.marker = marker;
+      candidate.updatedAt = new Date().toISOString();
+      await this.commit(candidate);
+      return { marker };
+    });
   }
   async readMarker() {
     await this.ensure();
     return { marker: this.record!.marker ?? null };
   }
   async getStartupScript() {
-    await this.init();
-    if (!this.record)
-      throw Object.assign(new Error("Administrative workspace not provisioned"), {
-        statusCode: 404,
-      });
-    return this.startupScriptRecord(this.record);
+    return this.exclusive(async () => {
+      await this.init();
+      await this.flushPendingCommit("startup-script:get");
+      if (!this.record)
+        throw Object.assign(new Error("Administrative workspace not provisioned"), {
+          statusCode: 404,
+        });
+      return this.startupScriptRecord(structuredClone(this.record));
+    });
   }
   async setStartupScript(value: unknown) {
-    await this.init();
-    if (!this.record)
-      throw Object.assign(new Error("Administrative workspace not provisioned"), {
-        statusCode: 404,
-      });
-    const script = validateAdminWorkspaceStartupScript(value);
-    if ((this.record.startupScript || "") !== script) {
-      this.record.startupScript = script;
-      this.record.startupScriptRevision =
-        normalizedRevision(this.record.startupScriptRevision) + 1;
-      this.record.updatedAt = new Date().toISOString();
-      await this.save();
-    }
-    return this.startupScriptRecord(this.record);
+    return this.exclusive(async () => {
+      await this.init();
+      await this.flushPendingCommit("startup-script:set");
+      if (!this.record)
+        throw Object.assign(new Error("Administrative workspace not provisioned"), {
+          statusCode: 404,
+        });
+      const script = validateAdminWorkspaceStartupScript(value);
+      let candidate = structuredClone(this.record);
+      if ((candidate.startupScript || "") !== script) {
+        candidate.startupScript = script;
+        candidate.startupScriptRevision =
+          normalizedRevision(candidate.startupScriptRevision) + 1;
+        candidate.updatedAt = new Date().toISOString();
+        await this.commit(candidate);
+      }
+      return this.startupScriptRecord(candidate);
+    });
   }
   private async startupScriptRecord(record: AdministrativeWorkspaceRecord) {
     const revision = normalizedRevision(record.startupScriptRevision);
@@ -268,21 +338,21 @@ export class AdminWorkspaceStore {
       runtime,
     };
   }
-  publicRecord() {
-    if (!this.record)
+  publicRecord(record = this.record) {
+    if (!record)
       throw new Error("Administrative workspace not initialized");
     return {
-      ...this.record,
+      ...structuredClone(record),
       ownerId: undefined,
       marker: undefined,
       startupScript: undefined,
       startupScriptRevision: undefined,
       appliedStartupScriptRevision: undefined,
       startupScriptLastAppliedAt: undefined,
-      startupScriptStatus: publicStartupScriptStatus(this.record),
+      startupScriptStatus: publicStartupScriptStatus(record),
       image: {
-        name: this.record.imageName || ADMIN_IMAGE,
-        digest: this.record.imageDigest || ADMIN_DIGEST,
+        name: record.imageName || ADMIN_IMAGE,
+        digest: record.imageDigest || ADMIN_DIGEST,
         promoted: true,
       },
       presentation: {
@@ -336,31 +406,32 @@ export class AdminWorkspaceStore {
       );
     return this.runtime.managementNetworkSecurity();
   }
-  private async applyRuntimeImage(image: AdminWorkspaceRuntimeImage | void) {
-    if (!image || !this.record) return;
+  private applyRuntimeImage(
+    record: AdministrativeWorkspaceRecord,
+    image: AdminWorkspaceRuntimeImage | void,
+  ) {
+    if (!image) return false;
     let changed = false;
     if (
-      this.record.imageName !== image.name ||
-      this.record.imageDigest !== image.digest
+      record.imageName !== image.name ||
+      record.imageDigest !== image.digest
     ) {
-      this.record.imageName = image.name;
-      this.record.imageDigest = image.digest;
+      record.imageName = image.name;
+      record.imageDigest = image.digest;
       changed = true;
     }
     if (
       image.appliedStartupScriptRevision !== undefined &&
-      normalizedRevision(this.record.appliedStartupScriptRevision) !==
+      normalizedRevision(record.appliedStartupScriptRevision) !==
         image.appliedStartupScriptRevision
     ) {
-      this.record.appliedStartupScriptRevision =
+      record.appliedStartupScriptRevision =
         image.appliedStartupScriptRevision;
-      this.record.startupScriptLastAppliedAt = new Date().toISOString();
+      record.startupScriptLastAppliedAt = new Date().toISOString();
       changed = true;
     }
-    if (changed) {
-      this.record.updatedAt = new Date().toISOString();
-      await this.save();
-    }
+    if (changed) record.updatedAt = new Date().toISOString();
+    return changed;
   }
 }
 

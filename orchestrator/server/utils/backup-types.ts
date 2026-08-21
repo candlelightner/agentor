@@ -18,8 +18,15 @@ export interface BackupJob {
   /** Restore-only provenance and the exact selected artifact subset. */
   artifactWorkspaceIds?: string[]; selectedWorkspaceIds?: string[];
   encrypted?: boolean; integrityVerified?: boolean; providerUploadId?: string; resumedFromChunk?: number;
-  /** Durable cleanup marker set before a local/fake provider upload begins. */
+  /** Durable cleanup marker set before a provider upload begins and replaced
+   * with the provider's authoritative object id after commit. */
   pendingProviderObjectId?: string;
+  /** Stable Agentor artifact id used to reconcile providers that assign an
+   * opaque object id after committing an upload. */
+  pendingProviderArtifactId?: string;
+  /** Durable resumable-upload abort marker retained until the provider
+   * confirms cancellation. */
+  pendingProviderUploadId?: string;
   consistency?: {workerState:string;strategy:string;warning:string}; target?:'new'|'original';workerId?:string;workerIds?:string[];
   /** Restore display name is retained so an interrupted restore can retry safely. */
   displayName?: string;

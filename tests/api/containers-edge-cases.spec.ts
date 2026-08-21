@@ -53,7 +53,7 @@ test.describe('Containers API — Edge Cases', () => {
   });
 
   test.describe('Operations on stopped containers', () => {
-    test('stop on already stopped container returns error', async ({ request }) => {
+    test('stop on already stopped container succeeds idempotently', async ({ request }) => {
       const container = await createWorker(request);
       createdContainerIds.push(container.id);
 
@@ -65,9 +65,14 @@ test.describe('Containers API — Edge Cases', () => {
       // Wait for stop
       await new Promise(r => setTimeout(r, 2000));
 
-      // Try stopping again
-      const { status: secondStop } = await api.stopContainer(container.id);
-      expect(secondStop).toBeGreaterThanOrEqual(400);
+      // Stopping an already-stopped worker is intentionally idempotent.
+      const { status: secondStop, body: secondBody } = await api.stopContainer(container.id);
+      expect(secondStop).toBe(200);
+      expect(secondBody.ok).toBe(true);
+
+      const { body: containers } = await api.listContainers();
+      const found = containers.find((candidate: { id: string }) => candidate.id === container.id);
+      expect(found?.status).toBe('stopped');
     });
 
     test('workspace download fails on stopped container', async ({ request }) => {

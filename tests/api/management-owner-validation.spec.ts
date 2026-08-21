@@ -6,6 +6,8 @@ import { validateManagementOwnerArguments } from "../../orchestrator/server/util
 import { UserEnvVarStore } from "../../orchestrator/server/utils/user-env-store";
 import { UserScopedJsonStore } from "../../orchestrator/server/utils/user-scoped-store";
 import { BackupStore } from "../../orchestrator/server/utils/backup-store";
+import { WorkspaceTombstoneStore } from "../../orchestrator/server/utils/workspace-tombstones";
+import { cleanManagementAuditDetails } from "../../orchestrator/server/utils/management-mcp-store";
 
 test("management owner selectors allow real cross-user administration", async () => {
   const real = new Set(["admin-owner", "other_owner", "uuid-owner-2"]);
@@ -21,6 +23,24 @@ test("management owner selectors allow real cross-user administration", async ()
   await expect(
     validateManagementOwnerArguments({ ownerId: "missing-owner" }, exists),
   ).rejects.toMatchObject({ statusCode: 404 });
+});
+
+test("management audit redacts backup provider upload and cleanup handles", () => {
+  expect(
+    cleanManagementAuditDetails({
+      providerUploadId: "session",
+      pendingProviderUploadId: "pending-session",
+      pendingProviderObjectId: "object",
+      pendingProviderArtifactId: "artifact",
+      jobId: "safe-job-id",
+    }),
+  ).toEqual({
+    providerUploadId: "[REDACTED]",
+    pendingProviderUploadId: "[REDACTED]",
+    pendingProviderObjectId: "[REDACTED]",
+    pendingProviderArtifactId: "[REDACTED]",
+    jobId: "safe-job-id",
+  });
 });
 
 test("management owner selectors reject traversal and encoded-ish separators", async () => {
@@ -87,14 +107,206 @@ test("user-scoped stores quarantine records whose embedded owner crosses partiti
   const store = new Store();
   (globalThis as any).useLogger = () => ({ error() {}, warn() {}, info() {}, debug() {} });
   await store.init();
-  expect(store.list()).toEqual([{ id: "record-valid", userId: ownerId }]);
+  expect(store.list()).toEqual([]);
+  expect(() => store.listForUser(ownerId)).toThrow(/unavailable/);
   await expect(
     store.save(ownerId, { id: "record-2", userId: "owner-b" }),
   ).rejects.toMatchObject({ statusCode: 400 });
+  await expect(
+    store.save(ownerId, { id: "record-2", userId: ownerId }),
+  ).rejects.toMatchObject({ statusCode: 503 });
   expect(JSON.parse(await readFile(join(ownerDir, "records.json"), "utf8"))).toEqual([
     { id: "record-valid", userId: ownerId },
     { id: "record-1", userId: "owner-b" },
   ]);
+  await rm(root, { recursive: true, force: true });
+});
+
+test("a corrupt user-scoped file stays quarantined and cannot be overwritten", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agentor-corrupt-owner-store-"));
+  const ownerId = "owner-corrupt";
+  const ownerDir = join(root, "users", ownerId);
+  const path = join(ownerDir, "records.json");
+  const corrupt = '[{"id":"partial"';
+  await mkdir(ownerDir, { recursive: true });
+  await writeFile(path, corrupt);
+
+  class Store extends UserScopedJsonStore<string, { id: string; userId: string }> {
+    constructor() {
+      super(root, "records.json", (item) => item.id);
+    }
+    save(userId: string, item: { id: string; userId: string }) {
+      return this.setItem(userId, item);
+    }
+  }
+
+  const store = new Store();
+  (globalThis as any).useLogger = () => ({ error() {}, warn() {}, info() {}, debug() {} });
+  await store.init();
+  expect(store.listUserIds()).toContain(ownerId);
+  expect(() => store.get(ownerId, "partial")).toThrow(/unavailable/);
+  await expect(store.save(ownerId, { id: "replacement", userId: ownerId }))
+    .rejects.toMatchObject({ statusCode: 503 });
+  expect(await readFile(path, "utf8")).toBe(corrupt);
+
+  // Authoritative deleted-owner cleanup can still remove quarantined bytes.
+  await expect(store.removeForUser(ownerId)).resolves.toBe(0);
+  await expect(access(path)).rejects.toMatchObject({ code: "ENOENT" });
+  expect(store.listUserIds()).not.toContain(ownerId);
+  await rm(root, { recursive: true, force: true });
+});
+
+test("user-scoped deletion restores its in-memory retry handle when persistence fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agentor-store-delete-"));
+  class Store extends UserScopedJsonStore<string, { id: string; userId: string }> {
+    failPersistence = false;
+    constructor() {
+      super(root, "records.json", (item) => item.id);
+    }
+    save(userId: string, item: { id: string; userId: string }) {
+      return this.setItem(userId, item);
+    }
+    remove(userId: string, id: string) {
+      return this.deleteItem(userId, id);
+    }
+    protected override persistUser(userId: string): Promise<void> {
+      if (this.failPersistence) {
+        return Promise.reject(new Error("injected persistence failure"));
+      }
+      return super.persistUser(userId);
+    }
+  }
+
+  const store = new Store();
+  await store.save("owner-1", { id: "record-1", userId: "owner-1" });
+  store.failPersistence = true;
+  await expect(store.remove("owner-1", "record-1")).rejects.toThrow(
+    "injected persistence failure",
+  );
+  expect(store.get("owner-1", "record-1")).toEqual({
+    id: "record-1",
+    userId: "owner-1",
+  });
+  await rm(root, { recursive: true, force: true });
+});
+
+test("user-scoped bulk removal restores retry handles when persistence fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agentor-store-remove-where-"));
+  class Store extends UserScopedJsonStore<string, { id: string; userId: string }> {
+    failPersistence = false;
+    constructor() {
+      super(root, "records.json", (item) => item.id);
+    }
+    save(userId: string, item: { id: string; userId: string }) {
+      return this.setItem(userId, item);
+    }
+    removeMatching(predicate: (item: { id: string; userId: string }) => boolean) {
+      return this.removeWhere(predicate);
+    }
+    protected override persistUser(userId: string): Promise<void> {
+      if (this.failPersistence) {
+        return Promise.reject(new Error("injected persistence failure"));
+      }
+      return super.persistUser(userId);
+    }
+  }
+
+  const store = new Store();
+  await store.save("owner-1", { id: "record-1", userId: "owner-1" });
+  await store.save("owner-1", { id: "record-2", userId: "owner-1" });
+  store.failPersistence = true;
+  await expect(store.removeMatching(() => true)).rejects.toThrow(
+    "injected persistence failure",
+  );
+  expect(store.listForUser("owner-1").map((item) => item.id).sort()).toEqual([
+    "record-1",
+    "record-2",
+  ]);
+  await rm(root, { recursive: true, force: true });
+});
+
+test("a failed queued write cannot roll back a newer same-key update", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agentor-store-serialized-mutation-"));
+  let releaseFailure!: () => void;
+  let failureStarted!: () => void;
+  const failureGate = new Promise<void>((resolve) => (releaseFailure = resolve));
+  const started = new Promise<void>((resolve) => (failureStarted = resolve));
+  class Store extends UserScopedJsonStore<string, { id: string; userId: string; value: string }> {
+    failNext = false;
+    constructor() {
+      super(root, "records.json", (item) => item.id);
+    }
+    save(item: { id: string; userId: string; value: string }) {
+      return this.setItem(item.userId, item);
+    }
+    protected override async persistUser(userId: string): Promise<void> {
+      if (this.failNext) {
+        this.failNext = false;
+        failureStarted();
+        await failureGate;
+        throw new Error("injected queued failure");
+      }
+      return super.persistUser(userId);
+    }
+  }
+
+  const store = new Store();
+  await store.save({ id: "record-1", userId: "owner-1", value: "v0" });
+  store.failNext = true;
+  const first = store.save({ id: "record-1", userId: "owner-1", value: "v1" });
+  await started;
+  const second = store.save({ id: "record-1", userId: "owner-1", value: "v2" });
+  releaseFailure();
+  await expect(first).rejects.toThrow("injected queued failure");
+  await expect(second).resolves.toBeUndefined();
+  expect(store.get("owner-1", "record-1")?.value).toBe("v2");
+  expect(JSON.parse(await readFile(join(root, "users", "owner-1", "records.json"), "utf8")))
+    .toEqual([{ id: "record-1", userId: "owner-1", value: "v2" }]);
+  await rm(root, { recursive: true, force: true });
+});
+
+test("user-scoped owner removal retains its candidate when unlink fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agentor-store-remove-owner-"));
+  class Store extends UserScopedJsonStore<string, { id: string; userId: string }> {
+    constructor() {
+      super(root, "records.json", (item) => item.id);
+    }
+    save(userId: string, item: { id: string; userId: string }) {
+      return this.setItem(userId, item);
+    }
+  }
+
+  const store = new Store();
+  await store.save("owner-1", { id: "record-1", userId: "owner-1" });
+  const persistedPath = join(root, "users", "owner-1", "records.json");
+  await rm(persistedPath, { force: true });
+  await mkdir(join(persistedPath, "non-empty"), { recursive: true });
+  await expect(store.removeForUser("owner-1")).rejects.toBeTruthy();
+  expect(store.listUserIds()).toContain("owner-1");
+  expect(store.get("owner-1", "record-1")).toBeTruthy();
+  await rm(root, { recursive: true, force: true });
+});
+
+test("workspace tombstone persistence recovers after a rejected save", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agentor-tombstone-queue-"));
+  const dataDir = join(root, "data");
+  await writeFile(dataDir, "blocks mkdir");
+  const store = new WorkspaceTombstoneStore(dataDir);
+  const first = {
+    workerId: "worker-1",
+    userId: "owner-1",
+    displayName: "first",
+    backend: "directory" as const,
+  };
+  await expect(store.record(first)).rejects.toBeTruthy();
+
+  await rm(dataDir, { force: true });
+  await mkdir(dataDir);
+  await expect(store.record({ ...first, workerId: "worker-2", displayName: "second" }))
+    .resolves.toBeUndefined();
+  expect((await store.list()).map((entry) => entry.workerId)).toEqual(["worker-2"]);
+  expect(JSON.parse(await readFile(join(dataDir, "workspace-tombstones.json"), "utf8")))
+    .toMatchObject({ entries: [{ workerId: "worker-2" }] });
   await rm(root, { recursive: true, force: true });
 });
 
@@ -127,5 +339,28 @@ test("historical URL-safe owner ids load while unsafe backup records are quarant
   expect(store.get(ownerId).jobs.map((job) => job.id)).toEqual(["job-valid_1"]);
   expect(store.get(ownerId).artifacts.map((artifact) => artifact.id)).toEqual(["artifact-valid_1"]);
   expect(await readFile(path, "utf8")).toBe(original);
+  await rm(root, { recursive: true, force: true });
+});
+
+test("corrupt backup state is quarantined, preserved, and closed by owner cleanup", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agentor-corrupt-backup-store-"));
+  const ownerId = "owner-corrupt-backup";
+  const ownerDir = join(root, "users", ownerId);
+  const path = join(ownerDir, "backups.json");
+  const corrupt = '{"schemaVersion":1,"jobs":[';
+  await mkdir(ownerDir, { recursive: true });
+  await writeFile(path, corrupt);
+  (globalThis as any).useLogger = () => ({ error() {}, warn() {}, info() {}, debug() {} });
+
+  const store = new BackupStore(root);
+  await store.init();
+  expect(store.userIds()).toContain(ownerId);
+  expect(() => store.get(ownerId)).toThrow(/unavailable/);
+  await expect(store.update(ownerId, () => undefined)).rejects.toMatchObject({ statusCode: 503 });
+  expect(await readFile(path, "utf8")).toBe(corrupt);
+
+  await store.forget(ownerId);
+  await expect(access(path)).rejects.toMatchObject({ code: "ENOENT" });
+  await expect(store.update(ownerId, () => undefined)).rejects.toMatchObject({ statusCode: 410 });
   await rm(root, { recursive: true, force: true });
 });

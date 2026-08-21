@@ -10,6 +10,8 @@ import {
   validateAdminWorkspaceStartupScript,
 } from "./admin-workspace-store";
 import { useWorkerGroupStore } from "./services";
+import type { WorkerGroup, WorkerGroupStore } from "./worker-group-store";
+import { withWorkerNetworkMutation } from "./worker-group-manager";
 
 export interface GroupAdministrativeWorkspaceRecord
   extends AdministrativeWorkspaceRecord {
@@ -19,12 +21,28 @@ export interface GroupAdministrativeWorkspaceRecord
   services: string[];
 }
 
+type OwnerSerializer = <T>(
+  ownerId: string,
+  operation: () => Promise<T>,
+) => Promise<T>;
+
 export class GroupAdminWorkspaceStore {
   private runtime?: AdminWorkspaceRuntimeAdapter;
   private identityMaterializer?: (
     record: GroupAdministrativeWorkspaceRecord,
   ) => Promise<void>;
   private running = new Set<string>();
+  private pendingCommits = new Map<
+    string,
+    { operation: string; record: GroupAdministrativeWorkspaceRecord }
+  >();
+  constructor(
+    private readonly groups: Pick<
+      WorkerGroupStore,
+      "findById" | "list" | "update"
+    > = useWorkerGroupStore(),
+    private readonly serializeOwner: OwnerSerializer = withWorkerNetworkMutation,
+  ) {}
   setRuntimeAdapter(runtime: AdminWorkspaceRuntimeAdapter) {
     this.runtime = runtime;
   }
@@ -42,25 +60,71 @@ export class GroupAdminWorkspaceStore {
       throw Object.assign(new Error("Administrative clipboard unavailable"), {
         statusCode: 503,
       });
-    await this.runtime.setClipboard(mime, bytes, record);
+    await this.runtime.setClipboard(mime, bytes, structuredClone(record));
   }
   private group(groupId: string) {
-    const group = useWorkerGroupStore().findById(groupId);
+    const group = this.groups.findById(groupId);
     if (!group)
       throw Object.assign(new Error("Worker group not found"), {
         statusCode: 404,
       });
-    return group;
+    return structuredClone(group);
   }
   private record(groupId: string) {
-    return this.group(groupId).adminWorkspace as
+    const record = this.group(groupId).adminWorkspace as
       | GroupAdministrativeWorkspaceRecord
       | undefined;
+    return record ? structuredClone(record) : undefined;
   }
   private async save(record: GroupAdministrativeWorkspaceRecord) {
-    await useWorkerGroupStore().update(record.ownerId, record.groupId, {
-      adminWorkspace: record,
+    await this.groups.update(record.ownerId, record.groupId, {
+      adminWorkspace: structuredClone(record),
     });
+  }
+  private async withGroup<T>(
+    groupId: string,
+    serialized: boolean,
+    operation: (group: WorkerGroup) => Promise<T>,
+  ) {
+    const snapshot = this.group(groupId);
+    const execute = async () => {
+      const live = this.group(groupId);
+      if (live.userId !== snapshot.userId)
+        throw Object.assign(new Error("Worker group not found"), {
+          statusCode: 404,
+        });
+      return operation(live);
+    };
+    return serialized
+      ? execute()
+      : this.serializeOwner(snapshot.userId, execute);
+  }
+  private async flushPendingCommit(groupId: string, operation: string) {
+    const pending = this.pendingCommits.get(groupId);
+    if (!pending) return undefined;
+    await this.save(pending.record);
+    this.pendingCommits.delete(groupId);
+    return {
+      matched: pending.operation === operation,
+      record: structuredClone(pending.record),
+    };
+  }
+  private async commitExternal(
+    operation: string,
+    record: GroupAdministrativeWorkspaceRecord,
+  ) {
+    try {
+      await this.save(record);
+    } catch (error) {
+      // The runtime has already accepted this lifecycle action. Preserve its
+      // exact resulting control-plane record so a retry persists the outcome
+      // rather than rebuilding or restarting the workspace a second time.
+      this.pendingCommits.set(record.groupId, {
+        operation,
+        record: structuredClone(record),
+      });
+      throw error;
+    }
   }
   private async run<T>(groupId: string, operation: () => Promise<T>): Promise<T> {
     // Lifecycle operations can rebuild images and take longer than an HTTP
@@ -80,9 +144,22 @@ export class GroupAdminWorkspaceStore {
       this.running.delete(groupId);
     }
   }
-  async ensure(groupId: string, _ownerId?: string) {
-    const group = this.group(groupId);
-    let record = this.record(groupId);
+  async ensure(groupId: string, _ownerId?: string, authorize?: () => void) {
+    return this.run(groupId, () =>
+      this.withGroup(groupId, false, (group) => {
+        authorize?.();
+        return this.ensureLocked(group);
+      }),
+    );
+  }
+  private async ensureLocked(group: WorkerGroup) {
+    const pending = await this.flushPendingCommit(group.id, "ensure");
+    if (pending?.matched) {
+      if (pending.record.status === "running" && this.identityMaterializer)
+        await this.identityMaterializer(structuredClone(pending.record));
+      return this.publicRecord(pending.record);
+    }
+    let record = pending?.record ?? this.record(group.id);
     if (!record) {
       const stamp = new Date().toISOString();
       record = {
@@ -90,97 +167,154 @@ export class GroupAdminWorkspaceStore {
         id: randomUUID(),
         kind: "group-administrative",
         trusted: true,
-        groupId,
+        groupId: group.id,
         ownerId: group.userId,
         services: ["terminal", "editor", "desktop"],
         status: "running",
         createdAt: stamp,
         updatedAt: stamp,
       };
+      // Commit the stable group/workspace identity before provisioning its
+      // disposable runtime.
       await this.save(record);
     } else if (!record.services) {
       record.services = ["terminal", "editor", "desktop"];
       await this.save(record);
     }
-    if (this.runtime)
-      await this.run(groupId, async () =>
-        this.applyImage(record!, await this.runtime!.ensure(record!)),
+    if (this.runtime) {
+      const changed = this.applyImage(
+        record,
+        await this.runtime.ensure(structuredClone(record)),
       );
+      if (changed) await this.commitExternal("ensure", record);
+    }
     if (record.status === "running" && this.identityMaterializer)
-      await this.identityMaterializer(record);
+      await this.identityMaterializer(structuredClone(record));
     return this.publicRecord(record);
   }
-  async setStatus(groupId: string, status: "running" | "stopped") {
-    // Avoid ensure() for an existing record: it reconciles the persisted
-    // running state and could execute an old startup-script revision before
-    // the explicit start operation replaces the container.
-    if (!this.record(groupId)) await this.ensure(groupId);
-    const record = this.record(groupId)!;
-    if (this.runtime)
-      await this.run(groupId, async () => {
-        if (status === "running")
-          await this.applyImage(record, await this.runtime!.start(record));
-        else await this.runtime!.stop(record);
-      });
-    record.status = status;
-    record.updatedAt = new Date().toISOString();
-    await this.save(record);
-    if (status === "running" && this.identityMaterializer)
-      await this.identityMaterializer(record);
-    return this.publicRecord(record);
-  }
-  async rebuild(groupId: string, ownerId?: string) {
-    // Rebuild must not first auto-start stale disposable compute. Provisioning
-    // is still retained for a genuinely new administrative workspace.
-    if (!this.record(groupId)) await this.ensure(groupId, ownerId);
-    const record = this.record(groupId)!;
-    if (!this.runtime)
-      throw Object.assign(
-        new Error("Administrative workspace runtime is unavailable"),
-        { statusCode: 503 },
-      );
-    await this.run(groupId, async () =>
-      this.applyImage(record, await this.runtime!.rebuild(record)),
+  async setStatus(
+    groupId: string,
+    status: "running" | "stopped",
+    authorize?: () => void,
+  ) {
+    return this.run(groupId, () =>
+      this.withGroup(groupId, false, async (group) => {
+        authorize?.();
+        const operation = `status:${status}`;
+        const pending = await this.flushPendingCommit(groupId, operation);
+        if (pending?.matched) {
+          if (status === "running" && this.identityMaterializer)
+            await this.identityMaterializer(structuredClone(pending.record));
+          return this.publicRecord(pending.record);
+        }
+        // Avoid public ensure(): this operation already owns both lifecycle
+        // and hierarchy serialization boundaries.
+        if (!this.record(groupId)) await this.ensureLocked(group);
+        const record = this.record(groupId)!;
+        if (this.runtime) {
+          if (status === "running")
+            this.applyImage(
+              record,
+              await this.runtime.start(structuredClone(record)),
+            );
+          else await this.runtime.stop(structuredClone(record));
+        }
+        record.status = status;
+        record.updatedAt = new Date().toISOString();
+        if (this.runtime) await this.commitExternal(operation, record);
+        else await this.save(record);
+        if (status === "running" && this.identityMaterializer)
+          await this.identityMaterializer(structuredClone(record));
+        return this.publicRecord(record);
+      }),
     );
-    record.status = "running";
-    record.updatedAt = new Date().toISOString();
-    await this.save(record);
-    if (this.identityMaterializer) await this.identityMaterializer(record);
-    return this.publicRecord(record);
+  }
+  async rebuild(groupId: string, ownerId?: string, authorize?: () => void) {
+    return this.run(groupId, () =>
+      this.withGroup(groupId, false, async (group) => {
+        authorize?.();
+        const pending = await this.flushPendingCommit(groupId, "rebuild");
+        if (pending?.matched) {
+          if (this.identityMaterializer)
+            await this.identityMaterializer(structuredClone(pending.record));
+          return this.publicRecord(pending.record);
+        }
+        // Rebuild must not first auto-start stale disposable compute.
+        if (!this.record(groupId)) await this.ensureLocked(group);
+        const record = this.record(groupId)!;
+        if (ownerId && ownerId !== record.ownerId)
+          throw Object.assign(new Error("Worker group not found"), {
+            statusCode: 404,
+          });
+        if (!this.runtime)
+          throw Object.assign(
+            new Error("Administrative workspace runtime is unavailable"),
+            { statusCode: 503 },
+          );
+        this.applyImage(
+          record,
+          await this.runtime.rebuild(structuredClone(record)),
+        );
+        record.status = "running";
+        record.updatedAt = new Date().toISOString();
+        await this.commitExternal("rebuild", record);
+        if (this.identityMaterializer)
+          await this.identityMaterializer(structuredClone(record));
+        return this.publicRecord(record);
+      }),
+    );
   }
   findByWorkspaceId(workspaceId: string) {
-    for (const group of useWorkerGroupStore().list()) {
+    for (const group of this.groups.list()) {
       const record = group.adminWorkspace as
         | GroupAdministrativeWorkspaceRecord
         | undefined;
-      if (record?.id === workspaceId) return record;
+      if (record?.id === workspaceId) return structuredClone(record);
     }
   }
-  async getStartupScript(groupId: string) {
-    const record = this.record(groupId);
-    if (!record)
-      throw Object.assign(
-        new Error("Group administrative workspace not provisioned"),
-        { statusCode: 404 },
+  async getStartupScript(groupId: string, authorize?: () => void) {
+    return this.withGroup(groupId, false, async () => {
+      authorize?.();
+      const pending = await this.flushPendingCommit(
+        groupId,
+        "startup-script:get",
       );
-    return this.startupScriptRecord(record);
+      const record = pending?.record ?? this.record(groupId);
+      if (!record)
+        throw Object.assign(
+          new Error("Group administrative workspace not provisioned"),
+          { statusCode: 404 },
+        );
+      return this.startupScriptRecord(record);
+    });
   }
-  async setStartupScript(groupId: string, value: unknown) {
-    const record = this.record(groupId);
-    if (!record)
-      throw Object.assign(
-        new Error("Group administrative workspace not provisioned"),
-        { statusCode: 404 },
+  async setStartupScript(
+    groupId: string,
+    value: unknown,
+    authorize?: () => void,
+  ) {
+    return this.withGroup(groupId, false, async () => {
+      authorize?.();
+      const pending = await this.flushPendingCommit(
+        groupId,
+        "startup-script:set",
       );
-    const script = validateAdminWorkspaceStartupScript(value);
-    if ((record.startupScript || "") !== script) {
-      record.startupScript = script;
-      record.startupScriptRevision =
-        normalizedRevision(record.startupScriptRevision) + 1;
-      record.updatedAt = new Date().toISOString();
-      await this.save(record);
-    }
-    return this.startupScriptRecord(record);
+      const record = pending?.record ?? this.record(groupId);
+      if (!record)
+        throw Object.assign(
+          new Error("Group administrative workspace not provisioned"),
+          { statusCode: 404 },
+        );
+      const script = validateAdminWorkspaceStartupScript(value);
+      if ((record.startupScript || "") !== script) {
+        record.startupScript = script;
+        record.startupScriptRevision =
+          normalizedRevision(record.startupScriptRevision) + 1;
+        record.updatedAt = new Date().toISOString();
+        await this.save(record);
+      }
+      return this.startupScriptRecord(record);
+    });
   }
   private async startupScriptRecord(record: GroupAdministrativeWorkspaceRecord) {
     const revision = normalizedRevision(record.startupScriptRevision);
@@ -210,23 +344,43 @@ export class GroupAdminWorkspaceStore {
       runtime,
     };
   }
-  async remove(groupId: string) {
-    const record = this.record(groupId);
-    if (record && this.runtime?.remove)
-      await this.run(groupId, () => this.runtime!.remove!(record));
+  async remove(groupId: string, serialized = false) {
+    const operation = () =>
+      this.withGroup(groupId, serialized, async () => {
+        const pending = await this.flushPendingCommit(groupId, "remove");
+        const record = pending?.record ?? this.record(groupId);
+        if (record && this.runtime?.remove)
+          await this.runtime.remove(structuredClone(record));
+      });
+    return serialized ? operation() : this.run(groupId, operation);
   }
   /** Recreate the runtime removed during a group-delete attempt whose final
    * group-store persistence failed. The group record (including workspace
    * identity and volumes) has already been restored by WorkerGroupStore. */
-  async restoreAfterFailedGroupDelete(groupId:string,status:"running"|"stopped"|"error"|"creating"="running") {
-    await this.ensure(groupId);
-    if(status==="stopped") await this.setStatus(groupId,"stopped");
+  async restoreAfterFailedGroupDelete(
+    groupId: string,
+    status: "running" | "stopped" | "error" | "creating" = "running",
+    serialized = false,
+  ) {
+    const operation = () =>
+      this.withGroup(groupId, serialized, async (group) => {
+        await this.ensureLocked(group);
+        if (status !== "stopped") return;
+        const record = this.record(groupId)!;
+        if (this.runtime) await this.runtime.stop(structuredClone(record));
+        record.status = "stopped";
+        record.updatedAt = new Date().toISOString();
+        if (this.runtime)
+          await this.commitExternal("status:stopped", record);
+        else await this.save(record);
+      });
+    return serialized ? operation() : this.run(groupId, operation);
   }
-  private async applyImage(
+  private applyImage(
     record: GroupAdministrativeWorkspaceRecord,
     image: any,
   ) {
-    if (!image) return;
+    if (!image) return false;
     let changed = false;
     if (record.imageName !== image.name || record.imageDigest !== image.digest) {
       record.imageName = image.name;
@@ -245,8 +399,8 @@ export class GroupAdminWorkspaceStore {
     }
     if (changed) {
       record.updatedAt = new Date().toISOString();
-      await this.save(record);
     }
+    return changed;
   }
   private publicRecord(record: GroupAdministrativeWorkspaceRecord) {
     return {

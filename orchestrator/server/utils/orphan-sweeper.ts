@@ -12,6 +12,22 @@ import type { InitScriptStore } from './init-script-store';
 import type { ExportJobManager } from './export-jobs';
 import { listWorkspaceTombstones, removeWorkspaceTombstonesForUser } from './workspace-tombstones';
 import { useGitImageCatalogManager } from './git-image-manager';
+import { withOwnerLifecycleMutation } from './worker-lifecycle-coordinator';
+
+/** Acquire the owner mutation fence before the final existence check and any
+ * destructive cleanup. Returning false means the owner was recreated while a
+ * stale sweep candidate waited for the fence and nothing was touched. */
+export function withDeletedOwnerCleanupFence(
+  userId: string,
+  ownerExists: () => boolean | Promise<boolean>,
+  cleanup: () => Promise<void>,
+): Promise<boolean> {
+  return withOwnerLifecycleMutation(userId, async () => {
+    if (await ownerExists()) return false;
+    await cleanup();
+    return true;
+  });
+}
 
 /** Remove per-user data whose owning user has been deleted from the auth DB.
  * Called once at startup and on a 10-minute interval so orphaned per-user
@@ -22,6 +38,7 @@ import { useGitImageCatalogManager } from './git-image-manager';
 export class OrphanSweeper {
   private timer: ReturnType<typeof setInterval> | null = null;
   private preCleanupHooks: Array<(userId: string) => Promise<void>> = [];
+  private lifecycleCleanupHooks: Array<(userId: string) => Promise<void>> = [];
   private cleanupHooks: Array<(userId: string) => Promise<void>> = [];
   private candidateSources: Array<() => string[] | Promise<string[]>> = [];
 
@@ -40,6 +57,9 @@ export class OrphanSweeper {
   ) {}
 
   addPreCleanupHook(hook: (userId: string) => Promise<void>) { this.preCleanupHooks.push(hook); }
+  /** Destructive runtime cleanup that must succeed before durable owner stores
+   * are removed. Runs while the shared owner lifecycle fence is held. */
+  addLifecycleCleanupHook(hook: (userId: string) => Promise<void>) { this.lifecycleCleanupHooks.push(hook); }
   addCleanupHook(hook: (userId: string) => Promise<void>) { this.cleanupHooks.push(hook); }
   addCandidateSource(source: () => string[] | Promise<string[]>) { this.candidateSources.push(source); }
 
@@ -76,6 +96,7 @@ export class OrphanSweeper {
     // we clean up even if a user was created but never saved env vars.
     const candidates = new Set<string>();
     for (const entry of this.envStore.list()) candidates.add(entry.userId);
+    for (const userId of await this.credMgr.listUserIds()) candidates.add(userId);
     for (const entry of await listWorkspaceTombstones()) candidates.add(entry.userId);
     for (const userId of useGitImageCatalogManager().ownerIds()) candidates.add(userId);
     for (const source of this.candidateSources) for (const userId of await source()) candidates.add(userId);
@@ -95,39 +116,51 @@ export class OrphanSweeper {
     let removed = 0;
     for (const userId of candidates) {
       if (existingIds.has(userId)) continue;
-      let cleanupFenced = true;
-      for (const hook of this.preCleanupHooks) {
-        try {
-          await hook(userId);
-        } catch (error) {
-          cleanupFenced = false;
-          useLogger().warn(
-            `[orphan-sweeper] deferred cleanup for ${userId}: ${error instanceof Error ? error.message : error}`,
-          );
-          break;
-        }
-      }
-      // A pre-cleanup hook is a mutation barrier, not best-effort cleanup. If
-      // an active restore cannot drain by its deadline, retain all owner state
-      // and retry on the next sweep rather than creating a post-cleanup worker.
-      if (!cleanupFenced) continue;
-      await this.envStore.delete(userId).catch(() => {});
-      await this.workerStore.removeForUser(userId).catch(() => {});
-      await this.portStore.removeForUser(userId).catch(() => {});
-      await this.domainStore.removeForUser(userId).catch(() => {});
-      await this.environmentStore.removeForUser(userId).catch(() => {});
-      await this.capabilityStore.removeForUser(userId).catch(() => {});
-      await this.instructionStore.removeForUser(userId).catch(() => {});
-      await this.initScriptStore.removeForUser(userId).catch(() => {});
-      await this.exportJobs.removeForUser(userId).catch(() => {});
-      await removeWorkspaceTombstonesForUser(userId).catch(() => {});
-      await useGitImageCatalogManager().forgetOwner(userId).catch(() => {});
-      for (const hook of this.cleanupHooks) await hook(userId).catch(() => {});
-      await this.usage.forgetUser(userId).catch(() => {});
-      // Removing the user's top-level dir cleans up any remaining files
-      // (workspaces/, agents/, credentials/) that the stores don't manage.
-      await this.credMgr.removeUserData(userId).catch(() => {});
-      removed++;
+      let ownerCleanupSucceeded = false;
+      await withDeletedOwnerCleanupFence(
+        userId,
+        () => Boolean(
+          getAuthDb()
+            .prepare('SELECT 1 FROM user WHERE id = ?')
+            .get(userId),
+        ),
+        async () => {
+          // Pre-cleanup hooks are destructive mutation barriers (for example,
+          // aborting and deleting owner backups). They must run only after the
+          // final owner revalidation and while the same owner fence remains
+          // held, otherwise a stale candidate can erase a recreated account.
+          for (const hook of this.preCleanupHooks) await hook(userId);
+
+          // Runtime resources are authoritative and must be removed before their
+          // WorkerStore handles. A Docker failure keeps all owner records intact
+          // so the next sweep can retry instead of leaking an untracked worker.
+          for (const hook of this.lifecycleCleanupHooks) await hook(userId);
+
+          await this.envStore.delete(userId);
+          await this.workerStore.removeForUser(userId);
+          await this.portStore.removeForUser(userId);
+          await this.domainStore.removeForUser(userId);
+          await this.environmentStore.removeForUser(userId);
+          await this.capabilityStore.removeForUser(userId);
+          await this.instructionStore.removeForUser(userId);
+          await this.initScriptStore.removeForUser(userId);
+          await this.exportJobs.removeForUser(userId);
+          await removeWorkspaceTombstonesForUser(userId);
+          await useGitImageCatalogManager().forgetOwner(userId);
+          for (const hook of this.cleanupHooks) await hook(userId);
+          await this.usage.forgetUser(userId);
+          // Removing the user's top-level dir cleans up any remaining files
+          // (workspaces/, agents/, credentials/) that the stores don't manage.
+          await this.credMgr.removeUserData(userId);
+          removed++;
+          ownerCleanupSucceeded = true;
+        },
+      ).catch((error) => {
+        useLogger().warn(
+          `[orphan-sweeper] deferred runtime cleanup for ${userId}: ${error instanceof Error ? error.message : error}`,
+        );
+      });
+      if (!ownerCleanupSucceeded) continue;
     }
     if (removed > 0) {
       useLogger().info(`[orphan-sweeper] cleaned up ${removed} orphaned per-user record(s)`);

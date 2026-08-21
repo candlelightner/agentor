@@ -1,7 +1,10 @@
 import { expect, test } from "@playwright/test";
 import { ManagementPlatformDomain } from "../../orchestrator/server/utils/management-platform-domain";
 import { withWorkerNetworkMutation } from "../../orchestrator/server/utils/worker-group-manager";
-import { withGroupImageMutationBoundary } from "../../orchestrator/server/utils/management-mcp-store";
+import {
+  withGroupImageMutationBoundary,
+  withGroupScopeAuthorizationBoundary,
+} from "../../orchestrator/server/utils/management-mcp-store";
 
 test("managed-network tools publish only fields consumed by each operation", () => {
   const tools = new Map(new ManagementPlatformDomain().tools().map((tool) => [tool.name, tool.inputSchema as any]));
@@ -58,4 +61,36 @@ test("group-image mutation boundary observes queued hierarchy revocation", async
   release();
   await preceding;
   await expect(mutation).rejects.toMatchObject({ statusCode: 404 });
+});
+
+test("direct group resource boundary re-authorizes after queued membership changes", async () => {
+  const ownerId = `direct-scope-race-${Date.now()}`;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const preceding = withWorkerNetworkMutation(ownerId, () => held);
+  let authorized = true;
+  let executed = false;
+  const invocation = withGroupScopeAuthorizationBoundary(
+    ownerId,
+    () => {
+      if (!authorized)
+        throw Object.assign(new Error("Resource not found"), { statusCode: 404 });
+    },
+    async () => {
+      executed = true;
+      return "unexpected";
+    },
+  );
+
+  authorized = false;
+  release();
+  await preceding;
+  await expect(invocation).rejects.toMatchObject({ statusCode: 404 });
+  expect(executed).toBe(false);
+
+  await expect(withGroupScopeAuthorizationBoundary(
+    ownerId,
+    () => undefined,
+    async () => "allowed",
+  )).resolves.toBe("allowed");
 });

@@ -7,6 +7,48 @@ export type GitHubHttpTransport = (
   init?: RequestInit,
 ) => Promise<Response>;
 
+const DEFAULT_GITHUB_TIMEOUT_MS = 20_000;
+const MIN_GITHUB_TIMEOUT_MS = 1_000;
+const MAX_GITHUB_TIMEOUT_MS = 120_000;
+
+function githubTimeoutMs() {
+  const configured = Number(process.env.GIT_IMAGE_HTTP_TIMEOUT_MS);
+  if (!Number.isFinite(configured)) return DEFAULT_GITHUB_TIMEOUT_MS;
+  return Math.min(
+    MAX_GITHUB_TIMEOUT_MS,
+    Math.max(MIN_GITHUB_TIMEOUT_MS, configured),
+  );
+}
+
+function withGitHubDeadline<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const controller = new AbortController();
+    let settled = false;
+    const finish = (error: unknown, value?: T) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      error ? reject(error) : resolve(value as T);
+    };
+    const timeout = setTimeout(() => {
+      const error = Object.assign(
+        new Error("GitHub catalog request timed out"),
+        { statusCode: 504 },
+      );
+      controller.abort(error);
+      finish(error);
+    }, githubTimeoutMs());
+    Promise.resolve()
+      .then(() => operation(controller.signal))
+      .then(
+        (value) => finish(undefined, value),
+        (error) => finish(error),
+      );
+  });
+}
+
 export interface GitSnapshot {
   revision: string | null;
   files: GitFileMap;
@@ -22,11 +64,24 @@ export interface GitWrite {
 export interface GitWriteResult {
   revision: string;
   branch: string;
-  pullRequest?: { number: number; url: string; state: "open" };
+  pullRequest?: GitPullRequest;
+}
+export interface GitPullRequest {
+  number: number;
+  url: string;
+  state: "open";
+}
+export interface GitPullRequestResult {
+  pullRequest: GitPullRequest;
+  created: boolean;
 }
 export interface GitImageProvider {
   read(repository: string, branch: string): Promise<GitSnapshot>;
   write(repository: string, input: GitWrite): Promise<GitWriteResult>;
+  ensurePullRequest?(
+    repository: string,
+    input: { branch: string; targetBranch: string; title: string },
+  ): Promise<GitPullRequestResult>;
   revoke?(): Promise<void>;
   dispatchWorkflow?(
     repository: string,
@@ -100,19 +155,46 @@ export class FakeGitHubProvider implements GitImageProvider {
     };
     let pullRequest;
     if (input.workflow === "pull-request") {
-      const number = repo.pullRequests.length + 1;
-      pullRequest = {
-        number,
-        url: `https://github.test/${repository}/pull/${number}`,
-        state: "open" as const,
-      };
-      repo.pullRequests.push({
-        ...pullRequest,
-        head: input.branch,
-        base: input.targetBranch,
-      });
+      ({ pullRequest } = await this.ensurePullRequest(repository, {
+        branch: input.branch,
+        targetBranch: input.targetBranch,
+        title: input.message,
+      }));
     }
     return { revision, branch: input.branch, pullRequest };
+  }
+  async ensurePullRequest(
+    repository: string,
+    input: { branch: string; targetBranch: string; title: string },
+  ): Promise<GitPullRequestResult> {
+    const repo = this.repo(repository),
+      existing = repo.pullRequests.find(
+        (candidate) =>
+          candidate.state === "open" &&
+          candidate.head === input.branch &&
+          candidate.base === input.targetBranch,
+      );
+    if (existing)
+      return {
+        pullRequest: {
+          number: existing.number,
+          url: existing.url,
+          state: "open",
+        },
+        created: false,
+      };
+    const number = repo.pullRequests.length + 1,
+      pullRequest: GitPullRequest = {
+        number,
+        url: `https://github.test/${repository}/pull/${number}`,
+        state: "open",
+      };
+    repo.pullRequests.push({
+      ...pullRequest,
+      head: input.branch,
+      base: input.targetBranch,
+    });
+    return { pullRequest, created: true };
   }
   async revoke() {}
   async dispatchWorkflow(repository: string, workflow: string, ref: string) {
@@ -137,22 +219,25 @@ export async function mintGitHubAppInstallationToken(
   const signer = createSign("RSA-SHA256");
   signer.update(`${header}.${payload}`);
   const jwt = `${header}.${payload}.${signer.sign(await readFile(privateKeyPath, "utf8")).toString("base64url")}`;
-  const response = await transport(
-    `https://api.github.com/app/installations/${encodeURIComponent(installationId)}/access_tokens`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${jwt}`,
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
+  return withGitHubDeadline(async (signal) => {
+    const response = await transport(
+      `https://api.github.com/app/installations/${encodeURIComponent(installationId)}/access_tokens`,
+      {
+        method: "POST",
+        signal,
+        headers: {
+          Authorization: `Bearer ${jwt}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
       },
-    },
-  );
-  if (!response.ok)
-    throw new Error("GitHub App installation token exchange failed");
-  const body = (await response.json()) as { token?: string };
-  if (!body.token) throw new Error("GitHub App token response was invalid");
-  return body.token;
+    );
+    if (!response.ok)
+      throw new Error("GitHub App installation token exchange failed");
+    const body = (await response.json()) as { token?: string };
+    if (!body.token) throw new Error("GitHub App token response was invalid");
+    return body.token;
+  });
 }
 
 export class GitHubRestProvider implements GitImageProvider {
@@ -161,35 +246,42 @@ export class GitHubRestProvider implements GitImageProvider {
     private transport: GitHubHttpTransport = fetch,
   ) {}
   private async api(path: string, init: RequestInit = {}) {
-    const token = await this.token();
+    const token = await withGitHubDeadline(() => this.token());
     if ((init.method || "GET").toUpperCase() !== "GET" && !token)
       throw Object.assign(
         new Error("This repository operation requires authentication"),
         { statusCode: 401 },
       );
-    const response = await this.transport(`https://api.github.com${path}`, {
-      ...init,
-      headers: {
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        Accept: "application/vnd.github+json",
-        "Content-Type": "application/json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        ...(init.headers || {}),
-      },
-    });
-    if (!response.ok)
-      throw Object.assign(
-        new Error(
-          response.status === 409
-            ? "Remote catalog changed; sync again before writing"
-            : "GitHub catalog request failed",
-        ),
-        {
-          statusCode:
-            response.status === 404 ? 404 : response.status === 409 ? 409 : 502,
+    return withGitHubDeadline(async (signal) => {
+      const response = await this.transport(`https://api.github.com${path}`, {
+        ...init,
+        signal,
+        headers: {
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          Accept: "application/vnd.github+json",
+          "Content-Type": "application/json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          ...(init.headers || {}),
         },
-      );
-    return response.status === 204 ? null : response.json();
+      });
+      if (!response.ok)
+        throw Object.assign(
+          new Error(
+            response.status === 409
+              ? "Remote catalog changed; sync again before writing"
+              : "GitHub catalog request failed",
+          ),
+          {
+            statusCode:
+              response.status === 404
+                ? 404
+                : response.status === 409
+                  ? 409
+                  : 502,
+          },
+        );
+      return response.status === 204 ? null : response.json();
+    });
   }
   async read(repository: string, branch: string): Promise<GitSnapshot> {
     let ref: any;
@@ -282,22 +374,66 @@ export class GitHubRestProvider implements GitImageProvider {
       });
     let pullRequest;
     if (input.workflow === "pull-request") {
-      const pr: any = await this.api(`/repos/${repository}/pulls`, {
+      ({ pullRequest } = await this.ensurePullRequest(repository, {
+        branch: input.branch,
+        targetBranch: input.targetBranch,
+        title: input.message,
+      }));
+    }
+    return { revision: commit.sha, branch: input.branch, pullRequest };
+  }
+  async ensurePullRequest(
+    repository: string,
+    input: { branch: string; targetBranch: string; title: string },
+  ): Promise<GitPullRequestResult> {
+    const existing = await this.findOpenPullRequest(repository, input);
+    if (existing) return { pullRequest: existing, created: false };
+    let pr: any;
+    try {
+      pr = await this.api(`/repos/${repository}/pulls`, {
         method: "POST",
         body: JSON.stringify({
-          title: input.message,
+          title: input.title,
           head: input.branch,
           base: input.targetBranch,
           body: "Agentor image catalog synchronization",
         }),
       });
-      pullRequest = {
+    } catch (error) {
+      // A transport can lose the successful POST response. Re-read the
+      // content-addressed head before surfacing the error so a retry never
+      // creates a second PR merely because acknowledgement was ambiguous.
+      try {
+        const reconciled = await this.findOpenPullRequest(repository, input);
+        if (reconciled) return { pullRequest: reconciled, created: false };
+      } catch {}
+      throw error;
+    }
+    return {
+      pullRequest: {
         number: pr.number,
         url: pr.html_url,
-        state: "open" as const,
-      };
-    }
-    return { revision: commit.sha, branch: input.branch, pullRequest };
+        state: "open",
+      },
+      created: true,
+    };
+  }
+  private async findOpenPullRequest(
+    repository: string,
+    input: { branch: string; targetBranch: string },
+  ): Promise<GitPullRequest | undefined> {
+    const owner = repository.split("/", 1)[0]!,
+      pulls: any = await this.api(
+        `/repos/${repository}/pulls?state=open&head=${encodeURIComponent(`${owner}:${input.branch}`)}&base=${encodeURIComponent(input.targetBranch)}`,
+      ),
+      existing = Array.isArray(pulls) ? pulls[0] : undefined;
+    return existing
+      ? {
+          number: existing.number,
+          url: existing.html_url,
+          state: "open",
+        }
+      : undefined;
   }
   async revoke() {
     await this.api("/installation/token", { method: "DELETE" });

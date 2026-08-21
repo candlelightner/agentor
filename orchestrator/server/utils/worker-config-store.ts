@@ -50,6 +50,14 @@ export interface WorkerConfigInputEntry {
   value: string;
   fileName?: string;
 }
+export interface WorkerConfigPatchInput {
+  variables?: Array<{ key: string; value: string }>;
+  secrets?: Array<{ key: string; value: string }>;
+  secretFiles?: Array<{ name: string; path: string; content: string }>;
+  envFile?: string;
+  deleteSecrets?: string[];
+  deleteSecretFiles?: string[];
+}
 export interface PublicWorkerConfigEntry {
   kind: WorkerConfigKind;
   key: string;
@@ -93,6 +101,7 @@ const MAX_SECRET_FILES_TOTAL_BYTES = 12 * 1024 * 1024;
 export class WorkerConfigStore {
   private records = new Map<string, Map<string, WorkerConfigRecord>>();
   private queues = new Map<string, Promise<void>>();
+  private unavailableUsers = new Set<string>();
   private initPromise?: Promise<void>;
   constructor(private config: Config) {}
 
@@ -106,7 +115,13 @@ export class WorkerConfigStore {
     workerId: string,
   ): Promise<WorkerConfigRecord | undefined> {
     await this.init();
-    return this.records.get(userId)?.get(workerId);
+    // Never expose a mutation that has changed memory but has not reached its
+    // persistence commit point yet. Failed tails settle after restoring the
+    // previous record, so readers observe either the old or committed state.
+    await this.queues.get(userId);
+    this.assertAvailable(userId);
+    const record = this.records.get(userId)?.get(workerId);
+    return record === undefined ? undefined : structuredClone(record);
   }
 
   async replace(
@@ -118,6 +133,16 @@ export class WorkerConfigStore {
     assertSafeId(userId);
     assertSafeId(workerId);
     const sanitized = validateInput(input);
+    return this.withUserMutation(userId, () =>
+      this.replaceUnlocked(userId, workerId, sanitized),
+    );
+  }
+
+  private async replaceUnlocked(
+    userId: string,
+    workerId: string,
+    sanitized: WorkerConfigInputEntry[],
+  ): Promise<WorkerConfigRecord> {
     const existing = this.records.get(userId)?.get(workerId);
     const entries: StoredWorkerConfigEntry[] = [];
     for (const entry of sanitized) {
@@ -157,24 +182,57 @@ export class WorkerConfigStore {
       this.records.set(userId, map);
     }
     map.set(workerId, record);
-    await this.persist(userId);
-    return record;
+    try {
+      await this.persist(userId);
+    } catch (error) {
+      if (existing) map.set(workerId, existing);
+      else map.delete(workerId);
+      if (map.size === 0) this.records.delete(userId);
+      throw error;
+    }
+    return structuredClone(record);
   }
 
   async markApplied(userId: string, workerId: string): Promise<void> {
-    const record = await this.get(userId, workerId);
-    if (!record) return;
-    record.appliedAt = record.updatedAt;
-    record.appliedEntries = structuredClone(record.entries);
-    await this.persist(userId);
+    await this.init();
+    assertSafeId(userId);
+    assertSafeId(workerId);
+    return this.withUserMutation(userId, async () => {
+      const map = this.records.get(userId);
+      const record = map?.get(workerId);
+      if (!map || !record) return;
+      const next: WorkerConfigRecord = {
+        ...record,
+        appliedAt: record.updatedAt,
+        appliedEntries: structuredClone(record.entries),
+      };
+      map.set(workerId, next);
+      try {
+        await this.persist(userId);
+      } catch (error) {
+        map.set(workerId, record);
+        throw error;
+      }
+    });
   }
 
   async remove(userId: string, workerId: string): Promise<void> {
     await this.init();
-    const map = this.records.get(userId);
-    if (!map?.delete(workerId)) return;
-    if (map.size === 0) this.records.delete(userId);
-    await this.persist(userId);
+    assertSafeId(userId);
+    assertSafeId(workerId);
+    return this.withUserMutation(userId, async () => {
+      const map = this.records.get(userId);
+      const previous = map?.get(workerId);
+      if (!map?.delete(workerId) || !previous) return;
+      if (map.size === 0) this.records.delete(userId);
+      try {
+        await this.persist(userId);
+      } catch (error) {
+        this.records.set(userId, map);
+        map.set(workerId, previous);
+        throw error;
+      }
+    });
   }
 
   async importDotEnv(
@@ -183,30 +241,38 @@ export class WorkerConfigStore {
     content: string,
     kind: "variable" | "secret",
   ): Promise<WorkerConfigRecord> {
+    await this.init();
+    assertSafeId(userId);
+    assertSafeId(workerId);
     const imported = parseDotEnv(content).map(
       (entry) => ({ ...entry, kind }) as WorkerConfigInputEntry,
     );
-    const existing = await this.resolveValues(userId, workerId);
-    const importedKeys = new Set(imported.map((entry) => entry.key));
-    return this.replace(userId, workerId, [
-      ...existing.filter((entry) => !importedKeys.has(entry.key)),
-      ...imported,
-    ]);
+    return this.withUserMutation(userId, async () => {
+      const existing = await this.resolveEntryValues(
+        userId,
+        workerId,
+        this.records.get(userId)?.get(workerId)?.entries ?? [],
+      );
+      const importedKeys = new Set(imported.map((entry) => entry.key));
+      return this.replaceUnlocked(
+        userId,
+        workerId,
+        validateInput([
+          ...existing.filter((entry) => !importedKeys.has(entry.key)),
+          ...imported,
+        ]),
+      );
+    });
   }
 
   async patch(
     userId: string,
     workerId: string,
-    input: {
-      variables?: Array<{ key: string; value: string }>;
-      secrets?: Array<{ key: string; value: string }>;
-      secretFiles?: Array<{ name: string; path: string; content: string }>;
-      envFile?: string;
-      deleteSecrets?: string[];
-      deleteSecretFiles?: string[];
-    },
+    input: WorkerConfigPatchInput,
   ): Promise<WorkerConfigRecord> {
-    const current = await this.resolveValues(userId, workerId);
+    await this.init();
+    assertSafeId(userId);
+    assertSafeId(workerId);
     if (
       input.deleteSecrets !== undefined &&
       (!Array.isArray(input.deleteSecrets) ||
@@ -227,6 +293,24 @@ export class WorkerConfigStore {
     assertUniquePatch(input.variables, (entry) => entry.key);
     assertUniquePatch(input.secrets, (entry) => entry.key);
     assertUniquePatch(input.secretFiles, (entry) => entry.name);
+    // Keep the read/merge/write transaction in the same per-user queue. A
+    // concurrent replace or patch must never be overwritten by a merge based
+    // on an earlier snapshot.
+    return this.withUserMutation(userId, () =>
+      this.patchUnlocked(userId, workerId, input),
+    );
+  }
+
+  private async patchUnlocked(
+    userId: string,
+    workerId: string,
+    input: WorkerConfigPatchInput,
+  ): Promise<WorkerConfigRecord> {
+    const current = await this.resolveEntryValues(
+      userId,
+      workerId,
+      this.records.get(userId)?.get(workerId)?.entries ?? [],
+    );
     let variables: WorkerConfigInputEntry[] =
       input.variables === undefined
         ? current
@@ -298,11 +382,11 @@ export class WorkerConfigStore {
       });
     }
     const secretFiles: WorkerConfigInputEntry[] = [...fileMap.values()];
-    return this.replace(userId, workerId, [
-      ...variables,
-      ...secrets,
-      ...secretFiles,
-    ]);
+    return this.replaceUnlocked(
+      userId,
+      workerId,
+      validateInput([...variables, ...secrets, ...secretFiles]),
+    );
   }
 
   publicRecord(
@@ -466,66 +550,86 @@ export class WorkerConfigStore {
       throw err;
     }
     for (const userId of users.filter(isSafeUserId)) {
+      const path = join(usersDir, userId, FILE);
       try {
-        const parsed = JSON.parse(
-          await readFile(join(usersDir, userId, FILE), "utf8"),
-        ) as unknown;
-        if (!Array.isArray(parsed)) continue;
+        const parsed = JSON.parse(await readFile(path, "utf8")) as unknown;
+        if (!Array.isArray(parsed))
+          throw new Error('Worker configuration state must be an array');
         const map = new Map<string, WorkerConfigRecord>();
-        for (const item of parsed as WorkerConfigRecord[])
-          if (
-            item?.schemaVersion === 1 &&
-            item.userId === userId &&
-            SAFE_ID_RE.test(item.workerId) &&
-            Array.isArray(item.entries)
-          ) {
-            if (
-              !validStoredEntries(item.entries) ||
-              (item.appliedEntries !== undefined &&
-                (!Array.isArray(item.appliedEntries) ||
-                  !validStoredEntries(item.appliedEntries)))
-            ) {
-              useLogger().error(
-                `[worker-config] quarantined invalid record ${userId}/${item.workerId}`,
-              );
-              continue;
-            }
-            map.set(item.workerId, item);
-          }
+        for (const item of parsed as WorkerConfigRecord[]) {
+          if (!validStoredRecord(item, userId))
+            throw new Error('Invalid worker configuration record');
+          if (map.has(item.workerId))
+            throw new Error('Duplicate worker configuration id');
+          map.set(item.workerId, structuredClone(item));
+        }
         if (map.size) this.records.set(userId, map);
+        else this.records.delete(userId);
+        this.unavailableUsers.delete(userId);
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT")
-          useLogger().error(
-            `[worker-config] skipped unreadable configuration for user ${userId}`,
-          );
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+          this.records.delete(userId);
+          this.unavailableUsers.delete(userId);
+          continue;
+        }
+        this.unavailableUsers.add(userId);
+        useLogger().error(
+          `[worker-config] quarantined unreadable configuration for user ${userId}: ${err instanceof Error ? err.message : err}`,
+        );
       }
     }
   }
 
-  private persist(userId: string): Promise<void> {
+  /** Serialize the complete in-memory mutation, write, and rollback per owner.
+   * Serializing only the write allowed an older failed operation to roll back a
+   * newer same-key value and allowed the older write to observe that newer
+   * snapshot before it was committed. */
+  private withUserMutation<T>(
+    userId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
     assertSafeUserId(userId);
     const previous = this.queues.get(userId) ?? Promise.resolve();
-    const next = previous.then(async () => {
-      const dir = join(this.config.dataDir, "users", userId);
-      await mkdir(dir, { recursive: true, mode: 0o700 });
-      const target = join(dir, FILE);
-      const tmp = `${target}.tmp.${process.pid}`;
-      await writeFile(
-        tmp,
-        JSON.stringify(
-          [...(this.records.get(userId)?.values() ?? [])],
-          null,
-          2,
-        ),
-        { mode: 0o600 },
-      );
-      await rename(tmp, target);
+    const next = previous.catch(() => undefined).then(() => {
+      this.assertAvailable(userId);
+      return operation();
     });
-    this.queues.set(
-      userId,
-      next.catch(() => {}),
+    const tail = next.then(
+      () => undefined,
+      () => undefined,
     );
+    this.queues.set(userId, tail);
+    void tail.finally(() => {
+      if (this.queues.get(userId) === tail) this.queues.delete(userId);
+    });
     return next;
+  }
+
+  private assertAvailable(userId: string): void {
+    if (!this.unavailableUsers.has(userId)) return;
+    throw Object.assign(
+      new Error(`Stored ${FILE} data is unavailable for this owner`),
+      { statusCode: 503 },
+    );
+  }
+
+  /** Persist the snapshot owned by the currently executing user mutation. */
+  private async persist(userId: string): Promise<void> {
+    assertSafeUserId(userId);
+    const dir = join(this.config.dataDir, "users", userId);
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    const target = join(dir, FILE);
+    const tmp = `${target}.tmp.${process.pid}`;
+    await writeFile(
+      tmp,
+      JSON.stringify(
+        [...(this.records.get(userId)?.values() ?? [])],
+        null,
+        2,
+      ),
+      { mode: 0o600 },
+    );
+    await rename(tmp, target);
   }
 }
 
@@ -599,6 +703,8 @@ function validStoredEntries(entries: StoredWorkerConfigEntry[]): boolean {
   if (entries.length > MAX_ENTRIES) return false;
   const names = new Set<string>();
   const paths: string[] = [];
+  let envBytes = 0;
+  let fileBytes = 0;
   for (const entry of entries) {
     if (
       !entry ||
@@ -616,30 +722,41 @@ function validStoredEntries(entries: StoredWorkerConfigEntry[]): boolean {
         Buffer.byteLength(entry.value) > MAX_VARIABLE_BYTES
       )
         return false;
+      envBytes += Buffer.byteLength(entry.key) + Buffer.byteLength(entry.value);
     } else {
       const value = entry.encrypted;
+      const ciphertextBytes = base64ByteLength(value?.ciphertext);
       if (
         !value ||
         value.version !== 1 ||
         value.algorithm !== "aes-256-gcm" ||
         !isBase64(value.iv, 12) ||
         !isBase64(value.tag, 16) ||
-        !isBase64(value.ciphertext)
+        ciphertextBytes === undefined
       )
         return false;
       if (entry.kind === "secret") {
-        if (!USER_ENV_KEY_RE.test(entry.key) || RESERVED.has(entry.key))
+        if (
+          !USER_ENV_KEY_RE.test(entry.key) ||
+          RESERVED.has(entry.key) ||
+          ciphertextBytes > MAX_VARIABLE_BYTES
+        )
           return false;
+        envBytes += Buffer.byteLength(entry.key) + ciphertextBytes;
       } else {
         if (
           !/^[a-zA-Z0-9._-]{1,255}$/.test(entry.key) ||
-          !isSafeSecretPath(entry.fileName)
+          !isSafeSecretPath(entry.fileName) ||
+          ciphertextBytes > MAX_SECRET_FILE_BYTES
         )
           return false;
         paths.push(entry.fileName);
+        fileBytes += ciphertextBytes;
       }
     }
   }
+  if (envBytes > MAX_ENV_TOTAL_BYTES || fileBytes > MAX_SECRET_FILES_TOTAL_BYTES)
+    return false;
   for (let i = 0; i < paths.length; i++)
     for (let j = i + 1; j < paths.length; j++)
       if (
@@ -649,6 +766,28 @@ function validStoredEntries(entries: StoredWorkerConfigEntry[]): boolean {
       )
         return false;
   return true;
+}
+
+function validStoredRecord(
+  record: WorkerConfigRecord,
+  expectedUserId: string,
+): boolean {
+  return !!(
+    record &&
+    typeof record === 'object' &&
+    record.schemaVersion === 1 &&
+    record.userId === expectedUserId &&
+    typeof record.workerId === 'string' &&
+    SAFE_ID_RE.test(record.workerId) &&
+    typeof record.createdAt === 'string' &&
+    typeof record.updatedAt === 'string' &&
+    Array.isArray(record.entries) &&
+    validStoredEntries(record.entries) &&
+    (record.appliedAt === undefined || typeof record.appliedAt === 'string') &&
+    (record.appliedEntries === undefined ||
+      (Array.isArray(record.appliedEntries) &&
+        validStoredEntries(record.appliedEntries)))
+  );
 }
 function isBase64(value: unknown, bytes?: number): boolean {
   if (typeof value !== "string" || !/^[A-Za-z0-9+/]*={0,2}$/.test(value))
@@ -660,6 +799,16 @@ function isBase64(value: unknown, bytes?: number): boolean {
       : decoded.length === bytes;
   } catch {
     return false;
+  }
+}
+
+function base64ByteLength(value: unknown): number | undefined {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9+/]*={0,2}$/.test(value))
+    return undefined;
+  try {
+    return Buffer.from(value, 'base64').length;
+  } catch {
+    return undefined;
   }
 }
 

@@ -147,7 +147,10 @@ test.describe.serial("Provider HTTP boundaries", () => {
     const source = join(dir, "source.backup");
     await writeFile(source, Buffer.alloc(8 * 1024 * 1024 + 3, 0x41));
     const ranges: string[] = [];
-    const transport: BackupHttpTransport = async (_input, init = {}) => {
+    const transport: BackupHttpTransport = async (input, init = {}) => {
+      if (String(input).includes("probe-failure"))
+        throw new Error("probe transport failed");
+      if (String(input).includes("completed-missing-id")) return json({});
       const range = new Headers(init.headers).get("content-range") || "";
       ranges.push(range);
       if (range.startsWith("bytes */"))
@@ -178,6 +181,32 @@ test.describe.serial("Provider HTTP boundaries", () => {
           "https://evil.example/upload/session",
         ),
       ).rejects.toThrow("Invalid Google Drive resumable upload session");
+      await expect(
+        provider.upload(
+          "user",
+          "artifact",
+          source,
+          () => {},
+          undefined,
+          "https://www.googleapis.com/upload/probe-failure",
+        ),
+      ).rejects.toMatchObject({
+        message: "probe transport failed",
+        uploadId: "https://www.googleapis.com/upload/probe-failure",
+      });
+      await expect(
+        provider.upload(
+          "user",
+          "artifact",
+          source,
+          () => {},
+          undefined,
+          "https://www.googleapis.com/upload/completed-missing-id",
+        ),
+      ).rejects.toMatchObject({
+        message: "Google Drive upload completed without an object id",
+        uploadId: "https://www.googleapis.com/upload/completed-missing-id",
+      });
       const result = await provider.upload(
         "user",
         "artifact",
@@ -194,6 +223,105 @@ test.describe.serial("Provider HTTP boundaries", () => {
         "bytes */8388611",
         "bytes 8388608-8388610/8388611",
       ]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("Google preserves resumable sessions on auth, throttle, and server probe failures", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agentor-google-probe-status-"));
+    const source = join(dir, "source.backup");
+    await writeFile(source, "resume-me");
+    try {
+      for (const status of [401, 429, 503]) {
+        const session = `https://www.googleapis.com/upload/probe-${status}`;
+        let newSessions = 0;
+        const provider = new GoogleDriveBackupProvider(
+          async () => ({
+            access_token: "valid",
+            expires_at: Date.now() + 3600_000,
+          }),
+          async () => {},
+          async () => ({
+            clientId: "test-client",
+            clientSecret: "test-secret",
+          }),
+          async (_input, init = {}) => {
+            if (init.method === "POST") newSessions += 1;
+            return new Response(null, { status });
+          },
+          async () => {},
+        );
+        await expect(
+          provider.upload(
+            "user",
+            "artifact",
+            source,
+            () => {},
+            undefined,
+            session,
+          ),
+        ).rejects.toMatchObject({
+          message: `Google Drive resumable upload probe failed (${status})`,
+          uploadId: session,
+        });
+        expect(newSessions).toBe(0);
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("Google replaces only terminally missing resumable sessions", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agentor-google-probe-terminal-"));
+    const source = join(dir, "source.backup");
+    await writeFile(source, "replace-me");
+    try {
+      for (const terminalStatus of [404, 410]) {
+        const oldSession = `https://www.googleapis.com/upload/missing-${terminalStatus}`;
+        const newSession = `https://www.googleapis.com/upload/replacement-${terminalStatus}`;
+        let newSessions = 0;
+        const provider = new GoogleDriveBackupProvider(
+          async () => ({
+            access_token: "valid",
+            expires_at: Date.now() + 3600_000,
+          }),
+          async () => {},
+          async () => ({
+            clientId: "test-client",
+            clientSecret: "test-secret",
+          }),
+          async (input, init = {}) => {
+            const url = String(input);
+            if (url === oldSession)
+              return new Response(null, { status: terminalStatus });
+            if (init.method === "POST") {
+              newSessions += 1;
+              return new Response(null, {
+                status: 200,
+                headers: { location: newSession },
+              });
+            }
+            if (url === newSession)
+              return json({ id: `replacement-object-${terminalStatus}` });
+            throw new Error(`Unexpected Google request: ${url}`);
+          },
+          async () => {},
+        );
+        await expect(
+          provider.upload(
+            "user",
+            "artifact",
+            source,
+            () => {},
+            undefined,
+            oldSession,
+          ),
+        ).resolves.toMatchObject({
+          objectId: `replacement-object-${terminalStatus}`,
+        });
+        expect(newSessions).toBe(1);
+      }
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -241,15 +369,20 @@ test.describe.serial("Provider HTTP boundaries", () => {
           () => {},
           controller.signal,
         ),
-      ).rejects.toMatchObject({ name: "AbortError" });
+      ).rejects.toMatchObject({
+        name: "AbortError",
+        uploadId: "https://www.googleapis.com/upload/cancel-session",
+      });
       await provider.download("user", "object/id", destination);
       expect(await readFile(destination, "utf8")).toBe("downloaded");
       await provider.delete("user", "object/id");
-      await provider.abortUpload(
-        "user",
-        "https://evil.example/upload/nope",
-        "artifact",
-      );
+      await expect(
+        provider.abortUpload(
+          "user",
+          "https://evil.example/upload/nope",
+          "artifact",
+        ),
+      ).rejects.toThrow("Invalid Google Drive resumable upload session");
       await provider.abortUpload(
         "user",
         "https://www.googleapis.com/upload/cancel-session",
@@ -279,6 +412,62 @@ test.describe.serial("Provider HTTP boundaries", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  test("Google Drive upload cancellation propagates provider failures", async () => {
+    const provider = new GoogleDriveBackupProvider(
+      async () => ({
+        access_token: "valid",
+        expires_at: Date.now() + 3600_000,
+      }),
+      async () => {},
+      async () => ({ clientId: "test-client", clientSecret: "test-secret" }),
+      async () => new Response(null, { status: 503 }),
+      async () => {},
+    );
+    await expect(
+      provider.abortUpload(
+        "user",
+        "https://www.googleapis.com/upload/cancel-session",
+        "artifact",
+      ),
+    ).rejects.toThrow("Google Drive resumable upload cancellation failed");
+  });
+
+  test("Google Drive reconciles a crash-window upload by artifact metadata", async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const provider = new GoogleDriveBackupProvider(
+      async () => ({
+        access_token: "valid",
+        expires_at: Date.now() + 3600_000,
+      }),
+      async () => {},
+      async () => ({ clientId: "test-client", clientSecret: "test-secret" }),
+      async (input, init = {}) => {
+        const url = String(input);
+        const method = init.method || "GET";
+        calls.push({ url, method });
+        if (method === "GET")
+          return new Response(
+            JSON.stringify({ files: [{ id: "opaque-id" }] }),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            },
+          );
+        return new Response(null, { status: 204 });
+      },
+      async () => {},
+    );
+    await provider.deleteByArtifactId("user", "agentor-artifact-id");
+    expect(calls[0]?.url).toContain("appProperties");
+    expect(decodeURIComponent(calls[0]!.url)).toContain(
+      "key='artifactId' and value='agentor-artifact-id'",
+    );
+    expect(calls).toContainEqual({
+      url: "https://www.googleapis.com/drive/v3/files/opaque-id",
+      method: "DELETE",
+    });
   });
 
   test("GitHub public reads omit Authorization while unauthenticated writes fail before HTTP", async () => {
@@ -325,6 +514,117 @@ test.describe.serial("Provider HTTP boundaries", () => {
       }),
     ).rejects.toMatchObject({ statusCode: 401 });
     expect(calls).toHaveLength(beforeWrite);
+  });
+
+  test("GitHub pull-request reconciliation reuses an open head and recovers a lost create response", async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    let existing = true;
+    let losePostResponse = false;
+    const transport: GitHubHttpTransport = async (input, init = {}) => {
+      const url = String(input),
+        method = init.method || "GET";
+      calls.push({ url, method });
+      if (method === "GET" && url.includes("/pulls?"))
+        return json(
+          existing
+            ? [{ number: 7, html_url: "https://github.test/pull/7" }]
+            : [],
+        );
+      if (method === "POST" && url.endsWith("/pulls")) {
+        if (losePostResponse) {
+          existing = true;
+          throw new Error("injected lost PR response");
+        }
+        return json({ number: 8, html_url: "https://github.test/pull/8" });
+      }
+      throw new Error(`Unexpected mock request: ${method} ${url}`);
+    };
+    const provider = new GitHubRestProvider(async () => "token", transport);
+    const input = {
+      branch: "agentor/catalog-content",
+      targetBranch: "main",
+      title: "Sync catalog",
+    };
+
+    await expect(
+      provider.ensurePullRequest("owner/repo", input),
+    ).resolves.toEqual({
+      pullRequest: {
+        number: 7,
+        url: "https://github.test/pull/7",
+        state: "open",
+      },
+      created: false,
+    });
+    expect(calls).toHaveLength(1);
+    expect(decodeURIComponent(calls[0]!.url)).toContain(
+      "head=owner:agentor/catalog-content",
+    );
+
+    existing = false;
+    await expect(
+      provider.ensurePullRequest("owner/repo", input),
+    ).resolves.toEqual({
+      pullRequest: {
+        number: 8,
+        url: "https://github.test/pull/8",
+        state: "open",
+      },
+      created: true,
+    });
+    expect(calls.slice(1).map((call) => call.method)).toEqual(["GET", "POST"]);
+
+    existing = false;
+    losePostResponse = true;
+    await expect(
+      provider.ensurePullRequest("owner/repo", input),
+    ).resolves.toEqual({
+      pullRequest: {
+        number: 7,
+        url: "https://github.test/pull/7",
+        state: "open",
+      },
+      created: false,
+    });
+    expect(calls.slice(3).map((call) => call.method)).toEqual([
+      "GET",
+      "POST",
+      "GET",
+    ]);
+  });
+
+  test("GitHub requests abort and settle within the configured deadline", async () => {
+    const previous = process.env.GIT_IMAGE_HTTP_TIMEOUT_MS;
+    process.env.GIT_IMAGE_HTTP_TIMEOUT_MS = "1000";
+    let aborted = false;
+    const provider = new GitHubRestProvider(
+      async () => undefined,
+      async (_input, init = {}) =>
+        new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener(
+            "abort",
+            () => {
+              aborted = true;
+              reject(init.signal?.reason);
+            },
+            { once: true },
+          );
+        }),
+    );
+    const started = Date.now();
+    try {
+      await expect(provider.read("owner/public", "main")).rejects.toMatchObject(
+        {
+          statusCode: 504,
+          message: "GitHub catalog request timed out",
+        },
+      );
+      expect(aborted).toBe(true);
+      expect(Date.now() - started).toBeLessThan(2_000);
+    } finally {
+      if (previous === undefined) delete process.env.GIT_IMAGE_HTTP_TIMEOUT_MS;
+      else process.env.GIT_IMAGE_HTTP_TIMEOUT_MS = previous;
+    }
   });
 
   test("Git catalog rejects definition and GHCR digest mismatches", () => {

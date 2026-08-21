@@ -164,7 +164,8 @@ export class ManagementWorkerDomain {
     if (name === "configuration.set") {
       await locks.verify(workerId,args.lockPassword);
       const input = configInput(args); await useWorkerConfigStore().patch(worker.userId,workerId,input);
-      worker.pendingRebuild=true; const stored=useWorkerStore().findById(workerId); if(stored){stored.pendingRebuild=true;stored.updatedAt=new Date().toISOString();await useWorkerStore().upsert(stored);}
+      const stored=await useWorkerStore().markPendingRebuild(worker.userId,workerId);
+      if(stored){worker.pendingRebuild=true;worker.updatedAt=stored.updatedAt;}
       return { handled:true,result: await workerConfigurationResponse(worker) };
     }
     if (name === "workers.restart") { await locks.verify(workerId,args.lockPassword); await cm.restart(workerId); return {handled:true,result:{workerId,status:"running"}}; }
@@ -208,19 +209,20 @@ export class ManagementWorkerDomain {
     });
     if(name.startsWith("groups.admin-workspace.")) {
       const workspaces=useGroupAdminWorkspaceStore();
-      if(name==="groups.admin-workspace.startup-script.get") return workspaces.getStartupScript(group.id);
-      if(name==="groups.admin-workspace.startup-script.set") return workspaces.setStartupScript(group.id,args.startupScript);
+      const authorize=typeof args.__scopeAuthorize==="function"?args.__scopeAuthorize as ()=>void:undefined;
+      if(name==="groups.admin-workspace.startup-script.get") return workspaces.getStartupScript(group.id,authorize);
+      if(name==="groups.admin-workspace.startup-script.set") return workspaces.setStartupScript(group.id,args.startupScript,authorize);
       const deadline=groupAdminLifecycleTimeoutSeconds(args.timeoutSeconds);
       if(name==="groups.admin-workspace.get") {
         if(!group.adminWorkspace) throw status(404,"Group administrative workspace not provisioned");
-        return withinGroupAdminLifecycleDeadline(() => workspaces.ensure(group.id,group.userId), deadline);
+        return withinGroupAdminLifecycleDeadline(() => workspaces.ensure(group.id,group.userId,authorize), deadline);
       }
-      if(name==="groups.admin-workspace.provision") return withinGroupAdminLifecycleDeadline(() => workspaces.ensure(group.id,group.userId), deadline);
-      if(name==="groups.admin-workspace.start") return withinGroupAdminLifecycleDeadline(() => workspaces.setStatus(group.id,"running"), deadline);
-      if(name==="groups.admin-workspace.stop") return withinGroupAdminLifecycleDeadline(() => workspaces.setStatus(group.id,"stopped"), deadline);
-      if(name==="groups.admin-workspace.rebuild") return withinGroupAdminLifecycleDeadline(() => workspaces.rebuild(group.id,group.userId), deadline);
+      if(name==="groups.admin-workspace.provision") return withinGroupAdminLifecycleDeadline(() => workspaces.ensure(group.id,group.userId,authorize), deadline);
+      if(name==="groups.admin-workspace.start") return withinGroupAdminLifecycleDeadline(() => workspaces.setStatus(group.id,"running",authorize), deadline);
+      if(name==="groups.admin-workspace.stop") return withinGroupAdminLifecycleDeadline(() => workspaces.setStatus(group.id,"stopped",authorize), deadline);
+      if(name==="groups.admin-workspace.rebuild") return withinGroupAdminLifecycleDeadline(() => workspaces.rebuild(group.id,group.userId,authorize), deadline);
     }
-    if(name==="groups.delete") { const workspaceStatus=group.adminWorkspace?.status;await deleteWorkerGroup(group.userId,group.id,async()=>{if(typeof args.__scopeAuthorize==="function")(args.__scopeAuthorize as ()=>void)();const workspaces=useGroupAdminWorkspaceStore();try{await workspaces.remove(group.id);}catch(error){await workspaces.restoreAfterFailedGroupDelete(group.id,workspaceStatus).catch(()=>undefined);throw error;}return async()=>workspaces.restoreAfterFailedGroupDelete(group.id,workspaceStatus);}); return {id:group.id,deleted:true}; }
+    if(name==="groups.delete") { const workspaceStatus=group.adminWorkspace?.status;await deleteWorkerGroup(group.userId,group.id,async()=>{if(typeof args.__scopeAuthorize==="function")(args.__scopeAuthorize as ()=>void)();const workspaces=useGroupAdminWorkspaceStore();try{await workspaces.remove(group.id,true);}catch(error){await workspaces.restoreAfterFailedGroupDelete(group.id,workspaceStatus,true).catch(()=>undefined);throw error;}return async()=>workspaces.restoreAfterFailedGroupDelete(group.id,workspaceStatus,true);}); return {id:group.id,deleted:true}; }
     const patch:{name?:string;workerIds?:string[];parentId?:string|null}={}; if(args.name!==undefined){const label=required(args.name,"name").trim();if(!label||label.length>100)throw status(400,"Invalid group name");patch.name=label;}
     if(args.parentId!==undefined)patch.parentId=args.parentId===null?null:required(args.parentId,"parentId");
     if(args.workerIds!==undefined){const ids=strings(args.workerIds,"workerIds");for(const id of ids){const worker=useWorkerStore().findById(id);if(!worker||worker.userId!==group.userId)throw status(400,"All workers must belong to group owner");}patch.workerIds=ids;}

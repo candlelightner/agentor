@@ -1,23 +1,101 @@
-import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { BackupArtifact, BackupConfig, BackupJob } from './backup-types';
 import { assertSafeUserId, isSafeUserId } from './user-id';
 
 interface UserBackupData { schemaVersion: 1; config?: BackupConfig; jobs: BackupJob[]; artifacts: BackupArtifact[] }
 export class BackupStore {
-  private data = new Map<string, UserBackupData>(); private queues = new Map<string, Promise<void>>(); private initialized?: Promise<void>;
+  private data = new Map<string, UserBackupData>();
+  private queues = new Map<string, Promise<void>>();
+  private revisions = new Map<string, number>();
+  private unavailableUsers = new Set<string>();
+  private closedUsers = new Set<string>();
+  private initialized?: Promise<void>;
   constructor(private dataDir: string) {}
   init() { return this.initialized ??= this.load(); }
-  get(userId: string) { return this.data.get(userId) ?? { schemaVersion: 1 as const, jobs: [], artifacts: [] }; }
-  all() { return [...this.data.values()]; }
-  userIds() { return [...this.data.keys()]; }
-  forget(userId: string) { this.data.delete(userId); }
-  findJob(id: string) { for (const value of this.data.values()) { const job = value.jobs.find((x) => x.id === id); if (job) return job; } }
-  findArtifact(id: string) { for (const value of this.data.values()) { const artifact = value.artifacts.find((x) => x.id === id); if (artifact) return artifact; } }
-  async save(userId: string, value: UserBackupData) { assertSafeUserId(userId); this.data.set(userId, value); await this.persist(userId); }
-  private async load() { let users: string[] = []; try { users = await readdir(join(this.dataDir, 'users')); } catch { return; }
-    for (const userId of users.filter(isSafeUserId)) try { const value = normalizeStoredUserBackupData(userId, JSON.parse(await readFile(join(this.dataDir, 'users', userId, 'backups.json'), 'utf8'))); if (value) this.data.set(userId, value); } catch {} }
-  private persist(userId: string) { assertSafeUserId(userId); const previous = this.queues.get(userId) ?? Promise.resolve(); const next = previous.then(async () => { const dir = join(this.dataDir, 'users', userId); await mkdir(dir, { recursive: true, mode: 0o700 }); const target = join(dir, 'backups.json'); const tmp = `${target}.tmp.${process.pid}`; await writeFile(tmp, JSON.stringify(this.get(userId), null, 2), { mode: 0o600 }); await rename(tmp, target); }); this.queues.set(userId, next.catch(() => {})); return next; }
+  get(userId: string) { this.assertAvailable(userId); return structuredClone(this.data.get(userId) ?? emptyUserBackupData()); }
+  all() { return [...this.data.values()].map((value) => structuredClone(value)); }
+  userIds() { return [...new Set([...this.data.keys(), ...this.unavailableUsers])]; }
+  async forget(userId: string) {
+    assertSafeUserId(userId);
+    const previous = this.queues.get(userId) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(async () => {
+      await rm(join(this.dataDir, 'users', userId, 'backups.json'), { force: true });
+      this.data.delete(userId);
+      this.unavailableUsers.delete(userId);
+      this.closedUsers.add(userId);
+      this.revisions.delete(userId);
+    });
+    this.queues.set(userId, next.then(() => undefined, () => undefined));
+    await next;
+  }
+  findJob(id: string) { for (const value of this.data.values()) { const job = value.jobs.find((x) => x.id === id); if (job) return structuredClone(job); } }
+  findArtifact(id: string) { for (const value of this.data.values()) { const artifact = value.artifacts.find((x) => x.id === id); if (artifact) return structuredClone(artifact); } }
+  async save(userId: string, value: UserBackupData) {
+    assertSafeUserId(userId);
+    const snapshot = structuredClone(value);
+    await this.enqueue(userId, async (revision) => {
+      await this.persistSnapshot(userId, revision, snapshot);
+      this.data.set(userId, structuredClone(snapshot));
+    });
+  }
+  async update<T>(
+    userId: string,
+    mutate: (draft: UserBackupData) => T,
+  ): Promise<T> {
+    assertSafeUserId(userId);
+    return this.enqueue(userId, async (revision) => {
+      const draft = structuredClone(this.data.get(userId) ?? emptyUserBackupData());
+      const result = mutate(draft);
+      await this.persistSnapshot(userId, revision, draft);
+      this.data.set(userId, draft);
+      return result;
+    });
+  }
+  private async load() {
+    let users: string[] = [];
+    try {
+      users = await readdir(join(this.dataDir, 'users'));
+    } catch (error: any) {
+      if (error?.code === 'ENOENT') return;
+      throw error;
+    }
+    for (const userId of users.filter(isSafeUserId)) {
+      const path = join(this.dataDir, 'users', userId, 'backups.json');
+      try {
+        const value = normalizeStoredUserBackupData(userId, JSON.parse(await readFile(path, 'utf8')));
+        if (!value) throw new Error('Unsupported or invalid backup store state');
+        this.data.set(userId, value);
+        this.unavailableUsers.delete(userId);
+      } catch (error: any) {
+        if (error?.code === 'ENOENT') continue;
+        this.unavailableUsers.add(userId);
+        useLogger().error(`[backup-store] quarantined unreadable ${path}: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+  }
+  private enqueue<T>(userId: string, operation: (revision: number) => Promise<T>): Promise<T> {
+    const revision = (this.revisions.get(userId) ?? 0) + 1;
+    this.revisions.set(userId, revision);
+    const previous = this.queues.get(userId) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(() => {
+      this.assertAvailable(userId);
+      if (this.closedUsers.has(userId))
+        throw Object.assign(new Error('Backup owner state is closed'), { statusCode: 410 });
+      return operation(revision);
+    });
+    this.queues.set(userId, next.then(() => undefined, () => undefined));
+    return next;
+  }
+  private async persistSnapshot(userId: string, revision: number, snapshot: UserBackupData) { assertSafeUserId(userId); const dir = join(this.dataDir, 'users', userId); await mkdir(dir, { recursive: true, mode: 0o700 }); const target = join(dir, 'backups.json'); const tmp = `${target}.tmp.${process.pid}.${revision}`; await writeFile(tmp, JSON.stringify(snapshot, null, 2), { mode: 0o600 }); await rename(tmp, target); }
+  private assertAvailable(userId: string) {
+    if (!this.unavailableUsers.has(userId)) return;
+    throw Object.assign(new Error('Stored backup data is unavailable for this owner'), { statusCode: 503 });
+  }
+}
+
+function emptyUserBackupData(): UserBackupData {
+  return { schemaVersion: 1, jobs: [], artifacts: [] };
 }
 
 /** Read old v1 files without rewriting them, but never trust an embedded owner
@@ -31,6 +109,9 @@ function normalizeStoredUserBackupData(userId: string, value: any): UserBackupDa
     ? value.jobs.filter((job: any): job is BackupJob =>
         validOwnedRecord(userId, job) && validProvider(job.provider) &&
         validPathId(job.workspaceId) && validOptionalPathIds(job, ['artifactId', 'backupId', 'workerId']) &&
+        (job.pendingProviderObjectId === undefined || validProviderObjectId(job.provider, job.pendingProviderObjectId)) &&
+        (job.pendingProviderArtifactId === undefined || validPathId(job.pendingProviderArtifactId)) &&
+        (job.pendingProviderUploadId === undefined || validOpaqueProviderId(job.pendingProviderUploadId)) &&
         validOptionalPathIdArray(job.workspaceIds) && validOptionalPathIdArray(job.artifactWorkspaceIds) &&
         validOptionalPathIdArray(job.selectedWorkspaceIds))
     : [];
@@ -76,4 +157,8 @@ function validProviderObjectId(provider: unknown, value: unknown): value is stri
   // Local and deterministic fake providers interpolate this value into a
   // filename. Google Drive ids are opaque and are URL-encoded before use.
   return provider === 'google-drive' || validPathId(value);
+}
+
+function validOpaqueProviderId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 4096 && !/[\0\r\n]/.test(value);
 }

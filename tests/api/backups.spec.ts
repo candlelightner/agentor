@@ -845,7 +845,7 @@ test.describe
     const job = await waitForJob(ownerCtx, created.id);
     expect(job.status).toBe("succeeded");
     const diagnostics = await ownerCtx.get(
-      `/api/backup-providers/fake/uploads/${job.providerUploadId}`,
+      `/api/backup-providers/fake/uploads/${job.id}`,
     );
     expect(diagnostics.status()).toBe(200);
     const upload = await diagnostics.json();

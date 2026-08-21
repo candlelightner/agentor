@@ -34,6 +34,20 @@ export async function publicGroupEnvKeys(userId:string,groupId:string) {
 export async function markGroupEnvPending(userId:string,groupId:string){
   const {useContainerManager,useWorkerStore}=await import("./services");
   const ids=new Set(new WorkerGroupHierarchy(useWorkerGroupStore()).subtreeWorkerIds(userId,groupId));
-  for(const id of ids){const live=useContainerManager().get(id);if(live){live.pendingRebuild=true;live.updatedAt=new Date().toISOString();}const record=useWorkerStore().get(userId,id);if(record){record.pendingRebuild=true;record.updatedAt=new Date().toISOString();await useWorkerStore().upsert(record);}}
+  for(const id of ids) await markWorkerEnvPending(userId,id,useWorkerStore(),useContainerManager());
 }
-export async function markWorkersEnvPending(userId:string,ids:Iterable<string>){const {useContainerManager,useWorkerStore}=await import("./services");for(const id of ids){const live=useContainerManager().get(id);if(live){live.pendingRebuild=true;live.updatedAt=new Date().toISOString();}const record=useWorkerStore().get(userId,id);if(record){record.pendingRebuild=true;record.updatedAt=new Date().toISOString();await useWorkerStore().upsert(record);}}}
+export async function markWorkersEnvPending(userId:string,ids:Iterable<string>){const {useContainerManager,useWorkerStore}=await import("./services");for(const id of ids)await markWorkerEnvPending(userId,id,useWorkerStore(),useContainerManager());}
+
+type PendingWorkerStore={markPendingRebuild(userId:string,id:string):Promise<{userId:string;updatedAt:string}|undefined>};
+type PendingContainerStore={get(id:string):{userId:string;pendingRebuild?:boolean;updatedAt:string}|undefined};
+
+/** Persist first and update the live projection only when the worker still
+ * exists. This ordering prevents a group-env mutation queued behind permanent
+ * deletion from reviving either the durable record or the dashboard card. */
+export async function markWorkerEnvPending(userId:string,id:string,workers:PendingWorkerStore,containers:PendingContainerStore){
+  const persisted=await workers.markPendingRebuild(userId,id);
+  if(!persisted)return false;
+  const live=containers.get(id);
+  if(live?.userId===userId){live.pendingRebuild=true;live.updatedAt=persisted.updatedAt;}
+  return true;
+}

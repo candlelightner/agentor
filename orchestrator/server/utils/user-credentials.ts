@@ -1,7 +1,8 @@
-import { chown, mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
+import { chown, mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { StorageManager } from './storage';
 import type { CredentialInfo } from '../../shared/types';
+import { isSafeUserId } from './user-id';
 
 /** Files expected to exist in each user's credentials directory. `fileName` is
  * the per-user file on the host; `containerPath` is where the file is bind-mounted
@@ -250,6 +251,19 @@ export class UserCredentialManager {
     this.seededUsers.delete(userId);
     await this.storage.removeUserDir(userId);
     useLogger().info(`[user-credentials] removed data directory for user ${userId}`);
+  }
+
+  /** Enumerate every durable per-user directory, including directories whose
+   * typed store files were already removed by a partially completed orphan
+   * sweep. This is the final restart-safe candidate source for cleanup retry. */
+  async listUserIds(): Promise<string[]> {
+    try {
+      return (await readdir(join(this.storage.dataDir, 'users')))
+        .filter(isSafeUserId);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    }
   }
 
   /** Absolute path to the user's credentials directory, inside the container. */

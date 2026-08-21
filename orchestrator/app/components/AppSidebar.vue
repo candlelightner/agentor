@@ -61,7 +61,13 @@ const { refreshing: usageRefreshing, refresh: usageRefresh } = useUsage();
 const { workers: workerMetrics } = useWorkerMetrics();
 const { mappings: portMappings } = usePortMappings();
 const { mappings: domainMappings } = useDomainMappings();
-const { groups: workerGroups } = useWorkerGroups();
+const { groups: workerGroups, refresh: refreshWorkerGroups } = useWorkerGroups();
+
+// Group membership can change outside this browser through the management MCP.
+// Keep it in step with the independently-polled worker inventory so a newly
+// enrolled or reassigned worker cannot remain rendered as ungrouped until the
+// operator reloads the whole dashboard.
+usePolling(() => void refreshWorkerGroups(), 10_000);
 
 // O(1) lookup of a worker's metrics, rebuilt only when the metrics list changes
 // (avoids a linear scan per card per render in the worker v-for).

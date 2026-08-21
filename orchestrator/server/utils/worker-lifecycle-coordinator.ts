@@ -27,3 +27,25 @@ export function withWorkerLifecycleMutation<T>(
 ): Promise<T> {
   return lifecycleCoordinator.withWorker(workerId, operation);
 }
+
+/** Serialize mutations that publish or remove owner-scoped worker state.
+ * The namespace prefix cannot collide with UUID worker ids. */
+export function withOwnerLifecycleMutation<T>(
+  userId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return lifecycleCoordinator.withWorker(`owner:${userId}`, operation);
+}
+
+/** Acquire lifecycle fences in the only supported nesting order. Keeping the
+ * ordering here prevents a future worker mutation from accidentally taking the
+ * worker fence first and deadlocking owner cleanup. */
+export function withOwnerWorkerLifecycleMutation<T>(
+  userId: string,
+  workerId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return withOwnerLifecycleMutation(userId, () =>
+    withWorkerLifecycleMutation(workerId, operation),
+  );
+}

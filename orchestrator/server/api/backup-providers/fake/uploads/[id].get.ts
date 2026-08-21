@@ -1,10 +1,13 @@
 defineRouteMeta({
   openAPI: {
     tags: ["Backups"],
-    summary: "Get fake upload diagnostics",
+    summary: "Get fake upload diagnostics by backup job or legacy upload ID",
     operationId: "getFakeBackupUpload",
     responses: {
-      200: { description: "Chunk diagnostics" },
+      200: {
+        description:
+          "Chunk diagnostics for an owner-scoped backup job ID or legacy upload ID",
+      },
       401: { description: "Unauthorized" },
       404: { description: "Not found" },
     },

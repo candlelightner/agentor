@@ -19,6 +19,15 @@ export async function findButtonByTooltip(
   page: Page,
   tooltipText: string,
 ): Promise<Locator> {
+  // Icon-only actions expose the same stable accessible name as their tooltip.
+  // Prefer that semantic contract: hover-driven portal tooltips can be delayed
+  // or suppressed when the horizontally scrollable action row is still moving.
+  const labelled = card.getByRole('button', { name: tooltipText, exact: true });
+  for (let i = 0; i < await labelled.count(); i++) {
+    const button = labelled.nth(i);
+    if (await button.isVisible()) return button;
+  }
+
   const buttons = card.locator('button');
   const count = await buttons.count();
   for (let i = count - 1; i >= 0; i--) {

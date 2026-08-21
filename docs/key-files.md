@@ -42,7 +42,7 @@
 - `orchestrator/server/api/account/ssh-key.put.ts` - Writes the caller's SSH public key to `<DATA_DIR>/users/<userId>/ssh/authorized_keys` (empty string → empty file). The SSH key is NOT an env var.
 - `orchestrator/server/api/account/agent-credentials.get.ts` - Per-user agent OAuth credential file status (`[{ agentId, fileName, configured }]`)
 - `orchestrator/server/api/account/agent-credentials/[agentId].delete.ts` - Resets one agent's per-user OAuth file to `{}` so the next CLI login writes fresh tokens
-- `orchestrator/server/utils/orphan-sweeper.ts` - OrphanSweeper class. Runs at startup and every 10 minutes; reads the auth DB's user table and prunes any per-user env-vars row / credentials directory / usage state whose userId is no longer present. Uses a timer rather than a middleware so nothing touches better-auth's request pipeline.
+- `orchestrator/server/utils/orphan-sweeper.ts` - OrphanSweeper class. Runs at startup and every 10 minutes; reads the auth DB's user table, drains owner activity, removes live/archived workers under the shared owner lifecycle fence, then prunes every per-user store/directory whose userId is no longer present. Runtime cleanup fails closed and remains retryable. Uses a timer rather than a middleware so nothing touches better-auth's request pipeline.
 - `orchestrator/server/utils/init-script-store.ts` - InitScriptStore class (extends JsonStore, built-in seeding)
 - `orchestrator/server/utils/agent-config.ts` - Static agent configuration registry (API domains, env var mappings per agent)
 - `orchestrator/server/utils/git-providers.ts` - Git provider registry (GIT_PROVIDER_REGISTRY)

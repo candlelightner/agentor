@@ -132,14 +132,22 @@ export class UsageChecker {
   /** Clear persisted state for a user (called on user deletion). */
   async forgetUser(userId: string): Promise<void> {
     assertSafeUserId(userId);
+    const previousState = this.userStates.get(userId);
+    const previousBackoff = [...this.rateLimitBackoff.entries()].filter(
+      ([key]) => key.startsWith(`${userId}:`),
+    );
     this.userStates.delete(userId);
     for (const key of [...this.rateLimitBackoff.keys()]) {
       if (key.startsWith(`${userId}:`)) this.rateLimitBackoff.delete(key);
     }
     try {
       await rm(this.stateFilePath(userId), { force: true });
-    } catch {
-      // best effort — the containing dir may already be gone
+    } catch (error) {
+      if (previousState) this.userStates.set(userId, previousState);
+      for (const [key, value] of previousBackoff) {
+        this.rateLimitBackoff.set(key, value);
+      }
+      throw error;
     }
   }
 
