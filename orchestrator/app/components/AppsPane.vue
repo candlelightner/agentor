@@ -10,9 +10,18 @@ const props = defineProps<{
 
 const containerIdRef = toRef(props, 'containerId');
 const { appTypes, instances, createInstance, stopInstance } = useApps(containerIdRef as Ref<string>);
-const { openTab } = useSplitPanes();
+const { openTab, openPluginTab } = useSplitPanes();
+const plugins = usePlugins(containerIdRef as Ref<string>);
 const toast = useToast();
 const startingTypes = ref<Set<string>>(new Set());
+const showPluginCatalog = ref(false);
+const pluginDefinitions = computed(() => new Map(plugins.definitions.value.map(item => [item.id, item])));
+const pluginActions = computed(() => plugins.installations.value.flatMap((installation) => {
+  const definition = pluginDefinitions.value.get(installation.definitionId);
+  if (!definition || !installation.desiredEnabled || !installation.observed.ready) return [];
+  return (definition.manifest.actions || []).map(action => ({ installation, definition, action }));
+}));
+onBeforeUnmount(plugins.stop);
 
 // Resolve the real Docker container name (`agentor-worker-<id>`) for the
 // app-row network hostname tooltip. `containerId` is the worker UUID, not the
@@ -63,11 +72,26 @@ async function handleStart(appTypeId: string) {
     startingTypes.value = next;
   }
 }
+function openInstalledPlugin(item: (typeof pluginActions.value)[number]) {
+  openPluginTab(
+    props.containerId,
+    containerDisplayName.value,
+    item.installation.id,
+    item.action.id,
+    `${item.definition.name}: ${item.action.label}`,
+  );
+}
+function openPluginCatalog() {
+  showPluginCatalog.value = true;
+}
 </script>
 
 <template>
   <div class="h-full overflow-y-auto p-6 bg-white dark:bg-gray-950">
-    <h2 class="text-lg font-semibold text-gray-900 dark:text-white mb-4">Apps</h2>
+    <div class="mb-4 flex items-center justify-between gap-3">
+      <h2 class="text-lg font-semibold text-gray-900 dark:text-white">Apps</h2>
+      <UButton size="xs" color="neutral" variant="outline" icon="i-lucide-puzzle" data-testid="manage-plugins" @click="openPluginCatalog">Plugins</UButton>
+    </div>
 
     <div v-if="appTypes.length === 0" class="text-gray-400 dark:text-gray-500 text-sm text-center py-12">
       No app types available
@@ -122,6 +146,13 @@ async function handleStart(appTypeId: string) {
           @stop="stopInstance"
         />
       </div>
+      <section v-if="pluginActions.length" class="rounded-lg border border-gray-200 bg-gray-50 p-4 dark:border-gray-800 dark:bg-gray-900" data-testid="installed-plugin-actions">
+        <h3 class="mb-3 text-sm font-medium text-gray-900 dark:text-white">Installed plugin applications</h3>
+        <div class="flex flex-wrap gap-2">
+          <UButton v-for="item in pluginActions" :key="`${item.installation.id}-${item.action.id}`" size="sm" color="neutral" variant="outline" icon="i-lucide-puzzle" @click="openInstalledPlugin(item)">{{ item.definition.name }} · {{ item.action.label }}</UButton>
+        </div>
+      </section>
     </div>
+    <PluginCatalogModal v-model:open="showPluginCatalog" :container-id="containerId" :container-name="containerDisplayName" />
   </div>
 </template>

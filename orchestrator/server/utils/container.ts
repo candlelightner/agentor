@@ -35,11 +35,19 @@ import {
   writeFilteredAgentsGz,
   packBundle,
   extractBundle,
+  extractBackupPathArchives,
+  sanitizeBackupPathTarPayload,
   validateGzipTarPayload,
   validateTarPayload,
 } from "./worker-export";
 import { recordWorkspaceTombstone } from "./workspace-tombstones";
 import type { WorkerExportManifest } from "./worker-export";
+import {
+  readPortablePluginConfiguration,
+  restoreWorkerPlugins,
+  snapshotWorkerPlugins,
+  writePortablePluginConfiguration,
+} from "./plugin-portability";
 import type {
   AppInstanceInfo,
   TmuxWindow,
@@ -366,6 +374,17 @@ export class ContainerManager {
             `[container] managed network reconcile failed: ${error instanceof Error ? error.message : error}`,
           ),
         );
+  }
+  private async reconcileWorkerPlugins(info: ContainerInfo) {
+    if (info.status !== "running" || info.administrativeKind) return;
+    const { usePluginRuntimeManager } = await import("./services");
+    await usePluginRuntimeManager()
+      .reconcileWorker(info.userId, info.id, info.containerId)
+      .catch((error) =>
+        useLogger().warn(
+          `[container] plugin reconcile failed for ${info.id}: ${error instanceof Error ? error.message : error}`,
+        ),
+      );
   }
   /** Keyed by the worker's UUID `id` (stable across rebuild/unarchive). */
   private containers: Map<string, ContainerInfo> = new Map();
@@ -1045,6 +1064,7 @@ export class ContainerManager {
       `[container] created worker ${containerName} (${containerInfo.containerId.slice(0, 12)})`,
     );
     await this.reconcileManagedNetworksForWorker(userId);
+    await this.reconcileWorkerPlugins(containerInfo);
 
     return containerInfo;
   }
@@ -1104,6 +1124,61 @@ export class ContainerManager {
     const containerId = this.dockerIdForFiles(id);
     const rel = normalizeClientPath(path, { allowRoot: true });
     return probeList(this.dockerService, containerId, rel);
+  }
+
+  /** A read-only absolute-path listing used solely by the backup selector.
+   * Unlike listFiles this is intentionally not rooted at /workspace: choosing
+   * a sensitive/authentication path is an explicit operator backup choice.
+   * It runs as the worker user and returns metadata only, never content. */
+  async listBackupPaths(id: string, absolutePath: string): Promise<{
+    path: string; entries: Array<{ name: string; path: string; type: "file" | "directory" | "symlink"; size: number; mtime: string; readable: boolean; linkTarget?: string }>;
+  }> {
+    const containerId = this.dockerIdForFiles(id);
+    const { normalizeBackupPath } = await import("./backup-paths");
+    const selected = normalizeBackupPath(absolutePath);
+    const script = String.raw`import os,sys,json,datetime
+p=sys.argv[1]
+try:
+ st=os.lstat(p)
+ if not os.path.isdir(p) or os.path.islink(p):
+  print(json.dumps({'error':'not_directory'}));sys.exit(0)
+ out=[]
+ for e in os.scandir(p):
+  try:
+   s=e.stat(follow_symlinks=False); typ='symlink' if e.is_symlink() else ('directory' if e.is_dir(follow_symlinks=False) else 'file')
+   item={'name':e.name,'path':os.path.join(p,e.name),'type':typ,'size':s.st_size if typ=='file' else 0,'mtime':datetime.datetime.utcfromtimestamp(s.st_mtime).strftime('%Y-%m-%dT%H:%M:%SZ'),'readable':os.access(e.path,os.R_OK)}
+   if typ=='symlink': item['linkTarget']=os.readlink(e.path)
+   out.append(item)
+  except OSError: pass
+ out.sort(key=lambda x:(x['type']!='directory',x['name'].casefold()))
+ print(json.dumps({'path':p,'entries':out[:1000]}))
+except FileNotFoundError: print(json.dumps({'error':'not_found'}))
+except PermissionError: print(json.dumps({'error':'forbidden'}))`;
+    const result = await this.dockerService.execCapture(containerId, ["python3", "-c", script, selected], { user: "agent" });
+    if (result.exitCode !== 0) throw Object.assign(new Error("Backup path listing failed"), { statusCode: 502 });
+    let value: any;
+    try { value = JSON.parse(result.stdout.toString("utf8")); } catch { throw Object.assign(new Error("Backup path listing failed"), { statusCode: 502 }); }
+    if (value?.error === "not_found") throw Object.assign(new Error("Backup path not found"), { statusCode: 404 });
+    if (value?.error === "forbidden") throw Object.assign(new Error("Backup path is not readable"), { statusCode: 403 });
+    if (value?.error === "not_directory" || !Array.isArray(value?.entries)) throw Object.assign(new Error("Backup path is not a directory"), { statusCode: 409 });
+    return value;
+  }
+
+  async assertBackupPathsReadable(id: string, paths: string[]): Promise<void> {
+    const containerId = this.dockerIdForFiles(id);
+    const { normalizeBackupPaths } = await import("./backup-paths");
+    const selected = normalizeBackupPaths(paths);
+    const script = String.raw`import os,sys
+for p in sys.argv[1:]:
+ try:
+  os.lstat(p)
+  if not os.access(p,os.R_OK): raise PermissionError(p)
+ except FileNotFoundError: print('missing',file=sys.stderr);sys.exit(2)
+ except PermissionError: print('unreadable',file=sys.stderr);sys.exit(3)`;
+    const result = await this.dockerService.execCapture(containerId, ["python3", "-c", script, ...selected], { user: "agent" });
+    if (result.exitCode === 2) throw Object.assign(new Error("Selected backup path was not found"), { statusCode: 404 });
+    if (result.exitCode === 3) throw Object.assign(new Error("Selected backup path is not readable"), { statusCode: 403 });
+    if (result.exitCode !== 0) throw Object.assign(new Error("Selected backup path could not be validated"), { statusCode: 409 });
   }
 
   /**
@@ -1758,6 +1833,7 @@ export class ContainerManager {
       .attach(info.containerName, info.containerId, "worker", info.displayName)
       .catch(() => {});
     useLogger().info(`[container] restarted ${info.containerName}`);
+    await this.reconcileWorkerPlugins(info);
   }
 
   private static normRepos(repos: RepoConfig[] | undefined): string {
@@ -2044,6 +2120,20 @@ export class ContainerManager {
         "worker-local configuration",
         () => useWorkerConfigStore().remove(info.userId, info.id),
       ],
+      [
+        "plugin installations",
+        async () => {
+          const { usePluginInstallationStore } = await import("./services");
+          await usePluginInstallationStore().removeForWorker(info.userId, info.id);
+        },
+      ],
+      [
+        "worker plugin definitions",
+        async () => {
+          const { usePluginDefinitionStore } = await import("./services");
+          await usePluginDefinitionStore().removeForWorker(info.userId, info.id);
+        },
+      ],
     );
     const failures = await collectWorkerCleanupFailures(actions);
     if (failures.length && deletionStateError) {
@@ -2298,6 +2388,7 @@ export class ContainerManager {
       `[container] rebuilt ${info.containerName} (${containerInfo.containerId.slice(0, 12)})`,
     );
     await this.reconcileManagedNetworksForWorker(info.userId);
+    await this.reconcileWorkerPlugins(containerInfo);
 
     return containerInfo;
   }
@@ -2451,6 +2542,7 @@ export class ContainerManager {
       `[container] unarchived ${containerName} (${containerInfo.containerId.slice(0, 12)})`,
     );
     await this.reconcileManagedNetworksForWorker(worker.userId);
+    await this.reconcileWorkerPlugins(containerInfo);
 
     return containerInfo;
   }
@@ -2705,6 +2797,10 @@ export class ContainerManager {
     id: string,
     opts: {
       includeRootfs: boolean;
+      /** Backup-only selection controls. Omitted values preserve the legacy
+       * complete portable export contract. */
+      includeWorkspace?: boolean;
+      includeAgents?: boolean;
       signal?: AbortSignal;
       onProgress?: (update: {
         phase: string;
@@ -2769,10 +2865,26 @@ export class ContainerManager {
 
     try {
       opts.signal?.throwIfAborted();
+      const includeWorkspace = opts.includeWorkspace !== false;
+      const includeAgents = opts.includeAgents !== false;
       let bytesProcessed = 0;
       const report = async (phase: string, progress: number) => {
         await opts.onProgress?.({ phase, progress, bytesProcessed });
       };
+      // `services` imports ContainerManager, so load the plugin stores only
+      // when an export needs its portable plugin snapshot. This avoids a
+      // module-cycle binding while keeping the snapshot in the export path.
+      const { usePluginDefinitionStore, usePluginInstallationStore } =
+        await import("./services");
+      const pluginConfiguration = snapshotWorkerPlugins(
+        info.userId,
+        info.id,
+        usePluginDefinitionStore(),
+        usePluginInstallationStore(),
+      );
+      const hasPlugins =
+        pluginConfiguration.definitions.length > 0 ||
+        pluginConfiguration.installations.length > 0;
       const manifest: WorkerExportManifest = {
         version: WORKER_EXPORT_VERSION,
         exportedAt: new Date().toISOString(),
@@ -2795,7 +2907,12 @@ export class ContainerManager {
         environment: { ...env, envVars: "" },
         portMappings,
         domainMappings,
-        contents: { rootfs: opts.includeRootfs, workspace: true, agents: true },
+        contents: {
+          rootfs: opts.includeRootfs,
+          workspace: includeWorkspace,
+          agents: includeAgents,
+          ...(hasPlugins ? { plugins: true } : {}),
+        },
         missingSecrets: (
           await useWorkerConfigStore().resolveValues(info.userId, info.id)
         )
@@ -2811,37 +2928,49 @@ export class ContainerManager {
           path: join(tmpDir, BUNDLE_FILES.manifest),
         },
       ];
+      if (hasPlugins) {
+        const pluginPath = join(tmpDir, BUNDLE_FILES.plugins);
+        bytesProcessed += await writePortablePluginConfiguration(
+          pluginPath,
+          pluginConfiguration,
+        );
+        files.push({ name: BUNDLE_FILES.plugins, path: pluginPath });
+      }
 
-      const wsSrc = await this.dockerService.getArchive(
-        info.containerId,
-        EXPORT_WORKSPACE_PATH,
-      );
-      bytesProcessed += await writeGzipFile(
-        wsSrc,
-        join(tmpDir, BUNDLE_FILES.workspace),
-        opts.signal,
-      );
-      files.push({
-        name: BUNDLE_FILES.workspace,
-        path: join(tmpDir, BUNDLE_FILES.workspace),
-      });
+      if (includeWorkspace) {
+        const wsSrc = await this.dockerService.getArchive(
+          info.containerId,
+          EXPORT_WORKSPACE_PATH,
+        );
+        bytesProcessed += await writeGzipFile(
+          wsSrc,
+          join(tmpDir, BUNDLE_FILES.workspace),
+          opts.signal,
+        );
+        files.push({
+          name: BUNDLE_FILES.workspace,
+          path: join(tmpDir, BUNDLE_FILES.workspace),
+        });
+      }
       await report("workspace", opts.includeRootfs ? 30 : 45);
 
-      const agSrc = await this.dockerService.getArchive(
-        info.containerId,
-        EXPORT_AGENTS_PATH,
-      );
-      bytesProcessed += await writeFilteredAgentsGz(
-        agSrc,
-        join(tmpDir, BUNDLE_FILES.agents),
-        CREDENTIAL_EXCLUDE_SUFFIXES,
-        SHARED_DATA_EXCLUDE_PREFIXES,
-        opts.signal,
-      );
-      files.push({
-        name: BUNDLE_FILES.agents,
-        path: join(tmpDir, BUNDLE_FILES.agents),
-      });
+      if (includeAgents) {
+        const agSrc = await this.dockerService.getArchive(
+          info.containerId,
+          EXPORT_AGENTS_PATH,
+        );
+        bytesProcessed += await writeFilteredAgentsGz(
+          agSrc,
+          join(tmpDir, BUNDLE_FILES.agents),
+          CREDENTIAL_EXCLUDE_SUFFIXES,
+          SHARED_DATA_EXCLUDE_PREFIXES,
+          opts.signal,
+        );
+        files.push({
+          name: BUNDLE_FILES.agents,
+          path: join(tmpDir, BUNDLE_FILES.agents),
+        });
+      }
       await report("agent-data", opts.includeRootfs ? 55 : 85);
 
       if (opts.includeRootfs) {
@@ -2921,6 +3050,8 @@ export class ContainerManager {
         rootfsCompressed,
         workspacePath,
         agentsPath,
+        backupPathsPath,
+        pluginConfigurationPath,
       } = await extractBundle(bundlePath, workDir);
       if (!manifest || typeof manifest.version !== "number") {
         throw new Error("Invalid worker export bundle");
@@ -2932,6 +3063,20 @@ export class ContainerManager {
       for (const payload of [workspacePath, agentsPath]) {
         if (payload) await validateGzipTarPayload(payload);
       }
+      const extractedAdditionalPaths = backupPathsPath && manifest.backupPaths
+        ? await extractBackupPathArchives(backupPathsPath, join(workDir, "backup-paths"), manifest.backupPaths)
+        : [];
+      // Backup artifacts may predate capture-side sanitization or originate
+      // outside this orchestrator. Repack again before Docker extracts them.
+      const additionalPaths = [] as typeof extractedAdditionalPaths;
+      for (const [index, item] of extractedAdditionalPaths.entries()) {
+        const sanitized = join(workDir, "backup-paths", `${index}.safe.tar`);
+        await sanitizeBackupPathTarPayload(item.archivePath, sanitized, item.path);
+        additionalPaths.push({ ...item, archivePath: sanitized });
+      }
+      const pluginConfiguration = pluginConfigurationPath
+        ? await readPortablePluginConfiguration(pluginConfigurationPath)
+        : undefined;
       if (rootfsPath)
         await (rootfsCompressed
           ? validateGzipTarPayload(rootfsPath)
@@ -3124,6 +3269,14 @@ export class ContainerManager {
             RESTORE_AGENTS_PARENT,
           );
         }
+        // The payload is created only from explicit operator selections. Each
+        // member is a Docker archive of one absolute path, restored under its
+        // recorded parent after schema + tar validation. This is deliberately
+        // additive: legacy bundles have no additionalPaths at all.
+        for (const item of additionalPaths) {
+          const parent = item.path === "/" ? "/" : item.path.slice(0, item.path.lastIndexOf("/")) || "/";
+          await this.dockerService.putArchive(container.id, createReadStream(item.archivePath), parent);
+        }
         await container.start();
         await this.dockerService.materializeWorkerSecretFiles(
           container.id,
@@ -3154,6 +3307,28 @@ export class ContainerManager {
           );
         }
         await this.recreateImportedMappings(userId, id, containerName, manifest);
+        if (pluginConfiguration) {
+          const {
+            usePluginDefinitionStore,
+            usePluginInstallationStore,
+            usePluginRuntimeManager,
+          } = await import("./services");
+          await restoreWorkerPlugins(
+            pluginConfiguration,
+            userId,
+            id,
+            usePluginDefinitionStore(),
+            usePluginInstallationStore(),
+          );
+          // Reconciliation records individual lifecycle failures as observed
+          // plugin state. Missing restored secret values therefore never make
+          // an otherwise valid worker import fail or leak a value.
+          await usePluginRuntimeManager().reconcileWorker(
+            userId,
+            id,
+            container.id,
+          );
+        }
       } catch (err) {
         await this.rollbackFailedProvisionedWorker({
           id,
@@ -3175,8 +3350,11 @@ export class ContainerManager {
 
       return {
         ...containerInfo,
-        ...(manifest.missingSecrets?.length
-          ? { missingSecrets: manifest.missingSecrets }
+        ...((manifest.missingSecrets?.length || pluginConfiguration?.installations.some((item) => item.secretKeys.length))
+          ? { missingSecrets: [...new Set([
+              ...(manifest.missingSecrets ?? []),
+              ...(pluginConfiguration?.installations.flatMap((item) => item.secretKeys) ?? []),
+            ])].sort() }
           : {}),
       };
       });

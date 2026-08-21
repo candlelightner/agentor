@@ -82,6 +82,37 @@ export interface AppTypeInfo {
   };
 }
 
+/** Public, safe-to-render subset of a plugin definition. `iconSvg` is never
+ * inserted into the dashboard DOM; use the server's sanitized icon endpoint. */
+export interface PluginManifest {
+  schemaVersion: 1;
+  name: string;
+  slug: string;
+  description: string;
+  version: string;
+  lifecycle: { start: { argv: string[]; [key: string]: unknown }; [key: string]: unknown };
+  environment?: { envKeys?: string[]; secretKeys?: string[] };
+  actions?: Array<{ id: string; label: string; kind: 'private-ui'; portId: string; path: string; openMode?: 'sandboxed-pane' }>;
+  [key: string]: unknown;
+}
+
+export interface PluginDefinition {
+  id: string;
+  name: string;
+  scope: 'platform' | 'owner' | 'group' | 'worker';
+  groupId?: string;
+  workerId?: string;
+  builtIn: boolean;
+  manifest: PluginManifest;
+}
+
+export interface PluginInstallation {
+  id: string;
+  definitionId: string;
+  desiredEnabled: boolean;
+  observed: { state: string; ready: boolean; checkedAt?: string; error?: { code: string; message: string } };
+}
+
 export interface PortMapping {
   id: string;
   userId: string;
@@ -186,13 +217,17 @@ export interface ArchivedWorker {
   initScript?: string;
 }
 
-export type TabType = 'terminal' | 'desktop' | 'apps' | 'editor' | 'logs';
+export type TabType = 'terminal' | 'desktop' | 'apps' | 'editor' | 'logs' | 'plugin';
 
 export interface Tab {
   id: string;
   containerId: string;
   containerName: string;
   type: TabType;
+  /** Present only for a sandboxed worker-plugin application tab. */
+  pluginInstallationId?: string;
+  pluginActionId?: string;
+  pluginName?: string;
 }
 
 export type SplitDirection = 'horizontal' | 'vertical';

@@ -22,6 +22,17 @@ const EMPTY_AUTH = {
 };
 const SECRET_SENTINEL = `mcp-secret-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
+function pluginManifest(suffix: string) {
+  return {
+    schemaVersion: 1,
+    name: `MCP plugin ${suffix}`,
+    slug: `mcp-plugin-${suffix.toLowerCase()}`,
+    description: "Management MCP definition CRUD coverage.",
+    version: "1.0.0",
+    lifecycle: { start: { argv: ["true"] } },
+  };
+}
+
 async function body(res: APIResponse): Promise<any> {
   const text = await res.text();
   try {
@@ -578,6 +589,94 @@ test.describe.serial("Internal management MCP security", () => {
     expect(names).toContain("status.system");
     expect(names).not.toContain("worker.stop");
     expect(names).not.toContain("console.open");
+  });
+
+  test("management MCP creates, updates, duplicates, lists, and deletes plugin definitions", async ({
+    request,
+  }) => {
+    const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    let definitionId = "";
+    let duplicateId = "";
+    try {
+      expect(
+        (
+          await request.put("/api/admin/management-mcp/policy", {
+            data: { groups: { apps: true } },
+          })
+        ).status(),
+      ).toBe(200);
+      const created = await invoke(request, credential, "plugins.definitions.create", {
+        workerId: normalWorker,
+        scope: "owner",
+        manifest: pluginManifest(suffix),
+      });
+      expect(created.status(), await created.text()).toBe(200);
+      const definition = await created.json();
+      definitionId = definition.id;
+      expect(definition).toMatchObject({
+        id: expect.any(String),
+        scope: "owner",
+        name: `MCP plugin ${suffix}`,
+      });
+
+      const updatedManifest = {
+        ...pluginManifest(`${suffix}-updated`),
+        name: `MCP plugin ${suffix} updated`,
+      };
+      const updated = await invoke(request, credential, "plugins.definitions.update", {
+        workerId: normalWorker,
+        definitionId,
+        manifest: updatedManifest,
+      });
+      expect(updated.status()).toBe(200);
+      expect(await updated.json()).toMatchObject({ id: definitionId, name: updatedManifest.name });
+
+      const duplicated = await invoke(request, credential, "plugins.definitions.duplicate", {
+        workerId: normalWorker,
+        definitionId,
+      });
+      expect(duplicated.status()).toBe(200);
+      duplicateId = (await duplicated.json()).id;
+
+      const listed = await invoke(request, credential, "plugins.list", { workerId: normalWorker });
+      expect(listed.status()).toBe(200);
+      expect((await listed.json()).definitions).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: definitionId, name: updatedManifest.name }),
+        expect.objectContaining({ id: duplicateId, scope: "worker", workerId: normalWorker }),
+      ]));
+
+      expect((await invoke(request, credential, "plugins.definitions.delete", { workerId: normalWorker, definitionId: duplicateId })).status()).toBe(200);
+      duplicateId = "";
+      expect((await invoke(request, credential, "plugins.definitions.delete", { workerId: normalWorker, definitionId })).status()).toBe(200);
+      definitionId = "";
+    } finally {
+      if (duplicateId) await request.delete(`/api/plugins/definitions/${duplicateId}`).catch(() => {});
+      if (definitionId) await request.delete(`/api/plugins/definitions/${definitionId}`).catch(() => {});
+      await request.put("/api/admin/management-mcp/policy", { data: { groups: { apps: false } } }).catch(() => {});
+    }
+  });
+
+  test("management MCP rejects undeclared plugin environment references", async ({ request }) => {
+    const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    let definitionId = "";
+    try {
+      expect((await request.put("/api/admin/management-mcp/policy", { data: { groups: { apps: true } } })).status()).toBe(200);
+      const created = await invoke(request, credential, "plugins.definitions.create", {
+        workerId: normalWorker,
+        scope: "owner",
+        manifest: { ...pluginManifest(suffix), environment: { envKeys: ["DECLARED_ENV"], secretKeys: ["DECLARED_SECRET"] } },
+      });
+      expect(created.status(), await created.text()).toBe(200);
+      definitionId = (await created.json()).id;
+
+      for (const args of [{ envKeys: ["UNDECLARED_ENV"] }, { secretKeys: ["UNDECLARED_SECRET"] }]) {
+        const rejected = await invoke(request, credential, "plugins.install", { workerId: normalWorker, definitionId, ...args });
+        expect(rejected.status()).toBe(400);
+      }
+    } finally {
+      if (definitionId) await request.delete(`/api/plugins/definitions/${definitionId}`).catch(() => {});
+      await request.put("/api/admin/management-mcp/policy", { data: { groups: { apps: false } } }).catch(() => {});
+    }
   });
 
   test("MCP exposure and app tools share worker ownership, apply mappings, and obey live capability policy", async ({

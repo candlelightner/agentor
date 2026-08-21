@@ -7,8 +7,9 @@ const form = reactive({
   name: "",
   description: "",
   baseImage: "agentor-worker:approved-latest",
+  provisioning: [] as Array<any>,
   dockerfileFragment: "",
-  contextFiles: [] as Array<{ path: string; contentBase64: string }>,
+  contextFiles: [] as Array<{ path: string; contentBase64: string; role: "asset" | "script"; destination: string }>,
 });
 const selected = ref(""),
   busy = ref(""),
@@ -45,11 +46,22 @@ async function files(e: Event) {
     form.contextFiles.push({
       path: f.webkitRelativePath || f.name,
       contentBase64: btoa(binary),
+      role: "asset",
+      destination: `/opt/agentor-context/${f.webkitRelativePath || f.name}`,
     });
   }
 }
 async function create() {
-  const d = await run("create", () => api.create(form));
+  // The package-manager selector is rendered even when no packages were
+  // entered. Do not persist that UI-only placeholder as an invalid empty
+  // provisioning step.
+  const definition = {
+    ...form,
+    provisioning: form.provisioning.filter(
+      (step) => step.type !== "packages" || step.packages?.length,
+    ),
+  };
+  const d = await run("create", () => api.create(definition));
   if (d) {
     selected.value = d.id;
     Object.assign(form, {
@@ -57,9 +69,31 @@ async function create() {
       description: "",
       dockerfileFragment: "",
       contextFiles: [],
+      provisioning: [],
     });
     emit("changed");
   }
+}
+function packageStep() {
+  let step = form.provisioning.find((value) => value.type === "packages");
+  if (!step) {
+    step = { type: "packages", manager: "apt", packages: [] };
+    form.provisioning.unshift(step);
+  }
+  return step;
+}
+function setPackages(event: Event) {
+  const step = packageStep();
+  step.packages = (event.target as HTMLInputElement).value.split(/\s+/).filter(Boolean);
+}
+function setCommand(event: Event) {
+  const value = (event.target as HTMLTextAreaElement).value.trim();
+  form.provisioning = form.provisioning.filter((step) => step.type !== "command");
+  if (value) form.provisioning.push({ type: "command", command: value });
+}
+function syncContextScript(file: { path: string; role: "asset" | "script" }) {
+  form.provisioning = form.provisioning.filter((step) => step.type !== "script" || step.path !== file.path);
+  if (file.role === "script") form.provisioning.push({ type: "script", path: file.path, interpreter: "bash" });
 }
 async function testWorker(d: string, v: string) {
   const r: any = await run("test", () => api.testWorker(d, v));
@@ -166,12 +200,11 @@ function close() { open.value = false; }
               v-model="form.baseImage"
               class="w-full border rounded p-2"
               aria-label="Approved base image"
-            /><textarea
-              v-model="form.dockerfileFragment"
-              rows="8"
-              class="w-full border rounded p-2 font-mono"
-              placeholder="RUN apt-get update…"
-            /><label class="block"
+            /><div class="space-y-2 border rounded p-2" data-testid="image-provisioning">
+              <div class="flex gap-2"><select v-model="packageStep().manager" class="border rounded p-1"><option value="apt">apt</option><option value="npm">npm</option><option value="pip">pip</option></select><input class="flex-1 border rounded p-1" placeholder="Pinned packages (space separated)" @change="setPackages" /></div>
+              <textarea rows="3" class="w-full border rounded p-1 font-mono" placeholder="Optional shell setup command" @change="setCommand" />
+              <p class="text-xs text-gray-500">Provisioning is server-rendered from pinned package installs, explicit commands, and uploaded context scripts. Secrets are rejected.</p>
+            </div><label class="block"
               >Build context files<input
                 type="file"
                 multiple
@@ -179,7 +212,7 @@ function close() { open.value = false; }
                 @change="files"
             /></label>
             <ul class="text-xs">
-              <li v-for="f in form.contextFiles" :key="f.path">{{ f.path }}</li>
+              <li v-for="f in form.contextFiles" :key="f.path" class="flex gap-2"><span>{{ f.path }}</span><select v-model="f.role" aria-label="Context file role" @change="syncContextScript(f)"><option value="asset">asset</option><option value="script">script (run)</option></select><input v-model="f.destination" aria-label="Context file destination" class="border rounded px-1" /></li>
             </ul>
             <UButton
               :disabled="!form.name || !form.baseImage"

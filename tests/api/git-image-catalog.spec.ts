@@ -37,6 +37,37 @@ async function createDefinition(ctx: APIRequestContext, name: string) {
   expect(response.status()).toBe(201);
   return response.json();
 }
+async function createPluginDefinition(ctx: APIRequestContext, suffix: string) {
+  const response = await ctx.post("/api/plugins/definitions", {
+    data: {
+      scope: "owner",
+      manifest: {
+        schemaVersion: 1,
+        name: `Git plugin ${suffix}`,
+        slug: `git-plugin-${suffix}`.toLowerCase(),
+        description: "Credential-free Git recovery acceptance plugin",
+        version: "1.0.0",
+        lifecycle: {
+          start: {
+            argv: ["sh", "-c", "exec sleep 3600"],
+            mode: "background",
+          },
+          stop: { argv: ["true"] },
+        },
+        documentation: {
+          markdown: "# Git plugin\n\nRecovered technical documentation.\n",
+          skillMarkdown:
+            "Use this plugin only when its installed capability is relevant.\n",
+        },
+        iconSvg:
+          '<svg viewBox="0 0 24 24"><path d="M1 1L2 2"/></svg>',
+      },
+    },
+  });
+  const payload = await response.text();
+  expect(response.status(), payload).toBe(201);
+  return JSON.parse(payload);
+}
 
 test.describe
   .serial("Git-backed custom image catalog and disaster recovery", () => {
@@ -73,9 +104,9 @@ test.describe
     expect(formatResponse.status()).toBe(200);
     const format = await formatResponse.json();
     expect(format).toMatchObject({
-      version: 1,
+      version: 2,
       layout: {
-        manifest: ".agentor/image-catalog.v1.json",
+        manifest: ".agentor/image-catalog.v2.json",
         dockerfile: expect.stringContaining("Dockerfile"),
         metadata: expect.stringContaining("metadata.json"),
         context: expect.stringContaining("context"),
@@ -137,6 +168,7 @@ test.describe
 
   test("sync writes Dockerfile, metadata, context, digests, local/Actions and GHCR metadata without secrets", async () => {
     const definition = await createDefinition(ctx, `git-primary-${Date.now()}`);
+    const plugin = await createPluginDefinition(ctx, String(Date.now()));
     const build = await ctx.post(
       `/api/image-catalog/definitions/${definition.id}/builds`,
       { data: { builder: "fake", fakeDurationMs: 100 } },
@@ -182,16 +214,22 @@ test.describe
     const files = repository.branches.main.files;
     expect(Object.keys(files)).toEqual(
       expect.arrayContaining([
-        ".agentor/image-catalog.v1.json",
+        ".agentor/image-catalog.v2.json",
+        ".agentor/plugin-catalog.v1.json",
         `images/${definition.id}/Dockerfile`,
         `images/${definition.id}/metadata.json`,
         `images/${definition.id}/context/config/tool.json`,
+        `plugins/${plugin.id}/manifest.json`,
+        `plugins/${plugin.id}/scripts/start.json`,
+        `plugins/${plugin.id}/README.md`,
+        `plugins/${plugin.id}/SKILL.md`,
+        `plugins/${plugin.id}/icon.svg`,
       ]),
     );
-    const manifest = JSON.parse(files[".agentor/image-catalog.v1.json"]);
+    const manifest = JSON.parse(files[".agentor/image-catalog.v2.json"]);
     expect(manifest).toMatchObject({
-      version: 1,
-      schema: expect.stringContaining("/image-catalog/v1"),
+      version: 2,
+      schema: expect.stringContaining("/image-catalog/v2"),
     });
     const entry = manifest.entries.find(
       (item: any) => item.id === definition.id,
@@ -209,6 +247,32 @@ test.describe
       ]),
     );
     expect(JSON.stringify(repository)).not.toContain(PAT);
+
+    // The repository is a recovery source, not a mirror that deletes local
+    // state. Pulling after a local deletion recreates an equivalent reusable
+    // definition with a fresh local identity and the same visibility scope.
+    expect(
+      (await ctx.delete(`/api/plugins/definitions/${plugin.id}`)).status(),
+    ).toBe(204);
+    const pull = await ctx.post("/api/image-catalog/git/sync", {
+      data: { direction: "pull" },
+    });
+    expect(pull.status()).toBe(200);
+    const pulled = await pull.json();
+    expect(pulled.importedPlugins).toHaveLength(1);
+    expect(pulled.importedPlugins[0]).not.toBe(plugin.id);
+    const recoveredPlugins = await (
+      await ctx.get("/api/plugins/definitions")
+    ).json();
+    expect(recoveredPlugins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: pulled.importedPlugins[0],
+          scope: "owner",
+          name: plugin.name,
+        }),
+      ]),
+    );
   });
 
   test("branch and pull-request workflow returns review metadata instead of updating the default branch", async () => {
@@ -245,7 +309,7 @@ test.describe
     });
   });
 
-  test("configured GitHub credentials are rejected if copied into catalog content", async () => {
+  test("configured GitHub credentials are rejected before catalog content can be created", async () => {
     const definition = await createDefinition(
       ctx,
       `credential-redaction-${Date.now()}`,
@@ -264,20 +328,8 @@ test.describe
         contextFiles: [],
       },
     });
-    expect(leaked.status()).toBe(201);
-    const leakedDefinition = await leaked.json();
-    const sync = await ctx.post("/api/image-catalog/git/sync", {
-      data: { direction: "push", workflow: "direct" },
-    });
-    expect(sync.status()).toBe(400);
-    expect(await sync.text()).not.toContain(PAT);
-    expect(
-      (
-        await ctx.delete(
-          `/api/image-catalog/definitions/${leakedDefinition.id}`,
-        )
-      ).status(),
-    ).toBe(204);
+    expect(leaked.status()).toBe(400);
+    expect(await leaked.text()).not.toContain(PAT);
     expect(body.id).toBe(definition.id);
   });
 
@@ -286,9 +338,9 @@ test.describe
         await ctx.get("/api/image-catalog/git/fake/repository")
       ).json(),
       files = structuredClone(repository.branches.main.files);
-    const manifest = JSON.parse(files[".agentor/image-catalog.v1.json"]);
+    const manifest = JSON.parse(files[".agentor/image-catalog.v2.json"]);
     manifest.generatedAt = new Date(Date.now() + 1000).toISOString();
-    files[".agentor/image-catalog.v1.json"] =
+    files[".agentor/image-catalog.v2.json"] =
       `${JSON.stringify(manifest, null, 2)}\n`;
     expect(
       (
@@ -308,8 +360,8 @@ test.describe
     const after = await (
       await ctx.get("/api/image-catalog/git/fake/repository")
     ).json();
-    expect(after.branches.main.files[".agentor/image-catalog.v1.json"]).toBe(
-      files[".agentor/image-catalog.v1.json"],
+    expect(after.branches.main.files[".agentor/image-catalog.v2.json"]).toBe(
+      files[".agentor/image-catalog.v2.json"],
     );
   });
 

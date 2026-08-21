@@ -196,6 +196,7 @@ COPY --chmod=755 init.sh /home/agent/init.sh
 COPY --chmod=755 apps/ /home/agent/apps/
 COPY --chmod=755 clipboard/ /home/agent/clipboard/
 COPY --chmod=755 management-mcp-proxy.mjs /usr/local/bin/agentor-management-mcp
+COPY --chmod=755 worker-self-mcp-proxy.mjs /usr/local/bin/agentor-worker-mcp
 
 # noVNC clipboard bridge: an ES module that capture-intercepts Ctrl/Cmd+V (and
 # Ctrl+Alt+V) in the desktop iframe, normalises the browser clipboard to PNG

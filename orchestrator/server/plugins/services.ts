@@ -23,6 +23,9 @@ import {
   useLogger,
   useLogCollector,
   useExportJobManager,
+  usePluginDefinitionStore,
+  usePluginInstallationStore,
+  usePluginRuntimeManager,
 } from "../utils/services";
 import {
   loadBuiltInCapabilities,
@@ -30,6 +33,7 @@ import {
   loadBuiltInInitScripts,
   loadBuiltInEnvironments,
 } from "../utils/built-in-content";
+import { BUILT_IN_PLUGINS } from "../utils/plugin-builtins";
 import { migrateAuth, getAuthDb } from "../utils/auth";
 import { cleanupWorkspaceHelpers } from "../utils/workspace-access";
 import { useBackupManager } from "../utils/backup-manager";
@@ -120,6 +124,8 @@ export default defineNitroPlugin(async (nitroApp) => {
   const workerStore = useWorkerStore();
   const portMappingStore = usePortMappingStore();
   const domainMappingStore = useDomainMappingStore();
+  const pluginDefinitionStore = usePluginDefinitionStore();
+  const pluginInstallationStore = usePluginInstallationStore();
 
   await Promise.all([
     userEnvStore.init(),
@@ -150,6 +156,11 @@ export default defineNitroPlugin(async (nitroApp) => {
     useGitImageCatalogManager().init(),
     useAdminWorkspaceStore().init(),
     useManagementMcpStore().init(),
+    (async () => {
+      await pluginDefinitionStore.init();
+      await pluginDefinitionStore.seedBuiltIns(BUILT_IN_PLUGINS);
+    })(),
+    pluginInstallationStore.init(),
   ]);
 
   containerManager.setEnvironmentStore(environmentStore);
@@ -158,12 +169,26 @@ export default defineNitroPlugin(async (nitroApp) => {
   containerManager.setWorkerStore(workerStore);
   await containerManager.sync();
   await containerManager.reconcileWorkers();
+  for (const worker of containerManager.list()) {
+    if (
+      worker.status !== "running" ||
+      worker.administrativeKind ||
+      worker.userId === "__agentor_admin__"
+    )
+      continue;
+    await usePluginRuntimeManager()
+      .reconcileWorker(worker.userId, worker.id, worker.containerId)
+      .catch((error) =>
+        logger.warn(
+          `[agentor] plugin reconciliation failed for ${worker.id}: ${error instanceof Error ? error.message : error}`,
+        ),
+      );
+  }
   // Restore desired managed-network membership after a daemon/orchestrator
   // restart. Keep worker startup available if a user-created bridge is broken;
   // validation/UI will expose the failed network instead of hiding it.
-  const { useManagedNetworkManager } = await import(
-    "../utils/managed-network-manager"
-  );
+  const { useManagedNetworkManager } =
+    await import("../utils/managed-network-manager");
   for (const userId of useManagedNetworkStore().listUserIds())
     await useManagedNetworkManager()
       .reconcileOwner(userId)
@@ -262,6 +287,18 @@ export default defineNitroPlugin(async (nitroApp) => {
   );
   useOrphanSweeper().addCandidateSource(() =>
     useImageCatalogManager().ownerIds(),
+  );
+  useOrphanSweeper().addCleanupHook(async (userId) => {
+    await pluginInstallationStore.removeForUser(userId);
+  });
+  useOrphanSweeper().addCleanupHook(async (userId) => {
+    await pluginDefinitionStore.removeForUser(userId);
+  });
+  useOrphanSweeper().addCandidateSource(() =>
+    pluginInstallationStore.listUserIds(),
+  );
+  useOrphanSweeper().addCandidateSource(() =>
+    pluginDefinitionStore.listUserIds(),
   );
   useOrphanSweeper().start();
 

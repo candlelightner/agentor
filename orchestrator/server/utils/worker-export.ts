@@ -2,6 +2,7 @@ import { createGzip, createGunzip, constants as zlibConstants } from 'node:zlib'
 import { createReadStream, createWriteStream, existsSync } from 'node:fs';
 import { stat, mkdir, writeFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { posix as posixPath } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Transform, type Readable } from 'node:stream';
 import { spawn } from 'node:child_process';
@@ -12,9 +13,10 @@ import type { DomainMapping } from './domain-mapping-store';
 import type { RepoConfig, MountConfig } from '../../shared/types';
 import { AGENT_CREDENTIAL_MAPPINGS } from './user-credentials';
 import { SHARED_DIRECTORY_MOUNT_POINTS } from './storage';
+import type { PortablePluginConfiguration } from './plugin-portability';
 
 /** Bumped when the bundle layout changes incompatibly. */
-export const WORKER_EXPORT_VERSION = 3;
+export const WORKER_EXPORT_VERSION = 5;
 
 /** Container paths whose contents are exported as separate volume tars (their
  * data lives in volumes, which `docker export` deliberately omits). */
@@ -55,6 +57,8 @@ export const BUNDLE_FILES = {
   legacyRootfs: 'rootfs.tar',
   workspace: 'workspace.tar.gz',
   agents: 'agents.tar.gz',
+  backupPaths: 'backup-paths.tar.gz',
+  plugins: 'plugins.json',
 } as const;
 
 /** What a port mapping looks like once stripped of identity for re-creation. */
@@ -68,8 +72,13 @@ export type ExportedDomainMapping = Pick<DomainMapping, 'subdomain' | 'baseDomai
 export const MAX_BUNDLE_ENTRY_BYTES = 20 * 1024 * 1024 * 1024;
 export const MAX_BUNDLE_TOTAL_BYTES = 40 * 1024 * 1024 * 1024;
 export const MAX_MANIFEST_BYTES = 1024 * 1024;
+export const MAX_PLUGIN_CONFIGURATION_BYTES = 16 * 1024 * 1024;
 export const MAX_INNER_ARCHIVE_BYTES = 100 * 1024 * 1024 * 1024;
 export const MAX_INNER_ARCHIVE_ENTRIES = 1_000_000;
+/** The compressed backup-paths member contains several individual tar files.
+ * Bound its aggregate expanded size before staging those files to prevent a
+ * gzip bomb from bypassing the per-inner-archive limits. */
+export const MAX_BACKUP_PATH_PAYLOAD_BYTES = MAX_INNER_ARCHIVE_BYTES;
 
 export interface WorkerExportManifest {
   version: number;
@@ -94,7 +103,10 @@ export interface WorkerExportManifest {
   portMappings: ExportedPortMapping[];
   domainMappings: ExportedDomainMapping[];
   /** Which payloads the bundle contains. */
-  contents: { rootfs: boolean; workspace: boolean; agents: boolean };
+  contents: { rootfs: boolean; workspace: boolean; agents: boolean; backupPaths?: boolean; plugins?: boolean };
+  /** Explicit, non-default absolute paths selected for a backup.  Their
+   * archives are only present in backup bundles, never ordinary exports. */
+  backupPaths?: Array<{ path: string; archive: string }>;
   /** Names only of worker-local secrets/files excluded from this bundle. */
   missingSecrets?: string[];
 }
@@ -196,6 +208,8 @@ export interface ExtractedBundle {
   rootfsCompressed?: boolean;
   workspacePath?: string;
   agentsPath?: string;
+  backupPathsPath?: string;
+  pluginConfigurationPath?: string;
 }
 
 /** Scan a compressed tar before Docker extracts/imports it. Compressed-size
@@ -260,6 +274,241 @@ export async function validateTarPayload(filePath: string, maxExpandedBytes = MA
   await pipeline(createReadStream(filePath), counter, extract);
 }
 
+/** Explicit backup paths can be restored under arbitrary absolute parents,
+ * including intentionally selected authentication locations. Unlike ordinary
+ * volume payloads, their archive must therefore contain only plain files and
+ * directories: links, devices, and FIFOs could redirect Docker extraction
+ * outside the recorded path even when member names themselves are safe. */
+export async function validateBackupPathTarPayload(filePath: string): Promise<void> {
+  let expandedBytes = 0;
+  let entries = 0;
+  const counter = new Transform({
+    transform(chunk, _encoding, callback) {
+      expandedBytes += Buffer.byteLength(chunk);
+      callback(expandedBytes > MAX_INNER_ARCHIVE_BYTES ? new Error('Invalid backup path archive: expanded archive exceeds the size limit') : null, chunk);
+    },
+  });
+  const extract = tar.extract();
+  extract.on('entry', (header, stream, next) => {
+    entries += 1;
+    const name = header.name.replace(/\\/g, '/');
+    const unsafeName = name.includes('\0') || name.startsWith('/') || name.split('/').includes('..');
+    const safeType = header.type === 'file' || header.type === 'directory';
+    // A regular entry has no meaningful link target. Reject it too, rather
+    // than depending on tar implementation-specific link semantics.
+    const hasLinkTarget = typeof header.linkname === 'string' && header.linkname.length > 0;
+    if (entries > MAX_INNER_ARCHIVE_ENTRIES || unsafeName || !safeType || hasLinkTarget) {
+      const error = new Error(entries > MAX_INNER_ARCHIVE_ENTRIES ? 'Invalid backup path archive: archive contains too many entries' : 'Invalid backup path archive: archive contains an unsafe entry');
+      stream.on('end', () => next(error));
+      stream.resume();
+      return;
+    }
+    stream.on('end', next);
+    stream.resume();
+  });
+  await pipeline(createReadStream(filePath), counter, extract);
+}
+
+/**
+ * Re-pack an explicit absolute-path archive before it is persisted or restored.
+ * Docker's getArchive() intentionally preserves links; rejecting all of them
+ * makes normal selections such as `/` unusable (`/bin -> /usr/bin`).  The
+ * sanitizer instead retains ordinary files, directories, and safe links while
+ * making it impossible for a later member to write through a symlink. Device
+ * nodes, FIFOs, sockets, and other special entries are omitted: they are not
+ * portable worker data and must not be recreated by putArchive().
+ */
+export async function sanitizeBackupPathTarPayload(
+  source: string,
+  destination: string,
+  selectedPath: string,
+  signal?: AbortSignal,
+): Promise<{ omittedSpecialEntries: number }> {
+  if (!safeAbsoluteBackupPath(selectedPath))
+    throw new Error("Invalid selected backup path");
+  signal?.throwIfAborted();
+  let expandedBytes = 0;
+  let entries = 0;
+  let omittedSpecialEntries = 0;
+  const kinds = new Map<string, "file" | "directory" | "symlink" | "link">();
+  const extract = tar.extract();
+  const pack = tar.pack();
+  const counter = new Transform({
+    transform(chunk, _encoding, callback) {
+      expandedBytes += Buffer.byteLength(chunk);
+      callback(
+        expandedBytes > MAX_INNER_ARCHIVE_BYTES
+          ? new Error("Invalid backup path archive: expanded archive exceeds the size limit")
+          : null,
+        chunk,
+      );
+    },
+  });
+  let failed: Error | undefined;
+  const fail = (error: unknown) => {
+    if (failed) return;
+    failed = error instanceof Error ? error : new Error(String(error));
+    // The pipeline that observed the original error will reject. Destroy the
+    // peer streams without re-emitting that error: tar-stream can otherwise
+    // surface a second unhandled error from a nested `next()` callback.
+    extract.destroy();
+    pack.destroy();
+  };
+  extract.on("entry", (header, stream, next) => {
+    entries += 1;
+    try {
+      if (entries > MAX_INNER_ARCHIVE_ENTRIES)
+        throw new Error("Invalid backup path archive: archive contains too many entries");
+      const type = backupEntryType(header.type);
+      if (!type) {
+        // Omit non-portable special entries. Consume their bodies so tar-stream
+        // can continue parsing the trusted Docker archive.
+        omittedSpecialEntries += 1;
+        stream.on("end", next);
+        stream.resume();
+        return;
+      }
+      // Docker may represent getArchive("/") with a leading `.` directory.
+      // It has no restoration value when putArchive targets `/`; omit that
+      // one wrapper while retaining every real child member.
+      if (selectedPath === "/" && type === "directory" && rootDirectoryMember(header.name)) {
+        stream.on("end", next);
+        stream.resume();
+        return;
+      }
+      const name = archiveMemberName(header.name);
+      assertBackupMemberWithinSelection(name, selectedPath);
+      assertArchiveTreeSafe(kinds, name, type);
+      const linkname = typeof header.linkname === "string" ? header.linkname : "";
+      if (type === "symlink") assertSafeSymlinkTarget(linkname, selectedPath, name);
+      if (type === "link") assertSafeHardlinkTarget(kinds, name, linkname);
+      kinds.set(name, type);
+      const safeHeader: tar.Headers = {
+        name,
+        type,
+        size: type === "file" ? header.size : 0,
+        mode: header.mode,
+        mtime: header.mtime,
+        ...(type === "symlink" || type === "link" ? { linkname } : {}),
+      };
+      const entry = pack.entry(safeHeader, (error) => {
+        if (error) fail(error);
+        next(error || undefined);
+      });
+      stream.on("error", fail);
+      entry.on("error", fail);
+      stream.pipe(entry);
+    } catch (error) {
+      stream.resume();
+      fail(error);
+    }
+  });
+  extract.on("finish", () => pack.finalize());
+  extract.on("error", fail);
+  pack.on("error", fail);
+  try {
+    await Promise.all([
+      pipeline(createReadStream(source), counter, extract, { signal }),
+      pipeline(pack, createWriteStream(destination, { mode: 0o600 }), { signal }),
+    ]);
+  } catch (error) {
+    throw failed ?? error;
+  }
+  return { omittedSpecialEntries };
+}
+
+/** Docker getArchive(path) preserves the selected resource as the top-level
+ * tar member. Requiring that wrapper for non-root selections prevents a
+ * crafted backup for `/a/selected` from writing a sibling below `/a` when it
+ * is later passed to putArchive(`/a`). Root selection deliberately retains
+ * its existing semantics: any safe relative member is allowed. */
+function assertBackupMemberWithinSelection(name: string, selectedPath: string) {
+  if (selectedPath === "/") return;
+  const wrapper = posixPath.basename(selectedPath);
+  if (name !== wrapper && !name.startsWith(`${wrapper}/`))
+    throw new Error("Invalid backup path archive: entry is outside the selected path");
+}
+
+function archiveMemberName(value: string): string {
+  const raw = value.replace(/\\/g, "/");
+  if (raw.startsWith("/") || raw.includes("\0") || raw.split("/").includes(".."))
+    throw new Error("Invalid backup path archive: archive contains an unsafe entry");
+  const normalized = posixPath.normalize(raw).replace(/^\.\//, "").replace(/\/+$/, "");
+  if (!normalized || normalized === ".")
+    throw new Error("Invalid backup path archive: archive contains an unsafe entry");
+  return normalized;
+}
+
+function rootDirectoryMember(value: string): boolean {
+  return value.replace(/\\/g, "/").replace(/\/+$/, "") === ".";
+}
+
+function backupEntryType(value: unknown): "file" | "directory" | "symlink" | "link" | undefined {
+  return value === "file" || value === "directory" || value === "symlink" || value === "link"
+    ? value
+    : undefined;
+}
+
+function assertArchiveTreeSafe(
+  kinds: Map<string, "file" | "directory" | "symlink" | "link">,
+  name: string,
+  type: "file" | "directory" | "symlink" | "link",
+) {
+  if (kinds.has(name))
+    throw new Error("Invalid backup path archive: duplicate entry");
+  const parts = name.split("/");
+  for (let index = 1; index < parts.length; index += 1) {
+    const ancestor = kinds.get(parts.slice(0, index).join("/"));
+    if (ancestor && ancestor !== "directory")
+      throw new Error("Invalid backup path archive: entry traverses a non-directory");
+  }
+  for (const existing of kinds.keys())
+    if (existing.startsWith(`${name}/`) && type !== "directory")
+      throw new Error("Invalid backup path archive: entry replaces an existing parent");
+}
+
+function assertSafeSymlinkTarget(target: string, selectedPath: string, member: string) {
+  if (!target || target.includes("\0") || target.includes("\\"))
+    throw new Error("Invalid backup path archive: unsafe symlink target");
+  const restoreParent = selectedPath === "/" ? "/" : posixPath.dirname(selectedPath);
+  const memberPath = posixPath.join(restoreParent, member);
+  const resolved = target.startsWith("/")
+    ? resolveInsideRoot(target)
+    : resolveInsideRoot(posixPath.join(posixPath.dirname(memberPath), target));
+  if (!resolved)
+    throw new Error("Invalid backup path archive: unsafe symlink target");
+}
+
+function resolveInsideRoot(value: string): string | undefined {
+  const segments: string[] = [];
+  for (const part of value.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (!segments.length) return undefined;
+      segments.pop();
+    } else segments.push(part);
+  }
+  return `/${segments.join("/")}`;
+}
+
+function assertSafeHardlinkTarget(
+  kinds: Map<string, "file" | "directory" | "symlink" | "link">,
+  name: string,
+  target: string,
+) {
+  if (!target || target.startsWith("/") || target.includes("\0") || target.includes("\\"))
+    throw new Error("Invalid backup path archive: unsafe hardlink target");
+  const direct = tryArchiveRelative(target);
+  const relative = tryArchiveRelative(posixPath.join(posixPath.dirname(name), target));
+  const resolved = [direct, relative].find((candidate) => candidate && kinds.get(candidate) === "file");
+  if (!resolved)
+    throw new Error("Invalid backup path archive: hardlink target must be an earlier regular file in the archive");
+}
+
+function tryArchiveRelative(value: string): string | undefined {
+  try { return archiveMemberName(value); } catch { return undefined; }
+}
+
 /** Extract the outer bundle tar into `destDir`, returning the parsed manifest
  * and the paths of any extracted payloads. */
 export async function extractBundle(bundlePath: string, destDir: string): Promise<ExtractedBundle> {
@@ -288,7 +537,11 @@ export async function extractBundle(bundlePath: string, destDir: string): Promis
         return;
       }
       const size = header.size ?? 0;
-      const limit = name === BUNDLE_FILES.manifest ? MAX_MANIFEST_BYTES : MAX_BUNDLE_ENTRY_BYTES;
+      const limit = name === BUNDLE_FILES.manifest
+        ? MAX_MANIFEST_BYTES
+        : name === BUNDLE_FILES.plugins
+          ? MAX_PLUGIN_CONFIGURATION_BYTES
+          : MAX_BUNDLE_ENTRY_BYTES;
       if (!Number.isSafeInteger(size) || size < 0 || size > limit || totalBytes + size > MAX_BUNDLE_TOTAL_BYTES) {
         reject(new Error(`Invalid worker export: bundle entry "${name}" exceeds the size limit`));
         extract.destroy();
@@ -332,8 +585,12 @@ export async function extractBundle(bundlePath: string, destDir: string): Promis
     ['rootfs', Boolean(rootfsFile)],
     ['workspace', present.has(BUNDLE_FILES.workspace)],
     ['agents', present.has(BUNDLE_FILES.agents)],
+    ['backupPaths', present.has(BUNDLE_FILES.backupPaths)],
+    ['plugins', present.has(BUNDLE_FILES.plugins)],
   ] as const) {
-    if (manifest.contents[key] !== filePresent) {
+    const declared = (manifest.contents as any)[key];
+    const optionalAbsent = (key === 'backupPaths' || key === 'plugins') && declared === undefined && !filePresent;
+    if (declared !== filePresent && !optionalAbsent) {
       throw new Error(`Invalid worker export: manifest contents.${key} does not match bundle payloads`);
     }
   }
@@ -344,6 +601,8 @@ export async function extractBundle(bundlePath: string, destDir: string): Promis
     rootfsCompressed: rootfsFile === BUNDLE_FILES.rootfs,
     workspacePath: present.has(BUNDLE_FILES.workspace) ? join(destDir, BUNDLE_FILES.workspace) : undefined,
     agentsPath: present.has(BUNDLE_FILES.agents) ? join(destDir, BUNDLE_FILES.agents) : undefined,
+    backupPathsPath: present.has(BUNDLE_FILES.backupPaths) ? join(destDir, BUNDLE_FILES.backupPaths) : undefined,
+    pluginConfigurationPath: present.has(BUNDLE_FILES.plugins) ? join(destDir, BUNDLE_FILES.plugins) : undefined,
   };
 }
 
@@ -389,9 +648,14 @@ function assertValidManifest(value: unknown): asserts value is WorkerExportManif
   if (!value.portMappings.every((mapping) => isRecord(mapping) && Number.isInteger(mapping.externalPort) && Number.isInteger(mapping.internalPort) && (mapping.type === 'localhost' || mapping.type === 'external') && (mapping.appType === undefined || isString(mapping.appType)) && (mapping.instanceId === undefined || isString(mapping.instanceId)))) {
     throw new Error('Invalid worker export: port mapping is invalid');
   }
-  if (!isRecord(contents) || !['rootfs', 'workspace', 'agents'].every((k) => typeof contents[k] === 'boolean')) {
+  if (!isRecord(contents) || !['rootfs', 'workspace', 'agents'].every((k) => typeof contents[k] === 'boolean') || (contents.backupPaths !== undefined && typeof contents.backupPaths !== 'boolean') || (contents.plugins !== undefined && typeof contents.plugins !== 'boolean')) {
     throw new Error('Invalid worker export: manifest.contents is invalid');
   }
+  if (value.backupPaths !== undefined && (!Array.isArray(value.backupPaths) || value.backupPaths.length > 32 || new Set(value.backupPaths.map((entry: any) => entry?.path)).size !== value.backupPaths.length || new Set(value.backupPaths.map((entry: any) => entry?.archive)).size !== value.backupPaths.length || value.backupPaths.some((entry) => !isRecord(entry) || !isString(entry.path) || !safeAbsoluteBackupPath(entry.path) || !isString(entry.archive) || !/^paths\/[0-9]{1,2}\.tar$/.test(entry.archive)))) {
+    throw new Error('Invalid worker export: manifest.backupPaths is invalid');
+  }
+  if (contents.backupPaths === true && !value.backupPaths?.length)
+    throw new Error('Invalid worker export: manifest.backupPaths is missing');
   if (value.missingSecrets !== undefined && (!Array.isArray(value.missingSecrets) || value.missingSecrets.length > 500 || value.missingSecrets.some((name) => typeof name !== 'string' || name.length < 1 || name.length > 255))) {
     throw new Error('Invalid worker export: manifest.missingSecrets is invalid');
   }
@@ -405,4 +669,41 @@ function assertValidManifest(value: unknown): asserts value is WorkerExportManif
     const { basicAuth: _secret, ...safe } = mapping;
     return safe;
   });
+}
+
+function safeAbsoluteBackupPath(path: string): boolean {
+  return path.length > 0 && path.length <= 4096 && !path.includes('\0') && !path.includes('\\') && path.startsWith('/') && posixPath.normalize(path) === path;
+}
+
+/** Extract the individually archived selected paths from an additive backup
+ * payload. Names are manifest-controlled fixed `paths/N.tar` entries; each
+ * inner archive is subsequently validated before Docker receives it. */
+export async function extractBackupPathArchives(payload: string, destDir: string, entries: Array<{ path: string; archive: string }>): Promise<Array<{ path: string; archivePath: string }>> {
+  await mkdir(destDir, { recursive: true, mode: 0o700 });
+  const wanted = new Set(entries.map((entry) => entry.archive));
+  const found = new Set<string>();
+  const extract = tar.extract();
+  let expandedBytes = 0;
+  const counter = new Transform({
+    transform(chunk, _encoding, callback) {
+      expandedBytes += Buffer.byteLength(chunk);
+      callback(
+        expandedBytes > MAX_BACKUP_PATH_PAYLOAD_BYTES
+          ? new Error('Invalid backup path payload: expanded archive exceeds the size limit')
+          : null,
+        chunk,
+      );
+    },
+  });
+  extract.on('entry', (header, stream, next) => {
+    if (header.type !== 'file' || !wanted.has(header.name) || found.has(header.name) || !Number.isSafeInteger(header.size) || header.size! < 0 || header.size! > MAX_BUNDLE_ENTRY_BYTES) {
+      stream.resume(); next(new Error('Invalid backup path payload')); return;
+    }
+    found.add(header.name);
+    pipeline(stream, createWriteStream(join(destDir, header.name.replace('/', '-')), { mode: 0o600 }))
+      .then(() => next(), (error) => next(error instanceof Error ? error : new Error(String(error))));
+  });
+  await pipeline(createReadStream(payload), createGunzip(), counter, extract);
+  if (found.size !== wanted.size) throw new Error('Backup path payload is incomplete');
+  return entries.map((entry) => ({ path: entry.path, archivePath: join(destDir, entry.archive.replace('/', '-')) }));
 }

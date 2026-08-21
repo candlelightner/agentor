@@ -2,6 +2,7 @@ import { requireAuth } from "../../../utils/auth-helpers";
 import { useGitImageCatalogManager } from "../../../utils/git-image-manager";
 import { useImageCatalogManager } from "../../../utils/image-catalog";
 import type { H3Event } from "h3";
+import { usePluginDefinitionStore } from "../../../utils/services";
 
 defineRouteMeta({
   openAPI: {
@@ -63,6 +64,7 @@ export default defineEventHandler(async (event) => {
         user.id,
         catalog,
         await readBody(event).catch(() => ({})),
+        usePluginDefinitionStore(),
       );
     if (parts[0] === "recovery" && method === "GET")
       return manager.recovery(user.id);
@@ -70,7 +72,7 @@ export default defineEventHandler(async (event) => {
       return manager.sync(user.id, catalog, {
         ...(await readBody(event).catch(() => ({}))),
         direction: "pull",
-      });
+      }, usePluginDefinitionStore());
     if (parts[0] === "fake") {
       if (
         process.env.NODE_ENV === "production" &&

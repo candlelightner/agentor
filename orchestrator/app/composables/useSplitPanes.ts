@@ -261,6 +261,23 @@ export function useSplitPanes() {
     focusedNodeId.value = leaf.id;
   }
 
+  function openPluginTab(
+    containerId: string,
+    containerName: string,
+    pluginInstallationId: string,
+    pluginActionId: string,
+    pluginName: string,
+    targetNodeId?: string,
+  ) {
+    const before = new Set(tabs.value.map((tab) => tab.id));
+    openTab(containerId, containerName, 'plugin', targetNodeId);
+    const created = tabs.value.find((tab) => !before.has(tab.id));
+    if (!created) return;
+    created.pluginInstallationId = pluginInstallationId;
+    created.pluginActionId = pluginActionId;
+    created.pluginName = pluginName;
+  }
+
   function closeTab(tabId: string) {
     const leaf = findGroupForTab(tabId);
     if (!leaf) return;
@@ -579,6 +596,7 @@ export function useSplitPanes() {
     tabs,
     activeTabId,
     openTab,
+    openPluginTab,
     closeTab,
     closeTabsForContainer,
     renameContainerTabs,

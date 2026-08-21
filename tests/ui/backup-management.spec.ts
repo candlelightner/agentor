@@ -10,10 +10,33 @@ async function mock(page: Page) {
   await page.route('**/api/backup-jobs/job-1/retry',r=>r.fulfill({status:202,json:{id:'job-2',status:'queued',phase:'queued',progress:0}}));
   await page.route('**/api/backups/backup-1/restore',r=>r.fulfill({status:202,json:{jobId:'restore-1'}}));
   await page.route('**/api/backups/backup-1',r=>{backups=[];return r.fulfill({status:204})});
+  await page.route('**/api/containers/worker-1/backup-paths**', async route => {
+    const path = new URL(route.request().url()).searchParams.get('path') || '/workspace';
+    const entries = path === '/' ? [{name:'etc',path:'/etc',type:'directory',readable:true}] : [{name:'project',path:'/workspace/project',type:'directory',readable:true},{name:'note.txt',path:'/workspace/note.txt',type:'file',readable:true}];
+    await route.fulfill({json:{path,entries}});
+  });
 }
 async function open(page:Page){await goToDashboard(page);await page.getByRole('button',{name:/backup management/i}).click();return page.locator('[data-testid="backup-management"]')}
 test.beforeEach(async({page})=>mock(page));
 test('configures scheduling and starts a manual backup with progress and consistency warning',async({page})=>{const m=await open(page);await expect(m).toContainText('fake — linked');await m.getByLabel('Enable scheduled backups').check();await m.getByRole('button',{name:'Save schedule'}).click();await m.getByRole('button',{name:'Back up now'}).click();await expect(m).toContainText('queued · queued');await expect(m).toContainText('crash-consistent')});
+test('selects files and any browsed directory including root from a picker rooted at workspace', async ({ page }) => {
+  const m = await open(page);
+  await m.getByLabel('Selected workspaces').check();
+  await m.getByLabel(/Workspace IDs/).fill('worker-1');
+  await m.getByRole('button', { name: 'Choose paths' }).click();
+  const picker = page.getByTestId('backup-path-picker');
+  const project = picker.getByRole('button', { name: 'project', exact: true });
+  await expect(project).toBeVisible();
+  await project.dblclick();
+  await expect(picker).toContainText('/workspace/project');
+  await picker.getByRole('button', { name: 'Up' }).click();
+  await picker.getByLabel(/note.txt/).check();
+  await picker.getByRole('button', { name: 'Up' }).click();
+  await expect(picker).toContainText('/');
+  await picker.getByLabel('Select current directory').check();
+  await picker.getByRole('button', { name: 'Done' }).click();
+  await expect(m).toContainText('2 additional');
+});
 test('restores safely into a new or lock-protected original worker without retaining its password',async({page})=>{
   const lockPassword='UI_BACKUP_LOCK_DO_NOT_RENDER';let restoreBody:any;
   await page.route('**/api/backups/backup-1/restore',async route=>{restoreBody=await route.request().postDataJSON();await route.fulfill({status:202,json:{jobId:'restore-1'}})});

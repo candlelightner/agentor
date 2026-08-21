@@ -141,7 +141,17 @@ function validOptionalPathIdArray(value: unknown): boolean {
 
 function validStoredConfig(userId: string, value: any): boolean {
   return value && value.schemaVersion === 1 && value.userId === userId &&
-    validProvider(value.provider) && validOptionalPathIdArray(value.selectedWorkspaceIds);
+    validProvider(value.provider) && validOptionalPathIdArray(value.selectedWorkspaceIds) && validPathSelections(value.selectedPathsByWorkspace);
+}
+
+function validPathSelections(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  return Object.entries(value as Record<string, unknown>).every(([id, paths]) =>
+    validPathId(id) && Array.isArray(paths) && paths.length <= 32 && paths.every((path) =>
+      typeof path === 'string' && path.length > 0 && path.length <= 4096 && path.startsWith('/') && !path.includes('\0') && !path.includes('\\'),
+    ),
+  );
 }
 
 function validProvider(value: unknown): value is BackupArtifact['provider'] {

@@ -13,7 +13,12 @@ export interface ImageDefinition {
   description: string;
   baseImage: string;
   dockerfileFragment: string;
-  contextFiles: Array<{ path: string; contentBase64: string }>;
+  contextFiles: Array<{ path: string; contentBase64: string; role?: "asset" | "script"; destination?: string }>;
+  provisioning?: Array<
+    | { type: "packages"; manager: "apt" | "npm" | "pip"; packages: string[] }
+    | { type: "command"; command: string }
+    | { type: "script"; path: string; interpreter: "sh" | "bash" | "python3" | "node" }
+  >;
   versions: CatalogVersion[];
   promotedVersion?: string;
 }

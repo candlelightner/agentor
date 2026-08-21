@@ -13,10 +13,12 @@ test('real browser creates, builds, and promotes an approved-base image', async 
     const modal = page.locator('[data-testid="image-catalog"]');
     await modal.getByPlaceholder('Definition name').fill(name);
     await modal.getByPlaceholder('Description').fill('Real browser controlled-build proof');
-    await modal.getByPlaceholder('RUN apt-get update…').fill('RUN printf agentor-image-proof > /etc/agentor-image-proof');
+    await modal.getByPlaceholder('Optional shell setup command').fill('printf agentor-image-proof > /etc/agentor-image-proof');
     const createResponse = page.waitForResponse(response => response.url().endsWith('/api/image-catalog/definitions') && response.request().method() === 'POST');
     await modal.getByRole('button', { name: 'Create definition' }).click();
-    definitionId = (await (await createResponse).json()).id;
+    const created = await createResponse;
+    expect(created.ok(), await created.text()).toBe(true);
+    definitionId = (await created.json()).id;
     const article = modal.locator('article').filter({ hasText: name });
     await expect(article).toBeVisible();
     await article.getByRole('button', { name: 'Build', exact: true }).click();

@@ -6,8 +6,9 @@ defineRouteMeta({ openAPI: {
 } });
 
 import { requireContainerAccess } from '../../../utils/auth-helpers';
-import { useContainerManager, useWorkerStore } from '../../../utils/services';
+import { useContainerManager, useWorkerStore, usePluginDefinitionStore, usePluginInstallationStore, usePluginRuntimeManager } from '../../../utils/services';
 import { useWorkerConfigStore } from '../../../utils/worker-config-store';
+import { restoreWorkerPlugins, snapshotWorkerPlugins } from '../../../utils/plugin-portability';
 import { findWorkspaceInventory } from '../../../utils/workspace-inventory';
 import { OfflineWorkspaceAccess } from '../../../utils/workspace-access';
 
@@ -20,6 +21,12 @@ export default defineEventHandler(async (event) => {
   const resolved = await useWorkerConfigStore().resolveValues(source!.userId, id);
   const variables = resolved.filter((entry) => entry.kind === 'variable').map(({ key, value }) => ({ key, value }));
   const missingSecrets = resolved.filter((entry) => entry.kind !== 'variable').map((entry) => entry.key);
+  const pluginConfiguration = snapshotWorkerPlugins(
+    source!.userId,
+    id,
+    usePluginDefinitionStore(),
+    usePluginInstallationStore(),
+  );
   const cloned = await useContainerManager().create({
     userId: user.id,
     displayName: typeof body?.displayName === 'string' ? body.displayName : `${source!.displayName || 'worker'} copy`,
@@ -33,10 +40,19 @@ export default defineEventHandler(async (event) => {
     const item = await findWorkspaceInventory(id, user.role === 'admin');
     if (!item || item.state === 'orphaned') throw new Error('Source workspace not found');
     await new OfflineWorkspaceAccess(item).cloneInto(cloned.containerId);
+    const restored = await restoreWorkerPlugins(
+      pluginConfiguration,
+      user.id,
+      cloned.id,
+      usePluginDefinitionStore(),
+      usePluginInstallationStore(),
+    );
+    missingSecrets.push(...restored.missingSecretNames);
+    await usePluginRuntimeManager().reconcileWorker(user.id, cloned.id, cloned.containerId);
   } catch (err) {
     await useContainerManager().remove(cloned.id).catch(() => {});
     throw err;
   }
   setResponseStatus(event, 201);
-  return { ...cloned, missingSecrets };
+  return { ...cloned, missingSecrets: [...new Set(missingSecrets)].sort() };
 });

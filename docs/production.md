@@ -18,6 +18,16 @@ Automatic image update detection and per-image or bulk updates for production de
 
 **No version numbers** — only image digest hashes (sha256) are compared and displayed. Workers are NOT automatically restarted; they pick up the new image when next created or unarchived.
 
+### Context-safe upgrade checklist
+
+1. Preserve the orchestrator data directory and its backup/configuration keys, then create or verify an encrypted backup for any worker that needs an independent recovery point. A normal rebuild already preserves that worker's `/workspace`, per-worker agent configuration/history, and DinD volumes.
+2. Pull and recreate the orchestrator. Wait for `/api/health` and the dashboard to recover before changing workers.
+3. Pull the current worker image. Existing ordinary workers continue using their pinned image until they are explicitly rebuilt; new workers use the pulled image.
+4. Rebuild ordinary workers that need new image-level files. Rebuild global and group administrative workspaces explicitly when they must inherit the new worker base/administrative overlay. Rebuilds replace disposable compute only and retain their workspace and agent-data volumes.
+5. Verify the worker shell, agent session/history, Apps pane, and management MCP appropriate to its role. Do not delete a worker as part of an upgrade: permanent deletion removes its persistent volumes.
+
+Default encrypted backups contain `/workspace` plus credential-filtered per-worker agent data and restore that context into a new worker. OAuth credentials and shared per-user Kilo config/data remain outside the default artifact. If disaster recovery must include Kilo's shared history/configuration, explicitly select `/home/agent/.agent-data/.kilo/shared-data` and `/home/agent/.agent-data/.kilo/config`; those deliberately sensitive paths are encrypted and can be restored only through the new-worker flow. Keep the exact `BACKUP_ENCRYPTION_KEY` available independently of the backup provider.
+
 ## Agent Usage Monitoring
 
 Polls agent usage APIs to show each user's remaining capacity in the sidebar. Works for OAuth-authenticated agents (per-user credential files at `<DATA_DIR>/users/<userId>/credentials/{claude,codex,gemini}.json` for the three polled agents, or the per-user `CLAUDE_CODE_OAUTH_TOKEN` set in the Account modal). API key auth has no usage endpoints. **Kilo is a fourth Account credential/reset row** (its shared per-user auth now lives at `<DATA_DIR>/users/<userId>/kilo/data/auth.json`, directory-bound into every worker because Kilo atomically temp+renames `auth.json`), but it has **no usage-monitoring endpoint** and is not polled by `UsageChecker` — usage monitoring covers only Claude, Codex, and Gemini.

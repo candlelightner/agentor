@@ -8,6 +8,8 @@ import {
 } from "./git-image-crypto";
 import {
   GIT_IMAGE_CATALOG_FORMAT,
+  GIT_IMAGE_CATALOG_PATH,
+  LEGACY_GIT_IMAGE_CATALOG_PATH,
   hashDefinition,
   parseCatalog as parseCatalogUnsafe,
   serializeCatalog,
@@ -28,6 +30,13 @@ import {
   type GitImageRecovery,
 } from "./git-image-store";
 import { withOwnerLifecycleMutation } from "./worker-lifecycle-coordinator";
+import type { PluginDefinitionStore } from "./plugin-definition-store";
+import {
+  GIT_PLUGIN_CATALOG_PATH,
+  parsePluginCatalog,
+  serializePluginCatalog,
+} from "./git-plugin-format";
+import { useWorkerGroupStore } from "./services";
 
 function fail(statusCode: number, message: string): never {
   throw Object.assign(new Error(message), { statusCode });
@@ -41,7 +50,7 @@ function parseCatalog(files: GitFileMap) {
     );
     if (
       bytes > 350 * 1024 * 1024 ||
-      Buffer.byteLength(files[".agentor/image-catalog.v1.json"] || "") >
+      Buffer.byteLength(files[GIT_IMAGE_CATALOG_PATH] || files[LEGACY_GIT_IMAGE_CATALOG_PATH] || "") >
         1024 * 1024
     )
       fail(400, "Remote image catalog exceeds import limits");
@@ -62,7 +71,7 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 function canonicalCatalogFile(path: string, value: string) {
-  if (path !== ".agentor/image-catalog.v1.json") return value;
+  if (path !== GIT_IMAGE_CATALOG_PATH && path !== LEGACY_GIT_IMAGE_CATALOG_PATH && path !== GIT_PLUGIN_CATALOG_PATH) return value;
   const manifest = JSON.parse(value);
   // generatedAt is intentionally nondeterministic and does not describe
   // catalog content. Every other field remains part of reconciliation.
@@ -144,6 +153,8 @@ export class GitImageCatalogManager {
     private store = new GitImageStore(),
     private ownerExists: (ownerId: string) => boolean | Promise<boolean> = () =>
       true,
+    private groupExists: (ownerId: string, groupId: string) =>
+      boolean | Promise<boolean> = () => true,
   ) {}
 
   private withOwner<T>(
@@ -352,7 +363,7 @@ export class GitImageCatalogManager {
     };
     return new GitHubRestProvider(token);
   }
-  async sync(ownerId: string, catalog: ImageCatalogManager, input: any = {}) {
+  async sync(ownerId: string, catalog: ImageCatalogManager, input: any = {}, plugins?: PluginDefinitionStore) {
     return this.withOwner(ownerId, async () => {
       const working = await this.store.read(() => {
         const connection = structuredClone(this.get(ownerId));
@@ -362,7 +373,7 @@ export class GitImageCatalogManager {
           recovery: structuredClone(this.store.state.recovery[ownerId]),
         };
       });
-      const result = await this.syncUnlocked(ownerId, catalog, input, working);
+      const result = await this.syncUnlocked(ownerId, catalog, input, working, plugins);
       await this.store.transaction(() => {
         const live = this.get(ownerId);
         if (live.id !== working.connection.id)
@@ -391,6 +402,7 @@ export class GitImageCatalogManager {
       links: GitImageLink[];
       recovery?: GitImageRecovery;
     },
+    plugins?: PluginDefinitionStore,
   ) {
     const connection = working.connection,
       direction = input.direction === "pull" ? "pull" : "push",
@@ -408,6 +420,38 @@ export class GitImageCatalogManager {
       imported: string[] = [];
     if (direction === "pull") {
       const entries = parseCatalog(remote.files);
+      const importedPlugins: string[] = [];
+      if (plugins && remote.files[GIT_PLUGIN_CATALOG_PATH]) {
+        const remotePlugins = parsePluginCatalog(remote.files);
+        const localPlugins = plugins.listForOwner(ownerId).filter((item) => !item.builtIn && item.userId === ownerId);
+        for (const entry of remotePlugins) {
+          // Preserve the reusable definition's visibility boundary. In
+          // particular, recovering a group definition as owner-wide would
+          // silently broaden it to sibling groups. Worker/platform entries
+          // are not emitted by our serializer and fail closed if supplied by
+          // a foreign repository.
+          if (entry.scope !== "owner" && entry.scope !== "group")
+            fail(400, "Remote plugin catalog contains an unsupported scope");
+          // Group IDs are owner-scoped local identities. A Git catalog cannot
+          // safely transfer one unless that exact group belongs to the owner
+          // importing it; otherwise it would create an unreachable or foreign
+          // scoped definition.
+          if (entry.scope === "group" &&
+            (!entry.groupId || !(await this.groupExists(ownerId, entry.groupId))))
+            fail(400, "Remote plugin catalog contains an unknown group");
+          if (localPlugins.some((item) => item.definitionHash === entry.definitionHash)) continue;
+          const created = await plugins.create({
+            scope: entry.scope,
+            ownerId,
+            ...(entry.scope === "group"
+              ? { groupId: entry.groupId }
+              : {}),
+            manifest: entry.manifest,
+          });
+          importedPlugins.push(created.id);
+          localPlugins.push(created);
+        }
+      }
       for (const entry of entries) {
         const link = links.find((x) => x.remoteId === entry.remoteId),
           localDefinition = link
@@ -541,6 +585,7 @@ export class GitImageCatalogManager {
         direction,
         revision: remote.revision,
         imported,
+        importedPlugins,
         conflicts,
         recovery: working.recovery,
       };
@@ -555,6 +600,14 @@ export class GitImageCatalogManager {
       publishGhcr: connection.publishGhcr,
       ghcrByDigest: input.ghcrByDigest,
     });
+    if (plugins)
+      Object.assign(
+        files,
+        serializePluginCatalog(
+          plugins.listForOwner(ownerId).filter((item) =>
+            !item.builtIn && item.userId === ownerId && item.scope !== "worker"),
+        ),
+      );
     if (connection.auth.type === "pat") {
       const credential = await decryptGitImageCredential(
         connection.auth.token,
@@ -789,5 +842,7 @@ export function useGitImageCatalogManager() {
   return (singleton ??= new GitImageCatalogManager(
     undefined,
     (ownerId) => getUserById(ownerId) !== null,
+    (ownerId, groupId) =>
+      useWorkerGroupStore().get(ownerId, groupId) !== undefined,
   ));
 }

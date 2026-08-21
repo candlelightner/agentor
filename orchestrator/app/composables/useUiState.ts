@@ -9,6 +9,7 @@ const VALID_TAB_TYPES: ReadonlySet<TabType> = new Set<TabType>([
   'apps',
   'editor',
   'logs',
+  'plugin',
 ]);
 
 function isLeafShape(node: unknown): node is PaneLeafNode {
@@ -21,7 +22,23 @@ function sanitizeTab(raw: unknown): Tab | null {
   if (typeof t.id !== 'string' || typeof t.containerId !== 'string') return null;
   if (typeof t.containerName !== 'string') return null;
   if (typeof t.type !== 'string' || !VALID_TAB_TYPES.has(t.type as TabType)) return null;
-  return { id: t.id, containerId: t.containerId, containerName: t.containerName, type: t.type as TabType };
+  const type = t.type as TabType;
+  if (type === 'plugin') {
+    if (typeof t.pluginInstallationId !== 'string' || !t.pluginInstallationId ||
+        typeof t.pluginActionId !== 'string' || !t.pluginActionId ||
+        typeof t.pluginName !== 'string' || !t.pluginName) return null;
+  }
+  return {
+    id: t.id,
+    containerId: t.containerId,
+    containerName: t.containerName,
+    type,
+    ...(type === 'plugin' ? {
+      pluginInstallationId: t.pluginInstallationId,
+      pluginActionId: t.pluginActionId,
+      pluginName: t.pluginName,
+    } : {}),
+  };
 }
 
 function sanitizeNode(raw: unknown): PaneNode | null {

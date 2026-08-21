@@ -225,6 +225,53 @@ test.describe.serial("Custom worker image builder and catalog", () => {
       },
     });
     expect(secretRef.status()).toBe(400);
+    const secretMetadata = await ownerCtx.post(
+      "/api/image-catalog/definitions",
+      {
+        data: {
+          name: `metadata-${Date.now()}`,
+          description: `TOKEN=${SECRET}`,
+          baseImage: "agentor-worker:approved-test",
+          dockerfileFragment: "RUN true",
+          contextFiles: [],
+        },
+      },
+    );
+    expect(secretMetadata.status()).toBe(400);
+  });
+
+  test("structured provisioning renders packages, commands, and context scripts without retaining secrets", async () => {
+    const response = await ownerCtx.post("/api/image-catalog/definitions", {
+      data: {
+        name: `structured-${Date.now()}`,
+        baseImage: "agentor-worker:approved-test",
+        dockerfileFragment: "",
+        contextFiles: [{ path: "setup.sh", contentBase64: Buffer.from("echo configured").toString("base64"), role: "script", destination: "/opt/agentor-context/setup.sh" }],
+        provisioning: [
+          { type: "packages", manager: "apt", packages: ["jq=1.7.1-3"] },
+          { type: "command", command: "mkdir -p /opt/example" },
+          { type: "script", path: "setup.sh", interpreter: "bash" },
+        ],
+      },
+    });
+    expect(response.status()).toBe(201);
+    expect(await response.json()).toMatchObject({
+      provisioning: expect.arrayContaining([expect.objectContaining({ type: "packages" }), expect.objectContaining({ type: "script", path: "setup.sh" })]),
+      contextFiles: [expect.objectContaining({ role: "script", destination: "/opt/agentor-context/setup.sh" })],
+    });
+    const runtimeTemplate = await ownerCtx.post("/api/image-catalog/definitions", { data: { name: `template-${Date.now()}`, baseImage: "agentor-worker:approved-test", dockerfileFragment: "", provisioning: [], contextFiles: [{ path: "launch.sh", contentBase64: Buffer.from("echo $TAVILY_API_KEY").toString("base64") }] } });
+    expect(runtimeTemplate.status()).toBe(201);
+    for (const definition of [
+      { provisioning: [{ type: "command", command: `echo ${SECRET}` }], contextFiles: [] },
+      { provisioning: [{ type: "command", command: "echo ok\nUSER root" }], contextFiles: [] },
+      { provisioning: [], contextFiles: [{ path: "secret.txt", contentBase64: Buffer.from(`TOKEN=${SECRET}`).toString("base64") }] },
+      { provisioning: [], contextFiles: [{ path: "key.pem", contentBase64: Buffer.from("-----BEGIN PRIVATE KEY-----\nabc").toString("base64") }] },
+      { provisioning: [], contextFiles: [{ path: "escape.txt", contentBase64: "eA==", destination: "/opt/agentor-context/../escape.txt" }] },
+      { provisioning: [{ type: "packages", manager: "apt", packages: ["--allow-unauthenticated"] }], contextFiles: [] },
+    ]) {
+      const rejected = await ownerCtx.post("/api/image-catalog/definitions", { data: { name: `structured-reject-${Math.random()}`, baseImage: "agentor-worker:approved-test", dockerfileFragment: "", ...definition } });
+      expect(rejected.status()).toBe(400);
+    }
   });
 
   test("asynchronous build exposes phases and redacted live logs then records immutable digest and version", async () => {

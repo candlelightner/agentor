@@ -46,6 +46,7 @@ All agents are installed in a single unified worker image. Start any agent via i
 - **Controlled custom images** — approved-base Dockerfile fragments and bounded uploaded contexts build asynchronously into immutable digest-pinned catalog versions with test workers, promotion/rollback, defaults, usage cleanup, and worker selection
 - **Git-backed image recovery** — optional public/private GitHub catalog sync with conflict preservation, fine-grained PAT or short-lived GitHub App authentication, branch/PR workflows, Actions dispatch, and immutable GHCR recovery references
 - **Administrative workspace and internal MCP** — a persistent red `ADMIN / ORCHESTRATOR` terminal/editor/desktop workspace, isolated management network, Codex auto-discovery with rotating short-lived workload identity, live fail-closed tool policy, audited calls, worker-console access, and optional dashboard review of immutable configuration proposals
+- **Worker plugin catalog** — scoped, versioned declarative plugins with bounded command/resource manifests, authenticated sandboxed private panes, per-worker lifecycle control, and a narrow worker-self MCP interface; see [Worker plugins](docs/plugins.md)
 - **Centralized logging** — collects logs from all containers (orchestrator, workers, traefik) with NDJSON storage, log rotation, and a live-streaming log viewer in the dashboard
 - **Theme toggle** — switch between system default, light, and dark mode
 - **API docs** — auto-generated OpenAPI 3.1.0 spec with interactive Scalar UI at `/api/docs`

@@ -2,8 +2,20 @@ import { test, expect } from '@playwright/test';
 import { ApiClient } from '../helpers/api-client';
 import { createWorker, cleanupWorker, uniquePort } from '../helpers/worker-lifecycle';
 import { TerminalWsClient } from '../helpers/terminal-ws';
+import { gunzipSync } from 'node:zlib';
 
 const ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL_INSIDE_NETWORK || 'http://agentor-orchestrator:3000';
+
+function pluginManifest(suffix: string) {
+  return {
+    schemaVersion: 1,
+    name: `Worker plugin ${suffix}`,
+    slug: `worker-plugin-${suffix.toLowerCase()}`,
+    description: 'Worker-self MCP mutation coverage.',
+    version: '1.0.0',
+    lifecycle: { start: { argv: ['true'] } },
+  };
+}
 
 /**
  * Run a single curl from inside the worker's tmux shell and return the body.
@@ -14,10 +26,10 @@ const ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL_INSIDE_NETWORK || 'http://
  * pty. We avoid every one of those by:
  *  1. Splitting the marker across two shell variables so the literal marker
  *     only exists in the actual output stream, never in the echoed command.
- *  2. Writing the body to a temp file and base64-encoding it inline. The
- *     output is two stable `KEY=VALUE` lines (`STATUS=...` and `BODY_B64=...`)
- *     plus a sentinel `END_TOKEN`, which is trivial to grep regardless of what
- *     the response body contains.
+ *  2. Writing the body to a temp file, compressing it, and base64-encoding the
+ *     result inline. Compression keeps large MCP responses within tmux's
+ *     scrollback; the explicit begin/end markers remain easy to parse
+ *     regardless of what the response body contains.
  */
 async function curlInside(ws: TerminalWsClient, path: string, opts: { method?: string; data?: unknown } = {}): Promise<{ status: number; body: string }> {
   const tag = `M${Math.random().toString(36).slice(2, 10)}`;
@@ -32,7 +44,7 @@ async function curlInside(ws: TerminalWsClient, path: string, opts: { method?: s
     `EA='${endA}'; EB='${endB}'; ` +
     `curl -sS -o ${tmp} -w '%{http_code}' -H 'Content-Type: application/json' ${methodFlag} ${dataFlag} '${ORCHESTRATOR_URL}${path}' > ${tmp}.code; ` +
     `echo STATUS=$(cat ${tmp}.code); ` +
-    `echo BODY_B64=$(base64 -w0 < ${tmp}); ` +
+    `echo BODY_B64_BEGIN; gzip -c < ${tmp} | base64 -w76; echo BODY_B64_END; ` +
     `printf '%s%s\\n' "$EA" "$EB"; ` +
     `rm -f ${tmp} ${tmp}.code`;
 
@@ -48,14 +60,20 @@ async function curlInside(ws: TerminalWsClient, path: string, opts: { method?: s
   // (the echoed command line never starts with these tokens at column 0, but
   // taking the last match is robust against any future terminal weirdness).
   const head = buf.slice(0, endIdx);
-  const statusMatches = [...head.matchAll(/^STATUS=(\d+)\s*$/gm)];
-  const bodyMatches = [...head.matchAll(/^BODY_B64=([A-Za-z0-9+/=]*)\s*$/gm)];
-  if (statusMatches.length === 0 || bodyMatches.length === 0) {
+  const statusMatches = [...head.matchAll(/STATUS=(\d+)/g)];
+  const bodyStart = head.lastIndexOf("BODY_B64_BEGIN");
+  const bodyEnd = head.lastIndexOf("BODY_B64_END");
+  if (statusMatches.length === 0 || bodyStart === -1 || bodyEnd <= bodyStart) {
     throw new Error(`curlInside could not parse output. Buffer (last 1500 chars):\n${buf.slice(-1500)}`);
   }
   const status = parseInt(statusMatches[statusMatches.length - 1][1], 10);
-  const b64 = bodyMatches[bodyMatches.length - 1][1];
-  const body = b64 ? Buffer.from(b64, 'base64').toString('utf-8') : '';
+  const b64 = head
+    .slice(bodyStart + "BODY_B64_BEGIN".length, bodyEnd)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^[A-Za-z0-9+/=]+$/.test(line))
+    .join("");
+  const body = b64 ? gunzipSync(Buffer.from(b64, 'base64')).toString('utf-8') : '';
   return { status, body };
 }
 
@@ -109,6 +127,48 @@ test.describe.serial('Worker-self API', () => {
     // does not resolve to any managed worker.
     const res = await request.get('/api/worker-self/info');
     expect(res.status()).toBe(401);
+  });
+
+  test('worker-self MCP mutates only its own plugin definitions and installations', async () => {
+    const ws = new TerminalWsClient(containerId);
+    const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    let definitionId = '';
+    let installationId = '';
+    const call = async (name: string, args: Record<string, unknown> = {}) => {
+      const response = await curlInside(ws, '/api/worker-self/mcp', {
+        method: 'POST',
+        data: { jsonrpc: '2.0', id: `${name}-${Math.random()}`, method: 'tools/call', params: { name, arguments: args } },
+      });
+      expect(response.status).toBe(200);
+      return JSON.parse(response.body).result;
+    };
+    try {
+      await ws.connect();
+      await ws.waitForOutput(/[\$#>]\s*$/, 15_000);
+      const created = await call('plugins.definitions.create', { manifest: pluginManifest(suffix) });
+      definitionId = created.structuredContent.id;
+      expect(created).toMatchObject({ isError: false, structuredContent: { scope: 'worker', workerId } });
+
+      const updatedManifest = { ...pluginManifest(`${suffix}-updated`), name: `Worker plugin ${suffix} updated` };
+      const updated = await call('plugins.definitions.update', { definitionId, manifest: updatedManifest });
+      expect(updated.structuredContent).toMatchObject({ id: definitionId, name: updatedManifest.name });
+
+      const installed = await call('plugins.install', { definitionId, enabled: false });
+      installationId = installed.structuredContent.id;
+      expect(installed.structuredContent).toMatchObject({ definitionId, workerId, desiredEnabled: false });
+      expect((await call('plugins.set-enabled', { installationId, enabled: false })).structuredContent).toMatchObject({ id: installationId, desiredEnabled: false });
+
+      const blockedDelete = await call('plugins.definitions.delete', { definitionId });
+      expect(blockedDelete).toMatchObject({ isError: true, structuredContent: { error: { statusCode: 409 } } });
+      expect((await call('plugins.uninstall', { installationId })).structuredContent).toEqual({ ok: true });
+      installationId = '';
+      expect((await call('plugins.definitions.delete', { definitionId })).structuredContent).toEqual({ ok: true });
+      definitionId = '';
+    } finally {
+      if (installationId) await call('plugins.uninstall', { installationId }).catch(() => {});
+      if (definitionId) await call('plugins.definitions.delete', { definitionId }).catch(() => {});
+      ws.close();
+    }
   });
 
   test('POST /api/worker-self/port-mappings creates a mapping owned by the calling worker', async ({ request }) => {

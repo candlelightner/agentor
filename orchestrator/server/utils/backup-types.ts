@@ -6,6 +6,9 @@ export interface BackupConfig {
   /** Exact schedule interval. `intervalHours` remains readable for v1 data. */
   intervalMinutes: number; intervalHours?: number; retentionCount: number; selectedWorkspaceIds: string[] | null;
   createdAt: string; updatedAt: string; nextRunAt?: string | null;
+  /** Optional, explicit absolute paths per worker. Omission preserves the
+   * legacy portable payload (/workspace plus filtered agent data). */
+  selectedPathsByWorkspace?: Record<string, string[]>;
   lastAttemptAt?: string; lastSuccessAt?: string; lastError?: string; consecutiveFailures?: number;
   google?: { clientId?: string; redirectUri?: string; token?: unknown; oauthPending?: { stateHash: string; expiresAt: number } };
 }
@@ -31,6 +34,7 @@ export interface BackupJob {
   /** Restore display name is retained so an interrupted restore can retry safely. */
   displayName?: string;
   missingSecrets?: Array<{name:string;type:string}>;
+  selectedPathsByWorkspace?: Record<string, string[]>;
 }
 export interface BackupArtifact {
   schemaVersion: 1; id: string; userId: string; workspaceId: string; provider: BackupProviderKind;
@@ -39,4 +43,5 @@ export interface BackupArtifact {
   workspaceIds?: string[];
   deletionPending?: boolean;
   deletionErrorAt?: string;
+  selectedPathsByWorkspace?: Record<string, string[]>;
 }

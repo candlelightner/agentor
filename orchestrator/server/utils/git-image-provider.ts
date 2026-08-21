@@ -303,7 +303,10 @@ export class GitHubRestProvider implements GitImageProvider {
       if (
         item.type !== "blob" ||
         (!item.path.startsWith("images/") &&
-          item.path !== ".agentor/image-catalog.v1.json")
+          !item.path.startsWith("plugins/") &&
+          item.path !== ".agentor/image-catalog.v1.json" &&
+          item.path !== ".agentor/image-catalog.v2.json" &&
+          item.path !== ".agentor/plugin-catalog.v1.json")
       )
         continue;
       if (

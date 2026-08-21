@@ -20,6 +20,7 @@ export interface BackupSettings {
   enabled: boolean;
   selection: "all" | "selected";
   workspaceIds: string[];
+  selectedPathsByWorkspace: Record<string, string[]>;
   intervalMinutes: number;
   retentionCount: number;
   nextRunAt: string | null;
@@ -71,7 +72,8 @@ export function useBackups() {
     providerId: "local",
     enabled: false,
     selection: "all",
-    workspaceIds: [],
+  workspaceIds: [],
+    selectedPathsByWorkspace: {},
     intervalMinutes: 1440,
     retentionCount: 7,
     nextRunAt: null,
@@ -137,10 +139,11 @@ export function useBackups() {
   async function startBackup(
     selection = settings.value.selection,
     workspaceIds = settings.value.workspaceIds,
+    selectedPathsByWorkspace = settings.value.selectedPathsByWorkspace,
   ) {
     const job = await $fetch<BackupJob>("/api/backups", {
       method: "POST",
-      body: { selection, workspaceIds, providerId: settings.value.providerId },
+      body: { selection, workspaceIds, providerId: settings.value.providerId, selectedPathsByWorkspace },
     });
     jobs.value.unshift(job);
     schedule();

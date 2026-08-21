@@ -20,6 +20,7 @@ const typeIcons: Record<string, string> = {
   apps: 'i-lucide-layout-grid',
   editor: 'i-lucide-code',
   logs: 'i-lucide-scroll-text',
+  plugin: 'i-lucide-puzzle',
 };
 
 const typeLabels: Record<string, string> = {
@@ -28,6 +29,7 @@ const typeLabels: Record<string, string> = {
   apps: 'Apps',
   editor: 'Editor',
   logs: 'Logs',
+  plugin: 'Plugin',
 };
 
 const dropInsertIndex = ref<number | null>(null);
@@ -124,7 +126,7 @@ const insertIndicatorLeft = computed(() => {
       @mousedown="onMiddleClick($event, tab.id)"
     >
       <UIcon :name="typeIcons[tab.type] ?? 'i-lucide-file'" class="size-3.5 shrink-0" />
-      <span class="truncate max-w-[140px]">{{ tab.type === 'logs' ? 'Logs' : `${tab.containerName} - ${typeLabels[tab.type] ?? tab.type}` }}</span>
+      <span class="truncate max-w-[140px]">{{ tab.type === 'logs' ? 'Logs' : `${tab.containerName} - ${tab.type === 'plugin' ? (tab.pluginName || 'Plugin') : (typeLabels[tab.type] ?? tab.type)}` }}</span>
       <button
         class="ml-1 w-4 h-4 flex items-center justify-center rounded opacity-0 group-hover:opacity-100 transition-opacity shrink-0 pane-tab-close"
         :class="tab.id === group.activeTabId ? 'opacity-60' : ''"

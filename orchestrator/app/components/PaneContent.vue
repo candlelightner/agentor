@@ -60,6 +60,13 @@ watch(() => props.group.tabs, (tabs) => {
         <LogPane
           v-else-if="tab.type === 'logs'"
         />
+        <PluginPane
+          v-else-if="tab.type === 'plugin' && tab.pluginInstallationId && tab.pluginActionId"
+          :container-id="tab.containerId"
+          :installation-id="tab.pluginInstallationId"
+          :action-id="tab.pluginActionId"
+          :label="tab.pluginName || 'Plugin'"
+        />
       </div>
     </template>
     <TerminalPlaceholder v-if="!group.tabs.length" />

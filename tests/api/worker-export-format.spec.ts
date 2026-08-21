@@ -3,9 +3,9 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
-import { BUNDLE_FILES, extractBundle, validateGzipTarPayload, validateTarPayload, WORKER_EXPORT_VERSION } from '../../orchestrator/server/utils/worker-export';
+import { BUNDLE_FILES, extractBackupPathArchives, extractBundle, sanitizeBackupPathTarPayload, validateBackupPathTarPayload, validateGzipTarPayload, validateTarPayload, WORKER_EXPORT_VERSION } from '../../orchestrator/server/utils/worker-export';
 
-type Entry = { name: string; body: Buffer };
+type Entry = { name: string; body: Buffer; type?: string; linkname?: string };
 
 async function tarBuffer(entries: Entry[]): Promise<Buffer> {
   const chunks: Buffer[] = [];
@@ -18,7 +18,8 @@ async function tarBuffer(entries: Entry[]): Promise<Buffer> {
     header.write(`${entry.body.length.toString(8).padStart(11, '0')}\0`, 124, 12, 'ascii');
     header.write('00000000000\0', 136, 12, 'ascii');
     header.fill(0x20, 148, 156);
-    header[156] = '0'.charCodeAt(0);
+    header[156] = (entry.type ?? '0').charCodeAt(0);
+    if (entry.linkname) header.write(entry.linkname, 157, 100, 'utf8');
     header.write('ustar\0', 257, 6, 'ascii');
     header.write('00', 263, 2, 'ascii');
     const checksum = header.reduce((sum, byte) => sum + byte, 0);
@@ -110,6 +111,72 @@ test.describe('Worker export root filesystem format compatibility', () => {
       const payload = join(directory, 'rootfs.tar');
       await writeFile(payload, await tarBuffer([{ name: '../outside', body: Buffer.from('no') }]));
       await expect(validateTarPayload(payload)).rejects.toThrow('unsafe path');
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('explicit backup path archives retain safe links, omit special entries, and reject write-through links', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentor-backup-path-unsafe-'));
+    try {
+      const safe = join(directory, 'safe.tar'), output = join(directory, 'safe-output.tar');
+      await writeFile(safe, await tarBuffer([
+        { name: 'bin', body: Buffer.alloc(0), type: '2', linkname: 'usr/bin' },
+        { name: 'usr', body: Buffer.alloc(0), type: '5' },
+        { name: 'usr/bin', body: Buffer.alloc(0), type: '5' },
+        { name: 'usr/bin/tool', body: Buffer.from('ok') },
+        { name: 'device', body: Buffer.alloc(0), type: '3' },
+        { name: 'pipe', body: Buffer.alloc(0), type: '6' },
+      ]));
+      await expect(sanitizeBackupPathTarPayload(safe, output, '/')).resolves.toEqual({ omittedSpecialEntries: 2 });
+      const sanitized = await (await import('node:fs/promises')).readFile(output);
+      expect(sanitized.includes(Buffer.from('usr/bin'))).toBe(true);
+      expect(sanitized.includes(Buffer.from('device'))).toBe(false);
+
+      for (const [index, entries] of [
+        [{ name: 'dir/link', body: Buffer.alloc(0), type: '2', linkname: '../target' }, { name: 'dir/link/child', body: Buffer.from('x') }],
+        [{ name: 'dir/child', body: Buffer.from('x') }, { name: 'dir', body: Buffer.alloc(0), type: '2', linkname: '../target' }],
+        [{ name: 'one', body: Buffer.from('x') }, { name: 'two', body: Buffer.alloc(0), type: '1', linkname: '../outside' }],
+        [{ name: '../escape', body: Buffer.from('x') }],
+        [{ name: 'same', body: Buffer.from('x') }, { name: 'same', body: Buffer.from('y') }],
+      ].entries()) {
+        const payload = join(directory, `${index}.tar`);
+        await writeFile(payload, await tarBuffer(entries));
+        await expect(sanitizeBackupPathTarPayload(payload, `${payload}.out`, '/')).rejects.toThrow();
+      }
+      // Retain the old validator for legacy callers: it remains deliberately
+      // strict; new backup paths use the sanitizer above.
+      await expect(validateBackupPathTarPayload(safe)).rejects.toThrow('unsafe entry');
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('explicit backup path archives retain Docker wrappers, settle malformed gzip, and observe aborts', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentor-backup-path-boundaries-'));
+    try {
+      const selected = '/home/agent/.agent-data';
+      const valid = join(directory, 'valid.tar');
+      await writeFile(valid, await tarBuffer([
+        { name: '.agent-data', body: Buffer.alloc(0), type: '5' },
+        { name: '.agent-data/state.json', body: Buffer.from('{}') },
+      ]));
+      await expect(sanitizeBackupPathTarPayload(valid, `${valid}.out`, selected)).resolves.toEqual({ omittedSpecialEntries: 0 });
+
+      const sibling = join(directory, 'sibling.tar');
+      await writeFile(sibling, await tarBuffer([
+        { name: '.ssh', body: Buffer.alloc(0), type: '5' },
+        { name: '.ssh/authorized_keys', body: Buffer.from('attacker') },
+      ]));
+      await expect(sanitizeBackupPathTarPayload(sibling, `${sibling}.out`, selected)).rejects.toThrow('outside the selected path');
+
+      const controller = new AbortController();
+      controller.abort();
+      await expect(sanitizeBackupPathTarPayload(valid, `${valid}.aborted`, selected, controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+
+      const malformed = join(directory, 'malformed.tar.gz');
+      await writeFile(malformed, Buffer.from('not a gzip stream'));
+      await expect(extractBackupPathArchives(malformed, join(directory, 'extracted'), [{ path: selected, archive: 'paths/0.tar' }])).rejects.toThrow();
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

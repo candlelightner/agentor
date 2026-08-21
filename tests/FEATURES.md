@@ -671,6 +671,14 @@ Every pane type supports **multiple simultaneous instances**. Clicking the Termi
 - It is **not auto-started** — the operator starts it explicitly from the Apps pane (singleton `Start` button shown when no instance is running, Stop lives on the row once running).
 - Persistent VS Code continues to use noVNC and now benefits from the keyboard-transparent clipboard paste bridge (§20b): because a successful Start auto-opens the Desktop pane (which loads `agentor.html`), host-clipboard images/text reach the in-desktop VS Code via the same X11 CLIPBOARD sync + key replay.
 
+### 19.5 Plugins
+- The Apps area exposes a **Plugins** catalog for creating and editing declarative plugin definitions, inspecting installations for the selected worker, installing them disabled or enabled, changing desired state, and removing them.
+- Definitions use schema version 1 and are scoped to platform, owner, group, or worker. Visibility follows owner and live group hierarchy; platform definitions require an administrator, and out-of-scope definitions cannot be installed by ID.
+- A definition contains only validated argv-based lifecycle commands (install/start/readiness/stop/cleanup), declared resources, named environment/secret references, optional documentation/agent skill text, sanitized SVG, and optional private UI actions. Literal secret-like material, shell snippets, unsafe paths, active SVG, undeclared references, and unbounded command/output settings are rejected.
+- The worker image provisions the `plugin-runner` at build time. The orchestrator sends it a bounded control document over Docker exec; it resolves only declared values already present in that worker and records background-process state in persistent agent data. Plugin authors receive neither the Docker socket nor orchestrator credentials.
+- Runtime reconciliation is serialized per worker and generation-aware: create/start/restart/rebuild reconcile desired installations, a new container generation never reuses old ready state, and lifecycle output/status are bounded. Enable runs install/start/readiness after reserving declared ports/display resources; disable runs stop; removal runs stop/cleanup and releases resources.
+- Private UI actions are authenticated, worker-scoped, sandboxed dashboard panes proxied only to a declared plugin port/path. They do not create a public port or Traefik mapping.
+
 ---
 
 ## 20. Workspace Upload/Download (quick actions)
@@ -1098,6 +1106,8 @@ The port-mapping / domain-mapping / usage routes additionally **enforce the call
 | `GET`  | `/api/worker-self/usage` | Usage status scoped to the worker's owning userId |
 | `POST` | `/api/worker-self/usage/refresh` | Force-refresh for the same userId |
 
+`POST /api/worker-self/mcp` is a separate narrow JSON-RPC MCP endpoint for the calling worker's installed plugins. It derives identity solely from the Docker-network source IP, implements initialization plus `tools/list` and `tools/call`, cannot target another worker, and returns bounded sanitized structured errors.
+
 The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/api/usage` routes still exist for the dashboard UI but are unreachable from inside a worker (no session cookie). All worker-side built-in capabilities reference the `/api/worker-self/*` form exclusively.
 
 ---
@@ -1155,6 +1165,7 @@ The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/ap
 
 - Worker-local variables, masked secrets, and secret files follow orchestrator → user → environment → worker precedence. Secrets are encrypted at rest, delivered over exec stdin, and materialized in tmpfs without entering Docker Env, exports, clones, backups, logs, or API responses.
 - Backups support manual/all/selected exact-minute schedules, durable next-run state, multi-workspace encrypted bundles, retention deletion tombstones, progress, cancellation, same-ciphertext resumable retry, integrity verification, archived workspaces, rollback-clean new restores, and stopped-original staged restore. Each member contains `/workspace`, credential-filtered persistent agent data, non-secret worker/environment metadata and mappings, and missing-secret names; rootfs/images, DinD, secret/env values, OAuth credentials, and shared Kilo account data are excluded. A multi-workspace artifact can be restored as a validated exact workspace subset or, when no subset is requested, in full; old artifacts remain restorable. In-place restore is limited to one selected stopped artifact workspace, while selected new restores create only the selected workers. Durable and legacy synchronous restores share the bounded restore/backup admission queue, and concurrent retries of one failed job admit only one new attempt. Every queued or running restore owns an independent source-artifact pin against explicit or retention deletion; cancelling queued work removes it from admission and releases only its pin even if durable status persistence fails, including for an in-place restore that has not begun, while a running in-place commit remains non-cancellable. Provider-object deletion and resumable-upload abort markers survive failed/cancelled jobs and restarts, are retried during startup and scheduler ticks, and clear only after provider acknowledgement plus state persistence. Original restore commits are serialized with worker lifecycle changes, and account cleanup uses a bounded fail-closed restore drain before deleting artifacts or other owner state.
+- A backup may additionally include explicitly selected readable absolute POSIX paths from the worker, including paths outside `/workspace`. The path picker is owner-checked metadata browsing only; it accepts at most 32 normalized selections, removes duplicates and descendants of a selected parent, and keeps the portable workspace/agent defaults. Extra data is represented as named path archives, never made public by browsing.
 - Backup cancellation is a durable absorbing terminal state: a stale admitted
   execution cannot overwrite it with `running`, publish a late artifact, or
   leave failure diagnostics observably behind the terminal job update.
@@ -1164,6 +1175,11 @@ The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/ap
 
 - Custom definitions use approved Agentor bases, constrained Dockerfile fragments, canonical bounded context files, async controlled builds, live redacted logs, cancellation/recovery, immutable image IDs, versions, test workers, promotion/rollback/defaults/rebuild, selection, usage, and cleanup. The open catalog periodically reconciles recent builds and definitions, so builds started through MCP appear while running and their completed version appears without a manual dashboard build or reload. Controlled builds resolve every approved alias (including `approved-default` and `approved-latest`) to a locally verified content digest before generating the Dockerfile, retain the configured alias as catalog intent, record the exact base digest on the build/version, and fail closed if the base cannot be pinned. Docker setup, pull, build, and inspection operations have a bounded configurable deadline (`IMAGE_BUILD_TIMEOUT_MS`, clamped to 1 second–24 hours; 30 minutes by default), so a stalled daemon cannot leave a catalog build pending indefinitely.
 - Optional GitHub recovery defines a versioned credential-free repository format, public/private repos, encrypted fine-grained PATs, GitHub App installation tokens, optimistic conflict-safe direct/branch/PR sync, Actions dispatch, optional immutable GHCR references, metadata recovery, and disconnect erasure. Automatic review branches are content-addressed; after a remote branch/PR/Actions success followed by a local state-commit failure, retry reconciles the matching branch and open PR instead of creating duplicates, and never repeats an already completed non-idempotent Actions dispatch. It is explicitly separate from workspace backups.
+
+#### 26.2.3a Portable plugins
+
+- Worker exports, imports, and clones carry an optional credential-free `plugins.json` snapshot. It includes referenced manifests and desired installation state only; secret values, observed runtime state, process IDs, output, and port/display allocations are excluded. Restore remints definitions as worker-scoped resources and remints installation IDs/allocation state locally, reporting missing secret names without failing an otherwise valid import.
+- Plugin definitions can also use the Git catalog format to round-trip manifests, lifecycle scripts, documentation, and sanitized icons. This is definition portability, not a transfer of installed runtime state or credentials.
 
 #### 26.2.4 Trusted administration and management MCP
 

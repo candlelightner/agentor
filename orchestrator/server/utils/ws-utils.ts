@@ -49,9 +49,10 @@ const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 export function createWsRelayHandlers(
   workerIdPattern: RegExp,
   getTargetWsUrl: (containerName: string, workerId: string, peer: Peer) => string,
+  authorize?: (workerId: string, peer: Peer) => boolean | Promise<boolean>,
 ) {
   return {
-    open(peer: Peer) {
+    async open(peer: Peer) {
       const id = getPeerId(peer);
       const ctx: RelayContext = { bufferedMessages: [], bufferedBytes: 0, closed: false };
       relayContexts.set(id, ctx);
@@ -72,7 +73,7 @@ export function createWsRelayHandlers(
       }
 
       // Authenticate and verify ownership before opening the relay
-      authenticateWsPeer(peer).then((auth) => {
+      authenticateWsPeer(peer).then(async (auth) => {
         if (ctx.closed) return;
         if (!auth) {
           ctx.closed = true;
@@ -81,6 +82,12 @@ export function createWsRelayHandlers(
           return;
         }
         if (auth.user.role !== 'admin' && info.userId !== auth.user.id) {
+          ctx.closed = true;
+          relayContexts.delete(id);
+          try { peer.close(); } catch {}
+          return;
+        }
+        if (authorize && !(await authorize(workerId, peer))) {
           ctx.closed = true;
           relayContexts.delete(id);
           try { peer.close(); } catch {}

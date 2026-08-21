@@ -42,6 +42,23 @@ Optional per-app fields on `list`:
 
 The VS Code tunnel and SSH apps used to be separate features with dedicated UI and API routes; they are now regular apps rendered in the Apps pane via specialised row components (`VsCodeAppRow.vue`, `SshAppRow.vue`).
 
+## Plugins in the Apps area
+
+Plugins are not `APP_REGISTRY` entries: they are separately versioned,
+scope-aware definitions installed into a specific worker. The Apps area opens a
+plugin catalog and per-worker plugin pane for definition management and the
+installation lifecycle. A definition declares bounded argv lifecycle commands,
+resources, named environment/secret references, optional agent guidance, and
+optional private UI actions; it cannot declare a public port mapping.
+
+The worker image ships the constrained plugin runner as part of its build, so
+updating the runner requires the normal worker-image update and worker rebuild
+to reach existing workers. Desired installations reconcile after worker
+create/start/restart/rebuild and are tied to the current container generation.
+Private actions open only through the authenticated sandboxed plugin UI proxy
+to their declared worker port/path. See [Plugins](plugins.md) for the full
+security, lifecycle, backup-path, and portability model.
+
 ## Adding a New App
 
 1. Add an entry to `APP_REGISTRY` in `orchestrator/server/utils/apps.ts`.

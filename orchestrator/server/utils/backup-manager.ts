@@ -1,5 +1,5 @@
-import { createWriteStream } from "node:fs";
-import { lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { lstat, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   randomUUID,
@@ -8,6 +8,8 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { pipeline } from "node:stream/promises";
+import { createGzip } from "node:zlib";
+import * as tar from "tar-stream";
 import { BackupStore } from "./backup-store";
 import {
   LocalBackupProvider,
@@ -37,6 +39,7 @@ import {
   type EncryptedWorkerValue,
 } from "./worker-config-crypto";
 import { packWorkspaceBackups, unpackWorkspaceBackups } from "./backup-bundle";
+import { extraBackupPaths, normalizeBackupPaths } from "./backup-paths";
 import { extractBundle } from "./worker-export";
 import { replaceStoppedWorkspace } from "./backup-restore-helper";
 import { useWorkerProtectionLockStore } from "./worker-protection-lock";
@@ -57,6 +60,7 @@ import {
   SHARED_DATA_EXCLUDE_PREFIXES,
   WORKER_EXPORT_VERSION,
   packBundle,
+  sanitizeBackupPathTarPayload,
   writeFilteredAgentsGz,
   writeGzipFile,
   writeManifest,
@@ -326,6 +330,7 @@ export class BackupManager {
         | "intervalMinutes"
         | "retentionCount"
         | "selectedWorkspaceIds"
+        | "selectedPathsByWorkspace"
       >
     >,
   ) {
@@ -353,6 +358,10 @@ export class BackupManager {
           input.selectedWorkspaceIds === undefined
             ? (old?.selectedWorkspaceIds ?? null)
             : input.selectedWorkspaceIds,
+        selectedPathsByWorkspace:
+          input.selectedPathsByWorkspace === undefined
+            ? old?.selectedPathsByWorkspace
+            : normalizeSelectedPaths(input.selectedPathsByWorkspace),
         createdAt: old?.createdAt ?? now,
         updatedAt: now,
         nextRunAt:
@@ -390,6 +399,7 @@ export class BackupManager {
     providerOverride?: BackupProviderKind,
     attempt = 1,
     resumed = 0,
+    selectedPathsByWorkspace?: Record<string, string[]>,
   ): Promise<BackupJob> {
     await this.init();
     this.assertOwnerAvailable(userId);
@@ -399,6 +409,10 @@ export class BackupManager {
       const w = useContainerManager().get(id) ?? useWorkerStore().findById(id);
       if (!w || w.userId !== userId) throw new Error("Workspace not found");
     }
+    const paths = normalizeSelectedPaths(selectedPathsByWorkspace);
+    for (const id of Object.keys(paths ?? {}))
+      if (!unique.includes(id))
+        throw Object.assign(new Error("Backup paths reference an unselected workspace"), { statusCode: 400 });
     const provider =
       providerOverride ?? this.store.get(userId).config?.provider ?? "local";
     if (provider === "fake" && !this.fakeUsers.has(userId))
@@ -443,6 +457,7 @@ export class BackupManager {
       attempt,
       resumedFromChunk: resumed,
       consistency,
+      ...(paths ? { selectedPathsByWorkspace: paths } : {}),
     };
     await this.store.update(userId, (data) => {
       data.jobs.push(structuredClone(job));
@@ -764,6 +779,8 @@ export class BackupManager {
       throw new Error(
         "Original restore requires selecting exactly one backup workspace",
       );
+    if (target === "original" && extraBackupPaths(artifact.selectedPathsByWorkspace?.[source]).length)
+      throw Object.assign(new Error("Original restore is unavailable for backups containing explicit absolute paths; restore into a new worker"), { statusCode: 409 });
     const jobId = randomUUID();
     const restorePinOwner = this.restorePinOwner(jobId, 1);
     this.pinRestoreArtifact(restorePinOwner, artifact);
@@ -874,6 +891,7 @@ export class BackupManager {
     id: string,
     destination: string,
     signal: AbortSignal,
+    selectedPaths?: string[],
   ) {
     assertSafeUserId(userId);
     const live = useContainerManager().get(id);
@@ -881,9 +899,22 @@ export class BackupManager {
     // longer have a Docker container. Only take the native export path when
     // sync discovered an actual container; archived storage is handled by
     // the hardened read-only helper below.
+    const explicitPaths = extraBackupPaths(selectedPaths);
+    // Omitted selection is the legacy complete portable backup. Once the
+    // operator supplies a selection, exact default roots become ordinary,
+    // deselectable paths while descendants remain explicit archives.
+    const includeWorkspace =
+      selectedPaths === undefined || selectedPaths.includes("/workspace");
+    const includeAgents =
+      selectedPaths === undefined ||
+      selectedPaths.includes("/home/agent/.agent-data");
     if (live?.containerId) {
+      if (explicitPaths.length)
+        await useContainerManager().assertBackupPathsReadable(id, explicitPaths);
       const result = await useContainerManager().exportWorker(id, {
         includeRootfs: false,
+        includeWorkspace,
+        includeAgents,
         signal,
       });
       await pipeline(
@@ -891,8 +922,12 @@ export class BackupManager {
         createWriteStream(destination, { mode: 0o600 }),
         { signal },
       );
+      if (explicitPaths.length)
+        await this.appendExplicitBackupPaths(destination, live.containerId, explicitPaths, signal);
       return;
     }
+    if (explicitPaths.length)
+      throw Object.assign(new Error("Explicit backup paths require a running worker"), { statusCode: 409 });
     const worker = useWorkerStore().findById(id);
     if (!worker || worker.userId !== userId || worker.status !== "archived")
       throw new Error("Workspace is unavailable for offline backup");
@@ -1035,7 +1070,11 @@ export class BackupManager {
               internalPort,
             }),
           ),
-        contents: { rootfs: false, workspace: true, agents: true },
+        contents: {
+          rootfs: false,
+          workspace: includeWorkspace,
+          agents: includeAgents,
+        },
         missingSecrets: (await useWorkerConfigStore().resolveValues(userId, id))
           .filter((entry) => entry.kind !== "variable")
           .map((entry) => entry.key),
@@ -1044,23 +1083,29 @@ export class BackupManager {
         workspacePath = join(temp, BUNDLE_FILES.workspace),
         agentsPath = join(temp, BUNDLE_FILES.agents);
       await writeManifest(manifest, manifestPath);
-      await writeGzipFile(
-        await useDockerService().getArchive(helper.id, EXPORT_WORKSPACE_PATH),
-        workspacePath,
-        signal,
-      );
-      await writeFilteredAgentsGz(
-        await useDockerService().getArchive(helper.id, EXPORT_AGENTS_PATH),
-        agentsPath,
-        CREDENTIAL_EXCLUDE_SUFFIXES,
-        SHARED_DATA_EXCLUDE_PREFIXES,
-        signal,
-      );
+      if (includeWorkspace)
+        await writeGzipFile(
+          await useDockerService().getArchive(helper.id, EXPORT_WORKSPACE_PATH),
+          workspacePath,
+          signal,
+        );
+      if (includeAgents)
+        await writeFilteredAgentsGz(
+          await useDockerService().getArchive(helper.id, EXPORT_AGENTS_PATH),
+          agentsPath,
+          CREDENTIAL_EXCLUDE_SUFFIXES,
+          SHARED_DATA_EXCLUDE_PREFIXES,
+          signal,
+        );
       await pipeline(
         packBundle([
           { name: BUNDLE_FILES.manifest, path: manifestPath },
-          { name: BUNDLE_FILES.workspace, path: workspacePath },
-          { name: BUNDLE_FILES.agents, path: agentsPath },
+          ...(includeWorkspace
+            ? [{ name: BUNDLE_FILES.workspace, path: workspacePath }]
+            : []),
+          ...(includeAgents
+            ? [{ name: BUNDLE_FILES.agents, path: agentsPath }]
+            : []),
         ]),
         createWriteStream(destination, { mode: 0o600 }),
         { signal },
@@ -1070,6 +1115,61 @@ export class BackupManager {
       await rm(temp, { recursive: true, force: true });
     }
   }
+  /** Repackage an ordinary portable worker bundle with separately archived
+   * explicit absolute paths. The ordinary workspace/agent payload is kept
+   * byte-for-byte and old bundles continue to omit this optional member. */
+  private async appendExplicitBackupPaths(destination: string, containerId: string, paths: string[], signal: AbortSignal) {
+    const dir = `${destination}.paths-${randomUUID()}`;
+    const unpacked = join(dir, "bundle");
+    const replacement = `${destination}.new-${randomUUID()}`;
+    try {
+      await mkdir(unpacked, { recursive: true, mode: 0o700 });
+      const extracted = await extractBundle(destination, unpacked);
+      const manifest = extracted.manifest;
+      const archives: Array<{ path: string; archive: string; file: string }> = [];
+      for (const [index, selected] of paths.entries()) {
+        signal.throwIfAborted();
+        const file = join(dir, `${index}.tar`);
+        await pipeline(await useDockerService().getArchive(containerId, selected), createWriteStream(file, { mode: 0o600 }), { signal });
+        const sanitized = join(dir, `${index}.sanitized.tar`);
+        await sanitizeBackupPathTarPayload(file, sanitized, selected, signal);
+        await rm(file, { force: true });
+        archives.push({ path: selected, archive: `paths/${index}.tar`, file: sanitized });
+      }
+      const payload = join(dir, BUNDLE_FILES.backupPaths);
+      const pack = tar.pack();
+      const writing = pipeline(pack, createGzip(), createWriteStream(payload, { mode: 0o600 }), { signal });
+      for (const archive of archives) {
+        const size = (await stat(archive.file)).size;
+        await new Promise<void>((resolve, reject) => {
+          const entry = pack.entry({ name: archive.archive, size, mode: 0o600 }, (error) => error ? reject(error) : resolve());
+          createReadStream(archive.file).pipe(entry);
+        });
+      }
+      pack.finalize(); await writing;
+      manifest.version = WORKER_EXPORT_VERSION;
+      manifest.contents.backupPaths = true;
+      manifest.backupPaths = archives.map(({ path, archive }) => ({ path, archive }));
+      const manifestPath = join(dir, BUNDLE_FILES.manifest);
+      await writeManifest(manifest, manifestPath);
+      const files = [
+        { name: BUNDLE_FILES.manifest, path: manifestPath },
+        ...(extracted.rootfsPath ? [{ name: BUNDLE_FILES.rootfs, path: extracted.rootfsPath }] : []),
+        ...(extracted.workspacePath ? [{ name: BUNDLE_FILES.workspace, path: extracted.workspacePath }] : []),
+        ...(extracted.agentsPath ? [{ name: BUNDLE_FILES.agents, path: extracted.agentsPath }] : []),
+        { name: BUNDLE_FILES.backupPaths, path: payload },
+      ];
+      await pipeline(packBundle(files), createWriteStream(replacement, { mode: 0o600 }), { signal });
+      await rename(replacement, destination);
+    } finally {
+      // `rename` removes this pathname on success. On failure/abort, remove
+      // the partial sibling as well as the private staging directory so a
+      // repeated backup cannot strand a large, misleading `.new` artifact.
+      await rm(replacement, { force: true }).catch(() => {});
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
   private async runV2(job: BackupJob) {
     const started = Date.now(),
       dir = join(this.dataDir, "tmp", `backup-${job.id}`);
@@ -1118,6 +1218,7 @@ export class BackupManager {
             id,
             path,
             controller.signal,
+            job.selectedPathsByWorkspace?.[id],
           );
           exports.push({ id, path });
         }
@@ -1208,6 +1309,7 @@ export class BackupManager {
         sha256: crypt.sha256,
         sourceWorkerId: job.workspaceId,
         missingSecrets: [...missing],
+        selectedPathsByWorkspace: job.selectedPathsByWorkspace,
       };
       job.status = "succeeded";
       job.phase = "complete";
@@ -1665,6 +1767,7 @@ export class BackupManager {
         sha256: crypt.sha256,
         sourceWorkerId: job.workspaceId,
         missingSecrets: missing,
+        selectedPathsByWorkspace: job.selectedPathsByWorkspace,
       };
       job.status = "succeeded";
       job.phase = "complete";
@@ -1978,7 +2081,7 @@ export class BackupManager {
           .map((worker) => worker.id);
       let scheduleError: string | undefined;
       try {
-        await this.createMany(c.userId, selected);
+        await this.createMany(c.userId, selected, undefined, 1, 0, pickSelectedPaths(c.selectedPathsByWorkspace, selected));
       } catch (error) {
         scheduleError = safeError(error);
         useLogger().error(
@@ -2369,6 +2472,21 @@ function configIntervalMinutes(c?: Partial<BackupConfig>) {
   return (
     c?.intervalMinutes ?? Math.max(1, Math.round((c?.intervalHours ?? 24) * 60))
   );
+}
+function normalizeSelectedPaths(value: unknown): Record<string, string[]> | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw Object.assign(new Error("selectedPathsByWorkspace must be an object"), { statusCode: 400 });
+  const output: Record<string, string[]> = {};
+  for (const [workerId, paths] of Object.entries(value as Record<string, unknown>)) {
+    assertSafeUserId(workerId);
+    output[workerId] = normalizeBackupPaths(paths);
+  }
+  return output;
+}
+function pickSelectedPaths(value: Record<string, string[]> | undefined, workerIds: string[]): Record<string, string[]> | undefined {
+  if (!value) return undefined;
+  return Object.fromEntries(Object.entries(value).filter(([id]) => workerIds.includes(id)));
 }
 function safeError(err: unknown) {
   const m = err instanceof Error ? err.message : "";

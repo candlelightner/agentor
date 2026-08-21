@@ -1,11 +1,15 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { expect, test } from "@playwright/test";
 import { ImageCatalogManager } from "../../orchestrator/server/utils/image-catalog";
 import { GitImageCatalogManager } from "../../orchestrator/server/utils/git-image-manager";
 import { GitImageStore } from "../../orchestrator/server/utils/git-image-store";
-import { serializeCatalog } from "../../orchestrator/server/utils/git-image-format";
+import { parseCatalog, serializeCatalog } from "../../orchestrator/server/utils/git-image-format";
+import { serializePluginCatalog } from "../../orchestrator/server/utils/git-plugin-format";
+import { PluginDefinitionStore } from "../../orchestrator/server/utils/plugin-definition-store";
+import { pluginDefinitionHash, validatePluginManifest } from "../../orchestrator/server/utils/plugin-manifest";
 import { withDeletedOwnerCleanupFence } from "../../orchestrator/server/utils/orphan-sweeper";
 
 const definition = (name: string) => ({
@@ -14,6 +18,69 @@ const definition = (name: string) => ({
   baseImage: "agentor-worker:approved-test",
   dockerfileFragment: "RUN true",
   contextFiles: [],
+});
+
+test("Git catalog parses legacy v1 fragments and v2 structured provisioning", () => {
+  const legacyHash = createHash("sha256").update('{"baseImage":"agentor-worker:approved-test","contextFiles":[],"description":"","dockerfileFragment":"RUN true","name":"legacy"}').digest("hex");
+  const legacy = {
+    ".agentor/image-catalog.v1.json": JSON.stringify({ schema: "https://agentor.dev/schemas/image-catalog/v1", version: 1, entries: [{ id: "legacy", name: "legacy", description: "", baseImage: "agentor-worker:approved-test", dockerfilePath: "images/legacy/Dockerfile", metadataPath: "images/legacy/metadata.json", contextPrefix: "images/legacy/context/", definitionHash: legacyHash }] }),
+    "images/legacy/Dockerfile": "FROM agentor-worker:approved-test\nRUN true\n",
+    "images/legacy/metadata.json": JSON.stringify({ name: "legacy", baseImage: "agentor-worker:approved-test" }),
+  };
+  // The hash protects the imported v1 representation exactly as it was stored.
+  expect(parseCatalog(legacy)).toMatchObject([{ definition: { dockerfileFragment: "RUN true" } }]);
+  const v2 = serializeCatalog([{ id: "structured", ownerId: "owner", ...definition("structured"), dockerfileFragment: "", provisioning: [{ type: "command" as const, command: "mkdir -p /opt/example" }], contextFiles: [{ path: "setup.sh", contentBase64: Buffer.from("echo setup").toString("base64"), role: "script" as const, destination: "/opt/agentor-context/setup.sh" }], createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", versions: [] }], { buildMode: "local" });
+  expect(JSON.parse(v2[".agentor/image-catalog.v2.json"]!)).toMatchObject({
+    schema: "https://agentor.dev/schemas/image-catalog/v2",
+    version: 2,
+  });
+  expect(parseCatalog(v2)).toMatchObject([{ definition: { provisioning: [{ type: "command" }], contextFiles: [{ role: "script", destination: "/opt/agentor-context/setup.sh" }] } }]);
+  const secretDefinition = { id: "secret", ownerId: "owner", ...definition("secret"), description: "TOKEN=github_pat_abcdefghijklmnopqrstuvwxyz", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", versions: [] };
+  expect(() => serializeCatalog([secretDefinition], { buildMode: "local" })).toThrow("secret values");
+});
+
+test("legacy v1 Git catalog pulls remain idempotent after current-format recovery", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agentor-git-v1-pull-"));
+  const catalogDirectory = await mkdtemp(join(tmpdir(), "agentor-git-v1-catalog-"));
+  try {
+    const manager = new GitImageCatalogManager(new GitImageStore(directory));
+    const catalog = new ImageCatalogManager(catalogDirectory);
+    await Promise.all([manager.init(), catalog.init()]);
+    await manager.connect("owner", { provider: "fake", repository: "owner/v1-pull", visibility: "public", workflow: "direct", auth: { type: "none" } });
+    const legacyHash = createHash("sha256").update('{"baseImage":"agentor-worker:approved-test","contextFiles":[],"description":"","dockerfileFragment":"RUN true","name":"legacy"}').digest("hex");
+    manager.fakeConfigure("owner", { private: false, branches: { main: { revision: "legacy-revision", files: {
+      ".agentor/image-catalog.v1.json": JSON.stringify({ schema: "https://agentor.dev/schemas/image-catalog/v1", version: 1, entries: [{ id: "legacy", name: "legacy", description: "", baseImage: "agentor-worker:approved-test", dockerfilePath: "images/legacy/Dockerfile", metadataPath: "images/legacy/metadata.json", contextPrefix: "images/legacy/context/", definitionHash: legacyHash }] }),
+      "images/legacy/Dockerfile": "FROM agentor-worker:approved-test\nRUN true\n",
+      "images/legacy/metadata.json": JSON.stringify({ name: "legacy", baseImage: "agentor-worker:approved-test" }),
+    } } } });
+    await expect(manager.sync("owner", catalog, { direction: "pull" })).resolves.toMatchObject({ conflicts: [] });
+    await expect(manager.sync("owner", catalog, { direction: "pull" })).resolves.toMatchObject({ imported: [], conflicts: [] });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+    await rm(catalogDirectory, { recursive: true, force: true });
+  }
+});
+
+test("Git plugin pull rejects group definitions not owned by the importer", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agentor-git-plugin-group-"));
+  const catalogDirectory = await mkdtemp(join(tmpdir(), "agentor-git-plugin-catalog-"));
+  const pluginDirectory = await mkdtemp(join(tmpdir(), "agentor-git-plugin-store-"));
+  try {
+    const manager = new GitImageCatalogManager(new GitImageStore(directory), () => true, () => false);
+    const catalog = new ImageCatalogManager(catalogDirectory);
+    const plugins = new PluginDefinitionStore(pluginDirectory);
+    await Promise.all([manager.init(), catalog.init(), plugins.init()]);
+    await manager.connect("owner", { provider: "fake", repository: "owner/plugin-group", visibility: "public", workflow: "direct", auth: { type: "none" } });
+    const manifest: any = validatePluginManifest({ schemaVersion: 1, name: "Scoped", slug: "scoped", description: "", version: "1.0.0", lifecycle: { start: { argv: ["echo", "start"] } } });
+    const remotePlugin: any = { schemaVersion: 1, id: "foreign-group-plugin", userId: "remote-owner", scope: "group", groupId: "foreign-group", name: manifest.name, builtIn: false, manifest, definitionHash: pluginDefinitionHash(manifest), createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" };
+    manager.fakeConfigure("owner", { private: false, branches: { main: { revision: "plugin-revision", files: { ...serializeCatalog([], { buildMode: "local" }), ...serializePluginCatalog([remotePlugin]) } } } });
+    await expect(manager.sync("owner", catalog, { direction: "pull" }, plugins)).rejects.toThrow("unknown group");
+    expect(plugins.listForOwner("owner")).toEqual([]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+    await rm(catalogDirectory, { recursive: true, force: true });
+    await rm(pluginDirectory, { recursive: true, force: true });
+  }
 });
 
 test("image catalog transactions discard a failed create without clobbering a queued create", async () => {

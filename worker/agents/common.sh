@@ -179,3 +179,49 @@ reconcile_role_skill() {
         return 1
     }
 }
+
+# Add Agentor's source-IP-authenticated worker-self MCP to each supported agent
+# without replacing any user-owned configuration or MCP entry. Administrative
+# workspaces use the separate credential-bound management MCP instead.
+reconcile_worker_self_mcp() {
+    local codex_config="/home/agent/.codex/config.toml"
+    mkdir -p "$(dirname "$codex_config")"
+    touch "$codex_config"
+    if ! grep -q '^\[mcp_servers\.agentor-worker\]$' "$codex_config"; then
+        cat >> "$codex_config" <<'EOF'
+
+# Generated for this ordinary Agentor worker. Identity is resolved server-side.
+[mcp_servers.agentor-worker]
+command = "/usr/local/bin/agentor-worker-mcp"
+EOF
+    fi
+
+    local config write_config stage
+    for config in "/home/agent/.claude.json" "/home/agent/.gemini/settings.json"; do
+        [ -f "$config" ] || continue
+        if ! jq -e 'type == "object"' "$config" >/dev/null 2>&1; then
+            echo "[agent] Warning: cannot add worker MCP to invalid JSON config: $config" >&2
+            continue
+        fi
+        if jq -e '.mcpServers["agentor-worker"]? != null' "$config" >/dev/null 2>&1; then
+            continue
+        fi
+        # ~/.claude.json is intentionally a symlink into the persistent
+        # agent-data volume. Replacing the link itself would break persistence;
+        # atomically update its resolved target instead.
+        write_config="$config"
+        if [ -L "$config" ]; then
+            write_config=$(readlink -f -- "$config") || return 1
+        fi
+        stage=$(mktemp "${write_config}.agentor-worker-mcp.XXXXXX") || return 1
+        if ! jq '.mcpServers = (.mcpServers // {}) | .mcpServers["agentor-worker"] = {"command":"/usr/local/bin/agentor-worker-mcp"}' "$config" > "$stage"; then
+            rm -f -- "$stage"
+            return 1
+        fi
+        chmod --reference="$write_config" "$stage" 2>/dev/null || chmod 0600 "$stage"
+        mv -- "$stage" "$write_config" || {
+            rm -f -- "$stage"
+            return 1
+        }
+    done
+}

@@ -41,6 +41,43 @@ test.describe.serial('Apps Pane — UI', () => {
     await expect(page.locator('main').getByRole('heading', { name: 'Apps', exact: true })).toBeVisible({ timeout: 15_000 });
   });
 
+  test('Apps pane opens the plugin catalog', async ({ page }) => {
+    await goToDashboard(page);
+    const card = page.locator('.rounded-lg').filter({ hasText: displayName }).first();
+    await expect(card.locator('text=running')).toBeVisible({ timeout: 60_000 });
+    await card.locator('button').nth(3).click();
+    await page.locator('main [data-testid="manage-plugins"]').click();
+
+    await expect(page.locator('[data-testid="plugin-catalog"]')).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Plugins', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'New definition' })).toBeVisible();
+  });
+
+  test('Apps pane exposes a ready installed plugin action directly and opens its sandboxed pane', async ({ page }) => {
+    const definition = {
+      id: 'plugin-ui-test', name: 'Plugin UI test', scope: 'owner', builtIn: false,
+      manifest: { schemaVersion: 1, name: 'Plugin UI test', slug: 'plugin-ui-test', version: '1.0.0', description: 'Test plugin', lifecycle: { start: { argv: ['true'] } }, actions: [{ id: 'open', label: 'Open plugin', kind: 'private-ui', portId: 'ui', path: '/' }] },
+    };
+    const installation = { id: 'installation-ui-test', definitionId: definition.id, desiredEnabled: true, observed: { state: 'ready', ready: true } };
+    // The pane scopes the catalog request with `?workerId=…`; Playwright glob
+    // patterns match the complete URL, so an exact path glob would silently
+    // miss this request and leave the action list dependent on live data.
+    await page.route(/\/api\/plugins\/definitions(?:\?.*)?$/, route => route.fulfill({ json: [definition] }));
+    await page.route('**/api/containers/*/plugins', route => route.fulfill({ json: [installation] }));
+    await goToDashboard(page);
+    const card = page.locator('.rounded-lg').filter({ hasText: displayName }).first();
+    await expect(card.locator('text=running')).toBeVisible({ timeout: 60_000 });
+    await card.locator('button').nth(3).click();
+    const action = page.getByTestId('installed-plugin-actions').getByRole('button', { name: /Plugin UI test.*Open plugin/ });
+    await expect(action).toBeVisible();
+    await action.click();
+
+    const frame = page.locator('[data-testid="plugin-application-frame"]');
+    await expect(frame).toBeVisible();
+    await expect(frame).toHaveAttribute('sandbox', 'allow-forms allow-scripts');
+    await expect(frame).toHaveAttribute('src', new RegExp(`/plugin-ui/${containerId}/installation-ui-test/open/`));
+  });
+
   test('Apps pane shows Chromium app type', async ({ page }) => {
     await goToDashboard(page);
     const card = page.locator('.rounded-lg').filter({ hasText: displayName }).first();

@@ -117,6 +117,17 @@ test("creates a constrained definition and follows asynchronous build logs", asy
     "safe build log",
   );
 });
+test("offers structured package, command, and context-script provisioning", async ({ page }) => {
+  const m = await open(page);
+  await expect(m.getByTestId("image-provisioning")).toContainText("server-rendered");
+  await m.getByPlaceholder("Pinned packages (space separated)").fill("jq=1.7.1-3");
+  await m.getByPlaceholder("Pinned packages (space separated)").press("Tab");
+  await m.getByPlaceholder("Optional shell setup command").fill("mkdir -p /opt/example");
+  await m.getByPlaceholder("Optional shell setup command").press("Tab");
+  await m.locator('input[type="file"]').setInputFiles({ name: "setup.sh", mimeType: "text/x-shellscript", buffer: Buffer.from("echo setup") });
+  await m.getByLabel("Context file role").selectOption("script");
+  await expect(m.getByLabel("Context file destination")).toHaveValue("/opt/agentor-context/setup.sh");
+});
 test("a double-click submits only one image build", async ({ page }) => {
   let requests = 0;
   await page.route("**/api/image-catalog/definitions/def-1/builds", async (route) => {

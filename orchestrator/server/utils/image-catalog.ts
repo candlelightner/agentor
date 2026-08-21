@@ -20,7 +20,23 @@ export interface ImageVersion {
   runtimeImage?: string;
   artifactTag?: string;
   recovered?: boolean;
+  /** Immutable, secret-free source recipe that produced this version. */
+  provisioning?: ProvisioningStep[];
+  contextFiles?: ContextFile[];
 }
+export type ContextFile = {
+  path: string;
+  contentBase64: string;
+  /** Assets are copied into the image; scripts can additionally be run by a
+   * structured `script` provisioning step. */
+  role?: "asset" | "script";
+  /** Absolute, controlled destination in the derived image. */
+  destination?: string;
+};
+export type ProvisioningStep =
+  | { type: "packages"; manager: "apt" | "npm" | "pip"; packages: string[] }
+  | { type: "command"; command: string }
+  | { type: "script"; path: string; interpreter: "sh" | "bash" | "python3" | "node" };
 export interface ImageDefinition {
   id: string;
   ownerId: string;
@@ -30,7 +46,10 @@ export interface ImageDefinition {
   description: string;
   baseImage: string;
   dockerfileFragment: string;
-  contextFiles: Array<{ path: string; contentBase64: string }>;
+  contextFiles: ContextFile[];
+  /** Ordered, server-rendered build recipe. Legacy fragments remain readable
+   * for catalog/Git compatibility but new definitions should use this field. */
+  provisioning?: ProvisioningStep[];
   createdAt: string;
   updatedAt: string;
   versions: ImageVersion[];
@@ -95,6 +114,9 @@ const MIN_BUILD_TIMEOUT_MS = 1_000;
 const MAX_BUILD_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const FORBIDDEN_FRAGMENT =
   /(^|\n)\s*(?:FROM|USER|ENTRYPOINT|CMD|ONBUILD|STOPSIGNAL|HEALTHCHECK|VOLUME|EXPOSE)\s|\bADD\s+https?:|docker\.sock|--mount\s*=\s*type=(?:bind|secret|ssh)|\bcurl\b.*\|\s*(?:sh|bash)|\bwget\b.*\|\s*(?:sh|bash)|\b(?:ENV|ARG)\b[^\n]*(?:TOKEN|SECRET|PASSWORD|API_KEY)|\$\{?[^\s}]*?(?:TOKEN|SECRET|PASSWORD|API_KEY)/i;
+const SECRET_VALUE = /(?:\b(?:TOKEN|SECRET|PASSWORD|API[_-]?KEY|PRIVATE[_-]?KEY)\b\s*[=:]\s*["']?[^\s"']{8,}|\bauthorization\s*[:=]\s*(?:bearer\s+)?[^\s"']{8,}|-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----|github_pat_[A-Za-z0-9_]{12,}|\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}|IMAGE_BUILD_MUST_NEVER_LEAK)/i;
+const SAFE_DESTINATION_RE = /^\/opt\/agentor-context\/(?!\.\.(?:\/|$))(?!.*\/\.\.(?:\/|$))[a-zA-Z0-9._/-]+$/;
+const SAFE_PACKAGE_RE = /^[a-zA-Z0-9@._+:/=~^-]+$/;
 const REDACT =
   /(?:[A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY)[A-Za-z0-9_]*\s*[=:]\s*)?[^\s]{8,}/gi;
 
@@ -704,6 +726,7 @@ export class ImageCatalogManager {
         ...definition,
         baseImage: requestedBase,
         contextFiles: definition.contextFiles.map((file) => ({ ...file })),
+        provisioning: definition.provisioning?.map((step) => structuredClone(step)),
         versions: definition.versions.map((version) => ({ ...version })),
       };
       return { build, definition, snapshot };
@@ -745,13 +768,7 @@ export class ImageCatalogManager {
       await this.mutate(() => {
         build.baseDigest = pinnedBase.digest;
       });
-      const dockerfile = [
-        `FROM ${pinnedBase.reference}`,
-        "USER root",
-        snapshot.dockerfileFragment || "# no additional image steps",
-        "USER agent",
-        "WORKDIR /workspace",
-      ].join("\n");
+      const dockerfile = renderDefinitionDockerfile(snapshot, pinnedBase.reference);
       await this.mutate(() => {
         build.phase = "building";
         build.updatedAt = now();
@@ -883,6 +900,8 @@ export class ImageCatalogManager {
           artifactTag: tag,
           baseImage: snapshot.baseImage,
           baseDigest: pinnedBase.digest,
+          provisioning: snapshot.provisioning?.map((step) => structuredClone(step)),
+          contextFiles: snapshot.contextFiles.map((file) => ({ ...file })),
           createdAt: stamp,
         });
         definition.baseImage = snapshot.baseImage;
@@ -1613,8 +1632,15 @@ function normalizeState(value: any): State {
           ...item,
           versions: Array.isArray(item.versions) ? item.versions : [],
           contextFiles: Array.isArray(item.contextFiles)
-            ? item.contextFiles
+            ? item.contextFiles.map((file: any) => ({
+                ...file,
+                role: file?.role === "script" ? "script" : "asset",
+                destination: typeof file?.destination === "string"
+                  ? file.destination
+                  : defaultContextDestination(String(file?.path || "")),
+              }))
             : [],
+          provisioning: Array.isArray(item.provisioning) ? item.provisioning : undefined,
           gitRecovery: normalizeGitRecovery(item.gitRecovery),
         }))
     : [];
@@ -1710,11 +1736,84 @@ function normalizeGitRecovery(
     return undefined;
   return { connectionId, remoteId, hash };
 }
+function defaultContextDestination(path: string) {
+  return `/opt/agentor-context/${path}`;
+}
+/** Render only instructions selected by the structured recipe. This is also
+ * used by Git export so its human-readable Dockerfile matches local builds. */
+export function renderDefinitionDockerfile(
+  definition: Pick<ImageDefinition, "dockerfileFragment" | "contextFiles" | "provisioning"> & { baseImage?: string },
+  baseReference = definition.baseImage,
+) {
+  const lines = [`FROM ${baseReference}`, "USER root"];
+  const files = definition.contextFiles || [];
+  for (const file of files)
+    // Context tar entries are mode 0600. Make the final runtime user their
+    // owner so copied assets (and optional launch scripts) remain readable
+    // after the generated Dockerfile switches back to `agent`.
+    lines.push(`COPY --chown=agent:agent ${file.path} ${file.destination || defaultContextDestination(file.path)}`);
+  if (definition.provisioning?.length) {
+    for (const step of definition.provisioning) {
+      if (step.type === "packages") {
+        const packages = step.packages.join(" ");
+        if (step.manager === "apt")
+          lines.push(`RUN apt-get update && apt-get install -y --no-install-recommends ${packages} && rm -rf /var/lib/apt/lists/*`);
+        else if (step.manager === "npm") lines.push(`RUN npm install --global ${packages}`);
+        else lines.push(`RUN python3 -m pip install --no-cache-dir --break-system-packages ${packages}`);
+      } else if (step.type === "command") lines.push(`RUN ${step.command}`);
+      else lines.push(`RUN ${step.interpreter} ${files.find((file) => file.path === step.path)?.destination || defaultContextDestination(step.path)}`);
+    }
+  } else if (definition.dockerfileFragment) lines.push(definition.dockerfileFragment);
+  else lines.push("# no additional image steps");
+  lines.push("USER agent", "WORKDIR /workspace");
+  return lines.join("\n");
+}
+function assertNoSecret(value: string, subject: string) {
+  // Runtime-variable references are templates, not secret material. Preserve
+  // them so non-secret launch/config assets do not false-positive while still
+  // scanning literal values and common bearer/private-key forms.
+  const withoutReferences = value.replace(/\$\{?[A-Z_][A-Z0-9_]*\}?/g, "");
+  if (SECRET_VALUE.test(withoutReferences)) httpError(400, `${subject} must not contain secrets`);
+}
+function validateProvisioning(input: unknown, contextFiles: ContextFile[]) {
+  if (input === undefined) return undefined;
+  if (!Array.isArray(input) || input.length > 100)
+    httpError(400, "Provisioning must be an ordered list of at most 100 steps");
+  return input.map((raw: any): ProvisioningStep => {
+    if (!raw || typeof raw !== "object") httpError(400, "Invalid provisioning step");
+    if (raw.type === "packages") {
+      const manager = String(raw.manager || "");
+      const packages: string[] = Array.isArray(raw.packages) ? raw.packages.map(String) : [];
+      if (!(["apt", "npm", "pip"] as string[]).includes(manager) || !packages.length || packages.length > 100 || packages.some((item) => item.startsWith("-") || !SAFE_PACKAGE_RE.test(item)))
+        httpError(400, "Invalid package provisioning step");
+      for (const item of packages) assertNoSecret(item, "Package provisioning");
+      return { type: "packages", manager: manager as "apt" | "npm" | "pip", packages };
+    }
+    if (raw.type === "command") {
+      const command = String(raw.command || "").trim();
+      if (!command || command.length > 16 * 1024 || /[\r\n]/.test(command) || FORBIDDEN_FRAGMENT.test(`RUN ${command}`))
+        httpError(400, "Command provisioning step violates build policy");
+      assertNoSecret(command, "Command provisioning");
+      return { type: "command", command };
+    }
+    if (raw.type === "script") {
+      const path = String(raw.path || ""), interpreter = String(raw.interpreter || "");
+      const context = contextFiles.find((file) => file.path === path);
+      if (!context || context.role !== "script" || !(["sh", "bash", "python3", "node"] as string[]).includes(interpreter))
+        httpError(400, "Script provisioning must reference a context script with an approved interpreter");
+      return { type: "script", path, interpreter: interpreter as "sh" | "bash" | "python3" | "node" };
+    }
+    httpError(400, "Unknown provisioning step");
+  });
+}
 function validateDefinition(input: any) {
   if (!input || typeof input !== "object")
     httpError(400, "Definition body is required");
   const name = String(input.name || "").trim();
   if (!name || name.length > 100) httpError(400, "Invalid definition name");
+  assertNoSecret(name, "Definition name");
+  const description = String(input.description || "").slice(0, 1000);
+  assertNoSecret(description, "Definition description");
   const baseImage = validateBaseImage(input.baseImage);
   const dockerfileFragment = String(input.dockerfileFragment || "");
   if (
@@ -1725,6 +1824,7 @@ function validateDefinition(input: any) {
       400,
       "Dockerfile fragment violates build policy: safe package downloads with apt, pip, npm, or similar tools are allowed; do not include FROM, USER, ENTRYPOINT, CMD, ENV/ARG secrets, EXPOSE, VOLUME, remote ADD, curl|sh, wget|sh, Docker socket mounts, or privilege changes",
     );
+  assertNoSecret(dockerfileFragment, "Dockerfile fragment");
   if (!Array.isArray(input.contextFiles))
     httpError(400, "contextFiles must be an array");
   const seen = new Set<string>();
@@ -1763,14 +1863,22 @@ function validateDefinition(input: any) {
       (total += size) > MAX_CONTEXT_TOTAL
     )
       httpError(400, "Build context is too large");
-    return { path, contentBase64: value };
+    const decodedText = decoded.toString("utf8");
+    assertNoSecret(decodedText, "Build context content");
+    const role = f?.role === undefined ? "asset" : String(f.role);
+    const destination = String(f?.destination || defaultContextDestination(path));
+    if ((role !== "asset" && role !== "script") || !SAFE_DESTINATION_RE.test(destination) || destination.includes("//") || destination.endsWith("/"))
+      httpError(400, "Invalid build context role or destination");
+    return { path, contentBase64: value, role: role as "asset" | "script", destination };
   });
+  const provisioning = validateProvisioning(input.provisioning, contextFiles);
   return {
     name,
-    description: String(input.description || "").slice(0, 1000),
+    description,
     baseImage,
     dockerfileFragment,
     contextFiles,
+    ...(provisioning ? { provisioning } : {}),
   };
 }
 

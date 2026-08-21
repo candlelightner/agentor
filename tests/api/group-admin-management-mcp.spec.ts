@@ -8,6 +8,17 @@ import { buildPng } from "../helpers/clipboard";
 
 const GROUP_ADMIN_ROLE_SKILL_SHA256 = "7af4f061b894c3e0eb9ba453fe2cd9c4d371fd87e865b6fe43bf27f4429e1cf4";
 
+function pluginManifest(suffix: string) {
+  return {
+    schemaVersion: 1,
+    name: `Group plugin ${suffix}`,
+    slug: `group-plugin-${suffix.toLowerCase()}`,
+    description: "Group-admin plugin scope coverage.",
+    version: "1.0.0",
+    lifecycle: { start: { argv: ["true"] } },
+  };
+}
+
 /**
  * These tests intentionally use the administrator-only diagnostic transport to
  * exercise the credential that is installed in a group-admin workspace.  The
@@ -37,6 +48,7 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
   let childGroupId = "";
   let childWorkspaceId = "";
   let siblingGroupId = "";
+  let pluginChildGroupId = "";
   let credential = "";
   let groupImageId = "";
   let globalImageId = "";
@@ -99,6 +111,7 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     // deletion; doing it first leaked networks across Playwright retries and
     // could exhaust Docker's subnet allocator.
     if (childGroupId) await ownerRequest.delete(`/api/worker-groups/${childGroupId}`).catch(() => {});
+    if (pluginChildGroupId) await ownerRequest.delete(`/api/worker-groups/${pluginChildGroupId}`).catch(() => {});
     if (siblingGroupId) await ownerRequest.delete(`/api/worker-groups/${siblingGroupId}`).catch(() => {});
     if (groupId) await ownerRequest.delete(`/api/worker-groups/${groupId}`).catch(() => {});
     await ownerRequest?.dispose();
@@ -481,6 +494,87 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
       script: "", configured: false, pendingRebuild: false, runtime: { state: "not-configured" },
     });
     expect((await invoke(request, credential, "groups.admin-workspace.startup-script.set", { groupId: childGroupId, startupScript: "" })).status()).toBe(200);
+  });
+
+  test("group-admin plugin definitions allow the subtree and hide denied targets as 404", async ({ request }) => {
+    const child = await ownerRequest.post("/api/worker-groups", {
+      data: { name: `plugin-child-${Date.now()}`, parentId: groupId },
+    });
+    expect(child.status()).toBe(201);
+    pluginChildGroupId = (await child.json()).id;
+    expect((await ownerRequest.patch(`/api/worker-groups/${pluginChildGroupId}`, {
+      data: { workerIds: [addedMemberId] },
+    })).status()).toBe(200);
+
+    const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    let descendantDefinitionId = "";
+    let siblingDefinitionId = "";
+    try {
+      await issueCredential(request);
+      const created = await invoke(request, credential, "plugins.definitions.create", {
+        workerId: addedMemberId,
+        scope: "group",
+        groupId: pluginChildGroupId,
+        manifest: pluginManifest(suffix),
+      });
+      expect(created.status(), await created.text()).toBe(200);
+      descendantDefinitionId = (await created.json()).id;
+
+      const updated = await invoke(request, credential, "plugins.definitions.update", {
+        workerId: addedMemberId,
+        definitionId: descendantDefinitionId,
+        manifest: { ...pluginManifest(`${suffix}-updated`), name: `Group plugin ${suffix} updated` },
+      });
+      expect(updated.status()).toBe(200);
+
+      const siblingDefinition = await ownerRequest.post("/api/plugins/definitions", {
+        data: { scope: "worker", workerId: outsiderId, manifest: pluginManifest(`${suffix}-sibling`) },
+      });
+      expect(siblingDefinition.status()).toBe(201);
+      siblingDefinitionId = (await siblingDefinition.json()).id;
+      const denied = await invoke(request, credential, "plugins.definitions.update", {
+        workerId: outsiderId,
+        definitionId: siblingDefinitionId,
+        manifest: pluginManifest(`${suffix}-denied`),
+      });
+      const unknown = await invoke(request, credential, "plugins.definitions.update", {
+        workerId: randomUUID(),
+        definitionId: randomUUID(),
+        manifest: pluginManifest(`${suffix}-unknown`),
+      });
+      expect(denied.status()).toBe(404);
+      expect(await denied.json()).toEqual(await unknown.json());
+    } finally {
+      if (descendantDefinitionId) await ownerRequest.delete(`/api/plugins/definitions/${descendantDefinitionId}`).catch(() => {});
+      if (siblingDefinitionId) await ownerRequest.delete(`/api/plugins/definitions/${siblingDefinitionId}`).catch(() => {});
+      if (pluginChildGroupId) {
+        await ownerRequest.patch(`/api/worker-groups/${pluginChildGroupId}`, { data: { workerIds: [] } }).catch(() => {});
+        await ownerRequest.delete(`/api/worker-groups/${pluginChildGroupId}`).catch(() => {});
+        pluginChildGroupId = "";
+      }
+    }
+  });
+
+  test("group-admin MCP rejects undeclared plugin environment references", async ({ request }) => {
+    const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    let definitionId = "";
+    try {
+      await issueCredential(request);
+      const created = await invoke(request, credential, "plugins.definitions.create", {
+        workerId: memberId,
+        scope: "worker",
+        manifest: { ...pluginManifest(suffix), environment: { envKeys: ["DECLARED_ENV"], secretKeys: ["DECLARED_SECRET"] } },
+      });
+      expect(created.status(), await created.text()).toBe(200);
+      definitionId = (await created.json()).id;
+
+      for (const args of [{ envKeys: ["UNDECLARED_ENV"] }, { secretKeys: ["UNDECLARED_SECRET"] }]) {
+        const rejected = await invoke(request, credential, "plugins.install", { workerId: memberId, definitionId, ...args });
+        expect(rejected.status()).toBe(400);
+      }
+    } finally {
+      if (definitionId) await ownerRequest.delete(`/api/plugins/definitions/${definitionId}`).catch(() => {});
+    }
   });
 
   test("group environment values are write-only and audit-safe", async ({ request }) => {

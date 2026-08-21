@@ -13,6 +13,7 @@ import {
   deleteTestUser,
   type CreatedUser,
 } from "../helpers/test-users";
+import { captureCommandOutput, runCommandInWorker } from "../helpers/terminal-ws";
 
 const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
 const EMPTY_AUTH = {
@@ -200,6 +201,43 @@ test.describe
     expect(serialized).not.toMatch(
       /ciphertext|authTag|access_token|refresh_token/i,
     );
+  });
+
+  test("backup path picker metadata starts at workspace and can browse to the worker root", async () => {
+    const initial = await ownerCtx.get(`/api/containers/${workspaceA}/backup-paths`);
+    expect(initial.status()).toBe(200);
+    expect((await initial.json()).path).toBe("/workspace");
+    const root = await ownerCtx.get(`/api/containers/${workspaceA}/backup-paths?path=/`);
+    expect(root.status()).toBe(200);
+    expect((await root.json()).path).toBe("/");
+  });
+
+  test("an explicitly selected readable absolute path round-trips only into a new worker", async () => {
+    const marker = `backup-extra-${Date.now()}`;
+    await runCommandInWorker(workspaceA, `printf %s ${marker} > /tmp/${marker}.txt`);
+    const created = await startBackup(ownerCtx, {
+      workspaceIds: [workspaceA], providerId: "fake",
+      selectedPathsByWorkspace: { [workspaceA]: [`/tmp/${marker}.txt`] },
+    });
+    const job = await waitForJob(ownerCtx, created.id);
+    expect(job.status).toBe("succeeded");
+    const restore = await ownerCtx.post(`/api/backups/${job.backupId}/restore`, { data: { target: "new" } });
+    expect(restore.status()).toBe(202);
+    const restored = await waitForJob(ownerCtx, (await restore.json()).jobId);
+    try {
+      expect(restored.status).toBe("succeeded");
+      expect((await captureCommandOutput(restored.workerId, `cat /tmp/${marker}.txt`)).trim()).toBe(marker);
+      expect(
+        (
+          await captureCommandOutput(
+            restored.workerId,
+            "[ -e /workspace/roundtrip.txt ] && echo present || echo absent",
+          )
+        ).trim(),
+      ).toBe("absent");
+      const original = await ownerCtx.post(`/api/backups/${job.backupId}/restore`, { data: { target: "original", workspaceIds: [workspaceA], confirmOverwrite: true } });
+      expect(original.status()).toBe(409);
+    } finally { if (restored?.workerId) await cleanupWorker(ownerCtx, restored.workerId).catch(() => {}); }
   });
 
   test("all-workspaces selection records each owned workspace and excludes foreign workspaces", async () => {

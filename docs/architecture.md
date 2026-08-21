@@ -151,6 +151,34 @@ Restore to new workers is rollback-clean across a multi-workspace bundle. Caller
 
 Google Drive is independently linked with server-owned OAuth client settings, one-time hashed state, encrypted refresh/access tokens, refresh handling, and resumable 8 MiB uploads. Local and gated fake providers implement the same interface for offline use and deterministic failure/resume tests. Failed/cancelled uploads retain provider-object and upload-session cleanup markers; startup and scheduler ticks retry them and clear each marker only after provider acknowledgement and durable state persistence. Archive credentials are never embedded: preserve `BACKUP_ENCRYPTION_KEY` or `<DATA_DIR>/backup.key` separately from both workspace data and provider objects.
 
+In addition to the standard portable workspace and filtered agent-data members, an owner may explicitly select up to 32 normalized absolute worker paths for a backup. Parent selections collapse descendants and the UI's read-only path browser exposes metadata only. Selected material is stored as named path archives in the encrypted bundle; choosing a path outside `/workspace` is intentional and does not create a public file route.
+
+### Plugins
+
+Plugin definitions are versioned declarative manifests scoped to platform,
+owner, group, or worker. The manifest permits bounded argv lifecycle phases,
+declared port/display resources, named environment and secret references,
+documentation/agent skill text, a safe SVG icon, and declared private UI
+actions. Definitions and installations are separate persistent records, and
+visibility follows ownership and the live group tree.
+
+The worker image provisions a constrained plugin runner during image build.
+The orchestrator executes it inside the selected worker with a bounded control
+document; no plugin receives the Docker socket or orchestrator credentials.
+Desired installations reconcile serially per worker and against the current
+container ID, so lifecycle state cannot survive a rebuild incorrectly.
+Declared private UI actions are authenticated sandboxed dashboard proxies to a
+declared worker port/path, not Traefik exposures. Worker-self plugin MCP uses
+the existing source-IP worker identity boundary and can operate only the
+calling worker's installations.
+
+Worker export/import/clone portability serializes referenced definitions and
+desired installation state but never secret values, runtime observations,
+output, processes, or allocations. Imported definitions become worker-scoped
+and all installation/resource identities are reminted locally; missing secret
+names are reported for re-entry. The Git plugin format carries definition
+content only and remains separate from workspace backup data.
+
 ### Controlled images and Git recovery
 
 The image catalog stores owner-scoped definitions and immutable versions. Controlled builds accept only approved Agentor base aliases, constrained Dockerfile fragments, and canonical bounded context files; the orchestrator generates the final Dockerfile, forces the final `agent` user, applies build limits, records the immutable Docker image ID, and never exposes the Docker socket or account credentials to workers or build inputs. Fake builds are explicitly gated for tests.

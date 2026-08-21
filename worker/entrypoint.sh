@@ -351,6 +351,11 @@ source /home/agent/agents/common.sh
 reconcile_role_skill "$AGENTOR_TRUSTED_RUNTIME_ROLE" \
     || echo "[agent] Warning: runtime role skill setup failed, continuing"
 
+if [[ "${AGENTOR_ADMIN_WORKSPACE:-}" != "1" ]]; then
+    reconcile_worker_self_mcp \
+        || echo "[agent] Warning: worker-self MCP setup failed, continuing"
+fi
+
 # The trusted administrative overlay is the only worker attached to the
 # management network. Advertise its internal MCP to Codex through a stdio
 # bridge which reads the current short-lived credential from tmpfs on every

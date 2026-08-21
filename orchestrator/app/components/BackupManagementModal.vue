@@ -8,6 +8,7 @@ const api = useBackups(),
     enabled: false,
     selection: "all" as "all" | "selected",
     workspaceText: "",
+    selectedPathsByWorkspace: {} as Record<string, string[]>,
     intervalMinutes: 1440,
     retentionCount: 7,
   });
@@ -19,6 +20,7 @@ const busy = ref(""),
   restoreName = ref(""),
   restoreLockPassword = ref(""),
   confirmOverwrite = ref(false),
+  pickerWorkspaceId = ref(""),
   actionError = ref("");
 const googleDraft = reactive({ clientId: "", redirectUri: "", clientSecret: "" });
 watch(open, async (shown) => {
@@ -28,6 +30,7 @@ watch(open, async (shown) => {
     Object.assign(draft, {
       ...api.settings.value,
       workspaceText: api.settings.value.workspaceIds.join(", "),
+      selectedPathsByWorkspace: structuredClone(api.settings.value.selectedPathsByWorkspace || {}),
     });
   } else {
     api.stop();
@@ -62,6 +65,7 @@ async function save() {
       intervalMinutes: draft.intervalMinutes,
       retentionCount: draft.retentionCount,
       workspaceIds: workspaceIds(),
+      selectedPathsByWorkspace: draft.selectedPathsByWorkspace,
       nextRunAt: api.settings.value.nextRunAt,
     });
     emit("changed");
@@ -69,9 +73,29 @@ async function save() {
 }
 async function backup() {
   await run("backup", async () => {
-    await api.startBackup(draft.selection, workspaceIds());
+    const ids = workspaceIds();
+    const selectedPaths = draft.selection === 'all'
+      ? draft.selectedPathsByWorkspace
+      : Object.fromEntries(
+          Object.entries(draft.selectedPathsByWorkspace).filter(([id]) => ids.includes(id)),
+        );
+    await api.startBackup(draft.selection, ids, selectedPaths);
     emit("changed");
   });
+}
+function openPathPicker(workerId: string) {
+  pickerWorkspaceId.value = workerId;
+  if (!(workerId in draft.selectedPathsByWorkspace))
+    draft.selectedPathsByWorkspace[workerId] = ['/workspace', '/home/agent/.agent-data'];
+}
+const defaultBackupPaths = new Set(['/workspace', '/home/agent/.agent-data']);
+function selectedPathCount(workerId: string) {
+  return draft.selectedPathsByWorkspace[workerId]?.length ?? defaultBackupPaths.size;
+}
+function additionalPathCount(workerId: string) {
+  return (draft.selectedPathsByWorkspace[workerId] || []).filter(
+    path => !defaultBackupPaths.has(path),
+  ).length;
 }
 async function configureGoogle() {
   await run("google-config", async () => {
@@ -306,6 +330,15 @@ watch(restoreTarget, (target) => {
               class="block w-full border rounded p-2"
               placeholder="workspace-a, workspace-b"
           /></label>
+          <section v-if="workspaceIds().length" class="rounded border p-3 space-y-2" data-testid="backup-path-settings">
+            <h4 class="text-sm font-medium">Backup paths</h4>
+            <p class="text-xs text-gray-500">The existing portable defaults (<code>/workspace</code> and credential-filtered agent data) start selected but may be changed. Any readable file or directory may be selected explicitly, including sensitive paths.</p>
+            <div v-for="id in workspaceIds()" :key="id" class="flex items-center gap-2 text-sm">
+              <code class="truncate">{{ id }}</code>
+              <span class="text-xs text-gray-500">{{ selectedPathCount(id) }} selected · {{ additionalPathCount(id) }} additional</span>
+              <UButton size="xs" variant="outline" @click="openPathPicker(id)">Choose paths</UButton>
+            </div>
+          </section>
           <div class="flex gap-2">
             <UButton :loading="busy === 'save'" @click="save"
               >Save schedule</UButton
@@ -318,6 +351,7 @@ watch(restoreTarget, (target) => {
             >
           </div>
         </section>
+        <BackupPathPickerModal v-if="pickerWorkspaceId" :open="Boolean(pickerWorkspaceId)" v-model:paths="draft.selectedPathsByWorkspace[pickerWorkspaceId]" :worker-id="pickerWorkspaceId" @update:open="shown => { if (!shown) pickerWorkspaceId = '' }" />
         <section>
           <h3 class="font-medium mb-2">Jobs</h3>
           <div v-if="!api.jobs.value.length" class="text-sm text-gray-500">

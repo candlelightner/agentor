@@ -13,12 +13,14 @@ export default defineEventHandler(async (event) => {
     intervalMinutes: body.intervalMinutes ?? old?.intervalMinutes ?? Math.round((old?.intervalHours ?? 24) * 60),
     retentionCount: body.retentionCount ?? old?.retentionCount,
     selectedWorkspaceIds: body.selection === 'all' ? null : body.workspaceIds ?? old?.selectedWorkspaceIds,
+    selectedPathsByWorkspace: body.selectedPathsByWorkspace ?? old?.selectedPathsByWorkspace,
   });
   return {
     providerId: config.provider,
     enabled: config.enabled,
     selection: config.selectedWorkspaceIds === null ? 'all' : 'selected',
     workspaceIds: config.selectedWorkspaceIds ?? [],
+    selectedPathsByWorkspace: config.selectedPathsByWorkspace ?? {},
     intervalMinutes: config.intervalMinutes,
     retentionCount: config.retentionCount,
     nextRunAt: config.nextRunAt,
