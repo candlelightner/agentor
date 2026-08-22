@@ -32,7 +32,9 @@ import {
   DockerPluginWorkerExecutor,
   PluginRuntimeManager,
 } from "./plugin-runtime-manager";
-import { definitionVisibleToWorker } from "./plugin-scope";
+import { definitionVisibleToWorker, definitionVisibleToPluginSelf } from "./plugin-scope";
+import type { WorkerSelfAuthority } from "./worker-auth";
+import { useGroupAdminWorkspaceStore } from "./group-admin-workspace-store";
 import { PersistentBackupPathManager } from "./persistent-backup-paths";
 
 function singleton<T>(factory: () => T): () => T {
@@ -120,20 +122,23 @@ export const usePluginRuntimeManager = singleton(
         new Docker({ socketPath: "/var/run/docker.sock" }),
         (workerId) => {
           const worker = useContainerManager().get(workerId);
-          return worker &&
-            !worker.administrativeKind &&
-            worker.userId !== "__agentor_admin__" &&
-            worker.status === "running"
+          return worker && worker.status === "running"
             ? worker.containerId
             : undefined;
         },
       ),
       {
         authorizeDefinition: (definition, installation) => {
-          const worker = useWorkerStore().findById(installation.workerId);
+          const worker = useContainerManager().get(installation.workerId);
+          if (worker?.administrativeKind) {
+            const authority: WorkerSelfAuthority | undefined = worker.administrativeKind === "group"
+              ? (() => { const record = useGroupAdminWorkspaceStore().findByWorkspaceId(worker.id); return record ? { kind: "group-admin" as const, workspaceId: worker.id, groupId: record.groupId, ownerId: record.ownerId } : undefined; })()
+              : { kind: "platform-admin", workspaceId: worker.id };
+            return Boolean(worker.status === "running" && authority && definitionVisibleToPluginSelf(definition, authority, useWorkerGroupStore()));
+          }
           return Boolean(
             worker &&
-            worker.status === "active" &&
+            worker.status === "running" &&
             worker.userId === installation.userId &&
             definitionVisibleToWorker(
               definition,

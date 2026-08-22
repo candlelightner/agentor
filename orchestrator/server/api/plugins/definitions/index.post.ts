@@ -14,6 +14,7 @@ import {
   useWorkerGroupStore,
   useWorkerStore,
 } from "../../../utils/services";
+import { resolvePluginTarget } from "../../../utils/plugin-api";
 
 export default defineEventHandler(async (event) => {
   const { user } = requireAuth(event);
@@ -28,10 +29,19 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 403, statusMessage: "Forbidden" });
   let ownerId: string | null = scope === "platform" ? null : user.id;
   if (scope === "owner" && body?.targetWorkerId !== undefined) {
-    const worker = useWorkerStore().findById(body.targetWorkerId);
+    const worker = resolvePluginTarget(body.targetWorkerId);
     if (!worker || (user.role !== "admin" && worker.userId !== user.id))
       throw createError({ statusCode: 404, statusMessage: "Worker not found" });
     ownerId = worker.userId;
+    if ("administrativeKind" in worker && worker.administrativeKind) {
+      // Administrative self-registration is always workspace-scoped; never
+      // let a dashboard field accidentally create owner-wide definitions.
+      const created = await usePluginDefinitionStore().create({
+        scope: "worker", ownerId: worker.userId, workerId: worker.id, manifest: body?.manifest,
+      });
+      setResponseStatus(event, 201);
+      return created;
+    }
   }
   if (scope === "group") {
     const group = useWorkerGroupStore().findById(body.groupId);
@@ -43,7 +53,7 @@ export default defineEventHandler(async (event) => {
     ownerId = group.userId;
   }
   if (scope === "worker") {
-    const worker = useWorkerStore().findById(body.workerId);
+    const worker = resolvePluginTarget(body.workerId);
     if (!worker || (user.role !== "admin" && worker.userId !== user.id))
       throw createError({ statusCode: 404, statusMessage: "Worker not found" });
     ownerId = worker.userId;

@@ -4,6 +4,8 @@ import type { PluginDefinition, PluginManifest } from '~/types';
 const open = defineModel<boolean>('open', { default: false });
 const props = defineProps<{ containerId: string; containerName: string }>();
 const { isAdmin } = useAuth();
+const { containers } = useContainers();
+const administrative = computed(() => Boolean(containers.value.find((item: any) => item.id === props.containerId)?.administrativeKind));
 const { openPluginTab } = useSplitPanes();
 const {
   definitions,
@@ -38,7 +40,7 @@ function defaultManifest(): PluginManifest {
 }
 function edit(definition?: PluginDefinition) {
   editingId.value = definition?.id ?? null;
-  scope.value = definition?.scope ?? 'owner';
+  scope.value = definition?.scope ?? (administrative.value ? 'worker' : 'owner');
   manifestText.value = JSON.stringify(definition?.manifest ?? defaultManifest(), null, 2);
   formError.value = '';
 }
@@ -53,12 +55,14 @@ function saveDefinition() {
     try { manifest = JSON.parse(manifestText.value) as PluginManifest; }
     catch { formError.value = 'Manifest must be valid JSON.'; return; }
     if (editingId.value) await updateDefinition(editingId.value, manifest);
-    else await createDefinition({
-      scope: scope.value,
+    else {
+      const effectiveScope = administrative.value ? 'worker' : scope.value;
+      await createDefinition({
+      scope: effectiveScope,
       manifest,
-      ...(scope.value === 'owner' ? { targetWorkerId: props.containerId } : {}),
-      ...(scope.value === 'worker' ? { workerId: props.containerId } : {}),
-    });
+      ...(effectiveScope === 'owner' ? { targetWorkerId: props.containerId } : {}),
+      ...(effectiveScope === 'worker' ? { workerId: props.containerId } : {}),
+    }); }
     editingId.value = null;
   });
 }
@@ -97,7 +101,7 @@ function remove(installationId: string) { return run(`remove-${installationId}`,
             <article v-for="installation in installations" :key="installation.id" class="rounded border p-3 space-y-2"><div class="flex justify-between gap-2"><div><b>{{ byDefinition.get(installation.definitionId)?.name || 'Unavailable plugin' }}</b><p class="text-xs text-gray-500">{{ installation.observed.state }}<template v-if="installation.observed.error"> · {{ installation.observed.error.message }}</template></p></div><span :class="installation.observed.ready ? 'text-emerald-600' : 'text-amber-600'" class="text-xs">{{ installation.observed.ready ? 'Ready' : 'Not ready' }}</span></div><div class="flex flex-wrap gap-2"><UButton size="xs" :loading="busy === `toggle-${installation.id}`" @click="toggleInstallation(installation.id, installation.desiredEnabled)">{{ installation.desiredEnabled ? 'Disable' : 'Enable' }}</UButton><UButton size="xs" color="error" variant="outline" @click="remove(installation.id)">Remove</UButton><UButton v-for="action in byDefinition.get(installation.definitionId)?.manifest?.actions || []" :key="action.id" size="xs" color="neutral" variant="outline" :disabled="!installation.observed.ready" @click="actionOpen(installation.id, action, byDefinition.get(installation.definitionId)!)">{{ action.label }}</UButton></div></article>
           </section>
         </div>
-        <section v-if="editingId !== null || manifestText" class="space-y-2 border-t pt-4"><div class="flex gap-2 items-center"><h3 class="font-medium">{{ editingId ? 'Edit definition' : 'New definition' }}</h3><select v-if="!editingId" v-model="scope" class="rounded border p-1 text-sm" aria-label="Plugin scope"><option value="owner">Worker owner</option><option value="worker">This worker only</option><option v-if="isAdmin" value="platform">Platform</option></select></div><textarea v-model="manifestText" class="min-h-56 w-full rounded border p-2 font-mono text-xs" aria-label="Plugin manifest JSON" /><div class="flex gap-2"><UButton size="sm" :loading="busy === 'save'" @click="saveDefinition">Save definition</UButton><UButton size="sm" color="neutral" variant="outline" @click="cancelEdit">Cancel</UButton></div></section>
+        <section v-if="editingId !== null || manifestText" class="space-y-2 border-t pt-4"><div class="flex gap-2 items-center"><h3 class="font-medium">{{ editingId ? 'Edit definition' : 'New definition' }}</h3><select v-if="!editingId && !administrative" v-model="scope" class="rounded border p-1 text-sm" aria-label="Plugin scope"><option value="owner">Worker owner</option><option value="worker">This worker only</option><option v-if="isAdmin" value="platform">Platform</option></select><span v-else-if="!editingId" class="text-xs text-gray-500">This administrative workspace only</span></div><textarea v-model="manifestText" class="min-h-56 w-full rounded border p-2 font-mono text-xs" aria-label="Plugin manifest JSON" /><div class="flex gap-2"><UButton size="sm" :loading="busy === 'save'" @click="saveDefinition">Save definition</UButton><UButton size="sm" color="neutral" variant="outline" @click="cancelEdit">Cancel</UButton></div></section>
       </div>
     </template>
   </UModal>

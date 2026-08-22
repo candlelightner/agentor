@@ -1,6 +1,6 @@
 import type { WorkerSelfContext } from "./worker-auth";
 import type { WorkerSelfMcpDomain } from "./worker-self-mcp";
-import { assertDefinitionVisibleToWorker } from "./plugin-scope";
+import { definitionVisibleToPluginSelf, pluginSelfCanMutateDefinition, resourceNotFound } from "./plugin-scope";
 import { usePluginDefinitionStore, usePluginInstallationStore, usePluginRuntimeManager, useWorkerGroupStore } from "./services";
 
 export class WorkerSelfPluginDomain implements WorkerSelfMcpDomain {
@@ -17,6 +17,7 @@ export class WorkerSelfPluginDomain implements WorkerSelfMcpDomain {
   ]; }
 
   async invoke(context: WorkerSelfContext, name: string, args: Record<string, unknown>) {
+    const authority = context.authority ?? { kind: "ordinary" as const, userId: context.userId, workerId: context.workerId };
     const definitions = usePluginDefinitionStore(), installations = usePluginInstallationStore();
     const records = installations.listForWorker(context.userId, context.workerId);
     if (name === "plugins.list") return records.map(publicInstallation).filter(Boolean);
@@ -25,8 +26,8 @@ export class WorkerSelfPluginDomain implements WorkerSelfMcpDomain {
       if (!found) throw failure(404, "Resource not found");
       return publicInstallation(found);
     }
-    if (name === "plugins.definitions.list") return definitions.listForOwner(context.userId).filter((definition) => visible(context, definition));
-    if (name === "plugins.definitions.create") return definitions.create({ scope: "worker", ownerId: context.userId, workerId: context.workerId, manifest: args.manifest });
+    if (name === "plugins.definitions.list") return (authority.kind === "platform-admin" ? definitions.list() : definitions.listForOwner(context.userId)).filter((definition) => visible({ ...context, authority }, definition));
+    if (name === "plugins.definitions.create") return definitions.create({ scope: "worker", ownerId: context.userId === "__agentor_admin__" ? "__agentor_admin__" : context.userId, workerId: context.workerId, manifest: args.manifest });
     if (name === "plugins.definitions.update" || name === "plugins.definitions.delete") {
       const definition = owned(context, String(args.definitionId || ""));
       if (name.endsWith("update")) return definitions.update(definition.id, args.manifest);
@@ -35,7 +36,7 @@ export class WorkerSelfPluginDomain implements WorkerSelfMcpDomain {
     }
     if (name === "plugins.install") {
       const definition = definitions.getById(String(args.definitionId || ""));
-      assertDefinitionVisibleToWorker(definition, context.container, useWorkerGroupStore());
+      if (!definition || !definitionVisibleToPluginSelf(definition, authority, useWorkerGroupStore())) throw resourceNotFound();
       const envKeys = strings(args.envKeys), secretKeys = strings(args.secretKeys);
       const declaredEnv = new Set(definition.manifest.environment?.envKeys ?? []), declaredSecrets = new Set(definition.manifest.environment?.secretKeys ?? []);
       if (envKeys.some((key) => !declaredEnv.has(key)) || secretKeys.some((key) => !declaredSecrets.has(key))) throw failure(400, "Undeclared environment key reference");
@@ -57,8 +58,8 @@ export class WorkerSelfPluginDomain implements WorkerSelfMcpDomain {
 function tool(name: string, description: string, properties: Record<string, unknown>, readOnly: boolean, required: string[] = []) { return { name, description, inputSchema: { type: "object", additionalProperties: false, properties, ...(required.length ? { required } : {}) }, annotations: { readOnlyHint: readOnly, destructiveHint: name.endsWith("delete") || name.endsWith("uninstall") } }; }
 function failure(statusCode: number, message: string) { return Object.assign(new Error(message), { statusCode }); }
 function strings(value: unknown): string[] { if (value === undefined) return []; if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw failure(400, "Key references must be strings"); return value as string[]; }
-function visible(context: WorkerSelfContext, definition: any) { try { assertDefinitionVisibleToWorker(definition, context.container, useWorkerGroupStore()); return true; } catch { return false; } }
-function owned(context: WorkerSelfContext, id: string) { const definition = usePluginDefinitionStore().getById(id); if (!definition || definition.scope !== "worker" || definition.userId !== context.userId || definition.workerId !== context.workerId || definition.builtIn) throw failure(404, "Resource not found"); return definition; }
+function visible(context: WorkerSelfContext, definition: any) { const authority = context.authority ?? { kind: "ordinary" as const, userId: context.userId, workerId: context.workerId }; return definitionVisibleToPluginSelf(definition, authority, useWorkerGroupStore()); }
+function owned(context: WorkerSelfContext, id: string) { const definition = usePluginDefinitionStore().getById(id); const authority = context.authority ?? { kind: "ordinary" as const, userId: context.userId, workerId: context.workerId }; if (!definition || !pluginSelfCanMutateDefinition(definition, authority)) throw failure(404, "Resource not found"); return definition; }
 
 function publicInstallation(installation: ReturnType<ReturnType<typeof usePluginInstallationStore>["getById"]>) {
   if (!installation) return undefined;

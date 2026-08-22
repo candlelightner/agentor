@@ -2,6 +2,7 @@ import type { PluginDefinitionRecord } from "./plugin-definition-store";
 import type { ContainerInfo } from "../../shared/types";
 import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 import type { WorkerGroupStore } from "./worker-group-store";
+import type { WorkerSelfAuthority } from "./worker-auth";
 
 export function workerDirectGroupId(
   groups: WorkerGroupStore,
@@ -102,6 +103,27 @@ export function groupAdminCanMutateDefinition(
     targetGroup &&
     hierarchy.canAdminister(ownerId, authorityGroupId, targetGroup),
   );
+}
+
+/** Visibility for the plugin self-MCP. Workspace-scoped definitions are the
+ * only mutable definitions an admin runtime may create or change. */
+export function definitionVisibleToPluginSelf(
+  definition: PluginDefinitionRecord,
+  authority: WorkerSelfAuthority,
+  groups: WorkerGroupStore,
+): boolean {
+  if (authority.kind === "ordinary") return definitionVisibleToWorker(definition, { id: authority.workerId, userId: authority.userId }, groups);
+  if (definition.scope === "platform") return true;
+  if (definition.scope === "owner") return false;
+  if (definition.scope === "worker") return definition.workerId === authority.workspaceId && definition.userId === (authority.kind === "group-admin" ? authority.ownerId : "__agentor_admin__");
+  if (authority.kind !== "group-admin" || definition.userId !== authority.ownerId || !definition.groupId) return false;
+  const hierarchy = new WorkerGroupHierarchy(groups);
+  return hierarchy.ancestors(authority.ownerId, authority.groupId, true).some((g) => g.id === definition.groupId)
+    || hierarchy.canAdminister(authority.ownerId, authority.groupId, definition.groupId);
+}
+
+export function pluginSelfCanMutateDefinition(definition: PluginDefinitionRecord, authority: WorkerSelfAuthority): boolean {
+  return !definition.builtIn && definition.scope === "worker" && definition.userId === (authority.kind === "ordinary" ? authority.userId : authority.kind === "group-admin" ? authority.ownerId : "__agentor_admin__") && definition.workerId === (authority.kind === "ordinary" ? authority.workerId : authority.workspaceId);
 }
 
 export function resourceNotFound(): Error & { statusCode: number } {

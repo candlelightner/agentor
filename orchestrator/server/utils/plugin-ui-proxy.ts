@@ -29,7 +29,7 @@ export async function proxyPluginUi(event: H3Event, suffix = "") {
   // checking worker ownership.
   const auth = await requireAuthFromEvent(event);
   (event.context as { auth?: unknown }).auth = auth;
-  const worker = useWorkerStore().findById(getRouterParam(event, "workerId")!);
+  const worker = useContainerManager().get(getRouterParam(event, "workerId")!) ?? useWorkerStore().findById(getRouterParam(event, "workerId")!);
   if (!worker || !canAccessResource(auth, worker, { allowGlobal: false }))
     throw createError({ statusCode: 404, statusMessage: "Plugin action not found" });
   const installation = requireWorkerInstallation(

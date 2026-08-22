@@ -7,19 +7,21 @@ import {
   useWorkerGroupStore,
   useWorkerStore,
 } from "../../../utils/services";
+import { resolvePluginTarget } from "../../../utils/plugin-api";
+import { pluginAuthorityForTarget } from "../../../utils/plugin-api";
+import { definitionVisibleToPluginSelf } from "../../../utils/plugin-scope";
 
 export default defineEventHandler((event) => {
   const { user } = requireAuth(event);
   const workerId = getQuery(event).workerId;
   if (typeof workerId === "string") {
-    const worker = useWorkerStore().findById(workerId);
+    const worker = resolvePluginTarget(workerId);
     if (!worker || (user.role !== "admin" && worker.userId !== user.id))
       throw createError({ statusCode: 404, statusMessage: "Worker not found" });
-    return usePluginDefinitionStore()
-      .listForOwner(worker.userId)
-      .filter((item) =>
-        definitionVisibleToWorker(item, worker, useWorkerGroupStore()),
-      );
+    const authority = pluginAuthorityForTarget(worker);
+    if (authority?.kind === "platform-admin") return usePluginDefinitionStore().list();
+    return (authority ? usePluginDefinitionStore().listForOwner(worker.userId) : [])
+      .filter((item) => authority ? definitionVisibleToPluginSelf(item, authority, useWorkerGroupStore()) : definitionVisibleToWorker(item, worker, useWorkerGroupStore()));
   }
   return user.role === "admin"
     ? usePluginDefinitionStore().list()

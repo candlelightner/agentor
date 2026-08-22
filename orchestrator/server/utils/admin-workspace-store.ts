@@ -182,6 +182,10 @@ export class AdminWorkspaceStore {
   async ensure() {
     return this.exclusive(() => this.ensureLocked());
   }
+  /** Read the persisted identity without provisioning or mutating the runtime. */
+  getRecord() {
+    return this.record ? structuredClone(this.record) : undefined;
+  }
   private async ensureLocked() {
     await this.init();
     if (await this.flushPendingCommit("ensure")) return this.publicRecord();

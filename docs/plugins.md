@@ -77,17 +77,47 @@ declaring an action.
 
 ## Worker-self MCP
 
-Workers can use the narrow JSON-RPC endpoint
-`POST /api/worker-self/mcp` to discover and operate their own installed
-plugins. The caller identity is derived from the worker's Docker-network
-source IP, so the request cannot select another worker or owner. The endpoint
-implements MCP initialization and `tools/list` / `tools/call`; it has no
-browser-session or externally exposed management transport.
+Ordinary workers and trusted administrative workspaces can use the narrow
+JSON-RPC endpoint `POST /api/worker-self/mcp` to discover and operate plugins
+installed on *that exact runtime*. The endpoint implements MCP initialization
+and `tools/list` / `tools/call`; it has no browser-session or externally
+exposed management transport.
+
+The server derives identity from the caller's live Docker source IP and the
+authoritative runtime registration, never from MCP arguments or environment
+variables. Ordinary workers are resolved only on the worker bridge. A platform
+admin or group-admin is additionally accepted only for this plugin endpoint
+when it is the currently running, labeled and registered trusted administrative
+workspace on its expected management network. That exception does **not** add
+admin workspaces to generic worker-self endpoints such as ports, domains,
+usage, or worker information.
+
+Self-created definitions are always worker/workspace scoped. A platform admin
+may use platform definitions and definitions scoped to its own administrative
+workspace. A group admin may use platform definitions, definitions inherited
+from its bound group or ancestors, and definitions scoped to its own workspace;
+it cannot use owner-wide, sibling, descendant-only, other-admin, or unrelated
+group definitions. Neither kind can choose another target worker or workspace
+through this MCP. Management MCP authorization remains the boundary for
+managing other authorized workers.
 
 Tool errors are sanitized: inaccessible resources resolve as `Resource not
 found`, authorization failures do not disclose details, and responses contain
 only bounded safe error text. This endpoint is intended for a plugin-aware
-agent running in its own worker, not for platform administration.
+agent running in its own runtime, not as a substitute for the management MCP
+or dashboard authorization.
+
+### Availability after upgrades
+
+The self-plugin client and `plugin-runner` are image/overlay components. New
+ordinary workers based on a current Agentor worker image receive them. An
+existing custom image version is immutable: rebuilding a worker on that same
+version does not add newly released worker-image files. Build and promote a
+new custom-image version from a current, digest-pinned Agentor base, then
+rebuild the worker. Trusted global and group administrative workspaces receive
+the self-plugin client through their current administrative overlay; apply an
+orchestrator update and rebuild/start the relevant admin workspace to refresh
+that overlay. Existing installations and user-owned files are preserved.
 
 ## Backup path selection
 

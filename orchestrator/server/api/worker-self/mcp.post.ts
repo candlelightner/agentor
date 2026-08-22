@@ -41,13 +41,13 @@ defineRouteMeta({
   },
 });
 
-import { requireWorkerSelf } from "../../utils/worker-auth";
+import { requirePluginSelf } from "../../utils/worker-auth";
 import { handleWorkerSelfMcp } from "../../utils/worker-self-mcp";
 import { WorkerSelfPluginDomain } from "../../utils/worker-self-plugin-domain";
 
 const domain = new WorkerSelfPluginDomain();
 export default defineEventHandler(async (event) => {
-  const context = await requireWorkerSelf(event);
+  const context = await requirePluginSelf(event);
   const result = await handleWorkerSelfMcp(
     await readBody(event),
     context,

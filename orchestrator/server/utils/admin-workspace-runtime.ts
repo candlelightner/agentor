@@ -26,7 +26,7 @@ const EGRESS_NETWORK = "agentor-admin-egress-v1";
 // must be materialized for existing persistent administrative workspaces.
 // The workspace volume remains untouched; only its disposable compute image
 // is refreshed.
-const ADMIN_OVERLAY_VERSION = "4";
+const ADMIN_OVERLAY_VERSION = "5";
 const ADMIN_CONTAINER = "agentor-admin-workspace";
 const ADMIN_WORKSPACE_VOLUME = "agentor-admin-workspace-data";
 const ADMIN_AGENTS_VOLUME = "agentor-admin-agent-data";
@@ -756,6 +756,14 @@ export class DockerAdminWorkspaceRuntime
       status: inspection.State.Running ? "running" : "stopped",
     };
     useContainerManager().registerExternal(info);
+    // Administrative workspaces are first-class plugin runtimes too. Reconcile
+    // only after the fresh container identity is registered, so rebuilds never
+    // execute desired state against a destroyed generation.
+    await import("./services").then(({ usePluginRuntimeManager }) =>
+      usePluginRuntimeManager().reconcileWorker(info.userId, info.id, info.containerId),
+    ).catch((error) =>
+      console.warn(`[admin-runtime] plugin reconciliation failed for ${info.id}: ${error instanceof Error ? error.message : error}`),
+    );
   }
 
   private async syncControlRepresentation(

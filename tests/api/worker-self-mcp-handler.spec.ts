@@ -6,6 +6,7 @@ const context = {
   workerId: "worker-a",
   containerName: "agentor-worker-a",
   container: { id: "worker-a", userId: "owner", status: "running" } as any,
+  authority: { kind: "ordinary", userId: "owner", workerId: "worker-a" },
 };
 
 const domain: WorkerSelfMcpDomain = {

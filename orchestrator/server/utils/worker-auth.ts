@@ -1,6 +1,8 @@
 import type { H3Event } from 'h3';
 import { createError } from 'h3';
 import { useDockerService, useContainerManager, useConfig } from './services';
+import { useAdminWorkspaceStore } from './admin-workspace-store';
+import { useGroupAdminWorkspaceStore } from './group-admin-workspace-store';
 import type { ContainerInfo } from '../../shared/types';
 
 export interface WorkerSelfContext {
@@ -9,7 +11,13 @@ export interface WorkerSelfContext {
   containerName: string;
   /** The calling worker's UUID `id`. */
   workerId: string;
+  authority?: WorkerSelfAuthority;
 }
+
+export type WorkerSelfAuthority =
+  | { kind: 'ordinary'; userId: string; workerId: string }
+  | { kind: 'platform-admin'; workspaceId: string }
+  | { kind: 'group-admin'; workspaceId: string; groupId: string; ownerId: string };
 
 interface IpMapEntry {
   containerName: string;
@@ -125,5 +133,53 @@ export async function requireWorkerSelf(event: H3Event): Promise<WorkerSelfConte
     userId: container.userId,
     containerName: container.containerName,
     workerId: container.id,
+    authority: { kind: 'ordinary', userId: container.userId, workerId: container.id },
   };
+}
+
+/** Plugin-only identity resolver. Administrative runtimes are deliberately
+ * excluded from generic worker-self routes; they are trusted only when the
+ * source address, live Docker labels, registered workspace and running
+ * ContainerManager entry all agree. */
+export async function requirePluginSelf(event: H3Event): Promise<WorkerSelfContext> {
+  const remoteIp = normalizeIp(event.node.req.socket?.remoteAddress ?? undefined);
+  if (!remoteIp) throw createError({ statusCode: 401, statusMessage: 'Unable to determine caller IP' });
+  // Preserve ordinary-worker behavior exactly; admin resolution below is a
+  // separate capability on private management networks.
+  const ordinary = await resolveCallerByIp(remoteIp);
+  if (ordinary) {
+    if (ordinary.status !== 'running') throw createError({ statusCode: 409, statusMessage: 'Worker container is not running' });
+    return { container: ordinary, userId: ordinary.userId, containerName: ordinary.containerName, workerId: ordinary.id, authority: { kind: 'ordinary', userId: ordinary.userId, workerId: ordinary.id } };
+  }
+  const docker = useDockerService();
+  const cm = useContainerManager();
+  const containers = await docker.listContainers();
+  for (const raw of containers) {
+    const labels = raw.Labels ?? {};
+    if (labels['agentor.administrative'] !== 'true') continue;
+    if (raw.State !== 'running') continue;
+    const networks = raw.NetworkSettings?.Networks ?? {};
+    const networkName = Object.keys(networks).find((name) =>
+      name.startsWith('agentor-management-') && networks[name]?.IPAddress === remoteIp);
+    if (!networkName) continue;
+    const name = raw.Names?.[0]?.replace(/^\//, '');
+    if (!name) continue;
+    const runtime = cm.findByContainerName(name);
+    if (!runtime || runtime.status !== 'running' || runtime.containerId !== raw.Id || runtime.containerName !== name) continue;
+    const workspaceId = labels['agentor.admin.workspace-id'];
+    if (!workspaceId || workspaceId !== runtime.id) continue;
+    let authority: WorkerSelfAuthority;
+    if (runtime.administrativeKind === 'group') {
+      const groupId = labels['agentor.admin.group-id'];
+      const record = groupId ? useGroupAdminWorkspaceStore().findByWorkspaceId(workspaceId) : undefined;
+      if (!groupId || !record || record.groupId !== groupId || record.status !== 'running') continue;
+      authority = { kind: 'group-admin', workspaceId, groupId, ownerId: record.ownerId };
+    } else {
+      const record = useAdminWorkspaceStore().getRecord();
+      if (!record || record.id !== workspaceId) continue;
+      authority = { kind: 'platform-admin', workspaceId };
+    }
+    return { container: runtime, userId: runtime.userId, containerName: name, workerId: runtime.id, authority };
+  }
+  throw createError({ statusCode: 401, statusMessage: 'Caller is not a recognized Agentor worker or administrative workspace' });
 }

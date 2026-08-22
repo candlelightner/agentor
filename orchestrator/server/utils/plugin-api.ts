@@ -1,6 +1,9 @@
 import type { H3Event } from "h3";
 import { requireResourceAccess } from "./auth-helpers";
-import { assertDefinitionVisibleToWorker } from "./plugin-scope";
+import { assertDefinitionVisibleToWorker, definitionVisibleToPluginSelf, resourceNotFound } from "./plugin-scope";
+import { useGroupAdminWorkspaceStore } from "./group-admin-workspace-store";
+import type { PluginDefinitionRecord } from "./plugin-definition-store";
+import type { WorkerSelfAuthority } from "./worker-auth";
 import {
   useContainerManager,
   usePluginDefinitionStore,
@@ -11,17 +14,34 @@ import {
 } from "./services";
 
 export function requirePluginWorker(event: H3Event, workerId: string) {
-  const worker = useWorkerStore().findById(workerId);
+  const worker = useContainerManager().get(workerId) ?? useWorkerStore().findById(workerId);
   requireResourceAccess(event, worker, { allowGlobal: true });
   return worker!;
 }
 
+export function resolvePluginTarget(workerId: string) {
+  return useContainerManager().get(workerId) ?? useWorkerStore().findById(workerId);
+}
+
+export function pluginAuthorityForTarget(worker: { id: string; userId: string; administrativeKind?: "platform" | "group" }): WorkerSelfAuthority | undefined {
+  if (worker.administrativeKind === "platform") return { kind: "platform-admin", workspaceId: worker.id };
+  if (worker.administrativeKind === "group") {
+    const record = useGroupAdminWorkspaceStore().findByWorkspaceId(worker.id);
+    return record ? { kind: "group-admin", workspaceId: worker.id, groupId: record.groupId, ownerId: record.ownerId } : undefined;
+  }
+  return { kind: "ordinary", userId: worker.userId, workerId: worker.id };
+}
+
 export function requireWorkerDefinition(
-  worker: { id: string; userId: string },
+  worker: { id: string; userId: string; administrativeKind?: "platform" | "group" },
   id: string,
-) {
+): PluginDefinitionRecord {
   const definition = usePluginDefinitionStore().getById(id);
-  assertDefinitionVisibleToWorker(definition, worker, useWorkerGroupStore());
+  if (!definition) throw resourceNotFound();
+  if (worker.administrativeKind) {
+    const authority = pluginAuthorityForTarget(worker);
+    if (!authority || !definitionVisibleToPluginSelf(definition, authority, useWorkerGroupStore())) throw resourceNotFound();
+  } else assertDefinitionVisibleToWorker(definition, worker, useWorkerGroupStore());
   return definition;
 }
 
