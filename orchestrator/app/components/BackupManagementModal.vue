@@ -74,7 +74,34 @@ async function run(key: string, fn: () => Promise<any>) {
     busy.value = "";
   }
 }
-async function save() {
+function settingsPayload() {
+  return {
+    ...api.settings.value,
+    providerId: draft.providerId,
+    enabled: draft.enabled,
+    selection: draft.selection,
+    intervalMinutes: draft.intervalMinutes,
+    retentionCount: draft.retentionCount,
+    workspaceIds: workspaceIds(),
+    selectedPathsByWorkspace: draft.selectedPathsByWorkspace,
+    nextRunAt: api.settings.value.nextRunAt,
+  };
+}
+function settingsChanged() {
+  const current = api.settings.value;
+  const next = settingsPayload();
+  return (
+    current.providerId !== next.providerId ||
+    current.enabled !== next.enabled ||
+    current.selection !== next.selection ||
+    current.intervalMinutes !== next.intervalMinutes ||
+    current.retentionCount !== next.retentionCount ||
+    JSON.stringify(current.workspaceIds) !== JSON.stringify(next.workspaceIds) ||
+    JSON.stringify(current.selectedPathsByWorkspace) !==
+      JSON.stringify(next.selectedPathsByWorkspace)
+  );
+}
+function confirmRemovedPathPersistence() {
   const removed = removedAdditionalPaths();
   if (
     removed.length &&
@@ -85,31 +112,35 @@ async function save() {
         "If you reselect the path before rebuilding again, current files are merged into the retained volume: current same-named files overwrite their older persisted versions, while other old and new files are kept.",
     )
   )
-    return;
+    return false;
+  return true;
+}
+async function save() {
+  if (!confirmRemovedPathPersistence()) return;
   await run("save", async () => {
-    await api.saveSettings({
-      ...api.settings.value,
-      providerId: draft.providerId,
-      enabled: draft.enabled,
-      selection: draft.selection,
-      intervalMinutes: draft.intervalMinutes,
-      retentionCount: draft.retentionCount,
-      workspaceIds: workspaceIds(),
-      selectedPathsByWorkspace: draft.selectedPathsByWorkspace,
-      nextRunAt: api.settings.value.nextRunAt,
-    });
+    await api.saveSettings(settingsPayload());
     emit("changed");
   });
 }
 async function backup() {
+  if (settingsChanged() && !confirmRemovedPathPersistence()) return;
   await run("backup", async () => {
-    const ids = workspaceIds();
-    const selectedPaths = draft.selection === 'all'
-      ? draft.selectedPathsByWorkspace
+    const effective = settingsChanged()
+      ? await api.saveSettings(settingsPayload())
+      : api.settings.value;
+    const selectedPaths = effective.selection === 'all'
+      ? effective.selectedPathsByWorkspace
       : Object.fromEntries(
-          Object.entries(draft.selectedPathsByWorkspace).filter(([id]) => ids.includes(id)),
+          Object.entries(effective.selectedPathsByWorkspace).filter(([id]) =>
+            effective.workspaceIds.includes(id),
+          ),
         );
-    await api.startBackup(draft.selection, ids, selectedPaths);
+    await api.startBackup(
+      effective.selection,
+      effective.workspaceIds,
+      selectedPaths,
+      effective.providerId,
+    );
     emit("changed");
   });
 }
@@ -463,7 +494,8 @@ watch(restoreTarget, (target) => {
               {{ j.consistency.warning }}
             </p>
             <p v-if="j.error" class="text-red-600 text-xs">
-              {{ j.error }}
+              <code v-if="j.errorCode" class="mr-1">{{ j.errorCode }}</code>
+              {{ j.error }}<span v-if="j.providerStatus"> (HTTP {{ j.providerStatus }})</span>
               <UButton
                 size="xs"
                 variant="ghost"

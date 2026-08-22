@@ -38,6 +38,9 @@ export interface BackupJob {
   sizeBytes?: number;
   durationMs?: number;
   error?: string;
+  errorCode?: string;
+  providerStatus?: number;
+  retryable?: boolean;
   attempt?: number;
   workspaceIds?: string[];
   consistency?: { warning?: string };
@@ -140,10 +143,11 @@ export function useBackups() {
     selection = settings.value.selection,
     workspaceIds = settings.value.workspaceIds,
     selectedPathsByWorkspace = settings.value.selectedPathsByWorkspace,
+    providerId = settings.value.providerId,
   ) {
     const job = await $fetch<BackupJob>("/api/backups", {
       method: "POST",
-      body: { selection, workspaceIds, providerId: settings.value.providerId, selectedPathsByWorkspace },
+      body: { selection, workspaceIds, providerId, selectedPathsByWorkspace },
     });
     jobs.value.unshift(job);
     schedule();

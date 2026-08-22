@@ -22,7 +22,7 @@ async function mock(page: Page) {
 }
 async function open(page:Page){await goToDashboard(page);await page.getByRole('button',{name:/backup management/i}).click();return page.locator('[data-testid="backup-management"]')}
 async function selectWorkspace(page:Page,modal:ReturnType<Page['locator']>,query:string,name:RegExp){
-  const selector=modal.getByLabel('Workspaces');
+  const selector=modal.getByTestId('backup-workspace-selector');
   await selector.click();
   await selector.fill(query);
   await page.getByRole('option',{name}).click();
@@ -30,6 +30,28 @@ async function selectWorkspace(page:Page,modal:ReturnType<Page['locator']>,query
 }
 test.beforeEach(async({page})=>mock(page));
 test('configures scheduling and starts a manual backup with progress and consistency warning',async({page})=>{const m=await open(page);await expect(m).toContainText('fake — linked');await m.getByLabel('Enable scheduled backups').check();await m.getByRole('button',{name:'Save schedule'}).click();await m.getByRole('button',{name:'Back up now'}).click();await expect(m).toContainText('queued · queued');await expect(m).toContainText('crash-consistent')});
+test('saves draft settings and uses the selected provider when backing up immediately',async({page})=>{
+  let saved:any; let started:any;
+  await page.route('**/api/backup-settings',async route=>{
+    if(route.request().method()==='PUT'){
+      saved=await route.request().postDataJSON();
+      return route.fulfill({json:saved});
+    }
+    return route.fulfill({json:{providerId:'fake',enabled:false,selection:'all',workspaceIds:[],selectedPathsByWorkspace:{},intervalMinutes:1440,retentionCount:7,nextRunAt:null}});
+  });
+  await page.route('**/api/backups',async route=>{
+    if(route.request().method()==='POST'){
+      started=await route.request().postDataJSON();
+      return route.fulfill({status:202,json:{id:'job-draft',status:'queued',phase:'queued',progress:0}});
+    }
+    return route.fulfill({json:{backups:[],jobs:[]}});
+  });
+  const m=await open(page);
+  await m.getByLabel('Provider').selectOption('google-drive');
+  await m.getByRole('button',{name:'Back up now'}).click();
+  await expect.poll(()=>saved?.providerId).toBe('google-drive');
+  await expect.poll(()=>started?.providerId).toBe('google-drive');
+});
 test('selects files and any browsed directory including root from a picker rooted at workspace', async ({ page }) => {
   const m = await open(page);
   await m.getByLabel('Selected workspaces').check();

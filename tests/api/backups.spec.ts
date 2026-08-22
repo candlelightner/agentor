@@ -710,6 +710,10 @@ test.describe
     const failed = await waitForJob(ownerCtx, created.id);
     expect(failed.status).toBe("failed");
     expect(failed.error).toBeTruthy();
+    expect(failed).toMatchObject({
+      errorCode: "BACKUP_FAILED",
+      retryable: true,
+    });
     expect(failed.error).not.toMatch(/token|credential|cipher|stack|\/data\//i);
     expect(failed.attempt).toBe(1);
     const failedSettings = await (

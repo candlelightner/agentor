@@ -16,6 +16,7 @@ import {
   FakeBackupProvider,
   GoogleDriveBackupProvider,
   exchangeGoogleAuthorizationCode,
+  publicBackupFailure,
   type BackupProvider,
   type GoogleDriveToken,
 } from "./backup-provider";
@@ -589,6 +590,9 @@ export class BackupManager {
       job.status = "queued";
       job.phase = "retrying";
       job.error = undefined;
+      job.errorCode = undefined;
+      job.providerStatus = undefined;
+      job.retryable = undefined;
       job.workerId = undefined;
       job.workerIds = undefined;
       job.missingSecrets = undefined;
@@ -1368,11 +1372,17 @@ export class BackupManager {
         }
         job.status = "failed";
         job.phase = "failed";
-        job.error = "Backup failed. Retry is available.";
+        const failure = publicBackupFailure(error);
+        job.error = failure.message;
+        job.errorCode = failure.code;
+        job.providerStatus = failure.providerStatus;
+        job.retryable = failure.retryable;
         job.completedAt = job.updatedAt = new Date().toISOString();
         job.durationMs = Date.now() - started;
         await this.commitFailedJob(job);
-        useLogger().error(`[backup] job ${job.id} failed`);
+        useLogger().error(
+          `[backup] job ${job.id} failed (${failure.code}${failure.providerStatus ? `, HTTP ${failure.providerStatus}` : ""})`,
+        );
       }
     } finally {
       const cleanupFailures: string[] = [];

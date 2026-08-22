@@ -17,6 +17,139 @@ export interface UploadResult {
   uploadId: string;
   resumedFromChunk: number;
 }
+
+export class BackupProviderFailure extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly providerStatus?: number,
+    public readonly retryable = false,
+  ) {
+    super(message);
+    this.name = "BackupProviderFailure";
+  }
+}
+
+export function publicBackupFailure(error: unknown) {
+  if (error instanceof BackupProviderFailure)
+    return {
+      code: error.code,
+      message: error.message,
+      providerStatus: error.providerStatus,
+      retryable: error.retryable,
+    };
+  return {
+    code: "BACKUP_FAILED",
+    message: "Backup failed. Check server logs for details.",
+    retryable: true,
+  };
+}
+
+async function googleResponseFailure(
+  response: Response,
+  operation: string,
+): Promise<BackupProviderFailure> {
+  const status = response.status;
+  let reasons: string[] = [];
+  try {
+    const body = (await response.clone().json()) as any;
+    reasons = [
+      body?.error?.status,
+      body?.error?.errors?.[0]?.reason,
+      body?.error,
+    ].filter((value): value is string => typeof value === "string");
+  } catch {
+    // Response bodies can contain provider diagnostics that are not safe to
+    // expose. Only known reason identifiers are classified below.
+  }
+  const reason = reasons.join(" ").toLowerCase();
+  if (/storagequotaexceeded|quotaexceeded/.test(reason))
+    return new BackupProviderFailure(
+      "GOOGLE_DRIVE_QUOTA_EXCEEDED",
+      "Google Drive storage quota is exhausted. Free storage or use another account.",
+      status,
+      false,
+    );
+  if (
+    status === 401 ||
+    /invalid_grant|invalidcredentials|autherror|unauthenticated/.test(reason)
+  )
+    return new BackupProviderFailure(
+      "GOOGLE_DRIVE_AUTHORIZATION_EXPIRED",
+      "Google Drive authorization expired or was revoked. Disconnect and reconnect Google Drive.",
+      status,
+      false,
+    );
+  if (
+    status === 429 ||
+    /ratelimitexceeded|userratelimitexceeded|dailylimitexceeded|resource_exhausted|resourceexhausted/.test(
+      reason,
+    )
+  )
+    return new BackupProviderFailure(
+      "GOOGLE_DRIVE_RATE_LIMITED",
+      "Google Drive rate limit reached. Retry the backup later.",
+      status,
+      true,
+    );
+  if (status === 403)
+    return new BackupProviderFailure(
+      "GOOGLE_DRIVE_PERMISSION_DENIED",
+      "Google Drive denied the backup request. Verify OAuth scopes and destination-folder permissions.",
+      status,
+      false,
+    );
+  if (status >= 500)
+    return new BackupProviderFailure(
+      "GOOGLE_DRIVE_TEMPORARILY_UNAVAILABLE",
+      `Google Drive is temporarily unavailable during ${operation}. Retry later.`,
+      status,
+      true,
+    );
+  return new BackupProviderFailure(
+    "GOOGLE_DRIVE_REQUEST_FAILED",
+    `Google Drive ${operation} failed.`,
+    status,
+    status === 408,
+  );
+}
+
+function normalizeGoogleUploadFailure(error: unknown): BackupProviderFailure {
+  if (error instanceof BackupProviderFailure) return error;
+  const message = error instanceof Error ? error.message : "";
+  if (/invalid Google Drive resumable upload session/i.test(message))
+    return new BackupProviderFailure(
+      "GOOGLE_DRIVE_INVALID_UPLOAD_SESSION",
+      "The saved Google Drive resumable upload session is invalid. Retry the backup to start a new upload.",
+      undefined,
+      true,
+    );
+  if (
+    /did not return an upload session|returned an invalid upload session|completed without an object id|invalid resumable offset/i.test(
+      message,
+    )
+  )
+    return new BackupProviderFailure(
+      "GOOGLE_DRIVE_INVALID_RESPONSE",
+      "Google Drive returned an invalid resumable-upload response. Retry the backup.",
+      undefined,
+      true,
+    );
+  if (message === "Backup archive changed during upload")
+    return new BackupProviderFailure(
+      "BACKUP_ARCHIVE_CHANGED",
+      "The encrypted backup archive changed during upload. Retry the backup.",
+      undefined,
+      true,
+    );
+  return new BackupProviderFailure(
+    "GOOGLE_DRIVE_UPLOAD_CONNECTION_FAILED",
+    "The Google Drive upload connection failed. The resumable upload can be retried.",
+    undefined,
+    true,
+  );
+}
+
 export interface BackupProvider {
   kind: string;
   upload(
@@ -270,10 +403,20 @@ export class GoogleDriveBackupProvider implements BackupProvider {
     )
       return token.access_token;
     if (!token.refresh_token)
-      throw new Error("Google Drive backup account is not linked");
+      throw new BackupProviderFailure(
+        "GOOGLE_DRIVE_NOT_LINKED",
+        "Google Drive is not linked. Connect a Google Drive account before starting a backup.",
+        undefined,
+        false,
+      );
     const credentials = await this.getOAuthCredentials();
     if (!credentials)
-      throw new Error("Google Drive backup OAuth is not configured");
+      throw new BackupProviderFailure(
+        "GOOGLE_DRIVE_OAUTH_NOT_CONFIGURED",
+        "Google Drive backup OAuth is not configured on this Agentor instance.",
+        undefined,
+        false,
+      );
     const response = await this.transport(
       "https://oauth2.googleapis.com/token",
       {
@@ -288,10 +431,26 @@ export class GoogleDriveBackupProvider implements BackupProvider {
         }),
       },
     );
-    if (!response.ok) throw new Error("Google Drive token refresh failed");
-    const refreshed = (await response.json()) as any;
+    if (!response.ok)
+      throw await googleResponseFailure(response, "token refresh");
+    let refreshed: any;
+    try {
+      refreshed = await response.json();
+    } catch {
+      throw new BackupProviderFailure(
+        "GOOGLE_DRIVE_INVALID_RESPONSE",
+        "Google Drive returned an invalid token-refresh response.",
+        response.status,
+        true,
+      );
+    }
     if (typeof refreshed.access_token !== "string" || !refreshed.access_token)
-      throw new Error("Google Drive token refresh returned an invalid token");
+      throw new BackupProviderFailure(
+        "GOOGLE_DRIVE_INVALID_RESPONSE",
+        "Google Drive token refresh completed without a usable access token.",
+        response.status,
+        true,
+      );
     const next: GoogleDriveToken = {
       ...token,
       access_token: refreshed.access_token,
@@ -340,8 +499,9 @@ export class GoogleDriveBackupProvider implements BackupProvider {
           // manager-side cancellation instead of starting a duplicate object.
           if (probe.status === 404 || probe.status === 410) session = undefined;
           else
-            throw new Error(
-              `Google Drive resumable upload probe failed (${probe.status})`,
+            throw await googleResponseFailure(
+              probe,
+              "resumable upload probe",
             );
         }
         else {
@@ -382,7 +542,7 @@ export class GoogleDriveBackupProvider implements BackupProvider {
           },
         );
         if (!begin.ok)
-          throw new Error("Google Drive resumable upload could not start");
+          throw await googleResponseFailure(begin, "resumable upload start");
         session = begin.headers.get("location") || undefined;
         if (!session)
           throw new Error("Google Drive did not return an upload session");
@@ -428,7 +588,7 @@ export class GoogleDriveBackupProvider implements BackupProvider {
           }
           if (response.status !== 308 && !response.ok)
             throw Object.assign(
-              new Error("Google Drive resumable upload failed"),
+              await googleResponseFailure(response, "resumable upload"),
               { uploadId: session },
             );
           offset += length;
@@ -447,14 +607,17 @@ export class GoogleDriveBackupProvider implements BackupProvider {
       // the manager so restart/cancellation cleanup can durably abort it. This
       // includes token refresh, resume probes, file open/read, and pre-request
       // cancellation—not only chunk transport failures.
-      if (session && isGoogleUploadSession(session))
-        throw Object.assign(
-          error instanceof Error
-            ? error
-            : new Error("Google Drive resumable upload failed"),
-          { uploadId: session },
-        );
-      throw error;
+      const uploadId =
+        session && isGoogleUploadSession(session) ? session : undefined;
+      if (
+        signal?.aborted ||
+        (error instanceof Error && error.name === "AbortError")
+      )
+        throw uploadId && error instanceof Error
+          ? Object.assign(error, { uploadId })
+          : error;
+      const failure = normalizeGoogleUploadFailure(error);
+      throw uploadId ? Object.assign(failure, { uploadId }) : failure;
     }
   }
   async download(
@@ -472,8 +635,15 @@ export class GoogleDriveBackupProvider implements BackupProvider {
         },
       },
     );
-    if (!response.ok || !response.body)
-      throw new Error("Google Drive backup download failed");
+    if (!response.ok)
+      throw await googleResponseFailure(response, "backup download");
+    if (!response.body)
+      throw new BackupProviderFailure(
+        "GOOGLE_DRIVE_INVALID_RESPONSE",
+        "Google Drive returned no backup download body.",
+        response.status,
+        true,
+      );
     await pipeline(
       createReadStreamFromWeb(response.body),
       createWriteStream(destination, { mode: 0o600 }),
@@ -490,7 +660,7 @@ export class GoogleDriveBackupProvider implements BackupProvider {
       },
     );
     if (!response.ok && response.status !== 404)
-      throw new Error("Google Drive backup deletion failed");
+      throw await googleResponseFailure(response, "backup deletion");
   }
   async deleteByArtifactId(userId: string, artifactId: string, signal?: AbortSignal): Promise<void> {
     assertSafePathId(artifactId, "artifactId");
@@ -501,7 +671,7 @@ export class GoogleDriveBackupProvider implements BackupProvider {
       { signal, headers: { Authorization: `Bearer ${access}` } },
     );
     if (!response.ok)
-      throw new Error("Google Drive backup reconciliation failed");
+      throw await googleResponseFailure(response, "backup reconciliation");
     const body = (await response.json()) as { files?: Array<{ id?: unknown }> };
     const objectIds = (body.files ?? [])
       .map((file) => file.id)
@@ -519,7 +689,7 @@ export class GoogleDriveBackupProvider implements BackupProvider {
     // Cancellation is idempotent: an expired or already-removed upload session
     // is terminal. Every other failure must retain the durable abort marker.
     if (!response.ok && response.status !== 404 && response.status !== 410)
-      throw new Error("Google Drive resumable upload cancellation failed");
+      throw await googleResponseFailure(response, "resumable upload cancellation");
   }
 
   private async retryChunk(
@@ -527,21 +697,29 @@ export class GoogleDriveBackupProvider implements BackupProvider {
     signal?: AbortSignal,
   ): Promise<Response> {
     let lastError: unknown;
+    let lastResponse: Response | undefined;
     for (let attempt = 0; attempt < 3; attempt++) {
       signal?.throwIfAborted();
       try {
         const response = await request();
         if (response.status !== 429 && response.status < 500) return response;
-        lastError = new Error("Google Drive resumable upload failed");
+        lastResponse = response;
       } catch (error) {
         if (signal?.aborted) throw error;
         lastError = error;
       }
       if (attempt < 2) await this.retryDelay(250 * 2 ** attempt, signal);
     }
-    throw lastError instanceof Error
+    if (lastResponse)
+      throw await googleResponseFailure(lastResponse, "resumable upload");
+    throw lastError instanceof BackupProviderFailure
       ? lastError
-      : new Error("Google Drive resumable upload failed");
+      : new BackupProviderFailure(
+          "GOOGLE_DRIVE_UPLOAD_CONNECTION_FAILED",
+          "The Google Drive upload connection failed. The resumable upload can be retried.",
+          undefined,
+          true,
+        );
   }
 }
 

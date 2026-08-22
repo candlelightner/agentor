@@ -16,6 +16,9 @@ export interface BackupJob {
   schemaVersion: 1; id: string; userId: string; workspaceId: string; provider: BackupProviderKind;
   status: BackupJobStatus; phase: string; progress: number; bytesProcessed: number;
   createdAt: string; updatedAt: string; startedAt?: string; completedAt?: string; error?: string;
+  /** Sanitized stable failure diagnostics; provider bodies, tokens, and
+   * resumable-session URLs are never persisted or returned. */
+  errorCode?: string; providerStatus?: number; retryable?: boolean;
   artifactId?: string; size?: number; durationMs?: number; sha256?: string; attempt: number;
   ownerId?: string; workspaceIds?: string[]; backupId?: string; sizeBytes?: number;
   /** Restore-only provenance and the exact selected artifact subset. */

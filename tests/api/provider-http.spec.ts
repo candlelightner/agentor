@@ -180,7 +180,12 @@ test.describe.serial("Provider HTTP boundaries", () => {
           undefined,
           "https://evil.example/upload/session",
         ),
-      ).rejects.toThrow("Invalid Google Drive resumable upload session");
+      ).rejects.toMatchObject({
+        code: "GOOGLE_DRIVE_INVALID_UPLOAD_SESSION",
+        message:
+          "The saved Google Drive resumable upload session is invalid. Retry the backup to start a new upload.",
+        retryable: true,
+      });
       await expect(
         provider.upload(
           "user",
@@ -191,7 +196,10 @@ test.describe.serial("Provider HTTP boundaries", () => {
           "https://www.googleapis.com/upload/probe-failure",
         ),
       ).rejects.toMatchObject({
-        message: "probe transport failed",
+        code: "GOOGLE_DRIVE_UPLOAD_CONNECTION_FAILED",
+        message:
+          "The Google Drive upload connection failed. The resumable upload can be retried.",
+        retryable: true,
         uploadId: "https://www.googleapis.com/upload/probe-failure",
       });
       await expect(
@@ -204,7 +212,10 @@ test.describe.serial("Provider HTTP boundaries", () => {
           "https://www.googleapis.com/upload/completed-missing-id",
         ),
       ).rejects.toMatchObject({
-        message: "Google Drive upload completed without an object id",
+        code: "GOOGLE_DRIVE_INVALID_RESPONSE",
+        message:
+          "Google Drive returned an invalid resumable-upload response. Retry the backup.",
+        retryable: true,
         uploadId: "https://www.googleapis.com/upload/completed-missing-id",
       });
       const result = await provider.upload(
@@ -233,7 +244,11 @@ test.describe.serial("Provider HTTP boundaries", () => {
     const source = join(dir, "source.backup");
     await writeFile(source, "resume-me");
     try {
-      for (const status of [401, 429, 503]) {
+      for (const [status, code] of [
+        [401, "GOOGLE_DRIVE_AUTHORIZATION_EXPIRED"],
+        [429, "GOOGLE_DRIVE_RATE_LIMITED"],
+        [503, "GOOGLE_DRIVE_TEMPORARILY_UNAVAILABLE"],
+      ] as const) {
         const session = `https://www.googleapis.com/upload/probe-${status}`;
         let newSessions = 0;
         const provider = new GoogleDriveBackupProvider(
@@ -262,11 +277,52 @@ test.describe.serial("Provider HTTP boundaries", () => {
             session,
           ),
         ).rejects.toMatchObject({
-          message: `Google Drive resumable upload probe failed (${status})`,
+          code,
+          providerStatus: status,
           uploadId: session,
         });
         expect(newSessions).toBe(0);
       }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("Google exposes stable failure diagnostics without leaking provider response bodies", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agentor-google-safe-error-"));
+    const source = join(dir, "source.backup");
+    await writeFile(source, "safe-error");
+    const secretDiagnostic = "provider-secret-diagnostic";
+    const provider = new GoogleDriveBackupProvider(
+      async () => ({
+        access_token: "valid",
+        expires_at: Date.now() + 3600_000,
+      }),
+      async () => {},
+      async () => ({ clientId: "test-client", clientSecret: "test-secret" }),
+      async () =>
+        json(
+          {
+            error: {
+              message: secretDiagnostic,
+              errors: [{ reason: "storageQuotaExceeded" }],
+            },
+          },
+          { status: 403 },
+        ),
+      async () => {},
+    );
+    try {
+      const failure = await provider
+        .upload("user", "artifact", source, () => {})
+        .catch((error) => error);
+      expect(failure).toMatchObject({
+        code: "GOOGLE_DRIVE_QUOTA_EXCEEDED",
+        providerStatus: 403,
+        retryable: false,
+      });
+      expect(failure.message).not.toContain(secretDiagnostic);
+      expect(JSON.stringify(failure)).not.toContain(secretDiagnostic);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -431,7 +487,11 @@ test.describe.serial("Provider HTTP boundaries", () => {
         "https://www.googleapis.com/upload/cancel-session",
         "artifact",
       ),
-    ).rejects.toThrow("Google Drive resumable upload cancellation failed");
+    ).rejects.toMatchObject({
+      code: "GOOGLE_DRIVE_TEMPORARILY_UNAVAILABLE",
+      providerStatus: 503,
+      retryable: true,
+    });
   });
 
   test("Google Drive reconciles a crash-window upload by artifact metadata", async () => {
