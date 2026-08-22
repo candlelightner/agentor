@@ -71,6 +71,13 @@ export async function proxyPluginUi(event: H3Event, suffix = "") {
       statusMessage: "Plugin action not found",
     });
 
+  // Desktop/noVNC is an Agentor-managed route, not a worker-local HTTP app.
+  // Redirect only after the normal authenticated installation/action checks so
+  // the desktop proxy retains its owner/admin authorization and clipboard
+  // bridge instead of exposing raw port 6080 through the generic gateway.
+  if (action.openMode === "desktop")
+    return sendRedirect(event, `/desktop/${encodeURIComponent(worker.id)}/agentor.html`, 302);
+
   const method = event.method.toUpperCase();
   if (!["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"].includes(method))
     throw createError({ statusCode: 405, statusMessage: "Method not allowed" });

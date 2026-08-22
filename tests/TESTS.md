@@ -118,7 +118,7 @@ tests/
 
 | `worker-protection-lock.spec.ts` | 6 | Password-verifier-only worker locks: set/change/remove validation, no password/hash disclosure, required lock credentials on settings/configuration/archive/unarchive, running-workspace file mutations, managed-network membership, stop/restart alternate lifecycle paths, and correct-password recovery. |
 | `backup-path-selection.spec.ts` | 2 | Flexible backup-path normalization: absolute POSIX paths only, 32-path cap, deduplication and parent-path collapse, with legacy workspace/agent defaults retained. |
-| `plugin-core.spec.ts` | 5 | Strict manifest/scope/resource validation, safe SVG handling, durable serialized worker-local allocation, generation-aware reconciliation, fail-closed group visibility, and bounded lifecycle deadlines. |
+| `plugin-core.spec.ts` | 6 | Strict manifest/scope/resource validation, safe SVG handling, durable serialized worker-local allocation, generation-aware reconciliation, fail-closed group visibility, bounded lifecycle deadlines, and authenticated desktop/noVNC action mode. |
 | `plugin-scope.spec.ts` | 4 | Ordinary, platform-admin, and group-admin plugin visibility and mutation boundaries across ancestor, sibling, descendant, and owner scopes. |
 | `plugins-rest.spec.ts` | 2 | Authenticated definition and installation lifecycle: create/list/install disabled, toggle desired state, and remove; global-admin creation derives owner/worker definition ownership from the target worker. |
 | `plugin-portability.spec.ts` | 1 | Clone/export/import plugin snapshots omit credentials and runtime allocations, remint worker-local state, and report missing secret names. |

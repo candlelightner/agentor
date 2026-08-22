@@ -73,6 +73,14 @@ test("plugin manifest is strict about scope, lifecycle, and resource references"
   ]) expect(() => validatePluginManifest(invalid)).toThrow(/secret values/);
 });
 
+test("desktop plugin actions use Agentor's authenticated noVNC route", () => {
+  const parsed = validatePluginManifest({
+    ...manifest(6080),
+    actions: [{ id: "desktop", label: "Open desktop", kind: "private-ui", portId: "web", path: "/vnc.html", openMode: "desktop" }],
+  });
+  expect(parsed.actions?.[0]?.openMode).toBe("desktop");
+});
+
 test("plugin SVG sanitizer rejects active content and preserves valid self-closing markup", () => {
   expect(
     sanitizePluginSvg('<svg viewBox="0 0 24 24"><path d="M1 1L2 2"/></svg>'),

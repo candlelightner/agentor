@@ -92,7 +92,7 @@ export interface PluginManifest {
   version: string;
   lifecycle: { start: { argv: string[]; [key: string]: unknown }; [key: string]: unknown };
   environment?: { envKeys?: string[]; secretKeys?: string[] };
-  actions?: Array<{ id: string; label: string; kind: 'private-ui'; portId: string; path: string; openMode?: 'sandboxed-pane' }>;
+  actions?: Array<{ id: string; label: string; kind: 'private-ui'; portId: string; path: string; openMode?: 'sandboxed-pane' | 'desktop' }>;
   [key: string]: unknown;
 }
 

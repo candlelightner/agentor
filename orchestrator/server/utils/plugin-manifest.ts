@@ -43,7 +43,7 @@ export interface PluginPrivateAction {
   kind: "private-ui";
   portId: string;
   path: string;
-  openMode?: "sandboxed-pane";
+  openMode?: "sandboxed-pane" | "desktop";
 }
 
 export interface PluginManifest {
@@ -493,11 +493,8 @@ function validateActions(
     )
       fail("action.path must be a safe relative backend path");
     const openMode = raw.openMode ?? "sandboxed-pane";
-    // A separate-origin presentation needs an independently authenticated
-    // gateway, which is not part of the core runner. Reject it instead of
-    // persisting a mode that an API/UI might accidentally serve same-origin.
-    if (openMode !== "sandboxed-pane")
-      fail("Only sandboxed-pane plugin actions are currently supported");
+    if (openMode !== "sandboxed-pane" && openMode !== "desktop")
+      fail("Unsupported plugin action openMode");
     return {
       id,
       label: requiredText(raw.label, "action.label", 1, 100),

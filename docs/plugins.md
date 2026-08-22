@@ -73,7 +73,10 @@ definition exports.
 Private UI actions are restricted to a declared plugin port and path. They are
 served through the authenticated plugin UI proxy and open in a sandboxed
 dashboard pane; a plugin does not receive a public Traefik mapping simply by
-declaring an action.
+declaring an action. Actions may use `openMode: "desktop"` for a noVNC-backed
+application: after the same installation/action authorization, Agentor routes
+the pane to `/desktop/:workerId/agentor.html`, preserving the authenticated
+clipboard-aware desktop proxy instead of forwarding raw port 6080.
 
 ## Worker-self MCP
 
