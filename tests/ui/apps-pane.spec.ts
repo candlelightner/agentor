@@ -67,6 +67,10 @@ test.describe.serial('Apps Pane — UI', () => {
     await goToDashboard(page);
     const card = page.locator('.rounded-lg').filter({ hasText: displayName }).first();
     await expect(card.locator('text=running')).toBeVisible({ timeout: 60_000 });
+    // Ready custom applications are also promoted to the worker card, below
+    // its standard lifecycle/action row, without requiring Apps to be opened.
+    const cardAction = card.getByTestId('worker-plugin-actions').getByRole('button', { name: /Plugin UI test.*Open plugin/ });
+    await expect(cardAction).toBeVisible({ timeout: 15_000 });
     await card.locator('button').nth(3).click();
     const action = page.getByTestId('installed-plugin-actions').getByRole('button', { name: /Plugin UI test.*Open plugin/ });
     await expect(action).toBeVisible();

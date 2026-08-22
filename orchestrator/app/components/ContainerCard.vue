@@ -56,6 +56,19 @@ const shortImageId = computed(() => {
 const isRunning = computed(() => props.container.status === 'running');
 const isStopped = computed(() => props.container.status === 'stopped');
 const isPlatformAdmin = computed(() => props.container.administrativeKind === 'platform');
+const cardContainerId = computed(() => props.container.id);
+const { openPluginTab } = useSplitPanes();
+const cardPlugins = usePlugins(cardContainerId);
+const cardPluginDefinitions = computed(() => new Map(cardPlugins.definitions.value.map(item => [item.id, item])));
+const cardPluginActions = computed(() => cardPlugins.installations.value.flatMap((installation) => {
+  const definition = cardPluginDefinitions.value.get(installation.definitionId);
+  if (!definition || !installation.desiredEnabled || !installation.observed.ready) return [];
+  return (definition.manifest.actions || []).map(action => ({ installation, definition, action }));
+}));
+onBeforeUnmount(cardPlugins.stop);
+function openCardPlugin(item: (typeof cardPluginActions.value)[number]) {
+  openPluginTab(props.container.id, displayLabel.value, item.installation.id, item.action.id, `${item.definition.name}: ${item.action.label}`);
+}
 
 function metricColor(p: number) {
   return p >= 80
@@ -220,6 +233,12 @@ function onHScrollWheel(e: WheelEvent) {
       </div>
     </div>
 
+    <div v-if="isRunning && cardPluginActions.length" class="card-plugin-actions mt-2 flex items-center gap-1.5 overflow-x-auto" data-testid="worker-plugin-actions" @wheel="onHScrollWheel">
+      <UTooltip v-for="item in cardPluginActions" :key="`${item.installation.id}-${item.action.id}`" :text="`${item.definition.name}: ${item.action.label}`">
+        <UButton size="xs" color="neutral" variant="outline" icon="i-lucide-puzzle" @click="openCardPlugin(item)">{{ item.definition.name }} · {{ item.action.label }}</UButton>
+      </UTooltip>
+    </div>
+
     <UploadModal
       v-model:open="showUpload"
       :container-id="container.id"
@@ -257,9 +276,15 @@ function onHScrollWheel(e: WheelEvent) {
   overflow-x: auto;
   scrollbar-width: none;
 }
+.card-plugin-actions {
+  scrollbar-width: none;
+}
 .card-header::-webkit-scrollbar,
 .card-metrics::-webkit-scrollbar,
 .card-actions::-webkit-scrollbar {
+  display: none;
+}
+.card-plugin-actions::-webkit-scrollbar {
   display: none;
 }
 </style>
