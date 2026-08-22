@@ -153,14 +153,15 @@ export async function requirePluginSelf(event: H3Event): Promise<WorkerSelfConte
   }
   const docker = useDockerService();
   const cm = useContainerManager();
-  const containers = await docker.listContainers();
+  const containers = await docker.listAdministrativeContainers();
   for (const raw of containers) {
     const labels = raw.Labels ?? {};
     if (labels['agentor.administrative'] !== 'true') continue;
     if (raw.State !== 'running') continue;
     const networks = raw.NetworkSettings?.Networks ?? {};
     const networkName = Object.keys(networks).find((name) =>
-      name.startsWith('agentor-management-') && networks[name]?.IPAddress === remoteIp);
+      (name === 'agentor-management' || name.startsWith('agentor-management-')) &&
+      networks[name]?.IPAddress === remoteIp);
     if (!networkName) continue;
     const name = raw.Names?.[0]?.replace(/^\//, '');
     if (!name) continue;

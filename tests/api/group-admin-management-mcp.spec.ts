@@ -238,6 +238,12 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     terminal.sendLine(`C=$(cat /run/agentor-management/credential); curl -fsS -H "Authorization: Bearer $C" -H 'Content-Type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' http://agentor-orchestrator:3099/mcp`);
     await terminal.waitForOutput(/agentor-management/, 30_000);
     terminal.close();
+    const workerMcp = await captureCommandOutput(
+      workspaceId,
+      `printf '%s\\n' '{"jsonrpc":"2.0","id":72,"method":"initialize","params":{}}' | /usr/local/bin/agentor-worker-mcp`,
+    );
+    expect(workerMcp).toContain('"name":"agentor-worker"');
+    expect(workerMcp).not.toContain('Worker MCP upstream request failed');
   });
 
   test("identity is workspace- and group-bound, and cannot be substituted", async ({ request }) => {

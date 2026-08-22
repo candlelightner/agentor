@@ -86,6 +86,12 @@ test.describe.serial('Persistent administrative workspace', () => {
     expect((await request.get(`/api/containers/${adminWorkspaceId}/desktop/status`)).status()).toBe(200);
     expect((await request.post(`/api/containers/${adminWorkspaceId}/stop`, { data: {} })).status()).toBe(409);
     expect((await request.delete(`/api/containers/${adminWorkspaceId}`)).status()).toBe(409);
+    const workerMcp = await captureCommandOutput(
+      adminWorkspaceId,
+      `printf '%s\\n' '{"jsonrpc":"2.0","id":71,"method":"initialize","params":{}}' | /usr/local/bin/agentor-worker-mcp`,
+    );
+    expect(workerMcp).toContain('"name":"agentor-worker"');
+    expect(workerMcp).not.toContain('Worker MCP upstream request failed');
     await request.delete(`/api/containers/${adminWorkspaceId}/panes/${created.index}`);
   });
 

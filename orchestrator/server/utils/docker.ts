@@ -318,6 +318,18 @@ export class DockerService {
     });
   }
 
+  /** Administrative runtimes deliberately use `agentor.managed=false`, so
+   * they must never be discovered through the ordinary worker inventory.
+   * Keep this separate label-filtered query for privileged source-IP identity
+   * resolution; callers still validate the live workspace record, container
+   * registration, immutable labels, and private management network. */
+  async listAdministrativeContainers(): Promise<Docker.ContainerInfo[]> {
+    return this.docker.listContainers({
+      all: true,
+      filters: { label: ["agentor.administrative=true"] },
+    });
+  }
+
   async execAttachTmuxWindow(
     containerId: string,
     windowIndex: number
