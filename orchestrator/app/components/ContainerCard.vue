@@ -67,7 +67,7 @@ const cardPluginActions = computed(() => cardPlugins.installations.value.flatMap
 }));
 onBeforeUnmount(cardPlugins.stop);
 function openCardPlugin(item: (typeof cardPluginActions.value)[number]) {
-  openPluginTab(props.container.id, displayLabel.value, item.installation.id, item.action.id, `${item.definition.name}: ${item.action.label}`);
+  openPluginTab(props.container.id, displayLabel.value, item.installation.id, item.action.id, `${item.definition.name}: ${item.action.label}`, item.action.openMode === 'desktop' || (item.action.path === '/vnc.html' && item.installation.allocations?.ports?.[item.action.portId] === 6080) ? 'desktop' : 'sandboxed-pane');
 }
 
 function metricColor(p: number) {

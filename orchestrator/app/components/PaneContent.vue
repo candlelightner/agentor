@@ -66,6 +66,7 @@ watch(() => props.group.tabs, (tabs) => {
           :installation-id="tab.pluginInstallationId"
           :action-id="tab.pluginActionId"
           :label="tab.pluginName || 'Plugin'"
+          :open-mode="tab.pluginOpenMode || 'sandboxed-pane'"
         />
       </div>
     </template>

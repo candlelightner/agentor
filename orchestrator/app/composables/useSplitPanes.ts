@@ -267,6 +267,7 @@ export function useSplitPanes() {
     pluginInstallationId: string,
     pluginActionId: string,
     pluginName: string,
+    pluginOpenMode: 'sandboxed-pane' | 'desktop' = 'sandboxed-pane',
     targetNodeId?: string,
   ) {
     const before = new Set(tabs.value.map((tab) => tab.id));
@@ -276,6 +277,7 @@ export function useSplitPanes() {
     created.pluginInstallationId = pluginInstallationId;
     created.pluginActionId = pluginActionId;
     created.pluginName = pluginName;
+    created.pluginOpenMode = pluginOpenMode;
   }
 
   function closeTab(tabId: string) {

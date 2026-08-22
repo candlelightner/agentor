@@ -4,10 +4,13 @@ const props = defineProps<{
   installationId: string;
   actionId: string;
   label: string;
+  openMode: 'sandboxed-pane' | 'desktop';
 }>();
 
 const source = computed(() =>
-  `/plugin-ui/${encodeURIComponent(props.containerId)}/${encodeURIComponent(props.installationId)}/${encodeURIComponent(props.actionId)}/`,
+  props.openMode === 'desktop'
+    ? `/desktop/${encodeURIComponent(props.containerId)}/agentor.html?autoconnect=true&resize=scale&quality=9&compression=0&reconnect=true&reconnect_delay=2000&path=ws/desktop/${encodeURIComponent(props.containerId)}`
+    : `/plugin-ui/${encodeURIComponent(props.containerId)}/${encodeURIComponent(props.installationId)}/${encodeURIComponent(props.actionId)}/`,
 );
 </script>
 
@@ -19,7 +22,7 @@ const source = computed(() =>
     <iframe
       :src="source"
       :title="label"
-      sandbox="allow-forms allow-scripts"
+      :sandbox="props.openMode === 'desktop' ? undefined : 'allow-forms allow-scripts'"
       referrerpolicy="no-referrer"
       class="h-full w-full border-0"
       data-testid="plugin-application-frame"

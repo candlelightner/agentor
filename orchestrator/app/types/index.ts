@@ -111,6 +111,7 @@ export interface PluginInstallation {
   definitionId: string;
   desiredEnabled: boolean;
   observed: { state: string; ready: boolean; checkedAt?: string; error?: { code: string; message: string } };
+  allocations?: { ports?: Record<string, number>; display?: number };
 }
 
 export interface PortMapping {
@@ -228,6 +229,7 @@ export interface Tab {
   pluginInstallationId?: string;
   pluginActionId?: string;
   pluginName?: string;
+  pluginOpenMode?: 'sandboxed-pane' | 'desktop';
 }
 
 export type SplitDirection = 'horizontal' | 'vertical';

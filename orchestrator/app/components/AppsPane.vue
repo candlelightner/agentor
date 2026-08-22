@@ -79,6 +79,7 @@ function openInstalledPlugin(item: (typeof pluginActions.value)[number]) {
     item.installation.id,
     item.action.id,
     `${item.definition.name}: ${item.action.label}`,
+    item.action.openMode === 'desktop' || (item.action.path === '/vnc.html' && item.installation.allocations?.ports?.[item.action.portId] === 6080) ? 'desktop' : 'sandboxed-pane',
   );
 }
 function openPluginCatalog() {
