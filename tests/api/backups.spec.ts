@@ -645,6 +645,14 @@ test.describe
       retentionCount: 3,
     });
     expect(settings.nextRunAt).toBeTruthy();
+    // The dashboard rehydrates from GET after a full page reload; keep a
+    // regression assertion that the selected workspace configuration is
+    // durable rather than only present in the PUT response.
+    expect(await (await ownerCtx.get("/api/backup-settings")).json()).toMatchObject({
+      enabled: true,
+      selection: "selected",
+      workspaceIds: [workspaceA],
+    });
 
     const disabled = await ownerCtx.put("/api/backup-settings", {
       data: { enabled: false },
