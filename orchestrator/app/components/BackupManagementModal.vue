@@ -22,7 +22,8 @@ const busy = ref(""),
   restoreLockPassword = ref(""),
   confirmOverwrite = ref(false),
   pickerWorkspaceId = ref(""),
-  actionError = ref("");
+  actionError = ref(""),
+  savedNotice = ref("");
 const googleDraft = reactive({ clientId: "", redirectUri: "", clientSecret: "" });
 watch(open, async (shown) => {
   if (shown) {
@@ -33,6 +34,7 @@ watch(open, async (shown) => {
       workspaceIds: [...api.settings.value.workspaceIds],
       selectedPathsByWorkspace: structuredClone(api.settings.value.selectedPathsByWorkspace || {}),
     });
+    savedNotice.value = "";
   } else {
     api.stop();
     restoreLockPassword.value = "";
@@ -118,7 +120,18 @@ function confirmRemovedPathPersistence() {
 async function save() {
   if (!confirmRemovedPathPersistence()) return;
   await run("save", async () => {
-    await api.saveSettings(settingsPayload());
+    const persisted = await api.saveSettings(settingsPayload());
+    // Rehydrate the draft from the server's canonical response. This makes
+    // normalization or a rejected path visible immediately instead of
+    // leaving an optimistic selection that disappears on the next refresh.
+    Object.assign(draft, {
+      ...persisted,
+      workspaceIds: [...persisted.workspaceIds],
+      selectedPathsByWorkspace: structuredClone(
+        persisted.selectedPathsByWorkspace || {},
+      ),
+    });
+    savedNotice.value = `Saved at ${new Date().toLocaleTimeString()}`;
     emit("changed");
   });
 }
@@ -462,6 +475,8 @@ watch(restoreTarget, (target) => {
             </div>
           </section>
           <div class="flex gap-2">
+            <span v-if="settingsChanged()" class="self-center text-xs text-amber-600" role="status">Unsaved changes</span>
+            <span v-else-if="savedNotice" class="self-center text-xs text-green-600" role="status">{{ savedNotice }}</span>
             <UButton :loading="busy === 'save'" @click="save"
               >Save schedule</UButton
             ><UButton

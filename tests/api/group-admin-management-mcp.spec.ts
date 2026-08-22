@@ -293,6 +293,10 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
         expect(tool.inputSchema.properties || {}).not.toHaveProperty("targetGroupId");
     }
     const schemas = new Map(discoveredTools.map((tool) => [tool.name, tool.inputSchema]));
+    expect(schemas.get("backups.create")?.required).toEqual(["workspaceIds"]);
+    expect(schemas.get("backups.create")?.properties || {}).not.toHaveProperty("ownerId");
+    expect(schemas.get("backups.paths.list")?.required).toEqual(["workerId"]);
+    expect(schemas.get("backups.paths.list")?.properties || {}).not.toHaveProperty("ownerId");
     expect((schemas.get("workers.create")?.properties as any)?.timeoutSeconds).toMatchObject({
       type: "integer", minimum: 1, maximum: 120,
     });
@@ -321,6 +325,29 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     expect(listed.status()).toBe(200);
     const ids = (await listed.json()).workers.map((worker: { id: string }) => worker.id);
     expect(ids).toEqual([memberId]);
+
+    // Backup path selection is available through the group MCP as well as the
+    // GUI. The owner is derived from the bound identity, and the group's own
+    // administrative workspace is a valid path-browsing target even though it
+    // is intentionally omitted from workers.list().
+    const ownPaths = await invoke(request, credential, "backups.paths.list", {
+      workerId: workspaceId,
+      path: "/workspace",
+    });
+    expect(ownPaths.status(), await ownPaths.text()).toBe(200);
+    const selectedBackup = await invoke(request, credential, "backups.create", {
+      workspaceIds: [memberId],
+      selectedPathsByWorkspace: { [memberId]: ["/workspace"] },
+    });
+    expect(selectedBackup.status(), await selectedBackup.text()).toBe(200);
+    const selectedBackupJob = await selectedBackup.json();
+    expect(selectedBackupJob).toMatchObject({ workspaceIds: [memberId] });
+    await invoke(request, credential, "backups.cancel", { jobId: selectedBackupJob.id });
+    const deniedSelectedPath = await invoke(request, credential, "backups.create", {
+      workspaceIds: [memberId],
+      selectedPathsByWorkspace: { [outsiderId]: ["/workspace"] },
+    });
+    expect(deniedSelectedPath.status()).toBe(404);
 
     expect((await invoke(request, credential, "workers.inspect", { workerId: memberId })).status()).toBe(200);
     // Direct targeting must enforce the same boundary as discovery; knowing a

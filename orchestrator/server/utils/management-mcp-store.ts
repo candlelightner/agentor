@@ -281,6 +281,15 @@ const GROUP_ADMIN_BACKUP_JOB_TOOLS = new Set([
   "backups.status",
   "backups.cancel",
 ]);
+// Group principals may create and inspect path selections for workers in their
+// subtree (and for their own administrative workspace).  The owner is always
+// derived from the authenticated workspace identity; it is never supplied by
+// the caller.
+const GROUP_ADMIN_BACKUP_TOOLS = new Set([
+  "backups.create",
+  "backups.paths.list",
+  ...GROUP_ADMIN_BACKUP_JOB_TOOLS,
+]);
 const GROUP_ADMIN_CONSOLE_SESSION_TOOLS = new Set([
   "console.read",
   "console.write",
@@ -685,6 +694,8 @@ export class ManagementMcpStore {
               ? "Create an evaluation worker owned by and atomically enrolled in this administrative group. The owner and group are derived from the workspace identity; timeoutSeconds bounds the MCP wait while safe enrollment or rollback remains serialized."
               : identity?.scope === "group" && GROUP_ADMIN_IMAGE_TOOLS.has(name)
                 ? `${imageBackup?.description || "Manage an image"} in the authorized image hierarchy. Global and ancestor images are read/use-only; this group and descendant images are manageable.`
+                : identity?.scope === "group" && GROUP_ADMIN_BACKUP_TOOLS.has(name)
+                  ? `${imageBackup?.description || "Manage a backup"} only for workers in the bound group subtree and the calling administrative workspace. Owner identity is derived server-side.`
                 : identity?.scope === "group" && name.startsWith("networks.")
                   ? groupNetworkDescription(name)
                   : identity?.scope === "group" && name.startsWith("groups.")
@@ -709,6 +720,8 @@ export class ManagementMcpStore {
               ? groupWorkerCreateInputSchema()
               : identity?.scope === "group" && GROUP_ADMIN_IMAGE_TOOLS.has(name)
                 ? groupImageInputSchema(name)
+                : identity?.scope === "group" && GROUP_ADMIN_BACKUP_TOOLS.has(name)
+                  ? groupBackupInputSchema(name)
                 : identity?.scope === "group" && name.startsWith("networks.")
                   ? groupNetworkInputSchema(name)
                   : identity?.scope === "group" && name.startsWith("groups.")
@@ -897,6 +910,11 @@ export class ManagementMcpStore {
       }
       if (identity.scope === "group" && GROUP_ADMIN_IMAGE_TOOLS.has(name)) {
         if (args.ownerId !== undefined || args.groupId !== undefined)
+          throw groupResourceNotFound();
+        args = { ...args, ownerId: identity.ownerId };
+      }
+      if (identity.scope === "group" && GROUP_ADMIN_BACKUP_TOOLS.has(name)) {
+        if (args.ownerId !== undefined)
           throw groupResourceNotFound();
         args = { ...args, ownerId: identity.ownerId };
       }
@@ -1881,6 +1899,16 @@ export class ManagementMcpStore {
     )
       throw groupResourceNotFound();
     const ids = this.groupWorkerIds(identity);
+    // Administrative workspaces are intentionally absent from workers.list,
+    // but their own group admin workspace is a valid backup/path-browsing
+    // target. Keep that exception narrow so it cannot widen ordinary worker
+    // inspection or lifecycle scope.
+    const backupIds = new Set(ids);
+    if (GROUP_ADMIN_BACKUP_TOOLS.has(name)) {
+      const self = useContainerManager().get(identity.workspaceId);
+      if (self?.administrativeKind === "group")
+        backupIds.add(identity.workspaceId);
+    }
     if (name === "groups.create") {
       const parentId = typeof args.parentId === "string" ? args.parentId : "";
       const hierarchy = new WorkerGroupHierarchy(useWorkerGroupStore());
@@ -1989,7 +2017,7 @@ export class ManagementMcpStore {
       const job = await useBackupManager().getJob(String(args.jobId || ""));
       const targets =
         job?.workspaceIds ?? (job?.workspaceId ? [job.workspaceId] : []);
-      if (!job || !targets.length || targets.some((id) => !ids.has(id)))
+      if (!job || !targets.length || targets.some((id) => !backupIds.has(id)))
         throw groupResourceNotFound();
       return;
     }
@@ -2014,16 +2042,20 @@ export class ManagementMcpStore {
         statusCode: 403,
       });
     for (const key of ["workerId", "workspaceId"] as const)
-      if (typeof args[key] === "string" && !ids.has(args[key] as string))
+      if (typeof args[key] === "string" && !(GROUP_ADMIN_BACKUP_TOOLS.has(name) ? backupIds : ids).has(args[key] as string))
         throw groupResourceNotFound();
     for (const key of ["workerIds", "workspaceIds"] as const)
       if (
         Array.isArray(args[key]) &&
         (args[key] as unknown[]).some(
-          (value) => typeof value !== "string" || !ids.has(value),
+          (value) => typeof value !== "string" || !(GROUP_ADMIN_BACKUP_TOOLS.has(name) ? backupIds : ids).has(value),
         )
       )
         throw groupResourceNotFound();
+    if (name === "backups.create" && args.selectedPathsByWorkspace && typeof args.selectedPathsByWorkspace === "object" && !Array.isArray(args.selectedPathsByWorkspace)) {
+      for (const id of Object.keys(args.selectedPathsByWorkspace as Record<string, unknown>))
+        if (!backupIds.has(id)) throw groupResourceNotFound();
+    }
   }
   async approve(id: string, actor: string) {
     await this.init();
@@ -2218,6 +2250,18 @@ function groupNetworkDescription(name: string): string {
                 ? "Delete"
                 : "Manage";
   return `${action} only group-scoped managed networks belonging to the bound administrative group or a live descendant.`;
+}
+function groupBackupInputSchema(name: string): Record<string, unknown> {
+  const source = imageBackupDomain.tools().find((tool) => tool.name === name)
+    ?.inputSchema as any;
+  const schema = structuredClone(source || { type: "object", properties: {} });
+  schema.required = (schema.required || []).filter(
+    (key: string) => key !== "ownerId",
+  );
+  if (schema.properties) delete schema.properties.ownerId;
+  schema.description =
+    "This operation is scoped by the calling administrative workspace. Worker IDs and selected paths must belong to the bound group subtree; the owner is derived from the authenticated identity.";
+  return schema;
 }
 function groupStructuralInputSchema(name: string): Record<string, unknown> {
   const source = workerDomain.tools().find((tool) => tool.name === name)
