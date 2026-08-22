@@ -78,7 +78,7 @@ export async function proxyPluginUi(event: H3Event, suffix = "") {
   // Keep definitions created before desktop mode existed working when they
   // use Agentor's canonical noVNC port/path.
   if (action.openMode === "desktop" || (port === 6080 && action.path === "/vnc.html"))
-    return sendRedirect(event, `/desktop/${encodeURIComponent(worker.id)}/agentor.html`, 302);
+    return sendRedirect(event, `/desktop/${encodeURIComponent(worker.id)}/agentor.html?autoconnect=true&resize=scale&quality=9&compression=0&reconnect=true&reconnect_delay=2000&path=ws/desktop/${encodeURIComponent(worker.id)}`, 302);
 
   const method = event.method.toUpperCase();
   if (!["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"].includes(method))
