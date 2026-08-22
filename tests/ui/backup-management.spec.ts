@@ -6,6 +6,10 @@ async function mock(page: Page) {
   await page.route('**/api/backup-providers',r=>r.fulfill({json:[{id:'fake',type:'fake',connected:true},{id:'google',type:'google-drive',connected:false}]}));
   await page.route('**/api/admin/backup-providers/google-oauth',async r=>r.fulfill({json:r.request().method()==='PUT'?{configured:true,source:'installation',clientId:'dashboard-client',redirectUri:'https://dash.example/api/backup-providers/google/oauth/callback',clientSecretConfigured:true}:{configured:false,source:'none',clientSecretConfigured:false}}));
   await page.route('**/api/backup-settings',async r=>r.fulfill({json:r.request().method()==='PUT'?await r.request().postDataJSON():{providerId:'fake',enabled:false,selection:'all',workspaceIds:[],intervalMinutes:1440,retentionCount:7,nextRunAt:null}}));
+  await page.route('**/api/containers',r=>r.fulfill({json:[
+    {id:'worker-1',userId:'test-user',displayName:'Alpha worker',status:'running'},
+    {id:'worker-2',userId:'test-user',displayName:'Beta worker',status:'stopped'},
+  ]}));
   await page.route('**/api/backups',async r=>{if(r.request().method()==='POST'){const j={id:'job-1',status:'queued',phase:'queued',progress:0,consistency:{warning:'Running worker: crash-consistent copy'}};jobs=[j];return r.fulfill({status:202,json:j})}return r.fulfill({json:{backups,jobs}})});
   await page.route('**/api/backup-jobs/job-1/retry',r=>r.fulfill({status:202,json:{id:'job-2',status:'queued',phase:'queued',progress:0}}));
   await page.route('**/api/backups/backup-1/restore',r=>r.fulfill({status:202,json:{jobId:'restore-1'}}));
@@ -17,12 +21,19 @@ async function mock(page: Page) {
   });
 }
 async function open(page:Page){await goToDashboard(page);await page.getByRole('button',{name:/backup management/i}).click();return page.locator('[data-testid="backup-management"]')}
+async function selectWorkspace(page:Page,modal:ReturnType<Page['locator']>,query:string,name:RegExp){
+  const selector=modal.getByLabel('Workspaces');
+  await selector.click();
+  await selector.fill(query);
+  await page.getByRole('option',{name}).click();
+  await page.keyboard.press('Escape');
+}
 test.beforeEach(async({page})=>mock(page));
 test('configures scheduling and starts a manual backup with progress and consistency warning',async({page})=>{const m=await open(page);await expect(m).toContainText('fake — linked');await m.getByLabel('Enable scheduled backups').check();await m.getByRole('button',{name:'Save schedule'}).click();await m.getByRole('button',{name:'Back up now'}).click();await expect(m).toContainText('queued · queued');await expect(m).toContainText('crash-consistent')});
 test('selects files and any browsed directory including root from a picker rooted at workspace', async ({ page }) => {
   const m = await open(page);
   await m.getByLabel('Selected workspaces').check();
-  await m.getByLabel(/Workspace IDs/).fill('worker-1');
+  await selectWorkspace(page,m,'Alpha',/Alpha worker.*Worker.*running.*worker-1/i);
   await m.getByRole('button', { name: 'Choose paths' }).click();
   const picker = page.getByTestId('backup-path-picker');
   const project = picker.getByRole('button', { name: 'project', exact: true });
@@ -40,7 +51,7 @@ test('selects files and any browsed directory including root from a picker roote
 test('warns precisely which retained and detached data can change when persistence is deselected', async ({ page }) => {
   const m = await open(page);
   await m.getByLabel('Selected workspaces').check();
-  await m.getByLabel(/Workspace IDs/).fill('worker-1');
+  await selectWorkspace(page,m,'worker-1',/Alpha worker.*worker-1/i);
   await m.getByRole('button', { name: 'Choose paths' }).click();
   let picker = page.getByTestId('backup-path-picker');
   await picker.getByRole('checkbox').nth(1).check();

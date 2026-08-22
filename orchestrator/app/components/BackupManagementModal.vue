@@ -7,7 +7,7 @@ const api = useBackups(),
     providerId: "local",
     enabled: false,
     selection: "all" as "all" | "selected",
-    workspaceText: "",
+    workspaceIds: [] as string[],
     selectedPathsByWorkspace: {} as Record<string, string[]>,
     intervalMinutes: 1440,
     retentionCount: 7,
@@ -17,6 +17,7 @@ const busy = ref(""),
   restoreTarget = ref<"new" | "original">("new"),
   restoreWorkspaceIds = ref<string[]>([]),
   workspaceNames = ref<Record<string, string>>({}),
+  workspaceOptions = ref<WorkspaceOption[]>([]),
   restoreName = ref(""),
   restoreLockPassword = ref(""),
   confirmOverwrite = ref(false),
@@ -29,7 +30,7 @@ watch(open, async (shown) => {
     await refreshWorkspaceNames();
     Object.assign(draft, {
       ...api.settings.value,
-      workspaceText: api.settings.value.workspaceIds.join(", "),
+      workspaceIds: [...api.settings.value.workspaceIds],
       selectedPathsByWorkspace: structuredClone(api.settings.value.selectedPathsByWorkspace || {}),
     });
   } else {
@@ -38,11 +39,29 @@ watch(open, async (shown) => {
   }
 });
 onBeforeUnmount(api.stop);
-const workspaceIds = () =>
-  draft.workspaceText
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean);
+type WorkspaceOption = {
+  id: string;
+  label: string;
+  displayName: string;
+  kind: string;
+  status: string;
+};
+const workspaceIds = () => draft.workspaceIds;
+const selectableWorkspaceOptions = computed(() => {
+  const known = new Set(workspaceOptions.value.map((option) => option.id));
+  return [
+    ...workspaceOptions.value,
+    ...draft.workspaceIds
+      .filter((id) => !known.has(id))
+      .map((id) => ({
+        id,
+        label: `${workspaceNames.value[id] || id} — unavailable`,
+        displayName: workspaceNames.value[id] || id,
+        kind: "Unavailable workspace",
+        status: "unavailable",
+      })),
+  ];
+});
 async function run(key: string, fn: () => Promise<any>) {
   busy.value = key;
   actionError.value = "";
@@ -178,14 +197,42 @@ function restoreMembers(item = restoreItem.value): Array<{ id: string; displayNa
 }
 async function refreshWorkspaceNames() {
   try {
-    const workers = await $fetch<Array<{ id: string; displayName?: string }>>(
-      "/api/containers",
-    );
+    const workers = await $fetch<Array<{
+      id: string;
+      userId: string;
+      displayName?: string;
+      status?: string;
+      administrativeKind?: "platform" | "group";
+    }>>("/api/containers");
+    workspaceOptions.value = workers
+      .map((worker) => {
+        const displayName = worker.displayName || worker.id;
+        const kind =
+          worker.administrativeKind === "platform"
+            ? "Global admin"
+            : worker.administrativeKind === "group"
+              ? "Group admin"
+              : "Worker";
+        const status = worker.status || "unknown";
+        return {
+          id: worker.id,
+          displayName,
+          kind,
+          status,
+          label: `${displayName} — ${kind} · ${status}`,
+        };
+      })
+      .sort((a, b) =>
+        a.displayName.localeCompare(b.displayName, undefined, {
+          sensitivity: "base",
+        }),
+      );
     workspaceNames.value = Object.fromEntries(
-      workers.map((worker) => [worker.id, worker.displayName || worker.id]),
+      workspaceOptions.value.map((worker) => [worker.id, worker.displayName]),
     );
   } catch {
     // Artifact IDs remain usable when a source worker has since been removed.
+    workspaceOptions.value = [];
     workspaceNames.value = {};
   }
 }
@@ -347,17 +394,38 @@ watch(restoreTarget, (target) => {
             </div>
             <UButton size="xs" :loading="busy === 'google-config'" @click="configureGoogle">Save Google OAuth configuration</UButton>
           </section>
-          <label v-if="draft.selection === 'selected'"
-            >Workspace IDs (comma separated)<input
-              v-model="draft.workspaceText"
-              class="block w-full border rounded p-2"
-              placeholder="workspace-a, workspace-b"
-          /></label>
+          <label v-if="draft.selection === 'selected'" class="block space-y-1">
+            <span>Workspaces</span>
+            <UInputMenu
+              v-model="draft.workspaceIds"
+              :items="selectableWorkspaceOptions"
+              multiple
+              value-key="id"
+              label-key="label"
+              :filter-fields="['displayName', 'id', 'kind', 'status']"
+              placeholder="Search workers and administrative workspaces…"
+              class="w-full"
+              aria-label="Workspaces"
+              data-testid="backup-workspace-selector"
+            >
+              <template #item-label="{ item }">
+                <span class="flex min-w-0 flex-col">
+                  <span class="truncate font-medium">{{ item.displayName }}</span>
+                  <span class="truncate text-xs text-gray-500">
+                    {{ item.kind }} · {{ item.status }} · {{ item.id }}
+                  </span>
+                </span>
+              </template>
+            </UInputMenu>
+          </label>
           <section v-if="workspaceIds().length" class="rounded border p-3 space-y-2" data-testid="backup-path-settings">
             <h4 class="text-sm font-medium">Backup paths</h4>
             <p class="text-xs text-gray-500">The existing portable defaults (<code>/workspace</code> and credential-filtered agent data) start selected but may be changed. Any readable file or directory may be selected explicitly, including sensitive paths. Saving prepares additional directories as local rebuild-persistent volumes; files and <code>/</code> remain backup-only. Deselected volumes are retained until worker deletion and merged with current files if selected again.</p>
             <div v-for="id in workspaceIds()" :key="id" class="flex items-center gap-2 text-sm">
-              <code class="truncate">{{ id }}</code>
+              <span class="min-w-0">
+                <span class="block truncate font-medium">{{ workspaceNames[id] || id }}</span>
+                <code class="block truncate text-xs text-gray-500">{{ id }}</code>
+              </span>
               <span class="text-xs text-gray-500">{{ selectedPathCount(id) }} selected · {{ additionalPathCount(id) }} additional</span>
               <UButton size="xs" variant="outline" @click="openPathPicker(id)">Choose paths</UButton>
             </div>
