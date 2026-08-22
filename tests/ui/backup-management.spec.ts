@@ -37,6 +37,32 @@ test('selects files and any browsed directory including root from a picker roote
   await picker.getByRole('button', { name: 'Done' }).click();
   await expect(m).toContainText('2 additional');
 });
+test('warns precisely which retained and detached data can change when persistence is deselected', async ({ page }) => {
+  const m = await open(page);
+  await m.getByLabel('Selected workspaces').check();
+  await m.getByLabel(/Workspace IDs/).fill('worker-1');
+  await m.getByRole('button', { name: 'Choose paths' }).click();
+  let picker = page.getByTestId('backup-path-picker');
+  await picker.getByRole('checkbox').nth(1).check();
+  await picker.getByRole('button', { name: 'Done' }).click();
+  const saveButton = m.getByRole('button', { name: 'Save schedule' });
+  await Promise.all([
+    page.waitForResponse(response => response.url().endsWith('/api/backup-settings') && response.request().method() === 'PUT'),
+    saveButton.click(),
+  ]);
+  await expect(saveButton).toBeEnabled();
+  await m.getByRole('button', { name: 'Choose paths' }).click();
+  picker = page.getByTestId('backup-path-picker');
+  await picker.getByRole('checkbox').nth(1).uncheck();
+  await picker.getByRole('button', { name: 'Done' }).click();
+  let warning = '';
+  page.once('dialog', async dialog => { warning = dialog.message(); await dialog.accept(); });
+  await saveButton.click();
+  await expect.poll(() => warning).toContain('No persisted data is deleted now');
+  expect(warning).toContain('changes made there are lost by another rebuild');
+  expect(warning).toContain('current same-named files overwrite their older persisted versions');
+  expect(warning).toContain('other old and new files are kept');
+});
 test('restores safely into a new or lock-protected original worker without retaining its password',async({page})=>{
   const lockPassword='UI_BACKUP_LOCK_DO_NOT_RENDER';let restoreBody:any;
   await page.route('**/api/backups/backup-1/restore',async route=>{restoreBody=await route.request().postDataJSON();await route.fulfill({status:202,json:{jobId:'restore-1'}})});

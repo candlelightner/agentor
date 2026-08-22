@@ -33,6 +33,7 @@ import {
   PluginRuntimeManager,
 } from "./plugin-runtime-manager";
 import { definitionVisibleToWorker } from "./plugin-scope";
+import { PersistentBackupPathManager } from "./persistent-backup-paths";
 
 function singleton<T>(factory: () => T): () => T {
   let instance: T | undefined;
@@ -53,6 +54,22 @@ export const useStorageManager = singleton(
 );
 export const useContainerManager = singleton(
   () => new ContainerManager(useDockerService(), useConfig()),
+);
+export const usePersistentBackupPathManager = singleton(
+  () =>
+    new PersistentBackupPathManager(
+      useConfig(),
+      (id) => useContainerManager().get(id),
+      async (id, path) => {
+        try {
+          await useContainerManager().listBackupPaths(id, path);
+          return true;
+        } catch (error: any) {
+          if (error?.statusCode === 409) return false;
+          throw error;
+        }
+      },
+    ),
 );
 export const usePortMappingStore = singleton(
   () => new PortMappingStore(useConfig().dataDir),

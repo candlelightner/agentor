@@ -56,6 +56,17 @@ async function run(key: string, fn: () => Promise<any>) {
   }
 }
 async function save() {
+  const removed = removedAdditionalPaths();
+  if (
+    removed.length &&
+    !window.confirm(
+      `Stop rebuild persistence for ${removed.length} selected path${removed.length === 1 ? "" : "s"}? ` +
+        "No persisted data is deleted now: the existing volume is retained until the worker is deleted. " +
+        "After the next rebuild, this path uses temporary container storage; changes made there are lost by another rebuild unless you reselect or back them up first. " +
+        "If you reselect the path before rebuilding again, current files are merged into the retained volume: current same-named files overwrite their older persisted versions, while other old and new files are kept.",
+    )
+  )
+    return;
   await run("save", async () => {
     await api.saveSettings({
       ...api.settings.value,
@@ -89,6 +100,18 @@ function openPathPicker(workerId: string) {
     draft.selectedPathsByWorkspace[workerId] = ['/workspace', '/home/agent/.agent-data'];
 }
 const defaultBackupPaths = new Set(['/workspace', '/home/agent/.agent-data']);
+function removedAdditionalPaths() {
+  const removed: string[] = [];
+  for (const [workerId, previous] of Object.entries(
+    api.settings.value.selectedPathsByWorkspace || {},
+  )) {
+    const current = new Set(draft.selectedPathsByWorkspace[workerId] || []);
+    for (const path of previous)
+      if (!defaultBackupPaths.has(path) && !current.has(path))
+        removed.push(`${workerId}:${path}`);
+  }
+  return removed;
+}
 function selectedPathCount(workerId: string) {
   return draft.selectedPathsByWorkspace[workerId]?.length ?? defaultBackupPaths.size;
 }
@@ -332,7 +355,7 @@ watch(restoreTarget, (target) => {
           /></label>
           <section v-if="workspaceIds().length" class="rounded border p-3 space-y-2" data-testid="backup-path-settings">
             <h4 class="text-sm font-medium">Backup paths</h4>
-            <p class="text-xs text-gray-500">The existing portable defaults (<code>/workspace</code> and credential-filtered agent data) start selected but may be changed. Any readable file or directory may be selected explicitly, including sensitive paths.</p>
+            <p class="text-xs text-gray-500">The existing portable defaults (<code>/workspace</code> and credential-filtered agent data) start selected but may be changed. Any readable file or directory may be selected explicitly, including sensitive paths. Saving prepares additional directories as local rebuild-persistent volumes; files and <code>/</code> remain backup-only. Deselected volumes are retained until worker deletion and merged with current files if selected again.</p>
             <div v-for="id in workspaceIds()" :key="id" class="flex items-center gap-2 text-sm">
               <code class="truncate">{{ id }}</code>
               <span class="text-xs text-gray-500">{{ selectedPathCount(id) }} selected · {{ additionalPathCount(id) }} additional</span>

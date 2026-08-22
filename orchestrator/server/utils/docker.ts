@@ -7,6 +7,7 @@ import { renderUserEnvVars } from './user-env-store';
 import type { MountConfig, TmuxWindow, AppInstanceInfo, NetworkMode, ExposeApis, UserEnvVars, FileEntry } from '../../shared/types';
 import type { StorageManager } from './storage';
 import type { ExecCaptureResult } from './workspace-probe';
+import type { PersistentPathMount } from './persistent-backup-paths';
 
 export interface EnvironmentJsonPayload {
   networkMode: string;
@@ -143,6 +144,9 @@ export class DockerService {
     mounts?: MountConfig[];
     dockerEnabled?: boolean;
     credentialBinds?: string[];
+    /** Trusted named volumes generated from explicit backup-directory
+     * selections; never accepts client-selected Docker sources. */
+    persistentPathMounts?: PersistentPathMount[];
     environmentJson: EnvironmentJsonPayload;
     capabilitiesJson: CapabilityJsonEntry[];
     instructionsJson: InstructionJsonEntry[];
@@ -282,6 +286,14 @@ export class DockerService {
         RestartPolicy: { Name: hasSensitiveWorkerConfig ? 'no' : 'unless-stopped' },
         ShmSize: 512 * 1024 * 1024,
         Binds: binds.length > 0 ? binds : undefined,
+        Mounts: (opts.persistentPathMounts?.length
+          ? opts.persistentPathMounts.map((mount) => ({
+              Type: 'volume' as const,
+              Source: mount.source,
+              Target: mount.target,
+              VolumeOptions: { NoCopy: true },
+            }))
+          : undefined) as any,
         Tmpfs: { '/run/agentor-secrets': 'rw,nosuid,nodev,noexec,mode=0711,uid=0,gid=0,size=16777216' },
       },
     });

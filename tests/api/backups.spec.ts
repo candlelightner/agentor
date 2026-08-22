@@ -212,6 +212,74 @@ test.describe
     expect((await root.json()).path).toBe("/");
   });
 
+  test("an explicitly selected directory becomes a rebuild-persistent local volume", async () => {
+    const path = "/home/agent/.agentor-persistent-backup-test";
+    await captureCommandOutput(
+      workspaceB,
+      `mkdir -p '${path}' && printf rebuild-persistent > '${path}/state.txt' && printf retained > '${path}/retained.txt'`,
+    );
+    const settings = await ownerCtx.put("/api/backup-settings", {
+      data: {
+        enabled: false,
+        selection: "selected",
+        workspaceIds: [workspaceB],
+        selectedPathsByWorkspace: {
+          [workspaceB]: ["/workspace", "/home/agent/.agent-data", path],
+        },
+      },
+    });
+    expect(settings.status(), await settings.text()).toBe(200);
+    expect((await new ApiClient(ownerCtx).rebuildContainer(workspaceB)).status).toBe(200);
+    expect(
+      (await captureCommandOutput(workspaceB, `cat '${path}/state.txt'`)).trim(),
+    ).toBe("rebuild-persistent");
+    expect(
+      (
+        await captureCommandOutput(
+          workspaceB,
+          `printf -- '-writable' >> '${path}/state.txt' && printf created > '${path}/after-rebuild.txt' && cat '${path}/state.txt'`,
+        )
+      ).trim(),
+    ).toBe("rebuild-persistent-writable");
+
+    const defaultsOnly = await ownerCtx.put("/api/backup-settings", {
+      data: {
+        enabled: false,
+        selection: "selected",
+        workspaceIds: [workspaceB],
+        selectedPathsByWorkspace: {
+          [workspaceB]: ["/workspace", "/home/agent/.agent-data"],
+        },
+      },
+    });
+    expect(defaultsOnly.status(), await defaultsOnly.text()).toBe(200);
+    expect((await new ApiClient(ownerCtx).rebuildContainer(workspaceB)).status).toBe(200);
+    await captureCommandOutput(
+      workspaceB,
+      `mkdir -p '${path}' && printf detached-current > '${path}/state.txt' && printf new > '${path}/detached.txt'`,
+    );
+    const reselected = await ownerCtx.put("/api/backup-settings", {
+      data: {
+        enabled: false,
+        selection: "selected",
+        workspaceIds: [workspaceB],
+        selectedPathsByWorkspace: {
+          [workspaceB]: ["/workspace", "/home/agent/.agent-data", path],
+        },
+      },
+    });
+    expect(reselected.status(), await reselected.text()).toBe(200);
+    expect((await new ApiClient(ownerCtx).rebuildContainer(workspaceB)).status).toBe(200);
+    expect(
+      (
+        await captureCommandOutput(
+          workspaceB,
+          `printf 'STATE=%s RETAINED=%s DETACHED=%s' "$(cat '${path}/state.txt')" "$(cat '${path}/retained.txt')" "$(cat '${path}/detached.txt')"`,
+        )
+      ).trim(),
+    ).toBe("STATE=detached-current RETAINED=retained DETACHED=new");
+  });
+
   test("an explicitly selected readable absolute path round-trips only into a new worker", async () => {
     const marker = `backup-extra-${Date.now()}`;
     await runCommandInWorker(workspaceA, `printf %s ${marker} > /tmp/${marker}.txt`);

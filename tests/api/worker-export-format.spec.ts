@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { BUNDLE_FILES, extractBackupPathArchives, extractBundle, sanitizeBackupPathTarPayload, validateBackupPathTarPayload, validateGzipTarPayload, validateTarPayload, WORKER_EXPORT_VERSION } from '../../orchestrator/server/utils/worker-export';
 
-type Entry = { name: string; body: Buffer; type?: string; linkname?: string };
+type Entry = { name: string; body: Buffer; type?: string; linkname?: string; uid?: number; gid?: number };
 
 async function tarBuffer(entries: Entry[]): Promise<Buffer> {
   const chunks: Buffer[] = [];
@@ -13,8 +13,8 @@ async function tarBuffer(entries: Entry[]): Promise<Buffer> {
     const header = Buffer.alloc(512);
     header.write(entry.name, 0, 100, 'utf8');
     header.write('0000644\0', 100, 8, 'ascii');
-    header.write('0000000\0', 108, 8, 'ascii');
-    header.write('0000000\0', 116, 8, 'ascii');
+    header.write(`${(entry.uid ?? 0).toString(8).padStart(7, '0')}\0`, 108, 8, 'ascii');
+    header.write(`${(entry.gid ?? 0).toString(8).padStart(7, '0')}\0`, 116, 8, 'ascii');
     header.write(`${entry.body.length.toString(8).padStart(11, '0')}\0`, 124, 12, 'ascii');
     header.write('00000000000\0', 136, 12, 'ascii');
     header.fill(0x20, 148, 156);
@@ -177,6 +177,24 @@ test.describe('Worker export root filesystem format compatibility', () => {
       const malformed = join(directory, 'malformed.tar.gz');
       await writeFile(malformed, Buffer.from('not a gzip stream'));
       await expect(extractBackupPathArchives(malformed, join(directory, 'extracted'), [{ path: selected, archive: 'paths/0.tar' }])).rejects.toThrow();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('explicit backup path archives preserve validated file ownership', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentor-backup-path-owner-'));
+    try {
+      const source = join(directory, 'source.tar');
+      const output = join(directory, 'output.tar');
+      await writeFile(source, await tarBuffer([
+        { name: 'state', body: Buffer.alloc(0), type: '5', uid: 1000, gid: 1000 },
+        { name: 'state/value.txt', body: Buffer.from('ok'), uid: 1000, gid: 1000 },
+      ]));
+      await sanitizeBackupPathTarPayload(source, output, '/home/agent/state');
+      const sanitized = await (await import('node:fs/promises')).readFile(output);
+      expect(Number.parseInt(sanitized.subarray(108, 116).toString('ascii').replace(/\0.*$/, ''), 8)).toBe(1000);
+      expect(Number.parseInt(sanitized.subarray(116, 124).toString('ascii').replace(/\0.*$/, ''), 8)).toBe(1000);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

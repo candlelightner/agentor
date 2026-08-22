@@ -26,6 +26,7 @@ import {
   usePluginDefinitionStore,
   usePluginInstallationStore,
   usePluginRuntimeManager,
+  usePersistentBackupPathManager,
 } from "../utils/services";
 import {
   loadBuiltInCapabilities,
@@ -168,6 +169,9 @@ export default defineNitroPlugin(async (nitroApp) => {
   containerManager.setInstructionStore(instructionStore);
   containerManager.setWorkerStore(workerStore);
   await containerManager.sync();
+  useBackupManager().setPathPersistenceAdapter(
+    usePersistentBackupPathManager(),
+  );
   await containerManager.reconcileWorkers();
   for (const worker of containerManager.list()) {
     if (

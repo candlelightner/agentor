@@ -55,6 +55,10 @@ The **Worker Self** group contains the unauthenticated, source-IP-identified rou
 
 **Shared schemas:** Defined via `$global.components.schemas` in anchor files (typically the "list" endpoint for each group). Other routes in the same group reference these via `$ref`. Schemas: `ContainerInfo`, `RepoConfig`, `MountConfig`, `TmuxWindow`, `AppInstanceInfo`, `PortMapping`, `DomainMapping`, `Environment`, `Capability`, `Instruction`, `ArchivedWorker`, `ImageUpdateInfo`, `ErrorResponse`, `SuccessResponse`, plus the workspace file-manager schemas (`FileEntry`, `FileListing`, `MkdirRequest`, `RenameRequest`, `MoveRequest`, `MoveConflict`, `MoveConflictResponse`, `MoveResult`, `DeleteFilesRequest`, `DeleteFilesResult`, `DownloadFilesRequest`, `UploadFilesResult`) defined in the `files` list route.
 
+### Backup-directory persistence
+
+Saving backup settings first copies each additional directory into an Agentor-managed local volume, which is mounted at the same absolute path across ordinary-worker and administrative rebuilds. Individual files and `/` remain backup-only; paths already covered by `/workspace`, agent-data, DinD, or another configured persistent mount need no extra volume. Deselecting a directory detaches but does not delete its volume. If it is selected again, current files merge into the retained volume and current same-named files replace their older persisted versions. Changes made while detached remain temporary and are lost on another rebuild unless the directory is reselected or backed up first.
+
 ### Adding Docs to a New Route
 
 1. Add `defineRouteMeta({ openAPI: { ... } })` as the very first statement in the route file (before imports)

@@ -18,7 +18,7 @@ watch(open, shown => { if (shown) void load('/workspace'); }, { immediate: true 
 </script>
 <template>
   <UModal v-model:open="open" :ui="{ content: 'max-w-3xl' }"><template #content><div class="p-5 space-y-3" data-testid="backup-path-picker">
-    <header><h3 class="font-medium">Backup paths</h3><p class="text-xs text-gray-500">Defaults remain selected. Browse from <code>/workspace</code> up to <code>/</code>; files and directories are backed up as explicitly selected.</p></header>
+    <header><h3 class="font-medium">Backup paths</h3><p class="text-xs text-gray-500">Defaults remain selected. Browse from <code>/workspace</code> up to <code>/</code>; files and directories are backed up as explicitly selected. When settings are saved, additional directories are copied into managed local volumes so later rebuilds preserve them. Individual files and <code>/</code> remain backup-only.</p></header>
     <div class="flex gap-2 items-center text-sm"><UButton size="xs" variant="ghost" :disabled="cwd==='/'" @click="load(parent(cwd))">Up</UButton><code class="break-all">{{ cwd }}</code><span v-if="loading">Loading…</span></div>
     <label class="flex gap-2 items-center rounded border px-2 py-1 text-sm">
       <input type="checkbox" aria-label="Select current directory" :checked="isSelected(cwd)" @change="toggle(cwd)">

@@ -382,6 +382,8 @@ export async function sanitizeBackupPathTarPayload(
       const linkname = typeof header.linkname === "string" ? header.linkname : "";
       if (type === "symlink") assertSafeSymlinkTarget(linkname, selectedPath, name);
       if (type === "link") assertSafeHardlinkTarget(kinds, name, linkname);
+      const uid = validatedArchiveOwnerId(header.uid, "uid");
+      const gid = validatedArchiveOwnerId(header.gid, "gid");
       kinds.set(name, type);
       const safeHeader: tar.Headers = {
         name,
@@ -389,6 +391,8 @@ export async function sanitizeBackupPathTarPayload(
         size: type === "file" ? header.size : 0,
         mode: header.mode,
         mtime: header.mtime,
+        ...(uid === undefined ? {} : { uid }),
+        ...(gid === undefined ? {} : { gid }),
         ...(type === "symlink" || type === "link" ? { linkname } : {}),
       };
       const entry = pack.entry(safeHeader, (error) => {
@@ -415,6 +419,16 @@ export async function sanitizeBackupPathTarPayload(
     throw failed ?? error;
   }
   return { omittedSpecialEntries };
+}
+
+function validatedArchiveOwnerId(
+  value: number | undefined,
+  field: "uid" | "gid",
+): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff)
+    throw new Error(`Invalid backup path archive: invalid ${field}`);
+  return value;
 }
 
 /** Docker getArchive(path) preserves the selected resource as the top-level

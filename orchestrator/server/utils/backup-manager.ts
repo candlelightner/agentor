@@ -111,6 +111,12 @@ export class BackupManager {
   private fake: FakeBackupProvider;
   private fakeUsers = new Set<string>();
   private providers: Map<BackupProviderKind, BackupProvider>;
+  private pathPersistence?: {
+    reconcileSelections(
+      userId: string,
+      selected: Record<string, string[]> | undefined,
+    ): Promise<void>;
+  };
   /** Dependency injection keeps restart recovery testable against the same
    * persisted files and provider boundary used by the production manager. */
   constructor(
@@ -161,6 +167,15 @@ export class BackupManager {
     ]);
     for (const [kind, provider] of Object.entries(options.providers ?? {}))
       if (provider) this.providers.set(kind as BackupProviderKind, provider);
+  }
+
+  setPathPersistenceAdapter(adapter: {
+    reconcileSelections(
+      userId: string,
+      selected: Record<string, string[]> | undefined,
+    ): Promise<void>;
+  }) {
+    this.pathPersistence = adapter;
   }
   init() {
     return (this.initialized ??= this.initialize());
@@ -336,6 +351,15 @@ export class BackupManager {
   ) {
     await this.init();
     this.assertOwnerAvailable(userId);
+    const normalizedPaths =
+      input.selectedPathsByWorkspace === undefined
+        ? undefined
+        : normalizeSelectedPaths(input.selectedPathsByWorkspace);
+    // Seed every newly selected directory before committing configuration.
+    // A failed copy therefore leaves both the old container and the previous
+    // backup settings authoritative, and no rebuild can attach an empty volume.
+    if (input.selectedPathsByWorkspace !== undefined && this.pathPersistence)
+      await this.pathPersistence.reconcileSelections(userId, normalizedPaths);
     const now = new Date().toISOString();
     const config = await this.store.update(userId, (data) => {
       const old = data.config;
@@ -361,7 +385,7 @@ export class BackupManager {
         selectedPathsByWorkspace:
           input.selectedPathsByWorkspace === undefined
             ? old?.selectedPathsByWorkspace
-            : normalizeSelectedPaths(input.selectedPathsByWorkspace),
+            : normalizedPaths,
         createdAt: old?.createdAt ?? now,
         updatedAt: now,
         nextRunAt:

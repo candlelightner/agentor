@@ -2113,6 +2113,13 @@ for p in sys.argv[1:]:
     }
     actions.push(
       [
+        "persistent backup paths",
+        async () => {
+          const { usePersistentBackupPathManager } = await import("./services");
+          await usePersistentBackupPathManager().removeWorkerVolumes(info.id);
+        },
+      ],
+      [
         "import-created environment",
         () => this.cleanupImportCreatedEnvironment(info.userId, info.id),
       ],
@@ -2220,10 +2227,32 @@ for p in sys.argv[1:]:
     );
   }
 
+  private async persistentBackupPathMounts(
+    worker: Pick<ContainerInfo, "id" | "userId" | "containerId" | "status">,
+    prepare: boolean,
+  ) {
+    const [{ useBackupManager }, { usePersistentBackupPathManager }] =
+      await Promise.all([import("./backup-manager"), import("./services")]);
+    const config = await useBackupManager().getConfig(worker.userId);
+    const paths = config?.selectedPathsByWorkspace?.[worker.id];
+    const manager = usePersistentBackupPathManager();
+    return prepare
+      ? manager.prepareWorker(worker, paths)
+      : manager.mountsForSelections(worker.id, paths);
+  }
+
   private async rebuildUnlocked(id: string): Promise<ContainerInfo> {
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+
+    // Materialize newly selected directories before touching disposable
+    // compute. If capture fails, the original container is still running and
+    // the rebuild aborts without exposing an empty volume at that path.
+    const persistentPathMounts = await this.persistentBackupPathMounts(
+      info,
+      true,
+    );
 
     useLogCollector().detach(info.containerId);
 
@@ -2338,6 +2367,7 @@ for p in sys.argv[1:]:
         mounts: info.mounts,
         dockerEnabled,
         credentialBinds,
+        persistentPathMounts,
         environmentJson: envConfig.environmentJson,
         capabilitiesJson: envConfig.capabilitiesJson,
         instructionsJson: envConfig.instructionsJson,
@@ -2453,7 +2483,6 @@ for p in sys.argv[1:]:
       worker.userId,
       worker.id,
     );
-
     const imageOpts = worker.importedImage
       ? await this.resolveImageOpts(worker.importedImage)
       : { image: worker.imageRuntimeReference, imageConfig: undefined };
@@ -2487,6 +2516,10 @@ for p in sys.argv[1:]:
       imageDigest: worker.imageDigest,
       imageRuntimeReference: worker.imageRuntimeReference,
     };
+    const persistentPathMounts = await this.persistentBackupPathMounts(
+      containerInfo,
+      false,
+    );
 
     // Make the active provisional identity authoritative before asking Docker
     // to create anything. This closes the post-create/pre-persistence leak.
@@ -2503,6 +2536,7 @@ for p in sys.argv[1:]:
         mounts: worker.mounts,
         dockerEnabled,
         credentialBinds,
+        persistentPathMounts,
         environmentJson: envConfig.environmentJson,
         capabilitiesJson: envConfig.capabilitiesJson,
         instructionsJson: envConfig.instructionsJson,
@@ -2620,6 +2654,13 @@ for p in sys.argv[1:]:
       ]);
     }
     actions.push(
+      [
+        "persistent backup paths",
+        async () => {
+          const { usePersistentBackupPathManager } = await import("./services");
+          await usePersistentBackupPathManager().removeWorkerVolumes(worker.id);
+        },
+      ],
       [
         "import-created environment",
         () => this.cleanupImportCreatedEnvironment(worker.userId, worker.id),

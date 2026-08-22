@@ -156,7 +156,24 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
       printf keep > ~/.claude/skills/user-kept/SKILL.md
       printf keep > ~/.agents/skills/user-kept/SKILL.md
       printf stale > ~/.gemini/commands/agentor-global-administration.toml
+      mkdir -p ~/.hermes-persistent-test
+      printf persistent-admin-state > ~/.hermes-persistent-test/state.txt
     `.trim().replace(/\n\s*/g, '; '));
+    const persistentSettings = await ownerRequest.put("/api/backup-settings", {
+      data: {
+        enabled: false,
+        selection: "selected",
+        workspaceIds: [workspaceId],
+        selectedPathsByWorkspace: {
+          [workspaceId]: [
+            "/workspace",
+            "/home/agent/.agent-data",
+            "/home/agent/.hermes-persistent-test",
+          ],
+        },
+      },
+    });
+    expect(persistentSettings.status(), await persistentSettings.text()).toBe(200);
     const rebuildStatuses = await Promise.all([
       ownerRequest.post(`/api/worker-groups/${groupId}/admin-workspace/rebuild`).then((response) => response.status()),
       ownerRequest.post(`/api/worker-groups/${groupId}/admin-workspace/rebuild`).then((response) => response.status()),
@@ -171,6 +188,10 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
       test ! -e ~/.agents/skills/agentor-global-administration && test ! -e ~/.agents/skills/agentor-worker-runtime && printf 'CODEX_ISOLATED=1\\n'
       test ! -e ~/.gemini/commands/agentor-global-administration.toml && test ! -e ~/.gemini/commands/agentor-worker-runtime.toml && printf 'GEMINI_ISOLATED=1\\n'
       printf 'USER_SKILLS=%s\\n' "$(cat ~/.claude/skills/user-kept/SKILL.md ~/.agents/skills/user-kept/SKILL.md)"
+      printf 'PERSISTENT_PATH=%s\\n' "$(cat ~/.hermes-persistent-test/state.txt)"
+      printf -- '-writable' >> ~/.hermes-persistent-test/state.txt
+      printf created > ~/.hermes-persistent-test/after-rebuild.txt
+      printf 'PERSISTENT_WRITABLE=%s\\n' "$(cat ~/.hermes-persistent-test/state.txt)"
     `.trim().replace(/\n\s*/g, '; '));
     expect(rebuiltRole).toContain(`CLAUDE_SHA=${GROUP_ADMIN_ROLE_SKILL_SHA256}`);
     expect(rebuiltRole).toContain(`CODEX_SHA=${GROUP_ADMIN_ROLE_SKILL_SHA256}`);
@@ -178,6 +199,8 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     expect(rebuiltRole).toContain('CODEX_ISOLATED=1');
     expect(rebuiltRole).toContain('GEMINI_ISOLATED=1');
     expect(rebuiltRole).toContain('USER_SKILLS=keepkeep');
+    expect(rebuiltRole).toContain('PERSISTENT_PATH=persistent-admin-state');
+    expect(rebuiltRole).toContain('PERSISTENT_WRITABLE=persistent-admin-state-writable');
 
     // A normal inventory refresh must not erase the externally registered
     // administrative runtime. The dashboard polls these endpoints every five

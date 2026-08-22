@@ -190,8 +190,13 @@ export class DockerAdminWorkspaceRuntime
         // silently retaining that privilege boundary violation on restart.
         inspection.HostConfig?.NetworkMode !== resources.managementNetwork
       ) {
+        const persistentPathMounts = await this.persistentBackupPathMounts(
+          record,
+          inspection.Id,
+          inspection.State.Running,
+        );
         await container.remove({ force: true });
-        container = await this.create(record, image.digest);
+        container = await this.create(record, image.digest, persistentPathMounts);
       }
     } catch (error: any) {
       if (error?.statusCode !== 404) throw error;
@@ -242,8 +247,13 @@ export class DockerAdminWorkspaceRuntime
       // Docker Env is immutable. An explicit start is the application boundary
       // for a pending script: replace disposable compute while retaining both
       // persistent volumes and the stable administrative workspace identity.
+      const persistentPathMounts = await this.persistentBackupPathMounts(
+        record,
+        before.Id,
+        before.State.Running,
+      );
       await container.remove({ force: true });
-      container = await this.create(record, image.digest);
+      container = await this.create(record, image.digest, persistentPathMounts);
     }
     if (!(await container.inspect()).State.Running) await container.start();
     await this.waitForReady(container);
@@ -269,15 +279,25 @@ export class DockerAdminWorkspaceRuntime
   async rebuild(
     record: Readonly<AdministrativeWorkspaceRecord>,
   ): Promise<AdminWorkspaceRuntimeImage> {
+    let persistentPathMounts: Array<{ source: string; target: string }> = [];
     try {
-      await this.docker
-        .getContainer(this.resources(record).container)
-        .remove({ force: true });
+      const old = this.docker.getContainer(this.resources(record).container);
+      const inspection = await old.inspect();
+      persistentPathMounts = await this.persistentBackupPathMounts(
+        record,
+        inspection.Id,
+        inspection.State.Running,
+      );
+      await old.remove({ force: true });
     } catch (error: any) {
       if (error?.statusCode !== 404) throw error;
     }
     const image = await this.ensureOverlayImage(true);
-    const container = await this.create(record, image.digest);
+    const container = await this.create(
+      record,
+      image.digest,
+      persistentPathMounts.length ? persistentPathMounts : undefined,
+    );
     await container.start();
     await this.waitForReady(container);
     await this.ensureAdminAttached(container, record);
@@ -405,6 +425,8 @@ export class DockerAdminWorkspaceRuntime
         if (error?.statusCode !== 404) throw error;
       }
     }
+    const { usePersistentBackupPathManager } = await import("./services");
+    await usePersistentBackupPathManager().removeWorkerVolumes(record.id);
     for (const networkName of [
       resources.managementNetwork,
       resources.egressNetwork,
@@ -560,9 +582,29 @@ export class DockerAdminWorkspaceRuntime
     }
   }
 
+  private async persistentBackupPathMounts(
+    record: Readonly<AdministrativeWorkspaceRecord>,
+    containerId?: string,
+    running = false,
+  ) {
+    if (!record.ownerId) return [];
+    const [{ useBackupManager }, { usePersistentBackupPathManager }] =
+      await Promise.all([import("./backup-manager"), import("./services")]);
+    const config = await useBackupManager().getConfig(record.ownerId);
+    const paths = config?.selectedPathsByWorkspace?.[record.id];
+    const manager = usePersistentBackupPathManager();
+    return containerId
+      ? manager.prepareWorker(
+          { id: record.id, containerId, status: running ? "running" : "stopped" },
+          paths,
+        )
+      : manager.mountsForSelections(record.id, paths);
+  }
+
   private async create(
     record: Readonly<AdministrativeWorkspaceRecord>,
     imageDigest: string,
+    preparedPersistentPathMounts?: Array<{ source: string; target: string }>,
   ): Promise<Docker.Container> {
     const environment = {
       networkMode: "full",
@@ -578,6 +620,9 @@ export class DockerAdminWorkspaceRuntime
       },
     };
     const resources = this.resources(record);
+    const persistentPathMounts =
+      preparedPersistentPathMounts ??
+      (await this.persistentBackupPathMounts(record));
     const worker = {
       id: record.id,
       displayName: resources.displayName,
@@ -639,6 +684,14 @@ export class DockerAdminWorkspaceRuntime
           `${resources.workspaceVolume}:/workspace`,
           `${resources.agentsVolume}:/home/agent/.agent-data`,
         ],
+        Mounts: (persistentPathMounts.length
+          ? persistentPathMounts.map((mount) => ({
+              Type: "volume" as const,
+              Source: mount.source,
+              Target: mount.target,
+              VolumeOptions: { NoCopy: true },
+            }))
+          : undefined) as any,
         Init: true,
         RestartPolicy: { Name: "unless-stopped" },
         ShmSize: 512 * 1024 * 1024,
