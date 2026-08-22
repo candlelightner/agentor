@@ -75,7 +75,9 @@ export async function proxyPluginUi(event: H3Event, suffix = "") {
   // Redirect only after the normal authenticated installation/action checks so
   // the desktop proxy retains its owner/admin authorization and clipboard
   // bridge instead of exposing raw port 6080 through the generic gateway.
-  if (action.openMode === "desktop")
+  // Keep definitions created before desktop mode existed working when they
+  // use Agentor's canonical noVNC port/path.
+  if (action.openMode === "desktop" || (port === 6080 && action.path === "/vnc.html"))
     return sendRedirect(event, `/desktop/${encodeURIComponent(worker.id)}/agentor.html`, 302);
 
   const method = event.method.toUpperCase();
