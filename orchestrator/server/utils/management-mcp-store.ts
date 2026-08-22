@@ -917,6 +917,17 @@ export class ManagementMcpStore {
         if (args.ownerId !== undefined)
           throw groupResourceNotFound();
         args = { ...args, ownerId: identity.ownerId };
+        const targetsSelf =
+          args.workerId === identity.workspaceId ||
+          args.workspaceId === identity.workspaceId ||
+          (Array.isArray(args.workspaceIds) &&
+            args.workspaceIds.includes(identity.workspaceId));
+        // The administrative runtime is registered as an external container,
+        // not an ordinary WorkerStore record. Reconcile it on demand before a
+        // self-backup call so an inventory refresh/restart cannot leave a
+        // valid admin identity with a stale ContainerManager lookup.
+        if (targetsSelf)
+          await useGroupAdminWorkspaceStore().ensure(identity.groupId!);
       }
       if (identity.scope === "group" && name.startsWith("networks.")) {
         if (args.ownerId !== undefined) throw groupResourceNotFound();
@@ -1905,9 +1916,7 @@ export class ManagementMcpStore {
     // inspection or lifecycle scope.
     const backupIds = new Set(ids);
     if (GROUP_ADMIN_BACKUP_TOOLS.has(name)) {
-      const self = useContainerManager().get(identity.workspaceId);
-      if (self?.administrativeKind === "group")
-        backupIds.add(identity.workspaceId);
+      backupIds.add(identity.workspaceId);
     }
     if (name === "groups.create") {
       const parentId = typeof args.parentId === "string" ? args.parentId : "";

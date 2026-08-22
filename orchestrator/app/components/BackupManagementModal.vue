@@ -25,6 +25,9 @@ const busy = ref(""),
   actionError = ref(""),
   savedNotice = ref("");
 const googleDraft = reactive({ clientId: "", redirectUri: "", clientSecret: "" });
+function clonePathSelections(value: Record<string, string[]> | undefined) {
+  return JSON.parse(JSON.stringify(value || {})) as Record<string, string[]>;
+}
 watch(open, async (shown) => {
   if (shown) {
     await api.refresh();
@@ -32,7 +35,7 @@ watch(open, async (shown) => {
     Object.assign(draft, {
       ...api.settings.value,
       workspaceIds: [...api.settings.value.workspaceIds],
-      selectedPathsByWorkspace: structuredClone(api.settings.value.selectedPathsByWorkspace || {}),
+      selectedPathsByWorkspace: clonePathSelections(api.settings.value.selectedPathsByWorkspace),
     });
     savedNotice.value = "";
   } else {
@@ -127,9 +130,7 @@ async function save() {
     Object.assign(draft, {
       ...persisted,
       workspaceIds: [...persisted.workspaceIds],
-      selectedPathsByWorkspace: structuredClone(
-        persisted.selectedPathsByWorkspace || {},
-      ),
+      selectedPathsByWorkspace: clonePathSelections(persisted.selectedPathsByWorkspace),
     });
     savedNotice.value = `Saved at ${new Date().toLocaleTimeString()}`;
     emit("changed");
