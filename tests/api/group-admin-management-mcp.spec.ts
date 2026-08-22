@@ -343,6 +343,17 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     const selectedBackupJob = await selectedBackup.json();
     expect(selectedBackupJob).toMatchObject({ workspaceIds: [memberId] });
     await invoke(request, credential, "backups.cancel", { jobId: selectedBackupJob.id });
+    // The calling administrative workspace is also backup-addressable. This
+    // must enqueue through the same owner-scoped path as ordinary workers,
+    // even when its external ContainerManager registration was refreshed.
+    const adminBackup = await invoke(request, credential, "backups.create", {
+      workspaceIds: [workspaceId],
+      selectedPathsByWorkspace: { [workspaceId]: ["/workspace"] },
+    });
+    expect(adminBackup.status(), await adminBackup.text()).toBe(200);
+    const adminBackupJob = await adminBackup.json();
+    expect(adminBackupJob).toMatchObject({ workspaceIds: [workspaceId] });
+    await invoke(request, credential, "backups.cancel", { jobId: adminBackupJob.id });
     const deniedSelectedPath = await invoke(request, credential, "backups.create", {
       workspaceIds: [memberId],
       selectedPathsByWorkspace: { [outsiderId]: ["/workspace"] },
