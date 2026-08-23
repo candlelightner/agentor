@@ -27,10 +27,10 @@ const formattedDate = computed(() => {
     </div>
     <div class="flex items-center gap-1 shrink-0">
       <UTooltip text="Unarchive">
-        <UButton size="xs" color="primary" variant="subtle" icon="i-lucide-archive-restore" :disabled="worker.deletionPending" @click="emit('unarchive', worker.id)" />
+        <UButton size="xs" color="primary" variant="subtle" icon="i-lucide-archive-restore" aria-label="Unarchive" :disabled="worker.deletionPending" @click="emit('unarchive', worker.id)" />
       </UTooltip>
       <UTooltip :text="worker.deletionPending ? 'Retry cleanup' : 'Delete'">
-        <UButton size="xs" color="error" variant="subtle" icon="i-lucide-trash-2" @click="emit('delete', worker.id)" />
+        <UButton size="xs" color="error" variant="subtle" icon="i-lucide-trash-2" :aria-label="worker.deletionPending ? 'Retry cleanup' : 'Delete'" @click="emit('delete', worker.id)" />
       </UTooltip>
     </div>
   </div>

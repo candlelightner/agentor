@@ -171,6 +171,9 @@ const GROUP_ADMIN_TOOLS = new Set([
   "groups.create",
   "groups.update",
   "groups.delete",
+  "groups.workers.stop",
+  "groups.workers.rebuild",
+  "groups.workers.archive",
   "groups.assign-worker",
   "groups.env.list",
   "groups.env.update",
@@ -218,6 +221,9 @@ const GROUP_ADMIN_NETWORK_TOOLS = new Set([
 const GROUP_ADMIN_GROUP_TOOLS = new Set([
   "groups.update",
   "groups.delete",
+  "groups.workers.stop",
+  "groups.workers.rebuild",
+  "groups.workers.archive",
   "groups.env.list",
   "groups.env.update",
   "groups.admin-workspace.get",
@@ -2303,6 +2309,12 @@ function groupStructuralDescription(name: string): string {
       "Rename an authorized group or reparent a descendant within the authorized subtree. Direct membership replacement is intentionally unavailable; use groups.assign-worker. The bound administrative group itself cannot be moved.",
     "groups.delete":
       "Delete an empty descendant group. The bound administrative group itself cannot be deleted.",
+    "groups.workers.stop":
+      "Recursively stop every ordinary worker in the selected bound or descendant group subtree. Administrative workspaces are not affected; all locks are checked before any worker changes.",
+    "groups.workers.rebuild":
+      "Recursively rebuild every ordinary worker in the selected bound or descendant group subtree while preserving durable data and membership. Administrative workspaces are not affected; all locks are checked before any worker changes.",
+    "groups.workers.archive":
+      "Recursively archive every ordinary worker in the selected bound or descendant group subtree while preserving durable data and membership. Administrative workspaces are not affected; all locks are checked before any worker changes.",
     "groups.assign-worker":
       "Move a worker already inside the authorized subtree into the bound administrative group or one of its descendants. Group administrators cannot import outside workers or leave workers ungrouped.",
     "groups.env.list":

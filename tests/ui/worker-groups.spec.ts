@@ -187,4 +187,40 @@ test.describe.serial('Worker groups dashboard', () => {
     await child.getByRole('button', { name: 'Save inherited selection' }).click();
     await expect(inherited).not.toBeChecked();
   });
+
+  test('archives a recursive group visually and restores its membership on unarchive', { timeout: 180_000 }, async ({ page, request }) => {
+    expect((await request.put('/api/worker-groups/assignment', {
+      data: { workerId: ungroupedWorkerId, groupId: treeChildId },
+    })).status()).toBe(200);
+    const child = await (await request.get(`/api/worker-groups/${treeChildId}`)).json() as { name: string };
+
+    await goToDashboard(page);
+    const activeChild = page.getByTestId(`worker-group-cards-${treeChildId}`);
+    await expect(activeChild.getByText(ungroupedWorkerName, { exact: true })).toBeVisible();
+    page.once('dialog', dialog => dialog.accept());
+    await activeChild.getByRole('button', { name: `Archive all in ${child.name}` }).click();
+
+    await expect.poll(async () => {
+      const workers = await (await request.get('/api/archived')).json() as Array<{ id: string }>;
+      return workers.some(worker => worker.id === ungroupedWorkerId);
+    }, { timeout: 90_000 }).toBe(true);
+    await page.getByRole('button', { name: /^Archived/ }).click();
+    const archivedRoot = page.getByTestId(`archived-worker-group-cards-${treeRootId}`);
+    const archivedChild = page.getByTestId(`archived-worker-group-cards-${treeChildId}`);
+    await expect(archivedRoot).toBeVisible();
+    await expect(archivedRoot.locator(`[data-testid="archived-worker-group-cards-${treeChildId}"]`)).toBeVisible();
+    await expect(archivedChild.getByText(ungroupedWorkerName, { exact: true })).toBeVisible();
+
+    await archivedChild.getByRole('button', { name: 'Unarchive' }).click();
+    await expect.poll(async () => {
+      const workers = await (await request.get('/api/containers')).json() as Array<{ id: string }>;
+      return workers.some(worker => worker.id === ungroupedWorkerId);
+    }, { timeout: 90_000 }).toBe(true);
+    await page.getByRole('button', { name: /^Workers/ }).click();
+    await expect(page.getByTestId(`worker-group-cards-${treeChildId}`).getByText(ungroupedWorkerName, { exact: true })).toBeVisible({ timeout: 20_000 });
+
+    expect((await request.put('/api/worker-groups/assignment', {
+      data: { workerId: ungroupedWorkerId, groupId: null },
+    })).status()).toBe(200);
+  });
 });

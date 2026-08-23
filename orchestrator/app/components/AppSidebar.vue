@@ -7,6 +7,7 @@ import type {
 } from "~/types";
 import type { WorkerGroup } from "~/composables/useWorkerGroups";
 import type { WorkerGroupSidebarTreeNode } from "~/components/WorkerGroupSidebarNode.vue";
+import type { ArchivedWorkerGroupSidebarTreeNode } from "~/components/ArchivedWorkerGroupSidebarNode.vue";
 
 const props = defineProps<{
   containers: ContainerInfo[];
@@ -38,6 +39,7 @@ const emit = defineEmits<{
   rebuildContainer: [id: string];
   removeContainer: [id: string];
   archiveContainer: [id: string];
+  groupLifecycle: [groupId: string, action: "stop" | "rebuild" | "archive", complete: (error?: string) => void];
   updateContainer: [
     id: string,
     patch: UpdateContainerSettingsRequest,
@@ -226,6 +228,68 @@ const groupedCurrentWorkerList = computed<WorkerListItem[]>(() => {
     if (renderedRoots.has(root.group.id)) return items;
     renderedRoots.add(root.group.id);
     if (visible(root)) items.push({ kind: "group", node: root });
+    return items;
+  }, []);
+});
+
+type ArchivedWorkerListItem =
+  | { kind: "worker"; worker: ArchivedWorker }
+  | { kind: "group"; node: ArchivedWorkerGroupSidebarTreeNode };
+
+/** Archived workers retain their direct group membership. Rebuild the same
+ * recursive hierarchy as the live tabs so archiving a subtree does not flatten
+ * or visually detach its workers. */
+const groupedArchivedWorkerList = computed<ArchivedWorkerListItem[]>(() => {
+  const groupByWorkerId = new Map<string, WorkerGroup>();
+  for (const group of workerGroups.value)
+    for (const workerId of group.workerIds)
+      if (!groupByWorkerId.has(workerId)) groupByWorkerId.set(workerId, group);
+
+  const workersByGroupId = new Map<string, ArchivedWorker[]>();
+  for (const worker of props.archivedWorkers) {
+    const group = groupByWorkerId.get(worker.id);
+    if (!group) continue;
+    const members = workersByGroupId.get(group.id) ?? [];
+    members.push(worker);
+    workersByGroupId.set(group.id, members);
+  }
+  const nodes = new Map<string, ArchivedWorkerGroupSidebarTreeNode>();
+  for (const group of workerGroups.value)
+    nodes.set(group.id, {
+      group,
+      workers: workersByGroupId.get(group.id) ?? [],
+      children: [],
+    });
+  const roots: ArchivedWorkerGroupSidebarTreeNode[] = [];
+  for (const node of nodes.values()) {
+    const parent = node.group.parentId ? nodes.get(node.group.parentId) : undefined;
+    if (parent) parent.children.push(node);
+    else roots.push(node);
+  }
+  const visible = (node: ArchivedWorkerGroupSidebarTreeNode): boolean =>
+    node.workers.length > 0 || node.children.some(visible);
+  const rootByGroupId = new Map<string, ArchivedWorkerGroupSidebarTreeNode>();
+  const index = (
+    node: ArchivedWorkerGroupSidebarTreeNode,
+    root: ArchivedWorkerGroupSidebarTreeNode,
+  ) => {
+    rootByGroupId.set(node.group.id, root);
+    node.children.forEach((child) => index(child, root));
+  };
+  roots.forEach((root) => index(root, root));
+
+  const renderedRoots = new Set<string>();
+  return props.archivedWorkers.reduce<ArchivedWorkerListItem[]>((items, worker) => {
+    const group = groupByWorkerId.get(worker.id);
+    if (!group) {
+      items.push({ kind: "worker", worker });
+      return items;
+    }
+    const root = rootByGroupId.get(group.id) ?? nodes.get(group.id)!;
+    if (!renderedRoots.has(root.group.id)) {
+      renderedRoots.add(root.group.id);
+      if (visible(root)) items.push({ kind: "group", node: root });
+    }
     return items;
   }, []);
 });
@@ -603,6 +667,7 @@ function isContainerActive(
               @archive-container="(id) => emit('archiveContainer', id)"
               @update-container="(id, patch, rebuild, complete) => emit('updateContainer', id, patch, rebuild, complete)"
               @download-workspace="(id) => emit('downloadWorkspace', id)"
+              @group-lifecycle="(groupId, action, complete) => emit('groupLifecycle', groupId, action, complete)"
             />
             <ContainerCard
               v-else
@@ -634,13 +699,23 @@ function isContainerActive(
           No archived workers.
         </div>
         <div class="space-y-2">
-          <ArchivedWorkerCard
-            v-for="w in archivedWorkers"
-            :key="w.id"
-            :worker="w"
-            @unarchive="(id) => emit('unarchiveWorker', id)"
-            @delete="(id) => emit('deleteArchivedWorker', id)"
-          />
+          <template
+            v-for="item in groupedArchivedWorkerList"
+            :key="item.kind === 'group' ? item.node.group.id : item.worker.id"
+          >
+            <ArchivedWorkerGroupSidebarNode
+              v-if="item.kind === 'group'"
+              :node="item.node"
+              @unarchive="(id) => emit('unarchiveWorker', id)"
+              @delete="(id) => emit('deleteArchivedWorker', id)"
+            />
+            <ArchivedWorkerCard
+              v-else
+              :worker="item.worker"
+              @unarchive="(id) => emit('unarchiveWorker', id)"
+              @delete="(id) => emit('deleteArchivedWorker', id)"
+            />
+          </template>
         </div>
       </div>
 

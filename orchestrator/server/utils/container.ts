@@ -84,6 +84,8 @@ import type {
   RepoConfig,
   MountConfig,
   UserEnvVars,
+  WorkerGroupLifecycleAction,
+  WorkerGroupLifecycleResult,
 } from "../../shared/types";
 import {
   normalizeClientPath,
@@ -357,6 +359,9 @@ export class ContainerManager {
   /** Restart-persistent ownership handles for custom environments created
    * implicitly by imports. */
   private importCreatedEnvironments = new Map<string, string>();
+  /** A caller timeout must not allow a retry to enqueue the same destructive
+   * owner-wide batch while the first operation is still running. */
+  private activeWorkerGroupLifecycleOwners = new Set<string>();
   /** Reattach a freshly created/rebuilt worker to owner-managed networks. Failure
    * is logged only: the worker lifecycle succeeded and the network remains
    * inspectable/reconcilable rather than leaving a half-created worker. */
@@ -1798,6 +1803,105 @@ for p in sys.argv[1:]:
     return this.withExistingWorkerLifecycleMutation(id, () =>
       this.stopUnlocked(id),
     );
+  }
+
+  /** Apply a lifecycle action to all ordinary workers directly contained in a
+   * group and its descendants. Locks are preflighted for the complete live
+   * target set before the first mutation. The ordering is owner fence, group
+   * hierarchy fence, then one worker fence at a time. */
+  async mutateWorkerGroupSubtree(
+    userId: string,
+    groupId: string,
+    action: WorkerGroupLifecycleAction,
+    lockPasswords?: unknown,
+    authorize?: () => void,
+  ): Promise<WorkerGroupLifecycleResult> {
+    if (this.activeWorkerGroupLifecycleOwners.has(userId)) {
+      throw Object.assign(
+        new Error("A worker-group lifecycle operation is already running for this owner"),
+        { statusCode: 409 },
+      );
+    }
+    this.activeWorkerGroupLifecycleOwners.add(userId);
+    try {
+      return await withOwnerLifecycleMutation(userId, async () => {
+        this.assertOwnerExists(userId);
+        const [
+          { withWorkerNetworkMutation },
+          { useWorkerGroupStore },
+          { WorkerGroupHierarchy },
+          { verifyWorkerMutationUnlocks },
+        ] = await Promise.all([
+          import("./worker-group-manager"),
+          import("./services"),
+          import("./worker-group-hierarchy"),
+          import("./worker-protection-lock"),
+        ]);
+        return withWorkerNetworkMutation(userId, async () => {
+          authorize?.();
+          const groups = useWorkerGroupStore();
+          const hierarchy = new WorkerGroupHierarchy(groups);
+          const subtree = hierarchy.descendants(userId, groupId, true);
+          const targetedWorkerIds = [
+            ...new Set(subtree.flatMap((group) => group.workerIds)),
+          ];
+          const result: WorkerGroupLifecycleResult = {
+            action,
+            groupId,
+            groupIds: subtree.map((group) => group.id),
+            targetedWorkerIds,
+            succeededWorkerIds: [],
+            skippedWorkerIds: [],
+            failures: [],
+          };
+          const liveWorkerIds: string[] = [];
+          for (const workerId of targetedWorkerIds) {
+            const record = this.workerStore?.get(userId, workerId);
+            if (record?.status === "archived" || (!record && !this.containers.has(workerId))) {
+              result.skippedWorkerIds.push(workerId);
+              continue;
+            }
+            liveWorkerIds.push(workerId);
+          }
+          await verifyWorkerMutationUnlocks(liveWorkerIds, lockPasswords);
+
+          for (const workerId of liveWorkerIds) {
+            await withWorkerLifecycleMutation(workerId, async () => {
+              const worker = this.containers.get(workerId);
+              if (!worker || worker.userId !== userId || worker.administrativeKind) {
+                result.failures.push({
+                  workerId,
+                  message: "Worker runtime is unavailable",
+                });
+                return;
+              }
+              try {
+                if (action === "stop") await this.stopUnlocked(workerId);
+                else if (action === "rebuild") await this.rebuildUnlocked(workerId);
+                else await this.archiveUnlocked(workerId);
+                result.succeededWorkerIds.push(workerId);
+              } catch (error) {
+                result.failures.push({
+                  workerId,
+                  message: error instanceof Error ? error.message : "Lifecycle operation failed",
+                });
+              }
+            });
+          }
+          if (result.failures.length) {
+            throw Object.assign(
+              new Error(
+                `Worker-group ${action} partially failed for ${result.failures.length} worker(s)`,
+              ),
+              { statusCode: 409, data: result },
+            );
+          }
+          return result;
+        });
+      });
+    } finally {
+      this.activeWorkerGroupLifecycleOwners.delete(userId);
+    }
   }
 
   private async stopUnlocked(id: string): Promise<void> {

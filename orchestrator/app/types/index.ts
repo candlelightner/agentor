@@ -9,6 +9,8 @@ export type {
   ServiceStatus,
   ContainerInfo,
   ContainerStatus,
+  WorkerGroupLifecycleAction,
+  WorkerGroupLifecycleResult,
   CreateContainerRequest,
   UpdateContainerSettingsRequest,
   ImageUpdateInfo,

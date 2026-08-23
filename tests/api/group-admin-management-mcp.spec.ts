@@ -279,7 +279,10 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
       "admin-workspace.startup-script.get", "admin-workspace.startup-script.set",
       "groups.admin-workspace.startup-script.get", "groups.admin-workspace.startup-script.set",
     ]));
-    expect(toolNames).toEqual(expect.arrayContaining(["groups.list", "groups.create", "groups.update", "groups.delete", "groups.assign-worker"]));
+    expect(toolNames).toEqual(expect.arrayContaining([
+      "groups.list", "groups.create", "groups.update", "groups.delete", "groups.assign-worker",
+      "groups.workers.stop", "groups.workers.rebuild", "groups.workers.archive",
+    ]));
     expect(toolNames).toContain("workers.create");
     expect(toolNames).not.toContain("port-mappings.list");
     expect(toolNames).toEqual(expect.arrayContaining(["workspaces.list", "workspaces.files", "workspaces.preview", "workspaces.download"]));
@@ -317,6 +320,18 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     expect(Object.keys(schemas.get("groups.update")?.properties || {})).not.toContain("workerIds");
     expect(schemas.get("groups.assign-worker")).toMatchObject({ required: ["workerId", "targetGroupId"] });
     expect((schemas.get("groups.env.update")?.properties as any)?.entries?.items?.properties?.value).toMatchObject({ writeOnly: true });
+    for (const name of ["groups.workers.stop", "groups.workers.rebuild", "groups.workers.archive"]) {
+      expect(schemas.get(name)).toMatchObject({
+        additionalProperties: false,
+        required: ["groupId"],
+        properties: {
+          lockPasswords: { additionalProperties: { type: "string", writeOnly: true } },
+          timeoutSeconds: { type: "integer", minimum: 1, maximum: 900 },
+        },
+      });
+      expect(discoveredTools.find(tool => tool.name === name)?.description).toContain("descendant");
+      expect(discoveredTools.find(tool => tool.name === name)?.description).toContain("Administrative workspaces are not affected");
+    }
     expect(Object.keys(schemas.get("admin-workspace.startup-script.get")?.properties || {})).toEqual(["timeoutSeconds"]);
     expect(Object.keys(schemas.get("admin-workspace.startup-script.set")?.properties || {}).sort()).toEqual(["startupScript", "timeoutSeconds"]);
     expect((schemas.get("admin-workspace.startup-script.set")?.properties as any)?.startupScript).toMatchObject({ type: "string", maxLength: 65_536 });
@@ -793,6 +808,102 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     }, { timeout: 60_000 }).toBe("stopped");
     expect((await invoke(request, credential, "worker.start", { workerId: addedMemberId })).status()).toBe(200);
     await waitForWorkerRunning(ownerRequest, addedMemberId, 90_000);
+  });
+
+  test("recursively manages ordinary workers in a descendant subtree and denies sibling groups promptly", { timeout: 360_000 }, async ({ request }) => {
+    let batchGroupId = "";
+    let batchGrandchildId = "";
+    const workerIds: string[] = [];
+    try {
+      await issueCredential(request);
+      const child = await invoke(request, credential, "groups.create", {
+        name: `batch-child-${Date.now()}`,
+        parentId: groupId,
+      });
+      expect(child.status(), await child.text()).toBe(200);
+      batchGroupId = (await child.json()).id;
+      const grandchild = await invoke(request, credential, "groups.create", {
+        name: `batch-grandchild-${Date.now()}`,
+        parentId: batchGroupId,
+      });
+      expect(grandchild.status(), await grandchild.text()).toBe(200);
+      batchGrandchildId = (await grandchild.json()).id;
+      for (const targetGroupId of [batchGroupId, batchGrandchildId]) {
+        const created = await invoke(request, credential, "workers.create", {
+          displayName: `batch-member-${Date.now()}-${workerIds.length}`,
+          targetGroupId,
+        });
+        expect(created.status(), await created.text()).toBe(200);
+        workerIds.push((await created.json()).id);
+      }
+
+      await issueCredential(request);
+      const stopped = await invoke(request, credential, "groups.workers.stop", {
+        groupId: batchGroupId,
+        timeoutSeconds: 180,
+      });
+      expect(stopped.status(), await stopped.text()).toBe(200);
+      expect(await stopped.json()).toMatchObject({
+        action: "stop",
+        groupIds: expect.arrayContaining([batchGroupId, batchGrandchildId]),
+        succeededWorkerIds: expect.arrayContaining(workerIds),
+        failures: [],
+      });
+      const stoppedWorkers = await new ApiClient(ownerRequest).listContainers();
+      for (const workerId of workerIds)
+        expect(stoppedWorkers.body.find((worker: { id: string }) => worker.id === workerId)?.status).toBe("stopped");
+
+      await issueCredential(request);
+      const rebuilt = await invoke(request, credential, "groups.workers.rebuild", {
+        groupId: batchGroupId,
+        timeoutSeconds: 300,
+      });
+      expect(rebuilt.status(), await rebuilt.text()).toBe(200);
+      for (const workerId of workerIds) await waitForWorkerRunning(ownerRequest, workerId, 90_000);
+
+      const randomGroupId = randomUUID();
+      await issueCredential(request);
+      const deniedAt = Date.now();
+      const siblingDenied = await invoke(request, credential, "groups.workers.archive", {
+        groupId: siblingGroupId,
+        timeoutSeconds: 1,
+      });
+      const randomDenied = await invoke(request, credential, "groups.workers.archive", {
+        groupId: randomGroupId,
+        timeoutSeconds: 1,
+      });
+      expect(siblingDenied.status()).toBe(404);
+      expect(randomDenied.status()).toBe(404);
+      expect(Date.now() - deniedAt).toBeLessThan(2_000);
+      expect(await siblingDenied.json()).toEqual(await randomDenied.json());
+
+      await issueCredential(request);
+      const archived = await invoke(request, credential, "groups.workers.archive", {
+        groupId: batchGroupId,
+        timeoutSeconds: 180,
+      });
+      expect(archived.status(), await archived.text()).toBe(200);
+      expect(await archived.json()).toMatchObject({
+        action: "archive",
+        succeededWorkerIds: expect.arrayContaining(workerIds),
+        failures: [],
+      });
+      const archivedIds = (await (await ownerRequest.get("/api/archived")).json() as Array<{ id: string }>).map(worker => worker.id);
+      expect(archivedIds).toEqual(expect.arrayContaining(workerIds));
+
+      await issueCredential(request);
+      for (const workerId of workerIds)
+        expect((await invoke(request, credential, "workers.delete", { workerId })).status()).toBe(200);
+      workerIds.length = 0;
+      expect((await invoke(request, credential, "groups.delete", { groupId: batchGrandchildId })).status()).toBe(200);
+      batchGrandchildId = "";
+      expect((await invoke(request, credential, "groups.delete", { groupId: batchGroupId })).status()).toBe(200);
+      batchGroupId = "";
+    } finally {
+      for (const workerId of workerIds) await cleanupWorker(ownerRequest, workerId).catch(() => {});
+      if (batchGrandchildId) await ownerRequest.delete(`/api/worker-groups/${batchGrandchildId}`).catch(() => {});
+      if (batchGroupId) await ownerRequest.delete(`/api/worker-groups/${batchGroupId}`).catch(() => {});
+    }
   });
 
   test("creates evaluation workers directly into the bound group and manages only there", { timeout: 180_000 }, async ({ request }) => {

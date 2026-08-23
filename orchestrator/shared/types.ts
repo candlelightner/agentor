@@ -72,6 +72,21 @@ export type ContainerStatus =
   | "removing"
   | "error";
 
+export type WorkerGroupLifecycleAction = "stop" | "rebuild" | "archive";
+
+/** Result of applying one lifecycle action to every ordinary worker in a
+ * worker-group subtree. Administrative workspaces are deliberately separate. */
+export interface WorkerGroupLifecycleResult {
+  action: WorkerGroupLifecycleAction;
+  groupId: string;
+  groupIds: string[];
+  targetedWorkerIds: string[];
+  succeededWorkerIds: string[];
+  /** Durable archived workers and stale membership references. */
+  skippedWorkerIds: string[];
+  failures: Array<{ workerId: string; message: string }>;
+}
+
 /** A worker. `id` is the worker's stable UUID identity (immutable across
  * rebuild/unarchive); `containerId`/`containerName` describe the current Docker
  * container (the `containerId` changes on every rebuild). Extends

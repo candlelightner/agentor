@@ -251,6 +251,20 @@ the workspace, and `POST` to `/start`, `/stop`, or `/rebuild` performs the
 corresponding lifecycle action. These routes are owner-scoped and are separate
 from the global administrator workspace routes.
 
+Ordinary-worker subtree lifecycle is a separate family:
+`POST /api/worker-groups/:id/stop`, `/rebuild`, and `/archive`, with matching
+management tools `groups.workers.stop`, `.rebuild`, and `.archive`. The target
+group and all live descendants are resolved inside the serialized hierarchy
+boundary. The operation then preflights every targeted worker lock before
+touching Docker and processes ordinary workers under owner → hierarchy →
+worker lifecycle fences. Missing/stale or already archived members are reported
+as skipped, post-preflight runtime failures are collected without abandoning
+later workers, and administrative workspaces are never targets. A per-owner
+active marker rejects overlapping batches with 409; an MCP deadline releases
+only its caller while the serialized operation and marker remain active. Worker
+group records are unchanged by archive, allowing both the active and archived
+dashboard inventories to reconstruct the same recursive group tree.
+
 ### Workspace, Agents & DinD Storage
 
 Each worker gets persistent storage mounted at `/workspace`, `/home/agent/.agent-data`, and (when DinD is enabled) `/var/lib/docker`. In **volume mode**, these are Docker named volumes (`<containerName>-workspace`, `<containerName>-agents`, `<containerName>-docker`). In **directory mode**, workspace and agents live under the owner's user directory keyed by the worker UUID (`<dataDir>/users/<userId>/workspaces/<id>/`, `<dataDir>/users/<userId>/agents/<id>/`). All survive container stops, restarts, and archiving. On archive, only the container is removed — workspace, agents, and DinD data persist for unarchiving. On permanent delete, all are removed.

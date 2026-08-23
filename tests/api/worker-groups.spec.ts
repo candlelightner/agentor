@@ -65,6 +65,98 @@ test.describe('Worker groups API', () => {
     expect((await request.delete(`/api/worker-groups/${archivedGroup.id}`)).status()).toBe(204);
   });
 
+  test('recursively stops, rebuilds, and archives a locked group subtree while preserving membership', { timeout: 300_000 }, async ({ request }) => {
+    const stamp = Date.now();
+    const password = `subtree-lock-${stamp}`;
+    let rootWorker: Awaited<ReturnType<typeof createWorker>> | undefined;
+    let childWorker: Awaited<ReturnType<typeof createWorker>> | undefined;
+    let rootId = '';
+    let childId = '';
+    const workerStatus = async (workerId: string) => {
+      const listed = await new ApiClient(request).listContainers();
+      return listed.body.find((worker: { id: string }) => worker.id === workerId)?.status;
+    };
+    try {
+      rootWorker = await createWorker(request, { displayName: `subtree-root-${stamp}` });
+      childWorker = await createWorker(request, { displayName: `subtree-child-${stamp}` });
+      const rootResponse = await request.post('/api/worker-groups', {
+        data: { name: `subtree-root-${stamp}` },
+      });
+      expect(rootResponse.status()).toBe(201);
+      rootId = (await rootResponse.json()).id;
+      const childResponse = await request.post('/api/worker-groups', {
+        data: { name: `subtree-child-${stamp}`, parentId: rootId },
+      });
+      expect(childResponse.status()).toBe(201);
+      childId = (await childResponse.json()).id;
+      expect((await request.put('/api/worker-groups/assignment', {
+        data: { workerId: rootWorker.id, groupId: rootId },
+      })).status()).toBe(200);
+      expect((await request.put('/api/worker-groups/assignment', {
+        data: { workerId: childWorker.id, groupId: childId },
+      })).status()).toBe(200);
+      expect((await request.put(`/api/containers/${childWorker.id}/protection`, {
+        data: { password },
+      })).status()).toBe(200);
+
+      // Complete lock preflight is atomic: the unlocked root worker must still
+      // be running when a descendant lock is missing.
+      const denied = await request.post(`/api/worker-groups/${rootId}/stop`, { data: {} });
+      expect(denied.status()).toBe(423);
+      expect(await workerStatus(rootWorker.id)).toBe('running');
+      expect(await workerStatus(childWorker.id)).toBe('running');
+
+      const unlocks = { [childWorker.id]: password };
+      const stopped = await request.post(`/api/worker-groups/${rootId}/stop`, {
+        data: { lockPasswords: unlocks },
+      });
+      expect(stopped.status(), await stopped.text()).toBe(200);
+      expect(await stopped.json()).toMatchObject({
+        action: 'stop',
+        groupId: rootId,
+        groupIds: expect.arrayContaining([rootId, childId]),
+        targetedWorkerIds: expect.arrayContaining([rootWorker.id, childWorker.id]),
+        succeededWorkerIds: expect.arrayContaining([rootWorker.id, childWorker.id]),
+        failures: [],
+      });
+      expect(await workerStatus(rootWorker.id)).toBe('stopped');
+      expect(await workerStatus(childWorker.id)).toBe('stopped');
+
+      const rebuilt = await request.post(`/api/worker-groups/${rootId}/rebuild`, {
+        data: { lockPasswords: unlocks },
+      });
+      expect(rebuilt.status(), await rebuilt.text()).toBe(200);
+      expect(await workerStatus(rootWorker.id)).toBe('running');
+      expect(await workerStatus(childWorker.id)).toBe('running');
+
+      const archived = await request.post(`/api/worker-groups/${rootId}/archive`, {
+        data: { lockPasswords: unlocks },
+      });
+      expect(archived.status(), await archived.text()).toBe(200);
+      expect(await archived.json()).toMatchObject({
+        action: 'archive',
+        succeededWorkerIds: expect.arrayContaining([rootWorker.id, childWorker.id]),
+        failures: [],
+      });
+      const archivedWorkers = await (await request.get('/api/archived')).json() as Array<{ id: string }>;
+      expect(archivedWorkers.map(worker => worker.id)).toEqual(
+        expect.arrayContaining([rootWorker.id, childWorker.id]),
+      );
+      expect((await (await request.get(`/api/worker-groups/${rootId}`)).json()).workerIds).toEqual([rootWorker.id]);
+      expect((await (await request.get(`/api/worker-groups/${childId}`)).json()).workerIds).toEqual([childWorker.id]);
+    } finally {
+      if (childWorker) {
+        await request.delete(`/api/containers/${childWorker.id}/protection`, {
+          data: { password },
+        }).catch(() => {});
+        await cleanupWorker(request, childWorker.id).catch(() => {});
+      }
+      if (rootWorker) await cleanupWorker(request, rootWorker.id).catch(() => {});
+      if (childId) await request.delete(`/api/worker-groups/${childId}`).catch(() => {});
+      if (rootId) await request.delete(`/api/worker-groups/${rootId}`).catch(() => {});
+    }
+  });
+
   test('reconciles every dependent network through API and MCP and preserves referenced groups', async ({ request }) => {
     const stamp = Date.now();
     const passwordA = `group-lock-a-${stamp}`;

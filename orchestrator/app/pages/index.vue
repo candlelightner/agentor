@@ -24,6 +24,11 @@ const {
   deleteArchivedWorker,
 } = useArchivedWorkers();
 const {
+  groups: workerGroups,
+  refresh: refreshWorkerGroups,
+  lifecycle: mutateWorkerGroup,
+} = useWorkerGroups();
+const {
   rootNode,
   focusedNodeId,
   tabs,
@@ -165,6 +170,61 @@ async function handleArchive(id: string) {
   await refreshContainers();
 }
 
+async function handleGroupLifecycle(
+  groupId: string,
+  action: "stop" | "rebuild" | "archive",
+  complete: (error?: string) => void,
+) {
+  const group = workerGroups.value.find((item) => item.id === groupId);
+  if (!group) {
+    complete("Worker group no longer exists.");
+    return;
+  }
+  const prompts = {
+    stop: `Stop all active ordinary workers in ${group.name} and its subgroups? Group administrative workspaces are not affected.`,
+    rebuild: `Rebuild all active ordinary workers in ${group.name} and its subgroups with their configured images? Workspace data and group membership are preserved. Group administrative workspaces are not affected.`,
+    archive: `Archive all active ordinary workers in ${group.name} and its subgroups? Workspace data and group membership are preserved. Group administrative workspaces are not affected.`,
+  };
+  if (!confirm(prompts[action])) {
+    complete();
+    return;
+  }
+  const groupIds = new Set<string>([groupId]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const item of workerGroups.value) {
+      if (item.parentId && groupIds.has(item.parentId) && !groupIds.has(item.id)) {
+        groupIds.add(item.id);
+        changed = true;
+      }
+    }
+  }
+  const targetedWorkerIds = new Set(
+    workerGroups.value
+      .filter((item) => groupIds.has(item.id))
+      .flatMap((item) => item.workerIds),
+  );
+  if (action === "archive" || action === "rebuild")
+    targetedWorkerIds.forEach((workerId) => closeTabsForContainer(workerId));
+  try {
+    await mutateWorkerGroup(groupId, action);
+    complete();
+  } catch (error: any) {
+    complete(
+      error?.data?.statusMessage ||
+        error?.data?.message ||
+        `Could not ${action} the worker-group subtree.`,
+    );
+  } finally {
+    await Promise.all([
+      refreshContainers(),
+      refreshArchived(),
+      refreshWorkerGroups(),
+    ]);
+  }
+}
+
 async function handleUpdate(
   id: string,
   patch: UpdateContainerSettingsRequest,
@@ -292,6 +352,7 @@ function onCreateModalClosed() {
       @rebuild-container="handleRebuild"
       @remove-container="handleRemove"
       @archive-container="handleArchive"
+      @group-lifecycle="handleGroupLifecycle"
       @update-container="handleUpdate"
       @download-workspace="handleDownloadWorkspace"
       @unarchive-worker="handleUnarchive"

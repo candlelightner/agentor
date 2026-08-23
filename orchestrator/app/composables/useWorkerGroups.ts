@@ -73,5 +73,29 @@ export function useWorkerGroups() {
     if (group) group.adminWorkspace = result;
     return result;
   };
-  return { groups, refresh, create, update, remove, assignWorker, adminAction };
+  const lifecycle = async (
+    id: string,
+    action: import("~/types").WorkerGroupLifecycleAction,
+    lockPasswords?: Record<string, string>,
+  ) => {
+    const result = await $fetch<import("~/types").WorkerGroupLifecycleResult>(
+      `/api/worker-groups/${id}/${action}`,
+      {
+        method: "POST",
+        body: lockPasswords ? { lockPasswords } : {},
+      },
+    );
+    await refresh();
+    return result;
+  };
+  return {
+    groups,
+    refresh,
+    create,
+    update,
+    remove,
+    assignWorker,
+    adminAction,
+    lifecycle,
+  };
 }

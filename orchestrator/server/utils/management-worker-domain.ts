@@ -29,6 +29,8 @@ const mutation = { readOnlyHint: false, destructiveHint: false, idempotentHint: 
 const read = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 const GROUP_ADMIN_LIFECYCLE_TIMEOUT_DEFAULT_SECONDS = 120;
 const GROUP_ADMIN_LIFECYCLE_TIMEOUT_MAX_SECONDS = 300;
+const GROUP_WORKER_LIFECYCLE_TIMEOUT_DEFAULT_SECONDS = 300;
+const GROUP_WORKER_LIFECYCLE_TIMEOUT_MAX_SECONDS = 900;
 const MANAGEMENT_FAIL_FAST_TIMEOUT_DEFAULT_SECONDS = 30;
 const MANAGEMENT_FAIL_FAST_TIMEOUT_MAX_SECONDS = 120;
 const MANAGEMENT_FAIL_FAST_TOOLS = new Set([
@@ -81,6 +83,30 @@ const groupAdminStartupScriptInput = (write: boolean) => ({
     timeoutSeconds: failFastTimeoutSchema,
   },
 });
+const groupWorkerLifecycleInput = {
+  type: "object",
+  additionalProperties: false,
+  required: ["groupId"],
+  properties: {
+    groupId: {
+      type: "string",
+      description:
+        "Target worker group. The action recursively includes descendant groups; group-admin callers are restricted to their bound subtree.",
+    },
+    lockPasswords: {
+      type: "object",
+      additionalProperties: { type: "string", writeOnly: true },
+      description:
+        "Write-only map of protected worker IDs to lock passwords. Every lock is checked before any worker is changed.",
+    },
+    timeoutSeconds: {
+      type: "integer",
+      minimum: 1,
+      maximum: GROUP_WORKER_LIFECYCLE_TIMEOUT_MAX_SECONDS,
+      description: `Server-side caller deadline in seconds (default ${GROUP_WORKER_LIFECYCLE_TIMEOUT_DEFAULT_SECONDS}; 1-${GROUP_WORKER_LIFECYCLE_TIMEOUT_MAX_SECONDS}). A timed-out operation remains serialized and continues safely in the background.`,
+    },
+  },
+};
 
 /** MCP domain adapter for ordinary worker administration. It is deliberately
  * transport-free: ManagementMcpStore can register these definitions/dispatch
@@ -103,6 +129,9 @@ export class ManagementWorkerDomain {
       ["groups.create", "groups", "Create a root or child worker group for an explicit owner. timeoutSeconds bounds hierarchy validation, persistence, and network reconciliation.", failFastInput({userId:{type:"string"},name:{type:"string"},parentId:{type:["string","null"]}}, ["userId","name"]), mutation],
       ["groups.update", "groups", "Rename, reparent, or replace same-owner direct membership, reconciling dependent managed networks. Protected workers require lockPasswords; timeoutSeconds bounds the operation.", failFastInput({groupId:{type:"string"},name:{type:"string"},parentId:{type:["string","null"]},workerIds:{type:"array",items:{type:"string"}},lockPasswords:{type:"object",additionalProperties:{type:"string",writeOnly:true}}}, ["groupId"]), mutation],
       ["groups.delete", "groups", "Delete an empty group without deleting workers. Groups referenced by managed networks must be reconfigured first; timeoutSeconds bounds the operation.", failFastInput({groupId:{type:"string"}}, ["groupId"]), { ...mutation, destructiveHint:true }],
+      ["groups.workers.stop", "groups", "Recursively stop every ordinary worker in a group and all descendant groups. Administrative workspaces are not affected; every protection lock is checked before any mutation.", groupWorkerLifecycleInput, mutation],
+      ["groups.workers.rebuild", "groups", "Recursively rebuild every ordinary worker in a group and all descendant groups, preserving durable data and group membership. Administrative workspaces are not affected; every protection lock is checked before any mutation.", groupWorkerLifecycleInput, mutation],
+      ["groups.workers.archive", "groups", "Recursively archive every ordinary worker in a group and all descendant groups, preserving durable data and group membership. Administrative workspaces are not affected; every protection lock is checked before any mutation.", groupWorkerLifecycleInput, mutation],
       ["groups.assign-worker", "groups", "Atomically move one worker to a group, or set targetGroupId to null to leave it ungrouped. timeoutSeconds bounds lock checks and network reconciliation.", failFastInput({workerId:{type:"string"},targetGroupId:{type:["string","null"]},lockPasswords:{type:"object",additionalProperties:{type:"string",writeOnly:true}}}, ["workerId","targetGroupId"]), mutation],
       ["groups.env.list", "groups", "List own, inherited, excluded, and effective group environment variable names. Values are never returned; timeoutSeconds bounds the server-side request.", failFastInput({groupId:{type:"string"}}, ["groupId"]), read],
       ["groups.env.update", "groups", "Set write-only variables owned by a group, delete own keys, or replace inherited-key exclusions. Returns names only; values never appear in results or audit output. timeoutSeconds bounds authorization, persistence, and rebuild marking.", failFastInput({groupId:{type:"string"},entries:{type:"array",items:{type:"object",required:["key","value"],additionalProperties:false,properties:{key:{type:"string"},value:{type:"string",writeOnly:true}}}},deleteKeys:{type:"array",items:{type:"string"}},excludedInheritedKeys:{type:"array",items:{type:"string"}}}, ["groupId"]), mutation],
@@ -200,6 +229,21 @@ export class ManagementWorkerDomain {
       return assignWorkerToGroupWithNetworks(worker.userId,workerId,target,args.lockPasswords);
     }
     const group=store.findById(required(args.groupId,"groupId")); if(!group) throw status(404,"Worker group not found");
+    if(name.startsWith("groups.workers.")) {
+      const action=name.slice("groups.workers.".length);
+      if(action!=="stop"&&action!=="rebuild"&&action!=="archive")throw status(400,"Unsupported worker-group lifecycle action");
+      return withinGroupWorkerLifecycleDeadline(
+        () => useContainerManager().mutateWorkerGroupSubtree(
+          group.userId,
+          group.id,
+          action,
+          args.lockPasswords,
+          typeof args.__scopeAuthorize==="function"?args.__scopeAuthorize as ()=>void:undefined,
+        ),
+        groupWorkerLifecycleTimeoutSeconds(args.timeoutSeconds),
+        name,
+      );
+    }
     if(name==="groups.env.list")return withWorkerNetworkMutation(group.userId,async()=>{if(typeof args.__scopeAuthorize==="function")(args.__scopeAuthorize as ()=>void)();return publicGroupEnvKeys(group.userId,group.id);});
     if(name==="groups.env.update")return withWorkerNetworkMutation(group.userId,async()=>{
       if(typeof args.__scopeAuthorize==="function")(args.__scopeAuthorize as ()=>void)();
@@ -257,6 +301,23 @@ export function withinGroupAdminLifecycleDeadline<T>(operation: () => Promise<T>
   let timer: ReturnType<typeof setTimeout> | undefined;
   return new Promise<T>((resolve, reject) => {
     timer = setTimeout(() => reject(status(504, `Group administrative workspace operation exceeded ${timeoutSeconds} seconds`)), timeoutSeconds * 1000);
+    timer.unref?.();
+    void operation().then(resolve, reject);
+  }).finally(() => { if (timer) clearTimeout(timer); });
+}
+function groupWorkerLifecycleTimeoutSeconds(value: unknown) {
+  if (value === undefined) return GROUP_WORKER_LIFECYCLE_TIMEOUT_DEFAULT_SECONDS;
+  if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > GROUP_WORKER_LIFECYCLE_TIMEOUT_MAX_SECONDS)
+    throw status(400, `timeoutSeconds must be an integer between 1 and ${GROUP_WORKER_LIFECYCLE_TIMEOUT_MAX_SECONDS}`);
+  return value as number;
+}
+/** Bounds the MCP caller only. The container manager retains its owner batch
+ * marker until the underlying serialized operation settles, so retries cannot
+ * enqueue duplicate rebuild/archive work after a timeout. */
+function withinGroupWorkerLifecycleDeadline<T>(operation: () => Promise<T>, timeoutSeconds: number, toolName: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return new Promise<T>((resolve, reject) => {
+    timer = setTimeout(() => reject(status(504, `${toolName} exceeded its ${timeoutSeconds} second server-side deadline`)), timeoutSeconds * 1000);
     timer.unref?.();
     void operation().then(resolve, reject);
   }).finally(() => { if (timer) clearTimeout(timer); });
