@@ -39,6 +39,32 @@ test.describe('Worker groups API', () => {
   });
   test('rejects invalid names and unknown workers', async ({ request }) => { expect((await request.post('/api/worker-groups', { data: { name: '' } })).status()).toBe(400); const group = await (await request.post('/api/worker-groups', { data: { name: 'Valid' } })).json(); expect((await request.patch(`/api/worker-groups/${group.id}`, { data: { workerIds: ['missing'] } })).status()).toBe(400); await request.delete(`/api/worker-groups/${group.id}`); });
 
+  test('permanent live or archived worker deletion clears membership and leaves the group deletable', { timeout: 180_000 }, async ({ request }) => {
+    const worker = await createWorker(request, { displayName: `group-delete-member-${Date.now()}` });
+    const created = await request.post('/api/worker-groups', { data: { name: `delete-cleanup-${Date.now()}` } });
+    expect(created.status()).toBe(201);
+    const group = await created.json();
+    expect((await request.patch(`/api/worker-groups/${group.id}`, { data: { workerIds: [worker.id] } })).status()).toBe(200);
+    expect((await request.delete(`/api/containers/${worker.id}`, { data: {} })).status()).toBe(200);
+    const repaired = await request.get(`/api/worker-groups/${group.id}`);
+    expect(repaired.status()).toBe(200);
+    expect((await repaired.json()).workerIds).toEqual([]);
+    expect((await request.delete(`/api/worker-groups/${group.id}`)).status()).toBe(204);
+
+    const archivedWorker = await createWorker(request, { displayName: `group-archived-delete-member-${Date.now()}` });
+    const archivedCreated = await request.post('/api/worker-groups', { data: { name: `archived-delete-cleanup-${Date.now()}` } });
+    expect(archivedCreated.status()).toBe(201);
+    const archivedGroup = await archivedCreated.json();
+    expect((await request.patch(`/api/worker-groups/${archivedGroup.id}`, { data: { workerIds: [archivedWorker.id] } })).status()).toBe(200);
+    const api = new ApiClient(request);
+    expect((await api.archiveContainer(archivedWorker.id)).status).toBe(200);
+    expect((await api.deleteArchivedWorker(archivedWorker.id)).status).toBe(200);
+    const repairedArchived = await request.get(`/api/worker-groups/${archivedGroup.id}`);
+    expect(repairedArchived.status()).toBe(200);
+    expect((await repairedArchived.json()).workerIds).toEqual([]);
+    expect((await request.delete(`/api/worker-groups/${archivedGroup.id}`)).status()).toBe(204);
+  });
+
   test('reconciles every dependent network through API and MCP and preserves referenced groups', async ({ request }) => {
     const stamp = Date.now();
     const passwordA = `group-lock-a-${stamp}`;

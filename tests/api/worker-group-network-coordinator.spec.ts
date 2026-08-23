@@ -195,6 +195,176 @@ test("group deletion rejects direct workers and child groups", async () => {
   );
 });
 
+test("group deletion prunes only missing worker records before the non-empty guard", async () => {
+  let current = group(["missing-worker"]);
+  let removed = false;
+  const service = new WorkerGroupNetworkCoordinator(
+    dependencies({
+      group: () => current,
+      workerExists: () => false,
+      update: async (_userId, _groupId, patch) => {
+        current = { ...current, ...patch } as WorkerGroup;
+        return current;
+      },
+      remove: async () => {
+        removed = true;
+      },
+    }),
+  );
+  await service.delete(ownerId, groupId);
+  expect(current.workerIds).toEqual([]);
+  expect(removed).toBe(true);
+
+  current = group(["live-worker"]);
+  removed = false;
+  const live = new WorkerGroupNetworkCoordinator(
+    dependencies({
+      group: () => current,
+      workerExists: () => true,
+      update: async (_userId, _groupId, patch) => {
+        current = { ...current, ...patch } as WorkerGroup;
+        return current;
+      },
+      remove: async () => {
+        removed = true;
+      },
+    }),
+  );
+  await expect(live.delete(ownerId, groupId)).rejects.toMatchObject({
+    statusCode: 409,
+  });
+  expect(current.workerIds).toEqual(["live-worker"]);
+  expect(removed).toBe(false);
+});
+
+test("permanent worker deletion clears membership and reconciles descendant and ancestor networks", async () => {
+  let groups = [
+    { ...group([]), id: "root" },
+    { ...group(["deleted-worker"]), id: "child", parentId: "root" },
+  ];
+  const networks = [
+    { ...network, id: "root-network", groupId: "root" },
+    { ...network, id: "child-network", groupId: "child" },
+  ];
+  const reconciled: string[] = [];
+  const setReferences = async (
+    _userId: string,
+    workerId: string,
+    groupIds: Iterable<string>,
+  ) => {
+    const targets = new Set(groupIds);
+    groups = groups.map((candidate) => ({
+      ...candidate,
+      workerIds: targets.has(candidate.id)
+        ? [...new Set([...candidate.workerIds, workerId])]
+        : candidate.workerIds.filter((id) => id !== workerId),
+    }));
+    return groups.map((candidate) => candidate.id);
+  };
+  const service = new WorkerGroupNetworkCoordinator(
+    dependencies({
+      groups: () => groups,
+      networks: () => networks,
+      setWorkerReferences: setReferences,
+      removeWorkerReferences: (userId, workerId) =>
+        setReferences(userId, workerId, []),
+      reconcile: async (candidate) => {
+        reconciled.push(candidate.id);
+        return { workerIds: [], partialFailures: [] };
+      },
+    }),
+  );
+  // Group-admin worker operations already execute inside this same owner
+  // boundary. Membership cleanup must therefore be safely reentrant instead
+  // of waiting forever on the queue tail owned by its own request.
+  await expect(
+    Promise.race([
+      service.withOwner(ownerId, () =>
+        service.removeDeletedWorker(ownerId, "deleted-worker"),
+      ),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("same-owner queue deadlocked")), 500),
+      ),
+    ]),
+  ).resolves.toEqual(["child"]);
+  expect(groups.find((candidate) => candidate.id === "child")?.workerIds).toEqual([]);
+  expect(new Set(reconciled)).toEqual(
+    new Set(["root-network", "child-network"]),
+  );
+
+  let releaseLate!: () => void;
+  const lateGate = new Promise<void>((resolve) => { releaseLate = resolve; });
+  const order: string[] = [];
+  let late!: Promise<void>;
+  await service.withOwner(ownerId, async () => {
+    late = (async () => {
+      await lateGate;
+      await service.withOwner(ownerId, async () => { order.push("late"); });
+    })();
+  });
+  let releaseBlocker!: () => void;
+  let markBlockerStarted!: () => void;
+  const blockerGate = new Promise<void>((resolve) => { releaseBlocker = resolve; });
+  const blockerStarted = new Promise<void>((resolve) => { markBlockerStarted = resolve; });
+  const blocker = service.withOwner(ownerId, async () => {
+    order.push("blocker-start");
+    markBlockerStarted();
+    await blockerGate;
+    order.push("blocker-end");
+  });
+  await blockerStarted;
+  releaseLate();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(order).toEqual(["blocker-start"]);
+  releaseBlocker();
+  await Promise.all([blocker, late]);
+  expect(order).toEqual(["blocker-start", "blocker-end", "late"]);
+});
+
+test("worker deletion restores exact memberships when network reconciliation fails", async () => {
+  let groups = [
+    { ...group(["deleted-worker"]), id: "first" },
+    { ...group(["deleted-worker"]), id: "legacy-duplicate" },
+  ];
+  const setReferences = async (
+    _userId: string,
+    workerId: string,
+    groupIds: Iterable<string>,
+  ) => {
+    const targets = new Set(groupIds);
+    groups = groups.map((candidate) => ({
+      ...candidate,
+      workerIds: targets.has(candidate.id)
+        ? [...new Set([...candidate.workerIds, workerId])]
+        : candidate.workerIds.filter((id) => id !== workerId),
+    }));
+    return [...targets];
+  };
+  let calls = 0;
+  const service = new WorkerGroupNetworkCoordinator(
+    dependencies({
+      groups: () => groups,
+      networks: () => [
+        { ...network, id: "first-network", groupId: "first" },
+      ],
+      setWorkerReferences: setReferences,
+      removeWorkerReferences: (userId, workerId) =>
+        setReferences(userId, workerId, []),
+      reconcile: async () => ({
+        workerIds: [],
+        partialFailures: calls++ === 0 ? ["injected detach failure"] : [],
+      }),
+    }),
+  );
+  await expect(
+    service.removeDeletedWorker(ownerId, "deleted-worker"),
+  ).rejects.toMatchObject({ statusCode: 409 });
+  expect(
+    groups.filter((candidate) => candidate.workerIds.includes("deleted-worker"))
+      .map((candidate) => candidate.id),
+  ).toEqual(["first", "legacy-duplicate"]);
+});
+
 test("reconciliation failure restores topology even when group storage rollback fails", async () => {
   let current = group();
   let updates = 0;
@@ -425,8 +595,11 @@ function dependencies(
     networks?: () => ManagedNetwork[];
     update?: WorkerGroupNetworkDependencies["groups"]["update"];
     assignWorker?: WorkerGroupNetworkDependencies["groups"]["assignWorker"];
+    setWorkerReferences?: WorkerGroupNetworkDependencies["groups"]["setWorkerReferences"];
+    removeWorkerReferences?: WorkerGroupNetworkDependencies["groups"]["removeWorkerReferences"];
     remove?: WorkerGroupNetworkDependencies["groups"]["remove"];
     reconcile?: WorkerGroupNetworkDependencies["manager"]["reconcile"];
+    workerExists?: WorkerGroupNetworkDependencies["workerExists"];
   } = {},
 ): WorkerGroupNetworkDependencies {
   return {
@@ -450,6 +623,10 @@ function dependencies(
         overrides.assignWorker ??
         (async (_userId, _workerId, _sourceId, targetId) =>
           targetId ? group() : null),
+      setWorkerReferences:
+        overrides.setWorkerReferences ?? (async () => []),
+      removeWorkerReferences:
+        overrides.removeWorkerReferences ?? (async () => []),
       remove: overrides.remove ?? (async () => undefined),
     },
     networks: {
@@ -466,5 +643,6 @@ function dependencies(
         })),
     },
     verify: async () => undefined,
+    workerExists: overrides.workerExists ?? (() => true),
   };
 }

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createError } from "h3";
 import { useManagedNetworkManager } from "./managed-network-manager";
 import type { ManagedNetwork } from "./managed-network-store";
@@ -5,6 +6,7 @@ import {
   useManagedNetworkStore,
   useWorkerGroupStore,
   useWorkerGroupEnvStore,
+  useWorkerStore,
 } from "./services";
 import { useImageCatalogManager } from "./image-catalog";
 import type { WorkerGroup } from "./worker-group-store";
@@ -30,6 +32,12 @@ interface GroupStoreLike {
     expectedSourceId: string | undefined,
     targetGroupId: string | null,
   ): Promise<WorkerGroup | null>;
+  setWorkerReferences(
+    userId: string,
+    workerId: string,
+    groupIds: Iterable<string>,
+  ): Promise<string[]>;
+  removeWorkerReferences(userId: string, workerId: string): Promise<string[]>;
   remove(userId: string, groupId: string): Promise<void>;
 }
 interface NetworkStoreLike {
@@ -47,6 +55,7 @@ export interface WorkerGroupNetworkDependencies {
   networks: NetworkStoreLike;
   manager: NetworkManagerLike;
   verify(workerIds: Iterable<string>, passwords: unknown): Promise<void>;
+  workerExists(userId: string, workerId: string): boolean;
 }
 
 /** One owner-scoped queue spans group mutations and managed-network reference
@@ -54,14 +63,39 @@ export interface WorkerGroupNetworkDependencies {
  * serializing unrelated users. */
 export class WorkerGroupNetworkCoordinator {
   private queues = new Map<string, Promise<void>>();
+  private activeOwners = new AsyncLocalStorage<
+    ReadonlyMap<string, { active: boolean }>
+  >();
 
   constructor(
     private readonly dependencies: WorkerGroupNetworkDependencies = productionDependencies(),
   ) {}
 
   withOwner<T>(userId: string, operation: () => Promise<T>): Promise<T> {
+    const active = this.activeOwners.getStore();
+    // Group-scoped management calls intentionally hold this queue across the
+    // authorized operation. Cleanup performed by that operation may need to
+    // update the same owner's memberships; waiting on our own queue tail would
+    // deadlock the request. The async-local marker permits only an operation
+    // already executing inside this coordinator's same-owner boundary to run
+    // inline. Independent requests remain serialized normally.
+    if (active?.get(userId)?.active) return operation();
     const previous = this.queues.get(userId) ?? Promise.resolve();
-    const result = previous.catch(() => undefined).then(operation);
+    const result = previous.catch(() => undefined).then(() => {
+      // Async-local state is inherited by detached tasks. Invalidate this
+      // marker when the queued operation settles so a late continuation can
+      // never use an expired execution context to bypass serialization.
+      const marker = { active: true };
+      const context = new Map(active ?? []);
+      context.set(userId, marker);
+      return this.activeOwners.run(context, async () => {
+        try {
+          return await operation();
+        } finally {
+          marker.active = false;
+        }
+      });
+    });
     const tail = result.then(
       () => undefined,
       () => undefined,
@@ -248,8 +282,24 @@ export class WorkerGroupNetworkCoordinator {
     userId: string,
     groupId: string,
     beforeRemove?: () => Promise<void | (() => Promise<void>)>,
+    authorize?: () => void,
   ) {
     return this.withOwner(userId, async () => {
+      authorize?.();
+      // Older worker deletion paths could leave ids behind after the durable
+      // worker record was already gone. Repair only this already-authorized
+      // target group before evaluating the normal non-empty guard. Never
+      // discard a reference to a live or archived worker.
+      const current = this.dependencies.groups.get(userId, groupId);
+      if (current) {
+        const retained = current.workerIds.filter((workerId) =>
+          this.dependencies.workerExists(userId, workerId),
+        );
+        if (retained.length !== current.workerIds.length)
+          await this.dependencies.groups.update(userId, groupId, {
+            workerIds: retained,
+          });
+      }
       this.assertCanDelete(userId, groupId);
       const rollback = await beforeRemove?.();
       try {
@@ -258,6 +308,47 @@ export class WorkerGroupNetworkCoordinator {
         await rollback?.().catch(() => undefined);
         throw error;
       }
+    });
+  }
+
+  /** Remove a permanently deleted worker from every direct membership and
+   * reconcile networks derived from those groups and their ancestors. The
+   * membership snapshot is restored on reconciliation failure so deletion
+   * remains safely retryable instead of committing a half-updated topology. */
+  removeDeletedWorker(userId: string, workerId: string) {
+    return this.withOwner(userId, async () => {
+      const containing = this.dependencies.groups
+        .listForUser(userId)
+        .filter((group) => group.workerIds.includes(workerId));
+      if (!containing.length) return [];
+      const hierarchy = new WorkerGroupHierarchy(this.dependencies.groups);
+      const affectedGroups = new Set<string>();
+      for (const group of containing)
+        for (const item of hierarchy.ancestors(userId, group.id, true))
+          affectedGroups.add(item.id);
+      const networkIds = this.networkIdsForGroups(userId, affectedGroups);
+      const previousTopology = this.networkMembershipSnapshot(
+        userId,
+        networkIds,
+      );
+      const previousGroupIds = containing.map((group) => group.id);
+      await this.dependencies.groups.removeWorkerReferences(userId, workerId);
+      const failures = await this.reconcileAll(userId, networkIds);
+      if (!failures.length) return previousGroupIds;
+
+      const rollbackFailures: string[] = [];
+      await this.dependencies.groups
+        .setWorkerReferences(userId, workerId, previousGroupIds)
+        .catch((error) =>
+          rollbackFailures.push(`membership: ${safeMessage(error)}`),
+        );
+      rollbackFailures.push(
+        ...(await this.reconcileSnapshot(userId, previousTopology)),
+      );
+      throw createError({
+        statusCode: 409,
+        statusMessage: `Worker group network reconciliation failed during worker deletion: ${failures.join("; ")}. ${rollbackFailures.length ? `Rollback failed: ${rollbackFailures.join("; ")}` : "Previous memberships and topology restored."}`,
+      });
     });
   }
 
@@ -396,6 +487,8 @@ function productionDependencies(): WorkerGroupNetworkDependencies {
     networks: useManagedNetworkStore(),
     manager: useManagedNetworkManager(),
     verify: verifyWorkerMutationUnlocks,
+    workerExists: (userId, workerId) =>
+      Boolean(useWorkerStore().get(userId, workerId)),
   };
 }
 
@@ -463,10 +556,21 @@ export function assignWorkerToGroupWithNetworks(
     });
 }
 
+export function removeDeletedWorkerFromGroups(
+  userId: string,
+  workerId: string,
+) {
+  return useWorkerGroupNetworkCoordinator().removeDeletedWorker(
+    userId,
+    workerId,
+  );
+}
+
 export async function deleteWorkerGroup(
   userId: string,
   groupId: string,
   beforeRemove?: () => Promise<void | (() => Promise<void>)>,
+  authorize?: () => void,
 ) {
   const catalog = useImageCatalogManager();
   await catalog.init();
@@ -500,6 +604,7 @@ export async function deleteWorkerGroup(
           throw error;
         }
       },
+      authorize,
     );
   } catch (error) {
     await envStore.restore(userId, removedEnv).catch(() => undefined);

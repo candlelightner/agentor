@@ -850,4 +850,34 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
       deleteKeys: ["GROUP_INITIAL_VISIBLE", "GROUP_INITIAL_BLOCKED"],
     })).status()).toBe(200);
   });
+
+  test("deleting a worker clears membership so its group admin can delete the emptied child group", { timeout: 180_000 }, async ({ request }) => {
+    await issueCredential(request);
+    const child = await invoke(request, credential, "groups.create", {
+      name: `delete-after-worker-${Date.now()}`,
+      parentId: groupId,
+    });
+    expect(child.status()).toBe(200);
+    const deletionGroupId = (await child.json()).id;
+    const created = await invoke(request, credential, "workers.create", {
+      displayName: `deleted-child-member-${Date.now()}`,
+      targetGroupId: deletionGroupId,
+    });
+    expect(created.status()).toBe(200);
+    const deletionWorkerId = (await created.json()).id;
+    expect((await invoke(request, credential, "workers.delete", {
+      workerId: deletionWorkerId,
+    })).status()).toBe(200);
+    const emptied = await ownerRequest.get(`/api/worker-groups/${deletionGroupId}`);
+    expect(emptied.status()).toBe(200);
+    expect((await emptied.json()).workerIds).toEqual([]);
+    expect((await invoke(request, credential, "groups.delete", {
+      groupId: deletionGroupId,
+    })).status()).toBe(200);
+    // Missing owner-scoped resources use the route's normal non-disclosure
+    // response (403). Confirm actual deletion through the authoritative list.
+    expect((await ownerRequest.get(`/api/worker-groups/${deletionGroupId}`)).status()).toBe(403);
+    const remaining = await (await ownerRequest.get("/api/worker-groups")).json();
+    expect(remaining.some((candidate: { id: string }) => candidate.id === deletionGroupId)).toBe(false);
+  });
 });

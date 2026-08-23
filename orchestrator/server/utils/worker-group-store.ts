@@ -141,6 +141,56 @@ export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
       return nextTarget ? structuredClone(nextTarget) : null;
     });
   }
+  /** Replace every direct reference to one worker with an exact set of group
+   * ids in a single owner-file commit. Permanent worker deletion uses the
+   * empty set; the coordinator can restore the prior set if dependent network
+   * reconciliation fails. This also repairs legacy duplicate references
+   * without exposing a sequence of partially updated group records. */
+  async setWorkerReferences(
+    userId: string,
+    workerId: string,
+    groupIds: Iterable<string>,
+  ): Promise<string[]> {
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId);
+      if (!map) return [];
+      const targets = new Set(groupIds);
+      for (const id of targets) {
+        if (!map.has(id))
+          throw createError({
+            statusCode: 404,
+            statusMessage: "Worker group not found",
+          });
+      }
+      const changed = [...map.values()].filter(
+        (group) =>
+          group.workerIds.includes(workerId) !== targets.has(group.id),
+      );
+      if (!changed.length) return [];
+      const stamp = new Date().toISOString();
+      for (const current of changed) {
+        const without = current.workerIds.filter((id) => id !== workerId);
+        map.set(current.id, {
+          ...current,
+          workerIds: targets.has(current.id)
+            ? [...new Set([...without, workerId])]
+            : without,
+          updatedAt: stamp,
+        });
+      }
+      try {
+        await this.persistUser(userId);
+      } catch (error) {
+        for (const current of changed) map.set(current.id, current);
+        throw error;
+      }
+      return changed.map((group) => group.id);
+    });
+  }
+
+  async removeWorkerReferences(userId: string, workerId: string) {
+    return this.setWorkerReferences(userId, workerId, []);
+  }
   async remove(userId: string, id: string) {
     const current = this.get(userId, id);
     if (!current)

@@ -2078,6 +2078,15 @@ for p in sys.argv[1:]:
           }),
       ],
       ["mapping cleanup", () => cleanupWorkerMappings(info.containerName)],
+      [
+        "worker group memberships",
+        async () => {
+          const { removeDeletedWorkerFromGroups } = await import(
+            "./worker-group-manager"
+          );
+          await removeDeletedWorkerFromGroups(info.userId, info.id);
+        },
+      ],
     ];
     if (this.storageManager) {
       actions.push(
@@ -2620,6 +2629,15 @@ for p in sys.argv[1:]:
           }),
       ],
       ["mapping cleanup", () => cleanupWorkerMappings(containerName)],
+      [
+        "worker group memberships",
+        async () => {
+          const { removeDeletedWorkerFromGroups } = await import(
+            "./worker-group-manager"
+          );
+          await removeDeletedWorkerFromGroups(worker.userId, worker.id);
+        },
+      ],
     ];
     if (this.storageManager) {
       actions.push(
