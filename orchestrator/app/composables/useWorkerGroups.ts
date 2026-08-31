@@ -17,6 +17,13 @@ export interface WorkerGroup {
   userId: string;
   name: string;
   workerIds: string[];
+  /** Additive direct-membership summary returned by list/get endpoints. Mutation
+   * responses may omit it until the shared list is refreshed. */
+  memberCounts?: {
+    total: number;
+    active: number;
+    archived: number;
+  };
   parentId?: string;
   adminWorkspace?: GroupAdminWorkspace;
   createdAt: string;

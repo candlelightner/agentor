@@ -931,6 +931,17 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
       expect(archivedIds).toEqual(expect.arrayContaining(workerIds));
 
       await issueCredential(request);
+      const listedGroups = await invoke(request, credential, "groups.list", {});
+      expect(listedGroups.status(), await listedGroups.text()).toBe(200);
+      const visibleGroups = await listedGroups.json() as Array<any>;
+      expect(visibleGroups.find(group => group.id === batchGroupId)).toMatchObject({
+        memberCounts: { total: 1, active: 0, archived: 1 },
+      });
+      expect(visibleGroups.find(group => group.id === batchGrandchildId)).toMatchObject({
+        memberCounts: { total: 1, active: 0, archived: 1 },
+      });
+
+      await issueCredential(request);
       for (const workerId of workerIds)
         expect((await invoke(request, credential, "workers.delete", { workerId })).status()).toBe(200);
       workerIds.length = 0;

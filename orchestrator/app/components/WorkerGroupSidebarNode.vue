@@ -5,6 +5,8 @@ import type { WorkerGroup } from "~/composables/useWorkerGroups";
 export interface WorkerGroupSidebarTreeNode {
   group: WorkerGroup;
   workers: ContainerInfo[];
+  archivedDirectCount: number;
+  archivedSubtreeCount: number;
   children: WorkerGroupSidebarTreeNode[];
 }
 
@@ -48,6 +50,22 @@ function active(id: string) {
       <span>{{ node.group.name }}</span>
       <span class="text-primary-600/70 dark:text-primary-400/70">
         {{ node.workers.filter((worker) => worker.administrativeKind !== 'group').length }} direct
+      </span>
+      <span
+        v-if="node.archivedDirectCount > 0"
+        class="flex items-center gap-0.5 text-amber-700 dark:text-amber-300"
+        :data-testid="`worker-group-archived-count-${node.group.id}`"
+      >
+        <UIcon name="i-lucide-archive" class="size-3" />
+        {{ node.archivedDirectCount }} archived
+      </span>
+      <span
+        v-else-if="node.archivedSubtreeCount > 0"
+        class="flex items-center gap-0.5 text-amber-700 dark:text-amber-300"
+        :data-testid="`worker-group-archived-count-${node.group.id}`"
+      >
+        <UIcon name="i-lucide-archive" class="size-3" />
+        {{ node.archivedSubtreeCount }} archived below
       </span>
       <span class="flex-1" />
       <UTooltip :text="`Stop all in ${node.group.name} and subgroups`">

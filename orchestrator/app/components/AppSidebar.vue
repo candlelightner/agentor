@@ -166,6 +166,17 @@ const currentWorkerList = computed(() =>
     : activeContainers.value,
 );
 
+const archivedWorkerIds = computed(
+  () => new Set(props.archivedWorkers.map((worker) => worker.id)),
+);
+
+function archivedDirectCount(group: WorkerGroup) {
+  // The REST projection is the normal source. The local archived inventory is
+  // a compatibility fallback for an in-flight rolling orchestrator update.
+  return group.memberCounts?.archived
+    ?? group.workerIds.filter((workerId) => archivedWorkerIds.value.has(workerId)).length;
+}
+
 type WorkerListItem =
   | { kind: "worker"; worker: ContainerInfo }
   | { kind: "group"; node: WorkerGroupSidebarTreeNode };
@@ -200,7 +211,13 @@ const groupedCurrentWorkerList = computed<WorkerListItem[]>(() => {
 
   const nodes = new Map<string, WorkerGroupSidebarTreeNode>();
   for (const group of workerGroups.value) {
-    nodes.set(group.id, { group, workers: workersByGroupId.get(group.id) ?? [], children: [] });
+    nodes.set(group.id, {
+      group,
+      workers: workersByGroupId.get(group.id) ?? [],
+      archivedDirectCount: archivedDirectCount(group),
+      archivedSubtreeCount: 0,
+      children: [],
+    });
   }
   const roots: WorkerGroupSidebarTreeNode[] = [];
   for (const node of nodes.values()) {
@@ -208,6 +225,12 @@ const groupedCurrentWorkerList = computed<WorkerListItem[]>(() => {
     if (parent) parent.children.push(node);
     else roots.push(node);
   }
+  const sumArchived = (node: WorkerGroupSidebarTreeNode): number => {
+    node.archivedSubtreeCount = node.archivedDirectCount
+      + node.children.reduce((total, child) => total + sumArchived(child), 0);
+    return node.archivedSubtreeCount;
+  };
+  roots.forEach(sumArchived);
   const visible = (node: WorkerGroupSidebarTreeNode): boolean =>
     node.workers.length > 0 || node.children.some(visible);
   const rootByGroupId = new Map<string, WorkerGroupSidebarTreeNode>();
@@ -218,7 +241,7 @@ const groupedCurrentWorkerList = computed<WorkerListItem[]>(() => {
   roots.forEach((root) => index(root, root));
 
   const renderedRoots = new Set<string>();
-  return currentWorkerList.value.reduce<WorkerListItem[]>((items, worker) => {
+  const items = currentWorkerList.value.reduce<WorkerListItem[]>((items, worker) => {
     const group = groupsByWorkerId.get(worker.id);
     if (!group) {
       items.push({ kind: "worker", worker });
@@ -230,6 +253,18 @@ const groupedCurrentWorkerList = computed<WorkerListItem[]>(() => {
     if (visible(root)) items.push({ kind: "group", node: root });
     return items;
   }, []);
+  // A group whose ordinary workers are all archived would otherwise disappear
+  // from the Workers tab entirely. Keep its hierarchy visible as a compact
+  // archive-status summary; the archived cards themselves remain in Archived.
+  if (activeTab.value === "workers") {
+    for (const root of roots) {
+      if (root.archivedSubtreeCount > 0 && !renderedRoots.has(root.group.id)) {
+        renderedRoots.add(root.group.id);
+        items.push({ kind: "group", node: root });
+      }
+    }
+  }
+  return items;
 });
 
 type ArchivedWorkerListItem =
@@ -648,7 +683,7 @@ function isContainerActive(
         class="p-3"
       >
         <div
-          v-if="currentWorkerList.length === 0"
+          v-if="groupedCurrentWorkerList.length === 0"
           class="text-gray-400 dark:text-gray-500 text-sm text-center py-8"
         >
           {{

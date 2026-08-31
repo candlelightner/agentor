@@ -144,6 +144,13 @@ test.describe('Worker groups API', () => {
       );
       expect((await (await request.get(`/api/worker-groups/${rootId}`)).json()).workerIds).toEqual([rootWorker.id]);
       expect((await (await request.get(`/api/worker-groups/${childId}`)).json()).workerIds).toEqual([childWorker.id]);
+      expect(await (await request.get(`/api/worker-groups/${rootId}`)).json()).toMatchObject({
+        memberCounts: { total: 1, active: 0, archived: 1 },
+      });
+      const listedGroups = await (await request.get('/api/worker-groups')).json() as Array<any>;
+      expect(listedGroups.find(group => group.id === childId)).toMatchObject({
+        memberCounts: { total: 1, active: 0, archived: 1 },
+      });
     } finally {
       if (childWorker) {
         await request.delete(`/api/containers/${childWorker.id}/protection`, {

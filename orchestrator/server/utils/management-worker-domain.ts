@@ -16,6 +16,7 @@ import { useGroupAdminWorkspaceStore } from "./group-admin-workspace-store";
 import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 import { markGroupEnvPending, publicGroupEnvKeys } from "./worker-group-env";
 import { useWorkerGroupEnvStore } from "./services";
+import { workerGroupsWithMemberCounts } from "./worker-group-response";
 
 export interface ManagementDomainTool {
   name: string;
@@ -125,7 +126,7 @@ export class ManagementWorkerDomain {
       ["workers.env-keys", "configuration", "List predefined, configured custom account, and effective worker-group environment variable names available to this worker. Values are never returned. timeoutSeconds bounds the server-side request.", {type:"object",required:["workerId"],additionalProperties:false,properties:{workerId:{type:"string"},timeoutSeconds:failFastTimeoutSchema}}, read],
       ["configuration.get", "configuration", "Read sanitized worker configuration.", objectWithWorker(), read],
       ["configuration.set", "configuration", "Replace worker-local variables/secrets/files; secrets are write-only.", objectWithWorker(), mutation],
-      ["groups.list", "groups", "List groups for an owner or all groups. timeoutSeconds bounds the server-side request.", failFastInput({userId:{type:"string"}}), read],
+      ["groups.list", "groups", "List groups for an owner or all groups, including direct total, active, and archived memberCounts. timeoutSeconds bounds the server-side request.", failFastInput({userId:{type:"string"}}), read],
       ["groups.create", "groups", "Create a root or child worker group for an explicit owner. timeoutSeconds bounds hierarchy validation, persistence, and network reconciliation.", failFastInput({userId:{type:"string"},name:{type:"string"},parentId:{type:["string","null"]}}, ["userId","name"]), mutation],
       ["groups.update", "groups", "Rename, reparent, or replace same-owner direct membership, reconciling dependent managed networks. Protected workers require lockPasswords; timeoutSeconds bounds the operation.", failFastInput({groupId:{type:"string"},name:{type:"string"},parentId:{type:["string","null"]},workerIds:{type:"array",items:{type:"string"}},lockPasswords:{type:"object",additionalProperties:{type:"string",writeOnly:true}}}, ["groupId"]), mutation],
       ["groups.delete", "groups", "Delete an empty group without deleting workers. Groups referenced by managed networks must be reconfigured first; timeoutSeconds bounds the operation.", failFastInput({groupId:{type:"string"}}, ["groupId"]), { ...mutation, destructiveHint:true }],
@@ -219,7 +220,13 @@ export class ManagementWorkerDomain {
   }
   private async groups(name:string,args:Record<string,unknown>) {
     const store=useWorkerGroupStore();
-    if(name==="groups.list") return args.userId ? store.listForUser(required(args.userId,"userId")) : store.list();
+    if(name==="groups.list") {
+      const userId=args.userId ? required(args.userId,"userId") : undefined;
+      return workerGroupsWithMemberCounts(
+        userId ? store.listForUser(userId) : store.list(),
+        userId ? useWorkerStore().listForUser(userId) : useWorkerStore().list(),
+      );
+    }
     if(name==="groups.create") { const userId=required(args.userId,"userId"), label=required(args.name,"name").trim(); if(!label||label.length>100) throw status(400,"Invalid group name"); const parent=args.parentId===null?null:optionalString(args.parentId); return withWorkerNetworkMutation(userId,()=>{if(typeof args.__scopeAuthorize==="function")(args.__scopeAuthorize as ()=>void)();new WorkerGroupHierarchy(store).validateParent(userId,undefined,parent);return store.create(userId,label,parent||undefined);}); }
     if(name==="groups.assign-worker") {
       const workerId=required(args.workerId,"workerId");

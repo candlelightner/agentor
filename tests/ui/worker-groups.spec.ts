@@ -213,6 +213,11 @@ test.describe.serial('Worker groups dashboard', () => {
       const workers = await (await request.get('/api/archived')).json() as Array<{ id: string }>;
       return workers.some(worker => worker.id === ungroupedWorkerId);
     }, { timeout: 90_000 }).toBe(true);
+    await expect(activeChild).toBeVisible({ timeout: 20_000 });
+    await expect(activeChild.getByText('0 direct', { exact: true })).toBeVisible();
+    await expect(activeChild.getByTestId(`worker-group-archived-count-${treeChildId}`)).toHaveText(/1 archived/);
+    const activeRoot = page.getByTestId(`worker-group-cards-${treeRootId}`);
+    await expect(activeRoot.getByTestId(`worker-group-archived-count-${treeRootId}`)).toHaveText('1 archived below');
     await page.getByRole('button', { name: /^Archived/ }).click();
     const archivedRoot = page.getByTestId(`archived-worker-group-cards-${treeRootId}`);
     const archivedChild = page.getByTestId(`archived-worker-group-cards-${treeChildId}`);
@@ -226,7 +231,9 @@ test.describe.serial('Worker groups dashboard', () => {
       return workers.some(worker => worker.id === ungroupedWorkerId);
     }, { timeout: 90_000 }).toBe(true);
     await page.getByRole('button', { name: /^Workers/ }).click();
-    await expect(page.getByTestId(`worker-group-cards-${treeChildId}`).getByText(ungroupedWorkerName, { exact: true })).toBeVisible({ timeout: 20_000 });
+    const restoredChild = page.getByTestId(`worker-group-cards-${treeChildId}`);
+    await expect(restoredChild.getByText(ungroupedWorkerName, { exact: true })).toBeVisible({ timeout: 20_000 });
+    await expect(restoredChild.getByTestId(`worker-group-archived-count-${treeChildId}`)).toHaveCount(0);
 
     expect((await request.put('/api/worker-groups/assignment', {
       data: { workerId: ungroupedWorkerId, groupId: null },
