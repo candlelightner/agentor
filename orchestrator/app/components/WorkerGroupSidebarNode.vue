@@ -50,32 +50,38 @@ function active(id: string) {
         {{ node.workers.filter((worker) => worker.administrativeKind !== 'group').length }} direct
       </span>
       <span class="flex-1" />
-      <UTooltip :text="`Stop all in ${node.group.name}`">
+      <UTooltip :text="`Stop all in ${node.group.name} and subgroups`">
         <UButton
           size="xs" color="neutral" variant="ghost" icon="i-lucide-square"
-          :aria-label="`Stop all in ${node.group.name}`"
+          :aria-label="`Stop all in ${node.group.name} and subgroups`"
+          :aria-busy="loadingAction === 'stop'"
+          :data-testid="`worker-group-stop-all-${node.group.id}`"
           :loading="loadingAction === 'stop'" :disabled="loadingAction !== null"
           @click="runGroupAction('stop')"
         />
       </UTooltip>
-      <UTooltip :text="`Rebuild all in ${node.group.name}`">
+      <UTooltip :text="`Rebuild all in ${node.group.name} and subgroups`">
         <UButton
           size="xs" color="warning" variant="ghost" icon="i-lucide-hammer"
-          :aria-label="`Rebuild all in ${node.group.name}`"
+          :aria-label="`Rebuild all in ${node.group.name} and subgroups`"
+          :aria-busy="loadingAction === 'rebuild'"
+          :data-testid="`worker-group-rebuild-all-${node.group.id}`"
           :loading="loadingAction === 'rebuild'" :disabled="loadingAction !== null"
           @click="runGroupAction('rebuild')"
         />
       </UTooltip>
-      <UTooltip :text="`Archive all in ${node.group.name}`">
+      <UTooltip :text="`Archive all in ${node.group.name} and subgroups`">
         <UButton
-          size="xs" color="neutral" variant="ghost" icon="i-lucide-archive"
-          :aria-label="`Archive all in ${node.group.name}`"
+          size="xs" color="warning" variant="ghost" icon="i-lucide-archive"
+          :aria-label="`Archive all in ${node.group.name} and subgroups`"
+          :aria-busy="loadingAction === 'archive'"
+          :data-testid="`worker-group-archive-all-${node.group.id}`"
           :loading="loadingAction === 'archive'" :disabled="loadingAction !== null"
           @click="runGroupAction('archive')"
         />
       </UTooltip>
     </div>
-    <p v-if="actionError" class="mb-2 px-1 text-[10px] text-red-600 dark:text-red-400" role="alert">
+    <p v-if="actionError" class="mb-2 px-1 text-[10px] text-red-600 dark:text-red-400" role="alert" aria-live="assertive">
       {{ actionError }}
     </p>
     <div class="space-y-2">

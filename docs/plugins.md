@@ -78,6 +78,10 @@ application: after the same installation/action authorization, Agentor routes
 the pane to `/desktop/:workerId/agentor.html`, preserving the authenticated
 clipboard-aware desktop proxy instead of forwarding raw port 6080.
 
+## Image-build contributions
+
+A plugin may declare `imageBuild` only for reusable, secret-free image construction: bounded context files, structured provisioning, and an optional bounded one-shot compatibility command. Selected contributions are snapshotted into the immutable image version. They do not carry an installation's runtime state, process output, allocated ports or display, worker configuration, environment values, or secret values; those remain per-worker runtime concerns. A contribution that sets `requiresAdvancedProvisioning` is rejected while the image definition remains in Safe mode, so switching to Advanced is always an explicit image-author decision.
+
 ## Worker-self MCP
 
 Ordinary workers and trusted administrative workspaces can use the narrow

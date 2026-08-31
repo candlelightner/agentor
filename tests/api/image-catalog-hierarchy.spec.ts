@@ -3,13 +3,22 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { expect, test } from "@playwright/test";
-import { ImageCatalogManager } from "../../orchestrator/server/utils/image-catalog";
+import {
+  ImageCatalogManager,
+  renderDefinitionDockerfile,
+} from "../../orchestrator/server/utils/image-catalog";
 import { GitImageCatalogManager } from "../../orchestrator/server/utils/git-image-manager";
 import { GitImageStore } from "../../orchestrator/server/utils/git-image-store";
-import { parseCatalog, serializeCatalog } from "../../orchestrator/server/utils/git-image-format";
+import {
+  parseCatalog,
+  serializeCatalog,
+} from "../../orchestrator/server/utils/git-image-format";
 import { serializePluginCatalog } from "../../orchestrator/server/utils/git-plugin-format";
 import { PluginDefinitionStore } from "../../orchestrator/server/utils/plugin-definition-store";
-import { pluginDefinitionHash, validatePluginManifest } from "../../orchestrator/server/utils/plugin-manifest";
+import {
+  pluginDefinitionHash,
+  validatePluginManifest,
+} from "../../orchestrator/server/utils/plugin-manifest";
 import { withDeletedOwnerCleanupFence } from "../../orchestrator/server/utils/orphan-sweeper";
 
 const definition = (name: string) => ({
@@ -21,40 +30,150 @@ const definition = (name: string) => ({
 });
 
 test("Git catalog parses legacy v1 fragments and v2 structured provisioning", () => {
-  const legacyHash = createHash("sha256").update('{"baseImage":"agentor-worker:approved-test","contextFiles":[],"description":"","dockerfileFragment":"RUN true","name":"legacy"}').digest("hex");
+  const legacyHash = createHash("sha256")
+    .update(
+      '{"baseImage":"agentor-worker:approved-test","contextFiles":[],"description":"","dockerfileFragment":"RUN true","name":"legacy"}',
+    )
+    .digest("hex");
   const legacy = {
-    ".agentor/image-catalog.v1.json": JSON.stringify({ schema: "https://agentor.dev/schemas/image-catalog/v1", version: 1, entries: [{ id: "legacy", name: "legacy", description: "", baseImage: "agentor-worker:approved-test", dockerfilePath: "images/legacy/Dockerfile", metadataPath: "images/legacy/metadata.json", contextPrefix: "images/legacy/context/", definitionHash: legacyHash }] }),
+    ".agentor/image-catalog.v1.json": JSON.stringify({
+      schema: "https://agentor.dev/schemas/image-catalog/v1",
+      version: 1,
+      entries: [
+        {
+          id: "legacy",
+          name: "legacy",
+          description: "",
+          baseImage: "agentor-worker:approved-test",
+          dockerfilePath: "images/legacy/Dockerfile",
+          metadataPath: "images/legacy/metadata.json",
+          contextPrefix: "images/legacy/context/",
+          definitionHash: legacyHash,
+        },
+      ],
+    }),
     "images/legacy/Dockerfile": "FROM agentor-worker:approved-test\nRUN true\n",
-    "images/legacy/metadata.json": JSON.stringify({ name: "legacy", baseImage: "agentor-worker:approved-test" }),
+    "images/legacy/metadata.json": JSON.stringify({
+      name: "legacy",
+      baseImage: "agentor-worker:approved-test",
+    }),
   };
   // The hash protects the imported v1 representation exactly as it was stored.
-  expect(parseCatalog(legacy)).toMatchObject([{ definition: { dockerfileFragment: "RUN true" } }]);
-  const v2 = serializeCatalog([{ id: "structured", ownerId: "owner", ...definition("structured"), dockerfileFragment: "", provisioning: [{ type: "command" as const, command: "mkdir -p /opt/example" }], contextFiles: [{ path: "setup.sh", contentBase64: Buffer.from("echo setup").toString("base64"), role: "script" as const, destination: "/opt/agentor-context/setup.sh" }], createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", versions: [] }], { buildMode: "local" });
+  expect(parseCatalog(legacy)).toMatchObject([
+    { definition: { dockerfileFragment: "RUN true" } },
+  ]);
+  const v2 = serializeCatalog(
+    [
+      {
+        id: "structured",
+        ownerId: "owner",
+        ...definition("structured"),
+        dockerfileFragment: "",
+        provisioning: [
+          { type: "command" as const, command: "mkdir -p /opt/example" },
+        ],
+        contextFiles: [
+          {
+            path: "setup.sh",
+            contentBase64: Buffer.from("echo setup").toString("base64"),
+            role: "script" as const,
+            destination: "/opt/agentor-context/setup.sh",
+          },
+        ],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        versions: [],
+      },
+    ],
+    { buildMode: "local" },
+  );
   expect(JSON.parse(v2[".agentor/image-catalog.v2.json"]!)).toMatchObject({
     schema: "https://agentor.dev/schemas/image-catalog/v2",
     version: 2,
   });
-  expect(parseCatalog(v2)).toMatchObject([{ definition: { provisioning: [{ type: "command" }], contextFiles: [{ role: "script", destination: "/opt/agentor-context/setup.sh" }] } }]);
-  const secretDefinition = { id: "secret", ownerId: "owner", ...definition("secret"), description: "TOKEN=github_pat_abcdefghijklmnopqrstuvwxyz", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", versions: [] };
-  expect(() => serializeCatalog([secretDefinition], { buildMode: "local" })).toThrow("secret values");
+  expect(parseCatalog(v2)).toMatchObject([
+    {
+      definition: {
+        provisioning: [{ type: "command" }],
+        contextFiles: [
+          { role: "script", destination: "/opt/agentor-context/setup.sh" },
+        ],
+      },
+    },
+  ]);
+  const secretDefinition = {
+    id: "secret",
+    ownerId: "owner",
+    ...definition("secret"),
+    description: "TOKEN=github_pat_abcdefghijklmnopqrstuvwxyz",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    versions: [],
+  };
+  expect(() =>
+    serializeCatalog([secretDefinition], { buildMode: "local" }),
+  ).toThrow("secret values");
 });
 
 test("legacy v1 Git catalog pulls remain idempotent after current-format recovery", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agentor-git-v1-pull-"));
-  const catalogDirectory = await mkdtemp(join(tmpdir(), "agentor-git-v1-catalog-"));
+  const catalogDirectory = await mkdtemp(
+    join(tmpdir(), "agentor-git-v1-catalog-"),
+  );
   try {
     const manager = new GitImageCatalogManager(new GitImageStore(directory));
     const catalog = new ImageCatalogManager(catalogDirectory);
     await Promise.all([manager.init(), catalog.init()]);
-    await manager.connect("owner", { provider: "fake", repository: "owner/v1-pull", visibility: "public", workflow: "direct", auth: { type: "none" } });
-    const legacyHash = createHash("sha256").update('{"baseImage":"agentor-worker:approved-test","contextFiles":[],"description":"","dockerfileFragment":"RUN true","name":"legacy"}').digest("hex");
-    manager.fakeConfigure("owner", { private: false, branches: { main: { revision: "legacy-revision", files: {
-      ".agentor/image-catalog.v1.json": JSON.stringify({ schema: "https://agentor.dev/schemas/image-catalog/v1", version: 1, entries: [{ id: "legacy", name: "legacy", description: "", baseImage: "agentor-worker:approved-test", dockerfilePath: "images/legacy/Dockerfile", metadataPath: "images/legacy/metadata.json", contextPrefix: "images/legacy/context/", definitionHash: legacyHash }] }),
-      "images/legacy/Dockerfile": "FROM agentor-worker:approved-test\nRUN true\n",
-      "images/legacy/metadata.json": JSON.stringify({ name: "legacy", baseImage: "agentor-worker:approved-test" }),
-    } } } });
-    await expect(manager.sync("owner", catalog, { direction: "pull" })).resolves.toMatchObject({ conflicts: [] });
-    await expect(manager.sync("owner", catalog, { direction: "pull" })).resolves.toMatchObject({ imported: [], conflicts: [] });
+    await manager.connect("owner", {
+      provider: "fake",
+      repository: "owner/v1-pull",
+      visibility: "public",
+      workflow: "direct",
+      auth: { type: "none" },
+    });
+    const legacyHash = createHash("sha256")
+      .update(
+        '{"baseImage":"agentor-worker:approved-test","contextFiles":[],"description":"","dockerfileFragment":"RUN true","name":"legacy"}',
+      )
+      .digest("hex");
+    manager.fakeConfigure("owner", {
+      private: false,
+      branches: {
+        main: {
+          revision: "legacy-revision",
+          files: {
+            ".agentor/image-catalog.v1.json": JSON.stringify({
+              schema: "https://agentor.dev/schemas/image-catalog/v1",
+              version: 1,
+              entries: [
+                {
+                  id: "legacy",
+                  name: "legacy",
+                  description: "",
+                  baseImage: "agentor-worker:approved-test",
+                  dockerfilePath: "images/legacy/Dockerfile",
+                  metadataPath: "images/legacy/metadata.json",
+                  contextPrefix: "images/legacy/context/",
+                  definitionHash: legacyHash,
+                },
+              ],
+            }),
+            "images/legacy/Dockerfile":
+              "FROM agentor-worker:approved-test\nRUN true\n",
+            "images/legacy/metadata.json": JSON.stringify({
+              name: "legacy",
+              baseImage: "agentor-worker:approved-test",
+            }),
+          },
+        },
+      },
+    });
+    await expect(
+      manager.sync("owner", catalog, { direction: "pull" }),
+    ).resolves.toMatchObject({ conflicts: [] });
+    await expect(
+      manager.sync("owner", catalog, { direction: "pull" }),
+    ).resolves.toMatchObject({ imported: [], conflicts: [] });
   } finally {
     await rm(directory, { recursive: true, force: true });
     await rm(catalogDirectory, { recursive: true, force: true });
@@ -63,24 +182,218 @@ test("legacy v1 Git catalog pulls remain idempotent after current-format recover
 
 test("Git plugin pull rejects group definitions not owned by the importer", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agentor-git-plugin-group-"));
-  const catalogDirectory = await mkdtemp(join(tmpdir(), "agentor-git-plugin-catalog-"));
-  const pluginDirectory = await mkdtemp(join(tmpdir(), "agentor-git-plugin-store-"));
+  const catalogDirectory = await mkdtemp(
+    join(tmpdir(), "agentor-git-plugin-catalog-"),
+  );
+  const pluginDirectory = await mkdtemp(
+    join(tmpdir(), "agentor-git-plugin-store-"),
+  );
   try {
-    const manager = new GitImageCatalogManager(new GitImageStore(directory), () => true, () => false);
+    const manager = new GitImageCatalogManager(
+      new GitImageStore(directory),
+      () => true,
+      () => false,
+    );
     const catalog = new ImageCatalogManager(catalogDirectory);
     const plugins = new PluginDefinitionStore(pluginDirectory);
     await Promise.all([manager.init(), catalog.init(), plugins.init()]);
-    await manager.connect("owner", { provider: "fake", repository: "owner/plugin-group", visibility: "public", workflow: "direct", auth: { type: "none" } });
-    const manifest: any = validatePluginManifest({ schemaVersion: 1, name: "Scoped", slug: "scoped", description: "", version: "1.0.0", lifecycle: { start: { argv: ["echo", "start"] } } });
-    const remotePlugin: any = { schemaVersion: 1, id: "foreign-group-plugin", userId: "remote-owner", scope: "group", groupId: "foreign-group", name: manifest.name, builtIn: false, manifest, definitionHash: pluginDefinitionHash(manifest), createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" };
-    manager.fakeConfigure("owner", { private: false, branches: { main: { revision: "plugin-revision", files: { ...serializeCatalog([], { buildMode: "local" }), ...serializePluginCatalog([remotePlugin]) } } } });
-    await expect(manager.sync("owner", catalog, { direction: "pull" }, plugins)).rejects.toThrow("unknown group");
+    await manager.connect("owner", {
+      provider: "fake",
+      repository: "owner/plugin-group",
+      visibility: "public",
+      workflow: "direct",
+      auth: { type: "none" },
+    });
+    const manifest: any = validatePluginManifest({
+      schemaVersion: 1,
+      name: "Scoped",
+      slug: "scoped",
+      description: "",
+      version: "1.0.0",
+      lifecycle: { start: { argv: ["echo", "start"] } },
+    });
+    const remotePlugin: any = {
+      schemaVersion: 1,
+      id: "foreign-group-plugin",
+      userId: "remote-owner",
+      scope: "group",
+      groupId: "foreign-group",
+      name: manifest.name,
+      builtIn: false,
+      manifest,
+      definitionHash: pluginDefinitionHash(manifest),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+    manager.fakeConfigure("owner", {
+      private: false,
+      branches: {
+        main: {
+          revision: "plugin-revision",
+          files: {
+            ...serializeCatalog([], { buildMode: "local" }),
+            ...serializePluginCatalog([remotePlugin]),
+          },
+        },
+      },
+    });
+    await expect(
+      manager.sync("owner", catalog, { direction: "pull" }, plugins),
+    ).rejects.toThrow("unknown group");
     expect(plugins.listForOwner("owner")).toEqual([]);
   } finally {
     await rm(directory, { recursive: true, force: true });
     await rm(catalogDirectory, { recursive: true, force: true });
     await rm(pluginDirectory, { recursive: true, force: true });
   }
+});
+
+test("Git recovery preserves plugin ids referenced by composed image definitions", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agentor-git-plugin-image-"));
+  const catalogDirectory = await mkdtemp(
+    join(tmpdir(), "agentor-git-plugin-image-catalog-"),
+  );
+  const pluginDirectory = await mkdtemp(
+    join(tmpdir(), "agentor-git-plugin-image-store-"),
+  );
+  try {
+    const manager = new GitImageCatalogManager(new GitImageStore(directory));
+    const catalog = new ImageCatalogManager(catalogDirectory);
+    const plugins = new PluginDefinitionStore(pluginDirectory);
+    await Promise.all([manager.init(), catalog.init(), plugins.init()]);
+    await manager.connect("owner", {
+      provider: "fake",
+      repository: "owner/plugin-image",
+      visibility: "public",
+      workflow: "direct",
+      auth: { type: "none" },
+    });
+    const manifest = validatePluginManifest({
+      schemaVersion: 1,
+      name: "Recovered build tool",
+      slug: "recovered-build-tool",
+      description: "",
+      version: "1.0.0",
+      lifecycle: { start: { argv: ["true"] } },
+      imageBuild: {
+        provisioning: [{ type: "packages", manager: "apt", packages: ["jq"] }],
+      },
+    });
+    const remotePlugin: any = {
+      schemaVersion: 1,
+      id: "recovered-build-plugin",
+      userId: "remote-owner",
+      scope: "owner",
+      name: manifest.name,
+      builtIn: false,
+      manifest,
+      definitionHash: pluginDefinitionHash(manifest),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const remoteDefinition: any = {
+      id: "composed-image",
+      ownerId: "remote-owner",
+      ...definition("composed-image"),
+      provisioningMode: "safe",
+      pluginComposition: [
+        { definitionId: remotePlugin.id, validation: "optional" },
+      ],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      versions: [],
+    };
+    manager.fakeConfigure("owner", {
+      private: false,
+      branches: {
+        main: {
+          revision: "plugin-image-revision",
+          files: {
+            ...serializeCatalog([remoteDefinition], { buildMode: "local" }),
+            ...serializePluginCatalog([remotePlugin]),
+          },
+        },
+      },
+    });
+    await expect(
+      manager.sync("owner", catalog, { direction: "pull" }, plugins),
+    ).resolves.toMatchObject({ conflicts: [] });
+    expect(plugins.getById(remotePlugin.id)).toMatchObject({
+      userId: "owner",
+      definitionHash: remotePlugin.definitionHash,
+    });
+    expect(catalog.list("owner", false)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          pluginComposition: [
+            { definitionId: remotePlugin.id, validation: "optional" },
+          ],
+        }),
+      ]),
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+    await rm(catalogDirectory, { recursive: true, force: true });
+    await rm(pluginDirectory, { recursive: true, force: true });
+  }
+});
+
+test("Git export renders resolved plugin imageBuild steps while recovery keeps the stable plugin selection", () => {
+  const plugin: any = {
+    definitionId: "stable-plugin-id",
+    validation: "required",
+    name: "Git build plugin",
+    definitionHash: "a".repeat(64),
+    provisioning: [{ type: "packages", manager: "apt", packages: ["jq"] }],
+    contextFiles: [
+      {
+        path: "plugins/stable-plugin-id/install.sh",
+        contentBase64: Buffer.from("echo plugin").toString("base64"),
+        role: "script",
+        destination: "/opt/agentor-context/plugins/install.sh",
+      },
+    ],
+  };
+  const exported = serializeCatalog(
+    [
+      {
+        id: "plugin-dockerfile",
+        ownerId: "owner",
+        ...definition("plugin-dockerfile"),
+        provisioningMode: "safe" as const,
+        pluginComposition: [
+          {
+            definitionId: plugin.definitionId,
+            validation: "required" as const,
+          },
+        ],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        versions: [],
+      },
+    ],
+    {
+      buildMode: "github-actions",
+      pluginBuildsByDefinitionId: { "plugin-dockerfile": [plugin] },
+    },
+  );
+  expect(exported["images/plugin-dockerfile/Dockerfile"]).toContain(
+    "apt-get install -y --no-install-recommends jq",
+  );
+  expect(
+    exported[
+      "images/plugin-dockerfile/context/plugins/stable-plugin-id/install.sh"
+    ],
+  ).toBe(plugin.contextFiles[0].contentBase64);
+  expect(parseCatalog(exported)).toMatchObject([
+    {
+      definition: {
+        pluginComposition: [
+          { definitionId: "stable-plugin-id", validation: "required" },
+        ],
+      },
+    },
+  ]);
 });
 
 test("image catalog transactions discard a failed create without clobbering a queued create", async () => {
@@ -267,10 +580,10 @@ test("controlled image builder terminalizes after its failure-state write is rej
       }
     });
     await catalog.init();
-    const created = await catalog.create(
-      "owner",
-      definition("controlled-terminal"),
-    );
+    const created = await catalog.create("owner", {
+      ...definition("controlled-terminal"),
+      baseImage: "agentor-worker:approved-default",
+    });
     (catalog as any).docker = {
       getImage: () => ({
         inspect: async () => ({ Id: `sha256:${"a".repeat(64)}` }),
@@ -834,6 +1147,532 @@ test("hierarchical image catalogs expose inherited images read-only and descenda
     expect(
       visible.find((item) => item.id === descendant.id)?.access.manageable,
     ).toBe(true);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("image catalog normalizes legacy definitions to Safe mode and ready compatibility", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agentor-image-legacy-safe-"));
+  try {
+    const stamp = new Date().toISOString();
+    await writeFile(
+      join(directory, "image-catalog.json"),
+      JSON.stringify({
+        definitions: [
+          {
+            id: "legacy-definition",
+            ownerId: "owner",
+            ...definition("legacy-safe"),
+            createdAt: stamp,
+            updatedAt: stamp,
+            versions: [
+              {
+                version: "v1",
+                digest: `sha256:${"a".repeat(64)}`,
+                baseImage: "agentor-worker:approved-test",
+                createdAt: stamp,
+              },
+            ],
+          },
+        ],
+        builds: [],
+        userDefaults: {},
+        faults: {},
+        deletions: [],
+      }),
+    );
+    const catalog = new ImageCatalogManager(directory);
+    await catalog.init();
+    const legacy = catalog.list("owner", false)[0]!;
+    expect(legacy.provisioningMode).toBe("safe");
+    expect(legacy.versions[0]).toMatchObject({
+      readiness: "ready",
+      compatibility: { state: "passed", coreState: "passed" },
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Safe provisioning returns an actionable preflight diagnostic without starting Docker", async () => {
+  const directory = await mkdtemp(
+    join(tmpdir(), "agentor-image-safe-diagnostic-"),
+  );
+  try {
+    const catalog = new ImageCatalogManager(directory);
+    await catalog.init();
+    let rejected: any;
+    try {
+      await catalog.create("owner", {
+        ...definition("safe-rejection"),
+        dockerfileFragment: "",
+        provisioning: [{ type: "command", command: "echo one\necho two" }],
+      });
+    } catch (error) {
+      rejected = error;
+    }
+    expect(rejected).toMatchObject({
+      statusCode: 400,
+      code: "safe-mode-blocked",
+    });
+    expect(rejected.diagnostic).toMatchObject({
+      code: "safe-mode-blocked",
+      blockedField: "provisioning[0]",
+      blockedStep: { index: 0, type: "command" },
+      dockerAttempted: false,
+      advancedModeAvailable: true,
+    });
+    expect(rejected.diagnostic.reason).toContain("Agentor");
+    expect(rejected.diagnostic.remediation).toContain("structured");
+    expect(rejected.diagnostic.advancedModeWarning).toContain(
+      "controlled Docker/BuildKit",
+    );
+    expect(catalog.publicBuilds("owner", false)).toEqual([]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Advanced provisioning accepts shell recipes but retains base, Dockerfile, and secret boundaries", async () => {
+  const directory = await mkdtemp(
+    join(tmpdir(), "agentor-image-advanced-boundary-"),
+  );
+  try {
+    const catalog = new ImageCatalogManager(directory);
+    await catalog.init();
+    const advanced = await catalog.create("owner", {
+      ...definition("advanced-recipe"),
+      dockerfileFragment: "",
+      provisioningMode: "advanced",
+      provisioning: [
+        {
+          type: "command",
+          command:
+            "set -eux\nprintf '%s\\n' experimental > /tmp/agentor-recipe\nrm -f /tmp/agentor-recipe",
+        },
+      ],
+    });
+    expect(advanced).toMatchObject({ provisioningMode: "advanced" });
+    const rendered = renderDefinitionDockerfile(advanced);
+    expect(rendered.match(/^USER .+$/gm)).toEqual(["USER root", "USER agent"]);
+    expect(rendered).toContain("\\nrm -f /tmp/agentor-recipe");
+    for (const invalid of [
+      { baseImage: "ubuntu:latest" },
+      { dockerfileFragment: "FROM ubuntu:latest" },
+      {
+        dockerfileFragment:
+          "COPY --from=ubuntu:latest /etc/os-release /tmp/external-base",
+      },
+      {
+        provisioning: [
+          {
+            type: "command",
+            command: "echo IMAGE_BUILD_MUST_NEVER_LEAK_TOKEN",
+          },
+        ],
+      },
+    ]) {
+      await expect(
+        catalog.create("owner", {
+          ...definition(`advanced-boundary-${Math.random()}`),
+          dockerfileFragment: "",
+          provisioningMode: "advanced",
+          ...invalid,
+        }),
+      ).rejects.toMatchObject({ statusCode: 400 });
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("fake builds are asynchronous, idempotent by request id, and retain distinct compatibility outcomes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agentor-image-outcomes-"));
+  try {
+    const catalog = new ImageCatalogManager(directory);
+    await catalog.init();
+    const created = await catalog.create("owner", definition("outcomes"));
+    const startedAt = Date.now();
+    const accepted = await catalog.startBuild(created.id, "owner", false, {
+      builder: "fake",
+      fakeDurationMs: 800,
+      requestId: "outcomes-request-1",
+    });
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(accepted).toMatchObject({
+      status: expect.stringMatching(/queued|running/),
+      operation: "build",
+      requestId: "outcomes-request-1",
+      dockerAttempted: false,
+    });
+    const retried = await catalog.startBuild(created.id, "owner", false, {
+      builder: "fake",
+      fakeDurationMs: 800,
+      requestId: "outcomes-request-1",
+    });
+    expect(retried.id).toBe(accepted.id);
+    expect(
+      catalog
+        .publicBuilds("owner", false)
+        .filter((build) => build.requestId === "outcomes-request-1"),
+    ).toHaveLength(1);
+    await expect(
+      catalog.startBuild(created.id, "owner", false, {
+        builder: "fake",
+        baseImage: "agentor-worker:approved-other",
+        requestId: "outcomes-request-1",
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await expect
+      .poll(() => catalog.publicBuild(accepted.id, "owner", false).outcome)
+      .toBe("ready");
+    await catalog.update(created.id, "owner", false, {
+      ...definition("outcomes"),
+      description: "edited after the original request was accepted",
+    });
+    const completedRetry = await catalog.startBuild(
+      created.id,
+      "owner",
+      false,
+      {
+        builder: "fake",
+        fakeDurationMs: 800,
+        requestId: "outcomes-request-1",
+      },
+    );
+    expect(completedRetry.id).toBe(accepted.id);
+
+    const warning = await catalog.startBuild(created.id, "owner", false, {
+      builder: "fake",
+      fakeDurationMs: 100,
+      fakeValidationOutcome: "warnings",
+    });
+    const incompatible = await catalog.startBuild(created.id, "owner", false, {
+      builder: "fake",
+      fakeDurationMs: 100,
+      fakeValidationOutcome: "incompatible",
+    });
+    const unavailable = await catalog.startBuild(created.id, "owner", false, {
+      builder: "fake",
+      fakeDurationMs: 100,
+      fakeValidationOutcome: "unavailable",
+    });
+    await expect
+      .poll(() => catalog.publicBuild(warning.id, "owner", false).outcome)
+      .toBe("ready-with-warnings");
+    await expect
+      .poll(() => catalog.publicBuild(incompatible.id, "owner", false).outcome)
+      .toBe("built-incompatible");
+    await expect
+      .poll(() => catalog.publicBuild(unavailable.id, "owner", false).outcome)
+      .toBe("validation-unavailable");
+    expect(
+      catalog.publicBuild(warning.id, "owner", false).compatibility,
+    ).toMatchObject({ state: "warnings" });
+    expect(catalog.publicBuild(incompatible.id, "owner", false)).toMatchObject({
+      status: "succeeded",
+      imageCreated: false,
+      validationState: "incompatible",
+    });
+    expect(catalog.publicBuild(unavailable.id, "owner", false)).toMatchObject({
+      status: "failed",
+      imageCreated: false,
+      validationState: "unavailable",
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("incompatible and validation-unavailable versions cannot be promoted, selected, or made defaults", async () => {
+  const directory = await mkdtemp(
+    join(tmpdir(), "agentor-image-readiness-gates-"),
+  );
+  try {
+    const catalog = new ImageCatalogManager(directory);
+    await catalog.init();
+    const created = await catalog.create(
+      "owner",
+      definition("readiness-gates"),
+    );
+    const incompatible = await catalog.startBuild(created.id, "owner", false, {
+      builder: "fake",
+      fakeDurationMs: 100,
+      fakeValidationOutcome: "incompatible",
+    });
+    const unavailable = await catalog.startBuild(created.id, "owner", false, {
+      builder: "fake",
+      fakeDurationMs: 100,
+      fakeValidationOutcome: "unavailable",
+    });
+    await expect
+      .poll(() => catalog.publicBuild(incompatible.id, "owner", false).outcome)
+      .toBe("built-incompatible");
+    await expect
+      .poll(() => catalog.publicBuild(unavailable.id, "owner", false).outcome)
+      .toBe("validation-unavailable");
+    for (const build of [incompatible, unavailable]) {
+      const result = catalog.publicBuild(build.id, "owner", false);
+      await expect(
+        catalog.promote(created.id, result.version!, "owner", false),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      await expect(
+        catalog.setUserDefault("owner", created.id, result.version!),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(() =>
+        catalog.resolveSelection("owner", created.id, result.version!),
+      ).toThrow(/compatibility|incompatible/i);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("build logs paginate and cancellation is prompt and idempotent", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agentor-image-cancel-page-"));
+  try {
+    const catalog = new ImageCatalogManager(directory);
+    await catalog.init();
+    const created = await catalog.create("owner", definition("cancel-page"));
+    const completed = await catalog.startBuild(created.id, "owner", false, {
+      builder: "fake",
+      fakeDurationMs: 100,
+    });
+    await expect
+      .poll(() => catalog.publicBuild(completed.id, "owner", false).status)
+      .toBe("succeeded");
+    const firstPage = catalog.logPage(completed.id, "owner", false, {
+      after: 0,
+      limit: 1,
+    });
+    expect(firstPage).toMatchObject({
+      after: 0,
+      entries: [expect.any(String)],
+      nextAfter: 1,
+    });
+    const secondPage = catalog.logPage(completed.id, "owner", false, {
+      after: firstPage.nextCursor,
+      limit: 1,
+    });
+    expect(secondPage.after).toBe(1);
+    expect(secondPage.entries).not.toEqual(firstPage.entries);
+
+    await catalog.setFault("owner", {
+      failPhase: "building",
+      message: "Authorization: Bearer abcdefghijklmnop",
+    });
+    const redactedFailure = await catalog.startBuild(
+      created.id,
+      "owner",
+      false,
+      { builder: "fake", fakeDurationMs: 100 },
+    );
+    await expect
+      .poll(
+        () =>
+          catalog.publicBuild(redactedFailure.id, "owner", false).status,
+      )
+      .toBe("failed");
+    const redactedLogs = catalog.logs(
+      redactedFailure.id,
+      "owner",
+      false,
+    );
+    expect(redactedLogs).toContain("[redacted]");
+    expect(redactedLogs).not.toContain("abcdefghijklmnop");
+
+    const pending = await catalog.startBuild(created.id, "owner", false, {
+      builder: "fake",
+      fakeDurationMs: 10_000,
+    });
+    const cancelStartedAt = Date.now();
+    const firstCancel = await catalog.cancelBuild(pending.id, "owner", false);
+    expect(Date.now() - cancelStartedAt).toBeLessThan(500);
+    const secondCancel = await catalog.cancelBuild(pending.id, "owner", false);
+    expect(firstCancel).toMatchObject({
+      status: "cancelled",
+      outcome: "cancelled",
+    });
+    expect(secondCancel).toMatchObject({
+      id: pending.id,
+      status: "cancelled",
+      outcome: "cancelled",
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("compatibility distinguishes Docker validator infrastructure failures from failed worker contract checks", async () => {
+  const directory = await mkdtemp(
+    join(tmpdir(), "agentor-image-validator-outcome-"),
+  );
+  try {
+    const catalog = new ImageCatalogManager(directory);
+    await catalog.init();
+    const runtimeImage = {
+      Id: `sha256:${"b".repeat(64)}`,
+      Config: {
+        User: "agent",
+        WorkingDir: "/workspace",
+        Entrypoint: ["/home/agent/entrypoint.sh"],
+      },
+    };
+    const validation = async (docker: any) => {
+      (catalog as any).docker = docker;
+      const build: any = {
+        id: `validator-${Math.random()}`,
+        definitionId: "validator-definition",
+        ownerId: "owner",
+        status: "running",
+        phase: "validating",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        logs: [],
+        builder: "controlled",
+      };
+      const version: any = {
+        version: "v1",
+        digest: runtimeImage.Id,
+        baseImage: "agentor-worker:approved-test",
+        createdAt: new Date().toISOString(),
+      };
+      return (catalog as any).runCompatibilityValidation(
+        build,
+        version,
+        { pluginComposition: [] },
+        runtimeImage.Id,
+        runtimeImage,
+      );
+    };
+
+    for (const docker of [
+      {
+        getImage: () => ({ inspect: async () => runtimeImage }),
+        createContainer: async () => {
+          throw new Error("validator container creation failed");
+        },
+      },
+      {
+        getImage: () => ({ inspect: async () => runtimeImage }),
+        createContainer: async () => ({
+          start: async () => {
+            throw new Error("validator container start failed");
+          },
+          remove: async () => undefined,
+        }),
+      },
+    ]) {
+      await expect(validation(docker)).resolves.toMatchObject({
+        state: "unavailable",
+        coreState: "unavailable",
+        infrastructureError: expect.stringContaining("could not complete"),
+      });
+    }
+
+    await expect(
+      validation({
+        getImage: () => ({ inspect: async () => runtimeImage }),
+        createContainer: async () => ({
+          start: async () => undefined,
+          wait: async () => ({ StatusCode: 1 }),
+          remove: async () => undefined,
+        }),
+      }),
+    ).resolves.toMatchObject({
+      state: "incompatible",
+      coreState: "failed",
+      requiredFailures: ["Agentor worker bootstrap contract"],
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("cancellation during compatibility validation is prompt, durable, and retryable", async () => {
+  const directory = await mkdtemp(
+    join(tmpdir(), "agentor-image-validator-cancel-"),
+  );
+  try {
+    const catalog = new ImageCatalogManager(directory);
+    await catalog.init();
+    const created = await catalog.create(
+      "owner",
+      definition("validator-cancel"),
+    );
+    const initial = await catalog.startBuild(created.id, "owner", false, {
+      builder: "fake",
+      fakeDurationMs: 100,
+    });
+    await expect
+      .poll(() => catalog.publicBuild(initial.id, "owner", false).outcome)
+      .toBe("ready");
+    const version = catalog.definition(created.id, "owner", false).versions[0]!;
+    version.artifactTag = "agentor-validator-cancel:test";
+    version.readiness = "validation-unavailable";
+    version.compatibility = {
+      state: "unavailable",
+      coreState: "unavailable",
+      pluginState: "none",
+      checks: [],
+      requiredFailures: [],
+      warnings: [],
+    };
+
+    let validatorStarted = false;
+    let rejectWait: ((error: Error) => void) | undefined;
+    (catalog as any).docker = {
+      getImage: () => ({
+        inspect: async () => ({
+          Id: version.digest,
+          Config: {
+            User: "agent",
+            WorkingDir: "/workspace",
+            Entrypoint: ["/home/agent/entrypoint.sh"],
+          },
+        }),
+      }),
+      createContainer: async () => ({
+        start: async () => {
+          validatorStarted = true;
+        },
+        wait: () =>
+          new Promise((_, reject) => {
+            rejectWait = reject;
+          }),
+        kill: async () => rejectWait?.(new Error("validator cancelled")),
+        remove: async () => undefined,
+      }),
+    };
+    const retry = await catalog.startValidation(
+      created.id,
+      version.version,
+      "owner",
+      false,
+      { requestId: "cancel-validation-1" },
+    );
+    await expect.poll(() => validatorStarted).toBe(true);
+    await expect
+      .poll(() => catalog.publicBuild(retry.id, "owner", false).phase)
+      .toBe("validating");
+    const startedAt = Date.now();
+    const cancelled = await catalog.cancelBuild(retry.id, "owner", false);
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(cancelled).toMatchObject({
+      status: "cancelled",
+      phase: "cancelled",
+      outcome: "cancelled",
+    });
+    expect(
+      catalog.definition(created.id, "owner", false).versions[0],
+    ).toMatchObject({
+      readiness: "validation-unavailable",
+      compatibility: {
+        state: "unavailable",
+        infrastructureError: "Compatibility validation was cancelled.",
+      },
+    });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

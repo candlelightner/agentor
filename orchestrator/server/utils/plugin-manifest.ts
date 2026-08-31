@@ -46,6 +46,38 @@ export interface PluginPrivateAction {
   openMode?: "sandboxed-pane" | "desktop";
 }
 
+/**
+ * A credential-free contribution which may be selected while constructing a
+ * custom worker image.  It deliberately describes image construction only:
+ * lifecycle commands, environment references, ports, displays and instance
+ * allocations remain worker-runtime concerns.
+ */
+export interface PluginImageBuild {
+  contextFiles?: PluginImageBuildContextFile[];
+  provisioning?: PluginImageBuildProvisioningStep[];
+  /** A plugin can make its image check required by default. The image/template
+   * selecting it may still decide whether that check is required. */
+  validation?: {
+    command: PluginCommand;
+    defaultRequired?: boolean;
+  };
+  /** Signals that the contribution intentionally needs unrestricted
+   * build-time shell behavior. It never changes an image's mode implicitly. */
+  requiresAdvancedProvisioning?: boolean;
+}
+
+export interface PluginImageBuildContextFile {
+  path: string;
+  contentBase64: string;
+  role?: "asset" | "script";
+  destination?: string;
+}
+
+export type PluginImageBuildProvisioningStep =
+  | { type: "packages"; manager: "apt" | "npm" | "pip"; packages: string[] }
+  | { type: "command"; command: string }
+  | { type: "script"; path: string; interpreter: "sh" | "bash" | "python3" | "node" };
+
 export interface PluginManifest {
   schemaVersion: typeof PLUGIN_MANIFEST_SCHEMA_VERSION;
   name: string;
@@ -73,6 +105,7 @@ export interface PluginManifest {
     markdown?: string;
     skillMarkdown?: string;
   };
+  imageBuild?: PluginImageBuild;
 }
 
 const ID_RE = /^[a-z][a-z0-9-]{0,63}$/;
@@ -80,6 +113,14 @@ const VERSION_RE = /^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$/;
 const MAX_COMMAND_ARGS = 128;
 const MAX_COMMAND_ARG_BYTES = 8 * 1024;
 const MAX_DOCUMENT_BYTES = 256 * 1024;
+const MAX_IMAGE_BUILD_CONTEXT_FILE = 100 * 1024 * 1024;
+const MAX_IMAGE_BUILD_CONTEXT_TOTAL = 250 * 1024 * 1024;
+const MAX_IMAGE_BUILD_FILES = 100;
+const MAX_IMAGE_BUILD_STEPS = 100;
+const MAX_IMAGE_BUILD_COMMAND_BYTES = 16 * 1024;
+const SAFE_BUILD_PATH_RE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[a-zA-Z0-9._/-]+$/;
+const SAFE_BUILD_DESTINATION_RE = /^\/opt\/agentor-context\/(?!\.\.(?:\/|$))(?!.*\/\.\.(?:\/|$))[a-zA-Z0-9._/-]+$/;
+const SAFE_BUILD_PACKAGE_RE = /^[a-zA-Z0-9@._+:/=~^-]+$/;
 const SECRET_MATERIAL_RE =
   /(?:\b(?:TOKEN|SECRET|PASSWORD|API[_-]?KEY|PRIVATE[_-]?KEY)\b\s*[=:]\s*["']?[^\s"']{8,}|\bauthorization\s*[:=]\s*(?:bearer\s+)?[^\s"']{8,}|-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----|github_pat_[A-Za-z0-9_]{12,}|\bsk-(?:proj-)?[A-Za-z0-9_-]{12,})/i;
 
@@ -99,6 +140,7 @@ export function validatePluginManifest(input: unknown): PluginManifest {
       "environment",
       "actions",
       "documentation",
+      "imageBuild",
     ],
     "plugin manifest",
   );
@@ -142,6 +184,7 @@ export function validatePluginManifest(input: unknown): PluginManifest {
   const environment = validateEnvironment(input.environment);
   const actions = validateActions(input.actions, portIds);
   const documentation = validateDocumentation(input.documentation);
+  const imageBuild = validatePluginImageBuild(input.imageBuild);
   // These fields are persisted in definitions and can be carried by export,
   // clone, and Git portability just like lifecycle/docs. Environment entries
   // are intentionally excluded because they are validated key references.
@@ -149,6 +192,7 @@ export function validatePluginManifest(input: unknown): PluginManifest {
   assertNoSecretMaterial(lifecycle, "Plugin lifecycle");
   if (documentation)
     assertNoSecretMaterial(documentation, "Plugin documentation");
+  if (imageBuild) assertNoSecretMaterial(imageBuild, "Plugin imageBuild");
   let iconSvg: string | undefined;
   if (input.iconSvg !== undefined) {
     iconSvg = sanitizePluginSvg(input.iconSvg) ?? undefined;
@@ -166,7 +210,120 @@ export function validatePluginManifest(input: unknown): PluginManifest {
     ...(environment ? { environment } : {}),
     ...(actions?.length ? { actions } : {}),
     ...(documentation ? { documentation } : {}),
+    ...(imageBuild ? { imageBuild } : {}),
   };
+}
+
+/** Validate the serializable, image-only portion of a plugin manifest. */
+export function validatePluginImageBuild(input: unknown): PluginImageBuild | undefined {
+  if (input === undefined) return undefined;
+  if (!isRecord(input)) fail("imageBuild must be an object");
+  assertOnlyKeys(
+    input,
+    ["contextFiles", "provisioning", "validation", "requiresAdvancedProvisioning"],
+    "imageBuild",
+  );
+  const contextFiles = validateImageBuildContextFiles(input.contextFiles);
+  const provisioning = validateImageBuildProvisioning(
+    input.provisioning,
+    contextFiles,
+  );
+  let validation: PluginImageBuild["validation"];
+  if (input.validation !== undefined) {
+    if (!isRecord(input.validation)) fail("imageBuild.validation must be an object");
+    assertOnlyKeys(input.validation, ["command", "defaultRequired"], "imageBuild.validation");
+    if (
+      input.validation.defaultRequired !== undefined &&
+      typeof input.validation.defaultRequired !== "boolean"
+    )
+      fail("imageBuild.validation.defaultRequired must be a boolean");
+    validation = {
+      command: validateCommand(input.validation.command, "imageBuild.validation.command", false),
+      ...(input.validation.defaultRequired === undefined
+        ? {}
+        : { defaultRequired: input.validation.defaultRequired }),
+    };
+  }
+  if (
+    input.requiresAdvancedProvisioning !== undefined &&
+    typeof input.requiresAdvancedProvisioning !== "boolean"
+  )
+    fail("imageBuild.requiresAdvancedProvisioning must be a boolean");
+  if (!contextFiles?.length && !provisioning?.length && !validation)
+    fail("imageBuild must include contextFiles, provisioning, or validation");
+  return {
+    ...(contextFiles?.length ? { contextFiles } : {}),
+    ...(provisioning?.length ? { provisioning } : {}),
+    ...(validation ? { validation } : {}),
+    ...(input.requiresAdvancedProvisioning ? { requiresAdvancedProvisioning: true } : {}),
+  };
+}
+
+function validateImageBuildContextFiles(input: unknown): PluginImageBuildContextFile[] | undefined {
+  if (input === undefined) return undefined;
+  if (!Array.isArray(input) || input.length > MAX_IMAGE_BUILD_FILES)
+    fail(`imageBuild.contextFiles must contain at most ${MAX_IMAGE_BUILD_FILES} files`);
+  const files: PluginImageBuildContextFile[] = [], seen = new Set<string>();
+  let total = 0;
+  for (const raw of input) {
+    if (!isRecord(raw)) fail("imageBuild context file must be an object");
+    assertOnlyKeys(raw, ["path", "contentBase64", "role", "destination"], "imageBuild context file");
+    const path = requiredText(raw.path, "imageBuild.contextFiles.path", 1, 512);
+    const folded = path.toLowerCase();
+    if (!SAFE_BUILD_PATH_RE.test(path) || path.startsWith("./") || path.includes("//") || path.endsWith("/") || folded === "dockerfile" || folded === ".dockerignore" || seen.has(folded))
+      fail("imageBuild.contextFiles.path is invalid");
+    seen.add(folded);
+    const contentBase64 = requiredText(raw.contentBase64, "imageBuild.contextFiles.contentBase64", 0, Math.ceil(MAX_IMAGE_BUILD_CONTEXT_FILE / 3) * 4 + 4);
+    if (contentBase64.length % 4 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(contentBase64))
+      fail("imageBuild.contextFiles.contentBase64 must be canonical base64");
+    const decoded = Buffer.from(contentBase64, "base64");
+    if (decoded.toString("base64") !== contentBase64 || decoded.length > MAX_IMAGE_BUILD_CONTEXT_FILE || (total += decoded.length) > MAX_IMAGE_BUILD_CONTEXT_TOTAL)
+      fail("imageBuild context content is invalid or too large");
+    assertNoSecretMaterial(decoded.toString("utf8"), "Plugin imageBuild context content");
+    const role = raw.role === undefined ? "asset" : raw.role;
+    const destination = raw.destination === undefined ? `/opt/agentor-context/${path}` : requiredText(raw.destination, "imageBuild.contextFiles.destination", 1, 1024);
+    if ((role !== "asset" && role !== "script") || !SAFE_BUILD_DESTINATION_RE.test(destination) || destination.includes("//") || destination.endsWith("/"))
+      fail("imageBuild context role or destination is invalid");
+    files.push({ path, contentBase64, role, destination });
+  }
+  return files;
+}
+
+function validateImageBuildProvisioning(input: unknown, files: PluginImageBuildContextFile[] | undefined): PluginImageBuildProvisioningStep[] | undefined {
+  if (input === undefined) return undefined;
+  if (!Array.isArray(input) || input.length > MAX_IMAGE_BUILD_STEPS)
+    fail(`imageBuild.provisioning must contain at most ${MAX_IMAGE_BUILD_STEPS} steps`);
+  return input.map((raw): PluginImageBuildProvisioningStep => {
+    if (!isRecord(raw)) fail("imageBuild provisioning step must be an object");
+    if (raw.type === "packages") {
+      assertOnlyKeys(raw, ["type", "manager", "packages"], "imageBuild package provisioning");
+      if (!(["apt", "npm", "pip"] as string[]).includes(String(raw.manager)) || !Array.isArray(raw.packages) || !raw.packages.length || raw.packages.length > 100)
+        fail("imageBuild package provisioning is invalid");
+      const packages = raw.packages.map((item, index) => {
+        const value = requiredText(item, `imageBuild.provisioning.packages[${index}]`, 1, 512);
+        if (value.startsWith("-") || !SAFE_BUILD_PACKAGE_RE.test(value)) fail("imageBuild package provisioning is invalid");
+        assertNoSecretMaterial(value, "Plugin imageBuild package provisioning");
+        return value;
+      });
+      return { type: "packages", manager: raw.manager as "apt" | "npm" | "pip", packages };
+    }
+    if (raw.type === "command") {
+      assertOnlyKeys(raw, ["type", "command"], "imageBuild command provisioning");
+      const command = requiredText(raw.command, "imageBuild.provisioning.command", 1, MAX_IMAGE_BUILD_COMMAND_BYTES).trim();
+      if (!command) fail("imageBuild.provisioning.command is invalid");
+      assertNoSecretMaterial(command, "Plugin imageBuild command provisioning");
+      return { type: "command", command };
+    }
+    if (raw.type === "script") {
+      assertOnlyKeys(raw, ["type", "path", "interpreter"], "imageBuild script provisioning");
+      const path = requiredText(raw.path, "imageBuild.provisioning.path", 1, 512);
+      const interpreter = raw.interpreter;
+      if (!files?.some((file) => file.path === path && file.role === "script") || !(["sh", "bash", "python3", "node"] as string[]).includes(String(interpreter)))
+        fail("imageBuild script provisioning must reference a context script with an approved interpreter");
+      return { type: "script", path, interpreter: interpreter as "sh" | "bash" | "python3" | "node" };
+    }
+    fail("Unknown imageBuild provisioning step");
+  });
 }
 
 function assertNoSecretMaterial(value: unknown, label: string): void {

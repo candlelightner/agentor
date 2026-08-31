@@ -216,6 +216,31 @@ test.describe.serial("Custom worker image builder and catalog", () => {
       });
       expect(res.status()).toBe(400);
     }
+    const invalidContext = await ownerCtx.post(
+      "/api/image-catalog/definitions",
+      {
+        data: {
+          name: `bad-context-diagnostic-${Date.now()}`,
+          baseImage: "agentor-worker:approved-test",
+          dockerfileFragment: "",
+          contextFiles: [{ path: "../escape", contentBase64: "eA==" }],
+        },
+      },
+    );
+    expect(invalidContext.status()).toBe(400);
+    expect(await invalidContext.json()).toMatchObject({
+      data: {
+        code: "invalid-build-context",
+        diagnostic: {
+          code: "invalid-build-context",
+          blockedField: "contextFiles[0].path",
+          constraint: expect.any(String),
+          remediation: expect.any(String),
+          advancedModeAvailable: false,
+          dockerAttempted: false,
+        },
+      },
+    });
     const secretRef = await ownerCtx.post("/api/image-catalog/definitions", {
       data: {
         name: "secret-ref",
@@ -246,7 +271,14 @@ test.describe.serial("Custom worker image builder and catalog", () => {
         name: `structured-${Date.now()}`,
         baseImage: "agentor-worker:approved-test",
         dockerfileFragment: "",
-        contextFiles: [{ path: "setup.sh", contentBase64: Buffer.from("echo configured").toString("base64"), role: "script", destination: "/opt/agentor-context/setup.sh" }],
+        contextFiles: [
+          {
+            path: "setup.sh",
+            contentBase64: Buffer.from("echo configured").toString("base64"),
+            role: "script",
+            destination: "/opt/agentor-context/setup.sh",
+          },
+        ],
         provisioning: [
           { type: "packages", manager: "apt", packages: ["jq=1.7.1-3"] },
           { type: "command", command: "mkdir -p /opt/example" },
@@ -256,32 +288,178 @@ test.describe.serial("Custom worker image builder and catalog", () => {
     });
     expect(response.status()).toBe(201);
     expect(await response.json()).toMatchObject({
-      provisioning: expect.arrayContaining([expect.objectContaining({ type: "packages" }), expect.objectContaining({ type: "script", path: "setup.sh" })]),
-      contextFiles: [expect.objectContaining({ role: "script", destination: "/opt/agentor-context/setup.sh" })],
+      provisioning: expect.arrayContaining([
+        expect.objectContaining({ type: "packages" }),
+        expect.objectContaining({ type: "script", path: "setup.sh" }),
+      ]),
+      contextFiles: [
+        expect.objectContaining({
+          role: "script",
+          destination: "/opt/agentor-context/setup.sh",
+        }),
+      ],
     });
-    const runtimeTemplate = await ownerCtx.post("/api/image-catalog/definitions", { data: { name: `template-${Date.now()}`, baseImage: "agentor-worker:approved-test", dockerfileFragment: "", provisioning: [], contextFiles: [{ path: "launch.sh", contentBase64: Buffer.from("echo $TAVILY_API_KEY").toString("base64") }] } });
+    const runtimeTemplate = await ownerCtx.post(
+      "/api/image-catalog/definitions",
+      {
+        data: {
+          name: `template-${Date.now()}`,
+          baseImage: "agentor-worker:approved-test",
+          dockerfileFragment: "",
+          provisioning: [],
+          contextFiles: [
+            {
+              path: "launch.sh",
+              contentBase64: Buffer.from("echo $TAVILY_API_KEY").toString(
+                "base64",
+              ),
+            },
+          ],
+        },
+      },
+    );
     expect(runtimeTemplate.status()).toBe(201);
     for (const definition of [
-      { provisioning: [{ type: "command", command: `echo ${SECRET}` }], contextFiles: [] },
-      { provisioning: [{ type: "command", command: "echo ok\nUSER root" }], contextFiles: [] },
-      { provisioning: [], contextFiles: [{ path: "secret.txt", contentBase64: Buffer.from(`TOKEN=${SECRET}`).toString("base64") }] },
-      { provisioning: [], contextFiles: [{ path: "key.pem", contentBase64: Buffer.from("-----BEGIN PRIVATE KEY-----\nabc").toString("base64") }] },
-      { provisioning: [], contextFiles: [{ path: "escape.txt", contentBase64: "eA==", destination: "/opt/agentor-context/../escape.txt" }] },
-      { provisioning: [{ type: "packages", manager: "apt", packages: ["--allow-unauthenticated"] }], contextFiles: [] },
+      {
+        provisioning: [{ type: "command", command: `echo ${SECRET}` }],
+        contextFiles: [],
+      },
+      {
+        provisioning: [{ type: "command", command: "echo ok\nUSER root" }],
+        contextFiles: [],
+      },
+      {
+        provisioning: [],
+        contextFiles: [
+          {
+            path: "secret.txt",
+            contentBase64: Buffer.from(`TOKEN=${SECRET}`).toString("base64"),
+          },
+        ],
+      },
+      {
+        provisioning: [],
+        contextFiles: [
+          {
+            path: "key.pem",
+            contentBase64: Buffer.from(
+              "-----BEGIN PRIVATE KEY-----\nabc",
+            ).toString("base64"),
+          },
+        ],
+      },
+      {
+        provisioning: [],
+        contextFiles: [
+          {
+            path: "escape.txt",
+            contentBase64: "eA==",
+            destination: "/opt/agentor-context/../escape.txt",
+          },
+        ],
+      },
+      {
+        provisioning: [
+          {
+            type: "packages",
+            manager: "apt",
+            packages: ["--allow-unauthenticated"],
+          },
+        ],
+        contextFiles: [],
+      },
     ]) {
-      const rejected = await ownerCtx.post("/api/image-catalog/definitions", { data: { name: `structured-reject-${Math.random()}`, baseImage: "agentor-worker:approved-test", dockerfileFragment: "", ...definition } });
+      const rejected = await ownerCtx.post("/api/image-catalog/definitions", {
+        data: {
+          name: `structured-reject-${Math.random()}`,
+          baseImage: "agentor-worker:approved-test",
+          dockerfileFragment: "",
+          ...definition,
+        },
+      });
       expect(rejected.status()).toBe(400);
+    }
+    const safeBlocked = await ownerCtx.post("/api/image-catalog/definitions", {
+      data: {
+        name: `safe-diagnostic-${Date.now()}`,
+        baseImage: "agentor-worker:approved-test",
+        dockerfileFragment: "",
+        contextFiles: [],
+        provisioning: [{ type: "command", command: "echo first\necho second" }],
+      },
+    });
+    expect(safeBlocked.status()).toBe(400);
+    expect(await safeBlocked.json()).toMatchObject({
+      statusMessage: expect.stringContaining("Blocked by Safe mode"),
+      data: {
+        code: "safe-mode-blocked",
+        diagnostic: {
+          code: "safe-mode-blocked",
+          blockedField: "provisioning[0]",
+          blockedStep: { index: 0, type: "command" },
+          constraint: expect.any(String),
+          reason: expect.stringContaining("Agentor"),
+          remediation: expect.any(String),
+          advancedModeAvailable: true,
+          advancedModeWarning: expect.stringContaining(
+            "controlled Docker/BuildKit",
+          ),
+          dockerAttempted: false,
+        },
+      },
+    });
+  });
+
+  test("Advanced provisioning executes multiline shell inside the controlled build without Dockerfile control", async () => {
+    const created = await createDefinition(ownerCtx, `advanced-${Date.now()}`, {
+      baseImage: "agentor-worker:approved-default",
+      dockerfileFragment: "",
+      contextFiles: [],
+      provisioningMode: "advanced",
+      provisioning: [
+        {
+          type: "command",
+          command:
+            "printf '%s\\n' advanced > /tmp/agentor-advanced-proof\nUSER root\ntest -f /tmp/agentor-advanced-proof",
+        },
+      ],
+    });
+    try {
+      const result = await waitForBuild(
+        ownerCtx,
+        (
+          await startBuild(ownerCtx, created.id, {
+            builder: "controlled",
+            requestId: `advanced-controlled-${Date.now()}`,
+          })
+        ).id,
+      );
+      expect(result).toMatchObject({
+        status: "succeeded",
+        outcome: "ready",
+        dockerAttempted: true,
+        imageCreated: true,
+        compatibility: { coreState: "passed" },
+      });
+    } finally {
+      await ownerCtx.delete(`/api/image-catalog/definitions/${created.id}`);
     }
   });
 
   test("asynchronous build exposes phases and redacted live logs then records immutable digest and version", async () => {
     const created = await startBuild(ownerCtx, definitionId, {
       fakeDurationMs: 1000,
+      requestId: `rest-build-${Date.now()}`,
     });
     expect(created).toMatchObject({
       status: expect.stringMatching(/queued|running/),
       definitionId,
     });
+    const retried = await startBuild(ownerCtx, definitionId, {
+      fakeDurationMs: 1000,
+      requestId: created.requestId,
+    });
+    expect(retried.id).toBe(created.id);
     const logsWhileRunning = await ownerCtx.get(
       `/api/image-builds/${created.id}/logs?after=0`,
     );
@@ -292,7 +470,9 @@ test.describe.serial("Custom worker image builder and catalog", () => {
     expect(build.status).toBe("succeeded");
     const recentBuilds = await ownerCtx.get("/api/image-builds");
     expect(recentBuilds.status()).toBe(200);
-    expect((await recentBuilds.json()).filter((item: any) => item.id === created.id)).toHaveLength(1);
+    expect(
+      (await recentBuilds.json()).filter((item: any) => item.id === created.id),
+    ).toHaveLength(1);
     expect(build.observedPhases).toEqual(
       expect.arrayContaining(["validating", "building"]),
     );
@@ -301,6 +481,27 @@ test.describe.serial("Custom worker image builder and catalog", () => {
     expect(build.version).toBeTruthy();
     expect(build.ownerId).toBe(owner.id);
     expect(JSON.stringify(build)).not.toContain(SECRET);
+    const firstLogPage = await ownerCtx.get(
+      `/api/image-builds/${created.id}/logs?after=0&limit=1`,
+    );
+    expect(firstLogPage.status()).toBe(200);
+    const firstLogPageBody = await firstLogPage.json();
+    expect(firstLogPageBody).toMatchObject({
+      after: 0,
+      entries: [expect.any(String)],
+      nextAfter: 1,
+      nextCursor: 1,
+    });
+    const nextLogPage = await ownerCtx.get(
+      `/api/image-builds/${created.id}/logs?after=${firstLogPageBody.nextCursor}&limit=1`,
+    );
+    expect(nextLogPage.status()).toBe(200);
+    const nextLogPageBody = await nextLogPage.json();
+    expect(nextLogPageBody).toMatchObject({
+      after: 1,
+      entries: [expect.any(String)],
+    });
+    expect(nextLogPageBody.entries).not.toEqual(firstLogPageBody.entries);
     promotedDigest = build.digest;
     promotedVersion = build.version;
 
@@ -367,24 +568,69 @@ test.describe.serial("Custom worker image builder and catalog", () => {
     expect(recovered.recovery).toBeTruthy();
   });
 
-  test("controlled setup failures retain a sanitized diagnostic instead of an empty log", async () => {
-    const unavailable = await createDefinition(ownerCtx, `unavailable-${Date.now()}`, {
-      baseImage: `agentor-worker:approved-unconfigured-${Date.now()}`,
-      dockerfileFragment: "RUN true",
-      contextFiles: [],
-    });
-    const started = await ownerCtx.post(
+  test("unconfigured approved base aliases are rejected synchronously before a Docker job is created", async () => {
+    const unavailable = await createDefinition(
+      ownerCtx,
+      `unavailable-${Date.now()}`,
+      {
+        baseImage: `agentor-worker:approved-unconfigured-${Date.now()}`,
+        dockerfileFragment: "RUN true",
+        contextFiles: [],
+      },
+    );
+    const buildsBefore = await ownerCtx.get("/api/image-builds");
+    expect(buildsBefore.status()).toBe(200);
+    const beforeIds = new Set(
+      (await buildsBefore.json()).map((build: any) => build.id),
+    );
+    const rejected = await ownerCtx.post(
       `/api/image-catalog/definitions/${unavailable.id}/builds`,
       { data: { builder: "controlled" } },
     );
-    expect(started.status()).toBe(202);
-    const failed = await waitForBuild(ownerCtx, (await started.json()).id);
-    expect(failed).toMatchObject({
-      status: "failed",
-      error: expect.stringContaining("Approved image base is unavailable"),
+    expect(rejected.status()).toBe(400);
+    expect(await rejected.json()).toMatchObject({
+      statusMessage: expect.stringContaining(
+        "Approved image base is unavailable",
+      ),
+      data: {
+        code: "invalid-definition",
+        diagnostic: {
+          code: "invalid-definition",
+          blockedField: "baseImage",
+          dockerAttempted: false,
+          advancedModeAvailable: false,
+          remediation: expect.any(String),
+        },
+      },
     });
-    const logs = await ownerCtx.get(`/api/image-builds/${failed.id}/logs`);
-    expect(await logs.text()).toContain("Approved image base is unavailable");
+    const buildsAfter = await ownerCtx.get("/api/image-builds");
+    expect(buildsAfter.status()).toBe(200);
+    expect(
+      (await buildsAfter.json()).filter(
+        (build: any) => !beforeIds.has(build.id),
+      ),
+    ).toEqual([]);
+    const invalidAlias = await ownerCtx.post(
+      `/api/image-catalog/definitions/${definitionId}/rebuild-base`,
+      { data: { builder: "fake", baseImage: "ubuntu:latest" } },
+    );
+    expect(invalidAlias.status()).toBe(400);
+    expect(await invalidAlias.json()).toMatchObject({
+      data: {
+        code: "invalid-definition",
+        diagnostic: {
+          blockedField: "baseImage",
+          dockerAttempted: false,
+          constraint: expect.stringContaining("agentor-worker:approved-*"),
+        },
+      },
+    });
+    const buildsAfterInvalidAlias = await ownerCtx.get("/api/image-builds");
+    expect(
+      (await buildsAfterInvalidAlias.json()).filter(
+        (build: any) => !beforeIds.has(build.id),
+      ),
+    ).toEqual([]);
   });
 
   test("promotion, test worker, rollback, and image selection use immutable catalog versions", async () => {
@@ -416,7 +662,9 @@ test.describe.serial("Custom worker image builder and catalog", () => {
     expect(controlled.status).toBe("succeeded");
     expect(controlled.baseDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
     const pinnedDefinition = await (
-      await ownerCtx.get(`/api/image-catalog/definitions/${runnableDefinition.id}`)
+      await ownerCtx.get(
+        `/api/image-catalog/definitions/${runnableDefinition.id}`,
+      )
     ).json();
     expect(pinnedDefinition.baseImage).toBe("agentor-worker:approved-default");
     expect(pinnedDefinition.versions[0]).toMatchObject({
@@ -425,17 +673,31 @@ test.describe.serial("Custom worker image builder and catalog", () => {
     });
     const testWorker = await ownerCtx.post(
       `/api/image-catalog/definitions/${runnableDefinition.id}/versions/${controlled.version}/test-worker`,
-      { data: { displayName: "image-smoke-test" } },
+      {
+        data: {
+          displayName: "image-smoke-test",
+          requestId: `test-worker-${Date.now()}`,
+        },
+      },
     );
-    expect(testWorker.status()).toBe(201);
-    const actualTestWorker = await testWorker.json();
-    expect(actualTestWorker).toMatchObject({
-      workerId: expect.any(String),
-      imageDigest: controlled.digest,
-      purpose: "image-test",
-      status: "running",
+    expect(testWorker.status()).toBe(202);
+    const acceptedTestWorker = await testWorker.json();
+    expect(acceptedTestWorker).toMatchObject({
+      id: expect.any(String),
+      operation: "test-worker",
+      digest: controlled.digest,
+      status: expect.stringMatching(/queued|running/),
+      requestId: expect.stringMatching(/^test-worker-/),
     });
-    expect(actualTestWorker.synthetic).toBeUndefined();
+    const actualTestWorker = await waitForBuild(
+      ownerCtx,
+      acceptedTestWorker.id,
+    );
+    expect(actualTestWorker).toMatchObject({
+      status: "succeeded",
+      outcome: "test-worker-ready",
+      workerId: expect.any(String),
+    });
     const workers = await ownerCtx.get("/api/containers");
     expect(
       (await workers.json()).some(
@@ -559,10 +821,13 @@ test.describe.serial("Custom worker image builder and catalog", () => {
         },
       },
     );
-    expect(unavailable.status()).toBe(202);
-    expect(
-      (await waitForBuild(ownerCtx, (await unavailable.json()).id)).status,
-    ).toBe("failed");
+    expect(unavailable.status()).toBe(400);
+    expect(await unavailable.json()).toMatchObject({
+      data: {
+        code: "invalid-definition",
+        diagnostic: { blockedField: "baseImage", dockerAttempted: false },
+      },
+    });
     const afterFailure = await (
       await ownerCtx.get(`/api/image-catalog/definitions/${definitionId}`)
     ).json();

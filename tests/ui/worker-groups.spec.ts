@@ -197,8 +197,17 @@ test.describe.serial('Worker groups dashboard', () => {
     await goToDashboard(page);
     const activeChild = page.getByTestId(`worker-group-cards-${treeChildId}`);
     await expect(activeChild.getByText(ungroupedWorkerName, { exact: true })).toBeVisible();
-    page.once('dialog', dialog => dialog.accept());
-    await activeChild.getByRole('button', { name: `Archive all in ${child.name}` }).click();
+    const archiveAll = activeChild.getByTestId(`worker-group-archive-all-${treeChildId}`);
+    await expect(archiveAll).toHaveAccessibleName(`Archive all in ${child.name} and subgroups`);
+    const confirmation = new Promise<string>(resolve =>
+      page.once('dialog', dialog => {
+        const message = dialog.message();
+        dialog.accept();
+        resolve(message);
+      }),
+    );
+    await archiveAll.click();
+    await expect(confirmation).resolves.toContain(`in ${child.name} and its subgroups`);
 
     await expect.poll(async () => {
       const workers = await (await request.get('/api/archived')).json() as Array<{ id: string }>;

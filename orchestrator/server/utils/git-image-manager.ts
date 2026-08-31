@@ -1,6 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { getUserById } from "./auth";
-import type { ImageCatalogManager, ImageDefinition } from "./image-catalog";
+import type {
+  ImageCatalogManager,
+  ImageDefinition,
+  ImagePluginSnapshot,
+  ContextFile,
+  ProvisioningStep,
+} from "./image-catalog";
 import {
   decryptGitImageCredential,
   encryptGitImageCredential,
@@ -50,7 +56,11 @@ function parseCatalog(files: GitFileMap) {
     );
     if (
       bytes > 350 * 1024 * 1024 ||
-      Buffer.byteLength(files[GIT_IMAGE_CATALOG_PATH] || files[LEGACY_GIT_IMAGE_CATALOG_PATH] || "") >
+      Buffer.byteLength(
+        files[GIT_IMAGE_CATALOG_PATH] ||
+          files[LEGACY_GIT_IMAGE_CATALOG_PATH] ||
+          "",
+      ) >
         1024 * 1024
     )
       fail(400, "Remote image catalog exceeds import limits");
@@ -71,7 +81,12 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 function canonicalCatalogFile(path: string, value: string) {
-  if (path !== GIT_IMAGE_CATALOG_PATH && path !== LEGACY_GIT_IMAGE_CATALOG_PATH && path !== GIT_PLUGIN_CATALOG_PATH) return value;
+  if (
+    path !== GIT_IMAGE_CATALOG_PATH &&
+    path !== LEGACY_GIT_IMAGE_CATALOG_PATH &&
+    path !== GIT_PLUGIN_CATALOG_PATH
+  )
+    return value;
   const manifest = JSON.parse(value);
   // generatedAt is intentionally nondeterministic and does not describe
   // catalog content. Every other field remains part of reconciliation.
@@ -153,8 +168,10 @@ export class GitImageCatalogManager {
     private store = new GitImageStore(),
     private ownerExists: (ownerId: string) => boolean | Promise<boolean> = () =>
       true,
-    private groupExists: (ownerId: string, groupId: string) =>
-      boolean | Promise<boolean> = () => true,
+    private groupExists: (
+      ownerId: string,
+      groupId: string,
+    ) => boolean | Promise<boolean> = () => true,
   ) {}
 
   private withOwner<T>(
@@ -222,8 +239,7 @@ export class GitImageCatalogManager {
   async connect(ownerId: string, input: any) {
     return withOwnerLifecycleMutation(ownerId, () =>
       this.withOwner(ownerId, async () => {
-        if (!(await this.ownerExists(ownerId)))
-          fail(404, "Owner not found");
+        if (!(await this.ownerExists(ownerId))) fail(404, "Owner not found");
         return this.connectUnlocked(ownerId, input);
       }),
     );
@@ -363,7 +379,12 @@ export class GitImageCatalogManager {
     };
     return new GitHubRestProvider(token);
   }
-  async sync(ownerId: string, catalog: ImageCatalogManager, input: any = {}, plugins?: PluginDefinitionStore) {
+  async sync(
+    ownerId: string,
+    catalog: ImageCatalogManager,
+    input: any = {},
+    plugins?: PluginDefinitionStore,
+  ) {
     return this.withOwner(ownerId, async () => {
       const working = await this.store.read(() => {
         const connection = structuredClone(this.get(ownerId));
@@ -373,7 +394,13 @@ export class GitImageCatalogManager {
           recovery: structuredClone(this.store.state.recovery[ownerId]),
         };
       });
-      const result = await this.syncUnlocked(ownerId, catalog, input, working, plugins);
+      const result = await this.syncUnlocked(
+        ownerId,
+        catalog,
+        input,
+        working,
+        plugins,
+      );
       await this.store.transaction(() => {
         const live = this.get(ownerId);
         if (live.id !== working.connection.id)
@@ -423,7 +450,9 @@ export class GitImageCatalogManager {
       const importedPlugins: string[] = [];
       if (plugins && remote.files[GIT_PLUGIN_CATALOG_PATH]) {
         const remotePlugins = parsePluginCatalog(remote.files);
-        const localPlugins = plugins.listForOwner(ownerId).filter((item) => !item.builtIn && item.userId === ownerId);
+        const localPlugins = plugins
+          .listForOwner(ownerId)
+          .filter((item) => !item.builtIn && item.userId === ownerId);
         for (const entry of remotePlugins) {
           // Preserve the reusable definition's visibility boundary. In
           // particular, recovering a group definition as owner-wide would
@@ -436,16 +465,27 @@ export class GitImageCatalogManager {
           // safely transfer one unless that exact group belongs to the owner
           // importing it; otherwise it would create an unreachable or foreign
           // scoped definition.
-          if (entry.scope === "group" &&
-            (!entry.groupId || !(await this.groupExists(ownerId, entry.groupId))))
+          if (
+            entry.scope === "group" &&
+            (!entry.groupId ||
+              !(await this.groupExists(ownerId, entry.groupId)))
+          )
             fail(400, "Remote plugin catalog contains an unknown group");
-          if (localPlugins.some((item) => item.definitionHash === entry.definitionHash)) continue;
-          const created = await plugins.create({
+          const sameId = localPlugins.find((item) => item.id === entry.id);
+          if (sameId) {
+            if (
+              sameId.definitionHash !== entry.definitionHash ||
+              sameId.scope !== entry.scope ||
+              sameId.groupId !== entry.groupId
+            )
+              fail(409, "Remote plugin catalog id conflicts with local data");
+            continue;
+          }
+          const created = await plugins.importRecovered({
+            id: entry.id,
             scope: entry.scope,
             ownerId,
-            ...(entry.scope === "group"
-              ? { groupId: entry.groupId }
-              : {}),
+            ...(entry.scope === "group" ? { groupId: entry.groupId } : {}),
             manifest: entry.manifest,
           });
           importedPlugins.push(created.id);
@@ -594,18 +634,85 @@ export class GitImageCatalogManager {
       const link = links.find((x) => x.localId === def.id);
       return !link || hashDefinition(def) !== link.baseHash;
     });
+    const pluginBuildsByDefinitionId: Record<string, ImagePluginSnapshot[]> =
+      {};
+    if (plugins)
+      for (const definition of local) {
+        const snapshots: ImagePluginSnapshot[] = [];
+        for (const selection of definition.pluginComposition || []) {
+          const plugin = plugins.getById(selection.definitionId),
+            imageBuild = plugin?.manifest.imageBuild;
+          const visible =
+            plugin &&
+            (plugin.scope === "platform" ||
+              (plugin.userId === ownerId &&
+                (plugin.scope === "owner" ||
+                  (plugin.scope === "group" &&
+                    plugin.groupId === definition.groupId))));
+          if (!visible || !plugin || !imageBuild)
+            fail(
+              409,
+              `Selected plugin build contribution ${selection.definitionId} is unavailable for Git export`,
+            );
+          if (
+            imageBuild.requiresAdvancedProvisioning &&
+            definition.provisioningMode !== "advanced"
+          )
+            fail(
+              409,
+              `Plugin ${plugin.name} requires Advanced provisioning; explicitly change the image definition from Safe mode before exporting its build recipe`,
+            );
+          const prefix = `plugins/${plugin.id}`;
+          const contextFiles: ContextFile[] = (
+            imageBuild.contextFiles || []
+          ).map((file) => ({ ...file, path: `${prefix}/${file.path}` }));
+          const provisioning: ProvisioningStep[] = (
+            imageBuild.provisioning || []
+          ).map((step) =>
+            step.type === "script"
+              ? { ...step, path: `${prefix}/${step.path}` }
+              : structuredClone(step),
+          );
+          snapshots.push({
+            ...selection,
+            name: plugin.name,
+            definitionHash: plugin.definitionHash,
+            ...(provisioning.length ? { provisioning } : {}),
+            ...(contextFiles.length ? { contextFiles } : {}),
+            ...(imageBuild.validation
+              ? {
+                  validationCommand: structuredClone(
+                    imageBuild.validation.command,
+                  ),
+                }
+              : {}),
+            ...(imageBuild.requiresAdvancedProvisioning
+              ? { requiresAdvancedProvisioning: true }
+              : {}),
+          });
+        }
+        if (snapshots.length)
+          pluginBuildsByDefinitionId[definition.id] = snapshots;
+      }
     const files = serializeCatalog(local, {
       buildMode: connection.buildMode,
       workflow: connection.actionsWorkflow,
       publishGhcr: connection.publishGhcr,
       ghcrByDigest: input.ghcrByDigest,
+      pluginBuildsByDefinitionId,
     });
     if (plugins)
       Object.assign(
         files,
         serializePluginCatalog(
-          plugins.listForOwner(ownerId).filter((item) =>
-            !item.builtIn && item.userId === ownerId && item.scope !== "worker"),
+          plugins
+            .listForOwner(ownerId)
+            .filter(
+              (item) =>
+                !item.builtIn &&
+                item.userId === ownerId &&
+                item.scope !== "worker",
+            ),
         ),
       );
     if (connection.auth.type === "pat") {

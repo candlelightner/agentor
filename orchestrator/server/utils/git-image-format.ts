@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
-import { renderDefinitionDockerfile, type ImageDefinition } from "./image-catalog";
+import {
+  renderDefinitionDockerfile,
+  type ImageDefinition,
+  type ImagePluginSelection,
+  type ImagePluginSnapshot,
+} from "./image-catalog";
 
 export const LEGACY_GIT_IMAGE_CATALOG_PATH = ".agentor/image-catalog.v1.json";
 export const GIT_IMAGE_CATALOG_PATH = ".agentor/image-catalog.v2.json";
@@ -63,7 +68,14 @@ function stable(value: unknown): string {
 export function hashDefinition(
   value: Pick<
     ImageDefinition,
-    "name" | "description" | "baseImage" | "dockerfileFragment" | "contextFiles" | "provisioning"
+    | "name"
+    | "description"
+    | "baseImage"
+    | "dockerfileFragment"
+    | "contextFiles"
+    | "provisioning"
+    | "provisioningMode"
+    | "pluginComposition"
   >,
 ) {
   return createHash("sha256")
@@ -77,6 +89,12 @@ export function hashDefinition(
           a.path.localeCompare(b.path),
         ),
         provisioning: value.provisioning || [],
+        ...(value.provisioningMode === "advanced"
+          ? { provisioningMode: "advanced" }
+          : {}),
+        ...(value.pluginComposition?.length
+          ? { pluginComposition: value.pluginComposition }
+          : {}),
       }),
     )
     .digest("hex");
@@ -126,6 +144,7 @@ export function serializeCatalog(
     workflow?: string;
     publishGhcr?: boolean;
     ghcrByDigest?: Record<string, string>;
+    pluginBuildsByDefinitionId?: Record<string, ImagePluginSnapshot[]>;
   },
 ): GitFileMap {
   const files: GitFileMap = {};
@@ -135,14 +154,28 @@ export function serializeCatalog(
       description: definition.description,
       dockerfileFragment: definition.dockerfileFragment,
       provisioning: definition.provisioning,
+      provisioningMode: definition.provisioningMode,
+      pluginComposition: definition.pluginComposition,
       contextFiles: definition.contextFiles.map((file) => ({
         ...file,
-        contentBase64: Buffer.from(file.contentBase64, "base64").toString("utf8"),
+        contentBase64: Buffer.from(file.contentBase64, "base64").toString(
+          "utf8",
+        ),
       })),
     });
     const id = safeId(definition.id),
       prefix = `images/${id}`;
-    files[`${prefix}/Dockerfile`] = `${renderDefinitionDockerfile(definition)}\n`;
+    const pluginBuilds =
+      options.pluginBuildsByDefinitionId?.[definition.id] || [];
+    const rendered = {
+      ...definition,
+      contextFiles: [
+        ...definition.contextFiles,
+        ...pluginBuilds.flatMap((plugin) => plugin.contextFiles || []),
+      ],
+      pluginComposition: pluginBuilds,
+    };
+    files[`${prefix}/Dockerfile`] = `${renderDefinitionDockerfile(rendered)}\n`;
     const metadata = {
       id,
       name: definition.name,
@@ -151,10 +184,19 @@ export function serializeCatalog(
       formatVersion: 2,
       dockerfileFragment: definition.dockerfileFragment,
       provisioning: definition.provisioning || [],
-      contextFiles: definition.contextFiles.map(({ path, role, destination }) => ({ path, role: role || "asset", destination })),
+      provisioningMode: definition.provisioningMode,
+      pluginComposition: definition.pluginComposition || [],
+      ...(pluginBuilds.length ? { pluginBuilds } : {}),
+      contextFiles: definition.contextFiles.map(
+        ({ path, role, destination }) => ({
+          path,
+          role: role || "asset",
+          destination,
+        }),
+      ),
     };
     files[`${prefix}/metadata.json`] = `${JSON.stringify(metadata, null, 2)}\n`;
-    for (const context of definition.contextFiles)
+    for (const context of rendered.contextFiles)
       files[`${prefix}/context/${safeContext(context.path)}`] = Buffer.from(
         context.contentBase64,
         "base64",
@@ -172,18 +214,30 @@ export function serializeCatalog(
         publishGhcr: options.publishGhcr,
       },
       versions: definition.versions.map((v) => {
-        const reference = options.ghcrByDigest?.[v.digest] || (v.runtimeImage?.startsWith("ghcr.io/") ? v.runtimeImage : undefined);
+        const reference =
+          options.ghcrByDigest?.[v.digest] ||
+          (v.runtimeImage?.startsWith("ghcr.io/") ? v.runtimeImage : undefined);
         if (
           reference &&
           !/^ghcr\.io\/[a-z0-9_.-]+\/[a-z0-9_./-]+@sha256:[0-9a-f]{64}$/i.test(
             reference,
           )
         )
-          throw Object.assign(new Error(
-            "GHCR references must be immutable digest references",
-          ), { statusCode: 400 });
-        if (reference && reference.slice(reference.lastIndexOf('@') + 1).toLowerCase() !== v.digest.toLowerCase())
-          throw Object.assign(new Error("GHCR reference digest must match the built image digest"), { statusCode: 400 });
+          throw Object.assign(
+            new Error("GHCR references must be immutable digest references"),
+            { statusCode: 400 },
+          );
+        if (
+          reference &&
+          reference.slice(reference.lastIndexOf("@") + 1).toLowerCase() !==
+            v.digest.toLowerCase()
+        )
+          throw Object.assign(
+            new Error(
+              "GHCR reference digest must match the built image digest",
+            ),
+            { statusCode: 400 },
+          );
         return {
           version: v.version,
           digest: v.digest,
@@ -205,9 +259,7 @@ export function serializeCatalog(
   return files;
 }
 
-export function parseCatalog(
-  files: GitFileMap,
-): Array<{
+export function parseCatalog(files: GitFileMap): Array<{
   remoteId: string;
   definition: Omit<
     ImageDefinition,
@@ -231,8 +283,12 @@ export function parseCatalog(
     throw new Error("Image catalog manifest is invalid JSON");
   }
   if (
-    !((manifest?.schema === "https://agentor.dev/schemas/image-catalog/v1" && manifest.version === 1) ||
-      (manifest?.schema === GIT_IMAGE_CATALOG_FORMAT.schema && manifest.version === 2)) ||
+    !(
+      (manifest?.schema === "https://agentor.dev/schemas/image-catalog/v1" &&
+        manifest.version === 1) ||
+      (manifest?.schema === GIT_IMAGE_CATALOG_FORMAT.schema &&
+        manifest.version === 2)
+    ) ||
     !Array.isArray(manifest.entries)
   )
     throw new Error("Unsupported image catalog format");
@@ -247,14 +303,26 @@ export function parseCatalog(
       throw new Error(
         `Catalog entry ${entry.id} Dockerfile base does not match metadata`,
       );
-    const contextMetadata = Array.isArray(metadata.contextFiles) ? metadata.contextFiles : [];
-    const contextFiles = Object.entries(files)
+    const contextMetadata = Array.isArray(metadata.contextFiles)
+      ? metadata.contextFiles
+      : [];
+    const allContextFiles = Object.entries(files)
       .filter(([p]) => p.startsWith(entry.contextPrefix))
       .map(([p, contentBase64]) => {
         const path = safeContext(p.slice(entry.contextPrefix.length));
-        const detail = contextMetadata.find((value: any) => value?.path === path);
-        return { path, contentBase64, ...(detail?.role ? { role: detail.role } : {}), ...(detail?.destination ? { destination: detail.destination } : {}) };
+        const detail = contextMetadata.find(
+          (value: any) => value?.path === path,
+        );
+        return {
+          path,
+          contentBase64,
+          ...(detail?.role ? { role: detail.role } : {}),
+          ...(detail?.destination ? { destination: detail.destination } : {}),
+        };
       });
+    const contextFiles = allContextFiles.filter((file) =>
+      contextMetadata.some((detail: any) => detail?.path === file.path),
+    );
     const fragmentWithTerminator = dockerfile.slice(
       `FROM ${entry.baseImage}\n`.length,
     );
@@ -262,27 +330,97 @@ export function parseCatalog(
       name: String(metadata.name),
       description: String(metadata.description || ""),
       baseImage: String(metadata.baseImage),
-      dockerfileFragment: metadata.formatVersion === 2 ? String(metadata.dockerfileFragment || "") : (fragmentWithTerminator.endsWith("\n")
-        ? fragmentWithTerminator.slice(0, -1)
-        : fragmentWithTerminator),
+      dockerfileFragment:
+        metadata.formatVersion === 2
+          ? String(metadata.dockerfileFragment || "")
+          : fragmentWithTerminator.endsWith("\n")
+            ? fragmentWithTerminator.slice(0, -1)
+            : fragmentWithTerminator,
       contextFiles,
       ...(metadata.formatVersion === 2 && Array.isArray(metadata.provisioning)
         ? { provisioning: metadata.provisioning }
         : {}),
+      provisioningMode:
+        metadata.formatVersion === 2 && metadata.provisioningMode === "advanced"
+          ? ("advanced" as const)
+          : ("safe" as const),
+      ...(metadata.formatVersion === 2 &&
+      Array.isArray(metadata.pluginComposition)
+        ? { pluginComposition: metadata.pluginComposition }
+        : {}),
       versions: Array.isArray(entry.versions) ? entry.versions : [],
       promotedVersion: entry.promotedVersion,
     };
-    if (manifest.version === 2 && `${renderDefinitionDockerfile(definition)}\n` !== dockerfile)
+    const pluginBuilds =
+      metadata.formatVersion === 2 && Array.isArray(metadata.pluginBuilds)
+        ? (metadata.pluginBuilds as ImagePluginSnapshot[])
+        : [];
+    if (
+      pluginBuilds.some(
+        (plugin) =>
+          !plugin ||
+          typeof plugin.definitionId !== "string" ||
+          typeof plugin.definitionHash !== "string" ||
+          (!Array.isArray(plugin.provisioning) &&
+            !Array.isArray(plugin.contextFiles)),
+      )
+    )
+      throw new Error(
+        `Catalog entry ${entry.id} plugin build metadata is invalid`,
+      );
+    if (
+      pluginBuilds.some(
+        (plugin) =>
+          !definition.pluginComposition?.some(
+            (selection: ImagePluginSelection) =>
+              selection.definitionId === plugin.definitionId &&
+              selection.validation === plugin.validation,
+          ),
+      )
+    )
+      throw new Error(
+        `Catalog entry ${entry.id} plugin build metadata does not match selections`,
+      );
+    if (
+      pluginBuilds.some((plugin) =>
+        (plugin.contextFiles || []).some(
+          (file) =>
+            files[`${entry.contextPrefix}${safeContext(file.path)}`] !==
+            file.contentBase64,
+        ),
+      )
+    )
+      throw new Error(
+        `Catalog entry ${entry.id} plugin build context integrity failed`,
+      );
+    const renderedDefinition = {
+      ...definition,
+      contextFiles: [
+        ...contextFiles,
+        ...pluginBuilds.flatMap((plugin) => plugin.contextFiles || []),
+      ],
+      pluginComposition: pluginBuilds,
+    };
+    if (
+      manifest.version === 2 &&
+      `${renderDefinitionDockerfile(renderedDefinition)}\n` !== dockerfile
+    )
       throw new Error(`Catalog entry ${entry.id} Dockerfile integrity failed`);
     // v1 stored a digest which predates provisioning.  Keep using it to
     // authenticate the legacy bytes, but return the current canonical digest:
     // recovered definitions are persisted in the current shape and links are
     // compared with hashDefinition() on subsequent pulls.
-    const integrityHash = manifest.version === 1
-      ? hashLegacyDefinition(definition)
-      : hashDefinition(definition);
+    const integrityHash =
+      manifest.version === 1
+        ? hashLegacyDefinition(definition)
+        : hashDefinition(definition);
     if (integrityHash !== entry.definitionHash)
       throw new Error(`Catalog entry ${entry.id} failed integrity validation`);
-    return { remoteId: entry.id, definition, hash: hashDefinition(definition), build: entry.build };
+    return {
+      remoteId: entry.id,
+      definition,
+      hash: hashDefinition(definition),
+      build: entry.build,
+    };
   });
 }

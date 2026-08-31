@@ -289,7 +289,8 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     expect(toolNames).toEqual(expect.arrayContaining([
       "images.list", "images.get", "images.create", "images.update", "images.validate",
       "images.delete", "images.delete-version", "images.build", "images.build-status",
-      "images.build-logs", "images.build-cancel", "images.promote", "images.rollback",
+      "images.build-logs", "images.build-cancel", "images.validation-retry",
+      "images.test-worker", "images.promote", "images.rollback",
     ]));
     for (const tool of discoveredTools.filter((item) => item.name.startsWith("images."))) {
       expect(tool.description).toContain("authorized image hierarchy");
@@ -721,14 +722,52 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     expect(updated.status()).toBe(200);
     expect((await updated.json()).description).toBe("updated in group only");
 
-    const build = await invoke(request, credential, "images.build", { definitionId: groupImageId, builder: "fake" });
+    const requestId = `group-image-build-${Date.now()}`;
+    const build = await invoke(request, credential, "images.build", { definitionId: groupImageId, builder: "fake", requestId });
     expect(build.status()).toBe(200);
-    const buildId = (await build.json()).id;
+    const accepted = await build.json();
+    const buildId = accepted.id;
+    expect(accepted).toMatchObject({
+      accepted: true,
+      jobId: buildId,
+      requestId,
+      nextActions: {
+        status: { tool: "images.build-status", arguments: { buildId } },
+        logs: { tool: "images.build-logs", arguments: { buildId } },
+        cancel: { tool: "images.build-cancel", arguments: { buildId } },
+      },
+    });
+    const duplicate = await invoke(request, credential, "images.build", { definitionId: groupImageId, builder: "fake", requestId });
+    expect(duplicate.status()).toBe(200);
+    expect((await duplicate.json()).id).toBe(buildId);
     await expect.poll(async () => {
       const response = await invoke(request, credential, "images.build-status", { buildId });
-      return (await response.json()).status;
+      const status = await response.json();
+      expect(status.nextActions).toMatchObject({
+        status: { tool: "images.build-status", arguments: { buildId } },
+        logs: { tool: "images.build-logs", arguments: { buildId } },
+      });
+      return status.status;
     }, { timeout: 10_000 }).toBe("succeeded");
-    expect((await invoke(request, credential, "images.build-logs", { buildId })).status()).toBe(200);
+    const terminalDuplicate = await invoke(request, credential, "images.build", {
+      definitionId: groupImageId,
+      builder: "fake",
+      requestId,
+    });
+    expect(terminalDuplicate.status()).toBe(200);
+    const terminalAccepted = await terminalDuplicate.json();
+    expect(terminalAccepted).toMatchObject({
+      id: buildId,
+      status: "succeeded",
+      nextActions: {
+        status: { tool: "images.build-status", arguments: { buildId } },
+        logs: { tool: "images.build-logs", arguments: { buildId } },
+      },
+    });
+    expect(terminalAccepted.nextActions.cancel).toBeUndefined();
+    const logResponse = await invoke(request, credential, "images.build-logs", { buildId, after: 0, limit: 1 });
+    expect(logResponse.status()).toBe(200);
+    expect(await logResponse.json()).toMatchObject({ after: 0, nextCursor: expect.any(Number), hasMore: expect.any(Boolean) });
     expect((await invoke(request, credential, "images.promote", { definitionId: groupImageId, version: "v1" })).status()).toBe(200);
 
     const ownerCatalog = await ownerRequest.get("/api/image-catalog/definitions");

@@ -72,3 +72,85 @@ test("MCP serializes tool failures as bounded CallToolResult errors", async () =
     await transport.stop();
   }
 });
+
+test("MCP exposes only structured server-authored Safe-mode diagnostics", async () => {
+  const port = await unusedPort();
+  const transport = new ManagementMcpTransport({
+    invoke: async () => {
+      throw Object.assign(new Error("Blocked by Safe mode at provisioning[0]"), {
+        statusCode: 400,
+        code: "safe-mode-blocked",
+        diagnostic: {
+          code: "safe-mode-blocked",
+          blockedField: "provisioning[0]",
+          blockedStep: { index: 0, type: "command", command: "SECRET=must-not-leak" },
+          constraint: "socket access is unavailable",
+          reason: "The worker contract is protected.",
+          remediation: "Use a structured package step.",
+          advancedModeAvailable: true,
+          dockerAttempted: false,
+          arbitrarySensitiveField: "must-not-leak",
+        },
+      });
+    },
+  } as any, port);
+  await transport.start("127.0.0.1");
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 10,
+        method: "tools/call",
+        params: { name: "images.create", arguments: {} },
+      }),
+    });
+    const body = await response.json();
+    expect(body.result).toMatchObject({
+      isError: true,
+      structuredContent: {
+        error: {
+          statusCode: 400,
+          code: "safe-mode-blocked",
+          diagnostic: {
+            blockedField: "provisioning[0]",
+            blockedStep: { index: 0, type: "command" },
+            advancedModeAvailable: true,
+            dockerAttempted: false,
+          },
+        },
+      },
+    });
+    expect(JSON.stringify(body)).not.toContain("must-not-leak");
+    expect(body.result.structuredContent.error.diagnostic.blockedStep).not.toHaveProperty("command");
+  } finally {
+    await transport.stop();
+  }
+});
+
+test("MCP diagnostic codes are allowlisted", async () => {
+  const port = await unusedPort();
+  const transport = new ManagementMcpTransport({
+    invoke: async () => {
+      throw Object.assign(new Error("Blocked by Safe mode"), {
+        statusCode: 400,
+        code: "SECRET=must-not-leak",
+        diagnostic: { code: "SECRET=must-not-leak", blockedField: "provisioning[0]", secret: "must-not-leak" },
+      });
+    },
+  } as any, port);
+  await transport.start("127.0.0.1");
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 11, method: "tools/call", params: { name: "images.create", arguments: {} } }),
+    });
+    const body = await response.json();
+    expect(body.result.structuredContent.error).not.toHaveProperty("code");
+    expect(body.result.structuredContent.error.diagnostic).toEqual({ blockedField: "provisioning[0]" });
+    expect(JSON.stringify(body)).not.toContain("must-not-leak");
+  } finally {
+    await transport.stop();
+  }
+});

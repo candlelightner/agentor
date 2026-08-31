@@ -200,9 +200,19 @@ export class ManagementMcpTransport {
       // ignore those as unrelated and would leave the original call pending.
       if (hasRpcId && isToolCall) {
         const message = safeToolErrorMessage(status, error);
+        const diagnostic = safeToolDiagnostic(error);
         return this.rpc(response, rpcId, {
           content: [{ type: "text", text: message }],
-          structuredContent: { error: { message, statusCode: status } },
+          structuredContent: {
+            error: {
+              message,
+              statusCode: status,
+              ...(safeDiagnosticCode(error?.code)
+                ? { code: error.code }
+                : {}),
+              ...(diagnostic ? { diagnostic } : {}),
+            },
+          },
           isError: true,
         });
       }
@@ -275,6 +285,51 @@ function safeToolErrorMessage(status: number, error: any): string {
   return typeof error?.message === "string" && error.message
     ? error.message.slice(0, 500)
     : "Management tool failed";
+}
+
+function safeToolDiagnostic(error: any): Record<string, unknown> | undefined {
+  const value = error?.diagnostic;
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return undefined;
+  // Only the server-created diagnostic vocabulary is allowed across MCP. It
+  // deliberately excludes command text, context contents, environment values,
+  // and arbitrary error properties.
+  const fields = [
+    "code",
+    "blockedField",
+    "constraint",
+    "reason",
+    "remediation",
+    "advancedModeAvailable",
+    "advancedModeWarning",
+    "dockerAttempted",
+  ] as const;
+  const diagnostic: Record<string, unknown> = {};
+  for (const field of fields) {
+    const candidate = value[field];
+    if (field === "code") {
+      if (safeDiagnosticCode(candidate)) diagnostic[field] = candidate;
+    } else if (typeof candidate === "string") diagnostic[field] = candidate.slice(0, 1000);
+    else if (typeof candidate === "boolean") diagnostic[field] = candidate;
+  }
+  if (
+    value.blockedStep &&
+    typeof value.blockedStep === "object" &&
+    !Array.isArray(value.blockedStep)
+  )
+    diagnostic.blockedStep = {
+      ...(Number.isSafeInteger(value.blockedStep.index)
+        ? { index: value.blockedStep.index }
+        : {}),
+      ...(typeof value.blockedStep.type === "string"
+        ? { type: value.blockedStep.type.slice(0, 100) }
+        : {}),
+    };
+  return Object.keys(diagnostic).length ? diagnostic : undefined;
+}
+
+function safeDiagnosticCode(value: unknown): value is "safe-mode-blocked" | "invalid-definition" | "invalid-build-context" {
+  return value === "safe-mode-blocked" || value === "invalid-definition" || value === "invalid-build-context";
 }
 
 function structuredContent(result: unknown): Record<string, unknown> {

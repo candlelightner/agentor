@@ -159,6 +159,8 @@ const GROUP_ADMIN_TOOLS = new Set([
   "images.build-status",
   "images.build-logs",
   "images.build-cancel",
+  "images.validation-retry",
+  "images.test-worker",
   "images.promote",
   "images.rollback",
   "networks.list",
@@ -1728,6 +1730,8 @@ export class ManagementMcpStore {
       "images.delete-version",
       "images.build",
       "images.build-cancel",
+      "images.validation-retry",
+      "images.test-worker",
       "images.promote",
       "images.rollback",
     ]);
@@ -1840,19 +1844,40 @@ export class ManagementMcpStore {
       if (!build.groupId || !manageableIds.has(build.groupId))
         throw groupResourceNotFound();
       if (name === "images.build-status")
-        return catalog.publicBuild(buildId, ownerId, true);
+        return groupImageStatus(catalog.publicBuild(buildId, ownerId, true));
       if (name === "images.build-logs")
-        return {
-          logs: catalog.logs(buildId, ownerId, true, Number(args.after || 0)),
-        };
+      return imageBuildLogs(
+        catalog,
+        buildId,
+        ownerId,
+        Number(args.after || 0),
+        Number(args.limit || 200),
+      );
       return catalog.cancelBuild(buildId, ownerId, true);
     }
     manageableDefinition();
     if (name === "images.build")
-      return catalog.startBuild(definitionId, ownerId, true, {
+      return groupImageAccepted(await catalog.startBuild(definitionId, ownerId, true, {
         builder: args.builder === "fake" ? "fake" : "controlled",
         baseImage: args.baseImage,
-      });
+        requestId: args.requestId,
+      }));
+    if (name === "images.validation-retry")
+      return groupImageAccepted(await (catalog as any).startValidation(
+        definitionId,
+        String(args.version || ""),
+        ownerId,
+        true,
+        { requestId: args.requestId },
+      ));
+    if (name === "images.test-worker")
+      return groupImageAccepted(await (catalog as any).startTestWorker(
+        definitionId,
+        String(args.version || ""),
+        ownerId,
+        true,
+        { requestId: args.requestId, displayName: args.displayName },
+      ));
     if (name === "images.delete") {
       await catalog.removeDefinition(definitionId, ownerId, true);
       return { deleted: true };
@@ -2363,6 +2388,16 @@ function validateToolArguments(name: string, args: Record<string, unknown>) {
     ? (schema as any).required
     : [];
   for (const key of required) {
+    // Image jobs are durable and owner-scoped in storage. Their follow-up
+    // action descriptors intentionally carry only buildId; the owner is
+    // resolved below from that job before dispatch.
+    if (
+      key === "ownerId" &&
+      ["images.build-status", "images.build-logs", "images.build-cancel"].includes(name) &&
+      typeof args.buildId === "string" &&
+      args.buildId
+    )
+      continue;
     const value = args[key];
     const property = (schema as any)?.properties?.[key] || {};
     const declaredType = property.type;
@@ -2394,6 +2429,12 @@ async function compatibleDomainArguments(
       .list("", true)
       .find((item) => item.id === args.definitionId);
     if (definition) return { ...args, ownerId: definition.ownerId };
+  }
+  if (name.startsWith("images.") && typeof args.buildId === "string") {
+    const catalog = useImageCatalogManager();
+    await catalog.init();
+    const build = catalog.build(args.buildId, "", true);
+    return { ...args, ownerId: build.ownerId };
   }
   if (name === "backups.create" && Array.isArray(args.workspaceIds)) {
     const first = useContainerManager().get(String(args.workspaceIds[0] || ""));
@@ -2745,6 +2786,61 @@ function normalizeProposal(value: any): Proposal | undefined {
       ? { appliedAt: value.appliedAt }
       : {}),
   };
+}
+
+/** Image catalog jobs are shared by the platform and group MCP adapters. Keep
+ * the log page and action descriptors identical, except that group callers do
+ * not need (or get to choose) an owner id. */
+function imageBuildLogs(
+  catalog: any,
+  buildId: string,
+  ownerId: string,
+  after: number,
+  limit: number,
+) {
+  const boundedLimit = Number.isSafeInteger(limit) && limit > 0
+    ? Math.min(limit, 1000)
+    : 200;
+  if (typeof catalog.logPage === "function")
+    return catalog.logPage(buildId, ownerId, true, {
+      after: Math.max(0, after || 0),
+      limit: boundedLimit,
+    });
+  return {
+    logs: catalog.logs(buildId, ownerId, true, Math.max(0, after || 0)),
+    after: Math.max(0, after || 0),
+    limit: boundedLimit,
+  };
+}
+function groupImageAccepted(result: any) {
+  const buildId = typeof result?.id === "string" ? result.id : result?.jobId;
+  if (!buildId) return result;
+  const arguments_ = { buildId };
+  const active = result?.status === "queued" || result?.status === "running";
+  return {
+    ...result,
+    accepted: true,
+    jobId: buildId,
+    message: result.message || (result?.operation === "validation" ? "Validation started" : result?.operation === "test-worker" ? "Test-worker creation started" : "Build started"),
+    nextActions: {
+      status: { tool: "images.build-status", arguments: arguments_ },
+      logs: { tool: "images.build-logs", arguments: arguments_ },
+      ...(active
+        ? {
+            cancel: {
+              tool: "images.build-cancel",
+              arguments: arguments_,
+            },
+          }
+        : {}),
+    },
+  };
+}
+function groupImageStatus(result:any){
+  const buildId=typeof result?.id==="string"?result.id:result?.jobId;
+  if(!buildId)return result;
+  const arguments_={buildId},active=result.status==="queued"||result.status==="running";
+  return{...result,nextActions:{status:{tool:"images.build-status",arguments:arguments_},logs:{tool:"images.build-logs",arguments:arguments_},...(active?{cancel:{tool:"images.build-cancel",arguments:arguments_}}:{}),...((result.outcome==="validation-unavailable"||result.outcome==="built-incompatible")&&result.definitionId&&result.version?{retryValidation:{tool:"images.validation-retry",arguments:{definitionId:result.definitionId,version:result.version}}}:{})}};
 }
 
 function validAudit(value: any): value is Audit {

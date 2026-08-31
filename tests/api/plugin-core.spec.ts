@@ -6,6 +6,7 @@ import { PluginDefinitionStore } from "../../orchestrator/server/utils/plugin-de
 import { PluginInstallationStore } from "../../orchestrator/server/utils/plugin-installation-store";
 import {
   validateDefinitionScope,
+  validatePluginImageBuild,
   validatePluginManifest,
 } from "../../orchestrator/server/utils/plugin-manifest";
 import {
@@ -79,6 +80,46 @@ test("desktop plugin actions use Agentor's authenticated noVNC route", () => {
     actions: [{ id: "desktop", label: "Open desktop", kind: "private-ui", portId: "web", path: "/vnc.html", openMode: "desktop" }],
   });
   expect(parsed.actions?.[0]?.openMode).toBe("desktop");
+});
+
+test("plugin image build contributions are secret-free, structured, and do not carry runtime state", () => {
+  const script = Buffer.from("#!/bin/sh\necho plugin\n").toString("base64");
+  const parsed = validatePluginManifest({
+    ...manifest(),
+    imageBuild: {
+      contextFiles: [
+        {
+          path: "install-plugin.sh",
+          contentBase64: script,
+          role: "script",
+          destination: "/opt/agentor-context/plugins/install-plugin.sh",
+        },
+      ],
+      provisioning: [
+        { type: "packages", manager: "apt", packages: ["jq"] },
+        { type: "script", path: "install-plugin.sh", interpreter: "sh" },
+      ],
+      validation: { command: { argv: ["test", "-x", "/bin/sh"] }, defaultRequired: true },
+      requiresAdvancedProvisioning: true,
+    },
+  });
+  expect(parsed.imageBuild).toEqual({
+    contextFiles: [{ path: "install-plugin.sh", contentBase64: script, role: "script", destination: "/opt/agentor-context/plugins/install-plugin.sh" }],
+    provisioning: [
+      { type: "packages", manager: "apt", packages: ["jq"] },
+      { type: "script", path: "install-plugin.sh", interpreter: "sh" },
+    ],
+    validation: {
+      command: { argv: ["test", "-x", "/bin/sh"], mode: "oneshot", timeoutSeconds: 30, maxOutputBytes: 256 * 1024 },
+      defaultRequired: true,
+    },
+    requiresAdvancedProvisioning: true,
+  });
+  expect(() => validatePluginImageBuild({ provisioning: [{ type: "command", command: "echo ok" }], environment: { secretKeys: ["TOKEN"] } })).toThrow(/unsupported fields/);
+  expect(() => validatePluginImageBuild({ contextFiles: [{ path: "Dockerfile", contentBase64: script }] })).toThrow(/path is invalid/);
+  expect(() => validatePluginImageBuild({ contextFiles: [{ path: "secret.txt", contentBase64: Buffer.from("TOKEN=github_pat_abcdefghijklmnopqrstuvwxyz").toString("base64") }] })).toThrow(/secret values/);
+  expect(() => validatePluginImageBuild({ provisioning: [{ type: "script", path: "missing.sh", interpreter: "sh" }] })).toThrow(/must reference a context script/);
+  expect(() => validatePluginImageBuild({ validation: { command: { argv: ["true"], mode: "background" } } })).toThrow(/must be oneshot/);
 });
 
 test("plugin SVG sanitizer rejects active content and preserves valid self-closing markup", () => {

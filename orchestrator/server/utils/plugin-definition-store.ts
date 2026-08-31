@@ -112,6 +112,61 @@ export class PluginDefinitionStore extends UserScopedJsonStore<
     return structuredClone(definition);
   }
 
+  /** Recover a reusable Git-catalog definition under its durable catalog id.
+   * Image definitions may refer to that id, so minting a replacement id would
+   * sever plugin-composition references after disaster recovery. */
+  async importRecovered(
+    input: CreatePluginDefinitionInput & { id: string },
+  ): Promise<PluginDefinitionRecord> {
+    if (!/^[a-zA-Z0-9._-]{1,100}$/.test(input.id))
+      throw Object.assign(new Error("Recovered plugin definition id is invalid"), {
+        statusCode: 400,
+      });
+    const identity = validateDefinitionScope({
+      scope: input.scope,
+      ownerId: input.ownerId,
+      groupId: input.groupId,
+      workerId: input.workerId,
+    });
+    if (identity.scope === "platform" || identity.scope === "worker")
+      throw Object.assign(
+        new Error("Recovered plugin definition scope is unsupported"),
+        { statusCode: 400 },
+      );
+    const manifest = validatePluginManifest(input.manifest);
+    const definitionHash = pluginDefinitionHash(manifest);
+    const existing = this.getById(input.id);
+    if (existing) {
+      if (
+        existing.userId === identity.ownerId &&
+        existing.scope === identity.scope &&
+        existing.groupId === identity.groupId &&
+        existing.definitionHash === definitionHash
+      )
+        return existing;
+      throw Object.assign(
+        new Error("Recovered plugin definition id conflicts with local data"),
+        { statusCode: 409 },
+      );
+    }
+    const stamp = new Date().toISOString();
+    const definition: PluginDefinitionRecord = {
+      schemaVersion: 1,
+      id: input.id,
+      userId: identity.ownerId,
+      scope: identity.scope,
+      ...(identity.groupId ? { groupId: identity.groupId } : {}),
+      name: manifest.name,
+      builtIn: false,
+      manifest,
+      definitionHash,
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    await this.setItem(identity.ownerId!, definition);
+    return structuredClone(definition);
+  }
+
   async update(
     id: string,
     manifestInput: unknown,

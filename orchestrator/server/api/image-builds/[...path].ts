@@ -31,12 +31,18 @@ export default defineEventHandler(async (event) => {
     if (parts.length === 1 && event.method === "DELETE")
       return manager.cancelBuild(id, ctx.user.id, admin);
     if (parts[1] === "logs" && event.method === "GET") {
+      const query = getQuery(event);
+      if (query.limit !== undefined || query.format === "json")
+        return manager.logPage(id, ctx.user.id, admin, {
+          after: Number(query.after) || 0,
+          limit: Number(query.limit) || 200,
+        });
       setResponseHeader(event, "Content-Type", "text/plain; charset=utf-8");
       return manager.logs(
         id,
         ctx.user.id,
         admin,
-        Number(getQuery(event).after) || 0,
+        Number(query.after) || 0,
       );
     }
     throw createError({
