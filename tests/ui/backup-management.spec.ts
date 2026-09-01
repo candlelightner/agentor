@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { randomBytes } from 'node:crypto';
 import { goToDashboard } from '../helpers/ui-helpers';
 
 async function mock(page: Page) {
@@ -119,6 +120,262 @@ test('selects one workspace from a multi-worker backup and posts that exact rest
   await expect(panel.getByLabel('worker-2')).toBeChecked();
   await panel.getByLabel('worker-1').uncheck();
   await panel.getByRole('button',{name:'Start restore'}).click();
-  expect(restoreBody).toEqual({target:'new',displayName:'',confirmOverwrite:false,workspaceIds:['worker-2']});
+  expect(restoreBody).toMatchObject({target:'new',displayName:'',confirmOverwrite:false,workspaceIds:['worker-2']});
+  expect(restoreBody.requestId).toMatch(/^ui-restore-/);
 });
 test('an administrator configures write-only Google OAuth installation credentials before linking',async({page})=>{const m=await open(page);const panel=m.locator('[data-testid="google-oauth-installation"]');await expect(panel).toBeVisible();await panel.getByLabel('Client ID').fill('dashboard-client');await panel.getByLabel('Redirect URI').fill('https://dash.example/api/backup-providers/google/oauth/callback');await panel.getByLabel('Client secret').fill('DO_NOT_RENDER_SECRET');await panel.getByRole('button',{name:'Save Google OAuth configuration'}).click();await expect(panel).toContainText('Configured from installation');await expect(panel).not.toContainText('DO_NOT_RENDER_SECRET')});
+test('discovers a remote backup and keeps recovery material out of persistent browser state', async ({ page }) => {
+  const rawKey = randomBytes(32).toString('base64');
+  let discoveryRequests = 0;
+  await page.route('**/api/backups/recovery-key', route => route.fulfill({
+    headers: { 'cache-control': 'no-store' },
+    json: { activeFingerprint: 'sha256:current', keys: [{ fingerprint: 'sha256:current', active: true, source: 'generated' }] },
+  }));
+  await page.route('**/api/backups/remote', async route => {
+    if (route.request().method() === 'POST') {
+      discoveryRequests++;
+      return route.fulfill({ status: 202, json: { jobId: 'discover-1', status: 'queued' } });
+    }
+    return route.fulfill({ json: [{ id: 'remote-1', provider: 'fake', createdAt: '2026-01-02T00:00:00Z', size: 42, formatVersion: 2, keyFingerprint: 'sha256:remote', keyAvailable: false, state: 'missing-key', integrityStatus: 'unverified', blockedReason: 'Recovery key sha256:remote is not available on this installation.' }] });
+  });
+  await page.route('**/api/backups/recovery-key/reveal', async route => {
+    expect(await route.request().postDataJSON()).toEqual({ password: 'fresh-password' });
+    await route.fulfill({ headers: { 'cache-control': 'private, no-store' }, json: { keyMaterial: rawKey, fingerprint: 'sha256:current' } });
+  });
+  const m = await open(page);
+  await expect(m.getByTestId('recovery-key-fingerprints')).toContainText('sha256:current');
+  await expect(m.getByTestId('remote-backup-discovery')).toContainText('missing-key');
+  await m.getByRole('button', { name: 'Scan provider' }).click();
+  await expect.poll(() => discoveryRequests).toBe(1);
+  await m.getByLabel(/Current password/).fill('fresh-password');
+  await m.getByRole('button', { name: 'Reveal recovery key' }).click();
+  await expect(m.getByTestId('revealed-recovery-key')).toHaveText(rawKey);
+  expect(await page.evaluate(() => JSON.stringify({
+    local: Object.fromEntries(Object.keys(localStorage).map(key => [key, localStorage.getItem(key)])),
+    session: Object.fromEntries(Object.keys(sessionStorage).map(key => [key, sessionStorage.getItem(key)])),
+    nuxt: (window as any).__NUXT__,
+  }))).not.toContain(rawKey);
+  await m.getByRole('button', { name: 'Hide key' }).click();
+  await expect(m.getByTestId('revealed-recovery-key')).toHaveCount(0);
+  expect(await page.content()).not.toContain(rawKey);
+});
+test('clears recovery material after a failed fresh reauthentication and after exporting a kit', async ({ page }) => {
+  const inputMaterial = 'RECOVERY_IMPORT_DO_NOT_KEEP';
+  const exportedMaterial = randomBytes(32).toString('base64');
+  let revealRequests = 0;
+  let importedBody: any;
+  const exportBodies: any[] = [];
+  await page.route('**/api/backups/recovery-key', route => route.fulfill({
+    json: {
+      activeFingerprint: 'sha256:current',
+      keys: [
+        { fingerprint: 'sha256:current', active: true, source: 'generated' },
+        { fingerprint: 'sha256:legacy', active: false, source: 'legacy' },
+      ],
+    },
+  }));
+  await page.route('**/api/backups/recovery-key/import', async route => {
+    importedBody = await route.request().postDataJSON();
+    await route.fulfill({
+      headers: { 'cache-control': 'private, no-store' },
+      json: { imported: true, fingerprint: 'sha256:imported', matchingRemoteBackupIds: [] },
+    });
+  });
+  await page.route('**/api/backups/recovery-key/reveal', async route => {
+    revealRequests++;
+    expect(await route.request().postDataJSON()).toEqual({ password: 'incorrect-password' });
+    await route.fulfill({ status: 401, json: { statusMessage: 'Fresh reauthentication required' } });
+  });
+  await page.route('**/api/backups/recovery-key/export', async route => {
+    exportBodies.push(await route.request().postDataJSON());
+    await route.fulfill({
+      headers: { 'cache-control': 'private, no-store' },
+      json: { formatVersion: 2, fingerprint: 'sha256:current', keyMaterial: exportedMaterial },
+    });
+  });
+  const m = await open(page);
+  await m.getByLabel('Import recovery key or kit').fill(inputMaterial);
+  await m.getByRole('button', { name: 'Import recovery material' }).click();
+  await expect.poll(() => importedBody).toEqual({ kit: inputMaterial });
+  await expect(m.getByLabel('Import recovery key or kit')).toHaveValue('');
+  expect(await page.content()).not.toContain(inputMaterial);
+
+  await m.getByLabel('Import recovery key or kit').fill(inputMaterial);
+  await m.getByLabel(/Current password/).fill('incorrect-password');
+  await m.getByRole('button', { name: 'Reveal recovery key' }).click();
+  await expect.poll(() => revealRequests).toBe(1);
+  await expect(m).toContainText('Fresh reauthentication required');
+  await expect(m.getByLabel('Import recovery key or kit')).toHaveValue('');
+  await expect(m.getByLabel(/Current password/)).toHaveValue('');
+  expect(await page.content()).not.toContain(inputMaterial);
+
+  await m.getByLabel(/Current password/).fill('fresh-password');
+  const download = page.waitForEvent('download');
+  await m.getByRole('button', { name: 'Download recovery kit' }).click();
+  await (await download).cancel();
+  expect(exportBodies[0]).toEqual({ password: 'fresh-password' });
+  await expect(m.getByLabel(/Current password/)).toHaveValue('');
+  expect(await page.evaluate(() => JSON.stringify({
+    local: Object.fromEntries(Object.keys(localStorage).map(key => [key, localStorage.getItem(key)])),
+    session: Object.fromEntries(Object.keys(sessionStorage).map(key => [key, sessionStorage.getItem(key)])),
+    nuxt: (window as any).__NUXT__,
+  }))).not.toContain(exportedMaterial);
+  expect(await page.content()).not.toContain(exportedMaterial);
+
+  await m.getByLabel(/Current password/).fill('historical-password');
+  const historicalDownload = page.waitForEvent('download');
+  await m.getByRole('button', { name: 'Export this key' }).nth(1).click();
+  await (await historicalDownload).cancel();
+  expect(exportBodies[1]).toEqual({
+    password: 'historical-password',
+    fingerprint: 'sha256:legacy',
+  });
+});
+test('inspects and adopts a ready remote-only backup asynchronously', async ({ page }) => {
+  const remote = {
+    id: 'remote-ready', provider: 'fake', createdAt: '2026-01-03T00:00:00Z', size: 2048,
+    formatVersion: 2, keyFingerprint: 'sha256:imported', keyAvailable: true,
+    state: 'ready-to-adopt', integrityStatus: 'unverified', knownLocally: false,
+    workspaceMembers: [{ id: 'source-worker', displayName: 'Recovered worker' }],
+  };
+  let adoptionBody: any;
+  await page.route('**/api/backups/remote/remote-ready/adopt', async route => {
+    adoptionBody = await route.request().postDataJSON();
+    await route.fulfill({ status: 202, json: { jobId: 'adopt-1', status: 'queued' } });
+  });
+  await page.route('**/api/backups/remote/remote-ready', route => route.fulfill({
+    json: { ...remote, sourceInstallationId: 'installation-a', restorable: false, blockedReason: 'Adopt and verify this provider object before restoring it.' },
+  }));
+  await page.route('**/api/backups/remote', route => route.fulfill({ json: [remote] }));
+  const m = await open(page);
+  const card = m.getByTestId('discovered-backup-remote-ready');
+  await expect(card).toContainText('remote only');
+  await expect(card).toContainText('recovery key: available');
+  await card.getByRole('button', { name: 'Inspect' }).click();
+  await expect(m).toContainText('Source installation: installation-a');
+  await expect(m).toContainText('not until adoption and verification complete');
+  await card.getByRole('button', { name: 'Adopt locally' }).click();
+  await expect.poll(() => adoptionBody).toBeTruthy();
+  expect(adoptionBody.requestId).toMatch(/^ui-adopt-/);
+  await expect(m).toContainText('queued · queued');
+});
+test('shows an unresolved custom-image dependency and sends only an explicit replacement or acknowledged workspace-only choice', async ({ page }) => {
+  const unresolved = {
+    id: 'backup-custom-image', workspaceIds: ['worker-1'], provider: 'fake',
+    createdAt: '2026-01-03T00:00:00Z', sizeBytes: 4096, integrityVerified: true,
+    workspaceMembers: [{ id: 'worker-1', displayName: 'Alpha worker' }],
+    reconstruction: [{
+      workspaceId: 'worker-1', displayName: 'Alpha worker',
+      image: { kind: 'custom', definitionId: 'captured-image', version: '3', digest: 'sha256:captured', recoveryAvailable: true },
+      pluginDefinitions: [], desiredPluginCount: 0, requiredSecretNames: [],
+    }],
+    dependencies: [{
+      kind: 'image', id: 'captured-image:3@sha256:captured', workspaceId: 'worker-1',
+      status: 'replacement-required', required: true,
+      reason: 'The captured immutable image is unavailable on this installation.',
+    }],
+  };
+  const restoreBodies: any[] = [];
+  let recoveryJob: any;
+  await page.route('**/api/backups', async route => {
+    if (route.request().method() === 'POST') return route.fulfill({ status: 202, json: { id: 'backup-job', status: 'queued', phase: 'queued', progress: 0 } });
+    return route.fulfill({ json: { backups: [unresolved], jobs: recoveryJob ? [recoveryJob] : [] } });
+  });
+  let imageRecoveryBody: any;
+  await page.route('**/api/backups/backup-custom-image/image-recovery', async route => {
+    imageRecoveryBody = await route.request().postDataJSON();
+    recoveryJob = {
+      id: 'image-recovery-1', artifactId: 'backup-custom-image', workspaceId: 'worker-1',
+      operation: 'dependency-resolution', status: 'succeeded', phase: 'complete', progress: 100,
+      recoveredImageDefinitionId: 'recovered-definition', recoveredImageBuildId: 'image-build-1',
+    };
+    await route.fulfill({
+      status: 202,
+      json: {
+        jobId: 'image-recovery-1',
+        status: 'queued',
+        next: {
+          status: '/api/backup-jobs/image-recovery-1',
+          logs: '/api/backups/jobs/image-recovery-1/logs',
+          cancel: '/api/backup-jobs/image-recovery-1',
+        },
+      },
+    });
+  });
+  await page.route('**/api/backups/backup-custom-image/restore', async route => {
+    restoreBodies.push(await route.request().postDataJSON());
+    await route.fulfill({ status: 202, json: { jobId: `restore-${restoreBodies.length}` } });
+  });
+  const m = await open(page);
+  await m.getByRole('button', { name: 'Restore' }).click();
+  const panel = m.getByTestId('restore-backup');
+  const dependencies = panel.getByTestId('restore-image-dependencies');
+  await expect(dependencies).toContainText('Agentor will never silently replace');
+  await expect(dependencies).toContainText('captured-image');
+  await expect(dependencies).toContainText('captured immutable image is unavailable');
+  await expect(dependencies.getByLabel('Image resolution')).toHaveValue('replacement');
+  await expect(panel.getByRole('button', { name: 'Start restore' })).toBeDisabled();
+  await dependencies.getByRole('button', { name: 'Recover definition & build' }).click();
+  await expect.poll(() => imageRecoveryBody).toMatchObject({ workspaceId: 'worker-1', startBuild: true, requestId: expect.stringMatching(/^ui-image-recovery-/) });
+  await expect(dependencies).toContainText('Recovery job image-recovery-1: queued · queued');
+  await page.waitForTimeout(1_600);
+  await expect(dependencies).toContainText('Recovered definition: recovered-definition');
+  await expect(dependencies).toContainText('Image build: image-build-1');
+  await expect(dependencies).toContainText('compatibility validation to succeed, then retry restore');
+
+  await dependencies.getByLabel('Replacement definition ID').fill('replacement-image');
+  await dependencies.getByLabel('Replacement version').fill('9');
+  await panel.getByRole('button', { name: 'Start restore' }).click();
+  expect(restoreBodies[0]).toMatchObject({
+    target: 'new', workspaceIds: ['worker-1'],
+    imageResolutions: {
+      'worker-1': { mode: 'replacement', imageDefinitionId: 'replacement-image', imageVersion: '9' },
+    },
+  });
+  expect(restoreBodies[0].requestId).toMatch(/^ui-restore-/);
+
+  await m.getByRole('button', { name: 'Restore' }).click();
+  const workspaceOnlyPanel = m.getByTestId('restore-backup');
+  await workspaceOnlyPanel.getByLabel('Image resolution').selectOption('workspace-only');
+  await expect(workspaceOnlyPanel).toContainText('only the workspace and portable configuration are restored');
+  await workspaceOnlyPanel.getByRole('button', { name: 'Start restore' }).click();
+  expect(restoreBodies[1]).toMatchObject({
+    target: 'new', workspaceIds: ['worker-1'],
+    imageResolutions: { 'worker-1': { mode: 'workspace-only', acknowledged: true } },
+  });
+});
+test('only offers definition recovery for a server-marked recipe and surfaces a safe recovery-start error', async ({ page }) => {
+  const artifact = {
+    id: 'backup-no-recipe', workspaceIds: ['worker-1', 'worker-2'], provider: 'fake', createdAt: '2026-01-04T00:00:00Z', sizeBytes: 10,
+    workspaceMembers: [{ id: 'worker-1' }, { id: 'worker-2' }],
+    reconstruction: [
+      { workspaceId: 'worker-1', image: { kind: 'custom', definitionId: 'no-recipe', version: '1', digest: 'sha256:no-recipe' }, pluginDefinitions: [], desiredPluginCount: 0, requiredSecretNames: [] },
+      { workspaceId: 'worker-2', image: { kind: 'unmanaged', digest: 'sha256:unmanaged' }, pluginDefinitions: [], desiredPluginCount: 0, requiredSecretNames: [] },
+    ],
+    dependencies: [
+      { kind: 'image', workspaceId: 'worker-1', id: 'no-recipe:1', status: 'replacement-required', required: true, reason: 'No portable recipe is available.' },
+      { kind: 'image', workspaceId: 'worker-2', id: 'unmanaged', status: 'replacement-required', required: true, reason: 'The image was unmanaged.' },
+    ],
+  };
+  await page.route('**/api/backups', route => route.fulfill({ json: { backups: [artifact], jobs: [] } }));
+  const m = await open(page);
+  await m.getByRole('button', { name: 'Restore' }).click();
+  await expect(m.getByTestId('restore-image-dependencies').getByRole('button', { name: 'Recover definition & build' })).toHaveCount(0);
+
+  const recoverable = {
+    ...artifact,
+    id: 'backup-recovery-error',
+    workspaceIds: ['worker-1'], workspaceMembers: [{ id: 'worker-1' }],
+    reconstruction: [{ ...artifact.reconstruction[0], image: { ...artifact.reconstruction[0].image, recoveryAvailable: true } }],
+    dependencies: [artifact.dependencies[0]],
+  };
+  await m.getByRole('button', { name: 'Cancel' }).click();
+  await m.getByLabel('Close').click();
+  await page.unroute('**/api/backups');
+  await page.route('**/api/backups', route => route.fulfill({ json: { backups: [recoverable], jobs: [] } }));
+  await page.route('**/api/backups/backup-recovery-error/image-recovery', route => route.fulfill({ status: 409, json: { statusMessage: 'The recovered definition cannot be built yet.' } }));
+  const reopened = await open(page);
+  await reopened.getByRole('button', { name: 'Restore' }).click();
+  await reopened.getByTestId('restore-image-dependencies').getByRole('button', { name: 'Recover definition & build' }).click();
+  await expect(reopened).toContainText('The recovered definition cannot be built yet.');
+});

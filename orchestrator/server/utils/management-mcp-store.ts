@@ -120,7 +120,9 @@ const GROUP_ADMIN_TOOLS = new Set([
   "backups.create",
   "backups.paths.list",
   "backups.status",
+  "backups.logs",
   "backups.cancel",
+  "backups.retry",
   "locks.get",
   "locks.set",
   "locks.remove",
@@ -287,7 +289,9 @@ const GROUP_ADMIN_EXPORT_JOB_TOOLS = new Set([
 ]);
 const GROUP_ADMIN_BACKUP_JOB_TOOLS = new Set([
   "backups.status",
+  "backups.logs",
   "backups.cancel",
+  "backups.retry",
 ]);
 // Group principals may create and inspect path selections for workers in their
 // subtree (and for their own administrative workspace).  The owner is always

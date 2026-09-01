@@ -32,6 +32,88 @@ Additional directories selected in backup settings are also rebuild-persistent. 
 
 Worker-group headers provide recursive Stop all, Rebuild all, and Archive all operations for ordinary workers. The same operations are available through the management MCP as `groups.workers.stop`, `groups.workers.rebuild`, and `groups.workers.archive`. They include descendant groups, preserve workspace/configuration and direct group membership, and never act on platform/group administrative workspaces. Supply a write-only `lockPasswords` map when any member is protected; lock validation is all-or-nothing before the first worker changes. Results identify targeted, succeeded, skipped, and failed worker IDs. MCP calls default to a 300-second caller deadline (configurable from 1 to 900 seconds); a timeout does not cancel or duplicate the already-running serialized batch.
 
+## Cross-instance backup recovery
+
+Backups are portable recovery artifacts, not merely local database rows. A
+fresh Agentor installation can link the same backup provider account, scan for
+remote Agentor objects, inspect their safe metadata, import the matching
+recovery material, adopt a selected artifact, and restore selected workspaces
+into newly created workers. This is additive to existing local backup and
+restore flows.
+
+The remote flow is asynchronous and durable:
+
+1. Start a provider scan and poll its job state/logs.
+2. Inspect a discovered record. It reports whether it is already adopted,
+   incomplete, unsupported, damaged, inaccessible, blocked by a missing key,
+   or ready to adopt.
+3. Import a matching recovery kit if needed, then start adoption. Adoption
+   downloads, authenticates/decrypts, integrity-checks, and hardened-manifest
+   inspects the remote archive before it becomes a local artifact.
+4. Inspect reconstruction dependencies and start a selective restore. A
+   failed download, validation, or dependency preflight leaves the discovered
+   or adopted record available for correction and retry.
+
+For an unresolved custom image, inspection carries only the server-derived
+`recoveryAvailable` boolean when an encrypted, secret-free reconstruction
+recipe is present. It never sends the recipe or build context to the browser.
+When available, start `backups.image-recovery.start` (or
+`POST /api/backups/:artifactId/image-recovery` with `workspaceId`,
+`requestId`, and `startBuild: true`). The durable recovery job re-downloads,
+authenticates/decrypts, and validates the provider artifact before importing
+an owner-scoped recovered definition and starting the existing controlled
+image build. The backup job exposes safe recovered-definition/build IDs and
+the normal status/log/cancel next actions; the image build then has its own
+asynchronous status, logs, cancellation, and Agentor compatibility-validation
+lifecycle. Restore stays blocked until that build is Ready (or Ready with
+warnings where applicable), then must be retried. There is no equivalent
+action for unmanaged images or backups without `recoveryAvailable`.
+
+V2 archives (`AGENTOR-BACKUP-2`) use AES-256-GCM and carry an authenticated,
+bounded discovery header with the recovery-key fingerprint and non-secret
+backup/source/workspace metadata. V1 (`AGENTOR-BACKUP-1`) archives remain
+readable for compatibility. Agentor's owner-scoped encrypted keyring keeps
+the active, imported, and historical keys required for old artifacts. Losing
+a key still makes its backups unreadable, so preserve exported recovery kits
+outside the provider account.
+
+Displaying a fingerprint is safe; revealing or exporting raw recovery material
+is intentionally a human dashboard action requiring fresh server-side
+reauthentication (password verification, or a session minted by a newly
+completed passkey sign-in). Those responses are non-cacheable. Normal API,
+MCP, logs, audit records, telemetry, and browser state never expose raw key
+material. Recovery kits contain only key material plus minimal recovery
+metadata—not provider OAuth tokens, Git credentials, worker secrets, or
+unrelated account data.
+
+Portable worker manifests preserve the non-secret relationship to the custom
+image definition/version/digest, catalog/runtime identity where available,
+plugin definitions and desired installation state, non-secret plugin
+configuration, and required secret *names*. They do not preserve secret
+values, allocated ports/displays, GUI sessions, process IDs, or temporary
+readiness state. Restores reallocate those runtime resources through the
+normal worker/plugin path. If an exact custom image cannot be resolved, the
+restore is stopped until the operator recovers/syncs and rebuilds the image,
+pulls its immutable digest, chooses an explicit replacement, or explicitly
+acknowledges a workspace-only restore; Agentor never silently labels a default
+image substitution as faithful recovery.
+
+Management MCP follows the durable `start → status → logs → cancel/retry`
+protocol. `backups.discovery.start`, `backups.adopt`,
+`backups.image-recovery.start`, and `backups.restore`
+return a job identifier plus exact `nextActions` for `backups.status`,
+`backups.logs`, and active-job `backups.cancel`. Logs are bounded incremental
+pages (`after`, `limit`). A caller can provide `requestId` for discovery,
+adoption, image recovery, or restore: retrying the same request returns its original job,
+whereas reusing the identity with different arguments is rejected.
+
+Google Drive uses the least-privileged `drive.file` scope. Cross-instance
+discovery therefore requires the same Google account **and the same OAuth
+client/app identity** that created the files. A different OAuth client cannot
+normally enumerate the prior client's `drive.file` objects merely because it
+uses the same account. See [Google Drive backup setup](google-drive-backups.md)
+for the exact OAuth setup and recovery procedure.
+
 ## Agent Usage Monitoring
 
 Polls agent usage APIs to show each user's remaining capacity in the sidebar. Works for OAuth-authenticated agents (per-user credential files at `<DATA_DIR>/users/<userId>/credentials/{claude,codex,gemini}.json` for the three polled agents, or the per-user `CLAUDE_CODE_OAUTH_TOKEN` set in the Account modal). API key auth has no usage endpoints. **Kilo is a fourth Account credential/reset row** (its shared per-user auth now lives at `<DATA_DIR>/users/<userId>/kilo/data/auth.json`, directory-bound into every worker because Kilo atomically temp+renames `auth.json`), but it has **no usage-monitoring endpoint** and is not polled by `UsageChecker` — usage monitoring covers only Claude, Codex, and Gemini.
@@ -89,16 +171,20 @@ Download a complete, portable snapshot of a worker and restore it as a brand-new
 
 The generated `.tar` contains:
 - `manifest.json` — the worker's own config + the embedded non-secret environment definition + its port/domain mappings. Environment variable values and domain basic-auth credentials are excluded.
+- `reconstruction.json` — versioned, secret-free image identity and rebuild recipe (definition/version/digest, controlled build inputs, and Git provenance where available), plus required secret names only.
+- `plugins.json` when applicable — reusable plugin manifests and desired installation state. Secret values and stale runtime allocations such as ports, displays, sessions, process IDs, and readiness state are excluded and reminted on restore.
 - `workspace.tar.gz`, `agents.tar.gz` — the two persistent volumes (per-user OAuth credential files, the shared Kilo config directory, the shared Kilo data directory, and the legacy `.kilo/data/auth.json` inside the agents dir are **stripped** so an export never leaks account-level secrets, Kilo sessions/history, or configuration).
 - `rootfs.tar.gz` — parallel level-1 gzip of `docker export` (captures non-volume changes). v3 avoids the historical single-core compression timeout while bounding temporary/artifact storage. This is still an explicit advanced option because it can be very large; workspace-only is the default. Import remains compatible with legacy v1 gzip and transitional v2 raw `rootfs.tar` bundles.
 
 Full-rootfs restore validates the complete inner tar before giving it to Docker, then Docker creates a new local image layer. On feature-rich worker images—especially with nested Docker storage—this can take tens of minutes. The validation pass is intentional protection against unsafe paths and archive expansion; the dashboard should be left open only for feedback, not to keep export jobs alive. Prefer workspace-only exports and reproducible custom image definitions for ordinary recovery.
 
-**Import** (`POST /api/containers/import`, raw `.tar` body streamed to disk, `ContainerManager.importWorker`): admits one import per user, rejects oversized bodies while streaming, preflights temporary space, strictly validates the outer manifest/tar, and scans compressed inner volume tars plus current/legacy compressed or transitional v2 uncompressed rootfs tar for expanded-size, entry-count, and traversal limits before any Docker mutation. It then mints a fresh UUID worker, resolves/recreates the environment, `docker import`s the rootfs into a per-worker image (`agentor-import-<id>`, replicating the standard image's entrypoint/env so it boots — falls back to the standard image on any failure), creates the container **stopped**, restores the volumes via `putArchive`, starts it, then recreates the mappings (skipping conflicts / base domains not configured locally). The per-worker image link (`importedImage` on the `WorkerRecord`) survives rebuild/unarchive and is removed on permanent delete.
+**Import** (`POST /api/containers/import`, raw `.tar` body streamed to disk, `ContainerManager.importWorker`): admits one import per user, rejects oversized bodies while streaming, preflights temporary space, strictly validates the outer manifest/tar, and scans compressed inner volume tars plus current/legacy compressed or transitional v2 uncompressed rootfs tar for expanded-size, entry-count, and traversal limits before any Docker mutation. It then mints a fresh UUID worker, resolves/recreates the environment, `docker import`s the rootfs into a per-worker image (`agentor-import-<id>`, replicating the standard image's entrypoint/env so it boots), creates the container **stopped**, restores the volumes via `putArchive`, starts it, then recreates mappings and plugin desired state (skipping mapping conflicts / base domains not configured locally). Legacy or platform-image exports retain the historical standard-image fallback if rootfs import fails. A captured custom-image failure never silently substitutes the standard image: recover/rebuild the referenced definition, select an explicit replacement, or explicitly choose workspace-only restore. The per-worker image link (`importedImage` on the `WorkerRecord`) survives rebuild/unarchive and is removed on permanent delete.
 
 ## Backup key and Google Drive configuration
 
-Backups are encrypted before leaving the orchestrator. Set a high-entropy `BACKUP_ENCRYPTION_KEY`, or preserve the generated `<DATA_DIR>/backup.key` (0600, regular non-symlink file). Provider objects and workspace data are insufficient for recovery without this exact key. Keep it in protected infrastructure backup/secret storage; do not put it in a Git catalog, worker, build context, or the same Google Drive folder. There is no automatic key rotation in archive schema v1.
+Backups are encrypted before leaving the orchestrator. New artifacts use the authenticated `AGENTOR-BACKUP-2` envelope and an owner-scoped recovery key stored encrypted in `<DATA_DIR>/backup-keyring.json`; normal APIs expose fingerprints only. Backup management can reveal the current key or export the current or a historical/legacy recovery kit after fresh server-validated password or passkey-session reauthentication. Keep those kits in protected disaster-recovery storage, separate from provider artifacts, Git catalogs, workers, and build contexts. Imported historical keys are retained rather than replacing the active key.
+
+Existing `AGENTOR-BACKUP-1` artifacts remain readable. Their historical source material is `BACKUP_ENCRYPTION_KEY` or the generated `<DATA_DIR>/backup.key` (0600, regular non-symlink file), which is exposed only as a fingerprint and explicit fresh-reauthenticated recovery-kit export. Preserve it while any v1 backups remain. V1 has no embedded key identifier, so restore tries only the owner's authorized local/imported candidates and lets AES-GCM authentication determine the match.
 
 Google backup linking uses a separate OAuth client and is unrelated to Agentor login. An administrator can configure the client ID, client secret, and exact registered redirect URI ending in `/api/backup-providers/google/oauth/callback` in **Backup management**, then start the link flow without editing the orchestrator environment. The client secret is write-only and AES-GCM encrypted at rest; status never returns it. Existing `GOOGLE_BACKUP_CLIENT_ID`, `GOOGLE_BACKUP_CLIENT_SECRET`, and `GOOGLE_BACKUP_REDIRECT_URI` remain a backward-compatible fallback when no dashboard configuration exists; `GOOGLE_BACKUP_FOLDER_ID` remains optional. OAuth state is one-time and expires after ten minutes. Tokens are AES-GCM encrypted at rest and refreshed by the provider. Tests use the explicitly gated fake provider and never require a real Google account.
 
@@ -106,7 +192,7 @@ See [Google Drive backup setup](google-drive-backups.md) for the current Google 
 
 The scheduler stores exact minutes and a durable next-run timestamp. `all` resolves durable worker records, including archived workspaces. Archived reads use a read-only networkless helper. Retention keeps deletion-pending metadata when a provider delete fails so cleanup can be retried instead of silently forgetting a remote object.
 
-Each encrypted backup member is the normal credential-filtered worker export without a rootfs payload: it contains `/workspace`, filtered persistent agent data, non-secret worker/environment metadata, port/domain mappings, and missing-secret names. It does not contain the worker image/root filesystem, DinD storage, environment or secret values, OAuth credentials, or shared per-user Kilo config/data. Multi-worker artifacts retain a manifest of every member, allowing a new-worker restore to select any non-empty subset retroactively; omission restores all members. An in-place restore selects exactly one stopped original member.
+Each encrypted backup member is the normal credential-filtered worker export without a rootfs payload: it contains `/workspace`, filtered persistent agent data, non-secret worker/environment metadata, port/domain mappings, reconstruction metadata, portable plugin desired state, and missing-secret names. It does not contain the worker image/root filesystem, DinD storage, environment or secret values, OAuth credentials, shared per-user Kilo config/data, or stale plugin runtime allocations. Multi-worker artifacts retain a manifest of every member, allowing a new-worker restore to select any non-empty subset retroactively; omission restores all members. An in-place restore selects exactly one stopped original member.
 
 ## Controlled image builds and Git recovery
 

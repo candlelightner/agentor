@@ -14,6 +14,7 @@ import type { RepoConfig, MountConfig } from '../../shared/types';
 import { AGENT_CREDENTIAL_MAPPINGS } from './user-credentials';
 import { SHARED_DIRECTORY_MOUNT_POINTS } from './storage';
 import type { PortablePluginConfiguration } from './plugin-portability';
+import { MAX_RECONSTRUCTION_BYTES, parseWorkerReconstruction, type WorkerReconstruction } from './worker-reconstruction';
 
 /** Bumped when the bundle layout changes incompatibly. */
 export const WORKER_EXPORT_VERSION = 5;
@@ -59,6 +60,7 @@ export const BUNDLE_FILES = {
   agents: 'agents.tar.gz',
   backupPaths: 'backup-paths.tar.gz',
   plugins: 'plugins.json',
+  reconstruction: 'reconstruction.json',
 } as const;
 
 /** What a port mapping looks like once stripped of identity for re-creation. */
@@ -103,7 +105,7 @@ export interface WorkerExportManifest {
   portMappings: ExportedPortMapping[];
   domainMappings: ExportedDomainMapping[];
   /** Which payloads the bundle contains. */
-  contents: { rootfs: boolean; workspace: boolean; agents: boolean; backupPaths?: boolean; plugins?: boolean };
+  contents: { rootfs: boolean; workspace: boolean; agents: boolean; backupPaths?: boolean; plugins?: boolean; reconstruction?: boolean };
   /** Explicit, non-default absolute paths selected for a backup.  Their
    * archives are only present in backup bundles, never ordinary exports. */
   backupPaths?: Array<{ path: string; archive: string }>;
@@ -210,6 +212,7 @@ export interface ExtractedBundle {
   agentsPath?: string;
   backupPathsPath?: string;
   pluginConfigurationPath?: string;
+  reconstructionPath?: string;
 }
 
 /** Scan a compressed tar before Docker extracts/imports it. Compressed-size
@@ -555,6 +558,8 @@ export async function extractBundle(bundlePath: string, destDir: string): Promis
         ? MAX_MANIFEST_BYTES
         : name === BUNDLE_FILES.plugins
           ? MAX_PLUGIN_CONFIGURATION_BYTES
+          : name === BUNDLE_FILES.reconstruction
+            ? MAX_RECONSTRUCTION_BYTES
           : MAX_BUNDLE_ENTRY_BYTES;
       if (!Number.isSafeInteger(size) || size < 0 || size > limit || totalBytes + size > MAX_BUNDLE_TOTAL_BYTES) {
         reject(new Error(`Invalid worker export: bundle entry "${name}" exceeds the size limit`));
@@ -601,9 +606,10 @@ export async function extractBundle(bundlePath: string, destDir: string): Promis
     ['agents', present.has(BUNDLE_FILES.agents)],
     ['backupPaths', present.has(BUNDLE_FILES.backupPaths)],
     ['plugins', present.has(BUNDLE_FILES.plugins)],
+    ['reconstruction', present.has(BUNDLE_FILES.reconstruction)],
   ] as const) {
     const declared = (manifest.contents as any)[key];
-    const optionalAbsent = (key === 'backupPaths' || key === 'plugins') && declared === undefined && !filePresent;
+    const optionalAbsent = (key === 'backupPaths' || key === 'plugins' || key === 'reconstruction') && declared === undefined && !filePresent;
     if (declared !== filePresent && !optionalAbsent) {
       throw new Error(`Invalid worker export: manifest contents.${key} does not match bundle payloads`);
     }
@@ -617,6 +623,7 @@ export async function extractBundle(bundlePath: string, destDir: string): Promis
     agentsPath: present.has(BUNDLE_FILES.agents) ? join(destDir, BUNDLE_FILES.agents) : undefined,
     backupPathsPath: present.has(BUNDLE_FILES.backupPaths) ? join(destDir, BUNDLE_FILES.backupPaths) : undefined,
     pluginConfigurationPath: present.has(BUNDLE_FILES.plugins) ? join(destDir, BUNDLE_FILES.plugins) : undefined,
+    reconstructionPath: present.has(BUNDLE_FILES.reconstruction) ? join(destDir, BUNDLE_FILES.reconstruction) : undefined,
   };
 }
 
@@ -662,7 +669,7 @@ function assertValidManifest(value: unknown): asserts value is WorkerExportManif
   if (!value.portMappings.every((mapping) => isRecord(mapping) && Number.isInteger(mapping.externalPort) && Number.isInteger(mapping.internalPort) && (mapping.type === 'localhost' || mapping.type === 'external') && (mapping.appType === undefined || isString(mapping.appType)) && (mapping.instanceId === undefined || isString(mapping.instanceId)))) {
     throw new Error('Invalid worker export: port mapping is invalid');
   }
-  if (!isRecord(contents) || !['rootfs', 'workspace', 'agents'].every((k) => typeof contents[k] === 'boolean') || (contents.backupPaths !== undefined && typeof contents.backupPaths !== 'boolean') || (contents.plugins !== undefined && typeof contents.plugins !== 'boolean')) {
+  if (!isRecord(contents) || !['rootfs', 'workspace', 'agents'].every((k) => typeof contents[k] === 'boolean') || (contents.backupPaths !== undefined && typeof contents.backupPaths !== 'boolean') || (contents.plugins !== undefined && typeof contents.plugins !== 'boolean') || (contents.reconstruction !== undefined && typeof contents.reconstruction !== 'boolean')) {
     throw new Error('Invalid worker export: manifest.contents is invalid');
   }
   if (value.backupPaths !== undefined && (!Array.isArray(value.backupPaths) || value.backupPaths.length > 32 || new Set(value.backupPaths.map((entry: any) => entry?.path)).size !== value.backupPaths.length || new Set(value.backupPaths.map((entry: any) => entry?.archive)).size !== value.backupPaths.length || value.backupPaths.some((entry) => !isRecord(entry) || !isString(entry.path) || !safeAbsoluteBackupPath(entry.path) || !isString(entry.archive) || !/^paths\/[0-9]{1,2}\.tar$/.test(entry.archive)))) {
@@ -683,6 +690,21 @@ function assertValidManifest(value: unknown): asserts value is WorkerExportManif
     const { basicAuth: _secret, ...safe } = mapping;
     return safe;
   });
+}
+
+export async function writeWorkerReconstruction(path: string, reconstruction: WorkerReconstruction): Promise<number> {
+  const payload = `${JSON.stringify(parseWorkerReconstruction(reconstruction))}\n`;
+  const bytes = Buffer.byteLength(payload);
+  if (bytes > MAX_RECONSTRUCTION_BYTES) throw Object.assign(new Error('Worker reconstruction metadata is too large'), { statusCode: 413 });
+  await writeFile(path, payload, { mode: 0o600 });
+  return bytes;
+}
+
+export async function readWorkerReconstruction(path: string): Promise<WorkerReconstruction> {
+  const payload = await readFile(path);
+  if (payload.byteLength > MAX_RECONSTRUCTION_BYTES) throw Object.assign(new Error('Worker reconstruction metadata is too large'), { statusCode: 400 });
+  try { return parseWorkerReconstruction(JSON.parse(payload.toString('utf8'))); }
+  catch (error) { if ((error as any)?.statusCode) throw error; throw Object.assign(new Error('Invalid worker reconstruction metadata'), { statusCode: 400 }); }
 }
 
 function safeAbsoluteBackupPath(path: string): boolean {

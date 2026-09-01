@@ -115,11 +115,19 @@ test("queued in-place cancellation releases only that restore job's artifact pin
       fixture.userId,
       fixture.artifact,
       "new",
+      undefined,
+      undefined,
+      undefined,
+      "queued-cancel-first",
     );
     const second = await fixture.manager.createRestore(
       fixture.userId,
       fixture.artifact,
       "new",
+      undefined,
+      undefined,
+      undefined,
+      "queued-cancel-second",
     );
     await expect.poll(() => fixture.provider.downloadCalls).toBe(2);
 
@@ -127,6 +135,10 @@ test("queued in-place cancellation releases only that restore job's artifact pin
       fixture.userId,
       fixture.artifact,
       "new",
+      undefined,
+      undefined,
+      undefined,
+      "queued-cancel-third",
     );
     // The queue/cancel behavior is independent of admission checks. Recast
     // this already-admitted fixture job to exercise the in-place branch
@@ -211,11 +223,19 @@ test("legacy synchronous restore waits for the shared concurrency limiter", asyn
       fixture.userId,
       fixture.artifact,
       "new",
+      undefined,
+      undefined,
+      undefined,
+      "legacy-limit-first",
     );
     const second = await fixture.manager.createRestore(
       fixture.userId,
       fixture.artifact,
       "new",
+      undefined,
+      undefined,
+      undefined,
+      "legacy-limit-second",
     );
     await expect.poll(() => fixture.provider.downloadCalls).toBe(2);
 

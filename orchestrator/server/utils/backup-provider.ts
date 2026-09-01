@@ -1,10 +1,11 @@
-import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, rm, stat, open } from "node:fs/promises";
+import { constants, createReadStream, createWriteStream } from "node:fs";
+import { mkdir, rm, stat, lstat, open, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { assertSafePathId, assertSafeUserId } from "./user-id";
+import type { RemoteBackupDescriptor } from "./backup-types";
 
 export type BackupHttpTransport = (
   input: string | URL | Request,
@@ -16,6 +17,240 @@ export interface UploadResult {
   size: number;
   uploadId: string;
   resumedFromChunk: number;
+}
+
+/** Metadata is stored only as bounded provider object properties. It is a
+ * discovery hint, never a substitute for decrypting and validating the
+ * archive. */
+export interface BackupUploadMetadata {
+  artifactId?: string;
+  formatVersion?: number;
+  keyFingerprint?: string;
+  integritySha256?: string;
+  createdAt?: string;
+  incomplete?: boolean;
+}
+
+export interface BackupDiscoveryPage {
+  records: RemoteBackupDescriptor[];
+  nextCursor?: string;
+}
+
+const MAX_REMOTE_DESCRIPTOR_COUNT = 100;
+const MAX_RANGE_BYTES = 64 * 1024;
+const MAX_OPAQUE_ID = 4096;
+/** Provider objects are untrusted and are staged before authentication. Keep
+ * the cap deliberately generous for personal multi-worker installations while
+ * preventing an object that grows during download from exhausting DATA_DIR. */
+export const MAX_BACKUP_PROVIDER_OBJECT_BYTES = 100 * 1024 * 1024 * 1024;
+
+export interface BackupDownloadConstraints {
+  expectedSize?: number;
+  maxBytes?: number;
+}
+
+function validOpaqueId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_OPAQUE_ID && !/[\0\r\n]/.test(value);
+}
+function validTimestamp(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 64 && Number.isFinite(Date.parse(value));
+}
+function validFingerprint(value: unknown): value is string {
+  return typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value);
+}
+function validSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/i.test(value);
+}
+function validFormat(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 100;
+}
+function validArtifactId(value: unknown): value is string {
+  try { assertSafePathId(value, "artifactId"); return true; } catch { return false; }
+}
+/** Reject rather than pass through provider-controlled fields. */
+export function normalizeRemoteBackupDescriptor(value: unknown): RemoteBackupDescriptor | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return;
+  const raw = value as Record<string, unknown>;
+  if (!validOpaqueId(raw.objectId) || typeof raw.size !== "number" || !Number.isSafeInteger(raw.size) || raw.size < 0) return;
+  if (raw.createdAt !== undefined && !validTimestamp(raw.createdAt)) return;
+  if (raw.artifactId !== undefined && !validArtifactId(raw.artifactId)) return;
+  if (raw.formatVersion !== undefined && !validFormat(raw.formatVersion)) return;
+  if (raw.keyFingerprint !== undefined && !validFingerprint(raw.keyFingerprint)) return;
+  if (raw.integritySha256 !== undefined && !validSha256(raw.integritySha256)) return;
+  if (raw.incomplete !== undefined && typeof raw.incomplete !== "boolean") return;
+  return {
+    objectId: raw.objectId, size: raw.size,
+    ...(raw.createdAt !== undefined ? { createdAt: raw.createdAt } : {}),
+    ...(raw.artifactId !== undefined ? { artifactId: raw.artifactId } : {}),
+    ...(raw.formatVersion !== undefined ? { formatVersion: raw.formatVersion } : {}),
+    ...(raw.keyFingerprint !== undefined ? { keyFingerprint: raw.keyFingerprint } : {}),
+    ...(raw.integritySha256 !== undefined ? { integritySha256: raw.integritySha256 } : {}),
+    ...(raw.incomplete !== undefined ? { incomplete: raw.incomplete } : {}),
+  };
+}
+function checkedUploadMetadata(metadata?: BackupUploadMetadata): BackupUploadMetadata | undefined {
+  if (!metadata) return;
+  const normalized = normalizeRemoteBackupDescriptor({ objectId: "metadata", size: 0, ...metadata });
+  if (!normalized) throw Object.assign(new Error("Invalid backup upload metadata"), { statusCode: 400 });
+  const { objectId: _id, size: _size, ...safe } = normalized;
+  return safe;
+}
+function checkedRangeLength(length: number) {
+  if (!Number.isSafeInteger(length) || length < 1 || length > MAX_RANGE_BYTES)
+    throw Object.assign(new Error("Invalid backup range length"), { statusCode: 400 });
+}
+async function readSidecarMetadata(path: string): Promise<BackupUploadMetadata | undefined> {
+  let file: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const info = await file.stat();
+    if (!info.isFile() || info.size > 4096) return;
+    const bytes = Buffer.alloc(info.size);
+    const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+    return checkedUploadMetadata(
+      JSON.parse(bytes.subarray(0, bytesRead).toString("utf8")),
+    );
+  } catch {
+    return;
+  } finally {
+    await file?.close().catch(() => {});
+  }
+}
+async function writeSidecarMetadata(path: string, metadata: BackupUploadMetadata | undefined) {
+  if (!metadata) return;
+  const file = await open(
+    path,
+    constants.O_WRONLY |
+      constants.O_CREAT |
+      constants.O_TRUNC |
+      constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    await file.writeFile(JSON.stringify(metadata), "utf8");
+  } finally {
+    await file.close();
+  }
+}
+async function copyRegularProviderObject(
+  source: string,
+  destination: string,
+  signal?: AbortSignal,
+  constraints?: BackupDownloadConstraints,
+) {
+  signal?.throwIfAborted();
+  const limits = checkedDownloadConstraints(constraints);
+  const file = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const info = await file.stat();
+    if (!info.isFile()) throw new Error("Backup provider object is not a regular file");
+    assertDownloadSize(info.size, limits);
+    let bytes = 0;
+    const counter = downloadCounter(limits, (count) => { bytes = count; });
+    try {
+      await pipeline(
+        file.createReadStream({ autoClose: false }),
+        counter,
+        createWriteStream(destination, { mode: 0o600 }),
+        { signal },
+      );
+      assertDownloadSize(bytes, limits);
+    } catch (error) {
+      await rm(destination, { force: true }).catch(() => {});
+      throw error;
+    }
+  } finally {
+    await file.close().catch(() => {});
+  }
+}
+
+function checkedDownloadConstraints(
+  constraints?: BackupDownloadConstraints,
+): Required<Pick<BackupDownloadConstraints, "maxBytes">> &
+  Pick<BackupDownloadConstraints, "expectedSize"> {
+  const maxBytes = constraints?.maxBytes ?? MAX_BACKUP_PROVIDER_OBJECT_BYTES;
+  const expectedSize = constraints?.expectedSize;
+  if (
+    !Number.isSafeInteger(maxBytes) ||
+    maxBytes < 1 ||
+    (expectedSize !== undefined &&
+      (!Number.isSafeInteger(expectedSize) || expectedSize < 0))
+  )
+    throw Object.assign(new Error("Invalid backup download constraints"), {
+      statusCode: 400,
+      code: "BACKUP_DOWNLOAD_CONSTRAINT_INVALID",
+    });
+  return { maxBytes, ...(expectedSize !== undefined ? { expectedSize } : {}) };
+}
+
+function assertDownloadSize(
+  size: number,
+  limits: ReturnType<typeof checkedDownloadConstraints>,
+) {
+  if (size > limits.maxBytes)
+    throw Object.assign(
+      new Error("The provider backup object exceeds Agentor's staging size limit."),
+      { code: "BACKUP_OBJECT_TOO_LARGE", statusCode: 409 },
+    );
+  if (limits.expectedSize !== undefined && size !== limits.expectedSize)
+    throw Object.assign(
+      new Error("The provider backup object changed size after discovery."),
+      { code: "BACKUP_REMOTE_OBJECT_CHANGED", statusCode: 409, retryable: true },
+    );
+}
+
+function downloadCounter(
+  limits: ReturnType<typeof checkedDownloadConstraints>,
+  onBytes: (bytes: number) => void,
+) {
+  let bytes = 0;
+  return new Transform({
+    transform(chunk, _encoding, callback) {
+      bytes += chunk.length;
+      onBytes(bytes);
+      if (
+        bytes > limits.maxBytes ||
+        (limits.expectedSize !== undefined && bytes > limits.expectedSize)
+      ) {
+        callback(
+          Object.assign(
+            new Error(
+              bytes > limits.maxBytes
+                ? "The provider backup object exceeds Agentor's staging size limit."
+                : "The provider backup object changed size after discovery.",
+            ),
+            {
+              code:
+                bytes > limits.maxBytes
+                  ? "BACKUP_OBJECT_TOO_LARGE"
+                  : "BACKUP_REMOTE_OBJECT_CHANGED",
+              statusCode: 409,
+            },
+          ),
+        );
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+}
+async function readRegularProviderRange(
+  source: string,
+  length: number,
+  signal?: AbortSignal,
+): Promise<Buffer> {
+  signal?.throwIfAborted();
+  const file = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const info = await file.stat();
+    if (!info.isFile()) throw new Error("Backup provider object is not a regular file");
+    const output = Buffer.alloc(length);
+    const { bytesRead } = await file.read(output, 0, length, 0);
+    signal?.throwIfAborted();
+    return output.subarray(0, bytesRead);
+  } finally {
+    await file.close();
+  }
 }
 
 export class BackupProviderFailure extends Error {
@@ -159,14 +394,20 @@ export interface BackupProvider {
     onProgress: (bytes: number) => void,
     signal?: AbortSignal,
     resumeUploadId?: string,
+    metadata?: BackupUploadMetadata,
   ): Promise<UploadResult>;
   download(
     userId: string,
     objectId: string,
     destination: string,
     signal?: AbortSignal,
+    constraints?: BackupDownloadConstraints,
   ): Promise<void>;
   delete(userId: string, objectId: string, signal?: AbortSignal): Promise<void>;
+  /** Provider-neutral bounded discovery and header read. Remote results are
+   * untrusted input and must be adopted/verified by BackupManager later. */
+  discover?(userId: string, cursor?: string, signal?: AbortSignal): Promise<BackupDiscoveryPage>;
+  readRange?(userId: string, objectId: string, length: number, signal?: AbortSignal): Promise<Buffer>;
   /** Reconcile an upload that committed remotely before its opaque object id
    * could be persisted locally. Providers with non-deterministic ids can use
    * the stable Agentor artifact id embedded in object metadata. */
@@ -192,6 +433,9 @@ export class FakeBackupProvider implements BackupProvider {
     string,
     { ownerId: string; artifactId: string; diagnostic: FakeUploadDiagnostic }
   >();
+  /** Tests may explicitly model two local principals linking one remote
+   * account. The remote descriptor itself never reveals the uploader. */
+  private accounts = new Map<string, string>();
   constructor(private root: string) {}
   connect(userId: string, chunkSize?: number) {
     const size = Math.max(
@@ -207,6 +451,14 @@ export class FakeBackupProvider implements BackupProvider {
       chunkSize: size,
     };
   }
+  bindAccount(userId: string, accountId: string) {
+    assertSafeUserId(userId); assertSafePathId(accountId, "accountId");
+    this.accounts.set(userId, accountId);
+  }
+  private accountId(userId: string) {
+    assertSafeUserId(userId);
+    return this.accounts.get(userId) ?? userId;
+  }
   setFault(userId: string, chunk: number, count: number) {
     this.faults.set(userId, { chunk, remaining: count });
   }
@@ -217,8 +469,9 @@ export class FakeBackupProvider implements BackupProvider {
   private path(userId: string, id: string) {
     assertSafeUserId(userId);
     assertSafePathId(id, "artifactId");
-    return join(this.root, userId, `${id}.backup`);
+    return join(this.root, this.accountId(userId), `${id}.backup`);
   }
+  private metadataPath(userId: string, id: string) { return `${this.path(userId, id)}.meta`; }
   async upload(
     userId: string,
     artifactId: string,
@@ -226,10 +479,12 @@ export class FakeBackupProvider implements BackupProvider {
     onProgress: (bytes: number) => void,
     signal?: AbortSignal,
     resumeUploadId?: string,
+    metadata?: BackupUploadMetadata,
   ): Promise<UploadResult> {
     assertSafeUserId(userId);
     assertSafePathId(artifactId, "artifactId");
-    await mkdir(join(this.root, userId), { recursive: true, mode: 0o700 });
+    const safeMetadata = checkedUploadMetadata(metadata);
+    await mkdir(join(this.root, this.accountId(userId)), { recursive: true, mode: 0o700 });
     const prior = resumeUploadId ? this.uploads.get(resumeUploadId) : undefined;
     if (prior && (prior.ownerId !== userId || prior.artifactId !== artifactId))
       throw new Error("Invalid resumable upload session");
@@ -290,6 +545,7 @@ export class FakeBackupProvider implements BackupProvider {
       await input.close();
       await output.close();
     }
+    await writeSidecarMetadata(this.metadataPath(userId, artifactId), safeMetadata);
     return {
       objectId: artifactId,
       size: offset,
@@ -302,16 +558,45 @@ export class FakeBackupProvider implements BackupProvider {
     id: string,
     dest: string,
     signal?: AbortSignal,
+    constraints?: BackupDownloadConstraints,
   ) {
-    await pipeline(
-      createReadStream(this.path(userId, id)),
-      createWriteStream(dest, { mode: 0o600 }),
-      { signal },
+    await copyRegularProviderObject(
+      this.path(userId, id),
+      dest,
+      signal,
+      constraints,
+    );
+  }
+  async discover(userId: string, cursor?: string, signal?: AbortSignal): Promise<BackupDiscoveryPage> {
+    signal?.throwIfAborted();
+    assertSafeUserId(userId);
+    if (cursor !== undefined) throw Object.assign(new Error("Invalid backup discovery cursor"), { statusCode: 400 });
+    let names: string[] = [];
+    try { names = await readdir(join(this.root, this.accountId(userId))); } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
+    const records: RemoteBackupDescriptor[] = [];
+    for (const name of names.sort()) {
+      if (records.length >= MAX_REMOTE_DESCRIPTOR_COUNT || !name.endsWith(".backup")) continue;
+      const objectId = name.slice(0, -".backup".length);
+      if (!validArtifactId(objectId)) continue;
+      const info = await lstat(this.path(userId, objectId));
+      if (!info.isFile() || info.isSymbolicLink()) continue;
+      const metadata = await readSidecarMetadata(this.metadataPath(userId, objectId));
+      records.push(normalizeRemoteBackupDescriptor({ objectId, size: info.size, createdAt: metadata?.createdAt ?? info.mtime.toISOString(), artifactId: metadata?.artifactId ?? objectId, formatVersion: metadata?.formatVersion ?? 1, keyFingerprint: metadata?.keyFingerprint, integritySha256: metadata?.integritySha256, incomplete: metadata?.incomplete })!);
+    }
+    return { records };
+  }
+  async readRange(userId: string, objectId: string, length: number, signal?: AbortSignal): Promise<Buffer> {
+    checkedRangeLength(length); signal?.throwIfAborted();
+    return readRegularProviderRange(
+      this.path(userId, objectId),
+      length,
+      signal,
     );
   }
   async delete(userId: string, id: string, signal?: AbortSignal) {
     signal?.throwIfAborted();
     await rm(this.path(userId, id), { force: true });
+    await rm(this.metadataPath(userId, id), { force: true });
     signal?.throwIfAborted();
   }
   async abortUpload(userId: string, uploadId: string, artifactId: string, signal?: AbortSignal) {
@@ -330,15 +615,19 @@ export class LocalBackupProvider implements BackupProvider {
     assertSafePathId(id, "artifactId");
     return join(this.root, u, `${id}.backup`);
   }
+  private metadataPath(u: string, id: string) { return `${this.path(u, id)}.meta`; }
   async upload(
     u: string,
     id: string,
     s: string,
     p: (n: number) => void,
     signal?: AbortSignal,
+    _resumeUploadId?: string,
+    metadata?: BackupUploadMetadata,
   ) {
     assertSafeUserId(u);
     assertSafePathId(id, "artifactId");
+    const safeMetadata = checkedUploadMetadata(metadata);
     await mkdir(join(this.root, u), { recursive: true, mode: 0o700 });
     let n = 0;
     const t = new (await import("node:stream")).Transform({
@@ -354,6 +643,7 @@ export class LocalBackupProvider implements BackupProvider {
       createWriteStream(this.path(u, id), { mode: 0o600 }),
       { signal },
     );
+    await writeSidecarMetadata(this.metadataPath(u, id), safeMetadata);
     return {
       objectId: id,
       size: (await stat(this.path(u, id))).size,
@@ -361,17 +651,46 @@ export class LocalBackupProvider implements BackupProvider {
       resumedFromChunk: 0,
     };
   }
-  async download(u: string, id: string, d: string, signal?: AbortSignal) {
-    await pipeline(
-      createReadStream(this.path(u, id)),
-      createWriteStream(d, { mode: 0o600 }),
-      { signal },
-    );
+  async download(
+    u: string,
+    id: string,
+    d: string,
+    signal?: AbortSignal,
+    constraints?: BackupDownloadConstraints,
+  ) {
+    await copyRegularProviderObject(this.path(u, id), d, signal, constraints);
   }
   async delete(u: string, id: string, signal?: AbortSignal) {
     signal?.throwIfAborted();
     await rm(this.path(u, id), { force: true });
+    await rm(this.metadataPath(u, id), { force: true });
     signal?.throwIfAborted();
+  }
+  async discover(userId: string, cursor?: string, signal?: AbortSignal): Promise<BackupDiscoveryPage> {
+    signal?.throwIfAborted(); assertSafeUserId(userId);
+    if (cursor !== undefined) throw Object.assign(new Error("Invalid backup discovery cursor"), { statusCode: 400 });
+    let names: string[] = [];
+    try { names = await readdir(join(this.root, userId)); } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
+    const records: RemoteBackupDescriptor[] = [];
+    for (const name of names.sort()) {
+      if (records.length >= MAX_REMOTE_DESCRIPTOR_COUNT || !name.endsWith(".backup")) continue;
+      const objectId = name.slice(0, -".backup".length);
+      if (!validArtifactId(objectId)) continue;
+      const info = await lstat(this.path(userId, objectId));
+      if (info.isFile() && !info.isSymbolicLink()) {
+        const metadata = await readSidecarMetadata(this.metadataPath(userId, objectId));
+        records.push(normalizeRemoteBackupDescriptor({ objectId, size: info.size, createdAt: metadata?.createdAt ?? info.mtime.toISOString(), artifactId: metadata?.artifactId ?? objectId, formatVersion: metadata?.formatVersion ?? 1, keyFingerprint: metadata?.keyFingerprint, integritySha256: metadata?.integritySha256, incomplete: metadata?.incomplete })!);
+      }
+    }
+    return { records };
+  }
+  async readRange(userId: string, objectId: string, length: number, signal?: AbortSignal): Promise<Buffer> {
+    checkedRangeLength(length); signal?.throwIfAborted();
+    return readRegularProviderRange(
+      this.path(userId, objectId),
+      length,
+      signal,
+    );
   }
 }
 export class GoogleDriveBackupProvider implements BackupProvider {
@@ -468,6 +787,7 @@ export class GoogleDriveBackupProvider implements BackupProvider {
     onProgress: (bytes: number) => void,
     signal?: AbortSignal,
     resumeUploadId?: string,
+    metadata?: BackupUploadMetadata,
   ): Promise<UploadResult> {
     let session = resumeUploadId;
     try {
@@ -521,12 +841,21 @@ export class GoogleDriveBackupProvider implements BackupProvider {
         }
       }
       if (!session) {
-        const metadata: Record<string, unknown> = {
+        const safeMetadata = checkedUploadMetadata(metadata);
+        const driveMetadata: Record<string, unknown> = {
           name: `agentor-${artifactId}.backup`,
-          appProperties: { agentorBackup: "v1", artifactId },
+          appProperties: {
+            agentorBackup: safeMetadata?.formatVersion === 2 ? "v2" : "v1",
+            artifactId,
+            ...(safeMetadata?.formatVersion ? { formatVersion: String(safeMetadata.formatVersion) } : {}),
+            ...(safeMetadata?.keyFingerprint ? { keyFingerprint: safeMetadata.keyFingerprint } : {}),
+            ...(safeMetadata?.integritySha256 ? { integritySha256: safeMetadata.integritySha256 } : {}),
+            ...(safeMetadata?.createdAt ? { createdAt: safeMetadata.createdAt } : {}),
+            ...(safeMetadata?.incomplete !== undefined ? { incomplete: String(safeMetadata.incomplete) } : {}),
+          },
         };
         if (process.env.GOOGLE_BACKUP_FOLDER_ID)
-          metadata.parents = [process.env.GOOGLE_BACKUP_FOLDER_ID];
+          driveMetadata.parents = [process.env.GOOGLE_BACKUP_FOLDER_ID];
         const begin = await this.transport(
           "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,size",
           {
@@ -538,7 +867,7 @@ export class GoogleDriveBackupProvider implements BackupProvider {
               "X-Upload-Content-Type": "application/octet-stream",
               "X-Upload-Content-Length": String(size),
             },
-            body: JSON.stringify(metadata),
+            body: JSON.stringify(driveMetadata),
           },
         );
         if (!begin.ok)
@@ -625,7 +954,9 @@ export class GoogleDriveBackupProvider implements BackupProvider {
     objectId: string,
     destination: string,
     signal?: AbortSignal,
+    constraints?: BackupDownloadConstraints,
   ): Promise<void> {
+    const limits = checkedDownloadConstraints(constraints);
     const response = await this.transport(
       `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(objectId)}?alt=media`,
       {
@@ -644,11 +975,114 @@ export class GoogleDriveBackupProvider implements BackupProvider {
         response.status,
         true,
       );
-    await pipeline(
-      createReadStreamFromWeb(response.body),
-      createWriteStream(destination, { mode: 0o600 }),
-      { signal },
+    const contentLength = response.headers.get("content-length");
+    if (contentLength !== null) {
+      const advertised = Number(contentLength);
+      if (!Number.isSafeInteger(advertised) || advertised < 0)
+        throw new BackupProviderFailure(
+          "GOOGLE_DRIVE_INVALID_RESPONSE",
+          "Google Drive returned an invalid backup download size.",
+          response.status,
+          true,
+        );
+      assertDownloadSize(advertised, limits);
+    }
+    let bytes = 0;
+    try {
+      await pipeline(
+        createReadStreamFromWeb(response.body),
+        downloadCounter(limits, (count) => { bytes = count; }),
+        createWriteStream(destination, { mode: 0o600 }),
+        { signal },
+      );
+      assertDownloadSize(bytes, limits);
+    } catch (error) {
+      await rm(destination, { force: true }).catch(() => {});
+      throw error;
+    }
+  }
+  async discover(userId: string, cursor?: string, signal?: AbortSignal): Promise<BackupDiscoveryPage> {
+    if (cursor !== undefined && (!validOpaqueId(cursor) || cursor.length > 1024))
+      throw Object.assign(new Error("Invalid backup discovery cursor"), { statusCode: 400 });
+    const access = await this.access(userId, signal);
+    // `agentorBackup` is the only trusted selector. Names and every returned
+    // field remain untrusted until bounded validation below.
+    const query = "(appProperties has { key='agentorBackup' and value='v1' } or appProperties has { key='agentorBackup' and value='v2' }) and trashed = false";
+    const params = new URLSearchParams({
+      q: `(${query})`, pageSize: String(MAX_REMOTE_DESCRIPTOR_COUNT),
+      fields: "nextPageToken,files(id,size,createdTime,appProperties)",
+    });
+    if (cursor) params.set("pageToken", cursor);
+    const response = await this.transport(`https://www.googleapis.com/drive/v3/files?${params}`, {
+      signal, headers: { Authorization: `Bearer ${access}` },
+    });
+    if (!response.ok) throw await googleResponseFailure(response, "backup discovery");
+    let body: any;
+    try { body = await response.json(); } catch { throw new BackupProviderFailure("GOOGLE_DRIVE_INVALID_RESPONSE", "Google Drive returned an invalid backup-discovery response.", response.status, true); }
+    if (!Array.isArray(body?.files) || body.files.length > MAX_REMOTE_DESCRIPTOR_COUNT)
+      throw new BackupProviderFailure("GOOGLE_DRIVE_INVALID_RESPONSE", "Google Drive returned an invalid backup-discovery response.", response.status, true);
+    const records: RemoteBackupDescriptor[] = [];
+    for (const file of body.files) {
+      const props = file?.appProperties;
+      if (!props || typeof props !== "object" || Array.isArray(props) || (props.agentorBackup !== "v1" && props.agentorBackup !== "v2")) continue;
+      const incomplete = props.incomplete;
+      if (incomplete !== undefined && incomplete !== "true" && incomplete !== "false") continue;
+      const descriptor = normalizeRemoteBackupDescriptor({
+        objectId: file.id,
+        size: typeof file.size === "string" ? Number(file.size) : file.size,
+        createdAt: file.createdTime,
+        artifactId: props.artifactId,
+        formatVersion: props.formatVersion === undefined ? (props.agentorBackup === "v2" ? 2 : 1) : Number(props.formatVersion),
+        keyFingerprint: props.keyFingerprint,
+        integritySha256: props.integritySha256,
+        incomplete: incomplete === undefined ? undefined : incomplete === "true",
+      });
+      if (descriptor) records.push(descriptor);
+    }
+    const nextCursor = body?.nextPageToken;
+    if (nextCursor !== undefined && (!validOpaqueId(nextCursor) || nextCursor.length > 1024))
+      throw new BackupProviderFailure("GOOGLE_DRIVE_INVALID_RESPONSE", "Google Drive returned an invalid backup-discovery response.", response.status, true);
+    return { records, ...(nextCursor ? { nextCursor } : {}) };
+  }
+  async readRange(userId: string, objectId: string, length: number, signal?: AbortSignal): Promise<Buffer> {
+    if (!validOpaqueId(objectId)) throw Object.assign(new Error("Invalid backup object id"), { statusCode: 400 });
+    checkedRangeLength(length);
+    const response = await this.transport(
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(objectId)}?alt=media`,
+      { signal, headers: { Authorization: `Bearer ${await this.access(userId, signal)}`, Range: `bytes=0-${length - 1}` } },
     );
+    if (!response.ok) throw await googleResponseFailure(response, "backup header read");
+    if (!response.body)
+      throw new BackupProviderFailure(
+        "GOOGLE_DRIVE_INVALID_RESPONSE",
+        "Google Drive returned no backup header body.",
+        response.status,
+        true,
+      );
+    const reader = response.body.getReader();
+    const chunks: Buffer[] = [];
+    let total = 0;
+    try {
+      while (true) {
+        signal?.throwIfAborted();
+        const next = await reader.read();
+        if (next.done) break;
+        total += next.value.byteLength;
+        if (total > length) {
+          await reader.cancel().catch(() => {});
+          throw new BackupProviderFailure(
+            "GOOGLE_DRIVE_INVALID_RESPONSE",
+            "Google Drive returned an oversized backup header.",
+            response.status,
+            true,
+          );
+        }
+        chunks.push(Buffer.from(next.value));
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return Buffer.concat(chunks, total);
   }
   async delete(userId: string, objectId: string, signal?: AbortSignal): Promise<void> {
     const response = await this.transport(

@@ -173,7 +173,12 @@ export async function restoreWorkerPlugins(
   workerId: string,
   definitions: PluginDefinitionStore,
   installations: PluginInstallationStore,
-): Promise<{ installationIds: string[]; missingSecretNames: string[] }> {
+): Promise<{
+  /** Ephemeral restore bookkeeping; callers use it only to undo this run. */
+  definitionIds: string[];
+  installationIds: string[];
+  missingSecretNames: string[];
+}> {
   const validated = parsePortablePluginConfiguration(snapshot);
   const definitionIds = new Map<string, PluginDefinitionRecord>();
   const createdDefinitions: string[] = [];
@@ -212,6 +217,7 @@ export async function restoreWorkerPlugins(
     throw error;
   }
   return {
+    definitionIds: createdDefinitions,
     installationIds: createdInstallations.map(({ id }) => id),
     missingSecretNames: [
       ...new Set(
@@ -219,6 +225,58 @@ export async function restoreWorkerPlugins(
       ),
     ].sort(),
   };
+}
+
+/**
+ * Undo precisely the records minted by one restore attempt. Definitions are
+ * worker-scoped and installations use fresh ids, but accepting explicit ids
+ * keeps rollback from touching a concurrently-created plugin for that worker.
+ * Runtime allocations are held by installation records, so deleting those
+ * records also releases any ports/displays allocated during reconciliation.
+ */
+export async function rollbackRestoredWorkerPlugins(
+  userId: string,
+  workerId: string,
+  restored: Pick<
+    Awaited<ReturnType<typeof restoreWorkerPlugins>>,
+    "definitionIds" | "installationIds"
+  >,
+  definitions: PluginDefinitionStore,
+  installations: PluginInstallationStore,
+): Promise<void> {
+  const failures: unknown[] = [];
+  for (const installationId of [...restored.installationIds].reverse()) {
+    const installation = installations.getById(installationId);
+    if (
+      installation?.userId !== userId ||
+      installation.workerId !== workerId
+    )
+      continue;
+    try {
+      await installations.delete(userId, installationId);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  for (const definitionId of [...restored.definitionIds].reverse()) {
+    const definition = definitions.getById(definitionId);
+    if (
+      definition?.userId !== userId ||
+      definition.scope !== "worker" ||
+      definition.workerId !== workerId
+    )
+      continue;
+    try {
+      await definitions.delete(definitionId);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length)
+    throw new AggregateError(
+      failures,
+      "Restored plugin cleanup did not complete",
+    );
 }
 
 function record(value: unknown): value is Record<string, any> {

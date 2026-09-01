@@ -43,6 +43,14 @@ export interface BackupJob {
   retryable?: boolean;
   attempt?: number;
   workspaceIds?: string[];
+  workspaceId?: string;
+  artifactId?: string;
+  operation?: "backup" | "restore" | "discovery" | "adoption" | "dependency-resolution";
+  /** IDs only: portable image recipes remain inside the authenticated bundle. */
+  recoveredImageDefinitionId?: string;
+  recoveredImageBuildId?: string;
+  /** Compatibility with an early server response spelling. */
+  imageBuildId?: string;
   consistency?: { warning?: string };
 }
 export interface BackupArtifact {
@@ -57,6 +65,50 @@ export interface BackupArtifact {
   missingSecrets?: string[];
   /** Member labels are present on newer multi-worker backup artifacts. */
   workspaceMembers?: BackupWorkspaceMember[];
+  formatVersion?: number;
+  keyFingerprint?: string;
+  sourceInstallationId?: string;
+  provenance?: "local" | "remote-adopted";
+  integrityStatus?: "verified" | "failed" | "unavailable";
+  reconstruction?: BackupWorkspaceReconstruction[];
+  dependencies?: BackupDependency[];
+}
+export interface BackupDependency {
+  kind: "image" | "plugin" | "secret" | "template";
+  id: string;
+  workspaceId?: string;
+  status: "resolved" | "missing" | "replacement-required" | "warning";
+  required?: boolean;
+  reason?: string;
+}
+export type BackupImageResolution =
+  | { mode: "exact" }
+  | { mode: "workspace-only"; acknowledged: true }
+  | {
+      mode: "replacement";
+      imageDefinitionId: string;
+      imageVersion: string;
+    };
+export interface BackupRecoveryKeyStatus { fingerprint: string; active: boolean; source: "generated" | "imported" | "legacy"; createdAt?: string }
+export interface BackupWorkspaceReconstruction {
+  workspaceId: string;
+  displayName?: string;
+  image: { kind: "legacy" | "platform-default" | "unmanaged" | "custom"; definitionId?: string; version?: string; digest?: string; runtimeImageAvailable?: boolean; /** Safe server-derived capability bit; recipe bytes are never returned. */ recoveryAvailable?: boolean; catalogSource?: { kind: "git"; connectionId: string; remoteId: string; hash: string } };
+  pluginDefinitions: Array<{ sourceId: string; name: string; version: string }>;
+  desiredPluginCount: number;
+  requiredSecretNames: string[];
+}
+export interface DiscoveredBackup {
+  id: string; provider: string; providerObjectId?: string; createdAt?: string;
+  size?: number; backupIdentity?: string; formatVersion?: number; keyFingerprint?: string;
+  state: "discovered" | "missing-key" | "unsupported-format" | "too-large" | "incomplete" | "inaccessible" | "damaged" | "ready-to-adopt" | "adopted";
+  integrityStatus?: "unverified" | "verified" | "failed";
+  blockedReason?: string; adoptedArtifactId?: string;
+  knownLocally?: boolean;
+  restorable?: boolean;
+  keyAvailable?: boolean | null;
+  sourceInstallationId?: string;
+  workspaceMembers?: BackupWorkspaceMember[];
 }
 export interface BackupWorkspaceMember {
   id: string;
@@ -70,6 +122,8 @@ export function useBackups() {
   const artifacts = ref<BackupArtifact[]>([]),
     jobs = ref<BackupJob[]>([]),
     providers = ref<BackupProviderStatus[]>([]),
+    recoveryKeys = ref<BackupRecoveryKeyStatus[]>([]),
+    discovered = ref<DiscoveredBackup[]>([]),
     googleOAuthInstallation = ref<GoogleBackupOAuthInstallationStatus | null>(null);
   const settings = ref<BackupSettings>({
     providerId: "local",
@@ -107,6 +161,16 @@ export function useBackups() {
       jobs.value = data.jobs;
       providers.value = providerData;
       settings.value = settingsData;
+      // These additive endpoints are deliberately best-effort during rolling
+      // upgrades, so an older server still renders ordinary backup management.
+      const [keyResult, discoveryResult] = await Promise.allSettled([
+        $fetch<{ keys?: BackupRecoveryKeyStatus[] } | BackupRecoveryKeyStatus[]>("/api/backups/recovery-key"),
+        $fetch<DiscoveredBackup[] | { backups: DiscoveredBackup[] }>(
+          "/api/backups/remote",
+        ),
+      ]);
+      if (keyResult.status === "fulfilled") recoveryKeys.value = Array.isArray(keyResult.value) ? keyResult.value : keyResult.value.keys ?? [];
+      if (discoveryResult.status === "fulfilled") discovered.value = Array.isArray(discoveryResult.value) ? discoveryResult.value : discoveryResult.value.backups ?? [];
       try {
         googleOAuthInstallation.value = await $fetch<GoogleBackupOAuthInstallationStatus>(
           "/api/admin/backup-providers/google-oauth",
@@ -175,6 +239,8 @@ export function useBackups() {
     confirmOverwrite = false,
     lockPassword = "",
     workspaceIds?: string[],
+    requestId?: string,
+    imageResolutions?: Record<string, BackupImageResolution>,
   ) {
     return $fetch<{ jobId: string }>(
       `/api/backups/${encodeURIComponent(id)}/restore`,
@@ -185,6 +251,8 @@ export function useBackups() {
           displayName,
           confirmOverwrite,
           ...(workspaceIds === undefined ? {} : { workspaceIds }),
+          ...(requestId ? { requestId } : {}),
+          ...(imageResolutions ? { imageResolutions } : {}),
           ...(target === "original" && lockPassword ? { lockPassword } : {}),
         },
       },
@@ -221,10 +289,67 @@ export function useBackups() {
     await $fetch("/api/backup-providers/google", { method: "DELETE" });
     await refresh();
   }
+  async function scanProvider(provider: string, requestId?: string) {
+    const result = await $fetch<{ jobId: string; status: BackupJobStatus }>("/api/backups/remote", { method: "POST", body: { provider, ...(requestId ? { requestId } : {}) } });
+    const job: BackupJob = { id: result.jobId, status: result.status, phase: "queued", progress: 0 };
+    jobs.value.unshift(job); schedule(); return job;
+  }
+  async function inspectDiscovered(id: string) {
+    return $fetch<DiscoveredBackup>(`/api/backups/remote/${encodeURIComponent(id)}`);
+  }
+  async function adoptDiscovered(id: string, requestId?: string) {
+    const result = await $fetch<{ jobId: string; status: BackupJobStatus }>(`/api/backups/remote/${encodeURIComponent(id)}/adopt`, { method: "POST", body: requestId ? { requestId } : {} });
+    const job: BackupJob = { id: result.jobId, status: result.status, phase: "queued", progress: 0 };
+    jobs.value.unshift(job); schedule(); return job;
+  }
+  async function recoverImageDefinition(
+    artifactId: string,
+    workspaceId: string,
+    requestId?: string,
+  ) {
+    const result = await $fetch<{ jobId: string; status: BackupJobStatus }>(
+      `/api/backups/${encodeURIComponent(artifactId)}/image-recovery`,
+      {
+        method: "POST",
+        body: { workspaceId, startBuild: true, ...(requestId ? { requestId } : {}) },
+      },
+    );
+    const job: BackupJob = {
+      id: result.jobId,
+      status: result.status,
+      phase: "queued",
+      progress: 0,
+      artifactId,
+      workspaceId,
+      operation: "dependency-resolution",
+    };
+    jobs.value.unshift(job);
+    schedule();
+    return job;
+  }
+  async function importRecoveryMaterial(material: string) {
+    const result = await $fetch<BackupRecoveryKeyStatus>("/api/backups/recovery-key/import", { method: "POST", body: { kit: material } });
+    await refresh(); return result;
+  }
+  async function revealRecoveryKey(reauth: { password?: string; useFreshSession?: boolean }) {
+    return $fetch<{ keyMaterial: string; fingerprint: string }>("/api/backups/recovery-key/reveal", { method: "POST", body: reauth, cache: "no-store" as RequestCache });
+  }
+  async function exportRecoveryKit(
+    reauth: { password?: string; useFreshSession?: boolean },
+    fingerprint?: string,
+  ) {
+    return $fetch<unknown>("/api/backups/recovery-key/export", {
+      method: "POST",
+      body: { ...reauth, ...(fingerprint ? { fingerprint } : {}) },
+      cache: "no-store" as RequestCache,
+    });
+  }
   return {
     artifacts,
     jobs,
     providers,
+    recoveryKeys,
+    discovered,
     googleOAuthInstallation,
     settings,
     activeJobs,
@@ -241,5 +366,12 @@ export function useBackups() {
     linkGoogle,
     configureGoogleInstallation,
     disconnectGoogle,
+    scanProvider,
+    inspectDiscovered,
+    adoptDiscovered,
+    recoverImageDefinition,
+    importRecoveryMaterial,
+    revealRecoveryKey,
+    exportRecoveryKit,
   };
 }

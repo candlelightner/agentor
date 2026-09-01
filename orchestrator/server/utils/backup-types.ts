@@ -1,6 +1,65 @@
 export type BackupProviderKind = 'local' | 'fake' | 'google-drive';
 export type BackupJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 
+/** A bounded, provider-supplied description. It is deliberately free of a
+ * provider account owner, archive paths, and any credential material. */
+export interface RemoteBackupDescriptor {
+  objectId: string;
+  size: number;
+  createdAt?: string;
+  artifactId?: string;
+  formatVersion?: number;
+  keyFingerprint?: string;
+  integritySha256?: string;
+  incomplete?: boolean;
+}
+
+/** Persisted discovery state is owner-scoped even when a provider account is
+ * deliberately linked by more than one Agentor installation. */
+export interface RemoteBackupRecord {
+  schemaVersion: 1;
+  id: string;
+  userId: string;
+  provider: BackupProviderKind;
+  providerObjectId: string;
+  discoveredAt: string;
+  lastSeenAt: string;
+  remote: RemoteBackupDescriptor;
+  adoptedArtifactId?: string;
+  state?: 'discovered'|'missing-key'|'unsupported-format'|'too-large'|'incomplete'|'inaccessible'|'damaged'|'ready-to-adopt'|'adopted';
+  integrityStatus?: 'unverified'|'verified'|'failed';
+  blockedReason?: string;
+  sourceInstallationId?: string;
+  keyFingerprint?: string;
+  formatVersion?: number;
+  workspaceIds?: string[];
+  workspaceMembers?: Array<{id:string;displayName?:string}>;
+  lastErrorAt?: string;
+}
+
+export type BackupImageResolution =
+  | { mode: 'exact' }
+  | { mode: 'workspace-only'; acknowledged: true }
+  | { mode: 'replacement'; imageDefinitionId: string; imageVersion: string };
+
+export interface BackupDependency {
+  kind: 'image'|'plugin'|'secret'|'template';
+  id: string;
+  workspaceId?: string;
+  status: 'resolved'|'missing'|'replacement-required'|'warning';
+  required?: boolean;
+  reason?: string;
+}
+
+export interface BackupWorkspaceReconstructionSummary {
+  workspaceId: string;
+  displayName?: string;
+  image: {kind:'legacy'|'platform-default'|'unmanaged'|'custom';definitionId?:string;version?:string;digest?:string;runtimeImageAvailable?:boolean;/** A validated recipe remains encrypted in the artifact and can be recovered asynchronously. */ recoveryAvailable?:boolean;catalogSource?:{kind:'git';connectionId:string;remoteId:string;hash:string}};
+  pluginDefinitions: Array<{sourceId:string;name:string;version:string}>;
+  desiredPluginCount: number;
+  requiredSecretNames: string[];
+}
+
 export interface BackupConfig {
   schemaVersion: 1; userId: string; provider: BackupProviderKind; enabled: boolean;
   /** Exact schedule interval. `intervalHours` remains readable for v1 data. */
@@ -38,6 +97,21 @@ export interface BackupJob {
   displayName?: string;
   missingSecrets?: Array<{name:string;type:string}>;
   selectedPathsByWorkspace?: Record<string, string[]>;
+  /** Additive operation identity for persisted discovery/adoption/dependency
+   * jobs. Existing backup and restore jobs intentionally remain valid. */
+  operation?: 'backup'|'restore'|'discovery'|'adoption'|'dependency-resolution';
+  requestId?: string;
+  requestFingerprint?: string;
+  remoteBackupId?: string;
+  dependencies?: BackupDependency[];
+  imageResolutions?: Record<string, BackupImageResolution>;
+  /** Result of an asynchronous portable image-definition recovery. The
+   * recipe itself stays in the authenticated backup bundle, never here. */
+  recoveredImageDefinitionId?: string;
+  recoveredImageBuildId?: string;
+  recoverImageStartBuild?: boolean;
+  restoreMappings?: Array<{sourceWorkspaceId:string;workerId:string}>;
+  logs?: string[];
 }
 export interface BackupArtifact {
   schemaVersion: 1; id: string; userId: string; workspaceId: string; provider: BackupProviderKind;
@@ -47,4 +121,15 @@ export interface BackupArtifact {
   deletionPending?: boolean;
   deletionErrorAt?: string;
   selectedPathsByWorkspace?: Record<string, string[]>;
+  formatVersion?: number;
+  keyFingerprint?: string;
+  sourceInstallationId?: string;
+  integrityStatus?: 'verified'|'failed'|'unavailable';
+  provenance?: 'local'|'remote-adopted';
+  workspaceMembers?: Array<{id:string;displayName?:string}>;
+  reconstruction?: BackupWorkspaceReconstructionSummary[];
+  /** Last persisted dependency assessment from authenticated archive
+   * inspection. Restore admission rechecks image selections against the
+   * current catalog before starting any worker mutation. */
+  dependencies?: BackupDependency[];
 }

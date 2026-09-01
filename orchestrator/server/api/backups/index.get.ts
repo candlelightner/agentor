@@ -15,13 +15,18 @@ export default defineEventHandler(async event => {
         ...artifact, workspaceIds, sizeBytes: artifact.size, encrypted: true, integrityVerified: true,
         // Names are best-effort current metadata; IDs remain the durable restore authority.
         workspaceMembers: workspaceIds.map(id => {
+          const captured = artifact.workspaceMembers?.find(
+            (member) => member.id === id,
+          );
           const container = containers.get(id);
           const storedWorker = workers.findById(id);
-          const displayName = container?.userId === artifact.userId
-            ? container.displayName
-            : storedWorker?.userId === artifact.userId
-              ? storedWorker.displayName
-              : undefined;
+          const displayName =
+            captured?.displayName ??
+            (container?.userId === artifact.userId
+              ? container.displayName
+              : storedWorker?.userId === artifact.userId
+                ? storedWorker.displayName
+                : undefined);
           return displayName ? { id, displayName } : { id };
         }),
       };

@@ -249,8 +249,10 @@ test.describe
     expect(JSON.stringify(repository)).not.toContain(PAT);
 
     // The repository is a recovery source, not a mirror that deletes local
-    // state. Pulling after a local deletion recreates an equivalent reusable
-    // definition with a fresh local identity and the same visibility scope.
+    // state. A recovered reusable plugin retains its durable catalog identity:
+    // image composition and portable worker reconstruction reference plugin
+    // definition IDs, so minting a local replacement ID would make those
+    // references impossible to resolve faithfully after recovery.
     expect(
       (await ctx.delete(`/api/plugins/definitions/${plugin.id}`)).status(),
     ).toBe(204);
@@ -260,7 +262,7 @@ test.describe
     expect(pull.status()).toBe(200);
     const pulled = await pull.json();
     expect(pulled.importedPlugins).toHaveLength(1);
-    expect(pulled.importedPlugins[0]).not.toBe(plugin.id);
+    expect(pulled.importedPlugins[0]).toBe(plugin.id);
     const recoveredPlugins = await (
       await ctx.get("/api/plugins/definitions")
     ).json();

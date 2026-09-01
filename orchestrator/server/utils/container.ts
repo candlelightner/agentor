@@ -39,11 +39,16 @@ import {
   sanitizeBackupPathTarPayload,
   validateGzipTarPayload,
   validateTarPayload,
+  readWorkerReconstruction,
+  writeWorkerReconstruction,
 } from "./worker-export";
+import { resolveWorkerReconstruction, snapshotWorkerReconstruction, type ReconstructionResolution } from "./worker-reconstruction";
+import { useImageCatalogManager } from "./image-catalog";
 import { recordWorkspaceTombstone } from "./workspace-tombstones";
 import type { WorkerExportManifest } from "./worker-export";
 import {
   readPortablePluginConfiguration,
+  rollbackRestoredWorkerPlugins,
   restoreWorkerPlugins,
   snapshotWorkerPlugins,
   writePortablePluginConfiguration,
@@ -55,6 +60,44 @@ import type {
   FileListing,
   MoveConflict,
 } from "../../shared/types";
+
+async function resolveImportedImage(
+  userId: string,
+  resolution: ReconstructionResolution,
+  override?: { mode: "replacement"; imageDefinitionId: string; imageVersion: string; imageDigest?: string; imageRuntimeReference?: string } | { mode: "workspace-only" },
+): Promise<{ imageDefinitionId?: string; imageVersion?: string; imageDigest?: string; imageRuntimeReference?: string }> {
+  if (override?.mode === "workspace-only") return {};
+  if (override?.mode === "replacement") {
+    const catalog = useImageCatalogManager();
+    await catalog.init();
+    const selected = catalog.resolveSelection(
+      userId,
+      override.imageDefinitionId,
+      override.imageVersion,
+    );
+    if (!selected || (override.imageDigest && selected.digest !== override.imageDigest))
+      throw Object.assign(new Error("The selected replacement image is unavailable or does not match its requested digest."), {
+        statusCode: 409,
+        code: "IMAGE_REPLACEMENT_UNAVAILABLE",
+      });
+    return {
+      imageDefinitionId: selected.definitionId,
+      imageVersion: selected.version,
+      imageDigest: selected.digest,
+      ...(selected.runtimeImage
+        ? { imageRuntimeReference: selected.runtimeImage }
+        : {}),
+    };
+  }
+  if (resolution.state === "resolved") return resolution.image ?? {};
+  if (resolution.state === "unresolved") {
+    const error = Object.assign(new Error("The backup requires a custom image that is unavailable. Recover the image definition, rebuild it, pull its immutable reference, select a replacement image, or restore workspace-only."), {
+      statusCode: 409, code: resolution.code, reconstruction: resolution.required,
+    });
+    throw error;
+  }
+  return {};
+}
 import {
   withOwnerLifecycleMutation,
   withOwnerWorkerLifecycleMutation,
@@ -3075,6 +3118,7 @@ for p in sys.argv[1:]:
           workspace: includeWorkspace,
           agents: includeAgents,
           ...(hasPlugins ? { plugins: true } : {}),
+          reconstruction: true,
         },
         missingSecrets: (
           await useWorkerConfigStore().resolveValues(info.userId, info.id)
@@ -3099,6 +3143,16 @@ for p in sys.argv[1:]:
         );
         files.push({ name: BUNDLE_FILES.plugins, path: pluginPath });
       }
+      const catalog = useImageCatalogManager();
+      await catalog.init();
+      const definition = info.imageDefinitionId
+        ? catalog.list(info.userId, false).find((item) => item.id === info.imageDefinitionId)
+        : undefined;
+      const reconstruction = snapshotWorkerReconstruction(info, definition);
+      reconstruction.requiredSecretNames = manifest.missingSecrets ?? [];
+      const reconstructionPath = join(tmpDir, BUNDLE_FILES.reconstruction);
+      bytesProcessed += await writeWorkerReconstruction(reconstructionPath, reconstruction);
+      files.push({ name: BUNDLE_FILES.reconstruction, path: reconstructionPath });
 
       if (includeWorkspace) {
         const wsSrc = await this.dockerService.getArchive(
@@ -3183,7 +3237,7 @@ for p in sys.argv[1:]:
   async importWorker(
     userId: string,
     bundlePath: string,
-    opts: { displayName?: string },
+    opts: { displayName?: string; imageResolution?: { mode: "replacement"; imageDefinitionId: string; imageVersion: string; imageDigest?: string; imageRuntimeReference?: string } | { mode: "workspace-only" } } = {},
   ): Promise<ContainerInfo & { missingSecrets?: string[] }> {
     if (!userId) throw new Error("import: userId is required");
     // Environment recreation is visible owner-wide. Share the owner mutation
@@ -3201,7 +3255,18 @@ for p in sys.argv[1:]:
   private async importWorkerForOwner(
     userId: string,
     bundlePath: string,
-    opts: { displayName?: string },
+    opts: {
+      displayName?: string;
+      imageResolution?:
+        | {
+            mode: "replacement";
+            imageDefinitionId: string;
+            imageVersion: string;
+            imageDigest?: string;
+            imageRuntimeReference?: string;
+          }
+        | { mode: "workspace-only" };
+    },
   ): Promise<ContainerInfo & { missingSecrets?: string[] }> {
     const workDir = join(this.config.dataDir, "tmp", `import-${randomUUID()}`);
     let createdImportEnvironmentId: string | undefined;
@@ -3215,6 +3280,7 @@ for p in sys.argv[1:]:
         agentsPath,
         backupPathsPath,
         pluginConfigurationPath,
+        reconstructionPath,
       } = await extractBundle(bundlePath, workDir);
       if (!manifest || typeof manifest.version !== "number") {
         throw new Error("Invalid worker export bundle");
@@ -3240,6 +3306,27 @@ for p in sys.argv[1:]:
       const pluginConfiguration = pluginConfigurationPath
         ? await readPortablePluginConfiguration(pluginConfigurationPath)
         : undefined;
+      const reconstruction = reconstructionPath
+        ? await readWorkerReconstruction(reconstructionPath)
+        : undefined;
+      const reconstructionResolution = await resolveWorkerReconstruction(userId, reconstruction);
+      // An explicitly captured rootfs is itself the image dependency. Keep
+      // existing full-export portability without requiring a matching catalog,
+      // while replacement/workspace-only modes deliberately ignore it.
+      const useCapturedRootfs = Boolean(
+        rootfsPath && manifest.contents?.rootfs && !opts.imageResolution,
+      );
+      const resolvedImage = useCapturedRootfs
+        ? {}
+        : await resolveImportedImage(
+            userId,
+            reconstructionResolution,
+            opts.imageResolution,
+          );
+      if (resolvedImage.imageRuntimeReference)
+        await this.dockerService.ensureImage(
+          resolvedImage.imageRuntimeReference,
+        );
       if (rootfsPath)
         await (rootfsCompressed
           ? validateGzipTarPayload(rootfsPath)
@@ -3294,7 +3381,7 @@ for p in sys.argv[1:]:
       // Import the captured rootfs into a per-worker image (best-effort).
       let importedImage: string | undefined;
       let imageConfig: ImageConfigOverride | undefined;
-      if (rootfsPath && manifest.contents?.rootfs) {
+      if (useCapturedRootfs && rootfsPath) {
         const repo = `${IMPORT_IMAGE_PREFIX}${id}`;
         const candidateImage = `${repo}:latest`;
         try {
@@ -3314,6 +3401,16 @@ for p in sys.argv[1:]:
           await removeFailedImportedImage(candidateImage, () =>
             this.dockerService.removeImage(candidateImage),
           );
+          if (reconstruction?.image.kind === "custom")
+            throw Object.assign(
+              new Error(
+                "The captured custom image could not be imported. Retry, recover the referenced image, select a replacement image, or explicitly restore workspace-only.",
+              ),
+              {
+                statusCode: 409,
+                code: "CAPTURED_IMAGE_IMPORT_FAILED",
+              },
+            );
           useLogger().warn(
             `[container] import: rootfs import failed, using standard image: ${err instanceof Error ? err.message : err}`,
           );
@@ -3327,9 +3424,7 @@ for p in sys.argv[1:]:
       // removal, this provisional entry is the authoritative handle that lets
       // the owner retry deletion by stable worker UUID instead of leaving only
       // an operator-facing Docker name behind.
-      const imageName =
-        importedImage ||
-        this.config.workerImagePrefix + this.config.workerImage;
+      const imageName = importedImage || resolvedImage.imageRuntimeReference || this.config.workerImagePrefix + this.config.workerImage;
       const now = new Date().toISOString();
       const containerInfo: ContainerInfo = {
         id,
@@ -3348,6 +3443,7 @@ for p in sys.argv[1:]:
         environmentId,
         pendingRebuild: false,
         ...(importedImage ? { importedImage } : {}),
+        ...(!importedImage ? resolvedImage : {}),
       };
       this.containers.set(id, containerInfo);
 
@@ -3377,6 +3473,9 @@ for p in sys.argv[1:]:
       // Create the container stopped so volumes can be populated before the
       // entrypoint runs, then restore the volume tars, then start.
       let container: Awaited<ReturnType<DockerService["createWorkerContainer"]>>;
+      let restoredPlugins:
+        | Awaited<ReturnType<typeof restoreWorkerPlugins>>
+        | undefined;
       try {
         container = await this.dockerService.createWorkerContainer({
           userId,
@@ -3394,7 +3493,7 @@ for p in sys.argv[1:]:
           storageManager: this.storageManager,
           userEnv,
           workerConfig,
-          image: importedImage,
+          image: importedImage || resolvedImage.imageRuntimeReference,
           imageConfig,
           start: false,
         });
@@ -3476,7 +3575,7 @@ for p in sys.argv[1:]:
             usePluginInstallationStore,
             usePluginRuntimeManager,
           } = await import("./services");
-          await restoreWorkerPlugins(
+          restoredPlugins = await restoreWorkerPlugins(
             pluginConfiguration,
             userId,
             id,
@@ -3493,14 +3592,37 @@ for p in sys.argv[1:]:
           );
         }
       } catch (err) {
-        await this.rollbackFailedProvisionedWorker({
-          id,
-          userId,
-          containerId: container.id,
-          containerName,
-          dockerEnabled,
-          importedImage,
-        });
+        let pluginCleanupError: unknown;
+        if (restoredPlugins) {
+          const { usePluginDefinitionStore, usePluginInstallationStore } =
+            await import("./services");
+          try {
+            await rollbackRestoredWorkerPlugins(
+              userId,
+              id,
+              restoredPlugins,
+              usePluginDefinitionStore(),
+              usePluginInstallationStore(),
+            );
+          } catch (cleanupError) {
+            pluginCleanupError = cleanupError;
+          }
+        }
+        try {
+          await this.rollbackFailedProvisionedWorker({
+            id,
+            userId,
+            containerId: container.id,
+            containerName,
+            dockerEnabled,
+            importedImage,
+          });
+        } finally {
+          if (pluginCleanupError)
+            throw new Error("Imported plugin cleanup requires operator attention", {
+              cause: pluginCleanupError,
+            });
+        }
         throw err;
       }
 

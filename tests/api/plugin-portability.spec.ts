@@ -6,6 +6,7 @@ import { PluginDefinitionStore } from "../../orchestrator/server/utils/plugin-de
 import { PluginInstallationStore } from "../../orchestrator/server/utils/plugin-installation-store";
 import {
   readPortablePluginConfiguration,
+  rollbackRestoredWorkerPlugins,
   restoreWorkerPlugins,
   snapshotWorkerPlugins,
   writePortablePluginConfiguration,
@@ -70,6 +71,35 @@ test("plugin clone/export snapshot is credential-free and remints worker-local s
     expect(copiedDefinition).toMatchObject({
       scope: "worker", userId: "owner-b", workerId: "worker-b", builtIn: false,
     });
+
+    // A later import/reconciliation failure must remove only this restore
+    // attempt's definitions/installations, including any locally allocated
+    // runtime resources. It must not preserve source ports/displays/sessions.
+    await installations.reserveResources(
+      "owner-b",
+      restored[0]!.id,
+      copiedDefinition.manifest,
+    );
+    expect(installations.getById(restored[0]!.id)?.allocations).toBeDefined();
+    await rollbackRestoredWorkerPlugins(
+      "owner-b",
+      "worker-b",
+      result,
+      definitions,
+      installations,
+    );
+    expect(installations.listForWorker("owner-b", "worker-b")).toEqual([]);
+    expect(definitions.getById(copiedDefinition.id)).toBeUndefined();
+    // Idempotent retry cleanup is safe after a partial/later failure.
+    await expect(
+      rollbackRestoredWorkerPlugins(
+        "owner-b",
+        "worker-b",
+        result,
+        definitions,
+        installations,
+      ),
+    ).resolves.toBeUndefined();
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

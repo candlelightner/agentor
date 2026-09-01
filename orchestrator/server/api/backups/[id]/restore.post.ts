@@ -13,6 +13,12 @@ defineRouteMeta({
               target: { type: "string", enum: ["new", "original"] },
               displayName: { type: "string" },
               workspaceIds: { type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true, description: "Optional non-empty, duplicate-free exact subset of artifact workspaces; omit to restore all members" } as any,
+              requestId: { type: "string", maxLength: 200 } as any,
+              imageResolutions: {
+                type: "object",
+                description:
+                  "Per-workspace exact, explicit replacement, or acknowledged workspace-only image resolution.",
+              },
               confirmOverwrite: { type: "boolean" },
               lockPassword: {
                 type: "string",
@@ -55,6 +61,17 @@ export default defineEventHandler(async (event) => {
     confirmOverwrite?: boolean;
     lockPassword?: unknown;
     workspaceIds?: string[];
+    requestId?: string;
+    imageResolutions?: Record<
+      string,
+      | { mode: "exact" }
+      | { mode: "workspace-only"; acknowledged: true }
+      | {
+          mode: "replacement";
+          imageDefinitionId: string;
+          imageVersion: string;
+        }
+    >;
   }>(event);
   const target = body?.target ?? "new";
   if (target !== "new" && target !== "original")
@@ -85,6 +102,8 @@ export default defineEventHandler(async (event) => {
       body?.displayName,
       body?.lockPassword,
       body?.workspaceIds,
+      body?.requestId,
+      body?.imageResolutions,
     );
   } catch (error: any) {
     if (typeof error?.statusCode === "number") throw error;
@@ -92,8 +111,17 @@ export default defineEventHandler(async (event) => {
       statusCode: 400,
       statusMessage:
         error instanceof Error ? error.message : "Invalid restore request",
+      data: error?.data,
     });
   }
   setResponseStatus(event, 202);
-  return { jobId: job.id };
+  return {
+    jobId: job.id,
+    status: job.status,
+    next: {
+      status: `/api/backup-jobs/${job.id}`,
+      logs: `/api/backups/jobs/${job.id}/logs`,
+      cancel: `/api/backup-jobs/${job.id}`,
+    },
+  };
 });

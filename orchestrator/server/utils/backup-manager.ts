@@ -15,22 +15,37 @@ import {
   LocalBackupProvider,
   FakeBackupProvider,
   GoogleDriveBackupProvider,
+  MAX_BACKUP_PROVIDER_OBJECT_BYTES,
   exchangeGoogleAuthorizationCode,
   publicBackupFailure,
   type BackupProvider,
   type GoogleDriveToken,
 } from "./backup-provider";
-import { encryptBackup, decryptBackup } from "./backup-crypto";
+import {
+  decryptBackup,
+  decryptBackupV1WithMaterial,
+  decryptBackupV2,
+  encryptedBackupPayloadSha256,
+  encryptBackupV2,
+  inspectBackupV2,
+} from "./backup-crypto";
+import { BackupKeyring } from "./backup-keyring";
 import type {
   BackupArtifact,
   BackupConfig,
+  BackupDependency,
+  BackupImageResolution,
   BackupJob,
   BackupProviderKind,
+  BackupWorkspaceReconstructionSummary,
+  RemoteBackupRecord,
 } from "./backup-types";
 import {
   useConfig,
   useContainerManager,
   useLogger,
+  usePluginDefinitionStore,
+  usePluginInstallationStore,
   useWorkerStore,
 } from "./services";
 import { useWorkerConfigStore } from "./worker-config-store";
@@ -39,12 +54,20 @@ import {
   encryptWorkerValue,
   type EncryptedWorkerValue,
 } from "./worker-config-crypto";
-import { packWorkspaceBackups, unpackWorkspaceBackups } from "./backup-bundle";
+import {
+  inspectWorkspaceBackups,
+  packWorkspaceBackups,
+  unpackWorkspaceBackups,
+} from "./backup-bundle";
 import { extraBackupPaths, normalizeBackupPaths } from "./backup-paths";
-import { extractBundle } from "./worker-export";
+import {
+  extractBundle,
+  readWorkerReconstruction,
+} from "./worker-export";
 import { replaceStoppedWorkspace } from "./backup-restore-helper";
 import { useWorkerProtectionLockStore } from "./worker-protection-lock";
 import { useGoogleBackupOAuthConfigStore } from "./google-backup-oauth-config";
+import { useImageCatalogManager } from "./image-catalog";
 import Docker from "dockerode";
 import {
   useDockerService,
@@ -65,9 +88,19 @@ import {
   writeFilteredAgentsGz,
   writeGzipFile,
   writeManifest,
+  writeWorkerReconstruction,
   type WorkerExportManifest,
 } from "./worker-export";
 import { assertSafeUserId } from "./user-id";
+import {
+  snapshotWorkerPlugins,
+  writePortablePluginConfiguration,
+} from "./plugin-portability";
+import { snapshotWorkerReconstruction } from "./worker-reconstruction";
+import { resolveWorkerReconstruction } from "./worker-reconstruction";
+import { readPortablePluginConfiguration } from "./plugin-portability";
+import { backupInstallationId } from "./backup-installation";
+import { pluginDefinitionHash } from "./plugin-manifest";
 
 interface RestoreExecution {
   controller: AbortController;
@@ -90,6 +123,7 @@ interface BackupQueueEntry {
 export class BackupManager {
   private readonly dataDir: string;
   private store: BackupStore;
+  private keyring: BackupKeyring;
   private initialized?: Promise<void>;
   private scheduleTimer?: NodeJS.Timeout;
   private active = 0;
@@ -144,6 +178,10 @@ export class BackupManager {
         await mkdir(path, { recursive: true, mode: 0o700 });
       });
     this.store = new BackupStore(this.dataDir);
+    this.keyring = new BackupKeyring(
+      { ...useConfig(), dataDir: this.dataDir },
+      join(this.dataDir, "backup-keyring.json"),
+    );
     this.fake = new FakeBackupProvider(join(this.dataDir, "backup-fake"));
     this.providers = new Map<BackupProviderKind, BackupProvider>([
       ["local", new LocalBackupProvider(join(this.dataDir, "backup-objects"))],
@@ -197,9 +235,12 @@ export class BackupManager {
           // The process that owned an interrupted provider transfer is gone.
           // Remove deterministic per-job scratch before publishing failure so
           // a hard restart cannot strand large encrypted/decrypted archives.
-          const resumable = job.target
-            ? undefined
-            : await readInterruptedBackupResume(this.dataDir, job.id);
+          const operation =
+            job.operation ?? (job.target ? "restore" : "backup");
+          const resumable =
+            operation === "backup"
+              ? await readInterruptedBackupResume(this.dataDir, job.id)
+              : undefined;
           if (resumable) {
             await rm(join(this.dataDir, "tmp", `restore-${job.id}`), {
               recursive: true,
@@ -214,11 +255,17 @@ export class BackupManager {
           }
           job.status = "failed";
           job.phase = "failed";
-          job.error = job.target
-            ? "Restore interrupted by orchestrator restart"
-            : resumable
-              ? "Backup interrupted by orchestrator restart. Retry is available."
-              : "Backup interrupted by orchestrator restart";
+          job.error =
+            operation === "restore"
+              ? "Restore interrupted by orchestrator restart"
+              : operation === "discovery"
+                ? "Provider discovery was interrupted by orchestrator restart. Retry is available."
+                : operation === "adoption"
+                  ? "Backup adoption was interrupted by orchestrator restart. The discovered record was retained and retry is available."
+                  : resumable
+                    ? "Backup interrupted by orchestrator restart. Retry is available."
+                    : "Backup interrupted by orchestrator restart";
+          job.retryable = operation !== "restore" || job.target !== "original";
           job.completedAt = job.updatedAt = new Date().toISOString();
           await this.store.update(job.userId, (data) => {
             const index = data.jobs.findIndex(
@@ -425,6 +472,7 @@ export class BackupManager {
     attempt = 1,
     resumed = 0,
     selectedPathsByWorkspace?: Record<string, string[]>,
+    requestId?: string,
   ): Promise<BackupJob> {
     await this.init();
     this.assertOwnerAvailable(userId);
@@ -465,6 +513,24 @@ export class BackupManager {
           : "Offline workspaces are read through a hardened read-only snapshot helper.",
     };
     const now = new Date().toISOString();
+    const normalizedRequestId = normalizeBackupRequestId(requestId);
+    const fingerprint = normalizedRequestId
+      ? requestFingerprint({
+          operation: "backup",
+          provider,
+          workspaceIds: [...unique].sort(),
+          selectedPathsByWorkspace: paths
+            ? Object.fromEntries(
+                Object.entries(paths)
+                  .sort(([left], [right]) => left.localeCompare(right))
+                  .map(([workspaceId, selectedPaths]) => [
+                    workspaceId,
+                    [...selectedPaths].sort(),
+                  ]),
+              )
+            : undefined,
+        })
+      : undefined;
     const job: BackupJob = {
       schemaVersion: 1,
       id: randomUUID(),
@@ -481,12 +547,20 @@ export class BackupManager {
       updatedAt: now,
       attempt,
       resumedFromChunk: resumed,
+      operation: "backup",
+      ...(normalizedRequestId ? { requestId: normalizedRequestId } : {}),
+      ...(fingerprint ? { requestFingerprint: fingerprint } : {}),
       consistency,
       ...(paths ? { selectedPathsByWorkspace: paths } : {}),
     };
-    await this.store.update(userId, (data) => {
-      data.jobs.push(structuredClone(job));
-    });
+    if (normalizedRequestId) {
+      const claimed = await this.claimStartJob(job);
+      if (!claimed.created) return sanitizeJob(claimed.job);
+    } else {
+      await this.store.update(userId, (data) => {
+        data.jobs.push(structuredClone(job));
+      });
+    }
     this.enqueue(job.id, job.userId, () => this.runV2(job));
     return sanitizeJob(job);
   }
@@ -495,13 +569,32 @@ export class BackupManager {
     const job = this.store.findJob(id);
     return job ? sanitizeJob(job) : undefined;
   }
+  async getJobLogs(id: string, after = 0, limit = 100) {
+    await this.init();
+    const job = this.store.findJob(id);
+    if (!job) return undefined;
+    const start = Number.isSafeInteger(after) ? Math.max(0, after) : 0;
+    const count = Number.isSafeInteger(limit)
+      ? Math.max(1, Math.min(200, limit))
+      : 100;
+    const all = job.logs ?? [];
+    const end = Math.min(all.length, start + count);
+    return {
+      jobId: job.id,
+      after: start,
+      next: end,
+      hasMore: end < all.length,
+      logs: all.slice(start, end),
+    };
+  }
   async getArtifact(id: string) {
     await this.init();
     return this.store.findArtifact(id);
   }
-  connectFake(userId: string, chunkSize?: number) {
+  connectFake(userId: string, chunkSize?: number, accountId?: string) {
     this.assertOwnerAvailable(userId);
     this.fakeUsers.add(userId);
+    if (accountId) this.fake.bindAccount(userId, accountId);
     return this.fake.connect(userId, chunkSize);
   }
   setFakeFault(userId: string, chunk: number, count: number) {
@@ -566,9 +659,11 @@ export class BackupManager {
       throw new Error("A retry is already being queued for this job");
     this.retryClaims.add(job.id);
     let restoreArtifact: BackupArtifact | undefined;
+    let remoteBackup: RemoteBackupRecord | undefined;
     let restorePinOwner: string | undefined;
     try {
-      if (job.target) {
+      const operation = job.operation ?? (job.target ? "restore" : "backup");
+      if (operation === "restore") {
         if (job.target === "original")
           throw new Error(
             "Original-worker restores cannot be retried; submit a new restore with the worker lock password",
@@ -578,10 +673,34 @@ export class BackupManager {
           : undefined;
         if (!restoreArtifact || restoreArtifact.userId !== job.userId)
           throw new Error("The restore artifact is no longer available");
-        this.selectRestoreWorkspaceIds(
+        const retryWorkspaceIds = this.selectRestoreWorkspaceIds(
           this.artifactWorkspaceIds(restoreArtifact),
           job.selectedWorkspaceIds ?? job.workspaceIds,
         );
+        job.dependencies = await this.preflightRestoreDependencies(
+          job.userId,
+          restoreArtifact,
+          retryWorkspaceIds,
+          job.imageResolutions,
+        );
+        restorePinOwner = this.restorePinOwner(job.id, job.attempt + 1);
+        this.pinRestoreArtifact(restorePinOwner, restoreArtifact);
+      } else if (operation === "adoption") {
+        remoteBackup = job.remoteBackupId
+          ? this.findRemoteBackup(job.userId, job.remoteBackupId)
+          : undefined;
+        if (!remoteBackup)
+          throw new Error("The discovered remote backup is no longer available");
+      } else if (operation === "discovery") {
+        if (!this.providers.get(job.provider)?.discover)
+          throw new Error("This backup provider no longer supports discovery");
+      } else if (operation === "dependency-resolution") {
+        restoreArtifact = job.artifactId ? await this.getArtifact(job.artifactId) : undefined;
+        if (!restoreArtifact || restoreArtifact.userId !== job.userId)
+          throw new Error("The recovery artifact is no longer available");
+        const workspaceId = job.selectedWorkspaceIds?.[0];
+        if (!workspaceId || !this.artifactWorkspaceIds(restoreArtifact).includes(workspaceId))
+          throw new Error("The selected recovery workspace is no longer available");
         restorePinOwner = this.restorePinOwner(job.id, job.attempt + 1);
         this.pinRestoreArtifact(restorePinOwner, restoreArtifact);
       }
@@ -599,8 +718,9 @@ export class BackupManager {
       job.integrityVerified = undefined;
       job.completedAt = undefined;
       job.updatedAt = new Date().toISOString();
+      appendBackupJobLog(job, `Retry ${job.attempt} queued.`);
       await this.saveJob(job);
-      if (job.target) {
+      if (operation === "restore") {
         this.enqueue(job.id, job.userId, () =>
           this.runRestoreV2(
             job,
@@ -609,7 +729,17 @@ export class BackupManager {
             restorePinOwner!,
           ),
         );
-      } else this.enqueue(job.id, job.userId, () => this.runV2(job));
+      } else if (operation === "discovery")
+        this.enqueue(job.id, job.userId, () => this.runDiscovery(job));
+      else if (operation === "adoption")
+        this.enqueue(job.id, job.userId, () =>
+          this.runAdoption(job, remoteBackup!),
+        );
+      else if (operation === "dependency-resolution")
+        this.enqueue(job.id, job.userId, () =>
+          this.runImageRecovery(job, restoreArtifact!, job.recoverImageStartBuild !== false, restorePinOwner!),
+        );
+      else this.enqueue(job.id, job.userId, () => this.runV2(job));
       return sanitizeJob(job);
     } catch (error) {
       if (restorePinOwner) this.releaseRestoreArtifactPin(restorePinOwner);
@@ -650,7 +780,7 @@ export class BackupManager {
               name: "AbortError",
             }),
           );
-        if (queued && job.target)
+        if (queued && (job.target || job.operation === "dependency-resolution"))
           this.releaseRestoreArtifactPin(
             this.restorePinOwner(job.id, job.attempt),
           );
@@ -675,6 +805,1356 @@ export class BackupManager {
       config: d.config ? sanitizeConfig(d.config) : undefined,
       jobs: d.jobs.map(sanitizeJob),
       artifacts: d.artifacts,
+      remoteBackups: await Promise.all(
+        d.remoteBackups.map((record) => this.publicRemoteBackup(record)),
+      ),
+    };
+  }
+
+  async recoveryKeyStatus(userId: string) {
+    await this.init();
+    this.assertOwnerAvailable(userId);
+    const keys = await this.keyring.status(userId);
+    const active = keys.find((key) => key.active);
+    return {
+      activeFingerprint: active?.fingerprint ?? (await this.keyring.active(userId)).fingerprint,
+      keys: await this.keyring.status(userId),
+    };
+  }
+
+  async importRecoveryKit(userId: string, material: unknown) {
+    await this.init();
+    this.assertOwnerAvailable(userId);
+    const imported = await this.keyring.importKit(userId, material);
+    return {
+      imported: true,
+      fingerprint: imported.fingerprint,
+      active: imported.active,
+      matchingRemoteBackupIds: this.store
+        .get(userId)
+        .remoteBackups.filter(
+          (record) =>
+            (record.keyFingerprint ?? record.remote.keyFingerprint) ===
+            imported.fingerprint,
+        )
+        .map(({ id }) => id),
+    };
+  }
+
+  async exportRecoveryKit(userId: string, fingerprint?: string) {
+    await this.init();
+    this.assertOwnerAvailable(userId);
+    return this.keyring.exportKit(userId, fingerprint);
+  }
+
+  async listRemoteBackups(userId: string) {
+    await this.init();
+    this.assertOwnerAvailable(userId);
+    return Promise.all(
+      this.store
+        .get(userId)
+        .remoteBackups.map((record) => this.publicRemoteBackup(record)),
+    );
+  }
+
+  async getRemoteBackup(id: string) {
+    await this.init();
+    for (const userId of this.store.userIds()) {
+      const record = this.store
+        .get(userId)
+        .remoteBackups.find((candidate) => candidate.id === id);
+      if (record) return this.publicRemoteBackup(record);
+    }
+  }
+
+  async createDiscovery(
+    userId: string,
+    providerOverride?: BackupProviderKind,
+    requestId?: string,
+  ): Promise<BackupJob> {
+    await this.init();
+    this.assertOwnerAvailable(userId);
+    const provider =
+      providerOverride ?? this.store.get(userId).config?.provider ?? "local";
+    const implementation = this.providers.get(provider);
+    if (!implementation?.discover)
+      throw Object.assign(
+        new Error("This backup provider does not support remote discovery"),
+        { statusCode: 501 },
+      );
+    if (provider === "fake" && !this.fakeUsers.has(userId))
+      throw Object.assign(new Error("Fake provider is not connected"), {
+        statusCode: 409,
+      });
+    const normalizedRequestId = normalizeBackupRequestId(requestId);
+    const fingerprint = requestFingerprint({ operation: "discovery", provider });
+    const now = new Date().toISOString();
+    const candidate: BackupJob = {
+      schemaVersion: 1,
+      id: randomUUID(),
+      userId,
+      ownerId: userId,
+      workspaceId: userId,
+      provider,
+      status: "queued",
+      phase: "queued",
+      progress: 0,
+      bytesProcessed: 0,
+      createdAt: now,
+      updatedAt: now,
+      attempt: 1,
+      operation: "discovery",
+      requestFingerprint: fingerprint,
+      ...(normalizedRequestId ? { requestId: normalizedRequestId } : {}),
+      logs: ["Remote provider scan queued."],
+    };
+    const claimed = await this.claimStartJob(candidate);
+    if (!claimed.created) return sanitizeJob(claimed.job);
+    this.enqueue(candidate.id, userId, () => this.runDiscovery(candidate));
+    return sanitizeJob(candidate);
+  }
+
+  async createAdoption(
+    userId: string,
+    remoteBackupId: string,
+    requestId?: string,
+  ): Promise<BackupJob> {
+    await this.init();
+    this.assertOwnerAvailable(userId);
+    const remote = this.findRemoteBackup(userId, remoteBackupId);
+    if (!remote)
+      throw Object.assign(new Error("Remote backup not found"), {
+        statusCode: 404,
+      });
+    if (remote.remote.incomplete || remote.state === "incomplete")
+      throw Object.assign(
+        new Error("The provider upload is incomplete and cannot be adopted"),
+        { statusCode: 409, code: "BACKUP_UPLOAD_INCOMPLETE" },
+      );
+    if (
+      remote.remote.size > MAX_BACKUP_PROVIDER_OBJECT_BYTES ||
+      remote.state === "too-large"
+    )
+      throw Object.assign(
+        new Error(
+          "The provider backup object exceeds Agentor's staging size limit and cannot be adopted.",
+        ),
+        { statusCode: 409, code: "BACKUP_OBJECT_TOO_LARGE" },
+      );
+    if ((remote.formatVersion ?? remote.remote.formatVersion) &&
+        ![1, 2].includes(remote.formatVersion ?? remote.remote.formatVersion!))
+      throw Object.assign(
+        new Error("The remote backup format is not supported by this Agentor version"),
+        { statusCode: 409, code: "BACKUP_FORMAT_UNSUPPORTED" },
+      );
+    const existingArtifact = this.store
+      .get(userId)
+      .artifacts.find(
+        (artifact) =>
+          artifact.provider === remote.provider &&
+          artifact.providerObjectId === remote.providerObjectId,
+      );
+    const normalizedRequestId = normalizeBackupRequestId(requestId);
+    const fingerprint = requestFingerprint({
+      operation: "adoption",
+      provider: remote.provider,
+      providerObjectId: remote.providerObjectId,
+    });
+    const now = new Date().toISOString();
+    const candidate: BackupJob = {
+      schemaVersion: 1,
+      id: randomUUID(),
+      userId,
+      ownerId: userId,
+      workspaceId: userId,
+      provider: remote.provider,
+      status: existingArtifact ? "succeeded" : "queued",
+      phase: existingArtifact ? "complete" : "queued",
+      progress: existingArtifact ? 100 : 0,
+      bytesProcessed: 0,
+      createdAt: now,
+      updatedAt: now,
+      ...(existingArtifact ? { completedAt: now } : {}),
+      attempt: 1,
+      operation: "adoption",
+      remoteBackupId: remote.id,
+      ...(existingArtifact
+        ? {
+            artifactId: existingArtifact.id,
+            backupId: existingArtifact.id,
+            integrityVerified: existingArtifact.integrityStatus === "verified",
+          }
+        : {}),
+      requestFingerprint: fingerprint,
+      ...(normalizedRequestId ? { requestId: normalizedRequestId } : {}),
+      logs: [
+        existingArtifact
+          ? "Remote backup was already adopted."
+          : "Remote backup adoption queued.",
+      ],
+    };
+    const claimed = await this.claimStartJob(candidate);
+    if (!claimed.created) return sanitizeJob(claimed.job);
+    if (!existingArtifact)
+      this.enqueue(candidate.id, userId, () =>
+        this.runAdoption(candidate, remote),
+      );
+    return sanitizeJob(candidate);
+  }
+
+  /** Recover exactly one captured custom-image recipe from an authorized,
+   * already retained artifact.  Context bytes deliberately remain inside the
+   * encrypted archive; the durable job records only catalog/build identities. */
+  async createImageRecovery(
+    userId: string,
+    artifactId: string,
+    workspaceId: string,
+    requestId?: string,
+    startBuild = true,
+  ): Promise<BackupJob> {
+    await this.init();
+    this.assertOwnerAvailable(userId);
+    const artifact = this.store.get(userId).artifacts.find((item) => item.id === artifactId);
+    if (!artifact || artifact.deletionPending)
+      throw Object.assign(new Error("Backup artifact not found"), { statusCode: 404 });
+    if (!this.artifactWorkspaceIds(artifact).includes(workspaceId))
+      throw Object.assign(new Error("Selected workspace is not contained in this backup artifact"), { statusCode: 400 });
+    const summary = artifact.reconstruction?.find((item) => item.workspaceId === workspaceId);
+    if (!summary || summary.image.kind !== "custom" || summary.image.recoveryAvailable !== true)
+      throw Object.assign(
+        new Error("This workspace has no portable custom-image recipe. Select a replacement image or explicitly restore workspace-only."),
+        { statusCode: 409, code: "BACKUP_IMAGE_RECIPE_UNAVAILABLE" },
+      );
+    const normalizedRequestId = normalizeBackupRequestId(requestId);
+    const fingerprint = requestFingerprint({
+      operation: "dependency-resolution",
+      artifactId,
+      workspaceId,
+      startBuild,
+    });
+    const now = new Date().toISOString();
+    const candidate: BackupJob = {
+      schemaVersion: 1, id: randomUUID(), userId, ownerId: userId,
+      workspaceId, workspaceIds: [workspaceId], artifactWorkspaceIds: this.artifactWorkspaceIds(artifact),
+      selectedWorkspaceIds: [workspaceId], artifactId, provider: artifact.provider,
+      status: "queued", phase: "queued", progress: 0, bytesProcessed: 0,
+      createdAt: now, updatedAt: now, attempt: 1,
+      operation: "dependency-resolution", requestFingerprint: fingerprint,
+      recoverImageStartBuild: startBuild,
+      ...(normalizedRequestId ? { requestId: normalizedRequestId } : {}),
+      logs: ["Portable image recipe recovery queued."],
+    };
+    const pinOwner = this.restorePinOwner(candidate.id, candidate.attempt);
+    this.pinRestoreArtifact(pinOwner, artifact);
+    try {
+      const claimed = await this.claimStartJob(candidate);
+      if (!claimed.created) {
+        this.releaseRestoreArtifactPin(pinOwner);
+        return sanitizeJob(claimed.job);
+      }
+      this.enqueue(candidate.id, userId, () =>
+        this.runImageRecovery(candidate, artifact, startBuild, pinOwner),
+      );
+    } catch (error) {
+      this.releaseRestoreArtifactPin(pinOwner);
+      throw error;
+    }
+    return sanitizeJob(candidate);
+  }
+
+  private async runImageRecovery(
+    job: BackupJob,
+    artifact: BackupArtifact,
+    startBuild: boolean,
+    pinOwner: string,
+  ) {
+    const controller = new AbortController();
+    this.controllers.set(job.id, controller);
+    const dir = join(this.dataDir, "tmp", `dependency-resolution-${job.id}`);
+    const assertActive = () => {
+      if (controller.signal.aborted || this.cancelledJobs.has(job.id) || job.status === "cancelled")
+        throw Object.assign(new Error("Image recovery cancelled"), { name: "AbortError" });
+    };
+    try {
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      job.status = "running";
+      job.phase = "downloading";
+      job.progress = 10;
+      job.startedAt ||= new Date().toISOString();
+      appendBackupJobLog(job, "Downloading the authenticated backup artifact to recover its image recipe.");
+      await this.saveJob(job);
+      const encrypted = join(dir, "archive.enc"), plain = join(dir, "bundle.tar");
+      await this.providers.get(artifact.provider)!.download(
+        job.userId, artifact.providerObjectId, encrypted, controller.signal,
+        { expectedSize: artifact.size, maxBytes: MAX_BACKUP_PROVIDER_OBJECT_BYTES },
+      );
+      assertActive();
+      if ((await stat(encrypted)).size !== artifact.size)
+        throw Object.assign(new Error("The provider object changed after adoption. Scan and adopt it again before recovering the image recipe."), { code: "BACKUP_REMOTE_OBJECT_CHANGED", statusCode: 409 });
+      job.phase = "verifying";
+      job.progress = 40;
+      appendBackupJobLog(job, "Authenticating and decrypting the retained backup before reading its image recipe.");
+      await this.saveJob(job);
+      await this.decryptArtifact(job.userId, artifact, encrypted, plain);
+      assertActive();
+      job.integrityVerified = true;
+      const workspaceId = job.selectedWorkspaceIds?.[0];
+      if (!workspaceId) throw new Error("Image recovery workspace selection is missing");
+      const bundles = await unpackWorkspaceBackups(
+        plain, this.artifactWorkspaceIds(artifact), [workspaceId], join(dir, "workspaces"),
+      );
+      const bundle = bundles[0];
+      if (!bundle) throw Object.assign(new Error("Selected workspace is absent from the authenticated backup"), { code: "BACKUP_MANIFEST_MISMATCH" });
+      const extracted = await extractBundle(bundle.path, join(dir, "workspace"));
+      if (!extracted.reconstructionPath)
+        throw Object.assign(new Error("This backup does not contain portable image reconstruction metadata. Select a replacement image or explicitly restore workspace-only."), { code: "BACKUP_IMAGE_RECIPE_UNAVAILABLE", statusCode: 409 });
+      const reconstruction = await readWorkerReconstruction(extracted.reconstructionPath);
+      if (reconstruction.image.kind !== "custom" || !reconstruction.image.definition)
+        throw Object.assign(new Error("The selected workspace has no embedded custom-image recipe. Select a replacement image or explicitly restore workspace-only."), { code: "BACKUP_IMAGE_RECIPE_UNAVAILABLE", statusCode: 409 });
+      assertActive();
+      job.phase = "importing-definition";
+      job.progress = 65;
+      appendBackupJobLog(job, "Importing a validated owner-scoped recovery copy of the custom image definition.");
+      await this.saveJob(job);
+      const catalog = useImageCatalogManager();
+      await catalog.init();
+      let definitionId = job.recoveredImageDefinitionId;
+      if (!definitionId) {
+        const recipe = reconstruction.image.definition;
+        const version = reconstruction.image.imageVersion;
+        const selectedPlugins =
+          version?.pluginComposition !== undefined
+            ? version.pluginComposition
+            : recipe.pluginComposition;
+        const pluginComposition = selectedPlugins?.length
+          ? await this.recoverImagePluginDefinitions(
+              job.userId,
+              extracted.pluginConfigurationPath,
+              selectedPlugins,
+            )
+          : undefined;
+        const definition = await catalog.create(job.userId, {
+          ...recipe,
+          name: `${recipe.name.slice(0, 84)} (recovered)`,
+          baseImage: version?.baseImage ?? recipe.baseImage,
+          contextFiles: version?.contextFiles ?? recipe.contextFiles,
+          provisioning: version?.provisioning ?? recipe.provisioning,
+          provisioningMode: version?.provisioningMode ?? recipe.provisioningMode,
+          // An explicitly empty version composition overrides the definition
+          // recipe. Set the field even though catalog validation later omits
+          // empty arrays, otherwise `...recipe` would resurrect old entries.
+          pluginComposition: pluginComposition ?? [],
+        });
+        definitionId = definition.id;
+        job.recoveredImageDefinitionId = definitionId;
+        await this.saveJob(job);
+      }
+      assertActive();
+      if (startBuild && !job.recoveredImageBuildId) {
+        job.phase = "starting-build";
+        job.progress = 80;
+        appendBackupJobLog(job, "Starting the ordinary asynchronous controlled image build.");
+        await this.saveJob(job);
+        const build = await catalog.startBuild(definitionId, job.userId, false, {
+          requestId: `backup-recovery-${job.id}`,
+        });
+        job.recoveredImageBuildId = build.id;
+      }
+      job.status = "succeeded";
+      job.phase = startBuild ? "build-started" : "definition-recovered";
+      job.progress = 100;
+      job.completedAt = job.updatedAt = new Date().toISOString();
+      appendBackupJobLog(job, startBuild ? "Recovery definition imported and its asynchronous image build started." : "Recovery definition imported. Start an image build when ready.");
+      await this.saveJob(job);
+    } catch (error) {
+      if (controller.signal.aborted || this.cancelledJobs.has(job.id) || job.status === "cancelled") {
+        job.status = "cancelled"; job.phase = "cancelled";
+        appendBackupJobLog(job, "Portable image recipe recovery cancelled.");
+      } else {
+        job.status = "failed"; job.phase = "failed";
+        job.errorCode = safeBackupErrorCode(error, "BACKUP_IMAGE_RECOVERY_FAILED");
+        job.error = safeImageRecoveryError(error);
+        job.retryable = isRetryableImageRecoveryError(error);
+        appendBackupJobLog(job, "Portable image recipe recovery failed. The adopted artifact and any imported recovery definition were retained for inspection or retry.");
+      }
+      job.completedAt = job.updatedAt = new Date().toISOString();
+      await this.saveJob(job);
+    } finally {
+      this.controllers.delete(job.id);
+      this.releaseRestoreArtifactPin(pinOwner);
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  /** Portable plugin definitions are reusable metadata, not worker instances:
+   * import only the definitions referenced by the image recipe and remap their
+   * destination-local ids.  No installation, secret, port, display, or other
+   * runtime allocation is recreated here. */
+  private async recoverImagePluginDefinitions(
+    userId: string,
+    configurationPath: string | undefined,
+    selections: Array<{ definitionId: string; validation: "required" | "optional" }>,
+  ): Promise<Array<{ definitionId: string; validation: "required" | "optional" }>> {
+    if (!configurationPath)
+      throw Object.assign(new Error("The image recipe references plugins, but this backup has no portable plugin definitions. Recover the plugins first or edit the recovered image definition."), { code: "BACKUP_PLUGIN_DEFINITION_MISSING", statusCode: 409 });
+    const configuration = await readPortablePluginConfiguration(configurationPath);
+    const source = new Map(configuration.definitions.map((definition) => [definition.sourceId, definition]));
+    const definitions = usePluginDefinitionStore();
+    await definitions.init();
+    const mappings = new Map<string, string>();
+    for (const selection of selections) {
+      if (mappings.has(selection.definitionId)) continue;
+      const portable = source.get(selection.definitionId);
+      if (!portable)
+        throw Object.assign(new Error("The image recipe references a plugin definition that is absent from this backup. Recover or replace that plugin before building."), { code: "BACKUP_PLUGIN_DEFINITION_MISSING", statusCode: 409 });
+      const existing = definitions.getById(selection.definitionId);
+      if (
+        existing &&
+        (existing.scope === "platform" ||
+          (existing.scope === "owner" && existing.userId === userId)) &&
+        existing.definitionHash === pluginDefinitionHash(portable.manifest)
+      ) {
+        mappings.set(selection.definitionId, existing.id);
+        continue;
+      }
+      // A retry may already have created a destination-local owner copy before
+      // a later catalog step failed. Reuse the canonical manifest rather than
+      // minting another definition for every retry.
+      const reusable = definitions
+        .listForOwner(userId)
+        .find(
+          (candidate) =>
+            (candidate.scope === "platform" ||
+              (candidate.scope === "owner" && candidate.userId === userId)) &&
+            candidate.definitionHash ===
+              pluginDefinitionHash(portable.manifest),
+        );
+      if (reusable) {
+        mappings.set(selection.definitionId, reusable.id);
+        continue;
+      }
+      const recovered = await definitions.create({
+        scope: "owner", ownerId: userId, manifest: portable.manifest,
+      });
+      mappings.set(selection.definitionId, recovered.id);
+    }
+    return selections.map((selection) => ({
+      definitionId: mappings.get(selection.definitionId)!, validation: selection.validation,
+    }));
+  }
+
+  private async runDiscovery(job: BackupJob) {
+    const controller = new AbortController();
+    this.controllers.set(job.id, controller);
+    const provider = this.providers.get(job.provider)!;
+    const dir = join(this.dataDir, "tmp", `discovery-${job.id}`);
+    try {
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      job.status = "running";
+      job.phase = "scanning-provider";
+      job.startedAt ||= new Date().toISOString();
+      job.updatedAt = new Date().toISOString();
+      appendBackupJobLog(job, "Scanning the connected provider for Agentor backup objects.");
+      await this.saveJob(job);
+      let cursor: string | undefined;
+      let pages = 0;
+      let discovered = 0;
+      do {
+        controller.signal.throwIfAborted();
+        if (++pages > 100)
+          throw new Error("Provider discovery returned too many pages");
+        const page = await provider.discover!(job.userId, cursor, controller.signal);
+        for (const descriptor of page.records) {
+          controller.signal.throwIfAborted();
+          let formatVersion = descriptor.formatVersion;
+          let keyFingerprint = descriptor.keyFingerprint;
+          let sourceInstallationId: string | undefined;
+          let headerWorkspaceIds: string[] | undefined;
+          let headerCreatedAt: string | undefined;
+          let headerBackupId: string | undefined;
+          let headerInvalid = false;
+          let headerAccessFailure: string | undefined;
+          if (provider.readRange) {
+            const path = join(dir, `${randomUUID()}.header`);
+            try {
+              await writeFile(
+                path,
+                await provider.readRange(
+                  job.userId,
+                  descriptor.objectId,
+                  64 * 1024,
+                  controller.signal,
+                ),
+                { mode: 0o600 },
+              );
+              try {
+                const header = await inspectBackupV2(path);
+                formatVersion = 2;
+                keyFingerprint = header.keyFingerprint;
+                sourceInstallationId = safeRemoteId(
+                  header.metadata.sourceInstallationId,
+                );
+                headerWorkspaceIds = header.metadata.workspaceIds?.filter(
+                  (id) => /^[A-Za-z0-9_-]{1,200}$/.test(id),
+                );
+                headerCreatedAt = safeRemoteTimestamp(header.metadata.createdAt);
+                headerBackupId = safeRemoteId(header.metadata.backupId);
+              } catch {
+                if (descriptor.formatVersion === 2) headerInvalid = true;
+              }
+            } catch (error) {
+              if (controller.signal.aborted) throw error;
+              const failure = publicBackupFailure(error);
+              headerAccessFailure =
+                failure.code === "BACKUP_FAILED"
+                  ? "The provider object could not be inspected."
+                  : failure.message;
+            } finally {
+              await rm(path, { force: true }).catch(() => {});
+            }
+          }
+          const existingArtifact = this.store
+            .get(job.userId)
+            .artifacts.find(
+              (artifact) =>
+                artifact.provider === job.provider &&
+                artifact.providerObjectId === descriptor.objectId,
+            );
+          const existingRemote = this.store
+            .get(job.userId)
+            .remoteBackups.find(
+              (candidate) =>
+                candidate.provider === job.provider &&
+                candidate.providerObjectId === descriptor.objectId,
+            );
+          const unchangedDamagedRecord = Boolean(
+            existingRemote?.state === "damaged" &&
+              existingRemote.remote.size === descriptor.size &&
+              existingRemote.remote.integritySha256 ===
+                descriptor.integritySha256,
+          );
+          const keyAvailable = keyFingerprint
+            ? Boolean(await this.keyring.find(job.userId, keyFingerprint))
+            : undefined;
+          const now = new Date().toISOString();
+          const unsupported =
+            formatVersion !== undefined && ![1, 2].includes(formatVersion);
+          const tooLarge =
+            descriptor.size > MAX_BACKUP_PROVIDER_OBJECT_BYTES;
+          const state: RemoteBackupRecord["state"] = existingArtifact
+            ? "adopted"
+            : descriptor.incomplete
+              ? "incomplete"
+              : headerAccessFailure
+                ? "inaccessible"
+              : headerInvalid
+                ? "damaged"
+                : unchangedDamagedRecord
+                  ? "damaged"
+                  : tooLarge
+                    ? "too-large"
+                    : unsupported
+                      ? "unsupported-format"
+                  : keyFingerprint && !keyAvailable
+                    ? "missing-key"
+                    : "ready-to-adopt";
+          const blockedReason =
+            state === "incomplete"
+              ? "The provider object is marked as an incomplete upload."
+              : state === "inaccessible"
+                ? headerAccessFailure
+              : state === "damaged"
+                ? unchangedDamagedRecord
+                  ? existingRemote?.blockedReason ??
+                    "The provider object previously failed authenticated integrity or manifest validation."
+                  : "The v2 discovery header is invalid or incomplete."
+                : state === "unsupported-format"
+                  ? `Backup format ${formatVersion} is not supported.`
+                  : state === "too-large"
+                    ? "The provider object exceeds Agentor's staging size limit."
+                  : state === "missing-key"
+                    ? `Recovery key ${keyFingerprint} is not available on this installation.`
+                    : undefined;
+          await this.store.upsertRemoteBackup(job.userId, {
+            schemaVersion: 1,
+            id: randomUUID(),
+            userId: job.userId,
+            provider: job.provider,
+            providerObjectId: descriptor.objectId,
+            discoveredAt: now,
+            lastSeenAt: now,
+            remote: {
+              ...descriptor,
+              ...(formatVersion ? { formatVersion } : {}),
+              ...(keyFingerprint ? { keyFingerprint } : {}),
+              ...(headerCreatedAt ? { createdAt: headerCreatedAt } : {}),
+              ...(headerBackupId ? { artifactId: headerBackupId } : {}),
+            },
+            state,
+            integrityStatus: existingArtifact ? "verified" : "unverified",
+            ...(blockedReason ? { blockedReason } : {}),
+            ...(sourceInstallationId ? { sourceInstallationId } : {}),
+            ...(keyFingerprint ? { keyFingerprint } : {}),
+            ...(formatVersion ? { formatVersion } : {}),
+            ...(headerWorkspaceIds?.length
+              ? { workspaceIds: headerWorkspaceIds }
+              : {}),
+            ...(existingArtifact
+              ? { adoptedArtifactId: existingArtifact.id }
+              : {}),
+          });
+          discovered++;
+        }
+        cursor = page.nextCursor;
+        job.bytesProcessed = discovered;
+        job.progress = Math.min(95, 10 + pages * 10);
+        job.updatedAt = new Date().toISOString();
+        await this.saveJob(job);
+      } while (cursor);
+      job.status = "succeeded";
+      job.phase = "complete";
+      job.progress = 100;
+      job.completedAt = job.updatedAt = new Date().toISOString();
+      appendBackupJobLog(
+        job,
+        discovered
+          ? `Provider scan completed; ${discovered} backup object(s) were inspected.`
+          : "Provider scan completed; no Agentor backups were found.",
+      );
+      await this.saveJob(job);
+    } catch (error) {
+      if (controller.signal.aborted || this.cancelledJobs.has(job.id)) {
+        job.status = "cancelled";
+        job.phase = "cancelled";
+      } else {
+        const failure = publicBackupFailure(error);
+        job.status = "failed";
+        job.phase = "failed";
+        job.error = failure.message;
+        job.errorCode = failure.code;
+        job.providerStatus = failure.providerStatus;
+        job.retryable = failure.retryable;
+        appendBackupJobLog(job, "Provider discovery failed. Retry is available when the provider error is transient.");
+      }
+      job.completedAt = job.updatedAt = new Date().toISOString();
+      await this.saveJob(job);
+    } finally {
+      this.controllers.delete(job.id);
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  private async runAdoption(job: BackupJob, remote: RemoteBackupRecord) {
+    const controller = new AbortController();
+    this.controllers.set(job.id, controller);
+    const dir = join(this.dataDir, "tmp", `adoption-${job.id}`);
+    try {
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      job.status = "running";
+      job.phase = "downloading";
+      job.progress = 10;
+      job.startedAt ||= new Date().toISOString();
+      appendBackupJobLog(job, "Downloading the selected provider object.");
+      await this.saveJob(job);
+      const encrypted = join(dir, "archive.enc");
+      const plain = join(dir, "bundle.tar");
+      await this.providers
+        .get(remote.provider)!
+        .download(
+          job.userId,
+          remote.providerObjectId,
+          encrypted,
+          controller.signal,
+          {
+            expectedSize: remote.remote.size,
+            maxBytes: MAX_BACKUP_PROVIDER_OBJECT_BYTES,
+          },
+        );
+      controller.signal.throwIfAborted();
+      const downloadedSize = (await stat(encrypted)).size;
+      if (downloadedSize !== remote.remote.size)
+        throw Object.assign(
+          new Error(
+            "The provider object changed after discovery. Scan the provider again before adopting it.",
+          ),
+          {
+            code: "BACKUP_REMOTE_OBJECT_CHANGED",
+            statusCode: 409,
+            retryable: true,
+          },
+        );
+      job.phase = "verifying";
+      job.progress = 45;
+      appendBackupJobLog(job, "Authenticating and decrypting the backup before adoption.");
+      await this.saveJob(job);
+      const sha256 = await encryptedBackupPayloadSha256(encrypted);
+      let formatVersion = 1;
+      let keyFingerprint: string | undefined;
+      let sourceInstallationId: string | undefined;
+      let authenticatedCreatedAt: string | undefined;
+      let authenticatedArtifactId: string | undefined;
+      let authenticatedWorkspaceIds: string[] | undefined;
+      let v2Header: Awaited<ReturnType<typeof inspectBackupV2>> | undefined;
+      try {
+        v2Header = await inspectBackupV2(encrypted);
+      } catch (error) {
+        if (
+          (remote.formatVersion ?? remote.remote.formatVersion) === 2 ||
+          !(
+            error instanceof Error &&
+            error.message === "Unsupported backup format"
+          )
+        )
+          throw error;
+      }
+      if (v2Header) {
+        const header = v2Header;
+        formatVersion = 2;
+        keyFingerprint = header.keyFingerprint;
+        await decryptBackupV2(
+          { ...useConfig(), dataDir: this.dataDir },
+          job.userId,
+          encrypted,
+          plain,
+          sha256,
+          this.keyring,
+        );
+        sourceInstallationId = safeRemoteId(
+          header.metadata.sourceInstallationId,
+        );
+        authenticatedCreatedAt = safeRemoteTimestamp(header.metadata.createdAt);
+        authenticatedArtifactId = safeRemoteId(header.metadata.backupId);
+        authenticatedWorkspaceIds = header.metadata.workspaceIds;
+      } else {
+        const candidates = await this.keyring.candidates(job.userId);
+        let matched: { fingerprint: string } | undefined;
+        for (const candidate of candidates) {
+          const attempt = join(dir, `v1-${randomUUID()}.tar`);
+          try {
+            await decryptBackupV1WithMaterial(
+              encrypted,
+              attempt,
+              sha256,
+              candidate.material,
+            );
+            await rename(attempt, plain);
+            matched = { fingerprint: candidate.fingerprint };
+            break;
+          } catch {
+            await rm(attempt, { force: true }).catch(() => {});
+          }
+        }
+        if (!matched)
+          throw Object.assign(
+            new Error("No available recovery key could authenticate this legacy backup."),
+            { code: "BACKUP_RECOVERY_KEY_MISSING", statusCode: 409 },
+          );
+        keyFingerprint = matched.fingerprint;
+      }
+      controller.signal.throwIfAborted();
+      const inspected = await inspectWorkspaceBackups(
+        plain,
+        join(dir, "inspection"),
+      );
+      const actualWorkspaceIds = inspected.workspaces.map(({ id }) => id);
+      if (
+        authenticatedWorkspaceIds &&
+        (authenticatedWorkspaceIds.length !== actualWorkspaceIds.length ||
+          authenticatedWorkspaceIds.some((id) => !actualWorkspaceIds.includes(id)))
+      )
+        throw Object.assign(
+          new Error("The authenticated backup summary does not match the contained workspaces."),
+          { code: "BACKUP_MANIFEST_MISMATCH" },
+        );
+      const {
+        summaries,
+        dependencies,
+        missingSecrets,
+        selectedPathsByWorkspace,
+      } = await this.summarizeArtifactInspection(job.userId, inspected);
+      job.phase = "adopting";
+      job.progress = 85;
+      job.dependencies = dependencies;
+      await this.saveJob(job);
+      const data = this.store.get(job.userId);
+      const already = data.artifacts.find(
+        (artifact) =>
+          artifact.provider === remote.provider &&
+          artifact.providerObjectId === remote.providerObjectId,
+      );
+      let artifact = already;
+      if (!artifact) {
+        // A provider backup identity belongs to its source installation. A
+        // destination-local artifact always gets a fresh identity so a scan
+        // from another account/installation cannot collide with an existing
+        // local artifact and make owner-scoped lookup resolve the wrong row.
+        // The authenticated source identity remains on the remote discovery
+        // record for inspection and deduplication uses provider object id.
+        const id = randomUUID();
+        artifact = {
+          schemaVersion: 1,
+          id,
+          userId: job.userId,
+          workspaceId: actualWorkspaceIds[0]!,
+          workspaceIds: actualWorkspaceIds,
+          provider: remote.provider,
+          providerObjectId: remote.providerObjectId,
+          createdAt:
+            authenticatedCreatedAt ??
+            remote.remote.createdAt ??
+            new Date().toISOString(),
+          size: downloadedSize,
+          sha256,
+          sourceWorkerId: actualWorkspaceIds[0],
+          missingSecrets,
+          ...(Object.keys(selectedPathsByWorkspace).length
+            ? { selectedPathsByWorkspace }
+            : {}),
+          formatVersion,
+          ...(keyFingerprint ? { keyFingerprint } : {}),
+          ...(sourceInstallationId ? { sourceInstallationId } : {}),
+          integrityStatus: "verified",
+          provenance: "remote-adopted",
+          workspaceMembers: summaries.map(({ workspaceId: id, displayName }) =>
+            displayName ? { id, displayName } : { id },
+          ),
+          reconstruction: summaries,
+          dependencies,
+        };
+        await this.store.update(job.userId, (draft) => {
+          const duplicate = draft.artifacts.find(
+            (candidate) =>
+              candidate.provider === remote.provider &&
+              candidate.providerObjectId === remote.providerObjectId,
+          );
+          if (!duplicate) draft.artifacts.push(structuredClone(artifact!));
+          else artifact = duplicate;
+          const discovered = draft.remoteBackups.find(
+            (candidate) => candidate.id === remote.id,
+          );
+          if (discovered) {
+            discovered.adoptedArtifactId = artifact!.id;
+            discovered.state = "adopted";
+            discovered.integrityStatus = "verified";
+            discovered.workspaceIds = actualWorkspaceIds;
+            discovered.workspaceMembers = artifact!.workspaceMembers;
+            discovered.keyFingerprint = keyFingerprint;
+            discovered.formatVersion = formatVersion;
+            if (sourceInstallationId)
+              discovered.sourceInstallationId = sourceInstallationId;
+            if (authenticatedCreatedAt)
+              discovered.remote.createdAt = authenticatedCreatedAt;
+            if (authenticatedArtifactId)
+              discovered.remote.artifactId = authenticatedArtifactId;
+            discovered.blockedReason = undefined;
+          }
+        });
+      }
+      job.status = "succeeded";
+      job.phase = "complete";
+      job.progress = 100;
+      job.artifactId = job.backupId = artifact.id;
+      job.integrityVerified = true;
+      job.size = job.sizeBytes = artifact.size;
+      job.sha256 = artifact.sha256;
+      job.workspaceIds = actualWorkspaceIds;
+      job.missingSecrets = artifact.missingSecrets.map((name) => ({
+        name,
+        type: "secret",
+      }));
+      job.completedAt = job.updatedAt = new Date().toISOString();
+      appendBackupJobLog(job, "Backup adopted after successful authentication, integrity, and manifest validation.");
+      await this.saveJob(job);
+    } catch (error: any) {
+      if (controller.signal.aborted || this.cancelledJobs.has(job.id)) {
+        job.status = "cancelled";
+        job.phase = "cancelled";
+      } else {
+        job.status = "failed";
+        job.phase = "failed";
+        job.errorCode = safeBackupErrorCode(error, "BACKUP_ADOPTION_FAILED");
+        job.error = safeAdoptionError(error);
+        job.retryable = isRetryableAdoptionError(error);
+        appendBackupJobLog(job, "Backup adoption stopped without deleting the discovered record.");
+        await this.store.update(job.userId, (draft) => {
+          const discovered = draft.remoteBackups.find(
+            (candidate) => candidate.id === remote.id,
+          );
+          if (!discovered) return;
+          discovered.lastErrorAt = new Date().toISOString();
+          if (job.errorCode === "BACKUP_RECOVERY_KEY_MISSING") {
+            discovered.state = "missing-key";
+            discovered.blockedReason = job.error;
+          } else if (/INTEGRITY|AUTHENTICATION|MANIFEST|INVALID/i.test(job.errorCode || "")) {
+            discovered.state = "damaged";
+            discovered.integrityStatus = "failed";
+            discovered.blockedReason = job.error;
+          } else {
+            discovered.state = "inaccessible";
+            discovered.blockedReason = job.error;
+          }
+        });
+      }
+      job.completedAt = job.updatedAt = new Date().toISOString();
+      await this.saveJob(job);
+    } finally {
+      this.controllers.delete(job.id);
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  private async summarizeWorkspaceReconstruction(
+    userId: string,
+    workspace: Awaited<ReturnType<typeof inspectWorkspaceBackups>>["workspaces"][number],
+    dependencies: BackupDependency[],
+  ): Promise<BackupWorkspaceReconstructionSummary> {
+    const requiredSecrets = new Set<string>([
+      ...(workspace.manifest.missingSecrets ?? []),
+      ...(workspace.reconstruction?.requiredSecretNames ?? []),
+      ...(workspace.plugins?.installations.flatMap(({ secretKeys }) => secretKeys) ?? []),
+    ]);
+    const resolution = await resolveWorkerReconstruction(
+      userId,
+      workspace.reconstruction,
+    );
+    let image: BackupWorkspaceReconstructionSummary["image"];
+    if (!workspace.reconstruction) image = { kind: "legacy" };
+    else if (workspace.reconstruction.image.kind === "platform-default")
+      image = { kind: "platform-default" };
+    else if (workspace.reconstruction.image.kind === "unmanaged") {
+      const required = workspace.reconstruction.image;
+      image = {
+        kind: "unmanaged",
+        ...(required.digest ? { digest: required.digest } : {}),
+        runtimeImageAvailable: false,
+      };
+      dependencies.push({
+        kind: "image",
+        id: `unmanaged:${workspace.id}${required.digest ? `@${required.digest}` : ""}`,
+        workspaceId: workspace.id,
+        status: "replacement-required",
+        required: true,
+        reason:
+          "The source worker used a per-worker or otherwise unmanaged image without a portable catalog definition. Select a replacement image or explicitly restore workspace-only.",
+      });
+    } else {
+      const required = workspace.reconstruction.image;
+      image = {
+        kind: "custom",
+        definitionId: required.definitionId,
+        version: required.version,
+        digest: required.digest,
+        runtimeImageAvailable: Boolean(required.runtimeImage),
+        recoveryAvailable: Boolean(required.definition),
+        ...(required.catalogSource
+          ? { catalogSource: structuredClone(required.catalogSource) }
+          : {}),
+      };
+      dependencies.push({
+        kind: "image",
+        id: `${required.definitionId}:${required.version}@${required.digest}`,
+        workspaceId: workspace.id,
+        status:
+          resolution.state === "resolved"
+            ? "resolved"
+            : "replacement-required",
+        required: true,
+        ...(resolution.state === "unresolved"
+          ? {
+              reason:
+                "Recover or sync the image definition, rebuild it, pull the immutable digest, select a replacement, or explicitly choose workspace-only restore.",
+            }
+          : {}),
+      });
+    }
+    const pluginDefinitions =
+      workspace.plugins?.definitions.map(({ sourceId, manifest }) => ({
+        sourceId,
+        name: manifest.name,
+        version: manifest.version,
+      })) ?? [];
+    for (const plugin of pluginDefinitions)
+      dependencies.push({
+        kind: "plugin",
+        id: `${plugin.name}@${plugin.version}`,
+        workspaceId: workspace.id,
+        status: "resolved",
+        required: workspace.plugins?.installations.some(
+          ({ definitionSourceId }) => definitionSourceId === plugin.sourceId,
+        ),
+        reason:
+          "The reusable plugin definition is embedded; runtime ports, displays, sessions, and process state will be allocated again.",
+      });
+    for (const name of requiredSecrets)
+      dependencies.push({
+        kind: "secret",
+        id: name,
+        workspaceId: workspace.id,
+        status: "missing",
+        required: true,
+        reason:
+          "Only the secret name is portable. Configure its value on the restored worker.",
+      });
+    return {
+      workspaceId: workspace.id,
+      displayName: workspace.manifest.source.displayName,
+      image,
+      pluginDefinitions,
+      desiredPluginCount: workspace.plugins?.installations.length ?? 0,
+      requiredSecretNames: [...requiredSecrets].sort(),
+    };
+  }
+
+  private async summarizeArtifactInspection(
+    userId: string,
+    inspected: Awaited<ReturnType<typeof inspectWorkspaceBackups>>,
+  ): Promise<{
+    summaries: BackupWorkspaceReconstructionSummary[];
+    dependencies: BackupDependency[];
+    missingSecrets: string[];
+    selectedPathsByWorkspace: Record<string, string[]>;
+  }> {
+    const summaries: BackupWorkspaceReconstructionSummary[] = [];
+    const dependencies: BackupDependency[] = [];
+    const missingSecrets = new Set<string>();
+    const selectedPathsByWorkspace: Record<string, string[]> = {};
+    for (const workspace of inspected.workspaces) {
+      const summary = await this.summarizeWorkspaceReconstruction(
+        userId,
+        workspace,
+        dependencies,
+      );
+      summaries.push(summary);
+      for (const name of summary.requiredSecretNames) missingSecrets.add(name);
+      if (workspace.manifest.backupPaths?.length)
+        selectedPathsByWorkspace[workspace.id] = [
+          ...new Set(workspace.manifest.backupPaths.map(({ path }) => path)),
+        ];
+    }
+    return {
+      summaries,
+      dependencies,
+      missingSecrets: [...missingSecrets].sort(),
+      selectedPathsByWorkspace,
+    };
+  }
+
+  private async preflightRestoreDependencies(
+    userId: string,
+    artifact: BackupArtifact,
+    selectedWorkspaceIds: string[],
+    imageResolutions?: Record<string, BackupImageResolution>,
+  ): Promise<BackupDependency[]> {
+    const selected = new Set(selectedWorkspaceIds);
+    const dependencies = structuredClone(
+      (artifact.dependencies ?? []).filter(
+        (dependency) =>
+          !dependency.workspaceId || selected.has(dependency.workspaceId),
+      ),
+    );
+    const summaries = (artifact.reconstruction ?? []).filter((summary) =>
+      selected.has(summary.workspaceId),
+    );
+    const catalog = useImageCatalogManager();
+    await catalog.init();
+    const blockers: BackupDependency[] = [];
+    for (const summary of summaries) {
+      if (summary.image.kind !== "custom" && summary.image.kind !== "unmanaged")
+        continue;
+      const resolution = imageResolutions?.[summary.workspaceId] ?? {
+        mode: "exact" as const,
+      };
+      const dependencyId =
+        summary.image.kind === "custom"
+          ? `${summary.image.definitionId}:${summary.image.version}@${summary.image.digest}`
+          : `unmanaged:${summary.workspaceId}${summary.image.digest ? `@${summary.image.digest}` : ""}`;
+      const prior = dependencies.find(
+        (dependency) =>
+          dependency.kind === "image" &&
+          dependency.workspaceId === summary.workspaceId,
+      );
+      if (resolution.mode === "workspace-only") {
+        const replacement: BackupDependency = {
+          kind: "image",
+          id: dependencyId,
+          workspaceId: summary.workspaceId,
+          status: "warning",
+          required: false,
+          reason:
+            "Workspace-only restore was explicitly acknowledged; the new worker will use the platform image and is not a faithful image reconstruction.",
+        };
+        if (prior) Object.assign(prior, replacement);
+        else dependencies.push(replacement);
+        continue;
+      }
+      if (resolution.mode === "replacement") {
+        try {
+          const selectedImage = catalog.resolveSelection(
+            userId,
+            resolution.imageDefinitionId,
+            resolution.imageVersion,
+          );
+          if (!selectedImage) throw new Error("replacement unavailable");
+          const replacement: BackupDependency = {
+            kind: "image",
+            id: `${selectedImage.definitionId}:${selectedImage.version}@${selectedImage.digest}`,
+            workspaceId: summary.workspaceId,
+            status: "resolved",
+            required: true,
+            reason: `Explicit replacement for ${dependencyId}.`,
+          };
+          if (prior) Object.assign(prior, replacement);
+          else dependencies.push(replacement);
+          continue;
+        } catch {
+          blockers.push({
+            kind: "image",
+            id: `${resolution.imageDefinitionId}:${resolution.imageVersion}`,
+            workspaceId: summary.workspaceId,
+            status: "replacement-required",
+            required: true,
+            reason:
+              "The selected replacement image is unavailable or not ready.",
+          });
+          continue;
+        }
+      }
+      let exactAvailable = false;
+      if (summary.image.kind === "unmanaged") {
+        blockers.push({
+          kind: "image",
+          id: dependencyId,
+          workspaceId: summary.workspaceId,
+          status: "replacement-required",
+          required: true,
+          reason:
+            "The source used an unmanaged per-worker image. Select a replacement or explicitly acknowledge workspace-only restore.",
+        });
+        continue;
+      }
+      const definitionIds = new Set([summary.image.definitionId!]);
+      if (summary.image.catalogSource)
+        for (const definition of catalog.list(userId, false))
+          if (
+            definition.gitRecovery?.remoteId ===
+              summary.image.catalogSource.remoteId &&
+            definition.gitRecovery.hash === summary.image.catalogSource.hash
+          )
+            definitionIds.add(definition.id);
+      for (const definitionId of definitionIds) {
+        try {
+          const exact = catalog.resolveSelection(
+            userId,
+            definitionId,
+            summary.image.version!,
+          );
+          if (exact && exact.digest === summary.image.digest) {
+            exactAvailable = true;
+            break;
+          }
+        } catch {
+          // Keep searching provenance-equivalent local definitions.
+        }
+      }
+      if (exactAvailable) {
+        if (prior) prior.status = "resolved";
+        else
+          dependencies.push({
+            kind: "image",
+            id: dependencyId,
+            workspaceId: summary.workspaceId,
+            status: "resolved",
+            required: true,
+          });
+      } else {
+        blockers.push({
+          kind: "image",
+          id: dependencyId,
+          workspaceId: summary.workspaceId,
+          status: "replacement-required",
+          required: true,
+          reason:
+            "Recover or sync the exact image definition, rebuild it, pull its immutable digest, select a replacement, or explicitly acknowledge workspace-only restore.",
+        });
+      }
+    }
+    if (blockers.length)
+      throw Object.assign(
+        new Error(
+          "Restore dependencies are unresolved. No download or worker creation was started.",
+        ),
+        {
+          statusCode: 409,
+          code: "BACKUP_DEPENDENCIES_UNRESOLVED",
+          data: { dependencies: blockers },
+        },
+      );
+    return dependencies;
+  }
+
+  private async decryptArtifact(
+    userId: string,
+    artifact: BackupArtifact,
+    encrypted: string,
+    plain: string,
+  ): Promise<void> {
+    const config = { ...useConfig(), dataDir: this.dataDir };
+    if (artifact.formatVersion === 2) {
+      await decryptBackupV2(
+        config,
+        userId,
+        encrypted,
+        plain,
+        artifact.sha256,
+        this.keyring,
+      );
+      return;
+    }
+    // Local v1 artifacts retain their installation-key path. Adopted legacy
+    // artifacts may instead depend on any explicitly imported historical key.
+    if (artifact.provenance !== "remote-adopted") {
+      try {
+        await decryptBackup(config, encrypted, plain, artifact.sha256);
+        return;
+      } catch {
+        await rm(plain, { force: true }).catch(() => {});
+      }
+    }
+    const candidates = await this.keyring.candidates(userId);
+    const preferred = artifact.keyFingerprint
+      ? candidates.sort((left, right) =>
+          left.fingerprint === artifact.keyFingerprint
+            ? -1
+            : right.fingerprint === artifact.keyFingerprint
+              ? 1
+              : 0,
+        )
+      : candidates;
+    for (const candidate of preferred) {
+      try {
+        await decryptBackupV1WithMaterial(
+          encrypted,
+          plain,
+          artifact.sha256,
+          candidate.material,
+        );
+        return;
+      } catch {
+        await rm(plain, { force: true }).catch(() => {});
+      }
+    }
+    throw Object.assign(
+      new Error(
+        "No available recovery key could authenticate this legacy backup.",
+      ),
+      {
+        statusCode: 409,
+        code: "BACKUP_RECOVERY_KEY_MISSING",
+      },
+    );
+  }
+
+  private async claimStartJob(
+    candidate: BackupJob,
+  ): Promise<{ job: BackupJob; created: boolean }> {
+    return this.store.update(candidate.userId, (data) => {
+      if (candidate.requestId) {
+        const existing = data.jobs.find(
+          (job) =>
+            job.operation === candidate.operation &&
+            job.requestId === candidate.requestId,
+        );
+        if (existing) {
+          if (existing.requestFingerprint !== candidate.requestFingerprint)
+            throw Object.assign(
+              new Error(
+                "The request identity is already associated with different backup arguments",
+              ),
+              { statusCode: 409, code: "BACKUP_REQUEST_ID_CONFLICT" },
+            );
+          return { job: structuredClone(existing), created: false };
+        }
+      } else if (candidate.requestFingerprint) {
+        // Older REST clients may omit requestId. Coalesce an identical active
+        // operation atomically so two near-simultaneous transport retries do
+        // not duplicate provider scans/downloads. Durable retry after an
+        // uncertain completed response still requires the documented ID.
+        const active = data.jobs.find(
+          (job) =>
+            job.operation === candidate.operation &&
+            job.requestFingerprint === candidate.requestFingerprint &&
+            (job.status === "queued" || job.status === "running"),
+        );
+        if (active)
+          return { job: structuredClone(active), created: false };
+      }
+      data.jobs.push(structuredClone(candidate));
+      return { job: structuredClone(candidate), created: true };
+    });
+  }
+
+  private findRemoteBackup(userId: string, id: string) {
+    return this.store
+      .get(userId)
+      .remoteBackups.find((candidate) => candidate.id === id);
+  }
+
+  private async publicRemoteBackup(record: RemoteBackupRecord) {
+    const fingerprint = record.keyFingerprint ?? record.remote.keyFingerprint;
+    const keyAvailable = fingerprint
+      ? Boolean(await this.keyring.find(record.userId, fingerprint))
+      : null;
+    const artifact = record.adoptedArtifactId
+      ? this.store.findArtifact(record.adoptedArtifactId)
+      : undefined;
+    const persistedState = record.state;
+    const state = artifact
+      ? "adopted"
+      : record.remote.incomplete
+        ? "incomplete"
+        : persistedState === "missing-key" && keyAvailable
+          ? "ready-to-adopt"
+          : persistedState === "ready-to-adopt" && fingerprint && !keyAvailable
+            ? "missing-key"
+            : persistedState ??
+              (fingerprint && !keyAvailable
+                ? "missing-key"
+                : "discovered");
+    return {
+      ...record,
+      createdAt: record.remote.createdAt ?? record.discoveredAt,
+      size: record.remote.size,
+      backupIdentity: record.remote.artifactId,
+      state,
+      formatVersion: record.formatVersion ?? record.remote.formatVersion,
+      keyFingerprint: fingerprint,
+      keyAvailable,
+      knownLocally: Boolean(artifact),
+      restorable: Boolean(artifact && artifact.integrityStatus === "verified"),
+      ...(artifact
+        ? {
+            adoptedArtifact: {
+              id: artifact.id,
+              workspaceIds: this.artifactWorkspaceIds(artifact),
+              workspaceMembers: artifact.workspaceMembers,
+              reconstruction: artifact.reconstruction,
+              dependencies: artifact.dependencies,
+              requiredSecretNames: artifact.missingSecrets,
+              integrityStatus: artifact.integrityStatus,
+            },
+          }
+        : {}),
+      blockedReason:
+        (persistedState === state ? record.blockedReason : undefined) ??
+        (state === "missing-key"
+          ? `Recovery key ${fingerprint} is not available on this installation.`
+          : state === "incomplete"
+            ? "The provider upload is incomplete."
+            : state === "discovered"
+              ? "Adopt and verify this provider object before restoring it."
+              : state === "ready-to-adopt"
+                ? "Adopt and verify this provider object before restoring it."
+              : undefined),
     };
   }
   async restore(
@@ -737,9 +2217,13 @@ export class BackupManager {
           artifact.providerObjectId,
           encrypted,
           execution.controller.signal,
+          {
+            expectedSize: artifact.size,
+            maxBytes: MAX_BACKUP_PROVIDER_OBJECT_BYTES,
+          },
         );
       assertActive();
-      await decryptBackup(useConfig(), encrypted, plain, artifact.sha256);
+      await this.decryptArtifact(userId, artifact, encrypted, plain);
       assertActive();
       const artifactWorkspaceIds = this.artifactWorkspaceIds(artifact);
       const selected = this.selectRestoreWorkspaceIds(
@@ -786,6 +2270,8 @@ export class BackupManager {
     displayName?: string,
     lockPassword?: unknown,
     selectedWorkspaceIds?: string[],
+    requestId?: string,
+    imageResolutions?: Record<string, BackupImageResolution>,
   ): Promise<BackupJob> {
     await this.init();
     this.assertOwnerAvailable(userId);
@@ -809,6 +2295,38 @@ export class BackupManager {
       );
     if (target === "original" && extraBackupPaths(artifact.selectedPathsByWorkspace?.[source]).length)
       throw Object.assign(new Error("Original restore is unavailable for backups containing explicit absolute paths; restore into a new worker"), { statusCode: 409 });
+    const normalizedResolutions = normalizeImageResolutions(
+      selected,
+      imageResolutions,
+    );
+    const dependencies =
+      target === "new"
+        ? await this.preflightRestoreDependencies(
+            userId,
+            artifact,
+            selected,
+            normalizedResolutions,
+          )
+        : structuredClone(
+            (artifact.dependencies ?? []).filter(
+              (dependency) =>
+                !dependency.workspaceId ||
+                selected.includes(dependency.workspaceId),
+            ),
+          );
+    const normalizedRequestId = normalizeBackupRequestId(requestId);
+    const fingerprint = requestFingerprint({
+      operation: "restore",
+      artifactId: artifact.id,
+      target,
+      displayName: displayName?.trim() || undefined,
+      selectedWorkspaceIds: [...selected].sort(),
+      imageResolutions: Object.fromEntries(
+        Object.entries(normalizedResolutions ?? {}).sort(([left], [right]) =>
+          left.localeCompare(right),
+        ),
+      ),
+    });
     const jobId = randomUUID();
     const restorePinOwner = this.restorePinOwner(jobId, 1);
     this.pinRestoreArtifact(restorePinOwner, artifact);
@@ -843,12 +2361,22 @@ export class BackupManager {
         createdAt: now,
         updatedAt: now,
         attempt: 1,
+        operation: "restore",
         target,
         displayName,
+        dependencies,
+        ...(normalizedResolutions
+          ? { imageResolutions: normalizedResolutions }
+          : {}),
+        requestFingerprint: fingerprint,
+        ...(normalizedRequestId ? { requestId: normalizedRequestId } : {}),
+        logs: ["Restore queued."],
       };
-      await this.store.update(userId, (data) => {
-        data.jobs.push(structuredClone(job));
-      });
+      const claimed = await this.claimStartJob(job);
+      if (!claimed.created) {
+        this.releaseRestoreArtifactPin(restorePinOwner);
+        return sanitizeJob(claimed.job);
+      }
       this.assertRestoreActive(userId, admission.controller.signal, job);
       this.enqueue(job.id, job.userId, () =>
         this.runRestoreV2(job, artifact, displayName, restorePinOwner),
@@ -878,11 +2406,14 @@ export class BackupManager {
         plain = join(dir, "worker.tar");
       await this.providers
         .get(artifact.provider)!
-        .download(job.userId, artifact.providerObjectId, enc);
+        .download(job.userId, artifact.providerObjectId, enc, undefined, {
+          expectedSize: artifact.size,
+          maxBytes: MAX_BACKUP_PROVIDER_OBJECT_BYTES,
+        });
       job.phase = "verifying";
       job.progress = 60;
       await this.saveJob(job);
-      await decryptBackup(useConfig(), enc, plain, artifact.sha256);
+      await this.decryptArtifact(job.userId, artifact, enc, plain);
       job.integrityVerified = true;
       if (job.target === "new") {
         const worker = await useContainerManager().importWorker(
@@ -1052,6 +2583,22 @@ export class BackupManager {
         useEnvironmentStore().getById(worker.environmentId || "default") ??
         useEnvironmentStore().list()[0];
       if (!environment) throw new Error("Workspace environment is unavailable");
+      const pluginConfiguration = snapshotWorkerPlugins(
+        userId,
+        id,
+        usePluginDefinitionStore(),
+        usePluginInstallationStore(),
+      );
+      const hasPlugins =
+        pluginConfiguration.definitions.length > 0 ||
+        pluginConfiguration.installations.length > 0;
+      const catalog = useImageCatalogManager();
+      await catalog.init();
+      const imageDefinition = worker.imageDefinitionId
+        ? catalog
+            .list(userId, false)
+            .find((item) => item.id === worker.imageDefinitionId)
+        : undefined;
       const manifest: WorkerExportManifest = {
         version: WORKER_EXPORT_VERSION,
         exportedAt: new Date().toISOString(),
@@ -1102,6 +2649,8 @@ export class BackupManager {
           rootfs: false,
           workspace: includeWorkspace,
           agents: includeAgents,
+          ...(hasPlugins ? { plugins: true } : {}),
+          reconstruction: true,
         },
         missingSecrets: (await useWorkerConfigStore().resolveValues(userId, id))
           .filter((entry) => entry.kind !== "variable")
@@ -1109,8 +2658,21 @@ export class BackupManager {
       };
       const manifestPath = join(temp, BUNDLE_FILES.manifest),
         workspacePath = join(temp, BUNDLE_FILES.workspace),
-        agentsPath = join(temp, BUNDLE_FILES.agents);
+        agentsPath = join(temp, BUNDLE_FILES.agents),
+        pluginsPath = join(temp, BUNDLE_FILES.plugins),
+        reconstructionPath = join(temp, BUNDLE_FILES.reconstruction);
       await writeManifest(manifest, manifestPath);
+      const reconstruction = snapshotWorkerReconstruction(
+        worker,
+        imageDefinition,
+      );
+      reconstruction.requiredSecretNames = manifest.missingSecrets ?? [];
+      await writeWorkerReconstruction(reconstructionPath, reconstruction);
+      if (hasPlugins)
+        await writePortablePluginConfiguration(
+          pluginsPath,
+          pluginConfiguration,
+        );
       if (includeWorkspace)
         await writeGzipFile(
           await useDockerService().getArchive(helper.id, EXPORT_WORKSPACE_PATH),
@@ -1134,6 +2696,13 @@ export class BackupManager {
           ...(includeAgents
             ? [{ name: BUNDLE_FILES.agents, path: agentsPath }]
             : []),
+          ...(hasPlugins
+            ? [{ name: BUNDLE_FILES.plugins, path: pluginsPath }]
+            : []),
+          {
+            name: BUNDLE_FILES.reconstruction,
+            path: reconstructionPath,
+          },
         ]),
         createWriteStream(destination, { mode: 0o600 }),
         { signal },
@@ -1185,6 +2754,22 @@ export class BackupManager {
         ...(extracted.rootfsPath ? [{ name: BUNDLE_FILES.rootfs, path: extracted.rootfsPath }] : []),
         ...(extracted.workspacePath ? [{ name: BUNDLE_FILES.workspace, path: extracted.workspacePath }] : []),
         ...(extracted.agentsPath ? [{ name: BUNDLE_FILES.agents, path: extracted.agentsPath }] : []),
+        ...(extracted.pluginConfigurationPath
+          ? [
+              {
+                name: BUNDLE_FILES.plugins,
+                path: extracted.pluginConfigurationPath,
+              },
+            ]
+          : []),
+        ...(extracted.reconstructionPath
+          ? [
+              {
+                name: BUNDLE_FILES.reconstruction,
+                path: extracted.reconstructionPath,
+              },
+            ]
+          : []),
         { name: BUNDLE_FILES.backupPaths, path: payload },
       ];
       await pipeline(packBundle(files), createWriteStream(replacement, { mode: 0o600 }), { signal });
@@ -1222,7 +2807,15 @@ export class BackupManager {
       let crypt: { sha256: string; size: number };
       let artifactId: string;
       let resumeUploadId: string | undefined;
+      let encryptionMetadata: {
+        createdAt: string;
+        sourceInstallationId: string;
+        workspaceIds: string[];
+        keyFingerprint?: string;
+        formatVersion: 1 | 2;
+      };
       job.status = "running";
+      job.operation ||= "backup";
       job.startedAt ||= new Date().toISOString();
       job.updatedAt = new Date().toISOString();
       await this.recordAttempt(job.userId);
@@ -1231,6 +2824,39 @@ export class BackupManager {
         crypt = { sha256: resume.sha256, size: resume.size };
         artifactId = resume.artifactId;
         resumeUploadId = resume.uploadId;
+        try {
+          const resumedHeader = await inspectBackupV2(encrypted);
+          encryptionMetadata = {
+            createdAt:
+              safeRemoteTimestamp(resumedHeader.metadata.createdAt) ??
+              new Date().toISOString(),
+            sourceInstallationId:
+              resumedHeader.metadata.sourceInstallationId ??
+              (await backupInstallationId(this.dataDir)),
+            workspaceIds:
+              resumedHeader.metadata.workspaceIds ??
+              job.workspaceIds ??
+              [job.workspaceId],
+            keyFingerprint: resumedHeader.keyFingerprint,
+            formatVersion: 2,
+          };
+        } catch {
+          // Interrupted uploads from pre-v2 Agentor installations retain the
+          // exact v1 ciphertext required by provider resumable sessions. Keep
+          // those jobs retryable instead of replacing their upload bytes.
+          if ((await encryptedBackupPayloadSha256(encrypted)) !== resume.sha256)
+            throw new Error("Interrupted backup ciphertext is invalid");
+          const legacy = (await this.keyring.status(job.userId)).find(
+            ({ source }) => source === "legacy",
+          );
+          encryptionMetadata = {
+            createdAt: new Date().toISOString(),
+            sourceInstallationId: await backupInstallationId(this.dataDir),
+            workspaceIds: job.workspaceIds ?? [job.workspaceId],
+            ...(legacy ? { keyFingerprint: legacy.fingerprint } : {}),
+            formatVersion: 1,
+          };
+        }
         job.phase = "uploading";
         job.progress = 60;
         await this.saveJob(job);
@@ -1256,15 +2882,34 @@ export class BackupManager {
         job.phase = "encrypting";
         job.progress = 35;
         await this.saveJob(job);
-        crypt = await encryptBackup(
-          useConfig(),
+        artifactId = randomUUID();
+        const createdAt = new Date().toISOString();
+        const sourceInstallationId = await backupInstallationId(this.dataDir);
+        const encryptedV2 = await encryptBackupV2(
+          { ...useConfig(), dataDir: this.dataDir },
+          job.userId,
           plain,
           encrypted,
+          {
+            backupId: artifactId,
+            sourceInstallationId,
+            createdAt,
+            workspaceIds: job.workspaceIds ?? [job.workspaceId],
+            formatVersion: 2,
+          },
+          this.keyring,
           (bytes: number) => {
             job.bytesProcessed = bytes;
           },
         );
-        artifactId = randomUUID();
+        crypt = encryptedV2;
+        encryptionMetadata = {
+          createdAt,
+          sourceInstallationId,
+          workspaceIds: job.workspaceIds ?? [job.workspaceId],
+          keyFingerprint: encryptedV2.header.keyFingerprint,
+          formatVersion: 2,
+        };
       }
       if (cancelled()) return;
       job.phase = "uploading";
@@ -1287,6 +2932,16 @@ export class BackupManager {
         },
         controller.signal,
         resumeUploadId,
+        {
+          artifactId,
+          formatVersion: encryptionMetadata.formatVersion,
+          ...(encryptionMetadata.keyFingerprint
+            ? { keyFingerprint: encryptionMetadata.keyFingerprint }
+            : {}),
+          integritySha256: crypt.sha256,
+          createdAt: encryptionMetadata.createdAt,
+          incomplete: false,
+        },
       );
       // Persist the provider's authoritative object id before verification so
       // cancellation or verification failure never deletes an Agentor UUID in
@@ -1311,15 +2966,54 @@ export class BackupManager {
         verifyPlain = join(dir, "verify.tar");
       await this.providers
         .get(job.provider)!
-        .download(job.userId, uploaded.objectId, verifyEnc, controller.signal);
-      await decryptBackup(useConfig(), verifyEnc, verifyPlain, crypt.sha256);
+        .download(job.userId, uploaded.objectId, verifyEnc, controller.signal, {
+          expectedSize: uploaded.size,
+          maxBytes: MAX_BACKUP_PROVIDER_OBJECT_BYTES,
+        });
+      if (encryptionMetadata.formatVersion === 2)
+        await decryptBackupV2(
+          { ...useConfig(), dataDir: this.dataDir },
+          job.userId,
+          verifyEnc,
+          verifyPlain,
+          crypt.sha256,
+          this.keyring,
+        );
+      else
+        await decryptBackup(
+          { ...useConfig(), dataDir: this.dataDir },
+          verifyEnc,
+          verifyPlain,
+          crypt.sha256,
+        );
       if (cancelled()) {
         await this.deletePendingProviderObject(job, uploaded.objectId).catch(
           () => {},
         );
         return;
       }
-      const missing = new Set<string>();
+      const inspected = await inspectWorkspaceBackups(
+        verifyPlain,
+        join(dir, "inspection"),
+      );
+      const actualWorkspaceIds = inspected.workspaces.map(({ id }) => id);
+      if (
+        encryptionMetadata.workspaceIds.length !== actualWorkspaceIds.length ||
+        encryptionMetadata.workspaceIds.some(
+          (id) => !actualWorkspaceIds.includes(id),
+        )
+      )
+        throw Object.assign(
+          new Error(
+            "The authenticated backup summary does not match the contained workspaces.",
+          ),
+          { code: "BACKUP_MANIFEST_MISMATCH" },
+        );
+      const inspection = await this.summarizeArtifactInspection(
+        job.userId,
+        inspected,
+      );
+      const missing = new Set<string>(inspection.missingSecrets);
       for (const id of job.workspaceIds ?? [job.workspaceId])
         for (const entry of (await useWorkerConfigStore().get(job.userId, id))
           ?.entries ?? [])
@@ -1332,13 +3026,30 @@ export class BackupManager {
         workspaceIds: job.workspaceIds,
         provider: job.provider,
         providerObjectId: uploaded.objectId,
-        createdAt: new Date().toISOString(),
+        createdAt: encryptionMetadata.createdAt,
         size: uploaded.size,
         sha256: crypt.sha256,
         sourceWorkerId: job.workspaceId,
         missingSecrets: [...missing],
-        selectedPathsByWorkspace: job.selectedPathsByWorkspace,
+        selectedPathsByWorkspace:
+          Object.keys(inspection.selectedPathsByWorkspace).length > 0
+            ? inspection.selectedPathsByWorkspace
+            : job.selectedPathsByWorkspace,
+        formatVersion: encryptionMetadata.formatVersion,
+        ...(encryptionMetadata.keyFingerprint
+          ? { keyFingerprint: encryptionMetadata.keyFingerprint }
+          : {}),
+        sourceInstallationId: encryptionMetadata.sourceInstallationId,
+        integrityStatus: "verified",
+        provenance: "local",
+        workspaceMembers: inspection.summaries.map(
+          ({ workspaceId: id, displayName }) =>
+            displayName ? { id, displayName } : { id },
+        ),
+        reconstruction: inspection.summaries,
+        dependencies: inspection.dependencies,
       };
+      job.dependencies = inspection.dependencies;
       job.status = "succeeded";
       job.phase = "complete";
       job.progress = 100;
@@ -1442,8 +3153,11 @@ export class BackupManager {
       await this.prepareRestoreDirectory(dir);
       assertActive();
       job.status = "running";
+      job.operation ||= "restore";
       job.phase = "downloading";
       job.progress = 20;
+      job.startedAt ||= new Date().toISOString();
+      appendBackupJobLog(job, "Downloading the adopted backup artifact.");
       await this.saveJob(job);
       const enc = join(dir, "archive.enc"),
         plain = join(dir, "bundle.tar");
@@ -1454,12 +3168,20 @@ export class BackupManager {
           artifact.providerObjectId,
           enc,
           execution.controller.signal,
+          {
+            expectedSize: artifact.size,
+            maxBytes: MAX_BACKUP_PROVIDER_OBJECT_BYTES,
+          },
         );
       assertActive();
       job.phase = "verifying";
       job.progress = 55;
+      appendBackupJobLog(
+        job,
+        "Authenticating the encrypted archive and validating the selected workspace bundles.",
+      );
       await this.saveJob(job);
-      await decryptBackup(useConfig(), enc, plain, artifact.sha256);
+      await this.decryptArtifact(job.userId, artifact, enc, plain);
       assertActive();
       job.integrityVerified = true;
       const artifactWorkspaceIds =
@@ -1474,14 +3196,45 @@ export class BackupManager {
       );
       assertActive();
       if (job.target === "new") {
+        job.phase = "restoring-workers";
+        job.progress = 70;
+        job.restoreMappings = [];
+        await this.saveJob(job);
         for (const [index, bundle] of bundles.entries()) {
           assertActive();
+          const resolution = job.imageResolutions?.[bundle.id];
+          const imageResolution =
+            resolution?.mode === "replacement"
+              ? {
+                  mode: "replacement" as const,
+                  imageDefinitionId: resolution.imageDefinitionId,
+                  imageVersion: resolution.imageVersion,
+                }
+              : resolution?.mode === "workspace-only"
+                ? { mode: "workspace-only" as const }
+                : undefined;
           const worker = await useContainerManager().importWorker(
             job.userId,
             bundle.path,
-            { displayName: index === 0 ? displayName : undefined },
+            {
+              displayName: index === 0 ? displayName : undefined,
+              ...(imageResolution ? { imageResolution } : {}),
+            },
           );
           createdWorkers.push(worker.id);
+          job.restoreMappings.push({
+            sourceWorkspaceId: bundle.id,
+            workerId: worker.id,
+          });
+          job.progress = Math.min(
+            95,
+            70 + Math.round((createdWorkers.length / bundles.length) * 25),
+          );
+          appendBackupJobLog(
+            job,
+            `Restored source workspace ${bundle.id} as worker ${worker.id}.`,
+          );
+          await this.saveJob(job);
           assertActive();
         }
         job.workerId = createdWorkers[0];
@@ -1505,6 +3258,9 @@ export class BackupManager {
           extracted.workspacePath,
         );
         job.workerId = source;
+        job.restoreMappings = [
+          { sourceWorkspaceId: source, workerId: source },
+        ];
       }
       job.missingSecrets = artifact.missingSecrets.map((name) => ({
         name,
@@ -1514,8 +3270,12 @@ export class BackupManager {
       job.phase = "complete";
       job.progress = 100;
       job.completedAt = job.updatedAt = new Date().toISOString();
+      appendBackupJobLog(
+        job,
+        `Restore completed for ${job.restoreMappings?.length ?? 0} workspace(s).`,
+      );
       await this.saveJob(job);
-    } catch {
+    } catch (error) {
       const survivingWorkers = await rollbackRestoredWorkers(createdWorkers);
       if (survivingWorkers.length) {
         job.status = "failed";
@@ -1524,6 +3284,7 @@ export class BackupManager {
         job.workerIds = survivingWorkers;
         job.error =
           "Restore failed and some newly created workers require manual cleanup.";
+        job.errorCode = "RESTORE_ROLLBACK_FAILED";
       } else if (
         job.status !== "cancelled" &&
         !this.cancelledJobs.has(job.id)
@@ -1533,11 +3294,18 @@ export class BackupManager {
         job.workerId = undefined;
         job.workerIds = undefined;
         job.error = "Restore failed. No secret values were restored.";
+        job.errorCode = safeBackupErrorCode(error, "BACKUP_RESTORE_FAILED");
       } else {
         job.status = "cancelled";
         job.phase = "cancelled";
       }
       job.completedAt = job.updatedAt = new Date().toISOString();
+      appendBackupJobLog(
+        job,
+        job.status === "cancelled"
+          ? "Restore cancelled."
+          : "Restore failed; the adopted backup record remains available for retry.",
+      );
       await this.saveJob(job);
       if (job.status === "failed")
         useLogger().error(`[backup] restore job ${job.id} failed`);
@@ -1782,7 +3550,10 @@ export class BackupManager {
         verifyPlain = join(dir, "verify.tar");
       await this.providers
         .get(job.provider)!
-        .download(job.userId, uploaded.objectId, verifyEnc);
+        .download(job.userId, uploaded.objectId, verifyEnc, undefined, {
+          expectedSize: uploaded.size,
+          maxBytes: MAX_BACKUP_PROVIDER_OBJECT_BYTES,
+        });
       await decryptBackup(useConfig(), verifyEnc, verifyPlain, crypt.sha256);
       const missing =
         (await useWorkerConfigStore().get(job.userId, job.workspaceId))?.entries
@@ -2421,6 +4192,14 @@ export async function cleanupInterruptedBackupStaging(
       recursive: true,
       force: true,
     }),
+    rm(join(dataDir, "tmp", `discovery-${jobId}`), {
+      recursive: true,
+      force: true,
+    }),
+    rm(join(dataDir, "tmp", `adoption-${jobId}`), {
+      recursive: true,
+      force: true,
+    }),
   ]);
 }
 export async function readInterruptedBackupResume(
@@ -2521,6 +4300,180 @@ function normalizeSelectedPaths(value: unknown): Record<string, string[]> | unde
 function pickSelectedPaths(value: Record<string, string[]> | undefined, workerIds: string[]): Record<string, string[]> | undefined {
   if (!value) return undefined;
   return Object.fromEntries(Object.entries(value).filter(([id]) => workerIds.includes(id)));
+}
+function normalizeImageResolutions(
+  selectedWorkspaceIds: string[],
+  value: Record<string, BackupImageResolution> | undefined,
+): Record<string, BackupImageResolution> | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw Object.assign(new Error("imageResolutions must be an object"), {
+      statusCode: 400,
+    });
+  const selected = new Set(selectedWorkspaceIds);
+  const output: Record<string, BackupImageResolution> = {};
+  for (const [workspaceId, resolution] of Object.entries(value)) {
+    assertSafeUserId(workspaceId, "workspaceId");
+    if (!selected.has(workspaceId))
+      throw Object.assign(
+        new Error("Image resolution references an unselected workspace"),
+        { statusCode: 400 },
+      );
+    if (!resolution || typeof resolution !== "object")
+      throw Object.assign(new Error("Invalid image resolution"), {
+        statusCode: 400,
+      });
+    if (resolution.mode === "exact") {
+      output[workspaceId] = { mode: "exact" };
+      continue;
+    }
+    if (resolution.mode === "workspace-only") {
+      if (resolution.acknowledged !== true)
+        throw Object.assign(
+          new Error("Workspace-only restore must be explicitly acknowledged"),
+          { statusCode: 400 },
+        );
+      output[workspaceId] = {
+        mode: "workspace-only",
+        acknowledged: true,
+      };
+      continue;
+    }
+    if (resolution.mode === "replacement") {
+      assertSafeUserId(resolution.imageDefinitionId, "imageDefinitionId");
+      if (
+        typeof resolution.imageVersion !== "string" ||
+        !resolution.imageVersion.trim() ||
+        resolution.imageVersion.length > 100 ||
+        /[\0\r\n]/.test(resolution.imageVersion)
+      )
+        throw Object.assign(new Error("Invalid replacement image version"), {
+          statusCode: 400,
+        });
+      output[workspaceId] = {
+        mode: "replacement",
+        imageDefinitionId: resolution.imageDefinitionId,
+        imageVersion: resolution.imageVersion,
+      };
+      continue;
+    }
+    throw Object.assign(new Error("Invalid image resolution mode"), {
+      statusCode: 400,
+    });
+  }
+  return Object.keys(output).length ? output : undefined;
+}
+function normalizeBackupRequestId(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const normalized = value.trim();
+  if (
+    !normalized ||
+    normalized.length > 200 ||
+    /[\0\r\n]/.test(normalized)
+  )
+    throw Object.assign(new Error("Invalid backup request identity"), {
+      statusCode: 400,
+      code: "BACKUP_REQUEST_ID_INVALID",
+    });
+  return normalized;
+}
+function requestFingerprint(value: Record<string, unknown>): string {
+  const canonical = Object.fromEntries(
+    Object.entries(value)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right)),
+  );
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+function appendBackupJobLog(job: BackupJob, message: string): void {
+  // Job logs are intentionally concise operational events, never exception
+  // bodies or provider responses. Keep their durable/MCP representation
+  // bounded so repeated polling stays inexpensive.
+  const safe = message.replace(/[\0\r\n]+/g, " ").slice(0, 2048);
+  job.logs = [...(job.logs ?? []), safe].slice(-1000);
+}
+function safeRemoteTimestamp(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length > 100) return undefined;
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds)) return undefined;
+  const year = new Date(milliseconds).getUTCFullYear();
+  return year >= 2000 && year <= 9999
+    ? new Date(milliseconds).toISOString()
+    : undefined;
+}
+function safeRemoteId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  try {
+    assertSafeUserId(value, "backupId");
+    return value;
+  } catch {
+    return undefined;
+  }
+}
+function safeBackupErrorCode(error: unknown, fallback: string): string {
+  const candidate =
+    error && typeof error === "object" && "code" in error
+      ? (error as { code?: unknown }).code
+      : undefined;
+  if (
+    typeof candidate === "string" &&
+    /^[A-Z][A-Z0-9_]{2,100}$/.test(candidate)
+  )
+    return candidate;
+  const message = error instanceof Error ? error.message : "";
+  if (/recovery key|required key.*unavailable/i.test(message))
+    return "BACKUP_RECOVERY_KEY_MISSING";
+  if (/integrity verification failed/i.test(message))
+    return "BACKUP_INTEGRITY_FAILED";
+  if (/authentication failed/i.test(message))
+    return "BACKUP_AUTHENTICATION_FAILED";
+  if (/unsupported backup format|format is not supported/i.test(message))
+    return "BACKUP_FORMAT_UNSUPPORTED";
+  if (/manifest|workspace identity|backup bundle|reconstruction metadata/i.test(message))
+    return "BACKUP_MANIFEST_INVALID";
+  const publicFailure = publicBackupFailure(error);
+  return publicFailure.code === "BACKUP_FAILED"
+    ? fallback
+    : publicFailure.code;
+}
+function safeAdoptionError(error: unknown): string {
+  const code = safeBackupErrorCode(error, "BACKUP_ADOPTION_FAILED");
+  if (code === "BACKUP_RECOVERY_KEY_MISSING")
+    return "The recovery key required by this backup is not available or did not authenticate it.";
+  if (code === "BACKUP_FORMAT_UNSUPPORTED")
+    return "This backup format is not supported by this Agentor version.";
+  if (/INTEGRITY|AUTHENTICATION|MANIFEST|INVALID|DAMAGED/.test(code))
+    return "The downloaded backup could not be authenticated or its manifest is invalid.";
+  const providerFailure = publicBackupFailure(error);
+  if (providerFailure.code !== "BACKUP_FAILED") return providerFailure.message;
+  return "Backup adoption failed. The discovered record was retained so the operation can be retried.";
+}
+function isRetryableAdoptionError(error: unknown): boolean {
+  const code = safeBackupErrorCode(error, "BACKUP_ADOPTION_FAILED");
+  if (/RECOVERY_KEY|FORMAT_UNSUPPORTED|INTEGRITY|AUTHENTICATION|MANIFEST|INVALID|DAMAGED/.test(code))
+    return false;
+  return publicBackupFailure(error).retryable;
+}
+function safeImageRecoveryError(error: unknown): string {
+  const code = safeBackupErrorCode(error, "BACKUP_IMAGE_RECOVERY_FAILED");
+  if (code === "BACKUP_RECOVERY_KEY_MISSING")
+    return "The recovery key required by this backup is not available or did not authenticate it.";
+  if (code === "BACKUP_IMAGE_RECIPE_UNAVAILABLE")
+    return "This workspace has no portable custom-image recipe. Select a replacement image or explicitly restore workspace-only.";
+  if (/INTEGRITY|AUTHENTICATION|MANIFEST|FORMAT/.test(code))
+    return "The backup could not be authenticated or its reconstruction metadata is invalid.";
+  if (code === "BACKUP_REMOTE_OBJECT_CHANGED")
+    return "The provider object changed after adoption. Scan and adopt it again before recovering its image definition.";
+  const providerFailure = publicBackupFailure(error);
+  return providerFailure.code !== "BACKUP_FAILED"
+    ? providerFailure.message
+    : "Image recipe recovery failed. The adopted backup and any imported recovery definition were retained.";
+}
+function isRetryableImageRecoveryError(error: unknown): boolean {
+  const code = safeBackupErrorCode(error, "BACKUP_IMAGE_RECOVERY_FAILED");
+  if (/RECOVERY_KEY|RECIPE_UNAVAILABLE|INTEGRITY|AUTHENTICATION|MANIFEST|FORMAT/.test(code))
+    return false;
+  return publicBackupFailure(error).retryable;
 }
 function safeError(err: unknown) {
   const m = err instanceof Error ? err.message : "";

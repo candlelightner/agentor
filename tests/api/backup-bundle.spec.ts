@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { createWriteStream } from 'node:fs';
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
@@ -9,6 +9,10 @@ import {
   packWorkspaceBackups,
   unpackWorkspaceBackups,
 } from '../../orchestrator/server/utils/backup-bundle';
+import {
+  MAX_BUNDLE_TOTAL_BYTES,
+  MAX_INNER_ARCHIVE_BYTES,
+} from '../../orchestrator/server/utils/worker-export';
 
 const orchestratorRequire = createRequire(
   new URL('../../orchestrator/package.json', import.meta.url),
@@ -111,6 +115,36 @@ test.describe('backup bundle boundary', () => {
         join(root, 'link-output.tar'),
       ),
     ).rejects.toThrow(/regular file/i);
+  });
+
+  test('rejects oversized nested and outer bundles before streaming sparse payloads', async () => {
+    const oversizedMember = join(root, 'oversized-member.tar');
+    const oversizedOuter = join(root, 'oversized-outer.tar');
+    await writeFile(oversizedMember, '');
+    await truncate(oversizedMember, MAX_BUNDLE_TOTAL_BYTES + 1);
+    await expect(
+      packWorkspaceBackups(
+        [
+          { id: 'worker-a', path: oversizedMember },
+          { id: 'worker-b', path: oversizedMember },
+        ],
+        join(root, 'should-not-exist.tar'),
+      ),
+    ).rejects.toThrow(/size limit/i);
+
+    await writeFile(oversizedOuter, '');
+    await truncate(
+      oversizedOuter,
+      MAX_INNER_ARCHIVE_BYTES + 64 * 1024 * 1024 + 1,
+    );
+    await expect(
+      unpackWorkspaceBackups(
+        oversizedOuter,
+        ['worker-a', 'worker-b'],
+        ['worker-a'],
+        join(root, 'oversized-extract'),
+      ),
+    ).rejects.toThrow(/size limit/i);
   });
 
   test('aborts malformed extraction without consuming later entries or leaving writers active', async () => {

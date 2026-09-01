@@ -20,11 +20,23 @@ const busy = ref(""),
   workspaceOptions = ref<WorkspaceOption[]>([]),
   restoreName = ref(""),
   restoreLockPassword = ref(""),
+  restoreRequestId = ref(""),
   confirmOverwrite = ref(false),
   pickerWorkspaceId = ref(""),
+  recoveryMaterial = ref(""),
+  revealedRecoveryKey = ref(""),
+  reauthPassword = ref(""),
+  restoreImageModes = ref<
+    Record<string, "exact" | "replacement" | "workspace-only">
+  >({}),
+  restoreReplacementImages = ref<
+    Record<string, { imageDefinitionId: string; imageVersion: string }>
+  >({}),
+  selectedDiscovered = ref<any>(null),
   actionError = ref(""),
   savedNotice = ref("");
 const googleDraft = reactive({ clientId: "", redirectUri: "", clientSecret: "" });
+let recoverySecretTimer: ReturnType<typeof setTimeout> | undefined;
 function clonePathSelections(value: Record<string, string[]> | undefined) {
   return JSON.parse(JSON.stringify(value || {})) as Record<string, string[]>;
 }
@@ -41,9 +53,10 @@ watch(open, async (shown) => {
   } else {
     api.stop();
     restoreLockPassword.value = "";
+    clearRecoverySecret();
   }
 });
-onBeforeUnmount(api.stop);
+onBeforeUnmount(() => { api.stop(); clearRecoverySecret(); });
 type WorkspaceOption = {
   id: string;
   label: string;
@@ -190,8 +203,101 @@ async function configureGoogle() {
     googleDraft.clientSecret = "";
   });
 }
+function clearRecoverySecret() {
+  if (recoverySecretTimer) clearTimeout(recoverySecretTimer);
+  recoverySecretTimer = undefined;
+  revealedRecoveryKey.value = "";
+  reauthPassword.value = "";
+  recoveryMaterial.value = "";
+}
+function requestIdentity(prefix: string) {
+  // A new human-initiated operation needs a new identity. The identity is
+  // retained by the server for a transport retry, but must not turn every
+  // later click on “scan” into a stale result from the first click.
+  const suffix = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `${prefix}-${suffix}`;
+}
+async function importRecoveryKey() {
+  if (!recoveryMaterial.value.trim()) return;
+  await run("recovery-import", async () => {
+    try { await api.importRecoveryMaterial(recoveryMaterial.value); }
+    finally { recoveryMaterial.value = ""; }
+  });
+}
+function reauthBody() { return reauthPassword.value ? { password: reauthPassword.value } : { useFreshSession: true }; }
+async function revealRecoveryKey() {
+  await run("recovery-reveal", async () => {
+    const reauth = reauthBody();
+    clearRecoverySecret();
+    const result = await api.revealRecoveryKey(reauth);
+    revealedRecoveryKey.value = result.keyMaterial;
+    reauthPassword.value = "";
+    recoverySecretTimer = setTimeout(clearRecoverySecret, 60_000);
+  });
+}
+async function copyRecoveryKey() {
+  if (!revealedRecoveryKey.value) return;
+  try { await navigator.clipboard.writeText(revealedRecoveryKey.value); savedNotice.value = "Recovery key copied. Clear your clipboard when finished."; }
+  catch { clearRecoverySecret(); actionError.value = "Could not copy the recovery key."; }
+}
+async function downloadRecoveryKit(fingerprint?: string) {
+  await run("recovery-export", async () => {
+    try {
+      const result: any = await api.exportRecoveryKit(reauthBody(), fingerprint);
+      const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob), anchor = document.createElement("a");
+      anchor.href = url; anchor.download = `agentor-recovery-${String(result.fingerprint || "kit").slice(-12)}.json`; anchor.click();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    } finally { clearRecoverySecret(); }
+  });
+}
+async function scanRemoteBackups() {
+  const provider = draft.providerId === "google" ? "google-drive" : draft.providerId;
+  await run("remote-scan", () => api.scanProvider(provider, requestIdentity("ui-discovery")));
+}
+async function inspectDiscovered(item: any) {
+  selectedDiscovered.value = await run(`remote-inspect-${item.id}`, () => api.inspectDiscovered(item.id));
+}
+async function adoptDiscovered(item: any) {
+  await run(`remote-adopt-${item.id}`, () => api.adoptDiscovered(item.id, requestIdentity("ui-adopt")));
+}
+async function recoverImageDefinition(summary: BackupWorkspaceReconstruction) {
+  if (!restoreItem.value || !imageRecoveryAvailable(summary)) return;
+  await run(`image-recovery-${summary.workspaceId}`, () =>
+    api.recoverImageDefinition(
+      restoreItem.value.id,
+      summary.workspaceId,
+      requestIdentity("ui-image-recovery"),
+    ),
+  );
+}
 async function restore() {
   if (!restoreItem.value || !restoreWorkspaceIds.value.length) return;
+  const imageResolutions: Record<string, any> = {};
+  for (const summary of selectedCustomImageSummaries.value) {
+    const mode = restoreImageModes.value[summary.workspaceId] || "exact";
+    if (mode === "workspace-only") {
+      imageResolutions[summary.workspaceId] = {
+        mode: "workspace-only",
+        acknowledged: true,
+      };
+    } else if (mode === "replacement") {
+      const replacement = restoreReplacementImages.value[summary.workspaceId];
+      if (
+        !replacement?.imageDefinitionId.trim() ||
+        !replacement.imageVersion.trim()
+      ) {
+        actionError.value =
+          "Enter both a replacement image definition ID and version.";
+        return;
+      }
+      imageResolutions[summary.workspaceId] = {
+        mode: "replacement",
+        imageDefinitionId: replacement.imageDefinitionId.trim(),
+        imageVersion: replacement.imageVersion.trim(),
+      };
+    } else imageResolutions[summary.workspaceId] = { mode: "exact" };
+  }
   const result = await run("restore", () =>
     api.restore(
       restoreItem.value.id,
@@ -200,6 +306,8 @@ async function restore() {
       confirmOverwrite.value,
       restoreLockPassword.value,
       restoreWorkspaceIds.value,
+      restoreRequestId.value || (restoreRequestId.value = requestIdentity("ui-restore")),
+      Object.keys(imageResolutions).length ? imageResolutions : undefined,
     ),
   );
   if (result) {
@@ -219,6 +327,38 @@ function selectRestore(item: any) {
   restoreName.value = "";
   confirmOverwrite.value = false;
   restoreLockPassword.value = "";
+  restoreRequestId.value = requestIdentity("ui-restore");
+  restoreImageModes.value = Object.fromEntries(
+    (item.reconstruction || [])
+      .filter(
+        (summary: any) =>
+          summary.image?.kind === "custom" ||
+          summary.image?.kind === "unmanaged",
+      )
+      .map((summary: any) => [
+        summary.workspaceId,
+        (item.dependencies || []).some(
+          (dependency: any) =>
+            dependency.kind === "image" &&
+            dependency.workspaceId === summary.workspaceId &&
+            dependency.status === "replacement-required",
+        )
+          ? "replacement"
+          : "exact",
+      ]),
+  );
+  restoreReplacementImages.value = Object.fromEntries(
+    (item.reconstruction || [])
+      .filter(
+        (summary: any) =>
+          summary.image?.kind === "custom" ||
+          summary.image?.kind === "unmanaged",
+      )
+      .map((summary: any) => [
+        summary.workspaceId,
+        { imageDefinitionId: "", imageVersion: "" },
+      ]),
+  );
 }
 function cancelRestore() {
   restoreItem.value = null;
@@ -226,6 +366,71 @@ function cancelRestore() {
   restoreName.value = "";
   confirmOverwrite.value = false;
   restoreLockPassword.value = "";
+  restoreRequestId.value = "";
+  restoreImageModes.value = {};
+  restoreReplacementImages.value = {};
+}
+const selectedCustomImageSummaries = computed(() =>
+  ((restoreItem.value?.reconstruction || []) as BackupWorkspaceReconstruction[])
+    .filter(
+      (summary) =>
+        (summary.image.kind === "custom" || summary.image.kind === "unmanaged") &&
+        restoreWorkspaceIds.value.includes(summary.workspaceId),
+    ),
+);
+function imageDependency(workspaceId: string) {
+  return (restoreItem.value?.dependencies || []).find(
+    (dependency: any) =>
+      dependency.kind === "image" &&
+      dependency.workspaceId === workspaceId,
+  );
+}
+function exactImageAvailable(workspaceId: string) {
+  return imageDependency(workspaceId)?.status !== "replacement-required";
+}
+function imageRecoveryAvailable(summary: BackupWorkspaceReconstruction) {
+  // Do not infer this from IDs or a dependency message. The backup bundle is
+  // untrusted and its recipe is deliberately not sent to the browser; only a
+  // server-derived capability bit enables recovery.
+  return summary.image.kind === "custom" && summary.image.recoveryAvailable === true;
+}
+function imageRecoveryJob(workspaceId: string) {
+  return api.jobs.value.find(
+    (job) =>
+      job.artifactId === restoreItem.value?.id &&
+      job.workspaceId === workspaceId &&
+      job.operation === "dependency-resolution",
+  );
+}
+function imageBuildId(job: BackupJob | undefined) {
+  return job?.recoveredImageBuildId ?? job?.imageBuildId;
+}
+const restoreCanStart = computed(() => {
+  if (!restoreWorkspaceIds.value.length) return false;
+  if (restoreTarget.value === "original") return confirmOverwrite.value;
+  return selectedCustomImageSummaries.value.every((summary) => {
+    const mode = restoreImageModes.value[summary.workspaceId] || "exact";
+    if (mode === "exact") return exactImageAvailable(summary.workspaceId);
+    if (mode === "workspace-only") return true;
+    const replacement = restoreReplacementImages.value[summary.workspaceId];
+    return Boolean(
+      replacement?.imageDefinitionId.trim() && replacement.imageVersion.trim(),
+    );
+  });
+});
+function setReplacementField(
+  workspaceId: string,
+  field: "imageDefinitionId" | "imageVersion",
+  value: string,
+) {
+  const current = restoreReplacementImages.value[workspaceId] ?? {
+    imageDefinitionId: "",
+    imageVersion: "",
+  };
+  restoreReplacementImages.value[workspaceId] = {
+    ...current,
+    [field]: value,
+  };
 }
 function restoreMembers(item = restoreItem.value): Array<{ id: string; displayName?: string }> {
   if (!item) return [];
@@ -490,6 +695,34 @@ watch(restoreTarget, (target) => {
           </div>
         </section>
         <BackupPathPickerModal v-if="pickerWorkspaceId" :open="Boolean(pickerWorkspaceId)" v-model:paths="draft.selectedPathsByWorkspace[pickerWorkspaceId]" :worker-id="pickerWorkspaceId" @update:open="shown => { if (!shown) pickerWorkspaceId = '' }" />
+        <section class="border rounded-md p-4 space-y-3" data-testid="backup-recovery-keys">
+          <div>
+            <h3 class="font-medium">Recovery key</h3>
+            <p class="text-xs text-amber-700 dark:text-amber-300">Anyone who has this key and a backup artifact can decrypt that backup. Keep the exported kit offline and do not share it in chat or source control.</p>
+          </div>
+          <p v-if="!api.recoveryKeys.value.length" class="text-sm text-gray-500">No owner recovery key has been generated yet. It is created when a new-format backup is made.</p>
+          <ul v-else class="text-xs space-y-1" data-testid="recovery-key-fingerprints">
+            <li v-for="key in api.recoveryKeys.value" :key="key.fingerprint" class="flex flex-wrap items-center gap-2"><code>{{ key.fingerprint }}</code> · {{ key.active ? "current" : key.source }}<UButton size="xs" color="neutral" variant="ghost" :loading="busy === 'recovery-export'" @click="downloadRecoveryKit(key.fingerprint)">Export this key</UButton></li>
+          </ul>
+          <label class="block text-sm">Import recovery key or kit<textarea v-model="recoveryMaterial" autocomplete="off" class="mt-1 block w-full border rounded p-2 font-mono text-xs" rows="3" placeholder="Paste an Agentor recovery kit or recovery material"></textarea></label>
+          <UButton size="xs" variant="outline" :disabled="!recoveryMaterial.trim()" :loading="busy === 'recovery-import'" @click="importRecoveryKey">Import recovery material</UButton>
+          <div class="rounded border p-3 space-y-2">
+            <label class="block text-sm">Current password (fresh server-side reauthentication)<input v-model="reauthPassword" type="password" autocomplete="current-password" class="mt-1 block w-full border rounded p-2" /></label>
+            <p class="text-xs text-gray-500">Passkey-only accounts: sign in again, then use these actions within five minutes without entering a password.</p>
+            <div class="flex flex-wrap gap-2"><UButton size="xs" :loading="busy === 'recovery-reveal'" @click="revealRecoveryKey">Reveal recovery key</UButton><UButton size="xs" variant="outline" :loading="busy === 'recovery-export'" @click="downloadRecoveryKit()">Download recovery kit</UButton><UButton v-if="revealedRecoveryKey" size="xs" variant="outline" @click="copyRecoveryKey">Copy revealed key</UButton><UButton v-if="revealedRecoveryKey" size="xs" color="neutral" variant="ghost" @click="clearRecoverySecret">Hide key</UButton></div>
+            <output v-if="revealedRecoveryKey" class="block break-all rounded bg-amber-50 p-2 font-mono text-xs dark:bg-amber-950" data-testid="revealed-recovery-key">{{ revealedRecoveryKey }}</output>
+          </div>
+        </section>
+        <section class="border rounded-md p-4 space-y-3" data-testid="remote-backup-discovery">
+          <div class="flex items-center justify-between gap-2"><div><h3 class="font-medium">Remote backup discovery</h3><p class="text-xs text-gray-500">Scans the linked provider account for Agentor artifacts not yet in this installation.</p></div><UButton size="xs" variant="outline" :loading="busy === 'remote-scan'" @click="scanRemoteBackups">Scan provider</UButton></div>
+          <p v-if="!api.discovered.value.length" class="text-sm text-gray-500">No remote-only backups discovered.</p>
+          <div v-for="item in api.discovered.value" :key="item.id" class="rounded border p-3 text-sm" :data-testid="`discovered-backup-${item.id}`">
+            <div class="flex justify-between gap-2"><div><b>{{ item.workspaceMembers?.map(memberLabel).join(', ') || item.id }}</b><p class="text-xs text-gray-500">{{ date(item.createdAt) }} · {{ fmt(item.size) }} · format {{ item.formatVersion ?? 'unknown' }} · <code>{{ item.keyFingerprint || 'key unknown' }}</code></p></div><span class="text-xs">{{ item.state }}</span></div>
+            <p v-if="item.blockedReason" class="mt-1 text-xs text-amber-700 dark:text-amber-300">{{ item.blockedReason }}</p><p class="text-xs text-gray-500">Integrity: {{ item.integrityStatus || 'unverified' }} · recovery key: {{ item.keyAvailable === true ? 'available' : item.keyAvailable === false ? 'missing' : 'unknown' }} · {{ item.knownLocally ? 'already adopted locally' : 'remote only' }}</p>
+            <div class="mt-2 flex gap-2"><UButton size="xs" variant="outline" @click="inspectDiscovered(item)">Inspect</UButton><UButton v-if="item.state !== 'adopted'" size="xs" :loading="busy === `remote-adopt-${item.id}`" :disabled="item.state !== 'ready-to-adopt'" @click="adoptDiscovered(item)">Adopt locally</UButton></div>
+          </div>
+          <div v-if="selectedDiscovered" class="rounded bg-gray-50 p-3 text-xs space-y-1 dark:bg-gray-900"><b>Remote backup details</b><p>Workers: {{ selectedDiscovered.workspaceMembers?.map(memberLabel).join(', ') || 'not inspected' }}</p><p>Ready to restore: {{ selectedDiscovered.restorable ? 'yes' : 'not until adoption and verification complete' }}</p><p v-if="selectedDiscovered.sourceInstallationId">Source installation: <code>{{ selectedDiscovered.sourceInstallationId }}</code></p><p v-if="selectedDiscovered.blockedReason">Blocked: {{ selectedDiscovered.blockedReason }}</p></div>
+        </section>
         <section>
           <h3 class="font-medium mb-2">Jobs</h3>
           <div v-if="!api.jobs.value.length" class="text-sm text-gray-500">
@@ -553,6 +786,9 @@ watch(restoreTarget, (target) => {
               </p>
               <p v-if="a.missingSecrets?.length" class="text-xs text-amber-600">
                 Secrets to reconfigure: {{ a.missingSecrets.join(", ") }}
+              </p>
+              <p v-if="a.reconstruction?.length" class="text-xs text-gray-500">
+                Reconstruction: {{ a.reconstruction.map(item => item.image.kind === 'custom' ? `custom image ${item.image.definitionId || 'unknown'}${item.image.version ? ` v${item.image.version}` : ''}` : item.image.kind === 'unmanaged' ? 'unmanaged per-worker image' : item.image.kind).join('; ') }} · {{ a.reconstruction.reduce((count, item) => count + item.desiredPluginCount, 0) }} plugin installation{{ a.reconstruction.reduce((count, item) => count + item.desiredPluginCount, 0) === 1 ? '' : 's' }}
               </p>
             </div>
             <div class="flex gap-1">
@@ -626,6 +862,139 @@ watch(restoreTarget, (target) => {
               Reset selection
             </UButton>
           </fieldset>
+          <fieldset
+            v-if="restoreTarget === 'new' && selectedCustomImageSummaries.length"
+            class="rounded border border-amber-300 p-3 space-y-3"
+            data-testid="restore-image-dependencies"
+          >
+            <legend class="px-1 text-sm font-medium">
+              Custom image reconstruction
+            </legend>
+            <p class="text-xs text-gray-500">
+              Agentor will never silently replace a required custom image with
+              the platform default. Resolve each selected worker explicitly.
+            </p>
+            <div
+              v-for="summary in selectedCustomImageSummaries"
+              :key="summary.workspaceId"
+              class="rounded border p-2 space-y-2"
+            >
+              <p class="text-sm font-medium">
+                {{ memberLabel({ id: summary.workspaceId, displayName: summary.displayName }) }}
+              </p>
+              <p class="break-all text-xs text-gray-500">
+                <template v-if="summary.image.kind === 'custom'">
+                  Required: <code>{{ summary.image.definitionId }}</code>
+                  version <code>{{ summary.image.version }}</code>
+                </template>
+                <template v-else>Required: unmanaged per-worker image</template>
+                <span v-if="summary.image.digest">
+                  · <code>{{ summary.image.digest }}</code>
+                </span>
+              </p>
+              <p
+                v-if="imageDependency(summary.workspaceId)?.reason"
+                class="text-xs text-amber-700 dark:text-amber-300"
+              >
+                {{ imageDependency(summary.workspaceId).reason }}
+              </p>
+              <div
+                v-if="imageRecoveryAvailable(summary)"
+                class="rounded border border-amber-300 bg-amber-50 p-2 text-xs space-y-2 dark:bg-amber-950"
+                data-testid="backup-image-recovery"
+              >
+                <p>
+                  A secret-free image recipe is available in this backup. Recover a new image definition and start its controlled build.
+                </p>
+                <UButton
+                  size="xs"
+                  variant="outline"
+                  :loading="busy === `image-recovery-${summary.workspaceId}`"
+                  :disabled="Boolean(imageRecoveryJob(summary.workspaceId) && (imageRecoveryJob(summary.workspaceId)?.status === 'queued' || imageRecoveryJob(summary.workspaceId)?.status === 'running'))"
+                  @click="recoverImageDefinition(summary)"
+                >Recover definition &amp; build</UButton>
+                <template v-if="imageRecoveryJob(summary.workspaceId)">
+                  <p>
+                    Recovery job <code>{{ imageRecoveryJob(summary.workspaceId)?.id }}</code>:
+                    {{ imageRecoveryJob(summary.workspaceId)?.status }} ·
+                    {{ imageRecoveryJob(summary.workspaceId)?.phase }}
+                  </p>
+                  <p v-if="imageRecoveryJob(summary.workspaceId)?.recoveredImageDefinitionId">
+                    Recovered definition: <code>{{ imageRecoveryJob(summary.workspaceId)?.recoveredImageDefinitionId }}</code>.
+                  </p>
+                  <p v-if="imageBuildId(imageRecoveryJob(summary.workspaceId))">
+                    Image build: <code>{{ imageBuildId(imageRecoveryJob(summary.workspaceId)) }}</code> ·
+                    <NuxtLink
+                      :to="`/api/image-builds/${encodeURIComponent(imageBuildId(imageRecoveryJob(summary.workspaceId))!)}`"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      class="underline"
+                    >Inspect build status</NuxtLink>.
+                  </p>
+                  <p
+                    v-if="imageRecoveryJob(summary.workspaceId)?.status === 'succeeded' && imageBuildId(imageRecoveryJob(summary.workspaceId))"
+                    class="font-medium"
+                  >
+                    Definition recovery succeeded and the image build was started. Wait for its Agentor compatibility validation to succeed, then retry restore.
+                  </p>
+                  <p
+                    v-if="imageRecoveryJob(summary.workspaceId)?.error"
+                    class="text-red-700 dark:text-red-300"
+                  >
+                    {{ imageRecoveryJob(summary.workspaceId)?.error }}
+                  </p>
+                </template>
+              </div>
+              <label class="block text-xs">
+                Image resolution
+                <select
+                  v-model="restoreImageModes[summary.workspaceId]"
+                  class="mt-1 block w-full rounded border p-2"
+                >
+                  <option
+                    value="exact"
+                    :disabled="!exactImageAvailable(summary.workspaceId)"
+                  >
+                    Use exact captured image identity
+                  </option>
+                  <option value="replacement">Select replacement image</option>
+                  <option value="workspace-only">
+                    Restore workspace with platform image (not faithful)
+                  </option>
+                </select>
+              </label>
+              <div
+                v-if="restoreImageModes[summary.workspaceId] === 'replacement'"
+                class="grid gap-2 md:grid-cols-2"
+              >
+                <label class="text-xs">
+                  Replacement definition ID
+                  <input
+                    :value="restoreReplacementImages[summary.workspaceId]?.imageDefinitionId || ''"
+                    class="mt-1 block w-full rounded border p-2"
+                    placeholder="image definition UUID"
+                    @input="setReplacementField(summary.workspaceId, 'imageDefinitionId', ($event.target as HTMLInputElement).value)"
+                  />
+                </label>
+                <label class="text-xs">
+                  Replacement version
+                  <input
+                    :value="restoreReplacementImages[summary.workspaceId]?.imageVersion || ''"
+                    class="mt-1 block w-full rounded border p-2"
+                    placeholder="version"
+                    @input="setReplacementField(summary.workspaceId, 'imageVersion', ($event.target as HTMLInputElement).value)"
+                  />
+                </label>
+              </div>
+              <p
+                v-if="restoreImageModes[summary.workspaceId] === 'workspace-only'"
+                class="text-xs font-medium text-amber-700 dark:text-amber-300"
+              >
+                By starting restore you acknowledge that only the workspace and
+                portable configuration are restored; the worker image differs.
+              </p>
+            </div>
+          </fieldset>
           <label v-if="restoreTarget === 'new'" class="block text-sm"
             >Display name (applies only to the first selected workspace)<input
               v-model="restoreName"
@@ -646,7 +1015,7 @@ watch(restoreTarget, (target) => {
           /></label>
           <div>
             <UButton
-              :disabled="!restoreWorkspaceIds.length || (restoreTarget === 'original' && !confirmOverwrite)"
+              :disabled="!restoreCanStart"
               :loading="busy === 'restore'"
               @click="restore"
               >Start restore</UButton
