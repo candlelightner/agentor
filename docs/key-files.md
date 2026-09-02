@@ -50,6 +50,9 @@
 - `orchestrator/server/utils/package-manager-domains.ts` - Package-manager domain allowlist + `getPackageManagerDomains()` (the firewall allowlist for the `package-managers`/`custom` network modes)
 - `orchestrator/server/utils/docker.ts` - DockerService class (dockerode wrapper)
 - `orchestrator/server/utils/container.ts` - ContainerManager class (container lifecycle, archive/unarchive)
+- `orchestrator/server/utils/host-mount-store.ts` / `host-mount-revocation.ts` - empty-by-default platform host-path catalog, per-account entitlement/grant/delegation graph, server-side source resolution, and durable stop/rebuild revocation enforcement
+- `orchestrator/server/utils/management-host-mount-domain.ts` / `orchestrator/server/api/host-mounts/` - platform/group management MCP and authenticated REST surfaces for the same host-mount policy
+- `worker/agents/role-skills/agentor-{global-administration,group-administration,worker-runtime}.md` - role-specific host-mount operating rules: platform catalog/entitlements, downward group delegation, and the ordinary-worker authority boundary
 - `orchestrator/server/utils/port-mapping-store.ts` - PortMappingStore class (extends JsonStore)
 - `orchestrator/server/utils/domain-mapping-store.ts` - DomainMappingStore class (persistent domain mappings)
 - `orchestrator/server/utils/traefik-manager.ts` - TraefikManager class (Traefik container lifecycle, dynamic config generation)
@@ -140,6 +143,7 @@
 - `orchestrator/app/components/ContainerCard.vue` - Worker card (controls, upload/download, archive, detail modal)
 - `orchestrator/app/components/ContainerDetailModal.vue` - Detail modal (auto-displays all `agentor.*` Docker labels)
 - `orchestrator/app/components/CreateContainerModal.vue` - New worker modal (environment selector, init preset, repos)
+- `orchestrator/app/components/HostMountManagementModal.vue` / `orchestrator/app/composables/useHostMounts.ts` - central platform catalog, account entitlement, all/group/worker assignment UI and effective-path client
 - `orchestrator/app/components/ServicePane.vue` - Unified iframe pane for desktop (noVNC) and editor (code-server)
 - `orchestrator/app/components/DomainMappingsPanel.vue` - Domain mapping CRUD panel (subdomain, protocol, basic auth)
 - `orchestrator/app/components/EnvironmentEditor.vue` - Environment form (resources, network, Docker, expose APIs, capabilities, instructions, scripts)
@@ -149,7 +153,7 @@
 - `orchestrator/app/components/InitScriptsModal.vue` - Init scripts management modal (list, view built-in, create/edit/delete custom)
 - `orchestrator/app/components/SettingsModal.vue` - System settings viewer (auto-renders categorized sections from `/api/settings`)
 - `orchestrator/app/components/FileDropZone.vue` - Drag-and-drop file zone for uploads
-- `orchestrator/app/components/MountInput.vue` - Form input for a single host bind-mount config
+- `orchestrator/app/components/MountInput.vue` - Approved-path selector, container target, and read-only/read-write dropdown for one governed host bind
 - `orchestrator/app/components/LogPane.vue` - Log viewer pane (filter bar, color-coded entries, auto-scroll, WebSocket live stream)
 - `orchestrator/app/components/PaneContent.vue` - Renders active tab content (Terminal/Desktop/Editor/Apps/Logs/Placeholder)
 - `orchestrator/app/components/PaneDropOverlay.vue` - 5-zone drop overlay during tab drag (left/right/top/bottom/center)

@@ -30,7 +30,7 @@ All agents are installed in a single unified worker image. Start any agent via i
 - **Port & domain mapping** — unified Traefik reverse proxy handling both TCP port forwarding (localhost- or network-bound) and subdomain-based HTTP/HTTPS/TCP routing with TLS (Let's Encrypt HTTP-01/DNS-01 or self-signed CA), optional HTTP basic auth
 - **Auto-updates** — per-image or bulk image updates in production mode with registry-agnostic digest comparison (GHCR + Docker Hub), orchestrator self-replaces
 - **Resource limits** — per-environment CPU and memory constraints applied to every worker on that environment (plus a global default)
-- **Volume mounts** — bind-mount host directories into workers
+- **Governed host mounts** — an empty-by-default platform path catalog, per-account entitlements, all/group/worker assignments, read-only-by-default access, downward-only group-admin delegation, and immediate stop/rebuild enforcement on revocation; see [Host mount permissions](docs/host-mounts.md)
 - **Persistent workspaces** — workspace data survives container stops, restarts, and archiving via named Docker volumes
 - **Worker archiving** — archive workers to free resources while preserving workspace data; unarchive to restore
 - **Worker groups and managed networks** — organize related experiments, create all/group/selected-worker bridge networks, and keep the internal management network unavailable to ordinary workers

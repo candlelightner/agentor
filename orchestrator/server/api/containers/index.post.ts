@@ -28,6 +28,11 @@ defineRouteMeta({
                 type: "string",
                 description: "Environment configuration ID",
               },
+              workerGroupId: {
+                type: "string",
+                description:
+                  "Optional direct worker-group membership. The group must belong to the authenticated account.",
+              },
               excludedGlobalEnvVarKeys: {
                 type: "array",
                 items: { type: "string" },
@@ -63,11 +68,13 @@ defineRouteMeta({
   },
 });
 
-import { useContainerManager, useConfig } from "../../utils/services";
+import { useContainerManager } from "../../utils/services";
 import { MAX_DISPLAY_NAME_LENGTH } from "../../utils/validation";
 import { validateMounts } from "../../utils/docker";
 import { requireAuth } from "../../utils/auth-helpers";
 import { useImageCatalogManager } from "../../utils/image-catalog";
+import { useWorkerGroupStore } from "../../utils/services";
+import { addWorkerToGroupWithNetworks } from "../../utils/worker-group-manager";
 
 export default defineEventHandler(async (event) => {
   const { user } = requireAuth(event);
@@ -111,9 +118,32 @@ export default defineEventHandler(async (event) => {
       statusMessage: "mounts must be an array",
     });
   }
-  const mountError = validateMounts(parsedMounts, useConfig().dataDir);
+  const mountError = validateMounts(parsedMounts);
   if (mountError) {
     throw createError({ statusCode: 400, statusMessage: mountError });
+  }
+
+  if (
+    body.workerGroupId !== undefined &&
+    typeof body.workerGroupId !== "string"
+  ) {
+    throw createError({
+      statusCode: 400,
+      statusMessage: "workerGroupId must be a string",
+    });
+  }
+  const targetWorkerGroupId =
+    typeof body.workerGroupId === "string" && body.workerGroupId
+      ? body.workerGroupId
+      : undefined;
+  if (
+    targetWorkerGroupId &&
+    !useWorkerGroupStore().get(user.id, targetWorkerGroupId)
+  ) {
+    throw createError({
+      statusCode: 404,
+      statusMessage: "Worker group not found",
+    });
   }
 
   let parsedRepos;
@@ -149,6 +179,7 @@ export default defineEventHandler(async (event) => {
     mounts: parsedMounts,
     environmentId: body.environmentId || undefined,
     excludedGlobalEnvVarKeys: body.excludedGlobalEnvVarKeys,
+    targetWorkerGroupId,
     initScript: body.initScript || undefined,
     workerConfiguration: body.workerConfiguration || undefined,
     imageDefinitionId: imageSelection?.definitionId,
@@ -157,6 +188,21 @@ export default defineEventHandler(async (event) => {
     imageRuntimeReference: imageSelection?.runtimeImage,
     userId: user.id,
   });
+
+  if (targetWorkerGroupId) {
+    try {
+      await addWorkerToGroupWithNetworks(
+        user.id,
+        targetWorkerGroupId,
+        container.id,
+      );
+    } catch (error) {
+      // A selected group is part of the create contract. Never return a
+      // successfully-created but unexpectedly ungrouped worker.
+      await containerManager.remove(container.id).catch(() => undefined);
+      throw error;
+    }
+  }
 
   setResponseStatus(event, 201);
   return container;

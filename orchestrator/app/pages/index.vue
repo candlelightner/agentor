@@ -53,6 +53,7 @@ const showAdminWorkspaceModal = ref(false);
 const showManagementMcpModal = ref(false);
 const showWorkerGroupsModal = ref(false);
 const showManagedNetworksModal = ref(false);
+const showHostMountManagementModal = ref(false);
 const showEnvironmentsModal = ref(false);
 const showCapabilitiesModal = ref(false);
 const showInstructionsModal = ref(false);
@@ -113,6 +114,8 @@ function handleGroupAdminService(workspaceId: string, service: string) {
 async function handleCreate(request: CreateContainerRequest) {
   const container = await createContainer(request);
   if (!container) return;
+
+  await refreshWorkerGroups();
 
   // Auto-open terminal tab immediately — the container is already starting
   handleOpenTab(container.id, "terminal");
@@ -339,6 +342,7 @@ function onCreateModalClosed() {
       @open-management-mcp="showManagementMcpModal = true"
       @manage-worker-groups="showWorkerGroupsModal = true"
       @manage-networks="showManagedNetworksModal = true"
+      @manage-host-mounts="showHostMountManagementModal = true"
       @manage-environments="showEnvironmentsModal = true"
       @manage-capabilities="showCapabilitiesModal = true"
       @manage-instructions="showInstructionsModal = true"
@@ -399,6 +403,7 @@ function onCreateModalClosed() {
     <CreateContainerModal
       v-model:open="showCreateModal"
       :git-providers="gitProviders"
+      :worker-groups="workerGroups"
       @create="handleCreate"
       @manage-environments="openEnvironmentsFromModal"
       @manage-init-scripts="openInitScriptsFromModal"
@@ -435,6 +440,7 @@ function onCreateModalClosed() {
       v-model:open="showManagedNetworksModal"
       :containers="containers"
     />
+    <HostMountManagementModal v-model:open="showHostMountManagementModal" />
 
     <EnvironmentsModal v-model:open="showEnvironmentsModal" />
 

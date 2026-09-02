@@ -14,6 +14,18 @@ Auto-generated OpenAPI 3.1.0 docs powered by Nitro's built-in OpenAPI support. Z
 
 Worker-group list/get responses retain `workerIds` for direct membership and add `memberCounts` with direct `total`, `active`, and `archived` counts. Archived workers remain group members until unarchived, reassigned, or permanently deleted. The management MCP `groups.list` returns the same additive summary.
 
+The **Host mounts** API (`/api/host-mounts*`) separates the platform raw-path
+catalog, per-account entitlements, and owner all/group/worker assignments.
+Catalog creation is the only route that accepts a raw host source. Worker create
+and settings accept only an approved `pathId`, container target, and read-only
+choice; the server resolves the source and rechecks authorization for create,
+rebuild, unarchive, clone, import, and restore. `POST /api/containers` also
+accepts optional `workerGroupId`, validated against the same owner and enrolled
+through the existing group/network coordinator. Revocation removes desired
+access, stops affected workers, and exposes the persisted rebuild guard through
+the ordinary container state. Management MCP uses the same store and lifecycle
+reconciler. See [Host mount permissions](host-mounts.md).
+
 The **Workspace file manager** (`/api/containers/:id/files/*`) and **worker clipboard** (`POST /api/containers/:id/clipboard`) endpoints are part of the Containers tag. They are session-authenticated, owner-scoped, running-worker only, never touch host paths (every op runs through Docker exec/getArchive/putArchive against the running container), execute as uid 1000 (`agent`), and enforce lexical + in-container realpath/lstat containment so a symlink can never redirect an operation outside `/workspace`. Upload is capped at 100 MiB / 1000 entries; clipboard payloads at 16 MiB image / 1 MiB text (`image/png` + UTF-8 `text/plain` only, validated server-side; auth/ownership/running checked before the body is read).
 
 The **Workspaces** API (`GET /api/workspaces`, `/api/workspaces/:id/{files,metadata,preview,search,download}`) is independent of worker runtime. It exposes no storage reference or host path. Regular users can only access their own records; admins may inventory all records and see orphan metadata, but orphan contents remain inaccessible until an ownership-adoption workflow exists. Named volumes and directory storage are mounted read-only into a one-shot, immutable-image helper with no network, capabilities, credentials, logs, or published ports. Preview and search are bounded; downloads stream with `private, no-store` responses. Both JSON `POST` and browser-native `GET` download forms are available.

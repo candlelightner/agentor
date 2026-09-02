@@ -789,6 +789,7 @@ export class ContainerManager {
         excludedGlobalEnvVarKeys: worker.excludedGlobalEnvVarKeys ?? [],
         excludedGroupEnvVarKeys: worker.excludedGroupEnvVarKeys ?? [],
         pendingRebuild: worker.pendingRebuild,
+        hostMountsRevoked: worker.hostMountsRevoked,
         importedImage: worker.importedImage,
         imageDefinitionId: worker.imageDefinitionId,
         imageVersion: worker.imageVersion,
@@ -897,6 +898,37 @@ export class ContainerManager {
     return `worker-${nanoid(6).toLowerCase()}`;
   }
 
+  private async resolveAuthorizedHostMounts(
+    userId: string,
+    workerId: string,
+    mounts: MountConfig[] | undefined,
+    targetGroupId?: string,
+  ): Promise<MountConfig[] | undefined> {
+    const { useHostMountStore, useWorkerGroupStore } = await import("./services");
+    let directGroupId = targetGroupId;
+    if (directGroupId && !useWorkerGroupStore().get(userId, directGroupId))
+      throw Object.assign(new Error("Worker group not found"), {
+        statusCode: 404,
+      });
+    if (!directGroupId) {
+      const memberships = useWorkerGroupStore()
+        .listForUser(userId)
+        .filter((group) => group.workerIds.includes(workerId));
+      if (memberships.length > 1)
+        throw Object.assign(
+          new Error("Worker has conflicting direct group memberships; host mount authorization is ambiguous"),
+          { statusCode: 409 },
+        );
+      directGroupId = memberships[0]?.id;
+    }
+    return useHostMountStore().resolveMounts(
+      userId,
+      workerId,
+      mounts,
+      directGroupId,
+    );
+  }
+
   async create(request: CreateContainerRequest): Promise<ContainerInfo> {
     const userId = request.userId ?? "";
     if (!userId) throw new Error("create: userId is required");
@@ -980,7 +1012,12 @@ export class ContainerManager {
       this.config.workerImagePrefix + this.config.workerImage;
     const now = new Date().toISOString();
 
-    const mounts = request.mounts?.length ? request.mounts : undefined;
+    let mounts = await this.resolveAuthorizedHostMounts(
+      userId,
+      id,
+      request.mounts,
+      request.targetWorkerGroupId,
+    );
     const initScript = request.initScript?.trim() || undefined;
 
     const containerInfo: ContainerInfo = {
@@ -1050,13 +1087,25 @@ export class ContainerManager {
     })();
 
     try {
+      // The first check rejects invalid input before publishing a worker. Check
+      // again after the provisional record is durable and immediately before
+      // Docker: if a grant is revoked between these checks, either this call
+      // fails before Docker or revocation reconciliation is guaranteed to see
+      // the persisted worker and stop it after this owner mutation settles.
+      mounts = await this.resolveAuthorizedHostMounts(
+        userId,
+        id,
+        mounts,
+        request.targetWorkerGroupId,
+      );
+      containerInfo.mounts = mounts;
       const container = await this.dockerService.createWorkerContainer({
         userId,
         id,
         containerName,
         cpuLimit,
         memoryLimit,
-        mounts: request.mounts,
+        mounts,
         dockerEnabled,
         credentialBinds,
         environmentJson: envConfig.environmentJson,
@@ -1968,6 +2017,17 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    if (info.hostMountsRevoked)
+      throw Object.assign(
+        new Error(
+          "Host mount access was revoked. Rebuild this worker before starting it again so Docker removes the old bind mount.",
+        ),
+        {
+          statusCode: 409,
+          statusMessage:
+            "Host mount access was revoked. Rebuild this worker before starting it again so Docker removes the old bind mount.",
+        },
+      );
     useLogCollector().detach(info.containerId);
     await this.dockerService.restartContainer(info.containerId);
     await this.dockerService.materializeWorkerSecretFiles(
@@ -1983,6 +2043,98 @@ for p in sys.argv[1:]:
     await this.reconcileWorkerPlugins(info);
   }
 
+  /** Reconcile durable desired mounts after a catalog/grant/hierarchy change.
+   * Invalid mounts are removed from desired state. A live Docker container is
+   * stopped immediately and guarded against restart because bind mounts cannot
+   * be detached in place; the next rebuild clears the guard. */
+  async reconcileHostMountAccess(userId?: string): Promise<{
+    affectedWorkerIds: string[];
+    stoppedWorkerIds: string[];
+    failures: Array<{ workerId: string; message: string }>;
+  }> {
+    if (!this.workerStore) throw new Error("WorkerStore not available");
+    const { useHostMountStore } = await import("./services");
+    const mountStore = useHostMountStore();
+    const records = this.workerStore
+      .list()
+      .filter(
+        (worker) =>
+          (!userId || worker.userId === userId) &&
+          (!!worker.mounts?.length || worker.hostMountsRevoked === true),
+      );
+    const result = {
+      affectedWorkerIds: [] as string[],
+      stoppedWorkerIds: [] as string[],
+      failures: [] as Array<{ workerId: string; message: string }>,
+    };
+
+    for (const snapshot of records) {
+      await withOwnerWorkerLifecycleMutation(snapshot.userId, snapshot.id, async () => {
+        const record = this.workerStore!.get(snapshot.userId, snapshot.id);
+        if (!record || (!record.mounts?.length && !record.hostMountsRevoked))
+          return;
+        const retained: MountConfig[] = [];
+        // A persisted guard means a previous revoke committed but could have
+        // lost the race to stop Docker. Keep retrying the stop even after the
+        // revoked mount was already removed from desired state.
+        let revoked = record.hostMountsRevoked === true;
+        for (const mount of record.mounts ?? []) {
+          try {
+            const normalized = mountStore.resolveMounts(
+              record.userId,
+              record.id,
+              [mount],
+            );
+            if (normalized?.[0]) retained.push(normalized[0]);
+          } catch {
+            revoked = true;
+          }
+        }
+        const next = retained.length ? retained : undefined;
+        const normalizedChanged =
+          ContainerManager.normMounts(next) !==
+          ContainerManager.normMounts(record.mounts);
+        if (!revoked && !normalizedChanged) return;
+
+        result.affectedWorkerIds.push(record.id);
+        const live = this.containers.get(record.id);
+        if (!live) {
+          await this.workerStore!.updateHostMountAccess(
+            record.userId,
+            record.id,
+            next,
+            false,
+          );
+          return;
+        }
+
+        live.mounts = next;
+        if (revoked) {
+          live.pendingRebuild = true;
+          live.hostMountsRevoked = true;
+        }
+        live.updatedAt = new Date().toISOString();
+        await this.workerStore!.updateHostMountAccess(
+          record.userId,
+          record.id,
+          next,
+          revoked,
+        );
+        if (!revoked || live.status !== "running") return;
+        try {
+          await this.stopUnlocked(live.id);
+          result.stoppedWorkerIds.push(live.id);
+        } catch (error) {
+          result.failures.push({
+            workerId: live.id,
+            message: error instanceof Error ? error.message : "Worker could not be stopped",
+          });
+        }
+      });
+    }
+    return result;
+  }
+
   private static normRepos(repos: RepoConfig[] | undefined): string {
     return JSON.stringify(
       (repos ?? []).map((r) => ({
@@ -1996,6 +2148,7 @@ for p in sys.argv[1:]:
   private static normMounts(mounts: MountConfig[] | undefined): string {
     return JSON.stringify(
       (mounts ?? []).map((m) => ({
+        pathId: m.pathId || "",
         source: m.source,
         target: m.target,
         readOnly: !!m.readOnly,
@@ -2118,16 +2271,14 @@ for p in sys.argv[1:]:
       }
     }
 
-    // Volume mounts — rebuild.
+    // Volume mounts — rebuild. The source is always re-resolved through the
+    // central catalog; a client-supplied source path is never authoritative.
     if (patch.mounts !== undefined) {
-      const cleaned = patch.mounts
-        .filter((m) => m && m.source && m.target)
-        .map((m) => ({
-          source: m.source,
-          target: m.target,
-          ...(m.readOnly ? { readOnly: true } : {}),
-        }));
-      const next = cleaned.length > 0 ? cleaned : undefined;
+      const next = await this.resolveAuthorizedHostMounts(
+        info.userId,
+        info.id,
+        patch.mounts,
+      );
       if (
         ContainerManager.normMounts(next) !==
         ContainerManager.normMounts(info.mounts)
@@ -2402,6 +2553,14 @@ for p in sys.argv[1:]:
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
 
+    // Fail before touching the existing container when a grant was revoked or
+    // a legacy source-only mount has not yet been approved.
+    const authorizedMounts = await this.resolveAuthorizedHostMounts(
+      info.userId,
+      info.id,
+      info.mounts,
+    );
+
     // Materialize newly selected directories before touching disposable
     // compute. If capture fails, the original container is still running and
     // the rebuild aborts without exposing an empty volume at that path.
@@ -2493,13 +2652,14 @@ for p in sys.argv[1:]:
       imageId: info.imageDigest || "",
       status: "creating",
       repos: info.repos,
-      mounts: info.mounts,
+      mounts: authorizedMounts,
       initScript: info.initScript,
       environmentId: info.environmentId,
       excludedGlobalEnvVarKeys: info.excludedGlobalEnvVarKeys ?? [],
       excludedGroupEnvVarKeys: info.excludedGroupEnvVarKeys ?? [],
       // Rebuild applies any pending settings edits, so the flag is cleared.
       pendingRebuild: false,
+      hostMountsRevoked: false,
       // Keep the imported-image link only while that image still exists.
       importedImage: imageOpts.image ? info.importedImage : undefined,
       imageDefinitionId: info.imageDefinitionId,
@@ -2520,7 +2680,7 @@ for p in sys.argv[1:]:
         containerName: info.containerName,
         cpuLimit,
         memoryLimit,
-        mounts: info.mounts,
+        mounts: authorizedMounts,
         dockerEnabled,
         credentialBinds,
         persistentPathMounts,
@@ -2602,6 +2762,11 @@ for p in sys.argv[1:]:
         { statusCode: 409 },
       );
     }
+    const authorizedMounts = await this.resolveAuthorizedHostMounts(
+      worker.userId,
+      worker.id,
+      worker.mounts,
+    );
 
     // containerName is derived from the stable UUID `id`, not stored on the record.
     const containerName = this.buildContainerName(worker.id);
@@ -2658,7 +2823,7 @@ for p in sys.argv[1:]:
       imageId: worker.imageDigest || "",
       status: "creating",
       repos: worker.repos,
-      mounts: worker.mounts,
+      mounts: authorizedMounts,
       initScript: worker.initScript,
       environmentId: worker.environmentId,
       excludedGlobalEnvVarKeys: worker.excludedGlobalEnvVarKeys ?? [],
@@ -2666,6 +2831,7 @@ for p in sys.argv[1:]:
       // Unarchive recreates the container from the stored config, applying any
       // pending settings edits, so the flag is cleared.
       pendingRebuild: false,
+      hostMountsRevoked: false,
       importedImage: imageOpts.image ? worker.importedImage : undefined,
       imageDefinitionId: worker.imageDefinitionId,
       imageVersion: worker.imageVersion,
@@ -2689,7 +2855,7 @@ for p in sys.argv[1:]:
         containerName,
         cpuLimit,
         memoryLimit,
-        mounts: worker.mounts,
+        mounts: authorizedMounts,
         dockerEnabled,
         credentialBinds,
         persistentPathMounts,
@@ -2893,6 +3059,7 @@ for p in sys.argv[1:]:
           excludedGlobalEnvVarKeys: worker.excludedGlobalEnvVarKeys ?? [],
           excludedGroupEnvVarKeys: worker.excludedGroupEnvVarKeys ?? [],
           pendingRebuild: worker.pendingRebuild,
+          hostMountsRevoked: worker.hostMountsRevoked,
           importedImage: worker.importedImage,
           imageDefinitionId: worker.imageDefinitionId,
           imageVersion: worker.imageVersion,
@@ -3356,7 +3523,12 @@ for p in sys.argv[1:]:
       ).slice(0, 100);
       const containerName = this.buildContainerName(id);
       const repos = (manifest.worker?.repos ?? []).filter((r) => r.url);
-      const mounts = manifest.worker?.mounts ?? [];
+      let mounts =
+        (await this.resolveAuthorizedHostMounts(
+          userId,
+          id,
+          manifest.worker?.mounts,
+        )) ?? [];
       const initScript = manifest.worker?.initScript || "";
 
       const envConfig = this.resolveEnvironmentConfig(environmentId);
@@ -3477,6 +3649,13 @@ for p in sys.argv[1:]:
         | Awaited<ReturnType<typeof restoreWorkerPlugins>>
         | undefined;
       try {
+        // Import may spend substantial time validating and recovering an
+        // image before Docker creates the worker. Recheck the live grant only
+        // after the provisional identity is durable, closing that revocation
+        // window without ever trusting the source stored in the archive.
+        mounts =
+          (await this.resolveAuthorizedHostMounts(userId, id, mounts)) ?? [];
+        containerInfo.mounts = mounts.length > 0 ? mounts : undefined;
         container = await this.dockerService.createWorkerContainer({
           userId,
           id,
@@ -3962,6 +4141,7 @@ for p in sys.argv[1:]:
       mounts: info.mounts,
       initScript: info.initScript,
       pendingRebuild: info.pendingRebuild,
+      hostMountsRevoked: info.hostMountsRevoked,
       importedImage: info.importedImage,
       importCreatedEnvironmentId: this.importCreatedEnvironments.get(info.id),
       imageDefinitionId: info.imageDefinitionId,

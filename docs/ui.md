@@ -58,11 +58,30 @@ The modal computes which fields changed: a pure display-name change shows just *
 
 The flow front-to-back:
 
-- **Create Worker modal**: the first field is labeled "Display name" (free-form, no keystroke sanitization). Its placeholder is a friendly suggestion fetched from `GET /api/containers/generate-name` (`{ displayName }`). On submit the client sends only `{ displayName }` (the typed value, or the suggestion when left blank) — never an `id`; the orchestrator mints the worker UUID.
+- **Create Worker modal**: the first field is labeled "Display name" (free-form, no keystroke sanitization). Its placeholder is a friendly suggestion fetched from `GET /api/containers/generate-name` (`{ displayName }`). An optional **Worker group** dropdown establishes direct membership during the same create operation; changing it refreshes group-effective host paths and removes mount selections no longer available. On submit the client sends the display name and optional `workerGroupId` — never an `id`; the orchestrator mints the worker UUID and rolls creation back if group enrollment/network reconciliation fails.
 - **ContainerCard**: shows `displayName || shortName(id)`. A "Settings" pencil button (`i-lucide-pencil`, in a `<UTooltip text="Settings">`) in the action row — and a click on the card title — opens the settings modal. When the worker has unapplied rebuild edits the card shows an amber `rebuild pending` badge next to its status. The card forwards an `update(id, patch, rebuild)` event (PATCH + optional rebuild) and a `rebuild(id)` event to `index.vue`'s `handleUpdate`, which relabels open tmux tabs when the display name changed and runs a rebuild when requested. The card also emits `export(id)` (→ `index.vue` `handleExportWorker` anchor download) and shows a per-worker live-metrics row (see **Resource Metrics & Worker Export/Import UI** below).
   - **Action row layout**: all buttons are left-aligned in logical groups separated by `w-px` vertical dividers — views (terminal/editor/desktop/apps) | workspace (upload/download/**export**) | lifecycle (settings/restart-or-stop/rebuild) | destructive (archive/remove). Views + workspace show only when running; lifecycle + destructive always. The row (`.card-actions`) is a single no-wrap flex strip with `overflow-x: auto` + hidden scrollbar; a vertical wheel over it scrolls horizontally (`onActionsWheel`), so it stays usable when the sidebar is narrow. The Rebuild button is neutral (not colored).
-- **ContainerDetailModal**: read-only **Worker** identity section (Worker ID = the worker UUID `container.id` in monospace, Container ID = the Docker `container.containerId` first 12 chars, Image = `container.imageName`, Image ID, Created) + an editable **Settings** section (Display name `UInput`, Environment `USelect`, Repositories via `RepoInput`, Volume Mounts via `MountInput`, Init Script via `useInitScriptSync` preset + textarea) + read-only **Info** sections (Port Mappings, Domain Mappings, App Instances) shown only when present. The form re-initialises from the worker each time the modal opens. `useContainers().updateContainerSettings(id, patch)` issues the `PATCH`.
+- **ContainerDetailModal**: read-only **Worker** identity section (Worker ID = the worker UUID `container.id` in monospace, Container ID = the Docker `container.containerId` first 12 chars, Image = `container.imageName`, Image ID, Created) + an editable **Settings** section (Display name `UInput`, Environment `USelect`, Repositories via `RepoInput`, governed Volume Mounts via `MountInput`, Init Script via `useInitScriptSync` preset + textarea) + read-only **Info** sections (Port Mappings, Domain Mappings, App Instances) shown only when present. Mount rows select an authorized catalog path, container target, and **Read only**/**Read and write** dropdown; writable is disabled unless the platform catalog permits it. The form re-initialises from the worker each time the modal opens. `useContainers().updateContainerSettings(id, patch)` issues the `PATCH`.
 - **Port/Domain mapping panels**: each row resolves the worker's `displayName` from the live container list by `containerName` (fallback `shortName(m.workerId)`), so rows show the friendly label rather than the raw UUID.
+
+## Host Mount Permission UI
+
+The sidebar's **Host mount permissions** action opens
+`HostMountManagementModal.vue`, the shared platform-admin/account-owner
+control surface. A platform administrator manages the immutable raw-path
+catalog and per-account entitlements; the selected account's owner manages
+all-worker, direct-group, and individual-worker assignments. The empty catalog
+is displayed as the secure default, and the dialog warns that worker code gets
+the selected host access. Workspace/group administrators are explicitly told
+to ask the account owner or platform administrator; their only equivalent is
+downward delegation through their identity-scoped MCP.
+
+Deletion, entitlement/assignment revocation, or disabling writable access
+warns that affected running workers will be stopped. A worker with a formerly
+active bind shows the persisted rebuild requirement; restart remains blocked
+until rebuild replaces the container. GUI, REST, and MCP all read and mutate the
+same catalog/grant records and the same `hostMountsRevoked` worker state. See
+[Host mount permissions](host-mounts.md).
 
 ## Resource Metrics & Worker Export/Import UI
 

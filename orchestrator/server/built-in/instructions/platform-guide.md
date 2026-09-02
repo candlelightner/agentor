@@ -66,6 +66,23 @@ The operator can also manage `/workspace` files from the dashboard via the per-w
 
 If Docker is enabled for this environment (`DOCKER_ENABLED=true`), a Docker daemon runs inside this container. The `agent` user is in the `docker` group — no sudo needed. Docker Compose, BuildKit, and all standard Docker features work natively. Docker data persists across container restarts.
 
+### Optional host mounts
+
+Any extra host directory visible in this worker was explicitly approved through
+Agentor's central host-mount policy. A worker, agent, setup script, custom image,
+or group-administrative workspace cannot choose a raw host source path. Platform
+administrators maintain the raw-path catalog and account entitlements; the
+account owner assigns entitled paths to all workers, a direct worker group, or
+one worker. Group administrators may only pass an existing grant downward in
+their own subtree through the management MCP.
+
+Mount access defaults to read-only. **Read and write** is possible only when the
+platform catalog explicitly permits it. If you need a host directory that is
+not present, ask the operator/account owner to use **Host mount permissions** in
+the dashboard; do not try to work around the policy with a custom image. A
+revoked bind stops the worker and requires a rebuild before restart so Docker
+cannot retain the old mount.
+
 ### Network access
 
 Network access depends on your environment's configuration. Some environments allow full internet access, others restrict outbound connections to specific domains using a DNS-based firewall (modes: `full`, `block`, `block-all`, `package-managers`, `custom`). Regardless of the firewall mode, the orchestrator and other containers on the Docker network are always reachable, and agent API domains plus configured git provider clone domains are always allowed.

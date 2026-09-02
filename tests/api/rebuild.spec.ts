@@ -2,6 +2,7 @@ import { test, expect } from '@playwright/test';
 import { ApiClient } from '../helpers/api-client';
 import { createWorker, cleanupWorker, waitForWorkerRunning } from '../helpers/worker-lifecycle';
 import { runInFreshWindow } from '../helpers/terminal-ws';
+import { approveHostPathForAll, deleteApprovedHostPath } from '../helpers/host-mounts';
 
 test.describe('POST /api/containers/:id/rebuild', () => {
   const createdContainerIds: string[] = [];
@@ -115,8 +116,9 @@ test.describe('POST /api/containers/:id/rebuild', () => {
     // metadata alone did NOT catch this (it was always set) — so we also verify
     // the bind is actually LIVE in the rebuilt container via /proc/mounts.
     const target = `/mnt/rebuild-mount-${Date.now()}`;
+    const approvedMount = await approveHostPathForAll(request, `/tmp/rebuild-host-${Date.now()}`);
     const container = await createWorker(request, {
-      mounts: [{ source: '/tmp', target, readOnly: true }],
+      mounts: [{ pathId: approvedMount.id, source: '', target, readOnly: true }],
     });
     const api = new ApiClient(request);
 
@@ -126,7 +128,8 @@ test.describe('POST /api/containers/:id/rebuild', () => {
     expect(Array.isArray(body.mounts)).toBe(true);
     expect(body.mounts).toHaveLength(1);
     expect(body.mounts[0].target).toBe(target);
-    expect(body.mounts[0].source).toBe('/tmp');
+    expect(body.mounts[0].source).toBe(approvedMount.sourcePath);
+    expect(body.mounts[0].pathId).toBe(approvedMount.id);
 
     // The bind must be live in the rebuilt container (count computed at runtime
     // so it cannot leak from the echoed command).
@@ -141,6 +144,7 @@ test.describe('POST /api/containers/:id/rebuild', () => {
     const m = out.match(/MNT=(\d)/);
     expect(m, `no computed mount line in:\n${out.slice(-300)}`).toBeTruthy();
     expect(m![1]).toBe('1'); // bind mount active after rebuild
+    await deleteApprovedHostPath(request, approvedMount.id);
   });
 
   test('preserves the environment FK across rebuild', async ({ request }) => {

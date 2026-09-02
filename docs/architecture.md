@@ -275,9 +275,29 @@ Each worker gets persistent storage mounted at `/workspace`, `/home/agent/.agent
 
 The agents volume stores agent CLI configuration directories (`claude/`, `gemini/`, `codex/`, `agents/`, `claude.json/`, `kilo/`, `code-server/`). The entrypoint symlinks these to their expected home directory paths (`~/.claude`, `~/.gemini`, `~/.codex`, `~/.agents`, `~/.claude.json`, and the Kilo XDG paths `~/.config/kilo`, `~/.local/share/kilo`, `~/.local/state/kilo`, `~/.cache/kilo`). This preserves MCP server configs, conversation history, auto-memory, installed plugins/extensions, custom commands, and other agent state across container lifecycle events. Credential files (OAuth tokens) are bind-mounted on top of the agents volume — Docker processes the volume mount first, then overlays the individual file bind mounts. The per-user Kilo **config** directory (`<DATA_DIR>/users/<userId>/kilo/config`) is bind-mounted over `.agent-data/.kilo/config` so the Kilo global config is shared per user across all their workers. Kilo's **complete data** directory (`<DATA_DIR>/users/<userId>/kilo/data`) is bind-mounted over `.agent-data/.kilo/shared-data` (a **directory** bind, not a file bind — required because Kilo atomically temp+renames `auth.json`, which would break a file-level bind) so Kilo login, provider API keys configured through Kilo's VS Code UI, and Kilo SQLite sessions/history are shared per user across all that user's workers. Legacy `credentials/kilo.json` and per-worker `.kilo/data` migrate into the shared data dir on the next worker start/rebuild (missing auth providers merge without overwriting shared entries; first available DB/history wins). Kilo **state** and **cache** (`~/.local/state/kilo`, `~/.cache/kilo`), plus code-server user/UI state, stay **per-worker** in `.agent-data` and are NOT shared.
 
+### Governed Host Mounts
+
+Optional host binds use a separate authorization plane. `HostMountStore` keeps a
+versioned platform catalog at `admin/host-mount-paths.v1.json` and owner-scoped
+entitlements/assignments/delegation ancestry at
+`users/<userId>/host-mount-grants.json`. The platform catalog starts empty.
+Only it contains raw host paths; worker/API/MCP mutations select `pathId`, and
+`ContainerManager` resolves the source immediately before every Docker create,
+settings update, rebuild, unarchive, clone, import, or restore boundary.
+
+Authorization is the intersection of platform catalog approval, account
+entitlement, and an owner all/direct-group/worker assignment. A group principal
+may derive child grants only from an explicit grant to its own authority group.
+Writable binds additionally require `allowWrite` in the catalog. A hierarchy or
+grant change calls `reconcileHostMountAccess`: invalid desired mounts are
+removed, live workers are stopped, and `hostMountsRevoked` blocks restart until
+rebuild creates a replacement container. Startup runs the same reconciliation,
+so a Docker stop failure never clears the durable guard. See
+[Host mount permissions](host-mounts.md).
+
 ### WorkerStore
 
-`WorkerStore` (`server/utils/worker-store.ts`) persists worker metadata per user at `<dataDir>/users/<userId>/workers.json`, keyed by the UUID `id`. Each `WorkerRecord` carries the standard base-resource fields (`id`, `userId`, `createdAt`, `updatedAt`) plus `displayName`, `status`, optional `archivedAt`, the config FKs/settings (`environmentId`, `repos`, `mounts`, `initScript`), and `pendingRebuild`. It deliberately does **not** persist any Docker-derived field (`containerId`, `containerName`, `imageName`, `imageId`) — those are discovered at runtime. Extends `UserScopedJsonStore<string, WorkerRecord>` (`server/utils/user-scoped-store.ts`) which scans `users/*/workers.json` on init and maintains a `Map<userId, Map<id, WorkerRecord>>` internally. `list()` returns a flat view across all users (sorted by `id`); `listForUser(userId)` scopes to one user; `findById(id)` resolves a single worker. The editable `displayName` is the only field a rename touches — `id`, the derived container name, volumes, and mappings are unaffected.
+`WorkerStore` (`server/utils/worker-store.ts`) persists worker metadata per user at `<dataDir>/users/<userId>/workers.json`, keyed by the UUID `id`. Each `WorkerRecord` carries the standard base-resource fields (`id`, `userId`, `createdAt`, `updatedAt`) plus `displayName`, `status`, optional `archivedAt`, the config FKs/settings (`environmentId`, `repos`, `mounts`, `initScript`), `pendingRebuild`, and the optional durable `hostMountsRevoked` restart guard. It deliberately does **not** persist any Docker-derived field (`containerId`, `containerName`, `imageName`, `imageId`) — those are discovered at runtime. Extends `UserScopedJsonStore<string, WorkerRecord>` (`server/utils/user-scoped-store.ts`) which scans `users/*/workers.json` on init and maintains a `Map<userId, Map<id, WorkerRecord>>` internally. `list()` returns a flat view across all users (sorted by `id`); `listForUser(userId)` scopes to one user; `findById(id)` resolves a single worker. The editable `displayName` is the only field a rename touches — `id`, the derived container name, volumes, and mappings are unaffected.
 
 On startup, `ContainerManager.reconcileWorkers()` syncs the WorkerStore with Docker state:
 - Docker containers carrying `agentor.id` are matched back to their `WorkerRecord` via `WorkerStore.findById` (the record holds the owner `userId` and all config); the live container's id/name/image are merged onto the runtime `ContainerInfo`, never written back to the record

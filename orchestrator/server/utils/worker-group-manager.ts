@@ -518,6 +518,8 @@ export function updateWorkerGroupWithNetworks(
         const { markGroupEnvPending } = await import("./worker-group-env");
         await markGroupEnvPending(userId, groupId);
       }
+      if (patch.parentId !== undefined || patch.workerIds !== undefined)
+        await reconcileHostMountsAfterGroupChange(userId);
       return result;
     });
 }
@@ -552,6 +554,7 @@ export function assignWorkerToGroupWithNetworks(
     .then(async (result) => {
       const { markWorkersEnvPending } = await import("./worker-group-env");
       await markWorkersEnvPending(userId, [workerId]);
+      await reconcileHostMountsAfterGroupChange(userId);
       return result;
     });
 }
@@ -616,4 +619,16 @@ function safeMessage(error: unknown) {
   return error instanceof Error
     ? error.message.slice(0, 300)
     : "Docker reconciliation failed";
+}
+
+async function reconcileHostMountsAfterGroupChange(userId: string) {
+  const { useContainerManager } = await import("./services");
+  const result = await useContainerManager().reconcileHostMountAccess(userId);
+  if (result.failures.length)
+    throw createError({
+      statusCode: 409,
+      statusMessage:
+        "Worker group changed, but one or more workers with revoked host mounts could not be stopped. Rebuild or stop the affected workers immediately.",
+      data: result,
+    });
 }

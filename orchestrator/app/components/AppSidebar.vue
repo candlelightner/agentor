@@ -26,6 +26,7 @@ const emit = defineEmits<{
   openManagementMcp: [];
   manageWorkerGroups: [];
   manageNetworks: [];
+  manageHostMounts: [];
   manageEnvironments: [];
   manageCapabilities: [];
   manageInstructions: [];
@@ -550,6 +551,7 @@ function isContainerActive(
       </div>
       <UButton class="w-full mt-2" color="neutral" variant="outline" size="sm" icon="i-lucide-folder-kanban" @click="emit('manageWorkerGroups')">Worker groups</UButton>
       <UButton class="w-full mt-2" color="neutral" variant="outline" size="sm" icon="i-lucide-network" @click="emit('manageNetworks')">Managed networks</UButton>
+      <UButton class="w-full mt-2" color="neutral" variant="outline" size="sm" icon="i-lucide-hard-drive" @click="emit('manageHostMounts')">Host mount permissions</UButton>
       <div
         v-if="isAdmin"
         class="mt-2 overflow-hidden rounded-lg border-2 border-red-600 bg-red-950 text-red-50 shadow-sm"

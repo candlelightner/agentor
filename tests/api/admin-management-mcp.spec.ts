@@ -591,6 +591,38 @@ test.describe.serial("Internal management MCP security", () => {
     expect(names).not.toContain("console.open");
   });
 
+  test("platform MCP creates a worker directly in an explicit owner group", async ({ request }) => {
+    let groupId = "";
+    let workerId = "";
+    try {
+      const groupResponse = await regularCtx.post("/api/worker-groups", {
+        data: { name: `platform-mcp-create-${Date.now()}` },
+      });
+      expect(groupResponse.status(), await groupResponse.text()).toBe(201);
+      groupId = (await groupResponse.json()).id;
+      expect((await request.put("/api/admin/management-mcp/policy", {
+        data: { groups: { "worker-lifecycle": true } },
+      })).status()).toBe(200);
+
+      const created = await invoke(request, credential, "workers.create", {
+        userId: regular.id,
+        workerGroupId: groupId,
+        displayName: `platform-mcp-group-worker-${Date.now()}`,
+      });
+      expect(created.status(), await created.text()).toBe(200);
+      workerId = (await created.json()).id;
+      const group = await regularCtx.get(`/api/worker-groups/${groupId}`);
+      expect(group.status()).toBe(200);
+      expect((await group.json()).workerIds).toContain(workerId);
+    } finally {
+      if (workerId) await cleanupWorker(regularCtx, workerId).catch(() => undefined);
+      if (groupId) await regularCtx.delete(`/api/worker-groups/${groupId}`).catch(() => undefined);
+      await request.put("/api/admin/management-mcp/policy", {
+        data: { groups: { "worker-lifecycle": false } },
+      }).catch(() => undefined);
+    }
+  });
+
   test("management MCP creates, updates, duplicates, lists, and deletes plugin definitions", async ({
     request,
   }) => {

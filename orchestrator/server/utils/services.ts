@@ -36,6 +36,7 @@ import { definitionVisibleToWorker, definitionVisibleToPluginSelf } from "./plug
 import type { WorkerSelfAuthority } from "./worker-auth";
 import { useGroupAdminWorkspaceStore } from "./group-admin-workspace-store";
 import { PersistentBackupPathManager } from "./persistent-backup-paths";
+import { HostMountStore } from "./host-mount-store";
 
 function singleton<T>(factory: () => T): () => T {
   let instance: T | undefined;
@@ -100,6 +101,15 @@ export const useWorkerStore = singleton(
 );
 export const useWorkerGroupStore = singleton(
   () => new WorkerGroupStore(useConfig().dataDir),
+);
+export const useHostMountStore = singleton(
+  () =>
+    new HostMountStore(
+      useConfig().dataDir,
+      () => useStorageManager().dataHostPath,
+      useWorkerGroupStore(),
+      useWorkerStore(),
+    ),
 );
 export const useWorkerGroupEnvStore = singleton(
   () => new WorkerGroupEnvStore(useConfig()),

@@ -3,7 +3,7 @@ import { ApiClient } from '../helpers/api-client';
 import { createWorker, cleanupWorker, waitForWorkerRunning } from '../helpers/worker-lifecycle';
 import { captureCommandOutput as execInWorker } from '../helpers/terminal-ws';
 
-const WORKER_ROLE_SKILL_SHA256 = '74c26bf91bd0c457c2d403935f0504cefe79c1ed65696bd540f975eb5c8117ad';
+const WORKER_ROLE_SKILL_SHA256 = '08fbb4bdb3606059b6ef95406512d4c11c4f7f28c2cbc50afc431214f08c6c0b';
 
 // -- Symlink and mount verification (single worker, serial) --
 

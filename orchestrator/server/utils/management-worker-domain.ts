@@ -11,7 +11,7 @@ import { workerConfigurationResponse } from "./worker-config-response";
 import { useWorkerProtectionLockStore } from "./worker-protection-lock";
 import { findWorkspaceInventory } from "./workspace-inventory";
 import { OfflineWorkspaceAccess } from "./workspace-access";
-import { assignWorkerToGroupWithNetworks, deleteWorkerGroup, updateWorkerGroupWithNetworks, withWorkerNetworkMutation } from "./worker-group-manager";
+import { addWorkerToGroupWithNetworks, assignWorkerToGroupWithNetworks, deleteWorkerGroup, updateWorkerGroupWithNetworks, withWorkerNetworkMutation } from "./worker-group-manager";
 import { useGroupAdminWorkspaceStore } from "./group-admin-workspace-store";
 import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 import { markGroupEnvPending, publicGroupEnvKeys } from "./worker-group-env";
@@ -108,6 +108,16 @@ const groupWorkerLifecycleInput = {
     },
   },
 };
+const hostMountInputSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["pathId", "target"],
+  properties: {
+    pathId: { type: "string", minLength: 1, description: "Centrally approved host-path identity. Raw source paths are not accepted." },
+    target: { type: "string", minLength: 1 },
+    readOnly: { type: "boolean", default: true },
+  },
+};
 
 /** MCP domain adapter for ordinary worker administration. It is deliberately
  * transport-free: ManagementMcpStore can register these definitions/dispatch
@@ -115,7 +125,7 @@ const groupWorkerLifecycleInput = {
 export class ManagementWorkerDomain {
   tools(): ManagementDomainTool[] {
     const names: Array<[string, ManagementDomainTool["group"], string, Record<string, unknown>, Record<string, boolean | string>]> = [
-      ["workers.create", "worker-lifecycle", "Create a worker for an explicit owner. excludedGlobalEnvVarKeys is a names-only list of account variables the worker must not inherit; unknown names fail validation and values are never returned.", { type:"object", required:["userId"], properties:{ userId:{type:"string"}, displayName:{type:"string"}, environmentId:{type:"string"}, imageDefinitionId:{type:"string"}, imageVersion:{type:"string"}, excludedGlobalEnvVarKeys:excludedEnvKeysSchema() } }, mutation],
+      ["workers.create", "worker-lifecycle", "Create a worker for an explicit owner, optionally enrolling it directly in one of that owner's worker groups. Host mounts accept only centrally approved pathId references and default to read-only.", { type:"object", required:["userId"], additionalProperties:false, properties:{ userId:{type:"string"}, displayName:{type:"string"}, environmentId:{type:"string"}, workerGroupId:{type:"string",description:"Optional direct worker-group membership. The group must belong to userId."}, imageDefinitionId:{type:"string"}, imageVersion:{type:"string"}, mounts:{type:"array",items:hostMountInputSchema}, excludedGlobalEnvVarKeys:excludedEnvKeysSchema() } }, mutation],
       ["workers.update", "worker-lifecycle", "Update worker settings. excludedGlobalEnvVarKeys completely replaces the names-only exclusion list and takes effect after rebuild; protected workers require lockPassword.", workerUpdateInput(), mutation],
       ["workers.restart", "worker-lifecycle", "Restart a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
       ["workers.rebuild", "worker-lifecycle", "Rebuild a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
@@ -155,16 +165,32 @@ export class ManagementWorkerDomain {
     const cm = useContainerManager(); const locks = useWorkerProtectionLockStore();
     if (name === "workers.create") {
       const userId = required(args.userId, "userId");
+      const scopedTargetGroupId=optionalString(args.__targetWorkerGroupId);
+      const requestedTargetGroupId=scopedTargetGroupId || optionalString(args.workerGroupId);
+      if(requestedTargetGroupId&&!useWorkerGroupStore().get(userId,requestedTargetGroupId))
+        throw status(404,"Worker group not found");
       const catalog=useImageCatalogManager(); await catalog.init();
       const imageCatalogGroupId=optionalString(args.imageCatalogGroupId);
-      const imageCatalogGroupIds=Array.isArray(args.imageCatalogGroupIds) ? strings(args.imageCatalogGroupIds,"imageCatalogGroupIds") : undefined;
+      const imageCatalogGroupIds=Array.isArray(args.imageCatalogGroupIds)
+        ? strings(args.imageCatalogGroupIds,"imageCatalogGroupIds")
+        : requestedTargetGroupId
+          ? new WorkerGroupHierarchy(useWorkerGroupStore()).ancestors(userId,requestedTargetGroupId,true).map(group=>group.id)
+          : undefined;
       const selection=imageCatalogGroupIds
         ? catalog.resolveSelectionForGroupHierarchy(userId,imageCatalogGroupIds,optionalString(args.imageDefinitionId),optionalString(args.imageVersion))
         : imageCatalogGroupId
         ? catalog.resolveSelectionForGroup(userId,imageCatalogGroupId,optionalString(args.imageDefinitionId),optionalString(args.imageVersion))
         : catalog.resolveSelection(userId,optionalString(args.imageDefinitionId),optionalString(args.imageVersion));
-      const request: CreateContainerRequest = { userId, displayName: optionalString(args.displayName), environmentId: optionalString(args.environmentId), excludedGlobalEnvVarKeys: args.excludedGlobalEnvVarKeys===undefined?undefined:strings(args.excludedGlobalEnvVarKeys,"excludedGlobalEnvVarKeys"), excludedGroupEnvVarKeys:args.excludedGroupEnvVarKeys===undefined?undefined:strings(args.excludedGroupEnvVarKeys,"excludedGroupEnvVarKeys"),targetWorkerGroupId:optionalString(args.__targetWorkerGroupId), initScript: optionalString(args.initScript), repos: array(args.repos), mounts: array(args.mounts), workerConfiguration: configInput(args.configuration), imageDefinitionId:selection?.definitionId, imageVersion:selection?.version, imageDigest:selection?.digest, imageRuntimeReference:selection?.runtimeImage } as CreateContainerRequest;
-      return { handled:true, result: await cm.create(request) };
+      const request: CreateContainerRequest = { userId, displayName: optionalString(args.displayName), environmentId: optionalString(args.environmentId), excludedGlobalEnvVarKeys: args.excludedGlobalEnvVarKeys===undefined?undefined:strings(args.excludedGlobalEnvVarKeys,"excludedGlobalEnvVarKeys"), excludedGroupEnvVarKeys:args.excludedGroupEnvVarKeys===undefined?undefined:strings(args.excludedGroupEnvVarKeys,"excludedGroupEnvVarKeys"),targetWorkerGroupId:requestedTargetGroupId, initScript: optionalString(args.initScript), repos: array(args.repos), mounts: array(args.mounts), workerConfiguration: configInput(args.configuration), imageDefinitionId:selection?.definitionId, imageVersion:selection?.version, imageDigest:selection?.digest, imageRuntimeReference:selection?.runtimeImage } as CreateContainerRequest;
+      const created=await cm.create(request);
+      // Group-scoped MCP creation owns its stronger hierarchy authorization and
+      // enrollment transaction in ManagementMcpStore. Platform management MCP
+      // uses the same normal group/network coordinator here.
+      if(requestedTargetGroupId&&!scopedTargetGroupId){
+        try{await addWorkerToGroupWithNetworks(userId,requestedTargetGroupId,created.id);}
+        catch(error){await cm.remove(created.id).catch(()=>undefined);throw error;}
+      }
+      return { handled:true, result: created };
     }
     if (name.startsWith("groups.")) {
       const operation = () => this.groups(name,args);
@@ -208,8 +234,12 @@ export class ManagementWorkerDomain {
     if (name === "workers.clone") {
       const resolved = await useWorkerConfigStore().resolveValues(worker.userId, workerId);
       const variables = resolved.filter(entry => entry.kind === "variable").map(({key,value}) => ({key,value}));
-      const clone = await cm.create({ userId: worker.userId, displayName: optionalString(args.displayName) || `${worker.displayName || "worker"} copy`, repos: worker.repos, mounts: worker.mounts, environmentId: worker.environmentId, initScript: worker.initScript, workerConfiguration:{variables} });
+      const memberships=useWorkerGroupStore().listForUser(worker.userId).filter(group=>group.workerIds.includes(worker.id));
+      if(memberships.length>1)throw status(409,"Source worker has conflicting group memberships");
+      const targetWorkerGroupId=memberships[0]?.id;
+      const clone = await cm.create({ userId: worker.userId, displayName: optionalString(args.displayName) || `${worker.displayName || "worker"} copy`, repos: worker.repos, mounts: worker.mounts, targetWorkerGroupId, environmentId: worker.environmentId, initScript: worker.initScript, workerConfiguration:{variables} });
       try {
+        if(targetWorkerGroupId)await addWorkerToGroupWithNetworks(worker.userId,targetWorkerGroupId,clone.id);
         const workspace = await findWorkspaceInventory(workerId, true);
         if (!workspace || workspace.state === "orphaned") throw status(404,"Source workspace not found");
         await new OfflineWorkspaceAccess(workspace).cloneInto(clone.containerId);
@@ -283,7 +313,7 @@ export class ManagementWorkerDomain {
 function objectWithWorker(){return {type:"object",required:["workerId"],properties:{workerId:{type:"string"},lockPassword:{type:"string",writeOnly:true}}};}
 function failFastInput(properties:Record<string,unknown>,requiredFields?:string[]){return {type:"object",...(requiredFields?{required:requiredFields}:{}),additionalProperties:false,properties:{...properties,timeoutSeconds:failFastTimeoutSchema}};}
 function excludedEnvKeysSchema(){return {type:"array",items:{type:"string"},uniqueItems:true,description:"Names of predefined or configured custom account environment variables to omit. Never accepts values."};}
-function workerUpdateInput(){return {type:"object",required:["workerId"],properties:{workerId:{type:"string"},displayName:{type:"string"},environmentId:{type:"string"},initScript:{type:"string"},repos:{type:"array",items:{type:"object"}},mounts:{type:"array",items:{type:"object"}},excludedGlobalEnvVarKeys:excludedEnvKeysSchema(),excludedGroupEnvVarKeys:{...excludedEnvKeysSchema(),description:"Names of effective inherited worker-group variables to omit after rebuild. Values are never accepted."},lockPassword:{type:"string",writeOnly:true}}};}
+function workerUpdateInput(){return {type:"object",required:["workerId"],additionalProperties:false,properties:{workerId:{type:"string"},displayName:{type:"string"},environmentId:{type:"string"},initScript:{type:"string"},repos:{type:"array",items:{type:"object"}},mounts:{type:"array",items:hostMountInputSchema},excludedGlobalEnvVarKeys:excludedEnvKeysSchema(),excludedGroupEnvVarKeys:{...excludedEnvKeysSchema(),description:"Names of effective inherited worker-group variables to omit after rebuild. Values are never accepted."},lockPassword:{type:"string",writeOnly:true}}};}
 function lockSetInput(){return {type:"object",required:["workerId","password"],properties:{workerId:{type:"string"},password:{type:"string",writeOnly:true},currentPassword:{type:"string",writeOnly:true}}};}
 function lockRemoveInput(){return {type:"object",required:["workerId","password"],properties:{workerId:{type:"string"},password:{type:"string",writeOnly:true}}};}
 function required(v:unknown,n:string){if(typeof v!=="string"||!v.trim())throw status(400,`${n} is required`);return v;}

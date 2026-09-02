@@ -27,6 +27,7 @@ import {
   usePluginInstallationStore,
   usePluginRuntimeManager,
   usePersistentBackupPathManager,
+  useHostMountStore,
 } from "../utils/services";
 import {
   loadBuiltInCapabilities,
@@ -148,6 +149,7 @@ export default defineNitroPlugin(async (nitroApp) => {
     })(),
     workerStore.init(),
     useWorkerGroupStore().init(),
+    useHostMountStore().init(),
     useManagedNetworkStore().init(),
     portMappingStore.init(),
     domainMappingStore.init(),
@@ -169,6 +171,16 @@ export default defineNitroPlugin(async (nitroApp) => {
   containerManager.setInstructionStore(instructionStore);
   containerManager.setWorkerStore(workerStore);
   await containerManager.sync();
+  // Re-evaluate every persisted bind before ordinary startup reconciliation.
+  // This both adopts exact approved legacy mounts and retries stopping any
+  // container whose revocation guard survived a previous Docker failure or an
+  // orchestrator restart. A failure remains loudly visible, but never clears
+  // the durable restart guard.
+  const hostMountRecovery = await containerManager.reconcileHostMountAccess();
+  if (hostMountRecovery.failures.length)
+    logger.error(
+      `[agentor] ${hostMountRecovery.failures.length} worker(s) still expose revoked host mounts and could not be stopped; restart remains blocked`,
+    );
   useBackupManager().setPathPersistenceAdapter(
     usePersistentBackupPathManager(),
   );
@@ -303,6 +315,12 @@ export default defineNitroPlugin(async (nitroApp) => {
   );
   useOrphanSweeper().addCandidateSource(() =>
     pluginDefinitionStore.listUserIds(),
+  );
+  useOrphanSweeper().addCandidateSource(() =>
+    useHostMountStore().listUserIds(),
+  );
+  useOrphanSweeper().addCleanupHook((userId) =>
+    useHostMountStore().removeForUser(userId).then(() => undefined),
   );
   useOrphanSweeper().start();
 

@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { ApiClient } from '../helpers/api-client';
 import { createWorker, cleanupWorker } from '../helpers/worker-lifecycle';
+import { approveHostPath, approveHostPathForAll, deleteApprovedHostPath } from '../helpers/host-mounts';
 
 test.describe('Containers API', () => {
   // Track containers created during tests for cleanup
@@ -91,6 +92,62 @@ test.describe('Containers API', () => {
       expect(container.id).toBeTruthy();
     });
 
+    test('creates a worker directly in its selected group and applies that group host-path grant', async ({ request }) => {
+      const groupResponse = await request.post('/api/worker-groups', {
+        data: { name: `create-target-${Date.now()}` },
+      });
+      expect(groupResponse.status()).toBe(201);
+      const group = await groupResponse.json();
+      const path = await approveHostPath(
+        request,
+        `/tmp/create-group-mount-${Date.now()}`,
+        { targetType: 'group', targetId: group.id },
+      );
+      let workerId: string | undefined;
+      try {
+        const container = await createWorker(request, {
+          workerGroupId: group.id,
+          mounts: [{ pathId: path.id, source: '/forged', target: '/mnt/group', readOnly: true }],
+        });
+        workerId = container.id;
+        createdContainerIds.push(container.id);
+        expect(container.mounts).toEqual([
+          expect.objectContaining({
+            pathId: path.id,
+            source: path.sourcePath,
+            target: '/mnt/group',
+            readOnly: true,
+          }),
+        ]);
+        const assigned = await request.get(`/api/worker-groups/${group.id}`);
+        expect(assigned.status()).toBe(200);
+        expect((await assigned.json()).workerIds).toContain(container.id);
+      } finally {
+        if (workerId) {
+          await cleanupWorker(request, workerId);
+          const tracked = createdContainerIds.indexOf(workerId);
+          if (tracked >= 0) createdContainerIds.splice(tracked, 1);
+        }
+        await deleteApprovedHostPath(request, path.id);
+        await request.delete(`/api/worker-groups/${group.id}`).catch(() => undefined);
+      }
+    });
+
+    test('rejects an unknown worker group before Docker creation', async ({ request }) => {
+      const before = await request.get('/api/containers');
+      const beforeIds = new Set((await before.json()).map((worker: { id: string }) => worker.id));
+      const response = await request.post('/api/containers', {
+        data: { workerGroupId: 'missing-worker-group' },
+      });
+      expect(response.status()).toBe(404);
+      expect((await response.json()).statusMessage).toContain('Worker group');
+      const after = await request.get('/api/containers');
+      const afterWorkers = await after.json();
+      expect(afterWorkers.map((worker: { id: string }) => worker.id))
+        .toEqual(expect.arrayContaining([...beforeIds]));
+      expect(afterWorkers.length).toBe(beforeIds.size);
+    });
+
     test('rejects invalid mounts JSON string', async ({ request }) => {
       const api = new ApiClient(request);
       const { status, body } = await api.createContainer({ mounts: 'not-json' });
@@ -106,48 +163,49 @@ test.describe('Containers API', () => {
     });
 
     test('accepts mounts as object array', async ({ request }) => {
+      const path = await approveHostPathForAll(request, '/tmp/test-agentor');
       const container = await createWorker(request, {
-        mounts: [{ source: '/tmp/test-agentor', target: '/mnt/test', readOnly: true }],
+        mounts: [{ pathId: path.id, source: '', target: '/mnt/test', readOnly: true }],
       });
       createdContainerIds.push(container.id);
       expect(container.id).toBeTruthy();
+      expect(container.mounts[0].source).toBe('/tmp/test-agentor');
+      await deleteApprovedHostPath(request, path.id);
     });
 
     test('rejects a mount source containing a colon (option injection)', async ({ request }) => {
-      const api = new ApiClient(request);
-      const { status, body } = await api.createContainer({
-        mounts: [{ source: '/tmp/test-agentor:rshared', target: '/mnt/test' }],
+      const response = await request.post('/api/host-mounts', {
+        data: { name: 'invalid-colon', sourcePath: '/tmp/test-agentor:rshared' },
       });
-      expect(status).toBe(400);
-      expect(body.statusMessage).toContain(':');
+      expect(response.status()).toBe(400);
+      expect((await response.json()).statusMessage).toContain('colon');
     });
 
     test('rejects a mount target containing a colon (option injection)', async ({ request }) => {
+      const path = await approveHostPathForAll(request, '/tmp/test-agentor-target');
       const api = new ApiClient(request);
       const { status, body } = await api.createContainer({
-        mounts: [{ source: '/tmp/test-agentor', target: '/mnt/test:Z' }],
+        mounts: [{ pathId: path.id, source: '', target: '/mnt/test:Z' }],
       });
       expect(status).toBe(400);
-      expect(body.statusMessage).toContain(':');
+      expect(body.statusMessage).toContain('colon');
+      await deleteApprovedHostPath(request, path.id);
     });
 
     test('rejects mounting the Docker socket', async ({ request }) => {
-      const api = new ApiClient(request);
-      const { status, body } = await api.createContainer({
-        mounts: [{ source: '/var/run/docker.sock', target: '/var/run/docker.sock' }],
+      const response = await request.post('/api/host-mounts', {
+        data: { name: 'docker-socket', sourcePath: '/var/run/docker.sock' },
       });
-      expect(status).toBe(400);
-      expect(body.statusMessage).toContain('Docker socket');
+      expect(response.status()).toBe(400);
+      expect((await response.json()).statusMessage).toContain('protected');
     });
 
     test('rejects mounting the orchestrator data directory', async ({ request }) => {
-      const api = new ApiClient(request);
-      // /data is the default DATA_DIR — its subtree holds other users' data.
-      const { status, body } = await api.createContainer({
-        mounts: [{ source: '/data/users', target: '/mnt/steal' }],
+      const response = await request.post('/api/host-mounts', {
+        data: { name: 'docker-data-parent', sourcePath: '/var/lib/docker/volumes' },
       });
-      expect(status).toBe(400);
-      expect(body.statusMessage).toContain('data directory');
+      expect(response.status()).toBe(400);
+      expect((await response.json()).statusMessage).toContain('protected');
     });
 
     test('accepts repos as object array', async ({ request }) => {
@@ -542,8 +600,9 @@ test.describe('Containers API', () => {
 
   test.describe('Snapshotted environment fields', () => {
     test('container list includes mounts when created with mounts', async ({ request }) => {
+      const path = await approveHostPathForAll(request, '/tmp/test-agentor-mounts');
       const container = await createWorker(request, {
-        mounts: [{ source: '/tmp/test-agentor-mounts', target: '/mnt/test', readOnly: true }],
+        mounts: [{ pathId: path.id, source: '', target: '/mnt/test', readOnly: true }],
       });
       createdContainerIds.push(container.id);
 
@@ -556,6 +615,8 @@ test.describe('Containers API', () => {
       expect(found.mounts[0].source).toBe('/tmp/test-agentor-mounts');
       expect(found.mounts[0].target).toBe('/mnt/test');
       expect(found.mounts[0].readOnly).toBe(true);
+      expect(found.mounts[0].pathId).toBe(path.id);
+      await deleteApprovedHostPath(request, path.id);
     });
 
     test('container list includes initScript when created with initScript', async ({ request }) => {

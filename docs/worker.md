@@ -108,7 +108,24 @@ Workers support running Docker inside the container, enabled per-environment via
 
 ## Host Bind Mounts
 
-Workers support optional host bind-mounts configured at creation time. Each mount specifies a `source` (host path), `target` (container path), and `readOnly` flag. Defined via the `MountConfig` interface in `orchestrator/app/types/index.ts`, configured in the UI via `MountInput.vue` within `CreateContainerModal.vue`, and passed through `ContainerManager.createContainer()` to dockerode as Docker bind mounts.
+Workers support optional, centrally authorized host bind mounts. The secure
+default is an empty platform catalog. Only a platform administrator may enter a
+raw canonical host path; the account must then be entitled to it and the account
+owner must assign it to all workers, one direct group, or one worker. Worker and
+management requests select an opaque `pathId`, a container `target`, and
+`readOnly` (default `true`). The server resolves the authoritative source and
+ignores a forged client source. **Read and write** is available only when the
+platform catalog explicitly allows it.
+
+Worker creation can select its direct group before choosing mounts, so
+group-specific assignments are available from the first container creation.
+Group administrators cannot enter paths or widen account permissions; through
+their scoped MCP they can delegate an existing grant only downward to descendant
+groups or in-subtree workers. Revocation stops affected running workers and
+blocks restart until rebuild removes the immutable Docker bind. Safe and
+Advanced custom-image provisioning do not grant host-mount authority. See
+[Host mount permissions](host-mounts.md) for the role model, protected paths,
+REST/MCP operations, persistence, and lifecycle behavior.
 
 ## Startup Sequence (entrypoint.sh)
 

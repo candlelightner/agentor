@@ -4,6 +4,7 @@ import { createWorker, cleanupWorker, waitForWorkerRunning } from '../helpers/wo
 import { runInFreshWindow } from '../helpers/terminal-ws';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { approveHostPathForAll, deleteApprovedHostPath } from '../helpers/host-mounts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
@@ -48,9 +49,11 @@ async function createRegularUserContext(email: string, password: string, name: s
 test.describe.serial('Worker settings — PATCH metadata & validation', () => {
   let worker: { id: string; [k: string]: unknown };
   let customEnvId: string | undefined;
+  let mountPath: { id: string; sourcePath: string } | undefined;
 
   test.beforeAll(async ({ request }) => {
     worker = await createWorker(request);
+    mountPath = await approveHostPathForAll(request, '/tmp/wset-meta-host');
     const api = new ApiClient(request);
     const { status, body } = await api.createEnvironment({ name: `wset-meta-env-${Date.now()}`, networkMode: 'full' });
     expect(status).toBe(201);
@@ -60,6 +63,7 @@ test.describe.serial('Worker settings — PATCH metadata & validation', () => {
   test.afterAll(async ({ request }) => {
     const api = new ApiClient(request);
     if (worker) await cleanupWorker(request, worker.id);
+    await deleteApprovedHostPath(request, mountPath?.id);
     if (customEnvId) await api.deleteEnvironment(customEnvId).catch(() => {});
   });
 
@@ -116,12 +120,13 @@ test.describe.serial('Worker settings — PATCH metadata & validation', () => {
   test('mounts change flags pendingRebuild and stores the mount list', async ({ request }) => {
     const api = new ApiClient(request);
     const { status, body } = await api.updateContainerSettings(worker.id, {
-      mounts: [{ source: '/tmp', target: '/mnt/wset-meta', readOnly: true }],
+      mounts: [{ pathId: mountPath!.id, source: '', target: '/mnt/wset-meta', readOnly: true }],
     });
     expect(status).toBe(200);
     expect(Array.isArray(body.mounts)).toBe(true);
     expect(body.mounts).toHaveLength(1);
-    expect(body.mounts[0].source).toBe('/tmp');
+    expect(body.mounts[0].source).toBe('/tmp/wset-meta-host');
+    expect(body.mounts[0].pathId).toBe(mountPath!.id);
     expect(body.mounts[0].target).toBe('/mnt/wset-meta');
     expect(body.mounts[0].readOnly).toBe(true);
     expect(body.pendingRebuild).toBe(true);
@@ -170,18 +175,16 @@ test.describe.serial('Worker settings — PATCH metadata & validation', () => {
     const api = new ApiClient(request);
     // repos that don't parse as JSON / aren't an array
     expect((await api.updateContainerSettings(worker.id, { repos: 'not-json' })).status).toBe(400);
-    // mount with a non-string source
-    expect((await api.updateContainerSettings(worker.id, { mounts: [{ source: 123, target: '/x' }] })).status).toBe(400);
+    // mount with a non-string path identity
+    expect((await api.updateContainerSettings(worker.id, { mounts: [{ pathId: 123, source: '', target: '/x' }] })).status).toBe(400);
   });
 
   test('unsafe mounts are rejected with 400 on PATCH', async ({ request }) => {
     const api = new ApiClient(request);
-    // colon in source/target (Docker mount-option injection)
+    // source-only requests are rejected; targets cannot inject Docker options.
     expect((await api.updateContainerSettings(worker.id, { mounts: [{ source: '/tmp:rshared', target: '/x' }] })).status).toBe(400);
-    expect((await api.updateContainerSettings(worker.id, { mounts: [{ source: '/tmp', target: '/x:Z' }] })).status).toBe(400);
-    // the Docker socket and the data directory are off-limits
-    expect((await api.updateContainerSettings(worker.id, { mounts: [{ source: '/var/run/docker.sock', target: '/sock' }] })).status).toBe(400);
-    expect((await api.updateContainerSettings(worker.id, { mounts: [{ source: '/data/users', target: '/steal' }] })).status).toBe(400);
+    expect((await api.updateContainerSettings(worker.id, { mounts: [{ pathId: mountPath!.id, source: '', target: '/x:Z' }] })).status).toBe(400);
+    expect((await api.updateContainerSettings(worker.id, { mounts: [{ pathId: 'unknown', source: '/var/run/docker.sock', target: '/sock' }] })).status).toBe(403);
   });
 
   test('PATCH on a non-existent container returns 404', async ({ request }) => {
@@ -233,13 +236,14 @@ test.describe('Worker settings — applied after rebuild', () => {
     const initMarker = `WSETINIT${Date.now()}`;
     const repoUrl = 'https://github.com/octocat/Hello-World';
     const mountTarget = `/mnt/wset${Date.now()}`;
+    const approvedMount = await approveHostPathForAll(request, `/tmp/wset-applied-${Date.now()}`);
 
     try {
       // Edit three rebuild-requiring settings at once.
       const { status, body } = await api.updateContainerSettings(worker.id, {
         initScript: `echo ${initMarker}`,
         repos: [{ provider: 'github', url: repoUrl }],
-        mounts: [{ source: '/tmp', target: mountTarget, readOnly: true }],
+        mounts: [{ pathId: approvedMount.id, source: '', target: mountTarget, readOnly: true }],
       });
       expect(status).toBe(200);
       expect(body.pendingRebuild).toBe(true);
@@ -290,8 +294,10 @@ test.describe('Worker settings — applied after rebuild', () => {
       expect(found.mounts?.[0]?.target).toBe(mountTarget);
 
       await cleanupWorker(request, newId);
+      await deleteApprovedHostPath(request, approvedMount.id);
     } catch (err) {
       await cleanupWorker(request, worker.id).catch(() => {});
+      await deleteApprovedHostPath(request, approvedMount.id);
       throw err;
     }
   });

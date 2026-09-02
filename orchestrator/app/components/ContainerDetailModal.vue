@@ -24,6 +24,7 @@ const open = defineModel<boolean>('open', { default: false });
 const { gitProviders } = useGitProviders();
 const { environments, defaultEnvironmentId } = useEnvironments();
 const { initScripts } = useInitScripts();
+const hostMounts = useHostMounts();
 
 const displayLabel = computed(() => props.container.displayName || shortName(props.container.id));
 
@@ -64,7 +65,7 @@ function removeRepo(idx: number) {
   form.repos.splice(idx, 1);
 }
 function addMount() {
-  form.mounts.push({ source: '', target: '', readOnly: false });
+  form.mounts.push({ pathId: '', source: '', target: '', readOnly: true });
 }
 function removeMount(idx: number) {
   form.mounts.splice(idx, 1);
@@ -75,7 +76,7 @@ function normRepos(repos: RepoConfig[] | undefined): string {
   return JSON.stringify((repos ?? []).filter((r) => r.url).map((r) => ({ provider: r.provider, url: r.url, branch: r.branch || '' })));
 }
 function normMounts(mounts: MountConfig[] | undefined): string {
-  return JSON.stringify((mounts ?? []).filter((m) => m.source && m.target).map((m) => ({ source: m.source, target: m.target, readOnly: !!m.readOnly })));
+  return JSON.stringify((mounts ?? []).filter((m) => (m.pathId || m.source) && m.target).map((m) => ({ pathId: m.pathId || '', source: m.source, target: m.target, readOnly: m.readOnly !== false })));
 }
 
 const liveDirty = computed(() => {
@@ -109,8 +110,8 @@ function buildPatch(): UpdateContainerSettingsRequest {
       .filter((r) => r.url)
       .map((r) => ({ provider: r.provider, url: r.url, ...(r.branch ? { branch: r.branch } : {}) })),
     mounts: form.mounts
-      .filter((m) => m.source && m.target)
-      .map((m) => ({ source: m.source, target: m.target, ...(m.readOnly ? { readOnly: true } : {}) })),
+      .filter((m) => m.pathId && m.target)
+      .map((m) => ({ pathId: m.pathId, source: m.source, target: m.target, readOnly: m.readOnly !== false })),
     excludedGlobalEnvVarKeys: [...form.excludedGlobalEnvVarKeys],
     excludedGroupEnvVarKeys: [...form.excludedGroupEnvVarKeys],
     ...(protection.value.protected && lockCurrentPassword.value ? { lockPassword: lockCurrentPassword.value } : {}),
@@ -195,6 +196,7 @@ watch(open, (isOpen) => {
     saving.value = false;
     settingsError.value = '';
     resetFormFromContainer();
+    void hostMounts.refresh({ workerId: props.container.id });
     loadDetails();
   }
 });
@@ -332,11 +334,15 @@ const formattedCreatedAt = computed(() => {
                   v-for="(mount, idx) in form.mounts"
                   :key="idx"
                   :model-value="mount"
+                  :paths="hostMounts.effectivePaths.value"
                   @update:model-value="form.mounts[idx] = $event"
                   @remove="removeMount(idx)"
                 />
               </div>
-              <UButton size="xs" variant="link" class="mt-1" @click="addMount">+ Add mount</UButton>
+              <UButton size="xs" variant="link" class="mt-1" :disabled="hostMounts.effectivePaths.value.length === 0" @click="addMount">+ Add mount</UButton>
+              <p v-if="hostMounts.effectivePaths.value.length === 0" class="text-xs text-gray-500">
+                No approved host path is assigned to this worker or its direct group.
+              </p>
             </div>
 
             <!-- Init script (rebuild) -->

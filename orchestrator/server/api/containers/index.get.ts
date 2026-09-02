@@ -31,6 +31,7 @@ defineRouteMeta({
               updatedAt: { type: 'string', format: 'date-time' },
               environmentId: { type: 'string', description: 'FK to the assigned environment. The environment config (CPU/memory/network/docker/setup/env vars/exposed APIs/capabilities/instructions) is resolved live by this id and not copied onto the worker. Git identity is resolved live from `userId`.' },
               pendingRebuild: { type: 'boolean', description: 'True when rebuild-requiring settings were edited but not yet applied via rebuild.' },
+              hostMountsRevoked: { type: 'boolean', description: 'True when a formerly active host bind was revoked. The worker is stopped and restart is blocked until rebuild replaces the Docker container.' },
             },
           },
           RepoConfig: {
@@ -44,7 +45,8 @@ defineRouteMeta({
           MountConfig: {
             type: 'object',
             properties: {
-              source: { type: 'string' },
+              pathId: { type: 'string', description: 'Centrally approved host-path identity. Required for new requests.' },
+              source: { type: 'string', description: 'Authoritative server-resolved source returned for display; request values are ignored.' },
               target: { type: 'string' },
               readOnly: { type: 'boolean' },
             },

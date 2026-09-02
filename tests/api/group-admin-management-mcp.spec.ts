@@ -6,7 +6,7 @@ import { createTestUser, deleteTestUser, type CreatedUser } from "../helpers/tes
 import { captureCommandOutput, TerminalWsClient } from "../helpers/terminal-ws";
 import { buildPng } from "../helpers/clipboard";
 
-const GROUP_ADMIN_ROLE_SKILL_SHA256 = "7af4f061b894c3e0eb9ba453fe2cd9c4d371fd87e865b6fe43bf27f4429e1cf4";
+const GROUP_ADMIN_ROLE_SKILL_SHA256 = "35c5e2a9a525658160a4f63904b93233f4914e203d4a87e0c86c9b339cc1fe53";
 
 function pluginManifest(suffix: string) {
   return {
@@ -284,6 +284,12 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
       "groups.workers.stop", "groups.workers.rebuild", "groups.workers.archive",
     ]));
     expect(toolNames).toContain("workers.create");
+    expect(toolNames).toEqual(expect.arrayContaining([
+      "host-mounts.delegations.list",
+      "host-mounts.delegations.create",
+      "host-mounts.delegations.delete",
+    ]));
+    expect(toolNames).not.toContain("host-mounts.catalog.create");
     expect(toolNames).not.toContain("port-mappings.list");
     expect(toolNames).toEqual(expect.arrayContaining(["workspaces.list", "workspaces.files", "workspaces.preview", "workspaces.download"]));
     expect(toolNames).toEqual(expect.arrayContaining([
@@ -303,6 +309,12 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
         expect(tool.inputSchema.properties || {}).not.toHaveProperty("targetGroupId");
     }
     const schemas = new Map(discoveredTools.map((tool) => [tool.name, tool.inputSchema]));
+    const delegationCreate = schemas.get("host-mounts.delegations.create");
+    expect(delegationCreate).toMatchObject({
+      additionalProperties: false,
+      required: ["pathId", "targetType", "targetId"],
+    });
+    expect(delegationCreate?.properties || {}).not.toHaveProperty("sourcePath");
     expect(schemas.get("backups.create")?.required).toEqual(["workspaceIds"]);
     expect(schemas.get("backups.create")?.properties || {}).not.toHaveProperty("ownerId");
     expect(schemas.get("backups.paths.list")?.required).toEqual(["workerId"]);
@@ -481,6 +493,83 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
     expect(deniedBridge).toContain('"id":42');
     expect(deniedBridge).toContain('"statusCode":404');
     expect(deniedBridge).not.toContain(outsiderId);
+  });
+
+  test("delegates only an explicitly granted host path downward through MCP", async ({ request }) => {
+    await issueCredential(request);
+    let pathId = "";
+    let childGroupId = "";
+    try {
+      const pathResponse = await request.post("/api/host-mounts", {
+        data: {
+          name: `group-mcp-path-${Date.now()}`,
+          sourcePath: `/tmp/group-mcp-path-${Date.now()}`,
+        },
+      });
+      expect(pathResponse.status(), await pathResponse.text()).toBe(201);
+      pathId = (await pathResponse.json()).id;
+      expect((await request.put("/api/host-mounts/entitlements", {
+        data: { ownerId: owner.id, pathId, enabled: true },
+      })).status()).toBe(200);
+      expect((await ownerRequest.post("/api/host-mounts/grants", {
+        data: { pathId, targetType: "group", targetId: groupId },
+      })).status()).toBe(201);
+
+      const child = await invoke(request, credential, "groups.create", {
+        name: `mount-delegation-child-${Date.now()}`,
+        parentId: groupId,
+      });
+      expect(child.status(), await child.text()).toBe(200);
+      childGroupId = (await child.json()).id;
+
+      const listed = await invoke(request, credential, "host-mounts.delegations.list");
+      expect(listed.status(), await listed.text()).toBe(200);
+      const listedBody = await listed.json();
+      expect(listedBody.availablePaths).toEqual(
+        expect.arrayContaining([expect.objectContaining({ id: pathId })]),
+      );
+      expect(listedBody.delegablePaths).toEqual(
+        expect.arrayContaining([expect.objectContaining({ id: pathId })]),
+      );
+      expect(listedBody.availablePaths.find((path: { id: string }) => path.id === pathId))
+        .not.toHaveProperty("sourcePath");
+      expect(listedBody.delegablePaths.find((path: { id: string }) => path.id === pathId))
+        .not.toHaveProperty("sourcePath");
+      const delegated = await invoke(
+        request,
+        credential,
+        "host-mounts.delegations.create",
+        { pathId, targetType: "group", targetId: childGroupId },
+      );
+      expect(delegated.status(), await delegated.text()).toBe(200);
+      const grant = await delegated.json();
+      expect(grant).toMatchObject({
+        pathId,
+        targetType: "group",
+        targetId: childGroupId,
+        grantorType: "group",
+        grantorGroupId: groupId,
+      });
+      expect((await invoke(
+        request,
+        credential,
+        "host-mounts.delegations.delete",
+        { grantId: grant.id },
+      )).status()).toBe(200);
+
+      // Raw path approval is never available to a group workspace, even when
+      // the caller guesses the platform tool name.
+      expect((await invoke(
+        request,
+        credential,
+        "host-mounts.catalog.create",
+        { name: "forbidden", sourcePath: "/tmp/forbidden-group-admin" },
+      )).status()).toBe(403);
+    } finally {
+      if (pathId) await request.delete(`/api/host-mounts/${pathId}`).catch(() => undefined);
+      if (childGroupId)
+        await ownerRequest.delete(`/api/worker-groups/${childGroupId}`).catch(() => undefined);
+    }
   });
 
   test("self, parent, and platform identities manage only authorized administrative startup scripts", { timeout: 360_000 }, async ({ request }) => {

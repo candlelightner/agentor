@@ -43,6 +43,7 @@ export interface WorkerRecord extends UserOwnedResource {
    * script) were edited after the container was last (re)created and have not
    * yet been applied. Cleared on create/rebuild/unarchive. */
   pendingRebuild?: boolean;
+  hostMountsRevoked?: boolean;
   /** Set on workers restored via import that captured the source container's
    * filesystem (`docker import`). The per-worker image reference the worker runs
    * — reused across rebuild/unarchive so the captured rootfs survives. Unset for
@@ -132,6 +133,30 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
       }
       return structuredClone(next);
     });
+  }
+
+  /** Persist the desired host-mount set after a grant/hierarchy change. Active
+   * workers additionally carry a restart guard until a rebuild has replaced
+   * the old Docker container and its immutable bind configuration. */
+  async updateHostMountAccess(
+    userId: string,
+    id: string,
+    mounts: MountConfig[] | undefined,
+    revoked: boolean,
+  ): Promise<WorkerRecord> {
+    const current = this.get(userId, id);
+    if (!current)
+      throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
+    const updated: WorkerRecord = {
+      ...current,
+      mounts: mounts?.length ? structuredClone(mounts) : undefined,
+      ...(current.status === "active" && revoked
+        ? { pendingRebuild: true, hostMountsRevoked: true }
+        : {}),
+      updatedAt: new Date().toISOString(),
+    };
+    await this.setItem(userId, updated);
+    return updated;
   }
 
   async archive(userId: string, id: string): Promise<void> {

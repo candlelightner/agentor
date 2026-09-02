@@ -8,6 +8,10 @@ import type { MountConfig, TmuxWindow, AppInstanceInfo, NetworkMode, ExposeApis,
 import type { StorageManager } from './storage';
 import type { ExecCaptureResult } from './workspace-probe';
 import type { PersistentPathMount } from './persistent-backup-paths';
+import {
+  validateHostMountCatalogSource,
+  validateHostMountTarget,
+} from './host-mount-store';
 
 export interface EnvironmentJsonPayload {
   networkMode: string;
@@ -76,33 +80,31 @@ const MANAGED_LABEL = 'agentor.managed';
  * Owner + config live in the WorkerStore record, not in labels. */
 const ID_LABEL = 'agentor.id';
 
-/** Validate a list of host bind mounts before they are concatenated into Docker
- * `${source}:${target}[:ro]` bind strings. Returns an error message string on
- * the first invalid mount, or `null` when all are safe. Rejects:
- * - a `:` in either side (would inject extra Docker mount options like `:Z`,
- *   `:rshared`, or an arbitrary mode segment);
- * - mounting the Docker socket (full host control) or the orchestrator's data
- *   directory (other users' workspaces, credentials, auth.db, …) into a worker
- *   that runs user code.
- * Caller-supplied `dataDir` is the orchestrator's data root. */
+/** Validate host-mount request shape or, at the final Docker boundary, a fully
+ * resolved catalog mount. Authorization is intentionally performed by the
+ * HostMountStore; this function is the independent structural backstop. */
 export function validateMounts(
   mounts: MountConfig[] | undefined,
-  dataDir: string,
+  dataHostPath = '',
+  resolved = false,
 ): string | null {
-  const norm = (p: string) => p.replace(/\/+$/, '') || '/';
-  const normalisedDataDir = norm(dataDir);
   for (const m of mounts || []) {
-    const source = typeof m?.source === 'string' ? m.source : '';
-    const target = typeof m?.target === 'string' ? m.target : '';
-    if (source.includes(':') || target.includes(':')) {
-      return 'mount source/target must not contain ":"';
-    }
-    const src = norm(source);
-    if (src === '/var/run/docker.sock' || src === '/run/docker.sock') {
-      return 'mounting the Docker socket is not allowed';
-    }
-    if (src === normalisedDataDir || src.startsWith(`${normalisedDataDir}/`)) {
-      return 'mounting the orchestrator data directory is not allowed';
+    if (!m || typeof m !== 'object') return 'each mount must be an object';
+    if (typeof m.pathId !== 'string' || !m.pathId)
+      return 'host mounts must reference an approved pathId; ask the platform administrator to approve and assign the host path';
+    if (m.readOnly !== undefined && typeof m.readOnly !== 'boolean')
+      return 'mount readOnly must be a boolean';
+    try {
+      validateHostMountTarget(m.target);
+      if (resolved) {
+        if (typeof m.source !== 'string' || !m.source)
+          return 'resolved host mount source is missing';
+        validateHostMountCatalogSource(m.source, dataHostPath);
+      } else if (m.source !== undefined && typeof m.source !== 'string') {
+        return 'mount source must be a string when supplied';
+      }
+    } catch (error) {
+      return error instanceof Error ? error.message : 'invalid host mount';
     }
   }
   return null;
@@ -211,7 +213,11 @@ export class DockerService {
     // re-check here so import/rebuild paths can never build an unsafe bind
     // string (a `:` in either side could inject extra Docker mount options;
     // the Docker socket / data dir are off-limits).
-    const mountError = validateMounts(opts.mounts, this.config.dataDir);
+    const mountError = validateMounts(
+      opts.mounts,
+      opts.storageManager?.dataHostPath || '',
+      true,
+    );
     if (mountError) {
       const err = new Error(mountError) as Error & { statusCode?: number };
       err.statusCode = 400;

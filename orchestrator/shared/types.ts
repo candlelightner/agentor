@@ -5,9 +5,39 @@ export interface RepoConfig {
 }
 
 export interface MountConfig {
+  /** Server-issued reference to a centrally approved host path. New mount
+   * requests must use this identity; `source` is resolved again server-side. */
+  pathId?: string;
   source: string;
   target: string;
   readOnly?: boolean;
+}
+
+export interface HostMountPath {
+  schemaVersion: 1;
+  id: string;
+  name: string;
+  sourcePath: string;
+  /** Writable worker mounts may be requested only when this is explicitly on. */
+  allowWrite: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type HostMountGrantTarget = "entitlement" | "all" | "group" | "worker";
+
+export interface HostMountGrant {
+  schemaVersion: 1;
+  id: string;
+  userId: string;
+  pathId: string;
+  targetType: HostMountGrantTarget;
+  targetId?: string;
+  grantorType: "platform" | "owner" | "group";
+  grantorGroupId?: string;
+  parentGrantId?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 /**
@@ -128,6 +158,9 @@ export interface ContainerInfo extends UserOwnedResource {
    * to the running container. Live edits (display name) never set this. Cleared
    * whenever the container is (re)created — create, rebuild, or unarchive. */
   pendingRebuild?: boolean;
+  /** A formerly active host bind was revoked. The stopped container must not
+   * be restarted until a rebuild has recreated it without that bind. */
+  hostMountsRevoked?: boolean;
   /** Set on workers restored from an export that captured the source container's
    * filesystem. The per-worker imported image the worker runs (reused across
    * rebuild/unarchive). Unset for normal workers running the standard image. */
@@ -151,6 +184,11 @@ export interface CreateContainerRequest {
   environmentId?: string;
   excludedGlobalEnvVarKeys?: string[];
   excludedGroupEnvVarKeys?: string[];
+  /** Optional direct worker-group membership selected by an authenticated
+   * account user. REST and management MCP validate that the group belongs to
+   * the worker owner, then enroll the worker through the normal group/network
+   * coordinator before reporting creation as successful. */
+  workerGroupId?: string;
   /** Internal, authorization-checked group used to resolve inherited group
    * environment variables during creation. Never accepted directly from an
    * untrusted client request. */

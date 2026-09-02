@@ -11,7 +11,11 @@ test('management worker domain declares bounded worker, configuration, group, an
   expect((tools.find(tool => tool.name === 'workers.create')?.inputSchema as any).properties).toMatchObject({
     imageDefinitionId:{type:'string'},
     imageVersion:{type:'string'},
+    workerGroupId:{type:'string'},
   });
+  const createMount = (tools.find(tool => tool.name === 'workers.create')?.inputSchema as any).properties.mounts.items;
+  expect(createMount).toMatchObject({ additionalProperties:false, required:['pathId','target'] });
+  expect(createMount.properties).not.toHaveProperty('source');
   expect((tools.find(tool => tool.name === 'locks.set')?.inputSchema as any).properties).toMatchObject({
     password:{type:'string',writeOnly:true},
     currentPassword:{type:'string',writeOnly:true},

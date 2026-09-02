@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import type { GitProviderInfo, MountConfig, RepoConfig, CreateContainerRequest, GitHubBranchInfo, GitHubRepoInfo } from '~/types';
+import type { WorkerGroup } from '~/composables/useWorkerGroups';
 
 const props = defineProps<{
   gitProviders: GitProviderInfo[];
+  workerGroups: WorkerGroup[];
 }>();
 
 const emit = defineEmits<{
@@ -15,6 +17,7 @@ const emit = defineEmits<{
 const open = defineModel<boolean>('open', { default: false });
 
 const { environments, defaultEnvironmentId } = useEnvironments();
+const hostMounts = useHostMounts();
 
 const {
   repos: githubRepos,
@@ -43,6 +46,7 @@ watch(defaultEnvironmentId, (id) => {
 watch(open, async (isOpen) => {
   if (isOpen) {
     fetchRepos();
+    await refreshEffectiveHostMounts();
     const { displayName } = await $fetch<{ displayName: string }>('/api/containers/generate-name');
     generatedName.value = displayName;
   }
@@ -51,6 +55,7 @@ watch(open, async (isOpen) => {
 const form = reactive({
   displayName: '',
   environmentId: '',
+  workerGroupId: '',
   repos: [] as RepoConfig[],
   mounts: [] as MountConfig[],
   initScript: '',
@@ -68,6 +73,41 @@ const { selectedPreset, presetOptions } = useInitScriptSync(
 const environmentOptions = computed(() =>
   environments.value.map((e) => ({ label: e.name, value: e.id })),
 );
+
+const workerGroupOptions = computed(() => {
+  const byId = new Map(props.workerGroups.map((group) => [group.id, group]));
+  const labelFor = (group: WorkerGroup) => {
+    const names = [group.name];
+    const seen = new Set([group.id]);
+    let parentId = group.parentId;
+    while (parentId && !seen.has(parentId)) {
+      seen.add(parentId);
+      const parent = byId.get(parentId);
+      if (!parent) break;
+      names.unshift(parent.name);
+      parentId = parent.parentId;
+    }
+    return names.join(' / ');
+  };
+  return [
+    { label: 'Ungrouped', value: '' },
+    ...props.workerGroups
+      .map((group) => ({ label: labelFor(group), value: group.id }))
+      .sort((a, b) => a.label.localeCompare(b.label)),
+  ];
+});
+
+async function refreshEffectiveHostMounts() {
+  await hostMounts.refresh({
+    ...(form.workerGroupId ? { groupId: form.workerGroupId } : {}),
+  });
+  const available = new Set(hostMounts.effectivePaths.value.map((path) => path.id));
+  form.mounts = form.mounts.filter((mount) => mount.pathId && available.has(mount.pathId));
+}
+
+watch(() => form.workerGroupId, () => {
+  if (open.value) void refreshEffectiveHostMounts();
+});
 
 const defaultProvider = computed(() => props.gitProviders[0]?.id || 'github');
 
@@ -148,7 +188,7 @@ function getCreatingRepo(idx: number) {
 }
 
 function addMount() {
-  form.mounts.push({ source: '', target: '', readOnly: false });
+  form.mounts.push({ pathId: '', source: '', target: '', readOnly: true });
 }
 
 function removeMount(idx: number) {
@@ -165,6 +205,7 @@ function submit() {
     displayName: customName || generatedName.value,
   };
   if (form.environmentId) request.environmentId = form.environmentId;
+  if (form.workerGroupId) request.workerGroupId = form.workerGroupId;
   request.excludedGlobalEnvVarKeys = [...excludedGlobalEnvVarKeys.value];
   const validRepos = form.repos.filter((r) => r.url);
   if (validRepos.length > 0) {
@@ -175,7 +216,7 @@ function submit() {
     }));
   }
   if (form.mounts.length > 0) {
-    request.mounts = form.mounts.filter((m) => m.source && m.target);
+    request.mounts = form.mounts.filter((m) => m.pathId && m.target);
   }
   if (form.initScript.trim()) {
     request.initScript = form.initScript;
@@ -189,6 +230,7 @@ function submit() {
 function reset() {
   form.displayName = '';
   form.environmentId = defaultEnvironmentId.value;
+  form.workerGroupId = '';
   form.repos = [];
   form.mounts = [];
   form.initScript = '';
@@ -228,6 +270,14 @@ function reset() {
               Manage
             </UButton>
           </div>
+        </UFormField>
+
+        <UFormField label="Worker group" hint="Optional direct membership; group permissions apply during creation">
+          <USelect
+            v-model="form.workerGroupId"
+            :items="workerGroupOptions"
+            class="w-full"
+          />
         </UFormField>
 
         <AccountEnvInheritancePicker v-model:excluded-keys="excludedGlobalEnvVarKeys" />
@@ -275,6 +325,7 @@ function reset() {
               v-for="(mount, idx) in form.mounts"
               :key="idx"
               :model-value="mount"
+              :paths="hostMounts.effectivePaths.value"
               @update:model-value="form.mounts[idx] = $event"
               @remove="removeMount(idx)"
             />
@@ -283,10 +334,14 @@ function reset() {
             size="xs"
             variant="link"
             class="mt-2"
+            :disabled="hostMounts.effectivePaths.value.length === 0"
             @click="addMount"
           >
             + Add mount
           </UButton>
+          <p v-if="hostMounts.effectivePaths.value.length === 0" class="mt-1 text-xs text-gray-500">
+            No host path is assigned to {{ form.workerGroupId ? 'the selected group' : 'all new workers' }}. Configure host mount permissions first.
+          </p>
         </UFormField>
 
         <UFormField label="Init Script" hint="Script to run in tmux on startup">

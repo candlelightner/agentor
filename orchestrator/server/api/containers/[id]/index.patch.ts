@@ -37,7 +37,7 @@ defineRouteMeta({
 });
 
 import type { RepoConfig, MountConfig, UpdateContainerSettingsRequest } from '../../../../shared/types';
-import { useContainerManager, useEnvironmentStore, useConfig } from '../../../utils/services';
+import { useContainerManager, useEnvironmentStore } from '../../../utils/services';
 import { MAX_DISPLAY_NAME_LENGTH } from '../../../utils/validation';
 import { validateMounts } from '../../../utils/docker';
 import { requireContainerAccess } from '../../../utils/auth-helpers';
@@ -144,15 +144,17 @@ export default defineEventHandler(async (event) => {
     for (const m of arr) {
       if (typeof m !== 'object' || m === null) bad('each mount must be an object');
       const mount = m as Record<string, unknown>;
+      if (mount.pathId !== undefined && typeof mount.pathId !== 'string') bad('mount.pathId must be a string');
       if (mount.source !== undefined && typeof mount.source !== 'string') bad('mount.source must be a string');
       if (mount.target !== undefined && typeof mount.target !== 'string') bad('mount.target must be a string');
       mounts.push({
+        pathId: (mount.pathId as string) || undefined,
         source: (mount.source as string) || '',
         target: (mount.target as string) || '',
-        ...(mount.readOnly ? { readOnly: true } : {}),
+        readOnly: mount.readOnly !== false,
       });
     }
-    const mountError = validateMounts(mounts, useConfig().dataDir);
+    const mountError = validateMounts(mounts);
     if (mountError) bad(mountError);
     patch.mounts = mounts;
   }

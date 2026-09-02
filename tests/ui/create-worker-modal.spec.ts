@@ -2,6 +2,7 @@ import { test, expect } from '@playwright/test';
 import { goToDashboard, openCreateWorkerModal } from '../helpers/ui-helpers';
 import { cleanupWorker } from '../helpers/worker-lifecycle';
 import { ApiClient } from '../helpers/api-client';
+import { approveHostPath, approveHostPathForAll, deleteApprovedHostPath } from '../helpers/host-mounts';
 
 test.describe('Create Worker Modal', () => {
 
@@ -42,13 +43,14 @@ test.describe('Create Worker Modal', () => {
     await expect(page.locator('[role="dialog"]')).toBeHidden({ timeout: 10_000 });
   });
 
-  test('shows form sections: Display name, Environment, Repositories, Volume Mounts, Init Script', async ({ page }) => {
+  test('shows form sections: Display name, Environment, Worker group, Repositories, Volume Mounts, Init Script', async ({ page }) => {
     await goToDashboard(page);
     await openCreateWorkerModal(page);
     const dialog = page.locator('[role="dialog"]');
     // Check all form field labels are present (using getByText for exact matching)
     await expect(dialog.getByText('Display name', { exact: true })).toBeVisible();
     await expect(dialog.getByText('Environment', { exact: true })).toBeVisible();
+    await expect(dialog.getByText('Worker group', { exact: true })).toBeVisible();
     await expect(dialog.getByText('Repositories', { exact: true })).toBeVisible();
     await expect(dialog.getByText('Volume Mounts', { exact: true })).toBeVisible();
     await expect(dialog.getByText('Init Script', { exact: true }).first()).toBeVisible();
@@ -86,6 +88,44 @@ test.describe('Create Worker Modal', () => {
     await expect(page.locator('[role="dialog"]').getByText('Default')).toBeVisible();
   });
 
+  test('has an optional Worker group selector that defaults to Ungrouped', async ({ page }) => {
+    await goToDashboard(page);
+    await openCreateWorkerModal(page);
+    const groupSelector = page.locator('[role="dialog"]').getByRole('combobox', { name: 'Worker group' });
+    await expect(groupSelector).toBeVisible();
+    await expect(groupSelector).toContainText('Ungrouped');
+  });
+
+  test('selecting a worker group exposes paths assigned to that group', async ({ page, request }) => {
+    const groupName = `ui-mount-group-${Date.now()}`;
+    const createdGroup = await request.post('/api/worker-groups', { data: { name: groupName } });
+    expect(createdGroup.status()).toBe(201);
+    const group = await createdGroup.json();
+    const path = await approveHostPath(
+      request,
+      `/tmp/ui-group-only-${Date.now()}`,
+      { targetType: 'group', targetId: group.id },
+    );
+    try {
+      await goToDashboard(page);
+      await openCreateWorkerModal(page);
+      const dialog = page.locator('[role="dialog"]');
+      const addMount = dialog.getByRole('button', { name: 'Add mount' });
+      await expect(addMount).toBeDisabled();
+      const groupSelector = dialog.getByRole('combobox', { name: 'Worker group' });
+      await groupSelector.click();
+      await page.getByRole('option', { name: groupName, exact: true }).click();
+      await expect(addMount).toBeEnabled();
+      await addMount.click();
+      const pathSelector = dialog.getByRole('combobox', { name: 'Approved host path' });
+      await pathSelector.click();
+      await expect(page.getByRole('option', { name: new RegExp(path.sourcePath) })).toBeVisible();
+    } finally {
+      await deleteApprovedHostPath(request, path.id);
+      await request.delete(`/api/worker-groups/${group.id}`).catch(() => undefined);
+    }
+  });
+
   test('has Init Script preset selector with None option', async ({ page }) => {
     await goToDashboard(page);
     await openCreateWorkerModal(page);
@@ -119,16 +159,20 @@ test.describe('Create Worker Modal', () => {
     await expect(dialog.locator('input').nth(1)).toBeVisible({ timeout: 10_000 });
   });
 
-  test('+ Add mount button adds a mount row', async ({ page }) => {
-    await goToDashboard(page);
-    await openCreateWorkerModal(page);
-    const dialog = page.locator('[role="dialog"]');
-    await dialog.locator('button:has-text("Add mount")').click();
-    // A new mount input row should appear
-    const inputs = dialog.locator('input');
-    const count = await inputs.count();
-    // Should have more than 1 input now (name + mount source/target)
-    expect(count).toBeGreaterThan(1);
+  test('+ Add mount button adds a mount row', async ({ page, request }) => {
+    const path = await approveHostPathForAll(request, `/tmp/ui-create-mount-${Date.now()}`);
+    try {
+      await goToDashboard(page);
+      await openCreateWorkerModal(page);
+      const dialog = page.locator('[role="dialog"]');
+      const addMount = dialog.locator('button:has-text("Add mount")');
+      await expect(addMount).toBeEnabled();
+      await addMount.click();
+      await expect(dialog.getByRole('combobox', { name: 'Approved host path' })).toBeVisible();
+      await expect(dialog.locator('input[placeholder="Container path"]')).toBeVisible();
+    } finally {
+      await deleteApprovedHostPath(request, path.id);
+    }
   });
 
   test('environment dropdown has selectable options', async ({ page }) => {
@@ -180,75 +224,114 @@ test.describe('Create Worker Modal', () => {
     }
   });
 
+  test('creates a worker directly in the selected group', async ({ page, request }) => {
+    const groupName = `ui-create-group-${Date.now()}`;
+    const createdGroup = await request.post('/api/worker-groups', { data: { name: groupName } });
+    expect(createdGroup.status()).toBe(201);
+    const group = await createdGroup.json();
+    let workerId: string | undefined;
+    try {
+      await goToDashboard(page);
+      await openCreateWorkerModal(page);
+      const dialog = page.locator('[role="dialog"]');
+      const groupSelector = dialog.getByRole('combobox', { name: 'Worker group' });
+      await groupSelector.click();
+      await page.getByRole('option', { name: groupName, exact: true }).click();
+      await dialog.getByRole('button', { name: 'Create', exact: true }).click();
+      for (let attempt = 0; attempt < 45; attempt++) {
+        const current = await request.get(`/api/worker-groups/${group.id}`);
+        const memberIds = current.ok() ? (await current.json()).workerIds as string[] : [];
+        if (memberIds.length) {
+          workerId = memberIds[0];
+          break;
+        }
+        await page.waitForTimeout(1000);
+      }
+      expect(workerId).toBeTruthy();
+    } finally {
+      if (workerId) await cleanupWorker(request, workerId);
+      await request.delete(`/api/worker-groups/${group.id}`).catch(() => undefined);
+    }
+  });
+
   // --- Volume Mounts ---
 
-  test('clicking + Add mount adds a mount row with source, target, and read-only fields', async ({ page }) => {
-    await goToDashboard(page);
-    await openCreateWorkerModal(page);
-    const dialog = page.locator('[role="dialog"]');
-    await dialog.locator('button:has-text("Add mount")').click();
-
-    // Mount row should contain source input (Host path), target input (Container path), and read-only checkbox
-    const hostPathInput = dialog.locator('input[placeholder="Host path"]');
-    const containerPathInput = dialog.locator('input[placeholder="Container path"]');
-    await expect(hostPathInput).toBeVisible();
-    await expect(containerPathInput).toBeVisible();
-
-    // Read-only checkbox labeled "ro"
-    await expect(dialog.getByText('ro', { exact: true })).toBeVisible();
+  test('clicking + Add mount adds approved-path, target, and access-mode dropdowns', async ({ page, request }) => {
+    const path = await approveHostPathForAll(request, `/tmp/ui-fields-${Date.now()}`, true);
+    try {
+      await goToDashboard(page);
+      await openCreateWorkerModal(page);
+      const dialog = page.locator('[role="dialog"]');
+      const addMount = dialog.locator('button:has-text("Add mount")');
+      await expect(addMount).toBeEnabled();
+      await addMount.click();
+      await expect(dialog.getByRole('combobox', { name: 'Approved host path' })).toBeVisible();
+      await expect(dialog.locator('input[placeholder="Container path"]')).toBeVisible();
+      await expect(dialog.getByRole('combobox', { name: 'Mount access' })).toContainText('Read only');
+    } finally {
+      await deleteApprovedHostPath(request, path.id);
+    }
   });
 
-  test('clicking + Add mount multiple times adds multiple mount rows', async ({ page }) => {
-    await goToDashboard(page);
-    await openCreateWorkerModal(page);
-    const dialog = page.locator('[role="dialog"]');
-
-    await dialog.locator('button:has-text("Add mount")').click();
-    await dialog.locator('button:has-text("Add mount")').click();
-
-    // Should have two "Host path" inputs now
-    const hostPathInputs = dialog.locator('input[placeholder="Host path"]');
-    await expect(hostPathInputs).toHaveCount(2);
-
-    const containerPathInputs = dialog.locator('input[placeholder="Container path"]');
-    await expect(containerPathInputs).toHaveCount(2);
+  test('clicking + Add mount multiple times adds multiple mount rows', async ({ page, request }) => {
+    const path = await approveHostPathForAll(request, `/tmp/ui-multiple-${Date.now()}`);
+    try {
+      await goToDashboard(page);
+      await openCreateWorkerModal(page);
+      const dialog = page.locator('[role="dialog"]');
+      const addMount = dialog.locator('button:has-text("Add mount")');
+      await expect(addMount).toBeEnabled();
+      await addMount.click();
+      await addMount.click();
+      await expect(dialog.getByRole('combobox', { name: 'Approved host path' })).toHaveCount(2);
+      await expect(dialog.locator('input[placeholder="Container path"]')).toHaveCount(2);
+    } finally {
+      await deleteApprovedHostPath(request, path.id);
+    }
   });
 
-  test('mount row remove button removes the mount row', async ({ page }) => {
-    await goToDashboard(page);
-    await openCreateWorkerModal(page);
-    const dialog = page.locator('[role="dialog"]');
-
-    // Add a mount row
-    await dialog.locator('button:has-text("Add mount")').click();
-    const hostInput = dialog.locator('input[placeholder="Host path"]');
-    await expect(hostInput).toBeVisible();
-
-    // The mount row (MountInput) is a flex div containing: inputs, checkbox, and a remove UButton
-    // Find the row containing the Host path input, then click the last button in it (the X icon)
-    const mountRow = hostInput.locator('xpath=ancestor::div[contains(@class, "flex")][contains(@class, "gap-2")]');
-    await mountRow.locator('button').last().click();
-
-    // Mount row should be gone
-    await expect(dialog.locator('input[placeholder="Host path"]')).toHaveCount(0);
-    await expect(dialog.locator('input[placeholder="Container path"]')).toHaveCount(0);
+  test('mount row remove button removes the mount row', async ({ page, request }) => {
+    const path = await approveHostPathForAll(request, `/tmp/ui-remove-${Date.now()}`);
+    try {
+      await goToDashboard(page);
+      await openCreateWorkerModal(page);
+      const dialog = page.locator('[role="dialog"]');
+      const addMount = dialog.locator('button:has-text("Add mount")');
+      await expect(addMount).toBeEnabled();
+      await addMount.click();
+      const pathSelector = dialog.getByRole('combobox', { name: 'Approved host path' });
+      await expect(pathSelector).toBeVisible();
+      const mountRow = pathSelector.locator('xpath=ancestor::div[contains(@class, "flex")][contains(@class, "gap-2")]');
+      await mountRow.locator('button').last().click();
+      await expect(dialog.getByRole('combobox', { name: 'Approved host path' })).toHaveCount(0);
+      await expect(dialog.locator('input[placeholder="Container path"]')).toHaveCount(0);
+    } finally {
+      await deleteApprovedHostPath(request, path.id);
+    }
   });
 
-  test('mount row inputs accept text values', async ({ page }) => {
-    await goToDashboard(page);
-    await openCreateWorkerModal(page);
-    const dialog = page.locator('[role="dialog"]');
-
-    await dialog.locator('button:has-text("Add mount")').click();
-
-    const hostPathInput = dialog.locator('input[placeholder="Host path"]');
-    const containerPathInput = dialog.locator('input[placeholder="Container path"]');
-
-    await hostPathInput.fill('/home/user/data');
-    await containerPathInput.fill('/mnt/data');
-
-    await expect(hostPathInput).toHaveValue('/home/user/data');
-    await expect(containerPathInput).toHaveValue('/mnt/data');
+  test('mount row selects an approved path and explicit read/write mode', async ({ page, request }) => {
+    const path = await approveHostPathForAll(request, `/tmp/ui-read-write-${Date.now()}`, true);
+    try {
+      await goToDashboard(page);
+      await openCreateWorkerModal(page);
+      const dialog = page.locator('[role="dialog"]');
+      const addMount = dialog.locator('button:has-text("Add mount")');
+      await expect(addMount).toBeEnabled();
+      await addMount.click();
+      const pathSelector = dialog.getByRole('combobox', { name: 'Approved host path' });
+      await pathSelector.click();
+      await page.getByRole('option', { name: new RegExp(path.sourcePath) }).click();
+      const containerPathInput = dialog.locator('input[placeholder="Container path"]');
+      await containerPathInput.fill('/mnt/data');
+      const access = dialog.getByRole('combobox', { name: 'Mount access' });
+      await access.click();
+      await page.getByRole('option', { name: 'Read and write', exact: true }).click();
+      await expect(containerPathInput).toHaveValue('/mnt/data');
+      await expect(access).toContainText('Read and write');
+    } finally {
+      await deleteApprovedHostPath(request, path.id);
+    }
   });
 
   // --- Repository ---
@@ -331,24 +414,25 @@ test.describe('Create Worker Modal', () => {
 
   // --- Modal close behaviors ---
 
-  test('Cancel button closes the modal and resets to clean state', async ({ page }) => {
-    await goToDashboard(page);
-    await openCreateWorkerModal(page);
-    const dialog = page.locator('[role="dialog"]');
-
-    // Add some state: a repo row and a mount row
-    await dialog.locator('button:has-text("Add repository")').click();
-    await dialog.locator('button:has-text("Add mount")').click();
-
-    // Close via Cancel
-    await dialog.locator('button:has-text("Cancel")').click();
-    await expect(dialog).toBeHidden({ timeout: 10_000 });
-
-    // Re-open the modal — form should be reset (no repo or mount rows)
-    await openCreateWorkerModal(page);
-    const dialog2 = page.locator('[role="dialog"]');
-    await expect(dialog2.locator('input[placeholder="branch (optional)"]')).toHaveCount(0);
-    await expect(dialog2.locator('input[placeholder="Host path"]')).toHaveCount(0);
+  test('Cancel button closes the modal and resets to clean state', async ({ page, request }) => {
+    const path = await approveHostPathForAll(request, `/tmp/ui-reset-${Date.now()}`);
+    try {
+      await goToDashboard(page);
+      await openCreateWorkerModal(page);
+      const dialog = page.locator('[role="dialog"]');
+      await dialog.locator('button:has-text("Add repository")').click();
+      const addMount = dialog.locator('button:has-text("Add mount")');
+      await expect(addMount).toBeEnabled();
+      await addMount.click();
+      await dialog.locator('button:has-text("Cancel")').click();
+      await expect(dialog).toBeHidden({ timeout: 10_000 });
+      await openCreateWorkerModal(page);
+      const dialog2 = page.locator('[role="dialog"]');
+      await expect(dialog2.locator('input[placeholder="branch (optional)"]')).toHaveCount(0);
+      await expect(dialog2.getByRole('combobox', { name: 'Approved host path' })).toHaveCount(0);
+    } finally {
+      await deleteApprovedHostPath(request, path.id);
+    }
   });
 
   test('Escape key closes the modal', async ({ page }) => {

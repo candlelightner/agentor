@@ -6,7 +6,8 @@ defineRouteMeta({ openAPI: {
 } });
 
 import { requireContainerAccess } from '../../../utils/auth-helpers';
-import { useContainerManager, useWorkerStore, usePluginDefinitionStore, usePluginInstallationStore, usePluginRuntimeManager } from '../../../utils/services';
+import { useContainerManager, useWorkerStore, useWorkerGroupStore, usePluginDefinitionStore, usePluginInstallationStore, usePluginRuntimeManager } from '../../../utils/services';
+import { addWorkerToGroupWithNetworks } from '../../../utils/worker-group-manager';
 import { useWorkerConfigStore } from '../../../utils/worker-config-store';
 import { restoreWorkerPlugins, snapshotWorkerPlugins } from '../../../utils/plugin-portability';
 import { findWorkspaceInventory } from '../../../utils/workspace-inventory';
@@ -27,16 +28,25 @@ export default defineEventHandler(async (event) => {
     usePluginDefinitionStore(),
     usePluginInstallationStore(),
   );
+  const sourceMemberships = useWorkerGroupStore()
+    .listForUser(user.id)
+    .filter((group) => group.workerIds.includes(source!.id));
+  if (sourceMemberships.length > 1)
+    throw createError({ statusCode: 409, statusMessage: 'Source worker has conflicting group memberships' });
+  const targetWorkerGroupId = sourceMemberships[0]?.id;
   const cloned = await useContainerManager().create({
     userId: user.id,
     displayName: typeof body?.displayName === 'string' ? body.displayName : `${source!.displayName || 'worker'} copy`,
     repos: source!.repos,
     mounts: source!.mounts,
+    targetWorkerGroupId,
     environmentId: source!.environmentId,
     initScript: source!.initScript,
     workerConfiguration: { variables },
   });
   try {
+    if (targetWorkerGroupId)
+      await addWorkerToGroupWithNetworks(user.id, targetWorkerGroupId, cloned.id);
     const item = await findWorkspaceInventory(id, user.role === 'admin');
     if (!item || item.state === 'orphaned') throw new Error('Source workspace not found');
     await new OfflineWorkspaceAccess(item).cloneInto(cloned.containerId);
