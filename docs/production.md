@@ -114,6 +114,40 @@ normally enumerate the prior client's `drive.file` objects merely because it
 uses the same account. See [Google Drive backup setup](google-drive-backups.md)
 for the exact OAuth setup and recovery procedure.
 
+## Whole-instance disaster recovery
+
+Portable backups above restore selected workers. A VPS-to-homeserver or
+control-plane migration can instead use the platform-admin **Instance disaster
+recovery** workflow. Its versioned `AGENTOR-INSTANCE-BACKUP-1` envelope contains
+a consistent SQLite online snapshot plus the versioned `DATA_DIR` stores,
+including complete plugin definitions and desired installation records. It can
+also contain selected Agentor-owned Docker volumes. The artifact is encrypted
+with an instance-specific key derived from the existing owner recovery
+material, and can be downloaded locally or synchronized with Google Drive.
+
+Before creating a snapshot, stop ordinary workers and every global/group
+administrative workspace. Before applying one, use a fresh empty installation
+started with `AGENTOR_INSTANCE_RECOVERY_MODE=true` and the same `DATA_DIR`
+storage mode and `CONTAINER_PREFIX`; Agentor refuses to overwrite existing
+workers, administrative workspaces, or named volumes. The staged restore
+authenticates and structurally validates every archive before a network-disabled
+helper stops the exact orchestrator, swaps the control-plane data, restores
+selected absent volumes, and restarts it with rollback on failure. Disable
+recovery mode again after successful reconciliation.
+
+Deployment `.env` values, GitHub App PEM files, DNS/registry credentials, host
+bind-mount contents, and Docker image layers are not silently embedded. Host
+mount policies are omitted by default even though their source-path inventory
+is visible during preflight. Preserve the recovery kit independently; linking
+Google Drive cannot decrypt an artifact without its matching key.
+
+Creation, Google Drive scan/adoption, upload verification, and restore are
+durable asynchronous REST/UI/MCP jobs with exact status/log/cancel next
+actions and retry-safe `requestId` admission. See
+[Instance disaster recovery](instance-disaster-recovery.md) for the complete
+migration runbook, external-dependency checklist, provider constraints, and
+format behavior.
+
 ## Agent Usage Monitoring
 
 Polls agent usage APIs to show each user's remaining capacity in the sidebar. Works for OAuth-authenticated agents (per-user credential files at `<DATA_DIR>/users/<userId>/credentials/{claude,codex,gemini}.json` for the three polled agents, or the per-user `CLAUDE_CODE_OAUTH_TOKEN` set in the Account modal). API key auth has no usage endpoints. **Kilo is a fourth Account credential/reset row** (its shared per-user auth now lives at `<DATA_DIR>/users/<userId>/kilo/data/auth.json`, directory-bound into every worker because Kilo atomically temp+renames `auth.json`), but it has **no usage-monitoring endpoint** and is not polled by `UsageChecker` — usage monitoring covers only Claude, Codex, and Gemini.

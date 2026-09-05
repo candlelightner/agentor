@@ -5,7 +5,7 @@ import { ManagementImageBackupDomain, sanitizeManagementBackupPayload } from '..
 test('image and backup MCP domain exposes bounded tool surface and safe hints', () => {
   const tools = new ManagementImageBackupDomain().tools();
   const names = tools.map(tool => tool.name);
-  for (const name of ['images.list','images.create','images.update','images.build','images.build-status','images.build-logs','images.build-cancel','images.validation-retry','images.promote','images.rollback','images.delete-version','images.usage','images.test-worker','images.git-sync','backups.list','backups.providers','backups.discovery.start','backups.discovery.list','backups.inspect','backups.adopt','backups.image-recovery.start','backups.key-status','backups.recovery-material.import','backups.logs','backups.create','backups.cancel','backups.retry','backups.delete','backups.restore']) expect(names).toContain(name);
+  for (const name of ['images.list','images.create','images.update','images.build','images.build-status','images.build-logs','images.build-cancel','images.validation-retry','images.promote','images.rollback','images.delete-version','images.usage','images.test-worker','images.git-sync','backups.list','backups.providers','backups.discovery.start','backups.discovery.list','backups.inspect','backups.adopt','backups.image-recovery.start','backups.key-status','backups.recovery-material.import','backups.logs','backups.create','backups.cancel','backups.retry','backups.delete','backups.restore','instance-backups.list','instance-backups.create','instance-backups.discovery.start','instance-backups.discovery.list','instance-backups.inspect','instance-backups.preflight','instance-backups.adopt','instance-backups.restore','instance-backups.status','instance-backups.logs','instance-backups.cancel']) expect(names).toContain(name);
   expect(tools.find(tool => tool.name === 'images.build-logs')?.annotations).toMatchObject({ readOnlyHint:true });
   expect(tools.find(tool => tool.name === 'backups.delete')?.annotations).toMatchObject({ destructiveHint:true });
   const restore = tools.find(tool => tool.name === 'backups.restore');
@@ -65,6 +65,50 @@ test('image and backup MCP domain exposes bounded tool surface and safe hints', 
     required: ['ownerId'],
     properties: { providerId: { enum: ['local', 'fake', 'google-drive'] }, requestId: { minLength: 1 } },
   });
+  expect(tools.find(tool => tool.name === 'instance-backups.create')?.inputSchema).toMatchObject({
+    required: ['ownerId'],
+    additionalProperties: false,
+    properties: {
+      providerId: { enum: ['local', 'fake', 'google-drive'] },
+      requestId: { type: 'string', minLength: 1 },
+      options: {
+        additionalProperties: false,
+        properties: {
+          includeWorkers: { type: 'boolean', default: true },
+          includeAgentData: { type: 'boolean', default: true },
+          includeDockerVolumes: { type: 'boolean', default: true },
+          includeLocalBackups: { type: 'boolean', default: false },
+          includeLogs: { type: 'boolean', default: false },
+        },
+      },
+    },
+  });
+  expect(tools.find(tool => tool.name === 'instance-backups.discovery.start')?.inputSchema).toMatchObject({
+    required: ['ownerId'],
+    properties: {
+      providerId: { enum: ['local', 'fake', 'google-drive'] },
+      requestId: { type: 'string', minLength: 1 },
+    },
+  });
+  expect(tools.find(tool => tool.name === 'instance-backups.restore')?.inputSchema).toMatchObject({
+    required: ['ownerId', 'artifactId'],
+    properties: {
+      requestId: { type: 'string', minLength: 1 },
+      options: {
+        required: ['confirmReplaceControlPlane', 'confirmExternalDependencies'],
+        properties: {
+          restoreDockerVolumes: { type: 'boolean', default: true },
+          restoreHostMountPolicies: { type: 'boolean', default: false },
+          confirmReplaceControlPlane: { type: 'boolean' },
+          confirmExternalDependencies: { type: 'boolean' },
+        },
+      },
+    },
+  });
+  for (const name of ['instance-backups.list','instance-backups.discovery.list','instance-backups.inspect','instance-backups.preflight','instance-backups.status','instance-backups.logs'])
+    expect(tools.find(tool => tool.name === name)?.annotations).toMatchObject({ readOnlyHint: true });
+  expect(tools.find(tool => tool.name === 'instance-backups.restore')?.annotations).toMatchObject({ destructiveHint: true });
+  expect(tools.find(tool => tool.name === 'instance-backups.cancel')?.annotations).toMatchObject({ destructiveHint: true });
   expect(tools.find(tool => tool.name === 'backups.restore')?.inputSchema.properties).toMatchObject({
     requestId: { type: 'string', minLength: 1 },
     imageResolutions: {
@@ -137,9 +181,14 @@ test('backup MCP payloads preserve required secret names without exposing secret
 
 test('backup MCP surface keeps recovery material write-only and uses shared async follow-ups', () => {
   const source = readFileSync(new URL('../../orchestrator/server/utils/management-image-backup-domain.ts', import.meta.url), 'utf8');
+  const managementStore = readFileSync(new URL('../../orchestrator/server/utils/management-mcp-store.ts', import.meta.url), 'utf8');
+  const httpGuard = readFileSync(new URL('../../orchestrator/server/middleware/instance-snapshot-guard.ts', import.meta.url), 'utf8');
   expect(source).toMatch(/tool:\s*["']backups\.status["']/);
   expect(source).toMatch(/tool:\s*["']backups\.logs["']/);
   expect(source).toMatch(/tool:\s*["']backups\.cancel["']/);
+  expect(source).toMatch(/tool:\s*["']instance-backups\.status["']/);
+  expect(source).toMatch(/tool:\s*["']instance-backups\.logs["']/);
+  expect(source).toMatch(/tool:\s*["']instance-backups\.cancel["']/);
   expect(source).toMatch(/createRecoveryRestore\(\s*manager,\s*owner,\s*artifact/);
   // The MCP boundary delegates cursor semantics to the persisted manager: it
   // must not truncate a long-running discovery/adoption log before applying
@@ -148,6 +197,14 @@ test('backup MCP surface keeps recovery material write-only and uses shared asyn
   expect(source).not.toContain('function backupLogs(');
   expect(source).not.toContain('backups.recovery-key.reveal');
   expect(source).not.toContain('backups.recovery-key.export');
+  expect(source).not.toContain('instance-backups.recovery-key.reveal');
+  expect(source).not.toContain('instance-backups.recovery-key.export');
+  expect(managementStore).toContain('instanceSnapshotActive()');
+  expect(managementStore).toContain('name === "instance-backups.cancel"');
+  expect(managementStore).toContain('args.jobId === instanceSnapshotJobId()');
+  expect(httpGuard).toContain('statusCode: 423');
+  expect(httpGuard).toContain('/api/admin/instance-backups/jobs/');
+  expect(httpGuard).toContain('encodeURIComponent(instanceSnapshotJobId()!)');
 });
 
 test('recovery MCP schemas make every long-operation follow-up and key boundary explicit', () => {

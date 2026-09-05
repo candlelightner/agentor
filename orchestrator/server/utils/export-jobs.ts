@@ -207,6 +207,14 @@ export class ExportJobManager {
     return this.store.listUserIds();
   }
 
+  hasActiveOperationsForInstanceSnapshot(): boolean {
+    return (
+      this.runningJobs.size > 0 ||
+      this.activeTasks.size > 0 ||
+      this.controllers.size > 0
+    );
+  }
+
   async removeForUser(userId: string): Promise<number> {
     this.closedOwners.add(userId);
     await this.init();

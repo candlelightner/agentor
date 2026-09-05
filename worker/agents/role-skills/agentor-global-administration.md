@@ -30,6 +30,15 @@ You are running in Agentor's trusted platform-administrative workspace. Use the 
 - Before revoking a path, explain that affected workers are stopped and cannot restart until rebuilt without the old bind. Verify the returned enforcement result and follow up on any stop failure.
 - For worker creation, select an optional direct group with `workerGroupId`, then choose mounts using only `{ pathId, target, readOnly }`. Group membership affects which paths are authorized during creation.
 
+## Whole-instance disaster recovery
+
+- Use `instance-backups.*` only for an explicitly requested whole-orchestrator migration or recovery. Portable `backups.*` remain the safer choice for selected workers/workspaces.
+- Supply only a current platform administrator as `ownerId` for `instance-backups.*`; it selects the administrator-controlled recovery-key and provider namespace, not the workers included in the snapshot.
+- Create, Google Drive discovery, adoption, and restore are durable asynchronous jobs. Keep and reuse the caller-supplied `requestId` after an uncertain response, then follow the exact `status`, bounded `logs`, and optional `cancel` actions returned by the tool.
+- Never ask an MCP tool to reveal or export existing raw recovery material. MCP reports fingerprints and accepts deliberately supplied write-only recovery material; raw-key reveal/export remains a fresh-reauthenticated human GUI workflow.
+- Before restore, require an empty destination in `AGENTOR_INSTANCE_RECOVERY_MODE=true`, matching storage mode and `CONTAINER_PREFIX`, both explicit confirmations, and reviewed external dependencies. Do not imply that host-mounted content, deployment secrets, or Docker image layers are embedded.
+- Google synchronization uses the Google Drive API connection configured through Google Cloud, not a Google Cloud Storage bucket. With least-privileged `drive.file`, cross-instance discovery normally requires the same Google account and OAuth client identity.
+
 ## Workflow
 
 1. Identify the requested outcome, affected resources, constraints, and acceptable side effects.

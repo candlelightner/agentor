@@ -6,7 +6,7 @@ import { createTestUser, deleteTestUser, type CreatedUser } from "../helpers/tes
 import { captureCommandOutput, TerminalWsClient } from "../helpers/terminal-ws";
 import { buildPng } from "../helpers/clipboard";
 
-const GROUP_ADMIN_ROLE_SKILL_SHA256 = "35c5e2a9a525658160a4f63904b93233f4914e203d4a87e0c86c9b339cc1fe53";
+const GROUP_ADMIN_ROLE_SKILL_SHA256 = "c690127342434ae3555332207f754f84b7b41125e7d58c1e914ccfb32204b012";
 
 function pluginManifest(suffix: string) {
   return {

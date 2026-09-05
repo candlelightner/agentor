@@ -2,6 +2,12 @@
 
 Agentor can store encrypted backups in Google Drive using a separate Google OAuth client. This OAuth client is only for backups; it is unrelated to Agentor login or the agent CLI credentials used inside workers.
 
+The same connection can optionally synchronize full orchestrator
+disaster-recovery snapshots. This is a Google Drive API integration configured
+through a Google Cloud project, not a Google Cloud Storage bucket. Instance
+artifacts use a separate provider marker and restore workflow; see
+[Instance disaster recovery](instance-disaster-recovery.md).
+
 ## Before you begin
 
 - After the first backup (or after opening the recovery-key status), export the owner recovery kit through **Backup management** and preserve it securely. Keep historical kits while their backups remain.
@@ -104,6 +110,12 @@ or by widening scopes without an explicit security decision. If a different
 client must be used, explicitly make the old files available to it or choose a
 provider/recovery procedure appropriate to that client; Agentor does not
 claim that arbitrary cross-client `drive.file` recovery will work.
+
+The same limitation applies to instance disaster-recovery snapshots. A fresh
+Agentor installation can discover `agentorInstanceBackup=v1` objects without
+the old local database only when the linked account and OAuth application can
+see those objects. Agentor intentionally keeps instance and portable-worker
+queries separate, even though both use the same OAuth connection.
 
 ## Encryption formats and recovery keys
 

@@ -4,7 +4,7 @@ import { createWorker, cleanupWorker } from '../helpers/worker-lifecycle';
 import { createTestUser, deleteTestUser, type CreatedUser } from '../helpers/test-users';
 import { captureCommandOutput } from '../helpers/terminal-ws';
 
-const GLOBAL_ADMIN_ROLE_SKILL_SHA256 = '69ed7d14e06dee0c0a54139278402db01bc133b76352fc4e9b166f2fcb7049c4';
+const GLOBAL_ADMIN_ROLE_SKILL_SHA256 = '21df22e410c9ce57848ac537b801398838b1b1c97bed62a66fec91d7d78344bc';
 
 const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
 const EMPTY_AUTH = { baseURL: BASE_URL, extraHTTPHeaders: { Origin: BASE_URL }, storageState: { cookies: [], origins: [] } };

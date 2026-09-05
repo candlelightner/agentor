@@ -15,6 +15,20 @@ Per-file test counts are tracked in [`tests/TESTS.md`](../tests/TESTS.md).
 
 Unit tests (vitest) are planned but not yet implemented.
 
+Focused instance-disaster-recovery module tests use Playwright's test runner
+without browser/global server setup. They cover crypto, nested archives,
+provider selection, durable state, REST helper semantics, the asynchronous
+manager with fake dependencies, and the isolated restore helper:
+
+```bash
+cd tests
+npx playwright test --config=playwright.modules.config.ts
+```
+
+These tests never require real Google credentials; Google Drive requests are
+handled by an injected transport and cross-installation recovery uses the fake
+provider's explicitly shared account.
+
 ## Prerequisites
 
 - Node.js 22+

@@ -55,12 +55,20 @@ import {
   type OpenedManagementDownload,
 } from "./management-download-domain";
 import { useWorkerProtectionLockStore } from "./worker-protection-lock";
-import { validateManagementOwnerArguments } from "./management-owner";
+import {
+  validateInstanceBackupOwnerArgument,
+  validateManagementOwnerArguments,
+} from "./management-owner";
 import type { Readable } from "node:stream";
 import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 import { withOwnerWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
 import { ManagementPluginDomain } from "./management-plugin-domain";
 import { ManagementHostMountDomain } from "./management-host-mount-domain";
+import {
+  instanceControlPlaneBarrierKind,
+  instanceSnapshotActive,
+  instanceSnapshotJobId,
+} from "./instance-snapshot-gate";
 
 const GROUPS = [
   "read-only-status",
@@ -916,6 +924,22 @@ export class ManagementMcpStore {
           statusCode: 403,
         });
       }
+      if (
+        instanceSnapshotActive() &&
+        !toolAnnotations(name).readOnlyHint &&
+        !(
+          name === "instance-backups.cancel" &&
+          args.jobId === instanceSnapshotJobId()
+        )
+      )
+        throw Object.assign(
+          new Error(
+            instanceControlPlaneBarrierKind() === "restore"
+              ? "Agentor control-plane mutations are locked while a verified whole-instance restore is being staged and applied."
+              : "Agentor control-plane mutations are temporarily paused while a consistent instance snapshot is being created.",
+          ),
+          { statusCode: 423, code: "INSTANCE_SNAPSHOT_ACTIVE" },
+        );
       if (identity.scope === "group" && name === "workers.create") {
         // A group principal never selects an owner or group. Both are derived
         // from its live workload identity, closing owner-wide confused-deputy
@@ -962,6 +986,8 @@ export class ManagementMcpStore {
           args.parentId = identity.groupId;
       }
       await validateManagementOwnerArguments(args);
+      if (name.startsWith("instance-backups."))
+        await validateInstanceBackupOwnerArgument(args);
       if (identity.scope === "group")
         await this.authorizeGroupInvocation(identity, name, args);
       let result: unknown;
@@ -2482,7 +2508,7 @@ async function compatibleDomainArguments(
 }
 function toolAnnotations(name: string) {
   const readOnly =
-    /(?:\.list|\.inspect|\.status|\.read|list-files|validate|build-status)$/.test(
+    /(?:\.list|\.inspect|\.status|\.logs|\.preflight|\.read|list-files|validate|build-status)$/.test(
       name,
     ) ||
     name === "status.system" ||

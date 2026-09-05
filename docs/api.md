@@ -34,6 +34,23 @@ The **Worker Configuration** routes under `/api/containers/:id/configuration` ar
 
 The **Backups** API uses `/api/backups`, `/api/backup-jobs`, `/api/backup-settings`, and `/api/backup-providers`. It supports owner-scoped manual/scheduled multi-workspace jobs, cancel/retry/status, restore, retention deletion, provider status, independently linked Google OAuth, and gated fake-provider diagnostics. A running worker's readable directories can be browsed as metadata with `GET /api/containers/:id/backup-paths`; any additional absolute paths selected for a backup are explicit portable copies rather than an expansion of normal workspace-file access. The default backup payload is `/workspace` plus credential-filtered per-worker agent data; shared user Kilo config/data is excluded unless explicitly selected. `POST /api/backups/:id/restore` accepts an optional non-empty, duplicate-free `workspaceIds` subset of the artifact's workspaces; omission restores every workspace in the artifact, including artifacts created before selective restore was introduced. New-worker restores create only that selected subset and restore its captured agent-data. An original-worker restore accepts exactly one selected artifact workspace, replaces its workspace only, and requires that selected worker to be stopped, plus explicit overwrite confirmation and a transient write-only `lockPassword` when that worker is protected; it rejects artifacts with explicit extra paths. Restoring into a new worker does not mutate a source and needs no lock credential. Invalid subsets are rejected before a restore job is created. Administrators configure installation Google OAuth material through `/api/admin/backup-providers/google-oauth`; the client secret is write-only and encrypted at rest. Responses expose safe progress/errors and encrypted-token status, never lock passwords, token values, client secrets, or archive keys.
 
+Platform-admin **whole-instance disaster recovery** uses the separate
+`/api/admin/instance-backups/**` surface. It lists/starts encrypted snapshots,
+streams local artifact download or upload admission, scans/inspects/adopts
+remote-only Google Drive objects, preflights an empty recovery installation,
+and starts the staged restore. Create, scan, adoption, upload verification, and
+restore return `202` with a durable `jobId`, initial state, and concrete
+status/log/cancel endpoint objects; job logs support bounded `after`/`limit`
+reads. Stable `requestId` values deduplicate uncertain transport retries. The
+same identity is accepted as the `Idempotency-Key` header on every start route;
+when both are supplied they must match. Status responses repeat the currently
+valid next actions and stop advertising cancellation after restore helper
+handoff. The instance selector and envelope are disjoint from worker backups. These routes
+return recovery-key fingerprints/availability only; use the existing
+fresh-reauthenticated recovery-key UI to reveal/export material. See
+[Instance disaster recovery](instance-disaster-recovery.md) for the restore
+preconditions and provider limitations.
+
 The **Image catalog** API uses `/api/image-catalog`, `/api/image-builds`, and `/api/image-builder`. Definitions default to **Safe** provisioning: server-rendered packages/scripts and policy-checked commands; rejected input returns an actionable no-Docker-attempt diagnostic. **Advanced** is an explicit controlled-build boundary for arbitrary build-time shell, never host access, Docker-socket access, raw Dockerfiles, arbitrary bases, or secrets. Existing definitions without provisioning fields normalize to Safe mode; their legacy fragments remain Safe-only, while Advanced requires structured commands/scripts and an empty fragment. This is compatibility normalization rather than a database migration. Controlled builds create immutable versions and durable jobs. Start a build, compatibility-validation retry, or test-worker job with an optional stable `requestId`; retrying the same request returns its original job, while using that id for different work is rejected. Poll `GET /api/image-builds/:buildId`, fetch bounded incremental logs from `GET /api/image-builds/:buildId/logs?after=&limit=`, and cancel with `DELETE /api/image-builds/:buildId`. Build status distinguishes build failure/cancellation from compatibility `ready`, `ready-with-warnings`, `built-incompatible`, and `validation-unavailable`; only ready/warning versions pass promotion and test-worker gates. The API also provides promotion/rollback/defaults/cleanup and optional `/api/image-catalog/git/*` connection/sync/recovery. Git credentials are write-only. Fake build/Git diagnostics are test-gated.
 
 The platform **Admin workspace** API is administrator-only, including

@@ -61,6 +61,10 @@
 - `orchestrator/server/utils/resource-monitor.ts` - ResourceMonitor class (in-memory singleton poller; PER-WORKER ONLY, all via the Docker API — cpu/mem/net from dockerode `container.stats` at 3s, disk = writable layer `SizeRw` + `du` of volumes at 60s; no host metrics, no persistence)
 - `orchestrator/server/utils/worker-export.ts` - Worker export/import helpers (WorkerExportManifest type, tar bundle pack/extract, credential-stripping agents-tar filter — strips per-user OAuth creds, `.kilo/config`, `.kilo/shared-data`, and the legacy `.kilo/data/auth.json`)
 - `orchestrator/server/utils/export-job-store.ts` / `export-jobs.ts` - durable owner-scoped export metadata, bounded execution queue, progress/cancellation/restart recovery, artifact retention and cleanup
+- `orchestrator/server/utils/instance-backup-{types,crypto,bundle,store,manager}.ts` - platform-admin whole-instance disaster recovery: the `AGENTOR-INSTANCE-BACKUP-1` authenticated envelope, hardened nested bundle validation, consistent SQLite/`DATA_DIR` snapshot construction, optional Agentor-owned Docker-volume inventory/snapshot, provider discovery/adoption, durable jobs/idempotency, restore preflight, and staged helper launch. Instance and portable-worker provider selectors are intentionally separate.
+- `orchestrator/server/utils/instance-snapshot-gate.ts` / `orchestrator/server/middleware/instance-snapshot-guard.ts` - installation-wide write barrier while SQLite and JSON/Docker state are snapshotted and from restore acceptance through helper handoff; mutating HTTP/MCP and background job commits fail closed rather than introducing cross-store skew or making a preflighted destination non-empty.
+- `orchestrator/instance-restore-helper.mjs` - network-disabled one-shot restore helper copied into the orchestrator image. It validates the exact container/data-mount boundary, extracts without following archive paths, refuses volume overwrite, swaps control-plane data, optionally omits host-mount policy, records terminal job state, rolls back helper-owned changes on failure, and restarts the original orchestrator.
+- `orchestrator/server/api/admin/instance-backups/` - platform-admin REST surface for list/create, remote scan/inspect/adopt, local upload verification, artifact inspect/download/preflight/restore, and job status/incremental logs/cancel.
 - `orchestrator/server/utils/environments.ts` - EnvironmentStore class, network mode types, package manager domains list
 - `orchestrator/server/utils/worker-store.ts` - WorkerStore class (persistent worker metadata for archive/unarchive)
 - `orchestrator/server/utils/user-credentials.ts` - UserCredentialManager class (per-user OAuth credential files at `<DATA_DIR>/users/<userId>/credentials/{claude,codex,gemini}.json` — Kilo's auth moved to the shared per-user data dir `<DATA_DIR>/users/<userId>/kilo/data`), ensures dirs/files, generates per-user bind strings (including the Kilo shared-data **directory** bind), statusList + reset) + AGENT_CREDENTIAL_MAPPINGS registry
@@ -203,6 +207,7 @@
 - `orchestrator/app/composables/useUpdates.ts` - Update status polling + apply (production mode only)
 - `orchestrator/app/composables/useUsage.ts` - Agent usage status polling (60s)
 - `orchestrator/app/composables/useWorkerMetrics.ts` - Per-worker metrics polling (10s singleton; sidebar feeds each card a `metric` prop)
+- `orchestrator/app/composables/useInstanceBackups.ts` / `orchestrator/app/components/InstanceBackupManagementModal.vue` - shared persisted-job client and platform-admin disaster-recovery UI for Local/Google Drive snapshot creation, transfer/discovery/adoption, recovery-key availability, manifest inspection, preflight, explicit destructive acknowledgements, and staged restore.
 - `orchestrator/app/utils/container-name.ts` - Utility for container name display (shortName helper)
 - `orchestrator/app/utils/format.ts` - `formatBytes` / `formatRate` helpers (metrics panels + worker cards)
 - `orchestrator/app/types/index.ts` - Client-side TypeScript types: re-exports shared types (including AgentAuthType, UsageWindow, AgentUsageInfo, AgentUsageStatus, ExposeApis, CapabilityInfo, InstructionInfo, InitScriptInfo, CredentialInfo, LogLevel, LogSource, LogEntry) + defines GitProviderInfo, GitHubRepoInfo, GitHubBranchInfo, AppTypeInfo, PortMapping, DomainMapping, DomainMapperStatus, EnvironmentInfo, WorkerSystemEnvVar, ArchivedWorker, TabType, Tab, SplitDirection, PaneLeafNode, PaneContainerNode, PaneNode, DragPayload, DropZone, ChallengeType, BaseDomainConfig
@@ -227,6 +232,7 @@
 
 ## Tests
 - `tests/playwright.config.ts` - Playwright config (two projects: api + ui, parallel workers, timeouts)
+- `tests/playwright.modules.config.ts` - focused no-server Playwright config for instance-backup crypto, bundle, provider/store, and manager module tests
 - `tests/helpers/api-client.ts` - Typed API wrapper for all endpoints (returns `{ status, body }`)
 - `tests/helpers/worker-lifecycle.ts` - Container create/cleanup helpers with timeouts
 - `tests/helpers/terminal-ws.ts` - WebSocket terminal client with ANSI stripping

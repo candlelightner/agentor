@@ -21,6 +21,7 @@ const emit = defineEmits<{
   importWorker: [];
   openWorkspaceStorage: [];
   openBackupManagement: [];
+  openInstanceBackups: [];
   openImageCatalog: [];
   openAdminWorkspace: [];
   openManagementMcp: [];
@@ -583,6 +584,17 @@ function isContainerActive(
               class="size-3.5 flex-shrink-0"
             />
             Management MCP
+          </button>
+          <button
+            class="col-span-2 flex items-center justify-center gap-1.5 rounded px-1.5 py-1.5 text-xs font-semibold transition-colors hover:bg-red-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300"
+            data-testid="open-instance-backups"
+            @click="emit('openInstanceBackups')"
+          >
+            <UIcon
+              name="i-lucide-database-backup"
+              class="size-3.5 flex-shrink-0"
+            />
+            Instance disaster recovery
           </button>
         </div>
       </div>

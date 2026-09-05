@@ -48,6 +48,7 @@ const showCreateModal = ref(false);
 const showImportModal = ref(false);
 const showWorkspaceStorageModal = ref(false);
 const showBackupManagementModal = ref(false);
+const showInstanceBackupManagementModal = ref(false);
 const showImageCatalogModal = ref(false);
 const showAdminWorkspaceModal = ref(false);
 const showManagementMcpModal = ref(false);
@@ -337,6 +338,7 @@ function onCreateModalClosed() {
       @import-worker="showImportModal = true"
       @open-workspace-storage="showWorkspaceStorageModal = true"
       @open-backup-management="showBackupManagementModal = true"
+      @open-instance-backups="showInstanceBackupManagementModal = true"
       @open-image-catalog="showImageCatalogModal = true"
       @open-admin-workspace="showAdminWorkspaceModal = true"
       @open-management-mcp="showManagementMcpModal = true"
@@ -420,6 +422,10 @@ function onCreateModalClosed() {
       v-model:open="showBackupManagementModal"
       @changed="() => {}"
       @restored="() => refreshContainers()"
+    />
+    <InstanceBackupManagementModal
+      v-model:open="showInstanceBackupManagementModal"
+      @open-backup-management="showBackupManagementModal = true"
     />
     <ImageCatalogModal
       v-model:open="showImageCatalogModal"

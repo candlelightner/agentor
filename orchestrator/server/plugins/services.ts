@@ -39,6 +39,7 @@ import { BUILT_IN_PLUGINS } from "../utils/plugin-builtins";
 import { migrateAuth, getAuthDb } from "../utils/auth";
 import { cleanupWorkspaceHelpers } from "../utils/workspace-access";
 import { useBackupManager } from "../utils/backup-manager";
+import { useInstanceBackupManager } from "../utils/instance-backup-manager";
 import { useImageCatalogManager } from "../utils/image-catalog";
 import { useAdminWorkspaceStore } from "../utils/admin-workspace-store";
 import { useGroupAdminWorkspaceStore } from "../utils/group-admin-workspace-store";
@@ -46,8 +47,11 @@ import { DockerAdminWorkspaceRuntime } from "../utils/admin-workspace-runtime";
 import { useManagementMcpStore } from "../utils/management-mcp-store";
 import { ManagementMcpTransport } from "../utils/management-mcp-transport";
 import { useGitImageCatalogManager } from "../utils/git-image-manager";
+import { instanceSnapshotActive } from "../utils/instance-snapshot-gate";
 
 export default defineNitroPlugin(async (nitroApp) => {
+  const instanceRecoveryMode =
+    process.env.AGENTOR_INSTANCE_RECOVERY_MODE === "true";
   // Initialize logging infrastructure first
   const logStore = useLogStore();
   await logStore.init();
@@ -155,6 +159,7 @@ export default defineNitroPlugin(async (nitroApp) => {
     domainMappingStore.init(),
     useExportJobManager().init(),
     useBackupManager().init(),
+    useInstanceBackupManager().init(),
     useImageCatalogManager().init(),
     useGitImageCatalogManager().init(),
     useAdminWorkspaceStore().init(),
@@ -176,7 +181,9 @@ export default defineNitroPlugin(async (nitroApp) => {
   // container whose revocation guard survived a previous Docker failure or an
   // orchestrator restart. A failure remains loudly visible, but never clears
   // the durable restart guard.
-  const hostMountRecovery = await containerManager.reconcileHostMountAccess();
+  const hostMountRecovery = instanceRecoveryMode
+    ? { failures: [] }
+    : await containerManager.reconcileHostMountAccess();
   if (hostMountRecovery.failures.length)
     logger.error(
       `[agentor] ${hostMountRecovery.failures.length} worker(s) still expose revoked host mounts and could not be stopped; restart remains blocked`,
@@ -184,8 +191,12 @@ export default defineNitroPlugin(async (nitroApp) => {
   useBackupManager().setPathPersistenceAdapter(
     usePersistentBackupPathManager(),
   );
-  await containerManager.reconcileWorkers();
-  for (const worker of containerManager.list()) {
+  if (!instanceRecoveryMode) await containerManager.reconcileWorkers();
+  else
+    logger.warn(
+      "[agentor] instance recovery mode active: worker and administrative workspace startup is suspended",
+    );
+  for (const worker of instanceRecoveryMode ? [] : containerManager.list()) {
     if (
       worker.status !== "running" ||
       worker.administrativeKind ||
@@ -205,7 +216,9 @@ export default defineNitroPlugin(async (nitroApp) => {
   // validation/UI will expose the failed network instead of hiding it.
   const { useManagedNetworkManager } =
     await import("../utils/managed-network-manager");
-  for (const userId of useManagedNetworkStore().listUserIds())
+  for (const userId of instanceRecoveryMode
+    ? []
+    : useManagedNetworkStore().listUserIds())
     await useManagedNetworkManager()
       .reconcileOwner(userId)
       .catch((error) =>
@@ -234,6 +247,7 @@ export default defineNitroPlugin(async (nitroApp) => {
   await managementMcp.start(await adminRuntime.managementAddress());
   let adminIdentityTimer: NodeJS.Timeout | undefined;
   const refreshAdminIdentity = async () => {
+    if (instanceSnapshotActive()) return;
     try {
       const workspace = await adminWorkspace.ensure();
       const identity = await useManagementMcpStore().issue(workspace.id, 60);
@@ -248,9 +262,11 @@ export default defineNitroPlugin(async (nitroApp) => {
       );
     }
   };
-  await refreshAdminIdentity();
-  adminIdentityTimer = setInterval(() => void refreshAdminIdentity(), 45_000);
-  adminIdentityTimer.unref?.();
+  if (!instanceRecoveryMode) {
+    await refreshAdminIdentity();
+    adminIdentityTimer = setInterval(() => void refreshAdminIdentity(), 45_000);
+    adminIdentityTimer.unref?.();
+  }
 
   // Mappings survive stop/archive/unarchive/rebuild, so the cleanup set
   // includes BOTH active containers and archived workers (matched by containerName).
@@ -357,6 +373,9 @@ export default defineNitroPlugin(async (nitroApp) => {
     } catch {}
     try {
       useBackupManager().stop();
+    } catch {}
+    try {
+      useInstanceBackupManager().stop();
     } catch {}
     try {
       if (adminIdentityTimer) clearInterval(adminIdentityTimer);

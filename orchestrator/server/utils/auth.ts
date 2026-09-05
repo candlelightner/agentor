@@ -291,6 +291,18 @@ export function getUserById(userId: string): { name: string; email: string } | n
   return { name: row.name ?? '', email: row.email ?? '' };
 }
 
+/** Returns whether the authoritative Better Auth record is a platform admin.
+ * Kept separate from getUserById so ordinary identity lookups do not start
+ * carrying authorization data that callers might accidentally cache. */
+export function isPlatformAdminUser(userId: string): boolean {
+  if (!userId) return false;
+  const db = getAuthDb();
+  const row = db.prepare('SELECT role FROM user WHERE id = ?').get(userId) as
+    | { role?: string | null }
+    | undefined;
+  return row?.role === 'admin';
+}
+
 export interface CredentialSummary {
   hasPassword: boolean;
   passkeyCount: number;

@@ -155,6 +155,33 @@ test.describe.serial("Internal management MCP security", () => {
     }
   });
 
+  test("whole-instance backup MCP accepts only an administrator recovery owner", async ({
+    request,
+  }) => {
+    expect(
+      (
+        await request.put("/api/admin/management-mcp/policy", {
+          data: { groups: { backups: true } },
+        })
+      ).status(),
+    ).toBe(200);
+
+    const denied = await invoke(request, credential, "instance-backups.list", {
+      ownerId: regular.id,
+    });
+    expect(denied.status()).toBe(403);
+    expect(await body(denied)).toMatchObject({
+      statusMessage: expect.stringContaining("platform-administrator"),
+    });
+
+    const session = await (await request.get("/api/auth/get-session")).json();
+    const allowed = await invoke(request, credential, "instance-backups.list", {
+      ownerId: session.user.id,
+    });
+    expect(allowed.status(), await allowed.text()).toBe(200);
+    expect(JSON.stringify(await allowed.json())).not.toContain("recoveryKey");
+  });
+
   test("global-admin MCP restores only the selected member of a multi-workspace backup", { timeout: 360_000 }, async ({ request }) => {
     const api = new ApiClient(regularCtx);
     const second = await createWorker(regularCtx, {

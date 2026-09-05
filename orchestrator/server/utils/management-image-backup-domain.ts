@@ -1,5 +1,6 @@
 import { useImageCatalogManager } from "./image-catalog";
 import { useBackupManager } from "./backup-manager";
+import { useInstanceBackupManager } from "./instance-backup-manager";
 import { useGitImageCatalogManager } from "./git-image-manager";
 import { useContainerManager, usePluginDefinitionStore } from "./services";
 import { useGroupAdminWorkspaceStore } from "./group-admin-workspace-store";
@@ -217,6 +218,72 @@ export class ManagementImageBackupDomain {
         "Restore all workspaces in an existing backup, or an exact non-empty workspaceIds subset, as new workers. Explicit selected paths are restored to their original absolute locations. Original-worker restore rejects such artifacts with a prompt 409. Returns a durable job and next actions.",
         mut,
       ],
+      [
+        "instance-backups.list",
+        "backups",
+        "List whole-instance disaster-recovery jobs, verified artifacts, and remotely discovered instance backups. ownerId must identify a platform administrator. Raw recovery keys and provider credentials are never returned.",
+        ro,
+      ],
+      [
+        "instance-backups.create",
+        "backups",
+        "Persist and start an asynchronous encrypted whole-instance backup in a platform-administrator recovery namespace. All workspaces must be stopped. The result names the exact status, logs, and cancellation tools.",
+        mut,
+      ],
+      [
+        "instance-backups.discovery.start",
+        "backups",
+        "Persist and start an asynchronous scan for instance DR objects using the selected connected provider, including Google Drive.",
+        mut,
+      ],
+      [
+        "instance-backups.discovery.list",
+        "backups",
+        "List remotely discovered whole-instance backup objects and safe key-availability state.",
+        ro,
+      ],
+      [
+        "instance-backups.inspect",
+        "backups",
+        "Inspect safe authenticated or discovery metadata for one whole-instance backup.",
+        ro,
+      ],
+      [
+        "instance-backups.preflight",
+        "backups",
+        "Inspect whole-instance restore blockers, volume conflicts, and external dependencies without changing the installation.",
+        ro,
+      ],
+      [
+        "instance-backups.adopt",
+        "backups",
+        "Start asynchronous download, decryption, nested-archive validation, and local adoption of a discovered instance backup.",
+        mut,
+      ],
+      [
+        "instance-backups.restore",
+        "backups",
+        "Persist and start a staged whole-instance restore after explicit control-plane replacement and external-dependency confirmations. The result names the exact status, logs, and cancellation tools.",
+        { ...mut, destructiveHint: true },
+      ],
+      [
+        "instance-backups.status",
+        "backups",
+        "Poll persisted whole-instance backup job state idempotently.",
+        ro,
+      ],
+      [
+        "instance-backups.logs",
+        "backups",
+        "Read a bounded incremental page of sanitized whole-instance backup logs.",
+        ro,
+      ],
+      [
+        "instance-backups.cancel",
+        "backups",
+        "Cancel a queued or active whole-instance backup operation.",
+        { ...mut, destructiveHint: true },
+      ],
     ].map(([name, group, description, annotations]) => ({
       name: name as string,
       group: group as "images" | "backups",
@@ -248,6 +315,8 @@ export class ManagementImageBackupDomain {
     }
     if (name.startsWith("images."))
       return { handled: true, result: await this.images(name, args) };
+    if (name.startsWith("instance-backups."))
+      return { handled: true, result: await this.instanceBackups(name, args) };
     return { handled: true, result: await this.backups(name, args) };
   }
   private async images(name: string, a: Record<string, unknown>): Promise<any> {
@@ -489,6 +558,91 @@ export class ManagementImageBackupDomain {
       return backupAccepted(await manager.retry(job), owner);
     throw fail(400, "Unknown backup tool");
   }
+
+  private async instanceBackups(
+    name: string,
+    a: Record<string, unknown>,
+  ): Promise<any> {
+    const manager = useInstanceBackupManager();
+    await manager.init();
+    const owner = required(a.ownerId, "ownerId");
+    if (name === "instance-backups.list")
+      return sanitize(await manager.list(owner));
+    if (name === "instance-backups.discovery.list")
+      return sanitize((await manager.list(owner)).remoteBackups);
+    if (name === "instance-backups.inspect") {
+      if (typeof a.remoteBackupId === "string" && a.remoteBackupId) {
+        const remote = await manager.getRemote(a.remoteBackupId);
+        if (!remote || remote.userId !== owner)
+          throw fail(404, "Remote instance backup not found");
+        return sanitize(remote);
+      }
+      const artifact = await manager.getArtifact(
+        required(a.artifactId, "artifactId"),
+      );
+      if (!artifact || artifact.userId !== owner)
+        throw fail(404, "Instance backup artifact not found");
+      return sanitize(artifact);
+    }
+    if (name === "instance-backups.preflight")
+      return sanitize(
+        await manager.restorePreflight(
+          owner,
+          required(a.artifactId, "artifactId"),
+          instanceRestoreOptions(a.options),
+        ),
+      );
+    if (name === "instance-backups.create")
+      return instanceBackupAccepted(
+        await manager.create(
+          owner,
+          backupProvider(a.providerId),
+          instanceBackupOptions(a.options),
+          string(a.requestId),
+        ),
+        owner,
+      );
+    if (name === "instance-backups.discovery.start")
+      return instanceBackupAccepted(
+        await manager.discover(
+          owner,
+          backupProvider(a.providerId) ?? "google-drive",
+          string(a.requestId),
+        ),
+        owner,
+      );
+    if (name === "instance-backups.adopt")
+      return instanceBackupAccepted(
+        await manager.adopt(
+          owner,
+          required(a.remoteBackupId, "remoteBackupId"),
+          string(a.requestId),
+        ),
+        owner,
+      );
+    if (name === "instance-backups.restore")
+      return instanceBackupAccepted(
+        await manager.restore(
+          owner,
+          required(a.artifactId, "artifactId"),
+          instanceRestoreOptions(a.options),
+          string(a.requestId),
+        ),
+        owner,
+      );
+    const job = await manager.getJob(required(a.jobId, "jobId"));
+    if (!job || job.userId !== owner)
+      throw fail(404, "Instance backup job not found");
+    if (name === "instance-backups.status")
+      return instanceBackupStatus(job, owner);
+    if (name === "instance-backups.logs")
+      return sanitize(
+        await manager.logs(job.id, number(a.after, 0), limit(a.limit)),
+      );
+    if (name === "instance-backups.cancel")
+      return sanitize(await manager.cancel(job.id));
+    throw fail(400, "Unknown instance backup tool");
+  }
 }
 function backupProvider(value: unknown): BackupProviderKind | undefined {
   if (value === undefined) return undefined;
@@ -588,6 +742,18 @@ function imageResolutions(value: unknown) {
       continue;
     throw fail(400, "imageResolutions contains an invalid resolution");
   }
+  return value as any;
+}
+function instanceBackupOptions(value: unknown) {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw fail(400, "options must be an object");
+  return value as any;
+}
+function instanceRestoreOptions(value: unknown) {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw fail(400, "options must be an object");
   return value as any;
 }
 function fail(statusCode: number, message: string) {
@@ -767,6 +933,55 @@ function backupStatus(job: any, ownerId: string) {
         ? { retry: { tool: "backups.retry", arguments: arguments_ } }
         : {}),
       ...imageRecoveryBuildActions(job),
+    },
+  });
+}
+function instanceBackupAccepted(result: any, ownerId: string) {
+  if (result?.alreadyAdopted) return sanitize(result);
+  const jobId = typeof result?.id === "string" ? result.id : result?.jobId;
+  if (!jobId) return sanitize(result);
+  const arguments_ = { ownerId, jobId };
+  const active = result.status === "queued" || result.status === "running";
+  const cancellable =
+    active && !(result.operation === "restore" && result.phase === "applying");
+  return sanitize({
+    ...result,
+    accepted: true,
+    jobId,
+    message:
+      result.message ||
+      ({
+        create: "Instance backup started",
+        discovery: "Instance backup discovery started",
+        adoption: "Instance backup adoption started",
+        verify: "Instance backup verification started",
+        restore: "Instance restore started",
+      } as Record<string, string>)[String(result.operation)] ||
+      "Instance backup operation started",
+    nextActions: {
+      status: { tool: "instance-backups.status", arguments: arguments_ },
+      logs: { tool: "instance-backups.logs", arguments: arguments_ },
+      ...(cancellable
+        ? { cancel: { tool: "instance-backups.cancel", arguments: arguments_ } }
+        : {}),
+    },
+  });
+}
+function instanceBackupStatus(job: any, ownerId: string) {
+  const jobId = typeof job?.id === "string" ? job.id : undefined;
+  if (!jobId) return sanitize(job);
+  const arguments_ = { ownerId, jobId };
+  const active = job.status === "queued" || job.status === "running";
+  const cancellable =
+    active && !(job.operation === "restore" && job.phase === "applying");
+  return sanitize({
+    ...job,
+    nextActions: {
+      status: { tool: "instance-backups.status", arguments: arguments_ },
+      logs: { tool: "instance-backups.logs", arguments: arguments_ },
+      ...(cancellable
+        ? { cancel: { tool: "instance-backups.cancel", arguments: arguments_ } }
+        : {}),
     },
   });
 }
@@ -998,6 +1213,22 @@ function catalogSchema(name: string): Record<string, unknown> {
       description:
         "Caller-supplied durable request identity. Retrying the same accepted request returns the original job rather than starting duplicate work.",
     },
+    providerId: {
+      type: "string",
+      enum: ["local", "fake", "google-drive"],
+    },
+    remoteBackupId: { type: "string", minLength: 1 },
+    options: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        includeWorkers: { type: "boolean", default: true },
+        includeAgentData: { type: "boolean", default: true },
+        includeDockerVolumes: { type: "boolean", default: true },
+        includeLocalBackups: { type: "boolean", default: false },
+        includeLogs: { type: "boolean", default: false },
+      },
+    },
     builder: { type: "string", enum: ["controlled", "fake"] },
     system: { type: "boolean" },
     direction: {
@@ -1024,6 +1255,46 @@ function catalogSchema(name: string): Record<string, unknown> {
         "Optional immutable GHCR references keyed by the matching built digest.",
     },
   };
+  if (
+    name === "instance-backups.preflight" ||
+    name === "instance-backups.restore"
+  )
+    p.options = {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        restoreDockerVolumes: {
+          type: "boolean",
+          default: true,
+          description:
+            "Restore the Agentor-owned Docker volumes embedded in the bundle. Existing destination volumes are never overwritten.",
+        },
+        restoreHostMountPolicies: {
+          type: "boolean",
+          default: false,
+          description:
+            "Restore host-mount allowlists and grants. External host contents are not embedded and must be prepared separately.",
+        },
+        confirmReplaceControlPlane: {
+          type: "boolean",
+          description:
+            "For restore, must be true to acknowledge replacement of the destination control-plane data.",
+        },
+        confirmExternalDependencies: {
+          type: "boolean",
+          description:
+            "For restore, must be true to acknowledge that environment values, external secret files, image layers, and selected host data have been prepared separately.",
+        },
+      },
+      ...(name === "instance-backups.restore"
+        ? {
+            required: [
+              "confirmReplaceControlPlane",
+              "confirmExternalDependencies",
+            ],
+          }
+        : {}),
+    };
   let r = ["ownerId"];
   if (name === "images.create" || name === "images.validate")
     r = ["ownerId", "definition"];
@@ -1055,6 +1326,22 @@ function catalogSchema(name: string): Record<string, unknown> {
     r = ["ownerId", "jobId"];
   else if (["backups.delete", "backups.restore"].includes(name))
     r = ["ownerId", "artifactId"];
+  else if (
+    [
+      "instance-backups.status",
+      "instance-backups.logs",
+      "instance-backups.cancel",
+    ].includes(name)
+  )
+    r = ["ownerId", "jobId"];
+  else if (name === "instance-backups.adopt")
+    r = ["ownerId", "remoteBackupId"];
+  else if (
+    name === "instance-backups.preflight" ||
+    name === "instance-backups.restore"
+  )
+    r = ["ownerId", "artifactId"];
+  else if (name === "instance-backups.inspect") r = ["ownerId"];
   return {
     type: "object",
     additionalProperties: false,

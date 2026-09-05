@@ -22,6 +22,9 @@ FROM node:22-alpine
 WORKDIR /app
 RUN apk add --no-cache pigz
 COPY --from=builder /app/.output/ .output/
+# Kept outside the Nitro request process on purpose: a short-lived,
+# network-disabled helper uses it to stop/apply/restart an instance restore.
+COPY --from=builder /app/instance-restore-helper.mjs .output/server/instance-restore-helper.mjs
 
 EXPOSE 3000
 

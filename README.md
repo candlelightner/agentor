@@ -42,6 +42,7 @@ All agents are installed in a single unified worker image. Start any agent via i
 - **Durable worker export/import** — background jobs with progress, cancellation, expiry, and browser-streamed downloads produce portable `.tar` bundles; workspace-only is fast/default and advanced rootfs capture uses parallel level-1 gzip to avoid the historical single-core compression timeout, with legacy and transitional bundle import compatibility
 - **Storage visibility and cleanup** — administrator disk inventory covers workspace, images, cache, staging, and helpers, with conservative cleanup that preserves referenced images, active jobs, workspaces, and retained artifacts
 - **Encrypted backup and restore** — manual or exact-minute scheduled multi-workspace backups, retention, retry/resume/cancel, integrity verification, retroactive per-worker selection from existing multi-workspace artifacts, safe original/new-worker restore, local/fake providers, and independently linked Google Drive OAuth (administrator-configured in the dashboard with a write-only encrypted client secret)
+- **Whole-instance disaster recovery** — platform-admin encrypted snapshots combine a consistent `auth.db` backup, versioned `DATA_DIR` state (including image/template/plugin catalogs and desired plugin installations), and optional Agentor-owned Docker volumes; snapshots can be downloaded or synchronized through Google Drive, discovered/adopted on an empty installation, preflighted, and applied by a rollback-capable helper. Host files, deployment secrets, and Docker image layers remain explicit external dependencies; see [Instance disaster recovery](docs/instance-disaster-recovery.md)
 - **Google Drive backup setup** — follow the [step-by-step OAuth guide](docs/google-drive-backups.md) to configure the Google Cloud client, link an account, and verify recovery
 - **Controlled custom images** — approved-base Dockerfile fragments and bounded uploaded contexts build asynchronously into immutable digest-pinned catalog versions with test workers, promotion/rollback, defaults, usage cleanup, and worker selection
 - **Git-backed image recovery** — optional public/private GitHub catalog sync with conflict preservation, fine-grained PAT or short-lived GitHub App authentication, branch/PR workflows, Actions dispatch, and immutable GHCR recovery references
@@ -58,6 +59,12 @@ All agents are installed in a single unified worker image. Start any agent via i
 The internal administrative MCP's current UI/API parity, intentional secret and
 streaming boundaries, capability policy, and remaining gaps are documented in
 [Management MCP parity](docs/management-mcp-parity.md).
+
+Whole-instance backup creation, Google Drive discovery/adoption, verification,
+restore preflight, and staged restore are also available through the
+platform-management MCP as durable asynchronous jobs. Recovery-key reveal and
+export remain fresh-reauthenticated human actions. See
+[Instance disaster recovery](docs/instance-disaster-recovery.md).
 
 ---
 

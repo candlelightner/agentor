@@ -5,7 +5,10 @@ import { pipeline } from "node:stream/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { Readable, Transform } from "node:stream";
 import { assertSafePathId, assertSafeUserId } from "./user-id";
-import type { RemoteBackupDescriptor } from "./backup-types";
+import type {
+  BackupArtifactKind,
+  RemoteBackupDescriptor,
+} from "./backup-types";
 
 export type BackupHttpTransport = (
   input: string | URL | Request,
@@ -23,6 +26,7 @@ export interface UploadResult {
  * discovery hint, never a substitute for decrypting and validating the
  * archive. */
 export interface BackupUploadMetadata {
+  artifactKind?: BackupArtifactKind;
   artifactId?: string;
   formatVersion?: number;
   keyFingerprint?: string;
@@ -67,12 +71,16 @@ function validFormat(value: unknown): value is number {
 function validArtifactId(value: unknown): value is string {
   try { assertSafePathId(value, "artifactId"); return true; } catch { return false; }
 }
+function validArtifactKind(value: unknown): value is BackupArtifactKind {
+  return value === "worker" || value === "instance";
+}
 /** Reject rather than pass through provider-controlled fields. */
 export function normalizeRemoteBackupDescriptor(value: unknown): RemoteBackupDescriptor | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return;
   const raw = value as Record<string, unknown>;
   if (!validOpaqueId(raw.objectId) || typeof raw.size !== "number" || !Number.isSafeInteger(raw.size) || raw.size < 0) return;
   if (raw.createdAt !== undefined && !validTimestamp(raw.createdAt)) return;
+  if (raw.artifactKind !== undefined && !validArtifactKind(raw.artifactKind)) return;
   if (raw.artifactId !== undefined && !validArtifactId(raw.artifactId)) return;
   if (raw.formatVersion !== undefined && !validFormat(raw.formatVersion)) return;
   if (raw.keyFingerprint !== undefined && !validFingerprint(raw.keyFingerprint)) return;
@@ -80,6 +88,7 @@ export function normalizeRemoteBackupDescriptor(value: unknown): RemoteBackupDes
   if (raw.incomplete !== undefined && typeof raw.incomplete !== "boolean") return;
   return {
     objectId: raw.objectId, size: raw.size,
+    ...(raw.artifactKind !== undefined ? { artifactKind: raw.artifactKind } : {}),
     ...(raw.createdAt !== undefined ? { createdAt: raw.createdAt } : {}),
     ...(raw.artifactId !== undefined ? { artifactId: raw.artifactId } : {}),
     ...(raw.formatVersion !== undefined ? { formatVersion: raw.formatVersion } : {}),
@@ -407,11 +416,19 @@ export interface BackupProvider {
   /** Provider-neutral bounded discovery and header read. Remote results are
    * untrusted input and must be adopted/verified by BackupManager later. */
   discover?(userId: string, cursor?: string, signal?: AbortSignal): Promise<BackupDiscoveryPage>;
+  /** Instance disaster-recovery artifacts use an independent provider selector
+   * so they can never be mistaken for portable worker backups. */
+  discoverInstances?(userId: string, cursor?: string, signal?: AbortSignal): Promise<BackupDiscoveryPage>;
   readRange?(userId: string, objectId: string, length: number, signal?: AbortSignal): Promise<Buffer>;
   /** Reconcile an upload that committed remotely before its opaque object id
    * could be persisted locally. Providers with non-deterministic ids can use
    * the stable Agentor artifact id embedded in object metadata. */
-  deleteByArtifactId?(userId: string, artifactId: string, signal?: AbortSignal): Promise<void>;
+  deleteByArtifactId?(
+    userId: string,
+    artifactId: string,
+    signal?: AbortSignal,
+    artifactKind?: BackupArtifactKind,
+  ): Promise<void>;
   abortUpload?(
     userId: string,
     uploadId: string,
@@ -568,6 +585,12 @@ export class FakeBackupProvider implements BackupProvider {
     );
   }
   async discover(userId: string, cursor?: string, signal?: AbortSignal): Promise<BackupDiscoveryPage> {
+    return this.discoverKind(userId, "worker", cursor, signal);
+  }
+  async discoverInstances(userId: string, cursor?: string, signal?: AbortSignal): Promise<BackupDiscoveryPage> {
+    return this.discoverKind(userId, "instance", cursor, signal);
+  }
+  private async discoverKind(userId: string, artifactKind: BackupArtifactKind, cursor?: string, signal?: AbortSignal): Promise<BackupDiscoveryPage> {
     signal?.throwIfAborted();
     assertSafeUserId(userId);
     if (cursor !== undefined) throw Object.assign(new Error("Invalid backup discovery cursor"), { statusCode: 400 });
@@ -581,7 +604,8 @@ export class FakeBackupProvider implements BackupProvider {
       const info = await lstat(this.path(userId, objectId));
       if (!info.isFile() || info.isSymbolicLink()) continue;
       const metadata = await readSidecarMetadata(this.metadataPath(userId, objectId));
-      records.push(normalizeRemoteBackupDescriptor({ objectId, size: info.size, createdAt: metadata?.createdAt ?? info.mtime.toISOString(), artifactId: metadata?.artifactId ?? objectId, formatVersion: metadata?.formatVersion ?? 1, keyFingerprint: metadata?.keyFingerprint, integritySha256: metadata?.integritySha256, incomplete: metadata?.incomplete })!);
+      if ((metadata?.artifactKind ?? "worker") !== artifactKind) continue;
+      records.push(normalizeRemoteBackupDescriptor({ objectId, size: info.size, artifactKind, createdAt: metadata?.createdAt ?? info.mtime.toISOString(), artifactId: metadata?.artifactId ?? objectId, formatVersion: metadata?.formatVersion ?? 1, keyFingerprint: metadata?.keyFingerprint, integritySha256: metadata?.integritySha256, incomplete: metadata?.incomplete })!);
     }
     return { records };
   }
@@ -667,6 +691,12 @@ export class LocalBackupProvider implements BackupProvider {
     signal?.throwIfAborted();
   }
   async discover(userId: string, cursor?: string, signal?: AbortSignal): Promise<BackupDiscoveryPage> {
+    return this.discoverKind(userId, "worker", cursor, signal);
+  }
+  async discoverInstances(userId: string, cursor?: string, signal?: AbortSignal): Promise<BackupDiscoveryPage> {
+    return this.discoverKind(userId, "instance", cursor, signal);
+  }
+  private async discoverKind(userId: string, artifactKind: BackupArtifactKind, cursor?: string, signal?: AbortSignal): Promise<BackupDiscoveryPage> {
     signal?.throwIfAborted(); assertSafeUserId(userId);
     if (cursor !== undefined) throw Object.assign(new Error("Invalid backup discovery cursor"), { statusCode: 400 });
     let names: string[] = [];
@@ -679,7 +709,8 @@ export class LocalBackupProvider implements BackupProvider {
       const info = await lstat(this.path(userId, objectId));
       if (info.isFile() && !info.isSymbolicLink()) {
         const metadata = await readSidecarMetadata(this.metadataPath(userId, objectId));
-        records.push(normalizeRemoteBackupDescriptor({ objectId, size: info.size, createdAt: metadata?.createdAt ?? info.mtime.toISOString(), artifactId: metadata?.artifactId ?? objectId, formatVersion: metadata?.formatVersion ?? 1, keyFingerprint: metadata?.keyFingerprint, integritySha256: metadata?.integritySha256, incomplete: metadata?.incomplete })!);
+        if ((metadata?.artifactKind ?? "worker") !== artifactKind) continue;
+        records.push(normalizeRemoteBackupDescriptor({ objectId, size: info.size, artifactKind, createdAt: metadata?.createdAt ?? info.mtime.toISOString(), artifactId: metadata?.artifactId ?? objectId, formatVersion: metadata?.formatVersion ?? 1, keyFingerprint: metadata?.keyFingerprint, integritySha256: metadata?.integritySha256, incomplete: metadata?.incomplete })!);
       }
     }
     return { records };
@@ -842,10 +873,19 @@ export class GoogleDriveBackupProvider implements BackupProvider {
       }
       if (!session) {
         const safeMetadata = checkedUploadMetadata(metadata);
+        const instanceArtifact = safeMetadata?.artifactKind === "instance";
         const driveMetadata: Record<string, unknown> = {
-          name: `agentor-${artifactId}.backup`,
+          name: instanceArtifact
+            ? `agentor-instance-${artifactId}.backup`
+            : `agentor-${artifactId}.backup`,
           appProperties: {
-            agentorBackup: safeMetadata?.formatVersion === 2 ? "v2" : "v1",
+            ...(instanceArtifact
+              ? { agentorInstanceBackup: "v1", artifactKind: "instance" }
+              : {
+                  agentorBackup:
+                    safeMetadata?.formatVersion === 2 ? "v2" : "v1",
+                  artifactKind: "worker",
+                }),
             artifactId,
             ...(safeMetadata?.formatVersion ? { formatVersion: String(safeMetadata.formatVersion) } : {}),
             ...(safeMetadata?.keyFingerprint ? { keyFingerprint: safeMetadata.keyFingerprint } : {}),
@@ -1002,12 +1042,20 @@ export class GoogleDriveBackupProvider implements BackupProvider {
     }
   }
   async discover(userId: string, cursor?: string, signal?: AbortSignal): Promise<BackupDiscoveryPage> {
+    return this.discoverKind(userId, "worker", cursor, signal);
+  }
+  async discoverInstances(userId: string, cursor?: string, signal?: AbortSignal): Promise<BackupDiscoveryPage> {
+    return this.discoverKind(userId, "instance", cursor, signal);
+  }
+  private async discoverKind(userId: string, artifactKind: BackupArtifactKind, cursor?: string, signal?: AbortSignal): Promise<BackupDiscoveryPage> {
     if (cursor !== undefined && (!validOpaqueId(cursor) || cursor.length > 1024))
       throw Object.assign(new Error("Invalid backup discovery cursor"), { statusCode: 400 });
     const access = await this.access(userId, signal);
-    // `agentorBackup` is the only trusted selector. Names and every returned
-    // field remain untrusted until bounded validation below.
-    const query = "(appProperties has { key='agentorBackup' and value='v1' } or appProperties has { key='agentorBackup' and value='v2' }) and trashed = false";
+    // The app-property selector separates whole-instance DR objects from
+    // portable worker backups. Names and every returned field remain untrusted.
+    const query = artifactKind === "instance"
+      ? "appProperties has { key='agentorInstanceBackup' and value='v1' } and trashed = false"
+      : "(appProperties has { key='agentorBackup' and value='v1' } or appProperties has { key='agentorBackup' and value='v2' }) and trashed = false";
     const params = new URLSearchParams({
       q: `(${query})`, pageSize: String(MAX_REMOTE_DESCRIPTOR_COUNT),
       fields: "nextPageToken,files(id,size,createdTime,appProperties)",
@@ -1024,15 +1072,19 @@ export class GoogleDriveBackupProvider implements BackupProvider {
     const records: RemoteBackupDescriptor[] = [];
     for (const file of body.files) {
       const props = file?.appProperties;
-      if (!props || typeof props !== "object" || Array.isArray(props) || (props.agentorBackup !== "v1" && props.agentorBackup !== "v2")) continue;
+      if (!props || typeof props !== "object" || Array.isArray(props)) continue;
+      if (artifactKind === "instance") {
+        if (props.agentorInstanceBackup !== "v1") continue;
+      } else if (props.agentorBackup !== "v1" && props.agentorBackup !== "v2") continue;
       const incomplete = props.incomplete;
       if (incomplete !== undefined && incomplete !== "true" && incomplete !== "false") continue;
       const descriptor = normalizeRemoteBackupDescriptor({
         objectId: file.id,
         size: typeof file.size === "string" ? Number(file.size) : file.size,
+        artifactKind,
         createdAt: file.createdTime,
         artifactId: props.artifactId,
-        formatVersion: props.formatVersion === undefined ? (props.agentorBackup === "v2" ? 2 : 1) : Number(props.formatVersion),
+        formatVersion: props.formatVersion === undefined ? (artifactKind === "worker" && props.agentorBackup === "v2" ? 2 : 1) : Number(props.formatVersion),
         keyFingerprint: props.keyFingerprint,
         integritySha256: props.integritySha256,
         incomplete: incomplete === undefined ? undefined : incomplete === "true",
@@ -1096,10 +1148,19 @@ export class GoogleDriveBackupProvider implements BackupProvider {
     if (!response.ok && response.status !== 404)
       throw await googleResponseFailure(response, "backup deletion");
   }
-  async deleteByArtifactId(userId: string, artifactId: string, signal?: AbortSignal): Promise<void> {
+  async deleteByArtifactId(
+    userId: string,
+    artifactId: string,
+    signal?: AbortSignal,
+    artifactKind: BackupArtifactKind = "worker",
+  ): Promise<void> {
     assertSafePathId(artifactId, "artifactId");
     const access = await this.access(userId, signal);
-    const query = `appProperties has { key='artifactId' and value='${artifactId}' } and trashed = false`;
+    const marker =
+      artifactKind === "instance"
+        ? "appProperties has { key='agentorInstanceBackup' and value='v1' }"
+        : "(appProperties has { key='agentorBackup' and value='v1' } or appProperties has { key='agentorBackup' and value='v2' })";
+    const query = `appProperties has { key='artifactId' and value='${artifactId}' } and ${marker} and trashed = false`;
     const response = await this.transport(
       `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)&pageSize=100`,
       { signal, headers: { Authorization: `Bearer ${access}` } },

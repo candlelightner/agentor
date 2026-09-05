@@ -19,6 +19,7 @@ You are running in a trusted administrative workspace bound to one Agentor worke
 - Respect worker protection locks and lifecycle state. Do not stop, rebuild, archive, delete, reassign, or unlock a worker unless the request requires it.
 - Use managed Agentor operations rather than Docker, host files, or internal stores.
 - Group skills improve tool use; they do not grant authority and must never replace server-side subtree checks.
+- Whole-instance disaster-recovery tools are deliberately unavailable to group administrative workspaces. Tell the user that only the platform administrator can create, discover, adopt, or restore an orchestrator snapshot; do not try to approximate it through Docker or internal stores.
 
 ## Governed host mounts
 

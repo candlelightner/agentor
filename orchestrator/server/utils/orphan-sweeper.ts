@@ -1,4 +1,5 @@
 import { getAuthDb } from './auth';
+import { instanceSnapshotActive } from './instance-snapshot-gate';
 import type { UserEnvVarStore } from './user-env-store';
 import type { UserCredentialManager } from './user-credentials';
 import type { UsageChecker } from './usage-checker';
@@ -37,6 +38,7 @@ export function withDeletedOwnerCleanupFence(
  * better-auth's body parsing on the delete-user endpoint. */
 export class OrphanSweeper {
   private timer: ReturnType<typeof setInterval> | null = null;
+  private sweepInFlight?: Promise<void>;
   private preCleanupHooks: Array<(userId: string) => Promise<void>> = [];
   private lifecycleCleanupHooks: Array<(userId: string) => Promise<void>> = [];
   private cleanupHooks: Array<(userId: string) => Promise<void>> = [];
@@ -81,7 +83,21 @@ export class OrphanSweeper {
     }
   }
 
-  async sweep(): Promise<void> {
+  sweep(): Promise<void> {
+    if (instanceSnapshotActive()) return Promise.resolve();
+    if (this.sweepInFlight) return this.sweepInFlight;
+    const task = this.doSweep().finally(() => {
+      if (this.sweepInFlight === task) this.sweepInFlight = undefined;
+    });
+    this.sweepInFlight = task;
+    return task;
+  }
+
+  hasActiveOperationsForInstanceSnapshot(): boolean {
+    return Boolean(this.sweepInFlight);
+  }
+
+  private async doSweep(): Promise<void> {
     const existingIds = new Set<string>();
     try {
       const rows = getAuthDb().prepare('SELECT id FROM user').all() as { id: string }[];

@@ -2,7 +2,10 @@ import { expect, test } from "@playwright/test";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { validateManagementOwnerArguments } from "../../orchestrator/server/utils/management-owner";
+import {
+  validateInstanceBackupOwnerArgument,
+  validateManagementOwnerArguments,
+} from "../../orchestrator/server/utils/management-owner";
 import { UserEnvVarStore } from "../../orchestrator/server/utils/user-env-store";
 import { UserScopedJsonStore } from "../../orchestrator/server/utils/user-scoped-store";
 import { BackupStore } from "../../orchestrator/server/utils/backup-store";
@@ -23,6 +26,21 @@ test("management owner selectors allow real cross-user administration", async ()
   await expect(
     validateManagementOwnerArguments({ ownerId: "missing-owner" }, exists),
   ).rejects.toMatchObject({ statusCode: 404 });
+});
+
+test("whole-instance recovery namespaces require a platform-admin owner", async () => {
+  const admins = new Set(["admin-owner"]);
+  const isAdmin = (id: string) => admins.has(id);
+
+  await expect(
+    validateInstanceBackupOwnerArgument({ ownerId: "admin-owner" }, isAdmin),
+  ).resolves.toBeUndefined();
+  await expect(
+    validateInstanceBackupOwnerArgument({ ownerId: "ordinary-owner" }, isAdmin),
+  ).rejects.toMatchObject({ statusCode: 403 });
+  await expect(
+    validateInstanceBackupOwnerArgument({}, isAdmin),
+  ).resolves.toBeUndefined();
 });
 
 test("management audit redacts backup provider upload and cleanup handles", () => {

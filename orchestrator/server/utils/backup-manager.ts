@@ -101,6 +101,7 @@ import { resolveWorkerReconstruction } from "./worker-reconstruction";
 import { readPortablePluginConfiguration } from "./plugin-portability";
 import { backupInstallationId } from "./backup-installation";
 import { pluginDefinitionHash } from "./plugin-manifest";
+import { instanceSnapshotActive } from "./instance-snapshot-gate";
 
 interface RestoreExecution {
   controller: AbortController;
@@ -282,6 +283,23 @@ export class BackupManager {
   async getConfig(userId: string) {
     await this.init();
     return this.store.get(userId).config;
+  }
+  async hasActiveOperationsForInstanceSnapshot(): Promise<boolean> {
+    await this.init();
+    return (
+      this.active > 0 ||
+      this.pending.length > 0 ||
+      this.activeTasks.size > 0 ||
+      this.restoreExecutions.size > 0 ||
+      Boolean(this.tickInFlight) ||
+      this.store
+        .all()
+        .some((data) =>
+          data.jobs.some(
+            (job) => job.status === "queued" || job.status === "running",
+          ),
+        )
+    );
   }
   ownerIds() {
     return this.store.userIds();
@@ -845,6 +863,28 @@ export class BackupManager {
     await this.init();
     this.assertOwnerAvailable(userId);
     return this.keyring.exportKit(userId, fingerprint);
+  }
+
+  /** Server-internal bridge for whole-instance disaster recovery. Raw recovery
+   * material must never be returned by an HTTP or MCP status tool. Keeping the
+   * lookup on this manager also avoids two keyring instances racing writes. */
+  async resolveInstanceRecoveryMaterial(
+    userId: string,
+    fingerprint?: string,
+  ): Promise<{ fingerprint: string; material: string } | undefined> {
+    await this.init();
+    this.assertOwnerAvailable(userId);
+    if (fingerprint) {
+      const material = await this.keyring.find(userId, fingerprint);
+      return material ? { fingerprint, material } : undefined;
+    }
+    return this.keyring.active(userId);
+  }
+
+  /** Instance DR reuses the authenticated provider connection but has its own
+   * object selector, state store, envelope, and restore parser. */
+  instanceBackupProvider(kind: BackupProviderKind): BackupProvider | undefined {
+    return this.providers.get(kind);
   }
 
   async listRemoteBackups(userId: string) {
@@ -3912,7 +3952,7 @@ export class BackupManager {
   }
 
   private triggerScheduleTick(): void {
-    if (this.tickInFlight) return;
+    if (this.tickInFlight || instanceSnapshotActive()) return;
     this.tickInFlight = this.tickSchedules()
       .catch((error) => {
         useLogger().error(

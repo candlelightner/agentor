@@ -36,6 +36,35 @@ const STARTUP_STATUS_PATH =
   "/home/agent/.agent-data/.agentor/admin-startup-script-status.json";
 const STARTUP_STATUS_DIR = "/home/agent/.agent-data/.agentor";
 
+/** Stable Docker resource identities are also used by instance disaster
+ * recovery to inventory the administrative workspace volumes without
+ * duplicating their naming contract. */
+export function administrativeWorkspaceResourceNames(
+  record: Readonly<AdministrativeWorkspaceRecord>,
+) {
+  const groupId =
+    record.kind === "group-administrative"
+      ? ((record as any).groupId as string)
+      : undefined;
+  const suffix = groupId ? `group-${groupId}` : "workspace";
+  return {
+    groupId,
+    container: groupId ? `agentor-admin-${suffix}` : ADMIN_CONTAINER,
+    workspaceVolume: groupId
+      ? `agentor-admin-${suffix}-data`
+      : ADMIN_WORKSPACE_VOLUME,
+    agentsVolume: groupId
+      ? `agentor-admin-${suffix}-agent-data`
+      : ADMIN_AGENTS_VOLUME,
+    managementNetwork: groupId
+      ? `agentor-management-group-${groupId}`
+      : MANAGEMENT_NETWORK,
+    egressNetwork: groupId
+      ? `agentor-admin-egress-group-${groupId}`
+      : EGRESS_NETWORK,
+  };
+}
+
 /** Docker boundary for the singleton administrative workspace. Every Docker
  * input is generated here; requests cannot choose images, mounts, commands,
  * networks, or capabilities. Only the owning administrator's standard worker
@@ -52,27 +81,11 @@ export class DockerAdminWorkspaceRuntime
   }
 
   private resources(record: Readonly<AdministrativeWorkspaceRecord>) {
-    const groupId =
-      record.kind === "group-administrative"
-        ? ((record as any).groupId as string)
-        : undefined;
-    const suffix = groupId ? `group-${groupId}` : "workspace";
+    const names = administrativeWorkspaceResourceNames(record);
+    const groupId = names.groupId;
     return {
-      groupId,
-      container: groupId ? `agentor-admin-${suffix}` : ADMIN_CONTAINER,
-      workspaceVolume: groupId
-        ? `agentor-admin-${suffix}-data`
-        : ADMIN_WORKSPACE_VOLUME,
-      agentsVolume: groupId
-        ? `agentor-admin-${suffix}-agent-data`
-        : ADMIN_AGENTS_VOLUME,
+      ...names,
       displayName: groupId ? "GROUP ADMIN" : "ADMIN / ORCHESTRATOR",
-      managementNetwork: groupId
-        ? `agentor-management-group-${groupId}`
-        : MANAGEMENT_NETWORK,
-      egressNetwork: groupId
-        ? `agentor-admin-egress-group-${groupId}`
-        : EGRESS_NETWORK,
     };
   }
   setManagementListener(listener: (host: string) => Promise<void>) {

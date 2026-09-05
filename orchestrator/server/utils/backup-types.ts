@@ -1,4 +1,5 @@
 export type BackupProviderKind = 'local' | 'fake' | 'google-drive';
+export type BackupArtifactKind = 'worker' | 'instance';
 export type BackupJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 
 /** A bounded, provider-supplied description. It is deliberately free of a
@@ -6,6 +7,9 @@ export type BackupJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'c
 export interface RemoteBackupDescriptor {
   objectId: string;
   size: number;
+  /** Provider-side selector only. The downloaded authenticated envelope stays
+   * authoritative; this prevents instance DR objects entering worker restore. */
+  artifactKind?: BackupArtifactKind;
   createdAt?: string;
   artifactId?: string;
   formatVersion?: number;

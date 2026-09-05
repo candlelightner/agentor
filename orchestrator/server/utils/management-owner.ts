@@ -1,7 +1,8 @@
-import { getUserById } from "./auth";
+import { getUserById, isPlatformAdminUser } from "./auth";
 import { assertSafeUserId } from "./user-id";
 
 type UserExists = (userId: string) => boolean | Promise<boolean>;
+type UserIsPlatformAdmin = (userId: string) => boolean | Promise<boolean>;
 
 /**
  * Validate every explicit management-MCP owner selector at the single
@@ -24,5 +25,27 @@ export async function validateManagementOwnerArguments(
     if (!(await userExists(userId))) {
       throw Object.assign(new Error("Owner not found"), { statusCode: 404 });
     }
+  }
+}
+
+/** Whole-instance snapshots contain every user's control-plane state. Their
+ * user-scoped recovery key/provider namespace must therefore belong to a
+ * platform administrator, never an ordinary account selected by a global
+ * management agent. Portable worker backups intentionally retain the broader
+ * cross-user administration behavior above. */
+export async function validateInstanceBackupOwnerArgument(
+  args: Record<string, unknown>,
+  userIsPlatformAdmin: UserIsPlatformAdmin = isPlatformAdminUser,
+): Promise<void> {
+  if (!Object.prototype.hasOwnProperty.call(args, "ownerId") || args.ownerId === undefined)
+    return;
+  const ownerId = assertSafeUserId(args.ownerId, "ownerId");
+  if (!(await userIsPlatformAdmin(ownerId))) {
+    throw Object.assign(
+      new Error(
+        "Whole-instance disaster recovery requires a platform-administrator recovery owner",
+      ),
+      { statusCode: 403 },
+    );
   }
 }

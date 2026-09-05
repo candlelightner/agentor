@@ -420,6 +420,7 @@ test("rebuild retries Docker removal without stopping an already-stopped worker"
   const fakeManager = {
     containers: new Map([[info.id, info]]),
     assertOrdinaryMutation: () => {},
+    resolveAuthorizedHostMounts: async () => [],
     persistentBackupPathMounts: async () => [],
     dockerService: {
       stopContainer: async () => {

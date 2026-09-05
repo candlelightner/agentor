@@ -1,6 +1,7 @@
 import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Config } from './config';
+import { instanceSnapshotActive } from './instance-snapshot-gate';
 import type { AgentUsageInfo, AgentUsageStatus, AgentAuthType } from '../../shared/types';
 import { getUserEnvVar } from './user-env-store';
 import type { UserEnvVarStore } from './user-env-store';
@@ -65,6 +66,7 @@ export class UsageChecker {
   private rateLimitBackoff = new Map<string, number>(); // key: `${userId}:${agentId}`
   private pollInterval: ReturnType<typeof setInterval> | null = null;
   private fetchQueue: Promise<void> = Promise.resolve();
+  private queuedFetches = 0;
   private saveQueues = new Map<string, Promise<void>>();
   /** Serialized payload most recently written to each user's usage.json, so we
    * can skip the writeFile() when nothing changed between 5-minute polls. */
@@ -168,12 +170,30 @@ export class UsageChecker {
   }
 
   private fetchAll(): Promise<void> {
-    this.fetchQueue = this.fetchQueue.then(() => this.doFetchAll()).catch(() => {});
-    return this.fetchQueue;
+    return this.enqueueFetch(() => this.doFetchAll());
   }
 
   private fetchUser(userId: string): Promise<void> {
-    this.fetchQueue = this.fetchQueue.then(() => this.doFetchUser(userId)).catch(() => {});
+    return this.enqueueFetch(() => this.doFetchUser(userId));
+  }
+
+  /** Instance snapshots include usage state and credential files. Refuse new
+   * background refreshes while the write barrier is active and expose queued
+   * work to snapshot preflight so a token rotation cannot race the archive. */
+  hasActiveOperationsForInstanceSnapshot(): boolean {
+    return this.queuedFetches > 0;
+  }
+
+  private enqueueFetch(operation: () => Promise<void>): Promise<void> {
+    if (instanceSnapshotActive()) return Promise.resolve();
+    this.queuedFetches += 1;
+    const queued = this.fetchQueue
+      .then(operation)
+      .catch(() => {})
+      .finally(() => {
+        this.queuedFetches = Math.max(0, this.queuedFetches - 1);
+      });
+    this.fetchQueue = queued;
     return this.fetchQueue;
   }
 

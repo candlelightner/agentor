@@ -2335,6 +2335,11 @@ export class ImageCatalogManager {
       .reverse()
       .map(publicBuild);
   }
+  hasActiveOperationsForInstanceSnapshot() {
+    return this.state.builds.some(
+      (build) => build.status === "queued" || build.status === "running",
+    );
+  }
 
   async promote(id: string, version: string, ownerId: string, admin: boolean) {
     return this.mutate(() => {
