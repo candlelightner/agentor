@@ -38,6 +38,7 @@ const emit = defineEmits<{
   openEditor: [containerId: string];
   stopContainer: [id: string];
   restartContainer: [id: string];
+  recoverContainer: [id: string];
   rebuildContainer: [id: string];
   removeContainer: [id: string];
   archiveContainer: [id: string];
@@ -712,6 +713,7 @@ function isContainerActive(
               @open-terminal="(id) => emit('openTerminal', id)" @open-desktop="(id) => emit('openDesktop', id)"
               @open-apps="(id) => emit('openApps', id)" @open-editor="(id) => emit('openEditor', id)"
               @stop-container="(id) => emit('stopContainer', id)" @restart-container="(id) => emit('restartContainer', id)"
+              @recover-container="(id) => emit('recoverContainer', id)"
               @rebuild-container="(id) => emit('rebuildContainer', id)" @remove-container="(id) => emit('removeContainer', id)"
               @archive-container="(id) => emit('archiveContainer', id)"
               @update-container="(id, patch, rebuild, complete) => emit('updateContainer', id, patch, rebuild, complete)"
@@ -729,6 +731,7 @@ function isContainerActive(
               @open-editor="(cid) => emit('openEditor', cid)"
               @stop="(id) => emit('stopContainer', id)"
               @restart="(id) => emit('restartContainer', id)"
+              @recover="(id) => emit('recoverContainer', id)"
               @rebuild="(id) => emit('rebuildContainer', id)"
               @remove="(id) => emit('removeContainer', id)"
               @archive="(id) => emit('archiveContainer', id)"

@@ -41,7 +41,11 @@ import { cleanupWorkspaceHelpers } from "../utils/workspace-access";
 import { useBackupManager } from "../utils/backup-manager";
 import { useInstanceBackupManager } from "../utils/instance-backup-manager";
 import { useImageCatalogManager } from "../utils/image-catalog";
-import { useAdminWorkspaceStore } from "../utils/admin-workspace-store";
+import {
+  useAdminWorkspaceStore,
+  type AdministrativeWorkspaceRecord,
+  type AdminWorkspaceIdentityMaterializationIntent,
+} from "../utils/admin-workspace-store";
 import { useGroupAdminWorkspaceStore } from "../utils/group-admin-workspace-store";
 import { DockerAdminWorkspaceRuntime } from "../utils/admin-workspace-runtime";
 import { useManagementMcpStore } from "../utils/management-mcp-store";
@@ -94,11 +98,30 @@ export default defineNitroPlugin(async (nitroApp) => {
   // builds (and memoizes) the auth instance internally, so no standalone
   // `useAuth()` is needed here.
   const dockerService = useDockerService();
-  const [, , staleWorkspaceHelpers] = await Promise.all([
+  const waitForDocker = async () => {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      try {
+        await dockerService.ensureNetwork();
+        return;
+      } catch (error) {
+        lastError = error;
+        if (attempt < 7)
+          await new Promise((resolve) =>
+            setTimeout(resolve, Math.min(4_000, 250 * 2 ** attempt)),
+          );
+      }
+    }
+    throw Object.assign(
+      new Error("Docker did not become ready within the startup deadline"),
+      { statusCode: 503, code: "DOCKER_STARTUP_UNAVAILABLE", cause: lastError },
+    );
+  };
+  await Promise.all([
     migrateAuth(),
-    dockerService.ensureNetwork(),
-    cleanupWorkspaceHelpers(),
+    waitForDocker(),
   ]);
+  const staleWorkspaceHelpers = await cleanupWorkspaceHelpers();
   logger.info("[agentor] auth initialized");
   if (staleWorkspaceHelpers > 0)
     logger.info(
@@ -211,6 +234,30 @@ export default defineNitroPlugin(async (nitroApp) => {
         ),
       );
   }
+  // Re-run daemon/task and desired-state reconciliation after startup. The
+  // overlap guard keeps a wedged worker's bounded call from stacking another
+  // pass; ContainerManager isolates failures per worker.
+  let workerReconcileRunning = false;
+  let workerReconcileTimer: NodeJS.Timeout | undefined;
+  if (!instanceRecoveryMode) {
+    workerReconcileTimer = setInterval(() => {
+      if (workerReconcileRunning || instanceSnapshotActive()) return;
+      workerReconcileRunning = true;
+      void (async () => {
+        await containerManager.sync();
+        await containerManager.reconcileWorkers();
+      })()
+        .catch((error) =>
+          logger.warn(
+            `[agentor] worker reconciliation pass deferred: ${(error as { code?: string })?.code || "Docker unavailable"}`,
+          ),
+        )
+        .finally(() => {
+          workerReconcileRunning = false;
+        });
+    }, 30_000);
+    workerReconcileTimer.unref?.();
+  }
   // Restore desired managed-network membership after a daemon/orchestrator
   // restart. Keep worker startup available if a user-created bridge is broken;
   // validation/UI will expose the failed network instead of hiding it.
@@ -239,10 +286,27 @@ export default defineNitroPlugin(async (nitroApp) => {
   adminWorkspace.setRuntimeAdapter(adminRuntime);
   const groupAdminWorkspaces = useGroupAdminWorkspaceStore();
   groupAdminWorkspaces.setRuntimeAdapter(adminRuntime);
-  groupAdminWorkspaces.setIdentityMaterializer(async (record) => {
-    const identity = await useManagementMcpStore().issue(record.id, 60);
-    await adminRuntime.materializeCredential(identity.credential, record);
-  });
+  const materializeAdminIdentity = async (
+    record: AdministrativeWorkspaceRecord,
+    intent: AdminWorkspaceIdentityMaterializationIntent,
+  ) => {
+    const issueCredential = async () =>
+      (await useManagementMcpStore().issue(record.id, 60)).credential;
+    if (intent === "prepare-start") {
+      // Image/overlay preparation may exceed the deliberately short MCP
+      // identity TTL. Retain only this issuer until the actual start boundary;
+      // no raw management credential exists while a build is in progress.
+      await adminRuntime.prepareCredential(record, issueCredential);
+      return;
+    }
+    await adminRuntime.materializeCredential(
+      await issueCredential(),
+      record.kind === "group-administrative" ? record : undefined,
+      intent,
+    );
+  };
+  adminWorkspace.setIdentityMaterializer(materializeAdminIdentity);
+  groupAdminWorkspaces.setIdentityMaterializer(materializeAdminIdentity);
   await adminRuntime.initializeBoundary();
   await managementMcp.start(await adminRuntime.managementAddress());
   let adminIdentityTimer: NodeJS.Timeout | undefined;
@@ -250,8 +314,6 @@ export default defineNitroPlugin(async (nitroApp) => {
     if (instanceSnapshotActive()) return;
     try {
       const workspace = await adminWorkspace.ensure();
-      const identity = await useManagementMcpStore().issue(workspace.id, 60);
-      await adminRuntime.materializeCredential(identity.credential);
       for (const group of useWorkerGroupStore().list()) {
         if (!group.adminWorkspace) continue;
         await groupAdminWorkspaces.ensure(group.id);
@@ -367,6 +429,9 @@ export default defineNitroPlugin(async (nitroApp) => {
     } catch {}
     try {
       useResourceMonitor().stop?.();
+    } catch {}
+    try {
+      if (workerReconcileTimer) clearInterval(workerReconcileTimer);
     } catch {}
     try {
       useExportJobManager().stop();

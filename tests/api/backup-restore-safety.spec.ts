@@ -24,16 +24,23 @@ import { DockerService } from "../../orchestrator/server/utils/docker";
 import { StorageManager } from "../../orchestrator/server/utils/storage";
 import { WorkerConfigStore } from "../../orchestrator/server/utils/worker-config-store";
 import { WorkerStore } from "../../orchestrator/server/utils/worker-store";
+import {
+  OperationDeadlineError,
+  operationSettlement,
+  type OperationFailureWithSettlement,
+} from "../../orchestrator/server/utils/operation-deadline";
 import type {
   BackupProvider,
   UploadResult,
 } from "../../orchestrator/server/utils/backup-provider";
 import {
   WorkerLifecycleCoordinator,
+  isWorkerLifecycleMutationActive,
   withOwnerLifecycleMutation,
   withOwnerWorkerLifecycleMutation,
 } from "../../orchestrator/server/utils/worker-lifecycle-coordinator";
 import { withDeletedOwnerCleanupFence } from "../../orchestrator/server/utils/orphan-sweeper";
+import { withOperationDeadline } from "../../orchestrator/server/utils/operation-deadline";
 
 // These utilities are Nuxt server auto-imports in production. Focused direct
 // module tests provide inert implementations for code paths that only detach
@@ -44,7 +51,10 @@ import { withDeletedOwnerCleanupFence } from "../../orchestrator/server/utils/or
   info() {},
   debug() {},
 });
-(globalThis as any).useLogCollector ??= () => ({ detach() {} });
+(globalThis as any).useLogCollector ??= () => ({
+  detach() {},
+  attach: async () => undefined,
+});
 
 test("worker lifecycle mutations serialize per worker and recover after rejection", async () => {
   const coordinator = new WorkerLifecycleCoordinator();
@@ -73,6 +83,168 @@ test("worker lifecycle mutations serialize per worker and recover after rejectio
   await expect(first).rejects.toThrow("expected failure");
   await second;
   expect(events).toEqual(["first-start", "unrelated", "first-end", "second"]);
+});
+
+test("a timed-out Docker mutation returns promptly but keeps its worker fenced until abort settles", async () => {
+  const coordinator = new WorkerLifecycleCoordinator();
+  const events: string[] = [];
+  const first = coordinator.withWorker("worker-timeout", () =>
+    withOperationDeadline(
+      (signal) =>
+        new Promise<void>((_resolve, reject) => {
+          events.push("docker-started");
+          signal.addEventListener(
+            "abort",
+            () => {
+              events.push("docker-aborted");
+              setTimeout(() => {
+                events.push("docker-settled");
+                reject(new Error("request closed"));
+              }, 20);
+            },
+            { once: true },
+          );
+        }),
+      5,
+      "Docker test mutation",
+    ),
+  );
+  const second = coordinator.withWorker("worker-timeout", async () => {
+    events.push("retry-started");
+  });
+
+  await expect(first).rejects.toMatchObject({
+    code: "DOCKER_OPERATION_TIMEOUT",
+  });
+  expect(events).toEqual(["docker-started", "docker-aborted"]);
+  await second;
+  expect(events).toEqual([
+    "docker-started",
+    "docker-aborted",
+    "docker-settled",
+    "retry-started",
+  ]);
+});
+
+test("a timed-out worker does not hold sibling workers behind its owner fence", async () => {
+  const ownerId = `owner-isolation-${Date.now()}-${Math.random()}`;
+  let releaseSettlement!: () => void;
+  const settlement = new Promise<void>((resolve) => {
+    releaseSettlement = resolve;
+  });
+  const timedOut = new OperationDeadlineError(
+    "DOCKER_OPERATION_TIMEOUT",
+    "Docker worker stop",
+    30_000,
+  ) as OperationFailureWithSettlement;
+  Object.defineProperty(timedOut, operationSettlement, {
+    value: settlement,
+    enumerable: false,
+  });
+
+  const affected = withOwnerWorkerLifecycleMutation(
+    ownerId,
+    "worker-a",
+    async () => {
+      throw timedOut;
+    },
+  );
+  await expect(affected).rejects.toMatchObject({
+    code: "DOCKER_OPERATION_TIMEOUT",
+  });
+
+  let siblingRan = false;
+  await withOwnerWorkerLifecycleMutation(ownerId, "worker-b", async () => {
+    siblingRan = true;
+  });
+  expect(siblingRan).toBe(true);
+
+  let affectedRetryRan = false;
+  const retry = withOwnerWorkerLifecycleMutation(ownerId, "worker-a", async () => {
+    affectedRetryRan = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(affectedRetryRan).toBe(false);
+  releaseSettlement();
+  await retry;
+  expect(affectedRetryRan).toBe(true);
+});
+
+test("reconciliation can detect an in-flight worker lifecycle boundary", async () => {
+  const workerId = `busy-worker-${Date.now()}-${Math.random()}`;
+  let release!: () => void;
+  let started!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const entered = new Promise<void>((resolve) => (started = resolve));
+  const operation = withOwnerWorkerLifecycleMutation(
+    `busy-owner-${Date.now()}-${Math.random()}`,
+    workerId,
+    async () => {
+      started();
+      await gate;
+    },
+  );
+  await entered;
+  expect(isWorkerLifecycleMutationActive(workerId)).toBe(true);
+  release();
+  await operation;
+  await Promise.resolve();
+  expect(isWorkerLifecycleMutationActive(workerId)).toBe(false);
+});
+
+test("missing-runtime reconciliation rechecks atomically behind the worker lifecycle fence", async () => {
+  const workerId = `reconcile-race-${Date.now()}-${Math.random()}`;
+  const userId = `reconcile-owner-${Date.now()}-${Math.random()}`;
+  const record: any = {
+    id: workerId,
+    userId,
+    displayName: "Reconcile race",
+    status: "active",
+    desiredRuntimeStatus: "stopped",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  let archived = 0;
+  const manager = new ContainerManager({} as any, {
+    containerPrefix: "agentor-worker",
+  } as any);
+  manager.setWorkerStore({
+    listActive: () => [record],
+    listArchived: () => [],
+    get: () => record,
+    archive: async () => {
+      archived++;
+    },
+    upsert: async () => undefined,
+  } as any);
+  let release!: () => void;
+  let entered!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const started = new Promise<void>((resolve) => (entered = resolve));
+  const publishing = withOwnerWorkerLifecycleMutation(
+    userId,
+    workerId,
+    async () => {
+      entered();
+      await gate;
+      manager.registerExternal({
+        ...record,
+        administrativeKind: undefined,
+        containerId: "docker-runtime",
+        containerName: `agentor-worker-${workerId}`,
+        imageName: "agentor-worker:latest",
+        imageId: "sha256:image",
+        status: "stopped",
+      });
+    },
+  );
+  await started;
+  const reconciling = manager.reconcileWorkers();
+  release();
+  await Promise.all([publishing, reconciling]);
+
+  expect(archived).toBe(0);
+  expect(manager.get(workerId)?.containerId).toBe("docker-runtime");
 });
 
 test("a provisional import cannot be deleted before its lifecycle mutation settles", async () => {
@@ -344,6 +516,9 @@ test("archive retries after stop/remove and persistence failures without restopp
     const fakeManager = {
       containers,
       assertOrdinaryMutation: () => {},
+      persistDesiredRuntimeStatus: async (current: any, desired: string) => {
+        current.desiredRuntimeStatus = desired;
+      },
       dockerService: {
         stopContainer: async () => {
           stopCalls++;
@@ -411,8 +586,10 @@ test("rebuild retries Docker removal without stopping an already-stopped worker"
     displayName: "Worker 1",
     imageName: "worker:latest",
     imageId: "image-1",
+    imageRuntimeReference: "worker:latest",
     status: "running",
   };
+  let ensureImageCalls = 0;
   let stopCalls = 0;
   let removeCalls = 0;
   let archiveCalls = 0;
@@ -420,9 +597,16 @@ test("rebuild retries Docker removal without stopping an already-stopped worker"
   const fakeManager = {
     containers: new Map([[info.id, info]]),
     assertOrdinaryMutation: () => {},
+    persistDesiredRuntimeStatus: async (current: any, desired: string) => {
+      current.desiredRuntimeStatus = desired;
+    },
     resolveAuthorizedHostMounts: async () => [],
     persistentBackupPathMounts: async () => [],
     dockerService: {
+      ensureImage: async (image: string) => {
+        expect(image).toBe("worker:latest");
+        ensureImageCalls++;
+      },
       stopContainer: async () => {
         stopCalls++;
       },
@@ -456,6 +640,7 @@ test("rebuild retries Docker removal without stopping an already-stopped worker"
   expect(stopCalls).toBe(1);
   expect(removeCalls).toBe(2);
   expect(archiveCalls).toBe(1);
+  expect(ensureImageCalls).toBe(2);
 });
 
 test("Docker 404 still runs the complete import cleanup sequence", async () => {
@@ -626,6 +811,197 @@ test("worker deletion-pending state cannot be cleared by archive or unarchive", 
   });
   expect(store.get("owner-1", "worker-1")?.deletionPending).toBe(true);
   await rm(root, { recursive: true, force: true });
+});
+
+test("desired runtime state is durable and backward-compatible", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agentor-worker-desired-state-"));
+  const createdAt = "2026-01-01T00:00:00.000Z";
+  try {
+    const store = new WorkerStore(root);
+    await store.upsert({
+      id: "worker-1",
+      userId: "owner-1",
+      createdAt,
+      updatedAt: createdAt,
+      displayName: "Worker 1",
+      status: "active",
+    });
+    expect(store.get("owner-1", "worker-1")?.desiredRuntimeStatus).toBeUndefined();
+    await store.setDesiredRuntimeStatus("owner-1", "worker-1", "stopped");
+
+    const reloaded = new WorkerStore(root);
+    await reloaded.init();
+    expect(reloaded.get("owner-1", "worker-1")).toMatchObject({
+      desiredRuntimeStatus: "stopped",
+      status: "active",
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("managed recovery preserves a timed-out remove settlement for lifecycle fencing", async () => {
+  const info: any = {
+    id: "worker-1",
+    userId: "owner-1",
+    containerId: "docker-1",
+    containerName: "agentor-worker-worker-1",
+    imageRuntimeReference: "worker:latest",
+    status: "unknown",
+  };
+  let releaseSettlement!: () => void;
+  const settlement = new Promise<void>((resolve) => {
+    releaseSettlement = resolve;
+  });
+  const timedOut = Object.assign(new Error("Docker remove timed out"), {
+    statusCode: 504,
+    code: "DOCKER_OPERATION_TIMEOUT",
+  }) as OperationFailureWithSettlement;
+  Object.defineProperty(timedOut, operationSettlement, {
+    value: settlement,
+    enumerable: false,
+  });
+  const manager: any = {
+    containers: new Map([[info.id, info]]),
+    assertOrdinaryMutation() {},
+    resolveAuthorizedHostMounts: async () => [],
+    persistentBackupPathMounts: async () => [],
+    persistDesiredRuntimeStatus: async () => {},
+    markRuntimeUnknown() {},
+    dockerService: {
+      ensureImage: async () => {},
+      assertWorkerPersistenceMounts: async () => {},
+      killContainer: async () => {},
+      removeContainer: async () => { throw timedOut; },
+    },
+  };
+
+  let wrapped: OperationFailureWithSettlement | undefined;
+  try {
+    await (ContainerManager.prototype as any).recoverUnlocked.call(manager, info.id);
+  } catch (error) {
+    wrapped = error as OperationFailureWithSettlement;
+  }
+  expect(wrapped).toMatchObject({ code: "WORKER_RECOVERY_DAEMON_STALE" });
+  expect(wrapped?.[operationSettlement]).toBe(settlement);
+  releaseSettlement();
+  await settlement;
+});
+
+test("managed recovery verifies persistence before touching disposable compute", async () => {
+  const calls: string[] = [];
+  const info: any = {
+    id: "worker-1",
+    userId: "owner-1",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    containerId: "docker-1",
+    containerName: "agentor-worker-worker-1",
+    displayName: "Worker 1",
+    imageName: "worker:latest",
+    imageId: "sha256:image",
+    imageRuntimeReference: "worker:latest",
+    status: "unknown",
+    desiredRuntimeStatus: "running",
+  };
+  const manager: any = {
+    containers: new Map([[info.id, info]]),
+    assertOrdinaryMutation() {},
+    resolveAuthorizedHostMounts: async () => [],
+    persistentBackupPathMounts: async () => [
+      { source: "selected-volume", target: "/home/agent/.agent-data/.codex" },
+    ],
+    dockerService: {
+      ensureImage: async (image: string) => {
+        expect(image).toBe("worker:latest");
+        calls.push("ensure-image");
+      },
+      assertWorkerPersistenceMounts: async (_id: string, targets: string[]) => {
+        calls.push(`verify:${targets.join(",")}`);
+        throw Object.assign(new Error("persistence unavailable"), {
+          code: "WORKER_PERSISTENCE_UNVERIFIED",
+        });
+      },
+      killContainer: async () => calls.push("kill"),
+      removeContainer: async () => calls.push("remove"),
+      removeVolume: async () => calls.push("remove-volume"),
+    },
+    persistDesiredRuntimeStatus: async () => calls.push("persist-desired"),
+  };
+
+  await expect(
+    (ContainerManager.prototype as any).recoverUnlocked.call(
+      manager,
+      info.id,
+    ),
+  ).rejects.toMatchObject({ code: "WORKER_PERSISTENCE_UNVERIFIED" });
+  expect(calls).toEqual([
+    "ensure-image",
+    "verify:/home/agent/.agent-data/.codex",
+  ]);
+});
+
+test("managed recovery replaces only compute and retains worker records and volumes", async () => {
+  const calls: string[] = [];
+  const info: any = {
+    id: "worker-1",
+    userId: "owner-1",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    containerId: "docker-1",
+    containerName: "agentor-worker-worker-1",
+    displayName: "Worker 1",
+    imageName: "worker:latest",
+    imageId: "sha256:image",
+    imageRuntimeReference: "worker:latest",
+    status: "unknown",
+    desiredRuntimeStatus: "running",
+  };
+  const recovered = { ...info, containerId: "docker-2", status: "running" };
+  const manager: any = {
+    containers: new Map([[info.id, info]]),
+    runtimeObservations: new Map(),
+    assertOrdinaryMutation() {},
+    resolveAuthorizedHostMounts: async () => [],
+    persistentBackupPathMounts: async () => [
+      { source: "selected-volume", target: "/home/agent/.agent-data/.codex" },
+    ],
+    dockerService: {
+      ensureImage: async (image: string) => {
+        expect(image).toBe("worker:latest");
+        calls.push("ensure-image");
+      },
+      assertWorkerPersistenceMounts: async () => calls.push("verify-mounts"),
+      killContainer: async () => calls.push("kill-task"),
+      removeContainer: async () => calls.push("remove-container"),
+      removeVolume: async () => calls.push("remove-volume"),
+    },
+    persistDesiredRuntimeStatus: async (_worker: unknown, desired: string) => {
+      calls.push(`desired:${desired}`);
+    },
+    workerStore: {
+      archive: async () => calls.push("archive-record"),
+    },
+    unarchiveUnlocked: async () => {
+      calls.push("recreate-and-reconcile");
+      return recovered;
+    },
+    markRuntimeUnknown: () => calls.push("mark-unknown"),
+  };
+
+  await expect(
+    (ContainerManager.prototype as any).recoverUnlocked.call(manager, info.id),
+  ).resolves.toBe(recovered);
+  expect(calls).toEqual([
+    "ensure-image",
+    "verify-mounts",
+    "desired:running",
+    "kill-task",
+    "remove-container",
+    "archive-record",
+    "recreate-and-reconcile",
+  ]);
+  expect(calls).not.toContain("remove-volume");
 });
 
 test("worker settings roll back in memory when durable persistence fails", async () => {

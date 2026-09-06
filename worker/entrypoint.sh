@@ -491,7 +491,14 @@ if [ -n "$GIT_USER_NAME" ] || [ -n "$GIT_USER_EMAIL" ] || [ -n "$GITHUB_TOKEN" ]
     fi
     if [ -n "$GITHUB_TOKEN" ]; then
         export GH_TOKEN="$GITHUB_TOKEN"
-        git config --global credential.https://github.com.helper '!gh auth git-credential'
+        # Older worker generations appended this key on every boot. A worker
+        # whose persistent agent-data carried two legacy values then aborted
+        # here under `set -e` with "cannot overwrite multiple values". Replace
+        # the complete value set atomically: zero, one, or many old entries all
+        # converge to exactly one helper, and repeated starts stay idempotent.
+        # The helper command contains no credential material; GH_TOKEN remains
+        # process-only and is never written to git config or the log.
+        git config --global --replace-all credential.https://github.com.helper '!gh auth git-credential'
         git config --global url."https://github.com/".insteadOf "git@github.com:"
         _log "Git config: credential helper configured"
     fi

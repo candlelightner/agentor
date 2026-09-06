@@ -99,17 +99,23 @@ async function resolveImportedImage(
   return {};
 }
 import {
+  isWorkerLifecycleMutationActive,
   withOwnerLifecycleMutation,
   withOwnerWorkerLifecycleMutation,
   withWorkerLifecycleMutation,
+  workerLifecycleGeneration,
+  workerLifecycleSequence,
 } from "./worker-lifecycle-coordinator";
+import {
+  operationSettlement,
+  type OperationFailureWithSettlement,
+} from "./operation-deadline";
 import { getAllGitCloneDomains } from "./git-providers";
 import { getAllAgentApiDomains } from "./agent-config";
 import {
   getPackageManagerDomains,
   DEFAULT_ENVIRONMENT_ID,
 } from "./environments";
-import { getUserById } from "./auth";
 import type { EnvironmentStore, Environment } from "./environments";
 import type { WorkerStore, WorkerRecord } from "./worker-store";
 import type { UserCredentialManager } from "./user-credentials";
@@ -237,8 +243,14 @@ export async function removeDockerContainerIdempotently(
 export async function stopWorkerContainerIdempotently(
   info: ContainerInfo,
   stop: () => Promise<void>,
+  attemptUncertain = false,
 ): Promise<void> {
-  if (info.status !== "running") return;
+  // Lifecycle retries may be in an error/removing/archive transition after a
+  // successful stop. Archive/rebuild therefore stop only a known-running
+  // container, while an explicit Stop request may make one bounded attempt
+  // against an unknown/starting/recovering runtime.
+  if (info.status !== "running" && !attemptUncertain) return;
+  if (info.status === "stopped") return;
   try {
     await stop();
   } catch (error) {
@@ -247,6 +259,7 @@ export async function stopWorkerContainerIdempotently(
     const message = error instanceof Error ? error.message : String(error);
     if (
       status !== 304 &&
+      status !== 404 &&
       !/already (?:is )?stopped|container .* is not running/i.test(message)
     ) {
       throw error;
@@ -405,6 +418,17 @@ export class ContainerManager {
   /** A caller timeout must not allow a retry to enqueue the same destructive
    * owner-wide batch while the first operation is still running. */
   private activeWorkerGroupLifecycleOwners = new Set<string>();
+  private syncPromise?: Promise<void>;
+  private runtimeObservations = new Map<
+    string,
+    {
+      at: number;
+      status: ContainerStatus;
+      diagnostic?: ContainerInfo["runtimeDiagnostic"];
+      secretHandshakeRequired?: boolean;
+      restartPolicy?: string;
+    }
+  >();
   /** Reattach a freshly created/rebuilt worker to owner-managed networks. Failure
    * is logged only: the worker lifecycle succeeded and the network remains
    * inspectable/reconcilable rather than leaving a half-created worker. */
@@ -433,6 +457,45 @@ export class ContainerManager {
           `[container] plugin reconcile failed for ${info.id}: ${error instanceof Error ? error.message : error}`,
         ),
       );
+  }
+  private async persistDesiredRuntimeStatus(
+    info: ContainerInfo,
+    desired: "running" | "stopped",
+  ): Promise<void> {
+    info.desiredRuntimeStatus = desired;
+    info.updatedAt = new Date().toISOString();
+    const record = this.workerStore?.get(info.userId, info.id);
+    if (record)
+      await this.workerStore!.setDesiredRuntimeStatus(
+        info.userId,
+        info.id,
+        desired,
+      );
+  }
+
+  private markRuntimeUnknown(
+    info: ContainerInfo,
+    operation: string,
+    error: unknown,
+  ): void {
+    info.status = "unknown";
+    info.updatedAt = new Date().toISOString();
+    info.runtimeDiagnostic = {
+      code: (error as { code?: string })?.code || "WORKER_RUNTIME_UNRESPONSIVE",
+      operation,
+      message:
+        "Agentor could not verify the Docker task. Retry the operation or use managed recovery; persistent volumes were not changed.",
+      retryable: true,
+      observedAt: info.updatedAt,
+    };
+    this.runtimeObservations.delete(info.containerId);
+  }
+
+  /** Metrics/log/terminal paths use this to invalidate optimistic Docker list
+   * state. The next inventory refresh performs an independent task probe. */
+  reportRuntimeFailure(id: string, operation: string, error: unknown): void {
+    const info = this.containers.get(id);
+    if (info) this.markRuntimeUnknown(info, operation, error);
   }
   /** Keyed by the worker's UUID `id` (stable across rebuild/unarchive). */
   private containers: Map<string, ContainerInfo> = new Map();
@@ -551,17 +614,6 @@ export class ContainerManager {
       }
     }
     return { userEnv, credentialBinds, groupSecrets };
-  }
-
-  /** Resolve the worker's git identity live from the owning user. The worker
-   * references the owner by `userId` only — name/email are never snapshotted onto
-   * the worker record, so they always reflect the user's current profile. */
-  private resolveGitIdentity(userId: string): {
-    gitName: string;
-    gitEmail: string;
-  } {
-    const user = getUserById(userId);
-    return { gitName: user?.name ?? "", gitEmail: user?.email ?? "" };
   }
 
   private resolveCapabilitiesAndInstructions(
@@ -708,12 +760,76 @@ export class ContainerManager {
     running: "running",
     exited: "stopped",
     created: "creating",
+    restarting: "starting",
+    paused: "unknown",
     dead: "error",
     removing: "removing",
   };
 
   async sync(): Promise<void> {
+    if (this.syncPromise) return this.syncPromise;
+    // Docker's list response is only a point-in-time observation. Capture the
+    // lifecycle admission marker before starting it so a stop/archive/rebuild
+    // which overlaps its task probes cannot publish that old response later.
+    const lifecycleSequenceAtStart = workerLifecycleSequence();
+    this.syncPromise = this.syncUnlocked(lifecycleSequenceAtStart).finally(() => {
+      this.syncPromise = undefined;
+    });
+    return this.syncPromise;
+  }
+
+  private async observeRuntime(
+    containerId: string,
+  ): Promise<{
+    status: ContainerStatus;
+    diagnostic?: ContainerInfo["runtimeDiagnostic"];
+    secretHandshakeRequired?: boolean;
+    restartPolicy?: string;
+  }> {
+    const cached = this.runtimeObservations.get(containerId);
+    if (cached && Date.now() - cached.at < 5_000) return cached;
+    try {
+      const runtime = await this.dockerService.inspectContainerRuntime(containerId);
+      const status = ContainerManager.STATE_MAP[runtime.status] ?? "unknown";
+      if (runtime.running)
+        await this.dockerService.probeContainerTask(
+          containerId,
+          runtime.secretHandshakeRequired,
+        );
+      const observed = {
+        at: Date.now(),
+        status,
+        secretHandshakeRequired: runtime.secretHandshakeRequired,
+        restartPolicy: runtime.restartPolicy,
+      };
+      this.runtimeObservations.set(containerId, observed);
+      return observed;
+    } catch (error) {
+      const data = (error as { data?: { operation?: string }; code?: string })?.data;
+      const diagnostic = {
+        code: (error as { code?: string })?.code || "WORKER_RUNTIME_UNRESPONSIVE",
+        operation: data?.operation || "Docker worker task probe",
+        message:
+          "Agentor could not verify the Docker task. Lifecycle operations remain bounded; retry or use managed recovery.",
+        retryable: true,
+        observedAt: new Date().toISOString(),
+      };
+      const observed = { at: Date.now(), status: "unknown" as const, diagnostic };
+      this.runtimeObservations.set(containerId, observed);
+      return observed;
+    }
+  }
+
+  private async syncUnlocked(lifecycleSequenceAtStart: number): Promise<void> {
     const dockerContainers = await this.dockerService.listContainers();
+    const observations = new Map(
+      await Promise.all(
+        dockerContainers.map(async (container) => [
+          container.Id,
+          await this.observeRuntime(container.Id),
+        ] as const),
+      ),
+    );
 
     // Administrative workspaces are registered explicitly by their dedicated
     // runtime and intentionally do not carry the ordinary `agentor.id` worker
@@ -725,11 +841,17 @@ export class ContainerManager {
     // only returns `agentor.managed=true`; administrative containers are
     // deliberately `agentor.managed=false`, so they cannot be reconciled from
     // this filtered inventory.
-    const external = Array.from(this.containers.values()).filter(
+    const concurrent = new Map(this.containers);
+    const external = Array.from(concurrent.values()).filter(
       (info) => Boolean(info.administrativeKind),
     );
 
-    this.containers.clear();
+    const nextContainers = new Map<string, ContainerInfo>();
+    const desiredMigrations: Array<{
+      userId: string;
+      workerId: string;
+      desired: "running" | "stopped";
+    }> = [];
     this.importCreatedEnvironments.clear();
     for (const worker of this.workerStore?.list() ?? []) {
       if (worker.importCreatedEnvironmentId) {
@@ -768,10 +890,53 @@ export class ContainerManager {
         continue;
       }
 
+      // A Docker list/inspect result obtained before a lifecycle mutation is
+      // not authoritative once that mutation has begun. Preserve the live
+      // in-memory handle while it is still present (so a stop/restart can
+      // publish its own accurate state), or omit it when the mutation removed
+      // the handle. In particular, never revive an archived/deletion-pending
+      // record from an old list response.
+      const lifecycleChangedSinceSnapshot =
+        workerLifecycleGeneration(worker.id) > lifecycleSequenceAtStart;
+      if (
+        worker.status !== "active" ||
+        worker.deletionPending ||
+        lifecycleChangedSinceSnapshot ||
+        isWorkerLifecycleMutationActive(worker.id)
+      ) {
+        const current = concurrent.get(worker.id);
+        if (
+          current &&
+          !current.administrativeKind &&
+          current.userId === worker.userId &&
+          worker.status === "active" &&
+          !worker.deletionPending
+        )
+          nextContainers.set(worker.id, current);
+        continue;
+      }
+
       const id = worker.id;
       const now = new Date().toISOString();
+      const observation = observations.get(dc.Id);
+      const observedStatus =
+        observation?.status ?? ContainerManager.STATE_MAP[dc.State] ?? "unknown";
+      const inferredDesiredRuntimeStatus =
+        // A legacy `unless-stopped` worker that is crash-looping is observed
+        // as Docker's `restarting` state (projected to `starting`). Treat that
+        // as durable running intent so startup reconciliation can disable the
+        // daemon restart policy and retry secret bootstrap through Agentor.
+        // A deliberately stopped legacy worker is `exited`/`stopped` and
+        // remains stopped.
+        observedStatus === "running" || observedStatus === "starting"
+          ? "running"
+          : observedStatus === "stopped"
+            ? "stopped"
+            : undefined;
+      const desiredRuntimeStatus =
+        worker.desiredRuntimeStatus ?? inferredDesiredRuntimeStatus;
 
-      this.containers.set(id, {
+      nextContainers.set(id, {
         id,
         userId: worker.userId,
         createdAt: worker.createdAt ?? now,
@@ -781,7 +946,11 @@ export class ContainerManager {
         displayName: worker.displayName ?? containerName,
         imageName: dc.Image,
         imageId: dc.ImageID,
-        status: ContainerManager.STATE_MAP[dc.State] || "error",
+        status: observedStatus,
+        ...(desiredRuntimeStatus ? { desiredRuntimeStatus } : {}),
+        ...(observation?.diagnostic
+          ? { runtimeDiagnostic: observation.diagnostic }
+          : {}),
         repos: worker.repos,
         mounts: worker.mounts,
         initScript: worker.initScript,
@@ -796,9 +965,33 @@ export class ContainerManager {
         imageDigest: worker.imageDigest,
         imageRuntimeReference: worker.imageRuntimeReference,
       });
+      if (!worker.desiredRuntimeStatus && desiredRuntimeStatus)
+        desiredMigrations.push({
+          userId: worker.userId,
+          workerId: worker.id,
+          desired: desiredRuntimeStatus,
+        });
     }
 
-    for (const info of external) this.containers.set(info.id, info);
+    for (const info of external) nextContainers.set(info.id, info);
+    // Commit synchronously: no lifecycle mutation can interleave between the
+    // final generation check above and this map replacement.
+    this.containers = nextContainers;
+
+    // Legacy desired-state migration is deliberately best effort and happens
+    // only for the just-published, still-stable observations. A concurrent
+    // lifecycle mutation owns the durable desired state instead.
+    for (const migration of desiredMigrations) {
+      if (
+        !isWorkerLifecycleMutationActive(migration.workerId) &&
+        workerLifecycleGeneration(migration.workerId) <= lifecycleSequenceAtStart
+      )
+        await this.workerStore?.setDesiredRuntimeStatus(
+          migration.userId,
+          migration.workerId,
+          migration.desired,
+        );
+    }
 
     useLogger().debug(`[container] synced ${this.containers.size} containers`);
   }
@@ -825,12 +1018,27 @@ export class ContainerManager {
     }
   }
 
-  private assertOwnerExists(userId: string): void {
+  private async assertOwnerExists(userId: string): Promise<void> {
+    // Container lifecycle tests import this module directly with mocked
+    // collaborators. Do not load the SQLite native addon unless an
+    // owner-validated production path actually needs it.
+    const { getUserById } = await import("./auth");
     if (!getUserById(userId)) {
       throw Object.assign(new Error("Worker owner not found"), {
         statusCode: 404,
       });
     }
+  }
+
+  /** Resolve the worker's git identity live from its owner without eagerly
+   * loading the SQLite-backed auth module in Docker-only recovery paths. */
+  private async resolveGitIdentity(userId: string): Promise<{
+    gitName: string;
+    gitEmail: string;
+  }> {
+    const { getUserById } = await import("./auth");
+    const user = getUserById(userId);
+    return { gitName: user?.name ?? "", gitEmail: user?.email ?? "" };
   }
 
   /** Serialize every ordinary lifecycle mutation owner-first, then worker.
@@ -843,8 +1051,8 @@ export class ContainerManager {
     const snapshot = this.containers.get(id);
     if (!snapshot) return Promise.reject(new Error("Container not found"));
     this.assertOrdinaryMutation(snapshot);
-    return withOwnerWorkerLifecycleMutation(snapshot.userId, id, () => {
-      this.assertOwnerExists(snapshot.userId);
+    return withOwnerWorkerLifecycleMutation(snapshot.userId, id, async () => {
+      await this.assertOwnerExists(snapshot.userId);
       const current = this.containers.get(id);
       if (!current || current.userId !== snapshot.userId) {
         throw new Error("Container not found");
@@ -932,11 +1140,8 @@ export class ContainerManager {
   async create(request: CreateContainerRequest): Promise<ContainerInfo> {
     const userId = request.userId ?? "";
     if (!userId) throw new Error("create: userId is required");
-    return withOwnerLifecycleMutation(userId, () => {
-      if (!getUserById(userId))
-        throw Object.assign(new Error("Worker owner not found"), {
-          statusCode: 404,
-        });
+    return withOwnerLifecycleMutation(userId, async () => {
+      await this.assertOwnerExists(userId);
       return this.createForOwner(request);
     });
   }
@@ -966,7 +1171,7 @@ export class ContainerManager {
       this.deriveLimits(envConfig);
 
     // Git identity resolved live from the owner — never stored on the worker.
-    const { gitName, gitEmail } = this.resolveGitIdentity(userId);
+    const { gitName, gitEmail } = await this.resolveGitIdentity(userId);
 
     const workerJson: WorkerJsonPayload = {
       id,
@@ -1033,6 +1238,7 @@ export class ContainerManager {
       imageName,
       imageId: request.imageDigest || "",
       status: "creating",
+      desiredRuntimeStatus: "running",
       repos: repos.length > 0 ? repos : undefined,
       mounts,
       initScript,
@@ -1179,9 +1385,12 @@ export class ContainerManager {
     await this.dockerService.putWorkspaceArchive(info.containerId, tarBuffer);
   }
 
-  async downloadWorkspace(id: string): Promise<NodeJS.ReadableStream> {
+  async downloadWorkspace(
+    id: string,
+    signal?: AbortSignal,
+  ): Promise<NodeJS.ReadableStream> {
     const info = this.assertRunning(id);
-    return this.dockerService.getWorkspaceArchive(info.containerId);
+    return this.dockerService.getWorkspaceArchive(info.containerId, signal);
   }
 
   // --- Full /workspace file manager ---
@@ -1782,6 +1991,7 @@ for p in sys.argv[1:]:
   async downloadFiles(
     id: string,
     rels: string[],
+    signal?: AbortSignal,
   ): Promise<
     | { kind: "file"; stream: Readable; entry: FileEntry }
     | { kind: "zip"; stream: Readable }
@@ -1795,7 +2005,13 @@ for p in sys.argv[1:]:
     // rejected here too).
     const entries: FileEntry[] = [];
     for (const rel of targets) {
-      const entry = await probeLstat(this.dockerService, containerId, rel);
+      signal?.throwIfAborted();
+      const entry = await probeLstat(
+        this.dockerService,
+        containerId,
+        rel,
+        signal,
+      );
       entries.push(entry);
     }
 
@@ -1806,8 +2022,13 @@ for p in sys.argv[1:]:
       const tarStream = await this.dockerService.getArchive(
         containerId,
         toContainerPath(entry.path),
+        signal,
       );
-      const fileStream = demuxSingleFileFromTar(tarStream, entry.size);
+      const fileStream = demuxSingleFileFromTar(
+        tarStream,
+        entry.size,
+        signal,
+      );
       return { kind: "file", stream: fileStream, entry };
     }
 
@@ -1819,6 +2040,7 @@ for p in sys.argv[1:]:
       this.dockerService,
       containerId,
       entries,
+      signal,
     );
     return { kind: "zip", stream: zipStream };
   }
@@ -1917,7 +2139,7 @@ for p in sys.argv[1:]:
     this.activeWorkerGroupLifecycleOwners.add(userId);
     try {
       return await withOwnerLifecycleMutation(userId, async () => {
-        this.assertOwnerExists(userId);
+        await this.assertOwnerExists(userId);
         const [
           { withWorkerNetworkMutation },
           { useWorkerGroupStore },
@@ -2000,10 +2222,23 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    await this.persistDesiredRuntimeStatus(info, "stopped");
     useLogCollector().detach(info.containerId);
-    await stopWorkerContainerIdempotently(info, () =>
-      this.dockerService.stopContainer(info.containerId),
-    );
+    try {
+      await stopWorkerContainerIdempotently(
+        info,
+        () => this.dockerService.stopContainer(info.containerId),
+        true,
+      );
+      // A list refresh may otherwise reuse the pre-stop task observation for
+      // up to five seconds and overwrite the accurate in-memory `stopped`
+      // state with stale `running` health.
+      this.runtimeObservations.delete(info.containerId);
+      info.runtimeDiagnostic = undefined;
+    } catch (error) {
+      this.markRuntimeUnknown(info, "Docker worker stop", error);
+      throw error;
+    }
     useLogger().info(`[container] stopped ${info.containerName}`);
   }
 
@@ -2028,19 +2263,183 @@ for p in sys.argv[1:]:
             "Host mount access was revoked. Rebuild this worker before starting it again so Docker removes the old bind mount.",
         },
       );
-    useLogCollector().detach(info.containerId);
-    await this.dockerService.restartContainer(info.containerId);
-    await this.dockerService.materializeWorkerSecretFiles(
-      info.containerId,
-      await useWorkerConfigStore().resolveAppliedValues(info.userId, id),
+    await this.persistDesiredRuntimeStatus(info, "running");
+    const { groupSecrets } = await this.resolveUserEnvAndBinds(
+      info.userId,
+      info.excludedGlobalEnvVarKeys ?? [],
+      info.id,
+      info.excludedGroupEnvVarKeys ?? [],
     );
-    info.status = "running";
-    info.updatedAt = new Date().toISOString();
+    const localConfig = await useWorkerConfigStore().resolveAppliedValues(
+      info.userId,
+      id,
+    );
+    const runtimeSecrets = [...groupSecrets, ...localConfig];
+    const sensitive = runtimeSecrets.some((entry) => entry.kind !== "variable");
+    useLogCollector().detach(info.containerId);
+    info.status = info.status === "unknown" ? "recovering" : "starting";
+    info.runtimeDiagnostic = undefined;
+    try {
+      // Migrate legacy containers before starting them. Secret-bearing
+      // workers must never be auto-started by dockerd without Agentor's
+      // authenticated bootstrap path.
+      await this.dockerService.updateContainerRestartPolicy(
+        info.containerId,
+        sensitive,
+      );
+      const runtime = await this.dockerService.inspectContainerRuntime(
+        info.containerId,
+      );
+      if (runtime.running)
+        await this.dockerService.restartContainer(info.containerId);
+      else await this.dockerService.startContainer(info.containerId);
+
+      let bootstrapError: unknown;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await this.dockerService.materializeWorkerSecretFiles(
+            info.containerId,
+            runtimeSecrets,
+          );
+          bootstrapError = undefined;
+          break;
+        } catch (error) {
+          bootstrapError = error;
+          if (attempt < 2)
+            await new Promise((resolve) =>
+              setTimeout(resolve, attempt === 0 ? 250 : 750),
+            );
+        }
+      }
+      if (bootstrapError) {
+        await this.dockerService.stopContainer(info.containerId).catch(() => {});
+        throw Object.assign(
+          new Error(
+            "Worker secret bootstrap failed after bounded retries; stop/start can retry without rebuilding",
+          ),
+          {
+            statusCode: 503,
+            code: "WORKER_SECRET_BOOTSTRAP_FAILED",
+            data: {
+              code: "WORKER_SECRET_BOOTSTRAP_FAILED",
+              workerId: info.id,
+              phase: "secret-bootstrap",
+              retryable: true,
+              volumesPreserved: true,
+              nextAction:
+                "Retry stop/start after the secret provider is available; rebuilding is not required.",
+            },
+          },
+        );
+      }
+      await this.dockerService.probeContainerTask(info.containerId, sensitive);
+      info.status = "running";
+      info.runtimeDiagnostic = undefined;
+      info.updatedAt = new Date().toISOString();
+      this.runtimeObservations.delete(info.containerId);
+    } catch (error) {
+      this.markRuntimeUnknown(info, "Managed worker restart", error);
+      throw error;
+    }
     useLogCollector()
       .attach(info.containerName, info.containerId, "worker", info.displayName)
       .catch(() => {});
     useLogger().info(`[container] restarted ${info.containerName}`);
     await this.reconcileWorkerPlugins(info);
+  }
+
+  /** Explicit recovery for a task/shim that no longer accepts normal stop,
+   * restart, console, or stats operations. Only disposable compute is replaced;
+   * every persistent mount is verified first and no volume is ever removed. */
+  async recover(id: string): Promise<ContainerInfo> {
+    return this.withExistingWorkerLifecycleMutation(id, () =>
+      this.recoverUnlocked(id),
+    );
+  }
+
+  private async recoverUnlocked(id: string): Promise<ContainerInfo> {
+    const info = this.containers.get(id);
+    if (!info) throw new Error("Container not found");
+    this.assertOrdinaryMutation(info);
+    await this.resolveAuthorizedHostMounts(
+      info.userId,
+      info.id,
+      info.mounts,
+    );
+    const recoveryImage = info.importedImage
+      ? (await this.resolveImageOpts(info.importedImage)).image
+      : info.imageRuntimeReference;
+    await this.dockerService.ensureImage(
+      recoveryImage || this.config.workerImagePrefix + this.config.workerImage,
+    );
+    const persistentPathMounts = await this.persistentBackupPathMounts(
+      info,
+      info.status === "running",
+    );
+    await this.dockerService.assertWorkerPersistenceMounts(
+      info.containerId,
+      persistentPathMounts.map((mount) => mount.target),
+    );
+    await this.persistDesiredRuntimeStatus(info, "running");
+    info.status = "recovering";
+    info.runtimeDiagnostic = undefined;
+    useLogCollector().detach(info.containerId);
+
+    // SIGKILL is deliberately scoped to this exact Docker container. A stopped
+    // or already-absent task is already past this phase; all other failures are
+    // retained as diagnostic evidence while force-remove gets its own bounded
+    // attempt.
+    try {
+      await this.dockerService.killContainer(info.containerId);
+    } catch (error) {
+      const status = (error as { statusCode?: number; status?: number })
+        ?.statusCode ?? (error as { status?: number })?.status;
+      if (status !== 404 && status !== 409)
+        useLogger().warn(
+          `[container] scoped task kill did not settle for ${info.id}; attempting bounded force removal`,
+        );
+    }
+
+    try {
+      await removeDockerContainerIdempotently(() =>
+        this.dockerService.removeContainer(info.containerId),
+      );
+    } catch (cause) {
+      this.markRuntimeUnknown(info, "Managed worker recovery", cause);
+      const error = Object.assign(
+        new Error(
+          "Managed recovery could not clear the stale Docker object. Persistent volumes are intact; retry after Docker daemon recovery.",
+        ),
+        {
+          statusCode: 503,
+          code: "WORKER_RECOVERY_DAEMON_STALE",
+          data: {
+            code: "WORKER_RECOVERY_DAEMON_STALE",
+            workerId: info.id,
+            phase: "remove-stale-runtime",
+            volumesPreserved: true,
+            retryable: true,
+          },
+          cause,
+        },
+      );
+      const settlement = (cause as OperationFailureWithSettlement)?.[
+        operationSettlement
+      ];
+      if (settlement)
+        Object.defineProperty(error, operationSettlement, {
+          value: settlement,
+          enumerable: false,
+        });
+      throw error;
+    }
+
+    info.containerId = info.containerName;
+    info.status = "error";
+    info.updatedAt = new Date().toISOString();
+    await this.workerStore?.archive(info.userId, info.id);
+    this.containers.delete(info.id);
+    return this.unarchiveUnlocked(info.userId, info.id);
   }
 
   /** Reconcile durable desired mounts after a catalog/grant/hierarchy change.
@@ -2495,6 +2894,7 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    await this.persistDesiredRuntimeStatus(info, "stopped");
 
     useLogCollector().detach(info.containerId);
 
@@ -2568,6 +2968,16 @@ for p in sys.argv[1:]:
       info,
       true,
     );
+    // Resolve every immutable image dependency while the current runtime is
+    // still intact. A missing captured/custom image must never turn rebuild or
+    // managed recovery into an unintended standard-image substitution.
+    const imageOpts = info.importedImage
+      ? await this.resolveImageOpts(info.importedImage)
+      : { image: info.imageRuntimeReference, imageConfig: undefined };
+    await this.dockerService.ensureImage(
+      imageOpts.image || this.config.workerImagePrefix + this.config.workerImage,
+    );
+    await this.persistDesiredRuntimeStatus(info, "running");
 
     useLogCollector().detach(info.containerId);
 
@@ -2609,7 +3019,7 @@ for p in sys.argv[1:]:
     const { cpuLimit, memoryLimit, dockerEnabled } =
       this.deriveLimits(envConfig);
 
-    const { gitName, gitEmail } = this.resolveGitIdentity(info.userId);
+    const { gitName, gitEmail } = await this.resolveGitIdentity(info.userId);
 
     const workerJson: WorkerJsonPayload = {
       id: info.id,
@@ -2631,12 +3041,6 @@ for p in sys.argv[1:]:
       info.id,
     );
 
-    // Imported workers reuse their per-worker image (captured rootfs) across
-    // rebuilds; falls back to the standard image if that image is gone.
-    const imageOpts = info.importedImage
-      ? await this.resolveImageOpts(info.importedImage)
-      : { image: info.imageRuntimeReference, imageConfig: undefined };
-
     const imageName =
       imageOpts.image ||
       this.config.workerImagePrefix + this.config.workerImage;
@@ -2651,6 +3055,7 @@ for p in sys.argv[1:]:
       imageName,
       imageId: info.imageDigest || "",
       status: "creating",
+      desiredRuntimeStatus: "running",
       repos: info.repos,
       mounts: authorizedMounts,
       initScript: info.initScript,
@@ -2740,8 +3145,8 @@ for p in sys.argv[1:]:
   }
 
   async unarchive(userId: string, id: string): Promise<ContainerInfo> {
-    return withOwnerWorkerLifecycleMutation(userId, id, () => {
-      this.assertOwnerExists(userId);
+    return withOwnerWorkerLifecycleMutation(userId, id, async () => {
+      await this.assertOwnerExists(userId);
       return this.unarchiveUnlocked(userId, id);
     });
   }
@@ -2783,7 +3188,7 @@ for p in sys.argv[1:]:
     const { cpuLimit, memoryLimit, dockerEnabled } =
       this.deriveLimits(envConfig);
 
-    const { gitName, gitEmail } = this.resolveGitIdentity(worker.userId);
+    const { gitName, gitEmail } = await this.resolveGitIdentity(worker.userId);
 
     const workerJson: WorkerJsonPayload = {
       id: worker.id,
@@ -2822,6 +3227,7 @@ for p in sys.argv[1:]:
       imageName,
       imageId: worker.imageDigest || "",
       status: "creating",
+      desiredRuntimeStatus: "running",
       repos: worker.repos,
       mounts: authorizedMounts,
       initScript: worker.initScript,
@@ -2904,8 +3310,8 @@ for p in sys.argv[1:]:
   }
 
   async deleteArchived(userId: string, id: string): Promise<void> {
-    return withOwnerWorkerLifecycleMutation(userId, id, () => {
-      this.assertOwnerExists(userId);
+    return withOwnerWorkerLifecycleMutation(userId, id, async () => {
+      await this.assertOwnerExists(userId);
       return this.deleteArchivedUnlocked(userId, id);
     });
   }
@@ -3133,18 +3539,20 @@ for p in sys.argv[1:]:
 
   /** Resolve the image + replicated config a worker should run. For normal
    * workers (`importedImage` unset) returns `{}` so the standard image is used.
-   * For imported workers, returns the per-worker image plus the standard image's
-   * runtime config (entrypoint/env), falling back to the standard image if the
-   * imported image no longer exists. */
+   * Imported workers fail closed if either their captured image or the approved
+   * runtime contract cannot be resolved; silently booting an unrelated default
+   * image would lose rootfs state while pretending recovery was faithful. */
   private async resolveImageOpts(
     importedImage?: string,
   ): Promise<{ image?: string; imageConfig?: ImageConfigOverride }> {
     if (!importedImage) return {};
     if (!(await this.dockerService.imageExists(importedImage))) {
-      useLogger().warn(
-        `[container] imported image ${importedImage} missing — using standard worker image`,
+      throw Object.assign(
+        new Error(
+          "The captured worker image is unavailable. Restore that image or explicitly choose a replacement before rebuilding or recovering this worker.",
+        ),
+        { statusCode: 409, code: "IMPORTED_WORKER_IMAGE_MISSING" },
       );
-      return {};
     }
     const standard = this.config.workerImagePrefix + this.config.workerImage;
     try {
@@ -3152,14 +3560,16 @@ for p in sys.argv[1:]:
       const imageConfig = await this.dockerService.inspectImageConfig(standard);
       return { image: importedImage, imageConfig };
     } catch (err) {
-      // A `docker import`ed image has no entrypoint/env of its own, so running
-      // it without the replicated standard-image config produces an unbootable
-      // worker. If we can't read that config, fall back to the standard image
-      // (loses the captured rootfs but boots) — mirroring the import path.
-      useLogger().warn(
-        `[container] could not read standard image config for imported worker — using standard image: ${err instanceof Error ? err.message : err}`,
+      throw Object.assign(
+        new Error(
+          "The approved worker runtime contract could not be resolved for the captured image. Retry after image access is restored.",
+        ),
+        {
+          statusCode: 503,
+          code: "IMPORTED_WORKER_RUNTIME_CONFIG_UNAVAILABLE",
+          cause: err,
+        },
       );
-      return {};
     }
   }
 
@@ -3325,6 +3735,7 @@ for p in sys.argv[1:]:
         const wsSrc = await this.dockerService.getArchive(
           info.containerId,
           EXPORT_WORKSPACE_PATH,
+          opts.signal,
         );
         bytesProcessed += await writeGzipFile(
           wsSrc,
@@ -3342,6 +3753,7 @@ for p in sys.argv[1:]:
         const agSrc = await this.dockerService.getArchive(
           info.containerId,
           EXPORT_AGENTS_PATH,
+          opts.signal,
         );
         bytesProcessed += await writeFilteredAgentsGz(
           agSrc,
@@ -3361,6 +3773,7 @@ for p in sys.argv[1:]:
         opts.signal?.throwIfAborted();
         const rootfsSrc = await this.dockerService.exportContainer(
           info.containerId,
+          opts.signal,
         );
         // Parallel level-1 gzip avoids the historical single-core compression
         // bottleneck while keeping artifacts and import staging bounded.
@@ -3398,9 +3811,9 @@ for p in sys.argv[1:]:
 
   /** Restore a worker from an export bundle as a brand-new worker (fresh UUID).
    * Recreates the environment, restores the workspace + agent-data volumes, and
-   * recreates port/domain mappings. When the bundle carries a captured rootfs it
-   * is imported into a per-worker image; on any failure there it falls back to
-   * the standard worker image (config + volumes are still restored). */
+   * recreates port/domain mappings. A captured rootfs is imported into a
+   * per-worker image and fails closed if that cannot be done; callers may retry
+   * or explicitly request replacement/workspace-only restore. */
   async importWorker(
     userId: string,
     bundlePath: string,
@@ -3410,11 +3823,8 @@ for p in sys.argv[1:]:
     // Environment recreation is visible owner-wide. Share the owner mutation
     // fence with ordinary worker creation/settings and orphan cleanup so the
     // reference check plus any rollback deletion is atomic for that owner.
-    return withOwnerLifecycleMutation(userId, () => {
-      if (!getUserById(userId))
-        throw Object.assign(new Error("Worker owner not found"), {
-          statusCode: 404,
-        });
+    return withOwnerLifecycleMutation(userId, async () => {
+      await this.assertOwnerExists(userId);
       return this.importWorkerForOwner(userId, bundlePath, opts);
     });
   }
@@ -3534,7 +3944,7 @@ for p in sys.argv[1:]:
       const envConfig = this.resolveEnvironmentConfig(environmentId);
       const { cpuLimit, memoryLimit, dockerEnabled } =
         this.deriveLimits(envConfig);
-      const { gitName, gitEmail } = this.resolveGitIdentity(userId);
+      const { gitName, gitEmail } = await this.resolveGitIdentity(userId);
       const workerJson: WorkerJsonPayload = {
         id,
         displayName,
@@ -3550,7 +3960,9 @@ for p in sys.argv[1:]:
         id,
       );
 
-      // Import the captured rootfs into a per-worker image (best-effort).
+      // Import the captured rootfs into a per-worker image. This is the exact
+      // state the caller explicitly requested, so import failure is surfaced
+      // instead of silently creating a different standard-image worker.
       let importedImage: string | undefined;
       let imageConfig: ImageConfigOverride | undefined;
       if (useCapturedRootfs && rootfsPath) {
@@ -3562,10 +3974,6 @@ for p in sys.argv[1:]:
             repo,
             "latest",
           );
-          const standard =
-            this.config.workerImagePrefix + this.config.workerImage;
-          await this.dockerService.ensureImage(standard);
-          imageConfig = await this.dockerService.inspectImageConfig(standard);
         } catch (err) {
           // Docker can create the tagged image before its progress stream
           // reports a later error. Remove the deterministic candidate even
@@ -3573,21 +3981,40 @@ for p in sys.argv[1:]:
           await removeFailedImportedImage(candidateImage, () =>
             this.dockerService.removeImage(candidateImage),
           );
-          if (reconstruction?.image.kind === "custom")
-            throw Object.assign(
-              new Error(
-                "The captured custom image could not be imported. Retry, recover the referenced image, select a replacement image, or explicitly restore workspace-only.",
-              ),
-              {
-                statusCode: 409,
-                code: "CAPTURED_IMAGE_IMPORT_FAILED",
-              },
-            );
-          useLogger().warn(
-            `[container] import: rootfs import failed, using standard image: ${err instanceof Error ? err.message : err}`,
+          throw Object.assign(
+            new Error(
+              "The captured worker root filesystem could not be imported. Retry, recover the referenced image, select a replacement image, or explicitly restore workspace-only.",
+            ),
+            {
+              statusCode: 409,
+              code: "CAPTURED_IMAGE_IMPORT_FAILED",
+              cause: err,
+            },
           );
-          importedImage = undefined;
-          imageConfig = undefined;
+        }
+        try {
+          const standard =
+            this.config.workerImagePrefix + this.config.workerImage;
+          await this.dockerService.ensureImage(standard);
+          imageConfig = await this.dockerService.inspectImageConfig(standard);
+        } catch (err) {
+          // Import succeeded, but docker-imported filesystems do not carry an
+          // entrypoint/user/environment. Do not misreport a runtime-contract
+          // lookup failure as a corrupt rootfs, and do not retain an orphaned
+          // image for a worker identity that was never made durable.
+          await removeFailedImportedImage(candidateImage, () =>
+            this.dockerService.removeImage(candidateImage),
+          );
+          throw Object.assign(
+            new Error(
+              "The captured filesystem was imported, but the approved Agentor worker runtime contract could not be resolved. Retry after image access is restored.",
+            ),
+            {
+              statusCode: 503,
+              code: "CAPTURED_IMAGE_RUNTIME_CONFIG_UNAVAILABLE",
+              cause: err,
+            },
+          );
         }
       }
 
@@ -3609,6 +4036,7 @@ for p in sys.argv[1:]:
         imageName,
         imageId: "",
         status: "creating",
+        desiredRuntimeStatus: "running",
         repos: repos.length > 0 ? repos : undefined,
         mounts: mounts.length > 0 ? mounts : undefined,
         initScript: initScript || undefined,
@@ -3677,7 +4105,9 @@ for p in sys.argv[1:]:
           start: false,
         });
         containerInfo.containerId = container.id;
-        containerInfo.imageId = (await container.inspect()).Image || "";
+        containerInfo.imageId = await this.dockerService.inspectContainerImage(
+          container.id,
+        );
       } catch (err) {
         // createWorkerContainer may already have created persistent storage
         // before image/container creation fails. The deterministic container
@@ -3718,7 +4148,7 @@ for p in sys.argv[1:]:
           const parent = item.path === "/" ? "/" : item.path.slice(0, item.path.lastIndexOf("/")) || "/";
           await this.dockerService.putArchive(container.id, createReadStream(item.archivePath), parent);
         }
-        await container.start();
+        await this.dockerService.startContainer(container.id);
         await this.dockerService.materializeWorkerSecretFiles(
           container.id,
           workerConfig,
@@ -4116,10 +4546,94 @@ for p in sys.argv[1:]:
       }
     }
 
+    const missingDesiredWorkers: WorkerRecord[] = [];
     for (const worker of this.workerStore.listActive()) {
       if (!activeContainerNames.has(this.buildContainerName(worker.id))) {
-        await this.workerStore.archive(worker.userId, worker.id);
+        // Acquire the same owner→worker fences as create/rebuild/recovery, then
+        // recheck live state inside them. A separate isBusy snapshot leaves a
+        // race in which reconciliation can archive a provisional worker just
+        // as its lifecycle mutation begins.
+        const missing = await withOwnerWorkerLifecycleMutation(
+          worker.userId,
+          worker.id,
+          async () => {
+            if (this.containers.has(worker.id)) return undefined;
+            const current = this.workerStore?.get(worker.userId, worker.id);
+            if (!current || current.status !== "active") return undefined;
+            await this.workerStore!.archive(worker.userId, worker.id);
+            return current;
+          },
+        );
+        if (missing?.desiredRuntimeStatus === "running")
+          missingDesiredWorkers.push(missing);
       }
+    }
+
+    // Rebuild/recovery first persists running intent, then may retain an
+    // archived record if disposable compute cannot be recreated. Retry those
+    // system transitions on later passes; a user archive persists stopped
+    // intent and is therefore never auto-unarchived.
+    for (const worker of this.workerStore.listArchived())
+      if (
+        worker.desiredRuntimeStatus === "running" &&
+        !missingDesiredWorkers.some((candidate) => candidate.id === worker.id)
+      )
+        missingDesiredWorkers.push(worker);
+
+    // Migrate immutable restart policy and converge the persisted lifecycle
+    // intent only after stores (including encrypted group configuration) are
+    // available. Each worker is isolated so one damaged task cannot prevent
+    // every other worker from recovering.
+    for (const info of [...this.containers.values()]) {
+      if (info.administrativeKind) continue;
+      try {
+        const { groupSecrets } = await this.resolveUserEnvAndBinds(
+          info.userId,
+          info.excludedGlobalEnvVarKeys ?? [],
+          info.id,
+          info.excludedGroupEnvVarKeys ?? [],
+        );
+        const local = await useWorkerConfigStore().resolveAppliedValues(
+          info.userId,
+          info.id,
+        );
+        const sensitive = [...groupSecrets, ...local].some(
+          (entry) => entry.kind !== "variable",
+        );
+        const runtime = await this.dockerService.inspectContainerRuntime(
+          info.containerId,
+        );
+        const expectedPolicy = sensitive ? "no" : "unless-stopped";
+        if (runtime.restartPolicy !== expectedPolicy)
+          await this.dockerService.updateContainerRestartPolicy(
+            info.containerId,
+            sensitive,
+          );
+        if (info.desiredRuntimeStatus === "stopped" && runtime.running)
+          await this.stop(info.id);
+        else if (
+          info.desiredRuntimeStatus === "running" &&
+          (!runtime.running || info.status === "unknown")
+        )
+          await this.restart(info.id);
+      } catch (error) {
+        this.markRuntimeUnknown(info, "Worker startup reconciliation", error);
+        useLogger().warn(
+          `[container] startup reconciliation deferred for ${info.id}: ${(error as { code?: string })?.code || "runtime unavailable"}`,
+        );
+      }
+    }
+
+    // A desired-running worker whose disposable container disappeared is
+    // recreated through the normal unarchive path. Workspace, agent-data,
+    // selected-path volumes, group identity, and plugin desired state remain
+    // authoritative and are reattached/reconciled there.
+    for (const worker of missingDesiredWorkers) {
+      await this.unarchive(worker.userId, worker.id).catch((error) =>
+        useLogger().warn(
+          `[container] missing worker recreation deferred for ${worker.id}: ${(error as { code?: string })?.code || "runtime unavailable"}`,
+        ),
+      );
     }
   }
 
@@ -4134,6 +4648,9 @@ for p in sys.argv[1:]:
       updatedAt: info.updatedAt,
       displayName: info.displayName,
       status: "active",
+      ...(info.desiredRuntimeStatus
+        ? { desiredRuntimeStatus: info.desiredRuntimeStatus }
+        : {}),
       environmentId: info.environmentId,
       excludedGlobalEnvVarKeys: info.excludedGlobalEnvVarKeys ?? [],
       excludedGroupEnvVarKeys: info.excludedGroupEnvVarKeys ?? [],
@@ -4152,24 +4669,45 @@ for p in sys.argv[1:]:
   }
 
   async logs(id: string, tail?: number): Promise<string> {
-    return this.dockerService.getLogs(this.dockerIdFor(id), tail);
+    const info = this.containers.get(id);
+    if (!info) throw new Error("Container not found");
+    try {
+      return await this.dockerService.getLogs(info.containerId, tail);
+    } catch (error) {
+      this.markRuntimeUnknown(info, "Docker worker log read", error);
+      throw error;
+    }
   }
 
   async listTmuxWindows(id: string): Promise<TmuxWindow[]> {
-    return this.dockerService.execListTmuxWindows(this.dockerIdFor(id));
+    const info = this.containers.get(id);
+    if (!info) throw new Error("Container not found");
+    try {
+      return await this.dockerService.execListTmuxWindows(info.containerId);
+    } catch (error) {
+      this.markRuntimeUnknown(info, "Docker terminal inspection", error);
+      throw error;
+    }
   }
 
   async createTmuxWindow(id: string, name?: string): Promise<TmuxWindow> {
     const containerId = this.dockerIdFor(id);
     const windowName = name || `shell-${nanoid(4)}`;
-    await this.dockerService.execTmux(containerId, [
-      "new-window",
-      "-t",
-      "main:",
-      "-n",
-      windowName,
-    ]);
-    const windows = await this.dockerService.execListTmuxWindows(containerId);
+    const info = this.containers.get(id)!;
+    let windows: TmuxWindow[];
+    try {
+      await this.dockerService.execTmux(containerId, [
+        "new-window",
+        "-t",
+        "main:",
+        "-n",
+        windowName,
+      ]);
+      windows = await this.dockerService.execListTmuxWindows(containerId);
+    } catch (error) {
+      this.markRuntimeUnknown(info, "Docker terminal creation", error);
+      throw error;
+    }
     const created = windows.findLast((w) => w.name === windowName);
     if (!created) {
       throw new Error("Failed to find newly created tmux window");

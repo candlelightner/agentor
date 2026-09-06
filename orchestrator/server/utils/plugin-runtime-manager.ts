@@ -1,6 +1,9 @@
 import Docker from "dockerode";
 import { PassThrough } from "node:stream";
 import type { Duplex } from "node:stream";
+import { OperationDeadlineError, withOperationDeadline } from "./operation-deadline";
+
+const PLUGIN_DOCKER_TIMEOUT_MS = 30_000;
 import type { PluginDefinitionRecord } from "./plugin-definition-store";
 import { PluginDefinitionStore } from "./plugin-definition-store";
 import type {
@@ -492,28 +495,46 @@ export class DockerPluginWorkerExecutor implements PluginWorkerExecutor {
     let container: Docker.Container;
     try {
       container = this.docker.getContainer(containerId);
-      const exec = await container.exec({
-        Cmd: ["/home/agent/apps/plugin-runner/runner.py", operation],
-        AttachStdin: true,
-        AttachStdout: true,
-        AttachStderr: true,
-        Tty: false,
-        User: "agent",
-      });
+      const exec = await withOperationDeadline(
+        (operationSignal) => container.exec({
+          Cmd: ["/home/agent/apps/plugin-runner/runner.py", operation],
+          AttachStdin: true,
+          AttachStdout: true,
+          AttachStderr: true,
+          Tty: false,
+          User: "agent",
+          abortSignal: operationSignal,
+        }),
+        PLUGIN_DOCKER_TIMEOUT_MS,
+        "Docker plugin-runner setup",
+        signal,
+      );
       if (signal.aborted)
         throw runtimeError(
           "PLUGIN_RUNTIME_TIMEOUT",
           "Plugin runtime request timed out",
           504,
         );
-      stream = (await exec.start({
-        hijack: true,
-        stdin: true,
-        Tty: false,
-      })) as Duplex;
+      stream = (await withOperationDeadline(
+        (operationSignal) => exec.start({
+          hijack: true,
+          stdin: true,
+          Tty: false,
+          abortSignal: operationSignal,
+        }),
+        PLUGIN_DOCKER_TIMEOUT_MS,
+        "Docker plugin-runner start",
+        signal,
+      )) as Duplex;
     } catch (error) {
       if ((error as { code?: unknown })?.code === "PLUGIN_RUNTIME_TIMEOUT")
         throw error;
+      if (error instanceof OperationDeadlineError)
+        throw runtimeError(
+          "PLUGIN_RUNTIME_TIMEOUT",
+          "Plugin runtime request timed out",
+          504,
+        );
       throw runtimeError(
         "PLUGIN_RUNNER_UNAVAILABLE",
         "Plugin runner is unavailable",

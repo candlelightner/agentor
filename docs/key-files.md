@@ -48,8 +48,9 @@
 - `orchestrator/server/utils/git-providers.ts` - Git provider registry (GIT_PROVIDER_REGISTRY)
 - `orchestrator/server/utils/apps.ts` - App type registry (APP_REGISTRY)
 - `orchestrator/server/utils/package-manager-domains.ts` - Package-manager domain allowlist + `getPackageManagerDomains()` (the firewall allowlist for the `package-managers`/`custom` network modes)
-- `orchestrator/server/utils/docker.ts` - DockerService class (dockerode wrapper)
-- `orchestrator/server/utils/container.ts` - ContainerManager class (container lifecycle, archive/unarchive)
+- `orchestrator/server/utils/docker.ts` - DockerService class (dockerode wrapper; bounded task/runtime inspection, lifecycle operations, and persistence assertions)
+- `orchestrator/server/utils/operation-deadline.ts` / `request-cancellation.ts` - fixed-label bounded Docker-operation wrapper with safe timeout/abort diagnostics, plus HTTP disconnect-to-AbortSignal handling for cancellable preparation/streams
+- `orchestrator/server/utils/container.ts` / `worker-lifecycle-coordinator.ts` - ContainerManager lifecycle, archive/unarchive, desired-runtime reconciliation, unknown/recovering diagnostics, serialized recovery, and mutation occupancy protection against provisional-worker misclassification
 - `orchestrator/server/utils/host-mount-store.ts` / `host-mount-revocation.ts` - empty-by-default platform host-path catalog, per-account entitlement/grant/delegation graph, server-side source resolution, and durable stop/rebuild revocation enforcement
 - `orchestrator/server/utils/management-host-mount-domain.ts` / `orchestrator/server/api/host-mounts/` - platform/group management MCP and authenticated REST surfaces for the same host-mount policy
 - `worker/agents/role-skills/agentor-{global-administration,group-administration,worker-runtime}.md` - role-specific host-mount operating rules: platform catalog/entitlements, downward group delegation, and the ordinary-worker authority boundary
@@ -58,7 +59,7 @@
 - `orchestrator/server/utils/traefik-manager.ts` - TraefikManager class (Traefik container lifecycle, dynamic config generation)
 - `orchestrator/server/utils/update-checker.ts` - UpdateChecker class (GHCR digest polling, image pull, orchestrator self-replacement)
 - `orchestrator/server/utils/usage-checker.ts` - UsageChecker class (agent usage API polling, OAuth token refresh for Codex)
-- `orchestrator/server/utils/resource-monitor.ts` - ResourceMonitor class (in-memory singleton poller; PER-WORKER ONLY, all via the Docker API — cpu/mem/net from dockerode `container.stats` at 3s, disk = writable layer `SizeRw` + `du` of volumes at 60s; no host metrics, no persistence)
+- `orchestrator/server/utils/resource-monitor.ts` - ResourceMonitor class (in-memory singleton poller; PER-WORKER ONLY — cpu/mem/net from bounded dockerode `container.stats` at 3s, durable disk from bounded in-worker `du` of `/workspace` + agent data at 60s; no `inspect({ size: true })`, host metrics, or persistence)
 - `orchestrator/server/utils/worker-export.ts` - Worker export/import helpers (WorkerExportManifest type, tar bundle pack/extract, credential-stripping agents-tar filter — strips per-user OAuth creds, `.kilo/config`, `.kilo/shared-data`, and the legacy `.kilo/data/auth.json`)
 - `orchestrator/server/utils/export-job-store.ts` / `export-jobs.ts` - durable owner-scoped export metadata, bounded execution queue, progress/cancellation/restart recovery, artifact retention and cleanup
 - `orchestrator/server/utils/instance-backup-{types,crypto,bundle,store,manager}.ts` - platform-admin whole-instance disaster recovery: the `AGENTOR-INSTANCE-BACKUP-1` authenticated envelope, hardened nested bundle validation, consistent SQLite/`DATA_DIR` snapshot construction, optional Agentor-owned Docker-volume inventory/snapshot, provider discovery/adoption, durable jobs/idempotency, restore preflight, and staged helper launch. Instance and portable-worker provider selectors are intentionally separate.
@@ -66,7 +67,7 @@
 - `orchestrator/instance-restore-helper.mjs` - network-disabled one-shot restore helper copied into the orchestrator image. It validates the exact container/data-mount boundary, extracts without following archive paths, refuses volume overwrite, swaps control-plane data, optionally omits host-mount policy, records terminal job state, rolls back helper-owned changes on failure, and restarts the original orchestrator.
 - `orchestrator/server/api/admin/instance-backups/` - platform-admin REST surface for list/create, remote scan/inspect/adopt, local upload verification, artifact inspect/download/preflight/restore, and job status/incremental logs/cancel.
 - `orchestrator/server/utils/environments.ts` - EnvironmentStore class, network mode types, package manager domains list
-- `orchestrator/server/utils/worker-store.ts` - WorkerStore class (persistent worker metadata for archive/unarchive)
+- `orchestrator/server/utils/worker-store.ts` - WorkerStore class (persistent worker metadata for archive/unarchive and durable desired running/stopped intent)
 - `orchestrator/server/utils/user-credentials.ts` - UserCredentialManager class (per-user OAuth credential files at `<DATA_DIR>/users/<userId>/credentials/{claude,codex,gemini}.json` — Kilo's auth moved to the shared per-user data dir `<DATA_DIR>/users/<userId>/kilo/data`), ensures dirs/files, generates per-user bind strings (including the Kilo shared-data **directory** bind), statusList + reset) + AGENT_CREDENTIAL_MAPPINGS registry
 - `orchestrator/server/utils/user-env-store.ts` - UserEnvVarStore class (one file per user at `<DATA_DIR>/users/<userId>/env-vars.json` holding a uniform `envVars: [{ key, value }]` list — no hardcoded fields and no SSH handling; provides the `renderUserEnvVars` helper and a `getUserEnvVar(env, key)` lookup used e.g. for the GitHub token)
 - `orchestrator/server/utils/user-scoped-store.ts` - UserScopedJsonStore<K, V> base class. Loads from `<DATA_DIR>/users/*/<filename>` and keeps `Map<userId, Map<K, V>>` in memory; each user's file is persisted independently. Used by WorkerStore, PortMappingStore, DomainMappingStore, and the user half of the built-in-plus-user stores (Environments, Capabilities, Instructions, InitScripts).
@@ -96,6 +97,7 @@
 - `orchestrator/server/api/worker-metrics/index.get.ts` + `refresh.post.ts` - Per-worker metrics list + forced re-sample (caller-owned; admins see all; defines the WorkerMetrics/WorkerMetricsStatus OpenAPI schemas)
 - `orchestrator/server/api/containers/[id]/metrics.get.ts` - Single worker's metrics (ownership-checked)
 - `orchestrator/server/api/containers/[id]/export-jobs.post.ts` + `orchestrator/server/api/export-jobs/*` - create/status/cancel/authenticated streamed-download endpoints for durable worker exports
+- `orchestrator/server/api/containers/[id]/recover.post.ts` - owner/lock-checked bounded recovery of an unresponsive worker; verifies persistence and preserves volumes while replacing disposable compute
 - `orchestrator/server/api/containers/[id]/export.get.ts` - legacy synchronous compatibility export (workspace-only default; `?includeRootfs=true` is advanced)
 - `orchestrator/server/api/containers/import.post.ts` - Worker import (raw `.tar` body streamed to disk → `importWorker`)
 - `orchestrator/server/api/containers/[id]/files/index.get.ts` - Workspace file manager: one-level directory listing (defines the OpenAPI `FileEntry`/`FileListing` + mutation schemas for the group). Running-worker only, owner-scoped, no host-path access, executes as uid 1000.

@@ -1917,7 +1917,7 @@ export class ImageCatalogManager {
   ): Promise<{ passed: boolean; message: string }> {
     let container: Docker.Container | undefined;
     const run = async (resourceLimits: boolean) => {
-      container = await this.docker.createContainer({
+      container = await withImageDeleteTimeout(this.docker.createContainer({
         Image: reference,
         Entrypoint: argv,
         Cmd: [],
@@ -1944,15 +1944,18 @@ export class ImageCatalogManager {
           "agentor.image-validation": build.id,
           "agentor.image-definition": build.definitionId,
         },
-      });
+      }));
       this.validationContainers.set(build.id, container);
       try {
-        await container.start();
+        await withImageDeleteTimeout(container.start());
         const wait = container.wait();
         const result = await new Promise<any>((resolve, reject) => {
           const timeout = setTimeout(
             () => {
-              void container?.kill().catch(() => undefined);
+              if (container)
+                void withImageDeleteTimeout(container.kill()).catch(
+                  () => undefined,
+                );
               reject(new Error("Compatibility check timed out"));
             },
             Math.max(1, Math.min(timeoutSeconds, 300)) * 1000,
@@ -1977,7 +1980,9 @@ export class ImageCatalogManager {
             };
       } finally {
         this.validationContainers.delete(build.id);
-        await container.remove({ force: true }).catch(() => undefined);
+        await withImageDeleteTimeout(
+          container.remove({ force: true }),
+        ).catch(() => undefined);
         container = undefined;
       }
     };
@@ -2245,10 +2250,11 @@ export class ImageCatalogManager {
       if (!["queued", "running"].includes(build.status)) return build;
       clearTimeout(this.timers.get(id));
       this.buildStreams.get(id)?.destroy();
-      void this.validationContainers
-        .get(id)
-        ?.kill()
-        .catch(() => undefined);
+      const validationContainer = this.validationContainers.get(id);
+      if (validationContainer)
+        void withImageDeleteTimeout(validationContainer.kill()).catch(
+          () => undefined,
+        );
       build.status = "cancelled";
       build.phase = "cancelled";
       build.progress = 100;

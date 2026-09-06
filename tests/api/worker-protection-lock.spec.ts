@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test';
-import { createWorker, cleanupWorker } from '../helpers/worker-lifecycle';
+import { createWorker, cleanupWorker, waitForWorkerRunning } from '../helpers/worker-lifecycle';
 import { ApiClient } from '../helpers/api-client';
+import { captureCommandOutput } from '../helpers/terminal-ws';
 
 test.describe.serial('Worker protection locks', () => {
   let workerId = '';
@@ -41,6 +42,27 @@ test.describe.serial('Worker protection locks', () => {
     expect((await request.post(`/api/containers/${workerId}/stop`, { data: { lockPassword: password } })).status()).toBe(200);
     expect((await request.post(`/api/containers/${workerId}/restart`, { data: {} })).status()).toBe(423);
     expect((await request.post(`/api/containers/${workerId}/restart`, { data: { lockPassword: password } })).status()).toBe(200);
+  });
+
+  test('managed recovery enforces the lock and preserves workspace plus Codex state', async ({ request }) => {
+    test.setTimeout(180_000);
+    const marker = `recovery-${Date.now()}`;
+    await captureCommandOutput(
+      workerId,
+      `mkdir -p /home/agent/.agent-data/.codex/sessions && printf %s ${marker} > /workspace/recovery-marker && printf %s ${marker} > /home/agent/.agent-data/.codex/sessions/recovery-marker`,
+    );
+    const before = await request.get('/api/containers');
+    const oldContainerId = (await before.json()).find((item: any) => item.id === workerId)?.containerId;
+
+    expect((await request.post(`/api/containers/${workerId}/recover`, { data: {} })).status()).toBe(423);
+    const recovered = await request.post(`/api/containers/${workerId}/recover`, {
+      data: { lockPassword: password },
+    });
+    expect(recovered.status()).toBe(200);
+    expect((await recovered.json()).containerId).not.toBe(oldContainerId);
+    await waitForWorkerRunning(request, workerId, 90_000);
+    expect(await captureCommandOutput(workerId, 'cat /workspace/recovery-marker')).toContain(marker);
+    expect(await captureCommandOutput(workerId, 'cat /home/agent/.agent-data/.codex/sessions/recovery-marker')).toContain(marker);
   });
 
   test('enforces the lock on every running-workspace file mutation without returning the credential', async ({ request }) => {

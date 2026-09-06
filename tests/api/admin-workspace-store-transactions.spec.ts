@@ -12,6 +12,14 @@ import {
   withWorkerNetworkMutation,
 } from "../../orchestrator/server/utils/worker-group-manager";
 import type { WorkerGroup } from "../../orchestrator/server/utils/worker-group-store";
+import {
+  OperationDeadlineError,
+  operationSettlement,
+} from "../../orchestrator/server/utils/operation-deadline";
+import {
+  administrativeOwnerEnvironment,
+  DockerAdminWorkspaceRuntime,
+} from "../../orchestrator/server/utils/admin-workspace-runtime";
 
 function runtime(overrides: Partial<AdminWorkspaceRuntimeAdapter> = {}) {
   return {
@@ -48,6 +56,108 @@ function groupRecord(ownerId: string, groupId: string) {
   };
   return { group, workspace };
 }
+
+test("administrative owner environment cannot override credential-routing control-plane keys", () => {
+  const environment = administrativeOwnerEnvironment({
+    userId: "owner-a",
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString(),
+    envVars: [
+      { key: "AGENTOR_MANAGEMENT_MCP_URL", value: "https://invalid.example/mcp" },
+      { key: "AGENTOR_MANAGEMENT_MCP_CREDENTIAL", value: "/workspace/not-a-credential" },
+      { key: "AGENTOR_MANAGEMENT_MCP_TIMEOUT_MS", value: "120000" },
+      { key: "ORCHESTRATOR_URL", value: "https://invalid.example" },
+      { key: "AGENTOR_RUNTIME_ROLE", value: "platform-admin" },
+      { key: "SAFE_OWNER_SETTING", value: "retained" },
+    ],
+  });
+  expect(environment).toEqual(["SAFE_OWNER_SETTING=retained"]);
+});
+
+test("unconsumed administrative bootstrap credentials expire and are cleared in-process", () => {
+  const runtime = new DockerAdminWorkspaceRuntime({} as any) as any;
+  runtime.rememberPendingCredential("admin-test", "test-credential");
+  expect(runtime.takePendingCredential("admin-test")).toBe("test-credential");
+
+  runtime.pendingCredentials.get("admin-test").expiresAt = 0;
+  expect(runtime.takePendingCredential("admin-test")).toBeUndefined();
+  expect(runtime.pendingCredentials.has("admin-test")).toBe(false);
+});
+
+test("start-boundary credentials survive an old-runtime refresh until the replacement consumes them", async () => {
+  const runtime = new DockerAdminWorkspaceRuntime({} as any) as any;
+  runtime.docker = {
+    getContainer: () => ({
+      inspect: async () => ({ State: { Running: true } }),
+    }),
+  };
+  runtime.writeCredential = async () => undefined;
+
+  await runtime.materializeCredential(
+    "replacement-credential",
+    undefined,
+    "prepare-start",
+  );
+  expect(runtime.takePendingCredential("agentor-admin-workspace")).toBe(
+    "replacement-credential",
+  );
+
+  await runtime.materializeCredential(
+    "refreshed-credential",
+    undefined,
+    "refresh-running",
+  );
+  expect(
+    runtime.takePendingCredential("agentor-admin-workspace"),
+  ).toBeUndefined();
+});
+
+test("slow administrative preparation mints the short-lived identity only at the actual start boundary", async () => {
+  const sequence: string[] = [];
+  const container = {
+    inspect: async () => ({ State: { Running: false } }),
+    start: async () => { sequence.push("start"); },
+    stop: async () => undefined,
+  };
+  const runtime = new DockerAdminWorkspaceRuntime({} as any) as any;
+  runtime.docker = { getContainer: () => container };
+  runtime.writeCredential = async (_container: unknown, credential: string) => {
+    expect(credential).toBe("just-in-time-credential");
+    sequence.push("write");
+  };
+  const stamp = new Date().toISOString();
+  const record: AdministrativeWorkspaceRecord = {
+    schemaVersion: 1,
+    id: "admin-jit-test",
+    kind: "administrative",
+    trusted: true,
+    status: "running",
+    createdAt: stamp,
+    updatedAt: stamp,
+  };
+
+  await runtime.prepareCredential(record, async () => {
+    sequence.push("issue");
+    return "just-in-time-credential";
+  });
+  expect(sequence).toEqual([]);
+  expect(runtime.pendingCredentials.size).toBe(0);
+  expect(runtime.pendingCredentialIssuers.size).toBe(1);
+
+  // Represents an arbitrarily slow image/overlay preparation phase. No raw
+  // identity exists until startWithPreparedCredential reaches the gate.
+  sequence.push("preflight-complete");
+  await runtime.startWithPreparedCredential(container, record);
+
+  expect(sequence).toEqual([
+    "preflight-complete",
+    "issue",
+    "start",
+    "write",
+  ]);
+  expect(runtime.pendingCredentialIssuers.size).toBe(0);
+  expect(runtime.pendingCredentials.size).toBe(0);
+});
 
 class FakeGroups {
   records = new Map<string, WorkerGroup>();
@@ -133,6 +243,78 @@ test("global admin persistence rejection does not publish an uncommitted script"
   });
 });
 
+test("global admin materializes its identity with start and refresh intents", async () => {
+  const events: string[] = [];
+  const store = new AdminWorkspaceStore("/unused", async () => {});
+  store.setRuntimeAdapter(runtime({
+    ensure: async () => { events.push("ensure"); },
+    start: async () => { events.push("start"); },
+    rebuild: async () => { events.push("rebuild"); },
+  }));
+  store.setIdentityMaterializer(async (_record, intent) => {
+    events.push(`identity:${intent}`);
+  });
+
+  await store.ensure();
+  expect(events).toEqual([
+    "identity:prepare-start",
+    "ensure",
+    "identity:refresh-running",
+  ]);
+  events.length = 0;
+  await store.setStatus("stopped");
+  await store.setStatus("running");
+  expect(events).toEqual([
+    "identity:prepare-start",
+    "start",
+    "identity:refresh-running",
+  ]);
+  events.length = 0;
+  await store.rebuild();
+  expect(events).toEqual([
+    "identity:prepare-start",
+    "rebuild",
+    "identity:refresh-running",
+  ]);
+});
+
+test("global admin retries stay fenced until an aborted Docker mutation settles", async () => {
+  const store = new AdminWorkspaceStore("/unused", async () => {});
+  let startCalls = 0;
+  let releaseDocker!: () => void;
+  const dockerSettlement = new Promise<void>((resolve) => {
+    releaseDocker = resolve;
+  });
+  const timeout = new OperationDeadlineError(
+    "DOCKER_OPERATION_TIMEOUT",
+    "admin workspace start",
+    30_000,
+  );
+  Object.defineProperty(timeout, operationSettlement, {
+    value: dockerSettlement,
+    enumerable: false,
+  });
+  store.setRuntimeAdapter(runtime({
+    start: async () => {
+      startCalls++;
+      if (startCalls === 1) throw timeout;
+    },
+  }));
+
+  await store.ensure();
+  await store.setStatus("stopped");
+  await expect(store.setStatus("running")).rejects.toMatchObject({
+    code: "DOCKER_OPERATION_TIMEOUT",
+  });
+  const retry = store.setStatus("running");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(startCalls).toBe(1);
+
+  releaseDocker();
+  await expect(retry).resolves.toMatchObject({ status: "running" });
+  expect(startCalls).toBe(2);
+});
+
 test("group admin runtime success is persisted on retry without a second stop", async () => {
   const ownerId = `group-admin-transaction-${Date.now()}`;
   const groupId = `${ownerId}-group`;
@@ -202,6 +384,45 @@ test("group admin rebuild acknowledgement retry does not rebuild twice", async (
   expect(fake.findById(groupId)?.adminWorkspace).toMatchObject({
     imageDigest: `sha256:${"a".repeat(64)}`,
   });
+});
+
+test("group admin materializes its identity with start and refresh intents", async () => {
+  const ownerId = `group-admin-identity-${Date.now()}`;
+  const groupId = `${ownerId}-group`;
+  const fake = new FakeGroups();
+  fake.records.set(groupId, groupRecord(ownerId, groupId).group);
+  const events: string[] = [];
+  const store = new GroupAdminWorkspaceStore(fake as any);
+  store.setRuntimeAdapter(runtime({
+    ensure: async () => { events.push("ensure"); },
+    start: async () => { events.push("start"); },
+    rebuild: async () => { events.push("rebuild"); },
+  }));
+  store.setIdentityMaterializer(async (_record, intent) => {
+    events.push(`identity:${intent}`);
+  });
+
+  await store.ensure(groupId);
+  expect(events).toEqual([
+    "identity:prepare-start",
+    "ensure",
+    "identity:refresh-running",
+  ]);
+  events.length = 0;
+  await store.setStatus(groupId, "stopped");
+  await store.setStatus(groupId, "running");
+  expect(events).toEqual([
+    "identity:prepare-start",
+    "start",
+    "identity:refresh-running",
+  ]);
+  events.length = 0;
+  await store.rebuild(groupId, ownerId);
+  expect(events).toEqual([
+    "identity:prepare-start",
+    "rebuild",
+    "identity:refresh-running",
+  ]);
 });
 
 test("group admin state mutations are cloned and wait behind live group deletion", async () => {

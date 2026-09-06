@@ -120,8 +120,15 @@ function handleTerminalOpen(peer: Peer): void {
       });
     })
     .catch((err) => {
-      useLogger().error(`[terminal-ws] Exec error: ${err.message}`);
-      try { peer.send(`\r\nError connecting to container: ${err.message}\r\n`); } catch {}
+      useContainerManager().reportRuntimeFailure(
+        params.workerId,
+        'Docker terminal attach',
+        err,
+      );
+      useLogger().error(
+        `[terminal-ws] worker ${params.workerId} terminal attach failed: ${(err as { code?: string })?.code || 'runtime unavailable'}`,
+      );
+      try { peer.send('\r\nWorker runtime is unavailable. Retry or use managed recovery.\r\n'); } catch {}
       ctx.closed = true;
       cleanupPeerContext(peer);
       try { peer.close(); } catch {}

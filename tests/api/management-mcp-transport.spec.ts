@@ -154,3 +154,146 @@ test("MCP diagnostic codes are allowlisted", async () => {
     await transport.stop();
   }
 });
+
+test("MCP exposes bounded lifecycle timeout diagnostics without Docker details", async () => {
+  const port = await unusedPort();
+  const transport = new ManagementMcpTransport({
+    invoke: async () => {
+      throw Object.assign(new Error("Docker worker task probe did not respond within 8000ms"), {
+        statusCode: 504,
+        code: "DOCKER_OPERATION_TIMEOUT",
+        data: {
+          code: "DOCKER_OPERATION_TIMEOUT",
+          operation: "Docker worker task probe",
+          timeoutMs: 8_000,
+          retryable: true,
+          nextAction: "Retry the individual operation or use managed worker recovery; other workers remain available.",
+          dockerMessage: "SECRET=must-not-leak",
+          command: ["sh", "-c", "SECRET=must-not-leak"],
+        },
+        cause: new Error("SECRET=must-not-leak"),
+      });
+    },
+  } as any, port);
+  await transport.start("127.0.0.1");
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 12, method: "tools/call", params: { name: "workers.restart", arguments: { workerId: "worker-a" } } }),
+    });
+    const body = await response.json();
+    expect(body.result.structuredContent.error).toMatchObject({
+      statusCode: 504,
+      code: "DOCKER_OPERATION_TIMEOUT",
+      diagnostic: {
+        code: "DOCKER_OPERATION_TIMEOUT",
+        operation: "Docker worker task probe",
+        timeoutMs: 8_000,
+        retryable: true,
+      },
+    });
+    expect(body.result.structuredContent.error.diagnostic).not.toHaveProperty("dockerMessage");
+    expect(body.result.structuredContent.error.diagnostic).not.toHaveProperty("command");
+    expect(JSON.stringify(body)).not.toContain("must-not-leak");
+  } finally {
+    await transport.stop();
+  }
+});
+
+test("MCP never uses raw lifecycle or daemon errors as tool text", async () => {
+  const port = await unusedPort();
+  let call = 0;
+  const transport = new ManagementMcpTransport({
+    invoke: async () => {
+      call++;
+      if (call === 1)
+        throw Object.assign(
+          new Error(
+            "Docker conflict for container 1a2b3c4d: command sh -c SECRET=must-not-leak",
+          ),
+          { statusCode: 409 },
+        );
+      throw Object.assign(
+        new Error(
+          "Docker daemon failed for container 1a2b3c4d: SECRET=must-not-leak",
+        ),
+        {
+          statusCode: 503,
+          code: "WORKER_TASK_UNRESPONSIVE",
+          data: {
+            code: "WORKER_TASK_UNRESPONSIVE",
+            operation: "Docker worker task probe",
+            retryable: true,
+          },
+        },
+      );
+    },
+  } as any, port);
+  await transport.start("127.0.0.1");
+  try {
+    for (const id of [14, 15]) {
+      const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: { name: "workers.recover", arguments: { workerId: "worker-a" } },
+        }),
+      });
+      const body = await response.json();
+      expect(body.result.isError).toBe(true);
+      expect(JSON.stringify(body)).not.toContain("1a2b3c4d");
+      expect(JSON.stringify(body)).not.toContain("must-not-leak");
+      expect(JSON.stringify(body)).not.toContain("sh -c");
+    }
+  } finally {
+    await transport.stop();
+  }
+});
+
+test("MCP recovery errors expose preservation and retry fields only", async () => {
+  const port = await unusedPort();
+  const transport = new ManagementMcpTransport({
+    invoke: async () => {
+      throw Object.assign(new Error("Managed recovery could not clear the stale Docker object"), {
+        statusCode: 503,
+        code: "WORKER_RECOVERY_DAEMON_STALE",
+        data: {
+          code: "WORKER_RECOVERY_DAEMON_STALE",
+          workerId: "worker-a",
+          phase: "remove-stale-runtime",
+          volumesPreserved: true,
+          retryable: true,
+          containerId: "SECRET=must-not-leak",
+        },
+      });
+    },
+  } as any, port);
+  await transport.start("127.0.0.1");
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 13, method: "tools/call", params: { name: "workers.recover", arguments: { workerId: "worker-a" } } }),
+    });
+    const body = await response.json();
+    expect(body.result.structuredContent.error).toMatchObject({
+      statusCode: 503,
+      code: "WORKER_RECOVERY_DAEMON_STALE",
+      diagnostic: {
+        code: "WORKER_RECOVERY_DAEMON_STALE",
+        workerId: "worker-a",
+        phase: "remove-stale-runtime",
+        volumesPreserved: true,
+        retryable: true,
+      },
+    });
+    expect(body.result.structuredContent.error.diagnostic).not.toHaveProperty("containerId");
+    expect(JSON.stringify(body)).not.toContain("must-not-leak");
+  } finally {
+    await transport.stop();
+  }
+});

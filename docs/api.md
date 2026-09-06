@@ -14,6 +14,8 @@ Auto-generated OpenAPI 3.1.0 docs powered by Nitro's built-in OpenAPI support. Z
 
 Worker-group list/get responses retain `workerIds` for direct membership and add `memberCounts` with direct `total`, `active`, and `archived` counts. Archived workers remain group members until unarchived, reassigned, or permanently deleted. The management MCP `groups.list` returns the same additive summary.
 
+Container responses distinguish durable `desiredRuntimeStatus` (`running`/`stopped`) from the current Docker observation. Besides normal states, `starting`, `recovering`, and `unknown` may be returned; `unknown` carries only a safe retryable runtime diagnostic. `POST /api/containers/:id/recover` is the bounded, owner/lock-checked recovery endpoint for an unresponsive worker: persistent mounts are verified, only the disposable container is replaced, managed secrets are bootstrapped, and desired plugins are reconciled. It returns 409 when persistence cannot be verified and 503 when Docker cannot yet clear stale runtime state; it never removes persistent volumes. Management MCP provides the equivalent `workers.recover` tool and projects only structured safe diagnostics (code, operation/phase, retryability, timeout, and preservation state), never Docker command text, environment values, or credentials.
+
 The **Host mounts** API (`/api/host-mounts*`) separates the platform raw-path
 catalog, per-account entitlements, and owner all/group/worker assignments.
 Catalog creation is the only route that accepts a raw host source. Worker create

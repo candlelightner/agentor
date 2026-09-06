@@ -802,7 +802,14 @@ export class ManagementMcpStore {
   }
   async issue(workspaceId: string, ttlSeconds = 60) {
     this.pruneExpiredIdentities();
-    const workspace = await useAdminWorkspaceStore().ensure();
+    // Identity preparation is now a pre-start hook of the administrative
+    // workspace store. Calling ensure() recursively from that hook would wait
+    // on the store's own serialization queue forever. A committed record is
+    // already authoritative and can be read without provisioning compute;
+    // retain ensure() only for older callers that issue before first setup.
+    const adminWorkspace = useAdminWorkspaceStore();
+    const workspace =
+      adminWorkspace.getRecord?.() ?? (await adminWorkspace.ensure());
     const groupWorkspace =
       useGroupAdminWorkspaceStore().findByWorkspaceId(workspaceId);
     if (workspace.id !== workspaceId && !groupWorkspace)
@@ -2678,6 +2685,8 @@ function publicWorker(worker: any) {
     userId: worker.userId,
     displayName: worker.displayName,
     status: worker.status,
+    desiredRuntimeStatus: worker.desiredRuntimeStatus,
+    runtimeDiagnostic: worker.runtimeDiagnostic,
     imageName: worker.imageName,
     environmentId: worker.environmentId,
     pendingRebuild: Boolean(worker.pendingRebuild),

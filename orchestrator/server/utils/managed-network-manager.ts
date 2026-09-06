@@ -7,6 +7,10 @@ import {
 } from "./services";
 import type { ManagedNetwork } from "./managed-network-store";
 import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
+import { withOperationDeadline } from "./operation-deadline";
+
+const DOCKER_READ_TIMEOUT_MS = 8_000;
+const DOCKER_MUTATION_TIMEOUT_MS = 30_000;
 
 const forbidden = (name: string) =>
   name === "agentor-management" || /management|internal/i.test(name);
@@ -46,9 +50,11 @@ export class ManagedNetworkManager {
     for (const id of target) {
       const worker = manager.get(id);
       if (!worker || !worker.containerId || currentByName.has(worker.containerName)) continue;
-      await this.docker
-        .getNetwork(network.dockerName)
-        .connect({ Container: worker.containerId })
+      await withOperationDeadline(
+        this.docker.getNetwork(network.dockerName).connect({ Container: worker.containerId }),
+        DOCKER_MUTATION_TIMEOUT_MS,
+        'Docker managed-network attachment',
+      )
         .catch((error: any) => failures.push(`attach ${id}: ${safeMessage(error)}`));
     }
     for (const [name, containerId] of currentByName) {
@@ -56,9 +62,11 @@ export class ManagedNetworkManager {
       // A managed bridge is only for its selected Agentor workers. Do not let
       // a manually attached container quietly become a peer on that network.
       if (worker && target.has(worker.id)) continue;
-      await this.docker
-        .getNetwork(network.dockerName)
-        .disconnect({ Container: containerId, Force: true })
+      await withOperationDeadline(
+        this.docker.getNetwork(network.dockerName).disconnect({ Container: containerId, Force: true }),
+        DOCKER_MUTATION_TIMEOUT_MS,
+        'Docker managed-network detachment',
+      )
         .catch((error: any) => failures.push(`detach ${worker?.id || name}: ${safeMessage(error)}`));
     }
     return { workerIds: [...target], partialFailures: failures };
@@ -75,13 +83,13 @@ export class ManagedNetworkManager {
     this.assertSafe(network);
     try {
       const target=this.docker.getNetwork(network.dockerName);
-      const inspection=await target.inspect();
+      const inspection = await withOperationDeadline(target.inspect(), DOCKER_READ_TIMEOUT_MS, 'Docker managed-network inspection');
       // Docker refuses to remove a bridge with attached endpoints. A managed
       // delete is explicitly the detach+remove operation, and this network has
       // already passed the Agentor label/name boundary above.
       for(const containerId of Object.keys(inspection.Containers||{}))
-        await target.disconnect({Container:containerId,Force:true});
-      await target.remove();
+        await withOperationDeadline(target.disconnect({ Container: containerId, Force: true }), DOCKER_MUTATION_TIMEOUT_MS, 'Docker managed-network removal detachment');
+      await withOperationDeadline(target.remove(), DOCKER_MUTATION_TIMEOUT_MS, 'Docker managed-network removal');
     } catch (error: any) {
       if (error?.statusCode === 404) return;
       throw createError({ statusCode: 409, statusMessage: `Network removal failed: ${safeMessage(error)}` });
@@ -90,7 +98,11 @@ export class ManagedNetworkManager {
 
   async topology(network: ManagedNetwork) {
     this.assertSafe(network);
-    const inspection = await this.docker.getNetwork(network.dockerName).inspect().catch(() => null);
+    const inspection = await withOperationDeadline(
+      this.docker.getNetwork(network.dockerName).inspect(),
+      DOCKER_READ_TIMEOUT_MS,
+      'Docker managed-network topology inspection',
+    ).catch(() => null);
     return {
       network,
       exists: Boolean(inspection),
@@ -124,7 +136,11 @@ export class ManagedNetworkManager {
 
   private async ensure(network: ManagedNetwork) {
     try {
-      const existing = await this.docker.getNetwork(network.dockerName).inspect();
+      const existing = await withOperationDeadline(
+        this.docker.getNetwork(network.dockerName).inspect(),
+        DOCKER_READ_TIMEOUT_MS,
+        'Docker managed-network inspection',
+      );
       if (
         existing.Driver !== "bridge" ||
         existing.Internal ||
@@ -136,14 +152,18 @@ export class ManagedNetworkManager {
     } catch (error: any) {
       if (error?.statusCode !== 404) throw error;
     }
-    await this.docker.createNetwork({
+    await withOperationDeadline(this.docker.createNetwork({
       Name: network.dockerName,
       Driver: "bridge",
       Internal: false,
       CheckDuplicate: true,
       Labels: { "agentor.managed-network": "true", "agentor.owner": network.userId },
-    });
-    return this.docker.getNetwork(network.dockerName).inspect();
+    }), DOCKER_MUTATION_TIMEOUT_MS, 'Docker managed-network creation');
+    return withOperationDeadline(
+      this.docker.getNetwork(network.dockerName).inspect(),
+      DOCKER_READ_TIMEOUT_MS,
+      'Docker managed-network post-create inspection',
+    );
   }
 }
 

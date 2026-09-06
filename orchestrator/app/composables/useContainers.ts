@@ -26,6 +26,18 @@ export function useContainers() {
     await refresh();
   }
 
+  async function recoverContainer(
+    id: string,
+    lockPassword?: string,
+  ): Promise<ContainerInfo> {
+    const result = await $fetch<ContainerInfo>(`/api/containers/${id}/recover`, {
+      method: 'POST',
+      body: lockPassword ? { lockPassword } : {},
+    });
+    await refresh();
+    return result;
+  }
+
   async function rebuildContainer(id: string): Promise<ContainerInfo> {
     const result = await $fetch<ContainerInfo>(`/api/containers/${id}/rebuild`, { method: 'POST' });
     await refresh();
@@ -68,6 +80,7 @@ export function useContainers() {
     createContainer,
     stopContainer,
     restartContainer,
+    recoverContainer,
     rebuildContainer,
     removeContainer,
     updateContainerSettings,

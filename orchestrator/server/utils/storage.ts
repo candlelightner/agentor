@@ -3,11 +3,13 @@ import { mkdir, rm, chmod, chown, stat, writeFile, readFile } from 'node:fs/prom
 import { dirname, join } from 'node:path';
 import type { Config } from './config';
 import { assertSafeUserId } from './user-id';
+import { withOperationDeadline } from './operation-deadline';
 
 type StorageMode = 'volume' | 'directory';
 
 const AGENT_UID = 1000;
 const AGENT_GID = 1000;
+const STORAGE_DOCKER_TIMEOUT_MS = 30_000;
 
 /** Relative paths inside a worker's agents directory where the orchestrator
  * pre-creates empty mountpoint files. Docker Desktop's virtiofs refuses to
@@ -70,7 +72,7 @@ export class StorageManager {
 
     try {
       const container = this.docker.getContainer(hostname);
-      const info = await container.inspect();
+      const info = await withOperationDeadline(container.inspect(), STORAGE_DOCKER_TIMEOUT_MS, 'Docker storage mount inspection');
 
       const dataMount = info.Mounts?.find(
         (m: { Destination: string }) => m.Destination === this.dataDir
@@ -381,7 +383,7 @@ export class StorageManager {
   private async removeVolume(volumeName: string): Promise<void> {
     try {
       const volume = this.docker.getVolume(volumeName);
-      await volume.remove();
+      await withOperationDeadline(volume.remove(), STORAGE_DOCKER_TIMEOUT_MS, 'Docker worker-volume cleanup');
     } catch (error) {
       // Absence is idempotent success. Propagate daemon, permission, and
       // in-use failures so rollback callers can report incomplete cleanup;

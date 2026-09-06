@@ -5,9 +5,12 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
   testDir: ".",
   testMatch: [
+    "api/admin-workspace-store-transactions.spec.ts",
+    "api/container-store-quarantine.spec.ts",
     "api/instance-backup-*.spec.ts",
     "api/instance-restore-helper.spec.ts",
     "api/management-image-backup-domain.spec.ts",
+    "api/workspace-download-cancellation.spec.ts",
   ],
   fullyParallel: false,
   workers: 1,

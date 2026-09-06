@@ -74,39 +74,37 @@ test.describe('Per-worker metrics API', () => {
     expect(typeof body.lastChecked).toBe('string');
   });
 
-  test('worker disk usage (writable layer + volumes) is non-zero after a forced sample', async ({ request }) => {
+  test('worker durable disk usage is non-zero after a forced sample', async ({ request }) => {
     test.setTimeout(60_000);
     const api = new ApiClient(request);
     // Disk samples on a slow cadence; the refresh endpoint forces an immediate
-    // sample (du of the volumes + the container's SizeRw writable layer).
+    // sample (a bounded du of /workspace and persistent agent data).
     await api.refreshWorkerMetrics();
     const { status, body } = await api.getContainerMetrics(workerId);
     expect(status).toBe(200);
-    // A running worker always uses some disk (agent-data configs + writable layer).
+    // A running worker always uses some durable disk (agent-data configuration).
     expect(body.diskUsedBytes).toBeGreaterThan(0);
   });
 
-  test('worker disk counts the container writable layer, not just volumes', async ({ request }) => {
+  test('worker disk counts durable workspace growth without inspect size', async ({ request }) => {
     test.setTimeout(150_000);
     const api = new ApiClient(request);
     await api.refreshWorkerMetrics();
     const before = (await api.getContainerMetrics(workerId)).body.diskUsedBytes as number;
 
-    // Write 40 MB to a path in the container's WRITABLE LAYER (/home/agent is not
-    // a volume — only /home/agent/.agent-data is). The `du` of the volumes won't
-    // see this; only the SizeRw writable-layer measurement will. Match on the
-    // shell-computed file size (not the echoed command literal).
+    // Write 40 MB to the durable workspace. Match on the shell-computed file
+    // size (not the echoed command literal).
     await runInFreshWindow(
       request,
       workerId,
-      'dd if=/dev/zero of=/home/agent/.disktest bs=1M count=40 2>/dev/null; echo "SZ=$(stat -c %s /home/agent/.disktest)"',
+      'dd if=/dev/zero of=/workspace/.disktest bs=1M count=40 2>/dev/null; echo "SZ=$(stat -c %s /workspace/.disktest)"',
       /SZ=\d{7,}/,
       60_000,
     );
 
     await api.refreshWorkerMetrics();
     const after = (await api.getContainerMetrics(workerId)).body.diskUsedBytes as number;
-    // The 40 MB writable-layer file must be reflected — proves SizeRw is counted.
+    // The 40 MB durable file must be reflected without a fragile SizeRw walk.
     expect(after - before).toBeGreaterThan(30 * 1024 * 1024);
   });
 

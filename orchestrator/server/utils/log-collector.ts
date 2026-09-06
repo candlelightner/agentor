@@ -6,6 +6,9 @@ import type { Config } from './config';
 import type { LogLevel, LogSource, LogEntry } from '../../shared/types';
 import { shouldLog } from './log-levels';
 import { useContainerManager } from './services';
+import { withOperationDeadline } from './operation-deadline';
+
+const LOG_DOCKER_TIMEOUT_MS = 8_000;
 
 interface AttachedStream {
   stream: NodeJS.ReadableStream;
@@ -43,7 +46,11 @@ export class LogCollector {
     try {
       const id = hostname();
       const container = this.docker.getContainer(id);
-      const info = await container.inspect();
+      const info = await withOperationDeadline(
+        (signal) => container.inspect({ abortSignal: signal }),
+        LOG_DOCKER_TIMEOUT_MS,
+        'Docker self-log inspection',
+      );
       const name = (info.Name || '').replace(/^\//, '') || id;
       await this.attach(name, info.Id, 'orchestrator', undefined, { sinceNow: true });
     } catch {
@@ -55,9 +62,19 @@ export class LogCollector {
     // Attach to all running managed containers (workers + traefik). Use
     // sinceNow so an orchestrator restart does not replay historical lines
     // that were already written to disk during the previous lifetime.
-    const containers = await this.docker.listContainers({
-      filters: { label: ['agentor.managed'] },
-    });
+    let containers: Docker.ContainerInfo[];
+    try {
+      containers = await withOperationDeadline(
+        (signal) => this.docker.listContainers({
+          filters: { label: ['agentor.managed'] },
+          abortSignal: signal,
+        }),
+        LOG_DOCKER_TIMEOUT_MS,
+        'Docker log-collector inventory',
+      );
+    } catch {
+      return;
+    }
 
     for (const info of containers) {
       const name = (info.Names[0] || '').replace(/^\//, '');
@@ -99,9 +116,17 @@ export class LogCollector {
       if (options.sinceNow) {
         logsOpts.since = Math.floor(Date.now() / 1000);
       }
-      const stream = await container.logs(logsOpts);
+      const stream = await withOperationDeadline(
+        (signal) => container.logs({ ...logsOpts, abortSignal: signal }),
+        LOG_DOCKER_TIMEOUT_MS,
+        'Docker log stream setup',
+      );
 
-      const containerInfo = await container.inspect();
+      const containerInfo = await withOperationDeadline(
+        (signal) => container.inspect({ abortSignal: signal }),
+        LOG_DOCKER_TIMEOUT_MS,
+        'Docker log-container inspection',
+      );
       const isTty = containerInfo.Config?.Tty ?? false;
 
       const ingest = (line: string, levelOverride?: LogLevel) => {
@@ -173,7 +198,29 @@ export class LogCollector {
         displayName,
         destroy,
       });
-    } catch {}
+      (stream as NodeJS.ReadableStream).once('error', (error) => {
+        if (source === 'worker') {
+          const worker = useContainerManager().findByContainerName(containerName);
+          if (worker)
+            useContainerManager().reportRuntimeFailure(
+              worker.id,
+              'Docker worker log stream',
+              error,
+            );
+        }
+        this.detach(containerId);
+      });
+    } catch (error) {
+      if (source === 'worker') {
+        const worker = useContainerManager().findByContainerName(containerName);
+        if (worker)
+          useContainerManager().reportRuntimeFailure(
+            worker.id,
+            'Docker worker log attachment',
+            error,
+          );
+      }
+    }
   }
 
   detach(containerId: string): void {

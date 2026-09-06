@@ -29,6 +29,7 @@ defineRouteMeta({
 
 import { resolveFilesAccess } from '../../../../utils/files-route-helpers';
 import { rethrowAsHttpError } from '../../../../utils/http-errors';
+import { requestCancellation } from '../../../../utils/request-cancellation';
 
 /** Build a safe Content-Disposition filename from a relative workspace path. */
 function safeAttachmentName(rel: string): string {
@@ -43,20 +44,26 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 400, statusMessage: 'paths must be an array' });
   }
 
+  const cancellation = requestCancellation(event);
   let result: Awaited<ReturnType<typeof cm.downloadFiles>>;
   try {
-    result = await cm.downloadFiles(id, body.paths);
+    result = await cm.downloadFiles(id, body.paths, cancellation.signal);
   } catch (err) {
+    cancellation.detach();
     rethrowAsHttpError(err);
   }
+
+  const abortStream = () => result.stream.destroy();
+  cancellation.signal.addEventListener('abort', abortStream, { once: true });
+  result.stream.once('close', () => {
+    cancellation.signal.removeEventListener('abort', abortStream);
+    cancellation.detach();
+  });
 
   if (result.kind === 'file') {
     const name = safeAttachmentName(result.entry.path);
     // If the client disconnects before the file is fully sent, destroy the
     // stream so the Docker tar source is torn down (backpressure cleanup).
-    event.node.res.on('close', () => {
-      if (!event.node.res.writableEnded) result.stream.destroy();
-    });
     // Single file: the size is known from lstat, so set Content-Length and let
     // the HTTP layer frame the body (no chunked encoding) — clients can show
     // progress and resume cleanly. Close cleanup is retained above.
@@ -70,9 +77,6 @@ export default defineEventHandler(async (event) => {
 
   // ZIP stream. Tear down on client close so the Docker tar sources + archiver
   // are aborted rather than buffering the whole archive after disconnect.
-  event.node.res.on('close', () => {
-    if (!event.node.res.writableEnded) result.stream.destroy();
-  });
   setResponseHeaders(event, {
     'Content-Type': 'application/zip',
     'Content-Disposition': 'attachment; filename="workspace-download.zip"',

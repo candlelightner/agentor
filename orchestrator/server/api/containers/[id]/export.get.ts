@@ -22,6 +22,7 @@ defineRouteMeta({
 import { useContainerManager } from '../../../utils/services';
 import { requireContainerAccess } from '../../../utils/auth-helpers';
 import { rethrowAsHttpError } from '../../../utils/http-errors';
+import { requestCancellation } from '../../../utils/request-cancellation';
 
 export default defineEventHandler(async (event) => {
   const id = getRouterParam(event, 'id')!;
@@ -38,16 +39,22 @@ export default defineEventHandler(async (event) => {
   // here (mapped from the manager's statusCode-tagged error) rather than a 500.
   let stream: Awaited<ReturnType<typeof mgr.exportWorker>>['stream'];
   let filename: string;
+  const cancellation = requestCancellation(event);
   try {
-    ({ stream, filename } = await mgr.exportWorker(id, { includeRootfs }));
+    ({ stream, filename } = await mgr.exportWorker(id, {
+      includeRootfs,
+      signal: cancellation.signal,
+    }));
   } catch (err) {
+    cancellation.detach();
     rethrowAsHttpError(err);
   }
 
-  // If the client disconnects before the bundle is fully sent, destroy the
-  // stream so its 'close' handler fires and the temp dir is cleaned up.
-  event.node.res.on('close', () => {
-    if (!event.node.res.writableEnded) stream.destroy();
+  const abortStream = () => stream.destroy();
+  cancellation.signal.addEventListener('abort', abortStream, { once: true });
+  stream.once('close', () => {
+    cancellation.signal.removeEventListener('abort', abortStream);
+    cancellation.detach();
   });
 
   setResponseHeaders(event, {

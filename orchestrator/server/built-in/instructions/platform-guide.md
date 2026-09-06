@@ -98,6 +98,10 @@ OAuth credential files for Claude / Codex / Gemini are bind-mounted from the ope
 
 A permanent `delete` (not `archive`) wipes `/workspace` and the agent config volume. Archive keeps both intact for unarchiving later.
 
+### Runtime recovery
+
+If the dashboard marks this worker **unknown**, Agentor could not verify its Docker task; this is distinct from a normal stopped state. The operator can use **Recover worker** to verify persistent mounts and replace only the disposable runtime, then reapply managed secrets and plugins. Workspace, agent-data, DinD, selected persistent paths, and the worker record are preserved. If mount verification fails, recovery does not alter Docker. After a Docker daemon restart, desired-running secret-bearing workers wait for Agentor's bootstrap; intentionally stopped workers remain stopped.
+
 ### Key environment variables
 
 - `ORCHESTRATOR_URL` — Base URL of the orchestrator API (e.g. `http://agentor-orchestrator:3000`). Use this for all `/api/worker-self/*` calls.

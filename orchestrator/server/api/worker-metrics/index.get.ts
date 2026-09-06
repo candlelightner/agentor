@@ -26,7 +26,7 @@ defineRouteMeta({
               memoryUsedBytes: { type: 'number' },
               memoryLimitBytes: { type: 'number' },
               memoryUtilization: { type: 'number' },
-              diskUsedBytes: { type: 'number', description: 'Writable layer (SizeRw) + /workspace + agent data' },
+              diskUsedBytes: { type: 'number', description: 'Durable /workspace + agent-data usage from a bounded in-worker sample' },
               netRxBytesPerSec: { type: 'number' },
               netTxBytesPerSec: { type: 'number' },
               blkReadBytesPerSec: { type: 'number' },

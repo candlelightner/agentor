@@ -41,7 +41,11 @@ import type { FileEntry } from '../../shared/types';
  * returned stream ends when the file entry is fully consumed; a tar error or an
  * unexpected (multi-entry / non-file) envelope destroys it.
  */
-export function demuxSingleFileFromTar(tarStream: NodeJS.ReadableStream, expectedSize: number): Readable {
+export function demuxSingleFileFromTar(
+  tarStream: NodeJS.ReadableStream,
+  expectedSize: number,
+  signal?: AbortSignal,
+): Readable {
   const out = new PassThrough();
   const extract = tar.extract();
   let handled = false;
@@ -75,12 +79,22 @@ export function demuxSingleFileFromTar(tarStream: NodeJS.ReadableStream, expecte
     if (!out.destroyed) out.destroy(err instanceof Error ? err : new Error(String(err)));
   });
 
+  // A client disconnect is an expected teardown path, not a stream failure.
+  // Destroy without an Error so cancellation cannot become an unhandled
+  // `error` event before the HTTP layer has attached its stream listeners.
+  const abort = () => out.destroy();
+  signal?.addEventListener('abort', abort, { once: true });
+
   // If the consumer aborts early, stop reading the Docker tar.
   out.on('close', () => {
+    signal?.removeEventListener('abort', abort);
     if (!extract.destroyed) extract.destroy();
     const tar = tarStream as Readable;
     if (!tar.destroyed) tar.destroy();
   });
+  // AbortSignal does not replay an abort that raced with Docker returning the
+  // archive stream, so close that post-preparation gap explicitly.
+  if (signal?.aborted) abort();
 
   // expectedSize is informational only — the tar header governs the bytes.
   void expectedSize;
@@ -108,6 +122,7 @@ export function buildWorkspaceZip(
   docker: DockerService,
   containerId: string,
   entries: FileEntry[],
+  signal?: AbortSignal,
 ): Readable {
   const zip = archiver('zip', { zlib: { level: 1 } });
   const out = new PassThrough();
@@ -121,11 +136,16 @@ export function buildWorkspaceZip(
   });
   zip.pipe(out);
 
+  const abort = () => out.destroy();
+  signal?.addEventListener('abort', abort, { once: true });
+
   // If the consumer aborts early, tear down archiver and any in-flight source.
   out.on('close', () => {
+    signal?.removeEventListener('abort', abort);
     zip.abort();
     if (activeTar && !(activeTar as Readable).destroyed) (activeTar as Readable).destroy();
   });
+  if (signal?.aborted) abort();
 
   // Detached driver: sequentially fetch each entry's Docker tar and re-encode it
   // into the ZIP, then finalize. Running this detached (not awaited before
@@ -136,8 +156,9 @@ export function buildWorkspaceZip(
     try {
       const kept = filterRedundantDescendants(entries.map((e) => e.path));
       for (const rel of kept) {
+        signal?.throwIfAborted();
         const abs = toContainerPath(rel);
-        activeTar = await docker.getArchive(containerId, abs);
+        activeTar = await docker.getArchive(containerId, abs, signal);
         await appendTarToZip(activeTar, zip, rel);
         activeTar = null;
       }

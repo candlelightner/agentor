@@ -64,10 +64,20 @@ export class ManagementConsoleStore {
       throw statusError(409, "Target worker is not running");
     if (!Number.isSafeInteger(windowIndex) || windowIndex < 0)
       throw statusError(400, "windowIndex must be a non-negative integer");
-    const attached = await withTimeout(
-      useDockerService().execAttachTmuxWindow(worker.containerId, windowIndex),
-      "Opening console session timed out; verify the worker is running and retry.",
-    );
+    let attached: Awaited<ReturnType<ReturnType<typeof useDockerService>["execAttachTmuxWindow"]>>;
+    try {
+      attached = await withTimeout(
+        useDockerService().execAttachTmuxWindow(worker.containerId, windowIndex),
+        "Opening console session timed out; verify the worker is running and retry.",
+      );
+    } catch (error) {
+      useContainerManager().reportRuntimeFailure(
+        workerId,
+        "Docker management console attach",
+        error,
+      );
+      throw error;
+    }
     const session: ConsoleSession = {
       id: randomUUID(),
       workspaceId,

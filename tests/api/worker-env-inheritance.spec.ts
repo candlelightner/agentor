@@ -4,6 +4,8 @@ import { ManagementWorkerDomain } from "../../orchestrator/server/utils/manageme
 import { markWorkerEnvPending,mergeGroupEnvLevels } from "../../orchestrator/server/utils/worker-group-env";
 import { createTestUser,deleteTestUser } from "../helpers/test-users";
 import { ApiClient } from "../helpers/api-client";
+import { createWorker, cleanupWorker, waitForWorkerRunning } from "../helpers/worker-lifecycle";
+import { captureCommandOutput } from "../helpers/terminal-ws";
 import { WorkerGroupEnvStore } from "../../orchestrator/server/utils/worker-group-env-store";
 import { mkdtemp,readFile,rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -84,4 +86,29 @@ test("names-only key discovery permits global admin but denies another owner",as
   const opts={baseURL:process.env.BASE_URL||"http://localhost:3000",extraHTTPHeaders:{Origin:process.env.BASE_URL||"http://localhost:3000"},storageState:{cookies:[],origins:[]}};
   const owner=await playwrightRequest.newContext(opts),outsider=await playwrightRequest.newContext(opts);
   try{await new ApiClient(owner).signInEmail(first.email,first.password);await new ApiClient(outsider).signInEmail(second.email,second.password);const created=await owner.post("/api/worker-groups",{data:{name:"env-scope"}});expect(created.status()).toBe(201);const group=await created.json();const adminRead=await request.get(`/api/account/env-var-keys?groupId=${group.id}`);expect(adminRead.status()).toBe(200);expect(await adminRead.json()).not.toHaveProperty("values");expect((await outsider.get(`/api/account/env-var-keys?groupId=${group.id}`)).status()).toBe(403);await owner.delete(`/api/worker-groups/${group.id}`);}finally{await owner.dispose();await outsider.dispose();await deleteTestUser(first.id);await deleteTestUser(second.id);}
+});
+
+test("managed stop/start re-bootstrap includes inherited group secrets without rebuild",async({request})=>{
+  const groupResponse=await request.post("/api/worker-groups",{data:{name:`restart-secrets-${Date.now()}`}});
+  expect(groupResponse.status()).toBe(201);
+  const group=await groupResponse.json();
+  const key=`GROUP_RESTART_${Date.now()}`;
+  const value="non-production-test-value";
+  let workerId="";
+  try{
+    const configured=await request.put(`/api/worker-groups/${group.id}/env-var-keys`,{data:{entries:[{key,value}]}});
+    expect(configured.status()).toBe(200);
+    expect(JSON.stringify(await configured.json())).not.toContain(value);
+    workerId=(await createWorker(request,{displayName:`group-restart-${Date.now()}`,workerGroupId:group.id})).id;
+    expect(await captureCommandOutput(workerId,`tmux show-environment -g ${key}`)).toContain(`${key}=${value}`);
+
+    const api=new ApiClient(request);
+    expect((await api.stopContainer(workerId)).status).toBe(200);
+    expect((await api.restartContainer(workerId)).status).toBe(200);
+    await waitForWorkerRunning(request,workerId,90_000);
+    expect(await captureCommandOutput(workerId,`tmux show-environment -g ${key}`)).toContain(`${key}=${value}`);
+  }finally{
+    if(workerId)await cleanupWorker(request,workerId).catch(()=>{});
+    await request.delete(`/api/worker-groups/${group.id}`).catch(()=>{});
+  }
 });

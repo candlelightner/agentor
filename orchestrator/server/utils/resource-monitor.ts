@@ -7,8 +7,8 @@ import type { WorkerMetrics, WorkerMetricsStatus } from '../../shared/types';
  * stacking the next tick. Network rates are derived from consecutive samples. */
 const POLL_INTERVAL_MS = 3_000;
 
-/** Per-worker disk usage (writable layer + volumes) is comparatively expensive
- * and slow-changing, so it samples on a much slower cadence. */
+/** Per-worker durable disk usage is comparatively expensive and slow-changing,
+ * so it samples on a much slower cadence. */
 const DISK_POLL_INTERVAL_MS = 60_000;
 
 /** Hard cap on a single per-worker Docker stats call. Without it, a hung stats
@@ -40,8 +40,8 @@ interface WorkerSample {
 
 /**
  * Polls per-worker resource metrics entirely through the Docker API — cpu /
- * memory / network via `container.stats`, and disk via the container's writable
- * layer size (`SizeRw`) plus a `du` of its volumes. This is OS- and
+ * memory / network via `container.stats`, and durable disk via a bounded `du`
+ * of `/workspace` plus agent data. This is OS- and
  * runtime-independent (no host `/proc`/`statfs`), so it behaves the same on
  * Docker Desktop, Linux, etc. Keeps the latest snapshot in memory only —
  * metrics are ephemeral, so nothing is persisted.
@@ -72,7 +72,7 @@ export class ResourceMonitor {
       });
     }, POLL_INTERVAL_MS);
 
-    // Disk on a slower cadence (du + SizeRw are comparatively expensive).
+    // Durable disk on a slower cadence (`du` is comparatively expensive).
     this.sampleWorkerDisk().catch(() => {});
     this.diskInterval = setInterval(() => {
       this.pollWorkerDisk().catch((err) => {
@@ -160,11 +160,12 @@ export class ResourceMonitor {
           );
           this.workers.set(c.containerName, this.computeWorkerMetrics(c, stats, now));
         } catch (err) {
+          this.containers.reportRuntimeFailure(c.id, 'Docker worker stats', err);
           this.workers.set(c.containerName, {
             workerId: c.id,
             containerName: c.containerName,
             displayName: c.displayName,
-            status: c.status,
+            status: 'unknown',
             cpuUtilization: 0,
             memoryUsedBytes: 0,
             memoryLimitBytes: 0,
@@ -175,7 +176,8 @@ export class ResourceMonitor {
             blkReadBytesPerSec: 0,
             blkWriteBytesPerSec: 0,
             lastChecked: now,
-            error: err instanceof Error ? err.message : String(err),
+            error:
+              'Worker runtime metrics are unavailable. Retry the request or use managed recovery.',
           });
         }
       }),

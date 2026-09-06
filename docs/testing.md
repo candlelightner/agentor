@@ -15,6 +15,8 @@ Per-file test counts are tracked in [`tests/TESTS.md`](../tests/TESTS.md).
 
 Unit tests (vitest) are planned but not yet implemented.
 
+Lifecycle fault coverage includes an isolated Docker-in-Docker daemon restart: it verifies that a secret-bearing desired-running worker waits for Agentor's managed bootstrap and that a deliberately stopped worker remains stopped. Focused no-server coverage also verifies operation-deadline timeout/abort diagnostics, disconnect cancellation, and independent retry of stalled Docker-helper cleanup. These checks are intentionally isolated from a host Docker daemon.
+
 Focused instance-disaster-recovery module tests use Playwright's test runner
 without browser/global server setup. They cover crypto, nested archives,
 provider selection, durable state, REST helper semantics, the asynchronous

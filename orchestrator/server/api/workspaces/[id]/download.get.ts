@@ -9,13 +9,26 @@ defineRouteMeta({ openAPI: {
 } });
 
 import { resolveOfflineWorkspace } from '../../../utils/workspace-api-access';
+import { requestCancellation } from '../../../utils/request-cancellation';
 
 export default defineEventHandler(async (event) => {
   const { access } = await resolveOfflineWorkspace(event);
   const raw = getQuery(event).path;
   const paths = Array.isArray(raw) ? raw : [raw];
-  const result = await access.download(paths);
-  event.node.res.on('close', () => { if (!event.node.res.writableEnded) result.stream.destroy(); });
+  const cancellation = requestCancellation(event);
+  let result: Awaited<ReturnType<typeof access.download>>;
+  try {
+    result = await access.download(paths, cancellation.signal);
+  } catch (error) {
+    cancellation.detach();
+    throw error;
+  }
+  const abortStream = () => result.stream.destroy();
+  cancellation.signal.addEventListener('abort', abortStream, { once: true });
+  result.stream.once('close', () => {
+    cancellation.signal.removeEventListener('abort', abortStream);
+    cancellation.detach();
+  });
   if (result.kind === 'file') {
     const name = (result.entry!.name || 'download').replace(/[^a-zA-Z0-9._-]/g, '_');
     setResponseHeaders(event, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="${name}"`, 'Content-Length': String(result.entry!.size), 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, no-store' });

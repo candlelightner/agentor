@@ -83,6 +83,43 @@ test.describe.serial('Plugin REST contract', () => {
     expect(definitionDelete.status()).toBe(204);
     definitionId = '';
   });
+
+  test('managed worker recovery preserves an enabled installation and refreshes its runtime generation', async ({ request }) => {
+    test.setTimeout(180_000);
+    const suffix = `recovery-${Date.now()}`;
+    const create = await request.post(`${BASE_URL}/api/plugins/definitions`, {
+      data: { scope: 'owner', manifest: manifest(suffix) },
+    });
+    expect(create.status()).toBe(201);
+    definitionId = (await create.json()).id;
+    const installed = await request.post(`${BASE_URL}/api/containers/${workerId}/plugins`, {
+      data: { definitionId, desiredEnabled: true },
+    });
+    expect(installed.status()).toBe(201);
+    const before = await installed.json();
+    installationId = before.id;
+    expect(before).toMatchObject({
+      desiredEnabled: true,
+      observed: { state: 'ready', ready: true, runtimeGeneration: expect.any(String) },
+    });
+
+    const recovered = await request.post(`${BASE_URL}/api/containers/${workerId}/recover`, { data: {} });
+    expect(recovered.status()).toBe(200);
+    const runtime = await recovered.json();
+    expect(runtime.containerId).not.toBe(before.observed.runtimeGeneration);
+    const listed = await request.get(`${BASE_URL}/api/containers/${workerId}/plugins`);
+    expect(listed.status()).toBe(200);
+    expect(await listed.json()).toContainEqual(expect.objectContaining({
+      id: installationId,
+      definitionId,
+      desiredEnabled: true,
+      observed: expect.objectContaining({
+        state: 'ready',
+        ready: true,
+        runtimeGeneration: runtime.containerId,
+      }),
+    }));
+  });
 });
 
 test('global admin derives target-worker ownership for owner and worker plugin definitions', async ({ request }) => {

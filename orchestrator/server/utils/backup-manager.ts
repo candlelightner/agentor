@@ -98,6 +98,9 @@ import {
 } from "./plugin-portability";
 import { snapshotWorkerReconstruction } from "./worker-reconstruction";
 import { resolveWorkerReconstruction } from "./worker-reconstruction";
+import { withOperationDeadline } from "./operation-deadline";
+
+const BACKUP_HELPER_DOCKER_TIMEOUT_MS = 30_000;
 import { readPortablePluginConfiguration } from "./plugin-portability";
 import { backupInstallationId } from "./backup-installation";
 import { pluginDefinitionHash } from "./plugin-manifest";
@@ -2541,7 +2544,7 @@ export class BackupManager {
         ? join(storage.dataRef, "users", userId, "agents", id)
         : `${containerName}-agents`;
     const image = `${useConfig().workerImagePrefix}${useConfig().workerImage}`;
-    await useDockerService().ensureImage(image);
+    await useDockerService().ensureImage(image, signal);
     const docker = new Docker({ socketPath: "/var/run/docker.sock" });
     if (storage.mode === "directory") {
       for (const source of [workspaceSource, agentsSource]) {
@@ -2553,18 +2556,38 @@ export class BackupManager {
       }
     } else {
       await Promise.all([
-        docker.getVolume(workspaceSource).inspect(),
-        docker.getVolume(agentsSource).inspect(),
+        withOperationDeadline(
+          (operationSignal) => docker.getVolume(workspaceSource).inspect({
+            abortSignal: operationSignal,
+          }),
+          BACKUP_HELPER_DOCKER_TIMEOUT_MS,
+          "Docker archived-workspace volume inspection",
+          signal,
+        ),
+        withOperationDeadline(
+          (operationSignal) => docker.getVolume(agentsSource).inspect({
+            abortSignal: operationSignal,
+          }),
+          BACKUP_HELPER_DOCKER_TIMEOUT_MS,
+          "Docker archived-agent-data volume inspection",
+          signal,
+        ),
       ]);
     }
+    const helperOperationId = randomUUID();
     const helperOptions: Docker.ContainerCreateOptions = {
       Image: image,
+      name: `agentor-archived-backup-${helperOperationId}`,
       Entrypoint: ["tail"],
       Cmd: ["-f", "/dev/null"],
       User: "1000:1000",
       Labels: {
         "agentor.storage-helper": "backup",
+        "agentor.workspace-helper": "true",
         "agentor.workspace-id": id,
+        "agentor.helper.operation-id": helperOperationId,
+        "agentor.helper.owner-id": userId,
+        "agentor.helper.created-at": new Date().toISOString(),
       },
       HostConfig: {
         NetworkMode: "none",
@@ -2599,24 +2622,53 @@ export class BackupManager {
         Tmpfs: { "/tmp": "rw,nosuid,nodev,noexec,size=16777216" },
       },
     };
-    let helper = await docker.createContainer(helperOptions);
+    let helper = await withOperationDeadline(
+      (operationSignal) => docker.createContainer({
+        ...helperOptions,
+        abortSignal: operationSignal,
+      }),
+      BACKUP_HELPER_DOCKER_TIMEOUT_MS,
+      "Docker archived-backup helper creation",
+      signal,
+    );
     const temp = join(this.dataDir, "tmp", `offline-backup-${randomUUID()}`);
     try {
       await mkdir(temp, { recursive: true, mode: 0o700 });
       try {
-        await helper.start();
+        await withOperationDeadline(
+          (operationSignal) => helper.start({ abortSignal: operationSignal }),
+          BACKUP_HELPER_DOCKER_TIMEOUT_MS,
+          "Docker archived-backup helper start",
+          signal,
+        );
       } catch (error) {
-        await helper.remove({ force: true }).catch(() => {});
+        await withOperationDeadline(
+          (operationSignal) => helper.remove({ force: true, abortSignal: operationSignal } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
+          BACKUP_HELPER_DOCKER_TIMEOUT_MS,
+          "Docker archived-backup helper failed-start cleanup",
+        ).catch(() => {});
         // See workspace-access.ts: retain the security boundary but tolerate
         // DinD's threaded-cgroup limitation for optional resource ceilings.
         if (!isThreadedCgroupLimitError(error)) throw error;
         const { PidsLimit, Memory, NanoCpus, ...fallbackHostConfig } =
           helperOptions.HostConfig!;
-        helper = await docker.createContainer({
-          ...helperOptions,
-          HostConfig: fallbackHostConfig,
-        });
-        await helper.start();
+        helper = await withOperationDeadline(
+          (operationSignal) => docker.createContainer({
+            ...helperOptions,
+            name: `${helperOptions.name}-fallback`,
+            HostConfig: fallbackHostConfig,
+            abortSignal: operationSignal,
+          }),
+          BACKUP_HELPER_DOCKER_TIMEOUT_MS,
+          "Docker archived-backup fallback helper creation",
+          signal,
+        );
+        await withOperationDeadline(
+          (operationSignal) => helper.start({ abortSignal: operationSignal }),
+          BACKUP_HELPER_DOCKER_TIMEOUT_MS,
+          "Docker archived-backup fallback helper start",
+          signal,
+        );
       }
       signal.throwIfAborted();
       const environment =
@@ -2715,13 +2767,21 @@ export class BackupManager {
         );
       if (includeWorkspace)
         await writeGzipFile(
-          await useDockerService().getArchive(helper.id, EXPORT_WORKSPACE_PATH),
+          await useDockerService().getArchive(
+            helper.id,
+            EXPORT_WORKSPACE_PATH,
+            signal,
+          ),
           workspacePath,
           signal,
         );
       if (includeAgents)
         await writeFilteredAgentsGz(
-          await useDockerService().getArchive(helper.id, EXPORT_AGENTS_PATH),
+          await useDockerService().getArchive(
+            helper.id,
+            EXPORT_AGENTS_PATH,
+            signal,
+          ),
           agentsPath,
           CREDENTIAL_EXCLUDE_SUFFIXES,
           SHARED_DATA_EXCLUDE_PREFIXES,
@@ -2748,7 +2808,11 @@ export class BackupManager {
         { signal },
       );
     } finally {
-      await helper.remove({ force: true }).catch(() => {});
+      await withOperationDeadline(
+        (operationSignal) => helper.remove({ force: true, abortSignal: operationSignal } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
+        BACKUP_HELPER_DOCKER_TIMEOUT_MS,
+        "Docker archived-backup helper cleanup",
+      ).catch(() => {});
       await rm(temp, { recursive: true, force: true });
     }
   }
@@ -2767,7 +2831,11 @@ export class BackupManager {
       for (const [index, selected] of paths.entries()) {
         signal.throwIfAborted();
         const file = join(dir, `${index}.tar`);
-        await pipeline(await useDockerService().getArchive(containerId, selected), createWriteStream(file, { mode: 0o600 }), { signal });
+        await pipeline(
+          await useDockerService().getArchive(containerId, selected, signal),
+          createWriteStream(file, { mode: 0o600 }),
+          { signal },
+        );
         const sanitized = join(dir, `${index}.sanitized.tar`);
         await sanitizeBackupPathTarPayload(file, sanitized, selected, signal);
         await rm(file, { force: true });
@@ -3296,6 +3364,7 @@ export class BackupManager {
           job.userId,
           source,
           extracted.workspacePath,
+          execution.controller.signal,
         );
         job.workerId = source;
         job.restoreMappings = [

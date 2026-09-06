@@ -8,6 +8,7 @@ import type { DomainMappingStore, DomainMapping } from './domain-mapping-store';
 import type { PortMappingStore, PortMapping } from './port-mapping-store';
 import type { StorageManager } from './storage';
 import type { SelfSignedCertManager } from './selfsigned-certs';
+import { withOperationDeadline } from './operation-deadline';
 
 const TRAEFIK_CONTAINER_NAME = 'agentor-traefik';
 const TRAEFIK_LABEL = 'agentor.managed';
@@ -19,6 +20,7 @@ const TRAEFIK_CONFIG_FILENAME = 'traefik-config.yml';
 // Hard deadline for the Traefik image pull. Without it a stalled registry pull
 // would never settle the reconcileQueue and wedge every later reconcile.
 const TRAEFIK_IMAGE_PULL_TIMEOUT_MS = 5 * 60 * 1000;
+const TRAEFIK_DOCKER_TIMEOUT_MS = 30_000;
 
 type PortBindings = Record<string, { HostIp: string; HostPort: string }[]>;
 
@@ -210,7 +212,7 @@ export class TraefikManager {
     }
 
     const c = this.docker.getContainer(container.Id);
-    const info = await c.inspect();
+    const info = await withOperationDeadline(c.inspect(), TRAEFIK_DOCKER_TIMEOUT_MS, 'Docker Traefik inspection');
 
     // The container exists but isn't running (crashed, or a previously-persisted
     // mapping couldn't bind its host port). Self-heal so the dashboard returns.
@@ -223,7 +225,11 @@ export class TraefikManager {
     if (this.configFileJustCreated) {
       this.configFileJustCreated = false;
       await this.writeTraefikConfig(m);
-      await c.restart();
+      await withOperationDeadline(
+        c.restart(),
+        TRAEFIK_DOCKER_TIMEOUT_MS,
+        'Docker Traefik restart',
+      );
       useLogger().info('[traefik-manager] restarted Traefik (config file was recreated)');
       this.lastGoodMappings = m;
       return;
@@ -283,7 +289,11 @@ export class TraefikManager {
    * and remove it. (Layer 5) */
   private async startOrSelfHeal(c: Docker.Container, m: Mappings): Promise<void> {
     try {
-      await c.start();
+      await withOperationDeadline(
+        c.start(),
+        TRAEFIK_DOCKER_TIMEOUT_MS,
+        'Docker Traefik recovery start',
+      );
       this.lastGoodMappings = m;
       return;
     } catch (err) {
@@ -333,7 +343,7 @@ export class TraefikManager {
    * tearing down the working Traefik. */
   private async occupiedHostPorts(): Promise<Set<number>> {
     const ports = new Set<number>();
-    const containers = await this.docker.listContainers({ all: false });
+    const containers = await withOperationDeadline(this.docker.listContainers({ all: false }), TRAEFIK_DOCKER_TIMEOUT_MS, 'Docker host-port inventory');
     for (const c of containers) {
       const names = (c.Names || []).map((n) => n.replace(/^\//, ''));
       if (names.includes(TRAEFIK_CONTAINER_NAME)) continue;
@@ -743,7 +753,7 @@ export class TraefikManager {
     const exposedPorts = this.buildExposedPorts(m);
     const portBindings = this.buildPortBindings(m);
 
-    const container = await this.docker.createContainer({
+    const container = await withOperationDeadline(this.docker.createContainer({
       Image: image,
       name: TRAEFIK_CONTAINER_NAME,
       Cmd: cmd,
@@ -767,15 +777,15 @@ export class TraefikManager {
           this.storageManager.getCertBind(),
         ],
       },
-    });
+    }), TRAEFIK_DOCKER_TIMEOUT_MS, 'Docker Traefik creation');
 
     try {
-      await container.start();
+      await withOperationDeadline(container.start(), TRAEFIK_DOCKER_TIMEOUT_MS, 'Docker Traefik start');
     } catch (err) {
       // Docker rejects the start when a host port can't be bound (e.g. another
       // process already owns it). Tear the half-created container down so the
       // caller's rollback/self-heal starts from a clean slate, then rethrow.
-      await container.remove({ force: true }).catch(() => {});
+      await withOperationDeadline(container.remove({ force: true }), TRAEFIK_DOCKER_TIMEOUT_MS, 'Docker Traefik failed-start cleanup').catch(() => {});
       throw err;
     }
     useLogger().info(
@@ -788,10 +798,10 @@ export class TraefikManager {
 
   private async ensureImage(image: string): Promise<void> {
     try {
-      await this.docker.getImage(image).inspect();
+      await withOperationDeadline(this.docker.getImage(image).inspect(), TRAEFIK_DOCKER_TIMEOUT_MS, 'Docker Traefik image inspection');
     } catch {
       useLogger().info(`[traefik-manager] pulling image ${image}...`);
-      const stream = await this.docker.pull(image);
+      const stream = await withOperationDeadline(this.docker.pull(image), TRAEFIK_DOCKER_TIMEOUT_MS, 'Docker Traefik image-pull setup');
       // Guard the pull with a deadline. Every reconcile()/forceRecreate() chains
       // onto a single reconcileQueue, so a registry that stalls mid-pull (held
       // connection, no bytes) would otherwise block *all* future Traefik
@@ -824,7 +834,7 @@ export class TraefikManager {
     try {
       useLogCollector().detach(container.Id);
       const c = this.docker.getContainer(container.Id);
-      await c.remove({ force: true });
+      await withOperationDeadline(c.remove({ force: true }), TRAEFIK_DOCKER_TIMEOUT_MS, 'Docker Traefik cleanup');
       useLogger().info('[traefik-manager] removed Traefik container');
     } catch (err: unknown) {
       const statusCode = (err as { statusCode?: number }).statusCode;
@@ -833,10 +843,10 @@ export class TraefikManager {
   }
 
   private async findTraefik(): Promise<Docker.ContainerInfo | null> {
-    const containers = await this.docker.listContainers({
+    const containers = await withOperationDeadline(this.docker.listContainers({
       all: true,
       filters: { label: [`${TRAEFIK_LABEL}=${TRAEFIK_LABEL_VALUE}`] },
-    });
+    }), TRAEFIK_DOCKER_TIMEOUT_MS, 'Docker Traefik inventory');
     return containers[0] || null;
   }
 }

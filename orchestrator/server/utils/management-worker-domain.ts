@@ -128,6 +128,7 @@ export class ManagementWorkerDomain {
       ["workers.create", "worker-lifecycle", "Create a worker for an explicit owner, optionally enrolling it directly in one of that owner's worker groups. Host mounts accept only centrally approved pathId references and default to read-only.", { type:"object", required:["userId"], additionalProperties:false, properties:{ userId:{type:"string"}, displayName:{type:"string"}, environmentId:{type:"string"}, workerGroupId:{type:"string",description:"Optional direct worker-group membership. The group must belong to userId."}, imageDefinitionId:{type:"string"}, imageVersion:{type:"string"}, mounts:{type:"array",items:hostMountInputSchema}, excludedGlobalEnvVarKeys:excludedEnvKeysSchema() } }, mutation],
       ["workers.update", "worker-lifecycle", "Update worker settings. excludedGlobalEnvVarKeys completely replaces the names-only exclusion list and takes effect after rebuild; protected workers require lockPassword.", workerUpdateInput(), mutation],
       ["workers.restart", "worker-lifecycle", "Restart a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
+      ["workers.recover", "worker-lifecycle", "Recover an unresponsive worker through the bounded Agentor control plane. Persistent mounts are verified, only disposable compute is replaced, managed secrets are bootstrapped, and plugins are reconciled; protected workers require lockPassword.", objectWithWorker(), mutation],
       ["workers.rebuild", "worker-lifecycle", "Rebuild a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
       ["workers.archive", "worker-lifecycle", "Archive a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
       ["workers.unarchive", "worker-lifecycle", "Unarchive a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
@@ -226,6 +227,7 @@ export class ManagementWorkerDomain {
     }
     if (name === "workers.restart") { await locks.verify(workerId,args.lockPassword); await cm.restart(workerId); return {handled:true,result:{workerId,status:"running"}}; }
     await locks.verify(workerId,args.lockPassword);
+    if (name === "workers.recover") return {handled:true,result:await cm.recover(workerId)};
     if (name === "workers.update") return {handled:true,result:await cm.updateSettings(workerId, settings(args))};
     if (name === "workers.rebuild") return {handled:true,result:await cm.rebuild(workerId)};
     if (name === "workers.archive") { await cm.archive(workerId); return {handled:true,result:{workerId,status:"archived"}}; }

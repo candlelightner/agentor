@@ -24,10 +24,13 @@ export async function runProbe(
   containerId: string,
   subcommand: 'lstat' | 'list',
   rel: string,
+  signal?: AbortSignal,
 ): Promise<ProbeResult> {
   const full = toContainerPath(rel);
   const res = await docker.execCapture(containerId, ['python3', '-c', WORKSPACE_PROBE_SCRIPT, subcommand, full], {
     user: 'agent',
+    signal,
+    operationLabel: 'Workspace path probe',
   });
   return parseProbe(res.stdout, res.stderr, res.exitCode, subcommand);
 }
@@ -41,12 +44,15 @@ export async function runProbeCheckMany(
   docker: DockerService,
   containerId: string,
   rels: string[],
+  signal?: AbortSignal,
 ): Promise<{ existing: string[]; escaping: string[] }> {
   const absPaths = rels.map(toContainerPath);
   const stdin = Buffer.from(`${JSON.stringify(absPaths)}\n`);
   const res = await docker.execCapture(containerId, ['python3', '-c', WORKSPACE_PROBE_SCRIPT, 'check_many'], {
     user: 'agent',
     stdin,
+    signal,
+    operationLabel: 'Workspace path-set probe',
   });
   const parsed = parseProbe(res.stdout, res.stderr, res.exitCode, 'check_many');
   if (!parsed.ok) throw probeErrorToHttp(parsed);
@@ -99,16 +105,16 @@ export function probeErrorToHttp(result: Extract<ProbeResult, { ok: false }>): n
 }
 
 /** `lstat` a single relative path; throws an h3 error on failure. */
-export async function probeLstat(docker: DockerService, containerId: string, rel: string): Promise<FileEntry> {
-  const r = await runProbe(docker, containerId, 'lstat', rel);
+export async function probeLstat(docker: DockerService, containerId: string, rel: string, signal?: AbortSignal): Promise<FileEntry> {
+  const r = await runProbe(docker, containerId, 'lstat', rel, signal);
   if (!r.ok) throw probeErrorToHttp(r);
   if (!r.entry) throw createError({ statusCode: 500, statusMessage: 'Workspace probe returned no entry' });
   return r.entry;
 }
 
 /** One-level directory listing; throws an h3 error on failure. */
-export async function probeList(docker: DockerService, containerId: string, rel: string): Promise<FileListing> {
-  const r = await runProbe(docker, containerId, 'list', rel);
+export async function probeList(docker: DockerService, containerId: string, rel: string, signal?: AbortSignal): Promise<FileListing> {
+  const r = await runProbe(docker, containerId, 'list', rel, signal);
   if (!r.ok) throw probeErrorToHttp(r);
   return { path: rel, entries: r.entries ?? [] };
 }

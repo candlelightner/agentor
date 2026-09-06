@@ -70,6 +70,48 @@ test.describe.serial('Git identity — persists across rebuild', () => {
   });
 });
 
+test.describe.serial('GitHub credential helper — legacy migration and restart idempotency', () => {
+  let workerId = '';
+
+  test.beforeAll(async ({ request }) => {
+    const worker = await createWorker(request, {
+      displayName: `GitHelper-${Date.now()}`,
+      // A harmless local placeholder exercises helper configuration without
+      // depending on real GitHub credentials or writing a token to the test.
+      workerConfiguration: {
+        variables: [{ key: 'GITHUB_TOKEN', value: 'integration-placeholder' }],
+      },
+    });
+    workerId = worker.id;
+  });
+
+  test.afterAll(async ({ request }) => {
+    if (workerId) await cleanupWorker(request, workerId);
+  });
+
+  test('duplicate legacy values converge to one helper across consecutive starts', async ({ request }) => {
+    await execInWorker(
+      workerId,
+      "git config --global --unset-all credential.https://github.com.helper 2>/dev/null || true; git config --global --add credential.https://github.com.helper '!legacy-one'; git config --global --add credential.https://github.com.helper '!legacy-two'",
+    );
+    expect(await execInWorker(workerId, "git config --global --get-all credential.https://github.com.helper | wc -l")).toContain('2');
+
+    const api = new ApiClient(request);
+    for (let start = 0; start < 2; start++) {
+      expect((await api.restartContainer(workerId)).status).toBe(200);
+      await waitForWorkerRunning(request, workerId, 90_000);
+      const values = await execInWorker(
+        workerId,
+        "git config --global --get-all credential.https://github.com.helper | sed '/^$/d'",
+      );
+      expect(values).toContain('!gh auth git-credential');
+      expect(values).not.toContain('legacy-one');
+      expect(values).not.toContain('legacy-two');
+      expect(await execInWorker(workerId, "git config --global --get-all credential.https://github.com.helper | wc -l")).toContain('1');
+    }
+  });
+});
+
 test.describe.serial('Git identity — persists across archive/unarchive', () => {
   let containerId: string;
   let workerId: string;

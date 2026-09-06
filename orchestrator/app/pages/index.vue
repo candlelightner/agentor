@@ -12,6 +12,7 @@ const {
   createContainer,
   stopContainer,
   restartContainer,
+  recoverContainer,
   rebuildContainer,
   removeContainer,
   updateContainerSettings,
@@ -147,6 +148,45 @@ async function handleRebuild(id: string) {
   const rebuilt = await rebuildContainer(id);
   if (rebuilt) {
     handleOpenTab(rebuilt.id, "terminal");
+  }
+}
+
+async function handleRecover(id: string) {
+  if (
+    !confirm(
+      "Recover this worker? Agentor will verify every persistent mount, replace only the unresponsive container, re-run managed secret bootstrap, and reconcile plugins. No workspace or volume is deleted.",
+    )
+  )
+    return;
+  const run = async (lockPassword?: string) => {
+    closeTabsForContainer(id);
+    const recovered = await recoverContainer(id, lockPassword);
+    if (recovered) handleOpenTab(recovered.id, "terminal");
+  };
+  try {
+    await run();
+  } catch (error: any) {
+    const status = error?.statusCode ?? error?.response?.status;
+    if (status === 423) {
+      const lockPassword = prompt(
+        "This worker is protected. Enter its worker lock password to continue recovery:",
+      );
+      if (lockPassword === null) return;
+      try {
+        await run(lockPassword);
+        return;
+      } catch (retryError: any) {
+        alert(
+          retryError?.data?.statusMessage ||
+            retryError?.message ||
+            "Worker recovery failed.",
+        );
+        return;
+      }
+    }
+    alert(
+      error?.data?.statusMessage || error?.message || "Worker recovery failed.",
+    );
   }
 }
 
@@ -355,6 +395,7 @@ function onCreateModalClosed() {
       @open-editor="(cid) => handleOpenTab(cid, 'editor')"
       @stop-container="stopContainer"
       @restart-container="restartContainer"
+      @recover-container="handleRecover"
       @rebuild-container="handleRebuild"
       @remove-container="handleRemove"
       @archive-container="handleArchive"

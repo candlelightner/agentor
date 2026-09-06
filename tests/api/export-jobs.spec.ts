@@ -336,7 +336,7 @@ test.describe.serial('Asynchronous worker exports', () => {
         created.body.id,
         `rootfs-import-${Date.now()}`,
       );
-      expect(imported.status).toBe(201);
+      expect(imported.status, JSON.stringify(imported.body)).toBe(201);
       importedId = imported.body.id;
       await waitForWorkerRunning(request, importedId, 90_000);
       await execInWorker(importedId, 'cat /home/agent/export-rootfs-marker', new RegExp(marker));

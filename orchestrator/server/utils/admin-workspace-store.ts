@@ -2,6 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { useContainerManager } from "./services";
+import {
+  operationSettlement,
+  type OperationFailureWithSettlement,
+} from "./operation-deadline";
 
 export interface AdministrativeWorkspaceRecord {
   schemaVersion: 1;
@@ -44,6 +48,21 @@ export interface AdminWorkspaceStartupScriptRuntimeStatus {
   finishedAt?: string;
   exitCode?: number;
 }
+
+/**
+ * A start-boundary identity must survive a refresh of the currently running
+ * generation because the same lifecycle operation may replace that generation.
+ * A post-start refresh, by contrast, is only for the already-running runtime
+ * and must not leave credential material pending for a later operation.
+ */
+export type AdminWorkspaceIdentityMaterializationIntent =
+  | "prepare-start"
+  | "refresh-running";
+
+export type AdminWorkspaceIdentityMaterializer = (
+  record: AdministrativeWorkspaceRecord,
+  intent: AdminWorkspaceIdentityMaterializationIntent,
+) => Promise<void>;
 
 /**
  * Narrow integration boundary for the real container implementation. The
@@ -89,6 +108,7 @@ export class AdminWorkspaceStore {
   private readonly path: string;
   private loading?: Promise<void>;
   private runtime?: AdminWorkspaceRuntimeAdapter;
+  private identityMaterializer?: AdminWorkspaceIdentityMaterializer;
   private operationTail: Promise<void> = Promise.resolve();
   private pendingCommit?: {
     operation: string;
@@ -104,6 +124,11 @@ export class AdminWorkspaceStore {
   }
   setRuntimeAdapter(runtime: AdminWorkspaceRuntimeAdapter) {
     this.runtime = runtime;
+  }
+  setIdentityMaterializer(
+    materializer: AdminWorkspaceIdentityMaterializer,
+  ) {
+    this.identityMaterializer = materializer;
   }
   async setClipboard(mime: "image/png" | "text/plain", bytes: Buffer) {
     if (!this.runtime?.setClipboard)
@@ -145,7 +170,12 @@ export class AdminWorkspaceStore {
     const result = this.operationTail.then(operation, operation);
     this.operationTail = result.then(
       () => undefined,
-      () => undefined,
+      async (error: OperationFailureWithSettlement) => {
+        // Return the bounded timeout to the caller, but do not admit another
+        // administrative mutation until the aborted Docker request has truly
+        // settled. This mirrors the ordinary per-worker lifecycle fence.
+        await error?.[operationSettlement];
+      },
     );
     return result;
   }
@@ -205,9 +235,22 @@ export class AdminWorkspaceStore {
       await this.commit(candidate);
     }
     if (this.runtime) {
+      if (candidate.status === "running" && this.identityMaterializer)
+        await this.identityMaterializer(
+          structuredClone(candidate),
+          "prepare-start",
+        );
       const image = await this.runtime.ensure(structuredClone(candidate));
       if (this.applyRuntimeImage(candidate, image))
         await this.commitExternal("ensure", candidate);
+      // Startup/readiness may consume most of the short identity TTL. Refresh
+      // once compute is ready so the first management request never inherits
+      // a credential that expired during bootstrap.
+      if (candidate.status === "running" && this.identityMaterializer)
+        await this.identityMaterializer(
+          structuredClone(candidate),
+          "refresh-running",
+        );
     }
     return this.publicRecord(candidate);
   }
@@ -221,12 +264,21 @@ export class AdminWorkspaceStore {
       if (!this.record) await this.ensureLocked();
       const candidate = structuredClone(this.record!);
       if (this.runtime) {
-        if (status === "running")
+        if (status === "running") {
+          if (this.identityMaterializer)
+            await this.identityMaterializer(
+              structuredClone(candidate),
+              "prepare-start",
+            );
           this.applyRuntimeImage(
             candidate,
             await this.runtime.start(structuredClone(candidate)),
           );
-        else await this.runtime.stop(structuredClone(candidate));
+          await this.identityMaterializer?.(
+            structuredClone(candidate),
+            "refresh-running",
+          );
+        } else await this.runtime.stop(structuredClone(candidate));
       }
       candidate.status = status;
       candidate.updatedAt = new Date().toISOString();
@@ -249,9 +301,20 @@ export class AdminWorkspaceStore {
           new Error("Administrative workspace runtime is unavailable"),
           { statusCode: 503 },
         );
+      // Rebuild creates new disposable compute, so identity preparation must
+      // happen before its first process can execute.
+      if (this.identityMaterializer)
+        await this.identityMaterializer(
+          structuredClone(candidate),
+          "prepare-start",
+        );
       this.applyRuntimeImage(
         candidate,
         await this.runtime.rebuild(structuredClone(candidate)),
+      );
+      await this.identityMaterializer?.(
+        structuredClone(candidate),
+        "refresh-running",
       );
       candidate.status = "running";
       candidate.updatedAt = new Date().toISOString();

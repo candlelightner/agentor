@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { useConfig, useContainerManager, useStorageManager, useWorkerStore } from './services';
 import { listWorkspaceTombstones } from './workspace-tombstones';
 import { isSafeUserId } from './user-id';
+import { withOperationDeadline } from './operation-deadline';
 
 export type WorkspaceState = 'running' | 'stopped' | 'archived' | 'deleted' | 'orphaned';
 
@@ -54,6 +55,7 @@ export function publicWorkspaceInventoryItem(item: WorkspaceInventoryItem): Publ
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const DOCKER_READ_TIMEOUT_MS = 8_000;
 
 /** Discovers workspaces from the durable WorkerStore plus physical storage.
  * Runtime state is derived on every request rather than persisted. */
@@ -104,7 +106,13 @@ export async function listWorkspaceInventory(includeOrphans: boolean): Promise<W
   const known = new Set(items.map((item) => item.storageRef));
   if (storage.mode === 'volume') {
     const docker = new Docker({ socketPath: '/var/run/docker.sock' });
-    const volumes = (await docker.listVolumes()).Volumes ?? [];
+    // Orphan discovery is supplementary: an unavailable Docker daemon must
+    // not make the durable worker/tombstone inventory unavailable.
+    const volumes = (await withOperationDeadline(
+      docker.listVolumes(),
+      DOCKER_READ_TIMEOUT_MS,
+      'Docker workspace-volume inventory',
+    ).catch(() => null))?.Volumes ?? [];
     const prefix = `${config.containerPrefix}-`;
     for (const volume of volumes) {
       const name = volume.Name;

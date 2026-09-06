@@ -1,6 +1,8 @@
 import Docker from 'dockerode';
+import type { Readable } from 'node:stream';
 import type { Config } from './config';
 import type { ImageUpdateInfo, UpdateStatus, ApplyResult, UpdatableImage, PruneResult } from '../../shared/types';
+import { withOperationDeadline } from './operation-deadline';
 
 interface ImageRef {
   registry: string;
@@ -11,6 +13,9 @@ interface ImageRef {
 /** Timeout for every outbound registry call (token + manifest fetch). A hung
  * registry socket must never pin a poll/check promise forever. */
 const FETCH_TIMEOUT_MS = 30_000;
+const DOCKER_READ_TIMEOUT_MS = 8_000;
+const DOCKER_MUTATION_TIMEOUT_MS = 30_000;
+const DOCKER_PULL_TIMEOUT_MS = 30 * 60_000;
 
 export class UpdateChecker {
   private docker: Docker;
@@ -221,7 +226,7 @@ export class UpdateChecker {
   private async getLocalDigest(imageName: string): Promise<string> {
     try {
       const image = this.docker.getImage(imageName);
-      const info = await image.inspect();
+      const info = await withOperationDeadline(image.inspect(), DOCKER_READ_TIMEOUT_MS, 'Docker update image inspection');
       const repoDigests: string[] = info.RepoDigests || [];
       const repoName = imageName.split(':')[0] ?? '';
 
@@ -283,14 +288,23 @@ export class UpdateChecker {
     // Images pulled by the orchestrator are public — agent credentials are
     // per-user and not available at infrastructure scope. Deploy private
     // images with `docker login` on the host.
-    await new Promise<void>((resolve, reject) => {
-      this.docker.pull(imageName, {}, (err: Error | null, stream: NodeJS.ReadableStream | undefined) => {
-        if (err || !stream) return reject(err || new Error('No stream returned'));
-        this.docker.modem.followProgress(stream, (err2: Error | null) => {
-          if (err2) reject(err2);
+    const stream = await withOperationDeadline(
+      this.docker.pull(imageName),
+      DOCKER_MUTATION_TIMEOUT_MS,
+      'Docker update image-pull setup',
+    );
+    await withOperationDeadline(
+      new Promise<void>((resolve, reject) => {
+        this.docker.modem.followProgress(stream, (err: Error | null) => {
+          if (err) reject(err);
           else resolve();
         });
-      });
+      }),
+      DOCKER_PULL_TIMEOUT_MS,
+      'Docker update image pull',
+    ).catch((error) => {
+      (stream as Readable).destroy();
+      throw error;
     });
   }
 
@@ -352,7 +366,7 @@ export class UpdateChecker {
     if (!hostname) throw new Error('HOSTNAME not set — cannot identify orchestrator container');
 
     const container = this.docker.getContainer(hostname);
-    const info = await container.inspect();
+    const info = await withOperationDeadline(container.inspect(), DOCKER_READ_TIMEOUT_MS, 'Docker update orchestrator inspection');
     const newImage = this.config.workerImagePrefix + this.config.orchestratorImage;
     const containerName = info.Name.replace(/^\//, '');
     const tempName = `${containerName}-next`;
@@ -387,7 +401,7 @@ export class UpdateChecker {
     await this.removeContainerIfExists(swapperName);
 
     // Create replacement container (not started — host port bindings would conflict)
-    const newContainer = await this.docker.createContainer(createOpts);
+    const newContainer = await withOperationDeadline(this.docker.createContainer(createOpts), DOCKER_MUTATION_TIMEOUT_MS, 'Docker update replacement creation');
 
     // Delegate the stop→remove→rename→start sequence to a one-shot swapper container.
     // We can't do this in-process because stopping our own container kills this process.
@@ -418,7 +432,7 @@ export class UpdateChecker {
       '})().catch(e => { console.error("[swapper] fatal:", e.message || e); process.exit(1); });',
     ].join('\n');
 
-    const swapper = await this.docker.createContainer({
+    const swapper = await withOperationDeadline(this.docker.createContainer({
       Image: newImage,
       name: swapperName,
       Cmd: ['node', '-e', swapScript],
@@ -427,14 +441,14 @@ export class UpdateChecker {
         AutoRemove: true,
         NetworkMode: 'none',
       },
-    });
+    }), DOCKER_MUTATION_TIMEOUT_MS, 'Docker update swapper creation');
 
-    await swapper.start();
+    await withOperationDeadline(swapper.start(), DOCKER_MUTATION_TIMEOUT_MS, 'Docker update swapper start');
     useLogger().info('[update-checker] swapper started — orchestrator will be replaced shortly');
   }
 
   async pruneImages(): Promise<PruneResult> {
-    const res = await this.docker.pruneImages({ filters: { dangling: ['true'] } });
+    const res = await withOperationDeadline(this.docker.pruneImages({ filters: { dangling: ['true'] } }), DOCKER_MUTATION_TIMEOUT_MS, 'Docker update image prune');
     return {
       imagesDeleted: res.ImagesDeleted?.length ?? 0,
       spaceReclaimed: res.SpaceReclaimed ?? 0,
@@ -443,7 +457,7 @@ export class UpdateChecker {
 
   private async removeContainerIfExists(name: string): Promise<void> {
     try {
-      await this.docker.getContainer(name).remove({ force: true });
+      await withOperationDeadline(this.docker.getContainer(name).remove({ force: true }), DOCKER_MUTATION_TIMEOUT_MS, 'Docker update leftover cleanup');
     } catch (err: unknown) {
       const status = (err as { statusCode?: number }).statusCode;
       if (status === 404) return; // already gone — nothing to clean up

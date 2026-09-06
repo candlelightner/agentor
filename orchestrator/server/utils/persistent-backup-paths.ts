@@ -8,9 +8,11 @@ import type { Config } from "./config";
 import type { ContainerInfo } from "../../shared/types";
 import { normalizeBackupPaths, isParentPath } from "./backup-paths";
 import { sanitizeBackupPathTarPayload } from "./worker-export";
+import { withOperationDeadline } from "./operation-deadline";
 
 const MANAGED_LABEL = "agentor.persistent-backup-path";
 const WORKER_LABEL = "agentor.worker-id";
+const PERSISTENT_PATH_DOCKER_TIMEOUT_MS = 30_000;
 
 export interface PersistentPathMount {
   source: string;
@@ -54,7 +56,7 @@ export class PersistentBackupPathManager {
     const paths = normalizeBackupPaths(rawPaths || []);
     let inspection: Docker.ContainerInspectInfo | undefined;
     try {
-      inspection = await this.docker.getContainer(worker.containerId).inspect();
+      inspection = await withOperationDeadline(this.docker.getContainer(worker.containerId).inspect(), PERSISTENT_PATH_DOCKER_TIMEOUT_MS, "Docker persistent-path source inspection");
     } catch (error: any) {
       if (error?.statusCode !== 404) throw error;
     }
@@ -96,18 +98,18 @@ export class PersistentBackupPathManager {
   }
 
   async removeWorkerVolumes(workerId: string): Promise<void> {
-    const result = await this.docker.listVolumes({
+    const result = await withOperationDeadline(this.docker.listVolumes({
       filters: { label: [`${MANAGED_LABEL}=true`, `${WORKER_LABEL}=${workerId}`] },
-    });
+    }), PERSISTENT_PATH_DOCKER_TIMEOUT_MS, "Docker persistent-path volume inventory");
     for (const volume of result.Volumes || []) {
       if (!volume.Name) continue;
-      await this.docker.getVolume(volume.Name).remove({ force: true });
+      await withOperationDeadline(this.docker.getVolume(volume.Name).remove({ force: true }), PERSISTENT_PATH_DOCKER_TIMEOUT_MS, "Docker persistent-path volume cleanup");
     }
   }
 
   private async volumeExists(name: string): Promise<boolean> {
     try {
-      await this.docker.getVolume(name).inspect();
+      await withOperationDeadline(this.docker.getVolume(name).inspect(), PERSISTENT_PATH_DOCKER_TIMEOUT_MS, "Docker persistent-path volume inspection");
       return true;
     } catch (error: any) {
       if (error?.statusCode === 404) return false;
@@ -130,20 +132,18 @@ export class PersistentBackupPathManager {
     let helper: Docker.Container | undefined;
     let created = false;
     try {
-      const archive = await this.docker
-        .getContainer(source.Id)
-        .getArchive({ path: selectedPath });
+      const archive = await withOperationDeadline(this.docker.getContainer(source.Id).getArchive({ path: selectedPath }), PERSISTENT_PATH_DOCKER_TIMEOUT_MS, "Docker persistent-path archive setup");
       await pipeline(archive as any, createWriteStream(raw, { mode: 0o600 }));
       await sanitizeBackupPathTarPayload(raw, safe, selectedPath);
 
       if (!replace) {
-        await this.docker.createVolume({
+        await withOperationDeadline(this.docker.createVolume({
           Name: volumeName,
           Labels: { [MANAGED_LABEL]: "true", [WORKER_LABEL]: workerId },
-        });
+        }), PERSISTENT_PATH_DOCKER_TIMEOUT_MS, "Docker persistent-path volume creation");
         created = true;
       }
-      helper = await this.docker.createContainer({
+      helper = await withOperationDeadline(this.docker.createContainer({
         Image: source.Config.Image,
         name: `agentor-persistent-path-${randomUUID()}`,
         Entrypoint: ["sleep"],
@@ -174,19 +174,19 @@ export class PersistentBackupPathManager {
           Tmpfs: { "/tmp": "rw,noexec,nosuid,nodev,size=16777216" },
           LogConfig: { Type: "none", Config: {} },
         },
-      });
+      }), PERSISTENT_PATH_DOCKER_TIMEOUT_MS, "Docker persistent-path helper creation");
       // putArchive works on a stopped container. The sanitized Docker archive
       // retains the selected directory's basename; extracting at its parent
       // writes through the exact-path volume mount without buffering in Node.
-      await helper.putArchive(createReadStream(safe) as any, {
+      await withOperationDeadline(helper.putArchive(createReadStream(safe) as any, {
         path: posix.dirname(selectedPath),
-      });
+      }), PERSISTENT_PATH_DOCKER_TIMEOUT_MS, "Docker persistent-path archive restore");
     } catch (error) {
       if (created)
-        await this.docker.getVolume(volumeName).remove({ force: true }).catch(() => {});
+        await withOperationDeadline(this.docker.getVolume(volumeName).remove({ force: true }), PERSISTENT_PATH_DOCKER_TIMEOUT_MS, "Docker persistent-path rollback cleanup").catch(() => {});
       throw error;
     } finally {
-      if (helper) await helper.remove({ force: true }).catch(() => {});
+      if (helper) await withOperationDeadline(helper.remove({ force: true }), PERSISTENT_PATH_DOCKER_TIMEOUT_MS, "Docker persistent-path helper cleanup").catch(() => {});
       await rm(dir, { recursive: true, force: true }).catch(() => {});
     }
   }

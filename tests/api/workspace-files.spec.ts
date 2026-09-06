@@ -1,10 +1,17 @@
 import { test, expect, request as playwrightRequest, type APIRequestContext } from '@playwright/test';
+import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
+import { promisify } from 'node:util';
 import { ApiClient } from '../helpers/api-client';
 import { createWorker, cleanupWorker, waitForWorkerRunning } from '../helpers/worker-lifecycle';
 import { createTestUser, deleteTestUser, type CreatedUser } from '../helpers/test-users';
 import { TerminalWsClient } from '../helpers/terminal-ws';
 
 const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
+const runCommand = promisify(execFile);
+const IS_ISOLATED_DIND = existsSync('/opt/test-stack/stack.yml');
 
 const UNAUTH_OPTS = {
   baseURL: BASE_URL,
@@ -137,6 +144,28 @@ function expectZipSignature(buf: Buffer) {
   expect(buf[1]).toBe(0x4b); // K
   expect(buf[2]).toBe(0x03);
   expect(buf[3]).toBe(0x04);
+}
+
+async function waitUntil(
+  predicate: () => Promise<boolean>,
+  timeoutMs: number,
+  message: string,
+) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (await predicate().catch(() => false)) return;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(message);
+}
+
+async function workspaceHelperNames(): Promise<string[]> {
+  const { stdout } = await runCommand(
+    'docker',
+    ['ps', '-a', '--filter', 'label=agentor.helper.operation-id', '--format', '{{.Names}}'],
+    { timeout: 5_000, maxBuffer: 1024 * 1024 },
+  );
+  return stdout.split('\n').map((value) => value.trim()).filter(Boolean);
 }
 
 // ─── Test suite ───────────────────────────────────────────────────────────
@@ -859,6 +888,120 @@ test.describe.serial('Workspace file manager API', () => {
     expect(headers['content-disposition']).toContain('attachment');
     expect(headers['content-disposition']).toContain(`dl-${stamp}.txt`);
     expect(Buffer.from(body).equals(payload)).toBe(true);
+  });
+
+  test('cancelling the worker-card workspace download leaves lifecycle and terminal responsive', async ({ request }) => {
+    test.skip(!IS_ISOLATED_DIND, 'requires the disposable Docker-in-Docker test runner');
+    test.setTimeout(180_000);
+    const api = new ApiClient(request);
+    const name = `cancel-worker-card-${Date.now()}.bin`;
+    // Random input prevents gzip from completing the full archive before the
+    // deliberately paused HTTP consumer disconnects.
+    expect(
+      (await execInWorker(request, workerId, `dd if=/dev/urandom of=/workspace/${name} bs=1M count=48 status=none`)).trim(),
+    ).toMatch(/MK_.*=0/);
+
+    const state = await request.storageState();
+    const cookie = state.cookies.map(({ name: key, value }) => `${key}=${value}`).join('; ');
+    const url = new URL(`${BASE_URL}/api/containers/${workerId}/workspace`);
+    const transport = url.protocol === 'https:' ? httpsRequest : httpRequest;
+    let response: import('node:http').IncomingMessage | undefined;
+    let rawRequest: import('node:http').ClientRequest | undefined;
+    await new Promise<void>((resolve, reject) => {
+      rawRequest = transport({
+        hostname: url.hostname,
+        port: url.port || undefined,
+        path: url.pathname,
+        method: 'GET',
+        headers: cookie ? { Cookie: cookie } : {},
+        ...(url.protocol === 'https:' ? { rejectUnauthorized: false } : {}),
+      }, (incoming) => {
+        response = incoming;
+        incoming.pause();
+        resolve();
+      });
+      rawRequest.once('error', reject);
+      rawRequest.end();
+    });
+
+    expect(response?.statusCode).toBe(200);
+    const responseClosed = new Promise<void>((resolve) =>
+      response!.once('close', resolve),
+    );
+    response?.destroy();
+    rawRequest?.destroy();
+    await responseClosed;
+
+    // The cancelled Docker archive stream must not poison the source worker's
+    // subsequent control-plane operations.
+    expect((await api.stopContainer(workerId)).status).toBe(200);
+    expect((await api.restartContainer(workerId)).status).toBe(200);
+    await waitForWorkerRunning(request, workerId, 90_000);
+    expect(await execInWorker(request, workerId, 'printf worker-card-responsive')).toContain('worker-card-responsive');
+  });
+
+  test('a client-aborted offline download removes its labelled helper and leaves the worker recoverable', async ({ request }) => {
+    test.skip(!IS_ISOLATED_DIND, 'requires the disposable Docker-in-Docker test runner to inspect helper labels');
+    test.setTimeout(180_000);
+    const api = new ApiClient(request);
+    const name = `cancel-offline-${Date.now()}.bin`;
+    // Keep the response streaming long enough to deterministically abort only
+    // after the helper was created and the HTTP response began.
+    expect(
+      (await execInWorker(request, workerId, `dd if=/dev/zero of=/workspace/${name} bs=1M count=96 status=none`)).trim(),
+    ).toMatch(/MK_.*=0/);
+    expect((await api.stopContainer(workerId)).status).toBe(200);
+
+    const state = await request.storageState();
+    const cookie = state.cookies.map(({ name: key, value }) => `${key}=${value}`).join('; ');
+    // A stopped worker is read through the bounded, labelled offline helper.
+    // This matches the helper ownership/cleanup path while still exercising a
+    // real authenticated HTTP response and persistent source workspace.
+    const url = new URL(`${BASE_URL}/api/workspaces/${workerId}/download`);
+    const transport = url.protocol === 'https:' ? httpsRequest : httpRequest;
+    let response: import('node:http').IncomingMessage | undefined;
+    let rawRequest: import('node:http').ClientRequest | undefined;
+    await new Promise<void>((resolve, reject) => {
+      rawRequest = transport({
+        hostname: url.hostname,
+        port: url.port || undefined,
+        path: `${url.pathname}${url.search}`,
+        method: 'POST',
+        headers: {
+          ...(cookie ? { Cookie: cookie } : {}),
+          Origin: BASE_URL,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(JSON.stringify({ paths: [name] })),
+        },
+        // The disposable test stack uses a local self-signed certificate.
+        ...(url.protocol === 'https:' ? { rejectUnauthorized: false } : {}),
+      }, (incoming) => {
+        response = incoming;
+        incoming.pause();
+        resolve();
+      });
+      rawRequest.once('error', reject);
+      rawRequest.end(JSON.stringify({ paths: [name] }));
+    });
+
+    await waitUntil(
+      async () => (await workspaceHelperNames()).length > 0,
+      20_000,
+      'The offline workspace download never created its helper',
+    );
+    response?.destroy();
+    rawRequest?.destroy();
+    await waitUntil(
+      async () => (await workspaceHelperNames()).length === 0,
+      30_000,
+      'The aborted workspace download left an Agentor operation helper behind',
+    );
+
+    // A cancelled reader must not poison its source worker's lifecycle or
+    // terminal. Restart from the deliberate stopped state, then attach.
+    expect((await api.restartContainer(workerId)).status).toBe(200);
+    await waitForWorkerRunning(request, workerId, 90_000);
+    expect(await execInWorker(request, workerId, 'printf worker-responsive')).toContain('worker-responsive');
   });
 
   test('folder download is a true ZIP with PK signature and relative names', async ({ request }) => {

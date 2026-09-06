@@ -175,13 +175,27 @@ export async function writeFilteredAgentsGz(src: NodeJS.ReadableStream, dest: st
  * temp file (sizes are known via stat, so no buffering). */
 export function packBundle(files: { name: string; path: string }[]): Readable {
   const pack = tar.pack();
+  let activeSource: ReturnType<typeof createReadStream> | undefined;
+  const closeActiveSource = () => {
+    activeSource?.destroy();
+    activeSource = undefined;
+  };
+  // A disconnected download destroys the outer tar. Explicitly close the
+  // currently-open staging file as well; pipe() only unpipes a destroyed
+  // destination and otherwise may leave the source fd paused until GC.
+  pack.once('close', closeActiveSource);
+  pack.once('error', closeActiveSource);
   (async () => {
     for (const f of files) {
       const size = (await stat(f.path)).size;
       await new Promise<void>((resolve, reject) => {
         const entry = pack.entry({ name: f.name, size }, (err) => (err ? reject(err) : resolve()));
-        createReadStream(f.path).pipe(entry);
+        const source = createReadStream(f.path);
+        activeSource = source;
+        source.once('error', reject);
+        source.pipe(entry);
       });
+      activeSource = undefined;
     }
     pack.finalize();
   })().catch((err) => pack.destroy(err instanceof Error ? err : new Error(String(err))));

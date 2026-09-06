@@ -97,10 +97,21 @@ export interface ServiceStatus {
 
 export type ContainerStatus =
   | "creating"
+  | "starting"
   | "running"
   | "stopped"
+  | "recovering"
+  | "unknown"
   | "removing"
   | "error";
+
+export interface WorkerRuntimeDiagnostic {
+  code: string;
+  operation: string;
+  message: string;
+  retryable: boolean;
+  observedAt: string;
+}
 
 export type WorkerGroupLifecycleAction = "stop" | "rebuild" | "archive";
 
@@ -140,6 +151,10 @@ export interface ContainerInfo extends UserOwnedResource {
   imageName: string;
   imageId: string;
   status: ContainerStatus;
+  /** Durable operator intent, distinct from an unreliable Docker observation. */
+  desiredRuntimeStatus?: "running" | "stopped";
+  /** Safe, value-free explanation when the runtime cannot be verified. */
+  runtimeDiagnostic?: WorkerRuntimeDiagnostic;
   repos?: RepoConfig[];
   mounts?: MountConfig[];
   initScript?: string;

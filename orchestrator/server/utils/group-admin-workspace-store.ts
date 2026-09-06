@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type {
+  AdminWorkspaceIdentityMaterializationIntent,
   AdminWorkspaceRuntimeAdapter,
   AdminWorkspaceStartupScriptRuntimeStatus,
   AdministrativeWorkspaceRecord,
@@ -12,6 +13,10 @@ import {
 import { useWorkerGroupStore } from "./services";
 import type { WorkerGroup, WorkerGroupStore } from "./worker-group-store";
 import { withWorkerNetworkMutation } from "./worker-group-manager";
+import {
+  operationSettlement,
+  type OperationFailureWithSettlement,
+} from "./operation-deadline";
 
 export interface GroupAdministrativeWorkspaceRecord
   extends AdministrativeWorkspaceRecord {
@@ -30,6 +35,7 @@ export class GroupAdminWorkspaceStore {
   private runtime?: AdminWorkspaceRuntimeAdapter;
   private identityMaterializer?: (
     record: GroupAdministrativeWorkspaceRecord,
+    intent: AdminWorkspaceIdentityMaterializationIntent,
   ) => Promise<void>;
   private running = new Set<string>();
   private pendingCommits = new Map<
@@ -47,7 +53,10 @@ export class GroupAdminWorkspaceStore {
     this.runtime = runtime;
   }
   setIdentityMaterializer(
-    materializer: (record: GroupAdministrativeWorkspaceRecord) => Promise<void>,
+    materializer: (
+      record: GroupAdministrativeWorkspaceRecord,
+      intent: AdminWorkspaceIdentityMaterializationIntent,
+    ) => Promise<void>,
   ) {
     this.identityMaterializer = materializer;
   }
@@ -138,10 +147,20 @@ export class GroupAdminWorkspaceStore {
         { statusCode: 409 },
       );
     this.running.add(groupId);
+    let deferredRelease = false;
     try {
       return await operation();
+    } catch (error) {
+      const settlement = (error as OperationFailureWithSettlement)?.[
+        operationSettlement
+      ];
+      if (settlement) {
+        deferredRelease = true;
+        void settlement.finally(() => this.running.delete(groupId));
+      }
+      throw error;
     } finally {
-      this.running.delete(groupId);
+      if (!deferredRelease) this.running.delete(groupId);
     }
   }
   async ensure(groupId: string, _ownerId?: string, authorize?: () => void) {
@@ -156,7 +175,10 @@ export class GroupAdminWorkspaceStore {
     const pending = await this.flushPendingCommit(group.id, "ensure");
     if (pending?.matched) {
       if (pending.record.status === "running" && this.identityMaterializer)
-        await this.identityMaterializer(structuredClone(pending.record));
+        await this.identityMaterializer(
+          structuredClone(pending.record),
+          "refresh-running",
+        );
       return this.publicRecord(pending.record);
     }
     let record = pending?.record ?? this.record(group.id);
@@ -182,14 +204,22 @@ export class GroupAdminWorkspaceStore {
       await this.save(record);
     }
     if (this.runtime) {
+      if (record.status === "running" && this.identityMaterializer)
+        await this.identityMaterializer(
+          structuredClone(record),
+          "prepare-start",
+        );
       const changed = this.applyImage(
         record,
         await this.runtime.ensure(structuredClone(record)),
       );
       if (changed) await this.commitExternal("ensure", record);
+      if (record.status === "running" && this.identityMaterializer)
+        await this.identityMaterializer(
+          structuredClone(record),
+          "refresh-running",
+        );
     }
-    if (record.status === "running" && this.identityMaterializer)
-      await this.identityMaterializer(structuredClone(record));
     return this.publicRecord(record);
   }
   async setStatus(
@@ -204,7 +234,10 @@ export class GroupAdminWorkspaceStore {
         const pending = await this.flushPendingCommit(groupId, operation);
         if (pending?.matched) {
           if (status === "running" && this.identityMaterializer)
-            await this.identityMaterializer(structuredClone(pending.record));
+            await this.identityMaterializer(
+              structuredClone(pending.record),
+              "refresh-running",
+            );
           return this.publicRecord(pending.record);
         }
         // Avoid public ensure(): this operation already owns both lifecycle
@@ -212,19 +245,26 @@ export class GroupAdminWorkspaceStore {
         if (!this.record(groupId)) await this.ensureLocked(group);
         const record = this.record(groupId)!;
         if (this.runtime) {
-          if (status === "running")
+          if (status === "running") {
+            if (this.identityMaterializer)
+              await this.identityMaterializer(
+                structuredClone(record),
+                "prepare-start",
+              );
             this.applyImage(
               record,
               await this.runtime.start(structuredClone(record)),
             );
-          else await this.runtime.stop(structuredClone(record));
+            await this.identityMaterializer?.(
+              structuredClone(record),
+              "refresh-running",
+            );
+          } else await this.runtime.stop(structuredClone(record));
         }
         record.status = status;
         record.updatedAt = new Date().toISOString();
         if (this.runtime) await this.commitExternal(operation, record);
         else await this.save(record);
-        if (status === "running" && this.identityMaterializer)
-          await this.identityMaterializer(structuredClone(record));
         return this.publicRecord(record);
       }),
     );
@@ -236,7 +276,10 @@ export class GroupAdminWorkspaceStore {
         const pending = await this.flushPendingCommit(groupId, "rebuild");
         if (pending?.matched) {
           if (this.identityMaterializer)
-            await this.identityMaterializer(structuredClone(pending.record));
+            await this.identityMaterializer(
+              structuredClone(pending.record),
+              "refresh-running",
+            );
           return this.publicRecord(pending.record);
         }
         // Rebuild must not first auto-start stale disposable compute.
@@ -251,15 +294,22 @@ export class GroupAdminWorkspaceStore {
             new Error("Administrative workspace runtime is unavailable"),
             { statusCode: 503 },
           );
+        if (this.identityMaterializer)
+          await this.identityMaterializer(
+            structuredClone(record),
+            "prepare-start",
+          );
         this.applyImage(
           record,
           await this.runtime.rebuild(structuredClone(record)),
         );
+        await this.identityMaterializer?.(
+          structuredClone(record),
+          "refresh-running",
+        );
         record.status = "running";
         record.updatedAt = new Date().toISOString();
         await this.commitExternal("rebuild", record);
-        if (this.identityMaterializer)
-          await this.identityMaterializer(structuredClone(record));
         return this.publicRecord(record);
       }),
     );

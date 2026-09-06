@@ -23,6 +23,9 @@ export interface WorkerRecord extends UserOwnedResource {
    * kept for unarchiving. (For archived workers the record is the only evidence
    * the worker exists, since no container remains to discover it from.) */
   status: "active" | "archived";
+  /** Desired runtime state survives daemon/orchestrator restarts. Legacy
+   * records are migrated from the first successfully verified observation. */
+  desiredRuntimeStatus?: "running" | "stopped";
   archivedAt?: string;
   /** Internal fail-closed marker: Docker is already gone, but permanent
    * resource cleanup must be retried. Such a record cannot be unarchived. */
@@ -133,6 +136,23 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
       }
       return structuredClone(next);
     });
+  }
+
+  async setDesiredRuntimeStatus(
+    userId: string,
+    id: string,
+    desiredRuntimeStatus: "running" | "stopped",
+  ): Promise<WorkerRecord> {
+    const current = this.get(userId, id);
+    if (!current)
+      throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
+    const updated: WorkerRecord = {
+      ...current,
+      desiredRuntimeStatus,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.setItem(userId, updated);
+    return updated;
   }
 
   /** Persist the desired host-mount set after a grant/hierarchy change. Active

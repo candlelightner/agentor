@@ -15,6 +15,7 @@ const emit = defineEmits<{
   openEditor: [containerId: string];
   stop: [id: string];
   restart: [id: string];
+  recover: [id: string];
   rebuild: [id: string];
   remove: [id: string];
   archive: [id: string];
@@ -41,6 +42,9 @@ const statusColor = computed<BadgeColor>(() => {
     running: 'success',
     stopped: 'neutral',
     creating: 'warning',
+    starting: 'warning',
+    recovering: 'warning',
+    unknown: 'warning',
     error: 'error',
     removing: 'warning',
   };
@@ -121,6 +125,9 @@ function onHScrollWheel(e: WheelEvent) {
         <UBadge :color="statusColor" variant="subtle" size="xs">
           {{ container.status }}
         </UBadge>
+        <UTooltip v-if="container.runtimeDiagnostic" :text="container.runtimeDiagnostic.message">
+          <UIcon name="i-lucide-triangle-alert" class="size-3.5 text-amber-500" aria-label="Runtime state could not be verified" />
+        </UTooltip>
       </div>
     </div>
 
@@ -211,6 +218,9 @@ function onHScrollWheel(e: WheelEvent) {
         </UTooltip>
         <UTooltip v-if="isStopped" text="Restart">
           <UButton size="xs" color="success" variant="subtle" icon="i-lucide-refresh-cw" @click="emit('restart', container.id)" />
+        </UTooltip>
+        <UTooltip v-if="container.status === 'unknown' || container.status === 'error'" text="Verify persistent mounts and recover disposable runtime">
+          <UButton size="xs" color="warning" variant="subtle" icon="i-lucide-life-buoy" aria-label="Recover worker" @click="emit('recover', container.id)" />
         </UTooltip>
         <UTooltip v-if="isRunning" text="Stop">
           <UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-square" @click="emit('stop', container.id)" />

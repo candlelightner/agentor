@@ -55,10 +55,14 @@ import {
   beginInstanceRestore,
   beginInstanceSnapshot,
 } from "./instance-snapshot-gate";
+import { withOperationDeadline } from "./operation-deadline";
 
 const MAX_CONCURRENT_JOBS = 1;
 const MAX_LOG_LINES = 1000;
 const REMOTE_HEADER_BYTES = 16 * 1024;
+const INSTANCE_DOCKER_READ_TIMEOUT_MS = 8_000;
+const INSTANCE_DOCKER_MUTATION_TIMEOUT_MS = 30_000;
+const INSTANCE_RESTORE_HELPER_TIMEOUT_MS = 10 * 60 * 1000;
 
 interface QueuedOperation {
   jobId: string;
@@ -420,7 +424,15 @@ export class InstanceBackupManager {
     const volumeConflicts: string[] = [];
     if (restoreOptions.restoreDockerVolumes) {
       const existingVolumes = new Set(
-        ((await this.docker.listVolumes()).Volumes ?? [])
+        ((
+          await withOperationDeadline(
+            (operationSignal) => this.docker.listVolumes({
+              abortSignal: operationSignal,
+            }),
+            INSTANCE_DOCKER_READ_TIMEOUT_MS,
+            "Docker instance-restore volume inventory",
+          )
+        ).Volumes ?? [])
           .map((volume) => volume.Name)
           .filter((name): name is string => Boolean(name)),
       );
@@ -1146,7 +1158,7 @@ export class InstanceBackupManager {
         70,
         "Validated restore staged. Starting the controlled helper that will stop the orchestrator, apply the snapshot, and restart it.",
       );
-      await this.launchRestoreHelper(job, stage, async () => {
+      await this.launchRestoreHelper(job, stage, signal, async () => {
         helperOwnsStage = true;
         await this.phase(
           job,
@@ -1171,11 +1183,19 @@ export class InstanceBackupManager {
   private async launchRestoreHelper(
     job: InstanceBackupJob,
     stage: string,
+    signal: AbortSignal,
     onHandoff: () => Promise<void>,
   ) {
     const hostname = process.env.HOSTNAME;
     if (!hostname) throw new Error("Orchestrator container identity is unavailable");
-    const current = await this.docker.getContainer(hostname).inspect();
+    const current = await withOperationDeadline(
+      (operationSignal) => this.docker.getContainer(hostname).inspect({
+        abortSignal: operationSignal,
+      }),
+      INSTANCE_DOCKER_READ_TIMEOUT_MS,
+      "Docker instance-restore orchestrator inspection",
+      signal,
+    );
     const dataMount = current.Mounts?.find(
       (mount) => mount.Destination === this.dataDir,
     );
@@ -1192,7 +1212,7 @@ export class InstanceBackupManager {
         Target: this.dataDir,
       } as Docker.MountSettings);
     else throw new Error("Unsupported orchestrator data mount type");
-    const helper = await this.docker.createContainer({
+    const helper = await withOperationDeadline((operationSignal) => this.docker.createContainer({
       Image: current.Config.Image,
       name: `agentor-instance-restore-${job.id}`,
       User: "0:0",
@@ -1225,15 +1245,35 @@ export class InstanceBackupManager {
         RestartPolicy: { Name: "no" },
         LogConfig: { Type: "json-file", Config: { "max-size": "1m" } },
       },
-    });
-    await helper.start();
+      abortSignal: operationSignal,
+    }), INSTANCE_DOCKER_MUTATION_TIMEOUT_MS, "Docker instance-restore helper creation", signal);
+    try {
+      await withOperationDeadline(
+        (operationSignal) => helper.start({ abortSignal: operationSignal }),
+        INSTANCE_DOCKER_MUTATION_TIMEOUT_MS,
+        "Docker instance-restore helper start",
+        signal,
+      );
+    } catch (error) {
+      await withOperationDeadline(
+        (operationSignal) => helper.remove({ force: true, abortSignal: operationSignal } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
+        INSTANCE_DOCKER_MUTATION_TIMEOUT_MS,
+        "Docker instance-restore failed-start cleanup",
+      ).catch(() => {});
+      throw error;
+    }
     await onHandoff();
     // If validation fails before the helper stops this container, remain
     // alive long enough to ingest the terminal ledger entry it wrote. On a
     // successful apply Docker stops this process, so this wait never turns a
     // management request into a long-running call—the request already
     // returned when the durable restore job was queued.
-    const result = await helper.wait();
+    const result = await withOperationDeadline(
+      (operationSignal) => helper.wait({ abortSignal: operationSignal }),
+      INSTANCE_RESTORE_HELPER_TIMEOUT_MS,
+      "Docker instance-restore helper completion",
+      signal,
+    );
     await this.store.reload();
     const persisted = this.store.getJob(job.id);
     if (result.StatusCode !== 0 && persisted?.status !== "failed")
@@ -1275,9 +1315,14 @@ export class InstanceBackupManager {
     }
     if (storage.mode === "volume")
       add({ name: "agentor-traefik-certs", kind: "traefik-certificates" });
-    const persistent = await this.docker.listVolumes({
-      filters: { label: ["agentor.persistent-backup-path=true"] },
-    });
+    const persistent = await withOperationDeadline(
+      (operationSignal) => this.docker.listVolumes({
+        filters: { label: ["agentor.persistent-backup-path=true"] },
+        abortSignal: operationSignal,
+      }),
+      INSTANCE_DOCKER_READ_TIMEOUT_MS,
+      "Docker persistent backup-volume inventory",
+    );
     for (const volume of persistent.Volumes ?? [])
       if (volume.Name)
         add({
@@ -1379,8 +1424,15 @@ export class InstanceBackupManager {
     if (!(await this.volumeExists(volumeName))) return false;
     const hostname = process.env.HOSTNAME;
     if (!hostname) throw new Error("Orchestrator container identity is unavailable");
-    const source = await this.docker.getContainer(hostname).inspect();
-    const helper = await this.docker.createContainer({
+    const source = await withOperationDeadline(
+      (operationSignal) => this.docker.getContainer(hostname).inspect({
+        abortSignal: operationSignal,
+      }),
+      INSTANCE_DOCKER_READ_TIMEOUT_MS,
+      "Docker instance-snapshot orchestrator inspection",
+      signal,
+    );
+    const helper = await withOperationDeadline((operationSignal) => this.docker.createContainer({
       Image: source.Config.Image,
       name: `agentor-instance-snapshot-${randomUUID()}`,
       Entrypoint: ["sleep"],
@@ -1406,13 +1458,27 @@ export class InstanceBackupManager {
         NanoCpus: 500_000_000,
         LogConfig: { Type: "none", Config: {} },
       },
-    });
+      abortSignal: operationSignal,
+    }), INSTANCE_DOCKER_MUTATION_TIMEOUT_MS, "Docker instance-snapshot helper creation", signal);
     const raw = `${output}.raw`;
     const sanitized = `${output}.tar`;
     try {
-      await helper.start();
+      await withOperationDeadline(
+        (operationSignal) => helper.start({ abortSignal: operationSignal }),
+        INSTANCE_DOCKER_MUTATION_TIMEOUT_MS,
+        "Docker instance-snapshot helper start",
+        signal,
+      );
       await pipeline(
-        (await helper.getArchive({ path: "/source" })) as NodeJS.ReadableStream,
+        (await withOperationDeadline(
+          (operationSignal) => helper.getArchive({
+            path: "/source",
+            abortSignal: operationSignal,
+          }),
+          INSTANCE_DOCKER_READ_TIMEOUT_MS,
+          "Docker instance-snapshot archive setup",
+          signal,
+        )) as NodeJS.ReadableStream,
         createWriteStream(raw, { mode: 0o600 }),
         { signal },
       );
@@ -1425,7 +1491,11 @@ export class InstanceBackupManager {
       );
       return true;
     } finally {
-      await helper.remove({ force: true }).catch(() => {});
+      await withOperationDeadline(
+        (operationSignal) => helper.remove({ force: true, abortSignal: operationSignal } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
+        INSTANCE_DOCKER_MUTATION_TIMEOUT_MS,
+        "Docker instance-snapshot helper cleanup",
+      ).catch(() => {});
       await rm(raw, { force: true }).catch(() => {});
       await rm(sanitized, { force: true }).catch(() => {});
     }
@@ -1433,7 +1503,13 @@ export class InstanceBackupManager {
 
   private async volumeExists(name: string) {
     try {
-      await this.docker.getVolume(name).inspect();
+      await withOperationDeadline(
+        (operationSignal) => this.docker.getVolume(name).inspect({
+          abortSignal: operationSignal,
+        }),
+        INSTANCE_DOCKER_READ_TIMEOUT_MS,
+        "Docker instance-snapshot volume inspection",
+      );
       return true;
     } catch (error: any) {
       if (error?.statusCode === 404) return false;

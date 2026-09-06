@@ -14,6 +14,12 @@ import { probeList, probeLstat } from "./workspace-probe-runner";
 import { demuxSingleFileFromTar, buildWorkspaceZip } from "./workspace-zip";
 import type { FileEntry, FileListing } from "../../shared/types";
 import type { WorkspaceInventoryItem } from "./workspace-inventory";
+import {
+  operationSettlement,
+  type OperationFailureWithSettlement,
+  withOperationDeadline,
+} from "./operation-deadline";
+import { registerOperationHelper } from "./operation-helper-registry";
 
 const HELPER_LIFETIME_MS = 60_000;
 const MAX_PREVIEW_BYTES = 10 * 1024 * 1024;
@@ -22,25 +28,49 @@ const MAX_SEARCH_RESULTS = 500;
 const MAX_IMAGE_PIXELS = 40_000_000;
 const MAX_ACTIVE_HELPERS = 8;
 const MAX_ACTIVE_HELPERS_PER_USER = 3;
+const HELPER_DOCKER_TIMEOUT_MS = 8_000;
 let activeHelpers = 0;
 const activeHelpersByUser = new Map<string, number>();
 
 /** Remove helper containers left behind by a process crash or hard restart. */
 export async function cleanupWorkspaceHelpers(): Promise<number> {
   const docker = new Docker({ socketPath: "/var/run/docker.sock" });
-  const containers = await docker.listContainers({
-    all: true,
-    filters: { label: ["agentor.workspace-helper=true"] },
-  });
-  await Promise.all(
-    containers.map((container) =>
-      docker
-        .getContainer(container.Id)
-        .remove({ force: true })
-        .catch(() => {}),
+  const inventories = await Promise.allSettled(
+    ["agentor.workspace-helper=true", "agentor.backup-restore-helper=true"].map(
+      (label) =>
+        withOperationDeadline(
+          (operationSignal) => docker.listContainers({
+            all: true,
+            filters: { label: [label] },
+            abortSignal: operationSignal,
+          }),
+          HELPER_DOCKER_TIMEOUT_MS,
+          "Docker workspace-helper inventory",
+        ),
     ),
   );
-  return containers.length;
+  const unique = new Map<string, Docker.ContainerInfo>();
+  for (const inventory of inventories)
+    if (inventory.status === "fulfilled")
+      for (const container of inventory.value)
+        unique.set(container.Id, container);
+  // Startup owns no legitimate transfer from the previous process. Remove
+  // every discovered helper, including one Docker still reports as running;
+  // per-helper deadlines keep a corrupt object from blocking the rest.
+  const containers = [...unique.values()];
+  const results = await Promise.allSettled(
+    containers.map((container) =>
+      withOperationDeadline(
+        (operationSignal) => docker.getContainer(container.Id).remove({
+          force: true,
+          abortSignal: operationSignal,
+        } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
+        HELPER_DOCKER_TIMEOUT_MS,
+        "Docker workspace-helper cleanup",
+      ),
+    ),
+  );
+  return results.filter((result) => result.status === "fulfilled").length;
 }
 
 export interface WorkspaceSearchResult {
@@ -90,24 +120,44 @@ class HelperLease {
   private timer?: NodeJS.Timeout;
   containerId = "";
   private slotHeld = false;
+  private readonly operationId = randomUUID();
+  private releaseOperation?: () => void;
 
   constructor(private item: WorkspaceInventoryItem) {}
 
-  async start(): Promise<void> {
+  async start(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     const config = useConfig();
     const image = config.workerImagePrefix + config.workerImage;
-    await useDockerService().ensureImage(image);
+    await useDockerService().ensureImage(image, signal);
     // Resolve the approved configured image to immutable content before the
     // helper is created. A mutable tag changing between requests cannot select
     // an unreviewed helper implementation mid-operation.
-    const imageId = (await this.docker.getImage(image).inspect()).Id;
+    const imageId = (
+      await withOperationDeadline(
+        (operationSignal) => this.docker.getImage(image).inspect({
+          abortSignal: operationSignal,
+        } as Docker.ImageInspectOptions & { abortSignal: AbortSignal }),
+        HELPER_DOCKER_TIMEOUT_MS,
+        "Docker workspace-helper image inspection",
+        signal,
+      )
+    ).Id;
     // Docker creates a missing bind source/volume implicitly. Refuse that side
     // effect: offline browsing must be strictly read-only, including setup.
     if (this.item.backend === "volume") {
-      await this.docker
-        .getVolume(this.item.storageRef)
-        .inspect()
-        .catch(() => {
+      await withOperationDeadline(
+        (operationSignal) => this.docker.getVolume(this.item.storageRef).inspect({
+          abortSignal: operationSignal,
+        }),
+        HELPER_DOCKER_TIMEOUT_MS,
+        "Docker workspace volume inspection",
+        signal,
+      )
+        .catch((error) => {
+          const status = (error as { statusCode?: number; status?: number })
+            ?.statusCode ?? (error as { status?: number })?.status;
+          if (status !== 404) throw error;
           throw createError({
             statusCode: 404,
             statusMessage: "Workspace volume not found",
@@ -124,7 +174,7 @@ class HelperLease {
     this.acquireSlot();
     const createOptions: Docker.ContainerCreateOptions = {
       Image: imageId,
-      name: `agentor-workspace-reader-${randomUUID()}`,
+      name: `agentor-workspace-reader-${this.operationId}`,
       // Lifetime is controlled explicitly by the lease and startup stale
       // cleanup. A fixed `sleep 60` killed valid throttled download streams.
       Entrypoint: ["tail"],
@@ -134,6 +184,9 @@ class HelperLease {
       Labels: {
         "agentor.workspace-helper": "true",
         "agentor.workspace-id": this.item.id,
+        "agentor.helper.operation-id": this.operationId,
+        "agentor.helper.owner-id": this.item.userId ?? "system",
+        "agentor.helper.created-at": new Date().toISOString(),
       },
       HostConfig: {
         Mounts: [
@@ -162,16 +215,53 @@ class HelperLease {
     };
     let helper: Docker.Container;
     try {
-      helper = await this.docker.createContainer(createOptions);
+      helper = await withOperationDeadline(
+        (operationSignal) => this.docker.createContainer({
+          ...createOptions,
+          abortSignal: operationSignal,
+        }),
+        HELPER_DOCKER_TIMEOUT_MS,
+        "Docker workspace-helper creation",
+        signal,
+      );
     } catch (err) {
+      // Docker may accept a create immediately before its HTTP response is
+      // aborted. The operation-scoped name remains a safe, deterministic
+      // cleanup handle even when dockerode never returned the container id.
+      const cleanupAmbiguousCreate = () => withOperationDeadline(
+        (operationSignal) => this.docker.getContainer(createOptions.name!).remove({
+          force: true,
+          abortSignal: operationSignal,
+        } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
+        HELPER_DOCKER_TIMEOUT_MS,
+        "Docker workspace-helper ambiguous-create cleanup",
+      ).catch(() => {});
+      await cleanupAmbiguousCreate();
+      // If abort won the race before Docker's create response settled, repeat
+      // cleanup after settlement so a late-created object cannot escape the
+      // immediate name-based attempt. Startup stale cleanup remains the final
+      // crash-safe backstop.
+      const settlement = (err as OperationFailureWithSettlement)?.[
+        operationSettlement
+      ];
+      if (settlement) void settlement.then(cleanupAmbiguousCreate);
       this.releaseSlot();
       throw err;
     }
     this.containerId = helper.id;
     try {
-      await helper.start();
+      await withOperationDeadline(
+        (operationSignal) => helper.start({ abortSignal: operationSignal }),
+        HELPER_DOCKER_TIMEOUT_MS,
+        "Docker workspace-helper start",
+        signal,
+      );
     } catch (err) {
-      await helper.remove({ force: true }).catch(() => {});
+      await withOperationDeadline(
+        (operationSignal) => helper.remove({ force: true, abortSignal: operationSignal } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
+        HELPER_DOCKER_TIMEOUT_MS,
+        "Docker workspace-helper failed-start cleanup",
+      ).catch(() => {});
       // Some rootless/nested Docker daemons run their docker cgroup in
       // threaded mode and reject *any* cgroup-v2 controller setting. Keep the
       // isolation controls that do not depend on cgroups (read-only rootfs,
@@ -184,16 +274,35 @@ class HelperLease {
       }
       const { PidsLimit, Memory, NanoCpus, ...fallbackHostConfig } =
         createOptions.HostConfig!;
+      const fallbackName = `agentor-workspace-reader-${this.operationId}-fallback`;
       try {
-        helper = await this.docker.createContainer({
+        helper = await withOperationDeadline((operationSignal) => this.docker.createContainer({
           ...createOptions,
-          name: `agentor-workspace-reader-${randomUUID()}`,
+          name: fallbackName,
           HostConfig: fallbackHostConfig,
-        });
+          abortSignal: operationSignal,
+        }), HELPER_DOCKER_TIMEOUT_MS, "Docker workspace-helper fallback creation", signal);
         this.containerId = helper.id;
-        await helper.start();
+        await withOperationDeadline(
+          (operationSignal) => helper.start({ abortSignal: operationSignal }),
+          HELPER_DOCKER_TIMEOUT_MS,
+          "Docker workspace-helper fallback start",
+          signal,
+        );
       } catch (fallbackError) {
-        await helper?.remove({ force: true }).catch(() => {});
+        const cleanupFallback = () => withOperationDeadline(
+          (operationSignal) => this.docker.getContainer(fallbackName).remove({
+            force: true,
+            abortSignal: operationSignal,
+          } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
+          HELPER_DOCKER_TIMEOUT_MS,
+          "Docker workspace-helper fallback cleanup",
+        ).catch(() => {});
+        await cleanupFallback();
+        const settlement = (
+          fallbackError as OperationFailureWithSettlement
+        )?.[operationSettlement];
+        if (settlement) void settlement.then(cleanupFallback);
         this.releaseSlot();
         throw fallbackError;
       }
@@ -211,11 +320,17 @@ class HelperLease {
     }
     const id = this.containerId;
     this.containerId = "";
-    await this.docker
-      .getContainer(id)
-      .remove({ force: true })
-      .catch(() => {});
+    // Capacity belongs to the lease, not Docker's response. Release it before
+    // waiting so one broken helper object cannot deny unrelated operations.
     this.releaseSlot();
+    await withOperationDeadline(
+      (operationSignal) => this.docker.getContainer(id).remove({
+        force: true,
+        abortSignal: operationSignal,
+      } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
+      HELPER_DOCKER_TIMEOUT_MS,
+      "Docker workspace-helper cleanup",
+    ).catch(() => {});
   }
 
   /** Guard a response/archive stream with an inactivity timeout. The source is
@@ -223,7 +338,7 @@ class HelperLease {
    * put it into flowing mode before h3/Docker attaches its consumer. Each chunk
    * that crosses the transform resets the timer; when downstream backpressure
    * stalls the transfer, chunks stop crossing and the helper is reclaimed. */
-  holdForStream(source: Readable): Readable {
+  holdForStream(source: Readable, signal?: AbortSignal): Readable {
     let guarded!: LazyWatchdogStream;
     const arm = () => {
       if (this.timer) clearTimeout(this.timer);
@@ -235,7 +350,14 @@ class HelperLease {
       this.timer.unref?.();
     };
     guarded = new LazyWatchdogStream(source, arm);
+    // Disconnect is a normal ownership release. Avoid emitting an unhandled
+    // stream error if it lands in the narrow interval before h3 consumes the
+    // returned stream.
+    const abort = () => guarded.destroy();
+    signal?.addEventListener("abort", abort, { once: true });
+    guarded.once("close", () => signal?.removeEventListener("abort", abort));
     arm();
+    if (signal?.aborted) abort();
     return guarded;
   }
 
@@ -254,6 +376,7 @@ class HelperLease {
     activeHelpers++;
     activeHelpersByUser.set(owner, ownerCount + 1);
     this.slotHeld = true;
+    this.releaseOperation = registerOperationHelper(this.operationId);
   }
 
   private releaseSlot(): void {
@@ -264,6 +387,8 @@ class HelperLease {
     const remaining = (activeHelpersByUser.get(owner) ?? 1) - 1;
     if (remaining > 0) activeHelpersByUser.set(owner, remaining);
     else activeHelpersByUser.delete(owner);
+    this.releaseOperation?.();
+    this.releaseOperation = undefined;
   }
 }
 
@@ -464,7 +589,8 @@ export class OfflineWorkspaceAccess {
     }
   }
 
-  async download(rawPaths: unknown): Promise<WorkspaceDownload> {
+  async download(rawPaths: unknown, signal?: AbortSignal): Promise<WorkspaceDownload> {
+    signal?.throwIfAborted();
     const rels = normalizeClientPathList(rawPaths);
     if (rels.length > 100)
       throw createError({
@@ -472,13 +598,15 @@ export class OfflineWorkspaceAccess {
         statusMessage: "Too many download paths",
       });
     const lease = new HelperLease(this.item);
-    await lease.start();
+    await lease.start(signal);
     try {
       const entries: FileEntry[] = [];
-      for (const rel of rels)
+      for (const rel of rels) {
+        signal?.throwIfAborted();
         entries.push(
-          await probeLstat(useDockerService(), lease.containerId, rel),
+          await probeLstat(useDockerService(), lease.containerId, rel, signal),
         );
+      }
       if (entries.some((entry) => entry.type === "symlink"))
         throw createError({
           statusCode: 400,
@@ -490,18 +618,20 @@ export class OfflineWorkspaceAccess {
         const tar = await useDockerService().getArchive(
           lease.containerId,
           toContainerPath(entries[0]!.path),
+          signal,
         );
-        stream = demuxSingleFileFromTar(tar, entries[0]!.size);
+        stream = demuxSingleFileFromTar(tar, entries[0]!.size, signal);
         result = { kind: "file", entry: entries[0], stream };
       } else {
         stream = buildWorkspaceZip(
           useDockerService(),
           lease.containerId,
           entries,
+          signal,
         );
         result = { kind: "zip", stream };
       }
-      stream = lease.holdForStream(stream);
+      stream = lease.holdForStream(stream, signal);
       result.stream = stream;
       stream.once("close", () => void lease.close());
       stream.once("end", () => void lease.close());

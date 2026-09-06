@@ -150,3 +150,49 @@ test.describe('Worker card actions', () => {
     }
   });
 });
+
+test('an unverifiable runtime is labelled unknown and offers managed recovery', async ({ page }) => {
+  const workerId = '00000000-0000-4000-8000-000000000321';
+  const displayName = 'Runtime recovery test';
+  let recoveryCalls = 0;
+  const worker = {
+    id: workerId,
+    userId: 'ui-owner',
+    createdAt: '2026-09-05T00:00:00.000Z',
+    updatedAt: '2026-09-05T00:00:01.000Z',
+    containerId: 'docker-runtime-test',
+    containerName: `agentor-worker-${workerId}`,
+    displayName,
+    imageName: 'agentor-worker:latest',
+    imageId: 'sha256:' + '1'.repeat(64),
+    status: 'unknown',
+    desiredRuntimeStatus: 'running',
+    runtimeDiagnostic: {
+      code: 'DOCKER_OPERATION_TIMEOUT',
+      operation: 'Docker worker task probe',
+      message: 'Agentor could not verify the Docker task. Persistent volumes were not changed.',
+      retryable: true,
+      observedAt: '2026-09-05T00:00:01.000Z',
+    },
+  };
+  await page.route(/\/api\/containers(?:\?.*)?$/, async route => {
+    await route.fulfill({ status: 200, json: [worker] });
+  });
+  await page.route(`**/api/containers/${workerId}/recover`, async route => {
+    recoveryCalls++;
+    await route.fulfill({ status: 200, json: { ...worker, status: 'running', runtimeDiagnostic: undefined } });
+  });
+
+  await goToDashboard(page);
+  const card = page.locator('aside .rounded-lg').filter({ hasText: displayName }).first();
+  await expect(card.getByText('unknown', { exact: true })).toBeVisible();
+  await expect(card.getByLabel('Runtime state could not be verified')).toBeVisible();
+  await expect(card.getByLabel('Recover worker')).toBeVisible();
+  page.once('dialog', async (dialog) => {
+    expect(dialog.type()).toBe('confirm');
+    expect(dialog.message()).toContain('No workspace or volume is deleted');
+    await dialog.accept();
+  });
+  await card.getByLabel('Recover worker').click();
+  await expect.poll(() => recoveryCalls).toBe(1);
+});
