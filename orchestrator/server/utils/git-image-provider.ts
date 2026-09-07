@@ -52,10 +52,13 @@ function withGitHubDeadline<T>(
 export interface GitSnapshot {
   revision: string | null;
   files: GitFileMap;
+  /** GitHub distinguishes a missing branch (404) from an empty repository (409). */
+  repositoryEmpty?: boolean;
 }
 export interface GitWrite {
   branch: string;
   expectedRevision: string | null;
+  repositoryEmpty?: boolean;
   files: GitFileMap;
   message: string;
   workflow: "direct" | "branch" | "pull-request";
@@ -296,7 +299,11 @@ export class GitHubRestProvider implements GitImageProvider {
       // This catch is scoped to the read-only ref lookup; write-time 409s keep
       // their conflict semantics below.
       if (e.statusCode === 404 || e.statusCode === 409)
-        return { revision: null, files: {} };
+        return {
+          revision: null,
+          files: {},
+          ...(e.statusCode === 409 ? { repositoryEmpty: true } : {}),
+        };
       throw e;
     }
     const commitSha = ref.object.sha,
@@ -333,7 +340,73 @@ export class GitHubRestProvider implements GitImageProvider {
     }
     return { revision: commitSha, files };
   }
+  private async initializeEmptyRepository(
+    repository: string,
+    message: string,
+  ): Promise<{ revision: string; branch: string }> {
+    const metadata: any = await this.api(`/repos/${repository}`),
+      defaultBranch = String(metadata?.default_branch || "");
+    if (!defaultBranch)
+      throw Object.assign(
+        new Error("GitHub repository default branch is unavailable"),
+        { statusCode: 502 },
+      );
+
+    // GitHub deliberately rejects Git-reference creation while a repository
+    // has no branches. Its documented bootstrap path is the Contents API.
+    // The marker contains no user data or credentials and keeps review-mode
+    // catalog changes out of the default branch until their PR is merged.
+    const markerPath = ".agentor/repository-initialized.txt";
+    let revision: string | undefined;
+    try {
+      const initialized: any = await this.api(
+        `/repos/${repository}/contents/${markerPath}`,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            message: `${message} (initialize repository)`,
+            content: Buffer.from(
+              "Initialized by Agentor for image catalog synchronization.\n",
+              "utf8",
+            ).toString("base64"),
+          }),
+        },
+      );
+      revision = initialized?.commit?.sha;
+    } catch (error) {
+      // The create response can be lost, or another writer can initialize the
+      // repository after our empty read. Re-read before failing so retries are
+      // idempotent while subsequent ref updates retain optimistic locking.
+      const reconciled = await this.read(repository, defaultBranch).catch(
+        () => undefined,
+      );
+      if (!reconciled?.revision) throw error;
+      revision = reconciled.revision;
+    }
+    if (!revision)
+      throw Object.assign(
+        new Error("GitHub repository initialization returned no revision"),
+        { statusCode: 502 },
+      );
+    return { revision, branch: defaultBranch };
+  }
   async write(repository: string, input: GitWrite): Promise<GitWriteResult> {
+    let expectedRevision = input.expectedRevision;
+    if (input.repositoryEmpty && expectedRevision === null) {
+      const initialized = await this.initializeEmptyRepository(
+        repository,
+        input.message,
+      );
+      expectedRevision = initialized.revision;
+      if (initialized.branch !== input.targetBranch)
+        await this.api(`/repos/${repository}/git/refs`, {
+          method: "POST",
+          body: JSON.stringify({
+            ref: `refs/heads/${input.targetBranch}`,
+            sha: expectedRevision,
+          }),
+        });
+    }
     const blobs: Record<string, string> = {};
     for (const [path, content] of Object.entries(input.files)) {
       const body: any = await this.api(`/repos/${repository}/git/blobs`, {
@@ -348,7 +421,7 @@ export class GitHubRestProvider implements GitImageProvider {
     const tree: any = await this.api(`/repos/${repository}/git/trees`, {
       method: "POST",
       body: JSON.stringify({
-        base_tree: input.expectedRevision || undefined,
+        base_tree: expectedRevision || undefined,
         tree: Object.entries(blobs).map(([path, sha]) => ({
           path,
           mode: "100644",
@@ -362,10 +435,10 @@ export class GitHubRestProvider implements GitImageProvider {
       body: JSON.stringify({
         message: input.message,
         tree: tree.sha,
-        parents: input.expectedRevision ? [input.expectedRevision] : [],
+        parents: expectedRevision ? [expectedRevision] : [],
       }),
     });
-    if (input.branch === input.targetBranch && input.expectedRevision)
+    if (input.branch === input.targetBranch && expectedRevision)
       await this.api(
         `/repos/${repository}/git/refs/heads/${encodeURIComponent(input.branch)}`,
         {

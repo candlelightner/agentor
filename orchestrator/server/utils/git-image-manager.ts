@@ -853,6 +853,7 @@ export class GitImageCatalogManager {
       branch: syncBranch,
       targetBranch: target,
       expectedRevision: remote.revision,
+      repositoryEmpty: remote.repositoryEmpty,
       files,
       message,
       workflow,

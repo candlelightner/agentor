@@ -588,25 +588,39 @@ test.describe.serial("Provider HTTP boundaries", () => {
           { message: "Git Repository is empty." },
           { status: 409 },
         );
+      if (method === "GET" && url.endsWith("/repos/owner/empty"))
+        return json({ default_branch: "main" });
+      if (
+        method === "PUT" &&
+        url.endsWith(
+          "/repos/owner/empty/contents/.agentor/repository-initialized.txt",
+        )
+      )
+        return json({ commit: { sha: "initial-sha" } }, { status: 201 });
       if (method === "POST" && url.endsWith("/git/blobs"))
         return json({ sha: "blob-sha" }, { status: 201 });
       if (method === "POST" && url.endsWith("/git/trees"))
         return json({ sha: "tree-sha" }, { status: 201 });
       if (method === "POST" && url.endsWith("/git/commits"))
         return json({ sha: "commit-sha" }, { status: 201 });
-      if (method === "POST" && url.endsWith("/git/refs"))
-        return json({ ref: "refs/heads/main" }, { status: 201 });
+      if (method === "PATCH" && url.endsWith("/git/refs/heads/main"))
+        return json({ ref: "refs/heads/main" });
       throw new Error(`Unexpected mock request: ${method} ${url}`);
     };
     const provider = new GitHubRestProvider(async () => "token", transport);
 
     const empty = await provider.read("owner/empty", "main");
-    expect(empty).toEqual({ revision: null, files: {} });
+    expect(empty).toEqual({
+      revision: null,
+      files: {},
+      repositoryEmpty: true,
+    });
     await expect(
       provider.write("owner/empty", {
         branch: "main",
         targetBranch: "main",
         expectedRevision: empty.revision,
+        repositoryEmpty: empty.repositoryEmpty,
         files: {
           [GIT_IMAGE_CATALOG_PATH]: JSON.stringify({
             schema: "https://agentor.dev/schemas/image-catalog/v2",
@@ -621,12 +635,125 @@ test.describe.serial("Provider HTTP boundaries", () => {
 
     const tree = calls.find((call) => call.url.endsWith("/git/trees"));
     const commit = calls.find((call) => call.url.endsWith("/git/commits"));
-    const ref = calls.find((call) => call.url.endsWith("/git/refs"));
-    expect(JSON.parse(tree!.body!)).not.toHaveProperty("base_tree");
-    expect(JSON.parse(commit!.body!).parents).toEqual([]);
+    const contents = calls.find((call) => call.method === "PUT");
+    const ref = calls.find((call) => call.method === "PATCH");
+    expect(JSON.parse(contents!.body!)).toMatchObject({
+      message: "Initialize Agentor image catalog (initialize repository)",
+    });
+    expect(
+      Buffer.from(JSON.parse(contents!.body!).content, "base64").toString(
+        "utf8",
+      ),
+    ).toBe("Initialized by Agentor for image catalog synchronization.\n");
+    expect(JSON.parse(tree!.body!)).toMatchObject({
+      base_tree: "initial-sha",
+    });
+    expect(JSON.parse(commit!.body!).parents).toEqual(["initial-sha"]);
     expect(JSON.parse(ref!.body!)).toMatchObject({
-      ref: "refs/heads/main",
       sha: "commit-sha",
+      force: false,
+    });
+  });
+
+  test("GitHub missing branches do not trigger empty-repository initialization", async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const transport: GitHubHttpTransport = async (input, init = {}) => {
+      const url = String(input),
+        method = init.method || "GET";
+      calls.push({ url, method });
+      if (method === "GET" && url.includes("/git/ref/heads/catalog"))
+        return json({ message: "Not Found" }, { status: 404 });
+      if (method === "POST" && url.endsWith("/git/blobs"))
+        return json({ sha: "blob-sha" }, { status: 201 });
+      if (method === "POST" && url.endsWith("/git/trees"))
+        return json({ sha: "tree-sha" }, { status: 201 });
+      if (method === "POST" && url.endsWith("/git/commits"))
+        return json({ sha: "commit-sha" }, { status: 201 });
+      if (method === "POST" && url.endsWith("/git/refs"))
+        return json({ ref: "refs/heads/catalog" }, { status: 201 });
+      throw new Error(`Unexpected mock request: ${method} ${url}`);
+    };
+    const provider = new GitHubRestProvider(async () => "token", transport);
+    const missing = await provider.read("owner/existing", "catalog");
+    expect(missing).toEqual({ revision: null, files: {} });
+    await provider.write("owner/existing", {
+      branch: "catalog",
+      targetBranch: "catalog",
+      expectedRevision: missing.revision,
+      repositoryEmpty: missing.repositoryEmpty,
+      files: { "images/a/Dockerfile": "FROM base\n" },
+      message: "Create catalog branch",
+      workflow: "direct",
+    });
+    expect(
+      calls.some((call) => call.url.includes("/contents/")),
+    ).toBe(false);
+    expect(calls.some((call) => call.url.endsWith("/repos/owner/existing"))).toBe(
+      false,
+    );
+  });
+
+  test("GitHub empty-repository bootstrap supports the pull-request workflow", async () => {
+    const calls: Array<{ url: string; method: string; body?: string }> = [];
+    const transport: GitHubHttpTransport = async (input, init = {}) => {
+      const url = String(input),
+        method = init.method || "GET",
+        body = init.body === undefined ? undefined : String(init.body);
+      calls.push({ url, method, body });
+      if (method === "GET" && url.endsWith("/repos/owner/review-empty"))
+        return json({ default_branch: "main" });
+      if (method === "PUT" && url.includes("/contents/"))
+        return json({ commit: { sha: "initial-sha" } }, { status: 201 });
+      if (method === "POST" && url.endsWith("/git/blobs"))
+        return json({ sha: "blob-sha" }, { status: 201 });
+      if (method === "POST" && url.endsWith("/git/trees"))
+        return json({ sha: "tree-sha" }, { status: 201 });
+      if (method === "POST" && url.endsWith("/git/commits"))
+        return json({ sha: "catalog-sha" }, { status: 201 });
+      if (method === "POST" && url.endsWith("/git/refs"))
+        return json({ ref: "refs/heads/agentor/catalog-test" }, { status: 201 });
+      if (method === "GET" && url.includes("/pulls?")) return json([]);
+      if (method === "POST" && url.endsWith("/pulls"))
+        return json(
+          { number: 3, html_url: "https://github.test/pull/3" },
+          { status: 201 },
+        );
+      throw new Error(`Unexpected mock request: ${method} ${url}`);
+    };
+    const provider = new GitHubRestProvider(async () => "token", transport);
+    await expect(
+      provider.write("owner/review-empty", {
+        branch: "agentor/catalog-test",
+        targetBranch: "main",
+        expectedRevision: null,
+        repositoryEmpty: true,
+        files: { [GIT_IMAGE_CATALOG_PATH]: "catalog" },
+        message: "Review Agentor image catalog",
+        workflow: "pull-request",
+      }),
+    ).resolves.toMatchObject({
+      revision: "catalog-sha",
+      branch: "agentor/catalog-test",
+      pullRequest: {
+        number: 3,
+        url: "https://github.test/pull/3",
+        state: "open",
+      },
+    });
+
+    const ref = calls.find(
+      (call) => call.method === "POST" && call.url.endsWith("/git/refs"),
+    );
+    expect(JSON.parse(ref!.body!)).toEqual({
+      ref: "refs/heads/agentor/catalog-test",
+      sha: "catalog-sha",
+    });
+    expect(calls.some((call) => call.method === "PATCH")).toBe(false);
+    expect(
+      JSON.parse(calls.find((call) => call.url.endsWith("/pulls"))!.body!),
+    ).toMatchObject({
+      head: "agentor/catalog-test",
+      base: "main",
     });
   });
 
