@@ -56,6 +56,7 @@ const form = reactive({
   displayName: '',
   environmentId: '',
   workerGroupId: '',
+  workerSelfApiAccess: 'inherit' as import('~/types').WorkerSelfApiAccess,
   repos: [] as RepoConfig[],
   mounts: [] as MountConfig[],
   initScript: '',
@@ -206,6 +207,7 @@ function submit() {
   };
   if (form.environmentId) request.environmentId = form.environmentId;
   if (form.workerGroupId) request.workerGroupId = form.workerGroupId;
+  request.workerSelfApiAccess = form.workerSelfApiAccess;
   request.excludedGlobalEnvVarKeys = [...excludedGlobalEnvVarKeys.value];
   const validRepos = form.repos.filter((r) => r.url);
   if (validRepos.length > 0) {
@@ -231,6 +233,7 @@ function reset() {
   form.displayName = '';
   form.environmentId = defaultEnvironmentId.value;
   form.workerGroupId = '';
+  form.workerSelfApiAccess = 'inherit';
   form.repos = [];
   form.mounts = [];
   form.initScript = '';
@@ -276,6 +279,18 @@ function reset() {
           <USelect
             v-model="form.workerGroupId"
             :items="workerGroupOptions"
+            class="w-full"
+          />
+        </UFormField>
+
+        <UFormField label="Worker-self API" hint="Orchestrator-side access; changes never require a worker restart or rebuild">
+          <USelect
+            v-model="form.workerSelfApiAccess"
+            :items="[
+              { label: 'Inherit from worker group (fallback: allow)', value: 'inherit' },
+              { label: 'Allow', value: 'allow' },
+              { label: 'Deny', value: 'deny' },
+            ]"
             class="w-full"
           />
         </UFormField>

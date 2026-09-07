@@ -11,6 +11,8 @@ export type {
   ContainerStatus,
   WorkerGroupLifecycleAction,
   WorkerGroupLifecycleResult,
+  WorkerSelfApiAccess,
+  EffectiveWorkerSelfApiAccess,
   CreateContainerRequest,
   UpdateContainerSettingsRequest,
   ImageUpdateInfo,
@@ -218,6 +220,8 @@ export interface ArchivedWorker {
   repos?: RepoConfig[];
   mounts?: MountConfig[];
   initScript?: string;
+  workerSelfApiAccess?: import('../../shared/types').WorkerSelfApiAccess;
+  effectiveWorkerSelfApiAccess?: import('../../shared/types').EffectiveWorkerSelfApiAccess;
 }
 
 export type TabType = 'terminal' | 'desktop' | 'apps' | 'editor' | 'logs' | 'plugin';

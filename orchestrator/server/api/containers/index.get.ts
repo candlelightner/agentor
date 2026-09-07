@@ -32,6 +32,16 @@ defineRouteMeta({
               createdAt: { type: 'string', format: 'date-time' },
               updatedAt: { type: 'string', format: 'date-time' },
               environmentId: { type: 'string', description: 'FK to the assigned environment. The environment config (CPU/memory/network/docker/setup/env vars/exposed APIs/capabilities/instructions) is resolved live by this id and not copied onto the worker. Git identity is resolved live from `userId`.' },
+              workerSelfApiAccess: { type: 'string', enum: ['inherit', 'allow', 'deny'], description: 'Per-worker worker-self API policy; missing legacy values inherit.' },
+              effectiveWorkerSelfApiAccess: {
+                type: 'object',
+                properties: {
+                  allowed: { type: 'boolean' },
+                  decision: { type: 'string', enum: ['allow', 'deny'] },
+                  source: { type: 'string', enum: ['worker', 'group', 'default', 'invalid-group-hierarchy'] },
+                  groupId: { type: 'string' },
+                },
+              },
               pendingRebuild: { type: 'boolean', description: 'True when rebuild-requiring settings were edited but not yet applied via rebuild.' },
               hostMountsRevoked: { type: 'boolean', description: 'True when a formerly active host bind was revoked. The worker is stopped and restart is blocked until rebuild replaces the Docker container.' },
             },
@@ -72,14 +82,18 @@ defineRouteMeta({
   },
 });
 
-import { useContainerManager } from '../../utils/services';
+import { useContainerManager, useWorkerGroupStore } from '../../utils/services';
 import { requireAuth } from '../../utils/auth-helpers';
+import { withEffectiveWorkerSelfApiAccess } from '../../utils/worker-self-access';
 
 export default defineEventHandler(async (event) => {
   const { user } = requireAuth(event);
   const containerManager = useContainerManager();
   await containerManager.sync();
   const all = containerManager.list();
-  if (user.role === 'admin') return all;
-  return all.filter((c) => c.userId === user.id);
+  const visible = user.role === 'admin' ? all : all.filter((c) => c.userId === user.id);
+  const groups = user.role === 'admin'
+    ? useWorkerGroupStore().list()
+    : useWorkerGroupStore().listForUser(user.id);
+  return visible.map((worker) => withEffectiveWorkerSelfApiAccess(worker, groups));
 });

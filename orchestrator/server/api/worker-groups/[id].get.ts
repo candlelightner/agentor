@@ -6,5 +6,5 @@ export default defineEventHandler((event) => {
   const group = useWorkerGroupStore().findById(id);
   requireAuth(event);
   requireResourceAccess(event, group, { allowGlobal: false });
-  return workerGroupWithMemberCounts(group!, useWorkerStore().listForUser(group!.userId));
+  return workerGroupWithMemberCounts(group!, useWorkerStore().listForUser(group!.userId), useWorkerGroupStore().listForUser(group!.userId));
 });

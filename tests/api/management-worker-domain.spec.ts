@@ -13,7 +13,16 @@ test('management worker domain declares bounded worker, configuration, group, an
     imageDefinitionId:{type:'string'},
     imageVersion:{type:'string'},
     workerGroupId:{type:'string'},
+    workerSelfApiAccess:{type:'string',enum:['inherit','allow','deny']},
   });
+  expect((tools.find(tool => tool.name === 'workers.update')?.inputSchema as any).properties.workerSelfApiAccess)
+    .toMatchObject({type:'string',enum:['inherit','allow','deny']});
+  expect((tools.find(tool => tool.name === 'groups.create')?.inputSchema as any).properties.workerSelfApiAccess)
+    .toMatchObject({type:'string',enum:['inherit','allow','deny']});
+  expect((tools.find(tool => tool.name === 'groups.update')?.inputSchema as any).properties.workerSelfApiAccess)
+    .toMatchObject({type:'string',enum:['inherit','allow','deny']});
+  for (const name of ['workers.create', 'workers.update', 'groups.create', 'groups.update'])
+    expect(tools.find(tool => tool.name === name)?.description).toContain('immediate');
   const createMount = (tools.find(tool => tool.name === 'workers.create')?.inputSchema as any).properties.mounts.items;
   expect(createMount).toMatchObject({ additionalProperties:false, required:['pathId','target'] });
   expect(createMount.properties).not.toHaveProperty('source');

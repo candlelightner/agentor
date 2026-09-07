@@ -96,6 +96,16 @@ test.describe('Create Worker Modal', () => {
     await expect(groupSelector).toContainText('Ungrouped');
   });
 
+  test('has a worker-self API access selector that defaults to inheritance', async ({ page }) => {
+    await goToDashboard(page);
+    await openCreateWorkerModal(page);
+    const access = page.locator('[role="dialog"]').getByRole('combobox', {
+      name: 'Worker-self API',
+    });
+    await expect(access).toBeVisible();
+    await expect(access).toContainText('Inherit from worker group (fallback: allow)');
+  });
+
   test('selecting a worker group exposes paths assigned to that group', async ({ page, request }) => {
     const groupName = `ui-mount-group-${Date.now()}`;
     const createdGroup = await request.post('/api/worker-groups', { data: { name: groupName } });

@@ -47,6 +47,7 @@ test.describe.serial('Worker groups dashboard', () => {
     const modal = page.getByRole('dialog', { name: 'Worker groups' });
     await expect(modal).toBeVisible();
     await modal.getByLabel('Group name').fill(groupName);
+    await modal.getByLabel('New group worker-self API access').selectOption('deny');
     await modal.getByRole('button', { name: 'Create group' }).click();
     const group = modal
       .locator('strong')
@@ -65,6 +66,13 @@ test.describe.serial('Worker groups dashboard', () => {
         return persisted?.workerIds || [];
       })
       .toEqual([workerId, secondWorkerId]);
+    const persistedPolicy = await (await request.get(`/api/worker-groups/${groupId}`)).json();
+    expect(persistedPolicy).toMatchObject({
+      workerSelfApiAccess: 'deny',
+      effectiveWorkerSelfApiAccess: { allowed: false, source: 'group' },
+    });
+    await expect(group.getByLabel(`Worker-self API access for ${groupName}`)).toHaveValue('deny');
+    await expect(group).toContainText('Effective: denied · immediate, no rebuild');
     const workerGroupCards = page.getByTestId(`worker-group-cards-${groupId}`);
     await expect(workerGroupCards).toBeVisible();
     await expect(workerGroupCards.getByText(groupName, { exact: true })).toBeVisible();

@@ -10,7 +10,7 @@ import * as tar from 'tar-stream';
 import type { Environment } from './environments';
 import type { PortMapping } from './port-mapping-store';
 import type { DomainMapping } from './domain-mapping-store';
-import type { RepoConfig, MountConfig } from '../../shared/types';
+import type { RepoConfig, MountConfig, WorkerSelfApiAccess } from '../../shared/types';
 import { AGENT_CREDENTIAL_MAPPINGS } from './user-credentials';
 import { SHARED_DIRECTORY_MOUNT_POINTS } from './storage';
 import type { PortablePluginConfiguration } from './plugin-portability';
@@ -98,6 +98,8 @@ export interface WorkerExportManifest {
     repos: RepoConfig[];
     mounts: MountConfig[];
     initScript: string;
+    /** Orchestrator-side access policy. Missing legacy values inherit. */
+    workerSelfApiAccess?: WorkerSelfApiAccess;
   };
   /** Full environment definition, embedded so the worker restores on a machine
    * that does not have the same environment. Matched/created on import. */
@@ -667,6 +669,12 @@ function assertValidManifest(value: unknown): asserts value is WorkerExportManif
   }
   if (!isRecord(worker) || !isString(worker.displayName) || !isString(worker.initScript) || !Array.isArray(worker.repos) || !Array.isArray(worker.mounts)) {
     throw new Error('Invalid worker export: manifest.worker is invalid');
+  }
+  if (
+    worker.workerSelfApiAccess !== undefined &&
+    !['inherit', 'allow', 'deny'].includes(String(worker.workerSelfApiAccess))
+  ) {
+    throw new Error('Invalid worker export: manifest.worker.workerSelfApiAccess is invalid');
   }
   if (!worker.repos.every((repo) => isRecord(repo) && isString(repo.provider) && isString(repo.url) && (repo.branch === undefined || isString(repo.branch)))) {
     throw new Error('Invalid worker export: manifest.worker.repos is invalid');

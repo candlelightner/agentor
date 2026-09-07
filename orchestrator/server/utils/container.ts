@@ -118,6 +118,7 @@ import {
 } from "./environments";
 import type { EnvironmentStore, Environment } from "./environments";
 import type { WorkerStore, WorkerRecord } from "./worker-store";
+import { isWorkerSelfApiAccess } from "./worker-self-access";
 import type { UserCredentialManager } from "./user-credentials";
 import type { UserEnvVarStore } from "./user-env-store";
 import type { CapabilityStore } from "./capability-store";
@@ -957,6 +958,7 @@ export class ContainerManager {
         environmentId: worker.environmentId,
         excludedGlobalEnvVarKeys: worker.excludedGlobalEnvVarKeys ?? [],
         excludedGroupEnvVarKeys: worker.excludedGroupEnvVarKeys ?? [],
+        workerSelfApiAccess: worker.workerSelfApiAccess,
         pendingRebuild: worker.pendingRebuild,
         hostMountsRevoked: worker.hostMountsRevoked,
         importedImage: worker.importedImage,
@@ -1188,6 +1190,13 @@ export class ContainerManager {
         (!Array.isArray(request.excludedGroupEnvVarKeys) || request.excludedGroupEnvVarKeys.some((key) => typeof key !== "string")))
       throw Object.assign(new Error("excludedGroupEnvVarKeys must be an array of strings"), { statusCode: 400 });
     const excludedGroupEnvVarKeys = [...new Set(request.excludedGroupEnvVarKeys ?? [])].sort();
+    if (
+      request.workerSelfApiAccess !== undefined &&
+      !isWorkerSelfApiAccess(request.workerSelfApiAccess)
+    )
+      throw Object.assign(new Error("Invalid workerSelfApiAccess"), {
+        statusCode: 400,
+      });
     if (excludedGroupEnvVarKeys.length) {
       if (!request.targetWorkerGroupId)
         throw Object.assign(new Error("Group environment exclusions require an authorized target worker group"), { statusCode: 400 });
@@ -1245,6 +1254,7 @@ export class ContainerManager {
       environmentId: request.environmentId,
       excludedGlobalEnvVarKeys,
       excludedGroupEnvVarKeys,
+      workerSelfApiAccess: request.workerSelfApiAccess,
       pendingRebuild: false,
       imageDefinitionId: request.imageDefinitionId,
       imageVersion: request.imageVersion,
@@ -2560,9 +2570,9 @@ for p in sys.argv[1:]:
    * The internal identity (`id`, `containerName`, volumes, routing) is always
    * immutable. Two tiers of settings exist:
    *
-   * - **Applied immediately (no rebuild)** — `displayName`. Applied to the
-   *   in-memory ContainerInfo and the WorkerStore immediately; the running
-   *   worker keeps serving.
+   * - **Applied immediately (no rebuild)** — `displayName` and
+   *   `workerSelfApiAccess`. Applied to the in-memory ContainerInfo and the
+   *   WorkerStore immediately; the running worker keeps serving.
    * - **Rebuild-requiring** — `environmentId`, `initScript`, `repos`, `mounts`.
    *   These are baked into the container at create time (the `WORKER`/`ENVIRONMENT`
    *   env JSON and Docker `Binds`), so editing them only updates the stored
@@ -2614,6 +2624,13 @@ for p in sys.argv[1:]:
     const excludedChanged = JSON.stringify(nextExcluded) !== JSON.stringify(info.excludedGlobalEnvVarKeys ?? []);
     const nextGroupExcluded = patch.excludedGroupEnvVarKeys === undefined ? info.excludedGroupEnvVarKeys ?? [] : [...new Set(patch.excludedGroupEnvVarKeys)].sort();
     const groupExcludedChanged = JSON.stringify(nextGroupExcluded) !== JSON.stringify(info.excludedGroupEnvVarKeys ?? []);
+    if (
+      patch.workerSelfApiAccess !== undefined &&
+      !isWorkerSelfApiAccess(patch.workerSelfApiAccess)
+    )
+      throw Object.assign(new Error("Invalid workerSelfApiAccess"), {
+        statusCode: 400,
+      });
     if (groupExcludedChanged) {
       const [{useWorkerGroupStore},{publicGroupEnvKeys}]=await Promise.all([import("./services"),import("./worker-group-env")]);
       const memberships=useWorkerGroupStore().listForUser(info.userId).filter(group=>group.workerIds.includes(info.id));
@@ -2628,6 +2645,13 @@ for p in sys.argv[1:]:
         info.displayName = next;
         liveChanged = true;
       }
+    }
+    if (
+      patch.workerSelfApiAccess !== undefined &&
+      patch.workerSelfApiAccess !== (info.workerSelfApiAccess ?? "inherit")
+    ) {
+      info.workerSelfApiAccess = patch.workerSelfApiAccess;
+      liveChanged = true;
     }
 
     // Environment assignment — rebuild. Only the FK is stored; the new env's
@@ -3062,6 +3086,7 @@ for p in sys.argv[1:]:
       environmentId: info.environmentId,
       excludedGlobalEnvVarKeys: info.excludedGlobalEnvVarKeys ?? [],
       excludedGroupEnvVarKeys: info.excludedGroupEnvVarKeys ?? [],
+      workerSelfApiAccess: info.workerSelfApiAccess,
       // Rebuild applies any pending settings edits, so the flag is cleared.
       pendingRebuild: false,
       hostMountsRevoked: false,
@@ -3234,6 +3259,7 @@ for p in sys.argv[1:]:
       environmentId: worker.environmentId,
       excludedGlobalEnvVarKeys: worker.excludedGlobalEnvVarKeys ?? [],
       excludedGroupEnvVarKeys: worker.excludedGroupEnvVarKeys ?? [],
+      workerSelfApiAccess: worker.workerSelfApiAccess,
       // Unarchive recreates the container from the stored config, applying any
       // pending settings edits, so the flag is cleared.
       pendingRebuild: false,
@@ -3464,6 +3490,7 @@ for p in sys.argv[1:]:
           environmentId: worker.environmentId,
           excludedGlobalEnvVarKeys: worker.excludedGlobalEnvVarKeys ?? [],
           excludedGroupEnvVarKeys: worker.excludedGroupEnvVarKeys ?? [],
+          workerSelfApiAccess: worker.workerSelfApiAccess,
           pendingRebuild: worker.pendingRebuild,
           hostMountsRevoked: worker.hostMountsRevoked,
           importedImage: worker.importedImage,
@@ -3682,6 +3709,7 @@ for p in sys.argv[1:]:
           repos: info.repos ?? [],
           mounts: info.mounts ?? [],
           initScript: info.initScript ?? "",
+          workerSelfApiAccess: info.workerSelfApiAccess ?? "inherit",
         },
         // Environment values can contain API keys and other credentials. The
         // portable definition retains non-secret behavior but never exports
@@ -3940,6 +3968,7 @@ for p in sys.argv[1:]:
           manifest.worker?.mounts,
         )) ?? [];
       const initScript = manifest.worker?.initScript || "";
+      const workerSelfApiAccess = manifest.worker?.workerSelfApiAccess;
 
       const envConfig = this.resolveEnvironmentConfig(environmentId);
       const { cpuLimit, memoryLimit, dockerEnabled } =
@@ -4040,6 +4069,7 @@ for p in sys.argv[1:]:
         repos: repos.length > 0 ? repos : undefined,
         mounts: mounts.length > 0 ? mounts : undefined,
         initScript: initScript || undefined,
+        workerSelfApiAccess,
         environmentId,
         pendingRebuild: false,
         ...(importedImage ? { importedImage } : {}),
@@ -4654,6 +4684,7 @@ for p in sys.argv[1:]:
       environmentId: info.environmentId,
       excludedGlobalEnvVarKeys: info.excludedGlobalEnvVarKeys ?? [],
       excludedGroupEnvVarKeys: info.excludedGroupEnvVarKeys ?? [],
+      workerSelfApiAccess: info.workerSelfApiAccess,
       repos: info.repos,
       mounts: info.mounts,
       initScript: info.initScript,

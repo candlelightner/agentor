@@ -1,5 +1,6 @@
 import type { WorkerGroup } from "./worker-group-store";
 import type { WorkerRecord } from "./worker-store";
+import { effectiveGroupWorkerSelfApiAccess } from "./worker-self-access";
 
 export interface WorkerGroupMemberCounts {
   /** Persisted direct memberships, including archived workers. */
@@ -12,6 +13,7 @@ export interface WorkerGroupMemberCounts {
 
 export type WorkerGroupResponse = WorkerGroup & {
   memberCounts: WorkerGroupMemberCounts;
+  effectiveWorkerSelfApiAccess: import("../../shared/types").EffectiveWorkerSelfApiAccess;
 };
 
 /** Add lifecycle counts without changing the persisted worker-group record.
@@ -37,6 +39,11 @@ export function workerGroupsWithMemberCounts(
         active,
         archived,
       },
+      effectiveWorkerSelfApiAccess: effectiveGroupWorkerSelfApiAccess(
+        group.userId,
+        group.id,
+        groups,
+      ),
     };
   });
 }
@@ -44,6 +51,11 @@ export function workerGroupsWithMemberCounts(
 export function workerGroupWithMemberCounts(
   group: WorkerGroup,
   workers: WorkerRecord[],
+  groups: WorkerGroup[] = [group],
 ): WorkerGroupResponse {
-  return workerGroupsWithMemberCounts([group], workers)[0]!;
+  return (
+    workerGroupsWithMemberCounts(groups, workers).find(
+      (candidate) => candidate.id === group.id,
+    ) ?? workerGroupsWithMemberCounts([group], workers)[0]!
+  );
 }

@@ -41,6 +41,7 @@ export default defineEventHandler(async (event) => {
     mounts: source!.mounts,
     targetWorkerGroupId,
     environmentId: source!.environmentId,
+    workerSelfApiAccess: source!.workerSelfApiAccess,
     initScript: source!.initScript,
     workerConfiguration: { variables },
   });

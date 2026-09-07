@@ -16,7 +16,8 @@ import { useGroupAdminWorkspaceStore } from "./group-admin-workspace-store";
 import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 import { markGroupEnvPending, publicGroupEnvKeys } from "./worker-group-env";
 import { useWorkerGroupEnvStore } from "./services";
-import { workerGroupsWithMemberCounts } from "./worker-group-response";
+import { workerGroupsWithMemberCounts, workerGroupWithMemberCounts } from "./worker-group-response";
+import { isWorkerSelfApiAccess, withEffectiveWorkerSelfApiAccess } from "./worker-self-access";
 
 export interface ManagementDomainTool {
   name: string;
@@ -125,8 +126,8 @@ const hostMountInputSchema = {
 export class ManagementWorkerDomain {
   tools(): ManagementDomainTool[] {
     const names: Array<[string, ManagementDomainTool["group"], string, Record<string, unknown>, Record<string, boolean | string>]> = [
-      ["workers.create", "worker-lifecycle", "Create a worker for an explicit owner, optionally enrolling it directly in one of that owner's worker groups. Host mounts accept only centrally approved pathId references and default to read-only.", { type:"object", required:["userId"], additionalProperties:false, properties:{ userId:{type:"string"}, displayName:{type:"string"}, environmentId:{type:"string"}, workerGroupId:{type:"string",description:"Optional direct worker-group membership. The group must belong to userId."}, imageDefinitionId:{type:"string"}, imageVersion:{type:"string"}, mounts:{type:"array",items:hostMountInputSchema}, excludedGlobalEnvVarKeys:excludedEnvKeysSchema() } }, mutation],
-      ["workers.update", "worker-lifecycle", "Update worker settings. excludedGlobalEnvVarKeys completely replaces the names-only exclusion list and takes effect after rebuild; protected workers require lockPassword.", workerUpdateInput(), mutation],
+      ["workers.create", "worker-lifecycle", "Create a worker for an explicit owner, optionally enrolling it directly in one of that owner's worker groups. Host mounts accept only centrally approved pathId references and default to read-only. workerSelfApiAccess is enforced immediately by the orchestrator.", { type:"object", required:["userId"], additionalProperties:false, properties:{ userId:{type:"string"}, displayName:{type:"string"}, environmentId:{type:"string"}, workerGroupId:{type:"string",description:"Optional direct worker-group membership. The group must belong to userId."}, workerSelfApiAccess:workerSelfApiAccessSchema(), imageDefinitionId:{type:"string"}, imageVersion:{type:"string"}, mounts:{type:"array",items:hostMountInputSchema}, excludedGlobalEnvVarKeys:excludedEnvKeysSchema() } }, mutation],
+      ["workers.update", "worker-lifecycle", "Update worker settings. workerSelfApiAccess takes effect immediately without restart or rebuild; protected workers require lockPassword.", workerUpdateInput(), mutation],
       ["workers.restart", "worker-lifecycle", "Restart a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
       ["workers.recover", "worker-lifecycle", "Recover an unresponsive worker through the bounded Agentor control plane. Persistent mounts are verified, only disposable compute is replaced, managed secrets are bootstrapped, and plugins are reconciled; protected workers require lockPassword.", objectWithWorker(), mutation],
       ["workers.rebuild", "worker-lifecycle", "Rebuild a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
@@ -138,8 +139,8 @@ export class ManagementWorkerDomain {
       ["configuration.get", "configuration", "Read sanitized worker configuration.", objectWithWorker(), read],
       ["configuration.set", "configuration", "Replace worker-local variables/secrets/files; secrets are write-only.", objectWithWorker(), mutation],
       ["groups.list", "groups", "List groups for an owner or all groups, including direct total, active, and archived memberCounts. timeoutSeconds bounds the server-side request.", failFastInput({userId:{type:"string"}}), read],
-      ["groups.create", "groups", "Create a root or child worker group for an explicit owner. timeoutSeconds bounds hierarchy validation, persistence, and network reconciliation.", failFastInput({userId:{type:"string"},name:{type:"string"},parentId:{type:["string","null"]}}, ["userId","name"]), mutation],
-      ["groups.update", "groups", "Rename, reparent, or replace same-owner direct membership, reconciling dependent managed networks. Protected workers require lockPasswords; timeoutSeconds bounds the operation.", failFastInput({groupId:{type:"string"},name:{type:"string"},parentId:{type:["string","null"]},workerIds:{type:"array",items:{type:"string"}},lockPasswords:{type:"object",additionalProperties:{type:"string",writeOnly:true}}}, ["groupId"]), mutation],
+      ["groups.create", "groups", "Create a root or child worker group for an explicit owner. The inherited worker-self API policy is enforced immediately. timeoutSeconds bounds the operation.", failFastInput({userId:{type:"string"},name:{type:"string"},parentId:{type:["string","null"]},workerSelfApiAccess:workerSelfApiAccessSchema()}, ["userId","name"]), mutation],
+      ["groups.update", "groups", "Rename, reparent, replace direct membership, or change the inherited worker-self API policy. Access changes apply immediately without worker restart or rebuild; timeoutSeconds bounds the operation.", failFastInput({groupId:{type:"string"},name:{type:"string"},parentId:{type:["string","null"]},workerIds:{type:"array",items:{type:"string"}},workerSelfApiAccess:workerSelfApiAccessSchema(),lockPasswords:{type:"object",additionalProperties:{type:"string",writeOnly:true}}}, ["groupId"]), mutation],
       ["groups.delete", "groups", "Delete an empty group without deleting workers. Groups referenced by managed networks must be reconfigured first; timeoutSeconds bounds the operation.", failFastInput({groupId:{type:"string"}}, ["groupId"]), { ...mutation, destructiveHint:true }],
       ["groups.workers.stop", "groups", "Recursively stop every ordinary worker in a group and all descendant groups. Administrative workspaces are not affected; every protection lock is checked before any mutation.", groupWorkerLifecycleInput, mutation],
       ["groups.workers.rebuild", "groups", "Recursively rebuild every ordinary worker in a group and all descendant groups, preserving durable data and group membership. Administrative workspaces are not affected; every protection lock is checked before any mutation.", groupWorkerLifecycleInput, mutation],
@@ -182,7 +183,7 @@ export class ManagementWorkerDomain {
         : imageCatalogGroupId
         ? catalog.resolveSelectionForGroup(userId,imageCatalogGroupId,optionalString(args.imageDefinitionId),optionalString(args.imageVersion))
         : catalog.resolveSelection(userId,optionalString(args.imageDefinitionId),optionalString(args.imageVersion));
-      const request: CreateContainerRequest = { userId, displayName: optionalString(args.displayName), environmentId: optionalString(args.environmentId), excludedGlobalEnvVarKeys: args.excludedGlobalEnvVarKeys===undefined?undefined:strings(args.excludedGlobalEnvVarKeys,"excludedGlobalEnvVarKeys"), excludedGroupEnvVarKeys:args.excludedGroupEnvVarKeys===undefined?undefined:strings(args.excludedGroupEnvVarKeys,"excludedGroupEnvVarKeys"),targetWorkerGroupId:requestedTargetGroupId, initScript: optionalString(args.initScript), repos: array(args.repos), mounts: array(args.mounts), workerConfiguration: configInput(args.configuration), imageDefinitionId:selection?.definitionId, imageVersion:selection?.version, imageDigest:selection?.digest, imageRuntimeReference:selection?.runtimeImage } as CreateContainerRequest;
+      const request: CreateContainerRequest = { userId, displayName: optionalString(args.displayName), environmentId: optionalString(args.environmentId), workerSelfApiAccess:parseWorkerSelfApiAccess(args.workerSelfApiAccess), excludedGlobalEnvVarKeys: args.excludedGlobalEnvVarKeys===undefined?undefined:strings(args.excludedGlobalEnvVarKeys,"excludedGlobalEnvVarKeys"), excludedGroupEnvVarKeys:args.excludedGroupEnvVarKeys===undefined?undefined:strings(args.excludedGroupEnvVarKeys,"excludedGroupEnvVarKeys"),targetWorkerGroupId:requestedTargetGroupId, initScript: optionalString(args.initScript), repos: array(args.repos), mounts: array(args.mounts), workerConfiguration: configInput(args.configuration), imageDefinitionId:selection?.definitionId, imageVersion:selection?.version, imageDigest:selection?.digest, imageRuntimeReference:selection?.runtimeImage } as CreateContainerRequest;
       const created=await cm.create(request);
       // Group-scoped MCP creation owns its stronger hierarchy authorization and
       // enrollment transaction in ManagementMcpStore. Platform management MCP
@@ -191,7 +192,13 @@ export class ManagementWorkerDomain {
         try{await addWorkerToGroupWithNetworks(userId,requestedTargetGroupId,created.id);}
         catch(error){await cm.remove(created.id).catch(()=>undefined);throw error;}
       }
-      return { handled:true, result: created };
+      return {
+        handled:true,
+        result: withEffectiveWorkerSelfApiAccess(
+          created,
+          useWorkerGroupStore().listForUser(created.userId),
+        ),
+      };
     }
     if (name.startsWith("groups.")) {
       const operation = () => this.groups(name,args);
@@ -228,7 +235,10 @@ export class ManagementWorkerDomain {
     if (name === "workers.restart") { await locks.verify(workerId,args.lockPassword); await cm.restart(workerId); return {handled:true,result:{workerId,status:"running"}}; }
     await locks.verify(workerId,args.lockPassword);
     if (name === "workers.recover") return {handled:true,result:await cm.recover(workerId)};
-    if (name === "workers.update") return {handled:true,result:await cm.updateSettings(workerId, settings(args))};
+    if (name === "workers.update") {
+      const updated=await cm.updateSettings(workerId, settings(args));
+      return {handled:true,result:withEffectiveWorkerSelfApiAccess(updated,useWorkerGroupStore().listForUser(updated.userId))};
+    }
     if (name === "workers.rebuild") return {handled:true,result:await cm.rebuild(workerId)};
     if (name === "workers.archive") { await cm.archive(workerId); return {handled:true,result:{workerId,status:"archived"}}; }
     if (name === "workers.unarchive") return {handled:true,result:await cm.unarchive(worker.userId,workerId)};
@@ -239,14 +249,14 @@ export class ManagementWorkerDomain {
       const memberships=useWorkerGroupStore().listForUser(worker.userId).filter(group=>group.workerIds.includes(worker.id));
       if(memberships.length>1)throw status(409,"Source worker has conflicting group memberships");
       const targetWorkerGroupId=memberships[0]?.id;
-      const clone = await cm.create({ userId: worker.userId, displayName: optionalString(args.displayName) || `${worker.displayName || "worker"} copy`, repos: worker.repos, mounts: worker.mounts, targetWorkerGroupId, environmentId: worker.environmentId, initScript: worker.initScript, workerConfiguration:{variables} });
+      const clone = await cm.create({ userId: worker.userId, displayName: optionalString(args.displayName) || `${worker.displayName || "worker"} copy`, repos: worker.repos, mounts: worker.mounts, targetWorkerGroupId, environmentId: worker.environmentId, workerSelfApiAccess: worker.workerSelfApiAccess, initScript: worker.initScript, workerConfiguration:{variables} });
       try {
         if(targetWorkerGroupId)await addWorkerToGroupWithNetworks(worker.userId,targetWorkerGroupId,clone.id);
         const workspace = await findWorkspaceInventory(workerId, true);
         if (!workspace || workspace.state === "orphaned") throw status(404,"Source workspace not found");
         await new OfflineWorkspaceAccess(workspace).cloneInto(clone.containerId);
       } catch(error) { await cm.remove(clone.id).catch(() => {}); throw error; }
-      return {handled:true,result:{...clone,missingSecrets:resolved.filter(entry=>entry.kind!=="variable").map(entry=>entry.key)}};
+      return {handled:true,result:{...withEffectiveWorkerSelfApiAccess(clone,useWorkerGroupStore().listForUser(clone.userId)),missingSecrets:resolved.filter(entry=>entry.kind!=="variable").map(entry=>entry.key)}};
     }
     return {handled:false};
   }
@@ -259,7 +269,7 @@ export class ManagementWorkerDomain {
         userId ? useWorkerStore().listForUser(userId) : useWorkerStore().list(),
       );
     }
-    if(name==="groups.create") { const userId=required(args.userId,"userId"), label=required(args.name,"name").trim(); if(!label||label.length>100) throw status(400,"Invalid group name"); const parent=args.parentId===null?null:optionalString(args.parentId); return withWorkerNetworkMutation(userId,()=>{if(typeof args.__scopeAuthorize==="function")(args.__scopeAuthorize as ()=>void)();new WorkerGroupHierarchy(store).validateParent(userId,undefined,parent);return store.create(userId,label,parent||undefined);}); }
+    if(name==="groups.create") { const userId=required(args.userId,"userId"), label=required(args.name,"name").trim(); if(!label||label.length>100) throw status(400,"Invalid group name"); const parent=args.parentId===null?null:optionalString(args.parentId),workerSelfApiAccess=parseWorkerSelfApiAccess(args.workerSelfApiAccess); return withWorkerNetworkMutation(userId,async()=>{if(typeof args.__scopeAuthorize==="function")(args.__scopeAuthorize as ()=>void)();new WorkerGroupHierarchy(store).validateParent(userId,undefined,parent);const created=await store.create(userId,label,parent||undefined,workerSelfApiAccess);return workerGroupWithMemberCounts(created,useWorkerStore().listForUser(userId),store.listForUser(userId));}); }
     if(name==="groups.assign-worker") {
       const workerId=required(args.workerId,"workerId");
       const worker=useContainerManager().get(workerId)??useWorkerStore().findById(workerId);
@@ -306,23 +316,27 @@ export class ManagementWorkerDomain {
       if(name==="groups.admin-workspace.rebuild") return withinGroupAdminLifecycleDeadline(() => workspaces.rebuild(group.id,group.userId,authorize), deadline);
     }
     if(name==="groups.delete") { const workspaceStatus=group.adminWorkspace?.status;await deleteWorkerGroup(group.userId,group.id,async()=>{const workspaces=useGroupAdminWorkspaceStore();try{await workspaces.remove(group.id,true);}catch(error){await workspaces.restoreAfterFailedGroupDelete(group.id,workspaceStatus,true).catch(()=>undefined);throw error;}return async()=>workspaces.restoreAfterFailedGroupDelete(group.id,workspaceStatus,true);},typeof args.__scopeAuthorize==="function"?args.__scopeAuthorize as ()=>void:undefined); return {id:group.id,deleted:true}; }
-    const patch:{name?:string;workerIds?:string[];parentId?:string|null}={}; if(args.name!==undefined){const label=required(args.name,"name").trim();if(!label||label.length>100)throw status(400,"Invalid group name");patch.name=label;}
+    const patch:{name?:string;workerIds?:string[];parentId?:string|null;workerSelfApiAccess?:import("../../shared/types").WorkerSelfApiAccess}={}; if(args.name!==undefined){const label=required(args.name,"name").trim();if(!label||label.length>100)throw status(400,"Invalid group name");patch.name=label;}
     if(args.parentId!==undefined)patch.parentId=args.parentId===null?null:required(args.parentId,"parentId");
     if(args.workerIds!==undefined){const ids=strings(args.workerIds,"workerIds");for(const id of ids){const worker=useWorkerStore().findById(id);if(!worker||worker.userId!==group.userId)throw status(400,"All workers must belong to group owner");}patch.workerIds=ids;}
-    return updateWorkerGroupWithNetworks(group.userId,group.id,patch,args.lockPasswords,typeof args.__scopeAuthorize==="function"?args.__scopeAuthorize as ()=>void:undefined);
+    if(args.workerSelfApiAccess!==undefined)patch.workerSelfApiAccess=parseWorkerSelfApiAccess(args.workerSelfApiAccess);
+    const updated=await updateWorkerGroupWithNetworks(group.userId,group.id,patch,args.lockPasswords,typeof args.__scopeAuthorize==="function"?args.__scopeAuthorize as ()=>void:undefined);
+    return workerGroupWithMemberCounts(updated,useWorkerStore().listForUser(group.userId),store.listForUser(group.userId));
   }
 }
 function objectWithWorker(){return {type:"object",required:["workerId"],properties:{workerId:{type:"string"},lockPassword:{type:"string",writeOnly:true}}};}
 function failFastInput(properties:Record<string,unknown>,requiredFields?:string[]){return {type:"object",...(requiredFields?{required:requiredFields}:{}),additionalProperties:false,properties:{...properties,timeoutSeconds:failFastTimeoutSchema}};}
 function excludedEnvKeysSchema(){return {type:"array",items:{type:"string"},uniqueItems:true,description:"Names of predefined or configured custom account environment variables to omit. Never accepts values."};}
-function workerUpdateInput(){return {type:"object",required:["workerId"],additionalProperties:false,properties:{workerId:{type:"string"},displayName:{type:"string"},environmentId:{type:"string"},initScript:{type:"string"},repos:{type:"array",items:{type:"object"}},mounts:{type:"array",items:hostMountInputSchema},excludedGlobalEnvVarKeys:excludedEnvKeysSchema(),excludedGroupEnvVarKeys:{...excludedEnvKeysSchema(),description:"Names of effective inherited worker-group variables to omit after rebuild. Values are never accepted."},lockPassword:{type:"string",writeOnly:true}}};}
+function workerUpdateInput(){return {type:"object",required:["workerId"],additionalProperties:false,properties:{workerId:{type:"string"},displayName:{type:"string"},environmentId:{type:"string"},workerSelfApiAccess:workerSelfApiAccessSchema(),initScript:{type:"string"},repos:{type:"array",items:{type:"object"}},mounts:{type:"array",items:hostMountInputSchema},excludedGlobalEnvVarKeys:excludedEnvKeysSchema(),excludedGroupEnvVarKeys:{...excludedEnvKeysSchema(),description:"Names of effective inherited worker-group variables to omit after rebuild. Values are never accepted."},lockPassword:{type:"string",writeOnly:true}}};}
 function lockSetInput(){return {type:"object",required:["workerId","password"],properties:{workerId:{type:"string"},password:{type:"string",writeOnly:true},currentPassword:{type:"string",writeOnly:true}}};}
 function lockRemoveInput(){return {type:"object",required:["workerId","password"],properties:{workerId:{type:"string"},password:{type:"string",writeOnly:true}}};}
 function required(v:unknown,n:string){if(typeof v!=="string"||!v.trim())throw status(400,`${n} is required`);return v;}
 function optionalString(v:unknown){return typeof v==="string"?v:undefined;}
 function array(v:unknown){return Array.isArray(v)?v:undefined;}
 function strings(v:unknown,n:string){if(!Array.isArray(v)||v.some(x=>typeof x!=="string"))throw status(400,`${n} must be strings`);return [...new Set(v as string[])];}
-function settings(a:Record<string,unknown>):UpdateContainerSettingsRequest { const result:any={}; for(const k of ["displayName","environmentId","initScript","repos","mounts"]){if(a[k]!==undefined)result[k]=a[k];} if(a.excludedGlobalEnvVarKeys!==undefined)result.excludedGlobalEnvVarKeys=strings(a.excludedGlobalEnvVarKeys,"excludedGlobalEnvVarKeys"); if(a.excludedGroupEnvVarKeys!==undefined)result.excludedGroupEnvVarKeys=strings(a.excludedGroupEnvVarKeys,"excludedGroupEnvVarKeys"); return result; }
+function settings(a:Record<string,unknown>):UpdateContainerSettingsRequest { const result:any={}; for(const k of ["displayName","environmentId","initScript","repos","mounts"]){if(a[k]!==undefined)result[k]=a[k];} if(a.workerSelfApiAccess!==undefined)result.workerSelfApiAccess=parseWorkerSelfApiAccess(a.workerSelfApiAccess); if(a.excludedGlobalEnvVarKeys!==undefined)result.excludedGlobalEnvVarKeys=strings(a.excludedGlobalEnvVarKeys,"excludedGlobalEnvVarKeys"); if(a.excludedGroupEnvVarKeys!==undefined)result.excludedGroupEnvVarKeys=strings(a.excludedGroupEnvVarKeys,"excludedGroupEnvVarKeys"); return result; }
+function workerSelfApiAccessSchema(){return {type:"string",enum:["inherit","allow","deny"],description:"Orchestrator-side access to /api/worker-self/*. Inherit uses the nearest group policy. Changes apply immediately without restart or rebuild."};}
+function parseWorkerSelfApiAccess(value:unknown){if(value===undefined)return undefined;if(!isWorkerSelfApiAccess(value))throw status(400,"workerSelfApiAccess must be inherit, allow, or deny");return value;}
 function configInput(value:unknown){const a=value && typeof value==="object"&&!Array.isArray(value)?value as Record<string,unknown>:{};const result:any={};for(const k of ["variables","secrets","secretFiles","envFile","deleteSecrets","deleteSecretFiles"]){if(a[k]!==undefined)result[k]=a[k];}return result;}
 function status(statusCode:number,message:string){return Object.assign(new Error(message),{statusCode});}
 export function managementFailFastTimeoutSeconds(value:unknown){if(value===undefined)return MANAGEMENT_FAIL_FAST_TIMEOUT_DEFAULT_SECONDS;if(!Number.isInteger(value)||(value as number)<1||(value as number)>MANAGEMENT_FAIL_FAST_TIMEOUT_MAX_SECONDS)throw status(400,`timeoutSeconds must be an integer between 1 and ${MANAGEMENT_FAIL_FAST_TIMEOUT_MAX_SECONDS}`);return value as number;}

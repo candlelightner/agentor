@@ -81,9 +81,19 @@ test.describe.serial('Worker-self API', () => {
   let containerId: string;
   let containerName: string;
   let workerId: string;
+  let workerGroupId: string;
 
   test.beforeAll(async ({ request }) => {
-    const container = await createWorker(request);
+    const createdGroup = await request.post('/api/worker-groups', {
+      data: {
+        name: `worker-self-live-${Date.now()}`,
+        workerSelfApiAccess: 'allow',
+      },
+    });
+    expect(createdGroup.status(), await createdGroup.text()).toBe(201);
+    workerGroupId = (await createdGroup.json()).id;
+
+    const container = await createWorker(request, { workerGroupId });
     containerId = container.id;
     workerId = container.id;
     containerName = container.containerName as string;
@@ -103,6 +113,7 @@ test.describe.serial('Worker-self API', () => {
 
   test.afterAll(async ({ request }) => {
     await cleanupWorker(request, containerId);
+    await request.delete(`/api/worker-groups/${workerGroupId}`).catch(() => undefined);
   });
 
   test('GET /api/worker-self/info returns the calling worker identity', async () => {
@@ -127,6 +138,113 @@ test.describe.serial('Worker-self API', () => {
     // does not resolve to any managed worker.
     const res = await request.get('/api/worker-self/info');
     expect(res.status()).toBe(401);
+  });
+
+  test('worker policy changes take effect on the next request without restart or rebuild', async ({ request }) => {
+    const api = new ApiClient(request);
+    const before = (await api.listContainers()).body.find(
+      (worker: { id: string }) => worker.id === workerId,
+    );
+    expect(before).toBeTruthy();
+    const ws = new TerminalWsClient(containerId);
+    try {
+      await ws.connect();
+      await ws.waitForOutput(/[\$#>]\s*$/, 15_000);
+      expect((await curlInside(ws, '/api/worker-self/info')).status).toBe(200);
+
+      const denied = await request.patch(`/api/containers/${workerId}`, {
+        data: { workerSelfApiAccess: 'deny' },
+      });
+      expect(denied.status(), await denied.text()).toBe(200);
+      expect(await denied.json()).toMatchObject({
+        id: workerId,
+        workerSelfApiAccess: 'deny',
+        effectiveWorkerSelfApiAccess: {
+          allowed: false,
+          decision: 'deny',
+          source: 'worker',
+        },
+        pendingRebuild: false,
+      });
+
+      const blocked = await curlInside(ws, '/api/worker-self/info');
+      expect(blocked.status).toBe(403);
+      expect(JSON.parse(blocked.body)).toMatchObject({
+        data: {
+          code: 'WORKER_SELF_API_DISABLED',
+          source: 'worker',
+        },
+      });
+
+      const during = (await api.listContainers()).body.find(
+        (worker: { id: string }) => worker.id === workerId,
+      );
+      expect(during).toMatchObject({
+        id: workerId,
+        containerId: before.containerId,
+        status: 'running',
+        pendingRebuild: false,
+      });
+
+      const allowed = await request.patch(`/api/containers/${workerId}`, {
+        data: { workerSelfApiAccess: 'allow' },
+      });
+      expect(allowed.status()).toBe(200);
+      expect((await curlInside(ws, '/api/worker-self/info')).status).toBe(200);
+    } finally {
+      await request.patch(`/api/containers/${workerId}`, {
+        data: { workerSelfApiAccess: 'inherit' },
+      }).catch(() => undefined);
+      ws.close();
+    }
+  });
+
+  test('inherited group policy changes are live too', async ({ request }) => {
+    const api = new ApiClient(request);
+    const before = (await api.listContainers()).body.find(
+      (worker: { id: string }) => worker.id === workerId,
+    );
+    const ws = new TerminalWsClient(containerId);
+    try {
+      await ws.connect();
+      await ws.waitForOutput(/[\$#>]\s*$/, 15_000);
+      expect((await request.patch(`/api/worker-groups/${workerGroupId}`, {
+        data: { workerSelfApiAccess: 'deny' },
+      })).status()).toBe(200);
+      const blocked = await curlInside(ws, '/api/worker-self/info');
+      expect(blocked.status).toBe(403);
+      expect(JSON.parse(blocked.body)).toMatchObject({
+        data: {
+          code: 'WORKER_SELF_API_DISABLED',
+          source: 'group',
+          groupId: workerGroupId,
+        },
+      });
+
+      expect((await request.patch(`/api/worker-groups/${workerGroupId}`, {
+        data: { workerSelfApiAccess: 'allow' },
+      })).status()).toBe(200);
+      expect((await curlInside(ws, '/api/worker-self/info')).status).toBe(200);
+      const current = (await api.listContainers()).body.find(
+        (worker: { id: string }) => worker.id === workerId,
+      );
+      expect(current).toMatchObject({
+        containerId: before.containerId,
+        status: 'running',
+        pendingRebuild: false,
+        workerSelfApiAccess: 'inherit',
+        effectiveWorkerSelfApiAccess: {
+          allowed: true,
+          source: 'group',
+          groupId: workerGroupId,
+        },
+      });
+    } finally {
+      await request.patch(`/api/worker-groups/${workerGroupId}`, {
+        data: { workerSelfApiAccess: 'allow' },
+      }).catch(() => undefined);
+      ws.close();
+    }
   });
 
   test('worker-self MCP mutates only its own plugin definitions and installations', async () => {

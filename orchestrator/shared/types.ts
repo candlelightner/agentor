@@ -115,6 +115,18 @@ export interface WorkerRuntimeDiagnostic {
 
 export type WorkerGroupLifecycleAction = "stop" | "rebuild" | "archive";
 
+/** Orchestrator-enforced access to the source-IP-authenticated worker-self API.
+ * `inherit` defers to the nearest group policy and ultimately the backwards-
+ * compatible platform default (`allow`). */
+export type WorkerSelfApiAccess = "inherit" | "allow" | "deny";
+
+export interface EffectiveWorkerSelfApiAccess {
+  allowed: boolean;
+  decision: "allow" | "deny";
+  source: "worker" | "group" | "default" | "invalid-group-hierarchy";
+  groupId?: string;
+}
+
 /** Result of applying one lifecycle action to every ordinary worker in a
  * worker-group subtree. Administrative workspaces are deliberately separate. */
 export interface WorkerGroupLifecycleResult {
@@ -168,6 +180,10 @@ export interface ContainerInfo extends UserOwnedResource {
   excludedGlobalEnvVarKeys?: string[];
   /** Effective inherited worker-group variable names intentionally omitted. */
   excludedGroupEnvVarKeys?: string[];
+  /** Live orchestrator-side worker-self API override; no rebuild is required. */
+  workerSelfApiAccess?: WorkerSelfApiAccess;
+  /** Effective value projected by authenticated management APIs. */
+  effectiveWorkerSelfApiAccess?: EffectiveWorkerSelfApiAccess;
   /** True when the worker's stored config carries rebuild-requiring edits
    * (environment, repos, mounts, or init script) that have not yet been applied
    * to the running container. Live edits (display name) never set this. Cleared
@@ -199,6 +215,7 @@ export interface CreateContainerRequest {
   environmentId?: string;
   excludedGlobalEnvVarKeys?: string[];
   excludedGroupEnvVarKeys?: string[];
+  workerSelfApiAccess?: WorkerSelfApiAccess;
   /** Optional direct worker-group membership selected by an authenticated
    * account user. REST and management MCP validate that the group belongs to
    * the worker owner, then enroll the worker through the normal group/network
@@ -242,6 +259,8 @@ export interface UpdateContainerSettingsRequest {
   mounts?: MountConfig[];
   excludedGlobalEnvVarKeys?: string[];
   excludedGroupEnvVarKeys?: string[];
+  /** Applied immediately by the orchestrator; never requires a rebuild. */
+  workerSelfApiAccess?: WorkerSelfApiAccess;
 }
 
 export interface ImageUpdateInfo {

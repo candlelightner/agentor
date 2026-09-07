@@ -13,7 +13,10 @@ import type { WorkerGroup } from "./worker-group-store";
 import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 import { verifyWorkerMutationUnlocks } from "./worker-protection-lock";
 
-type WorkerGroupPatch = Pick<Partial<WorkerGroup>, "name" | "workerIds"> & {
+type WorkerGroupPatch = Pick<
+  Partial<WorkerGroup>,
+  "name" | "workerIds" | "workerSelfApiAccess"
+> & {
   parentId?: string | null;
 };
 type Reconciliation = { workerIds: string[]; partialFailures: string[] };
@@ -227,6 +230,7 @@ export class WorkerGroupNetworkCoordinator {
       name: existing.name,
       workerIds: [...existing.workerIds],
       parentId: existing.parentId ?? null,
+      workerSelfApiAccess: existing.workerSelfApiAccess ?? "inherit",
     };
     const affectedGroups = new Set<string>();
     if (patch.workerIds !== undefined || patch.parentId !== undefined)

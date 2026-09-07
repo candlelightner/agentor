@@ -34,7 +34,7 @@ All agents are installed in a single unified worker image. Start any agent via i
 - **Persistent workspaces** — workspace data survives container stops, restarts, and archiving via named Docker volumes
 - **Bounded worker recovery** — durable running/stopped intent survives daemon restarts; unresponsive runtimes report safe diagnostics and can be recovered through UI/API/MCP without deleting persistent workspace, agent-data, or DinD volumes
 - **Worker archiving** — archive workers to free resources while preserving workspace data; unarchive to restore
-- **Worker groups and managed networks** — organize related experiments, create all/group/selected-worker bridge networks, and keep the internal management network unavailable to ordinary workers
+- **Worker groups and managed networks** — organize related experiments, create all/group/selected-worker bridge networks, keep the internal management network unavailable to ordinary workers, and allow/deny the worker-self orchestrator API live per worker or inherited group
 - **Worker protection locks** — optional write-only per-worker passwords protect lifecycle/configuration, running-workspace file changes, apps/exposure mappings, rebuilds, archive/unarchive, in-place restore, and deletion across UI, API, and MCP routes
 - **File upload/download** — upload files/folders to running workers or during creation, download workspace as `.tar.gz`
 - **Docker-in-Docker** — opt-in per-environment, full Docker daemon inside workers (build, run, compose)

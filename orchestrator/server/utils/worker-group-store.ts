@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { UserScopedJsonStore } from "./user-scoped-store";
+import type { WorkerSelfApiAccess } from "../../shared/types";
 
 export interface WorkerGroup {
   id: string;
@@ -10,6 +11,8 @@ export interface WorkerGroup {
   parentId?: string;
   /** Names suppressed from ancestors before this group's own entries apply. */
   excludedInheritedEnvVarKeys?: string[];
+  /** Inherited worker-self API policy for ordinary workers in this subtree. */
+  workerSelfApiAccess?: WorkerSelfApiAccess;
   adminWorkspace?: Record<string, any>;
   createdAt: string;
   updatedAt: string;
@@ -22,6 +25,7 @@ export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
     userId: string,
     name: string,
     parentId?: string,
+    workerSelfApiAccess?: WorkerSelfApiAccess,
   ): Promise<WorkerGroup> {
     const stamp = new Date().toISOString();
     const group = {
@@ -30,6 +34,7 @@ export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
       name: name.trim(),
       workerIds: [],
       ...(parentId ? { parentId } : {}),
+      ...(workerSelfApiAccess ? { workerSelfApiAccess } : {}),
       createdAt: stamp,
       updatedAt: stamp,
     };
@@ -44,6 +49,7 @@ export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
       workerIds?: string[];
       parentId?: string | null;
       excludedInheritedEnvVarKeys?: string[];
+      workerSelfApiAccess?: WorkerSelfApiAccess;
       adminWorkspace?: Record<string, any>;
     },
   ): Promise<WorkerGroup> {
@@ -73,6 +79,8 @@ export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
         group.excludedInheritedEnvVarKeys = [
           ...new Set(patch.excludedInheritedEnvVarKeys),
         ].sort();
+      if (patch.workerSelfApiAccess !== undefined)
+        group.workerSelfApiAccess = patch.workerSelfApiAccess;
       if (patch.adminWorkspace !== undefined)
         group.adminWorkspace = structuredClone(patch.adminWorkspace);
       const map = this.items.get(userId)!;

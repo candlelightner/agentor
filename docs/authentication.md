@@ -75,7 +75,7 @@ Application data remains in JSON files (via `JsonStore`) — we only use SQLite 
 | Auth handler | `orchestrator/server/api/auth/[...all].ts` | Catch-all that forwards `/api/auth/*` to `auth.handler()` |
 | Middleware | `orchestrator/server/middleware/auth.ts` | Global Nitro middleware that extracts the session on every `/api/*` request and populates `event.context.auth`. Skips `/api/auth/**`, `/api/health`, `/api/setup/**`, `/api/docs`, and `/api/worker-self/**`. |
 | Helpers | `orchestrator/server/utils/auth-helpers.ts` | `requireAuth(event)`, `requireAdmin(event)`, `requireContainerAccess(event, container)`, `canAccessResource(...)`, `authenticateWsPeer(peer)` |
-| Worker auth | `orchestrator/server/utils/worker-auth.ts` | `requireWorkerSelf(event)` — identifies the calling worker by source IP on the `agentor-net` Docker bridge network. Used by every `/api/worker-self/*` route in place of session auth. |
+| Worker auth | `orchestrator/server/utils/worker-auth.ts` | `requireWorkerSelf(event)` — identifies the calling worker by source IP on the `agentor-net` Docker bridge network, then enforces its current worker/group access policy. Used by every `/api/worker-self/*` route in place of session auth. |
 | Setup endpoints | `orchestrator/server/api/setup/status.get.ts` + `create-admin.post.ts` | First-run detection and initial admin creation |
 
 ### Secret
@@ -122,8 +122,24 @@ Each `/api/worker-self/*` handler instead calls `requireWorkerSelf(event)` from 
 
 1. Reads the source IP from `event.node.req.socket.remoteAddress` (stripping any `::ffff:` IPv4-mapped prefix).
 2. Lists managed Docker containers (filtered by `agentor.managed=true`) and matches each container's IP on `dockerNetwork` (`agentor-net`) against the source IP. The IP→containerName map is cached for 3 seconds; a miss forces a refresh.
-3. Resolves the matched containerName back to an in-memory `ContainerInfo` via `containerManager.findByContainerName()`. If the container is not in `running` state, returns 409.
-4. Returns `{ container, userId, containerName, workerId }`.
+3. Resolves the matched containerName back to an in-memory `ContainerInfo` via `containerManager.findByContainerName()`.
+4. Resolves the durable `workerSelfApiAccess` policy. An explicit worker value wins; otherwise the nearest explicit group/ancestor value wins; otherwise legacy/default behavior is `allow`. A malformed hierarchy and any denied path in a legacy duplicate membership fail closed. A denial returns structured 403 code `WORKER_SELF_API_DISABLED`.
+5. If the container is not in `running` state, returns 409; otherwise returns `{ container, userId, containerName, workerId }`.
+
+The dashboard exposes `inherit`, `allow`, and `deny` on worker settings and on
+each worker group. The same fields and effective decision are available through
+REST and management MCP (`workers.create`, `workers.update`, `workers.list`,
+`workers.inspect`, `groups.create`, `groups.update`, and `groups.list`). Store
+lookups happen for every request, so an access-policy change applies to the next
+request without recreating, restarting, or rebuilding a worker. Group membership
+also affects the access decision immediately, although changing membership can
+independently require a rebuild when it changes host-mount or other immutable
+runtime configuration. The access gate does not retroactively abort a response
+or stream that was already accepted.
+The policy gates all ordinary-worker routes, including the narrow plugin MCP.
+Platform and group administrative workspaces are intentionally exempt from
+this ordinary-worker gate so they retain their already-scoped management/plugin
+MCP authority; they still do not gain the generic worker-only routes.
 
 Every `/api/worker-self/*` mutation is therefore scoped to the calling worker only — `workerId` / `workerName` body fields are ignored, list endpoints filter by the caller's `containerName`, and delete endpoints reject (403) operations that would touch a different worker's mappings.
 
@@ -146,7 +162,7 @@ Routes:
 
 This is the only API surface workers should hit — the dashboard-facing `/api/port-mappings`, `/api/domain-mappings`, and `/api/usage` routes still require a session cookie that workers do not have.
 
-The Docker-bridge identification is safe because joining `agentor-net` requires Docker socket access (the orchestrator/operator), and Docker IPAM assigns a unique IP per container. A container removed and replaced with a new one on the same IP cannot impersonate the previous worker — the cache is verified against `containerManager.findByContainerName()`, which only returns running, registered workers.
+The Docker-bridge identification is safe because joining `agentor-net` requires Docker socket access (the orchestrator/operator), and Docker IPAM assigns a unique IP per container. A container removed and replaced with a new one on the same IP cannot impersonate the previous worker — the cache is verified against `containerManager.findByContainerName()`, which only returns registered workers, and runtime state plus the live policy are checked before authority is returned.
 
 ## Layered Auth (Basic Auth)
 

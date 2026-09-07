@@ -52,7 +52,7 @@ Instruction entries are merged into a single markdown document and written to:
 ## Environment Integration
 
 Both capabilities and instructions are selected per-environment:
-- `exposeApis: { portMappings, domainMappings, usage }` — Controls both which API capability docs are written into the worker **and** whether the corresponding `/api/worker-self/*` routes are reachable: each worker-self port-mapping/domain-mapping/usage handler resolves the calling worker's environment and returns **403** when the relevant flag is false. `worker-self/info` and the `*-mapper/status` routes are always available. Default all true.
+- `exposeApis: { portMappings, domainMappings, usage }` — Controls both which API capability docs are written into the worker **and** whether the corresponding `/api/worker-self/*` routes are reachable: each worker-self port-mapping/domain-mapping/usage handler resolves the calling worker's environment and returns **403** when the relevant flag is false. These per-capability flags are additional restrictions beneath the live worker/group-wide `workerSelfApiAccess` policy. `worker-self/info` and the `*-mapper/status` routes bypass the per-capability flags, but are still blocked when the complete worker-self API is denied. Default all true.
 - `enabledCapabilityIds: string[] | null` — `null` = all, `[]` = none, or specific IDs
 - `enabledInstructionIds: string[] | null` — Same semantics
 
@@ -69,8 +69,18 @@ Workers call dedicated `/api/worker-self/*` routes. These are listed in the glob
 
 1. Reads the source IP from `event.node.req.socket.remoteAddress` (stripping any `::ffff:` IPv4-mapped prefix).
 2. Lists managed Docker containers (filtered by `agentor.managed=true`) and matches each container's IP on the configured `dockerNetwork` (default `agentor-net`) against the source IP. The IP→containerName map is cached for 3 seconds; misses force a refresh.
-3. Resolves the matched `containerName` back to a `ContainerInfo` via `containerManager.findByContainerName()`. If the container is not in `running` state, returns 409.
-4. Returns `{ container, userId, containerName, workerId }` — the handler uses these to scope the operation to the calling worker.
+3. Resolves the matched `containerName` back to a `ContainerInfo` via `containerManager.findByContainerName()`.
+4. Reads the latest durable worker/group policy. The worker override wins, then the nearest group/ancestor policy, then the backward-compatible default `allow`. Denial returns structured 403 code `WORKER_SELF_API_DISABLED`; malformed hierarchy fails closed.
+5. If the container is not in `running` state, returns 409. Otherwise it returns `{ container, userId, containerName, workerId }` for worker-scoped handling.
+
+The complete worker-self API can be set to **Inherit**, **Allow**, or **Deny**
+from worker settings and worker-group controls. Changes are enforced by the
+orchestrator on the next request without a worker restart or rebuild; accepted
+streams are not killed retroactively. The management MCP exposes the same raw
+and effective policy. Ordinary worker plugin MCP calls are gated too. Trusted
+platform/group administrative workspaces retain only their existing scoped
+management/plugin MCP exception so denying ordinary workers cannot lock out the
+control plane.
 
 Available routes:
 - `GET  /api/worker-self/info` — diagnostics (`{ workerId, containerName, userId, status, displayName }`)

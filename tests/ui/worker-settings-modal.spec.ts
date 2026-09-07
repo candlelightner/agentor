@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { goToDashboard } from '../helpers/ui-helpers';
 import { createWorker, cleanupWorker } from '../helpers/worker-lifecycle';
+import { ApiClient } from '../helpers/api-client';
 
 // Behavioural coverage for the editable Worker Settings modal: display-name
 // edits apply without a rebuild, while rebuild-requiring edits (init script,
@@ -51,6 +52,43 @@ test.describe.serial('Worker Settings Modal — display-name edit applies withou
     await goToDashboard(page);
     await expect(page.locator(`h3:has-text("${newName}")`).first()).toBeVisible({ timeout: 15_000 });
     displayName = newName;
+  });
+
+  test('changing worker-self API access is a live setting', async ({ page, request }) => {
+    const api = new ApiClient(request);
+    const before = (await api.listContainers()).body.find(
+      (worker: { id: string }) => worker.id === containerId,
+    );
+    const dialog = await openSettings(page, displayName);
+    const access = dialog.getByRole('combobox', { name: 'Worker-self API access' });
+    await expect(access).toContainText('Inherit from worker group');
+    await access.click();
+    await page.getByRole('option', { name: 'Deny', exact: true }).click();
+
+    await expect(dialog.getByRole('button', { name: 'Save & Rebuild' })).toHaveCount(0);
+    await dialog.getByRole('button', { name: 'Save', exact: true }).click();
+    await expect(dialog).toBeHidden({ timeout: 10_000 });
+
+    await expect.poll(async () => {
+      const current = (await api.listContainers()).body.find(
+        (worker: { id: string }) => worker.id === containerId,
+      );
+      return {
+        access: current?.workerSelfApiAccess,
+        allowed: current?.effectiveWorkerSelfApiAccess?.allowed,
+        containerId: current?.containerId,
+        pendingRebuild: current?.pendingRebuild,
+      };
+    }).toEqual({
+      access: 'deny',
+      allowed: false,
+      containerId: before.containerId,
+      pendingRebuild: false,
+    });
+
+    expect((await request.patch(`/api/containers/${containerId}`, {
+      data: { workerSelfApiAccess: 'inherit' },
+    })).status()).toBe(200);
   });
 });
 

@@ -1,9 +1,10 @@
 import type { H3Event } from 'h3';
 import { createError } from 'h3';
-import { useDockerService, useContainerManager, useConfig } from './services';
+import { useDockerService, useContainerManager, useConfig, useWorkerGroupStore, useWorkerStore } from './services';
 import { useAdminWorkspaceStore } from './admin-workspace-store';
 import { useGroupAdminWorkspaceStore } from './group-admin-workspace-store';
 import type { ContainerInfo } from '../../shared/types';
+import { effectiveWorkerSelfApiAccess } from './worker-self-access';
 
 export interface WorkerSelfContext {
   container: ContainerInfo;
@@ -97,6 +98,29 @@ async function resolveCallerByIp(remoteIp: string): Promise<ContainerInfo | null
   return containerManager.findByContainerName(retry.containerName) ?? null;
 }
 
+/** Enforce the durable policy on every request rather than trusting the
+ * container's startup environment. Group moves and policy changes therefore
+ * take effect immediately without restarting or rebuilding the worker. */
+export function requireOrdinaryWorkerSelfAccess(container: ContainerInfo): void {
+  const stored = useWorkerStore().get(container.userId, container.id);
+  const decision = effectiveWorkerSelfApiAccess(
+    stored ?? container,
+    useWorkerGroupStore().listForUser(container.userId),
+  );
+  if (!decision.allowed)
+    throw createError({
+      statusCode: 403,
+      statusMessage: 'Worker-self API access is disabled by orchestrator policy',
+      data: {
+        code: 'WORKER_SELF_API_DISABLED',
+        source: decision.source,
+        ...(decision.groupId ? { groupId: decision.groupId } : {}),
+        remediation:
+          'An account or platform administrator can allow this worker directly or through its worker-group policy. The change applies to the next request without a worker restart or rebuild.',
+      },
+    });
+}
+
 /**
  * Resolves the calling worker by its source IP on the Docker bridge network.
  * Worker containers join `agentor-net` and reach the orchestrator at
@@ -120,6 +144,8 @@ export async function requireWorkerSelf(event: H3Event): Promise<WorkerSelfConte
       statusMessage: `No managed worker container found for caller IP ${remoteIp}. Worker-self endpoints can only be reached from inside a managed agentor worker on the Docker bridge network.`,
     });
   }
+
+  requireOrdinaryWorkerSelfAccess(container);
 
   if (container.status !== 'running') {
     throw createError({
@@ -148,6 +174,7 @@ export async function requirePluginSelf(event: H3Event): Promise<WorkerSelfConte
   // separate capability on private management networks.
   const ordinary = await resolveCallerByIp(remoteIp);
   if (ordinary) {
+    requireOrdinaryWorkerSelfAccess(ordinary);
     if (ordinary.status !== 'running') throw createError({ statusCode: 409, statusMessage: 'Worker container is not running' });
     return { container: ordinary, userId: ordinary.userId, containerName: ordinary.containerName, workerId: ordinary.id, authority: { kind: 'ordinary', userId: ordinary.userId, workerId: ordinary.id } };
   }

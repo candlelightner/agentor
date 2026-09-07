@@ -24,6 +24,16 @@ curl "$ORCHESTRATOR_URL/api/worker-self/info"
 
 That returns `{ workerId, containerName, userId, status, displayName }` for *this* worker.
 
+The account or platform administrator can disable the complete worker-self API
+for an individual ordinary worker or through its worker-group hierarchy. That
+orchestrator-side policy is checked on every new request and returns `403` with
+code `WORKER_SELF_API_DISABLED` when access is denied. Policy changes take
+effect immediately without restarting or rebuilding this worker; an already
+open stream is not terminated retroactively. Platform and group administrative
+workspaces retain their narrow management/plugin MCP path so an ordinary
+worker cannot disable the control plane. If access is disabled, ask the account
+or platform administrator to review the worker or group setting in the GUI.
+
 The orchestrator also exposes session-authenticated routes under `$ORCHESTRATOR_URL/api/...` (port mappings, domain mappings, etc.) for the dashboard UI — those need a logged-in browser session and are not usable from inside a worker. Always reach for the `/api/worker-self/*` variants when scripting from here.
 
 ## Your worker environment

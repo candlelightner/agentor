@@ -36,6 +36,7 @@ const displayLabel = computed(() => props.container.displayName || shortName(pro
 const form = reactive({
   displayName: '',
   environmentId: '',
+  workerSelfApiAccess: 'inherit' as import('~/types').WorkerSelfApiAccess,
   repos: [] as RepoConfig[],
   mounts: [] as MountConfig[],
   initScript: '',
@@ -51,6 +52,7 @@ const defaultProvider = computed(() => gitProviders.value[0]?.id || 'github');
 function resetFormFromContainer() {
   form.displayName = props.container.displayName || '';
   form.environmentId = props.container.environmentId || defaultEnvironmentId.value;
+  form.workerSelfApiAccess = props.container.workerSelfApiAccess || 'inherit';
   form.repos = (props.container.repos || []).map((r) => ({ ...r }));
   form.mounts = (props.container.mounts || []).map((m) => ({ ...m }));
   form.initScript = props.container.initScript || '';
@@ -81,7 +83,10 @@ function normMounts(mounts: MountConfig[] | undefined): string {
 
 const liveDirty = computed(() => {
   const next = form.displayName.trim();
-  return !!next && next !== (props.container.displayName || '');
+  return (
+    (!!next && next !== (props.container.displayName || '')) ||
+    form.workerSelfApiAccess !== (props.container.workerSelfApiAccess || 'inherit')
+  );
 });
 const envDirty = computed(() => form.environmentId !== (props.container.environmentId || defaultEnvironmentId.value));
 const initDirty = computed(() => (form.initScript.trim() || '') !== (props.container.initScript || ''));
@@ -102,6 +107,7 @@ function buildPatch(): UpdateContainerSettingsRequest {
   return {
     displayName: form.displayName.trim(),
     environmentId: form.environmentId,
+    workerSelfApiAccess: form.workerSelfApiAccess,
     // Trim to match the `initDirty` baseline — the dirty-check compares
     // `form.initScript.trim()`, so persist the same trimmed value (trailing
     // whitespace in a bash script is harmless) instead of drifting.
@@ -290,6 +296,28 @@ const formattedCreatedAt = computed(() => {
               </div>
               <UInput v-model="form.displayName" class="w-full" placeholder="Worker label" />
               <p v-if="!nameValid" class="text-xs text-red-500 mt-1">Name must be 1–100 characters.</p>
+            </div>
+
+            <div data-testid="worker-self-api-access">
+              <div class="flex items-center justify-between mb-1">
+                <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Worker-self API</label>
+                <UBadge color="success" variant="subtle" size="xs">no rebuild needed</UBadge>
+              </div>
+              <USelect
+                v-model="form.workerSelfApiAccess"
+                :items="[
+                  { label: 'Inherit from worker group', value: 'inherit' },
+                  { label: 'Allow', value: 'allow' },
+                  { label: 'Deny', value: 'deny' },
+                ]"
+                class="w-full"
+                aria-label="Worker-self API access"
+              />
+              <p class="mt-1 text-xs text-gray-500">
+                Effective access:
+                {{ container.effectiveWorkerSelfApiAccess?.allowed === false ? 'denied' : 'allowed' }}.
+                Applied immediately by the orchestrator; administrative workspaces are exempt.
+              </p>
             </div>
 
             <!-- Environment (rebuild) -->

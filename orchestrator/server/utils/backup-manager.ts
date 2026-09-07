@@ -2705,6 +2705,7 @@ export class BackupManager {
           repos: worker.repos ?? [],
           mounts: worker.mounts ?? [],
           initScript: worker.initScript ?? "",
+          workerSelfApiAccess: worker.workerSelfApiAccess ?? "inherit",
         },
         environment: { ...environment, envVars: "" },
         portMappings: usePortMappingStore()

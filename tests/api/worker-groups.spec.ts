@@ -39,6 +39,56 @@ test.describe('Worker groups API', () => {
   });
   test('rejects invalid names and unknown workers', async ({ request }) => { expect((await request.post('/api/worker-groups', { data: { name: '' } })).status()).toBe(400); const group = await (await request.post('/api/worker-groups', { data: { name: 'Valid' } })).json(); expect((await request.patch(`/api/worker-groups/${group.id}`, { data: { workerIds: ['missing'] } })).status()).toBe(400); await request.delete(`/api/worker-groups/${group.id}`); });
 
+  test('validates and projects inherited worker-self API policies', async ({ request }) => {
+    expect((await request.post('/api/worker-groups', {
+      data: { name: `bad-policy-${Date.now()}`, workerSelfApiAccess: 'enabled' },
+    })).status()).toBe(400);
+    const rootResponse = await request.post('/api/worker-groups', {
+      data: { name: `policy-root-${Date.now()}`, workerSelfApiAccess: 'deny' },
+    });
+    expect(rootResponse.status()).toBe(201);
+    const root = await rootResponse.json();
+    expect(root).toMatchObject({
+      workerSelfApiAccess: 'deny',
+      effectiveWorkerSelfApiAccess: {
+        allowed: false,
+        decision: 'deny',
+        source: 'group',
+      },
+    });
+    const childResponse = await request.post('/api/worker-groups', {
+      data: { name: `policy-child-${Date.now()}`, parentId: root.id },
+    });
+    expect(childResponse.status()).toBe(201);
+    const child = await childResponse.json();
+    try {
+      expect(child).toMatchObject({
+        effectiveWorkerSelfApiAccess: {
+          allowed: false,
+          decision: 'deny',
+          source: 'group',
+          groupId: root.id,
+        },
+      });
+      const allowed = await request.patch(`/api/worker-groups/${child.id}`, {
+        data: { workerSelfApiAccess: 'allow' },
+      });
+      expect(allowed.status()).toBe(200);
+      expect(await allowed.json()).toMatchObject({
+        workerSelfApiAccess: 'allow',
+        effectiveWorkerSelfApiAccess: {
+          allowed: true,
+          decision: 'allow',
+          source: 'group',
+          groupId: child.id,
+        },
+      });
+    } finally {
+      await request.delete(`/api/worker-groups/${child.id}`).catch(() => undefined);
+      await request.delete(`/api/worker-groups/${root.id}`).catch(() => undefined);
+    }
+  });
+
   test('permanent live or archived worker deletion clears membership and leaves the group deletable', { timeout: 180_000 }, async ({ request }) => {
     const worker = await createWorker(request, { displayName: `group-delete-member-${Date.now()}` });
     const created = await request.post('/api/worker-groups', { data: { name: `delete-cleanup-${Date.now()}` } });

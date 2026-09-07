@@ -25,6 +25,8 @@ export interface WorkerGroup {
     archived: number;
   };
   parentId?: string;
+  workerSelfApiAccess?: import("~/types").WorkerSelfApiAccess;
+  effectiveWorkerSelfApiAccess?: import("~/types").EffectiveWorkerSelfApiAccess;
   adminWorkspace?: GroupAdminWorkspace;
   createdAt: string;
   updatedAt: string;
@@ -34,17 +36,21 @@ export function useWorkerGroups() {
     "/api/worker-groups",
     { default: () => [] },
   );
-  const create = async (name: string, parentId?: string) => {
+  const create = async (
+    name: string,
+    parentId?: string,
+    workerSelfApiAccess: import("~/types").WorkerSelfApiAccess = "inherit",
+  ) => {
     const group = await $fetch<WorkerGroup>("/api/worker-groups", {
       method: "POST",
-      body: { name, ...(parentId ? { parentId } : {}) },
+      body: { name, ...(parentId ? { parentId } : {}), workerSelfApiAccess },
     });
     await refresh();
     return group;
   };
   const update = async (
     id: string,
-    patch: Partial<Pick<WorkerGroup, "name" | "workerIds">> & {
+    patch: Partial<Pick<WorkerGroup, "name" | "workerIds" | "workerSelfApiAccess">> & {
       parentId?: string | null;
     },
   ) => {

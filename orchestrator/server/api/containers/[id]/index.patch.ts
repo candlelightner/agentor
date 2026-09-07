@@ -3,7 +3,7 @@ defineRouteMeta({
     tags: ['Containers'],
     summary: 'Update worker settings',
     description:
-      "Updates a worker's editable settings. Every field is optional — only the keys present are changed. `displayName` is applied to the running worker immediately, without a rebuild. `environmentId`, `initScript`, `repos`, and `mounts` are baked into the container at create time, so changing any of them updates the stored config and flags the worker `pendingRebuild: true` until the next rebuild. The internal identity (id, container name, volumes, routing) is always immutable.",
+      "Updates a worker's editable settings. Every field is optional. `displayName` and `workerSelfApiAccess` apply immediately without a rebuild. `environmentId`, `initScript`, `repos`, and `mounts` require a rebuild.",
     operationId: 'updateContainerSettings',
     parameters: [
       { name: 'id', in: 'path', required: true, schema: { type: 'string' }, description: 'Worker container ID' },
@@ -16,6 +16,7 @@ defineRouteMeta({
             type: 'object',
             properties: {
               displayName: { type: 'string', description: 'New user-facing display name (free-form, non-empty, ≤100 chars). Live — applied without rebuild.' },
+              workerSelfApiAccess: { type: 'string', enum: ['inherit', 'allow', 'deny'], description: 'Live orchestrator-side worker-self API override. Inherit uses the nearest group policy.' },
               environmentId: { type: 'string', description: 'Reassign the worker to a different environment. Requires rebuild.' },
               initScript: { type: 'string', description: 'New init script (empty string clears it). Requires rebuild.' },
               repos: { type: 'array', items: { $ref: '#/components/schemas/RepoConfig' }, description: 'Replacement repository list. Requires rebuild.' },
@@ -37,11 +38,12 @@ defineRouteMeta({
 });
 
 import type { RepoConfig, MountConfig, UpdateContainerSettingsRequest } from '../../../../shared/types';
-import { useContainerManager, useEnvironmentStore } from '../../../utils/services';
+import { useContainerManager, useEnvironmentStore, useWorkerGroupStore } from '../../../utils/services';
 import { MAX_DISPLAY_NAME_LENGTH } from '../../../utils/validation';
 import { validateMounts } from '../../../utils/docker';
 import { requireContainerAccess } from '../../../utils/auth-helpers';
 import { useWorkerProtectionLockStore } from '../../../utils/worker-protection-lock';
+import { isWorkerSelfApiAccess, withEffectiveWorkerSelfApiAccess } from '../../../utils/worker-self-access';
 
 function bad(message: string): never {
   throw createError({ statusCode: 400, statusMessage: message });
@@ -79,6 +81,12 @@ export default defineEventHandler(async (event) => {
   await useWorkerProtectionLockStore().verify(id, (body as any).lockPassword);
 
   const patch: UpdateContainerSettingsRequest = {};
+
+  if (body.workerSelfApiAccess !== undefined) {
+    if (!isWorkerSelfApiAccess(body.workerSelfApiAccess))
+      bad('workerSelfApiAccess must be inherit, allow, or deny');
+    patch.workerSelfApiAccess = body.workerSelfApiAccess;
+  }
 
   if (body.excludedGlobalEnvVarKeys !== undefined && body.excludedGlobalEnvVarKeys !== null) {
     const keys = parseArray(body.excludedGlobalEnvVarKeys, 'excludedGlobalEnvVarKeys');
@@ -159,5 +167,9 @@ export default defineEventHandler(async (event) => {
     patch.mounts = mounts;
   }
 
-  return containerManager.updateSettings(id, patch);
+  const updated = await containerManager.updateSettings(id, patch);
+  return withEffectiveWorkerSelfApiAccess(
+    updated,
+    useWorkerGroupStore().listForUser(updated.userId),
+  );
 });

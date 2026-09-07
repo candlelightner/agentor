@@ -69,6 +69,7 @@ import {
   instanceSnapshotActive,
   instanceSnapshotJobId,
 } from "./instance-snapshot-gate";
+import { effectiveWorkerSelfApiAccess } from "./worker-self-access";
 
 const GROUPS = [
   "read-only-status",
@@ -1746,7 +1747,17 @@ export class ManagementMcpStore {
             throw groupResourceNotFound();
         },
       );
-      return worker;
+      const current = useContainerManager().get(worker.id);
+      return current
+        ? {
+            ...worker,
+            workerSelfApiAccess: current.workerSelfApiAccess ?? "inherit",
+            effectiveWorkerSelfApiAccess: effectiveWorkerSelfApiAccess(
+              current,
+              useWorkerGroupStore().listForUser(identity.ownerId),
+            ),
+          }
+        : worker;
     } catch (error) {
       // Never leave a successfully-created owner-wide worker behind when its
       // mandatory group enrollment/reconciliation did not complete.
@@ -2397,7 +2408,7 @@ function groupStructuralDescription(name: string): string {
     "groups.create":
       "Create a child group beneath the bound administrative group or one of its live descendants. parentId defaults to the bound group.",
     "groups.update":
-      "Rename an authorized group or reparent a descendant within the authorized subtree. Direct membership replacement is intentionally unavailable; use groups.assign-worker. The bound administrative group itself cannot be moved.",
+      "Rename an authorized group, change its inherited worker-self API policy, or reparent a descendant within the authorized subtree. Access-policy changes apply immediately without restarting or rebuilding workers. Direct membership replacement is intentionally unavailable; use groups.assign-worker. The bound administrative group itself cannot be moved.",
     "groups.delete":
       "Delete an empty descendant group. The bound administrative group itself cannot be deleted.",
     "groups.workers.stop":
@@ -2680,6 +2691,10 @@ function toolInputSchema(name: string) {
   return { type: "object", additionalProperties: false, properties: {} };
 }
 function publicWorker(worker: any) {
+  const workerSelf = effectiveWorkerSelfApiAccess(
+    worker,
+    useWorkerGroupStore().listForUser(worker.userId),
+  );
   return {
     id: worker.id,
     userId: worker.userId,
@@ -2689,6 +2704,8 @@ function publicWorker(worker: any) {
     runtimeDiagnostic: worker.runtimeDiagnostic,
     imageName: worker.imageName,
     environmentId: worker.environmentId,
+    workerSelfApiAccess: worker.workerSelfApiAccess ?? "inherit",
+    effectiveWorkerSelfApiAccess: workerSelf,
     pendingRebuild: Boolean(worker.pendingRebuild),
     createdAt: worker.createdAt,
     updatedAt: worker.updatedAt,

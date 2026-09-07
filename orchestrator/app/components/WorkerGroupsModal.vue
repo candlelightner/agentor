@@ -10,6 +10,7 @@ const emit = defineEmits<{ service: [workspaceId: string, service: string] }>();
 const { groups, create, update, remove, assignWorker, adminAction } = useWorkerGroups();
 const name = ref("");
 const createParentId = ref("");
+const createWorkerSelfApiAccess = ref<import("~/types").WorkerSelfApiAccess>("inherit");
 const error = ref("");
 const busy = ref("");
 const filesWorkspace = ref<GroupAdminWorkspace | null>(null);
@@ -28,7 +29,7 @@ async function run(key: string, operation: () => Promise<unknown>) {
 }
 async function createGroup() {
   if (!name.value.trim()) return;
-  const result = await run("create", () => create(name.value, createParentId.value || undefined));
+  const result = await run("create", () => create(name.value, createParentId.value || undefined, createWorkerSelfApiAccess.value));
   if (result) name.value = "";
 }
 async function rename(group: WorkerGroup) {
@@ -56,6 +57,13 @@ function legalParents(group: WorkerGroup) {
 }
 async function moveGroup(group: WorkerGroup, value: string) {
   await run(`parent-${group.id}`, () => update(group.id, { parentId: value || null }));
+}
+async function setWorkerSelfApiAccess(group: WorkerGroup, value: string) {
+  await run(`worker-self-${group.id}`, () =>
+    update(group.id, {
+      workerSelfApiAccess: value as import("~/types").WorkerSelfApiAccess,
+    }),
+  );
 }
 const orderedGroups = computed(() => {
   const result: Array<{ group: WorkerGroup; depth: number }> = [];
@@ -116,6 +124,11 @@ function serviceIcon(service: string) {
         <select v-model="createParentId" aria-label="Parent group" class="rounded border px-2 dark:bg-gray-900">
           <option value="">Root group</option><option v-for="candidate in groups" :key="candidate.id" :value="candidate.id">{{ groupPath(candidate) }}</option>
         </select>
+        <select v-model="createWorkerSelfApiAccess" aria-label="New group worker-self API access" class="rounded border px-2 dark:bg-gray-900">
+          <option value="inherit">Inherit API access</option>
+          <option value="allow">Allow worker-self API</option>
+          <option value="deny">Deny worker-self API</option>
+        </select>
         <UButton type="submit" :loading="busy === 'create'"
           >Create group</UButton
         >
@@ -164,6 +177,24 @@ function serviceIcon(service: string) {
             <option value="">Root group</option><option v-for="candidate in legalParents(entry.group)" :key="candidate.id" :value="candidate.id">{{ groupPath(candidate) }}</option>
           </select>
         </label>
+        <label class="mt-2 flex flex-wrap items-center gap-2 text-sm">Worker-self API
+          <select
+            :value="entry.group.workerSelfApiAccess || 'inherit'"
+            :aria-label="`Worker-self API access for ${entry.group.name}`"
+            class="rounded border px-2 py-1 dark:bg-gray-900"
+            @change="setWorkerSelfApiAccess(entry.group, ($event.target as HTMLSelectElement).value)"
+          >
+            <option value="inherit">Inherit</option>
+            <option value="allow">Allow</option>
+            <option value="deny">Deny</option>
+          </select>
+          <span class="text-xs text-gray-500">
+            Effective: {{ entry.group.effectiveWorkerSelfApiAccess?.allowed === false ? 'denied' : 'allowed' }} · immediate, no rebuild
+          </span>
+        </label>
+        <p class="text-xs text-gray-500">
+          Applies to ordinary workers in this subtree. Platform and group administrative workspaces remain reachable for management MCP.
+        </p>
         <label
           v-for="worker in props.containers.filter(
             (c) => c.userId === entry.group.userId && !c.administrativeKind,

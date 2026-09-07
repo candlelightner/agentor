@@ -33,6 +33,12 @@ defineRouteMeta({
                 description:
                   "Optional direct worker-group membership. The group must belong to the authenticated account.",
               },
+              workerSelfApiAccess: {
+                type: "string",
+                enum: ["inherit", "allow", "deny"],
+                description:
+                  "Live orchestrator-side worker-self API policy. Inherit uses the nearest worker-group policy; no restart or rebuild is required.",
+              },
               excludedGlobalEnvVarKeys: {
                 type: "array",
                 items: { type: "string" },
@@ -75,6 +81,7 @@ import { requireAuth } from "../../utils/auth-helpers";
 import { useImageCatalogManager } from "../../utils/image-catalog";
 import { useWorkerGroupStore } from "../../utils/services";
 import { addWorkerToGroupWithNetworks } from "../../utils/worker-group-manager";
+import { isWorkerSelfApiAccess, withEffectiveWorkerSelfApiAccess } from "../../utils/worker-self-access";
 
 export default defineEventHandler(async (event) => {
   const { user } = requireAuth(event);
@@ -137,6 +144,14 @@ export default defineEventHandler(async (event) => {
       ? body.workerGroupId
       : undefined;
   if (
+    body.workerSelfApiAccess !== undefined &&
+    !isWorkerSelfApiAccess(body.workerSelfApiAccess)
+  )
+    throw createError({
+      statusCode: 400,
+      statusMessage: "workerSelfApiAccess must be inherit, allow, or deny",
+    });
+  if (
     targetWorkerGroupId &&
     !useWorkerGroupStore().get(user.id, targetWorkerGroupId)
   ) {
@@ -179,6 +194,7 @@ export default defineEventHandler(async (event) => {
     mounts: parsedMounts,
     environmentId: body.environmentId || undefined,
     excludedGlobalEnvVarKeys: body.excludedGlobalEnvVarKeys,
+    workerSelfApiAccess: body.workerSelfApiAccess,
     targetWorkerGroupId,
     initScript: body.initScript || undefined,
     workerConfiguration: body.workerConfiguration || undefined,
@@ -205,5 +221,8 @@ export default defineEventHandler(async (event) => {
   }
 
   setResponseStatus(event, 201);
-  return container;
+  return withEffectiveWorkerSelfApiAccess(
+    container,
+    useWorkerGroupStore().listForUser(user.id),
+  );
 });

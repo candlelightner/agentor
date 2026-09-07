@@ -176,10 +176,15 @@ test.describe.serial('Worker export/import round-trip', () => {
       // Put a uniquely-named file in the source workspace.
       const up = await api.uploadToWorkspace(src.id, [{ name: marker, content: Buffer.from('round-trip-payload') }]);
       expect(up.status).toBe(200);
+      expect((await request.patch(`/api/containers/${src.id}`, {
+        data: { workerSelfApiAccess: 'deny' },
+      })).status()).toBe(200);
 
       // Export (no rootfs — fast) then import as a new worker.
       const exported = await api.exportWorker(src.id, false);
       expect(exported.status).toBe(200);
+      const manifest = JSON.parse(readTarEntry(Buffer.from(exported.body), 'manifest.json').toString('utf8'));
+      expect(manifest.worker.workerSelfApiAccess).toBe('deny');
 
       const imported = await api.importWorker(Buffer.from(exported.body), 'imported-roundtrip');
       expect(imported.status).toBe(201);
@@ -188,6 +193,8 @@ test.describe.serial('Worker export/import round-trip', () => {
       expect(imported.body.id).not.toBe(src.id);
       expect(imported.body.containerName).toBe(`agentor-worker-${imported.body.id}`);
       expect(imported.body.displayName).toBe('imported-roundtrip');
+      expect(imported.body.workerSelfApiAccess).toBe('deny');
+      expect(imported.body.pendingRebuild).toBe(false);
       importedId = imported.body.id;
 
       await waitForWorkerRunning(request, importedId!, 90_000);

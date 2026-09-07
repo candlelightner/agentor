@@ -40,6 +40,16 @@ defineRouteMeta({
               mounts: { type: 'array', items: { $ref: '#/components/schemas/MountConfig' } },
               initScript: { type: 'string' },
               environmentId: { type: 'string' },
+              workerSelfApiAccess: { type: 'string', enum: ['inherit', 'allow', 'deny'] },
+              effectiveWorkerSelfApiAccess: {
+                type: 'object',
+                properties: {
+                  allowed: { type: 'boolean' },
+                  decision: { type: 'string', enum: ['allow', 'deny'] },
+                  source: { type: 'string', enum: ['worker', 'group', 'default', 'invalid-group-hierarchy'] },
+                  groupId: { type: 'string' },
+                },
+              },
             },
           },
         },
@@ -48,12 +58,16 @@ defineRouteMeta({
   },
 });
 
-import { useContainerManager } from '../../utils/services';
+import { useContainerManager, useWorkerGroupStore } from '../../utils/services';
 import { requireAuth } from '../../utils/auth-helpers';
+import { withEffectiveWorkerSelfApiAccess } from '../../utils/worker-self-access';
 
 export default defineEventHandler((event) => {
   const { user } = requireAuth(event);
   const all = useContainerManager().listArchived();
-  if (user.role === 'admin') return all;
-  return all.filter((w) => w.userId === user.id);
+  const visible = user.role === 'admin' ? all : all.filter((w) => w.userId === user.id);
+  const groups = user.role === 'admin'
+    ? useWorkerGroupStore().list()
+    : useWorkerGroupStore().listForUser(user.id);
+  return visible.map((worker) => withEffectiveWorkerSelfApiAccess(worker, groups));
 });

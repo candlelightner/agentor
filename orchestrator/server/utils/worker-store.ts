@@ -3,6 +3,7 @@ import type {
   RepoConfig,
   MountConfig,
   UserOwnedResource,
+  WorkerSelfApiAccess,
 } from "../../shared/types";
 
 /** Persisted worker metadata — intentionally minimal. It stores ONLY what cannot
@@ -39,6 +40,8 @@ export interface WorkerRecord extends UserOwnedResource {
   /** Account env-var names intentionally excluded; absent legacy value means []. */
   excludedGlobalEnvVarKeys?: string[];
   excludedGroupEnvVarKeys?: string[];
+  /** Live worker-self API override. Missing legacy values inherit (allow). */
+  workerSelfApiAccess?: WorkerSelfApiAccess;
   repos?: RepoConfig[];
   mounts?: MountConfig[];
   initScript?: string;
