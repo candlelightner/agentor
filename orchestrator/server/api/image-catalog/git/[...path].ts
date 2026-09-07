@@ -26,12 +26,16 @@ function routeError(event: H3Event, error: unknown) {
   // receive actionable, non-secret feedback without reflecting provider
   // errors or credentials.
   if (
-    value.statusCode === 400 &&
-    (value.message ===
-      "GHCR reference digest must match the built image digest" ||
-      value.message === "GHCR references must be immutable digest references")
+    ((value.statusCode === 400 &&
+      (value.message ===
+        "GHCR reference digest must match the built image digest" ||
+        value.message ===
+          "GHCR references must be immutable digest references")) ||
+      (value.statusCode === 409 &&
+        value.message ===
+          "The remote repository does not contain an Agentor image catalog yet. Use Sync local changes to initialize it before Recover / pull."))
   ) {
-    setResponseStatus(event, 400);
+    setResponseStatus(event, value.statusCode);
     return { error: true, message: value.message };
   }
   throw createError({
@@ -56,11 +60,11 @@ export default defineEventHandler(async (event) => {
     if (parts[0] === "connection") {
       if (method === "GET") return manager.connection(user.id);
       if (method === "PUT")
-        return manager.connect(user.id, await readBody(event));
-      if (method === "DELETE") return manager.disconnect(user.id);
+        return await manager.connect(user.id, await readBody(event));
+      if (method === "DELETE") return await manager.disconnect(user.id);
     }
     if (parts[0] === "sync" && method === "POST")
-      return manager.sync(
+      return await manager.sync(
         user.id,
         catalog,
         await readBody(event).catch(() => ({})),
@@ -69,10 +73,15 @@ export default defineEventHandler(async (event) => {
     if (parts[0] === "recovery" && method === "GET")
       return manager.recovery(user.id);
     if (parts[0] === "recovery" && method === "POST")
-      return manager.sync(user.id, catalog, {
-        ...(await readBody(event).catch(() => ({}))),
-        direction: "pull",
-      }, usePluginDefinitionStore());
+      return await manager.sync(
+        user.id,
+        catalog,
+        {
+          ...(await readBody(event).catch(() => ({}))),
+          direction: "pull",
+        },
+        usePluginDefinitionStore(),
+      );
     if (parts[0] === "fake") {
       if (
         process.env.NODE_ENV === "production" &&
@@ -87,7 +96,11 @@ export default defineEventHandler(async (event) => {
         return manager.fakeInspect(user.id);
       if (parts[1] === "remote-files" && method === "PUT") {
         const body = await readBody<any>(event);
-        return manager.fakeSetFiles(user.id, body?.files || {}, body?.branch);
+        return await manager.fakeSetFiles(
+          user.id,
+          body?.files || {},
+          body?.branch,
+        );
       }
     }
     throw Object.assign(new Error("Git image catalog route not found"), {

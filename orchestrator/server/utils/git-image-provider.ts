@@ -290,7 +290,13 @@ export class GitHubRestProvider implements GitImageProvider {
         `/repos/${repository}/git/ref/heads/${encodeURIComponent(branch)}`,
       );
     } catch (e: any) {
-      if (e.statusCode === 404) return { revision: null, files: {} };
+      // GitHub returns 409 (rather than 404) when the repository exists but
+      // has no commits yet. That is the normal precondition for Agentor's
+      // first "Sync local changes" operation, not a remote-change conflict.
+      // This catch is scoped to the read-only ref lookup; write-time 409s keep
+      // their conflict semantics below.
+      if (e.statusCode === 404 || e.statusCode === 409)
+        return { revision: null, files: {} };
       throw e;
     }
     const commitSha = ref.object.sha,

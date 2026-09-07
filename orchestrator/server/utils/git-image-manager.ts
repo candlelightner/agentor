@@ -446,6 +446,14 @@ export class GitImageCatalogManager {
         [],
       imported: string[] = [];
     if (direction === "pull") {
+      if (
+        !remote.files[GIT_IMAGE_CATALOG_PATH] &&
+        !remote.files[LEGACY_GIT_IMAGE_CATALOG_PATH]
+      )
+        fail(
+          409,
+          "The remote repository does not contain an Agentor image catalog yet. Use Sync local changes to initialize it before Recover / pull.",
+        );
       const entries = parseCatalog(remote.files);
       const importedPlugins: string[] = [];
       if (plugins && remote.files[GIT_PLUGIN_CATALOG_PATH]) {

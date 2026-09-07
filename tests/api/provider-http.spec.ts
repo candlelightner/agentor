@@ -576,6 +576,60 @@ test.describe.serial("Provider HTTP boundaries", () => {
     expect(calls).toHaveLength(beforeWrite);
   });
 
+  test("GitHub 409 for an empty repository permits the initial catalog push", async () => {
+    const calls: Array<{ url: string; method: string; body?: string }> = [];
+    const transport: GitHubHttpTransport = async (input, init = {}) => {
+      const url = String(input),
+        method = init.method || "GET",
+        body = init.body === undefined ? undefined : String(init.body);
+      calls.push({ url, method, body });
+      if (method === "GET" && url.includes("/git/ref/heads/main"))
+        return json(
+          { message: "Git Repository is empty." },
+          { status: 409 },
+        );
+      if (method === "POST" && url.endsWith("/git/blobs"))
+        return json({ sha: "blob-sha" }, { status: 201 });
+      if (method === "POST" && url.endsWith("/git/trees"))
+        return json({ sha: "tree-sha" }, { status: 201 });
+      if (method === "POST" && url.endsWith("/git/commits"))
+        return json({ sha: "commit-sha" }, { status: 201 });
+      if (method === "POST" && url.endsWith("/git/refs"))
+        return json({ ref: "refs/heads/main" }, { status: 201 });
+      throw new Error(`Unexpected mock request: ${method} ${url}`);
+    };
+    const provider = new GitHubRestProvider(async () => "token", transport);
+
+    const empty = await provider.read("owner/empty", "main");
+    expect(empty).toEqual({ revision: null, files: {} });
+    await expect(
+      provider.write("owner/empty", {
+        branch: "main",
+        targetBranch: "main",
+        expectedRevision: empty.revision,
+        files: {
+          [GIT_IMAGE_CATALOG_PATH]: JSON.stringify({
+            schema: "https://agentor.dev/schemas/image-catalog/v2",
+            version: 2,
+            entries: [],
+          }),
+        },
+        message: "Initialize Agentor image catalog",
+        workflow: "direct",
+      }),
+    ).resolves.toMatchObject({ revision: "commit-sha", branch: "main" });
+
+    const tree = calls.find((call) => call.url.endsWith("/git/trees"));
+    const commit = calls.find((call) => call.url.endsWith("/git/commits"));
+    const ref = calls.find((call) => call.url.endsWith("/git/refs"));
+    expect(JSON.parse(tree!.body!)).not.toHaveProperty("base_tree");
+    expect(JSON.parse(commit!.body!).parents).toEqual([]);
+    expect(JSON.parse(ref!.body!)).toMatchObject({
+      ref: "refs/heads/main",
+      sha: "commit-sha",
+    });
+  });
+
   test("GitHub pull-request reconciliation reuses an open head and recovers a lost create response", async () => {
     const calls: Array<{ url: string; method: string }> = [];
     let existing = true;

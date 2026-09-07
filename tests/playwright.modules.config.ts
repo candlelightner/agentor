@@ -10,6 +10,7 @@ export default defineConfig({
     "api/instance-backup-*.spec.ts",
     "api/instance-restore-helper.spec.ts",
     "api/management-image-backup-domain.spec.ts",
+    "api/provider-http.spec.ts",
     "api/workspace-download-cancellation.spec.ts",
   ],
   fullyParallel: false,

@@ -674,6 +674,33 @@ test("shows whether each image belongs to the global catalog or a worker group",
       .filter({ hasText: "Worker group: Evaluation team" }),
   ).toBeVisible();
 });
+test("explains the effective fine-grained PAT permissions", async ({ page }) => {
+  const m = await open(page);
+  const git = m.locator('[data-testid="git-image-catalog"]');
+  const help = git.getByRole("button", {
+    name: "Required GitHub PAT permissions",
+  });
+  await expect(help).toHaveAttribute("title", /Contents: Read and write/);
+  await expect(help).toHaveAttribute("title", /Pull requests: Read and write/);
+  await expect(help).not.toHaveAttribute("title", /Actions: Read and write/);
+
+  await help.hover();
+  await expect(
+    page.getByText(/Metadata: Read; Contents: Read and write/, {
+      exact: false,
+    }).first(),
+  ).toBeVisible();
+
+  await git
+    .getByLabel("Git catalog synchronization workflow")
+    .selectOption("direct");
+  await git.getByLabel("Git catalog build mode").selectOption("github-actions");
+  await expect(help).not.toHaveAttribute(
+    "title",
+    /Pull requests: Read and write/,
+  );
+  await expect(help).toHaveAttribute("title", /Actions: Read and write/);
+});
 test("connects, syncs, recovers, and disconnects an optional GitHub catalog without conflating workspace backups", async ({
   page,
 }) => {

@@ -42,6 +42,21 @@ const git = reactive({
   buildMode: "local" as "local" | "github-actions",
   publishGhcr: false,
 });
+const gitPatPermissionHelp = computed(() =>
+  [
+    "Fine-grained PAT: select the configured repository.",
+    "Repository permissions — Metadata: Read; Contents: Read and write.",
+    git.workflow === "pull-request"
+      ? "Pull requests: Read and write."
+      : undefined,
+    git.buildMode === "github-actions"
+      ? "Actions: Read and write so Agentor can dispatch the existing workflow."
+      : undefined,
+    "The PAT is stored encrypted and is never copied into builds or workers.",
+  ]
+    .filter(Boolean)
+    .join(" "),
+);
 watch(open, (shown) => (shown ? api.start() : api.stop()));
 onBeforeUnmount(api.stop);
 const current = computed(
@@ -62,7 +77,10 @@ async function run(key: string, fn: () => Promise<any>) {
       e?.data?.data?.diagnostic || e?.data?.diagnostic,
     );
     actionError.value = [
-      e?.data?.statusMessage || e?.message || "Image operation failed.",
+      e?.data?.message ||
+        e?.data?.statusMessage ||
+        e?.message ||
+        "Image operation failed.",
       structured,
     ]
       .filter(
@@ -466,7 +484,11 @@ function close() {
               <option value="private">Private</option>
               <option value="public">Public</option>
             </select>
-            <select v-model="git.workflow" class="border rounded p-2">
+            <select
+              v-model="git.workflow"
+              class="border rounded p-2"
+              aria-label="Git catalog synchronization workflow"
+            >
               <option value="pull-request">Pull request</option>
               <option value="branch">Branch</option>
               <option value="direct">Direct</option>
@@ -478,15 +500,30 @@ function close() {
                 Public, no token
               </option>
             </select>
-            <input
+            <div
               v-if="git.authType === 'pat'"
-              v-model="git.token"
-              type="password"
-              autocomplete="off"
-              class="border rounded p-2"
-              placeholder="Fine-grained PAT"
-              aria-label="Fine-grained GitHub token"
-            />
+              class="flex min-w-0 items-center gap-1"
+            >
+              <input
+                v-model="git.token"
+                type="password"
+                autocomplete="off"
+                class="min-w-0 flex-1 border rounded p-2"
+                placeholder="Fine-grained PAT"
+                aria-label="Fine-grained GitHub token"
+              />
+              <UTooltip :text="gitPatPermissionHelp">
+                <UButton
+                  type="button"
+                  size="xs"
+                  color="neutral"
+                  variant="ghost"
+                  icon="i-lucide-circle-help"
+                  aria-label="Required GitHub PAT permissions"
+                  :title="gitPatPermissionHelp"
+                />
+              </UTooltip>
+            </div>
             <div v-else-if="git.authType === 'github-app'" class="flex gap-1">
               <input
                 v-model="git.appId"
@@ -516,6 +553,7 @@ function close() {
             <select
               v-model="git.buildMode"
               class="border rounded p-2 md:col-span-2"
+              aria-label="Git catalog build mode"
             >
               <option value="local">Build locally</option>
               <option value="github-actions">Build with GitHub Actions</option>

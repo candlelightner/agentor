@@ -166,6 +166,17 @@ test.describe
     }
   });
 
+  test("pull from an uninitialized repository explains how to seed it", async () => {
+    const response = await ctx.post("/api/image-catalog/git/sync", {
+      data: { direction: "pull" },
+    });
+    expect(response.status()).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: true,
+      message: expect.stringContaining("Use Sync local changes"),
+    });
+  });
+
   test("sync writes Dockerfile, metadata, context, digests, local/Actions and GHCR metadata without secrets", async () => {
     const definition = await createDefinition(ctx, `git-primary-${Date.now()}`);
     const plugin = await createPluginDefinition(ctx, String(Date.now()));
