@@ -127,8 +127,10 @@ test.describe('Worker export root filesystem format compatibility', () => {
         { name: 'usr/bin/tool', body: Buffer.from('ok') },
         { name: 'device', body: Buffer.alloc(0), type: '3' },
         { name: 'pipe', body: Buffer.alloc(0), type: '6' },
+        { name: 'overlay/diff/.wh.package', body: Buffer.alloc(0), type: '3' },
+        { name: 'overlay/work/#whiteout', body: Buffer.alloc(0), type: '1', linkname: 'overlay/diff/.wh.package' },
       ]));
-      await expect(sanitizeBackupPathTarPayload(safe, output, '/')).resolves.toEqual({ omittedSpecialEntries: 2 });
+      await expect(sanitizeBackupPathTarPayload(safe, output, '/')).resolves.toEqual({ omittedSpecialEntries: 4 });
       const sanitized = await (await import('node:fs/promises')).readFile(output);
       expect(sanitized.includes(Buffer.from('usr/bin'))).toBe(true);
       expect(sanitized.includes(Buffer.from('device'))).toBe(false);

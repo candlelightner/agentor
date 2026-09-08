@@ -350,6 +350,8 @@ export async function sanitizeBackupPathTarPayload(
   let entries = 0;
   let omittedSpecialEntries = 0;
   const kinds = new Map<string, "file" | "directory" | "symlink" | "link">();
+  const omittedSpecialNames = new Set<string>();
+  const descendantParents = new Set<string>();
   const extract = tar.extract();
   const pack = tar.pack();
   const counter = new Transform({
@@ -383,6 +385,9 @@ export async function sanitizeBackupPathTarPayload(
         // Omit non-portable special entries. Consume their bodies so tar-stream
         // can continue parsing the trusted Docker archive.
         omittedSpecialEntries += 1;
+        try {
+          omittedSpecialNames.add(archiveMemberName(header.name));
+        } catch {}
         stream.on("end", next);
         stream.resume();
         return;
@@ -397,13 +402,26 @@ export async function sanitizeBackupPathTarPayload(
       }
       const name = archiveMemberName(header.name);
       assertBackupMemberWithinSelection(name, selectedPath);
-      assertArchiveTreeSafe(kinds, name, type);
+      assertArchiveTreeSafe(kinds, descendantParents, name, type);
       const linkname = typeof header.linkname === "string" ? header.linkname : "";
       if (type === "symlink") assertSafeSymlinkTarget(linkname, selectedPath, name);
-      if (type === "link") assertSafeHardlinkTarget(kinds, name, linkname);
+      if (
+        type === "link" &&
+        hardlinkTargetWasOmitted(kinds, omittedSpecialNames, name, linkname)
+      ) {
+        // OverlayFS can hardlink work-directory markers to character-device
+        // whiteouts. The special target was deliberately omitted above, so
+        // omit its hardlink as the same non-portable entry.
+        omittedSpecialEntries += 1;
+        omittedSpecialNames.add(name);
+        stream.on("end", next);
+        stream.resume();
+        return;
+      }
       const uid = validatedArchiveOwnerId(header.uid, "uid");
       const gid = validatedArchiveOwnerId(header.gid, "gid");
       kinds.set(name, type);
+      rememberArchiveParents(descendantParents, name);
       const safeHeader: tar.Headers = {
         name,
         type,
@@ -484,6 +502,7 @@ function backupEntryType(value: unknown): "file" | "directory" | "symlink" | "li
 
 function assertArchiveTreeSafe(
   kinds: Map<string, "file" | "directory" | "symlink" | "link">,
+  descendantParents: Set<string>,
   name: string,
   type: "file" | "directory" | "symlink" | "link",
 ) {
@@ -495,9 +514,14 @@ function assertArchiveTreeSafe(
     if (ancestor && ancestor !== "directory")
       throw new Error("Invalid backup path archive: entry traverses a non-directory");
   }
-  for (const existing of kinds.keys())
-    if (existing.startsWith(`${name}/`) && type !== "directory")
-      throw new Error("Invalid backup path archive: entry replaces an existing parent");
+  if (descendantParents.has(name) && type !== "directory")
+    throw new Error("Invalid backup path archive: entry replaces an existing parent");
+}
+
+function rememberArchiveParents(parents: Set<string>, name: string) {
+  const parts = name.split("/");
+  for (let index = 1; index < parts.length; index += 1)
+    parents.add(parts.slice(0, index).join("/"));
 }
 
 function assertSafeSymlinkTarget(target: string, selectedPath: string, member: string) {
@@ -524,18 +548,22 @@ function resolveInsideRoot(value: string): string | undefined {
   return `/${segments.join("/")}`;
 }
 
-function assertSafeHardlinkTarget(
+function hardlinkTargetWasOmitted(
   kinds: Map<string, "file" | "directory" | "symlink" | "link">,
+  omittedSpecialNames: Set<string>,
   name: string,
   target: string,
-) {
+): boolean {
   if (!target || target.startsWith("/") || target.includes("\0") || target.includes("\\"))
     throw new Error("Invalid backup path archive: unsafe hardlink target");
   const direct = tryArchiveRelative(target);
   const relative = tryArchiveRelative(posixPath.join(posixPath.dirname(name), target));
-  const resolved = [direct, relative].find((candidate) => candidate && kinds.get(candidate) === "file");
-  if (!resolved)
-    throw new Error("Invalid backup path archive: hardlink target must be an earlier regular file in the archive");
+  const candidates = [direct, relative].filter(
+    (candidate): candidate is string => Boolean(candidate),
+  );
+  if (candidates.some((candidate) => kinds.get(candidate) === "file")) return false;
+  if (candidates.some((candidate) => omittedSpecialNames.has(candidate))) return true;
+  throw new Error("Invalid backup path archive: hardlink target must be an earlier regular file in the archive");
 }
 
 function tryArchiveRelative(value: string): string | undefined {
