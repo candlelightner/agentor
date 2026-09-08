@@ -115,6 +115,46 @@ test("Git catalog parses legacy v1 fragments and v2 structured provisioning", ()
   ).toThrow("secret values");
 });
 
+test("Git catalog preserves metadata context order after a Git tree read", () => {
+  const exported = serializeCatalog(
+    [
+      {
+        id: "ordered-context",
+        ownerId: "owner",
+        ...definition("ordered-context"),
+        contextFiles: [
+          {
+            path: "z-setup.sh",
+            contentBase64: Buffer.from("echo setup").toString("base64"),
+            role: "asset" as const,
+          },
+          {
+            path: "a-readme.md",
+            contentBase64: Buffer.from("readme").toString("base64"),
+            role: "asset" as const,
+          },
+        ],
+        provisioningMode: "safe" as const,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        versions: [],
+      },
+    ],
+    { buildMode: "local" },
+  );
+  const gitTreeOrder = Object.fromEntries(
+    Object.entries(exported).sort(([left], [right]) =>
+      left.localeCompare(right),
+    ),
+  );
+
+  expect(
+    parseCatalog(gitTreeOrder)[0]?.definition.contextFiles.map(
+      (file) => file.path,
+    ),
+  ).toEqual(["z-setup.sh", "a-readme.md"]);
+});
+
 test("legacy v1 Git catalog pulls remain idempotent after current-format recovery", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agentor-git-v1-pull-"));
   const catalogDirectory = await mkdtemp(

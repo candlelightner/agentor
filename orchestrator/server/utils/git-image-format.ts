@@ -306,23 +306,21 @@ export function parseCatalog(files: GitFileMap): Array<{
     const contextMetadata = Array.isArray(metadata.contextFiles)
       ? metadata.contextFiles
       : [];
-    const allContextFiles = Object.entries(files)
-      .filter(([p]) => p.startsWith(entry.contextPrefix))
-      .map(([p, contentBase64]) => {
-        const path = safeContext(p.slice(entry.contextPrefix.length));
-        const detail = contextMetadata.find(
-          (value: any) => value?.path === path,
-        );
-        return {
-          path,
-          contentBase64,
-          ...(detail?.role ? { role: detail.role } : {}),
-          ...(detail?.destination ? { destination: detail.destination } : {}),
-        };
-      });
-    const contextFiles = allContextFiles.filter((file) =>
-      contextMetadata.some((detail: any) => detail?.path === file.path),
-    );
+    // Git tree responses are path-sorted, while the context order is part of
+    // the rendered Dockerfile. Reconstruct from metadata order so a remote
+    // round trip preserves the definition that was originally hashed.
+    const contextFiles = contextMetadata.map((detail: any) => {
+      const path = safeContext(detail?.path);
+      const contentBase64 = files[`${entry.contextPrefix}${path}`];
+      if (typeof contentBase64 !== "string")
+        throw new Error(`Catalog entry ${entry.id} context is incomplete`);
+      return {
+        path,
+        contentBase64,
+        ...(detail?.role ? { role: detail.role } : {}),
+        ...(detail?.destination ? { destination: detail.destination } : {}),
+      };
+    });
     const fragmentWithTerminator = dockerfile.slice(
       `FROM ${entry.baseImage}\n`.length,
     );
