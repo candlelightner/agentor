@@ -67,7 +67,7 @@ async function writeTarGzip(
   entries: Array<{
     name: string;
     body?: string | Buffer;
-    type?: "file" | "directory" | "symlink";
+    type?: "file" | "directory" | "symlink" | "link";
     linkname?: string;
   }>,
 ) {
@@ -488,6 +488,12 @@ test.describe("controlled instance restore helper", () => {
     await writeTarGzip(volumeArchive, [
       { name: "source/", type: "directory" },
       { name: "source/workspace.txt", body: "workspace" },
+      { name: "source/workspace-copy.txt", type: "link", linkname: "source/workspace.txt" },
+      {
+        name: "source/.venv/bin/python3",
+        type: "symlink",
+        linkname: "/usr/bin/python3",
+      },
     ]);
     prepared.plan.volumes = [
       {

@@ -696,6 +696,8 @@ export class InstanceBackupManager {
       };
       await this.phase(job, "packing", 65, "Packing the authenticated instance recovery bundle.");
       await packInstanceBundle(manifest, dataArchive, volumes, bundle, signal);
+      await this.phase(job, "verifying", 70, "Validating the manifest and every nested archive before encryption.");
+      await inspectInstanceBundle(bundle, join(stage, "verification"), signal);
       const recovery = await this.backupManager.resolveInstanceRecoveryMaterial(job.userId);
       if (!recovery) throw new Error("Backup recovery key is unavailable");
       await this.phase(job, "encrypting", 75, "Encrypting the instance bundle before provider access.");

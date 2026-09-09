@@ -225,6 +225,12 @@ test.describe("instance disaster-recovery bundle boundary", () => {
     await writeTarGzip(volumeArchive, [
       { name: "source/", type: "directory" },
       { name: "source/workspace.txt", body: "workspace data" },
+      { name: "source/workspace-copy.txt", type: "link", linkname: "source/workspace.txt" },
+      {
+        name: "source/.venv/bin/python3",
+        type: "symlink",
+        linkname: "/usr/bin/python3",
+      },
     ]);
     const volumeName = "agentor-worker-safe-workspace";
     const volume = {

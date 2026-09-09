@@ -379,6 +379,55 @@ test("worker and agent-data options filter Docker volumes while the write barrie
   }
 });
 
+test("create validates nested archives before publishing an instance artifact", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agentor-instance-create-validation-"));
+  const provider = new FakeBackupProvider(join(root, "provider"));
+  const owner = "platform-admin";
+  const recoveryMaterial = Buffer.alloc(32, 57).toString("base64");
+  const manager = new InstanceBackupManager({
+    dataDir: join(root, "data"),
+    backupManager: {
+      instanceBackupProvider: () => provider,
+      resolveInstanceRecoveryMaterial: async () => ({
+        fingerprint: backupKeyFingerprint(recoveryMaterial),
+        material: recoveryMaterial,
+      }),
+    } as unknown as BackupManager,
+    preflightCreate: async () => {},
+    authSnapshot: async (destination) => writeFile(destination, "sqlite snapshot"),
+    inventory: async () => ({
+      ...inventory(),
+      volumes: [
+        {
+          name: "worker-workspace",
+          kind: "worker-workspace" as const,
+          workerId: "worker-1",
+        },
+      ],
+    }),
+  });
+  (manager as any).snapshotVolume = async (_name: string, output: string) => {
+    await writeFile(output, "not a gzip archive");
+    return true;
+  };
+  try {
+    const job = await manager.create(
+      owner,
+      "fake",
+      { includeDockerVolumes: true },
+      "create-validation",
+    );
+    await expect(settled(manager, job.id)).resolves.toMatchObject({
+      status: "failed",
+      errorCode: "INSTANCE_BACKUP_INVALID",
+    });
+    expect((await manager.list(owner)).artifacts).toHaveLength(0);
+  } finally {
+    manager.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("the control-plane snapshot write barrier is exclusive and releases idempotently", () => {
   const release = beginInstanceSnapshot("snapshot-job-1");
   expect(instanceSnapshotActive()).toBe(true);

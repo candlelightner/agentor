@@ -458,7 +458,7 @@ async function validateTarGzip(
   let bytes = 0;
   let entries = 0;
   let authDb = false;
-  const tree = new Map<string, "file" | "directory" | "symlink">();
+  const tree = new Map<string, "file" | "directory" | "symlink" | "hardlink">();
   const extract = tar.extract();
   const expanded = new Transform({
     transform(chunk, _encoding, callback) {
@@ -495,6 +495,10 @@ async function validateTarGzip(
           header.linkname,
           requireAuthDb ? undefined : "source",
         );
+      } else if (kind === "hardlink") {
+        if (requireAuthDb)
+          throw new Error("Instance backup archive contains a special entry");
+        assertContainedHardlink(tree, header.linkname, "source");
       } else if (header.linkname)
         throw new Error("Instance backup archive contains an unexpected link target");
       tree.set(name, kind);
@@ -518,9 +522,9 @@ async function validateTarGzip(
 }
 
 function assertTreeEntry(
-  tree: Map<string, "file" | "directory" | "symlink">,
+  tree: Map<string, "file" | "directory" | "symlink" | "hardlink">,
   name: string,
-  kind: "file" | "directory" | "symlink",
+  kind: "file" | "directory" | "symlink" | "hardlink",
 ) {
   if (tree.has(name)) throw new Error("Instance backup archive has a duplicate entry");
   const parts = name.split("/");
@@ -601,7 +605,25 @@ function normalizedEntryKind(value: unknown) {
   if (value === "file") return "file" as const;
   if (value === "directory") return "directory" as const;
   if (value === "symlink") return "symlink" as const;
+  if (value === "link") return "hardlink" as const;
   return undefined;
+}
+
+function assertContainedHardlink(
+  tree: Map<string, "file" | "directory" | "symlink" | "hardlink">,
+  linkname: unknown,
+  requiredRoot: string,
+) {
+  if (typeof linkname !== "string")
+    throw new Error("Instance backup archive contains an unsafe hard link");
+  const target = safeTarName(linkname);
+  if (
+    (target !== requiredRoot && !target.startsWith(`${requiredRoot}/`)) ||
+    tree.get(target) !== "file"
+  )
+    throw new Error(
+      "Instance backup archive hard link must target a prior regular file inside its archive root",
+    );
 }
 
 function assertContainedSymlink(
@@ -613,10 +635,17 @@ function assertContainedSymlink(
     typeof linkname !== "string" ||
     !linkname ||
     linkname.includes("\0") ||
-    linkname.length > 4096 ||
-    posix.isAbsolute(linkname)
+    linkname.length > 4096
   )
     throw new Error("Instance backup archive contains an unsafe symlink");
+
+  // Docker volume payloads are restored into an isolated helper container.
+  // Their prevalidated entry tree cannot write through a symlink, while the
+  // preserved link may legitimately target the eventual worker filesystem.
+  if (posix.isAbsolute(linkname)) {
+    if (requiredRoot) return;
+    throw new Error("Instance backup archive contains an unsafe symlink");
+  }
   const resolved = posix.normalize(posix.join(posix.dirname(entryName), linkname));
   if (
     !resolved ||

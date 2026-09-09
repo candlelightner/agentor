@@ -432,7 +432,7 @@ async function extractDataArchive(archive, destination) {
 async function handleDataEntry(header, stream, destination, kinds, directoryMetadata) {
   const name = safeTarName(header.name);
   const kind = entryKind(header.type);
-  if (!kind)
+  if (!kind || kind === "hardlink")
     throw new SafeRestoreError("Instance data archive contains a special entry", "INSTANCE_RESTORE_INVALID_ARCHIVE");
   if (RESERVED_TOP_LEVEL.has(name.split("/")[0]) || name === JOB_STORE_RELATIVE)
     throw new SafeRestoreError("Instance data archive uses a reserved recovery path", "INSTANCE_RESTORE_INVALID_ARCHIVE");
@@ -525,6 +525,7 @@ async function validateVolumeArchive(archive) {
       assertTreeSafe(kinds, name, kind);
       assertHeader(header, kind);
       if (kind === "symlink") assertContainedSymlink(name, header.linkname, "source");
+      if (kind === "hardlink") assertContainedHardlink(kinds, header.linkname, "source");
       kinds.set(name, kind);
       entries += 1;
       payloadBytes += kind === "file" ? safeSize(header.size) : 0;
@@ -950,7 +951,7 @@ async function verifySqliteHeader(path) {
 function assertHeader(header, kind) {
   if (kind !== "file" && header.size !== 0)
     throw new SafeRestoreError("Instance archive contains an invalid non-file payload", "INSTANCE_RESTORE_INVALID_ARCHIVE");
-  if (kind !== "symlink" && header.linkname)
+  if (kind !== "symlink" && kind !== "hardlink" && header.linkname)
     throw new SafeRestoreError("Instance archive contains an unexpected link target", "INSTANCE_RESTORE_INVALID_ARCHIVE");
   if (kind === "file") safeSize(header.size);
   safeMode(header.mode);
@@ -1010,15 +1011,36 @@ function safeTarName(value) {
   return normalized;
 }
 
+function assertContainedHardlink(kinds, linkname, requiredRoot) {
+  if (typeof linkname !== "string")
+    throw new SafeRestoreError("Instance archive contains an unsafe hard link", "INSTANCE_RESTORE_INVALID_ARCHIVE");
+  const target = safeTarName(linkname);
+  if (
+    (target !== requiredRoot && !target.startsWith(`${requiredRoot}/`)) ||
+    kinds.get(target) !== "file"
+  )
+    throw new SafeRestoreError(
+      "Instance archive hard link must target a prior regular file inside its archive root",
+      "INSTANCE_RESTORE_INVALID_ARCHIVE",
+    );
+}
+
 function assertContainedSymlink(entryName, linkname, requiredRoot) {
   if (
     typeof linkname !== "string" ||
     !linkname ||
     linkname.includes("\0") ||
-    linkname.length > 4096 ||
-    posix.isAbsolute(linkname)
+    linkname.length > 4096
   )
     throw new SafeRestoreError("Instance archive contains an unsafe symlink", "INSTANCE_RESTORE_INVALID_ARCHIVE");
+
+  // Docker volume payloads are restored into an isolated helper container.
+  // Their prevalidated entry tree cannot write through a symlink, while the
+  // preserved link may legitimately target the eventual worker filesystem.
+  if (posix.isAbsolute(linkname)) {
+    if (requiredRoot) return;
+    throw new SafeRestoreError("Instance archive contains an unsafe symlink", "INSTANCE_RESTORE_INVALID_ARCHIVE");
+  }
   const resolvedTarget = posix.normalize(
     posix.join(posix.dirname(entryName), linkname),
   );
@@ -1035,6 +1057,7 @@ function assertContainedSymlink(entryName, linkname, requiredRoot) {
 
 function entryKind(value) {
   if (value === "file" || value === "directory" || value === "symlink") return value;
+  if (value === "link") return "hardlink";
   return undefined;
 }
 
