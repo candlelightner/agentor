@@ -130,6 +130,11 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 400, statusMessage: mountError });
   }
 
+  const hardwareDeviceIds = body.hardwareDeviceIds;
+  if (hardwareDeviceIds !== undefined &&
+      (!Array.isArray(hardwareDeviceIds) || hardwareDeviceIds.some((id: unknown) => typeof id !== "string" || !id)))
+    throw createError({ statusCode: 400, statusMessage: "hardwareDeviceIds must be an array of non-empty strings" });
+
   if (
     body.workerGroupId !== undefined &&
     typeof body.workerGroupId !== "string"
@@ -192,6 +197,7 @@ export default defineEventHandler(async (event) => {
     displayName: body.displayName || undefined,
     repos: parsedRepos,
     mounts: parsedMounts,
+    hardwareDeviceIds,
     environmentId: body.environmentId || undefined,
     excludedGlobalEnvVarKeys: body.excludedGlobalEnvVarKeys,
     workerSelfApiAccess: body.workerSelfApiAccess,

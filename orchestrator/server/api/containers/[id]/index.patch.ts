@@ -145,6 +145,12 @@ export default defineEventHandler(async (event) => {
     patch.repos = repos;
   }
 
+  if (body.hardwareDeviceIds !== undefined && body.hardwareDeviceIds !== null) {
+    const ids = parseArray(body.hardwareDeviceIds, 'hardwareDeviceIds');
+    if (ids.some((id) => typeof id !== 'string' || !id)) bad('hardwareDeviceIds must contain non-empty strings');
+    patch.hardwareDeviceIds = [...new Set(ids as string[])];
+  }
+
   // --- mounts (rebuild) ---
   if (body.mounts !== undefined && body.mounts !== null) {
     const arr = parseArray(body.mounts, 'mounts');

@@ -627,12 +627,15 @@ function safeMessage(error: unknown) {
 
 async function reconcileHostMountsAfterGroupChange(userId: string) {
   const { useContainerManager } = await import("./services");
-  const result = await useContainerManager().reconcileHostMountAccess(userId);
-  if (result.failures.length)
+  const [mounts, devices] = await Promise.all([
+    useContainerManager().reconcileHostMountAccess(userId),
+    useContainerManager().reconcileHardwareDeviceAccess(userId),
+  ]);
+  if (mounts.failures.length || devices.failures.length)
     throw createError({
       statusCode: 409,
       statusMessage:
-        "Worker group changed, but one or more workers with revoked host mounts could not be stopped. Rebuild or stop the affected workers immediately.",
-      data: result,
+        "Worker group changed, but one or more workers with revoked host mounts or hardware devices could not be stopped. Rebuild or stop the affected workers immediately.",
+      data: { mounts, devices },
     });
 }

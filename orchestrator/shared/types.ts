@@ -40,6 +40,57 @@ export interface HostMountGrant {
   updatedAt: string;
 }
 
+export type HardwareDeviceKind = "gpu" | "usb";
+
+/** A host device discovered by a hardened, read-only Docker probe. `selector`
+ * is stable across device-node renumbering; live node paths are resolved again
+ * immediately before Docker creates a worker. */
+export interface HardwareDevice {
+  schemaVersion: 1;
+  id: string;
+  name: string;
+  kind: HardwareDeviceKind;
+  selector: string;
+  vendor?: string;
+  product?: string;
+  serial?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface HardwareDeviceCandidate {
+  name: string;
+  kind: HardwareDeviceKind;
+  selector: string;
+  vendor?: string;
+  product?: string;
+  serial?: string;
+  deviceNodes: string[];
+  groupIds: number[];
+}
+
+export type HardwareDeviceGrantTarget = HostMountGrantTarget;
+
+export interface HardwareDeviceGrant {
+  schemaVersion: 1;
+  id: string;
+  userId: string;
+  deviceId: string;
+  targetType: HardwareDeviceGrantTarget;
+  targetId?: string;
+  grantorType: "platform" | "owner" | "group";
+  grantorGroupId?: string;
+  parentGrantId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ResolvedHardwareDevice {
+  deviceId: string;
+  deviceNodes: string[];
+  groupIds: number[];
+}
+
 /**
  * Common shape shared by every persisted resource. Resources extend this (and
  * usually `UserOwnedResource`) and add their own fields — keeping the model
@@ -169,6 +220,7 @@ export interface ContainerInfo extends UserOwnedResource {
   runtimeDiagnostic?: WorkerRuntimeDiagnostic;
   repos?: RepoConfig[];
   mounts?: MountConfig[];
+  hardwareDeviceIds?: string[];
   initScript?: string;
   /** Foreign key to the assigned environment. The environment's own config (CPU /
    * memory / network / docker / setup script / env vars / exposed APIs /
@@ -192,6 +244,9 @@ export interface ContainerInfo extends UserOwnedResource {
   /** A formerly active host bind was revoked. The stopped container must not
    * be restarted until a rebuild has recreated it without that bind. */
   hostMountsRevoked?: boolean;
+  /** A formerly active device assignment was revoked. Rebuild must replace the
+   * immutable Docker device mapping before this worker may restart. */
+  hardwareDevicesRevoked?: boolean;
   /** Set on workers restored from an export that captured the source container's
    * filesystem. The per-worker imported image the worker runs (reused across
    * rebuild/unarchive). Unset for normal workers running the standard image. */
@@ -209,6 +264,7 @@ export interface CreateContainerRequest {
   displayName?: string;
   repos?: RepoConfig[];
   mounts?: MountConfig[];
+  hardwareDeviceIds?: string[];
   /** Foreign key to the environment whose config (incl. CPU/memory limits) the
    * worker is built with. Resource limits are an environment property — there is
    * no per-worker limit override. */
@@ -257,6 +313,7 @@ export interface UpdateContainerSettingsRequest {
   initScript?: string;
   repos?: RepoConfig[];
   mounts?: MountConfig[];
+  hardwareDeviceIds?: string[];
   excludedGlobalEnvVarKeys?: string[];
   excludedGroupEnvVarKeys?: string[];
   /** Applied immediately by the orchestrator; never requires a rebuild. */

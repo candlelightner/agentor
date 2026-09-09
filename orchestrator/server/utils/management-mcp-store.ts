@@ -64,6 +64,7 @@ import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 import { withOwnerWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
 import { ManagementPluginDomain } from "./management-plugin-domain";
 import { ManagementHostMountDomain } from "./management-host-mount-domain";
+import { ManagementHardwareDeviceDomain } from "./management-hardware-device-domain";
 import {
   instanceControlPlaneBarrierKind,
   instanceSnapshotActive,
@@ -151,6 +152,9 @@ const GROUP_ADMIN_TOOLS = new Set([
   "host-mounts.delegations.list",
   "host-mounts.delegations.create",
   "host-mounts.delegations.delete",
+  "hardware-devices.delegations.list",
+  "hardware-devices.delegations.create",
+  "hardware-devices.delegations.delete",
   "files.list",
   "files.upload",
   "files.mkdir",
@@ -226,6 +230,9 @@ const GROUP_ADMIN_TARGET_FREE_TOOLS = new Set([
   "host-mounts.delegations.list",
   "host-mounts.delegations.create",
   "host-mounts.delegations.delete",
+  "hardware-devices.delegations.list",
+  "hardware-devices.delegations.create",
+  "hardware-devices.delegations.delete",
 ]);
 const GROUP_ADMIN_NETWORK_TOOLS = new Set([
   "networks.inspect",
@@ -360,6 +367,7 @@ const importDomain = new ManagementImportDomain();
 const downloadDomain = new ManagementDownloadDomain();
 const pluginDomain = new ManagementPluginDomain();
 const hostMountDomain = new ManagementHostMountDomain();
+const hardwareDeviceDomain = new ManagementHardwareDeviceDomain();
 interface Policy {
   schemaVersion: 1;
   default: "deny";
@@ -456,6 +464,7 @@ for (const tool of globalConfigurationDomain.tools())
 for (const tool of importDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 for (const tool of pluginDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 for (const tool of hostMountDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
+for (const tool of hardwareDeviceDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 const sensitive =
   /secret|token|credential|password|authorization|cookie|cipher|key|providerUploadId|pendingProvider(?:Object|Artifact|Upload)Id/i;
 export function cleanManagementAuditDetails(value: unknown, depth = 0): any {
@@ -713,6 +722,7 @@ export class ManagementMcpStore {
         const imports = importDomain.tools().find((tool) => tool.name === name);
         const plugin = pluginDomain.tools().find((tool) => tool.name === name);
         const hostMount = hostMountDomain.tools().find((tool) => tool.name === name);
+        const hardwareDevice = hardwareDeviceDomain.tools().find((tool) => tool.name === name);
         return {
           name,
           description:
@@ -741,6 +751,7 @@ export class ManagementMcpStore {
             imports?.description ||
             plugin?.description ||
             hostMount?.description ||
+            hardwareDevice?.description ||
             `Agentor management tool (${TOOL_GROUP[name]})`,
           inputSchema:
             (identity?.scope === "group" && name === "workers.create"
@@ -767,6 +778,7 @@ export class ManagementMcpStore {
             imports?.inputSchema ||
             plugin?.inputSchema ||
             hostMount?.inputSchema ||
+            hardwareDevice?.inputSchema ||
             toolInputSchema(name),
           annotations:
             domain?.annotations ||
@@ -782,6 +794,7 @@ export class ManagementMcpStore {
             imports?.annotations ||
             plugin?.annotations ||
             hostMount?.annotations ||
+            hardwareDevice?.annotations ||
             toolAnnotations(name),
         };
       });
@@ -1522,6 +1535,8 @@ export class ManagementMcpStore {
     if (globalConfiguration.handled) return globalConfiguration.result;
     const hostMount = await hostMountDomain.execute(name, args, identity);
     if (hostMount.handled) return hostMount.result;
+    const hardwareDevice = await hardwareDeviceDomain.execute(name, args, identity);
+    if (hardwareDevice.handled) return hardwareDevice.result;
     const imported = await importDomain.execute(name, args, workspaceId);
     if (imported.handled) return imported.result;
     const plugin = await withinManagementFailFastDeadline(
@@ -2458,6 +2473,7 @@ function validateToolArguments(name: string, args: Record<string, unknown>) {
     ...importDomain.tools(),
     ...pluginDomain.tools(),
     ...hostMountDomain.tools(),
+    ...hardwareDeviceDomain.tools(),
   ];
   const schema =
     definitions.find((tool) => tool.name === name)?.inputSchema ||

@@ -136,6 +136,7 @@ import type {
   UserEnvVars,
   WorkerGroupLifecycleAction,
   WorkerGroupLifecycleResult,
+  ResolvedHardwareDevice,
 } from "../../shared/types";
 import {
   normalizeClientPath,
@@ -954,6 +955,7 @@ export class ContainerManager {
           : {}),
         repos: worker.repos,
         mounts: worker.mounts,
+        hardwareDeviceIds: worker.hardwareDeviceIds,
         initScript: worker.initScript,
         environmentId: worker.environmentId,
         excludedGlobalEnvVarKeys: worker.excludedGlobalEnvVarKeys ?? [],
@@ -961,6 +963,7 @@ export class ContainerManager {
         workerSelfApiAccess: worker.workerSelfApiAccess,
         pendingRebuild: worker.pendingRebuild,
         hostMountsRevoked: worker.hostMountsRevoked,
+        hardwareDevicesRevoked: worker.hardwareDevicesRevoked,
         importedImage: worker.importedImage,
         imageDefinitionId: worker.imageDefinitionId,
         imageVersion: worker.imageVersion,
@@ -1139,6 +1142,44 @@ export class ContainerManager {
     );
   }
 
+  private async resolveHardwareDeviceAccess(
+    userId: string,
+    workerId: string,
+    deviceIds: string[] | undefined,
+    targetGroupId: string | undefined,
+    live: true,
+  ): Promise<ResolvedHardwareDevice[] | undefined>;
+  private async resolveHardwareDeviceAccess(
+    userId: string,
+    workerId: string,
+    deviceIds: string[] | undefined,
+    targetGroupId?: string,
+    live?: false,
+  ): Promise<string[] | undefined>;
+  private async resolveHardwareDeviceAccess(
+    userId: string,
+    workerId: string,
+    deviceIds: string[] | undefined,
+    targetGroupId?: string,
+    live = false,
+  ): Promise<string[] | ResolvedHardwareDevice[] | undefined> {
+    const { useHardwareDeviceStore, useWorkerGroupStore } = await import("./services");
+    let directGroupId = targetGroupId;
+    if (directGroupId && !useWorkerGroupStore().get(userId, directGroupId))
+      throw Object.assign(new Error("Worker group not found"), { statusCode: 404 });
+    if (!directGroupId) {
+      const memberships = useWorkerGroupStore().listForUser(userId)
+        .filter((group) => group.workerIds.includes(workerId));
+      if (memberships.length > 1)
+        throw Object.assign(new Error("Worker has conflicting direct group memberships; hardware authorization is ambiguous"), { statusCode: 409 });
+      directGroupId = memberships[0]?.id;
+    }
+    const store = useHardwareDeviceStore();
+    return live
+      ? store.resolveAuthorizedDevices(userId, workerId, deviceIds, directGroupId)
+      : store.authorizeDeviceIds(userId, workerId, deviceIds, directGroupId);
+  }
+
   async create(request: CreateContainerRequest): Promise<ContainerInfo> {
     const userId = request.userId ?? "";
     if (!userId) throw new Error("create: userId is required");
@@ -1232,6 +1273,12 @@ export class ContainerManager {
       request.mounts,
       request.targetWorkerGroupId,
     );
+    let hardwareDeviceIds = await this.resolveHardwareDeviceAccess(
+      userId,
+      id,
+      request.hardwareDeviceIds,
+      request.targetWorkerGroupId,
+    );
     const initScript = request.initScript?.trim() || undefined;
 
     const containerInfo: ContainerInfo = {
@@ -1250,6 +1297,7 @@ export class ContainerManager {
       desiredRuntimeStatus: "running",
       repos: repos.length > 0 ? repos : undefined,
       mounts,
+      hardwareDeviceIds,
       initScript,
       environmentId: request.environmentId,
       excludedGlobalEnvVarKeys,
@@ -1315,6 +1363,13 @@ export class ContainerManager {
         request.targetWorkerGroupId,
       );
       containerInfo.mounts = mounts;
+      hardwareDeviceIds = await this.resolveHardwareDeviceAccess(
+        userId, id, hardwareDeviceIds, request.targetWorkerGroupId,
+      );
+      containerInfo.hardwareDeviceIds = hardwareDeviceIds;
+      const hardwareDevices = await this.resolveHardwareDeviceAccess(
+        userId, id, hardwareDeviceIds, request.targetWorkerGroupId, true,
+      );
       const container = await this.dockerService.createWorkerContainer({
         userId,
         id,
@@ -1322,6 +1377,7 @@ export class ContainerManager {
         cpuLimit,
         memoryLimit,
         mounts,
+        hardwareDevices,
         dockerEnabled,
         credentialBinds,
         environmentJson: envConfig.environmentJson,
@@ -2273,6 +2329,11 @@ for p in sys.argv[1:]:
             "Host mount access was revoked. Rebuild this worker before starting it again so Docker removes the old bind mount.",
         },
       );
+    if (info.hardwareDevicesRevoked)
+      throw Object.assign(
+        new Error("Hardware device access was revoked. Rebuild this worker before starting it again so Docker removes the old device mapping."),
+        { statusCode: 409, statusMessage: "Hardware device access was revoked. Rebuild this worker before starting it again so Docker removes the old device mapping." },
+      );
     await this.persistDesiredRuntimeStatus(info, "running");
     const { groupSecrets } = await this.resolveUserEnvAndBinds(
       info.userId,
@@ -2544,6 +2605,60 @@ for p in sys.argv[1:]:
     return result;
   }
 
+  /** Revoke device mappings with the same stop-and-rebuild guarantee used for
+   * host binds. Docker device cgroup rules cannot be removed from a live worker. */
+  async reconcileHardwareDeviceAccess(userId?: string): Promise<{
+    affectedWorkerIds: string[];
+    stoppedWorkerIds: string[];
+    failures: Array<{ workerId: string; message: string }>;
+  }> {
+    if (!this.workerStore) throw new Error("WorkerStore not available");
+    const records = this.workerStore.list().filter((worker) =>
+      (!userId || worker.userId === userId) &&
+      (!!worker.hardwareDeviceIds?.length || worker.hardwareDevicesRevoked === true),
+    );
+    const result = {
+      affectedWorkerIds: [] as string[], stoppedWorkerIds: [] as string[],
+      failures: [] as Array<{ workerId: string; message: string }>,
+    };
+    for (const snapshot of records) {
+      await withOwnerWorkerLifecycleMutation(snapshot.userId, snapshot.id, async () => {
+        const record = this.workerStore!.get(snapshot.userId, snapshot.id);
+        if (!record || (!record.hardwareDeviceIds?.length && !record.hardwareDevicesRevoked)) return;
+        const retained: string[] = [];
+        let revoked = record.hardwareDevicesRevoked === true;
+        for (const deviceId of record.hardwareDeviceIds ?? []) {
+          try {
+            const allowed = await this.resolveHardwareDeviceAccess(
+              record.userId, record.id, [deviceId], undefined, false,
+            );
+            if (allowed?.[0]) retained.push(allowed[0]);
+          } catch { revoked = true; }
+        }
+        const next = retained.length ? retained.sort() : undefined;
+        if (!revoked && JSON.stringify(next ?? []) === JSON.stringify(record.hardwareDeviceIds ?? [])) return;
+        result.affectedWorkerIds.push(record.id);
+        const live = this.containers.get(record.id);
+        if (!live) {
+          await this.workerStore!.updateHardwareDeviceAccess(record.userId, record.id, next, false);
+          return;
+        }
+        live.hardwareDeviceIds = next;
+        if (revoked) { live.pendingRebuild = true; live.hardwareDevicesRevoked = true; }
+        live.updatedAt = new Date().toISOString();
+        await this.workerStore!.updateHardwareDeviceAccess(record.userId, record.id, next, revoked);
+        if (!revoked || live.status !== "running") return;
+        try {
+          await this.stopUnlocked(live.id);
+          result.stoppedWorkerIds.push(live.id);
+        } catch (error) {
+          result.failures.push({ workerId: live.id, message: error instanceof Error ? error.message : "Worker could not be stopped" });
+        }
+      });
+    }
+    return result;
+  }
+
   private static normRepos(repos: RepoConfig[] | undefined): string {
     return JSON.stringify(
       (repos ?? []).map((r) => ({
@@ -2707,6 +2822,16 @@ for p in sys.argv[1:]:
         ContainerManager.normMounts(info.mounts)
       ) {
         info.mounts = next;
+        rebuildChanged = true;
+      }
+    }
+
+    if (patch.hardwareDeviceIds !== undefined) {
+      const next = await this.resolveHardwareDeviceAccess(
+        info.userId, info.id, patch.hardwareDeviceIds,
+      );
+      if (JSON.stringify(next ?? []) !== JSON.stringify(info.hardwareDeviceIds ?? [])) {
+        info.hardwareDeviceIds = next;
         rebuildChanged = true;
       }
     }
@@ -2984,6 +3109,12 @@ for p in sys.argv[1:]:
       info.id,
       info.mounts,
     );
+    const authorizedHardwareDeviceIds = await this.resolveHardwareDeviceAccess(
+      info.userId, info.id, info.hardwareDeviceIds,
+    );
+    const hardwareDevices = await this.resolveHardwareDeviceAccess(
+      info.userId, info.id, authorizedHardwareDeviceIds, undefined, true,
+    );
 
     // Materialize newly selected directories before touching disposable
     // compute. If capture fails, the original container is still running and
@@ -3082,6 +3213,7 @@ for p in sys.argv[1:]:
       desiredRuntimeStatus: "running",
       repos: info.repos,
       mounts: authorizedMounts,
+      hardwareDeviceIds: authorizedHardwareDeviceIds,
       initScript: info.initScript,
       environmentId: info.environmentId,
       excludedGlobalEnvVarKeys: info.excludedGlobalEnvVarKeys ?? [],
@@ -3090,6 +3222,7 @@ for p in sys.argv[1:]:
       // Rebuild applies any pending settings edits, so the flag is cleared.
       pendingRebuild: false,
       hostMountsRevoked: false,
+      hardwareDevicesRevoked: false,
       // Keep the imported-image link only while that image still exists.
       importedImage: imageOpts.image ? info.importedImage : undefined,
       imageDefinitionId: info.imageDefinitionId,
@@ -3111,6 +3244,7 @@ for p in sys.argv[1:]:
         cpuLimit,
         memoryLimit,
         mounts: authorizedMounts,
+        hardwareDevices,
         dockerEnabled,
         credentialBinds,
         persistentPathMounts,
@@ -3197,6 +3331,12 @@ for p in sys.argv[1:]:
       worker.id,
       worker.mounts,
     );
+    const authorizedHardwareDeviceIds = await this.resolveHardwareDeviceAccess(
+      worker.userId, worker.id, worker.hardwareDeviceIds,
+    );
+    const hardwareDevices = await this.resolveHardwareDeviceAccess(
+      worker.userId, worker.id, authorizedHardwareDeviceIds, undefined, true,
+    );
 
     // containerName is derived from the stable UUID `id`, not stored on the record.
     const containerName = this.buildContainerName(worker.id);
@@ -3255,6 +3395,7 @@ for p in sys.argv[1:]:
       desiredRuntimeStatus: "running",
       repos: worker.repos,
       mounts: authorizedMounts,
+      hardwareDeviceIds: authorizedHardwareDeviceIds,
       initScript: worker.initScript,
       environmentId: worker.environmentId,
       excludedGlobalEnvVarKeys: worker.excludedGlobalEnvVarKeys ?? [],
@@ -3264,6 +3405,7 @@ for p in sys.argv[1:]:
       // pending settings edits, so the flag is cleared.
       pendingRebuild: false,
       hostMountsRevoked: false,
+      hardwareDevicesRevoked: false,
       importedImage: imageOpts.image ? worker.importedImage : undefined,
       imageDefinitionId: worker.imageDefinitionId,
       imageVersion: worker.imageVersion,
@@ -3288,6 +3430,7 @@ for p in sys.argv[1:]:
         cpuLimit,
         memoryLimit,
         mounts: authorizedMounts,
+        hardwareDevices,
         dockerEnabled,
         credentialBinds,
         persistentPathMounts,
@@ -3486,6 +3629,7 @@ for p in sys.argv[1:]:
           status: "error",
           repos: worker.repos,
           mounts: worker.mounts,
+          hardwareDeviceIds: worker.hardwareDeviceIds,
           initScript: worker.initScript,
           environmentId: worker.environmentId,
           excludedGlobalEnvVarKeys: worker.excludedGlobalEnvVarKeys ?? [],
@@ -3493,6 +3637,7 @@ for p in sys.argv[1:]:
           workerSelfApiAccess: worker.workerSelfApiAccess,
           pendingRebuild: worker.pendingRebuild,
           hostMountsRevoked: worker.hostMountsRevoked,
+          hardwareDevicesRevoked: worker.hardwareDevicesRevoked,
           importedImage: worker.importedImage,
           imageDefinitionId: worker.imageDefinitionId,
           imageVersion: worker.imageVersion,
@@ -4687,9 +4832,11 @@ for p in sys.argv[1:]:
       workerSelfApiAccess: info.workerSelfApiAccess,
       repos: info.repos,
       mounts: info.mounts,
+      hardwareDeviceIds: info.hardwareDeviceIds,
       initScript: info.initScript,
       pendingRebuild: info.pendingRebuild,
       hostMountsRevoked: info.hostMountsRevoked,
+      hardwareDevicesRevoked: info.hardwareDevicesRevoked,
       importedImage: info.importedImage,
       importCreatedEnvironmentId: this.importCreatedEnvironments.get(info.id),
       imageDefinitionId: info.imageDefinitionId,

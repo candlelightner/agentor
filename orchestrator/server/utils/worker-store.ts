@@ -44,12 +44,14 @@ export interface WorkerRecord extends UserOwnedResource {
   workerSelfApiAccess?: WorkerSelfApiAccess;
   repos?: RepoConfig[];
   mounts?: MountConfig[];
+  hardwareDeviceIds?: string[];
   initScript?: string;
   /** True when rebuild-requiring settings (environment, repos, mounts, init
    * script) were edited after the container was last (re)created and have not
    * yet been applied. Cleared on create/rebuild/unarchive. */
   pendingRebuild?: boolean;
   hostMountsRevoked?: boolean;
+  hardwareDevicesRevoked?: boolean;
   /** Set on workers restored via import that captured the source container's
    * filesystem (`docker import`). The per-worker image reference the worker runs
    * — reused across rebuild/unarchive so the captured rootfs survives. Unset for
@@ -175,6 +177,29 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
       mounts: mounts?.length ? structuredClone(mounts) : undefined,
       ...(current.status === "active" && revoked
         ? { pendingRebuild: true, hostMountsRevoked: true }
+        : {}),
+      updatedAt: new Date().toISOString(),
+    };
+    await this.setItem(userId, updated);
+    return updated;
+  }
+
+  /** Persist desired device assignments after policy changes. Active workers
+   * keep a durable restart guard until Docker is rebuilt without revoked nodes. */
+  async updateHardwareDeviceAccess(
+    userId: string,
+    id: string,
+    hardwareDeviceIds: string[] | undefined,
+    revoked: boolean,
+  ): Promise<WorkerRecord> {
+    const current = this.get(userId, id);
+    if (!current)
+      throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
+    const updated: WorkerRecord = {
+      ...current,
+      hardwareDeviceIds: hardwareDeviceIds?.length ? [...hardwareDeviceIds] : undefined,
+      ...(current.status === "active" && revoked
+        ? { pendingRebuild: true, hardwareDevicesRevoked: true }
         : {}),
       updatedAt: new Date().toISOString(),
     };

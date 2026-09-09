@@ -37,6 +37,7 @@ services:
       - DATA_DIR=/data
       - LOG_LEVEL=info
       - ALLOW_ADMIN_DIAGNOSTICS=true
+      - ALLOW_FAKE_HARDWARE_DEVICES=true
       - ALLOW_FAKE_IMAGE_BUILDER=true
       - ALLOW_FAKE_GIT_PROVIDER=true
       - ALLOW_FAKE_BACKUP_PROVIDER=true

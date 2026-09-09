@@ -40,6 +40,7 @@ Three managed containers:
 |-------|------|----------|
 | Architecture | @docs/architecture.md | Storage modes (volume vs directory), worker state & persistence, WorkerStore, Docker labels |
 | Worker System | @docs/worker.md | Unified worker image, init scripts, agents, per-user git identity, DinD, host bind mounts, startup sequence |
+| Hardware devices | @docs/hardware-devices.md | GPU/USB discovery, stable identity, authorization, delegation, Docker mappings, and revocation |
 | Networking | @docs/networking.md | Unified Traefik proxy (port mappings + domain mappings), TLS challenges, self-signed certs, config drift detection |
 | UI | @docs/ui.md | Split pane layout, tmux tab integration, theme system, VS Code editor, UI state persistence |
 | Environments | @docs/environments.md | Environment system, network firewall, capabilities, instructions, worker API exposure |

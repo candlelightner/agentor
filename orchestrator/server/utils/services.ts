@@ -37,6 +37,7 @@ import type { WorkerSelfAuthority } from "./worker-auth";
 import { useGroupAdminWorkspaceStore } from "./group-admin-workspace-store";
 import { PersistentBackupPathManager } from "./persistent-backup-paths";
 import { HostMountStore } from "./host-mount-store";
+import { HardwareDeviceStore } from "./hardware-device-store";
 
 function singleton<T>(factory: () => T): () => T {
   let instance: T | undefined;
@@ -107,6 +108,15 @@ export const useHostMountStore = singleton(
     new HostMountStore(
       useConfig().dataDir,
       () => useStorageManager().dataHostPath,
+      useWorkerGroupStore(),
+      useWorkerStore(),
+    ),
+);
+export const useHardwareDeviceStore = singleton(
+  () =>
+    new HardwareDeviceStore(
+      useConfig().dataDir,
+      () => useDockerService().discoverHardwareDevices(),
       useWorkerGroupStore(),
       useWorkerStore(),
     ),

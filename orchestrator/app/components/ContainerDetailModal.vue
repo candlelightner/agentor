@@ -25,6 +25,7 @@ const { gitProviders } = useGitProviders();
 const { environments, defaultEnvironmentId } = useEnvironments();
 const { initScripts } = useInitScripts();
 const hostMounts = useHostMounts();
+const hardwareDevices = useHardwareDevices();
 
 const displayLabel = computed(() => props.container.displayName || shortName(props.container.id));
 
@@ -39,6 +40,7 @@ const form = reactive({
   workerSelfApiAccess: 'inherit' as import('~/types').WorkerSelfApiAccess,
   repos: [] as RepoConfig[],
   mounts: [] as MountConfig[],
+  hardwareDeviceIds: [] as string[],
   initScript: '',
   excludedGlobalEnvVarKeys: [] as string[],
   excludedGroupEnvVarKeys: [] as string[],
@@ -55,6 +57,7 @@ function resetFormFromContainer() {
   form.workerSelfApiAccess = props.container.workerSelfApiAccess || 'inherit';
   form.repos = (props.container.repos || []).map((r) => ({ ...r }));
   form.mounts = (props.container.mounts || []).map((m) => ({ ...m }));
+  form.hardwareDeviceIds = [...(props.container.hardwareDeviceIds || [])];
   form.initScript = props.container.initScript || '';
   form.excludedGlobalEnvVarKeys = [...(props.container.excludedGlobalEnvVarKeys || [])];
   form.excludedGroupEnvVarKeys = [...(props.container.excludedGroupEnvVarKeys || [])];
@@ -69,9 +72,9 @@ function removeRepo(idx: number) {
 function addMount() {
   form.mounts.push({ pathId: '', source: '', target: '', readOnly: true });
 }
-function removeMount(idx: number) {
-  form.mounts.splice(idx, 1);
-}
+function removeMount(idx: number) { form.mounts.splice(idx, 1); }
+function addHardwareDevice() { form.hardwareDeviceIds.push(''); }
+function removeHardwareDevice(idx: number) { form.hardwareDeviceIds.splice(idx, 1); }
 
 // ─── Dirty / validity tracking ───────────────────────────────────────────
 function normRepos(repos: RepoConfig[] | undefined): string {
@@ -92,9 +95,10 @@ const envDirty = computed(() => form.environmentId !== (props.container.environm
 const initDirty = computed(() => (form.initScript.trim() || '') !== (props.container.initScript || ''));
 const reposDirty = computed(() => normRepos(form.repos) !== normRepos(props.container.repos));
 const mountsDirty = computed(() => normMounts(form.mounts) !== normMounts(props.container.mounts));
+const hardwareDirty = computed(() => JSON.stringify([...new Set(form.hardwareDeviceIds.filter(Boolean))].sort()) !== JSON.stringify([...(props.container.hardwareDeviceIds || [])].sort()));
 const inheritedEnvDirty = computed(() => JSON.stringify([...form.excludedGlobalEnvVarKeys].sort()) !== JSON.stringify([...(props.container.excludedGlobalEnvVarKeys || [])].sort()));
 const groupEnvDirty = computed(() => JSON.stringify([...form.excludedGroupEnvVarKeys].sort()) !== JSON.stringify([...(props.container.excludedGroupEnvVarKeys || [])].sort()));
-const rebuildDirty = computed(() => envDirty.value || initDirty.value || reposDirty.value || mountsDirty.value || inheritedEnvDirty.value || groupEnvDirty.value);
+const rebuildDirty = computed(() => envDirty.value || initDirty.value || reposDirty.value || mountsDirty.value || hardwareDirty.value || inheritedEnvDirty.value || groupEnvDirty.value);
 const anyDirty = computed(() => liveDirty.value || rebuildDirty.value);
 
 const nameValid = computed(() => {
@@ -118,6 +122,7 @@ function buildPatch(): UpdateContainerSettingsRequest {
     mounts: form.mounts
       .filter((m) => m.pathId && m.target)
       .map((m) => ({ pathId: m.pathId, source: m.source, target: m.target, readOnly: m.readOnly !== false })),
+    hardwareDeviceIds: [...new Set(form.hardwareDeviceIds.filter(Boolean))],
     excludedGlobalEnvVarKeys: [...form.excludedGlobalEnvVarKeys],
     excludedGroupEnvVarKeys: [...form.excludedGroupEnvVarKeys],
     ...(protection.value.protected && lockCurrentPassword.value ? { lockPassword: lockCurrentPassword.value } : {}),
@@ -202,7 +207,7 @@ watch(open, (isOpen) => {
     saving.value = false;
     settingsError.value = '';
     resetFormFromContainer();
-    void hostMounts.refresh({ workerId: props.container.id });
+    void Promise.all([hostMounts.refresh({ workerId: props.container.id }), hardwareDevices.refresh({ workerId: props.container.id })]);
     loadDetails();
   }
 });
@@ -371,6 +376,13 @@ const formattedCreatedAt = computed(() => {
               <p v-if="hostMounts.effectivePaths.value.length === 0" class="text-xs text-gray-500">
                 No approved host path is assigned to this worker or its direct group.
               </p>
+            </div>
+
+            <div>
+              <div class="mb-1 flex items-center justify-between"><label class="text-sm font-medium text-gray-700 dark:text-gray-300">Hardware devices</label><UBadge color="warning" variant="subtle" size="xs">requires rebuild</UBadge></div>
+              <div class="space-y-2"><HardwareDeviceInput v-for="(_, idx) in form.hardwareDeviceIds" :key="idx" :model-value="form.hardwareDeviceIds[idx]!" :devices="hardwareDevices.effectiveDevices.value" @update:model-value="form.hardwareDeviceIds[idx] = $event" @remove="removeHardwareDevice(idx)" /></div>
+              <UButton size="xs" variant="link" class="mt-1" :disabled="hardwareDevices.effectiveDevices.value.length === 0" @click="addHardwareDevice">+ Add hardware device</UButton>
+              <p v-if="hardwareDevices.effectiveDevices.value.length === 0" class="text-xs text-gray-500">No approved hardware device is assigned to this worker or its direct group.</p>
             </div>
 
             <!-- Init script (rebuild) -->

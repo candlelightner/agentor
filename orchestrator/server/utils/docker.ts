@@ -1,10 +1,11 @@
 import Docker from 'dockerode';
 import { PassThrough } from 'node:stream';
+import { randomUUID } from 'node:crypto';
 import type { Duplex, Readable } from 'node:stream';
 import type { Config } from './config';
 import { getAppType } from './apps';
 import { renderUserEnvVars } from './user-env-store';
-import type { MountConfig, TmuxWindow, AppInstanceInfo, NetworkMode, ExposeApis, UserEnvVars, FileEntry } from '../../shared/types';
+import type { MountConfig, TmuxWindow, AppInstanceInfo, NetworkMode, ExposeApis, UserEnvVars, FileEntry, HardwareDeviceCandidate, ResolvedHardwareDevice } from '../../shared/types';
 import type { StorageManager } from './storage';
 import type { ExecCaptureResult } from './workspace-probe';
 import type { PersistentPathMount } from './persistent-backup-paths';
@@ -165,6 +166,7 @@ export class DockerService {
     cpuLimit?: number;
     memoryLimit?: string;
     mounts?: MountConfig[];
+    hardwareDevices?: ResolvedHardwareDevice[];
     dockerEnabled?: boolean;
     credentialBinds?: string[];
     /** Trusted named volumes generated from explicit backup-directory
@@ -249,6 +251,20 @@ export class DockerService {
       (m) => `${m.source}:${m.target}${m.readOnly ? ':ro' : ''}`
     );
 
+    const deviceMappings = (opts.hardwareDevices ?? []).flatMap((device) =>
+      device.deviceNodes.map((node) => {
+        if (!/^\/dev\/[A-Za-z0-9._+/:=-]+$/.test(node)) {
+          const err = new Error('Resolved hardware device node is invalid') as Error & { statusCode?: number };
+          err.statusCode = 400;
+          throw err;
+        }
+        return { PathOnHost: node, PathInContainer: node, CgroupPermissions: 'rwm' };
+      }),
+    );
+    const deviceGroups = [...new Set((opts.hardwareDevices ?? []).flatMap((device) => device.groupIds))]
+      .filter((gid) => Number.isInteger(gid) && gid >= 0)
+      .map(String);
+
     // Persistent workspace — named volume (volume mode) or host directory under
     // the user's data dir (directory mode).
     if (opts.storageManager) {
@@ -305,6 +321,8 @@ export class DockerService {
         ...(memBytes > 0 ? { Memory: memBytes } : {}),
         ...(capAdd.length > 0 ? { CapAdd: capAdd } : {}),
         ...(opts.dockerEnabled ? { Privileged: true } : {}),
+        ...(deviceMappings.length ? { Devices: deviceMappings } : {}),
+        ...(deviceGroups.length ? { GroupAdd: deviceGroups } : {}),
         Init: true,
         // A Docker-daemon-only restart cannot repopulate ephemeral secrets.
         // Keep secret-bearing workers stopped until the orchestrator can run
@@ -345,6 +363,121 @@ export class DockerService {
     }
     useLogger().info(`[docker] created container ${opts.containerName}${opts.image ? ` (image ${opts.image})` : ''}`);
     return container;
+  }
+
+  /** Enumerate host DRM render devices and USB devices without granting the
+   * orchestrator container broad /dev access. The short-lived probe is isolated,
+   * read-only, networkless, and has no Linux capabilities. */
+  async discoverHardwareDevices(): Promise<HardwareDeviceCandidate[]> {
+    const image = this.config.workerImagePrefix + this.config.workerImage;
+    await this.ensureImage(image);
+    const name = `agentor-hardware-probe-${randomUUID()}`;
+    const script = `set -eu
+clean() { tr '\t\r\n' '   ' < "$1" 2>/dev/null || true; }
+for node in /host/dev/dri/renderD*; do
+  [ -e "$node" ] || continue
+  base="\${node##*/}"
+  sys="$(readlink -f "/host/sys/class/drm/$base/device")"
+  [ -n "$sys" ] || continue
+  pci="\${sys##*/}"
+  vendor="$(clean "$sys/vendor")"
+  product="$(clean "$sys/device")"
+  nodes=""; gids=""
+  for link in /host/sys/class/drm/card* /host/sys/class/drm/renderD*; do
+    [ -e "$link" ] || continue
+    [ "$(readlink -f "$link/device")" = "$sys" ] || continue
+    dev="/dev/dri/\${link##*/}"
+    [ -e "/host$dev" ] || continue
+    gid="$(stat -c %g "/host$dev")"
+    nodes="\${nodes}\${nodes:+,}$dev"; gids="\${gids}\${gids:+,}$gid"
+  done
+  printf 'gpu\tdrm:pci:%s\tGPU %s:%s (%s)\t%s\t%s\t\t%s\t%s\n' "$pci" "\${vendor#0x}" "\${product#0x}" "$pci" "\${vendor#0x}" "\${product#0x}" "$nodes" "$gids"
+done
+for sys in /host/sys/bus/usb/devices/*; do
+  [ -f "$sys/idVendor" ] && [ -f "$sys/idProduct" ] && [ -f "$sys/busnum" ] && [ -f "$sys/devnum" ] || continue
+  vendor="$(clean "$sys/idVendor")"; product="$(clean "$sys/idProduct")"; serial=""
+  [ ! -f "$sys/serial" ] || serial="$(clean "$sys/serial")"
+  bus="$(cat "$sys/busnum")"; devnum="$(cat "$sys/devnum")"
+  node="$(printf '/dev/bus/usb/%03d/%03d' "$bus" "$devnum")"
+  [ -e "/host$node" ] || continue
+  port="\${sys##*/}"; identity="\${serial:-port:$port}"
+  manufacturer=""; product_name=""
+  [ ! -f "$sys/manufacturer" ] || manufacturer="$(clean "$sys/manufacturer")"
+  [ ! -f "$sys/product" ] || product_name="$(clean "$sys/product")"
+  label="\${manufacturer:+$manufacturer }\${product_name:-USB $vendor:$product}"
+  gid="$(stat -c %g "/host$node")"
+  printf 'usb\tusb:%s:%s:%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vendor" "$product" "$identity" "$label" "$vendor" "$product" "$serial" "$node" "$gid"
+done`;
+    let helper: Docker.Container | undefined;
+    try {
+      helper = await withOperationDeadline(
+        (operationSignal) => this.docker.createContainer({
+          Image: image,
+          name,
+          User: '0:0',
+          Entrypoint: ['sh', '-c'],
+          Cmd: [script],
+          Tty: true,
+          NetworkDisabled: true,
+          HostConfig: {
+            NetworkMode: 'none',
+            Binds: ['/dev:/host/dev:ro', '/sys:/host/sys:ro'],
+            ReadonlyRootfs: true,
+            CapDrop: ['ALL'],
+            SecurityOpt: ['no-new-privileges:true'],
+            PidsLimit: 64,
+            Memory: 128 * 1024 * 1024,
+            NanoCpus: 500_000_000,
+            RestartPolicy: { Name: 'no' },
+          },
+          Labels: { 'agentor.hardware-probe': 'true' },
+          abortSignal: operationSignal,
+        }),
+        DOCKER_LIFECYCLE_TIMEOUT_MS,
+        'Docker hardware probe creation',
+      );
+      await withOperationDeadline(
+        (operationSignal) => helper!.start({ abortSignal: operationSignal }),
+        DOCKER_LIFECYCLE_TIMEOUT_MS,
+        'Docker hardware probe start',
+      );
+      const result = await withOperationDeadline(
+        (operationSignal) => helper!.wait({ abortSignal: operationSignal }),
+        DOCKER_LIFECYCLE_TIMEOUT_MS,
+        'Docker hardware probe completion',
+      );
+      const output = await this.getLogs(helper.id, 10_000);
+      if (result.StatusCode !== 0) throw new Error('Host hardware probe failed');
+      const discovered: HardwareDeviceCandidate[] = output.split(/\r?\n/).filter(Boolean).map((line) => {
+        const [kind, selector, deviceName, vendor, product, serial, nodes, gids] = line.split('\t');
+        return {
+          kind: kind as 'gpu' | 'usb', selector: selector!, name: deviceName!,
+          vendor: vendor || undefined, product: product || undefined,
+          serial: serial || undefined,
+          deviceNodes: (nodes || '').split(',').filter(Boolean),
+          groupIds: [...new Set((gids || '').split(',').filter(Boolean).map(Number))],
+        };
+      });
+      // Explicitly gated deterministic fixture for the isolated Docker E2E
+      // stack. Requiring diagnostics mode prevents accidental production use.
+      if (process.env.ALLOW_ADMIN_DIAGNOSTICS === 'true' &&
+          process.env.ALLOW_FAKE_HARDWARE_DEVICES === 'true')
+        discovered.push({
+          kind: 'usb', selector: 'usb:agentor:test-device',
+          name: 'Agentor test USB device', vendor: 'agentor', product: 'test',
+          serial: 'deterministic', deviceNodes: ['/dev/null'], groupIds: [],
+        });
+      return discovered;
+    } finally {
+      if (helper)
+        await withOperationDeadline(
+          (operationSignal) => helper!.remove({ force: true, abortSignal: operationSignal } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
+          DOCKER_LIFECYCLE_TIMEOUT_MS,
+          'Docker hardware probe cleanup',
+        ).catch(() => undefined);
+      else
+        await this.docker.getContainer(name).remove({ force: true } as Docker.ContainerRemoveOptions).catch(() => undefined);
+    }
   }
 
   async listContainers(): Promise<Docker.ContainerInfo[]> {

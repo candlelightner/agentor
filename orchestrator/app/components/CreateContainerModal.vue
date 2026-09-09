@@ -18,6 +18,7 @@ const open = defineModel<boolean>('open', { default: false });
 
 const { environments, defaultEnvironmentId } = useEnvironments();
 const hostMounts = useHostMounts();
+const hardwareDevices = useHardwareDevices();
 
 const {
   repos: githubRepos,
@@ -46,7 +47,7 @@ watch(defaultEnvironmentId, (id) => {
 watch(open, async (isOpen) => {
   if (isOpen) {
     fetchRepos();
-    await refreshEffectiveHostMounts();
+    await Promise.all([refreshEffectiveHostMounts(), refreshEffectiveHardwareDevices()]);
     const { displayName } = await $fetch<{ displayName: string }>('/api/containers/generate-name');
     generatedName.value = displayName;
   }
@@ -59,6 +60,7 @@ const form = reactive({
   workerSelfApiAccess: 'inherit' as import('~/types').WorkerSelfApiAccess,
   repos: [] as RepoConfig[],
   mounts: [] as MountConfig[],
+  hardwareDeviceIds: [] as string[],
   initScript: '',
 });
 const workerConfiguration = ref<CreateContainerRequest['workerConfiguration']>({ variables: [], secrets: [], secretFiles: [] });
@@ -105,9 +107,14 @@ async function refreshEffectiveHostMounts() {
   const available = new Set(hostMounts.effectivePaths.value.map((path) => path.id));
   form.mounts = form.mounts.filter((mount) => mount.pathId && available.has(mount.pathId));
 }
+async function refreshEffectiveHardwareDevices() {
+  await hardwareDevices.refresh({ ...(form.workerGroupId ? { groupId: form.workerGroupId } : {}) });
+  const available = new Set(hardwareDevices.effectiveDevices.value.map((device) => device.id));
+  form.hardwareDeviceIds = form.hardwareDeviceIds.filter((id) => available.has(id));
+}
 
 watch(() => form.workerGroupId, () => {
-  if (open.value) void refreshEffectiveHostMounts();
+  if (open.value) void Promise.all([refreshEffectiveHostMounts(), refreshEffectiveHardwareDevices()]);
 });
 
 const defaultProvider = computed(() => props.gitProviders[0]?.id || 'github');
@@ -192,9 +199,9 @@ function addMount() {
   form.mounts.push({ pathId: '', source: '', target: '', readOnly: true });
 }
 
-function removeMount(idx: number) {
-  form.mounts.splice(idx, 1);
-}
+function removeMount(idx: number) { form.mounts.splice(idx, 1); }
+function addHardwareDevice() { form.hardwareDeviceIds.push(''); }
+function removeHardwareDevice(idx: number) { form.hardwareDeviceIds.splice(idx, 1); }
 
 function submit() {
   // The internal worker identity is a UUID v4 minted server-side; the form only
@@ -217,9 +224,9 @@ function submit() {
       ...(r.branch ? { branch: r.branch } : {}),
     }));
   }
-  if (form.mounts.length > 0) {
-    request.mounts = form.mounts.filter((m) => m.pathId && m.target);
-  }
+  if (form.mounts.length > 0) request.mounts = form.mounts.filter((m) => m.pathId && m.target);
+  const selectedDevices = [...new Set(form.hardwareDeviceIds.filter(Boolean))];
+  if (selectedDevices.length) request.hardwareDeviceIds = selectedDevices;
   if (form.initScript.trim()) {
     request.initScript = form.initScript;
   }
@@ -236,6 +243,7 @@ function reset() {
   form.workerSelfApiAccess = 'inherit';
   form.repos = [];
   form.mounts = [];
+  form.hardwareDeviceIds = [];
   form.initScript = '';
   generatedName.value = '';
   branchData.clear();
@@ -357,6 +365,12 @@ function reset() {
           <p v-if="hostMounts.effectivePaths.value.length === 0" class="mt-1 text-xs text-gray-500">
             No host path is assigned to {{ form.workerGroupId ? 'the selected group' : 'all new workers' }}. Configure host mount permissions first.
           </p>
+        </UFormField>
+
+        <UFormField label="Hardware devices">
+          <div class="space-y-2"><HardwareDeviceInput v-for="(_, idx) in form.hardwareDeviceIds" :key="idx" :model-value="form.hardwareDeviceIds[idx]!" :devices="hardwareDevices.effectiveDevices.value" @update:model-value="form.hardwareDeviceIds[idx] = $event" @remove="removeHardwareDevice(idx)" /></div>
+          <UButton size="xs" variant="link" class="mt-2" :disabled="hardwareDevices.effectiveDevices.value.length === 0" @click="addHardwareDevice">+ Add hardware device</UButton>
+          <p v-if="hardwareDevices.effectiveDevices.value.length === 0" class="mt-1 text-xs text-gray-500">No hardware device is assigned to {{ form.workerGroupId ? 'the selected group' : 'all new workers' }}.</p>
         </UFormField>
 
         <UFormField label="Init Script" hint="Script to run in tmux on startup">

@@ -28,6 +28,7 @@ import {
   usePluginRuntimeManager,
   usePersistentBackupPathManager,
   useHostMountStore,
+  useHardwareDeviceStore,
 } from "../utils/services";
 import {
   loadBuiltInCapabilities,
@@ -177,6 +178,7 @@ export default defineNitroPlugin(async (nitroApp) => {
     workerStore.init(),
     useWorkerGroupStore().init(),
     useHostMountStore().init(),
+    useHardwareDeviceStore().init(),
     useManagedNetworkStore().init(),
     portMappingStore.init(),
     domainMappingStore.init(),
@@ -210,6 +212,13 @@ export default defineNitroPlugin(async (nitroApp) => {
   if (hostMountRecovery.failures.length)
     logger.error(
       `[agentor] ${hostMountRecovery.failures.length} worker(s) still expose revoked host mounts and could not be stopped; restart remains blocked`,
+    );
+  const hardwareRecovery = instanceRecoveryMode
+    ? { failures: [] }
+    : await containerManager.reconcileHardwareDeviceAccess();
+  if (hardwareRecovery.failures.length)
+    logger.error(
+      `[agentor] ${hardwareRecovery.failures.length} worker(s) still expose revoked hardware devices and could not be stopped; restart remains blocked`,
     );
   useBackupManager().setPathPersistenceAdapter(
     usePersistentBackupPathManager(),

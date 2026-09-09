@@ -6,7 +6,7 @@ import { createTestUser, deleteTestUser, type CreatedUser } from "../helpers/tes
 import { captureCommandOutput, TerminalWsClient } from "../helpers/terminal-ws";
 import { buildPng } from "../helpers/clipboard";
 
-const GROUP_ADMIN_ROLE_SKILL_SHA256 = "c690127342434ae3555332207f754f84b7b41125e7d58c1e914ccfb32204b012";
+const GROUP_ADMIN_ROLE_SKILL_SHA256 = "ab1af23ccdb6dd9ff7e12954bf2547e3b1faa7a04ded4065d4bd9e004adbac50";
 
 function pluginManifest(suffix: string) {
   return {
@@ -288,8 +288,12 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
       "host-mounts.delegations.list",
       "host-mounts.delegations.create",
       "host-mounts.delegations.delete",
+      "hardware-devices.delegations.list",
+      "hardware-devices.delegations.create",
+      "hardware-devices.delegations.delete",
     ]));
     expect(toolNames).not.toContain("host-mounts.catalog.create");
+    expect(toolNames).not.toContain("hardware-devices.catalog.approve");
     expect(toolNames).not.toContain("port-mappings.list");
     expect(toolNames).toEqual(expect.arrayContaining(["workspaces.list", "workspaces.files", "workspaces.preview", "workspaces.download"]));
     expect(toolNames).toEqual(expect.arrayContaining([
@@ -315,6 +319,12 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
       required: ["pathId", "targetType", "targetId"],
     });
     expect(delegationCreate?.properties || {}).not.toHaveProperty("sourcePath");
+    const hardwareDelegationCreate = schemas.get("hardware-devices.delegations.create");
+    expect(hardwareDelegationCreate).toMatchObject({
+      additionalProperties: false,
+      required: ["deviceId", "targetType", "targetId"],
+    });
+    expect(hardwareDelegationCreate?.properties || {}).not.toHaveProperty("deviceNodes");
     expect(schemas.get("backups.create")?.required).toEqual(["workspaceIds"]);
     expect(schemas.get("backups.create")?.properties || {}).not.toHaveProperty("ownerId");
     expect(schemas.get("backups.paths.list")?.required).toEqual(["workerId"]);

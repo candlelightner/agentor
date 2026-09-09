@@ -56,6 +56,7 @@ const showManagementMcpModal = ref(false);
 const showWorkerGroupsModal = ref(false);
 const showManagedNetworksModal = ref(false);
 const showHostMountManagementModal = ref(false);
+const showHardwareDeviceManagementModal = ref(false);
 const showEnvironmentsModal = ref(false);
 const showCapabilitiesModal = ref(false);
 const showInstructionsModal = ref(false);
@@ -385,6 +386,7 @@ function onCreateModalClosed() {
       @manage-worker-groups="showWorkerGroupsModal = true"
       @manage-networks="showManagedNetworksModal = true"
       @manage-host-mounts="showHostMountManagementModal = true"
+      @manage-hardware-devices="showHardwareDeviceManagementModal = true"
       @manage-environments="showEnvironmentsModal = true"
       @manage-capabilities="showCapabilitiesModal = true"
       @manage-instructions="showInstructionsModal = true"
@@ -488,6 +490,7 @@ function onCreateModalClosed() {
       :containers="containers"
     />
     <HostMountManagementModal v-model:open="showHostMountManagementModal" />
+    <HardwareDeviceManagementModal v-model:open="showHardwareDeviceManagementModal" />
 
     <EnvironmentsModal v-model:open="showEnvironmentsModal" />
 
