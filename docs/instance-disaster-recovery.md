@@ -206,11 +206,15 @@ destination changed during the handoff, restore stops before moving any data.
 
 The helper is part of Agentor's trusted recovery boundary: it necessarily has
 access to the Docker socket so it can stop/restart the exact orchestrator and
-create selected volumes. It is not exposed as an API, receives only a bounded
-four-value launch context, has no network, uses a read-only root filesystem,
-drops Linux capabilities, enables `no-new-privileges`, and has explicit
-resource limits. Treat access to the orchestrator image and Docker socket as
-host-administrator authority.
+create selected volumes. It is not exposed as an API and receives only a
+bounded four-value launch context. The main restore helper has no network, uses
+a read-only root filesystem, drops Linux capabilities, enables
+`no-new-privileges`, and has explicit resource limits. Each selected volume is
+extracted by a separate, narrowly constrained temporary helper. That helper's
+root filesystem must be writable because Docker `putArchive` rejects a
+read-only root filesystem; archive validation confines every extracted path
+under its `/source` volume mount. Treat access to the orchestrator image and
+Docker socket as host-administrator authority.
 
 The browser will disconnect during this step. Reopen Agentor after restart and
 sign in with credentials from the source installation. If restart itself fails,

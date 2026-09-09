@@ -168,6 +168,7 @@ async function fixture(root: string, options?: { hostPolicies?: boolean }) {
 
 function fakeDocker(dataDir: string, orchestratorId: string, options?: {
   createVolumeError?: Error;
+  createContainerOptions?: any[];
   containers?: Array<{ Id: string; Labels?: Record<string, string> }>;
 }) {
   let running = true;
@@ -209,11 +210,25 @@ function fakeDocker(dataDir: string, orchestratorId: string, options?: {
         id === orchestratorId ? target : helper,
       getVolume: () => missingVolume(),
       listContainers: async () => options?.containers ?? [],
-      createVolume: async () => {
-        throw options?.createVolumeError ?? new Error("unexpected createVolume");
+      createVolume: async (spec: any) => {
+        if (options?.createVolumeError) throw options.createVolumeError;
+        if (!options?.createContainerOptions)
+          throw new Error("unexpected createVolume");
+        options.createContainerOptions.push(spec);
+        return {
+          inspect: async () => ({ Labels: spec.Labels }),
+          remove: async () => undefined,
+        };
       },
-      createContainer: async () => {
-        throw new Error("unexpected createContainer");
+      createContainer: async (spec: any) => {
+        if (!options?.createContainerOptions)
+          throw new Error("unexpected createContainer");
+        options.createContainerOptions.push(spec);
+        return {
+          start: async () => undefined,
+          putArchive: async () => undefined,
+          remove: async () => undefined,
+        };
       },
     },
     state: {
@@ -471,6 +486,63 @@ test.describe("controlled instance restore helper", () => {
       errorCode: "INSTANCE_RESTORE_DESTINATION_CHANGED",
       userId: "recovery-admin",
     });
+  });
+
+  test("uses a writable constrained helper for volume extraction", async () => {
+    const prepared = await fixture(root);
+    await writeTarGzip(prepared.plan.dataArchive, [
+      {
+        name: "auth.db",
+        body: Buffer.concat([
+          Buffer.from("SQLite format 3\0"),
+          Buffer.alloc(128),
+        ]),
+      },
+    ]);
+    const volumeArchive = join(prepared.unpacked, "volume-selected.tar.gz");
+    await writeTarGzip(volumeArchive, [
+      { name: "source/", type: "directory" },
+      { name: "source/workspace.txt", body: "workspace" },
+    ]);
+    prepared.plan.volumes = [{
+      name: "agentor-restore-test-volume",
+      archive: volumeArchive,
+      kind: "worker-workspace",
+      workerId: "worker-restore-test",
+    }];
+    await writeFile(
+      join(prepared.stage, "restore-plan.json"),
+      JSON.stringify(prepared.plan),
+    );
+    const createContainerOptions: any[] = [];
+    const fake = fakeDocker(
+      prepared.dataDir,
+      prepared.env.AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR,
+      { createContainerOptions },
+    );
+
+    const result = await runInjected(prepared, fake.docker);
+
+    expect(result).toMatchObject({ status: "succeeded" });
+    const helper = createContainerOptions.find(
+      (spec) => spec.Labels?.["agentor.instance-restore-volume-helper"] === "true",
+    );
+    expect(helper).toBeTruthy();
+    expect(helper.HostConfig).toMatchObject({
+      NetworkMode: "none",
+      ReadonlyRootfs: false,
+      CapDrop: ["ALL"],
+      SecurityOpt: ["no-new-privileges:true"],
+      PidsLimit: 32,
+      Memory: 128 * 1024 * 1024,
+      NanoCpus: 500_000_000,
+      Mounts: [{
+        Type: "volume",
+        Source: "agentor-restore-test-volume",
+        Target: "/source",
+      }],
+    });
+    expect(helper.HostConfig.Mounts).toHaveLength(1);
   });
 
   test("rolls data and ownership back when a selected volume cannot be created", async () => {
