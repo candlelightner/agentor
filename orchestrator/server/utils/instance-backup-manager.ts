@@ -1241,7 +1241,7 @@ export class InstanceBackupManager {
         CapDrop: ["ALL"],
         SecurityOpt: ["no-new-privileges:true"],
         Tmpfs: { "/tmp": "rw,noexec,nosuid,nodev,size=16777216" },
-        CapAdd: ["CHOWN", "FOWNER"],
+        CapAdd: ["CHOWN", "DAC_OVERRIDE", "FOWNER"],
         PidsLimit: 64,
         Memory: 256 * 1024 * 1024,
         NanoCpus: 1_000_000_000,

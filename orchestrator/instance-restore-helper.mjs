@@ -628,7 +628,9 @@ async function restoreVolume(docker, orchestrator, input, volume) {
     },
     HostConfig: {
       NetworkMode: "none",
-      ReadonlyRootfs: true,
+      // Docker putArchive rejects a read-only rootfs even with writable /source;
+      // prevalidation confines extracted entries to /source.
+      ReadonlyRootfs: false,
       CapDrop: ["ALL"],
       SecurityOpt: ["no-new-privileges:true"],
       Mounts: [{ Type: "volume", Source: volume.name, Target: "/source" }],
