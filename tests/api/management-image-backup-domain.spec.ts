@@ -130,6 +130,12 @@ test('image and backup MCP domain exposes bounded tool surface and safe hints', 
   });
 });
 
+test('backup workspace resolution permits archived owner records', () => {
+  const source = readFileSync(new URL('../../orchestrator/server/utils/management-image-backup-domain.ts', import.meta.url), 'utf8');
+  expect(source).toContain('const storedWorker = useWorkerStore().findById(id);');
+  expect(source).toContain('if (storedWorker?.userId === owner) return storedWorker;');
+});
+
 test('image MCP follow-up actions use durable build ids without an owner selector', () => {
   // The platform adapter resolves the owner from buildId; group adapters have
   // always derived it from identity. Keep the public async protocol identical.

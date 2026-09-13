@@ -654,6 +654,8 @@ async function resolveBackupWorkspace(id: string, owner: string) {
   const containers = useContainerManager();
   let worker = containers.get(id);
   if (worker?.userId === owner) return worker;
+  const storedWorker = useWorkerStore().findById(id);
+  if (storedWorker?.userId === owner) return storedWorker;
   // Administrative workspaces are external ContainerManager registrations and
   // may briefly be absent after an orchestrator refresh. Reconcile only the
   // exact persisted group-admin identity; never broaden this to owner-wide
