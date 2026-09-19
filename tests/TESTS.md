@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **2002 tests** across 196 test files (1379 API across 134 files + 623 UI across 62 files)
+- **2017 tests** across 199 test files (1391 API across 136 files + 626 UI across 63 files)
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -108,14 +108,18 @@ tests/
     worker-lifecycle.ts    # Container create/cleanup utilities
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
-    api/                     # API endpoint tests (1362 tests across 131 files)
-  ui/                      # UI interaction tests (619 tests across 61 files)
+    api/                     # API endpoint tests (1391 tests across 136 files)
+  ui/                      # UI interaction tests (626 tests across 63 files)
 ```
 
 ## Test Categories
 
-### API Tests (1362 tests, 131 files)
+### API Tests (1391 tests, 136 files)
 
+| File | Tests | Coverage |
+| --- | ---: | --- |
+| `plugin-desktop-core.spec.ts` | 5 | Isolated/native schema compatibility, concurrent durable reservations, crash/rebuild reconciliation and scoped cleanup, sanitized GUI-failure teardown, and user/worker/installation/action/display/generation authorization. Also runs without a server through the modules config. |
+| `plugin-desktops.spec.ts` | 4 | Real independent display allocations, authenticated noVNC modules and RFB refresh, shared `:99` availability, anonymous/cross-user/cross-origin/mismatched-target denial, worker restart, and scoped disable/uninstall. |
 | `worker-protection-lock.spec.ts` | 7 | Password-verifier-only worker locks: set/change/remove validation, no password/hash disclosure, required lock credentials on settings/configuration/archive/unarchive, running-workspace file mutations, managed-network membership, stop/restart alternate lifecycle paths, and correct-password recovery. |
 | `backup-path-selection.spec.ts` | 2 | Flexible backup-path normalization: absolute POSIX paths only, 32-path cap, deduplication and parent-path collapse, with legacy workspace/agent defaults retained. |
 | `plugin-core.spec.ts` | 7 | Strict manifest/scope/resource validation; secret-free structured `imageBuild` contributions with no runtime state; safe SVG handling; durable serialized worker-local allocation; generation-aware reconciliation; fail-closed group visibility; bounded lifecycle deadlines; and authenticated desktop/noVNC action mode. |
@@ -254,8 +258,11 @@ tests/
 The container edge-case coverage includes repeated-stop idempotency: stopping an
 already-stopped worker returns success and leaves its persisted status stopped.
 
-### UI Tests (619 tests, 61 files)
+### UI Tests (626 tests, 63 files)
 
+| File | Tests | Coverage |
+| --- | ---: | --- |
+| `plugin-desktops.spec.ts` | 3 | Real dashboard button → pane/tab → independent red/blue framebuffer pixels and resolutions; refresh/reconnect, active-viewer revocation and disabled UI, and authenticated modules/WebSockets through a reverse proxy with a URL prefix. |
 | `admin-management-live.spec.ts` | 2 | Live global-administration workspace management flows. |
 | `backup-management-real.spec.ts` | 1 | Real browser backup creation and management. |
 | `instance-backup-management.spec.ts` | 5 | Platform-admin whole-instance UI: asynchronous Local/Google Drive creation scope, retry-stable body/header idempotency identity after an uncertain response, remote discovery/inspection/adoption with key availability, plugin/image/host dependency inventory, restore preflight, explicit destructive/external-dependency acknowledgements, and blocker-safe disabled restore. Provider and job responses are mocked; no real Google credentials are required. |

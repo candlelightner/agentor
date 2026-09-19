@@ -430,13 +430,12 @@ _step display "Display stack"
 _log "Display: starting..."
 # Clean stale state from previous container runs (lock files persist across restarts)
 sudo rm -f /tmp/.X99-lock
-sudo rm -rf /tmp/.X11-unix
+sudo rm -f /tmp/.X11-unix/X99
 sudo mkdir -p /tmp/.X11-unix && sudo chmod 1777 /tmp/.X11-unix
-pkill -f Xvfb 2>/dev/null || true
-pkill -f x11vnc 2>/dev/null || true
-pkill -f fluxbox 2>/dev/null || true
-pkill -f websockify 2>/dev/null || true
-Xvfb :99 -screen 0 1920x1080x24 -ac &
+# Container restart has already terminated old processes. Never globally kill
+# display programs or remove the X socket directory: isolated plugins own
+# independent displays and may be reconciling concurrently.
+Xvfb :99 -screen 0 1920x1080x24 -ac -nolisten tcp &
 wait_for_file /tmp/.X11-unix/X99
 xrdb -merge /home/agent/.Xresources 2>/dev/null || true
 fluxbox &

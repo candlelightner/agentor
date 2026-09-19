@@ -194,6 +194,8 @@ COPY --chmod=755 memfd-exec.py /home/agent/memfd-exec.py
 COPY --chmod=755 setup.sh /home/agent/setup.sh
 COPY --chmod=755 init.sh /home/agent/init.sh
 COPY --chmod=755 apps/ /home/agent/apps/
+RUN apt-get update && apt-get install -y --no-install-recommends xauth x11-utils \
+    && rm -rf /var/lib/apt/lists/*
 COPY --chmod=755 clipboard/ /home/agent/clipboard/
 COPY --chmod=755 management-mcp-proxy.mjs /usr/local/bin/agentor-management-mcp
 COPY --chmod=755 worker-self-mcp-proxy.mjs /usr/local/bin/agentor-worker-mcp

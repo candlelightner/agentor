@@ -32,9 +32,12 @@ export interface PluginPortRequirement {
 }
 
 export interface PluginDisplayRequirement {
-  mode: "none" | "shared" | "dedicated";
+  mode: "none" | "shared" | "dedicated" | "isolated";
   rangeStart?: number;
   rangeEnd?: number;
+  width?: number;
+  height?: number;
+  depth?: 24;
 }
 
 export interface PluginPrivateAction {
@@ -45,6 +48,15 @@ export interface PluginPrivateAction {
   path: string;
   openMode?: "sandboxed-pane" | "desktop";
 }
+
+export interface PluginDesktopAction {
+  id: string;
+  label: string;
+  kind: "desktop";
+  displayId: "primary";
+  openMode: "sandboxed-pane";
+}
+export type PluginAction = PluginPrivateAction | PluginDesktopAction;
 
 /**
  * A credential-free contribution which may be selected while constructing a
@@ -100,7 +112,7 @@ export interface PluginManifest {
     envKeys?: string[];
     secretKeys?: string[];
   };
-  actions?: PluginPrivateAction[];
+  actions?: PluginAction[];
   documentation?: {
     markdown?: string;
     skillMarkdown?: string;
@@ -182,7 +194,7 @@ export function validatePluginManifest(input: unknown): PluginManifest {
   )
     fail("readiness.portId must reference a declared port");
   const environment = validateEnvironment(input.environment);
-  const actions = validateActions(input.actions, portIds);
+  const actions = validateActions(input.actions, portIds, resources?.display);
   const documentation = validateDocumentation(input.documentation);
   const imageBuild = validatePluginImageBuild(input.imageBuild);
   // These fields are persisted in definitions and can be carried by export,
@@ -562,16 +574,27 @@ function validateResources(
   if (input.display !== undefined) {
     if (
       !isRecord(input.display) ||
-      !["none", "shared", "dedicated"].includes(String(input.display.mode))
+      !["none", "shared", "dedicated", "isolated"].includes(String(input.display.mode))
     )
       fail("resources.display.mode is invalid");
     assertOnlyKeys(
       input.display,
-      ["mode", "rangeStart", "rangeEnd"],
+      ["mode", "rangeStart", "rangeEnd", "width", "height", "depth"],
       "resources.display",
     );
     const mode = input.display.mode as PluginDisplayRequirement["mode"];
-    if (mode === "dedicated") {
+    if (mode !== "isolated" && ["width", "height", "depth"].some(key => input.display![key] !== undefined))
+      fail("display dimensions are only valid for isolated displays");
+    if (mode === "isolated") {
+      if (input.display.rangeStart !== undefined || input.display.rangeEnd !== undefined)
+        fail("Isolated display numbers are allocated by Agentor");
+      display = {
+        mode,
+        width: boundedInteger(input.display.width, "display.width", 320, 3840, 1920),
+        height: boundedInteger(input.display.height, "display.height", 200, 2160, 1080),
+        depth: boundedInteger(input.display.depth, "display.depth", 24, 24, 24) as 24,
+      };
+    } else if (mode === "dedicated") {
       const rangeStart = boundedInteger(
         input.display.rangeStart,
         "display.rangeStart",
@@ -622,22 +645,29 @@ function validateEnvironment(
 function validateActions(
   input: unknown,
   portIds: Set<string>,
-): PluginPrivateAction[] | undefined {
+  display?: PluginDisplayRequirement,
+): PluginAction[] | undefined {
   if (input === undefined) return undefined;
   if (!Array.isArray(input) || input.length > 32) fail("actions is invalid");
   const ids = new Set<string>();
-  return input.map((raw) => {
-    if (!isRecord(raw) || raw.kind !== "private-ui")
-      fail("Only private-ui actions are supported");
+  return input.map((raw): PluginAction => {
+    if (!isRecord(raw) || !["private-ui", "desktop"].includes(String(raw.kind)))
+      fail("Only private-ui and desktop actions are supported");
     assertOnlyKeys(
       raw,
-      ["id", "label", "kind", "portId", "path", "openMode"],
+      raw.kind === "desktop" ? ["id", "label", "kind", "displayId", "openMode"] : ["id", "label", "kind", "portId", "path", "openMode"],
       "action",
     );
     const id = requiredText(raw.id, "action.id", 1, 64);
     if (!ID_RE.test(id) || ids.has(id))
       fail("action ids must be unique safe identifiers");
     ids.add(id);
+    if (raw.kind === "desktop") {
+      if (display?.mode !== "isolated" && display?.mode !== "shared") fail("desktop action requires a shared or isolated display");
+      if ((raw.displayId ?? "primary") !== "primary") fail("action.displayId must be primary");
+      if ((raw.openMode ?? "sandboxed-pane") !== "sandboxed-pane") fail("Unsupported desktop action openMode");
+      return { id, label: requiredText(raw.label, "action.label", 1, 100), kind: "desktop", displayId: "primary", openMode: "sandboxed-pane" };
+    }
     const portId = requiredText(raw.portId, "action.portId", 1, 64);
     if (!portIds.has(portId))
       fail("action.portId must reference a declared port");

@@ -30,6 +30,7 @@ export interface PluginObservedStatus {
   runtimeGeneration?: string;
   checkedAt: string;
   error?: { code: string; message: string };
+  desktop?: { mode: "isolated"; display: number; state: "starting" | "ready" | "reconnecting" | "failed" | "disabled"; viewerReady: boolean; error?: string };
 }
 
 export interface PluginInstallationRecord {
@@ -157,6 +158,7 @@ export class PluginInstallationStore extends UserScopedJsonStore<
     userId: string,
     id: string,
     manifest: PluginManifest,
+    unavailableDisplays: ReadonlySet<number> = new Set(),
   ): Promise<PluginInstallationRecord> {
     return this.withUserMutation(userId, async () => {
       const map = this.items.get(userId);
@@ -164,7 +166,7 @@ export class PluginInstallationStore extends UserScopedJsonStore<
       if (!map || !current) throw notFound();
       const previous = structuredClone(current);
       const usedPorts = new Set<number>();
-      const usedDisplays = new Set<number>();
+      const usedDisplays = new Set<number>(unavailableDisplays);
       for (const candidate of map.values()) {
         if (candidate.id === id || candidate.workerId !== current.workerId)
           continue;
@@ -305,16 +307,18 @@ function allocateDisplay(
 ): number | undefined {
   if (!requirement || requirement.mode === "none") return undefined;
   if (requirement.mode === "shared") return 99;
+  const start = requirement.mode === "isolated" ? 100 : requirement.rangeStart!;
+  const end = requirement.mode === "isolated" ? 999 : requirement.rangeEnd!;
   if (
     current !== undefined &&
-    current >= requirement.rangeStart! &&
-    current <= requirement.rangeEnd! &&
+    current >= start &&
+    current <= end &&
     !used.has(current)
   )
     return current;
   for (
-    let display = requirement.rangeStart!;
-    display <= requirement.rangeEnd!;
+    let display = start;
+    display <= end;
     display++
   )
     if (!used.has(display)) return display;
@@ -400,6 +404,9 @@ function validateObserved(
       typeof observed.error.message !== "string")
   )
     throw new Error("Invalid plugin observed error");
+  if (observed.desktop && (observed.desktop.mode !== "isolated" || !Number.isInteger(observed.desktop.display) || observed.desktop.display < 100 || observed.desktop.display > 999 ||
+      !["starting", "ready", "reconnecting", "failed", "disabled"].includes(observed.desktop.state) || typeof observed.desktop.viewerReady !== "boolean"))
+    throw new Error("Invalid plugin desktop observation");
 }
 
 function validateKeyReferences(input: unknown, label: string): string[] {

@@ -255,6 +255,10 @@ export default defineNitroPlugin(async (nitroApp) => {
       void (async () => {
         await containerManager.sync();
         await containerManager.reconcileWorkers();
+        for (const worker of containerManager.list()) {
+          if (worker.status === "running" && usePluginInstallationStore().listForWorker(worker.userId, worker.id).length)
+            await usePluginRuntimeManager().reconcileWorker(worker.userId, worker.id, worker.containerId).catch(() => undefined);
+        }
       })()
         .catch((error) =>
           logger.warn(

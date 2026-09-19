@@ -15,6 +15,7 @@ export function pluginWebSocketTarget(urlText: string, containerName: string) {
   if (!installation || installation.workerId !== workerId || !installation.desiredEnabled || !installation.observed.ready) return undefined;
   const definition = usePluginDefinitionStore().getById(installation.definitionId);
   const action = definition?.manifest.actions?.find((item) => item.id === actionId);
+  if (action?.kind !== 'private-ui') return undefined;
   const requirement = action && definition?.manifest.resources?.ports?.find((item) => item.id === action.portId);
   const port = action && installation.allocations?.ports[action.portId];
   if (!definition || definition.definitionHash !== installation.definitionHash || !action || requirement?.protocol !== 'http' || !port) return undefined;
@@ -37,17 +38,7 @@ export async function proxyPluginUi(event: H3Event, suffix = "") {
     worker.id,
     getRouterParam(event, "installationId")!,
   );
-  if (!installation.desiredEnabled || !installation.observed.ready)
-    throw createError({
-      statusCode: 409,
-      statusMessage: "Plugin is not ready",
-    });
   const runtime = useContainerManager().get(worker.id);
-  if (!runtime || runtime.status !== "running")
-    throw createError({
-      statusCode: 409,
-      statusMessage: "Worker is not running",
-    });
   const definition = usePluginDefinitionStore().getById(
     installation.definitionId,
   );
@@ -59,6 +50,14 @@ export async function proxyPluginUi(event: H3Event, suffix = "") {
   const action = definition.manifest.actions?.find(
     (item) => item.id === getRouterParam(event, "actionId"),
   );
+  if (action?.kind === "desktop") {
+    const prefix = getRequestURL(event).pathname.split("/plugin-ui/")[0];
+    return sendRedirect(event, `${prefix}/plugin-desktop/${encodeURIComponent(worker.id)}/${encodeURIComponent(installation.id)}/${encodeURIComponent(action.id)}/${action.displayId}/`, 302);
+  }
+  if (!installation.desiredEnabled || !installation.observed.ready)
+    throw createError({ statusCode: 409, statusMessage: "Plugin is not ready" });
+  if (!runtime || runtime.status !== "running")
+    throw createError({ statusCode: 409, statusMessage: "Worker is not running" });
   const port = action && installation.allocations?.ports[action.portId];
   const requirement =
     action &&

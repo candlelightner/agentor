@@ -42,7 +42,7 @@ export class WorkerSelfPluginDomain implements WorkerSelfMcpDomain {
       if (envKeys.some((key) => !declaredEnv.has(key)) || secretKeys.some((key) => !declaredSecrets.has(key))) throw failure(400, "Undeclared environment key reference");
       const created = await installations.create({ userId: context.userId, workerId: context.workerId, definitionId: definition.id, definitionVersion: definition.manifest.version, definitionHash: definition.definitionHash, desiredEnabled: args.enabled !== false, envKeys, secretKeys });
       try { return created.desiredEnabled ? await usePluginRuntimeManager().reconcileInstallation(context.userId, created.id, context.container.containerId) : created; }
-      catch (error) { await installations.delete(context.userId, created.id).catch(() => undefined); throw error; }
+      catch (error) { if (definition.manifest.resources?.display?.mode === "isolated") return installations.getById(created.id); await installations.delete(context.userId, created.id).catch(() => undefined); throw error; }
     }
     const installation = records.find((item) => item.id === args.installationId);
     if (!installation) throw failure(404, "Resource not found");
@@ -65,5 +65,5 @@ function publicInstallation(installation: ReturnType<ReturnType<typeof usePlugin
   if (!installation) return undefined;
   const definition = usePluginDefinitionStore().getById(installation.definitionId);
   if (!definition || definition.definitionHash !== installation.definitionHash) return undefined;
-  return { id: installation.id, definitionId: definition.id, name: definition.manifest.name, version: definition.manifest.version, desiredEnabled: installation.desiredEnabled, observed: installation.observed, allocations: installation.allocations ?? { ports: {} }, actions: definition.manifest.actions ?? [], documentation: definition.manifest.documentation ?? {}, environment: { envKeys: installation.envKeys, secretKeys: installation.secretKeys } };
+  return { id: installation.id, definitionId: definition.id, name: definition.manifest.name, version: definition.manifest.version, desiredEnabled: installation.desiredEnabled, observed: installation.observed, displayMode: definition.manifest.resources?.display?.mode ?? "none", allocations: installation.allocations ?? { ports: {} }, actions: definition.manifest.actions ?? [], documentation: definition.manifest.documentation ?? {}, environment: { envKeys: installation.envKeys, secretKeys: installation.secretKeys } };
 }

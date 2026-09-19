@@ -16,6 +16,7 @@ import type {
   PluginCommand,
   PluginManifest,
   PluginReadiness,
+  PluginDisplayRequirement,
 } from "./plugin-manifest";
 
 export interface PluginExecutionRequest {
@@ -28,9 +29,11 @@ export interface PluginExecutionRequest {
   systemEnvironment: Record<string, string>;
   skillMarkdown?: string;
   signal: AbortSignal;
+  isolatedDisplay?: number;
 }
 
 export interface PluginProbeRequest {
+  isolatedDisplay?: number;
   workerId: string;
   installationId: string;
   readiness: PluginReadiness;
@@ -51,6 +54,7 @@ export interface PluginExecutionResult {
 export interface PluginWorkerExecutor {
   execute(request: PluginExecutionRequest): Promise<PluginExecutionResult>;
   probe(request: PluginProbeRequest): Promise<PluginExecutionResult>;
+  desktop?(request: { workerId: string; installationId: string; operation: "ensure" | "status" | "stop"; config: { display: number; width: number; height: number; depth: number }; signal: AbortSignal }): Promise<PluginExecutionResult>;
 }
 
 export type PluginDefinitionRuntimeAuthorizer = (
@@ -169,12 +173,16 @@ export class PluginRuntimeManager {
     assertRuntimeGeneration(runtimeGeneration);
     const installation = this.requiredInstallation(userId, installationId);
     return this.withWorker(installation.workerId, async () => {
-      const current = this.requiredInstallation(userId, installationId);
+      const current = await this.installations.setDesiredEnabled(userId, installationId, false);
       const definition = await this.definitionFor(current);
       await this.transition(current, "cleaning", runtimeGeneration);
       try {
-        await this.runPhase(current, definition.manifest, "stop");
-        await this.runPhase(current, definition.manifest, "cleanup");
+        try {
+          await this.runPhase(current, definition.manifest, "stop");
+          await this.runPhase(current, definition.manifest, "cleanup");
+        } finally {
+          await this.desktop(current, definition.manifest.resources?.display, "stop");
+        }
         await this.installations.releaseResources(userId, installationId);
         await this.installations.delete(userId, installationId);
       } catch (error) {
@@ -195,8 +203,16 @@ export class PluginRuntimeManager {
       installation.observed.state === "ready" &&
       installation.observed.ready &&
       installation.observed.runtimeGeneration === runtimeGeneration
-    )
-      return installation;
+    ) {
+      if (definition.manifest.resources?.display?.mode !== "isolated") return installation;
+      try {
+        await this.desktop(installation, definition.manifest.resources.display, "status");
+        await this.probe(installation, definition.manifest);
+        return installation;
+      } catch {
+        await this.transition(installation, "starting", runtimeGeneration);
+      }
+    }
     if (
       !installation.desiredEnabled &&
       installation.observed.state === "disabled" &&
@@ -206,11 +222,12 @@ export class PluginRuntimeManager {
     if (!installation.desiredEnabled) {
       await this.transition(installation, "stopping", runtimeGeneration);
       try {
-        await this.runPhase(installation, definition.manifest, "stop");
+        try { await this.runPhase(installation, definition.manifest, "stop"); }
+        finally { await this.desktop(installation, definition.manifest.resources?.display, "stop"); }
         return await this.installations.setObserved(
           installation.userId,
           installation.id,
-          observed("disabled", false, runtimeGeneration),
+          { ...observed("disabled", false, runtimeGeneration), ...this.desktopObservation(installation, "disabled") },
         );
       } catch (error) {
         await this.recordError(installation, error, runtimeGeneration);
@@ -225,6 +242,16 @@ export class PluginRuntimeManager {
         definition.manifest,
       );
       await this.transition(current, "installing", runtimeGeneration);
+      const unavailable = new Set<number>();
+      for (;;) {
+        try { await this.desktop(current, definition.manifest.resources?.display, "ensure"); break; }
+        catch (error) {
+          if ((error as { code?: string }).code !== "PLUGIN_DISPLAY_IN_USE" || unavailable.size >= 15) throw error;
+          unavailable.add(current.allocations!.display!);
+          current = await this.installations.reserveResources(current.userId, current.id, definition.manifest, unavailable);
+          await this.transition(current, "starting", runtimeGeneration);
+        }
+      }
       await this.runPhase(current, definition.manifest, "install");
       current = this.requiredInstallation(current.userId, current.id);
       await this.transition(current, "starting", runtimeGeneration);
@@ -234,12 +261,35 @@ export class PluginRuntimeManager {
       return await this.installations.setObserved(
         current.userId,
         current.id,
-        observed("ready", true, runtimeGeneration),
+        { ...observed("ready", true, runtimeGeneration), ...this.desktopObservation(current, "ready") },
       );
     } catch (error) {
+      if (definition.manifest.resources?.display?.mode === "isolated") {
+        const current = this.requiredInstallation(installation.userId, installation.id);
+        try { await this.runPhase(current, definition.manifest, "stop"); }
+        catch { /* Preserve the original bounded failure. */ }
+        await this.desktop(current, definition.manifest.resources.display, "stop").catch(() => undefined);
+      }
       await this.recordError(installation, error, runtimeGeneration);
       throw error;
     }
+  }
+
+  private desktopObservation(installation: PluginInstallationRecord, state: "starting" | "ready" | "failed" | "disabled") {
+    if (this.definitions.getById(installation.definitionId)?.manifest.resources?.display?.mode !== "isolated" || installation.allocations?.display === undefined) return {};
+    return { desktop: { mode: "isolated" as const, display: installation.allocations.display, state, viewerReady: state === "ready" } };
+  }
+
+  private async desktop(installation: PluginInstallationRecord, requirement: PluginDisplayRequirement | undefined, operation: "ensure" | "status" | "stop") {
+    if (requirement?.mode !== "isolated" || (operation === "stop" && installation.allocations?.display === undefined)) return;
+    if (!this.executor.desktop || installation.allocations?.display === undefined)
+      throw runtimeError("PLUGIN_DESKTOP_UNAVAILABLE", "Managed desktop is unavailable. Update the worker image and rebuild the worker.", 502);
+    const result = await settleOnceWithDeadline(signal => this.executor.desktop!({
+      workerId: installation.workerId, installationId: installation.id, operation,
+      config: { display: installation.allocations!.display!, width: requirement.width ?? 1920, height: requirement.height ?? 1080, depth: 24 }, signal,
+    }), 20_000, "Managed desktop timed out");
+    if (result.exitCode === 98) throw runtimeError("PLUGIN_DISPLAY_IN_USE", "Display is occupied by another application. Agentor could not find a free display; retry Enable after closing unused desktops.", 409);
+    if (result.exitCode !== 0) throw runtimeError("PLUGIN_DESKTOP_UNAVAILABLE", "Managed desktop is unavailable. Check the worker image, available memory, and display conflicts; then retry Enable.", 502);
   }
 
   private async definitionFor(
@@ -293,6 +343,7 @@ export class PluginRuntimeManager {
       envKeys: [...installation.envKeys],
       secretKeys: [...installation.secretKeys],
       systemEnvironment: runtimeEnvironment(installation),
+      ...(manifest.resources?.display?.mode === "isolated" ? { isolatedDisplay: installation.allocations?.display } : {}),
       ...(manifest.documentation?.skillMarkdown
         ? { skillMarkdown: manifest.documentation.skillMarkdown }
         : {}),
@@ -354,6 +405,7 @@ export class PluginRuntimeManager {
           envKeys: [...installation.envKeys],
           secretKeys: [...installation.secretKeys],
           systemEnvironment: runtimeEnvironment(installation),
+          ...(manifest.resources?.display?.mode === "isolated" ? { isolatedDisplay: installation.allocations?.display } : {}),
           signal,
         }),
       timeoutMs,
@@ -375,7 +427,7 @@ export class PluginRuntimeManager {
     return this.installations.setObserved(
       installation.userId,
       installation.id,
-      observed(state, false, runtimeGeneration),
+      { ...observed(state, false, runtimeGeneration), ...this.desktopObservation(installation, "starting") },
     );
   }
 
@@ -391,6 +443,7 @@ export class PluginRuntimeManager {
       .setObserved(installation.userId, installation.id, {
         ...observed("error", false, runtimeGeneration),
         error: { code: normalized.code, message: normalized.publicMessage },
+        ...this.desktopObservation(current, "failed"),
       })
       .catch(() => undefined);
   }
@@ -451,6 +504,7 @@ export class DockerPluginWorkerExecutor implements PluginWorkerExecutor {
         secretKeys: request.secretKeys,
         systemEnvironment: request.systemEnvironment,
         skillMarkdown: request.skillMarkdown,
+        isolatedDisplay: request.isolatedDisplay,
       },
       request.signal,
     );
@@ -467,14 +521,19 @@ export class DockerPluginWorkerExecutor implements PluginWorkerExecutor {
         envKeys: request.envKeys,
         secretKeys: request.secretKeys,
         systemEnvironment: request.systemEnvironment,
+        isolatedDisplay: request.isolatedDisplay,
       },
       request.signal,
     );
   }
 
+  desktop(request: Parameters<NonNullable<PluginWorkerExecutor["desktop"]>>[0]): Promise<PluginExecutionResult> {
+    return this.invoke(request.workerId, "desktop", { installationId: request.installationId, operation: request.operation, config: request.config }, request.signal);
+  }
+
   private async invoke(
     workerId: string,
-    operation: "execute" | "probe",
+    operation: "execute" | "probe" | "desktop",
     payload: Record<string, unknown>,
     signal: AbortSignal,
   ): Promise<PluginExecutionResult> {

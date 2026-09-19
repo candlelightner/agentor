@@ -5,6 +5,8 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
   testDir: ".",
   testMatch: [
+    "api/plugin-core.spec.ts",
+    "api/plugin-desktop-core.spec.ts",
     "api/admin-workspace-store-transactions.spec.ts",
     "api/container-store-quarantine.spec.ts",
     "api/instance-backup-*.spec.ts",

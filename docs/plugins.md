@@ -47,6 +47,9 @@ output, and releases allocated resources when stopped or removed. A plugin
 cannot choose an arbitrary host port: it must declare a port ID and protocol,
 then receives an allocation from its declared fixed value or range. Display
 use is similarly declared as none, shared, or a bounded dedicated display.
+Opt-in `isolated` displays have an Agentor-owned graphical lifecycle and native
+`desktop` actions requiring no plugin HTTP port. See [Managed plugin desktops](plugin-desktops.md)
+for the schema, authorization boundary, upgrade instructions, and examples.
 
 The worker image includes the small `plugin-runner` at build time. Lifecycle
 requests reach it through the orchestrator's Docker-exec boundary as a bounded

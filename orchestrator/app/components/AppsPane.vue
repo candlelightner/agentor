@@ -18,7 +18,7 @@ const showPluginCatalog = ref(false);
 const pluginDefinitions = computed(() => new Map(plugins.definitions.value.map(item => [item.id, item])));
 const pluginActions = computed(() => plugins.installations.value.flatMap((installation) => {
   const definition = pluginDefinitions.value.get(installation.definitionId);
-  if (!definition || !installation.desiredEnabled || !installation.observed.ready) return [];
+  if (!definition) return [];
   return (definition.manifest.actions || []).map(action => ({ installation, definition, action }));
 }));
 onBeforeUnmount(plugins.stop);
@@ -79,7 +79,7 @@ function openInstalledPlugin(item: (typeof pluginActions.value)[number]) {
     item.installation.id,
     item.action.id,
     `${item.definition.name}: ${item.action.label}`,
-    item.action.openMode === 'desktop' || (item.action.path === '/vnc.html' && item.installation.allocations?.ports?.[item.action.portId] === 6080) ? 'desktop' : 'sandboxed-pane',
+    item.action.kind === 'desktop' || item.action.openMode === 'desktop' || (item.action.path === '/vnc.html' && item.action.portId && item.installation.allocations?.ports?.[item.action.portId] === 6080) ? 'desktop' : 'sandboxed-pane',
   );
 }
 function openPluginCatalog() {
@@ -150,7 +150,7 @@ function openPluginCatalog() {
       <section v-if="pluginActions.length" class="rounded-lg border border-gray-200 bg-gray-50 p-4 dark:border-gray-800 dark:bg-gray-900" data-testid="installed-plugin-actions">
         <h3 class="mb-3 text-sm font-medium text-gray-900 dark:text-white">Installed plugin applications</h3>
         <div class="flex flex-wrap gap-2">
-          <UButton v-for="item in pluginActions" :key="`${item.installation.id}-${item.action.id}`" size="sm" color="neutral" variant="outline" icon="i-lucide-puzzle" @click="openInstalledPlugin(item)">{{ item.definition.name }} · {{ item.action.label }}</UButton>
+          <PluginActionButton v-for="item in pluginActions" :key="`${item.installation.id}-${item.action.id}`" :worker-id="containerId" :installation="item.installation" :action="item.action" :name="item.definition.name" @open="openInstalledPlugin(item)" />
         </div>
       </section>
     </div>

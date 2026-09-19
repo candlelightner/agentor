@@ -113,6 +113,14 @@ def child_env(req: dict[str, Any]) -> dict[str, str]:
             env[key] = value
         else:
             raise Invalid()
+    if req.get("isolatedDisplay") is not None:
+        from desktop_runtime import env_for
+        ident = installation(req.get("installationId"))
+        display = req["isolatedDisplay"]
+        if type(display) is not int or not 100 <= display <= 999:
+            raise Invalid()
+        env["DISPLAY"] = f":{display}"
+        env["XAUTHORITY"] = env_for(ident, display)["XAUTHORITY"]
     return env
 
 
@@ -307,7 +315,11 @@ def main() -> None:
     try:
         operation = sys.argv[1] if len(sys.argv) == 2 else ""
         req = read_request()
-        result = execute(req) if operation == "execute" else probe(req) if operation == "probe" else None
+        if operation == "desktop":
+            from desktop_runtime import control
+            result = control(req)
+        else:
+            result = execute(req) if operation == "execute" else probe(req) if operation == "probe" else None
         if result is None: raise Invalid()
         sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
     except Invalid: fail()

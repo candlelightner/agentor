@@ -49,6 +49,12 @@ export default defineEventHandler(async (event) => {
     setResponseStatus(event, 201);
     return result;
   } catch (error) {
+    // Keep a failed managed desktop inspectable and its allocation reserved
+    // until cleanup succeeds. Deleting it here could orphan a live desktop.
+    if (definition.manifest.resources?.display?.mode === "isolated") {
+      setResponseStatus(event, 201);
+      return usePluginInstallationStore().getById(created.id);
+    }
     await usePluginInstallationStore()
       .delete(worker.userId, created.id)
       .catch(() => undefined);

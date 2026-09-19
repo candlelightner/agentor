@@ -67,7 +67,7 @@ function saveDefinition() {
   });
 }
 function actionOpen(installationId: string, action: NonNullable<PluginManifest['actions']>[number], definition: PluginDefinition) {
-  openPluginTab(props.containerId, props.containerName, installationId, action.id, `${definition.name}: ${action.label}`, action.openMode === 'desktop' ? 'desktop' : 'sandboxed-pane');
+  openPluginTab(props.containerId, props.containerName, installationId, action.id, `${definition.name}: ${action.label}`, action.kind === 'desktop' || action.openMode === 'desktop' ? 'desktop' : 'sandboxed-pane');
   open.value = false;
 }
 function close() { open.value = false; }

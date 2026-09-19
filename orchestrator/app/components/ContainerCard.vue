@@ -66,12 +66,12 @@ const cardPlugins = usePlugins(cardContainerId);
 const cardPluginDefinitions = computed(() => new Map(cardPlugins.definitions.value.map(item => [item.id, item])));
 const cardPluginActions = computed(() => cardPlugins.installations.value.flatMap((installation) => {
   const definition = cardPluginDefinitions.value.get(installation.definitionId);
-  if (!definition || !installation.desiredEnabled || !installation.observed.ready) return [];
+  if (!definition) return [];
   return (definition.manifest.actions || []).map(action => ({ installation, definition, action }));
 }));
 onBeforeUnmount(cardPlugins.stop);
 function openCardPlugin(item: (typeof cardPluginActions.value)[number]) {
-  openPluginTab(props.container.id, displayLabel.value, item.installation.id, item.action.id, `${item.definition.name}: ${item.action.label}`, item.action.openMode === 'desktop' || (item.action.path === '/vnc.html' && item.installation.allocations?.ports?.[item.action.portId] === 6080) ? 'desktop' : 'sandboxed-pane');
+  openPluginTab(props.container.id, displayLabel.value, item.installation.id, item.action.id, `${item.definition.name}: ${item.action.label}`, item.action.kind === 'desktop' || item.action.openMode === 'desktop' || (item.action.path === '/vnc.html' && item.action.portId && item.installation.allocations?.ports?.[item.action.portId] === 6080) ? 'desktop' : 'sandboxed-pane');
 }
 
 function metricColor(p: number) {
@@ -245,7 +245,7 @@ function onHScrollWheel(e: WheelEvent) {
 
     <div v-if="isRunning && cardPluginActions.length" class="card-plugin-actions mt-2 flex items-center gap-1.5 overflow-x-auto" data-testid="worker-plugin-actions" @wheel="onHScrollWheel">
       <UTooltip v-for="item in cardPluginActions" :key="`${item.installation.id}-${item.action.id}`" :text="`${item.definition.name}: ${item.action.label}`">
-        <UButton size="xs" color="neutral" variant="outline" icon="i-lucide-puzzle" @click="openCardPlugin(item)">{{ item.definition.name }} · {{ item.action.label }}</UButton>
+        <PluginActionButton :worker-id="container.id" :installation="item.installation" :action="item.action" :name="item.definition.name" @open="openCardPlugin(item)" />
       </UTooltip>
     </div>
 

@@ -96,7 +96,7 @@ export interface PluginManifest {
   version: string;
   lifecycle: { start: { argv: string[]; [key: string]: unknown }; [key: string]: unknown };
   environment?: { envKeys?: string[]; secretKeys?: string[] };
-  actions?: Array<{ id: string; label: string; kind: 'private-ui'; portId: string; path: string; openMode?: 'sandboxed-pane' | 'desktop' }>;
+  actions?: Array<{ id: string; label: string; kind: 'private-ui' | 'desktop'; portId?: string; path?: string; displayId?: 'primary'; openMode?: 'sandboxed-pane' | 'desktop' }>;
   [key: string]: unknown;
 }
 
@@ -114,7 +114,7 @@ export interface PluginInstallation {
   id: string;
   definitionId: string;
   desiredEnabled: boolean;
-  observed: { state: string; ready: boolean; checkedAt?: string; error?: { code: string; message: string } };
+  observed: { state: string; ready: boolean; checkedAt?: string; error?: { code: string; message: string }; desktop?: { mode: 'isolated'; display: number; state: string; viewerReady: boolean } };
   allocations?: { ports?: Record<string, number>; display?: number };
 }
 

@@ -8,14 +8,13 @@ const props = defineProps<{
 }>();
 
 const source = computed(() =>
-  props.openMode === 'desktop'
-    ? `/desktop/${encodeURIComponent(props.containerId)}/agentor.html?autoconnect=true&resize=scale&quality=9&compression=0&reconnect=true&reconnect_delay=2000&path=ws/desktop/${encodeURIComponent(props.containerId)}`
-    : `/plugin-ui/${encodeURIComponent(props.containerId)}/${encodeURIComponent(props.installationId)}/${encodeURIComponent(props.actionId)}/`,
+  `${useRuntimeConfig().app.baseURL.replace(/\/$/, '')}/plugin-ui/${encodeURIComponent(props.containerId)}/${encodeURIComponent(props.installationId)}/${encodeURIComponent(props.actionId)}/`,
 );
 </script>
 
 <template>
-  <div class="h-full w-full bg-white dark:bg-gray-950">
+  <div class="h-full w-full flex flex-col bg-white dark:bg-gray-950">
+    <div class="px-3 py-1 text-xs border-b"><a :href="source" target="_blank" rel="noopener noreferrer">Open in tab</a></div>
     <!-- The proxy authenticates every request and strips dashboard credentials
          before forwarding. Omission of allow-same-origin keeps arbitrary
          worker-supplied application code in an opaque browser origin. -->
@@ -24,7 +23,7 @@ const source = computed(() =>
       :title="label"
       :sandbox="props.openMode === 'desktop' ? undefined : 'allow-forms allow-scripts'"
       referrerpolicy="no-referrer"
-      class="h-full w-full border-0"
+      class="flex-1 min-h-0 w-full border-0"
       data-testid="plugin-application-frame"
     />
   </div>
