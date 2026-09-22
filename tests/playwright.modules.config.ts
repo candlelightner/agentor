@@ -11,6 +11,7 @@ export default defineConfig({
     "api/container-store-quarantine.spec.ts",
     "api/instance-backup-*.spec.ts",
     "api/instance-restore-helper.spec.ts",
+    "api/managed-volume-store.spec.ts",
     "api/management-image-backup-domain.spec.ts",
     "api/management-worker-domain.spec.ts",
     "api/provider-http.spec.ts",

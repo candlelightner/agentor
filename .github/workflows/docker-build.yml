@@ -11,12 +11,19 @@ on:
 env:
   REGISTRY: ghcr.io
 
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   changes:
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     outputs:
       orchestrator: ${{ steps.filter.outputs.orchestrator }}
       worker: ${{ steps.filter.outputs.worker }}
+      validation: ${{ steps.filter.outputs.validation }}
+      force: ${{ steps.scope.outputs.force }}
     steps:
       - uses: actions/checkout@v4
 
@@ -30,10 +37,135 @@ jobs:
             worker:
               - 'worker/**'
               - '.github/workflows/docker-build.yml'
+            validation:
+              - 'orchestrator/**'
+              - 'worker/**'
+              - 'tests/**'
+              - 'docker-compose.tests.yml'
+              - '.github/workflows/docker-build.yml'
+
+      - name: Select full validation for tags and manual runs
+        id: scope
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" || "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "force=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "force=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  quality:
+    name: Typecheck and module tests
+    needs: changes
+    if: needs.changes.outputs.validation == 'true' || needs.changes.outputs.force == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            orchestrator/package-lock.json
+            tests/package-lock.json
+
+      - name: Install orchestrator dependencies
+        working-directory: orchestrator
+        run: npm ci --no-audit --no-fund
+
+      - name: Install test dependencies
+        working-directory: tests
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck orchestrator
+        working-directory: orchestrator
+        run: npm run typecheck
+
+      - name: Run no-server module and helper tests
+        working-directory: tests
+        run: npm run test:modules
+
+  docker_regression:
+    name: Isolated Docker API and UI regression
+    needs: changes
+    if: needs.changes.outputs.validation == 'true' || needs.changes.outputs.force == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report runner capacity
+        shell: bash
+        run: |
+          df -h /
+          docker system df
+          available_kib=$(df --output=avail / | tail -n 1)
+          # A measured warm run occupies about 12.5 GiB across the outer
+          # runner image and nested-Docker volume. Require another ~3.5 GiB
+          # for cold-build transient layers, npm installs, and artifacts.
+          minimum_kib=$((16 * 1024 * 1024))
+          if (( available_kib < minimum_kib )); then
+            echo "At least 16 GiB of free disk is required for the isolated DinD build and tests." >&2
+            exit 1
+          fi
+
+      - name: Run bounded isolated regression suite
+        working-directory: tests
+        run: npm run test:docker:ci
+
+      - name: Upload Playwright failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: isolated-regression-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            tests/playwright-report/
+            tests/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove isolated test state
+        if: always()
+        run: docker compose -f docker-compose.tests.yml down -v --remove-orphans
+
+  test_gate:
+    name: CI test gate
+    needs: [changes, quality, docker_regression]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CHANGES_RESULT: ${{ needs.changes.result }}
+      VALIDATION_REQUIRED: ${{ needs.changes.outputs.validation == 'true' || needs.changes.outputs.force == 'true' }}
+      QUALITY_RESULT: ${{ needs.quality.result }}
+      REGRESSION_RESULT: ${{ needs.docker_regression.result }}
+    steps:
+      - name: Enforce validation results
+        shell: bash
+        run: |
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "Change detection did not succeed: $CHANGES_RESULT" >&2
+            exit 1
+          fi
+          if [[ "$VALIDATION_REQUIRED" != "true" ]]; then
+            echo "No image, runtime, or test-harness changes require validation."
+            exit 0
+          fi
+          if [[ "$QUALITY_RESULT" != "success" || "$REGRESSION_RESULT" != "success" ]]; then
+            echo "Required validation did not succeed (quality=$QUALITY_RESULT, regression=$REGRESSION_RESULT)." >&2
+            exit 1
+          fi
+          echo "All required validation jobs succeeded."
 
   build-orchestrator:
-    needs: changes
-    if: needs.changes.outputs.orchestrator == 'true' || startsWith(github.ref, 'refs/tags/')
+    needs: [changes, test_gate]
+    if: >-
+      always() &&
+      needs.changes.result == 'success' &&
+      needs.test_gate.result == 'success' &&
+      (needs.changes.outputs.orchestrator == 'true' || needs.changes.outputs.force == 'true')
     strategy:
       fail-fast: true
       matrix:
@@ -130,8 +262,12 @@ jobs:
           docker buildx imagetools create $TAGS $SOURCES
 
   build-worker:
-    needs: changes
-    if: needs.changes.outputs.worker == 'true' || startsWith(github.ref, 'refs/tags/')
+    needs: [changes, test_gate]
+    if: >-
+      always() &&
+      needs.changes.result == 'success' &&
+      needs.test_gate.result == 'success' &&
+      (needs.changes.outputs.worker == 'true' || needs.changes.outputs.force == 'true')
     strategy:
       fail-fast: true
       matrix:

@@ -13,7 +13,7 @@
 
 Per-file test counts are tracked in [`tests/TESTS.md`](../tests/TESTS.md).
 
-Unit tests (vitest) are planned but not yet implemented.
+No separate Vitest unit-test runner is implemented. Focused no-server module tests nevertheless exist and use Playwright's module configuration; they cover server utilities without browser or global-server setup. Vitest remains planned if a separate unit-test runner is needed.
 
 Lifecycle fault coverage includes an isolated Docker-in-Docker daemon restart: it verifies that a secret-bearing desired-running worker waits for Agentor's managed bootstrap and that a deliberately stopped worker remains stopped. Focused no-server coverage also verifies operation-deadline timeout/abort diagnostics, disconnect cancellation, and independent retry of stalled Docker-helper cleanup. These checks are intentionally isolated from a host Docker daemon.
 
@@ -24,7 +24,7 @@ manager with fake dependencies, and the isolated restore helper:
 
 ```bash
 cd tests
-npx playwright test --config=playwright.modules.config.ts
+npm run test:modules
 ```
 
 These tests never require real Google credentials; Google Drive requests are
@@ -68,7 +68,32 @@ npx playwright test api/health.spec.ts
 
 # View HTML report after run
 npm run test:report
+
+# The bounded API/UI suite used by the image-publication CI gate
+npm run test:docker:ci
 ```
+
+## Image-publication CI gate
+
+The Docker image workflow validates runtime, image, workflow, and test-harness
+changes before either architecture build can publish a digest. Tags and manual
+runs always execute the gate. Test-only changes execute validation without
+publishing unchanged images.
+
+The gate has two independent jobs:
+
+- Node.js 22 installs both lockfiles with `npm ci`, typechecks the orchestrator,
+  and runs every test selected by `playwright.modules.config.ts` without a live
+  server or browser.
+- A single amd64 privileged runner boots the isolated DinD stack and runs
+  `npm run test:docker:ci`: health API, the managed-volume helper and full
+  managed-volume API lifecycle, login UI, and managed-volume UI coverage.
+
+The Docker job requires 16 GiB free disk, runs for at most 90 minutes, uploads
+Playwright artifacts on failure, and removes only its test-owned Compose state.
+It receives no application credentials; fork pull requests use read-only
+repository and pull-request permissions. This bounded gate is representative,
+not a replacement for the full Dockerized suite required for feature sign-off.
 
 ## Default Failure Artifacts
 

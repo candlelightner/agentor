@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **2017 tests** across 199 test files (1391 API across 136 files + 626 UI across 63 files)
+- **2045 tests** across 205 test files (1418 API across 141 files + 627 UI across 64 files), as enumerated with `npx playwright test --list`
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -108,13 +108,13 @@ tests/
     worker-lifecycle.ts    # Container create/cleanup utilities
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
-    api/                     # API endpoint tests (1391 tests across 136 files)
-  ui/                      # UI interaction tests (626 tests across 63 files)
+    api/                     # API endpoint tests (1418 tests across 141 files)
+  ui/                      # UI interaction tests (627 tests across 64 files)
 ```
 
 ## Test Categories
 
-### API Tests (1391 tests, 136 files)
+### API Tests (1418 tests, 141 files)
 
 | File | Tests | Coverage |
 | --- | ---: | --- |
@@ -219,6 +219,11 @@ tests/
 | `backup-restore-safety.spec.ts`   | 34 | Restore and worker lifecycle safety: per-worker and owner→worker serialization (including provisional imports), prompt Docker timeouts whose worker fence remains held until the aborted request settles without blocking sibling workers, atomic missing-runtime reconciliation, durable backward-compatible desired state, idempotent stop/archive/rebuild retries, persistence-first managed recovery, explicit reverse-order partial-rollback reporting, reference-safe imported-environment cleanup, transactional worker-configuration deletion, strict production volume/image cleanup adapters, retryable aggregate permanent-deletion cleanup, preserved failed-rootfs recovery tags, deleted-owner worker cleanup, restore draining, and a bounded fail-closed deadline for non-cooperative restore work. |
 | `backup-restore-cancellation.spec.ts` | 6 | Restore admission/cancellation safety: setup-time cancellation cannot be overwritten, queued cancellation removes admission/pins even when status persistence fails, queued in-place restores are removable, shared-artifact pins are independently job-owned, concurrent retry calls admit one execution/pin, and the legacy synchronous restore contract runs through the same bounded queue. |
 | `google-backup-oauth-installation.spec.ts` | 2 | Admin-only installation Google OAuth configuration: encrypted write-only client secret status, non-disclosure, and a mocked authorization challenge without a Google account. |
+| `managed-volumes.spec.ts` | 11 | Managed local persistence API: safe/additive targets, owner isolation, live/recreation authorization, detach/reattach and confirmed deletion, protection locks, restart/archive survival, and deleted-account administrator retention. |
+| `managed-volume-store.spec.ts` | 6 | No-server managed-volume store/module coverage: protected-path validation, owner-scoped idempotence/overlap rejection, policy defaults, fail-closed missing-volume behavior, startup recovery isolation, and retained deleted-owner records across restart. |
+| `managed-volume-helper.spec.ts` | 3 | Isolated-Docker trusted live-mount helper: both worker privilege states retain their own privilege setting, and a busy path is rejected without replacing contents. |
+| `managed-volume-mcp.spec.ts` | 1 | Delegated management-MCP volume inventory and mutations are limited to the live group subtree and revoked with membership. |
+| `resource-monitor-lifecycle.spec.ts` | 2 | No-server resource-monitor lifecycle regression: a stale stats failure from a replaced container cannot mark its replacement unknown, while a current-runtime failure still reports unknown health. |
 | `image-catalog.spec.ts`           | 16    | Controlled local image definitions/builds: Safe actionable rejection and explicit Advanced boundary, approved bases/context/legacy-fragment policy, requestId-idempotent async build/validation/test-worker jobs with logs/cancellation, immutable digests, distinct compatibility outcomes and promotion/test-worker gates, rollback/defaults, cleanup, ownership, and legacy normalization without a separate database migration. |
 | `git-image-catalog.spec.ts`       | 9     | Mocked GitHub catalog connection, encrypted write-only PAT handling, initial empty-repository diagnostics, push/pull conflict safety, recovery, branch/PR metadata, immutable GHCR digests, disconnect, and credential redaction.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `image-catalog-hierarchy.spec.ts` | 29 | Transactional image/Git store rollback, deleted-owner fencing that prevents stale Git connections from resurrecting credentials, corruption fail-closed behavior, controlled/fake builder terminalization after persistence failures, durable definition-artifact deletion recovery, Git-exported plugin imageBuild Dockerfile/context reproduction with stable-ID recovery, first/subsequent direct plus branch/PR push and provenance-bound pull retry reconciliation without duplicate remote commits, branches, PRs, or Actions dispatches, recursive image visibility/manageability, legacy Safe/Ready normalization, provisioning boundaries, idempotent async outcomes, promotion gates, paged logs, and cancellation. |
@@ -258,7 +263,7 @@ tests/
 The container edge-case coverage includes repeated-stop idempotency: stopping an
 already-stopped worker returns success and leaves its persisted status stopped.
 
-### UI Tests (626 tests, 63 files)
+### UI Tests (627 tests, 64 files)
 
 | File | Tests | Coverage |
 | --- | ---: | --- |
@@ -268,6 +273,7 @@ already-stopped worker returns success and leaves its persisted status stopped.
 | `instance-backup-management.spec.ts` | 5 | Platform-admin whole-instance UI: asynchronous Local/Google Drive creation scope, retry-stable body/header idempotency identity after an uncertain response, remote discovery/inspection/adoption with key availability, plugin/image/host dependency inventory, restore preflight, explicit destructive/external-dependency acknowledgements, and blocker-safe disabled restore. Provider and job responses are mocked; no real Google credentials are required. |
 | `image-catalog-real.spec.ts` | 1 | Real controlled image build, test-worker verification, and promotion. |
 | `managed-networks.spec.ts` | 1 | Managed-network dashboard workflow. |
+| `managed-volumes.spec.ts` | 1 | Persistent-path controls show the live-mount warning, independent self-service controls, and the managed-volume inventory. |
 | `worker-configuration-real.spec.ts` | 1 | Real worker-configuration persistence and execution. |
 | `worker-groups.spec.ts` | 5 | Worker-group dashboard CRUD, inherited worker-self API access selection, grouping, recursive lifecycle controls, nested archived-group rendering, and administration controls. |
 | `workspace-storage-real.spec.ts` | 1 | Real workspace storage browsing and operations. |
