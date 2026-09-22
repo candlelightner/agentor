@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test as base, expect } from '@playwright/test';
 import { execFileSync } from 'node:child_process';
 import { link, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -12,6 +12,22 @@ import {
 } from '../../orchestrator/server/utils/managed-volume-sizing';
 import { beginInstanceSnapshot } from '../../orchestrator/server/utils/instance-snapshot-gate';
 import { managedVolumeIsLive, type ManagedVolumeSizingResource } from '../../orchestrator/server/utils/managed-volume-inventory';
+
+const TEST_ORCHESTRATOR_HOSTNAME = 'sizing-test-orchestrator';
+// The mocked Docker runtime needs an orchestrator identity even on non-container
+// runners. Own it per test rather than inheriting this worker's HOSTNAME.
+const test = base.extend<{ orchestratorIdentity: void }>({
+  orchestratorIdentity: [async ({}, use) => {
+    const previousHostname = process.env.HOSTNAME;
+    process.env.HOSTNAME = TEST_ORCHESTRATOR_HOSTNAME;
+    try {
+      await use();
+    } finally {
+      if (previousHostname === undefined) delete process.env.HOSTNAME;
+      else process.env.HOSTNAME = previousHostname;
+    }
+  }, { auto: true }],
+});
 
 const INCARNATION = 'a'.repeat(64);
 const fakeDocker = () => ({ listContainers: async () => [] });
@@ -126,7 +142,13 @@ test('helper is immutable, read-only, networkless and grants only DAC_READ_SEARC
     };
     const docker = {
       listContainers: async () => [], getVolume: () => ({ inspect: async () => ({ Name: 'private-helper' }) }),
-      getContainer: () => ({ inspect: async () => ({ Image: 'sha256:trusted' }), remove: async () => {} }),
+      getContainer: (id: string) => ({
+        inspect: async () => {
+          expect(id).toBe(TEST_ORCHESTRATOR_HOSTNAME);
+          return { Image: 'sha256:trusted' };
+        },
+        remove: async () => {},
+      }),
       createContainer: async (options: any) => { createOptions = options; return helper; },
     };
     const target = { ...resource('helper'), dockerName: 'private-helper' };
