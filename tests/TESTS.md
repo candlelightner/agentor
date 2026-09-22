@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **2084 tests** across 208 test files (1456 API across 144 files + 628 UI across 64 files), as enumerated with the Playwright JSON list reporter
+- **2085 tests** across 208 test files (1457 API across 144 files + 628 UI across 64 files), as enumerated with the Playwright JSON list reporter
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -108,13 +108,13 @@ tests/
     worker-lifecycle.ts    # Container create/cleanup utilities
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
-    api/                     # API endpoint tests (1456 tests across 144 files)
+    api/                     # API endpoint tests (1457 tests across 144 files)
   ui/                      # UI interaction tests (628 tests across 64 files)
 ```
 
 ## Test Categories
 
-### API Tests (1456 tests, 144 files)
+### API Tests (1457 tests, 144 files)
 
 | File | Tests | Coverage |
 | --- | ---: | --- |
@@ -221,7 +221,7 @@ tests/
 | `google-backup-oauth-installation.spec.ts` | 2 | Admin-only installation Google OAuth configuration: encrypted write-only client secret status, non-disclosure, and a mocked authorization challenge without a Google account. |
 | `managed-volumes.spec.ts` | 12 | Managed local persistence API: safe/additive targets, owner isolation, live/recreation authorization, detach/reattach and confirmed deletion, bounded allocated/logical on-demand sizing without Docker-identity disclosure, protection locks, restart/archive survival, and deleted-account administrator retention. |
 | `managed-volume-store.spec.ts` | 6 | No-server managed-volume store/module coverage: protected-path validation, owner-scoped idempotence/overlap rejection, policy defaults, fail-closed missing-volume behavior, startup recovery isolation, and retained deleted-owner records across restart. |
-| `managed-volume-sizing.spec.ts` | 19 | No-server sizing coverage: known/stale/unknown cache and incarnation invalidation, global/per-owner admission and helper-cleanup reservations, cancellation/publication and snapshot fencing, restart interruption, live authorization revocation, immutable read-only networkless helper options with only `DAC_READ_SEARCH`, bounded scanner parsing, Docker timeout/cleanup settlement, and fail-closed startup reconciliation. A test-scoped orchestrator identity is restored after each test, so mocked helper tests do not depend on the runner exporting `HOSTNAME`. |
+| `managed-volume-sizing.spec.ts` | 20 | No-server sizing coverage: known/stale/unknown cache and incarnation invalidation, global/per-owner admission and helper-cleanup reservations, cancellation/publication and snapshot fencing, restart interruption, live authorization revocation, immutable read-only networkless helper options with only `DAC_READ_SEARCH`, bounded scanner parsing, Docker timeout/cleanup settlement, fail-closed startup reconciliation, and pre-create trusted-image failure releases snapshot/owner/global accounting. A test-scoped orchestrator identity is restored after each test, so mocked helper tests do not depend on the runner exporting `HOSTNAME`. |
 | `managed-volume-sizing-control.spec.ts` | 9 | Durable metadata-only REST/MCP job-control authorization, platform-only and owner/subtree boundaries, live credential/role/workspace/policy revocation after manager initialization and state-queue waits, no private-field disclosure, Docker-outage inspection, and cancellation without physical-volume discovery. |
 | `managed-volume-sizing-mcp-authority.spec.ts` | 7 | Management-MCP size-start authorization rechecks credential, policy, workspace binding, target identity, owner, and live group descendants around asynchronous discovery and manager admission. |
 | `managed-volume-helper.spec.ts` | 3 | Isolated-Docker trusted live-mount helper: both worker privilege states retain their own privilege setting, and a busy path is rejected without replacing contents. |

@@ -578,6 +578,10 @@ export class ManagedVolumeSizingManager {
       if (error?.statusCode === 404) throw volumeError(409, "Volume disappeared before the size scan; no replacement was created.");
       throw error;
     });
+    // Resolve the immutable helper image before registering a possible Docker
+    // create. A failure here definitively means no helper can exist, so it must
+    // not leave a pending-create reservation behind.
+    const image = await this.runtime.trustedImage();
     const operationId = randomUUID(), name = `agentor-volume-size-${operationId}`;
     const releaseOperation = registerOperationHelper(operationId);
     const tracked: TrackedSizeHelper = { release: releaseOperation, ownerKey: resource.ownerKey,
@@ -585,7 +589,6 @@ export class ManagedVolumeSizingManager {
     this.unresolvedHelpers.set(name, tracked);
     let helper: Docker.Container | undefined;
     try {
-      const image = await this.runtime.trustedImage();
       try {
         helper = await withOperationDeadline((operationSignal) => this.docker.createContainer({
           name, Image: image, Entrypoint: ["node", "-e", VOLUME_SIZE_SCANNER], Cmd: [],

@@ -163,6 +163,57 @@ test('helper is immutable, read-only, networkless and grants only DAC_READ_SEARC
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test('trusted-image failure before Docker create releases snapshot, owner, and global scheduling accounting', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'agentor-volume-size-image-failure-'));
+  let imageInspections = 0, createCalls = 0, helperRemovals = 0;
+  const started: string[] = [], releases = new Map<string, () => void>();
+  try {
+    const docker = {
+      listContainers: async () => [],
+      getVolume: () => ({ inspect: async () => ({}) }),
+      getContainer: (id: string) => id === TEST_ORCHESTRATOR_HOSTNAME ? {
+        inspect: async () => {
+          imageInspections += 1;
+          if (imageInspections === 1) throw new Error('trusted image unavailable');
+          return { Image: 'sha256:trusted' };
+        },
+      } : {
+        remove: async () => { helperRemovals += 1; },
+      },
+      createContainer: async (options: any) => {
+        createCalls += 1;
+        const volumeId = options.Labels['agentor.helper.volume-id'];
+        return {
+          start: async () => { started.push(volumeId); },
+          wait: async () => await new Promise<{ StatusCode: number }>((resolve) => {
+            releases.set(volumeId, () => resolve({ StatusCode: 0 }));
+          }),
+          logs: async () => Buffer.from('AGENTOR_VOLUME_SIZE {"ok":true,"allocatedBytes":"4","logicalBytes":"3","entriesScanned":1}\n'),
+        };
+      },
+    };
+    const manager = new ManagedVolumeSizingManager(dir, { docker: docker as any });
+    const failed = await manager.create('owner-a', async () => resource('image-failure', 'owner-a'), true);
+    expect(await terminal(manager, failed.id)).toMatchObject({ status: 'failed' });
+    expect(createCalls).toBe(0);
+    expect(helperRemovals).toBe(0);
+    expect(manager.hasActiveOperationsForInstanceSnapshot()).toBe(false);
+
+    const retried = await manager.create('owner-a', async () => resource('image-failure', 'owner-a'), true);
+    const otherOwner = await manager.create('owner-b', async () => resource('other-volume', 'owner-b'), true);
+    await expect.poll(() => releases.size).toBe(2);
+    expect(started).toEqual(expect.arrayContaining(['image-failure', 'other-volume']));
+    expect(started).toHaveLength(2);
+    expect(createCalls).toBe(2);
+    releases.get('image-failure')!();
+    releases.get('other-volume')!();
+    expect(await terminal(manager, retried.id)).toMatchObject({ status: 'succeeded' });
+    expect(await terminal(manager, otherOwner.id)).toMatchObject({ status: 'succeeded' });
+    expect(helperRemovals).toBe(2);
+    expect(manager.hasActiveOperationsForInstanceSnapshot()).toBe(false);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test('scanner output parser rejects malformed, unknown and unbounded values', () => {
   expect(parseScannerOutput('header\nAGENTOR_VOLUME_SIZE {"ok":true,"allocatedBytes":"1","logicalBytes":"2","entriesScanned":3}\n')).toMatchObject({ ok: true });
   expect(() => parseScannerOutput('AGENTOR_VOLUME_SIZE {"ok":false,"error":"host detail"}\n')).toThrow();
