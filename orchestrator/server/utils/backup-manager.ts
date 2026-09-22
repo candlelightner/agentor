@@ -415,11 +415,16 @@ export class BackupManager {
         | "retentionCount"
         | "selectedWorkspaceIds"
         | "selectedPathsByWorkspace"
+        | "persistSelectedDirectories"
       >
     >,
   ) {
     await this.init();
     this.assertOwnerAvailable(userId);
+    if (input.persistSelectedDirectories !== undefined && typeof input.persistSelectedDirectories !== "boolean")
+      throw Object.assign(new Error("persistSelectedDirectories must be boolean"), { statusCode: 400 });
+    const previousConfig = await this.getConfig(userId);
+    const persistDirectories = input.persistSelectedDirectories ?? previousConfig?.persistSelectedDirectories ?? true;
     const normalizedPaths =
       input.selectedPathsByWorkspace === undefined
         ? undefined
@@ -427,7 +432,7 @@ export class BackupManager {
     // Seed every newly selected directory before committing configuration.
     // A failed copy therefore leaves both the old container and the previous
     // backup settings authoritative, and no rebuild can attach an empty volume.
-    if (input.selectedPathsByWorkspace !== undefined && this.pathPersistence)
+    if (persistDirectories && input.selectedPathsByWorkspace !== undefined && this.pathPersistence)
       await this.pathPersistence.reconcileSelections(userId, normalizedPaths);
     const now = new Date().toISOString();
     const config = await this.store.update(userId, (data) => {
@@ -455,6 +460,7 @@ export class BackupManager {
           input.selectedPathsByWorkspace === undefined
             ? old?.selectedPathsByWorkspace
             : normalizedPaths,
+        persistSelectedDirectories: persistDirectories,
         createdAt: old?.createdAt ?? now,
         updatedAt: now,
         nextRunAt:
@@ -2748,6 +2754,8 @@ export class BackupManager {
         missingSecrets: (await useWorkerConfigStore().resolveValues(userId, id))
           .filter((entry) => entry.kind !== "variable")
           .map((entry) => entry.key),
+        localPersistence: (await import("./managed-volume-manager")).useManagedVolumeManager().store.forWorker(userId, id)
+          .filter((v) => v.attached).map((v) => ({ path: v.target, included: false })),
       };
       const manifestPath = join(temp, BUNDLE_FILES.manifest),
         workspacePath = join(temp, BUNDLE_FILES.workspace),
@@ -2856,6 +2864,9 @@ export class BackupManager {
       manifest.version = WORKER_EXPORT_VERSION;
       manifest.contents.backupPaths = true;
       manifest.backupPaths = archives.map(({ path, archive }) => ({ path, archive }));
+      if (manifest.localPersistence) manifest.localPersistence = manifest.localPersistence.map((v) => ({
+        ...v, included: paths.some((path) => path === "/" || path === v.path || v.path.startsWith(`${path}/`)),
+      }));
       const manifestPath = join(dir, BUNDLE_FILES.manifest);
       await writeManifest(manifest, manifestPath);
       const files = [

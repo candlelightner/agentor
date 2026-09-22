@@ -21,6 +21,7 @@ export interface BackupSettings {
   selection: "all" | "selected";
   workspaceIds: string[];
   selectedPathsByWorkspace: Record<string, string[]>;
+  persistSelectedDirectories?: boolean;
   intervalMinutes: number;
   retentionCount: number;
   nextRunAt: string | null;

@@ -212,7 +212,7 @@ test.describe
     expect((await root.json()).path).toBe("/");
   });
 
-  test("an explicitly selected directory becomes a rebuild-persistent local volume", async () => {
+  test("legacy backup persistence is adopted and remains mounted after backup deselection", async () => {
     const path = "/home/agent/.agentor-persistent-backup-test";
     await captureCommandOutput(
       workspaceB,
@@ -254,6 +254,9 @@ test.describe
     });
     expect(defaultsOnly.status(), await defaultsOnly.text()).toBe(200);
     expect((await new ApiClient(ownerCtx).rebuildContainer(workspaceB)).status).toBe(200);
+    expect((await captureCommandOutput(workspaceB, `cat '${path}/state.txt'`)).trim()).toBe("rebuild-persistent-writable");
+    const storage = await (await ownerCtx.get(`/api/containers/${workspaceB}/storage`)).json();
+    expect(storage.volumes.find((v: any) => v.target === path)).toMatchObject({ purpose: 'legacy-backup-path', attached: true });
     await captureCommandOutput(
       workspaceB,
       `mkdir -p '${path}' && printf detached-current > '${path}/state.txt' && printf new > '${path}/detached.txt'`,

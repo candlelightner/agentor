@@ -72,6 +72,8 @@ export interface BackupConfig {
   /** Optional, explicit absolute paths per worker. Omission preserves the
    * legacy portable payload (/workspace plus filtered agent data). */
   selectedPathsByWorkspace?: Record<string, string[]>;
+  /** Legacy missing value preserves implicit persistence; new UI sends false. */
+  persistSelectedDirectories?: boolean;
   lastAttemptAt?: string; lastSuccessAt?: string; lastError?: string; consecutiveFailures?: number;
   google?: { clientId?: string; redirectUri?: string; token?: unknown; oauthPending?: { stateHash: string; expiresAt: number } };
 }

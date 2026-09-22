@@ -9,6 +9,7 @@ const api = useBackups(),
     selection: "all" as "all" | "selected",
     workspaceIds: [] as string[],
     selectedPathsByWorkspace: {} as Record<string, string[]>,
+    persistSelectedDirectories: false,
     intervalMinutes: 1440,
     retentionCount: 7,
   });
@@ -102,6 +103,7 @@ function settingsPayload() {
     retentionCount: draft.retentionCount,
     workspaceIds: workspaceIds(),
     selectedPathsByWorkspace: draft.selectedPathsByWorkspace,
+    persistSelectedDirectories: draft.persistSelectedDirectories,
     nextRunAt: api.settings.value.nextRunAt,
   };
 }
@@ -111,6 +113,7 @@ function settingsChanged() {
   return (
     current.providerId !== next.providerId ||
     current.enabled !== next.enabled ||
+    current.persistSelectedDirectories !== next.persistSelectedDirectories ||
     current.selection !== next.selection ||
     current.intervalMinutes !== next.intervalMinutes ||
     current.retentionCount !== next.retentionCount ||
@@ -124,10 +127,8 @@ function confirmRemovedPathPersistence() {
   if (
     removed.length &&
     !window.confirm(
-      `Stop rebuild persistence for ${removed.length} selected path${removed.length === 1 ? "" : "s"}? ` +
-        "No persisted data is deleted now: the existing volume is retained until the worker is deleted. " +
-        "After the next rebuild, this path uses temporary container storage; changes made there are lost by another rebuild unless you reselect or back them up first. " +
-        "If you reselect the path before rebuilding again, current files are merged into the retained volume: current same-named files overwrite their older persisted versions, while other old and new files are kept.",
+      `Remove backup coverage for ${removed.length} selected path${removed.length === 1 ? "" : "s"}? ` +
+        "Existing local persistent volumes and their attachments are unchanged. Manage local persistence separately in Worker Settings → Persistent paths.",
     )
   )
     return false;
@@ -670,7 +671,9 @@ watch(restoreTarget, (target) => {
           </label>
           <section v-if="workspaceIds().length" class="rounded border p-3 space-y-2" data-testid="backup-path-settings">
             <h4 class="text-sm font-medium">Backup paths</h4>
-            <p class="text-xs text-gray-500">The existing portable defaults (<code>/workspace</code> and credential-filtered agent data) start selected but may be changed. Any readable file or directory may be selected explicitly, including sensitive paths. Saving prepares additional directories as local rebuild-persistent volumes; files and <code>/</code> remain backup-only. Deselected volumes are retained until worker deletion and merged with current files if selected again.</p>
+            <p class="text-xs text-gray-500">The portable defaults (<code>/workspace</code> and credential-filtered agent data) start selected but may be changed. Explicit selections may include sensitive files. Backup coverage is independent of local persistence: deselecting a path does not detach or overwrite its volume.</p>
+            <UCheckbox v-model="draft.persistSelectedDirectories" label="Also make newly selected directories locally persistent" />
+            <p class="text-xs text-gray-500">When enabled, additional directories are prepared for a later rebuild. Files and <code>/</code> remain backup-only. For local-only persistence, use Worker Settings → Persistent paths.</p>
             <div v-for="id in workspaceIds()" :key="id" class="flex items-center gap-2 text-sm">
               <span class="min-w-0">
                 <span class="block truncate font-medium">{{ workspaceNames[id] || id }}</span>

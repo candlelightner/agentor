@@ -13,6 +13,7 @@ const storage = ref<any>(null);
 const storageLoading = ref(false);
 const storageError = ref('');
 const cleaning = ref('');
+const storageTab = ref('workspaces');
 
 watch(open, (shown) => {
   if (shown) { void refresh(); if (isAdmin.value) void refreshStorage(); }
@@ -76,7 +77,7 @@ async function backupWorkspace(item: WorkspaceInventoryItem) {
       <div class="p-6 space-y-4 max-h-[90vh] overflow-y-auto" data-testid="workspace-inventory">
         <div class="flex items-start justify-between gap-4">
           <div>
-            <h2 class="text-lg font-semibold">Workspace storage</h2>
+            <h2 class="text-lg font-semibold">Storage</h2>
             <p class="text-xs text-gray-500 mt-1">Browse persistent workspace data independently of worker runtime state.</p>
           </div>
           <div class="flex gap-2">
@@ -85,14 +86,16 @@ async function backupWorkspace(item: WorkspaceInventoryItem) {
           </div>
         </div>
         <p v-if="error" class="text-sm text-red-600 dark:text-red-400" role="alert">{{ error }}</p>
+        <div class="flex gap-2" role="tablist" aria-label="Storage views"><UButton role="tab" :aria-selected="storageTab === 'workspaces'" :variant="storageTab === 'workspaces' ? 'solid' : 'outline'" @click="() => { storageTab = 'workspaces'; }">Workspaces</UButton><UButton role="tab" :aria-selected="storageTab === 'volumes'" :variant="storageTab === 'volumes' ? 'solid' : 'outline'" @click="() => { storageTab = 'volumes'; }">Volumes</UButton></div>
+        <ManagedVolumeInventory v-if="storageTab === 'volumes'" />
 
-        <section v-if="isAdmin" class="rounded border p-4 space-y-3" data-testid="storage-management">
+        <section v-if="isAdmin && storageTab === 'workspaces'" class="rounded border p-4 space-y-3" data-testid="storage-management">
           <div class="flex items-center justify-between gap-2"><div><h3 class="font-medium">Agentor disk storage</h3><p class="text-xs text-gray-500">Only safe cleanup targets are offered; referenced images and active artifacts are never deleted.</p></div><UButton size="xs" variant="outline" :loading="storageLoading" @click="refreshStorage">Refresh</UButton></div>
           <p v-if="storageError" role="alert" class="text-xs text-red-600">{{ storageError }}</p>
           <template v-if="storage"><p :class="storage.disk.warning === 'critical' ? 'text-red-600' : storage.disk.warning === 'warning' ? 'text-amber-600' : 'text-xs text-gray-500'" class="text-sm">{{ storage.disk.warning === 'ok' ? 'Disk capacity healthy' : `Disk space ${storage.disk.warning}` }} · {{ formatBytes(storage.disk.freeBytes) }} free of {{ formatBytes(storage.disk.totalBytes) }}</p><div class="grid gap-2 text-xs md:grid-cols-3"><span>Workspaces: {{ storage.workspaces.count }} · {{ storage.workspaces.bytes === null ? 'size unavailable' : formatBytes(storage.workspaces.bytes) }}</span><span>Docker images: {{ storage.docker.imagesBytes === null ? 'unavailable' : formatBytes(storage.docker.imagesBytes) }}</span><span>Build cache: {{ storage.docker.buildCacheBytes === null ? 'unavailable' : formatBytes(storage.docker.buildCacheBytes) }}</span></div><div class="flex flex-wrap gap-2"><UButton size="xs" variant="outline" :loading="cleaning === 'danglingImages'" @click="cleanupStorage('danglingImages')">Prune dangling images</UButton><UButton size="xs" variant="outline" :loading="cleaning === 'buildCache'" @click="cleanupStorage('buildCache')">Prune build cache</UButton><UButton size="xs" variant="outline" :loading="cleaning === 'staleHelpers'" @click="cleanupStorage('staleHelpers')">Remove stale helpers ({{ storage.helpers.stale }})</UButton><UButton size="xs" variant="outline" :loading="cleaning === 'staleStaging'" @click="cleanupStorage('staleStaging')">Clean old staging</UButton></div><ul class="text-xs text-gray-500"><li v-for="item in storage.staging" :key="item.id">{{ item.label }}: {{ formatBytes(item.bytes) }}</li></ul></template>
         </section>
 
-        <div class="overflow-x-auto border border-gray-200 dark:border-gray-700 rounded-md">
+        <div v-if="storageTab === 'workspaces'" class="overflow-x-auto border border-gray-200 dark:border-gray-700 rounded-md">
           <table class="w-full text-sm">
             <thead class="bg-gray-50 dark:bg-gray-800 text-left text-xs text-gray-500">
               <tr><th class="p-3">Workspace / worker</th><th class="p-3">Owner</th><th class="p-3">Storage</th><th class="p-3">State</th><th class="p-3">Size</th><th class="p-3">Updated</th><th class="p-3">Latest backup</th><th class="p-3">Actions</th></tr>

@@ -71,6 +71,25 @@ function dockerWorker() {
   };
 }
 
+test('a late runtime probe overlapping recreation cannot repopulate the stale status cache', async () => {
+  let finish!: (value: unknown) => void;
+  let calls = 0;
+  const manager = new ContainerManager({
+    inspectContainerRuntime: () => ++calls === 1
+      ? new Promise((resolve) => { finish = resolve; })
+      : Promise.resolve({ status: 'running', running: true }),
+    probeContainerTask: async () => undefined,
+  } as any, { containerPrefix: 'agentor-worker' } as any);
+  let observation!: Promise<unknown>;
+  await withWorkerLifecycleMutation('storage-probe-race', async () => {
+    observation = (manager as any).observeRuntime('replacement-runtime', 'storage-probe-race');
+  });
+  finish({ status: 'created', running: false });
+  await observation;
+  expect(await (manager as any).observeRuntime('replacement-runtime', 'storage-probe-race')).toMatchObject({ status: 'running' });
+  expect(calls).toBe(2);
+});
+
 test("legacy workers persist desired running state after a verified task observation", async () => {
   const saved: string[] = [];
   const record = workerRecord();
@@ -289,6 +308,30 @@ test("sync cannot overwrite a lifecycle replacement with its older Docker snapsh
     imageId: "sha256:replacement",
     status: "starting",
   });
+});
+
+for (const delayedPhase of ['list', 'inspect', 'missing']) test(`sync starting during recreation preserves completed state after delayed ${delayedPhase}`, async () => {
+  const record = { ...workerRecord(), desiredRuntimeStatus: 'running' };
+  let release!: () => void;
+  let entered = false;
+  const delay = () => { entered = true; return new Promise<void>((resolve) => { release = resolve; }); };
+  const manager = new ContainerManager({
+    listContainers: async () => { if (delayedPhase !== 'inspect') await delay(); return delayedPhase === 'missing' ? [] : [dockerWorker()]; },
+    inspectContainerRuntime: async () => { if (delayedPhase === 'inspect') await delay(); return { status: 'created', running: false }; },
+  } as any, { containerPrefix: 'agentor-worker' } as any);
+  manager.setWorkerStore({ list: () => [record], findById: () => record } as any);
+  const current = { ...record, containerId: 'docker-worker-1', containerName: 'agentor-worker-worker-1', status: 'starting' };
+  (manager as any).containers.set(record.id, current);
+  let syncing!: Promise<void>;
+  await withWorkerLifecycleMutation(record.id, async () => {
+    syncing = manager.sync();
+    for (let i = 0; !entered && i < 10; i++) await Promise.resolve();
+    expect(entered).toBe(true);
+    current.status = 'running';
+  });
+  release();
+  await syncing;
+  expect(manager.get(record.id)?.status).toBe('running');
 });
 
 test("sync never revives an archived worker from an older Docker list response", async () => {

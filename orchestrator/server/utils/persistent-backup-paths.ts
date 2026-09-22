@@ -45,7 +45,14 @@ export class PersistentBackupPathManager {
       const worker = this.resolveWorker(workerId);
       if (!worker || worker.userId !== userId)
         throw Object.assign(new Error("Workspace not found"), { statusCode: 404 });
-      await this.prepareWorker(worker, rawPaths);
+      const { withOwnerWorkerLifecycleMutation } = await import("./worker-lifecycle-coordinator");
+      const { useManagedVolumeManager } = await import("./managed-volume-manager");
+      await withOwnerWorkerLifecycleMutation(userId, workerId, async () => {
+        const volumes = useManagedVolumeManager(); await volumes.init();
+        const known = new Set(volumes.store.forWorker(userId, workerId).map((v) => v.target));
+        const mounts = await this.prepareWorker(worker, rawPaths.filter((p) => !known.has(p)));
+        await volumes.adoptLegacy(userId, workerId, mounts.map((m) => m.target));
+      });
     }
   }
 
@@ -97,12 +104,12 @@ export class PersistentBackupPathManager {
     return mounts;
   }
 
-  async removeWorkerVolumes(workerId: string): Promise<void> {
+  async removeWorkerVolumes(workerId: string, preserve: string[] = []): Promise<void> {
     const result = await withOperationDeadline(this.docker.listVolumes({
       filters: { label: [`${MANAGED_LABEL}=true`, `${WORKER_LABEL}=${workerId}`] },
     }), PERSISTENT_PATH_DOCKER_TIMEOUT_MS, "Docker persistent-path volume inventory");
     for (const volume of result.Volumes || []) {
-      if (!volume.Name) continue;
+      if (!volume.Name || preserve.includes(volume.Name)) continue;
       await withOperationDeadline(this.docker.getVolume(volume.Name).remove({ force: true }), PERSISTENT_PATH_DOCKER_TIMEOUT_MS, "Docker persistent-path volume cleanup");
     }
   }

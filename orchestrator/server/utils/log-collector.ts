@@ -206,6 +206,7 @@ export class LogCollector {
               worker.id,
               'Docker worker log stream',
               error,
+              containerId,
             );
         }
         this.detach(containerId);
@@ -218,6 +219,7 @@ export class LogCollector {
             worker.id,
             'Docker worker log attachment',
             error,
+            containerId,
           );
       }
     }

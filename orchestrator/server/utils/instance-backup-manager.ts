@@ -1334,6 +1334,13 @@ export class InstanceBackupManager {
           workerId: volume.Labels?.["agentor.worker-id"],
         });
     const volumes: VolumeCandidate[] = [];
+    const { useManagedVolumeManager } = await import("./managed-volume-manager");
+    const managedVolumes = useManagedVolumeManager();
+    await managedVolumes.init();
+    for (const volume of managedVolumes.store.list()) {
+      if (!await managedVolumes.runtime.inspectVolume(volume)) continue;
+      add({ name: volume.dockerName, kind: "persistent-path", ownerId: volume.userId, workerId: volume.workerId });
+    }
     for (const candidate of candidates.values())
       if (await this.volumeExists(candidate.name)) volumes.push(candidate);
     const definitions = services.usePluginDefinitionStore().list();
@@ -1403,6 +1410,7 @@ export class InstanceBackupManager {
       );
     if (
       (await useBackupManager().hasActiveOperationsForInstanceSnapshot()) ||
+      useManagedVolumeManager().hasActiveOperationsForInstanceSnapshot() ||
       services.useExportJobManager().hasActiveOperationsForInstanceSnapshot() ||
       imageModule.useImageCatalogManager().hasActiveOperationsForInstanceSnapshot() ||
       services.useUsageChecker().hasActiveOperationsForInstanceSnapshot() ||

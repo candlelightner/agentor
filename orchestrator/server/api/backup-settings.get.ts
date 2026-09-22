@@ -15,6 +15,7 @@ function publicSettings(config: any) {
     selection: config?.selectedWorkspaceIds === null ? 'all' : 'selected',
     workspaceIds: config?.selectedWorkspaceIds ?? [],
     selectedPathsByWorkspace: config?.selectedPathsByWorkspace ?? {},
+    persistSelectedDirectories: config ? config.persistSelectedDirectories ?? true : false,
     intervalMinutes: config?.intervalMinutes ?? Math.round((config?.intervalHours ?? 24) * 60),
     retentionCount: config?.retentionCount ?? 7,
     nextRunAt: config?.enabled ? config?.nextRunAt ?? null : null,

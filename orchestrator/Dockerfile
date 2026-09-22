@@ -20,11 +20,12 @@ RUN npx nuxt build
 FROM node:22-alpine
 
 WORKDIR /app
-RUN apk add --no-cache pigz
+RUN apk add --no-cache pigz python3
 COPY --from=builder /app/.output/ .output/
 # Kept outside the Nitro request process on purpose: a short-lived,
 # network-disabled helper uses it to stop/apply/restart an instance restore.
 COPY --from=builder /app/instance-restore-helper.mjs .output/server/instance-restore-helper.mjs
+COPY --from=builder /app/volume-mount-helper.py .output/server/volume-mount-helper.py
 
 EXPOSE 3000
 

@@ -446,6 +446,8 @@ const formattedCreatedAt = computed(() => {
             <WorkerConfigurationEditor :worker-id="container.id" />
           </section>
 
+          <WorkerStoragePanel v-if="open" :worker-id="container.id" :lock-password="lockCurrentPassword" />
+
           <!-- Port Mappings (read-only) -->
           <section v-if="portMappings.length > 0">
             <h3 class="text-[10px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider mb-2">Port Mappings</h3>

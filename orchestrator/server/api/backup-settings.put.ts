@@ -14,6 +14,7 @@ export default defineEventHandler(async (event) => {
     retentionCount: body.retentionCount ?? old?.retentionCount,
     selectedWorkspaceIds: body.selection === 'all' ? null : body.workspaceIds ?? old?.selectedWorkspaceIds,
     selectedPathsByWorkspace: body.selectedPathsByWorkspace ?? old?.selectedPathsByWorkspace,
+    persistSelectedDirectories: body.persistSelectedDirectories,
   });
   return {
     providerId: config.provider,
@@ -21,6 +22,7 @@ export default defineEventHandler(async (event) => {
     selection: config.selectedWorkspaceIds === null ? 'all' : 'selected',
     workspaceIds: config.selectedWorkspaceIds ?? [],
     selectedPathsByWorkspace: config.selectedPathsByWorkspace ?? {},
+    persistSelectedDirectories: config.persistSelectedDirectories ?? true,
     intervalMinutes: config.intervalMinutes,
     retentionCount: config.retentionCount,
     nextRunAt: config.nextRunAt,

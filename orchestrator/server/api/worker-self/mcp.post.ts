@@ -44,8 +44,17 @@ defineRouteMeta({
 import { requirePluginSelf } from "../../utils/worker-auth";
 import { handleWorkerSelfMcp } from "../../utils/worker-self-mcp";
 import { WorkerSelfPluginDomain } from "../../utils/worker-self-plugin-domain";
+import { WorkerSelfStorageDomain } from "../../utils/worker-self-storage-domain";
+import type { WorkerSelfContext } from "../../utils/worker-auth";
 
-const domain = new WorkerSelfPluginDomain();
+const plugins = new WorkerSelfPluginDomain();
+const storage = new WorkerSelfStorageDomain();
+const domain = {
+  async tools(context: WorkerSelfContext) { return [...plugins.tools(), ...await storage.tools(context)]; },
+  invoke(context: WorkerSelfContext, name: string, args: Record<string, unknown>) {
+    return name.startsWith("storage.") ? storage.invoke(context, name, args) : plugins.invoke(context, name, args);
+  },
+};
 export default defineEventHandler(async (event) => {
   const context = await requirePluginSelf(event);
   const result = await handleWorkerSelfMcp(

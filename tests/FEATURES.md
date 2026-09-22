@@ -2,6 +2,22 @@
 
 Every user-facing feature of the Agentor web dashboard, organized by category. This document drives the Playwright test suite — every item below must have test coverage.
 
+## Local persistent volumes
+
+- Worker settings expose independent persistent directory attachments with deferred,
+  recreate, or explicitly acknowledged privileged-helper live application. Live
+  application supports privileged and non-privileged workers without changing their
+  privilege level. Existing contents survive migration, restart and archive/unarchive.
+- Storage inventory lists owner-scoped Agentor volumes and backup selection without
+  exposing Docker names or host paths. Detach retains data; confirmed deletion is
+  separate and refused while attached. Worker deletion retains custom volumes.
+- Opt-in worker-self REST/MCP permits only inspect/add/idempotent retry, with separate
+  live-helper and recreation authorization. Protection locks, access-policy revocation,
+  owner isolation and delegated-admin live subtree scope are enforced server-side.
+- Legacy backup-created volumes are adopted without copying or renaming. Backup
+  deselection does not remove persistence. Missing populated volumes fail closed;
+  duplicate adds are idempotent and busy live mounts require explicit retry/recreation.
+
 ## Worker groups
 
 - Per-user worker groups form an arbitrarily deep tree. Each worker belongs directly to at most one group; legacy overlaps are reported by `/api/worker-groups/validation` and block hierarchy changes until resolved. Owners can create/reparent child groups with `parentId` and atomically move or unassign workers through `PUT /api/worker-groups/assignment`; self-parenting, cycles, missing/cross-owner parents, and overlapping direct membership are rejected. Existing records without `parentId` remain roots.

@@ -111,6 +111,8 @@ export interface WorkerExportManifest {
   /** Explicit, non-default absolute paths selected for a backup.  Their
    * archives are only present in backup bundles, never ordinary exports. */
   backupPaths?: Array<{ path: string; archive: string }>;
+  /** Coverage only, never a host-volume attachment instruction on import. */
+  localPersistence?: Array<{ path: string; included: boolean }>;
   /** Names only of worker-local secrets/files excluded from this bundle. */
   missingSecrets?: string[];
 }
@@ -727,6 +729,9 @@ function assertValidManifest(value: unknown): asserts value is WorkerExportManif
   }
   if (contents.backupPaths === true && !value.backupPaths?.length)
     throw new Error('Invalid worker export: manifest.backupPaths is missing');
+  if (value.localPersistence !== undefined && (!Array.isArray(value.localPersistence) || value.localPersistence.length > 32 ||
+      value.localPersistence.some((v: any) => !isRecord(v) || !isString(v.path) || !safeAbsoluteBackupPath(v.path) || typeof v.included !== 'boolean')))
+    throw new Error('Invalid worker export: local persistence coverage is invalid');
   if (value.missingSecrets !== undefined && (!Array.isArray(value.missingSecrets) || value.missingSecrets.length > 500 || value.missingSecrets.some((name) => typeof name !== 'string' || name.length < 1 || name.length > 255))) {
     throw new Error('Invalid worker export: manifest.missingSecrets is invalid');
   }

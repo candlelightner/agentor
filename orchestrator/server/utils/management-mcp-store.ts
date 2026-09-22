@@ -43,6 +43,7 @@ import {
 } from "./management-mcp-workspace-adapter";
 import { ManagementImageBackupDomain } from "./management-image-backup-domain";
 import { ManagementPlatformDomain } from "./management-platform-domain";
+import { ManagementVolumeDomain, VOLUME_MCP_NAMES } from "./management-volume-domain";
 import { ManagementConfigurationCatalogDomain } from "./management-configuration-catalog-domain";
 import { ManagementExposureDomain } from "./management-exposure-domain";
 import { ManagementRunningFilesDomain } from "./management-running-files-domain";
@@ -99,6 +100,7 @@ const GROUPS = [
  * current group members. Platform/global catalog, policy, group mutation and
  * import operations are intentionally absent. */
 const GROUP_ADMIN_TOOLS = new Set([
+  ...VOLUME_MCP_NAMES,
   "status.system",
   "workers.list",
   "workers.inspect",
@@ -212,6 +214,9 @@ const GROUP_ADMIN_IMAGE_TOOLS = new Set(
   [...GROUP_ADMIN_TOOLS].filter((name) => name.startsWith("images.")),
 );
 const GROUP_ADMIN_TARGET_FREE_TOOLS = new Set([
+  // Volume domain resolves opaque IDs and rechecks live worker-subtree scope
+  // inside each queued operation, like the delegation domains below.
+  ...VOLUME_MCP_NAMES,
   "status.system",
   "workers.list",
   "volumes.list",
@@ -357,6 +362,7 @@ type Group = (typeof GROUPS)[number];
 const workerDomain = new ManagementWorkerDomain();
 const imageBackupDomain = new ManagementImageBackupDomain();
 const platformDomain = new ManagementPlatformDomain();
+const volumeDomain = new ManagementVolumeDomain();
 const catalogDomain = new ManagementConfigurationCatalogDomain();
 const exposureDomain = new ManagementExposureDomain();
 const runningFilesDomain = new ManagementRunningFilesDomain();
@@ -451,6 +457,7 @@ for (const tool of workspaceMcpTools)
 for (const tool of imageBackupDomain.tools())
   TOOL_GROUP[tool.name] ??= tool.group;
 for (const tool of platformDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
+for (const tool of volumeDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 for (const tool of catalogDomain.tools())
   TOOL_GROUP[tool.name] = tool.group as Group;
 for (const tool of exposureDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
@@ -723,6 +730,7 @@ export class ManagementMcpStore {
         const plugin = pluginDomain.tools().find((tool) => tool.name === name);
         const hostMount = hostMountDomain.tools().find((tool) => tool.name === name);
         const hardwareDevice = hardwareDeviceDomain.tools().find((tool) => tool.name === name);
+        const volume = volumeDomain.tools().find((tool) => tool.name === name);
         return {
           name,
           description:
@@ -752,6 +760,7 @@ export class ManagementMcpStore {
             plugin?.description ||
             hostMount?.description ||
             hardwareDevice?.description ||
+            volume?.description ||
             `Agentor management tool (${TOOL_GROUP[name]})`,
           inputSchema:
             (identity?.scope === "group" && name === "workers.create"
@@ -779,6 +788,7 @@ export class ManagementMcpStore {
             plugin?.inputSchema ||
             hostMount?.inputSchema ||
             hardwareDevice?.inputSchema ||
+            volume?.inputSchema ||
             toolInputSchema(name),
           annotations:
             domain?.annotations ||
@@ -795,6 +805,7 @@ export class ManagementMcpStore {
             plugin?.annotations ||
             hostMount?.annotations ||
             hardwareDevice?.annotations ||
+            volume?.annotations ||
             toolAnnotations(name),
         };
       });
@@ -1482,6 +1493,8 @@ export class ManagementMcpStore {
           throw groupResourceNotFound();
       };
     }
+    const volume = await volumeDomain.execute(name, args, identity);
+    if (volume.handled) return volume.result;
     const domain = await workerDomain.execute(name, args);
     if (domain.handled) {
       if (identity?.scope === "group" && name === "groups.list") {
@@ -2474,6 +2487,7 @@ function validateToolArguments(name: string, args: Record<string, unknown>) {
     ...pluginDomain.tools(),
     ...hostMountDomain.tools(),
     ...hardwareDeviceDomain.tools(),
+    ...volumeDomain.tools(),
   ];
   const schema =
     definitions.find((tool) => tool.name === name)?.inputSchema ||

@@ -495,8 +495,9 @@ export class ContainerManager {
 
   /** Metrics/log/terminal paths use this to invalidate optimistic Docker list
    * state. The next inventory refresh performs an independent task probe. */
-  reportRuntimeFailure(id: string, operation: string, error: unknown): void {
+  reportRuntimeFailure(id: string, operation: string, error: unknown, observedContainerId?: string): void {
     const info = this.containers.get(id);
+    if (isWorkerLifecycleMutationActive(id) || observedContainerId && info?.containerId !== observedContainerId) return;
     if (info) this.markRuntimeUnknown(info, operation, error);
   }
   /** Keyed by the worker's UUID `id` (stable across rebuild/unarchive). */
@@ -774,7 +775,8 @@ export class ContainerManager {
     // lifecycle admission marker before starting it so a stop/archive/rebuild
     // which overlaps its task probes cannot publish that old response later.
     const lifecycleSequenceAtStart = workerLifecycleSequence();
-    this.syncPromise = this.syncUnlocked(lifecycleSequenceAtStart).finally(() => {
+    const busyAtStart = new Set([...this.containers.keys()].filter(isWorkerLifecycleMutationActive));
+    this.syncPromise = this.syncUnlocked(lifecycleSequenceAtStart, busyAtStart).finally(() => {
       this.syncPromise = undefined;
     });
     return this.syncPromise;
@@ -782,14 +784,20 @@ export class ContainerManager {
 
   private async observeRuntime(
     containerId: string,
+    workerId?: string,
   ): Promise<{
     status: ContainerStatus;
     diagnostic?: ContainerInfo["runtimeDiagnostic"];
     secretHandshakeRequired?: boolean;
     restartPolicy?: string;
+    lifecycleStale?: boolean;
   }> {
+    const generation = workerId ? workerLifecycleGeneration(workerId) : 0;
+    const startedDuringMutation = !!workerId && isWorkerLifecycleMutationActive(workerId);
+    const cacheable = () => !workerId || (!startedDuringMutation &&
+      !isWorkerLifecycleMutationActive(workerId) && workerLifecycleGeneration(workerId) === generation);
     const cached = this.runtimeObservations.get(containerId);
-    if (cached && Date.now() - cached.at < 5_000) return cached;
+    if (cached && Date.now() - cached.at < 5_000) return { ...cached, lifecycleStale: !cacheable() };
     try {
       const runtime = await this.dockerService.inspectContainerRuntime(containerId);
       const status = ContainerManager.STATE_MAP[runtime.status] ?? "unknown";
@@ -804,8 +812,8 @@ export class ContainerManager {
         secretHandshakeRequired: runtime.secretHandshakeRequired,
         restartPolicy: runtime.restartPolicy,
       };
-      this.runtimeObservations.set(containerId, observed);
-      return observed;
+      if (cacheable()) this.runtimeObservations.set(containerId, observed);
+      return { ...observed, lifecycleStale: !cacheable() };
     } catch (error) {
       const data = (error as { data?: { operation?: string }; code?: string })?.data;
       const diagnostic = {
@@ -817,18 +825,18 @@ export class ContainerManager {
         observedAt: new Date().toISOString(),
       };
       const observed = { at: Date.now(), status: "unknown" as const, diagnostic };
-      this.runtimeObservations.set(containerId, observed);
-      return observed;
+      if (cacheable()) this.runtimeObservations.set(containerId, observed);
+      return { ...observed, lifecycleStale: !cacheable() };
     }
   }
 
-  private async syncUnlocked(lifecycleSequenceAtStart: number): Promise<void> {
+  private async syncUnlocked(lifecycleSequenceAtStart: number, busyAtStart = new Set<string>()): Promise<void> {
     const dockerContainers = await this.dockerService.listContainers();
     const observations = new Map(
       await Promise.all(
         dockerContainers.map(async (container) => [
           container.Id,
-          await this.observeRuntime(container.Id),
+          await this.observeRuntime(container.Id, container.Labels?.[WORKER_ID_LABEL]),
         ] as const),
       ),
     );
@@ -871,6 +879,9 @@ export class ContainerManager {
       // The worker UUID `id` is the only identifying label; resolve the
       // authoritative record (with userId + config) from the WorkerStore.
       const labelId = labels[WORKER_ID_LABEL] ?? "";
+      // Retained storage-rollback containers are evidence for recovery, never
+      // a second live identity. Their exact IDs are tracked by a durable journal.
+      if (labelId && containerName.startsWith(`${this.buildContainerName(labelId)}-storage-rollback-`)) continue;
       // DockerService also discovers Agentor-owned auxiliary containers (for
       // example the persistent administrative workspace).  They deliberately
       // have no ordinary-worker identity and must never be projected into the
@@ -903,6 +914,8 @@ export class ContainerManager {
       if (
         worker.status !== "active" ||
         worker.deletionPending ||
+        busyAtStart.has(worker.id) ||
+        observations.get(dc.Id)?.lifecycleStale ||
         lifecycleChangedSinceSnapshot ||
         isWorkerLifecycleMutationActive(worker.id)
       ) {
@@ -979,6 +992,16 @@ export class ContainerManager {
     }
 
     for (const info of external) nextContainers.set(info.id, info);
+    // During the rename/create window Docker may list only the retained
+    // rollback source (excluded above), or neither runtime. Preserve the
+    // lifecycle's authoritative handle even without a corresponding list row.
+    for (const [id, current] of concurrent) {
+      if (current.administrativeKind || nextContainers.has(id)) continue;
+      if (!busyAtStart.has(id) && workerLifecycleGeneration(id) <= lifecycleSequenceAtStart && !isWorkerLifecycleMutationActive(id)) continue;
+      const record = this.workerStore?.findById(id);
+      if (record?.status === "active" && !record.deletionPending && record.userId === current.userId)
+        nextContainers.set(id, current);
+    }
     // Commit synchronously: no lifecycle mutation can interleave between the
     // final generation check above and this map replacement.
     this.containers = nextContainers;
@@ -2314,10 +2337,15 @@ for p in sys.argv[1:]:
     );
   }
 
-  private async restartUnlocked(id: string): Promise<void> {
+  private async restartUnlocked(id: string, storagePrepared = false): Promise<void> {
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    const { useManagedVolumeManager } = await import("./managed-volume-manager");
+    if (!storagePrepared && await useManagedVolumeManager().requiresRecreation(info.userId, id, info.containerId)) {
+      await this.applyManagedStorageUnlocked(id);
+      return;
+    }
     if (info.hostMountsRevoked)
       throw Object.assign(
         new Error(
@@ -2971,7 +2999,10 @@ for p in sys.argv[1:]:
         "persistent backup paths",
         async () => {
           const { usePersistentBackupPathManager } = await import("./services");
-          await usePersistentBackupPathManager().removeWorkerVolumes(info.id);
+          const { useManagedVolumeManager } = await import("./managed-volume-manager");
+          const volumes = useManagedVolumeManager();
+          await volumes.workerDeleted(info.userId, info.id);
+          await usePersistentBackupPathManager().removeWorkerVolumes(info.id, volumes.store.forWorker(info.userId, info.id).map((v) => v.dockerName));
         },
       ],
       [
@@ -3043,6 +3074,9 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    // A deferred persistence request must capture data before archive discards
+    // the rootfs, just as an explicit rebuild does.
+    await this.persistentBackupPathMounts(info, true);
     await this.persistDesiredRuntimeStatus(info, "stopped");
 
     useLogCollector().detach(info.containerId);
@@ -3090,11 +3124,134 @@ for p in sys.argv[1:]:
     const [{ useBackupManager }, { usePersistentBackupPathManager }] =
       await Promise.all([import("./backup-manager"), import("./services")]);
     const config = await useBackupManager().getConfig(worker.userId);
-    const paths = config?.selectedPathsByWorkspace?.[worker.id];
+    const { useManagedVolumeManager } = await import("./managed-volume-manager");
+    const volumes = useManagedVolumeManager();
+    await volumes.init();
+    if (volumes.isRecoveryBlocked(worker.id)) await volumes.recoverWorker(worker.userId, worker.id);
+    // Once adopted, backup selection no longer controls or reseeds a volume.
+    // In particular, removing an attachment must not be undone by an old
+    // backup selection that still references the same path.
+    const knownTargets = new Set(volumes.store.forWorker(worker.userId, worker.id).map((v) => v.target));
+    const paths = config?.persistSelectedDirectories === false ? [] : config?.selectedPathsByWorkspace?.[worker.id]?.filter((path) => !knownTargets.has(path));
     const manager = usePersistentBackupPathManager();
-    return prepare
+    const legacy = prepare
       ? manager.prepareWorker(worker, paths)
       : manager.mountsForSelections(worker.id, paths);
+    const mounts = await legacy;
+    await volumes.adoptLegacy(worker.userId, worker.id, mounts.map((m) => m.target));
+    return prepare ? volumes.prepare(worker) : volumes.mounts(worker.userId, worker.id);
+  }
+
+  /** Storage-only recreation. Caller MUST hold owner then worker lifecycle
+   * fences. Clone the actual immutable image and runtime configuration rather
+   * than applying pending environment/image/settings changes as rebuild does. */
+  async applyManagedStorageUnlocked(id: string): Promise<void> {
+    const info = this.containers.get(id);
+    if (!info) throw new Error("Container not found");
+    this.assertOrdinaryMutation(info);
+    if (info.hostMountsRevoked || info.hardwareDevicesRevoked)
+      throw Object.assign(new Error("Rebuild the worker to apply revoked hardware or host-mount permissions first."), { statusCode: 409 });
+    const { useManagedVolumeManager } = await import("./managed-volume-manager");
+    const volumes = useManagedVolumeManager();
+    await volumes.init();
+    if (volumes.isRecoveryBlocked(id)) await volumes.recoverWorker(info.userId, id);
+    const docker = volumes.runtime.docker;
+    const interrupted = volumes.recreations.get(info.userId, id);
+    if (interrupted) {
+      // Retry the retained replacement before creating another journal. The
+      // old rootfs remains recoverable until bootstrap succeeds.
+      if (interrupted.replacementId) {
+        const replacement = await docker.getContainer(interrupted.replacementId).inspect();
+        if (replacement.Config.Labels?.[WORKER_ID_LABEL] !== id)
+          throw new Error("Storage replacement identity mismatch");
+        info.containerId = replacement.Id;
+        await volumes.markDeclared(info.userId, id, replacement.Id);
+        await this.restartUnlocked(id, true);
+        await docker.getContainer(interrupted.originalId).remove();
+        await volumes.recreations.clear(info.userId, id);
+        if (!await volumes.requiresRecreation(info.userId, id, replacement.Id) &&
+            volumes.store.forWorker(info.userId, id).every((v) => !v.attached || v.seeded)) return;
+      } else {
+        const source = await docker.getContainer(interrupted.originalId).inspect();
+        if (source.Config.Labels?.[WORKER_ID_LABEL] !== id) throw new Error("Storage source identity mismatch");
+        if (source.Name !== `/${info.containerName}`)
+          await docker.getContainer(source.Id).rename({ name: info.containerName });
+        info.containerId = source.Id;
+        await volumes.recreations.clear(info.userId, id);
+      }
+    }
+    const beforePrepare = await docker.getContainer(info.containerId).inspect();
+    const endpoints = Object.entries(beforePrepare.NetworkSettings.Networks ?? {});
+    // Fixed IP reservations cannot belong to both a retained rollback source
+    // and its replacement. Refuse before stopping rather than silently drop
+    // the reservation or alter unrelated networking settings.
+    if (endpoints.some(([, endpoint]) => endpoint.IPAMConfig?.IPv4Address || endpoint.IPAMConfig?.IPv6Address)) {
+      const { volumeError } = await import("./managed-volume-store");
+      throw volumeError(409, "Storage-only recreation cannot preserve an explicit network IP reservation. Use live mounting or remove the reservation first.");
+    }
+    const mounts = await volumes.prepare(info);
+    const old = docker.getContainer(info.containerId);
+    const original = await old.inspect();
+    const oldId = original.Id;
+    const targets = new Set(volumes.store.forWorker(info.userId, info.id).map((v) => v.target));
+    if (original.State.Paused)
+      throw Object.assign(new Error("Resolve the interrupted live-mount operation before recreating this worker."), { statusCode: 409 });
+    await this.persistDesiredRuntimeStatus(info, "running");
+    if (original.State.Running) await old.stop({ t: 15 });
+    useLogCollector().detach(oldId);
+    const rollbackName = `${info.containerName}-storage-rollback-${randomUUID()}`;
+    const journal = { userId: info.userId, workerId: id, originalId: oldId,
+      containerName: info.containerName, rollbackName, createdAt: new Date().toISOString(), replacementId: undefined as string | undefined };
+    await volumes.recreations.save(journal);
+    await old.update({ RestartPolicy: { Name: "no" } });
+    await old.rename({ name: rollbackName });
+    let replacement: Awaited<ReturnType<typeof docker.createContainer>> | undefined;
+    try {
+      const hostConfig = { ...original.HostConfig,
+        RestartPolicy: { Name: "no" },
+        Mounts: [
+          ...(original.HostConfig.Mounts ?? []).filter((m) => !targets.has(m.Target)),
+          // Dockerfile VOLUME declarations can produce anonymous mounts not
+          // present in HostConfig.Mounts/Binds. Retain those exact volumes.
+          ...original.Mounts.filter((m) => m.Type === "volume" && m.Name && !targets.has(m.Destination) &&
+            !(original.HostConfig.Mounts ?? []).some((declared) => declared.Target === m.Destination) &&
+            !(original.HostConfig.Binds ?? []).some((bind) => bind.split(":")[1] === m.Destination))
+            .map((m) => ({ Type: "volume" as const, Source: m.Name!, Target: m.Destination, ReadOnly: !m.RW, VolumeOptions: { NoCopy: true } })),
+          ...mounts.map((m) => ({ Type: "volume" as const, Source: m.source, Target: m.target, VolumeOptions: { NoCopy: true } })),
+        ] as any,
+      };
+      replacement = await docker.createContainer({
+        ...original.Config, Image: original.Image,
+        Hostname: original.Config.Hostname === oldId.slice(0, 12) ? undefined : original.Config.Hostname,
+        name: info.containerName, HostConfig: hostConfig,
+        NetworkingConfig: { EndpointsConfig: Object.fromEntries(endpoints.map(([network, endpoint]) => [network, {
+          Aliases: endpoint.Aliases?.filter((alias: string) => alias !== oldId && alias !== oldId.slice(0, 12)),
+          Links: endpoint.Links,
+          DriverOpts: (endpoint as { DriverOpts?: Record<string, string> }).DriverOpts,
+        }])) },
+      });
+      info.containerId = replacement.id;
+      journal.replacementId = replacement.id;
+      await volumes.recreations.save(journal);
+      info.status = "stopped";
+      // Docker now declares every volume. Clear transient markers before
+      // restartUnlocked so it performs bootstrap rather than recreating again.
+      await volumes.markDeclared(info.userId, info.id, replacement.id);
+      await this.restartUnlocked(id, true);
+      await old.remove();
+      if (this.workerStore) await this.workerStore.upsert(this.containerInfoToWorkerRecord(info));
+      await volumes.recreations.clear(info.userId, id);
+    } catch (error) {
+      // Never delete persistent volumes or the retained source rootfs. A
+      // partially started replacement is stopped, not silently substituted.
+      if (replacement) await replacement.stop({ t: 5 }).catch(() => {});
+      info.status = "error";
+      if (!replacement) {
+        await old.rename({ name: info.containerName });
+        info.containerId = oldId;
+      }
+      throw error;
+    }
   }
 
   private async rebuildUnlocked(id: string): Promise<ContainerInfo> {
@@ -3264,6 +3421,8 @@ for p in sys.argv[1:]:
     } catch (error) {
       await this.rollbackFailedRecreation(containerInfo, info.containerName, error);
     }
+
+    await (await import("./managed-volume-manager")).useManagedVolumeManager().markDeclared(info.userId, info.id, containerInfo.containerId);
 
     try {
       if (this.workerStore) {
@@ -3449,6 +3608,7 @@ for p in sys.argv[1:]:
       containerInfo.updatedAt = new Date().toISOString();
       await this.workerStore.upsert(this.containerInfoToWorkerRecord(containerInfo));
       await useWorkerConfigStore().markApplied(worker.userId, worker.id);
+      await (await import("./managed-volume-manager")).useManagedVolumeManager().markDeclared(worker.userId, worker.id, containerInfo.containerId);
     } catch (error) {
       await this.rollbackFailedRecreation(
         containerInfo,
@@ -3564,7 +3724,10 @@ for p in sys.argv[1:]:
         "persistent backup paths",
         async () => {
           const { usePersistentBackupPathManager } = await import("./services");
-          await usePersistentBackupPathManager().removeWorkerVolumes(worker.id);
+          const { useManagedVolumeManager } = await import("./managed-volume-manager");
+          const volumes = useManagedVolumeManager();
+          await volumes.workerDeleted(worker.userId, worker.id);
+          await usePersistentBackupPathManager().removeWorkerVolumes(worker.id, volumes.store.forWorker(worker.userId, worker.id).map((v) => v.dockerName));
         },
       ],
       [
@@ -3840,6 +4003,8 @@ for p in sys.argv[1:]:
       const hasPlugins =
         pluginConfiguration.definitions.length > 0 ||
         pluginConfiguration.installations.length > 0;
+      const { useManagedVolumeManager } = await import("./managed-volume-manager");
+      const persistence = useManagedVolumeManager(); await persistence.init();
       const manifest: WorkerExportManifest = {
         version: WORKER_EXPORT_VERSION,
         exportedAt: new Date().toISOString(),
@@ -3870,6 +4035,8 @@ for p in sys.argv[1:]:
           ...(hasPlugins ? { plugins: true } : {}),
           reconstruction: true,
         },
+        localPersistence: persistence.store.forWorker(info.userId, info.id).filter((v) => v.attached)
+          .map((v) => ({ path: v.target, included: false })),
         missingSecrets: (
           await useWorkerConfigStore().resolveValues(info.userId, info.id)
         )
@@ -4722,7 +4889,9 @@ for p in sys.argv[1:]:
     }
 
     const missingDesiredWorkers: WorkerRecord[] = [];
+    const { useManagedVolumeManager: storageManager } = await import("./managed-volume-manager");
     for (const worker of this.workerStore.listActive()) {
+      if (storageManager().isRecoveryBlocked(worker.id)) continue;
       if (!activeContainerNames.has(this.buildContainerName(worker.id))) {
         // Acquire the same owner→worker fences as create/rebuild/recovery, then
         // recheck live state inside them. A separate isBusy snapshot leaves a
@@ -4750,6 +4919,7 @@ for p in sys.argv[1:]:
     // intent and is therefore never auto-unarchived.
     for (const worker of this.workerStore.listArchived())
       if (
+        !storageManager().isRecoveryBlocked(worker.id) &&
         worker.desiredRuntimeStatus === "running" &&
         !missingDesiredWorkers.some((candidate) => candidate.id === worker.id)
       )
@@ -4761,6 +4931,13 @@ for p in sys.argv[1:]:
     // every other worker from recovering.
     for (const info of [...this.containers.values()]) {
       if (info.administrativeKind) continue;
+      if (storageManager().isRecoveryBlocked(info.id)) {
+        info.status = "error";
+        info.runtimeDiagnostic = { code: "WORKER_STORAGE_RECOVERY_REQUIRED", operation: "Storage recovery",
+          message: "Persistent storage recovery needs attention. Restore missing storage, then retry application or restart.",
+          retryable: true, observedAt: new Date().toISOString() };
+        continue;
+      }
       try {
         const { groupSecrets } = await this.resolveUserEnvAndBinds(
           info.userId,
@@ -4772,7 +4949,9 @@ for p in sys.argv[1:]:
           info.userId,
           info.id,
         );
-        const sensitive = [...groupSecrets, ...local].some(
+        const { useManagedVolumeManager } = await import("./managed-volume-manager");
+        const transientStorage = await useManagedVolumeManager().requiresRecreation(info.userId, info.id, info.containerId);
+        const sensitive = transientStorage || [...groupSecrets, ...local].some(
           (entry) => entry.kind !== "variable",
         );
         const runtime = await this.dockerService.inspectContainerRuntime(

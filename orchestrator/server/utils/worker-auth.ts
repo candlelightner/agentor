@@ -22,6 +22,7 @@ export type WorkerSelfAuthority =
 
 interface IpMapEntry {
   containerName: string;
+  containerId: string;
 }
 
 let ipCache: Map<string, IpMapEntry> = new Map();
@@ -59,7 +60,7 @@ async function refreshIpCache(): Promise<void> {
       if (!net?.IPAddress) continue;
       const containerName = c.Names[0]?.replace(/^\//, '');
       if (!containerName) continue;
-      next.set(net.IPAddress, { containerName });
+      next.set(net.IPAddress, { containerName, containerId: c.Id });
     }
     ipCache = next;
     cacheTime = Date.now();
@@ -87,7 +88,10 @@ async function resolveCallerByIp(remoteIp: string): Promise<ContainerInfo | null
   if (!entry) return null;
 
   const container = containerManager.findByContainerName(entry.containerName);
-  if (container) return container;
+  // A recreated worker reuses its name but not its Docker identity. Never
+  // authorize an old address against the replacement's current name: Docker
+  // may already have reassigned that address to another worker.
+  if (container?.containerId === entry.containerId) return container;
 
   // Cache hit for a name that no longer resolves to a running worker (e.g. the
   // container was rebuilt and got a new id under the same name) — force one
@@ -95,7 +99,8 @@ async function resolveCallerByIp(remoteIp: string): Promise<ContainerInfo | null
   await refreshIpCache();
   const retry = ipCache.get(remoteIp);
   if (!retry) return null;
-  return containerManager.findByContainerName(retry.containerName) ?? null;
+  const current = containerManager.findByContainerName(retry.containerName);
+  return current?.containerId === retry.containerId ? current : null;
 }
 
 /** Enforce the durable policy on every request rather than trusting the
@@ -175,7 +180,7 @@ export async function requirePluginSelf(event: H3Event): Promise<WorkerSelfConte
   const ordinary = await resolveCallerByIp(remoteIp);
   if (ordinary) {
     requireOrdinaryWorkerSelfAccess(ordinary);
-    if (ordinary.status !== 'running') throw createError({ statusCode: 409, statusMessage: 'Worker container is not running' });
+    if (ordinary.status !== 'running') throw createError({ statusCode: 409, statusMessage: 'Worker container is not running', data: { status: ordinary.status, diagnostic: ordinary.runtimeDiagnostic } });
     return { container: ordinary, userId: ordinary.userId, containerName: ordinary.containerName, workerId: ordinary.id, authority: { kind: 'ordinary', userId: ordinary.userId, workerId: ordinary.id } };
   }
   const docker = useDockerService();

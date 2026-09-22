@@ -1,6 +1,7 @@
 import type { DockerService, RawContainerStats } from './docker';
 import type { ContainerManager } from './container';
 import type { WorkerMetrics, WorkerMetricsStatus } from '../../shared/types';
+import { isWorkerLifecycleMutationActive, workerLifecycleGeneration } from './worker-lifecycle-coordinator';
 
 /** How often per-worker cpu/mem/net is sampled via the Docker stats API. Short
  * so the dashboard feels live; an overlap guard keeps a slow sample from
@@ -151,16 +152,22 @@ export class ResourceMonitor {
 
     await Promise.all(
       running.map(async (c) => {
+        if (isWorkerLifecycleMutationActive(c.id)) return;
+        const containerId = c.containerId;
+        const generation = workerLifecycleGeneration(c.id);
+        const stale = () => isWorkerLifecycleMutationActive(c.id) || workerLifecycleGeneration(c.id) !== generation ||
+          this.containers.get(c.id)?.containerId !== containerId;
         const now = new Date().toISOString();
         try {
           const stats = await withTimeout(
-            this.docker.getContainerStats(c.containerId),
+            this.docker.getContainerStats(containerId),
             STATS_TIMEOUT_MS,
             `stats(${c.containerName})`,
           );
-          this.workers.set(c.containerName, this.computeWorkerMetrics(c, stats, now));
+          if (!stale()) this.workers.set(c.containerName, this.computeWorkerMetrics(c, stats, now));
         } catch (err) {
-          this.containers.reportRuntimeFailure(c.id, 'Docker worker stats', err);
+          if (stale()) return;
+          this.containers.reportRuntimeFailure(c.id, 'Docker worker stats', err, containerId);
           this.workers.set(c.containerName, {
             workerId: c.id,
             containerName: c.containerName,

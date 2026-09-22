@@ -183,7 +183,7 @@ export class ManagementImageBackupDomain {
       [
         "backups.settings",
         "backups",
-        "Read or replace safe backup settings, including optional absolute paths per worker. Saving first copies additional directories from the running workspace into managed local volumes, which are attached on later rebuilds. Individual files and / remain backup-only. Omission preserves the legacy /workspace plus filtered agent-data payload; explicit sensitive/authentication paths are allowed and are not treated as secret values.",
+        "Read or replace backup settings, including absolute paths per worker and persistSelectedDirectories. Set false for backup-only selections; legacy omission preserves prior behavior. Existing managed persistence is never removed or overwritten by changing backup coverage. Individual files and / remain backup-only; explicit sensitive paths are allowed.",
         mut,
       ],
       [
@@ -1204,7 +1204,7 @@ function catalogSchema(name: string): Record<string, unknown> {
     },
     settings: {
       type: "object",
-      properties: { selectedPathsByWorkspace: absolutePaths },
+      properties: { selectedPathsByWorkspace: absolutePaths, persistSelectedDirectories: { type: "boolean" } },
     },
     after: { type: "integer", minimum: 0 },
     limit: { type: "integer", minimum: 1, maximum: 1000 },
