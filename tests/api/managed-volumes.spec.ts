@@ -171,7 +171,10 @@ test.describe.serial('Managed local persistence', () => {
     docker('restart', 'agentor-orchestrator');
     await expect.poll(async () => { try { return (await request.get('/api/health')).status(); } catch { return 0; } }, { timeout: 60_000 }).toBe(200);
     await waitForWorkerRunning(request, worker.id);
-    expect(docker('exec', worker.containerName, 'cat', '/home/agent/recovery-cache/kept')).toBe('recover-me');
+    // Recovery briefly pauses the worker.
+    await expect.poll(() => {
+      try { return docker('exec', worker.containerName, 'cat', '/home/agent/recovery-cache/kept'); } catch { return ''; }
+    }, { timeout: 60_000, intervals: [500, 1000, 2000] }).toBe('recover-me');
     // Stopping discards the namespace mount, just as daemon/task loss does.
     expect((await new ApiClient(request).stopContainer(worker.id)).status).toBe(200);
     expect((await new ApiClient(request).restartContainer(worker.id)).status).toBe(200);
