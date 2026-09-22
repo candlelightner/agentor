@@ -43,7 +43,12 @@ import {
 } from "./management-mcp-workspace-adapter";
 import { ManagementImageBackupDomain } from "./management-image-backup-domain";
 import { ManagementPlatformDomain } from "./management-platform-domain";
-import { ManagementVolumeDomain, VOLUME_MCP_NAMES } from "./management-volume-domain";
+import {
+  ManagementVolumeDomain,
+  VOLUME_MCP_NAMES,
+  type ManagementVolumeAuthority,
+  type ManagementVolumePrincipal,
+} from "./management-volume-domain";
 import { ManagementConfigurationCatalogDomain } from "./management-configuration-catalog-domain";
 import { ManagementExposureDomain } from "./management-exposure-domain";
 import { ManagementRunningFilesDomain } from "./management-running-files-domain";
@@ -419,6 +424,36 @@ interface IdentityMetadata {
   scope: "platform" | "group";
   groupId?: string;
   ownerId?: string;
+}
+
+/** Bind an asynchronous storage authorizer to the exact trusted invocation
+ * principal. The supplied callbacks deliberately capture server-held state;
+ * no request argument can replace the credential, workspace, or policy group. */
+export function createLiveManagementVolumeAuthority<
+  T extends ManagementVolumePrincipal & { workspaceId: string },
+>(
+  expected: T,
+  introspect: () => Promise<T>,
+  policyEnabled: () => boolean | Promise<boolean>,
+  workspaceBound: (current: T) => boolean | Promise<boolean> = () => true,
+): T & ManagementVolumeAuthority {
+  return {
+    ...expected,
+    reauthorize: async () => {
+      const current = await introspect();
+      if (
+        current.workspaceId !== expected.workspaceId ||
+        current.scope !== expected.scope ||
+        current.ownerId !== expected.ownerId ||
+        current.groupId !== expected.groupId
+      )
+        throw statusError(403, "Workload identity binding changed");
+      if (!(await workspaceBound(current)))
+        throw statusError(403, "Administrative workspace is no longer authorized");
+      if (!(await policyEnabled())) throw statusError(403, "Tool denied by policy");
+      return current;
+    },
+  };
 }
 
 const TOOL_GROUP: Record<string, Group> = {
@@ -902,7 +937,11 @@ export class ManagementMcpStore {
       const live = useGroupAdminWorkspaceStore().findByWorkspaceId(
         id.workspaceId,
       );
-      if (!live || live.groupId !== id.groupId)
+      if (
+        !live ||
+        live.groupId !== id.groupId ||
+        live.ownerId !== id.ownerId
+      )
         throw Object.assign(
           new Error("Group administrative workspace is no longer authorized"),
           { statusCode: 403 },
@@ -1046,8 +1085,23 @@ export class ManagementMcpStore {
       } else if (name === "configuration.apply") {
         result = await this.applyConfigurationProposal(args);
       } else {
+        const executionIdentity = name.startsWith("volumes.size.")
+          ? createLiveManagementVolumeAuthority(
+              identity,
+              async () => {
+                // Wait for any accepted policy mutation to publish before this
+                // stage decides whether a queued/running job remains allowed.
+                await this.mutations;
+                return this.introspect(credential);
+              },
+              () => this.state.policy.groups["storage-maintenance"].enabled,
+              (current) =>
+                current.scope === "group" ||
+                useAdminWorkspaceStore().getRecord()?.id === current.workspaceId,
+            )
+          : identity;
         const execute = () =>
-          this.executeTool(name, args, identity.workspaceId, identity);
+          this.executeTool(name, args, identity.workspaceId, executionIdentity);
         result =
           identity.scope === "group" &&
           GROUP_ADMIN_DIRECT_SCOPE_BOUNDARY_TOOLS.has(name)

@@ -7,7 +7,7 @@ import { expect, test } from "@playwright/test";
 import { ContainerManager } from "../../orchestrator/server/utils/container";
 import { withOperationDeadline } from "../../orchestrator/server/utils/operation-deadline";
 import { requestCancellation } from "../../orchestrator/server/utils/request-cancellation";
-import { cleanupStaleDockerHelpers } from "../../orchestrator/server/utils/storage-visibility";
+import { cleanupStaleDockerHelpers, cleanupStaleStorageHelpers, StorageVisibilityManager } from "../../orchestrator/server/utils/storage-visibility";
 import { packBundle } from "../../orchestrator/server/utils/worker-export";
 import { demuxSingleFileFromTar } from "../../orchestrator/server/utils/workspace-zip";
 import { registerOperationHelper } from "../../orchestrator/server/utils/operation-helper-registry";
@@ -215,7 +215,7 @@ test("stale-helper cleanup times out each helper independently and a retry remai
 
   const releaseActive = registerOperationHelper("active-operation");
   const first = await cleanupStaleDockerHelpers(docker as any, 200);
-  expect(listCalls).toBe(2);
+  expect(listCalls).toBe(3);
   expect(first).toEqual({
     attempted: 3,
     removed: 2,
@@ -241,4 +241,51 @@ test("stale-helper cleanup times out each helper independently and a retry remai
     failures: [],
   });
   releaseActive();
+});
+
+test("production storage cleanup reconciles sizing before and after generic helpers", async () => {
+  const calls: string[] = [];
+  const docker = {
+    listContainers: async (options: any) => {
+      const label = options.filters.label[0];
+      calls.push(`list:${label}`);
+      return label === "agentor.workspace-helper=true"
+        ? [{ Id: "workspace-helper", Names: ["/agentor-workspace-reader-test"], State: "exited" }]
+        : [];
+    },
+    getContainer: (id: string) => ({
+      remove: async () => { calls.push(`remove:${id}`); },
+    }),
+  };
+  let reconciliations = 0;
+  const result = await cleanupStaleStorageHelpers(docker as any, async () => {
+    reconciliations += 1;
+    calls.push(`reconcile:${reconciliations}`);
+  }, 200);
+  expect(result).toEqual({ attempted: 1, removed: 1, failures: [] });
+  expect(reconciliations).toBe(2);
+  expect(calls[0]).toBe("reconcile:1");
+  expect(calls.at(-1)).toBe("reconcile:2");
+  expect(calls).not.toContain("list:agentor.volume-size-helper=true");
+});
+
+test("StorageVisibilityManager invokes sizing-owned reconciliation for explicit helper cleanup", async () => {
+  let reconciliations = 0;
+  const docker = {
+    listContainers: async () => [],
+  };
+  const manager = new StorageVisibilityManager({
+    docker: docker as any,
+    reconcileSizingHelpers: async () => { reconciliations += 1; },
+  });
+  (manager as any).inspect = async () => ({ generatedAt: "test" });
+  await expect(manager.cleanup({ staleHelpers: true })).resolves.toMatchObject({
+    actions: ["stale-helpers"],
+    helperCleanup: {
+      attempted: 0,
+      removed: 0,
+      failures: [],
+    },
+  });
+  expect(reconciliations).toBe(2);
 });

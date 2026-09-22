@@ -21,6 +21,7 @@ test.describe.serial('Managed local persistence', () => {
   test.skip(!existsSync('/src/orchestrator'), 'Requires the isolated Docker test runner');
   let worker: Awaited<ReturnType<typeof createWorker>>, environmentId: string;
   const volumeIds: string[] = [];
+  let sizeJobId = '';
   test.beforeAll(async ({ request }) => {
     const env = await new ApiClient(request).createEnvironment({ name: `Persistence-${Date.now()}`, dockerEnabled: false });
     expect(env.status, JSON.stringify(env.body)).toBe(201); environmentId = env.body.id;
@@ -68,6 +69,28 @@ test.describe.serial('Managed local persistence', () => {
     expect(JSON.stringify(inventory)).not.toMatch(/Mountpoint|dockerName|\/var\/lib\/docker\/volumes/);
   });
 
+  test('on-demand sizing reports allocated and hardlink-deduplicated logical bytes without exposing Docker identity', async ({ request }) => {
+    docker('exec', worker.containerName, 'python3', '-c', 'from pathlib import Path; p=Path("/home/agent/new-cache/size-source"); p.write_bytes(b"sizing-payload"); q=Path("/home/agent/new-cache/size-hardlink"); q.unlink(missing_ok=True); q.hardlink_to(p)');
+    const id = volumeIds[1]!;
+    const start = await request.post(`/api/volumes/${id}/size-jobs`, { data: { force: true } });
+    expect(start.status(), await start.text()).toBe(202);
+    sizeJobId = (await start.json()).id;
+    let job: any;
+    await expect.poll(async () => {
+      const response = await request.get(`/api/volume-size-jobs/${sizeJobId}`);
+      job = await response.json(); return job.status;
+    }, { timeout: 90_000, intervals: [500, 1000, 2000] }).toMatch(/succeeded|failed|cancelled/);
+    expect(job.status, job.error).toBe('succeeded');
+    expect(job.measurement).toMatchObject({ state: 'known', source: 'bounded-read-only-scan', consistency: 'live-approximate' });
+    expect(job.measurement.allocatedBytes).toBeGreaterThan(0);
+    expect(job.measurement.logicalBytes).toBe('sizing-payload'.length);
+    const inventory = await (await request.get('/api/volumes')).json();
+    const item = inventory.volumes.find((candidate: any) => candidate.id === id);
+    expect(item).toMatchObject({ sizeBytes: job.measurement.allocatedBytes, logicalSizeBytes: job.measurement.logicalBytes,
+      size: { state: 'known' }, canMeasureSize: true });
+    expect(JSON.stringify({ job, item })).not.toMatch(/dockerName|Mountpoint|private-|\/var\/lib\/docker\/volumes/);
+  });
+
   test('self-service defaults off, allows only additive requests and does not authorize disruption', async ({ request }) => {
     const self = (body: any) => {
       const raw = docker('exec', worker.containerName, 'curl', '-sS', '-w', '\n%{http_code}', '-H', 'Content-Type: application/json', '-d', JSON.stringify(body), 'http://agentor-orchestrator:3000/api/worker-self/storage');
@@ -111,6 +134,8 @@ test.describe.serial('Managed local persistence', () => {
       expect((await strangerRequest.get(`/api/containers/${worker.id}/storage`)).status()).toBe(404);
       expect((await strangerRequest.get(`/api/volumes/${ids[0]}`)).status()).toBe(404);
       expect((await strangerRequest.post(`/api/volumes/${ids[0]}`, { data: { action: 'delete', confirmed: true } })).status()).toBe(404);
+      expect((await strangerRequest.post(`/api/volumes/${volumeIds[0]}/size-jobs`, { data: { force: true } })).status()).toBe(404);
+      expect((await strangerRequest.get(`/api/volume-size-jobs/${sizeJobId}`)).status()).toBe(404);
       expect((await (await strangerRequest.get('/api/volumes')).json()).volumes.some((v: any) => volumeIds.includes(v.id))).toBe(false);
     } finally { await strangerRequest.dispose(); await deleteTestUser(stranger.id); }
   });

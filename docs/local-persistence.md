@@ -168,5 +168,7 @@ browser tests, covering lifecycle recovery, protection locks, account retention,
 owner/group authorization, self-service and backup compatibility. The helper also
 has Python unit tests; orchestrator typechecking is part of local verification.
 
-Filesystem size scanning is not implemented; inventory exposes available Docker
-usage metadata or explicit unknown, without blocking on a recursive scan.
+Named-volume sizes are calculated only by explicit asynchronous requests—never
+during inventory reads—using a 60-second/1,000,000-entry read-only helper and a
+15-minute incarnation-bound cache. Results report allocated blocks separately
+from hardlink-deduplicated logical file bytes; live mounts are explicitly approximate.

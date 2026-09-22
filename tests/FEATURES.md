@@ -11,6 +11,13 @@ Every user-facing feature of the Agentor web dashboard, organized by category. T
 - Storage inventory lists owner-scoped Agentor volumes and backup selection without
   exposing Docker names or host paths. Detach retains data; confirmed deletion is
   separate and refused while attached. Worker deletion retains custom volumes.
+- Named-volume sizes are calculated only on demand by cancellable asynchronous jobs;
+  inventory reads never recurse through volume contents. Results distinguish allocated
+  disk bytes from hardlink-deduplicated logical file bytes and become stale after 15
+  minutes. Scans are time/entry/concurrency bounded, validate the volume incarnation,
+  use an immutable read-only networkless helper, and label live-volume results as an
+  approximate point-in-time traversal. GUI, owner/admin REST, and platform/group MCP
+  share live authorization and expose known/stale/unknown state without Docker names.
 - Opt-in worker-self REST/MCP permits only inspect/add/idempotent retry, with separate
   live-helper and recreation authorization. Protection locks, access-policy revocation,
   owner isolation and delegated-admin live subtree scope are enforced server-side.

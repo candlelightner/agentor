@@ -203,6 +203,8 @@ export default defineNitroPlugin(async (nitroApp) => {
   // Storage journals must settle before sync can observe old and replacement
   // containers with the same worker label after an interrupted recreation.
   const { useManagedVolumeManager } = await import("../utils/managed-volume-manager");
+  const { useManagedVolumeSizingManager } = await import("../utils/managed-volume-sizing");
+  await useManagedVolumeSizingManager().init();
   if (!instanceRecoveryMode) await useManagedVolumeManager().recoverStartup();
   await containerManager.sync();
   // Re-evaluate every persisted bind before ordinary startup reconciliation.
@@ -394,6 +396,7 @@ export default defineNitroPlugin(async (nitroApp) => {
   );
   useOrphanSweeper().addCandidateSource(() => useBackupManager().ownerIds());
   useOrphanSweeper().addCandidateSource(() => useManagedVolumeManager().store.listUserIds());
+  useOrphanSweeper().addLifecycleCleanupHook((userId) => useManagedVolumeSizingManager().forgetUser(userId));
   useOrphanSweeper().addLifecycleCleanupHook((userId) => useManagedVolumeManager().retainDeletedOwner(userId));
   useOrphanSweeper().addCleanupHook((userId) =>
     useImageCatalogManager().forgetOwner(userId),

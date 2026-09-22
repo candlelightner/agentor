@@ -21,7 +21,7 @@ test('delegated volume MCP confines inventory and mutations to the current group
     const policy = await (await request.get('/api/admin/management-mcp/policy')).json();
     previous = policy.groups['storage-maintenance'].enabled;
     expect((await request.put('/api/admin/management-mcp/policy', { data: { groups: { 'storage-maintenance': true } } })).status()).toBe(200);
-    const identity = await request.post('/api/admin/management-mcp/diagnostics/issue-identity', { data: { workspaceId, ttlSeconds: 60 } });
+    const identity = await request.post('/api/admin/management-mcp/diagnostics/issue-identity', { data: { workspaceId, ttlSeconds: 300 } });
     expect(identity.status()).toBe(201);
     const credential = (await identity.json()).credential;
     const invoke = (tool: string, args: Record<string, unknown> = {}) => request.post('/api/admin/management-mcp/diagnostics/invoke', { data: { credential, tool, arguments: args } });
@@ -36,7 +36,19 @@ test('delegated volume MCP confines inventory and mutations to the current group
     const entries = (await inventory.json()).volumes;
     expect(entries.some((v: any) => v.id === own.id)).toBe(true);
     expect(entries.some((v: any) => v.id === other.id)).toBe(false);
-    for (const tool of ['volumes.inspect', 'volumes.rename', 'volumes.delete', 'workers.storage.apply', 'workers.storage.detach', 'workers.storage.reattach']) {
+    const workspaceVolume = entries.find((v: any) => v.workerId === workers[0] && v.purpose === 'workspace');
+    expect(workspaceVolume).toBeTruthy();
+    const sizeStart = await invoke('volumes.size.start', { volumeId: workspaceVolume.id, force: true });
+    expect(sizeStart.status(), await sizeStart.text()).toBe(200);
+    const sizeJob = await sizeStart.json();
+    let terminalJob: any;
+    await expect.poll(async () => {
+      const response = await invoke('volumes.size.inspect', { jobId: sizeJob.id });
+      terminalJob = response.status() === 200 ? await response.json() : { status: `http-${response.status()}` };
+      return terminalJob.status;
+    }, { timeout: 60_000 }).toMatch(/succeeded|failed|cancelled/);
+    expect(terminalJob.status, terminalJob.error).toBe('succeeded');
+    for (const tool of ['volumes.inspect', 'volumes.rename', 'volumes.delete', 'volumes.size.start', 'workers.storage.apply', 'workers.storage.detach', 'workers.storage.reattach']) {
       const args: Record<string, unknown> = { volumeId: other.id };
       if (tool === 'volumes.rename') args.name = 'Forbidden';
       if (tool === 'volumes.delete' || tool === 'workers.storage.detach') args.confirmed = true;

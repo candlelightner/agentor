@@ -7,18 +7,20 @@ import { withOperationDeadline } from "./operation-deadline";
 import { isOperationHelperActive } from "./operation-helper-registry";
 
 const STALE_TEMP_MS = 2 * 60 * 60 * 1000;
-const HELPER_LABELS = ["agentor.workspace-helper", "agentor.backup-restore-helper"] as const;
+const HELPER_LABELS = ["agentor.workspace-helper", "agentor.backup-restore-helper", "agentor.volume-size-helper"] as const;
+const GENERIC_HELPER_LABELS = HELPER_LABELS.filter((label) => label !== "agentor.volume-size-helper");
 const STORAGE_DOCKER_TIMEOUT_MS = 8_000;
 
 export async function cleanupStaleDockerHelpers(
   docker: Pick<Docker, "listContainers" | "getContainer">,
   timeoutMs = STORAGE_DOCKER_TIMEOUT_MS,
+  labels: readonly string[] = HELPER_LABELS,
 ): Promise<{
   attempted: number;
   removed: number;
   failures: Array<{ helperName: string; code: string }>;
 }> {
-  const containers = await listDockerHelpers(docker, timeoutMs);
+  const containers = await listDockerHelpers(docker, timeoutMs, labels);
   // Docker's `running` state can itself be stale. Protect helpers that still
   // have a live in-process request owner, but retry every unowned helper even
   // when Docker reports it running. This also catches an object created after
@@ -64,6 +66,20 @@ export async function cleanupStaleDockerHelpers(
   };
 }
 
+export async function cleanupStaleStorageHelpers(
+  docker: Pick<Docker, "listContainers" | "getContainer">,
+  reconcileSizingHelpers: () => Promise<unknown>,
+  timeoutMs = STORAGE_DOCKER_TIMEOUT_MS,
+) {
+  // Sizing owns its helper reservations. Reconcile before generic cleanup so
+  // cleanup-required running helpers are retried, and after it so an external
+  // removal can release a confirmed-absent reservation.
+  await reconcileSizingHelpers();
+  const result = await cleanupStaleDockerHelpers(docker, timeoutMs, GENERIC_HELPER_LABELS);
+  await reconcileSizingHelpers();
+  return result;
+}
+
 /** Docker combines repeated label filters with AND, while these helper kinds
  * are intentionally disjoint. Query each deterministic label independently
  * and deduplicate by container id so one kind (or one failed inventory call)
@@ -71,9 +87,10 @@ export async function cleanupStaleDockerHelpers(
 async function listDockerHelpers(
   docker: Pick<Docker, "listContainers">,
   timeoutMs: number,
+  labels: readonly string[] = HELPER_LABELS,
 ): Promise<Docker.ContainerInfo[]> {
   const settled = await Promise.allSettled(
-    HELPER_LABELS.map((label) =>
+    labels.map((label) =>
       withOperationDeadline(
         (operationSignal) => docker.listContainers({
           all: true,
@@ -105,7 +122,20 @@ export interface StorageVisibility {
  * referenced worker/custom image or active artifact; cleanup is limited to
  * Docker's dangling images, exited Agentor helpers, and old Agentor tmp dirs. */
 export class StorageVisibilityManager {
-  private docker = new Docker({ socketPath: "/var/run/docker.sock" });
+  private readonly docker: Docker;
+  private readonly reconcileSizingHelpers: () => Promise<unknown>;
+  constructor(options: {
+    docker?: Docker;
+    reconcileSizingHelpers?: () => Promise<unknown>;
+  } = {}) {
+    this.docker = options.docker ?? new Docker({ socketPath: "/var/run/docker.sock" });
+    this.reconcileSizingHelpers = options.reconcileSizingHelpers ?? (async () => {
+      const { useManagedVolumeSizingManager } = await import("./managed-volume-sizing");
+      const sizing = useManagedVolumeSizingManager();
+      await sizing.init();
+      await sizing.cleanupStaleHelpers();
+    });
+  }
   async inspect(): Promise<StorageVisibility> {
     const config = useConfig();
     const fs = await statfs(config.dataDir);
@@ -180,7 +210,7 @@ export class StorageVisibilityManager {
       reclaimedBytes += Number(result?.SpaceReclaimed || 0); actions.push("build-cache");
     }
     if (input.staleHelpers) {
-      helperCleanup = await cleanupStaleDockerHelpers(this.docker);
+      helperCleanup = await cleanupStaleStorageHelpers(this.docker, this.reconcileSizingHelpers);
       actions.push("stale-helpers");
     }
     if (input.staleStaging) { reclaimedBytes += await this.removeStaleStaging(); actions.push("stale-staging"); }

@@ -20,27 +20,54 @@ log() { echo -e "\033[1;36m[test-runner]\033[0m $*"; }
 err() { echo -e "\033[1;31m[test-runner]\033[0m $*" >&2; }
 
 # ---------------------------------------------------------------------------
-# Phase 0: cgroup v2 nesting
+# Phase 0: private cgroup v2 delegation and nesting
 #
-# When this container starts, the runner process is in the parent cgroup
-# (e.g. /sys/fs/cgroup/docker). cgroupv2 forbids nested cgroup creation
-# in a "domain" cgroup that has live processes — child cgroups created by
-# the inner dockerd would inherit "domain threaded" mode, and any attempt
-# to apply controllers (Memory, CpuQuota, etc.) on grandchild containers
-# fails with: "cannot enter cgroupv2 ... with domain controllers — it is
-# in threaded mode". This is the well-known DinD cgroupv2 issue and is
-# fixed by moving every process out of the root group into a child
-# `init` group, then enabling controllers on the now-empty parent.
-# Same trick the official `docker:dind` image uses.
+# Resource ceilings are part of the sizing helper's security boundary. The
+# runner therefore requires a private domain cgroup with delegated cpu,
+# memory, and pids controllers; it never borrows the host cgroup namespace or
+# mutates outer ancestry. Move root processes into `init`, then enable only
+# those required controllers for inner dockerd.
 # ---------------------------------------------------------------------------
-if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
-    log "Setting up cgroup v2 nesting..."
-    mkdir -p /sys/fs/cgroup/init
-    xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null || true
-    sed -e 's/ / +/g' -e 's/^/+/' < /sys/fs/cgroup/cgroup.controllers \
-        > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || \
-        log "Warning: could not enable cgroup controllers (may be restricted by parent)."
+if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+    err "Docker E2E environment blocked: a private cgroup v2 hierarchy is required."
+    exit 1
 fi
+if [ "$(cat /proc/self/cgroup)" != "0::/" ]; then
+    err "Docker E2E environment blocked: the test runner does not have a private cgroup namespace root."
+    exit 1
+fi
+CGROUP_TYPE=$(cat /sys/fs/cgroup/cgroup.type)
+if [ "$CGROUP_TYPE" != "domain" ]; then
+    err "Docker E2E environment blocked: private cgroup root type is '$CGROUP_TYPE', expected 'domain'."
+    exit 1
+fi
+CGROUP_CONTROLLERS=" $(cat /sys/fs/cgroup/cgroup.controllers) "
+for controller in cpu memory pids; do
+    case "$CGROUP_CONTROLLERS" in
+        *" $controller "*) ;;
+        *)
+            err "Docker E2E environment blocked: '$controller' is not delegated to the private cgroup root."
+            exit 1
+            ;;
+    esac
+done
+log "Setting up private cgroup v2 nesting..."
+mkdir -p /sys/fs/cgroup/init
+# With no command, xargs defaults to echo. One PID per invocation writes each
+# current root process to the child cgroup, matching the official DinD setup.
+xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs
+if read -r remaining_pid < /sys/fs/cgroup/cgroup.procs; then
+    err "Docker E2E environment blocked: process $remaining_pid remained in the private cgroup root."
+    exit 1
+fi
+echo "+cpu +memory +pids" > /sys/fs/cgroup/cgroup.subtree_control
+CGROUP_ENABLED=" $(cat /sys/fs/cgroup/cgroup.subtree_control) "
+for controller in cpu memory pids; do
+    case "$CGROUP_ENABLED" in
+        *" $controller "*) ;;
+        *) err "Docker E2E environment blocked: failed to enable '$controller' for inner dockerd."; exit 1 ;;
+    esac
+done
 
 # ---------------------------------------------------------------------------
 # Phase 0.5: dnsmasq + resolver fix (must run BEFORE dockerd starts)
@@ -189,6 +216,36 @@ build_with_retry() {
 build_with_retry agentor-worker:latest /src/worker
 build_with_retry agentor-orchestrator:latest /src/orchestrator
 log "Images built."
+
+# Exercise the exact production sizing-helper ceilings before starting the
+# stack. A daemon that accepts ordinary containers but cannot apply one of
+# these controls is not a valid E2E environment.
+log "Validating constrained volume-size helper support..."
+SMOKE_VOLUME=agentor-volume-size-constraints-smoke
+docker volume rm -f "$SMOKE_VOLUME" > /dev/null 2>&1 || true
+docker volume create --label agentor.test.volume-size-smoke=true "$SMOKE_VOLUME" > /dev/null
+if ! docker run --rm \
+    --name agentor-volume-size-constraints-smoke \
+    --entrypoint node \
+    --user 0:0 \
+    --network none \
+    --read-only \
+    --cap-drop ALL \
+    --cap-add DAC_READ_SEARCH \
+    --security-opt no-new-privileges:true \
+    --pids-limit 16 \
+    --memory 134217728 \
+    --cpus 0.5 \
+    --init \
+    --tmpfs /tmp:rw,noexec,nosuid,nodev,size=1048576 \
+    --log-driver json-file --log-opt max-size=32k --log-opt max-file=1 \
+    --mount type=volume,src="$SMOKE_VOLUME",dst=/volume,readonly,volume-nocopy \
+    agentor-worker:latest -e "require('node:fs').readdirSync('/volume')"; then
+    docker volume rm -f "$SMOKE_VOLUME" > /dev/null 2>&1 || true
+    err "Docker E2E environment blocked: the exact constrained sizing helper cannot start."
+    exit 1
+fi
+docker volume rm -f "$SMOKE_VOLUME" > /dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # Phase 3: bring inner stack up fresh

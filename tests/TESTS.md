@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **2045 tests** across 205 test files (1418 API across 141 files + 627 UI across 64 files), as enumerated with `npx playwright test --list`
+- **2084 tests** across 208 test files (1456 API across 144 files + 628 UI across 64 files), as enumerated with the Playwright JSON list reporter
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -87,7 +87,7 @@ npm run test:docker -- -g "should create worker"
 npm run test:docker:clean
 ```
 
-The runner uses `docker.localhost` and `docker2.localhost` as base domains with self-signed wildcard certs, dashboard at `https://dash.docker.localhost`. Traefik publishes 80/443 inside the runner's own network namespace, and `*.localhost` resolves to `127.0.0.1` so playwright reaches it without any `/etc/hosts` setup. The runner's `agentor-test-runner-docker` volume persists between runs so the inner image builds are cached — first run is slow, subsequent runs start fast. Reports and `.auth` cookies are written back to `tests/` on the host because the project source is bind-mounted into the runner. Works under triple-nested DinD (host → user's worker → test-runner → inner orchestrator → inner workers) since every level uses overlay2 on a volume.
+The runner uses `docker.localhost` and `docker2.localhost` as base domains with self-signed wildcard certs, dashboard at `https://dash.docker.localhost`. Traefik publishes 80/443 inside the runner's own network namespace, and `*.localhost` resolves to `127.0.0.1` so playwright reaches it without any `/etc/hosts` setup. Before starting the stack, the runner requires a private cgroup-v2 root with delegated CPU, memory, and PID controllers and smoke-tests the exact constrained, read-only volume-size helper launch; unsupported nested Docker environments fail closed. The CI smoke selection includes both managed-volume REST and management-MCP coverage plus the managed-volume UI. The runner's `agentor-test-runner-docker` volume persists between runs so the inner image builds are cached — first run is slow, subsequent runs start fast. Reports and `.auth` cookies are written back to `tests/` on the host because the project source is bind-mounted into the runner. Works under triple-nested DinD (host → user's worker → test-runner → inner orchestrator → inner workers) when each level provides the required private cgroup delegation and overlay2 volume storage.
 
 ## Configuration
 
@@ -108,13 +108,13 @@ tests/
     worker-lifecycle.ts    # Container create/cleanup utilities
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
-    api/                     # API endpoint tests (1418 tests across 141 files)
-  ui/                      # UI interaction tests (627 tests across 64 files)
+    api/                     # API endpoint tests (1456 tests across 144 files)
+  ui/                      # UI interaction tests (628 tests across 64 files)
 ```
 
 ## Test Categories
 
-### API Tests (1418 tests, 141 files)
+### API Tests (1456 tests, 144 files)
 
 | File | Tests | Coverage |
 | --- | ---: | --- |
@@ -219,10 +219,13 @@ tests/
 | `backup-restore-safety.spec.ts`   | 34 | Restore and worker lifecycle safety: per-worker and owner→worker serialization (including provisional imports), prompt Docker timeouts whose worker fence remains held until the aborted request settles without blocking sibling workers, atomic missing-runtime reconciliation, durable backward-compatible desired state, idempotent stop/archive/rebuild retries, persistence-first managed recovery, explicit reverse-order partial-rollback reporting, reference-safe imported-environment cleanup, transactional worker-configuration deletion, strict production volume/image cleanup adapters, retryable aggregate permanent-deletion cleanup, preserved failed-rootfs recovery tags, deleted-owner worker cleanup, restore draining, and a bounded fail-closed deadline for non-cooperative restore work. |
 | `backup-restore-cancellation.spec.ts` | 6 | Restore admission/cancellation safety: setup-time cancellation cannot be overwritten, queued cancellation removes admission/pins even when status persistence fails, queued in-place restores are removable, shared-artifact pins are independently job-owned, concurrent retry calls admit one execution/pin, and the legacy synchronous restore contract runs through the same bounded queue. |
 | `google-backup-oauth-installation.spec.ts` | 2 | Admin-only installation Google OAuth configuration: encrypted write-only client secret status, non-disclosure, and a mocked authorization challenge without a Google account. |
-| `managed-volumes.spec.ts` | 11 | Managed local persistence API: safe/additive targets, owner isolation, live/recreation authorization, detach/reattach and confirmed deletion, protection locks, restart/archive survival, and deleted-account administrator retention. |
+| `managed-volumes.spec.ts` | 12 | Managed local persistence API: safe/additive targets, owner isolation, live/recreation authorization, detach/reattach and confirmed deletion, bounded allocated/logical on-demand sizing without Docker-identity disclosure, protection locks, restart/archive survival, and deleted-account administrator retention. |
 | `managed-volume-store.spec.ts` | 6 | No-server managed-volume store/module coverage: protected-path validation, owner-scoped idempotence/overlap rejection, policy defaults, fail-closed missing-volume behavior, startup recovery isolation, and retained deleted-owner records across restart. |
+| `managed-volume-sizing.spec.ts` | 19 | No-server sizing coverage: known/stale/unknown cache and incarnation invalidation, global/per-owner admission and helper-cleanup reservations, cancellation/publication and snapshot fencing, restart interruption, live authorization revocation, immutable read-only networkless helper options with only `DAC_READ_SEARCH`, bounded scanner parsing, Docker timeout/cleanup settlement, and fail-closed startup reconciliation. |
+| `managed-volume-sizing-control.spec.ts` | 9 | Durable metadata-only REST/MCP job-control authorization, platform-only and owner/subtree boundaries, live credential/role/workspace/policy revocation after manager initialization and state-queue waits, no private-field disclosure, Docker-outage inspection, and cancellation without physical-volume discovery. |
+| `managed-volume-sizing-mcp-authority.spec.ts` | 7 | Management-MCP size-start authorization rechecks credential, policy, workspace binding, target identity, owner, and live group descendants around asynchronous discovery and manager admission. |
 | `managed-volume-helper.spec.ts` | 3 | Isolated-Docker trusted live-mount helper: both worker privilege states retain their own privilege setting, and a busy path is rejected without replacing contents. |
-| `managed-volume-mcp.spec.ts` | 1 | Delegated management-MCP volume inventory and mutations are limited to the live group subtree and revoked with membership. |
+| `managed-volume-mcp.spec.ts` | 1 | Delegated management-MCP volume inventory, size jobs, and mutations are limited to the live group subtree and revoked with membership. |
 | `resource-monitor-lifecycle.spec.ts` | 2 | No-server resource-monitor lifecycle regression: a stale stats failure from a replaced container cannot mark its replacement unknown, while a current-runtime failure still reports unknown health. |
 | `image-catalog.spec.ts`           | 16    | Controlled local image definitions/builds: Safe actionable rejection and explicit Advanced boundary, approved bases/context/legacy-fragment policy, requestId-idempotent async build/validation/test-worker jobs with logs/cancellation, immutable digests, distinct compatibility outcomes and promotion/test-worker gates, rollback/defaults, cleanup, ownership, and legacy normalization without a separate database migration. |
 | `git-image-catalog.spec.ts`       | 9     | Mocked GitHub catalog connection, encrypted write-only PAT handling, initial empty-repository diagnostics, push/pull conflict safety, recovery, branch/PR metadata, immutable GHCR digests, disconnect, and credential redaction.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -233,7 +236,7 @@ tests/
 | `management-owner-validation.spec.ts` | 14 | Shared management owner boundary: valid cross-user targets, platform-admin-only whole-instance recovery namespaces, nonexistent-owner rejection, `..`/absolute/slash/backslash/percent-encoded-ish traversal rejection, no filesystem/map mutation on invalid user-env writes, quarantine of persisted cross-partition owner/path metadata, retry-safe transactional single/bulk/owner deletion, serialized same-key failure rollback, recoverable tombstone persistence queues, and backward-compatible loading of historical URL-safe ids containing `-`/`_` without rewriting source files. |
 | `config-store-integrity.spec.ts` | 6 | Owner-partition persistence integrity: detached ingress/get/list/predicate snapshots, stale reload hiding, fail-closed `keyFn` exceptions, corrupt/malformed/mismatched-owner account env and worker configuration quarantine, healthy-owner isolation, source-byte preservation, explicit cleanup recovery, and detached worker-configuration results. |
 | `container-store-quarantine.spec.ts` | 9 | Managed Docker containers without authoritative WorkerStore metadata are quarantined and never resurrected as ownerless workers; desired-state migration, unknown runtime diagnostics, rejection of directly started secret runtimes without a valid handshake, stale-sync fencing across replacement/archive, bounded secret-bootstrap retry/stop-start recovery, and failure-isolated reconciliation are covered. |
-| `workspace-download-cancellation.spec.ts` | 9 | Request disconnect during preparation, worker-card workspace-download signal propagation, streaming-source teardown including the post-preparation abort race, finalization/staging-file closure, structured safe deadline/abort diagnostics, and independent timed-out stale-helper cleanup with retry-safe reconciliation. |
+| `workspace-download-cancellation.spec.ts` | 11 | Request disconnect during preparation, worker-card workspace-download signal propagation, streaming-source teardown including the post-preparation abort race, finalization/staging-file closure, structured safe deadline/abort diagnostics, and independent timed-out stale-helper cleanup with retry-safe reconciliation. |
 | `rebuild-persistence-reconciliation.spec.ts` | 1 | Live rebuild regression: a selected Codex path and `/workspace` markers survive, while an enabled plugin is reconciled onto the replacement runtime generation. |
 | `worker-daemon-restart-recovery.spec.ts` | 1 | Disposable DinD daemon restart convergence: secret-bearing desired workers restart only through Agentor bootstrap while explicitly stopped workers remain stopped. |
 | `management-image-backup-domain.spec.ts` | 7 | Image/backup management MCP schemas cover async build/status/log/cancel, validation retry/test-worker requestId inputs, executable follow-up actions, Safe/Advanced and plugin-composition schemas, remote worker recovery/adoption/image-recovery, whole-instance create/Google discovery/adoption/preflight/restore with explicit confirmations and exact status/log/cancel tools, write-only recovery material, safe secret-name diagnostics, object-shaped structured content, and exact optional backup-subset selection. |
@@ -263,7 +266,7 @@ tests/
 The container edge-case coverage includes repeated-stop idempotency: stopping an
 already-stopped worker returns success and leaves its persisted status stopped.
 
-### UI Tests (627 tests, 64 files)
+### UI Tests (628 tests, 64 files)
 
 | File | Tests | Coverage |
 | --- | ---: | --- |
@@ -273,7 +276,7 @@ already-stopped worker returns success and leaves its persisted status stopped.
 | `instance-backup-management.spec.ts` | 5 | Platform-admin whole-instance UI: asynchronous Local/Google Drive creation scope, retry-stable body/header idempotency identity after an uncertain response, remote discovery/inspection/adoption with key availability, plugin/image/host dependency inventory, restore preflight, explicit destructive/external-dependency acknowledgements, and blocker-safe disabled restore. Provider and job responses are mocked; no real Google credentials are required. |
 | `image-catalog-real.spec.ts` | 1 | Real controlled image build, test-worker verification, and promotion. |
 | `managed-networks.spec.ts` | 1 | Managed-network dashboard workflow. |
-| `managed-volumes.spec.ts` | 1 | Persistent-path controls show the live-mount warning, independent self-service controls, and the managed-volume inventory. |
+| `managed-volumes.spec.ts` | 2 | Persistent-path controls show the live-mount warning, independent self-service controls, and managed-volume inventory with explicit on-demand known/stale/unknown allocated/logical sizing and safe polling/cancellation behavior. |
 | `worker-configuration-real.spec.ts` | 1 | Real worker-configuration persistence and execution. |
 | `worker-groups.spec.ts` | 5 | Worker-group dashboard CRUD, inherited worker-self API access selection, grouping, recursive lifecycle controls, nested archived-group rendering, and administration controls. |
 | `workspace-storage-real.spec.ts` | 1 | Real workspace storage browsing and operations. |

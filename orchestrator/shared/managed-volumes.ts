@@ -30,6 +30,36 @@ export interface ManagedVolume {
   };
 }
 
+export type VolumeSizeState = "known" | "stale" | "unknown";
+export type VolumeSizeJobStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+
+export interface VolumeSizeMeasurement {
+  state: VolumeSizeState;
+  /** Allocated filesystem blocks. This is the disk-usage figure shown first. */
+  allocatedBytes: number | null;
+  /** Sum of regular-file lengths, with hard links counted once. */
+  logicalBytes: number | null;
+  measuredAt?: string;
+  source?: "bounded-read-only-scan";
+  consistency?: "offline-read-only" | "live-approximate";
+  reason?: "not-measured" | "stale" | "volume-unavailable" | "incarnation-changed" | "scan-failed";
+}
+
+export interface PublicVolumeSizeJob {
+  id: string;
+  volumeId: string;
+  status: VolumeSizeJobStatus;
+  phase: "queued" | "validating" | "scanning" | "complete" | "failed" | "cancelled";
+  progress: number;
+  entriesScanned: number;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  error?: string;
+  measurement?: VolumeSizeMeasurement;
+}
+
 export interface VolumeInventoryItem {
   id: string;
   name: string;
@@ -42,6 +72,10 @@ export interface VolumeInventoryItem {
   observed: "mounted" | "unmounted" | "missing" | "unknown";
   state: string;
   sizeBytes: number | null;
+  logicalSizeBytes?: number | null;
+  size: VolumeSizeMeasurement;
+  sizeJob?: PublicVolumeSizeJob;
+  canMeasureSize: boolean;
   backupCoverage: "selected" | "not-configured" | "unknown";
   createdAt?: string;
   managed: boolean;
