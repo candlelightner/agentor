@@ -22,9 +22,9 @@ services:
       # Provider boundary tests import the same TypeScript modules directly;
       # mirror the repository-relative path they use outside Docker.
       - ./orchestrator:/work/orchestrator:ro
-      # Resolve direct production-module imports against the orchestrator lockfile.
-      # The source tree stays read-only; only this dependency mount is writable.
-      - orchestrator-test-node-modules:/work/orchestrator/node_modules
+      # Node also resolves imports from /work/node_modules, keeping this
+      # dependency mount outside the read-only orchestrator source tree.
+      - orchestrator-test-node-modules:/work/node_modules
       - ./worker:/src/worker:ro
       # Test source. Read-write so playwright can write reports / .auth
       # back to the host for inspection.

@@ -306,11 +306,10 @@ if [ ! -d node_modules ] || [ ! -x node_modules/.bin/playwright ] || [ "$DEPENDE
 fi
 
 # Some acceptance specs import production server modules directly from the
-# read-only source mount. Node resolves their packages from the orchestrator
-# directory, so install its locked production dependencies into the separate
-# writable node_modules mount. Ignore project postinstall scripts: the probe
-# needs module resolution, not a second Nuxt build in the test runner.
-ORCHESTRATOR_DEPENDENCY_MARKER="/work/orchestrator/node_modules/.agentor-probe-dependencies.sha256"
+# read-only source mount. Node finds packages in its /work parent directory,
+# whose node_modules is a separate writable volume. Ignore project postinstall
+# scripts: the probe needs module resolution, not a second Nuxt build.
+ORCHESTRATOR_DEPENDENCY_MARKER="/work/node_modules/.agentor-probe-dependencies.sha256"
 ORCHESTRATOR_DEPENDENCY_KEY=$(
     {
         sha256sum /work/orchestrator/package.json /work/orchestrator/package-lock.json
@@ -320,9 +319,10 @@ ORCHESTRATOR_DEPENDENCY_KEY=$(
     } | sha256sum | awk '{print $1}'
 )
 INSTALLED_ORCHESTRATOR_DEPENDENCY_KEY=$(cat "$ORCHESTRATOR_DEPENDENCY_MARKER" 2>/dev/null || true)
-if [ ! -d /work/orchestrator/node_modules/dockerode ] || [ "$ORCHESTRATOR_DEPENDENCY_KEY" != "$INSTALLED_ORCHESTRATOR_DEPENDENCY_KEY" ]; then
+if [ ! -d /work/node_modules/dockerode ] || [ "$ORCHESTRATOR_DEPENDENCY_KEY" != "$INSTALLED_ORCHESTRATOR_DEPENDENCY_KEY" ]; then
     log "Installing orchestrator dependencies for direct module tests..."
-    npm ci --prefix /work/orchestrator --omit=dev --ignore-scripts --no-audit --no-fund
+    cp /work/orchestrator/package.json /work/orchestrator/package-lock.json /work/
+    npm ci --prefix /work --omit=dev --ignore-scripts --no-audit --no-fund
     printf '%s\n' "$ORCHESTRATOR_DEPENDENCY_KEY" > "$ORCHESTRATOR_DEPENDENCY_MARKER"
 fi
 
