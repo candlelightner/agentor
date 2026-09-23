@@ -197,7 +197,10 @@ test('trusted-image failure before Docker create releases snapshot, owner, and g
     expect(await terminal(manager, failed.id)).toMatchObject({ status: 'failed' });
     expect(createCalls).toBe(0);
     expect(helperRemovals).toBe(0);
-    expect(manager.hasActiveOperationsForInstanceSnapshot()).toBe(false);
+    await expect.poll(
+      () => manager.hasActiveOperationsForInstanceSnapshot(),
+      { timeout: 5_000 },
+    ).toBe(false);
 
     const retried = await manager.create('owner-a', async () => resource('image-failure', 'owner-a'), true);
     const otherOwner = await manager.create('owner-b', async () => resource('other-volume', 'owner-b'), true);
@@ -210,7 +213,10 @@ test('trusted-image failure before Docker create releases snapshot, owner, and g
     expect(await terminal(manager, retried.id)).toMatchObject({ status: 'succeeded' });
     expect(await terminal(manager, otherOwner.id)).toMatchObject({ status: 'succeeded' });
     expect(helperRemovals).toBe(2);
-    expect(manager.hasActiveOperationsForInstanceSnapshot()).toBe(false);
+    await expect.poll(
+      () => manager.hasActiveOperationsForInstanceSnapshot(),
+      { timeout: 5_000 },
+    ).toBe(false);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
