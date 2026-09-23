@@ -513,6 +513,11 @@ export class PortableManagedVolumeRuntime {
       probe = await this.createHelperWithSettlement(helperName, helperOperationId, input.signal, {
         Image: input.image,
         name: helperName,
+        // docker-imported root filesystems carry no image command metadata.
+        // Moby still requires a command at create time even though this probe
+        // is deliberately never started, so supply an inert fixed override.
+        Entrypoint: ["/bin/true"],
+        Cmd: [],
         Env: [],
         NetworkDisabled: true,
         Labels: this.helperLabels(helperOperationId, {

@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **2144 tests** across 215 test files (1514 API across 150 files + 630 UI across 65 files), as enumerated with the Playwright list reporter
+- **2147 tests** across 215 test files (1516 API across 150 files + 631 UI across 65 files), as enumerated with the Playwright list reporter
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -108,13 +108,13 @@ tests/
     worker-lifecycle.ts    # Container create/cleanup utilities
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
-    api/                     # API endpoint tests (1514 tests across 150 files)
-  ui/                      # UI interaction tests (630 tests across 65 files)
+    api/                     # API endpoint tests (1516 tests across 150 files)
+  ui/                      # UI interaction tests (631 tests across 65 files)
 ```
 
 ## Test Categories
 
-### API Tests (1514 tests, 150 files)
+### API Tests (1516 tests, 150 files)
 
 | File | Tests | Coverage |
 | --- | ---: | --- |
@@ -134,8 +134,8 @@ tests/
 | `portable-managed-volume-archive.spec.ts` | 12 | Exact nested payload packing plus GNU/Docker tar interoperability; mode, ownership, safe-link, long-path PAX, framing, count, raw/expanded/compressed-size, traversal, collision, special-file, cancellation, and cleanup boundaries. |
 | `portable-managed-volume-plan.spec.ts` | 6 | Verified attached-volume capture planning, explicit exclusions, fresh deterministic destination identities, and root/exact/ancestor/descendant conflict rejection across every protected destination class. |
 | `portable-managed-volume-journal.spec.ts` | 7 | Strict durable import intents and transitions, exact ownership labels, positive worker confirmation, ambiguous outcomes, retryable cleanup debt, and unreachable-state rejection. |
-| `portable-managed-volume-runtime.spec.ts` | 18 | Snapshot admission, empty-v6 accounting, bounded capture, late Docker settlement, label-safe helper/volume/worker collision handling, restart cleanup, legacy v5 stability, importable bundle-output ceilings, and writable tmpfs extraction with a read-only helper rootfs. |
-| `portable-managed-volumes.spec.ts` | 5 | Isolated real-Docker running/stopped export and archived-backup round trips, preserved data/metadata/safe links, fresh restore authority, default v5 compatibility, exact v6 agreement, and pre-mutation authorization failures. |
+| `portable-managed-volume-runtime.spec.ts` | 19 | Snapshot admission, empty-v6 accounting, bounded capture, late Docker settlement, label-safe helper/volume/worker collision handling, restart cleanup, configless-image probe hardening, legacy v5 stability, importable bundle-output ceilings, and writable tmpfs extraction with a read-only helper rootfs. |
+| `portable-managed-volumes.spec.ts` | 6 | Isolated real-Docker running/stopped export and archived-backup round trips, preserved data/metadata/safe links, fresh restore authority, configless imported-image probing, default v5 compatibility, exact v6 agreement, and pre-mutation authorization failures. |
 | `group-admin-management-mcp.spec.ts` | 16 | Group-bound MCP discovery, recursive authorization and subtree lifecycle batches, workspace, image, plugin, startup-script, environment, fail-fast denial behavior, and deletion cleanup that leaves an emptied child group removable. |
 | `managed-networks.spec.ts` | 1 | Managed bridge-network creation, topology, validation, and deletion. |
 | `management-configuration-catalog-domain.spec.ts` | 2 | Configuration-catalog MCP schemas, scoped discovery, and structured results. |
@@ -272,7 +272,7 @@ tests/
 The container edge-case coverage includes repeated-stop idempotency: stopping an
 already-stopped worker returns success and leaves its persisted status stopped.
 
-### UI Tests (630 tests, 65 files)
+### UI Tests (631 tests, 65 files)
 
 | File | Tests | Coverage |
 | --- | ---: | --- |
@@ -283,7 +283,7 @@ already-stopped worker returns success and leaves its persisted status stopped.
 | `image-catalog-real.spec.ts` | 1 | Real controlled image build, test-worker verification, and promotion. |
 | `managed-networks.spec.ts` | 1 | Managed-network dashboard workflow. |
 | `managed-volumes.spec.ts` | 2 | Persistent-path controls show the live-mount warning, independent self-service controls, and managed-volume inventory with explicit on-demand known/stale/unknown allocated/logical sizing and safe polling/cancellation behavior. |
-| `portable-managed-volumes.spec.ts` | 2 | Worker-export and backup-settings controls default managed-volume portability off, show exact detached/live-capture warnings, and send or persist explicit opt-in. |
+| `portable-managed-volumes.spec.ts` | 3 | Default-off export/backup option controls, warnings and request forwarding, plus a real browser opt-in export/download/import round trip verifying custom-volume data, fresh identities, unchanged targets, and disabled restored policies. |
 | `worker-configuration-real.spec.ts` | 1 | Real worker-configuration persistence and execution. |
 | `worker-groups.spec.ts` | 5 | Worker-group dashboard CRUD, inherited worker-self API access selection, grouping, recursive lifecycle controls, nested archived-group rendering, and administration controls. |
 | `workspace-storage-real.spec.ts` | 1 | Real workspace storage browsing and operations. |

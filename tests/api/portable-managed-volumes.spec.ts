@@ -5,11 +5,19 @@ import {
   type APIRequestContext,
   type APIResponse,
 } from "@playwright/test";
+import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ApiClient } from "../helpers/api-client";
 import { cleanupWorker, createWorker, waitForWorkerRunning } from "../helpers/worker-lifecycle";
 import { createTestUser, deleteTestUser, type CreatedUser } from "../helpers/test-users";
+import {
+  PortableManagedVolumeRuntime,
+  PORTABLE_VOLUME_HELPER_LABEL,
+} from "../../orchestrator/server/utils/portable-managed-volume-runtime";
 
 const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
 const EMPTY_AUTH = {
@@ -313,6 +321,70 @@ test.describe.serial("Portable managed-volume API acceptance", () => {
     expect(secondManifest.contents).not.toHaveProperty("managedVolumes");
     expect(secondManifest).not.toHaveProperty("managedVolumes");
     expect(tarMembers(repacked).map((member) => member.name)).not.toContain("managed-volumes.tar.gz");
+  });
+
+  test("destination probe creates and removes a never-started configless imported image container", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agentor-configless-portable-probe-"));
+    const rootfs = join(dir, "rootfs");
+    const archive = join(dir, "rootfs.tar");
+    const image = `agentor-portable-configless-probe:${randomUUID()}`;
+    const helperFilter = `label=${PORTABLE_VOLUME_HELPER_LABEL}=true`;
+    let probeInspection: any;
+    let probeId = "";
+    let starts = 0;
+    try {
+      await mkdir(join(rootfs, "home", "agent"), { recursive: true });
+      await writeFile(join(rootfs, "home", "agent", "marker"), "configless\n");
+      execFileSync("tar", ["-C", rootfs, "-cf", archive, "."], { timeout: 60_000 });
+      docker("import", archive, image);
+      const imageInspection = JSON.parse(docker("image", "inspect", image))[0];
+      expect(imageInspection.Config.Entrypoint ?? []).toEqual([]);
+      expect(imageInspection.Config.Cmd ?? []).toEqual([]);
+
+      const helpersBefore = docker("ps", "-aq", "--filter", helperFilter);
+      const runtime = new PortableManagedVolumeRuntime(join(dir, "runtime"));
+      const actualDocker = (runtime as any).docker;
+      const createContainer = actualDocker.createContainer.bind(actualDocker);
+      actualDocker.createContainer = async (options: any) => {
+        const container = await createContainer(options);
+        probeId = container.id;
+        probeInspection = await container.inspect();
+        const start = container.start.bind(container);
+        container.start = async (...args: any[]) => { starts += 1; return start(...args); };
+        return container;
+      };
+
+      await (runtime as any).validateImageTargetsWithProbe(
+        { image, userId: owner.id, workerId: source.id },
+        randomUUID(),
+        [{ target: "/home/agent/portable-probe" }],
+      );
+      expect(probeInspection).toMatchObject({
+        Config: {
+          Image: image,
+          Entrypoint: ["/bin/true"],
+          NetworkDisabled: true,
+        },
+        HostConfig: {
+          NetworkMode: "none",
+          ReadonlyRootfs: true,
+          CapDrop: ["ALL"],
+          SecurityOpt: ["no-new-privileges:true"],
+          PidsLimit: 8,
+          Memory: 64 * 1024 * 1024,
+          NanoCpus: 250_000_000,
+        },
+        State: { Running: false },
+        Mounts: [],
+      });
+      expect(probeInspection.Config.Cmd ?? []).toEqual([]);
+      expect(starts).toBe(0);
+      expect(docker("ps", "-aq", "--filter", helperFilter)).toBe(helpersBefore);
+    } finally {
+      if (probeId) try { docker("rm", "-f", probeId); } catch {}
+      try { docker("image", "rm", "-f", image); } catch {}
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   test("archived backup opt-in restores managed data while the original remains archived", async () => {

@@ -1,5 +1,7 @@
 import { expect, test, type Locator } from '@playwright/test';
-import { cleanupWorker, createWorker } from '../helpers/worker-lifecycle';
+import { readFile } from 'node:fs/promises';
+import { captureCommandOutput } from '../helpers/terminal-ws';
+import { cleanupWorker, createWorker, waitForWorkerRunning } from '../helpers/worker-lifecycle';
 import { findButtonByTooltip, goToDashboard } from '../helpers/ui-helpers';
 
 test.describe.serial('Portable managed-volume option UI', () => {
@@ -95,6 +97,127 @@ test.describe.serial('Portable managed-volume option UI', () => {
     await modal.getByRole('button', { name: 'Back up now' }).click();
     await expect.poll(() => saved?.includeManagedVolumes).toBe(true);
     await expect.poll(() => started?.includeManagedVolumes).toBe(true);
+  });
+
+  test('real browser export opt-in restores custom volume data with fresh identity and disabled policies', async ({ page, request }) => {
+    test.setTimeout(600_000);
+    const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const target = `/home/agent/portable-browser-${stamp}`;
+    const marker = `PORTABLE_BROWSER_${stamp}`;
+    const importedName = `Portable-browser-import-${stamp}`;
+    const createdWorkerIds: string[] = [];
+    const createdVolumeIds = new Set<string>();
+
+    try {
+      const source = await createWorker(request, { displayName: `Portable-browser-source-${stamp}` });
+      createdWorkerIds.push(source.id);
+      const add = await request.post(`/api/containers/${source.id}/storage`, {
+        data: { action: 'add', target, name: 'Browser portable data', mode: 'recreate' },
+      });
+      expect(add.status(), await add.text()).toBe(200);
+      const sourceVolume = await add.json();
+      createdVolumeIds.add(sourceVolume.id);
+      await expect.poll(async () => {
+        const response = await request.get(`/api/volumes/${sourceVolume.id}`);
+        expect(response.status()).toBe(200);
+        return (await response.json()).operation?.stage;
+      }, { timeout: 180_000, intervals: [500, 1000, 2000] }).toMatch(/complete|failed/);
+      const completedVolume = await (await request.get(`/api/volumes/${sourceVolume.id}`)).json();
+      expect(completedVolume.operation, JSON.stringify(completedVolume)).toMatchObject({ stage: 'complete' });
+      await waitForWorkerRunning(request, source.id, 120_000);
+
+      const policy = await request.post(`/api/containers/${source.id}/storage`, {
+        data: { action: 'policy', policy: { selfService: true, allowSelfRecreate: true, allowLiveMount: true } },
+      });
+      expect(policy.status(), await policy.text()).toBe(200);
+      expect(await captureCommandOutput(source.id, `printf '%s' '${marker}' > '${target}/marker.txt' && cat '${target}/marker.txt'`, 30_000)).toContain(marker);
+
+      await goToDashboard(page);
+      const card = page.locator('.rounded-lg').filter({ hasText: source.displayName as string }).first();
+      await expect(card).toBeVisible({ timeout: 15_000 });
+      await (await findButtonByTooltip(card, page, 'Export worker')).click();
+      const exportModal = page.getByTestId('export-worker-modal');
+      const checkbox = exportModal.getByTestId('export-managed-volumes');
+      await expect(checkbox).not.toBeChecked();
+      await checkbox.check();
+      const exportResponsePromise = page.waitForResponse((response) =>
+        response.url().includes(`/api/containers/${source.id}/export-jobs`) && response.request().method() === 'POST');
+      await exportModal.getByTestId('export-start').click();
+      const exportResponse = await exportResponsePromise;
+      expect(exportResponse.status(), await exportResponse.text()).toBe(202);
+      const exportJob = await exportResponse.json();
+      expect(exportJob).toMatchObject({ workerId: source.id, includeRootfs: false, includeManagedVolumes: true });
+      await expect.poll(async () => {
+        const response = await request.get(`/api/export-jobs/${exportJob.id}`);
+        expect(response.status()).toBe(200);
+        return (await response.json()).status;
+      }, { timeout: 180_000, intervals: [500, 1000, 2000] }).toMatch(/succeeded|failed|cancelled/);
+      const finishedJob = await (await request.get(`/api/export-jobs/${exportJob.id}`)).json();
+      expect(finishedJob.status, JSON.stringify(finishedJob)).toBe('succeeded');
+      await expect(exportModal.getByTestId('export-download')).toBeVisible({ timeout: 30_000 });
+      const downloadPromise = page.waitForEvent('download');
+      await exportModal.getByTestId('export-download').click();
+      const download = await downloadPromise;
+      expect(await download.failure()).toBeNull();
+      const bundle = await readFile(await download.path());
+      expect(bundle.length).toBeGreaterThan(0);
+
+      await exportModal.getByRole('button', { name: 'Close' }).click();
+      await page.click('button[aria-label="Import worker"]');
+      const importDialog = page.locator('[role="dialog"]');
+      await importDialog.locator('[data-testid="import-file"]').setInputFiles({
+        name: 'portable-browser-export.tar', mimeType: 'application/x-tar', buffer: bundle,
+      });
+      await importDialog.locator('[data-testid="import-name"]').fill(importedName);
+      const importResponsePromise = page.waitForResponse((response) =>
+        new URL(response.url()).pathname === '/api/containers/import' && response.request().method() === 'POST',
+        { timeout: 300_000 });
+      await importDialog.locator('[data-testid="import-submit"]').click();
+      const importResponse = await importResponsePromise;
+      expect(importResponse.status(), await importResponse.text()).toBe(201);
+      const imported = await importResponse.json();
+      createdWorkerIds.push(imported.id);
+      await expect(importDialog).toBeHidden({ timeout: 120_000 });
+      await expect(page.getByText(importedName, { exact: true })).toBeVisible({ timeout: 60_000 });
+      await waitForWorkerRunning(request, imported.id, 120_000);
+
+      const sourceStorageResponse = await request.get(`/api/containers/${source.id}/storage`);
+      const importedStorageResponse = await request.get(`/api/containers/${imported.id}/storage`);
+      expect(sourceStorageResponse.status()).toBe(200);
+      expect(importedStorageResponse.status()).toBe(200);
+      const sourceStorage = await sourceStorageResponse.json();
+      const importedStorage = await importedStorageResponse.json();
+      for (const volume of importedStorage.volumes) createdVolumeIds.add(volume.id);
+      expect(imported.id).not.toBe(source.id);
+      expect(sourceStorage.volumes).toEqual(expect.arrayContaining([expect.objectContaining({
+        id: sourceVolume.id, target, attached: true, state: 'ready',
+      })]));
+      expect(importedStorage.volumes).toEqual([expect.objectContaining({
+        target, name: 'Browser portable data', purpose: 'persistent-path', attached: true, state: 'ready',
+      })]);
+      expect(importedStorage.volumes[0].id).not.toBe(sourceVolume.id);
+      expect(importedStorage.policy).toMatchObject({
+        workerId: imported.id, selfService: false, allowSelfRecreate: false, allowLiveMount: false,
+      });
+      expect(sourceStorage.policy).toMatchObject({
+        workerId: source.id, selfService: true, allowSelfRecreate: true, allowLiveMount: true,
+      });
+      expect(await captureCommandOutput(imported.id, `cat '${target}/marker.txt'`, 30_000)).toContain(marker);
+      expect(await captureCommandOutput(source.id, `cat '${target}/marker.txt'`, 30_000)).toContain(marker);
+    } finally {
+      // Permanent worker removal detaches its custom volumes; only then can these test-created IDs be deleted.
+      for (const id of [...createdWorkerIds].reverse()) {
+        const response = await request.get(`/api/containers/${id}/storage`).catch(() => null);
+        if (response?.ok()) {
+          const storage = await response.json();
+          for (const volume of storage.volumes || []) createdVolumeIds.add(volume.id);
+        }
+        await cleanupWorker(request, id).catch(() => {});
+      }
+      for (const id of createdVolumeIds) {
+        await request.post(`/api/volumes/${id}`, { data: { action: 'delete', confirmed: true } }).catch(() => {});
+      }
+    }
   });
 });
 

@@ -380,6 +380,73 @@ test("preexisting destination volume collision is refused without create or dele
   }
 });
 
+test("destination probe creates a configless image with an inert command and never starts it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agentor-portable-configless-probe-"));
+  let helperOptions: any;
+  let starts = 0;
+  let removals = 0;
+  const inspectedPaths: string[] = [];
+  const directoryStat = Buffer.from(JSON.stringify({ mode: 0x800001ed, linkTarget: "" }))
+    .toString("base64");
+  try {
+    const helper = {
+      id: "probe-helper",
+      start: async () => { starts += 1; },
+      infoArchive: async ({ path }: { path: string }) => {
+        inspectedPaths.push(path);
+        if (path === "/home" || path === "/home/agent") return {
+          headers: { "x-docker-container-path-stat": directoryStat },
+          resume() {},
+        };
+        throw Object.assign(new Error("missing"), { statusCode: 404 });
+      },
+    };
+    const runtime = new PortableManagedVolumeRuntime(dir, {
+      createContainer: async (options: any) => {
+        helperOptions = options;
+        if (!options.Entrypoint?.length && !options.Cmd?.length)
+          throw Object.assign(new Error("no command specified"), { statusCode: 400 });
+        return helper;
+      },
+      getContainer: () => ({
+        inspect: async () => ({
+          Id: helper.id,
+          Name: `/${helperOptions.name}`,
+          Config: { Labels: helperOptions.Labels },
+        }),
+        remove: async () => { removals += 1; },
+      }),
+    } as any);
+    await (runtime as any).validateImageTargetsWithProbe(
+      { image: "sha256:configless", userId: USER_ID, workerId: WORKER_ID },
+      OPERATION_ID,
+      [{ target: "/home/agent/portable-probe" }],
+    );
+    expect(helperOptions).toMatchObject({
+      Image: "sha256:configless",
+      Entrypoint: ["/bin/true"],
+      Cmd: [],
+      Env: [],
+      NetworkDisabled: true,
+      HostConfig: {
+        NetworkMode: "none",
+        ReadonlyRootfs: true,
+        CapDrop: ["ALL"],
+        SecurityOpt: ["no-new-privileges:true"],
+        PidsLimit: 8,
+        Memory: 64 * 1024 * 1024,
+        NanoCpus: 250_000_000,
+      },
+    });
+    expect(helperOptions.HostConfig).not.toHaveProperty("Mounts");
+    expect(starts).toBe(0);
+    expect(inspectedPaths).toEqual(["/home", "/home/agent", "/home/agent/portable-probe"]);
+    expect(removals).toBe(1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 for (const stage of ["start", "getArchive"] as const) {
   test(`capture waits for a cancelled helper ${stage} call to settle before cleanup`, async () => {
     const dir = await mkdtemp(join(tmpdir(), `agentor-portable-${stage}-settlement-`));
