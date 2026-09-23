@@ -119,7 +119,7 @@ os.symlink('/home/agent/portable-a/nested/payload.bin',a/'nested'/'absolute-link
 os.link(a/'nested'/'payload.bin',a/'nested'/'hard-link')
 (b/'notes.txt').write_text('second portable volume\n',encoding='utf8')
 os.chmod(b/'notes.txt',0o604); os.chown(b/'notes.txt',321,654)`;
-  docker("exec", containerName, "python3", "-c", script);
+  docker("exec", "--user", "0:0", containerName, "python3", "-c", script);
 }
 
 function portableDataSnapshot(containerName: string): any {
@@ -127,7 +127,7 @@ function portableDataSnapshot(containerName: string): any {
 a=pathlib.Path('/home/agent/portable-a/nested'); f=a/'payload.bin'; h=a/'hard-link'; s=a/'relative-link'; absolute=a/'absolute-link'; long_file=a/('long-'+('segment-'*20)+'payload.bin'); b=pathlib.Path('/home/agent/portable-b/notes.txt')
 fs=os.stat(f); hs=os.stat(h); ds=os.stat(a); bs=os.stat(b)
 print(json.dumps({'payloadSha256':hashlib.sha256(f.read_bytes()).hexdigest(),'longPathSha256':hashlib.sha256(long_file.read_bytes()).hexdigest(),'payloadMode':stat.S_IMODE(fs.st_mode),'payloadUid':fs.st_uid,'payloadGid':fs.st_gid,'directoryMode':stat.S_IMODE(ds.st_mode),'directoryUid':ds.st_uid,'directoryGid':ds.st_gid,'hardlinkSameInode':fs.st_ino==hs.st_ino,'hardlinkCount':fs.st_nlink,'symlinkTarget':os.readlink(s),'absoluteSymlinkTarget':os.readlink(absolute),'secondText':b.read_text(encoding='utf8'),'secondMode':stat.S_IMODE(bs.st_mode),'secondUid':bs.st_uid,'secondGid':bs.st_gid}))`;
-  return JSON.parse(docker("exec", containerName, "python3", "-c", script));
+  return JSON.parse(docker("exec", "--user", "0:0", containerName, "python3", "-c", script));
 }
 
 async function waitForBackupJob(request: APIRequestContext, jobId: string): Promise<any> {
