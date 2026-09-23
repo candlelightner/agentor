@@ -371,7 +371,7 @@ test.describe.serial("Portable managed-volume API acceptance", () => {
     try {
       expect((await anonymous.get(`/api/containers/${source.id}/export?includeManagedVolumes=true`)).status()).toBe(401);
       expect((await new ApiClient(outsiderRequest).signInEmail(outsider.email, outsider.password)).status).toBe(200);
-      expect((await outsiderRequest.get(`/api/containers/${source.id}/export?includeManagedVolumes=true`)).status()).toBe(404);
+      expect((await outsiderRequest.get(`/api/containers/${source.id}/export?includeManagedVolumes=true`)).status()).toBe(403);
 
       const before = (await new ApiClient(ownerRequest).listContainers()).body.map((worker: any) => worker.id).sort();
       const missingPayload = withoutTarMember(runningBundle, "managed-volumes.tar.gz");
