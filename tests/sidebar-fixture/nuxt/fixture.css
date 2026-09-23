@@ -1,0 +1,5 @@
+@import "../../../orchestrator/app/assets/css/main.css";
+
+/* These production components live outside the fixture's Nuxt root. Include
+   their utility classes just as the production app's Tailwind scan does. */
+@source "../../../orchestrator/app";

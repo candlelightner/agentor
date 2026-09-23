@@ -480,14 +480,14 @@ function isContainerActive(
 
 <template>
   <aside
-    class="relative bg-gray-50 dark:bg-gray-900 border-r border-gray-200 dark:border-gray-800 flex flex-col flex-shrink-0 min-w-0"
+    class="agentor-sidebar relative bg-gray-50 dark:bg-gray-900 border-r border-gray-200 dark:border-gray-800 flex flex-col flex-shrink-0 min-w-0"
   >
     <!-- Header -->
     <div
-      class="p-4 border-b border-gray-200 dark:border-gray-800 flex-shrink-0"
+      class="sidebar-header p-4 border-b border-gray-200 dark:border-gray-800 flex-shrink-0"
     >
       <div class="flex items-center justify-between">
-        <h1 class="text-lg font-bold text-gray-900 dark:text-white">Agentor</h1>
+        <h1 class="sidebar-brand text-lg font-bold text-gray-900 dark:text-white">Agentor</h1>
         <div class="flex items-center gap-1">
           <ThemeToggle />
           <button
@@ -501,7 +501,7 @@ function isContainerActive(
       </div>
       <p class="text-xs text-gray-500 mt-0.5">Orchestrator</p>
       <div class="flex gap-2 mt-3">
-        <UButton class="flex-1" @click="emit('newWorker')">
+        <UButton class="sidebar-primary-action flex-1" @click="emit('newWorker')">
           + New Worker
         </UButton>
         <UTooltip text="Import worker">
@@ -557,7 +557,7 @@ function isContainerActive(
       <div class="mt-2 grid grid-cols-2 gap-2"><UButton color="neutral" variant="outline" size="sm" icon="i-lucide-hard-drive" @click="emit('manageHostMounts')">Host mount permissions</UButton><UButton color="neutral" variant="outline" size="sm" icon="i-lucide-cpu" @click="emit('manageHardwareDevices')">Hardware</UButton></div>
       <div
         v-if="isAdmin"
-        class="mt-2 overflow-hidden rounded-lg border-2 border-red-600 bg-red-950 text-red-50 shadow-sm"
+        class="sidebar-admin-zone mt-2 overflow-hidden rounded-lg border-2 border-red-600 bg-red-950 text-red-50 shadow-sm"
         data-testid="admin-orchestrator-controls"
       >
         <div
@@ -871,7 +871,7 @@ function isContainerActive(
 
     <!-- Signed-in user card — pinned to the bottom of the sidebar -->
     <div
-      class="flex-shrink-0 border-t border-gray-200 dark:border-gray-800 p-3"
+      class="sidebar-account flex-shrink-0 border-t border-gray-200 dark:border-gray-800 p-3"
     >
       <div class="flex items-center gap-2 min-w-0">
         <button

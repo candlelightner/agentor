@@ -41,7 +41,7 @@ function active(id: string) {
 
 <template>
   <section
-    class="rounded-xl border-2 border-primary-300/70 bg-primary-50/40 p-2 dark:border-primary-700/70 dark:bg-primary-950/20"
+    class="sidebar-worker-group rounded-xl border-2 border-primary-300/70 bg-primary-50/40 p-2 dark:border-primary-700/70 dark:bg-primary-950/20"
     :aria-label="`Worker group: ${node.group.name}`"
     :data-testid="`worker-group-cards-${node.group.id}`"
   >

@@ -1,3 +1,4 @@
+@import "@fontsource-variable/inter";
 @import "tailwindcss";
 @import "@nuxt/ui";
 
@@ -546,4 +547,330 @@ body.split-dragging-v .xterm {
 body.tab-dragging iframe,
 body.tab-dragging .xterm {
   pointer-events: none;
+}
+
+/* Sidebar palette is intentionally local: the workspace, dialogs and terminal
+   keep their existing theme. The warm metal accent marks selection/actions,
+   while text uses high-contrast neutrals in both color modes. */
+.agentor-sidebar {
+  --sb-bg: #f4f5f5;
+  --sb-surface: #ffffff;
+  --sb-surface-soft: #f8f8f7;
+  --sb-hover: #e9eaeb;
+  --sb-border: #d8dadd;
+  --sb-text: #24282d;
+  --sb-muted: #5d646c;
+  --sb-accent: #b59861;
+  --sb-focus: #806536;
+  --sb-accent-text: #70542b;
+  --sb-accent-wash: #f5f0e7;
+  background: var(--sb-bg);
+  border-color: var(--sb-border);
+  color: var(--sb-text);
+  font-family: 'Inter Variable', Inter, ui-sans-serif, system-ui, sans-serif;
+  font-feature-settings: 'cv11', 'ss01';
+}
+
+.dark .agentor-sidebar {
+  --sb-bg: #17191d;
+  --sb-surface: #202328;
+  --sb-surface-soft: #1b1e22;
+  --sb-hover: #2b2f35;
+  --sb-border: #383d43;
+  --sb-text: #edeef0;
+  --sb-muted: #a6abb2;
+  --sb-accent: #b59861;
+  --sb-focus: #d2bd91;
+  --sb-accent-text: #d2bd91;
+  --sb-accent-wash: #302b23;
+}
+
+.agentor-sidebar .sidebar-header,
+.agentor-sidebar .sidebar-account {
+  background: var(--sb-surface-soft);
+  border-color: var(--sb-border);
+}
+
+.agentor-sidebar .sidebar-brand,
+.dark .agentor-sidebar .sidebar-brand,
+.agentor-sidebar .sidebar-account .text-gray-900,
+.dark .agentor-sidebar .sidebar-account .dark\:text-gray-100 {
+  color: var(--sb-text);
+}
+
+.agentor-sidebar .sidebar-header > p,
+.agentor-sidebar .sidebar-account .text-gray-500,
+.dark .agentor-sidebar .sidebar-account .dark\:text-gray-400 {
+  color: var(--sb-muted);
+}
+
+/* Keep long labels inside the existing button grid at the minimum sidebar
+   width, including anonymous flex text beside Nuxt UI's leading icons. */
+.agentor-sidebar .sidebar-header button {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.agentor-sidebar .sidebar-header {
+  container: sidebar-header / inline-size;
+}
+
+/* At the minimum width, inline icon/text flow gives labels the full button
+   width instead of squeezing them into a tiny anonymous flex column. */
+@container sidebar-header (max-width: 220px) {
+  .agentor-sidebar .sidebar-header > .grid > button,
+  .agentor-sidebar .sidebar-admin-zone > .grid > button {
+    display: block;
+    text-align: center;
+  }
+
+  .agentor-sidebar .sidebar-header > .grid > button > .iconify,
+  .agentor-sidebar .sidebar-admin-zone > .grid > button > .iconify {
+    vertical-align: -0.15em;
+    margin-inline-end: 0.25em;
+  }
+}
+
+.agentor-sidebar .sidebar-header button,
+.agentor-sidebar .sidebar-tab,
+.agentor-sidebar .sidebar-tab-more-btn,
+.agentor-sidebar .sidebar-tab-dropdown-item,
+.agentor-sidebar .sidebar-account button,
+.agentor-sidebar .sidebar-worker-card button,
+.agentor-sidebar .sidebar-archived-card button,
+.agentor-sidebar .sidebar-worker-group > div:first-child button,
+.agentor-sidebar .sidebar-admin-zone button,
+.agentor-sidebar .system-card-link {
+  border-radius: 5px;
+}
+
+.agentor-sidebar :is(button, a, input, select):focus-visible {
+  outline: 2px solid var(--sb-focus);
+  outline-offset: 2px;
+}
+
+.agentor-sidebar :is(button, a, input, select):disabled {
+  cursor: not-allowed;
+}
+
+.agentor-sidebar .sidebar-primary-action {
+  background: #806536;
+  color: #fff;
+  box-shadow: none;
+}
+
+.agentor-sidebar .sidebar-primary-action:hover:not(:disabled) {
+  background: #6c532b;
+}
+
+.dark .agentor-sidebar .sidebar-primary-action {
+  background: #b59861;
+  color: #17191d;
+}
+
+.dark .agentor-sidebar .sidebar-primary-action:hover:not(:disabled) {
+  background: #ceb683;
+}
+
+.agentor-sidebar [data-theme-toggle] {
+  border: 1px solid var(--sb-border);
+  background: var(--sb-hover);
+  border-radius: 5px;
+}
+
+.agentor-sidebar .sidebar-tab-bar {
+  border-color: var(--sb-border);
+  background: var(--sb-surface-soft);
+}
+
+.agentor-sidebar .sidebar-tab,
+.dark .agentor-sidebar .sidebar-tab,
+.agentor-sidebar .sidebar-tab-more-btn,
+.dark .agentor-sidebar .sidebar-tab-more-btn {
+  color: var(--sb-muted);
+}
+
+.agentor-sidebar .sidebar-tab:hover,
+.dark .agentor-sidebar .sidebar-tab:hover,
+.agentor-sidebar .sidebar-tab-more-btn:hover,
+.dark .agentor-sidebar .sidebar-tab-more-btn:hover {
+  color: var(--sb-text);
+  background-color: var(--sb-hover);
+}
+
+.agentor-sidebar .sidebar-tab-active,
+.dark .agentor-sidebar .sidebar-tab-active,
+.agentor-sidebar .sidebar-tab-more-btn.sidebar-tab-active,
+.dark .agentor-sidebar .sidebar-tab-more-btn.sidebar-tab-active {
+  color: var(--sb-text);
+  border-bottom-color: var(--sb-accent);
+  font-weight: 650;
+}
+
+.agentor-sidebar .sidebar-tab-active:hover,
+.dark .agentor-sidebar .sidebar-tab-active:hover {
+  background-color: var(--sb-accent-wash);
+}
+
+.agentor-sidebar .sidebar-tab-more-btn,
+.dark .agentor-sidebar .sidebar-tab-more-btn {
+  background: linear-gradient(to right, transparent 0%, var(--sb-surface-soft) 45%);
+}
+
+.agentor-sidebar .sidebar-tab-badge,
+.agentor-sidebar .sidebar-tab-dropdown-badge {
+  border-radius: 4px;
+  background: var(--sb-hover);
+  color: var(--sb-muted);
+}
+
+.agentor-sidebar .sidebar-tab-dropdown,
+.dark .agentor-sidebar .sidebar-tab-dropdown {
+  background: var(--sb-surface);
+  border-color: var(--sb-border);
+  border-radius: 5px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 13%);
+}
+
+.agentor-sidebar .sidebar-tab-dropdown-item,
+.dark .agentor-sidebar .sidebar-tab-dropdown-item {
+  color: var(--sb-muted);
+}
+
+.agentor-sidebar .sidebar-tab-dropdown-item:hover,
+.dark .agentor-sidebar .sidebar-tab-dropdown-item:hover {
+  color: var(--sb-text);
+  background: var(--sb-hover);
+}
+
+.agentor-sidebar .sidebar-tab-dropdown-item-active,
+.dark .agentor-sidebar .sidebar-tab-dropdown-item-active,
+.agentor-sidebar .sidebar-tab-dropdown-item-active:hover,
+.dark .agentor-sidebar .sidebar-tab-dropdown-item-active:hover {
+  color: var(--sb-accent-text);
+  background: var(--sb-accent-wash);
+}
+
+.agentor-sidebar .sidebar-worker-group,
+.dark .agentor-sidebar .sidebar-worker-group,
+.agentor-sidebar .sidebar-archived-group,
+.dark .agentor-sidebar .sidebar-archived-group {
+  border: 1px solid var(--sb-border);
+  border-left: 2px solid var(--sb-accent);
+  border-radius: 6px;
+  background: var(--sb-surface-soft);
+}
+
+.agentor-sidebar .sidebar-worker-group > div:first-child,
+.dark .agentor-sidebar .sidebar-worker-group > div:first-child,
+.agentor-sidebar .sidebar-archived-group > div:first-child,
+.dark .agentor-sidebar .sidebar-archived-group > div:first-child {
+  color: var(--sb-text);
+}
+
+.agentor-sidebar .sidebar-worker-card,
+.dark .agentor-sidebar .sidebar-worker-card,
+.agentor-sidebar .sidebar-archived-card,
+.dark .agentor-sidebar .sidebar-archived-card {
+  border: 1px solid var(--sb-border);
+  border-radius: 6px;
+  background: var(--sb-surface);
+  box-shadow: none;
+}
+
+.agentor-sidebar .sidebar-worker-card-active,
+.dark .agentor-sidebar .sidebar-worker-card-active {
+  border-color: var(--sb-accent);
+  background: var(--sb-accent-wash);
+  box-shadow: inset 2px 0 0 var(--sb-accent);
+}
+
+.agentor-sidebar .sidebar-worker-card-admin,
+.dark .agentor-sidebar .sidebar-worker-card-admin {
+  border-color: #b75f5b;
+  background: #fff5f3;
+  box-shadow: inset 2px 0 0 #ae4944;
+}
+
+.dark .agentor-sidebar .sidebar-worker-card-admin {
+  background: #332020;
+}
+
+.agentor-sidebar .sidebar-worker-card-admin.sidebar-worker-card-active,
+.dark .agentor-sidebar .sidebar-worker-card-admin.sidebar-worker-card-active {
+  border-color: #a33e3a;
+  box-shadow: inset 3px 0 0 #a33e3a, 0 0 0 1px #a33e3a;
+}
+
+.agentor-sidebar .sidebar-worker-card-admin.sidebar-worker-card-active {
+  background: #ffece9;
+}
+
+.dark .agentor-sidebar .sidebar-worker-card-admin.sidebar-worker-card-active {
+  background: #402323;
+}
+
+.agentor-sidebar .sidebar-worker-card .card-header h3,
+.dark .agentor-sidebar .sidebar-worker-card .card-header h3 {
+  color: var(--sb-text);
+}
+
+.agentor-sidebar .sidebar-archived-card h3,
+.dark .agentor-sidebar .sidebar-archived-card h3 {
+  color: var(--sb-muted);
+}
+
+.agentor-sidebar .system-card,
+.dark .agentor-sidebar .system-card {
+  border-color: var(--sb-border);
+  border-radius: 6px;
+  background: var(--sb-surface);
+}
+
+.agentor-sidebar .system-card-header,
+.dark .agentor-sidebar .system-card-header {
+  color: var(--sb-muted);
+  border-color: var(--sb-border);
+  background: var(--sb-surface-soft);
+}
+
+.agentor-sidebar .system-card-link,
+.dark .agentor-sidebar .system-card-link {
+  color: var(--sb-muted);
+}
+
+.agentor-sidebar .system-card-link:hover,
+.dark .agentor-sidebar .system-card-link:hover {
+  color: var(--sb-text);
+  background: var(--sb-hover);
+}
+
+.agentor-sidebar .sidebar-account button:hover {
+  background: var(--sb-hover);
+}
+
+.agentor-sidebar .sidebar-admin-zone {
+  border-radius: 6px;
+  border-color: #b74e49;
+  background: #481e1e;
+  color: #fff2f0;
+}
+
+.agentor-sidebar .sidebar-admin-zone > div:first-child {
+  border-color: #a84d48;
+  background: #a33e3a;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar-panel {
+    transition-duration: 0.01ms !important;
+  }
+
+  .agentor-sidebar *,
+  .agentor-sidebar *::before,
+  .agentor-sidebar *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
 }

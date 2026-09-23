@@ -96,8 +96,9 @@ function onHScrollWheel(e: WheelEvent) {
 
 <template>
   <div
-    class="rounded-lg p-3 border transition-colors overflow-hidden"
+    class="sidebar-worker-card rounded-lg p-3 border transition-colors overflow-hidden"
     :class="[
+      { 'sidebar-worker-card-active': isActive, 'sidebar-worker-card-admin': isPlatformAdmin },
       isPlatformAdmin
         ? 'bg-red-50/80 dark:bg-red-950/35 border-red-400/70 dark:border-red-700/70 shadow-sm shadow-red-500/10'
         : isActive

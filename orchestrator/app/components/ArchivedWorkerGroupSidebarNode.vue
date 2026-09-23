@@ -17,7 +17,7 @@ const emit = defineEmits<{
 
 <template>
   <section
-    class="rounded-xl border-2 border-slate-300/70 bg-slate-100/40 p-2 dark:border-slate-700/70 dark:bg-slate-900/25"
+    class="sidebar-archived-group rounded-xl border-2 border-slate-300/70 bg-slate-100/40 p-2 dark:border-slate-700/70 dark:bg-slate-900/25"
     :aria-label="`Archived worker group: ${node.group.name}`"
     :data-testid="`archived-worker-group-cards-${node.group.id}`"
   >

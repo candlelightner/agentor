@@ -17,7 +17,7 @@ const formattedDate = computed(() => {
 </script>
 
 <template>
-  <div class="rounded-lg px-2.5 py-1.5 bg-gray-100/40 dark:bg-gray-800/30 border border-gray-200/50 dark:border-gray-700/30 flex items-center gap-2">
+  <div class="sidebar-archived-card rounded-lg px-2.5 py-1.5 bg-gray-100/40 dark:bg-gray-800/30 border border-gray-200/50 dark:border-gray-700/30 flex items-center gap-2">
     <div class="min-w-0 flex-1">
       <h3 class="text-xs font-medium text-gray-500 dark:text-gray-400 truncate" :title="worker.displayName || shortName(worker.id)">
         {{ worker.displayName || shortName(worker.id) }}
