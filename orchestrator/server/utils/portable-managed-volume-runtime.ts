@@ -693,10 +693,20 @@ export class PortableManagedVolumeRuntime {
           Memory: 128 * 1024 * 1024,
           NanoCpus: 500_000_000,
           Init: true,
-          Mounts: [{
-            Type: "volume", Source: intent.dockerName, Target: "/volume",
-            VolumeOptions: { NoCopy: true },
-          }] as any,
+          // Moby validates the putArchive destination before inspecting tar
+          // members. Give the validated volume/-rooted payload a writable
+          // tmpfs extraction point while keeping the helper rootfs read-only;
+          // the nested fresh-volume mount receives every durable member.
+          Mounts: [
+            {
+              Type: "tmpfs", Source: "", Target: "/restore",
+              TmpfsOptions: { SizeBytes: 1024 * 1024, Mode: 0o700 },
+            },
+            {
+              Type: "volume", Source: intent.dockerName, Target: "/restore/volume",
+              VolumeOptions: { NoCopy: true },
+            },
+          ] as any,
           Tmpfs: { "/tmp": "rw,noexec,nosuid,nodev,size=1048576" },
           LogConfig: { Type: "none", Config: {} },
         },
@@ -709,7 +719,7 @@ export class PortableManagedVolumeRuntime {
           signal,
         );
         await withOperationDeadline(
-          (operationSignal) => helper!.putArchive(createReadStream(archivePath) as any, { path: "/", abortSignal: operationSignal } as any),
+          (operationSignal) => helper!.putArchive(createReadStream(archivePath) as any, { path: "/restore", abortSignal: operationSignal } as any),
           CAPTURE_TIMEOUT_MS,
           "Restore portable managed volume",
           signal,

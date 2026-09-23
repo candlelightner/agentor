@@ -490,6 +490,73 @@ test("restore waits for cancelled putArchive settlement before helper cleanup", 
   }
 });
 
+test("restore permits Docker to extract the validated volume-rooted tar", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agentor-portable-put-rootfs-"));
+  const archive = join(dir, "volume.tar");
+  let createOptions: any;
+  let restored = false;
+  let putPath = "";
+  let removals = 0;
+  try {
+    await writeInnerVolumeTar(archive);
+    const helper = {
+      id: "restore-helper",
+      start: async () => {},
+      putArchive: async (_input: unknown, options: { path: string }) => {
+        putPath = options.path;
+        // Moby validates the destination itself before tar members. Extracting
+        // on the read-only rootfs returns HTTP 400 even when every member is
+        // safely rooted under a nested writable volume mount.
+        const writableDestination = createOptions.HostConfig.Mounts.some(
+          (mount: any) => mount.Target === options.path && mount.ReadOnly !== true,
+        );
+        if (createOptions.HostConfig.ReadonlyRootfs && !writableDestination)
+          throw Object.assign(new Error("container rootfs is marked read-only"), { statusCode: 400 });
+        restored = true;
+      },
+    };
+    const runtime = new PortableManagedVolumeRuntime(dir, {
+      createContainer: async (options: any) => { createOptions = options; return helper; },
+      getContainer: () => ({
+        inspect: async () => ({ Id: helper.id, Name: `/${createOptions.name}`, Config: { Labels: createOptions.Labels } }),
+        remove: async () => { removals += 1; },
+      }),
+    } as any, { trustedImage: async () => "sha256:trusted" });
+    await (runtime as any).restoreOneVolume(
+      OPERATION_ID,
+      {
+        id: "55555555-5555-4555-8555-555555555555",
+        dockerName: "destination-volume",
+        target: "/srv/state",
+        name: "state",
+        archive: "volumes/0.tar",
+        labels: {
+          "agentor.volume-id": "55555555-5555-4555-8555-555555555555",
+          "agentor.owner-id": USER_ID,
+          "agentor.worker-id": WORKER_ID,
+          "agentor.portable-import-id": OPERATION_ID,
+        },
+      },
+      archive,
+    );
+    expect(createOptions.HostConfig).toMatchObject({
+      NetworkMode: "none",
+      ReadonlyRootfs: true,
+      CapDrop: ["ALL"],
+      SecurityOpt: ["no-new-privileges:true"],
+      Mounts: [
+        { Type: "tmpfs", Source: "", Target: "/restore", TmpfsOptions: { SizeBytes: 1024 * 1024, Mode: 0o700 } },
+        { Type: "volume", Source: "destination-volume", Target: "/restore/volume" },
+      ],
+    });
+    expect(putPath).toBe("/restore");
+    expect(restored).toBe(true);
+    expect(removals).toBe(1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("capture enforces the aggregate staging bound while streaming", async () => {
   const dir = await mkdtemp(join(tmpdir(), "agentor-portable-capture-bound-"));
   let removals = 0;
