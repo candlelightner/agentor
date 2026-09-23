@@ -45,7 +45,7 @@ test.describe.serial('Portable managed-volume option UI', () => {
     await expectPortableWarnings(modal);
     await checkbox.check();
     await modal.getByTestId('export-start').click();
-    expect(requestedBody).toEqual({ includeRootfs: false, includeManagedVolumes: true });
+    await expect.poll(() => requestedBody, { timeout: 10_000 }).toEqual({ includeRootfs: false, includeManagedVolumes: true });
   });
 
   test('backup settings default off, show exact warnings, and persist manual opt-in', async ({ page }) => {

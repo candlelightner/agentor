@@ -14,7 +14,7 @@ documentation is current.
 | Custom image builder/catalog | Complete and verified | Approved-base constrained contexts, controlled/fake async builders, immutable image IDs, selection/defaults, test/promotion/rollback/rebuild, logs, cancellation, race-safe cleanup, and real browser creation/build/promotion are covered. |
 | Backup/restore | Complete and verified locally; live Google credentials external | Multi-workspace encrypted bundles, scheduling, retention, cancellation/retry/recovery, local/fake/Google-provider contracts, integrity verification, archived backup, and rollback-safe restore are covered with deterministic providers. A real Google account remains an external configuration boundary. |
 | Volume inventory/offline browsing | Complete and verified | Running/stopped/archived/deleted/orphan inventory, bounded size, latest backup, owner-scoped hardened browse/preview/search/metadata/streamed download, backup, and clone cover directory and named-volume abstractions. Orphans remain deliberately non-browsable until a separately audited adoption workflow exists. |
-| Managed local persistent paths | Sizing verified; portable workflow implemented pending final isolated acceptance | A worker can retain an approved application-data directory in an Agentor-managed local volume. Adds are owner scoped and idempotent; protected/system/credential paths and overlap are rejected; live application is explicitly authorized, detach retains data, and explicit deletion is separate. Deleted-account records move to retained administrator storage instead of silently deleting the volume. Bounded on-demand sizing is verified. Default-off portable export/backup capture and fresh-identity restore are implemented across API, MCP, and UI, with final real-Docker acceptance still required before release. |
+| Managed local persistent paths | Complete and verified by bounded image-publication CI gate | Owner-scoped persistent paths retain data through lifecycle changes; approved-path validation, live-helper acknowledgement, separate detach/delete, and retained deleted-account records are covered. Bounded on-demand allocated/logical sizing is exposed through inventory and the GUI, REST jobs, and management MCP; inventory reads do not trigger scans. Default-off portable capture is covered through running and stopped worker export/import plus archived backup/restore real-Docker round trips using `includeRootfs=false`; a separate real-Docker test exercises the configless imported-image destination probe. Coverage checks data, ownership and mode metadata, safe symlinks and hard links, and fresh destination volume identities with persistence authority disabled. Legacy exports remain v5 by default; malformed opt-in payloads and foreign-owner access are rejected without creating destination workers. GUI coverage exercises sizing and portable workflows. The image-publication CI test gate runs the isolated storage/API/UI acceptance coverage before image publication when relevant files change. |
 | Worker-local variables/secrets | Complete and verified | Worker create/settings, precedence preview, encrypted write-only secrets, tmpfs secret files, desired/applied rebuild semantics, clone/export/backup omission, and same-user/cross-user isolation are covered through API and real browser paths. |
 | Administrative workspace | Complete and verified | Trusted digest-pinned overlay, persistent storage, terminal/editor/desktop services, red identity, privileged confirmations, internal MCP discovery, and hardened Docker runtime are covered. |
 | Internal management MCP | Complete and verified | Internal-only listener/network, short-lived workspace identity, live fail-closed groups, owner-checked/redacted logs, console, storage/download handoffs, networking, lifecycle, configuration, and invocation audit are covered. Dashboard proposal review is optional; harness confirmation is not a platform boundary. |
@@ -24,13 +24,19 @@ documentation is current.
 
 Managed local persistent paths use Docker-managed capacity and expose bounded,
 on-demand allocated and logical sizing without recursing during inventory reads.
-The strict default-false portable custom-volume workflow is now implemented for
-worker exports and encrypted backups: opted-in v6 bundles capture eligible
-attached volumes, and new-worker restore mints fresh identities while leaving
-self-service, live-mount, and recreation policies disabled. Focused module,
-type, and surface checks are local evidence; the dedicated running, stopped, and
-archived real-Docker round trips remain a release gate and are not claimed as
-passing until the isolated suite runs successfully.
+The strict default-false portable custom-volume workflow is verified for worker
+exports and encrypted backup/restore through the isolated image-publication CI
+gate. Opted-in v6 bundles capture eligible attached volumes; running and
+stopped worker round trips, plus archived backup/restore, verify the restored
+data and filesystem metadata, safe link behavior, and fresh destination volume
+identities. These round trips use `includeRootfs=false`; a separate real-Docker
+test validates the never-started probe against a configless imported image.
+New-worker restores leave self-service, live-mount, and recreation
+policies disabled. Legacy exports remain v5 by default, and malformed payloads
+and unauthorized access are rejected before destination creation. The same CI
+gate includes managed-volume GUI coverage and is required before relevant image
+publication; these claims do not imply live Google-provider verification or
+execution of the full Dockerized suite.
 
 ## Delivery order and dependencies
 
