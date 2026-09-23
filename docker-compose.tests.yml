@@ -22,6 +22,9 @@ services:
       # Provider boundary tests import the same TypeScript modules directly;
       # mirror the repository-relative path they use outside Docker.
       - ./orchestrator:/work/orchestrator:ro
+      # Resolve direct production-module imports against the orchestrator lockfile.
+      # The source tree stays read-only; only this dependency mount is writable.
+      - orchestrator-test-node-modules:/work/orchestrator/node_modules
       - ./worker:/src/worker:ro
       # Test source. Read-write so playwright can write reports / .auth
       # back to the host for inspection.
@@ -46,3 +49,5 @@ services:
 volumes:
   test-runner-docker:
     name: agentor-test-runner-docker
+  orchestrator-test-node-modules:
+    name: agentor-test-orchestrator-node-modules
