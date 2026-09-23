@@ -2,6 +2,7 @@
 const props = defineProps<{ workerId: string; workerName: string }>();
 const open = defineModel<boolean>('open', { default: false });
 const includeRootfs = ref(false);
+const includeManagedVolumes = ref(false);
 const error = ref('');
 const { job, active, loading, statusError, restore, start, cancel, clear, download } = useExportJob(toRef(props, 'workerId'));
 
@@ -25,7 +26,7 @@ async function begin() {
   if (loading.value || active.value) return;
   error.value = '';
   try {
-    await start(includeRootfs.value);
+    await start(includeRootfs.value, includeManagedVolumes.value);
   } catch (err: any) {
     error.value = err?.data?.statusMessage || err?.message || 'Could not start the export.';
   }
@@ -68,6 +69,15 @@ async function downloadArtifact() {
               <span class="block text-sm font-medium">Include container root filesystem</span>
               <span class="block text-xs text-amber-600 dark:text-amber-400 mt-0.5">
                 Advanced: this can be very large and take a long time. Workspace-only is the recommended default.
+              </span>
+            </span>
+          </label>
+          <label class="flex items-start gap-3 rounded-md border border-gray-200 dark:border-gray-700 p-3">
+            <UCheckbox v-model="includeManagedVolumes" data-testid="export-managed-volumes" />
+            <span>
+              <span class="block text-sm font-medium">Include attached custom volumes</span>
+              <span class="block text-xs text-amber-600 dark:text-amber-400 mt-0.5">
+                Only attached custom volumes are captured; detached volumes are excluded. Capture from a running worker is best-effort, and restored persistence self-service, live-attach, and recreation policies remain disabled.
               </span>
             </span>
           </label>

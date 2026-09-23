@@ -23,6 +23,7 @@ import type {
 import { normalizeExcludedGlobalEnvVarKeys, zeroUserEnvVars } from "./user-env-store";
 import {
   WORKER_EXPORT_VERSION,
+  PORTABLE_MANAGED_VOLUME_EXPORT_VERSION,
   BUNDLE_FILES,
   EXPORT_WORKSPACE_PATH,
   EXPORT_AGENTS_PATH,
@@ -46,6 +47,8 @@ import { resolveWorkerReconstruction, snapshotWorkerReconstruction, type Reconst
 import { useImageCatalogManager } from "./image-catalog";
 import { recordWorkspaceTombstone } from "./workspace-tombstones";
 import type { WorkerExportManifest } from "./worker-export";
+import type { PreparedPortableManagedVolumeImport } from "./portable-managed-volume-runtime";
+import type { PortableManagedVolumeImportJournal } from "./portable-managed-volume-journal";
 import {
   readPortablePluginConfiguration,
   rollbackRestoredWorkerPlugins,
@@ -106,6 +109,7 @@ import {
   workerLifecycleGeneration,
   workerLifecycleSequence,
 } from "./worker-lifecycle-coordinator";
+import { instanceSnapshotActive } from "./instance-snapshot-gate";
 import {
   operationSettlement,
   type OperationFailureWithSettlement,
@@ -3915,8 +3919,38 @@ for p in sys.argv[1:]:
     id: string,
     opts: {
       includeRootfs: boolean;
+      includeManagedVolumes?: boolean;
       /** Backup-only selection controls. Omitted values preserve the legacy
        * complete portable export contract. */
+      includeWorkspace?: boolean;
+      includeAgents?: boolean;
+      signal?: AbortSignal;
+      onProgress?: (update: {
+        phase: string;
+        progress: number;
+        bytesProcessed: number;
+      }) => void | Promise<void>;
+    },
+  ): Promise<{ stream: Readable; filename: string }> {
+    const snapshot = this.containers.get(id);
+    if (!snapshot) throw new Error("Container not found");
+    return withOwnerWorkerLifecycleMutation(snapshot.userId, id, async () => {
+      if (instanceSnapshotActive())
+        throw Object.assign(
+          new Error("Worker export is unavailable during instance backup or restore. Retry afterwards."),
+          { statusCode: 409, code: "INSTANCE_CONTROL_PLANE_BARRIER_ACTIVE" },
+        );
+      return this.exportWorkerWithLifecycleFenceHeld(id, opts);
+    });
+  }
+
+  /** Internal integration seam for backup capture, whose caller holds the
+   * owner -> worker lifecycle fence across base capture and any repacking. */
+  async exportWorkerWithLifecycleFenceHeld(
+    id: string,
+    opts: {
+      includeRootfs: boolean;
+      includeManagedVolumes?: boolean;
       includeWorkspace?: boolean;
       includeAgents?: boolean;
       signal?: AbortSignal;
@@ -4005,8 +4039,23 @@ for p in sys.argv[1:]:
         pluginConfiguration.installations.length > 0;
       const { useManagedVolumeManager } = await import("./managed-volume-manager");
       const persistence = useManagedVolumeManager(); await persistence.init();
+      const portableCapture = opts.includeManagedVolumes === true
+        ? await (await import("./portable-managed-volume-runtime"))
+            .usePortableManagedVolumeRuntime()
+            .captureWithLifecycleFenceHeld({
+              userId: info.userId,
+              workerId: info.id,
+              state: info.status,
+              containerId: info.containerId,
+              outputPath: join(tmpDir, BUNDLE_FILES.managedVolumes),
+              signal: opts.signal,
+            })
+        : undefined;
+      if (portableCapture) bytesProcessed += portableCapture.bytes;
       const manifest: WorkerExportManifest = {
-        version: WORKER_EXPORT_VERSION,
+        version: portableCapture
+          ? PORTABLE_MANAGED_VOLUME_EXPORT_VERSION
+          : WORKER_EXPORT_VERSION,
         exportedAt: new Date().toISOString(),
         source: {
           id: info.id,
@@ -4034,9 +4083,12 @@ for p in sys.argv[1:]:
           agents: includeAgents,
           ...(hasPlugins ? { plugins: true } : {}),
           reconstruction: true,
+          ...(portableCapture ? { managedVolumes: true } : {}),
         },
-        localPersistence: persistence.store.forWorker(info.userId, info.id).filter((v) => v.attached)
-          .map((v) => ({ path: v.target, included: false })),
+        localPersistence: portableCapture?.localPersistence ??
+          persistence.store.forWorker(info.userId, info.id).filter((v) => v.attached)
+            .map((v) => ({ path: v.target, included: false })),
+        ...(portableCapture ? { managedVolumes: portableCapture.entries } : {}),
         missingSecrets: (
           await useWorkerConfigStore().resolveValues(info.userId, info.id)
         )
@@ -4052,6 +4104,11 @@ for p in sys.argv[1:]:
           path: join(tmpDir, BUNDLE_FILES.manifest),
         },
       ];
+      if (portableCapture)
+        files.push({
+          name: BUNDLE_FILES.managedVolumes,
+          path: join(tmpDir, BUNDLE_FILES.managedVolumes),
+        });
       if (hasPlugins) {
         const pluginPath = join(tmpDir, BUNDLE_FILES.plugins);
         bytesProcessed += await writePortablePluginConfiguration(
@@ -4165,7 +4222,11 @@ for p in sys.argv[1:]:
     // reference check plus any rollback deletion is atomic for that owner.
     return withOwnerLifecycleMutation(userId, async () => {
       await this.assertOwnerExists(userId);
-      return this.importWorkerForOwner(userId, bundlePath, opts);
+      return (await import("./portable-managed-volume-runtime"))
+        .usePortableManagedVolumeRuntime()
+        .withInstanceSnapshotAccounting(() =>
+          this.importWorkerForOwner(userId, bundlePath, opts),
+        );
     });
   }
 
@@ -4198,6 +4259,7 @@ for p in sys.argv[1:]:
         backupPathsPath,
         pluginConfigurationPath,
         reconstructionPath,
+        managedVolumesPath,
       } = await extractBundle(bundlePath, workDir);
       if (!manifest || typeof manifest.version !== "number") {
         throw new Error("Invalid worker export bundle");
@@ -4226,6 +4288,57 @@ for p in sys.argv[1:]:
       const reconstruction = reconstructionPath
         ? await readWorkerReconstruction(reconstructionPath)
         : undefined;
+      if (rootfsPath)
+        await (rootfsCompressed
+          ? validateGzipTarPayload(rootfsPath)
+          : validateTarPayload(rootfsPath));
+
+      const id = randomUUID();
+      provisionalWorkerId = id;
+      let mounts =
+        (await this.resolveAuthorizedHostMounts(
+          userId,
+          id,
+          manifest.worker?.mounts,
+        )) ?? [];
+      if (managedVolumesPath && manifest.managedVolumes) {
+        const [{ validateAndExtractPortableManagedVolumePayload }, {
+          planPortableManagedVolumeImport,
+        }, {
+          portableManagedVolumeImportConflicts,
+        }] = await Promise.all([
+          import("./portable-managed-volume-archive"),
+          import("./portable-managed-volume-plan"),
+          import("./portable-managed-volume-runtime"),
+        ]);
+        // Nested tar validation and every static overlap check happen before
+        // importing an image, creating an environment, or journaling resources.
+        const managedVolumePreflightDir = join(workDir, "managed-volumes-preflight");
+        try {
+          await validateAndExtractPortableManagedVolumePayload(
+            managedVolumesPath,
+            manifest.managedVolumes,
+            managedVolumePreflightDir,
+          );
+        } finally {
+          // Preflight bytes are not restore input. Drop them before image or
+          // environment mutation so the later journalled extraction cannot
+          // double the managed-volume staging footprint.
+          await rm(managedVolumePreflightDir, { recursive: true, force: true }).catch(() => {});
+        }
+        planPortableManagedVolumeImport({
+          operationId: randomUUID(),
+          userId,
+          workerId: id,
+          entries: manifest.managedVolumes,
+          conflicts: portableManagedVolumeImportConflicts({
+            hostGrantPaths: mounts.map((mount) => mount.target),
+            destinationMountPaths: mounts.map((mount) => mount.target),
+            selectedBackupPaths: manifest.backupPaths?.map(({ path }) => path),
+          }),
+        });
+      }
+
       const reconstructionResolution = await resolveWorkerReconstruction(userId, reconstruction);
       // An explicitly captured rootfs is itself the image dependency. Keep
       // existing full-export portability without requiring a matching catalog,
@@ -4244,10 +4357,6 @@ for p in sys.argv[1:]:
         await this.dockerService.ensureImage(
           resolvedImage.imageRuntimeReference,
         );
-      if (rootfsPath)
-        await (rootfsCompressed
-          ? validateGzipTarPayload(rootfsPath)
-          : validateTarPayload(rootfsPath));
 
       const environment = await this.resolveImportEnvironment(
         userId,
@@ -4256,8 +4365,6 @@ for p in sys.argv[1:]:
       const environmentId = environment.id;
       if (environment.created) createdImportEnvironmentId = environment.id;
 
-      const id = randomUUID();
-      provisionalWorkerId = id;
       if (createdImportEnvironmentId) {
         this.importCreatedEnvironments.set(id, createdImportEnvironmentId);
       }
@@ -4273,12 +4380,6 @@ for p in sys.argv[1:]:
       ).slice(0, 100);
       const containerName = this.buildContainerName(id);
       const repos = (manifest.worker?.repos ?? []).filter((r) => r.url);
-      let mounts =
-        (await this.resolveAuthorizedHostMounts(
-          userId,
-          id,
-          manifest.worker?.mounts,
-        )) ?? [];
       const initScript = manifest.worker?.initScript || "";
       const workerSelfApiAccess = manifest.worker?.workerSelfApiAccess;
 
@@ -4365,6 +4466,44 @@ for p in sys.argv[1:]:
       // the owner retry deletion by stable worker UUID instead of leaving only
       // an operator-facing Docker name behind.
       const imageName = importedImage || resolvedImage.imageRuntimeReference || this.config.workerImagePrefix + this.config.workerImage;
+      let portableImport: PreparedPortableManagedVolumeImport | undefined;
+      if (managedVolumesPath && manifest.managedVolumes) {
+        try {
+          const portableRuntime = (await import("./portable-managed-volume-runtime"))
+            .usePortableManagedVolumeRuntime();
+          portableImport = await portableRuntime.prepareImportWithLifecycleFenceHeld({
+            userId,
+            workerId: id,
+            entries: manifest.managedVolumes,
+            payloadPath: managedVolumesPath,
+            stagingDir: join(workDir, "managed-volumes-restore"),
+            conflicts: (await import("./portable-managed-volume-runtime"))
+              .portableManagedVolumeImportConflicts({
+                hostGrantPaths: mounts.map((mount) => mount.target),
+                destinationMountPaths: mounts.map((mount) => mount.target),
+                selectedBackupPaths: manifest.backupPaths?.map(({ path }) => path),
+              }),
+            image: imageName,
+          });
+        } catch (error) {
+          if (importedImage)
+            await removeFailedImportedImage(importedImage, () =>
+              this.dockerService.removeImage(importedImage!),
+            );
+          throw error;
+        }
+      }
+      const rollbackProvisionedImport = async (
+        input: Parameters<ContainerManager["rollbackFailedProvisionedWorker"]>[0],
+        workerCreateWasJournaled: boolean,
+      ) => {
+        if (portableImport) {
+          if (workerCreateWasJournaled)
+            return portableImport.rollback(() => this.rollbackFailedProvisionedWorker(input));
+          await portableImport.rollback(async () => {});
+        }
+        await this.rollbackFailedProvisionedWorker(input);
+      };
       const now = new Date().toISOString();
       const containerInfo: ContainerInfo = {
         id,
@@ -4401,14 +4540,14 @@ for p in sys.argv[1:]:
           );
         }
       } catch (err) {
-        await this.rollbackFailedProvisionedWorker({
+        await rollbackProvisionedImport({
           id,
           userId,
           containerId: containerName,
           containerName,
           dockerEnabled,
           importedImage,
-        });
+        }, false);
         throw err;
       }
 
@@ -4426,6 +4565,7 @@ for p in sys.argv[1:]:
         mounts =
           (await this.resolveAuthorizedHostMounts(userId, id, mounts)) ?? [];
         containerInfo.mounts = mounts.length > 0 ? mounts : undefined;
+        await portableImport?.markWorkerCreatePending();
         container = await this.dockerService.createWorkerContainer({
           userId,
           id,
@@ -4442,27 +4582,54 @@ for p in sys.argv[1:]:
           storageManager: this.storageManager,
           userEnv,
           workerConfig,
+          persistentPathMounts: portableImport?.mounts,
+          ...(portableImport?.mounts.length
+            ? {
+                portableImportIdentity: {
+                  ownerId: userId,
+                  workerId: id,
+                  operationId: portableImport.operationId,
+                },
+              }
+            : {}),
           image: importedImage || resolvedImage.imageRuntimeReference,
           imageConfig,
           start: false,
         });
+        await portableImport?.confirmWorkerCreated(container.id);
         containerInfo.containerId = container.id;
         containerInfo.imageId = await this.dockerService.inspectContainerImage(
           container.id,
         );
       } catch (err) {
+        const settlement = (err as OperationFailureWithSettlement)[operationSettlement];
+        if (settlement) await settlement;
         // createWorkerContainer may already have created persistent storage
         // before image/container creation fails. The deterministic container
         // name is also a valid Docker removal target if creation got that far.
-        await this.rollbackFailedProvisionedWorker({
+        await rollbackProvisionedImport({
           id,
           userId,
           containerId: containerName,
           containerName,
           dockerEnabled,
           importedImage,
-        });
+        }, Boolean(portableImport));
         throw err;
+      }
+
+      if (portableImport) {
+        try {
+          await (await import("./managed-volume-manager"))
+            .useManagedVolumeManager()
+            .markDeclared(userId, id, container.id);
+        } catch (err) {
+          await rollbackProvisionedImport({
+            id, userId, containerId: container.id, containerName,
+            dockerEnabled, importedImage,
+          }, true);
+          throw err;
+        }
       }
 
       // Restore the volumes and start. If anything here fails, roll back the
@@ -4498,14 +4665,14 @@ for p in sys.argv[1:]:
         containerInfo.status = "running";
         containerInfo.updatedAt = new Date().toISOString();
       } catch (err) {
-        await this.rollbackFailedProvisionedWorker({
+        await rollbackProvisionedImport({
           id,
           userId,
           containerId: container.id,
           containerName,
           dockerEnabled,
           importedImage,
-        });
+        }, Boolean(portableImport));
         throw err;
       }
 
@@ -4542,6 +4709,7 @@ for p in sys.argv[1:]:
             container.id,
           );
         }
+        await portableImport?.commit();
       } catch (err) {
         let pluginCleanupError: unknown;
         if (restoredPlugins) {
@@ -4560,14 +4728,14 @@ for p in sys.argv[1:]:
           }
         }
         try {
-          await this.rollbackFailedProvisionedWorker({
+          await rollbackProvisionedImport({
             id,
             userId,
             containerId: container.id,
             containerName,
             dockerEnabled,
             importedImage,
-          });
+          }, Boolean(portableImport));
         } finally {
           if (pluginCleanupError)
             throw new Error("Imported plugin cleanup requires operator attention", {
@@ -4752,6 +4920,48 @@ for p in sys.argv[1:]:
               }
             : {}),
         },
+      );
+    }
+  }
+
+  /** Startup-only cleanup seam for the portable import journal. Recovery runs
+   * before sync(), so derive everything from durable worker metadata and the
+   * journal's fresh identity rather than trusting Docker discovery state. */
+  async recoverPortableManagedVolumeProvisionalWorker(
+    journal: PortableManagedVolumeImportJournal,
+  ): Promise<void> {
+    const worker = this.workerStore?.get(journal.userId, journal.workerId);
+    const containerName = this.buildContainerName(journal.workerId);
+    let dockerEnabled = true;
+    if (worker) {
+      try {
+        dockerEnabled = this.deriveLimits(
+          this.resolveEnvironmentConfig(worker.environmentId),
+        ).dockerEnabled;
+      } catch {
+        // Cleanup must remain conservative when a referenced environment was
+        // removed or corrupted: attempting the idempotent Docker-data cleanup
+        // is safer than retaining an untracked privileged data directory.
+      }
+    }
+    const importEnvironmentId = worker?.importCreatedEnvironmentId;
+    await this.rollbackFailedProvisionedWorker({
+      id: journal.workerId,
+      userId: journal.userId,
+      containerId: containerName,
+      containerName,
+      dockerEnabled,
+      importedImage: worker?.importedImage,
+    });
+    if (
+      importEnvironmentId &&
+      this.environmentStore &&
+      !this.importEnvironmentIsReferenced(journal.userId, importEnvironmentId)
+    ) {
+      await removeImportEnvironmentIdempotently(
+        importEnvironmentId,
+        (id) => Boolean(this.environmentStore?.getById(id)),
+        (id) => this.environmentStore!.delete(id),
       );
     }
   }

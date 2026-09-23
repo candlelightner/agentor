@@ -379,6 +379,16 @@ test.describe.serial("Group-admin workspace and scoped management MCP", () => {
       path: "/workspace",
     });
     expect(ownPaths.status(), await ownPaths.text()).toBe(200);
+    const invalidManagedBackup = await invoke(request, credential, "backups.create", {
+      workspaceIds: [memberId],
+      includeManagedVolumes: "true",
+    });
+    expect(invalidManagedBackup.status()).toBe(400);
+    const invalidManagedExport = await invoke(request, credential, "exports.create", {
+      workerId: memberId,
+      includeManagedVolumes: 1,
+    });
+    expect(invalidManagedExport.status()).toBe(400);
     const selectedBackup = await invoke(request, credential, "backups.create", {
       workspaceIds: [memberId],
       selectedPathsByWorkspace: { [memberId]: ["/workspace"] },

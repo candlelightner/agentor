@@ -1714,7 +1714,8 @@ export class ManagementMcpStore {
       return useExportJobManager().create(
         worker.userId,
         worker.id,
-        args.includeRootfs === true,
+        optionalBoolean(args.includeRootfs, "includeRootfs"),
+        optionalBoolean(args.includeManagedVolumes, "includeManagedVolumes"),
       );
     }
     if (name === "exports.status" || name === "exports.cancel") {
@@ -1733,7 +1734,16 @@ export class ManagementMcpStore {
       if (!ids.length) throw statusError(400, "workspaceIds required");
       const first = useContainerManager().get(ids[0]!);
       if (!first) throw statusError(404, "Workspace not found");
-      return useBackupManager().createMany(first.userId, ids);
+      return useBackupManager().createMany(
+        first.userId,
+        ids,
+        undefined,
+        1,
+        0,
+        undefined,
+        undefined,
+        optionalBoolean(args.includeManagedVolumes, "includeManagedVolumes"),
+      );
     }
     if (name === "backups.status" || name === "backups.cancel") {
       const job = await useBackupManager().getJob(String(args.jobId || ""));
@@ -2298,6 +2308,12 @@ export function useManagementMcpStore() {
 function statusError(statusCode: number, message: string) {
   return Object.assign(new Error(message), { statusCode });
 }
+function optionalBoolean(value: unknown, name: string) {
+  if (value === undefined) return false;
+  if (typeof value !== "boolean")
+    throw statusError(400, `${name} must be a boolean`);
+  return value;
+}
 function groupResourceNotFound() {
   return statusError(404, "Resource not found");
 }
@@ -2700,6 +2716,11 @@ function toolInputSchema(name: string) {
       properties: {
         workerId: { type: "string", minLength: 1 },
         includeRootfs: { type: "boolean" },
+        includeManagedVolumes: {
+          type: "boolean",
+          default: false,
+          description: "Include eligible attached custom volumes. Detached volumes are excluded and running capture is best-effort.",
+        },
       },
     };
   if (name === "exports.status" || name === "exports.cancel")

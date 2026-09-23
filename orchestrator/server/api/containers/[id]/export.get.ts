@@ -3,11 +3,12 @@ defineRouteMeta({
     tags: ['Containers'],
     summary: 'Export a worker',
     description:
-      'Legacy synchronous worker export. Streams a bundle containing settings, workspace, and agent data. Root filesystem capture is opt-in with `?includeRootfs=true`. New clients should use the asynchronous export-jobs endpoint.',
+      'Legacy synchronous worker export. Streams a bundle containing settings, workspace, and agent data. Root filesystem and attached custom managed-volume capture are independent opt-ins. New clients should use the asynchronous export-jobs endpoint.',
     operationId: 'exportWorker',
     parameters: [
       { name: 'id', in: 'path', required: true, schema: { type: 'string' }, description: 'Worker UUID' },
       { name: 'includeRootfs', in: 'query', required: false, schema: { type: 'boolean', default: false }, description: 'Include a docker-export snapshot of the container filesystem (advanced and potentially slow)' },
+      { name: 'includeManagedVolumes', in: 'query', required: false, schema: { type: 'boolean', default: false }, description: 'Include eligible attached custom volumes; detached volumes are excluded and running capture is best-effort' },
     ],
     responses: {
       200: { description: 'Worker export bundle (tar stream)', content: { 'application/x-tar': { schema: { type: 'string', format: 'binary' } } } },
@@ -34,6 +35,9 @@ export default defineEventHandler(async (event) => {
   // Keep this compatibility endpoint, but make the safe/fast workspace-focused
   // bundle the default. Rootfs capture is now an explicit advanced option.
   const includeRootfs = q.includeRootfs === 'true' || q.includeRootfs === '1';
+  if (q.includeManagedVolumes !== undefined && q.includeManagedVolumes !== 'true' && q.includeManagedVolumes !== 'false')
+    throw createError({ statusCode: 400, statusMessage: 'includeManagedVolumes must be true or false' });
+  const includeManagedVolumes = q.includeManagedVolumes === 'true';
 
   // Materialise the bundle before streaming — a bad-state worker throws a 409
   // here (mapped from the manager's statusCode-tagged error) rather than a 500.
@@ -43,6 +47,7 @@ export default defineEventHandler(async (event) => {
   try {
     ({ stream, filename } = await mgr.exportWorker(id, {
       includeRootfs,
+      includeManagedVolumes,
       signal: cancellation.signal,
     }));
   } catch (err) {

@@ -6,6 +6,7 @@ test('workspace MCP adapter declares private streaming download, clone, and dura
   expect(clone?.inputSchema.properties.lockPassword).toMatchObject({type:'string',writeOnly:true});
   expect(workspaceMcpTools.find(x=>x.name==='workspaces.download')?.description).toContain('private one-use streaming');
   expect(workspaceMcpTools.find(x=>x.name==='exports.download')?.description).toContain('private one-use');
+  expect(workspaceMcpTools.find(x=>x.name==='exports.create')?.inputSchema.properties.includeManagedVolumes).toMatchObject({type:'boolean',description:expect.stringContaining('Detached volumes are excluded')});
 });
 
 test('group-admin lifecycle tools declare bounded deadlines and return a timeout instead of hanging', async () => {

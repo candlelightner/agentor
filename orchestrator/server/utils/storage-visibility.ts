@@ -7,7 +7,12 @@ import { withOperationDeadline } from "./operation-deadline";
 import { isOperationHelperActive } from "./operation-helper-registry";
 
 const STALE_TEMP_MS = 2 * 60 * 60 * 1000;
-const HELPER_LABELS = ["agentor.workspace-helper", "agentor.backup-restore-helper", "agentor.volume-size-helper"] as const;
+const HELPER_LABELS = [
+  "agentor.workspace-helper",
+  "agentor.backup-restore-helper",
+  "agentor.volume-size-helper",
+  "agentor.portable-volume-helper",
+] as const;
 const GENERIC_HELPER_LABELS = HELPER_LABELS.filter((label) => label !== "agentor.volume-size-helper");
 const STORAGE_DOCKER_TIMEOUT_MS = 8_000;
 

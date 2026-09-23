@@ -2,6 +2,7 @@ export type ExportJobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'ca
 
 export interface ExportJob {
   id: string;
+  includeManagedVolumes: boolean;
   status: ExportJobState;
   phase?: string;
   progress?: number;
@@ -25,6 +26,7 @@ function normalize(value: any): ExportJob {
   }
   return {
     id: jobId(value),
+    includeManagedVolumes: value?.includeManagedVolumes === true,
     status,
     phase: typeof value?.phase === 'string' ? value.phase : undefined,
     progress: Number.isFinite(rawProgress) ? Math.max(0, Math.min(100, rawProgress)) : undefined,
@@ -91,11 +93,11 @@ export function useExportJob(workerId: MaybeRef<string>) {
     if (!import.meta.client || job.value) return;
     const id = localStorage.getItem(storageKey.value);
     if (!id) return;
-    job.value = { id, status: 'queued' };
+    job.value = { id, includeManagedVolumes: false, status: 'queued' };
     await refresh();
   }
 
-  async function start(includeRootfs = false) {
+  async function start(includeRootfs = false, includeManagedVolumes = false) {
     if (loading.value || active.value) return;
     loading.value = true;
     statusError.value = '';
@@ -103,7 +105,7 @@ export function useExportJob(workerId: MaybeRef<string>) {
     try {
       const created = await $fetch(`/api/containers/${toValue(workerId)}/export-jobs`, {
         method: 'POST',
-        body: { includeRootfs },
+        body: { includeRootfs, includeManagedVolumes },
       });
       job.value = normalize(created);
       if (!job.value.id) throw new Error('The server did not return an export job ID.');

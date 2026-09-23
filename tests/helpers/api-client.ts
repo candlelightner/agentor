@@ -627,8 +627,11 @@ export class ApiClient {
   }
 
   // ─── Worker Export / Import ────────────────────────────────────
-  async createExportJob(id: string, includeRootfs?: boolean) {
-    const data = includeRootfs === undefined ? {} : { includeRootfs };
+  async createExportJob(id: string, includeRootfs?: boolean, includeManagedVolumes?: boolean) {
+    const data = {
+      ...(includeRootfs === undefined ? {} : { includeRootfs }),
+      ...(includeManagedVolumes === undefined ? {} : { includeManagedVolumes }),
+    };
     const res = await this.request.post(`${BASE_URL}/api/containers/${id}/export-jobs`, { data });
     return { status: res.status(), body: await res.json().catch(() => ({})) };
   }

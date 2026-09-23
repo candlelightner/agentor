@@ -83,6 +83,7 @@ import {
   EXPORT_WORKSPACE_PATH,
   SHARED_DATA_EXCLUDE_PREFIXES,
   WORKER_EXPORT_VERSION,
+  PORTABLE_MANAGED_VOLUME_EXPORT_VERSION,
   packBundle,
   sanitizeBackupPathTarPayload,
   writeFilteredAgentsGz,
@@ -105,6 +106,7 @@ import { readPortablePluginConfiguration } from "./plugin-portability";
 import { backupInstallationId } from "./backup-installation";
 import { pluginDefinitionHash } from "./plugin-manifest";
 import { instanceSnapshotActive } from "./instance-snapshot-gate";
+import { withOwnerWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
 
 interface RestoreExecution {
   controller: AbortController;
@@ -416,6 +418,7 @@ export class BackupManager {
         | "selectedWorkspaceIds"
         | "selectedPathsByWorkspace"
         | "persistSelectedDirectories"
+        | "includeManagedVolumes"
       >
     >,
   ) {
@@ -423,6 +426,8 @@ export class BackupManager {
     this.assertOwnerAvailable(userId);
     if (input.persistSelectedDirectories !== undefined && typeof input.persistSelectedDirectories !== "boolean")
       throw Object.assign(new Error("persistSelectedDirectories must be boolean"), { statusCode: 400 });
+    if (input.includeManagedVolumes !== undefined && typeof input.includeManagedVolumes !== "boolean")
+      throw Object.assign(new Error("includeManagedVolumes must be boolean"), { statusCode: 400 });
     const previousConfig = await this.getConfig(userId);
     const persistDirectories = input.persistSelectedDirectories ?? previousConfig?.persistSelectedDirectories ?? true;
     const normalizedPaths =
@@ -461,6 +466,8 @@ export class BackupManager {
             ? old?.selectedPathsByWorkspace
             : normalizedPaths,
         persistSelectedDirectories: persistDirectories,
+        includeManagedVolumes:
+          input.includeManagedVolumes ?? old?.includeManagedVolumes ?? false,
         createdAt: old?.createdAt ?? now,
         updatedAt: now,
         nextRunAt:
@@ -489,8 +496,8 @@ export class BackupManager {
     });
     return sanitizeConfig(config);
   }
-  async create(userId: string, workspaceId: string) {
-    return this.createMany(userId, [workspaceId]);
+  async create(userId: string, workspaceId: string, includeManagedVolumes = false) {
+    return this.createMany(userId, [workspaceId], undefined, 1, 0, undefined, undefined, includeManagedVolumes);
   }
   async createMany(
     userId: string,
@@ -500,6 +507,7 @@ export class BackupManager {
     resumed = 0,
     selectedPathsByWorkspace?: Record<string, string[]>,
     requestId?: string,
+    includeManagedVolumes = false,
   ): Promise<BackupJob> {
     await this.init();
     this.assertOwnerAvailable(userId);
@@ -556,6 +564,7 @@ export class BackupManager {
                   ]),
               )
             : undefined,
+          includeManagedVolumes,
         })
       : undefined;
     const job: BackupJob = {
@@ -578,6 +587,7 @@ export class BackupManager {
       ...(normalizedRequestId ? { requestId: normalizedRequestId } : {}),
       ...(fingerprint ? { requestFingerprint: fingerprint } : {}),
       consistency,
+      includeManagedVolumes,
       ...(paths ? { selectedPathsByWorkspace: paths } : {}),
     };
     if (normalizedRequestId) {
@@ -952,6 +962,7 @@ export class BackupManager {
       createdAt: now,
       updatedAt: now,
       attempt: 1,
+      includeManagedVolumes: false,
       operation: "discovery",
       requestFingerprint: fingerprint,
       ...(normalizedRequestId ? { requestId: normalizedRequestId } : {}),
@@ -1025,6 +1036,7 @@ export class BackupManager {
       updatedAt: now,
       ...(existingArtifact ? { completedAt: now } : {}),
       attempt: 1,
+      includeManagedVolumes: false,
       operation: "adoption",
       remoteBackupId: remote.id,
       ...(existingArtifact
@@ -1088,6 +1100,7 @@ export class BackupManager {
       selectedWorkspaceIds: [workspaceId], artifactId, provider: artifact.provider,
       status: "queued", phase: "queued", progress: 0, bytesProcessed: 0,
       createdAt: now, updatedAt: now, attempt: 1,
+      includeManagedVolumes: false,
       operation: "dependency-resolution", requestFingerprint: fingerprint,
       recoverImageStartBuild: startBuild,
       ...(normalizedRequestId ? { requestId: normalizedRequestId } : {}),
@@ -1620,10 +1633,12 @@ export class BackupManager {
         dependencies,
         missingSecrets,
         selectedPathsByWorkspace,
+        includeManagedVolumes,
       } = await this.summarizeArtifactInspection(job.userId, inspected);
       job.phase = "adopting";
       job.progress = 85;
       job.dependencies = dependencies;
+      job.includeManagedVolumes = includeManagedVolumes;
       await this.saveJob(job);
       const data = this.store.get(job.userId);
       const already = data.artifacts.find(
@@ -1656,6 +1671,7 @@ export class BackupManager {
           sha256,
           sourceWorkerId: actualWorkspaceIds[0],
           missingSecrets,
+          includeManagedVolumes,
           ...(Object.keys(selectedPathsByWorkspace).length
             ? { selectedPathsByWorkspace }
             : {}),
@@ -1862,6 +1878,7 @@ export class BackupManager {
     dependencies: BackupDependency[];
     missingSecrets: string[];
     selectedPathsByWorkspace: Record<string, string[]>;
+    includeManagedVolumes: boolean;
   }> {
     const summaries: BackupWorkspaceReconstructionSummary[] = [];
     const dependencies: BackupDependency[] = [];
@@ -1885,6 +1902,9 @@ export class BackupManager {
       dependencies,
       missingSecrets: [...missingSecrets].sort(),
       selectedPathsByWorkspace,
+      includeManagedVolumes: inspected.workspaces.some(
+        (workspace) => workspace.manifest.contents.managedVolumes === true,
+      ),
     };
   }
 
@@ -2410,6 +2430,7 @@ export class BackupManager {
         createdAt: now,
         updatedAt: now,
         attempt: 1,
+        includeManagedVolumes: artifact.includeManagedVolumes,
         operation: "restore",
         target,
         displayName,
@@ -2500,6 +2521,32 @@ export class BackupManager {
     destination: string,
     signal: AbortSignal,
     selectedPaths?: string[],
+    includeManagedVolumes = false,
+  ) {
+    return withOwnerWorkerLifecycleMutation(userId, id, async () => {
+      if (instanceSnapshotActive())
+        throw Object.assign(
+          new Error("Portable backup capture is unavailable during instance backup or restore."),
+          { statusCode: 409, code: "INSTANCE_CONTROL_PLANE_BARRIER_ACTIVE" },
+        );
+      return this.exportWorkspaceBundleWithLifecycleFenceHeld(
+        userId,
+        id,
+        destination,
+        signal,
+        selectedPaths,
+        includeManagedVolumes,
+      );
+    });
+  }
+
+  private async exportWorkspaceBundleWithLifecycleFenceHeld(
+    userId: string,
+    id: string,
+    destination: string,
+    signal: AbortSignal,
+    selectedPaths?: string[],
+    includeManagedVolumes = false,
   ) {
     assertSafeUserId(userId);
     const live = useContainerManager().get(id);
@@ -2519,8 +2566,9 @@ export class BackupManager {
     if (live?.containerId) {
       if (explicitPaths.length)
         await useContainerManager().assertBackupPathsReadable(id, explicitPaths);
-      const result = await useContainerManager().exportWorker(id, {
+      const result = await useContainerManager().exportWorkerWithLifecycleFenceHeld(id, {
         includeRootfs: false,
+        includeManagedVolumes,
         includeWorkspace,
         includeAgents,
         signal,
@@ -2690,6 +2738,17 @@ export class BackupManager {
       const hasPlugins =
         pluginConfiguration.definitions.length > 0 ||
         pluginConfiguration.installations.length > 0;
+      const portableCapture = includeManagedVolumes
+        ? await (await import("./portable-managed-volume-runtime"))
+            .usePortableManagedVolumeRuntime()
+            .captureWithLifecycleFenceHeld({
+              userId,
+              workerId: id,
+              state: "archived",
+              outputPath: join(temp, BUNDLE_FILES.managedVolumes),
+              signal,
+            })
+        : undefined;
       const catalog = useImageCatalogManager();
       await catalog.init();
       const imageDefinition = worker.imageDefinitionId
@@ -2698,7 +2757,9 @@ export class BackupManager {
             .find((item) => item.id === worker.imageDefinitionId)
         : undefined;
       const manifest: WorkerExportManifest = {
-        version: WORKER_EXPORT_VERSION,
+        version: portableCapture
+          ? PORTABLE_MANAGED_VOLUME_EXPORT_VERSION
+          : WORKER_EXPORT_VERSION,
         exportedAt: new Date().toISOString(),
         source: {
           id,
@@ -2750,12 +2811,15 @@ export class BackupManager {
           agents: includeAgents,
           ...(hasPlugins ? { plugins: true } : {}),
           reconstruction: true,
+          ...(portableCapture ? { managedVolumes: true } : {}),
         },
         missingSecrets: (await useWorkerConfigStore().resolveValues(userId, id))
           .filter((entry) => entry.kind !== "variable")
           .map((entry) => entry.key),
-        localPersistence: (await import("./managed-volume-manager")).useManagedVolumeManager().store.forWorker(userId, id)
-          .filter((v) => v.attached).map((v) => ({ path: v.target, included: false })),
+        localPersistence: portableCapture?.localPersistence ??
+          (await import("./managed-volume-manager")).useManagedVolumeManager().store.forWorker(userId, id)
+            .filter((v) => v.attached).map((v) => ({ path: v.target, included: false })),
+        ...(portableCapture ? { managedVolumes: portableCapture.entries } : {}),
       };
       const manifestPath = join(temp, BUNDLE_FILES.manifest),
         workspacePath = join(temp, BUNDLE_FILES.workspace),
@@ -2807,6 +2871,12 @@ export class BackupManager {
             : []),
           ...(hasPlugins
             ? [{ name: BUNDLE_FILES.plugins, path: pluginsPath }]
+            : []),
+          ...(portableCapture
+            ? [{
+                name: BUNDLE_FILES.managedVolumes,
+                path: join(temp, BUNDLE_FILES.managedVolumes),
+              }]
             : []),
           {
             name: BUNDLE_FILES.reconstruction,
@@ -2861,7 +2931,11 @@ export class BackupManager {
         });
       }
       pack.finalize(); await writing;
-      manifest.version = WORKER_EXPORT_VERSION;
+      // Repacking must not downgrade an opted-in v6 bundle or synthesize v6
+      // fields into the ordinary v5 path.
+      manifest.version = manifest.contents.managedVolumes === true
+        ? PORTABLE_MANAGED_VOLUME_EXPORT_VERSION
+        : WORKER_EXPORT_VERSION;
       manifest.contents.backupPaths = true;
       manifest.backupPaths = archives.map(({ path, archive }) => ({ path, archive }));
       if (manifest.localPersistence) manifest.localPersistence = manifest.localPersistence.map((v) => ({
@@ -2887,6 +2961,14 @@ export class BackupManager {
               {
                 name: BUNDLE_FILES.reconstruction,
                 path: extracted.reconstructionPath,
+              },
+            ]
+          : []),
+        ...(extracted.managedVolumesPath
+          ? [
+              {
+                name: BUNDLE_FILES.managedVolumes,
+                path: extracted.managedVolumesPath,
               },
             ]
           : []),
@@ -2993,6 +3075,7 @@ export class BackupManager {
             path,
             controller.signal,
             job.selectedPathsByWorkspace?.[id],
+            job.includeManagedVolumes,
           );
           exports.push({ id, path });
         }
@@ -3151,6 +3234,7 @@ export class BackupManager {
         sha256: crypt.sha256,
         sourceWorkerId: job.workspaceId,
         missingSecrets: [...missing],
+        includeManagedVolumes: job.includeManagedVolumes,
         selectedPathsByWorkspace:
           Object.keys(inspection.selectedPathsByWorkspace).length > 0
             ? inspection.selectedPathsByWorkspace
@@ -3506,6 +3590,7 @@ export class BackupManager {
         intervalMinutes: 1440,
         retentionCount: 7,
         selectedWorkspaceIds: null,
+        includeManagedVolumes: false,
         createdAt: now,
         updatedAt: now,
       };
@@ -3635,6 +3720,7 @@ export class BackupManager {
         throw new Error("Workspace worker must be running or stopped");
       const bundle = await useContainerManager().exportWorker(job.workspaceId, {
         includeRootfs: false,
+        includeManagedVolumes: job.includeManagedVolumes,
       });
       const plain = join(dir, "worker.tar");
       await pipeline(bundle.stream, createWriteStream(plain, { mode: 0o600 }));
@@ -3693,6 +3779,7 @@ export class BackupManager {
         sha256: crypt.sha256,
         sourceWorkerId: job.workspaceId,
         missingSecrets: missing,
+        includeManagedVolumes: job.includeManagedVolumes,
         selectedPathsByWorkspace: job.selectedPathsByWorkspace,
       };
       job.status = "succeeded";
@@ -4007,7 +4094,7 @@ export class BackupManager {
           .map((worker) => worker.id);
       let scheduleError: string | undefined;
       try {
-        await this.createMany(c.userId, selected, undefined, 1, 0, pickSelectedPaths(c.selectedPathsByWorkspace, selected));
+        await this.createMany(c.userId, selected, undefined, 1, 0, pickSelectedPaths(c.selectedPathsByWorkspace, selected), undefined, c.includeManagedVolumes);
       } catch (error) {
         scheduleError = safeError(error);
         useLogger().error(

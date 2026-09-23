@@ -183,13 +183,13 @@ export class ManagementImageBackupDomain {
       [
         "backups.settings",
         "backups",
-        "Read or replace backup settings, including absolute paths per worker and persistSelectedDirectories. Set false for backup-only selections; legacy omission preserves prior behavior. Existing managed persistence is never removed or overwritten by changing backup coverage. Individual files and / remain backup-only; explicit sensitive paths are allowed.",
+        "Read or replace backup settings, including absolute paths per worker, persistSelectedDirectories, and explicit attached custom-volume capture. Existing managed persistence is never removed or overwritten by changing backup coverage. Individual files and / remain backup-only; explicit sensitive paths are allowed.",
         mut,
       ],
       [
         "backups.create",
         "backups",
-        "Start a backup for authorized workers. selectedPathsByWorkspace optionally selects absolute readable files/directories per worker; omission preserves legacy defaults.",
+        "Start a backup for authorized workers. selectedPathsByWorkspace optionally selects absolute readable files/directories per worker. includeManagedVolumes explicitly captures eligible attached custom volumes; detached volumes remain excluded and running capture is best-effort.",
         mut,
       ],
       ["backups.status", "backups", "Read persisted job status", ro],
@@ -504,8 +504,12 @@ export class ManagementImageBackupDomain {
       );
     }
     if (name === "backups.settings") {
-      if (a.settings !== undefined)
+      if (a.settings !== undefined) {
+        const settings = a.settings as Record<string, unknown>;
+        if (settings.includeManagedVolumes !== undefined)
+          optionalBoolean(settings.includeManagedVolumes, "includeManagedVolumes");
         return sanitize(await manager.setConfig(owner, a.settings as any));
+      }
       return sanitize(await manager.getConfig(owner));
     }
     if (name === "backups.create") {
@@ -520,6 +524,7 @@ export class ManagementImageBackupDomain {
           0,
           pathSelections(a.selectedPathsByWorkspace),
           string(a.requestId),
+          optionalBoolean(a.includeManagedVolumes, "includeManagedVolumes"),
         ),
         owner,
       );
@@ -675,6 +680,12 @@ function required(v: unknown, n: string) {
 }
 function string(v: unknown) {
   return typeof v === "string" && v ? v : undefined;
+}
+function optionalBoolean(value: unknown, name: string) {
+  if (value === undefined) return false;
+  if (typeof value !== "boolean")
+    throw fail(400, `${name} must be a boolean`);
+  return value;
 }
 function number(v: unknown, d: number) {
   return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : d;
@@ -1190,6 +1201,12 @@ function catalogSchema(name: string): Record<string, unknown> {
         "For backups.restore, an optional exact subset of artifact workspace IDs. Omit to restore every workspace in the artifact. For backups.create, the workspaces to include.",
     },
     selectedPathsByWorkspace: absolutePaths,
+    includeManagedVolumes: {
+      type: "boolean",
+      default: false,
+      description:
+        "Include eligible attached custom volumes. Detached volumes are excluded; capture from a running worker is best-effort.",
+    },
     artifactId: { type: "string" },
     jobId: { type: "string" },
     displayName: {
@@ -1204,7 +1221,7 @@ function catalogSchema(name: string): Record<string, unknown> {
     },
     settings: {
       type: "object",
-      properties: { selectedPathsByWorkspace: absolutePaths, persistSelectedDirectories: { type: "boolean" } },
+      properties: { selectedPathsByWorkspace: absolutePaths, persistSelectedDirectories: { type: "boolean" }, includeManagedVolumes: { type: "boolean", default: false } },
     },
     after: { type: "integer", minimum: 0 },
     limit: { type: "integer", minimum: 1, maximum: 1000 },

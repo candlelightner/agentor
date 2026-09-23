@@ -1412,6 +1412,7 @@ export class InstanceBackupManager {
       (await useBackupManager().hasActiveOperationsForInstanceSnapshot()) ||
       useManagedVolumeManager().hasActiveOperationsForInstanceSnapshot() ||
       (await import("./managed-volume-sizing")).useManagedVolumeSizingManager().hasActiveOperationsForInstanceSnapshot() ||
+      (await import("./portable-managed-volume-runtime")).usePortableManagedVolumeRuntime().hasActiveOperationsForInstanceSnapshot() ||
       services.useExportJobManager().hasActiveOperationsForInstanceSnapshot() ||
       imageModule.useImageCatalogManager().hasActiveOperationsForInstanceSnapshot() ||
       services.useUsageChecker().hasActiveOperationsForInstanceSnapshot() ||

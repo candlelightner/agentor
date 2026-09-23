@@ -6,7 +6,7 @@ only marked complete when its API and UI are usable end to end, authorization
 and persistence are covered, failure paths are tested, and the public
 documentation is current.
 
-## Verification status (2026-08-13)
+## Verification status (2026-09-23)
 
 | Workstream | Current classification | Evidence / immediate gap |
 |---|---|---|
@@ -14,15 +14,23 @@ documentation is current.
 | Custom image builder/catalog | Complete and verified | Approved-base constrained contexts, controlled/fake async builders, immutable image IDs, selection/defaults, test/promotion/rollback/rebuild, logs, cancellation, race-safe cleanup, and real browser creation/build/promotion are covered. |
 | Backup/restore | Complete and verified locally; live Google credentials external | Multi-workspace encrypted bundles, scheduling, retention, cancellation/retry/recovery, local/fake/Google-provider contracts, integrity verification, archived backup, and rollback-safe restore are covered with deterministic providers. A real Google account remains an external configuration boundary. |
 | Volume inventory/offline browsing | Complete and verified | Running/stopped/archived/deleted/orphan inventory, bounded size, latest backup, owner-scoped hardened browse/preview/search/metadata/streamed download, backup, and clone cover directory and named-volume abstractions. Orphans remain deliberately non-browsable until a separately audited adoption workflow exists. |
-| Managed local persistent paths | Implemented; focused API/UI coverage | A worker can retain an approved application-data directory in an Agentor-managed local volume. Adds are owner scoped and idempotent; protected/system/credential paths and overlap are rejected; live application is explicitly authorized, detach retains data, and explicit deletion is separate. Deleted-account records move to retained administrator storage instead of silently deleting the volume. |
+| Managed local persistent paths | Sizing verified; portable workflow implemented pending final isolated acceptance | A worker can retain an approved application-data directory in an Agentor-managed local volume. Adds are owner scoped and idempotent; protected/system/credential paths and overlap are rejected; live application is explicitly authorized, detach retains data, and explicit deletion is separate. Deleted-account records move to retained administrator storage instead of silently deleting the volume. Bounded on-demand sizing is verified. Default-off portable export/backup capture and fresh-identity restore are implemented across API, MCP, and UI, with final real-Docker acceptance still required before release. |
 | Worker-local variables/secrets | Complete and verified | Worker create/settings, precedence preview, encrypted write-only secrets, tmpfs secret files, desired/applied rebuild semantics, clone/export/backup omission, and same-user/cross-user isolation are covered through API and real browser paths. |
 | Administrative workspace | Complete and verified | Trusted digest-pinned overlay, persistent storage, terminal/editor/desktop services, red identity, privileged confirmations, internal MCP discovery, and hardened Docker runtime are covered. |
 | Internal management MCP | Complete and verified | Internal-only listener/network, short-lived workspace identity, live fail-closed groups, owner-checked/redacted logs, console, storage/download handoffs, networking, lifecycle, configuration, and invocation audit are covered. Dashboard proposal review is optional; harness confirmation is not a platform boundary. |
 | Git-backed image recovery | Complete with fake-provider verification; live GitHub credentials external | Versioned format, public/private GitHub contracts, encrypted PAT and GitHub App paths, conflict-safe direct/branch/PR sync, Actions dispatch, GHCR digest recovery, credential erasure, API/UI, and fake integration tests are covered. A real repository/account remains an external configuration boundary. |
 
-## Planned storage follow-ups
+## Current storage follow-up status
 
-Managed local persistent paths currently use Docker-managed capacity; they do not offer on-demand custom-volume sizing. There is also no portable custom-volume backup/export-and-restore workflow. Both are planned work, not claims made by the existing worker export/import or backup paths.
+Managed local persistent paths use Docker-managed capacity and expose bounded,
+on-demand allocated and logical sizing without recursing during inventory reads.
+The strict default-false portable custom-volume workflow is now implemented for
+worker exports and encrypted backups: opted-in v6 bundles capture eligible
+attached volumes, and new-worker restore mints fresh identities while leaving
+self-service, live-mount, and recreation policies disabled. Focused module,
+type, and surface checks are local evidence; the dedicated running, stopped, and
+archived real-Docker round trips remain a release gate and are not claimed as
+passing until the isolated suite runs successfully.
 
 ## Delivery order and dependencies
 

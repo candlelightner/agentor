@@ -10,7 +10,7 @@ const workspaceToolEntries: Array<[string, string]> = [
   ['workspaces.list','List offline workspaces'],['workspaces.files','List files in a workspace'],['workspaces.preview','Preview safe text/image metadata'],['workspaces.download','Prepare a private one-use streaming download'],['workspaces.clone','Clone a workspace into a new worker'],['exports.create','Create durable worker export'],['exports.status','Read export job status'],['exports.cancel','Cancel export job'],['exports.download','Prepare a private one-use export artifact download']
 ];
 export const workspaceMcpTools = workspaceToolEntries.map(([name,description])=>{
-  const properties={workspaceId:{type:'string',minLength:1},workerId:{type:'string',minLength:1},displayName:{type:'string'},lockPassword:{type:'string',writeOnly:true,description:'Required when cloning a protected source worker'},path:{type:'string'},jobId:{type:'string',minLength:1},includeRootfs:{type:'boolean'}};
+  const properties={workspaceId:{type:'string',minLength:1},workerId:{type:'string',minLength:1},displayName:{type:'string'},lockPassword:{type:'string',writeOnly:true,description:'Required when cloning a protected source worker'},path:{type:'string'},jobId:{type:'string',minLength:1},includeRootfs:{type:'boolean'},includeManagedVolumes:{type:'boolean',default:false,description:'Include eligible attached custom volumes. Detached volumes are excluded and running capture is best-effort.'}};
   const required = name==='workspaces.list' ? [] : name==='exports.create' ? ['workerId'] : name==='workspaces.clone'||name==='workspaces.files'||name==='workspaces.preview'||name==='workspaces.download' ? ['workspaceId'] : ['jobId'];
   return {name,group:(name.startsWith('exports.')?'exports':'storage') as 'exports'|'storage',description,inputSchema:{type:'object',additionalProperties:false,properties,...(required.length?{required}:{})},annotations:{readOnlyHint:/\.(list|files|preview|download|status)$/.test(name),destructiveHint:name==='exports.cancel',idempotentHint:/\.(list|files|preview|download|status)$/.test(name),openWorldHint:false}};
 });
@@ -29,5 +29,23 @@ export async function executeWorkspaceMcpTool(name:string,args:Record<string,any
     if(!executed.handled)throw Object.assign(new Error('Workspace clone unavailable'),{statusCode:501});
     return executed.result;
   }
-  const jobs=useExportJobManager(); if(name==='exports.create'){const worker=useContainerManager().get(args.workerId);if(!worker)throw Object.assign(new Error('Worker not found'),{statusCode:404});return jobs.create(worker.userId,worker.id,args.includeRootfs===true)} const job=await jobs.get(String(args.jobId||''));if(!job)throw Object.assign(new Error('Export job not found'),{statusCode:404});if(name==='exports.status')return jobs.toPublic(job);if(name==='exports.cancel')return jobs.cancel(job);throw Object.assign(new Error('Unknown workspace MCP tool'),{statusCode:404});
+  const jobs=useExportJobManager();
+  if(name==='exports.create'){
+    const worker=useContainerManager().get(args.workerId);
+    if(!worker)throw Object.assign(new Error('Worker not found'),{statusCode:404});
+    return jobs.create(
+      worker.userId,
+      worker.id,
+      optionalBoolean(args.includeRootfs,'includeRootfs'),
+      optionalBoolean(args.includeManagedVolumes,'includeManagedVolumes'),
+    );
+  }
+  const job=await jobs.get(String(args.jobId||''));if(!job)throw Object.assign(new Error('Export job not found'),{statusCode:404});if(name==='exports.status')return jobs.toPublic(job);if(name==='exports.cancel')return jobs.cancel(job);throw Object.assign(new Error('Unknown workspace MCP tool'),{statusCode:404});
+}
+
+function optionalBoolean(value: unknown, name: string) {
+  if (value === undefined) return false;
+  if (typeof value !== 'boolean')
+    throw Object.assign(new Error(`${name} must be a boolean`), { statusCode: 400 });
+  return value;
 }

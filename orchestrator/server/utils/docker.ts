@@ -189,6 +189,13 @@ export class DockerService {
     /** When false, the container is created but not started (used by import so
      * the volumes can be populated before the entrypoint runs). Defaults to true. */
     start?: boolean;
+    /** Server-generated recovery identity for a journaled portable-volume
+     * import. This is deliberately narrower than arbitrary caller labels. */
+    portableImportIdentity?: {
+      ownerId: string;
+      workerId: string;
+      operationId: string;
+    };
     /** Runtime config to apply when running an imported image (which has no
      * baked entrypoint/env). Ignored for the standard image. */
     imageConfig?: ImageConfigOverride;
@@ -296,6 +303,14 @@ export class DockerService {
     const capAdd = needsNetAdmin && !opts.dockerEnabled ? ['NET_ADMIN'] : [];
 
     const cfg = opts.imageConfig;
+    if (
+      opts.portableImportIdentity &&
+      (
+        opts.portableImportIdentity.ownerId !== opts.userId ||
+        opts.portableImportIdentity.workerId !== opts.id ||
+        !/^[a-f0-9-]{36}$/i.test(opts.portableImportIdentity.operationId)
+      )
+    ) throw new Error('Portable import identity does not match the worker creation request');
     const container = await withOperationDeadline((operationSignal) => this.docker.createContainer({
       Image: image,
       name: opts.containerName,
@@ -314,6 +329,13 @@ export class DockerService {
       Labels: {
         [MANAGED_LABEL]: 'true',
         [ID_LABEL]: opts.id,
+        ...(opts.portableImportIdentity
+          ? {
+              'agentor.owner-id': opts.portableImportIdentity.ownerId,
+              'agentor.worker-id': opts.portableImportIdentity.workerId,
+              'agentor.portable-import-id': opts.portableImportIdentity.operationId,
+            }
+          : {}),
       },
       HostConfig: {
         NetworkMode: this.config.dockerNetwork,

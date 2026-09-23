@@ -30,7 +30,7 @@ test.describe('Worker card actions', () => {
     await page.route('**/api/containers/*/export-jobs', async (route) => {
       requestedBody = route.request().postDataJSON();
       await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({
-        id: 'ui-export-job', workerId, includeRootfs: false, status: 'queued', phase: 'queued',
+        id: 'ui-export-job', workerId, includeRootfs: false, includeManagedVolumes: false, status: 'queued', phase: 'queued',
         progress: 0, bytesProcessed: 0, downloadReady: false,
       }) });
     });
@@ -38,7 +38,7 @@ test.describe('Worker card actions', () => {
       statusPolls++;
       const done = statusPolls > 1;
       await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
-        id: 'ui-export-job', workerId, includeRootfs: false,
+        id: 'ui-export-job', workerId, includeRootfs: false, includeManagedVolumes: false,
         status: done ? 'succeeded' : 'running', phase: done ? 'complete' : 'workspace',
         progress: done ? 100 : 40, bytesProcessed: done ? 2048 : 1024, downloadReady: done,
       }) });
@@ -60,7 +60,7 @@ test.describe('Worker card actions', () => {
     await expect(modal).toContainText('Workspace-only is the recommended default');
     await expect(modal.locator('[data-testid="export-rootfs"]')).not.toBeChecked();
     await modal.locator('[data-testid="export-start"]').click();
-    expect(requestedBody).toEqual({ includeRootfs: false });
+    expect(requestedBody).toEqual({ includeRootfs: false, includeManagedVolumes: false });
     await expect(modal).toContainText('workspace');
     await expect(modal).toContainText('succeeded', { timeout: 5_000 });
 

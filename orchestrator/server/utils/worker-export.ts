@@ -1,6 +1,6 @@
 import { createGzip, createGunzip, constants as zlibConstants } from 'node:zlib';
 import { createReadStream, createWriteStream, existsSync } from 'node:fs';
-import { stat, mkdir, writeFile, readFile } from 'node:fs/promises';
+import { stat, lstat, mkdir, writeFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { posix as posixPath } from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -15,9 +15,20 @@ import { AGENT_CREDENTIAL_MAPPINGS } from './user-credentials';
 import { SHARED_DIRECTORY_MOUNT_POINTS } from './storage';
 import type { PortablePluginConfiguration } from './plugin-portability';
 import { MAX_RECONSTRUCTION_BYTES, parseWorkerReconstruction, type WorkerReconstruction } from './worker-reconstruction';
+import {
+  MANAGED_VOLUMES_BUNDLE_MEMBER,
+  resolvePortableManagedVolumeFormat,
+  type PortableManagedVolumeEntry,
+} from './portable-managed-volume-format';
+import { MAX_PORTABLE_MANAGED_VOLUME_COMPRESSED_PAYLOAD_BYTES } from './portable-managed-volume-archive';
 
 /** Bumped when the bundle layout changes incompatibly. */
 export const WORKER_EXPORT_VERSION = 5;
+/** Version 6 is emitted only by the explicit managed-volume portability path. */
+export const PORTABLE_MANAGED_VOLUME_EXPORT_VERSION = 6;
+/** Coverage includes detached historical records as well as the at-most-32
+ * attached paths. Keep it bounded without silently truncating exclusions. */
+export const MAX_LOCAL_PERSISTENCE_COVERAGE_ENTRIES = 1024;
 
 /** Container paths whose contents are exported as separate volume tars (their
  * data lives in volumes, which `docker export` deliberately omits). */
@@ -61,6 +72,7 @@ export const BUNDLE_FILES = {
   backupPaths: 'backup-paths.tar.gz',
   plugins: 'plugins.json',
   reconstruction: 'reconstruction.json',
+  managedVolumes: MANAGED_VOLUMES_BUNDLE_MEMBER,
 } as const;
 
 /** What a port mapping looks like once stripped of identity for re-creation. */
@@ -71,7 +83,7 @@ export type ExportedDomainMapping = Pick<DomainMapping, 'subdomain' | 'baseDomai
 /** Import limits apply to the outer (already-compressed) bundle. They prevent a
  * hostile upload from creating arbitrary files or exhausting the data volume
  * before Docker ever sees it. Large legitimate worker exports remain supported. */
-export const MAX_BUNDLE_ENTRY_BYTES = 20 * 1024 * 1024 * 1024;
+export const MAX_BUNDLE_ENTRY_BYTES = MAX_PORTABLE_MANAGED_VOLUME_COMPRESSED_PAYLOAD_BYTES;
 export const MAX_BUNDLE_TOTAL_BYTES = 40 * 1024 * 1024 * 1024;
 export const MAX_MANIFEST_BYTES = 1024 * 1024;
 export const MAX_PLUGIN_CONFIGURATION_BYTES = 16 * 1024 * 1024;
@@ -81,6 +93,47 @@ export const MAX_INNER_ARCHIVE_ENTRIES = 1_000_000;
  * Bound its aggregate expanded size before staging those files to prevent a
  * gzip bomb from bypassing the per-inner-archive limits. */
 export const MAX_BACKUP_PATH_PAYLOAD_BYTES = MAX_INNER_ARCHIVE_BYTES;
+
+export interface BundleOutputMember {
+  name: string;
+  size: number;
+}
+
+/** Preflight a generated outer bundle against the same member and aggregate
+ * ceilings enforced by extractBundle, before opening any payload stream. */
+export function validateBundleOutputLayout(
+  members: readonly BundleOutputMember[],
+): void {
+  const names = new Set<string>();
+  let totalBytes = 0;
+  let containerBytes = 1024;
+  for (const member of members) {
+    if (!member.name || names.has(member.name))
+      throw new Error('Worker export output contains a duplicate or empty member name');
+    names.add(member.name);
+    const limit = member.name === BUNDLE_FILES.manifest
+      ? MAX_MANIFEST_BYTES
+      : member.name === BUNDLE_FILES.plugins
+        ? MAX_PLUGIN_CONFIGURATION_BYTES
+        : member.name === BUNDLE_FILES.reconstruction
+          ? MAX_RECONSTRUCTION_BYTES
+          : MAX_BUNDLE_ENTRY_BYTES;
+    const paddedSize = Math.ceil(member.size / 512) * 512;
+    const nextContainerBytes = containerBytes + 512 + paddedSize;
+    if (
+      !Number.isSafeInteger(member.size) ||
+      member.size < 0 ||
+      member.size > limit ||
+      !Number.isSafeInteger(totalBytes + member.size) ||
+      totalBytes + member.size > MAX_BUNDLE_TOTAL_BYTES ||
+      !Number.isSafeInteger(paddedSize) ||
+      !Number.isSafeInteger(nextContainerBytes) ||
+      nextContainerBytes > MAX_BUNDLE_TOTAL_BYTES
+    ) throw new Error(`Worker export output member "${member.name}" exceeds the importable size limit`);
+    totalBytes += member.size;
+    containerBytes = nextContainerBytes;
+  }
+}
 
 export interface WorkerExportManifest {
   version: number;
@@ -107,12 +160,14 @@ export interface WorkerExportManifest {
   portMappings: ExportedPortMapping[];
   domainMappings: ExportedDomainMapping[];
   /** Which payloads the bundle contains. */
-  contents: { rootfs: boolean; workspace: boolean; agents: boolean; backupPaths?: boolean; plugins?: boolean; reconstruction?: boolean };
+  contents: { rootfs: boolean; workspace: boolean; agents: boolean; backupPaths?: boolean; plugins?: boolean; reconstruction?: boolean; managedVolumes?: boolean };
   /** Explicit, non-default absolute paths selected for a backup.  Their
    * archives are only present in backup bundles, never ordinary exports. */
   backupPaths?: Array<{ path: string; archive: string }>;
   /** Coverage only, never a host-volume attachment instruction on import. */
   localPersistence?: Array<{ path: string; included: boolean }>;
+  /** Version-6-only portable data descriptors. Source identities are never serialized. */
+  managedVolumes?: PortableManagedVolumeEntry[];
   /** Names only of worker-local secrets/files excluded from this bundle. */
   missingSecrets?: string[];
 }
@@ -190,8 +245,13 @@ export function packBundle(files: { name: string; path: string }[]): Readable {
   pack.once('close', closeActiveSource);
   pack.once('error', closeActiveSource);
   (async () => {
-    for (const f of files) {
-      const size = (await stat(f.path)).size;
+    const measured = await Promise.all(files.map(async (file) => ({
+      ...file,
+      size: (await stat(file.path)).size,
+    })));
+    validateBundleOutputLayout(measured);
+    for (const f of measured) {
+      const { size } = f;
       await new Promise<void>((resolve, reject) => {
         const entry = pack.entry({ name: f.name, size }, (err) => (err ? reject(err) : resolve()));
         const source = createReadStream(f.path);
@@ -231,6 +291,7 @@ export interface ExtractedBundle {
   backupPathsPath?: string;
   pluginConfigurationPath?: string;
   reconstructionPath?: string;
+  managedVolumesPath?: string;
 }
 
 /** Scan a compressed tar before Docker extracts/imports it. Compressed-size
@@ -575,6 +636,12 @@ function tryArchiveRelative(value: string): string | undefined {
 /** Extract the outer bundle tar into `destDir`, returning the parsed manifest
  * and the paths of any extracted payloads. */
 export async function extractBundle(bundlePath: string, destDir: string): Promise<ExtractedBundle> {
+  const bundleInfo = await lstat(bundlePath);
+  if (
+    !bundleInfo.isFile() ||
+    bundleInfo.isSymbolicLink() ||
+    bundleInfo.size > MAX_BUNDLE_TOTAL_BYTES
+  ) throw new Error('Invalid worker export: outer bundle exceeds the size limit');
   await mkdir(destDir, { recursive: true });
   const known = new Set<string>(Object.values(BUNDLE_FILES));
   const present = new Set<string>();
@@ -639,8 +706,8 @@ export async function extractBundle(bundlePath: string, destDir: string): Promis
   // Enforce the version gate the constant promises: reject a bundle produced by
   // a newer, incompatible exporter rather than silently restoring it with
   // mismatched semantics. Older versions (<= current) are still accepted.
-  if (manifest.version > WORKER_EXPORT_VERSION) {
-    throw new Error(`Unsupported worker export: bundle version ${manifest.version} is newer than supported version ${WORKER_EXPORT_VERSION}`);
+  if (manifest.version > PORTABLE_MANAGED_VOLUME_EXPORT_VERSION) {
+    throw new Error(`Unsupported worker export: bundle version ${manifest.version} is newer than supported version ${PORTABLE_MANAGED_VOLUME_EXPORT_VERSION}`);
   }
 
   const rootfsFile = present.has(BUNDLE_FILES.rootfs) ? BUNDLE_FILES.rootfs : present.has(BUNDLE_FILES.legacyRootfs) ? BUNDLE_FILES.legacyRootfs : undefined;
@@ -661,6 +728,16 @@ export async function extractBundle(bundlePath: string, destDir: string): Promis
     }
   }
 
+  const portableManagedVolumes = resolvePortableManagedVolumeFormat({
+    version: manifest.version,
+    contentsManagedVolumes: manifest.contents.managedVolumes,
+    managedVolumes: manifest.managedVolumes,
+    localPersistence: manifest.localPersistence,
+    payloadPresent: present.has(BUNDLE_FILES.managedVolumes),
+  });
+  if (manifest.version === PORTABLE_MANAGED_VOLUME_EXPORT_VERSION)
+    manifest.managedVolumes = portableManagedVolumes;
+
   return {
     manifest,
     rootfsPath: rootfsFile ? join(destDir, rootfsFile) : undefined,
@@ -670,6 +747,7 @@ export async function extractBundle(bundlePath: string, destDir: string): Promis
     backupPathsPath: present.has(BUNDLE_FILES.backupPaths) ? join(destDir, BUNDLE_FILES.backupPaths) : undefined,
     pluginConfigurationPath: present.has(BUNDLE_FILES.plugins) ? join(destDir, BUNDLE_FILES.plugins) : undefined,
     reconstructionPath: present.has(BUNDLE_FILES.reconstruction) ? join(destDir, BUNDLE_FILES.reconstruction) : undefined,
+    managedVolumesPath: present.has(BUNDLE_FILES.managedVolumes) ? join(destDir, BUNDLE_FILES.managedVolumes) : undefined,
   };
 }
 
@@ -721,7 +799,7 @@ function assertValidManifest(value: unknown): asserts value is WorkerExportManif
   if (!value.portMappings.every((mapping) => isRecord(mapping) && Number.isInteger(mapping.externalPort) && Number.isInteger(mapping.internalPort) && (mapping.type === 'localhost' || mapping.type === 'external') && (mapping.appType === undefined || isString(mapping.appType)) && (mapping.instanceId === undefined || isString(mapping.instanceId)))) {
     throw new Error('Invalid worker export: port mapping is invalid');
   }
-  if (!isRecord(contents) || !['rootfs', 'workspace', 'agents'].every((k) => typeof contents[k] === 'boolean') || (contents.backupPaths !== undefined && typeof contents.backupPaths !== 'boolean') || (contents.plugins !== undefined && typeof contents.plugins !== 'boolean') || (contents.reconstruction !== undefined && typeof contents.reconstruction !== 'boolean')) {
+  if (!isRecord(contents) || !['rootfs', 'workspace', 'agents'].every((k) => typeof contents[k] === 'boolean') || (contents.backupPaths !== undefined && typeof contents.backupPaths !== 'boolean') || (contents.plugins !== undefined && typeof contents.plugins !== 'boolean') || (contents.reconstruction !== undefined && typeof contents.reconstruction !== 'boolean') || (contents.managedVolumes !== undefined && typeof contents.managedVolumes !== 'boolean')) {
     throw new Error('Invalid worker export: manifest.contents is invalid');
   }
   if (value.backupPaths !== undefined && (!Array.isArray(value.backupPaths) || value.backupPaths.length > 32 || new Set(value.backupPaths.map((entry: any) => entry?.path)).size !== value.backupPaths.length || new Set(value.backupPaths.map((entry: any) => entry?.archive)).size !== value.backupPaths.length || value.backupPaths.some((entry) => !isRecord(entry) || !isString(entry.path) || !safeAbsoluteBackupPath(entry.path) || !isString(entry.archive) || !/^paths\/[0-9]{1,2}\.tar$/.test(entry.archive)))) {
@@ -729,7 +807,7 @@ function assertValidManifest(value: unknown): asserts value is WorkerExportManif
   }
   if (contents.backupPaths === true && !value.backupPaths?.length)
     throw new Error('Invalid worker export: manifest.backupPaths is missing');
-  if (value.localPersistence !== undefined && (!Array.isArray(value.localPersistence) || value.localPersistence.length > 32 ||
+  if (value.localPersistence !== undefined && (!Array.isArray(value.localPersistence) || value.localPersistence.length > MAX_LOCAL_PERSISTENCE_COVERAGE_ENTRIES ||
       value.localPersistence.some((v: any) => !isRecord(v) || !isString(v.path) || !safeAbsoluteBackupPath(v.path) || typeof v.included !== 'boolean')))
     throw new Error('Invalid worker export: local persistence coverage is invalid');
   if (value.missingSecrets !== undefined && (!Array.isArray(value.missingSecrets) || value.missingSecrets.length > 500 || value.missingSecrets.some((name) => typeof name !== 'string' || name.length < 1 || name.length > 255))) {

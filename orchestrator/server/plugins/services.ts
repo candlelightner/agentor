@@ -204,8 +204,16 @@ export default defineNitroPlugin(async (nitroApp) => {
   // containers with the same worker label after an interrupted recreation.
   const { useManagedVolumeManager } = await import("../utils/managed-volume-manager");
   const { useManagedVolumeSizingManager } = await import("../utils/managed-volume-sizing");
+  const { usePortableManagedVolumeRuntime } = await import("../utils/portable-managed-volume-runtime");
+  const portableManagedVolumes = usePortableManagedVolumeRuntime();
+  await portableManagedVolumes.init();
   await useManagedVolumeSizingManager().init();
-  if (!instanceRecoveryMode) await useManagedVolumeManager().recoverStartup();
+  if (!instanceRecoveryMode) {
+    await portableManagedVolumes.recoverStartup((journal) =>
+      containerManager.recoverPortableManagedVolumeProvisionalWorker(journal),
+    );
+    await useManagedVolumeManager().recoverStartup();
+  }
   await containerManager.sync();
   // Re-evaluate every persisted bind before ordinary startup reconciliation.
   // This both adopts exact approved legacy mounts and retries stopping any

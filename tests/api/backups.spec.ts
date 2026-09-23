@@ -176,6 +176,35 @@ test.describe
     }
   });
 
+  test("managed-volume backup options default false and reject non-boolean REST values", async () => {
+    const initial = await ownerCtx.get("/api/backup-settings");
+    expect(initial.status()).toBe(200);
+    expect(await initial.json()).toMatchObject({ includeManagedVolumes: false });
+
+    for (const [path, method, data] of [
+      ["/api/backup-settings", "put", { includeManagedVolumes: "true" }],
+      ["/api/backups/config", "put", { includeManagedVolumes: 1 }],
+      ["/api/backups", "post", { workspaceIds: [workspaceA], includeManagedVolumes: "false" }],
+      [`/api/workspaces/${workspaceA}/backup`, "post", { includeManagedVolumes: 0 }],
+    ] as const) {
+      const response = await ownerCtx[method](path, { data });
+      expect(response.status(), `${method.toUpperCase()} ${path}: ${await response.text()}`).toBe(400);
+    }
+
+    const enabled = await ownerCtx.put("/api/backup-settings", {
+      data: { includeManagedVolumes: true },
+    });
+    expect(enabled.status()).toBe(200);
+    expect(await enabled.json()).toMatchObject({ includeManagedVolumes: true });
+    expect(await (await ownerCtx.get("/api/backup-settings")).json()).toMatchObject({ includeManagedVolumes: true });
+
+    const reset = await ownerCtx.put("/api/backup-settings", {
+      data: { includeManagedVolumes: false },
+    });
+    expect(reset.status()).toBe(200);
+    expect(await reset.json()).toMatchObject({ includeManagedVolumes: false });
+  });
+
   test("manual selected-workspace backup is encrypted and integrity-verified before success", async () => {
     const created = await startBackup(ownerCtx, {
       workspaceIds: [workspaceA],

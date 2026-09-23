@@ -7,6 +7,11 @@ export default defineConfig({
   testMatch: [
     "api/plugin-core.spec.ts",
     "api/plugin-desktop-core.spec.ts",
+    "api/portable-managed-volume-format.spec.ts",
+    "api/portable-managed-volume-archive.spec.ts",
+    "api/portable-managed-volume-plan.spec.ts",
+    "api/portable-managed-volume-journal.spec.ts",
+    "api/portable-managed-volume-runtime.spec.ts",
     "api/admin-workspace-store-transactions.spec.ts",
     "api/container-store-quarantine.spec.ts",
     "api/instance-backup-*.spec.ts",

@@ -24,6 +24,15 @@ Every user-facing feature of the Agentor web dashboard, organized by category. T
 - Legacy backup-created volumes are adopted without copying or renaming. Backup
   deselection does not remove persistence. Missing populated volumes fail closed;
   duplicate adds are idempotent and busy live mounts require explicit retry/recreation.
+- Worker exports and backups expose a strict default-off attached-custom-volume
+  option across GUI, REST, jobs/settings, and management MCP. Detached volumes are
+  excluded and running capture is best-effort. Opted-in v6 import allocates fresh
+  destination identities at unchanged targets; restored self-service, live-mount,
+  and recreation policies remain false. Inner archives preserve safe relative and
+  target-confined absolute symlinks, backward hardlinks to earlier regular files,
+  and bounded per-file PAX `path`/`linkpath` metadata for long paths and links.
+  Global PAX/GNU extension records, unknown or authority-bearing metadata, special
+  files, path/link escapes, and normalized path/type collisions fail closed.
 
 ## Worker groups
 
@@ -987,7 +996,7 @@ See §20b for the bridge. The endpoint sets the worker's X11 CLIPBOARD selection
 - `GET /api/containers/:id/workspace` — download workspace .tar.gz
 - `POST /api/containers/:id/workspace` — upload files (multipart, path traversal protection)
 - `GET /api/containers/:id/metrics` — single worker's live resource metrics (zeroed snapshot when not running / not yet sampled). Ownership-checked (`requireContainerAccess`): 401 unauth, 403 cross-user, 404 unknown id.
-- `GET /api/containers/:id/export` — stream a worker export bundle (`.tar`). `?includeRootfs=` (default `true`) toggles the `docker export` filesystem snapshot. 401/403/404 as above; the worker must be running or stopped. See §28.
+- `GET /api/containers/:id/export` — stream a worker export bundle (`.tar`). `?includeRootfs=` and strict `?includeManagedVolumes=true|false` are independent default-false options. The latter includes eligible attached custom volumes only. 401/403/404 as above; the worker must be running or stopped. See §28.
 - `POST /api/containers/import` — restore a worker from an export bundle (raw `.tar` request body, `Content-Type: application/x-tar`). `?displayName=` overrides the restored label. Returns 201 + the new `ContainerInfo` (fresh UUID id). 400 on an invalid bundle, 401 unauth. See §28.
 - `GET /api/containers/:id/desktop/status` — desktop service status
 - `GET /api/containers/:id/editor/status` — editor service status
@@ -1205,7 +1214,8 @@ The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/ap
 #### 26.2.1 Durable exports and offline storage
 
 - Worker exports are owner-scoped asynchronous jobs with durable state, bounded concurrency, progress/bytes/phases, cancellation, expiry, restart recovery, streamed downloads, and partial cleanup.
-- Workspace-only is the default; root-filesystem capture is an explicit warned advanced mode. Current v3 bundles use parallel level-1 gzip for `rootfs.tar.gz`; imports also accept legacy v1 gzip bundles and transitional v2 raw `rootfs.tar` bundles. The prior long single-core compression timeout was historical, not a current behavior claim. All paths exclude credentials and secret values.
+- Workspace-only is the default; root-filesystem capture is an explicit warned advanced mode. Current default v5 bundles and managed-volume opt-in v6 bundles use parallel level-1 gzip for `rootfs.tar.gz`; imports also accept legacy v1 gzip bundles and transitional v2 raw `rootfs.tar` bundles. The prior long single-core compression timeout was historical, not a current behavior claim. All paths exclude credentials and secret values.
+- Attached custom-volume capture is an independent strict default-false option on export jobs, synchronous export, backup settings/manual requests, and management MCP. Default exports remain v5; opt-in emits v6 with explicit empty coverage when no eligible volume exists. Detached volumes are excluded, running capture is best-effort, and restores allocate fresh identities with all persistence policy flags false.
 - Storage inventory is independent of runtime and reports running, stopped, archived, deleted-tombstone, and orphan metadata with size/latest-backup where available. Directory and named-volume browsing is read-only, owner checked, traversal/symlink safe, and helper hardened.
 - Administrators additionally see practical disk free-space warnings, workspace/Docker/build-cache/staging totals, and only conservative cleanup controls for dangling images/cache, exited Agentor helpers, and aged Agentor staging directories. Referenced images and active artifacts are excluded.
 
@@ -1214,6 +1224,7 @@ The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/ap
 - Worker-local variables, masked secrets, and secret files follow orchestrator → user → environment → worker precedence. Secrets are encrypted at rest, delivered over exec stdin, and materialized in tmpfs without entering Docker Env, exports, clones, backups, logs, or API responses.
 - Backups support manual/all/selected exact-minute schedules, durable next-run state, multi-workspace encrypted bundles, retention deletion tombstones, progress, cancellation, same-ciphertext resumable retry, integrity verification, archived workspaces, rollback-clean new restores, and stopped-original staged restore. Each member contains `/workspace`, credential-filtered persistent agent data, non-secret worker/environment metadata and mappings, and missing-secret names; rootfs/images, DinD, secret/env values, OAuth credentials, and shared Kilo account data are excluded. A multi-workspace artifact can be restored as a validated exact workspace subset or, when no subset is requested, in full; old artifacts remain restorable. In-place restore is limited to one selected stopped artifact workspace, while selected new restores create only the selected workers. Durable and legacy synchronous restores share the bounded restore/backup admission queue, and concurrent retries of one failed job admit only one new attempt. Every queued or running restore owns an independent source-artifact pin against explicit or retention deletion; cancelling queued work removes it from admission and releases only its pin even if durable status persistence fails, including for an in-place restore that has not begun, while a running in-place commit remains non-cancellable. Provider-object deletion and resumable-upload abort markers survive failed/cancelled jobs and restarts, are retried during startup and scheduler ticks, and clear only after provider acknowledgement plus state persistence. Original restore commits are serialized with worker lifecycle changes, and account cleanup uses a bounded fail-closed restore drain before deleting artifacts or other owner state.
 - A backup may additionally include explicitly selected readable absolute POSIX paths from the worker, including paths outside `/workspace`. The path picker is owner-checked metadata browsing only; it accepts at most 32 normalized selections, removes duplicates and descendants of a selected parent, and keeps the portable workspace/agent defaults. Extra data is represented as named path archives, never made public by browsing.
+- Backup settings and manual jobs may explicitly include eligible attached custom volumes. This is distinct from selected file paths and local persistence policy; jobs and artifacts record the choice, legacy omissions normalize false, and restore never imports source Docker names or authority flags.
 - Backup cancellation is a durable absorbing terminal state: a stale admitted
   execution cannot overwrite it with `running`, publish a late artifact, or
   leave failure diagnostics observably behind the terminal job update.

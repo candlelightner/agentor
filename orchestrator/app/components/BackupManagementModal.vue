@@ -10,6 +10,7 @@ const api = useBackups(),
     workspaceIds: [] as string[],
     selectedPathsByWorkspace: {} as Record<string, string[]>,
     persistSelectedDirectories: false,
+    includeManagedVolumes: false,
     intervalMinutes: 1440,
     retentionCount: 7,
   });
@@ -104,6 +105,7 @@ function settingsPayload() {
     workspaceIds: workspaceIds(),
     selectedPathsByWorkspace: draft.selectedPathsByWorkspace,
     persistSelectedDirectories: draft.persistSelectedDirectories,
+    includeManagedVolumes: draft.includeManagedVolumes,
     nextRunAt: api.settings.value.nextRunAt,
   };
 }
@@ -114,6 +116,7 @@ function settingsChanged() {
     current.providerId !== next.providerId ||
     current.enabled !== next.enabled ||
     current.persistSelectedDirectories !== next.persistSelectedDirectories ||
+    current.includeManagedVolumes !== next.includeManagedVolumes ||
     current.selection !== next.selection ||
     current.intervalMinutes !== next.intervalMinutes ||
     current.retentionCount !== next.retentionCount ||
@@ -168,6 +171,7 @@ async function backup() {
       effective.workspaceIds,
       selectedPaths,
       effective.providerId,
+      effective.includeManagedVolumes,
     );
     emit("changed");
   });
@@ -683,6 +687,12 @@ watch(restoreTarget, (target) => {
               <UButton size="xs" variant="outline" @click="openPathPicker(id)">Choose paths</UButton>
             </div>
           </section>
+          <section class="rounded border p-3 space-y-2" data-testid="backup-managed-volume-settings">
+            <UCheckbox v-model="draft.includeManagedVolumes" label="Include attached custom volumes" data-testid="backup-managed-volumes" />
+            <p class="text-xs text-amber-700 dark:text-amber-300">
+              Only attached custom volumes are captured; detached volumes are excluded. Capture from a running worker is best-effort, and restored persistence self-service, live-attach, and recreation policies remain disabled.
+            </p>
+          </section>
           <div class="flex gap-2">
             <span v-if="settingsChanged()" class="self-center text-xs text-amber-600" role="status">Unsaved changes</span>
             <span v-else-if="savedNotice" class="self-center text-xs text-green-600" role="status">{{ savedNotice }}</span>
@@ -741,6 +751,7 @@ watch(restoreTarget, (target) => {
                 ><b>{{ j.status }}</b> · {{ j.phase }}</span
               ><span>{{ j.progress || 0 }}% · {{ fmt(j.bytesProcessed) }}</span>
             </div>
+            <p v-if="j.includeManagedVolumes" class="text-xs text-gray-500">Includes attached custom volumes</p>
             <progress class="w-full" max="100" :value="j.progress || 0" />
             <p v-if="j.consistency?.warning" class="text-amber-600 text-xs">
               {{ j.consistency.warning }}
@@ -790,6 +801,7 @@ watch(restoreTarget, (target) => {
               <p v-if="a.missingSecrets?.length" class="text-xs text-amber-600">
                 Secrets to reconfigure: {{ a.missingSecrets.join(", ") }}
               </p>
+              <p v-if="a.includeManagedVolumes" class="text-xs text-gray-500">Includes attached custom volumes</p>
               <p v-if="a.reconstruction?.length" class="text-xs text-gray-500">
                 Reconstruction: {{ a.reconstruction.map(item => item.image.kind === 'custom' ? `custom image ${item.image.definitionId || 'unknown'}${item.image.version ? ` v${item.image.version}` : ''}` : item.image.kind === 'unmanaged' ? 'unmanaged per-worker image' : item.image.kind).join('; ') }} · {{ a.reconstruction.reduce((count, item) => count + item.desiredPluginCount, 0) }} plugin installation{{ a.reconstruction.reduce((count, item) => count + item.desiredPluginCount, 0) === 1 ? '' : 's' }}
               </p>

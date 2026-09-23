@@ -8,6 +8,8 @@ export interface ExportJobRecord {
   userId: string;
   workerId: string;
   includeRootfs: boolean;
+  /** Explicit portable custom-volume capture. Legacy records normalize false. */
+  includeManagedVolumes: boolean;
   status: ExportJobStatus;
   phase: ExportJobPhase;
   progress: number;
@@ -32,7 +34,7 @@ export class ExportJobStore extends UserScopedJsonStore<string, ExportJobRecord>
   }
 
   async save(job: ExportJobRecord): Promise<void> {
-    await this.setItem(job.userId, job);
+    await this.setItem(job.userId, normalizeExportJob(job));
   }
 
   async remove(userId: string, id: string): Promise<boolean> {
@@ -48,6 +50,19 @@ export class ExportJobStore extends UserScopedJsonStore<string, ExportJobRecord>
   }
 
   findById(id: string): ExportJobRecord | undefined {
-    return this.findWithOwner((job) => job.id === id)?.item;
+    const job = this.findWithOwner((item) => item.id === id)?.item;
+    return job ? normalizeExportJob(job) : undefined;
   }
+
+  override list(): ExportJobRecord[] {
+    return super.list().map(normalizeExportJob);
+  }
+
+  override listForUser(userId: string): ExportJobRecord[] {
+    return super.listForUser(userId).map(normalizeExportJob);
+  }
+}
+
+function normalizeExportJob(job: ExportJobRecord): ExportJobRecord {
+  return { ...job, includeManagedVolumes: job.includeManagedVolumes === true };
 }

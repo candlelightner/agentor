@@ -215,7 +215,7 @@ test("stale-helper cleanup times out each helper independently and a retry remai
 
   const releaseActive = registerOperationHelper("active-operation");
   const first = await cleanupStaleDockerHelpers(docker as any, 200);
-  expect(listCalls).toBe(3);
+  expect(listCalls).toBe(4);
   expect(first).toEqual({
     attempted: 3,
     removed: 2,

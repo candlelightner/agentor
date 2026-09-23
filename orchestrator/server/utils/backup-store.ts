@@ -122,7 +122,9 @@ function emptyUserBackupData(): UserBackupData {
  * hide otherwise recoverable configuration and artifacts. */
 function normalizeStoredUserBackupData(userId: string, value: any): UserBackupData | undefined {
   if (!value || value.schemaVersion !== 1) return;
-  const config = validStoredConfig(userId, value.config) ? value.config as BackupConfig : undefined;
+  const config = validStoredConfig(userId, value.config)
+    ? { ...value.config, includeManagedVolumes: value.config.includeManagedVolumes === true } as BackupConfig
+    : undefined;
   const jobs = Array.isArray(value.jobs)
     ? value.jobs.filter((job: any): job is BackupJob =>
         validOwnedRecord(userId, job) && validProvider(job.provider) &&
@@ -132,6 +134,7 @@ function normalizeStoredUserBackupData(userId: string, value: any): UserBackupDa
         (job.pendingProviderUploadId === undefined || validOpaqueProviderId(job.pendingProviderUploadId)) &&
         validOptionalPathIdArray(job.workspaceIds) && validOptionalPathIdArray(job.artifactWorkspaceIds) &&
         validOptionalPathIdArray(job.selectedWorkspaceIds) && validJobAdditions(job))
+        .map((job: BackupJob) => ({ ...job, includeManagedVolumes: job.includeManagedVolumes === true }))
     : [];
   const artifacts = Array.isArray(value.artifacts)
     ? value.artifacts.filter((artifact: any): artifact is BackupArtifact =>
@@ -141,6 +144,7 @@ function normalizeStoredUserBackupData(userId: string, value: any): UserBackupDa
         validPathId(artifact.id) &&
         validProviderObjectId(artifact.provider, artifact.providerObjectId) &&
         validArtifactAdditions(artifact))
+        .map((artifact: BackupArtifact) => ({ ...artifact, includeManagedVolumes: artifact.includeManagedVolumes === true }))
     : [];
   const remoteBackups = Array.isArray(value.remoteBackups)
     ? value.remoteBackups.filter((record: any): record is RemoteBackupRecord => validRemoteRecord(userId, record))
@@ -185,6 +189,7 @@ function validRemoteDescriptor(value: any): boolean {
     (value.incomplete === undefined || typeof value.incomplete === 'boolean');
 }
 function validJobAdditions(value: any): boolean {
+  if (value.includeManagedVolumes !== undefined && typeof value.includeManagedVolumes !== 'boolean') return false;
   if (value.operation !== undefined && !['backup', 'restore', 'discovery', 'adoption', 'dependency-resolution'].includes(value.operation)) return false;
   if (value.requestId !== undefined && !validOpaqueProviderId(value.requestId)) return false;
   if (value.requestFingerprint !== undefined && !/^[a-f0-9]{64}$/.test(value.requestFingerprint)) return false;
@@ -215,6 +220,7 @@ function validImageResolutions(value: unknown): boolean {
   });
 }
 function validArtifactAdditions(value: any): boolean {
+  if (value.includeManagedVolumes !== undefined && typeof value.includeManagedVolumes !== 'boolean') return false;
   if (value.formatVersion !== undefined && (!Number.isInteger(value.formatVersion) || value.formatVersion < 1 || value.formatVersion > 100)) return false;
   if (value.keyFingerprint !== undefined && !/^sha256:[a-f0-9]{64}$/.test(value.keyFingerprint)) return false;
   if (value.sourceInstallationId !== undefined && !validBoundedText(value.sourceInstallationId, 200)) return false;
@@ -246,7 +252,9 @@ function validOptionalPathIdArray(value: unknown): boolean {
 
 function validStoredConfig(userId: string, value: any): boolean {
   return value && value.schemaVersion === 1 && value.userId === userId &&
-    validProvider(value.provider) && validOptionalPathIdArray(value.selectedWorkspaceIds) && validPathSelections(value.selectedPathsByWorkspace);
+    validProvider(value.provider) &&
+    (value.includeManagedVolumes === undefined || typeof value.includeManagedVolumes === 'boolean') &&
+    validOptionalPathIdArray(value.selectedWorkspaceIds) && validPathSelections(value.selectedPathsByWorkspace);
 }
 
 function validPathSelections(value: unknown): boolean {

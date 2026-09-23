@@ -63,8 +63,13 @@ After adoption, changing backup coverage does not remove local persistence, and
 an old backup selection cannot reattach or overwrite a detached volume.
 
 Local persistence is not a backup. Inventory must distinguish backed-up paths
-from local-only data. Instance recovery and portable export must explicitly
-describe coverage rather than silently including or excluding custom volumes.
+from local-only data. Instance recovery and portable export explicitly describe
+coverage rather than silently including or excluding custom volumes. Worker
+export and backup settings expose a strict `includeManagedVolumes` boolean that
+defaults false. Opt-in captures eligible attached custom volumes only; detached
+volumes are excluded, and capture from a running worker is best-effort. Restore
+allocates fresh local volume identities at the same target and keeps self-service,
+live-mount, and recreation policies false.
 
 ## Operator workflow
 
@@ -132,13 +137,15 @@ The setting `persistSelectedDirectories` separates backup selection from creatio
 of new persistence. An omitted value preserves legacy behavior; new GUI settings
 default it off. Disabling it does not detach already adopted volumes.
 
-Portable rootfs exports do not include custom mounted data automatically. Optional
-`localPersistence` manifest metadata records each path and whether an explicit
-backup included its data; it never authorizes mounts during import. Explicit path
-backups restore files into a new worker; configure persistence separately there.
-Archived portable backups support standard workspace/agent-data payloads, not
-arbitrary selected paths. Whole-instance snapshots inventory managed custom
-volumes, including detached data, and reject concurrent storage operations.
+Portable rootfs exports do not include custom mounted data automatically.
+Default v5 exports retain optional `localPersistence` coverage metadata, which
+never authorizes mounts during import. An explicit custom-volume opt-in emits a
+v6 bundle with a strict bounded payload for eligible attached volumes. Imported
+Docker names, IDs, host paths, and policy fields are never trusted; fresh
+destination identities are allocated only after target and image-ancestor
+validation. Explicit path backups remain distinct from mounted-volume capture.
+Whole-instance snapshots inventory managed custom volumes, including detached
+data, and reject concurrent storage operations.
 
 This requires an orchestrator-image update, not a worker-image rebuild. Live
 mounting needs Linux amd64/arm64, namespace access, and modern mount syscalls.

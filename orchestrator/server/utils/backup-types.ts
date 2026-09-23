@@ -74,6 +74,8 @@ export interface BackupConfig {
   selectedPathsByWorkspace?: Record<string, string[]>;
   /** Legacy missing value preserves implicit persistence; new UI sends false. */
   persistSelectedDirectories?: boolean;
+  /** Explicit portable custom-volume capture; legacy omission is false. */
+  includeManagedVolumes: boolean;
   lastAttemptAt?: string; lastSuccessAt?: string; lastError?: string; consecutiveFailures?: number;
   google?: { clientId?: string; redirectUri?: string; token?: unknown; oauthPending?: { stateHash: string; expiresAt: number } };
 }
@@ -103,6 +105,8 @@ export interface BackupJob {
   displayName?: string;
   missingSecrets?: Array<{name:string;type:string}>;
   selectedPathsByWorkspace?: Record<string, string[]>;
+  /** Explicit portable custom-volume capture; legacy omission is false. */
+  includeManagedVolumes: boolean;
   /** Additive operation identity for persisted discovery/adoption/dependency
    * jobs. Existing backup and restore jobs intentionally remain valid. */
   operation?: 'backup'|'restore'|'discovery'|'adoption'|'dependency-resolution';
@@ -127,6 +131,8 @@ export interface BackupArtifact {
   deletionPending?: boolean;
   deletionErrorAt?: string;
   selectedPathsByWorkspace?: Record<string, string[]>;
+  /** Whether this authenticated artifact captured portable custom volumes. */
+  includeManagedVolumes: boolean;
   formatVersion?: number;
   keyFingerprint?: string;
   sourceInstallationId?: string;

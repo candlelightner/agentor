@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { lstat, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, lstat, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BackupStore } from "../../orchestrator/server/utils/backup-store";
@@ -86,4 +86,42 @@ test("remote backup records deduplicate by provider object id and never accept a
     expect((store.get("owner") as any).remoteBackups).toHaveLength(1);
     await expect(store.upsertRemoteBackup("owner", { ...first, userId: "other" })).rejects.toMatchObject({ statusCode: 400 });
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("legacy backup settings, jobs, and artifacts normalize managed-volume capture to false", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agentor-backup-managed-option-"));
+  const ownerId = "owner-portable";
+  const ownerDir = join(root, "users", ownerId);
+  const stamp = "2026-01-01T00:00:00.000Z";
+  const source = {
+    schemaVersion: 1,
+    config: { schemaVersion: 1, userId: ownerId, provider: "local", enabled: false, intervalMinutes: 60, retentionCount: 2, selectedWorkspaceIds: null, createdAt: stamp, updatedAt: stamp },
+    jobs: [
+      { schemaVersion: 1, id: "job-legacy", userId: ownerId, workspaceId: "worker-1", provider: "local", status: "succeeded", phase: "complete", progress: 100, bytesProcessed: 1, createdAt: stamp, updatedAt: stamp, attempt: 1 },
+      { schemaVersion: 1, id: "job-opted-in", userId: ownerId, workspaceId: "worker-1", provider: "local", status: "succeeded", phase: "complete", progress: 100, bytesProcessed: 1, createdAt: stamp, updatedAt: stamp, attempt: 1, includeManagedVolumes: true },
+      { schemaVersion: 1, id: "job-invalid", userId: ownerId, workspaceId: "worker-1", provider: "local", status: "failed", phase: "failed", progress: 0, bytesProcessed: 0, createdAt: stamp, updatedAt: stamp, attempt: 1, includeManagedVolumes: "true" },
+    ],
+    artifacts: [
+      { schemaVersion: 1, id: "artifact-legacy", userId: ownerId, workspaceId: "worker-1", provider: "local", providerObjectId: "object-legacy", createdAt: stamp, size: 1, sha256: "a".repeat(64), missingSecrets: [] },
+      { schemaVersion: 1, id: "artifact-opted-in", userId: ownerId, workspaceId: "worker-1", provider: "local", providerObjectId: "object-opted-in", createdAt: stamp, size: 1, sha256: "b".repeat(64), missingSecrets: [], includeManagedVolumes: true },
+      { schemaVersion: 1, id: "artifact-invalid", userId: ownerId, workspaceId: "worker-1", provider: "local", providerObjectId: "object-invalid", createdAt: stamp, size: 1, sha256: "c".repeat(64), missingSecrets: [], includeManagedVolumes: 1 },
+    ],
+    remoteBackups: [],
+  };
+  try {
+    await mkdir(ownerDir, { recursive: true });
+    await writeFile(join(ownerDir, "backups.json"), JSON.stringify(source));
+    const store = new BackupStore(root);
+    await store.init();
+    const loaded = store.get(ownerId);
+    expect(loaded.config?.includeManagedVolumes).toBe(false);
+    expect(loaded.jobs.map((job) => [job.id, job.includeManagedVolumes])).toEqual([
+      ["job-legacy", false], ["job-opted-in", true],
+    ]);
+    expect(loaded.artifacts.map((artifact) => [artifact.id, artifact.includeManagedVolumes])).toEqual([
+      ["artifact-legacy", false], ["artifact-opted-in", true],
+    ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

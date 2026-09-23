@@ -22,6 +22,7 @@ export interface BackupSettings {
   workspaceIds: string[];
   selectedPathsByWorkspace: Record<string, string[]>;
   persistSelectedDirectories?: boolean;
+  includeManagedVolumes: boolean;
   intervalMinutes: number;
   retentionCount: number;
   nextRunAt: string | null;
@@ -32,6 +33,7 @@ export interface BackupSettings {
 }
 export interface BackupJob {
   id: string;
+  includeManagedVolumes: boolean;
   status: BackupJobStatus;
   phase: string;
   progress: number;
@@ -56,6 +58,7 @@ export interface BackupJob {
 }
 export interface BackupArtifact {
   id: string;
+  includeManagedVolumes: boolean;
   provider: string;
   workspaceIds?: string[];
   workspaceId?: string;
@@ -132,6 +135,7 @@ export function useBackups() {
     selection: "all",
   workspaceIds: [],
     selectedPathsByWorkspace: {},
+    includeManagedVolumes: false,
     intervalMinutes: 1440,
     retentionCount: 7,
     nextRunAt: null,
@@ -158,10 +162,19 @@ export function useBackups() {
         $fetch<BackupProviderStatus[]>("/api/backup-providers"),
         $fetch<BackupSettings>("/api/backup-settings"),
       ]);
-      artifacts.value = data.backups;
-      jobs.value = data.jobs;
+      artifacts.value = data.backups.map((artifact) => ({
+        ...artifact,
+        includeManagedVolumes: artifact.includeManagedVolumes === true,
+      }));
+      jobs.value = data.jobs.map((job) => ({
+        ...job,
+        includeManagedVolumes: job.includeManagedVolumes === true,
+      }));
       providers.value = providerData;
-      settings.value = settingsData;
+      settings.value = {
+        ...settingsData,
+        includeManagedVolumes: settingsData.includeManagedVolumes === true,
+      };
       // These additive endpoints are deliberately best-effort during rolling
       // upgrades, so an older server still renders ordinary backup management.
       const [keyResult, discoveryResult] = await Promise.allSettled([
@@ -209,10 +222,11 @@ export function useBackups() {
     workspaceIds = settings.value.workspaceIds,
     selectedPathsByWorkspace = settings.value.selectedPathsByWorkspace,
     providerId = settings.value.providerId,
+    includeManagedVolumes = settings.value.includeManagedVolumes,
   ) {
     const job = await $fetch<BackupJob>("/api/backups", {
       method: "POST",
-      body: { selection, workspaceIds, providerId, selectedPathsByWorkspace },
+      body: { selection, workspaceIds, providerId, selectedPathsByWorkspace, includeManagedVolumes },
     });
     jobs.value.unshift(job);
     schedule();
@@ -292,7 +306,7 @@ export function useBackups() {
   }
   async function scanProvider(provider: string, requestId?: string) {
     const result = await $fetch<{ jobId: string; status: BackupJobStatus }>("/api/backups/remote", { method: "POST", body: { provider, ...(requestId ? { requestId } : {}) } });
-    const job: BackupJob = { id: result.jobId, status: result.status, phase: "queued", progress: 0 };
+    const job: BackupJob = { id: result.jobId, includeManagedVolumes: false, status: result.status, phase: "queued", progress: 0 };
     jobs.value.unshift(job); schedule(); return job;
   }
   async function inspectDiscovered(id: string) {
@@ -300,7 +314,7 @@ export function useBackups() {
   }
   async function adoptDiscovered(id: string, requestId?: string) {
     const result = await $fetch<{ jobId: string; status: BackupJobStatus }>(`/api/backups/remote/${encodeURIComponent(id)}/adopt`, { method: "POST", body: requestId ? { requestId } : {} });
-    const job: BackupJob = { id: result.jobId, status: result.status, phase: "queued", progress: 0 };
+    const job: BackupJob = { id: result.jobId, includeManagedVolumes: false, status: result.status, phase: "queued", progress: 0 };
     jobs.value.unshift(job); schedule(); return job;
   }
   async function recoverImageDefinition(
@@ -317,6 +331,7 @@ export function useBackups() {
     );
     const job: BackupJob = {
       id: result.jobId,
+      includeManagedVolumes: false,
       status: result.status,
       phase: "queued",
       progress: 0,

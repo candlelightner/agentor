@@ -67,6 +67,7 @@ export class ExportJobManager {
     dataDir: string,
     private readonly exportWorker: (workerId: string, opts: {
       includeRootfs: boolean;
+      includeManagedVolumes: boolean;
       signal?: AbortSignal;
       onProgress?: (update: { phase: string; progress: number; bytesProcessed: number }) => void | Promise<void>;
     }) => Promise<{ stream: Readable; filename: string }>,
@@ -130,7 +131,12 @@ export class ExportJobManager {
     this.cleanupTimer.unref?.();
   }
 
-  async create(userId: string, workerId: string, includeRootfs = false): Promise<PublicExportJob> {
+  async create(
+    userId: string,
+    workerId: string,
+    includeRootfs = false,
+    includeManagedVolumes = false,
+  ): Promise<PublicExportJob> {
     await this.init();
     return this.withOwner(userId, async () => {
       this.assertOwnerOpen(userId);
@@ -150,7 +156,7 @@ export class ExportJobManager {
       this.assertOwnerOpen(userId);
       const stamp = now();
       const job: ExportJobRecord = {
-        id: randomUUID(), userId, workerId, includeRootfs,
+        id: randomUUID(), userId, workerId, includeRootfs, includeManagedVolumes,
         status: 'queued', phase: 'queued', progress: 0, bytesProcessed: 0,
         createdAt: stamp, updatedAt: stamp, missingSecrets,
       };
@@ -287,6 +293,7 @@ export class ExportJobManager {
       if (this.store.findById(id)?.status === 'cancelled' || controller.signal.aborted) return;
       const result = await this.exportWorker(job.workerId, {
         includeRootfs: job.includeRootfs,
+        includeManagedVolumes: job.includeManagedVolumes,
         signal: controller.signal,
         onProgress: async (update) => {
           await this.transition(id, (current) => {

@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **2085 tests** across 208 test files (1457 API across 144 files + 628 UI across 64 files), as enumerated with the Playwright JSON list reporter
+- **2143 tests** across 215 test files (1513 API across 150 files + 630 UI across 65 files), as enumerated with the Playwright JSON list reporter
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -87,7 +87,7 @@ npm run test:docker -- -g "should create worker"
 npm run test:docker:clean
 ```
 
-The runner uses `docker.localhost` and `docker2.localhost` as base domains with self-signed wildcard certs, dashboard at `https://dash.docker.localhost`. Traefik publishes 80/443 inside the runner's own network namespace, and `*.localhost` resolves to `127.0.0.1` so playwright reaches it without any `/etc/hosts` setup. Before starting the stack, the runner requires a private cgroup-v2 root with delegated CPU, memory, and PID controllers and smoke-tests the exact constrained, read-only volume-size helper launch; unsupported nested Docker environments fail closed. The CI smoke selection includes both managed-volume REST and management-MCP coverage plus the managed-volume UI. The runner's `agentor-test-runner-docker` volume persists between runs so the inner image builds are cached — first run is slow, subsequent runs start fast. Reports and `.auth` cookies are written back to `tests/` on the host because the project source is bind-mounted into the runner. Works under triple-nested DinD (host → user's worker → test-runner → inner orchestrator → inner workers) when each level provides the required private cgroup delegation and overlay2 volume storage.
+The runner uses `docker.localhost` and `docker2.localhost` as base domains with self-signed wildcard certs, dashboard at `https://dash.docker.localhost`. Traefik publishes 80/443 inside the runner's own network namespace, and `*.localhost` resolves to `127.0.0.1` so playwright reaches it without any `/etc/hosts` setup. Before starting the stack, the runner requires a private cgroup-v2 root with delegated CPU, memory, and PID controllers and smoke-tests the exact constrained, read-only volume-size helper launch; unsupported nested Docker environments fail closed. The CI smoke selection includes managed-volume REST, management-MCP, and UI coverage plus the dedicated portable managed-volume API and UI acceptance specs. The runner's `agentor-test-runner-docker` volume persists between runs so the inner image builds are cached — first run is slow, subsequent runs start fast. Reports and `.auth` cookies are written back to `tests/` on the host because the project source is bind-mounted into the runner. Works under triple-nested DinD (host → user's worker → test-runner → inner orchestrator → inner workers) when each level provides the required private cgroup delegation and overlay2 volume storage.
 
 ## Configuration
 
@@ -108,13 +108,13 @@ tests/
     worker-lifecycle.ts    # Container create/cleanup utilities
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
-    api/                     # API endpoint tests (1457 tests across 144 files)
-  ui/                      # UI interaction tests (628 tests across 64 files)
+    api/                     # API endpoint tests (1513 tests across 150 files)
+  ui/                      # UI interaction tests (630 tests across 65 files)
 ```
 
 ## Test Categories
 
-### API Tests (1457 tests, 144 files)
+### API Tests (1513 tests, 150 files)
 
 | File | Tests | Coverage |
 | --- | ---: | --- |
@@ -130,6 +130,12 @@ tests/
 | `worker-self-mcp-handler.spec.ts` | 3 | Worker-self MCP initialization, narrow plugin-tool discovery, source-derived ordinary/admin runtime identity, role-scoped self access, and sanitized structured tool errors. |
 | `plugin-ui-proxy.spec.ts` | 4 | Private plugin UI proxy rejects unauthenticated, cross-owner, disabled, unready, unknown-action, and WebSocket relay requests before forwarding. |
 | `worker-export-format.spec.ts` | 8 | Worker export format/version compatibility, inner archive bounds, ownership preservation, and explicit-path archive rejection for traversal, links, devices, and FIFOs before restore. |
+| `portable-managed-volume-format.spec.ts` | 4 | Strict v6 manifest/member agreement and bounded canonical entries, with every portable field forbidden in legacy formats and coverage metadata never interpreted as mounts. |
+| `portable-managed-volume-archive.spec.ts` | 12 | Exact nested payload packing plus GNU/Docker tar interoperability; mode, ownership, safe-link, long-path PAX, framing, count, raw/expanded/compressed-size, traversal, collision, special-file, cancellation, and cleanup boundaries. |
+| `portable-managed-volume-plan.spec.ts` | 6 | Verified attached-volume capture planning, explicit exclusions, fresh deterministic destination identities, and root/exact/ancestor/descendant conflict rejection across every protected destination class. |
+| `portable-managed-volume-journal.spec.ts` | 7 | Strict durable import intents and transitions, exact ownership labels, positive worker confirmation, ambiguous outcomes, retryable cleanup debt, and unreachable-state rejection. |
+| `portable-managed-volume-runtime.spec.ts` | 17 | Snapshot admission, empty-v6 accounting, bounded capture, late Docker settlement, label-safe helper/volume/worker collision handling, restart cleanup, legacy v5 stability, and importable bundle-output ceilings. |
+| `portable-managed-volumes.spec.ts` | 5 | Isolated real-Docker running/stopped export and archived-backup round trips, preserved data/metadata/safe links, fresh restore authority, default v5 compatibility, exact v6 agreement, and pre-mutation authorization failures. |
 | `group-admin-management-mcp.spec.ts` | 16 | Group-bound MCP discovery, recursive authorization and subtree lifecycle batches, workspace, image, plugin, startup-script, environment, fail-fast denial behavior, and deletion cleanup that leaves an emptied child group removable. |
 | `managed-networks.spec.ts` | 1 | Managed bridge-network creation, topology, validation, and deletion. |
 | `management-configuration-catalog-domain.spec.ts` | 2 | Configuration-catalog MCP schemas, scoped discovery, and structured results. |
@@ -266,7 +272,7 @@ tests/
 The container edge-case coverage includes repeated-stop idempotency: stopping an
 already-stopped worker returns success and leaves its persisted status stopped.
 
-### UI Tests (628 tests, 64 files)
+### UI Tests (630 tests, 65 files)
 
 | File | Tests | Coverage |
 | --- | ---: | --- |
@@ -277,6 +283,7 @@ already-stopped worker returns success and leaves its persisted status stopped.
 | `image-catalog-real.spec.ts` | 1 | Real controlled image build, test-worker verification, and promotion. |
 | `managed-networks.spec.ts` | 1 | Managed-network dashboard workflow. |
 | `managed-volumes.spec.ts` | 2 | Persistent-path controls show the live-mount warning, independent self-service controls, and managed-volume inventory with explicit on-demand known/stale/unknown allocated/logical sizing and safe polling/cancellation behavior. |
+| `portable-managed-volumes.spec.ts` | 2 | Worker-export and backup-settings controls default managed-volume portability off, show exact detached/live-capture warnings, and send or persist explicit opt-in. |
 | `worker-configuration-real.spec.ts` | 1 | Real worker-configuration persistence and execution. |
 | `worker-groups.spec.ts` | 5 | Worker-group dashboard CRUD, inherited worker-self API access selection, grouping, recursive lifecycle controls, nested archived-group rendering, and administration controls. |
 | `workspace-storage-real.spec.ts` | 1 | Real workspace storage browsing and operations. |

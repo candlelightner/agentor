@@ -15,7 +15,7 @@
     "test:docker": "docker compose -f ../docker-compose.tests.yml run --rm test-runner",
     "test:docker:api": "docker compose -f ../docker-compose.tests.yml run --rm test-runner --project=api",
     "test:docker:ui": "docker compose -f ../docker-compose.tests.yml run --rm test-runner --project=ui",
-    "test:docker:ci": "docker compose -f ../docker-compose.tests.yml run --rm test-runner api/health.spec.ts api/managed-volume-helper.spec.ts api/managed-volumes.spec.ts api/managed-volume-mcp.spec.ts ui/login.spec.ts ui/managed-volumes.spec.ts",
+    "test:docker:ci": "docker compose -f ../docker-compose.tests.yml run --rm test-runner api/health.spec.ts api/managed-volume-helper.spec.ts api/managed-volumes.spec.ts api/managed-volume-mcp.spec.ts api/portable-managed-volumes.spec.ts ui/login.spec.ts ui/managed-volumes.spec.ts ui/portable-managed-volumes.spec.ts",
     "test:docker:clean": "docker compose -f ../docker-compose.tests.yml down -v --remove-orphans && docker volume rm agentor-test-runner-docker 2>/dev/null || true"
   },
   "devDependencies": {

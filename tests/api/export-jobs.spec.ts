@@ -5,7 +5,7 @@ import { ApiClient } from '../helpers/api-client';
 import { createWorker, cleanupWorker, waitForWorkerRunning } from '../helpers/worker-lifecycle';
 import { createTestUser, deleteTestUser } from '../helpers/test-users';
 import { TerminalWsClient } from '../helpers/terminal-ws';
-import { mkdtemp, rm as removePath } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm as removePath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
@@ -30,6 +30,58 @@ async function unitExportManager(
   await manager.init();
   return { directory, manager, errors };
 }
+
+test('export jobs persist and pass through the strict default-false managed-volume option', async () => {
+  const calls: Array<{ workerId: string; includeRootfs: boolean; includeManagedVolumes: boolean }> = [];
+  const fixture = await unitExportManager(async (workerId, options) => {
+    calls.push({ workerId, includeRootfs: options.includeRootfs, includeManagedVolumes: options.includeManagedVolumes });
+    return { stream: Readable.from([Buffer.from('export')]), filename: 'worker.tar' };
+  });
+  try {
+    const defaultJob = await fixture.manager.create('owner', 'worker-default');
+    expect(defaultJob.includeManagedVolumes).toBe(false);
+    await expect.poll(async () => (await fixture.manager.get(defaultJob.id))?.status).toBe('succeeded');
+
+    const optedInJob = await fixture.manager.create('owner', 'worker-opted-in', false, true);
+    expect(optedInJob.includeManagedVolumes).toBe(true);
+    await expect.poll(async () => (await fixture.manager.get(optedInJob.id))?.status).toBe('succeeded');
+
+    expect(calls).toEqual([
+      { workerId: 'worker-default', includeRootfs: false, includeManagedVolumes: false },
+      { workerId: 'worker-opted-in', includeRootfs: false, includeManagedVolumes: true },
+    ]);
+    const persisted = JSON.parse(await readFile(join(fixture.directory, 'users', 'owner', 'export-jobs.json'), 'utf8'));
+    expect(persisted.map((job: any) => ({ workerId: job.workerId, includeManagedVolumes: job.includeManagedVolumes }))).toEqual([
+      { workerId: 'worker-default', includeManagedVolumes: false },
+      { workerId: 'worker-opted-in', includeManagedVolumes: true },
+    ]);
+  } finally {
+    await fixture.manager.removeForUser('owner').catch(() => {});
+    fixture.manager.stop();
+    await removePath(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('legacy export jobs with no managed-volume option normalize to false', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agentor-export-legacy-option-'));
+  const ownerDir = join(directory, 'users', 'owner');
+  const legacy = {
+    id: 'legacy-job', userId: 'owner', workerId: 'worker', includeRootfs: false,
+    status: 'failed', phase: 'failed', progress: 0, bytesProcessed: 0,
+    createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  try {
+    await mkdir(ownerDir, { recursive: true });
+    await writeFile(join(ownerDir, 'export-jobs.json'), JSON.stringify([legacy]));
+    const store = new ExportJobStore(directory);
+    await store.init();
+    expect(store.findById('legacy-job')?.includeManagedVolumes).toBe(false);
+    expect(store.listForUser('owner')[0]?.includeManagedVolumes).toBe(false);
+    expect(store.list()[0]?.includeManagedVolumes).toBe(false);
+  } finally {
+    await removePath(directory, { recursive: true, force: true });
+  }
+});
 
 test('export manager atomically rejects duplicate same-worker admission', async () => {
   const fixture = await unitExportManager();
@@ -259,11 +311,18 @@ test.describe.serial('Asynchronous worker exports', () => {
 
   test('creation returns 202 and defaults to workspace-only', async ({ request }) => {
     const api = new ApiClient(request);
+    const invalid = await request.post(`/api/containers/${workerId}/export-jobs`, {
+      data: { includeManagedVolumes: 'true' },
+    });
+    expect(invalid.status()).toBe(400);
+    const invalidDirect = await request.get(`/api/containers/${workerId}/export?includeManagedVolumes=1`);
+    expect(invalidDirect.status()).toBe(400);
     const created = await api.createExportJob(workerId);
     expect(created.status).toBe(202);
     expect(created.body).toMatchObject({
       workerId,
       includeRootfs: false,
+      includeManagedVolumes: false,
       status: expect.stringMatching(/^(queued|running)$/),
       progress: expect.any(Number),
       bytesProcessed: expect.any(Number),

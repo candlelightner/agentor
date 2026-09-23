@@ -65,6 +65,18 @@ test('image and backup MCP domain exposes bounded tool surface and safe hints', 
     required: ['ownerId'],
     properties: { providerId: { enum: ['local', 'fake', 'google-drive'] }, requestId: { minLength: 1 } },
   });
+  expect(tools.find(tool => tool.name === 'backups.create')?.inputSchema).toMatchObject({
+    properties: {
+      includeManagedVolumes: {
+        type: 'boolean',
+        default: false,
+        description: expect.stringContaining('Detached volumes are excluded'),
+      },
+    },
+  });
+  expect((tools.find(tool => tool.name === 'backups.settings')?.inputSchema.properties as any).settings).toMatchObject({
+    properties: { includeManagedVolumes: { type: 'boolean', default: false } },
+  });
   expect(tools.find(tool => tool.name === 'instance-backups.create')?.inputSchema).toMatchObject({
     required: ['ownerId'],
     additionalProperties: false,
@@ -128,6 +140,16 @@ test('image and backup MCP domain exposes bounded tool surface and safe hints', 
       ghcrByDigest: { type: 'object' },
     },
   });
+});
+
+test('backup MCP uses strict booleans for portable custom-volume capture', () => {
+  const source = readFileSync(new URL('../../orchestrator/server/utils/management-image-backup-domain.ts', import.meta.url), 'utf8');
+  const managementStore = readFileSync(new URL('../../orchestrator/server/utils/management-mcp-store.ts', import.meta.url), 'utf8');
+  expect(source).toContain('optionalBoolean(a.includeManagedVolumes, "includeManagedVolumes")');
+  expect(source).toContain('optionalBoolean(settings.includeManagedVolumes, "includeManagedVolumes")');
+  expect(source).toMatch(/typeof value !== ["']boolean["']/);
+  expect(managementStore).toContain('optionalBoolean(args.includeManagedVolumes, "includeManagedVolumes")');
+  expect(managementStore).toMatch(/typeof value !== ["']boolean["']/);
 });
 
 test('backup workspace resolution permits archived owner records', () => {
