@@ -38,6 +38,23 @@ test.describe.serial('Worker Settings Modal', () => {
     await openModal(page);
   });
 
+  test('runtime migration remains disabled without capacity admission even after downtime acknowledgement', async ({ page }) => {
+    let submissions = 0;
+    await page.route(`**/api/admin/workers/${workerId}/migration-preflight*`, route => route.fulfill({ json: {
+      targetProfile: 'kata-qemu', capacityAdmission: 'not-yet-implemented', mounts: [],
+    } }));
+    await page.route(`**/api/admin/workers/${workerId}/migration`, route => {
+      if (route.request().method() === 'POST') submissions++;
+      return route.fulfill({ json: null });
+    });
+    const dialog = await openModal(page);
+    await dialog.getByRole('button', { name: 'Check runtime migration', exact: true }).click();
+    await expect(dialog).toContainText('Migration is unavailable until trusted disk-capacity admission is implemented');
+    await dialog.getByRole('checkbox', { name: 'I confirm worker downtime and snapshot creation.' }).check();
+    await expect(dialog.getByRole('button', { name: 'Migrate runtime', exact: true })).toBeDisabled();
+    expect(submissions).toBe(0);
+  });
+
   test('opens when clicking the Settings pencil', async ({ page }) => {
     await goToDashboard(page);
     const card = page.locator('.rounded-lg').filter({ hasText: displayName }).first();

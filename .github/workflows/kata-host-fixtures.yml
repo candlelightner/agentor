@@ -9,6 +9,8 @@ on:
       - scripts/validate-kata-archive.py
       - tests/kata-host-fixtures.sh
       - tests/kata-archive-fixtures.py
+      - scripts/test-kata-worker.sh
+      - tests/kata-worker-fixtures.py
       - .github/workflows/kata-host-fixtures.yml
   push:
     branches: [main]
@@ -19,6 +21,8 @@ on:
       - scripts/validate-kata-archive.py
       - tests/kata-host-fixtures.sh
       - tests/kata-archive-fixtures.py
+      - scripts/test-kata-worker.sh
+      - tests/kata-worker-fixtures.py
       - .github/workflows/kata-host-fixtures.yml
   workflow_dispatch:
 
@@ -33,3 +37,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate installer configuration fixtures
         run: bash tests/kata-host-fixtures.sh
+      - name: Validate standalone worker canary fixtures
+        run: python3 tests/kata-worker-fixtures.py

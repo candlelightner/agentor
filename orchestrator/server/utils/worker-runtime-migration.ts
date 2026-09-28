@@ -123,7 +123,7 @@ export class WorkerRuntimeMigration {
     if (source.Id !== input.sourceId || source.Name !== `/${input.sourceName}` || source.Config.Labels?.['agentor.id'] !== input.record.id)
       throw migrationError('Migration source identity changed');
     assertWorkerRuntimeMatches(profile, source.HostConfig.Runtime, source.HostConfig.Privileged === true, input.record.legacyPrivilegeGrant);
-    const dockerEnabled = source.Config.Env?.includes('DOCKER_ENABLED=true') === true;
+    const dockerEnabled = inspectedSourceDockerEnabled(source.Config.Env);
     resolveWorkerRuntimePolicy({ runtimeProfile: input.targetProfile, dockerEnabled,
       ...(input.targetProfile === 'legacy-runc' ? { legacyPrivilegeGrant: 'admin' as const } : {}) });
     await this.callbacks.assertAvailable(input.targetProfile);
@@ -211,7 +211,7 @@ export class WorkerRuntimeMigration {
       j.phase = 'snapshots'; await this.store.save(j);
       await old.rename({ name: j.rollbackName });
       const policy = resolveWorkerRuntimePolicy({ runtimeProfile: j.targetProfile,
-        dockerEnabled: source.Config.Env?.includes('DOCKER_ENABLED=true') === true,
+        dockerEnabled: inspectedSourceDockerEnabled(source.Config.Env),
         ...(j.targetProfile === 'legacy-runc' ? { legacyPrivilegeGrant: 'admin' as const } : {}) });
       await this.callbacks.authorize();
       // A committed Docker image preserves writable rootfs changes. Reproduce
@@ -447,6 +447,52 @@ export class WorkerRuntimeMigration {
       await stale.remove({ force: true });
     } catch (error) { if ((error as any)?.statusCode !== 404) throw error; }
   }
+}
+
+/** Resolve the immutable source startup payload, never today's environment
+ * record. Config.Env does not include shell assignments made by entrypoint.sh:
+ * normal workers derive DOCKER_ENABLED from ENVIRONMENT.dockerEnabled at boot.
+ * Ambiguity is an admission failure, not evidence that DinD is disabled. */
+function inspectedSourceDockerEnabled(env: string[] | undefined | null): boolean {
+  const invalid = () => migrationError('Source Docker-in-Docker configuration is missing or ambiguous; resolve it before migration',
+    'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN');
+  if (!Array.isArray(env) || env.some((entry) => typeof entry !== 'string')) throw invalid();
+  const value = (key: string): string | undefined => {
+    const entries = env.filter((entry) => entry === key || entry.startsWith(`${key}=`));
+    if (entries.length > 1 || entries.some((entry) => !entry.startsWith(`${key}=`))) throw invalid();
+    return entries[0]?.slice(key.length + 1);
+  };
+  const payload = value('ENVIRONMENT');
+  const historical = value('DOCKER_ENABLED');
+  const workerLocal = value('WORKER_LOCAL_ENV');
+  if (payload === undefined && historical === undefined) throw invalid();
+  if (historical !== undefined && historical !== 'true' && historical !== 'false') throw invalid();
+  let configured: boolean | undefined;
+  if (payload !== undefined) {
+    let parsed: any;
+    try { parsed = JSON.parse(payload); } catch { throw invalid(); }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw invalid();
+    if (parsed.dockerEnabled != null && typeof parsed.dockerEnabled !== 'boolean') throw invalid();
+    configured = parsed.dockerEnabled ?? false; // entrypoint: .dockerEnabled // false
+    if (parsed.envVars != null && typeof parsed.envVars !== 'string') throw invalid();
+    // Phase 0b exports arbitrary values before Phase 2 resolves dockerEnabled.
+    // Do not interpret nested runtime-payload overrides as trustworthy defaults.
+    if ((parsed.envVars ?? '').split('\n').some((line: string) => {
+      const trimmed = line.trim();
+      return !trimmed.startsWith('#') && /^(ENVIRONMENT|WORKER_LOCAL_ENV)=/.test(trimmed);
+    })) throw invalid();
+  }
+  if (workerLocal) {
+    let entries: any;
+    try {
+      if (!/^[A-Za-z0-9+/]*={0,2}$/.test(workerLocal) || workerLocal.length % 4 !== 0) throw invalid();
+      entries = JSON.parse(Buffer.from(workerLocal, 'base64').toString('utf8'));
+    } catch { throw invalid(); }
+    if (!Array.isArray(entries) || entries.some((entry) => !entry || typeof entry.key !== 'string' ||
+      !/^[A-Z_][A-Z0-9_]*$/.test(entry.key) || typeof entry.value !== 'string' || entry.key === 'ENVIRONMENT')) throw invalid();
+  }
+  if (configured !== undefined && historical !== undefined && configured !== (historical === 'true')) throw invalid();
+  return configured ?? (historical === 'true');
 }
 
 function migrationError(message: string, code = 'WORKER_RUNTIME_MIGRATION_PREFLIGHT_FAILED') {

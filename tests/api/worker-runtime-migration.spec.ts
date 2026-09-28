@@ -18,7 +18,7 @@ async function fixture() {
   const containers = new Map<string, any>();
   const source = { Id: SOURCE, Name: '/agentor-worker-worker-1', Image: 'sha256:source',
     Config: { Image: 'worker:old', Hostname: SOURCE.slice(0, 12), Labels: { 'agentor.id': 'worker-1', 'agentor.managed': 'true' },
-      Env: ['DOCKER_ENABLED=false'], Cmd: ['/entrypoint'], Entrypoint: ['/bin/bash'] },
+      Env: ['ENVIRONMENT={"dockerEnabled":false,"networkMode":"full","envVars":""}'], Cmd: ['/entrypoint'], Entrypoint: ['/bin/bash'] },
     HostConfig: { Runtime: 'runc', Privileged: false, NetworkMode: 'agentor-net', RestartPolicy: { Name: 'unless-stopped' },
       Binds: ['worker-workspace:/workspace', 'worker-agents:/home/agent/.agent-data', '/data/user/kilo:/home/agent/.agent-data/.kilo/config'] },
     State: { Running: true, Paused: false },
@@ -183,10 +183,103 @@ test('preflight refuses unapproved writable mounts and Kata DinD before stopping
   try {
     f.source.Mounts.push({ Type: 'bind', Source: '/external', Destination: '/external', RW: true } as any);
     await expect(f.engine.preflight(f.input)).rejects.toThrow(/rollback policy/);
-    f.source.Mounts.pop(); f.source.Config.Env = ['DOCKER_ENABLED=true'];
+    f.source.Mounts.pop(); f.source.Config.Env = ['ENVIRONMENT={"dockerEnabled":true}'];
     await expect(f.engine.preflight(f.input)).rejects.toMatchObject({ code: 'KATA_DIND_NOT_VALIDATED' });
     expect(f.source.State.Running).toBe(true);
     expect(f.options).toEqual([]);
+  } finally { await f.cleanup(); }
+});
+
+for (const [name, env, code] of [
+  ['normal structured DinD', ['ENVIRONMENT={"dockerEnabled":true}'], 'KATA_DIND_NOT_VALIDATED'],
+  ['historical DinD', ['DOCKER_ENABLED=true'], 'KATA_DIND_NOT_VALIDATED'],
+  ['matching structured/historical DinD', ['ENVIRONMENT={"dockerEnabled":true}', 'DOCKER_ENABLED=true'], 'KATA_DIND_NOT_VALIDATED'],
+  ['missing configuration', [], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['malformed JSON', ['ENVIRONMENT={'], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['empty JSON', ['ENVIRONMENT='], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['null JSON', ['ENVIRONMENT=null'], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['array JSON', ['ENVIRONMENT=[]'], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['boolean JSON', ['ENVIRONMENT=false'], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['string true', ['ENVIRONMENT={"dockerEnabled":"true"}'], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['number value', ['ENVIRONMENT={"dockerEnabled":1}'], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['duplicate structured fields', ['ENVIRONMENT={"dockerEnabled":false}', 'ENVIRONMENT={"dockerEnabled":true}'], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['identical duplicated fields', ['ENVIRONMENT={}', 'ENVIRONMENT={}'], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['duplicate historical fields', ['DOCKER_ENABLED=false', 'DOCKER_ENABLED=false'], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['invalid historical flag', ['DOCKER_ENABLED='], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['contradictory fields', ['ENVIRONMENT={"dockerEnabled":true}', 'DOCKER_ENABLED=false'], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['reverse contradictory fields', ['ENVIRONMENT={"dockerEnabled":false}', 'DOCKER_ENABLED=true'], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['custom environment override', [`ENVIRONMENT=${JSON.stringify({ dockerEnabled: false, envVars: 'ENVIRONMENT={"dockerEnabled":true}' })}`], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['custom local payload override', [`ENVIRONMENT=${JSON.stringify({ dockerEnabled: false, envVars: 'WORKER_LOCAL_ENV=payload' })}`], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['local environment override', ['ENVIRONMENT={"dockerEnabled":false}', `WORKER_LOCAL_ENV=${Buffer.from(JSON.stringify([{ key: 'ENVIRONMENT', value: '{"dockerEnabled":true}' }])).toString('base64')}`], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['malformed local payload', ['ENVIRONMENT={"dockerEnabled":false}', 'WORKER_LOCAL_ENV=invalid'], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+  ['assignment-shaped local key', ['ENVIRONMENT={"dockerEnabled":false}', `WORKER_LOCAL_ENV=${Buffer.from(JSON.stringify([{ key: 'ENVIRONMENT={"dockerEnabled":true,"x":"', value: '"}' }])).toString('base64')}`], 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN'],
+] as const) test(`migration rejects ${name} before journal or Docker mutations`, async () => {
+  const f = await fixture();
+  try {
+    f.source.Config.Env = [...env];
+    await expect(f.engine.migrate(f.input)).rejects.toMatchObject({ code });
+    expect(f.events).toEqual([]);
+    expect(f.options).toEqual([]);
+    expect(f.store.get('owner-1', 'worker-1')).toBeUndefined();
+    expect(f.source.HostConfig.RestartPolicy).toEqual({ Name: 'unless-stopped' });
+    expect(f.source.State.Running).toBe(true);
+    expect(f.volumes.size).toBe(2);
+    expect(f.containers.size).toBe(1);
+  } finally { await f.cleanup(); }
+});
+
+for (const [name, value] of [['absent', undefined], ['null', null], ['non-array', {}], ['non-string entry', [42]]] as const)
+  test(`migration rejects ${name} inspected Env without leaking payloads`, async () => {
+    const f = await fixture();
+    try {
+      (f.source.Config as any).Env = value;
+      await expect(f.engine.migrate(f.input)).rejects.toMatchObject({ code: 'WORKER_RUNTIME_MIGRATION_DIND_CONFIG_UNCERTAIN' });
+      expect(f.events).toEqual([]);
+      expect(f.options).toEqual([]);
+      expect(f.store.get('owner-1', 'worker-1')).toBeUndefined();
+      expect(f.source.State.Running).toBe(true);
+      expect(f.source.HostConfig.RestartPolicy).toEqual({ Name: 'unless-stopped' });
+      expect(f.volumes.size).toBe(2);
+    } finally { await f.cleanup(); }
+  });
+
+test('uncertain source configuration diagnostics do not disclose runtime values', async () => {
+  const f = await fixture();
+  try {
+    f.source.Config.Env = ['ENVIRONMENT={SECRET-CANARY-NOT-LOGGED'];
+    await expect(f.engine.migrate(f.input)).rejects.not.toThrow(/SECRET-CANARY-NOT-LOGGED/);
+  } finally { await f.cleanup(); }
+});
+
+for (const [name, env] of [
+  ['explicit structured false', ['ENVIRONMENT={"dockerEnabled":false}']],
+  ['missing structured property', ['ENVIRONMENT={}']],
+  ['null structured property', ['ENVIRONMENT={"dockerEnabled":null}']],
+  ['historical false', ['DOCKER_ENABLED=false']],
+  ['matching structured/historical false', ['ENVIRONMENT={"dockerEnabled":false}', 'DOCKER_ENABLED=false']],
+  ['ordinary local settings', ['ENVIRONMENT={"dockerEnabled":false}', `WORKER_LOCAL_ENV=${Buffer.from(JSON.stringify([{ key: 'EXAMPLE', value: 'kept' }])).toString('base64')}`]],
+] as const) test(`migration preserves ${name} and disables target Kata privilege`, async () => {
+  const f = await fixture();
+  try {
+    f.source.Config.Env = [...env];
+    const j = await f.engine.migrate(f.input);
+    expect(j.phase).toBe('committed');
+    const replacement = f.options.find((o) => o.name === f.input.sourceName);
+    expect(replacement.HostConfig).toMatchObject({ Runtime: 'agentor-kata-qemu', Privileged: false });
+    expect(replacement.Env).toEqual(env);
+  } finally { await f.cleanup(); }
+});
+
+test('explicit legacy target retains inspected structured DinD semantics', async () => {
+  const f = await fixture();
+  try {
+    f.input.record.runtimeProfile = 'kata-qemu';
+    f.input.targetProfile = 'legacy-runc';
+    f.source.HostConfig.Runtime = 'agentor-kata-qemu';
+    f.source.Config.Env = ['ENVIRONMENT={"dockerEnabled":true}'];
+    const j = await f.engine.migrate(f.input);
+    expect(j.phase).toBe('committed');
+    expect(f.options.find((o) => o.name === f.input.sourceName).HostConfig).toMatchObject({ Runtime: 'runc', Privileged: true });
   } finally { await f.cleanup(); }
 });
 

@@ -23,7 +23,9 @@ Every user-facing feature of the Agentor web dashboard, organized by category. T
   require a separate legacy acknowledgement. Ordinary users see no legacy
   selector. Recovery requires acknowledgement that outstanding Docker operations
   settled; finalization separately confirms permanent rollback-evidence cleanup.
-  Automatic capacity admission is explicitly unimplemented and remains a rollout gate.
+  Automatic capacity admission is explicitly unimplemented; the public migration
+  path rejects before journal/Docker access, and the UI disables submission.
+  Existing migration recovery and finalization remain available.
 - Snapshot image defaults preserve baked/custom image configuration but clear
   runtime-only environment values so removed account tokens and bootstrap flags
   cannot return on rebuild. Whole-instance manifests record exact local snapshot
@@ -39,6 +41,13 @@ Every user-facing feature of the Agentor web dashboard, organized by category. T
 - Host setup verifies exact on-disk shim/options separately from Docker's
   reported runtime alias: Docker 26/29 omit shim-v2 type/options in `info`.
   Registration is not proof of effective configuration, boot, or isolation.
+- An opt-in standalone non-DinD worker canary checks real startup, UID 1000
+  tmux/editor/desktop, and named-volume persistence over restart/replacement.
+  It never enables host attestation or deploys an orchestrator, and retains
+  failed containers plus data for diagnosis instead of silently retrying.
+- Migration derives DinD from the source container's structured environment,
+  not mutable environment settings or an assumed exported shell variable.
+  Ambiguous/malformed/conflicting source settings reject before mutation.
 - Coverage: `worker-runtime-policy.spec.ts`, `worker-runtime-admin.spec.ts`,
   `worker-runtime-backup.spec.ts`, `worker-runtime-migration.spec.ts`,
   `kata-managed-volume-runtime.spec.ts`, and runtime additions in the inventory,

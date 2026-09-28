@@ -1,6 +1,6 @@
 # Kata + QEMU worker runtime upgrade plan
 
-Status: implementation and review in progress, not ready to deploy. Runtime policy, operator attestation, explicit legacy authorization, migration transactions, host setup fixtures, and backup destination policy have local implementations and module coverage. UI/API integration and acceptance remain subject to final review. This document does not claim Kata, QEMU, guest storage, or any target host has been installed or verified. No host setup is authorized by this plan.
+Status: implementation and review in progress, not ready to deploy. Runtime policy, operator attestation, explicit legacy authorization, migration transactions, host setup fixtures, and backup destination policy have local implementations and module coverage. UI/API integration and acceptance remain subject to final review. An operator-provisioned disposable VM has passed a basic Kata boot and produced directly correlated shim/QEMU evidence; this is not production-host, DinD, or Agentor lifecycle acceptance. No production or outer-host setup is authorized by this plan.
 
 ## Resumed implementation decisions (2026-09-28)
 
@@ -11,7 +11,10 @@ Status: implementation and review in progress, not ready to deploy. Runtime poli
 - The operator explicitly selected preservation of the stopped container's writable root filesystem as an image snapshot, plus copied persistent-volume data for rollback. Shared account credentials/Kilo bindings retain their current identity; rolling shared state back would erase sibling-worker updates, so it is outside worker-local point-in-time rollback.
 - Whole-instance restore holds workers for destination administrator approval, strips incoming legacy privilege grants, and omits source-host migration journals containing container IDs and rollback bindings. Profiles, including missing historical values, remain descriptive until approval. Portable metadata is descriptive only; explicit legacy import authority is passed separately from bundle contents through a live administrator callback. A serialized job can require reauthorization but cannot supply it.
 - The worker-local runc DinD probe started an `overlay2` daemon and pulled an image on an ext filesystem named volume. Nested execution failed on read-only private cgroups. No Kata runtime was available, and no host cgroups, devices, modules, storage or namespaces were changed. See [local evidence](kata-dind-local-evidence.md).
-- Host access/root, deployment, and network isolation remain outside this work. Worker-local DinD tests are permitted. The operator subsequently authorized publishing this unfinished work to a clearly marked draft feature branch using `AGENTOR_GH_TOKEN`; this does not authorize a main-branch push, image publication, or deployment.
+- Outer-host access/root, production deployment, and network isolation remain outside this work. Worker-local DinD tests are permitted. The operator subsequently authorized publishing this unfinished work to a clearly marked draft feature branch using `AGENTOR_GH_TOKEN`; this does not authorize a main-branch push, image publication, or deployment.
+- The operator later provisioned a disposable Ubuntu 24.04 VM and authorized dedicated pinned-key SSH access with guest-only sudo for autonomous tests. Its successful Ubuntu canary correlated an exact container ID with Kata 4.2.0, QEMU 11.0.1, KVM acceleration, and guest kernel 6.18.35. Rootfs uses virtiofs and container cgroup2 is read-only. Shim/QEMU run as VM-local root, and guest seccomp is disabled in the selected defaults; these facts are not a security certification. No validation flag or DinD gate has been enabled.
+- The real non-DinD worker passed first-boot READY, tmux/editor/desktop and UID-1000 writes, but explicit-user exec failed after restart on Docker29/containerd snapshotter. A plain Ubuntu Kata/runc control reproduced the Kata-specific failure. See [VM evidence](kata-worker-vm-evidence.md). Full worker acceptance remains blocked by this compatibility failure.
+- Migration now reads DinD from the inspected structured `ENVIRONMENT`, not a runtime-derived shell variable absent from Docker metadata. Missing/ambiguous/override inputs fail closed before mutation. Public migration submission is additionally blocked while trusted capacity admission is unimplemented; preflight, existing-journal recovery, and finalization remain available.
 
 ## Approved scope
 
@@ -110,7 +113,7 @@ The following are no-server module suites selected by `tests/playwright.modules.
 
 The following end-to-end checks remain required; their appearance here is not a claim that they ran or passed.
 
-- Implement sound disk-capacity admission using operator-provided measurements for the actual snapshot/image destinations; helper/worker `df` cannot prove image-store capacity. The current preflight reports this as unimplemented.
+- Implement sound disk-capacity admission using operator-provided measurements for the actual snapshot/image destinations; helper/worker `df` cannot prove image-store capacity. The current preflight reports this as unimplemented and the public migration path fails closed with `WORKER_RUNTIME_MIGRATION_CAPACITY_UNVERIFIED` before journal or Docker access.
 - Complete a disposable API/UI stack run, including regular-owner fixture provisioning on a runc-only CI daemon without giving ordinary users runtime authority. New import/backup runtime UI specs exist but have not been browser-executed here.
 - Exercise the documented separate encrypted snapshot-image transfer on the destination host. Instance manifests now record exact snapshot image identities and destination preflight blocks missing/mismatched images; layers are not embedded in instance backups.
 

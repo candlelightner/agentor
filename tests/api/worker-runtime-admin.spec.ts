@@ -3,9 +3,27 @@ import { authorizeRuntimeSelection, authorizeRuntimeRestore, grantLegacyWorkerRu
 import { withOwnerWorkerLifecycleMutation } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
 import { beginInstanceSnapshot } from '../../orchestrator/server/utils/instance-snapshot-gate';
 import type { WorkerRecord } from '../../orchestrator/server/utils/worker-store';
+import { ContainerManager } from '../../orchestrator/server/utils/container';
 
 const deny = async () => { throw Object.assign(new Error('Forbidden'), { statusCode: 403 }); };
 const admin = { authorize: async () => {} };
+
+test('public migration fails closed before journal or Docker access while capacity admission is unavailable', async () => {
+  const calls: string[] = [];
+  const manager = {
+    withExistingWorkerLifecycleMutation: async (_id: string, run: () => Promise<unknown>) => run(),
+    runtimeMigrations: async () => { calls.push('journal'); throw new Error('must not open journal'); },
+    runtimeMigrationInput: async () => { calls.push('inspect'); throw new Error('must not access Docker'); },
+    runtimeMigrationEngine: () => { calls.push('engine'); throw new Error('must not migrate'); },
+  };
+  for (const target of ['kata-qemu', 'legacy-runc'] as const) {
+    await expect(ContainerManager.prototype.migrateRuntime.call(manager as any, 'worker', target, async () => { calls.push('authorize'); }))
+      .rejects.toMatchObject({ statusCode: 503, code: 'WORKER_RUNTIME_MIGRATION_CAPACITY_UNVERIFIED' });
+  }
+  expect(calls).toEqual(['authorize', 'authorize']);
+  await expect(ContainerManager.prototype.migrateRuntime.call(manager as any, 'worker', 'kata-qemu', deny))
+    .rejects.toMatchObject({ statusCode: 403 });
+});
 
 test('queued restore authority stays ephemeral and rechecks revocation for every import', async () => {
   let authorized = true;

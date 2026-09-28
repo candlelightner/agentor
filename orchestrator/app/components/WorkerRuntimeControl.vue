@@ -16,7 +16,8 @@ const lockPassword = ref('');
 const busy = ref(false);
 const message = ref('');
 const error = ref('');
-const migrationPlan = ref<{ targetProfile: WorkerRuntimeProfile; mounts: Array<{ target: string; kind: string }> }>();
+const migrationPlan = ref<{ targetProfile: WorkerRuntimeProfile; capacityAdmission?: string; mounts: Array<{ target: string; kind: string }> }>();
+const capacityAdmitted = computed(() => migrationPlan.value?.capacityAdmission === 'admitted');
 const migrationPhase = ref('');
 const confirmDowntime = ref(false);
 const daemonSettled = ref(false);
@@ -68,7 +69,7 @@ async function preflightMigration() {
 }
 
 async function migrate() {
-  if (!migrationPlan.value || !confirmDowntime.value) return;
+  if (!migrationPlan.value || !confirmDowntime.value || !capacityAdmitted.value) return;
   busy.value = true; error.value = ''; migrationPhase.value = 'Preparing';
   const poll = async () => {
     try {
@@ -123,14 +124,14 @@ async function authorize() {
     <UButton v-if="isAdmin && canMigrate && !disabled && !approvalRequired" size="xs" color="neutral" variant="outline" :disabled="busy" @click="preflightMigration">Check runtime migration</UButton>
     <div v-if="migrationPlan" class="space-y-2">
       <p>Target: {{ migrationPlan.targetProfile }}. Migration stops this worker, snapshots its root filesystem, and copies worker data for rollback. Allow temporary disk space for the copies.</p>
-      <p class="text-amber-600">Automatic disk-capacity admission is not implemented. An operator must verify space for root filesystem and persistent-data snapshots before migration.</p>
+      <p v-if="!capacityAdmitted" class="text-amber-600">Migration is unavailable until trusted disk-capacity admission is implemented. Checking space manually or acknowledging downtime does not bypass this gate.</p>
       <p>The captured root filesystem becomes a required local image. Whole-instance backups do not contain image layers: separately encrypt and transfer its Docker image archive before restoring on another host.</p>
       <p>Shared account credentials and Kilo data keep their existing bindings and are not rolled back with this worker.</p>
       <ul class="list-disc pl-4"><li v-for="mount in migrationPlan.mounts" :key="mount.target">{{ mount.target }} — {{ mount.kind }}</li></ul>
       <UCheckbox v-model="confirmDowntime" label="I confirm worker downtime and snapshot creation." />
       <UCheckbox v-if="migrationPlan.targetProfile === 'legacy-runc'" v-model="acknowledged" label="I authorize legacy runc and its host privilege for Docker-enabled workers." />
       <UInput v-model="lockPassword" type="password" placeholder="Protection password, if set" aria-label="Migration protection password" />
-      <UButton size="xs" :loading="busy" :disabled="!confirmDowntime || (migrationPlan.targetProfile === 'legacy-runc' && !acknowledged)" @click="migrate">Migrate runtime</UButton>
+      <UButton size="xs" :loading="busy" :disabled="!capacityAdmitted || !confirmDowntime || (migrationPlan.targetProfile === 'legacy-runc' && !acknowledged)" @click="migrate">Migrate runtime</UButton>
     </div>
     <p v-if="migrationPhase" role="status">Migration: {{ migrationPhase }}</p>
     <div v-if="isAdmin && canMigrate && migrationPhase && !busy" class="space-y-2">

@@ -679,6 +679,8 @@ export class ContainerManager {
   async migrateRuntime(id: string, targetProfile: WorkerRuntimeProfile, authorize: () => Promise<void>) {
     return this.withExistingWorkerLifecycleMutation(id, async () => {
       await authorize();
+      const { assertRuntimeMigrationCapacityAdmission } = await import('./worker-runtime-capacity');
+      assertRuntimeMigrationCapacityAdmission();
       const { instanceSnapshotActive } = await import('./instance-snapshot-gate');
       if (instanceSnapshotActive()) throw Object.assign(new Error('Instance backup or restore is active'), { statusCode: 423 });
       const store = await this.runtimeMigrations();

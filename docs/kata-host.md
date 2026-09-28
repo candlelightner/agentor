@@ -73,6 +73,20 @@ attestation before creating a Kata worker. Set it only after the canary evidence
 has been reviewed. It does not override the separate `KATA_DIND_NOT_VALIDATED`
 gate or turn alias registration into host validation.
 
+After the basic smoke check, the opt-in standalone worker test is:
+
+```bash
+sudo bash scripts/test-kata-worker.sh --disposable-host --image LOCAL_WORKER_IMAGE
+```
+
+Build the standard `worker/Dockerfile` locally first; the test does not build or
+pull images. It checks READY, UID-1000 services/writes, restart and recreation,
+but is not an orchestrator API/UI test. It retains image/volumes/evidence and
+retains failed containers (possibly running) for exact-ID diagnosis. The tested
+Docker 29.1.3/containerd 2.2.1/Kata 4.2.0 VM passed first boot but failed explicit
+UID exec after restart. See [the VM evidence](kata-worker-vm-evidence.md).
+Do not attest that combination based on the earlier root-only boot check.
+
 ## Compatibility boundaries
 
 ### Archive validation correction (2026-09-28)
