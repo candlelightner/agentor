@@ -2710,9 +2710,16 @@ for p in sys.argv[1:]:
       );
       assertWorkerRuntimeMatches(resolveWorkerRuntimeProfile(info.runtimeProfile),
         runtime.runtime, runtime.privileged, info.legacyPrivilegeGrant);
-      if (runtime.running)
-        await this.dockerService.restartContainer(info.containerId);
-      else await this.dockerService.startContainer(info.containerId);
+      if (runtime.running) {
+        if (resolveWorkerRuntimeProfile(info.runtimeProfile) === "kata-qemu") {
+          // Docker's combined restart can lose its host-side rootfs mount with
+          // Kata + the containerd image store, breaking explicit-user exec.
+          // Keep separate stop/start inside the existing lifecycle fence; a
+          // failed or uncertain stop must never be followed by a start.
+          await this.dockerService.stopContainer(info.containerId);
+          await this.dockerService.startContainer(info.containerId);
+        } else await this.dockerService.restartContainer(info.containerId);
+      } else await this.dockerService.startContainer(info.containerId);
 
       let bootstrapError: unknown;
       for (let attempt = 0; attempt < 3; attempt++) {

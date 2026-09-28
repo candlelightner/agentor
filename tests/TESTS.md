@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **2246 tests** across 221 test files (1608 API across 156 files + 638 UI across 65 files), enumerated with Playwright `--list` on 2026-09-28. Discovery counts are an inventory, not a passing test result.
+- **2254 tests** across 221 test files (1616 API across 156 files + 638 UI across 65 files), enumerated with Playwright `--list` on 2026-09-28. Discovery counts are an inventory, not a passing test result. The separate module configuration selects 345 tests across 32 files; the latest local module run passed all 345.
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -31,11 +31,18 @@ ownership/content across restart and replacement using retained named volumes.
 It does not deploy an orchestrator or enable host attestation. Success removes
 only exact test container IDs; failures retain containers (possibly running),
 image, volumes, and evidence for diagnosis. `python3 tests/kata-worker-fixtures.py`
-runs six offline fake-Docker safety/lifecycle cases, not actual Kata acceptance.
-The actual disposable VM passed first boot but failed explicit UID exec after
-restart; see [VM evidence](../docs/kata-worker-vm-evidence.md). The public migration
+runs 11 offline fake-Docker safety/lifecycle cases, not actual Kata acceptance.
+The actual disposable VM failed explicit UID exec after combined Docker restart;
+separate stop/start passed the standard standalone worker's services and retained
+volume markers through recreation. See [VM evidence](../docs/kata-worker-vm-evidence.md).
+Both canaries default to `--restart-method stop-start`; explicit `docker` remains
+a diagnostic and neither method falls back to the other. The public migration
 capacity gate has module coverage; the component passed typechecking and the
 new disabled-submit UI regression was discovered but not browser-executed.
+Six focused runtime-control cases from `import-worker-modal.spec.ts` and
+`backup-management.spec.ts` passed in Chromium against a fresh disposable-VM
+recovery-mode stack. Operations/session-role presentation were mocked; this is
+not backend runtime-authorization or worker import/restore acceptance.
 
 `worker-runtime-snapshot.spec.ts` adds 4 no-server cases for snapshot configuration,
 runtime-only environment clearing, exact image dependency inventory, and
@@ -76,10 +83,11 @@ These do not establish the running daemon's effective ConfigPath or VM boot.
 exec to succeed both before and after a container restart; root exec alone missed
 the observed Docker29/containerd/Kata compatibility failure. Its JSON reports
 each stage and retains `isolationVerified:false`; cleanup failures cannot report
-a pass. `bash tests/kata-smoke-fixtures.sh` runs one success and eleven failure
-scenarios entirely through source-only fake Docker functions, including missing
+a pass. `bash tests/kata-smoke-fixtures.sh` runs 21 scenarios (3 success, 14 failure,
+4 invalid-argument) entirely through source-only fake Docker functions, including missing
 runtime, invalid/partial create results, initial/restarted user exec, incorrect
-identity, restart failure, and exact-ID cleanup failure. These fixtures also run
+identity, stop/start failure or timeout without method fallback, restart failure,
+argument rejection before Docker access, and exact-ID cleanup failure. These fixtures also run
 through `tests/kata-host-fixtures.sh`; they do not count as real VM acceptance.
 
 The separate opt-in `scripts/probe-worker-local-dind.sh --run-worker-local`
@@ -321,7 +329,7 @@ tests/
 | `admin-management-mcp.spec.ts`    | 21    | Internal management MCP workload authentication, per-call fail-closed policy and discovery filtering, redaction, auditing, expiring workspace-bound credentials, traversal-safe real-owner selection with valid cross-user administration, platform-admin-only whole-instance recovery namespaces, exact selected-member backup restore with active-artifact deletion pinning, lock enforcement across legacy lifecycle/configuration/app/exposure aliases, harness-controlled immutable proposal application, selected-worker console open/read/write/interrupt/close, plugin administration, and mapping/app capability discovery, ownership-derived mapping lifecycle, and live enable/disable denial. |
 | `management-owner-validation.spec.ts` | 14 | Shared management owner boundary: valid cross-user targets, platform-admin-only whole-instance recovery namespaces, nonexistent-owner rejection, `..`/absolute/slash/backslash/percent-encoded-ish traversal rejection, no filesystem/map mutation on invalid user-env writes, quarantine of persisted cross-partition owner/path metadata, retry-safe transactional single/bulk/owner deletion, serialized same-key failure rollback, recoverable tombstone persistence queues, and backward-compatible loading of historical URL-safe ids containing `-`/`_` without rewriting source files. |
 | `config-store-integrity.spec.ts` | 6 | Owner-partition persistence integrity: detached ingress/get/list/predicate snapshots, stale reload hiding, fail-closed `keyFn` exceptions, corrupt/malformed/mismatched-owner account env and worker configuration quarantine, healthy-owner isolation, source-byte preservation, explicit cleanup recovery, and detached worker-configuration results. |
-| `container-store-quarantine.spec.ts` | 21 | Managed runtimes without authoritative metadata remain quarantined; pre-profile privilege inspection survives initial inspect/health failures, restored records cannot regain grants from inventory, mismatched/privileged Kata observations reject, and desired state, secret-handshake recovery, stale-sync fencing and failure-isolated reconciliation remain covered. |
+| `container-store-quarantine.spec.ts` | 29 | Managed runtimes without authoritative metadata remain quarantined; pre-profile privilege inspection survives initial inspect/health failures, restored records cannot regain grants from inventory, mismatched/privileged Kata observations reject, and desired state, secret-handshake recovery, stale-sync fencing and failure-isolated reconciliation remain covered. Eight restart regressions cover fenced Kata stop/start ordering, definitive/ambiguous stop and start failures, no premature bootstrap, stopped-worker direct start, and unchanged unprivileged/explicitly privileged legacy combined restart. |
 | `workspace-download-cancellation.spec.ts` | 11 | Request disconnect during preparation, worker-card workspace-download signal propagation, streaming-source teardown including the post-preparation abort race, finalization/staging-file closure, structured safe deadline/abort diagnostics, and independent timed-out stale-helper cleanup with retry-safe reconciliation. |
 | `rebuild-persistence-reconciliation.spec.ts` | 1 | Live rebuild regression: a selected Codex path and `/workspace` markers survive, while an enabled plugin is reconciled onto the replacement runtime generation. |
 | `worker-daemon-restart-recovery.spec.ts` | 1 | Disposable DinD daemon restart convergence: secret-bearing desired workers restart only through Agentor bootstrap while explicitly stopped workers remain stopped. |

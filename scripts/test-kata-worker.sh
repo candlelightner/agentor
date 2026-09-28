@@ -6,16 +6,22 @@ set -euo pipefail
 
 usage() {
   printf '%s\n' 'Usage: bash scripts/test-kata-worker.sh --disposable-host --image LOCAL_IMAGE' \
+    '  [--restart-method stop-start|docker] (default: stop-start; no fallback)' \
     'Requires an explicitly approved disposable host with Kata already installed.' \
     'Uses only unix:///var/run/docker.sock; no pulls, builds, host setup, or fallback.' \
     'Retains evidence and volumes; retains failed containers. Does not enable validation.'
 }
 approved=false
 image_ref=
+restart_method=stop-start
+method_set=false
 while (($#)); do
   case "$1" in
     --disposable-host) approved=true; shift ;;
     --image) [[ $# -ge 2 && -n "$2" ]] || { usage >&2; exit 2; }; image_ref=$2; shift 2 ;;
+    --restart-method)
+      [[ "$method_set" == false && $# -ge 2 && "$2" =~ ^(stop-start|docker)$ ]] || { usage >&2; exit 2; }
+      restart_method=$2; method_set=true; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
@@ -55,10 +61,12 @@ finish() {
   fi
   jq -n --argjson passed "$([[ $result == 0 && "$complete" == true ]] && echo true || echo false)" \
     --arg evidence "$evidence" --arg image "${image_id:-}" \
+    --arg restartMethod "$restart_method" \
     --arg workspace "$workspace_volume" --arg agentData "$agent_volume" \
     --argjson containers "$(printf '%s\n' "${containers[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     '{passed:$passed,evidence:$evidence,image:$image,retainedVolumes:[$workspace,$agentData],containerIds:$containers,
       scope:"standalone non-DinD worker startup/restart/recreate; not API/UI, isolation certification, DinD, or migration acceptance",
+      restartMethod:$restartMethod,
       hostValidated:false}' | tee "$evidence/result.json"
   if [[ "$complete" != true || $result != 0 ]]; then
     printf 'Failure: inspect evidence and exact IDs before cleanup; volumes/image are retained. No automatic retry or fallback.\n' >&2
@@ -192,7 +200,16 @@ dk exec --user 1000:1000 "$current_id" bash -euc '
 marker_check first
 # Remove the prior READY record so a stale rootfs marker cannot satisfy restart.
 dk exec --user 1000:1000 "$current_id" rm /tmp/worker-events
-dk restart --time 20 "$current_id" >"$evidence/restart.log" 2>&1
+if [[ "$restart_method" == stop-start ]]; then
+  if ! dk stop --time 20 "$current_id" >"$evidence/restart-stop.log" 2>&1; then
+    fail 'Restart stop failed or timed out; start was not attempted.'
+  fi
+  if ! dk start "$current_id" >"$evidence/restart-start.log" 2>&1; then
+    fail 'Restart start failed after successful stop; no fallback was attempted.'
+  fi
+elif ! dk restart --time 20 "$current_id" >"$evidence/restart.log" 2>&1; then
+  fail 'Direct Docker restart failed; no fallback was attempted.'
+fi
 ready_and_services restarted
 marker_check restarted
 dk stop --time 20 "$current_id" >"$evidence/stop-first.log" 2>&1

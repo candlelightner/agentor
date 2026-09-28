@@ -608,6 +608,143 @@ test("a failed secret bootstrap is recoverable by stop/start without rebuilding"
   expect(pluginReconciles).toBe(1);
 });
 
+function restartFixture(profile: "kata-qemu" | "legacy-runc" = "kata-qemu", running = true) {
+  const events: string[] = [];
+  const record = { ...workerRecord(), runtimeProfile: profile, desiredRuntimeStatus: "running" as const };
+  const secrets = [{ kind: "secret", key: "GROUP_TOKEN", value: "test-runtime-only" }];
+  const docker = {
+    updateContainerRestartPolicy: async (id: string, sensitive: boolean) => {
+      expect(id).toBe("docker-worker-1");
+      expect(sensitive).toBe(true);
+      events.push("policy");
+    },
+    inspectContainerRuntime: async () => {
+      events.push("inspect");
+      return { running, runtime: profile === "kata-qemu" ? "agentor-kata-qemu" : "runc", privileged: false };
+    },
+    stopContainer: async (id: string) => { expect(id).toBe("docker-worker-1"); events.push("stop"); },
+    startContainer: async (id: string) => { expect(id).toBe("docker-worker-1"); events.push("start"); },
+    restartContainer: async (id: string) => { expect(id).toBe("docker-worker-1"); events.push("restart"); },
+    materializeWorkerSecretFiles: async (id: string, values: unknown[]) => {
+      expect(id).toBe("docker-worker-1");
+      expect(values).toEqual(secrets);
+      events.push("bootstrap");
+    },
+    probeContainerTask: async (id: string, sensitive: boolean) => {
+      expect(id).toBe("docker-worker-1");
+      expect(sensitive).toBe(true);
+      events.push("probe");
+    },
+  };
+  const manager = new ContainerManager(docker as any, { containerPrefix: "agentor-worker" } as any);
+  manager.setWorkerStore({
+    get: () => record,
+    setDesiredRuntimeStatus: async (_owner: string, _id: string, desired: string) => {
+      expect(desired).toBe("running");
+      events.push("desired-running");
+      return record;
+    },
+  } as any);
+  // Keep the real public lifecycle fence while isolating the auth database.
+  (manager as any).assertOwnerExists = async () => undefined;
+  (manager as any).containers.set(record.id, {
+    ...record, containerId: "docker-worker-1", containerName: "agentor-worker-worker-1",
+    imageName: "agentor-worker:latest", imageId: "sha256:image", status: running ? "running" : "stopped",
+  });
+  (manager as any).resolveUserEnvAndBinds = async () => ({
+    userEnv: { userId: record.userId, envVars: [] }, credentialBinds: [], groupSecrets: secrets,
+  });
+  (manager as any).reconcileWorkerPlugins = async () => { events.push("plugins"); };
+  return { manager, docker, events };
+}
+
+test("running Kata restart awaits stop inside the lifecycle fence before start and secret bootstrap", async () => {
+  const { manager, docker, events } = restartFixture();
+  let stopped!: () => void;
+  let enteredStop!: () => void;
+  const stopEntered = new Promise<void>((resolve) => { enteredStop = resolve; });
+  docker.stopContainer = async () => {
+    events.push("stop");
+    enteredStop();
+    await new Promise<void>((resolve) => { stopped = resolve; });
+  };
+  const restarting = manager.restart("worker-1");
+  await stopEntered;
+  let nextMutationEntered = false;
+  const nextMutation = withWorkerLifecycleMutation("worker-1", async () => { nextMutationEntered = true; });
+  await Promise.resolve();
+  expect(nextMutationEntered).toBe(false);
+  expect(events).toEqual(["desired-running", "policy", "inspect", "stop"]);
+  stopped();
+  await restarting;
+  await nextMutation;
+  expect(events).toEqual(["desired-running", "policy", "inspect", "stop", "start", "bootstrap", "probe", "plugins"]);
+  expect(manager.get("worker-1")).toMatchObject({ status: "running", desiredRuntimeStatus: "running", runtimeProfile: "kata-qemu" });
+});
+
+for (const ambiguous of [false, true]) {
+  test(`Kata restart does not start after ${ambiguous ? "an ambiguous" : "a definitive"} stop failure`, async () => {
+    const { manager, docker, events } = restartFixture();
+    const failure = ambiguous
+      ? new OperationDeadlineError("DOCKER_OPERATION_TIMEOUT", "Docker worker stop", 30_000)
+      : new Error("injected stop failure");
+    docker.stopContainer = async () => { events.push("stop"); throw failure; };
+    await expect(manager.restart("worker-1")).rejects.toBe(failure);
+    expect(events).toEqual(["desired-running", "policy", "inspect", "stop"]);
+    expect(manager.get("worker-1")).toMatchObject({ status: "unknown", desiredRuntimeStatus: "running" });
+    if (ambiguous) expect(manager.get("worker-1")?.runtimeDiagnostic?.code).toBe("DOCKER_OPERATION_TIMEOUT");
+  });
+}
+
+test("Kata restart start failure stays unknown and never bootstraps or reports running", async () => {
+  const { manager, docker, events } = restartFixture();
+  const failure = new Error("injected start failure");
+  docker.startContainer = async () => { events.push("start"); throw failure; };
+  await expect(manager.restart("worker-1")).rejects.toBe(failure);
+  expect(events).toEqual(["desired-running", "policy", "inspect", "stop", "start"]);
+  expect(manager.get("worker-1")).toMatchObject({ status: "unknown", desiredRuntimeStatus: "running" });
+});
+
+test("Kata restart ambiguous start timeout stays unknown without secret bootstrap", async () => {
+  const { manager, docker, events } = restartFixture();
+  const failure = new OperationDeadlineError("DOCKER_OPERATION_TIMEOUT", "Docker worker start", 30_000);
+  docker.startContainer = async () => { events.push("start"); throw failure; };
+  await expect(manager.restart("worker-1")).rejects.toBe(failure);
+  expect(events).toEqual(["desired-running", "policy", "inspect", "stop", "start"]);
+  expect(manager.get("worker-1")).toMatchObject({
+    status: "unknown", desiredRuntimeStatus: "running",
+    runtimeDiagnostic: { code: "DOCKER_OPERATION_TIMEOUT" },
+  });
+});
+
+test("running legacy workers retain Docker's combined restart path", async () => {
+  const { manager, events } = restartFixture("legacy-runc");
+  await manager.restart("worker-1");
+  expect(events).toEqual(["desired-running", "policy", "inspect", "restart", "bootstrap", "probe", "plugins"]);
+  expect(manager.get("worker-1")).toMatchObject({ status: "running", runtimeProfile: "legacy-runc" });
+});
+
+test("running privileged legacy worker retains its explicit grant and combined restart", async () => {
+  const { manager, docker, events } = restartFixture("legacy-runc");
+  (manager.get("worker-1") as any).legacyPrivilegeGrant = "admin";
+  docker.inspectContainerRuntime = async () => {
+    events.push("inspect");
+    return { running: true, runtime: "runc", privileged: true };
+  };
+  await manager.restart("worker-1");
+  expect(events).toEqual(["desired-running", "policy", "inspect", "restart", "bootstrap", "probe", "plugins"]);
+  expect(manager.get("worker-1")).toMatchObject({
+    status: "running", runtimeProfile: "legacy-runc", legacyPrivilegeGrant: "admin",
+  });
+});
+
+test("stopped Kata workers start directly without a redundant stop or combined restart", async () => {
+  const { manager, events } = restartFixture("kata-qemu", false);
+  await manager.restart("worker-1");
+  expect(events).toEqual(["desired-running", "policy", "inspect", "start", "bootstrap", "probe", "plugins"]);
+  expect(manager.get("worker-1")).toMatchObject({ status: "running", desiredRuntimeStatus: "running" });
+});
+
 test("one unresponsive runtime does not block reconciliation of another worker", async () => {
   const records = [
     { ...workerRecord(), id: "worker-1", desiredRuntimeStatus: "running" as const },

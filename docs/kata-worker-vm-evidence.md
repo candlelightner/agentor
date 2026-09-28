@@ -1,8 +1,10 @@
 # Disposable Kata worker evidence — 2026-09-28
 
-Status: **not ready to deploy**. First boot passed; restart broke explicit-user
-Docker exec with the containerd image store. A minimal classic-overlay2 control
-passed, but full worker acceptance on that backend is still outstanding.
+Status: **not ready to deploy**. Docker's combined restart broke explicit-user
+exec with the containerd image store; separate stop/start passed the standard
+standalone non-DinD worker's restart/replacement checks on the same daemon.
+A minimal classic-overlay2 control passed, but full worker acceptance on that
+backend is still outstanding. Real Agentor API/UI lifecycle acceptance is pending.
 The host-validation flag and Kata DinD gate remain disabled.
 
 ## Scope and environment
@@ -88,9 +90,9 @@ why root-only smoke testing missed the failure; the root cause of the missing
 mount still needs investigation. No daemon restart, storage-driver change, mount
 repair, version change, or root-user workaround was attempted to hide the failure.
 
-Remaining: restart/user-resolution compatibility, complete worker recreation and
-persistence, real API/UI paths, migration/capacity admission, and DinD permissions
-and storage. None is established by first-boot success.
+At that checkpoint, restart/recreation compatibility remained unresolved. The
+later separate stop/start result below supersedes that narrow compatibility
+blocker, not the outstanding API/UI, migration, capacity, or DinD acceptance.
 
 ## Storage-backend comparison and diagnostic recovery
 
@@ -171,3 +173,124 @@ A current orchestrator test image was built locally as
 `sha256:23b1a75156f00b098cecf864c12b0f8ee44ce6ac8833c24f3edd75394df32ab8`.
 The build passed; no browser/API stack was run from it in this checkpoint and
 it was not published. Browser acceptance remains outstanding.
+
+## Separate stop/start correction
+
+On the original Docker29/containerd daemon, a plain Ubuntu Kata container passed
+two explicit stop/start cycles with numeric `0:0`, numeric `1000:1000`, and named
+`ubuntu` exec. VM evidence is `/home/kata-test/kata-stop-start.BTUAiCUf`;
+the development-worker summary is `/workspace/kata-vm-stop-start.log`.
+
+The standard worker canary then passed initial/restarted/replacement READY,
+UID-1000 tmux/editor/desktop checks, and marker contents/ownership on both retained
+persistent volumes. This experiment kept the canary script unchanged (SHA-256
+`ddefdd029a5257cd65aa88bef40893afe5bcf664df309830f255dd7c95dfcc29`)
+and used a narrow external wrapper translating only its exact
+`docker restart --time 20 <CID>` call into awaited stop followed by start. Every
+other Docker call, including explicit-user exec, reached the same daemon
+unchanged. No runtime, user, privilege, or storage fallback occurred.
+
+Here, tmux/editor/desktop checks mean session existence and successful HTTP
+responses. They do not establish interactive terminal, browser editor,
+VNC/WebSocket, or clipboard acceptance.
+
+- VM evidence: `/home/kata-test/kata-worker-stop-start.8ANRJuae/agentor-kata-worker.KNElAeau`.
+- Development-worker summary: `/workspace/kata-vm-worker-stop-start.log`.
+- Exact successful test containers, subsequently removed:
+  `83f96e592dcd049e15362e698db63f6d3baa07ca04327cc28c32dd4e67f00dcf`
+  and `534d6206c7621f3ec146c42c56614e0932c7ec2deac2dfc15f3e73217f09955e`.
+- Retained volumes: `kata-worker-20260928T174813Z-KNElAeau-workspace` and
+  `kata-worker-20260928T174813Z-KNElAeau-agent-data`; the worker image is unchanged.
+
+Agentor now performs separate awaited stop/start for running Kata workers inside
+the existing owner/worker lifecycle fence. Legacy workers retain Docker's
+combined restart, including explicit administrator-authorized privileged legacy
+workers. Stopped workers still start directly. Runtime/restore checks, durable
+running intent, secret restart policy, bootstrap, and health validation are
+unchanged. Failed or ambiguous stop never proceeds to start; start failure leaves
+the runtime unknown. Eight new direct-manager regressions cover these boundaries.
+
+Both operator canaries now default to `--restart-method stop-start` and record
+`restartMethod` in JSON. Explicit `--restart-method docker` remains a diagnostic
+of Docker's combined restart; failure never switches methods automatically.
+The wrapper experiment proves the chosen primitive with the standard image, not
+execution of the updated manager through authenticated APIs.
+
+The current repository scripts then passed directly on the original daemon,
+without a wrapper. `/workspace/kata-vm-direct-stop-start.log` records the smoke
+and full standalone-worker JSON, both `passed: true` and
+`restartMethod: stop-start`, with `isolationVerified: false` /
+`hostValidated: false`. Script identities were checked before execution:
+
+- Smoke SHA-256: `86e20ddc733fcd8be96ccfe4c676d21505103bed8115f8ce13e20bbaa88c6da5`.
+- Worker SHA-256: `46aaad551b2398acc336074d60a0cd1d0d4e0a70370629d1fd8d0f015a4673bb`.
+- VM worker evidence: `/home/kata-test/agentor-kata-worker.MsE4ozsQ`.
+- Removed exact successful containers:
+  `904becfed1d0085e00f0b5ccda285ec7bf33507edb74ba6586948b7d078a1cd3`
+  and `f4d578e94228e1ec193b1e443921d961f36b4d1df361c30ef9e7c98f5467df73`.
+- Retained volumes: `kata-worker-20260928T180141Z-MsE4ozsQ-workspace` and
+  `kata-worker-20260928T180141Z-MsE4ozsQ-agent-data`.
+
+The current smoke script's explicit `--restart-method docker` control again
+failed after combined restart (`initialUserExecPassed: true`, `restartPassed:
+true`, `restartedUserExecPassed: false`), with successful exact-container
+cleanup. `/workspace/kata-vm-direct-combined-restart.log` records the exit-1
+result; the default stop/start did not hide or retry that failure.
+
+Local verification passed 345 module tests, 21 offline smoke scenarios and 11
+fake-Docker worker-harness cases. These are distinct from the direct VM tests.
+The full classic-overlay2 worker attempt stopped in the private-daemon identity
+guard before acceptance; its evidence remains at
+`/var/tmp/kata-classic-worker.cHkzClyM`. A Bash unquoted-pattern comparison was
+identified in that outside-repository diagnostic guard; no successful full
+classic worker result is claimed.
+
+Capacity admission, guest DinD permissions/storage/cgroups, backup/migration
+rollback, and real API/UI worker lifecycle acceptance remain incomplete. The
+six import/restore UI-control cases are separately scoped mocked-operation tests;
+their browser pass below does not prove real worker migration. No host attestation
+or DinD gate is enabled by this result.
+
+## Browser runtime controls
+
+Six focused import/backup UI cases passed in Chromium against a fresh VM-local
+orchestrator (21.6 seconds), with real setup/login but mocked import/restore
+operation routes. Ordinary-user cases mock the displayed session role; they are
+not backend authorization tests. They cover administrator legacy acknowledgement,
+reset on modal close, no runtime override for original-worker restore, and no
+legacy selection/override in the ordinary-user controls.
+
+The orchestrator used `AGENTOR_INSTANCE_RECOVERY_MODE=true` to suppress automatic
+workers and administrative workspaces. No Kata validation flag was set. The
+harness rejected existing managed workers/Traefik and fixed networks before
+startup, and verified preexisting container IDs remained afterward. The browser
+ran as the test-directory owner, UID/GID 1001, with all capabilities dropped and
+no Docker socket. Only the test orchestrator had the disposable VM Docker socket.
+
+- Log: `/workspace/kata-vm-ui-acceptance-2.log`.
+- VM evidence: `/home/kata-test/kata-ui-evidence.jGOOc9B2`.
+- Reports: `/home/kata-test/kata-ui-tests.Wih6QSEQ/playwright-report`.
+- Retained data: `kata-ui-20260928T181016Z-jGOOc9B2-data`.
+- Harness SHA-256: `852b06e7f5a863b89c394e545e7aa77b64bc6b05aed4ca62947a0672c70c6621`.
+- Orchestrator VM manifest ID: `sha256:49861c2978532dd9766a0e1cdd5625c306c1800f7190e79f8f35b06cd2ff06d5`;
+  verified config digest: `sha256:dcc2191f2b072bcb84c71970afe3ed439a65a8cdb2c63a6d698813d9395f60b6`.
+- Playwright VM manifest ID: `sha256:6010c1140fc5c0cb4e969822a31b1562ade77886e8a000be2a37677c39fe9c8e`;
+  verified config digest: `sha256:fc1610b07935476ac20219b7911f6bbe47ac861523635845ba0bc7cc5f0277c4`.
+
+The first UI harness attempt failed at npm before tests because a capability-
+dropped root browser could not read the UID1001-owned 0700 test directory. It
+cleaned up successfully; evidence remains at `kata-ui-evidence.HRKjznc1`. The
+second run used that non-root owner rather than adding capabilities.
+
+Both runs removed only their exact containers and labeled empty networks,
+retaining data/evidence. Main Docker PID28754, service start time, and daemon.json
+hash remained unchanged; the original failed worker remains stopped. There are
+no active test containers. Worker and UI evidence/reports are archived locally
+at `/workspace/kata-vm-stop-start-ui-evidence.tar.gz`, SHA-256
+`5eecff308eb1edcc86c8b3c53a81ba18eb34d4b2e24c30c5061b9cf79a308a45`.
+
+Image transfer exposed a separate backup compatibility blocker: classic Docker's
+config ID and containerd Docker's manifest ID differ for unchanged content.
+Raw config hashes were verified on both sides; the current snapshot destination
+check would reject this valid transfer. A portable cryptographic identity must
+be implemented before claiming cross-store snapshot restore support.

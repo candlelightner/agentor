@@ -5,6 +5,7 @@ set -euo pipefail
 RUNTIME=agentor-kata-qemu
 DOCKER_SOCKET=unix:///var/run/docker.sock
 IMAGE=ubuntu:24.04
+restart_method=stop-start
 container_id=
 passed=false
 guest_kernel=
@@ -32,10 +33,12 @@ report() {
     --arg guestKernel "$guest_kernel" --arg message "$message" --argjson passed "$passed" \
     --argjson initialUserExecPassed "$initial_user_exec" --argjson restartPassed "$restart_passed" \
     --argjson restartedUserExecPassed "$restarted_user_exec" \
+    --arg restartMethod "$restart_method" \
     '{passed:$passed,runtime:$runtime,image:$image,hostKernel:$hostKernel,guestKernel:$guestKernel,
       kernelReleaseDiffers:($guestKernel != "" and $guestKernel != $hostKernel),isolationVerified:false,
       initialUserExecPassed:$initialUserExecPassed,restartPassed:$restartPassed,
       restartedUserExecPassed:$restartedUserExecPassed,message:$message,
+      restartMethod:$restartMethod,
       scope:"requested-runtime create/start/root exec and UID/GID 1000 exec before/after restart only; VM isolation, DinD and Agentor migration unverified"}'
 }
 
@@ -59,6 +62,19 @@ check_user_exec() {
 }
 
 main() {
+  local method_set=false
+  while (($#)); do
+    case "$1" in
+      --restart-method)
+        if [[ "$method_set" == true || $# -lt 2 || ! "$2" =~ ^(stop-start|docker)$ ]]; then
+          printf 'Usage: bash scripts/check-kata-host.sh [--restart-method stop-start|docker]\n' >&2; return 2
+        fi
+        restart_method=$2; method_set=true; shift 2 ;;
+      -h|--help)
+        printf 'Usage: bash scripts/check-kata-host.sh [--restart-method stop-start|docker]\nDefault stop-start matches Agentor Kata lifecycle; docker is a direct-restart diagnostic. No fallback.\n'; return 0 ;;
+      *) printf 'Unknown argument: %s\n' "$1" >&2; return 2 ;;
+    esac
+  done
   command -v jq >/dev/null || { printf 'jq is required.\n' >&2; return 1; }
   trap finish EXIT
   if ! docker_available; then
@@ -90,12 +106,19 @@ main() {
     message='Initial explicit UID/GID 1000 Docker exec failed or returned the wrong identity.'; return 1
   fi
   initial_user_exec=true
-  if ! timeout 180 docker -H "$DOCKER_SOCKET" restart --time 10 "$container_id" >/dev/null; then
-    message='Kata canary restart failed; inspect Docker and Kata logs.'; return 1
+  if [[ "$restart_method" == stop-start ]]; then
+    if ! timeout 180 docker -H "$DOCKER_SOCKET" stop --time 10 "$container_id" >/dev/null; then
+      message='Kata canary stop failed or timed out; start was not attempted.'; return 1
+    fi
+    if ! timeout 180 docker -H "$DOCKER_SOCKET" start "$container_id" >/dev/null; then
+      message='Kata canary start after stop failed; no fallback was attempted.'; return 1
+    fi
+  elif ! timeout 180 docker -H "$DOCKER_SOCKET" restart --time 10 "$container_id" >/dev/null; then
+    message='Kata canary direct Docker restart failed; no fallback was attempted.'; return 1
   fi
   restart_passed=true
   if ! check_user_exec; then
-    message='Explicit UID/GID 1000 Docker exec failed after restart; this host is not worker-compatible.'; return 1
+    message="Explicit UID/GID 1000 Docker exec failed after $restart_method; the selected restart method is not worker-compatible."; return 1
   fi
   restarted_user_exec=true
   passed=true

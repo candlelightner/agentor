@@ -59,7 +59,8 @@ status field `dockerRuntimeOptionsVerified` remains false because Docker info
 does not expose the effective shim-v2 options. The
 check script starts a disposable Ubuntu container with that runtime, records
 the guest and host kernel releases, verifies explicit UID/GID `1000:1000` exec
-both before and after container restart, prints stage-specific JSON, and
+both before and after separate stop/start, prints stage-specific JSON including
+`restartMethod`, and
 removes its exact canary container. Cleanup failure also fails the check.
 It may pull `ubuntu:24.04`; it does not remove the shared image.
 A successful smoke check is **not** DinD or full
@@ -85,9 +86,19 @@ Build the standard `worker/Dockerfile` locally first; the test does not build or
 pull images. It checks READY, UID-1000 services/writes, restart and recreation,
 but is not an orchestrator API/UI test. It retains image/volumes/evidence and
 retains failed containers (possibly running) for exact-ID diagnosis. The tested
-Docker 29.1.3/containerd 2.2.1/Kata 4.2.0 VM passed first boot but failed explicit
-UID exec after restart. See [the VM evidence](kata-worker-vm-evidence.md).
-Do not attest that combination based on the earlier root-only boot check.
+Docker 29.1.3/containerd 2.2.1/Kata 4.2.0 VM failed explicit UID exec after Docker's
+combined restart. Separate stop/start on the same daemon passed the standard
+standalone non-DinD worker's services and volume persistence through recreation.
+The updated smoke and full worker scripts subsequently passed directly without
+the diagnostic wrapper. See [the VM evidence](kata-worker-vm-evidence.md) for exact
+script/image identities and limits; real Agentor API/UI lifecycle acceptance is
+still pending.
+
+Both canaries default to `--restart-method stop-start`, matching Agentor's running
+Kata-worker restart path. `--restart-method docker` explicitly tests Docker's
+combined restart and never falls back after failure. Legacy workers keep their
+existing combined restart path. Do not attest the host from root-only checks,
+change Docker's storage backend in place, or substitute root exec for UID 1000.
 
 ## Compatibility boundaries
 
@@ -205,6 +216,14 @@ those do not preserve image configuration. Rootfs files may contain credentials;
 protect these archives like the encrypted instance backup. This is an explicit
 operator image-transfer dependency, not automatic image backup.
 
+Cross-store transfer remains an acceptance blocker: Docker classic may report
+the config digest as `Id`, while Docker29's containerd store reports a manifest
+digest for the same saved image. The current exact-ID destination check rejects
+that legitimate mismatch. Do not bypass it or replace it with tag-only matching.
+A verified portable config identity (including runtime configuration and ordered
+layer identities) and backward-compatible manifest handling still need
+implementation and cross-store tests before this procedure is generally usable.
+
 `scripts/test-worker-local-runtime-snapshot.sh --run-worker-local` checks a
 disposable unprivileged container's writable rootfs, configuration, runtime-Env
 clearing, and image save/load round trip in the worker-local daemon. It does
@@ -219,6 +238,21 @@ content may reside on different filesystems. A sound automatic admission check
 needs operator-provided read-only storage mappings/capacity measurements, bounded
 source sizing, and reservation or a post-stop recheck. Until implemented and
 tested, this is a rollout blocker; copying failure alone is not capacity proof.
+Public migration currently rejects with
+`WORKER_RUNTIME_MIGRATION_CAPACITY_UNVERIFIED` before journal or Docker access;
+preflight and existing-journal recovery/finalization remain available.
+
+The proposed next step is a narrowly scoped, operator-installed capacity broker
+with authenticated, operation-bound filesystem measurements and durable
+per-filesystem byte/inode reservations, followed by a fresh stopped-source
+recheck. Broker trust/key deployment and a maintenance lease or equivalent
+controls over unrelated writers still need an operator choice. A signature
+authenticates evidence but cannot stop another worker or host process consuming
+space. Protected recovery capacity must survive uncertain outcomes; neither
+restarts nor expired evidence may silently release it. No production collector,
+new host mount, global worker stop, or filesystem quota policy is authorized by
+this design proposal. Source-host reservations must never become destination
+authority through backup restore.
 
 ## Sources and pin
 

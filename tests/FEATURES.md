@@ -44,10 +44,23 @@ Every user-facing feature of the Agentor web dashboard, organized by category. T
 - The operator smoke check requires explicit UID/GID 1000 exec before and after
   container restart, not only root exec. Restart/user-resolution failures and
   cleanup failures reject the check; VM isolation remains explicitly unverified.
+  Smoke and worker canaries default to separate `stop-start`, with explicit
+  `docker` combined-restart diagnostics and no automatic method fallback.
+- Running Kata workers restart through awaited stop then start under the existing
+  lifecycle fence, preserving desired state, runtime authorization and secret
+  bootstrap. Stop failure/timeout prevents start; failed/ambiguous start remains
+  unknown without bootstrap. Stopped workers still start directly; legacy
+  workers, including explicitly authorized privileged legacy workers, retain
+  combined restart and their existing privilege grant. Explicit-user exec is
+  never replaced with a root-user workaround.
 - An opt-in standalone non-DinD worker canary checks real startup, UID 1000
   tmux/editor/desktop, and named-volume persistence over restart/replacement.
   It never enables host attestation or deploys an orchestrator, and retains
   failed containers plus data for diagnosis instead of silently retrying.
+  Separate stop/start passed the standard standalone worker on the tested
+  Docker29/containerd/Kata VM; authenticated API/UI worker acceptance, DinD and
+  migration remain pending. Capacity-broker deployment/trust and controls over
+  unrelated storage writers require an operator decision before admission.
 - Migration derives DinD from the source container's structured environment,
   not mutable environment settings or an assumed exported shell variable.
   Ambiguous/malformed/conflicting source settings reject before mutation.
