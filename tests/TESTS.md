@@ -50,6 +50,13 @@ installer tests do not access host Docker or install anything. The archive
 fixtures are in `tests/kata-archive-fixtures.py` (11 unittest cases). These include
 the pinned release's `.`/`opt` directory headers, non-directory wrapper rejection,
 normalized duplicates, wrapper-only archives, and forbidden wrapper link targets.
+Runtime-report fixtures use Docker 26/29's actual empty-object shim-v2 shape,
+accept absent type/options only with exact on-disk configuration, and reject
+malformed, missing, failed-query, and contradictory reports. Eight mocked
+installer scenarios cover unchanged/no-restart, initial registration, stale
+registration, and five failure/rollback paths (missing alias, original config
+preservation, malformed report, query failure, and service restart failure).
+These do not establish the running daemon's effective ConfigPath or VM boot.
 
 The separate opt-in `scripts/probe-worker-local-dind.sh --run-worker-local`
 experiment uses the worker's own Docker daemon with no privileged flag, host

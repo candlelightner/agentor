@@ -44,8 +44,8 @@ archive paths and required files, validates a merged daemon configuration,
 then installs to `/opt/kata` and registers `agentor-kata-qemu`. The daemon JSON
 merge retains existing keys and runtimes, including `default-runtime`. An
 existing `/etc/docker/daemon.json` gets a uniquely named backup. A repeated run
-with the same managed release and active registration returns without a Docker
-restart; a different existing Kata installation is left untouched for manual
+with the same managed release, exact on-disk configuration, and reported runtime
+alias returns without a Docker restart; a different existing Kata installation is left untouched for manual
 review. If Docker fails after
 the restart, the previous daemon JSON is restored when the script changed it
 and Docker restart is retried. Installed `/opt/kata` files remain for inspection;
@@ -55,6 +55,8 @@ The preflight and status commands print JSON. `prerequisitesDetected: true` mean
 basic candidate host requirements were detected; `physicalHostValidated` remains
 false. `dockerReportsRuntime: true` means
 Docker lists the alias. Neither means a VM or Agentor worker succeeded. The
+status field `dockerRuntimeOptionsVerified` remains false because Docker info
+does not expose the effective shim-v2 options. The
 check script starts and executes a disposable Ubuntu container with that
 runtime, records the guest and host kernel releases, prints JSON, and
 removes its exact canary container. It may pull `ubuntu:24.04`; it does not
@@ -84,6 +86,26 @@ Eleven archive fixture cases and the offline host fixtures pass. The full pinned
 amd64 archive also passed read-only validation inside the development worker,
 with SHA-256 `b828904fa3f1e49ddd7dc799c72cb1503cd1e772d354c3987c8d4189b2a623a8`.
 This verifies archive compatibility only, not installation, VM boot, or isolation.
+
+### Docker runtime reporting correction (2026-09-28)
+
+The second VM attempt installed the pinned files and restarted Docker, but the
+installer incorrectly required `runtimeType` and `options` from `docker info`.
+Docker's runtime reporting omits those fields for configured shim-v2 runtimes;
+an empty object for the alias is valid. The installer consequently rolled back
+the newly created daemon configuration and restarted Docker again. The managed
+Kata files remain and can be reused on retry without another release download.
+
+Verification now separates exact on-disk shim/options configuration from the
+runtime alias Docker reports. Any reported contradictory configuration is still
+rejected. The API does not prove which ConfigPath is loaded; a no-op registration
+check is not proof of effective shim configuration or VM isolation. The separate
+boot check and operator canary remain mandatory, and `KATA_HOST_VALIDATED` must
+remain unset pending that evidence.
+
+Source: Moby's `fillPlatformInfo` copies only runtime Path/Args and status in
+[Docker 26.1.5](https://github.com/moby/moby/blob/v26.1.5/daemon/info_unix.go)
+and [Docker 29.1.3](https://github.com/moby/moby/blob/docker-v29.1.3/daemon/info_unix.go).
 
 ### Host and guest prerequisites
 

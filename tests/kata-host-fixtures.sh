@@ -46,6 +46,48 @@ if bash "$setup" --install >/dev/null 2>&1; then
   exit 1
 fi
 
+# Docker Info reports only Path/Args/status in Moby v26.1.5 and v29.1.3;
+# unlike daemon.json, a shim-v2 entry is normally an empty object.
+(
+  source "$setup"
+  DOCKER_CONFIG="$fixture_dir/merged.json"
+  runtime_report='{"runc":{"path":"runc"},"agentor-kata-qemu":{}}'
+  docker() { printf '%s\n' "$runtime_report"; }
+  docker_runtime_matches
+  for runtime_report in \
+    '{"agentor-kata-qemu":{"status":{}}}' \
+    '{"agentor-kata-qemu":{"path":"","runtimeArgs":[]}}'; do
+    docker_runtime_matches
+  done
+  runtime_report=$(jq -c '.runtimes' "$DOCKER_CONFIG")
+  docker_runtime_matches
+  for runtime_report in \
+    '{}' '[]' 'null' 'not-json' \
+    '{"agentor-kata-qemu":null}' '{"agentor-kata-qemu":[]}' \
+    '{"agentor-kata-qemu":"shim"}' \
+    '{"agentor-kata-qemu":{"path":"/usr/bin/runc"}}' \
+    '{"agentor-kata-qemu":{"runtimeArgs":["unexpected"]}}' \
+    '{"agentor-kata-qemu":{"runtimeType":"unexpected-shim"}}' \
+    '{"agentor-kata-qemu":{"options":{"ConfigPath":"unexpected-config"}}}'; do
+    if docker_runtime_matches; then
+      printf 'Invalid Docker Info runtime report was accepted: %s\n' "$runtime_report" >&2
+      exit 1
+    fi
+  done
+  runtime_report='{"agentor-kata-qemu":{}}'
+  DOCKER_CONFIG="$fixture_dir/conflict.json"
+  if docker_runtime_matches; then
+    printf 'Alias-only report bypassed conflicting on-disk configuration.\n' >&2
+    exit 1
+  fi
+  DOCKER_CONFIG="$fixture_dir/merged.json"
+  docker() { return 1; }
+  if docker_runtime_matches; then
+    printf 'Failed Docker Info command was accepted.\n' >&2
+    exit 1
+  fi
+)
+
 # Source-only tests replace every host operation and redirect all installation
 # paths into the fixture directory. They never invoke host installation mode.
 mock_install() (
@@ -66,20 +108,30 @@ mock_install() (
   host_arch() { printf amd64; }
   dockerd() { :; }
   docker() {
-    if [[ "$scenario" == stale-active && ! -e "$fixture_dir/$scenario/restarts" ]]; then
-      printf '{"agentor-kata-qemu":{"runtimeType":"unexpected-shim"}}\n'
-    else
-      jq -n --arg shim "$KATA_SHIM" --arg config "$KATA_CONFIG" \
-        '{"agentor-kata-qemu":{runtimeType:$shim,options:{ConfigPath:$config}}}'
-    fi
+    case "$scenario" in
+      stale-active)
+        if [[ ! -e "$fixture_dir/$scenario/restarts" ]]; then
+          printf '{"agentor-kata-qemu":{"path":"/usr/bin/runc"}}\n'
+          return
+        fi ;;
+      fail-missing|fail-existing) printf '{}\n'; return ;;
+      fail-malformed) printf 'not-json\n'; return ;;
+      fail-query) return 1 ;;
+    esac
+    printf '{"runc":{"path":"runc"},"agentor-kata-qemu":{}}\n'
   }
-  systemctl() { printf '%s\n' "$*" >> "$fixture_dir/$scenario/restarts"; }
+  systemctl() {
+    printf '%s\n' "$*" >> "$fixture_dir/$scenario/restarts"
+    [[ "$scenario" != fail-restart ]]
+  }
   curl() { printf 'Unexpected download in managed-install fixture.\n' >&2; return 1; }
   status() { :; }
   if [[ "$scenario" == unchanged || "$scenario" == stale-active ]]; then
     render_daemon_config /dev/null "$fixture_dir/$scenario/rendered.json"
     # Deliberately use different whitespace to test semantic idempotence.
     jq -c . "$fixture_dir/$scenario/rendered.json" > "$DOCKER_CONFIG"
+  elif [[ "$scenario" == fail-existing ]]; then
+    cp "$fixture_dir/existing.json" "$DOCKER_CONFIG"
   fi
   install_host
   [[ -f "$DOCKER_CONFIG" ]]
@@ -97,5 +149,27 @@ mock_install() (
 mock_install unchanged
 mock_install registration-needed
 mock_install stale-active
+
+for scenario in fail-missing fail-existing fail-malformed fail-query fail-restart; do
+  if mock_install "$scenario" > "$fixture_dir/$scenario.stdout" 2> "$fixture_dir/$scenario.stderr"; then
+    printf 'Expected installation verification failure: %s\n' "$scenario" >&2
+    exit 1
+  fi
+  if [[ "$scenario" == fail-existing ]]; then
+    cmp "$fixture_dir/existing.json" "$fixture_dir/$scenario/etc/docker/daemon.json"
+  else
+    [[ ! -e "$fixture_dir/$scenario/etc/docker/daemon.json" ]]
+  fi
+  [[ "$(wc -l < "$fixture_dir/$scenario/restarts")" == 2 ]]
+  grep -q 'Runtime verification: exact daemon.json configuration matches: yes' "$fixture_dir/$scenario.stderr"
+  grep -q 'Docker runtime registration' "$fixture_dir/$scenario.stderr"
+  grep -q 'Previous daemon.json was restored' "$fixture_dir/$scenario.stderr"
+  if [[ "$scenario" == fail-query || "$scenario" == fail-malformed ]]; then
+    grep -q 'Could not read a valid runtime map' "$fixture_dir/$scenario.stderr"
+  elif [[ "$scenario" == fail-restart ]]; then
+    grep -q 'Docker service restart failed' "$fixture_dir/$scenario.stderr"
+    grep -q 'restart after configuration rollback also failed' "$fixture_dir/$scenario.stderr"
+  fi
+done
 
 printf 'Kata host offline fixtures passed.\n'

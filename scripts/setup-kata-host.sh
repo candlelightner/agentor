@@ -78,10 +78,41 @@ docker_server_version() {
   docker -H "$DOCKER_SOCKET" version --format '{{.Server.Version}}' 2>/dev/null
 }
 
-docker_runtime_matches() {
+daemon_config_matches() {
+  [[ -f "$DOCKER_CONFIG" ]] && jq -e --arg runtime "$KATA_RUNTIME" --arg shim "$KATA_SHIM" --arg config "$KATA_CONFIG" \
+    '.runtimes[$runtime] == {runtimeType:$shim,options:{ConfigPath:$config}}' "$DOCKER_CONFIG" >/dev/null 2>&1
+}
+
+docker_runtime_report_matches() {
+  # Moby v26.1.5 and docker-v29.1.3 daemon/info_unix.go copy only Path/Args
+  # into Info.Runtimes, not shim-v2 Type/Options. A shim-v2 alias can be {}.
+  # Verify registration and reject any exposed contradictions, but never infer
+  # that this API proves the running daemon's ConfigPath (or a successful boot).
   docker -H "$DOCKER_SOCKET" info --format '{{json .Runtimes}}' 2>/dev/null |
     jq -e --arg runtime "$KATA_RUNTIME" --arg shim "$KATA_SHIM" --arg config "$KATA_CONFIG" \
-      '.[$runtime] | .runtimeType == $shim and .options == {ConfigPath:$config}' >/dev/null
+      'type == "object" and (.[$runtime] | type == "object"
+        and ((has("path") | not) or .path == "")
+        and ((has("runtimeArgs") | not) or .runtimeArgs == [])
+        and ((has("runtimeType") | not) or .runtimeType == $shim)
+        and ((has("options") | not) or .options == {ConfigPath:$config}))' >/dev/null 2>&1
+}
+
+docker_runtime_matches() {
+  daemon_config_matches && docker_runtime_report_matches
+}
+
+runtime_failure_diagnostics() {
+  printf 'Runtime verification: exact daemon.json configuration matches: ' >&2
+  if daemon_config_matches; then printf 'yes\n' >&2; else printf 'no\n' >&2; fi
+  printf 'Docker runtime registration (options/arguments omitted from diagnostics):\n' >&2
+  if ! docker -H "$DOCKER_SOCKET" info --format '{{json .Runtimes}}' 2>/dev/null |
+    jq --arg runtime "$KATA_RUNTIME" \
+      'if type != "object" then error("runtime map is not an object") else
+        {runtime:$runtime,registered:has($runtime),entryType:(.[$runtime]|type),
+         path:(.[$runtime] | if type == "object" then .path else null end),
+         runtimeType:(.[$runtime] | if type == "object" then .runtimeType else null end)} end' >&2; then
+    printf 'Could not read a valid runtime map from the local Docker daemon.\n' >&2
+  fi
 }
 
 host_arch() {
@@ -154,23 +185,22 @@ status() {
     [[ "$(<"$KATA_MARKER")" == "$KATA_VERSION $arch $expected" ]]; then
     installed=true
   fi
-  if [[ -f "$DOCKER_CONFIG" ]] && jq -e --arg runtime "$KATA_RUNTIME" --arg shim "$KATA_SHIM" --arg config "$KATA_CONFIG" \
-    '.runtimes[$runtime] == {runtimeType:$shim,options:{ConfigPath:$config}}' "$DOCKER_CONFIG" >/dev/null 2>&1; then
+  if daemon_config_matches; then
     registered=true
   fi
   if command -v docker >/dev/null && [[ -S /var/run/docker.sock ]] &&
-    docker -H "$DOCKER_SOCKET" info --format '{{json .Runtimes}}' 2>/dev/null | jq -e --arg runtime "$KATA_RUNTIME" 'has($runtime)' >/dev/null 2>&1; then
+    docker_runtime_report_matches; then
     active=true
   fi
   jq -n --arg runtime "$KATA_RUNTIME" --arg version "$KATA_VERSION" --argjson installed "$installed" \
     --argjson registered "$registered" --argjson active "$active" \
-    '{runtime:$runtime,kataVersion:$version,installed:$installed,daemonConfigRegistered:$registered,dockerReportsRuntime:$active,canaryResult:"not_recorded"}'
+    '{runtime:$runtime,kataVersion:$version,installed:$installed,daemonConfigRegistered:$registered,dockerReportsRuntime:$active,dockerRuntimeOptionsVerified:false,canaryResult:"not_recorded"}'
 }
 
 install_host() {
   require_root
   preflight >&2 || die 'Host preflight failed; no files changed.'
-  local arch expected archive_url scratch staged_config backup='' existing=false config_changed=false
+  local arch expected archive_url scratch staged_config backup='' existing=false config_changed=false failure_reason=''
   arch=$(host_arch)
   expected=$(expected_sha "$arch")
   archive_url="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/kata-static-${KATA_VERSION}-${arch}.tar.zst"
@@ -216,17 +246,23 @@ install_host() {
   if [[ "$existing" == true && "$config_changed" == false ]] &&
     docker_runtime_matches; then
     status
-    printf 'Kata host runtime already installed and active; Docker was not restarted.\n' >&2
+    printf 'Kata files and daemon.json match; Docker reports the runtime alias. Docker was not restarted.\n' >&2
+    printf 'Docker info does not verify active ConfigPath/options. Run scripts/check-kata-host.sh next.\n' >&2
     return
   fi
   # Explicit operator consent was required before entering this function.
-  if ! systemctl restart docker.service ||
-    ! docker_runtime_matches; then
+  if ! systemctl restart docker.service; then
+    failure_reason='Docker service restart failed.'
+  elif ! docker_runtime_matches; then
+    failure_reason='Docker runtime registration or exact on-disk configuration did not match after restart.'
+  fi
+  if [[ -n "$failure_reason" ]]; then
+    runtime_failure_diagnostics
     if [[ "$config_changed" == true ]]; then
       if [[ -n "$backup" ]]; then cp -p -- "$backup" "$DOCKER_CONFIG"; else rm -f -- "$DOCKER_CONFIG"; fi
-      systemctl restart docker.service || true
+      systemctl restart docker.service || printf 'WARNING: Docker restart after configuration rollback also failed.\n' >&2
     fi
-    die 'Docker did not report the expected Kata shim/config after restart; previous daemon.json was restored if this run changed it. Inspect docker.service before upgrading Agentor.'
+    die "$failure_reason Previous daemon.json was restored if this run changed it. Inspect docker.service before upgrading Agentor."
   fi
   status
   printf 'Run scripts/check-kata-host.sh next; a runtime listing is not a VM boot check.\n' >&2

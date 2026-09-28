@@ -36,6 +36,9 @@ Every user-facing feature of the Agentor web dashboard, organized by category. T
 - Operator host setup accepts the pinned release's `.` and `opt` directory
   headers without admitting payloads outside `opt/kata`; traversal, unsafe links,
   duplicate members, and special files remain rejected before extraction.
+- Host setup verifies exact on-disk shim/options separately from Docker's
+  reported runtime alias: Docker 26/29 omit shim-v2 type/options in `info`.
+  Registration is not proof of effective configuration, boot, or isolation.
 - Coverage: `worker-runtime-policy.spec.ts`, `worker-runtime-admin.spec.ts`,
   `worker-runtime-backup.spec.ts`, `worker-runtime-migration.spec.ts`,
   `kata-managed-volume-runtime.spec.ts`, and runtime additions in the inventory,
