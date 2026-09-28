@@ -73,6 +73,20 @@ gate or turn alias registration into host validation.
 
 ## Compatibility boundaries
 
+### Archive validation correction (2026-09-28)
+
+The first operator attempt on a disposable Ubuntu 24.04 amd64 VM with Docker
+29.1.3 passed preflight and checksum verification, but rejected the official
+archive's `.` directory header. No Kata installation or Docker restart occurred.
+The validator now accepts only directory headers for `.` and `opt` as extraction
+scaffolding; payloads and link targets remain confined to `opt/kata`.
+Eleven archive fixture cases and the offline host fixtures pass. The full pinned
+amd64 archive also passed read-only validation inside the development worker,
+with SHA-256 `b828904fa3f1e49ddd7dc799c72cb1503cd1e772d354c3987c8d4189b2a623a8`.
+This verifies archive compatibility only, not installation, VM boot, or isolation.
+
+### Host and guest prerequisites
+
 Kata's VM requires `/dev/kvm` and VSOCK. If the preflight reports missing
 `/dev/vhost-vsock`, load `vhost_vsock` under your host change process; Kata
 also documents `vhost_net` for networking. The setup script does not load

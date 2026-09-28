@@ -33,6 +33,9 @@ Every user-facing feature of the Agentor web dashboard, organized by category. T
   destination administrator callback. Whole-instance restores strip privilege
   grants, omit source-host migration journals, and hold all worker runtimes until
   destination approval, including old records without profile metadata.
+- Operator host setup accepts the pinned release's `.` and `opt` directory
+  headers without admitting payloads outside `opt/kata`; traversal, unsafe links,
+  duplicate members, and special files remain rejected before extraction.
 - Coverage: `worker-runtime-policy.spec.ts`, `worker-runtime-admin.spec.ts`,
   `worker-runtime-backup.spec.ts`, `worker-runtime-migration.spec.ts`,
   `kata-managed-volume-runtime.spec.ts`, and runtime additions in the inventory,

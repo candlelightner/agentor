@@ -47,7 +47,9 @@ From the repository root, `bash tests/kata-host-fixtures.sh` checks configuratio
 preservation/conflicts, semantic no-op versus required restart, cleanup after
 function return, and malicious archive paths/types/link chains. Its mocked
 installer tests do not access host Docker or install anything. The archive
-fixtures are in `tests/kata-archive-fixtures.py`.
+fixtures are in `tests/kata-archive-fixtures.py` (11 unittest cases). These include
+the pinned release's `.`/`opt` directory headers, non-directory wrapper rejection,
+normalized duplicates, wrapper-only archives, and forbidden wrapper link targets.
 
 The separate opt-in `scripts/probe-worker-local-dind.sh --run-worker-local`
 experiment uses the worker's own Docker daemon with no privileged flag, host

@@ -10,11 +10,14 @@ def inside_tree(path):
     return path == "opt/kata" or path.startswith("opt/kata/")
 
 
-def member_path(path):
-    if path.startswith("/") or ".." in path.split("/"):
+def member_path(path, *, allow_scaffolding=False):
+    if not path or path.startswith("/") or ".." in path.split("/"):
         raise ValueError(f"absolute/traversing archive path: {path!r}")
     normalized = posixpath.normpath(path)
-    if not inside_tree(normalized):
+    # Release archives include ./ and ./opt/ directory headers. They are
+    # harmless extraction scaffolding, not additional allowed payload roots or
+    # link destinations. Callers must opt in only for directory members.
+    if not inside_tree(normalized) and not (allow_scaffolding and normalized in (".", "opt")):
         raise ValueError(f"path outside opt/kata: {path!r}")
     return normalized
 
@@ -23,7 +26,7 @@ def validate(stream):
     members = {}
     with tarfile.open(fileobj=stream, mode="r|") as archive:
         for item in archive:
-            path = member_path(item.name)
+            path = member_path(item.name, allow_scaffolding=item.isdir())
             if path in members:
                 raise ValueError(f"duplicate archive member: {path!r}")
             if not (item.isfile() or item.isdir() or item.issym() or item.islnk()):
@@ -40,6 +43,8 @@ def validate(stream):
             members[path] = item
     if not members:
         raise ValueError("empty archive")
+    if not any(inside_tree(path) for path in members):
+        raise ValueError("archive contains only directory scaffolding")
     for path, item in members.items():
         parent = posixpath.dirname(path)
         while inside_tree(parent):
