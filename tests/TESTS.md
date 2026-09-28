@@ -52,10 +52,11 @@ the pinned release's `.`/`opt` directory headers, non-directory wrapper rejectio
 normalized duplicates, wrapper-only archives, and forbidden wrapper link targets.
 Runtime-report fixtures use Docker 26/29's actual empty-object shim-v2 shape,
 accept absent type/options only with exact on-disk configuration, and reject
-malformed, missing, failed-query, and contradictory reports. Eight mocked
+empty, malformed, missing, failed-query, and contradictory reports. Nine mocked
 installer scenarios cover unchanged/no-restart, initial registration, stale
-registration, and five failure/rollback paths (missing alias, original config
-preservation, malformed report, query failure, and service restart failure).
+registration, and six failure/rollback paths (missing alias, original config
+preservation, malformed report, query failure, service restart failure, and
+unchanged configuration retained when the alias remains missing).
 These do not establish the running daemon's effective ConfigPath or VM boot.
 
 The separate opt-in `scripts/probe-worker-local-dind.sh --run-worker-local`

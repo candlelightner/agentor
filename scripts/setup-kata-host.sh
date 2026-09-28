@@ -106,7 +106,7 @@ runtime_failure_diagnostics() {
   if daemon_config_matches; then printf 'yes\n' >&2; else printf 'no\n' >&2; fi
   printf 'Docker runtime registration (options/arguments omitted from diagnostics):\n' >&2
   if ! docker -H "$DOCKER_SOCKET" info --format '{{json .Runtimes}}' 2>/dev/null |
-    jq --arg runtime "$KATA_RUNTIME" \
+    jq -e --arg runtime "$KATA_RUNTIME" \
       'if type != "object" then error("runtime map is not an object") else
         {runtime:$runtime,registered:has($runtime),entryType:(.[$runtime]|type),
          path:(.[$runtime] | if type == "object" then .path else null end),

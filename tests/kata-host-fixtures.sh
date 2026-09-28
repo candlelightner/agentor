@@ -62,7 +62,7 @@ fi
   runtime_report=$(jq -c '.runtimes' "$DOCKER_CONFIG")
   docker_runtime_matches
   for runtime_report in \
-    '{}' '[]' 'null' 'not-json' \
+    '' '{}' '[]' 'null' 'not-json' \
     '{"agentor-kata-qemu":null}' '{"agentor-kata-qemu":[]}' \
     '{"agentor-kata-qemu":"shim"}' \
     '{"agentor-kata-qemu":{"path":"/usr/bin/runc"}}' \
@@ -114,7 +114,7 @@ mock_install() (
           printf '{"agentor-kata-qemu":{"path":"/usr/bin/runc"}}\n'
           return
         fi ;;
-      fail-missing|fail-existing) printf '{}\n'; return ;;
+      fail-missing|fail-existing|fail-unchanged) printf '{}\n'; return ;;
       fail-malformed) printf 'not-json\n'; return ;;
       fail-query) return 1 ;;
     esac
@@ -126,7 +126,7 @@ mock_install() (
   }
   curl() { printf 'Unexpected download in managed-install fixture.\n' >&2; return 1; }
   status() { :; }
-  if [[ "$scenario" == unchanged || "$scenario" == stale-active ]]; then
+  if [[ "$scenario" == unchanged || "$scenario" == stale-active || "$scenario" == fail-unchanged ]]; then
     render_daemon_config /dev/null "$fixture_dir/$scenario/rendered.json"
     # Deliberately use different whitespace to test semantic idempotence.
     jq -c . "$fixture_dir/$scenario/rendered.json" > "$DOCKER_CONFIG"
@@ -150,17 +150,22 @@ mock_install unchanged
 mock_install registration-needed
 mock_install stale-active
 
-for scenario in fail-missing fail-existing fail-malformed fail-query fail-restart; do
+for scenario in fail-missing fail-existing fail-malformed fail-query fail-restart fail-unchanged; do
   if mock_install "$scenario" > "$fixture_dir/$scenario.stdout" 2> "$fixture_dir/$scenario.stderr"; then
     printf 'Expected installation verification failure: %s\n' "$scenario" >&2
     exit 1
   fi
   if [[ "$scenario" == fail-existing ]]; then
     cmp "$fixture_dir/existing.json" "$fixture_dir/$scenario/etc/docker/daemon.json"
+  elif [[ "$scenario" == fail-unchanged ]]; then
+    jq -e -n --slurpfile first "$fixture_dir/$scenario/rendered.json" \
+      --slurpfile second "$fixture_dir/$scenario/etc/docker/daemon.json" '$first == $second' >/dev/null
   else
     [[ ! -e "$fixture_dir/$scenario/etc/docker/daemon.json" ]]
   fi
-  [[ "$(wc -l < "$fixture_dir/$scenario/restarts")" == 2 ]]
+  expected_restarts=2
+  [[ "$scenario" != fail-unchanged ]] || expected_restarts=1
+  [[ "$(wc -l < "$fixture_dir/$scenario/restarts")" == "$expected_restarts" ]]
   grep -q 'Runtime verification: exact daemon.json configuration matches: yes' "$fixture_dir/$scenario.stderr"
   grep -q 'Docker runtime registration' "$fixture_dir/$scenario.stderr"
   grep -q 'Previous daemon.json was restored' "$fixture_dir/$scenario.stderr"
