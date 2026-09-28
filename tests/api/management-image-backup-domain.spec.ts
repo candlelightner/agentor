@@ -2,6 +2,20 @@ import { test, expect } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import { ManagementImageBackupDomain, sanitizeManagementBackupPayload } from '../../orchestrator/server/utils/management-image-backup-domain';
 
+test('backup runtime metadata cannot grant MCP restore authority', async () => {
+  const domain = new ManagementImageBackupDomain();
+  for (const authority of [undefined, { scope: 'platform' }, { scope: 'group', reauthorize: async () => ({ scope: 'platform' }) }]) {
+    await expect(domain.execute('backups.restore', { ownerId: 'owner', artifactId: 'backup', runtimeProfile: 'legacy-runc', acknowledgeHostPrivilege: true }, authority as any))
+      .rejects.toMatchObject({ statusCode: 403 });
+  }
+  await expect(domain.execute('backups.restore', { legacyPrivilegeGrant: 'admin' })).rejects.toMatchObject({ statusCode: 400 });
+  const authority = { scope: 'platform' as const, workspaceId: 'admin', reauthorize: async () => ({ scope: 'platform' as const, workspaceId: 'admin' }) };
+  await expect(domain.execute('backups.restore', { runtimeProfile: 'legacy-runc', acknowledgeHostPrivilege: false }, authority)).rejects.toMatchObject({ statusCode: 400 });
+  expect(domain.tools().find((tool) => tool.name === 'backups.restore')?.inputSchema).toMatchObject({ properties: {
+    runtimeProfile: { enum: ['kata-qemu', 'legacy-runc'] }, acknowledgeHostPrivilege: { type: 'boolean' },
+  } });
+});
+
 test('image and backup MCP domain exposes bounded tool surface and safe hints', () => {
   const tools = new ManagementImageBackupDomain().tools();
   const names = tools.map(tool => tool.name);

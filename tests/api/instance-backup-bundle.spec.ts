@@ -138,6 +138,20 @@ test.describe("instance disaster-recovery bundle boundary", () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  test('optional runtime snapshot dependencies preserve old manifests and reject mismatched identities', async () => {
+    const data = join(root, 'data.tar.gz');
+    await writeFile(data, 'fixture archive');
+    const manifest = await manifestFor(data);
+    expect(validateInstanceManifest(manifest).images.capturedWorkerImages).toBeUndefined();
+    const image = { workerId: 'worker-1', reference: 'agentor-import-worker-1:runtime-operation-1', imageId: `sha256:${'b'.repeat(64)}` };
+    manifest.images.capturedWorkerImages = [image];
+    expect(validateInstanceManifest(manifest).images.capturedWorkerImages).toEqual([image]);
+    for (const bad of [{ ...image, workerId: 'worker-2' }, { ...image, reference: '/host/path' }, { ...image, imageId: 'mutable-tag' }]) {
+      manifest.images.capturedWorkerImages = [bad];
+      expect(() => validateInstanceManifest(manifest)).toThrow();
+    }
+  });
+
   test("uses the SQLite snapshot and applies recursive-data exclusions without dropping plugin state", async () => {
     const dataDir = join(root, "data");
     const authSnapshot = join(root, "auth-snapshot.db");

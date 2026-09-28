@@ -208,11 +208,13 @@ export default defineNitroPlugin(async (nitroApp) => {
   const portableManagedVolumes = usePortableManagedVolumeRuntime();
   await portableManagedVolumes.init();
   await useManagedVolumeSizingManager().init();
+  await containerManager.hasPendingRuntimeMigrations();
   if (!instanceRecoveryMode) {
     await portableManagedVolumes.recoverStartup((journal) =>
       containerManager.recoverPortableManagedVolumeProvisionalWorker(journal),
     );
     await useManagedVolumeManager().recoverStartup();
+    await containerManager.recoverRuntimeMigrations();
   }
   await containerManager.sync();
   // Re-evaluate every persisted bind before ordinary startup reconciliation.

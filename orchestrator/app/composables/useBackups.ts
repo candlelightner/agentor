@@ -256,6 +256,7 @@ export function useBackups() {
     workspaceIds?: string[],
     requestId?: string,
     imageResolutions?: Record<string, BackupImageResolution>,
+    runtimeSelection?: { runtimeProfile: 'kata-qemu' | 'legacy-runc'; acknowledgeHostPrivilege?: boolean },
   ) {
     return $fetch<{ jobId: string }>(
       `/api/backups/${encodeURIComponent(id)}/restore`,
@@ -269,6 +270,11 @@ export function useBackups() {
           ...(requestId ? { requestId } : {}),
           ...(imageResolutions ? { imageResolutions } : {}),
           ...(target === "original" && lockPassword ? { lockPassword } : {}),
+          ...(target === 'new' && runtimeSelection ? {
+            runtimeProfile: runtimeSelection.runtimeProfile,
+            ...(runtimeSelection.runtimeProfile === 'legacy-runc' && runtimeSelection.acknowledgeHostPrivilege === true
+              ? { acknowledgeHostPrivilege: true } : {}),
+          } : {}),
         },
       },
     );

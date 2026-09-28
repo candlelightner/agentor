@@ -80,6 +80,8 @@ export interface BackupConfig {
   google?: { clientId?: string; redirectUri?: string; token?: unknown; oauthPending?: { stateHash: string; expiresAt: number } };
 }
 export interface BackupJob {
+  /** Descriptive retry guard; privilege authorization is never persisted. */
+  requestedRuntimeProfile?: 'legacy-runc';
   schemaVersion: 1; id: string; userId: string; workspaceId: string; provider: BackupProviderKind;
   status: BackupJobStatus; phase: string; progress: number; bytesProcessed: number;
   createdAt: string; updatedAt: string; startedAt?: string; completedAt?: string; error?: string;

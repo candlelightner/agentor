@@ -137,6 +137,9 @@ export class ManagedVolumeRuntime {
   /** Worker is paused by the service after journaling recovery information. */
   async mountLive(containerId: string, v: StoredManagedVolume, probe = false): Promise<boolean> {
     const worker = await this.inspect(containerId);
+    if (worker.Config.Labels?.["agentor.runtime-profile"] === "kata-qemu" ||
+        worker.HostConfig.Runtime && worker.HostConfig.Runtime !== "runc")
+      throw volumeError(409, "Live mounting requires a verified legacy runc worker. Choose recreation.");
     if (!worker.State.Running || (!probe && !worker.State.Paused)) throw volumeError(409, "The worker must be frozen before live mounting.");
     if (worker.HostConfig.UsernsMode || worker.HostConfig.PidMode && worker.HostConfig.PidMode !== "private")
       throw volumeError(409, "Live mounting is not supported for this namespace configuration. Choose recreation.");

@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { goToDashboard, openCreateWorkerModal } from '../helpers/ui-helpers';
+import { goToDashboard, openCreateWorkerModal, selectLegacyFixtureRuntime } from '../helpers/ui-helpers';
 import { cleanupWorker } from '../helpers/worker-lifecycle';
 import { ApiClient } from '../helpers/api-client';
 import { approveHostPath, approveHostPathForAll, deleteApprovedHostPath } from '../helpers/host-mounts';
@@ -212,6 +212,7 @@ test.describe('Create Worker Modal', () => {
 
     await goToDashboard(page);
     await openCreateWorkerModal(page);
+    await selectLegacyFixtureRuntime(page);
     await page.click('[role="dialog"] button:has-text("Create")');
     await expect(page.locator('[role="dialog"]')).toBeHidden({ timeout: 10_000 });
 
@@ -243,6 +244,7 @@ test.describe('Create Worker Modal', () => {
     try {
       await goToDashboard(page);
       await openCreateWorkerModal(page);
+      await selectLegacyFixtureRuntime(page);
       const dialog = page.locator('[role="dialog"]');
       const groupSelector = dialog.getByRole('combobox', { name: 'Worker group' });
       await groupSelector.click();

@@ -24,6 +24,7 @@ const formattedDate = computed(() => {
       </h3>
       <p v-if="worker.deletionPending" class="text-[10px] text-amber-600 dark:text-amber-400 leading-tight">Cleanup pending</p>
       <p v-else class="text-[10px] text-gray-400 dark:text-gray-600 leading-tight">{{ formattedDate }}</p>
+      <WorkerRuntimeControl class="mt-1" :worker-id="worker.id" :runtime-profile="worker.runtimeProfile" :approval-required="worker.runtimeRestoreApprovalRequired" :disabled="worker.deletionPending" />
     </div>
     <div class="flex items-center gap-1 shrink-0">
       <UTooltip text="Unarchive">

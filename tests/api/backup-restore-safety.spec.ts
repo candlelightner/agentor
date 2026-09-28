@@ -56,6 +56,23 @@ import { withOperationDeadline } from "../../orchestrator/server/utils/operation
   attach: async () => undefined,
 });
 
+// These lifecycle fixtures represent existing, administrator-authorized legacy
+// DinD workers. Exercise the real runtime guards while keeping host readiness
+// and environment lookup independent from production service singletons.
+function legacyLifecycleRuntimeFixture() {
+  return {
+    assertRuntimeRestoreApproved: (ContainerManager.prototype as any).assertRuntimeRestoreApproved,
+    assertRuntimeRollbackFinalized: (ContainerManager.prototype as any).assertRuntimeRollbackFinalized,
+    assertRecreationRuntime: (ContainerManager.prototype as any).assertRecreationRuntime,
+    resolveEnvironmentConfig: () => ({ dockerEnabled: true }),
+    deriveLimits: () => ({ dockerEnabled: true }),
+  };
+}
+
+async function assertLegacyRuntimeAvailable(profile: string) {
+  expect(profile).toBe('legacy-runc');
+}
+
 test("worker lifecycle mutations serialize per worker and recover after rejection", async () => {
   const coordinator = new WorkerLifecycleCoordinator();
   const events: string[] = [];
@@ -516,6 +533,8 @@ test("archive retries after stop/remove and persistence failures without restopp
     const fakeManager = {
       containers,
       assertOrdinaryMutation: () => {},
+      assertRuntimeRollbackFinalized: (ContainerManager.prototype as any).assertRuntimeRollbackFinalized,
+      persistentBackupPathMounts: async () => [],
       persistDesiredRuntimeStatus: async (current: any, desired: string) => {
         current.desiredRuntimeStatus = desired;
       },
@@ -588,6 +607,8 @@ test("rebuild retries Docker removal without stopping an already-stopped worker"
     imageId: "image-1",
     imageRuntimeReference: "worker:latest",
     status: "running",
+    runtimeProfile: "legacy-runc",
+    legacyPrivilegeGrant: "preexisting",
   };
   let ensureImageCalls = 0;
   let stopCalls = 0;
@@ -595,14 +616,17 @@ test("rebuild retries Docker removal without stopping an already-stopped worker"
   let archiveCalls = 0;
   const reachedRecreation = new Error("reached recreation");
   const fakeManager = {
+    ...legacyLifecycleRuntimeFixture(),
     containers: new Map([[info.id, info]]),
     assertOrdinaryMutation: () => {},
     persistDesiredRuntimeStatus: async (current: any, desired: string) => {
       current.desiredRuntimeStatus = desired;
     },
     resolveAuthorizedHostMounts: async () => [],
+    resolveHardwareDeviceAccess: async () => [],
     persistentBackupPathMounts: async () => [],
     dockerService: {
+      assertWorkerRuntimeAvailable: assertLegacyRuntimeAvailable,
       ensureImage: async (image: string) => {
         expect(image).toBe("worker:latest");
         ensureImageCalls++;
@@ -625,7 +649,10 @@ test("rebuild retries Docker removal without stopping an already-stopped worker"
       },
     },
     resolveEnvironmentConfig: () => {
-      throw reachedRecreation;
+      // Runtime preflight now resolves the environment before removal. Keep
+      // the failure injection at the original post-removal recreation boundary.
+      if (archiveCalls > 0) throw reachedRecreation;
+      return { dockerEnabled: true };
     },
   };
   const rebuildUnlocked = (ContainerManager.prototype as any).rebuildUnlocked;
@@ -848,6 +875,8 @@ test("managed recovery preserves a timed-out remove settlement for lifecycle fen
     containerName: "agentor-worker-worker-1",
     imageRuntimeReference: "worker:latest",
     status: "unknown",
+    runtimeProfile: "legacy-runc",
+    legacyPrivilegeGrant: "preexisting",
   };
   let releaseSettlement!: () => void;
   const settlement = new Promise<void>((resolve) => {
@@ -862,6 +891,7 @@ test("managed recovery preserves a timed-out remove settlement for lifecycle fen
     enumerable: false,
   });
   const manager: any = {
+    ...legacyLifecycleRuntimeFixture(),
     containers: new Map([[info.id, info]]),
     assertOrdinaryMutation() {},
     resolveAuthorizedHostMounts: async () => [],
@@ -869,6 +899,7 @@ test("managed recovery preserves a timed-out remove settlement for lifecycle fen
     persistDesiredRuntimeStatus: async () => {},
     markRuntimeUnknown() {},
     dockerService: {
+      assertWorkerRuntimeAvailable: assertLegacyRuntimeAvailable,
       ensureImage: async () => {},
       assertWorkerPersistenceMounts: async () => {},
       killContainer: async () => {},
@@ -903,8 +934,11 @@ test("managed recovery verifies persistence before touching disposable compute",
     imageRuntimeReference: "worker:latest",
     status: "unknown",
     desiredRuntimeStatus: "running",
+    runtimeProfile: "legacy-runc",
+    legacyPrivilegeGrant: "preexisting",
   };
   const manager: any = {
+    ...legacyLifecycleRuntimeFixture(),
     containers: new Map([[info.id, info]]),
     assertOrdinaryMutation() {},
     resolveAuthorizedHostMounts: async () => [],
@@ -912,6 +946,7 @@ test("managed recovery verifies persistence before touching disposable compute",
       { source: "selected-volume", target: "/home/agent/.agent-data/.codex" },
     ],
     dockerService: {
+      assertWorkerRuntimeAvailable: assertLegacyRuntimeAvailable,
       ensureImage: async (image: string) => {
         expect(image).toBe("worker:latest");
         calls.push("ensure-image");
@@ -956,9 +991,12 @@ test("managed recovery replaces only compute and retains worker records and volu
     imageRuntimeReference: "worker:latest",
     status: "unknown",
     desiredRuntimeStatus: "running",
+    runtimeProfile: "legacy-runc",
+    legacyPrivilegeGrant: "preexisting",
   };
   const recovered = { ...info, containerId: "docker-2", status: "running" };
   const manager: any = {
+    ...legacyLifecycleRuntimeFixture(),
     containers: new Map([[info.id, info]]),
     runtimeObservations: new Map(),
     assertOrdinaryMutation() {},
@@ -967,6 +1005,7 @@ test("managed recovery replaces only compute and retains worker records and volu
       { source: "selected-volume", target: "/home/agent/.agent-data/.codex" },
     ],
     dockerService: {
+      assertWorkerRuntimeAvailable: assertLegacyRuntimeAvailable,
       ensureImage: async (image: string) => {
         expect(image).toBe("worker:latest");
         calls.push("ensure-image");
@@ -1381,6 +1420,17 @@ async function restoreFixture(
     providers: { local: provider },
     restoreCleanupTimeoutMs: options.cleanupTimeoutMs,
   });
+  // Cancellation/drain tests never reach worker import. Their artifact has no
+  // image recipe, so dependency catalog lookup belongs to another fixture;
+  // don't initialize the real /data catalog before the blocking download.
+  (manager as any).preflightRestoreDependencies = async (
+    ownerId: string, artifact: { id: string }, selected: string[],
+  ) => {
+    expect(ownerId).toBe(userId);
+    expect(artifact.id).toBe(artifactId);
+    expect(selected).toEqual(['source-worker']);
+    return [];
+  };
   await manager.init();
   return { dataDir, userId, artifactId, objectId, provider, manager };
 }

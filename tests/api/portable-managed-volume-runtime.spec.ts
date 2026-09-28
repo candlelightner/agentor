@@ -733,6 +733,7 @@ function workerCreateInput() {
       gitEmail: "test@example.invalid",
     },
     userEnv: { envVars: [] },
+    runtimeProfile: 'kata-qemu',
     start: false,
   } as any;
 }
@@ -741,6 +742,7 @@ test("Docker worker creation adds portable recovery labels only for journaled im
   const service = new DockerService(loadConfig());
   const creations: any[] = [];
   (service as any).ensureImage = async () => {};
+  (service as any).assertWorkerRuntimeAvailable = async () => {};
   (service as any).docker = {
     createContainer: async (options: any) => {
       creations.push(options);
@@ -759,10 +761,14 @@ test("Docker worker creation adds portable recovery labels only for journaled im
   expect(creations[0].Labels).toEqual({
     "agentor.managed": "true",
     "agentor.id": WORKER_ID,
+    "agentor.runtime-profile": "kata-qemu",
   });
+  expect(creations[0].HostConfig.Runtime).toBe('agentor-kata-qemu');
+  expect(creations[0].HostConfig.Privileged).toBeUndefined();
   expect(creations[1].Labels).toMatchObject({
     "agentor.managed": "true",
     "agentor.id": WORKER_ID,
+    "agentor.runtime-profile": "kata-qemu",
     "agentor.owner-id": USER_ID,
     "agentor.worker-id": WORKER_ID,
     "agentor.portable-import-id": OPERATION_ID,
@@ -776,6 +782,25 @@ test("Docker worker creation adds portable recovery labels only for journaled im
     },
   })).rejects.toThrow("does not match");
   expect(creations).toHaveLength(2);
+});
+
+test('live administrator authorization is rechecked after image preparation and before starting', async () => {
+  const service = new DockerService(loadConfig());
+  let authorized = true;
+  let creates = 0, starts = 0, removes = 0, checks = 0;
+  (service as any).ensureImage = async () => { authorized = false; };
+  (service as any).docker = { createContainer: async () => { creates++; return {
+    id: 'replacement', start: async () => { starts++; }, remove: async () => { removes++; },
+  }; } };
+  const authorizeRuntime = async () => { checks++; if (!authorized || checks === 2) throw new Error('administrator revoked'); };
+  const input = { ...workerCreateInput(), runtimeProfile: 'legacy-runc' as const, legacyPrivilegeGrant: 'admin' as const,
+    authorizeRuntime, start: true };
+  await expect(service.createWorkerContainer(input)).rejects.toThrow(/administrator revoked/);
+  expect(creates).toBe(0);
+  authorized = true; checks = 0;
+  (service as any).ensureImage = async () => {};
+  await expect(service.createWorkerContainer(input)).rejects.toThrow(/administrator revoked/);
+  expect(creates).toBe(1); expect(starts).toBe(0); expect(removes).toBe(1);
 });
 
 test("legacy v5 extract-repack-extract never gains managed-volume fields", async () => {

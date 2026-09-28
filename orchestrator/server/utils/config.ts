@@ -14,6 +14,8 @@ export interface DnsProviderConfig {
 }
 
 export interface Config {
+  /** Operator attestation only: host canary evidence is maintained separately. */
+  kataHostValidated: boolean;
   dockerNetwork: string;
   containerPrefix: string;
   defaultCpuLimit: number;
@@ -120,6 +122,7 @@ export function loadConfig(): Config {
     : baseDomains[0] || '';
 
   return {
+    kataHostValidated: process.env.KATA_HOST_VALIDATED === 'true',
     dockerNetwork: process.env.DOCKER_NETWORK || 'agentor-net',
     containerPrefix: process.env.CONTAINER_PREFIX || 'agentor-worker',
     defaultCpuLimit: parseFloat(process.env.DEFAULT_CPU_LIMIT || '0'),

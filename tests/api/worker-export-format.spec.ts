@@ -1,9 +1,10 @@
 import { test, expect } from '@playwright/test';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
-import { BUNDLE_FILES, extractBackupPathArchives, extractBundle, sanitizeBackupPathTarPayload, validateBackupPathTarPayload, validateGzipTarPayload, validateTarPayload, WORKER_EXPORT_VERSION } from '../../orchestrator/server/utils/worker-export';
+import { BUNDLE_FILES, extractBackupPathArchives, extractBundle, sanitizeBackupPathTarPayload, validateBackupPathTarPayload, validateGzipTarPayload, validateTarPayload, WORKER_EXPORT_VERSION, PORTABLE_MANAGED_VOLUME_EXPORT_VERSION, writeManifest } from '../../orchestrator/server/utils/worker-export';
+import { resolveNewWorkerRuntime } from '../../orchestrator/server/utils/worker-runtime-policy';
 
 type Entry = { name: string; body: Buffer; type?: string; linkname?: string; uid?: number; gid?: number };
 
@@ -56,6 +57,44 @@ async function withBundle(entries: Entry[], action: (bundle: string, destination
 }
 
 test.describe('Worker export root filesystem format compatibility', () => {
+  test('source runtime metadata is optional and never selects the destination runtime', async () => {
+    for (const runtimeProfile of [undefined, 'legacy-runc', 'kata-qemu']) {
+      const metadata = JSON.parse(manifest(WORKER_EXPORT_VERSION, false).toString());
+      if (runtimeProfile !== undefined) metadata.source.runtimeProfile = runtimeProfile;
+      for (const section of [metadata, metadata.source, metadata.worker]) {
+        section.legacyPrivilegeGrant = 'admin';
+        section.runtimeRestoreApprovalRequired = false;
+      }
+      await withBundle([{ name: BUNDLE_FILES.manifest, body: Buffer.from(JSON.stringify(metadata)) }], async (bundle, destination) => {
+        const extracted = await extractBundle(bundle, destination);
+        expect(extracted.manifest.source.runtimeProfile).toBe(runtimeProfile);
+        for (const section of [extracted.manifest, extracted.manifest.source, extracted.manifest.worker]) {
+          expect(section).not.toHaveProperty('legacyPrivilegeGrant');
+          expect(section).not.toHaveProperty('runtimeRestoreApprovalRequired');
+        }
+        expect(resolveNewWorkerRuntime()).toEqual({ runtimeProfile: 'kata-qemu' });
+        const output = `${destination}-manifest.json`;
+        await writeManifest(metadata, output);
+        const serialized = JSON.parse(await readFile(output, 'utf8'));
+        expect(serialized.source.runtimeProfile).toBe(runtimeProfile);
+        for (const section of [serialized, serialized.source, serialized.worker]) {
+          expect(section).not.toHaveProperty('legacyPrivilegeGrant');
+          expect(section).not.toHaveProperty('runtimeRestoreApprovalRequired');
+        }
+      });
+    }
+  });
+
+  test('rejects malformed source runtime metadata without treating it as authority', async () => {
+    for (const runtimeProfile of [null, 'privileged', { runtimeProfile: 'legacy-runc' }]) {
+      const metadata = JSON.parse(manifest(WORKER_EXPORT_VERSION, false).toString());
+      metadata.source.runtimeProfile = runtimeProfile;
+      await withBundle([{ name: BUNDLE_FILES.manifest, body: Buffer.from(JSON.stringify(metadata)) }], async (bundle, destination) => {
+        await expect(extractBundle(bundle, destination)).rejects.toThrow('manifest.source.runtimeProfile is invalid');
+      });
+    }
+  });
+
   test('v2 accepts the transitional uncompressed rootfs.tar payload', async () => {
     const rawRootfs = await tarBuffer([{ name: 'etc/issue', body: Buffer.from('agentor\n') }]);
     await withBundle(
@@ -203,7 +242,7 @@ test.describe('Worker export root filesystem format compatibility', () => {
   });
 
   test('rejects bundle versions newer than the supported format', async () => {
-    await withBundle([{ name: BUNDLE_FILES.manifest, body: manifest(WORKER_EXPORT_VERSION + 1, false) }], async (bundle, destination) => {
+    await withBundle([{ name: BUNDLE_FILES.manifest, body: manifest(Math.max(WORKER_EXPORT_VERSION, PORTABLE_MANAGED_VOLUME_EXPORT_VERSION) + 1, false) }], async (bundle, destination) => {
       await expect(extractBundle(bundle, destination)).rejects.toThrow('newer than supported');
     });
   });

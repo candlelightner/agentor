@@ -1019,7 +1019,10 @@ export class ManagementMcpStore {
           args.userId !== undefined ||
           args.ownerId !== undefined ||
           args.groupId !== undefined ||
-          args.workerGroupId !== undefined
+          args.workerGroupId !== undefined ||
+          args.runtimeProfile !== undefined ||
+          args.acknowledgeHostPrivilege !== undefined ||
+          args.legacyPrivilegeGrant !== undefined
         )
           throw groupResourceNotFound();
         args = { ...args, userId: identity.ownerId };
@@ -1085,7 +1088,8 @@ export class ManagementMcpStore {
       } else if (name === "configuration.apply") {
         result = await this.applyConfigurationProposal(args);
       } else {
-        const executionIdentity = name.startsWith("volumes.size.")
+        const executionIdentity = name.startsWith("volumes.size.") ||
+          name === 'workers.create' || name.startsWith('workers.runtime.') || name === 'backups.restore'
           ? createLiveManagementVolumeAuthority(
               identity,
               async () => {
@@ -1094,7 +1098,7 @@ export class ManagementMcpStore {
                 await this.mutations;
                 return this.introspect(credential);
               },
-              () => this.state.policy.groups["storage-maintenance"].enabled,
+              () => this.state.policy.groups[TOOL_GROUP[name]!].enabled,
               (current) =>
                 current.scope === "group" ||
                 useAdminWorkspaceStore().getRecord()?.id === current.workspaceId,
@@ -1391,7 +1395,7 @@ export class ManagementMcpStore {
     name: string,
     args: Record<string, unknown>,
     workspaceId: string,
-    identity?: IdentityMetadata,
+    identity?: IdentityMetadata & ManagementVolumeAuthority,
   ): Promise<any> {
     // Validate the MCP envelope before entering any domain manager. In
     // particular, missing ownerId must not trigger backup/image store
@@ -1549,7 +1553,7 @@ export class ManagementMcpStore {
     }
     const volume = await volumeDomain.execute(name, args, identity);
     if (volume.handled) return volume.result;
-    const domain = await workerDomain.execute(name, args);
+    const domain = await workerDomain.execute(name, args, identity);
     if (domain.handled) {
       if (identity?.scope === "group" && name === "groups.list") {
         const hierarchy = new WorkerGroupHierarchy(useWorkerGroupStore());
@@ -1567,6 +1571,7 @@ export class ManagementMcpStore {
     const imageBackup = await imageBackupDomain.execute(
       name,
       await compatibleDomainArguments(name, args),
+      identity,
     );
     if (imageBackup.handled) return imageBackup.result;
     const platform = await platformDomain.execute(name, args);
@@ -2474,6 +2479,10 @@ function groupBackupInputSchema(name: string): Record<string, unknown> {
     (key: string) => key !== "ownerId",
   );
   if (schema.properties) delete schema.properties.ownerId;
+  if (schema.properties) {
+    delete schema.properties.runtimeProfile;
+    delete schema.properties.acknowledgeHostPrivilege;
+  }
   schema.description =
     "This operation is scoped by the calling administrative workspace. Worker IDs and selected paths must belong to the bound group subtree; the owner is derived from the authenticated identity.";
   return schema;

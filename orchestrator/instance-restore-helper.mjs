@@ -381,6 +381,7 @@ async function prepareDataArchive(input) {
     if (!result.authDb)
       throw new SafeRestoreError("The instance data archive has no authentication database", "INSTANCE_RESTORE_INVALID_ARCHIVE");
     await verifySqliteHeader(join(input.preparedData, "auth.db"));
+    await holdRestoredWorkerRuntimes(input.preparedData);
     if (!input.plan.restoreHostMountPolicies)
       await omitHostMountPolicies(input.preparedData);
   } catch (error) {
@@ -799,11 +800,57 @@ async function omitHostMountPolicies(root) {
   }
 }
 
-async function removeRegularIfPresent(path) {
+/** A source installation's persisted profile is history, not destination
+ * authority. Hold even old/profile-less and non-DinD records so recovery cannot
+ * silently choose a runtime before a destination administrator reviews it. */
+async function holdRestoredWorkerRuntimes(root) {
+  const users = join(root, "users");
+  try {
+    await assertDirectoryNoFollow(users);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  for (const ownerName of await readdir(users)) {
+    const owner = join(users, ownerName);
+    await assertDirectoryNoFollow(owner);
+    // These journals contain source-daemon container IDs, mount bindings, and
+    // rollback authority. Retain them in the backup, never replay them here.
+    await removeRegularIfPresent(join(owner, "worker-runtime-migrations.v1.json"), "Runtime migration journal");
+    const path = join(owner, "workers.json");
+    const workers = await readOptionalBoundedJson(path, MAX_STORE_BYTES, "restored worker store");
+    if (workers === undefined) continue;
+    if (!Array.isArray(workers))
+      throw new SafeRestoreError("Restored worker store must contain an array", "INSTANCE_RESTORE_INVALID_ARCHIVE");
+    const ids = new Set();
+    for (const worker of workers) {
+      if (!worker || typeof worker !== "object" || Array.isArray(worker) ||
+          !safeId(worker.id) || worker.userId !== ownerName || ids.has(worker.id))
+        throw new SafeRestoreError("Restored worker store contains invalid identities", "INSTANCE_RESTORE_INVALID_ARCHIVE");
+      ids.add(worker.id);
+      delete worker.legacyPrivilegeGrant;
+      worker.runtimeRestoreApprovalRequired = true;
+    }
+    const serialized = `${JSON.stringify(workers, null, 2)}\n`;
+    if (Buffer.byteLength(serialized) > MAX_STORE_BYTES)
+      throw new SafeRestoreError("Restored worker store exceeds its safe size limit", "INSTANCE_RESTORE_INVALID_ARCHIVE");
+    // This is isolated prepared data, not live state. Preserve original file
+    // ownership/mode and refuse a symlink even though extraction checked it.
+    const file = await open(path, constants.O_WRONLY | constants.O_TRUNC | constants.O_NOFOLLOW);
+    try {
+      await file.writeFile(serialized, "utf8");
+      await file.sync();
+    } finally {
+      await file.close();
+    }
+  }
+}
+
+async function removeRegularIfPresent(path, label = "Host-mount policy") {
   try {
     const info = await lstat(path);
     if (!info.isFile() || info.isSymbolicLink())
-      throw new SafeRestoreError("Host-mount policy path is not a regular file", "INSTANCE_RESTORE_INVALID_ARCHIVE");
+      throw new SafeRestoreError(`${label} path is not a regular file`, "INSTANCE_RESTORE_INVALID_ARCHIVE");
     await rm(path, { force: true });
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;

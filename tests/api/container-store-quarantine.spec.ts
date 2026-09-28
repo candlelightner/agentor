@@ -123,6 +123,161 @@ test("legacy workers persist desired running state after a verified task observa
   expect(saved).toEqual(["running"]);
 });
 
+test('pre-profile privileged legacy worker captures grant from Docker inspection', async () => {
+  const record = workerRecord();
+  const captures: boolean[] = [];
+  const manager = new ContainerManager({
+    listContainers: async () => [dockerWorker()],
+    inspectContainerRuntime: async () => ({ status: 'running', running: true,
+      runtime: 'runc', privileged: true, restartPolicy: 'unless-stopped',
+      secretHandshakeRequired: false }),
+    probeContainerTask: async () => undefined,
+  } as any, { containerPrefix: 'agentor-worker' } as any);
+  manager.setWorkerStore({
+    list: () => [record], findById: () => record,
+    setDesiredRuntimeStatus: async () => undefined,
+    capturePreexistingRuntime: async (_owner: string, _id: string, privileged: boolean) => {
+      captures.push(privileged);
+    },
+  } as any);
+  await manager.sync();
+  expect(manager.get('worker-1')).toMatchObject({
+    runtimeProfile: 'legacy-runc', legacyPrivilegeGrant: 'preexisting',
+  });
+  expect(JSON.stringify(manager.get('worker-1'))).not.toContain('legacyPrivilegeGrant');
+  expect(captures).toEqual([true]);
+});
+
+test('failed first inspection retains missing profile until privilege can be verified', async () => {
+  let record: any = workerRecord();
+  let fail = true;
+  const manager = new ContainerManager({
+    listContainers: async () => [dockerWorker()],
+    inspectContainerRuntime: async () => {
+      if (fail) throw new Error('inspection unavailable');
+      return { status: 'running', running: true, runtime: 'runc', privileged: true,
+        restartPolicy: 'no', secretHandshakeRequired: false };
+    },
+    probeContainerTask: async () => undefined,
+  } as any, { containerPrefix: 'agentor-worker' } as any);
+  const captures: boolean[] = [];
+  manager.setWorkerStore({ list: () => [record], findById: () => record,
+    capturePreexistingRuntime: async (_owner: string, _id: string, privileged: boolean) => captures.push(privileged),
+    setDesiredRuntimeStatus: async () => undefined,
+  } as any);
+  await manager.sync();
+  record = (manager as any).containerInfoToWorkerRecord(manager.get('worker-1'));
+  expect(record.runtimeProfile).toBeUndefined();
+  fail = false;
+  (manager as any).runtimeObservations.clear();
+  await manager.sync();
+  expect(captures).toEqual([true]);
+  expect(manager.get('worker-1')).toMatchObject({ runtimeProfile: 'legacy-runc', legacyPrivilegeGrant: 'preexisting' });
+});
+
+test('failed health probe retains successful legacy privilege inspection', async () => {
+  const record = workerRecord();
+  const captures: boolean[] = [];
+  const manager = new ContainerManager({
+    listContainers: async () => [dockerWorker()],
+    inspectContainerRuntime: async () => ({ status: 'running', running: true,
+      runtime: 'runc', privileged: true, restartPolicy: 'no', secretHandshakeRequired: false }),
+    probeContainerTask: async () => { throw new Error('health failed'); },
+  } as any, { containerPrefix: 'agentor-worker' } as any);
+  manager.setWorkerStore({ list: () => [record], findById: () => record,
+    capturePreexistingRuntime: async (_owner: string, _id: string, privileged: boolean) => captures.push(privileged),
+    setDesiredRuntimeStatus: async () => undefined,
+  } as any);
+  await manager.sync();
+  expect(captures).toEqual([true]);
+  expect(manager.get('worker-1')).toMatchObject({ status: 'unknown', runtimeProfile: 'legacy-runc', legacyPrivilegeGrant: 'preexisting' });
+});
+
+test('restored legacy records cannot regain privileged authority from Docker inventory', async () => {
+  const record = { ...workerRecord(), runtimeRestoreApprovalRequired: true };
+  const captures: boolean[] = [];
+  const manager = new ContainerManager({
+    listContainers: async () => [dockerWorker()],
+    inspectContainerRuntime: async () => ({ status: 'running', running: true,
+      runtime: 'runc', privileged: true, restartPolicy: 'no', secretHandshakeRequired: false }),
+    probeContainerTask: async () => undefined,
+  } as any, { containerPrefix: 'agentor-worker' } as any);
+  manager.setWorkerStore({ list: () => [record], findById: () => record,
+    capturePreexistingRuntime: async (_owner: string, _id: string, privileged: boolean) => captures.push(privileged),
+    setDesiredRuntimeStatus: async () => undefined,
+  } as any);
+  await manager.sync();
+  expect(captures).toEqual([]);
+  const worker = manager.get('worker-1')!;
+  expect(worker.legacyPrivilegeGrant).toBeUndefined();
+  expect(worker.runtimeRestoreApprovalRequired).toBe(true);
+  expect((manager as any).containerInfoToWorkerRecord(worker).runtimeRestoreApprovalRequired).toBe(true);
+  await expect((manager as any).restartUnlocked('worker-1')).rejects.toMatchObject({ code: 'WORKER_RUNTIME_RESTORE_APPROVAL_REQUIRED' });
+  await expect((manager as any).rebuildUnlocked('worker-1')).rejects.toMatchObject({ code: 'WORKER_RUNTIME_RESTORE_APPROVAL_REQUIRED' });
+  await expect((manager as any).recoverUnlocked('worker-1')).rejects.toMatchObject({ code: 'WORKER_RUNTIME_RESTORE_APPROVAL_REQUIRED' });
+});
+
+test('retained committed migration requires finalization before every worker recreation path', async () => {
+  const manager = new ContainerManager({} as any, { containerPrefix: 'agentor-worker' } as any);
+  (manager as any).containers.set('worker-1', { ...workerRecord(), containerId: 'replacement', containerName: 'agentor-worker-worker-1', runtimeProfile: 'kata-qemu' });
+  (manager as any).runtimeMigrationStore = { get: () => ({ phase: 'committed' }), isBlocked: () => false };
+  manager.setWorkerStore({ get: () => ({ ...workerRecord(), status: 'archived' }) } as any);
+  for (const method of ['rebuildUnlocked', 'recoverUnlocked', 'archiveUnlocked', 'applyManagedStorageUnlocked'])
+    await expect((manager as any)[method]('worker-1')).rejects.toMatchObject({ code: 'WORKER_RUNTIME_MIGRATION_FINALIZE_REQUIRED' });
+  await expect((manager as any).unarchiveUnlocked('owner-1', 'worker-1'))
+    .rejects.toMatchObject({ code: 'WORKER_RUNTIME_MIGRATION_FINALIZE_REQUIRED' });
+});
+
+test('permanent worker deletion finalizes retained migration before removing active container', async () => {
+  const events: string[] = [];
+  const manager = new ContainerManager({ removeContainer: async () => {
+    events.push('remove-active'); throw new Error('stop test after ordered removal');
+  } } as any, { containerPrefix: 'agentor-worker' } as any);
+  (manager as any).containers.set('worker-1', { ...workerRecord(), containerId: 'replacement', containerName: 'agentor-worker-worker-1' });
+  (manager as any).runtimeMigrationStore = { get: () => ({ phase: 'committed' }), isBlocked: () => false };
+  (manager as any).runtimeMigrationEngine = () => ({ finalize: async () => { events.push('finalize'); } });
+  await expect((manager as any).removeUnlocked('worker-1')).rejects.toThrow(/stop test/);
+  expect(events).toEqual(['finalize', 'remove-active']);
+});
+
+test('runtime mismatch is quarantined without adopting Docker privilege', async () => {
+  const record = { ...workerRecord(), runtimeProfile: 'kata-qemu' as const };
+  const manager = new ContainerManager({
+    listContainers: async () => [{ ...dockerWorker(), Labels: {
+      'agentor.id': 'worker-1', 'agentor.runtime-profile': 'kata-qemu',
+    } }],
+    inspectContainerRuntime: async () => ({ status: 'running', running: true,
+      runtime: 'runc', privileged: true, restartPolicy: 'unless-stopped',
+      secretHandshakeRequired: false }),
+    probeContainerTask: async () => undefined,
+  } as any, { containerPrefix: 'agentor-worker' } as any);
+  manager.setWorkerStore({ list: () => [record], findById: () => record } as any);
+  await manager.sync();
+  expect(manager.get('worker-1')).toMatchObject({
+    status: 'unknown', runtimeDiagnostic: { code: 'WORKER_RUNTIME_MISMATCH' },
+  });
+});
+
+test('privileged Kata inventory is quarantined even with the correct runtime alias', async () => {
+  const record = { ...workerRecord(), runtimeProfile: 'kata-qemu' as const };
+  const manager = new ContainerManager({
+    listContainers: async () => [{ ...dockerWorker(), Labels: {
+      'agentor.id': 'worker-1', 'agentor.runtime-profile': 'kata-qemu',
+    } }],
+    inspectContainerRuntime: async () => ({ status: 'running', running: true,
+      runtime: 'agentor-kata-qemu', privileged: true, restartPolicy: 'no',
+      secretHandshakeRequired: false }),
+    probeContainerTask: async () => undefined,
+  } as any, { containerPrefix: 'agentor-worker' } as any);
+  manager.setWorkerStore({ list: () => [record], findById: () => record } as any);
+  await manager.sync();
+  expect(manager.get('worker-1')).toMatchObject({
+    status: 'unknown', runtimeDiagnostic: { code: 'WORKER_RUNTIME_MISMATCH' },
+  });
+  await expect((manager as any).rebuildUnlocked('worker-1'))
+    .rejects.toMatchObject({ code: 'WORKER_RUNTIME_MISMATCH' });
+});
+
 test("legacy crash-looping workers retain running intent for managed bootstrap recovery", async () => {
   const saved: string[] = [];
   const record = workerRecord();

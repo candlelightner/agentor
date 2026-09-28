@@ -107,6 +107,7 @@ import { backupInstallationId } from "./backup-installation";
 import { pluginDefinitionHash } from "./plugin-manifest";
 import { instanceSnapshotActive } from "./instance-snapshot-gate";
 import { withOwnerWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
+import type { RuntimeRestoreAuthorization } from './worker-runtime-admin';
 
 interface RestoreExecution {
   controller: AbortController;
@@ -690,6 +691,10 @@ export class BackupManager {
     if (!current || current.userId !== job.userId)
       throw new Error("Backup job not found");
     job = current;
+    if (job.requestedRuntimeProfile === 'legacy-runc')
+      throw Object.assign(new Error('Start a new administrator-authorized legacy restore request; persisted jobs cannot retain runtime privilege'), {
+        statusCode: 403, code: 'LEGACY_RESTORE_REAUTHORIZATION_REQUIRED',
+      });
     if (job.status !== "failed")
       throw new Error("Only failed jobs can be retried");
     if (this.retryClaims.has(job.id))
@@ -2232,6 +2237,7 @@ export class BackupManager {
     mode: "new" | "original",
     displayName?: string,
     selectedWorkspaceIds?: string[],
+    runtimeAuthorization?: RuntimeRestoreAuthorization,
   ) {
     await this.init();
     this.assertOwnerAvailable(userId);
@@ -2256,6 +2262,7 @@ export class BackupManager {
           artifact,
           displayName,
           selectedWorkspaceIds,
+          runtimeAuthorization,
         ),
       );
     } finally {
@@ -2267,6 +2274,7 @@ export class BackupManager {
     artifact: BackupArtifact,
     displayName?: string,
     selectedWorkspaceIds?: string[],
+    runtimeAuthorization?: RuntimeRestoreAuthorization,
   ) {
     const dir = join(this.dataDir, "tmp", `restore-${randomUUID()}`);
     const encrypted = join(dir, "archive.enc");
@@ -2313,6 +2321,7 @@ export class BackupManager {
           userId,
           bundle.path,
           { displayName: index === 0 ? displayName : undefined },
+          await runtimeAuthorization?.(),
         );
         workers.push(worker);
         createdWorkers.push(worker.id);
@@ -2341,7 +2350,12 @@ export class BackupManager {
     selectedWorkspaceIds?: string[],
     requestId?: string,
     imageResolutions?: Record<string, BackupImageResolution>,
+    runtimeAuthorization?: RuntimeRestoreAuthorization,
   ): Promise<BackupJob> {
+    // Authority is held only by this invocation's closure, never by backup data.
+    if (runtimeAuthorization && target !== 'new')
+      throw Object.assign(new Error('Runtime selection is only supported when restoring into new workers'), { statusCode: 400 });
+    if (runtimeAuthorization) await runtimeAuthorization();
     await this.init();
     this.assertOwnerAvailable(userId);
     const currentArtifact = this.store.findArtifact(artifact.id);
@@ -2387,6 +2401,7 @@ export class BackupManager {
     const fingerprint = requestFingerprint({
       operation: "restore",
       artifactId: artifact.id,
+      ...(runtimeAuthorization ? { requestedRuntimeProfile: 'legacy-runc' } : {}),
       target,
       displayName: displayName?.trim() || undefined,
       selectedWorkspaceIds: [...selected].sort(),
@@ -2433,6 +2448,7 @@ export class BackupManager {
         includeManagedVolumes: artifact.includeManagedVolumes,
         operation: "restore",
         target,
+        ...(runtimeAuthorization ? { requestedRuntimeProfile: 'legacy-runc' as const } : {}),
         displayName,
         dependencies,
         ...(normalizedResolutions
@@ -2449,7 +2465,7 @@ export class BackupManager {
       }
       this.assertRestoreActive(userId, admission.controller.signal, job);
       this.enqueue(job.id, job.userId, () =>
-        this.runRestoreV2(job, artifact, displayName, restorePinOwner),
+        this.runRestoreV2(job, artifact, displayName, restorePinOwner, runtimeAuthorization),
       );
       return sanitizeJob(job);
     } catch (error) {
@@ -3345,6 +3361,7 @@ export class BackupManager {
     artifact: BackupArtifact,
     displayName?: string,
     restorePinOwner = this.restorePinOwner(job.id, job.attempt),
+    runtimeAuthorization?: RuntimeRestoreAuthorization,
   ) {
     const dir = join(this.dataDir, "tmp", `restore-${job.id}`);
     const createdWorkers: string[] = [];
@@ -3353,6 +3370,10 @@ export class BackupManager {
       this.assertRestoreActive(job.userId, execution.controller.signal, job);
     };
     try {
+      if (job.requestedRuntimeProfile === 'legacy-runc' && !runtimeAuthorization)
+        throw Object.assign(new Error('Legacy restore requires a new explicit destination administrator request; backup job metadata cannot grant runtime privilege'), {
+          statusCode: 403, code: 'LEGACY_RESTORE_REAUTHORIZATION_REQUIRED',
+        });
       assertActive();
       await this.prepareRestoreDirectory(dir);
       assertActive();
@@ -3424,6 +3445,7 @@ export class BackupManager {
               displayName: index === 0 ? displayName : undefined,
               ...(imageResolution ? { imageResolution } : {}),
             },
+            await runtimeAuthorization?.(),
           );
           createdWorkers.push(worker.id);
           job.restoreMappings.push({

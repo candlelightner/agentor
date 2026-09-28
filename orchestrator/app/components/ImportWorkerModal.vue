@@ -5,6 +5,10 @@ const open = defineModel<boolean>('open', { default: false });
 const emit = defineEmits<{ imported: [container: ContainerInfo] }>();
 
 const { importContainer } = useContainers();
+const { isAdmin } = useAuth();
+const runtimeProfile = ref<'kata-qemu' | 'legacy-runc'>('kata-qemu');
+const acknowledgeHostPrivilege = ref(false);
+const runtimeOptions = [{ label: 'Kata / QEMU', value: 'kata-qemu' }, { label: 'Legacy runc (administrator)', value: 'legacy-runc' }];
 
 const file = ref<File | null>(null);
 const displayName = ref('');
@@ -17,7 +21,13 @@ watch(open, (isOpen) => {
     displayName.value = '';
     importing.value = false;
     error.value = '';
+    runtimeProfile.value = 'kata-qemu';
+    acknowledgeHostPrivilege.value = false;
   }
+});
+watch(runtimeProfile, () => { acknowledgeHostPrivilege.value = false; });
+watch(isAdmin, (admin) => {
+  if (!admin) { runtimeProfile.value = 'kata-qemu'; acknowledgeHostPrivilege.value = false; }
 });
 
 function onFileChange(e: Event) {
@@ -27,10 +37,13 @@ function onFileChange(e: Event) {
 
 async function doImport() {
   if (!file.value) return;
+  if (runtimeProfile.value === 'legacy-runc' && (!isAdmin.value || !acknowledgeHostPrivilege.value)) return;
   importing.value = true;
   error.value = '';
   try {
-    const container = await importContainer(file.value, displayName.value.trim() || undefined);
+    const container = await importContainer(file.value, displayName.value.trim() || undefined,
+      isAdmin.value ? { runtimeProfile: runtimeProfile.value,
+        ...(runtimeProfile.value === 'legacy-runc' ? { acknowledgeHostPrivilege: true } : {}) } : undefined);
     emit('imported', container);
     open.value = false;
   } catch (err: any) {
@@ -69,10 +82,19 @@ async function doImport() {
           <UInput v-model="displayName" size="sm" class="w-full" placeholder="Defaults to the exported worker's name" data-testid="import-name" />
         </div>
 
+        <div class="space-y-1.5">
+          <p class="text-xs font-medium text-gray-600 dark:text-gray-300">Worker runtime</p>
+          <USelect v-if="isAdmin" v-model="runtimeProfile" :items="runtimeOptions" class="w-full" aria-label="Import worker runtime" />
+          <p v-else class="text-sm">Kata / QEMU</p>
+          <p v-if="runtimeProfile === 'kata-qemu'" class="text-xs text-gray-500">Requires an operator-validated host. Docker-in-Docker is currently unavailable for Kata workers.</p>
+          <UCheckbox v-else v-model="acknowledgeHostPrivilege" label="I authorize legacy runc. Docker-enabled workers receive privilege on the host." />
+          <p class="text-xs text-gray-500">The exported runtime does not authorize the runtime on this installation.</p>
+        </div>
+
         <p v-if="error" class="text-sm text-red-600 dark:text-red-400" data-testid="import-error">{{ error }}</p>
 
         <div class="flex gap-3 pt-2">
-          <UButton class="flex-1" :loading="importing" :disabled="!file" data-testid="import-submit" @click="doImport">
+          <UButton class="flex-1" :loading="importing" :disabled="!file || (runtimeProfile === 'legacy-runc' && (!isAdmin || !acknowledgeHostPrivilege))" data-testid="import-submit" @click="doImport">
             Import
           </UButton>
           <UButton color="neutral" variant="outline" @click="() => { open = false; }">Cancel</UButton>

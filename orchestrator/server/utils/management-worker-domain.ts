@@ -18,6 +18,20 @@ import { markGroupEnvPending, publicGroupEnvKeys } from "./worker-group-env";
 import { useWorkerGroupEnvStore } from "./services";
 import { workerGroupsWithMemberCounts, workerGroupWithMemberCounts } from "./worker-group-response";
 import { isWorkerSelfApiAccess, withEffectiveWorkerSelfApiAccess } from "./worker-self-access";
+import { approveRestoredKataRuntime, authorizeRuntimeSelection, grantLegacyWorkerRuntime, runtimeGrantDependencies, type RuntimeAdministrator } from "./worker-runtime-admin";
+import type { ManagementVolumeAuthority } from "./management-volume-domain";
+
+/** Runtime authority comes only from the live, server-held MCP identity. */
+export function managementRuntimeAdministrator(authority?: ManagementVolumeAuthority): RuntimeAdministrator {
+  return { authorize: async () => {
+    if (authority?.scope !== 'platform' || !authority.reauthorize)
+      throw status(403, 'A live platform administrative identity is required for legacy runtime authority');
+    const current = await authority.reauthorize();
+    if (current.scope !== 'platform' || current.workspaceId !== authority.workspaceId ||
+        current.ownerId !== authority.ownerId || current.groupId !== authority.groupId)
+      throw status(403, 'Administrative runtime identity changed');
+  } };
+}
 
 export interface ManagementDomainTool {
   name: string;
@@ -29,6 +43,10 @@ export interface ManagementDomainTool {
 
 const mutation = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
 const read = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+const runtimeSelectionProperties = {
+  runtimeProfile: { type: 'string', enum: ['kata-qemu', 'legacy-runc'], description: 'Kata by default. Legacy runc requires a live platform administrator and explicit host privilege acknowledgement.' },
+  acknowledgeHostPrivilege: { type: 'boolean', description: 'Required true for legacy runc; Docker-enabled legacy workers are privileged on the host.' },
+};
 const GROUP_ADMIN_LIFECYCLE_TIMEOUT_DEFAULT_SECONDS = 120;
 const GROUP_ADMIN_LIFECYCLE_TIMEOUT_MAX_SECONDS = 300;
 const GROUP_WORKER_LIFECYCLE_TIMEOUT_DEFAULT_SECONDS = 300;
@@ -128,6 +146,12 @@ export class ManagementWorkerDomain {
     const names: Array<[string, ManagementDomainTool["group"], string, Record<string, unknown>, Record<string, boolean | string>]> = [
       ["workers.create", "worker-lifecycle", "Create a worker for an explicit owner, optionally enrolling it directly in one of that owner's worker groups. Host mounts accept only centrally approved pathId references and default to read-only. workerSelfApiAccess is enforced immediately by the orchestrator.", { type:"object", required:["userId"], additionalProperties:false, properties:{ userId:{type:"string"}, displayName:{type:"string"}, environmentId:{type:"string"}, workerGroupId:{type:"string",description:"Optional direct worker-group membership. The group must belong to userId."}, workerSelfApiAccess:workerSelfApiAccessSchema(), imageDefinitionId:{type:"string"}, imageVersion:{type:"string"}, mounts:{type:"array",items:hostMountInputSchema}, hardwareDeviceIds:{type:"array",items:{type:"string",minLength:1}}, excludedGlobalEnvVarKeys:excludedEnvKeysSchema() } }, mutation],
       ["workers.update", "worker-lifecycle", "Update worker settings. workerSelfApiAccess takes effect immediately without restart or rebuild; protected workers require lockPassword.", workerUpdateInput(), mutation],
+      ['workers.runtime.authorize', 'worker-lifecycle', 'Platform administrator only: authorize an existing legacy worker, or approve a restored Kata worker on this destination. Preserves the runtime profile; does not start, recreate or migrate the worker.', { type: 'object', additionalProperties: false, required: ['workerId', 'runtimeProfile'], properties: { workerId: { type: 'string' }, ...runtimeSelectionProperties, lockPassword: { type: 'string', writeOnly: true } } }, mutation],
+      ['workers.runtime.preflight', 'worker-lifecycle', 'Platform administrator only: inspect runtime migration prerequisites, downtime and persistent mount preservation before stopping a worker.', { type: 'object', additionalProperties: false, required: ['workerId', 'runtimeProfile'], properties: { workerId: { type: 'string' }, runtimeProfile: runtimeSelectionProperties.runtimeProfile } }, read],
+      ['workers.runtime.status', 'worker-lifecycle', 'Platform administrator only: read durable runtime migration progress and recovery state.', { type: 'object', additionalProperties: false, required: ['workerId'], properties: { workerId: { type: 'string' } } }, read],
+      ['workers.runtime.migrate', 'worker-lifecycle', 'Platform administrator only: explicitly migrate a worker with downtime, stopped-rootfs snapshot and worker-volume rollback copies. Shared account data retains its bindings and is not rewound.', { type: 'object', additionalProperties: false, required: ['workerId', 'runtimeProfile', 'confirmDowntime'], properties: { workerId: { type: 'string' }, ...runtimeSelectionProperties, confirmDowntime: { type: 'boolean' }, lockPassword: { type: 'string', writeOnly: true } } }, mutation],
+      ['workers.runtime.recover', 'worker-lifecycle', 'Platform administrator only: retry rollback of one interrupted runtime migration. An operator must verify outstanding Docker operations have settled before acknowledging uncertain recovery. Requires the worker protection password when set.', { type: 'object', additionalProperties: false, required: ['workerId'], properties: { workerId: { type: 'string' }, acknowledgeDaemonOperationsSettled: { type: 'boolean' }, lockPassword: { type: 'string', writeOnly: true } } }, mutation],
+      ['workers.runtime.finalize', 'worker-lifecycle', 'Platform administrator only: permanently delete retained rollback container and copied volumes after validation; retain the active rootfs image. Requires explicit confirmation and the worker protection password when set.', { type: 'object', additionalProperties: false, required: ['workerId', 'confirmDeleteRollback'], properties: { workerId: { type: 'string' }, confirmDeleteRollback: { type: 'boolean' }, lockPassword: { type: 'string', writeOnly: true } } }, { ...mutation, destructiveHint: true }],
       ["workers.restart", "worker-lifecycle", "Restart a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
       ["workers.recover", "worker-lifecycle", "Recover an unresponsive worker through the bounded Agentor control plane. Persistent mounts are verified, only disposable compute is replaced, managed secrets are bootstrapped, and plugins are reconciled; protected workers require lockPassword.", objectWithWorker(), mutation],
       ["workers.rebuild", "worker-lifecycle", "Rebuild a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
@@ -159,11 +183,50 @@ export class ManagementWorkerDomain {
       ["locks.set", "locks", "Set/change a worker protection password; values are write-only.", lockSetInput(), mutation],
       ["locks.remove", "locks", "Remove protection with its current password.", lockRemoveInput(), { ...mutation, destructiveHint:true }],
     ];
-    return names.map(([name, group, description, inputSchema, annotations]) => ({ name, group, description, inputSchema, annotations }));
+    return names.map(([name, group, description, inputSchema, annotations]) => ({ name, group, description,
+      inputSchema: name === 'workers.create' ? { ...inputSchema, properties: { ...(inputSchema.properties as object), ...runtimeSelectionProperties } } : inputSchema,
+      annotations }));
   }
 
-  async execute(name: string, args: Record<string, unknown>): Promise<{ handled: boolean; result?: unknown }> {
+  async execute(name: string, args: Record<string, unknown>, authority?: ManagementVolumeAuthority): Promise<{ handled: boolean; result?: unknown }> {
     if (!this.tools().some(tool => tool.name === name)) return { handled:false };
+    if ((name === 'workers.create' || name.startsWith('workers.runtime.')) &&
+        ['legacyPrivilegeGrant', 'runtimeAuthorization', 'runtimeRestoreApprovalRequired'].some((key) => key in args))
+      throw status(400, 'Runtime authority fields cannot be supplied as tool arguments');
+    const runtimeActor = managementRuntimeAdministrator(authority);
+    if (name.startsWith('workers.runtime.') && name !== 'workers.runtime.authorize') {
+      await runtimeActor.authorize();
+      const workerId = required(args.workerId, 'workerId');
+      const cm = useContainerManager();
+      if (name === 'workers.runtime.status') return { handled: true, result: await cm.runtimeMigrationStatus(workerId) };
+      const authorize = async () => { await runtimeActor.authorize(); await useWorkerProtectionLockStore().verify(workerId, args.lockPassword); };
+      if (name === 'workers.runtime.recover') return { handled: true, result: await cm.recoverRuntimeMigration(workerId, authorize, args.acknowledgeDaemonOperationsSettled === true) };
+      if (name === 'workers.runtime.finalize') {
+        if (args.confirmDeleteRollback !== true) throw status(400, 'Explicitly confirm deletion of retained rollback evidence');
+        return { handled: true, result: await cm.finalizeRuntimeMigration(workerId, authorize) };
+      }
+      const profile = args.runtimeProfile;
+      if (profile !== 'kata-qemu' && profile !== 'legacy-runc') throw status(400, 'Invalid runtime profile');
+      if (name === 'workers.runtime.preflight') return { handled: true, result: await cm.preflightRuntimeMigration(workerId, profile) };
+      if (args.confirmDowntime !== true) throw status(400, 'Explicit worker downtime confirmation is required');
+      await authorizeRuntimeSelection(runtimeActor, profile, args.acknowledgeHostPrivilege);
+      return { handled: true, result: await cm.migrateRuntime(workerId, profile, authorize) };
+    }
+    if (name === 'workers.runtime.authorize') {
+      await runtimeActor.authorize();
+      if (Object.keys(args).some((key) => !['workerId', 'runtimeProfile', 'acknowledgeHostPrivilege', 'lockPassword'].includes(key)))
+        throw status(400, 'Unknown runtime authorization argument');
+      const workerId = required(args.workerId, 'workerId');
+      if (args.runtimeProfile !== 'kata-qemu' && args.runtimeProfile !== 'legacy-runc')
+        throw status(400, 'runtimeProfile must select the existing worker runtime');
+      const deps = await runtimeGrantDependencies();
+      return { handled: true, result: args.runtimeProfile === 'kata-qemu'
+        ? await approveRestoredKataRuntime(runtimeActor, workerId, args.lockPassword, deps)
+        : await grantLegacyWorkerRuntime(runtimeActor, workerId, args, deps) };
+    }
+    const runtimeAuthorization = name === 'workers.create'
+      ? await authorizeRuntimeSelection(runtimeActor, args.runtimeProfile, args.acknowledgeHostPrivilege)
+      : undefined;
     const cm = useContainerManager(); const locks = useWorkerProtectionLockStore();
     if (name === "workers.create") {
       const userId = required(args.userId, "userId");
@@ -184,7 +247,8 @@ export class ManagementWorkerDomain {
         ? catalog.resolveSelectionForGroup(userId,imageCatalogGroupId,optionalString(args.imageDefinitionId),optionalString(args.imageVersion))
         : catalog.resolveSelection(userId,optionalString(args.imageDefinitionId),optionalString(args.imageVersion));
       const request: CreateContainerRequest = { userId, displayName: optionalString(args.displayName), environmentId: optionalString(args.environmentId), workerSelfApiAccess:parseWorkerSelfApiAccess(args.workerSelfApiAccess), excludedGlobalEnvVarKeys: args.excludedGlobalEnvVarKeys===undefined?undefined:strings(args.excludedGlobalEnvVarKeys,"excludedGlobalEnvVarKeys"), excludedGroupEnvVarKeys:args.excludedGroupEnvVarKeys===undefined?undefined:strings(args.excludedGroupEnvVarKeys,"excludedGroupEnvVarKeys"),targetWorkerGroupId:requestedTargetGroupId, initScript: optionalString(args.initScript), repos: array(args.repos), mounts: array(args.mounts), hardwareDeviceIds: args.hardwareDeviceIds===undefined?undefined:strings(args.hardwareDeviceIds,"hardwareDeviceIds"), workerConfiguration: configInput(args.configuration), imageDefinitionId:selection?.definitionId, imageVersion:selection?.version, imageDigest:selection?.digest, imageRuntimeReference:selection?.runtimeImage } as CreateContainerRequest;
-      const created=await cm.create(request);
+      if (runtimeAuthorization) await runtimeActor.authorize();
+      const created=await cm.create(request, runtimeAuthorization);
       // Group-scoped MCP creation owns its stronger hierarchy authorization and
       // enrollment transaction in ManagementMcpStore. Platform management MCP
       // uses the same normal group/network coordinator here.

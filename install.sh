@@ -110,10 +110,18 @@ echo ""
 
 sync_file "$BASE/docker-compose.prod.yml" "docker-compose.yml"
 sync_file "$BASE/.env.example"            ".env"
+mkdir -p scripts
+sync_file "$BASE/scripts/setup-kata-host.sh" "scripts/setup-kata-host.sh"
+sync_file "$BASE/scripts/check-kata-host.sh" "scripts/check-kata-host.sh"
+sync_file "$BASE/scripts/validate-kata-archive.py" "scripts/validate-kata-archive.py"
+mkdir -p docs
+sync_file "$BASE/docs/kata-host.md" "docs/kata-host.md"
 
 echo ""
 echo "Done! Next steps:"
-echo "  1. docker compose up -d"
-echo "  2. Open http://localhost:3000 and create your admin account"
-echo "  3. Open Account → API keys & tokens to set agent API keys + GitHub token"
+echo "  1. For Kata workers, read docs/kata-host.md and run the optional host preflight/setup"
+echo "     before upgrading the stack. The installer has not changed Docker."
+echo "  2. docker compose up -d"
+echo "  3. Open http://localhost:3000 and create your admin account"
+echo "  4. Open Account → API keys & tokens to set agent API keys + GitHub token"
 echo "     For OAuth subscriptions, log in once inside a worker (see README)"

@@ -22,6 +22,10 @@ async function mock(page: Page) {
   });
 }
 async function open(page:Page){await goToDashboard(page);await page.getByRole('button',{name:/backup management/i}).click();return page.locator('[data-testid="backup-management"]')}
+async function selectLegacyRestore(page: Page) {
+  await page.getByRole('combobox', { name: 'Restored worker runtime' }).click();
+  await page.getByRole('option', { name: 'Legacy runc (administrator)', exact: true }).click();
+}
 async function selectWorkspace(page:Page,modal:ReturnType<Page['locator']>,query:string,name:RegExp){
   const selector=modal.getByTestId('backup-workspace-selector');
   await selector.click();
@@ -30,6 +34,82 @@ async function selectWorkspace(page:Page,modal:ReturnType<Page['locator']>,query
   await page.keyboard.press('Escape');
 }
 test.beforeEach(async({page})=>mock(page));
+test('administrator new-worker restore requires legacy acknowledgement and sends explicit selection', async ({ page }) => {
+  let body: any;
+  await page.route('**/api/backups/backup-1/restore', async route => {
+    body = route.request().postDataJSON();
+    await route.fulfill({ status: 202, json: { jobId: 'restore-legacy' } });
+  });
+  const modal = await open(page);
+  await modal.getByRole('button', { name: 'Restore', exact: true }).click();
+  const panel = modal.getByTestId('restore-backup');
+  await expect(panel.getByRole('combobox', { name: 'Restored worker runtime' })).toContainText('Kata / QEMU');
+  await selectLegacyRestore(page);
+  await expect(panel.getByRole('button', { name: 'Start restore' })).toBeDisabled();
+  await panel.getByRole('checkbox', { name: /I authorize legacy runc/ }).check();
+  await panel.getByRole('button', { name: 'Start restore' }).click();
+  await expect.poll(() => body?.runtimeProfile).toBe('legacy-runc');
+  expect(body).toMatchObject({ target: 'new', acknowledgeHostPrivilege: true });
+});
+
+test('closing backup management clears the selected runtime and legacy acknowledgement', async ({ page }) => {
+  const modal = await open(page);
+  await modal.getByRole('button', { name: 'Restore', exact: true }).click();
+  await selectLegacyRestore(page);
+  await modal.getByRole('checkbox', { name: /I authorize legacy runc/ }).check();
+  await modal.getByRole('button', { name: 'Close', exact: true }).click();
+  await expect(modal).toBeHidden();
+  await page.getByRole('button', { name: /backup management/i }).click();
+  await modal.getByRole('button', { name: 'Restore', exact: true }).click();
+  const panel = modal.getByTestId('restore-backup');
+  await expect(panel.getByRole('combobox', { name: 'Restored worker runtime' })).toContainText('Kata / QEMU');
+  await selectLegacyRestore(page);
+  await expect(panel.getByRole('checkbox', { name: /I authorize legacy runc/ })).not.toBeChecked();
+  await expect(panel.getByRole('button', { name: 'Start restore' })).toBeDisabled();
+});
+
+test('original-worker restore never submits a previously selected legacy override', async ({ page }) => {
+  let body: any;
+  await page.route('**/api/backups/backup-1/restore', async route => {
+    body = route.request().postDataJSON();
+    await route.fulfill({ status: 202, json: { jobId: 'restore-original' } });
+  });
+  const modal = await open(page);
+  await modal.getByRole('button', { name: 'Restore', exact: true }).click();
+  await selectLegacyRestore(page);
+  await modal.getByRole('checkbox', { name: /I authorize legacy runc/ }).check();
+  const panel = modal.getByTestId('restore-backup');
+  await panel.getByLabel('Original worker', { exact: true }).check();
+  await expect(panel.getByRole('combobox', { name: 'Restored worker runtime' })).toHaveCount(0);
+  await panel.getByLabel(/Original worker is stopped/).check();
+  await panel.getByRole('button', { name: 'Start restore' }).click();
+  await expect.poll(() => body?.target).toBe('original');
+  expect(body).not.toHaveProperty('runtimeProfile');
+  expect(body).not.toHaveProperty('acknowledgeHostPrivilege');
+});
+
+test('ordinary-user backup restore exposes Kata only and sends no runtime override', async ({ page }) => {
+  await page.route('**/api/auth/get-session**', async route => {
+    const response = await route.fetch();
+    const session = await response.json();
+    await route.fulfill({ response, json: { ...session, user: { ...session.user, role: 'user' } } });
+  });
+  let body: any;
+  await page.route('**/api/backups/backup-1/restore', async route => {
+    body = route.request().postDataJSON();
+    await route.fulfill({ status: 202, json: { jobId: 'restore-ordinary' } });
+  });
+  const modal = await open(page);
+  await modal.getByRole('button', { name: 'Restore', exact: true }).click();
+  const panel = modal.getByTestId('restore-backup');
+  await expect(panel).toContainText('Kata / QEMU');
+  await expect(panel.getByRole('combobox', { name: 'Restored worker runtime' })).toHaveCount(0);
+  await expect(panel.getByRole('checkbox', { name: /I authorize legacy runc/ })).toHaveCount(0);
+  await panel.getByRole('button', { name: 'Start restore' }).click();
+  await expect.poll(() => body?.target).toBe('new');
+  expect(body).not.toHaveProperty('runtimeProfile');
+  expect(body).not.toHaveProperty('acknowledgeHostPrivilege');
+});
 test('configures scheduling and starts a manual backup with progress and consistency warning',async({page})=>{const m=await open(page);await expect(m).toContainText('fake — linked');await m.getByLabel('Enable scheduled backups').check();await m.getByRole('button',{name:'Save schedule'}).click();await m.getByRole('button',{name:'Back up now'}).click();await expect(m).toContainText('queued · queued');await expect(m).toContainText('crash-consistent')});
 test('saves draft settings and uses the selected provider when backing up immediately',async({page})=>{
   let saved:any; let started:any;
@@ -120,7 +200,8 @@ test('selects one workspace from a multi-worker backup and posts that exact rest
   await expect(panel.getByLabel('worker-2')).toBeChecked();
   await panel.getByLabel('worker-1').uncheck();
   await panel.getByRole('button',{name:'Start restore'}).click();
-  expect(restoreBody).toMatchObject({target:'new',displayName:'',confirmOverwrite:false,workspaceIds:['worker-2']});
+  expect(restoreBody).toMatchObject({target:'new',displayName:'',confirmOverwrite:false,workspaceIds:['worker-2'],runtimeProfile:'kata-qemu'});
+  expect(restoreBody).not.toHaveProperty('acknowledgeHostPrivilege');
   expect(restoreBody.requestId).toMatch(/^ui-restore-/);
 });
 test('an administrator configures write-only Google OAuth installation credentials before linking',async({page})=>{const m=await open(page);const panel=m.locator('[data-testid="google-oauth-installation"]');await expect(panel).toBeVisible();await panel.getByLabel('Client ID').fill('dashboard-client');await panel.getByLabel('Redirect URI').fill('https://dash.example/api/backup-providers/google/oauth/callback');await panel.getByLabel('Client secret').fill('DO_NOT_RENDER_SECRET');await panel.getByRole('button',{name:'Save Google OAuth configuration'}).click();await expect(panel).toContainText('Configured from installation');await expect(panel).not.toContainText('DO_NOT_RENDER_SECRET')});

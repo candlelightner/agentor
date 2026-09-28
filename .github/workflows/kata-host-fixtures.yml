@@ -1,0 +1,35 @@
+name: Kata host installer fixtures
+
+on:
+  pull_request:
+    paths:
+      - install.sh
+      - scripts/setup-kata-host.sh
+      - scripts/check-kata-host.sh
+      - scripts/validate-kata-archive.py
+      - tests/kata-host-fixtures.sh
+      - tests/kata-archive-fixtures.py
+      - .github/workflows/kata-host-fixtures.yml
+  push:
+    branches: [main]
+    paths:
+      - install.sh
+      - scripts/setup-kata-host.sh
+      - scripts/check-kata-host.sh
+      - scripts/validate-kata-archive.py
+      - tests/kata-host-fixtures.sh
+      - tests/kata-archive-fixtures.py
+      - .github/workflows/kata-host-fixtures.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-fixtures:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate installer configuration fixtures
+        run: bash tests/kata-host-fixtures.sh

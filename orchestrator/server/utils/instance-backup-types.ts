@@ -71,6 +71,9 @@ export interface InstanceBackupHostMountInventory {
 export interface InstanceBackupImageInventory {
   definitions: number;
   immutableDigests: string[];
+  /** Additive v1 field: transfer these exact local snapshots separately with
+   * docker save/load. A base-image rebuild cannot reconstruct their rootfs. */
+  capturedWorkerImages?: import('./worker-runtime-snapshot').CapturedWorkerImage[];
   /** Docker image layers are not silently copied with DATA_DIR. */
   layersIncluded: false;
 }

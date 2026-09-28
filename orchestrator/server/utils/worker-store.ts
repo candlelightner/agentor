@@ -4,6 +4,7 @@ import type {
   MountConfig,
   UserOwnedResource,
   WorkerSelfApiAccess,
+  WorkerRuntimeProfile,
 } from "../../shared/types";
 
 /** Persisted worker metadata — intentionally minimal. It stores ONLY what cannot
@@ -24,6 +25,12 @@ export interface WorkerRecord extends UserOwnedResource {
    * kept for unarchiving. (For archived workers the record is the only evidence
    * the worker exists, since no container remains to discover it from.) */
   status: "active" | "archived";
+  /** New records carry an explicit profile; absence is pre-upgrade legacy. */
+  runtimeProfile?: WorkerRuntimeProfile;
+  /** Granted only by a trusted admin operation or migration from Docker inspect. */
+  legacyPrivilegeGrant?: "preexisting" | "admin";
+  /** Instance restore requires a fresh destination administrator decision. */
+  runtimeRestoreApprovalRequired?: boolean;
   /** Desired runtime state survives daemon/orchestrator restarts. Legacy
    * records are migrated from the first successfully verified observation. */
   desiredRuntimeStatus?: "running" | "stopped";
@@ -158,6 +165,31 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     };
     await this.setItem(userId, updated);
     return updated;
+  }
+
+  /** One-way migration of an active pre-profile worker, after Docker inspect
+   * verifies the actual runtime. Never grants privilege from environment data. */
+  async capturePreexistingRuntime(
+    userId: string,
+    id: string,
+    privileged: boolean,
+  ): Promise<WorkerRecord | undefined> {
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId);
+      const previous = map?.get(id);
+      if (!map || !previous || previous.status !== 'active' || previous.runtimeProfile !== undefined)
+        return previous ? structuredClone(previous) : undefined;
+      const next: WorkerRecord = {
+        ...previous,
+        runtimeProfile: 'legacy-runc',
+        ...(privileged ? { legacyPrivilegeGrant: 'preexisting' as const } : {}),
+        updatedAt: new Date().toISOString(),
+      };
+      map.set(id, next);
+      try { await this.persistUser(userId); }
+      catch (error) { map.set(id, previous); throw error; }
+      return structuredClone(next);
+    });
   }
 
   /** Persist the desired host-mount set after a grant/hierarchy change. Active

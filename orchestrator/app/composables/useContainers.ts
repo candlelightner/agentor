@@ -63,9 +63,17 @@ export function useContainers() {
 
   /** Restore a worker from an exported bundle. The bundle is streamed as the raw
    * request body (`application/x-tar`) so multi-GB imports never buffer. */
-  async function importContainer(file: File, displayName?: string): Promise<ContainerInfo> {
-    const query = displayName ? `?displayName=${encodeURIComponent(displayName)}` : '';
-    const result = await $fetch<ContainerInfo>(`/api/containers/import${query}`, {
+  async function importContainer(file: File, displayName?: string,
+    runtimeSelection?: { runtimeProfile: 'kata-qemu' | 'legacy-runc'; acknowledgeHostPrivilege?: boolean },
+  ): Promise<ContainerInfo> {
+    const query = new URLSearchParams();
+    if (displayName) query.set('displayName', displayName);
+    if (runtimeSelection) {
+      query.set('runtimeProfile', runtimeSelection.runtimeProfile);
+      if (runtimeSelection.runtimeProfile === 'legacy-runc' && runtimeSelection.acknowledgeHostPrivilege === true)
+        query.set('acknowledgeHostPrivilege', 'true');
+    }
+    const result = await $fetch<ContainerInfo>(`/api/containers/import${query.size ? `?${query}` : ''}`, {
       method: 'POST',
       body: file,
       headers: { 'Content-Type': 'application/x-tar' },

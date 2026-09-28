@@ -191,6 +191,9 @@ export interface WorkerGroupLifecycleResult {
   failures: Array<{ workerId: string; message: string }>;
 }
 
+/** Isolation chosen when an ordinary worker container is created. */
+export type WorkerRuntimeProfile = "kata-qemu" | "legacy-runc";
+
 /** A worker. `id` is the worker's stable UUID identity (immutable across
  * rebuild/unarchive); `containerId`/`containerName` describe the current Docker
  * container (the `containerId` changes on every rebuild). Extends
@@ -214,6 +217,11 @@ export interface ContainerInfo extends UserOwnedResource {
   imageName: string;
   imageId: string;
   status: ContainerStatus;
+  /** Durable ordinary-worker runtime selection. Missing old records resolve to legacy-runc. */
+  runtimeProfile?: WorkerRuntimeProfile;
+  /** Internal authorization provenance for host-privileged legacy DinD. */
+  legacyPrivilegeGrant?: "preexisting" | "admin";
+  runtimeRestoreApprovalRequired?: boolean;
   /** Durable operator intent, distinct from an unreliable Docker observation. */
   desiredRuntimeStatus?: "running" | "stopped";
   /** Safe, value-free explanation when the runtime cannot be verified. */
@@ -258,6 +266,9 @@ export interface ContainerInfo extends UserOwnedResource {
 }
 
 export interface CreateContainerRequest {
+  /** REST selection is checked by platform-admin policy; manager never trusts this field. */
+  runtimeProfile?: WorkerRuntimeProfile;
+  acknowledgeHostPrivilege?: boolean;
   /** Editable, user-facing label. Free-form; defaults to a generated friendly
    * slug server-side when omitted. The internal worker identity is a UUID v4
    * minted by the orchestrator and is never client-supplied. */

@@ -28,7 +28,12 @@ export async function createWorker(
   const api = new ApiClient(request);
   const displayName = `test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-  const { status, body } = await api.createContainer({
+  // Explicit admin fixture selection keeps runc-only CI useful. Ordinary
+  // callers keep the production default and never gain legacy authority.
+  const session = await api.getAuthSession();
+  const create = session.body?.user?.role === 'admin' && overrides.runtimeProfile === undefined
+    ? api.createLegacyContainer.bind(api) : api.createContainer.bind(api);
+  const { status, body } = await create({
     displayName,
     ...overrides,
   });

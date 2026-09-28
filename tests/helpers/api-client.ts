@@ -59,6 +59,15 @@ export class ApiClient {
     return { status: res.status(), body: await res.json() };
   }
 
+  /** Explicit fixture provisioning for the isolated runc-only runner. The
+   * ordinary create method above intentionally retains production defaults. */
+  async createLegacyContainer(data: Record<string, unknown> = {}) {
+    const session = await this.getAuthSession();
+    if (session.status !== 200 || session.body?.user?.role !== 'admin')
+      throw new Error('Legacy fixture provisioning requires an authenticated platform administrator');
+    return this.createContainer({ runtimeProfile: 'legacy-runc', acknowledgeHostPrivilege: true, ...data });
+  }
+
   // Returns a display-name suggestion. Body is now `{ displayName }`.
   async generateName() {
     const res = await this.request.get(`${BASE_URL}/api/containers/generate-name`);

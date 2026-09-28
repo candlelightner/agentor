@@ -1,4 +1,5 @@
 import Docker from "dockerode";
+import { capturedWorkerImageInventory, missingCapturedWorkerImages } from './worker-runtime-snapshot';
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, createReadStream, createWriteStream } from "node:fs";
 import {
@@ -455,8 +456,16 @@ export class InstanceBackupManager {
       warnings.push(
         "Docker image layers are not embedded. Pull immutable registry digests or rebuild custom images after restore.",
       );
+    const capturedImages = manifest.images.capturedWorkerImages ?? [];
+    if (capturedImages.length) {
+      warnings.push('Runtime-migrated workers require their exact local snapshot images. Transfer encrypted docker-save archives separately and docker-load them on this destination; rebuilding the base image loses writable rootfs changes.');
+      const missing = await missingCapturedWorkerImages(this.docker, capturedImages);
+      if (missing.length) blockers.push(`Load the exact captured runtime snapshot images before restore: ${missing.join(', ')}`);
+    }
     warnings.push(
       "External .env values, GitHub App PEM files, DNS credentials, registry credentials, and host-mounted file contents are not embedded and must be supplied separately.",
+      "Restored worker runtime profiles are informational. Imported legacy privilege grants are removed, and every worker is held until a destination administrator explicitly authorizes its runtime.",
+      "Source-host runtime migration journals are omitted from restored state; their container IDs and rollback bindings cannot be replayed on this destination.",
     );
     return {
       ready: blockers.length === 0,
@@ -1371,6 +1380,7 @@ export class InstanceBackupManager {
       images: {
         definitions: images.length,
         immutableDigests,
+        capturedWorkerImages: await capturedWorkerImageInventory(this.docker, services.useWorkerStore().list()),
         layersIncluded: false as const,
       },
       storage: {
@@ -1409,6 +1419,7 @@ export class InstanceBackupManager {
         },
       );
     if (
+      (await services.useContainerManager().hasPendingRuntimeMigrations()) ||
       (await useBackupManager().hasActiveOperationsForInstanceSnapshot()) ||
       useManagedVolumeManager().hasActiveOperationsForInstanceSnapshot() ||
       (await import("./managed-volume-sizing")).useManagedVolumeSizingManager().hasActiveOperationsForInstanceSnapshot() ||

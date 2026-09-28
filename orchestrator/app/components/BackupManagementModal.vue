@@ -17,6 +17,8 @@ const api = useBackups(),
 const busy = ref(""),
   restoreItem = ref<any>(null),
   restoreTarget = ref<"new" | "original">("new"),
+  restoreRuntimeProfile = ref<'kata-qemu' | 'legacy-runc'>('kata-qemu'),
+  acknowledgeHostPrivilege = ref(false),
   restoreWorkspaceIds = ref<string[]>([]),
   workspaceNames = ref<Record<string, string>>({}),
   workspaceOptions = ref<WorkspaceOption[]>([]),
@@ -38,6 +40,14 @@ const busy = ref(""),
   actionError = ref(""),
   savedNotice = ref("");
 const googleDraft = reactive({ clientId: "", redirectUri: "", clientSecret: "" });
+const runtimeOptions = [{ label: 'Kata / QEMU', value: 'kata-qemu' }, { label: 'Legacy runc (administrator)', value: 'legacy-runc' }];
+watch(restoreRuntimeProfile, () => {
+  acknowledgeHostPrivilege.value = false;
+  if (restoreItem.value) restoreRequestId.value = requestIdentity('ui-restore');
+});
+watch(isAdmin, (admin) => {
+  if (!admin) { restoreRuntimeProfile.value = 'kata-qemu'; acknowledgeHostPrivilege.value = false; }
+});
 let recoverySecretTimer: ReturnType<typeof setTimeout> | undefined;
 function clonePathSelections(value: Record<string, string[]> | undefined) {
   return JSON.parse(JSON.stringify(value || {})) as Record<string, string[]>;
@@ -54,7 +64,7 @@ watch(open, async (shown) => {
     savedNotice.value = "";
   } else {
     api.stop();
-    restoreLockPassword.value = "";
+    cancelRestore();
     clearRecoverySecret();
   }
 });
@@ -277,7 +287,7 @@ async function recoverImageDefinition(summary: BackupWorkspaceReconstruction) {
   );
 }
 async function restore() {
-  if (!restoreItem.value || !restoreWorkspaceIds.value.length) return;
+  if (!restoreItem.value || !restoreCanStart.value) return;
   const imageResolutions: Record<string, any> = {};
   for (const summary of selectedCustomImageSummaries.value) {
     const mode = restoreImageModes.value[summary.workspaceId] || "exact";
@@ -313,6 +323,10 @@ async function restore() {
       restoreWorkspaceIds.value,
       restoreRequestId.value || (restoreRequestId.value = requestIdentity("ui-restore")),
       Object.keys(imageResolutions).length ? imageResolutions : undefined,
+      restoreTarget.value === 'new' && isAdmin.value ? {
+        runtimeProfile: restoreRuntimeProfile.value,
+        ...(restoreRuntimeProfile.value === 'legacy-runc' ? { acknowledgeHostPrivilege: true } : {}),
+      } : undefined,
     ),
   );
   if (result) {
@@ -328,6 +342,8 @@ function close() {
 function selectRestore(item: any) {
   restoreItem.value = item;
   restoreTarget.value = "new";
+  restoreRuntimeProfile.value = 'kata-qemu';
+  acknowledgeHostPrivilege.value = false;
   restoreWorkspaceIds.value = restoreMembers(item).map((member) => member.id);
   restoreName.value = "";
   confirmOverwrite.value = false;
@@ -366,6 +382,8 @@ function selectRestore(item: any) {
   );
 }
 function cancelRestore() {
+  restoreRuntimeProfile.value = 'kata-qemu';
+  acknowledgeHostPrivilege.value = false;
   restoreItem.value = null;
   restoreWorkspaceIds.value = [];
   restoreName.value = "";
@@ -413,6 +431,7 @@ function imageBuildId(job: BackupJob | undefined) {
 const restoreCanStart = computed(() => {
   if (!restoreWorkspaceIds.value.length) return false;
   if (restoreTarget.value === "original") return confirmOverwrite.value;
+  if (restoreRuntimeProfile.value === 'legacy-runc' && (!isAdmin.value || !acknowledgeHostPrivilege.value)) return false;
   return selectedCustomImageSummaries.value.every((summary) => {
     const mode = restoreImageModes.value[summary.workspaceId] || "exact";
     if (mode === "exact") return exactImageAvailable(summary.workspaceId);
@@ -507,6 +526,8 @@ function selectOriginalWorkspace(id: string) {
   restoreWorkspaceIds.value = [id];
 }
 watch(restoreTarget, (target) => {
+  restoreRuntimeProfile.value = 'kata-qemu';
+  acknowledgeHostPrivilege.value = false;
   if (!restoreItem.value) return;
   const members = restoreMembers();
   if (target === "original" && restoreWorkspaceIds.value.length !== 1)
@@ -843,6 +864,14 @@ watch(restoreTarget, (target) => {
               /> Original worker</label
             >
           </fieldset>
+          <div v-if="restoreTarget === 'new'" class="space-y-1.5">
+            <p class="text-sm font-medium">Worker runtime</p>
+            <USelect v-if="isAdmin" v-model="restoreRuntimeProfile" :items="runtimeOptions" class="w-full" aria-label="Restored worker runtime" />
+            <p v-else class="text-sm">Kata / QEMU</p>
+            <p v-if="restoreRuntimeProfile === 'kata-qemu'" class="text-xs text-gray-500">Requires an operator-validated host. Docker-in-Docker is currently unavailable for Kata workers.</p>
+            <UCheckbox v-else v-model="acknowledgeHostPrivilege" label="I authorize legacy runc. Docker-enabled workers receive privilege on the host." />
+            <p class="text-xs text-gray-500">Backup runtime metadata does not authorize host privilege. A legacy restore retry requires a new administrator-authorized request.</p>
+          </div>
           <fieldset class="rounded border p-3 space-y-1">
             <legend class="px-1 text-sm font-medium">
               Workspaces to restore

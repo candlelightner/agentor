@@ -129,13 +129,16 @@ export class ManagedVolumeManager {
 
   private resolveMode(actor: PersistenceActor, raw: unknown, acknowledged: unknown): VolumeApplyMode {
     const policy = this.policies.policy(actor.userId, actor.workerId);
+    const isKata = useWorkerStore().get(actor.userId, actor.workerId)?.runtimeProfile === "kata-qemu";
     if (actor.selfService) {
       if (raw !== undefined || acknowledged !== undefined)
         throw volumeError(403, "Workers cannot select a privileged or disruptive application mode.");
-      return policy.allowLiveMount ? "live" : policy.allowSelfRecreate ? "recreate" : "deferred";
+      return policy.allowLiveMount && !isKata ? "live" : policy.allowSelfRecreate ? "recreate" : "deferred";
     }
     const mode = raw ?? "deferred";
     if (mode !== "deferred" && mode !== "recreate" && mode !== "live") throw volumeError(400, "Invalid persistence application mode.");
+    if (mode === "live" && isKata)
+      throw volumeError(409, "Live mounting is not supported for Kata workers. Choose recreation or deferred application.");
     if (mode === "live" && !policy.allowLiveMount && acknowledged !== true)
       throw volumeError(409, "Live mounting runs a temporary privileged Agentor helper. Acknowledge this operation or choose recreation.");
     return mode;
@@ -200,7 +203,11 @@ export class ManagedVolumeManager {
   }
 
   private async live(worker: ContainerInfo, v: StoredManagedVolume) {
+    if (worker.runtimeProfile === "kata-qemu")
+      throw volumeError(409, "Live mounting is not supported for Kata workers. Choose recreation or deferred application.");
     const before = await this.runtime.validateTarget(worker.containerId, v.target, v.seeded ? v.dockerName : undefined);
+    if (before.HostConfig.Runtime && before.HostConfig.Runtime !== "runc")
+      throw volumeError(409, "Live mounting requires a verified legacy runc worker. Choose recreation.");
     if (v.seeded && before.Mounts.some((m) => m.Name === v.dockerName && m.Destination === v.target)) return;
     if (!before.State.Running || before.State.Paused) throw volumeError(409, "Live mounting requires a running, unpaused worker.");
     if (v.liveContainerId) await this.recoverLive(v);

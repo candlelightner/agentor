@@ -26,6 +26,7 @@ import type {
   InstanceBackupOptions,
   InstanceBackupVolumeManifest,
 } from "./instance-backup-types";
+import { isRuntimeSnapshotImage } from './worker-runtime-snapshot';
 
 const MANIFEST = "manifest.json";
 const DATA_ARCHIVE = "data.tar.gz";
@@ -331,6 +332,14 @@ export function validateInstanceManifest(
       (digest: unknown) =>
         typeof digest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(digest),
     ) ||
+    (input.images.capturedWorkerImages !== undefined && (
+      !Array.isArray(input.images.capturedWorkerImages) || input.images.capturedWorkerImages.length > 100_000 ||
+      input.images.capturedWorkerImages.some((image: any) => !image ||
+        !bounded(image.workerId, 256) || !/^[a-zA-Z0-9_-]+$/.test(image.workerId) ||
+        typeof image.reference !== 'string' || !isRuntimeSnapshotImage(image.reference) ||
+        !image.reference.startsWith(`agentor-import-${image.workerId}:runtime-`) ||
+        !/^sha256:[a-f0-9]{64}$/.test(image.imageId))
+    )) ||
     !Array.isArray(input.excludedDataPaths) ||
     input.excludedDataPaths.length > 100 ||
     input.excludedDataPaths.some(

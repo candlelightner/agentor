@@ -2,12 +2,52 @@
 
 Every user-facing feature of the Agentor web dashboard, organized by category. This document drives the Playwright test suite — every item below must have test coverage.
 
+## Worker runtimes (Kata/QEMU rollout gated)
+
+- Ordinary workers persist `kata-qemu` or `legacy-runc`; old workers retain their
+  observed legacy behavior until explicit administrator action. New ordinary
+  creation selects Kata and fails closed without operator host attestation and
+  the registered alias. An administrator may explicitly acknowledge legacy host
+  privilege; environment settings, manifests and serialized jobs cannot grant it.
+- Kata DinD and device passthrough remain blocked pending validation. The local
+  runc probe only established daemon startup/image pull on ext-backed overlay2;
+  nested execution failed on read-only private cgroups. No supported physical-host
+  matrix or working Kata storage/permissions recipe is claimed.
+- Explicit runtime migration preflights downtime, source identity, target
+  readiness and every mount. It snapshots stopped rootfs and supported worker
+  data, validates before committing the profile, journals interrupted work, and
+  retains rollback evidence until separate finalization. Shared account mounts
+  preserve their bindings and are not rewound on rollback. Module failure
+  injection covers the transaction; actual Kata migration requires a canary.
+- Administrator create/import/new-worker-restore controls default to Kata and
+  require a separate legacy acknowledgement. Ordinary users see no legacy
+  selector. Recovery requires acknowledgement that outstanding Docker operations
+  settled; finalization separately confirms permanent rollback-evidence cleanup.
+  Automatic capacity admission is explicitly unimplemented and remains a rollout gate.
+- Snapshot image defaults preserve baked/custom image configuration but clear
+  runtime-only environment values so removed account tokens and bootstrap flags
+  cannot return on rebuild. Whole-instance manifests record exact local snapshot
+  image IDs; restore blocks until separately transferred Docker image archives
+  are loaded with matching identities. Image layers are not embedded in backups.
+- Portable runtime metadata is descriptive. Legacy restores require a fresh
+  destination administrator callback. Whole-instance restores strip privilege
+  grants, omit source-host migration journals, and hold all worker runtimes until
+  destination approval, including old records without profile metadata.
+- Coverage: `worker-runtime-policy.spec.ts`, `worker-runtime-admin.spec.ts`,
+  `worker-runtime-backup.spec.ts`, `worker-runtime-migration.spec.ts`,
+  `kata-managed-volume-runtime.spec.ts`, and runtime additions in the inventory,
+  export-format, restore-helper and lifecycle safety suites. See
+  [runtime test scope](TESTS.md#kataqemu-runtime-test-scope) and the
+  [operator handoff](../docs/kata-upgrade-plan.md#operator-handoff).
+
 ## Local persistent volumes
 
 - Worker settings expose independent persistent directory attachments with deferred,
   recreate, or explicitly acknowledged privileged-helper live application. Live
-  application supports privileged and non-privileged workers without changing their
-  privilege level. Existing contents survive migration, restart and archive/unarchive.
+  application supports verified legacy runc workers without changing their
+  privilege level; Kata live application rejects before using the privileged
+  helper or pausing a worker. Existing contents survive supported storage
+  migration, restart and archive/unarchive.
 - Storage inventory lists owner-scoped Agentor volumes and backup selection without
   exposing Docker names or host paths. Detach retains data; confirmed deletion is
   separate and refused while attached. Worker deletion retains custom volumes.

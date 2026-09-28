@@ -6,6 +6,8 @@ defineRouteMeta({
       'Restores a worker from an export bundle as a brand-new worker (fresh UUID). The request body is the raw `.tar` bundle produced by the export endpoint (Content-Type `application/x-tar`). Recreates the environment, restores the workspace + agent-data volumes, imports any captured filesystem into a per-worker image, and recreates port/domain mappings (skipping conflicts). Pass `?displayName=` to override the restored worker\'s label.',
     operationId: 'importWorker',
     parameters: [
+      { name: 'runtimeProfile', in: 'query', required: false, schema: { type: 'string', enum: ['kata-qemu', 'legacy-runc'] }, description: 'Destination selection, independent of bundle metadata. Legacy requires current platform administrator authority.' },
+      { name: 'acknowledgeHostPrivilege', in: 'query', required: false, schema: { type: 'string', enum: ['true'] }, description: 'Required for explicit legacy restore.' },
       { name: 'displayName', in: 'query', required: false, schema: { type: 'string' }, description: 'Display name for the restored worker' },
     ],
     requestBody: {
@@ -31,6 +33,8 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { useContainerManager, useConfig } from '../../utils/services';
 import { requireAuth } from '../../utils/auth-helpers';
+import { isPlatformAdminUser } from '../../utils/auth';
+import { authorizeRuntimeSelection } from '../../utils/worker-runtime-admin';
 
 const MAX_IMPORT_UPLOAD_BYTES = 40 * 1024 * 1024 * 1024;
 const MIN_IMPORT_FREE_BYTES = 512 * 1024 * 1024;
@@ -40,6 +44,10 @@ export default defineEventHandler(async (event) => {
   const { user } = requireAuth(event);
   const q = getQuery(event);
   const displayName = typeof q.displayName === 'string' ? q.displayName : undefined;
+  const runtimeActor = { authorize: async () => {
+    if (!isPlatformAdminUser(user.id)) throw createError({ statusCode: 403, statusMessage: 'Current platform administrator required for legacy restore' });
+  } };
+  const runtimeAuthorization = await authorizeRuntimeSelection(runtimeActor, q.runtimeProfile, q.acknowledgeHostPrivilege === 'true');
 
   if (activeImports.has(user.id)) {
     throw createError({ statusCode: 409, statusMessage: 'An import is already active for this user' });
@@ -72,7 +80,9 @@ export default defineEventHandler(async (event) => {
       },
     });
     await pipeline(event.node.req, limit, createWriteStream(bundlePath, { mode: 0o600 }));
-    const info = await useContainerManager().importWorker(user.id, bundlePath, { displayName });
+    // Uploads can take a long time; recheck privilege immediately before use.
+    if (runtimeAuthorization) await runtimeActor.authorize();
+    const info = await useContainerManager().importWorker(user.id, bundlePath, { displayName }, runtimeAuthorization);
     setResponseStatus(event, 201);
     return info;
   } catch (err) {

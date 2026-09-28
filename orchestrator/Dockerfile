@@ -20,7 +20,7 @@ RUN npx nuxt build
 FROM node:22-alpine
 
 WORKDIR /app
-RUN apk add --no-cache pigz python3
+RUN apk add --no-cache pigz python3 coreutils
 COPY --from=builder /app/.output/ .output/
 # Kept outside the Nitro request process on purpose: a short-lived,
 # network-disabled helper uses it to stop/apply/restart an instance restore.

@@ -15,6 +15,10 @@ const emit = defineEmits<{
 }>();
 
 const open = defineModel<boolean>('open', { default: false });
+const { isAdmin } = useAuth();
+const runtimeProfile = ref<'kata-qemu' | 'legacy-runc'>('kata-qemu');
+const acknowledgeHostPrivilege = ref(false);
+const runtimeOptions = [{ label: 'Kata / QEMU', value: 'kata-qemu' }, { label: 'Legacy runc (administrator)', value: 'legacy-runc' }];
 
 const { environments, defaultEnvironmentId } = useEnvironments();
 const hostMounts = useHostMounts();
@@ -204,6 +208,7 @@ function addHardwareDevice() { form.hardwareDeviceIds.push(''); }
 function removeHardwareDevice(idx: number) { form.hardwareDeviceIds.splice(idx, 1); }
 
 function submit() {
+  if (runtimeProfile.value === 'legacy-runc' && (!isAdmin.value || !acknowledgeHostPrivilege.value)) return;
   // The internal worker identity is a UUID v4 minted server-side; the form only
   // collects the editable, free-form display name. Send the suggested name when
   // the user leaves the field blank so the worker keeps the friendly label they
@@ -211,6 +216,8 @@ function submit() {
   const customName = form.displayName.trim();
   const request: CreateContainerRequest = {
     displayName: customName || generatedName.value,
+    runtimeProfile: runtimeProfile.value,
+    ...(runtimeProfile.value === 'legacy-runc' ? { acknowledgeHostPrivilege: true } : {}),
   };
   if (form.environmentId) request.environmentId = form.environmentId;
   if (form.workerGroupId) request.workerGroupId = form.workerGroupId;
@@ -237,6 +244,8 @@ function submit() {
 }
 
 function reset() {
+  runtimeProfile.value = 'kata-qemu';
+  acknowledgeHostPrivilege.value = false;
   form.displayName = '';
   form.environmentId = defaultEnvironmentId.value;
   form.workerGroupId = '';
@@ -267,6 +276,13 @@ function reset() {
             :placeholder="generatedName"
             class="w-full"
           />
+        </UFormField>
+
+        <UFormField label="Runtime">
+          <USelect v-if="isAdmin" v-model="runtimeProfile" :items="runtimeOptions" class="w-full" aria-label="Worker runtime" />
+          <p v-else class="text-sm">Kata / QEMU</p>
+          <p v-if="runtimeProfile === 'kata-qemu'" class="text-xs text-gray-500 mt-1">Requires an operator-validated host. Docker-in-Docker is currently unavailable for Kata workers.</p>
+          <UCheckbox v-else v-model="acknowledgeHostPrivilege" class="mt-2" label="I authorize legacy runc. Docker-enabled workers receive privilege on the host." />
         </UFormField>
 
         <UFormField label="Environment">
@@ -396,7 +412,7 @@ function reset() {
         </UFormField>
 
         <div class="flex gap-3 pt-2">
-          <UButton class="flex-1" @click="submit">
+          <UButton class="flex-1" :disabled="runtimeProfile === 'legacy-runc' && (!isAdmin || !acknowledgeHostPrivilege)" @click="submit">
             Create
           </UButton>
           <UButton

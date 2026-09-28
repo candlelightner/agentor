@@ -10,7 +10,7 @@ import * as tar from 'tar-stream';
 import type { Environment } from './environments';
 import type { PortMapping } from './port-mapping-store';
 import type { DomainMapping } from './domain-mapping-store';
-import type { RepoConfig, MountConfig, WorkerSelfApiAccess } from '../../shared/types';
+import type { RepoConfig, MountConfig, WorkerSelfApiAccess, WorkerRuntimeProfile } from '../../shared/types';
 import { AGENT_CREDENTIAL_MAPPINGS } from './user-credentials';
 import { SHARED_DIRECTORY_MOUNT_POINTS } from './storage';
 import type { PortablePluginConfiguration } from './plugin-portability';
@@ -144,6 +144,8 @@ export interface WorkerExportManifest {
     displayName: string;
     containerName: string;
     imageName: string;
+    /** Source history only; importing must select runtime using destination policy. */
+    runtimeProfile?: WorkerRuntimeProfile;
   };
   /** The worker's own rebuild-time config, restored onto the new worker. */
   worker: {
@@ -272,13 +274,22 @@ export async function writeManifest(manifest: WorkerExportManifest, dest: string
   // configuration. Sanitize at the serialization boundary as defense in depth:
   // callers compiled against an older type cannot accidentally export them.
   const safeManifest = {
-    ...manifest,
+    ...withoutRuntimeAuthority(manifest),
+    source: withoutRuntimeAuthority(manifest.source),
+    worker: withoutRuntimeAuthority(manifest.worker),
     domainMappings: manifest.domainMappings.map((mapping) => {
       const { basicAuth: _secret, ...safe } = mapping as ExportedDomainMapping & { basicAuth?: unknown };
       return safe;
     }),
   } as WorkerExportManifest;
   await writeFile(dest, JSON.stringify(safeManifest, null, 2));
+}
+
+function withoutRuntimeAuthority<T extends object>(value: T): T {
+  const safe = { ...value } as T & { legacyPrivilegeGrant?: unknown; runtimeRestoreApprovalRequired?: unknown };
+  delete safe.legacyPrivilegeGrant;
+  delete safe.runtimeRestoreApprovalRequired;
+  return safe;
 }
 
 export interface ExtractedBundle {
@@ -774,6 +785,15 @@ function assertValidManifest(value: unknown): asserts value is WorkerExportManif
   const contents = value.contents;
   if (!isRecord(source) || !['id', 'displayName', 'containerName', 'imageName'].every((k) => isString(source[k]))) {
     throw new Error('Invalid worker export: manifest.source is invalid');
+  }
+  if (source.runtimeProfile !== undefined && source.runtimeProfile !== 'kata-qemu' && source.runtimeProfile !== 'legacy-runc')
+    throw new Error('Invalid worker export: manifest.source.runtimeProfile is invalid');
+  // Runtime grants and restore approvals are never portable, including unknown
+  // fields supplied by a newer or manually constructed bundle.
+  for (const section of [source, worker, value]) {
+    if (!isRecord(section)) continue;
+    delete section.legacyPrivilegeGrant;
+    delete section.runtimeRestoreApprovalRequired;
   }
   if (!isRecord(worker) || !isString(worker.displayName) || !isString(worker.initScript) || !Array.isArray(worker.repos) || !Array.isArray(worker.mounts)) {
     throw new Error('Invalid worker export: manifest.worker is invalid');

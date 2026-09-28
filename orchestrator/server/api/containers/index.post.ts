@@ -11,6 +11,8 @@ defineRouteMeta({
           schema: {
             type: "object",
             properties: {
+              runtimeProfile: { type: 'string', enum: ['kata-qemu', 'legacy-runc'], description: 'Defaults to Kata. Legacy requires current platform administrator authority.' },
+              acknowledgeHostPrivilege: { type: 'boolean', description: 'Must be true for explicit legacy selection. Docker-enabled legacy workers receive host privilege.' },
               displayName: {
                 type: "string",
                 description:
@@ -82,10 +84,15 @@ import { useImageCatalogManager } from "../../utils/image-catalog";
 import { useWorkerGroupStore } from "../../utils/services";
 import { addWorkerToGroupWithNetworks } from "../../utils/worker-group-manager";
 import { isWorkerSelfApiAccess, withEffectiveWorkerSelfApiAccess } from "../../utils/worker-self-access";
+import { isPlatformAdminUser } from "../../utils/auth";
+import { authorizeRuntimeSelection } from "../../utils/worker-runtime-admin";
 
 export default defineEventHandler(async (event) => {
   const { user } = requireAuth(event);
   const body = await readBody(event);
+  const runtimeAuthorization = await authorizeRuntimeSelection({ authorize: async () => {
+    if (!isPlatformAdminUser(user.id)) throw createError({ statusCode: 403, statusMessage: 'Platform administrator required for legacy runtime' });
+  } }, body.runtimeProfile, body.acknowledgeHostPrivilege);
 
   if (body.displayName != null && typeof body.displayName !== "string") {
     throw createError({
@@ -209,7 +216,7 @@ export default defineEventHandler(async (event) => {
     imageDigest: imageSelection?.digest,
     imageRuntimeReference: imageSelection?.runtimeImage,
     userId: user.id,
-  });
+  }, runtimeAuthorization);
 
   if (targetWorkerGroupId) {
     try {

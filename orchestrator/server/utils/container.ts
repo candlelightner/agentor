@@ -13,6 +13,18 @@ import { join } from "node:path";
 import type { Readable } from "node:stream";
 import * as tar from "tar-stream";
 import { DockerService } from "./docker";
+import Docker from 'dockerode';
+import { WorkerRuntimeMigration, RuntimeMigrationStore } from './worker-runtime-migration';
+import { isRuntimeSnapshotImage } from './worker-runtime-snapshot';
+import type { RuntimeMigrationInput, RuntimeMigrationJournal } from './worker-runtime-migration';
+import type { WorkerRuntimeProfile } from '../../shared/types';
+import {
+  assertWorkerRuntimeMatches,
+  resolveWorkerRuntimePolicy,
+  resolveWorkerRuntimeProfile,
+  resolveNewWorkerRuntime,
+} from "./worker-runtime-policy";
+import type { AdminLegacyRuntimeAuthorization } from "./worker-runtime-policy";
 import type {
   EnvironmentJsonPayload,
   CapabilityJsonEntry,
@@ -171,6 +183,17 @@ interface ResolvedEnvConfig {
   environmentJson: EnvironmentJsonPayload;
   capabilitiesJson: CapabilityJsonEntry[];
   instructionsJson: InstructionJsonEntry[];
+}
+
+/** Keep privilege provenance available to lifecycle code without publishing it
+ * through generic JSON and spread-based response paths. */
+function concealLegacyPrivilegeGrant<T extends { legacyPrivilegeGrant?: string }>(info: T): T {
+  if (info.legacyPrivilegeGrant !== undefined)
+    Object.defineProperty(info, 'legacyPrivilegeGrant', {
+      value: info.legacyPrivilegeGrant, writable: true, configurable: true,
+      enumerable: false,
+    });
+  return info;
 }
 
 function normalizeWorkerConfiguration(
@@ -433,6 +456,8 @@ export class ContainerManager {
       diagnostic?: ContainerInfo["runtimeDiagnostic"];
       secretHandshakeRequired?: boolean;
       restartPolicy?: string;
+      runtime?: string;
+      privileged?: boolean;
     }
   >();
   /** Reattach a freshly created/rebuilt worker to owner-managed networks. Failure
@@ -515,6 +540,8 @@ export class ContainerManager {
   private capabilityStore?: CapabilityStore;
   private instructionStore?: InstructionStore;
   private storageManager?: StorageManager;
+  private runtimeMigrationStore?: RuntimeMigrationStore;
+  private runtimeMigrationLoading?: Promise<void>;
   constructor(dockerService: DockerService, config: Config) {
     this.dockerService = dockerService;
     this.config = config;
@@ -546,6 +573,177 @@ export class ContainerManager {
 
   setStorageManager(manager: StorageManager): void {
     this.storageManager = manager;
+  }
+
+  private async runtimeMigrations() {
+    this.runtimeMigrationStore ??= new RuntimeMigrationStore(this.config.dataDir);
+    await (this.runtimeMigrationLoading ??= this.runtimeMigrationStore.init());
+    return this.runtimeMigrationStore;
+  }
+
+  private runtimeMigrationEngine(store: RuntimeMigrationStore, authorize: () => Promise<void> = async () => {}) {
+    return new WorkerRuntimeMigration(new Docker({ socketPath: '/var/run/docker.sock', timeout: 120_000 }), store, {
+      authorize,
+      trustedHelperImage: async () => {
+        const ownId = process.env.HOSTNAME;
+        if (!ownId) throw new Error('Orchestrator identity is required for trusted migration helper image');
+        const own = await new Docker({ socketPath: '/var/run/docker.sock', timeout: 30_000 }).getContainer(ownId).inspect();
+        if (!/^sha256:[a-f0-9]{64}$/.test(own.Image)) throw new Error('Trusted migration image digest unavailable');
+        return own.Image;
+      },
+      assertAvailable: (profile) => this.dockerService.assertWorkerRuntimeAvailable(profile),
+      validate: async (containerId, record) => {
+        const { groupSecrets } = await this.resolveUserEnvAndBinds(record.userId,
+          record.excludedGlobalEnvVarKeys ?? [], record.id, record.excludedGroupEnvVarKeys ?? []);
+        const local = await useWorkerConfigStore().resolveAppliedValues(record.userId, record.id);
+        await this.dockerService.materializeWorkerSecretFiles(containerId, [...groupSecrets, ...local]);
+        const observed = await this.dockerService.inspectContainerRuntime(containerId);
+        if (!observed.running) throw new Error('Runtime migration replacement is not running');
+        await this.dockerService.probeContainerTask(containerId, observed.secretHandshakeRequired);
+        const inspect = await new Docker({ socketPath: '/var/run/docker.sock' }).getContainer(containerId).inspect();
+        const expected = store.get(record.userId, record.id)?.mounts ?? [];
+        for (const mount of expected)
+          if (!inspect.Mounts.some((m) => m.Destination === mount.target && (m.Type === 'volume' ? m.Name : m.Source) === mount.source))
+            throw new Error(`Migration replacement lost persistent mount ${mount.target}`);
+      },
+      commit: async (journal, replacementId) => {
+        if (!this.workerStore) throw new Error('WorkerStore not available');
+        const record: WorkerRecord = { ...journal.sourceRecord, runtimeProfile: journal.targetProfile,
+          ...(journal.targetProfile === 'legacy-runc' ? { legacyPrivilegeGrant: 'admin' as const } : {}),
+          importedImage: journal.snapshotImage, updatedAt: new Date().toISOString() };
+        if (journal.targetProfile === 'kata-qemu') delete record.legacyPrivilegeGrant;
+        await this.workerStore.upsert(record);
+        const live = this.containers.get(journal.workerId);
+        if (live) {
+          live.containerId = replacementId; live.runtimeProfile = journal.targetProfile;
+          delete live.legacyPrivilegeGrant;
+          if (record.legacyPrivilegeGrant) live.legacyPrivilegeGrant = record.legacyPrivilegeGrant;
+          concealLegacyPrivilegeGrant(live);
+          live.importedImage = journal.snapshotImage; live.imageName = journal.snapshotImage;
+          live.status = journal.sourceRunning ? 'running' : 'stopped'; live.runtimeDiagnostic = undefined;
+        }
+      },
+      restore: async (journal) => {
+        if (!this.workerStore) throw new Error('WorkerStore not available');
+        await this.workerStore.upsert(journal.sourceRecord);
+        const live = this.containers.get(journal.workerId);
+        if (live) {
+          live.containerId = journal.sourceId; live.runtimeProfile = journal.sourceRecord.runtimeProfile;
+          delete live.legacyPrivilegeGrant;
+          if (journal.sourceRecord.legacyPrivilegeGrant) live.legacyPrivilegeGrant = journal.sourceRecord.legacyPrivilegeGrant;
+          concealLegacyPrivilegeGrant(live);
+          live.importedImage = journal.sourceRecord.importedImage;
+          live.imageName = journal.sourceImage; live.imageId = journal.sourceImageId;
+          live.status = journal.sourceRunning ? 'running' : 'stopped'; live.runtimeDiagnostic = undefined;
+        }
+      },
+    });
+  }
+
+  private async runtimeMigrationInput(id: string, targetProfile: WorkerRuntimeProfile): Promise<RuntimeMigrationInput> {
+    const info = this.containers.get(id);
+    const record = this.workerStore?.findById(id);
+    if (!info || !record) throw Object.assign(new Error('Active worker not found'), { statusCode: 404 });
+    this.assertOrdinaryMutation(info); this.assertRuntimeRestoreApproved(record);
+    if (info.hostMountsRevoked || info.hardwareDevicesRevoked || info.runtimeDiagnostic?.code === 'WORKER_RUNTIME_MISMATCH')
+      throw Object.assign(new Error('Resolve revoked access or runtime mismatch before migration'), { statusCode: 409 });
+    const { useManagedVolumeManager } = await import('./managed-volume-manager');
+    const managed = useManagedVolumeManager(); await managed.init();
+    if (managed.isRecoveryBlocked(id) || managed.recreations.get(record.userId, id))
+      throw Object.assign(new Error('Resolve pending storage recovery before migration'), { statusCode: 409 });
+    const mounts = managed.store.forWorker(record.userId, id).filter((m) => m.attached);
+    if (mounts.some((m) => !m.seeded || m.liveContainerId))
+      throw Object.assign(new Error('Apply pending persistent mounts before migration'), { statusCode: 409 });
+    const ownedBindings: RuntimeMigrationInput['ownedBindings'] = mounts.map((m) => ({ source: m.dockerName, target: m.target, type: 'volume' }));
+    const parseOwned = (bind: string) => { const [source, target] = bind.split(':'); ownedBindings.push({ source: source!, target: target!, type: source!.startsWith('/') ? 'bind' : 'volume' }); };
+    parseOwned(this.storageManager?.getWorkerWorkspaceBind(record.userId, id, info.containerName) ?? `${info.containerName}-workspace:/workspace`);
+    parseOwned(this.storageManager?.getWorkerAgentsBind(record.userId, id, info.containerName) ?? `${info.containerName}-agents:/home/agent/.agent-data`);
+    const shared = [...(this.userCredentialManager?.getBindMountsForUser(record.userId) ?? [])];
+    if (this.storageManager?.dataHostPath) shared.push(this.storageManager.getKiloConfigBind(record.userId),
+      this.storageManager.getKiloSharedDataBind(record.userId), this.storageManager.getSshAuthorizedKeysBind(record.userId));
+    const docker = new Docker({ socketPath: '/var/run/docker.sock', timeout: 120_000 });
+    const source = await docker.getContainer(info.containerId).inspect();
+    if (source.Mounts.some((m) => m.Destination === '/var/lib/docker'))
+      parseOwned(this.storageManager?.getWorkerDockerBind(info.containerName) ?? `${info.containerName}-docker:/var/lib/docker`);
+    return { record, sourceId: info.containerId, sourceName: info.containerName, targetProfile, ownedBindings,
+      sharedBindings: shared.map((bind) => { const [source, target] = bind.split(':'); return { source: source!, target: target! }; }) };
+  }
+
+  /** Trusted admin adapter must authorize before calling and supply a live
+   * callback for reauthorization after entering the worker lifecycle fence. */
+  async preflightRuntimeMigration(id: string, targetProfile: WorkerRuntimeProfile) {
+    const store = await this.runtimeMigrations();
+    return (await this.runtimeMigrationEngine(store).preflight(await this.runtimeMigrationInput(id, targetProfile))).plan;
+  }
+
+  async migrateRuntime(id: string, targetProfile: WorkerRuntimeProfile, authorize: () => Promise<void>) {
+    return this.withExistingWorkerLifecycleMutation(id, async () => {
+      await authorize();
+      const { instanceSnapshotActive } = await import('./instance-snapshot-gate');
+      if (instanceSnapshotActive()) throw Object.assign(new Error('Instance backup or restore is active'), { statusCode: 423 });
+      const store = await this.runtimeMigrations();
+      const result = await this.runtimeMigrationEngine(store, authorize).migrate(await this.runtimeMigrationInput(id, targetProfile));
+      this.runtimeObservations.clear();
+      return this.publicRuntimeMigration(result);
+    });
+  }
+
+  private publicRuntimeMigration(journal: RuntimeMigrationJournal) {
+    return { workerId: journal.workerId, operationId: journal.operationId, phase: journal.phase,
+      sourceProfile: resolveWorkerRuntimeProfile(journal.sourceRecord.runtimeProfile), targetProfile: journal.targetProfile,
+      createdAt: journal.createdAt, updatedAt: journal.updatedAt, error: journal.error,
+      rollbackRetained: true, sharedAccountState: 'preserved-shared-bindings-not-rewound' as const };
+  }
+
+  async runtimeMigrationStatus(id: string) {
+    const worker = this.workerStore?.findById(id);
+    if (!worker) throw Object.assign(new Error('Worker not found'), { statusCode: 404 });
+    const journal = (await this.runtimeMigrations()).get(worker.userId, id);
+    return journal ? this.publicRuntimeMigration(journal) : null;
+  }
+
+  async recoverRuntimeMigrations() {
+    const store = await this.runtimeMigrations();
+    for (const journal of store.pending()) {
+      await withOwnerWorkerLifecycleMutation(journal.userId, journal.workerId, () =>
+        this.runtimeMigrationEngine(store).recover(journal)).catch((error) =>
+        useLogger().error(`[container] runtime migration recovery required for ${journal.workerId}: ${error instanceof Error ? error.message : 'recovery failed'}`));
+    }
+  }
+
+  async recoverRuntimeMigration(id: string, authorize: () => Promise<void>, daemonOperationsSettled = false) {
+    const record = this.workerStore?.findById(id);
+    if (!record) throw Object.assign(new Error('Worker not found'), { statusCode: 404 });
+    return withOwnerWorkerLifecycleMutation(record.userId, id, async () => {
+      await authorize();
+      const { instanceSnapshotActive } = await import('./instance-snapshot-gate');
+      if (instanceSnapshotActive()) throw Object.assign(new Error('Instance backup or restore is active'), { statusCode: 423 });
+      const store = await this.runtimeMigrations();
+      const journal = store.get(record.userId, id);
+      if (!journal) throw Object.assign(new Error('Runtime migration not found'), { statusCode: 404 });
+      await this.runtimeMigrationEngine(store).recover(journal, daemonOperationsSettled);
+      this.runtimeObservations.clear();
+      return this.publicRuntimeMigration(store.get(record.userId, id)!);
+    });
+  }
+
+  async hasPendingRuntimeMigrations() {
+    const store = await this.runtimeMigrations();
+    return store.pending().length > 0 || store.hasUnavailableOwners();
+  }
+
+  async finalizeRuntimeMigration(id: string, authorize: () => Promise<void>) {
+    const record = this.workerStore?.findById(id);
+    if (!record) throw Object.assign(new Error('Worker not found'), { statusCode: 404 });
+    return withOwnerWorkerLifecycleMutation(record.userId, id, async () => {
+      await authorize();
+      const { instanceSnapshotActive } = await import('./instance-snapshot-gate');
+      if (instanceSnapshotActive()) throw Object.assign(new Error('Instance backup or restore is active'), { statusCode: 423 });
+      const store = await this.runtimeMigrations(); const journal = store.get(record.userId, id);
+      if (!journal) return { workerId: id, finalized: true };
+      await this.runtimeMigrationEngine(store).finalize(journal);
+      return { workerId: id, finalized: true };
+    });
   }
 
   /** Build the globally unique Docker container name from the worker's UUID `id`:
@@ -763,6 +961,16 @@ export class ContainerManager {
     };
   }
 
+  private async assertRecreationRuntime(
+    profile: ContainerInfo['runtimeProfile'],
+    dockerEnabled: boolean,
+    legacyPrivilegeGrant?: ContainerInfo['legacyPrivilegeGrant'],
+  ): Promise<void> {
+    const runtimeProfile = resolveWorkerRuntimeProfile(profile);
+    resolveWorkerRuntimePolicy({ runtimeProfile, dockerEnabled, legacyPrivilegeGrant });
+    await this.dockerService.assertWorkerRuntimeAvailable(runtimeProfile);
+  }
+
   private static readonly STATE_MAP: Record<string, ContainerStatus> = {
     running: "running",
     exited: "stopped",
@@ -794,6 +1002,8 @@ export class ContainerManager {
     diagnostic?: ContainerInfo["runtimeDiagnostic"];
     secretHandshakeRequired?: boolean;
     restartPolicy?: string;
+    runtime?: string;
+    privileged?: boolean;
     lifecycleStale?: boolean;
   }> {
     const generation = workerId ? workerLifecycleGeneration(workerId) : 0;
@@ -802,8 +1012,10 @@ export class ContainerManager {
       !isWorkerLifecycleMutationActive(workerId) && workerLifecycleGeneration(workerId) === generation);
     const cached = this.runtimeObservations.get(containerId);
     if (cached && Date.now() - cached.at < 5_000) return { ...cached, lifecycleStale: !cacheable() };
+    let inspected: Awaited<ReturnType<DockerService['inspectContainerRuntime']>> | undefined;
     try {
       const runtime = await this.dockerService.inspectContainerRuntime(containerId);
+      inspected = runtime;
       const status = ContainerManager.STATE_MAP[runtime.status] ?? "unknown";
       if (runtime.running)
         await this.dockerService.probeContainerTask(
@@ -815,6 +1027,8 @@ export class ContainerManager {
         status,
         secretHandshakeRequired: runtime.secretHandshakeRequired,
         restartPolicy: runtime.restartPolicy,
+        runtime: runtime.runtime,
+        privileged: runtime.privileged,
       };
       if (cacheable()) this.runtimeObservations.set(containerId, observed);
       return { ...observed, lifecycleStale: !cacheable() };
@@ -828,7 +1042,12 @@ export class ContainerManager {
         retryable: true,
         observedAt: new Date().toISOString(),
       };
-      const observed = { at: Date.now(), status: "unknown" as const, diagnostic };
+      // Task health is independent of the successfully inspected isolation
+      // configuration. Losing these fields can erase pre-upgrade provenance.
+      const observed = { at: Date.now(), status: "unknown" as const, diagnostic,
+        ...(inspected ? { runtime: inspected.runtime, privileged: inspected.privileged,
+          restartPolicy: inspected.restartPolicy, secretHandshakeRequired: inspected.secretHandshakeRequired } : {}),
+      };
       if (cacheable()) this.runtimeObservations.set(containerId, observed);
       return { ...observed, lifecycleStale: !cacheable() };
     }
@@ -866,6 +1085,7 @@ export class ContainerManager {
       workerId: string;
       desired: "running" | "stopped";
     }> = [];
+    const runtimeMigrations: Array<{ userId: string; workerId: string; privileged: boolean }> = [];
     this.importCreatedEnvironments.clear();
     for (const worker of this.workerStore?.list() ?? []) {
       if (worker.importCreatedEnvironmentId) {
@@ -894,6 +1114,15 @@ export class ContainerManager {
       // orchestrator restart before the administrative runtime is registered.
       if (!labelId) continue;
       const worker = labelId ? this.workerStore?.findById(labelId) : undefined;
+      if (worker && this.runtimeMigrationStore) {
+        try {
+          const migration = this.runtimeMigrationStore.get(worker.userId, worker.id);
+          if (migration && dc.Id === migration.sourceId && containerName === migration.rollbackName) continue;
+        } catch {
+          useLogger().error(`[container] quarantined worker ${labelId}: runtime migration journal unavailable`);
+          continue;
+        }
+      }
 
       // The label is only an identifier; ownership and configuration must
       // come from the durable WorkerStore. If that owner partition is corrupt
@@ -938,8 +1167,31 @@ export class ContainerManager {
       const id = worker.id;
       const now = new Date().toISOString();
       const observation = observations.get(dc.Id);
+      let runtimeProfile;
+      try { runtimeProfile = resolveWorkerRuntimeProfile(worker.runtimeProfile); }
+      catch (error) {
+        useLogger().error(`[container] quarantined worker ${id}: invalid durable runtime profile`);
+        continue;
+      }
+      const legacyPrivilegeGrant = worker.legacyPrivilegeGrant ??
+        (!worker.runtimeRestoreApprovalRequired && worker.runtimeProfile === undefined && observation?.runtime !== undefined &&
+          observation.privileged && (!observation.runtime || observation.runtime === 'runc')
+          ? 'preexisting' as const : undefined);
+      let runtimeMismatch = false;
+      try {
+        if (observation?.runtime !== undefined) {
+          if (labels['agentor.runtime-profile'] && labels['agentor.runtime-profile'] !== runtimeProfile)
+            throw new Error('Docker runtime profile label differs from the worker record');
+          if (runtimeProfile === 'kata-qemu' && labels['agentor.runtime-profile'] !== 'kata-qemu')
+            throw new Error('Kata worker runtime label is missing');
+          assertWorkerRuntimeMatches(runtimeProfile, observation.runtime, observation.privileged === true, legacyPrivilegeGrant);
+        }
+      } catch {
+        runtimeMismatch = true;
+        useLogger().error(`[container] worker ${id} runtime does not match its durable profile`);
+      }
       const observedStatus =
-        observation?.status ?? ContainerManager.STATE_MAP[dc.State] ?? "unknown";
+        runtimeMismatch ? 'unknown' : observation?.status ?? ContainerManager.STATE_MAP[dc.State] ?? "unknown";
       const inferredDesiredRuntimeStatus =
         // A legacy `unless-stopped` worker that is crash-looping is observed
         // as Docker's `restarting` state (projected to `starting`). Treat that
@@ -955,7 +1207,7 @@ export class ContainerManager {
       const desiredRuntimeStatus =
         worker.desiredRuntimeStatus ?? inferredDesiredRuntimeStatus;
 
-      nextContainers.set(id, {
+      nextContainers.set(id, concealLegacyPrivilegeGrant({
         id,
         userId: worker.userId,
         createdAt: worker.createdAt ?? now,
@@ -966,8 +1218,19 @@ export class ContainerManager {
         imageName: dc.Image,
         imageId: dc.ImageID,
         status: observedStatus,
+        // Keep missing legacy provenance missing until Docker inspection has
+        // actually verified it. Reconciliation must not normalize uncertainty
+        // into an explicit unprivileged legacy record.
+        runtimeProfile: worker.runtimeProfile === undefined && observation?.runtime === undefined
+          ? undefined : runtimeProfile,
+        runtimeRestoreApprovalRequired: worker.runtimeRestoreApprovalRequired,
+        ...(legacyPrivilegeGrant ? { legacyPrivilegeGrant } : {}),
         ...(desiredRuntimeStatus ? { desiredRuntimeStatus } : {}),
-        ...(observation?.diagnostic
+        ...(runtimeMismatch ? { runtimeDiagnostic: {
+          code: 'WORKER_RUNTIME_MISMATCH', operation: 'Docker worker inventory',
+          message: 'Docker worker runtime differs from its durable runtime policy; administrator intervention is required.',
+          retryable: false, observedAt: now,
+        } } : observation?.diagnostic
           ? { runtimeDiagnostic: observation.diagnostic }
           : {}),
         repos: worker.repos,
@@ -986,7 +1249,9 @@ export class ContainerManager {
         imageVersion: worker.imageVersion,
         imageDigest: worker.imageDigest,
         imageRuntimeReference: worker.imageRuntimeReference,
-      });
+      }));
+      if (!worker.runtimeRestoreApprovalRequired && worker.runtimeProfile === undefined && observation?.runtime !== undefined && !runtimeMismatch)
+        runtimeMigrations.push({ userId: worker.userId, workerId: worker.id, privileged: observation.privileged === true });
       if (!worker.desiredRuntimeStatus && desiredRuntimeStatus)
         desiredMigrations.push({
           userId: worker.userId,
@@ -1024,6 +1289,13 @@ export class ContainerManager {
           migration.desired,
         );
     }
+    for (const migration of runtimeMigrations) {
+      if (!isWorkerLifecycleMutationActive(migration.workerId) &&
+          workerLifecycleGeneration(migration.workerId) <= lifecycleSequenceAtStart)
+        await this.workerStore?.capturePreexistingRuntime(
+          migration.userId, migration.workerId, migration.privileged,
+        );
+    }
 
     useLogger().debug(`[container] synced ${this.containers.size} containers`);
   }
@@ -1041,6 +1313,10 @@ export class ContainerManager {
     this.containers.delete(id);
   }
   private assertOrdinaryMutation(info: ContainerInfo) {
+    if (this.runtimeMigrationStore?.isBlocked(info.userId, info.id))
+      throw Object.assign(new Error('Runtime migration recovery must complete before other worker changes'), {
+        statusCode: 409, code: 'WORKER_RUNTIME_MIGRATION_RECOVERY_REQUIRED',
+      });
     if (info.administrativeKind || info.userId === "__agentor_admin__") {
       const error = new Error(
         "Administrative workspace lifecycle requires the dedicated confirmed admin API",
@@ -1048,6 +1324,26 @@ export class ContainerManager {
       error.statusCode = 409;
       throw error;
     }
+  }
+
+  private assertRuntimeRestoreApproved(worker: Pick<ContainerInfo, 'runtimeRestoreApprovalRequired'>) {
+    if (worker.runtimeRestoreApprovalRequired)
+      throw Object.assign(new Error('Restored worker runtime requires destination administrator approval before starting or recreating it'), {
+        statusCode: 409, code: 'WORKER_RUNTIME_RESTORE_APPROVAL_REQUIRED',
+      });
+  }
+
+  private assertRuntimeRollbackFinalized(info: Pick<ContainerInfo, 'id' | 'userId'>) {
+    if (this.runtimeMigrationStore?.get(info.userId, info.id)?.phase === 'committed')
+      throw Object.assign(new Error('Finalize retained runtime rollback evidence before recreating or archiving this worker'), {
+        statusCode: 409, code: 'WORKER_RUNTIME_MIGRATION_FINALIZE_REQUIRED',
+      });
+  }
+
+  private async cleanupRuntimeMigrationForDeletion(userId: string, id: string) {
+    const store = this.runtimeMigrationStore;
+    const journal = store?.get(userId, id);
+    if (journal) await this.runtimeMigrationEngine(store!).finalize(journal);
   }
 
   private async assertOwnerExists(userId: string): Promise<void> {
@@ -1207,17 +1503,22 @@ export class ContainerManager {
       : store.authorizeDeviceIds(userId, workerId, deviceIds, directGroupId);
   }
 
-  async create(request: CreateContainerRequest): Promise<ContainerInfo> {
+  async create(request: CreateContainerRequest, runtimeAuthorization?: AdminLegacyRuntimeAuthorization): Promise<ContainerInfo> {
     const userId = request.userId ?? "";
     if (!userId) throw new Error("create: userId is required");
     return withOwnerLifecycleMutation(userId, async () => {
       await this.assertOwnerExists(userId);
-      return this.createForOwner(request);
+      if (runtimeAuthorization) {
+        resolveNewWorkerRuntime(runtimeAuthorization);
+        await runtimeAuthorization.authorize();
+      }
+      return this.createForOwner(request, runtimeAuthorization);
     });
   }
 
   private async createForOwner(
     request: CreateContainerRequest,
+    runtimeAuthorization?: AdminLegacyRuntimeAuthorization,
   ): Promise<ContainerInfo> {
     const userId = request.userId ?? "";
     if (!userId) throw new Error("create: userId is required");
@@ -1239,6 +1540,8 @@ export class ContainerManager {
     // Resource limits are an environment property (no per-worker override).
     const { cpuLimit, memoryLimit, dockerEnabled } =
       this.deriveLimits(envConfig);
+    const { runtimeProfile, legacyPrivilegeGrant } = resolveNewWorkerRuntime(runtimeAuthorization);
+    await this.assertRecreationRuntime(runtimeProfile, dockerEnabled, legacyPrivilegeGrant);
 
     // Git identity resolved live from the owner — never stored on the worker.
     const { gitName, gitEmail } = await this.resolveGitIdentity(userId);
@@ -1322,6 +1625,8 @@ export class ContainerManager {
       imageId: request.imageDigest || "",
       status: "creating",
       desiredRuntimeStatus: "running",
+      runtimeProfile,
+      legacyPrivilegeGrant,
       repos: repos.length > 0 ? repos : undefined,
       mounts,
       hardwareDeviceIds,
@@ -1336,6 +1641,7 @@ export class ContainerManager {
       imageDigest: request.imageDigest,
       imageRuntimeReference: request.imageRuntimeReference,
     };
+    concealLegacyPrivilegeGrant(containerInfo);
 
     // Publish and persist the provisional UUID before the first Docker
     // mutation. Any ambiguous create/rollback failure therefore remains
@@ -1397,6 +1703,7 @@ export class ContainerManager {
       const hardwareDevices = await this.resolveHardwareDeviceAccess(
         userId, id, hardwareDeviceIds, request.targetWorkerGroupId, true,
       );
+      await runtimeAuthorization?.authorize();
       const container = await this.dockerService.createWorkerContainer({
         userId,
         id,
@@ -1406,6 +1713,9 @@ export class ContainerManager {
         mounts,
         hardwareDevices,
         dockerEnabled,
+        runtimeProfile,
+        legacyPrivilegeGrant,
+        authorizeRuntime: runtimeAuthorization?.authorize,
         credentialBinds,
         environmentJson: envConfig.environmentJson,
         capabilitiesJson: envConfig.capabilitiesJson,
@@ -1416,6 +1726,7 @@ export class ContainerManager {
         workerConfig: [...groupSecrets, ...workerConfig],
         image: request.imageRuntimeReference,
       });
+      await runtimeAuthorization?.authorize();
       containerInfo.containerId = container.id;
       containerInfo.status = "running";
       containerInfo.updatedAt = new Date().toISOString();
@@ -1434,6 +1745,7 @@ export class ContainerManager {
     // gated rollback. The provisional identity is retained if Docker removal
     // fails, rather than converting a live worker into an untracked orphan.
     try {
+      await runtimeAuthorization?.authorize();
       await workerConfigStore.markApplied(userId, id);
       if (this.workerStore) {
         await this.workerStore.upsert(
@@ -2345,6 +2657,7 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    this.assertRuntimeRestoreApproved(info);
     const { useManagedVolumeManager } = await import("./managed-volume-manager");
     if (!storagePrepared && await useManagedVolumeManager().requiresRecreation(info.userId, id, info.containerId)) {
       await this.applyManagedStorageUnlocked(id);
@@ -2393,6 +2706,8 @@ for p in sys.argv[1:]:
       const runtime = await this.dockerService.inspectContainerRuntime(
         info.containerId,
       );
+      assertWorkerRuntimeMatches(resolveWorkerRuntimeProfile(info.runtimeProfile),
+        runtime.runtime, runtime.privileged, info.legacyPrivilegeGrant);
       if (runtime.running)
         await this.dockerService.restartContainer(info.containerId);
       else await this.dockerService.startContainer(info.containerId);
@@ -2464,6 +2779,19 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    this.assertRuntimeRestoreApproved(info);
+    this.assertRuntimeRollbackFinalized(info);
+    if (info.runtimeDiagnostic?.code === 'WORKER_RUNTIME_MISMATCH')
+      throw Object.assign(new Error('Worker runtime mismatch requires administrator review before recovery'), {
+        statusCode: 409, code: 'WORKER_RUNTIME_MISMATCH',
+      });
+    let recoveryEnv: ResolvedEnvConfig;
+    try { recoveryEnv = this.resolveEnvironmentConfig(info.environmentId); }
+    catch { recoveryEnv = this.resolveEnvironmentConfig(undefined); }
+    await this.assertRecreationRuntime(
+      info.runtimeProfile, this.deriveLimits(recoveryEnv).dockerEnabled,
+      info.legacyPrivilegeGrant,
+    );
     await this.resolveAuthorizedHostMounts(
       info.userId,
       info.id,
@@ -2906,6 +3234,7 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    await this.cleanupRuntimeMigrationForDeletion(info.userId, id);
     // Keep the authoritative entry when Docker removal fails. Dropping it in a
     // finally block made a retry resolve the stable worker UUID as though it
     // were a Docker container id, leaving the real container untracked and
@@ -3078,6 +3407,7 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    this.assertRuntimeRollbackFinalized(info);
     // A deferred persistence request must capture data before archive discards
     // the rootfs, just as an explicit rebuild does.
     await this.persistentBackupPathMounts(info, true);
@@ -3153,6 +3483,8 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    this.assertRuntimeRestoreApproved(info);
+    this.assertRuntimeRollbackFinalized(info);
     if (info.hostMountsRevoked || info.hardwareDevicesRevoked)
       throw Object.assign(new Error("Rebuild the worker to apply revoked hardware or host-mount permissions first."), { statusCode: 409 });
     const { useManagedVolumeManager } = await import("./managed-volume-manager");
@@ -3185,6 +3517,11 @@ for p in sys.argv[1:]:
       }
     }
     const beforePrepare = await docker.getContainer(info.containerId).inspect();
+    await this.assertRecreationRuntime(info.runtimeProfile,
+      beforePrepare.HostConfig?.Privileged === true, info.legacyPrivilegeGrant);
+    assertWorkerRuntimeMatches(resolveWorkerRuntimeProfile(info.runtimeProfile),
+      beforePrepare.HostConfig?.Runtime, beforePrepare.HostConfig?.Privileged === true,
+      info.legacyPrivilegeGrant);
     const endpoints = Object.entries(beforePrepare.NetworkSettings.Networks ?? {});
     // Fixed IP reservations cannot belong to both a retained rollback source
     // and its replacement. Refuse before stopping rather than silently drop
@@ -3196,6 +3533,11 @@ for p in sys.argv[1:]:
     const mounts = await volumes.prepare(info);
     const old = docker.getContainer(info.containerId);
     const original = await old.inspect();
+    await this.assertRecreationRuntime(info.runtimeProfile,
+      original.HostConfig?.Privileged === true, info.legacyPrivilegeGrant);
+    assertWorkerRuntimeMatches(resolveWorkerRuntimeProfile(info.runtimeProfile),
+      original.HostConfig?.Runtime, original.HostConfig?.Privileged === true,
+      info.legacyPrivilegeGrant);
     const oldId = original.Id;
     const targets = new Set(volumes.store.forWorker(info.userId, info.id).map((v) => v.target));
     if (original.State.Paused)
@@ -3262,6 +3604,19 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    this.assertRuntimeRestoreApproved(info);
+    this.assertRuntimeRollbackFinalized(info);
+    if (info.runtimeDiagnostic?.code === 'WORKER_RUNTIME_MISMATCH')
+      throw Object.assign(new Error('Worker runtime mismatch requires administrator review before rebuild'), {
+        statusCode: 409, code: 'WORKER_RUNTIME_MISMATCH',
+      });
+    let rebuildEnv: ResolvedEnvConfig;
+    try { rebuildEnv = this.resolveEnvironmentConfig(info.environmentId); }
+    catch { rebuildEnv = this.resolveEnvironmentConfig(undefined); }
+    await this.assertRecreationRuntime(
+      info.runtimeProfile, this.deriveLimits(rebuildEnv).dockerEnabled,
+      info.legacyPrivilegeGrant,
+    );
 
     // Fail before touching the existing container when a grant was revoked or
     // a legacy source-only mount has not yet been approved.
@@ -3334,6 +3689,7 @@ for p in sys.argv[1:]:
 
     const { cpuLimit, memoryLimit, dockerEnabled } =
       this.deriveLimits(envConfig);
+    await this.assertRecreationRuntime(info.runtimeProfile, dockerEnabled, info.legacyPrivilegeGrant);
 
     const { gitName, gitEmail } = await this.resolveGitIdentity(info.userId);
 
@@ -3372,6 +3728,8 @@ for p in sys.argv[1:]:
       imageId: info.imageDigest || "",
       status: "creating",
       desiredRuntimeStatus: "running",
+      runtimeProfile: resolveWorkerRuntimeProfile(info.runtimeProfile),
+      legacyPrivilegeGrant: info.legacyPrivilegeGrant,
       repos: info.repos,
       mounts: authorizedMounts,
       hardwareDeviceIds: authorizedHardwareDeviceIds,
@@ -3391,6 +3749,7 @@ for p in sys.argv[1:]:
       imageDigest: info.imageDigest,
       imageRuntimeReference: info.imageRuntimeReference,
     };
+    concealLegacyPrivilegeGrant(containerInfo);
 
     // Publish a single active provisional identity before Docker mutation.
     // Failed recreation rolls this back to the already-persisted archive.
@@ -3407,6 +3766,8 @@ for p in sys.argv[1:]:
         mounts: authorizedMounts,
         hardwareDevices,
         dockerEnabled,
+        runtimeProfile: resolveWorkerRuntimeProfile(info.runtimeProfile),
+        legacyPrivilegeGrant: info.legacyPrivilegeGrant,
         credentialBinds,
         persistentPathMounts,
         environmentJson: envConfig.environmentJson,
@@ -3483,6 +3844,8 @@ for p in sys.argv[1:]:
     if (!worker || worker.status !== "archived") {
       throw new Error("Archived worker not found");
     }
+    this.assertRuntimeRestoreApproved(worker);
+    this.assertRuntimeRollbackFinalized(worker);
     if (worker.deletionPending) {
       throw Object.assign(
         new Error("Worker deletion cleanup is still pending"),
@@ -3515,6 +3878,7 @@ for p in sys.argv[1:]:
 
     const { cpuLimit, memoryLimit, dockerEnabled } =
       this.deriveLimits(envConfig);
+    await this.assertRecreationRuntime(worker.runtimeProfile, dockerEnabled, worker.legacyPrivilegeGrant);
 
     const { gitName, gitEmail } = await this.resolveGitIdentity(worker.userId);
 
@@ -3556,6 +3920,8 @@ for p in sys.argv[1:]:
       imageId: worker.imageDigest || "",
       status: "creating",
       desiredRuntimeStatus: "running",
+      runtimeProfile: resolveWorkerRuntimeProfile(worker.runtimeProfile),
+      legacyPrivilegeGrant: worker.legacyPrivilegeGrant,
       repos: worker.repos,
       mounts: authorizedMounts,
       hardwareDeviceIds: authorizedHardwareDeviceIds,
@@ -3575,6 +3941,7 @@ for p in sys.argv[1:]:
       imageDigest: worker.imageDigest,
       imageRuntimeReference: worker.imageRuntimeReference,
     };
+    concealLegacyPrivilegeGrant(containerInfo);
     const persistentPathMounts = await this.persistentBackupPathMounts(
       containerInfo,
       false,
@@ -3595,6 +3962,8 @@ for p in sys.argv[1:]:
         mounts: authorizedMounts,
         hardwareDevices,
         dockerEnabled,
+        runtimeProfile: resolveWorkerRuntimeProfile(worker.runtimeProfile),
+        legacyPrivilegeGrant: worker.legacyPrivilegeGrant,
         credentialBinds,
         persistentPathMounts,
         environmentJson: envConfig.environmentJson,
@@ -3660,6 +4029,7 @@ for p in sys.argv[1:]:
       throw new Error("Archived worker not found");
     }
 
+    await this.cleanupRuntimeMigrationForDeletion(userId, id);
     // This is the commit point before the first destructive operation. A
     // partial failure must never leave an apparently safe, unarchivable record.
     await this.workerStore.markDeletionPending(userId, id);
@@ -3893,6 +4263,10 @@ for p in sys.argv[1:]:
         { statusCode: 409, code: "IMPORTED_WORKER_IMAGE_MISSING" },
       );
     }
+    // Docker commit preserves the source container's image configuration.
+    // Unlike a portable docker-import tar, a runtime snapshot must inherit its
+    // own entrypoint/cmd/user/workdir and image Env, including custom images.
+    if (isRuntimeSnapshotImage(importedImage)) return { image: importedImage };
     const standard = this.config.workerImagePrefix + this.config.workerImage;
     try {
       await this.dockerService.ensureImage(standard);
@@ -4062,6 +4436,7 @@ for p in sys.argv[1:]:
           displayName: info.displayName,
           containerName: info.containerName,
           imageName: info.imageName,
+          runtimeProfile: resolveWorkerRuntimeProfile(info.runtimeProfile),
         },
         worker: {
           displayName: info.displayName,
@@ -4215,6 +4590,7 @@ for p in sys.argv[1:]:
     userId: string,
     bundlePath: string,
     opts: { displayName?: string; imageResolution?: { mode: "replacement"; imageDefinitionId: string; imageVersion: string; imageDigest?: string; imageRuntimeReference?: string } | { mode: "workspace-only" } } = {},
+    runtimeAuthorization?: AdminLegacyRuntimeAuthorization,
   ): Promise<ContainerInfo & { missingSecrets?: string[] }> {
     if (!userId) throw new Error("import: userId is required");
     // Environment recreation is visible owner-wide. Share the owner mutation
@@ -4222,10 +4598,14 @@ for p in sys.argv[1:]:
     // reference check plus any rollback deletion is atomic for that owner.
     return withOwnerLifecycleMutation(userId, async () => {
       await this.assertOwnerExists(userId);
+      if (runtimeAuthorization) {
+        resolveNewWorkerRuntime(runtimeAuthorization);
+        await runtimeAuthorization.authorize();
+      }
       return (await import("./portable-managed-volume-runtime"))
         .usePortableManagedVolumeRuntime()
         .withInstanceSnapshotAccounting(() =>
-          this.importWorkerForOwner(userId, bundlePath, opts),
+          this.importWorkerForOwner(userId, bundlePath, opts, runtimeAuthorization),
         );
     });
   }
@@ -4245,7 +4625,9 @@ for p in sys.argv[1:]:
           }
         | { mode: "workspace-only" };
     },
+    runtimeAuthorization?: AdminLegacyRuntimeAuthorization,
   ): Promise<ContainerInfo & { missingSecrets?: string[] }> {
+    const { runtimeProfile, legacyPrivilegeGrant } = resolveNewWorkerRuntime(runtimeAuthorization);
     const workDir = join(this.config.dataDir, "tmp", `import-${randomUUID()}`);
     let createdImportEnvironmentId: string | undefined;
     let provisionalWorkerId: string | undefined;
@@ -4386,6 +4768,7 @@ for p in sys.argv[1:]:
       const envConfig = this.resolveEnvironmentConfig(environmentId);
       const { cpuLimit, memoryLimit, dockerEnabled } =
         this.deriveLimits(envConfig);
+      await this.assertRecreationRuntime(runtimeProfile, dockerEnabled, legacyPrivilegeGrant);
       const { gitName, gitEmail } = await this.resolveGitIdentity(userId);
       const workerJson: WorkerJsonPayload = {
         id,
@@ -4517,6 +4900,8 @@ for p in sys.argv[1:]:
         imageId: "",
         status: "creating",
         desiredRuntimeStatus: "running",
+        runtimeProfile,
+        legacyPrivilegeGrant,
         repos: repos.length > 0 ? repos : undefined,
         mounts: mounts.length > 0 ? mounts : undefined,
         initScript: initScript || undefined,
@@ -4526,6 +4911,7 @@ for p in sys.argv[1:]:
         ...(importedImage ? { importedImage } : {}),
         ...(!importedImage ? resolvedImage : {}),
       };
+      concealLegacyPrivilegeGrant(containerInfo);
       this.containers.set(id, containerInfo);
 
       // Persist the provisional identity before the first container mutation.
@@ -4566,6 +4952,7 @@ for p in sys.argv[1:]:
           (await this.resolveAuthorizedHostMounts(userId, id, mounts)) ?? [];
         containerInfo.mounts = mounts.length > 0 ? mounts : undefined;
         await portableImport?.markWorkerCreatePending();
+        await runtimeAuthorization?.authorize();
         container = await this.dockerService.createWorkerContainer({
           userId,
           id,
@@ -4574,6 +4961,9 @@ for p in sys.argv[1:]:
           memoryLimit,
           mounts,
           dockerEnabled,
+          runtimeProfile,
+          legacyPrivilegeGrant,
+          authorizeRuntime: runtimeAuthorization?.authorize,
           credentialBinds,
           environmentJson: envConfig.environmentJson,
           capabilitiesJson: envConfig.capabilitiesJson,
@@ -4598,6 +4988,7 @@ for p in sys.argv[1:]:
         });
         await portableImport?.confirmWorkerCreated(container.id);
         containerInfo.containerId = container.id;
+        await runtimeAuthorization?.authorize();
         containerInfo.imageId = await this.dockerService.inspectContainerImage(
           container.id,
         );
@@ -4657,6 +5048,7 @@ for p in sys.argv[1:]:
           const parent = item.path === "/" ? "/" : item.path.slice(0, item.path.lastIndexOf("/")) || "/";
           await this.dockerService.putArchive(container.id, createReadStream(item.archivePath), parent);
         }
+        await runtimeAuthorization?.authorize();
         await this.dockerService.startContainer(container.id);
         await this.dockerService.materializeWorkerSecretFiles(
           container.id,
@@ -4680,6 +5072,7 @@ for p in sys.argv[1:]:
       // in-memory map. Roll it back just like a volume-restore failure so the
       // caller never loses the only handle to a live imported worker.
       try {
+        await runtimeAuthorization?.authorize();
         await useWorkerConfigStore().markApplied(userId, id);
         if (this.workerStore) {
           await this.workerStore.upsert(
@@ -5081,7 +5474,7 @@ for p in sys.argv[1:]:
 
   listArchived(): WorkerRecord[] {
     return (this.workerStore?.listArchived() ?? []).map((record) => {
-      const { importCreatedEnvironmentId: _internal, ...publicRecord } = record;
+      const { importCreatedEnvironmentId: _internal, legacyPrivilegeGrant: _grant, ...publicRecord } = record;
       return publicRecord;
     });
   }
@@ -5092,6 +5485,7 @@ for p in sys.argv[1:]:
     const activeContainerNames = new Set<string>();
     for (const [, info] of this.containers) {
       activeContainerNames.add(info.containerName);
+      if (this.runtimeMigrationStore?.isBlocked(info.userId, info.id)) continue;
       const existing = this.workerStore.get(info.userId, info.id);
       if (!existing || existing.status === "active") {
         await this.workerStore.upsert(this.containerInfoToWorkerRecord(info));
@@ -5101,6 +5495,9 @@ for p in sys.argv[1:]:
     const missingDesiredWorkers: WorkerRecord[] = [];
     const { useManagedVolumeManager: storageManager } = await import("./managed-volume-manager");
     for (const worker of this.workerStore.listActive()) {
+      if (this.runtimeMigrationStore?.isBlocked(worker.userId, worker.id)) continue;
+      if (this.runtimeMigrationStore?.get(worker.userId, worker.id)?.phase === 'committed' &&
+          !activeContainerNames.has(this.buildContainerName(worker.id))) continue;
       if (storageManager().isRecoveryBlocked(worker.id)) continue;
       if (!activeContainerNames.has(this.buildContainerName(worker.id))) {
         // Acquire the same owner→worker fences as create/rebuild/recovery, then
@@ -5129,6 +5526,7 @@ for p in sys.argv[1:]:
     // intent and is therefore never auto-unarchived.
     for (const worker of this.workerStore.listArchived())
       if (
+        !this.runtimeMigrationStore?.isBlocked(worker.userId, worker.id) &&
         !storageManager().isRecoveryBlocked(worker.id) &&
         worker.desiredRuntimeStatus === "running" &&
         !missingDesiredWorkers.some((candidate) => candidate.id === worker.id)
@@ -5141,6 +5539,8 @@ for p in sys.argv[1:]:
     // every other worker from recovering.
     for (const info of [...this.containers.values()]) {
       if (info.administrativeKind) continue;
+      if (this.runtimeMigrationStore?.isBlocked(info.userId, info.id)) continue;
+      if (info.runtimeRestoreApprovalRequired) continue;
       if (storageManager().isRecoveryBlocked(info.id)) {
         info.status = "error";
         info.runtimeDiagnostic = { code: "WORKER_STORAGE_RECOVERY_REQUIRED", operation: "Storage recovery",
@@ -5212,6 +5612,9 @@ for p in sys.argv[1:]:
       updatedAt: info.updatedAt,
       displayName: info.displayName,
       status: "active",
+      ...(info.runtimeProfile !== undefined ? { runtimeProfile: resolveWorkerRuntimeProfile(info.runtimeProfile) } : {}),
+      runtimeRestoreApprovalRequired: info.runtimeRestoreApprovalRequired,
+      ...(info.legacyPrivilegeGrant ? { legacyPrivilegeGrant: info.legacyPrivilegeGrant } : {}),
       ...(info.desiredRuntimeStatus
         ? { desiredRuntimeStatus: info.desiredRuntimeStatus }
         : {}),

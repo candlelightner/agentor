@@ -204,6 +204,8 @@ export interface WorkerSystemEnvVar {
  * container (containerId, containerName, imageName, imageId) are NOT persisted —
  * they are discovered at runtime and only appear on `ContainerInfo`. */
 export interface ArchivedWorker {
+  runtimeProfile?: import('../../shared/types').WorkerRuntimeProfile;
+  runtimeRestoreApprovalRequired?: boolean;
   /** Worker UUID `id` — used to unarchive / delete. */
   id: string;
   userId: string;

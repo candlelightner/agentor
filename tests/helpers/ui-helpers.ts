@@ -105,6 +105,7 @@ export async function openCreateWorkerModal(page: Page): Promise<void> {
  */
 export async function createWorkerViaUI(page: Page, options?: { displayName?: string }): Promise<string> {
   await openCreateWorkerModal(page);
+  await selectLegacyFixtureRuntime(page);
 
   // The name input should have a pre-generated name
   const nameInput = page.locator('[role="dialog"] input[placeholder*="name"], [role="dialog"] input').first();
@@ -124,6 +125,15 @@ export async function createWorkerViaUI(page: Page, options?: { displayName?: st
   await expect(page.locator('[role="dialog"]')).toBeHidden({ timeout: 10_000 });
 
   return name;
+}
+
+/** Select through the administrator's real control; no request interception
+ * and no fallback for ordinary users. */
+export async function selectLegacyFixtureRuntime(page: Page): Promise<void> {
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('combobox', { name: 'Worker runtime', exact: true }).click();
+  await page.getByRole('option', { name: 'Legacy runc (administrator)', exact: true }).click();
+  await dialog.getByRole('checkbox', { name: 'I authorize legacy runc. Docker-enabled workers receive privilege on the host.', exact: true }).check();
 }
 
 /**

@@ -14,6 +14,9 @@ import {
   validateHostMountTarget,
 } from './host-mount-store';
 import { withOperationDeadline } from './operation-deadline';
+import { resolveWorkerRuntimePolicy, KATA_DOCKER_RUNTIME } from './worker-runtime-policy';
+import type { LegacyPrivilegeGrant } from './worker-runtime-policy';
+import type { WorkerRuntimeProfile } from '../../shared/types';
 
 export interface EnvironmentJsonPayload {
   networkMode: string;
@@ -131,6 +134,28 @@ export class DockerService {
     this.config = config;
   }
 
+  /** Operator attestation plus daemon registration, not automatic proof of
+   * host suitability. A separately recorded physical-host canary is required. */
+  async assertWorkerRuntimeAvailable(profile: WorkerRuntimeProfile): Promise<void> {
+    if (profile !== 'kata-qemu') return;
+    if (this.config.kataHostValidated !== true)
+      throw Object.assign(new Error('Kata/QEMU host validation has not been attested by the operator; worker data was preserved'), {
+        statusCode: 503,
+        code: 'KATA_HOST_NOT_VALIDATED',
+      });
+    const info = await withOperationDeadline(
+      this.docker.info(),
+      DOCKER_READ_TIMEOUT_MS,
+      'Docker runtime inspection',
+    );
+    const runtimes = (info as { Runtimes?: Record<string, unknown> }).Runtimes;
+    if (!runtimes || !Object.hasOwn(runtimes, KATA_DOCKER_RUNTIME))
+      throw Object.assign(new Error('Kata/QEMU runtime is not registered with Docker; worker data was preserved'), {
+        statusCode: 503,
+        code: 'KATA_RUNTIME_UNAVAILABLE',
+      });
+  }
+
   async ensureNetwork(): Promise<void> {
     const networks = await withOperationDeadline(
       (operationSignal) => this.docker.listNetworks({
@@ -168,6 +193,10 @@ export class DockerService {
     mounts?: MountConfig[];
     hardwareDevices?: ResolvedHardwareDevice[];
     dockerEnabled?: boolean;
+    runtimeProfile: WorkerRuntimeProfile;
+    legacyPrivilegeGrant?: LegacyPrivilegeGrant;
+    /** Recheck a live administrator selection after slow image preparation. */
+    authorizeRuntime?: () => Promise<void>;
     credentialBinds?: string[];
     /** Trusted named volumes generated from explicit backup-directory
      * selections; never accepts client-selected Docker sources. */
@@ -200,6 +229,16 @@ export class DockerService {
      * baked entrypoint/env). Ignored for the standard image. */
     imageConfig?: ImageConfigOverride;
   }): Promise<Docker.Container> {
+    const runtimePolicy = resolveWorkerRuntimePolicy({
+      runtimeProfile: opts.runtimeProfile,
+      dockerEnabled: opts.dockerEnabled === true,
+      legacyPrivilegeGrant: opts.legacyPrivilegeGrant,
+    });
+    if (opts.runtimeProfile === 'kata-qemu' && opts.hardwareDevices?.length)
+      throw Object.assign(new Error('Kata host-device passthrough has not been validated'), {
+        statusCode: 409, code: 'KATA_DEVICE_PASSTHROUGH_NOT_VALIDATED',
+      });
+    await this.assertWorkerRuntimeAvailable(opts.runtimeProfile);
     const env: string[] = [];
 
     // When running an imported image (no baked config), seed the base env
@@ -311,6 +350,7 @@ export class DockerService {
         !/^[a-f0-9-]{36}$/i.test(opts.portableImportIdentity.operationId)
       )
     ) throw new Error('Portable import identity does not match the worker creation request');
+    await opts.authorizeRuntime?.();
     const container = await withOperationDeadline((operationSignal) => this.docker.createContainer({
       Image: image,
       name: opts.containerName,
@@ -329,6 +369,7 @@ export class DockerService {
       Labels: {
         [MANAGED_LABEL]: 'true',
         [ID_LABEL]: opts.id,
+        'agentor.runtime-profile': opts.runtimeProfile,
         ...(opts.portableImportIdentity
           ? {
               'agentor.owner-id': opts.portableImportIdentity.ownerId,
@@ -339,10 +380,11 @@ export class DockerService {
       },
       HostConfig: {
         NetworkMode: this.config.dockerNetwork,
+        Runtime: runtimePolicy.runtime,
         ...(nanoCpus > 0 ? { NanoCpus: nanoCpus } : {}),
         ...(memBytes > 0 ? { Memory: memBytes } : {}),
         ...(capAdd.length > 0 ? { CapAdd: capAdd } : {}),
-        ...(opts.dockerEnabled ? { Privileged: true } : {}),
+        ...(runtimePolicy.privileged ? { Privileged: true } : {}),
         ...(deviceMappings.length ? { Devices: deviceMappings } : {}),
         ...(deviceGroups.length ? { GroupAdd: deviceGroups } : {}),
         Init: true,
@@ -368,6 +410,7 @@ export class DockerService {
 
     if (opts.start !== false) {
       try {
+        await opts.authorizeRuntime?.();
         await withOperationDeadline(
           (operationSignal) => container.start({ abortSignal: operationSignal }),
           DOCKER_LIFECYCLE_TIMEOUT_MS,
@@ -753,6 +796,8 @@ done`;
     status: string;
     running: boolean;
     restartPolicy: string;
+    runtime: string;
+    privileged: boolean;
     secretHandshakeRequired: boolean;
     startedAt?: string;
     finishedAt?: string;
@@ -768,6 +813,8 @@ done`;
       status: info.State?.Status || 'unknown',
       running: info.State?.Running === true,
       restartPolicy: info.HostConfig?.RestartPolicy?.Name || 'no',
+      runtime: info.HostConfig?.Runtime || '',
+      privileged: info.HostConfig?.Privileged === true,
       secretHandshakeRequired: (info.Config?.Env ?? []).some(
         (entry) => entry === 'WORKER_SECRET_HANDSHAKE=1',
       ),

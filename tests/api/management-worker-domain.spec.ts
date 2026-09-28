@@ -1,5 +1,7 @@
 import { test, expect } from '@playwright/test';
-import { ManagementWorkerDomain, withinManagementFailFastDeadline } from '../../orchestrator/server/utils/management-worker-domain';
+import { ManagementWorkerDomain, managementRuntimeAdministrator, withinManagementFailFastDeadline } from '../../orchestrator/server/utils/management-worker-domain';
+import { createLiveManagementVolumeAuthority, ManagementMcpStore } from '../../orchestrator/server/utils/management-mcp-store';
+import { authorizeRuntimeSelection } from '../../orchestrator/server/utils/worker-runtime-admin';
 
 test('management worker domain declares bounded worker, configuration, group, and lock tools', () => {
   const tools = new ManagementWorkerDomain().tools();
@@ -80,4 +82,74 @@ test('recursive management fail-fast deadline returns a structured timeout error
 test('recursive management tools reject invalid timeout switches before work', async () => {
   await expect(new ManagementWorkerDomain().execute('groups.list', { timeoutSeconds:0 }))
     .rejects.toMatchObject({ statusCode:400, message:expect.stringContaining('timeoutSeconds') });
+});
+
+test('legacy MCP runtime authority requires a live platform principal and acknowledgement', async () => {
+  const domain = new ManagementWorkerDomain();
+  for (const name of ['workers.runtime.preflight', 'workers.runtime.status', 'workers.runtime.migrate', 'workers.runtime.recover', 'workers.runtime.finalize']) {
+    await expect(domain.execute(name, { workerId: 'worker-1', runtimeProfile: 'kata-qemu', confirmDowntime: true },
+      { scope: 'group', reauthorize: async () => ({ scope: 'platform' }) } as any)).rejects.toMatchObject({ statusCode: 403 });
+  }
+  for (const authority of [undefined, { scope: 'platform' as const },
+    { scope: 'group' as const, reauthorize: async () => ({ scope: 'platform' as const }) }]) {
+    await expect(domain.execute('workers.create', { userId: 'owner', runtimeProfile: 'legacy-runc', acknowledgeHostPrivilege: true }, authority))
+      .rejects.toMatchObject({ statusCode: 403 });
+    await expect(domain.execute('workers.runtime.authorize', { workerId: 'worker', runtimeProfile: 'legacy-runc', acknowledgeHostPrivilege: true }, authority))
+      .rejects.toMatchObject({ statusCode: 403 });
+  }
+  const principal = { scope: 'platform' as const, workspaceId: 'admin-workspace' };
+  let enabled = true;
+  let bound = true;
+  const actor = managementRuntimeAdministrator(createLiveManagementVolumeAuthority(principal,
+    async () => principal, () => enabled, () => bound));
+  await expect(authorizeRuntimeSelection(actor, 'legacy-runc', false)).rejects.toMatchObject({ statusCode: 400 });
+  await expect(authorizeRuntimeSelection(actor, 'legacy-runc', true)).resolves.toMatchObject({ legacyPrivilegeGrant: 'admin' });
+  enabled = false;
+  await expect(actor.authorize()).rejects.toMatchObject({ statusCode: 403 });
+  enabled = true; bound = false;
+  await expect(actor.authorize()).rejects.toMatchObject({ statusCode: 403 });
+});
+
+test('runtime tools exclude internal grant fields and group discovery excludes platform authority', async () => {
+  const domain = new ManagementWorkerDomain();
+  const definitions = domain.tools();
+  for (const name of ['workers.create', 'workers.runtime.authorize']) {
+    const schema = definitions.find((tool) => tool.name === name)!.inputSchema as any;
+    expect(schema.additionalProperties).toBe(false);
+    expect(schema.properties.runtimeProfile.enum).toEqual(['kata-qemu', 'legacy-runc']);
+    expect(schema.properties).not.toHaveProperty('legacyPrivilegeGrant');
+    await expect(domain.execute(name, { legacyPrivilegeGrant: 'admin' })).rejects.toMatchObject({ statusCode: 400 });
+  }
+  const store = new ManagementMcpStore('/unused', async () => undefined);
+  (store as any).init = async () => undefined;
+  (store as any).state.policy.groups['worker-lifecycle'].enabled = true;
+  const platform = await store.listTools();
+  expect(platform.map((tool) => tool.name)).toContain('workers.runtime.authorize');
+  expect(platform.map((tool) => tool.name)).toContain('workers.runtime.finalize');
+  expect(definitions.find((tool) => tool.name === 'workers.runtime.finalize')).toMatchObject({
+    annotations: { destructiveHint: true }, inputSchema: { required: ['workerId', 'confirmDeleteRollback'] },
+  });
+  expect((definitions.find((tool) => tool.name === 'workers.runtime.recover')!.inputSchema as any).properties)
+    .toHaveProperty('acknowledgeDaemonOperationsSettled');
+  const group = await store.listTools({ scope: 'group', workspaceId: 'group-workspace', ownerId: 'owner', groupId: 'group' } as any);
+  expect(group.map((tool) => tool.name)).not.toContain('workers.runtime.authorize');
+  expect(group.map((tool) => tool.name)).not.toContain('workers.runtime.finalize');
+  const groupCreate = group.find((tool) => tool.name === 'workers.create')!.inputSchema as any;
+  expect(groupCreate.properties).not.toHaveProperty('runtimeProfile');
+  expect(groupCreate.properties).not.toHaveProperty('acknowledgeHostPrivilege');
+});
+
+test('direct MCP invocation cannot give group credentials a runtime selection', async () => {
+  const store = new ManagementMcpStore('/unused', async () => undefined);
+  (store as any).init = async () => undefined;
+  (store as any).auditSafely = async () => undefined;
+  (store as any).introspect = async () => ({ scope: 'group', workspaceId: 'group-workspace', ownerId: 'owner', groupId: 'group' });
+  (store as any).state.policy.groups['worker-lifecycle'].enabled = true;
+  for (const args of [
+    { runtimeProfile: 'legacy-runc', acknowledgeHostPrivilege: true },
+    { legacyPrivilegeGrant: 'admin' },
+    { acknowledgeHostPrivilege: true },
+  ]) await expect(store.invoke('server-credential', 'workers.create', args)).rejects.toMatchObject({ statusCode: 404 });
+  await expect(store.invoke('server-credential', 'workers.runtime.authorize', { workerId: 'worker', runtimeProfile: 'legacy-runc', acknowledgeHostPrivilege: true }))
+    .rejects.toMatchObject({ statusCode: 403 });
 });

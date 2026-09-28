@@ -10,6 +10,8 @@ defineRouteMeta({
           schema: {
             type: "object",
             properties: {
+              runtimeProfile: { type: 'string', enum: ['kata-qemu', 'legacy-runc'], description: 'Destination runtime for new workers; legacy requires a current platform administrator. The grant is not stored in the backup job.' },
+              acknowledgeHostPrivilege: { type: 'boolean', description: 'Required true for legacy runtime. A retry requires a new authorized restore request.' },
               target: { type: "string", enum: ["new", "original"] },
               displayName: { type: "string" },
               workspaceIds: { type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true, description: "Optional non-empty, duplicate-free exact subset of artifact workspaces; omit to restore all members" } as any,
@@ -46,6 +48,8 @@ defineRouteMeta({
 import { requireAuth } from "../../../utils/auth-helpers";
 import { useBackupManager } from "../../../utils/backup-manager";
 import { useContainerManager } from "../../../utils/services";
+import { isPlatformAdminUser } from '../../../utils/auth';
+import { authorizeRuntimeRestore } from '../../../utils/worker-runtime-admin';
 
 export default defineEventHandler(async (event) => {
   const user = requireAuth(event).user;
@@ -57,6 +61,8 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 403, statusMessage: "Forbidden" });
   const body = await readBody<{
     target?: "new" | "original";
+    runtimeProfile?: unknown;
+    acknowledgeHostPrivilege?: unknown;
     displayName?: string;
     confirmOverwrite?: boolean;
     lockPassword?: unknown;
@@ -74,6 +80,9 @@ export default defineEventHandler(async (event) => {
     >;
   }>(event);
   const target = body?.target ?? "new";
+  const runtimeAuthorization = await authorizeRuntimeRestore({ authorize: async () => {
+    if (!isPlatformAdminUser(user.id)) throw createError({ statusCode: 403, statusMessage: 'Current platform administrator required for legacy restore' });
+  } }, body?.runtimeProfile, body?.acknowledgeHostPrivilege);
   if (target !== "new" && target !== "original")
     throw createError({ statusCode: 400, statusMessage: "Invalid restore target" });
   if (body?.displayName !== undefined && typeof body.displayName !== "string")
@@ -104,6 +113,7 @@ export default defineEventHandler(async (event) => {
       body?.workspaceIds,
       body?.requestId,
       body?.imageResolutions,
+      runtimeAuthorization,
     );
   } catch (error: any) {
     if (typeof error?.statusCode === "number") throw error;

@@ -287,6 +287,7 @@ const formattedCreatedAt = computed(() => {
               <dt class="text-gray-500 dark:text-gray-400">Created</dt>
               <dd class="text-gray-900 dark:text-white text-xs">{{ formattedCreatedAt }}</dd>
             </dl>
+            <WorkerRuntimeControl class="mt-3" can-migrate :worker-id="container.id" :runtime-profile="container.runtimeProfile" :approval-required="container.runtimeRestoreApprovalRequired" />
           </section>
 
           <!-- Editable settings -->

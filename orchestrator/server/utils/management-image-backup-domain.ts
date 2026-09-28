@@ -5,6 +5,9 @@ import { useGitImageCatalogManager } from "./git-image-manager";
 import { useContainerManager, usePluginDefinitionStore } from "./services";
 import { useGroupAdminWorkspaceStore } from "./group-admin-workspace-store";
 import type { BackupProviderKind } from "./backup-types";
+import type { ManagementVolumeAuthority } from './management-volume-domain';
+import { managementRuntimeAdministrator } from './management-worker-domain';
+import { authorizeRuntimeRestore, type RuntimeRestoreAuthorization } from './worker-runtime-admin';
 
 export interface ImageBackupTool {
   name: string;
@@ -298,8 +301,16 @@ export class ManagementImageBackupDomain {
       annotations: annotations as any,
     }));
   }
-  async execute(name: string, args: Record<string, unknown>) {
+  async execute(name: string, args: Record<string, unknown>, authority?: ManagementVolumeAuthority) {
     if (!this.tools().some((t) => t.name === name)) return { handled: false };
+    let runtimeAuthorization: RuntimeRestoreAuthorization | undefined;
+    if (name === 'backups.restore') {
+      if (['legacyPrivilegeGrant', 'runtimeAuthorization', 'runtimeRestoreApprovalRequired'].some((key) => key in args))
+        throw fail(400, 'Runtime authority cannot be supplied in backup arguments');
+      if (authority?.scope === 'group' && ('runtimeProfile' in args || 'acknowledgeHostPrivilege' in args))
+        throw fail(403, 'Runtime selection requires a platform administrator');
+      runtimeAuthorization = await authorizeRuntimeRestore(managementRuntimeAdministrator(authority), args.runtimeProfile, args.acknowledgeHostPrivilege);
+    }
     if (name === "images.update") {
       const catalog = useImageCatalogManager();
       await catalog.init();
@@ -317,7 +328,7 @@ export class ManagementImageBackupDomain {
       return { handled: true, result: await this.images(name, args) };
     if (name.startsWith("instance-backups."))
       return { handled: true, result: await this.instanceBackups(name, args) };
-    return { handled: true, result: await this.backups(name, args) };
+    return { handled: true, result: await this.backups(name, args, runtimeAuthorization) };
   }
   private async images(name: string, a: Record<string, unknown>): Promise<any> {
     const catalog = useImageCatalogManager();
@@ -432,6 +443,7 @@ export class ManagementImageBackupDomain {
   private async backups(
     name: string,
     a: Record<string, unknown>,
+    runtimeAuthorization?: RuntimeRestoreAuthorization,
   ): Promise<any> {
     const manager = useBackupManager();
     await manager.init();
@@ -545,6 +557,7 @@ export class ManagementImageBackupDomain {
             optionalUniqueStrings(a.workspaceIds, "workspaceIds"),
             imageResolutions(a.imageResolutions),
             string(a.requestId),
+            runtimeAuthorization,
           ),
           owner,
         );
@@ -799,6 +812,7 @@ function createRecoveryRestore(
   workspaceIds: string[] | undefined,
   resolutions: unknown,
   requestId: string | undefined,
+  runtimeAuthorization?: RuntimeRestoreAuthorization,
 ) {
   const createRestore = (manager as { createRestore?: unknown }).createRestore;
   if (typeof createRestore !== "function")
@@ -813,6 +827,7 @@ function createRecoveryRestore(
     workspaceIds,
     requestId,
     resolutions,
+    runtimeAuthorization,
   );
 }
 function imageLogs(
@@ -1274,6 +1289,10 @@ function catalogSchema(name: string): Record<string, unknown> {
         "Optional immutable GHCR references keyed by the matching built digest.",
     },
   };
+  if (name === 'backups.restore') {
+    p.runtimeProfile = { type: 'string', enum: ['kata-qemu', 'legacy-runc'], description: 'Destination profile. Legacy requires current platform authority and explicit acknowledgement; backup metadata cannot authorize it.' };
+    p.acknowledgeHostPrivilege = { type: 'boolean', description: 'Explicitly authorize host privilege for legacy Docker-enabled workers.' };
+  }
   if (
     name === "instance-backups.preflight" ||
     name === "instance-backups.restore"

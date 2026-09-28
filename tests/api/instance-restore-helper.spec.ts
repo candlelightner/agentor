@@ -390,6 +390,53 @@ test.describe("controlled instance restore helper", () => {
     ).resolves.toBe("[]");
   });
 
+  test("holds restored runtimes and strips source authority while preserving old profiles and worker data", async () => {
+    const prepared = await fixture(root);
+    const workers = [
+      { id: "legacy", runtimeProfile: "legacy-runc", legacyPrivilegeGrant: "admin" },
+      { id: "existing", runtimeProfile: "legacy-runc", legacyPrivilegeGrant: "preexisting" },
+      { id: "kata", runtimeProfile: "kata-qemu", legacyPrivilegeGrant: "admin" },
+      { id: "old" },
+    ].map((worker) => ({
+      ...worker, userId: "source-owner", status: "active", desiredRuntimeStatus: "running",
+      runtimeRestoreApprovalRequired: false, environmentId: "docker-env",
+      mounts: [{ source: "persistent-workspace", target: "/workspace" }],
+    }));
+    await writeTarGzip(prepared.plan.dataArchive, [
+      { name: "auth.db", body: Buffer.concat([Buffer.from("SQLite format 3\0"), Buffer.alloc(32)]) },
+      { name: "users/source-owner/workers.json", body: JSON.stringify(workers) },
+      { name: "users/source-owner/worker-runtime-migrations.v1.json", body: JSON.stringify({ jobs: [{ sourceContainerId: "source-daemon-only", phase: "rolling-back" }] }) },
+      { name: "users/journal-only-owner/worker-runtime-migrations.v1.json", body: "[]" },
+    ]);
+    const fake = fakeDocker(prepared.dataDir, prepared.env.AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR);
+    expect(await runInjected(prepared, fake.docker)).toEqual({ status: "succeeded" });
+    const restored = JSON.parse(await readFile(join(prepared.dataDir, "users/source-owner/workers.json"), "utf8"));
+    expect(restored).toEqual(workers.map(({ legacyPrivilegeGrant: _grant, ...worker }) => ({
+      ...worker, runtimeRestoreApprovalRequired: true,
+    })));
+    expect(restored[3]).not.toHaveProperty("runtimeProfile");
+    for (const owner of ["source-owner", "journal-only-owner"])
+      await expect(readFile(join(prepared.dataDir, "users", owner, "worker-runtime-migrations.v1.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(fake.state).toMatchObject({ stops: 1, starts: 1 });
+  });
+
+  test("rejects malformed restored worker stores before stopping the destination", async () => {
+    for (const workers of [
+      {}, [null], [{ id: "foreign", userId: "other-owner" }],
+      [{ id: "duplicate", userId: "source-owner" }, { id: "duplicate", userId: "source-owner" }],
+    ]) {
+      const prepared = await fixture(root);
+      await writeTarGzip(prepared.plan.dataArchive, [
+        { name: "auth.db", body: Buffer.concat([Buffer.from("SQLite format 3\0"), Buffer.alloc(32)]) },
+        { name: "users/source-owner/workers.json", body: JSON.stringify(workers) },
+      ]);
+      const fake = fakeDocker(prepared.dataDir, prepared.env.AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR);
+      expect(await runInjected(prepared, fake.docker)).toMatchObject({ status: "failed", code: "INSTANCE_RESTORE_INVALID_ARCHIVE" });
+      expect(fake.state).toMatchObject({ stops: 0, starts: 0 });
+      expect((await readFile(join(prepared.dataDir, "auth.db"))).toString()).toContain("old");
+    }
+  });
+
   test("applies a verified data snapshot, transfers job ownership, and restarts the exact container", async () => {
     const prepared = await fixture(root);
     await writeFile(join(prepared.dataDir, "old-control-plane.txt"), "old");
