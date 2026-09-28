@@ -10,6 +10,7 @@ trap 'rm -rf -- "$fixture_dir"' EXIT
 
 bash -n "$setup" "$canary" "$repo_dir/install.sh"
 python3 "$repo_dir/tests/kata-archive-fixtures.py"
+bash "$repo_dir/tests/kata-smoke-fixtures.sh"
 
 printf '%s\n' '{"default-runtime":"runc","log-driver":"json-file","runtimes":{"other":{"path":"/usr/local/bin/other"}}}' > "$fixture_dir/existing.json"
 bash "$setup" --render-daemon-config "$fixture_dir/existing.json" "$fixture_dir/merged.json"

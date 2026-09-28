@@ -72,6 +72,16 @@ preservation, malformed report, query failure, service restart failure, and
 unchanged configuration retained when the alias remains missing).
 These do not establish the running daemon's effective ConfigPath or VM boot.
 
+`scripts/check-kata-host.sh` now requires explicit UID/GID `1000:1000` Docker
+exec to succeed both before and after a container restart; root exec alone missed
+the observed Docker29/containerd/Kata compatibility failure. Its JSON reports
+each stage and retains `isolationVerified:false`; cleanup failures cannot report
+a pass. `bash tests/kata-smoke-fixtures.sh` runs one success and eleven failure
+scenarios entirely through source-only fake Docker functions, including missing
+runtime, invalid/partial create results, initial/restarted user exec, incorrect
+identity, restart failure, and exact-ID cleanup failure. These fixtures also run
+through `tests/kata-host-fixtures.sh`; they do not count as real VM acceptance.
+
 The separate opt-in `scripts/probe-worker-local-dind.sh --run-worker-local`
 experiment uses the worker's own Docker daemon with no privileged flag, host
 devices, host namespace sharing, or bind/socket mounts. Its recorded runc result

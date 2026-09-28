@@ -57,10 +57,12 @@ false. `dockerReportsRuntime: true` means
 Docker lists the alias. Neither means a VM or Agentor worker succeeded. The
 status field `dockerRuntimeOptionsVerified` remains false because Docker info
 does not expose the effective shim-v2 options. The
-check script starts and executes a disposable Ubuntu container with that
-runtime, records the guest and host kernel releases, prints JSON, and
-removes its exact canary container. It may pull `ubuntu:24.04`; it does not
-remove the shared image. A successful basic boot is **not** DinD or full
+check script starts a disposable Ubuntu container with that runtime, records
+the guest and host kernel releases, verifies explicit UID/GID `1000:1000` exec
+both before and after container restart, prints stage-specific JSON, and
+removes its exact canary container. Cleanup failure also fails the check.
+It may pull `ubuntu:24.04`; it does not remove the shared image.
+A successful smoke check is **not** DinD or full
 Agentor migration acceptance or VM isolation proof. Kernel release equality or
 inequality is only supporting information, not an isolation test. The report
 always sets `isolationVerified: false`. An operator-approved physical-host canary

@@ -8,6 +8,7 @@ on:
       - scripts/check-kata-host.sh
       - scripts/validate-kata-archive.py
       - tests/kata-host-fixtures.sh
+      - tests/kata-smoke-fixtures.sh
       - tests/kata-archive-fixtures.py
       - scripts/test-kata-worker.sh
       - tests/kata-worker-fixtures.py
@@ -20,6 +21,7 @@ on:
       - scripts/check-kata-host.sh
       - scripts/validate-kata-archive.py
       - tests/kata-host-fixtures.sh
+      - tests/kata-smoke-fixtures.sh
       - tests/kata-archive-fixtures.py
       - scripts/test-kata-worker.sh
       - tests/kata-worker-fixtures.py

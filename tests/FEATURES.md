@@ -41,6 +41,9 @@ Every user-facing feature of the Agentor web dashboard, organized by category. T
 - Host setup verifies exact on-disk shim/options separately from Docker's
   reported runtime alias: Docker 26/29 omit shim-v2 type/options in `info`.
   Registration is not proof of effective configuration, boot, or isolation.
+- The operator smoke check requires explicit UID/GID 1000 exec before and after
+  container restart, not only root exec. Restart/user-resolution failures and
+  cleanup failures reject the check; VM isolation remains explicitly unverified.
 - An opt-in standalone non-DinD worker canary checks real startup, UID 1000
   tmux/editor/desktop, and named-volume persistence over restart/replacement.
   It never enables host attestation or deploys an orchestrator, and retains
