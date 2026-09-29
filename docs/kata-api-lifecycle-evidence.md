@@ -149,3 +149,61 @@ gates remain closed.
 - Local evidence archive:
   `/workspace/kata-vm-api-lifecycle-success-evidence.tar.gz`, SHA-256
   `cdd7af8cec0d3f4a13ba8e014de2cbd4e2cde86c3d192f595f9c569bd505bce6`.
+
+## Extended sharing and real regular-user denial checks
+
+A fresh two-worker run passed the same API lifecycle and both workers' UID1000
+services. It verified that workspace/agent-data volumes were distinct while
+the Kilo config/data directory bind sources were shared. Each worker replaced
+a synthetic `auth.json` through temp-file creation, fsync and atomic rename;
+the sibling worker and orchestrator observed the new contents. Authenticated
+credential status and reset worked in both directions. No real provider
+credential was used.
+
+A separately authenticated, verified `role=user` account could not see the
+administrator's workers. Explicit legacy creation and administrator migration
+preflight/journal access returned 403; container inventory was unchanged.
+
+The run nevertheless exited **1** at the final strict baseline comparison:
+`Preexisting container changed`. The exact differing inspection was not saved
+by that harness version. A subsequent read-only check found full equality with
+the original canary inspection, unchanged Docker PID/config, no running
+containers and only default networks. All owned test containers/networks were
+removed and volumes retained. The cause of the transient comparison mismatch
+is unproven, so this is not an overall successful acceptance run. Later harness
+versions save the exact compared post-test inspection without weakening equality.
+
+- VM evidence: `/home/kata-test/kata-api-lifecycle.32u3fp4f`.
+- Local logs: `/workspace/kata-vm-api-sharing.log` and
+  `/workspace/kata-vm-api-sharing-postcheck.log`.
+- Harness SHA-256: `4c3f774c4991559368770b6f627b2e0a59a66266fb7494ca4213ba79e50ae866`.
+- Archive: `/workspace/kata-vm-api-sharing-evidence.tar.gz`, SHA-256
+  `8cd9baf3724498727637f3eed61ceca09439bf5a62fa938490c8f5a9d6f8f84e`.
+
+## Real browser lifecycle pass
+
+A separate fresh run completed the API lifecycle, then real browser sign-in,
+runtime display, stop/restart, archive and unarchive. No browser routes were
+mocked. The browser ran as UID1000 in its own nonprivileged container, with all
+capabilities dropped, no mounts or Docker socket, and only the test network.
+The parent harness independently inspected Docker state and verified fresh
+READY, UID1000/tmux/editor/desktop and workspace/agent-data/shared-Kilo markers.
+Stop/restart retained the container ID; archive/unarchive created a new one.
+
+This run exited **0**, including removal of exact owned containers and empty
+networks, unchanged full original-canary inspection, Docker PID/config and no
+running containers afterward. Volumes remain, including
+`kata-api-uoej5vjy-data`. It does not include the two-worker sharing extension.
+The temporary host attestation ended with removal of the app.
+
+This proves the bounded **recovery-mode, non-DinD API plus real browser
+lifecycle** sequence. It is not normal-startup reconciliation, the full test
+suite, DinD, migration, backup restore or production-host acceptance.
+
+- Worker ID: `60efc26b-2356-4b34-af14-ab9ef50ace4b`.
+- VM evidence: `/home/kata-test/kata-api-lifecycle.uoej5vjy`.
+- Local log: `/workspace/kata-vm-browser-lifecycle.log`.
+- API harness SHA-256: `7b98c0a391967de53c3abf1cb0378c2ef81293b7ceca7126879e1ef3306b2384`.
+- Browser wrapper SHA-256: `1a1608e4f618278739db4f39954ab9b865292ee1dbd01b6d0ed406d94d0ff767`.
+- Archive: `/workspace/kata-vm-browser-lifecycle-evidence.tar.gz`, SHA-256
+  `40000138a70992ed8545403d71138970cd77949b43f0687df16f7eb68d892532`.

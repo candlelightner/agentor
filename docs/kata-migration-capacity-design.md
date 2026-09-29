@@ -3,7 +3,9 @@
 Status: protocol design with isolated accounting groundwork; no capacity
 admission implementation or deployment approval. The operator
 has chosen an operator-installed disk-measurement service and a maintenance
-window that excludes unrelated disk writers. This document does not install a
+window that excludes unrelated disk writers, and has approved designing around
+operator-provisioned filesystem quotas. These are design decisions, not
+installation or deployment approval. This document does not install a
 service, stop workers, grant host access to Agentor workers, or authorize a
 production migration. Until the contract is implemented and tested, public
 migration remains closed by `WORKER_RUNTIME_MIGRATION_CAPACITY_UNVERIFIED`.
@@ -99,8 +101,10 @@ The envelope must use checked arithmetic, explicit units and versioned,
 layout-specific amplification rules backed by tests of the exact supported
 Docker/containerd/filesystem combination. Docker `SizeRw`, compressed image
 size, `du`, or a volume's apparent size alone is not a safe complete bound.
-Include inodes and a nonzero operator safety floor on every constrained
-domain. Reject uncountable special files, unreadable trees, source mutations
+Include inodes and a nonzero operator safety floor on every physical allocation
+domain. Quota-only constraints need the separate floor semantics described
+below; they do not create physical storage. Reject uncountable special files,
+unreadable trees, source mutations
 during measurement, unsupported copy semantics, or an unknown store mapping.
 The service also needs fixed time, tree-entry, depth and memory budgets for
 measurement, with cancellation and a clear incomplete-scan result. A timeout,
@@ -108,15 +112,162 @@ limit hit, permission denial or changing tree fails admission; partial counts
 must never be promoted to a size bound. Do not invent a universal multiplier
 and label it precise.
 
-Most importantly, arbitrary replacement startup or validation can write
-without a finite bound. Admission cannot promise rollback headroom for such a
-worker unless an independently enforced per-domain write limit (or an equally
-sound workload-specific bound) is present and included. Monitoring free space
-after the fact is not a hard limit. No quota policy is implicitly authorized
-here; until the operator selects and validates one, general migration remains
-blocked. The same applies where source growth between initial measurement and
-stop cannot be bounded. A stopped-source measurement is mandatory even when a
-pre-stop upper estimate exists.
+Arbitrary replacement startup or validation can write without a finite bound.
+The selected design therefore requires kernel-enforced hard byte and inode
+quotas for every workload-writable allocation destination. Polling free space,
+soft limits, quota grace periods and stopping a worker after a threshold is
+crossed do not provide this bound. Quotas bound allocation; they do not prove
+that a worker will start, that an application handles `EDQUOT` correctly, or
+that a filesystem has enough physical space. Those are separate checks.
+Source growth between initial measurement and stop must obey the same hard
+limits. A stopped-source measurement remains mandatory.
+
+## Proposed quota implementation and initial candidate matrix
+
+The first implementation target is deliberately a **candidate, unvalidated**
+layout, not support for the current disposable VM or arbitrary existing Docker
+installations. Use a dedicated, rootful Docker Engine 29.1.3 daemon with the
+classic `overlay2` image store, on Ubuntu 24.04 with kernel 6.8.0-142-generic and
+XFS formatted with `ftype=1`, `reflink=0` and project-quota enforcement enabled.
+Pin the exact Engine/containerd package builds and XFS tooling in the acceptance
+manifest before testing; the VM's previously recorded containerd 2.2.1 is a
+candidate version, not proof of this different layout. Test Kata 4.2.0/QEMU
+11.0.1 against that exact configuration. Begin with non-DinD workers and one
+thick-provisioned XFS allocation domain for the daemon stores and managed data.
+Keep the broker ledger and orchestrator control journal on separately protected
+storage inaccessible to workers. This proposal requires fresh operator-provided
+test storage; it does not authorize reformatting or switching the current VM's
+Docker store in place.
+
+Version one rejects the containerd image-store mode, Docker's own per-container
+`overlay2.size` quota management, rootless Docker, remote volume drivers,
+arbitrary bind sources, nested backing mounts, sparse/thin backing devices,
+reflink/COW layouts and unvalidated encryption layers. Reject existing workers
+whose complete writable paths have not been enrolled by the operator. Support
+for separate image/volume filesystems is a later adapter with its own tests;
+the accounting module can represent it but does not establish that support.
+Encrypted backup transport is independent of this exclusion on host block
+storage layouts.
+
+Use an operator-owned project-ID registry; identify each quota by filesystem
+identity **and** project ID. Project quotas are not hierarchical: a child
+directory assigned a different project does not also consume its parent's
+project quota. Every project consumes the common filesystem budget, and any
+alias of that project consumes the same quota budget. No project limit or free
+count may be added twice. The adapter must verify inheritance, enforcement and
+actual project membership, not merely the configured mount option or a Docker
+volume label.
+
+Reject disabled enforcement, accounting-only mode and zero/unlimited hard-limit
+sentinels when producing trusted measurements. Interpret raw kernel/tool quota
+fields using the pinned adapter's documented units and semantics: zero remaining
+headroom is not an unlimited quota, and a zero hard-limit sentinel must never be
+turned into a finite enforced bound.
+
+| Allocation role | Proposed hard-limit and ownership rule |
+| --- | --- |
+| Source and replacement writable rootfs | Separate enrolled XFS projects for each actual `overlay2` upper/work allocation set. Verify Kata's actual writable path belongs to the expected project; never derive this solely from container ID. Source is already constrained before admission. Replacement directories are mapped and assigned before any worker code executes. |
+| Canonical worker volumes | One enrolled project per distinct physical worker-owned volume, with both byte and inode hard limits. Mount aliases share this quota; multiple rollback copies remain distinct additional allocations. Preserve volume identity and mount access mode. |
+| Shared account writable binds | Permit only the existing account credential/Kilo paths that have explicit operator-owned mappings and hard limits. Fence all other writers sharing those projects. Preserve their shared identity and contents on rollback; never rewind them with the worker-owned copies. Unknown writable binds reject admission. |
+| Committed image/content, layer, extraction, helper and daemon metadata | Map every effective write destination to a bounded daemon-store project or an explicitly enumerated project. The common project bounds daemon allocations during the maintenance epoch; do not claim per-container upper quotas cover these writes. Protect unused recovery quota separately from the forward phase. |
+| Rollback-copy volume data | Create only journaled, labeled empty volumes under the bounded daemon-store parent. Before copying, verify exact Docker volume identity, no consumers and empty contents, then enroll its data directory into a separate rollback project. Set inheritance and hard limits before helper start. Existing source/canonical directories must never be recursively reassigned as part of migration. |
+| Broker ledger, migration journal and audit metadata | Protected control storage with its own finite operation/log budgets and reserved bytes/inodes. Worker, guest and copy-helper writes must not consume this recovery/control budget. Journal exhaustion fails admission; logging must not erase recovery state. |
+
+Docker container/volume creation can allocate metadata before its new project
+is assigned. That bounded setup phase must already be reserved against the
+daemon-store project and physical filesystem; post-create quota assignment is
+not a substitute for pre-create admission. The adapter must demonstrate that
+Docker does not reassign, clear or reuse broker-owned project IDs during
+create/commit/remove/restart, and that no open writable handle exists during
+new-project enrollment. If this cannot be proven for the candidate version,
+reject that adapter instead of racing Docker or changing live source project
+membership. No daemon patch or storage-layout support is assumed by this design.
+
+Hard quota accounting must include host allocation by Kata/virtiofs and by the
+copy helper, including hardlinks, open-but-unlinked files and delayed allocation.
+Test both UID1000 and container-root attempts to change project IDs, inheritance
+or limits through filesystem ioctls/xattrs, and to allocate through every bind
+alias. Worker-visible privilege must not become authority to bypass host quota
+enforcement. Unsupported inode accounting, unexpected project membership,
+cross-project hardlink/copy behavior, or a destination escaping quota coverage
+fails preflight. Guest-visible `df` and guest-only quotas are not sufficient.
+
+## Quota phases and reserved recovery headroom
+
+Provision a current hard byte/inode ceiling for forward work and a maximum
+recovery ceiling per relevant project in the operator policy, with a nonzero
+physical-filesystem safety floor outside all workload allowances. The broker
+may request only
+policy-bounded transitions through an operator-installed enforcement adapter;
+an API caller cannot pick limits, project IDs or paths. The installation must
+explicitly configure that adapter's authority. Merely approving this design
+does not grant an existing measurement-only service quota-write permissions.
+
+Physical and quota budgets are separate constraints. Before stopping the source,
+reserve the complete worst-case future source/forward growth, backup copies,
+recovery-copy peak and bounded original-worker restart/validation allocations.
+In particular, recovery-only room is excluded from the hard ceiling reachable
+by the replacement during startup. Available filesystem bytes alone cannot
+protect recovery when a canonical project's quota is already exhausted.
+
+For quota-only constraints, account the kernel-reported hard limit minus actual
+usage with a zero additional quota floor when the workload can consume that
+entire limit. A positive quota floor cannot be promised merely by reserving it:
+the kernel's hard ceiling must enforce any intended workload margin. Never add
+fictitious available quota above the currently enforced limit. Future recovery
+limit increases are separate conditional phase entitlements backed by an
+already durable **physical** reservation; re-read the applied kernel limit and
+usage before admitting recovery writes. Physical safety floors stay nonzero.
+The initial arithmetic module currently requires a nonzero floor on every
+constraint, including quota; it therefore needs a reviewed schema/test
+refinement for this distinction before quota integration. Until then it may
+reject these valid quota envelopes conservatively, and must not be fed invented
+headroom to force success.
+
+1. **Pre-stop:** verify the running source's enrolled hard limits and reserve
+   its maximum remaining allocation up to those limits, including shutdown
+   writes. This covers the measurement-to-stop interval without assuming a
+   stable running tree. Do not lower limits below current usage or change
+   existing source project ownership as part of admission. An unenrolled source
+   needs separate operator preparation and is rejected before any stop.
+2. **Stopped measurement and forward work:** after quiescence, scan the stopped
+   rootfs and owned mounts, resolve outstanding writes and recompute the full
+   envelope. Complete any reservation increase before commit/copy. Enroll and
+   verify fresh rollback/replacement projects before their producers start.
+   Every forward phase stays within its configured hard ceilings; hitting a
+   quota is a failure, never permission to increase a limit automatically.
+3. **Replacement startup/validation:** keep finite ceilings on its writable
+   rootfs, canonical volumes and shared-account binds, plus the daemon's
+   metadata/log paths. The envelope includes all their maximum additional
+   allocations, including output/logging outside the upper layer. Validation
+   has a deadline, but time bounds alone do not replace disk/inode limits.
+4. **Rollback:** first prove that replacement execution and in-flight mutations
+   are settled, the maintenance fence is valid and affected destinations still
+   match. Persist the recovery transition and obtain quota/physical admission
+   before destructive canonical-volume copyback. Only then may the enforcement
+   adapter expose the separately reserved recovery ceiling on those projects.
+   A running or ambiguous replacement must never receive that extra room. If a
+   quota failure prevents proving quiescence, retain `recovery-required` and do
+   not lift the ceiling or begin copyback. Recovery must not depend on deletion
+   freeing space or assume `cp -a` has a bounded peak without the tested rules.
+5. **Original restart:** restore data first, then use a separately bounded
+   restart/validation allowance. Keep the failed replacement stopped and the
+   rollback copies retained. Repeated retries must reserve any additional peak;
+   they cannot repeatedly reuse an already consumed allowance. Failure to
+   validate may leave the original stopped with retained evidence.
+6. **Finalization:** identity-check and remove only explicitly finalized retained
+   artifacts. Reconcile project usage and remaining future reservation after
+   deletion has actually settled, including open handles and delayed frees.
+   Retire a project ID only after no artifacts or in-flight operations reference
+   it. Keep active canonical projects and snapshot images, retain applicable
+   hard limits, and do not lower a limit below live usage to reclaim a ticket.
+
+Persist desired quota transitions in the broker's durable ledger before asking
+the enforcement adapter to apply them; after a crash, query actual kernel state
+and reconcile idempotently. A transition with an unknown outcome retains the
+larger physical reservation and prevents new phases. No ticket expiry, journal
+terminal state or backup restore removes a quota, restores an old project ID,
+or releases recovery capacity.
 
 ## Maintenance fence and durable reservation
 
@@ -124,12 +275,46 @@ Before admission the operator establishes a maintenance epoch that excludes
 unrelated writers to **every** affected allocation domain. This is more than
 stopping the selected worker: it must account for other Agentor workers,
 image pulls/builds, backups/restores, daemon garbage collection, host jobs and
-any non-Agentor process that can consume the same budgets. The operator must
-choose enforceable fencing and document allowed daemon bookkeeping. If the
+any non-Agentor process that can consume the same budgets. The implementation
+must attest enforceable fencing and document allowed daemon bookkeeping. If the
 service cannot attest that the fence is active and remains active, it refuses
 new reservations and migration pauses before the next storage mutation.
 This design does not itself stop unrelated workers or authorize global
 downtime.
+
+For the initial dedicated-daemon candidate, implement one host-wide maintenance
+lock owned by the operator service, with a generation and a durable owner/epoch.
+Every orchestrator instance sharing that daemon must drain existing storage
+jobs and acquire this lock for create/start/rebuild, pulls/builds, backup/restore,
+managed-volume writes and destructive cleanup. Read-only status can continue.
+Lock acquisition refuses active conflicting jobs; it does not stop unrelated
+workers or cancel an unknown Docker request. The operator's maintenance-window
+procedure must quiesce unrelated workers, shared-account writers and host jobs
+before activation. That procedure requires separate scheduling and authority
+at installation/test time; this design issues no shutdown commands.
+
+An application mutex alone is insufficient. The dedicated daemon's mutation
+endpoint must be accessible only to the orchestrator and the service's enrolled
+operation adapter during the window; local root remains an operator trust
+boundary. Operator preparation must remove other clients and resolve existing
+connections/file descriptors, not merely chmod the socket. The service attests
+the allowed process/daemon inventory, project registry, active hard limits and
+quiescent operations at epoch creation. Background daemon GC, logging, container
+exits and bounded cleanup are explicitly mapped and charged; disable or drain
+unbounded background work in the operator's test configuration. An unaccounted
+writer or inability to establish this inventory prevents activating the epoch.
+This is local storage/daemon access control, not worker network-policy work.
+
+The lease permits the next phase; it is not the durable reservation itself.
+Daemon restart, store remount, unrecognized quota enforcement change,
+unexpected process-inventory change or service recovery invalidates phase
+permission. Expected process/quota transitions must match the journaled operation
+and advance the service's generation before the next phase. Already-running
+worker writes remain bounded by kernel hard quotas while the orchestrator
+holds further mutation and reconciles state. A watchdog may report an invalid
+epoch, but does not itself prove exclusion. After a crash, default to no new
+work until the operator/service has re-established the fence; preserve the
+quota registry, reservations and journals throughout.
 
 The service owns a host-global, crash-durable reservation ledger, serialized
 across all Agentor instances and operations sharing the domains. Admission is
@@ -212,9 +397,9 @@ volume paths, bind-path policy, rootless/rootful mode, encryption/thin-pool
 behavior, and expected backup/restore layout. Local-volume-only preflight does
 not by itself prove that the volume and image stores share a filesystem.
 Unknown, remote, overlay-on-overlay, reflink/COW, thin-provisioned or
-filesystem-quota configurations fail closed until a validated accounting and
-hard-limit rule exists. Per-workload write bounds and a maintenance-fence
-mechanism remain operator design decisions.
+unvalidated quota configurations fail closed until a validated accounting and
+hard-limit rule exists. The quota and maintenance approach above now supplies
+the design direction; it is not evidence that the candidate adapter works.
 
 Before lifting the gate, test measurement spoofing/replay, aliased paths,
 separate image/volume filesystems, bytes and inode exhaustion, concurrent
@@ -223,5 +408,79 @@ service/restart recovery, lease expiry, Docker timeouts, partial copy/commit,
 failed rollback and explicit finalization. Then run a disposable host/VM
 migration with real retained data and recovery evidence. Tests must verify that
 all admission failures leave existing workers intact and that no restored
-source-host ticket can enable a destination migration. None of those checks
-has been completed by this design document.
+source-host ticket can enable a destination migration. The isolated arithmetic
+tests cover some malformed/insufficient accounting cases; none establishes the
+host-service or migration acceptance described here.
+
+## Service boundaries and actionable implementation sequence
+
+Use a dedicated operator-provisioned Unix socket mounted only into the
+orchestrator, with mutual TLS identity verification over that socket. Pin a
+host-specific service identity and dedicated client trust root; never reuse
+worker, application-login or repository credentials. Operator installation
+provisions certificates, socket ownership and the narrow socket bind. Rotate
+certificates through an explicit overlapping trust interval with generation
+tracking; removal/revocation ends permission for new phases but preserves
+reservations. No broker key, socket configuration, ticket or project grant is
+part of an instance backup or a worker environment.
+
+Separate the measurement/ledger process from the narrowly privileged local
+quota-enforcement adapter. Its operations are enrolled identity lookup,
+verified fresh-project enrollment and policy-bounded quota transitions. It
+must reject arbitrary paths, filesystem creation/reformatting, mounts,
+device access, shell commands and caller-selected project IDs. Operator-owned path handles and
+registry mappings resolve destinations; use no-follow/identity checks at each
+access, and fail on changed mount/layout generation. The host installer must
+specify process isolation, its minimal filesystem/ioctl privileges and bounded
+audit storage. Do not advertise a read-only measurement service if its bundled
+adapter can write quotas; review that installation authority explicitly.
+
+Implement and independently review in this order while keeping public admission
+closed:
+
+1. Define versioned RPC and persisted ledger schemas: host/layout/epoch,
+   operation and mount identities, authenticated sequence/nonce, complete
+   scan result, envelope, project limits, desired/applied quota transitions and
+   conservative reservation state. Add strict size/time limits, authentication,
+   replay rejection and fake-service tests before any real host adapter exists.
+2. Implement a crash-durable, serialized ledger with atomic compare/reserve,
+   idempotent operation lookup, explicit reconciliation and no TTL release.
+   Fsync state and its containing directory before acknowledging a transition.
+   Exercise concurrent orchestrators, torn/failed writes, service restarts,
+   orphan tickets and journal-write failures without Docker access.
+3. Implement the candidate mapper and bounded scanner behind an explicit
+   unsupported-layout default. Build offline fixtures from exact store/mount
+   metadata; include aliasing, project inheritance, special files, sparse
+   allocation, copy expansion, inode exhaustion, delayed frees and every image
+   destination. A complete scan cannot synthesize quota enforcement evidence.
+4. Implement quota enrollment/transitions and maintenance fencing using a
+   separately provisioned disposable host/storage test harness. Prove kernel
+   `EDQUOT` for both blocks and inodes, unchanged limits after worker/daemon
+   restart, root/UID1000 non-bypass, create-before-start enrollment ordering,
+   interruption between intent and application, and recovery-only limit
+   isolation. Reconcile real quota usage against measured physical allocation.
+5. Add migration integration behind the still-closed public gate: durable
+   ticket before source stop, post-stop remeasurement, validation before every
+   allocation phase and guarded rollback/restart/finalization. Existing journals
+   without capacity state must not manufacture a ticket; define an explicit
+   service-assisted recovery enrollment path that inspects retained artifacts
+   before permitting writes. Preserve old-format backup readability while
+   stripping host capacity/quota authority on restore.
+6. Run reviewed disposable end-to-end migration success, failed replacement,
+   quota exhaustion, process interruption, rollback retry and explicit
+   finalization with real retained rootfs/volume markers. Then run encrypted
+   cross-host restore into separately enrolled destination storage. Only after
+   all required evidence and a reviewed rollout change may public admission
+   consume this protocol. DinD remains a separate gate and support extension.
+
+The remaining operator work is concrete host provisioning and scheduling, not
+another choice of whether to use a capacity service, maintenance window or
+filesystem quotas. Before live quota acceptance, the operator must provide an
+isolated test host/storage matching the candidate (or explicitly select another
+adapter), approve installation of the measurement/enforcement service with its
+declared privileges, assign hard ceilings/recovery maxima/control-storage
+floors and a maintenance window, and supply the expected backup destination
+layout. Exact package/filesystem compatibility, quota non-bypass and the
+envelope's allocation rules are implementation/test questions, not facts an
+administrator checkbox can attest away. This document neither requests nor
+performs those host changes, and nothing here is ready to deploy.
