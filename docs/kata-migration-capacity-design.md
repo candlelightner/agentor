@@ -1,11 +1,23 @@
 # Runtime migration disk-capacity admission: proposed contract
 
-Status: design only, not implemented or approved for deployment. The operator
+Status: protocol design with isolated accounting groundwork; no capacity
+admission implementation or deployment approval. The operator
 has chosen an operator-installed disk-measurement service and a maintenance
 window that excludes unrelated disk writers. This document does not install a
 service, stop workers, grant host access to Agentor workers, or authorize a
 production migration. Until the contract is implemented and tested, public
 migration remains closed by `WORKER_RUNTIME_MIGRATION_CAPACITY_UNVERIFIED`.
+
+The initial `worker-runtime-capacity-accounting.ts` module provides only pure
+bounded arithmetic: canonical uint64 byte/inode quantities, one budget per
+allocation constraint, additive demands and outstanding reservations, and
+nonzero safety floors. Shared filesystem aliases cannot multiply free space;
+separate quota/pool constraints also consume their mapped demands. Its 69
+focused tests cover malformed input, limits, exhaustion, precision and overflow.
+It performs no measurement, authentication, I/O or durable reservation and is
+not connected to migration admission. Concrete supported layouts, enforced
+write bounds, maintenance fencing, broker transport and phase integration
+remain unfinished. A successful calculation is not a capacity ticket.
 
 ## Existing transaction and trust boundary
 

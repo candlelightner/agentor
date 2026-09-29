@@ -203,3 +203,39 @@ Evidence: VM `/home/kata-test/kata-guest-dind.Anfzi8zB`; local log
 `7c06ab2dabd140cde698239d80daf9cfc163716ff9ea969f6c4c9d988e8df4d2`.
 Executed harness SHA-256:
 `d9c0296dbfa2ac209d9d641659a3453a88782bc7659ccc9b7355c8929d58eafb`.
+
+### Original cgroup mount traced: EBUSY confirmed
+
+An independently reviewed bounded diagnostic on 2026-09-29 repeated exactly
+one original mount command in a fresh Kata container and private guest mount
+namespace. Capabilities and device/namespace grants were unchanged. It used
+no volume or inner daemon. The guest's installed strace observed:
+
+```text
+mount("none", "/sys/fs/cgroup", "cgroup2", MS_NOSUID|MS_NODEV|MS_NOEXEC, NULL) = -1 EBUSY (Device or resource busy)
+```
+
+The command exited 32 and the diagnostic stopped. This confirms EBUSY for
+this attempt, rather than EPERM. Linux's same-filesystem/root overmount guard
+is consistent with the captured topology; the trace does not identify the
+exact kernel branch. Guest mount/libmount packages are `2.39.3-9ubuntu6.6`.
+The root virtiofs source is `none`, consistent with libmount's source-name
+lookup producing the misleading `none already mounted on /` message. The
+cgroup mount is VFS read-only with a read-write superblock. No remount, bind
+replacement, alternate hierarchy or permission change was attempted.
+
+The exact container
+`45061296b611698a835e40e1dc3db755bb481a34a62aa66d68b058a746a30b8f`
+was removed and absence verified. Only the original stopped canary remains;
+Docker PID 28754, daemon configuration hash and approximately 13 GiB free
+space were unchanged. The diagnostic created no persistent data volume.
+
+Evidence: VM `/home/kata-test/kata-cgroup-metadata.YphXaMGg`, local log
+`/workspace/kata-vm-cgroup-trace.log`, and archive
+`/workspace/kata-vm-cgroup-trace-evidence.tar.gz`, SHA-256
+`428af3ac3ebc4fa27c1efa6a2957b3445954179b73b4e101503dd607b37a01d2`.
+Executed harness SHA-256:
+`bb10c13aa835c25a8a3ac72416a24c4a144de2e297aeb834a19b38a96f2882c1`.
+Eleven offline diagnostic-control tests and syntax checks passed before the
+run. This is a confirmed failed mount diagnostic, not DinD acceptance;
+`KATA_DIND_NOT_VALIDATED` remains in force.
