@@ -358,3 +358,36 @@ remained; VM Docker PID28754/config checksum were unchanged and approximately
 - Log `/workspace/kata-vm-guest-dind-bind-3.log`.
 - Archive `/workspace/kata-vm-guest-dind-bind-evidence-3.tar.gz`, SHA256
   `473e2f4aa87916466f3a39845a6cfe7f3acd15c0ecc381d47a32c36819803efb`.
+
+### Approved same-permissions trace: process-identity guard stopped the run
+
+The operator approved a separately reviewed, bounded trace without permission
+changes. Harness SHA256
+`bd87cd1abb4129c3c4c6d19070cf3ef742604a27e6e95cd8fb5deaa5319b59cb`
+received independent review; all 21 offline fixtures passed. It requires
+preinstalled strace, parent-child tracing with EXITKILL, bounded output/time,
+exact process ownership and at most one nested-start attempt. Tracing can
+perturb behavior and cannot itself establish untraced DinD acceptance.
+
+The live run exited **1 before dockerd or nested startup**. The smoke trace
+completed successfully; private containerd logged successful boot, but the
+supervisor did not publish its required process-identity record. Cleanup
+cancelled that supervisor and deferred guest mount teardown to exact outer
+container removal. This is a harness identity-verification failure under
+investigation, not another observation of the original nested-init denial.
+The denied nested operation remains unidentified; no permission increase,
+untraced fallback or live retry followed.
+
+Exact outer container
+`b78d7bf06c9eef94d3bedb7643b5987c0c6f71f79c5f8fe15f895ca49bdc9eff`
+was removed; `kata-guest-dind-trace-LT5yDhx4-data` remains. Docker PID28754 and
+configuration checksum were unchanged. The original stopped canary's full
+inspection matched its saved baseline; approximately 9.9GiB remained free.
+
+- VM evidence: `/home/kata-test/kata-guest-dind-trace.LT5yDhx4`.
+- Log: `/workspace/kata-vm-guest-dind-trace.log`.
+- Archive: `/workspace/kata-vm-guest-dind-trace-evidence.tar.gz`, SHA256
+  `844a41b8e5cc4073d621d92aa7931e717bc994b99a0b09e3b58d1d095772497c`.
+
+DinD and deployment acceptance remain incomplete; the application gate stays
+closed.

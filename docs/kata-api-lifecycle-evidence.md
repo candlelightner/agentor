@@ -306,3 +306,45 @@ material remain. No production credential was used or exported.
 The complete no-server module suite at this code checkpoint passed all 633
 tests (`/workspace/kata-all-modules-1ebfc1e.log`). These mocked/local tests are
 not full API/UI, migration or cross-host restore acceptance.
+
+## Corrected source pass; destination blocked before application startup
+
+The checksum correction received independent approval at the exact recorded
+hashes; 24 harness fixtures and four production crypto tests passed. The next
+fresh disposable-VM source run exited **0**, including the non-DinD lifecycle,
+real encrypted backup, downloaded payload checksum, synthetic recovery-kit
+export, exact cleanup and original-canary baseline preservation. The whole-file
+transfer digest is separate from the API's payload/tag digest; neither replaces
+destination authenticated decryption.
+
+The encrypted artifact and synthetic recovery kit were transferred privately
+to this worker's local Docker environment. The reviewed destination harness
+exited **1 before the application started**, so import, decryption, restore and
+destination-policy checks were not reached. The exact created app's Docker
+state records:
+
+```text
+unable to apply cgroup configuration: cannot enter cgroupv2
+"/sys/fs/cgroup/docker" with domain controllers -- it is in threaded mode
+```
+
+No cgroup, permission or host configuration was changed, and no retry or
+workaround followed. The exact unstarted app and owned test networks were
+removed; the empty test data volume remains. Existing local networks were
+preserved. The harness result's `restoredVolumes` field names its expected
+volumes, not successfully restored volumes. This is a source-backup pass and
+a destination-startup failure, **not encrypted cross-host restore acceptance**.
+
+- Source worker: `5127d0b8-64c8-41fa-afa9-1211c7f40a4f`.
+- Source evidence: `/home/kata-test/kata-api-lifecycle.misr_mvk`.
+- Retained source app volume: `kata-api-misr_mvk-data`.
+- Source log: `/workspace/kata-vm-instance-source-checksum.log`.
+- Source archive: `/workspace/kata-vm-instance-source-checksum-evidence.tar.gz`,
+  SHA256 `f1478c1378a2ede293c4906378f869f953a6126489c42cdfa2b6c5b73382cb82`.
+- Destination evidence: `/workspace/kata-instance-destination.nveqpded`.
+- Destination log: `/workspace/kata-instance-destination-checksum.log`.
+- Retained destination app volume: `kata-instance-destination-nveqpded-data`.
+
+Private synthetic recovery material is excluded from evidence archives and the
+repository. No second Kata boot, captured-image transfer or source-journal
+stripping was tested by this sequence. Runtime gates remain closed.
