@@ -48,11 +48,42 @@ focused tests include separate-process lock contention and injected write/sync/
 rename/acknowledgement failures. They are not physical power-cut tests.
 
 This is not an installed service or a capacity ticket. No release, reduction,
-increase or phase-transition operation exists yet. Transport authentication,
-inventory interpretation, trusted mapper/scanner, actual quota enforcement,
+increase or phase-transition operation exists yet. The isolated authenticated
+measurement transport described below now exists; inventory interpretation,
+trusted mapper/scanner, actual quota enforcement,
 maintenance fencing and migration integration remain unimplemented. The ledger
 accepts only trusted local adapter outputs; tests do not prove those adapters.
 The public migration gate remains closed.
+
+`worker-runtime-capacity-rpc.ts` and its strict RPC schema add an isolated
+TLS1.3 mutually authenticated Unix-socket measurement client/server. Construction
+requires operator-supplied CA/certificate/key material, exact peer certificate
+pins, host/service/daemon identity and a trusted local credential-generation
+policy. Both certificate validity/chain and pins are checked; resumed sessions
+are rejected. Rotation allows at most two explicitly configured pins, with
+generation rechecks rejecting revoked in-flight replies. No credential or
+socket installation, environment variable, API route or backup integration is
+included.
+
+One canonical JSON frame per connection is bounded to64KiB with strict fields,
+UTF-8 and EOF checks. Absolute20–30000ms deadlines cover handshake, framing,
+measurement and reply. Server connections are capped at32, handlers at the
+configured connection bound, and each client at8 requests. Timed-out handlers
+retain their slot until actual settlement; abort/close does not prove that work
+stopped or release a reservation. There is no retry, TCP fallback or mutation
+RPC. Socket binding never replaces an occupied endpoint or changes permissions.
+
+Authenticated success carries both measurement evidence and the complete
+accounting payload consumed by the existing ledger callback. Both ends validate
+structure and bind the demand-envelope digest to the request; this cannot prove
+that a trusted adapter measured correctly. The client returns no ticket or
+replay grant. The ledger must independently verify, recompute against all
+reservations and durably consume the nonce/sequence. Forty-nine focused tests
+exercise real local TLS/Unix sockets using temporary synthetic certificates,
+including ledger callback composition; no real host measurement or service
+installation was tested. Operator provisioning/rotation procedures, complete
+inventory/scanner/enforcement evidence and reserve/phase service RPCs remain
+unfinished. Public migration admission is unchanged.
 
 ## Existing transaction and trust boundary
 
