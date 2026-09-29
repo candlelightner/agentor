@@ -166,3 +166,40 @@ was removed and absence verified; the fresh volume
 process was unchanged, no test containers remained running, and about 13 GiB
 was free afterward. No validation flag, additional grant, inner daemon, or
 production/outer-host change was made.
+
+### Guest-only DinD attempt: stopped at cgroup mount
+
+The operator subsequently approved a bounded guest-only DinD experiment with
+the same permissions, fresh backing storage and private guest cgroups. The
+independently reviewed harness used a new 512 MiB file on a new labeled volume,
+guest loop0/ext4 and a private mount namespace. It retained the SYS_ADMIN-only
+capability addition, SYS_MODULE drop, no-new-privileges, network `none`, no
+device mappings/rules, no host namespaces, and no bind or socket mounts.
+
+The ext4 setup completed, but mounting cgroup2 over the existing guest
+`/sys/fs/cgroup` failed with exit 32:
+
+```text
+mount: /sys/fs/cgroup: none already mounted on /.
+```
+
+The sequence stopped before starting containerd or dockerd. Thus no inner image
+import, nested container or nested-volume write ran. This is a failed canonical
+cgroup-mount attempt, not proof that a fresh mount at another path would fail
+(the earlier empty-child prerequisite used a different mount location). Its
+kernel cause has not been established. No permissions were added, no fallback
+was attempted, and `KATA_DIND_NOT_VALIDATED` remains in force.
+
+Exact outer container
+`4afb39236524015086c2f81fbcfb4813c51370ba452bab3f7a0746d7d76f8174`
+was removed; subsequent inspection confirmed absence. Volume
+`kata-guest-dind-Anfzi8zB-data` and the backing file remain. VM Docker PID 28754
+and daemon configuration checksum were unchanged; no test container remained
+running after this attempt.
+
+Evidence: VM `/home/kata-test/kata-guest-dind.Anfzi8zB`; local log
+`/workspace/kata-vm-guest-dind.log`; archive
+`/workspace/kata-vm-guest-dind-evidence.tar.gz`, SHA-256
+`7c06ab2dabd140cde698239d80daf9cfc163716ff9ea969f6c4c9d988e8df4d2`.
+Executed harness SHA-256:
+`d9c0296dbfa2ac209d9d641659a3453a88782bc7659ccc9b7355c8929d58eafb`.
