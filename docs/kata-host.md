@@ -272,7 +272,7 @@ Public migration currently rejects with
 `WORKER_RUNTIME_MIGRATION_CAPACITY_UNVERIFIED` before journal or Docker access;
 preflight and existing-journal recovery/finalization remain available.
 
-The proposed next step is a narrowly scoped, operator-installed capacity broker
+The operator approved designing for a narrowly scoped, operator-installed capacity broker
 with authenticated, operation-bound filesystem measurements and durable
 per-filesystem byte/inode reservations, followed by a fresh stopped-source
 recheck. Broker trust/key deployment and a maintenance lease or equivalent
@@ -281,7 +281,9 @@ authenticates evidence but cannot stop another worker or host process consuming
 space. Protected recovery capacity must survive uncertain outcomes; neither
 restarts nor expired evidence may silently release it. No production collector,
 new host mount, global worker stop, or filesystem quota policy is authorized by
-this design proposal. Source-host reservations must never become destination
+this design proposal. The [reviewed capacity contract](kata-migration-capacity-design.md)
+records these requirements; service installation and worker shutdown remain
+separate operator actions. Source-host reservations must never become destination
 authority through backup restore.
 
 ## Sources and pin
