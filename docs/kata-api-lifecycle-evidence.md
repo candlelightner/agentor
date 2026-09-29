@@ -335,6 +335,13 @@ preserved. The harness result's `restoredVolumes` field names its expected
 volumes, not successfully restored volumes. This is a source-backup pass and
 a destination-startup failure, **not encrypted cross-host restore acceptance**.
 
+A later read-only check within this worker found its cgroup namespace root is
+`domain threaded`, `/sys/fs/cgroup/docker` is `threaded`, and that child exposes
+`cpuset cpu pids` controllers, while the local Docker daemon uses cgroupfs/v2.
+This is consistent with the reported domain-controller startup rejection. It
+does not establish why the worker's cgroup topology was configured this way,
+nor authorize removing test limits, changing cgroups or accessing the outer host.
+
 - Source worker: `5127d0b8-64c8-41fa-afa9-1211c7f40a4f`.
 - Source evidence: `/home/kata-test/kata-api-lifecycle.misr_mvk`.
 - Retained source app volume: `kata-api-misr_mvk-data`.

@@ -391,3 +391,41 @@ inspection matched its saved baseline; approximately 9.9GiB remained free.
 
 DinD and deployment acceptance remain incomplete; the application gate stays
 closed.
+
+### Revised identity handoff: trace reached the nested-start denial
+
+The independently reviewed handoff revision ran once with unchanged grants,
+fresh 512 MiB guest loop/ext4 storage and private guest cgroups. All 44 offline
+fixtures passed before execution. Both daemon identities were verified; private
+containerd and dockerd booted, and image import, inner-volume creation and
+nested-container creation completed. The single nested start again failed with
+`error during container init: operation not permitted`; the marker did not run.
+The harness exited 1 and stopped, with no retry or permission change.
+
+Both daemon supervisors completed their bounded drain with return code 0,
+and their identity reports record successful handoffs. The failed-syscall trace
+contains 89,105 bytes; it shows runc init exiting 255 but does **not** show an
+EPERM syscall in that init process. Other EPERM entries are `epoll_ctl` calls
+in daemon/runtime processes; they do not identify the cause of the init failure.
+The trace therefore establishes that the repaired harness reached the failure,
+not its cause. Tracing can perturb behavior, and userspace-generated errors or
+successful calls returning an error payload are outside this failed-syscall view.
+
+Exact outer container
+`45bc922ea732f7a03347ba8c5ee893db2d024b3e99a1565589ace20bb180319d`
+was removed and its absence verified. Fresh volume
+`kata-guest-dind-trace-SFpvpvkN-data` remains. The original stopped canary's
+complete inspection is unchanged after sorting its Mounts array (Docker returned
+the same mounts in a different order). VM Docker PID28754 and daemon-config
+checksum are unchanged; 10,083,057,664 bytes remained free. No test is running.
+
+- Harness SHA256: `56df363a9a7ceea9a684e1a99c8a8cfe8a0d2e6a2da19122fbfc302c222aa69f`.
+- Supervisor SHA256: `71054875113d060ee11cbcf78c7f74ea05e3fb7e9439920e9257589f2271a1c3`.
+- VM evidence: `/home/kata-test/kata-guest-dind-trace.SFpvpvkN`.
+- Log: `/workspace/kata-vm-guest-dind-trace-handshake.log`.
+- Archive: `/workspace/kata-vm-guest-dind-trace-handshake-evidence.tar.gz`, SHA256
+  `e771fdf411aa142fa09d14aacd3296d6d7b6e1e852e4ee9ef1fa3ef3232ec0cd`.
+
+DinD persistence/recovery and deployment acceptance remain unproved. The gate
+stays closed; any further live experiment needs separate review within the
+operator's existing same-permissions diagnostic authority.
