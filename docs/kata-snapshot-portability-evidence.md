@@ -44,6 +44,34 @@ the test-owned tag and verified exact container cleanup. This exercises the
 resolver, not ContainerManager or the new DockerService creation branch.
 The other archive fixtures use an orchestrator image, not migrated workers.
 
+## Real DockerService creation boundary
+
+A separate, independently reviewed worker-local harness passed three tests
+against the actual `DockerService.createWorkerContainer()` implementation:
+
+- Creation with `expectedImageId` used the immutable synthetic snapshot ID;
+  the method's real pre-start Docker inspection succeeded and the resulting
+  container's `Image` and `Config.Image` matched that ID.
+- A missing immutable ID returned 404 without creating a container.
+- An image/expected-ID mismatch was rejected before container creation.
+
+This used nonprivileged `legacy-runc`, non-DinD, network `none`, `start:false`,
+and two fresh labeled named volumes. A fixture supplied only the volume bindings;
+Docker operations were real, not mocked. The container remained in `created`
+state and was never started. Exact identity checks preceded cleanup; the test
+container and both volumes were removed and their absence verified. Snapshot
+images/tags and runtime gates were unchanged. This closes only the real
+DockerService creation-boundary check, not Kata execution, manager lifecycle,
+migration, or encrypted instance restore.
+
+Harness: `/workspace/kata-image-proof-live/docker-service-proof.spec.ts`,
+SHA-256 `f7467d1946cd41325ca1806555f259aa4e265674a20c5a9be3fe242e6fdd0923`.
+Config: `/workspace/kata-image-proof-live/docker-service-proof.config.ts`,
+SHA-256 `71c791ae936876aa875840310afa889653b7928426e4ec46215bbbfad01d7651`.
+Results: `/workspace/kata-image-proof-live/docker-service-proof-results.log`.
+Run from `tests/` with
+`npx playwright test --config=/workspace/kata-image-proof-live/docker-service-proof.config.ts`.
+
 ## Evidence and limitations
 
 - Source VM: `/home/kata-test/kata-portable-snapshot.BRMpjsu0`.

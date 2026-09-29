@@ -126,3 +126,43 @@ Combined synthetic-snapshot and tmpfs evidence is retained locally at
 `/workspace/kata-vm-snapshot-tmpfs-evidence.tar.gz`, SHA-256
 `5431a09f8015c48ed35a5fe26666f2960a8bda4b4924adf11787229adb327ca1`.
 No inner Docker daemon or additional device/cgroup grant was introduced.
+
+### Guest-only loop/ext4 storage diagnostic
+
+A third reviewed, fresh Kata probe in the disposable VM tested only whether a
+loop-backed ext4 filesystem inside the guest could support a tiny overlay
+copy-up. It used a new labeled container and named volume, `SYS_ADMIN` as the
+only added capability, `SYS_MODULE` dropped, no-new-privileges, a private mount
+namespace, and network none. Docker inspection recorded `Privileged=false`, no
+device passthrough or device-cgroup rules, and no bind, socket, or host namespace
+mounts. The sole mount was its new named volume at `/var/lib/docker`.
+
+Inside the Kata guest, the probe wrote a fully allocated 64 MiB regular backing
+file in that volume and formatted **the file**, not a VM-host block device. It
+created `/dev/loop0` only in the verified guest `/dev` tmpfs after checking the
+guest loop devices were unbound. It attached that exact file to the guest loop
+device, mounted ext4 in a private guest mount namespace, and passed a tiny
+overlay mount and copy-up. The guest command exited 0; the result explicitly
+reports `dindValidated=false`. `mkfs.ext4` warned that its long filesystem label
+was truncated to `agentor-loop-pro`; this was not an operation failure.
+
+The probe did **not** start an inner Docker daemon, demonstrate durable
+stop/recreate or host-restart retention, test resource accounting or capacity
+exhaustion, recover an interrupted filesystem initialization, or test cross-host
+restore. It does not select or approve loop-backed ext4 for workers and does not
+clear the Kata DinD gate. The earlier virtiofs-overlay failure and tmpfs-overlay
+success remain separate observations; this result narrows only the guest-loop
+storage prerequisite.
+
+Evidence: VM `/home/kata-test/kata-guest-loop.sw4ufNH0`, local log
+`/workspace/kata-vm-guest-loop.log`, and local archive
+`/workspace/kata-vm-guest-loop-evidence.tar.gz` (SHA-256
+`b0a720ba576b75a21221ba5261b49da4ea5b65ea72ade2e0e34bf52adcb48e93`).
+The reviewed harness SHA-256 was
+`5527d1eb7a465e8392dfc07ce6d05f0531eb6be004d07c3b4512d608c316ecda`.
+Exact container `b9e142d6894648f6732a69db3c380ad1b16aea28c77e8e0821327f7124e73676`
+was removed and absence verified; the fresh volume
+`kata-guest-loop-sw4ufNH0-data` was retained for evidence. The VM's main Docker
+process was unchanged, no test containers remained running, and about 13 GiB
+was free afterward. No validation flag, additional grant, inner daemon, or
+production/outer-host change was made.
