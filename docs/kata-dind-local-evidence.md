@@ -62,3 +62,42 @@ in this runc environment. It says nothing about Kata's virtiofs/block-device
 path. No loop-backed ext4 design was selected or tested. Successful nested
 build/run/volume/restart/recreate, failures and recovery, cross-host restore,
 and Kata physical-host canary evidence remain outstanding.
+
+## Disposable Kata guest prerequisite probe, 2026-09-29
+
+The separately approved VM ran a fresh Kata container from the existing standard
+worker image, with its entrypoint replaced by `sleep`. No inner Docker daemon
+was started. It added only `SYS_ADMIN`, explicitly dropped `SYS_MODULE`, kept
+`Privileged=false`, and set no-new-privileges. It used no network, host namespace,
+device mapping, device-cgroup grant, bind mount or socket; a fresh named volume
+was mounted at `/var/lib/docker`. The guest remained on kernel `6.18.35`.
+
+Inside a new guest mount namespace with private propagation, a fresh cgroup2
+mount accepted creation/removal of one empty test child. The available controller
+list was `cpuset cpu io memory hugetlb pids rdma`; subtree control was empty. No
+controllers were enabled and no processes were moved. This demonstrates a
+guest-private writable cgroup child, **not** resource delegation or working DinD.
+
+An independent tiny overlay mount/copy-up probe on the named volume failed at
+`mount` with exit 32; copy-up was not reached. The mount command returned the
+generic “wrong fs type, bad option, bad superblock” diagnostic. Guest mountinfo
+records virtiofs sharing (`stat -f` reports the generic `fuseblk` name). This is
+a failure of this tested storage/permission combination, not proof of a specific
+kernel cause. No alternate driver, loop device, formatting, seccomp change,
+extra capability or runtime fallback was attempted.
+
+Evidence: VM `/home/kata-test/kata-guest-prerequisites.LmNsQjBt`, local log
+`/workspace/kata-vm-guest-prerequisites-2.log`. The exact container
+`09ebcb9ef238ec1a233c8c4770f29b97a502fcf4d8e3df4d74692e2118cb2a00`
+was removed; its named volume `kata-guest-prerequisites-LmNsQjBt-data` remains.
+The initial harness attempt rejected Docker29's `CAP_SYS_ADMIN` spelling before
+start; accepting the canonical prefix did not change the requested capability.
+Its exact unstarted container was also removed, with evidence/data retained.
+
+The reviewed outside-repository probe's SHA-256 was
+`709ca4218a2230be8cc435c044ddd3161e1b4a68ca24f6e010e68aa0f84403a3`.
+Both attempts are archived at
+`/workspace/kata-vm-guest-prerequisites-evidence.tar.gz`, SHA-256
+`fa32e9807091d1145c7978f836d13f0236315f444f98ece3ed36da6320d54363`.
+Kata DinD remains blocked; pull/build/run/volumes/restart/recreation and recovery
+have not been established by these prerequisites.

@@ -110,8 +110,8 @@ The following are no-server module suites selected by `tests/playwright.modules.
 
 `bash tests/kata-host-fixtures.sh` runs only offline configuration, archive-safety, installer no-op/restart, and cleanup fixtures, including `tests/kata-archive-fixtures.py`. It never installs Kata or accesses host Docker. `scripts/probe-worker-local-dind.sh` is a separate opt-in worker-local experiment; its partial result is documented in [kata-dind-local-evidence.md](kata-dind-local-evidence.md). The test inventory and reproducible commands are in [tests/TESTS.md](../tests/TESTS.md).
 
-The latest local module run passed 345 tests in 32 files; discovery lists 2254
-tests in 221 files (1616 API, 638 UI). The latter is not a whole-suite pass.
+The latest local module run passed 366 tests in 33 files; discovery lists 2275
+tests in 222 files (1637 API, 638 UI). The latter is not a whole-suite pass.
 Offline smoke coverage has 21 scenarios; the standalone worker harness has 11
 fake-Docker cases. These checks cannot establish VM isolation or API/UI acceptance.
 
@@ -123,7 +123,7 @@ The following end-to-end checks remain required; their appearance here is not a 
 - Settle the operator capacity-broker trust/deployment and maintenance-lease model before enabling admission. Proposed authenticated filesystem evidence, bounded source sizing, global durable reservations and stopped-source rechecks must cover recovery bytes/inodes and reject replay/layout changes. Signing alone does not constrain unrelated writers; no production broker, broad host mounts, automatic global worker downtime, or quota policy is implicitly authorized. Source-host capacity grants must not survive as destination authority in backups.
 - Complete a disposable API/UI stack run, including regular-owner fixture provisioning on a runc-only CI daemon without giving ordinary users runtime authority. Six focused import/backup runtime-control UI cases passed with mocked operation routes and recovery-mode startup; real backend/worker round-trips and the full API/UI suite remain unverified.
 - Exercise the documented separate encrypted snapshot-image transfer on the destination host. Instance manifests now record exact snapshot image identities and destination preflight blocks missing/mismatched images; layers are not embedded in instance backups.
-- Resolve legitimate classic/config-ID versus containerd/manifest-ID changes across Docker save/load. The existing exact-ID restore check fails closed but rejects such valid transfers; portable cryptographic configuration identity, legacy manifest handling and real cross-store tests remain required. Never relax this to matching tags or layers alone.
+- Portable cryptographic image-config identity now handles classic/config-ID versus containerd/manifest-ID changes in snapshot inventory and restore preflight, with legacy manifest compatibility and bounded cancellable export verification. Real archive and worker-local Docker API checks pass. Persist/revalidate that expected identity through the final restored-worker create and use the immutable destination ID; mutable tags after preflight remain unresolved. Full instance cross-store restore acceptance is still required.
 
 - `tests/api/containers.spec.ts`: new-worker default profile, explicit admin-only legacy profile, Kata runtime options, no `Privileged` fallback when alias is missing or Kata start fails.
 - `tests/api/worker-settings.spec.ts` and `tests/api/environments.spec.ts`: changing an environment does not rewrite existing workers' runtime profile; ordinary environment edits cannot grant legacy runtime.

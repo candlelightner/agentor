@@ -146,8 +146,31 @@ test.describe("instance disaster-recovery bundle boundary", () => {
     const image = { workerId: 'worker-1', reference: 'agentor-import-worker-1:runtime-operation-1', imageId: `sha256:${'b'.repeat(64)}` };
     manifest.images.capturedWorkerImages = [image];
     expect(validateInstanceManifest(manifest).images.capturedWorkerImages).toEqual([image]);
-    for (const bad of [{ ...image, workerId: 'worker-2' }, { ...image, reference: '/host/path' }, { ...image, imageId: 'mutable-tag' }]) {
+    for (const bad of [{ ...image, workerId: 'worker-2' }, { ...image, reference: '/host/path' }, { ...image, imageId: 'mutable-tag' }, { ...image, imageId: [image.imageId] }]) {
       manifest.images.capturedWorkerImages = [bad];
+      expect(() => validateInstanceManifest(manifest)).toThrow();
+    }
+    const portableIdentity = {
+      version: 1 as const,
+      configDigest: `sha256:${'c'.repeat(64)}`,
+      platform: { os: 'linux', architecture: 'amd64' },
+    };
+    manifest.images.capturedWorkerImages = [{ ...image, portableIdentity }];
+    expect(validateInstanceManifest(manifest).images.capturedWorkerImages).toEqual([{ ...image, portableIdentity }]);
+    manifest.images.capturedWorkerImages = [{ ...image, portableIdentity }, { ...image, portableIdentity }];
+    expect(() => validateInstanceManifest(manifest)).toThrow();
+    for (const bad of [
+      { ...portableIdentity, version: 2 },
+      { ...portableIdentity, configDigest: 'mutable-tag' },
+      { ...portableIdentity, configDigest: [portableIdentity.configDigest] },
+      { ...portableIdentity, platform: { os: 'linux', architecture: '' } },
+      { ...portableIdentity, platform: { os: 'linux', architecture: 'amd64', variant: '../../x' } },
+      { ...portableIdentity, platform: { os: 'linux', architecture: 'amd64', unknown: true } },
+      null,
+      [],
+      { ...portableIdentity, unknown: true },
+    ]) {
+      manifest.images.capturedWorkerImages = [{ ...image, portableIdentity: bad as any }];
       expect(() => validateInstanceManifest(manifest)).toThrow();
     }
   });

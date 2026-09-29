@@ -463,6 +463,41 @@ test("the control-plane snapshot write barrier is exclusive and releases idempot
   expect(instanceSnapshotActive()).toBe(false);
 });
 
+test('cancelling image inventory releases the instance snapshot barrier before publishing an artifact', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agentor-instance-inventory-cancel-'));
+  const provider = new FakeBackupProvider(join(root, 'provider'));
+  let entered!: () => void;
+  const inventoryStarted = new Promise<void>((resolve) => { entered = resolve; });
+  const manager = new InstanceBackupManager({
+    dataDir: join(root, 'data'),
+    backupManager: { instanceBackupProvider: () => provider } as unknown as BackupManager,
+    preflightCreate: async () => {},
+    authSnapshot: async (destination) => writeFile(destination, 'sqlite snapshot'),
+    inventory: async (_userId, signal) => {
+      expect(instanceSnapshotActive()).toBe(true);
+      entered();
+      await new Promise<void>((_resolve, reject) => {
+        if (!signal) { reject(new Error('Inventory did not receive cancellation')); return; }
+        if (signal.aborted) { reject(Object.assign(new Error('cancelled'), { name: 'AbortError' })); return; }
+        signal.addEventListener('abort', () => reject(Object.assign(new Error('cancelled'), { name: 'AbortError' })), { once: true });
+      });
+      return inventory();
+    },
+  });
+  try {
+    const job = await manager.create('platform-admin', 'fake', { includeDockerVolumes: false }, 'cancel-inventory');
+    await inventoryStarted;
+    expect(instanceSnapshotActive()).toBe(true);
+    await manager.cancel(job.id);
+    await expect(settled(manager, job.id)).resolves.toMatchObject({ status: 'cancelled' });
+    expect(instanceSnapshotActive()).toBe(false);
+    expect((await manager.list('platform-admin')).artifacts).toHaveLength(0);
+  } finally {
+    manager.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("restore acceptance holds the mutation barrier until cancellation has unwound", async () => {
   const root = await mkdtemp(join(tmpdir(), "agentor-instance-restore-barrier-"));
   const store = new InstanceBackupStore(root);

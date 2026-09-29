@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **2254 tests** across 221 test files (1616 API across 156 files + 638 UI across 65 files), enumerated with Playwright `--list` on 2026-09-28. Discovery counts are an inventory, not a passing test result. The separate module configuration selects 345 tests across 32 files; the latest local module run passed all 345.
+- **2275 tests** across 222 test files (1637 API across 157 files + 638 UI across 65 files), enumerated with Playwright `--list` on 2026-09-29. Discovery counts are an inventory, not a passing test result. The separate module configuration selects 366 tests across 33 files; the latest local module run passed all 366.
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -44,9 +44,16 @@ Six focused runtime-control cases from `import-worker-modal.spec.ts` and
 recovery-mode stack. Operations/session-role presentation were mocked; this is
 not backend runtime-authorization or worker import/restore acceptance.
 
-`worker-runtime-snapshot.spec.ts` adds 4 no-server cases for snapshot configuration,
-runtime-only environment clearing, exact image dependency inventory, and
-destination missing/mismatched image rejection. `scripts/test-worker-local-runtime-snapshot.sh`
+`worker-runtime-snapshot.spec.ts` adds 9 no-server cases for snapshot configuration,
+runtime-only environment clearing, portable image dependency inventory,
+destination identity/platform/tag rejection, legacy compatibility and cancellation.
+`worker-runtime-image-proof.spec.ts` adds 15 cases for bounded classic/OCI archive
+verification, gzip layer digests, graph/platform binding, malformed input and
+stream cancellation. Its captured real-archive case skips when the external
+fixtures are absent; those fixtures were available for the reported local run.
+Separate real archive and worker-local Docker API checks passed 5 cases, not a
+full instance restore. Final-use immutable pinning remains required.
+`scripts/test-worker-local-runtime-snapshot.sh`
 separately checks real unprivileged Docker snapshot/save/load semantics and
 runtime-Env clearing in the worker-local daemon; it is not Kata acceptance.
 
@@ -190,18 +197,19 @@ tests/
     worker-lifecycle.ts    # Container create/cleanup utilities
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
-    api/                     # API endpoint tests (1516 tests across 150 files)
-  ui/                      # UI interaction tests (631 tests across 65 files)
+  api/                     # API endpoint/module tests (1637 tests across 157 files)
+  ui/                      # UI interaction tests (638 tests across 65 files)
 ```
 
 ## Test Categories
 
-### API Tests (1558 tests, 155 files; discovery snapshot 2026-09-28)
+### API Tests (1637 tests, 157 files; discovery snapshot 2026-09-29)
 
 | File | Tests | Coverage |
 | --- | ---: | --- |
 | `worker-runtime-policy.spec.ts` | 7 | No-server runtime selection, explicit legacy privilege, operator attestation/alias requirements, Kata DinD/device rejection before Docker mutation, and observed/durable runtime mismatch rejection. |
-| `worker-runtime-snapshot.spec.ts` | 4 | Captured image configuration, runtime-only Env clearing, exact snapshot dependencies, and destination identity checks. |
+| `worker-runtime-snapshot.spec.ts` | 9 | Captured image configuration, runtime-only Env clearing, portable snapshot dependencies, cross-store/legacy identity checks, mutable-tag rejection and export cancellation. |
+| `worker-runtime-image-proof.spec.ts` | 15 | Bounded classic/OCI image proof, config and layer digests, gzip diff IDs, index/platform binding, malformed archives, cancellation and optional captured real archives. |
 | `worker-runtime-admin.spec.ts` | 7 | No-server live platform authority and acknowledgement, ephemeral per-import restore callbacks, old-archive privilege grants, restored-Kata readiness/approval, snapshot fences, revocation while queued, and public capacity rejection before journal/Docker access. |
 | `worker-runtime-backup.spec.ts` | 2 | No-server durable legacy retry guard rejects before mutation/queueing; original-worker runtime selection and revoked restore authority reject admission. Job metadata never grants privilege. |
 | `worker-runtime-migration.spec.ts` | 52 | Fake-Docker rootfs/worker-volume snapshots, unchanged shared binds, validation-before-commit, failure rollback/recovery, strict inspected structured/historical DinD settings and malformed/override rejection before mutation, restore holds, source/access-mode mismatches, ambiguous Docker outcomes, finalization, and corrupt-owner quarantine. |
@@ -307,7 +315,7 @@ tests/
 | `instance-backup-bundle.spec.ts` | 5 | Consistent SQLite snapshot substitution; recursive/staging/log/local-backup exclusions without losing plugin stores; manifest/data/volume digest round trip; and hardened rejection of traversal, absolute/escaping symlinks, reserved paths, special/duplicate entries, non-directory ancestors, missing `auth.db`, mismatched payloads, and unsafe host/image manifest claims. |
 | `instance-backup-provider-store.spec.ts` | 4 | Local/fake/Google worker-vs-instance provider selector separation, same-account fake discovery, Google instance filename/app-property/query contract without credentials, concurrent atomic durable-store updates/reload, idempotent remote adoption preservation, caller-clone isolation, and symlink/invalid-state fail-closed loading. |
 | `instance-backup-http.spec.ts` | 3 | Shared whole-instance REST helpers: conflicting header/body idempotency identities, persisted status/log next actions with cancellation omitted after helper handoff, status payload log omission, and strict bounded incremental log cursors. Runs through `playwright.modules.config.ts`. |
-| `instance-backup-manager.spec.ts` | 6 | Two independent installations create, discover, transition from missing-key to ready, authenticate/adopt, and deduplicate the same encrypted fake-provider instance snapshot while retaining plugin/image/host-mount inventory; covers prompt start, request-identity conflicts, cross-owner denial, prompt/repeated cancellation, exclusive/idempotent snapshot and restore-barrier ownership/release, exact worker/agent-data Docker-volume option filtering, and plaintext restore-staging cleanup on failure/cancel while the encrypted artifact remains. |
+| `instance-backup-manager.spec.ts` | 7 | Two independent installations create, discover, transition from missing-key to ready, authenticate/adopt, and deduplicate the same encrypted fake-provider instance snapshot while retaining plugin/image/host-mount inventory; covers prompt start, request-identity conflicts, cross-owner denial, prompt/repeated cancellation (including image inventory), exclusive/idempotent snapshot and restore-barrier ownership/release, exact worker/agent-data Docker-volume option filtering, and plaintext restore-staging cleanup on failure/cancel while the encrypted artifact remains. |
 | `instance-restore-helper.spec.ts` | 11 | Network-disabled restore-helper boundary: launch/staging confinement, traversal/symlink rejection, omission of host-mount policies and source runtime-migration journals, removal of imported privilege grants, runtime approval holds including old profile-less workers, malformed-store rejection before shutdown, verified data swap/owner transfer/restart, post-stop emptiness recheck, constrained volume extraction, and data/ownership rollback on failure. Runs through the no-server modules config. |
 | `instance-backups-api.spec.ts` | 3 | Live platform-admin whole-instance REST boundary: anonymous/regular-user denial, prompt provider-discovery admission, stable header/body request identity, concrete status/log/cancel actions, idempotent retry, terminal status polling, bounded logs, and invalid-cursor rejection. |
 | `backup-restore-safety.spec.ts`   | 34 | Restore and worker lifecycle safety: per-worker and owner→worker serialization (including provisional imports), prompt Docker timeouts whose worker fence remains held until the aborted request settles without blocking sibling workers, atomic missing-runtime reconciliation, durable backward-compatible desired state, idempotent stop/archive/rebuild retries, persistence-first managed recovery, explicit reverse-order partial-rollback reporting, reference-safe imported-environment cleanup, transactional worker-configuration deletion, strict production volume/image cleanup adapters, retryable aggregate permanent-deletion cleanup, preserved failed-rootfs recovery tags, deleted-owner worker cleanup, restore draining, and a bounded fail-closed deadline for non-cooperative restore work. |

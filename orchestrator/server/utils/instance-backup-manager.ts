@@ -84,8 +84,8 @@ export interface InstanceBackupManagerOptions {
   store?: InstanceBackupStore;
   backupManager?: BackupManager;
   authSnapshot?: (destination: string) => Promise<void>;
-  preflightCreate?: () => Promise<void>;
-  inventory?: (userId: string) => Promise<{
+  preflightCreate?: (signal?: AbortSignal) => Promise<void>;
+  inventory?: (userId: string, signal?: AbortSignal) => Promise<{
     volumes: VolumeCandidate[];
     plugins: InstanceBackupManifest["plugins"];
     hostMounts: InstanceBackupManifest["hostMounts"];
@@ -102,7 +102,7 @@ export class InstanceBackupManager {
   private readonly store: InstanceBackupStore;
   private readonly backupManager: BackupManager;
   private readonly authSnapshot: (destination: string) => Promise<void>;
-  private readonly preflightCreate: () => Promise<void>;
+  private readonly preflightCreate: (signal?: AbortSignal) => Promise<void>;
   private readonly inventoryOverride?: InstanceBackupManagerOptions["inventory"];
   private initialized?: Promise<void>;
   private accepting = true;
@@ -379,7 +379,9 @@ export class InstanceBackupManager {
     userId: string,
     artifactId: string,
     options?: Partial<InstanceRestoreOptions>,
+    signal?: AbortSignal,
   ): Promise<InstanceRestorePreflight> {
+    signal?.throwIfAborted();
     await this.init();
     const artifact = this.store.getArtifact(artifactId);
     if (!artifact || artifact.userId !== userId || !artifact.manifest)
@@ -432,6 +434,7 @@ export class InstanceBackupManager {
             }),
             INSTANCE_DOCKER_READ_TIMEOUT_MS,
             "Docker instance-restore volume inventory",
+            signal,
           )
         ).Volumes ?? [])
           .map((volume) => volume.Name)
@@ -458,9 +461,9 @@ export class InstanceBackupManager {
       );
     const capturedImages = manifest.images.capturedWorkerImages ?? [];
     if (capturedImages.length) {
-      warnings.push('Runtime-migrated workers require their exact local snapshot images. Transfer encrypted docker-save archives separately and docker-load them on this destination; rebuilding the base image loses writable rootfs changes.');
-      const missing = await missingCapturedWorkerImages(this.docker, capturedImages);
-      if (missing.length) blockers.push(`Load the exact captured runtime snapshot images before restore: ${missing.join(', ')}`);
+      warnings.push('Runtime-migrated workers require their captured local snapshot images. Transfer protected docker-save archives separately and docker-load them on this destination; rebuilding the base image loses writable rootfs changes.');
+      const missing = await missingCapturedWorkerImages(this.docker, capturedImages, signal);
+      if (missing.length) blockers.push(`Load matching captured runtime snapshot images before restore: ${missing.join(', ')}`);
     }
     warnings.push(
       "External .env values, GitHub App PEM files, DNS credentials, registry credentials, and host-mounted file contents are not embedded and must be supplied separately.",
@@ -625,15 +628,16 @@ export class InstanceBackupManager {
     try {
       await this.running(job, "preflight", "Checking whether the installation is quiescent enough to snapshot.");
       releaseSnapshot = beginInstanceSnapshot(job.id);
-      await this.preflightCreate();
+      await this.preflightCreate(signal);
       signal.throwIfAborted();
       await mkdir(stage, { recursive: true, mode: 0o700 });
       await this.phase(job, "database-snapshot", 10, "Pausing control-plane mutations and creating a consistent SQLite online-backup snapshot.");
       await this.authSnapshot(authSnapshot);
       signal.throwIfAborted();
       inventory = this.inventoryOverride
-        ? await this.inventoryOverride(job.userId)
-        : await this.inventory(job.userId);
+        ? await this.inventoryOverride(job.userId, signal)
+        : await this.inventory(job.userId, signal);
+      signal.throwIfAborted();
       await this.phase(job, "data-snapshot", 20, "Archiving the versioned control-plane stores under the snapshot write barrier.");
       data = await createInstanceDataArchive({
         dataDir: this.dataDir,
@@ -1134,7 +1138,7 @@ export class InstanceBackupManager {
         inspected.manifest.sourceInstallationId !== artifact.sourceInstallationId
       )
         throw new Error("Retained instance artifact identity does not match its manifest");
-      const preflight = await this.restorePreflight(job.userId, artifact.id, options);
+      const preflight = await this.restorePreflight(job.userId, artifact.id, options, signal);
       if (!preflight.ready)
         throw Object.assign(new Error(preflight.blockers.join(" ")), {
           code: "INSTANCE_RESTORE_PREFLIGHT_FAILED",
@@ -1169,6 +1173,18 @@ export class InstanceBackupManager {
         70,
         "Validated restore staged. Starting the controlled helper that will stop the orchestrator, apply the snapshot, and restart it.",
       );
+      // A loaded tag may change after the earlier interactive preflight. Check
+      // again immediately before handing the restore to the stopped-process
+      // helper, while the queued job still observes cancellation.
+      const captured = inspected.manifest.images.capturedWorkerImages ?? [];
+      if (captured.length) {
+        const missing = await missingCapturedWorkerImages(this.docker, captured, signal);
+        if (missing.length)
+          throw Object.assign(new Error(`Captured runtime snapshot images changed before restore: ${missing.join(', ')}`), {
+            code: 'INSTANCE_RESTORE_PREFLIGHT_FAILED', statusCode: 409,
+          });
+      }
+      signal.throwIfAborted();
       await this.launchRestoreHelper(job, stage, signal, async () => {
         helperOwnsStage = true;
         await this.phase(
@@ -1294,7 +1310,8 @@ export class InstanceBackupManager {
       });
   }
 
-  private async inventory(userId: string) {
+  private async inventory(userId: string, signal?: AbortSignal) {
+    signal?.throwIfAborted();
     const [services, adminStoreModule, imageModule] = await Promise.all([
       import("./services"),
       import("./admin-workspace-store"),
@@ -1334,6 +1351,7 @@ export class InstanceBackupManager {
       }),
       INSTANCE_DOCKER_READ_TIMEOUT_MS,
       "Docker persistent backup-volume inventory",
+      signal,
     );
     for (const volume of persistent.Volumes ?? [])
       if (volume.Name)
@@ -1347,11 +1365,13 @@ export class InstanceBackupManager {
     const managedVolumes = useManagedVolumeManager();
     await managedVolumes.init();
     for (const volume of managedVolumes.store.list()) {
+      signal?.throwIfAborted();
       if (!await managedVolumes.runtime.inspectVolume(volume)) continue;
       add({ name: volume.dockerName, kind: "persistent-path", ownerId: volume.userId, workerId: volume.workerId });
     }
     for (const candidate of candidates.values())
-      if (await this.volumeExists(candidate.name)) volumes.push(candidate);
+      if (await this.volumeExists(candidate.name, signal)) volumes.push(candidate);
+    signal?.throwIfAborted();
     const definitions = services.usePluginDefinitionStore().list();
     const installations = services.usePluginInstallationStore().list();
     const catalog = imageModule.useImageCatalogManager();
@@ -1380,7 +1400,7 @@ export class InstanceBackupManager {
       images: {
         definitions: images.length,
         immutableDigests,
-        capturedWorkerImages: await capturedWorkerImageInventory(this.docker, services.useWorkerStore().list()),
+        capturedWorkerImages: await capturedWorkerImageInventory(this.docker, services.useWorkerStore().list(), signal),
         layersIncluded: false as const,
       },
       storage: {
@@ -1525,7 +1545,7 @@ export class InstanceBackupManager {
     }
   }
 
-  private async volumeExists(name: string) {
+  private async volumeExists(name: string, signal?: AbortSignal) {
     try {
       await withOperationDeadline(
         (operationSignal) => this.docker.getVolume(name).inspect({
@@ -1533,6 +1553,7 @@ export class InstanceBackupManager {
         }),
         INSTANCE_DOCKER_READ_TIMEOUT_MS,
         "Docker instance-snapshot volume inspection",
+        signal,
       );
       return true;
     } catch (error: any) {

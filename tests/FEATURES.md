@@ -64,6 +64,13 @@ Every user-facing feature of the Agentor web dashboard, organized by category. T
 - Migration derives DinD from the source container's structured environment,
   not mutable environment settings or an assumed exported shell variable.
   Ambiguous/malformed/conflicting source settings reject before mutation.
+- Instance snapshot-image preflight records/verifies a versioned raw-config
+  digest and platform across classic/config-ID and containerd/manifest-ID stores.
+  Immutable-ID exports are bounded and cancellable, validate descriptors and
+  streamed layers, and never extract or persist raw configuration. Tags changed
+  during proof reject. Legacy equal IDs and provable classic config IDs remain
+  compatible; unsupported equivalence and contradictory proofs fail closed.
+  This does not yet pin the final image used when a restored worker is created.
 - Coverage: `worker-runtime-policy.spec.ts`, `worker-runtime-admin.spec.ts`,
   `worker-runtime-backup.spec.ts`, `worker-runtime-migration.spec.ts`,
   `kata-managed-volume-runtime.spec.ts`, and runtime additions in the inventory,

@@ -30,6 +30,7 @@ export default defineConfig({
     "api/backup-restore-safety.spec.ts",
     "api/worker-runtime-migration.spec.ts",
     "api/worker-runtime-snapshot.spec.ts",
+    "api/worker-runtime-image-proof.spec.ts",
     "api/worker-export-format.spec.ts",
     "api/kata-managed-volume-runtime.spec.ts",
     "api/workspace-download-cancellation.spec.ts",

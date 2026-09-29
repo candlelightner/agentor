@@ -209,20 +209,32 @@ back up these images separately. On the source daemon, `docker image save -o
 <protected-archive> <exact-snapshot-reference>` preserves both layers and image
 configuration; encrypt the archive using the installation's approved backup
 method before transfer. On the destination, decrypt in protected temporary
-storage, run `docker image load -i <protected-archive>`, and compare `docker image
-inspect --format '{{.Id}}' <exact-snapshot-reference>` with the recorded image ID
-before proceeding. Do not use `docker export`/`docker import` for this path:
+storage, run `docker image load -i <protected-archive>`, and run instance-restore
+preflight to verify the captured image identity before proceeding. Do not use
+`docker export`/`docker import` for this path:
 those do not preserve image configuration. Rootfs files may contain credentials;
 protect these archives like the encrypted instance backup. This is an explicit
 operator image-transfer dependency, not automatic image backup.
 
-Cross-store transfer remains an acceptance blocker: Docker classic may report
-the config digest as `Id`, while Docker29's containerd store reports a manifest
-digest for the same saved image. The current exact-ID destination check rejects
-that legitimate mismatch. Do not bypass it or replace it with tag-only matching.
-A verified portable config identity (including runtime configuration and ordered
-layer identities) and backward-compatible manifest handling still need
-implementation and cross-store tests before this procedure is generally usable.
+Docker classic may report the config digest as `Id`, while Docker29's containerd
+store reports a manifest/index digest for the same saved image. New backup
+entries retain the original ID and a versioned portable identity: SHA-256 of the
+exact exported config bytes plus OS/architecture/variant. The config binds runtime
+settings and ordered uncompressed layer digests. A bounded, cancellable Docker
+export proves the immutable ID's descriptor/config/layer relationship without
+extracting files or persisting raw image configuration. Tags are rechecked after
+proof; tag-only, reconstructed-config or layer-only matches are not accepted.
+
+Older manifests remain accepted when IDs match. An old classic config ID can
+also match a verified destination config after transfer to the containerd store.
+An old containerd manifest ID alone may not prove equivalence after transfer to
+classic storage; create a new enriched backup on the source rather than bypassing
+the check. A contradictory portable identity rejects even when IDs match.
+
+This remains **preflight-only protection**. Restored-worker recreation still
+needs durable binding to the verified identity and creation by an immutable
+destination ID; a tag can change after preflight. Cross-store full instance
+restore acceptance and this final-use protection are still rollout blockers.
 
 `scripts/test-worker-local-runtime-snapshot.sh --run-worker-local` checks a
 disposable unprivileged container's writable rootfs, configuration, runtime-Env

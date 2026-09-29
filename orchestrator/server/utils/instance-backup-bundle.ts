@@ -334,11 +334,13 @@ export function validateInstanceManifest(
     ) ||
     (input.images.capturedWorkerImages !== undefined && (
       !Array.isArray(input.images.capturedWorkerImages) || input.images.capturedWorkerImages.length > 100_000 ||
+      new Set(input.images.capturedWorkerImages.map((image: any) => image?.workerId)).size !== input.images.capturedWorkerImages.length ||
       input.images.capturedWorkerImages.some((image: any) => !image ||
         !bounded(image.workerId, 256) || !/^[a-zA-Z0-9_-]+$/.test(image.workerId) ||
         typeof image.reference !== 'string' || !isRuntimeSnapshotImage(image.reference) ||
         !image.reference.startsWith(`agentor-import-${image.workerId}:runtime-`) ||
-        !/^sha256:[a-f0-9]{64}$/.test(image.imageId))
+        typeof image.imageId !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(image.imageId) ||
+        (image.portableIdentity !== undefined && !validPortableImageIdentity(image.portableIdentity)))
     )) ||
     !Array.isArray(input.excludedDataPaths) ||
     input.excludedDataPaths.length > 100 ||
@@ -348,6 +350,19 @@ export function validateInstanceManifest(
   )
     throw new Error("Invalid instance backup manifest");
   return structuredClone(input) as InstanceBackupManifest;
+}
+
+function validPortableImageIdentity(value: any): boolean {
+  const platformName = (name: unknown) =>
+    typeof name === 'string' && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(name);
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value) &&
+    value.version === 1 &&
+    typeof value.configDigest === 'string' && /^sha256:[a-f0-9]{64}$/.test(value.configDigest) &&
+    value.platform && typeof value.platform === 'object' && !Array.isArray(value.platform) &&
+    platformName(value.platform.os) && platformName(value.platform.architecture) &&
+    (value.platform.variant === undefined || platformName(value.platform.variant)) &&
+    Object.keys(value).every((key) => ['version', 'configDigest', 'platform'].includes(key)) &&
+    Object.keys(value.platform).every((key) => ['os', 'architecture', 'variant'].includes(key)));
 }
 
 async function addPathTree(
