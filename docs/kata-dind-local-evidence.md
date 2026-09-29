@@ -304,3 +304,57 @@ not captured, so that individual comparison remains unexplained.
 - Log `/workspace/kata-vm-guest-dind-bind.log`.
 - Archive `/workspace/kata-vm-guest-dind-bind-evidence.tar.gz`, SHA256
   `b918ac14bd81a6601f171639081b8d81f0d7e5a3f42dc15f832717aca140a0d0`.
+
+A second reviewed fresh run, harness
+`fbc5831f4f0042444fcc1070d1edc32ebcec274a71591ec48b04180c4d1c28e9`,
+stopped **before containerd or dockerd startup** at the new pre-start config
+validator. The input explicitly used native v4 with `imports=[]`, but the dump
+retained `imports=['/etc/containerd/conf.d/*.toml']`. Pinned upstream 2.3.6
+`LoadConfigWithPlugins` resolves imports from each freshly decoded input config;
+`mergeConfig` separately retains the default slice in the output. The dump
+display alone is therefore not proof of imported-file access. A further
+source-backed correction must independently check the raw no-import input and
+the exact known merged output before another run. No permission denial or
+working inner daemon is established by this attempt.
+
+Container `f696f1f34a5523165a7402ff57d1c1fe31ff0d562e410ba8fcb9ce580dad5ee8`
+was removed; `kata-guest-dind-bind-sJpTlnUX-data` remains. Only the original
+stopped canary remained, Docker PID/config stayed unchanged and about 12 GiB
+was free. VM evidence `/home/kata-test/kata-guest-dind-bind.sJpTlnUX`; local log
+`/workspace/kata-vm-guest-dind-bind-2.log`; archive
+`/workspace/kata-vm-guest-dind-bind-evidence-2.tar.gz`, SHA256
+`40399a9fb9caaf6fbeedfe229030074c52bcd36330a89cb8227297d1c04efd9a`.
+
+### Inner Docker started; nested runc initialization denied
+
+The third reviewed fresh attempt, harness SHA256
+`184bce3f8924aaa6d16da9e242ed5075dce78a1f607882fe7ae97550ba57eb18`,
+passed the raw/merged containerd configuration checks. Private containerd2.3.6
+and Docker29.8.1 started successfully, with `overlay2`, cgroupfs/v2 and the
+fresh 512 MiB guest ext4 data root. Synthetic image import, inner-volume creation
+and nested-container creation completed. Nested start then failed:
+
+```text
+OCI runtime create failed: runc create failed: unable to start container process:
+error during container init: operation not permitted
+```
+
+The harness stopped at this denial. The logs do not identify the exact denied
+operation, so this does not establish its capability, seccomp, namespace or
+filesystem cause. No permission broadening or live retry followed. The nested
+workload and volume marker did not run; build/pull, persistence, daemon recovery,
+worker recreation, interruption and cross-host acceptance remain unproved.
+`KATA_DIND_NOT_VALIDATED` stays closed. Further live denial diagnostics require
+operator direction under the existing stop-on-denial boundary.
+
+Exact outer container
+`2f2ed8f10fb2f0bae048dc4988a0e76b12823308872afad3c804f991841d7ecc`
+was removed and absence verified. Its fresh volume
+`kata-guest-dind-bind-Itt4nPrX-data` remains. Only the original stopped canary
+remained; VM Docker PID28754/config checksum were unchanged and approximately
+11 GiB was free. No VM-host storage or production configuration was changed.
+
+- VM `/home/kata-test/kata-guest-dind-bind.Itt4nPrX`.
+- Log `/workspace/kata-vm-guest-dind-bind-3.log`.
+- Archive `/workspace/kata-vm-guest-dind-bind-evidence-3.tar.gz`, SHA256
+  `473e2f4aa87916466f3a39845a6cfe7f3acd15c0ecc381d47a32c36819803efb`.
