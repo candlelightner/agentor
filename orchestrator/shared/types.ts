@@ -194,6 +194,18 @@ export interface WorkerGroupLifecycleResult {
 /** Isolation chosen when an ordinary worker container is created. */
 export type WorkerRuntimeProfile = "kata-qemu" | "legacy-runc";
 
+/** Internal expected content of a stopped-container runtime snapshot. The
+ * destination still has to prove its local image before using this value. */
+export interface RuntimeSnapshotIdentity {
+  reference: string;
+  imageId: string;
+  portableIdentity?: {
+    version: 1;
+    configDigest: string;
+    platform: { os: string; architecture: string; variant?: string };
+  };
+}
+
 /** A worker. `id` is the worker's stable UUID identity (immutable across
  * rebuild/unarchive); `containerId`/`containerName` describe the current Docker
  * container (the `containerId` changes on every rebuild). Extends
@@ -259,6 +271,8 @@ export interface ContainerInfo extends UserOwnedResource {
    * filesystem. The per-worker imported image the worker runs (reused across
    * rebuild/unarchive). Unset for normal workers running the standard image. */
   importedImage?: string;
+  /** Internal durable expectation, never accepted from ordinary create/edit APIs. */
+  runtimeSnapshotIdentity?: RuntimeSnapshotIdentity;
   imageDefinitionId?: string;
   imageVersion?: string;
   imageDigest?: string;

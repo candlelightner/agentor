@@ -1160,6 +1160,12 @@ export class InstanceBackupManager {
         sourceInstallationId: inspected.manifest.sourceInstallationId,
         restoredOwnerId: inspected.manifest.createdByUserId,
         stagingOwnerId: job.userId,
+        // Presence is meaningful: old manifests omit this field and retain
+        // the historical restored-worker behavior. New manifests bind each
+        // runtime snapshot expectation into its restored worker record.
+        ...(inspected.manifest.images.capturedWorkerImages !== undefined
+          ? { capturedWorkerImages: inspected.manifest.images.capturedWorkerImages }
+          : {}),
       };
       if (plan.volumes.some((volume) => !volume.archive))
         throw new Error("Instance restore staging is missing a declared volume archive");
@@ -1400,7 +1406,9 @@ export class InstanceBackupManager {
       images: {
         definitions: images.length,
         immutableDigests,
-        capturedWorkerImages: await capturedWorkerImageInventory(this.docker, services.useWorkerStore().list(), signal),
+        capturedWorkerImages: await capturedWorkerImageInventory(this.docker, services.useWorkerStore().list(), signal, {
+          containerPrefix: useConfig().containerPrefix,
+        }),
         layersIncluded: false as const,
       },
       storage: {

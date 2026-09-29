@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { PassThrough, Readable } from 'node:stream';
-import { capturedWorkerImageInventory, isRuntimeSnapshotImage, missingCapturedWorkerImages, runtimeSnapshotEnvironment } from '../../orchestrator/server/utils/worker-runtime-snapshot';
+import { capturedWorkerImageInventory, isRuntimeSnapshotImage, missingCapturedWorkerImages, resolveRuntimeSnapshotImage, runtimeSnapshotEnvironment } from '../../orchestrator/server/utils/worker-runtime-snapshot';
 import { ContainerManager } from '../../orchestrator/server/utils/container';
 
 const tar = createRequire(new URL('../../orchestrator/package.json', import.meta.url))('tar-stream') as { pack(): any };
@@ -83,7 +83,7 @@ test('snapshot defaults cannot resurrect removed account tokens, local variables
   expect(sanitized.join('\n')).not.toMatch(/old-token|account-override|REMOVED/);
 });
 
-test('migration snapshots retain their image configuration while raw imports use the standard contract', async () => {
+test('migration snapshots without expected identity fail closed while raw imports use the standard contract', async () => {
   const snapshot = 'agentor-import-worker-1:runtime-operation-1';
   const calls: string[] = [];
   const manager = { config: { workerImagePrefix: '', workerImage: 'standard' }, dockerService: {
@@ -92,12 +92,12 @@ test('migration snapshots retain their image configuration while raw imports use
     inspectImageConfig: async () => ({ Entrypoint: ['standard-entrypoint'] }),
   } };
   const resolve = (ContainerManager.prototype as any).resolveImageOpts.bind(manager);
-  expect(await resolve(snapshot)).toEqual({ image: snapshot });
+  await expect(resolve(snapshot)).rejects.toMatchObject({ code: 'RUNTIME_SNAPSHOT_IDENTITY_MISSING' });
   expect(calls).toEqual([]);
   expect(await resolve('agentor-import-worker-2')).toEqual({ image: 'agentor-import-worker-2', imageConfig: { Entrypoint: ['standard-entrypoint'] } });
   expect(calls).toEqual(['standard']);
   manager.dockerService.imageExists = async () => false;
-  await expect(resolve(snapshot)).rejects.toMatchObject({ code: 'IMPORTED_WORKER_IMAGE_MISSING' });
+  await expect(resolve(snapshot)).rejects.toMatchObject({ code: 'RUNTIME_SNAPSHOT_IDENTITY_MISSING' });
 });
 
 test('instance inventory proves a pinned image export and detects a moving tag', async () => {
@@ -107,13 +107,15 @@ test('instance inventory proves a pinned image export and detects a moving tag',
   const tags = new Map([[reference, image.imageId]]);
   const docker = imageDocker(tags, new Map([[image.imageId, image]]));
   const inventory = await capturedWorkerImageInventory(docker, [
-    { id: 'worker-1', importedImage: reference }, { id: 'worker-2' }, { id: 'worker-3', importedImage: 'agentor-import-worker-3' },
+    { id: 'worker-1', importedImage: reference, runtimeSnapshotIdentity: { reference, imageId: image.imageId } },
+    { id: 'worker-2' }, { id: 'worker-3', importedImage: 'agentor-import-worker-3' },
   ] as any);
   expect(inventory).toEqual([{ workerId: 'worker-1', reference, imageId: image.imageId,
     portableIdentity: { version: 1, configDigest: image.configDigest, platform: { os: 'linux', architecture: 'amd64' } } }]);
   expect(docker.requests).toEqual([`/images/${reference}/json`, `/images/${image.imageId}/get`, `/images/${reference}/json`]);
   const moved = imageDocker(tags, new Map([[image.imageId, image], [movedImage.imageId, movedImage]]), () => tags.set(reference, movedImage.imageId));
-  await expect(capturedWorkerImageInventory(moved, [{ id: 'worker-1', importedImage: reference }] as any))
+  await expect(capturedWorkerImageInventory(moved, [{ id: 'worker-1', importedImage: reference,
+    runtimeSnapshotIdentity: { reference, imageId: image.imageId } }] as any))
     .rejects.toThrow('Runtime snapshot image reference changed during inventory');
   expect(isRuntimeSnapshotImage('agentor-import-worker-3')).toBe(false);
   expect(isRuntimeSnapshotImage('registry/image:runtime-x')).toBe(false);
@@ -125,11 +127,56 @@ test('two captured workers sharing one immutable image export it only once', asy
   const second = 'agentor-import-worker-2:runtime-operation-2';
   const docker = imageDocker(new Map([[first, image.imageId], [second, image.imageId]]), new Map([[image.imageId, image]]));
   const inventory = await capturedWorkerImageInventory(docker, [
-    { id: 'worker-1', importedImage: first }, { id: 'worker-2', importedImage: second },
+    { id: 'worker-1', importedImage: first, runtimeSnapshotIdentity: { reference: first, imageId: image.imageId } },
+    { id: 'worker-2', importedImage: second, runtimeSnapshotIdentity: { reference: second, imageId: image.imageId } },
   ] as any);
   expect(inventory).toHaveLength(2);
   expect(inventory[0]!.portableIdentity).toEqual(inventory[1]!.portableIdentity);
   expect(docker.requests.filter((request: string) => request.endsWith('/get'))).toHaveLength(1);
+});
+
+test('backup inventory refuses to replace a durable expectation with a retagged image', async () => {
+  const expectedImage = await savedImage();
+  const replacement = await savedImage('amd64', false, 'replacement');
+  const reference = 'agentor-import-worker-1:runtime-operation-1';
+  const docker = imageDocker(new Map([[reference, replacement.imageId]]), new Map([[replacement.imageId, replacement]]));
+  await expect(capturedWorkerImageInventory(docker, [{ id: 'worker-1', importedImage: reference,
+    runtimeSnapshotIdentity: { reference, imageId: expectedImage.imageId } }] as any))
+    .rejects.toMatchObject({ code: 'RUNTIME_SNAPSHOT_IMAGE_MISMATCH' });
+  await expect(capturedWorkerImageInventory(docker, [{ id: 'worker-1', importedImage: reference }] as any))
+    .rejects.toMatchObject({ code: 'RUNTIME_SNAPSHOT_IDENTITY_MISSING' });
+});
+
+test('pre-field active worker backup derives identity only from its exact stopped container', async () => {
+  const image = await savedImage();
+  const replacement = await savedImage('amd64', false, 'replacement');
+  const reference = 'agentor-import-worker-1:runtime-operation-1';
+  const name = 'agentor-worker-worker-1';
+  const tags = new Map([[reference, image.imageId]]);
+  const docker = imageDocker(tags, new Map([[image.imageId, image], [replacement.imageId, replacement]]));
+  let ownerLabel: string | undefined;
+  (docker as any).getContainer = () => ({ modem: { dial: (_options: unknown, callback: (error: Error | null, value: any) => void) =>
+    callback(null, { Id: 'f'.repeat(64), Name: `/${name}`, Image: image.imageId, State: { Running: false },
+      Config: { Image: reference, Labels: { 'agentor.managed': 'true', 'agentor.id': 'worker-1',
+        ...(ownerLabel ? { 'agentor.owner-id': ownerLabel } : {}) } } }) } });
+  const worker = { id: 'worker-1', userId: 'owner-1', status: 'active', importedImage: reference };
+  const inventory = await capturedWorkerImageInventory(docker, [worker] as any, undefined, { containerPrefix: 'agentor-worker' });
+  expect(inventory).toEqual([{ workerId: 'worker-1', reference, imageId: image.imageId,
+    portableIdentity: { version: 1, configDigest: image.configDigest, platform: { os: 'linux', architecture: 'amd64' } } }]);
+  ownerLabel = 'other-owner';
+  await expect(capturedWorkerImageInventory(docker, [worker] as any, undefined, { containerPrefix: 'agentor-worker' }))
+    .rejects.toMatchObject({ code: 'RUNTIME_SNAPSHOT_IDENTITY_MISSING' });
+  ownerLabel = undefined;
+  tags.set(reference, replacement.imageId);
+  await expect(capturedWorkerImageInventory(docker, [worker] as any, undefined, { containerPrefix: 'agentor-worker' }))
+    .rejects.toMatchObject({ code: 'RUNTIME_SNAPSHOT_IMAGE_MISMATCH' });
+  tags.set(reference, image.imageId);
+  await expect(capturedWorkerImageInventory(docker, [{ ...worker, status: 'archived' }] as any, undefined,
+    { containerPrefix: 'agentor-worker' })).rejects.toMatchObject({ code: 'RUNTIME_SNAPSHOT_IDENTITY_MISSING' });
+  await expect(capturedWorkerImageInventory(docker, [{ ...worker, runtimeRestoreApprovalRequired: true }] as any, undefined,
+    { containerPrefix: 'agentor-worker' })).rejects.toMatchObject({ code: 'RUNTIME_SNAPSHOT_IDENTITY_MISSING' });
+  await expect(capturedWorkerImageInventory(docker, [{ ...worker, id: 'worker/1' }] as any, undefined,
+    { containerPrefix: 'agentor-worker' })).rejects.toMatchObject({ code: 'RUNTIME_SNAPSHOT_IDENTITY_MISSING' });
 });
 
 test('destination accepts a proven config identity across classic and OCI stores and rejects wrong config or platform', async () => {
@@ -144,8 +191,16 @@ test('destination accepts a proven config identity across classic and OCI stores
   const images = new Map([[oci.imageId, oci], [wrongPlatform.imageId, wrongPlatform], [wrongConfig.imageId, wrongConfig]]);
   const docker = imageDocker(tags, images);
   expect(await missingCapturedWorkerImages(docker, expected)).toEqual([]);
+  const sourceExpectation = { reference, imageId: classic.imageId, portableIdentity: expected[0]!.portableIdentity };
+  const verifiedId = await resolveRuntimeSnapshotImage(docker, sourceExpectation);
+  expect(verifiedId).toBe(oci.imageId);
+  tags.set(reference, wrongConfig.imageId);
+  expect(verifiedId).toBe(oci.imageId);
   tags.set(reference, wrongPlatform.imageId);
   expect(await missingCapturedWorkerImages(docker, expected)).toEqual([reference]);
+  await expect(resolveRuntimeSnapshotImage(docker, sourceExpectation)).rejects.toMatchObject({ code: 'RUNTIME_SNAPSHOT_IMAGE_MISMATCH' });
+  await expect(resolveRuntimeSnapshotImage(docker, { ...sourceExpectation, portableIdentity: null } as any))
+    .rejects.toMatchObject({ code: 'RUNTIME_SNAPSHOT_IDENTITY_INVALID' });
   tags.set(reference, wrongConfig.imageId);
   expect(await missingCapturedWorkerImages(docker, expected)).toEqual([reference]);
   tags.set(reference, oci.imageId);
@@ -201,7 +256,8 @@ test('cancelling a pending image export closes its late stream and stops invento
       options.abortSignal.addEventListener('abort', () => queueMicrotask(() => callback(null, late)), { once: true });
     }
   } } }) } as any;
-  const pending = capturedWorkerImageInventory(docker, [{ id: 'worker-1', importedImage: reference }] as any, controller.signal);
+  const pending = capturedWorkerImageInventory(docker, [{ id: 'worker-1', importedImage: reference,
+    runtimeSnapshotIdentity: { reference, imageId: image.imageId } }] as any, controller.signal);
   await started;
   controller.abort();
   await expect(pending).rejects.toMatchObject({ code: 'OPERATION_ABORTED' });
@@ -220,7 +276,8 @@ test('cancelling a stalled image proof destroys the active export stream', async
     if (options.path.endsWith('/json')) callback(null, { Id: image.imageId, Os: 'linux', Architecture: 'amd64' });
     else { callback(null, stream); started(); }
   } } }) } as any;
-  const pending = capturedWorkerImageInventory(docker, [{ id: 'worker-1', importedImage: reference }] as any, controller.signal);
+  const pending = capturedWorkerImageInventory(docker, [{ id: 'worker-1', importedImage: reference,
+    runtimeSnapshotIdentity: { reference, imageId: image.imageId } }] as any, controller.signal);
   await reading;
   controller.abort();
   await expect(pending).rejects.toMatchObject({ code: 'OPERATION_ABORTED' });

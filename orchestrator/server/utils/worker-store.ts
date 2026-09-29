@@ -5,7 +5,35 @@ import type {
   UserOwnedResource,
   WorkerSelfApiAccess,
   WorkerRuntimeProfile,
+  RuntimeSnapshotIdentity,
 } from "../../shared/types";
+
+const SHA256_IMAGE_ID = /^sha256:[a-f0-9]{64}$/;
+const RUNTIME_IMAGE_REFERENCE = /^agentor-import-[a-zA-Z0-9_-]+:runtime-[a-zA-Z0-9_-]+$/;
+
+export function validRuntimeSnapshotIdentity(value: unknown, importedImage?: string, workerId?: string): value is RuntimeSnapshotIdentity {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const identity = value as Record<string, unknown>;
+  if (Object.keys(identity).some((key) => !["reference", "imageId", "portableIdentity"].includes(key))) return false;
+  if (typeof identity.reference !== "string" || !RUNTIME_IMAGE_REFERENCE.test(identity.reference) ||
+      identity.reference !== importedImage ||
+      (workerId !== undefined && !identity.reference.startsWith(`agentor-import-${workerId}:runtime-`)) ||
+      typeof identity.imageId !== "string" || !SHA256_IMAGE_ID.test(identity.imageId)) return false;
+  const portable = identity.portableIdentity;
+  if (portable === undefined) return true;
+  if (!portable || typeof portable !== "object" || Array.isArray(portable)) return false;
+  const portableRecord = portable as Record<string, unknown>;
+  if (Object.keys(portableRecord).some((key) => !["version", "configDigest", "platform"].includes(key))) return false;
+  const platform = portableRecord.platform;
+  if (!platform || typeof platform !== "object" || Array.isArray(platform)) return false;
+  const platformRecord = platform as Record<string, unknown>;
+  if (Object.keys(platformRecord).some((key) => !["os", "architecture", "variant"].includes(key))) return false;
+  const component = (item: unknown) => typeof item === "string" && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(item);
+  return portableRecord.version === 1 && typeof portableRecord.configDigest === "string" &&
+    SHA256_IMAGE_ID.test(portableRecord.configDigest) &&
+    component(platformRecord.os) && component(platformRecord.architecture) &&
+    (platformRecord.variant === undefined || component(platformRecord.variant));
+}
 
 /** Persisted worker metadata — intentionally minimal. It stores ONLY what cannot
  * be discovered from Docker at runtime: the worker's identity, owner, editable
@@ -64,6 +92,9 @@ export interface WorkerRecord extends UserOwnedResource {
    * — reused across rebuild/unarchive so the captured rootfs survives. Unset for
    * normal workers (which run the shared standard worker image). */
   importedImage?: string;
+  /** Expected stopped-container snapshot identity; local Docker content must
+   * still be proved before every container recreation. */
+  runtimeSnapshotIdentity?: RuntimeSnapshotIdentity;
   /** Internal ownership marker for a custom environment created implicitly by
    * this import. The environment is removed with its final owning worker unless
    * another worker adopted it. Never projected into the public worker response. */
@@ -76,7 +107,12 @@ export interface WorkerRecord extends UserOwnedResource {
 
 export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
   constructor(dataDir: string) {
-    super(dataDir, "workers.json", (w) => w.id);
+    super(dataDir, "workers.json", (w) => {
+      if (w.runtimeSnapshotIdentity !== undefined &&
+          !validRuntimeSnapshotIdentity(w.runtimeSnapshotIdentity, w.importedImage, w.id))
+        throw new Error("Invalid worker runtime snapshot identity");
+      return w.id;
+    });
   }
 
   /** Flat list of every worker across every user, sorted by the immutable UUID

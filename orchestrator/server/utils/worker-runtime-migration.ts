@@ -1,7 +1,8 @@
 import Docker from 'dockerode';
 import { randomUUID } from 'node:crypto';
-import type { WorkerRuntimeProfile } from '../../shared/types';
+import type { RuntimeSnapshotIdentity, WorkerRuntimeProfile } from '../../shared/types';
 import type { WorkerRecord } from './worker-store';
+import { validRuntimeSnapshotIdentity } from './worker-store';
 import { UserScopedJsonStore } from './user-scoped-store';
 import { assertWorkerRuntimeMatches, resolveWorkerRuntimePolicy, resolveWorkerRuntimeProfile } from './worker-runtime-policy';
 import { withOperationDeadline, operationSettlement } from './operation-deadline';
@@ -20,6 +21,7 @@ export interface RuntimeMigrationJournal {
   sourceRunning: boolean; sourceRestartPolicy: Docker.HostRestartPolicy;
   targetProfile: WorkerRuntimeProfile; sourceRecord: WorkerRecord;
   snapshotImage: string; mounts: RuntimeMigrationMount[]; replacementMayHaveRun: boolean;
+  snapshotIdentity?: RuntimeSnapshotIdentity;
   helperImage: string;
   uncertainOperation?: boolean;
   inFlightOperation?: string;
@@ -38,6 +40,7 @@ export class RuntimeMigrationStore extends UserScopedJsonStore<string, RuntimeMi
           !['kata-qemu', 'legacy-runc'].includes(j.targetProfile) ||
           j.rollbackName !== `${j.sourceName}-runtime-rollback-${j.operationId}` ||
           j.snapshotImage !== `agentor-import-${j.workerId}:runtime-${j.operationId}` ||
+          (j.snapshotIdentity !== undefined && !validRuntimeSnapshotIdentity(j.snapshotIdentity, j.snapshotImage, j.workerId)) ||
           !/^sha256:[a-f0-9]{64}$/.test(j.helperImage) ||
           !Array.isArray(j.expectedMounts) || j.expectedMounts.some((m) => (typeof m.source !== 'string' || (!m.source && m.type !== 'tmpfs')) || !m.target?.startsWith('/') || typeof m.readOnly !== 'boolean') ||
           (j.replacementId !== undefined && !/^[a-f0-9]{64}$/.test(j.replacementId)) ||
@@ -199,10 +202,17 @@ export class WorkerRuntimeMigration {
       const [repo, tag] = j.snapshotImage.split(':');
       const bakedImage = await this.docker.getImage(source.Image).inspect();
       if (!bakedImage.Config) throw migrationError('Source image configuration is unavailable');
-      await old.commit({
+      const snapshot = await old.commit({
         _query: { container: j.sourceId, repo, tag, pause: false, comment: `Agentor runtime migration ${operationId}` },
         _body: { Env: runtimeSnapshotEnvironment(bakedImage.Config.Env, source.Config.Env) },
       });
+      if (typeof snapshot.Id !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(snapshot.Id))
+        throw migrationError('Committed runtime snapshot did not return an immutable image ID');
+      const snapshotInspect = await this.docker.getImage(j.snapshotImage).inspect();
+      if (snapshotInspect.Id !== snapshot.Id)
+        throw migrationError('Runtime snapshot reference changed after commit');
+      j.snapshotIdentity = { reference: j.snapshotImage, imageId: snapshot.Id };
+      await this.store.save(j);
       for (const m of j.mounts) {
         await this.docker.createVolume({ Name: m.backup, Labels: this.labels(j) });
         await this.copy(j, m, false);
@@ -219,7 +229,7 @@ export class WorkerRuntimeMigration {
       // defaults during migration. Explicit restart suppression protects both
       // sides during orchestrator/daemon crashes and secret bootstrap.
       const replacement = await this.docker.createContainer({
-        ...source.Config, Image: j.snapshotImage, name: j.sourceName,
+        ...source.Config, Image: j.snapshotIdentity.imageId, name: j.sourceName,
         Hostname: source.Config.Hostname === source.Id.slice(0, 12) ? undefined : source.Config.Hostname,
         Labels: { ...source.Config.Labels, ...this.labels(j), 'agentor.managed': 'true', 'agentor.id': j.workerId,
           'agentor.runtime-profile': j.targetProfile },
@@ -237,6 +247,9 @@ export class WorkerRuntimeMigration {
         }])) },
       });
       j.replacementId = replacement.id; j.phase = 'replacement'; await this.store.save(j);
+      const created = await replacement.inspect();
+      if (created.Image !== j.snapshotIdentity.imageId)
+        throw migrationError('Replacement container resolved a different snapshot image');
       j.replacementMayHaveRun = true; await this.store.save(j);
       await this.callbacks.authorize();
       await replacement.start();
@@ -329,8 +342,18 @@ export class WorkerRuntimeMigration {
     // The committed snapshot is the active rebuild image, so keep it. A
     // rolled-back snapshot is no longer referenced by the worker record.
     if (j.phase === 'rolled-back') {
-      try { await this.docker.getImage(j.snapshotImage).remove(); }
-      catch (error) { if ((error as any)?.statusCode !== 404) throw error; }
+      if (!j.snapshotIdentity) {
+        // Older journals have no immutable commit response. Do not let a
+        // mutable tag identify a deletion target after rollback.
+        useLogger().warn(`Retaining unpinned rolled-back runtime snapshot ${j.operationId}`);
+      } else {
+        try {
+          const tagged = await this.docker.getImage(j.snapshotImage).inspect();
+          if (tagged.Id !== j.snapshotIdentity.imageId)
+            throw migrationError('Rolled-back snapshot reference changed; retain image for operator review');
+          await this.docker.getImage(j.snapshotIdentity.imageId).remove({ force: false });
+        } catch (error) { if ((error as any)?.statusCode !== 404) throw error; }
+      }
     }
     await this.store.clear(j.userId, j.workerId);
   }

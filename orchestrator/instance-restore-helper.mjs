@@ -360,6 +360,7 @@ function validatePlan(value, expected) {
       ...(entry.workerId ? { workerId: entry.workerId } : {}),
     };
   });
+  const capturedWorkerImages = validateCapturedWorkerImages(value.capturedWorkerImages);
   return {
     version: 1,
     jobId: expected.jobId,
@@ -369,7 +370,54 @@ function validatePlan(value, expected) {
     sourceInstallationId: value.sourceInstallationId,
     restoredOwnerId: value.restoredOwnerId,
     stagingOwnerId: value.stagingOwnerId,
+    ...(capturedWorkerImages === undefined ? {} : { capturedWorkerImages }),
   };
+}
+
+function validateCapturedWorkerImages(value) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 100_000)
+    throw new SafeRestoreError("Invalid captured worker image selection", "INSTANCE_RESTORE_INVALID_PLAN");
+  const workerIds = new Set();
+  const references = new Set();
+  return value.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry) ||
+        typeof entry.workerId !== "string" || entry.workerId.length > 256 ||
+        !/^[a-zA-Z0-9_-]+$/.test(entry.workerId) ||
+        typeof entry.reference !== "string" ||
+        !/^agentor-import-[a-zA-Z0-9_-]+:runtime-[a-zA-Z0-9_-]+$/.test(entry.reference) ||
+        !entry.reference.startsWith(`agentor-import-${entry.workerId}:runtime-`) ||
+        typeof entry.imageId !== "string" || !/^sha256:[a-f0-9]{64}$/.test(entry.imageId) ||
+        workerIds.has(entry.workerId) || references.has(entry.reference))
+      throw new SafeRestoreError("Invalid captured worker image selection", "INSTANCE_RESTORE_INVALID_PLAN");
+    workerIds.add(entry.workerId);
+    references.add(entry.reference);
+    const portableIdentity = entry.portableIdentity;
+    if (portableIdentity !== undefined && !validPortableImageIdentity(portableIdentity))
+      throw new SafeRestoreError("Invalid captured worker image identity", "INSTANCE_RESTORE_INVALID_PLAN");
+    return {
+      workerId: entry.workerId,
+      reference: entry.reference,
+      imageId: entry.imageId,
+      ...(portableIdentity === undefined ? {} : { portableIdentity: {
+        version: 1,
+        configDigest: portableIdentity.configDigest,
+        platform: { ...portableIdentity.platform },
+      } }),
+    };
+  });
+}
+
+function validPortableImageIdentity(value) {
+  const platformName = (name) => typeof name === "string" && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(name);
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) &&
+    value.version === 1 &&
+    typeof value.configDigest === "string" && /^sha256:[a-f0-9]{64}$/.test(value.configDigest) &&
+    value.platform && typeof value.platform === "object" && !Array.isArray(value.platform) &&
+    platformName(value.platform.os) && platformName(value.platform.architecture) &&
+    (value.platform.variant === undefined || platformName(value.platform.variant)) &&
+    Object.keys(value).every((key) => ["version", "configDigest", "platform"].includes(key)) &&
+    Object.keys(value.platform).every((key) => ["os", "architecture", "variant"].includes(key)));
 }
 
 async function prepareDataArchive(input) {
@@ -381,7 +429,7 @@ async function prepareDataArchive(input) {
     if (!result.authDb)
       throw new SafeRestoreError("The instance data archive has no authentication database", "INSTANCE_RESTORE_INVALID_ARCHIVE");
     await verifySqliteHeader(join(input.preparedData, "auth.db"));
-    await holdRestoredWorkerRuntimes(input.preparedData);
+    await holdRestoredWorkerRuntimes(input.preparedData, input.plan.capturedWorkerImages);
     if (!input.plan.restoreHostMountPolicies)
       await omitHostMountPolicies(input.preparedData);
   } catch (error) {
@@ -803,12 +851,18 @@ async function omitHostMountPolicies(root) {
 /** A source installation's persisted profile is history, not destination
  * authority. Hold even old/profile-less and non-DinD records so recovery cannot
  * silently choose a runtime before a destination administrator reviews it. */
-async function holdRestoredWorkerRuntimes(root) {
+async function holdRestoredWorkerRuntimes(root, capturedWorkerImages) {
+  const expected = capturedWorkerImages === undefined
+    ? undefined
+    : new Map(capturedWorkerImages.map((image) => [image.workerId, image]));
+  const matched = new Set();
   const users = join(root, "users");
   try {
     await assertDirectoryNoFollow(users);
   } catch (error) {
-    if (error?.code === "ENOENT") return;
+    if (error?.code === "ENOENT" && (!expected || expected.size === 0)) return;
+    if (error?.code === "ENOENT")
+      throw new SafeRestoreError("Captured worker image has no restored worker", "INSTANCE_RESTORE_INVALID_ARCHIVE");
     throw error;
   }
   for (const ownerName of await readdir(users)) {
@@ -829,6 +883,24 @@ async function holdRestoredWorkerRuntimes(root) {
         throw new SafeRestoreError("Restored worker store contains invalid identities", "INSTANCE_RESTORE_INVALID_ARCHIVE");
       ids.add(worker.id);
       delete worker.legacyPrivilegeGrant;
+      // An archived worker record is not authority to choose its own image
+      // expectation. Only the authenticated manifest carried in the plan can
+      // install that expectation on this destination.
+      delete worker.runtimeSnapshotIdentity;
+      const image = expected?.get(worker.id);
+      if (image) {
+        if (matched.has(worker.id) || worker.importedImage !== image.reference)
+          throw new SafeRestoreError("Captured worker image does not match restored worker", "INSTANCE_RESTORE_INVALID_ARCHIVE");
+        matched.add(worker.id);
+        worker.runtimeSnapshotIdentity = {
+          reference: image.reference,
+          imageId: image.imageId,
+          ...(image.portableIdentity ? { portableIdentity: image.portableIdentity } : {}),
+        };
+      } else if (expected && typeof worker.importedImage === "string" &&
+                 /^agentor-import-[a-zA-Z0-9_-]+:runtime-[a-zA-Z0-9_-]+$/.test(worker.importedImage)) {
+        throw new SafeRestoreError("Restored runtime snapshot has no captured image identity", "INSTANCE_RESTORE_INVALID_ARCHIVE");
+      }
       worker.runtimeRestoreApprovalRequired = true;
     }
     const serialized = `${JSON.stringify(workers, null, 2)}\n`;
@@ -844,6 +916,8 @@ async function holdRestoredWorkerRuntimes(root) {
       await file.close();
     }
   }
+  if (expected && matched.size !== expected.size)
+    throw new SafeRestoreError("Captured worker image has no restored worker", "INSTANCE_RESTORE_INVALID_ARCHIVE");
 }
 
 async function removeRegularIfPresent(path, label = "Host-mount policy") {

@@ -231,10 +231,28 @@ An old containerd manifest ID alone may not prove equivalence after transfer to
 classic storage; create a new enriched backup on the source rather than bypassing
 the check. A contradictory portable identity rejects even when IDs match.
 
-This remains **preflight-only protection**. Restored-worker recreation still
-needs durable binding to the verified identity and creation by an immutable
-destination ID; a tag can change after preflight. Cross-store full instance
-restore acceptance and this final-use protection are still rollout blockers.
+The authenticated image dependency now becomes a durable worker expectation
+during instance restore; incoming worker-record identity fields are discarded.
+The helper checks exact worker/reference mappings before stopping Agentor, and
+destination runtime approval remains separate. Rebuild, unarchive and recovery
+revalidate the expected content, pass an immutable local image ID to Docker
+create, and check the created container's image before first start. Migration
+likewise journals the committed image ID and creates from that ID. Neither
+missing images nor changed tags trigger a runtime/image fallback.
+
+Pre-field active snapshots can establish their expectation from a verified
+existing managed container, not by trusting its tag. Archive preserves that
+evidence before removing the container; stopped-source instance inventory can
+use the same read-only provenance. An already archived snapshot without a
+recorded/authenticated image identity remains blocked for administrator recovery;
+do not infer the missing identity from the current tag. Ordinary old workers and
+plain portable imports keep their existing image/runtime policy.
+
+Runtime snapshot cleanup uses only proved immutable IDs without forced removal;
+unproved, retagged or shared images are retained. Full cross-store instance
+restore and real Agentor lifecycle acceptance remain rollout blockers. The
+[synthetic transfer evidence](kata-snapshot-portability-evidence.md) proves the
+image primitive and final-use resolver, not those complete workflows.
 
 `scripts/test-worker-local-runtime-snapshot.sh --run-worker-local` checks a
 disposable unprivileged container's writable rootfs, configuration, runtime-Env

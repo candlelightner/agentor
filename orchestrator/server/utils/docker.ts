@@ -215,6 +215,9 @@ export class DockerService {
     /** Image to run. Defaults to the standard worker image; set to a per-worker
      * imported image (from `docker import`) for restored workers. */
     image?: string;
+    /** Trusted migrated snapshot pin. The final Docker create must use this
+     * immutable local ID and verify the resulting container before first start. */
+    expectedImageId?: string;
     /** When false, the container is created but not started (used by import so
      * the volumes can be populated before the entrypoint runs). Defaults to true. */
     start?: boolean;
@@ -333,7 +336,30 @@ export class DockerService {
     }
 
     const image = opts.image || this.config.workerImagePrefix + this.config.workerImage;
-    await this.ensureImage(image);
+    if (opts.expectedImageId) {
+      if (!/^sha256:[a-f0-9]{64}$/.test(opts.expectedImageId) || image !== opts.expectedImageId)
+        throw new Error('Runtime snapshot creation requires its exact immutable image ID');
+      // An absent snapshot is a preservation failure, not a reason to pull a
+      // mutable image name from a registry.
+      const localImage = await withOperationDeadline(
+        (operationSignal) => new Promise<Docker.ImageInspectInfo>((resolve, reject) => {
+          this.docker.getImage(image).modem.dial({
+            path: `/images/${image}/json`, method: 'GET', abortSignal: operationSignal,
+            statusCodes: { 200: true, 404: 'no such image', 500: 'server error' },
+          }, (error: Error | null, inspected?: Docker.ImageInspectInfo) => {
+            if (error) reject(error);
+            else if (inspected) resolve(inspected);
+            else reject(new Error('Runtime snapshot image inspection returned no image'));
+          });
+        }),
+        DOCKER_READ_TIMEOUT_MS,
+        'Docker runtime snapshot image inspection',
+      );
+      if (localImage.Id !== opts.expectedImageId)
+        throw new Error('Runtime snapshot image ID changed before container creation');
+    } else {
+      await this.ensureImage(image);
+    }
 
     // Add CAP_NET_ADMIN when network restrictions are needed (for iptables)
     // Docker-in-Docker requires --privileged (which implies all caps)
@@ -407,6 +433,34 @@ export class DockerService {
       },
       abortSignal: operationSignal,
     }), DOCKER_LIFECYCLE_TIMEOUT_MS, 'Docker worker creation');
+
+    if (opts.expectedImageId) {
+      try {
+        const created = await withOperationDeadline(
+          (operationSignal) => new Promise<Docker.ContainerInspectInfo>((resolve, reject) => {
+            container.modem.dial({
+              path: `/containers/${container.id}/json`, method: 'GET', abortSignal: operationSignal,
+              statusCodes: { 200: true, 404: 'no such container', 500: 'server error' },
+            }, (error: Error | null, inspected?: Docker.ContainerInspectInfo) => {
+              if (error) reject(error);
+              else if (inspected) resolve(inspected);
+              else reject(new Error('Created runtime snapshot container inspection returned no container'));
+            });
+          }),
+          DOCKER_READ_TIMEOUT_MS,
+          'Docker runtime snapshot container inspection',
+        );
+        if (created.Image !== opts.expectedImageId)
+          throw new Error('Created worker resolved a different runtime snapshot image');
+      } catch (error) {
+        await withOperationDeadline(
+          (operationSignal) => container.remove({ force: true, abortSignal: operationSignal } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
+          DOCKER_LIFECYCLE_TIMEOUT_MS,
+          'Docker mismatched-snapshot cleanup',
+        ).catch(() => {});
+        throw error;
+      }
+    }
 
     if (opts.start !== false) {
       try {

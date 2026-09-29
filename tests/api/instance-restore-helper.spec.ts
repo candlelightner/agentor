@@ -420,6 +420,73 @@ test.describe("controlled instance restore helper", () => {
     expect(fake.state).toMatchObject({ stops: 1, starts: 1 });
   });
 
+  test('binds authenticated image proof to the restored worker and discards forged source metadata', async () => {
+    const prepared = await fixture(root);
+    const reference = 'agentor-import-snapshot:runtime-operation';
+    const sourceId = `sha256:${'a'.repeat(64)}`;
+    const authenticated = { workerId: 'snapshot', reference, imageId: sourceId,
+      portableIdentity: { version: 1, configDigest: `sha256:${'b'.repeat(64)}`,
+        platform: { os: 'linux', architecture: 'amd64' } } };
+    (prepared.plan as any).capturedWorkerImages = [authenticated];
+    await writeFile(join(prepared.stage, 'restore-plan.json'), JSON.stringify(prepared.plan));
+    await writeTarGzip(prepared.plan.dataArchive, [
+      { name: 'auth.db', body: Buffer.concat([Buffer.from('SQLite format 3\0'), Buffer.alloc(32)]) },
+      { name: 'users/source-owner/workers.json', body: JSON.stringify([{ id: 'snapshot', userId: 'source-owner',
+        status: 'archived', importedImage: reference,
+        runtimeSnapshotIdentity: { reference, imageId: `sha256:${'c'.repeat(64)}` },
+        legacyPrivilegeGrant: 'admin' }]) },
+    ]);
+    const fake = fakeDocker(prepared.dataDir, prepared.env.AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR);
+    expect(await runInjected(prepared, fake.docker)).toEqual({ status: 'succeeded' });
+    const restored = JSON.parse(await readFile(join(prepared.dataDir, 'users/source-owner/workers.json'), 'utf8'));
+    expect(restored[0]).toMatchObject({
+      importedImage: reference, runtimeRestoreApprovalRequired: true,
+      runtimeSnapshotIdentity: { reference, imageId: sourceId, portableIdentity: authenticated.portableIdentity },
+    });
+    expect(restored[0]).not.toHaveProperty('legacyPrivilegeGrant');
+  });
+
+  test('old restore plans strip untrusted image expectations and leave legacy snapshots held', async () => {
+    const prepared = await fixture(root);
+    const reference = 'agentor-import-snapshot:runtime-operation';
+    await writeTarGzip(prepared.plan.dataArchive, [
+      { name: 'auth.db', body: Buffer.concat([Buffer.from('SQLite format 3\0'), Buffer.alloc(32)]) },
+      { name: 'users/source-owner/workers.json', body: JSON.stringify([{ id: 'snapshot', userId: 'source-owner',
+        status: 'archived', importedImage: reference,
+        runtimeSnapshotIdentity: { reference, imageId: `sha256:${'c'.repeat(64)}` } }]) },
+    ]);
+    const fake = fakeDocker(prepared.dataDir, prepared.env.AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR);
+    expect(await runInjected(prepared, fake.docker)).toEqual({ status: 'succeeded' });
+    const restored = JSON.parse(await readFile(join(prepared.dataDir, 'users/source-owner/workers.json'), 'utf8'));
+    expect(restored[0]).not.toHaveProperty('runtimeSnapshotIdentity');
+    expect(restored[0].runtimeRestoreApprovalRequired).toBe(true);
+  });
+
+  test('image plan and restored worker mismatches fail before stopping Agentor', async () => {
+    const reference = 'agentor-import-snapshot:runtime-operation';
+    const image = { workerId: 'snapshot', reference, imageId: `sha256:${'a'.repeat(64)}` };
+    const cases = [
+      { plan: [image, image], worker: { id: 'snapshot', importedImage: reference }, code: 'INSTANCE_RESTORE_INVALID_PLAN' },
+      { plan: [{ ...image, portableIdentity: { version: 2, configDigest: image.imageId,
+        platform: { os: 'linux', architecture: 'amd64' } } }], worker: { id: 'snapshot', importedImage: reference }, code: 'INSTANCE_RESTORE_INVALID_PLAN' },
+      { plan: [image], worker: { id: 'snapshot', importedImage: 'agentor-import-snapshot:runtime-other' }, code: 'INSTANCE_RESTORE_INVALID_ARCHIVE' },
+      { plan: [image], worker: { id: 'other', importedImage: reference }, code: 'INSTANCE_RESTORE_INVALID_ARCHIVE' },
+      { plan: [], worker: { id: 'snapshot', importedImage: reference }, code: 'INSTANCE_RESTORE_INVALID_ARCHIVE' },
+    ];
+    for (const [index, input] of cases.entries()) {
+      const prepared = await fixture(join(root, `mismatch-${index}`));
+      (prepared.plan as any).capturedWorkerImages = input.plan;
+      await writeFile(join(prepared.stage, 'restore-plan.json'), JSON.stringify(prepared.plan));
+      await writeTarGzip(prepared.plan.dataArchive, [
+        { name: 'auth.db', body: Buffer.concat([Buffer.from('SQLite format 3\0'), Buffer.alloc(32)]) },
+        { name: 'users/source-owner/workers.json', body: JSON.stringify([{ ...input.worker, userId: 'source-owner', status: 'archived' }]) },
+      ]);
+      const fake = fakeDocker(prepared.dataDir, prepared.env.AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR);
+      expect(await runInjected(prepared, fake.docker)).toMatchObject({ status: 'failed', code: input.code });
+      expect(fake.state).toMatchObject({ stops: 0, starts: 0 });
+    }
+  });
+
   test("rejects malformed restored worker stores before stopping the destination", async () => {
     for (const workers of [
       {}, [null], [{ id: "foreign", userId: "other-owner" }],

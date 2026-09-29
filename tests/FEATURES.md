@@ -70,7 +70,11 @@ Every user-facing feature of the Agentor web dashboard, organized by category. T
   streamed layers, and never extract or persist raw configuration. Tags changed
   during proof reject. Legacy equal IDs and provable classic config IDs remain
   compatible; unsupported equivalence and contradictory proofs fail closed.
-  This does not yet pin the final image used when a restored worker is created.
+  Authenticated dependencies become durable worker expectations; recreation and
+  migration use immutable image IDs and verify the created container before
+  start. Pre-field backfill needs existing managed-container evidence; unproved
+  archived snapshots remain blocked. Cleanup retains unproved/changed/shared
+  snapshots. Full Agentor cross-store restore acceptance remains outstanding.
 - Coverage: `worker-runtime-policy.spec.ts`, `worker-runtime-admin.spec.ts`,
   `worker-runtime-backup.spec.ts`, `worker-runtime-migration.spec.ts`,
   `kata-managed-volume-runtime.spec.ts`, and runtime additions in the inventory,

@@ -15,9 +15,10 @@ import * as tar from "tar-stream";
 import { DockerService } from "./docker";
 import Docker from 'dockerode';
 import { WorkerRuntimeMigration, RuntimeMigrationStore } from './worker-runtime-migration';
-import { isRuntimeSnapshotImage } from './worker-runtime-snapshot';
+import { isRuntimeSnapshotImage, resolveRuntimeSnapshotImage } from './worker-runtime-snapshot';
+import { validRuntimeSnapshotIdentity } from './worker-store';
 import type { RuntimeMigrationInput, RuntimeMigrationJournal } from './worker-runtime-migration';
-import type { WorkerRuntimeProfile } from '../../shared/types';
+import type { RuntimeSnapshotIdentity, WorkerRuntimeProfile } from '../../shared/types';
 import {
   assertWorkerRuntimeMatches,
   resolveWorkerRuntimePolicy,
@@ -123,6 +124,7 @@ import {
 } from "./worker-lifecycle-coordinator";
 import { instanceSnapshotActive } from "./instance-snapshot-gate";
 import {
+  withOperationDeadline,
   operationSettlement,
   type OperationFailureWithSettlement,
 } from "./operation-deadline";
@@ -608,9 +610,12 @@ export class ContainerManager {
       },
       commit: async (journal, replacementId) => {
         if (!this.workerStore) throw new Error('WorkerStore not available');
+        if (!validRuntimeSnapshotIdentity(journal.snapshotIdentity, journal.snapshotImage))
+          throw new Error('Committed runtime snapshot identity is unavailable');
         const record: WorkerRecord = { ...journal.sourceRecord, runtimeProfile: journal.targetProfile,
           ...(journal.targetProfile === 'legacy-runc' ? { legacyPrivilegeGrant: 'admin' as const } : {}),
-          importedImage: journal.snapshotImage, updatedAt: new Date().toISOString() };
+          importedImage: journal.snapshotImage, runtimeSnapshotIdentity: journal.snapshotIdentity,
+          updatedAt: new Date().toISOString() };
         if (journal.targetProfile === 'kata-qemu') delete record.legacyPrivilegeGrant;
         await this.workerStore.upsert(record);
         const live = this.containers.get(journal.workerId);
@@ -620,6 +625,8 @@ export class ContainerManager {
           if (record.legacyPrivilegeGrant) live.legacyPrivilegeGrant = record.legacyPrivilegeGrant;
           concealLegacyPrivilegeGrant(live);
           live.importedImage = journal.snapshotImage; live.imageName = journal.snapshotImage;
+          live.imageId = journal.snapshotIdentity.imageId;
+          live.runtimeSnapshotIdentity = journal.snapshotIdentity;
           live.status = journal.sourceRunning ? 'running' : 'stopped'; live.runtimeDiagnostic = undefined;
         }
       },
@@ -633,6 +640,7 @@ export class ContainerManager {
           if (journal.sourceRecord.legacyPrivilegeGrant) live.legacyPrivilegeGrant = journal.sourceRecord.legacyPrivilegeGrant;
           concealLegacyPrivilegeGrant(live);
           live.importedImage = journal.sourceRecord.importedImage;
+          live.runtimeSnapshotIdentity = journal.sourceRecord.runtimeSnapshotIdentity;
           live.imageName = journal.sourceImage; live.imageId = journal.sourceImageId;
           live.status = journal.sourceRunning ? 'running' : 'stopped'; live.runtimeDiagnostic = undefined;
         }
@@ -1247,6 +1255,7 @@ export class ContainerManager {
         hostMountsRevoked: worker.hostMountsRevoked,
         hardwareDevicesRevoked: worker.hardwareDevicesRevoked,
         importedImage: worker.importedImage,
+        runtimeSnapshotIdentity: worker.runtimeSnapshotIdentity,
         imageDefinitionId: worker.imageDefinitionId,
         imageVersion: worker.imageVersion,
         imageDigest: worker.imageDigest,
@@ -2806,12 +2815,13 @@ for p in sys.argv[1:]:
       info.id,
       info.mounts,
     );
-    const recoveryImage = info.importedImage
-      ? (await this.resolveImageOpts(info.importedImage)).image
-      : info.imageRuntimeReference;
-    await this.dockerService.ensureImage(
-      recoveryImage || this.config.workerImagePrefix + this.config.workerImage,
-    );
+    const recoveryImageOpts = info.importedImage
+      ? await this.resolveImageOpts(info.importedImage, info.runtimeSnapshotIdentity, info)
+      : { image: info.imageRuntimeReference, expectedImageId: undefined };
+    if (!recoveryImageOpts.expectedImageId)
+      await this.dockerService.ensureImage(
+        recoveryImageOpts.image || this.config.workerImagePrefix + this.config.workerImage,
+      );
     const persistentPathMounts = await this.persistentBackupPathMounts(
       info,
       info.status === "running",
@@ -3333,7 +3343,9 @@ for p in sys.argv[1:]:
     if (info.importedImage?.startsWith(IMPORT_IMAGE_PREFIX)) {
       actions.push([
         "imported image",
-        () => this.dockerService.removeImage(info.importedImage!),
+        () => isRuntimeSnapshotImage(info.importedImage!)
+          ? this.removeOwnedRuntimeSnapshotImage(info.userId, info.id, info.runtimeSnapshotIdentity)
+          : this.dockerService.removeImage(info.importedImage!),
       ]);
     }
     actions.push(
@@ -3417,6 +3429,10 @@ for p in sys.argv[1:]:
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
     this.assertRuntimeRollbackFinalized(info);
+    if (info.importedImage && isRuntimeSnapshotImage(info.importedImage) && !info.runtimeSnapshotIdentity) {
+      this.assertRuntimeRestoreApproved(info);
+      await this.resolveImageOpts(info.importedImage, undefined, info);
+    }
     // A deferred persistence request must capture data before archive discards
     // the rootfs, just as an explicit rebuild does.
     await this.persistentBackupPathMounts(info, true);
@@ -3494,6 +3510,9 @@ for p in sys.argv[1:]:
     this.assertOrdinaryMutation(info);
     this.assertRuntimeRestoreApproved(info);
     this.assertRuntimeRollbackFinalized(info);
+    const storageSnapshot = info.importedImage && isRuntimeSnapshotImage(info.importedImage)
+      ? await this.resolveImageOpts(info.importedImage, info.runtimeSnapshotIdentity, info)
+      : undefined;
     if (info.hostMountsRevoked || info.hardwareDevicesRevoked)
       throw Object.assign(new Error("Rebuild the worker to apply revoked hardware or host-mount permissions first."), { statusCode: 409 });
     const { useManagedVolumeManager } = await import("./managed-volume-manager");
@@ -3509,6 +3528,8 @@ for p in sys.argv[1:]:
         const replacement = await docker.getContainer(interrupted.replacementId).inspect();
         if (replacement.Config.Labels?.[WORKER_ID_LABEL] !== id)
           throw new Error("Storage replacement identity mismatch");
+        if (storageSnapshot?.expectedImageId && replacement.Image !== storageSnapshot.expectedImageId)
+          throw new Error("Storage replacement resolved a different runtime snapshot image");
         info.containerId = replacement.Id;
         await volumes.markDeclared(info.userId, id, replacement.Id);
         await this.restartUnlocked(id, true);
@@ -3526,6 +3547,8 @@ for p in sys.argv[1:]:
       }
     }
     const beforePrepare = await docker.getContainer(info.containerId).inspect();
+    if (storageSnapshot?.expectedImageId && beforePrepare.Image !== storageSnapshot.expectedImageId)
+      throw new Error("Storage source differs from durable runtime snapshot image");
     await this.assertRecreationRuntime(info.runtimeProfile,
       beforePrepare.HostConfig?.Privileged === true, info.legacyPrivilegeGrant);
     assertWorkerRuntimeMatches(resolveWorkerRuntimeProfile(info.runtimeProfile),
@@ -3542,6 +3565,8 @@ for p in sys.argv[1:]:
     const mounts = await volumes.prepare(info);
     const old = docker.getContainer(info.containerId);
     const original = await old.inspect();
+    if (storageSnapshot?.expectedImageId && original.Image !== storageSnapshot.expectedImageId)
+      throw new Error("Storage source image changed before recreation");
     await this.assertRecreationRuntime(info.runtimeProfile,
       original.HostConfig?.Privileged === true, info.legacyPrivilegeGrant);
     assertWorkerRuntimeMatches(resolveWorkerRuntimeProfile(info.runtimeProfile),
@@ -3585,9 +3610,17 @@ for p in sys.argv[1:]:
           DriverOpts: (endpoint as { DriverOpts?: Record<string, string> }).DriverOpts,
         }])) },
       });
-      info.containerId = replacement.id;
+      // Persist the exact candidate before inspecting it. If inspection fails
+      // or Docker resolves the wrong image, recovery must still know which
+      // replacement to inspect instead of guessing by its reusable name.
       journal.replacementId = replacement.id;
       await volumes.recreations.save(journal);
+      if (storageSnapshot?.expectedImageId) {
+        const created = await replacement.inspect();
+        if (created.Image !== storageSnapshot.expectedImageId)
+          throw new Error("Storage replacement resolved a different runtime snapshot image");
+      }
+      info.containerId = replacement.id;
       info.status = "stopped";
       // Docker now declares every volume. Clear transient markers before
       // restartUnlocked so it performs bootstrap rather than recreating again.
@@ -3652,11 +3685,12 @@ for p in sys.argv[1:]:
     // still intact. A missing captured/custom image must never turn rebuild or
     // managed recovery into an unintended standard-image substitution.
     const imageOpts = info.importedImage
-      ? await this.resolveImageOpts(info.importedImage)
-      : { image: info.imageRuntimeReference, imageConfig: undefined };
-    await this.dockerService.ensureImage(
-      imageOpts.image || this.config.workerImagePrefix + this.config.workerImage,
-    );
+      ? await this.resolveImageOpts(info.importedImage, info.runtimeSnapshotIdentity, info)
+      : { image: info.imageRuntimeReference, imageConfig: undefined, expectedImageId: undefined };
+    if (!imageOpts.expectedImageId)
+      await this.dockerService.ensureImage(
+        imageOpts.image || this.config.workerImagePrefix + this.config.workerImage,
+      );
     await this.persistDesiredRuntimeStatus(info, "running");
 
     useLogCollector().detach(info.containerId);
@@ -3753,6 +3787,7 @@ for p in sys.argv[1:]:
       hardwareDevicesRevoked: false,
       // Keep the imported-image link only while that image still exists.
       importedImage: imageOpts.image ? info.importedImage : undefined,
+      runtimeSnapshotIdentity: info.runtimeSnapshotIdentity,
       imageDefinitionId: info.imageDefinitionId,
       imageVersion: info.imageVersion,
       imageDigest: info.imageDigest,
@@ -3788,6 +3823,7 @@ for p in sys.argv[1:]:
         workerConfig: [...groupSecrets, ...workerConfig],
         image: imageOpts.image,
         imageConfig: imageOpts.imageConfig,
+        expectedImageId: imageOpts.expectedImageId,
       });
       containerInfo.containerId = container.id;
       containerInfo.status = "running";
@@ -3911,8 +3947,8 @@ for p in sys.argv[1:]:
       worker.id,
     );
     const imageOpts = worker.importedImage
-      ? await this.resolveImageOpts(worker.importedImage)
-      : { image: worker.imageRuntimeReference, imageConfig: undefined };
+      ? await this.resolveImageOpts(worker.importedImage, worker.runtimeSnapshotIdentity)
+      : { image: worker.imageRuntimeReference, imageConfig: undefined, expectedImageId: undefined };
 
     const imageName =
       imageOpts.image ||
@@ -3945,6 +3981,7 @@ for p in sys.argv[1:]:
       hostMountsRevoked: false,
       hardwareDevicesRevoked: false,
       importedImage: imageOpts.image ? worker.importedImage : undefined,
+      runtimeSnapshotIdentity: worker.runtimeSnapshotIdentity,
       imageDefinitionId: worker.imageDefinitionId,
       imageVersion: worker.imageVersion,
       imageDigest: worker.imageDigest,
@@ -3984,6 +4021,7 @@ for p in sys.argv[1:]:
         workerConfig: [...groupSecrets, ...workerConfig],
         image: imageOpts.image,
         imageConfig: imageOpts.imageConfig,
+        expectedImageId: imageOpts.expectedImageId,
       });
       containerInfo.containerId = container.id;
       containerInfo.status = "running";
@@ -4099,7 +4137,9 @@ for p in sys.argv[1:]:
     if (worker.importedImage?.startsWith(IMPORT_IMAGE_PREFIX)) {
       actions.push([
         "imported image",
-        () => this.dockerService.removeImage(worker.importedImage!),
+        () => isRuntimeSnapshotImage(worker.importedImage!)
+          ? this.removeOwnedRuntimeSnapshotImage(worker.userId, worker.id, worker.runtimeSnapshotIdentity)
+          : this.dockerService.removeImage(worker.importedImage!),
       ]);
     }
     actions.push(
@@ -4185,6 +4225,7 @@ for p in sys.argv[1:]:
           hostMountsRevoked: worker.hostMountsRevoked,
           hardwareDevicesRevoked: worker.hardwareDevicesRevoked,
           importedImage: worker.importedImage,
+          runtimeSnapshotIdentity: worker.runtimeSnapshotIdentity,
           imageDefinitionId: worker.imageDefinitionId,
           imageVersion: worker.imageVersion,
           imageDigest: worker.imageDigest,
@@ -4255,6 +4296,85 @@ for p in sys.argv[1:]:
 
   // --- Worker export / import ---
 
+  private runtimeSnapshotDocker(): Docker {
+    return new Docker({ socketPath: '/var/run/docker.sock', timeout: 30_000 });
+  }
+
+  private async inspectRuntimeSnapshotSource(containerId: string): Promise<Docker.ContainerInspectInfo> {
+    if (!/^[a-f0-9]{64}$/.test(containerId))
+      throw new Error('Existing runtime snapshot container ID is unavailable');
+    const docker = this.runtimeSnapshotDocker();
+    return withOperationDeadline(
+      (signal) => new Promise<Docker.ContainerInspectInfo>((resolve, reject) => {
+        docker.getContainer(containerId).modem.dial({
+          path: `/containers/${containerId}/json`, method: 'GET', abortSignal: signal,
+          statusCodes: { 200: true, 404: 'no such container', 500: 'server error' },
+        }, (error: Error | null, inspected?: Docker.ContainerInspectInfo) => {
+          if (error) reject(error);
+          else if (inspected) resolve(inspected);
+          else reject(new Error('Existing runtime snapshot container inspection returned no container'));
+        });
+      }),
+      30_000, 'Existing runtime snapshot container inspection',
+    );
+  }
+
+  /** Runtime snapshot tags are mutable. Never use the generic force-removal
+   * path for them: resolve the stored expectation and remove only that local
+   * immutable ID, without force, when no other worker record depends on it. */
+  private async removeOwnedRuntimeSnapshotImage(
+    userId: string, workerId: string, identity?: RuntimeSnapshotIdentity,
+  ): Promise<void> {
+    if (!validRuntimeSnapshotIdentity(identity, identity?.reference, workerId)) {
+      useLogger().warn(`[container] retained unproved runtime snapshot image for ${workerId}`);
+      return;
+    }
+    // list() silently omits quarantined owner partitions. An image cleanup
+    // must prove that no archived worker still depends on this image, so a
+    // missing store or unreadable owner means retention rather than deletion.
+    if (!this.workerStore || typeof this.workerStore.listUserIds !== 'function' ||
+        typeof this.workerStore.listForUser !== 'function') {
+      useLogger().warn(`[container] retained runtime snapshot image without complete worker inventory for ${workerId}`);
+      return;
+    }
+    let workers: WorkerRecord[];
+    try {
+      workers = this.workerStore.listUserIds().flatMap((owner) => this.workerStore!.listForUser(owner));
+    } catch {
+      useLogger().warn(`[container] retained runtime snapshot image while worker inventory is unavailable for ${workerId}`);
+      return;
+    }
+    const shared = workers.some((worker) => !(worker.userId === userId && worker.id === workerId) &&
+      (worker.importedImage === identity.reference ||
+       worker.runtimeSnapshotIdentity?.imageId === identity.imageId ||
+       (identity.portableIdentity && worker.runtimeSnapshotIdentity?.portableIdentity?.configDigest === identity.portableIdentity.configDigest)));
+    if (shared) {
+      useLogger().warn(`[container] retained runtime snapshot image shared by another worker for ${workerId}`);
+      return;
+    }
+    const docker = this.runtimeSnapshotDocker();
+    let resolved: string;
+    try { resolved = await resolveRuntimeSnapshotImage(docker, identity); }
+    catch (error) {
+      if ((error as { code?: string })?.code === 'RUNTIME_SNAPSHOT_IMAGE_MISMATCH' ||
+          (error as { statusCode?: number })?.statusCode === 404) {
+        useLogger().warn(`[container] retained runtime snapshot image with changed reference for ${workerId}`);
+        return;
+      }
+      throw error;
+    }
+    try {
+      await withOperationDeadline(
+        (signal) => docker.getImage(resolved).remove({ force: false, abortSignal: signal } as Docker.ImageRemoveOptions & { abortSignal: AbortSignal }),
+        30_000, 'Docker owned runtime snapshot image removal',
+      );
+    } catch (error) {
+      const status = (error as { statusCode?: number })?.statusCode;
+      if (status !== 404 && status !== 409) throw error;
+      if (status === 409) useLogger().warn(`[container] retained runtime snapshot image still referenced elsewhere for ${workerId}`);
+    }
+  }
+
   /** Resolve the image + replicated config a worker should run. For normal
    * workers (`importedImage` unset) returns `{}` so the standard image is used.
    * Imported workers fail closed if either their captured image or the approved
@@ -4262,8 +4382,65 @@ for p in sys.argv[1:]:
    * image would lose rootfs state while pretending recovery was faithful. */
   private async resolveImageOpts(
     importedImage?: string,
-  ): Promise<{ image?: string; imageConfig?: ImageConfigOverride }> {
+    snapshotIdentity?: RuntimeSnapshotIdentity,
+    existing?: ContainerInfo,
+  ): Promise<{ image?: string; imageConfig?: ImageConfigOverride; expectedImageId?: string }> {
     if (!importedImage) return {};
+    if (isRuntimeSnapshotImage(importedImage)) {
+      const record = existing ? this.workerStore?.get(existing.userId, existing.id) : undefined;
+      if (existing && (!record || record.importedImage !== importedImage))
+        throw new Error('Runtime snapshot worker record changed during image resolution');
+      const durable = record?.runtimeSnapshotIdentity;
+      if (durable && snapshotIdentity &&
+          (durable.reference !== snapshotIdentity.reference || durable.imageId !== snapshotIdentity.imageId ||
+           JSON.stringify(durable.portableIdentity) !== JSON.stringify(snapshotIdentity.portableIdentity)))
+        throw Object.assign(new Error('Live runtime snapshot identity disagrees with its durable record'), {
+          statusCode: 409, code: 'RUNTIME_SNAPSHOT_IDENTITY_INVALID',
+        });
+      let expected = durable ?? snapshotIdentity;
+      if (!expected) {
+        // Older active migrations predate the durable image pin. The current
+        // worker container's immutable Image field is the only safe source for
+        // a one-time backfill; an archived tag alone carries no provenance.
+        if (!existing || !this.workerStore)
+          throw Object.assign(new Error('Runtime snapshot identity is unavailable; administrator recovery evidence is required'), {
+            statusCode: 409, code: 'RUNTIME_SNAPSHOT_IDENTITY_MISSING',
+          });
+        if (!record) throw new Error('Runtime snapshot worker record changed during image resolution');
+        const inspected = await this.inspectRuntimeSnapshotSource(existing.containerId);
+        if (inspected.Id !== existing.containerId || inspected.Name !== `/${existing.containerName}` ||
+            inspected.Config.Labels?.['agentor.managed'] !== 'true' ||
+            inspected.Config.Labels?.['agentor.id'] !== existing.id ||
+            (inspected.Config.Labels?.['agentor.owner-id'] !== undefined &&
+             inspected.Config.Labels?.['agentor.owner-id'] !== existing.userId) ||
+            (inspected.Config.Labels?.['agentor.worker-id'] !== undefined &&
+             inspected.Config.Labels?.['agentor.worker-id'] !== existing.id) ||
+            inspected.Config.Image !== importedImage ||
+            typeof inspected.Image !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(inspected.Image))
+          throw Object.assign(new Error('Existing worker cannot establish runtime snapshot image identity'), {
+            statusCode: 409, code: 'RUNTIME_SNAPSHOT_IDENTITY_MISSING',
+          });
+        assertWorkerRuntimeMatches(resolveWorkerRuntimeProfile(existing.runtimeProfile),
+          inspected.HostConfig.Runtime, inspected.HostConfig.Privileged === true,
+          existing.legacyPrivilegeGrant);
+        expected = { reference: importedImage, imageId: inspected.Image };
+        const resolved = await resolveRuntimeSnapshotImage(
+          this.runtimeSnapshotDocker(), expected,
+        );
+        if (resolved !== inspected.Image) throw new Error('Runtime snapshot image changed during identity backfill');
+        await this.workerStore.upsert({ ...record, runtimeSnapshotIdentity: expected, updatedAt: new Date().toISOString() });
+        existing.runtimeSnapshotIdentity = expected;
+        return { image: resolved, expectedImageId: resolved };
+      }
+      if (!validRuntimeSnapshotIdentity(expected, importedImage, existing?.id))
+        throw Object.assign(new Error('Stored runtime snapshot identity is invalid'), {
+          statusCode: 409, code: 'RUNTIME_SNAPSHOT_IDENTITY_INVALID',
+        });
+      const resolved = await resolveRuntimeSnapshotImage(
+        this.runtimeSnapshotDocker(), expected,
+      );
+      return { image: resolved, expectedImageId: resolved };
+    }
     if (!(await this.dockerService.imageExists(importedImage))) {
       throw Object.assign(
         new Error(
@@ -4272,10 +4449,8 @@ for p in sys.argv[1:]:
         { statusCode: 409, code: "IMPORTED_WORKER_IMAGE_MISSING" },
       );
     }
-    // Docker commit preserves the source container's image configuration.
-    // Unlike a portable docker-import tar, a runtime snapshot must inherit its
-    // own entrypoint/cmd/user/workdir and image Env, including custom images.
-    if (isRuntimeSnapshotImage(importedImage)) return { image: importedImage };
+    // Plain docker-import images lack baked config and still inherit the
+    // standard worker contract. Runtime snapshots were handled above.
     const standard = this.config.workerImagePrefix + this.config.workerImage;
     try {
       await this.dockerService.ensureImage(standard);
@@ -5614,6 +5789,20 @@ for p in sys.argv[1:]:
    * dropping everything Docker can re-discover (containerId, containerName,
    * imageName, imageId) and keeping only the worker's identity + config. */
   private containerInfoToWorkerRecord(info: ContainerInfo): WorkerRecord {
+    const prior = info.importedImage && isRuntimeSnapshotImage(info.importedImage) &&
+      typeof this.workerStore?.get === 'function'
+      ? this.workerStore.get(info.userId, info.id) : undefined;
+    if (prior && prior.importedImage === info.importedImage && prior.runtimeSnapshotIdentity &&
+        info.runtimeSnapshotIdentity &&
+        (prior.runtimeSnapshotIdentity.reference !== info.runtimeSnapshotIdentity.reference ||
+         prior.runtimeSnapshotIdentity.imageId !== info.runtimeSnapshotIdentity.imageId ||
+         JSON.stringify(prior.runtimeSnapshotIdentity.portableIdentity) !==
+           JSON.stringify(info.runtimeSnapshotIdentity.portableIdentity)))
+      throw Object.assign(new Error('Live runtime snapshot identity disagrees with its durable record'), {
+        statusCode: 409, code: 'RUNTIME_SNAPSHOT_IDENTITY_INVALID',
+      });
+    const runtimeSnapshotIdentity = info.runtimeSnapshotIdentity ??
+      (prior?.importedImage === info.importedImage ? prior?.runtimeSnapshotIdentity : undefined);
     return {
       id: info.id,
       userId: info.userId,
@@ -5639,6 +5828,7 @@ for p in sys.argv[1:]:
       hostMountsRevoked: info.hostMountsRevoked,
       hardwareDevicesRevoked: info.hardwareDevicesRevoked,
       importedImage: info.importedImage,
+      runtimeSnapshotIdentity,
       importCreatedEnvironmentId: this.importCreatedEnvironments.get(info.id),
       imageDefinitionId: info.imageDefinitionId,
       imageVersion: info.imageVersion,

@@ -101,3 +101,28 @@ Both attempts are archived at
 `fa32e9807091d1145c7978f836d13f0236315f444f98ece3ed36da6320d54363`.
 Kata DinD remains blocked; pull/build/run/volumes/restart/recreation and recovery
 have not been established by these prerequisites.
+
+### Guest tmpfs comparison
+
+A second reviewed, fresh Kata probe used the same capability recipe but no
+volumes. Inside a private mount namespace, a 16 MiB tmpfs supported a tiny overlay
+mount and copy-up (exit 0). The earlier named-volume/virtiofs case failed. This
+narrows the tested failure to a storage-dependent combination; it does not
+establish durable storage or a production Docker data-root design.
+
+The pinned guest kernel configuration has loop, ext4, overlay and tmpfs built
+in, with kernel modules disabled. Guest `/proc/devices` listed loop major 7, but
+no `/dev/loop*` nodes were present. Loop devices were only inventoried: none was
+created, opened, attached, formatted or mounted. An ext4 loop-backed candidate
+still requires a separately reviewed guest-only experiment and persistence,
+capacity, interruption/recovery and cross-host tests before selection.
+
+Evidence: VM `/home/kata-test/kata-guest-tmpfs.rp6Io7Zz`, local log
+`/workspace/kata-vm-guest-tmpfs.log`. Exact container
+`7b59bc01d9d238e93e7eb306e9bfa3dc90a393a75a0775736d60e23a6490e78a`
+was removed and absence verified. The reviewed probe SHA-256 is
+`8819f3c553a66350e14bda0d1441bff3bbdcfc4ad341d725828be15fbbc0ce23`.
+Combined synthetic-snapshot and tmpfs evidence is retained locally at
+`/workspace/kata-vm-snapshot-tmpfs-evidence.tar.gz`, SHA-256
+`5431a09f8015c48ed35a5fe26666f2960a8bda4b4924adf11787229adb327ca1`.
+No inner Docker daemon or additional device/cgroup grant was introduced.

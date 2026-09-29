@@ -6,6 +6,7 @@ import { WorkerRuntimeMigration, RuntimeMigrationStore, type RuntimeMigrationInp
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, error() {}, debug() {} });
 const SOURCE = 'a'.repeat(64), REPLACEMENT = 'b'.repeat(64), HELPER_IMAGE = `sha256:${'c'.repeat(64)}`;
+const SNAPSHOT_ID = `sha256:${'d'.repeat(64)}`;
 
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), 'agentor-runtime-migration-'));
@@ -27,8 +28,9 @@ async function fixture() {
       { Type: 'bind', Source: '/data/user/kilo', Destination: '/home/agent/.agent-data/.kilo/config', RW: true }],
     NetworkSettings: { Networks: { 'agentor-net': { Aliases: ['worker-1'] } } } };
   containers.set(SOURCE, source);
-  let fail: 'create' | 'start' | 'validate' | 'commit' | 'restore' | 'timeout' | 'mount' | 'authority' | undefined;
+  let fail: 'create' | 'start' | 'validate' | 'commit' | 'restore' | 'timeout' | 'mount' | 'image' | 'authority' | undefined;
   let restoredRecord: any; let committedRecord: any; let helperCounter = 0;
+  let snapshotTagId = SNAPSHOT_ID;
   let authorizeCount = 0, revokeAt = 0;
   const find = (id: string) => [...containers.values()].find((c) => c.Id === id || c.Name === `/${id}`);
   const missing = () => Object.assign(new Error('not found'), { statusCode: 404 });
@@ -53,14 +55,15 @@ async function fixture() {
     },
     wait: async () => ({ StatusCode: 0 }),
     rename: async (opts: any) => { const c = find(id); if (!c) throw missing(); events.push(`rename:${c.Id}`); c.Name = `/${opts.name}`; },
-    commit: async (opts: any) => { events.push('rootfs-snapshot'); expect(find(id).State.Running).toBe(false); return { Id: 'snapshot' }; },
+    commit: async (opts: any) => { events.push('rootfs-snapshot'); expect(find(id).State.Running).toBe(false); return { Id: SNAPSHOT_ID }; },
     remove: async () => { const c = find(id); if (!c) throw missing(); events.push(`remove:${c.Id}`); containers.delete(c.Id); },
   });
   const docker: any = {
     getContainer: handle,
     getVolume: (name: string) => ({ inspect: async () => { if (!volumes.has(name)) throw missing(); return volumes.get(name); },
       remove: async () => { events.push(`remove-volume:${name}`); volumes.delete(name); data.delete(name); } }),
-    getImage: (name: string) => ({ inspect: async () => ({ Config: { Env: ['BAKED_SETTING=default'] } }),
+    getImage: (name: string) => ({ inspect: async () => ({ Id: name.startsWith('agentor-import-') ? snapshotTagId : name,
+      Config: { Env: ['BAKED_SETTING=default'] } }),
       remove: async () => { events.push(`remove-image:${name}`); } }),
     createVolume: async (opts: any) => { volumes.set(opts.Name, { ...opts, Driver: 'local' }); return {}; },
     listContainers: async (opts: any) => [...containers.values()].filter((c) => c.Mounts.some((m: any) => m.Name === opts.filters.volume[0])).map((c) => ({ Id: c.Id })),
@@ -72,7 +75,8 @@ async function fixture() {
       const mounts = helper ? opts.HostConfig.Mounts.map((m: any) => ({ Type: m.Type, Name: m.Type === 'volume' ? m.Source : undefined,
         Source: m.Source, Destination: m.Target, RW: !m.ReadOnly })) : structuredClone(source.Mounts);
       if (!helper && fail === 'mount') mounts[mounts.length - 1]!.RW = false;
-      containers.set(id, { Id: id, Name: `/${opts.name}`, Config: { ...opts }, HostConfig: opts.HostConfig,
+      containers.set(id, { Id: id, Name: `/${opts.name}`, Image: !helper && fail === 'image' ? 'sha256:wrong' : opts.Image,
+        Config: { ...opts }, HostConfig: opts.HostConfig,
         State: { Running: false }, Mounts: mounts, NetworkSettings: source.NetworkSettings, helper });
       return handle(id);
     },
@@ -92,6 +96,7 @@ async function fixture() {
     restore: async (j) => { events.push('restore-policy'); restoredRecord = j.sourceRecord; },
   });
   return { dir, engine, store, input, source, containers, volumes, data, options, events,
+    repointSnapshot: (id: string) => { snapshotTagId = id; },
     revokeAt: (count: number) => { revokeAt = count; },
     fail: (value: typeof fail) => { fail = value; }, get restoredRecord() { return restoredRecord; },
     get committedRecord() { return committedRecord; }, cleanup: () => rm(dir, { recursive: true, force: true }) };
@@ -111,7 +116,9 @@ test('migration snapshots stopped rootfs and worker storage, preserves shared ac
     expect(f.data.get(j.mounts[0]!.backup)).toBe('original workspace');
     expect(f.options.filter((o) => o.name.startsWith('agentor-runtime-copy-')).every((o) => o.Image === HELPER_IMAGE)).toBe(true);
     const replacement = f.options.find((o) => o.name === f.input.sourceName);
-    expect(replacement.Image).toBe(j.snapshotImage);
+    expect(j.snapshotIdentity).toEqual({ reference: j.snapshotImage, imageId: SNAPSHOT_ID });
+    expect(f.store.get('owner-1', 'worker-1')!.snapshotIdentity).toEqual(j.snapshotIdentity);
+    expect(replacement.Image).toBe(SNAPSHOT_ID);
     expect(replacement.HostConfig).toMatchObject({ Runtime: 'agentor-kata-qemu', Privileged: false });
     expect(replacement.HostConfig.Binds).toContain('/data/user/kilo:/home/agent/.agent-data/.kilo/config');
     expect(f.options.filter((o) => o.name.startsWith('agentor-runtime-copy-')).flatMap((o) => o.HostConfig.Mounts)
@@ -132,7 +139,7 @@ test('standard secret tmpfs is recreated as ephemeral state while persistent sto
   } finally { await f.cleanup(); }
 });
 
-for (const phase of ['create', 'start', 'validate', 'commit'] as const) test(`migration ${phase} failure restores original runtime and canonical storage`, async () => {
+for (const phase of ['create', 'image', 'start', 'validate', 'commit'] as const) test(`migration ${phase} failure restores original runtime and canonical storage`, async () => {
   const f = await fixture();
   try {
     f.fail(phase);
@@ -144,6 +151,7 @@ for (const phase of ['create', 'start', 'validate', 'commit'] as const) test(`mi
     expect(f.restoredRecord.runtimeProfile).toBe('legacy-runc');
     expect(f.containers.has(SOURCE)).toBe(true);
     expect(f.containers.has(REPLACEMENT)).toBe(false);
+    if (phase === 'image') expect(f.events).not.toContain(`start:${REPLACEMENT}`);
     const j = f.store.get('owner-1', 'worker-1')!;
     expect(j.phase).toBe('rolled-back');
     expect(j.mounts.every((m) => f.volumes.has(m.backup))).toBe(true);
@@ -337,6 +345,19 @@ test('finalization removes retained evidence without deleting active rootfs or c
     expect(f.data.get('worker-workspace')).toBe('replacement workspace');
     expect(j.mounts.every((m) => !f.volumes.has(m.backup))).toBe(true);
     expect(f.events.some((e) => e.startsWith('remove-image:'))).toBe(false);
+  } finally { await f.cleanup(); }
+});
+
+test('rolled-back finalization never deletes an image reached through a repointed snapshot tag', async () => {
+  const f = await fixture();
+  try {
+    f.fail('create');
+    await expect(f.engine.migrate(f.input)).rejects.toMatchObject({ code: 'WORKER_RUNTIME_MIGRATION_ROLLED_BACK' });
+    const journal = f.store.get('owner-1', 'worker-1')!;
+    f.repointSnapshot(`sha256:${'e'.repeat(64)}`);
+    await expect(f.engine.finalize(journal)).rejects.toThrow(/reference changed/);
+    expect(f.events.some((event) => event.startsWith('remove-image:'))).toBe(false);
+    expect(f.store.get('owner-1', 'worker-1')).toBeDefined();
   } finally { await f.cleanup(); }
 });
 
