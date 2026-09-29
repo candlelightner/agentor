@@ -258,4 +258,51 @@ The subsequent frozen-source build has classic/config ID
 `sha256:7425e0f5e3dfc21d61f341dd5c3d9c6fa5c7b43c10add1f8075ade87ce320694`
 and archive manifest ID
 `sha256:0a290c98bb97a6965eb236698f06fef6b911ad8d5793de53fd1ff7b51c9709d9`.
-No VM load, live retry or destination restore is claimed for this image yet.
+The image was subsequently loaded into the disposable VM; the actual VM
+load/save archive passed the full cryptographic image-proof check against the
+local image. The restore-helper bytes remained unchanged.
+
+## Fixed-image source retry: backup succeeded, harness checksum mismatch
+
+The fresh fixed-image run repeated the authenticated non-DinD lifecycle,
+stopped its synthetic worker and completed a real encrypted instance backup.
+Both production volume-snapshot helpers were observed with the expected
+isolation and exact workspace/agent-data mounts. The application reported
+`succeeded` / `complete`, and the artifact's integrity status was `verified`.
+This establishes source backup creation, not successful destination restore.
+
+The harness then exited 1 at its downloaded-file checksum comparison. Source
+inspection established that `encryptInstanceBackup` returns SHA-256 over the
+**ciphertext plus GCM tag**, excluding the discovery header and IV; the harness
+had compared this with a whole-file hash. Read-only checks of the exact
+download confirmed matching size (185199 bytes) and matching payload/tag digest,
+but a different whole-file digest. No corrupted transport or failed encryption
+is established by that comparison failure.
+
+A harness-only correction now retains a whole-file transfer digest separately
+and compares the API checksum with the bounded payload/tag region. Four added
+fixtures distinguish header-only changes from ciphertext/tag changes and reject
+malformed/truncated/oversize input; 24 offline fixtures pass. This correction
+still requires independent review before another execution. The production
+destination must still perform authenticated decryption; checksums alone are
+not authentication. Recovery-kit export was not reached and the destination
+has not run.
+
+Cleanup removed the exact test containers and empty networks; the original
+stopped canary's full inspection was unchanged. Volumes and encrypted test
+material remain. No production credential was used or exported.
+
+- Source worker: `4fef47eb-d2fb-4b3d-a857-73ebc0bb9f97`.
+- Backup artifact: `dcad5675-67ba-4c2a-b3aa-af9deb8930db`.
+- Retained data volume: `kata-api-eyzq8z0u-data`.
+- VM evidence: `/home/kata-test/kata-api-lifecycle.eyzq8z0u`.
+- Local log: `/workspace/kata-vm-instance-source-fixed.log`.
+- Evidence archive: `/workspace/kata-vm-instance-source-fixed-evidence.tar.gz`,
+  SHA-256 `aa2ad34f59c08495a515e81daab953dcc1159091a26b851611c532965ca689aa`.
+- Actual VM image-export archive SHA-256:
+  `3b25c4f65fdfbda50e616152e1b59deb1b9eec7ce311948fef90e5140a9644ed`.
+- Image-proof log: `/workspace/kata-image-proof-live/backup-fix-image-proof.log`.
+
+The complete no-server module suite at this code checkpoint passed all 633
+tests (`/workspace/kata-all-modules-1ebfc1e.log`). These mocked/local tests are
+not full API/UI, migration or cross-host restore acceptance.
