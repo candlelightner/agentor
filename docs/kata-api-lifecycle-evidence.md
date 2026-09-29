@@ -207,3 +207,55 @@ suite, DinD, migration, backup restore or production-host acceptance.
 - Browser wrapper SHA-256: `1a1608e4f618278739db4f39954ab9b865292ee1dbd01b6d0ed406d94d0ff767`.
 - Archive: `/workspace/kata-vm-browser-lifecycle-evidence.tar.gz`, SHA-256
   `40000138a70992ed8545403d71138970cd77949b43f0687df16f7eb68d892532`.
+
+## Encrypted instance-backup source attempt: preflight failure
+
+A separately reviewed fresh source run repeated the non-DinD API lifecycle,
+stopped its synthetic worker and submitted a real encrypted instance backup.
+The job failed with `INSTANCE_BACKUP_FAILED` during preflight, before database
+or volume snapshots. Recovery-kit export and destination restore were not
+reached. The harness exited 1; its test containers were removed and evidence
+volumes retained. The original stopped canary remained unchanged.
+
+Read-only investigation found a missing lexical import: `defaultPreflight()`
+calls `useManagedVolumeManager()` without an accessible binding. The exact
+pinned image's archived bundle retains this bare reference while defining the
+manager factory under a different bundled name. An isolated execution with
+inactive-service mocks reproduced `ReferenceError: useManagedVolumeManager is
+not defined`. This is a concrete code defect consistent with the live failure;
+the original job sanitized its exception, so the live exception itself was not
+captured. No permission change or preflight bypass is indicated.
+
+The archived image manifest and application-layer hashes were rechecked against
+their content-addressed names. The image remains the previously proved
+`75a43c35…` VM manifest / `0f7fb34b…` classic config pair. The application layer
+is `sha256:c2ba1d5562af709e9301f510415a7310c1166c73c8b96490fd7f66974fd02cc6`.
+
+- Source worker: `79b975e0-46c7-4daf-9cbd-832b3c988922`.
+- Backup job: `ffc06a59-39d5-490e-a19d-4efe8ab15092`.
+- Retained data volume: `kata-api-0qfbljwm-data`.
+- VM evidence: `/home/kata-test/kata-api-lifecycle.0qfbljwm`.
+- Local log: `/workspace/kata-vm-instance-source.log`.
+- Archive: `/workspace/kata-vm-instance-source-evidence.tar.gz`, SHA-256
+  `85d9c044e81c1e8e48805108da484d9a9e2c5fd911142910fcfc6e13553cdebf`.
+
+The source/restore harnesses passed 20 offline cases before this run. Those
+checks and this failed source run do not establish encrypted cross-host restore.
+
+The missing import has now been fixed with an explicit local module binding.
+New regression tests invoke the constructor-selected default preflight without
+the old test override: three reproduced the missing binding before the fix,
+and all 12 manager tests pass afterward. Main reviewed the change and passed
+318 combined capacity/migration/admin/backup-manager tests and full typecheck.
+An isolated check of the actual rebuilt image's bundled preflight passed all
+nine active-operation guard cases, active-worker rejection and quiescent
+success (11 cases). Service dependencies are inert mocks in these checks;
+they do not replace a live backup/restore retry.
+
+An initial successful image build captured an intermediate edit and still had
+an unresolved binding; read-only bundle inspection rejected it before any run.
+The subsequent frozen-source build has classic/config ID
+`sha256:7425e0f5e3dfc21d61f341dd5c3d9c6fa5c7b43c10add1f8075ade87ce320694`
+and archive manifest ID
+`sha256:0a290c98bb97a6965eb236698f06fef6b911ad8d5793de53fd1ff7b51c9709d9`.
+No VM load, live retry or destination restore is claimed for this image yet.

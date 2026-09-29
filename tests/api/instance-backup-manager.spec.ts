@@ -1,11 +1,13 @@
 import { expect, test } from "@playwright/test";
 import { createWriteStream } from "node:fs";
 import { createRequire } from "node:module";
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { createGzip } from "node:zlib";
+import { runInNewContext } from "node:vm";
+import ts from "typescript";
 import { backupKeyFingerprint } from "../../orchestrator/server/utils/backup-keyring";
 import {
   FakeBackupProvider,
@@ -27,6 +29,74 @@ const orchestratorRequire = createRequire(
   new URL("../../orchestrator/package.json", import.meta.url),
 );
 const tar = orchestratorRequire("tar-stream") as { pack(): any };
+
+/** Execute the real module and constructor-selected default preflight in an
+ * isolated CommonJS transform. Every service import is a safe mock; no Nitro
+ * globals, Docker clients, singleton initialization or filesystem stores run.
+ * In particular, do not install a global useManagedVolumeManager: that would
+ * conceal the missing lexical binding this regression is intended to catch.
+ */
+async function defaultPreflightFixture(active = "") {
+  const calls: string[] = [];
+  const operation = (name: string) => ({
+    hasActiveOperationsForInstanceSnapshot: () => { calls.push(name); return active === name; },
+  });
+  const backup = operation("backup");
+  const modules: Record<string, unknown> = {
+    "node:path": { join },
+    "./services": {
+      useContainerManager: () => ({
+        list: () => active === "worker" ? [{ status: "running" }] : [],
+        hasPendingRuntimeMigrations: async () => { calls.push("migration"); return active === "migration"; },
+      }),
+      useWorkerGroupStore: () => ({ list: () => [] }),
+      useExportJobManager: () => operation("export"),
+      useUsageChecker: () => operation("usage"),
+      useOrphanSweeper: () => operation("orphan"),
+    },
+    "./admin-workspace-store": { useAdminWorkspaceStore: () => ({ getRecord: () => undefined }) },
+    "./backup-manager": { useBackupManager: () => backup },
+    "./managed-volume-manager": { useManagedVolumeManager: () => operation("managed-volume") },
+    "./managed-volume-sizing": { useManagedVolumeSizingManager: () => operation("sizing") },
+    "./portable-managed-volume-runtime": { usePortableManagedVolumeRuntime: () => operation("portable") },
+    "./image-catalog": { useImageCatalogManager: () => operation("image") },
+  };
+  const source = await readFile(new URL("../../orchestrator/server/utils/instance-backup-manager.ts", import.meta.url), "utf8");
+  const compiled = ts.transpileModule(source, { compilerOptions: {
+    target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, esModuleInterop: true,
+  } }).outputText;
+  const exports: Record<string, any> = {};
+  runInNewContext(compiled, {
+    exports,
+    // Unused imports receive empty modules, never access real services.
+    require: (id: string) => modules[id] ?? Object.freeze({}),
+  }, { timeout: 1_000 });
+  const manager = new exports.InstanceBackupManager({
+    dataDir: "/unused-synthetic-preflight", docker: {}, store: {}, backupManager: backup,
+    authSnapshot: async () => { throw new Error("Snapshot must not run in preflight fixture"); },
+  });
+  return { calls, run: () => manager.preflightCreate() };
+}
+
+test("default instance preflight resolves managed-volume binding and visits every quiescence guard", async () => {
+  const fixture = await defaultPreflightFixture();
+  await expect(fixture.run()).resolves.toBeUndefined();
+  expect(fixture.calls).toEqual(["migration", "backup", "managed-volume", "sizing", "portable", "export", "image", "usage", "orphan"]);
+});
+
+for (const active of ["managed-volume", "orphan"]) {
+  test(`default instance preflight rejects active ${active} operations`, async () => {
+    const fixture = await defaultPreflightFixture(active);
+    await expect(fixture.run()).rejects.toMatchObject({ code: "INSTANCE_BACKUP_JOBS_ACTIVE", statusCode: 409 });
+    expect(fixture.calls.at(-1)).toBe(active);
+  });
+}
+
+test("default instance preflight rejects running workers before querying operation guards", async () => {
+  const fixture = await defaultPreflightFixture("worker");
+  await expect(fixture.run()).rejects.toMatchObject({ code: "INSTANCE_BACKUP_WORKSPACES_ACTIVE", statusCode: 409 });
+  expect(fixture.calls).toEqual([]);
+});
 
 async function settled(manager: InstanceBackupManager, id: string) {
   const deadline = Date.now() + 15_000;

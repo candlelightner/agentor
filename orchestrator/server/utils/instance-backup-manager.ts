@@ -1419,10 +1419,11 @@ export class InstanceBackupManager {
   }
 
   private async defaultPreflight() {
-    const [services, adminStoreModule, imageModule] = await Promise.all([
+    const [services, adminStoreModule, imageModule, managedVolumeModule] = await Promise.all([
       import("./services"),
       import("./admin-workspace-store"),
       import("./image-catalog"),
+      import("./managed-volume-manager"),
     ]);
     const activeWorkers = services
       .useContainerManager()
@@ -1449,7 +1450,7 @@ export class InstanceBackupManager {
     if (
       (await services.useContainerManager().hasPendingRuntimeMigrations()) ||
       (await useBackupManager().hasActiveOperationsForInstanceSnapshot()) ||
-      useManagedVolumeManager().hasActiveOperationsForInstanceSnapshot() ||
+      managedVolumeModule.useManagedVolumeManager().hasActiveOperationsForInstanceSnapshot() ||
       (await import("./managed-volume-sizing")).useManagedVolumeSizingManager().hasActiveOperationsForInstanceSnapshot() ||
       (await import("./portable-managed-volume-runtime")).usePortableManagedVolumeRuntime().hasActiveOperationsForInstanceSnapshot() ||
       services.useExportJobManager().hasActiveOperationsForInstanceSnapshot() ||
