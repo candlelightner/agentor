@@ -2,7 +2,7 @@ import type { AdminLegacyRuntimeAuthorization } from './worker-runtime-policy';
 import { resolveWorkerRuntimeProfile } from './worker-runtime-policy';
 import { withOwnerWorkerLifecycleMutation } from './worker-lifecycle-coordinator';
 import { instanceSnapshotActive } from './instance-snapshot-gate';
-import type { WorkerRecord } from './worker-store';
+import { workerRuntimeProjection, type WorkerRecord, type WorkerRuntimeWriteGuard } from './worker-store';
 import type { ContainerInfo } from '../../shared/types';
 
 /** Server-held authority callback. Never construct this from request fields. */
@@ -36,7 +36,8 @@ export async function authorizeRuntimeSelection(
 
 export interface RuntimeGrantDependencies {
   find(id: string): WorkerRecord | undefined;
-  save(record: WorkerRecord): Promise<void>;
+  save(record: WorkerRecord, guard: WorkerRuntimeWriteGuard): Promise<void>;
+  assertRuntimeChangeAllowed(id: string): Promise<void>;
   live(id: string): ContainerInfo | undefined;
   verifyLock(id: string, password: unknown): Promise<void>;
   assertKataReady?(): Promise<void>;
@@ -57,13 +58,15 @@ export async function approveRestoredKataRuntime(
       throw Object.assign(new Error('Worker not found'), { statusCode: 404 });
     if (worker.runtimeProfile !== 'kata-qemu')
       throw Object.assign(new Error('Changing a worker runtime requires explicit migration'), { statusCode: 409 });
+    await deps.assertRuntimeChangeAllowed(workerId);
     await deps.verifyLock(workerId, lockPassword);
     if (!deps.assertKataReady) throw Object.assign(new Error('Kata readiness unavailable'), { statusCode: 503 });
     await deps.assertKataReady();
     const next = { ...worker, updatedAt: new Date().toISOString() };
     delete next.runtimeRestoreApprovalRequired;
     delete next.legacyPrivilegeGrant;
-    await deps.save(next);
+    await deps.save(next, { expectedRuntime: workerRuntimeProjection(worker),
+      expectedRestoreApprovalRequired: worker.runtimeRestoreApprovalRequired });
     const live = deps.live(workerId);
     if (live) delete live.runtimeRestoreApprovalRequired;
     return { workerId, runtimeProfile: 'kata-qemu' as const, authorized: true };
@@ -90,11 +93,13 @@ export async function grantLegacyWorkerRuntime(
       throw Object.assign(new Error('Worker not found'), { statusCode: 404 });
     if (resolveWorkerRuntimeProfile(worker.runtimeProfile) !== 'legacy-runc')
       throw Object.assign(new Error('Changing a worker runtime requires explicit migration'), { statusCode: 409 });
+    await deps.assertRuntimeChangeAllowed(workerId);
     await deps.verifyLock(workerId, input.lockPassword);
     const next: WorkerRecord = { ...worker, runtimeProfile: 'legacy-runc',
       legacyPrivilegeGrant: 'admin', updatedAt: new Date().toISOString() };
     delete next.runtimeRestoreApprovalRequired;
-    await deps.save(next);
+    await deps.save(next, { expectedRuntime: workerRuntimeProjection(worker),
+      expectedRestoreApprovalRequired: worker.runtimeRestoreApprovalRequired });
     const live = deps.live(workerId);
     if (live) {
       live.runtimeProfile = 'legacy-runc';
@@ -114,7 +119,8 @@ export async function runtimeGrantDependencies(): Promise<RuntimeGrantDependenci
   ]);
   return {
     find: (id) => useWorkerStore().findById(id),
-    save: (record) => useWorkerStore().upsert(record),
+    save: (record, guard) => useWorkerStore().upsert(record, guard),
+    assertRuntimeChangeAllowed: (id) => useContainerManager().assertRuntimeRecordChangeAllowed(id),
     live: (id) => useContainerManager().get(id),
     verifyLock: async (id, password) => { await useWorkerProtectionLockStore().verify(id, password); },
     assertKataReady: () => useDockerService().assertWorkerRuntimeAvailable('kata-qemu'),

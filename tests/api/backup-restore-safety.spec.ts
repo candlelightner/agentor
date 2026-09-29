@@ -64,6 +64,7 @@ function legacyLifecycleRuntimeFixture() {
     assertRuntimeRestoreApproved: (ContainerManager.prototype as any).assertRuntimeRestoreApproved,
     assertRuntimeRollbackFinalized: (ContainerManager.prototype as any).assertRuntimeRollbackFinalized,
     assertRecreationRuntime: (ContainerManager.prototype as any).assertRecreationRuntime,
+    publishWorkerMetadata: (ContainerManager.prototype as any).publishWorkerMetadata,
     resolveEnvironmentConfig: () => ({ dockerEnabled: true }),
     deriveLimits: () => ({ dockerEnabled: true }),
   };
@@ -225,6 +226,7 @@ test("missing-runtime reconciliation rechecks atomically behind the worker lifec
   const manager = new ContainerManager({} as any, {
     containerPrefix: "agentor-worker",
   } as any);
+  (manager as any).runtimeMigrationStore = { init: async () => {}, get: () => undefined, isBlocked: () => false };
   manager.setWorkerStore({
     listActive: () => [record],
     listArchived: () => [],
@@ -1062,7 +1064,7 @@ test("worker settings roll back in memory when durable persistence fails", async
     assertOrdinaryMutation: () => {},
     userEnvStore: undefined,
     workerStore: {
-      upsert: async () => {
+      updateSettings: async () => {
         throw new Error("injected worker settings persistence failure");
       },
     },

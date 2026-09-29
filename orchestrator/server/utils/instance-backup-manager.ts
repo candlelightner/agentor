@@ -390,6 +390,10 @@ export class InstanceBackupManager {
       });
     const restoreOptions = normalizeRestoreOptions(options, false);
     const services = await import("./services");
+    if (services.useWorkerStore().hasUnavailableOwners())
+      throw Object.assign(new Error('Worker records are unavailable; resolve worker-store recovery before instance restore'), {
+        statusCode: 503, code: 'WORKER_RECORD_STORE_UNAVAILABLE',
+      });
     const adminStore = await import("./admin-workspace-store");
     const storage = services.useStorageManager();
     await storage.init();
@@ -1327,7 +1331,18 @@ export class InstanceBackupManager {
     await storage.init();
     const candidates = new Map<string, VolumeCandidate>();
     const add = (candidate: VolumeCandidate) => candidates.set(candidate.name, candidate);
-    for (const worker of services.useWorkerStore().list()) {
+    const workerStore = services.useWorkerStore();
+    const assertWorkerInventoryAvailable = () => {
+      if (workerStore.hasUnavailableOwners())
+        throw Object.assign(new Error('Worker inventory became unavailable during instance backup'), {
+          statusCode: 503, code: 'WORKER_RECORD_STORE_UNAVAILABLE',
+        });
+    };
+    assertWorkerInventoryAvailable();
+    // list() intentionally omits unavailable owners for ordinary UI inventory.
+    // A whole-instance backup must instead fail, never silently omit workers.
+    const workers = workerStore.listUserIds().flatMap(owner => workerStore.listForUser(owner));
+    for (const worker of workers) {
       const containerName = `${useConfig().containerPrefix}-${worker.id}`;
       if (storage.mode === "volume") {
         add({ name: `${containerName}-workspace`, kind: "worker-workspace", ownerId: worker.userId, workerId: worker.id });
@@ -1392,6 +1407,11 @@ export class InstanceBackupManager {
         ),
       ),
     ];
+    assertWorkerInventoryAvailable();
+    const capturedWorkerImages = await capturedWorkerImageInventory(this.docker, workers, signal, {
+      containerPrefix: useConfig().containerPrefix,
+    });
+    assertWorkerInventoryAvailable();
     return {
       volumes,
       plugins: {
@@ -1406,9 +1426,7 @@ export class InstanceBackupManager {
       images: {
         definitions: images.length,
         immutableDigests,
-        capturedWorkerImages: await capturedWorkerImageInventory(this.docker, services.useWorkerStore().list(), signal, {
-          containerPrefix: useConfig().containerPrefix,
-        }),
+        capturedWorkerImages,
         layersIncluded: false as const,
       },
       storage: {
@@ -1425,6 +1443,10 @@ export class InstanceBackupManager {
       import("./image-catalog"),
       import("./managed-volume-manager"),
     ]);
+    if (services.useWorkerStore().hasUnavailableOwners())
+      throw Object.assign(new Error('Worker records are unavailable; resolve worker-store recovery before instance backup'), {
+        statusCode: 503, code: 'WORKER_RECORD_STORE_UNAVAILABLE',
+      });
     const activeWorkers = services
       .useContainerManager()
       .list()

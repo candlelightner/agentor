@@ -303,12 +303,13 @@ test('create result lost to completion persistence failure is recovered by exact
       getImage: (name: string) => ({ inspect: async () => ({ Id: name === j.sourceImageId ? name : snapshotId, Config: { Env: [] } }) }),
       createContainer: async (opts: any) => {
         mutations.push('create');
-        containers.set(replacementId, { Id: replacementId, Name: '/' + opts.name, Config: opts,
+        containers.set(replacementId, { Id: replacementId, Name: '/' + opts.name, Image: opts.Image, Config: opts,
           State: { Running: false }, HostConfig: opts.HostConfig, Mounts: [] });
         f.fail('owner-sync'); // Fail after create returned, not its durable intent.
         return handle(replacementId);
       } };
-    const callbacks: any = { trustedHelperImage: async () => j.helperImage, authorize: async () => {}, restore: async () => {} };
+    const callbacks: any = { trustedHelperImage: async () => j.helperImage, authorize: async () => {}, restore: async () => {},
+      assertRecord: async () => {}, publish: () => {} };
     const migration = new WorkerRuntimeMigration(docker, f.store, callbacks);
     migration.preflight = async () => ({ source, owned: [], plan: {} } as any);
     await expect(migration.migrate({ record: j.sourceRecord, sourceId: SOURCE, sourceName: j.sourceName,

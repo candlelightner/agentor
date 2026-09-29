@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 import { authorizeRuntimeSelection, authorizeRuntimeRestore, grantLegacyWorkerRuntime, approveRestoredKataRuntime } from '../../orchestrator/server/utils/worker-runtime-admin';
 import { withOwnerWorkerLifecycleMutation } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
 import { beginInstanceSnapshot } from '../../orchestrator/server/utils/instance-snapshot-gate';
-import type { WorkerRecord } from '../../orchestrator/server/utils/worker-store';
+import { workerRuntimeProjection, type WorkerRecord, type WorkerRuntimeWriteGuard } from '../../orchestrator/server/utils/worker-store';
 import { ContainerManager } from '../../orchestrator/server/utils/container';
 
 const deny = async () => { throw Object.assign(new Error('Forbidden'), { statusCode: 403 }); };
@@ -46,12 +46,14 @@ function fixture(profile?: WorkerRecord['runtimeProfile']) {
     createdAt: '2026-01-01', updatedAt: '2026-01-01', runtimeProfile: profile };
   let writes = 0;
   let locks = 0;
+  let lastGuard: WorkerRuntimeWriteGuard | undefined;
   return { deps: {
     find: () => saved,
-    save: async (record: WorkerRecord) => { saved = record; writes++; },
+    save: async (record: WorkerRecord, guard: WorkerRuntimeWriteGuard) => { lastGuard = guard; saved = record; writes++; },
+    assertRuntimeChangeAllowed: async () => {},
     live: () => undefined,
     verifyLock: async () => { locks++; },
-  }, record: () => saved, writes: () => writes, locks: () => locks };
+  }, record: () => saved, guard: () => lastGuard, writes: () => writes, locks: () => locks };
 }
 
 test('an old archive receives durable admin authorization without starting or migrating it', async () => {
@@ -62,6 +64,7 @@ test('an old archive receives durable admin authorization without starting or mi
   expect(f.writes()).toBe(1);
   expect(f.locks()).toBe(1);
   expect(f.record().runtimeRestoreApprovalRequired).toBeUndefined();
+  expect(f.guard()).toEqual({ expectedRuntime: workerRuntimeProjection({}), expectedRestoreApprovalRequired: true });
 });
 
 test('restored Kata approval requires destination readiness and keeps the runtime profile', async () => {
@@ -109,4 +112,27 @@ test('queued grant rechecks administrator authority before persistence', async (
   await first;
   await expect(pending).rejects.toMatchObject({ statusCode: 403 });
   expect(f.writes()).toBe(0);
+});
+
+for (const code of ['WORKER_RECORD_STORE_UNAVAILABLE', 'WORKER_RECORD_RUNTIME_CONFLICT']) test(`runtime admin ${code} does not publish uncommitted authority`, async () => {
+  const f = fixture();
+  const live: any = { runtimeRestoreApprovalRequired: true };
+  await expect(grantLegacyWorkerRuntime(admin, 'runtime-grant-worker', { acknowledgeHostPrivilege: true }, {
+    ...f.deps, live: () => live,
+    save: async () => { throw Object.assign(new Error('record write rejected'), { code }); },
+  })).rejects.toMatchObject({ code });
+  expect(live).toEqual({ runtimeRestoreApprovalRequired: true });
+  expect(f.writes()).toBe(0);
+});
+
+for (const phase of ['committed', 'rolled-back']) test(`runtime admin preserves ${phase} migration finalization hold`, async () => {
+  const f = fixture();
+  const manager = new ContainerManager({} as any, {} as any);
+  manager.setWorkerStore({ findById: () => f.record() } as any);
+  (manager as any).runtimeMigrationStore = { init: async () => {}, get: () => ({ phase }), isBlocked: () => false };
+  await expect(grantLegacyWorkerRuntime(admin, 'runtime-grant-worker', { acknowledgeHostPrivilege: true }, {
+    ...f.deps, assertRuntimeChangeAllowed: (id) => manager.assertRuntimeRecordChangeAllowed(id),
+  })).rejects.toMatchObject({ code: 'WORKER_RUNTIME_MIGRATION_FINALIZE_REQUIRED' });
+  expect(f.writes()).toBe(0);
+  expect(f.locks()).toBe(0);
 });

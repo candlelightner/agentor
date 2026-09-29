@@ -112,11 +112,12 @@ The following are no-server module suites selected by `tests/playwright.modules.
 
 An earlier local module checkpoint passed 384 tests in 34 files; that checkpoint's
 discovery listed 2293 tests in 223 files (1655 API, 638 UI). The latter was not a
-whole-suite pass. A subsequent worker-durability integration checkpoint passed
-716 module tests and typechecking, but independent review found additional
-integration gaps; those results do not validate the later fixes or complete the
-review. A later interim integration run had 738 passes and one failing new
-settings-race fixture; further configuration/recreation fixes remain in progress.
+whole-suite pass. The reviewed worker-durability integration now passes all
+764 selected module/component tests and the full Nuxt/vue-tsc typecheck. Independent review covered the final
+image-pin backfill ordering and exact configuration-materialization receipts,
+including same-millisecond desired/applied differences. Earlier intermediate
+runs (716 passes, and 738 passes with one settings-race failure) are superseded
+for this scoped code checkpoint, not reclassified as broader acceptance.
 The expanded recovery dashboard, route authorization and MCP tests passed 30
 checks independently, with mocked services rather than a live backend.
 Offline smoke coverage has 21 scenarios; the standalone worker harness has 11
@@ -139,7 +140,8 @@ The following end-to-end checks remain required; their appearance here is not a 
 - `tests/api/worker-export-import.spec.ts`, `tests/api/portable-managed-volumes.spec.ts`, and `tests/api/backup-restore-safety.spec.ts`: export/import and restore cannot elevate runtime from manifest data; old/missing profile metadata is handled under policy.
 - `tests/api/instance-backup-manager.spec.ts` and `tests/api/instance-backup-bundle.spec.ts`: durable per-worker profile round-trips, while restore policy remains authoritative.
 - Extend mocked migration coverage with real disposable Docker/Kata acceptance for downtime/report state, workspace/agent/Docker/managed-volume data, writable-rootfs preservation, failed replacement rollback, validation success, and no automatic migration.
-- Migration journals use a separately reviewed migration-only durable store: mode0600 exclusive temporary files, file and directory synchronization (including first-owner ancestry), empty-array clear tombstones, publish-after-sync memory and sticky owner quarantine on persistence failures. The Docker wrapper no longer retries a failed completion-journal write or permits automatic rollback/helper removal after journal uncertainty. Recovery can identify a replacement whose successful create result was lost. The pending worker-only durable store and engine integration add journaled worker-transition intent, guarded runtime-only worker persistence, terminal-journal durability before live publication, and explicit reconciliation of loaded terminal journals. Both terminal phases retain evidence until separate finalization. This integration is still under independent review, including ordinary lifecycle/backup quarantine boundaries, queued metadata preservation and a discoverable recovery UI when normal inventory hides held workers. Earlier journal tests and the 716-test checkpoint do not prove these later fixes, whole-migration power-loss survival or real rollback acceptance.
+- Migration journals use a separately reviewed migration-only durable store: mode0600 exclusive temporary files, file and directory synchronization (including first-owner ancestry), empty-array clear tombstones, publish-after-sync memory and sticky owner quarantine on persistence failures. The Docker wrapper no longer retries a failed completion-journal write or permits automatic rollback/helper removal after journal uncertainty. Recovery can identify a replacement whose successful create result was lost. The independently reviewed worker-only durable store and engine integration add journaled worker-transition intent, guarded runtime-only worker persistence, terminal-journal durability before live publication, and explicit reconciliation of loaded terminal journals. Both terminal phases retain evidence until separate finalization. Review and regressions cover ordinary lifecycle/backup quarantine boundaries, queued metadata/rebuild-debt preservation, exact configuration materialization, and a dashboard recovery inventory independent of held workers' absence from live inventory. This is code-level evidence, not whole-migration power-loss survival or real rollback acceptance.
+- Whole-instance snapshot consistency still needs an admitted-mutation drain: the current HTTP/MCP admission barrier and active-job checks do not prove that already-admitted asynchronous writes have settled. Strict worker-inventory availability checks prevent silent quarantine omissions, but do not establish whole-control-plane snapshot atomicity.
 - Complete isolated DinD acceptance after settling guest permissions/cgroups and storage. Run host compatibility and Kata/QEMU execution as an operator-approved physical-host canary; do not present local tests as host verification.
 
 ## Operator handoff

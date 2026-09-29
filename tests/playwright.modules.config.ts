@@ -1,7 +1,7 @@
 import { defineConfig } from "@playwright/test";
 
-/** Fast server-module tests that import utility code directly and therefore do
- * not require a running Agentor installation or authenticated global setup. */
+/** Isolated module/component tests that do not require a running Agentor
+ * installation or authenticated global setup. */
 export default defineConfig({
   testDir: ".",
   testMatch: [
@@ -14,6 +14,10 @@ export default defineConfig({
     "api/portable-managed-volume-runtime.spec.ts",
     "api/admin-workspace-store-transactions.spec.ts",
     "api/container-store-quarantine.spec.ts",
+    "api/worker-store-durability.spec.ts",
+    "api/config-store-integrity.spec.ts",
+    "api/worker-config-materialization.spec.ts",
+    "api/management-owner-validation.spec.ts",
     "api/instance-backup-*.spec.ts",
     "api/instance-restore-helper.spec.ts",
     "api/managed-volume-store.spec.ts",
@@ -26,6 +30,7 @@ export default defineConfig({
     "api/worker-self-access-policy.spec.ts",
     "api/worker-runtime-policy.spec.ts",
     "api/worker-runtime-admin.spec.ts",
+    "api/worker-runtime-recovery-route.spec.ts",
     "api/worker-runtime-backup.spec.ts",
     "api/backup-restore-safety.spec.ts",
     "api/worker-runtime-migration.spec.ts",
@@ -39,6 +44,7 @@ export default defineConfig({
     "api/worker-export-format.spec.ts",
     "api/kata-managed-volume-runtime.spec.ts",
     "api/workspace-download-cancellation.spec.ts",
+    "ui/worker-runtime-recovery.spec.ts",
   ],
   fullyParallel: false,
   workers: 1,

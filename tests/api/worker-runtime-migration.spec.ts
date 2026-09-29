@@ -1,17 +1,36 @@
 import { test, expect } from '@playwright/test';
-import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir, writeFile, open, rename, unlink, readFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { WorkerRuntimeMigration, RuntimeMigrationStore, type RuntimeMigrationInput } from '../../orchestrator/server/utils/worker-runtime-migration';
+import { WorkerRuntimeMigration, RuntimeMigrationStore, migrationTargetRuntime, type RuntimeMigrationInput } from '../../orchestrator/server/utils/worker-runtime-migration';
+import { WorkerStore, workerRuntimeProjection, sameWorkerRuntimeProjection } from '../../orchestrator/server/utils/worker-store';
+import type { WorkerStoreIO } from '../../orchestrator/server/utils/worker-durable-store';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, error() {}, debug() {} });
 const SOURCE = 'a'.repeat(64), REPLACEMENT = 'b'.repeat(64), HELPER_IMAGE = `sha256:${'c'.repeat(64)}`;
 const SNAPSHOT_ID = `sha256:${'d'.repeat(64)}`;
 
-async function fixture() {
+async function fixture(durableRecords = false) {
   const dir = await mkdtemp(join(tmpdir(), 'agentor-runtime-migration-'));
   const store = new RuntimeMigrationStore(dir); await store.init();
   const events: string[] = [];
+  let workerFailure: { transition: 'commit' | 'restore'; stage: 'file-sync' | 'owner-sync' } | undefined;
+  let transition: 'commit' | 'restore' | undefined;
+  const workerIO: WorkerStoreIO = {
+    mkdir: (path, options) => mkdir(path, options), rename, unlink,
+    open: async (path, flags, mode) => {
+      const handle = await open(path, flags, mode);
+      const stage = flags & constants.O_DIRECTORY ? (path === join(dir, 'users', 'owner-1') ? 'owner-sync' : 'ancestry-sync') : 'file-sync';
+      return { writeFile: (data, options) => handle.writeFile(data, options), close: () => handle.close(),
+        sync: async () => {
+          if (workerFailure?.transition === transition && workerFailure?.stage === stage)
+            throw Object.assign(new Error('injected worker persistence failure'), { code: 'EIO' });
+          await handle.sync();
+        } };
+    },
+  };
+  const workers = new WorkerStore(dir, workerIO); await workers.init();
   const options: any[] = [];
   const volumes = new Map<string, any>([['worker-workspace', { Name: 'worker-workspace', Driver: 'local', Options: {}, Labels: {} }],
     ['worker-agents', { Name: 'worker-agents', Driver: 'local', Options: {}, Labels: {} }]]);
@@ -32,6 +51,7 @@ async function fixture() {
   let restoredRecord: any; let committedRecord: any; let helperCounter = 0;
   let snapshotTagId = SNAPSHOT_ID;
   let authorizeCount = 0, revokeAt = 0;
+  let beforeValidation: (() => Promise<void>) | undefined;
   const find = (id: string) => [...containers.values()].find((c) => c.Id === id || c.Name === `/${id}`);
   const missing = () => Object.assign(new Error('not found'), { statusCode: 404 });
   const handle = (id: string): any => ({ id,
@@ -87,15 +107,52 @@ async function fixture() {
     ownedBindings: [{ source: 'worker-workspace', target: '/workspace', type: 'volume' },
       { source: 'worker-agents', target: '/home/agent/.agent-data', type: 'volume' }],
     sharedBindings: [{ source: '/data/user/kilo', target: '/home/agent/.agent-data/.kilo/config' }] };
-  const engine = new WorkerRuntimeMigration(docker, store, {
+  if (durableRecords) await workers.upsert(input.record);
+  const createEngine = (journalStore = store, workerStore = workers) => new WorkerRuntimeMigration(docker, journalStore, {
     authorize: async () => { events.push('authorize'); authorizeCount++; if (fail === 'authority' || authorizeCount === revokeAt) throw Object.assign(new Error('administrator revoked'), { statusCode: 403 }); },
     trustedHelperImage: async () => HELPER_IMAGE,
     assertAvailable: async () => { events.push('readiness'); },
-    validate: async (id) => { events.push(`validate:${id}`); if (id === REPLACEMENT && (fail === 'validate' || fail === 'restore')) throw new Error('validation failure'); },
-    commit: async (j) => { events.push('commit-policy'); if (fail === 'commit') throw new Error('persist failure'); committedRecord = j; },
-    restore: async (j) => { events.push('restore-policy'); restoredRecord = j.sourceRecord; },
+    validate: async (id) => { events.push(`validate:${id}`); if (id === REPLACEMENT) await beforeValidation?.(); if (id === REPLACEMENT && (fail === 'validate' || fail === 'restore')) throw new Error('validation failure'); },
+    commit: async (j) => {
+      events.push('commit-policy'); if (fail === 'commit') throw new Error('persist failure');
+      if (durableRecords) {
+        transition = 'commit';
+        await workerStore.transitionRuntimeMigration({ userId: j.userId, workerId: j.workerId,
+          expected: workerRuntimeProjection(j.sourceRecord), target: migrationTargetRuntime(j) });
+        transition = undefined;
+      }
+      committedRecord = j;
+    },
+    restore: async (j) => {
+      events.push('restore-policy');
+      if (durableRecords) {
+        transition = 'restore';
+        await workerStore.transitionRuntimeMigration({ userId: j.userId, workerId: j.workerId,
+          expected: j.snapshotIdentity ? migrationTargetRuntime(j) : workerRuntimeProjection(j.sourceRecord),
+          target: workerRuntimeProjection(j.sourceRecord) });
+        transition = undefined;
+      }
+      restoredRecord = j.sourceRecord;
+    },
+    assertRecord: async (j, expected, durable) => {
+      if (!durableRecords) return;
+      events.push('assert-record');
+      const current = workerStore.get(j.userId, j.workerId);
+      const source = workerRuntimeProjection(j.sourceRecord);
+      const target = j.snapshotIdentity ? migrationTargetRuntime(j) : undefined;
+      if (!current || current.status !== 'active' || current.deletionPending || current.runtimeRestoreApprovalRequired ||
+          !(expected !== 'target' && sameWorkerRuntimeProjection(current, source) ||
+            expected !== 'source' && target && sameWorkerRuntimeProjection(current, target)))
+        throw Object.assign(new Error('worker record mismatch'), { code: 'WORKER_RECORD_RUNTIME_CONFLICT' });
+      if (durable) await workerStore.transitionRuntimeMigration({ userId: j.userId, workerId: j.workerId,
+        expected: workerRuntimeProjection(current), target: workerRuntimeProjection(current) });
+    },
+    publish: (_j, phase) => { events.push(`publish:${phase}`); },
   });
-  return { dir, engine, store, input, source, containers, volumes, data, options, events,
+  const engine = createEngine();
+  return { dir, engine, store, workers, createEngine, input, source, containers, volumes, data, options, events,
+    workerFailure: (value: typeof workerFailure) => { workerFailure = value; },
+    beforeValidation: (hook: () => Promise<void>) => { beforeValidation = hook; },
     repointSnapshot: (id: string) => { snapshotTagId = id; },
     revokeAt: (count: number) => { revokeAt = count; },
     fail: (value: typeof fail) => { fail = value; }, get restoredRecord() { return restoredRecord; },
@@ -136,6 +193,157 @@ test('standard secret tmpfs is recreated as ephemeral state while persistent sto
     const j = await f.engine.migrate(f.input);
     expect(j.phase).toBe('committed');
     expect(j.mounts.map((m) => m.target)).not.toContain('/run/agentor-secrets');
+  } finally { await f.cleanup(); }
+});
+
+for (const stage of ['file-sync', 'owner-sync'] as const) test(`uncertain worker commit ${stage} retains durable intent without rollback or publication`, async () => {
+  const f = await fixture(true);
+  try {
+    f.workerFailure({ transition: 'commit', stage });
+    await expect(f.engine.migrate(f.input)).rejects.toMatchObject({ code: 'WORKER_RECORD_STORE_UNAVAILABLE' });
+    expect(f.events.slice(f.events.indexOf('commit-policy'))).toEqual(['commit-policy']);
+    expect(f.source.State.Running).toBe(false);
+    expect(f.containers.has(REPLACEMENT)).toBe(true);
+    const journals = new RuntimeMigrationStore(f.dir); await journals.init();
+    const workers = new WorkerStore(f.dir); await workers.init();
+    const j = journals.get('owner-1', 'worker-1')!;
+    expect(j.workerRecordIntent).toBe('commit');
+    expect(j.phase).toBe('validated');
+    expect(workers.get('owner-1', 'worker-1')!.runtimeProfile).toBe(stage === 'owner-sync' ? 'kata-qemu' : 'legacy-runc');
+    const engine = f.createEngine(journals, workers);
+    await expect(engine.recover(j)).rejects.toMatchObject({ code: 'WORKER_RUNTIME_MIGRATION_OUTCOME_UNCERTAIN' });
+    f.workerFailure(undefined);
+    await engine.recover(j, true);
+    expect(journals.get('owner-1', 'worker-1')!.phase).toBe('rolled-back');
+    expect(workers.get('owner-1', 'worker-1')!.runtimeProfile).toBe('legacy-runc');
+  } finally { await f.cleanup(); }
+});
+
+test('uncertain worker restore cannot restart the original or publish rollback', async () => {
+  const f = await fixture(true);
+  try {
+    f.fail('validate'); f.workerFailure({ transition: 'restore', stage: 'owner-sync' });
+    await expect(f.engine.migrate(f.input)).rejects.toMatchObject({ code: 'WORKER_RUNTIME_MIGRATION_RECOVERY_REQUIRED',
+      rollback: { code: 'WORKER_RECORD_STORE_UNAVAILABLE' } });
+    expect(f.events.slice(f.events.indexOf('restore-policy'))).toEqual(['restore-policy']);
+    expect(f.source.State.Running).toBe(false);
+    expect(f.store.get('owner-1', 'worker-1')!.workerRecordIntent).toBe('restore');
+  } finally { await f.cleanup(); }
+});
+
+for (const mutation of ['missing', 'runtime-conflict'] as const) test(`${mutation} worker record prevents the first automatic rollback Docker mutation`, async () => {
+  const f = await fixture(true);
+  try {
+    f.fail('validate');
+    f.beforeValidation(async () => {
+      if (mutation === 'missing') await f.workers.delete('owner-1', 'worker-1');
+      else await f.workers.upsert({ ...f.input.record, importedImage: 'unrelated-image' }, {
+        expectedRuntime: workerRuntimeProjection(f.input.record),
+      });
+    });
+    await expect(f.engine.migrate(f.input)).rejects.toMatchObject({ code: 'WORKER_RUNTIME_MIGRATION_RECOVERY_REQUIRED',
+      rollback: { code: 'WORKER_RECORD_RUNTIME_CONFLICT' } });
+    expect(f.events.slice(f.events.indexOf(`validate:${REPLACEMENT}`))).toEqual([`validate:${REPLACEMENT}`, 'assert-record']);
+    expect(f.containers.get(REPLACEMENT).State.Running).toBe(true);
+    expect(f.source.State.Running).toBe(false);
+  } finally { await f.cleanup(); }
+});
+
+test('runtime migration commit preserves concurrently queued pendingRebuild metadata', async () => {
+  const f = await fixture(true);
+  try {
+    f.beforeValidation(async () => { await f.workers.markPendingRebuild('owner-1', 'worker-1'); });
+    await f.engine.migrate(f.input);
+    expect(f.workers.get('owner-1', 'worker-1')).toMatchObject({ runtimeProfile: 'kata-qemu', pendingRebuild: true });
+  } finally { await f.cleanup(); }
+});
+
+test('worker-write interruption requires exact Docker identity before clearing loaded reconciliation', async () => {
+  const f = await fixture(true);
+  try {
+    f.workerFailure({ transition: 'commit', stage: 'owner-sync' });
+    await expect(f.engine.migrate(f.input)).rejects.toMatchObject({ code: 'WORKER_RECORD_STORE_UNAVAILABLE' });
+    f.containers.get(REPLACEMENT).Mounts[0].Name = 'foreign-volume';
+    const journals = new RuntimeMigrationStore(f.dir); await journals.init();
+    const workers = new WorkerStore(f.dir); await workers.init();
+    const j = journals.get('owner-1', 'worker-1')!;
+    const before = await readFile(join(f.dir, 'users/owner-1/worker-runtime-migrations.v1.json'), 'utf8');
+    f.events.length = 0;
+    await expect(f.createEngine(journals, workers).recover(j, true)).rejects.toThrow(/mounts differ/);
+    expect(f.events).toEqual(['assert-record']);
+    expect(journals.requiresReconciliation(j.userId, j.workerId)).toBe(true);
+    expect(await readFile(join(f.dir, 'users/owner-1/worker-runtime-migrations.v1.json'), 'utf8')).toBe(before);
+  } finally { await f.cleanup(); }
+});
+
+test('terminal journal failure after durable worker transition cannot publish or roll back', async () => {
+  const f = await fixture(true);
+  try {
+    const save = f.store.save.bind(f.store);
+    f.store.save = async (j) => {
+      if (j.phase === 'committed') throw Object.assign(new Error('terminal journal uncertain'), { code: 'WORKER_RUNTIME_MIGRATION_JOURNAL_UNAVAILABLE' });
+      return save(j);
+    };
+    await expect(f.engine.migrate(f.input)).rejects.toMatchObject({ code: 'WORKER_RUNTIME_MIGRATION_JOURNAL_UNAVAILABLE' });
+    expect(f.workers.get('owner-1', 'worker-1')!.runtimeProfile).toBe('kata-qemu');
+    expect(f.store.get('owner-1', 'worker-1')!.workerRecordIntent).toBe('commit');
+    expect(f.events.slice(f.events.indexOf('commit-policy'))).toEqual(['commit-policy']);
+    expect(f.containers.has(REPLACEMENT)).toBe(true);
+    expect(f.source.State.Running).toBe(false);
+  } finally { await f.cleanup(); }
+});
+
+for (const phase of ['committed', 'rolled-back'] as const) test(`reopened ${phase} evidence needs exact worker and Docker reconciliation before finalization`, async () => {
+  const f = await fixture(true);
+  try {
+    if (phase === 'rolled-back') {
+      f.fail('validate');
+      await expect(f.engine.migrate(f.input)).rejects.toMatchObject({ code: 'WORKER_RUNTIME_MIGRATION_ROLLED_BACK' });
+    } else await f.engine.migrate(f.input);
+    const journals = new RuntimeMigrationStore(f.dir); await journals.init();
+    const workers = new WorkerStore(f.dir); await workers.init();
+    const j = journals.get('owner-1', 'worker-1')!;
+    const engine = f.createEngine(journals, workers);
+    expect(journals.isBlocked(j.userId, j.workerId)).toBe(true);
+    await expect(engine.finalize(j)).rejects.toThrow(/recovery/);
+    await expect(engine.recover(j)).rejects.toMatchObject({ code: 'WORKER_RUNTIME_MIGRATION_OUTCOME_UNCERTAIN' });
+    await engine.recover(j, true);
+    expect(journals.isBlocked(j.userId, j.workerId)).toBe(false);
+    await engine.finalize(j);
+    expect(journals.get(j.userId, j.workerId)).toBeUndefined();
+  } finally { await f.cleanup(); }
+});
+
+for (const mismatch of ['profile', 'image', 'owner', 'mount', 'recreated-source'] as const) test(`loaded terminal ${mismatch} mismatch preserves record and all rollback evidence`, async () => {
+  const f = await fixture(true);
+  try {
+    if (mismatch === 'recreated-source') {
+      f.fail('validate');
+      await expect(f.engine.migrate(f.input)).rejects.toMatchObject({ code: 'WORKER_RUNTIME_MIGRATION_ROLLED_BACK' });
+      const recreated = { ...f.source, Id: 'e'.repeat(64) };
+      f.containers.delete(SOURCE); f.containers.set(recreated.Id, recreated);
+    } else {
+      await f.engine.migrate(f.input);
+      const active = f.containers.get(REPLACEMENT);
+      if (mismatch === 'profile') {
+        const current = f.workers.get('owner-1', 'worker-1')!;
+        await f.workers.upsert({ ...current, runtimeProfile: 'legacy-runc' }, { expectedRuntime: workerRuntimeProjection(current) });
+      } else if (mismatch === 'image') active.Image = 'sha256:wrong';
+      else if (mismatch === 'owner') active.Config.Labels['agentor.owner-id'] = 'other-owner';
+      else active.Mounts[0].Name = 'other-volume';
+    }
+    const before = await readFile(join(f.dir, 'users/owner-1/workers.json'), 'utf8');
+    const journals = new RuntimeMigrationStore(f.dir); await journals.init();
+    const workers = new WorkerStore(f.dir); await workers.init();
+    const j = journals.get('owner-1', 'worker-1')!;
+    const engine = f.createEngine(journals, workers);
+    f.events.length = 0;
+    await expect(engine.recover(j, true)).rejects.toThrow();
+    await expect(engine.finalize(j)).rejects.toThrow();
+    expect(f.events.filter((e) => e !== 'assert-record')).toEqual([]);
+    expect(await readFile(join(f.dir, 'users/owner-1/workers.json'), 'utf8')).toBe(before);
+    expect(journals.isBlocked(j.userId, j.workerId)).toBe(true);
+    expect(j.mounts.every((m) => f.volumes.has(m.backup))).toBe(true);
   } finally { await f.cleanup(); }
 });
 

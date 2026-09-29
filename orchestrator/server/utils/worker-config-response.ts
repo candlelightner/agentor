@@ -2,7 +2,7 @@ import type { WorkerRecord } from './worker-store';
 import type { ContainerInfo } from '../../shared/types';
 import { DEFAULT_ENVIRONMENT_ID } from './environments';
 import { WORKER_SYSTEM_ENV_VARS } from './user-env-store';
-import { parseDotEnv, useWorkerConfigStore, type EffectiveScopeEntry } from './worker-config-store';
+import { parseDotEnv, useWorkerConfigStore, workerConfigHasUnappliedChanges, type EffectiveScopeEntry } from './worker-config-store';
 import { useEnvironmentStore, useUserEnvStore } from './services';
 
 const SENSITIVE_NAME_RE = /(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|CREDENTIAL)/i;
@@ -37,7 +37,7 @@ export async function workerConfigurationResponse(worker: WorkerRecord | Contain
     local,
     effective,
     precedence: ['orchestrator', 'user', 'environment', 'worker'],
-    pendingRebuild: !!worker.pendingRebuild || (!!record && record.appliedAt !== record.updatedAt),
+    pendingRebuild: !!worker.pendingRebuild || workerConfigHasUnappliedChanges(record),
     secretsEncryptedAtRest: true,
     storageFormat: 'aes-256-gcm-v1',
   };

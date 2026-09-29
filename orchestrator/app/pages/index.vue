@@ -6,6 +6,7 @@ import type {
 } from "~/types";
 
 const { gitProviders } = useGitProviders();
+const { isAdmin } = useAuth();
 const {
   containers,
   refresh: refreshContainers,
@@ -432,17 +433,20 @@ function onCreateModalClosed() {
     </button>
 
     <!-- Main content -->
-    <main class="flex-1 flex min-w-0 min-h-0">
-      <SplitPaneLayout
-        :root-node="rootNode"
-        :focused-node-id="focusedNodeId"
-        @activate-tab="activateTab"
-        @close-tab="closeTab"
-        @focus-node="focusGroup"
-        @resize="resizeNodes"
-        @move-tab="moveTab"
-        @split-with-tab="splitWithTab"
-      />
+    <main class="flex-1 flex flex-col min-w-0 min-h-0">
+      <RuntimeMigrationRecoveryPanel v-if="isAdmin" />
+      <div class="flex-1 flex min-w-0 min-h-0">
+        <SplitPaneLayout
+          :root-node="rootNode"
+          :focused-node-id="focusedNodeId"
+          @activate-tab="activateTab"
+          @close-tab="closeTab"
+          @focus-node="focusGroup"
+          @resize="resizeNodes"
+          @move-tab="moveTab"
+          @split-with-tab="splitWithTab"
+        />
+      </div>
     </main>
 
     <CreateContainerModal

@@ -1,5 +1,6 @@
 import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { Config } from "./config";
 import { USER_ENV_KEY_RE, WORKER_SYSTEM_ENV_VARS } from "./user-env-store";
 import {
@@ -42,6 +43,12 @@ export interface WorkerConfigRecord {
    * without accidentally applying newer pending settings. */
   appliedAt?: string;
   appliedEntries?: StoredWorkerConfigEntry[];
+}
+
+/** Timestamps are display metadata, not configuration revision identities:
+ * two edits (or an empty receipt completion) may have the same millisecond. */
+export function workerConfigHasUnappliedChanges(record: WorkerConfigRecord | undefined): boolean {
+  return !!record && (record.appliedEntries === undefined || !isDeepStrictEqual(record.entries, record.appliedEntries));
 }
 
 export interface WorkerConfigInputEntry {
@@ -102,6 +109,7 @@ export class WorkerConfigStore {
   private records = new Map<string, Map<string, WorkerConfigRecord>>();
   private queues = new Map<string, Promise<void>>();
   private unavailableUsers = new Set<string>();
+  private materializations = new Map<string, object>();
   private initPromise?: Promise<void>;
   constructor(private config: Config) {}
 
@@ -193,33 +201,75 @@ export class WorkerConfigStore {
     return structuredClone(record);
   }
 
-  async markApplied(userId: string, workerId: string): Promise<void> {
+  /** Capture the exact desired entries used for one recreation. The caller
+   * holds the worker lifecycle fence through materialization and completion.
+   * This process-local receipt is not serializable authority or crash evidence.
+   * A newer receipt or worker removal invalidates the old completion callback.
+   * Desired edits may continue; they must not become the applied secret state.
+   */
+  async resolveForMaterialization(userId: string, workerId: string): Promise<{
+    values: WorkerConfigInputEntry[];
+    markApplied(): Promise<void>;
+  }> {
     await this.init();
     assertSafeId(userId);
     assertSafeId(workerId);
-    return this.withUserMutation(userId, async () => {
-      const map = this.records.get(userId);
-      const record = map?.get(workerId);
-      if (!map || !record) return;
-      const next: WorkerConfigRecord = {
-        ...record,
-        appliedAt: record.updatedAt,
-        appliedEntries: structuredClone(record.entries),
-      };
-      map.set(workerId, next);
+    const identity = `${userId}/${workerId}`;
+    const token = {};
+    this.materializations.set(identity, token);
+    let captured: WorkerConfigRecord | undefined;
+    let values: WorkerConfigInputEntry[];
+    try {
+      captured = await this.get(userId, workerId);
+      values = await this.resolveEntryValues(userId, workerId, captured?.entries ?? []);
+    } catch (error) {
+      if (this.materializations.get(identity) === token) this.materializations.delete(identity);
+      throw error;
+    }
+    const entries = captured?.entries ?? [];
+    // Prevent a caller from accidentally changing the returned values while
+    // later acknowledging the original encrypted snapshot as applied.
+    for (const value of values) Object.freeze(value);
+    Object.freeze(values);
+    let consumed = false;
+    return Object.freeze({ values, markApplied: async () => {
+      if (consumed || this.materializations.get(identity) !== token)
+        throw new Error('Worker configuration materialization receipt is stale');
+      consumed = true;
       try {
-        await this.persist(userId);
-      } catch (error) {
-        map.set(workerId, record);
-        throw error;
+        await this.withUserMutation(userId, async () => {
+          if (this.materializations.get(identity) !== token)
+            throw new Error('Worker configuration materialization receipt is stale');
+          const map = this.records.get(userId);
+          const record = map?.get(workerId);
+          if (!map || !record) {
+            if (captured) throw new Error('Worker configuration disappeared before materialization completion');
+            return;
+          }
+          const next: WorkerConfigRecord = {
+            ...record,
+            appliedAt: captured?.updatedAt ?? new Date().toISOString(),
+            appliedEntries: structuredClone(entries),
+          };
+          map.set(workerId, next);
+          try {
+            await this.persist(userId);
+          } catch (error) {
+            map.set(workerId, record);
+            throw error;
+          }
+        });
+      } finally {
+        if (this.materializations.get(identity) === token) this.materializations.delete(identity);
       }
-    });
+    } });
   }
 
   async remove(userId: string, workerId: string): Promise<void> {
     await this.init();
     assertSafeId(userId);
     assertSafeId(workerId);
+    this.materializations.delete(`${userId}/${workerId}`);
     return this.withUserMutation(userId, async () => {
       const map = this.records.get(userId);
       const previous = map?.get(workerId);

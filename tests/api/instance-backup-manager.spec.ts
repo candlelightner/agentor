@@ -37,6 +37,7 @@ const tar = orchestratorRequire("tar-stream") as { pack(): any };
  * conceal the missing lexical binding this regression is intended to catch.
  */
 async function defaultPreflightFixture(active = "") {
+  let workerUnavailable = active === 'worker-store';
   const calls: string[] = [];
   const operation = (name: string) => ({
     hasActiveOperationsForInstanceSnapshot: () => { calls.push(name); return active === name; },
@@ -45,6 +46,10 @@ async function defaultPreflightFixture(active = "") {
   const modules: Record<string, unknown> = {
     "node:path": { join },
     "./services": {
+      useWorkerStore: () => ({ hasUnavailableOwners: () => workerUnavailable,
+        list: () => { calls.push('unsafe-worker-list'); return []; },
+        listUserIds: () => { calls.push('strict-worker-list'); return []; } }),
+      useStorageManager: () => ({ init: async () => {}, mode: 'volume' }),
       useContainerManager: () => ({
         list: () => active === "worker" ? [{ status: "running" }] : [],
         hasPendingRuntimeMigrations: async () => { calls.push("migration"); return active === "migration"; },
@@ -72,11 +77,29 @@ async function defaultPreflightFixture(active = "") {
     require: (id: string) => modules[id] ?? Object.freeze({}),
   }, { timeout: 1_000 });
   const manager = new exports.InstanceBackupManager({
-    dataDir: "/unused-synthetic-preflight", docker: {}, store: {}, backupManager: backup,
+    dataDir: "/unused-synthetic-preflight", docker: {}, store: { getArtifact: () => ({ userId: 'owner', manifest: {} }) }, backupManager: backup,
     authSnapshot: async () => { throw new Error("Snapshot must not run in preflight fixture"); },
   });
-  return { calls, run: () => manager.preflightCreate() };
+  return { calls, run: () => manager.preflightCreate(), inventory: () => manager.inventory('owner'),
+    quarantine: () => { workerUnavailable = true; }, restore: () => {
+    manager.init = async () => {};
+    return manager.restorePreflight('owner', 'artifact');
+  } };
 }
+
+for (const operation of ['run', 'restore'] as const) test(`instance ${operation === 'run' ? 'backup' : 'restore'} preflight rejects unavailable worker owners before inventory`, async () => {
+  const fixture = await defaultPreflightFixture('worker-store');
+  await expect(fixture[operation]()).rejects.toMatchObject({ statusCode: 503, code: 'WORKER_RECORD_STORE_UNAVAILABLE' });
+  expect(fixture.calls).toEqual([]);
+});
+
+test('production backup inventory rejects a worker owner becoming unavailable after successful preflight', async () => {
+  const fixture = await defaultPreflightFixture();
+  await fixture.run(); fixture.calls.length = 0;
+  fixture.quarantine();
+  await expect(fixture.inventory()).rejects.toMatchObject({ statusCode: 503, code: 'WORKER_RECORD_STORE_UNAVAILABLE' });
+  expect(fixture.calls).toEqual([]);
+});
 
 test("default instance preflight resolves managed-volume binding and visits every quiescence guard", async () => {
   const fixture = await defaultPreflightFixture();

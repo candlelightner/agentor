@@ -1,4 +1,4 @@
-import { UserScopedJsonStore } from "./user-scoped-store";
+import { WorkerDurableStore, type WorkerStoreIO } from "./worker-durable-store";
 import type {
   RepoConfig,
   MountConfig,
@@ -85,6 +85,8 @@ export interface WorkerRecord extends UserOwnedResource {
    * script) were edited after the container was last (re)created and have not
    * yet been applied. Cleared on create/rebuild/unarchive. */
   pendingRebuild?: boolean;
+  /** Dirty-signal generation; old backup arrays without it start at zero. */
+  configurationRevision?: number;
   hostMountsRevoked?: boolean;
   hardwareDevicesRevoked?: boolean;
   /** Set on workers restored via import that captured the source container's
@@ -105,14 +107,62 @@ export interface WorkerRecord extends UserOwnedResource {
   imageRuntimeReference?: string;
 }
 
-export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
-  constructor(dataDir: string) {
-    super(dataDir, "workers.json", (w) => {
+export type WorkerRuntimeProjection = Pick<WorkerRecord,
+  'runtimeProfile' | 'legacyPrivilegeGrant' | 'importedImage' | 'runtimeSnapshotIdentity'>;
+/** Absent legacy profile is intentionally distinct from explicit legacy-runc.
+ * Only capturePreexistingRuntime or an explicitly guarded trusted write may
+ * normalize it. Snapshot comparison is independent of JSON property order. */
+export function workerRuntimeProjection(record: WorkerRuntimeProjection): WorkerRuntimeProjection {
+  return structuredClone({ runtimeProfile: record.runtimeProfile, legacyPrivilegeGrant: record.legacyPrivilegeGrant,
+    importedImage: record.importedImage, runtimeSnapshotIdentity: record.runtimeSnapshotIdentity });
+}
+export function sameWorkerRuntimeProjection(left: WorkerRuntimeProjection, right: WorkerRuntimeProjection): boolean {
+  const canonical = (value: WorkerRuntimeProjection) => {
+    const identity = value.runtimeSnapshotIdentity, portable = identity?.portableIdentity;
+    return JSON.stringify([value.runtimeProfile ?? null, value.legacyPrivilegeGrant ?? null, value.importedImage ?? null,
+      identity ? [identity.reference, identity.imageId, portable ? [portable.version, portable.configDigest,
+        portable.platform.os, portable.platform.architecture, portable.platform.variant ?? null] : null] : null]);
+  };
+  return canonical(left) === canonical(right);
+}
+export interface WorkerRuntimeWriteGuard {
+  expectedRuntime: WorkerRuntimeProjection;
+  /** Absence/false both mean no restore hold. Trusted admin context only. */
+  expectedRestoreApprovalRequired?: boolean;
+}
+export interface WorkerRuntimeMigrationTransition {
+  userId: string;
+  workerId: string;
+  expected: WorkerRuntimeProjection;
+  target: WorkerRuntimeProjection;
+}
+export type WorkerSettingsPatch = Partial<Pick<WorkerRecord,
+  'displayName' | 'workerSelfApiAccess' | 'environmentId' | 'excludedGlobalEnvVarKeys' |
+  'excludedGroupEnvVarKeys' | 'initScript' | 'repos' | 'mounts' | 'hardwareDeviceIds'>> & { pendingRebuild?: true };
+function conflict(message: string): Error {
+  return Object.assign(new Error(message), { statusCode: 409, code: 'WORKER_RECORD_RUNTIME_CONFLICT' });
+}
+function nextConfigurationRevision(record: WorkerRecord): number {
+  const revision = record.configurationRevision ?? 0;
+  if (!Number.isSafeInteger(revision) || revision < 0 || revision === Number.MAX_SAFE_INTEGER)
+    throw conflict('Worker configuration revision is exhausted or invalid');
+  return revision + 1;
+}
+
+export class WorkerStore extends WorkerDurableStore<WorkerRecord> {
+  constructor(dataDir: string, io?: WorkerStoreIO) {
+    super(dataDir, (w) => {
+      if (!w || typeof w.id !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(w.id) ||
+          !['active', 'archived'].includes(w.status) ||
+          (w.runtimeProfile !== undefined && !['legacy-runc', 'kata-qemu'].includes(w.runtimeProfile)) ||
+          (w.configurationRevision !== undefined && (!Number.isSafeInteger(w.configurationRevision) || w.configurationRevision < 0)) ||
+          (w.legacyPrivilegeGrant !== undefined && !['admin', 'preexisting'].includes(w.legacyPrivilegeGrant)))
+        throw new Error('Invalid worker record');
       if (w.runtimeSnapshotIdentity !== undefined &&
           !validRuntimeSnapshotIdentity(w.runtimeSnapshotIdentity, w.importedImage, w.id))
         throw new Error("Invalid worker runtime snapshot identity");
       return w.id;
-    });
+    }, io);
   }
 
   /** Flat list of every worker across every user, sorted by the immutable UUID
@@ -145,208 +195,180 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     return this.findWithOwner((w) => w.id === id)?.item;
   }
 
-  async upsert(worker: WorkerRecord): Promise<void> {
-    const isNew = !this.has(worker.userId, worker.id);
-    await this.setItem(worker.userId, worker);
-    const label = worker.displayName || worker.id;
-    if (isNew) {
-      useLogger().info(
-        `[worker-store] registered worker ${label} (status=${worker.status})`,
-      );
-    } else {
-      useLogger().debug(`[worker-store] updated worker ${label}`);
-    }
-  }
-
-  /** Atomically mark an existing worker for rebuild without ever creating it.
-   * The lookup happens inside the same per-owner store transaction as the
-   * write, so a queued environment/configuration update cannot reinsert a
-   * worker that was deleted while the caller held a stale record reference. */
-  async markPendingRebuild(
-    userId: string,
-    id: string,
-  ): Promise<WorkerRecord | undefined> {
-    return this.withUserMutation(userId, async () => {
-      const map = this.items.get(userId);
-      const previous = map?.get(id);
-      if (!map || !previous) return undefined;
-      const next: WorkerRecord = {
-        ...previous,
-        pendingRebuild: true,
-        updatedAt: new Date().toISOString(),
-      };
-      map.set(id, next);
-      try {
-        await this.persistUser(userId);
-      } catch (error) {
-        map.set(id, previous);
-        throw error;
+  /** Ordinary full metadata writes must leave the runtime tuple/hold unchanged.
+   * A trusted expected-runtime guard instead selects a runtime-only CAS: apply
+   * its tuple/hold and timestamp to queue-current metadata, never the caller's
+   * possibly stale labels/settings/lifecycle. This is used by admin grants and
+   * immutable-image backfill; it is not permission to replace other fields. */
+  async upsert(worker: WorkerRecord, guard?: WorkerRuntimeWriteGuard): Promise<void> {
+    const owned = structuredClone(worker), expected = guard ? structuredClone(guard) : undefined;
+    await this.transaction(owned.userId, draft => {
+      const current = draft.get(owned.id);
+      if (expected) {
+        if (!current || !sameWorkerRuntimeProjection(current, expected.expectedRuntime) ||
+            (current.runtimeRestoreApprovalRequired === true) !== (expected.expectedRestoreApprovalRequired === true))
+          throw conflict('Worker runtime changed before guarded record write');
+      } else if (current && (!sameWorkerRuntimeProjection(current, owned) ||
+          (current.runtimeRestoreApprovalRequired === true) !== (owned.runtimeRestoreApprovalRequired === true))) {
+        throw conflict('Changing an existing worker runtime or restore hold requires an expected runtime guard');
       }
-      return structuredClone(next);
+      if (!expected && current && (current.configurationRevision ?? 0) !== (owned.configurationRevision ?? 0))
+        throw conflict('Stale worker configuration cannot replace newer metadata');
+      if (current?.deletionPending && !owned.deletionPending)
+        throw conflict('Worker deletion cleanup is still pending');
+      draft.set(owned.id, expected && current ? {
+        ...current, ...workerRuntimeProjection(owned),
+        runtimeRestoreApprovalRequired: owned.runtimeRestoreApprovalRequired,
+        updatedAt: owned.updatedAt,
+      } : current ? { ...owned, configurationRevision: nextConfigurationRevision(current) } : owned);
+      return { result: undefined, persist: true };
     });
   }
 
-  async setDesiredRuntimeStatus(
-    userId: string,
-    id: string,
-    desiredRuntimeStatus: "running" | "stopped",
-  ): Promise<WorkerRecord> {
-    const current = this.get(userId, id);
-    if (!current)
-      throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
-    const updated: WorkerRecord = {
-      ...current,
-      desiredRuntimeStatus,
-      updatedAt: new Date().toISOString(),
-    };
-    await this.setItem(userId, updated);
-    return updated;
+  /** Runtime-only compare-and-set under the owner queue. Caller owns the
+   * owner/worker lifecycle fence and has verified Docker/journal authority.
+   * Neither this method nor a matching tuple proves Docker settlement.
+   * An idempotent match still fsyncs the complete owner snapshot. */
+  async transitionRuntimeMigration(input: WorkerRuntimeMigrationTransition): Promise<WorkerRecord> {
+    const owned = structuredClone(input);
+    return this.transaction(owned.userId, draft => {
+      const current = draft.get(owned.workerId);
+      if (!current) throw Object.assign(conflict('Worker not found for runtime migration transition'), { statusCode: 404 });
+      if (current.userId !== owned.userId || current.status !== 'active' || current.deletionPending ||
+          current.runtimeRestoreApprovalRequired)
+        throw conflict('Worker lifecycle does not permit a runtime migration transition');
+      if (!sameWorkerRuntimeProjection(current, owned.expected) && !sameWorkerRuntimeProjection(current, owned.target))
+        throw conflict('Worker runtime no longer matches the migration source or target');
+      const next = { ...current, ...workerRuntimeProjection(owned.target), updatedAt: new Date().toISOString() };
+      draft.set(owned.workerId, next);
+      return { result: next, persist: true };
+    });
   }
 
-  /** One-way migration of an active pre-profile worker, after Docker inspect
-   * verifies the actual runtime. Never grants privilege from environment data. */
-  async capturePreexistingRuntime(
-    userId: string,
-    id: string,
-    privileged: boolean,
-  ): Promise<WorkerRecord | undefined> {
-    return this.withUserMutation(userId, async () => {
-      const map = this.items.get(userId);
-      const previous = map?.get(id);
-      if (!map || !previous || previous.status !== 'active' || previous.runtimeProfile !== undefined)
-        return previous ? structuredClone(previous) : undefined;
-      const next: WorkerRecord = {
-        ...previous,
-        runtimeProfile: 'legacy-runc',
+  private updateExisting(userId: string, id: string, update: (current: WorkerRecord) => WorkerRecord): Promise<WorkerRecord> {
+    return this.transaction(userId, draft => {
+      const current = draft.get(id);
+      if (!current) throw Object.assign(new Error('Worker not found'), { statusCode: 404 });
+      const next = update(current);
+      draft.set(id, next);
+      return { result: next, persist: true };
+    });
+  }
+
+  /** Field-specific settings merge against queue-current metadata. A settings
+   * edit can require a rebuild, but cannot clear another writer's rebuild debt. */
+  async updateSettings(userId: string, id: string, patch: WorkerSettingsPatch,
+    expectedRuntime: WorkerRuntimeProjection): Promise<WorkerRecord> {
+    const owned = structuredClone(patch), expected = workerRuntimeProjection(expectedRuntime);
+    const allowed = new Set(['displayName', 'workerSelfApiAccess', 'environmentId', 'excludedGlobalEnvVarKeys',
+      'excludedGroupEnvVarKeys', 'initScript', 'repos', 'mounts', 'hardwareDeviceIds', 'pendingRebuild']);
+    if (Object.keys(owned).some(key => !allowed.has(key)) ||
+        ('pendingRebuild' in owned && owned.pendingRebuild !== true))
+      throw conflict('Invalid worker settings patch');
+    return this.updateExisting(userId, id, current => {
+      if (current.status !== 'active' || current.deletionPending || !sameWorkerRuntimeProjection(current, expected))
+        throw conflict('Worker runtime changed before settings were saved');
+      return { ...current, ...owned, configurationRevision: nextConfigurationRevision(current), updatedAt: new Date().toISOString() };
+    });
+  }
+
+  /** A successful recreation applies only the configuration generation it
+   * actually read. A newer dirty signal keeps its metadata and rebuild debt;
+   * it is not a reason to destroy an otherwise valid replacement. */
+  async completeRecreation(userId: string, id: string, expected: WorkerRuntimeProjection,
+    configurationRevision: number): Promise<WorkerRecord> {
+    const runtime = workerRuntimeProjection(expected);
+    if (!Number.isSafeInteger(configurationRevision) || configurationRevision < 0)
+      throw conflict('Invalid applied configuration revision');
+    return this.updateExisting(userId, id, current => {
+      if (current.status !== 'active' || current.deletionPending || current.runtimeRestoreApprovalRequired ||
+          !sameWorkerRuntimeProjection(current, runtime))
+        throw conflict('Worker authority or lifecycle changed during recreation');
+      const applied = (current.configurationRevision ?? 0) === configurationRevision;
+      return { ...current, ...(applied ? { pendingRebuild: false, hostMountsRevoked: false, hardwareDevicesRevoked: false } : {}),
+        updatedAt: new Date().toISOString() };
+    });
+  }
+
+  /** No missing-worker resurrection, including when queued behind deletion. */
+  async markPendingRebuild(userId: string, id: string): Promise<WorkerRecord | undefined> {
+    return this.transaction(userId, draft => {
+      const current = draft.get(id);
+      if (!current) return { result: undefined, persist: false };
+      const next = { ...current, pendingRebuild: true, configurationRevision: nextConfigurationRevision(current), updatedAt: new Date().toISOString() };
+      draft.set(id, next);
+      return { result: next, persist: true };
+    });
+  }
+
+  async setDesiredRuntimeStatus(userId: string, id: string, desiredRuntimeStatus: 'running' | 'stopped'): Promise<WorkerRecord> {
+    return this.updateExisting(userId, id, current => ({
+      ...current, desiredRuntimeStatus, updatedAt: new Date().toISOString(),
+    }));
+  }
+
+  /** Trusted, inspected one-way enrollment of a pre-profile legacy worker. */
+  async capturePreexistingRuntime(userId: string, id: string, privileged: boolean): Promise<WorkerRecord | undefined> {
+    return this.transaction(userId, draft => {
+      const current = draft.get(id);
+      if (!current || current.status !== 'active' || current.runtimeProfile !== undefined ||
+          current.deletionPending || current.runtimeRestoreApprovalRequired)
+        return { result: current, persist: false };
+      const next: WorkerRecord = { ...current, runtimeProfile: 'legacy-runc',
         ...(privileged ? { legacyPrivilegeGrant: 'preexisting' as const } : {}),
-        updatedAt: new Date().toISOString(),
-      };
-      map.set(id, next);
-      try { await this.persistUser(userId); }
-      catch (error) { map.set(id, previous); throw error; }
-      return structuredClone(next);
+        updatedAt: new Date().toISOString() };
+      draft.set(id, next);
+      return { result: next, persist: true };
     });
   }
 
-  /** Persist the desired host-mount set after a grant/hierarchy change. Active
-   * workers additionally carry a restart guard until a rebuild has replaced
-   * the old Docker container and its immutable bind configuration. */
-  async updateHostMountAccess(
-    userId: string,
-    id: string,
-    mounts: MountConfig[] | undefined,
-    revoked: boolean,
-  ): Promise<WorkerRecord> {
-    const current = this.get(userId, id);
-    if (!current)
-      throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
-    const updated: WorkerRecord = {
-      ...current,
-      mounts: mounts?.length ? structuredClone(mounts) : undefined,
-      ...(current.status === "active" && revoked
-        ? { pendingRebuild: true, hostMountsRevoked: true }
-        : {}),
+  async updateHostMountAccess(userId: string, id: string, mounts: MountConfig[] | undefined, revoked: boolean): Promise<WorkerRecord> {
+    const owned = mounts?.length ? structuredClone(mounts) : undefined;
+    return this.updateExisting(userId, id, current => ({
+      ...current, mounts: owned,
+      configurationRevision: nextConfigurationRevision(current),
+      ...(current.status === 'active' && revoked ? { pendingRebuild: true, hostMountsRevoked: true } : {}),
       updatedAt: new Date().toISOString(),
-    };
-    await this.setItem(userId, updated);
-    return updated;
+    }));
   }
 
-  /** Persist desired device assignments after policy changes. Active workers
-   * keep a durable restart guard until Docker is rebuilt without revoked nodes. */
-  async updateHardwareDeviceAccess(
-    userId: string,
-    id: string,
-    hardwareDeviceIds: string[] | undefined,
-    revoked: boolean,
-  ): Promise<WorkerRecord> {
-    const current = this.get(userId, id);
-    if (!current)
-      throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
-    const updated: WorkerRecord = {
-      ...current,
-      hardwareDeviceIds: hardwareDeviceIds?.length ? [...hardwareDeviceIds] : undefined,
-      ...(current.status === "active" && revoked
-        ? { pendingRebuild: true, hardwareDevicesRevoked: true }
-        : {}),
+  async updateHardwareDeviceAccess(userId: string, id: string, hardwareDeviceIds: string[] | undefined, revoked: boolean): Promise<WorkerRecord> {
+    const owned = hardwareDeviceIds?.length ? [...hardwareDeviceIds] : undefined;
+    return this.updateExisting(userId, id, current => ({
+      ...current, hardwareDeviceIds: owned,
+      configurationRevision: nextConfigurationRevision(current),
+      ...(current.status === 'active' && revoked ? { pendingRebuild: true, hardwareDevicesRevoked: true } : {}),
       updatedAt: new Date().toISOString(),
-    };
-    await this.setItem(userId, updated);
-    return updated;
+    }));
   }
 
   async archive(userId: string, id: string): Promise<void> {
-    const worker = this.get(userId, id);
-    if (!worker) {
-      useLogger().warn(
-        `[worker-store] archive failed — worker not found: ${userId}/${id}`,
-      );
-      throw new Error(`Worker not found: ${id}`);
-    }
-    const updatedAt = new Date().toISOString();
-    const archivedAt = worker.archivedAt ?? updatedAt;
-    await this.setItem(userId, {
-      ...worker,
-      status: "archived",
-      // Once destructive deletion has begun, no generic archive/reconcile path
-      // may silently make the record unarchivable again.
-      deletionPending: worker.deletionPending === true,
-      archivedAt,
-      updatedAt,
+    await this.updateExisting(userId, id, current => {
+      const updatedAt = new Date().toISOString();
+      return { ...current, status: 'archived', deletionPending: current.deletionPending === true,
+        archivedAt: current.archivedAt ?? updatedAt, updatedAt };
     });
-    useLogger().info(
-      `[worker-store] archived worker ${worker.displayName || worker.id}`,
-    );
   }
 
   async markDeletionPending(userId: string, id: string): Promise<void> {
-    const worker = this.get(userId, id);
-    if (!worker) throw new Error(`Worker not found: ${id}`);
-    const updatedAt = new Date().toISOString();
-    const archivedAt = worker.archivedAt ?? updatedAt;
-    await this.setItem(userId, {
-      ...worker,
-      status: "archived",
-      deletionPending: true,
-      archivedAt,
-      updatedAt,
+    await this.updateExisting(userId, id, current => {
+      const updatedAt = new Date().toISOString();
+      return { ...current, status: 'archived', deletionPending: true,
+        archivedAt: current.archivedAt ?? updatedAt, updatedAt };
     });
   }
 
   async unarchive(userId: string, id: string): Promise<void> {
-    const worker = this.get(userId, id);
-    if (!worker) {
-      useLogger().warn(
-        `[worker-store] unarchive failed — worker not found: ${userId}/${id}`,
-      );
-      throw new Error(`Worker not found: ${id}`);
-    }
-    if (worker.deletionPending) {
-      throw Object.assign(
-        new Error("Worker deletion cleanup is still pending"),
-        { statusCode: 409 },
-      );
-    }
-    await this.setItem(userId, {
-      ...worker,
-      status: "active",
-      archivedAt: undefined,
-      deletionPending: false,
-      updatedAt: new Date().toISOString(),
+    await this.updateExisting(userId, id, current => {
+      if (current.deletionPending) throw conflict('Worker deletion cleanup is still pending');
+      return { ...current, status: 'active', archivedAt: undefined, deletionPending: false,
+        desiredRuntimeStatus: 'running',
+        updatedAt: new Date().toISOString() };
     });
-    useLogger().info(
-      `[worker-store] unarchived worker ${worker.displayName || worker.id}`,
-    );
   }
 
   async delete(userId: string, id: string): Promise<void> {
-    const existed = await this.deleteItem(userId, id);
-    if (!existed) {
-      useLogger().warn(
-        `[worker-store] delete failed — worker not found: ${userId}/${id}`,
-      );
-      throw new Error(`Worker not found: ${id}`);
-    }
-    useLogger().info(`[worker-store] deleted worker ${userId}/${id}`);
+    if (!await this.deleteItem(userId, id))
+      throw Object.assign(new Error('Worker not found'), { statusCode: 404 });
   }
 }

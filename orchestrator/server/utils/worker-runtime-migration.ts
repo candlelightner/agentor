@@ -2,7 +2,7 @@ import Docker from 'dockerode';
 import { randomUUID } from 'node:crypto';
 import type { RuntimeSnapshotIdentity, WorkerRuntimeProfile } from '../../shared/types';
 import type { WorkerRecord } from './worker-store';
-import { validRuntimeSnapshotIdentity } from './worker-store';
+import { validRuntimeSnapshotIdentity, workerRuntimeProjection } from './worker-store';
 import { DurableMigrationJournalStore, isMigrationJournalPersistenceError, type MigrationJournalIO } from './runtime-migration-durable-store';
 import { assertWorkerRuntimeMatches, resolveWorkerRuntimePolicy, resolveWorkerRuntimeProfile } from './worker-runtime-policy';
 import { withOperationDeadline, operationSettlement } from './operation-deadline';
@@ -25,11 +25,24 @@ export interface RuntimeMigrationJournal {
   helperImage: string;
   uncertainOperation?: boolean;
   inFlightOperation?: string;
+  workerRecordIntent?: 'commit' | 'restore';
+  workerRecordTransitionVersion?: 1;
   expectedMounts: Array<{ type: string; source: string; target: string; readOnly: boolean }>;
   error?: string;
 }
 
 const terminal = (phase: RuntimeMigrationPhase) => phase === 'committed' || phase === 'rolled-back';
+export function migrationTargetRuntime(j: RuntimeMigrationJournal) {
+  if (!validRuntimeSnapshotIdentity(j.snapshotIdentity, j.snapshotImage, j.workerId))
+    throw migrationError('Committed runtime snapshot identity is unavailable');
+  return workerRuntimeProjection({ ...j.sourceRecord, runtimeProfile: j.targetProfile,
+    legacyPrivilegeGrant: j.targetProfile === 'legacy-runc' ? 'admin' : undefined,
+    importedImage: j.snapshotImage, runtimeSnapshotIdentity: j.snapshotIdentity });
+}
+function recordPersistenceUnavailable(error: unknown) {
+  return isMigrationJournalPersistenceError(error) ||
+    ['WORKER_RECORD_STORE_UNAVAILABLE', 'WORKER_RECORD_RUNTIME_CONFLICT'].includes((error as { code?: string })?.code ?? '');
+}
 export class RuntimeMigrationStore extends DurableMigrationJournalStore<RuntimeMigrationJournal> {
   constructor(dataDir: string, io?: MigrationJournalIO) {
     super(dataDir, (j) => {
@@ -44,6 +57,8 @@ export class RuntimeMigrationStore extends DurableMigrationJournalStore<RuntimeM
           !/^sha256:[a-f0-9]{64}$/.test(j.helperImage) ||
           !Array.isArray(j.expectedMounts) || j.expectedMounts.some((m) => (typeof m.source !== 'string' || (!m.source && m.type !== 'tmpfs')) || !m.target?.startsWith('/') || typeof m.readOnly !== 'boolean') ||
           (j.replacementId !== undefined && !/^[a-f0-9]{64}$/.test(j.replacementId)) ||
+          (j.workerRecordIntent !== undefined && !['commit', 'restore'].includes(j.workerRecordIntent)) ||
+          (j.workerRecordTransitionVersion !== undefined && j.workerRecordTransitionVersion !== 1) ||
           !Array.isArray(j.mounts) || j.mounts.some((m, i) =>
             !['volume', 'bind'].includes(m.type) || !m.source || !m.target.startsWith('/') ||
             m.backup !== `agentor-runtime-backup-${j.operationId}-${i}` || typeof m.copied !== 'boolean'))
@@ -60,11 +75,15 @@ export class RuntimeMigrationStore extends DurableMigrationJournalStore<RuntimeM
     await this.save(j);
     this.acknowledgeLoadedReconciliation(j.userId, j.workerId);
   }
-  pending() { return this.list().filter((j) => !terminal(j.phase)); }
+  pending() { return this.list().filter((j) => this.isBlocked(j.userId, j.workerId)); }
   hasUnavailableOwners() {
     return this.listUserIds().some((userId) => { try { this.listForUser(userId); return false; } catch { return true; } });
   }
-  isBlocked(userId: string, workerId: string) { const j = this.get(userId, workerId); return !!j && !terminal(j.phase); }
+  isBlocked(userId: string, workerId: string) {
+    const j = this.get(userId, workerId);
+    return !!j && (!terminal(j.phase) || !!j.workerRecordIntent || this.requiresReconciliation(userId, workerId) ||
+      j.workerRecordTransitionVersion !== 1);
+  }
 }
 
 export interface RuntimeMigrationPlan {
@@ -89,6 +108,10 @@ export interface RuntimeMigrationCallbacks {
   validate(containerId: string, record: WorkerRecord): Promise<void>;
   commit(journal: RuntimeMigrationJournal, replacementId: string): Promise<void>;
   restore(journal: RuntimeMigrationJournal): Promise<void>;
+  /** Read-only consistency checks; durable=true also reaffirms matching bytes. */
+  assertRecord(journal: RuntimeMigrationJournal, expected: 'source' | 'target' | 'either', durable: boolean): Promise<void>;
+  /** In-memory publication only, after both persistence boundaries complete. */
+  publish(journal: RuntimeMigrationJournal, phase: 'committed' | 'rolled-back'): void;
 }
 
 /** All mutations run under the owner/worker lifecycle fence. Journal intent is
@@ -275,13 +298,14 @@ export class WorkerRuntimeMigration {
       if (!j.sourceRunning) await replacement.stop({ t: 30 });
       j.phase = 'validated'; await this.store.save(j);
       await this.callbacks.authorize();
+      j.workerRecordIntent = 'commit'; await this.store.save(j);
       await this.callbacks.commit(j, replacement.id);
-      j.phase = 'committed'; await this.store.save(j);
+      await this.completeRecordTransition(j, 'committed');
       // Retain rollback evidence after success. Explicit operator cleanup is
       // separate; failures never destroy the source rootfs or volume copies.
       return j;
     } catch (cause) {
-      if (isMigrationJournalPersistenceError(cause)) throw cause;
+      if (recordPersistenceUnavailable(cause) || terminal(j.phase)) throw cause;
       await (cause as any)?.[operationSettlement];
       if (ambiguousDockerOutcome(cause)) {
         j.phase = 'recovery-required'; j.uncertainOperation = true;
@@ -307,10 +331,24 @@ export class WorkerRuntimeMigration {
   async recover(j: RuntimeMigrationJournal, daemonOperationsSettled = false) {
     // Reading also enforces sticky owner quarantine for detached callers.
     this.store.get(j.userId, j.workerId);
-    if (j.uncertainOperation || j.inFlightOperation ||
-        (!terminal(j.phase) && this.store.requiresReconciliation(j.userId, j.workerId))) {
+    if (j.uncertainOperation || j.inFlightOperation || j.workerRecordIntent ||
+        this.store.requiresReconciliation(j.userId, j.workerId) ||
+        (terminal(j.phase) && j.workerRecordTransitionVersion !== 1)) {
       if (!daemonOperationsSettled)
         throw migrationError('An operator must verify all outstanding Docker operations have settled before recovery', 'WORKER_RUNTIME_MIGRATION_OUTCOME_UNCERTAIN');
+      if (terminal(j.phase)) {
+        await this.assertTerminalIdentity(j);
+        await this.callbacks.assertRecord(j, j.phase === 'committed' ? 'target' : 'source', true);
+        const next = { ...j, workerRecordTransitionVersion: 1 as const };
+        delete next.uncertainOperation; delete next.inFlightOperation; delete next.workerRecordIntent;
+        await this.store.recordReconciliation(next);
+        Object.assign(j, next); delete j.uncertainOperation; delete j.inFlightOperation; delete j.workerRecordIntent;
+        this.callbacks.publish(j, j.phase as 'committed' | 'rolled-back');
+        return;
+      }
+      // No Docker mutation follows a conflicting or unavailable worker record.
+      await this.callbacks.assertRecord(j, 'either', false);
+      await this.assertRecoveryIdentity(j);
       delete j.uncertainOperation;
       delete j.inFlightOperation;
       await this.store.recordReconciliation(j);
@@ -325,8 +363,11 @@ export class WorkerRuntimeMigration {
    * cleanup targets. Repeated cleanup is safe after partial deletion. */
   async finalize(j: RuntimeMigrationJournal) {
     this.store.get(j.userId, j.workerId);
-    if (!terminal(j.phase) || j.uncertainOperation || j.inFlightOperation)
+    if (!terminal(j.phase) || j.uncertainOperation || j.inFlightOperation || j.workerRecordIntent ||
+        this.store.isBlocked(j.userId, j.workerId))
       throw migrationError('Complete migration recovery before deleting rollback evidence');
+    await this.assertTerminalIdentity(j);
+    await this.callbacks.assertRecord(j, j.phase === 'committed' ? 'target' : 'source', true);
     if (j.phase === 'committed') {
       const active = await this.docker.getContainer(j.replacementId!).inspect();
       if (active.Name !== `/${j.sourceName}` || active.Config.Labels?.['agentor.runtime-migration'] !== j.operationId)
@@ -374,8 +415,82 @@ export class WorkerRuntimeMigration {
     return { 'agentor.runtime-migration': j.operationId, 'agentor.runtime-migration-worker': j.workerId,
       'agentor.runtime-migration-owner': j.userId };
   }
+  private async completeRecordTransition(j: RuntimeMigrationJournal, phase: 'committed' | 'rolled-back') {
+    const next = { ...j, phase, workerRecordTransitionVersion: 1 as const };
+    delete next.workerRecordIntent;
+    await this.store.save(next);
+    Object.assign(j, next); delete j.workerRecordIntent;
+    this.callbacks.publish(j, phase);
+  }
+
+  private async assertTerminalIdentity(j: RuntimeMigrationJournal) {
+    const committed = j.phase === 'committed';
+    if (committed && (!j.replacementId || !validRuntimeSnapshotIdentity(j.snapshotIdentity, j.snapshotImage, j.workerId)))
+      throw migrationError('Terminal migration has no exact replacement snapshot identity');
+    const expectedId = committed ? j.replacementId! : j.sourceId;
+    const actual = await this.docker.getContainer(expectedId).inspect();
+    if (actual.Id !== expectedId || actual.Name !== '/' + j.sourceName || actual.Config.Labels?.['agentor.id'] !== j.workerId ||
+        actual.Image !== (committed ? j.snapshotIdentity!.imageId : j.sourceImageId) ||
+        (actual.Config.Labels?.['agentor.owner-id'] !== undefined && actual.Config.Labels['agentor.owner-id'] !== j.userId) ||
+        (committed && Object.entries(this.labels(j)).some(([key, value]) => actual.Config.Labels?.[key] !== value)))
+      throw migrationError('Terminal migration Docker identity differs; retain evidence for explicit reconciliation');
+    const profile = committed ? j.targetProfile : resolveWorkerRuntimeProfile(j.sourceRecord.runtimeProfile);
+    assertWorkerRuntimeMatches(profile, actual.HostConfig.Runtime, actual.HostConfig.Privileged === true,
+      committed ? (j.targetProfile === 'legacy-runc' ? 'admin' : undefined) : j.sourceRecord.legacyPrivilegeGrant);
+    if (actual.Mounts.length !== j.expectedMounts.length || j.expectedMounts.some((expected) =>
+      !actual.Mounts.some((mount) => mount.Type === expected.type && mount.Destination === expected.target &&
+        (mount.Type === 'volume' ? mount.Name : mount.Source) === expected.source && !mount.RW === expected.readOnly)))
+      throw migrationError('Terminal migration mounts differ; retain rollback evidence');
+    if (committed) {
+      if ((await this.docker.getImage(j.snapshotImage).inspect()).Id !== j.snapshotIdentity!.imageId)
+        throw migrationError('Terminal migration snapshot reference changed');
+      try {
+        const old = await this.docker.getContainer(j.sourceId).inspect();
+        if (old.Id !== j.sourceId || old.Name !== '/' + j.rollbackName || old.Image !== j.sourceImageId ||
+            old.Config.Labels?.['agentor.id'] !== j.workerId || old.State.Running)
+          throw migrationError('Terminal rollback source identity differs');
+      } catch (error) { if ((error as any)?.statusCode !== 404) throw error; }
+    } else if (j.replacementId) {
+      try {
+        await this.docker.getContainer(j.replacementId).inspect();
+        throw migrationError('Rolled-back migration still has a replacement; retain evidence');
+      } catch (error) { if ((error as any)?.statusCode !== 404) throw error; }
+    }
+  }
+  private async assertRecoveryIdentity(j: RuntimeMigrationJournal) {
+    const original = await this.docker.getContainer(j.sourceId).inspect();
+    if (original.Id !== j.sourceId || original.Image !== j.sourceImageId ||
+        ![`/${j.sourceName}`, `/${j.rollbackName}`].includes(original.Name) ||
+        original.Config.Labels?.['agentor.id'] !== j.workerId ||
+        (original.Config.Labels?.['agentor.owner-id'] !== undefined && original.Config.Labels['agentor.owner-id'] !== j.userId))
+      throw migrationError('Recovery source identity differs; retain evidence');
+    assertWorkerRuntimeMatches(resolveWorkerRuntimeProfile(j.sourceRecord.runtimeProfile), original.HostConfig.Runtime,
+      original.HostConfig.Privileged === true, j.sourceRecord.legacyPrivilegeGrant);
+    const assertMounts = (actual: Docker.ContainerInspectInfo) => {
+      if (actual.Mounts.length !== j.expectedMounts.length || j.expectedMounts.some((expected) =>
+        !actual.Mounts.some((mount) => mount.Type === expected.type && mount.Destination === expected.target &&
+          (mount.Type === 'volume' ? mount.Name : mount.Source) === expected.source && !mount.RW === expected.readOnly)))
+        throw migrationError('Recovery mounts differ; retain evidence');
+    };
+    assertMounts(original);
+    try {
+      const replacement = await this.docker.getContainer(j.replacementId || j.sourceName).inspect();
+      if (replacement.Id === j.sourceId && !j.replacementId) return;
+      if (j.replacementId && replacement.Id !== j.replacementId || replacement.Name !== '/' + j.sourceName ||
+          !j.snapshotIdentity || replacement.Image !== j.snapshotIdentity.imageId ||
+          replacement.Config.Labels?.['agentor.id'] !== j.workerId ||
+          Object.entries(this.labels(j)).some(([key, value]) => replacement.Config.Labels?.[key] !== value))
+        throw migrationError('Recovery replacement identity differs; retain evidence');
+      assertWorkerRuntimeMatches(j.targetProfile, replacement.HostConfig.Runtime, replacement.HostConfig.Privileged === true,
+        j.targetProfile === 'legacy-runc' ? 'admin' : undefined);
+      assertMounts(replacement);
+    } catch (error) { if ((error as any)?.statusCode !== 404) throw error; }
+  }
   private async rollback(j: RuntimeMigrationJournal) {
     try {
+      // Even a definitive validation failure must not authorize destructive
+      // rollback after another record writer removed or changed this worker.
+      await this.callbacks.assertRecord(j, 'either', false);
       j.phase = 'rollback'; await this.store.save(j);
       // Resolve deterministic name after ambiguous create, but never touch a
       // foreign container occupying it. Source is checked independently.
@@ -423,6 +538,7 @@ export class WorkerRuntimeMigration {
       }
       if (replacement) await replacement.remove();
       if ((await old.inspect()).Name !== `/${j.sourceName}`) await old.rename({ name: j.sourceName });
+      j.workerRecordIntent = 'restore'; await this.store.save(j);
       await this.callbacks.restore(j);
       if (j.sourceRunning) {
         await old.start();
@@ -431,9 +547,9 @@ export class WorkerRuntimeMigration {
         await this.clearInFlight();
       }
       await old.update({ RestartPolicy: j.sourceRestartPolicy });
-      j.phase = 'rolled-back'; delete j.error; await this.store.save(j);
+      delete j.error; await this.completeRecordTransition(j, 'rolled-back');
     } catch (error) {
-      if (isMigrationJournalPersistenceError(error)) throw error;
+      if (recordPersistenceUnavailable(error) || terminal(j.phase)) throw error;
       await (error as any)?.[operationSettlement];
       j.phase = 'recovery-required'; j.error = 'Rollback incomplete; retained source, image and volume snapshots require recovery';
       if (ambiguousDockerOutcome(error)) {

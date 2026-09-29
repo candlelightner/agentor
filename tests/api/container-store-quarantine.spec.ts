@@ -1,5 +1,10 @@
 import { expect, test } from "@playwright/test";
-import { ContainerManager } from "../../orchestrator/server/utils/container";
+import { ContainerManager as ActualContainerManager } from "../../orchestrator/server/utils/container";
+import { mkdtemp, rm, mkdir, open, rename, unlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { RuntimeMigrationStore } from '../../orchestrator/server/utils/worker-runtime-migration';
+import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
 import { OperationDeadlineError } from "../../orchestrator/server/utils/operation-deadline";
 import { withWorkerLifecycleMutation } from "../../orchestrator/server/utils/worker-lifecycle-coordinator";
 
@@ -13,6 +18,13 @@ import { withWorkerLifecycleMutation } from "../../orchestrator/server/utils/wor
   info() {},
   debug() {},
 });
+
+let dataDir: string;
+test.beforeEach(async () => { dataDir = await mkdtemp(join(tmpdir(), 'container-runtime-holds-')); });
+test.afterEach(async () => { await rm(dataDir, { recursive: true, force: true }); });
+class ContainerManager extends ActualContainerManager {
+  constructor(docker: any, config: any) { super(docker, { ...config, dataDir }); }
+}
 
 test("managed runtimes without authoritative worker records stay quarantined", async () => {
   const errors: string[] = [];
@@ -70,6 +82,182 @@ function dockerWorker() {
     Labels: { "agentor.id": "worker-1" },
   };
 }
+
+test('uncertain durable worker write prevents subsequent removal through a retained live handle', async () => {
+  let failSync = false;
+  const workers = new WorkerStore(dataDir, { mkdir, rename, unlink, open: async (path, flags, mode) => {
+    const handle = await open(path, flags, mode);
+    return { writeFile: (data, options) => handle.writeFile(data, options), close: () => handle.close(),
+      sync: async () => { if (failSync) throw new Error('injected fsync failure'); await handle.sync(); } };
+  } });
+  await workers.init(); await workers.upsert(workerRecord());
+  const mutations: string[] = [];
+  const manager = new ContainerManager({ removeContainer: async () => { mutations.push('remove'); } }, { containerPrefix: 'agentor-worker' });
+  manager.setWorkerStore(workers);
+  (manager as any).assertOwnerExists = async () => {};
+  (manager as any).containers.set('worker-1', { ...workerRecord(), containerId: 'docker-worker-1', containerName: 'agentor-worker-worker-1' });
+  failSync = true;
+  await expect(workers.upsert({ ...workerRecord(), displayName: 'changed settings' })).rejects.toMatchObject({ code: 'WORKER_RECORD_STORE_UNAVAILABLE' });
+  await expect(manager.remove('worker-1')).rejects.toMatchObject({ code: 'WORKER_RECORD_STORE_UNAVAILABLE' });
+  await expect(manager.removeWorkersForDeletedOwner('owner-1')).rejects.toMatchObject({ code: 'WORKER_RECORD_STORE_UNAVAILABLE' });
+  expect(mutations).toEqual([]);
+});
+
+test('settings edit preserves durable pending rebuild and unrelated settings absent from stale live state', async () => {
+  const workers = new WorkerStore(dataDir); await workers.init();
+  await workers.upsert({ ...workerRecord(), runtimeProfile: 'legacy-runc', legacyPrivilegeGrant: 'admin',
+    repos: [{ provider: 'github', url: 'example/current' }] });
+  await workers.markPendingRebuild('owner-1', 'worker-1');
+  const manager = new ContainerManager({}, {}); manager.setWorkerStore(workers);
+  const info = { ...workerRecord(), runtimeProfile: 'legacy-runc', status: 'running', pendingRebuild: false, containerId: 'original' };
+  Object.defineProperty(info, 'legacyPrivilegeGrant', { value: 'admin', configurable: true, writable: true, enumerable: false });
+  (manager as any).containers.set(info.id, info);
+  await (manager as any).updateSettingsForOwner(info.id, { displayName: 'Updated label' });
+  expect(workers.get('owner-1', 'worker-1')).toMatchObject({ displayName: 'Updated label', pendingRebuild: true, legacyPrivilegeGrant: 'admin',
+    repos: [{ provider: 'github', url: 'example/current' }] });
+  expect(info).toMatchObject({ displayName: 'Updated label', pendingRebuild: true, repos: [{ provider: 'github', url: 'example/current' }] });
+});
+
+test('uncertain final recreation record write retains replacement without automatic Docker rollback', async () => {
+  const mutations: string[] = [];
+  const manager = new ContainerManager({ removeContainer: async () => { mutations.push('remove'); } }, {});
+  const info = { ...workerRecord(), containerId: 'replacement', containerName: 'agentor-worker-worker-1', status: 'running' };
+  const error = Object.assign(new Error('fsync failed'), { code: 'WORKER_RECORD_STORE_UNAVAILABLE' });
+  await expect((manager as any).rollbackFailedRecreation(info, info.containerId, error)).rejects.toBe(error);
+  expect(mutations).toEqual([]);
+  expect(manager.get(info.id)).toMatchObject({ containerId: 'replacement', status: 'unknown' });
+});
+
+test('uncertain deletion marker prevents post-container data cleanup', async () => {
+  const mutations: string[] = [];
+  const manager = new ContainerManager({ removeContainer: async () => { mutations.push('remove-compute'); } }, {});
+  const info = { ...workerRecord(), containerId: 'replacement', containerName: 'agentor-worker-worker-1', status: 'running' };
+  (manager as any).containers.set(info.id, info);
+  manager.setWorkerStore({ get: () => workerRecord(), markDeletionPending: async () => {
+    throw Object.assign(new Error('fsync failed'), { code: 'WORKER_RECORD_STORE_UNAVAILABLE' });
+  } } as any);
+  manager.setStorageManager({ removeWorkerWorkspace: async () => { mutations.push('delete-data'); } } as any);
+  await expect((manager as any).removeUnlocked(info.id)).rejects.toMatchObject({ code: 'WORKER_RECORD_STORE_UNAVAILABLE' });
+  expect(mutations).toEqual(['remove-compute']);
+  expect(manager.get(info.id)).toBeDefined();
+});
+
+for (const lateDirty of [false, true]) test(`pre-upgrade archived worker preserves absent profile and ${lateDirty ? 'newer' : 'applied'} configuration debt`, async () => {
+  const workers = new WorkerStore(dataDir); await workers.init();
+  const record = { ...workerRecord(), status: 'archived' as const, desiredRuntimeStatus: 'stopped' as const };
+  await workers.upsert(record);
+  const created: any[] = [];
+  const manager = new ContainerManager({ assertWorkerRuntimeAvailable: async () => {},
+    createWorkerContainer: async (options: unknown) => {
+      created.push(options);
+      if (lateDirty) await workers.markPendingRebuild(record.userId, record.id);
+      return { id: 'replacement' };
+    },
+  }, { containerPrefix: 'agentor-worker', workerImagePrefix: '', workerImage: 'worker:latest' });
+  manager.setWorkerStore(workers);
+  const narrow = manager as any;
+  narrow.resolveAuthorizedHostMounts = async () => [];
+  narrow.resolveHardwareDeviceAccess = async () => [];
+  narrow.resolveEnvironmentConfig = () => ({});
+  narrow.deriveLimits = () => ({ dockerEnabled: false });
+  narrow.resolveGitIdentity = async () => ({});
+  narrow.resolveUserEnvAndBinds = async () => ({ credentialBinds: [], groupSecrets: [] });
+  narrow.persistentBackupPathMounts = async () => [];
+  const previous = (globalThis as any).reassignWorkerMappings;
+  (globalThis as any).reassignWorkerMappings = async () => {};
+  try {
+    await expect(narrow.unarchiveUnlocked(record.userId, record.id)).resolves.toMatchObject({ containerId: 'replacement', status: 'running' });
+    expect(created).toHaveLength(1);
+    expect(created[0]).toMatchObject({ runtimeProfile: 'legacy-runc', dockerEnabled: false });
+    expect(created[0].legacyPrivilegeGrant).toBeUndefined();
+    expect(workers.get(record.userId, record.id)).toMatchObject({ status: 'active', desiredRuntimeStatus: 'running' });
+    expect(workers.get(record.userId, record.id)!.runtimeProfile).toBeUndefined();
+    expect(workers.get(record.userId, record.id)!.pendingRebuild).toBe(lateDirty);
+    expect(manager.get(record.id)!.pendingRebuild).toBe(lateDirty);
+  } finally { (globalThis as any).reassignWorkerMappings = previous; }
+});
+
+test('rebuild completion uses the runtime tuple after immutable snapshot backfill', async () => {
+  const workers = new WorkerStore(dataDir); await workers.init();
+  const reference = 'agentor-import-worker-1:runtime-old';
+  const imageId = `sha256:${'e'.repeat(64)}`;
+  const record = { ...workerRecord(), runtimeProfile: 'legacy-runc' as const, importedImage: reference, pendingRebuild: true };
+  await workers.upsert(record);
+  const removed: string[] = [];
+  const manager = new ContainerManager({ assertWorkerRuntimeAvailable: async () => {},
+    stopContainer: async () => {}, removeContainer: async (id: string) => { removed.push(id); },
+    createWorkerContainer: async () => ({ id: 'replacement' }),
+  }, { containerPrefix: 'agentor-worker', workerImagePrefix: '', workerImage: 'worker:latest' });
+  manager.setWorkerStore(workers);
+  const narrow = manager as any;
+  const info = { ...record, status: 'running', containerId: 'a'.repeat(64), containerName: 'agentor-worker-worker-1',
+    imageName: reference, imageId };
+  narrow.containers.set(record.id, info);
+  narrow.resolveAuthorizedHostMounts = async () => [];
+  narrow.resolveHardwareDeviceAccess = async () => [];
+  narrow.resolveEnvironmentConfig = () => ({});
+  narrow.deriveLimits = () => ({ dockerEnabled: false });
+  narrow.resolveGitIdentity = async () => ({});
+  narrow.resolveUserEnvAndBinds = async () => ({ credentialBinds: [], groupSecrets: [] });
+  narrow.persistentBackupPathMounts = async () => [];
+  narrow.reconcileManagedNetworksForWorker = async () => {};
+  narrow.reconcileWorkerPlugins = async () => {};
+  narrow.inspectRuntimeSnapshotSource = async () => ({ Id: info.containerId, Name: '/' + info.containerName, Image: imageId,
+    Config: { Image: reference, Labels: { 'agentor.managed': 'true', 'agentor.id': record.id } },
+    HostConfig: { Runtime: 'runc', Privileged: false } });
+  narrow.runtimeSnapshotDocker = () => ({ getImage: () => ({ modem: { dial: (_options: unknown, callback: any) => callback(null, { Id: imageId }) } }) });
+  const previous = (globalThis as any).reassignWorkerMappings;
+  (globalThis as any).reassignWorkerMappings = async () => {};
+  try {
+    await expect(narrow.rebuildUnlocked(record.id)).resolves.toMatchObject({ containerId: 'replacement', pendingRebuild: false });
+    expect(removed).toEqual(['a'.repeat(64)]);
+    expect(workers.get(record.userId, record.id)).toMatchObject({ status: 'active', pendingRebuild: false,
+      runtimeSnapshotIdentity: { reference, imageId } });
+  } finally { (globalThis as any).reassignWorkerMappings = previous; }
+});
+
+for (const phase of ['committed', 'rolled-back'] as const) test(`startup sync loads historical ${phase} hold before legacy runtime backfill`, async () => {
+  const record = workerRecord();
+  const journals = new RuntimeMigrationStore(dataDir); await journals.init();
+  await journals.save({ version: 1, operationId: 'operation', workerId: record.id, userId: record.userId, phase,
+    createdAt: record.createdAt, updatedAt: record.updatedAt, sourceId: 'a'.repeat(64),
+    sourceName: 'agentor-worker-worker-1', rollbackName: 'agentor-worker-worker-1-runtime-rollback-operation',
+    sourceImage: 'worker:source', sourceImageId: `sha256:${'b'.repeat(64)}`, sourceRunning: false,
+    sourceRestartPolicy: { Name: 'no' }, targetProfile: 'kata-qemu', sourceRecord: record,
+    snapshotImage: 'agentor-import-worker-1:runtime-operation', mounts: [],
+    helperImage: `sha256:${'c'.repeat(64)}`, expectedMounts: [], replacementMayHaveRun: false });
+  const writes: string[] = [];
+  const manager = new ContainerManager({ listContainers: async () => [dockerWorker()],
+    inspectContainerRuntime: async () => ({ status: 'running', running: true, runtime: 'runc', privileged: true }),
+    probeContainerTask: async () => {},
+  }, { containerPrefix: 'agentor-worker' });
+  manager.setWorkerStore({ list: () => [record], findById: () => record,
+    get: () => record, hasUnavailableOwners: () => false,
+    capturePreexistingRuntime: async () => { writes.push('grant'); },
+    setDesiredRuntimeStatus: async () => { writes.push('desired'); },
+  } as any);
+  await manager.sync();
+  expect(manager.get(record.id)).toBeUndefined();
+  expect(writes).toEqual([]);
+  expect(await manager.hasPendingRuntimeMigrations()).toBe(true);
+  const inventory = await manager.runtimeMigrationInventory();
+  expect(inventory).toHaveLength(1);
+  expect(inventory[0]).toMatchObject({ workerId: record.id, displayName: record.displayName, phase,
+    reconciliationRequired: true, workerRecordTransitionPending: false });
+  expect(inventory[0]).not.toHaveProperty('sourceRecord');
+  expect(inventory[0]).not.toHaveProperty('mounts');
+  expect(inventory[0]).not.toHaveProperty('userId');
+  expect(manager.list()).toEqual([]);
+});
+
+for (const unavailable of ['worker', 'journal']) test(`migration inventory visibly rejects unavailable ${unavailable} owner partitions`, async () => {
+  const manager = new ContainerManager({}, {});
+  manager.setWorkerStore({ hasUnavailableOwners: () => unavailable === 'worker' } as any);
+  (manager as any).runtimeMigrationStore = { init: async () => {}, hasUnavailableOwners: () => unavailable === 'journal',
+    list: () => { throw new Error('must not silently omit unavailable owners'); } };
+  await expect(manager.runtimeMigrationInventory()).rejects.toMatchObject({ statusCode: 503,
+    code: unavailable === 'worker' ? 'WORKER_RECORD_STORE_UNAVAILABLE' : 'WORKER_RUNTIME_MIGRATION_JOURNAL_UNAVAILABLE' });
+});
 
 test('a late runtime probe overlapping recreation cannot repopulate the stale status cache', async () => {
   let finish!: (value: unknown) => void;
@@ -217,10 +405,10 @@ test('restored legacy records cannot regain privileged authority from Docker inv
   await expect((manager as any).recoverUnlocked('worker-1')).rejects.toMatchObject({ code: 'WORKER_RUNTIME_RESTORE_APPROVAL_REQUIRED' });
 });
 
-test('retained committed migration requires finalization before every worker recreation path', async () => {
+for (const phase of ['committed', 'rolled-back']) test(`retained ${phase} migration requires finalization before every worker recreation path`, async () => {
   const manager = new ContainerManager({} as any, { containerPrefix: 'agentor-worker' } as any);
   (manager as any).containers.set('worker-1', { ...workerRecord(), containerId: 'replacement', containerName: 'agentor-worker-worker-1', runtimeProfile: 'kata-qemu' });
-  (manager as any).runtimeMigrationStore = { get: () => ({ phase: 'committed' }), isBlocked: () => false };
+  (manager as any).runtimeMigrationStore = { init: async () => {}, get: () => ({ phase }), isBlocked: () => false };
   manager.setWorkerStore({ get: () => ({ ...workerRecord(), status: 'archived' }) } as any);
   for (const method of ['rebuildUnlocked', 'recoverUnlocked', 'archiveUnlocked', 'applyManagedStorageUnlocked'])
     await expect((manager as any)[method]('worker-1')).rejects.toMatchObject({ code: 'WORKER_RUNTIME_MIGRATION_FINALIZE_REQUIRED' });
@@ -228,16 +416,16 @@ test('retained committed migration requires finalization before every worker rec
     .rejects.toMatchObject({ code: 'WORKER_RUNTIME_MIGRATION_FINALIZE_REQUIRED' });
 });
 
-test('permanent worker deletion finalizes retained migration before removing active container', async () => {
+for (const phase of ['committed', 'rolled-back']) test(`permanent worker deletion requires explicit ${phase} migration finalization`, async () => {
   const events: string[] = [];
   const manager = new ContainerManager({ removeContainer: async () => {
     events.push('remove-active'); throw new Error('stop test after ordered removal');
   } } as any, { containerPrefix: 'agentor-worker' } as any);
   (manager as any).containers.set('worker-1', { ...workerRecord(), containerId: 'replacement', containerName: 'agentor-worker-worker-1' });
-  (manager as any).runtimeMigrationStore = { get: () => ({ phase: 'committed' }), isBlocked: () => false };
+  (manager as any).runtimeMigrationStore = { init: async () => {}, get: () => ({ phase }), isBlocked: () => false };
   (manager as any).runtimeMigrationEngine = () => ({ finalize: async () => { events.push('finalize'); } });
-  await expect((manager as any).removeUnlocked('worker-1')).rejects.toThrow(/stop test/);
-  expect(events).toEqual(['finalize', 'remove-active']);
+  await expect((manager as any).removeUnlocked('worker-1')).rejects.toMatchObject({ code: 'WORKER_RUNTIME_MIGRATION_FINALIZE_REQUIRED' });
+  expect(events).toEqual([]);
 });
 
 test('runtime mismatch is quarantined without adopting Docker privilege', async () => {
@@ -442,8 +630,7 @@ test("sync cannot overwrite a lifecycle replacement with its older Docker snapsh
   });
 
   const syncing = manager.sync();
-  for (let i = 0; !inspecting && i < 10; i++) await Promise.resolve();
-  expect(inspecting).toBe(true);
+  await expect.poll(() => inspecting).toBe(true);
 
   await withWorkerLifecycleMutation("worker-1", async () => {
     // This models a completed rebuild/recovery that replaced the disposable
@@ -480,8 +667,7 @@ for (const delayedPhase of ['list', 'inspect', 'missing']) test(`sync starting d
   let syncing!: Promise<void>;
   await withWorkerLifecycleMutation(record.id, async () => {
     syncing = manager.sync();
-    for (let i = 0; !entered && i < 10; i++) await Promise.resolve();
-    expect(entered).toBe(true);
+    await expect.poll(() => entered).toBe(true);
     current.status = 'running';
   });
   release();
@@ -507,8 +693,7 @@ test("sync never revives an archived worker from an older Docker list response",
   );
   manager.setWorkerStore({ list: () => [record], findById: () => record } as any);
   const syncing = manager.sync();
-  for (let i = 0; !inspecting && i < 10; i++) await Promise.resolve();
-  expect(inspecting).toBe(true);
+  await expect.poll(() => inspecting).toBe(true);
   await withWorkerLifecycleMutation("worker-1", async () => {
     (record as any).status = "archived";
     (manager as any).containers.delete("worker-1");
