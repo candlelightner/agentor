@@ -40,6 +40,9 @@ four offline cases before the second attempt. Neither failure is a product pass.
 
 ## Observed result
 
+The first attempt below failed; a subsequent independently reviewed fresh-data
+run passed the complete bounded sequence. See **Successful fresh-data retry**.
+
 The fresh test administrator created a non-DinD environment and used the
 ordinary worker-create route without a legacy override. Creation returned 201
 and the worker selected `kata-qemu` / `agentor-kata-qemu` without privilege,
@@ -86,3 +89,63 @@ validation flag; no global flag, migration-capacity gate or DinD gate changed.
   `6d7164aac8f8bb9714ad8dd5c4a6924e33dbf5e113f3bfe6f4213d7e798bafb1`.
 - Image identity proof: `/workspace/kata-image-proof-live/api-image-proof.spec.ts`
   and `api-image-proof-results.log` (one passed).
+
+## Successful fresh-data retry
+
+On 2026-09-29 the same immutable app and worker images passed authenticated
+create, restart, rebuild, archive and unarchive in a new isolated test stack.
+The test orchestrator retained `cap-drop ALL` and no-new-privileges, with only
+`CHOWN`, `DAC_OVERRIDE` and `FOWNER` added. These are app-only filesystem
+capabilities: chown establishes the intended UID-1000 ownership, DAC override
+permits access through private UID-1000 directories, and FOWNER permits chmod
+of worker-owned directories. The exact capability set was checked before app
+start, accepting only Docker's optional `CAP_` spelling difference. No worker
+grant or production configuration was changed.
+
+The correction and full harness received independent review before execution.
+Offline checks covered syntax and exact capability matching, including missing,
+duplicate and extra grants; Python optimization now explicitly fails because
+it would disable the safety assertions. The run used fresh data and stopped
+on failure, with no runtime fallback.
+
+| Operation | Result |
+| --- | --- |
+| Default worker create | HTTP 201; durable `kata-qemu`, runtime `agentor-kata-qemu` |
+| API restart | Passed; same container ID, READY and services checked again |
+| API rebuild | Passed; different container ID, retained volume markers |
+| API archive | Passed; active container absent and archived runtime profile retained |
+| API unarchive | Passed; another container ID, retained volume markers |
+
+At every running stage, READY, numeric UID1000 exec, tmux, editor HTTP and
+desktop HTTP passed. Workspace and agent-data markers survived. Both shared
+Kilo directories were UID:GID `1000:1000`, mode `0700`; worker-written markers
+survived each lifecycle transition and were readable through the app data
+mount. Docker inspection checked the immutable worker image, no privilege,
+added capabilities, device grants, socket or host namespaces, and mount sources
+confined to this test's data. The guest kernel remained `6.18.35`.
+
+This is one successful **recovery-mode, non-DinD API lifecycle** sequence. It
+does not establish normal-startup reconciliation, browser UI acceptance,
+credential reset/atomic replacement, multiworker credential sharing, backup
+restore, rootfs snapshot migration, DinD or production-host validation.
+
+The harness exited 0, including cleanup and baseline comparisons. Only its
+exact test app/worker containers and empty owned networks were removed; test
+volumes were retained. The pre-existing stopped canary's full inspection was
+unchanged. VM Docker PID `28754` and daemon-config SHA-256
+`74b0b314ff3a005384a2595d392a61c21acdd090a36f77eaf1211cad918737cf`
+were unchanged, with no running containers and about 13 GiB free afterward.
+Test-only attestation ended with removal of the app. DinD and migration-capacity
+gates remain closed.
+
+- Worker ID: `b7d1a9f5-b7f1-43ff-a776-9b9abaa54edf`.
+- Final removed worker container:
+  `515dd4cdc1c9b12f2fce0e4fc208fb49bdd8d605efebf70bd75e63938f391472`.
+- Retained app volume: `kata-api-bpyea6he-data`.
+- VM evidence: `/home/kata-test/kata-api-lifecycle.bpyea6he`.
+- Local log: `/workspace/kata-vm-api-lifecycle-3.log`.
+- Executed harness SHA-256:
+  `91916034b2ac4031d44febee95f46fac55b8839e3fcd42db4d11f75efcacd084`.
+- Local evidence archive:
+  `/workspace/kata-vm-api-lifecycle-success-evidence.tar.gz`, SHA-256
+  `cdd7af8cec0d3f4a13ba8e014de2cbd4e2cde86c3d192f595f9c569bd505bce6`.

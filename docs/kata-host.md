@@ -266,7 +266,7 @@ API cannot establish free space for every image/layer/content-store filesystem.
 A worker or helper's `df` is not a valid substitute: volume storage and image
 content may reside on different filesystems. A sound automatic admission check
 needs operator-provided read-only storage mappings/capacity measurements, bounded
-source sizing, and reservation or a post-stop recheck. Until implemented and
+source sizing, durable reservation and a post-stop recheck. Until implemented and
 tested, this is a rollout blocker; copying failure alone is not capacity proof.
 Public migration currently rejects with
 `WORKER_RUNTIME_MIGRATION_CAPACITY_UNVERIFIED` before journal or Docker access;
