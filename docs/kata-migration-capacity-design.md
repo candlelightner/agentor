@@ -87,6 +87,21 @@ unfinished. Public migration admission is unchanged.
 
 ## Existing transaction and trust boundary
 
+The isolated candidate mapper/scanner now has synthetic offline coverage for
+the proposed classic-overlay2/XFS DATA-domain layout. Mapping checks exact
+candidate/build identities, mount and superblock write flags, filesystem and
+project constraints, directory alias consistency, and source-project isolation.
+An injected no-follow reader performs bounded matching scan passes, retaining
+actual handle cleanup settlement after interruption. Independent review found
+and corrected read-only-superblock and contradictory-inode/project acceptance;
+89 focused tests now pass. These are synthetic observations, not host support.
+
+There is no concrete Linux reader, protected control-storage adapter,
+allocation envelope, kernel quota non-bypass proof, maintenance fence or
+migration admission wiring. The scanner cannot prove stability between its
+observations without those external controls. All mapper/scanner outputs remain
+`admissionReady: false`; the public gate is unchanged.
+
 `worker-runtime-capacity.ts` currently throws before the public migration path
 builds its input, journal, or performs Docker access. Read-only preflight and
 recovery/finalization of existing journals remain available. The migration
