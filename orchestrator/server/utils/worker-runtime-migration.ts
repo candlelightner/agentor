@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { RuntimeSnapshotIdentity, WorkerRuntimeProfile } from '../../shared/types';
 import type { WorkerRecord } from './worker-store';
 import { validRuntimeSnapshotIdentity } from './worker-store';
-import { UserScopedJsonStore } from './user-scoped-store';
+import { DurableMigrationJournalStore, isMigrationJournalPersistenceError, type MigrationJournalIO } from './runtime-migration-durable-store';
 import { assertWorkerRuntimeMatches, resolveWorkerRuntimePolicy, resolveWorkerRuntimeProfile } from './worker-runtime-policy';
 import { withOperationDeadline, operationSettlement } from './operation-deadline';
 import { runtimeSnapshotEnvironment } from './worker-runtime-snapshot';
@@ -30,9 +30,9 @@ export interface RuntimeMigrationJournal {
 }
 
 const terminal = (phase: RuntimeMigrationPhase) => phase === 'committed' || phase === 'rolled-back';
-export class RuntimeMigrationStore extends UserScopedJsonStore<string, RuntimeMigrationJournal> {
-  constructor(dataDir: string) {
-    super(dataDir, 'worker-runtime-migrations.v1.json', (j) => {
+export class RuntimeMigrationStore extends DurableMigrationJournalStore<RuntimeMigrationJournal> {
+  constructor(dataDir: string, io?: MigrationJournalIO) {
+    super(dataDir, (j) => {
       if (!j || j.version !== 1 || !/^[a-zA-Z0-9_-]+$/.test(j.workerId) ||
           !/^[a-zA-Z0-9_-]+$/.test(j.operationId) || j.sourceRecord?.id !== j.workerId ||
           j.sourceRecord?.userId !== j.userId || !/^[a-f0-9]{64}$/.test(j.sourceId) ||
@@ -49,10 +49,17 @@ export class RuntimeMigrationStore extends UserScopedJsonStore<string, RuntimeMi
             m.backup !== `agentor-runtime-backup-${j.operationId}-${i}` || typeof m.copied !== 'boolean'))
         throw new Error('Invalid worker runtime migration journal');
       return j.workerId;
-    });
+    }, io);
   }
   async save(j: RuntimeMigrationJournal) { this.keyFn(j); await this.setItem(j.userId, { ...j, updatedAt: new Date().toISOString() }); }
   async clear(userId: string, workerId: string) { await this.deleteItem(userId, workerId); }
+  requiresReconciliation(userId: string, workerId: string) {
+    return this.requiresLoadedReconciliation(userId, workerId);
+  }
+  async recordReconciliation(j: RuntimeMigrationJournal) {
+    await this.save(j);
+    this.acknowledgeLoadedReconciliation(j.userId, j.workerId);
+  }
   pending() { return this.list().filter((j) => !terminal(j.phase)); }
   hasUnavailableOwners() {
     return this.listUserIds().some((userId) => { try { this.listForUser(userId); return false; } catch { return true; } });
@@ -274,6 +281,7 @@ export class WorkerRuntimeMigration {
       // separate; failures never destroy the source rootfs or volume copies.
       return j;
     } catch (cause) {
+      if (isMigrationJournalPersistenceError(cause)) throw cause;
       await (cause as any)?.[operationSettlement];
       if (ambiguousDockerOutcome(cause)) {
         j.phase = 'recovery-required'; j.uncertainOperation = true;
@@ -297,12 +305,15 @@ export class WorkerRuntimeMigration {
   }
 
   async recover(j: RuntimeMigrationJournal, daemonOperationsSettled = false) {
-    if (j.uncertainOperation || j.inFlightOperation) {
+    // Reading also enforces sticky owner quarantine for detached callers.
+    this.store.get(j.userId, j.workerId);
+    if (j.uncertainOperation || j.inFlightOperation ||
+        (!terminal(j.phase) && this.store.requiresReconciliation(j.userId, j.workerId))) {
       if (!daemonOperationsSettled)
         throw migrationError('An operator must verify all outstanding Docker operations have settled before recovery', 'WORKER_RUNTIME_MIGRATION_OUTCOME_UNCERTAIN');
       delete j.uncertainOperation;
       delete j.inFlightOperation;
-      await this.store.save(j);
+      await this.store.recordReconciliation(j);
     }
     this.activeJournal = j;
     try { if (!terminal(j.phase)) await this.rollback(j); }
@@ -313,6 +324,7 @@ export class WorkerRuntimeMigration {
    * completed rollback. Canonical worker volumes and active rootfs are never
    * cleanup targets. Repeated cleanup is safe after partial deletion. */
   async finalize(j: RuntimeMigrationJournal) {
+    this.store.get(j.userId, j.workerId);
     if (!terminal(j.phase) || j.uncertainOperation || j.inFlightOperation)
       throw migrationError('Complete migration recovery before deleting rollback evidence');
     if (j.phase === 'committed') {
@@ -373,9 +385,14 @@ export class WorkerRuntimeMigration {
         const actual = await candidate.inspect();
         if (actual.Id !== j.sourceId) {
           if (actual.Config.Labels?.['agentor.runtime-migration'] !== j.operationId ||
-              actual.Config.Labels?.['agentor.runtime-migration-worker'] !== j.workerId)
+              actual.Config.Labels?.['agentor.runtime-migration-worker'] !== j.workerId ||
+              actual.Config.Labels?.['agentor.runtime-migration-owner'] !== j.userId)
             throw migrationError('Replacement identity mismatch during rollback');
           replacement = candidate;
+          // createContainer can succeed while completion-journal persistence
+          // fails before its return value reaches the caller. Recover its exact
+          // identity before volume-consumer checks and persist before mutation.
+          j.replacementId = actual.Id;
           j.replacementMayHaveRun ||= actual.State.Running || !!actual.State.StartedAt && !actual.State.StartedAt.startsWith('0001-');
           await candidate.update({ RestartPolicy: { Name: 'no' } });
           if (actual.State.Running) await candidate.stop({ t: 30 });
@@ -416,6 +433,7 @@ export class WorkerRuntimeMigration {
       await old.update({ RestartPolicy: j.sourceRestartPolicy });
       j.phase = 'rolled-back'; delete j.error; await this.store.save(j);
     } catch (error) {
+      if (isMigrationJournalPersistenceError(error)) throw error;
       await (error as any)?.[operationSettlement];
       j.phase = 'recovery-required'; j.error = 'Rollback incomplete; retained source, image and volume snapshots require recovery';
       if (ambiguousDockerOutcome(error)) {
@@ -454,7 +472,7 @@ export class WorkerRuntimeMigration {
       const result = await helper.wait();
       if (result.StatusCode !== 0) throw migrationError('Persistent data snapshot or restore failed');
     } catch (error) {
-      uncertain = ambiguousDockerOutcome(error);
+      uncertain = ambiguousDockerOutcome(error) || isMigrationJournalPersistenceError(error);
       throw error;
     } finally { if (!uncertain) await helper.remove({ force: true }); }
   }
@@ -542,19 +560,22 @@ function boundedDocker(docker: Docker, beforeMutation: (operation: string) => Pr
       return async (...args: any[]) => {
         const mutation = mutating.has(String(key));
         if (mutation) await beforeMutation(`${kind} ${String(key)}`);
+        let result;
         try {
-          const result = await withOperationDeadline((signal) => {
+          result = await withOperationDeadline((signal) => {
             const next = args.length ? [...args] : [{}];
             next[0] = { ...(next[0] ?? {}), abortSignal: signal };
             return value.apply(target, next);
           }, key === 'wait' || key === 'commit' ? 120_000 : 30_000, `Docker runtime migration ${kind} ${String(key)}`);
-          if (mutation) await afterMutation();
-          return key === 'createContainer' || key === 'createVolume' ? wrap(result, String(key)) : result;
         } catch (error) {
           await (error as any)?.[operationSettlement];
-          if (mutation && !ambiguousDockerOutcome(error)) await afterMutation();
+          if (mutation && !ambiguousDockerOutcome(error) && !isMigrationJournalPersistenceError(error)) await afterMutation();
           throw error;
         }
+        // A journal failure must not be mistaken for a Docker failure and
+        // retried, nor authorize rollback through uncertain persisted state.
+        if (mutation) await afterMutation();
+        return key === 'createContainer' || key === 'createVolume' ? wrap(result, String(key)) : result;
       };
     },
   });

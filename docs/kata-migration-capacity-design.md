@@ -32,7 +32,27 @@ replay, malformed values and exact uint64 boundaries. It does not authenticate
 transport, produce/validate the digested inventory or envelope, prove quota
 enforcement, or persist one-use nonce consumption/replay state. Returned data
 is not a ticket or migration authority. Atomic durable replay consumption,
-the full measurement payload, ledger and phase integration remain required.
+the full measurement payload and phase integration remain required.
+
+`worker-runtime-capacity-ledger.ts` now supplies an independently reviewed,
+isolated operator-broker ledger core on protected local POSIX control storage.
+It durably registers requests, serializes fresh measurement and compare/reserve,
+and commits nonce consumption, replay high-water and retained allocations with
+file and directory synchronization before acknowledgement. An exclusive
+persistent directory lock prevents concurrent broker ownership; crashes and
+uncertain writes retain that lock for offline operator reconciliation, never
+PID/TTL-based takeover. Every reopen requires explicit trusted review. Exact
+retries return historical records, not renewed phase permission. Fixed operation
+and state-size limits fail closed rather than evict reservations. Thirty-six
+focused tests include separate-process lock contention and injected write/sync/
+rename/acknowledgement failures. They are not physical power-cut tests.
+
+This is not an installed service or a capacity ticket. No release, reduction,
+increase or phase-transition operation exists yet. Transport authentication,
+inventory interpretation, trusted mapper/scanner, actual quota enforcement,
+maintenance fencing and migration integration remain unimplemented. The ledger
+accepts only trusted local adapter outputs; tests do not prove those adapters.
+The public migration gate remains closed.
 
 ## Existing transaction and trust boundary
 
