@@ -58,6 +58,58 @@ test('exact floor boundary succeeds with zero remaining allocation headroom', ()
   expect(calculateRuntimeCapacityHeadroom(input).constraints[0]!.remaining).toEqual(amount('0'));
 });
 
+function quotaFixture(): RuntimeCapacityAccountingInput {
+  const input = fixture();
+  input.constraints.push({ id: 'quota', kind: 'quota', available: amount('650'), safetyFloor: amount('0') });
+  input.destinations.forEach((destination) => destination.constraintIds.push('quota'));
+  input.reservations[0]!.allocations.push({ constraintId: 'quota', amount: amount('150') });
+  return input;
+}
+
+test('quota-only zero floors admit the exact enforced boundary without weakening physical floors', () => {
+  const result = calculateRuntimeCapacityHeadroom(quotaFixture()).constraints;
+  expect(result[0]).toMatchObject({ id: 'fs-1', safetyFloor: amount('100'), remaining: amount('250') });
+  expect(result[1]).toEqual({ id: 'quota', available: amount('650'), safetyFloor: amount('0'),
+    outstanding: amount('150'), requested: amount('500'), remaining: amount('0') });
+});
+
+for (const resource of ['bytes', 'inodes'] as const) {
+  test(`zero quota ${resource} headroom rejects positive demand rather than representing unlimited quota`, () => {
+    const input = quotaFixture();
+    input.constraints[1]!.available[resource] = '0';
+    expect(() => calculateRuntimeCapacityHeadroom(input)).toThrow(`quota (${resource})`);
+  });
+
+  test(`quota-only ${resource} floor may be positive and is still charged`, () => {
+    const input = quotaFixture();
+    input.constraints[1]!.safetyFloor[resource] = '1';
+    expect(() => calculateRuntimeCapacityHeadroom(input)).toThrow(`quota (${resource})`);
+    input.constraints[1]!.available[resource] = '651';
+    expect(calculateRuntimeCapacityHeadroom(input).constraints[1]!.remaining).toEqual(amount('0'));
+  });
+
+  test(`pool ${resource} safety floor must remain positive even with a valid filesystem mapping`, () => {
+    const input = fixture();
+    input.constraints.push({ id: 'pool', kind: 'pool', available: amount('1000'), safetyFloor: amount('100') });
+    input.constraints[1]!.safetyFloor[resource] = '0';
+    input.destinations.forEach((destination) => destination.constraintIds.push('pool'));
+    expect(() => calculateRuntimeCapacityHeadroom(input)).toThrow(/physical constraint.safetyFloor must be nonzero/);
+  });
+
+  test(`quota allowance cannot cover filesystem ${resource} exhaustion`, () => {
+    const input = quotaFixture();
+    input.constraints[0]!.available[resource] = '749';
+    expect(() => calculateRuntimeCapacityHeadroom(input)).toThrow(`fs-1 (${resource})`);
+  });
+}
+
+test('changing the only filesystem to a zero-floor quota cannot bypass physical domain mapping', () => {
+  const input = fixture();
+  input.constraints[0]!.kind = 'quota';
+  input.constraints[0]!.safetyFloor = amount('0');
+  expect(() => calculateRuntimeCapacityHeadroom(input)).toThrow(/exactly one filesystem/);
+});
+
 test('all outstanding reservations accumulate; no terminal or expired ticket can be silently excluded', () => {
   const input = fixture();
   input.reservations.push({ id: 'expired-or-orphan-operation', allocations: [{ constraintId: 'fs-1', amount: amount('250') }] });

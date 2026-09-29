@@ -13,9 +13,11 @@ migration remains closed by `WORKER_RUNTIME_MIGRATION_CAPACITY_UNVERIFIED`.
 The initial `worker-runtime-capacity-accounting.ts` module provides only pure
 bounded arithmetic: canonical uint64 byte/inode quantities, one budget per
 allocation constraint, additive demands and outstanding reservations, and
-nonzero safety floors. Shared filesystem aliases cannot multiply free space;
-separate quota/pool constraints also consume their mapped demands. Its 69
-focused tests cover malformed input, limits, exhaustion, precision and overflow.
+nonzero physical-filesystem/pool safety floors. Quota-only floors may be zero;
+zero available quota still means no allocation headroom. Shared filesystem
+aliases cannot multiply free space; separate quota/pool constraints also consume
+their mapped demands. Its focused tests cover malformed input, limits,
+exhaustion, quota-floor semantics, precision and overflow.
 It performs no measurement, authentication, I/O or durable reservation and is
 not connected to migration admission. Concrete supported layouts, enforced
 write bounds, maintenance fencing, broker transport and phase integration
@@ -218,11 +220,12 @@ fictitious available quota above the currently enforced limit. Future recovery
 limit increases are separate conditional phase entitlements backed by an
 already durable **physical** reservation; re-read the applied kernel limit and
 usage before admitting recovery writes. Physical safety floors stay nonzero.
-The initial arithmetic module currently requires a nonzero floor on every
-constraint, including quota; it therefore needs a reviewed schema/test
-refinement for this distinction before quota integration. Until then it may
-reject these valid quota envelopes conservatively, and must not be fed invented
-headroom to force success.
+The isolated arithmetic module implements this floor distinction: only quota
+constraints may use zero floors, and every destination still requires a mapped
+filesystem with positive byte/inode floors. It performs no raw quota discovery
+or enforcement validation; the trusted adapter must reject unlimited/disabled
+quota sentinels before constructing these inputs. Future recovery ceilings
+must not be fed into currently available quota to force arithmetic success.
 
 1. **Pre-stop:** verify the running source's enrolled hard limits and reserve
    its maximum remaining allocation up to those limits, including shutdown

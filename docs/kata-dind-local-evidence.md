@@ -239,3 +239,42 @@ Executed harness SHA-256:
 Eleven offline diagnostic-control tests and syntax checks passed before the
 run. This is a confirmed failed mount diagnostic, not DinD acceptance;
 `KATA_DIND_NOT_VALIDATED` remains in force.
+
+### Fresh guest cgroup mount and canonical bind prerequisite
+
+The reviewed bounded candidate mounted a fresh cgroup2 view in a private guest
+mount namespace, then nonrecursively bound that same guest filesystem onto
+`/sys/fs/cgroup`. Two preliminary attempts stopped at verification: `findmnt`
+reported both the hidden read-only and visible read-write stacked mounts, so
+the single-record assertion failed. Both mount operations succeeded in the
+instrumented attempt; neither run reached the empty child or an inner daemon.
+These were verification failures, not demonstrated permission denials.
+
+The corrected harness opens the actual directory with a read-only `O_PATH`
+descriptor and matches its fdinfo `mnt_id` to the exact mountinfo record. It
+checks filesystem/device/root/inode identity and effective mount flags without
+assuming listing order or the highest mount ID. Independent review and all
+29 offline fixtures passed before execution.
+
+The fresh corrected run exited **0**: canonical mount ID86 was read-write,
+with nosuid/nodev/noexec, while the hidden original ID70 remained read-only.
+One empty child was created and removed. No controller was enabled, process
+moved or inner daemon started. The original container mount namespace remained
+unchanged/read-only. The same SYS_ADMIN-only addition, SYS_MODULE drop, private
+cgroups, no-new-privileges, network none and no device/socket/bind exposure were
+retained. This establishes only the bounded cgroup prerequisite, not DinD.
+
+Exact container
+`5c9e6e30a3d7ffe063685bb64eba1e6d43a3aec3c83eeba538d93cbdb65021bb`
+was removed and absence checked. Only the original stopped canary remained;
+VM Docker PID28754/config checksum and approximately 13 GiB free were unchanged.
+No persistent volume was created. Evidence:
+
+- VM `/home/kata-test/kata-cgroup-bind.ijOOQAcL`.
+- Log `/workspace/kata-vm-cgroup-bind-3.log`.
+- Harness SHA256 `7d7ce8933760c3f9000c6476008f249cd91427154249e6a4d06371eb7fe290d6`.
+- Archive `/workspace/kata-vm-cgroup-bind-evidence-3.tar.gz`, SHA256
+  `29348a7b36f3c3be3a0aaacc03647a1567fca818af4367afc0cad087ac7e66a1`.
+
+The subsequent inner-daemon harness still requires its own complete review;
+this result does not enable `KATA_DIND_NOT_VALIDATED` or select production storage.

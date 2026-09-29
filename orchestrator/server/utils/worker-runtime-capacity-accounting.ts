@@ -13,6 +13,9 @@
  * even when they read the same source. Reservations describe FUTURE allocations
  * only; materialized usage is already reflected in available space. The caller
  * must reconcile that distinction durably, never infer it from ticket expiry.
+ * Physical filesystem / pool floors must be positive in both dimensions.
+ * Quota-only floors may be zero: a workload can consume its enforced hard
+ * limit. Zero available quota means no headroom, never unlimited allocation.
  */
 
 export interface RuntimeCapacityAmount { bytes: string; inodes: string }
@@ -113,7 +116,8 @@ export function calculateRuntimeCapacityHeadroom(input: unknown): RuntimeCapacit
     if (row.kind !== 'filesystem' && row.kind !== 'quota' && row.kind !== 'pool') invalid('constraint.kind');
     const available = amount(row.available, 'constraint.available');
     const safetyFloor = amount(row.safetyFloor, 'constraint.safetyFloor');
-    if (safetyFloor.bytes === 0n || safetyFloor.inodes === 0n) invalid('constraint.safetyFloor must be nonzero');
+    if (row.kind !== 'quota' && (safetyFloor.bytes === 0n || safetyFloor.inodes === 0n))
+      invalid('physical constraint.safetyFloor must be nonzero');
     constraints.set(id, { kind: row.kind, available, safetyFloor,
       outstanding: { bytes: 0n, inodes: 0n }, requested: { bytes: 0n, inodes: 0n } });
   }
