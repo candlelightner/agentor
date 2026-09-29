@@ -30,6 +30,7 @@ export default defineConfig({
     "api/backup-restore-safety.spec.ts",
     "api/worker-runtime-migration.spec.ts",
     "api/worker-runtime-capacity-accounting.spec.ts",
+    "api/worker-runtime-capacity-protocol.spec.ts",
     "api/worker-runtime-snapshot.spec.ts",
     "api/worker-runtime-image-proof.spec.ts",
     "api/worker-runtime-image-pinning.spec.ts",

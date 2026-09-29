@@ -23,6 +23,17 @@ not connected to migration admission. Concrete supported layouts, enforced
 write bounds, maintenance fencing, broker transport and phase integration
 remain unfinished. A successful calculation is not a capacity ticket.
 
+`worker-runtime-capacity-protocol.ts` adds isolated version-one request/evidence
+structure and consistency checks. It binds identities, inventory/envelope
+digests, phase, expected source state, nonce, bounded timestamps and scan
+metadata to trusted local expectations and a host/service/daemon replay
+high-water mark. Its 110 focused tests include mismatch, stale/incomplete scan,
+replay, malformed values and exact uint64 boundaries. It does not authenticate
+transport, produce/validate the digested inventory or envelope, prove quota
+enforcement, or persist one-use nonce consumption/replay state. Returned data
+is not a ticket or migration authority. Atomic durable replay consumption,
+the full measurement payload, ledger and phase integration remain required.
+
 ## Existing transaction and trust boundary
 
 `worker-runtime-capacity.ts` currently throws before the public migration path

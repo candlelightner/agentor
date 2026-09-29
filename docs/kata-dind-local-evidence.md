@@ -278,3 +278,29 @@ No persistent volume was created. Evidence:
 
 The subsequent inner-daemon harness still requires its own complete review;
 this result does not enable `KATA_DIND_NOT_VALIDATED` or select production storage.
+
+### Inner daemon attempt: containerd v4 verification mismatch
+
+After full independent review, harness SHA256
+`579ddc558732948da5023931dfd68311b7e2338270063cf734c7b75473109c40`
+ran once on fresh 512 MiB fully allocated guest loop/ext4 storage. Private fresh
+cgroup mount/bind and empty-child checks passed. Containerd 2.3.6 started on the
+explicit private socket, but the harness stopped at `KeyError: 'grpc'`: this
+version migrates configuration v3 to v4, moving listener fields under server
+plugins. Dockerd, image import and nested-container execution were **not reached**.
+This is a harness schema-verification failure, not a demonstrated permission
+denial or DinD pass. A corrected pre-start configuration validator requires
+separate review before any retry.
+
+The exact container
+`bd909754a364c19a9e416eb1eeed87c44ee09e8d8e35869fb843add6a685bcc0`
+was removed; volume `kata-guest-dind-bind-iPzJHlW3-data` remains. Docker PID/config
+and original stopped-canary inventory were unchanged; about 12 GiB remained.
+Two captured subsequent canary inspections equal the saved browser-run baseline.
+An earlier unsaved inline comparison returned false; its differing value was
+not captured, so that individual comparison remains unexplained.
+
+- VM `/home/kata-test/kata-guest-dind-bind.iPzJHlW3`.
+- Log `/workspace/kata-vm-guest-dind-bind.log`.
+- Archive `/workspace/kata-vm-guest-dind-bind-evidence.tar.gz`, SHA256
+  `b918ac14bd81a6601f171639081b8d81f0d7e5a3f42dc15f832717aca140a0d0`.
