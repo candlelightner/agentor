@@ -22,10 +22,11 @@
  * phase permission. All persistence uncertainty quarantines the owner and
  * leaves the exclusive lock in place for offline recovery.
  */
-import { constants } from 'node:fs';
+import { constants, type Stats } from 'node:fs';
 import { lstat, mkdir, open, readdir, realpath, rename, rmdir, type FileHandle } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { combineSettlements, operationSettlement } from './operation-deadline';
 import { calculateRuntimeCapacityHeadroom, type RuntimeCapacityAccountingInput } from './worker-runtime-capacity-accounting';
 import { parseRuntimeCapacityMeasurementRequest, verifyRuntimeCapacityMeasurementEvidence,
   type RuntimeCapacityMeasurementRequest } from './worker-runtime-capacity-protocol';
@@ -51,12 +52,26 @@ export interface CapacityLedgerOptions {
   policy: { maxEvidenceAgeMs: number; maxLifetimeMs: number; maxScanDurationMs: number; maxScanEntries: string };
   /** Test-only fault injection, never populated by an RPC request. */
   fault?: (point: CapacityLedgerFaultPoint) => void | Promise<void>;
+  /** Internal fixture-only I/O seam. Never populated by broker/RPC input. */
+  openFile?: typeof open;
 }
 const MAX_BYTES = 4 * 1024 * 1024;
 const MAX_ENTRIES = 128;
 const MAX_UINT = (1n << 64n) - 1n;
-function fail(reason: string): never {
-  throw Object.assign(new Error(`Capacity ledger refused: ${reason}`), { code: 'WORKER_RUNTIME_CAPACITY_LEDGER_HELD' });
+function refused(reason: string): Error {
+  return Object.assign(new Error(`Capacity ledger refused: ${reason}`), { code: 'WORKER_RUNTIME_CAPACITY_LEDGER_HELD' });
+}
+function fail(reason: string): never { throw refused(reason); }
+/** Preserve caller-visible failure semantics (including EEXIST) without
+ * mutating immutable errors or losing either compound native lifetime. */
+function failureWithSettlements(primary: unknown, ...secondary: unknown[]): Error {
+  const error = primary instanceof Error ? primary : refused('operation failed');
+  const settlement = combineSettlements(primary, ...secondary);
+  if (!settlement) return error;
+  return Object.create(Object.getPrototypeOf(error), {
+    ...Object.getOwnPropertyDescriptors(error),
+    [operationSettlement]: { value: settlement, enumerable: false },
+  });
 }
 function object(value: unknown, fields: string[]): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value) ||
@@ -174,6 +189,7 @@ export class RuntimeCapacityLedger {
   private directoryIdentity!: { dev: number; ino: number };
   private queue: Promise<unknown> = Promise.resolve();
   private closed = false;
+  private accepting = true;
   private quarantined = false;
   private epoch: { layoutGeneration: string; maintenanceEpoch: string } | null = null;
   private constructor(private readonly options: CapacityLedgerOptions) {}
@@ -186,7 +202,7 @@ export class RuntimeCapacityLedger {
     if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid?.() || (info.mode & 0o777) !== 0o700) fail('control directory ownership/mode');
     ledger.options.directory = directory;
     ledger.directoryIdentity = { dev: info.dev, ino: info.ino };
-    ledger.directoryHandle = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    ledger.directoryHandle = await (ledger.options.openFile ?? open)(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
     try {
       await ledger.assertDirectory();
       // A second process loses here. Existing locks are NEVER declared stale.
@@ -200,7 +216,9 @@ export class RuntimeCapacityLedger {
           sequence: '0', lastReviewDigest: null, entries: [] };
         await ledger.persist(ledger.state);
       } else {
-        const file = await open(join(directory, 'ledger.json'), constants.O_RDONLY | constants.O_NOFOLLOW);
+        // Validate type without waiting for a writer if corrupt state is a FIFO.
+        const file = await (ledger.options.openFile ?? open)(join(directory, 'ledger.json'), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        let primary: unknown, closeError: unknown, readFailed = false, closeFailed = false;
         try {
           const stat = await file.stat();
           if (!stat.isFile() || stat.nlink !== 1 || stat.uid !== process.getuid?.() || (stat.mode & 0o777) !== 0o600 || stat.size > MAX_BYTES) fail('ledger file boundary');
@@ -216,28 +234,40 @@ export class RuntimeCapacityLedger {
           if (digest(envelope.checksum) !== hash(envelope.state)) fail('ledger checksum');
           ledger.state = parseState(envelope.state);
           if (encoded(ledger.state.identity) !== encoded(ledger.options.identity)) fail('ledger identity changed');
-        } finally { await file.close(); }
+        } catch (error) { primary = error; readFailed = true; }
+        try { await file.close(); } catch (error) { closeError = error; closeFailed = true; }
+        if (readFailed || closeFailed) throw failureWithSettlements(readFailed ? primary : closeError, closeError);
       }
       return ledger;
     } catch (error) {
       // This includes bootstrap uncertainty. Preserve any owned lock/next file.
-      await ledger.directoryHandle.close();
-      throw error;
+      let closeError: unknown;
+      try { await ledger.directoryHandle.close(); } catch (failure) { closeError = failure; }
+      throw failureWithSettlements(error, closeError);
     }
   }
 
   private async assertDirectory(): Promise<void> {
-    const [path, handle] = await Promise.all([lstat(this.options.directory), this.directoryHandle.stat()]);
+    // A first failed stat must not abandon its still-running sibling. Both
+    // results and all exposed failed settlements belong to this operation.
+    const results = await Promise.allSettled([
+      Promise.resolve().then(() => lstat(this.options.directory)),
+      Promise.resolve().then(() => this.directoryHandle.stat()),
+    ]);
+    const failures = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failures.length) throw failureWithSettlements(failures[0]!.reason, ...failures.slice(1).map(result => result.reason));
+    const path = (results[0] as PromiseFulfilledResult<Stats>).value;
+    const handle = (results[1] as PromiseFulfilledResult<Stats>).value;
     if (!path.isDirectory() || path.isSymbolicLink() || path.dev !== this.directoryIdentity.dev || path.ino !== this.directoryIdentity.ino ||
         handle.dev !== path.dev || handle.ino !== path.ino || path.uid !== process.getuid?.() || (path.mode & 0o777) !== 0o700) fail('control directory changed');
   }
   private async persist(next: State): Promise<void> {
     const state = parseState(next);
     const data = encoded({ state, checksum: hash(state) }) + '\n';
-    let file: FileHandle | undefined;
+    let file: FileHandle | undefined, primary: unknown, closeError: unknown, primaryFailed = false, closeFailed = false;
     try {
       await this.assertDirectory();
-      file = await open(join(this.options.directory, 'ledger.next'), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      file = await (this.options.openFile ?? open)(join(this.options.directory, 'ledger.next'), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
       await this.options.fault?.('write');
       await file.writeFile(data);
       await this.options.fault?.('file-sync');
@@ -249,17 +279,23 @@ export class RuntimeCapacityLedger {
       await this.directoryHandle.sync();
       await this.options.fault?.('acknowledge');
       this.state = state;
-    } catch {
+    } catch (error) {
+      primary = error; primaryFailed = true;
       this.quarantined = true; this.epoch = null;
-      fail('persistence uncertain; offline reconciliation required');
-    } finally { if (file) await file.close().catch(() => undefined); }
+    }
+    if (file) try { await file.close(); } catch (error) {
+      closeError = error; closeFailed = true; this.quarantined = true; this.epoch = null;
+    }
+    if (primaryFailed || closeFailed) throw failureWithSettlements(
+      refused('persistence uncertain; offline reconciliation required'), primary, closeError);
   }
   private serial<T>(action: () => Promise<T>): Promise<T> {
+    if (!this.accepting) return Promise.reject(refused('owner closed/quarantined'));
     const work = this.queue.then(async () => {
       if (this.closed || this.quarantined) fail('owner closed/quarantined');
       return action();
     });
-    this.queue = work.catch(() => undefined);
+    this.queue = work.then(() => undefined, async error => { await combineSettlements(error); });
     return work;
   }
   /** Detached historical state; never a phase grant. */
@@ -334,19 +370,30 @@ export class RuntimeCapacityLedger {
   /** Clean shutdown only. Quarantined owners retain their lock. A crash at any
    * point before durable lock removal requires offline operator recovery. */
   async close(): Promise<void> {
+    this.accepting = false;
     const action = this.queue.then(async () => {
       if (this.closed) return;
       this.closed = true; this.epoch = null;
+      let primary: unknown, closeError: unknown, primaryFailed = false, closeFailed = false;
       try {
         if (!this.quarantined) {
           await this.assertDirectory();
           await this.directoryHandle.sync();
-          await rmdir(join(this.options.directory, 'writer.lock'));
-          await this.directoryHandle.sync();
         }
-      } finally { await this.directoryHandle.close(); }
+      } catch (error) { primary = error; primaryFailed = true; this.quarantined = true; }
+      try { await this.directoryHandle.close(); } catch (error) { closeError = error; closeFailed = true; this.quarantined = true; }
+      if (primaryFailed || closeFailed) throw failureWithSettlements(primaryFailed ? primary : closeError, closeError);
+      if (!this.quarantined) {
+        try {
+          // Final native operation. No fallible writer I/O follows unlocking:
+          // a new broker may already own the lock and it cannot be reacquired.
+          // A power loss may conservatively retain this lock; the next broker's
+          // exclusive mkdir + directory fsync durably establishes its ownership.
+          await rmdir(join(this.options.directory, 'writer.lock'));
+        } catch (error) { this.quarantined = true; throw failureWithSettlements(error); }
+      }
     });
-    this.queue = action.catch(() => undefined);
+    this.queue = action.then(() => undefined, async error => { await combineSettlements(error); });
     return action;
   }
 }

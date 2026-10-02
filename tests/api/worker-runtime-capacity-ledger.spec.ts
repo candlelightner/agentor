@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test';
-import { mkdtemp, chmod, readFile, rm, readdir, writeFile, mkdir, symlink } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { mkdtemp, chmod, readFile, rm, readdir, writeFile, mkdir, symlink, open, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -9,6 +10,15 @@ import { createRequire } from 'node:module';
 import { RuntimeCapacityLedger, capacityLedgerEnvelopeDigest, type CapacityLedgerMeasurement,
   type CapacityLedgerOptions, type CapacityLedgerFaultPoint } from '../../orchestrator/server/utils/worker-runtime-capacity-ledger';
 import type { RuntimeCapacityMeasurementRequest } from '../../orchestrator/server/utils/worker-runtime-capacity-protocol';
+import { attachSettlement, operationSettlement } from '../../orchestrator/server/utils/operation-deadline';
+
+function held() {
+  let resolve!: () => void, reject!: (error: unknown) => void;
+  const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+  void promise.catch(() => undefined);
+  return { promise, resolve, reject };
+}
+const tick = () => new Promise(resolve => setTimeout(resolve, 5));
 
 const identity = { hostId: 'host', serviceId: 'service', daemonId: 'daemon' };
 const policy = { maxEvidenceAgeMs: 2000, maxLifetimeMs: 10000, maxScanDurationMs: 1000, maxScanEntries: '1000' };
@@ -34,11 +44,12 @@ async function activate(ledger: RuntimeCapacityLedger) {
   await ledger.reconcile({ expectedStateDigest: before.stateDigest, reviewDigest: 'sha256:' + 'c'.repeat(64),
     layoutGeneration: '1', maintenanceEpoch: 'epoch' });
 }
-async function fixture() {
+async function fixture(openFile?: CapacityLedgerOptions['openFile']) {
   const directory = await mkdtemp(join(tmpdir(), 'capacity-ledger-test-'));
   await chmod(directory, 0o700);
   let now = 2000, point: CapacityLedgerFaultPoint | undefined;
   const options: CapacityLedgerOptions = { directory, identity, create: true, policy, now: () => now,
+    ...(openFile ? { openFile } : {}),
     fault: current => { if (point === current) throw new Error('injected'); } };
   const ledger = await RuntimeCapacityLedger.open(options);
   return { directory, options, ledger, setNow: (value: number) => { now = value; },
@@ -293,4 +304,222 @@ test('stale lock has no PID, timeout, force-open or initialization override', as
     for (const create of [true, false]) await expect(RuntimeCapacityLedger.open({ ...f.options, create })).rejects.toThrow();
     expect(await readdir(f.directory)).toContain('writer.lock');
   } finally { await f.cleanup(); }
+});
+
+test('shutdown closes its descriptor while ownership still blocks a second broker', async () => {
+  const f = await fixture(), handle = (f.ledger as any).directoryHandle;
+  const actualClose = handle.close.bind(handle); let observed = false;
+  handle.close = async () => {
+    observed = true; expect(await readdir(f.directory)).toContain('writer.lock');
+    await expect(RuntimeCapacityLedger.open({ ...f.options, create: false })).rejects.toMatchObject({ code: 'EEXIST' });
+    await actualClose();
+  };
+  try {
+    await f.ledger.close(); expect(observed).toBe(true);
+    expect(await readdir(f.directory)).not.toContain('writer.lock');
+    const reopened = await RuntimeCapacityLedger.open({ ...f.options, create: false }); await reopened.close();
+  } finally { handle.close = actualClose; await actualClose(); await f.cleanup(); }
+});
+
+test('frozen shutdown close failure retains lock and exposed native settlement', async () => {
+  const f = await fixture(), native = held(), handle = (f.ledger as any).directoryHandle;
+  const actualClose = handle.close.bind(handle);
+  const failure = Object.freeze(attachSettlement(new Error('synthetic close failure'), native.promise));
+  handle.close = async () => { await actualClose(); throw failure; };
+  try {
+    const error = await f.ledger.close().catch(error => error);
+    expect(error[operationSettlement]).toBeInstanceOf(Promise);
+    expect(await readdir(f.directory)).toContain('writer.lock');
+    await expect(RuntimeCapacityLedger.open({ ...f.options, create: false })).rejects.toMatchObject({ code: 'EEXIST' });
+    let settled = false; const settlement = error[operationSettlement].then(() => { settled = true; });
+    let secondClosed = false; const secondClose = f.ledger.close().then(() => { secondClosed = true; });
+    await tick(); expect(settled).toBe(false); expect(secondClosed).toBe(false);
+    native.reject(new Error('synthetic late close')); await settlement; await secondClose;
+  } finally { native.resolve(); handle.close = actualClose; await actualClose(); await f.cleanup(); }
+});
+
+test('compound frozen shutdown sync and close failures retain both lifetimes', async () => {
+  const f = await fixture(), sync = held(), close = held(), handle = (f.ledger as any).directoryHandle;
+  const actualSync = handle.sync.bind(handle), actualClose = handle.close.bind(handle);
+  const primary = Object.freeze(attachSettlement(new Error('synthetic sync'), sync.promise));
+  const secondary = Object.freeze(attachSettlement(new Error('synthetic close'), close.promise));
+  handle.sync = async () => { throw primary; };
+  handle.close = async () => { await actualClose(); throw secondary; };
+  try {
+    const error = await f.ledger.close().catch(error => error);
+    let settled = false; const settlement = error[operationSettlement].then(() => { settled = true; });
+    close.resolve(); await tick(); expect(settled).toBe(false);
+    expect(await readdir(f.directory)).toContain('writer.lock');
+    await expect(RuntimeCapacityLedger.open({ ...f.options, create: false })).rejects.toMatchObject({ code: 'EEXIST' });
+    sync.reject(new Error('synthetic late sync')); await settlement;
+  } finally { sync.resolve(); close.resolve(); handle.sync = actualSync; handle.close = actualClose; await actualClose(); await f.cleanup(); }
+});
+
+test('failed shutdown directory sync retains ownership after successful descriptor close', async () => {
+  const f = await fixture(), native = held(), handle = (f.ledger as any).directoryHandle;
+  const actualSync = handle.sync.bind(handle);
+  const failure = Object.freeze(attachSettlement(new Error('synthetic shutdown sync'), native.promise));
+  handle.sync = async () => { throw failure; };
+  try {
+    const error = await f.ledger.close().catch(error => error);
+    expect(error.message).toBe('synthetic shutdown sync');
+    expect(error[operationSettlement]).toBeInstanceOf(Promise);
+    expect(await readdir(f.directory)).toContain('writer.lock');
+    await expect(RuntimeCapacityLedger.open({ ...f.options, create: false })).rejects.toMatchObject({ code: 'EEXIST' });
+    let settled = false; const settlement = error[operationSettlement].then(() => { settled = true; });
+    await tick(); expect(settled).toBe(false); native.resolve(); await settlement;
+  } finally { native.resolve(); handle.sync = actualSync; await f.cleanup(); }
+});
+
+test('frozen failed measurement retains queued reserve and shutdown through native settlement', async () => {
+  const f = await fixture(), native = held();
+  const failure = Object.freeze(attachSettlement(new Error('synthetic measurement'), native.promise));
+  let measured = false, closed = false;
+  try {
+    await activate(f.ledger); await f.ledger.prepare(request()); await f.ledger.prepare(request('two'));
+    const first = f.ledger.reserve(request(), async () => { throw failure; });
+    expect(await first.catch(error => error)).toBe(failure);
+    const next = f.ledger.reserve(request('two'), async req => { measured = true; return measurement(req); });
+    const closing = f.ledger.close().then(() => { closed = true; });
+    await tick(); expect(measured).toBe(false); expect(closed).toBe(false);
+    expect(await readdir(f.directory)).toContain('writer.lock');
+    native.reject(new Error('synthetic late measurement')); await next; await closing;
+    const reopened = await RuntimeCapacityLedger.open({ ...f.options, create: false });
+    expect((await reopened.inspect()).state.entries.map(entry => entry.status)).toEqual(['pending', 'reserved']);
+    await reopened.close();
+  } finally { native.resolve(); await f.cleanup(); }
+});
+
+test('failed persistence combines frozen write and file-close lifetimes before shutdown', async () => {
+  const write = held(), close = held(); let armed = false;
+  const primary = Object.freeze(attachSettlement(new Error('synthetic write'), write.promise));
+  const secondary = Object.freeze(attachSettlement(new Error('synthetic file close'), close.promise));
+  const f = await fixture(async (...args) => {
+    const file = await open(...args);
+    if (String(args[0]).endsWith('/ledger.next')) {
+      const actualClose = file.close.bind(file);
+      file.close = async () => { await actualClose(); if (armed) throw secondary; };
+    }
+    return file;
+  });
+  try {
+    await activate(f.ledger); armed = true;
+    (f.ledger as any).options.fault = (point: CapacityLedgerFaultPoint) => { if (point === 'write') throw primary; };
+    const error = await f.ledger.prepare(request()).catch(error => error);
+    expect(error.message).toContain('persistence uncertain'); expect(error[operationSettlement]).toBeInstanceOf(Promise);
+    let settled = false, closed = false;
+    const settlement = error[operationSettlement].then(() => { settled = true; });
+    const closing = f.ledger.close().then(() => { closed = true; });
+    close.resolve(); await tick(); expect(settled).toBe(false); expect(closed).toBe(false);
+    expect(await readdir(f.directory)).toEqual(expect.arrayContaining(['ledger.next', 'writer.lock']));
+    write.reject(new Error('synthetic late write')); await settlement; await closing;
+    expect(await readdir(f.directory)).toContain('writer.lock');
+    await expect(RuntimeCapacityLedger.open({ ...f.options, create: false })).rejects.toMatchObject({ code: 'EEXIST' });
+  } finally { write.resolve(); close.resolve(); armed = false; await f.cleanup(); }
+});
+
+for (const create of [true, false])
+  test(`bootstrap ${create ? 'write' : 'read'} preserves frozen primary and both cleanup failures`, async () => {
+    const f = await fixture(); const primaryLife = held(), fileLife = held(), directoryLife = held();
+    const primary = Object.freeze(attachSettlement(new Error('synthetic bootstrap primary'), primaryLife.promise));
+    const fileFailure = Object.freeze(attachSettlement(new Error('synthetic bootstrap file close'), fileLife.promise));
+    const directoryFailure = Object.freeze(attachSettlement(new Error('synthetic bootstrap directory close'), directoryLife.promise));
+    try {
+      await f.ledger.close();
+      if (create) await rm(join(f.directory, 'ledger.json'));
+      const error = await RuntimeCapacityLedger.open({ ...f.options, create,
+        fault: point => { if (create && point === 'write') throw primary; },
+        openFile: async (...args) => {
+          const file = await open(...args), actualClose = file.close.bind(file);
+          const directory = String(args[0]) === f.directory;
+          if (!directory && !create) file.read = async () => { throw primary; };
+          file.close = async () => { await actualClose(); throw directory ? directoryFailure : fileFailure; };
+          return file;
+        },
+      }).catch(error => error);
+      expect(error.message).toContain(create ? 'persistence uncertain' : 'synthetic bootstrap primary');
+      expect(error[operationSettlement]).toBeInstanceOf(Promise);
+      let settled = false; const settlement = error[operationSettlement].then(() => { settled = true; });
+      fileLife.resolve(); directoryLife.reject(new Error('synthetic late bootstrap cleanup'));
+      await tick(); expect(settled).toBe(false); expect(await readdir(f.directory)).toContain('writer.lock');
+      primaryLife.resolve(); await settlement;
+      await expect(RuntimeCapacityLedger.open({ ...f.options, create: false })).rejects.toMatchObject({ code: 'EEXIST' });
+    } finally { primaryLife.resolve(); fileLife.resolve(); directoryLife.resolve(); await f.cleanup(); }
+  });
+
+test('directory assertion waits its actual pending stat sibling before reporting missing path', async () => {
+  const f = await fixture(), native = held(), handle = (f.ledger as any).directoryHandle;
+  const actualStat = handle.stat.bind(handle), displaced = f.directory + '.displaced';
+  let entered = false, reported = false;
+  handle.stat = async () => { entered = true; await native.promise; return actualStat(); };
+  let assertion: Promise<any> | undefined;
+  try {
+    await rename(f.directory, displaced);
+    assertion = (f.ledger as any).assertDirectory().catch((error: unknown) => { reported = true; return error; });
+    await tick(); expect(entered).toBe(true); expect(reported).toBe(false);
+    native.resolve(); expect((await assertion).code).toBe('ENOENT');
+  } finally {
+    native.resolve(); await assertion; handle.stat = actualStat; await rename(displaced, f.directory); await f.cleanup();
+  }
+});
+
+test('directory assertion preserves failed stat settlement alongside a missing-path error', async () => {
+  const f = await fixture(), native = held(), handle = (f.ledger as any).directoryHandle;
+  const actualStat = handle.stat.bind(handle), displaced = f.directory + '.displaced';
+  const failure = Object.freeze(attachSettlement(new Error('synthetic native stat'), native.promise));
+  handle.stat = () => { throw failure; };
+  try {
+    await rename(f.directory, displaced);
+    const error = await (f.ledger as any).assertDirectory().catch((error: unknown) => error);
+    expect(error.code).toBe('ENOENT'); expect(error[operationSettlement]).toBeInstanceOf(Promise);
+    let settled = false; const settlement = error[operationSettlement].then(() => { settled = true; });
+    await tick(); expect(settled).toBe(false); native.reject(new Error('synthetic late stat')); await settlement;
+  } finally { native.resolve(); handle.stat = actualStat; await rename(displaced, f.directory); await f.cleanup(); }
+});
+
+test('shutdown admission rejects new work while draining an already accepted reserve', async () => {
+  const f = await fixture(), entered = held(), release = held(); let closing: Promise<void> | undefined;
+  let reservation: Promise<unknown> | undefined;
+  try {
+    await activate(f.ledger); await f.ledger.prepare(request());
+    reservation = f.ledger.reserve(request(), async req => { entered.resolve(); await release.promise; return measurement(req); });
+    await entered.promise; closing = f.ledger.close();
+    await expect(f.ledger.prepare(request('two'))).rejects.toThrow('closed');
+    release.resolve(); await reservation; await closing;
+    const reopened = await RuntimeCapacityLedger.open({ ...f.options, create: false });
+    expect((await reopened.inspect()).state.entries[0].status).toBe('reserved'); await reopened.close();
+  } finally { release.resolve(); await Promise.allSettled([reservation, closing]); await f.cleanup(); }
+});
+
+test('corrupt FIFO bootstrap rejects promptly without waiting for a writer', async () => {
+  const directory = await mkdtemp('/workspace/capacity-ledger-fifo-review-');
+  await chmod(directory, 0o700);
+  const path = join(directory, 'ledger.json');
+  await promisify(execFile)('mkfifo', ['-m', '600', path]);
+  let opening: Promise<unknown> | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let writer: Awaited<ReturnType<typeof open>> | undefined;
+  const pending = Symbol('pending FIFO open');
+  try {
+    opening = RuntimeCapacityLedger.open({ directory, identity, create: false, policy, now: () => 2000 })
+      .then(ledger => ledger, error => error);
+    const result = await Promise.race([opening,
+      new Promise<typeof pending>(resolve => { timer = setTimeout(() => resolve(pending), 250); })]);
+    // Release the actual native open before making the assertion, so a failing
+    // regression leaves no blocked libuv thread or owned descriptor behind.
+    if (result === pending) {
+      writer = await open(path, constants.O_WRONLY | constants.O_NONBLOCK);
+      await writer.close(); writer = undefined;
+    }
+    const outcome = await opening;
+    if (outcome instanceof RuntimeCapacityLedger) await outcome.close();
+    expect(result, 'FIFO bootstrap must reject without requiring a writer').not.toBe(pending);
+    expect(outcome).toMatchObject({ code: 'WORKER_RUNTIME_CAPACITY_LEDGER_HELD' });
+    expect((outcome as Error).message).toContain('ledger file boundary');
+    expect(await readdir(directory)).toContain('writer.lock');
+  } finally {
+    if (timer) clearTimeout(timer);
+    await writer?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });

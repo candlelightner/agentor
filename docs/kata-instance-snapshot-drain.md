@@ -35,6 +35,19 @@ tombstone retirement remain required;256 retained entries currently fail closed.
 No blanket restart-safe application reconciliation or full snapshot acceptance
 is claimed.
 
+The next wiring must open protected operator-provisioned control storage before
+startup helper cleanup or background dispatch, outside included/restored data
+and volume domains. Installed identity plus live daemon/storage generation must
+be checked, not inferred from a socket pathname or Docker's stable daemon ID.
+Durable intent precedes external dispatch; returned full native identities are
+bound durably before start/next dispatch. Only server-owned operation-specific
+receipts may prove descendant/cleanup completion or explicit background-service
+handoff. Initialized-only snapshot/restore readiness must retain every existing
+veto; the excluded job cannot give ordinary operations a bypass. Source control
+authority must never initialize destination state on restore. Terminal retirement
+needs serialized, bounded persistence and exact-reference reconciliation, never
+time-based deletion or removal of uncertain records.
+
 The frozen integration passed1,567 offline module tests, full typecheck and
 production build. Logs: `/workspace/kata-snapshot-integration-modules-11.log`,
 `/workspace/kata-snapshot-integration-typecheck-21.log` and

@@ -2,6 +2,41 @@
 
 Status: implementation and review in progress, not ready to deploy. Runtime policy, operator attestation, explicit legacy authorization, migration transactions, host setup fixtures, and backup destination policy have local implementations and module coverage. UI/API integration and acceptance remain subject to final review. An operator-provisioned disposable VM has passed a basic Kata boot and produced directly correlated shim/QEMU evidence; this is not production-host, DinD, or Agentor lifecycle acceptance. No production or outer-host setup is authorized by this plan.
 
+## Current implementation and acceptance checkpoint (2026-10-02)
+
+Draft checkpoint8437dfe adds independently reviewed native command capture,
+an isolated durable external-operation journal and a concrete bounded Linux
+tree-observation reader.1,567 offline module tests, full typecheck and production
+build pass. These are not a quota service, restart-safe application integration
+or deployment acceptance; public migration-capacity and DinD gates remain closed.
+See [snapshot drain](kata-instance-snapshot-drain.md) and
+[capacity design](kata-migration-capacity-design.md) for exact review limits.
+
+Remaining implementation includes durable operation dispatch/startup/preflight
+and backup-authority stripping, operation-specific terminal/reconciliation
+checkers, bounded journal retirement, controlled image/build/pull/update/helper
+ownership, and capacity control-storage/enforcement/envelope/maintenance/
+reserve-phase RPCs and guarded migration integration. Native client closure
+must never clear daemon mutation uncertainty. The capacity ledger's analogous
+shutdown/failed-settlement seam has also received a reviewed correction, with
+97 focused ledger/RPC tests passing; concrete capacity admission is still absent.
+
+Established live evidence is authenticated **recovery-mode non-DinD** API/browser
+lifecycle and encrypted **source** backup/export. Inner DinD daemons booted, but
+nested runc initialization still returns EPERM; the failed-syscall trace did
+not establish its cause. DinD storage/persistence/recovery, real migration
+success/rollback/interruption, encrypted destination restore and broader normal-
+startup/API/UI/physical-host acceptance remain open. See
+[API evidence](kata-api-lifecycle-evidence.md) and
+[DinD evidence](kata-dind-local-evidence.md); historical prerequisites are not
+substitutes for those gates.
+
+The operator still needs to supply isolated quota-capable test storage/service,
+declared service-installation privileges and hard/recovery ceilings/control
+floors/window, plus a compatible second Kata host for destination restore.
+Capacity-service, maintenance-window and filesystem-quota design decisions are
+already approved; no installation or unrelated shutdown is performed here.
+
 ## Resumed implementation decisions (2026-09-28)
 
 - Subagent dispatch and two-way messaging were verified before assigning disjoint implementation/review work; no prior subagents remained active.

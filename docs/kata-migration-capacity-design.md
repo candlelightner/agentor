@@ -43,9 +43,18 @@ persistent directory lock prevents concurrent broker ownership; crashes and
 uncertain writes retain that lock for offline operator reconciliation, never
 PID/TTL-based takeover. Every reopen requires explicit trusted review. Exact
 retries return historical records, not renewed phase permission. Fixed operation
-and state-size limits fail closed rather than evict reservations. Thirty-six
+and state-size limits fail closed rather than evict reservations. Forty-eight
 focused tests include separate-process lock contention and injected write/sync/
-rename/acknowledgement failures. They are not physical power-cut tests.
+rename/acknowledgement failures. Follow-up independent review reproduced early
+unlock on failed shutdown and lost compound/native failure lifetimes. Queue and
+close tails now retain actual outcome-neutral settlements, frozen bootstrap/
+read/write/stat/cleanup errors preserve every exposed lifetime, and unlock is
+the final native operation after successful sync and descriptor close. There
+is no post-unlock fsync or lock reacquisition; a crash-resurrected lock requires
+offline review. A real disposable FIFO regression also proved bootstrap could
+block before type validation; nonblocking open now rejects that corrupt state
+while keeping the lock.97 combined ledger/RPC tests pass with narrow independent
+review. These are local POSIX fault fixtures, not physical power-cut tests.
 
 This is not an installed service or a capacity ticket. No release, reduction,
 increase or phase-transition operation exists yet. The isolated authenticated
