@@ -55,6 +55,9 @@ import { useConfig } from "./services";
 import {
   beginInstanceRestore,
   beginInstanceSnapshot,
+  instanceControlPlaneCoordinator,
+  instanceSnapshotJobId,
+  type InstanceBarrierRelease,
 } from "./instance-snapshot-gate";
 import { withOperationDeadline } from "./operation-deadline";
 
@@ -68,6 +71,7 @@ const INSTANCE_RESTORE_HELPER_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 interface QueuedOperation {
   jobId: string;
   run: (job: InstanceBackupJob, signal: AbortSignal) => Promise<void>;
+  lifetime?: ReturnType<typeof instanceControlPlaneCoordinator.fork>;
 }
 
 interface VolumeCandidate {
@@ -79,6 +83,7 @@ interface VolumeCandidate {
 }
 
 export interface InstanceBackupManagerOptions {
+  controlPlaneDrainTimeoutMs?: number;
   dataDir?: string;
   docker?: Docker;
   store?: InstanceBackupStore;
@@ -104,15 +109,21 @@ export class InstanceBackupManager {
   private readonly authSnapshot: (destination: string) => Promise<void>;
   private readonly preflightCreate: (signal?: AbortSignal) => Promise<void>;
   private readonly inventoryOverride?: InstanceBackupManagerOptions["inventory"];
+  private readonly controlPlaneDrainTimeoutMs: number;
   private initialized?: Promise<void>;
+  private initializationComplete = false;
   private accepting = true;
   private active = 0;
+  private drainingControlPlane = false;
   private queue: QueuedOperation[] = [];
   private controllers = new Map<string, AbortController>();
   private tasks = new Map<string, Promise<void>>();
-  private restoreBarriers = new Map<string, () => void>();
+  private restoreBarriers = new Map<string, InstanceBarrierRelease>();
 
   constructor(options: InstanceBackupManagerOptions = {}) {
+    this.controlPlaneDrainTimeoutMs = options.controlPlaneDrainTimeoutMs ?? 30_000;
+    if (!Number.isSafeInteger(this.controlPlaneDrainTimeoutMs) || this.controlPlaneDrainTimeoutMs < 1 || this.controlPlaneDrainTimeoutMs > 300_000)
+      throw new Error('Invalid control-plane drain timeout');
     this.dataDir = options.dataDir ?? useConfig().dataDir;
     this.artifactsDir = join(this.dataDir, "instance-backup-artifacts");
     this.stagingDir = join(this.dataDir, "instance-restore-staging");
@@ -158,6 +169,24 @@ export class InstanceBackupManager {
         logs: appendLog(job.logs, "Operation interrupted by orchestrator restart."),
       });
     }
+    this.initializationComplete = true;
+  }
+
+  /** Narrow barrier-control path: no lazy init, filesystem, provider lookup or
+   * audit writes. Only the exact active job owned by this administrator exists
+   * through this view. Cancellation signals the already-running task; that task
+   * owns persisted status/cleanup and retains its barrier until unwound. */
+  barrierControlJob(id: string, userId: string, cancel = false): PublicInstanceBackupJob | undefined {
+    if (!this.initializationComplete || instanceSnapshotJobId() !== id) return undefined;
+    const job = this.store.getJob(id);
+    if (!job || job.userId !== userId) return undefined;
+    if (cancel) {
+      const controller = this.controllers.get(id);
+      if (!controller || (job.operation === 'restore' && job.phase === 'applying'))
+        throw Object.assign(new Error('This instance job cannot currently be cancelled'), { statusCode: 409 });
+      controller.abort(Object.assign(new Error('Instance backup cancelled'), { name: 'AbortError' }));
+    }
+    return publicJob(job);
   }
 
   async list(userId: string) {
@@ -396,7 +425,7 @@ export class InstanceBackupManager {
       });
     const adminStore = await import("./admin-workspace-store");
     const storage = services.useStorageManager();
-    await storage.init();
+    storage.assertInitializedForInstanceSnapshot();
     const manifest = artifact.manifest;
     const blockers: string[] = [];
     const warnings: string[] = [];
@@ -503,6 +532,15 @@ export class InstanceBackupManager {
         statusCode: 404,
       });
     const restoreOptions = normalizeRestoreOptions(options, true);
+    // Keyring initialization normalizes permissions. Complete it before this
+    // request closes admission; the excluded job may only perform readonly
+    // recovery lookup once all admitted writers have drained.
+    await this.backupManager.prepareInstanceRecoveryMaterial();
+    this.assertAccepting();
+    const currentArtifact = this.store.getArtifact(artifactId);
+    if (!currentArtifact || currentArtifact.userId !== userId || !currentArtifact.manifest ||
+        currentArtifact.sha256 !== artifact.sha256 || currentArtifact.keyFingerprint !== artifact.keyFingerprint)
+      throw Object.assign(new Error('Verified instance backup artifact changed before restore acceptance'), { statusCode: 409 });
     const identity = normalizeRequestId(requestId);
     const fingerprint = requestFingerprint({
       operation: "restore",
@@ -609,10 +647,11 @@ export class InstanceBackupManager {
 
   stop() {
     this.accepting = false;
+    for (const operation of this.queue) operation.lifetime?.cancel();
     for (const controller of this.controllers.values())
       controller.abort(Object.assign(new Error("Orchestrator is stopping"), { name: "AbortError" }));
     for (const jobId of [...this.restoreBarriers.keys()])
-      this.releaseRestoreBarrier(jobId);
+      if (!this.controllers.has(jobId)) this.releaseRestoreBarrier(jobId);
   }
 
   private async runCreate(
@@ -626,16 +665,21 @@ export class InstanceBackupManager {
     const bundle = join(stage, "instance.tar");
     const encrypted = this.artifactPath(job.id);
     let provider: BackupProvider | undefined;
-    let releaseSnapshot: (() => void) | undefined;
+    let releaseSnapshot: InstanceBarrierRelease | undefined;
     let inventory: Awaited<ReturnType<NonNullable<InstanceBackupManagerOptions["inventory"]>>>;
     let data: Awaited<ReturnType<typeof createInstanceDataArchive>>;
     try {
       await this.running(job, "preflight", "Checking whether the installation is quiescent enough to snapshot.");
       releaseSnapshot = beginInstanceSnapshot(job.id);
+      await this.drainControlPlane(releaseSnapshot, signal);
+      // Authority/workload/quarantine may have changed while admitted writers
+      // settled. The authoritative preflight must run AFTER the drain.
       await this.preflightCreate(signal);
       signal.throwIfAborted();
+      releaseSnapshot.assertDrained();
       await mkdir(stage, { recursive: true, mode: 0o700 });
       await this.phase(job, "database-snapshot", 10, "Pausing control-plane mutations and creating a consistent SQLite online-backup snapshot.");
+      releaseSnapshot.assertDrained();
       await this.authSnapshot(authSnapshot);
       signal.throwIfAborted();
       inventory = this.inventoryOverride
@@ -643,6 +687,7 @@ export class InstanceBackupManager {
         : await this.inventory(job.userId, signal);
       signal.throwIfAborted();
       await this.phase(job, "data-snapshot", 20, "Archiving the versioned control-plane stores under the snapshot write barrier.");
+      releaseSnapshot.assertDrained();
       data = await createInstanceDataArchive({
         dataDir: this.dataDir,
         authSnapshotPath: authSnapshot,
@@ -664,6 +709,7 @@ export class InstanceBackupManager {
         let index = 0;
         for (const candidate of selectedVolumes) {
           signal.throwIfAborted();
+          releaseSnapshot.assertDrained();
           const output = join(stage, `volume-${index}.tar.gz`);
           const snapshotted = await this.snapshotVolume(candidate.name, output, signal);
           if (!snapshotted) continue;
@@ -1115,11 +1161,15 @@ export class InstanceBackupManager {
     const unpacked = join(stage, "unpacked");
     let helperOwnsStage = false;
     try {
+      const barrier = this.restoreBarriers.get(job.id);
+      if (!barrier) throw new Error('Instance restore has no admission barrier');
+      await this.drainControlPlane(barrier, signal);
+      barrier.assertDrained();
       await mkdir(stage, { recursive: true, mode: 0o700 });
       await this.running(job, "authenticating", "Re-authenticating the retained instance backup before restore.");
       const encrypted = this.artifactPath(artifact.id);
       const header = await inspectInstanceBackup(encrypted);
-      const recovery = await this.backupManager.resolveInstanceRecoveryMaterial(
+      const recovery = await this.backupManager.resolveInstanceRecoveryMaterialForRestore(
         artifact.userId,
         header.keyFingerprint,
       );
@@ -1195,6 +1245,7 @@ export class InstanceBackupManager {
           });
       }
       signal.throwIfAborted();
+      barrier.assertDrained();
       await this.launchRestoreHelper(job, stage, signal, async () => {
         helperOwnsStage = true;
         await this.phase(
@@ -1328,7 +1379,7 @@ export class InstanceBackupManager {
       import("./image-catalog"),
     ]);
     const storage = services.useStorageManager();
-    await storage.init();
+    storage.assertInitializedForInstanceSnapshot();
     const candidates = new Map<string, VolumeCandidate>();
     const add = (candidate: VolumeCandidate) => candidates.set(candidate.name, candidate);
     const workerStore = services.useWorkerStore();
@@ -1384,7 +1435,7 @@ export class InstanceBackupManager {
     const volumes: VolumeCandidate[] = [];
     const { useManagedVolumeManager } = await import("./managed-volume-manager");
     const managedVolumes = useManagedVolumeManager();
-    await managedVolumes.init();
+    managedVolumes.assertInitializedForInstanceSnapshot();
     for (const volume of managedVolumes.store.list()) {
       signal?.throwIfAborted();
       if (!await managedVolumes.runtime.inspectVolume(volume)) continue;
@@ -1396,7 +1447,7 @@ export class InstanceBackupManager {
     const definitions = services.usePluginDefinitionStore().list();
     const installations = services.usePluginInstallationStore().list();
     const catalog = imageModule.useImageCatalogManager();
-    await catalog.init();
+    catalog.assertInitializedForInstanceSnapshot();
     const images = catalog.list(userId, true);
     const immutableDigests = [
       ...new Set(
@@ -1478,11 +1529,12 @@ export class InstanceBackupManager {
       services.useExportJobManager().hasActiveOperationsForInstanceSnapshot() ||
       imageModule.useImageCatalogManager().hasActiveOperationsForInstanceSnapshot() ||
       services.useUsageChecker().hasActiveOperationsForInstanceSnapshot() ||
-      services.useOrphanSweeper().hasActiveOperationsForInstanceSnapshot()
+      services.useOrphanSweeper().hasActiveOperationsForInstanceSnapshot() ||
+      services.useUpdateChecker().hasActiveOperationsForInstanceSnapshot()
     )
       throw Object.assign(
         new Error(
-          "Wait for portable backup, export, image build, validation, usage refresh, orphan cleanup, and restore jobs to finish before creating a full instance snapshot.",
+          "Wait for portable backup, export, image build, validation, usage refresh, orphan cleanup, update, and restore jobs to finish before creating a full instance snapshot.",
         ),
         {
           statusCode: 409,
@@ -1632,20 +1684,59 @@ export class InstanceBackupManager {
     jobId: string,
     run: QueuedOperation["run"],
   ) {
-    this.queue.push({ jobId, run });
+    const kind = this.store.getJob(jobId)?.operation;
+    // Only create/restore execute the excluded snapshot/helper protocol.
+    // Discovery/adoption/import may resolve provider state and must retain
+    // ordinary admission from acceptance through queued execution.
+    const lifetime = kind === 'create' || kind === 'restore'
+      ? undefined : instanceControlPlaneCoordinator.fork();
+    this.queue.push({ jobId, run, lifetime });
     setImmediate(() => this.dispatch());
   }
 
+  private async drainControlPlane(barrier: InstanceBarrierRelease, signal: AbortSignal) {
+    signal.throwIfAborted();
+    this.drainingControlPlane = true;
+    try {
+      // A request already admitted before the cut may enqueue ordinary work
+      // after this snapshot job starts. Drain must let that queued work settle
+      // instead of waiting while monopolizing its only scheduler slot.
+      this.dispatch();
+      await barrier.drain({ timeoutMs: this.controlPlaneDrainTimeoutMs, signal });
+    } catch (error) {
+      // Preserve the existing job-cancellation error contract. Cancelling the
+      // wait does not retire any still-running admitted operation.
+      signal.throwIfAborted();
+      throw error;
+    } finally {
+      this.drainingControlPlane = false;
+    }
+    signal.throwIfAborted();
+  }
+
   private dispatch() {
-    while (this.accepting && this.active < MAX_CONCURRENT_JOBS && this.queue.length) {
-      const operation = this.queue.shift()!;
+    while (this.accepting && this.queue.length) {
+      // Only one admitted ordinary child may run beside the draining job.
+      // Never run a second create/restore barrier protocol concurrently.
+      const index = this.active < MAX_CONCURRENT_JOBS ? 0
+        : this.drainingControlPlane && this.active === MAX_CONCURRENT_JOBS
+          ? this.queue.findIndex(operation => operation.lifetime !== undefined) : -1;
+      if (index < 0) break;
+      const operation = this.queue.splice(index, 1)[0]!;
       const job = this.store.getJob(operation.jobId);
-      if (!job || job.status !== "queued") continue;
+      if (!job || job.status !== "queued") { operation.lifetime?.cancel(); continue; }
       const controller = new AbortController();
       this.controllers.set(job.id, controller);
       this.active += 1;
-      const task = operation
-        .run(job, controller.signal)
+      // Instance job ledger/staging/artifacts are excluded from the snapshot.
+      // Do not inherit the accepting HTTP/MCP operation: drain must wait for
+      // that request's final audit without waiting for itself. This drops
+      // admission; it does NOT grant access to included stores during a cut.
+      const task = instanceControlPlaneCoordinator.withoutOperationContext(
+        () => operation.lifetime
+          ? operation.lifetime.run(() => operation.run(job, controller.signal))
+          : operation.run(job, controller.signal),
+      )
         .catch((error) => this.fail(job, error))
         .finally(() => {
           this.releaseRestoreBarrier(job.id);
@@ -1939,6 +2030,10 @@ function publicInstanceFailure(error: unknown) {
 }
 
 let singleton: InstanceBackupManager | undefined;
+/** Does not construct or initialize any service during a snapshot. */
+export function initializedInstanceBackupManager(): InstanceBackupManager | undefined {
+  return singleton;
+}
 export function useInstanceBackupManager() {
   return (singleton ??= new InstanceBackupManager());
 }

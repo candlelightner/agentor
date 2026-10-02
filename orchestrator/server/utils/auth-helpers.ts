@@ -3,6 +3,7 @@ import { createError } from 'h3';
 import { useAuth } from './auth';
 import { useContainerManager } from './services';
 import type { ContainerInfo } from '../../shared/types';
+import { instanceControlPlaneCoordinator } from './instance-snapshot-gate';
 
 export interface AuthContext {
   user: {
@@ -124,9 +125,11 @@ function toAuthContext(session: any): AuthContext | null {
  */
 export async function resolveAuthFromEvent(event: H3Event): Promise<AuthContext | null> {
   try {
-    const auth = useAuth();
-    const session: any = await auth.api.getSession({ headers: event.headers });
-    return toAuthContext(session);
+    return await instanceControlPlaneCoordinator.run(async () => {
+      const auth = useAuth();
+      const session: any = await auth.api.getSession({ headers: event.headers });
+      return toAuthContext(session);
+    });
   } catch {
     return null;
   }
@@ -183,9 +186,11 @@ export async function authenticateWsPeer(peer: any): Promise<AuthContext | null>
       ?? '';
     if (!cookieHeader) return null;
 
-    const auth = useAuth();
-    const session: any = await auth.api.getSession({ headers: new Headers({ cookie: cookieHeader }) });
-    return toAuthContext(session);
+    return await instanceControlPlaneCoordinator.run(async () => {
+      const auth = useAuth();
+      const session: any = await auth.api.getSession({ headers: new Headers({ cookie: cookieHeader }) });
+      return toAuthContext(session);
+    });
   } catch {
     return null;
   }

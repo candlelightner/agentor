@@ -1,7 +1,7 @@
 import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Config } from './config';
-import { instanceSnapshotActive } from './instance-snapshot-gate';
+import { instanceMutationBlocked, instanceControlPlaneCoordinator } from './instance-snapshot-gate';
 import type { AgentUsageInfo, AgentUsageStatus, AgentAuthType } from '../../shared/types';
 import { getUserEnvVar } from './user-env-store';
 import type { UserEnvVarStore } from './user-env-store';
@@ -185,7 +185,11 @@ export class UsageChecker {
   }
 
   private enqueueFetch(operation: () => Promise<void>): Promise<void> {
-    if (instanceSnapshotActive()) return Promise.resolve();
+    if (instanceMutationBlocked()) return Promise.resolve();
+    return instanceControlPlaneCoordinator.run(() => this.enqueueAdmittedFetch(operation));
+  }
+
+  private enqueueAdmittedFetch(operation: () => Promise<void>): Promise<void> {
     this.queuedFetches += 1;
     const queued = this.fetchQueue
       .then(operation)

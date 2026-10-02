@@ -71,12 +71,17 @@ test('management worker domain declares bounded worker, configuration, group, an
 
 test('recursive management fail-fast deadline returns a structured timeout error', async () => {
   const started = Date.now();
+  let settle!: () => void;
+  const underlying = new Promise<void>(resolve => { settle = resolve; });
   await expect(withinManagementFailFastDeadline(
-    () => new Promise<void>(() => {}),
+    () => underlying,
     0.01,
     'groups.env.list',
   )).rejects.toMatchObject({ statusCode:504, message:expect.stringContaining('groups.env.list') });
   expect(Date.now() - started).toBeLessThan(1000);
+  // A caller timeout intentionally does not retire the underlying writer.
+  settle();
+  await underlying;
 });
 
 test('recursive management tools reject invalid timeout switches before work', async () => {

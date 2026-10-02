@@ -8,11 +8,23 @@ import { existsSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { loadConfig } from './config';
 import { consumeSetupToken } from './setup-token-store';
+import { getCookies } from 'better-auth/cookies';
+import { createSnapshotAdministratorReader } from './instance-snapshot-auth';
 
 // The return type of `betterAuth()` varies with plugins; we cast to any
 // downstream to avoid double-type-definition issues from nested Zod/better-call.
 let _auth: any = null;
 let _db: Database.Database | null = null;
+let _snapshotAdministrator: ReturnType<typeof createSnapshotAdministratorReader> | undefined;
+let _snapshotOrigins: ReadonlySet<string> | undefined;
+
+/** Barrier-only read: never initializes auth, generates secrets or migrates. */
+export function readInitializedSnapshotAdministrator(cookie: string | undefined) {
+  return _snapshotAdministrator?.(cookie) ?? null;
+}
+export function isInitializedSnapshotOrigin(origin: string | undefined): boolean {
+  return typeof origin === 'string' && (_snapshotOrigins?.has(origin) ?? false);
+}
 
 /**
  * Resolves the BETTER_AUTH_SECRET.
@@ -131,7 +143,7 @@ function buildAuth(): any {
   const baseURL = config.betterAuthUrl || 'http://localhost:3000';
   const passkeyCfg = resolvePasskeyConfig(config);
 
-  return betterAuth({
+  const auth = betterAuth({
     database: db,
     basePath: '/api/auth',
     baseURL,
@@ -232,6 +244,15 @@ function buildAuth(): any {
         : []),
     ],
   });
+  _snapshotAdministrator = createSnapshotAdministratorReader({
+    db, secret: auth.options.secret as string,
+    cookieName: getCookies(auth.options).sessionToken.name,
+  });
+  _snapshotOrigins = new Set(buildTrustedOrigins(config).flatMap(value => {
+    try { const url = new URL(value); return url.origin === value ? [value] : []; }
+    catch { return []; }
+  }));
+  return auth;
 }
 
 /** Returns whether passkey authentication is enabled (dashboard is on Traefik). */

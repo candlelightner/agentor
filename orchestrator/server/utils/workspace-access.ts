@@ -20,6 +20,7 @@ import {
   withOperationDeadline,
 } from "./operation-deadline";
 import { registerOperationHelper } from "./operation-helper-registry";
+import { instanceControlPlaneCoordinator } from "./instance-snapshot-gate";
 
 const HELPER_LIFETIME_MS = 60_000;
 const MAX_PREVIEW_BYTES = 10 * 1024 * 1024;
@@ -122,10 +123,35 @@ class HelperLease {
   private slotHeld = false;
   private readonly operationId = randomUUID();
   private releaseOperation?: () => void;
+  // Reserve ownership before returning any stream or scheduling late cleanup.
+  // Event callbacks cannot acquire fresh admission after a snapshot begins.
+  private readonly drain = instanceControlPlaneCoordinator.fork();
+  private readonly pending = new Set<Promise<void>>();
+  private closePromise?: Promise<void>;
+  private cleanupDenied = false;
+  private readonly unresolvedHelpers = new Set<string>();
+  // Client-request rejection/settlement is not proof Docker abandoned create.
+  // A name lookup/removal returning 404 cannot clear this uncertainty either.
+  // Only a successful create response establishes the identity whose cleanup
+  // can retire this lease. Rejected creates need external reconciliation,
+  // which is deliberately not invented by this process-local ownership layer.
+  private readonly uncertainCreates = new Set<string>();
 
   constructor(private item: WorkspaceInventoryItem) {}
 
   async start(signal?: AbortSignal): Promise<void> {
+    try {
+      await this.startHelper(signal);
+    } catch (error) {
+      // Service-level image setup can also return a bounded failure carrying
+      // an outstanding Docker request, before this lease creates a container.
+      this.retainFailure(error);
+      await this.close();
+      throw error;
+    }
+  }
+
+  private async startHelper(signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
     const config = useConfig();
     const image = config.workerImagePrefix + config.workerImage;
@@ -134,7 +160,7 @@ class HelperLease {
     // helper is created. A mutable tag changing between requests cannot select
     // an unreviewed helper implementation mid-operation.
     const imageId = (
-      await withOperationDeadline(
+      await this.withDeadline(
         (operationSignal) => this.docker.getImage(image).inspect({
           abortSignal: operationSignal,
         } as Docker.ImageInspectOptions & { abortSignal: AbortSignal }),
@@ -146,7 +172,7 @@ class HelperLease {
     // Docker creates a missing bind source/volume implicitly. Refuse that side
     // effect: offline browsing must be strictly read-only, including setup.
     if (this.item.backend === "volume") {
-      await withOperationDeadline(
+      await this.withDeadline(
         (operationSignal) => this.docker.getVolume(this.item.storageRef).inspect({
           abortSignal: operationSignal,
         }),
@@ -215,11 +241,8 @@ class HelperLease {
     };
     let helper: Docker.Container;
     try {
-      helper = await withOperationDeadline(
-        (operationSignal) => this.docker.createContainer({
-          ...createOptions,
-          abortSignal: operationSignal,
-        }),
+      helper = await this.withDeadline(
+        (operationSignal) => this.createHelper(createOptions, operationSignal),
         HELPER_DOCKER_TIMEOUT_MS,
         "Docker workspace-helper creation",
         signal,
@@ -228,14 +251,10 @@ class HelperLease {
       // Docker may accept a create immediately before its HTTP response is
       // aborted. The operation-scoped name remains a safe, deterministic
       // cleanup handle even when dockerode never returned the container id.
-      const cleanupAmbiguousCreate = () => withOperationDeadline(
-        (operationSignal) => this.docker.getContainer(createOptions.name!).remove({
-          force: true,
-          abortSignal: operationSignal,
-        } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
-        HELPER_DOCKER_TIMEOUT_MS,
+      const cleanupAmbiguousCreate = () => this.removeHelper(
+        createOptions.name!,
         "Docker workspace-helper ambiguous-create cleanup",
-      ).catch(() => {});
+      );
       await cleanupAmbiguousCreate();
       // If abort won the race before Docker's create response settled, repeat
       // cleanup after settlement so a late-created object cannot escape the
@@ -244,66 +263,60 @@ class HelperLease {
       const settlement = (err as OperationFailureWithSettlement)?.[
         operationSettlement
       ];
-      if (settlement) void settlement.then(cleanupAmbiguousCreate);
-      this.releaseSlot();
+      if (settlement) this.track(settlement.then(cleanupAmbiguousCreate));
       throw err;
     }
     this.containerId = helper.id;
     try {
-      await withOperationDeadline(
+      await this.withDeadline(
         (operationSignal) => helper.start({ abortSignal: operationSignal }),
         HELPER_DOCKER_TIMEOUT_MS,
         "Docker workspace-helper start",
         signal,
       );
     } catch (err) {
-      await withOperationDeadline(
-        (operationSignal) => helper.remove({ force: true, abortSignal: operationSignal } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
-        HELPER_DOCKER_TIMEOUT_MS,
+      const removed = await this.removeHelper(
+        helper.id,
         "Docker workspace-helper failed-start cleanup",
-      ).catch(() => {});
+      );
+      const settlement = (err as OperationFailureWithSettlement)?.[operationSettlement];
+      if (removed && !settlement) this.containerId = "";
       // Some rootless/nested Docker daemons run their docker cgroup in
       // threaded mode and reject *any* cgroup-v2 controller setting. Keep the
       // isolation controls that do not depend on cgroups (read-only rootfs,
       // no network, dropped capabilities and no-new-privileges), but retry
       // without the optional resource ceilings in that known-hostile runtime.
       // A normal Docker failure must still fail closed.
-      if (!isThreadedCgroupLimitError(err)) {
-        this.releaseSlot();
+      if (!removed || !isThreadedCgroupLimitError(err)) {
         throw err;
       }
       const { PidsLimit, Memory, NanoCpus, ...fallbackHostConfig } =
         createOptions.HostConfig!;
       const fallbackName = `agentor-workspace-reader-${this.operationId}-fallback`;
       try {
-        helper = await withOperationDeadline((operationSignal) => this.docker.createContainer({
+        helper = await this.withDeadline((operationSignal) => this.createHelper({
           ...createOptions,
           name: fallbackName,
           HostConfig: fallbackHostConfig,
-          abortSignal: operationSignal,
-        }), HELPER_DOCKER_TIMEOUT_MS, "Docker workspace-helper fallback creation", signal);
+        }, operationSignal), HELPER_DOCKER_TIMEOUT_MS, "Docker workspace-helper fallback creation", signal);
         this.containerId = helper.id;
-        await withOperationDeadline(
+        await this.withDeadline(
           (operationSignal) => helper.start({ abortSignal: operationSignal }),
           HELPER_DOCKER_TIMEOUT_MS,
           "Docker workspace-helper fallback start",
           signal,
         );
       } catch (fallbackError) {
-        const cleanupFallback = () => withOperationDeadline(
-          (operationSignal) => this.docker.getContainer(fallbackName).remove({
-            force: true,
-            abortSignal: operationSignal,
-          } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
-          HELPER_DOCKER_TIMEOUT_MS,
+        const cleanupFallback = () => this.removeHelper(
+          fallbackName,
           "Docker workspace-helper fallback cleanup",
-        ).catch(() => {});
-        await cleanupFallback();
+        );
+        const removed = await cleanupFallback();
         const settlement = (
           fallbackError as OperationFailureWithSettlement
         )?.[operationSettlement];
-        if (settlement) void settlement.then(cleanupFallback);
-        this.releaseSlot();
+        if (settlement) this.track(settlement.then(cleanupFallback));
+        else if (removed) this.containerId = "";
         throw fallbackError;
       }
     }
@@ -311,26 +324,111 @@ class HelperLease {
     this.timer.unref?.();
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
-    if (!this.containerId) {
-      this.releaseSlot();
-      return;
-    }
-    const id = this.containerId;
-    this.containerId = "";
-    // Capacity belongs to the lease, not Docker's response. Release it before
-    // waiting so one broken helper object cannot deny unrelated operations.
-    this.releaseSlot();
-    await withOperationDeadline(
-      (operationSignal) => this.docker.getContainer(id).remove({
-        force: true,
-        abortSignal: operationSignal,
-      } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
+    const cleanup = this.drain.run(async () => {
+      try {
+        await this.settlePending();
+        if (this.containerId) {
+          await this.removeHelper(
+            this.containerId,
+            "Docker workspace-helper cleanup",
+          );
+        }
+      } finally {
+        // A deadline bounds the caller, not the actual mutation. Retain both
+        // drain and helper ownership until late Docker/cleanup work settles.
+        await this.settlePending();
+        // Settlement is not successful removal. There is not yet an explicit
+        // authoritative helper reconciliation interface. Fail closed for this
+        // process instead of letting a residual helper cross a snapshot cut.
+        if (this.unresolvedHelpers.size || this.uncertainCreates.size) await new Promise<void>(() => {});
+        this.containerId = "";
+        this.releaseSlot();
+      }
+    });
+    this.closePromise = withOperationDeadline(
+      cleanup,
       HELPER_DOCKER_TIMEOUT_MS,
-      "Docker workspace-helper cleanup",
+      "Docker workspace-helper cleanup settlement",
     ).catch(() => {});
+    return this.closePromise;
+  }
+
+  private track<T>(operation: Promise<T>): Promise<T> {
+    const settlement = operation.then(() => undefined, () => undefined);
+    this.pending.add(settlement);
+    void settlement.then(() => this.pending.delete(settlement));
+    return operation;
+  }
+
+  /** Register service-level bounded failures before any caller catch/finally
+   * can retire this lease. In particular, target archive extraction is actual
+   * mutation even though its source helper is read-only. Removal of that source
+   * helper does not establish settlement of a request writing another worker.
+   * Service methods that hide settlement internally need their own integration;
+   * this observes only the explicit existing operationSettlement contract. */
+  retainFailure(error: unknown): void {
+    const settlement = (error as OperationFailureWithSettlement | undefined)?.[operationSettlement];
+    if (settlement) this.track(settlement);
+  }
+
+  private async createHelper(options: Docker.ContainerCreateOptions, signal: AbortSignal): Promise<Docker.Container> {
+    const name = options.name!;
+    this.uncertainCreates.add(name);
+    const helper = await this.docker.createContainer({ ...options, abortSignal: signal });
+    // A malformed response is no stronger than a lost one. Retain uncertainty
+    // rather than interpreting a missing identity as successful creation.
+    if (!helper || typeof helper.id !== "string" || !helper.id) throw new Error("Docker workspace-helper create identity unavailable");
+    this.uncertainCreates.delete(name);
+    return helper;
+  }
+
+  private withDeadline<T>(
+    operation: (signal: AbortSignal) => Promise<T>,
+    timeoutMs: number,
+    label: string,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    return withOperationDeadline(
+      (operationSignal) => this.track(Promise.resolve().then(() => operation(operationSignal))),
+      timeoutMs, label, signal,
+    );
+  }
+
+  private async settlePending(): Promise<void> {
+    // Late-create finalizers may themselves register another Docker request.
+    while (this.pending.size) await Promise.all([...this.pending]);
+  }
+
+  private async removeHelper(id: string, label: string): Promise<boolean> {
+    // A denied cleanup is an authority boundary, never a reason to retry or
+    // relax helper grants. A residual/uncertain object retains drain ownership;
+    // retiring a settled request is not removal proof.
+    if (this.cleanupDenied) return false;
+    try {
+      await this.withDeadline(async (operationSignal) => {
+        try {
+          await this.docker.getContainer(id).remove({
+            force: true,
+            abortSignal: operationSignal,
+          } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal });
+          this.unresolvedHelpers.delete(id);
+        } catch (error) {
+          const status = (error as { statusCode?: number; status?: number })?.statusCode ??
+            (error as { status?: number })?.status;
+          if (status === 404) { this.unresolvedHelpers.delete(id); return; }
+          this.unresolvedHelpers.add(id);
+          if (status === 401 || status === 403) this.cleanupDenied = true;
+          throw error;
+        }
+      }, HELPER_DOCKER_TIMEOUT_MS, label);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** Guard a response/archive stream with an inactivity timeout. The source is
@@ -584,6 +682,9 @@ export class OfflineWorkspaceAccess {
         size: entry.size,
         text,
       };
+    } catch (error) {
+      lease.retainFailure(error);
+      throw error;
     } finally {
       await lease.close();
     }
@@ -638,6 +739,7 @@ export class OfflineWorkspaceAccess {
       stream.once("error", () => void lease.close());
       return result;
     } catch (err) {
+      lease.retainFailure(err);
       await lease.close();
       throw err;
     }
@@ -659,6 +761,9 @@ export class OfflineWorkspaceAccess {
         lease.holdForStream(stream as Readable),
         "/",
       );
+    } catch (error) {
+      lease.retainFailure(error);
+      throw error;
     } finally {
       await lease.close();
     }
@@ -671,6 +776,9 @@ export class OfflineWorkspaceAccess {
     await lease.start();
     try {
       return await fn(lease);
+    } catch (error) {
+      lease.retainFailure(error);
+      throw error;
     } finally {
       await lease.close();
     }

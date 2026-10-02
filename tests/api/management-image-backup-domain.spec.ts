@@ -241,9 +241,10 @@ test('backup MCP surface keeps recovery material write-only and uses shared asyn
   expect(source).not.toContain('backups.recovery-key.export');
   expect(source).not.toContain('instance-backups.recovery-key.reveal');
   expect(source).not.toContain('instance-backups.recovery-key.export');
-  expect(managementStore).toContain('instanceSnapshotActive()');
-  expect(managementStore).toContain('name === "instance-backups.cancel"');
-  expect(managementStore).toContain('args.jobId === instanceSnapshotJobId()');
+  // MCP cancellation also persists an included audit: no new MCP root is
+  // exempt during a snapshot. Exact-job cancellation remains an HTTP path.
+  expect(managementStore).toContain('runManagementOperation(() => this.invokeAdmitted(credential, tool, args))');
+  expect(managementStore).not.toContain('args.jobId === instanceSnapshotJobId()');
   expect(httpGuard).toContain('statusCode: 423');
   expect(httpGuard).toContain('/api/admin/instance-backups/jobs/');
   expect(httpGuard).toContain('encodeURIComponent(instanceSnapshotJobId()!)');

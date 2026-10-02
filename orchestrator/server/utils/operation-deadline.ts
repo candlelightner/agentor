@@ -13,6 +13,30 @@ export type OperationFailureWithSettlement = Error & {
   [operationSettlement]?: Promise<void>;
 };
 
+export function combineSettlements(...errors: unknown[]): Promise<void> | undefined {
+  const settlements: Promise<void>[] = [];
+  for (const err of errors) {
+    const s = (err as OperationFailureWithSettlement | undefined)?.[operationSettlement];
+    if (s && typeof (s as Promise<void>).then === "function") {
+      settlements.push(Promise.resolve(s).then(() => undefined, () => undefined));
+    }
+  }
+  if (settlements.length === 0) return undefined;
+  if (settlements.length === 1) return settlements[0];
+  return Promise.all(settlements).then(() => undefined);
+}
+
+export function attachSettlement<T extends Error>(target: T, settlement?: Promise<void>): T {
+  if (settlement) {
+    Object.defineProperty(target, operationSettlement, {
+      value: settlement,
+      configurable: true,
+      enumerable: false,
+    });
+  }
+  return target;
+}
+
 /** A deliberately value-free control-plane error. Operation names must be
  * fixed server strings, never Docker command lines, environment values, or
  * other caller-controlled data that could contain credentials. */

@@ -1,7 +1,7 @@
 import type { AdminLegacyRuntimeAuthorization } from './worker-runtime-policy';
 import { resolveWorkerRuntimeProfile } from './worker-runtime-policy';
 import { withOwnerWorkerLifecycleMutation } from './worker-lifecycle-coordinator';
-import { instanceSnapshotActive } from './instance-snapshot-gate';
+import { instanceMutationBlocked } from './instance-snapshot-gate';
 import { workerRuntimeProjection, type WorkerRecord, type WorkerRuntimeWriteGuard } from './worker-store';
 import type { ContainerInfo } from '../../shared/types';
 
@@ -52,7 +52,7 @@ export async function approveRestoredKataRuntime(
   if (!initial) throw Object.assign(new Error('Worker not found'), { statusCode: 404 });
   return withOwnerWorkerLifecycleMutation(initial.userId, workerId, async () => {
     await actor.authorize();
-    if (instanceSnapshotActive()) throw Object.assign(new Error('Runtime changes are unavailable during instance backup or restore'), { statusCode: 423 });
+    if (instanceMutationBlocked()) throw Object.assign(new Error('Runtime changes are unavailable during instance backup or restore'), { statusCode: 423 });
     const worker = deps.find(workerId);
     if (!worker || worker.userId !== initial.userId || worker.deletionPending)
       throw Object.assign(new Error('Worker not found'), { statusCode: 404 });
@@ -86,7 +86,7 @@ export async function grantLegacyWorkerRuntime(
   if (!initial) throw Object.assign(new Error('Worker not found'), { statusCode: 404 });
   return withOwnerWorkerLifecycleMutation(initial.userId, workerId, async () => {
     await actor.authorize();
-    if (instanceSnapshotActive())
+    if (instanceMutationBlocked())
       throw Object.assign(new Error('Runtime changes are unavailable during instance backup or restore'), { statusCode: 423 });
     const worker = deps.find(workerId);
     if (!worker || worker.userId !== initial.userId || worker.deletionPending)

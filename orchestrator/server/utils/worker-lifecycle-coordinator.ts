@@ -2,6 +2,7 @@ import {
   operationSettlement,
   type OperationFailureWithSettlement,
 } from "./operation-deadline";
+import { instanceControlPlaneCoordinator } from "./instance-snapshot-gate";
 
 /** Serializes lifecycle mutations for one worker without blocking unrelated
  * workers. The queue deliberately survives a failed operation so a rejected
@@ -33,6 +34,18 @@ export class WorkerLifecycleCoordinator {
     operation: () => Promise<T>,
     options: { holdTimeoutSettlement?: boolean } = {},
   ): Promise<T> {
+    // Admission precedes owner/worker queue acquisition. Waiting transactions
+    // are writers too: closing a snapshot barrier must drain, not discard,
+    // their already accepted multi-store work.
+    return instanceControlPlaneCoordinator.run(() =>
+      this.withAdmittedWorker(workerId, operation, options));
+  }
+
+  private withAdmittedWorker<T>(
+    workerId: string,
+    operation: () => Promise<T>,
+    options: { holdTimeoutSettlement?: boolean },
+  ): Promise<T> {
     this.generations.set(workerId, ++this.sequence);
     const previous = this.queues.get(workerId) ?? Promise.resolve();
     const result = previous.catch(() => undefined).then(operation);
@@ -44,7 +57,10 @@ export class WorkerLifecycleCoordinator {
         // actually settled, preventing a retry/reconciler from racing a late
         // start, stop, restart, or remove. Unrelated workers remain available.
         if (options.holdTimeoutSettlement !== false)
-          await error?.[operationSettlement];
+          // Rejection also settles the retained client operation. Preserve the
+          // original caller failure; don't create an unobserved rejected queue
+          // tail/finally promise. This says nothing about daemon reconciliation.
+          await Promise.resolve(error?.[operationSettlement]).catch(() => undefined);
       },
     );
     this.queues.set(workerId, tail);

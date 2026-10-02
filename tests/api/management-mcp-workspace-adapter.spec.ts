@@ -25,6 +25,10 @@ test('group-admin lifecycle tools declare bounded deadlines and return a timeout
     expect(tool.inputSchema).toMatchObject({ required: ['groupId'], properties: { groupId: { type: 'string' }, timeoutSeconds: { type: 'integer', minimum: 1, maximum: 300 } } });
     expect((tool.inputSchema.properties as any).timeoutSeconds.description).toContain('default 120');
   }
-  await expect(withinGroupAdminLifecycleDeadline(() => new Promise<never>(() => {}), 0.01))
+  let settle!: () => void;
+  const underlying = new Promise<void>(resolve => { settle = resolve; });
+  await expect(withinGroupAdminLifecycleDeadline(() => underlying, 0.01))
     .rejects.toMatchObject({ statusCode: 504 });
+  settle();
+  await underlying;
 });

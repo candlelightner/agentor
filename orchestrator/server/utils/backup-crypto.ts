@@ -6,27 +6,37 @@ import { Transform } from 'node:stream';
 import { join } from 'node:path';
 import type { Config } from './config';
 import { BackupKeyring, deriveBackupArchiveKey } from './backup-keyring';
+import { instanceControlPlaneCoordinator } from './instance-snapshot-gate';
+import { combineSettlements } from './operation-deadline';
 
-async function key(config: Config): Promise<Buffer> {
+const keyFilesystem = { chmod, lstat, mkdir, readFile, writeFile };
+
+async function key(config: Config, io = keyFilesystem): Promise<Buffer> {
+  return instanceControlPlaneCoordinator.run(async () => {
   const keyPath = join(config.dataDir, 'backup.key');
   let secret = process.env.BACKUP_ENCRYPTION_KEY?.trim() || '';
-  if (!secret) try { secret = (await readFile(keyPath, 'utf8')).trim(); } catch {}
+  if (!secret) try { secret = (await io.readFile(keyPath, 'utf8')).trim(); }
+  catch (error) { await combineSettlements(error); }
   if (!secret) {
-    await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
+    await io.mkdir(config.dataDir, { recursive: true, mode: 0o700 });
     secret = randomBytes(32).toString('hex');
-    await writeFile(keyPath, secret, { mode: 0o600, flag: 'wx' }).catch(async()=>{secret=(await readFile(keyPath,'utf8')).trim();});
+    await io.writeFile(keyPath, secret, { mode: 0o600, flag: 'wx' }).catch(async error => {
+      await combineSettlements(error);
+      secret = (await io.readFile(keyPath, 'utf8')).trim();
+    });
   }
   if (!secret) throw new Error('Dedicated backup encryption key is unavailable');
   if (!process.env.BACKUP_ENCRYPTION_KEY) {
-    const info = await lstat(keyPath);
+    const info = await io.lstat(keyPath);
     if (!info.isFile() || info.isSymbolicLink()) throw new Error('Backup encryption key must be a regular non-symlink file');
-    await chmod(keyPath, 0o600);
+    await io.chmod(keyPath, 0o600);
   }
   return Buffer.from(hkdfSync('sha256', Buffer.from(secret), Buffer.from('agentor-backups-v1'), Buffer.from('archive-key'), 32));
+  });
 }
 
-export async function encryptBackup(config: Config, input: string, output: string, onBytes?: (bytes: number) => void): Promise<{ size: number; sha256: string }> {
-  const iv = randomBytes(12); const cipher = createCipheriv('aes-256-gcm', await key(config), iv);
+export async function encryptBackup(config: Config, input: string, output: string, onBytes?: (bytes: number) => void, keyIo = keyFilesystem): Promise<{ size: number; sha256: string }> {
+  const iv = randomBytes(12); const cipher = createCipheriv('aes-256-gcm', await key(config, keyIo), iv);
   const hash = createHash('sha256'); let size = 0;
   const counter = new Transform({ transform(chunk, _enc, cb) { size += chunk.length; hash.update(chunk); onBytes?.(size); cb(null, chunk); } });
   const header = Buffer.concat([Buffer.from('AGENTOR-BACKUP-1\n'), iv]);
@@ -36,8 +46,8 @@ export async function encryptBackup(config: Config, input: string, output: strin
   return { size: header.length + size + tag.length, sha256: hash.digest('hex') };
 }
 
-export async function decryptBackup(config: Config, input: string, output: string, expectedSha256: string): Promise<void> {
-  return decryptBackupV1WithArchiveKey(input, output, expectedSha256, await key(config));
+export async function decryptBackup(config: Config, input: string, output: string, expectedSha256: string, keyIo = keyFilesystem): Promise<void> {
+  return decryptBackupV1WithArchiveKey(input, output, expectedSha256, await key(config, keyIo));
 }
 
 /** Cross-instance adoption of a legacy v1 object has no key identifier in its

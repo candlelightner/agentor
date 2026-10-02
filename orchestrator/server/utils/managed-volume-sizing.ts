@@ -13,7 +13,7 @@ import {
   resolveManagedVolumeSizingResource,
   type ManagedVolumeSizingResource,
 } from "./managed-volume-inventory";
-import { instanceSnapshotActive } from "./instance-snapshot-gate";
+import { instanceMutationBlocked } from "./instance-snapshot-gate";
 import { withOwnerWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
 import {
   operationSettlement,
@@ -336,10 +336,10 @@ export class ManagedVolumeSizingManager {
     try {
       await this.init();
       const result = await this.withState(async () => {
-        if (instanceSnapshotActive()) throw volumeError(409, "Volume sizing is unavailable during instance backup or restore. Retry afterwards.");
+        if (instanceMutationBlocked()) throw volumeError(409, "Volume sizing is unavailable during instance backup or restore. Retry afterwards.");
         if (this.cleanupUncertain) throw volumeError(503, "Volume sizing helper cleanup is incomplete. Retry after storage cleanup.");
         const resource = await authorize();
-        if (instanceSnapshotActive()) throw volumeError(409, "Volume sizing is unavailable during instance backup or restore. Retry afterwards.");
+        if (instanceMutationBlocked()) throw volumeError(409, "Volume sizing is unavailable during instance backup or restore. Retry afterwards.");
         if (!resource.incarnation) throw volumeError(409, "Volume identity cannot be verified safely.");
         if (this.closedOwners.has(resource.ownerKey)) throw volumeError(409, "Storage owner cleanup is in progress.");
         if (this.reservationConflicts(resource.ownerKey, resource.id))
@@ -479,12 +479,12 @@ export class ManagedVolumeSizingManager {
         return true;
       });
       if (!started) return;
-      if (instanceSnapshotActive()) throw volumeError(409, "Instance backup or restore started before the size scan.");
+      if (instanceMutationBlocked()) throw volumeError(409, "Instance backup or restore started before the size scan.");
       const admitted = await authorize();
       this.assertSameIncarnation(queued, admitted);
       const execute = async () => {
         controller.signal.throwIfAborted();
-        if (instanceSnapshotActive()) throw volumeError(409, "Instance backup or restore started before the size scan.");
+        if (instanceMutationBlocked()) throw volumeError(409, "Instance backup or restore started before the size scan.");
         const before = await authorize(); this.assertSameIncarnation(queued, before);
         const scanning = await this.withState(async () => {
           const current = this.jobs.find(id);
@@ -501,13 +501,13 @@ export class ManagedVolumeSizingManager {
         const after = await authorize(); this.assertSameIncarnation(queued, after);
         await this.withState(async () => {
           controller.signal.throwIfAborted();
-          if (instanceSnapshotActive()) throw volumeError(409, "Instance backup or restore started before the size result was published.");
+          if (instanceMutationBlocked()) throw volumeError(409, "Instance backup or restore started before the size result was published.");
           const current = this.jobs.find(id);
           if (!current || current.status !== "running" || this.closedOwners.has(current.ownerKey)) return;
           const publish = await authorize(); this.assertSameIncarnation(queued, publish);
           if (this.closedOwners.has(current.ownerKey)) return;
           controller.signal.throwIfAborted();
-          if (instanceSnapshotActive()) throw volumeError(409, "Instance backup or restore started before the size result was published.");
+          if (instanceMutationBlocked()) throw volumeError(409, "Instance backup or restore started before the size result was published.");
           const measuredAt = new Date(this.now()).toISOString();
           const cached: StoredVolumeSizeMeasurement = { id: publish.id, userId: "volume-sizing", ownerKey: publish.ownerKey,
             volumeId: publish.id, incarnation: publish.incarnation!, allocatedBytes: result.allocatedBytes,

@@ -20,10 +20,11 @@ defineRouteMeta({
   },
 });
 
-import { useContainerManager } from '../../../utils/services';
+import { useContainerManager, useLogger } from '../../../utils/services';
 import { requireContainerAccess } from '../../../utils/auth-helpers';
 import { rethrowAsHttpError } from '../../../utils/http-errors';
 import { requestCancellation } from '../../../utils/request-cancellation';
+import { consumeWorkerExport } from '../../../utils/worker-export-consumer';
 
 export default defineEventHandler(async (event) => {
   const id = getRouterParam(event, 'id')!;
@@ -41,31 +42,41 @@ export default defineEventHandler(async (event) => {
 
   // Materialise the bundle before streaming — a bad-state worker throws a 409
   // here (mapped from the manager's statusCode-tagged error) rather than a 500.
-  let stream: Awaited<ReturnType<typeof mgr.exportWorker>>['stream'];
-  let filename: string;
+  let bundle: Awaited<ReturnType<typeof mgr.exportWorker>>;
   const cancellation = requestCancellation(event);
   try {
-    ({ stream, filename } = await mgr.exportWorker(id, {
+    bundle = await mgr.exportWorker(id, {
       includeRootfs,
       includeManagedVolumes,
       signal: cancellation.signal,
-    }));
+    });
   } catch (err) {
     cancellation.detach();
     rethrowAsHttpError(err);
   }
 
-  const abortStream = () => stream.destroy();
+  const abortStream = () => bundle.stream.destroy();
   cancellation.signal.addEventListener('abort', abortStream, { once: true });
-  stream.once('close', () => {
+  try {
+    return await consumeWorkerExport(bundle, () => {
+      // A disconnect can race with export preparation returning its stream.
+      cancellation.signal.throwIfAborted();
+      setResponseHeaders(event, {
+        'Content-Type': 'application/x-tar',
+        'Content-Disposition': `attachment; filename="${bundle.filename}"`,
+        'Transfer-Encoding': 'chunked',
+      });
+      // The consumer's Node pipeline covers premature close and actual output
+      // destruction; H3 sendStream only observes source end/error.
+      return event.node.res;
+    }, cancellation.signal);
+  } catch (error) {
+    // Bytes already delivered cannot be recalled or relabelled as an HTTP
+    // failure. Retain accurate server-side accounting without logging secrets.
+    useLogger().error('[export] legacy worker export transfer or cleanup failed');
+    throw error;
+  } finally {
     cancellation.signal.removeEventListener('abort', abortStream);
     cancellation.detach();
-  });
-
-  setResponseHeaders(event, {
-    'Content-Type': 'application/x-tar',
-    'Content-Disposition': `attachment; filename="${filename}"`,
-    'Transfer-Encoding': 'chunked',
-  });
-  return sendStream(event, stream);
+  }
 });

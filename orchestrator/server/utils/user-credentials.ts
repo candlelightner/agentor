@@ -3,6 +3,9 @@ import { dirname, join } from 'node:path';
 import type { StorageManager } from './storage';
 import type { CredentialInfo } from '../../shared/types';
 import { isSafeUserId } from './user-id';
+import { instanceControlPlaneCoordinator } from './instance-snapshot-gate';
+
+const credentialFiles = { chown, mkdir, readFile, readdir, stat, unlink, writeFile };
 
 /** Files expected to exist in each user's credentials directory. `fileName` is
  * the per-user file on the host; `containerPath` is where the file is bind-mounted
@@ -63,7 +66,7 @@ export class UserCredentialManager {
    * syscalls on every subsequent worker create for the same user. */
   private seededUsers = new Set<string>();
 
-  constructor(storage: StorageManager) {
+  constructor(storage: StorageManager, private readonly files = credentialFiles) {
     this.storage = storage;
   }
 
@@ -93,19 +96,23 @@ export class UserCredentialManager {
    * `StorageManager.ensureUserKiloSharedDataDir` ensures). Cached per-userId
    * after first success. */
   async ensureUserDir(userId: string): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.seedUserDir(userId));
+  }
+
+  private async seedUserDir(userId: string): Promise<void> {
     if (this.seededUsers.has(userId)) return;
     await this.storage.ensureUserDir(userId);
     await this.storage.ensureUserKiloSharedDataDir(userId);
-    await Promise.all(
+    const seeded = await Promise.allSettled(
       AGENT_CREDENTIAL_MAPPINGS.map(async (mapping) => {
         const filePath = this.filePath(userId, mapping.fileName);
-        await mkdir(dirname(filePath), { recursive: true, mode: 0o700 });
+        await this.files.mkdir(dirname(filePath), { recursive: true, mode: 0o700 });
         try {
-          await stat(filePath);
+          await this.files.stat(filePath);
         } catch {
-          await writeFile(filePath, '{}', { mode: 0o600 });
+          await this.files.writeFile(filePath, '{}', { mode: 0o600 });
           try {
-            await chown(filePath, AGENT_UID, AGENT_GID);
+            await this.files.chown(filePath, AGENT_UID, AGENT_GID);
           } catch {
             // Best effort — ownership only matters in directory mode. In volume
             // mode the entrypoint's chown handles it.
@@ -113,6 +120,10 @@ export class UserCredentialManager {
         }
       }),
     );
+    // A failed branch must not retire the logical operation while sibling
+    // credential writes/chowns are still pending.
+    const failed = seeded.find((result) => result.status === 'rejected');
+    if (failed?.status === 'rejected') throw failed.reason;
     // Migrate a legacy `credentials/kilo.json` into the shared Kilo auth file,
     // then remove the duplicate so a single canonical secret copy remains.
     const kiloMigrationComplete = await this.migrateLegacyKilo(userId).catch((err) => {
@@ -133,7 +144,7 @@ export class UserCredentialManager {
     const legacyPath = this.kiloLegacyPath(userId);
     let legacyRaw: string;
     try {
-      legacyRaw = await readFile(legacyPath, 'utf-8');
+      legacyRaw = await this.files.readFile(legacyPath, 'utf-8');
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true;
       throw err;
@@ -141,7 +152,7 @@ export class UserCredentialManager {
     const trimmed = legacyRaw.trim();
     if (!trimmed || trimmed === '{}') {
       // Empty legacy duplicate — just remove it.
-      await unlink(legacyPath).catch(() => {});
+      await this.files.unlink(legacyPath).catch(() => {});
       return true;
     }
     let legacy: Record<string, unknown>;
@@ -160,7 +171,7 @@ export class UserCredentialManager {
     const authPath = this.kiloAuthPath(userId);
     let shared: Record<string, unknown> = {};
     try {
-      const sharedRaw = (await readFile(authPath, 'utf-8')).trim();
+      const sharedRaw = (await this.files.readFile(authPath, 'utf-8')).trim();
       if (sharedRaw && sharedRaw !== '{}') {
         shared = JSON.parse(sharedRaw) as Record<string, unknown>;
       }
@@ -181,15 +192,15 @@ export class UserCredentialManager {
       }
     }
     if (changed) {
-      await mkdir(dirname(authPath), { recursive: true, mode: 0o700 });
-      await writeFile(authPath, JSON.stringify(shared, null, 2), { mode: 0o600 });
+      await this.files.mkdir(dirname(authPath), { recursive: true, mode: 0o700 });
+      await this.files.writeFile(authPath, JSON.stringify(shared, null, 2), { mode: 0o600 });
       try {
-        await chown(authPath, AGENT_UID, AGENT_GID);
+        await this.files.chown(authPath, AGENT_UID, AGENT_GID);
       } catch {
         // Best effort.
       }
     }
-    await unlink(legacyPath).catch(() => {});
+    await this.files.unlink(legacyPath).catch(() => {});
     useLogger().info(`[user-credentials] migrated legacy kilo.json into shared Kilo auth for user ${userId}`);
     return true;
   }
@@ -211,7 +222,7 @@ export class UserCredentialManager {
   /** Returns true when the user's credential file contains more than `{}`. */
   async getStatusForUser(userId: string, fileName: string): Promise<boolean> {
     try {
-      const content = await readFile(this.filePath(userId, fileName), 'utf-8');
+      const content = await this.files.readFile(this.filePath(userId, fileName), 'utf-8');
       return content.trim().length > 2;
     } catch {
       return false;
@@ -221,13 +232,17 @@ export class UserCredentialManager {
   /** Reset (truncate to `{}`) a single credential file. For Kilo this writes
    * the live shared auth file (shared across all of the user's workers). */
   async reset(userId: string, fileName: string): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.resetFile(userId, fileName));
+  }
+
+  private async resetFile(userId: string, fileName: string): Promise<void> {
     const mapping = AGENT_CREDENTIAL_MAPPINGS.find((m) => m.fileName === fileName);
     if (!mapping) throw new Error(`Unknown credential file: ${fileName}`);
     await this.ensureUserDir(userId);
     const filePath = this.filePath(userId, fileName);
-    await writeFile(filePath, '{}', { mode: 0o600 });
+    await this.files.writeFile(filePath, '{}', { mode: 0o600 });
     try {
-      await chown(filePath, AGENT_UID, AGENT_GID);
+      await this.files.chown(filePath, AGENT_UID, AGENT_GID);
     } catch {
       // See ensureUserDir — best effort.
     }
@@ -248,9 +263,11 @@ export class UserCredentialManager {
   /** Remove the user's entire data directory (credentials + anything else).
    * Also forgets the user from the ensureUserDir cache. */
   async removeUserData(userId: string): Promise<void> {
-    this.seededUsers.delete(userId);
-    await this.storage.removeUserDir(userId);
-    useLogger().info(`[user-credentials] removed data directory for user ${userId}`);
+    return instanceControlPlaneCoordinator.run(async () => {
+      this.seededUsers.delete(userId);
+      await this.storage.removeUserDir(userId);
+      useLogger().info(`[user-credentials] removed data directory for user ${userId}`);
+    });
   }
 
   /** Enumerate every durable per-user directory, including directories whose
@@ -258,7 +275,7 @@ export class UserCredentialManager {
    * sweep. This is the final restart-safe candidate source for cleanup retry. */
   async listUserIds(): Promise<string[]> {
     try {
-      return (await readdir(join(this.storage.dataDir, 'users')))
+      return (await this.files.readdir(join(this.storage.dataDir, 'users')))
         .filter(isSafeUserId);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];

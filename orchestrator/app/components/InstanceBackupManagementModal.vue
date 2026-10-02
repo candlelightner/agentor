@@ -71,6 +71,7 @@ const canCreate = computed(
 const restoreCanStart = computed(
   () =>
     Boolean(selectedArtifact.value && restorePreflight.value?.ready) &&
+    !preflightLoading.value &&
     confirmReplaceControlPlane.value &&
     confirmExternalDependencies.value &&
     busy.value !== "restore",
@@ -81,16 +82,24 @@ const hasMatchingRecoveryKey = (fingerprint?: string) =>
       api.recoveryKeys.value.some((key) => key.fingerprint === fingerprint),
   );
 
+let actionViewVersion = 0;
 watch(open, async (shown) => {
+  const view = ++actionViewVersion;
+  preflightVersion++;
+  preflightLoading.value = false;
+  restorePreflight.value = null;
+  busy.value = "";
   if (!shown) {
     api.stop();
     selectedUpload.value = null;
     return;
   }
   await api.refresh();
+  if (view !== actionViewVersion) return;
   Object.assign(options, api.defaults.value);
   if (selectedProvider.value?.connected === false) provider.value = "local";
-});
+  if (selectedArtifact.value) void loadPreflight();
+}, { flush: "sync" });
 watch(
   () => options.includeWorkers,
   (included) => {
@@ -99,8 +108,13 @@ watch(
 );
 watch([restoreDockerVolumes, restoreHostMountPolicies], () => {
   if (selectedArtifact.value) void loadPreflight();
-});
-onBeforeUnmount(api.stop);
+}, { flush: "sync" });
+watch(selectedArtifact, () => {
+  preflightVersion++;
+  restorePreflight.value = null;
+  preflightLoading.value = false;
+}, { flush: "sync" });
+onBeforeUnmount(() => { actionViewVersion++; preflightVersion++; api.stop(); });
 
 function closeModal() {
   open.value = false;
@@ -127,16 +141,19 @@ function message(error: any, fallback: string) {
 }
 
 async function run<T>(key: string, action: () => Promise<T>) {
+  const actionView = actionViewVersion;
   busy.value = key;
   actionError.value = "";
   notice.value = "";
   try {
-    return await action();
+    const result = await action();
+    return actionView === actionViewVersion ? result : undefined;
   } catch (error: any) {
-    actionError.value = message(error, "Instance backup operation failed.");
+    if (actionView === actionViewVersion)
+      actionError.value = message(error, "Instance backup operation failed.");
     return undefined;
   } finally {
-    busy.value = "";
+    if (actionView === actionViewVersion) busy.value = "";
   }
 }
 
@@ -257,23 +274,31 @@ async function loadMoreLogs(job: InstanceBackupJob) {
 }
 
 async function loadPreflight() {
-  if (!selectedArtifact.value) return;
+  if (!open.value || !selectedArtifact.value) return;
+  const artifact = selectedArtifact.value;
+  const view = actionViewVersion;
   const version = ++preflightVersion;
+  const scope = {
+    restoreDockerVolumes: restoreDockerVolumes.value,
+    restoreHostMountPolicies: restoreHostMountPolicies.value,
+  };
+  const current = () => open.value && view === actionViewVersion &&
+    version === preflightVersion && selectedArtifact.value === artifact &&
+    scope.restoreDockerVolumes === restoreDockerVolumes.value &&
+    scope.restoreHostMountPolicies === restoreHostMountPolicies.value;
   preflightLoading.value = true;
+  restorePreflight.value = null;
   actionError.value = "";
   try {
-    const result = await api.preflight(selectedArtifact.value.id, {
-      restoreDockerVolumes: restoreDockerVolumes.value,
-      restoreHostMountPolicies: restoreHostMountPolicies.value,
-    });
-    if (version === preflightVersion) restorePreflight.value = result;
+    const result = await api.preflight(artifact.id, scope);
+    if (current()) restorePreflight.value = result;
   } catch (error: any) {
-    if (version === preflightVersion) {
+    if (current()) {
       restorePreflight.value = null;
       actionError.value = message(error, "Restore preflight failed.");
     }
   } finally {
-    if (version === preflightVersion) preflightLoading.value = false;
+    if (current()) preflightLoading.value = false;
   }
 }
 
@@ -340,6 +365,9 @@ const statusClass = (status: string) => {
         class="max-h-[92vh] space-y-5 overflow-y-auto p-6"
         data-testid="instance-backup-management"
       >
+        <p v-if="api.controlPlaneLocked.value" role="status" class="text-sm text-amber-700 dark:text-amber-300">
+          A snapshot or restore is holding the control plane. Active job status and cancellation remain available; other actions and logs resume after it finishes.
+        </p>
         <header class="flex items-start justify-between gap-4">
           <div>
             <div class="flex items-center gap-2">

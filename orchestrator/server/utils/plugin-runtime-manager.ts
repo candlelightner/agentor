@@ -1,7 +1,11 @@
 import Docker from "dockerode";
 import { PassThrough } from "node:stream";
 import type { Duplex } from "node:stream";
-import { OperationDeadlineError, withOperationDeadline } from "./operation-deadline";
+import { OperationDeadlineError, operationSettlement, withOperationDeadline, type OperationFailureWithSettlement } from "./operation-deadline";
+import { instanceControlPlaneCoordinator } from "./instance-snapshot-gate";
+import { InstanceControlPlaneCoordinator } from "./instance-control-plane-coordinator";
+import { withInstanceOperationDeadline } from "./instance-operation-deadline";
+import { createDockerPluginExecTransport, type DockerPluginExecTransport } from "./docker-plugin-exec-transport";
 
 const PLUGIN_DOCKER_TIMEOUT_MS = 30_000;
 import type { PluginDefinitionRecord } from "./plugin-definition-store";
@@ -65,6 +69,7 @@ export type PluginDefinitionRuntimeAuthorizer = (
 export interface PluginRuntimeManagerOptions {
   authorizeDefinition?: PluginDefinitionRuntimeAuthorizer;
   maxRequestTimeoutMs?: number;
+  coordinator?: InstanceControlPlaneCoordinator;
 }
 
 /**
@@ -74,6 +79,8 @@ export interface PluginRuntimeManagerOptions {
  */
 export class PluginRuntimeManager {
   private workerQueues = new Map<string, Promise<void>>();
+  private executorQueues = new Map<string, Promise<void>>();
+  private readonly coordinator: InstanceControlPlaneCoordinator;
   private readonly authorizeDefinition: PluginDefinitionRuntimeAuthorizer;
   private readonly maxRequestTimeoutMs: number;
 
@@ -83,6 +90,7 @@ export class PluginRuntimeManager {
     private readonly executor: PluginWorkerExecutor,
     options: PluginRuntimeManagerOptions = {},
   ) {
+    this.coordinator = options.coordinator ?? instanceControlPlaneCoordinator;
     this.authorizeDefinition =
       options.authorizeDefinition ?? defaultDefinitionAuthorizer;
     this.maxRequestTimeoutMs = Math.max(
@@ -134,17 +142,19 @@ export class PluginRuntimeManager {
     installationId: string,
     runtimeGeneration: string,
   ): Promise<PluginInstallationRecord> {
-    const installation = await this.installations.setDesiredEnabled(
-      userId,
-      installationId,
-      true,
-    );
-    return this.withWorker(installation.workerId, () =>
-      this.reconcileUnlocked(
-        this.requiredInstallation(userId, installationId),
-        runtimeGeneration,
-      ),
-    );
+    return this.coordinator.run(async () => {
+      const installation = await this.installations.setDesiredEnabled(
+        userId,
+        installationId,
+        true,
+      );
+      return this.withWorker(installation.workerId, () =>
+        this.reconcileUnlocked(
+          this.requiredInstallation(userId, installationId),
+          runtimeGeneration,
+        ),
+      );
+    });
   }
 
   async disable(
@@ -152,17 +162,19 @@ export class PluginRuntimeManager {
     installationId: string,
     runtimeGeneration: string,
   ): Promise<PluginInstallationRecord> {
-    const installation = await this.installations.setDesiredEnabled(
-      userId,
-      installationId,
-      false,
-    );
-    return this.withWorker(installation.workerId, () =>
-      this.reconcileUnlocked(
-        this.requiredInstallation(userId, installationId),
-        runtimeGeneration,
-      ),
-    );
+    return this.coordinator.run(async () => {
+      const installation = await this.installations.setDesiredEnabled(
+        userId,
+        installationId,
+        false,
+      );
+      return this.withWorker(installation.workerId, () =>
+        this.reconcileUnlocked(
+          this.requiredInstallation(userId, installationId),
+          runtimeGeneration,
+        ),
+      );
+    });
   }
 
   async uninstall(
@@ -284,10 +296,10 @@ export class PluginRuntimeManager {
     if (requirement?.mode !== "isolated" || (operation === "stop" && installation.allocations?.display === undefined)) return;
     if (!this.executor.desktop || installation.allocations?.display === undefined)
       throw runtimeError("PLUGIN_DESKTOP_UNAVAILABLE", "Managed desktop is unavailable. Update the worker image and rebuild the worker.", 502);
-    const result = await settleOnceWithDeadline(signal => this.executor.desktop!({
+    const result = await settleOnceWithDeadline(signal => this.withExecutor(installation.workerId, () => this.executor.desktop!({
       workerId: installation.workerId, installationId: installation.id, operation,
       config: { display: installation.allocations!.display!, width: requirement.width ?? 1920, height: requirement.height ?? 1080, depth: 24 }, signal,
-    }), 20_000, "Managed desktop timed out");
+    })), 20_000, "Managed desktop timed out", this.coordinator);
     if (result.exitCode === 98) throw runtimeError("PLUGIN_DISPLAY_IN_USE", "Display is occupied by another application. Agentor could not find a free display; retry Enable after closing unused desktops.", 409);
     if (result.exitCode !== 0) throw runtimeError("PLUGIN_DESKTOP_UNAVAILABLE", "Managed desktop is unavailable. Check the worker image, available memory, and display conflicts; then retry Enable.", 502);
   }
@@ -354,9 +366,10 @@ export class PluginRuntimeManager {
       (command?.timeoutSeconds ?? 30) * 1_000,
     );
     const result = await settleOnceWithDeadline(
-      (signal) => this.executor.execute({ ...request, signal }),
+      (signal) => this.withExecutor(installation.workerId, () => this.executor.execute({ ...request, signal })),
       timeoutMs,
       `${phase} timed out`,
+      this.coordinator,
     );
     if (result.exitCode !== 0)
       throw runtimeError(
@@ -397,7 +410,7 @@ export class PluginRuntimeManager {
     );
     const result = await settleOnceWithDeadline(
       (signal) =>
-        this.executor.probe({
+        this.withExecutor(installation.workerId, () => this.executor.probe({
           workerId: installation.workerId,
           installationId: installation.id,
           readiness,
@@ -407,9 +420,10 @@ export class PluginRuntimeManager {
           systemEnvironment: runtimeEnvironment(installation),
           ...(manifest.resources?.display?.mode === "isolated" ? { isolatedDisplay: installation.allocations?.display } : {}),
           signal,
-        }),
+        })),
       timeoutMs,
       "readiness probe timed out",
+      this.coordinator,
     );
     if (result.exitCode !== 0 || result.truncated)
       throw runtimeError(
@@ -464,11 +478,15 @@ export class PluginRuntimeManager {
     workerId: string,
     operation: () => Promise<T>,
   ): Promise<T> {
+    return this.coordinator.run(() => this.withAdmittedWorker(workerId, operation));
+  }
+
+  private withAdmittedWorker<T>(workerId: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.workerQueues.get(workerId) ?? Promise.resolve();
     const result = previous.then(operation);
     const tail = result.then(
-      () => undefined,
-      () => undefined,
+      () => this.executorQueues.get(workerId),
+      () => this.executorQueues.get(workerId),
     );
     this.workerQueues.set(workerId, tail);
     void tail.finally(() => {
@@ -476,6 +494,23 @@ export class PluginRuntimeManager {
         this.workerQueues.delete(workerId);
     });
     return result;
+  }
+
+  /** A bounded phase may finish before its executor. Serialize actual worker
+   * commands, including error cleanup, without holding unrelated workers. */
+  private withExecutor<T>(workerId: string, operation: () => Promise<T>): Promise<T> {
+    return this.coordinator.run(() => {
+      const previous = this.executorQueues.get(workerId) ?? Promise.resolve();
+      const result = previous.then(operation);
+      const tail = result.then(() => undefined, async (error: OperationFailureWithSettlement) => {
+        await Promise.resolve(error?.[operationSettlement]).catch(() => undefined);
+      });
+      this.executorQueues.set(workerId, tail);
+      void tail.then(() => {
+        if (this.executorQueues.get(workerId) === tail) this.executorQueues.delete(workerId);
+      });
+      return result;
+    });
   }
 }
 
@@ -485,12 +520,17 @@ export class PluginRuntimeManager {
  * validated, values-free control document over stdin.
  */
 export class DockerPluginWorkerExecutor implements PluginWorkerExecutor {
+  private readonly transport: DockerPluginExecTransport;
   constructor(
     private readonly docker: Docker,
     private readonly resolveContainerId: (
       workerId: string,
     ) => string | undefined,
-  ) {}
+    private readonly coordinator = instanceControlPlaneCoordinator,
+    transport?: DockerPluginExecTransport,
+  ) {
+    this.transport = transport ?? createDockerPluginExecTransport({ modem: docker.modem, coordinator });
+  }
 
   execute(request: PluginExecutionRequest): Promise<PluginExecutionResult> {
     return this.invoke(
@@ -537,6 +577,15 @@ export class DockerPluginWorkerExecutor implements PluginWorkerExecutor {
     payload: Record<string, unknown>,
     signal: AbortSignal,
   ): Promise<PluginExecutionResult> {
+    return this.coordinator.run(() => this.invokeAdmitted(workerId, operation, payload, signal));
+  }
+
+  private async invokeAdmitted(
+    workerId: string,
+    operation: "execute" | "probe" | "desktop",
+    payload: Record<string, unknown>,
+    signal: AbortSignal,
+  ): Promise<PluginExecutionResult> {
     const containerId = this.resolveContainerId(workerId);
     if (!containerId)
       throw runtimeError(
@@ -554,16 +603,9 @@ export class DockerPluginWorkerExecutor implements PluginWorkerExecutor {
     let container: Docker.Container;
     try {
       container = this.docker.getContainer(containerId);
-      const exec = await withOperationDeadline(
-        (operationSignal) => container.exec({
-          Cmd: ["/home/agent/apps/plugin-runner/runner.py", operation],
-          AttachStdin: true,
-          AttachStdout: true,
-          AttachStderr: true,
-          Tty: false,
-          User: "agent",
-          abortSignal: operationSignal,
-        }),
+      const execId = await withInstanceOperationDeadline(
+        this.coordinator,
+        operationSignal => this.transport.setup(containerId, operation, operationSignal),
         PLUGIN_DOCKER_TIMEOUT_MS,
         "Docker plugin-runner setup",
         signal,
@@ -574,13 +616,16 @@ export class DockerPluginWorkerExecutor implements PluginWorkerExecutor {
           "Plugin runtime request timed out",
           504,
         );
-      stream = (await withOperationDeadline(
-        (operationSignal) => exec.start({
-          hijack: true,
-          stdin: true,
-          Tty: false,
-          abortSignal: operationSignal,
-        }),
+      stream = (await withInstanceOperationDeadline(
+        this.coordinator,
+        async (operationSignal) => {
+          const opened = await this.transport.start(execId, operationSignal);
+          if (operationSignal.aborted) {
+            await closePluginStream(opened);
+            throw runtimeError("PLUGIN_RUNTIME_TIMEOUT", "Plugin runtime request timed out", 504);
+          }
+          return opened;
+        },
         PLUGIN_DOCKER_TIMEOUT_MS,
         "Docker plugin-runner start",
         signal,
@@ -589,144 +634,190 @@ export class DockerPluginWorkerExecutor implements PluginWorkerExecutor {
       if ((error as { code?: unknown })?.code === "PLUGIN_RUNTIME_TIMEOUT")
         throw error;
       if (error instanceof OperationDeadlineError)
-        throw runtimeError(
+        throw preserveSettlement(runtimeError(
           "PLUGIN_RUNTIME_TIMEOUT",
           "Plugin runtime request timed out",
           504,
-        );
-      throw runtimeError(
+        ), error);
+      throw preserveSettlement(runtimeError(
         "PLUGIN_RUNNER_UNAVAILABLE",
         "Plugin runner is unavailable",
         502,
-      );
+      ), error);
     }
-    if (signal.aborted) {
-      stream.destroy();
-      throw runtimeError(
-        "PLUGIN_RUNTIME_TIMEOUT",
-        "Plugin runtime request timed out",
-        504,
-      );
-    }
-    return new Promise<PluginExecutionResult>((resolve, reject) => {
-      let settled = false;
-      const chunks: Buffer[] = [];
-      let bytes = 0;
-      const maxResponseBytes = 9 * 1024 * 1024;
-      const stdout = new PassThrough();
-      const stderr = new PassThrough();
-      const finish = (error?: unknown, result?: PluginExecutionResult) => {
-        if (settled) return;
-        settled = true;
-        signal.removeEventListener("abort", abort);
-        stdout.destroy();
-        stderr.destroy();
-        error ? reject(error) : resolve(result!);
-      };
-      const abort = () => {
-        stream.destroy();
-        finish(
-          runtimeError(
-            "PLUGIN_RUNTIME_TIMEOUT",
-            "Plugin runtime request timed out",
-            504,
-          ),
-        );
-      };
-      signal.addEventListener("abort", abort, { once: true });
-      stdout.on("data", (chunk: Buffer) => {
-        bytes += chunk.length;
-        if (bytes > maxResponseBytes) {
-          stream.destroy();
-          finish(
-            runtimeError(
-              "PLUGIN_RUNNER_OUTPUT_LIMIT",
-              "Plugin runner response exceeded its limit",
-              502,
-            ),
-          );
-          return;
-        }
-        chunks.push(Buffer.from(chunk));
-      });
-      // Runner stderr is intentionally discarded. It may contain details from
-      // a failed child process and must never become part of an API response.
-      stderr.resume();
-      stream.on("error", () =>
-        finish(
-          runtimeError(
-            "PLUGIN_RUNNER_UNAVAILABLE",
-            "Plugin runner is unavailable",
-            502,
-          ),
-        ),
-      );
-      const complete = () => {
-        try {
-          const output = Buffer.concat(chunks).toString("utf8").trim();
-          const line = output
-            .split(/\r?\n/)
-            .findLast((candidate) => candidate.trim().startsWith("{"));
-          if (!line) throw new Error("Plugin runner returned no response");
-          const result = JSON.parse(line) as PluginExecutionResult & {
-            error?: string;
+    const child = this.coordinator.fork();
+    let sent = false;
+    let receipt = false;
+    let writeSettled: Promise<void> = Promise.resolve();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let response!: Promise<PluginExecutionResult>;
+    const actual = child.run(async () => {
+      try {
+        return await (response = new Promise<PluginExecutionResult>((resolve, reject) => {
+          let settled = false;
+          const chunks: Buffer[] = [];
+          let bytes = 0;
+          const maxResponseBytes = 9 * 1024 * 1024;
+          const finish = (error?: unknown, result?: PluginExecutionResult) => {
+            if (settled) return;
+            settled = true;
+            signal.removeEventListener("abort", abort);
+            error ? reject(error) : resolve(result!);
           };
-          if (!Number.isInteger(result.exitCode))
-            throw new Error("Plugin runner response is invalid");
-          finish(undefined, {
-            exitCode: result.exitCode,
-            ...(typeof result.output === "string"
-              ? { output: result.output }
-              : {}),
-            ...(result.truncated ? { truncated: true } : {}),
+          const abort = () => {
+            stream.destroy();
+            finish(
+              runtimeError(
+                "PLUGIN_RUNTIME_TIMEOUT",
+                "Plugin runtime request timed out",
+                504,
+              ),
+            );
+          };
+          signal.addEventListener("abort", abort, { once: true });
+          stdout.on("data", (chunk: Buffer) => {
+            bytes += chunk.length;
+            if (bytes > maxResponseBytes) {
+              stream.destroy();
+              finish(
+                runtimeError(
+                  "PLUGIN_RUNNER_OUTPUT_LIMIT",
+                  "Plugin runner response exceeded its limit",
+                  502,
+                ),
+              );
+              return;
+            }
+            chunks.push(Buffer.from(chunk));
           });
-        } catch {
-          finish(
-            runtimeError(
-              "PLUGIN_RUNNER_INVALID_RESPONSE",
-              "Plugin runner returned an invalid response",
-              502,
+          // Runner stderr is intentionally discarded. It may contain details from
+          // a failed child process and must never become part of an API response.
+          stderr.resume();
+          stream.on("error", () =>
+            finish(
+              runtimeError(
+                "PLUGIN_RUNNER_UNAVAILABLE",
+                "Plugin runner is unavailable",
+                502,
+              ),
             ),
           );
+          const complete = () => {
+            try {
+              const output = Buffer.concat(chunks).toString("utf8").trim();
+              const line = output
+                .split(/\r?\n/)
+                .findLast((candidate) => candidate.trim().startsWith("{"));
+              if (!line) throw new Error("Plugin runner returned no response");
+              const result = JSON.parse(line) as PluginExecutionResult & {
+                error?: string;
+              };
+              if (!Number.isInteger(result.exitCode))
+                throw new Error("Plugin runner response is invalid");
+              receipt = true;
+              finish(undefined, {
+                exitCode: result.exitCode,
+                ...(typeof result.output === "string"
+                  ? { output: result.output }
+                  : {}),
+                ...(result.truncated ? { truncated: true } : {}),
+              });
+            } catch {
+              finish(
+                runtimeError(
+                  "PLUGIN_RUNNER_INVALID_RESPONSE",
+                  "Plugin runner returned an invalid response",
+                  502,
+                ),
+              );
+            }
+          };
+          stream.once("end", complete);
+          stream.once("close", complete);
+          container.modem.demuxStream(stream, stdout, stderr);
+          if (signal.aborted) { abort(); return; }
+          // The newline is the frame boundary. Docker hijacked sockets do not
+          // reliably propagate a write-side EOF, so the runner reads exactly one
+          // bounded record rather than waiting for stream.end().
+          writeSettled = new Promise<void>(writeDone => {
+            sent = true;
+            try {
+              stream.write(`${JSON.stringify(payload)}\n`, error => {
+                writeDone();
+                if (error) finish(runtimeError("PLUGIN_RUNNER_UNAVAILABLE", "Plugin runner is unavailable", 502));
+              });
+            }
+            catch (error) { writeDone(); finish(error); }
+          });
+        }));
+      } finally {
+        await Promise.all([closePluginStream(stream), closePluginStream(stdout), closePluginStream(stderr), writeSettled]);
+        if (sent && !receipt) {
+          // The request could have mutated worker data. A closed Docker client
+          // socket is not a runner completion receipt. Retain a process-local
+          // veto; authoritative/restart-safe reconciliation is not implemented.
+          await new Promise<void>(() => { });
         }
-      };
-      stream.once("end", complete);
-      stream.once("close", complete);
-      container.modem.demuxStream(stream, stdout, stderr);
-      // The newline is the frame boundary. Docker hijacked sockets do not
-      // reliably propagate a write-side EOF, so the runner reads exactly one
-      // bounded record rather than waiting for stream.end().
-      stream.write(`${JSON.stringify(payload)}\n`);
+      }
     });
+    void actual.catch(() => { });
+    const transportSettlement = { [operationSettlement]: actual.then(() => undefined, () => undefined) };
+    const result = response.then(value => actual.then(() => value), error => {
+      throw preserveSettlement(error, transportSettlement);
+    });
+    void result.catch(() => { }); // Pre-aborted deadline inputs do not observe their promise.
+    try {
+      // Actual transport was explicitly admitted above, including pre-aborted
+      // delivery races. This wrapper only bounds the caller's wait.
+      return await withOperationDeadline(result, 310_000, "Plugin runner transport", signal);
+    } catch (error) {
+      if (error instanceof OperationDeadlineError)
+        throw preserveSettlement(runtimeError("PLUGIN_RUNTIME_TIMEOUT", "Plugin runtime request timed out", 504), transportSettlement);
+      throw error;
+    }
   }
 }
 
-export function settleOnceWithDeadline<T>(
+export async function settleOnceWithDeadline<T>(
   operation: (signal: AbortSignal) => Promise<T>,
   timeoutMs: number,
   timeoutMessage: string,
+  coordinator = instanceControlPlaneCoordinator,
 ): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const controller = new AbortController();
-    let settled = false;
-    const finish = (error?: unknown, value?: T) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      error ? reject(error) : resolve(value as T);
+  try {
+    return await withInstanceOperationDeadline(coordinator, operation, timeoutMs, "Plugin runtime operation");
+  } catch (error) {
+    if (error instanceof OperationDeadlineError)
+      throw preserveSettlement(runtimeError("PLUGIN_RUNTIME_TIMEOUT", timeoutMessage, 504), error);
+    throw error;
+  }
+}
+
+function preserveSettlement<T extends Error>(target: T, source: unknown): T {
+  const settlement = (source as OperationFailureWithSettlement | undefined)?.[operationSettlement];
+  if (settlement) Object.defineProperty(target, operationSettlement, { value: settlement });
+  return target;
+}
+
+/** Destruction is not closure: asynchronous _destroy and pending writes may
+ * continue after the caller's bounded error. Never retire their child early. */
+async function closePluginStream(stream: Duplex): Promise<void> {
+  if (stream.closed) return;
+  const closed = new Promise<void>(resolve => {
+    const observeClose = () => {
+      // An emitted notification alone is not proof that asynchronous _destroy
+      // finished. Remain subscribed until the actual stream state is closed.
+      if (!stream.closed) return;
+      stream.off("close", observeClose);
+      resolve();
     };
-    const timer = setTimeout(() => {
-      const error = runtimeError("PLUGIN_RUNTIME_TIMEOUT", timeoutMessage, 504);
-      controller.abort(error);
-      finish(error);
-    }, timeoutMs);
-    Promise.resolve()
-      .then(() => operation(controller.signal))
-      .then(
-        (value) => finish(undefined, value),
-        (error) => finish(error),
-      );
+    stream.on("close", observeClose);
+    observeClose();
   });
+  stream.on("error", () => { });
+  stream.destroy();
+  await closed;
 }
 
 function runtimeEnvironment(

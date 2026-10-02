@@ -3,12 +3,16 @@ import { constants } from "node:fs";
 import { chmod, mkdir, open, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "./config";
-import { decryptWorkerValue, encryptWorkerValue, type EncryptedWorkerValue } from "./worker-config-crypto";
+import { decryptWorkerValue, decryptWorkerValueForInstanceRestore, encryptWorkerValue, type EncryptedWorkerValue } from "./worker-config-crypto";
 import { assertSafeUserId, isSafeUserId } from "./user-id";
+import { instanceControlPlaneCoordinator } from "./instance-snapshot-gate";
+import { operationSettlement, type OperationFailureWithSettlement, combineSettlements, attachSettlement } from "./operation-deadline";
+import { readExistingRecoveryKey } from "./recovery-key-read";
 
 const KIT_KIND = "agentor-backup-recovery-kit";
 const KIT_VERSION = 1;
 const MAX_KIT_BYTES = 16 * 1024;
+const keyringFiles = { chmod, mkdir, open, rename, rm };
 
 export interface BackupRecoveryKit {
   kind: typeof KIT_KIND;
@@ -42,6 +46,7 @@ interface KeyringState { version: 1; owners: Record<string, OwnerKeyring>; }
 export class BackupKeyring {
   private state: KeyringState = { version: 1, owners: {} };
   private initialized?: Promise<void>;
+  private ready = false;
   private writes = Promise.resolve();
   /**
    * `active()` may create an owner record and `importKit()` may create or
@@ -52,13 +57,17 @@ export class BackupKeyring {
   private ownerMutations = new Map<string, Promise<void>>();
   private readonly path: string;
 
-  constructor(private readonly config: Config, path?: string) {
+  constructor(private readonly config: Config, path?: string, private readonly files = keyringFiles) {
     this.path = path ?? join(config.dataDir, "backup-keyring.json");
   }
 
-  init() { return (this.initialized ??= this.load()); }
+  init() {
+    return instanceControlPlaneCoordinator.run(() =>
+      (this.initialized ??= this.load().then(() => { this.ready = true; })));
+  }
 
   async status(ownerId: string): Promise<BackupKeyStatus[]> {
+    return instanceControlPlaneCoordinator.run(async () => {
     assertSafeUserId(ownerId);
     await this.init();
     const owner = this.state.owners[ownerId];
@@ -71,9 +80,11 @@ export class BackupKeyring {
     const legacy = await this.legacyStatus();
     if (legacy && !result.some((item) => item.fingerprint === legacy.fingerprint)) result.push(legacy);
     return result;
+    });
   }
 
   async active(ownerId: string): Promise<{ fingerprint: string; material: string }> {
+    return instanceControlPlaneCoordinator.run(async () => {
     assertSafeUserId(ownerId);
     await this.init();
     return this.mutateOwner(ownerId, async () => {
@@ -93,6 +104,7 @@ export class BackupKeyring {
       await this.commit((state) => { state.owners[ownerId] = owner; });
       return { fingerprint, material };
     });
+    });
   }
 
   private async activeFromRecord(ownerId: string, owner: OwnerKeyring) {
@@ -102,6 +114,7 @@ export class BackupKeyring {
   }
 
   async find(ownerId: string, fingerprint: string): Promise<string | undefined> {
+    return instanceControlPlaneCoordinator.run(async () => {
     assertSafeUserId(ownerId);
     if (!isFingerprint(fingerprint)) return undefined;
     await this.init();
@@ -109,19 +122,39 @@ export class BackupKeyring {
     if (stored) return this.decrypt(ownerId, stored);
     const legacy = await this.legacyMaterial();
     return legacy && backupKeyFingerprint(legacy) === fingerprint ? legacy : undefined;
+    });
+  }
+
+  /** Only for restore authentication after init() and the mutation drain have
+   * completed. Deliberately cannot initialize, generate, or chmod key files. */
+  async findForInstanceRestore(ownerId: string, fingerprint: string): Promise<string | undefined> {
+    assertSafeUserId(ownerId);
+    if (!this.ready) throw new Error("Backup recovery keyring must be initialized before instance restore");
+    if (!isFingerprint(fingerprint)) return undefined;
+    const stored = this.state.owners[ownerId]?.keys.find((key) => key.fingerprint === fingerprint);
+    if (stored) return this.decrypt(ownerId, stored, true);
+    const legacy = await this.legacyMaterial(true);
+    return legacy && backupKeyFingerprint(legacy) === fingerprint ? legacy : undefined;
   }
 
   async candidates(ownerId: string): Promise<Array<{ fingerprint: string; material: string }>> {
+    return instanceControlPlaneCoordinator.run(async () => {
     assertSafeUserId(ownerId);
     await this.init();
     const owner = this.state.owners[ownerId];
-    const keys = await Promise.all((owner?.keys ?? []).map(async (key) => ({ fingerprint: key.fingerprint, material: await this.decrypt(ownerId, key) })));
+    const results = await Promise.allSettled((owner?.keys ?? []).map((key) =>
+      instanceControlPlaneCoordinator.run(async () => ({ fingerprint: key.fingerprint, material: await this.decrypt(ownerId, key) }))));
+    const failed = results.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
+    const keys = results.map((result) => (result as PromiseFulfilledResult<{ fingerprint: string; material: string }>).value);
     const legacy = await this.legacyMaterial();
     if (legacy && !keys.some((key) => key.fingerprint === backupKeyFingerprint(legacy))) keys.push({ fingerprint: backupKeyFingerprint(legacy), material: legacy });
     return keys;
+    });
   }
 
   async importKit(ownerId: string, input: string | unknown): Promise<BackupKeyStatus> {
+    return instanceControlPlaneCoordinator.run(async () => {
     assertSafeUserId(ownerId);
     const kit = validateRecoveryKit(input);
     await this.init();
@@ -146,24 +179,28 @@ export class BackupKeyring {
       const active = this.state.owners[ownerId]!.activeFingerprint === stored.fingerprint;
       return { fingerprint: stored.fingerprint, active, source: "imported" as const, createdAt: stored.createdAt };
     });
+    });
   }
 
   async exportKit(ownerId: string, fingerprint?: string): Promise<BackupRecoveryKit> {
+    return instanceControlPlaneCoordinator.run(async () => {
     const key = fingerprint ? await this.find(ownerId, fingerprint) : (await this.active(ownerId)).material;
     if (!key) throw new Error("Backup recovery key is unavailable");
     const actualFingerprint = backupKeyFingerprint(key);
     return { kind: KIT_KIND, version: KIT_VERSION, keyMaterial: key, fingerprint: actualFingerprint, encryptionFormat: 2, createdAt: new Date().toISOString() };
+    });
   }
 
   private aad(ownerId: string, fingerprint: string) { return `agentor-backup-keyring-v1:${ownerId}:${fingerprint}`; }
-  private async decrypt(ownerId: string, stored: StoredKey) {
-    try { return await decryptWorkerValue(this.config, stored.material, this.aad(ownerId, stored.fingerprint)); }
-    catch { throw new Error("Backup recovery key is unavailable"); }
+  private async decrypt(ownerId: string, stored: StoredKey, readOnly = false) {
+    try { return await (readOnly ? decryptWorkerValueForInstanceRestore : decryptWorkerValue)(this.config, stored.material, this.aad(ownerId, stored.fingerprint)); }
+    catch (error) { throw unavailableKeyError("Backup recovery key is unavailable", error); }
   }
   private async load() {
     let file: Awaited<ReturnType<typeof open>> | undefined;
+    let readError: unknown;
     try {
-      file = await open(this.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      file = await this.files.open(this.path, constants.O_RDONLY | constants.O_NOFOLLOW);
       const info = await file.stat();
       if (!info.isFile() || info.size > 16 * 1024 * 1024)
         throw new Error("Invalid backup recovery keyring");
@@ -173,17 +210,49 @@ export class BackupKeyring {
       if (!validKeyringState(parsed))
         throw new Error("Invalid backup recovery keyring");
       this.state = parsed;
-    } catch (error: any) { if (error?.code !== "ENOENT") throw new Error("Backup recovery keyring is unavailable"); }
-    finally { await file?.close().catch(() => {}); }
+    } catch (error: any) {
+      if (error?.code === "ENOENT") {
+        // Missing keyrings remain compatible with an empty installation, but
+        // absence reported by a bounded operation does not settle that work.
+        await mutationTail(Promise.reject(error));
+      } else readError = error;
+    } finally {
+      let closeError: unknown;
+      if (file) {
+        try {
+          await file.close();
+        } catch (error) {
+          closeError = error;
+        }
+      }
+      const combined = combineSettlements(readError, closeError);
+      if (closeError) {
+        await mutationTail(Promise.reject(closeError));
+      }
+      if (readError && closeError) {
+        const error = unavailableKeyError("Backup recovery keyring is unavailable", readError);
+        attachSettlement(error, combined);
+        throw error;
+      }
+      if (readError) {
+        throw unavailableKeyError("Backup recovery keyring is unavailable", readError);
+      }
+      if (closeError) {
+        const error = unavailableKeyError("Backup recovery keyring cleanup is unavailable", closeError);
+        attachSettlement(error, combined);
+        throw error;
+      }
+    }
   }
   private async commit(change: (state: KeyringState) => void) {
+    return instanceControlPlaneCoordinator.run(() => {
     const write = async () => {
       const next = structuredClone(this.state); change(next);
-      await mkdir(this.config.dataDir, { recursive: true, mode: 0o700 });
+      await this.files.mkdir(this.config.dataDir, { recursive: true, mode: 0o700 });
       const temporary = `${this.path}.${randomBytes(12).toString("hex")}.tmp`;
       let file: Awaited<ReturnType<typeof open>> | undefined;
       try {
-        file = await open(
+        file = await this.files.open(
           temporary,
           constants.O_WRONLY |
             constants.O_CREAT |
@@ -194,49 +263,68 @@ export class BackupKeyring {
         await file.writeFile(JSON.stringify(next), "utf8");
         await file.close();
         file = undefined;
-        await rename(temporary, this.path);
+        await this.files.rename(temporary, this.path);
         this.state = next;
       } finally {
-        await file?.close().catch(() => {});
-        await rm(temporary, { force: true }).catch(() => {});
+        if (file) await mutationTail(file.close());
+        await mutationTail(this.files.rm(temporary, { force: true }));
       }
     };
-    const pending = this.writes.then(write, write); this.writes = pending.catch(() => {}); return pending;
+    const pending = this.writes.then(write); this.writes = mutationTail(pending); return pending;
+    });
   }
   private async mutateOwner<T>(ownerId: string, operation: () => Promise<T>): Promise<T> {
+    return instanceControlPlaneCoordinator.run(() => {
     const previous = this.ownerMutations.get(ownerId) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(operation);
-    const settled = next.then(() => undefined, () => undefined);
+    const next = previous.then(operation);
+    const settled = mutationTail(next);
     this.ownerMutations.set(ownerId, settled);
-    try {
-      return await next;
-    } finally {
+    void settled.then(() => {
       if (this.ownerMutations.get(ownerId) === settled)
         this.ownerMutations.delete(ownerId);
-    }
+    });
+    return next;
+    });
   }
-  private async legacyMaterial(): Promise<string | undefined> {
+  private async legacyMaterial(readOnly = false): Promise<string | undefined> {
     const configured = process.env.BACKUP_ENCRYPTION_KEY?.trim();
     if (configured) return configured;
     const path = join(this.config.dataDir, "backup.key");
     let file: Awaited<ReturnType<typeof open>> | undefined;
     try {
-      file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      if (readOnly) return (await readExistingRecoveryKey(path, 4096, this.files.open)) || undefined;
+      file = await this.files.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
       const info = await file.stat();
       if (!info.isFile() || info.size > 4096) return undefined;
-      await chmod(path, 0o600);
+      if (!readOnly) await this.files.chmod(path, 0o600);
       const value = (await file.readFile("utf8")).trim();
       return value || undefined;
-    } catch {
+    } catch (error) {
+      // Legacy lookup deliberately treats unreadable material as absent, but
+      // must not retire any exposed late normalization work with that fallback.
+      await mutationTail(Promise.reject(error));
       return undefined;
     } finally {
-      await file?.close().catch(() => {});
+      if (file) await mutationTail(file.close());
     }
   }
   private async legacyStatus(): Promise<BackupKeyStatus | undefined> {
     const material = await this.legacyMaterial();
     return material ? { fingerprint: backupKeyFingerprint(material), active: false, source: "legacy" } : undefined;
   }
+}
+
+function mutationTail(pending: Promise<unknown>): Promise<void> {
+  return pending.then(() => undefined, async (error: OperationFailureWithSettlement) => {
+    await Promise.resolve(error?.[operationSettlement]).catch(() => {});
+  });
+}
+
+function unavailableKeyError(message: string, error: unknown): Error {
+  const unavailable = new Error(message);
+  const settlement = (error as OperationFailureWithSettlement | undefined)?.[operationSettlement];
+  if (settlement) Object.defineProperty(unavailable, operationSettlement, { value: settlement, configurable: true });
+  return unavailable;
 }
 
 export function backupKeyFingerprint(material: string): string {

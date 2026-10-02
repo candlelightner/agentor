@@ -1,14 +1,14 @@
 import { createError, getRequestURL } from "h3";
 import {
   instanceControlPlaneBarrierKind,
-  instanceSnapshotActive,
+  instanceMutationBlocked,
   instanceSnapshotJobId,
 } from "../utils/instance-snapshot-gate";
 
 const READ_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 export default defineEventHandler((event) => {
-  if (!instanceSnapshotActive() || READ_METHODS.has(event.method)) return;
+  if (!instanceMutationBlocked() || READ_METHODS.has(event.method)) return;
   const path = getRequestURL(event).pathname;
   // Cancellation is the only mutation that remains useful during the barrier.
   // The manager validates the exact job identity and aborts its streams.

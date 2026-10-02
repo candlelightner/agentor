@@ -41,6 +41,7 @@ defineRouteMeta({
 import type { UpdatableImage } from '../../../shared/types';
 import { useUpdateChecker, useTraefikManager } from '../../utils/services';
 import { requireAdmin } from '../../utils/auth-helpers';
+import { instanceControlPlaneCoordinator } from '../../utils/instance-snapshot-gate';
 
 export default defineEventHandler(async (event) => {
   requireAdmin(event);
@@ -76,11 +77,17 @@ export default defineEventHandler(async (event) => {
   // Schedule orchestrator self-replacement if its image was pulled
   if (result.orchestratorPulled) {
     result.orchestratorRestarting = true;
+    const restartLease = instanceControlPlaneCoordinator.fork();
+    const releaseRestart = checker.registerPendingRestart();
     setTimeout(async () => {
       try {
-        await checker.recreateOrchestrator();
+        await restartLease.run(async () => {
+          await checker.recreateOrchestrator();
+        });
       } catch (err: unknown) {
         useLogger().error(`[update-checker] orchestrator self-replace failed: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        releaseRestart();
       }
     }, 2000);
   }

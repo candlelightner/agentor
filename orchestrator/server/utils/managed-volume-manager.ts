@@ -6,14 +6,14 @@ import { ManagedVolumeStore, PersistencePolicyStore, VolumeRecreationStore, publ
 import { ManagedVolumeRuntime } from "./managed-volume-runtime";
 import { useConfig, useContainerManager, useWorkerStore } from "./services";
 import { withOwnerWorkerLifecycleMutation as withWorkerMutation } from "./worker-lifecycle-coordinator";
-import { instanceSnapshotActive } from "./instance-snapshot-gate";
+import { instanceMutationBlocked, instanceControlPlaneCoordinator } from "./instance-snapshot-gate";
 import { useWorkerProtectionLockStore } from "./worker-protection-lock";
 import { requireOrdinaryWorkerSelfAccess } from "./worker-auth";
 import { persistentPathVolumeName } from "./persistent-backup-paths";
 
 function withOwnerWorkerLifecycleMutation<T>(userId: string, workerId: string, operation: () => Promise<T>) {
   return withWorkerMutation(userId, workerId, () => {
-    if (instanceSnapshotActive()) throw volumeError(409, "Storage changes are unavailable during instance backup or restore. Retry afterwards.");
+    if (instanceMutationBlocked()) throw volumeError(409, "Storage changes are unavailable during instance backup or restore. Retry afterwards.");
     return operation();
   });
 }
@@ -34,6 +34,7 @@ export class ManagedVolumeManager {
   readonly runtime: ManagedVolumeRuntime;
   readonly recreations: VolumeRecreationStore;
   private loading?: Promise<void>;
+  private initializationComplete = false;
   private operations = new Set<string>();
   private recoveryFailures = new Set<string>();
 
@@ -44,9 +45,29 @@ export class ManagedVolumeManager {
     this.recreations = new VolumeRecreationStore(dataDir);
   }
 
-  init() { return this.loading ??= Promise.all([this.store.init(), this.policies.init(), this.recreations.init()]).then(() => {}); }
+  init() {
+    return instanceControlPlaneCoordinator.run(() => this.loading ??= this.initialize());
+  }
 
-  hasActiveOperationsForInstanceSnapshot() { return this.operations.size > 0 || this.recreations.list().length > 0; }
+  private async initialize() {
+    const results = await Promise.allSettled([this.store, this.policies, this.recreations].map(store =>
+      instanceControlPlaneCoordinator.run(() => store.init())));
+    const failed = results.find(result => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
+    this.initializationComplete = true;
+  }
+
+  assertInitializedForInstanceSnapshot(): void {
+    if (!this.initializationComplete || [this.store, this.policies, this.recreations].some(store => store.hasUnavailableOwners()))
+      throw Object.assign(new Error("Managed volume records are unavailable for instance backup or restore"), {
+        statusCode: 503, code: "INSTANCE_SNAPSHOT_MANAGED_VOLUMES_UNAVAILABLE",
+      });
+  }
+
+  hasActiveOperationsForInstanceSnapshot() {
+    this.assertInitializedForInstanceSnapshot();
+    return this.operations.size > 0 || this.recreations.list().length > 0;
+  }
   isRecoveryBlocked(workerId: string) { return this.recoveryFailures.has(workerId); }
 
   /** Called after deleted-account worker cleanup under the owner's fence.

@@ -71,11 +71,7 @@ import { withOwnerWorkerLifecycleMutation } from "./worker-lifecycle-coordinator
 import { ManagementPluginDomain } from "./management-plugin-domain";
 import { ManagementHostMountDomain } from "./management-host-mount-domain";
 import { ManagementHardwareDeviceDomain } from "./management-hardware-device-domain";
-import {
-  instanceControlPlaneBarrierKind,
-  instanceSnapshotActive,
-  instanceSnapshotJobId,
-} from "./instance-snapshot-gate";
+import { accountManagementStream, runManagementOperation } from "./management-control-plane";
 import { effectiveWorkerSelfApiAccess } from "./worker-self-access";
 
 const GROUPS = [
@@ -676,6 +672,9 @@ export class ManagementMcpStore {
     this.path = join(dataDir, "admin", "management-mcp.v1.json");
   }
   async init() {
+    return runManagementOperation(() => this.initAdmitted());
+  }
+  private async initAdmitted() {
     if (!this.loading)
       this.loading = (async () => {
         try {
@@ -692,6 +691,9 @@ export class ManagementMcpStore {
     return this.loading;
   }
   private persistState(state: State) {
+    return runManagementOperation(() => this.persistStateAdmitted(state));
+  }
+  private persistStateAdmitted(state: State) {
     const next = this.writes.then(async () => {
       if (this.stateWriter) {
         await this.stateWriter(structuredClone(state));
@@ -714,6 +716,9 @@ export class ManagementMcpStore {
     return this.persistState(structuredClone(this.state));
   }
   private mutate<T>(operation: (draft: State) => T): Promise<T> {
+    return runManagementOperation(() => this.mutateAdmitted(operation));
+  }
+  private mutateAdmitted<T>(operation: (draft: State) => T): Promise<T> {
     const result = this.mutations.then(async () => {
       const draft = structuredClone(this.state);
       const value = operation(draft);
@@ -846,6 +851,9 @@ export class ManagementMcpStore {
       });
   }
   async updatePolicy(groups: Record<string, unknown>, actor: string) {
+    return runManagementOperation(() => this.updatePolicyAdmitted(groups, actor));
+  }
+  private async updatePolicyAdmitted(groups: Record<string, unknown>, actor: string) {
     await this.init();
     for (const [name, value] of Object.entries(groups || {})) {
       if (!GROUPS.includes(name as Group) || typeof value !== "boolean")
@@ -957,15 +965,22 @@ export class ManagementMcpStore {
     };
   }
   async auditAuthorizationFailure(operation: string) {
-    await this.auditSafely("authorization.denied", "failure", {
+    return runManagementOperation(() => this.auditSafely("authorization.denied", "failure", {
       operation,
       reason: "identity",
-    });
+    }));
   }
   async invoke(
     credential: unknown,
     tool: unknown,
     args: Record<string, unknown> = {},
+  ) {
+    return runManagementOperation(() => this.invokeAdmitted(credential, tool, args));
+  }
+  private async invokeAdmitted(
+    credential: unknown,
+    tool: unknown,
+    args: Record<string, unknown>,
   ) {
     const name = typeof tool === "string" ? tool : "";
     let identity: IdentityMetadata;
@@ -995,22 +1010,6 @@ export class ManagementMcpStore {
           statusCode: 403,
         });
       }
-      if (
-        instanceSnapshotActive() &&
-        !toolAnnotations(name).readOnlyHint &&
-        !(
-          name === "instance-backups.cancel" &&
-          args.jobId === instanceSnapshotJobId()
-        )
-      )
-        throw Object.assign(
-          new Error(
-            instanceControlPlaneBarrierKind() === "restore"
-              ? "Agentor control-plane mutations are locked while a verified whole-instance restore is being staged and applied."
-              : "Agentor control-plane mutations are temporarily paused while a consistent instance snapshot is being created.",
-          ),
-          { statusCode: 423, code: "INSTANCE_SNAPSHOT_ACTIVE" },
-        );
       if (identity.scope === "group" && name === "workers.create") {
         // A group principal never selects an owner or group. Both are derived
         // from its live workload identity, closing owner-wide confused-deputy
@@ -1290,6 +1289,14 @@ export class ManagementMcpStore {
     source: Readable,
     declaredLength?: number,
   ) {
+    return runManagementOperation(() => this.uploadImportAdmitted(credential, token, source, declaredLength));
+  }
+  private async uploadImportAdmitted(
+    credential: unknown,
+    token: string,
+    source: Readable,
+    declaredLength?: number,
+  ) {
     let identity;
     try {
       identity = await this.introspect(credential);
@@ -1322,6 +1329,16 @@ export class ManagementMcpStore {
     }
   }
   async openDownload(
+    credential: unknown,
+    token: string,
+  ): Promise<OpenedManagementDownload> {
+    return runManagementOperation(async () => {
+      const opened = await this.openDownloadAdmitted(credential, token);
+      accountManagementStream(opened.stream);
+      return opened;
+    });
+  }
+  private async openDownloadAdmitted(
     credential: unknown,
     token: string,
   ): Promise<OpenedManagementDownload> {
@@ -1389,7 +1406,7 @@ export class ManagementMcpStore {
     audit: OpenedManagementDownload["audit"],
     outcome: "success" | "failure",
   ) {
-    await this.auditSafely("download.transferred", outcome, audit);
+    return runManagementOperation(() => this.auditSafely("download.transferred", outcome, audit));
   }
   private async executeTool(
     name: string,
@@ -2254,6 +2271,9 @@ export class ManagementMcpStore {
     }
   }
   async approve(id: string, actor: string) {
+    return runManagementOperation(() => this.approveAdmitted(id, actor));
+  }
+  private async approveAdmitted(id: string, actor: string) {
     await this.init();
     return this.mutate((state) => {
       const p = state.proposals.find((x) => x.id === id);
@@ -2289,6 +2309,13 @@ export class ManagementMcpStore {
     );
   }
   async audit(
+    action: string,
+    outcome: string,
+    details?: Record<string, unknown>,
+  ) {
+    return runManagementOperation(() => this.auditAdmitted(action, outcome, details));
+  }
+  private async auditAdmitted(
     action: string,
     outcome: string,
     details?: Record<string, unknown>,

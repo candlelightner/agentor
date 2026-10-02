@@ -63,6 +63,7 @@ export class ManagedVolumeStore extends UserScopedJsonStore<string, StoredManage
   override list() { return mergeVolumeRecords(super.list(), this.retained.list()); }
   override listForUser(userId: string) { return mergeVolumeRecords(super.listForUser(userId), this.retained.listForUser(userId)); }
   override get(userId: string, id: string) { return this.retained.get(userId, id) ?? super.get(userId, id); }
+  override hasUnavailableOwners() { return super.hasUnavailableOwners() || this.retained.hasUnavailableOwners(); }
 
   /** Copy first, then remove the disposable owner partition. A crash with both
    * copies present is safe: the administrator-retained record wins on load. */

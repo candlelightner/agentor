@@ -12,6 +12,7 @@ import { UserScopedJsonStore } from "./user-scoped-store";
 import type { WorkerGroupStore } from "./worker-group-store";
 import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 import type { WorkerStore } from "./worker-store";
+import { instanceControlPlaneCoordinator } from "./instance-snapshot-gate";
 
 const PLATFORM_FILE = "admin/hardware-devices.v1.json";
 
@@ -52,7 +53,12 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
   }
 
   override async init() {
-    await Promise.all([super.init(), this.loadCatalog()]);
+    return instanceControlPlaneCoordinator.run(async () => {
+      // Retain every parallel load through quarantine/publication, even when
+      // the other partition has already failed.
+      const results = await Promise.allSettled([super.init(), this.loadCatalog()]);
+      for (const result of results) if (result.status === "rejected") throw result.reason;
+    });
   }
 
   listCatalog() {
@@ -93,6 +99,10 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
   }
 
   async approveDevice(input: { selector: unknown; name?: unknown }) {
+    return instanceControlPlaneCoordinator.run(() => this.approveAdmittedDevice(input));
+  }
+
+  private async approveAdmittedDevice(input: { selector: unknown; name?: unknown }) {
     if (typeof input.selector !== "string" || !input.selector)
       throw statusError(400, "A discovered hardware selector is required");
     const candidate = (await this.listDiscoveredDevices()).find(
@@ -134,6 +144,10 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
   }
 
   async deleteDevice(deviceId: string): Promise<HardwareDeviceRevocation> {
+    return instanceControlPlaneCoordinator.run(() => this.deleteAdmittedDevice(deviceId));
+  }
+
+  private async deleteAdmittedDevice(deviceId: string): Promise<HardwareDeviceRevocation> {
     if (!this.getDevice(deviceId)) throw statusError(404, "Approved hardware device not found");
     await this.mutateCatalog((catalog) => catalog.delete(deviceId));
     const removed = this.list().filter((grant) => grant.deviceId === deviceId);
@@ -539,6 +553,10 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
   }
 
   private mutateCatalog(operation: (catalog: Map<string, HardwareDevice>) => void) {
+    return instanceControlPlaneCoordinator.run(() => this.mutateAdmittedCatalog(operation));
+  }
+
+  private mutateAdmittedCatalog(operation: (catalog: Map<string, HardwareDevice>) => void) {
     const result = this.catalogWrites.then(async () => {
       this.assertCatalogAvailable();
       const previous = this.catalog;

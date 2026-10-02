@@ -36,6 +36,8 @@ import {
   type GitImageRecovery,
 } from "./git-image-store";
 import { withOwnerLifecycleMutation } from "./worker-lifecycle-coordinator";
+import { instanceControlPlaneCoordinator } from './instance-snapshot-gate';
+import { operationSettlement, type OperationFailureWithSettlement } from './operation-deadline';
 import type { PluginDefinitionStore } from "./plugin-definition-store";
 import {
   GIT_PLUGIN_CATALOG_PATH,
@@ -178,18 +180,22 @@ export class GitImageCatalogManager {
     ownerId: string,
     operation: () => Promise<T>,
   ): Promise<T> {
+    return instanceControlPlaneCoordinator.run(() => {
     const previous = this.ownerQueues.get(ownerId) ?? Promise.resolve();
     const result = previous.catch(() => undefined).then(operation);
     const tail = result.then(
       () => undefined,
-      () => undefined,
+      async (error: OperationFailureWithSettlement) => {
+        await Promise.resolve(error?.[operationSettlement]).catch(() => {});
+      },
     );
     this.ownerQueues.set(ownerId, tail);
-    void tail.finally(() => {
+    void tail.then(() => {
       if (this.ownerQueues.get(ownerId) === tail)
         this.ownerQueues.delete(ownerId);
     });
     return result;
+    });
   }
   init() {
     return this.store.init();

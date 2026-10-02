@@ -6,6 +6,7 @@ import {
 } from "node:http";
 import { pipeline } from "node:stream/promises";
 import type { ManagementMcpStore } from "./management-mcp-store";
+import { runManagementOperation } from "./management-control-plane";
 
 const MAX_BODY = 1024 * 1024;
 
@@ -48,6 +49,27 @@ export class ManagementMcpTransport {
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse) {
+    try {
+      // Covers authentication denials, all dispatch paths, upload consumption,
+      // download pipeline/disconnect, and the final persisted transfer audit.
+      // Response close is not completion of these asynchronous operations.
+      await runManagementOperation(() => this.handleAdmitted(request, response));
+    } catch (error: any) {
+      if (response.headersSent || response.destroyed) {
+        if (!response.destroyed) response.destroy();
+        return;
+      }
+      response.setHeader("Cache-Control", "no-store");
+      response.setHeader("X-Content-Type-Options", "nosniff");
+      const locked = error?.code === "INSTANCE_CONTROL_PLANE_BARRIER_ACTIVE";
+      this.send(response, locked ? 423 : 500, {
+        error: locked ? "Instance control-plane recovery is in progress" : "Management request failed",
+        ...(locked ? { code: error.code } : {}),
+      });
+    }
+  }
+
+  private async handleAdmitted(request: IncomingMessage, response: ServerResponse) {
     response.setHeader("Cache-Control", "no-store");
     response.setHeader("X-Content-Type-Options", "nosniff");
     const downloadMatch = request.url?.match(/^\/downloads\/([0-9a-f-]{36})$/i);

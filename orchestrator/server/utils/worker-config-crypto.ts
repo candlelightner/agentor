@@ -2,6 +2,8 @@ import { createCipheriv, createDecipheriv, hkdfSync, randomBytes } from 'node:cr
 import { chmod, lstat, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Config } from './config';
+import { instanceControlPlaneCoordinator } from './instance-snapshot-gate';
+import { readExistingRecoveryKey } from './recovery-key-read';
 
 export interface EncryptedWorkerValue {
   version: 1;
@@ -11,7 +13,7 @@ export interface EncryptedWorkerValue {
   ciphertext: string;
 }
 
-async function keyMaterial(config: Config): Promise<Buffer> {
+async function keyMaterial(config: Config, readOnly = false): Promise<Buffer> {
   const path = join(config.dataDir, 'worker-config.key');
   let secret = process.env.WORKER_CONFIG_ENCRYPTION_KEY?.trim() || '';
   if (secret) {
@@ -19,8 +21,9 @@ async function keyMaterial(config: Config): Promise<Buffer> {
     if (decoded.length !== 32) throw new Error('WORKER_CONFIG_ENCRYPTION_KEY must be a base64-encoded 32-byte key');
     return Buffer.from(hkdfSync('sha256', decoded, Buffer.from('agentor-worker-config-v1'), Buffer.from('encryption-key'), 32));
   }
-  try { secret = (await readFile(path, 'utf8')).trim(); }
+  try { secret = readOnly ? await readExistingRecoveryKey(path, 4096) : (await readFile(path, 'utf8')).trim(); }
   catch (err) {
+    if (readOnly) throw err;
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
     const generated = randomBytes(32).toString('base64');
@@ -30,26 +33,40 @@ async function keyMaterial(config: Config): Promise<Buffer> {
       secret = (await readFile(path, 'utf8')).trim();
     }
   }
-  const info = await lstat(path);
-  if (!info.isFile() || info.isSymbolicLink()) throw new Error('Worker secret encryption key must be a regular non-symlink file');
-  await chmod(path, 0o600);
+  if (!readOnly) {
+    const info = await lstat(path);
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error('Worker secret encryption key must be a regular non-symlink file');
+    await chmod(path, 0o600);
+  }
   const decoded = Buffer.from(secret, 'base64');
   if (decoded.length !== 32) throw new Error('Worker secret encryption key is invalid');
   return Buffer.from(hkdfSync('sha256', decoded, Buffer.from('agentor-worker-config-v1'), Buffer.from('encryption-key'), 32));
 }
 
 export async function encryptWorkerValue(config: Config, plaintext: string, aad: string): Promise<EncryptedWorkerValue> {
+  return instanceControlPlaneCoordinator.run(async () => {
   const key = await keyMaterial(config);
   const iv = randomBytes(12);
   const cipher = createCipheriv('aes-256-gcm', key, iv);
   cipher.setAAD(Buffer.from(aad));
   const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
   return { version: 1, algorithm: 'aes-256-gcm', iv: iv.toString('base64'), tag: cipher.getAuthTag().toString('base64'), ciphertext: ciphertext.toString('base64') };
+  });
 }
 
 export async function decryptWorkerValue(config: Config, value: EncryptedWorkerValue, aad: string): Promise<string> {
+  return instanceControlPlaneCoordinator.run(() => decryptValue(config, value, aad, false));
+}
+
+/** Restore authentication after pre-barrier keyring initialization. This path
+ * only reads an existing key; it never creates files or normalizes permissions. */
+export async function decryptWorkerValueForInstanceRestore(config: Config, value: EncryptedWorkerValue, aad: string): Promise<string> {
+  return decryptValue(config, value, aad, true);
+}
+
+async function decryptValue(config: Config, value: EncryptedWorkerValue, aad: string, readOnly: boolean): Promise<string> {
   if (value.version !== 1 || value.algorithm !== 'aes-256-gcm') throw new Error('Unsupported worker secret encryption format');
-  const decipher = createDecipheriv('aes-256-gcm', await keyMaterial(config), Buffer.from(value.iv, 'base64'));
+  const decipher = createDecipheriv('aes-256-gcm', await keyMaterial(config, readOnly), Buffer.from(value.iv, 'base64'));
   decipher.setAAD(Buffer.from(aad));
   decipher.setAuthTag(Buffer.from(value.tag, 'base64'));
   return Buffer.concat([decipher.update(Buffer.from(value.ciphertext, 'base64')), decipher.final()]).toString('utf8');

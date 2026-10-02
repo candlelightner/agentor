@@ -23,12 +23,153 @@ import {
   beginInstanceSnapshot,
   instanceSnapshotActive,
   instanceSnapshotJobId,
+  instanceControlPlaneCoordinator,
 } from "../../orchestrator/server/utils/instance-snapshot-gate";
 
 const orchestratorRequire = createRequire(
   new URL("../../orchestrator/package.json", import.meta.url),
 );
 const tar = orchestratorRequire("tar-stream") as { pack(): any };
+
+function heldOperation() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(yes => { resolve = yes; });
+  return { promise, resolve };
+}
+
+async function drainManagerFixture(timeoutMs = 1000) {
+  const root = await mkdtemp(join(tmpdir(), 'agentor-instance-drain-'));
+  const provider = new FakeBackupProvider(join(root, 'provider'));
+  const calls: string[] = [];
+  const manager = new InstanceBackupManager({
+    dataDir: root, controlPlaneDrainTimeoutMs: timeoutMs,
+    backupManager: { instanceBackupProvider: () => provider } as unknown as BackupManager,
+    preflightCreate: async () => { calls.push('preflight'); },
+    authSnapshot: async () => { calls.push('snapshot'); throw new Error('Intentional snapshot boundary stop'); },
+  });
+  await manager.init();
+  return { manager, root, calls, close: async () => {
+    manager.stop();
+    await Promise.allSettled([...(manager as any).tasks.values()] as Promise<void>[]);
+    await rm(root, { recursive: true, force: true });
+  } };
+}
+
+test('snapshot waits for both logical writes and accepting request final audit before authoritative preflight', async () => {
+  const f = await drainManagerFixture(), held = heldOperation(), accepted = heldOperation();
+  let id!: string;
+  const request = instanceControlPlaneCoordinator.run(async () => {
+    f.calls.push('first-write');
+    id = (await f.manager.create('owner', 'fake')).id;
+    accepted.resolve(); await held.promise;
+    await instanceControlPlaneCoordinator.run(() => { f.calls.push('second-write'); });
+    f.calls.push('final-audit');
+  });
+  try {
+    await accepted.promise;
+    await expect.poll(instanceSnapshotActive).toBe(true);
+    expect(f.calls).toEqual(['first-write']);
+    held.resolve(); await request; await settled(f.manager, id);
+    expect(f.calls).toEqual(['first-write', 'second-write', 'final-audit', 'preflight', 'snapshot']);
+  } finally { held.resolve(); await request; await f.close(); }
+});
+
+test('snapshot drain timeout never reaches preflight or snapshots and keeps the writer accounted', async () => {
+  const f = await drainManagerFixture(10), held = heldOperation();
+  const writer = instanceControlPlaneCoordinator.run(() => held.promise);
+  try {
+    const job = await f.manager.create('owner', 'fake');
+    expect((await settled(f.manager, job.id)).status).toBe('failed');
+    expect(f.calls).toEqual([]); expect(instanceControlPlaneCoordinator.activeOperations).toBe(1);
+    expect(instanceSnapshotActive()).toBe(false);
+    held.resolve(); await writer; expect(instanceControlPlaneCoordinator.activeOperations).toBe(0);
+  } finally { held.resolve(); await writer; await f.close(); }
+});
+
+test('cancelled drain never reaches a snapshot and does not cancel another admitted writer', async () => {
+  const f = await drainManagerFixture(), held = heldOperation();
+  const writer = instanceControlPlaneCoordinator.run(() => held.promise);
+  try {
+    const job = await f.manager.create('owner', 'fake');
+    await expect.poll(instanceSnapshotActive).toBe(true);
+    await f.manager.cancel(job.id);
+    await expect.poll(instanceSnapshotActive).toBe(false);
+    expect((await settled(f.manager, job.id)).status).toBe('cancelled');
+    expect(f.calls).toEqual([]); expect(instanceControlPlaneCoordinator.activeOperations).toBe(1);
+  } finally { held.resolve(); await writer; await f.close(); }
+});
+
+test('barrier-only control reads without initialization and aborts only the exact running owner job', async () => {
+  const f = await drainManagerFixture(), held = heldOperation();
+  const writer = instanceControlPlaneCoordinator.run(() => held.promise);
+  try {
+    const job = await f.manager.create('owner', 'fake');
+    await expect.poll(instanceSnapshotActive).toBe(true);
+    const originalInit = f.manager.init;
+    f.manager.init = () => { throw new Error('Barrier path must never initialize'); };
+    try {
+      expect(f.manager.barrierControlJob(job.id, 'other', true)).toBeUndefined();
+      expect(f.manager.barrierControlJob('other', 'owner', true)).toBeUndefined();
+      expect(f.manager.barrierControlJob(job.id, 'owner')?.id).toBe(job.id);
+      expect((f.manager as any).controllers.get(job.id).signal.aborted).toBe(false);
+      expect(f.manager.barrierControlJob(job.id, 'owner', true)?.id).toBe(job.id);
+      expect((f.manager as any).controllers.get(job.id).signal.aborted).toBe(true);
+      expect(instanceSnapshotActive()).toBe(true);
+    } finally { f.manager.init = originalInit; }
+    await expect.poll(instanceSnapshotActive).toBe(false);
+    expect((await settled(f.manager, job.id)).status).toBe('cancelled');
+    expect(f.calls).toEqual([]); expect(instanceControlPlaneCoordinator.activeOperations).toBe(1);
+  } finally { held.resolve(); await writer; await f.close(); }
+});
+
+test('barrier control refuses uninitialized, undispatched and already-applying restore cancellation', () => {
+  const job = { id: 'barrier-job', userId: 'owner', operation: 'restore', status: 'queued', phase: 'queued' };
+  let reads = 0;
+  const manager = new InstanceBackupManager({ dataDir: '/unused-barrier-control', docker: {} as any,
+    backupManager: {} as any, store: { getJob: () => { reads++; return { ...job }; } } as any });
+  const release = beginInstanceRestore(job.id);
+  try {
+    expect(manager.barrierControlJob(job.id, 'owner', true)).toBeUndefined(); expect(reads).toBe(0);
+    (manager as any).initializationComplete = true;
+    expect(() => manager.barrierControlJob(job.id, 'owner', true)).toThrow('cannot currently be cancelled');
+    const controller = new AbortController(); (manager as any).controllers.set(job.id, controller);
+    job.status = 'running'; job.phase = 'applying';
+    expect(() => manager.barrierControlJob(job.id, 'owner', true)).toThrow('cannot currently be cancelled');
+    expect(controller.signal.aborted).toBe(false);
+  } finally { release(); }
+});
+
+test('post-drain workload preflight can veto snapshots after an admitted writer changes state', async () => {
+  const f = await drainManagerFixture(), held = heldOperation(); let workload = false;
+  (f.manager as any).preflightCreate = async () => {
+    f.calls.push('preflight'); if (workload) throw new Error('New workload requires quiescence');
+  };
+  const writer = instanceControlPlaneCoordinator.run(async () => { await held.promise; workload = true; });
+  try {
+    const job = await f.manager.create('owner', 'fake'); await expect.poll(instanceSnapshotActive).toBe(true);
+    held.resolve(); await writer;
+    expect((await settled(f.manager, job.id)).status).toBe('failed');
+    expect(f.calls).toEqual(['preflight']);
+  } finally { held.resolve(); await writer; await f.close(); }
+});
+
+test('snapshot drain dispatches an admitted ordinary instance job queued behind itself without self-deadlock', async () => {
+  const f = await drainManagerFixture(), continueRequest = heldOperation(), accepted = heldOperation();
+  let snapshotId!: string, childId!: string;
+  const request = instanceControlPlaneCoordinator.run(async () => {
+    snapshotId = (await f.manager.create('owner', 'fake')).id;
+    accepted.resolve(); await continueRequest.promise;
+    childId = (await f.manager.discover('owner', 'fake')).id;
+    f.calls.push('accepting-request-finished');
+  });
+  try {
+    await accepted.promise; await expect.poll(instanceSnapshotActive).toBe(true);
+    continueRequest.resolve(); await request;
+    expect((await settled(f.manager, childId)).status).toBe('succeeded');
+    await settled(f.manager, snapshotId);
+    expect(f.calls).toEqual(['accepting-request-finished', 'preflight', 'snapshot']);
+  } finally { continueRequest.resolve(); await request; await f.close(); }
+});
 
 /** Execute the real module and constructor-selected default preflight in an
  * isolated CommonJS transform. Every service import is a safe mock; no Nitro
@@ -49,7 +190,7 @@ async function defaultPreflightFixture(active = "") {
       useWorkerStore: () => ({ hasUnavailableOwners: () => workerUnavailable,
         list: () => { calls.push('unsafe-worker-list'); return []; },
         listUserIds: () => { calls.push('strict-worker-list'); return []; } }),
-      useStorageManager: () => ({ init: async () => {}, mode: 'volume' }),
+      useStorageManager: () => ({ assertInitializedForInstanceSnapshot() {}, mode: 'volume' }),
       useContainerManager: () => ({
         list: () => active === "worker" ? [{ status: "running" }] : [],
         hasPendingRuntimeMigrations: async () => { calls.push("migration"); return active === "migration"; },
@@ -58,6 +199,7 @@ async function defaultPreflightFixture(active = "") {
       useExportJobManager: () => operation("export"),
       useUsageChecker: () => operation("usage"),
       useOrphanSweeper: () => operation("orphan"),
+      useUpdateChecker: () => operation("update"),
     },
     "./admin-workspace-store": { useAdminWorkspaceStore: () => ({ getRecord: () => undefined }) },
     "./backup-manager": { useBackupManager: () => backup },
@@ -104,10 +246,10 @@ test('production backup inventory rejects a worker owner becoming unavailable af
 test("default instance preflight resolves managed-volume binding and visits every quiescence guard", async () => {
   const fixture = await defaultPreflightFixture();
   await expect(fixture.run()).resolves.toBeUndefined();
-  expect(fixture.calls).toEqual(["migration", "backup", "managed-volume", "sizing", "portable", "export", "image", "usage", "orphan"]);
+  expect(fixture.calls).toEqual(["migration", "backup", "managed-volume", "sizing", "portable", "export", "image", "usage", "orphan", "update"]);
 });
 
-for (const active of ["managed-volume", "orphan"]) {
+for (const active of ["managed-volume", "orphan", "update"]) {
   test(`default instance preflight rejects active ${active} operations`, async () => {
     const fixture = await defaultPreflightFixture(active);
     await expect(fixture.run()).rejects.toMatchObject({ code: "INSTANCE_BACKUP_JOBS_ACTIVE", statusCode: 409 });
@@ -529,13 +671,11 @@ test("the control-plane snapshot write barrier is exclusive and releases idempot
     /another instance control-plane recovery operation is already active/i,
   );
 
-  // Reentry by the same durable operation is safe and neither release callback
-  // can clear a future operation after its ownership changed.
-  const releaseSame = beginInstanceSnapshot("snapshot-job-1");
+  // A durable job ID is not ownership of another live acquisition.
+  expect(() => beginInstanceSnapshot("snapshot-job-1")).toThrow();
   release();
   expect(instanceSnapshotActive()).toBe(false);
-  releaseSame();
-  releaseSame();
+  release();
   expect(instanceSnapshotActive()).toBe(false);
 
   const releaseNext = beginInstanceSnapshot("snapshot-job-2");
@@ -625,6 +765,7 @@ test("restore acceptance holds the mutation barrier until cancellation has unwou
     store,
     backupManager: {
       instanceBackupProvider: () => undefined,
+      prepareInstanceRecoveryMaterial: async () => {},
     } as unknown as BackupManager,
   });
   (manager as any).runRestore = async (
@@ -664,6 +805,68 @@ test("restore acceptance holds the mutation barrier until cancellation has unwou
       .toBe(false);
   } finally {
     manager.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('real restore drain waits for its accepting request and nested final audit before staging and authentication', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agentor-instance-restore-drain-'));
+  const store = new InstanceBackupStore(root), held = heldOperation(), accepted = heldOperation();
+  const events: string[] = [], artifactId = 'restore-drain-artifact';
+  const stamp = new Date().toISOString(), input = join(root, 'fixture-input');
+  const artifactPath = join(root, 'instance-backup-artifacts', `${artifactId}.backup`);
+  await store.init(); await mkdir(join(root, 'instance-backup-artifacts'), { recursive: true });
+  await writeFile(input, 'offline fixture, deliberately never decrypted');
+  const encrypted = await encryptInstanceBackup(input, artifactPath, Buffer.alloc(32, 43).toString('base64'), {
+    backupId: artifactId, sourceInstallationId: 'source-installation', createdAt: stamp, formatVersion: 1,
+  });
+  await store.saveArtifact({
+    schemaVersion: 1, id: artifactId, userId: 'owner', provider: 'local', providerObjectId: artifactId,
+    createdAt: stamp, size: encrypted.size, sha256: encrypted.sha256, keyFingerprint: encrypted.header.keyFingerprint,
+    sourceInstallationId: 'source-installation', formatVersion: 1, integrityStatus: 'verified', provenance: 'local',
+    // Acceptance requires a retained manifest, but the deliberate missing-key
+    // boundary stops this real execution before decrypt/preflight/helper work.
+    manifest: { kind: 'agentor-instance-backup', formatVersion: 1, backupId: artifactId,
+      sourceInstallationId: 'source-installation', createdByUserId: 'source-owner', createdAt: stamp, volumes: [] } as any,
+  });
+  const manager = new InstanceBackupManager({ dataDir: root, store, controlPlaneDrainTimeoutMs: 2000,
+    backupManager: { prepareInstanceRecoveryMaterial: async () => {
+      expect(instanceSnapshotActive()).toBe(false);
+    }, resolveInstanceRecoveryMaterialForRestore: async () => {
+      events.push('post-drain-authentication');
+      expect(instanceControlPlaneCoordinator.activeOperations).toBe(0);
+      return undefined;
+    } } as unknown as BackupManager,
+  });
+  await manager.init();
+  let id!: string;
+  const request = instanceControlPlaneCoordinator.run(async () => {
+    id = (await manager.restore('owner', artifactId, {
+      confirmReplaceControlPlane: true, confirmExternalDependencies: true,
+    }, 'restore-drain-request')).id;
+    events.push('accepted'); accepted.resolve(); await held.promise;
+    await instanceControlPlaneCoordinator.run(async () => {
+      await writeFile(join(root, 'final-audit-marker'), 'complete');
+      events.push('final-audit');
+    });
+  });
+  try {
+    await accepted.promise;
+    await expect.poll(() => (manager as any).controllers.has(id)).toBe(true);
+    expect(instanceSnapshotActive()).toBe(true);
+    expect(events).toEqual(['accepted']);
+    await expect(stat(join(root, 'instance-restore-staging', `restore-${id}`))).rejects.toMatchObject({ code: 'ENOENT' });
+    held.resolve(); await request;
+    const result = await settled(manager, id);
+    expect(result).toMatchObject({ status: 'failed', errorCode: 'INSTANCE_BACKUP_KEY_MISSING' });
+    expect(events).toEqual(['accepted', 'final-audit', 'post-drain-authentication']);
+    expect(await readFile(join(root, 'final-audit-marker'), 'utf8')).toBe('complete');
+    await expect.poll(instanceSnapshotActive).toBe(false);
+    await expect(stat(join(root, 'instance-restore-staging', `restore-${id}`))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await stat(artifactPath)).size).toBe(encrypted.size);
+  } finally {
+    held.resolve(); await request; manager.stop();
+    await Promise.allSettled([...(manager as any).tasks.values()] as Promise<void>[]);
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -731,11 +934,14 @@ test("restore failures and cancellation remove plaintext staging but retain the 
       dataDir: root,
       store,
       backupManager: {
-        resolveInstanceRecoveryMaterial: async () => undefined,
+        resolveInstanceRecoveryMaterialForRestore: async () => undefined,
       } as unknown as BackupManager,
     });
     const missingKeyJob = job("restore-cleanup-missing-key");
     await store.saveJob(missingKeyJob);
+    const missingKeyBarrier = beginInstanceRestore(missingKeyJob.id);
+    (missingKeyManager as any).restoreBarriers.set(missingKeyJob.id, missingKeyBarrier);
+    try {
     await expect(
       (missingKeyManager as any).runRestore(
         missingKeyJob,
@@ -744,6 +950,7 @@ test("restore failures and cancellation remove plaintext staging but retain the 
         new AbortController().signal,
       ),
     ).rejects.toThrow(/recovery key is unavailable/i);
+    } finally { missingKeyBarrier(); }
     await expect(
       stat(join(root, "instance-restore-staging", `restore-${missingKeyJob.id}`)),
     ).rejects.toMatchObject({ code: "ENOENT" });
@@ -752,7 +959,7 @@ test("restore failures and cancellation remove plaintext staging but retain the 
       dataDir: root,
       store,
       backupManager: {
-        resolveInstanceRecoveryMaterial: async () => ({
+        resolveInstanceRecoveryMaterialForRestore: async () => ({
           fingerprint: encrypted.header.keyFingerprint,
           material: recoveryMaterial,
         }),
@@ -762,6 +969,9 @@ test("restore failures and cancellation remove plaintext staging but retain the 
     await store.saveJob(cancelledJob);
     const abort = new AbortController();
     abort.abort();
+    const cancelledBarrier = beginInstanceRestore(cancelledJob.id);
+    (cancelledManager as any).restoreBarriers.set(cancelledJob.id, cancelledBarrier);
+    try {
     await expect(
       (cancelledManager as any).runRestore(
         cancelledJob,
@@ -770,6 +980,7 @@ test("restore failures and cancellation remove plaintext staging but retain the 
         abort.signal,
       ),
     ).rejects.toMatchObject({ name: "AbortError" });
+    } finally { cancelledBarrier(); }
     await expect(
       stat(join(root, "instance-restore-staging", `restore-${cancelledJob.id}`)),
     ).rejects.toMatchObject({ code: "ENOENT" });

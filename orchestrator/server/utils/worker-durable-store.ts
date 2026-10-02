@@ -3,6 +3,7 @@ import { mkdir, open, readdir, rename, unlink, type FileHandle } from 'node:fs/p
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { assertSafeUserId, isSafeUserId } from './user-id';
+import { instanceControlPlaneCoordinator } from './instance-snapshot-gate';
 
 type WorkerFile = Pick<FileHandle, 'writeFile' | 'sync' | 'close'>;
 /** Trusted test injection only, never populated by an API request. */
@@ -49,6 +50,11 @@ export class WorkerDurableStore<V extends { id: string; userId: string }> {
   }
   private file(userId: string) { assertSafeUserId(userId); return join(this.dataDir, 'users', userId, filename); }
   private queue<T>(userId: string, operation: () => Promise<T>, allowCorruptDeletion = false): Promise<T> {
+    // Admission precedes queue insertion and draft publication. Existing
+    // admitted queues may finish through a closed snapshot barrier.
+    return instanceControlPlaneCoordinator.run(() => this.admittedQueue(userId, operation, allowCorruptDeletion));
+  }
+  private admittedQueue<T>(userId: string, operation: () => Promise<T>, allowCorruptDeletion: boolean): Promise<T> {
     assertSafeUserId(userId);
     const next = (this.queues.get(userId) ?? Promise.resolve()).then(() => {
       this.assertAvailable(userId, allowCorruptDeletion);
@@ -58,6 +64,9 @@ export class WorkerDurableStore<V extends { id: string; userId: string }> {
     return next;
   }
   async init(): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.loadAllOwners());
+  }
+  private async loadAllOwners(): Promise<void> {
     let owners: string[];
     try { owners = await readdir(join(this.dataDir, 'users')); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }

@@ -11,6 +11,7 @@ import { UserScopedJsonStore } from "./user-scoped-store";
 import type { WorkerGroupStore } from "./worker-group-store";
 import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 import type { WorkerStore } from "./worker-store";
+import { instanceControlPlaneCoordinator } from "./instance-snapshot-gate";
 
 const PLATFORM_FILE = "admin/host-mount-paths.v1.json";
 const PROTECTED_HOST_PATHS = [
@@ -126,7 +127,11 @@ export class HostMountStore extends UserScopedJsonStore<string, HostMountGrant> 
   }
 
   override async init() {
-    await Promise.all([super.init(), this.loadCatalog()]);
+    return instanceControlPlaneCoordinator.run(async () => {
+      // A failed catalog load must not retire the still-running owner loads.
+      const results = await Promise.allSettled([super.init(), this.loadCatalog()]);
+      for (const result of results) if (result.status === "rejected") throw result.reason;
+    });
   }
 
   listCatalog() {
@@ -208,6 +213,10 @@ export class HostMountStore extends UserScopedJsonStore<string, HostMountGrant> 
   }
 
   async deletePath(pathId: string): Promise<HostMountRevocation> {
+    return instanceControlPlaneCoordinator.run(() => this.deleteAdmittedPath(pathId));
+  }
+
+  private async deleteAdmittedPath(pathId: string): Promise<HostMountRevocation> {
     if (!this.getPath(pathId)) throw statusError(404, "Approved host path not found");
     await this.mutateCatalog((catalog) => catalog.delete(pathId));
     const removed = this.list().filter((grant) => grant.pathId === pathId);
@@ -617,6 +626,10 @@ export class HostMountStore extends UserScopedJsonStore<string, HostMountGrant> 
   }
 
   private mutateCatalog(operation: (catalog: Map<string, HostMountPath>) => void) {
+    return instanceControlPlaneCoordinator.run(() => this.mutateAdmittedCatalog(operation));
+  }
+
+  private mutateAdmittedCatalog(operation: (catalog: Map<string, HostMountPath>) => void) {
     const result = this.catalogWrites.then(async () => {
       this.assertCatalogAvailable();
       const previous = this.catalog;

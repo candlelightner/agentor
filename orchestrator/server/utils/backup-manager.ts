@@ -99,13 +99,15 @@ import {
 } from "./plugin-portability";
 import { snapshotWorkerReconstruction } from "./worker-reconstruction";
 import { resolveWorkerReconstruction } from "./worker-reconstruction";
-import { withOperationDeadline } from "./operation-deadline";
+import { withOperationDeadline, operationSettlement, type OperationFailureWithSettlement } from "./operation-deadline";
+import { withInstanceOperationDeadline } from "./instance-operation-deadline";
+import { consumeWorkerExport } from "./worker-export-consumer";
 
 const BACKUP_HELPER_DOCKER_TIMEOUT_MS = 30_000;
 import { readPortablePluginConfiguration } from "./plugin-portability";
 import { backupInstallationId } from "./backup-installation";
 import { pluginDefinitionHash } from "./plugin-manifest";
-import { instanceSnapshotActive } from "./instance-snapshot-gate";
+import { instanceMutationBlocked, instanceControlPlaneCoordinator } from "./instance-snapshot-gate";
 import { withOwnerWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
 import type { RuntimeRestoreAuthorization } from './worker-runtime-admin';
 
@@ -125,6 +127,7 @@ interface BackupQueueEntry {
   ownerId: string;
   task: () => Promise<void>;
   cancel?: (error: Error) => void;
+  lifetime: ReturnType<typeof instanceControlPlaneCoordinator.fork>;
 }
 
 export class BackupManager {
@@ -132,6 +135,7 @@ export class BackupManager {
   private store: BackupStore;
   private keyring: BackupKeyring;
   private initialized?: Promise<void>;
+  private initializationComplete = false;
   private scheduleTimer?: NodeJS.Timeout;
   private active = 0;
   private pending: BackupQueueEntry[] = [];
@@ -224,7 +228,17 @@ export class BackupManager {
     this.pathPersistence = adapter;
   }
   init() {
-    return (this.initialized ??= this.initialize());
+    return instanceControlPlaneCoordinator.run(() => (this.initialized ??= this.initialize().then(() => {
+      this.initializationComplete = true;
+    })));
+  }
+  /** Excluded instance jobs may inspect only previously initialized state. */
+  assertInitializedForInstanceSnapshot(): void {
+    if (!this.initializationComplete)
+      throw Object.assign(new Error('Backup manager is not initialized for instance recovery'), {
+        statusCode: 503, code: 'INSTANCE_SNAPSHOT_BACKUP_MANAGER_UNAVAILABLE',
+      });
+    this.store.assertInitializedForInstanceSnapshot();
   }
   private assertOwnerAvailable(userId: string): void {
     if (!this.forgottenUsers.has(userId)) return;
@@ -282,16 +296,21 @@ export class BackupManager {
           });
         }
     await this.retryPendingProviderDeletes();
+    // stop() may race asynchronous recovery. Never resurrect its scheduler.
+    if (!this.accepting) return;
     this.scheduleTimer = setInterval(() => this.triggerScheduleTick(), 60_000);
     this.scheduleTimer.unref?.();
     setImmediate(() => this.triggerScheduleTick());
   }
   async getConfig(userId: string) {
+    return instanceControlPlaneCoordinator.run(() => this.getConfigAdmitted(userId));
+  }
+  private async getConfigAdmitted(userId: string) {
     await this.init();
     return this.store.get(userId).config;
   }
   async hasActiveOperationsForInstanceSnapshot(): Promise<boolean> {
-    await this.init();
+    this.assertInitializedForInstanceSnapshot();
     return (
       this.active > 0 ||
       this.pending.length > 0 ||
@@ -311,6 +330,9 @@ export class BackupManager {
     return this.store.userIds();
   }
   async forgetUser(userId: string) {
+    return instanceControlPlaneCoordinator.run(() => this.forgetUserAdmitted(userId));
+  }
+  private async forgetUserAdmitted(userId: string) {
     await this.init();
     this.forgottenUsers.add(userId);
     const activeJobIds = this.store
@@ -423,6 +445,24 @@ export class BackupManager {
       >
     >,
   ) {
+    return instanceControlPlaneCoordinator.run(() => this.setConfigAdmitted(userId, input));
+  }
+  private async setConfigAdmitted(
+    userId: string,
+    input: Partial<
+      Pick<
+        BackupConfig,
+        | "provider"
+        | "enabled"
+        | "intervalMinutes"
+        | "retentionCount"
+        | "selectedWorkspaceIds"
+        | "selectedPathsByWorkspace"
+        | "persistSelectedDirectories"
+        | "includeManagedVolumes"
+      >
+    >,
+  ) {
     await this.init();
     this.assertOwnerAvailable(userId);
     if (input.persistSelectedDirectories !== undefined && typeof input.persistSelectedDirectories !== "boolean")
@@ -498,9 +538,24 @@ export class BackupManager {
     return sanitizeConfig(config);
   }
   async create(userId: string, workspaceId: string, includeManagedVolumes = false) {
+    return instanceControlPlaneCoordinator.run(() => this.createAdmitted(userId, workspaceId, includeManagedVolumes));
+  }
+  private async createAdmitted(userId: string, workspaceId: string, includeManagedVolumes = false) {
     return this.createMany(userId, [workspaceId], undefined, 1, 0, undefined, undefined, includeManagedVolumes);
   }
   async createMany(
+    userId: string,
+    workspaceIds: string[],
+    providerOverride?: BackupProviderKind,
+    attempt = 1,
+    resumed = 0,
+    selectedPathsByWorkspace?: Record<string, string[]>,
+    requestId?: string,
+    includeManagedVolumes = false,
+  ): Promise<BackupJob> {
+    return instanceControlPlaneCoordinator.run(() => this.createManyAdmitted(userId, workspaceIds, providerOverride, attempt, resumed, selectedPathsByWorkspace, requestId, includeManagedVolumes));
+  }
+  private async createManyAdmitted(
     userId: string,
     workspaceIds: string[],
     providerOverride?: BackupProviderKind,
@@ -603,11 +658,17 @@ export class BackupManager {
     return sanitizeJob(job);
   }
   async getJob(id: string) {
+    return instanceControlPlaneCoordinator.run(() => this.getJobAdmitted(id));
+  }
+  private async getJobAdmitted(id: string) {
     await this.init();
     const job = this.store.findJob(id);
     return job ? sanitizeJob(job) : undefined;
   }
   async getJobLogs(id: string, after = 0, limit = 100) {
+    return instanceControlPlaneCoordinator.run(() => this.getJobLogsAdmitted(id, after, limit));
+  }
+  private async getJobLogsAdmitted(id: string, after = 0, limit = 100) {
     await this.init();
     const job = this.store.findJob(id);
     if (!job) return undefined;
@@ -626,6 +687,9 @@ export class BackupManager {
     };
   }
   async getArtifact(id: string) {
+    return instanceControlPlaneCoordinator.run(() => this.getArtifactAdmitted(id));
+  }
+  private async getArtifactAdmitted(id: string) {
     await this.init();
     return this.store.findArtifact(id);
   }
@@ -674,6 +738,9 @@ export class BackupManager {
       : providers;
   }
   async disconnectGoogle(userId: string) {
+    return instanceControlPlaneCoordinator.run(() => this.disconnectGoogleAdmitted(userId));
+  }
+  private async disconnectGoogleAdmitted(userId: string) {
     await this.init();
     this.assertOwnerAvailable(userId);
     await this.store.update(userId, (data) => {
@@ -685,6 +752,9 @@ export class BackupManager {
     });
   }
   async retry(job: BackupJob) {
+    return instanceControlPlaneCoordinator.run(() => this.retryAdmitted(job));
+  }
+  private async retryAdmitted(job: BackupJob) {
     await this.init();
     this.assertOwnerAvailable(job.userId);
     const current = this.store.findJob(job.id);
@@ -791,6 +861,9 @@ export class BackupManager {
     }
   }
   async cancel(job: BackupJob) {
+    return instanceControlPlaneCoordinator.run(() => this.cancelAdmitted(job));
+  }
+  private async cancelAdmitted(job: BackupJob) {
     await this.init();
     this.assertOwnerAvailable(job.userId);
     const current = this.store.findJob(job.id);
@@ -841,6 +914,9 @@ export class BackupManager {
     );
   }
   async list(userId: string) {
+    return instanceControlPlaneCoordinator.run(() => this.listAdmitted(userId));
+  }
+  private async listAdmitted(userId: string) {
     await this.init();
     const d = this.store.get(userId);
     return {
@@ -854,6 +930,9 @@ export class BackupManager {
   }
 
   async recoveryKeyStatus(userId: string) {
+    return instanceControlPlaneCoordinator.run(() => this.recoveryKeyStatusAdmitted(userId));
+  }
+  private async recoveryKeyStatusAdmitted(userId: string) {
     await this.init();
     this.assertOwnerAvailable(userId);
     const keys = await this.keyring.status(userId);
@@ -865,6 +944,9 @@ export class BackupManager {
   }
 
   async importRecoveryKit(userId: string, material: unknown) {
+    return instanceControlPlaneCoordinator.run(() => this.importRecoveryKitAdmitted(userId, material));
+  }
+  private async importRecoveryKitAdmitted(userId: string, material: unknown) {
     await this.init();
     this.assertOwnerAvailable(userId);
     const imported = await this.keyring.importKit(userId, material);
@@ -884,6 +966,9 @@ export class BackupManager {
   }
 
   async exportRecoveryKit(userId: string, fingerprint?: string) {
+    return instanceControlPlaneCoordinator.run(() => this.exportRecoveryKitAdmitted(userId, fingerprint));
+  }
+  private async exportRecoveryKitAdmitted(userId: string, fingerprint?: string) {
     await this.init();
     this.assertOwnerAvailable(userId);
     return this.keyring.exportKit(userId, fingerprint);
@@ -893,6 +978,12 @@ export class BackupManager {
    * material must never be returned by an HTTP or MCP status tool. Keeping the
    * lookup on this manager also avoids two keyring instances racing writes. */
   async resolveInstanceRecoveryMaterial(
+    userId: string,
+    fingerprint?: string,
+  ): Promise<{ fingerprint: string; material: string } | undefined> {
+    return instanceControlPlaneCoordinator.run(() => this.resolveInstanceRecoveryMaterialAdmitted(userId, fingerprint));
+  }
+  private async resolveInstanceRecoveryMaterialAdmitted(
     userId: string,
     fingerprint?: string,
   ): Promise<{ fingerprint: string; material: string } | undefined> {
@@ -911,7 +1002,31 @@ export class BackupManager {
     return this.providers.get(kind);
   }
 
+  /** Prepare permission-normalizing keyring initialization BEFORE accepting
+   * the restore barrier. Does not create an owner key or export material. */
+  async prepareInstanceRecoveryMaterial(): Promise<void> {
+    return instanceControlPlaneCoordinator.run(async () => {
+      await this.init();
+      await this.keyring.init();
+    });
+  }
+
+  /** Nonwriting lookup used only by the excluded, drained restore job. No lazy
+   * initialization, key creation, permission normalization or admission bypass. */
+  async resolveInstanceRecoveryMaterialForRestore(
+    userId: string,
+    fingerprint: string,
+  ): Promise<{ fingerprint: string; material: string } | undefined> {
+    this.assertInitializedForInstanceSnapshot();
+    this.assertOwnerAvailable(userId);
+    const material = await this.keyring.findForInstanceRestore(userId, fingerprint);
+    return material ? { fingerprint, material } : undefined;
+  }
+
   async listRemoteBackups(userId: string) {
+    return instanceControlPlaneCoordinator.run(() => this.listRemoteBackupsAdmitted(userId));
+  }
+  private async listRemoteBackupsAdmitted(userId: string) {
     await this.init();
     this.assertOwnerAvailable(userId);
     return Promise.all(
@@ -922,6 +1037,9 @@ export class BackupManager {
   }
 
   async getRemoteBackup(id: string) {
+    return instanceControlPlaneCoordinator.run(() => this.getRemoteBackupAdmitted(id));
+  }
+  private async getRemoteBackupAdmitted(id: string) {
     await this.init();
     for (const userId of this.store.userIds()) {
       const record = this.store
@@ -932,6 +1050,13 @@ export class BackupManager {
   }
 
   async createDiscovery(
+    userId: string,
+    providerOverride?: BackupProviderKind,
+    requestId?: string,
+  ): Promise<BackupJob> {
+    return instanceControlPlaneCoordinator.run(() => this.createDiscoveryAdmitted(userId, providerOverride, requestId));
+  }
+  private async createDiscoveryAdmitted(
     userId: string,
     providerOverride?: BackupProviderKind,
     requestId?: string,
@@ -980,6 +1105,13 @@ export class BackupManager {
   }
 
   async createAdoption(
+    userId: string,
+    remoteBackupId: string,
+    requestId?: string,
+  ): Promise<BackupJob> {
+    return instanceControlPlaneCoordinator.run(() => this.createAdoptionAdmitted(userId, remoteBackupId, requestId));
+  }
+  private async createAdoptionAdmitted(
     userId: string,
     remoteBackupId: string,
     requestId?: string,
@@ -1072,6 +1204,15 @@ export class BackupManager {
    * already retained artifact.  Context bytes deliberately remain inside the
    * encrypted archive; the durable job records only catalog/build identities. */
   async createImageRecovery(
+    userId: string,
+    artifactId: string,
+    workspaceId: string,
+    requestId?: string,
+    startBuild = true,
+  ): Promise<BackupJob> {
+    return instanceControlPlaneCoordinator.run(() => this.createImageRecoveryAdmitted(userId, artifactId, workspaceId, requestId, startBuild));
+  }
+  private async createImageRecoveryAdmitted(
     userId: string,
     artifactId: string,
     workspaceId: string,
@@ -2239,6 +2380,16 @@ export class BackupManager {
     selectedWorkspaceIds?: string[],
     runtimeAuthorization?: RuntimeRestoreAuthorization,
   ) {
+    return instanceControlPlaneCoordinator.run(() => this.restoreAdmitted(userId, artifact, mode, displayName, selectedWorkspaceIds, runtimeAuthorization));
+  }
+  private async restoreAdmitted(
+    userId: string,
+    artifact: BackupArtifact,
+    mode: "new" | "original",
+    displayName?: string,
+    selectedWorkspaceIds?: string[],
+    runtimeAuthorization?: RuntimeRestoreAuthorization,
+  ) {
     await this.init();
     this.assertOwnerAvailable(userId);
     const currentArtifact = this.store.findArtifact(artifact.id);
@@ -2342,6 +2493,19 @@ export class BackupManager {
     }
   }
   async createRestore(
+    userId: string,
+    artifact: BackupArtifact,
+    target: "new" | "original",
+    displayName?: string,
+    lockPassword?: unknown,
+    selectedWorkspaceIds?: string[],
+    requestId?: string,
+    imageResolutions?: Record<string, BackupImageResolution>,
+    runtimeAuthorization?: RuntimeRestoreAuthorization,
+  ): Promise<BackupJob> {
+    return instanceControlPlaneCoordinator.run(() => this.createRestoreAdmitted(userId, artifact, target, displayName, lockPassword, selectedWorkspaceIds, requestId, imageResolutions, runtimeAuthorization));
+  }
+  private async createRestoreAdmitted(
     userId: string,
     artifact: BackupArtifact,
     target: "new" | "original",
@@ -2540,7 +2704,7 @@ export class BackupManager {
     includeManagedVolumes = false,
   ) {
     return withOwnerWorkerLifecycleMutation(userId, id, async () => {
-      if (instanceSnapshotActive())
+      if (instanceMutationBlocked())
         throw Object.assign(
           new Error("Portable backup capture is unavailable during instance backup or restore."),
           { statusCode: 409, code: "INSTANCE_CONTROL_PLANE_BARRIER_ACTIVE" },
@@ -2589,11 +2753,7 @@ export class BackupManager {
         includeAgents,
         signal,
       });
-      await pipeline(
-        result.stream,
-        createWriteStream(destination, { mode: 0o600 }),
-        { signal },
-      );
+      await consumeWorkerExport(result, () => createWriteStream(destination, { mode: 0o600 }), signal);
       if (explicitPaths.length)
         await this.appendExplicitBackupPaths(destination, live.containerId, explicitPaths, signal);
       return;
@@ -3546,6 +3706,9 @@ export class BackupManager {
     }
   }
   async deleteArtifact(artifact: BackupArtifact) {
+    return instanceControlPlaneCoordinator.run(() => this.deleteArtifactAdmitted(artifact));
+  }
+  private async deleteArtifactAdmitted(artifact: BackupArtifact) {
     await this.init();
     this.assertOwnerAvailable(artifact.userId);
     const currentArtifact = this.store.findArtifact(artifact.id);
@@ -3599,6 +3762,13 @@ export class BackupManager {
     clientId: string,
     redirectUri: string,
   ) {
+    return instanceControlPlaneCoordinator.run(() => this.beginGoogleOAuthAdmitted(userId, clientId, redirectUri));
+  }
+  private async beginGoogleOAuthAdmitted(
+    userId: string,
+    clientId: string,
+    redirectUri: string,
+  ) {
     await this.init();
     this.assertOwnerAvailable(userId);
     const state = randomBytes(32).toString("base64url");
@@ -3629,6 +3799,9 @@ export class BackupManager {
     return { state };
   }
   async completeGoogleOAuth(userId: string, state: string, code: string) {
+    return instanceControlPlaneCoordinator.run(() => this.completeGoogleOAuthAdmitted(userId, state, code));
+  }
+  private async completeGoogleOAuthAdmitted(userId: string, state: string, code: string) {
     await this.init();
     this.assertOwnerAvailable(userId);
     const data = this.store.get(userId);
@@ -3745,7 +3918,7 @@ export class BackupManager {
         includeManagedVolumes: job.includeManagedVolumes,
       });
       const plain = join(dir, "worker.tar");
-      await pipeline(bundle.stream, createWriteStream(plain, { mode: 0o600 }));
+      await consumeWorkerExport(bundle, () => createWriteStream(plain, { mode: 0o600 }));
       job.phase = "encrypting";
       job.progress = 35;
       await this.saveJob(job);
@@ -4142,16 +4315,18 @@ export class BackupManager {
   }
 
   private triggerScheduleTick(): void {
-    if (this.tickInFlight || instanceSnapshotActive()) return;
-    this.tickInFlight = this.tickSchedules()
-      .catch((error) => {
-        useLogger().error(
-          `[backup] schedule tick failed: ${error instanceof Error ? error.message : error}`,
-        );
-      })
-      .finally(() => {
+    if (!this.accepting || this.tickInFlight || instanceMutationBlocked()) return;
+    this.tickInFlight = instanceControlPlaneCoordinator.run(async () => {
+      // Install tickInFlight before synchronous failure/cleanup can clear it.
+      await Promise.resolve();
+      try { await this.tickSchedules(); }
+      catch (error) {
+        useLogger().error(`[backup] schedule tick failed: ${error instanceof Error ? error.message : error}`);
+        await Promise.resolve((error as OperationFailureWithSettlement)?.[operationSettlement]).catch(() => undefined);
+      } finally {
         this.tickInFlight = undefined;
-      });
+      }
+    });
   }
 
   private async commitCompletedBackup(
@@ -4305,37 +4480,17 @@ export class BackupManager {
     label: string,
     operation: (signal: AbortSignal) => Promise<void>,
   ): Promise<void> {
-    const controller = new AbortController();
-    let deadlineExceeded = false;
-    let timer: NodeJS.Timeout | undefined;
     try {
-      const running = operation(controller.signal).catch((error) => {
-        // Once the deadline owns the public result, keep the provider
-        // rejection observed without allowing it to replace the structured
-        // timeout or become an unhandled rejection.
-        if (deadlineExceeded) return new Promise<void>(() => {});
-        throw error;
+      await withInstanceOperationDeadline(instanceControlPlaneCoordinator,
+        operation, this.providerCleanupTimeoutMs, label);
+    } catch (error) {
+      if ((error as any)?.code !== 'DOCKER_OPERATION_TIMEOUT') throw error;
+      // Preserve the public provider error while the separately admitted child
+      // owns actual cleanup, including late writes after a caught deadline.
+      throw Object.assign(new Error(`${label} exceeded the cleanup deadline`), {
+        code: 'BACKUP_PROVIDER_CLEANUP_TIMEOUT',
+        [operationSettlement]: (error as OperationFailureWithSettlement)[operationSettlement],
       });
-      await Promise.race([
-        running,
-        new Promise<void>((_resolve, reject) => {
-          timer = setTimeout(
-            () => {
-              deadlineExceeded = true;
-              const error = Object.assign(
-                new Error(`${label} exceeded the cleanup deadline`),
-                { code: "BACKUP_PROVIDER_CLEANUP_TIMEOUT" },
-              );
-              reject(error);
-              controller.abort(error);
-            },
-            this.providerCleanupTimeoutMs,
-          );
-          timer.unref?.();
-        }),
-      ]);
-    } finally {
-      if (timer) clearTimeout(timer);
     }
   }
   private async recordAttempt(userId: string) {
@@ -4347,7 +4502,8 @@ export class BackupManager {
   }
   private enqueue(jobId: string, ownerId: string, task: () => Promise<void>) {
     if (!this.accepting) throw new Error("Backup manager is shutting down");
-    this.pending.push({ jobId, ownerId, task });
+    const lifetime = instanceControlPlaneCoordinator.fork();
+    this.pending.push({ jobId, ownerId, task, lifetime });
     this.pump();
   }
   private enqueueAndWait<T>(
@@ -4358,15 +4514,20 @@ export class BackupManager {
     if (!this.accepting)
       return Promise.reject(new Error("Backup manager is shutting down"));
     return new Promise<T>((resolve, reject) => {
+      const lifetime = instanceControlPlaneCoordinator.fork();
       this.pending.push({
         jobId,
         ownerId,
+        lifetime,
         cancel: reject,
         task: async () => {
           try {
             resolve(await task());
           } catch (error) {
             reject(error);
+            // The queue owner must retain exposed late settlement even though
+            // the synchronous caller has already received its failure.
+            throw error;
           }
         },
       });
@@ -4379,7 +4540,10 @@ export class BackupManager {
   ): void {
     const retained: BackupQueueEntry[] = [];
     for (const candidate of this.pending) {
-      if (shouldCancel(candidate)) candidate.cancel?.(error);
+      if (shouldCancel(candidate)) {
+        candidate.cancel?.(error);
+        candidate.lifetime.cancel();
+      }
       else retained.push(candidate);
     }
     this.pending = retained;
@@ -4388,22 +4552,26 @@ export class BackupManager {
     while (this.active < this.maxConcurrent && this.pending.length) {
       const entry = this.pending.shift()!;
       this.active++;
-      const task = Promise.resolve().then(entry.task);
       const ownerTasks = this.activeTasks.get(entry.ownerId) ?? new Set();
-      ownerTasks.add(task);
       this.activeTasks.set(entry.ownerId, ownerTasks);
-      void task
-        .catch((error) => {
+      const task = entry.lifetime.run(async () => {
+        await Promise.resolve();
+        try { await entry.task(); }
+        catch (error) {
           useLogger().error(
             `[backup] queued task ${entry.jobId} failed: ${error instanceof Error ? error.message : error}`,
           );
-        })
-        .finally(() => {
+          await Promise.resolve((error as OperationFailureWithSettlement)?.[operationSettlement]).catch(() => undefined);
+        } finally {
           ownerTasks.delete(task);
           if (!ownerTasks.size) this.activeTasks.delete(entry.ownerId);
           this.active--;
           this.pump();
-        });
+        }
+      });
+      ownerTasks.add(task);
+      // Observes exceptional logger/dispatch failures as well as task errors.
+      void task.catch(() => undefined);
     }
   }
 }
@@ -4413,7 +4581,7 @@ export async function cleanupInterruptedBackupStaging(
   jobId: string,
 ) {
   assertSafeUserId(jobId, "jobId");
-  await Promise.all([
+  const results = await Promise.allSettled([
     rm(join(dataDir, "tmp", `backup-${jobId}`), {
       recursive: true,
       force: true,
@@ -4431,6 +4599,7 @@ export async function cleanupInterruptedBackupStaging(
       force: true,
     }),
   ]);
+  for (const result of results) if (result.status === 'rejected') throw result.reason;
 }
 export async function readInterruptedBackupResume(
   dataDir: string,

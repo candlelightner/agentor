@@ -2,6 +2,8 @@ import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promise
 import { join } from 'node:path';
 import type { BackupArtifact, BackupConfig, BackupJob, RemoteBackupRecord } from './backup-types';
 import { assertSafeUserId, isSafeUserId } from './user-id';
+import { instanceControlPlaneCoordinator } from './instance-snapshot-gate';
+import { operationSettlement, type OperationFailureWithSettlement } from './operation-deadline';
 
 interface UserBackupData { schemaVersion: 1; config?: BackupConfig; jobs: BackupJob[]; artifacts: BackupArtifact[]; remoteBackups: RemoteBackupRecord[] }
 export class BackupStore {
@@ -11,23 +13,31 @@ export class BackupStore {
   private unavailableUsers = new Set<string>();
   private closedUsers = new Set<string>();
   private initialized?: Promise<void>;
+  private initializationComplete = false;
   constructor(private dataDir: string) {}
-  init() { return this.initialized ??= this.load(); }
+  init(): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.initialized ??= this.load().then(() => {
+      this.initializationComplete = true;
+    }));
+  }
+  /** Snapshot/restore must not invoke ordinary initialization under its cut. */
+  assertInitializedForInstanceSnapshot(): void {
+    if (!this.initializationComplete)
+      throw Object.assign(new Error('Backup store is not initialized'), { statusCode: 503 });
+  }
   get(userId: string) { this.assertAvailable(userId); return structuredClone(this.data.get(userId) ?? emptyUserBackupData()); }
   all() { return [...this.data.values()].map((value) => structuredClone(value)); }
   userIds() { return [...new Set([...this.data.keys(), ...this.unavailableUsers])]; }
   async forget(userId: string) {
     assertSafeUserId(userId);
-    const previous = this.queues.get(userId) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(async () => {
+    return instanceControlPlaneCoordinator.run(() => this.queueOwner(userId, async () => {
+      await this.init();
       await rm(join(this.dataDir, 'users', userId, 'backups.json'), { force: true });
       this.data.delete(userId);
       this.unavailableUsers.delete(userId);
       this.closedUsers.add(userId);
       this.revisions.delete(userId);
-    });
-    this.queues.set(userId, next.then(() => undefined, () => undefined));
-    await next;
+    }));
   }
   findJob(id: string) { for (const value of this.data.values()) { const job = value.jobs.find((x) => x.id === id); if (job) return structuredClone(job); } }
   findArtifact(id: string) { for (const value of this.data.values()) { const artifact = value.artifacts.find((x) => x.id === id); if (artifact) return structuredClone(artifact); } }
@@ -93,16 +103,29 @@ export class BackupStore {
     }
   }
   private enqueue<T>(userId: string, operation: (revision: number) => Promise<T>): Promise<T> {
-    const revision = (this.revisions.get(userId) ?? 0) + 1;
-    this.revisions.set(userId, revision);
-    const previous = this.queues.get(userId) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(() => {
-      this.assertAvailable(userId);
-      if (this.closedUsers.has(userId))
-        throw Object.assign(new Error('Backup owner state is closed'), { statusCode: 410 });
-      return operation(revision);
+    return instanceControlPlaneCoordinator.run(() => {
+      const revision = (this.revisions.get(userId) ?? 0) + 1;
+      this.revisions.set(userId, revision);
+      return this.queueOwner(userId, async () => {
+        // Also serialize first load against callers that did not explicitly
+        // initialize: it must never overwrite a write or resurrect a forget.
+        await this.init();
+        this.assertAvailable(userId);
+        if (this.closedUsers.has(userId))
+          throw Object.assign(new Error('Backup owner state is closed'), { statusCode: 410 });
+        return operation(revision);
+      });
     });
-    this.queues.set(userId, next.then(() => undefined, () => undefined));
+  }
+  /** Call only inside an admitted operation, before releasing that lifetime. */
+  private queueOwner<T>(userId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.queues.get(userId) ?? Promise.resolve();
+    const next = previous.then(operation);
+    const tail = next.then(() => undefined, async (error: OperationFailureWithSettlement) => {
+      await Promise.resolve(error?.[operationSettlement]).catch(() => {});
+    });
+    this.queues.set(userId, tail);
+    void tail.then(() => { if (this.queues.get(userId) === tail) this.queues.delete(userId); });
     return next;
   }
   private async persistSnapshot(userId: string, revision: number, snapshot: UserBackupData) { assertSafeUserId(userId); const dir = join(this.dataDir, 'users', userId); await mkdir(dir, { recursive: true, mode: 0o700 }); const target = join(dir, 'backups.json'); const tmp = `${target}.tmp.${process.pid}.${revision}`; await writeFile(tmp, JSON.stringify(snapshot, null, 2), { mode: 0o600 }); await rename(tmp, target); }

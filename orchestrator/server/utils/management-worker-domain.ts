@@ -20,6 +20,7 @@ import { workerGroupsWithMemberCounts, workerGroupWithMemberCounts } from "./wor
 import { isWorkerSelfApiAccess, withEffectiveWorkerSelfApiAccess } from "./worker-self-access";
 import { approveRestoredKataRuntime, authorizeRuntimeSelection, grantLegacyWorkerRuntime, runtimeGrantDependencies, type RuntimeAdministrator } from "./worker-runtime-admin";
 import type { ManagementVolumeAuthority } from "./management-volume-domain";
+import { runManagementOperation } from "./management-control-plane";
 
 /** Runtime authority comes only from the live, server-held MCP identity. */
 export function managementRuntimeAdministrator(authority?: ManagementVolumeAuthority): RuntimeAdministrator {
@@ -404,7 +405,7 @@ function parseWorkerSelfApiAccess(value:unknown){if(value===undefined)return und
 function configInput(value:unknown){const a=value && typeof value==="object"&&!Array.isArray(value)?value as Record<string,unknown>:{};const result:any={};for(const k of ["variables","secrets","secretFiles","envFile","deleteSecrets","deleteSecretFiles"]){if(a[k]!==undefined)result[k]=a[k];}return result;}
 function status(statusCode:number,message:string){return Object.assign(new Error(message),{statusCode});}
 export function managementFailFastTimeoutSeconds(value:unknown){if(value===undefined)return MANAGEMENT_FAIL_FAST_TIMEOUT_DEFAULT_SECONDS;if(!Number.isInteger(value)||(value as number)<1||(value as number)>MANAGEMENT_FAIL_FAST_TIMEOUT_MAX_SECONDS)throw status(400,`timeoutSeconds must be an integer between 1 and ${MANAGEMENT_FAIL_FAST_TIMEOUT_MAX_SECONDS}`);return value as number;}
-export function withinManagementFailFastDeadline<T>(operation:()=>Promise<T>,timeoutSeconds:number,toolName:string):Promise<T>{let timer:ReturnType<typeof setTimeout>|undefined;return new Promise<T>((resolve,reject)=>{timer=setTimeout(()=>reject(status(504,`${toolName} exceeded its ${timeoutSeconds} second server-side deadline`)),timeoutSeconds*1000);timer.unref?.();void operation().then(resolve,reject);}).finally(()=>{if(timer)clearTimeout(timer);});}
+export function withinManagementFailFastDeadline<T>(operation:()=>Promise<T>,timeoutSeconds:number,toolName:string):Promise<T>{let timer:ReturnType<typeof setTimeout>|undefined;return new Promise<T>((resolve,reject)=>{timer=setTimeout(()=>reject(status(504,`${toolName} exceeded its ${timeoutSeconds} second server-side deadline`)),timeoutSeconds*1000);timer.unref?.();void runManagementOperation(operation).then(resolve,reject);}).finally(()=>{if(timer)clearTimeout(timer);});}
 function groupAdminLifecycleTimeoutSeconds(value: unknown) {
   if (value === undefined) return GROUP_ADMIN_LIFECYCLE_TIMEOUT_DEFAULT_SECONDS;
   if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > GROUP_ADMIN_LIFECYCLE_TIMEOUT_MAX_SECONDS)
@@ -419,7 +420,7 @@ export function withinGroupAdminLifecycleDeadline<T>(operation: () => Promise<T>
   return new Promise<T>((resolve, reject) => {
     timer = setTimeout(() => reject(status(504, `Group administrative workspace operation exceeded ${timeoutSeconds} seconds`)), timeoutSeconds * 1000);
     timer.unref?.();
-    void operation().then(resolve, reject);
+    void runManagementOperation(operation).then(resolve, reject);
   }).finally(() => { if (timer) clearTimeout(timer); });
 }
 function groupWorkerLifecycleTimeoutSeconds(value: unknown) {
@@ -436,6 +437,6 @@ function withinGroupWorkerLifecycleDeadline<T>(operation: () => Promise<T>, time
   return new Promise<T>((resolve, reject) => {
     timer = setTimeout(() => reject(status(504, `${toolName} exceeded its ${timeoutSeconds} second server-side deadline`)), timeoutSeconds * 1000);
     timer.unref?.();
-    void operation().then(resolve, reject);
+    void runManagementOperation(operation).then(resolve, reject);
   }).finally(() => { if (timer) clearTimeout(timer); });
 }

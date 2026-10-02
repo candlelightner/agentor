@@ -2,7 +2,8 @@ import Docker from 'dockerode';
 import type { Readable } from 'node:stream';
 import type { Config } from './config';
 import type { ImageUpdateInfo, UpdateStatus, ApplyResult, UpdatableImage, PruneResult } from '../../shared/types';
-import { withOperationDeadline } from './operation-deadline';
+import { operationSettlement, type OperationFailureWithSettlement, withOperationDeadline } from './operation-deadline';
+import { instanceControlPlaneCoordinator } from './instance-snapshot-gate';
 
 interface ImageRef {
   registry: string;
@@ -15,6 +16,7 @@ interface ImageRef {
 const FETCH_TIMEOUT_MS = 30_000;
 const DOCKER_READ_TIMEOUT_MS = 8_000;
 const DOCKER_MUTATION_TIMEOUT_MS = 30_000;
+const DOCKER_SWAPPER_TIMEOUT_MS = 120_000;
 const DOCKER_PULL_TIMEOUT_MS = 30 * 60_000;
 
 export class UpdateChecker {
@@ -22,9 +24,11 @@ export class UpdateChecker {
   private config: Config;
   private status: UpdateStatus;
   private pollInterval: ReturnType<typeof setInterval> | null = null;
+  private activeOperations = 0;
+  private pendingRestarts = 0;
 
-  constructor(config: Config) {
-    this.docker = new Docker({ socketPath: '/var/run/docker.sock' });
+  constructor(config: Config, docker?: Docker) {
+    this.docker = docker ?? new Docker({ socketPath: '/var/run/docker.sock' });
     this.config = config;
     this.status = {
       orchestrator: null,
@@ -32,6 +36,49 @@ export class UpdateChecker {
       traefik: null,
       isProductionMode: !!config.workerImagePrefix || config.baseDomains.length > 0,
     };
+  }
+
+  hasActiveOperationsForInstanceSnapshot(): boolean {
+    return this.activeOperations > 0 || this.pendingRestarts > 0;
+  }
+
+  registerPendingRestart(): () => void {
+    this.pendingRestarts += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.pendingRestarts = Math.max(0, this.pendingRestarts - 1);
+    };
+  }
+
+  private withOperation<T>(operation: () => Promise<T>): Promise<T> {
+    return instanceControlPlaneCoordinator.run(async () => {
+      this.activeOperations += 1;
+      try {
+        return await operation();
+      } catch (error) {
+        this.retainFailureSettlement(error);
+        throw error;
+      } finally {
+        this.activeOperations = Math.max(0, this.activeOperations - 1);
+      }
+    });
+  }
+
+  /** A caught deadline must retain both coordinator and checker accounting.
+   * This observes the exposed lifetime; native Docker transport ownership and
+   * restart-safe uncertainty reconciliation remain separate requirements. */
+  private retainFailureSettlement(error: unknown): void {
+    const settlement = (error as OperationFailureWithSettlement | undefined)?.[operationSettlement];
+    if (!settlement) return;
+    const lease = instanceControlPlaneCoordinator.fork();
+    this.activeOperations += 1;
+    void lease.run(async () => {
+      try { await settlement; } catch {} finally {
+        this.activeOperations = Math.max(0, this.activeOperations - 1);
+      }
+    }).catch(() => {});
   }
 
   async init(): Promise<void> {
@@ -285,6 +332,10 @@ export class UpdateChecker {
   }
 
   async pullImage(imageName: string): Promise<void> {
+    return this.withOperation(() => this.pullImageAdmitted(imageName));
+  }
+
+  private async pullImageAdmitted(imageName: string): Promise<void> {
     // Images pulled by the orchestrator are public — agent credentials are
     // per-user and not available at infrastructure scope. Deploy private
     // images with `docker login` on the host.
@@ -309,60 +360,66 @@ export class UpdateChecker {
   }
 
   async applyUpdates(images?: UpdatableImage[]): Promise<ApplyResult> {
-    const result: ApplyResult = {
-      orchestratorPulled: false,
-      workerPulled: false,
-      traefikPulled: false,
-      orchestratorRestarting: false,
-      errors: [],
-    };
+    return this.withOperation(async () => {
+      const result: ApplyResult = {
+        orchestratorPulled: false,
+        workerPulled: false,
+        traefikPulled: false,
+        orchestratorRestarting: false,
+        errors: [],
+      };
 
-    const hasPrefix = !!this.config.workerImagePrefix;
-    const hasBaseDomains = this.config.baseDomains.length > 0;
+      const hasPrefix = !!this.config.workerImagePrefix;
+      const hasBaseDomains = this.config.baseDomains.length > 0;
 
-    if (!hasPrefix && !hasBaseDomains) {
-      result.errors.push('Not in production mode');
+      if (!hasPrefix && !hasBaseDomains) {
+        result.errors.push('Not in production mode');
+        return result;
+      }
+
+      const shouldUpdate = (key: UpdatableImage) => !images || images.includes(key);
+      const prefix = this.config.workerImagePrefix;
+
+      // Pull worker image if update available
+      if (hasPrefix && shouldUpdate('worker') && this.status.worker?.updateAvailable) {
+        try {
+          await this.pullImage(prefix + this.config.workerImage);
+          result.workerPulled = true;
+        } catch (err: unknown) {
+          this.retainFailureSettlement(err);
+          result.errors.push(`Worker pull failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
+      // Pull Traefik image if update available
+      if (hasBaseDomains && shouldUpdate('traefik') && this.status.traefik?.updateAvailable) {
+        try {
+          await this.pullImage(this.config.traefikImage);
+          result.traefikPulled = true;
+        } catch (err: unknown) {
+          this.retainFailureSettlement(err);
+          result.errors.push(`Traefik pull failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
+      // Pull orchestrator image if update available
+      if (hasPrefix && shouldUpdate('orchestrator') && this.status.orchestrator?.updateAvailable) {
+        try {
+          await this.pullImage(prefix + this.config.orchestratorImage);
+          result.orchestratorPulled = true;
+        } catch (err: unknown) {
+          this.retainFailureSettlement(err);
+          result.errors.push(`Orchestrator pull failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
       return result;
-    }
-
-    const shouldUpdate = (key: UpdatableImage) => !images || images.includes(key);
-    const prefix = this.config.workerImagePrefix;
-
-    // Pull worker image if update available
-    if (hasPrefix && shouldUpdate('worker') && this.status.worker?.updateAvailable) {
-      try {
-        await this.pullImage(prefix + this.config.workerImage);
-        result.workerPulled = true;
-      } catch (err: unknown) {
-        result.errors.push(`Worker pull failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-
-    // Pull Traefik image if update available
-    if (hasBaseDomains && shouldUpdate('traefik') && this.status.traefik?.updateAvailable) {
-      try {
-        await this.pullImage(this.config.traefikImage);
-        result.traefikPulled = true;
-      } catch (err: unknown) {
-        result.errors.push(`Traefik pull failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-
-    // Pull orchestrator image if update available
-    if (hasPrefix && shouldUpdate('orchestrator') && this.status.orchestrator?.updateAvailable) {
-      try {
-        await this.pullImage(prefix + this.config.orchestratorImage);
-        result.orchestratorPulled = true;
-      } catch (err: unknown) {
-        result.errors.push(`Orchestrator pull failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-
-    return result;
+    });
   }
 
   async recreateOrchestrator(): Promise<void> {
-    const hostname = process.env.HOSTNAME;
+    return this.withOperation(async () => {
+      const hostname = process.env.HOSTNAME;
     if (!hostname) throw new Error('HOSTNAME not set — cannot identify orchestrator container');
 
     const container = this.docker.getContainer(hostname);
@@ -443,16 +500,38 @@ export class UpdateChecker {
       },
     }), DOCKER_MUTATION_TIMEOUT_MS, 'Docker update swapper creation');
 
-    await withOperationDeadline(swapper.start(), DOCKER_MUTATION_TIMEOUT_MS, 'Docker update swapper start');
-    useLogger().info('[update-checker] swapper started — orchestrator will be replaced shortly');
+      try {
+        await withOperationDeadline(swapper.start(), DOCKER_MUTATION_TIMEOUT_MS, 'Docker update swapper start');
+        useLogger().info('[update-checker] swapper started — orchestrator will be replaced shortly');
+      } catch (err) {
+        try { await this.removeContainerIfExists(swapperName); }
+        catch (cleanupError) { this.retainFailureSettlement(cleanupError); }
+        throw err;
+      }
+
+      const waitResult = await withOperationDeadline(
+        swapper.wait(),
+        DOCKER_SWAPPER_TIMEOUT_MS,
+        'Docker update swapper execution',
+      );
+      const statusCode = (waitResult as { StatusCode?: number } | undefined)?.StatusCode;
+      if (statusCode !== 0) {
+        throw Object.assign(
+          new Error(`Orchestrator replacement swapper failed with exit status ${statusCode ?? 'unknown'}`),
+          { code: 'UPDATE_SWAPPER_FAILED' },
+        );
+      }
+    });
   }
 
   async pruneImages(): Promise<PruneResult> {
-    const res = await withOperationDeadline(this.docker.pruneImages({ filters: { dangling: ['true'] } }), DOCKER_MUTATION_TIMEOUT_MS, 'Docker update image prune');
-    return {
-      imagesDeleted: res.ImagesDeleted?.length ?? 0,
-      spaceReclaimed: res.SpaceReclaimed ?? 0,
-    };
+    return this.withOperation(async () => {
+      const res = await withOperationDeadline(this.docker.pruneImages({ filters: { dangling: ['true'] } }), DOCKER_MUTATION_TIMEOUT_MS, 'Docker update image prune');
+      return {
+        imagesDeleted: res.ImagesDeleted?.length ?? 0,
+        spaceReclaimed: res.SpaceReclaimed ?? 0,
+      };
+    });
   }
 
   private async removeContainerIfExists(name: string): Promise<void> {
@@ -461,11 +540,9 @@ export class UpdateChecker {
     } catch (err: unknown) {
       const status = (err as { statusCode?: number }).statusCode;
       if (status === 404) return; // already gone — nothing to clean up
-      // Best-effort cleanup: a transient daemon error or an in-progress removal
-      // (409) shouldn't abort the whole self-replace. The subsequent
-      // createContainer(tempName) will surface a real name conflict if the
-      // leftover is genuinely still present.
-      useLogger().warn(`[update-checker] could not remove leftover container ${name}: ${err instanceof Error ? err.message : err}`);
+      // A pending deletion cannot overlap replacement creation. In-use,
+      // permission and uncertain failures require recovery before proceeding.
+      throw err;
     }
   }
 

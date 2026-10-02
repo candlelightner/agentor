@@ -1,6 +1,8 @@
 import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { assertSafeUserId, isSafeUserId } from './user-id';
+import { instanceControlPlaneCoordinator } from './instance-snapshot-gate';
+import { operationSettlement, type OperationFailureWithSettlement } from './operation-deadline';
 
 /**
  * JSON store partitioned per user. Each user's items live in their own file at
@@ -26,12 +28,21 @@ export class UserScopedJsonStore<K, V> {
   }
 
   async init(): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.loadUsers());
+  }
+
+  private async loadUsers(): Promise<void> {
     const usersDir = join(this.dataDir, 'users');
     let userIds: string[] = [];
     try {
       userIds = await readdir(usersDir);
     } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        // Absence is usable only after the failed read's actual lifetime ends.
+        // Swallowing the error also hides it from automatic gate retention.
+        await Promise.resolve((err as OperationFailureWithSettlement)?.[operationSettlement]).catch(() => undefined);
+        return;
+      }
       throw err;
     }
     // A single corrupt or unreadable per-user file must NOT take down the whole
@@ -56,12 +67,17 @@ export class UserScopedJsonStore<K, V> {
    * rejects this load; init() isolates the rejection so other owners still load. */
   async loadUser(userId: string): Promise<void> {
     assertSafeUserId(userId);
+    return this.withUserMutation(userId, () => this.loadUserUnlocked(userId), true);
+  }
+
+  private async loadUserUnlocked(userId: string): Promise<void> {
     const filePath = this.filePathForUser(userId);
     let raw: string;
     try {
       raw = await readFile(filePath, 'utf-8');
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        await Promise.resolve((err as OperationFailureWithSettlement)?.[operationSettlement]).catch(() => undefined);
         this.unavailableUsers.delete(userId);
         this.items.delete(userId);
         return;
@@ -133,6 +149,11 @@ export class UserScopedJsonStore<K, V> {
    * than iterating the whole dataset when the caller only needs the key set. */
   listUserIds(): string[] {
     return [...new Set([...this.items.keys(), ...this.unavailableUsers])];
+  }
+
+  /** Inventory must distinguish an empty store from quarantined owner data. */
+  hasUnavailableOwners(): boolean {
+    return this.unavailableUsers.size > 0;
   }
 
   listForUser(userId: string): V[] {
@@ -225,6 +246,10 @@ export class UserScopedJsonStore<K, V> {
   }
 
   protected async removeWhere(predicate: (item: V) => boolean): Promise<number> {
+    return instanceControlPlaneCoordinator.run(() => this.removeWhereAdmitted(predicate));
+  }
+
+  private async removeWhereAdmitted(predicate: (item: V) => boolean): Promise<number> {
     let count = 0;
     for (const userId of this.listUserIds()) {
       if (this.unavailableUsers.has(userId)) continue;
@@ -286,13 +311,19 @@ export class UserScopedJsonStore<K, V> {
     operation: () => Promise<T>,
     allowUnavailable = false,
   ): Promise<T> {
+    return instanceControlPlaneCoordinator.run(() => {
     const prev = this.saveQueues.get(userId) ?? Promise.resolve();
     const next = prev.then(() => {
       if (!allowUnavailable) this.assertAvailable(userId);
       return operation();
     });
-    this.saveQueues.set(userId, next.then(() => undefined, () => undefined));
+    const tail = next.then(() => undefined, async (error: OperationFailureWithSettlement) => {
+      await Promise.resolve(error?.[operationSettlement]).catch(() => {});
+    });
+    this.saveQueues.set(userId, tail);
+    void tail.then(() => { if (this.saveQueues.get(userId) === tail) this.saveQueues.delete(userId); });
     return next;
+    });
   }
 
   private assertAvailable(userId: string): void {

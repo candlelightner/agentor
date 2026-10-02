@@ -5,6 +5,8 @@ import Docker from "dockerode";
 import { pack } from "tar-stream";
 import type { Readable } from "node:stream";
 import type { PluginCommand } from "./plugin-manifest";
+import { instanceControlPlaneCoordinator } from "./instance-snapshot-gate";
+import { operationSettlement, type OperationFailureWithSettlement } from "./operation-deadline";
 
 export type ImageBuildStatus =
   "queued" | "running" | "succeeded" | "failed" | "cancelled";
@@ -428,6 +430,7 @@ export class ImageCatalogManager {
     deletions: [],
   };
   private initialized?: Promise<void>;
+  private initializationComplete = false;
   private mutationChain = Promise.resolve();
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
   private buildStreams = new Map<string, Readable>();
@@ -441,7 +444,17 @@ export class ImageCatalogManager {
   ) {}
 
   init(): Promise<void> {
-    return (this.initialized ??= this.load());
+    return instanceControlPlaneCoordinator.run(() => (this.initialized ??= this.load().then(() => {
+      this.initializationComplete = true;
+    })));
+  }
+  /** Read-only evidence for excluded snapshot jobs. Never initializes, reloads
+   * or grants write admission while the snapshot barrier is held. */
+  assertInitializedForInstanceSnapshot(): void {
+    if (!this.initializationComplete)
+      throw Object.assign(new Error('Image catalog is not initialized for instance snapshot inventory'), {
+        statusCode: 503, code: 'INSTANCE_SNAPSHOT_IMAGE_CATALOG_UNAVAILABLE',
+      });
   }
   private async load() {
     await mkdir(this.dataDir, { recursive: true });
@@ -516,6 +529,9 @@ export class ImageCatalogManager {
     await rename(tmp, this.path());
   }
   private mutate<T>(operation: () => Promise<T> | T): Promise<T> {
+    return instanceControlPlaneCoordinator.run(() => this.mutateAdmitted(operation));
+  }
+  private mutateAdmitted<T>(operation: () => Promise<T> | T): Promise<T> {
     const result = this.mutationChain.then(async () => {
       const previous = structuredClone(this.state);
       try {
@@ -529,9 +545,32 @@ export class ImageCatalogManager {
     });
     this.mutationChain = result.then(
       () => undefined,
-      () => undefined,
+      async (error: OperationFailureWithSettlement) => {
+        await Promise.resolve(error?.[operationSettlement]).catch(() => undefined);
+      },
     );
     return result;
+  }
+  /** Reserve detached admission before scheduling, not when the prior build
+   * eventually finishes. A terminal record is not the execution lifetime. */
+  private enqueueDefinition(id: string, operation: () => Promise<void>): void {
+    const child = instanceControlPlaneCoordinator.fork();
+    const previous = this.definitionBuilds.get(id) ?? Promise.resolve();
+    let execution!: Promise<void>;
+    execution = child.run(async () => {
+      try {
+        await previous.catch(() => undefined);
+        await operation();
+      }
+      catch (error) {
+        await Promise.resolve((error as OperationFailureWithSettlement)?.[operationSettlement]).catch(() => undefined);
+        throw error;
+      } finally {
+        if (this.definitionBuilds.get(id) === execution) this.definitionBuilds.delete(id);
+      }
+    });
+    this.definitionBuilds.set(id, execution);
+    void execution.catch(() => undefined);
   }
   private restoreState(previous: State) {
     const restoreObjects = <T extends { id: string }>(
@@ -600,6 +639,9 @@ export class ImageCatalogManager {
     ];
   }
   async forgetOwner(ownerId: string) {
+    return instanceControlPlaneCoordinator.run(() => this.forgetOwnerAdmitted(ownerId));
+  }
+  private async forgetOwnerAdmitted(ownerId: string) {
     const deletionIds = await this.mutate(() => {
       const definitions = this.state.definitions.filter(
         (definition) => definition.ownerId === ownerId,
@@ -891,6 +933,9 @@ export class ImageCatalogManager {
     return { valid: true, definition: validateDefinition(input) };
   }
   async removeDefinition(id: string, ownerId: string, admin: boolean) {
+    return instanceControlPlaneCoordinator.run(() => this.removeDefinitionAdmitted(id, ownerId, admin));
+  }
+  private async removeDefinitionAdmitted(id: string, ownerId: string, admin: boolean) {
     const deletion = await this.mutate(async () => {
       const item = this.definitionRecord(id, ownerId, admin);
       const pending = this.definitionDeletion(id);
@@ -1027,6 +1072,9 @@ export class ImageCatalogManager {
     admin: boolean,
     input: any = {},
   ) {
+    return instanceControlPlaneCoordinator.run(() => this.startBuildAdmitted(id, ownerId, admin, input));
+  }
+  private async startBuildAdmitted(id: string, ownerId: string, admin: boolean, input: any) {
     const builder = input.builder ?? "controlled";
     if (builder !== "fake" && builder !== "controlled")
       httpError(400, "Unknown image builder");
@@ -1146,20 +1194,12 @@ export class ImageCatalogManager {
       return { build, definition, snapshot };
     });
     if (!snapshot) return publicBuild(build);
-    const previous = this.definitionBuilds.get(id) ?? Promise.resolve();
-    const execution = previous
-      .catch(() => undefined)
-      .then(async () => {
+    this.enqueueDefinition(id, async () => {
         if (build.status === "cancelled") return;
         if (builder === "fake")
           await this.advance(build, definition, snapshot, input);
         else await this.advanceControlled(build, definition, snapshot);
       });
-    this.definitionBuilds.set(id, execution);
-    void execution.finally(() => {
-      if (this.definitionBuilds.get(id) === execution)
-        this.definitionBuilds.delete(id);
-    });
     return publicBuild(build);
   }
   async startValidation(
@@ -1169,6 +1209,9 @@ export class ImageCatalogManager {
     admin: boolean,
     input: any = {},
   ) {
+    return instanceControlPlaneCoordinator.run(() => this.startValidationAdmitted(id, versionName, ownerId, admin, input));
+  }
+  private async startValidationAdmitted(id: string, versionName: string, ownerId: string, admin: boolean, input: any) {
     const definition = this.definition(id, ownerId, admin);
     const requestId = normalizeRequestId(input.requestId);
     const requestFingerprint = createHash("sha256")
@@ -1258,10 +1301,7 @@ export class ImageCatalogManager {
       ),
       versions: definition.versions.map((entry) => ({ ...entry })),
     };
-    const previous = this.definitionBuilds.get(id) ?? Promise.resolve();
-    const execution = previous
-      .catch(() => undefined)
-      .then(async () => {
+    this.enqueueDefinition(id, async () => {
         if (build.status === "cancelled") return;
         const started = Date.now();
         try {
@@ -1272,13 +1312,15 @@ export class ImageCatalogManager {
             reference,
           );
           if ((build.status as ImageBuildStatus) !== "cancelled")
-            await this.mutate(() =>
-              this.applyCompatibility(build, version, compatibility, started),
-            );
+            await this.mutate(() => {
+              if ((build.status as ImageBuildStatus) === "cancelled") return;
+              this.applyCompatibility(build, version, compatibility, started);
+            });
         } catch (error) {
           if ((build.status as ImageBuildStatus) !== "cancelled") {
             const diagnostic = safeBuildDiagnostic(error);
             await this.mutate(() => {
+              if ((build.status as ImageBuildStatus) === "cancelled") return;
               const unavailable: ImageCompatibility = {
                 state: "unavailable",
                 coreState: "unavailable",
@@ -1294,11 +1336,6 @@ export class ImageCatalogManager {
           }
         }
       });
-    this.definitionBuilds.set(id, execution);
-    void execution.finally(() => {
-      if (this.definitionBuilds.get(id) === execution)
-        this.definitionBuilds.delete(id);
-    });
     return publicBuild(build);
   }
   async startTestWorker(
@@ -1308,6 +1345,9 @@ export class ImageCatalogManager {
     admin: boolean,
     input: any = {},
   ) {
+    return instanceControlPlaneCoordinator.run(() => this.startTestWorkerAdmitted(id, versionName, ownerId, admin, input));
+  }
+  private async startTestWorkerAdmitted(id: string, versionName: string, ownerId: string, admin: boolean, input: any) {
     const definition = this.definition(id, ownerId, admin);
     const requestId = normalizeRequestId(input.requestId);
     const requestedDisplayName =
@@ -1393,20 +1433,20 @@ export class ImageCatalogManager {
       return job;
     });
     if (!createdJob) return publicBuild(build);
-    const previous = this.definitionBuilds.get(id) ?? Promise.resolve();
-    const execution = previous
-      .catch(() => undefined)
-      .then(async () => {
+    this.enqueueDefinition(id, async () => {
         if (build.status === "cancelled") return;
         const started = Date.now();
         try {
           await this.mutate(() => {
+            if ((build.status as ImageBuildStatus) === "cancelled") return;
             build.status = "running";
             build.phase = "creating-test-worker";
             build.progress = 20;
             build.startedAt = build.updatedAt = now();
           });
+          if ((build.status as ImageBuildStatus) === "cancelled") return;
           const { useContainerManager } = await import("./services");
+          if ((build.status as ImageBuildStatus) === "cancelled") return;
           const worker = await useContainerManager().create({
             userId: definition.ownerId,
             displayName,
@@ -1421,7 +1461,8 @@ export class ImageCatalogManager {
               .catch(() => undefined);
             return;
           }
-          await this.mutate(() => {
+          const published = await this.mutate(() => {
+            if ((build.status as ImageBuildStatus) === "cancelled") return false;
             build.status = "succeeded";
             build.phase = "completed";
             build.progress = 100;
@@ -1430,11 +1471,15 @@ export class ImageCatalogManager {
             build.logs.push("Test worker created and running.");
             build.completedAt = build.updatedAt = now();
             build.durationMs = Date.now() - started;
+            return true;
           });
+          if (!published)
+            await useContainerManager().remove(worker.id).catch(() => undefined);
         } catch (error) {
           if ((build.status as ImageBuildStatus) !== "cancelled") {
             const diagnostic = safeBuildDiagnostic(error);
             await this.mutate(() => {
+              if ((build.status as ImageBuildStatus) === "cancelled") return;
               build.status = "failed";
               build.phase = "failed";
               build.progress = 100;
@@ -1447,11 +1492,6 @@ export class ImageCatalogManager {
           }
         }
       });
-    this.definitionBuilds.set(id, execution);
-    void execution.finally(() => {
-      if (this.definitionBuilds.get(id) === execution)
-        this.definitionBuilds.delete(id);
-    });
     return publicBuild(build);
   }
   private async advanceControlled(
@@ -2061,19 +2101,26 @@ export class ImageCatalogManager {
     const started = Date.now();
     return new Promise<void>((resolve) => {
       let settled = false;
+      let running = false;
+      let finishRequested = false;
       const finish = () => {
         if (settled) return;
-        settled = true;
+        finishRequested = true;
         const timer = this.timers.get(build.id);
         if (timer) clearTimeout(timer);
         this.timers.delete(build.id);
+        // Cancellation can run while a step/terminalizer awaits persistence.
+        // Keep the execution child until that work has actually returned.
+        if (running) return;
+        settled = true;
         this.buildSettlers.delete(build.id);
         resolve();
       };
+      const stopped = () => finishRequested || ["cancelled", "failed"].includes(build.status);
       const terminalize = async (error: unknown) => {
         try {
           await this.mutate(() => {
-            if (build.status === "cancelled") return;
+            if (stopped()) return;
             const stamp = now();
             build.status = "failed";
             build.phase = "failed";
@@ -2090,7 +2137,7 @@ export class ImageCatalogManager {
           // The state writer may remain unavailable. The execution still has
           // to unwind so cancellation/deletion cannot wait forever; the last
           // durable queued/running record is failed safely during restart.
-          if (build.status !== "cancelled") {
+          if (!stopped()) {
             const stamp = now();
             build.status = "failed";
             build.phase = "failed";
@@ -2106,32 +2153,43 @@ export class ImageCatalogManager {
         }
       };
       const schedule = (delay: number) => {
+        if (stopped()) { finish(); return; }
         this.timers.set(
           build.id,
-          setTimeout(() => void step().catch(terminalize), delay),
+          setTimeout(() => {
+            this.timers.delete(build.id);
+            running = true;
+            void (async () => {
+              try { await step(); }
+              catch (error) { await terminalize(error); }
+              finally { running = false; if (finishRequested) finish(); }
+            })();
+          }, delay),
         );
       };
       this.buildSettlers.set(build.id, finish);
       const step = async () => {
-        if (["cancelled", "failed"].includes(build.status)) {
+        if (stopped()) {
           finish();
           return;
         }
         if (builtVersion) {
           const compatibility = fakeCompatibility(input.fakeValidationOutcome);
-          await this.mutate(() =>
+          await this.mutate(() => {
+            if (stopped()) return;
             this.applyCompatibility(
               build,
               builtVersion!,
               compatibility,
               started,
-            ),
-          );
+            );
+          });
           finish();
           return;
         }
         if (input.fakePauseUntilRestart) {
           await this.mutate(() => {
+            if (stopped()) return;
             build.status = "running";
             build.phase = "building";
             build.updatedAt = now();
@@ -2144,6 +2202,7 @@ export class ImageCatalogManager {
         if (fault && fault.failPhase === phase) {
           const failureMessage = fault.message;
           await this.mutate(() => {
+            if (stopped()) return;
             build.status = "running";
             build.phase = phase!;
             build.startedAt ||= now();
@@ -2165,6 +2224,7 @@ export class ImageCatalogManager {
         }
         if (index < phases.length) {
           await this.mutate(() => {
+            if (stopped()) return;
             build.status = "running";
             build.phase = phase!;
             build.startedAt ||= now();
@@ -2178,6 +2238,7 @@ export class ImageCatalogManager {
         const version = `v${definition.versions.length + 1}`;
         const stamp = now();
         await this.mutate(() => {
+          if (stopped()) return;
           build.status = "running";
           build.phase = phase!;
           build.startedAt ||= now();
@@ -2245,6 +2306,9 @@ export class ImageCatalogManager {
     return build;
   }
   async cancelBuild(id: string, ownerId: string, admin: boolean) {
+    return instanceControlPlaneCoordinator.run(() => this.cancelBuildAdmitted(id, ownerId, admin));
+  }
+  private async cancelBuildAdmitted(id: string, ownerId: string, admin: boolean) {
     const b = await this.mutate(() => {
       const build = this.build(id, ownerId, admin);
       if (!["queued", "running"].includes(build.status)) return build;
@@ -2367,6 +2431,9 @@ export class ImageCatalogManager {
     ownerId: string,
     admin: boolean,
   ) {
+    return instanceControlPlaneCoordinator.run(() => this.deleteVersionAdmitted(id, version, ownerId, admin));
+  }
+  private async deleteVersionAdmitted(id: string, version: string, ownerId: string, admin: boolean) {
     const deletion = await this.mutate(async () => {
       const d = this.definitionRecord(id, ownerId, admin);
       this.assertDefinitionAvailable(id);
@@ -2603,6 +2670,9 @@ export class ImageCatalogManager {
     };
   }
   async cleanup(ownerId: string, admin: boolean, input: any = {}) {
+    return instanceControlPlaneCoordinator.run(() => this.cleanupAdmitted(ownerId, admin, input));
+  }
+  private async cleanupAdmitted(ownerId: string, admin: boolean, input: any) {
     let partialArtifactsRemoved = 0;
     let bytesReclaimed = 0;
     let unusedVersionsRemoved = 0;

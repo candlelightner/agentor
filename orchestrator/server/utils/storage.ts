@@ -3,7 +3,11 @@ import { mkdir, rm, chmod, chown, stat, writeFile, readFile } from 'node:fs/prom
 import { dirname, join } from 'node:path';
 import type { Config } from './config';
 import { assertSafeUserId } from './user-id';
-import { withOperationDeadline } from './operation-deadline';
+import { operationSettlement, type OperationFailureWithSettlement } from './operation-deadline';
+import { withInstanceOperationDeadline } from './instance-operation-deadline';
+import { instanceControlPlaneCoordinator } from './instance-snapshot-gate';
+
+const storageFiles = { mkdir, rm, chmod, chown, stat, writeFile, readFile };
 
 type StorageMode = 'volume' | 'directory';
 
@@ -43,6 +47,8 @@ export const SHARED_DIRECTORY_MOUNT_POINTS = [
 export class StorageManager {
   private docker: Docker;
   private config: Config;
+  private initialized = false;
+  private initialization?: Promise<void>;
 
   mode: StorageMode = 'volume';
   /** Volume name (volume mode) or host path (directory mode) — used in bind strings
@@ -55,24 +61,53 @@ export class StorageManager {
   /** In-container path for fs operations (always /data) */
   dataDir: string;
 
-  constructor(docker: Docker, config: Config) {
+  constructor(docker: Docker, config: Config, private readonly files = storageFiles) {
     this.docker = docker;
     this.config = config;
     this.dataDir = config.dataDir;
   }
 
-  async init(): Promise<void> {
+  init(): Promise<void> {
+    return instanceControlPlaneCoordinator.run(async () => {
+      if (!this.initialization) {
+        this.initialized = false;
+        const pending = this.initialize();
+        this.initialization = pending;
+        void pending.then(() => { this.initialization = undefined; }, () => { this.initialization = undefined; });
+      }
+      await this.initialization;
+    });
+  }
+
+  /** Excluded snapshot inventory must never lazily initialize storage. */
+  assertInitializedForInstanceSnapshot(): void {
+    if (!this.initialized) throw Object.assign(new Error('Storage is not initialized for instance snapshot'), {
+      statusCode: 503, code: 'INSTANCE_STORAGE_NOT_INITIALIZED',
+    });
+  }
+
+  private retainCaughtSettlement(error: unknown): void {
+    const settlement = (error as OperationFailureWithSettlement | undefined)?.[operationSettlement];
+    if (!settlement) return;
+    // A best-effort catch may return promptly, but its actual external lifetime
+    // must remain registered independently of the completed caller.
+    const child = instanceControlPlaneCoordinator.fork();
+    void child.run(() => Promise.resolve(settlement).then(() => undefined, () => undefined));
+  }
+
+  private async initialize(): Promise<void> {
     const hostname = process.env.HOSTNAME;
     if (!hostname) {
       useLogger().info('[storage] HOSTNAME not set — falling back to volume mode');
       this.mode = 'volume';
       this.dataRef = this.config.dataVolume;
+      this.initialized = true;
       return;
     }
 
     try {
       const container = this.docker.getContainer(hostname);
-      const info = await withOperationDeadline(container.inspect(), STORAGE_DOCKER_TIMEOUT_MS, 'Docker storage mount inspection');
+      const info = await withInstanceOperationDeadline(instanceControlPlaneCoordinator, () => container.inspect(), STORAGE_DOCKER_TIMEOUT_MS, 'Docker storage mount inspection');
 
       const dataMount = info.Mounts?.find(
         (m: { Destination: string }) => m.Destination === this.dataDir
@@ -82,6 +117,7 @@ export class StorageManager {
         useLogger().info('[storage] /data not mounted — falling back to volume mode');
         this.mode = 'volume';
         this.dataRef = this.config.dataVolume;
+        this.initialized = true;
         return;
       }
 
@@ -99,7 +135,9 @@ export class StorageManager {
           `[storage] volume mode — volume: ${this.dataRef}${this.dataHostPath ? ` (host path: ${this.dataHostPath})` : ''}`,
         );
       }
+      this.initialized = true;
     } catch (err: unknown) {
+      this.retainCaughtSettlement(err);
       useLogger().error(`[storage] init failed, falling back to volume mode: ${err instanceof Error ? err.message : err}`);
       this.mode = 'volume';
       this.dataRef = this.config.dataVolume;
@@ -147,42 +185,48 @@ export class StorageManager {
   /** Ensure workspace and agents directories exist with correct ownership,
    * and pre-create nested directory/file mountpoints so Docker Desktop's
    * virtiofs can layer per-user binds on top (directory mode only). */
-  async ensureWorkerDirs(userId: string, name: string): Promise<void> {
+  ensureWorkerDirs(userId: string, name: string): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.ensureWorkerDirsAdmitted(userId, name));
+  }
+
+  private async ensureWorkerDirsAdmitted(userId: string, name: string): Promise<void> {
     if (this.mode !== 'directory') return;
 
     const userDir = this.getUserDir(userId);
     // Explicit 0o700 on per-user dirs so on a shared host another user's process
     // can't traverse/read into them (the entrypoint re-chowns to the agent uid).
-    await mkdir(userDir, { recursive: true, mode: 0o700 });
+    await this.files.mkdir(userDir, { recursive: true, mode: 0o700 });
     await this.chownDir(userDir);
 
     const workspaceDir = join(userDir, 'workspaces', name);
-    await mkdir(workspaceDir, { recursive: true, mode: 0o700 });
+    await this.files.mkdir(workspaceDir, { recursive: true, mode: 0o700 });
     await this.chownDir(workspaceDir);
 
     const agentsDir = join(userDir, 'agents', name);
-    await mkdir(agentsDir, { recursive: true, mode: 0o700 });
+    await this.files.mkdir(agentsDir, { recursive: true, mode: 0o700 });
     await this.chownDir(agentsDir);
 
     for (const relPath of SHARED_DIRECTORY_MOUNT_POINTS) {
       const mountpoint = join(agentsDir, relPath);
-      await mkdir(mountpoint, { recursive: true, mode: 0o700 });
-      await chmod(mountpoint, 0o700);
+      await this.files.mkdir(mountpoint, { recursive: true, mode: 0o700 });
+      await this.files.chmod(mountpoint, 0o700);
       await this.chownDir(mountpoint);
     }
 
     for (const relPath of CREDENTIAL_MOUNT_POINTS) {
       const mountpoint = join(agentsDir, relPath);
       const parent = dirname(mountpoint);
-      await mkdir(parent, { recursive: true, mode: 0o700 });
+      await this.files.mkdir(parent, { recursive: true, mode: 0o700 });
       await this.chownDir(parent);
       try {
-        await stat(mountpoint);
-      } catch {
-        await writeFile(mountpoint, '', { mode: 0o600 });
+        await this.files.stat(mountpoint);
+      } catch (error) {
+        this.retainCaughtSettlement(error);
+        await this.files.writeFile(mountpoint, '', { mode: 0o600 });
         try {
-          await chown(mountpoint, AGENT_UID, AGENT_GID);
-        } catch {
+          await this.files.chown(mountpoint, AGENT_UID, AGENT_GID);
+        } catch (error) {
+          this.retainCaughtSettlement(error);
           // See chownDir — best effort.
         }
       }
@@ -194,7 +238,11 @@ export class StorageManager {
    * the in-container data path so it works in both volume and directory mode;
    * the file surfaces on the host at `<dataHostPath>/users/<userId>/ssh/…`,
    * which is what the Docker bind string references. */
-  async ensureUserSshDir(userId: string): Promise<void> {
+  ensureUserSshDir(userId: string): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.ensureUserSshDirAdmitted(userId));
+  }
+
+  private async ensureUserSshDirAdmitted(userId: string): Promise<void> {
     const sshDir = join(this.getUserDir(userId), 'ssh');
     const keyFile = join(sshDir, 'authorized_keys');
     // A tight `ssh/` dir (0o700) keeps a co-located process from tampering with
@@ -203,22 +251,27 @@ export class StorageManager {
     // unprivileged `agent` uid (1000, ≠ the orchestrator's uid) must read it for
     // sshd. A 0o600 file owned by the orchestrator uid is unreadable across that
     // bind mount and breaks pubkey auth.
-    await mkdir(sshDir, { recursive: true, mode: 0o700 });
+    await this.files.mkdir(sshDir, { recursive: true, mode: 0o700 });
     try {
-      await stat(keyFile);
-    } catch {
-      await writeFile(keyFile, '', { mode: 0o644 });
+      await this.files.stat(keyFile);
+    } catch (error) {
+      this.retainCaughtSettlement(error);
+      await this.files.writeFile(keyFile, '', { mode: 0o644 });
     }
   }
 
   /** Ensure the per-user Kilo global-config directory exists and is writable by
    * the worker's unprivileged agent user in both storage modes. */
-  async ensureUserKiloConfigDir(userId: string): Promise<void> {
+  ensureUserKiloConfigDir(userId: string): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.ensureUserKiloConfigDirAdmitted(userId));
+  }
+
+  private async ensureUserKiloConfigDirAdmitted(userId: string): Promise<void> {
     const kiloDir = join(this.getUserDir(userId), 'kilo');
     const configDir = join(kiloDir, 'config');
-    await mkdir(configDir, { recursive: true, mode: 0o700 });
-    await chmod(kiloDir, 0o700);
-    await chmod(configDir, 0o700);
+    await this.files.mkdir(configDir, { recursive: true, mode: 0o700 });
+    await this.files.chmod(kiloDir, 0o700);
+    await this.files.chmod(configDir, 0o700);
     await this.chownDir(kiloDir);
     await this.chownDir(configDir);
   }
@@ -229,7 +282,7 @@ export class StorageManager {
   async readSshAuthorizedKeys(userId: string): Promise<string> {
     const keyFile = join(this.getUserDir(userId), 'ssh', 'authorized_keys');
     try {
-      return (await readFile(keyFile, 'utf-8')).trimEnd();
+      return (await this.files.readFile(keyFile, 'utf-8')).trimEnd();
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return '';
       throw err;
@@ -240,13 +293,17 @@ export class StorageManager {
    * content is the Account UI field 1:1; a trailing newline is added for sshd.
    * Empty → empty file (no logins accepted). Bind-mounted into every worker the
    * user owns, so updates are visible live. */
-  async writeSshAuthorizedKeys(userId: string, content: string): Promise<void> {
+  writeSshAuthorizedKeys(userId: string, content: string): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.writeSshAuthorizedKeysAdmitted(userId, content));
+  }
+
+  private async writeSshAuthorizedKeysAdmitted(userId: string, content: string): Promise<void> {
     const sshDir = join(this.getUserDir(userId), 'ssh');
-    await mkdir(sshDir, { recursive: true, mode: 0o700 });
+    await this.files.mkdir(sshDir, { recursive: true, mode: 0o700 });
     const trimmed = (content ?? '').trimEnd();
     // 0o644: bind-mounted read-only into the worker; the agent uid must read it
     // for sshd (see ensureUserSshDir). It is a public key, not a secret.
-    await writeFile(join(sshDir, 'authorized_keys'), trimmed ? `${trimmed}\n` : '', { mode: 0o644 });
+    await this.files.writeFile(join(sshDir, 'authorized_keys'), trimmed ? `${trimmed}\n` : '', { mode: 0o644 });
   }
 
   /** Bind string for the user's `authorized_keys` file, mounted read-only at
@@ -273,12 +330,16 @@ export class StorageManager {
    * Kilo's `~/.local/share/kilo`) exists with correct ownership in both
    * storage modes. Holds `auth.json` (provider keys + login) plus Kilo's
    * SQLite session/history DBs — all shared across that user's workers. */
-  async ensureUserKiloSharedDataDir(userId: string): Promise<void> {
+  ensureUserKiloSharedDataDir(userId: string): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.ensureUserKiloSharedDataDirAdmitted(userId));
+  }
+
+  private async ensureUserKiloSharedDataDirAdmitted(userId: string): Promise<void> {
     const kiloDir = join(this.getUserDir(userId), 'kilo');
     const sharedDir = join(kiloDir, 'data');
-    await mkdir(sharedDir, { recursive: true, mode: 0o700 });
-    await chmod(kiloDir, 0o700);
-    await chmod(sharedDir, 0o700);
+    await this.files.mkdir(sharedDir, { recursive: true, mode: 0o700 });
+    await this.files.chmod(kiloDir, 0o700);
+    await this.files.chmod(sharedDir, 0o700);
     await this.chownDir(kiloDir);
     await this.chownDir(sharedDir);
   }
@@ -314,10 +375,14 @@ export class StorageManager {
 
   /** Ensure a user's data + credentials directories exist with correct ownership
    * (directory mode only — volume mode relies on the entrypoint's chown). */
-  async ensureUserDir(userId: string): Promise<void> {
+  ensureUserDir(userId: string): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.ensureUserDirAdmitted(userId));
+  }
+
+  private async ensureUserDirAdmitted(userId: string): Promise<void> {
     const userDir = this.getUserDir(userId);
     const credDir = join(userDir, 'credentials');
-    await mkdir(credDir, { recursive: true, mode: 0o700 });
+    await this.files.mkdir(credDir, { recursive: true, mode: 0o700 });
     if (this.mode === 'directory') {
       await this.chownDir(userDir);
       await this.chownDir(credDir);
@@ -326,45 +391,69 @@ export class StorageManager {
 
   /** Remove a user's entire data directory (credentials, workers, mappings,
    * env vars, usage, workspaces, agents — everything). */
-  async removeUserDir(userId: string): Promise<void> {
-    await rm(this.getUserDir(userId), { recursive: true, force: true });
+  removeUserDir(userId: string): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.removeUserDirAdmitted(userId));
+  }
+
+  private async removeUserDirAdmitted(userId: string): Promise<void> {
+    await this.files.rm(this.getUserDir(userId), { recursive: true, force: true });
   }
 
   /** Remove a worker's workspace (volume or directory). In directory mode the
    * path is scoped by userId; in volume mode the volume is keyed by the globally
    * unique containerName. */
-  async removeWorkerWorkspace(userId: string, name: string, containerName: string): Promise<void> {
+  removeWorkerWorkspace(userId: string, name: string, containerName: string): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.removeWorkerWorkspaceAdmitted(userId, name, containerName));
+  }
+
+  private async removeWorkerWorkspaceAdmitted(userId: string, name: string, containerName: string): Promise<void> {
     if (this.mode === 'directory') {
-      await rm(join(this.getUserDir(userId), 'workspaces', name), { recursive: true, force: true });
+      await this.files.rm(join(this.getUserDir(userId), 'workspaces', name), { recursive: true, force: true });
     } else {
       await this.removeVolume(`${containerName}-workspace`);
     }
   }
 
   /** Remove a worker's Docker-in-Docker volume (always a named volume). */
-  async removeWorkerDocker(containerName: string): Promise<void> {
+  removeWorkerDocker(containerName: string): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.removeWorkerDockerAdmitted(containerName));
+  }
+
+  private async removeWorkerDockerAdmitted(containerName: string): Promise<void> {
     await this.removeVolume(`${containerName}-docker`);
   }
 
   /** Remove a worker's persistent agent config data (volume or directory). */
-  async removeWorkerAgents(userId: string, name: string, containerName: string): Promise<void> {
+  removeWorkerAgents(userId: string, name: string, containerName: string): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.removeWorkerAgentsAdmitted(userId, name, containerName));
+  }
+
+  private async removeWorkerAgentsAdmitted(userId: string, name: string, containerName: string): Promise<void> {
     if (this.mode === 'directory') {
-      await rm(join(this.getUserDir(userId), 'agents', name), { recursive: true, force: true });
+      await this.files.rm(join(this.getUserDir(userId), 'agents', name), { recursive: true, force: true });
     } else {
       await this.removeVolume(`${containerName}-agents`);
     }
   }
 
   /** Ensure Traefik cert directory exists (directory mode only) */
-  async ensureCertDir(): Promise<void> {
+  ensureCertDir(): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.ensureCertDirAdmitted());
+  }
+
+  private async ensureCertDirAdmitted(): Promise<void> {
     if (this.mode !== 'directory') return;
-    await mkdir(join(this.dataDir, 'traefik-certs'), { recursive: true });
+    await this.files.mkdir(join(this.dataDir, 'traefik-certs'), { recursive: true });
   }
 
   /** Ensure self-signed cert directory exists (directory mode only) */
-  async ensureSelfSignedCertDir(): Promise<void> {
+  ensureSelfSignedCertDir(): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.ensureSelfSignedCertDirAdmitted());
+  }
+
+  private async ensureSelfSignedCertDirAdmitted(): Promise<void> {
     if (this.mode !== 'directory') return;
-    await mkdir(join(this.dataDir, 'selfsigned-certs'), { recursive: true });
+    await this.files.mkdir(join(this.dataDir, 'selfsigned-certs'), { recursive: true });
   }
 
   /** In-container path of the built-in defaults directory
@@ -376,15 +465,20 @@ export class StorageManager {
 
   /** Ensure the `defaults/` directory exists. Called at startup before built-in
    * seeding so the seed writers can simply write. */
-  async ensureDefaultsDir(): Promise<void> {
-    await mkdir(this.getDefaultsDir(), { recursive: true });
+  ensureDefaultsDir(): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.ensureDefaultsDirAdmitted());
+  }
+
+  private async ensureDefaultsDirAdmitted(): Promise<void> {
+    await this.files.mkdir(this.getDefaultsDir(), { recursive: true });
   }
 
   private async removeVolume(volumeName: string): Promise<void> {
     try {
       const volume = this.docker.getVolume(volumeName);
-      await withOperationDeadline(volume.remove(), STORAGE_DOCKER_TIMEOUT_MS, 'Docker worker-volume cleanup');
+      await withInstanceOperationDeadline(instanceControlPlaneCoordinator, () => volume.remove(), STORAGE_DOCKER_TIMEOUT_MS, 'Docker worker-volume cleanup');
     } catch (error) {
+      this.retainCaughtSettlement(error);
       // Absence is idempotent success. Propagate daemon, permission, and
       // in-use failures so rollback callers can report incomplete cleanup;
       // ordinary deletion paths already log and continue explicitly.
@@ -396,8 +490,9 @@ export class StorageManager {
 
   private async chownDir(dir: string): Promise<void> {
     try {
-      await chown(dir, AGENT_UID, AGENT_GID);
-    } catch {
+      await this.files.chown(dir, AGENT_UID, AGENT_GID);
+    } catch (error) {
+      this.retainCaughtSettlement(error);
       // Best effort — mainly relevant in directory mode where the host
       // filesystem persists, and even there the entrypoint re-chowns.
     }

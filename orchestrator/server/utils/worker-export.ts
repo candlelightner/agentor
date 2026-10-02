@@ -4,7 +4,7 @@ import { stat, lstat, mkdir, writeFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { posix as posixPath } from 'node:path';
 import { pipeline } from 'node:stream/promises';
-import { Transform, type Readable } from 'node:stream';
+import { PassThrough, Transform, type Readable, type Writable } from 'node:stream';
 import { spawn } from 'node:child_process';
 import * as tar from 'tar-stream';
 import type { Environment } from './environments';
@@ -21,6 +21,8 @@ import {
   type PortableManagedVolumeEntry,
 } from './portable-managed-volume-format';
 import { MAX_PORTABLE_MANAGED_VOLUME_COMPRESSED_PAYLOAD_BYTES } from './portable-managed-volume-archive';
+import { instanceControlPlaneCoordinator } from './instance-snapshot-gate';
+import { operationSettlement, type OperationFailureWithSettlement } from './operation-deadline';
 
 /** Bumped when the bundle layout changes incompatibly. */
 export const WORKER_EXPORT_VERSION = 5;
@@ -174,8 +176,34 @@ export interface WorkerExportManifest {
   missingSecrets?: string[];
 }
 
+/** Preserve the original diagnostic without mutating an existing deadline's
+ * non-configurable settlement property. This adds lifecycle evidence only. */
+export function workerExportFailureWithSettlement(error: unknown, settlement: Promise<void>): OperationFailureWithSettlement {
+  const failure = error instanceof Error ? error : new Error('Worker export failed', { cause: error });
+  return Object.create(Object.getPrototypeOf(failure), {
+    ...Object.getOwnPropertyDescriptors(failure),
+    [operationSettlement]: { value: settlement, enumerable: false },
+  });
+}
+
+function exportStreamClosed(stream: NodeJS.ReadableStream | NodeJS.WritableStream): Promise<void> {
+  return new Promise(resolve => {
+    // Node and streamx both emit close after destruction, but only Node
+    // exposes .closed. Never infer closure from .destroyed or pipeline error.
+    const node = 'closed' in stream;
+    const closed = () => {
+      if (node && (stream as Readable | Writable).closed !== true) return;
+      stream.off('close', closed); resolve();
+    };
+    stream.on('close', closed);
+    if (node) closed();
+  });
+}
+
 /** Pipe a readable through gzip into a file; return the written size in bytes. */
 export async function writeGzipFile(src: NodeJS.ReadableStream, dest: string, signal?: AbortSignal): Promise<number> {
+  return instanceControlPlaneCoordinator.run(async () => {
+  const sourceClosed = exportStreamClosed(src);
   // Root filesystem exports are routinely several GiB. The default level 6
   // made an otherwise-streaming export spend 30+ minutes compressing the
   // standard worker image. Level 1 keeps the same portable gzip/tar format and
@@ -195,18 +223,39 @@ export async function writeGzipFile(src: NodeJS.ReadableStream, dest: string, si
       gzip.once('error', reject);
       gzip.once('close', (code, childSignal) => (code === 0 ? resolve() : reject(new Error(`Parallel gzip failed${childSignal ? ` (${childSignal})` : ''}${stderr.trim() ? `: ${stderr.trim()}` : ''}`))));
     });
-    await Promise.all([pipeline(src, gzip.stdin, { signal }), pipeline(gzip.stdout, createWriteStream(dest), { signal }), exited]);
+    const childClosed = new Promise<void>(resolve => gzip.once('close', () => resolve()));
+    const writer = createWriteStream(dest), writerClosed = exportStreamClosed(writer);
+    const childStreamsClosed = [gzip.stdin, gzip.stdout, gzip.stderr].map(exportStreamClosed);
+    const operations = [pipeline(src, gzip.stdin, { signal }), pipeline(gzip.stdout, writer, { signal }), exited];
+    const settlement = Promise.allSettled([...operations, sourceClosed, childClosed, writerClosed, ...childStreamsClosed]).then(() => {});
+    try { await Promise.all(operations); await settlement; }
+    catch (error) {
+      // Only this export's child and streams are stopped. Awaitable settlement
+      // prevents a caller from unlinking staging while another branch writes.
+      try { gzip.kill(); } catch { /* No denial retry; childClosed retains uncertainty. */ }
+      gzip.stdin.destroy(); gzip.stdout.destroy(); writer.destroy();
+      throw workerExportFailureWithSettlement(error, settlement);
+    }
   } else {
-    await pipeline(src, createGzip({ level: zlibConstants.Z_BEST_SPEED }), createWriteStream(dest), { signal });
+    const writer = createWriteStream(dest), writerClosed = exportStreamClosed(writer);
+    const compressor = createGzip({ level: zlibConstants.Z_BEST_SPEED });
+    const compressorClosed = exportStreamClosed(compressor);
+    const compressed = pipeline(src, compressor, writer, { signal });
+    const settlement = Promise.allSettled([compressed, sourceClosed, compressorClosed, writerClosed]).then(() => {});
+    try { await compressed; await settlement; }
+    catch (error) { writer.destroy(); throw workerExportFailureWithSettlement(error, settlement); }
   }
   return (await stat(dest)).size;
+  });
 }
 
 /** Re-pack an agents tar, dropping per-user files/directories, then gzip to a
  * file. Returns the written size. */
 export async function writeFilteredAgentsGz(src: NodeJS.ReadableStream, dest: string, excludeSuffixes: string[], excludePrefixes: string[] = [], signal?: AbortSignal): Promise<number> {
+  return instanceControlPlaneCoordinator.run(async () => {
   const extract = tar.extract();
   const pack = tar.pack();
+  const producerClosed = [src, extract, pack].map(exportStreamClosed);
 
   extract.on('entry', (header, stream, next) => {
     const relativeName = header.name.replace(/^\.?\//, '').replace(/^\.agent-data\/?/, '');
@@ -222,50 +271,91 @@ export async function writeFilteredAgentsGz(src: NodeJS.ReadableStream, dest: st
   extract.on('finish', () => pack.finalize());
   extract.on('error', (err) => pack.destroy(err));
 
-  const writeDone = pipeline(pack, createGzip(), createWriteStream(dest), {
+  const writer = createWriteStream(dest), writerClosed = exportStreamClosed(writer);
+  const compressor = createGzip(), compressorClosed = exportStreamClosed(compressor);
+  const writeDone = pipeline(pack, compressor, writer, {
     signal,
   });
   // Drive src → extract with pipeline (not a bare .pipe) so a src error tears
   // down extract → pack and rejects, instead of hanging forever waiting for an
   // 'end'/'finish' that never comes.
-  await Promise.all([pipeline(src, extract, { signal }), writeDone]);
+  const operations = [pipeline(src, extract, { signal }), writeDone];
+  const settlement = Promise.allSettled([...operations, ...producerClosed, compressorClosed, writerClosed]).then(() => {});
+  try { await Promise.all(operations); await settlement; }
+  catch (error) {
+    extract.destroy(); pack.destroy(); writer.destroy();
+    throw workerExportFailureWithSettlement(error, settlement);
+  }
   return (await stat(dest)).size;
+  });
 }
 
-/** Build the outer bundle tar as a readable stream, sourcing each entry from a
- * temp file (sizes are known via stat, so no buffering). */
-export function packBundle(files: { name: string; path: string }[]): Readable {
+export type BundleOutputStream = Readable & {
+  /** Outcome-neutral lifetime, NOT proof that the stream produced a valid
+   * archive. Resolves after all producer work and opened file handles settle;
+   * consumers still observe errors on the ordinary readable stream. */
+  readonly producerSettlement: Promise<void>;
+};
+
+/** Build the unchanged outer tar format without buffering payloads. The Node
+ * output stream preserves backpressure and exposes reliable `closed` state
+ * (tar-stream itself uses streamx, whose lifecycle properties differ). */
+export function packBundle(files: { name: string; path: string }[]): BundleOutputStream {
+  const lifetime = instanceControlPlaneCoordinator.fork();
   const pack = tar.pack();
+  const output = new PassThrough();
+  const streamsClosed = [pack, output].map(exportStreamClosed);
   let activeSource: ReturnType<typeof createReadStream> | undefined;
-  const closeActiveSource = () => {
-    activeSource?.destroy();
-    activeSource = undefined;
-  };
-  // A disconnected download destroys the outer tar. Explicitly close the
-  // currently-open staging file as well; pipe() only unpipes a destroyed
-  // destination and otherwise may leave the source fd paused until GC.
-  pack.once('close', closeActiveSource);
-  pack.once('error', closeActiveSource);
-  (async () => {
-    const measured = await Promise.all(files.map(async (file) => ({
-      ...file,
-      size: (await stat(file.path)).size,
-    })));
-    validateBundleOutputLayout(measured);
-    for (const f of measured) {
-      const { size } = f;
-      await new Promise<void>((resolve, reject) => {
-        const entry = pack.entry({ name: f.name, size }, (err) => (err ? reject(err) : resolve()));
-        const source = createReadStream(f.path);
+  let activeSourceClosed: Promise<void> | undefined;
+  const closeActiveSource = () => activeSource?.destroy();
+  output.on('close', closeActiveSource);
+  output.on('error', closeActiveSource);
+  const transferred = pipeline(pack, output);
+  void transferred.catch(closeActiveSource);
+  const producer = lifetime.run(async () => {
+    try {
+      const measured: Array<{ name: string; path: string; size: number }> = [];
+      // Sequential measurement has no abandoned sibling stats on rejection.
+      // Cancellation during stat must never start a subsequent file open.
+      for (const file of files) {
+        if (output.destroyed) return;
+        const size = (await stat(file.path)).size;
+        if (output.destroyed) return;
+        measured.push({ ...file, size });
+      }
+      validateBundleOutputLayout(measured);
+      for (const file of measured) {
+        if (output.destroyed) return;
+        const entry = pack.entry({ name: file.name, size: file.size });
+        const source = createReadStream(file.path);
         activeSource = source;
-        source.once('error', reject);
-        source.pipe(entry);
-      });
+        activeSourceClosed = exportStreamClosed(source);
+        await pipeline(source, entry);
+        // Entry completion/error is not proof its backing fd has closed.
+        await activeSourceClosed;
+        activeSource = undefined;
+        activeSourceClosed = undefined;
+      }
+      pack.finalize();
+      await transferred;
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      pack.destroy(failure);
+      output.destroy(failure);
+    } finally {
+      closeActiveSource();
+      await activeSourceClosed;
       activeSource = undefined;
+      await transferred.catch(() => {});
+      await Promise.all(streamsClosed);
+      output.off('close', closeActiveSource);
+      output.off('error', closeActiveSource);
     }
-    pack.finalize();
-  })().catch((err) => pack.destroy(err instanceof Error ? err : new Error(String(err))));
-  return pack;
+  });
+  // The child owns actual production even if a caller only observes stream
+  // close/error. The explicit settlement lets temp owners sequence removal.
+  const producerSettlement = producer.then(() => undefined, () => undefined);
+  return Object.assign(output, { producerSettlement });
 }
 
 /** Write the manifest JSON to a file. */

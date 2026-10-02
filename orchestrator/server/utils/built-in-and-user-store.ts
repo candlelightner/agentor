@@ -1,5 +1,6 @@
 import { DefaultsStore } from './defaults-store';
 import { UserScopedJsonStore } from './user-scoped-store';
+import { instanceControlPlaneCoordinator } from './instance-snapshot-gate';
 
 export interface BuiltInAndUserItem {
   id: string;
@@ -27,8 +28,10 @@ export abstract class BuiltInAndUserStore<V extends BuiltInAndUserItem, B extend
   }
 
   override async init(): Promise<void> {
-    await this.defaults.init();
-    await super.init();
+    return instanceControlPlaneCoordinator.run(async () => {
+      await this.defaults.init();
+      await super.init();
+    });
   }
 
   override list(): V[] {
@@ -52,6 +55,10 @@ export abstract class BuiltInAndUserStore<V extends BuiltInAndUserItem, B extend
   /** Merge `patch` onto an existing user entry. Subclasses narrow the patch
    * type at their public API layer. */
   protected async updateUserItem(id: string, patch: Partial<V>): Promise<V> {
+    return instanceControlPlaneCoordinator.run(() => this.updateAdmittedUserItem(id, patch));
+  }
+
+  private async updateAdmittedUserItem(id: string, patch: Partial<V>): Promise<V> {
     if (this.defaults.has(id)) {
       useLogger().warn(`[${this.label}] update rejected — built-in (${id})`);
       throw new Error(`Cannot modify built-in ${this.label}s`);
@@ -73,6 +80,10 @@ export abstract class BuiltInAndUserStore<V extends BuiltInAndUserItem, B extend
   }
 
   async delete(id: string): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.deleteAdmitted(id));
+  }
+
+  private async deleteAdmitted(id: string): Promise<void> {
     if (this.defaults.has(id)) {
       useLogger().warn(`[${this.label}] delete rejected — built-in (${id})`);
       throw new Error(`Cannot delete built-in ${this.label}s`);
@@ -84,10 +95,12 @@ export abstract class BuiltInAndUserStore<V extends BuiltInAndUserItem, B extend
   }
 
   async seedBuiltIns(items: B[]): Promise<void> {
-    const now = new Date().toISOString();
-    const snapshot = items.map((item) => this.snapshotBuiltIn(item, now));
-    await this.defaults.replace(snapshot);
-    useLogger().info(`[${this.label}] seeded ${snapshot.length} built-in(s)`);
+    return instanceControlPlaneCoordinator.run(async () => {
+      const now = new Date().toISOString();
+      const snapshot = items.map((item) => this.snapshotBuiltIn(item, now));
+      await this.defaults.replace(snapshot);
+      useLogger().info(`[${this.label}] seeded ${snapshot.length} built-in(s)`);
+    });
   }
 
   /** Build a defaults-store record from a source built-in definition. */

@@ -13,7 +13,8 @@ import {
   validateHostMountCatalogSource,
   validateHostMountTarget,
 } from './host-mount-store';
-import { withOperationDeadline } from './operation-deadline';
+import { withOperationDeadline, operationSettlement, type OperationFailureWithSettlement } from './operation-deadline';
+import { openDockerArchiveTransfer } from './docker-archive-transfer';
 import { resolveWorkerRuntimePolicy, KATA_DOCKER_RUNTIME } from './worker-runtime-policy';
 import type { LegacyPrivilegeGrant } from './worker-runtime-policy';
 import type { WorkerRuntimeProfile } from '../../shared/types';
@@ -1119,6 +1120,27 @@ for item in json.loads(sys.stdin.readline()):
 
   // --- Workspace archive methods ---
 
+  /** docker-modem may derive a remote host from DOCKER_HOST even when its
+   * constructor receives socketPath. Never let archive reads silently select
+   * a different daemon from this service's other operations. This adapter
+   * supports only the existing unversioned, direct local HTTP socket setup. */
+  private assertArchiveEndpointCoherent(): void {
+    // These effective fields exist in the pinned docker-modem implementation,
+    // but its public declaration exposes only operations. Treat them as unknown
+    // evidence rather than assuming a typed or caller-selected endpoint.
+    const modem = this.docker.modem as unknown as Record<string, unknown> | undefined;
+    if (!modem || modem.host || modem.protocol !== 'http' ||
+        modem.socketPath !== '/var/run/docker.sock' ||
+        (modem.socketPathCache !== undefined && modem.socketPathCache !== '/var/run/docker.sock') ||
+        modem.version || modem.agent ||
+        (modem.headers !== undefined && (typeof modem.headers !== 'object' || modem.headers === null ||
+          Array.isArray(modem.headers) || Reflect.ownKeys(modem.headers).length !== 0))) {
+      throw Object.assign(new Error('Docker archive transport is unavailable for the effective daemon configuration'), {
+        statusCode: 503, code: 'DOCKER_ARCHIVE_ENDPOINT_UNSUPPORTED',
+      });
+    }
+  }
+
   async putWorkspaceArchive(containerId: string, tarBuffer: Buffer): Promise<void> {
     const container = this.docker.getContainer(containerId);
     await withOperationDeadline(
@@ -1132,16 +1154,8 @@ for item in json.loads(sys.stdin.readline()):
   }
 
   async getWorkspaceArchive(containerId: string, signal?: AbortSignal): Promise<NodeJS.ReadableStream> {
-    const container = this.docker.getContainer(containerId);
-    return withOperationDeadline(
-      (operationSignal) => container.getArchive({
-        path: '/workspace',
-        abortSignal: operationSignal,
-      }),
-      DOCKER_TRANSFER_SETUP_TIMEOUT_MS,
-      'Docker workspace archive preparation',
-      signal,
-    );
+    this.assertArchiveEndpointCoherent();
+    return openDockerArchiveTransfer({ kind: 'workspace', containerId, path: '/workspace', signal });
   }
 
   // --- Generic archive + export/import (worker export/import) ---
@@ -1149,15 +1163,8 @@ for item in json.loads(sys.stdin.readline()):
   /** Stream a tar of an arbitrary path inside a container. Entries are prefixed
    * with the basename of `path` (e.g. `/workspace` → `workspace/...`). */
   async getArchive(containerId: string, path: string, signal?: AbortSignal): Promise<NodeJS.ReadableStream> {
-    return withOperationDeadline(
-      (operationSignal) => this.docker.getContainer(containerId).getArchive({
-        path,
-        abortSignal: operationSignal,
-      }),
-      DOCKER_TRANSFER_SETUP_TIMEOUT_MS,
-      'Docker archive preparation',
-      signal,
-    );
+    this.assertArchiveEndpointCoherent();
+    return openDockerArchiveTransfer({ kind: 'archive', containerId, path, signal });
   }
 
   /** Extract a tar (buffer or stream; gzip auto-detected) into `path` inside a
@@ -1185,14 +1192,8 @@ for item in json.loads(sys.stdin.readline()):
   /** Stream the full container filesystem as a tar (`docker export`). Excludes
    * mounted volumes — those are exported separately via `getArchive`. */
   async exportContainer(containerId: string, signal?: AbortSignal): Promise<NodeJS.ReadableStream> {
-    return withOperationDeadline(
-      (operationSignal) => this.docker.getContainer(containerId).export({
-        abortSignal: operationSignal,
-      }),
-      DOCKER_TRANSFER_SETUP_TIMEOUT_MS,
-      'Docker root-filesystem export preparation',
-      signal,
-    );
+    this.assertArchiveEndpointCoherent();
+    return openDockerArchiveTransfer({ kind: 'export', containerId, signal });
   }
 
   /** Create a local image from a filesystem tar (`docker import`; gzip auto-
@@ -1342,107 +1343,131 @@ for item in json.loads(sys.stdin.readline()):
     const container = this.docker.getContainer(containerId);
     const timeoutMs = opts.timeoutMs ?? DOCKER_EXEC_TIMEOUT_MS;
     const label = opts.operationLabel ?? 'Docker worker command';
-    const exec = await withOperationDeadline(
-      (operationSignal) => container.exec({
-        Cmd: cmd,
-        AttachStdin: !!opts.stdin,
-        AttachStdout: true,
-        AttachStderr: true,
-        Tty: false,
-        ...(opts.user ? { User: opts.user } : {}),
-        ...(opts.workdir ? { WorkingDir: opts.workdir } : {}),
-        abortSignal: operationSignal,
-      }),
-      timeoutMs,
-      `${label} setup`,
-      opts.signal,
-    );
-    const stream = (await withOperationDeadline(
-      (operationSignal) => exec.start({
-        Detach: false,
-        Tty: false,
-        stdin: !!opts.stdin,
-        abortSignal: operationSignal,
-      }),
-      timeoutMs,
-      `${label} start`,
-      opts.signal,
-    )) as Duplex;
-    const abortStream = () => stream.destroy();
-    opts.signal?.addEventListener('abort', abortStream, { once: true });
-
-    const stdout = new PassThrough();
-    const stderr = new PassThrough();
-    // Demux the multiplexed Docker stream into separate stdout/stderr buffers.
-    // Falls back to raw passthrough on stdout if the stream is not framed.
-    container.modem.demuxStream(stream, stdout, stderr);
-
-    // docker-modem's demuxStream only forwards `data`; it does not close the
-    // destination streams when the Docker attach stream ends. Close them here
-    // so capture promises cannot wait forever after a successful exec.
-    let captureEnded = false;
-    const finishCapture = (err?: Error) => {
-      if (captureEnded) return;
-      captureEnded = true;
-      if (err) {
-        stdout.destroy(err);
-        stderr.destroy(err);
-      } else {
-        stdout.end();
-        stderr.end();
+    return withOperationDeadline(async (operationSignal) => {
+      let stream: Duplex | undefined;
+      let closed: Promise<void> | undefined;
+      let stdinSettled: Promise<void> = Promise.resolve();
+      let failureSettlement: Promise<void> | undefined;
+      let stdout: PassThrough | undefined;
+      let stderr: PassThrough | undefined;
+      let failCapture: ((error: Error) => void) | undefined;
+      const abortStream = () => {
+        failCapture?.(new Error('Docker command capture was cancelled'));
+        stream?.destroy();
+      };
+      operationSignal.addEventListener('abort', abortStream, { once: true });
+      try {
+        const exec = await container.exec({
+          Cmd: cmd,
+          AttachStdin: !!opts.stdin,
+          AttachStdout: true,
+          AttachStderr: true,
+          Tty: false,
+          ...(opts.user ? { User: opts.user } : {}),
+          ...(opts.workdir ? { WorkingDir: opts.workdir } : {}),
+          abortSignal: operationSignal,
+        });
+        operationSignal.throwIfAborted();
+        stream = await exec.start({
+          Detach: false, Tty: false, stdin: !!opts.stdin, hijack: true,
+          abortSignal: operationSignal,
+        }) as Duplex;
+        const attach = stream;
+        // `end`, `destroyed`, and a close notification alone do not prove that
+        // native stream finalization has finished. Retain the actual closed state.
+        // docker-modem's non-upgrade HTTP duplex overrides destroy without
+        // finalizing itself, and its write callback does not track req.write.
+        // In that fallback, own its exposed native components and write directly
+        // to the request instead of trusting the wrapper's synthetic callback.
+        const httpAttach = attach as Duplex & { req?: import('node:http').ClientRequest;
+          _output?: import('node:http').IncomingMessage; socket?: import('node:net').Socket };
+        const components = httpAttach.req && httpAttach._output
+          ? [httpAttach.req, httpAttach._output, httpAttach._output.socket].filter(Boolean)
+          : [attach, httpAttach.req, httpAttach.socket].filter((component) => component != null);
+        closed = Promise.all(components.map(component => new Promise<void>((resolve) => {
+          const check = () => {
+            if (!component.closed) return;
+            component.removeListener('close', check);
+            resolve();
+          };
+          component.on('close', check);
+          check();
+        }))).then(() => undefined);
+        stdout = new PassThrough();
+        stderr = new PassThrough();
+        const captures = Promise.all([this.streamToBuffer(stdout), this.streamToBuffer(stderr)]);
+        // Observe immediately: demux/write can throw before the await below.
+        void captures.catch(() => undefined);
+        let captureEnded = false;
+        let attachFailure: Error | undefined;
+        const finishCapture = (err?: Error) => {
+          if (err) attachFailure ??= err;
+          if (captureEnded) return;
+          captureEnded = true;
+          if (err) { stdout!.destroy(err); stderr!.destroy(err); }
+          else { stdout!.end(); stderr!.end(); }
+        };
+        failCapture = finishCapture;
+        attach.once('end', () => finishCapture());
+        attach.on('close', () => {
+          if (attach.closed && !captureEnded) finishCapture(new Error('Docker command attach closed before end'));
+        });
+        // Keep the error listener until closure, including abandoned late streams.
+        attach.on('error', (err) => finishCapture(err));
+        for (const component of components) {
+          if (component !== attach) component.on('error', (err) => finishCapture(err));
+          component.on('close', () => {
+            if (component.closed && !captureEnded && !attach.readableEnded &&
+                !httpAttach._output?.readableEnded) {
+              finishCapture(new Error('Docker command native attach closed before end'));
+            }
+          });
+        }
+        if (operationSignal.aborted) {
+          abortStream();
+          operationSignal.throwIfAborted();
+        }
+        container.modem.demuxStream(attach, stdout, stderr);
+        if (opts.stdin) {
+          stdinSettled = new Promise<void>((resolve, reject) => {
+            (httpAttach.req ?? attach).write(opts.stdin!, (error?: Error | null) => error ? reject(error) : resolve());
+          });
+          void stdinSettled.catch(() => undefined);
+        }
+        if (attach.readableEnded) finishCapture();
+        if (attach.closed && !attach.readableEnded) finishCapture(new Error('Docker command attach closed before end'));
+        const [[stdoutBuf, stderrBuf]] = await Promise.all([captures, stdinSettled]);
+        // Readable EOF can precede socket teardown. Explicitly close our attach
+        // and wait for finalization before trusting the exec result.
+        attach.destroy();
+        await closed;
+        operationSignal.throwIfAborted();
+        if (attachFailure) throw attachFailure;
+        let info = await exec.inspect({ abortSignal: operationSignal });
+        for (let attempt = 0; (info.ExitCode == null || info.Running === true) && attempt < 20; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          operationSignal.throwIfAborted();
+          info = await exec.inspect({ abortSignal: operationSignal });
+        }
+        if (info.Running !== false || !Number.isSafeInteger(info.ExitCode) || info.ExitCode! < 0) {
+          throw new Error('Docker command has no valid terminal exit status');
+        }
+        return { stdout: stdoutBuf, stderr: stderrBuf, exitCode: info.ExitCode! };
+      } catch (error) {
+        failureSettlement = (error as OperationFailureWithSettlement | undefined)?.[operationSettlement];
+        throw error;
+      } finally {
+        stream?.destroy();
+        stdout?.destroy();
+        stderr?.destroy();
+        await Promise.all([
+          closed,
+          stdinSettled.catch(() => undefined),
+          failureSettlement?.catch(() => undefined),
+        ]);
+        operationSignal.removeEventListener('abort', abortStream);
       }
-    };
-    stream.once('end', () => finishCapture());
-    stream.once('close', () => finishCapture());
-    stream.once('error', (err) => finishCapture(err));
-
-    if (opts.stdin) {
-      stream.write(opts.stdin);
-    }
-
-    // Consume stdout AND stderr concurrently. Awaiting them sequentially can
-    // deadlock the demuxer: if stderr's internal buffer fills while we are
-    // still awaiting stdout (or vice versa), the multiplexed stream stops
-    // being drained and neither side ever ends. Promise.all drains both sides
-    // in parallel so backpressure never stalls the other half.
-    let stdoutBuf: Buffer;
-    let stderrBuf: Buffer;
-    try {
-      [stdoutBuf, stderrBuf] = await withOperationDeadline(
-        Promise.all([
-          this.streamToBuffer(stdout),
-          this.streamToBuffer(stderr),
-        ]),
-        timeoutMs,
-        label,
-        opts.signal,
-      );
-    } catch (error) {
-      stream.destroy();
-      stdout.destroy();
-      stderr.destroy();
-      throw error;
-    } finally {
-      opts.signal?.removeEventListener('abort', abortStream);
-    }
-    // Capture completion means the attach stream ended/closed. Docker normally
-    // records ExitCode synchronously, but allow a brief propagation window.
-    let info = await withOperationDeadline(
-      (operationSignal) => exec.inspect({ abortSignal: operationSignal }),
-      DOCKER_READ_TIMEOUT_MS,
-      `${label} result inspection`,
-      opts.signal,
-    );
-    for (let attempt = 0; info.ExitCode == null && attempt < 20; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 25));
-      info = await withOperationDeadline(
-        (operationSignal) => exec.inspect({ abortSignal: operationSignal }),
-        DOCKER_READ_TIMEOUT_MS,
-        `${label} result inspection`,
-        opts.signal,
-      );
-    }
-    return { stdout: stdoutBuf, stderr: stderrBuf, exitCode: info.ExitCode ?? 0 };
+    }, timeoutMs, label, opts.signal);
   }
 
   private streamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {

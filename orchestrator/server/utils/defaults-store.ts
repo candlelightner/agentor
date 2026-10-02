@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { instanceControlPlaneCoordinator } from './instance-snapshot-gate';
 
 /** Single-file JSON store for platform-seeded (built-in) resources at
  * `<DATA_DIR>/defaults/<filename>`. Write-only from `seed()` — never mutated
@@ -15,6 +16,10 @@ export class DefaultsStore<V> {
   }
 
   async init(): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.load());
+  }
+
+  private async load(): Promise<void> {
     let raw: string;
     try {
       raw = await readFile(this.filePath, 'utf-8');
@@ -49,12 +54,18 @@ export class DefaultsStore<V> {
 
   /** Replace the stored defaults with the given items, persisting to disk. */
   async replace(items: V[]): Promise<void> {
-    this.items.clear();
-    for (const item of items) this.items.set(this.keyFn(item), item);
-    await this.persist();
+    return instanceControlPlaneCoordinator.run(async () => {
+      this.items.clear();
+      for (const item of items) this.items.set(this.keyFn(item), item);
+      await this.persist();
+    });
   }
 
   protected async persist(): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => this.write());
+  }
+
+  private async write(): Promise<void> {
     try {
       // Self-sufficient: ensure the defaults dir exists rather than relying on a
       // prior `ensureDefaultsDir()` having run (matches `JsonStore.persist`).

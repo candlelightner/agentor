@@ -9,6 +9,8 @@ import {
   type PluginManifest,
 } from "./plugin-manifest";
 import { UserScopedJsonStore } from "./user-scoped-store";
+import { instanceControlPlaneCoordinator } from './instance-snapshot-gate';
+import { operationSettlement, type OperationFailureWithSettlement } from './operation-deadline';
 
 export interface PluginDefinitionRecord {
   schemaVersion: 1;
@@ -57,7 +59,10 @@ export class PluginDefinitionStore extends UserScopedJsonStore<
   }
 
   override async init(): Promise<void> {
-    await Promise.all([super.init(), this.loadPlatform()]);
+    return instanceControlPlaneCoordinator.run(async () => {
+      const results = await Promise.allSettled([super.init(), this.platformTransaction(() => this.loadPlatform())]);
+      for (const result of results) if (result.status === 'rejected') throw result.reason;
+    });
   }
 
   override list(): PluginDefinitionRecord[] {
@@ -280,7 +285,7 @@ export class PluginDefinitionStore extends UserScopedJsonStore<
   private mutatePlatform(
     operation: (map: Map<string, PluginDefinitionRecord>) => void,
   ): Promise<void> {
-    const result = this.platformSave.then(async () => {
+    return this.platformTransaction(async () => {
       this.assertPlatformAvailable();
       const previous = this.platform;
       const next = new Map(
@@ -295,11 +300,16 @@ export class PluginDefinitionStore extends UserScopedJsonStore<
         throw error;
       }
     });
-    this.platformSave = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
+  }
+
+  private platformTransaction(operation: () => Promise<void>): Promise<void> {
+    return instanceControlPlaneCoordinator.run(() => {
+      const result = this.platformSave.then(operation);
+      this.platformSave = result.then(() => undefined, async (error: OperationFailureWithSettlement) => {
+        await Promise.resolve(error?.[operationSettlement]).catch(() => {});
+      });
+      return result;
+    });
   }
 
   private async persistPlatform(): Promise<void> {

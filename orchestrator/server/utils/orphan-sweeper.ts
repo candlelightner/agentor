@@ -1,5 +1,5 @@
 import { getAuthDb } from './auth';
-import { instanceSnapshotActive } from './instance-snapshot-gate';
+import { instanceMutationBlocked, instanceControlPlaneCoordinator } from './instance-snapshot-gate';
 import type { UserEnvVarStore } from './user-env-store';
 import type { UserCredentialManager } from './user-credentials';
 import type { UsageChecker } from './usage-checker';
@@ -84,9 +84,9 @@ export class OrphanSweeper {
   }
 
   sweep(): Promise<void> {
-    if (instanceSnapshotActive()) return Promise.resolve();
+    if (instanceMutationBlocked()) return Promise.resolve();
     if (this.sweepInFlight) return this.sweepInFlight;
-    const task = this.doSweep().finally(() => {
+    const task = instanceControlPlaneCoordinator.run(() => this.doSweep()).finally(() => {
       if (this.sweepInFlight === task) this.sweepInFlight = undefined;
     });
     this.sweepInFlight = task;

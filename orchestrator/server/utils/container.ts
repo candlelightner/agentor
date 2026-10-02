@@ -50,6 +50,7 @@ import {
   writeGzipFile,
   writeFilteredAgentsGz,
   packBundle,
+  workerExportFailureWithSettlement,
   extractBundle,
   extractBackupPathArchives,
   sanitizeBackupPathTarPayload,
@@ -61,7 +62,7 @@ import {
 import { resolveWorkerReconstruction, snapshotWorkerReconstruction, type ReconstructionResolution } from "./worker-reconstruction";
 import { useImageCatalogManager } from "./image-catalog";
 import { recordWorkspaceTombstone } from "./workspace-tombstones";
-import type { WorkerExportManifest } from "./worker-export";
+import type { WorkerExportManifest, BundleOutputStream } from "./worker-export";
 import type { PreparedPortableManagedVolumeImport } from "./portable-managed-volume-runtime";
 import type { PortableManagedVolumeImportJournal } from "./portable-managed-volume-journal";
 import {
@@ -124,7 +125,7 @@ import {
   workerLifecycleGeneration,
   workerLifecycleSequence,
 } from "./worker-lifecycle-coordinator";
-import { instanceSnapshotActive } from "./instance-snapshot-gate";
+import { instanceControlPlaneCoordinator, instanceMutationBlocked } from "./instance-snapshot-gate";
 import {
   withOperationDeadline,
   operationSettlement,
@@ -700,8 +701,8 @@ export class ContainerManager {
       await authorize();
       const { assertRuntimeMigrationCapacityAdmission } = await import('./worker-runtime-capacity');
       assertRuntimeMigrationCapacityAdmission();
-      const { instanceSnapshotActive } = await import('./instance-snapshot-gate');
-      if (instanceSnapshotActive()) throw Object.assign(new Error('Instance backup or restore is active'), { statusCode: 423 });
+      const { instanceMutationBlocked } = await import('./instance-snapshot-gate');
+      if (instanceMutationBlocked()) throw Object.assign(new Error('Instance backup or restore is active'), { statusCode: 423 });
       const store = await this.runtimeMigrations();
       const result = await this.runtimeMigrationEngine(store, authorize).migrate(await this.runtimeMigrationInput(id, targetProfile));
       this.runtimeObservations.clear();
@@ -758,8 +759,8 @@ export class ContainerManager {
     if (!record) throw Object.assign(new Error('Worker not found'), { statusCode: 404 });
     return withOwnerWorkerLifecycleMutation(record.userId, id, async () => {
       await authorize();
-      const { instanceSnapshotActive } = await import('./instance-snapshot-gate');
-      if (instanceSnapshotActive()) throw Object.assign(new Error('Instance backup or restore is active'), { statusCode: 423 });
+      const { instanceMutationBlocked } = await import('./instance-snapshot-gate');
+      if (instanceMutationBlocked()) throw Object.assign(new Error('Instance backup or restore is active'), { statusCode: 423 });
       const store = await this.runtimeMigrations();
       const journal = store.get(record.userId, id);
       if (!journal) throw Object.assign(new Error('Runtime migration not found'), { statusCode: 404 });
@@ -779,8 +780,8 @@ export class ContainerManager {
     if (!record) throw Object.assign(new Error('Worker not found'), { statusCode: 404 });
     return withOwnerWorkerLifecycleMutation(record.userId, id, async () => {
       await authorize();
-      const { instanceSnapshotActive } = await import('./instance-snapshot-gate');
-      if (instanceSnapshotActive()) throw Object.assign(new Error('Instance backup or restore is active'), { statusCode: 423 });
+      const { instanceMutationBlocked } = await import('./instance-snapshot-gate');
+      if (instanceMutationBlocked()) throw Object.assign(new Error('Instance backup or restore is active'), { statusCode: 423 });
       const store = await this.runtimeMigrations(); const journal = store.get(record.userId, id);
       if (!journal) return { workerId: id, finalized: true };
       await this.runtimeMigrationEngine(store).finalize(journal);
@@ -4593,16 +4594,18 @@ for p in sys.argv[1:]:
         bytesProcessed: number;
       }) => void | Promise<void>;
     },
-  ): Promise<{ stream: Readable; filename: string }> {
+  ): Promise<{ stream: Readable; filename: string; settlement: Promise<void> }> {
+    return instanceControlPlaneCoordinator.run(async () => {
     const snapshot = this.containers.get(id);
     if (!snapshot) throw new Error("Container not found");
     return withOwnerWorkerLifecycleMutation(snapshot.userId, id, async () => {
-      if (instanceSnapshotActive())
+      if (instanceMutationBlocked())
         throw Object.assign(
           new Error("Worker export is unavailable during instance backup or restore. Retry afterwards."),
           { statusCode: 409, code: "INSTANCE_CONTROL_PLANE_BARRIER_ACTIVE" },
         );
       return this.exportWorkerWithLifecycleFenceHeld(id, opts);
+    });
     });
   }
 
@@ -4622,7 +4625,8 @@ for p in sys.argv[1:]:
         bytesProcessed: number;
       }) => void | Promise<void>;
     },
-  ): Promise<{ stream: Readable; filename: string }> {
+  ): Promise<{ stream: Readable; filename: string; settlement: Promise<void> }> {
+    return instanceControlPlaneCoordinator.run(async () => {
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     if (info.status !== "running" && info.status !== "stopped") {
@@ -4665,19 +4669,43 @@ for p in sys.argv[1:]:
       }));
 
     const tmpDir = join(this.config.dataDir, "tmp", `export-${randomUUID()}`);
-    await mkdir(tmpDir, { recursive: true });
-
-    // Single-shot temp-dir cleanup — fires on stream end/close/error, and runs
-    // immediately if materialising the bundle throws before streaming starts
-    // (otherwise a multi-GB rootfs payload would leak in `<dataDir>/tmp`).
-    let cleaned = false;
-    const cleanup = () => {
-      if (cleaned) return;
-      cleaned = true;
-      rm(tmpDir, { recursive: true, force: true }).catch(() => {});
-    };
+    // Reserve cleanup ownership BEFORE mkdir or any capture await. A returned
+    // response/stream and a bounded preparation error do not own this lifetime.
+    const cleanupLifetime = instanceControlPlaneCoordinator.fork();
+    let cleanup!: () => void;
+    const cleanupRequested = new Promise<void>(resolve => { cleanup = resolve; });
+    let preparationSettlement: Promise<void> | undefined;
+    let bundle: BundleOutputStream | undefined;
+    let bundleClosed: Promise<void> | undefined;
+    let resolveSettlement!: () => void;
+    let rejectSettlement!: (error: unknown) => void;
+    const settlement = new Promise<void>((resolve, reject) => {
+      resolveSettlement = resolve; rejectSettlement = reject;
+    });
+    void settlement.catch(() => {});
+    void cleanupLifetime.run(async () => {
+      try {
+        await cleanupRequested;
+        await preparationSettlement;
+        if (bundle) {
+          bundle.destroy();
+          await bundleClosed;
+          await bundle.producerSettlement;
+        }
+        await rm(tmpDir, { recursive: true, force: true });
+        resolveSettlement();
+      } catch (error) {
+        // A definite rm failure leaves residual staging; a bounded failure may
+        // also leave an outstanding writer. Both veto this process's drain,
+        // with no denial retry. Neither hold is restart-safe reconciliation.
+        rejectSettlement(error);
+        await Promise.resolve((error as OperationFailureWithSettlement)?.[operationSettlement]).catch(() => {});
+        await new Promise<void>(() => {});
+      }
+    });
 
     try {
+      await mkdir(tmpDir, { recursive: true });
       opts.signal?.throwIfAborted();
       const includeWorkspace = opts.includeWorkspace !== false;
       const includeAgents = opts.includeAgents !== false;
@@ -4851,6 +4879,16 @@ for p in sys.argv[1:]:
 
       opts.signal?.throwIfAborted();
       const stream = packBundle(files);
+      bundle = stream;
+      bundleClosed = new Promise<void>(resolve => {
+        const closed = () => {
+          if (!stream.closed) return;
+          stream.off("close", closed);
+          resolve();
+        };
+        stream.on("close", closed);
+        closed();
+      });
       stream.on("end", cleanup);
       stream.on("close", cleanup);
       stream.on("error", cleanup);
@@ -4862,11 +4900,13 @@ for p in sys.argv[1:]:
       useLogger().info(
         `[container] exporting worker ${info.containerName}${opts.includeRootfs ? " (with rootfs)" : ""}`,
       );
-      return { stream, filename: `${safe}-worker-export.tar` };
+      return { stream, filename: `${safe}-worker-export.tar`, settlement };
     } catch (err) {
+      preparationSettlement = (err as OperationFailureWithSettlement)?.[operationSettlement];
       cleanup();
-      throw err;
+      throw workerExportFailureWithSettlement(err, settlement);
     }
+    });
   }
 
   /** Restore a worker from an export bundle as a brand-new worker (fresh UUID).

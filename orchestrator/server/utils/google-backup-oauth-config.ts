@@ -2,6 +2,8 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { useConfig } from "./services";
+import { instanceControlPlaneCoordinator } from "./instance-snapshot-gate";
+import { combineSettlements } from "./operation-deadline";
 import {
   decryptWorkerValue,
   encryptWorkerValue,
@@ -31,6 +33,12 @@ export interface GoogleBackupOAuthCredentials {
   clientSecret: string;
 }
 
+const dependencies = {
+  readFile,
+  encrypt: (value: string) => encryptWorkerValue(useConfig(), value, "backup-google-installation-oauth-v1"),
+  decrypt: (value: EncryptedWorkerValue) => decryptWorkerValue(useConfig(), value, "backup-google-installation-oauth-v1"),
+};
+
 /** Installation-wide Google OAuth client material. The client secret is never
  * serialized to callers; existing environment variables remain a fallback for
  * deployments already configured outside the dashboard. */
@@ -44,6 +52,7 @@ export class GoogleBackupOAuthConfigStore {
     private readonly stateWriter?: (
       value: StoredGoogleBackupOAuthConfig,
     ) => Promise<void>,
+    private readonly io = dependencies,
   ) {}
 
   private get path() {
@@ -51,10 +60,11 @@ export class GoogleBackupOAuthConfigStore {
   }
 
   private async init() {
+    return instanceControlPlaneCoordinator.run(async () => {
     if (!this.loaded)
-      this.loaded = (async () => {
+      this.loaded = instanceControlPlaneCoordinator.run(async () => {
         try {
-          const parsed = JSON.parse(await readFile(this.path, "utf8"));
+          const parsed = JSON.parse(await this.io.readFile(this.path, "utf8"));
           if (
             parsed?.schemaVersion === 1 &&
             typeof parsed.clientId === "string" &&
@@ -64,12 +74,15 @@ export class GoogleBackupOAuthConfigStore {
             this.value = parsed;
         } catch (error: any) {
           if (error?.code !== "ENOENT") throw error;
+          await combineSettlements(error);
         }
-      })();
+      });
     await this.loaded;
+    });
   }
 
   async status(): Promise<GoogleBackupOAuthStatus> {
+    return instanceControlPlaneCoordinator.run(async () => {
     await this.init();
     if (this.value)
       return {
@@ -90,19 +103,17 @@ export class GoogleBackupOAuthConfigStore {
       redirectUri: redirectUri || undefined,
       clientSecretConfigured: Boolean(clientSecret),
     };
+    });
   }
 
   async credentials(): Promise<GoogleBackupOAuthCredentials | undefined> {
+    return instanceControlPlaneCoordinator.run(async () => {
     await this.init();
     if (this.value)
       return {
         clientId: this.value.clientId,
         redirectUri: this.value.redirectUri,
-        clientSecret: await decryptWorkerValue(
-          useConfig(),
-          this.value.clientSecret,
-          "backup-google-installation-oauth-v1",
-        ),
+        clientSecret: await this.io.decrypt(this.value.clientSecret),
       };
     const clientId = process.env.GOOGLE_BACKUP_CLIENT_ID || "";
     const redirectUri = process.env.GOOGLE_BACKUP_REDIRECT_URI || "";
@@ -110,6 +121,7 @@ export class GoogleBackupOAuthConfigStore {
     return clientId && redirectUri && clientSecret
       ? { clientId, redirectUri, clientSecret }
       : undefined;
+    });
   }
 
   async configure(input: {
@@ -117,6 +129,7 @@ export class GoogleBackupOAuthConfigStore {
     redirectUri: string;
     clientSecret: string;
   }): Promise<GoogleBackupOAuthStatus> {
+    return instanceControlPlaneCoordinator.run(async () => {
     const clientId = input.clientId.trim();
     const redirectUri = input.redirectUri.trim();
     if (!clientId || !clientSecretValue(input.clientSecret) || !validRedirectUri(redirectUri))
@@ -126,18 +139,16 @@ export class GoogleBackupOAuthConfigStore {
       schemaVersion: 1,
       clientId,
       redirectUri,
-      clientSecret: await encryptWorkerValue(
-        useConfig(),
-        input.clientSecret,
-        "backup-google-installation-oauth-v1",
-      ),
+      clientSecret: await this.io.encrypt(input.clientSecret),
       updatedAt: new Date().toISOString(),
     };
     await this.persist(nextValue);
     return this.status();
+    });
   }
 
   private async persist(value: StoredGoogleBackupOAuthConfig) {
+    return instanceControlPlaneCoordinator.run(async () => {
     const next = this.writes.then(async () => {
       if (this.stateWriter) {
         await this.stateWriter(structuredClone(value));
@@ -150,8 +161,11 @@ export class GoogleBackupOAuthConfigStore {
       await rename(temp, this.path);
       this.value = value;
     });
-    this.writes = next.then(() => undefined, () => undefined);
+    // Recover the queue only after a failed writer's exposed work settles.
+    // Normalize rejection so the tail itself cannot become unhandled.
+    this.writes = next.then(() => undefined, async error => { await combineSettlements(error); });
     await next;
+    });
   }
 }
 

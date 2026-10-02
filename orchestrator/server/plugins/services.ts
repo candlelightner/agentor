@@ -52,9 +52,9 @@ import { DockerAdminWorkspaceRuntime } from "../utils/admin-workspace-runtime";
 import { useManagementMcpStore } from "../utils/management-mcp-store";
 import { ManagementMcpTransport } from "../utils/management-mcp-transport";
 import { useGitImageCatalogManager } from "../utils/git-image-manager";
-import { instanceSnapshotActive } from "../utils/instance-snapshot-gate";
+import { instanceMutationBlocked, instanceControlPlaneCoordinator } from "../utils/instance-snapshot-gate";
 
-export default defineNitroPlugin(async (nitroApp) => {
+export default defineNitroPlugin(async (nitroApp) => instanceControlPlaneCoordinator.run(async () => {
   const instanceRecoveryMode =
     process.env.AGENTOR_INSTANCE_RECOVERY_MODE === "true";
   // Initialize logging infrastructure first
@@ -206,6 +206,9 @@ export default defineNitroPlugin(async (nitroApp) => {
   const { useManagedVolumeSizingManager } = await import("../utils/managed-volume-sizing");
   const { usePortableManagedVolumeRuntime } = await import("../utils/portable-managed-volume-runtime");
   const portableManagedVolumes = usePortableManagedVolumeRuntime();
+  // Recovery mode still needs loaded inventory; no storage recovery is started
+  // by initialization. Excluded snapshot jobs cannot lazily initialize stores.
+  await useManagedVolumeManager().init();
   await portableManagedVolumes.init();
   await useManagedVolumeSizingManager().init();
   await containerManager.hasPendingRuntimeMigrations();
@@ -266,16 +269,16 @@ export default defineNitroPlugin(async (nitroApp) => {
   let workerReconcileTimer: NodeJS.Timeout | undefined;
   if (!instanceRecoveryMode) {
     workerReconcileTimer = setInterval(() => {
-      if (workerReconcileRunning || instanceSnapshotActive()) return;
+      if (workerReconcileRunning || instanceMutationBlocked()) return;
       workerReconcileRunning = true;
-      void (async () => {
+      void instanceControlPlaneCoordinator.run(async () => {
         await containerManager.sync();
         await containerManager.reconcileWorkers();
         for (const worker of containerManager.list()) {
           if (worker.status === "running" && usePluginInstallationStore().listForWorker(worker.userId, worker.id).length)
             await usePluginRuntimeManager().reconcileWorker(worker.userId, worker.id, worker.containerId).catch(() => undefined);
         }
-      })()
+      })
         .catch((error) =>
           logger.warn(
             `[agentor] worker reconciliation pass deferred: ${(error as { code?: string })?.code || "Docker unavailable"}`,
@@ -340,13 +343,15 @@ export default defineNitroPlugin(async (nitroApp) => {
   await managementMcp.start(await adminRuntime.managementAddress());
   let adminIdentityTimer: NodeJS.Timeout | undefined;
   const refreshAdminIdentity = async () => {
-    if (instanceSnapshotActive()) return;
+    if (instanceMutationBlocked()) return;
     try {
-      const workspace = await adminWorkspace.ensure();
+      await instanceControlPlaneCoordinator.run(async () => {
+      await adminWorkspace.ensure();
       for (const group of useWorkerGroupStore().list()) {
         if (!group.adminWorkspace) continue;
         await groupAdminWorkspaces.ensure(group.id);
       }
+      });
     } catch (error) {
       logger.error(
         `[agentor] administrative workspace identity refresh failed: ${error instanceof Error ? error.message : error}`,
@@ -490,4 +495,4 @@ export default defineNitroPlugin(async (nitroApp) => {
       getAuthDb().close();
     } catch {}
   });
-});
+}));

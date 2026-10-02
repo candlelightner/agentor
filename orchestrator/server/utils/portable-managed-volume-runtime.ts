@@ -30,7 +30,7 @@ import {
 import { useManagedVolumeManager } from "./managed-volume-manager";
 import type { StoredManagedVolume } from "./managed-volume-store";
 import { UserScopedJsonStore } from "./user-scoped-store";
-import { instanceSnapshotActive } from "./instance-snapshot-gate";
+import { instanceMutationBlocked } from "./instance-snapshot-gate";
 import { withOwnerWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
 import {
   operationSettlement,
@@ -1131,7 +1131,7 @@ export class PortableManagedVolumeRuntime {
   }
 
   private assertSnapshotAvailable(): void {
-    if (instanceSnapshotActive())
+    if (instanceMutationBlocked())
       throw Object.assign(
         new Error("Portable volume operations are unavailable during instance backup or restore."),
         { statusCode: 409, code: "INSTANCE_CONTROL_PLANE_BARRIER_ACTIVE" },

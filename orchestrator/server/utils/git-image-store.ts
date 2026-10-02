@@ -1,6 +1,8 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { GitImageCiphertext } from "./git-image-crypto";
+import { instanceControlPlaneCoordinator } from './instance-snapshot-gate';
+import { operationSettlement, type OperationFailureWithSettlement } from './operation-deadline';
 
 export type GitAuth =
   | { type: "none" }
@@ -69,7 +71,8 @@ export class GitImageStore {
     private readonly stateWriter?: (state: GitImageState) => Promise<void>,
   ) {}
   init() {
-    return (this.initialized ??= this.load());
+    return instanceControlPlaneCoordinator.run(() =>
+      (this.initialized ??= this.enqueue(() => this.load())));
   }
   private path() {
     return join(this.dataDir, "state.json");
@@ -93,7 +96,9 @@ export class GitImageStore {
       // or a transient read failure into a successful empty write.
       if (error?.code !== "ENOENT") throw error;
     }
-    await this.persist();
+    // load already owns the queue; calling persist here would queue behind
+    // itself. The initial durable write belongs to this same transaction.
+    await this.writeState();
   }
   private async writeState() {
     if (this.stateWriter) {
@@ -107,12 +112,7 @@ export class GitImageStore {
     await rename(temp, this.path());
   }
   persist() {
-    const next = this.saves.then(() => this.writeState());
-    this.saves = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    return next;
+    return this.enqueue(() => this.writeState());
   }
 
   /** Read a stable snapshot after every previously admitted transaction has
@@ -124,7 +124,7 @@ export class GitImageStore {
   /** Serialize the in-memory mutation together with its durable commit. The
    * snapshot is restored on failure before a later mutation is allowed to run. */
   transaction<T>(operation: () => Promise<T> | T): Promise<T> {
-    const result = this.saves.then(async () => {
+    return this.enqueue(async () => {
       const previous = structuredClone(this.state);
       try {
         const value = await operation();
@@ -135,10 +135,15 @@ export class GitImageStore {
         throw error;
       }
     });
-    this.saves = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
+  }
+
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    return instanceControlPlaneCoordinator.run(() => {
+      const result = this.saves.then(operation);
+      this.saves = result.then(() => undefined, async (error: OperationFailureWithSettlement) => {
+        await Promise.resolve(error?.[operationSettlement]).catch(() => {});
+      });
+      return result;
+    });
   }
 }
