@@ -1,9 +1,46 @@
 # Whole-instance snapshot writer drain
 
-Status: incomplete, uncommitted integration pending independent final review.
+Status: incomplete. Reviewed writer/capture checkpoint25a548f is committed on
+the draft branch; further native transport/durable reconciliation work is pending.
 The instance-backup barrier now drains registered operations, but registration
 is not yet complete and does not prove an atomic control-plane snapshot.
 This is separate from the reviewed worker-store quarantine/inventory guards.
+
+## Native and durable-operation work, 2026-10-02
+
+The new command transport owns actual setup/start/inspect requests, response
+bodies, upgraded/native200 streams and write callbacks on the same fixed local
+daemon. Independent review reproduced premature destruction of buffered output;
+the corrected source passes48 focused tests, including delayed consumption.
+DockerService capture now uses this transport for setup/start/inspect, with no
+Dockerode fallback.81 combined transport/capture tests pass with narrow
+independent integration approval. Capture waits actual bridge closure and stdin
+callbacks; successful setup/inspect native tails retain separate coordinator
+leases. Client transport closure is not proof that a command or daemon mutation
+has stopped, and cancellation does not clear mutation uncertainty.
+
+An isolated external-operation journal persists secret-free typed intent before
+dispatch, exact identity additions and receipt-bound terminal tombstones. Every
+nonterminal record vetoes readiness across clean reopen. Corruption, lost storage,
+uncertain persistence or an unclean lock requires offline reconciliation, never
+PID/TTL/404 clearing. Independent review reproduced shutdown releasing its lock
+before sync/descriptor closure; release now occurs only as the final operation
+after both succeed. No post-unlock fsync is attempted. A crash-resurrected lock
+is a conservative hold.33 focused tests and narrow independent core review pass;
+these are local POSIX fault fixtures, not physical power-cut acceptance.
+
+Neither application startup/dispatch nor backup authority stripping consumes
+this journal yet. Trusted operation-specific receipt checkers and bounded
+tombstone retirement remain required;256 retained entries currently fail closed.
+No blanket restart-safe application reconciliation or full snapshot acceptance
+is claimed.
+
+The frozen integration passed1,567 offline module tests, full typecheck and
+production build. Logs: `/workspace/kata-snapshot-integration-modules-11.log`,
+`/workspace/kata-snapshot-integration-typecheck-21.log` and
+`/workspace/kata-snapshot-integration-build-8.log`. Existing duplicate-import,
+listener and BigInt-target warnings remain visible. These are not live Docker,
+whole-instance, capacity, DinD or deployment acceptance.
 No deployment, service installation or unrelated workload shutdown is approved.
 
 ## Storage/config and initialized inventory continuation, 2026-10-02

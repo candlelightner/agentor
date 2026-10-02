@@ -13,8 +13,9 @@ import {
   validateHostMountCatalogSource,
   validateHostMountTarget,
 } from './host-mount-store';
-import { withOperationDeadline, operationSettlement, type OperationFailureWithSettlement } from './operation-deadline';
+import { combineSettlements, withOperationDeadline, operationSettlement, type OperationFailureWithSettlement } from './operation-deadline';
 import { openDockerArchiveTransfer } from './docker-archive-transfer';
+import { createDockerCommandExecTransport, type DockerCommandExecTransport } from './docker-command-exec-transport';
 import { resolveWorkerRuntimePolicy, KATA_DOCKER_RUNTIME } from './worker-runtime-policy';
 import type { LegacyPrivilegeGrant } from './worker-runtime-policy';
 import type { WorkerRuntimeProfile } from '../../shared/types';
@@ -1338,16 +1339,22 @@ for item in json.loads(sys.stdin.readline()):
       timeoutMs?: number;
       /** Fixed server-owned label only; never pass a command or secret. */
       operationLabel?: string;
+      /** Internal offline test seam; production uses the effective local modem. */
+      commandTransport?: DockerCommandExecTransport;
     } = {},
   ): Promise<ExecCaptureResult> {
-    const container = this.docker.getContainer(containerId);
     const timeoutMs = opts.timeoutMs ?? DOCKER_EXEC_TIMEOUT_MS;
     const label = opts.operationLabel ?? 'Docker worker command';
+    const transport = opts.commandTransport ?? createDockerCommandExecTransport({ modem: this.docker.modem, timeoutMs });
     return withOperationDeadline(async (operationSignal) => {
       let stream: Duplex | undefined;
       let closed: Promise<void> | undefined;
       let stdinSettled: Promise<void> = Promise.resolve();
-      let failureSettlement: Promise<void> | undefined;
+      const failureSettlements: Promise<void>[] = [];
+      const retainFailure = (error: unknown) => {
+        const settlement = combineSettlements(error);
+        if (settlement) failureSettlements.push(settlement);
+      };
       let stdout: PassThrough | undefined;
       let stderr: PassThrough | undefined;
       let failCapture: ((error: Error) => void) | undefined;
@@ -1357,42 +1364,27 @@ for item in json.loads(sys.stdin.readline()):
       };
       operationSignal.addEventListener('abort', abortStream, { once: true });
       try {
-        const exec = await container.exec({
-          Cmd: cmd,
-          AttachStdin: !!opts.stdin,
-          AttachStdout: true,
-          AttachStderr: true,
-          Tty: false,
-          ...(opts.user ? { User: opts.user } : {}),
-          ...(opts.workdir ? { WorkingDir: opts.workdir } : {}),
-          abortSignal: operationSignal,
-        });
+        const execId = await transport.setup(containerId, cmd, {
+          stdin: !!opts.stdin,
+          ...(opts.user ? { user: opts.user } : {}),
+          ...(opts.workdir ? { workdir: opts.workdir } : {}),
+        }, operationSignal);
         operationSignal.throwIfAborted();
-        stream = await exec.start({
-          Detach: false, Tty: false, stdin: !!opts.stdin, hijack: true,
-          abortSignal: operationSignal,
-        }) as Duplex;
+        stream = await transport.start(execId, operationSignal);
         const attach = stream;
         // `end`, `destroyed`, and a close notification alone do not prove that
         // native stream finalization has finished. Retain the actual closed state.
-        // docker-modem's non-upgrade HTTP duplex overrides destroy without
-        // finalizing itself, and its write callback does not track req.write.
-        // In that fallback, own its exposed native components and write directly
-        // to the request instead of trusting the wrapper's synthetic callback.
-        const httpAttach = attach as Duplex & { req?: import('node:http').ClientRequest;
-          _output?: import('node:http').IncomingMessage; socket?: import('node:net').Socket };
-        const components = httpAttach.req && httpAttach._output
-          ? [httpAttach.req, httpAttach._output, httpAttach._output.socket].filter(Boolean)
-          : [attach, httpAttach.req, httpAttach.socket].filter((component) => component != null);
-        closed = Promise.all(components.map(component => new Promise<void>((resolve) => {
+        // The reviewed native Duplex owns its requests, sockets, responses and
+        // exact native write callbacks for both 101 and 200 start responses.
+        closed = new Promise<void>((resolve) => {
           const check = () => {
-            if (!component.closed) return;
-            component.removeListener('close', check);
+            if (!attach.closed) return;
+            attach.removeListener('close', check);
             resolve();
           };
-          component.on('close', check);
+          attach.on('close', check);
           check();
-        }))).then(() => undefined);
+        });
         stdout = new PassThrough();
         stderr = new PassThrough();
         const captures = Promise.all([this.streamToBuffer(stdout), this.streamToBuffer(stderr)]);
@@ -1401,7 +1393,7 @@ for item in json.loads(sys.stdin.readline()):
         let captureEnded = false;
         let attachFailure: Error | undefined;
         const finishCapture = (err?: Error) => {
-          if (err) attachFailure ??= err;
+          if (err) { attachFailure ??= err; retainFailure(err); }
           if (captureEnded) return;
           captureEnded = true;
           if (err) { stdout!.destroy(err); stderr!.destroy(err); }
@@ -1414,23 +1406,16 @@ for item in json.loads(sys.stdin.readline()):
         });
         // Keep the error listener until closure, including abandoned late streams.
         attach.on('error', (err) => finishCapture(err));
-        for (const component of components) {
-          if (component !== attach) component.on('error', (err) => finishCapture(err));
-          component.on('close', () => {
-            if (component.closed && !captureEnded && !attach.readableEnded &&
-                !httpAttach._output?.readableEnded) {
-              finishCapture(new Error('Docker command native attach closed before end'));
-            }
-          });
-        }
         if (operationSignal.aborted) {
           abortStream();
           operationSignal.throwIfAborted();
         }
-        container.modem.demuxStream(attach, stdout, stderr);
+        this.docker.modem.demuxStream(attach, stdout, stderr);
         if (opts.stdin) {
           stdinSettled = new Promise<void>((resolve, reject) => {
-            (httpAttach.req ?? attach).write(opts.stdin!, (error?: Error | null) => error ? reject(error) : resolve());
+            attach.write(opts.stdin!, (error?: Error | null) => {
+              if (error) { retainFailure(error); reject(error); } else resolve();
+            });
           });
           void stdinSettled.catch(() => undefined);
         }
@@ -1443,18 +1428,22 @@ for item in json.loads(sys.stdin.readline()):
         await closed;
         operationSignal.throwIfAborted();
         if (attachFailure) throw attachFailure;
-        let info = await exec.inspect({ abortSignal: operationSignal });
+        // Closing client transports is not proof the daemon command stopped.
+        // Only a valid terminal inspection supplies this invocation's result;
+        // caller cancellation/failure does not clear separate durable uncertainty.
+        let info = await transport.inspect(execId, operationSignal);
         for (let attempt = 0; (info.ExitCode == null || info.Running === true) && attempt < 20; attempt++) {
           await new Promise((resolve) => setTimeout(resolve, 25));
           operationSignal.throwIfAborted();
-          info = await exec.inspect({ abortSignal: operationSignal });
+          info = await transport.inspect(execId, operationSignal);
         }
-        if (info.Running !== false || !Number.isSafeInteger(info.ExitCode) || info.ExitCode! < 0) {
+        operationSignal.throwIfAborted();
+        if (info.Running !== false || !Number.isSafeInteger(info.ExitCode) || info.ExitCode! < 0 || info.ExitCode! > 255) {
           throw new Error('Docker command has no valid terminal exit status');
         }
         return { stdout: stdoutBuf, stderr: stderrBuf, exitCode: info.ExitCode! };
       } catch (error) {
-        failureSettlement = (error as OperationFailureWithSettlement | undefined)?.[operationSettlement];
+        retainFailure(error);
         throw error;
       } finally {
         stream?.destroy();
@@ -1463,8 +1452,8 @@ for item in json.loads(sys.stdin.readline()):
         await Promise.all([
           closed,
           stdinSettled.catch(() => undefined),
-          failureSettlement?.catch(() => undefined),
         ]);
+        for (let index = 0; index < failureSettlements.length; index++) await failureSettlements[index];
         operationSignal.removeEventListener('abort', abortStream);
       }
     }, timeoutMs, label, opts.signal);

@@ -4,10 +4,12 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { DockerService } from '../../orchestrator/server/utils/docker';
 import { operationSettlement } from '../../orchestrator/server/utils/operation-deadline';
 import { createRequire } from 'node:module';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createServer as createUnixServer, type Socket } from 'node:net';
+import { createDockerCommandExecTransport, type DockerCommandExecTransport } from '../../orchestrator/server/utils/docker-command-exec-transport';
+import { InstanceControlPlaneCoordinator } from '../../orchestrator/server/utils/instance-control-plane-coordinator';
 
 const require = createRequire(new URL('../../orchestrator/package.json', import.meta.url));
 const Docker = require('dockerode');
@@ -27,17 +29,17 @@ function fixture(info: any = { Running: false, ExitCode: 0 }) {
   });
   let inspections = 0;
   const controls = {
-    setup: async (): Promise<any> => exec,
+    setup: async (): Promise<string> => 'a'.repeat(64),
     start: async (): Promise<Duplex> => { started.resolve(); return stream; },
     inspect: async (): Promise<any> => { inspections++; return info; },
     demux: (source: Duplex, stdout: any) => source.on('data', chunk => stdout.write(chunk)),
   };
-  const exec = { start: () => controls.start(), inspect: () => controls.inspect() };
   const service = Object.create(DockerService.prototype) as DockerService;
-  (service as any).docker = { getContainer: () => ({ exec: () => controls.setup(), modem: {
+  (service as any).docker = { getContainer: () => { throw new Error('Dockerode command path forbidden'); }, modem: {
     demuxStream: (source: Duplex, stdout: any) => controls.demux(source, stdout),
-  } }) };
-  const run = (options: any = {}) => service.execCapture('synthetic', ['synthetic'], { timeoutMs: 1500, ...options });
+  } };
+  const commandTransport: DockerCommandExecTransport = { setup: () => controls.setup(), start: () => controls.start(), inspect: () => controls.inspect() };
+  const run = (options: any = {}) => service.execCapture('synthetic', ['synthetic'], { timeoutMs: 1500, commandTransport, ...options });
   return { run, stream, started, writing, destroying, controls,
     inspections: () => inspections,
     close: () => finishDestroy?.(), write: (error?: Error) => finishWrite?.(error),
@@ -122,7 +124,7 @@ test('cancellation during inspection retains the late inspection promise', async
 for (const info of [{ Running: false }, { Running: false, ExitCode: null },
   { Running: true, ExitCode: 0 }, { Running: false, ExitCode: '0' },
   { Running: false, ExitCode: NaN }, { Running: false, ExitCode: -1 },
-  { Running: false, ExitCode: 0.5 }, { ExitCode: 0 }])
+  { Running: false, ExitCode: 0.5 }, { Running: false, ExitCode: 256 }, { ExitCode: 0 }])
   test(`rejects invalid terminal status Running=${info.Running}, ExitCode=${String(info.ExitCode)}`, async () => {
     const f = fixture(info), pending = f.run();
     const failed = expect(pending).rejects.toThrow('no valid terminal exit status');
@@ -145,12 +147,72 @@ test('failed setup preserves exposed late settlement rather than dropping it', a
   await delay(5); expect(settled).toBe(false); held.resolve(); await settlement;
 });
 
+for (const phase of ['start', 'inspect'] as const)
+  test(`failed native ${phase} retains exposed settlement`, async () => {
+    const f = fixture(), held = deferred();
+    const error = Object.freeze(Object.defineProperty(new Error(`synthetic ${phase}`), operationSettlement, { value: held.promise }));
+    f.controls[phase] = async () => { if (phase === 'start') f.started.resolve(); throw error; };
+    const pending = f.run({ timeoutMs: 30 }).catch(value => value);
+    if (phase === 'inspect') { await f.started.promise; await delay(0); f.end(); await f.destroying.promise; f.close(); }
+    const failed = await pending; expect(failed.code).toBe('DOCKER_OPERATION_TIMEOUT');
+    let settled = false; const settlement = failed[operationSettlement].then(() => { settled = true; });
+    await delay(5); expect(settled).toBe(false); held.resolve(); await settlement;
+  });
+
+test('late stdin error settlement remains linked after caller cancellation', async () => {
+  const f = fixture(), held = deferred(), abort = new AbortController();
+  const pending = f.run({ stdin: Buffer.from('synthetic'), signal: abort.signal }).catch(error => error);
+  await f.writing.promise; abort.abort(); const error = await pending;
+  await f.destroying.promise; f.close();
+  f.write(Object.freeze(Object.defineProperty(new Error('synthetic late stdin'), operationSettlement, { value: held.promise })));
+  let settled = false; const settlement = error[operationSettlement].then(() => { settled = true; });
+  await delay(5); expect(settled).toBe(false); held.resolve(); await settlement;
+});
+
+test('default command transport rejects a remote effective modem without Dockerode fallback', async () => {
+  const service = Object.create(DockerService.prototype) as DockerService; let fallback = false;
+  (service as any).docker = { modem: { protocol: 'http', host: 'synthetic-remote' },
+    getContainer: () => { fallback = true; throw new Error('unexpected fallback'); } };
+  await expect(service.execCapture('synthetic', ['synthetic'])).rejects.toMatchObject({ code: 'DOCKER_COMMAND_ENDPOINT_UNSUPPORTED' });
+  expect(fallback).toBe(false);
+});
+
+test('capture forwards server-owned setup identity and options without changing argv', async () => {
+  const f = fixture(); let setup: any[] | undefined;
+  const commandTransport: DockerCommandExecTransport = {
+    setup: async (...args) => { setup = args; return 'a'.repeat(64); },
+    start: () => f.controls.start(), inspect: () => f.controls.inspect(),
+  };
+  const pending = f.run({ commandTransport, stdin: Buffer.alloc(0), user: 'agent', workdir: '/workspace' });
+  await f.writing.promise; f.write(); f.end(); await f.destroying.promise; f.close(); await pending;
+  expect(setup?.slice(0, 3)).toEqual(['synthetic', ['synthetic'], { stdin: true, user: 'agent', workdir: '/workspace' }]);
+  expect(setup?.[3]).toBeInstanceOf(AbortSignal);
+});
+
+function localTransport(docker: any, path: string, components: any[], onStart: (attach: Duplex) => void) {
+  const coordinator = new InstanceControlPlaneCoordinator();
+  const native = createDockerCommandExecTransport({ modem: docker.modem, coordinator,
+    request: options => {
+      const req = httpRequest({ ...options, socketPath: path }); components.push(req);
+      req.on('socket', socket => components.push(socket));
+      req.on('response', response => components.push(response));
+      req.on('upgrade', response => components.push(response));
+      return req;
+    },
+  });
+  return Object.assign({ ...native, start: async (id: string, signal: AbortSignal) => {
+    const attach = await native.start(id, signal); components.push(attach); onStart(attach); return attach;
+  } } satisfies DockerCommandExecTransport, { coordinator });
+}
+
 for (const mode of ['upgrade', 'http']) test(`native local Unix ${mode} capture closes with stdin receipt`, async () => {
   const directory = await mkdtemp('/workspace/exec-capture-unix-');
   const path = join(directory, 'fixture.sock'), id = 'a'.repeat(64);
   const payload = Buffer.from('synthetic-input'), output = Buffer.from('synthetic-receipt');
   const header = Buffer.alloc(8); header[0] = 1; header.writeUInt32BE(output.length, 4);
-  const frame = Buffer.concat([header, output]);
+  const stderr = Buffer.from('synthetic-stderr'), stderrHeader = Buffer.alloc(8);
+  stderrHeader[0] = 2; stderrHeader.writeUInt32BE(stderr.length, 4);
+  const frame = Buffer.concat([header, output, stderrHeader, stderr]);
   let received = false;
   const server = createServer((req, res) => {
     if (req.url === '/containers/synthetic/exec') {
@@ -186,32 +248,25 @@ for (const mode of ['upgrade', 'http']) test(`native local Unix ${mode} capture 
   // the client requests an upgrade.
   await new Promise<void>(resolve => server.listen(path, resolve));
   const service = Object.create(DockerService.prototype) as DockerService;
-  (service as any).docker = new Docker({ socketPath: path });
-  const container = (service as any).docker.getContainer('synthetic');
-  const nativeExec = container.exec.bind(container);
+  (service as any).docker = new Docker({ socketPath: '/var/run/docker.sock' });
   let components: any[] = [], releaseWrite!: () => void;
   const wrote = deferred();
-  container.exec = async (options: any) => {
-    const exec = await nativeExec(options), nativeStart = exec.start.bind(exec);
-    exec.start = async (startOptions: any) => {
-      const attach = await nativeStart(startOptions);
-      components = attach.req ? [attach.req, attach._output, attach._output.socket] : [attach];
-      const destination = attach.req ?? attach, nativeWrite = destination.write.bind(destination);
-      destination.write = (chunk: Buffer, callback: (error?: Error) => void) => nativeWrite(chunk, (error?: Error) => {
-        releaseWrite = () => callback(error); wrote.resolve();
-      });
-      return attach;
-    };
-    return exec;
-  };
-  (service as any).docker.getContainer = () => container;
+  const commandTransport = localTransport((service as any).docker, path, components, attach => {
+    const nativeWrite = attach.write.bind(attach);
+    attach.write = ((chunk: Buffer, callback: (error?: Error | null) => void) => nativeWrite(chunk, error => {
+      releaseWrite = () => callback(error); wrote.resolve();
+    })) as typeof attach.write;
+  });
   try {
     let complete = false;
-    const pending = service.execCapture('synthetic', ['synthetic'], { stdin: payload, timeoutMs: 2000 })
+    const pending = service.execCapture('synthetic', ['synthetic'], { stdin: payload, timeoutMs: 2000, commandTransport })
       .then(result => { complete = true; return result; });
     await wrote.promise; await delay(10); expect(complete).toBe(false); releaseWrite();
     const result = await pending;
     expect(received).toBe(true); expect(result.stdout.toString()).toBe(output.toString()); expect(result.exitCode).toBe(0);
+    expect(result.stderr.toString()).toBe(stderr.toString());
+    const barrier = commandTransport.coordinator.begin('native-capture', 'snapshot');
+    try { await barrier.drain({ timeoutMs: 1000 }); } finally { barrier.release(); }
     expect(components.every(component => component.closed)).toBe(true);
   } finally {
     server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
@@ -244,31 +299,21 @@ for (const stdin of [false, true]) for (const reason of ['abort', 'premature-clo
       });
     });
     await new Promise<void>(resolve => server.listen(path, resolve));
-    const docker = new Docker({ socketPath: path }), container = docker.getContainer('synthetic');
-    const nativeExec = container.exec.bind(container);
-    container.exec = async (options: any) => {
-      const exec = await nativeExec(options), nativeStart = exec.start.bind(exec);
-      exec.start = async (options: any) => {
-        const attach = await nativeStart(options);
-        components = attach.req && attach._output
-          ? [attach.req, attach._output, attach._output.socket]
-          : [attach, attach.req, attach.socket].filter(Boolean);
-        if (stdin) {
-          const nativeWrite = attach.req.write.bind(attach.req);
-          attach.req.write = (chunk: Buffer, callback: (error?: Error) => void) => nativeWrite(chunk, (error?: Error) => {
-            releaseWrite = () => callback(error); writing.resolve();
-          });
-        }
-        attached.resolve(); return attach;
-      };
-      return exec;
-    };
-    docker.getContainer = () => container;
+    const docker = new Docker({ socketPath: '/var/run/docker.sock' });
+    const commandTransport = localTransport(docker, path, components, attach => {
+      if (stdin) {
+        const nativeWrite = attach.write.bind(attach);
+        attach.write = ((chunk: Buffer, callback: (error?: Error | null) => void) => nativeWrite(chunk, error => {
+          releaseWrite = () => callback(error); writing.resolve();
+        })) as typeof attach.write;
+      }
+      attached.resolve();
+    });
     const service = Object.create(DockerService.prototype) as DockerService;
     (service as any).docker = docker;
     const abort = new AbortController();
     const pending = service.execCapture('synthetic', ['synthetic'], {
-      ...(stdin ? { stdin: Buffer.from('synthetic-payload') } : {}), signal: abort.signal, timeoutMs: 500,
+      ...(stdin ? { stdin: Buffer.from('synthetic-payload') } : {}), signal: abort.signal, timeoutMs: 500, commandTransport,
     }).catch(error => error);
     try {
       await Promise.race([attached.promise, delay(1000).then(() => { throw new Error(`Attach missing; fixture requests: ${requests.join(', ')}`); })]);
@@ -277,7 +322,7 @@ for (const stdin of [false, true]) for (const reason of ['abort', 'premature-clo
       if (stdin && reason === 'premature-close') releaseWrite();
       const error = await pending;
       if (reason === 'abort') expect(error.code).toBe('OPERATION_ABORTED');
-      else expect(error.code).toBeUndefined();
+      else expect(error.message).toContain('Docker command');
       const settlement = error[operationSettlement];
       if (stdin && reason === 'abort') {
         let settled = false; const observed = settlement.then(() => { settled = true; });

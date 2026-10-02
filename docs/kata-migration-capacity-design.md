@@ -96,9 +96,28 @@ actual handle cleanup settlement after interruption. Independent review found
 and corrected read-only-superblock and contradictory-inode/project acceptance;
 89 focused tests now pass. These are synthetic observations, not host support.
 
-There is no concrete Linux reader, protected control-storage adapter,
-allocation envelope, kernel quota non-bypass proof, maintenance fence or
-migration admission wiring. The scanner cannot prove stability between its
+An isolated concrete Linux tree-observation reader uses an operator-built pinned
+native helper and executes its verified descriptor without a shell/PATH lookup. Root
+and child opens are no-follow, special files and symlinks fail closed, and real
+statx/statfs identities bind opaque handles. XFS project/xattr/ACL reads are
+bounded and checked before/after; unsupported filesystems return incomplete
+rather than fabricated counts. Helper acquisition preserves actual read/close
+failure lifetimes, and abort owns the sole child plus inherited pipe closure.
+Independent review reproduced missing STAT mount identity and premature
+failure-settlement retirement; both are fixed.116 focused candidate/reader tests
+pass with narrow independent review. Native supported-STAT serialization uses
+synthetic XFS/ioctl fixtures, not live XFS quota acceptance.
+
+The filesystem identity convention is
+`linuxfs:<dev-major>:<dev-minor>:<16-hex statfs fsid>`; eventual mapper/enrollment
+observations must obtain and verify that same convention. The operator must
+protect the helper, ELF interpreter/libraries, procfs and enrolled root/generation
+policy. No helper installation or host path discovery is performed, and this
+reader is not selected by an application service.
+
+There is still no protected control-storage adapter, allocation envelope,
+kernel quota non-bypass proof, maintenance fence or migration admission wiring.
+The scanner cannot prove stability between its
 observations without those external controls. All mapper/scanner outputs remain
 `admissionReady: false`; the public gate is unchanged.
 
