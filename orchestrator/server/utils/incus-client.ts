@@ -2,6 +2,7 @@ import https from 'node:https';
 import http, { type IncomingHttpHeaders } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import WebSocket from 'ws';
+import { PassThrough, Writable } from 'node:stream';
 import type { Config } from './config';
 
 export class IncusError extends Error {
@@ -218,6 +219,17 @@ export interface IncusInteractiveExecSession {
   close: () => void;
 }
 
+export interface IncusStreamExecSession {
+  stdin: Writable;
+  stdout: PassThrough;
+  stderr: PassThrough;
+  operationId: string;
+  /** Exit status is authoritative operation metadata, not socket closure. */
+  result: Promise<number>;
+  sendSignal: (signal: number) => void;
+  close: () => void;
+}
+
 export interface IncusFilePushOptions {
   mode?: number | string;
   uid?: number;
@@ -323,6 +335,13 @@ export class IncusClient {
 
   isConfigured(): boolean {
     return Boolean(this.endpoint);
+  }
+
+  /** Session owners close their exec channels separately. Release idle REST
+   * connections when an integration fixture/client lifetime ends. */
+  dispose(): void {
+    this.httpsAgent?.destroy();
+    this.httpsAgent = undefined;
   }
 
   private async getAgent(): Promise<https.Agent> {
@@ -495,6 +514,7 @@ export class IncusClient {
   async waitForOperation(
     operationUrlOrId: string,
     timeoutSeconds = 120,
+    signal?: AbortSignal,
   ): Promise<IncusOperationMetadata> {
     const opId = operationUrlOrId.includes('/')
       ? operationUrlOrId.split('/').filter(Boolean).pop()!
@@ -504,6 +524,7 @@ export class IncusClient {
     // An image-backed VM create can outlive one HTTP request. Poll its state
     // without blocking HTTP on /wait or resending the accepted mutation.
     while (Date.now() < deadline) {
+      if (signal?.aborted) throw new IncusError('Incus operation wait cancelled', 499);
       const res = await this.request<IncusOperationMetadata>('GET', path);
       if (res.status === 'Success') return res;
       if (res.status === 'Failure' || res.status_code >= 400) {
@@ -821,6 +842,127 @@ export class IncusClient {
 
   // --- Exec ---
 
+  /** Non-PTY exec preserves binary bytes and separates stdout/stderr. Closing
+   * control cancels the direct command; this does not promise tree-wide kill. */
+  async execStream(
+    name: string,
+    command: string[],
+    options?: IncusInstanceExecOptions & { signal?: AbortSignal; timeoutMs?: number },
+  ): Promise<IncusStreamExecSession> {
+    const signal = options?.signal;
+    if (signal?.aborted) throw new IncusError('Incus exec cancelled', 499);
+    const raw = await this.rawRequest('POST', `/1.0/instances/${encodeURIComponent(name)}/exec`, {
+      command, 'wait-for-websocket': true, interactive: false,
+      environment: options?.environment, cwd: options?.cwd, user: options?.user, group: options?.group,
+    });
+    const json = JSON.parse(raw.body.toString('utf-8')) as IncusResponse<any>;
+    if (json.type === 'error' || raw.statusCode >= 400)
+      throw new IncusError('Incus streaming exec setup failed', raw.statusCode, json.error_code);
+    const opId = json.metadata.id;
+    const fds = json.metadata.metadata?.fds;
+    if (!fds?.['0'] || !fds?.['1'] || !fds?.['2'] || !fds.control)
+      throw new IncusError('Incus exec did not return required websocket descriptors');
+    // No sockets were opened, so Incus's bounded wait-for-websocket prevents
+    // an accepted late setup from launching after caller cancellation.
+    if (signal?.aborted) throw new IncusError('Incus exec cancelled', 499);
+
+    const stdout = new PassThrough(), stderr = new PassThrough();
+    const ended = new Set<string>();
+    const channels: Record<string, WebSocket> = {};
+    let closed = false;
+    let rejectCompletion!: (error: Error) => void;
+    const cancelled = new Promise<never>((_resolve, reject) => { rejectCompletion = reject; });
+    cancelled.catch(() => {});
+    const operationController = new AbortController();
+    const close = (error: Error = new IncusError('Incus exec cancelled', 499)) => {
+      if (closed) return;
+      closed = true;
+      operationController.abort();
+      rejectCompletion(error);
+      for (const channel of Object.values(channels)) channel.terminate();
+      stdout.destroy(error); stderr.destroy(error); stdin.destroy(error);
+    };
+    const stdin = new Writable({
+      write: (chunk, _encoding, callback) => {
+        const socket = channels['0'];
+        if (closed || socket?.readyState !== WebSocket.OPEN) return callback(new IncusError('Incus exec stdin closed', 502));
+        socket.send(Buffer.from(chunk), { binary: true }, callback);
+      },
+      final: (callback) => {
+        const socket = channels['0'];
+        if (socket?.readyState !== WebSocket.OPEN) return callback();
+        socket.send('', { binary: false }, (error) => { socket.close(); callback(error); });
+      },
+    });
+    // Preserve rejection through result even if a socket fails before the
+    // caller receives the session and installs stream error listeners.
+    for (const stream of [stdin, stdout, stderr]) stream.on('error', () => {});
+    const outputDone = Promise.all(['1', '2'].map((fd) => new Promise<void>((resolve) => {
+      const output = fd === '1' ? stdout : stderr;
+      output.once('finish', resolve);
+    })));
+    const abort = () => close();
+    signal?.addEventListener('abort', abort, { once: true });
+    const timer = setTimeout(() => close(new IncusError('Incus exec timed out', 408)), options?.timeoutMs ?? 120_000);
+    timer.unref?.();
+    if (signal?.aborted) abort();
+    const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); };
+    try {
+      const attach = (fd: string, socket: WebSocket) => {
+        channels[fd] = socket;
+        if (closed) { socket.terminate(); return; }
+        socket.on('error', () => close(new IncusError('Incus exec channel failed', 502)));
+        if (fd !== '1' && fd !== '2') return;
+        const output = fd === '1' ? stdout : stderr;
+        const finish = () => {
+          if (ended.has(fd)) return;
+          ended.add(fd);
+          output.end();
+          socket.close();
+          if (ended.has('1') && ended.has('2')) {
+            ended.add('0');
+            channels['0']?.close();
+          }
+        };
+        socket.on('message', (bytes: Buffer, binary) => {
+          if (!binary) { finish(); return; }
+          if (!ended.has(fd) && !output.write(bytes)) socket.pause();
+        });
+        output.on('drain', () => socket.resume());
+        socket.on('close', () => {
+          if (!ended.has(fd)) close(new IncusError('Incus exec output closed before EOF', 502));
+        });
+      };
+      // The daemon may launch a non-PTY command before control attaches for
+      // older-client compatibility. Connect control first, so a fast command
+      // cannot close it normally during its own handshake.
+      await this.openExecWebSockets(opId, { control: fds.control }, attach);
+      await this.openExecWebSockets(opId, { '0': fds['0'], '1': fds['1'], '2': fds['2'] }, attach, (fd) => ended.has(fd));
+      if (closed) throw new IncusError('Incus exec cancelled during setup', 499);
+      const result = Promise.race([cancelled, (async () => {
+        await outputDone;
+        const operation = await this.waitForOperation(opId, 120, operationController.signal);
+        const code = operation.metadata?.return;
+        if (!Number.isInteger(code)) throw new IncusError('Incus exec omitted its exit status', 502);
+        return code as number;
+      })()]).catch((error) => { close(error); throw error; }).finally(() => {
+        cleanup();
+        for (const channel of Object.values(channels)) channel.close();
+      });
+      result.catch(() => {});
+      return { stdin, stdout, stderr, operationId: opId, result, close,
+        sendSignal: (signalNumber) => {
+          if (channels.control?.readyState === WebSocket.OPEN)
+            channels.control.send(JSON.stringify({ command: 'signal', signal: signalNumber }));
+        },
+      };
+    } catch (error) {
+      close(error instanceof Error ? error : new IncusError('Incus exec setup failed', 502));
+      cleanup();
+      throw error;
+    }
+  }
+
   async exec(
     name: string,
     command: string[],
@@ -901,27 +1043,15 @@ export class IncusClient {
       throw new IncusError('Incus interactive exec did not return required websocket descriptors');
     }
 
-    const wsBaseUrl = this.endpoint.replace(/^http(s?):/, 'ws$1:');
-    const dataWsUrl = `${wsBaseUrl}/1.0/operations/${encodeURIComponent(opId)}/websocket?secret=${encodeURIComponent(fds['0'])}`;
-    const controlWsUrl = `${wsBaseUrl}/1.0/operations/${encodeURIComponent(opId)}/websocket?secret=${encodeURIComponent(fds['control'])}`;
-
-    const isHttps = this.endpoint.startsWith('https:');
-    const agent = isHttps ? await this.getAgent() : undefined;
-    const wsOpts = agent ? { agent } : undefined;
-    const dataWs = new WebSocket(dataWsUrl, wsOpts);
-    const controlWs = new WebSocket(controlWsUrl, wsOpts);
-
-    // Wait for both sockets to establish connection
-    await Promise.all([
-      new Promise<void>((resolve, reject) => {
-        dataWs.once('open', () => resolve());
-        dataWs.once('error', reject);
-      }),
-      new Promise<void>((resolve, reject) => {
-        controlWs.once('open', () => resolve());
-        controlWs.once('error', reject);
-      }),
-    ]);
+    const sockets = await this.openExecWebSockets(opId, { '0': fds['0'], control: fds.control });
+    const dataWs = sockets['0']!;
+    const controlWs = sockets.control!;
+    // Incus signals output EOF with a TEXT frame, not a WebSocket close.
+    // Close the data channel at that barrier so its stdin mirror also ends;
+    // otherwise a successfully exited PTY command can leave /operations busy.
+    dataWs.on('message', (_bytes, binary) => {
+      if (!binary && dataWs.readyState === WebSocket.OPEN) dataWs.close();
+    });
 
     const session: IncusInteractiveExecSession = {
       dataWs,
@@ -933,7 +1063,7 @@ export class IncusClient {
             controlWs.send(
               JSON.stringify({
                 command: 'window-resize',
-                args: { width: cols, height: rows },
+                args: { width: String(cols), height: String(rows) },
               }),
             );
           } catch {}
@@ -945,7 +1075,7 @@ export class IncusClient {
             controlWs.send(
               JSON.stringify({
                 command: 'signal',
-                args: { signal },
+                signal,
               }),
             );
           } catch {}
@@ -962,6 +1092,63 @@ export class IncusClient {
     };
 
     return session;
+  }
+
+  /** Project-scoped exec channels use the same pinned mTLS agent as REST.
+   * Bound every handshake and tear down all partially connected channels.
+   * Keep descriptor secrets out of diagnostics. */
+  private async openExecWebSockets(operationId: string, descriptors: Record<string, string>,
+    onSocket?: (fd: string, socket: WebSocket) => void,
+    finished?: (fd: string) => boolean,
+  ): Promise<Record<string, WebSocket>> {
+    const agent = this.endpoint.startsWith('https:') ? await this.getAgent() : undefined;
+    const sockets: Record<string, WebSocket> = {};
+    let disposed = false;
+    let ready = false;
+    const dispose = () => {
+      if (disposed) return;
+      disposed = true;
+      for (const socket of Object.values(sockets)) socket.terminate();
+    };
+    const pending: Promise<void>[] = [];
+    try {
+      for (const [fd, secret] of Object.entries(descriptors)) {
+        const url = new URL(`/1.0/operations/${encodeURIComponent(operationId)}/websocket`, this.endpoint);
+        url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+        url.searchParams.set('project', this.project);
+        url.searchParams.set('secret', secret);
+        const socket = sockets[fd] = new WebSocket(url, { agent, handshakeTimeout: Math.min(this.timeoutMs, 30_000) });
+        onSocket?.(fd, socket);
+        // An error after setup must still close the other channel, and must
+        // never become an unhandled EventEmitter error during late teardown.
+        socket.on('error', dispose);
+        pending.push(new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new IncusError('Incus exec websocket handshake timed out', 408)), Math.min(this.timeoutMs, 30_000));
+          const finish = (error?: Error) => {
+            clearTimeout(timeout);
+            error ? reject(error) : resolve();
+          };
+          socket.once('open', () => finish());
+          socket.once('error', () => finish(new IncusError('Incus exec websocket handshake failed', 502)));
+          socket.once('close', () => {
+            finish(new IncusError('Incus exec websocket closed during setup', 502));
+            // An already opened channel can close while a sibling still
+            // waits. Its resolved promise alone is not a usable session.
+            if (!ready && !finished?.(fd)) dispose();
+          });
+        }));
+      }
+      await Promise.all(pending);
+      if (Object.entries(sockets).some(([fd, socket]) => socket.readyState !== WebSocket.OPEN && !finished?.(fd)))
+        throw new IncusError('Incus exec websocket closed during setup', 502);
+      ready = true;
+      return sockets;
+    } catch (error) {
+      dispose();
+      // Observe every late handshake rejection, including constructor failure.
+      await Promise.allSettled(pending);
+      throw error;
+    }
   }
 
   // --- Storage Volumes ---

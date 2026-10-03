@@ -39,6 +39,7 @@ export default defineConfig({
     "api/worker-self-access-policy.spec.ts",
     "api/worker-runtime-kind.spec.ts",
     "api/incus-client.spec.ts",
+    "api/incus-exec-transport.spec.ts",
     "api/incus-derived-image.spec.ts",
     "api/incus-worker-runtime.spec.ts",
     "api/incus-worker-network.spec.ts",
