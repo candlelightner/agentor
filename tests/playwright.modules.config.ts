@@ -23,6 +23,7 @@ export default defineConfig({
     "api/management-image-backup-domain.spec.ts",
     "api/management-worker-domain.spec.ts",
     "api/provider-http.spec.ts",
+    "api/resource-monitor-lifecycle.spec.ts",
     "api/worker-self-access-policy.spec.ts",
     "api/workspace-download-cancellation.spec.ts",
   ],

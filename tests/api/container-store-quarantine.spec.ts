@@ -515,3 +515,69 @@ test("one unresponsive runtime does not block reconciliation of another worker",
   });
   expect(manager.get("worker-2")).toMatchObject({ status: "running" });
 });
+
+function reconciliationFixture(running: boolean) {
+  const record = { ...workerRecord(), desiredRuntimeStatus: "running" as const };
+  const calls = { inspect: 0, restart: 0, stop: 0, start: 0, create: 0, remove: 0 };
+  const manager = new ContainerManager({
+    inspectContainerRuntime: async () => {
+      calls.inspect++;
+      return { running, restartPolicy: "unless-stopped", secretHandshakeRequired: false };
+    },
+    updateContainerRestartPolicy: async () => undefined,
+    restartContainer: async () => { calls.restart++; },
+    stopContainer: async () => { calls.stop++; },
+    startContainer: async () => { calls.start++; },
+    createWorkerContainer: async () => { calls.create++; },
+    removeContainer: async () => { calls.remove++; },
+    materializeWorkerSecretFiles: async () => undefined,
+    probeContainerTask: async () => undefined,
+  } as any, { containerPrefix: "agentor-worker" } as any);
+  manager.setWorkerStore({
+    get: () => record,
+    upsert: async () => undefined,
+    listActive: () => [record],
+    listArchived: () => [],
+    setDesiredRuntimeStatus: async () => record,
+  } as any);
+  const worker = {
+    ...record, status: "running", containerId: "docker-worker-1",
+    containerName: "agentor-worker-worker-1", imageName: "agentor-worker:latest", imageId: "sha256:image",
+  };
+  (manager as any).containers.set(record.id, worker);
+  (manager as any).assertOwnerExists = async () => undefined;
+  (manager as any).resolveUserEnvAndBinds = async () => ({ groupSecrets: [] });
+  (manager as any).reconcileWorkerPlugins = async () => undefined;
+  return { manager, worker, calls };
+}
+
+test("reconciliation preserves an unknown worker when Docker confirms it is running", async () => {
+  const { manager, worker, calls } = reconciliationFixture(true);
+  manager.reportRuntimeFailure(worker.id, "Docker tmux listing", new Error("tmux listing timed out"), worker.containerId);
+  expect(manager.get(worker.id)?.status).toBe("unknown");
+  const before = structuredClone(manager.get(worker.id));
+  const lifecycleCalls: string[] = [];
+  manager.restart = async () => { lifecycleCalls.push("restart"); };
+  manager.stop = async () => { lifecycleCalls.push("stop"); };
+  manager.unarchive = async () => { lifecycleCalls.push("unarchive"); return worker as any; };
+
+  await manager.reconcileWorkers();
+
+  expect(lifecycleCalls).toEqual([]);
+  expect(calls).toEqual({ inspect: 1, restart: 0, stop: 0, start: 0, create: 0, remove: 0 });
+  expect(manager.get(worker.id)).toEqual(before);
+  expect(manager.list()).toHaveLength(1);
+});
+
+test("reconciliation still starts the existing desired-running worker when Docker confirms it is stopped", async () => {
+  const { manager, worker, calls } = reconciliationFixture(false);
+  manager.reportRuntimeFailure(worker.id, "Docker tmux listing", new Error("tmux listing failed"), worker.containerId);
+
+  await manager.reconcileWorkers();
+
+  expect(calls).toEqual({ inspect: 2, restart: 0, stop: 0, start: 1, create: 0, remove: 0 });
+  expect(manager.get(worker.id)).toMatchObject({
+    id: worker.id, containerId: "docker-worker-1", containerName: "agentor-worker-worker-1",
+    desiredRuntimeStatus: "running", status: "running",
+  });
+});

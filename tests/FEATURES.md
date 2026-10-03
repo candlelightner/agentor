@@ -252,6 +252,7 @@ Every user-facing feature of the Agentor web dashboard, organized by category. T
 - When the worker is running, a compact metrics row (`data-testid="worker-metrics"`) shows live **CPU %** (of total host, from `docker stats`), **RAM** used bytes (limit in the tooltip — no percentage), **Disk** used bytes (the container's writable filesystem layer + its `/workspace` + agent data), and network throughput (↓ down / ↑ up). CPU/RAM colorize green/amber/red by threshold (<50 / 50-79 / ≥80).
 - Sampled once in the sidebar via `useWorkerMetrics()` (one 10s poll → `GET /api/worker-metrics`) and passed to each card as a `metric` prop (no per-card polling). cpu/mem/net come from bounded `container.stats` calls on a 3s server cadence. Durable disk is sampled server-side on a slower (60s) cadence with a bounded in-worker `du` of `/workspace` plus agent data. Docker `SizeRw`, disposable rootfs changes, and DinD storage are intentionally excluded so an expensive storage-driver walk cannot obstruct lifecycle recovery. 0 until first sampled; `POST /api/worker-metrics/refresh` forces an immediate sample.
 - Hidden when the worker is not running or has not been sampled yet.
+- Failed or timed-out Docker stats samples report unavailable metrics and log the error without changing worker lifecycle state; sampling can resume on the next poll.
 
 ### 4.1a Settings Pencil
 - A "Settings" pencil button (icon `i-lucide-pencil`, wrapped in `<UTooltip text="Settings">`) sits in the card's action button row
@@ -972,6 +973,7 @@ See §20b for the bridge. The endpoint sets the worker's X11 CLIPBOARD selection
 - `POST /api/containers/:id/stop` — stop worker
 - `POST /api/containers/:id/restart` — restart worker
 - Runtime observations are verified independently of Docker inventory. An unresponsive task is reported as `unknown` with a retryable, secret-safe diagnostic rather than stale `running`; only the affected worker is degraded.
+- Reconciliation never restarts a desired-running worker merely because its status is `unknown` when Docker inspection confirms that its container is running. Desired-running workers confirmed stopped still use managed startup recovery.
 - `POST /api/containers/:id/recover` — persistence-first managed recovery for an unknown/unresponsive worker. It verifies authorized/persistent mounts before replacing only the disposable container, re-runs secret bootstrap and plugin reconciliation, and preserves workspace, agent-data, DinD, selected persistent-path volumes, and the worker record. If recovery cannot verify persistence, it makes no Docker mutation.
 - Desired runtime state is durable: after a Docker daemon restart, secret-bearing desired-running workers wait for Agentor's authenticated bootstrap instead of daemon auto-start, while explicitly stopped workers remain stopped.
 - `DELETE /api/containers/:id` — remove worker (cleans up port/domain mappings, volumes, store)

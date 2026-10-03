@@ -167,7 +167,8 @@ export class ResourceMonitor {
           if (!stale()) this.workers.set(c.containerName, this.computeWorkerMetrics(c, stats, now));
         } catch (err) {
           if (stale()) return;
-          this.containers.reportRuntimeFailure(c.id, 'Docker worker stats', err, containerId);
+          // Telemetry failures are not evidence that the worker stopped.
+          useLogger().warn(`[resource-monitor] stats(${c.containerName}) failed: ${err instanceof Error ? err.message : err}`);
           this.workers.set(c.containerName, {
             workerId: c.id,
             containerName: c.containerName,
@@ -184,7 +185,7 @@ export class ResourceMonitor {
             blkWriteBytesPerSec: 0,
             lastChecked: now,
             error:
-              'Worker runtime metrics are unavailable. Retry the request or use managed recovery.',
+              'Worker runtime metrics are unavailable. Retry the request.',
           });
         }
       }),

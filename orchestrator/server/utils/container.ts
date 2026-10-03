@@ -497,7 +497,7 @@ export class ContainerManager {
     this.runtimeObservations.delete(info.containerId);
   }
 
-  /** Metrics/log/terminal paths use this to invalidate optimistic Docker list
+  /** Log/terminal paths use this to invalidate optimistic Docker list
    * state. The next inventory refresh performs an independent task probe. */
   reportRuntimeFailure(id: string, operation: string, error: unknown, observedContainerId?: string): void {
     const info = this.containers.get(id);
@@ -5177,8 +5177,9 @@ for p in sys.argv[1:]:
           await this.stop(info.id);
         else if (
           info.desiredRuntimeStatus === "running" &&
-          (!runtime.running || info.status === "unknown")
+          !runtime.running
         )
+          // Failed observability probes must not restart a running worker.
           await this.restart(info.id);
       } catch (error) {
         this.markRuntimeUnknown(info, "Worker startup reconciliation", error);

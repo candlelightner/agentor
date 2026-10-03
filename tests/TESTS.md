@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **2147 tests** across 215 test files (1516 API across 150 files + 631 UI across 65 files), as enumerated with the Playwright list reporter
+- **2151 tests** across 215 test files (1520 API across 150 files + 631 UI across 65 files), as enumerated with the Playwright list reporter
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -108,13 +108,13 @@ tests/
     worker-lifecycle.ts    # Container create/cleanup utilities
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
-    api/                     # API endpoint tests (1516 tests across 150 files)
+    api/                     # API endpoint tests (1520 tests across 150 files)
   ui/                      # UI interaction tests (631 tests across 65 files)
 ```
 
 ## Test Categories
 
-### API Tests (1516 tests, 150 files)
+### API Tests (1520 tests, 150 files)
 
 | File | Tests | Coverage |
 | --- | ---: | --- |
@@ -232,7 +232,7 @@ tests/
 | `managed-volume-sizing-mcp-authority.spec.ts` | 7 | Management-MCP size-start authorization rechecks credential, policy, workspace binding, target identity, owner, and live group descendants around asynchronous discovery and manager admission. |
 | `managed-volume-helper.spec.ts` | 3 | Isolated-Docker trusted live-mount helper: both worker privilege states retain their own privilege setting, and a busy path is rejected without replacing contents. |
 | `managed-volume-mcp.spec.ts` | 1 | Delegated management-MCP volume inventory, size jobs, and mutations are limited to the live group subtree and revoked with membership. |
-| `resource-monitor-lifecycle.spec.ts` | 2 | No-server resource-monitor lifecycle regression: a stale stats failure from a replaced container cannot mark its replacement unknown, while a current-runtime failure still reports unknown health. |
+| `resource-monitor-lifecycle.spec.ts` | 4 | No-server resource-monitor lifecycle regression: stale failures are discarded; rejected/timed-out stats samples report unavailable metrics and log the error without changing worker lifecycle state; subsequent sampling resumes without recovery. Runs through the modules CI configuration. |
 | `image-catalog.spec.ts`           | 16    | Controlled local image definitions/builds: Safe actionable rejection and explicit Advanced boundary, approved bases/context/legacy-fragment policy, requestId-idempotent async build/validation/test-worker jobs with logs/cancellation, immutable digests, distinct compatibility outcomes and promotion/test-worker gates, rollback/defaults, cleanup, ownership, and legacy normalization without a separate database migration. |
 | `git-image-catalog.spec.ts`       | 9     | Mocked GitHub catalog connection, encrypted write-only PAT handling, initial empty-repository diagnostics, push/pull conflict safety, recovery, branch/PR metadata, immutable GHCR digests, disconnect, and credential redaction.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `image-catalog-hierarchy.spec.ts` | 29 | Transactional image/Git store rollback, deleted-owner fencing that prevents stale Git connections from resurrecting credentials, corruption fail-closed behavior, controlled/fake builder terminalization after persistence failures, durable definition-artifact deletion recovery, Git-exported plugin imageBuild Dockerfile/context reproduction with stable-ID recovery, first/subsequent direct plus branch/PR push and provenance-bound pull retry reconciliation without duplicate remote commits, branches, PRs, or Actions dispatches, recursive image visibility/manageability, legacy Safe/Ready normalization, provisioning boundaries, idempotent async outcomes, promotion gates, paged logs, and cancellation. |
@@ -241,7 +241,7 @@ tests/
 | `admin-management-mcp.spec.ts`    | 21    | Internal management MCP workload authentication, per-call fail-closed policy and discovery filtering, redaction, auditing, expiring workspace-bound credentials, traversal-safe real-owner selection with valid cross-user administration, platform-admin-only whole-instance recovery namespaces, exact selected-member backup restore with active-artifact deletion pinning, lock enforcement across legacy lifecycle/configuration/app/exposure aliases, harness-controlled immutable proposal application, selected-worker console open/read/write/interrupt/close, plugin administration, and mapping/app capability discovery, ownership-derived mapping lifecycle, and live enable/disable denial. |
 | `management-owner-validation.spec.ts` | 14 | Shared management owner boundary: valid cross-user targets, platform-admin-only whole-instance recovery namespaces, nonexistent-owner rejection, `..`/absolute/slash/backslash/percent-encoded-ish traversal rejection, no filesystem/map mutation on invalid user-env writes, quarantine of persisted cross-partition owner/path metadata, retry-safe transactional single/bulk/owner deletion, serialized same-key failure rollback, recoverable tombstone persistence queues, and backward-compatible loading of historical URL-safe ids containing `-`/`_` without rewriting source files. |
 | `config-store-integrity.spec.ts` | 6 | Owner-partition persistence integrity: detached ingress/get/list/predicate snapshots, stale reload hiding, fail-closed `keyFn` exceptions, corrupt/malformed/mismatched-owner account env and worker configuration quarantine, healthy-owner isolation, source-byte preservation, explicit cleanup recovery, and detached worker-configuration results. |
-| `container-store-quarantine.spec.ts` | 9 | Managed Docker containers without authoritative WorkerStore metadata are quarantined and never resurrected as ownerless workers; desired-state migration, unknown runtime diagnostics, rejection of directly started secret runtimes without a valid handshake, stale-sync fencing across replacement/archive, bounded secret-bootstrap retry/stop-start recovery, and failure-isolated reconciliation are covered. |
+| `container-store-quarantine.spec.ts` | 15 | Managed Docker containers without authoritative WorkerStore metadata stay quarantined; desired-state migration, runtime diagnostics, secret bootstrap, stale-sync fencing, and failure-isolated reconciliation are covered. Reconciliation preserves unknown workers that Docker confirms running, without lifecycle calls or identity changes, while stopped desired-running workers still start. |
 | `workspace-download-cancellation.spec.ts` | 11 | Request disconnect during preparation, worker-card workspace-download signal propagation, streaming-source teardown including the post-preparation abort race, finalization/staging-file closure, structured safe deadline/abort diagnostics, and independent timed-out stale-helper cleanup with retry-safe reconciliation. |
 | `rebuild-persistence-reconciliation.spec.ts` | 1 | Live rebuild regression: a selected Codex path and `/workspace` markers survive, while an enabled plugin is reconciled onto the replacement runtime generation. |
 | `worker-daemon-restart-recovery.spec.ts` | 1 | Disposable DinD daemon restart convergence: secret-bearing desired workers restart only through Agentor bootstrap while explicitly stopped workers remain stopped. |
