@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, open, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -91,5 +91,24 @@ test("unavailable exact-host and path routes retain precedence over another work
     expect(config.http.services["http-vm-http"].loadBalancer.servers).toEqual([]);
     expect(config.tcp.routers["tcp-vm-tcp"].rule).toBe("HostSNI(`db.example.test`)");
     expect(config.tcp.services["tcp-vm-tcp"].loadBalancer.servers).toEqual([]);
+  });
+});
+
+test("route refresh atomically replaces the watched file without truncating existing readers", async () => {
+  await fixture(async (manager, mappings, read) => {
+    let address = "10.20.30.42";
+    manager.setWorkerBackendResolver(async () => address);
+    await (manager as any).writeTraefikConfig(mappings);
+    const dataDir = (manager as any).config.dataDir;
+    const path = join(dataDir, "traefik-config.yml");
+    const original = await readFile(path, "utf8");
+    const reader = await open(path, "r");
+    try {
+      address = "10.20.30.43";
+      await manager.refreshWorkerBackends();
+      expect(await reader.readFile("utf8")).toBe(original);
+      expect((await read()).http.services["http-vm-http"].loadBalancer.servers[0].url).toContain(address);
+      expect(await readdir(dataDir)).toEqual(["traefik-config.yml"]);
+    } finally { await reader.close(); }
   });
 });

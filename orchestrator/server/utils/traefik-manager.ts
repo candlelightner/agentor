@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
-import { writeFile, mkdir, access } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { writeFile, mkdir, access, rename, rm } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import Docker from 'dockerode';
 import { stringify as stringifyYaml } from 'yaml';
@@ -653,7 +653,15 @@ export class TraefikManager {
     await mkdir(dirname(configPath), { recursive: true });
     // lineWidth: 0 disables line folding so each Traefik rule stays on a single
     // line — long router rules with `||`/`&&` are far more readable unwrapped.
-    await writeFile(configPath, stringifyYaml(clean, { lineWidth: 0 }));
+    // The file provider watches this directory. Never truncate the live file:
+    // a periodic refresh could otherwise publish an empty/partial route set.
+    const temporary = `${configPath}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, stringifyYaml(clean, { lineWidth: 0 }), { flag: 'wx', mode: 0o600 });
+      await rename(temporary, configPath);
+    } finally {
+      await rm(temporary, { force: true });
+    }
   }
 
   buildCmd(m: Mappings): string[] {

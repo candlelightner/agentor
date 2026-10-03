@@ -1,4 +1,4 @@
-import { test, expect, request as playwrightRequest } from "@playwright/test";
+import { test, expect, request as playwrightRequest, chromium } from "@playwright/test";
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { join } from "node:path";
@@ -28,6 +28,7 @@ test("real Dockerized Agentor routes editor/desktop/Traefik and authorizes filte
     serverCertPath: "/workspace/agentor-incus-tls/server.crt" });
   const workers: any[] = [], envs: string[] = [];
   let primaryFailure = false;
+  let ipv6FixtureStarted = false;
   const previousPaths = JSON.parse(host("sudo incus query /1.0/projects/agentor")).config["restricted.devices.disk.paths"] || "";
   const checked = async (name: string, script: string) => {
     const result = await client.exec(name, ["bash", "-ec", script]);
@@ -65,6 +66,25 @@ test("real Dockerized Agentor routes editor/desktop/Traefik and authorizes filte
       expect(worker.userId).toBe(owner);
     }
     const [victim, attacker] = workers;
+    // Exercise the unchanged dashboard panes in a real browser, not only the
+    // proxy endpoints. Reuse this isolated test's session and exact workers.
+    const browser = await chromium.launch({ executablePath: process.env.INCUS_BROWSER_EXECUTABLE });
+    try {
+      const context = await browser.newContext({ baseURL, storageState: await api.storageState() });
+      const page = await context.newPage();
+      await page.goto("/");
+      const card = page.locator(".rounded-lg").filter({ hasText: victim.displayName }).first();
+      await expect(card.locator("text=running")).toBeVisible({ timeout: 60_000 });
+      await card.locator("button").nth(1).click();
+      const editorFrame = page.locator(`iframe[src*="/editor/${victim.id}/"]`);
+      await expect(editorFrame).toBeVisible({ timeout: 30_000 });
+      await expect(editorFrame.contentFrame().locator(".monaco-workbench")).toBeVisible({ timeout: 60_000 });
+      await card.locator("button").nth(2).click();
+      const desktopFrame = page.locator(`iframe[src*="/desktop/${victim.id}/"]`);
+      await expect(desktopFrame).toBeVisible({ timeout: 30_000 });
+      await expect(desktopFrame.contentFrame().locator("#noVNC_container canvas")).toBeVisible({ timeout: 30_000 });
+      await expect(desktopFrame.contentFrame().locator("html")).toHaveClass(/noVNC_connected/, { timeout: 30_000 });
+    } finally { await browser.close(); }
     for (const worker of workers) {
       const identity = JSON.parse(await checked(worker.containerName, `curl --noproxy '*' -fsS ${quote(gateway + "/api/worker-self/info")}`));
       expect(identity.workerId).toBe(worker.id);
@@ -76,22 +96,31 @@ test("real Dockerized Agentor routes editor/desktop/Traefik and authorizes filte
     }
     const cookie = (await api.storageState()).cookies.map((c) => `${c.name}=${c.value}`).join("; ");
     const rfb = await new Promise<string>((resolve, reject) => {
-      const ws = new WebSocket(baseURL.replace(/^http/, "ws") + `/desktop/${victim.id}/websockify`, { headers: { Cookie: cookie } });
+      const ws = new WebSocket(baseURL.replace(/^http/, "ws") + `/ws/desktop/${victim.id}`, { headers: { Cookie: cookie, Origin: baseURL } });
       const timeout = setTimeout(() => { ws.terminate(); reject(new Error("noVNC relay handshake timeout")); }, 15_000);
       ws.once("message", (data: Buffer) => { clearTimeout(timeout); ws.close(); resolve(data.toString()); });
       ws.once("error", (error: Error) => { clearTimeout(timeout); ws.terminate(); reject(error); });
+      ws.once("close", () => { clearTimeout(timeout); reject(new Error("noVNC relay closed before its RFB handshake")); });
     });
     expect(rfb).toMatch(/^RFB 003\./);
     await checked(victim.containerName, "docker run -d --name agentor-route-test -p 18080:80 nginx:alpine");
     const domain = await api.post("/api/domain-mappings", { data: { workerId: victim.id, subdomain: "phase6", baseDomain: "incus.test", protocol: "http", internalPort: 18080 } });
     expect(domain.status(), await domain.text()).toBe(201);
+    const tcpDomain = await api.post("/api/domain-mappings", { data: { workerId: victim.id, subdomain: "phase6tcp", baseDomain: "incus.test", protocol: "tcp", internalPort: 18080 } });
+    expect(tcpDomain.status(), await tcpDomain.text()).toBe(201);
     const port = await api.post("/api/port-mappings", { data: { workerId: victim.id, externalPort: 38081, type: "localhost", internalPort: 18080 } });
     expect(port.status(), await port.text()).toBe(201);
     await expect.poll(() => host("curl --noproxy '*' -fsS -H 'Host: phase6.incus.test' http://127.0.0.1/"), { timeout: 30_000 }).toContain("Welcome to nginx!");
     expect(host("curl --noproxy '*' -fsS http://127.0.0.1:38081/")).toContain("Welcome to nginx!");
+    // The TCP router terminates TLS but does not translate HTTP/2 frames for
+    // its raw HTTP/1 backend. Exercise the intended TCP transport explicitly.
+    expect(host("curl --noproxy '*' --http1.1 -kfsS --resolve phase6tcp.incus.test:443:127.0.0.1 https://phase6tcp.incus.test/")).toContain("Welcome to nginx!");
     const victimIP = await primary(victim.containerName), attackerIP = await primary(attacker.containerName);
     const victimMAC = (await client.getInstance(victim.containerName)).config["volatile.eth0.hwaddr"]!;
     const attackerMAC = (await client.getInstance(attacker.containerName)).config["volatile.eth0.hwaddr"]!;
+    const attackerPrefix = (await client.getInstanceState(attacker.containerName)).network?.eth0?.addresses
+      .find((entry: any) => entry.address === attackerIP)?.netmask;
+    expect(attackerPrefix).toBeTruthy();
     // root in the attacker guest can assign an arbitrary address. Host filtering
     // must reject it, and the victim's current identity/routing must survive.
     const healthyAttacker = async () => expect(JSON.parse(await checked(attacker.containerName,
@@ -101,11 +130,34 @@ test("real Dockerized Agentor routes editor/desktop/Traefik and authorizes filte
     await healthyAttacker();
     await checked(attacker.containerName, `trap 'ip addr del ${victimIP}/32 dev eth0' EXIT; ip addr add ${victimIP}/32 dev eth0; ${blockedProbe(victimIP)}`);
     await healthyAttacker();
-    await checked(attacker.containerName, `trap 'ip link set eth0 down; ip link set eth0 address ${attackerMAC}; ip link set eth0 up' EXIT; ip link set eth0 down; ip link set eth0 address ${victimMAC}; ip link set eth0 up; ${blockedProbe(attackerIP)}`);
+    // Networkd removes DHCP addresses when link identity changes. Pause only
+    // the fixture's guest manager and deliberately assign a valid source/route
+    // so the negative control tests host MAC filtering, not missing guest IPs.
+    await checked(attacker.containerName, `trap 'ip link set eth0 down; ip link set eth0 address ${attackerMAC}; ip link set eth0 up; systemctl start systemd-networkd' EXIT; systemctl stop systemd-networkd; ip link set eth0 down; ip link set eth0 address ${victimMAC}; ip link set eth0 up; ip -4 addr replace ${attackerIP}/${attackerPrefix} dev eth0; ip route replace default via ${gatewayHost} dev eth0; ${blockedProbe(attackerIP)}`);
     await expect.poll(async () => {
       const result = await client.exec(attacker.containerName, ["curl", "--noproxy", "*", "-fsS", "--max-time", "5", gateway + "/api/worker-self/info"]);
       return result.returnCode === 0 ? JSON.parse(result.stdout).workerId : null;
     }, { timeout: 30_000 }).toBe(attacker.id);
+    const ipv6CIDR = host("sudo incus network get incusbr0 ipv6.address");
+    if (ipv6CIDR && ipv6CIDR !== "none") {
+      const gateway6 = ipv6CIDR.split("/")[0]!;
+      const addresses = async (name: string) => (await client.getInstanceState(name)).network?.eth0?.addresses ?? [];
+      const global6 = async (name: string) => (await addresses(name)).find((entry: any) => entry.family === "inet6" && entry.scope === "global")?.address;
+      await expect.poll(() => global6(victim.containerName), { timeout: 30_000 }).toBeTruthy();
+      await expect.poll(() => global6(attacker.containerName), { timeout: 30_000 }).toBeTruthy();
+      const source6 = await global6(victim.containerName);
+      // Host-side fixture serves a constant only, never a host directory. Its
+      // narrow listener expires even if this test process disappears.
+      const server = "import http.server,socket; H=type('H',(http.server.BaseHTTPRequestHandler,),{'do_GET':lambda s:(s.send_response(200),s.end_headers(),s.wfile.write(b'agentor-ipv6-fixture')),'log_message':lambda *a:None}); S=type('S',(http.server.HTTPServer,),{'address_family':socket.AF_INET6}); S((" + JSON.stringify(gateway6) + ",38886),H).serve_forever()";
+      host(`sudo systemd-run --quiet --collect --unit=agentor-phase6-ipv6-fixture --uid=ubuntu --property=RuntimeMaxSec=600 /usr/bin/python3 -c ${quote(server)}`);
+      ipv6FixtureStarted = true;
+      const target6 = `http://[${gateway6}]:38886/`;
+      await expect.poll(async () => (await client.exec(attacker.containerName,
+        ["curl", "--noproxy", "*", "-6", "-fsS", "--max-time", "3", target6])).stdout.trim(), { timeout: 15_000 }).toBe("agentor-ipv6-fixture");
+      expect(await checked(victim.containerName, `curl --noproxy '*' -6 --interface ${source6} -fsS --max-time 5 ${quote(target6)}`)).toBe("agentor-ipv6-fixture");
+      await checked(attacker.containerName, `trap 'ip -6 addr del ${source6}/128 dev eth0' EXIT; ip -6 addr add ${source6}/128 dev eth0 nodad; ip -6 route get ${gateway6} from ${source6}; code=0; curl --noproxy '*' -6 --interface ${source6} -fsS --connect-timeout 2 --max-time 3 ${quote(target6)} || code=$?; test "$code" = 28`);
+      expect(await checked(attacker.containerName, `curl --noproxy '*' -6 -fsS --max-time 5 ${quote(target6)}`)).toBe("agentor-ipv6-fixture");
+    }
     // Ethernet filtering doesn't compare DHCP chaddr. Forge it deliberately;
     // even if DHCP replies, it must not retarget authority to the attacker.
     const forged = `import socket,struct,random\nmac=bytes.fromhex('${attackerMAC}'.replace(':',''))\nvictim=bytes.fromhex('${victimMAC}'.replace(':',''))\ns=socket.socket(socket.AF_PACKET,socket.SOCK_RAW); s.bind(('eth0',0))\nfor kind in (1,3):\n body=struct.pack('!BBBBIHH4s4s4s4s16s64s128s',1,1,6,0,random.randrange(2**32),0,32768,b'\\0'*4,b'\\0'*4,b'\\0'*4,b'\\0'*4,victim+b'\\0'*10,b'\\0'*64,b'\\0'*128)+b'\\x63\\x82\\x53\\x63'+bytes([53,1,kind,50,4])+socket.inet_aton('${victimIP}')+bytes([255])\n udp=struct.pack('!HHHH',68,67,8+len(body),0)+body\n ip=struct.pack('!BBHHHBBH4s4s',69,0,20+len(udp),1,0,64,17,0,b'\\0'*4,b'\\xff'*4)\n words=struct.unpack('!10H',ip); checksum=sum(words); checksum=(checksum&65535)+(checksum>>16); checksum=(checksum&65535)+(checksum>>16)\n ip=ip[:10]+struct.pack('!H',65535-checksum)+ip[12:]\n s.send(b'\\xff'*6+mac+b'\\x08\\x00'+ip+udp)\ns.close()\n`;
@@ -118,7 +170,10 @@ test("real Dockerized Agentor routes editor/desktop/Traefik and authorizes filte
         return result.returnCode === 0 ? JSON.parse(result.stdout).workerId : null;
       }, { timeout: 30_000 }).toBe(worker.id);
     }
-    expect(host("curl --noproxy '*' -fsS -H 'Host: phase6.incus.test' http://127.0.0.1/")).toContain("Welcome to nginx!");
+    // MAC/link testing can overlap the periodic backend refresh. Require
+    // convergence after host identity recovers, not an unchanged route cache.
+    await expect.poll(() => host("curl --noproxy '*' -sS --max-time 5 -H 'Host: phase6.incus.test' http://127.0.0.1/"),
+      { timeout: 60_000, intervals: [1000] }).toContain("Welcome to nginx!");
     await expect.poll(async () => [await primary(victim.containerName), await primary(attacker.containerName)],
       { timeout: 10_000, intervals: [1000] }).toEqual([victimIP, attackerIP]);
     // Also check after processing has settled, not just immediately after send.
@@ -127,6 +182,8 @@ test("real Dockerized Agentor routes editor/desktop/Traefik and authorizes filte
     expect(await primary(attacker.containerName)).toBe(attackerIP);
   } catch (error) {
     primaryFailure = true;
+    try { console.error(host("sudo docker logs --tail 60 agentor-traefik 2>&1 || true")); }
+    catch { console.error("Traefik failure diagnostics unavailable; preserving primary test error"); }
     throw error;
   } finally {
     const cleanupFailures: string[] = [];
@@ -136,10 +193,19 @@ test("real Dockerized Agentor routes editor/desktop/Traefik and authorizes filte
         if (!removed.ok()) cleanupFailures.push(`Worker cleanup ${worker.id}: HTTP ${removed.status()}`);
       } catch { cleanupFailures.push(`Worker cleanup ${worker.id}: transport failure`); }
     }
-    for (const id of envs) await api.delete(`/api/environments/${id}`).catch(() => cleanupFailures.push(`Environment cleanup ${id} deferred`));
+    for (const id of envs) {
+      try {
+        const removed = await api.delete(`/api/environments/${id}`);
+        if (!removed.ok()) cleanupFailures.push(`Environment cleanup ${id}: HTTP ${removed.status()}`);
+      } catch { cleanupFailures.push(`Environment cleanup ${id}: transport failure`); }
+    }
     try { host(`sudo incus project set agentor restricted.devices.disk.paths ${quote(previousPaths)}`); }
     catch { cleanupFailures.push("Test project allowlist restoration failed"); }
     finally { await Promise.allSettled([api.dispose(), anonymous.dispose()]); }
+    if (ipv6FixtureStarted) {
+      try { host("sudo systemctl stop agentor-phase6-ipv6-fixture.service"); }
+      catch { cleanupFailures.push("IPv6 fixture cleanup deferred (bounded expiry remains active)"); }
+    }
     if (cleanupFailures.length) {
       console.error(cleanupFailures.join("\n"));
       // Preserve the primary test evidence while still failing a successful run

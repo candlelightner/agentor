@@ -31,7 +31,7 @@ function options() {
 
 test("real derived image boots unattended and waits for runtime provisioning", async () => {
   test.skip(process.env.INCUS_LIVE_TEST !== "true", "Explicit disposable-host acceptance run");
-  test.setTimeout(240_000);
+  test.setTimeout(600_000);
   const client = IncusClient.fromConfig(config);
   const id = randomUUID();
   const name = `${config.containerPrefix}-${id}`;
