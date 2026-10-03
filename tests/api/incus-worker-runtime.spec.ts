@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile, symlink, link } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -261,6 +261,47 @@ test("account directories require exact restricted grants before allocating work
   expect(Object.values(spec.devices).some((device: any) => device.source === base)).toBe(false);
 });
 
+test("credential provisioning detaches stale mounts before stat and rejects unsafe sources or busy targets", async () => {
+  const { client, events } = fakeClient();
+  const storage = new StorageManager({} as any, config);
+  storage.dataHostPath = "/platform-data";
+  const base = "/platform-data/users/test-user";
+  client.request = async () => ({ config: { restricted: "true", "restricted.devices.disk": "allow",
+    "restricted.devices.disk.paths": `${base}/credentials,${base}/kilo/config,${base}/kilo/data` } });
+  await new IncusWorkerRuntime(config, client as any).create({ ...options(), storageManager: storage });
+  const binder = events.find((event) => event.operation === "exec" && event.args[1][3] === "agentor-bind")!.args[1][2];
+  expect(binder).toContain("/proc/self/mountinfo");
+  const dir = await mkdtemp(join(tmpdir(), "agentor-stale-bind-"));
+  const source = join(dir, "source"), target = join(dir, "target"), detached = join(dir, "detached"), mounted = join(dir, "mounted");
+  try {
+    await writeFile(source, "canonical");
+    await writeFile(target, "private backing");
+    // Model ESTALE until detachment; no real mount privileges are required.
+    const harness = [
+      'test() { if [[ "$1" == -f && "$2" == "$AGENTOR_BIND_TARGET" ]] && [[ ! -e "$AGENTOR_BIND_DETACHED" ]]; then return 1; fi; builtin test "$@"; }',
+      'awk() { return 0; }',
+      'umount() { [[ "$1 $2 $3" == "--internal-only --no-canonicalize --" ]]; printf detached > "$AGENTOR_BIND_DETACHED"; }',
+      'mount() { printf mounted > "$AGENTOR_BIND_MOUNTED"; }',
+    ].join("\n");
+    const run = (prefix = harness) => execFileSync("bash", ["-ec", `${prefix}\n${binder}`, "agentor-bind", source, target], {
+      env: { ...process.env, AGENTOR_BIND_TARGET: target, AGENTOR_BIND_DETACHED: detached, AGENTOR_BIND_MOUNTED: mounted },
+      stdio: "pipe",
+    });
+    run();
+    expect(await readFile(mounted, "utf-8")).toBe("mounted");
+    await rm(detached); await rm(mounted);
+    expect(() => run(`${harness}\numount() { return 1; }`)).toThrow();
+    await expect(readFile(mounted)).rejects.toMatchObject({ code: "ENOENT" });
+    await rm(source); await symlink(target, source);
+    expect(() => run()).toThrow();
+    await expect(readFile(detached)).rejects.toMatchObject({ code: "ENOENT" });
+    await rm(source); await link(target, source);
+    expect(() => run()).toThrow();
+    await expect(readFile(detached)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(target, "utf-8")).toBe("private backing");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("live SSH key refresh verifies account ownership and does not touch stopped guests", async () => {
   const { client, events } = fakeClient();
   const runtime = new IncusWorkerRuntime(config, client as any);
@@ -411,7 +452,11 @@ test("real production worker create/start, inventory and reprovisioning", async 
     await expect(runtime.client.getCustomVolume(config.incusStoragePool, `${name}-workspace`)).rejects.toMatchObject({ statusCode: 404 });
   } finally {
     // Derive any failed provisional VM identity from retained authoritative state.
-    for (const worker of store.list()) await runtime.remove(manager.buildContainerName(worker.id));
+    for (const worker of store.list()) {
+      const containerName = manager.buildContainerName(worker.id);
+      await runtime.remove(containerName);
+      await runtime.removeStorage({ id: worker.id, userId: worker.userId, containerName });
+    }
     await rm(dir, { recursive: true, force: true });
   }
 });

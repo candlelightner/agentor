@@ -10,7 +10,7 @@ import { zeroUserEnvVars } from "../../orchestrator/server/utils/user-env-store"
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
-(globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, error() {} });
+(globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 
 for (const name of ["claude.json", "codex.json", "gemini.json", "kilo.json"]) {
   test(`directory-shared ${name} cannot redirect account reads or writes`, async () => {

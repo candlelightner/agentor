@@ -215,11 +215,14 @@ export class IncusWorkerRuntime {
         // then falls back to in-place writes; symlinks would break sharing.
         for (const mapping of AGENT_CREDENTIAL_MAPPINGS.filter((entry) => entry.fileBind !== false)) {
           await this.checkedExec(name, ["bash", "-ec", [
-            'source="$1"; target="$2"', 'test -f "$source" && test ! -L "$source" && test ! -L "$target"',
+            'source="$1"; target="$2"', 'test -f "$source"', 'test ! -L "$source"', 'test "$(stat -c %h "$source")" = 1',
+            // Replaced virtiofs files leave an unstatable pinned inode. Read
+            // kernel mount metadata before touching the target, then detach
+            // without canonicalizing it. Never force/lazily unmount a busy file.
+            'if awk -v target="$target" \'$5 == target { mounted=1 } END { exit !mounted }\' /proc/self/mountinfo; then umount --internal-only --no-canonicalize -- "$target"; fi',
+            'test ! -L "$target"',
             'mkdir -p "$(dirname "$target")"', 'if [ ! -e "$target" ]; then install -o 1000 -g 1000 -m 0600 /dev/null "$target"; fi',
-            'test -f "$target" && test "$(stat -c %h "$source")" = 1',
-            'if mountpoint -q "$target" && [ "$(stat -c %d:%i "$source")" != "$(stat -c %d:%i "$target")" ]; then umount "$target"; fi',
-            'if ! mountpoint -q "$target"; then mount --bind "$source" "$target"; fi',
+            'test -f "$target"', 'mount --bind "$source" "$target"',
           ].join("; "), "agentor-bind", `/run/agentor/account-credentials/${mapping.fileName}`, mapping.containerPath]);
         }
       }
