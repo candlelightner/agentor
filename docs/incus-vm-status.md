@@ -1,10 +1,11 @@
 # Incus/QEMU VM Worker Migration Status
 
-- Current Phase: Phase 1 (Persisted runtime kind complete) -> Phase 2 (Minimal Incus API client)
+- Current Phase: Phase 2 complete -> Phase 3 (Derived image conversion pipeline)
 - Completed Commits:
   - `feat(runtime): persist worker runtime kind`
+  - `feat(incus): add restricted TLS client`
 - Baseline Tests Passed:
-  - 209 module tests passed (`npm run test:modules` in `tests/`)
+  - 220 module tests passed (`npm run test:modules` in `tests/`)
   - Typecheck passed (0 errors in `orchestrator`)
 - Tests Failing: None
 - Discovered Constraints & Key Invariants:
@@ -14,6 +15,9 @@
   - Runtime kind is durable state on `WorkerRecord` (`legacy-docker` | `incus-vm`). Default for missing is `legacy-docker`.
   - Admin workspace is not migrated.
   - Ephemeral runtime config in `/run/agentor/` in guest.
-  - Anti-spoofing mandatory on worker NICs.
+  - Anti-spoofing mandatory on worker NICs: `security.mac_filtering: true` and `security.ipv4_filtering: true` verified with DHCP on `incusbr0`.
+  - Primary IP resolution in `IncusClient` prioritizes `eth0` and ignores `docker0` (172.17.0.1), loopback, and virtual interfaces.
+  - Interactive exec WebSocket multiplexing (data on `fd 0`, control on `control`) verified live.
   - No Incus Unix socket mounted in Orchestrator; mutual TLS HTTPS API with restricted `agentor` project.
-- Next Exact Task: Phase 2 — Minimal Incus API client (mutual TLS, restricted project selection, readiness, instances, exec, websockets, files, storage).
+  - Guest VM netplan configuration requires matching `eth*` and `en*` via separate glob blocks (`all-eth` and `all-en`).
+- Next Exact Task: Phase 3 — Derived image conversion pipeline (`d2vm --raw`, Incus image import & cache).

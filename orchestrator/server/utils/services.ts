@@ -38,6 +38,7 @@ import { useGroupAdminWorkspaceStore } from "./group-admin-workspace-store";
 import { PersistentBackupPathManager } from "./persistent-backup-paths";
 import { HostMountStore } from "./host-mount-store";
 import { HardwareDeviceStore } from "./hardware-device-store";
+import { IncusClient } from "./incus-client";
 
 function singleton<T>(factory: () => T): () => T {
   let instance: T | undefined;
@@ -49,6 +50,7 @@ function singleton<T>(factory: () => T): () => T {
 
 export const useConfig = singleton(() => loadConfig());
 export const useDockerService = singleton(() => new DockerService(useConfig()));
+export const useIncusClient = singleton(() => IncusClient.fromConfig(useConfig()));
 export const useStorageManager = singleton(
   () =>
     new StorageManager(

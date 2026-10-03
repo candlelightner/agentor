@@ -26,6 +26,7 @@ export default defineConfig({
     "api/resource-monitor-lifecycle.spec.ts",
     "api/worker-self-access-policy.spec.ts",
     "api/worker-runtime-kind.spec.ts",
+    "api/incus-client.spec.ts",
     "api/workspace-download-cancellation.spec.ts",
   ],
   fullyParallel: false,
