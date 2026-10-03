@@ -470,7 +470,7 @@ test.describe("IncusClient live disposable integration tests", () => {
     // Project restriction verification: unauthorized project returns ready: false
     const forbiddenClient = new IncusClient({
       endpoint: liveEndpoint,
-      project: "forbidden-test",
+      project: "default",
       clientCertPath: liveCertPath,
       clientKeyPath: liveKeyPath,
       rejectUnauthorized: false,

@@ -1,4 +1,16 @@
 import { defineConfig } from "@playwright/test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// Live runtime acceptance still exercises real control-plane metadata cleanup.
+// Scope its service singletons before worker modules are imported; never use a
+// developer's /data merely because no installation stack is running.
+if (process.env.INCUS_LIVE_TEST === "true" && !process.env.DATA_DIR) {
+  const fixtureData = mkdtempSync(join(tmpdir(), "agentor-incus-acceptance-"));
+  process.env.DATA_DIR = fixtureData;
+  process.once("exit", () => rmSync(fixtureData, { recursive: true, force: true }));
+}
 
 /** Fast server-module tests that import utility code directly and therefore do
  * not require a running Agentor installation or authenticated global setup. */
@@ -28,6 +40,7 @@ export default defineConfig({
     "api/worker-runtime-kind.spec.ts",
     "api/incus-client.spec.ts",
     "api/incus-derived-image.spec.ts",
+    "api/incus-worker-runtime.spec.ts",
     "api/workspace-download-cancellation.spec.ts",
   ],
   fullyParallel: false,

@@ -65,6 +65,7 @@ import type {
   WorkerRuntimeKind,
 } from "../../shared/types";
 import { normalizeWorkerRuntimeKind } from "../../shared/types";
+import { IncusWorkerRuntime, incusWorkerStatus, type IncusWorkerOptions } from "./incus-worker-runtime";
 
 async function resolveImportedImage(
   userId: string,
@@ -517,9 +518,15 @@ export class ContainerManager {
   private capabilityStore?: CapabilityStore;
   private instructionStore?: InstructionStore;
   private storageManager?: StorageManager;
+  private incusRuntime: IncusWorkerRuntime;
   constructor(dockerService: DockerService, config: Config) {
     this.dockerService = dockerService;
     this.config = config;
+    this.incusRuntime = new IncusWorkerRuntime(config);
+  }
+
+  setIncusRuntime(runtime: IncusWorkerRuntime): void {
+    this.incusRuntime = runtime;
   }
 
   setEnvironmentStore(store: EnvironmentStore): void {
@@ -765,6 +772,29 @@ export class ContainerManager {
     };
   }
 
+  private async incusOptionsForWorker(info: ContainerInfo, applied: boolean): Promise<IncusWorkerOptions> {
+    const environment = this.resolveEnvironmentConfig(info.environmentId);
+    const { userEnv, credentialBinds, groupSecrets } = await this.resolveUserEnvAndBinds(
+      info.userId, info.excludedGlobalEnvVarKeys ?? [], info.id, info.excludedGroupEnvVarKeys ?? [],
+    );
+    const store = useWorkerConfigStore();
+    const workerConfig = applied
+      ? await store.resolveAppliedValues(info.userId, info.id)
+      : await store.resolveValues(info.userId, info.id);
+    const { gitName, gitEmail } = await this.resolveGitIdentity(info.userId);
+    return {
+      userId: info.userId, id: info.id, containerName: info.containerName,
+      ...this.deriveLimits(environment),
+      environmentJson: environment.environmentJson,
+      capabilitiesJson: environment.capabilitiesJson, instructionsJson: environment.instructionsJson,
+      workerJson: { id: info.id, displayName: info.displayName,
+        repos: info.repos ?? [], initScript: info.initScript ?? "", gitName, gitEmail },
+      userEnv, credentialBinds, workerConfig: [...groupSecrets, ...workerConfig], mounts: info.mounts,
+      image: info.imageRuntimeReference,
+      sshAuthorizedKeys: await this.storageManager?.readSshAuthorizedKeys(info.userId),
+    };
+  }
+
   private static readonly STATE_MAP: Record<string, ContainerStatus> = {
     running: "running",
     exited: "stopped",
@@ -838,6 +868,9 @@ export class ContainerManager {
 
   private async syncUnlocked(lifecycleSequenceAtStart: number, busyAtStart = new Set<string>()): Promise<void> {
     const dockerContainers = await this.dockerService.listContainers();
+    const incusInstances = this.config.incusEndpoint
+      ? await this.incusRuntime.client.listInstances()
+      : [];
     const observations = new Map(
       await Promise.all(
         dockerContainers.map(async (container) => [
@@ -906,6 +939,10 @@ export class ContainerManager {
         useLogger().error(
           `[container] quarantined managed container ${containerName}: authoritative worker record ${labelId} is unavailable`,
         );
+        continue;
+      }
+      if (normalizeWorkerRuntimeKind(worker.runtimeKind) !== "legacy-docker") {
+        useLogger().error(`[container] quarantined Docker runtime with Incus worker identity ${labelId}`);
         continue;
       }
 
@@ -998,6 +1035,26 @@ export class ContainerManager {
         });
     }
 
+    for (const instance of incusInstances) {
+      const id = instance.config["user.agentor.id"];
+      if (!id) continue;
+      const worker = id ? this.workerStore?.findById(id) : undefined;
+      if (!worker || worker.runtimeKind !== "incus-vm" ||
+          !await this.incusRuntime.matchesWorkerIdentity(instance, worker.id)) continue;
+      if (worker.status !== "active" || worker.deletionPending) continue;
+      if (busyAtStart.has(id) || workerLifecycleGeneration(id) > lifecycleSequenceAtStart || isWorkerLifecycleMutationActive(id)) {
+        const current = concurrent.get(id);
+        if (current?.userId === worker.userId) nextContainers.set(id, current);
+        continue;
+      }
+      nextContainers.set(id, {
+        ...worker, runtimeKind: "incus-vm", containerId: `incus:${instance.name}`,
+        containerName: instance.name, displayName: worker.displayName || instance.name,
+        imageName: instance.config["image.source_image"] || this.config.incusWorkerImage,
+        imageId: instance.config["volatile.base_image"] || "",
+        status: incusWorkerStatus(instance),
+      });
+    }
     for (const info of external) nextContainers.set(info.id, info);
     // During the rename/create window Docker may list only the retained
     // rollback source (excluded above), or neither runtime. Preserve the
@@ -1404,7 +1461,7 @@ export class ContainerManager {
       const hardwareDevices = await this.resolveHardwareDeviceAccess(
         userId, id, hardwareDeviceIds, request.targetWorkerGroupId, true,
       );
-      const container = await this.dockerService.createWorkerContainer({
+      const options: IncusWorkerOptions = {
         userId,
         id,
         containerName,
@@ -1422,8 +1479,15 @@ export class ContainerManager {
         userEnv,
         workerConfig: [...groupSecrets, ...workerConfig],
         image: request.imageRuntimeReference,
-      });
-      containerInfo.containerId = container.id;
+        sshAuthorizedKeys: runtimeKind === "incus-vm" ? await this.storageManager?.readSshAuthorizedKeys(userId) : undefined,
+      };
+      if (runtimeKind === "incus-vm") {
+        await this.incusRuntime.create(options);
+        containerInfo.containerId = `incus:${containerName}`;
+      } else {
+        const container = await this.dockerService.createWorkerContainer(options);
+        containerInfo.containerId = container.id;
+      }
       containerInfo.status = "running";
       containerInfo.updatedAt = new Date().toISOString();
     } catch (err) {
@@ -1459,15 +1523,17 @@ export class ContainerManager {
     }
 
     // Attach log collector to the new container
-    useLogCollector()
+    if (runtimeKind === "legacy-docker") useLogCollector()
       .attach(containerName, containerInfo.containerId, "worker", displayName)
       .catch(() => {});
 
     useLogger().info(
       `[container] created worker ${containerName} (${containerInfo.containerId.slice(0, 12)})`,
     );
-    await this.reconcileManagedNetworksForWorker(userId);
-    await this.reconcileWorkerPlugins(containerInfo);
+    if (runtimeKind === "legacy-docker") {
+      await this.reconcileManagedNetworksForWorker(userId);
+      await this.reconcileWorkerPlugins(containerInfo);
+    }
 
     return containerInfo;
   }
@@ -2327,7 +2393,9 @@ for p in sys.argv[1:]:
     try {
       await stopWorkerContainerIdempotently(
         info,
-        () => this.dockerService.stopContainer(info.containerId),
+        () => info.runtimeKind === "incus-vm"
+          ? this.incusRuntime.stop(info.containerName)
+          : this.dockerService.stopContainer(info.containerId),
         true,
       );
       // A list refresh may otherwise reuse the pre-stop task observation for
@@ -2352,6 +2420,24 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    if (info.runtimeKind === "incus-vm") {
+      if (info.hostMountsRevoked || info.hardwareDevicesRevoked)
+        throw Object.assign(new Error("Worker access was revoked; rebuild is required"), { statusCode: 409 });
+      await this.persistDesiredRuntimeStatus(info, "running");
+      const options = await this.incusOptionsForWorker(info, true);
+      info.status = "starting";
+      try {
+        await this.incusRuntime.stop(info.containerName);
+        await this.incusRuntime.start(options);
+        info.status = "running";
+        info.updatedAt = new Date().toISOString();
+        info.runtimeDiagnostic = undefined;
+      } catch (error) {
+        this.markRuntimeUnknown(info, "Incus worker start", error);
+        throw error;
+      }
+      return;
+    }
     const { useManagedVolumeManager } = await import("./managed-volume-manager");
     if (!storagePrepared && await useManagedVolumeManager().requiresRecreation(info.userId, id, info.containerId)) {
       await this.applyManagedStorageUnlocked(id);
@@ -2918,7 +3004,8 @@ for p in sys.argv[1:]:
     // were a Docker container id, leaving the real container untracked and
     // preventing restore/account-cleanup rollback from retrying it.
     await removeDockerContainerIdempotently(() =>
-      this.dockerService.removeContainer(info.containerId),
+      info.runtimeKind === "incus-vm" ? this.incusRuntime.remove(info.containerName)
+        : this.dockerService.removeContainer(info.containerId),
     );
     useLogCollector().detach(info.containerId);
     info.status = "removing";
@@ -2973,7 +3060,7 @@ for p in sys.argv[1:]:
         },
       ],
     ];
-    if (this.storageManager) {
+    if (this.storageManager && info.runtimeKind !== "incus-vm") {
       actions.push(
         [
           "Docker data",
@@ -3268,6 +3355,7 @@ for p in sys.argv[1:]:
   private async rebuildUnlocked(id: string): Promise<ContainerInfo> {
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
+    if (info.runtimeKind === "incus-vm") throw new Error("Incus rebuild requires persistent-storage lifecycle integration");
     this.assertOrdinaryMutation(info);
 
     // Fail before touching the existing container when a grant was revoked or
@@ -3491,6 +3579,7 @@ for p in sys.argv[1:]:
     if (!worker || worker.status !== "archived") {
       throw new Error("Archived worker not found");
     }
+    if (worker.runtimeKind === "incus-vm") throw new Error("Incus unarchive requires persistent-storage lifecycle integration");
     if (worker.deletionPending) {
       throw Object.assign(
         new Error("Worker deletion cleanup is still pending"),
@@ -4515,9 +4604,9 @@ for p in sys.argv[1:]:
         await this.rollbackFailedProvisionedWorker(input);
       };
       const now = new Date().toISOString();
-      const runtimeKind: WorkerRuntimeKind = this.config.incusEnabled
-        ? "incus-vm"
-        : "legacy-docker";
+      // Existing backup formats reconstruct legacy Docker workers. Incus
+      // restore is added explicitly with runtime-aware metadata in Phase 10.
+      const runtimeKind: WorkerRuntimeKind = "legacy-docker";
       const containerInfo: ContainerInfo = {
         id,
         runtimeKind,
@@ -4874,6 +4963,8 @@ for p in sys.argv[1:]:
   }): Promise<void> {
     const { id, userId, containerId, containerName, dockerEnabled, importedImage } =
       input;
+    const incus = this.containers.get(id)?.runtimeKind === "incus-vm" ||
+      this.workerStore?.get(userId, id)?.runtimeKind === "incus-vm";
     try {
       await rollbackFailedWorkerImport({
         removeFromMemory: () => this.containers.delete(id),
@@ -4888,19 +4979,19 @@ for p in sys.argv[1:]:
         // A create failure may occur before Docker materializes the named
         // container. Absence is the desired rollback state.
         removeContainer: () =>
-          removeDockerContainerIdempotently(() =>
+          incus ? this.incusRuntime.remove(containerName) : removeDockerContainerIdempotently(() =>
             this.dockerService.removeContainer(containerId),
           ),
         removeWorkspace: () =>
-          this.storageManager?.removeWorkerWorkspace(
+          incus ? Promise.resolve() : this.storageManager?.removeWorkerWorkspace(
             userId,
             id,
             containerName,
           ) ?? Promise.resolve(),
         removeAgents: () =>
-          this.storageManager?.removeWorkerAgents(userId, id, containerName) ??
+          incus ? Promise.resolve() : this.storageManager?.removeWorkerAgents(userId, id, containerName) ??
           Promise.resolve(),
-        ...(dockerEnabled && this.storageManager
+        ...(!incus && dockerEnabled && this.storageManager
           ? {
               removeDocker: () =>
                 this.storageManager!.removeWorkerDocker(containerName),
@@ -5115,6 +5206,8 @@ for p in sys.argv[1:]:
     const missingDesiredWorkers: WorkerRecord[] = [];
     const { useManagedVolumeManager: storageManager } = await import("./managed-volume-manager");
     for (const worker of this.workerStore.listActive()) {
+      // Never feed missing Incus compute through Docker recovery.
+      if (worker.runtimeKind === "incus-vm") continue;
       if (storageManager().isRecoveryBlocked(worker.id)) continue;
       if (!activeContainerNames.has(this.buildContainerName(worker.id))) {
         // Acquire the same owner→worker fences as create/rebuild/recovery, then
@@ -5143,6 +5236,7 @@ for p in sys.argv[1:]:
     // intent and is therefore never auto-unarchived.
     for (const worker of this.workerStore.listArchived())
       if (
+        worker.runtimeKind !== "incus-vm" &&
         !storageManager().isRecoveryBlocked(worker.id) &&
         worker.desiredRuntimeStatus === "running" &&
         !missingDesiredWorkers.some((candidate) => candidate.id === worker.id)
@@ -5155,6 +5249,7 @@ for p in sys.argv[1:]:
     // every other worker from recovering.
     for (const info of [...this.containers.values()]) {
       if (info.administrativeKind) continue;
+      if (info.runtimeKind === "incus-vm") continue;
       if (storageManager().isRecoveryBlocked(info.id)) {
         info.status = "error";
         info.runtimeDiagnostic = { code: "WORKER_STORAGE_RECOVERY_REQUIRED", operation: "Storage recovery",

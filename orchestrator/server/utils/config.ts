@@ -48,6 +48,7 @@ export interface Config {
   incusServerCertPath: string;
   incusNetwork: string;
   incusStoragePool: string;
+  incusWorkerImage: string;
   incusInternalGatewayUrl: string;
 }
 
@@ -165,8 +166,9 @@ export function loadConfig(): Config {
     incusClientCertPath: process.env.INCUS_CLIENT_CERT_PATH || '',
     incusClientKeyPath: process.env.INCUS_CLIENT_KEY_PATH || '',
     incusServerCertPath: process.env.INCUS_SERVER_CERT_PATH || '',
-    incusNetwork: process.env.INCUS_NETWORK || 'incusbr0',
-    incusStoragePool: process.env.INCUS_STORAGE_POOL || 'default',
+    incusNetwork: process.env.INCUS_NETWORK || '',
+    incusStoragePool: process.env.INCUS_STORAGE_POOL || '',
+    incusWorkerImage: process.env.INCUS_WORKER_IMAGE || 'agentor-worker',
     incusInternalGatewayUrl: process.env.INCUS_INTERNAL_GATEWAY_URL || '',
   };
 }

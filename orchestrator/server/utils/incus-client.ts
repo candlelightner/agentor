@@ -278,6 +278,7 @@ export class IncusClient {
   private rejectUnauthorized: boolean;
   private timeoutMs: number;
   private httpsAgent?: https.Agent;
+  private requireVerifiedTransport = false;
 
   constructor(options: IncusClientOptions) {
     this.endpoint = (options.endpoint || '').replace(/\/+$/, '');
@@ -293,14 +294,16 @@ export class IncusClient {
   }
 
   static fromConfig(config: Config): IncusClient {
-    return new IncusClient({
+    const client = new IncusClient({
       endpoint: config.incusEndpoint,
       project: config.incusProject || 'agentor',
       clientCertPath: config.incusClientCertPath,
       clientKeyPath: config.incusClientKeyPath,
       serverCertPath: config.incusServerCertPath,
-      rejectUnauthorized: Boolean(config.incusServerCertPath),
+      rejectUnauthorized: true,
     });
+    client.requireVerifiedTransport = true;
+    return client;
   }
 
   isConfigured(): boolean {
@@ -308,6 +311,7 @@ export class IncusClient {
   }
 
   private async getAgent(): Promise<https.Agent> {
+    this.validateTransport();
     if (this.httpsAgent) return this.httpsAgent;
 
     let cert = this.clientCert;
@@ -348,6 +352,12 @@ export class IncusClient {
     return this.httpsAgent;
   }
 
+  private validateTransport(): void {
+    if (this.requireVerifiedTransport && (!this.endpoint.startsWith('https://') ||
+        !this.clientCertPath || !this.clientKeyPath || !this.serverCertPath))
+      throw new IncusError('Production Incus access requires HTTPS, client credentials and verified server TLS');
+  }
+
   private buildUrl(path: string, queryParams?: Record<string, string | number | boolean | undefined>): URL {
     const fullUrl = new URL(path.startsWith('http') ? path : `${this.endpoint}${path.startsWith('/') ? '' : '/'}${path}`);
     if (fullUrl.origin !== new URL(this.endpoint).origin)
@@ -376,6 +386,8 @@ export class IncusClient {
     if (!this.isConfigured()) {
       throw new IncusError('Incus client is not configured (missing endpoint)');
     }
+
+    this.validateTransport();
 
     const url = this.buildUrl(path, queryParams);
     const isHttps = url.protocol === 'https:';

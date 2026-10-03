@@ -3,16 +3,16 @@
 ## CURRENT HANDOFF
 
 - Goal: finish the authoritative implementation contract through Phase 13; `/goal` active. No production-host mutation, main push/merge, automatic legacy migration, or architecture restart.
-- Current phase: **Phase 3 live acceptance passed; Phase 4 in progress**. Phase 4 implementation is preserved and intentionally uncommitted.
-- Exact subtask: complete Phase 4 installation ownership, final provisioning marker/SSH, and fresh service readiness; run production-manager lifecycle test.
-- Latest completed commits: `29edb8b` (Phase 1), `c216cf9` (Phase 2); `979124d` committed Phase 3 pipeline but does not close live acceptance.
-- Working tree: dirty with Phase 3 corrections, Phase 4 runtime/dispatch/tests, and status/test documentation. Do not discard or replace these changes.
-- Verification: 225 module tests passed / one separately gated live test skipped; typecheck passed. Focused latest runtime checks 5 passed / one live test skipped. Full API/UI and Phase 13 acceptance remain outstanding.
+- Current phase: **Phase 4 live acceptance passed; Phase 5 next**. Phase 3 corrections are committed; reviewed Phase 4 changes are ready for checkpoint.
+- Exact subtask: checkpoint minimal runtime integration, then attach separate persistent workspace/agent volumes and identified native Docker block storage; preserve live account sharing.
+- Latest completed commits: `29edb8b` (Phase 1), `c216cf9` (Phase 2), `9f395d9` (Phase 3 correction/live acceptance following initial pipeline `979124d`).
+- Working tree: dirty with completed Phase 4 runtime/dispatch/tests and updated handoff/test docs; checkpoint next. Do not discard these changes.
+- Verification: Phase 4 public-manager live gate passed (1.6 minutes): create, installation metadata, guest provisioning, editor/noVNC, authoritative inventory, public stop, start/SSH/marker reprovision, public delete/WorkerRecord cleanup, no Docker fallback. Account authorization is mocked for this bounded module acceptance; full HTTP/UI/account persistence is not yet claimed. Full module suite 229 passed / two gated tests skipped (231 total); both gated tests separately passed. Typecheck passed. Full API/UI and Phase 13 acceptance remain outstanding.
 - Verification added: rebuilt-image live gate passed (1.2 minutes): unattended EFI/systemd/agent/sudo; worker/Docker/socket/containerd inactive before provisioning; UID 1000 reads ephemeral config; configured tmux/Xvfb/fluxbox/x11vnc/editor 302/noVNC 200. Client focused suite passed 12/12 before moving URL-origin coverage into it. Typecheck, shell syntax, diff checks passed.
 - Current blockers: none. Client operation waiting needed metadata polling (image expansion exceeds HTTP timeout). Disposable host required `br_netfilter` for IPv6 NIC filtering; loaded without weakening filters; operator setup/check must verify it.
 - Cache corrections required by contract: immutable OCI, bootstrap generation, pinned d2vm v0.4.0, detected architecture, recipe contents; same-host lock and import-before-atomic-alias-update. No image-proof or scheduler subsystem.
 - Disposable host: disk now 100 GiB / root ext4 96 GiB. Rebuilt image `agentor-worker-takeover` = `b88c1d5a35220e52d568fe1ef7bebb0bb644d6cd8201f27b88c57bf3f74be714`; artifacts `/var/tmp/agentor-takeover-final.0eW5WC7z`. Original image, old logs, deleted previous root disk mounted at `/tmp/mnt2`, guest recovery backup, local image backup, and scratch raw output preserved. Details below.
-- Exact next action: commit reviewed Phase 3 correction separately; finish Phase 4 identity/provisioning checks and live production-manager acceptance. Continue Phases 5–13 without ordinary phase approval.
+- Exact next action: Phase 4 checkpoint, then Phase 5 core persistence/native Docker plus live shared-account semantics. Continue Phases 5–13 without ordinary phase approval.
 - Remaining contract gates: full persisted-data inventory/sharing; safe identified ext4/overlay2 Docker and enable/disable persistence; authoritative addresses/routing/worker-self; exec/PTY/files/plugins; lifecycle/self-reboot/orphans; existing managed volumes/networks/authorized mounts; runtime-safe new backup/import plus old→legacy compatibility; small explicit admin migration/rollback retaining source; idempotent operator bootstrap/check/Portainer; automated complete acceptance. Hardware passthrough and new network policy remain out of scope.
 
 ## Roadmap & Phase Status
@@ -21,7 +21,7 @@
 - **PHASE 1 — Persisted runtime kind**: COMPLETE (commit `29edb8b` - `feat(runtime): persist worker runtime kind`)
 - **PHASE 2 — Minimal Incus API client**: COMPLETE (commit `c216cf9` - `feat(incus): add restricted TLS client`)
 - **PHASE 3 — Derived image pipeline**: COMPLETE (corrective pipeline and rebuilt-image live boot/provisioning/services gate passed; follow-up milestone follows `979124d`)
-- **PHASE 4 — Minimal Incus worker create/start**: IN PROGRESS (runtime dispatch, bootstrap, inventory and focused tests implemented; live production-path test pending rebuilt image)
+- **PHASE 4 — Minimal Incus worker create/start**: COMPLETE (real ContainerManager create/start/provision/inventory/stop/delete gate passed; intentionally pending persistence/feature slices follow)
 - **PHASE 5 — Persistent storage + Docker**: PENDING
 - **PHASE 6 — Routing and worker identity**: PENDING
 - **PHASE 7 — Terminal/files/plugins**: PENDING
@@ -96,7 +96,24 @@
 - Phase 4 currently rejects Docker/shared credentials/host mounts/custom OCI mappings pending subsequent integrations. Imported pre-Incus bundles explicitly stay legacy; Incus handles use a non-Docker identifier to prevent accidental backend calls. No fallback.
 - Roadmap remains Phase 0 through Phase 13; Phases 4–13 are outstanding.
 - Corrected native pipeline completed at `/var/tmp/agentor-takeover-final.0eW5WC7z` (2.6 GiB qcow2, pinned source OCI). Atomic alias PUT verified with an explicit project query; `incus query --project` is unsupported despite showing the global flag. Initial timeout/failed-launch fixtures removed after inspecting their completed state; original image and recovery data untouched.
-- Phase 4 bounded review still requires installation ownership on every runtime mutation/inventory, feature guards on start as well as create, SSH/marker provisioning, and stale-readiness rejection. Normal account credential/shared-storage integration is Phase 5, not proven by the minimal lifecycle fixture.
+- Phase 4 bounded review findings fixed: installation ownership on every mutation/inventory, start capability guards, SSH→env→marker ordering, cleared stale readiness/active-service polls, and verified production TLS on every client operation. No test network/storage defaults in runtime configuration. Test mTLS certificate fingerprint `4e8ac5555412…` now grants only `agentor`; live default-project access denied. Normal account/shared-storage integration remains Phase 5.
+
+### Phase 5 persistent-state inventory
+
+| State | Existing canonical source | Incus requirement |
+|---|---|---|
+| Workspace | Per-user workspace directory or `<worker>-workspace` Docker volume | Private UID/GID 1000 filesystem volume; retain on rebuild/archive |
+| Agent/editor state | Per-user agents directory or `<worker>-agents` volume | Private filesystem volume, including Kilo state/cache |
+| Docker | `<worker>-docker` volume | Identified, private ext4 block volume; retain on disable/rebuild/archive |
+| Claude/Codex/Gemini credentials | `/data/users/<owner>/credentials/{claude,codex,gemini}.json` | Preserve live shared writes and existing account status/reset API |
+| Kilo config/data | `/data/users/<owner>/kilo/{config,data}` | Live same-owner directory sharing, including atomic rename/SQLite |
+| SSH public keys | `/data/users/<owner>/ssh/authorized_keys` | Read-only access; account updates propagate to running workers |
+| Selected persistent paths | `agentor-persist-<worker>-<path hash>` | Preserve current selections; integrate managed storage/backup semantics |
+| Managed volumes | Durable owner/attachment store, `agentor-persist-<volume UUID>` | Retain until explicitly deleted; worker deletion must not destroy them |
+| Authorized host mounts | Exact approved HostMountStore source/grant | Only granted sources/modes; Phase 9 |
+| Runtime config/secrets | Newly provisioned `/run` files | Ephemeral; regenerate every boot; never canonical root-disk data |
+
+Boot-only credential copies are not equivalent to current sharing. Use only narrow server-controlled account directories under platform data, with explicit restricted-project allowlisting; no worker-controlled raw sources and no whole-user/control-plane metadata mount. Keep workspace/agent/Docker custom volumes independent of VM lifetime.
 
 ### Next Exact Task
 - Finish and verify the corrected image build; confirm unconfigured boot starts neither worker nor Docker.

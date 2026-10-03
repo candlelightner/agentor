@@ -157,7 +157,7 @@ test.describe("Worker runtime kind", () => {
     expect(info?.runtimeKind).toBe("legacy-docker");
   });
 
-  test("ContainerManager sync resolves incus worker record to incus-vm", async () => {
+  test("ContainerManager sync quarantines Docker containers claiming an Incus worker identity", async () => {
     const docker = {
       listContainers: async () => [
         {
@@ -206,7 +206,6 @@ test.describe("Worker runtime kind", () => {
     await manager.sync();
 
     const info = manager.get("incus-1");
-    expect(info).toBeDefined();
-    expect(info?.runtimeKind).toBe("incus-vm");
+    expect(info).toBeUndefined();
   });
 });
