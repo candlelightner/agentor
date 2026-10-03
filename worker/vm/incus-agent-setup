@@ -1,0 +1,41 @@
+#!/bin/sh
+set -eu
+PREFIX="/run/incus_agent"
+CDROM="/dev/disk/by-id/scsi-0QEMU_QEMU_CD-ROM_incus_agent"
+
+mount_cdrom() {
+    mount "${CDROM}" "${PREFIX}.mnt" >/dev/null 2>&1
+}
+
+mount_9p() {
+    modprobe 9pnet_virtio >/dev/null 2>&1 || true
+    mount -t 9p config "${PREFIX}.mnt" -o access=0,trans=virtio,size=1048576 >/dev/null 2>&1
+}
+
+fail() {
+    if [ -x "${PREFIX}/incus-agent" ]; then
+        echo "${1}, re-using existing agent"
+        exit 0
+    fi
+    umount -l "${PREFIX}" >/dev/null 2>&1 || true
+    eject "${CDROM}" >/dev/null 2>&1 || true
+    rmdir "${PREFIX}" >/dev/null 2>&1 || true
+    echo "${1}, failing"
+    exit 1
+}
+
+mkdir -p "${PREFIX}.mnt"
+mount_9p || mount_cdrom || fail "Couldn't mount 9p or cdrom"
+umount -l "${PREFIX}" >/dev/null 2>&1 || true
+mkdir -p "${PREFIX}"
+mount -t tmpfs tmpfs "${PREFIX}" -o mode=0700,size=50M
+cp -Ra "${PREFIX}.mnt/"* "${PREFIX}"
+umount "${PREFIX}.mnt"
+rmdir "${PREFIX}.mnt"
+eject "${CDROM}" >/dev/null 2>&1 || true
+chown -R root:root "${PREFIX}"
+if [ ! -e "${PREFIX}/incus-agent" ] && [ -e "${PREFIX}/lxd-agent" ]; then
+    ln -s lxd-agent "${PREFIX}"/incus-agent
+fi
+restorecon -R "${PREFIX}" >/dev/null 2>&1 || true
+exit 0

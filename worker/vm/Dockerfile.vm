@@ -1,0 +1,68 @@
+ARG BASE_IMAGE=agentor-worker:latest
+FROM ${BASE_IMAGE}
+USER root
+
+# Install Linux kernel, systemd init, bootloader, netplan, and core networking
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get -y install --no-install-recommends \
+    linux-image-virtual \
+    initramfs-tools \
+    systemd-sysv \
+    systemd \
+    grub-common \
+    grub2-common \
+    grub-efi-amd64-bin \
+    dbus \
+    isc-dhcp-client \
+    iproute2 \
+    iputils-ping \
+    netplan.io \
+    udev && \
+    find /boot -type l -delete && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Configure netplan for automatic DHCP on eth* and en* interfaces
+RUN mkdir -p /etc/netplan && printf 'network:\n  version: 2\n  renderer: networkd\n  ethernets:\n    all-eth:\n      match:\n        name: "eth*"\n      dhcp4: true\n      dhcp-identifier: mac\n    all-en:\n      match:\n        name: "en*"\n      dhcp4: true\n      dhcp-identifier: mac\n' > /etc/netplan/01-netcfg.yaml && chmod 600 /etc/netplan/01-netcfg.yaml
+
+# Kernel modules for virtiofs, 9p, and overlay
+RUN mkdir -p /etc/modules-load.d && \
+    printf '9pnet\n9pnet_virtio\n9p\noverlay\n' > /etc/modules-load.d/incus.conf
+
+# Incus agent setup and service
+COPY 99-incus-agent.rules /usr/lib/udev/rules.d/99-incus-agent.rules
+COPY incus-agent.service /usr/lib/systemd/system/incus-agent.service
+COPY incus-agent-setup /usr/lib/systemd/incus-agent-setup
+RUN chmod +x /usr/lib/systemd/incus-agent-setup
+
+# Docker persistent block volume mount helper
+RUN mkdir -p /usr/lib/agentor
+COPY agentor-docker-storage.sh /usr/lib/agentor/agentor-docker-storage.sh
+RUN chmod +x /usr/lib/agentor/agentor-docker-storage.sh
+COPY agentor-docker-storage.service /etc/systemd/system/agentor-docker-storage.service
+
+# Agentor worker systemd service
+COPY agentor-worker.service /etc/systemd/system/agentor-worker.service
+
+# Configure docker.service dependencies to wait for agentor-docker-storage
+RUN mkdir -p /etc/systemd/system/docker.service.d && \
+    printf '[Unit]\nAfter=agentor-docker-storage.service\nWants=agentor-docker-storage.service\n' > /etc/systemd/system/docker.service.d/storage.conf
+
+# Enable units in multi-user.target
+RUN mkdir -p /etc/systemd/system/multi-user.target.wants && \
+    ln -sf /usr/lib/systemd/system/incus-agent.service /etc/systemd/system/multi-user.target.wants/incus-agent.service && \
+    ln -sf /etc/systemd/system/agentor-worker.service /etc/systemd/system/multi-user.target.wants/agentor-worker.service && \
+    ln -sf /etc/systemd/system/agentor-docker-storage.service /etc/systemd/system/multi-user.target.wants/agentor-docker-storage.service
+
+# Configure grub defaults for instant boot and dual console (VGA + serial ttyS0)
+RUN printf 'GRUB_DEFAULT=0\nGRUB_TIMEOUT_STYLE=hidden\nGRUB_TIMEOUT=0\nGRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyS0,115200n8 net.ifnames=0"\nGRUB_CMDLINE_LINUX=""\nGRUB_TERMINAL="console serial"\nGRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1"\n' > /etc/default/grub
+
+# Enable systemd-networkd for automatic DHCP network management
+RUN systemctl enable systemd-networkd && \
+    systemctl disable systemd-resolved 2>/dev/null || true
+
+# Prepare ephemeral config mount directory
+RUN mkdir -p /run/agentor /etc/agentor
+
+USER agent
+WORKDIR /workspace

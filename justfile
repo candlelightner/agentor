@@ -23,6 +23,10 @@ down:
 build:
     docker build -t agentor-worker:latest ./worker
 
+# Build the Incus VM worker image
+build-vm *args:
+    ./scripts/build-incus-worker-image.sh {{args}}
+
 # Run the isolated dockerized test suite (e.g. `just test api/health.spec.ts` or `just test --project=api`)
 test *args:
     cd tests && npm run test:docker -- {{args}}

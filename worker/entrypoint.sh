@@ -45,6 +45,17 @@ _ready() {
     echo "READY|" >> /tmp/worker-events
 }
 
+# Source worker environment files if present (used in Incus VM mode)
+if [ -f /run/agentor/worker.env ]; then
+    set -a
+    . /run/agentor/worker.env
+    set +a
+elif [ -f /etc/agentor/worker.env ]; then
+    set -a
+    . /etc/agentor/worker.env
+    set +a
+fi
+
 # Capture the server-provisioned runtime role before ENVIRONMENT.envVars or
 # worker-local values are exported. Only these three internal values exist;
 # missing or invalid values fail closed to the ordinary-worker role.
@@ -384,12 +395,17 @@ _log "Agent setup: done"
 DOCKER_ENABLED=$(echo "$ENVIRONMENT" | jq -r '.dockerEnabled // false')
 if [ "$DOCKER_ENABLED" = "true" ]; then
     _step docker "Docker daemon"
-    _log "DinD: starting dockerd..."
-    sudo find /run /var/run -iname 'docker*.pid' -delete 2>/dev/null || true
-    sudo find /run /var/run -path '*/containerd*' -delete 2>/dev/null || true
-    sudo rm -rf /var/run/docker /var/run/docker.sock 2>/dev/null || true
-    sudo mkdir -p /var/lib/docker /etc/docker
-    sudo tee /etc/docker/daemon.json > /dev/null <<'DOCKERCONF'
+    _log "Docker: starting dockerd..."
+    if [ -d /run/systemd/system ]; then
+        # Running under systemd (Incus VM native Docker)
+        sudo systemctl start docker || sudo systemctl restart docker
+    else
+        # Running in container (legacy DinD)
+        sudo find /run /var/run -iname 'docker*.pid' -delete 2>/dev/null || true
+        sudo find /run /var/run -path '*/containerd*' -delete 2>/dev/null || true
+        sudo rm -rf /var/run/docker /var/run/docker.sock 2>/dev/null || true
+        sudo mkdir -p /var/lib/docker /etc/docker
+        sudo tee /etc/docker/daemon.json > /dev/null <<'DOCKERCONF'
 {
     "storage-driver": "overlay2",
     "iptables": true,
@@ -398,11 +414,8 @@ if [ "$DOCKER_ENABLED" = "true" ]; then
     "log-opts": { "max-size": "10m", "max-file": "3" }
 }
 DOCKERCONF
-    # Mirror dockerd output to both /tmp/dockerd.log (for in-container
-    # debugging) and the container's stdout (so the orchestrator's log
-    # collector captures it). The "[dockerd] " prefix tags entries so they
-    # are distinguishable from other entrypoint output.
-    ( sudo dockerd 2>&1 | stdbuf -oL -eL sed -u 's/^/[dockerd] /' | tee -a /tmp/dockerd.log ) &
+        ( sudo dockerd 2>&1 | stdbuf -oL -eL sed -u 's/^/[dockerd] /' | tee -a /tmp/dockerd.log ) &
+    fi
     tries=300  # 300 * 0.1s = 30s (matches the "within 30s" warn message below)
     while [ ! -S /var/run/docker.sock ] && [ $tries -gt 0 ]; do
         sleep 0.1
@@ -414,12 +427,15 @@ DOCKERCONF
                 || echo "[docker] Warning: GHCR login failed, continuing"
         fi
         _done docker "Docker daemon"
-        _log "DinD: dockerd ready"
+        _log "Docker: dockerd ready"
     else
         _warn docker "Docker daemon (failed to start)"
-        _log "DinD: WARNING — dockerd failed to start within 30s"
+        _log "Docker: WARNING — dockerd failed to start within 30s"
     fi
 else
+    if [ -d /run/systemd/system ]; then
+        sudo systemctl stop docker 2>/dev/null || true
+    fi
     _skip docker "Docker daemon"
 fi
 
