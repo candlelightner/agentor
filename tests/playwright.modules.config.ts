@@ -25,6 +25,7 @@ export default defineConfig({
     "api/provider-http.spec.ts",
     "api/resource-monitor-lifecycle.spec.ts",
     "api/worker-self-access-policy.spec.ts",
+    "api/worker-runtime-kind.spec.ts",
     "api/workspace-download-cancellation.spec.ts",
   ],
   fullyParallel: false,

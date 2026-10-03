@@ -40,6 +40,15 @@ export interface Config {
   betterAuthUrl: string;
   betterAuthTrustedOrigins: string[];
   betterAuthRpId: string;
+  incusEnabled: boolean;
+  incusEndpoint: string;
+  incusProject: string;
+  incusClientCertPath: string;
+  incusClientKeyPath: string;
+  incusServerCertPath: string;
+  incusNetwork: string;
+  incusStoragePool: string;
+  incusInternalGatewayUrl: string;
 }
 
 const DEFAULT_LOG_MAX_SIZE = 50 * 1024 * 1024;
@@ -150,5 +159,14 @@ export function loadConfig(): Config {
       ? process.env.BETTER_AUTH_TRUSTED_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
       : [],
     betterAuthRpId: process.env.BETTER_AUTH_RP_ID?.trim() || '',
+    incusEnabled: process.env.INCUS_ENABLED === 'true',
+    incusEndpoint: process.env.INCUS_ENDPOINT || '',
+    incusProject: process.env.INCUS_PROJECT || 'agentor',
+    incusClientCertPath: process.env.INCUS_CLIENT_CERT_PATH || '',
+    incusClientKeyPath: process.env.INCUS_CLIENT_KEY_PATH || '',
+    incusServerCertPath: process.env.INCUS_SERVER_CERT_PATH || '',
+    incusNetwork: process.env.INCUS_NETWORK || 'incusbr0',
+    incusStoragePool: process.env.INCUS_STORAGE_POOL || 'default',
+    incusInternalGatewayUrl: process.env.INCUS_INTERNAL_GATEWAY_URL || '',
   };
 }

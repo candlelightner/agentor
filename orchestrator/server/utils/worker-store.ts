@@ -4,7 +4,9 @@ import type {
   MountConfig,
   UserOwnedResource,
   WorkerSelfApiAccess,
+  WorkerRuntimeKind,
 } from "../../shared/types";
+import { normalizeWorkerRuntimeKind } from "../../shared/types";
 
 /** Persisted worker metadata — intentionally minimal. It stores ONLY what cannot
  * be discovered from Docker at runtime: the worker's identity, owner, editable
@@ -17,6 +19,8 @@ import type {
  * `agentor.id` label, never persisted here. Extends `UserOwnedResource`, so it
  * also carries `userId`/`createdAt`/`updatedAt`. */
 export interface WorkerRecord extends UserOwnedResource {
+  /** Worker compute runtime technology: legacy Docker container vs Incus VM. */
+  runtimeKind?: WorkerRuntimeKind;
   /** Editable, user-facing label. Free-form and not required to be unique. */
   displayName: string;
   /** Lifecycle marker. `active` = a Docker container exists for this worker;
@@ -72,16 +76,35 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     super(dataDir, "workers.json", (w) => w.id);
   }
 
+  override get(userId: string, key: string): WorkerRecord | undefined {
+    const item = super.get(userId, key);
+    if (!item) return undefined;
+    return {
+      ...item,
+      runtimeKind: normalizeWorkerRuntimeKind(item.runtimeKind),
+    };
+  }
+
   /** Flat list of every worker across every user, sorted by the immutable UUID
    * `id` for a stable global ordering. */
   override list(): WorkerRecord[] {
-    return super.list().sort((a, b) => a.id.localeCompare(b.id));
+    return super
+      .list()
+      .map((w) => ({
+        ...w,
+        runtimeKind: normalizeWorkerRuntimeKind(w.runtimeKind),
+      }))
+      .sort((a, b) => a.id.localeCompare(b.id));
   }
 
   override listForUser(userId: string): WorkerRecord[] {
     // Sort by the user-facing label (the UUID `id` is meaningless to sort on).
     return super
       .listForUser(userId)
+      .map((w) => ({
+        ...w,
+        runtimeKind: normalizeWorkerRuntimeKind(w.runtimeKind),
+      }))
       .sort((a, b) =>
         (a.displayName || a.id).localeCompare(b.displayName || b.id),
       );
@@ -99,19 +122,28 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
    * `agentor.id` Docker label back to its record (and, since `containerName` is
    * just `<prefix>-<id>`, to resolve a container name once the prefix is stripped). */
   findById(id: string): WorkerRecord | undefined {
-    return this.findWithOwner((w) => w.id === id)?.item;
+    const item = this.findWithOwner((w) => w.id === id)?.item;
+    if (!item) return undefined;
+    return {
+      ...item,
+      runtimeKind: normalizeWorkerRuntimeKind(item.runtimeKind),
+    };
   }
 
   async upsert(worker: WorkerRecord): Promise<void> {
-    const isNew = !this.has(worker.userId, worker.id);
-    await this.setItem(worker.userId, worker);
-    const label = worker.displayName || worker.id;
+    const normalized: WorkerRecord = {
+      ...worker,
+      runtimeKind: normalizeWorkerRuntimeKind(worker.runtimeKind),
+    };
+    const isNew = !this.has(normalized.userId, normalized.id);
+    await this.setItem(normalized.userId, normalized);
+    const label = normalized.displayName || normalized.id;
     if (isNew) {
       useLogger().info(
-        `[worker-store] registered worker ${label} (status=${worker.status})`,
+        `[worker-store] registered worker ${label} (status=${normalized.status}, runtime=${normalized.runtimeKind})`,
       );
     } else {
-      useLogger().debug(`[worker-store] updated worker ${label}`);
+      useLogger().debug(`[worker-store] updated worker ${label} (runtime=${normalized.runtimeKind})`);
     }
   }
 

@@ -1010,6 +1010,7 @@ export class DockerAdminWorkspaceRuntime
     const inspection = await this.read("admin service registration inspect", container.inspect());
     const resources = this.resources(record);
     const info: ContainerInfo = {
+      runtimeKind: "legacy-docker",
       administrativeKind: resources.groupId ? "group" : "platform",
       id: record.id,
       userId: record.ownerId || "__agentor_admin__",

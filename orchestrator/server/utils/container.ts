@@ -62,7 +62,9 @@ import type {
   FileEntry,
   FileListing,
   MoveConflict,
+  WorkerRuntimeKind,
 } from "../../shared/types";
+import { normalizeWorkerRuntimeKind } from "../../shared/types";
 
 async function resolveImportedImage(
   userId: string,
@@ -957,6 +959,7 @@ export class ContainerManager {
 
       nextContainers.set(id, {
         id,
+        runtimeKind: normalizeWorkerRuntimeKind(worker.runtimeKind),
         userId: worker.userId,
         createdAt: worker.createdAt ?? now,
         updatedAt: worker.updatedAt ?? now,
@@ -1307,9 +1310,13 @@ export class ContainerManager {
       request.targetWorkerGroupId,
     );
     const initScript = request.initScript?.trim() || undefined;
+    const runtimeKind: WorkerRuntimeKind = this.config.incusEnabled
+      ? "incus-vm"
+      : "legacy-docker";
 
     const containerInfo: ContainerInfo = {
       id,
+      runtimeKind,
       userId,
       createdAt: now,
       updatedAt: now,
@@ -3362,6 +3369,7 @@ for p in sys.argv[1:]:
       this.config.workerImagePrefix + this.config.workerImage;
     const containerInfo: ContainerInfo = {
       id: info.id,
+      runtimeKind: normalizeWorkerRuntimeKind(info.runtimeKind),
       userId: info.userId,
       createdAt: info.createdAt,
       updatedAt: new Date().toISOString(),
@@ -3546,6 +3554,7 @@ for p in sys.argv[1:]:
       this.config.workerImagePrefix + this.config.workerImage;
     const containerInfo: ContainerInfo = {
       id: worker.id,
+      runtimeKind: normalizeWorkerRuntimeKind(worker.runtimeKind),
       userId: worker.userId,
       createdAt: worker.createdAt,
       updatedAt: new Date().toISOString(),
@@ -3784,6 +3793,7 @@ for p in sys.argv[1:]:
         const containerName = this.buildContainerName(worker.id);
         this.containers.set(worker.id, {
           id: worker.id,
+          runtimeKind: normalizeWorkerRuntimeKind(worker.runtimeKind),
           userId: worker.userId,
           createdAt: worker.createdAt,
           updatedAt: worker.updatedAt,
@@ -4505,8 +4515,12 @@ for p in sys.argv[1:]:
         await this.rollbackFailedProvisionedWorker(input);
       };
       const now = new Date().toISOString();
+      const runtimeKind: WorkerRuntimeKind = this.config.incusEnabled
+        ? "incus-vm"
+        : "legacy-docker";
       const containerInfo: ContainerInfo = {
         id,
+        runtimeKind,
         userId,
         createdAt: now,
         updatedAt: now,
@@ -5208,6 +5222,7 @@ for p in sys.argv[1:]:
   private containerInfoToWorkerRecord(info: ContainerInfo): WorkerRecord {
     return {
       id: info.id,
+      runtimeKind: normalizeWorkerRuntimeKind(info.runtimeKind),
       userId: info.userId,
       createdAt: info.createdAt,
       updatedAt: info.updatedAt,

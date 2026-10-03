@@ -191,11 +191,21 @@ export interface WorkerGroupLifecycleResult {
   failures: Array<{ workerId: string; message: string }>;
 }
 
+export type WorkerRuntimeKind = "legacy-docker" | "incus-vm";
+
+export function normalizeWorkerRuntimeKind(
+  runtimeKind?: unknown,
+): WorkerRuntimeKind {
+  return runtimeKind === "incus-vm" ? "incus-vm" : "legacy-docker";
+}
+
 /** A worker. `id` is the worker's stable UUID identity (immutable across
  * rebuild/unarchive); `containerId`/`containerName` describe the current Docker
  * container (the `containerId` changes on every rebuild). Extends
  * `UserOwnedResource` so it carries `id`/`userId`/`createdAt`/`updatedAt`. */
 export interface ContainerInfo extends UserOwnedResource {
+  /** Worker compute runtime technology: legacy Docker container vs Incus VM. */
+  runtimeKind: WorkerRuntimeKind;
   /** Trusted orchestrator-managed workspace; never eligible for ordinary worker lifecycle mutations. */
   administrativeKind?: "platform" | "group";
   /** Current Docker container ID (64-hex; the short form is the in-container
