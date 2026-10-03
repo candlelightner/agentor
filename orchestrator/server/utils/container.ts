@@ -529,6 +529,21 @@ export class ContainerManager {
     this.incusRuntime = runtime;
   }
 
+  async refreshIncusSshKeys(userId: string): Promise<void> {
+    if (!this.storageManager || !this.workerStore) return;
+    const keys = await this.storageManager.readSshAuthorizedKeys(userId);
+    for (const worker of this.workerStore.list().filter((record) =>
+      record.userId === userId && record.runtimeKind === "incus-vm" && record.status !== "archived")) {
+      try {
+        await this.incusRuntime.refreshSshKeys({ id: worker.id, userId,
+          containerName: this.buildContainerName(worker.id) }, keys);
+      } catch (error) {
+        if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+        // No guest exists; its next create/start uses current canonical keys.
+      }
+    }
+  }
+
   setEnvironmentStore(store: EnvironmentStore): void {
     this.environmentStore = store;
   }
@@ -790,6 +805,7 @@ export class ContainerManager {
       workerJson: { id: info.id, displayName: info.displayName,
         repos: info.repos ?? [], initScript: info.initScript ?? "", gitName, gitEmail },
       userEnv, credentialBinds, workerConfig: [...groupSecrets, ...workerConfig], mounts: info.mounts,
+      storageManager: this.storageManager,
       image: info.imageRuntimeReference,
       sshAuthorizedKeys: await this.storageManager?.readSshAuthorizedKeys(info.userId),
     };
@@ -3050,6 +3066,9 @@ for p in sys.argv[1:]:
           }),
       ],
       ["mapping cleanup", () => cleanupWorkerMappings(info.containerName)],
+      ...(info.runtimeKind === "incus-vm" ? [["Incus core storage", () => this.incusRuntime.removeStorage({
+        id: info.id, userId: info.userId, containerName: info.containerName,
+      })] as const] : []),
       [
         "worker group memberships",
         async () => {
@@ -3779,6 +3798,9 @@ for p in sys.argv[1:]:
           }),
       ],
       ["mapping cleanup", () => cleanupWorkerMappings(containerName)],
+      ...(worker.runtimeKind === "incus-vm" ? [["Incus core storage", () => this.incusRuntime.removeStorage({
+        id: worker.id, userId: worker.userId, containerName,
+      })] as const] : []),
       [
         "worker group memberships",
         async () => {
@@ -3789,7 +3811,7 @@ for p in sys.argv[1:]:
         },
       ],
     ];
-    if (this.storageManager) {
+    if (this.storageManager && worker.runtimeKind !== "incus-vm") {
       actions.push(
         [
           "workspace",
@@ -4983,7 +5005,7 @@ for p in sys.argv[1:]:
             this.dockerService.removeContainer(containerId),
           ),
         removeWorkspace: () =>
-          incus ? Promise.resolve() : this.storageManager?.removeWorkerWorkspace(
+          incus ? this.incusRuntime.removeStorage({ id, userId, containerName }) : this.storageManager?.removeWorkerWorkspace(
             userId,
             id,
             containerName,

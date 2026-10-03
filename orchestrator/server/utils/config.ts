@@ -49,6 +49,7 @@ export interface Config {
   incusNetwork: string;
   incusStoragePool: string;
   incusWorkerImage: string;
+  incusDockerVolumeSize: string;
   incusInternalGatewayUrl: string;
 }
 
@@ -169,6 +170,7 @@ export function loadConfig(): Config {
     incusNetwork: process.env.INCUS_NETWORK || '',
     incusStoragePool: process.env.INCUS_STORAGE_POOL || '',
     incusWorkerImage: process.env.INCUS_WORKER_IMAGE || 'agentor-worker',
+    incusDockerVolumeSize: process.env.INCUS_DOCKER_VOLUME_SIZE || '20GiB',
     incusInternalGatewayUrl: process.env.INCUS_INTERNAL_GATEWAY_URL || '',
   };
 }

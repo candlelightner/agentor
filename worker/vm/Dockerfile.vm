@@ -39,7 +39,9 @@ RUN chmod +x /usr/lib/systemd/incus-agent-setup
 # Docker persistent block volume mount helper
 RUN mkdir -p /usr/lib/agentor
 COPY agentor-docker-storage.sh /usr/lib/agentor/agentor-docker-storage.sh
-RUN chmod +x /usr/lib/agentor/agentor-docker-storage.sh
+COPY agentor-private-storage.sh /usr/lib/agentor/agentor-private-storage.sh
+RUN chmod +x /usr/lib/agentor/agentor-docker-storage.sh /usr/lib/agentor/agentor-private-storage.sh
+RUN printf '2\n' > /usr/lib/agentor/bootstrap-generation
 COPY agentor-docker-storage.service /etc/systemd/system/agentor-docker-storage.service
 
 # Agentor worker systemd service
@@ -47,15 +49,16 @@ COPY agentor-worker.service /etc/systemd/system/agentor-worker.service
 
 # Configure docker.service dependencies to wait for agentor-docker-storage
 RUN mkdir -p /etc/systemd/system/docker.service.d && \
-    printf '[Unit]\nAfter=agentor-docker-storage.service\nRequires=agentor-docker-storage.service\n' > /etc/systemd/system/docker.service.d/storage.conf
+    printf '[Unit]\nAfter=agentor-docker-storage.service\nRequires=agentor-docker-storage.service\nConditionPathExists=/run/agentor/docker-storage.json\n[Service]\nExecStartPre=/usr/bin/mountpoint -q /var/lib/docker\n' > /etc/systemd/system/docker.service.d/storage.conf && \
+    mkdir -p /etc/docker && \
+    printf '{"storage-driver":"overlay2","iptables":true,"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}\n' > /etc/docker/daemon.json
 
 # Enable units in multi-user.target
 RUN mkdir -p /etc/systemd/system/multi-user.target.wants && \
-    ln -sf /usr/lib/systemd/system/incus-agent.service /etc/systemd/system/multi-user.target.wants/incus-agent.service && \
-    ln -sf /etc/systemd/system/agentor-docker-storage.service /etc/systemd/system/multi-user.target.wants/agentor-docker-storage.service
+    ln -sf /usr/lib/systemd/system/incus-agent.service /etc/systemd/system/multi-user.target.wants/incus-agent.service
 
 # Orchestrator starts the worker only after agent readiness and /run provisioning.
-RUN systemctl disable agentor-worker docker docker.socket containerd
+RUN systemctl disable agentor-worker agentor-docker-storage docker docker.socket containerd
 
 # Configure grub defaults for instant boot and dual console (VGA + serial ttyS0)
 RUN printf 'GRUB_DEFAULT=0\nGRUB_TIMEOUT_STYLE=hidden\nGRUB_TIMEOUT=0\nGRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyS0,115200n8 net.ifnames=0"\nGRUB_CMDLINE_LINUX=""\nGRUB_TERMINAL="console serial"\nGRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1"\n' > /etc/default/grub

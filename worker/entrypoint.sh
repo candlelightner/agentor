@@ -114,7 +114,9 @@ _log "Tmux: ready"
 AGENT_DATA=/home/agent/.agent-data
 if [ -d "$AGENT_DATA" ]; then
     # Fix ownership (Docker may create subdirs as root for credential bind mounts)
-    sudo chown -R agent:agent "$AGENT_DATA"
+    if [ "$(cat /proc/1/comm)" != systemd ]; then
+        sudo chown -R agent:agent "$AGENT_DATA"
+    fi
 
     # Ensure subdirectories exist in the per-worker volume. Kilo's config and
     # shared-data are overlaid by per-user bind mounts (config = global config,
@@ -122,7 +124,10 @@ if [ -d "$AGENT_DATA" ]; then
     # workers). state/cache stay private to this worker.
     mkdir -p "$AGENT_DATA"/{.claude,.gemini,.codex,.agents,.vscode,.code-server}
     mkdir -p "$AGENT_DATA/.kilo"/{config,shared-data,state,cache}
-    chmod 700 "$AGENT_DATA/.code-server" "$AGENT_DATA/.kilo" "$AGENT_DATA/.kilo"/{config,shared-data,state,cache}
+    chmod 700 "$AGENT_DATA/.code-server" "$AGENT_DATA/.kilo" "$AGENT_DATA/.kilo"/{state,cache}
+    if [ "$(cat /proc/1/comm)" != systemd ]; then
+        chmod 700 "$AGENT_DATA/.kilo"/{config,shared-data}
+    fi
 
     # Symlink agent config dirs to persistent volume
     for dir in .claude .gemini .codex .agents .vscode; do
@@ -394,7 +399,9 @@ if [ "$DOCKER_ENABLED" = "true" ]; then
     _log "Docker: starting dockerd..."
     if [ -d /run/systemd/system ]; then
         # Running under systemd (Incus VM native Docker)
-        sudo systemctl start docker || sudo systemctl restart docker
+        sudo systemctl start docker
+        # A skipped systemd condition must not report a successful capability.
+        docker info >/dev/null || { echo "[agent] ERROR: native Docker storage/daemon is not ready" >&2; exit 70; }
     else
         # Running in container (legacy DinD)
         sudo find /run /var/run -iname 'docker*.pid' -delete 2>/dev/null || true
@@ -430,7 +437,7 @@ DOCKERCONF
     fi
 else
     if [ -d /run/systemd/system ]; then
-        sudo systemctl stop docker 2>/dev/null || true
+        sudo systemctl stop docker docker.socket containerd 2>/dev/null || true
     fi
     _skip docker "Docker daemon"
 fi

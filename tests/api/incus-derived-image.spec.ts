@@ -1,6 +1,7 @@
 import { test, expect } from "@playwright/test";
 import { randomUUID } from "node:crypto";
 import { IncusClient } from "../../orchestrator/server/utils/incus-client";
+import { IncusWorkerStorage } from "../../orchestrator/server/utils/incus-worker-storage";
 import type { Config } from "../../orchestrator/server/utils/config";
 
 function serializeIncusWorkerEnv(values: Record<string, string>): string {
@@ -32,14 +33,19 @@ test("real derived image boots unattended and waits for runtime provisioning", a
   test.skip(process.env.INCUS_LIVE_TEST !== "true", "Explicit disposable-host acceptance run");
   test.setTimeout(240_000);
   const client = IncusClient.fromConfig(config);
-  const name = `phase3-${randomUUID()}`;
+  const id = randomUUID();
+  const name = `${config.containerPrefix}-${id}`;
   const image = await client.getImageAlias(config.incusWorkerImage);
+  const storage = new IncusWorkerStorage(client, config, name);
+  const owner = { id, userId: "image-test", containerName: name };
+  const devices = await storage.devices(owner, false);
   let created = false;
   try {
     await client.createInstance({ name, type: "virtual-machine", profiles: [],
       source: { type: "image", fingerprint: image.target },
       config: { "security.secureboot": "false", "limits.memory": "2GiB", "limits.cpu": "2" },
       devices: {
+        ...devices,
         root: { type: "disk", path: "/", pool: config.incusStoragePool },
         eth0: { type: "nic", name: "eth0", network: config.incusNetwork,
           "security.ipv4_filtering": "true", "security.mac_filtering": "true", "security.ipv6_filtering": "true" },
@@ -68,6 +74,7 @@ test("real derived image boots unattended and waits for runtime provisioning", a
       AGENTOR_RUNTIME_ROLE: "worker", WORKER_CONTAINER_NAME: name,
     }), { mode: 0o640, uid: 0, gid: 1000 });
     expect((await client.exec(name, ["sudo", "-u", "agent", "test", "-r", "/run/agentor/worker.env"])).returnCode).toBe(0);
+    await client.pushFile(name, "/run/agentor/provisioned", "image-acceptance\n", { mode: 0o600, uid: 0, gid: 0 });
     expect((await client.exec(name, ["systemctl", "start", "agentor-worker"])).returnCode).toBe(0);
     await expect.poll(async () => (await client.exec(name, ["grep", "-q", "^READY|", "/tmp/worker-events"])).returnCode,
       { timeout: 120_000, intervals: [500, 1000] }).toBe(0);
@@ -81,10 +88,17 @@ test("real derived image boots unattended and waits for runtime provisioning", a
     expect(services.returnCode, services.stderr).toBe(0);
     expect(await client.getPrimaryIp(name)).toBeTruthy();
   } finally {
-    if (created) {
+    // A transport/operation timeout may occur after creation was accepted.
+    // Cleanup only this exact generated test name, not an arbitrary inventory.
+    const exists = created || await client.getInstance(name).then(() => true, (error) => {
+      if (error.statusCode === 404) return false;
+      throw error;
+    });
+    if (exists) {
       if ((await client.getInstanceState(name)).status !== "Stopped")
         await client.stopInstance(name, { force: true });
       await client.deleteInstance(name);
     }
+    await storage.remove(owner);
   }
 });

@@ -1,4 +1,5 @@
-import { chown, mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, open, readdir, unlink } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { StorageManager } from './storage';
 import type { CredentialInfo } from '../../shared/types';
@@ -67,6 +68,30 @@ export class UserCredentialManager {
     this.storage = storage;
   }
 
+  // A worker can replace directory-shared entries. Never follow its symlinks
+  // into unrelated control-plane data, and verify before truncating a file.
+  private async readCredential(path: string): Promise<string> {
+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const stat = await file.stat();
+      if (!stat.isFile() || stat.nlink !== 1) throw new Error('Credential must be a private regular file');
+      return await file.readFile('utf-8');
+    } finally { await file.close(); }
+  }
+
+  private async writeCredential(path: string, content: string, exclusive = false): Promise<void> {
+    const file = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW |
+      constants.O_NONBLOCK | (exclusive ? constants.O_EXCL : 0), 0o600);
+    try {
+      const stat = await file.stat();
+      if (!stat.isFile() || stat.nlink !== 1) throw new Error('Credential must be a private regular file');
+      await file.truncate(0);
+      await file.writeFile(content);
+      await file.chmod(0o600);
+      await file.chown(AGENT_UID, AGENT_GID).catch(() => {});
+    } finally { await file.close(); }
+  }
+
   /** Absolute in-container path to the user's live Kilo auth file (inside the
    * shared Kilo data directory). */
   private kiloAuthPath(userId: string): string {
@@ -83,9 +108,18 @@ export class UserCredentialManager {
    * routing Kilo to the shared Kilo data directory. */
   filePath(userId: string, fileName: string): string {
     const mapping = AGENT_CREDENTIAL_MAPPINGS.find((entry) => entry.fileName === fileName);
+    if (!mapping) throw new Error('Unknown credential file');
     return mapping?.storagePath
       ? join(this.storage.getUserDir(userId), mapping.storagePath)
       : join(this.credentialsDir(userId), fileName);
+  }
+
+  async readForUser(userId: string, fileName: string): Promise<string> {
+    return this.readCredential(this.filePath(userId, fileName));
+  }
+
+  async writeForUser(userId: string, fileName: string, content: string): Promise<void> {
+    await this.writeCredential(this.filePath(userId, fileName), content);
   }
 
   /** Create the user's credentials directory and seed each agent's file as `{}`
@@ -101,15 +135,10 @@ export class UserCredentialManager {
         const filePath = this.filePath(userId, mapping.fileName);
         await mkdir(dirname(filePath), { recursive: true, mode: 0o700 });
         try {
-          await stat(filePath);
-        } catch {
-          await writeFile(filePath, '{}', { mode: 0o600 });
-          try {
-            await chown(filePath, AGENT_UID, AGENT_GID);
-          } catch {
-            // Best effort — ownership only matters in directory mode. In volume
-            // mode the entrypoint's chown handles it.
-          }
+          await this.writeCredential(filePath, '{}', true);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+          await this.readCredential(filePath);
         }
       }),
     );
@@ -133,7 +162,7 @@ export class UserCredentialManager {
     const legacyPath = this.kiloLegacyPath(userId);
     let legacyRaw: string;
     try {
-      legacyRaw = await readFile(legacyPath, 'utf-8');
+      legacyRaw = await this.readCredential(legacyPath);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true;
       throw err;
@@ -160,7 +189,7 @@ export class UserCredentialManager {
     const authPath = this.kiloAuthPath(userId);
     let shared: Record<string, unknown> = {};
     try {
-      const sharedRaw = (await readFile(authPath, 'utf-8')).trim();
+      const sharedRaw = (await this.readCredential(authPath)).trim();
       if (sharedRaw && sharedRaw !== '{}') {
         shared = JSON.parse(sharedRaw) as Record<string, unknown>;
       }
@@ -182,12 +211,7 @@ export class UserCredentialManager {
     }
     if (changed) {
       await mkdir(dirname(authPath), { recursive: true, mode: 0o700 });
-      await writeFile(authPath, JSON.stringify(shared, null, 2), { mode: 0o600 });
-      try {
-        await chown(authPath, AGENT_UID, AGENT_GID);
-      } catch {
-        // Best effort.
-      }
+      await this.writeCredential(authPath, JSON.stringify(shared, null, 2));
     }
     await unlink(legacyPath).catch(() => {});
     useLogger().info(`[user-credentials] migrated legacy kilo.json into shared Kilo auth for user ${userId}`);
@@ -211,7 +235,7 @@ export class UserCredentialManager {
   /** Returns true when the user's credential file contains more than `{}`. */
   async getStatusForUser(userId: string, fileName: string): Promise<boolean> {
     try {
-      const content = await readFile(this.filePath(userId, fileName), 'utf-8');
+      const content = await this.readCredential(this.filePath(userId, fileName));
       return content.trim().length > 2;
     } catch {
       return false;
@@ -225,12 +249,7 @@ export class UserCredentialManager {
     if (!mapping) throw new Error(`Unknown credential file: ${fileName}`);
     await this.ensureUserDir(userId);
     const filePath = this.filePath(userId, fileName);
-    await writeFile(filePath, '{}', { mode: 0o600 });
-    try {
-      await chown(filePath, AGENT_UID, AGENT_GID);
-    } catch {
-      // See ensureUserDir — best effort.
-    }
+    await this.writeCredential(filePath, '{}');
     useLogger().info(`[user-credentials] reset ${fileName} for user ${userId}`);
   }
 

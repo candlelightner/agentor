@@ -580,6 +580,17 @@ export class IncusClient {
     return this.request<IncusInstanceState>('GET', `/1.0/instances/${encodeURIComponent(name)}/state`);
   }
 
+  async updateInstanceDevices(name: string, devices: Record<string, IncusDevice>): Promise<void> {
+    const current = await this.getInstance(name);
+    const raw = await this.rawRequest('PUT', `/1.0/instances/${encodeURIComponent(name)}`, {
+      config: current.config, profiles: current.profiles, description: current.description, devices,
+    });
+    const json = JSON.parse(raw.body.toString('utf-8')) as IncusResponse<any>;
+    if (json.type === 'error' || raw.statusCode >= 400)
+      throw new IncusError(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code);
+    if (json.type === 'async' && json.operation) await this.waitForOperation(json.operation);
+  }
+
   async getPrimaryIp(name: string, preferredInterface = 'eth0'): Promise<string | undefined> {
     const state = await this.getInstanceState(name);
     if (!state.network) return undefined;
@@ -974,6 +985,15 @@ export class IncusClient {
     if (json.type === 'async' && json.operation) {
       await this.waitForOperation(json.operation);
     }
+  }
+
+  async updateCustomVolume(pool: string, name: string, config: Record<string, string>): Promise<void> {
+    const raw = await this.rawRequest('PUT',
+      `/1.0/storage-pools/${encodeURIComponent(pool)}/volumes/custom/${encodeURIComponent(name)}`, { config });
+    const json = JSON.parse(raw.body.toString('utf-8')) as IncusResponse<any>;
+    if (json.type === 'error' || raw.statusCode >= 400)
+      throw new IncusError(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code);
+    if (json.type === 'async' && json.operation) await this.waitForOperation(json.operation);
   }
 
   async listCustomVolumes(pool: string): Promise<string[]> {

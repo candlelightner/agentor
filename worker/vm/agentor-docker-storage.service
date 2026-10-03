@@ -3,6 +3,7 @@ Description=Prepare and Mount Incus Docker Storage Volume
 Before=docker.service
 Wants=local-fs.target
 After=local-fs.target
+ConditionPathExists=/run/agentor/docker-storage.json
 
 [Service]
 Type=oneshot

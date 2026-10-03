@@ -1,11 +1,19 @@
 import type { Config } from "./config";
 import type { DockerService } from "./docker";
-import { IncusClient, type IncusInstance } from "./incus-client";
+import { IncusClient, type IncusInstance, type IncusDevice } from "./incus-client";
+import { AGENT_CREDENTIAL_MAPPINGS } from "./user-credentials";
+import { join } from "node:path";
 import { renderUserEnvVars } from "./user-env-store";
 import { backupInstallationId } from "./backup-installation";
+import { IncusWorkerStorage, type IncusStorageOwner } from "./incus-worker-storage";
 import type { ContainerStatus } from "../../shared/types";
 
 export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & { sshAuthorizedKeys?: string };
+
+function sameDevice(actual: Record<string, string> | undefined, expected: Record<string, string>): boolean {
+  return !!actual && Object.keys(actual).length === Object.keys(expected).length &&
+    Object.entries(expected).every(([key, value]) => actual[key] === value);
+}
 
 /** Config is a shell file consumed only by entrypoint.sh, never systemd's
  * EnvironmentFile parser. Quote values literally, including newlines. */
@@ -35,6 +43,14 @@ export class IncusWorkerRuntime {
     return this.installation ??= backupInstallationId(this.config.dataDir);
   }
 
+  private async storage(): Promise<IncusWorkerStorage> {
+    return new IncusWorkerStorage(this.client, this.config, await this.installationId());
+  }
+
+  async removeStorage(owner: IncusStorageOwner): Promise<void> {
+    await (await this.storage()).remove(owner);
+  }
+
   async matchesWorkerIdentity(instance: IncusInstance, workerId: string): Promise<boolean> {
     return instance.type === "virtual-machine" && instance.config["user.agentor.id"] === workerId &&
       instance.name === `${this.config.containerPrefix}-${workerId}` &&
@@ -52,10 +68,39 @@ export class IncusWorkerRuntime {
   private validateOptions(opts: IncusWorkerOptions): void {
     // Refuse pending storage features on restart too; never put persistent
     // Docker/account data on disposable rootfs when settings change.
-    if (opts.dockerEnabled || opts.environmentJson.dockerEnabled || opts.mounts?.length ||
-        opts.hardwareDevices?.length || opts.credentialBinds?.length)
-      throw new Error("Incus persistent Docker, mounts, and shared credentials require storage integration");
+    if (opts.mounts?.length || opts.hardwareDevices?.length)
+      throw new Error("Incus mounts and hardware require their feature integration");
+    if (opts.credentialBinds?.length && !opts.storageManager)
+      throw new Error("Incus account shares require authoritative platform storage");
+    if (opts.dockerEnabled !== undefined && opts.dockerEnabled !== opts.environmentJson.dockerEnabled)
+      throw new Error("Docker capability must match the resolved worker environment");
     if (opts.image) throw new Error("A custom OCI image requires its derived Incus image mapping");
+  }
+
+  private async accountDevices(opts: IncusWorkerOptions): Promise<Record<string, IncusDevice>> {
+    if (!opts.storageManager) return {};
+    const userHost = opts.storageManager.getUserHostDir(opts.userId);
+    const credentials = join(userHost, "credentials");
+    const allowedBinds = new Set([
+      ...AGENT_CREDENTIAL_MAPPINGS.filter((mapping) => mapping.fileBind !== false)
+        .map((mapping) => `${join(credentials, mapping.fileName)}:${mapping.containerPath}`),
+      opts.storageManager.getSshAuthorizedKeysBind(opts.userId),
+      opts.storageManager.getKiloConfigBind(opts.userId), opts.storageManager.getKiloSharedDataBind(opts.userId),
+    ]);
+    if (opts.credentialBinds?.some((bind) => !allowedBinds.has(bind)))
+      throw new Error("Refusing an unrecognized account share");
+    const devices: Record<string, IncusDevice> = {
+      // Short device keys also bound QEMU's Unix socket pathname (108 bytes).
+      cred: { type: "disk", source: credentials, path: "/run/agentor/account-credentials" },
+      kcfg: { type: "disk", source: join(userHost, "kilo/config"), path: "/home/agent/.agent-data/.kilo/config" },
+      kdata: { type: "disk", source: join(userHost, "kilo/data"), path: "/home/agent/.agent-data/.kilo/shared-data" },
+    };
+    const project = await this.client.request<{ config: Record<string, string> }>("GET", `/1.0/projects/${encodeURIComponent(this.config.incusProject)}`);
+    const paths = project.config["restricted.devices.disk.paths"]?.split(",").map((path) => path.trim()) ?? [];
+    if (project.config.restricted !== "true" || project.config["restricted.devices.disk"] !== "allow" ||
+        Object.values(devices).some((device) => !paths.includes(device.source!)))
+      throw new Error("Host setup must explicitly allowlist this account's credential and Kilo directories in the restricted Incus project");
+    return devices;
   }
 
   private async assertReady(): Promise<void> {
@@ -69,6 +114,15 @@ export class IncusWorkerRuntime {
       throw new Error("Incus workers require installation data, configured worker network and storage pool");
     const readiness = await this.client.getReadiness();
     if (!readiness.ready) throw new Error("Incus worker runtime is unavailable");
+    // Earlier 6.0 LTS exports restricted host paths with an implicit unmapped
+    // user namespace. Do not compensate by granting host-root ID mappings or
+    // unrestricted low-level options; use the upstream fixed share transport.
+    const version = /^(\d+)\.(\d+)(?:\.(\d+))?(?:[-+].*)?$/.exec(readiness.serverVersion);
+    // LTS backports are not a numeric lower bound for older rolling releases:
+    // 6.1–6.9 still have the defect; rolling 6.10 contains the fixed transport.
+    if (!version || !(Number(version[1]) > 6 || (Number(version[1]) === 6 &&
+        (Number(version[2]) >= 10 || (Number(version[2]) === 0 && Number(version[3] ?? 0) >= 5)))))
+      throw new Error("Incus workers require patched Incus (6.0 LTS >=6.0.5 or >=6.10) and compatible Rust virtiofsd; run host setup/check");
     const project = await this.client.request<{ config: Record<string, string> }>(
       "GET", `/1.0/projects/${encodeURIComponent(c.incusProject)}`);
     if (project.config.restricted !== "true") throw new Error("Agentor Incus project must be restricted");
@@ -83,11 +137,17 @@ export class IncusWorkerRuntime {
       throw new Error("Incus worker name must match its WorkerRecord identity");
     const alias = await this.client.getImageAlias(this.config.incusWorkerImage);
     if (alias.type !== "virtual-machine") throw new Error("Incus worker image must be a virtual machine");
+    const image = await this.client.getImage(alias.target);
+    if (image.properties?.bootstrap_generation !== "2")
+      throw new Error("Rebuild the derived Incus worker image with the current safe storage bootstrap");
+    const account = await this.accountDevices(opts);
+    const persistent = await (await this.storage()).devices(opts, opts.environmentJson.dockerEnabled);
     const instance = await this.client.createInstance({
       name: opts.containerName, type: "virtual-machine", profiles: [],
       source: { type: "image", fingerprint: alias.target },
       config: {
         "user.agentor.id": opts.id,
+        "user.agentor.owner": opts.userId,
         "user.agentor.installation": await this.installationId(),
         "user.agentor.runtime-generation": "1",
         "security.secureboot": "false",
@@ -96,6 +156,8 @@ export class IncusWorkerRuntime {
         ...(opts.cpuLimit ? { "limits.cpu": String(Math.max(1, Math.ceil(opts.cpuLimit))) } : {}),
       },
       devices: {
+        ...persistent,
+        ...account,
         root: { type: "disk", path: "/", pool: this.config.incusStoragePool },
         eth0: { type: "nic", name: "eth0", network: this.config.incusNetwork,
           "security.mac_filtering": "true", "security.ipv4_filtering": "true", "security.ipv6_filtering": "true" },
@@ -107,14 +169,32 @@ export class IncusWorkerRuntime {
 
   private async checkedExec(name: string, command: string[]): Promise<void> {
     const result = await this.client.exec(name, command);
-    if (result.returnCode !== 0) throw new Error("Incus worker bootstrap command failed");
+    if (result.returnCode !== 0) throw new Error(`Incus worker bootstrap command failed (${command[0]}, exit ${result.returnCode})`);
   }
 
   async start(opts: IncusWorkerOptions): Promise<void> {
     this.validateOptions(opts);
+    await this.assertReady();
     const name = opts.containerName;
-    await this.assertOwned(name, opts.id);
+    const instance = await this.assertOwned(name, opts.id);
     const state = await this.client.getInstanceState(name);
+    const account = await this.accountDevices(opts);
+    for (const [key, expected] of Object.entries(account)) {
+      if (!sameDevice(instance.devices[key], expected))
+        throw new Error("Incus account share layout is missing or ambiguous; rebuild required");
+    }
+    const storage = await this.storage();
+    const persistent = await storage.devices(opts, opts.environmentJson.dockerEnabled, { docker: !!instance.devices.docker });
+    for (const role of ["workspace", "agents"] as const) {
+      if (!sameDevice(instance.devices[role], persistent[role]!))
+        throw new Error("Incus persistent layout is missing or ambiguous; explicit recovery is required");
+    }
+    if (persistent.docker && !sameDevice(instance.devices.docker, persistent.docker)) {
+      if (instance.devices.docker && (instance.devices.docker.source !== persistent.docker.source || instance.devices.docker.pool !== this.config.incusStoragePool))
+        throw new Error("Incus Docker device identity is ambiguous");
+      if (state.status === "Running") throw new Error("Restart the VM to attach native Docker storage");
+      await this.client.updateInstanceDevices(name, { ...instance.devices, ...persistent });
+    }
     if (state.status !== "Running") await this.client.startInstance(name);
     const deadline = Date.now() + 120_000;
     let ready = false;
@@ -127,9 +207,40 @@ export class IncusWorkerRuntime {
     }
     if (!ready) throw new Error("Incus worker agent did not become ready");
     try {
+      await this.checkedExec(name, ["bash", "-ec", 'test "$(cat /usr/lib/agentor/bootstrap-generation)" = 2; mountpoint -q /workspace; mountpoint -q /home/agent/.agent-data']);
       await this.checkedExec(name, ["systemctl", "stop", "agentor-worker.service"]);
+      if (Object.keys(account).length) {
+        for (const device of Object.values(account)) await this.checkedExec(name, ["mountpoint", "-q", device.path!]);
+        // Reproduce existing regular-file bind semantics. CLI atomic rename
+        // then falls back to in-place writes; symlinks would break sharing.
+        for (const mapping of AGENT_CREDENTIAL_MAPPINGS.filter((entry) => entry.fileBind !== false)) {
+          await this.checkedExec(name, ["bash", "-ec", [
+            'source="$1"; target="$2"', 'test -f "$source" && test ! -L "$source" && test ! -L "$target"',
+            'mkdir -p "$(dirname "$target")"', 'if [ ! -e "$target" ]; then install -o 1000 -g 1000 -m 0600 /dev/null "$target"; fi',
+            'test -f "$target" && test "$(stat -c %h "$source")" = 1',
+            'if mountpoint -q "$target" && [ "$(stat -c %d:%i "$source")" != "$(stat -c %d:%i "$target")" ]; then umount "$target"; fi',
+            'if ! mountpoint -q "$target"; then mount --bind "$source" "$target"; fi',
+          ].join("; "), "agentor-bind", `/run/agentor/account-credentials/${mapping.fileName}`, mapping.containerPath]);
+        }
+      }
       await this.checkedExec(name, ["rm", "-f", "/tmp/worker-events", "/run/agentor/provisioned", "/run/agentor/worker.env"]);
       await this.provision(opts);
+      await this.checkedExec(name, ["systemctl", "stop", "docker", "docker.socket", "containerd", "agentor-docker-storage"]);
+      if (opts.environmentJson.dockerEnabled) {
+        await this.client.pushFile(name, "/run/agentor/docker-storage.json", JSON.stringify({
+          serial: "incus_docker", volume: persistent.docker!.source,
+          initialize: await storage.dockerInitializationAllowed(opts),
+        }), { uid: 0, gid: 0, mode: 0o600 });
+        await this.checkedExec(name, ["systemctl", "unmask", "docker", "docker.socket", "containerd", "agentor-docker-storage"]);
+        await this.checkedExec(name, ["systemctl", "start", "agentor-docker-storage"]);
+        await this.checkedExec(name, ["mountpoint", "-q", "/var/lib/docker"]);
+        await storage.markDockerInitialized(opts);
+      } else {
+        await this.checkedExec(name, ["rm", "-f", "/run/agentor/docker-storage.json"]);
+        // The local storage unit is gated by absent /run authorization. Unlike
+        // vendor Docker units, masking it would overwrite an installed unit.
+        await this.checkedExec(name, ["systemctl", "mask", "docker", "docker.socket", "containerd"]);
+      }
       await this.checkedExec(name, ["systemctl", "start", "agentor-worker.service"]);
       await this.checkedExec(name, ["systemctl", "is-active", "--quiet", "agentor-worker.service"]);
       const workerDeadline = Date.now() + 120_000;
@@ -191,6 +302,15 @@ export class IncusWorkerRuntime {
     await this.assertOwned(name);
     const state = await this.client.getInstanceState(name);
     if (state.status !== "Stopped") await this.client.stopInstance(name, { timeout: 30 });
+  }
+
+  async refreshSshKeys(owner: IncusStorageOwner, content: string): Promise<void> {
+    const instance = await this.assertOwned(owner.containerName, owner.id);
+    if (instance.config["user.agentor.owner"] !== owner.userId)
+      throw new Error("Incus worker account identity does not match");
+    if ((await this.client.getInstanceState(owner.containerName)).status !== "Running") return;
+    await this.client.pushFile(owner.containerName, "/home/agent/.ssh/authorized_keys", content,
+      { mode: 0o600, uid: 1000, gid: 1000 });
   }
 
   async remove(name: string): Promise<void> {
