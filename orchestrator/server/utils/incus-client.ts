@@ -76,6 +76,21 @@ export interface IncusProject {
   used_by: string[];
 }
 
+export interface IncusNetwork {
+  name: string;
+  type: string;
+  managed: boolean;
+  config: Record<string, string>;
+}
+
+export interface IncusNetworkLease {
+  address: string;
+  hwaddr: string;
+  hostname: string;
+  type: string;
+  location?: string;
+}
+
 export interface IncusNetworkAddress {
   family: 'inet' | 'inet6';
   address: string;
@@ -580,6 +595,14 @@ export class IncusClient {
     return this.request<IncusInstanceState>('GET', `/1.0/instances/${encodeURIComponent(name)}/state`);
   }
 
+  async getNetwork(name: string): Promise<IncusNetwork> {
+    return this.request<IncusNetwork>('GET', `/1.0/networks/${encodeURIComponent(name)}`);
+  }
+
+  async getNetworkLeases(name: string): Promise<IncusNetworkLease[]> {
+    return this.request<IncusNetworkLease[]>('GET', `/1.0/networks/${encodeURIComponent(name)}/leases`);
+  }
+
   async updateInstanceDevices(name: string, devices: Record<string, IncusDevice>): Promise<void> {
     const current = await this.getInstance(name);
     const raw = await this.rawRequest('PUT', `/1.0/instances/${encodeURIComponent(name)}`, {
@@ -591,6 +614,8 @@ export class IncusClient {
     if (json.type === 'async' && json.operation) await this.waitForOperation(json.operation);
   }
 
+  /** Guest-agent reports are diagnostic only. Guest root can falsify them;
+   * routing and worker-self authority must use host NIC configuration/leases. */
   async getPrimaryIp(name: string, preferredInterface = 'eth0'): Promise<string | undefined> {
     const state = await this.getInstanceState(name);
     if (!state.network) return undefined;
@@ -633,7 +658,9 @@ export class IncusClient {
     }
 
     if (json.type === 'async' && json.operation) {
-      await this.waitForOperation(json.operation);
+      // Image unpacking is disk-bound and can exceed a short lifecycle wait
+      // on a loaded host. Keep the accepted create, never resend it.
+      await this.waitForOperation(json.operation, 300);
     }
 
     return this.getInstance(spec.name);

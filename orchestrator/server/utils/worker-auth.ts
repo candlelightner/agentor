@@ -91,7 +91,7 @@ async function resolveCallerByIp(remoteIp: string): Promise<ContainerInfo | null
   // A recreated worker reuses its name but not its Docker identity. Never
   // authorize an old address against the replacement's current name: Docker
   // may already have reassigned that address to another worker.
-  if (container?.containerId === entry.containerId) return container;
+  if (container?.runtimeKind !== 'incus-vm' && container?.containerId === entry.containerId) return container;
 
   // Cache hit for a name that no longer resolves to a running worker (e.g. the
   // container was rebuilt and got a new id under the same name) — force one
@@ -100,7 +100,7 @@ async function resolveCallerByIp(remoteIp: string): Promise<ContainerInfo | null
   const retry = ipCache.get(remoteIp);
   if (!retry) return null;
   const current = containerManager.findByContainerName(retry.containerName);
-  return current?.containerId === retry.containerId ? current : null;
+  return current?.runtimeKind !== 'incus-vm' && current?.containerId === retry.containerId ? current : null;
 }
 
 /** Enforce the durable policy on every request rather than trusting the
@@ -142,7 +142,7 @@ export async function requireWorkerSelf(event: H3Event): Promise<WorkerSelfConte
     throw createError({ statusCode: 401, statusMessage: 'Unable to determine caller IP' });
   }
 
-  const container = await resolveCallerByIp(remoteIp);
+  const container = await resolveCallerByIp(remoteIp).catch(() => null) ?? await useContainerManager().resolveIncusCaller(remoteIp);
   if (!container) {
     throw createError({
       statusCode: 401,
@@ -177,7 +177,7 @@ export async function requirePluginSelf(event: H3Event): Promise<WorkerSelfConte
   if (!remoteIp) throw createError({ statusCode: 401, statusMessage: 'Unable to determine caller IP' });
   // Preserve ordinary-worker behavior exactly; admin resolution below is a
   // separate capability on private management networks.
-  const ordinary = await resolveCallerByIp(remoteIp);
+  const ordinary = await resolveCallerByIp(remoteIp).catch(() => null) ?? await useContainerManager().resolveIncusCaller(remoteIp);
   if (ordinary) {
     requireOrdinaryWorkerSelfAccess(ordinary);
     if (ordinary.status !== 'running') throw createError({ statusCode: 409, statusMessage: 'Worker container is not running', data: { status: ordinary.status, diagnostic: ordinary.runtimeDiagnostic } });

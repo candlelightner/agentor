@@ -279,8 +279,18 @@ export default defineNitroPlugin(async (nitroApp) => {
             `[agentor] worker reconciliation pass deferred: ${(error as { code?: string })?.code || "Docker unavailable"}`,
           ),
         )
-        .finally(() => {
-          workerReconcileRunning = false;
+        .finally(async () => {
+          try {
+            // Durable runtime selection survives INCUS_ENABLED=false and
+            // inventory failures. Re-observe route authority independently so
+            // stale destinations are withdrawn even when sync was unavailable.
+            if (useWorkerStore().list().some((worker) => worker.runtimeKind === "incus-vm"))
+              await useTraefikManager().refreshWorkerBackends().catch(() =>
+                logger.warn("[agentor] worker route refresh deferred; retrying next reconciliation"),
+              );
+          } finally {
+            workerReconcileRunning = false;
+          }
         });
     }, 30_000);
     workerReconcileTimer.unref?.();

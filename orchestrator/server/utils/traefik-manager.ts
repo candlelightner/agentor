@@ -68,6 +68,22 @@ export class TraefikManager {
    * On a failed (re)create the reconcile rolls back to this so the dashboard
    * (served through Traefik) always comes back. Null until the first success. */
   private lastGoodMappings: Mappings | null = null;
+  private workerBackendResolver?: (mapping: Pick<PortMapping, 'workerId' | 'userId' | 'containerName'>) => Promise<string | null>;
+
+  setWorkerBackendResolver(resolve: NonNullable<TraefikManager['workerBackendResolver']>): void {
+    this.workerBackendResolver = resolve;
+  }
+
+  /** Runtime addresses can change without a mapping edit. Refresh only the
+   * file-provider targets; observation failures must not restart Traefik or
+   * workers. Use the existing queue to avoid racing mapping reconciliation. */
+  async refreshWorkerBackends(): Promise<void> {
+    await this.enqueue(async () => {
+      const mappings = this.currentMappings();
+      if (this.workerBackendResolver && this.shouldRun(mappings))
+        await this.writeTraefikConfig(mappings);
+    });
+  }
 
   constructor(
     config: Config,
@@ -437,6 +453,16 @@ export class TraefikManager {
 
   private async writeTraefikConfig(m: Mappings): Promise<void> {
     const { domain: domainMappings, port: portMappings } = m;
+    // Coalesce only within this rendering. Never persist a VM IP as mapping
+    // authority or reuse it across lifecycle/IP changes.
+    const targets = new Map<string, Promise<string | null>>();
+    const backend = (mapping: PortMapping | DomainMapping): Promise<string | null> => {
+      const key = JSON.stringify([mapping.userId, mapping.workerId, mapping.containerName]);
+      if (!targets.has(key)) targets.set(key, this.workerBackendResolver
+        ? this.workerBackendResolver(mapping).catch(() => null)
+        : Promise.resolve(mapping.containerName));
+      return targets.get(key)!;
+    };
     const config = {
       http: { routers: {} as Record<string, unknown>, services: {} as Record<string, unknown>, middlewares: {} as Record<string, unknown> },
       tcp: { routers: {} as Record<string, unknown>, services: {} as Record<string, unknown> },
@@ -495,6 +521,9 @@ export class TraefikManager {
     // fresh prefix to stay collision-free. `safeId` is a UUID with non-alnum
     // chars stripped — unique because the source ids are UUIDs.
     for (const m of domainMappings) {
+      const backendHost = await backend(m);
+      // Keep router precedence even when unavailable: removing an exact host
+      // or path route could fall through to another worker's wildcard route.
       const host = m.subdomain ? `${m.subdomain}.${m.baseDomain}` : m.baseDomain;
       const safeId = m.id.replace(/[^a-zA-Z0-9-]/g, '');
 
@@ -519,7 +548,7 @@ export class TraefikManager {
           ...(m.wildcard ? { priority: 1 } : {}),
         };
         config.tcp.services[`tcp-${safeId}`] = {
-          loadBalancer: { servers: [{ address: `${m.containerName}:${m.internalPort}` }] },
+          loadBalancer: { servers: backendHost ? [{ address: `${backendHost}:${m.internalPort}` }] : [] },
         };
       } else {
         const middlewares: string[] = [];
@@ -563,7 +592,7 @@ export class TraefikManager {
           ...(m.wildcard ? { priority: 1 } : {}),
         };
         config.http.services[`http-${safeId}`] = {
-          loadBalancer: { servers: [{ url: `http://${m.containerName}:${m.internalPort}` }] },
+          loadBalancer: { servers: backendHost ? [{ url: `http://${backendHost}:${m.internalPort}` }] : [] },
         };
       }
     }
@@ -573,6 +602,7 @@ export class TraefikManager {
     // any connection regardless of TLS/SNI, so this works for raw TCP of any
     // protocol (HTTP, SSH, database, etc.).
     for (const m of portMappings) {
+      const backendHost = await backend(m);
       const name = `pm-${m.externalPort}`;
       config.tcp.routers[name] = {
         rule: 'HostSNI(`*`)',
@@ -580,7 +610,7 @@ export class TraefikManager {
         entryPoints: [name],
       };
       config.tcp.services[name] = {
-        loadBalancer: { servers: [{ address: `${m.containerName}:${m.internalPort}` }] },
+        loadBalancer: { servers: backendHost ? [{ address: `${backendHost}:${m.internalPort}` }] : [] },
       };
     }
 

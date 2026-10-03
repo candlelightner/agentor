@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isIP } from "node:net";
 import { nanoid } from "nanoid";
 import {
   uniqueNamesGenerator,
@@ -1064,7 +1065,7 @@ export class ContainerManager {
         continue;
       }
       nextContainers.set(id, {
-        ...worker, runtimeKind: "incus-vm", containerId: `incus:${instance.name}`,
+        ...worker, runtimeKind: "incus-vm", containerId: `incus:${instance.config["volatile.uuid"] || "unverified"}`,
         containerName: instance.name, displayName: worker.displayName || instance.name,
         imageName: instance.config["image.source_image"] || this.config.incusWorkerImage,
         imageId: instance.config["volatile.base_image"] || "",
@@ -1172,6 +1173,54 @@ export class ContainerManager {
   /** Look up a worker by its UUID `id`. */
   get(id: string): ContainerInfo | undefined {
     return this.containers.get(id);
+  }
+
+  /** Preserve legacy Docker DNS; VM destinations come from filtered host
+   * leases and the current daemon incarnation, never guest-reported IPs. */
+  async resolveWorkerHost(id: string): Promise<string> {
+    const info = this.get(id);
+    if (!info || info.status !== "running") throw new Error("Worker backend is not running");
+    if (info.runtimeKind !== "incus-vm") return info.containerName;
+    const record = this.workerStore?.findById(id);
+    if (!record || record.runtimeKind !== "incus-vm" || record.status !== "active" || record.deletionPending ||
+        record.userId !== info.userId || isWorkerLifecycleMutationActive(id)) throw new Error("Incus worker is not authoritative");
+    const generation = workerLifecycleGeneration(id);
+    const primary = await this.incusRuntime.resolvePrimaryAddress({ id, userId: info.userId, containerName: info.containerName });
+    const current = this.get(id), stored = this.workerStore?.findById(id);
+    if (info.containerId !== `incus:${primary.incarnation}` || current?.containerId !== info.containerId ||
+        current.status !== "running" || current.userId !== info.userId || stored?.runtimeKind !== "incus-vm" ||
+        stored.status !== "active" || stored.deletionPending || stored.userId !== info.userId ||
+        workerLifecycleGeneration(id) !== generation || isWorkerLifecycleMutationActive(id))
+      throw new Error("Incus worker changed during backend resolution; retry");
+    return primary.address;
+  }
+
+  /** IPv4 is the configured internal transport. Do not cache Incus caller
+   * authority: address reassignment and recreation must take effect now. */
+  async resolveIncusCaller(address: string): Promise<ContainerInfo | null> {
+    if (isIP(address) !== 4) return null;
+    const records = this.workerStore?.list().filter((record) => record.runtimeKind === "incus-vm" &&
+      record.status === "active" && !record.deletionPending) ?? [];
+    if (!records.length) return null;
+    try {
+      const [leases, instances] = await Promise.all([
+        this.incusRuntime.client.getNetworkLeases(this.config.incusNetwork), this.incusRuntime.client.listInstances(),
+      ]);
+      const macs = new Set(leases.filter((lease) => lease.address === address).map((lease) => lease.hwaddr.toLowerCase()));
+      if (macs.size !== 1) return null;
+      const candidates = instances.filter((instance) => {
+        const nic = (instance.expanded_devices ?? instance.devices).eth0;
+        const config = instance.expanded_config ?? instance.config;
+        return nic?.network === this.config.incusNetwork && macs.has((nic.hwaddr || config["volatile.eth0.hwaddr"] || "").toLowerCase());
+      });
+      if (candidates.length !== 1) return null;
+      const instance = candidates[0]!;
+      const record = records.find((worker) => worker.id === instance.config["user.agentor.id"]);
+      if (!record || !await this.incusRuntime.matchesWorkerIdentity(instance, record.id) ||
+          instance.config["user.agentor.owner"] !== record.userId) return null;
+      if (await this.resolveWorkerHost(record.id) !== address) return null;
+      return this.get(record.id) ?? null;
+    } catch { return null; /* Observation failure denies access, never restarts compute. */ }
   }
 
   /** Resolve a worker `id` to its current Docker container id (for dockerode
@@ -1499,7 +1548,9 @@ export class ContainerManager {
       };
       if (runtimeKind === "incus-vm") {
         await this.incusRuntime.create(options);
-        containerInfo.containerId = `incus:${containerName}`;
+        const instance = await this.incusRuntime.client.getInstance(containerName);
+        if (!instance.config["volatile.uuid"]) throw new Error("Incus worker incarnation is missing");
+        containerInfo.containerId = `incus:${instance.config["volatile.uuid"]}`;
       } else {
         const container = await this.dockerService.createWorkerContainer(options);
         containerInfo.containerId = container.id;

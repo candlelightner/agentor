@@ -96,9 +96,8 @@ export async function proxyPluginUi(event: H3Event, suffix = "") {
     .split("/")
     .map((part) => encodeURIComponent(decodeURIComponent(part)))
     .join("/");
-  const url = new URL(
-    `http://${runtime.containerName}:${port}${base}${relative}`,
-  );
+  const host = await useContainerManager().resolveWorkerHost(worker.id);
+  const url = new URL(`http://${host}:${port}${base}${relative}`);
   url.search = getRequestURL(event).search;
   const response = await fetch(url, {
     method,

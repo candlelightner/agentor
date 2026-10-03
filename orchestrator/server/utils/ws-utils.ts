@@ -44,11 +44,11 @@ const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
  *
  * The route segment captured by `workerIdPattern` is the worker's UUID `id`
  * (passed to `get()`), NOT the Docker container id — the relay forwards to the
- * worker by its stable `containerName` via Docker DNS.
+ * worker by its runtime-resolved backend host (Docker DNS or Incus host lease).
  */
 export function createWsRelayHandlers(
   workerIdPattern: RegExp,
-  getTargetWsUrl: (containerName: string, workerId: string, peer: Peer) => string,
+  getTargetWsUrl: (backendHost: string, workerId: string, peer: Peer) => string,
   authorize?: (workerId: string, peer: Peer) => boolean | Promise<boolean>,
 ) {
   return {
@@ -94,7 +94,9 @@ export function createWsRelayHandlers(
           return;
         }
 
-        const ws = new WebSocket(getTargetWsUrl(info.containerName, workerId, peer));
+        const host = await useContainerManager().resolveWorkerHost(workerId);
+        if (ctx.closed) return;
+        const ws = new WebSocket(getTargetWsUrl(host, workerId, peer));
         ctx.containerWs = ws;
 
         ws.on('open', () => {

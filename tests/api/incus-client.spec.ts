@@ -167,6 +167,16 @@ test.describe("IncusClient mock server protocol tests", () => {
       const url = new URL(req.url || "", `http://${req.headers.host}`);
       const path = url.pathname;
 
+      if (req.method === "GET" && (path === "/1.0/networks/workers" || path === "/1.0/networks/workers/leases")) {
+        const allowed = url.searchParams.get("project") === "agentor";
+        res.writeHead(allowed ? 200 : 403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(allowed ? { type: "sync", metadata: path.endsWith("/leases")
+          ? [{ address: "10.20.30.42", hwaddr: "10:66:6a:11:22:33", hostname: "untrusted", type: "dynamic" }]
+          : { name: "workers", managed: true, type: "bridge", config: { "ipv4.address": "10.20.30.1/24" } } }
+          : { type: "error", error_code: 403, error: "Project scope required" }));
+        return;
+      }
+
       // GET /1.0
       if (req.method === "GET" && path === "/1.0") {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -373,6 +383,12 @@ test.describe("IncusClient mock server protocol tests", () => {
     expect(list[0].name).toBe("worker-test-1");
   });
 
+  test("network and host lease reads preserve project scoping", async () => {
+    const client = new IncusClient({ endpoint: `http://127.0.0.1:${serverPort}`, project: "agentor" });
+    expect((await client.getNetwork("workers")).managed).toBe(true);
+    expect(await client.getNetworkLeases("workers")).toMatchObject([{ address: "10.20.30.42", type: "dynamic" }]);
+  });
+
   test("pushFile and pullFile handle headers and content correctly", async () => {
     const client = new IncusClient({
       endpoint: `http://127.0.0.1:${serverPort}`,
@@ -425,6 +441,25 @@ test.describe("IncusClient mock server protocol tests", () => {
     await expect(client.waitForOperation("cancelled")).rejects.toThrow("cancelled");
     (client as any).request = async () => ({ status: "Running", status_code: 103 });
     await expect(client.waitForOperation("unfinished", 0.15)).rejects.toThrow("did not finish");
+  });
+
+  test("image create waits on its accepted operation with a bounded longer deadline and never resends", async () => {
+    const client = new IncusClient({ endpoint: "https://mock.invalid" });
+    let posts = 0;
+    client.rawRequest = async (method, path) => {
+      expect([method, path]).toEqual(["POST", "/1.0/instances"]); posts++;
+      return { statusCode: 202, headers: {}, body: Buffer.from(JSON.stringify({ type: "async", operation: "/1.0/operations/create-once" })) };
+    };
+    client.getInstance = async () => ({ name: "worker" }) as any;
+    client.waitForOperation = async (operation, deadline) => {
+      expect([operation, deadline]).toEqual(["/1.0/operations/create-once", 300]);
+      return { status: "Success" } as any;
+    };
+    expect((await client.createInstance({ name: "worker", source: { type: "none" } })).name).toBe("worker");
+    expect(posts).toBe(1);
+    client.waitForOperation = async () => { throw new Error("Observation unavailable"); };
+    await expect(client.createInstance({ name: "worker", source: { type: "none" } })).rejects.toThrow("Observation unavailable");
+    expect(posts).toBe(2); // One mutation per distinct caller, no hidden resend.
   });
 });
 

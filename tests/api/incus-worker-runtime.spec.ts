@@ -55,7 +55,7 @@ function fakeClient() {
   const client = {
     getReadiness: record("ready", { ready: true, serverVersion: "6.0.6" }), request: record("project", { config: { restricted: "true" } }),
     getImageAlias: record("image", { target: "image-fingerprint", type: "virtual-machine" }),
-    getImage: record("image-info", { properties: { bootstrap_generation: "2" } }),
+    getImage: record("image-info", { properties: { bootstrap_generation: "3" } }),
     endpoint: config.incusEndpoint,
     getCustomVolume: async (_pool: string, name: string) => {
       if (!volumes.has(name)) throw Object.assign(new Error("Not found"), { statusCode: 404 });
@@ -394,7 +394,7 @@ test("existing-worker lifecycle and inventory reject unverified production trans
 
 test("real production worker create/start, inventory and reprovisioning", async () => {
   test.skip(process.env.INCUS_LIVE_TEST !== "true", "Explicit disposable-host acceptance run");
-  test.setTimeout(240_000);
+  test.setTimeout(600_000);
   const dir = await mkdtemp(join(tmpdir(), "agentor-incus-lifecycle-"));
   const store = new WorkerStore(dir);
   await store.init();
@@ -420,6 +420,9 @@ test("real production worker create/start, inventory and reprovisioning", async 
     expect(store.findById(info.id)?.runtimeKind).toBe("incus-vm");
     await manager.sync();
     expect(manager.get(info.id)?.containerName).toBe(name);
+    const primary = await runtime.resolvePrimaryAddress({ id: info.id, userId: info.userId, containerName: name! });
+    expect(primary.address).toMatch(/^\d+\.\d+\.\d+\.\d+$/);
+    expect(primary.incarnation).toBe((await runtime.client.getInstance(name!)).config["volatile.uuid"]);
     const services = await runtime.client.exec(name!, ["sh", "-c", "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8443/; echo; curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:6080/"]);
     expect(services.returnCode).toBe(0);
     expect(services.stdout).toContain("302");

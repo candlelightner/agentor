@@ -1,0 +1,9 @@
+[Unit]
+Description=Agentor guest filtering DNS resolver
+After=systemd-resolved.service
+ConditionPathExists=/run/agentor/firewall-dns.conf
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/run/agentor/firewall-dns.conf --log-facility=/dev/null
+Restart=no

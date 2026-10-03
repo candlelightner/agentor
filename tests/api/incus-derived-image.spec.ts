@@ -87,6 +87,25 @@ test("real derived image boots unattended and waits for runtime provisioning", a
     ].join("; ")]);
     expect(services.returnCode, services.stderr).toBe(0);
     expect(await client.getPrimaryIp(name)).toBeTruthy();
+    const network = await client.exec(name, ["bash", "-ec", [
+      "/usr/lib/agentor/agentor-network.sh custom '[\"example.com\"]'",
+      "test \"$(readlink /etc/resolv.conf)\" = /run/agentor/filter-resolv.conf",
+      "! grep -q 127.0.0.11 /run/agentor/firewall-dns.conf",
+      "getent ahostsv4 example.com",
+      "curl --ipv4 --noproxy '*' -fsSI --max-time 30 https://example.com",
+      "iptables -Z AGENTOR-OUTPUT",
+      "! curl --noproxy '*' -fsS --connect-timeout 2 --max-time 3 http://198.51.100.10:81/",
+      "iptables -nvxL AGENTOR-OUTPUT | awk '$3 == \"DROP\" { if($1>0) found=1 } END { exit !found }'",
+      "/usr/lib/agentor/agentor-network.sh custom '[\"example.org\"]'",
+      "! grep -q 'example.com' /run/agentor/firewall-dns.conf",
+      "test \"$(iptables -S OUTPUT | grep -c -- '-j AGENTOR-OUTPUT')\" = 1",
+      "ip6tables -S AGENTOR-OUTPUT | grep -q -- '-j DROP'",
+      "/usr/lib/agentor/agentor-network.sh full",
+      "test \"$(readlink /etc/resolv.conf)\" = /run/systemd/resolve/stub-resolv.conf",
+      "! systemctl is-active --quiet agentor-dnsmasq.service",
+      "getent ahostsv4 example.org",
+    ].join("; ")]);
+    expect(network.returnCode, `${network.stdout}\n${network.stderr}`).toBe(0);
   } finally {
     // A transport/operation timeout may occur after creation was accepted.
     // Cleanup only this exact generated test name, not an arbitrary inventory.

@@ -54,7 +54,8 @@ export async function proxyPluginDesktop(event: H3Event) {
   if (!/^(core|vendor)\/[a-zA-Z0-9_./-]+\.js$/.test(path) || path.split("/").some(p => p === "." || p === ".." || !p))
     throw createError({ statusCode: 404, statusMessage: "Desktop resource not found" });
   if (resolved.worker.status !== "running") throw createError({ statusCode: 409, statusMessage: "Start the worker to load its desktop" });
-  const response = await fetch(`http://${resolved.worker.containerName}:6080/${path}`, { redirect: "error", signal: AbortSignal.timeout(10_000) }).catch(() => undefined);
+  const host = await useContainerManager().resolveWorkerHost(resolved.worker.id);
+  const response = await fetch(`http://${host}:6080/${path}`, { redirect: "error", signal: AbortSignal.timeout(10_000) }).catch(() => undefined);
   if (!response?.ok || Number(response.headers.get("content-length")) > 2 * 1024 * 1024)
     throw createError({ statusCode: 502, statusMessage: "noVNC assets unavailable. Update the worker image and rebuild the worker." });
   const reader = response.body!.getReader(); const chunks: Uint8Array[] = []; let size = 0;

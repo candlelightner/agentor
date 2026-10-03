@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { renderUserEnvVars } from "./user-env-store";
 import { backupInstallationId } from "./backup-installation";
 import { IncusWorkerStorage, type IncusStorageOwner } from "./incus-worker-storage";
+import { resolveIncusPrimaryLease } from "./incus-worker-network";
 import type { ContainerStatus } from "../../shared/types";
 
 export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & { sshAuthorizedKeys?: string };
@@ -55,6 +56,23 @@ export class IncusWorkerRuntime {
     return instance.type === "virtual-machine" && instance.config["user.agentor.id"] === workerId &&
       instance.name === `${this.config.containerPrefix}-${workerId}` &&
       instance.config["user.agentor.installation"] === await this.installationId();
+  }
+
+  async resolvePrimaryAddress(owner: IncusStorageOwner): Promise<{ address: string; incarnation: string }> {
+    const initial = await this.assertOwned(owner.containerName, owner.id);
+    if (initial.config["user.agentor.owner"] !== owner.userId) throw new Error("Incus worker account identity does not match");
+    const [network, leases, peers] = await Promise.all([
+      this.client.getNetwork(this.config.incusNetwork), this.client.getNetworkLeases(this.config.incusNetwork), this.client.listInstances(),
+    ]);
+    const result = resolveIncusPrimaryLease(initial, peers, network, leases, this.config.incusNetwork);
+    // A name survives recreation. Revalidate host incarnation/metadata after
+    // the network reads rather than trusting a potentially stale name/IP pair.
+    const current = await this.assertOwned(owner.containerName, owner.id);
+    if (current.config["user.agentor.owner"] !== owner.userId) throw new Error("Incus worker account identity does not match");
+    const confirmed = resolveIncusPrimaryLease(current, peers, network, leases, this.config.incusNetwork);
+    if (confirmed.incarnation !== result.incarnation || confirmed.address !== result.address)
+      throw new Error("Incus worker changed during address resolution; retry");
+    return confirmed;
   }
 
   private async assertOwned(name: string, workerId?: string): Promise<IncusInstance> {
@@ -138,7 +156,7 @@ export class IncusWorkerRuntime {
     const alias = await this.client.getImageAlias(this.config.incusWorkerImage);
     if (alias.type !== "virtual-machine") throw new Error("Incus worker image must be a virtual machine");
     const image = await this.client.getImage(alias.target);
-    if (image.properties?.bootstrap_generation !== "2")
+    if (image.properties?.bootstrap_generation !== "3")
       throw new Error("Rebuild the derived Incus worker image with the current safe storage bootstrap");
     const account = await this.accountDevices(opts);
     const persistent = await (await this.storage()).devices(opts, opts.environmentJson.dockerEnabled);
@@ -207,7 +225,7 @@ export class IncusWorkerRuntime {
     }
     if (!ready) throw new Error("Incus worker agent did not become ready");
     try {
-      await this.checkedExec(name, ["bash", "-ec", 'test "$(cat /usr/lib/agentor/bootstrap-generation)" = 2; mountpoint -q /workspace; mountpoint -q /home/agent/.agent-data']);
+      await this.checkedExec(name, ["bash", "-ec", 'test "$(cat /usr/lib/agentor/bootstrap-generation)" = 3; mountpoint -q /workspace; mountpoint -q /home/agent/.agent-data']);
       await this.checkedExec(name, ["systemctl", "stop", "agentor-worker.service"]);
       if (Object.keys(account).length) {
         for (const device of Object.values(account)) await this.checkedExec(name, ["mountpoint", "-q", device.path!]);

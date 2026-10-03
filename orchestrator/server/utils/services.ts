@@ -87,14 +87,26 @@ export const useSelfSignedCertManager = singleton(
   () => new SelfSignedCertManager(useConfig().dataDir),
 );
 export const useTraefikManager = singleton(
-  () =>
-    new TraefikManager(
+  () => {
+    const manager = new TraefikManager(
       useConfig(),
       useDomainMappingStore(),
       usePortMappingStore(),
       useStorageManager(),
       useSelfSignedCertManager(),
-    ),
+    );
+    manager.setWorkerBackendResolver(async (mapping) => {
+      const workers = useContainerManager();
+      const info = workers.get(mapping.workerId) ?? workers.findByContainerName(mapping.containerName);
+      if (!info || info.userId !== mapping.userId || info.containerName !== mapping.containerName) return null;
+      if (info.runtimeKind === "incus-vm") {
+        if (info.id !== mapping.workerId) return null;
+        return workers.resolveWorkerHost(info.id);
+      }
+      return info.containerName;
+    });
+    return manager;
+  },
 );
 export const useEnvironmentStore = singleton(
   () => new EnvironmentStore(useConfig().dataDir),

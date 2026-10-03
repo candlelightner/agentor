@@ -52,6 +52,13 @@ if [ -f /run/agentor/worker.env ]; then
     set +a
 fi
 
+# A VM keeps guest firewall/resolver state across worker-service restarts.
+# Reset our guest-only policy before the same bootstrap network operations that
+# precede firewall activation in the legacy entrypoint.
+if [ -d /run/systemd/system ]; then
+    sudo /usr/lib/agentor/agentor-network.sh full
+fi
+
 # Capture the server-provisioned runtime role before ENVIRONMENT.envVars or
 # worker-local values are exported. Only these three internal values exist;
 # missing or invalid values fail closed to the ordinary-worker role.
@@ -610,7 +617,12 @@ fi
 # ==========================================================================
 FIREWALL_MODE=$(echo "$ENVIRONMENT" | jq -r '.networkMode // "full"')
 
-if [ "$FIREWALL_MODE" != "full" ]; then
+if [ -d /run/systemd/system ]; then
+    _step firewall "Network firewall"
+    ALLOWED_DOMAINS=$(echo "$ENVIRONMENT" | jq -c '.allowedDomains // []')
+    sudo /usr/lib/agentor/agentor-network.sh "$FIREWALL_MODE" "$ALLOWED_DOMAINS"
+    _done firewall "Network firewall ($FIREWALL_MODE)"
+elif [ "$FIREWALL_MODE" != "full" ]; then
     _step firewall "Network firewall"
     _log "Firewall: start ($FIREWALL_MODE)"
 
