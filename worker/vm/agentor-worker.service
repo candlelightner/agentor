@@ -2,6 +2,7 @@
 Description=Agentor Worker Entrypoint Service
 After=network.target local-fs.target incus-agent.service
 Wants=network.target
+ConditionPathExists=/run/agentor/worker.env
 
 [Service]
 Type=simple
@@ -9,8 +10,7 @@ User=agent
 Group=agent
 WorkingDirectory=/workspace
 Environment=LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 DISPLAY=:99 PATH=/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-EnvironmentFile=-/run/agentor/worker.env
-EnvironmentFile=-/etc/agentor/worker.env
+# entrypoint.sh sources the shell-quoted /run file; use only one parser.
 ExecStartPre=+/bin/bash -c "mkdir -p /workspace /home/agent/.agent-data && chown -R agent:agent /workspace /home/agent/.agent-data"
 ExecStart=/home/agent/entrypoint.sh
 Restart=no

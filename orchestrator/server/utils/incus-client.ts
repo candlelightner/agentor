@@ -32,7 +32,7 @@ export interface IncusOperationMetadata {
   description: string;
   created_at: string;
   updated_at: string;
-  status: 'Pending' | 'Running' | 'Success' | 'Failure' | 'Cancelling';
+  status: 'Pending' | 'Running' | 'Success' | 'Failure' | 'Cancelling' | 'Cancelled';
   status_code: number;
   resources?: Record<string, string[]>;
   metadata?: Record<string, any> | null;
@@ -350,6 +350,8 @@ export class IncusClient {
 
   private buildUrl(path: string, queryParams?: Record<string, string | number | boolean | undefined>): URL {
     const fullUrl = new URL(path.startsWith('http') ? path : `${this.endpoint}${path.startsWith('/') ? '' : '/'}${path}`);
+    if (fullUrl.origin !== new URL(this.endpoint).origin)
+      throw new IncusError('Incus response URL must remain on the configured server');
     if (queryParams) {
       for (const [k, v] of Object.entries(queryParams)) {
         if (v !== undefined) {
@@ -470,16 +472,19 @@ export class IncusClient {
     const opId = operationUrlOrId.includes('/')
       ? operationUrlOrId.split('/').filter(Boolean).pop()!
       : operationUrlOrId;
-    const path = `/1.0/operations/${encodeURIComponent(opId)}/wait`;
-    const res = await this.request<IncusOperationMetadata>('GET', path, undefined, {}, {
-      timeout: timeoutSeconds,
-    });
-
-    if (res.status === 'Failure') {
-      throw new IncusError(res.err || 'Incus operation failed', 500, res.status_code);
+    const path = `/1.0/operations/${encodeURIComponent(opId)}`;
+    const deadline = Date.now() + timeoutSeconds * 1000;
+    // An image-backed VM create can outlive one HTTP request. Poll its state
+    // without blocking HTTP on /wait or resending the accepted mutation.
+    while (Date.now() < deadline) {
+      const res = await this.request<IncusOperationMetadata>('GET', path);
+      if (res.status === 'Success') return res;
+      if (res.status === 'Failure' || res.status_code >= 400) {
+        throw new IncusError(res.err || 'Incus operation failed', 500, res.status_code);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
-
-    return res;
+    throw new IncusError(`Incus operation ${opId} did not finish within ${timeoutSeconds}s`, 408);
   }
 
   async getReadiness(): Promise<{

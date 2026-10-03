@@ -9,6 +9,11 @@ import {
 import type { Config } from "../../orchestrator/server/utils/config";
 
 test.describe("IncusClient unit tests", () => {
+  test("response URLs cannot forward client credentials to another origin", async () => {
+    const client = new IncusClient({ endpoint: "https://example.invalid", project: "agentor" });
+    await expect(client.rawRequest("GET", "https://other.invalid/1.0")).rejects.toThrow("configured server");
+  });
+
   test("isConfigured reflects presence of endpoint", () => {
     const unconfigured = new IncusClient({ endpoint: "" });
     expect(unconfigured.isConfigured()).toBe(false);
@@ -276,8 +281,8 @@ test.describe("IncusClient mock server protocol tests", () => {
         return;
       }
 
-      // GET /1.0/operations/op-success/wait
-      if (req.method === "GET" && path === "/1.0/operations/op-success/wait") {
+      // GET /1.0/operations/op-success
+      if (req.method === "GET" && path === "/1.0/operations/op-success") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
@@ -295,8 +300,8 @@ test.describe("IncusClient mock server protocol tests", () => {
         return;
       }
 
-      // GET /1.0/operations/op-failure/wait
-      if (req.method === "GET" && path === "/1.0/operations/op-failure/wait") {
+      // GET /1.0/operations/op-failure
+      if (req.method === "GET" && path === "/1.0/operations/op-failure") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
@@ -404,6 +409,22 @@ test.describe("IncusClient mock server protocol tests", () => {
     await expect(
       client.waitForOperation("/1.0/operations/op-failure"),
     ).rejects.toThrow(/QEMU failed to allocate disk/);
+  });
+
+  test("long operations poll within the transport deadline and require terminal success", async () => {
+    const client = new IncusClient({ endpoint: "https://mock.invalid", timeoutMs: 30_000 });
+    const paths: string[] = [];
+    (client as any).request = async (method: string, path: string) => {
+      expect(method).toBe("GET");
+      paths.push(path);
+      return { status: paths.length === 1 ? "Running" : "Success", status_code: paths.length === 1 ? 103 : 200 };
+    };
+    expect((await client.waitForOperation("long-create", 120)).status).toBe("Success");
+    expect(paths).toEqual(["/1.0/operations/long-create", "/1.0/operations/long-create"]);
+    (client as any).request = async () => ({ status: "Cancelled", status_code: 401, err: "cancelled" });
+    await expect(client.waitForOperation("cancelled")).rejects.toThrow("cancelled");
+    (client as any).request = async () => ({ status: "Running", status_code: 103 });
+    await expect(client.waitForOperation("unfinished", 0.15)).rejects.toThrow("did not finish");
   });
 });
 

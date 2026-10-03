@@ -4,7 +4,9 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-- **2151 tests** across 215 test files (1520 API across 150 files + 631 UI across 65 files), as enumerated with the Playwright list reporter
+Incus migration coverage: `api/worker-runtime-kind.spec.ts` (6 cases), `api/incus-client.spec.ts` (13 cases, including disposable-host integration), `api/incus-derived-image.spec.ts` (one gated live boot/provisioning/service test, passed against the rebuilt production-derived image), and in-progress `api/incus-worker-runtime.spec.ts` (5 cases, including a gated production-manager lifecycle test). The focused module configuration enumerates 228 cases, with two separately gated live tests. Full API/UI acceptance remains required by Phase 13.
+
+- **2175 tests** across 219 test files (1544 API across 154 files + 631 UI across 65 files); totals will be re-enumerated after completing the health-check rebase.
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting

@@ -50,10 +50,6 @@ if [ -f /run/agentor/worker.env ]; then
     set -a
     . /run/agentor/worker.env
     set +a
-elif [ -f /etc/agentor/worker.env ]; then
-    set -a
-    . /etc/agentor/worker.env
-    set +a
 fi
 
 # Capture the server-provisioned runtime role before ENVIRONMENT.envVars or

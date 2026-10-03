@@ -2,6 +2,8 @@
 
 Every user-facing feature of the Agentor web dashboard, organized by category. This document drives the Playwright test suite — every item below must have test coverage.
 
+Incus worker migration is in progress: durable runtime kind preserves legacy Docker workers; the production-derived image passed unattended EFI boot, guest-agent access, and provisioning-gated editor/desktop startup. New VM create/start integration uses restricted mTLS, filtered NICs, and ephemeral provisioning. Persistent storage and downstream feature integration remain pending; there is no Docker fallback. The complete roadmap and verification state are in `docs/incus-vm-status.md`.
+
 ## Local persistent volumes
 
 - Worker settings expose independent persistent directory attachments with deferred,

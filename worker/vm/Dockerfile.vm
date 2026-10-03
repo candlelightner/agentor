@@ -1,6 +1,7 @@
 ARG BASE_IMAGE=agentor-worker:latest
 FROM ${BASE_IMAGE}
 USER root
+COPY --from=worker-source entrypoint.sh /home/agent/entrypoint.sh
 
 # Install Linux kernel, systemd init, bootloader, netplan, and core networking
 RUN apt-get update && \
@@ -46,13 +47,15 @@ COPY agentor-worker.service /etc/systemd/system/agentor-worker.service
 
 # Configure docker.service dependencies to wait for agentor-docker-storage
 RUN mkdir -p /etc/systemd/system/docker.service.d && \
-    printf '[Unit]\nAfter=agentor-docker-storage.service\nWants=agentor-docker-storage.service\n' > /etc/systemd/system/docker.service.d/storage.conf
+    printf '[Unit]\nAfter=agentor-docker-storage.service\nRequires=agentor-docker-storage.service\n' > /etc/systemd/system/docker.service.d/storage.conf
 
 # Enable units in multi-user.target
 RUN mkdir -p /etc/systemd/system/multi-user.target.wants && \
     ln -sf /usr/lib/systemd/system/incus-agent.service /etc/systemd/system/multi-user.target.wants/incus-agent.service && \
-    ln -sf /etc/systemd/system/agentor-worker.service /etc/systemd/system/multi-user.target.wants/agentor-worker.service && \
     ln -sf /etc/systemd/system/agentor-docker-storage.service /etc/systemd/system/multi-user.target.wants/agentor-docker-storage.service
+
+# Orchestrator starts the worker only after agent readiness and /run provisioning.
+RUN systemctl disable agentor-worker docker docker.socket containerd
 
 # Configure grub defaults for instant boot and dual console (VGA + serial ttyS0)
 RUN printf 'GRUB_DEFAULT=0\nGRUB_TIMEOUT_STYLE=hidden\nGRUB_TIMEOUT=0\nGRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyS0,115200n8 net.ifnames=0"\nGRUB_CMDLINE_LINUX=""\nGRUB_TERMINAL="console serial"\nGRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1"\n' > /etc/default/grub
@@ -62,7 +65,7 @@ RUN systemctl enable systemd-networkd && \
     systemctl disable systemd-resolved 2>/dev/null || true
 
 # Prepare ephemeral config mount directory
-RUN mkdir -p /run/agentor /etc/agentor
+RUN mkdir -p /run/agentor
 
 USER agent
 WORKDIR /workspace
