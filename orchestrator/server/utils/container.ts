@@ -2690,6 +2690,8 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    if (info.runtimeKind === 'incus-vm')
+      return this.recreateIncusWorker(info, info.containerId.startsWith('incus:') ? info : undefined, true);
     await this.resolveAuthorizedHostMounts(
       info.userId,
       info.id,
@@ -3922,25 +3924,34 @@ for p in sys.argv[1:]:
 
   /** Replace disposable Incus compute. All desired inputs and canonical data
    * are checked before removing a running original; no Docker helper is used. */
-  private async recreateIncusWorker(snapshot: ContainerInfo, original?: ContainerInfo): Promise<ContainerInfo> {
+  private async recreateIncusWorker(snapshot: ContainerInfo, original?: ContainerInfo, applied = false): Promise<ContainerInfo> {
     if (!this.workerStore) throw new Error('WorkerStore is required for Incus recreation');
     const record = this.workerStore.get(snapshot.userId, snapshot.id);
     if (!record || record.runtimeKind !== 'incus-vm' || record.deletionPending || record.incusRecreation ||
-        record.status !== (original ? 'active' : 'archived'))
+        record.status !== (original || applied ? 'active' : 'archived'))
       throw new Error('Incus recreation requires matching durable authority and no unresolved replacement');
+    if (applied && (record.hostMountsRevoked || record.hardwareDevicesRevoked))
+      throw new Error('Incus worker access was revoked; explicit rebuild is required');
+    const assertMissing = async () => {
+      try { await this.incusRuntime.client.getInstance(snapshot.containerName); }
+      catch (error) { if ((error as { statusCode?: number }).statusCode === 404) return; throw error; }
+      throw new Error('Incus recovery cannot replace uncaptured or foreign compute');
+    };
+    if (applied && !original) await assertMissing();
     const info: ContainerInfo = structuredClone(snapshot);
     await this.assertIncusPersistenceReady(info);
     info.mounts = await this.resolveAuthorizedHostMounts(info.userId, info.id, info.mounts);
     info.hardwareDeviceIds = await this.resolveHardwareDeviceAccess(info.userId, info.id, info.hardwareDeviceIds);
     if (info.importedImage || info.hardwareDeviceIds?.length)
       throw new Error('Incus captured OCI images and hardware require their feature integration');
-    const options = await this.incusOptionsForWorker(info, false);
+    const options = await this.incusOptionsForWorker(info, applied);
     const originalIncarnation = original?.containerId.startsWith('incus:') ? original.containerId.slice(6) : undefined;
     if (original) {
       if (!originalIncarnation) throw new Error('Incus rebuild requires a captured original incarnation');
       await this.incusRuntime.prepareArchive(info, originalIncarnation);
     }
-    const existing = await this.incusRuntime.preflightRecreation(options);
+    const existing = await this.incusRuntime.preflightRecreation(options, applied && options.dockerEnabled);
+    if (applied && !original) await assertMissing();
     const marker = { nonce: randomUUID(), originalIncarnation,
       replacementIncarnation: undefined as string | undefined };
     // Persist stopped intent before any destructive operation. The bounded
@@ -3979,15 +3990,15 @@ for p in sys.argv[1:]:
       await this.workerStore.transitionIncusRecreation(info.userId, info.id,
         { status: 'active', desiredRuntimeStatus: 'stopped', incusRecreation: marker });
       await this.incusRuntime.start(options, incarnation);
-      await useWorkerConfigStore().markApplied(info.userId, info.id,
+      if (!applied) await useWorkerConfigStore().markApplied(info.userId, info.id,
         this.appliedIncusBootstrap(options, info), options.configurationRevision);
       info.status = 'running';
       info.desiredRuntimeStatus = 'running';
-      info.hostMountsRevoked = info.hardwareDevicesRevoked = false;
+      if (!applied) info.hostMountsRevoked = info.hardwareDevicesRevoked = false;
       info.runtimeDiagnostic = undefined;
       info.updatedAt = new Date().toISOString();
       const completed = await this.workerStore.transitionIncusRecreation(info.userId, info.id,
-        { status: 'active', desiredRuntimeStatus: 'running', incusRecreation: undefined }, async () => {
+        { status: 'active', desiredRuntimeStatus: 'running', incusRecreation: undefined }, applied ? undefined : async () => {
           const desired = await useWorkerConfigStore().resolveDesiredRevision(info.userId, info.id);
           if (options.configurationRevision && JSON.stringify(desired.revision) !== JSON.stringify(options.configurationRevision)) return true;
           // Account/environment/group edits can also arrive during boot. Keys
@@ -4000,7 +4011,9 @@ for p in sys.argv[1:]:
             return signature(current) !== signature(options);
           } catch { return true; /* inability to read desired state must not claim it was applied */ }
         });
-      info.pendingRebuild = completed.pendingRebuild;
+      // Applied recovery has no configuration authority. Include concurrent
+      // desired metadata edits in memory without promoting them in the guest.
+      Object.assign(info, completed, { status: 'running' });
     } catch (cause) {
       // Without a returned, verified incarnation, a 409 or lost response may
       // refer to preexisting compute. Never remove whatever owns the name.
@@ -5640,6 +5653,22 @@ for p in sys.argv[1:]:
     for (const snapshot of this.workerStore?.listActive() ?? []) {
       if (snapshot.runtimeKind !== 'incus-vm' || snapshot.deletionPending || snapshot.incusRecreation) continue;
       let observedHandle: string | undefined, observedGeneration: number | undefined;
+      if (!this.get(snapshot.id)) {
+        try {
+          await withOwnerWorkerLifecycleMutation(snapshot.userId, snapshot.id, async () => {
+            const record = this.workerStore?.get(snapshot.userId, snapshot.id);
+            if (!record || record.status !== 'active' || record.runtimeKind !== 'incus-vm' || record.deletionPending ||
+                record.incusRecreation || record.desiredRuntimeStatus !== 'running' || this.get(record.id)) return;
+            await this.assertOwnerExists(record.userId);
+            const name = this.buildContainerName(record.id);
+            await this.recreateIncusWorker({ ...record, runtimeKind: 'incus-vm', containerName: name,
+              containerId: name, imageName: this.config.incusWorkerImage, imageId: record.imageDigest ?? '', status: 'unknown' }, undefined, true);
+          });
+        } catch (error) {
+          useLogger().warn(`[container] Incus missing compute recovery deferred for ${snapshot.id}: ${(error as { code?: string })?.code ?? 'runtime unavailable'}`);
+        }
+        continue;
+      }
       const inspect = async () => {
         const record = this.workerStore?.get(snapshot.userId, snapshot.id), info = this.get(snapshot.id);
         if (!record || record.status !== 'active' || record.runtimeKind !== 'incus-vm' || record.deletionPending ||

@@ -268,6 +268,88 @@ test('Incus rebuild does not clear newer account/group/environment configuration
   });
 });
 
+test('explicit Incus recovery replaces only captured compute with applied settings and leaves desired edits pending', async () => {
+  await recreationFixture(async (manager, store, calls, info) => {
+    const options = await (manager as any).incusOptionsForWorker();
+    options.workerJson.initScript = 'applied-init';
+    (manager as any).incusOptionsForWorker = async (_worker: any, applied: boolean) => {
+      expect(applied).toBe(true); calls.push('applied-options'); return options;
+    };
+    const start = (manager as any).incusRuntime.start;
+    (manager as any).incusRuntime.start = async (...args: any[]) => {
+      await store.upsert({ ...store.get(info.userId, info.id)!, pendingRebuild: true, initScript: 'newer desired init' });
+      await start(...args);
+    };
+    const recovered = await manager.recover(info.id);
+    expect(calls).not.toContain('applied');
+    expect(calls.filter((call) => call.startsWith('remove-'))).toEqual(['remove-original-uuid']);
+    expect(recovered).toMatchObject({ status: 'running', containerId: 'incus:replacement-uuid',
+      initScript: 'newer desired init', pendingRebuild: true });
+    expect(options.workerJson.initScript).toBe('applied-init');
+    expect(store.get(info.userId, info.id)).toMatchObject({ desiredRuntimeStatus: 'running', pendingRebuild: true });
+  });
+});
+
+test('missing Incus compute is recreated only from authoritative absence, applied settings and existing persistence', async () => {
+  await recreationFixture(async (manager, store, calls, info) => {
+    (manager as any).containers.delete(info.id);
+    const options = await (manager as any).incusOptionsForWorker();
+    (manager as any).incusOptionsForWorker = async (_worker: any, applied: boolean) => {
+      expect(applied).toBe(true); calls.push('applied-options'); return options;
+    };
+    let lookups = 0;
+    (manager as any).incusRuntime.client = { getInstance: async () => {
+      lookups++; throw Object.assign(new Error('missing compute'), { statusCode: 404 });
+    } };
+    await manager.reconcileIncusWorkers();
+    expect(lookups).toBe(2);
+    expect(calls).toEqual(['persistence-preflight', 'applied-options', 'preflight', 'create', 'start', 'plugins']);
+    expect(store.get(info.userId, info.id)).toMatchObject({ status: 'active', desiredRuntimeStatus: 'running', pendingRebuild: true });
+    expect(manager.get(info.id)).toMatchObject({ status: 'running', containerId: 'incus:replacement-uuid', pendingRebuild: true });
+  });
+});
+
+test('applied recovery requires existing Docker data even when desired configuration disables Docker', async () => {
+  await recreationFixture(async (manager, store, calls, info) => {
+    (manager as any).containers.delete(info.id);
+    const options = await (manager as any).incusOptionsForWorker();
+    options.dockerEnabled = options.environmentJson.dockerEnabled = true;
+    (manager as any).resolveEnvironmentConfig = () => ({ dockerEnabled: false });
+    (manager as any).incusOptionsForWorker = async (_worker: any, applied: boolean) => { expect(applied).toBe(true); return options; };
+    (manager as any).incusRuntime.client = { getInstance: async () => { throw Object.assign(new Error('missing'), { statusCode: 404 }); } };
+    (manager as any).incusRuntime.preflightRecreation = async (applied: any, dockerRequired: boolean) => {
+      expect(applied.dockerEnabled).toBe(true); expect(dockerRequired).toBe(true);
+      calls.push('required-docker-data'); throw new Error('applied Docker volume missing');
+    };
+    await manager.reconcileIncusWorkers();
+    expect(calls).toEqual(['persistence-preflight', 'required-docker-data']);
+    expect(store.get(info.userId, info.id)?.incusRecreation).toBeUndefined();
+  });
+});
+
+test('missing-compute recovery never allocates from unavailable facts, missing bootstrap/data, revoked access or stopped intent', async () => {
+  for (const failure of ['lookup', 'foreign', 'late-conflict', 'bootstrap', 'data', 'revoked', 'stopped']) {
+    await recreationFixture(async (manager, store, calls, info) => {
+      (manager as any).containers.delete(info.id);
+      let lookups = 0;
+      (manager as any).incusRuntime.client = { getInstance: async () => {
+        lookups++;
+        if (failure === 'foreign' || (failure === 'late-conflict' && lookups === 2)) return { config: {} };
+        throw Object.assign(new Error('lookup'), { statusCode: failure === 'lookup' ? 503 : 404 });
+      } };
+      if (failure === 'bootstrap') (manager as any).incusOptionsForWorker = async () => { throw new Error('missing applied bootstrap'); };
+      if (failure === 'data') (manager as any).incusRuntime.preflightRecreation = async () => { throw new Error('missing canonical volume'); };
+      if (failure === 'revoked' || failure === 'stopped') await store.upsert({ ...store.get(info.userId, info.id)!,
+        hostMountsRevoked: failure === 'revoked', desiredRuntimeStatus: failure === 'stopped' ? 'stopped' : 'running' });
+      await manager.reconcileIncusWorkers();
+      expect(calls.some((call) => ['create', 'start', 'applied', 'remove-original-uuid'].includes(call))).toBe(false);
+      expect(store.get(info.userId, info.id)?.incusRecreation).toBeUndefined();
+      expect(store.get(info.userId, info.id)?.pendingRebuild).toBe(true);
+      expect(manager.get(info.id)).toBeUndefined();
+    });
+  }
+});
+
 async function reconciliationFixture(run: (manager: ContainerManager, store: WorkerStore, calls: string[], info: any, state: any) => Promise<void>) {
   await fixture(async (manager, store, calls, info) => {
     const state = { status: 'Running', bootId: 'first-boot', provisioned: true, serviceReady: true };
@@ -398,7 +480,8 @@ test('Incus boot changes and repair failures defer convergence without stopping 
 
 test('real production-manager archive retains canonical volumes, source and pending settings without Docker', async () => {
   test.skip(process.env.INCUS_ARCHIVE_TEST !== 'true' && process.env.INCUS_RECREATION_TEST !== 'true' &&
-    process.env.INCUS_REBOOT_TEST !== 'true' && process.env.INCUS_RECREATION_RECOVERY_TEST !== 'true', 'Explicit disposable Incus lifecycle acceptance');
+    process.env.INCUS_REBOOT_TEST !== 'true' && process.env.INCUS_RECREATION_RECOVERY_TEST !== 'true' &&
+    process.env.INCUS_MISSING_RECOVERY_TEST !== 'true', 'Explicit disposable Incus lifecycle acceptance');
   test.setTimeout(900_000);
   const root = await mkdtemp(join(tmpdir(), 'agentor-incus-archive-live-'));
   const config = { dataDir: root, incusEnabled: true, incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor',
@@ -420,10 +503,42 @@ test('real production-manager archive retains canonical volumes, source and pend
       exposeApis: { portMappings: true, domainMappings: true, usage: true } }, capabilitiesJson: [], instructionsJson: [] });
   try {
     let info = await (manager as any).createForOwner({ userId: 'archive-live-owner', displayName: 'archive acceptance',
-      workerConfiguration: process.env.INCUS_REBOOT_TEST === 'true' ? { secrets: [{ key: 'BOOT_SECRET', value: 'applied' }] } : undefined });
+      workerConfiguration: process.env.INCUS_REBOOT_TEST === 'true' || process.env.INCUS_MISSING_RECOVERY_TEST === 'true'
+        ? { secrets: [{ key: 'BOOT_SECRET', value: 'applied' }] } : undefined });
     const created = await runtime.client.exec(info.containerName, ['sh', '-ec',
       'echo retained-workspace > /workspace/archive-fixture; echo retained-agents > /home/agent/.agent-data/archive-fixture']);
     expect(created.returnCode).toBe(0);
+    if (process.env.INCUS_MISSING_RECOVERY_TEST === 'true') {
+      info.pendingRebuild = true; info.initScript = 'touch /workspace/unapplied-recovery-init';
+      await store.upsert((manager as any).containerInfoToWorkerRecord(info));
+      await useWorkerConfigStore().replace(info.userId, info.id, [{ kind: 'secret', key: 'BOOT_SECRET', value: 'unapplied' }]);
+      const originalHandle = info.containerId;
+      info = await manager.recover(info.id);
+      expect(info.containerId).not.toBe(originalHandle); expect(info.pendingRebuild).toBe(true);
+      const checkApplied = async (target: any) => {
+        expect((await runtime.client.exec(target.containerName, ['bash', '-ec',
+          'source /run/agentor/worker.env; test "$(printf %s "$WORKER_LOCAL_ENV" | base64 -d | jq -r \'.[] | select(.key == "BOOT_SECRET") | .value\')" = applied; test ! -e /workspace/unapplied-recovery-init; test "$(cat /workspace/archive-fixture)" = retained-workspace; test "$(cat /home/agent/.agent-data/archive-fixture)" = retained-agents'])).returnCode).toBe(0);
+      };
+      await checkApplied(info);
+      const removedHandle = info.containerId;
+      await runtime.remove(info, info.containerId.slice(6));
+      const reloadedStore = new WorkerStore(root); await reloadedStore.init();
+      const reloaded = new ContainerManager({ listContainers: async () => [] } as any, config);
+      reloaded.setWorkerStore(reloadedStore); reloaded.setIncusRuntime(runtime);
+      (reloaded as any).assertOwnerExists = async () => {};
+      (reloaded as any).resolveAuthorizedHostMounts = async () => undefined;
+      (reloaded as any).resolveHardwareDeviceAccess = async () => undefined;
+      (reloaded as any).resolveUserEnvAndBinds = (manager as any).resolveUserEnvAndBinds;
+      await reloaded.sync(); expect(reloaded.get(info.id)).toBeUndefined();
+      await reloaded.reconcileIncusWorkers();
+      const recovered = reloaded.get(info.id)!;
+      expect(recovered.status).toBe('running'); expect(recovered.containerId).not.toBe(removedHandle);
+      expect(recovered.pendingRebuild).toBe(true);
+      expect(reloadedStore.get(info.userId, info.id)).toMatchObject({ status: 'active', pendingRebuild: true, desiredRuntimeStatus: 'running' });
+      expect((await useWorkerConfigStore().resolveValues(info.userId, info.id))[0]!.value).toBe('unapplied');
+      await checkApplied(recovered);
+      return; // finally cleans only this test's newly-created runtime/volumes
+    }
     if (process.env.INCUS_RECREATION_RECOVERY_TEST === 'true') {
       const originalUuid = info.containerId.slice(6);
       const marker = { nonce: 'live-interrupted-recreation', originalIncarnation: originalUuid };
