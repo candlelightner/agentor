@@ -11,6 +11,21 @@ export function getPeerUrl(peer: Peer): string | undefined {
   return peer.request?.url;
 }
 
+/** Browsers supply Origin on WebSocket upgrades. A session cookie must not
+ * authorize a relay opened by another site. Keep authenticated non-browser
+ * clients without Origin compatible; never accept an explicit opaque origin.
+ * Compare Host, not the internal URL scheme behind a TLS-terminating proxy.
+ */
+export function isAllowedRelayOrigin(request: Pick<Request, 'url' | 'headers'>): boolean {
+  const origin = request.headers.get('origin');
+  if (origin === null) return true;
+  try {
+    const parsed = new URL(origin);
+    return ['http:', 'https:'].includes(parsed.protocol) && !parsed.username && !parsed.password &&
+      parsed.origin === origin && parsed.host === (request.headers.get('host') || new URL(request.url).host);
+  } catch { return false; }
+}
+
 export function toBuffer(message: unknown): Buffer | null {
   try {
     if (Buffer.isBuffer(message)) return message;
@@ -53,6 +68,10 @@ export function createWsRelayHandlers(
 ) {
   return {
     async open(peer: Peer) {
+      if (!isAllowedRelayOrigin(peer.request)) {
+        try { peer.close(); } catch {}
+        return;
+      }
       const id = getPeerId(peer);
       const ctx: RelayContext = { bufferedMessages: [], bufferedBytes: 0, closed: false };
       relayContexts.set(id, ctx);

@@ -108,6 +108,7 @@ async function resolveImportedImage(
 }
 import {
   isWorkerLifecycleMutationActive,
+  isWorkerLifecycleMutationPending,
   withOwnerLifecycleMutation,
   withOwnerWorkerLifecycleMutation,
   withOwnerWorkerRuntimeSetup,
@@ -1273,14 +1274,14 @@ export class ContainerManager {
     if (info.runtimeKind !== "incus-vm") return info.containerName;
     const record = this.workerStore?.findById(id);
     if (!record || record.runtimeKind !== "incus-vm" || record.status !== "active" || record.deletionPending ||
-        record.userId !== info.userId || isWorkerLifecycleMutationActive(id)) throw new Error("Incus worker is not authoritative");
+        record.userId !== info.userId || isWorkerLifecycleMutationPending(id)) throw new Error("Incus worker is not authoritative");
     const generation = workerLifecycleGeneration(id);
     const primary = await this.incusRuntime.resolvePrimaryAddress({ id, userId: info.userId, containerName: info.containerName });
     const current = this.get(id), stored = this.workerStore?.findById(id);
     if (info.containerId !== `incus:${primary.incarnation}` || current?.containerId !== info.containerId ||
         current.status !== "running" || current.userId !== info.userId || stored?.runtimeKind !== "incus-vm" ||
         stored.status !== "active" || stored.deletionPending || stored.userId !== info.userId ||
-        workerLifecycleGeneration(id) !== generation || isWorkerLifecycleMutationActive(id))
+        workerLifecycleGeneration(id) !== generation || isWorkerLifecycleMutationPending(id))
       throw new Error("Incus worker changed during backend resolution; retry");
     return primary.address;
   }

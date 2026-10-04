@@ -10,7 +10,8 @@ import type { IncusInstance, IncusNetwork, IncusNetworkLease } from "../../orche
 import { IncusClient } from "../../orchestrator/server/utils/incus-client";
 import { ContainerManager } from "../../orchestrator/server/utils/container";
 import { WorkerStore } from "../../orchestrator/server/utils/worker-store";
-import { withWorkerLifecycleMutation, isWorkerLifecycleMutationActive } from "../../orchestrator/server/utils/worker-lifecycle-coordinator";
+import { withWorkerLifecycleMutation, withOwnerWorkerRuntimeSetup, isWorkerLifecycleMutationActive,
+  isWorkerLifecycleMutationPending, workerLifecycleGeneration } from "../../orchestrator/server/utils/worker-lifecycle-coordinator";
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 
@@ -139,6 +140,14 @@ test("manager publishes only current record/incarnation/lease authority, not sta
     expect(await manager.resolveIncusCaller("10.20.30.42")).toBeNull();
     expect(await manager.resolveWorkerHost(info.id)).toBe("10.20.30.43");
     expect(await manager.resolveIncusCaller("10.20.30.43")).toBe(info);
+    const generation = workerLifecycleGeneration(info.id);
+    await withOwnerWorkerRuntimeSetup(info.userId, info.id, async () => {
+      expect(isWorkerLifecycleMutationActive(info.id)).toBe(true);
+      expect(isWorkerLifecycleMutationPending(info.id)).toBe(false);
+      expect(await manager.resolveWorkerHost(info.id)).toBe('10.20.30.43');
+      expect(await manager.resolveIncusCaller('10.20.30.43')).toBe(info);
+    });
+    expect(workerLifecycleGeneration(info.id)).toBe(generation);
     await withWorkerLifecycleMutation(info.id, async () => {
       await expect(manager.resolveWorkerHost(info.id)).rejects.toThrow("not authoritative");
       expect(await manager.resolveIncusCaller("10.20.30.43")).toBeNull();

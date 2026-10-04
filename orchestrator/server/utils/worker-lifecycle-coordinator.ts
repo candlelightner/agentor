@@ -8,6 +8,7 @@ import {
  * mutation cannot strand every later lifecycle request for that worker. */
 export class WorkerLifecycleCoordinator {
   private queues = new Map<string, Promise<void>>();
+  private mutations = new Map<string, number>();
   /** A monotonic admission marker lets inventory reconciliation distinguish a
    * Docker list snapshot taken before a worker mutation from current state.
    * Queue occupancy alone is insufficient: a mutation can complete while
@@ -18,6 +19,10 @@ export class WorkerLifecycleCoordinator {
 
   isBusy(workerId: string): boolean {
     return this.queues.has(workerId);
+  }
+
+  hasMutation(workerId: string): boolean {
+    return (this.mutations.get(workerId) ?? 0) > 0;
   }
 
   currentSequence(): number {
@@ -33,7 +38,10 @@ export class WorkerLifecycleCoordinator {
     operation: () => Promise<T>,
     options: { holdTimeoutSettlement?: boolean; runtimeSetup?: boolean } = {},
   ): Promise<T> {
-    if (!options.runtimeSetup) this.generations.set(workerId, ++this.sequence);
+    if (!options.runtimeSetup) {
+      this.generations.set(workerId, ++this.sequence);
+      this.mutations.set(workerId, (this.mutations.get(workerId) ?? 0) + 1);
+    }
     const previous = this.queues.get(workerId) ?? Promise.resolve();
     const result = previous.catch(() => undefined).then(operation);
     const tail = result.then(
@@ -49,6 +57,11 @@ export class WorkerLifecycleCoordinator {
     );
     this.queues.set(workerId, tail);
     void tail.finally(() => {
+      if (!options.runtimeSetup) {
+        const remaining = (this.mutations.get(workerId) ?? 1) - 1;
+        if (remaining) this.mutations.set(workerId, remaining);
+        else this.mutations.delete(workerId);
+      }
       if (this.queues.get(workerId) === tail) this.queues.delete(workerId);
     });
     return result;
@@ -69,6 +82,13 @@ export function withWorkerLifecycleMutation<T>(
  * queued operation or any caller data. */
 export function isWorkerLifecycleMutationActive(workerId: string): boolean {
   return lifecycleCoordinator.isBusy(workerId);
+}
+
+/** Routes deny queued/running mutations (including late timeout settlement),
+ * not brief exec setup or healthy read-only guest observations. Inventory
+ * continues using the stricter all-queue occupancy check above. */
+export function isWorkerLifecycleMutationPending(workerId: string): boolean {
+  return lifecycleCoordinator.hasMutation(workerId);
 }
 
 /** Snapshot markers for read-only inventory work. They contain no worker

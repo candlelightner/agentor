@@ -23,7 +23,7 @@ test('real Incus dashboard terminal/files/apps and authenticated plugin UI/deskt
   const anonymous = await request.newContext({ baseURL });
   const definitions: string[] = [], installations: string[] = [];
   let worker: any, environment: any, browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
-  let terminal: any, primaryFailure = false;
+  let terminal: any, primaryFailure = false, stage = 'login';
   const previousPaths = JSON.parse(host('sudo incus query /1.0/projects/agentor')).config['restricted.devices.disk.paths'] || '';
   try {
     const login = await api.post('/api/auth/sign-in/email', { data: {
@@ -40,9 +40,11 @@ test('real Incus dashboard terminal/files/apps and authenticated plugin UI/deskt
     expect(created.status(), await created.text()).toBe(201); worker = await created.json();
     expect(worker).toMatchObject({ runtimeKind: 'incus-vm', status: 'running', userId: owner });
     const prefix = `/api/containers/${worker.id}`;
+    stage = 'files';
     expect((await anonymous.get(`${prefix}/files`)).status()).toBe(401);
     const binary = Buffer.from([0, 255, 10, 13, 128]);
-    expect((await api.post(`${prefix}/files/mkdir`, { data: { path: 'experience' } })).status()).toBe(200);
+    const mkdir = await api.post(`${prefix}/files/mkdir`, { data: { path: 'experience' } });
+    expect(mkdir.status(), await mkdir.text()).toBe(200);
     const upload = await api.post(`${prefix}/files/upload`, { multipart: {
       path: 'experience', file: { name: 'bytes.bin', mimeType: 'application/octet-stream', buffer: binary },
     } });
@@ -54,6 +56,7 @@ test('real Incus dashboard terminal/files/apps and authenticated plugin UI/deskt
     expect(zip.status()).toBe(200); expect((await zip.body()).subarray(0, 2).toString()).toBe('PK');
     expect((await api.post(`${prefix}/files/mkdir`, { data: { path: '../escape' } })).status()).toBe(400);
     expect((await api.post(`${prefix}/files/rename`, { data: { path: 'experience/bytes.bin', newName: 'renamed.bin' } })).status()).toBe(200);
+    stage = 'terminal';
     const pane = await api.post(`${prefix}/panes`, { data: { name: 'experience' } });
     expect(pane.status(), await pane.text()).toBe(201); const window = await pane.json();
     const cookie = (await api.storageState()).cookies.map((c) => `${c.name}=${c.value}`).join('; ');
@@ -79,12 +82,14 @@ test('real Incus dashboard terminal/files/apps and authenticated plugin UI/deskt
     await expect.poll(() => output, { timeout: 20_000 }).toMatch(/40\s+120/);
     terminal.close(); terminal = undefined;
     expect((await api.delete(`${prefix}/panes/${window.index}`)).status()).toBe(200);
+    stage = 'apps';
     const app = await api.post(`${prefix}/apps/socks5`);
     expect(app.status(), await app.text()).toBe(201); const instance = await app.json();
     await expect.poll(async () => (await (await api.get(`${prefix}/apps/socks5`)).json()), { timeout: 15_000 })
       .toContainEqual(expect.objectContaining({ id: instance.id, status: 'running' }));
     expect((await api.delete(`${prefix}/apps/socks5/${instance.id}`)).status()).toBe(200);
 
+    stage = 'plugins';
     const install = async (manifest: any) => {
       const definition = await api.post('/api/plugins/definitions', { data: { scope: 'owner', manifest } });
       expect(definition.status(), await definition.text()).toBe(201); const def = await definition.json(); definitions.push(def.id);
@@ -126,9 +131,67 @@ http.server.ThreadingHTTPServer(('0.0.0.0',int(os.environ['AGENTOR_PLUGIN_PORT_U
     expect(await firstFrame(`${desktopPath}websockify`, false)).toBe('');
     expect(await firstFrame(`${desktopPath}websockify`, true, 'https://unrelated.invalid')).toBe('');
     expect((await api.get(`/plugin-desktop/${worker.id}/${desktops[0].id}/open/primary/`)).url()).toContain(`/desktop/${worker.id}/agentor.html`);
+    if (process.env.INCUS_STACK_RESTART_TEST === 'true') {
+      stage = 'orchestrator restart';
+      // Restart only the helper-owned disposable Orchestrator, never a
+      // similarly named production/control-plane container.
+      expect(worker.containerName).toMatch(/^agentor-worker-[a-f0-9-]+$/);
+      const containerId = host("sudo docker inspect --format '{{.Id}}' agentor-orchestrator");
+      expect(containerId).toMatch(/^[a-f0-9]{64}$/);
+      const owned = JSON.parse(host(`sudo docker inspect --format '{{json .Config.Labels}}' ${quote(containerId)}`));
+      expect(owned['agentor.incus.acceptance']).toBe('true');
+      const mounts = JSON.parse(host(`sudo docker inspect --format '{{json .Mounts}}' ${quote(containerId)}`));
+      expect(mounts).toContainEqual(expect.objectContaining({ Source: data, Destination: '/data' }));
+      const guestState = () => host(`sudo incus exec ${quote(worker.containerName)} --project agentor -- sh -ec 'cat /proc/sys/kernel/random/boot_id; systemctl show agentor-worker --property=MainPID --value'`);
+      const before = guestState();
+      host(`sudo docker restart --time 30 ${quote(containerId)}`);
+      await expect.poll(async () => {
+        try { return (await api.get(`${prefix}/files?path=experience`)).status(); }
+        catch { return 0; }
+      }, { timeout: 120_000, intervals: [1000, 2000] }).toBe(200);
+      expect(guestState()).toBe(before);
+      expect((await api.get(privatePath)).status()).toBe(200);
+      expect(await firstFrame(`${desktopPath}websockify`)).toMatch(/^RFB 003\./);
+    }
+    stage = 'browser';
     browser = await chromium.launch({ executablePath: process.env.INCUS_BROWSER_EXECUTABLE });
     const context = await browser.newContext({ baseURL, storageState: await api.storageState() });
     const page = await context.newPage(); await page.goto('/');
+    // A trusted dashboard-origin browser can relay to the authenticated plugin.
+    // An opaque sandbox cannot borrow that authority; do not widen the existing
+    // PluginPane sandbox with allow-same-origin just to enable its WebSockets.
+    const browserFrame = (url: string) => new Promise<string>((resolve) => {
+      const socket = new window.WebSocket(url); socket.binaryType = 'arraybuffer';
+      let settled = false;
+      const finish = (value: string) => {
+        if (settled) return; settled = true; clearTimeout(timer); socket.close(); resolve(value);
+      };
+      const timer = setTimeout(() => finish(''), 15_000);
+      socket.onmessage = (event) => finish(typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data));
+      socket.onerror = socket.onclose = () => finish('');
+    });
+    const pluginSocketUrl = baseURL.replace(/^http/, 'ws') + privatePath;
+    expect(await page.evaluate(browserFrame, pluginSocketUrl)).toBe('plugin-ws');
+    await page.evaluate(() => {
+      const frame = document.createElement('iframe'); frame.dataset.originFixture = 'opaque';
+      frame.sandbox.add('allow-scripts'); frame.srcdoc = '<body>Opaque plugin origin fixture</body>';
+      document.body.append(frame);
+    });
+    const opaqueBody = page.locator('iframe[data-origin-fixture="opaque"]').contentFrame().locator('body');
+    await opaqueBody.waitFor();
+    expect(await opaqueBody.evaluate((_body, args) => {
+      // Serialize the same bounded probe without relying on the parent origin.
+      return new Promise<string>((resolve) => {
+        const socket = new window.WebSocket(args); let settled = false;
+        const finish = (value: string) => {
+          if (settled) return; settled = true; clearTimeout(timer); socket.close(); resolve(value);
+        };
+        const timer = setTimeout(() => finish(''), 15_000);
+        socket.onmessage = () => finish('unexpected backend frame');
+        socket.onerror = socket.onclose = () => finish('');
+      });
+    }, pluginSocketUrl)).toBe('');
+    await page.locator('iframe[data-origin-fixture="opaque"]').evaluate((frame) => frame.remove());
     const card = page.locator('.rounded-lg').filter({ hasText: worker.displayName }).first();
     await expect(card.locator('text=running')).toBeVisible({ timeout: 60_000 });
     await card.locator('button').first().click();
@@ -149,7 +212,11 @@ http.server.ThreadingHTTPServer(('0.0.0.0',int(os.environ['AGENTOR_PLUGIN_PORT_U
     expect((await api.put(`${prefix}/plugins/${desktops[1].id}/enabled`, { data: { enabled: false } })).status()).toBe(200);
     await expect(page.locator('body')).toHaveAttribute('data-desktop-state', 'disabled', { timeout: 15_000 });
     expect((await api.get(privatePath)).status()).toBe(200);
-  } catch (error) { primaryFailure = true; throw error; }
+  } catch (error) {
+    primaryFailure = true;
+    console.error('Incus experience failed at stage', stage, 'worker', worker?.id);
+    throw error;
+  }
   finally {
     const failures: string[] = [];
     const cleanup = async (label: string, operation: () => Promise<unknown>) => {
