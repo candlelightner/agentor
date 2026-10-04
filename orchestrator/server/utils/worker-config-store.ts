@@ -9,6 +9,18 @@ import {
 } from "./worker-config-crypto";
 import { assertSafeUserId, isSafeUserId } from "./user-id";
 import { useConfig } from "./services";
+import type { DockerService } from './docker';
+
+/** Private applied VM userspace configuration, encrypted like local secrets.
+ * Not a WorkerRecord or public configuration response. No guest credentials,
+ * TLS material, runtime addresses or duplicated local secrets are stored. */
+export type WorkerAppliedBootstrap = Pick<Parameters<DockerService['createWorkerContainer']>[0],
+  'userEnv' | 'environmentJson' | 'capabilitiesJson' | 'instructionsJson' | 'workerJson' |
+  'cpuLimit' | 'memoryLimit' | 'dockerEnabled'> & {
+    version: 1;
+    excludedGlobalEnvVarKeys: string[];
+    excludedGroupEnvVarKeys: string[];
+  };
 
 export type WorkerConfigKind = "variable" | "secret" | "secretFile";
 export interface WorkerVariable {
@@ -42,6 +54,16 @@ export interface WorkerConfigRecord {
    * without accidentally applying newer pending settings. */
   appliedAt?: string;
   appliedEntries?: StoredWorkerConfigEntry[];
+  appliedBootstrap?: EncryptedWorkerValue;
+}
+
+/** Identity-bound revision actually sent to a guest, not the current desired
+ * state at the later completion of a slow boot. */
+export interface WorkerConfigRevision {
+  userId: string;
+  workerId: string;
+  updatedAt?: string;
+  entries: StoredWorkerConfigEntry[];
 }
 
 export interface WorkerConfigInputEntry {
@@ -97,6 +119,7 @@ const MAX_VARIABLE_BYTES = 64 * 1024;
 const MAX_SECRET_FILE_BYTES = 1024 * 1024;
 const MAX_ENV_TOTAL_BYTES = 96 * 1024;
 const MAX_SECRET_FILES_TOTAL_BYTES = 12 * 1024 * 1024;
+const MAX_BOOTSTRAP_BYTES = 16 * 1024 * 1024;
 
 export class WorkerConfigStore {
   private records = new Map<string, Map<string, WorkerConfigRecord>>();
@@ -175,6 +198,7 @@ export class WorkerConfigStore {
       entries,
       appliedAt: existing?.appliedAt,
       appliedEntries: existing?.appliedEntries,
+      appliedBootstrap: existing?.appliedBootstrap,
     };
     let map = this.records.get(userId);
     if (!map) {
@@ -193,27 +217,55 @@ export class WorkerConfigStore {
     return structuredClone(record);
   }
 
-  async markApplied(userId: string, workerId: string): Promise<void> {
-    await this.init();
+  async markApplied(userId: string, workerId: string, bootstrap?: WorkerAppliedBootstrap,
+    revision?: WorkerConfigRevision): Promise<void> {
     assertSafeId(userId);
     assertSafeId(workerId);
+    // Snapshot before the async mutation queue: callers cannot change the
+    // successfully materialized revision while it is waiting to persist.
+    const plaintext = bootstrap === undefined ? undefined : JSON.stringify(bootstrap);
+    if (plaintext !== undefined && (Buffer.byteLength(plaintext) > MAX_BOOTSTRAP_BYTES ||
+        !validAppliedBootstrap(JSON.parse(plaintext), userId, workerId)))
+      throw new Error('Applied worker bootstrap is invalid');
+    const applied = revision === undefined ? undefined : structuredClone(revision);
+    if (applied && (applied.userId !== userId || applied.workerId !== workerId ||
+        !Array.isArray(applied.entries) || !validStoredEntries(applied.entries) ||
+        (applied.updatedAt !== undefined && typeof applied.updatedAt !== 'string')))
+      throw new Error('Applied worker configuration revision is invalid');
+    await this.init();
     return this.withUserMutation(userId, async () => {
-      const map = this.records.get(userId);
+      let map = this.records.get(userId);
       const record = map?.get(workerId);
-      if (!map || !record) return;
+      if (!record && plaintext === undefined) return;
+      const encrypted = plaintext !== undefined ? await encryptWorkerValue(this.config, plaintext,
+        aad(userId, workerId, 'bootstrap', 'applied')) : undefined;
+      if (!map) { map = new Map(); this.records.set(userId, map); }
+      const stamp = new Date().toISOString();
       const next: WorkerConfigRecord = {
-        ...record,
-        appliedAt: record.updatedAt,
-        appliedEntries: structuredClone(record.entries),
+        ...(record ?? { schemaVersion: 1, userId, workerId, createdAt: stamp, updatedAt: stamp, entries: [] }),
+        appliedAt: applied ? applied.updatedAt ?? (record ? undefined : stamp) : record?.updatedAt ?? stamp,
+        appliedEntries: structuredClone(applied?.entries ?? record?.entries ?? []),
+        ...(encrypted ? { appliedBootstrap: encrypted } : {}),
       };
       map.set(workerId, next);
       try {
         await this.persist(userId);
       } catch (error) {
-        map.set(workerId, record);
+        if (record) map.set(workerId, record);
+        else { map.delete(workerId); if (!map.size) this.records.delete(userId); }
         throw error;
       }
     });
+  }
+
+  async resolveAppliedBootstrap(userId: string, workerId: string): Promise<WorkerAppliedBootstrap | undefined> {
+    const record = await this.get(userId, workerId);
+    if (!record?.appliedBootstrap) return undefined;
+    const value: unknown = JSON.parse(await decryptWorkerValue(this.config, record.appliedBootstrap,
+      aad(userId, workerId, 'bootstrap', 'applied')));
+    if (!validAppliedBootstrap(value, userId, workerId))
+      throw new Error('Applied worker bootstrap is invalid; explicit rebuild is required');
+    return value;
   }
 
   async remove(userId: string, workerId: string): Promise<void> {
@@ -440,6 +492,13 @@ export class WorkerConfigStore {
       workerId,
       (await this.get(userId, workerId))?.entries ?? [],
     );
+  }
+
+  async resolveDesiredRevision(userId: string, workerId: string) {
+    const record = await this.get(userId, workerId);
+    const revision: WorkerConfigRevision = { userId, workerId, updatedAt: record?.updatedAt,
+      entries: record?.entries ?? [] };
+    return { revision, values: await this.resolveEntryValues(userId, workerId, revision.entries) };
   }
 
   async resolveAppliedValues(
@@ -786,8 +845,47 @@ function validStoredRecord(
     (record.appliedAt === undefined || typeof record.appliedAt === 'string') &&
     (record.appliedEntries === undefined ||
       (Array.isArray(record.appliedEntries) &&
-        validStoredEntries(record.appliedEntries)))
+        validStoredEntries(record.appliedEntries))) &&
+    (record.appliedBootstrap === undefined || validBootstrapEnvelope(record.appliedBootstrap))
   );
+}
+
+function validBootstrapEnvelope(value: EncryptedWorkerValue): boolean {
+  if (typeof value?.ciphertext !== 'string' || value.ciphertext.length > Math.ceil(MAX_BOOTSTRAP_BYTES / 3) * 4)
+    return false;
+  const bytes = base64ByteLength(value?.ciphertext);
+  return !!value && value.version === 1 && value.algorithm === 'aes-256-gcm' &&
+    isBase64(value.iv, 12) && isBase64(value.tag, 16) &&
+    bytes !== undefined && bytes > 0 && bytes <= MAX_BOOTSTRAP_BYTES;
+}
+
+function validAppliedBootstrap(value: unknown, userId: string, workerId: string): value is WorkerAppliedBootstrap {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const v = value as WorkerAppliedBootstrap;
+  const strings = (items: unknown): items is string[] => Array.isArray(items) && items.every((item) => typeof item === 'string');
+  const documents = (items: unknown) => Array.isArray(items) && items.every((item) =>
+    item && typeof item.name === 'string' && typeof item.content === 'string');
+  const e = v.environmentJson, w = v.workerJson, u = v.userEnv;
+  return v.version === 1 && !!e && !!w && !!u && u.userId === userId && w.id === workerId &&
+    typeof u.createdAt === 'string' && typeof u.updatedAt === 'string' &&
+    Array.isArray(u.envVars) && u.envVars.every((item) => item && typeof item.key === 'string' &&
+      USER_ENV_KEY_RE.test(item.key) && !RESERVED.has(item.key) && typeof item.value === 'string') &&
+    typeof e.networkMode === 'string' && strings(e.allowedDomains) && typeof e.dockerEnabled === 'boolean' &&
+    typeof e.setupScript === 'string' && typeof e.envVars === 'string' && !!e.exposeApis &&
+    typeof e.exposeApis === 'object' && !Array.isArray(e.exposeApis) &&
+    // Historical environments may provide only selected flags. The worker
+    // entrypoint defaults missing/null flags to true, preserving explicit false.
+    ['portMappings', 'domainMappings', 'usage'].every((key) =>
+      e.exposeApis[key as keyof typeof e.exposeApis] == null || typeof e.exposeApis[key as keyof typeof e.exposeApis] === 'boolean') &&
+    typeof v.dockerEnabled === 'boolean' && v.dockerEnabled === e.dockerEnabled &&
+    (v.cpuLimit === undefined || (typeof v.cpuLimit === 'number' && Number.isFinite(v.cpuLimit) && v.cpuLimit >= 0)) &&
+    (v.memoryLimit === undefined || typeof v.memoryLimit === 'string') &&
+    documents(v.capabilitiesJson) && documents(v.instructionsJson) &&
+    typeof w.displayName === 'string' && typeof w.initScript === 'string' &&
+    typeof w.gitName === 'string' && typeof w.gitEmail === 'string' && Array.isArray(w.repos) &&
+    w.repos.every((repo) => repo && typeof repo.provider === 'string' && typeof repo.url === 'string' &&
+      (repo.branch === undefined || typeof repo.branch === 'string')) &&
+    strings(v.excludedGlobalEnvVarKeys) && strings(v.excludedGroupEnvVarKeys);
 }
 function isBase64(value: unknown, bytes?: number): boolean {
   if (typeof value !== "string" || !/^[A-Za-z0-9+/]*={0,2}$/.test(value))
@@ -815,7 +913,7 @@ function base64ByteLength(value: unknown): number | undefined {
 function aad(
   userId: string,
   workerId: string,
-  kind: WorkerConfigKind,
+  kind: WorkerConfigKind | 'bootstrap',
   key: string,
 ): string {
   return `${userId}\0${workerId}\0${kind}\0${key}`;

@@ -95,6 +95,19 @@ export class IncusWorkerStorage {
     return volume.config["user.agentor.allow-initialization"] === "true";
   }
 
+  /** Read-only reconstruction preflight. Missing known data is an error, never
+   * permission to allocate an empty replacement. */
+  async verifyExisting(owner: IncusStorageOwner, dockerRequired = false): Promise<{ docker: boolean }> {
+    let docker = false;
+    for (const role of ['workspace', 'agents', 'docker'] as const) {
+      const volume = await this.find(owner, role);
+      if (!volume && (role !== 'docker' || dockerRequired))
+        throw new Error('Existing Incus ' + role + ' volume is missing; explicit recovery is required');
+      if (volume) { this.validate(volume, owner, role); if (role === 'docker') docker = true; }
+    }
+    return { docker };
+  }
+
   async markDockerInitialized(owner: IncusStorageOwner): Promise<void> {
     const volume = await this.find(owner, "docker");
     if (!volume) throw new Error("Authoritative Docker volume is missing");

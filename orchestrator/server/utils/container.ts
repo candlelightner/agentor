@@ -168,6 +168,8 @@ import {
   useWorkerConfigStore,
   parseDotEnv,
   type WorkerConfigInputEntry,
+  type WorkerAppliedBootstrap,
+  type WorkerConfigRevision,
 } from "./worker-config-store";
 
 interface ResolvedEnvConfig {
@@ -595,10 +597,13 @@ export class ContainerManager {
     workerId?: string,
     excludedGroupKeys: unknown = [],
     targetGroupId?: string,
+    appliedUserEnv?: UserEnvVars,
   ): Promise<{ userEnv: UserEnvVars; credentialBinds: string[]; groupSecrets: Array<{kind:"secret";key:string;value:string}> }> {
     const source =
-      this.userEnvStore?.getOrDefault(userId) ?? zeroUserEnvVars(userId);
-    const excluded = new Set(normalizeExcludedGlobalEnvVarKeys(source, excludedKeys));
+      appliedUserEnv ?? this.userEnvStore?.getOrDefault(userId) ?? zeroUserEnvVars(userId);
+    // Applied account values are already filtered. Removed account keys must
+    // not invalidate an older, successfully applied exclusion selection.
+    const excluded = new Set(appliedUserEnv ? [] : normalizeExcludedGlobalEnvVarKeys(source, excludedKeys));
     const merged = new Map(source.envVars.filter(({ key }) => !excluded.has(key)).map((entry) => [entry.key, entry.value]));
     const groupSecrets: Array<{kind:"secret";key:string;value:string}>=[];
     if (workerId) {
@@ -791,27 +796,40 @@ export class ContainerManager {
   }
 
   private async incusOptionsForWorker(info: ContainerInfo, applied: boolean): Promise<IncusWorkerOptions> {
-    const environment = this.resolveEnvironmentConfig(info.environmentId);
-    const { userEnv, credentialBinds, groupSecrets } = await this.resolveUserEnvAndBinds(
-      info.userId, info.excludedGlobalEnvVarKeys ?? [], info.id, info.excludedGroupEnvVarKeys ?? [],
-    );
     const store = useWorkerConfigStore();
-    const workerConfig = applied
-      ? await store.resolveAppliedValues(info.userId, info.id)
-      : await store.resolveValues(info.userId, info.id);
-    const { gitName, gitEmail } = await this.resolveGitIdentity(info.userId);
+    const bootstrap = applied ? await store.resolveAppliedBootstrap(info.userId, info.id) : undefined;
+    if (applied && !bootstrap)
+      throw new Error('Applied Incus bootstrap is missing; explicit rebuild is required before restart');
+    const environment = bootstrap ?? this.resolveEnvironmentConfig(info.environmentId);
+    const { userEnv, credentialBinds, groupSecrets } = await this.resolveUserEnvAndBinds(
+      info.userId, bootstrap?.excludedGlobalEnvVarKeys ?? info.excludedGlobalEnvVarKeys ?? [], info.id,
+      bootstrap?.excludedGroupEnvVarKeys ?? info.excludedGroupEnvVarKeys ?? [],
+      undefined, bootstrap?.userEnv,
+    );
+    const desired = applied ? undefined : await store.resolveDesiredRevision(info.userId, info.id);
+    const workerConfig = applied ? await store.resolveAppliedValues(info.userId, info.id) : desired!.values;
+    const { gitName, gitEmail } = bootstrap?.workerJson ?? await this.resolveGitIdentity(info.userId);
     return {
       userId: info.userId, id: info.id, containerName: info.containerName,
-      ...this.deriveLimits(environment),
+      ...(bootstrap ? { cpuLimit: bootstrap.cpuLimit, memoryLimit: bootstrap.memoryLimit, dockerEnabled: bootstrap.dockerEnabled }
+        : this.deriveLimits(environment)),
       environmentJson: environment.environmentJson,
       capabilitiesJson: environment.capabilitiesJson, instructionsJson: environment.instructionsJson,
-      workerJson: { id: info.id, displayName: info.displayName,
+      workerJson: bootstrap?.workerJson ?? { id: info.id, displayName: info.displayName,
         repos: info.repos ?? [], initScript: info.initScript ?? "", gitName, gitEmail },
-      userEnv, credentialBinds, workerConfig: [...groupSecrets, ...workerConfig], mounts: info.mounts,
+      userEnv: bootstrap?.userEnv ?? userEnv, credentialBinds, workerConfig: [...groupSecrets, ...workerConfig], mounts: info.mounts,
       storageManager: this.storageManager,
       image: info.imageRuntimeReference,
+      configurationRevision: desired?.revision,
       sshAuthorizedKeys: await this.storageManager?.readSshAuthorizedKeys(info.userId),
     };
+  }
+
+  private appliedIncusBootstrap(opts: IncusWorkerOptions, info: ContainerInfo): WorkerAppliedBootstrap {
+    return { version: 1, cpuLimit: opts.cpuLimit, memoryLimit: opts.memoryLimit, dockerEnabled: opts.dockerEnabled,
+      userEnv: opts.userEnv, environmentJson: opts.environmentJson, capabilitiesJson: opts.capabilitiesJson,
+      instructionsJson: opts.instructionsJson, workerJson: opts.workerJson,
+      excludedGlobalEnvVarKeys: info.excludedGlobalEnvVarKeys ?? [], excludedGroupEnvVarKeys: info.excludedGroupEnvVarKeys ?? [] };
   }
 
   private static readonly STATE_MAP: Record<string, ContainerStatus> = {
@@ -1520,6 +1538,7 @@ export class ContainerManager {
       throw err;
     }
 
+    let configurationRevision: WorkerConfigRevision | undefined;
     const workerConfig = await (async () => {
       try {
         if (requestedWorkerConfiguration) {
@@ -1528,6 +1547,11 @@ export class ContainerManager {
             id,
             requestedWorkerConfiguration,
           );
+        }
+        if (runtimeKind === 'incus-vm') {
+          const desired = await workerConfigStore.resolveDesiredRevision(userId, id);
+          configurationRevision = desired.revision;
+          return desired.values;
         }
         return await workerConfigStore.resolveValues(userId, id);
       } catch (err) {
@@ -1542,6 +1566,7 @@ export class ContainerManager {
       }
     })();
 
+    let appliedBootstrap: WorkerAppliedBootstrap | undefined;
     try {
       // The first check rejects invalid input before publishing a worker. Check
       // again after the provisional record is durable and immediately before
@@ -1584,6 +1609,7 @@ export class ContainerManager {
       };
       if (runtimeKind === "incus-vm") {
         await this.incusRuntime.create(options);
+        appliedBootstrap = this.appliedIncusBootstrap(options, containerInfo);
         const instance = await this.incusRuntime.client.getInstance(containerName);
         if (!instance.config["volatile.uuid"]) throw new Error("Incus worker incarnation is missing");
         containerInfo.containerId = `incus:${instance.config["volatile.uuid"]}`;
@@ -1608,7 +1634,7 @@ export class ContainerManager {
     // gated rollback. The provisional identity is retained if Docker removal
     // fails, rather than converting a live worker into an untracked orphan.
     try {
-      await workerConfigStore.markApplied(userId, id);
+      await workerConfigStore.markApplied(userId, id, appliedBootstrap, configurationRevision);
       if (this.workerStore) {
         await this.workerStore.upsert(
           this.containerInfoToWorkerRecord(containerInfo),
@@ -2497,7 +2523,7 @@ for p in sys.argv[1:]:
       await stopWorkerContainerIdempotently(
         info,
         () => info.runtimeKind === "incus-vm"
-          ? this.incusRuntime.stop(info.containerName)
+          ? this.incusRuntime.stop(info, info.containerId.startsWith('incus:') ? info.containerId.slice(6) : undefined)
           : this.dockerService.stopContainer(info.containerId),
         true,
       );
@@ -2530,8 +2556,9 @@ for p in sys.argv[1:]:
       const options = await this.incusOptionsForWorker(info, true);
       info.status = "starting";
       try {
-        await this.incusRuntime.stop(info.containerName);
-        await this.incusRuntime.start(options);
+        const incarnation = info.containerId.startsWith('incus:') ? info.containerId.slice(6) : undefined;
+        await this.incusRuntime.stop(info, incarnation);
+        await this.incusRuntime.start(options, incarnation);
         info.status = "running";
         info.updatedAt = new Date().toISOString();
         info.runtimeDiagnostic = undefined;
@@ -3108,7 +3135,7 @@ for p in sys.argv[1:]:
     // were a Docker container id, leaving the real container untracked and
     // preventing restore/account-cleanup rollback from retrying it.
     await removeDockerContainerIdempotently(() =>
-      info.runtimeKind === "incus-vm" ? this.incusRuntime.remove(info.containerName)
+      info.runtimeKind === "incus-vm" ? this.incusRuntime.remove(info, info.containerId.startsWith('incus:') ? info.containerId.slice(6) : undefined)
         : this.dockerService.removeContainer(info.containerId),
     );
     useLogCollector().detach(info.containerId);

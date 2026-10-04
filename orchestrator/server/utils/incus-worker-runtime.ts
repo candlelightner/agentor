@@ -10,8 +10,12 @@ import { resolveIncusPrimaryLease } from "./incus-worker-network";
 import type { ContainerStatus } from "../../shared/types";
 import { IncusWorkerCommands } from "./incus-worker-commands";
 import { withOwnerWorkerRuntimeSetup } from "./worker-lifecycle-coordinator";
+import type { WorkerConfigRevision } from './worker-config-store';
 
-export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & { sshAuthorizedKeys?: string };
+export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & {
+  sshAuthorizedKeys?: string;
+  configurationRevision?: WorkerConfigRevision;
+};
 
 function sameDevice(actual: Record<string, string> | undefined, expected: Record<string, string>): boolean {
   return !!actual && Object.keys(actual).length === Object.keys(expected).length &&
@@ -127,11 +131,13 @@ export class IncusWorkerRuntime {
     return confirmed;
   }
 
-  private async assertOwned(name: string, workerId?: string): Promise<IncusInstance> {
+  private async assertOwned(name: string, workerId?: string, userId?: string, incarnation?: string): Promise<IncusInstance> {
     const instance = await this.client.getInstance(name);
     const id = workerId ?? instance.config["user.agentor.id"];
-    if (!id || !await this.matchesWorkerIdentity(instance, id))
+    if (!id || !await this.matchesWorkerIdentity(instance, id, userId))
       throw new Error("Refusing to manage an Incus instance without matching Agentor installation/worker identity");
+    if (incarnation && instance.config['volatile.uuid'] !== incarnation)
+      throw new Error('Incus worker incarnation changed; explicit recovery is required');
     return instance;
   }
 
@@ -211,23 +217,42 @@ export class IncusWorkerRuntime {
     if (project.config.restricted !== "true") throw new Error("Agentor Incus project must be restricted");
   }
 
-  async create(opts: IncusWorkerOptions): Promise<IncusInstance> {
+  async preflightRecreation(opts: IncusWorkerOptions, dockerRequired = false): Promise<{ fingerprint: string; docker: boolean }> {
+    await this.assertReady();
+    this.validateOptions(opts);
+    const fingerprint = await this.resolveImage();
+    await this.accountDevices(opts);
+    const storage = await (await this.storage()).verifyExisting(opts, dockerRequired);
+    return { fingerprint, ...storage };
+  }
+
+  private async resolveImage(fingerprint?: string): Promise<string> {
+    if (!fingerprint) {
+      const alias = await this.client.getImageAlias(this.config.incusWorkerImage);
+      if (alias.type !== 'virtual-machine') throw new Error('Incus worker image must be a virtual machine');
+      fingerprint = alias.target;
+    }
+    const image = await this.client.getImage(fingerprint);
+    if (image.type && image.type !== 'virtual-machine') throw new Error('Incus worker image must be a virtual machine');
+    if (image.properties?.bootstrap_generation !== '3')
+      throw new Error('Rebuild the derived Incus worker image with the current safe storage bootstrap');
+    return fingerprint;
+  }
+
+  async create(opts: IncusWorkerOptions, existing?: { fingerprint: string; docker: boolean }): Promise<IncusInstance> {
     await this.assertReady();
     // These features are integrated in the following storage/device phases.
     // Refuse them here rather than silently placing data on disposable rootfs.
     this.validateOptions(opts);
     if (opts.containerName !== `${this.config.containerPrefix}-${opts.id}`)
       throw new Error("Incus worker name must match its WorkerRecord identity");
-    const alias = await this.client.getImageAlias(this.config.incusWorkerImage);
-    if (alias.type !== "virtual-machine") throw new Error("Incus worker image must be a virtual machine");
-    const image = await this.client.getImage(alias.target);
-    if (image.properties?.bootstrap_generation !== "3")
-      throw new Error("Rebuild the derived Incus worker image with the current safe storage bootstrap");
+    const fingerprint = await this.resolveImage(existing?.fingerprint);
     const account = await this.accountDevices(opts);
-    const persistent = await (await this.storage()).devices(opts, opts.environmentJson.dockerEnabled);
+    const persistent = await (await this.storage()).devices(opts, opts.environmentJson.dockerEnabled,
+      existing && { docker: existing.docker });
     const instance = await this.client.createInstance({
       name: opts.containerName, type: "virtual-machine", profiles: [],
-      source: { type: "image", fingerprint: alias.target },
+      source: { type: "image", fingerprint },
       config: {
         "user.agentor.id": opts.id,
         "user.agentor.owner": opts.userId,
@@ -255,11 +280,11 @@ export class IncusWorkerRuntime {
     if (result.returnCode !== 0) throw new Error(`Incus worker bootstrap command failed (${command[0]}, exit ${result.returnCode})`);
   }
 
-  async start(opts: IncusWorkerOptions): Promise<void> {
+  async start(opts: IncusWorkerOptions, incarnation?: string): Promise<void> {
     this.validateOptions(opts);
     await this.assertReady();
     const name = opts.containerName;
-    const instance = await this.assertOwned(name, opts.id);
+    const instance = await this.assertOwned(name, opts.id, opts.userId, incarnation);
     if (instance.config['user.agentor.owner'] !== opts.userId)
       throw new Error('Incus worker account identity does not match');
     const state = await this.client.getInstanceState(name);
@@ -341,7 +366,7 @@ export class IncusWorkerRuntime {
       }
       if (!workerReady) throw new Error("Incus worker service did not complete startup");
     } catch (error) {
-      await this.stop(name).catch(() => {});
+      await this.stop(opts, instance.config['volatile.uuid']).catch(() => {});
       throw error;
     }
   }
@@ -386,8 +411,10 @@ export class IncusWorkerRuntime {
     await this.client.pushFile(name, "/run/agentor/provisioned", "agentor-runtime-v1\n", { mode: 0o600, uid: 0, gid: 0 });
   }
 
-  async stop(name: string): Promise<void> {
-    await this.assertOwned(name);
+  async stop(target: string | IncusStorageOwner, incarnation?: string): Promise<void> {
+    const name = typeof target === 'string' ? target : target.containerName;
+    await this.assertOwned(name, typeof target === 'string' ? undefined : target.id,
+      typeof target === 'string' ? undefined : target.userId, incarnation);
     const state = await this.client.getInstanceState(name);
     if (state.status !== "Stopped") await this.client.stopInstance(name, { timeout: 30 });
   }
@@ -401,10 +428,12 @@ export class IncusWorkerRuntime {
       { mode: 0o600, uid: 1000, gid: 1000 });
   }
 
-  async remove(name: string): Promise<void> {
+  async remove(target: string | IncusStorageOwner, incarnation?: string): Promise<void> {
+    const name = typeof target === 'string' ? target : target.containerName;
     try {
-      await this.assertOwned(name);
-      await this.stop(name);
+      await this.stop(target, incarnation);
+      await this.assertOwned(name, typeof target === 'string' ? undefined : target.id,
+        typeof target === 'string' ? undefined : target.userId, incarnation);
       await this.client.deleteInstance(name);
     } catch (error) {
       if ((error as { statusCode?: number }).statusCode !== 404) throw error;

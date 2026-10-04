@@ -45,6 +45,7 @@ export default defineConfig({
     "api/incus-worker-experience.spec.ts",
     "api/incus-derived-image.spec.ts",
     "api/incus-worker-runtime.spec.ts",
+    "api/incus-applied-bootstrap.spec.ts",
     "api/incus-worker-observability.spec.ts",
     "api/incus-worker-network.spec.ts",
     "api/incus-traefik-routing.spec.ts",

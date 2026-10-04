@@ -13,6 +13,7 @@ import { zeroUserEnvVars } from "../../orchestrator/server/utils/user-env-store"
 import type { Config } from "../../orchestrator/server/utils/config";
 import { withOwnerLifecycleMutation } from "../../orchestrator/server/utils/worker-lifecycle-coordinator";
 import { StorageManager } from "../../orchestrator/server/utils/storage";
+import { useWorkerConfigStore } from '../../orchestrator/server/utils/worker-config-store';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 (globalThis as any).useLogCollector ??= () => ({ attach: async () => {}, detach() {} });
@@ -237,6 +238,67 @@ test("start never replaces missing canonical storage with empty volumes", async 
   }
 });
 
+test('recreation preflight is read-only, pins the image and rechecks canonical data at creation', async () => {
+  const { client, events } = fakeClient();
+  const runtime = new IncusWorkerRuntime(config, client as any);
+  const opts = options();
+  await runtime.create({ ...opts, start: false });
+  events.length = 0;
+  const existing = await runtime.preflightRecreation(opts);
+  expect(existing).toEqual({ fingerprint: 'image-fingerprint', docker: false });
+  expect(events.some((event) => ['volume-create', 'create', 'start', 'file', 'exec'].includes(event.operation))).toBe(false);
+  client.getImageAlias = async () => { throw new Error('mutable alias moved'); };
+  await runtime.create({ ...opts, start: false }, existing);
+  expect(events.find((e) => e.operation === 'create')!.args[0].source.fingerprint).toBe('image-fingerprint');
+  const getVolume = client.getCustomVolume;
+  client.getCustomVolume = async (pool, name) => {
+    if (name.endsWith('-agents')) throw Object.assign(new Error('missing'), { statusCode: 404 });
+    return getVolume(pool, name);
+  };
+  events.length = 0;
+  await expect(runtime.create({ ...opts, start: false }, existing)).rejects.toThrow('Existing Incus agents volume is missing');
+  expect(events.some((e) => ['volume-create', 'create', 'start'].includes(e.operation))).toBe(false);
+});
+
+test('recreation preflight rejects missing required Docker, wrong ownership/type or foreign attachment without writes', async () => {
+  for (const failure of ['missing-docker', 'owner', 'type', 'attachment']) {
+    const { client, events } = fakeClient();
+    const runtime = new IncusWorkerRuntime(config, client as any);
+    const opts = options();
+    await runtime.create({ ...opts, start: false });
+    const getVolume = client.getCustomVolume;
+    client.getCustomVolume = async (pool, name) => {
+      const volume = structuredClone(await getVolume(pool, name));
+      if (name.endsWith('-agents')) {
+        if (failure === 'owner') volume.config['user.agentor.owner'] = 'foreign';
+        if (failure === 'type') volume.content_type = 'block';
+        if (failure === 'attachment') volume.used_by = ['/1.0/instances/foreign?project=agentor'];
+      }
+      return volume;
+    };
+    events.length = 0;
+    await expect(runtime.preflightRecreation(opts, failure === 'missing-docker')).rejects.toThrow();
+    expect(events.some((e) => ['volume-create', 'create', 'start', 'stop', 'remove', 'file', 'exec'].includes(e.operation))).toBe(false);
+  }
+});
+
+test('lifecycle mutations require matching account and original incarnation', async () => {
+  for (const action of ['start', 'stop', 'remove'] as const) {
+    for (const mismatch of ['owner', 'incarnation']) {
+      const { client, events } = fakeClient();
+      const runtime = new IncusWorkerRuntime(config, client as any);
+      const opts = options();
+      await runtime.create({ ...opts, start: false });
+      const instance = await client.getInstance(opts.containerName);
+      instance.config['volatile.uuid'] = 'original-uuid';
+      if (mismatch === 'owner') instance.config['user.agentor.owner'] = 'foreign';
+      events.length = 0;
+      await expect(runtime[action](opts, mismatch === 'incarnation' ? 'stale-uuid' : 'original-uuid')).rejects.toThrow();
+      expect(events.some((e) => ['volume-create', 'start', 'stop', 'remove', 'file', 'exec'].includes(e.operation))).toBe(false);
+    }
+  }
+});
+
 test("account directories require exact restricted grants before allocating worker data", async () => {
   const { client, events } = fakeClient();
   const storage = new StorageManager({} as any, config);
@@ -405,7 +467,10 @@ test("real production worker create/start, inventory and reprovisioning", async 
   // Account authorization/resolution is independent of runtime acceptance.
   (manager as any).assertOwnerExists = async () => {};
   (manager as any).resolveGitIdentity = async () => ({ gitName: "Incus Test", gitEmail: "test@example.invalid" });
-  (manager as any).resolveUserEnvAndBinds = async () => ({ userEnv: zeroUserEnvVars("test-user"), credentialBinds: [], groupSecrets: [] });
+  let accountSetting = 'old-account';
+  (manager as any).resolveUserEnvAndBinds = async () => ({
+    userEnv: { ...zeroUserEnvVars("test-user"), envVars: [{ key: 'ACCOUNT_SETTING', value: accountSetting }] },
+    credentialBinds: [], groupSecrets: [] });
   (manager as any).resolveAuthorizedHostMounts = async () => undefined;
   (manager as any).resolveHardwareDeviceAccess = async () => undefined;
   (manager as any).resolveEnvironmentConfig = () => ({ ...options(), dockerEnabled: false });
@@ -413,7 +478,8 @@ test("real production worker create/start, inventory and reprovisioning", async 
   manager.setIncusRuntime(runtime);
   let name: string | undefined;
   try {
-    const info = await (manager as any).createForOwner({ userId: "test-user", displayName: "Takeover lifecycle acceptance" });
+    const info = await (manager as any).createForOwner({ userId: "test-user", displayName: "Takeover lifecycle acceptance",
+      initScript: ': # original-init', workerConfiguration: { variables: [{ key: 'LOCAL_SETTING', value: 'old-local' }] } });
     name = info.containerName;
     expect(info.runtimeKind).toBe("incus-vm");
     expect(info.status).toBe("running");
@@ -427,6 +493,20 @@ test("real production worker create/start, inventory and reprovisioning", async 
     expect(services.returnCode).toBe(0);
     expect(services.stdout).toContain("302");
     expect(services.stdout).toContain("200");
+    accountSetting = 'new-account';
+    const current = manager.get(info.id)!;
+    current.initScript = ': # pending-init'; current.environmentId = 'pending-or-deleted-environment'; current.pendingRebuild = true;
+    await store.upsert((manager as any).containerInfoToWorkerRecord(current));
+    await useWorkerConfigStore().replace(info.userId, info.id, [{ kind: 'variable', key: 'LOCAL_SETTING', value: 'new-local' }]);
+    const desiredEnvironment = (manager as any).resolveEnvironmentConfig;
+    (manager as any).resolveEnvironmentConfig = () => { throw new Error('Restart must not resolve pending environment'); };
+    await manager.restart(info.id);
+    const applied = await runtime.client.exec(name!, ['bash', '-ec',
+      'source /run/agentor/worker.env; test "$ACCOUNT_SETTING" = old-account; test "$(printf %s "$WORKER_LOCAL_ENV" | base64 -d | jq -r \'.[] | select(.key == "LOCAL_SETTING") | .value\')" = old-local; test "$(jq -r .initScript <<< "$WORKER")" = ": # original-init"']);
+    expect(applied.returnCode, applied.stderr).toBe(0);
+    expect(manager.get(info.id)?.pendingRebuild).toBe(true);
+    expect((await useWorkerConfigStore().resolveValues(info.userId, info.id))[0]!.value).toBe('new-local');
+    (manager as any).resolveEnvironmentConfig = desiredEnvironment;
     await manager.stop(info.id);
     expect((await runtime.client.getInstanceState(name!)).status).toBe("Stopped");
     const opts = await (manager as any).incusOptionsForWorker(info, true);
