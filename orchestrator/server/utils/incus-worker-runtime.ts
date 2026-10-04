@@ -54,10 +54,60 @@ export class IncusWorkerRuntime {
     await (await this.storage()).remove(owner);
   }
 
-  async matchesWorkerIdentity(instance: IncusInstance, workerId: string): Promise<boolean> {
+  async matchesWorkerIdentity(instance: IncusInstance, workerId: string, userId?: string): Promise<boolean> {
     return instance.type === "virtual-machine" && instance.config["user.agentor.id"] === workerId &&
       instance.name === `${this.config.containerPrefix}-${workerId}` &&
-      instance.config["user.agentor.installation"] === await this.installationId();
+      instance.config["user.agentor.installation"] === await this.installationId() &&
+      (!userId || instance.config["user.agentor.owner"] === userId);
+  }
+
+  /** Telemetry is diagnostic only. It never supplies routing/worker identity. */
+  async inspectState(owner: IncusStorageOwner, incarnation: string) {
+    const check = async () => {
+      const instance = await this.assertOwned(owner.containerName, owner.id);
+      if (instance.config['user.agentor.owner'] !== owner.userId || !incarnation ||
+          instance.config['volatile.uuid'] !== incarnation)
+        throw new Error('Incus observation target ownership or incarnation changed');
+      return instance;
+    };
+    const instance = await check();
+    const state = await this.client.getInstanceState(owner.containerName);
+    await check();
+    const limit = (instance.expanded_config ?? instance.config)['limits.cpu'] ?? '1';
+    const nic = (instance.expanded_devices ?? instance.devices).eth0;
+    return { state, cpuCount: /^[1-9][0-9]*$/.test(limit) ? Number(limit) : 0,
+      primaryMac: nic?.hwaddr ?? instance.config['volatile.eth0.hwaddr'] };
+  }
+
+  /** Read the journal without requiring provisioned /run config. This remains
+   * available to diagnose a running guest whose worker service is unhealthy. */
+  async openJournal(owner: IncusStorageOwner, incarnation: string, validateRecord: () => void,
+    options: { tail?: number; follow?: boolean; sinceNow?: boolean; signal?: AbortSignal } = {}) {
+    return withOwnerWorkerRuntimeSetup(owner.userId, owner.id, async () => {
+      const validate = async () => {
+        validateRecord();
+        const instance = await this.assertOwned(owner.containerName, owner.id);
+        validateRecord();
+        if (instance.config['user.agentor.owner'] !== owner.userId || !incarnation || instance.config['volatile.uuid'] !== incarnation)
+          throw new Error('Incus journal target ownership or incarnation changed');
+        if (instance.status !== 'Running') throw new Error('Incus guest journal requires a running VM');
+      };
+      await validate();
+      const command = ['journalctl', '--boot', '--no-pager', '--output=short-iso-precise',
+        '_SYSTEMD_UNIT=agentor-worker.service', '+', 'SYSLOG_IDENTIFIER=agentor-app',
+        '--lines=' + Math.min(10_000, Math.max(1, Math.trunc(options.tail ?? 200)))];
+      if (options.follow) command.push('--follow');
+      if (options.sinceNow) command.push('--since=now');
+      const session = await this.client.execStream(owner.containerName, command, {
+        command: [], user: 0, group: 0, signal: options.signal,
+        timeoutMs: options.follow ? 24 * 60 * 60_000 : 10_000,
+      });
+      try {
+        await validate(); session.stdin.end();
+        return Object.assign(session, { isCurrent: () => { try { validateRecord(); return true; } catch { return false; } } });
+      }
+      catch (error) { session.close(); throw error; }
+    });
   }
 
   async resolvePrimaryAddress(owner: IncusStorageOwner): Promise<{ address: string; incarnation: string }> {
@@ -210,6 +260,8 @@ export class IncusWorkerRuntime {
     await this.assertReady();
     const name = opts.containerName;
     const instance = await this.assertOwned(name, opts.id);
+    if (instance.config['user.agentor.owner'] !== opts.userId)
+      throw new Error('Incus worker account identity does not match');
     const state = await this.client.getInstanceState(name);
     const account = await this.accountDevices(opts);
     for (const [key, expected] of Object.entries(account)) {

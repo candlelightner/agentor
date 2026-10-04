@@ -6,7 +6,8 @@ import { join } from "node:path";
 // Live runtime acceptance still exercises real control-plane metadata cleanup.
 // Scope its service singletons before worker modules are imported; never use a
 // developer's /data merely because no installation stack is running.
-if ((process.env.INCUS_LIVE_TEST === "true" || process.env.INCUS_COMMAND_TEST === "true") && !process.env.DATA_DIR) {
+if ((process.env.INCUS_LIVE_TEST === "true" || process.env.INCUS_COMMAND_TEST === "true" ||
+    process.env.INCUS_OBSERVABILITY_TEST === "true") && !process.env.DATA_DIR) {
   const fixtureData = mkdtempSync(join(tmpdir(), "agentor-incus-acceptance-"));
   process.env.DATA_DIR = fixtureData;
   process.once("exit", () => rmSync(fixtureData, { recursive: true, force: true }));
@@ -44,6 +45,7 @@ export default defineConfig({
     "api/incus-worker-experience.spec.ts",
     "api/incus-derived-image.spec.ts",
     "api/incus-worker-runtime.spec.ts",
+    "api/incus-worker-observability.spec.ts",
     "api/incus-worker-network.spec.ts",
     "api/incus-traefik-routing.spec.ts",
     "api/incus-guest-network.spec.ts",

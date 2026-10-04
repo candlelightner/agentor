@@ -7,6 +7,8 @@ import type { LogLevel, LogSource, LogEntry } from '../../shared/types';
 import { shouldLog } from './log-levels';
 import { useContainerManager } from './services';
 import { withOperationDeadline } from './operation-deadline';
+import { StringDecoder } from 'node:string_decoder';
+import type { ContainerManager } from './container';
 
 const LOG_DOCKER_TIMEOUT_MS = 8_000;
 
@@ -31,8 +33,10 @@ export class LogCollector {
   private broadcaster: LogBroadcaster;
   private config: Config;
   private attached: Map<string, AttachedStream> = new Map();
+  private pendingIncus = new Map<string, AbortController>();
 
-  constructor(config: Config, logStore: LogStore, broadcaster: LogBroadcaster) {
+  constructor(config: Config, logStore: LogStore, broadcaster: LogBroadcaster,
+    private getContainers: () => ContainerManager = useContainerManager) {
     this.docker = new Docker({ socketPath: '/var/run/docker.sock' });
     this.logStore = logStore;
     this.broadcaster = broadcaster;
@@ -73,7 +77,7 @@ export class LogCollector {
         'Docker log-collector inventory',
       );
     } catch {
-      return;
+      containers = [];
     }
 
     for (const info of containers) {
@@ -90,9 +94,13 @@ export class LogCollector {
       // already populated by the time this runs, so re-attached worker logs
       // keep their `sourceName` after an orchestrator restart.
       const displayName = source === 'worker'
-        ? useContainerManager().findByContainerName(name)?.displayName
+        ? this.getContainers().findByContainerName(name)?.displayName
         : undefined;
       await this.attach(name, info.Id, source, displayName, { sinceNow: true });
+    }
+    for (const worker of this.getContainers().list()) {
+      if (worker.runtimeKind === 'incus-vm' && worker.status === 'running')
+        await this.attach(worker.containerName, worker.containerId, 'worker', worker.displayName, { sinceNow: true });
     }
   }
 
@@ -104,6 +112,10 @@ export class LogCollector {
     options: AttachOptions = {},
   ): Promise<void> {
     if (this.attached.has(containerId)) return;
+    if (source === 'worker' && containerId.startsWith('incus:')) {
+      await this.attachIncus(containerName, containerId, displayName, options);
+      return;
+    }
 
     try {
       const container = this.docker.getContainer(containerId);
@@ -200,9 +212,9 @@ export class LogCollector {
       });
       (stream as NodeJS.ReadableStream).once('error', (error) => {
         if (source === 'worker') {
-          const worker = useContainerManager().findByContainerName(containerName);
+          const worker = this.getContainers().findByContainerName(containerName);
           if (worker)
-            useContainerManager().reportRuntimeFailure(
+            this.getContainers().reportRuntimeFailure(
               worker.id,
               'Docker worker log stream',
               error,
@@ -213,9 +225,9 @@ export class LogCollector {
       });
     } catch (error) {
       if (source === 'worker') {
-        const worker = useContainerManager().findByContainerName(containerName);
+        const worker = this.getContainers().findByContainerName(containerName);
         if (worker)
-          useContainerManager().reportRuntimeFailure(
+          this.getContainers().reportRuntimeFailure(
             worker.id,
             'Docker worker log attachment',
             error,
@@ -225,7 +237,57 @@ export class LogCollector {
     }
   }
 
+  /** Idempotent retry on the existing periodic worker reconciliation. Avoid
+   * replaying old journal lines after a transient failure or guest reboot. */
+  async reconcileIncus(): Promise<void> {
+    for (const worker of this.getContainers().list()) {
+      if (worker.runtimeKind === 'incus-vm' && worker.status === 'running')
+        await this.attach(worker.containerName, worker.containerId, 'worker', worker.displayName, { sinceNow: true });
+    }
+  }
+
+  private async attachIncus(containerName: string, containerId: string, displayName: string | undefined, options: AttachOptions): Promise<void> {
+    if (this.pendingIncus.has(containerId)) return;
+    const controller = new AbortController();
+    this.pendingIncus.set(containerId, controller);
+    try {
+      const manager = this.getContainers(), worker = manager.findByContainerName(containerName);
+      if (!worker || worker.runtimeKind !== 'incus-vm' || worker.containerId !== containerId) return;
+      const ownerId = worker.userId;
+      const session = await manager.openWorkerJournal(worker.id, { follow: true, sinceNow: options.sinceNow, signal: controller.signal });
+      if (controller.signal.aborted || manager.get(worker.id)?.containerId !== containerId) { session.close(); return; }
+      const attached: AttachedStream = { stream: session.stdout, source: 'worker', containerName, displayName,
+        destroy: () => { controller.abort(); session.close(); } };
+      this.attached.set(containerId, attached);
+      const finish = () => { if (this.attached.get(containerId) === attached) this.detach(containerId); };
+      const decoder = new StringDecoder('utf8');
+      let buffer = '';
+      session.stdout.on('data', (chunk: Buffer) => {
+        const current = manager.get(worker.id);
+        if (!session.isCurrent() || current?.runtimeKind !== 'incus-vm' || current.containerId !== containerId || current.userId !== ownerId) { finish(); return; }
+        buffer += decoder.write(chunk);
+        const lines = buffer.split(/\r?\n/);
+        buffer = (lines.pop() || '').slice(-64 * 1024);
+        for (const line of lines) {
+          const entry = this.parseLine(line.slice(0, 64 * 1024), 'worker', containerName, displayName);
+          if (!entry || !shouldLog(entry.level, this.config.logLevel)) continue;
+          this.logStore.append(entry, 'containers'); this.broadcaster.broadcast(entry);
+        }
+      });
+      session.stderr.on('error', finish); session.stderr.resume();
+      session.stdout.once('error', finish); session.stdout.once('end', finish); session.stdout.once('close', finish);
+      void session.result.then(finish, finish);
+    } catch {
+      // A journal failure is telemetry failure, never a lifecycle failure.
+      // Normal reconciliation can retry attachment on a subsequent pass.
+    } finally {
+      if (this.pendingIncus.get(containerId) === controller) this.pendingIncus.delete(containerId);
+    }
+  }
+
   detach(containerId: string): void {
+    this.pendingIncus.get(containerId)?.abort();
+    this.pendingIncus.delete(containerId);
     const attached = this.attached.get(containerId);
     if (attached) {
       attached.destroy();
@@ -234,6 +296,8 @@ export class LogCollector {
   }
 
   detachAll(): void {
+    for (const controller of this.pendingIncus.values()) controller.abort();
+    this.pendingIncus.clear();
     for (const [id] of this.attached) {
       this.detach(id);
     }
@@ -247,15 +311,11 @@ export class LogCollector {
     // Trim a trailing \r defensively in case any caller bypassed the splitter.
     const clean = line.endsWith('\r') ? line.slice(0, -1) : line;
 
-    const tsMatch = clean.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z?)\s+(.*)$/);
+    const tsMatch = clean.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+(?:Z|[+-]\d{2}:?\d{2})?)\s+(.*)$/);
     if (tsMatch) {
-      timestamp = tsMatch[1]!;
-      // Normalize to ISO with millisecond precision.
-      if (timestamp.length > 24) {
-        timestamp = timestamp.slice(0, 23) + 'Z';
-      } else if (!timestamp.endsWith('Z')) {
-        timestamp = timestamp + 'Z';
-      }
+      const raw = tsMatch[1]!;
+      const parsed = new Date(/(?:Z|[+-]\d{2}:?\d{2})$/.test(raw) ? raw : raw + 'Z');
+      timestamp = Number.isFinite(parsed.getTime()) ? parsed.toISOString() : new Date().toISOString();
       message = tsMatch[2]!;
     } else {
       timestamp = new Date().toISOString();

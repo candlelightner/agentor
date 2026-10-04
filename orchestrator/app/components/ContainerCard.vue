@@ -142,7 +142,7 @@ function onHScrollWheel(e: WheelEvent) {
       <span
         class="flex items-center gap-1 flex-shrink-0 whitespace-nowrap"
         :class="metricColor(metric.cpuUtilization)"
-        :title="`CPU ${metric.cpuUtilization.toFixed(1)}% of host`"
+        :title="`CPU ${metric.cpuUtilization.toFixed(1)}% of ${metric.cpuCapacity === 'worker' ? 'worker' : 'host'}`"
       >
         <UIcon name="i-lucide-cpu" class="size-3" />{{ Math.round(metric.cpuUtilization) }}%
       </span>

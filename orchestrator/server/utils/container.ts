@@ -1059,7 +1059,7 @@ export class ContainerManager {
       if (!id) continue;
       const worker = id ? this.workerStore?.findById(id) : undefined;
       if (!worker || worker.runtimeKind !== "incus-vm" ||
-          !await this.incusRuntime.matchesWorkerIdentity(instance, worker.id)) continue;
+          !await this.incusRuntime.matchesWorkerIdentity(instance, worker.id, worker.userId)) continue;
       if (worker.status !== "active" || worker.deletionPending) continue;
       if (busyAtStart.has(id) || workerLifecycleGeneration(id) > lifecycleSequenceAtStart || isWorkerLifecycleMutationActive(id)) {
         const current = concurrent.get(id);
@@ -1252,7 +1252,7 @@ export class ContainerManager {
       if (candidates.length !== 1) return null;
       const instance = candidates[0]!;
       const record = records.find((worker) => worker.id === instance.config["user.agentor.id"]);
-      if (!record || !await this.incusRuntime.matchesWorkerIdentity(instance, record.id) ||
+      if (!record || !await this.incusRuntime.matchesWorkerIdentity(instance, record.id, record.userId) ||
           instance.config["user.agentor.owner"] !== record.userId) return null;
       if (await this.resolveWorkerHost(record.id) !== address) return null;
       return this.get(record.id) ?? null;
@@ -1626,7 +1626,7 @@ export class ContainerManager {
     }
 
     // Attach log collector to the new container
-    if (runtimeKind === "legacy-docker") useLogCollector()
+    useLogCollector()
       .attach(containerName, containerInfo.containerId, "worker", displayName)
       .catch(() => {});
 
@@ -2535,6 +2535,7 @@ for p in sys.argv[1:]:
         info.status = "running";
         info.updatedAt = new Date().toISOString();
         info.runtimeDiagnostic = undefined;
+        useLogCollector().attach(info.containerName, info.containerId, 'worker', info.displayName).catch(() => {});
       } catch (error) {
         this.markRuntimeUnknown(info, "Incus worker start", error);
         throw error;
@@ -5458,12 +5459,67 @@ for p in sys.argv[1:]:
   async logs(id: string, tail?: number): Promise<string> {
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
+    if (info.runtimeKind === 'incus-vm') {
+      const session = await this.openWorkerJournal(id, { tail });
+      session.stderr.resume();
+      try {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        for await (const chunk of session.stdout) {
+          size += chunk.length;
+          if (size > 16 * 1024 * 1024) throw new Error('Worker journal output exceeded its limit');
+          chunks.push(Buffer.from(chunk));
+        }
+        if (await session.result !== 0) throw new Error('Worker journal read failed');
+        if (!session.isCurrent()) throw new Error('Worker journal authority changed; retry');
+        return Buffer.concat(chunks).toString('utf8');
+      } finally { session.close(); }
+    }
     try {
       return await this.dockerService.getLogs(info.containerId, tail);
     } catch (error) {
       this.markRuntimeUnknown(info, "Docker worker log read", error);
       throw error;
     }
+  }
+
+  private incusObservationTarget(id: string) {
+    const info = this.containers.get(id);
+    if (!info || info.runtimeKind !== 'incus-vm') throw new Error('Incus worker not found');
+    const handle = info.containerId, userId = info.userId, generation = workerLifecycleGeneration(id);
+    const validate = () => {
+      const current = this.containers.get(id), record = this.workerStore?.findById(id);
+      if (!record || record.status !== 'active' || record.deletionPending || record.runtimeKind !== 'incus-vm' ||
+          record.userId !== userId || current?.runtimeKind !== 'incus-vm' || current.userId !== userId ||
+          current.containerId !== handle || workerLifecycleGeneration(id) !== generation)
+        throw new Error('Incus observation authority changed; retry');
+    };
+    validate();
+    return { info, validate, incarnation: handle.slice('incus:'.length),
+      owner: { id, userId, containerName: info.containerName } };
+  }
+
+  async incusWorkerMetrics(id: string) {
+    const target = this.incusObservationTarget(id);
+    const result = await this.incusRuntime.inspectState(target.owner, target.incarnation);
+    target.validate();
+    return result;
+  }
+
+  async incusWorkerDiskUsageBytes(id: string): Promise<number> {
+    const info = this.assertRunning(id);
+    if (info.runtimeKind !== 'incus-vm') throw new Error('Incus worker not found');
+    const result = await this.workerCommands(id).execCapture(info.containerId,
+      ['du', '-skc', '/workspace', '/home/agent/.agent-data'], { timeoutMs: 20_000 });
+    if (result.exitCode !== 0) throw new Error('Worker disk sample failed');
+    const total = result.stdout.toString('utf8').trim().split(/\r?\n/).at(-1) ?? '';
+    if (!/^\d+\s+total$/.test(total)) throw new Error('Worker disk sample was invalid');
+    return Number(total.split(/\s+/)[0]) * 1024;
+  }
+
+  openWorkerJournal(id: string, options: Parameters<IncusWorkerRuntime['openJournal']>[3] = {}) {
+    const target = this.incusObservationTarget(id);
+    return this.incusRuntime.openJournal(target.owner, target.incarnation, target.validate, options);
   }
 
   async listTmuxWindows(id: string): Promise<TmuxWindow[]> {

@@ -1,6 +1,6 @@
 import type { DockerService, RawContainerStats } from './docker';
 import type { ContainerManager } from './container';
-import type { WorkerMetrics, WorkerMetricsStatus } from '../../shared/types';
+import type { ContainerInfo, WorkerMetrics, WorkerMetricsStatus } from '../../shared/types';
 import { isWorkerLifecycleMutationActive, workerLifecycleGeneration } from './worker-lifecycle-coordinator';
 
 /** How often per-worker cpu/mem/net is sampled via the Docker stats API. Short
@@ -32,6 +32,9 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 }
 
 interface WorkerSample {
+  incarnation: string;
+  cpu?: number;
+  cpuCount?: number;
   rx: number;
   tx: number;
   blkRead: number;
@@ -40,7 +43,7 @@ interface WorkerSample {
 }
 
 /**
- * Polls per-worker resource metrics entirely through the Docker API — cpu /
+ * Polls per-worker resource metrics through the selected runtime API — cpu /
  * memory / network via `container.stats`, and durable disk via a bounded `du`
  * of `/workspace` plus agent data. This is OS- and
  * runtime-independent (no host `/proc`/`statfs`), so it behaves the same on
@@ -52,7 +55,11 @@ export class ResourceMonitor {
   private workers = new Map<string, WorkerMetrics>();
   private prevWorker = new Map<string, WorkerSample>();
   /** Last-sampled per-worker disk usage (bytes), keyed by container name. */
-  private workerDisk = new Map<string, number>();
+  private workerDisk = new Map<string, { bytes: number; incarnation: string }>();
+  private incarnations = new Map<string, string>();
+  private sampleSequence = 0;
+  private latestStats = new Map<string, number>();
+  private latestDisk = new Map<string, number>();
 
   private pollInterval?: ReturnType<typeof setInterval>;
   private diskInterval?: ReturnType<typeof setInterval>;
@@ -100,13 +107,13 @@ export class ResourceMonitor {
   }
 
   getWorkerMetricsStatus(): WorkerMetricsStatus {
-    return { workers: Array.from(this.workers.values()).map((m) => this.withLatestDisk(m)) };
+    return { workers: Array.from(this.workers.values()).filter((m) => this.currentMetric(m)).map((m) => this.withLatestDisk(m)) };
   }
 
   /** Per-worker metrics for one worker, by its UUID `id`. */
   getWorkerMetric(workerId: string): WorkerMetrics | undefined {
     for (const m of this.workers.values()) {
-      if (m.workerId === workerId) return this.withLatestDisk(m);
+      if (m.workerId === workerId && this.currentMetric(m)) return this.withLatestDisk(m);
     }
     return undefined;
   }
@@ -116,7 +123,23 @@ export class ResourceMonitor {
    * its own cadence. */
   private withLatestDisk(m: WorkerMetrics): WorkerMetrics {
     const disk = this.workerDisk.get(m.containerName);
-    return disk === undefined ? m : { ...m, diskUsedBytes: disk };
+    return disk && disk.incarnation === this.containers.get(m.workerId)?.containerId ? { ...m, diskUsedBytes: disk.bytes } : m;
+  }
+
+  private currentMetric(m: WorkerMetrics): boolean {
+    const current = this.containers.get(m.workerId);
+    return current?.status === 'running' && this.incarnations.get(m.containerName) === current.containerId;
+  }
+
+  private resetIncarnation(c: ContainerInfo): void {
+    if (this.incarnations.get(c.containerName) === c.containerId) return;
+    this.incarnations.set(c.containerName, c.containerId);
+    this.workers.delete(c.containerName); this.prevWorker.delete(c.containerName); this.workerDisk.delete(c.containerName);
+  }
+
+  private diskBytes(c: Pick<ContainerInfo, 'containerName' | 'containerId'>): number {
+    const disk = this.workerDisk.get(c.containerName);
+    return disk && disk.incarnation === c.containerId ? disk.bytes : 0;
   }
 
   /** Force an immediate re-sample (used by the manual refresh endpoint) of
@@ -149,22 +172,30 @@ export class ResourceMonitor {
     for (const name of [...this.prevWorker.keys()]) {
       if (!runningNames.has(name)) this.prevWorker.delete(name);
     }
+    for (const name of [...this.incarnations.keys()]) {
+      if (!runningNames.has(name)) { this.incarnations.delete(name); this.latestStats.delete(name); this.latestDisk.delete(name); }
+    }
 
     await Promise.all(
       running.map(async (c) => {
         if (isWorkerLifecycleMutationActive(c.id)) return;
         const containerId = c.containerId;
+        this.resetIncarnation(c);
+        const sequence = ++this.sampleSequence;
+        this.latestStats.set(c.containerName, sequence);
         const generation = workerLifecycleGeneration(c.id);
         const stale = () => isWorkerLifecycleMutationActive(c.id) || workerLifecycleGeneration(c.id) !== generation ||
-          this.containers.get(c.id)?.containerId !== containerId;
+          this.containers.get(c.id)?.containerId !== containerId || this.containers.get(c.id)?.status !== 'running' ||
+          this.latestStats.get(c.containerName) !== sequence;
         const now = new Date().toISOString();
         try {
-          const stats = await withTimeout(
-            this.docker.getContainerStats(containerId),
-            STATS_TIMEOUT_MS,
-            `stats(${c.containerName})`,
-          );
-          if (!stale()) this.workers.set(c.containerName, this.computeWorkerMetrics(c, stats, now));
+          if (c.runtimeKind === 'incus-vm') {
+            const sample = await withTimeout(this.containers.incusWorkerMetrics(c.id), STATS_TIMEOUT_MS, `stats(${c.containerName})`);
+            if (!stale()) this.workers.set(c.containerName, this.computeIncusMetrics(c, sample, now));
+          } else {
+            const stats = await withTimeout(this.docker.getContainerStats(containerId), STATS_TIMEOUT_MS, `stats(${c.containerName})`);
+            if (!stale()) this.workers.set(c.containerName, this.computeWorkerMetrics(c, stats, now));
+          }
         } catch (err) {
           if (stale()) return;
           // Telemetry failures are not evidence that the worker stopped.
@@ -178,7 +209,7 @@ export class ResourceMonitor {
             memoryUsedBytes: 0,
             memoryLimitBytes: 0,
             memoryUtilization: 0,
-            diskUsedBytes: this.workerDisk.get(c.containerName) ?? 0,
+            diskUsedBytes: this.diskBytes(c),
             netRxBytesPerSec: 0,
             netTxBytesPerSec: 0,
             blkReadBytesPerSec: 0,
@@ -193,7 +224,7 @@ export class ResourceMonitor {
   }
 
   private computeWorkerMetrics(
-    c: { id: string; containerName: string; displayName: string; status: WorkerMetrics['status'] },
+    c: ContainerInfo,
     stats: RawContainerStats,
     now: string,
   ): WorkerMetrics {
@@ -228,23 +259,7 @@ export class ResourceMonitor {
       else if (e.op.toLowerCase() === 'write') blkWrite += e.value;
     }
 
-    const t = Date.now();
-    const prev = this.prevWorker.get(c.containerName);
-    this.prevWorker.set(c.containerName, { rx, tx, blkRead, blkWrite, t });
-
-    let netRxBytesPerSec = 0;
-    let netTxBytesPerSec = 0;
-    let blkReadBytesPerSec = 0;
-    let blkWriteBytesPerSec = 0;
-    if (prev) {
-      const dt = (t - prev.t) / 1000;
-      if (dt > 0) {
-        netRxBytesPerSec = Math.max(0, (rx - prev.rx) / dt);
-        netTxBytesPerSec = Math.max(0, (tx - prev.tx) / dt);
-        blkReadBytesPerSec = Math.max(0, (blkRead - prev.blkRead) / dt);
-        blkWriteBytesPerSec = Math.max(0, (blkWrite - prev.blkWrite) / dt);
-      }
-    }
+    const rates = this.counterRates(c, { rx, tx, blkRead, blkWrite });
 
     return {
       workerId: c.id,
@@ -255,13 +270,46 @@ export class ResourceMonitor {
       memoryUsedBytes,
       memoryLimitBytes,
       memoryUtilization,
-      diskUsedBytes: this.workerDisk.get(c.containerName) ?? 0,
-      netRxBytesPerSec,
-      netTxBytesPerSec,
-      blkReadBytesPerSec,
-      blkWriteBytesPerSec,
+      diskUsedBytes: this.diskBytes(c),
+      ...rates,
       lastChecked: now,
     };
+  }
+
+  private counterRates(c: ContainerInfo, counters: Omit<WorkerSample, 'incarnation' | 't'>) {
+    const t = Date.now(), prev = this.prevWorker.get(c.containerName);
+    this.prevWorker.set(c.containerName, { ...counters, incarnation: c.containerId, t });
+    const dt = prev ? (t - prev.t) / 1000 : 0;
+    // Guest reboot may reset counters without replacing the VM UUID.
+    const valid = prev && dt > 0 && prev.incarnation === c.containerId && prev.cpuCount === counters.cpuCount &&
+      (['rx', 'tx', 'blkRead', 'blkWrite', 'cpu'] as const).every((key) =>
+        counters[key] === undefined || prev[key] !== undefined && counters[key]! >= prev[key]!);
+    const rate = (key: 'rx' | 'tx' | 'blkRead' | 'blkWrite') => valid ? (counters[key] - prev[key]) / dt : 0;
+    return { netRxBytesPerSec: rate('rx'), netTxBytesPerSec: rate('tx'),
+      blkReadBytesPerSec: rate('blkRead'), blkWriteBytesPerSec: rate('blkWrite') };
+  }
+
+  private computeIncusMetrics(c: ContainerInfo, sample: Awaited<ReturnType<ContainerManager['incusWorkerMetrics']>>, now: string): WorkerMetrics {
+    const { state, cpuCount, primaryMac } = sample;
+    const cpu = state.cpu?.usage, memory = state.memory;
+    if (state.status !== 'Running' || state.processes === -1 || !Number.isFinite(cpu) || cpu! < 0 ||
+        !memory || !Number.isFinite(memory.usage) || memory.usage < 0 || !Number.isFinite(memory.total) || memory.total <= 0 ||
+        !Number.isFinite(cpuCount) || cpuCount < 1)
+      throw new Error('Incus guest metrics are unavailable');
+    const interfaces = Object.values(state.network ?? {}).filter((nic) =>
+      !!primaryMac && nic.hwaddr?.toLowerCase() === primaryMac.toLowerCase());
+    if (interfaces.length !== 1 || !interfaces[0]!.counters) throw new Error('Incus primary NIC metrics are unavailable');
+    const { bytes_received: rx, bytes_sent: tx } = interfaces[0]!.counters!;
+    if (![rx, tx].every((n) => Number.isFinite(n) && n >= 0)) throw new Error('Incus NIC counters are invalid');
+    const prev = this.prevWorker.get(c.containerName), dt = prev ? (Date.now() - prev.t) / 1000 : 0;
+    const valid = prev?.incarnation === c.containerId && prev.cpuCount === cpuCount && prev.cpu !== undefined &&
+      cpu! >= prev.cpu && rx >= prev.rx && tx >= prev.tx && dt > 0;
+    const cpuUtilization = valid ? this.clampPct((cpu! - prev.cpu!) / (dt * 1e9 * cpuCount) * 100) : 0;
+    const rates = this.counterRates(c, { cpu, cpuCount, rx, tx, blkRead: 0, blkWrite: 0 });
+    return { workerId: c.id, containerName: c.containerName, displayName: c.displayName, status: c.status,
+      cpuUtilization, cpuCapacity: 'worker', memoryUsedBytes: memory.usage, memoryLimitBytes: memory.total,
+      memoryUtilization: this.clampPct(memory.usage / memory.total * 100), diskUsedBytes: this.diskBytes(c),
+      ...rates, lastChecked: now };
   }
 
   // --- Per-worker disk usage (slow poll) ---
@@ -287,9 +335,18 @@ export class ResourceMonitor {
     }
     await Promise.all(
       running.map(async (c) => {
+        if (isWorkerLifecycleMutationActive(c.id)) return;
+        this.resetIncarnation(c);
+        const containerId = c.containerId, generation = workerLifecycleGeneration(c.id), sequence = ++this.sampleSequence;
+        this.latestDisk.set(c.containerName, sequence);
         try {
-          const bytes = await this.docker.getWorkerDiskUsageBytes(c.containerId);
-          this.workerDisk.set(c.containerName, bytes);
+          const bytes = c.runtimeKind === 'incus-vm' ? await this.containers.incusWorkerDiskUsageBytes(c.id)
+            : await this.docker.getWorkerDiskUsageBytes(containerId);
+          if (!isWorkerLifecycleMutationActive(c.id) && workerLifecycleGeneration(c.id) === generation &&
+              this.containers.get(c.id)?.containerId === containerId && this.containers.get(c.id)?.status === 'running' &&
+              this.latestDisk.get(c.containerName) === sequence &&
+              Number.isFinite(bytes) && bytes >= 0)
+            this.workerDisk.set(c.containerName, { bytes, incarnation: containerId });
         } catch {
           // Keep the last known value on a transient failure.
         }

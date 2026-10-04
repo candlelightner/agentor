@@ -479,8 +479,9 @@ export interface WorkerMetrics {
   containerName: string;
   displayName: string;
   status: ContainerStatus;
-  /** 0-100 — fraction of total host CPU capacity used by this worker. */
+  /** 0-100; legacy workers use total host capacity, VMs allocated vCPU capacity. */
   cpuUtilization: number;
+  cpuCapacity?: 'host' | 'worker';
   memoryUsedBytes: number;
   /** The worker's memory limit (cgroup limit; equals host memory when uncapped). */
   memoryLimitBytes: number;
