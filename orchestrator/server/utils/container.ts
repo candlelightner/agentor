@@ -1436,6 +1436,15 @@ export class ContainerManager {
   ): Promise<ContainerInfo> {
     const userId = request.userId ?? "";
     if (!userId) throw new Error("create: userId is required");
+    const id = randomUUID();
+    // The owner fence alone is invisible to inventory's per-worker generation
+    // checks. Fence the new UUID before publishing provisional state so a slow
+    // boot cannot leave a detached/stale map projection after creation returns.
+    return withWorkerLifecycleMutation(id, () => this.createFenced(request, id));
+  }
+
+  private async createFenced(request: CreateContainerRequest, id: string): Promise<ContainerInfo> {
+    const userId = request.userId!;
 
     const envConfig = this.resolveEnvironmentConfig(request.environmentId);
 
@@ -1443,7 +1452,6 @@ export class ContainerManager {
     // the free-form, editable `displayName` (defaulted to a friendly slug when
     // the user provides none). The Docker container is described by the separate
     // `containerId` (assigned by Docker) and `containerName` (`<prefix>-<id>`).
-    const id = randomUUID();
     const displayName =
       request.displayName?.trim() || this.suggestDisplayName(userId);
     const containerName = this.buildContainerName(id);

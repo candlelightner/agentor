@@ -549,6 +549,45 @@ test('initial Incus create captures operation/UUID before start and merges pendi
   });
 });
 
+test('initial Incus creation fences concurrent inventory during boot and after a delayed response', async () => {
+  for (const delayedInventory of [false, true]) await initialCreationFixture(async (manager, store, _calls, state) => {
+    const runtime = (manager as any).incusRuntime;
+    (manager as any).config.incusEndpoint = 'https://incus.invalid';
+    (manager as any).dockerService = { listContainers: async () => [] };
+    let releaseBoot!: () => void, bootEntered!: () => void;
+    const boot = new Promise<void>((resolve) => { releaseBoot = resolve; });
+    const entered = new Promise<void>((resolve) => { bootEntered = resolve; });
+    const start = runtime.start;
+    runtime.start = async (...args: any[]) => { await start(...args); bootEntered(); await boot; };
+    let releaseInventory!: () => void, inventoryEntered!: () => void;
+    const inventory = new Promise<void>((resolve) => { releaseInventory = resolve; });
+    const listed = new Promise<void>((resolve) => { inventoryEntered = resolve; });
+    runtime.client = { listInstances: async () => {
+      // Capture the still-provisional record before completion clears its marker.
+      const options = state.options;
+      const instance = { name: options.containerName, status: 'Running', config: {
+        'user.agentor.id': options.id, 'volatile.uuid': 'initial-uuid',
+      } };
+      inventoryEntered();
+      if (delayedInventory) await inventory;
+      return [instance];
+    } };
+    const creating = manager.create({ userId: state.owner, displayName: 'concurrent inventory' });
+    await entered;
+    const refreshing = manager.sync(); await listed;
+    if (!delayedInventory) await refreshing;
+    releaseBoot();
+    const created = await creating;
+    if (delayedInventory) { releaseInventory(); await refreshing; }
+    expect(created.status).toBe('running');
+    expect(manager.get(created.id)).toBe(created);
+    expect(manager.get(created.id)?.status).toBe('running');
+    expect(store.get(created.userId, created.id)?.incusRecreation).toBeUndefined();
+    expect(store.get(created.userId, created.id)?.desiredRuntimeStatus).toBe('running');
+    expect((manager as any).assertRunning(created.id)).toBe(created);
+  });
+});
+
 test('initial Incus lost/conflict response or unproven identity retains marker, compute and persistence', async () => {
   for (const failure of ['conflict', 'lost-response', 'nonce', 'uuid', 'owner']) {
     await initialCreationFixture(async (manager, store, calls, state) => {
@@ -827,7 +866,7 @@ test('real production-manager archive retains canonical volumes, source and pend
     }
     if (process.env.INCUS_REBOOT_TEST === 'true') {
       const incarnation = info.containerId.slice(6);
-      const original = await runtime.inspectGuestReadiness(info, incarnation);
+      let original = await runtime.inspectGuestReadiness(info, incarnation);
       expect(original.provisioned && original.serviceReady).toBe(true);
       const servicePid = await runtime.client.exec(info.containerName, ['systemctl', 'show', '--property=MainPID', '--value', 'agentor-worker.service']);
       const reloadedStore = new WorkerStore(root); await reloadedStore.init();
@@ -844,6 +883,20 @@ test('real production-manager archive retains canonical volumes, source and pend
       info.pendingRebuild = true; info.initScript = 'touch /workspace/unapplied-init';
       await store.upsert((manager as any).containerInfoToWorkerRecord(info));
       await useWorkerConfigStore().replace(info.userId, info.id, [{ kind: 'secret', key: 'BOOT_SECRET', value: 'unapplied' }]);
+      // Simulate an out-of-band VM stop, not an Agentor user stop: durable
+      // running intent must survive and recover the applied, not pending,
+      // configuration on the same captured instance.
+      const stoppedBootId = original.bootId;
+      await runtime.stop(info, incarnation);
+      expect(store.get(info.userId, info.id)?.desiredRuntimeStatus).toBe('running');
+      expect((await runtime.client.getInstanceState(info.containerName)).status).toBe('Stopped');
+      await manager.reconcileIncusWorkers();
+      expect(info).toMatchObject({ status: 'running', pendingRebuild: true, containerId: `incus:${incarnation}` });
+      original = await runtime.inspectGuestReadiness(info, incarnation);
+      expect(original.provisioned && original.serviceReady).toBe(true);
+      expect(original.bootId).not.toBe(stoppedBootId);
+      expect((await runtime.client.exec(info.containerName, ['bash', '-ec',
+        'source /run/agentor/worker.env; test "$(printf %s "$WORKER_LOCAL_ENV" | base64 -d | jq -r \'.[] | select(.key == "BOOT_SECRET") | .value\')" = applied; test ! -e /workspace/unapplied-init'])).returnCode).toBe(0);
       await runtime.client.exec(info.containerName, ['sh', '-c', 'nohup sh -c "sleep 1; reboot" >/dev/null 2>&1 &']);
       let rebootId = '';
       await expect.poll(async () => {
