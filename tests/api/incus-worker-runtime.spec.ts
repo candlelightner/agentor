@@ -17,6 +17,8 @@ import { useWorkerConfigStore } from '../../orchestrator/server/utils/worker-con
 import { incusImageIdentity, sameIncusImageSource, validateIncusImageIdentity } from '../../orchestrator/server/utils/incus-worker-image';
 import { IncusWorkerStorage } from '../../orchestrator/server/utils/incus-worker-storage';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
+import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volume-store';
+import { IncusManagedVolumeRuntime } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 (globalThis as any).useLogCollector ??= () => ({ attach: async () => {}, detach() {} });
@@ -47,6 +49,27 @@ function options(): IncusWorkerOptions {
     workerJson: { id: "test-worker", displayName: "Incus test", repos: [], initScript: "", gitName: "", gitEmail: "" },
   };
 }
+
+test('declared managed disks require guest mountpoints before configuration or worker service startup', async () => {
+  const fake = fakeClient(), runtime = new IncusWorkerRuntime(config, fake.client as any);
+  const store = new ManagedVolumeStore(config.dataDir); await store.init();
+  const opts = options();
+  const v = await store.create(opts.userId, opts.id, '/opt/required-data', undefined, 'incus-vm');
+  v.seeded = true;
+  await fake.client.createCustomVolume(config.incusStoragePool, { name: v.dockerName, content_type: 'filesystem', config: {
+    'user.agentor.installation': await backupInstallationId(config.dataDir), 'user.agentor.owner': v.userId,
+    'user.agentor.id': v.workerId, 'user.agentor.volume-id': v.id, 'user.agentor.target': v.target } });
+  const managed = new IncusManagedVolumeRuntime(config, runtime);
+  const instance = await runtime.create({ ...opts, start: false, managedVolumes: [v] });
+  expect(instance.devices[managed.deviceKey(v)]).toEqual(managed.device(v));
+  fake.events.length = 0;
+  const exec = fake.client.exec;
+  fake.client.exec = async (...args: any[]) => args[1].includes(v.target)
+    ? { returnCode: 1, stdout: '', stderr: 'not mounted' } : exec(...args);
+  await expect(runtime.start({ ...opts, managedVolumes: [v] })).rejects.toThrow('bootstrap command failed');
+  expect(fake.events.some(event => event.operation === 'file')).toBe(false);
+  expect(fake.events.some(event => event.operation === 'exec' && event.args[1]?.includes('start'))).toBe(false);
+});
 
 function fakeClient() {
   const events: Array<{ operation: string; args: any[] }> = [];

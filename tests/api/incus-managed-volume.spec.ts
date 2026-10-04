@@ -4,9 +4,19 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker-runtime';
+import { IncusManagedVolumeRuntime } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
+import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volume-store';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import { zeroUserEnvVars } from '../../orchestrator/server/utils/user-env-store';
 import type { Config } from '../../orchestrator/server/utils/config';
+import { useConfig, useContainerManager, useWorkerStore } from '../../orchestrator/server/utils/services';
+import { useManagedVolumeManager } from '../../orchestrator/server/utils/managed-volume-manager';
+import { useWorkerConfigStore } from '../../orchestrator/server/utils/worker-config-store';
+
+(globalThis as any).useLogger ??= () => ({ info() {}, error() {}, warn() {}, debug() {} });
+(globalThis as any).useLogCollector ??= () => ({ attach: async () => {}, detach() {} });
+(globalThis as any).reassignWorkerMappings ??= async () => {};
+(globalThis as any).cleanupWorkerMappings ??= async () => {};
 
 test('real retained compute seeds an Incus filesystem staging disk before any disposable-root replacement', async () => {
   test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable managed-storage primitive gate');
@@ -18,23 +28,25 @@ test('real retained compute seeds an Incus filesystem staging disk before any di
     incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase7-bounded', containerPrefix: 'agentor-worker',
     incusInternalGatewayUrl: 'http://10.159.68.1:38000', workerImagePrefix: '', workerImage: 'agentor-worker:latest' } as Config;
   const runtime = new IncusWorkerRuntime(config), client = runtime.client;
-  const id = randomUUID(), volumeId = randomUUID();
+  const id = randomUUID();
   const owner = { id, userId: 'managed-volume-primitive', containerName: `${config.containerPrefix}-${id}` };
   const options = { ...owner, dockerEnabled: false, userEnv: zeroUserEnvVars(owner.userId),
     environmentJson: { networkMode: 'full', allowedDomains: [], dockerEnabled: false, setupScript: '', envVars: '', exposeApis: {} },
     capabilitiesJson: [], instructionsJson: [], workerJson: { id, displayName: 'storage primitive', repos: [], initScript: '', gitName: '', gitEmail: '' } };
   const installation = await backupInstallationId(dataDir);
+  const store = new ManagedVolumeStore(dataDir); await store.init();
+  const source = '/opt/agentor-volume-seed-fixture';
+  const record = await store.create(owner.userId, owner.id, source, undefined, 'incus-vm');
+  const volumeId = record.id;
   const volumeName = `agentor-persist-${volumeId}`;
-  const source = '/opt/agentor-volume-seed-fixture', staging = `/run/agentor-volume-seed/${volumeId}`;
+  const staging = `/run/agentor-volume-seed/${volumeId}`;
+  const managed = new IncusManagedVolumeRuntime(config, runtime);
   let incarnation: string | undefined, volumeCreationAttempted = false, primaryFailure = false;
   const checked = async (command: string[], ...args: string[]) => {
     const result = await client.exec(owner.containerName, [...command, ...args]);
     expect(result.returnCode, result.stderr + result.stdout).toBe(0);
     return result.stdout;
   };
-  const ready = async () => expect.poll(async () => {
-    try { return (await client.exec(owner.containerName, ['true'])).returnCode; } catch { return -1; }
-  }, { timeout: 120_000, intervals: [500, 1000] }).toBe(0);
   try {
     const instance = await runtime.create(options); incarnation = instance.config['volatile.uuid'];
     expect(incarnation).toBeTruthy();
@@ -48,22 +60,21 @@ test('real retained compute seeds an Incus filesystem staging disk before any di
       "os.utime(p/'bytes',ns=(1700000000000000000,1700000000123456789))",
     ].join('\n')], source);
     await checked(['bash', '-ec', 'cp /bin/true "$1/capability-exec"; setcap cap_net_bind_service=ep "$1/capability-exec"; getcap "$1/capability-exec" | grep -q "cap_net_bind_service=ep"', 'source-capability'], source);
-    await runtime.stop(owner, incarnation);
-    // Boot the retained root with /run empty: no worker/dockerd/plugin processes
-    // from the prior boot can write while the guest agent copies its directory.
+    // Production adapter boots retained compute unprovisioned, seeds through
+    // the agent and durably commits data authority before returning stopped.
     volumeCreationAttempted = true;
-    await client.createCustomVolume(config.incusStoragePool, { name: volumeName, content_type: 'filesystem', config: {
-      'user.agentor.installation': installation, 'user.agentor.owner': owner.userId,
-      'user.agentor.id': owner.id, 'user.agentor.volume-id': volumeId, 'user.agentor.target': source,
-    } });
+    await managed.seed(`incus:${incarnation}`, record, async () => {
+      record.seeded = true; await store.save(record);
+    });
+    expect(store.get(owner.userId, volumeId)?.seeded).toBe(true);
     const retained = await client.getInstance(owner.containerName);
     expect(retained.config['volatile.uuid']).toBe(incarnation);
-    await client.updateInstanceDevices(owner.containerName, { ...retained.devices,
-      seed: { type: 'disk', pool: config.incusStoragePool, source: volumeName, path: staging } });
-    await client.startInstance(owner.containerName); await ready();
+    expect(retained.status).toBe('Stopped');
+    await client.startInstance(owner.containerName);
+    await expect.poll(async () => {
+      try { return (await client.exec(owner.containerName, ['true'])).returnCode; } catch { return -1; }
+    }, { timeout: 120_000, intervals: [500, 1000] }).toBe(0);
     await checked(['bash', '-ec', 'test ! -e /run/agentor/provisioned; ! systemctl is-active --quiet agentor-worker; ! systemctl is-active --quiet docker; mountpoint -q "$1"', 'seed-preflight'], staging);
-    await checked(['bash', '-ec',
-      'set -o pipefail; tar --format=pax --xattrs --xattrs-include="*" --acls --numeric-owner -cpf - -C "$1" . | tar --xattrs --xattrs-include="*" --acls --numeric-owner -xpf - -C "$2"; sync -f "$2"', 'seed-copy'], source, staging);
     const verify = [
       'import os,pathlib,sys,struct', 'p=pathlib.Path(sys.argv[1]); a=p/"bytes"; b=p/"hardlink"',
       'assert a.read_bytes()==bytes([0,255,10,13,128])', 'assert os.stat(a).st_ino==os.stat(b).st_ino',
@@ -81,7 +92,7 @@ test('real retained compute seeds an Incus filesystem staging disk before any di
     const beforeDeclaration = await client.getInstance(owner.containerName);
     expect(beforeDeclaration.config['volatile.uuid']).toBe(incarnation);
     await client.updateInstanceDevices(owner.containerName, { ...beforeDeclaration.devices,
-      seed: { type: 'disk', pool: config.incusStoragePool, source: volumeName, path: source } });
+      [managed.deviceKey(record)]: managed.device(record) });
     await runtime.start(options, incarnation);
     await checked(['bash', '-ec', 'mountpoint -q "$1"; systemctl is-active --quiet agentor-worker', 'declared-volume'], source);
     await checked(['python3', '-c', verify], source);
@@ -111,5 +122,175 @@ test('real retained compute seeds an Incus filesystem staging disk before any di
     if (!failures.length) await rm(dataDir, { recursive: true, force: true });
     else { console.error('Preserving exact failed storage fixture', owner.containerName, volumeName, dataDir, failures);
       if (!primaryFailure) throw new Error('Managed storage primitive cleanup failed'); }
+  }
+});
+
+async function productionManagerFixture() {
+  const config = useConfig();
+  Object.assign(config, { incusEnabled: true, incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor',
+    incusClientCertPath: '/workspace/agentor-incus-tls/client.crt', incusClientKeyPath: '/workspace/agentor-incus-tls/client.key',
+    incusServerCertPath: '/workspace/agentor-incus-tls/server.crt', incusNetwork: 'incusbr0', incusStoragePool: 'default',
+    incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase7-bounded', containerPrefix: 'agentor-worker',
+    incusInternalGatewayUrl: 'http://10.159.68.1:38000', workerImagePrefix: '', workerImage: 'agentor-worker:latest' });
+  const manager = useContainerManager(), store = useWorkerStore(), volumes = useManagedVolumeManager();
+  await store.init(); await volumes.init();
+  const runtime = new IncusWorkerRuntime(config);
+  manager.setWorkerStore(store); manager.setIncusRuntime(runtime);
+  (manager as any).dockerService = new Proxy({}, { get: () => () => { throw new Error('Docker fallback must not occur'); } });
+  (volumes.runtime as any).docker = new Proxy({}, { get: () => () => { throw new Error('Docker storage must not be called'); } });
+  (manager as any).assertOwnerExists = async () => {};
+  (manager as any).resolveGitIdentity = async () => ({ gitName: '', gitEmail: '' });
+  (manager as any).resolveAuthorizedHostMounts = async () => undefined;
+  (manager as any).resolveHardwareDeviceAccess = async () => undefined;
+  (manager as any).resolveUserEnvAndBinds = async () => ({ userEnv: zeroUserEnvVars('managed-live-owner'), credentialBinds: [], groupSecrets: [] });
+  (manager as any).resolveEnvironmentConfig = () => ({ dockerEnabled: false,
+    environmentJson: { networkMode: 'full', allowedDomains: [], dockerEnabled: false, setupScript: '', envVars: '', exposeApis: {} },
+    capabilitiesJson: [], instructionsJson: [] });
+  return { config, manager, store, volumes, runtime };
+}
+
+test('real production manager applies Incus persistence without promoting pending configuration and retains detached data', async () => {
+  test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable managed-storage integration gate');
+  test.setTimeout(900_000);
+  const { config, manager, store, volumes, runtime } = await productionManagerFixture();
+  let info: any, volumeId: string | undefined, failed = false;
+  const target = '/opt/managed-integration';
+  const check = async (script: string) => {
+    const result = await runtime.client.exec(info.containerName, ['bash', '-ec', script, 'managed-check', target]);
+    expect(result.returnCode, result.stdout + result.stderr).toBe(0);
+  };
+  const ready = async () => {
+    await expect.poll(async () => {
+      const volume = volumes.store.get(info.userId, volumeId!)!;
+      if (volume.state === 'failed') throw new Error(volume.operation?.error || 'Managed persistence failed');
+      return volume.operation?.stage;
+    }, { timeout: 300_000, intervals: [500, 1000] }).toBe('complete');
+    info = manager.get(info.id)!;
+  };
+  try {
+    info = await (manager as any).createForOwner({ userId: 'managed-live-owner', displayName: 'managed integration',
+      workerConfiguration: { secrets: [{ key: 'MANAGED_BOOT', value: 'applied' }] } });
+    await check('mkdir -p "$1"; echo retained-managed-data > "$1/sentinel"; chown -R 1000:1000 "$1"');
+    const actor = { userId: info.userId, workerId: info.id };
+    const volume = await volumes.add(actor, { target, mode: 'deferred' }); volumeId = volume.id;
+    expect(volumes.store.get(info.userId, volumeId)?.storageRuntimeKind).toBe('incus-vm');
+    info.initScript = 'echo pending-must-not-run > /workspace/managed-pending'; info.pendingRebuild = true;
+    await store.upsert((manager as any).containerInfoToWorkerRecord(info));
+    await useWorkerConfigStore().replace(info.userId, info.id, [{ kind: 'secret', key: 'MANAGED_BOOT', value: 'pending' }]);
+    const original = info.containerId;
+    await volumes.apply(actor, volume.id, 'recreate'); await ready();
+    console.info('Managed-storage production gate: applied with original bootstrap');
+    expect(info.containerId).not.toBe(original); expect(info.pendingRebuild).toBe(true);
+    expect(store.get(info.userId, info.id)?.incusRecreation).toBeUndefined();
+    await check('mountpoint -q "$1"; test "$(cat "$1/sentinel")" = retained-managed-data; test ! -e /workspace/managed-pending; source /run/agentor/worker.env; test "$(printf %s "$WORKER_LOCAL_ENV" | base64 -d | jq -r \'.[] | select(.key == "MANAGED_BOOT") | .value\')" = applied');
+    expect((await useWorkerConfigStore().resolveValues(info.userId, info.id))[0]?.value).toBe('pending');
+    await volumes.detach(actor, volume.id, true, true); await ready();
+    console.info('Managed-storage production gate: detached with retained data');
+    await check('! mountpoint -q "$1"; test ! -e "$1/sentinel"');
+    expect((await runtime.client.getCustomVolume(config.incusStoragePool, volumes.store.get(info.userId, volumeId)!.dockerName)).used_by ?? []).toEqual([]);
+    await volumes.reattach(actor, volume.id, 'recreate'); await ready();
+    console.info('Managed-storage production gate: reattached');
+    await check('mountpoint -q "$1"; test "$(cat "$1/sentinel")" = retained-managed-data');
+    info = await manager.rebuild(info.id);
+    console.info('Managed-storage production gate: rebuilt');
+    await check('mountpoint -q "$1"; test "$(cat "$1/sentinel")" = retained-managed-data; test -e /workspace/managed-pending');
+    expect((await useWorkerConfigStore().resolveAppliedValues(info.userId, info.id))[0]?.value).toBe('pending');
+    await manager.archive(info.id);
+    console.info('Managed-storage production gate: archived');
+    expect((await runtime.client.getCustomVolume(config.incusStoragePool, volumes.store.get(info.userId, volumeId)!.dockerName)).used_by ?? []).toEqual([]);
+    info = await manager.unarchive(info.userId, info.id);
+    console.info('Managed-storage production gate: unarchived');
+    await check('mountpoint -q "$1"; test "$(cat "$1/sentinel")" = retained-managed-data');
+    await manager.remove(info.id);
+    expect(volumes.store.get(info.userId, volumeId)).toMatchObject({ attached: false, seeded: true, state: 'detached' });
+    expect(await runtime.client.getCustomVolume(config.incusStoragePool, volumes.store.get(info.userId, volumeId)!.dockerName)).toBeTruthy();
+    await volumes.delete(actor, volume.id, true);
+    expect(volumes.store.get(info.userId, volumeId)).toBeUndefined();
+  } catch (error) { failed = true; throw error; }
+  finally {
+    if (info) {
+      try {
+        const current = await runtime.client.getInstance(info.containerName).catch(error => {
+          if (error.statusCode !== 404) throw error;
+        });
+        if (current) {
+          expect(await runtime.matchesWorkerIdentity(current, info.id, info.userId)).toBe(true);
+          await runtime.remove(info, current.config['volatile.uuid']);
+        }
+        if (volumeId) {
+          const record = volumes.store.get(info.userId, volumeId);
+          if (record) {
+            await volumes.incusRuntime.delete(record);
+            await volumes.store.forget(record.userId, record.id);
+          }
+        }
+        await runtime.removeStorage(info);
+        if (store.get(info.userId, info.id)) await store.delete(info.userId, info.id);
+      } catch (error) {
+        console.error('Preserving failed managed integration fixture', info.containerName, volumeId, error);
+        if (!failed) throw error;
+      }
+    }
+  }
+});
+
+test('real deferred Incus path survives restart and guest reboot without applying pending storage or configuration', async () => {
+  test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable deferred-storage reboot gate');
+  test.setTimeout(600_000);
+  const { manager, store, volumes, runtime } = await productionManagerFixture();
+  let info: any, failed = false;
+  try {
+    info = await (manager as any).createForOwner({ userId: 'managed-live-owner', displayName: 'deferred reboot integration',
+      workerConfiguration: { secrets: [{ key: 'DEFERRED_BOOT', value: 'applied' }] } });
+    const actor = { userId: info.userId, workerId: info.id };
+    const source = '/opt/deferred-integration';
+    expect((await runtime.client.exec(info.containerName, ['bash', '-ec',
+      'mkdir -p "$1"; echo source-retained > "$1/sentinel"', 'deferred-source', source])).returnCode).toBe(0);
+    const volume = await volumes.add(actor, { target: source, mode: 'deferred' });
+    const originalHandle = info.containerId, incarnation = originalHandle.slice(6);
+    info.initScript = 'echo pending-init > /workspace/deferred-must-not-run'; info.pendingRebuild = true;
+    await store.upsert((manager as any).containerInfoToWorkerRecord(info));
+    await useWorkerConfigStore().replace(info.userId, info.id, [{ kind: 'secret', key: 'DEFERRED_BOOT', value: 'pending' }]);
+    await manager.restart(info.id);
+    expect(info.containerId).toBe(originalHandle);
+    expect(volumes.store.get(info.userId, volume.id)).toMatchObject({ seeded: false, attached: true, state: 'pending' });
+    const boot = await runtime.inspectGuestReadiness(info, incarnation);
+    expect(boot.provisioned && boot.serviceReady).toBe(true);
+    await runtime.client.exec(info.containerName, ['sh', '-c', 'nohup sh -c "sleep 1; reboot" >/dev/null 2>&1 &']);
+    let rebootId = '';
+    await expect.poll(async () => {
+      try {
+        const observed = await runtime.inspectGuestReadiness(info, incarnation);
+        if (observed.bootId !== boot.bootId) { rebootId = observed.bootId; return !observed.provisioned; }
+      } catch { /* guest agent unavailable during reboot */ }
+      return false;
+    }, { timeout: 120_000, intervals: [1000, 2000] }).toBe(true);
+    await manager.reconcileIncusWorkers();
+    expect(await runtime.inspectGuestReadiness(info, incarnation)).toMatchObject({ bootId: rebootId, provisioned: true, serviceReady: true });
+    expect(info).toMatchObject({ containerId: originalHandle, status: 'running', pendingRebuild: true });
+    expect(volumes.store.get(info.userId, volume.id)).toMatchObject({ seeded: false, attached: true, state: 'pending' });
+    await expect(runtime.client.getCustomVolume(useConfig().incusStoragePool, volumes.store.get(info.userId, volume.id)!.dockerName)).rejects.toMatchObject({ statusCode: 404 });
+    const result = await runtime.client.exec(info.containerName, ['bash', '-ec',
+      'test "$(cat "$1/sentinel")" = source-retained; ! mountpoint -q "$1"; test ! -e /workspace/deferred-must-not-run; source /run/agentor/worker.env; test "$(printf %s "$WORKER_LOCAL_ENV" | base64 -d | jq -r \'.[] | select(.key == "DEFERRED_BOOT") | .value\')" = applied', 'deferred-check', source]);
+    expect(result.returnCode, result.stdout + result.stderr).toBe(0);
+    await manager.remove(info.id);
+    await volumes.delete(actor, volume.id, true);
+  } catch (error) { failed = true; throw error; }
+  finally {
+    if (info && store.get(info.userId, info.id)) {
+      try {
+        const instance = await runtime.client.getInstance(info.containerName);
+        expect(await runtime.matchesWorkerIdentity(instance, info.id, info.userId)).toBe(true);
+        await runtime.remove(info, instance.config['volatile.uuid']);
+        await runtime.removeStorage(info);
+        await volumes.workerDeleted(info.userId, info.id);
+        for (const v of volumes.store.forWorker(info.userId, info.id))
+          await volumes.delete({ userId: info.userId, workerId: info.id }, v.id, true);
+        await store.delete(info.userId, info.id);
+      } catch (error) {
+        console.error('Preserving deferred reboot fixture', info.containerName, error);
+        if (!failed) throw error;
+      }
+    }
   }
 });

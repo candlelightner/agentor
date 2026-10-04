@@ -12,11 +12,15 @@ import { IncusWorkerCommands } from "./incus-worker-commands";
 import { withOwnerWorkerRuntimeSetup } from "./worker-lifecycle-coordinator";
 import type { WorkerConfigRevision } from './worker-config-store';
 import { incusImageIdentity, sameIncusImageSource, type IncusWorkerImageIdentity } from './incus-worker-image';
+import { IncusManagedVolumeRuntime } from './incus-managed-volume-runtime';
+import type { StoredManagedVolume } from './managed-volume-store';
 
 export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & {
   sshAuthorizedKeys?: string;
   configurationRevision?: WorkerConfigRevision;
   recreationNonce?: string;
+  /** Authoritative internal records, never accepted from worker/user payloads. */
+  managedVolumes?: StoredManagedVolume[];
 };
 
 function sameDevice(actual: Record<string, string> | undefined, expected: Record<string, string>): boolean {
@@ -246,6 +250,22 @@ export class IncusWorkerRuntime {
     return devices;
   }
 
+  private async managedDevices(opts: IncusWorkerOptions): Promise<Record<string, IncusDevice>> {
+    const runtime = new IncusManagedVolumeRuntime(this.config, this);
+    const devices: Record<string, IncusDevice> = {};
+    for (const v of opts.managedVolumes ?? []) {
+      if (v.userId !== opts.userId || v.workerId !== opts.id || !v.attached || !v.seeded)
+        throw new Error('Incus managed storage requires seeded, attached records for this worker');
+      const key = runtime.deviceKey(v);
+      if (devices[key]) throw new Error('Incus managed device keys collide; no compute was changed');
+      if (Object.values(devices).some(d => d.path === v.target || d.path?.startsWith(v.target + '/') || v.target.startsWith(d.path + '/')))
+        throw new Error('Incus managed targets overlap; no compute was changed');
+      await runtime.ensureVolume(v);
+      devices[key] = runtime.device(v);
+    }
+    return devices;
+  }
+
   private async assertReady(): Promise<void> {
     const c = this.config;
     if (!c.incusEndpoint?.startsWith("https://") || !c.incusClientCertPath ||
@@ -428,6 +448,7 @@ export class IncusWorkerRuntime {
       devices: {
         ...persistent,
         ...account,
+        ...await this.managedDevices(opts),
         root: { type: "disk", path: "/", pool: this.config.incusStoragePool },
         eth0: { type: "nic", name: "eth0", network: this.config.incusNetwork,
           "security.mac_filtering": "true", "security.ipv4_filtering": "true", "security.ipv6_filtering": "true" },
@@ -474,6 +495,11 @@ export class IncusWorkerRuntime {
       throw new Error('Incus worker account identity does not match');
     const state = await this.client.getInstanceState(name);
     const account = await this.accountDevices(opts);
+    const managed = await this.managedDevices(opts);
+    for (const [key, expected] of Object.entries(managed)) {
+      if (!sameDevice(instance.devices[key], expected))
+        throw new Error('Incus managed storage layout is missing or ambiguous; explicit recreation is required');
+    }
     for (const [key, expected] of Object.entries(account)) {
       if (!sameDevice(instance.devices[key], expected))
         throw new Error("Incus account share layout is missing or ambiguous; rebuild required");
@@ -503,6 +529,8 @@ export class IncusWorkerRuntime {
     if (!ready) throw new Error("Incus worker agent did not become ready");
     try {
       await this.checkedExec(name, ["bash", "-ec", 'test "$(cat /usr/lib/agentor/bootstrap-generation)" = 3; mountpoint -q /workspace; mountpoint -q /home/agent/.agent-data']);
+      for (const v of opts.managedVolumes ?? [])
+        await this.checkedExec(name, ['timeout', '15', 'mountpoint', '-q', '--', v.target]);
       await this.checkedExec(name, ["systemctl", "stop", "agentor-worker.service"]);
       if (Object.keys(account).length) {
         for (const device of Object.values(account)) await this.checkedExec(name, ["mountpoint", "-q", device.path!]);

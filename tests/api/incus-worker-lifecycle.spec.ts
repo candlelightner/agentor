@@ -11,6 +11,7 @@ import { useManagedVolumeManager } from '../../orchestrator/server/utils/managed
 import { useWorkerConfigStore } from '../../orchestrator/server/utils/worker-config-store';
 import { workerLifecycleGeneration } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
 import type { Config } from '../../orchestrator/server/utils/config';
+import { usePersistentBackupPathManager } from '../../orchestrator/server/utils/services';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, error() {}, warn() {}, debug() {} });
 (globalThis as any).useLogCollector ??= () => ({ attach: async () => {}, detach() {} });
@@ -62,6 +63,20 @@ test('Incus archive persistence failure retains the captured incarnation for saf
     await manager.archive(info.id);
     expect(calls.filter((call) => call === 'remove-compute')).toHaveLength(2);
     expect(store.get(info.userId, info.id)?.status).toBe('archived');
+  });
+});
+
+test('archived Incus deletion retains managed handles without dispatching legacy Docker path cleanup', async () => {
+  await fixture(async (manager, store, calls, info) => {
+    await manager.archive(info.id);
+    (manager as any).incusRuntime.removeStorage = async () => { calls.push('core-storage-delete'); };
+    const legacy = usePersistentBackupPathManager(), original = legacy.removeWorkerVolumes;
+    legacy.removeWorkerVolumes = async () => { throw new Error('Docker cleanup must not occur for Incus'); };
+    try {
+      await manager.deleteArchived(info.userId, info.id);
+      expect(calls).toContain('core-storage-delete');
+      expect(store.get(info.userId, info.id)).toBeUndefined();
+    } finally { legacy.removeWorkerVolumes = original; }
   });
 });
 
@@ -128,7 +143,7 @@ test('queued archive/unarchive transitions never clobber pending config or reins
   });
 });
 
-test('Incus archive refuses unresolved selected-directory and managed-volume persistence', async () => {
+test('Incus archive refuses unresolved selected-directory and unseeded managed-volume persistence', async () => {
   const manager = new ContainerManager({} as any, { incusEnabled: false } as Config);
   const backup = useBackupManager(), volumes = useManagedVolumeManager();
   const original = { config: backup.getConfig, init: volumes.init, blocked: volumes.isRecoveryBlocked,
@@ -146,7 +161,7 @@ test('Incus archive refuses unresolved selected-directory and managed-volume per
       await expect((manager as any).assertIncusPersistenceReady({ id: 'worker', userId: 'owner' })).rejects.toThrow('selected-directory persistence');
     }
     paths = ['/workspace']; attached = true;
-    await expect((manager as any).assertIncusPersistenceReady({ id: 'worker', userId: 'owner' })).rejects.toThrow('managed persistent storage');
+    await expect((manager as any).assertIncusPersistenceReady({ id: 'worker', userId: 'owner' })).rejects.toThrow('Persistence is pending');
   } finally {
     backup.getConfig = original.config; volumes.init = original.init; volumes.isRecoveryBlocked = original.blocked;
     volumes.recreations.get = original.recreation; volumes.store.forWorker = original.records;
@@ -193,6 +208,20 @@ test('Incus rebuild preflights before original removal and captures replacement 
     expect(calls).toEqual(['persistence-preflight', 'source-preflight', 'preflight', 'remove-original-uuid', 'create', 'start', 'applied', 'plugins']);
     expect(replacement).toMatchObject({ containerId: 'incus:replacement-uuid', status: 'running', pendingRebuild: false });
     expect(store.get(info.userId, info.id)).toMatchObject({ status: 'active', desiredRuntimeStatus: 'running', pendingRebuild: false });
+    expect(store.get(info.userId, info.id)?.incusRecreation).toBeUndefined();
+  });
+});
+
+test('Incus managed-storage application uses applied bootstrap and never promotes pending configuration', async () => {
+  await recreationFixture(async (manager, store, calls, info) => {
+    (manager as any).incusOptionsForWorker = async (_info: any, applied: boolean) => {
+      expect(applied).toBe(true);
+      return { id: info.id, userId: info.userId, containerName: info.containerName };
+    };
+    await manager.applyManagedStorageUnlocked(info.id);
+    expect(calls).not.toContain('applied');
+    expect(manager.get(info.id)).toMatchObject({ status: 'running', pendingRebuild: true });
+    expect(store.get(info.userId, info.id)).toMatchObject({ status: 'active', pendingRebuild: true, desiredRuntimeStatus: 'running' });
     expect(store.get(info.userId, info.id)?.incusRecreation).toBeUndefined();
   });
 });

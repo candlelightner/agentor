@@ -3,17 +3,17 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-// Live runtime acceptance still exercises real control-plane metadata cleanup.
-// Scope its service singletons before worker modules are imported; never use a
-// developer's /data merely because no installation stack is running.
-if ((process.env.INCUS_LIVE_TEST === "true" || process.env.INCUS_COMMAND_TEST === "true" ||
-    process.env.INCUS_OBSERVABILITY_TEST === "true" || process.env.INCUS_ARCHIVE_TEST === 'true' ||
-    process.env.INCUS_RECREATION_TEST === 'true' || process.env.INCUS_REBOOT_TEST === 'true' ||
-    process.env.INCUS_RECREATION_RECOVERY_TEST === 'true' || process.env.INCUS_MISSING_RECOVERY_TEST === 'true' ||
-    process.env.INCUS_INITIAL_CREATE_TEST === 'true' || process.env.INCUS_MANAGED_VOLUME_TEST === 'true') && !process.env.DATA_DIR) {
+// Module lifecycle tests also exercise real metadata cleanup (e.g. workspace
+// tombstones). Scope service singletons before imports; never touch developer
+// /data just because no installation stack is running.
+if (!process.env.DATA_DIR) {
   const fixtureData = mkdtempSync(join(tmpdir(), "agentor-incus-acceptance-"));
   process.env.DATA_DIR = fixtureData;
-  process.once("exit", () => rmSync(fixtureData, { recursive: true, force: true }));
+  // Managed-storage tests retain bounded recovery records on ambiguity. Never
+  // erase their service store automatically when failed fixture cleanup leaves
+  // Incus resources for operator diagnosis; successful tests clean exact state.
+  if (process.env.INCUS_MANAGED_VOLUME_TEST !== 'true')
+    process.once("exit", () => rmSync(fixtureData, { recursive: true, force: true }));
 }
 
 /** Fast server-module tests that import utility code directly and therefore do
@@ -59,6 +59,7 @@ export default defineConfig({
     "api/incus-full-stack.spec.ts",
     "api/incus-worker-storage.spec.ts",
     "api/incus-managed-volume.spec.ts",
+    "api/incus-managed-volume-runtime.spec.ts",
     "api/incus-account-sharing.spec.ts",
     "api/incus-private-storage.spec.ts",
     "api/workspace-download-cancellation.spec.ts",

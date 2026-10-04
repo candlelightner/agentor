@@ -796,7 +796,7 @@ export class ContainerManager {
     };
   }
 
-  private async incusOptionsForWorker(info: ContainerInfo, applied: boolean): Promise<IncusWorkerOptions> {
+  private async incusOptionsForWorker(info: ContainerInfo, applied: boolean, currentLayout?: string): Promise<IncusWorkerOptions> {
     const store = useWorkerConfigStore();
     const bootstrap = applied ? await store.resolveAppliedBootstrap(info.userId, info.id) : undefined;
     if (applied && !bootstrap)
@@ -810,6 +810,12 @@ export class ContainerManager {
     const desired = applied ? undefined : await store.resolveDesiredRevision(info.userId, info.id);
     const workerConfig = applied ? await store.resolveAppliedValues(info.userId, info.id) : desired!.values;
     const { gitName, gitEmail } = bootstrap?.workerJson ?? await this.resolveGitIdentity(info.userId);
+    const { useManagedVolumeManager } = await import('./managed-volume-manager');
+    const volumes = useManagedVolumeManager();
+    if (!currentLayout) await volumes.mounts(info.userId, info.id);
+    const managedVolumes = currentLayout
+      ? await volumes.currentIncusVolumes(info.userId, info.id, currentLayout)
+      : volumes.store.forWorker(info.userId, info.id).filter(v => v.attached);
     return {
       userId: info.userId, id: info.id, containerName: info.containerName,
       ...(bootstrap ? { cpuLimit: bootstrap.cpuLimit, memoryLimit: bootstrap.memoryLimit, dockerEnabled: bootstrap.dockerEnabled }
@@ -823,6 +829,7 @@ export class ContainerManager {
       image: info.imageRuntimeReference,
       configurationRevision: desired?.revision,
       sshAuthorizedKeys: await this.storageManager?.readSshAuthorizedKeys(info.userId),
+      managedVolumes,
     };
   }
 
@@ -2622,8 +2629,13 @@ for p in sys.argv[1:]:
       const incarnation = this.capturedIncusIncarnation(info);
       if (info.hostMountsRevoked || info.hardwareDevicesRevoked)
         throw Object.assign(new Error("Worker access was revoked; rebuild is required"), { statusCode: 409 });
+      const { useManagedVolumeManager } = await import('./managed-volume-manager');
+      if (!storagePrepared && await useManagedVolumeManager().requiresRecreation(info.userId, id, info.containerId)) {
+        await this.applyManagedStorageUnlocked(id);
+        return;
+      }
       await this.persistDesiredRuntimeStatus(info, "running");
-      const options = await this.incusOptionsForWorker(info, true);
+      const options = await this.incusOptionsForWorker(info, true, info.containerId);
       info.status = "starting";
       try {
         await this.incusRuntime.stop(info, incarnation);
@@ -3310,7 +3322,8 @@ for p in sys.argv[1:]:
           const { useManagedVolumeManager } = await import("./managed-volume-manager");
           const volumes = useManagedVolumeManager();
           await volumes.workerDeleted(info.userId, info.id);
-          await usePersistentBackupPathManager().removeWorkerVolumes(info.id, volumes.store.forWorker(info.userId, info.id).map((v) => v.dockerName));
+          if (info.runtimeKind !== 'incus-vm')
+            await usePersistentBackupPathManager().removeWorkerVolumes(info.id, volumes.store.forWorker(info.userId, info.id).map((v) => v.dockerName));
         },
       ],
       [
@@ -3387,7 +3400,7 @@ for p in sys.argv[1:]:
       const record = this.workerStore.get(info.userId, info.id);
       if (!record || record.status !== 'active' || record.runtimeKind !== 'incus-vm' || record.deletionPending)
         throw new Error('Incus archive requires a matching active durable worker record');
-      await this.assertIncusPersistenceReady(info);
+      await this.assertIncusPersistenceReady(info, true);
       const incarnation = info.containerId.startsWith('incus:') ? info.containerId.slice(6) : '';
       await this.incusRuntime.prepareArchive(info, incarnation);
       await this.persistDesiredRuntimeStatus(info, 'stopped');
@@ -3440,15 +3453,16 @@ for p in sys.argv[1:]:
     this.containers.delete(id);
   }
 
-  private async assertIncusPersistenceReady(info: Pick<ContainerInfo, 'id' | 'userId'>): Promise<void> {
+  private async assertIncusPersistenceReady(info: Pick<ContainerInfo, 'id' | 'userId'> & Partial<Pick<ContainerInfo, 'containerId'>>, prepare = false): Promise<void> {
     const [{ useBackupManager }, { useManagedVolumeManager }] = await Promise.all([
       import('./backup-manager'), import('./managed-volume-manager'),
     ]);
     const volumes = useManagedVolumeManager();
     await volumes.init();
-    if (volumes.isRecoveryBlocked(info.id) || volumes.recreations.get(info.userId, info.id) ||
-        volumes.store.forWorker(info.userId, info.id).some((volume) => volume.attached || volume.liveContainerId))
-      throw new Error('Incus managed persistent storage must be integrated/recovered before replacing compute');
+    if (volumes.isRecoveryBlocked(info.id)) await volumes.recoverWorker(info.userId, info.id);
+    if (volumes.recreations.get(info.userId, info.id) ||
+        volumes.store.forWorker(info.userId, info.id).some(volume => volume.liveContainerId))
+      throw new Error('Incus storage has incompatible legacy recovery state; data was retained');
     const backup = await useBackupManager().getConfig(info.userId);
     const { normalizeBackupPaths } = await import('./backup-paths');
     const selected = normalizeBackupPaths(backup?.persistSelectedDirectories === false ? [] : backup?.selectedPathsByWorkspace?.[info.id] ?? []);
@@ -3456,6 +3470,10 @@ for p in sys.argv[1:]:
     // selected-directory/managed-volume integration is still pending.
     if (selected.some((path) => !['/workspace', '/home/agent/.agent-data'].includes(path)))
       throw new Error('Incus selected-directory persistence must be applied before replacing compute');
+    if (prepare) {
+      if (!info.containerId?.startsWith('incus:')) throw new Error('Incus storage preparation requires a captured source incarnation');
+      await volumes.prepare({ id: info.id, userId: info.userId, containerId: info.containerId });
+    } else await volumes.mounts(info.userId, info.id);
   }
 
   async rebuild(id: string): Promise<ContainerInfo> {
@@ -3502,6 +3520,12 @@ for p in sys.argv[1:]:
     const volumes = useManagedVolumeManager();
     await volumes.init();
     if (volumes.isRecoveryBlocked(id)) await volumes.recoverWorker(info.userId, id);
+    if (info.runtimeKind === 'incus-vm') {
+      // Use the existing bounded Incus recreation marker and applied bootstrap;
+      // storage application is not authority to promote pending settings.
+      await this.recreateIncusWorker(info, info, true);
+      return;
+    }
     const docker = volumes.runtime.docker;
     const interrupted = volumes.recreations.get(info.userId, id);
     if (interrupted) {
@@ -4011,11 +4035,11 @@ for p in sys.argv[1:]:
     };
     if (applied && !original) await assertMissing();
     const info: ContainerInfo = structuredClone(snapshot);
-    await this.assertIncusPersistenceReady(info);
     info.mounts = await this.resolveAuthorizedHostMounts(info.userId, info.id, info.mounts);
     info.hardwareDeviceIds = await this.resolveHardwareDeviceAccess(info.userId, info.id, info.hardwareDeviceIds);
     if (info.importedImage || info.hardwareDeviceIds?.length)
       throw new Error('Incus captured OCI images and hardware require their feature integration');
+    await this.assertIncusPersistenceReady(info, !!original);
     const options = await this.incusOptionsForWorker(info, applied);
     const originalIncarnation = original?.containerId.startsWith('incus:') ? original.containerId.slice(6) : undefined;
     if (original) {
@@ -4062,6 +4086,7 @@ for p in sys.argv[1:]:
       await this.workerStore.transitionIncusRecreation(info.userId, info.id,
         { status: 'active', desiredRuntimeStatus: 'stopped', incusRecreation: marker });
       await this.incusRuntime.start(options, incarnation);
+      await (await import('./managed-volume-manager')).useManagedVolumeManager().markDeclared(info.userId, info.id, info.containerId);
       if (!applied) await useWorkerConfigStore().markApplied(info.userId, info.id,
         this.appliedIncusBootstrap(options, info), options.configurationRevision);
       info.status = 'running';
@@ -4206,7 +4231,8 @@ for p in sys.argv[1:]:
           const { useManagedVolumeManager } = await import("./managed-volume-manager");
           const volumes = useManagedVolumeManager();
           await volumes.workerDeleted(worker.userId, worker.id);
-          await usePersistentBackupPathManager().removeWorkerVolumes(worker.id, volumes.store.forWorker(worker.userId, worker.id).map((v) => v.dockerName));
+          if (worker.runtimeKind !== 'incus-vm')
+            await usePersistentBackupPathManager().removeWorkerVolumes(worker.id, volumes.store.forWorker(worker.userId, worker.id).map((v) => v.dockerName));
         },
       ],
       [
@@ -5827,7 +5853,7 @@ for p in sys.argv[1:]:
             if (guest.provisioned && guest.serviceReady) { info.status = 'running'; return; }
             bootId = guest.bootId;
           } else if (instance.status !== 'Stopped') throw new Error('Incus guest is not ready for recovery');
-          const options = await this.incusOptionsForWorker(info, true);
+          const options = await this.incusOptionsForWorker(info, true, info.containerId);
           info.status = 'starting';
           await this.incusRuntime.start(options, incarnation, { leaveRunningOnFailure: true });
           const guest = await this.incusRuntime.inspectGuestReadiness(info, incarnation);
