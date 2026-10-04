@@ -39,6 +39,58 @@ export function incusWorkerStatus(instance: IncusInstance): ContainerStatus {
     Stopping: "removing", Frozen: "unknown", Error: "error" } as Record<string, ContainerStatus>)[instance.status] ?? "unknown";
 }
 
+export const INCUS_GUEST_READINESS_SCRIPT = String.raw`
+set -u
+boot=$(cat /proc/sys/kernel/random/boot_id) || exit 70
+provisioned=0; service=0
+if test -e /run/agentor/worker.env; then
+ test -f /run/agentor/worker.env && test -r /run/agentor/worker.env || exit 70
+ if test -e /run/agentor/provisioned; then
+  grep -qx agentor-runtime-v1 /run/agentor/provisioned
+  result=$?
+  case "$result" in 0) provisioned=1;; 1) :;; *) exit 70;; esac
+ fi
+fi
+systemctl is-active --quiet agentor-worker.service
+result=$?
+case "$result" in
+ 0)
+  if test "$provisioned" = 1; then
+   runuser -u agent -- "$@"
+   result=$?
+   case "$result" in
+    0)
+     if test -e /tmp/worker-events; then
+      grep -q '^READY|' /tmp/worker-events
+      result=$?
+      case "$result" in 0) service=1;; 1) :;; *) exit 70;; esac
+     fi;;
+    42) :;;
+    *) exit 70;;
+   esac
+  fi;;
+ 3|4) :;;
+ *) exit 70;;
+esac
+test "$boot" = "$(cat /proc/sys/kernel/random/boot_id)" || exit 70
+printf '%s %s %s\n' "$boot" "$provisioned" "$service"
+`;
+
+/** Exit42 means positively absent main session; transport/config errors remain
+ * unknown. Exact matching rejects surviving main-other prefix sessions. */
+export const INCUS_MAIN_SESSION_PROBE = String.raw`
+message=$(LC_ALL=C tmux has-session -t '=main' 2>&1)
+result=$?
+case "$result" in
+ 0) exit 0;;
+ 1) case "$message" in
+  "can't find session: main"|"can't find session: =main"|"no server running on "*|"error connecting to "*" (No such file or directory)") exit 42;;
+  *) exit 70;;
+ esac;;
+ *) exit 70;;
+esac
+`;
+
 /** Ordinary worker VM lifecycle. Incus credentials stay in the control plane;
  * guest configuration crosses only the agent file API after each boot. */
 export class IncusWorkerRuntime {
@@ -338,7 +390,30 @@ export class IncusWorkerRuntime {
     if (result.returnCode !== 0) throw new Error(`Incus worker bootstrap command failed (${command[0]}, exit ${result.returnCode})`);
   }
 
-  async start(opts: IncusWorkerOptions, incarnation?: string): Promise<void> {
+  /** Positive guest facts only. Timeout/transport failures are unknown, never
+   * evidence that a running VM should be rebooted or its services restarted. */
+  async inspectGuestReadiness(owner: IncusStorageOwner, incarnation: string): Promise<{
+    bootId: string; provisioned: boolean; serviceReady: boolean;
+  }> {
+    if (!incarnation) throw new Error('Incus guest readiness requires a captured incarnation');
+    const before = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    if (before.status !== 'Running') throw new Error('Incus readiness requires a running VM');
+    const result = await this.client.exec(owner.containerName, ['timeout', '5', 'sh', '-c',
+      // main is created before entrypoint's environment/local-variable phase.
+      // Match that original account environment, not later app overrides.
+      INCUS_GUEST_READINESS_SCRIPT, 'agentor-readiness', '/bin/bash', '-ec',
+      'set -a; . /run/agentor/worker.env; set +a; exec /bin/sh -c "$1"',
+      'agentor-main-probe', INCUS_MAIN_SESSION_PROBE]);
+    if (result.returnCode !== 0) throw new Error('Incus guest readiness could not be verified');
+    const parsed = /^([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}) ([01]) ([01])\s*$/.exec(result.stdout);
+    if (!parsed) throw new Error('Incus guest readiness response is invalid');
+    const after = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    if (after.status !== 'Running') throw new Error('Incus guest changed during readiness inspection');
+    return { bootId: parsed[1]!, provisioned: parsed[2] === '1', serviceReady: parsed[3] === '1' };
+  }
+
+  async start(opts: IncusWorkerOptions, incarnation?: string,
+    recovery: { leaveRunningOnFailure?: boolean } = {}): Promise<void> {
     this.validateOptions(opts);
     await this.assertReady();
     const name = opts.containerName;
@@ -424,7 +499,8 @@ export class IncusWorkerRuntime {
       }
       if (!workerReady) throw new Error("Incus worker service did not complete startup");
     } catch (error) {
-      await this.stop(opts, instance.config['volatile.uuid']).catch(() => {});
+      if (!recovery.leaveRunningOnFailure || state.status !== 'Running')
+        await this.stop(opts, instance.config['volatile.uuid']).catch(() => {});
       throw error;
     }
   }

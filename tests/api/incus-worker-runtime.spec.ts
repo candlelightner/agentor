@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile, readFile, symlink, link } from "node:fs/promise
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { IncusWorkerRuntime, serializeIncusWorkerEnv, type IncusWorkerOptions } from "../../orchestrator/server/utils/incus-worker-runtime";
+import { IncusWorkerRuntime, serializeIncusWorkerEnv, INCUS_GUEST_READINESS_SCRIPT, INCUS_MAIN_SESSION_PROBE, type IncusWorkerOptions } from "../../orchestrator/server/utils/incus-worker-runtime";
 import { IncusClient } from "../../orchestrator/server/utils/incus-client";
 import { ContainerManager } from "../../orchestrator/server/utils/container";
 import { WorkerStore } from "../../orchestrator/server/utils/worker-store";
@@ -305,6 +305,71 @@ test('lifecycle mutations require matching account and original incarnation', as
       expect(events.some((e) => ['volume-create', 'start', 'stop', 'remove', 'file', 'exec'].includes(e.operation))).toBe(false);
     }
   }
+});
+
+test('guest readiness reads positive boot/config/service facts without lifecycle or storage writes', async () => {
+  const { client, events } = fakeClient();
+  const runtime = new IncusWorkerRuntime(config, client as any), opts = options();
+  const instance = await runtime.create({ ...opts, start: false }); instance.status = 'Running';
+  for (const flags of ['1 1', '0 0', '1 0']) {
+    client.exec = async () => ({ returnCode: 0, stdout: `12345678-1234-1234-1234-123456789abc ${flags}\n`, stderr: '' });
+    events.length = 0;
+    expect(await runtime.inspectGuestReadiness(opts, 'original-uuid')).toMatchObject({
+      provisioned: flags[0] === '1', serviceReady: flags[2] === '1' });
+    expect(events.some((event) => ['start', 'stop', 'file', 'volume-create', 'volume-update'].includes(event.operation))).toBe(false);
+  }
+  client.exec = async () => ({ returnCode: 124, stdout: '', stderr: '' });
+  await expect(runtime.inspectGuestReadiness(opts, 'original-uuid')).rejects.toThrow('could not be verified');
+  client.exec = async () => ({ returnCode: 0, stdout: 'not-authoritative', stderr: '' });
+  await expect(runtime.inspectGuestReadiness(opts, 'original-uuid')).rejects.toThrow('response is invalid');
+  await expect(runtime.inspectGuestReadiness(opts, 'other-uuid')).rejects.toThrow('incarnation changed');
+});
+
+test('actual readiness shell distinguishes absent services/main from command/transport failures', () => {
+  const prefix = String.raw`
+cat() { printf '12345678-1234-1234-1234-123456789abc\n'; }
+test() { case "$*" in *'/run/'*|*'/tmp/'*) return 0;; *) builtin test "$@";; esac; }
+grep() { if [[ "$*" == *provisioned* ]]; then return "$PROBE_MARKER_EXIT"; fi; return "$PROBE_EVENT_EXIT"; }
+systemctl() { return "$PROBE_SERVICE_EXIT"; }
+runuser() { return "$PROBE_USER_EXIT"; }
+`;
+  for (const [marker, service, user, event, expected] of [
+    [0, 0, 0, 0, '1 1'], [1, 0, 0, 0, '0 0'], [0, 3, 0, 0, '1 0'], [0, 4, 0, 0, '1 0'],
+    [0, 0, 42, 0, '1 0'], [0, 0, 0, 1, '1 0'],
+    [2, 0, 0, 0, 'error'], [0, 1, 0, 0, 'error'], [0, 0, 1, 0, 'error'], [0, 0, 0, 2, 'error'],
+  ] as const) {
+    const run = () => execFileSync('bash', ['-c', prefix + INCUS_GUEST_READINESS_SCRIPT], {
+      encoding: 'utf8', env: { ...process.env, PROBE_MARKER_EXIT: String(marker), PROBE_SERVICE_EXIT: String(service),
+        PROBE_USER_EXIT: String(user), PROBE_EVENT_EXIT: String(event) }, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (expected === 'error') expect(run).toThrow();
+    else expect(run().trim()).toBe(`12345678-1234-1234-1234-123456789abc ${expected}`);
+  }
+});
+
+test('actual main-session probe uses exact matching and does not treat socket errors as absence', () => {
+  for (const [message, expected] of [
+    ['can\'t find session: main', 42], ['no server running on /tmp/tmux-1000/default', 42],
+    ['error connecting to /tmp/tmux-1000/default (Permission denied)', 70], ['server exited unexpectedly', 70],
+  ] as const) {
+    try {
+      execFileSync('sh', ['-c', 'tmux() { test "$3" = "=main" || exit 71; printf "%s" "$PROBE_MESSAGE"; return 1; };' + INCUS_MAIN_SESSION_PROBE],
+        { env: { ...process.env, PROBE_MESSAGE: message }, stdio: ['ignore', 'pipe', 'pipe'] });
+      throw new Error('Expected probe exit');
+    } catch (error) { expect((error as { status?: number }).status).toBe(expected); }
+  }
+});
+
+test('recovery provisioning failure does not stop an already-running guest', async () => {
+  const { client, events } = fakeClient();
+  const runtime = new IncusWorkerRuntime(config, client as any), opts = options();
+  await runtime.create(opts);
+  const execute = client.exec;
+  client.exec = async (...args: any[]) => args[1][0] === 'systemctl' && args[1][1] === 'start'
+    ? { returnCode: 1, stdout: '', stderr: 'service failure' } : execute(...args);
+  events.length = 0;
+  await expect(runtime.start(opts, 'original-uuid', { leaveRunningOnFailure: true })).rejects.toThrow('bootstrap command failed');
+  expect(events.some((event) => event.operation === 'stop')).toBe(false);
 });
 
 test('worker image source survives platform alias movement and cannot be silently changed', async () => {

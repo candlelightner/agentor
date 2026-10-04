@@ -498,7 +498,7 @@ export class ContainerManager {
       code: (error as { code?: string })?.code || "WORKER_RUNTIME_UNRESPONSIVE",
       operation,
       message:
-        "Agentor could not verify the Docker task. Retry the operation or use managed recovery; persistent volumes were not changed.",
+        "Agentor could not verify the worker runtime. Retry the operation or use managed recovery; persistent volumes were not changed.",
       retryable: true,
       observedAt: info.updatedAt,
     };
@@ -5485,6 +5485,7 @@ for p in sys.argv[1:]:
 
   async reconcileWorkers(): Promise<void> {
     if (!this.workerStore) return;
+    await this.reconcileIncusWorkers();
 
     const activeContainerNames = new Set<string>();
     for (const [, info] of this.containers) {
@@ -5603,6 +5604,80 @@ for p in sys.argv[1:]:
           `[container] missing worker recreation deferred for ${worker.id}: ${(error as { code?: string })?.code || "runtime unavailable"}`,
         ),
       );
+    }
+  }
+
+  /** Read healthy guests without advancing their lifecycle generation. Only a
+   * positive stopped/missing-provisioning/service observation admits repair. */
+  async reconcileIncusWorkers(): Promise<void> {
+    for (const snapshot of this.workerStore?.listActive() ?? []) {
+      if (snapshot.runtimeKind !== 'incus-vm' || snapshot.deletionPending || snapshot.incusRecreation) continue;
+      let observedHandle: string | undefined, observedGeneration: number | undefined;
+      const inspect = async () => {
+        const record = this.workerStore?.get(snapshot.userId, snapshot.id), info = this.get(snapshot.id);
+        if (!record || record.status !== 'active' || record.runtimeKind !== 'incus-vm' || record.deletionPending ||
+            record.incusRecreation || !info || info.userId !== record.userId || info.runtimeKind !== 'incus-vm') return;
+        const incarnation = info.containerId.startsWith('incus:') ? info.containerId.slice(6) : '';
+        if (!incarnation) throw new Error('Incus reconciliation incarnation is unavailable');
+        observedHandle = info.containerId; observedGeneration = workerLifecycleGeneration(info.id);
+        const instance = await this.incusRuntime.client.getInstance(info.containerName);
+        if (!await this.incusRuntime.matchesWorkerIdentity(instance, info.id, info.userId) ||
+            instance.config['volatile.uuid'] !== incarnation)
+          throw new Error('Incus reconciliation owner or incarnation changed');
+        return { record, info, instance, incarnation };
+      };
+      try {
+        const repair = await withOwnerWorkerRuntimeSetup(snapshot.userId, snapshot.id, async () => {
+          const target = await inspect(); if (!target) return false;
+          const { record, info, instance, incarnation } = target;
+          if (record.desiredRuntimeStatus === 'stopped') {
+            if (instance.status === 'Stopped') { info.status = 'stopped'; info.runtimeDiagnostic = undefined; }
+            return instance.status === 'Running';
+          }
+          if (record.desiredRuntimeStatus !== 'running') return false;
+          if (record.hostMountsRevoked || record.hardwareDevicesRevoked)
+            throw new Error('Incus worker access was revoked; rebuild is required');
+          if (instance.status === 'Stopped') return true;
+          if (instance.status !== 'Running') throw new Error('Incus guest is not ready for observation');
+          const guest = await this.incusRuntime.inspectGuestReadiness(info, incarnation);
+          if (!guest.provisioned || !guest.serviceReady) return true;
+          info.status = 'running'; info.runtimeDiagnostic = undefined;
+          return false;
+        });
+        if (!repair) continue;
+        await withOwnerWorkerLifecycleMutation(snapshot.userId, snapshot.id, async () => {
+          const target = await inspect(); if (!target) return;
+          const { record, info, instance, incarnation } = target;
+          await this.assertOwnerExists(info.userId);
+          if (record.desiredRuntimeStatus === 'stopped') {
+            await this.incusRuntime.stop(info, incarnation); info.status = 'stopped'; return;
+          }
+          if (record.desiredRuntimeStatus !== 'running') return;
+          if (record.hostMountsRevoked || record.hardwareDevicesRevoked)
+            throw new Error('Incus worker access was revoked; rebuild is required');
+          let bootId: string | undefined;
+          if (instance.status === 'Running') {
+            const guest = await this.incusRuntime.inspectGuestReadiness(info, incarnation);
+            if (guest.provisioned && guest.serviceReady) { info.status = 'running'; return; }
+            bootId = guest.bootId;
+          } else if (instance.status !== 'Stopped') throw new Error('Incus guest is not ready for recovery');
+          const options = await this.incusOptionsForWorker(info, true);
+          info.status = 'starting';
+          await this.incusRuntime.start(options, incarnation, { leaveRunningOnFailure: true });
+          const guest = await this.incusRuntime.inspectGuestReadiness(info, incarnation);
+          if (!guest.provisioned || !guest.serviceReady || (bootId && guest.bootId !== bootId))
+            throw new Error('Incus guest rebooted or remained unready during recovery; retry later');
+          info.status = 'running'; info.runtimeDiagnostic = undefined; info.updatedAt = new Date().toISOString();
+          useLogCollector().attach(info.containerName, info.containerId, 'worker', info.displayName).catch(() => {});
+          await this.reconcileWorkerPlugins(info);
+        });
+      } catch (error) {
+        const current = this.get(snapshot.id);
+        if (current?.userId === snapshot.userId && current.containerId === observedHandle &&
+            workerLifecycleGeneration(snapshot.id) === observedGeneration)
+          this.markRuntimeUnknown(current, 'Incus guest reconciliation', error);
+        useLogger().warn(`[container] Incus recovery deferred for ${snapshot.id}: ${(error as { code?: string })?.code ?? 'runtime unavailable'}`);
+      }
     }
   }
 

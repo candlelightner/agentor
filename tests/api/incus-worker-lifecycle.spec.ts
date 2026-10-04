@@ -9,6 +9,7 @@ import { zeroUserEnvVars } from '../../orchestrator/server/utils/user-env-store'
 import { useBackupManager } from '../../orchestrator/server/utils/backup-manager';
 import { useManagedVolumeManager } from '../../orchestrator/server/utils/managed-volume-manager';
 import { useWorkerConfigStore } from '../../orchestrator/server/utils/worker-config-store';
+import { workerLifecycleGeneration } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
 import type { Config } from '../../orchestrator/server/utils/config';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, error() {}, warn() {}, debug() {} });
@@ -267,8 +268,73 @@ test('Incus rebuild does not clear newer account/group/environment configuration
   });
 });
 
+async function reconciliationFixture(run: (manager: ContainerManager, store: WorkerStore, calls: string[], info: any, state: any) => Promise<void>) {
+  await fixture(async (manager, store, calls, info) => {
+    const state = { status: 'Running', bootId: 'first-boot', provisioned: true, serviceReady: true };
+    const runtime = (manager as any).incusRuntime;
+    runtime.client = { getInstance: async () => ({ status: state.status, config: { 'volatile.uuid': 'original-uuid' } }) };
+    runtime.matchesWorkerIdentity = async () => true;
+    runtime.inspectGuestReadiness = async () => ({ ...state });
+    runtime.start = async (_opts: any, uuid: string, recovery: any) => {
+      expect(uuid).toBe('original-uuid'); expect(recovery.leaveRunningOnFailure).toBe(true);
+      calls.push('repair'); state.status = 'Running'; state.provisioned = state.serviceReady = true;
+    };
+    (manager as any).incusOptionsForWorker = async (_worker: any, applied: boolean) => {
+      expect(applied).toBe(true); calls.push('applied-options'); return {};
+    };
+    (manager as any).reconcileWorkerPlugins = async () => {};
+    const config = useWorkerConfigStore(), mark = config.markApplied;
+    config.markApplied = async () => { throw new Error('Reboot recovery must not promote desired settings'); };
+    try { await run(manager, store, calls, info, state); }
+    finally { config.markApplied = mark; }
+  });
+}
+
+test('healthy Incus reconciliation preserves VM/services and terminal lifecycle generation', async () => {
+  await reconciliationFixture(async (manager, _store, calls, info) => {
+    const generation = workerLifecycleGeneration(info.id);
+    await manager.reconcileIncusWorkers();
+    expect(calls).toEqual([]); expect(info.status).toBe('running'); expect(info.pendingRebuild).toBe(true);
+    expect(workerLifecycleGeneration(info.id)).toBe(generation);
+  });
+});
+
+test('positively missing Incus provisioning/service recovers applied settings without reboot or pending promotion', async () => {
+  for (const missing of ['provisioned', 'serviceReady']) await reconciliationFixture(async (manager, store, calls, info, state) => {
+    state[missing] = false;
+    await manager.reconcileIncusWorkers();
+    expect(calls).toEqual(['applied-options', 'repair']); expect(info.status).toBe('running');
+    expect(state.bootId).toBe('first-boot'); expect(info.pendingRebuild).toBe(true);
+    expect(store.get(info.userId, info.id)?.pendingRebuild).toBe(true);
+  });
+});
+
+test('Incus readiness timeout, foreign identity and revoked access never cause start/stop/reboot', async () => {
+  for (const failure of ['timeout', 'foreign', 'revoked']) await reconciliationFixture(async (manager, store, calls, info) => {
+    if (failure === 'timeout') (manager as any).incusRuntime.inspectGuestReadiness = async () => { throw new Error('guest timed out'); };
+    if (failure === 'foreign') (manager as any).incusRuntime.matchesWorkerIdentity = async () => false;
+    if (failure === 'revoked') await store.upsert({ ...store.get(info.userId, info.id)!, hostMountsRevoked: true });
+    await manager.reconcileIncusWorkers();
+    expect(calls).toEqual([]); expect(manager.get(info.id)?.status).toBe('unknown');
+  });
+});
+
+test('Incus boot changes and repair failures defer convergence without stopping a running guest', async () => {
+  for (const failure of ['reboot', 'repair']) await reconciliationFixture(async (manager, _store, calls, info, state) => {
+    state.provisioned = false;
+    const start = (manager as any).incusRuntime.start;
+    (manager as any).incusRuntime.start = async (...args: any[]) => {
+      if (failure === 'repair') throw new Error('provider unavailable');
+      await start(...args); state.bootId = 'newer-boot';
+    };
+    await manager.reconcileIncusWorkers();
+    expect(calls).not.toContain('remove-compute'); expect(state.status).toBe('Running');
+    expect(info.status).toBe('unknown'); expect(info.pendingRebuild).toBe(true);
+  });
+});
+
 test('real production-manager archive retains canonical volumes, source and pending settings without Docker', async () => {
-  test.skip(process.env.INCUS_ARCHIVE_TEST !== 'true' && process.env.INCUS_RECREATION_TEST !== 'true', 'Explicit disposable Incus lifecycle acceptance');
+  test.skip(process.env.INCUS_ARCHIVE_TEST !== 'true' && process.env.INCUS_RECREATION_TEST !== 'true' && process.env.INCUS_REBOOT_TEST !== 'true', 'Explicit disposable Incus lifecycle acceptance');
   test.setTimeout(900_000);
   const root = await mkdtemp(join(tmpdir(), 'agentor-incus-archive-live-'));
   const config = { dataDir: root, incusEnabled: true, incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor',
@@ -289,10 +355,48 @@ test('real production-manager archive retains canonical volumes, source and pend
     environmentJson: { networkMode: 'full', allowedDomains: [], dockerEnabled: false, setupScript: '', envVars: '',
       exposeApis: { portMappings: true, domainMappings: true, usage: true } }, capabilitiesJson: [], instructionsJson: [] });
   try {
-    let info = await (manager as any).createForOwner({ userId: 'archive-live-owner', displayName: 'archive acceptance' });
+    let info = await (manager as any).createForOwner({ userId: 'archive-live-owner', displayName: 'archive acceptance',
+      workerConfiguration: process.env.INCUS_REBOOT_TEST === 'true' ? { secrets: [{ key: 'BOOT_SECRET', value: 'applied' }] } : undefined });
     const created = await runtime.client.exec(info.containerName, ['sh', '-ec',
       'echo retained-workspace > /workspace/archive-fixture; echo retained-agents > /home/agent/.agent-data/archive-fixture']);
     expect(created.returnCode).toBe(0);
+    if (process.env.INCUS_REBOOT_TEST === 'true') {
+      const incarnation = info.containerId.slice(6);
+      const original = await runtime.inspectGuestReadiness(info, incarnation);
+      expect(original.provisioned && original.serviceReady).toBe(true);
+      const servicePid = await runtime.client.exec(info.containerName, ['systemctl', 'show', '--property=MainPID', '--value', 'agentor-worker.service']);
+      const reloadedStore = new WorkerStore(root); await reloadedStore.init();
+      const reloaded = new ContainerManager({ listContainers: async () => [] } as any, config);
+      reloaded.setWorkerStore(reloadedStore); reloaded.setIncusRuntime(new IncusWorkerRuntime(config));
+      await reloaded.sync(); await reloaded.reconcileWorkers();
+      expect(reloaded.get(info.id)?.status).toBe('running');
+      expect((await runtime.client.exec(info.containerName, ['systemctl', 'show', '--property=MainPID', '--value', 'agentor-worker.service'])).stdout).toBe(servicePid.stdout);
+      expect((await runtime.inspectGuestReadiness(info, incarnation)).bootId).toBe(original.bootId);
+      const generation = workerLifecycleGeneration(info.id);
+      await manager.reconcileIncusWorkers();
+      expect(workerLifecycleGeneration(info.id)).toBe(generation);
+      expect((await runtime.inspectGuestReadiness(info, incarnation)).bootId).toBe(original.bootId);
+      info.pendingRebuild = true; info.initScript = 'touch /workspace/unapplied-init';
+      await store.upsert((manager as any).containerInfoToWorkerRecord(info));
+      await useWorkerConfigStore().replace(info.userId, info.id, [{ kind: 'secret', key: 'BOOT_SECRET', value: 'unapplied' }]);
+      await runtime.client.exec(info.containerName, ['sh', '-c', 'nohup sh -c "sleep 1; reboot" >/dev/null 2>&1 &']);
+      let rebootId = '';
+      await expect.poll(async () => {
+        try {
+          const probe = await runtime.inspectGuestReadiness(info, incarnation);
+          if (probe.bootId !== original.bootId) { rebootId = probe.bootId; return !probe.provisioned; }
+        } catch { /* guest agent is temporarily unavailable during legitimate reboot */ }
+        return false;
+      }, { timeout: 120_000, intervals: [1000, 2000] }).toBe(true);
+      await manager.reconcileIncusWorkers();
+      expect(info.status).toBe('running'); expect(info.pendingRebuild).toBe(true);
+      const recovered = await runtime.inspectGuestReadiness(info, incarnation);
+      expect(recovered).toMatchObject({ bootId: rebootId, provisioned: true, serviceReady: true });
+      const applied = await runtime.client.exec(info.containerName, ['bash', '-ec',
+        'source /run/agentor/worker.env; test "$(printf %s "$WORKER_LOCAL_ENV" | base64 -d | jq -r \'.[] | select(.key == "BOOT_SECRET") | .value\')" = applied; test ! -e /workspace/unapplied-init']);
+      expect(applied.returnCode).toBe(0);
+      expect((await useWorkerConfigStore().resolveValues(info.userId, info.id))[0]!.value).toBe('unapplied');
+    }
     if (process.env.INCUS_RECREATION_TEST === 'true') {
       const oldHandle = info.containerId;
       info.initScript = 'echo applied-rebuild > /workspace/rebuild-applied'; info.pendingRebuild = true;
