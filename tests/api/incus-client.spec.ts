@@ -291,6 +291,18 @@ test.describe("IncusClient mock server protocol tests", () => {
         return;
       }
 
+      if (req.method === 'GET' && path === '/1.0/images') {
+        if (url.searchParams.get('project') !== 'agentor' || url.searchParams.get('recursion') !== '1') {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: 'Forbidden', error_code: 403 }));
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'sync', status_code: 200,
+            metadata: [{ fingerprint: 'a'.repeat(64), type: 'virtual-machine' }] }));
+        }
+        return;
+      }
+
       // GET /1.0/operations/op-success
       if (req.method === "GET" && path === "/1.0/operations/op-success") {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -387,6 +399,13 @@ test.describe("IncusClient mock server protocol tests", () => {
     const client = new IncusClient({ endpoint: `http://127.0.0.1:${serverPort}`, project: "agentor" });
     expect((await client.getNetwork("workers")).managed).toBe(true);
     expect(await client.getNetworkLeases("workers")).toMatchObject([{ address: "10.20.30.42", type: "dynamic" }]);
+  });
+
+  test('image cache inventory remains recursive and project-scoped', async () => {
+    const endpoint = `http://127.0.0.1:${serverPort}`;
+    expect(await new IncusClient({ endpoint, project: 'agentor' }).listImages())
+      .toEqual([{ fingerprint: 'a'.repeat(64), type: 'virtual-machine' }]);
+    await expect(new IncusClient({ endpoint, project: 'forbidden' }).listImages()).rejects.toMatchObject({ statusCode: 403 });
   });
 
   test("pushFile and pullFile handle headers and content correctly", async () => {

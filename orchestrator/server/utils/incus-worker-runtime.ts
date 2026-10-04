@@ -11,6 +11,7 @@ import type { ContainerStatus } from "../../shared/types";
 import { IncusWorkerCommands } from "./incus-worker-commands";
 import { withOwnerWorkerRuntimeSetup } from "./worker-lifecycle-coordinator";
 import type { WorkerConfigRevision } from './worker-config-store';
+import { incusImageIdentity, sameIncusImageSource, type IncusWorkerImageIdentity } from './incus-worker-image';
 
 export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & {
   sshAuthorizedKeys?: string;
@@ -220,10 +221,44 @@ export class IncusWorkerRuntime {
   async preflightRecreation(opts: IncusWorkerOptions, dockerRequired = false): Promise<{ fingerprint: string; docker: boolean }> {
     await this.assertReady();
     this.validateOptions(opts);
-    const fingerprint = await this.resolveImage();
+    const storage = await this.storage();
+    const source = await storage.imageIdentity(opts);
+    if (!source) throw new Error('Incus worker image source is missing; preserve the original source before compute removal');
+    const fingerprint = await this.resolveStoredImage(source);
     await this.accountDevices(opts);
-    const storage = await (await this.storage()).verifyExisting(opts, dockerRequired);
-    return { fingerprint, ...storage };
+    return { fingerprint, ...await storage.verifyExisting(opts, dockerRequired) };
+  }
+
+  private async resolveStoredImage(source: IncusWorkerImageIdentity): Promise<string> {
+    try {
+      const identity = incusImageIdentity(await this.client.getImage(source.fingerprint));
+      if (!sameIncusImageSource(identity, source)) throw new Error('Incus cached worker image source does not match');
+      return identity.fingerprint;
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+    }
+    // Cache fingerprints are not portable source authority. A re-import of
+    // the exact conversion inputs may have a different artifact fingerprint.
+    for (const image of await this.client.listImages()) {
+      let identity: IncusWorkerImageIdentity;
+      try { identity = incusImageIdentity(image); } catch { continue; }
+      if (sameIncusImageSource(identity, source)) return identity.fingerprint;
+    }
+    throw new Error('Derived image for the worker immutable OCI source is unavailable; rebuild/import that source before retrying');
+  }
+
+  /** Upgrade older owned compute before archive, never infer its source from
+   * the current mutable platform alias. Persistent data remains untouched. */
+  async preserveRecreationSource(owner: IncusStorageOwner, incarnation: string): Promise<void> {
+    const instance = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    const fingerprint = instance.config['volatile.base_image'];
+    if (!fingerprint) throw new Error('Original Incus worker image identity is unavailable; explicit recovery is required');
+    const image = incusImageIdentity(await this.client.getImage(fingerprint));
+    const storage = await this.storage();
+    await storage.verifyExisting(owner, !!instance.devices.docker);
+    await storage.devices(owner, false, { docker: !!instance.devices.docker });
+    await storage.recordImageIdentity(owner, image);
+    await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
   }
 
   private async resolveImage(fingerprint?: string): Promise<string> {
@@ -246,10 +281,16 @@ export class IncusWorkerRuntime {
     this.validateOptions(opts);
     if (opts.containerName !== `${this.config.containerPrefix}-${opts.id}`)
       throw new Error("Incus worker name must match its WorkerRecord identity");
-    const fingerprint = await this.resolveImage(existing?.fingerprint);
+    const storage = await this.storage();
+    const source = await storage.imageIdentity(opts);
+    const fingerprint = existing ? await this.resolveImage(existing.fingerprint)
+      : source ? await this.resolveStoredImage(source) : await this.resolveImage();
+    const identity = incusImageIdentity(await this.client.getImage(fingerprint));
+    if (source && !sameIncusImageSource(source, identity)) throw new Error('Incus reconstruction image source changed');
     const account = await this.accountDevices(opts);
-    const persistent = await (await this.storage()).devices(opts, opts.environmentJson.dockerEnabled,
+    const persistent = await storage.devices(opts, opts.environmentJson.dockerEnabled,
       existing && { docker: existing.docker });
+    await storage.recordImageIdentity(opts, identity);
     const instance = await this.client.createInstance({
       name: opts.containerName, type: "virtual-machine", profiles: [],
       source: { type: "image", fingerprint },

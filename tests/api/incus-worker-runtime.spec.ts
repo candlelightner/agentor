@@ -14,6 +14,9 @@ import type { Config } from "../../orchestrator/server/utils/config";
 import { withOwnerLifecycleMutation } from "../../orchestrator/server/utils/worker-lifecycle-coordinator";
 import { StorageManager } from "../../orchestrator/server/utils/storage";
 import { useWorkerConfigStore } from '../../orchestrator/server/utils/worker-config-store';
+import { incusImageIdentity, sameIncusImageSource, validateIncusImageIdentity } from '../../orchestrator/server/utils/incus-worker-image';
+import { IncusWorkerStorage } from '../../orchestrator/server/utils/incus-worker-storage';
+import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 (globalThis as any).useLogCollector ??= () => ({ attach: async () => {}, detach() {} });
@@ -55,8 +58,11 @@ function fakeClient() {
   };
   const client = {
     getReadiness: record("ready", { ready: true, serverVersion: "6.0.6" }), request: record("project", { config: { restricted: "true" } }),
-    getImageAlias: record("image", { target: "image-fingerprint", type: "virtual-machine" }),
-    getImage: record("image-info", { properties: { bootstrap_generation: "3" } }),
+    getImageAlias: record("image", { target: 'a'.repeat(64), type: "virtual-machine" }),
+    getImage: record("image-info", { fingerprint: 'a'.repeat(64), type: 'virtual-machine', properties: {
+      bootstrap_generation: "3", source_image_id: 'sha256:' + 'b'.repeat(64), recipe_id: 'c'.repeat(64),
+      source_architecture: 'amd64', converter_version: 'v0.4.0' } }),
+    listImages: record('images', []),
     endpoint: config.incusEndpoint,
     getCustomVolume: async (_pool: string, name: string) => {
       if (!volumes.has(name)) throw Object.assign(new Error("Not found"), { statusCode: 404 });
@@ -72,7 +78,9 @@ function fakeClient() {
     },
     deleteCustomVolume: async (_pool: string, name: string) => { volumes.delete(name); },
     updateInstanceDevices: async (_name: string, devices: any) => { instance.devices = devices; },
-    createInstance: async (spec: any) => { events.push({ operation: "create", args: [spec] }); instance = spec; return spec; },
+    createInstance: async (spec: any) => { events.push({ operation: "create", args: [spec] });
+      instance = { ...spec, config: { ...spec.config, 'volatile.uuid': 'original-uuid', 'volatile.base_image': spec.source.fingerprint } };
+      return instance; },
     getInstance: async (...args: any[]) => { events.push({ operation: "instance", args }); return instance; },
     getInstanceState: async (...args: any[]) => { events.push({ operation: "state", args }); return { status }; },
     startInstance: async (...args: any[]) => { events.push({ operation: "start", args }); status = "Running"; },
@@ -182,7 +190,7 @@ test("foreign installation is never adopted, started, stopped or deleted", async
   const runtime = new IncusWorkerRuntime(config, client as any);
   const opts = options();
   await runtime.create({ ...opts, start: false });
-  const spec = events.find((event) => event.operation === "create")!.args[0];
+  const spec = await client.getInstance(opts.containerName);
   spec.config["user.agentor.installation"] = "foreign-installation";
   events.length = 0;
   expect(await runtime.matchesWorkerIdentity(spec, opts.id)).toBe(false);
@@ -245,11 +253,11 @@ test('recreation preflight is read-only, pins the image and rechecks canonical d
   await runtime.create({ ...opts, start: false });
   events.length = 0;
   const existing = await runtime.preflightRecreation(opts);
-  expect(existing).toEqual({ fingerprint: 'image-fingerprint', docker: false });
+  expect(existing).toEqual({ fingerprint: 'a'.repeat(64), docker: false });
   expect(events.some((event) => ['volume-create', 'create', 'start', 'file', 'exec'].includes(event.operation))).toBe(false);
   client.getImageAlias = async () => { throw new Error('mutable alias moved'); };
   await runtime.create({ ...opts, start: false }, existing);
-  expect(events.find((e) => e.operation === 'create')!.args[0].source.fingerprint).toBe('image-fingerprint');
+  expect(events.find((e) => e.operation === 'create')!.args[0].source.fingerprint).toBe('a'.repeat(64));
   const getVolume = client.getCustomVolume;
   client.getCustomVolume = async (pool, name) => {
     if (name.endsWith('-agents')) throw Object.assign(new Error('missing'), { statusCode: 404 });
@@ -297,6 +305,108 @@ test('lifecycle mutations require matching account and original incarnation', as
       expect(events.some((e) => ['volume-create', 'start', 'stop', 'remove', 'file', 'exec'].includes(e.operation))).toBe(false);
     }
   }
+});
+
+test('worker image source survives platform alias movement and cannot be silently changed', async () => {
+  const { client, events } = fakeClient();
+  const runtime = new IncusWorkerRuntime(config, client as any);
+  const opts = options();
+  await runtime.create({ ...opts, start: false });
+  const original = client.getImage;
+  client.getImageAlias = async () => { throw new Error('must not reread mutable platform alias'); };
+  events.length = 0;
+  const preflight = await runtime.preflightRecreation(opts);
+  await runtime.create({ ...opts, start: false }, preflight);
+  expect(events.find((event) => event.operation === 'create')!.args[0].source.fingerprint).toBe('a'.repeat(64));
+  client.getImage = async (...args) => {
+    const image = structuredClone(await original(...args));
+    image.properties.source_image_id = 'sha256:' + 'd'.repeat(64);
+    return image;
+  };
+  events.length = 0;
+  await expect(runtime.preflightRecreation(opts)).rejects.toThrow('cached worker image source does not match');
+  await expect(runtime.create({ ...opts, start: false }, preflight)).rejects.toThrow('reconstruction image source changed');
+  expect(events.some((e) => ['volume-create', 'volume-update', 'create', 'stop', 'remove', 'start'].includes(e.operation))).toBe(false);
+});
+
+test('cache fingerprint replacement uses exact conversion inputs, not tags or unrelated recipes', async () => {
+  const { client, events } = fakeClient();
+  const runtime = new IncusWorkerRuntime(config, client as any);
+  const opts = options();
+  await runtime.create({ ...opts, start: false });
+  const recreated = structuredClone(await client.getImage('a'.repeat(64)));
+  recreated.fingerprint = 'd'.repeat(64);
+  client.getImage = async (fingerprint: string) => {
+    if (fingerprint !== recreated.fingerprint) throw Object.assign(new Error('cache removed'), { statusCode: 404 });
+    return recreated;
+  };
+  const foreign = { ...structuredClone(recreated), fingerprint: 'e'.repeat(64) };
+  foreign.properties.converter_version = 'v0.4.1';
+  client.listImages = async () => [foreign, recreated];
+  client.getImageAlias = async () => { throw new Error('no alias fallback'); };
+  const preflight = await runtime.preflightRecreation(opts);
+  expect(preflight.fingerprint).toBe(recreated.fingerprint);
+  await runtime.create({ ...opts, start: false }, preflight);
+  const workspace = await client.getCustomVolume(config.incusStoragePool, `${opts.containerName}-workspace`);
+  expect(JSON.parse(workspace.config['user.agentor.image-source']).fingerprint).toBe(recreated.fingerprint);
+  client.getImage = async () => { throw Object.assign(new Error('gone'), { statusCode: 404 }); };
+  client.listImages = async () => [foreign];
+  events.length = 0;
+  await expect(runtime.preflightRecreation(opts)).rejects.toThrow('immutable OCI source is unavailable');
+  expect(events.some((e) => ['volume-create', 'volume-update', 'create', 'stop', 'remove', 'start'].includes(e.operation))).toBe(false);
+});
+
+test('older owned compute captures original image before removal, with strict incarnation and storage checks', async () => {
+  const { client, events } = fakeClient();
+  const runtime = new IncusWorkerRuntime(config, client as any);
+  const opts = options();
+  await runtime.create({ ...opts, start: false });
+  const workspace = await client.getCustomVolume(config.incusStoragePool, `${opts.containerName}-workspace`);
+  delete workspace.config['user.agentor.image-source'];
+  client.getImageAlias = async () => { throw new Error('no mutable alias'); };
+  await expect(runtime.preflightRecreation(opts)).rejects.toThrow('source is missing');
+  events.length = 0;
+  await expect(runtime.preserveRecreationSource(opts, 'foreign-uuid')).rejects.toThrow('incarnation changed');
+  expect(events.some((e) => e.operation === 'volume-update')).toBe(false);
+  await runtime.preserveRecreationSource(opts, 'original-uuid');
+  expect((await runtime.preflightRecreation(opts)).fingerprint).toBe('a'.repeat(64));
+  expect(events.some((e) => ['stop', 'remove', 'create', 'start', 'file', 'exec'].includes(e.operation))).toBe(false);
+});
+
+test('immutable image identity validates complete pinned conversion metadata', async () => {
+  const { client } = fakeClient();
+  const original = incusImageIdentity(await client.getImage('a'.repeat(64)) as any);
+  expect(validateIncusImageIdentity(original)).toEqual(original);
+  for (const key of ['sourceImageId', 'recipeId', 'architecture', 'converterVersion', 'bootstrapGeneration', 'fingerprint']) {
+    const malformed: any = { ...original, [key]: key === 'sourceImageId' ? [original.sourceImageId]
+      : key === 'converterVersion' ? '' : 'invalid' };
+    expect(() => validateIncusImageIdentity(malformed)).toThrow('immutable worker image metadata');
+  }
+  expect(sameIncusImageSource(original, { ...original, fingerprint: 'd'.repeat(64) })).toBe(true);
+  expect(sameIncusImageSource(original, { ...original, recipeId: 'd'.repeat(64) })).toBe(false);
+});
+
+test('real read-only recreation resolves persisted OCI conversion identity without platform alias or VM', async () => {
+  test.skip(process.env.INCUS_SOURCE_TEST !== 'true', 'Explicit isolated source-volume/cache acceptance');
+  test.setTimeout(120_000);
+  const runtime = new IncusWorkerRuntime({ ...config, incusWorkerImage: 'must-not-use-this-platform-alias' });
+  const id = randomUUID();
+  const opts = { ...options(), id, containerName: `${config.containerPrefix}-${id}` };
+  opts.workerJson = { ...opts.workerJson, id };
+  const storage = new IncusWorkerStorage(runtime.client, config, await backupInstallationId(config.dataDir));
+  const image = await runtime.client.getImage((await runtime.client.getImageAlias(config.incusWorkerImage)).target);
+  const identity = incusImageIdentity(image);
+  try {
+    await storage.devices(opts, false);
+    // A missing reconstructable cache hint must resolve by exact source inputs,
+    // never by the current mutable worker alias or fingerprint alone.
+    await storage.recordImageIdentity(opts, { ...identity, fingerprint: 'f'.repeat(64) });
+    const preflight = await runtime.preflightRecreation(opts);
+    expect(preflight.docker).toBe(false);
+    expect(sameIncusImageSource(incusImageIdentity(await runtime.client.getImage(preflight.fingerprint)), identity)).toBe(true);
+    expect((await runtime.client.getCustomVolume(config.incusStoragePool, `${opts.containerName}-workspace`)).used_by ?? []).toEqual([]);
+    await expect(runtime.client.getInstance(opts.containerName)).rejects.toMatchObject({ statusCode: 404 });
+  } finally { await storage.remove(opts); }
 });
 
 test("account directories require exact restricted grants before allocating worker data", async () => {

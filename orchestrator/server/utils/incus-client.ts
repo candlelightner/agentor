@@ -1244,4 +1244,8 @@ export class IncusClient {
   async getImage(fingerprint: string): Promise<IncusImage> {
     return this.request<IncusImage>('GET', `/1.0/images/${encodeURIComponent(fingerprint)}`);
   }
+
+  async listImages(): Promise<IncusImage[]> {
+    return this.request<IncusImage[]>('GET', '/1.0/images?recursion=1');
+  }
 }
