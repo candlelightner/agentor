@@ -482,8 +482,9 @@ test('interrupted-recreation reconciliation merges rollback without overwriting 
 });
 
 test('interrupted-recreation persistence or lookup failure retains marker and runtime for safe retry', async () => {
-  for (const failure of ['persist', 'lookup']) await fixture(async (manager, store, _calls, info) => {
-    const marker = { nonce: 'operation-nonce', originalIncarnation: 'original-uuid' };
+  for (const initial of [false, true]) for (const failure of ['persist', 'lookup']) await fixture(async (manager, store, _calls, info) => {
+    const marker = initial ? { nonce: 'operation-nonce', initialCreate: true as const, replacementIncarnation: 'original-uuid' }
+      : { nonce: 'operation-nonce', originalIncarnation: 'original-uuid' };
     await store.upsert({ ...store.get(info.userId, info.id)!, incusRecreation: marker });
     (manager as any).incusRuntime.rollbackRecreation = async () => {
       if (failure === 'lookup') throw new Error('API unavailable');
@@ -500,6 +501,18 @@ test('interrupted-recreation persistence or lookup failure retains marker and ru
       expect(store.get(info.userId, info.id)?.incusRecreation).toBeUndefined();
       expect(store.get(info.userId, info.id)?.status).toBe('archived');
     }
+  });
+});
+
+test('queued rollback cannot clear a changed initial-create discriminator', async () => {
+  await fixture(async (_manager, store, _calls, info) => {
+    const marker = { nonce: 'same-nonce', initialCreate: true as const };
+    await store.upsert({ ...store.get(info.userId, info.id)!, incusRecreation: marker });
+    await store.upsert({ ...store.get(info.userId, info.id)!, incusRecreation: { nonce: marker.nonce } });
+    await expect(store.transitionIncusRecreation(info.userId, info.id,
+      { status: 'archived', desiredRuntimeStatus: 'stopped', incusRecreation: undefined }, undefined, marker))
+      .rejects.toThrow('marker changed');
+    expect(store.get(info.userId, info.id)?.incusRecreation).toEqual({ nonce: marker.nonce });
   });
 });
 
@@ -537,6 +550,7 @@ async function initialCreationFixture(run: (manager: ContainerManager, store: Wo
       state.options = options;
       expect(options.start).toBe(false);
       expect(store.get(options.userId, options.id)?.incusRecreation?.nonce).toBe(options.recreationNonce);
+      expect(store.get(options.userId, options.id)?.incusRecreation?.initialCreate).toBe(true);
       calls.push('create-stopped');
       return { config: { 'volatile.uuid': 'initial-uuid', 'user.agentor.recreation': options.recreationNonce } };
     };
@@ -818,6 +832,48 @@ test('real production-manager archive retains canonical volumes, source and pend
       for (const worker of [lost, failed]) for (const role of ['workspace', 'agents']) {
         const volume = await runtime.client.getCustomVolume(config.incusStoragePool, `${manager.buildContainerName(worker.id)}-${role}`);
         expect(volume.config['user.agentor.id']).toBe(worker.id); expect(volume.used_by ?? []).toEqual([]);
+      }
+      // A first create can fail before allocation, or after only workspace
+      // allocation. Reload/reconcile must preserve partial state and config,
+      // not leave an unrecoverable rebuild-style marker or fabricate roots.
+      for (const allocation of ['none', 'workspace']) {
+        let attemptedOptions: any;
+        const createVolume = runtime.client.createCustomVolume.bind(runtime.client);
+        if (allocation === 'workspace') runtime.client.createCustomVolume = async (pool, volume) => {
+          if (volume.name.endsWith('-agents')) throw new Error('injected partial allocation');
+          return createVolume(pool, volume);
+        };
+        runtime.create = async (options, existing) => {
+          attemptedOptions = options;
+          if (allocation === 'none') throw new Error('injected preallocation failure');
+          return create(options, existing);
+        };
+        try {
+          await expect((manager as any).createForOwner({ userId: info.userId, displayName: `initial ${allocation}`,
+            workerConfiguration: { secrets: [{ key: 'PARTIAL_SECRET', value: `retained-${allocation}` }] } }))
+            .rejects.toMatchObject({ code: 'WORKER_CREATE_CONTAINER_RETAINED' });
+        } finally { runtime.create = create; runtime.client.createCustomVolume = createVolume; }
+        expect(cleanupStore.get(info.userId, attemptedOptions.id)?.incusRecreation?.initialCreate).toBe(true);
+        const partialStore = new WorkerStore(root); await partialStore.init();
+        const recovery = new ContainerManager({ listContainers: async () => [] } as any, config);
+        recovery.setWorkerStore(partialStore); recovery.setIncusRuntime(runtime);
+        (recovery as any).assertOwnerExists = async () => {};
+        await recovery.sync(); await recovery.reconcileIncusWorkers();
+        expect(partialStore.get(info.userId, attemptedOptions.id)).toMatchObject({
+          status: 'archived', desiredRuntimeStatus: 'stopped', displayName: `initial ${allocation}` });
+        expect(partialStore.get(info.userId, attemptedOptions.id)?.incusRecreation).toBeUndefined();
+        expect(await useWorkerConfigStore().resolveValues(info.userId, attemptedOptions.id))
+          .toContainEqual(expect.objectContaining({ key: 'PARTIAL_SECRET', value: `retained-${allocation}` }));
+        await expect(runtime.client.getInstance(attemptedOptions.containerName)).rejects.toMatchObject({ statusCode: 404 });
+        await expect(runtime.preflightRecreation(attemptedOptions)).rejects.toThrow('source is missing');
+        await expect(runtime.client.getCustomVolume(config.incusStoragePool, `${attemptedOptions.containerName}-agents`))
+          .rejects.toMatchObject({ statusCode: 404 });
+        if (allocation === 'workspace') {
+          const workspace = await runtime.client.getCustomVolume(config.incusStoragePool, `${attemptedOptions.containerName}-workspace`);
+          expect(workspace.config['user.agentor.id']).toBe(attemptedOptions.id); expect(workspace.used_by ?? []).toEqual([]);
+        } else await expect(runtime.client.getCustomVolume(config.incusStoragePool, `${attemptedOptions.containerName}-workspace`))
+          .rejects.toMatchObject({ statusCode: 404 });
+        manager.setWorkerStore(partialStore); cleanupStore = partialStore;
       }
       return;
     }

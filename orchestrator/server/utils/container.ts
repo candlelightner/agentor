@@ -1658,7 +1658,7 @@ export class ContainerManager {
       };
       if (runtimeKind === "incus-vm") {
         if (!this.workerStore) throw new Error('WorkerStore is required for Incus creation');
-        const marker = { nonce: randomUUID(), replacementIncarnation: undefined as string | undefined };
+        const marker = { nonce: randomUUID(), replacementIncarnation: undefined as string | undefined, initialCreate: true as const };
         await this.workerStore.transitionIncusRecreation(userId, id,
           { status: 'active', desiredRuntimeStatus: 'stopped', incusRecreation: marker });
         incusCreation!.nonce = marker.nonce; incusCreation!.attempted = true;
@@ -1700,7 +1700,7 @@ export class ContainerManager {
       if (runtimeKind === 'incus-vm') {
         const resolved = await this.workerStore!.transitionIncusRecreation(userId, id,
           { status: 'active', desiredRuntimeStatus: 'running', incusRecreation: undefined }, undefined,
-          { nonce: incusCreation!.nonce!, replacementIncarnation: incusCreation!.incarnation });
+          { nonce: incusCreation!.nonce!, replacementIncarnation: incusCreation!.incarnation, initialCreate: true });
         Object.assign(containerInfo, resolved, { status: 'running' });
       } else if (this.workerStore) {
         await this.workerStore.upsert(
@@ -5363,7 +5363,7 @@ for p in sys.argv[1:]:
       }
       try {
         await this.incusRuntime.rollbackRecreation({ id, userId, containerName },
-          { nonce: proof.nonce, replacementIncarnation: proof.incarnation });
+          { nonce: proof.nonce, replacementIncarnation: proof.incarnation, initialCreate: marker.initialCreate });
         await this.workerStore!.transitionIncusRecreation(userId, id,
           { status: 'archived', desiredRuntimeStatus: 'stopped', incusRecreation: undefined }, undefined, marker);
         this.containers.delete(id);

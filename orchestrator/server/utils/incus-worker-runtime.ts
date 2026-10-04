@@ -333,11 +333,13 @@ export class IncusWorkerRuntime {
    * newer desired settings. A lost response is recoverable only by the nonce
    * written by our create request, authoritative owner and current UUID. */
   async rollbackRecreation(owner: IncusStorageOwner,
-    marker: { nonce: string; originalIncarnation?: string; replacementIncarnation?: string }):
+    marker: { nonce: string; originalIncarnation?: string; replacementIncarnation?: string; initialCreate?: true }):
     Promise<{ status: 'active' | 'archived'; incarnation?: string }> {
     if (!marker || typeof marker.nonce !== 'string' || !marker.nonce || marker.nonce.length > 128 ||
         [marker.originalIncarnation, marker.replacementIncarnation].some((id) =>
           id !== undefined && (typeof id !== 'string' || !id || id.length > 128)) ||
+        (marker.initialCreate !== undefined && marker.initialCreate !== true) ||
+        (marker.initialCreate && marker.originalIncarnation !== undefined) ||
         (marker.originalIncarnation && marker.originalIncarnation === marker.replacementIncarnation))
       throw new Error('Incus recreation recovery marker is invalid');
     let instance: IncusInstance;
@@ -347,6 +349,12 @@ export class IncusWorkerRuntime {
       // unavailable API/storage facts into permission to discard the marker.
       if ((error as { statusCode?: number }).statusCode !== 404) throw error;
       const storage = await this.storage();
+      if (marker.initialCreate) {
+        // Only explicit first-create authority permits incomplete allocation.
+        // Keep partial data/config; neither allocate nor delete anything.
+        await storage.verifyPartialInitial(owner);
+        return { status: 'archived' };
+      }
       if (!await storage.imageIdentity(owner)) throw new Error('Incus recreation retained source is missing');
       await storage.verifyExisting(owner);
       return { status: 'archived' };

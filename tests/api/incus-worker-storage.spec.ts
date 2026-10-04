@@ -76,6 +76,47 @@ test("an active attachment on another instance or project cannot be shared", asy
   await expect(storage.remove(owner)).rejects.toThrow("attached");
 });
 
+test('partial first-create preflight permits missing volumes but never allocates or replaces canonical data', async () => {
+  for (const roles of [[], ['workspace'], ['workspace', 'agents'], ['docker']]) {
+    const { storage, volumes, writes } = fixture();
+    await storage.devices(owner, true);
+    for (const name of volumes.keys()) if (!roles.some((role) => name.endsWith('-' + role))) volumes.delete(name);
+    writes.length = 0;
+    await storage.verifyPartialInitial(owner);
+    if (!roles.includes('workspace') || !roles.includes('agents'))
+      await expect(storage.verifyExisting(owner)).rejects.toThrow('missing');
+    expect(writes).toEqual([]);
+    expect(volumes.size).toBe(roles.length);
+  }
+});
+
+test('partial initial storage rejects foreign/type/metadata ambiguity and every attachment without writes', async () => {
+  for (const failure of ['owner', 'installation', 'type', 'source', 'docker-marker', 'same-attachment', 'foreign-attachment']) {
+    const { storage, volumes, writes } = fixture();
+    await storage.devices(owner, true);
+    const workspace = volumes.get(`${owner.containerName}-workspace`);
+    if (failure === 'owner') workspace.config['user.agentor.owner'] = 'foreign';
+    if (failure === 'installation') workspace.config['user.agentor.installation'] = 'foreign';
+    if (failure === 'type') workspace.content_type = 'block';
+    if (failure === 'source') workspace.config['user.agentor.image-source'] = '{invalid';
+    if (failure === 'docker-marker') workspace.config['user.agentor.docker-data'] = 'false';
+    if (failure === 'same-attachment') workspace.used_by = [`/1.0/instances/${owner.containerName}?project=agentor`];
+    if (failure === 'foreign-attachment') workspace.used_by = ['/1.0/instances/foreign?project=agentor'];
+    writes.length = 0;
+    await expect(storage.verifyPartialInitial(owner)).rejects.toThrow();
+    expect(writes).toEqual([]);
+  }
+});
+
+test('partial initial preflight propagates unavailable storage rather than treating it as missing', async () => {
+  for (const statusCode of [503, undefined]) {
+    const { storage, writes } = fixture();
+    (storage as any).client.getCustomVolume = async () => { throw Object.assign(new Error('storage unavailable'), { statusCode }); };
+    await expect(storage.verifyPartialInitial(owner)).rejects.toThrow('storage unavailable');
+    expect(writes).toEqual([]);
+  }
+});
+
 test("permanent deletion removes only detached core worker-owned volumes", async () => {
   const { storage, volumes, writes } = fixture();
   await storage.devices(owner, true);

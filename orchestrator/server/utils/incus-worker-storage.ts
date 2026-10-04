@@ -128,10 +128,30 @@ export class IncusWorkerStorage {
     return marker === 'true';
   }
 
+  /** Failed first creation may not have allocated all canonical roots yet.
+   * This read-only check is never a rebuild/unarchive allocation preflight. */
+  async verifyPartialInitial(owner: IncusStorageOwner): Promise<void> {
+    for (const role of ['workspace', 'agents', 'docker'] as const) {
+      const volume = await this.find(owner, role);
+      if (!volume) continue;
+      this.validate(volume, owner, role);
+      if (volume.used_by?.length)
+        throw new Error('Incus initial storage is still attached; explicit recovery is required');
+      if (role === 'workspace') {
+        this.expectsDocker(volume);
+        this.readImageIdentity(volume);
+      }
+    }
+  }
+
   async imageIdentity(owner: IncusStorageOwner): Promise<IncusWorkerImageIdentity | undefined> {
     const workspace = await this.find(owner, 'workspace');
     if (!workspace) return undefined;
     this.validate(workspace, owner, 'workspace');
+    return this.readImageIdentity(workspace);
+  }
+
+  private readImageIdentity(workspace: IncusCustomVolume): IncusWorkerImageIdentity | undefined {
     const stored = workspace.config['user.agentor.image-source'];
     if (stored === undefined) return undefined;
     if (typeof stored !== 'string' || stored.length > 2048)

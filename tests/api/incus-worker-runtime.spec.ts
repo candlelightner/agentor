@@ -361,6 +361,53 @@ test('absent interrupted compute requires canonical volumes and source metadata 
   }
 });
 
+test('only explicit initial-create recovery can archive authoritative missing compute with incomplete storage', async () => {
+  for (const roles of [[], ['workspace'], ['workspace', 'agents']]) {
+    const { client, events } = fakeClient();
+    const runtime = new IncusWorkerRuntime(config, client as any), opts = options();
+    await runtime.create({ ...opts, start: false });
+    client.getInstance = async () => { throw Object.assign(new Error('missing compute'), { statusCode: 404 }); };
+    const get = client.getCustomVolume;
+    client.getCustomVolume = async (pool, name) => {
+      if (!roles.some((role) => name.endsWith('-' + role))) throw Object.assign(new Error('missing volume'), { statusCode: 404 });
+      const volume = structuredClone(await get(pool, name));
+      delete volume.config['user.agentor.image-source'];
+      return volume;
+    };
+    events.length = 0;
+    await expect(runtime.rollbackRecreation(opts, { nonce: 'initial-nonce', initialCreate: true })).resolves.toEqual({ status: 'archived' });
+    await expect(runtime.rollbackRecreation(opts, { nonce: 'historical-nonce' })).rejects.toThrow();
+    await expect(runtime.preflightRecreation(opts)).rejects.toThrow();
+    expect(events.some((e) => ['stop', 'remove', 'create', 'start', 'volume-create', 'volume-update'].includes(e.operation))).toBe(false);
+  }
+});
+
+test('initial-create discriminator rejects nonliteral/contradictory markers before any runtime lookup', async () => {
+  for (const marker of [
+    { nonce: 'nonce', initialCreate: false }, { nonce: 'nonce', initialCreate: 'true' },
+    { nonce: 'nonce', initialCreate: null }, { nonce: 'nonce', initialCreate: true, originalIncarnation: 'old' },
+  ]) {
+    const { client, events } = fakeClient();
+    const runtime = new IncusWorkerRuntime(config, client as any);
+    await expect(runtime.rollbackRecreation(options(), marker as any)).rejects.toThrow('marker is invalid');
+    expect(events).toEqual([]);
+  }
+});
+
+test('initial-create marker does not waive unavailable lookup or replacement nonce/UUID fencing', async () => {
+  for (const failure of ['lookup', 'nonce', 'uuid']) {
+    const { client, events } = fakeClient();
+    const runtime = new IncusWorkerRuntime(config, client as any), opts = options();
+    const instance = await runtime.create({ ...opts, start: false, recreationNonce: 'initial-nonce' });
+    if (failure === 'lookup') client.getInstance = async () => { throw Object.assign(new Error('API unavailable'), { statusCode: 503 }); };
+    if (failure === 'nonce') instance.config['user.agentor.recreation'] = 'wrong';
+    events.length = 0;
+    await expect(runtime.rollbackRecreation(opts, { nonce: 'initial-nonce', initialCreate: true,
+      replacementIncarnation: failure === 'uuid' ? 'wrong' : 'original-uuid' })).rejects.toThrow();
+    expect(events.some((e) => ['stop', 'remove', 'create', 'start', 'volume-create', 'volume-update'].includes(e.operation))).toBe(false);
+  }
+});
+
 test('replacement nonce, UUID and owner are rechecked after stop before interrupted-recreation deletion', async () => {
   for (const key of ['user.agentor.recreation', 'volatile.uuid', 'user.agentor.owner']) {
     const { client, events } = fakeClient();

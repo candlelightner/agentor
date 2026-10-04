@@ -37,7 +37,7 @@ export interface WorkerRecord extends UserOwnedResource {
   deletionPending?: boolean;
   /** Bounded Incus compute-replacement recovery marker, not portable image or
    * storage authority. Unfinished replacements stay inaccessible until resolved. */
-  incusRecreation?: { nonce: string; originalIncarnation?: string; replacementIncarnation?: string };
+  incusRecreation?: { nonce: string; originalIncarnation?: string; replacementIncarnation?: string; initialCreate?: true };
   /** Foreign key to the assigned environment — the only environment data stored
    * on the worker. The environment's config (CPU/memory/network/docker/setup
    * script/env vars/exposed APIs/capabilities/instructions) lives in the
@@ -190,7 +190,8 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
         throw new Error('Incus recreation durable authority is unavailable');
       if (expectedMarker && (previous.incusRecreation?.nonce !== expectedMarker.nonce ||
           previous.incusRecreation.originalIncarnation !== expectedMarker.originalIncarnation ||
-          previous.incusRecreation.replacementIncarnation !== expectedMarker.replacementIncarnation))
+          previous.incusRecreation.replacementIncarnation !== expectedMarker.replacementIncarnation ||
+          previous.incusRecreation.initialCreate !== expectedMarker.initialCreate))
         throw new Error('Incus recreation recovery marker changed');
       const completion = pendingAfterCompletion ? { pendingRebuild: await pendingAfterCompletion(),
         hostMountsRevoked: false, hardwareDevicesRevoked: false } : {};
