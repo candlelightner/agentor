@@ -4,6 +4,9 @@ import { IncusWorkerRuntime } from './incus-worker-runtime';
 import { backupInstallationId } from './backup-installation';
 import { managedVolumeRuntimeKind, pathsOverlap, validatePersistenceTarget, volumeError, assertIncusLiveResolved, type StoredManagedVolume } from './managed-volume-store';
 import type { IncusStorageOwner } from './incus-worker-storage';
+import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 /** Managed paths keep their existing store/policy. This adapter owns only the
  * Incus filesystem and retained-compute seeding operations, not a second
@@ -190,6 +193,172 @@ export class IncusManagedVolumeRuntime {
       { incusStagingAmbiguous: true, cause: error });
   }
 
+  private async liveProof(handle: string, v: StoredManagedVolume, marker: string, seconds = 15) {
+    const intent = v.incusLive!;
+    return JSON.parse(await this.exec(v.userId, v.workerId, handle, ['timeout', String(seconds + 2), 'python3', '-I', '-c',
+      INCUS_LIVE_PROOF, intent.id, intent.bootId, marker, String(seconds)])) as Record<string, unknown>;
+  }
+  private async liveSignal(handle: string, v: StoredManagedVolume, marker: string) {
+    await this.exec(v.userId, v.workerId, handle, ['python3', '-I', '-c', INCUS_LIVE_SIGNAL,
+      v.incusLive!.id, v.incusLive!.bootId, marker]);
+  }
+
+  /** Existing owner/worker fence is held by the caller. No ordinary exec
+   * adapter may run while the guest agent is exempt from the freezer. */
+  async mountLive(handle: string, initial: StoredManagedVolume, persist: (v: StoredManagedVolume) => Promise<void>) {
+    assertIncusLiveResolved(initial); this.validateRecord(initial);
+    if (!initial.attached) throw volumeError(409, 'Reattach the volume before live application.');
+    let instance = await this.validateTarget(initial.userId, initial.workerId, handle, initial.target, initial.seeded ? initial : undefined);
+    const key = this.deviceKey(initial);
+    if (initial.seeded && this.matchesDevice(instance.devices[key], initial)) {
+      await this.ensureVolume(initial);
+      await this.exec(initial.userId, initial.workerId, handle, ['mountpoint', '-q', '--', initial.target]);
+      return;
+    }
+    if (instance.devices[key]) throw volumeError(409, 'Live persistence device conflicts with retained compute.');
+    // Provisional selection copies are not canonical. Never reuse their stale
+    // bytes when live adoption follows continued rootfs writes/deletions.
+    if (!initial.seeded) await this.removeStaging(initial);
+    await this.ensureVolume(initial);
+    const helpers = await Promise.all(['incus-volume-live-helper.py', 'volume-mount-helper.py'].map(trustedLiveHelper));
+    const bootId = (await this.exec(initial.userId, initial.workerId, handle, ['cat', '/proc/sys/kernel/random/boot_id'])).trim();
+    const incarnation = handle.slice(6), uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
+    if (!uuid.test(bootId) || !uuid.test(incarnation)) throw volumeError(409, 'Live guest boot or incarnation is unavailable.');
+    const agent = (await this.exec(initial.userId, initial.workerId, handle, ['systemctl', 'show', '-p', 'MainPID', '--value', 'incus-agent'])).trim();
+    if (!/^[1-9][0-9]*$/.test(agent) || agent === '1') throw volumeError(409, 'Incus guest agent PID is unavailable.');
+    let v = structuredClone(initial);
+    const save = async (next: StoredManagedVolume) => { await persist(next); v = structuredClone(next); };
+    await save({ ...v, incusLive: { id: randomUUID(), incarnation, bootId, attachment: 'not-submitted' } });
+    try {
+      const path = `/run/agentor/live-volumes/${v.incusLive!.id}`;
+      await this.exec(v.userId, v.workerId, handle, ['install', '-d', '-m', '700', '--', path]);
+      for (const [index, name] of ['incus-volume-live-helper.py', 'volume-mount-helper.py'].entries())
+        await this.worker.client.pushFile(instance.name, `${path}/${name}`, helpers[index]!, { mode: 0o600 });
+      await this.exec(v.userId, v.workerId, handle, ['bash', '-ec',
+        'umask 077; nohup python3 -I "$1/incus-volume-live-helper.py" "$2" "$3" "$4" "$5" "$6" >"$1/log" 2>&1 </dev/null &',
+        'agentor-live-volume', path, v.target, v.seeded ? 'seeded' : 'new', agent, bootId, v.incusLive!.id]);
+      await this.liveProof(handle, v, 'armed');
+      await this.liveSignal(handle, v, 'begin');
+      const ready = await this.liveProof(handle, v, 'ready', 120);
+      if (ready.sourceSynced !== true) throw volumeError(409, 'Original live source sync was not proven.');
+      await this.liveSignal(handle, v, 'request-attach');
+      await this.liveProof(handle, v, 'attach-armed');
+      // This write precedes the only canonical attachment submission. Lost
+      // response/ack persistence is never permission to resend or detach it.
+      await save({ ...v, incusLive: { ...v.incusLive!, attachment: 'unknown' } });
+      instance = await this.inspect(v.userId, v.workerId, handle);
+      if (instance.devices[key]) throw volumeError(409, 'Canonical device changed before live attachment.');
+      await this.worker.client.updateInstanceDevices(instance.name, { ...instance.devices, [key]: this.device(v) }, async operation => {
+        await save({ ...v, incusLive: { ...v.incusLive!, attachment: operation ? 'accepted' : 'settled', operation } });
+      });
+      await save({ ...v, incusLive: { ...v.incusLive!, attachment: 'settled' } });
+      instance = await this.inspect(v.userId, v.workerId, handle);
+      if (!this.matchesDevice(instance.devices[key], v)) throw volumeError(409, 'Canonical live attachment is not authoritative.');
+      await this.exec(v.userId, v.workerId, handle, ['timeout', '15', 'bash', '-ec',
+        'until mountpoint -q -- "$1"; do sleep .05; done', 'live-mount-ready', v.target]);
+      await this.liveSignal(handle, v, 'mount-settled');
+      await this.liveProof(handle, v, 'copied', 120);
+      await save({ ...v, seeded: true }); // Data authority BEFORE writer release.
+      await this.liveSignal(handle, v, 'release');
+      await this.liveProof(handle, v, 'restored');
+      await save({ ...v, incusLive: undefined });
+    } catch (error) {
+      // Recovery only consumes acknowledged terminal operations and proven
+      // durable data. Any ambiguity retains both sources and the quarantine.
+      try { await this.recoverLive(v, persist); }
+      catch { /* retained intent fences all ordinary lifecycle and commands */ }
+      throw Object.assign(volumeError(409, 'Live persistence failed. Original and volume data were retained; retry storage recovery before changing compute.'), { cause: error });
+    }
+  }
+
+  /** Bounded per-volume recovery, also used after Orchestrator restart. Unknown
+   * submission or uncommitted data after a different boot cannot be adopted. */
+  async recoverLive(initial: StoredManagedVolume, persist: (v: StoredManagedVolume) => Promise<void>) {
+    if (!initial.incusLive) return;
+    this.validateRecord(initial);
+    let v = structuredClone(initial), intent = v.incusLive!, handle = `incus:${intent.incarnation}`;
+    const save = async (next: StoredManagedVolume) => { await persist(next); v = structuredClone(next); intent = v.incusLive!; };
+    let instance = await this.inspect(v.userId, v.workerId, handle);
+    const key = this.deviceKey(v), found = await this.inspectVolume(v);
+    if (!found) throw volumeError(409, 'Live recovery volume is missing; no replacement was allocated.');
+    if (intent.attachment === 'unknown') throw volumeError(409, 'Live device submission has unknown authority. Both sources remain quarantined.');
+    if (intent.attachment === 'accepted') {
+      // Observe the exact operation. Failure is terminal too, but timeout,
+      // missing operation and transport failure do not establish settlement.
+      try { await this.worker.client.waitForOperation(intent.operation!); }
+      catch {
+        const operation = await this.worker.client.request<{ status: string }>('GET', intent.operation!);
+        if (operation.status !== 'Failure' && operation.status !== 'Success')
+          throw volumeError(409, 'Live device operation is not terminal; data remains quarantined.');
+      }
+      await save({ ...v, incusLive: { ...intent, attachment: 'settled' } });
+      instance = await this.inspect(v.userId, v.workerId, handle);
+    }
+    if (instance.devices[key] && !this.matchesDevice(instance.devices[key], v))
+      throw volumeError(409, 'Live recovery device identity changed. All data was retained.');
+    if (intent.attachment === 'not-submitted') {
+      if (instance.devices[key] || found.used_by.length) throw volumeError(409, 'Unsubmitted live recovery unexpectedly has an attachment.');
+      if (instance.status === 'Running') {
+        let restored = false;
+        try { await this.liveProof(handle, v, 'safe-original'); restored = true; }
+        catch {
+          if (v.seeded) throw volumeError(409, 'Seeded reattachment restoration is unresolved. Data remains quarantined.');
+          // Without independent no-thaw containment, wait for restoration.
+          await this.liveProof(handle, v, 'frozen-source');
+        }
+        if (restored) { await save({ ...v, incusLive: undefined }); return; }
+        await this.worker.client.stopInstance(instance.name, { force: true });
+      }
+      instance = await this.inspect(v.userId, v.workerId, handle);
+      const after = await this.inspectVolume(v);
+      if (instance.status !== 'Stopped' || instance.devices[key] || !after || after.used_by.length)
+        throw volumeError(409, 'Unsubmitted live recovery is not contained and detached.');
+      // No canonical submission occurred. Both fresh staging and an existing
+      // seeded volume stay unchanged; reattachment can be retried later.
+      await save({ ...v, incusLive: undefined });
+      return;
+    }
+    if (v.seeded) {
+      if (!this.matchesDevice(instance.devices[key], v)) throw volumeError(409, 'Committed live volume lost its canonical attachment.');
+      if (instance.status === 'Running') {
+        // Once release happened, the earlier copy sync is stale: writers may
+        // have dirty canonical bytes. Never power-cut them to clear metadata.
+        // Same-boot restored proof permits a non-disruptive final commit retry;
+        // another boot or incomplete restoration stays quarantined.
+        await this.liveProof(handle, v, 'restored');
+        await this.exec(v.userId, v.workerId, handle, ['mountpoint', '-q', '--', v.target]);
+      } else if (instance.status !== 'Stopped') throw volumeError(409, 'Committed live recovery compute state is ambiguous.');
+      await save({ ...v, incusLive: undefined });
+      return;
+    }
+    if (!intent.rollback) {
+      // Before a cold stop, prove the synced original and all original writers
+      // still frozen in this exact boot. A stopped/rebooted guest has lost the
+      // ephemeral proof and therefore stays quarantined instead of guessing.
+      if (instance.status !== 'Running') throw volumeError(409, 'Uncommitted live source has lost its boot proof. Both copies were retained.');
+      await this.liveProof(handle, v, 'frozen-source');
+    }
+    if (intent.rollback && instance.status !== 'Stopped')
+      throw volumeError(409, 'Contained rollback compute was restarted unexpectedly. Data remains quarantined.');
+    if (instance.status === 'Running') await this.worker.client.stopInstance(instance.name, { force: true });
+    instance = await this.inspect(v.userId, v.workerId, handle);
+    if (instance.status !== 'Stopped') throw volumeError(409, 'Live recovery compute is not cold-contained.');
+    if (!v.seeded && !intent.rollback) await save({ ...v, incusLive: { ...intent, rollback: true } });
+    if (instance.devices[key]) {
+      const devices = { ...instance.devices }; delete devices[key];
+      await save({ ...v, incusLive: { ...intent, attachment: 'unknown', operation: undefined } });
+      await this.worker.client.updateInstanceDevices(instance.name, devices, async operation => {
+        await save({ ...v, incusLive: { ...intent, attachment: operation ? 'accepted' : 'settled', operation } });
+      });
+      await save({ ...v, incusLive: { ...intent, attachment: 'settled' } });
+    }
+    instance = await this.inspect(v.userId, v.workerId, handle);
+    const after = await this.inspectVolume(v);
+    if (instance.status !== 'Stopped' || (!v.seeded && (instance.devices[key] || !after || after.used_by.length)))
+      throw volumeError(409, 'Live recovery device/reference settlement is not authoritative.');
+    await save({ ...v, incusLive: undefined });
+  }
+
   /** Retain the original root until the metadata-faithful copy AND seeded
    * store write succeed. Lost responses leave exact-owned staging for retry.
    * Standard Agentor units are quiesced by an unprovisioned new boot; arbitrary
@@ -243,6 +412,60 @@ export class IncusManagedVolumeRuntime {
     }
   }
 }
+
+async function trustedLiveHelper(name: string) {
+  for (const directory of ['.output/server', '.', '../orchestrator']) {
+    try { return await readFile(join(process.cwd(), directory, name)); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  }
+  throw volumeError(503, 'Trusted live persistence helper is missing from the Orchestrator installation.');
+}
+
+export const INCUS_LIVE_SIGNAL = String.raw`
+import pathlib,re,sys
+operation,boot,marker=sys.argv[1:]
+assert re.fullmatch(r'[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}',operation)
+assert marker in ('begin','request-attach','mount-settled','release')
+assert pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()==boot
+(pathlib.Path('/run/agentor/live-volumes')/operation/marker).touch(mode=0o600)
+`;
+
+export const INCUS_LIVE_PROOF = String.raw`
+import json,pathlib,re,sys,time
+operation,boot,marker,seconds=sys.argv[1:]
+assert re.fullmatch(r'[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}',operation)
+state=pathlib.Path('/run/agentor/live-volumes')/operation
+def read(name):
+ value=json.loads((state/name).read_text());assert value['bootId']==boot;return value
+assert pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()==boot
+if marker=='safe-original':
+ assert not (state/'attach-armed').exists();read('restored');result={'safe':True}
+elif marker=='frozen-source':
+ ready=read('ready');assert ready['sourceSynced'] is True
+ # Before attachment is armed, the watchdog may safely thaw on timeout.
+ # Such a proof cannot authorize a later power cut of resumed writers.
+ read('attach-armed')
+ assert not (state/'released').exists() and not (state/'release').exists()
+ root=pathlib.Path('/sys/fs/cgroup');exempt=root/('agentor-live-'+operation)
+ assert exempt.is_dir()
+ for group in root.iterdir():
+  if group.is_dir() and group!=exempt:assert 'frozen 1' in (group/'cgroup.events').read_text()
+ for pid in (root/'cgroup.procs').read_text().split():
+  try:value=(pathlib.Path('/proc')/pid/'stat').read_text()
+  except FileNotFoundError:continue
+  assert int(value[value.rindex(')')+2:].split()[6]) & 0x00200000
+ result={'safe':True}
+else:
+ assert marker in ('armed','ready','attach-armed','copied','restored')
+ deadline=time.monotonic()+min(120,float(seconds))
+ while not (state/marker).exists():
+  assert not (state/'error').exists() and not (state/'watchdog-error').exists()
+  assert time.monotonic()<deadline
+  time.sleep(.05)
+ result=read(marker)
+assert pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()==boot
+print(json.dumps(result))
+`;
 
 export const INCUS_SELECTION_DIRECTORY_CHECK = String.raw`
 import os, stat, sys

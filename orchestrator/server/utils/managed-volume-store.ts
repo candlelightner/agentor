@@ -40,6 +40,9 @@ export interface IncusLiveVolumeIntent {
   bootId: string;
   attachment: 'not-submitted' | 'unknown' | 'accepted' | 'settled';
   operation?: string;
+  /** Set only after proven source sync/freezer state and terminal cold stop.
+   * Allows interrupted rollback to continue without recopying either source. */
+  rollback?: true;
 }
 
 export interface StoredManagedVolume extends ManagedVolume {
@@ -72,9 +75,10 @@ function validateRecord(v: StoredManagedVolume) {
     if (!intent || typeof intent !== 'object' || Array.isArray(intent) ||
         v.storageRuntimeKind !== 'incus-vm' || v.purpose !== 'persistent-path' ||
         v.liveContainerId !== undefined || v.previousRestartPolicy !== undefined ||
-        Object.keys(intent).some(key => !['id', 'incarnation', 'bootId', 'attachment', 'operation'].includes(key)) ||
+        Object.keys(intent).some(key => !['id', 'incarnation', 'bootId', 'attachment', 'operation', 'rollback'].includes(key)) ||
         ![intent.id, intent.incarnation, intent.bootId].every(value => typeof value === 'string' && uuid.test(value)) ||
         !['not-submitted', 'unknown', 'accepted', 'settled'].includes(intent.attachment) ||
+        (intent.rollback !== undefined && (intent.rollback !== true || v.seeded)) ||
         (intent.operation !== undefined && (typeof intent.operation !== 'string' ||
           !/^\/1\.0\/operations\/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(intent.operation))) ||
         (intent.attachment === 'accepted' && !intent.operation) ||

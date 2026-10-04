@@ -146,8 +146,6 @@ export class ManagedVolumeManager {
       if (record.runtimeKind === 'incus-vm') await this.incusRuntime.validateTarget(actor.userId, actor.workerId, live.containerId, target);
       else await this.runtime.validateTarget(live.containerId, target);
       const mode = this.resolveMode(actor, input.mode, input.acknowledgePrivileged);
-      if (record.runtimeKind === 'incus-vm' && mode === 'live')
-        throw volumeError(409, 'Incus live persistence is not yet available. Choose deferred application or recreation.');
       const volume = await this.store.create(actor.userId, actor.workerId, target, input.name as string | undefined, record.runtimeKind);
       volume.operation = { id: randomUUID(), mode, stage: "queued" };
       await this.store.save(volume);
@@ -197,6 +195,10 @@ export class ManagedVolumeManager {
         if (!v) return;
         try {
           const { live } = this.worker(actor);
+          // Another admitted operation may have left an unresolved intent
+          // before this queued callback acquired the worker fence. Do not
+          // start a second freezer or disrupt its independent containment.
+          this.assertDesiredStateEditable(actor);
           if (!live) throw volumeError(409, "Worker runtime is unavailable.");
           await useWorkerProtectionLockStore().verify(actor.workerId, actor.lockPassword);
           // Recheck policy after queueing; a revoke must take effect immediately.
@@ -229,8 +231,10 @@ export class ManagedVolumeManager {
   }
 
   private async live(worker: ContainerInfo, v: StoredManagedVolume) {
-    if (managedVolumeRuntimeKind(v) === 'incus-vm')
-      throw volumeError(409, 'Incus live persistence is not yet available. Choose recreation.');
+    if (managedVolumeRuntimeKind(v) === 'incus-vm') {
+      await this.incusRuntime.mountLive(worker.containerId, v, next => this.store.save(next));
+      return;
+    }
     const before = await this.runtime.validateTarget(worker.containerId, v.target, v.seeded ? v.dockerName : undefined);
     if (v.seeded && before.Mounts.some((m) => m.Name === v.dockerName && m.Destination === v.target)) return;
     if (!before.State.Running || before.State.Paused) throw volumeError(409, "Live mounting requires a running, unpaused worker.");
@@ -577,7 +581,7 @@ export class ManagedVolumeManager {
     for (const v of this.store.list()) workers.set(v.workerId, v.userId);
     for (const journal of this.recreations.list()) workers.set(journal.workerId, journal.userId);
     for (const [workerId, userId] of workers) {
-      try { await this.recoverWorker(userId, workerId); }
+      try { await withOwnerWorkerLifecycleMutation(userId, workerId, () => this.recoverWorker(userId, workerId)); }
       catch {
         this.recoveryFailures.add(workerId);
         for (const v of this.store.forWorker(userId, workerId)) {
@@ -602,13 +606,20 @@ export class ManagedVolumeManager {
     const worker = useWorkerStore().get(userId, workerId);
     this.assertBackend(userId, workerId);
     const records = this.store.forWorker(userId, workerId);
-    // Until the live recovery path proves operation/boot/data authority, an
-    // interrupted intent is never permission to reseed or reprovision.
-    this.assertLiveRecoveryResolved(userId, workerId);
+    if (records.some(v => v.incusLive) && (!worker || worker.status === 'archived' || worker.runtimeKind !== 'incus-vm' || worker.deletionPending || worker.incusRecreation))
+      throw volumeError(409, 'Live storage recovery has unresolved WorkerRecord authority. All data was retained.');
     if (worker?.runtimeKind === 'incus-vm' || records.some(v => managedVolumeRuntimeKind(v) === 'incus-vm')) {
       if (this.recreations.get(userId, workerId) || records.some(v => managedVolumeRuntimeKind(v) !== 'incus-vm' || v.liveContainerId || v.previousRestartPolicy))
         throw volumeError(409, 'Incus storage has incompatible legacy recovery state. All data was retained.');
-      for (const v of records) {
+      for (let v of records) {
+        if (v.incusLive) {
+          await this.incusRuntime.recoverLive(v, next => this.store.save(next));
+          // Recovery may durably change seeded/intent authority. Never write
+          // the stale pre-recovery snapshot back over that transaction.
+          const recovered = this.store.get(userId, v.id);
+          if (!recovered) throw volumeError(409, 'Live recovery lost its durable volume record.');
+          v = recovered;
+        }
         if (v.attached && v.seeded) await this.incusRuntime.ensureVolume(v);
         if (v.state === 'preparing' || v.operation?.stage === 'queued' && v.operation.mode !== 'deferred') {
           v.state = 'failed';
@@ -619,6 +630,7 @@ export class ManagedVolumeManager {
       this.recoveryFailures.delete(workerId);
       return;
     }
+    this.assertLiveRecoveryResolved(userId, workerId);
     if (worker) {
       const config = await useBackupManager().getConfig(worker.userId);
       const paths = [...(config?.selectedPathsByWorkspace?.[worker.id] ?? [])];

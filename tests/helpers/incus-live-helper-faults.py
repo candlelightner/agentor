@@ -65,6 +65,7 @@ with tempfile.TemporaryDirectory(prefix='incus-live-local-faults-') as temporary
              mock.patch.object(helper.os, 'waitpid', return_value=(99999, 0)), \
              mock.patch.object(helper, 'wait', side_effect=wait), mock.patch.object(helper, 'watchdog_alive', side_effect=alive), \
              mock.patch.object(helper, 'reject_source_mounts'), mock.patch.object(helper, 'scan_source'), \
+             mock.patch.object(helper.subprocess, 'run'), \
              mock.patch.object(helper, 'poweroff', side_effect=poweroff), \
              mock.patch.object(helper.os, '_exit', side_effect=SystemExit):
             if failure == 'fork':

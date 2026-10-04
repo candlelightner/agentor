@@ -84,11 +84,12 @@ test('Incus live intent survives reload, remains private and cannot be forgotten
     expect(reloaded.get(v.userId, v.id)?.incusLive).toEqual(intent);
     for (const bad of [null, {}, { ...intent, id: 'not-a-uuid' }, { ...intent, attachment: 'accepted' },
       { ...intent, operation: `/1.0/operations/${randomUUID()}` }, { ...intent, attachment: 'settled', operation: 'https://foreign/operation' },
-      { ...intent, authority: 'discard-source' }, { ...intent, bootId: 'old-boot' }])
+      { ...intent, authority: 'discard-source' }, { ...intent, bootId: 'old-boot' }, { ...intent, rollback: false }])
       await expect(reloaded.save({ ...v, incusLive: bad as any })).rejects.toThrow('recovery intent');
     for (const fields of [{ storageRuntimeKind: undefined }, { liveContainerId: 'container' }, { previousRestartPolicy: { Name: 'always' } }, { purpose: 'legacy-backup-path' }])
       await expect(reloaded.save({ ...v, incusLive: intent, ...fields } as any)).rejects.toThrow('recovery intent');
     const accepted = { ...intent, attachment: 'accepted' as const, operation: `/1.0/operations/${randomUUID()}` };
+    await expect(reloaded.save({ ...v, seeded: true, incusLive: { ...accepted, rollback: true } })).rejects.toThrow('recovery intent');
     await reloaded.save({ ...v, incusLive: accepted });
     await reloaded.save({ ...v, incusLive: { ...accepted, attachment: 'settled' }, seeded: true });
     const committed = new ManagedVolumeStore(dir); await committed.init();

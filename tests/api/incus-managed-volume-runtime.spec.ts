@@ -4,8 +4,8 @@ import { mkdtemp, mkdir, writeFile, symlink, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { IncusManagedVolumeRuntime, INCUS_PERSISTENCE_TARGET_CHECK, INCUS_SELECTION_DIRECTORY_CHECK } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
-import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volume-store';
+import { IncusManagedVolumeRuntime, INCUS_PERSISTENCE_TARGET_CHECK, INCUS_SELECTION_DIRECTORY_CHECK, INCUS_LIVE_PROOF, INCUS_LIVE_SIGNAL } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
+import { ManagedVolumeStore, assertIncusLiveResolved } from '../../orchestrator/server/utils/managed-volume-store';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import { ManagedVolumeManager } from '../../orchestrator/server/utils/managed-volume-manager';
 import { useWorkerStore } from '../../orchestrator/server/utils/services';
@@ -59,6 +59,247 @@ async function fixture(run: (runtime: IncusManagedVolumeRuntime, v: any, calls: 
   try { await run(runtime, v, calls, state); }
   finally { await rm(root, { recursive: true, force: true }); }
 }
+
+async function liveFixture(run: (runtime: IncusManagedVolumeRuntime, v: any, calls: string[], state: any,
+  persist: (next: any) => Promise<void>) => Promise<void>) {
+  await fixture(async (runtime, v, calls, state) => {
+    const store = new ManagedVolumeStore((runtime as any).config.dataDir); await store.init();
+    state.instance.config['volatile.uuid'] = randomUUID(); state.boot = randomUUID();
+    const baseExec = runtime.worker.client.exec.bind(runtime.worker.client);
+    runtime.worker.client.exec = async (name: string, command: string[], options: any) => {
+      if (command[0] === 'cat') return { returnCode: 0, stdout: state.boot, stderr: '' };
+      if (command[0] === 'systemctl') return { returnCode: 0, stdout: '4242', stderr: '' };
+      const proof = command.indexOf(INCUS_LIVE_PROOF), signal = command.indexOf(INCUS_LIVE_SIGNAL);
+      if (proof >= 0) {
+        const marker = command[proof + 3]!; calls.push('proof:' + marker);
+        if (marker === 'attach-armed') state.armed = true;
+        if (state.failProof === marker || (marker === 'safe-original' && state.armed) ||
+            (marker === 'frozen-source' && !state.armed))
+          return { returnCode: 1, stdout: '', stderr: '' };
+        return { returnCode: 0, stdout: JSON.stringify({ bootId: state.boot, sourceSynced: !state.noSourceSync, safe: true }), stderr: '' };
+      }
+      if (signal >= 0) { calls.push('signal:' + command[signal + 3]); return { returnCode: 0, stdout: '', stderr: '' }; }
+      return baseExec(name, command, options);
+    };
+    runtime.worker.client.pushFile = async () => { calls.push('push-helper'); };
+    runtime.worker.client.stopInstance = async (_name: string, options: any) => {
+      expect(options).toEqual({ force: true }); calls.push('force-stop'); state.instance.status = 'Stopped';
+    };
+    runtime.worker.client.waitForOperation = async (operation: string) => {
+      calls.push('wait:' + operation); if (state.unsettled) throw new Error('wait timeout'); return {} as any;
+    };
+    runtime.worker.client.request = async () => ({ status: state.unsettled ? 'Running' : 'Success' }) as any;
+    runtime.worker.client.updateInstanceDevices = async (_name: string, devices: any, accepted: any) => {
+      const attach = !!devices[runtime.deviceKey(v)]; calls.push(attach ? 'attach' : 'detach');
+      state.instance.devices = devices;
+      state.volume.used_by = attach ? [`/1.0/instances/${state.instance.name}?project=agentor`] : [];
+      if (state.lostAttach && attach || state.lostDetach && !attach) throw new Error('lost submission acknowledgement');
+      await accepted?.(`/1.0/operations/${randomUUID()}`);
+      if (state.unsettled) throw new Error('operation wait timeout');
+    };
+    const persist = async (next: any) => {
+      calls.push(`save:${next.incusLive?.attachment ?? 'clear'}:${next.seeded}:${!!next.incusLive?.rollback}`);
+      if (state.failSave?.(next)) throw new Error('injected store write failure');
+      await store.save(next); state.saved = store.get(v.userId, v.id);
+    };
+    state.saved = v;
+    await run(runtime, v, calls, state, persist);
+  });
+}
+
+test('live adapter persists intent/acknowledgement/seeded authority before release, without stop/start on success', async () => {
+  await liveFixture(async (runtime, v, calls, state, persist) => {
+    await runtime.mountLive(`incus:${state.instance.config['volatile.uuid']}`, v, persist);
+    expect(state.saved).toMatchObject({ seeded: true, incusLive: undefined });
+    const before = (a: string, b: string) => expect(calls.indexOf(a)).toBeLessThan(calls.indexOf(b));
+    before('save:not-submitted:false:false', 'push-helper');
+    before('save:unknown:false:false', 'attach');
+    before('save:accepted:false:false', 'save:settled:false:false');
+    before('save:settled:false:false', 'signal:mount-settled');
+    before('save:settled:true:false', 'signal:release');
+    before('proof:restored', 'save:clear:true:false');
+    expect(calls).not.toContain('force-stop'); expect(calls).not.toContain('start'); expect(calls).not.toContain('stop:original');
+  });
+});
+
+test('live adapter never submits canonical mutation if initial/unknown intent cannot be persisted', async () => {
+  for (const stage of ['not-submitted', 'unknown']) await liveFixture(async (runtime, v, calls, state, persist) => {
+    state.failSave = (next: any) => next.incusLive?.attachment === stage;
+    await expect(runtime.mountLive(`incus:${state.instance.config['volatile.uuid']}`, v, persist)).rejects.toThrow();
+    expect(calls).not.toContain('attach'); expect(calls).not.toContain('signal:release');
+    if (stage === 'not-submitted') expect(calls).not.toContain('push-helper');
+  });
+});
+
+test('lost canonical acknowledgement or accepted-store failure retains unknown intent and never resends or thaws', async () => {
+  for (const failure of ['ack', 'store']) await liveFixture(async (runtime, v, calls, state, persist) => {
+    state.lostAttach = failure === 'ack';
+    state.failSave = (next: any) => failure === 'store' && next.incusLive?.attachment === 'accepted';
+    await expect(runtime.mountLive(`incus:${state.instance.config['volatile.uuid']}`, v, persist)).rejects.toThrow('Live persistence failed');
+    expect(state.saved).toMatchObject({ seeded: false, incusLive: { attachment: 'unknown' } });
+    const before = [...calls]; await expect(runtime.recoverLive(state.saved, persist)).rejects.toThrow('unknown authority');
+    expect(calls).toEqual(before); expect(calls.filter(c => c === 'attach')).toHaveLength(1);
+    expect(calls).not.toContain('signal:release'); expect(calls).not.toContain('detach'); expect(calls).not.toContain('force-stop');
+  });
+});
+
+test('failed seeded-store write rolls back only synced frozen source with terminal detach, retaining both data sources', async () => {
+  await liveFixture(async (runtime, v, calls, state, persist) => {
+    state.failSave = (next: any) => next.seeded;
+    await expect(runtime.mountLive(`incus:${state.instance.config['volatile.uuid']}`, v, persist)).rejects.toThrow('Live persistence failed');
+    expect(state.saved).toMatchObject({ seeded: false, incusLive: undefined });
+    expect(state.instance.status).toBe('Stopped'); expect(state.instance.devices).toEqual({}); expect(state.volume).toBeTruthy();
+    expect(calls).not.toContain('signal:release');
+    expect(calls.indexOf('proof:frozen-source')).toBeLessThan(calls.indexOf('force-stop'));
+    expect(calls.indexOf('save:settled:false:true')).toBeLessThan(calls.indexOf('detach'));
+    expect(calls.at(-1)).toBe('save:clear:false:false');
+  });
+});
+
+test('lost rollback-detach response retains stopped compute and unknown rollback intent despite absent read-back', async () => {
+  await liveFixture(async (runtime, v, calls, state, persist) => {
+    state.failSave = (next: any) => next.seeded; state.lostDetach = true;
+    await expect(runtime.mountLive(`incus:${state.instance.config['volatile.uuid']}`, v, persist)).rejects.toThrow('Live persistence failed');
+    expect(state.saved).toMatchObject({ seeded: false, incusLive: { attachment: 'unknown', rollback: true } });
+    expect(state.instance.status).toBe('Stopped'); expect(state.instance.devices).toEqual({});
+    const before = [...calls]; await expect(runtime.recoverLive(state.saved, persist)).rejects.toThrow('unknown authority');
+    expect(calls).toEqual(before); expect(calls.filter(c => c === 'detach')).toHaveLength(1);
+    expect(calls).not.toContain('signal:release');
+  });
+});
+
+test('missing sync, lost boot proof and nonterminal operations quarantine uncommitted sources without force-stop or clear', async () => {
+  for (const failure of ['sync', 'boot', 'operation']) await liveFixture(async (runtime, v, calls, state, persist) => {
+    state.volume = state.ownedVolume;
+    const record = { ...v, incusLive: { id: randomUUID(), incarnation: state.instance.config['volatile.uuid'], bootId: state.boot,
+      attachment: failure === 'operation' ? 'accepted' : 'settled', operation: `/1.0/operations/${randomUUID()}` } };
+    if (failure === 'boot') state.instance.status = 'Stopped';
+    if (failure === 'sync') state.failProof = 'frozen-source';
+    if (failure === 'operation') state.unsettled = true;
+    await persist(record); const before = calls.length;
+    await expect(runtime.recoverLive(record as any, persist)).rejects.toThrow();
+    expect(calls.slice(before)).not.toContain('force-stop'); expect(calls.slice(before)).not.toContain('detach');
+    expect(state.saved.incusLive).toBeTruthy(); expect(state.saved.seeded).toBe(false);
+  });
+});
+
+test('durably committed volume recovers after boot-proof loss without recopying or detaching canonical data', async () => {
+  await liveFixture(async (runtime, v, calls, state, persist) => {
+    state.volume = state.ownedVolume; state.instance.status = 'Stopped';
+    state.instance.devices[runtime.deviceKey(v)] = runtime.device(v);
+    const record = { ...v, seeded: true, incusLive: { id: randomUUID(), incarnation: state.instance.config['volatile.uuid'],
+      bootId: state.boot, attachment: 'settled' as const } };
+    await runtime.recoverLive(record, persist);
+    expect(state.saved).toMatchObject({ seeded: true, incusLive: undefined });
+    expect(calls).not.toContain('detach'); expect(calls).not.toContain('copy');
+    expect(calls).not.toContain('force-stop'); expect(state.volume).toBeTruthy();
+  });
+});
+
+test('failed final intent clear retries restored committed authority without power-cutting released writers', async () => {
+  await liveFixture(async (runtime, v, calls, state, persist) => {
+    let failed = false;
+    state.failSave = (next: any) => {
+      if (!next.incusLive && !failed) { failed = true; return true; }
+      return false;
+    };
+    await expect(runtime.mountLive(`incus:${state.instance.config['volatile.uuid']}`, v, persist)).rejects.toThrow('Live persistence failed');
+    expect(failed).toBe(true);
+    expect(state.saved).toMatchObject({ seeded: true, incusLive: undefined });
+    expect(state.instance.status).toBe('Running');
+    expect(calls).toContain('signal:release');
+    expect(calls.filter(call => call === 'proof:restored')).toHaveLength(2);
+    expect(calls).not.toContain('force-stop'); expect(calls).not.toContain('detach');
+  });
+});
+
+test('running committed recovery without restored same-boot proof never cuts power or clears authority', async () => {
+  await liveFixture(async (runtime, v, calls, state, persist) => {
+    state.volume = state.ownedVolume; state.failProof = 'restored';
+    state.instance.devices[runtime.deviceKey(v)] = runtime.device(v);
+    const record = { ...v, seeded: true, incusLive: { id: randomUUID(), incarnation: state.instance.config['volatile.uuid'],
+      bootId: state.boot, attachment: 'settled' as const } };
+    await persist(record);
+    await expect(runtime.recoverLive(record, persist)).rejects.toThrow();
+    expect(state.saved).toMatchObject({ seeded: true, incusLive: record.incusLive });
+    expect(state.instance.status).toBe('Running');
+    expect(calls).not.toContain('force-stop'); expect(calls).not.toContain('detach');
+  });
+});
+
+test('pre-attachment synced freeze cannot authorize cold containment when watchdog may still thaw', async () => {
+  await liveFixture(async (runtime, v, calls, state, persist) => {
+    state.volume = state.ownedVolume; state.failProof = 'safe-original';
+    const record = { ...v, incusLive: { id: randomUUID(), incarnation: state.instance.config['volatile.uuid'],
+      bootId: state.boot, attachment: 'not-submitted' as const } };
+    await persist(record);
+    await expect(runtime.recoverLive(record, persist)).rejects.toThrow();
+    expect(INCUS_LIVE_PROOF).toContain("read('attach-armed')");
+    expect(state.saved.incusLive).toEqual(record.incusLive);
+    expect(calls).not.toContain('force-stop'); expect(calls).not.toContain('detach');
+    expect(state.instance.status).toBe('Running');
+  });
+});
+
+test('pre-submission recovery retains seeded reattachment data and clears only restored or cold detached authority', async () => {
+  for (const running of [true, false]) await liveFixture(async (runtime, v, calls, state, persist) => {
+    state.volume = state.ownedVolume; state.instance.status = running ? 'Running' : 'Stopped';
+    const record = { ...v, seeded: true, incusLive: { id: randomUUID(), incarnation: state.instance.config['volatile.uuid'],
+      bootId: state.boot, attachment: 'not-submitted' as const } };
+    await runtime.recoverLive(record, persist);
+    expect(state.saved).toMatchObject({ seeded: true, incusLive: undefined });
+    expect(calls).not.toContain('force-stop'); expect(calls).not.toContain('detach');
+    expect(state.instance.devices).toEqual({}); expect(state.volume).toBeTruthy();
+    expect(state.instance.status).toBe(running ? 'Running' : 'Stopped');
+  });
+});
+
+test('seeded reattachment without safe-original proof never authorizes a power cut even when attachment is armed', async () => {
+  await liveFixture(async (runtime, v, calls, state, persist) => {
+    state.volume = state.ownedVolume; state.armed = true;
+    const record = { ...v, seeded: true, incusLive: { id: randomUUID(), incarnation: state.instance.config['volatile.uuid'],
+      bootId: state.boot, attachment: 'not-submitted' as const } };
+    await persist(record);
+    await expect(runtime.recoverLive(record, persist)).rejects.toThrow('restoration is unresolved');
+    expect(state.saved.incusLive).toEqual(record.incusLive); expect(state.saved.seeded).toBe(true);
+    expect(calls).not.toContain('proof:frozen-source'); expect(calls).not.toContain('force-stop');
+    expect(calls).not.toContain('detach'); expect(calls).not.toContain('copy'); expect(calls).not.toContain('delete-volume');
+    expect(state.instance.status).toBe('Running');
+  });
+});
+
+test('interrupted acknowledged detach waits for terminal proof and retries failed settlement persistence without resubmission', async () => {
+  for (const failure of ['operation', 'store']) await liveFixture(async (runtime, v, calls, state, persist) => {
+    state.volume = state.ownedVolume; state.instance.status = 'Stopped';
+    const operation = `/1.0/operations/${randomUUID()}`;
+    const record = { ...v, incusLive: { id: randomUUID(), incarnation: state.instance.config['volatile.uuid'],
+      bootId: state.boot, attachment: 'accepted' as const, operation, rollback: true as const } };
+    await persist(record);
+    state.unsettled = failure === 'operation';
+    state.failSave = (next: any) => failure === 'store' && next.incusLive?.attachment === 'settled';
+    await expect(runtime.recoverLive(record, persist)).rejects.toThrow();
+    expect(state.saved.incusLive).toEqual(record.incusLive);
+    expect(calls).not.toContain('detach'); expect(calls).not.toContain('force-stop');
+    state.unsettled = false; state.failSave = undefined;
+    await runtime.recoverLive(state.saved, persist);
+    expect(calls.filter(call => call === 'wait:' + operation)).toHaveLength(2);
+    expect(state.saved.incusLive).toBeUndefined(); expect(state.saved.seeded).toBe(false);
+    expect(calls).not.toContain('detach'); expect(calls).not.toContain('start'); expect(state.volume).toBeTruthy();
+  });
+});
+
+test('live recovery refuses changed instance incarnation or installation identity without mutation', async () => {
+  for (const failure of ['incarnation', 'identity']) await liveFixture(async (runtime, v, calls, state, persist) => {
+    state.volume = state.ownedVolume; state.instance.status = 'Stopped';
+    const record = { ...v, incusLive: { id: randomUUID(), incarnation: state.instance.config['volatile.uuid'],
+      bootId: state.boot, attachment: 'settled' as const, rollback: true as const } };
+    await persist(record); const before = [...calls];
+    if (failure === 'incarnation') state.instance.config['volatile.uuid'] = randomUUID();
+    else runtime.worker.matchesWorkerIdentity = async () => false;
+    await expect(runtime.recoverLive(record, persist)).rejects.toThrow('incarnation changed');
+    expect(calls).toEqual(before); expect(state.saved.incusLive).toEqual(record.incusLive);
+  });
+});
 
 test('Incus storage refuses missing seeded data, wrong backend and unavailable or foreign identity without allocating', async () => {
   await fixture(async (runtime, v, calls, state) => {
@@ -221,6 +462,7 @@ test('Incus selection classification keeps files, root, protected and already-ba
 
 test('durable live intent quarantines provisioning, recreation, snapshots and deletion even before startup recovery', async () => {
   await selectionFixture(async (manager, worker, calls) => {
+    (manager.incusRuntime as any).recoverLive = async (v: any) => { assertIncusLiveResolved(v); };
     const v = await manager.store.create(worker.userId, worker.id, '/opt/live', undefined, 'incus-vm');
     await manager.store.save({ ...v, attached: false, seeded: true,
       incusLive: { id: randomUUID(), incarnation: randomUUID(), bootId: randomUUID(), attachment: 'settled' } });
@@ -238,6 +480,44 @@ test('durable live intent quarantines provisioning, recreation, snapshots and de
     expect(manager.store.get(worker.userId, v.id)?.incusLive).toBeTruthy();
     expect(manager.isRecoveryBlocked(worker.id)).toBe(true);
     expect(calls).toEqual([]);
+  });
+});
+
+test('queued second live volume never starts its helper after first cutover becomes quarantined', async () => {
+  await selectionFixture(async (manager, worker) => {
+    (manager as any).worker = () => ({ live: worker });
+    const first = await manager.store.create(worker.userId, worker.id, '/opt/queued-first', undefined, 'incus-vm');
+    const second = await manager.store.create(worker.userId, worker.id, '/opt/queued-second', undefined, 'incus-vm');
+    for (const v of [first, second]) await manager.store.save({ ...v,
+      operation: { id: randomUUID(), mode: 'live', stage: 'queued' } });
+    const launched: string[] = [];
+    (manager.incusRuntime as any).mountLive = async (_handle: string, v: any, persist: any) => {
+      launched.push(v.id);
+      await persist({ ...v, incusLive: { id: randomUUID(), incarnation: randomUUID(), bootId: randomUUID(), attachment: 'unknown' } });
+      throw new Error('lost first acknowledgement');
+    };
+    const actor = { userId: worker.userId, workerId: worker.id, platformAdmin: true };
+    for (const v of [first, second]) (manager as any).enqueue(actor, v.id, 'live', true);
+    await expect.poll(() => manager.store.get(worker.userId, second.id)?.operation?.stage).toBe('failed');
+    expect(launched).toEqual([first.id]);
+    expect(manager.store.get(worker.userId, first.id)?.incusLive?.attachment).toBe('unknown');
+    expect(manager.store.get(worker.userId, second.id)?.incusLive).toBeUndefined();
+    expect(manager.isRecoveryBlocked(worker.id)).toBe(true);
+  });
+});
+
+test('live recovery requires current non-deleting non-recreating Incus WorkerRecord authority', async () => {
+  await selectionFixture(async (manager, worker, _calls, state) => {
+    let recoveries = 0;
+    (manager.incusRuntime as any).recoverLive = async () => { recoveries++; };
+    const v = await manager.store.create(worker.userId, worker.id, '/opt/authority', undefined, 'incus-vm');
+    await manager.store.save({ ...v, incusLive: { id: randomUUID(), incarnation: randomUUID(), bootId: randomUUID(), attachment: 'unknown' } });
+    for (const declared of [undefined, { runtimeKind: 'legacy-docker' }, { runtimeKind: 'incus-vm', deletionPending: true },
+      { runtimeKind: 'incus-vm', incusRecreation: {} }, { runtimeKind: 'incus-vm', status: 'archived' }]) {
+      state.declared = declared;
+      await expect(manager.recoverWorker(worker.userId, worker.id)).rejects.toThrow();
+    }
+    expect(recoveries).toBe(0); expect(manager.store.get(worker.userId, v.id)?.incusLive).toBeTruthy();
   });
 });
 

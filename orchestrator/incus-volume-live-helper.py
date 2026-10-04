@@ -243,7 +243,11 @@ def run(target, mode, agent, boot_id, operation):
         source = checks.open_directory(root, target, create=True)
         scan_source(source, min(deadline - 10, time.monotonic() + checks.MAX_SECONDS))
         original = os.fstat(source)
-        write('ready', {'bootId': boot_id, 'source': [original.st_dev, original.st_ino]})
+        # A force-stop is a power cut, not a flush. Rollback can authorize the
+        # original source only after all its pre-freeze writes reached disk.
+        subprocess.run(['sync', '-f', f'/proc/self/fd/{source}'], pass_fds=(source,),
+                       timeout=max(.1, deadline - time.monotonic() - 10), check=True)
+        write('ready', {'bootId': boot_id, 'source': [original.st_dev, original.st_ino], 'sourceSynced': True})
         wait('request-attach', deadline - 10)
         write('attach-armed', {'bootId': boot_id})
         wait('mount-settled', deadline - 10)

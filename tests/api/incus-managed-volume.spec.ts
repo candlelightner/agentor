@@ -14,6 +14,7 @@ import { useConfig, useContainerManager, useWorkerStore, usePersistentBackupPath
 import { useBackupManager } from '../../orchestrator/server/utils/backup-manager';
 import { useManagedVolumeManager } from '../../orchestrator/server/utils/managed-volume-manager';
 import { useWorkerConfigStore } from '../../orchestrator/server/utils/worker-config-store';
+import { withOwnerWorkerLifecycleMutation } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, error() {}, warn() {}, debug() {} });
 (globalThis as any).useLogCollector ??= () => ({ attach: async () => {}, detach() {} });
@@ -628,6 +629,251 @@ assert os.getxattr(a,'system.posix_acl_access')==acl;assert os.stat(a).st_mtime_
       } else {
         await runtime.remove(info, info.containerId.slice(6));
         for (const v of records) { await managed.delete(v); await volumes.store.forget(v.userId, v.id); }
+        await runtime.removeStorage(info); await store.delete(info.userId, info.id);
+      }
+    }
+  }
+});
+
+test('production managed live application keeps successful boot and safely recovers failed seeded commitment', async () => {
+  test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable production live manager gate');
+  test.setTimeout(600_000);
+  const { manager, store, volumes, runtime } = await productionManagerFixture();
+  let info: any, failed = false;
+  const created: any[] = [];
+  const originalSave = volumes.store.save.bind(volumes.store);
+  const exec = async (command: string[]) => {
+    const result = await runtime.client.exec(info.containerName, command);
+    expect(result.returnCode, result.stdout + result.stderr).toBe(0);
+    return result.stdout.trim();
+  };
+  const apply = async (target: string) => {
+    const v = await volumes.add({ userId: info.userId, workerId: info.id, platformAdmin: true },
+      { target, mode: 'live', acknowledgePrivileged: true });
+    created.push(v);
+    await expect.poll(() => volumes.store.get(info.userId, v.id)?.operation?.stage,
+      { timeout: 180_000, intervals: [200, 500] }).toMatch(/complete|failed/);
+    return volumes.store.get(info.userId, v.id)!;
+  };
+  try {
+    info = await (manager as any).createForOwner({ userId: 'managed-live-owner', displayName: 'managed production live gate' });
+    const handle = info.containerId, before = await runtime.inspectGuestReadiness(info, handle.slice(6));
+    const service = await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'agentor-worker']);
+    const target = '/opt/managed-live-production';
+    await exec(['python3', '-c', String.raw`
+import os,pathlib,sys
+p=pathlib.Path(sys.argv[1]);p.mkdir();a=p/'sentinel';a.write_bytes(bytes([0,255,10,128]))
+os.chown(a,1000,1000);os.chmod(a,0o640);os.link(a,p/'hardlink');os.symlink('sentinel',p/'symlink')
+os.setxattr(a,'user.agentor-live',b'preserved');os.utime(a,ns=(1700000000000000000,1700000000123456789))
+`, target]);
+    const verify = String.raw`
+import os,pathlib,sys
+p=pathlib.Path(sys.argv[1]);a=p/'sentinel'
+assert a.read_bytes()==bytes([0,255,10,128]);assert os.stat(a).st_ino==os.stat(p/'hardlink').st_ino
+assert os.readlink(p/'symlink')=='sentinel';assert os.stat(a).st_uid==1000 and os.stat(a).st_gid==1000
+assert os.stat(a).st_mode & 0o777==0o640;assert os.getxattr(a,'user.agentor-live')==b'preserved'
+assert os.stat(a).st_mtime_ns==1700000000123456789
+`;
+    const applied = await apply(target);
+    expect(applied).toMatchObject({ state: 'ready', seeded: true, incusLive: undefined, operation: { stage: 'complete' } });
+    expect(info.containerId).toBe(handle);
+    expect((await runtime.inspectGuestReadiness(info, handle.slice(6))).bootId).toBe(before.bootId);
+    expect(await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'agentor-worker'])).toBe(service);
+    await exec(['mountpoint', '-q', '--', target]); await exec(['python3', '-c', verify, target]);
+    // Retry an already canonical volume: no freeze, VM/service restart or copy.
+    await volumes.apply({ userId: info.userId, workerId: info.id, platformAdmin: true }, applied.id, 'live', true);
+    await expect.poll(() => volumes.store.get(info.userId, applied.id)?.operation?.stage, { timeout: 30_000 }).toBe('complete');
+    expect(await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'agentor-worker'])).toBe(service);
+    const busyTarget = '/opt/managed-live-busy';
+    await exec(['bash', '-ec', 'mkdir "$1"; echo busy >"$1/file"; nohup python3 -c "$2" "$1/file" >/run/managed-busy.log 2>&1 </dev/null &', 'busy', busyTarget,
+      'import pathlib,sys,time; f=open(sys.argv[1]); pathlib.Path("/run/managed-busy-ready").touch(); time.sleep(300)']);
+    await exec(['timeout', '10', 'bash', '-ec', 'until test -e /run/managed-busy-ready; do sleep .05; done']);
+    const busy = await apply(busyTarget);
+    expect(busy).toMatchObject({ seeded: false, incusLive: undefined, state: 'failed' });
+    expect((await runtime.client.getInstance(info.containerName)).devices[volumes.incusRuntime.deviceKey(busy)]).toBeUndefined();
+    expect((await runtime.inspectGuestReadiness(info, handle.slice(6))).bootId).toBe(before.bootId);
+    expect(await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'agentor-worker'])).toBe(service);
+    console.info('Production manager same-boot live adoption/idempotent retry/busy rejection passed.');
+    // The copy finishes, but authority must never move if its store write fails.
+    const rollbackTarget = '/opt/managed-live-rollback';
+    await exec(['bash', '-ec', 'mkdir "$1"; echo original >"$1/sentinel"', 'rollback-source', rollbackTarget]);
+    let rejected = false;
+    volumes.store.save = async next => {
+      if (next.target === rollbackTarget && next.seeded) { rejected = true; throw new Error('test seeded write failure'); }
+      await originalSave(next);
+    };
+    const rolled = await apply(rollbackTarget);
+    volumes.store.save = originalSave;
+    expect(rejected).toBe(true);
+    expect(rolled).toMatchObject({ seeded: false, incusLive: undefined, state: 'failed' });
+    expect((await runtime.client.getInstance(info.containerName)).status).toBe('Stopped');
+    expect((await volumes.incusRuntime.inspectVolume(rolled))?.used_by).toEqual([]);
+    expect(volumes.isRecoveryBlocked(info.id)).toBe(false);
+    await manager.reconcileIncusWorkers();
+    expect(info.containerId).toBe(handle);
+    expect((await runtime.inspectGuestReadiness(info, handle.slice(6))).bootId).not.toBe(before.bootId);
+    await exec(['bash', '-ec', 'test "$(cat "$1/sentinel")" = original; ! mountpoint -q -- "$1"', 'rollback-original', rollbackTarget]);
+    await exec(['python3', '-c', verify, target]);
+    console.info('Failed seeded authority write: synced original recovered by force containment + terminal detach; same incarnation, safe reconciliation reboot, both storage copies retained.');
+    // A lost final metadata write is after writer release. Recovery must not
+    // power-cut freshly dirtied canonical bytes; it retries restored proof.
+    const finalTarget = '/opt/managed-live-final-clear';
+    await exec(['mkdir', '--', finalTarget]);
+    const finalBoot = (await runtime.inspectGuestReadiness(info, handle.slice(6))).bootId;
+    const finalPid = await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'agentor-worker']);
+    let lostClear = false;
+    volumes.store.save = async next => {
+      if (next.target === finalTarget && next.seeded && !next.incusLive && !lostClear) {
+        lostClear = true;
+        await exec(['bash', '-ec', 'echo released-writer >"$1/new-write"', 'post-release-write', finalTarget]);
+        throw new Error('test final intent clear failure');
+      }
+      await originalSave(next);
+    };
+    const final = await apply(finalTarget); volumes.store.save = originalSave;
+    expect(lostClear).toBe(true);
+    expect(final).toMatchObject({ seeded: true, incusLive: undefined, state: 'failed' });
+    expect((await runtime.inspectGuestReadiness(info, handle.slice(6))).bootId).toBe(finalBoot);
+    expect(await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'agentor-worker'])).toBe(finalPid);
+    expect(await exec(['cat', `${finalTarget}/new-write`])).toBe('released-writer');
+    console.info('Failed final metadata clear: released writer data retained, same boot/service PID, no power cut.');
+    // Live canonical data remains through ordinary restart, not a rootfs copy.
+    await manager.restart(info.id);
+    await exec(['python3', '-c', verify, target]);
+    expect(await exec(['cat', `${finalTarget}/new-write`])).toBe('released-writer');
+  } catch (error) {
+    failed = true;
+    if (info) try { console.error('Managed-live diagnostics:', await runtime.client.exec(info.containerName, ['bash', '-ec',
+      'for d in /run/agentor/live-volumes/*; do test -d "$d" || continue; echo "$d"; cat "$d/log"; test ! -f "$d/error" || cat "$d/error"; test ! -f "$d/watchdog-error" || cat "$d/watchdog-error"; ls -l "$d"; done'])); } catch { /* retained below */ }
+    throw error;
+  } finally {
+    volumes.store.save = originalSave;
+    if (info) {
+      if (failed) {
+        const instance = await runtime.client.getInstance(info.containerName);
+        if (await runtime.matchesWorkerIdentity(instance, info.id, info.userId) && instance.config['volatile.uuid'] === info.containerId.slice(6))
+          await runtime.client.stopInstance(info.containerName, { force: true });
+        console.error('Retained managed-live fixture', info.containerName, created.map(v => v.id));
+      } else {
+        await manager.remove(info.id);
+        for (const v of created) {
+          const current = volumes.store.get(info.userId, v.id)!;
+          await volumes.incusRuntime.delete(current); await volumes.store.forget(info.userId, v.id);
+        }
+        if (store.get(info.userId, info.id)) await store.delete(info.userId, info.id);
+      }
+    }
+  }
+});
+
+test('production live acknowledgement loss stays quarantined across reload and only exact terminal proof permits recovery', async () => {
+  test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable live lost-response/reboot gate');
+  test.setTimeout(600_000);
+  const { config, manager, store, volumes, runtime } = await productionManagerFixture();
+  let info: any, failed = false, loss: 'attach' | 'detach' | undefined, operation: string | undefined;
+  const targets = ['/opt/live-lost-attach', '/opt/live-lost-detach', '/opt/live-reboot-ambiguity'];
+  const records: any[] = [], mutations: string[] = [];
+  const originalSave = volumes.store.save.bind(volumes.store);
+  const client = volumes.incusRuntime.worker.client, originalUpdate = client.updateInstanceDevices.bind(client);
+  let rejectSeed = false;
+  client.updateInstanceDevices = async (name, devices, accepted) => {
+    const attaching = Object.values(devices).some(device => device.path === targets[records.length - 1]);
+    const kind = attaching ? 'attach' : 'detach'; mutations.push(kind);
+    if (loss === kind) {
+      loss = undefined;
+      // Test harness remembers the real daemon operation, while simulating
+      // its acknowledgement being lost to the production application.
+      await originalUpdate(name, devices, async actual => { operation = actual; });
+      throw new Error('test lost device acknowledgement');
+    }
+    await originalUpdate(name, devices, accepted);
+  };
+  volumes.store.save = async next => {
+    if (rejectSeed && next.target === targets[1] && next.seeded) throw new Error('test uncommitted copy');
+    await originalSave(next);
+  };
+  const exec = async (command: string[]) => {
+    const result = await runtime.client.exec(info.containerName, command);
+    expect(result.returnCode, result.stdout + result.stderr).toBe(0); return result.stdout.trim();
+  };
+  const repairFromTestOracle = async (v: any) => withOwnerWorkerLifecycleMutation(info.userId, info.id, async () => {
+    expect(operation).toMatch(/^\/1\.0\/operations\/[a-f0-9-]{36}$/);
+    await originalSave({ ...v, incusLive: { ...v.incusLive, attachment: 'accepted', operation } });
+    await volumes.recoverWorker(info.userId, info.id);
+  });
+  try {
+    info = await (manager as any).createForOwner({ userId: 'managed-live-owner', displayName: 'live acknowledgement-loss gate' });
+    for (const [index, target] of targets.entries()) {
+      await exec(['bash', '-ec', 'mkdir "$1"; echo retained-original >"$1/sentinel"', 'source', target]);
+      const boot = (await runtime.inspectGuestReadiness(info, info.containerId.slice(6))).bootId;
+      rejectSeed = index === 1; loss = index === 1 ? 'detach' : 'attach'; operation = undefined;
+      const v = await volumes.add({ userId: info.userId, workerId: info.id, platformAdmin: true },
+        { target, mode: 'live', acknowledgePrivileged: true }); records.push(v);
+      await expect.poll(() => volumes.store.get(info.userId, v.id)?.operation?.stage,
+        { timeout: 180_000, intervals: [200, 500] }).toBe('failed');
+      rejectSeed = false;
+      const current = volumes.store.get(info.userId, v.id)!;
+      expect(current).toMatchObject({ seeded: false, incusLive: { attachment: 'unknown', ...(index === 1 ? { rollback: true } : {}) } });
+      const reloaded = new ManagedVolumeStore(config.dataDir); await reloaded.init();
+      expect(reloaded.get(info.userId, v.id)?.incusLive).toEqual(current.incusLive);
+      expect(volumes.hasActiveOperationsForInstanceSnapshot()).toBe(true);
+      expect(volumes.isRecoveryBlocked(info.id)).toBe(true);
+      const count = mutations.length;
+      await expect(volumes.recoverWorker(info.userId, info.id)).rejects.toThrow('unknown authority');
+      await expect(manager.stop(info.id)).rejects.toThrow('unresolved');
+      await expect(manager.remove(info.id)).rejects.toThrow('unresolved');
+      await expect(manager.workerCommands(info.id).execCapture(info.containerId, ['true'])).rejects.toThrow('unresolved');
+      await manager.reconcileIncusWorkers();
+      expect(mutations).toHaveLength(count); // Never resend an uncertain map.
+      expect((await runtime.client.getInstance(info.containerName)).status).toBe(index === 1 ? 'Stopped' : 'Running');
+      if (index === 2) {
+        // An uncommitted guest reboot destroys ephemeral source proof. A
+        // terminal attach acknowledgement cannot turn it into data authority.
+        await runtime.client.stopInstance(info.containerName, { force: true });
+        await runtime.client.startInstance(info.containerName);
+        await expect.poll(async () => { try { return (await runtime.client.exec(info.containerName, ['true'])).returnCode; } catch { return -1; } },
+          { timeout: 120_000, intervals: [500, 1000] }).toBe(0);
+        await originalSave({ ...current, incusLive: { ...current.incusLive!, attachment: 'accepted', operation } });
+        await expect(withOwnerWorkerLifecycleMutation(info.userId, info.id, () => volumes.recoverWorker(info.userId, info.id))).rejects.toThrow();
+        expect(volumes.store.get(info.userId, v.id)?.incusLive).toBeTruthy();
+        expect(mutations).toHaveLength(count);
+        await exec(['bash', '-ec', 'test ! -e /run/agentor/provisioned; ! systemctl is-active --quiet agentor-worker; ! systemctl is-active --quiet docker; mkdir /run/lost-original; mount --bind / /run/lost-original; test "$(cat "/run/lost-original$1/sentinel")" = retained-original', 'retained-source', target]);
+        await manager.reconcileIncusWorkers();
+        await exec(['bash', '-ec', '! systemctl is-active --quiet agentor-worker']);
+        console.info('Different-boot uncommitted source stayed quarantined despite exact terminal operation; source retained, services inactive.');
+      } else {
+        // TEST ONLY: the injected observer supplies exact acknowledgement
+        // lost to Agentor. Never manufacture this authority from read-back.
+        await repairFromTestOracle(current);
+        expect(volumes.store.get(info.userId, v.id)?.incusLive).toBeUndefined();
+        expect(volumes.isRecoveryBlocked(info.id)).toBe(false);
+        if (index === 1) expect(mutations).toHaveLength(count); // Detach already settled: no second mutation.
+        expect((await runtime.client.getInstance(info.containerName)).status).toBe('Stopped');
+        await manager.reconcileIncusWorkers();
+        expect((await runtime.inspectGuestReadiness(info, info.containerId.slice(6))).bootId).not.toBe(boot);
+        await exec(['bash', '-ec', 'test "$(cat "$1/sentinel")" = retained-original; ! mountpoint -q -- "$1"', 'original-after-recovery', target]);
+        console.info(`Lost ${index === 0 ? 'attach' : 'detach'} acknowledgement: durable reload/quarantine/no resend, exact-operation recovery and retained original verified.`);
+      }
+    }
+  } catch (error) { failed = true; throw error; }
+  finally {
+    volumes.store.save = originalSave; client.updateInstanceDevices = originalUpdate;
+    if (info) {
+      const instance = await runtime.client.getInstance(info.containerName);
+      expect(await runtime.matchesWorkerIdentity(instance, info.id, info.userId)).toBe(true);
+      expect(instance.config['volatile.uuid']).toBe(info.containerId.slice(6));
+      await runtime.client.stopInstance(info.containerName, { force: true });
+      if (failed) console.error('Retained live acknowledgement fixture', info.containerName, records.map(v => v.id));
+      else {
+        // Explicit approved TEST-fixture teardown, not production authority
+        // recovery. Original data was verified above; all data is synthetic.
+        await runtime.remove(info, instance.config['volatile.uuid']);
+        for (const v of records) {
+          const current = volumes.store.get(info.userId, v.id)!;
+          await originalSave({ ...current, incusLive: undefined });
+          await volumes.incusRuntime.delete({ ...current, incusLive: undefined });
+          await volumes.store.forget(info.userId, v.id);
+        }
         await runtime.removeStorage(info); await store.delete(info.userId, info.id);
       }
     }
