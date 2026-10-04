@@ -35,6 +35,9 @@ export interface WorkerRecord extends UserOwnedResource {
   /** Internal fail-closed marker: Docker is already gone, but permanent
    * resource cleanup must be retried. Such a record cannot be unarchived. */
   deletionPending?: boolean;
+  /** Bounded Incus compute-replacement recovery marker, not portable image or
+   * storage authority. Unfinished replacements stay inaccessible until resolved. */
+  incusRecreation?: { nonce: string; originalIncarnation?: string; replacementIncarnation?: string };
   /** Foreign key to the assigned environment — the only environment data stored
    * on the worker. The environment's config (CPU/memory/network/docker/setup
    * script/env vars/exposed APIs/capabilities/instructions) lives in the
@@ -175,6 +178,25 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     });
   }
 
+  /** Incus replacement transitions merge only runtime fields inside the owner
+   * store queue; a slow boot must never overwrite concurrently edited config. */
+  async transitionIncusRecreation(userId: string, id: string,
+    change: Pick<WorkerRecord, 'status' | 'desiredRuntimeStatus' | 'incusRecreation'>,
+    pendingAfterCompletion?: () => Promise<boolean>): Promise<WorkerRecord> {
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId), previous = map?.get(id);
+      if (!map || !previous || previous.runtimeKind !== 'incus-vm' || previous.deletionPending)
+        throw new Error('Incus recreation durable authority is unavailable');
+      const completion = pendingAfterCompletion ? { pendingRebuild: await pendingAfterCompletion(),
+        hostMountsRevoked: false, hardwareDevicesRevoked: false } : {};
+      const next = { ...previous, ...change, ...completion, updatedAt: new Date().toISOString() };
+      map.set(id, structuredClone(next));
+      try { await this.persistUser(userId); }
+      catch (error) { map.set(id, previous); throw error; }
+      return structuredClone(next);
+    });
+  }
+
   async setDesiredRuntimeStatus(
     userId: string,
     id: string,
@@ -240,24 +262,7 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
   }
 
   async archive(userId: string, id: string): Promise<void> {
-    const worker = this.get(userId, id);
-    if (!worker) {
-      useLogger().warn(
-        `[worker-store] archive failed — worker not found: ${userId}/${id}`,
-      );
-      throw new Error(`Worker not found: ${id}`);
-    }
-    const updatedAt = new Date().toISOString();
-    const archivedAt = worker.archivedAt ?? updatedAt;
-    await this.setItem(userId, {
-      ...worker,
-      status: "archived",
-      // Once destructive deletion has begun, no generic archive/reconcile path
-      // may silently make the record unarchivable again.
-      deletionPending: worker.deletionPending === true,
-      archivedAt,
-      updatedAt,
-    });
+    const worker = await this.setArchiveStatus(userId, id, 'archived');
     useLogger().info(
       `[worker-store] archived worker ${worker.displayName || worker.id}`,
     );
@@ -278,29 +283,27 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
   }
 
   async unarchive(userId: string, id: string): Promise<void> {
-    const worker = this.get(userId, id);
-    if (!worker) {
-      useLogger().warn(
-        `[worker-store] unarchive failed — worker not found: ${userId}/${id}`,
-      );
-      throw new Error(`Worker not found: ${id}`);
-    }
-    if (worker.deletionPending) {
-      throw Object.assign(
-        new Error("Worker deletion cleanup is still pending"),
-        { statusCode: 409 },
-      );
-    }
-    await this.setItem(userId, {
-      ...worker,
-      status: "active",
-      archivedAt: undefined,
-      deletionPending: false,
-      updatedAt: new Date().toISOString(),
-    });
+    const worker = await this.setArchiveStatus(userId, id, 'active');
     useLogger().info(
       `[worker-store] unarchived worker ${worker.displayName || worker.id}`,
     );
+  }
+
+  private async setArchiveStatus(userId: string, id: string, status: WorkerRecord['status']): Promise<WorkerRecord> {
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId), previous = map?.get(id);
+      if (!map || !previous) throw new Error(`Worker not found: ${id}`);
+      if (status === 'active' && previous.deletionPending)
+        throw Object.assign(new Error('Worker deletion cleanup is still pending'), { statusCode: 409 });
+      const stamp = new Date().toISOString();
+      const next: WorkerRecord = { ...previous, status, updatedAt: stamp,
+        archivedAt: status === 'archived' ? previous.archivedAt ?? stamp : undefined,
+        deletionPending: status === 'archived' && previous.deletionPending === true };
+      map.set(id, next);
+      try { await this.persistUser(userId); }
+      catch (error) { map.set(id, previous); throw error; }
+      return structuredClone(next);
+    });
   }
 
   async delete(userId: string, id: string): Promise<void> {

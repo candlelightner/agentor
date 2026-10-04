@@ -16,6 +16,7 @@ import { incusImageIdentity, sameIncusImageSource, type IncusWorkerImageIdentity
 export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & {
   sshAuthorizedKeys?: string;
   configurationRevision?: WorkerConfigRevision;
+  recreationNonce?: string;
 };
 
 function sameDevice(actual: Record<string, string> | undefined, expected: Record<string, string>): boolean {
@@ -314,6 +315,7 @@ export class IncusWorkerRuntime {
         "user.agentor.owner": opts.userId,
         "user.agentor.installation": await this.installationId(),
         "user.agentor.runtime-generation": "1",
+        ...(opts.recreationNonce ? { 'user.agentor.recreation': opts.recreationNonce } : {}),
         "security.secureboot": "false",
         "boot.autostart": "false",
         ...(opts.memoryLimit ? { "limits.memory": opts.memoryLimit } : {}),
