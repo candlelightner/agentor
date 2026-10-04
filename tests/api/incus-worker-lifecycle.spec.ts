@@ -351,6 +351,63 @@ test('missing-compute recovery never allocates from unavailable facts, missing b
   }
 });
 
+test('Incus inventory keeps missing/foreign workers visible without UUID authority and never adopts or deletes orphans', async () => {
+  await fixture(async (manager, store, calls, info) => {
+    (manager as any).config.incusEndpoint = 'https://test.invalid';
+    (manager as any).dockerService = { listContainers: async () => [] };
+    const runtime = (manager as any).incusRuntime;
+    runtime.client = { listInstances: async () => [
+      { name: info.containerName, config: { 'user.agentor.id': info.id, foreign: 'true' } },
+      { name: 'agentor-worker-orphan', config: { 'user.agentor.id': 'orphan' } },
+    ] };
+    runtime.matchesWorkerIdentity = async (instance: any) => !instance.config.foreign;
+    await manager.sync();
+    expect(manager.get(info.id)).toMatchObject({ status: 'unknown', containerId: info.containerName,
+      runtimeDiagnostic: { code: 'INCUS_COMPUTE_UNVERIFIED' } });
+    expect(manager.get('orphan')).toBeUndefined(); expect(calls).toEqual([]);
+    expect(store.get(info.userId, info.id)?.pendingRebuild).toBe(true);
+    runtime.client.listInstances = async () => [{ name: info.containerName, status: 'Running', config: { 'user.agentor.id': info.id } }];
+    await manager.sync();
+    expect(manager.get(info.id)).toMatchObject({ status: 'unknown', containerId: info.containerName });
+    await store.archive(info.userId, info.id);
+    runtime.client.listInstances = async () => [{ name: info.containerName, config: { 'user.agentor.id': info.id } }];
+    await manager.sync();
+    expect(manager.get(info.id)).toBeUndefined(); expect(calls).toEqual([]);
+    expect(store.get(info.userId, info.id)?.status).toBe('archived');
+  });
+});
+
+test('missing-compute diagnostic cannot be mistaken for captured incarnation or bypass foreign/API checks', async () => {
+  for (const failure of ['foreign', 'unavailable']) await recreationFixture(async (manager, store, calls, info) => {
+    (manager as any).config.incusEndpoint = 'https://test.invalid';
+    (manager as any).dockerService = { listContainers: async () => [] };
+    (manager as any).incusRuntime.client = { listInstances: async () => [], getInstance: async () => {
+      if (failure === 'foreign') return { config: {} };
+      throw Object.assign(new Error('unavailable'), { statusCode: 503 });
+    } };
+    await manager.sync();
+    const unavailable = manager.get(info.id)!;
+    expect(unavailable.containerId).toBe(info.containerName); expect(unavailable.status).toBe('unknown');
+    await manager.reconcileIncusWorkers();
+    expect(manager.get(info.id)?.runtimeDiagnostic?.operation).toBe('Incus missing compute recovery');
+    await expect(manager.recover(info.id)).rejects.toThrow();
+    expect(calls).toEqual([]);
+    expect(store.get(info.userId, info.id)?.incusRecreation).toBeUndefined();
+  });
+});
+
+test('uncaptured Incus diagnostic handles cannot stop, restart or delete same-name compute or persistence', async () => {
+  for (const action of ['stop', 'restart', 'remove'] as const) await fixture(async (manager, store, calls, info) => {
+    info.containerId = info.containerName; info.status = 'unknown';
+    const runtime = (manager as any).incusRuntime;
+    runtime.stop = runtime.start = runtime.remove = runtime.removeStorage = async () => { calls.push('unsafe-mutation'); };
+    await expect(manager[action](info.id)).rejects.toThrow('incarnation is unavailable');
+    expect(calls).toEqual([]);
+    expect(store.get(info.userId, info.id)).toMatchObject({ status: 'active', desiredRuntimeStatus: 'running' });
+    expect(manager.get(info.id)?.status).toBe('unknown');
+  });
+});
+
 async function reconciliationFixture(run: (manager: ContainerManager, store: WorkerStore, calls: string[], info: any, state: any) => Promise<void>) {
   await fixture(async (manager, store, calls, info) => {
     const state = { status: 'Running', bootId: 'first-boot', provisioned: true, serviceReady: true };
@@ -718,7 +775,7 @@ test('real production-manager archive retains canonical volumes, source and pend
       (reloaded as any).resolveAuthorizedHostMounts = async () => undefined;
       (reloaded as any).resolveHardwareDeviceAccess = async () => undefined;
       (reloaded as any).resolveUserEnvAndBinds = (manager as any).resolveUserEnvAndBinds;
-      await reloaded.sync(); expect(reloaded.get(info.id)).toBeUndefined();
+      await reloaded.sync(); expect(reloaded.get(info.id)).toMatchObject({ status: 'unknown', containerId: info.containerName });
       await reloaded.reconcileIncusWorkers();
       const recovered = reloaded.get(info.id)!;
       expect(recovered.status).toBe('running'); expect(recovered.containerId).not.toBe(removedHandle);

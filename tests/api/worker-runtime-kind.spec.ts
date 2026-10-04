@@ -206,6 +206,8 @@ test.describe("Worker runtime kind", () => {
     await manager.sync();
 
     const info = manager.get("incus-1");
-    expect(info).toBeUndefined();
+    expect(info).toMatchObject({ runtimeKind: 'incus-vm', containerId: 'agentor-worker-incus-1', status: 'unknown',
+      runtimeDiagnostic: { code: 'INCUS_COMPUTE_UNVERIFIED' } });
+    expect(info?.containerId).not.toBe('docker-cid-2');
   });
 });

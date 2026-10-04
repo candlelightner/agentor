@@ -1076,21 +1076,49 @@ export class ContainerManager {
       const id = instance.config["user.agentor.id"];
       if (!id) continue;
       const worker = id ? this.workerStore?.findById(id) : undefined;
+      if (!worker) {
+        if (await this.incusRuntime.matchesWorkerIdentity(instance, id))
+          useLogger().warn(`[container] quarantined Agentor-owned Incus orphan ${id}; no WorkerRecord authority`);
+        continue;
+      }
       if (!worker || worker.runtimeKind !== "incus-vm" ||
           !await this.incusRuntime.matchesWorkerIdentity(instance, worker.id, worker.userId)) continue;
-      if (worker.status !== "active" || worker.deletionPending) continue;
+      if (!instance.config['volatile.uuid']) continue;
+      if (worker.status !== "active" || worker.deletionPending) {
+        useLogger().warn(`[container] quarantined Incus compute for inactive worker ${worker.id}; persistence retained`);
+        continue;
+      }
       if (busyAtStart.has(id) || workerLifecycleGeneration(id) > lifecycleSequenceAtStart || isWorkerLifecycleMutationActive(id)) {
         const current = concurrent.get(id);
         if (current?.userId === worker.userId) nextContainers.set(id, current);
         continue;
       }
       nextContainers.set(id, {
-        ...worker, runtimeKind: "incus-vm", containerId: `incus:${instance.config["volatile.uuid"] || "unverified"}`,
+        ...worker, runtimeKind: "incus-vm", containerId: `incus:${instance.config["volatile.uuid"]}`,
         containerName: instance.name, displayName: worker.displayName || instance.name,
         imageName: instance.config["image.source_image"] || this.config.incusWorkerImage,
         imageId: instance.config["volatile.base_image"] || "",
         status: worker.incusRecreation ? 'error' : incusWorkerStatus(instance),
+        ...(worker.incusRecreation ? { runtimeDiagnostic: {
+          code: 'INCUS_RECREATION_RECOVERY_REQUIRED', operation: 'Incus inventory',
+          message: 'Interrupted VM recreation is quarantined until ownership-safe rollback succeeds.',
+          retryable: true, observedAt: new Date().toISOString(),
+        } } : {}),
       });
+    }
+    // Keep missing active records visible/recoverable, without inventing a
+    // captured UUID or treating inventory absence as deletion authority. The
+    // recovery pass separately confirms lookup404 and canonical storage.
+    for (const worker of this.workerStore?.list() ?? []) {
+      if (worker.status !== 'active' || worker.runtimeKind !== 'incus-vm' || worker.deletionPending || nextContainers.has(worker.id)) continue;
+      if (busyAtStart.has(worker.id) || workerLifecycleGeneration(worker.id) > lifecycleSequenceAtStart ||
+          isWorkerLifecycleMutationActive(worker.id)) continue;
+      const name = this.buildContainerName(worker.id);
+      nextContainers.set(worker.id, { ...worker, runtimeKind: 'incus-vm', containerName: name, containerId: name,
+        imageName: this.config.incusWorkerImage, imageId: worker.imageDigest ?? '', status: 'unknown',
+        runtimeDiagnostic: { code: worker.incusRecreation ? 'INCUS_RECREATION_RECOVERY_REQUIRED' : 'INCUS_COMPUTE_UNVERIFIED',
+          operation: 'Incus inventory', message: 'VM identity is unavailable. Persistent data is retained; recovery requires authoritative runtime and storage checks.',
+          retryable: true, observedAt: new Date().toISOString() } });
     }
     for (const info of external) nextContainers.set(info.id, info);
     // During the rename/create window Docker may list only the retained
@@ -1147,6 +1175,12 @@ export class ContainerManager {
       error.statusCode = 409;
       throw error;
     }
+  }
+
+  private capturedIncusIncarnation(info: ContainerInfo): string {
+    const uuid = info.containerId.startsWith('incus:') ? info.containerId.slice(6) : '';
+    if (!uuid) throw new Error('Incus runtime incarnation is unavailable; use ownership-safe recovery before lifecycle mutation');
+    return uuid;
   }
 
   private async assertOwnerExists(userId: string): Promise<void> {
@@ -2542,13 +2576,14 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    const incarnation = info.runtimeKind === 'incus-vm' ? this.capturedIncusIncarnation(info) : undefined;
     await this.persistDesiredRuntimeStatus(info, "stopped");
     useLogCollector().detach(info.containerId);
     try {
       await stopWorkerContainerIdempotently(
         info,
         () => info.runtimeKind === "incus-vm"
-          ? this.incusRuntime.stop(info, info.containerId.startsWith('incus:') ? info.containerId.slice(6) : undefined)
+          ? this.incusRuntime.stop(info, incarnation)
           : this.dockerService.stopContainer(info.containerId),
         true,
       );
@@ -2575,13 +2610,13 @@ for p in sys.argv[1:]:
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
     if (info.runtimeKind === "incus-vm") {
+      const incarnation = this.capturedIncusIncarnation(info);
       if (info.hostMountsRevoked || info.hardwareDevicesRevoked)
         throw Object.assign(new Error("Worker access was revoked; rebuild is required"), { statusCode: 409 });
       await this.persistDesiredRuntimeStatus(info, "running");
       const options = await this.incusOptionsForWorker(info, true);
       info.status = "starting";
       try {
-        const incarnation = info.containerId.startsWith('incus:') ? info.containerId.slice(6) : undefined;
         await this.incusRuntime.stop(info, incarnation);
         await this.incusRuntime.start(options, incarnation);
         info.status = "running";
@@ -3157,12 +3192,13 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    const incarnation = info.runtimeKind === 'incus-vm' ? this.capturedIncusIncarnation(info) : undefined;
     // Keep the authoritative entry when Docker removal fails. Dropping it in a
     // finally block made a retry resolve the stable worker UUID as though it
     // were a Docker container id, leaving the real container untracked and
     // preventing restore/account-cleanup rollback from retrying it.
     await removeDockerContainerIdempotently(() =>
-      info.runtimeKind === "incus-vm" ? this.incusRuntime.remove(info, info.containerId.startsWith('incus:') ? info.containerId.slice(6) : undefined)
+      info.runtimeKind === "incus-vm" ? this.incusRuntime.remove(info, incarnation)
         : this.dockerService.removeContainer(info.containerId),
     );
     useLogCollector().detach(info.containerId);
@@ -5710,18 +5746,22 @@ for p in sys.argv[1:]:
     for (const snapshot of this.workerStore?.listActive() ?? []) {
       if (snapshot.runtimeKind !== 'incus-vm' || snapshot.deletionPending || snapshot.incusRecreation) continue;
       let observedHandle: string | undefined, observedGeneration: number | undefined;
-      if (!this.get(snapshot.id)) {
+      if (!this.get(snapshot.id)?.containerId.startsWith('incus:')) {
         try {
           await withOwnerWorkerLifecycleMutation(snapshot.userId, snapshot.id, async () => {
             const record = this.workerStore?.get(snapshot.userId, snapshot.id);
             if (!record || record.status !== 'active' || record.runtimeKind !== 'incus-vm' || record.deletionPending ||
-                record.incusRecreation || record.desiredRuntimeStatus !== 'running' || this.get(record.id)) return;
+                record.incusRecreation || record.desiredRuntimeStatus !== 'running' ||
+                this.get(record.id)?.containerId.startsWith('incus:')) return;
             await this.assertOwnerExists(record.userId);
             const name = this.buildContainerName(record.id);
             await this.recreateIncusWorker({ ...record, runtimeKind: 'incus-vm', containerName: name,
               containerId: name, imageName: this.config.incusWorkerImage, imageId: record.imageDigest ?? '', status: 'unknown' }, undefined, true);
           });
         } catch (error) {
+          const current = this.get(snapshot.id), record = this.workerStore?.get(snapshot.userId, snapshot.id);
+          if (current?.userId === snapshot.userId && !current.containerId.startsWith('incus:') && !record?.incusRecreation)
+            this.markRuntimeUnknown(current, 'Incus missing compute recovery', error);
           useLogger().warn(`[container] Incus missing compute recovery deferred for ${snapshot.id}: ${(error as { code?: string })?.code ?? 'runtime unavailable'}`);
         }
         continue;
