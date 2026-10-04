@@ -11,16 +11,22 @@ from unittest.mock import patch
 
 class RedeployFixtureTest(unittest.TestCase):
     def setUp(self):
-        parent = "/var/tmp/agentor-phase6-production.fixture"
+        parent = "/var/tmp/agentor-phase6-production.SSkg3hQz"
         self.old = {"Id": "old-fixture-id", "Config": {"Env": ["TEST_SECRET=fixture-only", "INCUS_WORKER_IMAGE=old"]},
                     "HostConfig": {"Binds": [parent + "/stack-data:/data", parent + "/tls:/tls:ro", "/var/run/docker.sock:/var/run/docker.sock"],
                                    "PortBindings": {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "38000"}, {"HostIp": "10.159.68.1", "HostPort": "38000"}]}},
                     "NetworkSettings": {"Networks": {"agentor-phase6-net": {"IPAddress": "172.22.0.2"}, "agentor-management": {"IPAddress": "172.20.0.2"}}}}
         self.calls = []
         self.envfile = None
+        self.ambiguous_create = False
 
     def execute(self, fail=None, hostname="agentor-kata-preflight"):
-        def docker(argv, **_kwargs):
+        def docker(argv, **kwargs):
+            self.assertEqual(argv[:3], ["docker", "--host", "unix:///var/run/docker.sock"])
+            self.assertNotIn("DOCKER_HOST", kwargs["env"])
+            self.assertNotIn("DOCKER_CONTEXT", kwargs["env"])
+            self.assertEqual(kwargs["timeout"], 60)
+            argv = argv[2:]
             self.calls.append(argv[1:])
             if fail and fail(argv[1:]):
                 raise RuntimeError("fixture operation failed")
@@ -32,7 +38,11 @@ class RedeployFixtureTest(unittest.TestCase):
                 self.assertIn("TEST_SECRET=fixture-only", Path(self.envfile).read_text())
                 self.assertIn("INCUS_WORKER_IMAGE=agentor-worker-phase7-candidate", Path(self.envfile).read_text())
                 self.assertNotIn("TEST_SECRET=fixture-only", argv)
+                if self.ambiguous_create:
+                    raise RuntimeError("lost create response")
                 return "new-fixture-id"
+            if argv[1] == "ps" and any(value.startswith("label=agentor.incus.acceptance.attempt=") for value in argv):
+                return "new-fixture-id" if self.ambiguous_create else ""
             return ""
         script = str(Path(__file__).with_name("redeploy-incus-fixture.py"))
         with patch("sys.argv", [script, "--image", "agentor-phase7-orchestrator:trial", "--worker-image", "agentor-worker-phase7-candidate", "--retain-as", "agentor-orchestrator-before-phase7"]), \
@@ -65,6 +75,36 @@ class RedeployFixtureTest(unittest.TestCase):
         self.assertEqual(self.calls[-1], ["start", "old-fixture-id"])
         self.assertFalse(any(call[:2] == ["rm", "-f"] and call[-1] != "new-fixture-id" for call in self.calls))
         self.assertFalse(Path(self.envfile).exists())
+
+    def test_empty_ip_or_other_scratch_data_fails_before_stop(self):
+        self.old["NetworkSettings"]["Networks"]["agentor-phase6-net"]["IPAddress"] = ""
+        with self.assertRaises(SystemExit):
+            self.execute()
+        self.assertFalse(any(call[0] == "stop" for call in self.calls))
+        self.old["HostConfig"]["Binds"][0] = "/var/tmp/agentor-phase6-production.other/stack-data:/data"
+        with self.assertRaises(SystemExit):
+            self.execute()
+        self.assertFalse(any(call[0] == "stop" for call in self.calls))
+
+    def test_failed_removal_never_starts_two_shared_data_writers(self):
+        with self.assertRaisesRegex(RuntimeError, "rollback incomplete") as caught:
+            self.execute(fail=lambda args: args in [["start", "new-fixture-id"], ["rm", "-f", "new-fixture-id"]])
+        self.assertIsNotNone(caught.exception.__cause__)
+        self.assertNotIn(["start", "old-fixture-id"], self.calls)
+        self.assertFalse(Path(self.envfile).exists())
+
+    def test_reconnect_failure_does_not_skip_other_network_or_safe_source_restart(self):
+        with self.assertRaisesRegex(RuntimeError, "rollback incomplete"):
+            self.execute(fail=lambda args: args == ["start", "new-fixture-id"] or args[:5] == ["network", "connect", "--ip", "172.22.0.2", "agentor-phase6-net"])
+        self.assertIn(["network", "connect", "--ip", "172.20.0.2", "agentor-management", "old-fixture-id"], self.calls)
+        self.assertEqual(self.calls[-1], ["start", "old-fixture-id"])
+
+    def test_lost_create_response_removes_only_nonce_owned_replacement(self):
+        self.ambiguous_create = True
+        with self.assertRaisesRegex(RuntimeError, "lost create response"):
+            self.execute()
+        self.assertIn(["rm", "-f", "new-fixture-id"], self.calls)
+        self.assertEqual(self.calls[-1], ["start", "old-fixture-id"])
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ import type { Config } from '../../orchestrator/server/utils/config';
 import { withOwnerWorkerLifecycleMutation, withOwnerWorkerRuntimeSetup } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
 import { DockerPluginWorkerExecutor } from '../../orchestrator/server/utils/plugin-runtime-manager';
 import { Duplex } from 'node:stream';
+import { parseAppInstances, assertAppManageOk } from '../../orchestrator/server/utils/apps';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 (globalThis as any).useLogCollector ??= () => ({ attach: async () => {}, detach() {} });
@@ -24,6 +25,47 @@ async function collect(stream: NodeJS.ReadableStream): Promise<Buffer> {
   for await (const chunk of stream) chunks.push(Buffer.from(chunk));
   return Buffer.concat(chunks);
 }
+
+test('legacy terminal dispatch keeps the Docker exec, resize and linked-session cleanup contract', async () => {
+  const calls: unknown[][] = [], stream = new PassThrough();
+  const docker = {
+    execAttachTmuxWindow: async (...args: unknown[]) => { calls.push(['attach', ...args]); return { exec: { id: 'legacy-exec' }, stream, tmuxSession: 'ws-legacy' }; },
+    resizeExec: async (...args: unknown[]) => { calls.push(['resize', ...args]); },
+    killTmuxSession: async (...args: unknown[]) => { calls.push(['cleanup', ...args]); },
+  };
+  const manager = new ContainerManager(docker as any, { containerPrefix: 'agentor-worker' } as Config);
+  (manager as any).containers.set('legacy', { id: 'legacy', status: 'running', runtimeKind: 'legacy-docker', containerId: 'legacy-container' });
+  expect(manager.workerCommands('legacy')).toBe(docker);
+  const terminal = await manager.attachTerminal('legacy', 3);
+  expect(terminal.stream).toBe(stream);
+  terminal.resize(120, 40); terminal.close(); terminal.close();
+  expect(calls).toEqual([['attach', 'legacy-container', 3], ['resize', 'legacy-exec', 120, 40], ['cleanup', 'legacy-container', 'ws-legacy']]);
+  expect(stream.writableEnded).toBe(true);
+  delete (manager as any).containers.get('legacy').runtimeKind;
+  expect(manager.workerCommands('legacy')).toBe(docker);
+});
+
+test('shared app parser preserves legacy noisy NDJSON and tunnel metadata semantics', () => {
+  expect(parseAppInstances('{"id":"socks5-1","port":1080,"status":"running"}\nwarning\n{bad-json\n{}\n{"id":"socks5-2","port":1081,"status":"stopped"}', 'socks5')).toEqual([
+    { id: 'socks5-1', appType: 'socks5', port: 1080, status: 'running' },
+    { id: 'socks5-2', appType: 'socks5', port: 1081, status: 'stopped' },
+  ]);
+  expect(parseAppInstances('warning\n{bad-json\n{}\n' + JSON.stringify({ id: 'vscode', port: '1234', status: 'auth_required',
+    machineName: 'fixture', authUrl: 'https://fixture.invalid/login', authCode: 'TEST-CODE' }) + '\n', 'vscode')).toEqual([
+    { id: 'vscode', appType: 'vscode', port: 1234, status: 'auth_required', machineName: 'fixture', authUrl: 'https://fixture.invalid/login', authCode: 'TEST-CODE' },
+  ]);
+  expect(parseAppInstances(' \n ', 'socks5')).toEqual([]);
+  expect(parseAppInstances('{"id":"socks5-1","port":"not-a-port"}', 'socks5')).toEqual([
+    { id: 'socks5-1', appType: 'socks5', port: 0, status: 'stopped' },
+  ]);
+});
+
+test('shared app errors retain legacy actionable errors rather than accepting failed launch', () => {
+  expect(() => assertAppManageOk('{"status":"running"}\nwarning\n{bad-json\n{"status":"error","message":"late launch failure"}', 'start fixture')).toThrow('late launch failure');
+  expect(() => assertAppManageOk('warning\n{bad-json\n{"status":"running"}', 'start fixture')).not.toThrow();
+  expect(() => assertAppManageOk('{"status":"error","message":"fixture port busy"}', 'start fixture')).toThrow('fixture port busy');
+  expect(() => assertAppManageOk('{"status":"error"}', 'start fixture')).toThrow('app manage failed: start fixture');
+});
 
 test('exec wrapper applies existing precedence and literal values without shell evaluation', () => {
   const value = "quotes'\"\n$(not-executed)=literal";
@@ -46,9 +88,10 @@ logger() { [ "$1" = -t ] && [ "$2" = agentor-app ] || exit 1; command cat >&2; }
 printf 'app-output\\n' | app_log
 logger() { return 1; }
 printf 'sink-unavailable\\n' | app_log
+head -c 1048576 /dev/zero | app_log
 printf '{"status":"running"}\\n'
 `;
-  const result = spawnSync('bash', ['-ec', script], { cwd: process.cwd(), encoding: 'utf8' });
+  const result = spawnSync('bash', ['-e', '-o', 'pipefail', '-c', script], { cwd: process.cwd(), encoding: 'utf8' });
   expect(result.status).toBe(0);
   expect(result.stdout).toBe('{"status":"running"}\n');
   expect(result.stderr).toBe('app-output\n');

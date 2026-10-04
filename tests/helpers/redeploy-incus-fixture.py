@@ -11,10 +11,14 @@ import re
 import socket
 import subprocess
 import tempfile
+import uuid
 
 
 def docker(*args):
-    return subprocess.check_output(["docker", *args], text=True).strip()
+    env = {key: value for key, value in os.environ.items()
+           if key not in {"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"}}
+    return subprocess.check_output(["docker", "--host", "unix:///var/run/docker.sock", *args],
+                                   text=True, env=env, timeout=60).strip()
 
 
 parser = argparse.ArgumentParser()
@@ -35,7 +39,7 @@ old_id = old["Id"]
 cfg, host = old["Config"], old["HostConfig"]
 binds = host["Binds"] or []
 data = next((bind.split(":")[0] for bind in binds if bind.endswith(":/data")), "")
-if not re.fullmatch(r"/var/tmp/agentor-phase6-production\.[A-Za-z0-9]+/stack-data", data):
+if data != "/var/tmp/agentor-phase6-production.SSkg3hQz/stack-data":
     raise SystemExit("Not the retained isolated acceptance data")
 parent = os.path.dirname(data)
 if set(binds) != {data + ":/data", parent + "/tls:/tls:ro", "/var/run/docker.sock:/var/run/docker.sock"}:
@@ -43,6 +47,9 @@ if set(binds) != {data + ":/data", parent + "/tls:/tls:ro", "/var/run/docker.soc
 networks = old["NetworkSettings"]["Networks"]
 if set(networks) != {"agentor-phase6-net", "agentor-management"}:
     raise SystemExit("Unexpected fixture topology")
+if any(networks[name].get("IPAddress") != address for name, address in
+       {"agentor-phase6-net": "172.22.0.2", "agentor-management": "172.20.0.2"}.items()):
+    raise SystemExit("Fixture IP changed; reconcile exact source-preserving routing first")
 ports = host["PortBindings"]
 if ports != {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "38000"}, {"HostIp": "10.159.68.1", "HostPort": "38000"}]}:
     raise SystemExit("Unexpected fixture listener scope")
@@ -54,6 +61,7 @@ environment.append("INCUS_WORKER_IMAGE=" + args.worker_image)
 if any("\n" in line or "\r" in line for line in environment):
     raise SystemExit("Environment cannot be represented safely in env-file")
 created = None
+attempt = str(uuid.uuid4())
 disconnected = []
 renamed = False
 with tempfile.NamedTemporaryFile(mode="w", prefix="agentor-fixture-env-") as env:
@@ -69,7 +77,8 @@ with tempfile.NamedTemporaryFile(mode="w", prefix="agentor-fixture-env-") as env
         renamed = True
         command = ["create", "--name", "agentor-orchestrator", "--network", "agentor-phase6-net",
                    "--ip", networks["agentor-phase6-net"]["IPAddress"], "--env-file", env.name,
-                   "--label", "agentor.incus.acceptance=true"]
+                   "--label", "agentor.incus.acceptance=true",
+                   "--label", "agentor.incus.acceptance.attempt=" + attempt]
         for bind in binds:
             command += ["-v", bind]
         for binding in ports["3000/tcp"]:
@@ -77,14 +86,36 @@ with tempfile.NamedTemporaryFile(mode="w", prefix="agentor-fixture-env-") as env
         created = docker(*command, args.image)
         docker("network", "connect", "--ip", networks["agentor-management"]["IPAddress"], "agentor-management", created)
         docker("start", created)
-    except BaseException:
+    except BaseException as primary:
         # Remove only the just-created fixture container, never data/volumes.
-        if created:
-            docker("rm", "-f", created)
-        if renamed:
-            docker("rename", old_id, "agentor-orchestrator")
-        for name in disconnected:
-            docker("network", "connect", "--ip", networks[name]["IPAddress"], name, old_id)
-        docker("start", old_id)
+        failures = []
+        def recover(label, *command):
+            try:
+                docker(*command)
+                return True
+            except BaseException:
+                failures.append(label)
+                return False
+        if created is None:
+            try:
+                candidates = docker("ps", "-a", "--filter", "label=agentor.incus.acceptance.attempt=" + attempt,
+                                    "--format", "{{.ID}}")
+                if "\n" in candidates:
+                    raise RuntimeError("Ambiguous attempt ownership")
+                created = candidates or None
+            except BaseException:
+                failures.append("replacement ownership check")
+        destination_absent = not failures and (created is None or recover("replacement removal", "rm", "-f", created))
+        # Never run two writers against the same DATA_DIR. An ambiguous failed
+        # destination is retained for explicit recovery with source stopped.
+        if destination_absent:
+            if renamed:
+                recover("source name restoration", "rename", old_id, "agentor-orchestrator")
+            for name in disconnected:
+                recover("source network restoration: " + name, "network", "connect", "--ip",
+                        networks[name]["IPAddress"], name, old_id)
+            recover("source restart", "start", old_id)
+        if failures:
+            raise RuntimeError("Fixture rollback incomplete; retained source " + old_id + ": " + ", ".join(failures)) from primary
         raise
 print("Acceptance Orchestrator replaced; previous exact container retained as " + args.retain_as)
