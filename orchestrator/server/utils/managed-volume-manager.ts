@@ -11,6 +11,7 @@ import { instanceSnapshotActive } from "./instance-snapshot-gate";
 import { useWorkerProtectionLockStore } from "./worker-protection-lock";
 import { requireOrdinaryWorkerSelfAccess } from "./worker-auth";
 import { persistentPathVolumeName } from "./persistent-backup-paths";
+import { normalizeBackupPaths, isParentPath } from './backup-paths';
 
 function withOwnerWorkerLifecycleMutation<T>(userId: string, workerId: string, operation: () => Promise<T>) {
   return withWorkerMutation(userId, workerId, () => {
@@ -260,6 +261,78 @@ export class ManagedVolumeManager {
     } finally {
       if (safeToResume) await container.unpause();
     }
+  }
+
+  /** Caller holds the owner/worker fence. Selection records are desired paths,
+   * never authority to overwrite canonical data or undo explicit detachment. */
+  async adoptIncusSelections(worker: Pick<ContainerInfo, 'id' | 'userId' | 'containerId'>,
+    rawPaths: string[] | undefined, stage = false) {
+    if (instanceSnapshotActive()) throw volumeError(409, 'Directory persistence changes are unavailable during instance backup or restore.');
+    await this.init(); this.assertBackend(worker.userId, worker.id);
+    const record = useWorkerStore().get(worker.userId, worker.id);
+    if (!record || record.runtimeKind !== 'incus-vm' || record.status !== 'active' || record.deletionPending)
+      throw volumeError(409, 'Directory selections require matching active Incus worker authority.');
+    if (record?.incusRecreation || this.recreations.get(worker.userId, worker.id) || this.isRecoveryBlocked(worker.id))
+      throw volumeError(409, 'Complete worker storage recovery before changing directory selections.');
+    const records = this.store.forWorker(worker.userId, worker.id);
+    const known = new Map(records.map(v => [v.target, v]));
+    for (const target of normalizeBackupPaths(rawPaths ?? [])) {
+      const prior = known.get(target);
+      if (prior) {
+        const applying = !stage && this.operations.has(prior.id) &&
+          prior.operation?.mode === 'recreate' && prior.operation.stage === 'recreating';
+        if (!applying && (prior.state === 'failed' || prior.state === 'preparing' || prior.operation?.stage === 'failed'))
+          throw volumeError(409, 'Selection staging needs recovery before configuration can change. Original data was retained.');
+        if (stage && prior.attached && !prior.seeded)
+          await this.stageIncusSelection(worker.containerId, prior, false);
+        continue; // Including explicit detachments: selections do not reattach.
+      }
+      if (target === '/') continue;
+      // System/config/credential targets may be explicitly backed up, but
+      // must never obscure the derived VM bootstrap or become rootfs backing.
+      try { validatePersistenceTarget(target); }
+      catch (error) { if ((error as { statusCode?: number }).statusCode === 400) continue; throw error; }
+      const actual = await this.incusRuntime.inspect(worker.userId, worker.id, worker.containerId);
+      // Saving new selections requires present readable source. Lifecycle
+      // preparation may encounter a backup-only file removed since selection;
+      // there is no directory data at that path to preserve.
+      if (!await this.incusRuntime.isSelectionDirectory(worker.userId, worker.id, worker.containerId, target, !stage)) continue;
+      if (Object.values(actual.expanded_devices ?? actual.devices).some(device =>
+        device.type === 'disk' && device.path && device.path !== '/' &&
+        (device.path === target || isParentPath(device.path, target)))) continue;
+      await this.incusRuntime.validateTarget(worker.userId, worker.id, worker.containerId, target);
+      const v = await this.store.create(worker.userId, worker.id, target, undefined, 'incus-vm');
+      v.operation = { id: randomUUID(), mode: 'deferred', stage: 'queued' };
+      if (stage) {
+        await this.stageIncusSelection(worker.containerId, v, true);
+      } else await this.store.save(v);
+      known.set(target, v);
+    }
+  }
+
+  private async stageIncusSelection(handle: string, v: StoredManagedVolume, newCandidate: boolean) {
+    this.operations.add(v.id);
+    v.state = 'preparing';
+    v.operation = { id: randomUUID(), mode: 'deferred', stage: 'copying' };
+    try {
+      await this.store.save(v);
+      await this.incusRuntime.stageSelection(handle, v);
+      v.state = 'pending'; v.operation.stage = 'complete'; await this.store.save(v);
+    } catch (error) {
+      let cleaned = false;
+      if (!(error as { incusStagingAmbiguous?: boolean })?.incusStagingAmbiguous) {
+        try {
+          await this.incusRuntime.removeStaging(v);
+          if (newCandidate) { await this.store.forget(v.userId, v.id); cleaned = true; }
+        } catch { /* Ambiguous references/ownership: retain record, data and source. */ }
+      }
+      if (!cleaned) {
+        v.state = 'failed'; v.operation.stage = 'failed';
+        v.operation.error = 'Selection staging needs recovery. The original directory and previous backup configuration were retained.';
+        await this.store.save(v);
+      }
+      throw error;
+    } finally { this.operations.delete(v.id); }
   }
 
   /** Called inside the worker lifecycle fence, before discarding its rootfs. */

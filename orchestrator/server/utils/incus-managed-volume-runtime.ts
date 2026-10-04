@@ -87,8 +87,25 @@ export class IncusManagedVolumeRuntime {
     if (before.status !== 'Running') throw volumeError(409, 'Start the retained VM before validating its persistence path.');
     const result = await this.worker.client.exec(before.name, command);
     await this.inspect(userId, workerId, handle);
-    if (result.returnCode !== 0) throw volumeError(409, 'Incus persistence directory validation or copy failed. Original data was retained.');
+    if (result.returnCode !== 0) throw Object.assign(
+      volumeError(409, 'Incus persistence directory validation or copy failed. Original data was retained.'),
+      { guestExitCode: result.returnCode, guestStep: command[0] === 'timeout' ? command[2] : command[0] });
     return result.stdout;
+  }
+
+  /** Called under the existing lifecycle fence: do not use workerCommands,
+   * which would reacquire that queue. Files and leaf symlinks are backup-only;
+   * missing/unreadable paths and changed source incarnations fail closed. */
+  async isSelectionDirectory(userId: string, workerId: string, handle: string, target: string, allowMissing = false) {
+    const before = await this.inspect(userId, workerId, handle);
+    if (before.status !== 'Running') throw volumeError(409, 'Start the retained VM before changing directory selections.');
+    const result = await this.worker.client.exec(before.name, ['timeout', '15', 'python3', '-c',
+      INCUS_SELECTION_DIRECTORY_CHECK, target], { command: [], user: 1000, group: 1000 });
+    await this.inspect(userId, workerId, handle);
+    if (result.returnCode === 0 && allowMissing && result.stdout.trim() === 'missing') return false;
+    if (result.returnCode !== 0 || !['directory', 'backup-only'].includes(result.stdout.trim()))
+      throw volumeError(409, 'Backup selection is missing or unreadable. Previous configuration was retained.');
+    return result.stdout.trim() === 'directory';
   }
 
   async validateTarget(userId: string, workerId: string, handle: string, target: string, allow?: StoredManagedVolume) {
@@ -117,6 +134,57 @@ export class IncusManagedVolumeRuntime {
     if (!found) return;
     if (found.used_by?.length) throw volumeError(409, 'Volume is still referenced by an Incus instance; it was not deleted.');
     await this.worker.client.deleteCustomVolume(this.config.incusStoragePool, v.dockerName);
+  }
+
+  /** Selection-time preflight snapshot, not canonical backing: applications
+   * continue writing the original directory. seed() MUST recopy it before a
+   * later rebuild/archive discards that root. Hotplug needs no VM reboot. */
+  async stageSelection(handle: string, v: StoredManagedVolume) {
+    this.validateRecord(v);
+    if (v.seeded) throw volumeError(409, 'Canonical managed data cannot be overwritten by a backup selection.');
+    await this.validateTarget(v.userId, v.workerId, handle, v.target);
+    const instance = await this.inspect(v.userId, v.workerId, handle);
+    const key = this.deviceKey(v), staging = `/run/agentor-volume-seed/${v.id}`;
+    if (instance.devices[key]) throw volumeError(409, 'Selection staging has an existing device. Recover it before retrying.');
+    // A previous provisional copy is never canonical. Start with an empty,
+    // exact-owned detached staging volume so deleted files cannot reappear.
+    try { await this.removeStaging(v); await this.ensureVolume(v); }
+    catch (error) { throw this.ambiguousStaging(error); }
+    try {
+      try {
+        const attachTo = await this.inspect(v.userId, v.workerId, handle);
+        if (attachTo.devices[key]) throw new Error('Selection staging device changed before attachment.');
+        await this.worker.client.updateInstanceDevices(attachTo.name, { ...attachTo.devices,
+          [key]: { ...this.device(v), path: staging } });
+      } catch (error) { throw this.ambiguousStaging(error); }
+      await this.exec(v.userId, v.workerId, handle, ['timeout', '15', 'mountpoint', '-q', '--', staging]);
+      await this.exec(v.userId, v.workerId, handle, ['timeout', '150', 'bash', '-ec', INCUS_PERSISTENCE_COPY,
+        'selection-copy', v.target, staging]);
+    } finally {
+      try {
+        // Even a lost successful attach response must be inspected. Never
+        // replace whatever now owns the name/device with a stale device map.
+        const current = await this.inspect(v.userId, v.workerId, handle);
+        const device = current.devices[key];
+        if (device) {
+          const expected = { ...this.device(v), path: staging };
+          if (Object.keys(device).length !== Object.keys(expected).length ||
+              Object.entries(expected).some(([field, value]) => device[field] !== value))
+            throw volumeError(409, 'Selection staging identity changed. Compute and storage were retained.');
+          const devices = { ...current.devices }; delete devices[key];
+          await this.worker.client.updateInstanceDevices(current.name, devices);
+        }
+        const detached = await this.inspect(v.userId, v.workerId, handle);
+        if (detached.devices[key]) throw new Error('Selection staging device was not removed.');
+        const found = await this.inspectVolume(v);
+        if (found?.used_by.length) throw volumeError(409, 'Selection staging is still referenced. Recover it before retrying.');
+      } catch (error) { throw this.ambiguousStaging(error); }
+    }
+  }
+
+  private ambiguousStaging(error: unknown) {
+    return Object.assign(volumeError(409, 'Incus selection staging operation is ambiguous. Its recovery record, storage and original directory were retained.'),
+      { incusStagingAmbiguous: true, cause: error });
   }
 
   /** Retain the original root until the metadata-faithful copy AND seeded
@@ -171,6 +239,22 @@ export class IncusManagedVolumeRuntime {
     }
   }
 }
+
+export const INCUS_SELECTION_DIRECTORY_CHECK = String.raw`
+import os, stat, sys
+p=sys.argv[1]
+try: info=os.lstat(p)
+except FileNotFoundError:
+    print('missing'); sys.exit(0)
+directory=stat.S_ISDIR(info.st_mode)
+if directory:
+    current=''
+    for component in p[1:].split('/')[:-1]:
+        current += '/' + component
+        if not stat.S_ISDIR(os.lstat(current).st_mode): raise RuntimeError('Directory selection has a symlink ancestor')
+    if not os.access(p, os.R_OK | os.X_OK): raise PermissionError('Selection is not readable')
+print('directory' if directory else 'backup-only')
+`;
 
 export const INCUS_PERSISTENCE_TARGET_CHECK = String.raw`
 import os, stat, sys, re

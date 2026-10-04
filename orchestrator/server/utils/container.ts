@@ -3466,14 +3466,27 @@ for p in sys.argv[1:]:
     const backup = await useBackupManager().getConfig(info.userId);
     const { normalizeBackupPaths } = await import('./backup-paths');
     const selected = normalizeBackupPaths(backup?.persistSelectedDirectories === false ? [] : backup?.selectedPathsByWorkspace?.[info.id] ?? []);
-    // Do not infer persistent backing through guest-controlled symlinks while
-    // selected-directory/managed-volume integration is still pending.
-    if (selected.some((path) => !['/workspace', '/home/agent/.agent-data'].includes(path)))
-      throw new Error('Incus selected-directory persistence must be applied before replacing compute');
     if (prepare) {
       if (!info.containerId?.startsWith('incus:')) throw new Error('Incus storage preparation requires a captured source incarnation');
+      await volumes.adoptIncusSelections({ id: info.id, userId: info.userId, containerId: info.containerId }, selected);
       await volumes.prepare({ id: info.id, userId: info.userId, containerId: info.containerId });
-    } else await volumes.mounts(info.userId, info.id);
+    } else {
+      // Archive/recreation preflight already classified selections. With
+      // unexpectedly missing active compute there is no source left to prove
+      // whether an unrecorded application path was a file or lost directory.
+      const record = this.workerStore?.get(info.userId, info.id);
+      if (record?.status === 'active' && !record.incusRecreation) {
+        const { validatePersistenceTarget } = await import('./managed-volume-store');
+        const known = new Set(volumes.store.forWorker(info.userId, info.id).map(v => v.target));
+        for (const path of selected) {
+          if (known.has(path) || path === '/' || path === '/workspace') continue;
+          try { validatePersistenceTarget(path); }
+          catch (error) { if ((error as { statusCode?: number }).statusCode === 400) continue; throw error; }
+          throw new Error('Missing Incus compute has an unrecorded selected path. Restore or resolve its persistence before replacement.');
+        }
+      }
+      await volumes.mounts(info.userId, info.id);
+    }
   }
 
   async rebuild(id: string): Promise<ContainerInfo> {

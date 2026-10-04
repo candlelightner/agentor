@@ -23,7 +23,7 @@ type WorkerResolver = (id: string) => ContainerInfo | undefined;
 type DirectoryProbe = (id: string, path: string) => Promise<boolean>;
 
 /**
- * Converts explicit backup directory selections into local Docker volumes.
+ * Converts explicit backup directory selections into runtime-managed volumes.
  * The volume is populated while the old container is still intact; only a
  * later rebuild attaches it at the selected absolute path. Files, `/`, and
  * paths already covered by another persistent mount remain backup-only.
@@ -48,9 +48,16 @@ export class PersistentBackupPathManager {
       const { withOwnerWorkerLifecycleMutation } = await import("./worker-lifecycle-coordinator");
       const { useManagedVolumeManager } = await import("./managed-volume-manager");
       await withOwnerWorkerLifecycleMutation(userId, workerId, async () => {
+        const current = this.resolveWorker(workerId);
+        if (!current || current.userId !== userId)
+          throw Object.assign(new Error('Workspace not found'), { statusCode: 404 });
         const volumes = useManagedVolumeManager(); await volumes.init();
+        if (current.runtimeKind === 'incus-vm') {
+          await volumes.adoptIncusSelections(current, rawPaths, true);
+          return;
+        }
         const known = new Set(volumes.store.forWorker(userId, workerId).map((v) => v.target));
-        const mounts = await this.prepareWorker(worker, rawPaths.filter((p) => !known.has(p)));
+        const mounts = await this.prepareWorker(current, rawPaths.filter((p) => !known.has(p)));
         await volumes.adoptLegacy(userId, workerId, mounts.map((m) => m.target));
       });
     }

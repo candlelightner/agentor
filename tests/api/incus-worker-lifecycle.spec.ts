@@ -143,28 +143,64 @@ test('queued archive/unarchive transitions never clobber pending config or reins
   });
 });
 
-test('Incus archive refuses unresolved selected-directory and unseeded managed-volume persistence', async () => {
+test('Incus replacement reconciles selections before preparing and refuses unseeded managed data without source', async () => {
   const manager = new ContainerManager({} as any, { incusEnabled: false } as Config);
   const backup = useBackupManager(), volumes = useManagedVolumeManager();
   const original = { config: backup.getConfig, init: volumes.init, blocked: volumes.isRecoveryBlocked,
-    recreation: volumes.recreations.get, records: volumes.store.forWorker };
+    recreation: volumes.recreations.get, records: volumes.store.forWorker,
+    adopt: volumes.adoptIncusSelections, prepare: volumes.prepare };
   let paths = ['/workspace', '/home/agent/.agent-data'];
   let attached = false;
   backup.getConfig = async () => ({ selectedPathsByWorkspace: { worker: paths } } as any);
   volumes.init = async () => {}; volumes.isRecoveryBlocked = () => false;
   volumes.recreations.get = () => undefined;
   volumes.store.forWorker = () => attached ? [{ attached: true } as any] : [];
+  const adopted: string[][] = [], prepared: string[] = [];
+  volumes.adoptIncusSelections = async (worker, selected) => { expect(worker.containerId).toBe('incus:original'); adopted.push(selected!); };
+  volumes.prepare = async worker => { prepared.push(worker.containerId); return []; };
   try {
     await (manager as any).assertIncusPersistenceReady({ id: 'worker', userId: 'owner' });
     for (const selection of [['/'], ['/', '/opt/project'], ['/opt/project'], ['/workspace/../opt/project'], ['/workspace/possible-symlink']]) {
       paths = selection;
-      await expect((manager as any).assertIncusPersistenceReady({ id: 'worker', userId: 'owner' })).rejects.toThrow('selected-directory persistence');
+      await (manager as any).assertIncusPersistenceReady({ id: 'worker', userId: 'owner', containerId: 'incus:original' }, true);
     }
+    expect(adopted).toEqual([['/'], ['/'], ['/opt/project'], ['/opt/project'], ['/workspace/possible-symlink']]);
+    expect(prepared).toHaveLength(5);
+    await expect((manager as any).assertIncusPersistenceReady({ id: 'worker', userId: 'owner' }, true)).rejects.toThrow('captured source');
     paths = ['/workspace']; attached = true;
     await expect((manager as any).assertIncusPersistenceReady({ id: 'worker', userId: 'owner' })).rejects.toThrow('Persistence is pending');
   } finally {
     backup.getConfig = original.config; volumes.init = original.init; volumes.isRecoveryBlocked = original.blocked;
     volumes.recreations.get = original.recreation; volumes.store.forWorker = original.records;
+    volumes.adoptIncusSelections = original.adopt; volumes.prepare = original.prepare;
+  }
+});
+
+test('missing active Incus compute refuses unknown selected paths but archive and bounded rollback preserve backup-only selections', async () => {
+  const manager = new ContainerManager({} as any, { incusEnabled: false } as Config);
+  const backup = useBackupManager(), volumes = useManagedVolumeManager();
+  const original = { config: backup.getConfig, init: volumes.init, blocked: volumes.isRecoveryBlocked,
+    recreation: volumes.recreations.get, records: volumes.store.forWorker, mounts: volumes.mounts };
+  let record: any = { status: 'active' }, paths = ['/opt/unknown'], known: any[] = [];
+  manager.setWorkerStore({ get: () => record } as any);
+  backup.getConfig = async () => ({ selectedPathsByWorkspace: { worker: paths } } as any);
+  volumes.init = async () => {}; volumes.isRecoveryBlocked = () => false;
+  volumes.recreations.get = () => undefined; volumes.store.forWorker = () => known;
+  volumes.mounts = async () => [];
+  const check = () => (manager as any).assertIncusPersistenceReady({ id: 'worker', userId: 'owner' });
+  try {
+    await expect(check()).rejects.toThrow('unrecorded selected path');
+    record = { status: 'archived' }; await check();
+    record = { status: 'active', incusRecreation: { nonce: 'bounded' } }; await check();
+    record = { status: 'active' }; known = [{ target: '/opt/unknown', attached: false }]; await check();
+    known = [];
+    for (const backupOnly of ['/', '/etc', '/home/agent/.agent-data', '/workspace']) {
+      paths = [backupOnly]; await check();
+    }
+    paths = ['/workspace/possible-symlink/child']; await expect(check()).rejects.toThrow('unrecorded selected path');
+  } finally {
+    backup.getConfig = original.config; volumes.init = original.init; volumes.isRecoveryBlocked = original.blocked;
+    volumes.recreations.get = original.recreation; volumes.store.forWorker = original.records; volumes.mounts = original.mounts;
   }
 });
 

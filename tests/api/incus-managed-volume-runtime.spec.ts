@@ -3,10 +3,13 @@ import { execFileSync } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, symlink, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { IncusManagedVolumeRuntime, INCUS_PERSISTENCE_TARGET_CHECK } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
+import { IncusManagedVolumeRuntime, INCUS_PERSISTENCE_TARGET_CHECK, INCUS_SELECTION_DIRECTORY_CHECK } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
 import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volume-store';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import { ManagedVolumeManager } from '../../orchestrator/server/utils/managed-volume-manager';
+import { useWorkerStore } from '../../orchestrator/server/utils/services';
+import { BackupManager } from '../../orchestrator/server/utils/backup-manager';
+import { beginInstanceSnapshot } from '../../orchestrator/server/utils/instance-snapshot-gate';
 import type { Config } from '../../orchestrator/server/utils/config';
 
 async function fixture(run: (runtime: IncusManagedVolumeRuntime, v: any, calls: string[], state: any) => Promise<void>) {
@@ -29,12 +32,22 @@ async function fixture(run: (runtime: IncusManagedVolumeRuntime, v: any, calls: 
       },
       createCustomVolume: async (_pool: string, spec: any) => { calls.push('create-volume'); state.volume = { ...spec, type: 'custom', used_by: [] }; },
       deleteCustomVolume: async () => { calls.push('delete-volume'); state.volume = undefined; },
-      updateInstanceDevices: async (_name: string, devices: any) => { calls.push('devices'); state.instance.devices = devices; },
+      updateInstanceDevices: async (_name: string, devices: any) => {
+        calls.push('devices');
+        if (!(state.ignoreDetach && !Object.keys(devices).length)) state.instance.devices = devices;
+        if (state.lostAttach && Object.keys(devices).length) { state.lostAttach = false; throw new Error('lost attach response'); }
+      },
       startInstance: async () => { calls.push('start'); state.instance.status = 'Running'; if (state.startFailure) throw new Error('lost start response'); },
-      exec: async (_name: string, command: string[]) => {
+      exec: async (_name: string, command: string[], options: any) => {
+        if (command[4]?.includes("print('directory'")) {
+          expect(options).toMatchObject({ user: 1000, group: 1000 });
+          if (state.changedProbe) state.instance.config['volatile.uuid'] = 'foreign';
+          return state.probeResponse ?? { returnCode: 0, stdout: 'directory\n', stderr: '' };
+        }
         const copying = command[0] === 'timeout' && command[1] === '150';
         calls.push(copying ? 'copy' : 'exec');
         if (copying && state.copyFailure) return { returnCode: 1, stderr: 'ENOSPC', stdout: '' };
+        if (copying && state.foreignAfterCopy) state.instance.devices[runtime.deviceKey(v)].path = '/foreign';
         return { returnCode: 0, stderr: '', stdout: '' };
       },
     },
@@ -68,6 +81,240 @@ test('Incus storage refuses missing seeded data, wrong backend and unavailable o
     await expect(runtime.inspect(v.userId, v.workerId, 'incus:wrong')).rejects.toThrow('incarnation');
     state.instance.config['volatile.uuid'] = '';
     await expect(runtime.inspect(v.userId, v.workerId, 'worker-name')).rejects.toThrow('incarnation');
+  });
+});
+
+test('selection staging does not stop/start compute, keeps data unseeded and refreshes provisional copies', async () => {
+  await fixture(async (runtime, v, calls, state) => {
+    state.volume = state.ownedVolume;
+    await runtime.stageSelection('incus:original', v);
+    expect(v.seeded).toBe(false); expect(state.instance.devices).toEqual({});
+    expect(state.instance.status).toBe('Running');
+    expect(calls.filter(c => c === 'copy')).toHaveLength(1);
+    expect(calls).not.toContain('start'); expect(calls).not.toContain('stop:original');
+    expect(calls.indexOf('delete-volume')).toBeLessThan(calls.indexOf('create-volume'));
+    await runtime.seed('incus:original', v, async () => { v.seeded = true; });
+    expect(calls.filter(c => c === 'copy')).toHaveLength(2);
+    expect(v.seeded).toBe(true);
+  });
+});
+
+test('failed selection copy and lost attach response detach only exact staging without changing source lifecycle', async () => {
+  for (const fault of ['copyFailure', 'lostAttach']) await fixture(async (runtime, v, calls, state) => {
+    state[fault] = true;
+    await expect(runtime.stageSelection('incus:original', v)).rejects.toThrow();
+    expect(state.instance.devices).toEqual({}); expect(v.seeded).toBe(false);
+    expect(state.instance.status).toBe('Running');
+    expect(calls).not.toContain('stop:original'); expect(calls).not.toContain('start');
+    await runtime.removeStaging(v); expect(state.volume).toBeUndefined();
+  });
+});
+
+test('selection cleanup retains changed staging devices rather than overwriting foreign identity', async () => {
+  await fixture(async (runtime, v, calls, state) => {
+    state.foreignAfterCopy = true;
+    await expect(runtime.stageSelection('incus:original', v)).rejects.toMatchObject({ incusStagingAmbiguous: true });
+    expect(state.instance.devices[runtime.deviceKey(v)].path).toBe('/foreign');
+    expect(calls.filter(c => c === 'devices')).toHaveLength(1);
+    expect(calls).not.toContain('delete-volume'); expect(v.seeded).toBe(false);
+  });
+});
+
+test('selection attachment rechecks incarnation after storage allocation and never applies a stale device map', async () => {
+  await fixture(async (runtime, v, calls, state) => {
+    const create = runtime.worker.client.createCustomVolume.bind(runtime.worker.client);
+    runtime.worker.client.createCustomVolume = async (...args) => {
+      await create(...args); state.instance.config['volatile.uuid'] = 'replaced-during-allocation';
+    };
+    await expect(runtime.stageSelection('incus:original', v)).rejects.toMatchObject({ incusStagingAmbiguous: true });
+    expect(calls).not.toContain('devices'); expect(state.volume).toBeTruthy();
+    expect(v.seeded).toBe(false);
+  });
+});
+
+test('successful detach responses still require the captured device to disappear and references to be empty', async () => {
+  await fixture(async (runtime, v, _calls, state) => {
+    state.ignoreDetach = true;
+    await expect(runtime.stageSelection('incus:original', v)).rejects.toMatchObject({ incusStagingAmbiguous: true });
+    expect(state.instance.devices[runtime.deviceKey(v)]).toBeTruthy();
+  });
+  await fixture(async (runtime, v, _calls, state) => {
+    const create = runtime.worker.client.createCustomVolume.bind(runtime.worker.client);
+    runtime.worker.client.createCustomVolume = async (...args) => {
+      await create(...args); state.volume.used_by = ['/1.0/instances/agentor-worker-worker?project=agentor'];
+    };
+    await expect(runtime.stageSelection('incus:original', v)).rejects.toMatchObject({ incusStagingAmbiguous: true });
+    expect(state.volume).toBeTruthy(); expect(v.seeded).toBe(false);
+  });
+});
+
+test('captured selection probe uses guest UID1000 without queue reentry and refuses changed/missing/unreadable facts', async () => {
+  await fixture(async (runtime, v, _calls, state) => {
+    expect(await runtime.isSelectionDirectory(v.userId, v.workerId, 'incus:original', v.target)).toBe(true);
+    state.probeResponse = { returnCode: 0, stdout: 'backup-only\n' };
+    expect(await runtime.isSelectionDirectory(v.userId, v.workerId, 'incus:original', v.target)).toBe(false);
+    state.probeResponse = { returnCode: 0, stdout: 'missing\n' };
+    await expect(runtime.isSelectionDirectory(v.userId, v.workerId, 'incus:original', v.target)).rejects.toThrow('missing or unreadable');
+    expect(await runtime.isSelectionDirectory(v.userId, v.workerId, 'incus:original', v.target, true)).toBe(false);
+    for (const response of [{ returnCode: 1, stdout: '' }, { returnCode: 0, stdout: 'invalid' }]) {
+      state.probeResponse = response;
+      await expect(runtime.isSelectionDirectory(v.userId, v.workerId, 'incus:original', v.target)).rejects.toThrow('missing or unreadable');
+    }
+    state.probeResponse = { returnCode: 0, stdout: 'directory' }; state.changedProbe = true;
+    await expect(runtime.isSelectionDirectory(v.userId, v.workerId, 'incus:original', v.target)).rejects.toThrow('incarnation changed');
+  });
+});
+
+async function selectionFixture(run: (manager: ManagedVolumeManager, worker: any, calls: string[], state: any) => Promise<void>) {
+  const root = await mkdtemp(join(tmpdir(), 'incus-selected-paths-'));
+  const manager = new ManagedVolumeManager(root, new Proxy({}, { get: () => () => { throw new Error('Docker must not be called'); } }) as any);
+  await manager.init();
+  const worker = { id: 'selection-worker', userId: 'selection-owner', containerId: 'incus:original' };
+  const workers = useWorkerStore(), originalGet = workers.get;
+  const calls: string[] = [], state: any = { devices: {}, files: new Set(), declared: { runtimeKind: 'incus-vm', status: 'active' } };
+  workers.get = () => state.declared;
+  (manager as any).incus = {
+    inspect: async () => ({ devices: state.devices }),
+    isSelectionDirectory: async (_owner: string, _worker: string, handle: string, target: string, allowMissing: boolean) => {
+      if (state.missing) { if (allowMissing) return false; throw new Error('missing selection'); }
+      expect(handle).toBe('incus:original'); calls.push('probe:' + target); return !state.files.has(target);
+    },
+    validateTarget: async () => { if (state.invalidTarget) throw new Error('invalid guest path'); },
+    stageSelection: async (_handle: string, v: any) => {
+      calls.push('stage:' + v.target);
+      if (state.ambiguous) throw Object.assign(new Error('late attachment'), { incusStagingAmbiguous: true });
+      if (state.copyFailure) throw new Error('ENOSPC');
+    },
+    removeStaging: async () => { calls.push('cleanup'); if (state.cleanupFailure) throw new Error('ambiguous attachment'); },
+  };
+  try { await run(manager, worker, calls, state); }
+  finally { workers.get = originalGet; await rm(root, { recursive: true, force: true }); }
+}
+
+test('Incus selection classification keeps files, root, protected and already-backed paths backup-only', async () => {
+  await selectionFixture(async (manager, worker, calls, state) => {
+    state.files.add('/opt/file'); state.files.add('/opt/symlink');
+    state.devices.workspace = { type: 'disk', path: '/workspace' };
+    await manager.adoptIncusSelections(worker, ['/']);
+    await manager.adoptIncusSelections(worker, ['/etc', '/home/agent/.agent-data', '/workspace/project', '/opt/file', '/opt/symlink'], true);
+    expect(manager.store.forWorker(worker.userId, worker.id)).toEqual([]);
+    expect(calls).toEqual(['probe:/workspace/project', 'probe:/opt/file', 'probe:/opt/symlink']);
+    await manager.adoptIncusSelections(worker, ['/opt/project'], true);
+    expect(manager.store.forWorker(worker.userId, worker.id)[0]).toMatchObject({
+      target: '/opt/project', seeded: false, attached: true, state: 'pending', storageRuntimeKind: 'incus-vm', operation: { stage: 'complete' } });
+  });
+});
+
+test('ambiguous staging retains its durable candidate even when an early inspection would report detached', async () => {
+  await selectionFixture(async (manager, worker, calls, state) => {
+    state.ambiguous = true;
+    await expect(manager.adoptIncusSelections(worker, ['/opt/project'], true)).rejects.toThrow('late attachment');
+    expect(calls).not.toContain('cleanup');
+    expect(manager.store.forWorker(worker.userId, worker.id)[0]).toMatchObject({ state: 'failed', seeded: false });
+  });
+});
+
+test('selection adoption honors the instance snapshot barrier before any probe, record or hotplug', async () => {
+  await selectionFixture(async (manager, worker, calls) => {
+    const release = beginInstanceSnapshot('selection-barrier');
+    try { await expect(manager.adoptIncusSelections(worker, ['/opt/project'], true)).rejects.toThrow('instance backup or restore'); }
+    finally { release(); }
+    expect(calls).toEqual([]); expect(manager.store.forWorker(worker.userId, worker.id)).toEqual([]);
+  });
+});
+
+test('removed backup-only selections do not block lifecycle preparation but cannot be newly committed as persistent', async () => {
+  await selectionFixture(async (manager, worker, calls, state) => {
+    state.missing = true;
+    await manager.adoptIncusSelections(worker, ['/opt/removed-file']);
+    await expect(manager.adoptIncusSelections(worker, ['/opt/removed-file'], true)).rejects.toThrow('missing selection');
+    expect(manager.store.forWorker(worker.userId, worker.id)).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+});
+
+test('selection errors retain previous backup config; ambiguous cleanup cannot bypass validation on retry', async () => {
+  await selectionFixture(async (manager, worker, calls, state) => {
+    const root = await mkdtemp(join(tmpdir(), 'incus-selection-backup-'));
+    try {
+      const backup = new BackupManager({ dataDir: root });
+      backup.setPathPersistenceAdapter({ reconcileSelections: async (_owner, selected) => {
+        await manager.adoptIncusSelections(worker, selected?.[worker.id], true);
+      } });
+      await backup.setConfig(worker.userId, { enabled: false, selectedPathsByWorkspace: {} });
+      const previous = await backup.getConfig(worker.userId);
+      state.copyFailure = true;
+      const input = { selectedPathsByWorkspace: { [worker.id]: ['/opt/project'] } };
+      await expect(backup.setConfig(worker.userId, input)).rejects.toThrow('ENOSPC');
+      expect(await backup.getConfig(worker.userId)).toEqual(previous);
+      expect(manager.store.forWorker(worker.userId, worker.id)).toEqual([]);
+      state.cleanupFailure = true;
+      await expect(backup.setConfig(worker.userId, input)).rejects.toThrow('ENOSPC');
+      expect(manager.store.forWorker(worker.userId, worker.id)[0]).toMatchObject({ state: 'failed', seeded: false });
+      const copied = calls.filter(c => c.startsWith('stage:')).length;
+      await expect(backup.setConfig(worker.userId, input)).rejects.toThrow('needs recovery');
+      expect(calls.filter(c => c.startsWith('stage:'))).toHaveLength(copied);
+      expect(await backup.getConfig(worker.userId)).toEqual(previous);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+});
+
+test('repeated selection refreshes unseeded staging but never reattaches explicitly detached data', async () => {
+  await selectionFixture(async (manager, worker, calls) => {
+    await manager.adoptIncusSelections(worker, ['/opt/project'], true);
+    await manager.adoptIncusSelections(worker, ['/opt/project'], true);
+    expect(calls.filter(c => c === 'stage:/opt/project')).toHaveLength(2);
+    const v = manager.store.forWorker(worker.userId, worker.id)[0]!;
+    await manager.store.save({ ...v, seeded: true, attached: false, state: 'detached' });
+    await manager.adoptIncusSelections(worker, ['/opt/project'], true);
+    expect(calls.filter(c => c === 'stage:/opt/project')).toHaveLength(2);
+    expect(manager.store.get(worker.userId, v.id)?.attached).toBe(false);
+    await manager.adoptIncusSelections(worker, []);
+    expect(manager.store.get(worker.userId, v.id)).toBeTruthy();
+  });
+});
+
+test('interrupted selection staging, invalid target and changed worker authority fail before configuration adoption', async () => {
+  await selectionFixture(async (manager, worker, calls, state) => {
+    state.invalidTarget = true;
+    await expect(manager.adoptIncusSelections(worker, ['/opt/project'], true)).rejects.toThrow('invalid guest path');
+    expect(manager.store.forWorker(worker.userId, worker.id)).toEqual([]);
+    state.invalidTarget = false;
+    const v = await manager.store.create(worker.userId, worker.id, '/opt/project', undefined, 'incus-vm');
+    await manager.store.save({ ...v, state: 'preparing', operation: { id: 'interrupted', mode: 'deferred', stage: 'copying' } });
+    await expect(manager.adoptIncusSelections(worker, [v.target], true)).rejects.toThrow('needs recovery');
+    expect(calls.filter(c => c.startsWith('stage:'))).toEqual([]);
+    state.declared = undefined;
+    await expect(manager.adoptIncusSelections(worker, [v.target], true)).rejects.toThrow('active Incus worker authority');
+  });
+});
+
+test('enabling directory persistence reconciles effective existing selections before config commit', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'incus-selection-reenable-'));
+  try {
+    const backup = new BackupManager({ dataDir: root }), calls: any[] = [];
+    let fail = false;
+    backup.setPathPersistenceAdapter({ reconcileSelections: async (_owner, paths) => {
+      calls.push(paths); if (fail) throw new Error('copy failed');
+    } });
+    await backup.setConfig('owner', { persistSelectedDirectories: false, selectedPathsByWorkspace: { worker: ['/opt/project'] } });
+    expect(calls).toEqual([]); fail = true;
+    await expect(backup.setConfig('owner', { persistSelectedDirectories: true })).rejects.toThrow('copy failed');
+    expect((await backup.getConfig('owner'))?.persistSelectedDirectories).toBe(false);
+    fail = false; await backup.setConfig('owner', { persistSelectedDirectories: true });
+    expect(calls).toEqual([{ worker: ['/opt/project'] }, { worker: ['/opt/project'] }]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('an in-process explicit storage retry may prepare its own selected record without authorizing settings-save bypass', async () => {
+  await selectionFixture(async (manager, worker, calls) => {
+    const v = await manager.store.create(worker.userId, worker.id, '/opt/project', undefined, 'incus-vm');
+    await manager.store.save({ ...v, state: 'preparing', operation: { id: 'own-retry', mode: 'recreate', stage: 'recreating' } });
+    await expect(manager.adoptIncusSelections(worker, [v.target])).rejects.toThrow('needs recovery');
+    (manager as any).operations.add(v.id);
+    await manager.adoptIncusSelections(worker, [v.target]);
+    await expect(manager.adoptIncusSelections(worker, [v.target], true)).rejects.toThrow('needs recovery');
+    expect(calls).toEqual([]);
   });
 });
 
@@ -190,5 +437,20 @@ test('actual guest path validator rejects symlink components and decodes mountin
       await writeFile(mountinfo, `1 0 0:1 / ${path.replaceAll(' ', '\\040')} rw - ext4 /dev/disk rw\n`);
       expect(() => run()).toThrow();
     }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('actual selection classifier rejects symlink ancestors before treating lexical mount coverage as persistent', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'incus-selection-path-proof-'));
+  try {
+    const target = join(root, 'directory with spaces'); await mkdir(target);
+    await mkdir(join(target, 'child')); await writeFile(join(root, 'file'), 'backup-only');
+    await symlink(target, join(root, 'escape'));
+    const run = (path: string) => execFileSync('python3', ['-c', INCUS_SELECTION_DIRECTORY_CHECK, path], { encoding: 'utf8' }).trim();
+    expect(run(target)).toBe('directory');
+    expect(run(join(root, 'file'))).toBe('backup-only');
+    expect(run(join(root, 'escape'))).toBe('backup-only');
+    expect(() => run(join(root, 'escape/child'))).toThrow();
+    expect(run(join(root, 'missing'))).toBe('missing');
   } finally { await rm(root, { recursive: true, force: true }); }
 });

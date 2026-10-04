@@ -9,7 +9,8 @@ import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volu
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import { zeroUserEnvVars } from '../../orchestrator/server/utils/user-env-store';
 import type { Config } from '../../orchestrator/server/utils/config';
-import { useConfig, useContainerManager, useWorkerStore } from '../../orchestrator/server/utils/services';
+import { useConfig, useContainerManager, useWorkerStore, usePersistentBackupPathManager } from '../../orchestrator/server/utils/services';
+import { useBackupManager } from '../../orchestrator/server/utils/backup-manager';
 import { useManagedVolumeManager } from '../../orchestrator/server/utils/managed-volume-manager';
 import { useWorkerConfigStore } from '../../orchestrator/server/utils/worker-config-store';
 
@@ -148,6 +149,155 @@ async function productionManagerFixture() {
     capabilitiesJson: [], instructionsJson: [] });
   return { config, manager, store, volumes, runtime };
 }
+
+test('real Incus filesystem hotplug capability preserves the running worker boot and service', async () => {
+  test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable filesystem hotplug diagnostic');
+  test.setTimeout(300_000);
+  const { config, manager, store, volumes, runtime } = await productionManagerFixture();
+  let info: any, v: any, failed = false;
+  try {
+    info = await (manager as any).createForOwner({ userId: 'managed-live-owner', displayName: 'filesystem hotplug diagnostic' });
+    const incarnation = info.containerId.slice(6), managed = new IncusManagedVolumeRuntime(config, runtime);
+    v = await volumes.store.create(info.userId, info.id, '/opt/hotplug-proof', undefined, 'incus-vm');
+    await managed.ensureVolume(v);
+    const key = managed.deviceKey(v), staging = `/run/agentor-volume-seed/${v.id}`;
+    const before = await runtime.inspectGuestReadiness(info, incarnation);
+    const servicePid = async () => (await runtime.client.exec(info.containerName, ['systemctl', 'show', '-p', 'MainPID', '--value', 'agentor-worker'])).stdout.trim();
+    const pid = await servicePid();
+    const instance = await runtime.client.getInstance(info.containerName);
+    expect(instance.config['volatile.uuid']).toBe(incarnation);
+    await runtime.client.updateInstanceDevices(info.containerName, { ...instance.devices,
+      [key]: { ...managed.device(v), path: staging } });
+    const mounted = await runtime.client.exec(info.containerName, ['mountpoint', '-q', '--', staging]);
+    console.info('Filesystem hotplug diagnostic:', { mounted: mounted.returnCode === 0, boot: (await runtime.inspectGuestReadiness(info, incarnation)).bootId === before.bootId, service: await servicePid() === pid });
+    expect(mounted.returnCode, mounted.stdout + mounted.stderr).toBe(0);
+    expect((await runtime.inspectGuestReadiness(info, incarnation)).bootId).toBe(before.bootId);
+    expect(await servicePid()).toBe(pid);
+    const attached = await runtime.client.getInstance(info.containerName);
+    const devices = { ...attached.devices }; delete devices[key];
+    await runtime.client.updateInstanceDevices(info.containerName, devices);
+    expect((await managed.inspectVolume(v))?.used_by).toEqual([]);
+    expect((await runtime.client.exec(info.containerName, ['bash', '-ec',
+      'mkdir -p /opt/hotplug-proof; echo repeated-staging > /opt/hotplug-proof/sentinel'])).returnCode).toBe(0);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try { await managed.stageSelection(info.containerId, v); }
+      catch (error) {
+        console.error('Repeated hotplug failure', { attempt,
+          step: (error as any).guestStep, returnCode: (error as any).guestExitCode });
+        throw error;
+      }
+      expect((await managed.inspectVolume(v))?.used_by).toEqual([]);
+      expect(v.seeded).toBe(false);
+    }
+    expect((await runtime.inspectGuestReadiness(info, incarnation)).bootId).toBe(before.bootId);
+    expect(await servicePid()).toBe(pid);
+    console.info('Repeated selection hotplug: five exact-owned provisional copies; unchanged boot/service PID');
+  } catch (error) { failed = true; throw error; }
+  finally {
+    if (info) {
+      try {
+        const instance = await runtime.client.getInstance(info.containerName);
+        expect(await runtime.matchesWorkerIdentity(instance, info.id, info.userId)).toBe(true);
+        await runtime.remove(info, instance.config['volatile.uuid']);
+        if (v) { await volumes.incusRuntime.delete(v); await volumes.store.forget(v.userId, v.id); }
+        await runtime.removeStorage(info);
+        if (store.get(info.userId, info.id)) await store.delete(info.userId, info.id);
+      } catch (error) {
+        console.error('Preserving filesystem hotplug diagnostic fixture', info.containerName, v?.id, error);
+        if (!failed) throw error;
+      }
+    }
+  }
+});
+
+test('real production backup selections hotplug without restart and refresh root data before storage recreation', async () => {
+  test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable production selection gate');
+  test.setTimeout(900_000);
+  const { manager, store, volumes, runtime } = await productionManagerFixture();
+  const backup = useBackupManager(); backup.setPathPersistenceAdapter(usePersistentBackupPathManager());
+  const target = '/opt/selected-integration';
+  const selectionClient = volumes.incusRuntime.worker.client;
+  const originalExec = selectionClient.exec;
+  selectionClient.exec = async (name, command, options) => {
+    const result = await originalExec.call(selectionClient, name, command, options);
+    if (command[0] === 'timeout' && result.returnCode !== 0)
+      console.error('Selection guest failure:', { step: command[2], timeout: command[1],
+        returnCode: result.returnCode, stderr: result.stderr.slice(0, 2000) });
+    return result;
+  };
+  let info: any, volumeId: string | undefined, failed = false;
+  const check = async (script: string) => {
+    const result = await runtime.client.exec(info.containerName, ['bash', '-ec', script, 'selection-check', target]);
+    expect(result.returnCode, result.stdout + result.stderr).toBe(0);
+    return result.stdout.trim();
+  };
+  const ready = async () => {
+    await expect.poll(() => {
+      const v = volumes.store.get(info.userId, volumeId!)!;
+      if (v.state === 'failed') throw new Error(v.operation?.error || 'Selection persistence failed');
+      return v.operation?.stage;
+    }, { timeout: 300_000, intervals: [500, 1000] }).toBe('complete');
+    info = manager.get(info.id)!;
+  };
+  try {
+    info = await (manager as any).createForOwner({ userId: 'managed-live-owner', displayName: 'selection integration',
+      workerConfiguration: { secrets: [{ key: 'SELECTION_BOOT', value: 'applied' }] } });
+    await check('mkdir -p "$1"; echo before-selection > "$1/sentinel"; echo removed-later > "$1/stale"; chown -R 1000:1000 "$1"; echo backup-file > /tmp/selection-file');
+    const actor = { userId: info.userId, workerId: info.id }, originalHandle = info.containerId;
+    const before = await runtime.inspectGuestReadiness(info, originalHandle.slice(6));
+    const pid = await check('systemctl show -p MainPID --value agentor-worker');
+    info.initScript = 'echo desired-init > /workspace/selection-pending'; info.pendingRebuild = true;
+    await store.upsert((manager as any).containerInfoToWorkerRecord(info));
+    await useWorkerConfigStore().replace(info.userId, info.id, [{ kind: 'secret', key: 'SELECTION_BOOT', value: 'pending' }]);
+    await backup.setConfig(info.userId, { persistSelectedDirectories: true,
+      selectedPathsByWorkspace: { [info.id]: [target, '/tmp/selection-file', '/etc'] } });
+    const records = volumes.store.forWorker(info.userId, info.id);
+    expect(records).toHaveLength(1); volumeId = records[0]!.id;
+    expect(records[0]).toMatchObject({ target, seeded: false, attached: true, state: 'pending', operation: { stage: 'complete' } });
+    expect((await volumes.incusRuntime.inspectVolume(records[0]!))?.used_by).toEqual([]);
+    expect(info.containerId).toBe(originalHandle);
+    expect((await runtime.inspectGuestReadiness(info, originalHandle.slice(6))).bootId).toBe(before.bootId);
+    expect(await check('systemctl show -p MainPID --value agentor-worker')).toBe(pid);
+    await check('! mountpoint -q "$1"; test "$(cat "$1/sentinel")" = before-selection; test ! -e /workspace/selection-pending');
+    console.info('Selection gate: settings validated/copied, unchanged boot and service PID');
+    await check('echo after-selection > "$1/sentinel"; echo new-write > "$1/new"; rm "$1/stale"');
+    await volumes.apply(actor, volumeId, 'recreate'); await ready();
+    await check('mountpoint -q "$1"; test "$(cat "$1/sentinel")" = after-selection; test "$(cat "$1/new")" = new-write; test ! -e "$1/stale"; test ! -e /workspace/selection-pending; source /run/agentor/worker.env; test "$(printf %s "$WORKER_LOCAL_ENV" | base64 -d | jq -r \'.[] | select(.key == "SELECTION_BOOT") | .value\')" = applied');
+    expect(info.pendingRebuild).toBe(true);
+    console.info('Selection gate: fresh root copy includes later writes/deletions; pending settings remain unapplied');
+    await volumes.detach(actor, volumeId, true, true); await ready();
+    await backup.setConfig(info.userId, { selectedPathsByWorkspace: { [info.id]: [target] } });
+    expect(volumes.store.get(info.userId, volumeId)?.attached).toBe(false);
+    info = await manager.rebuild(info.id);
+    await check('! mountpoint -q "$1"; test ! -e "$1/sentinel"; test -e /workspace/selection-pending');
+    console.info('Selection gate: stale backup selection does not reattach explicitly detached data');
+    await backup.setConfig(info.userId, { selectedPathsByWorkspace: {} });
+    await manager.remove(info.id);
+    await volumes.delete(actor, volumeId, true);
+  } catch (error) { failed = true; throw error; }
+  finally {
+    selectionClient.exec = originalExec;
+    if (info) {
+      try {
+        const instance = await runtime.client.getInstance(info.containerName).catch(error => {
+          if (error.statusCode !== 404) throw error;
+        });
+        if (instance) {
+          expect(await runtime.matchesWorkerIdentity(instance, info.id, info.userId)).toBe(true);
+          await runtime.remove(info, instance.config['volatile.uuid']);
+        }
+        for (const v of volumes.store.forWorker(info.userId, info.id)) {
+          await volumes.incusRuntime.delete(v); await volumes.store.forget(v.userId, v.id);
+        }
+        await runtime.removeStorage(info);
+        if (store.get(info.userId, info.id)) await store.delete(info.userId, info.id);
+      } catch (error) {
+        console.error('Preserving failed selection fixture', info.containerName, volumeId, error);
+        if (!failed) throw error;
+      }
+    }
+  }
+});
 
 test('real production manager applies Incus persistence without promoting pending configuration and retains detached data', async () => {
   test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable managed-storage integration gate');

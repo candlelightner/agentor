@@ -437,8 +437,9 @@ export class BackupManager {
     // Seed every newly selected directory before committing configuration.
     // A failed copy therefore leaves both the old container and the previous
     // backup settings authoritative, and no rebuild can attach an empty volume.
-    if (persistDirectories && input.selectedPathsByWorkspace !== undefined && this.pathPersistence)
-      await this.pathPersistence.reconcileSelections(userId, normalizedPaths);
+    if (persistDirectories && this.pathPersistence &&
+        (input.selectedPathsByWorkspace !== undefined || previousConfig?.persistSelectedDirectories === false))
+      await this.pathPersistence.reconcileSelections(userId, normalizedPaths ?? previousConfig?.selectedPathsByWorkspace);
     const now = new Date().toISOString();
     const config = await this.store.update(userId, (data) => {
       const old = data.config;
