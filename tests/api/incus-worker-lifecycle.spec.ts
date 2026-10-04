@@ -15,6 +15,7 @@ import type { Config } from '../../orchestrator/server/utils/config';
 (globalThis as any).useLogger ??= () => ({ info() {}, error() {}, warn() {}, debug() {} });
 (globalThis as any).useLogCollector ??= () => ({ attach: async () => {}, detach() {} });
 (globalThis as any).reassignWorkerMappings ??= async () => {};
+(globalThis as any).cleanupWorkerMappings ??= async () => {};
 
 async function fixture(run: (manager: ContainerManager, store: WorkerStore, calls: string[], info: any) => Promise<void>) {
   const root = await mkdtemp(join(tmpdir(), 'agentor-incus-archive-'));
@@ -435,6 +436,148 @@ test('queued recreation rollback cannot clear a changed marker or resurrect dele
   });
 });
 
+async function initialCreationFixture(run: (manager: ContainerManager, store: WorkerStore, calls: string[], options: any) => Promise<void>) {
+  await fixture(async (manager, store, calls, info) => {
+    (manager as any).config.incusEnabled = true;
+    (manager as any).resolveGitIdentity = async () => ({ gitName: '', gitEmail: '' });
+    (manager as any).resolveAuthorizedHostMounts = async () => undefined;
+    (manager as any).resolveHardwareDeviceAccess = async () => undefined;
+    (manager as any).resolveUserEnvAndBinds = async () => ({ userEnv: zeroUserEnvVars(info.userId), credentialBinds: [], groupSecrets: [] });
+    (manager as any).resolveEnvironmentConfig = () => ({ dockerEnabled: false,
+      environmentJson: { networkMode: 'full', allowedDomains: [], dockerEnabled: false, setupScript: '', envVars: '', exposeApis: {} },
+      capabilitiesJson: [], instructionsJson: [] });
+    const runtime = (manager as any).incusRuntime;
+    const state: any = {};
+    runtime.create = async (options: any) => {
+      state.options = options;
+      expect(options.start).toBe(false);
+      expect(store.get(options.userId, options.id)?.incusRecreation?.nonce).toBe(options.recreationNonce);
+      calls.push('create-stopped');
+      return { config: { 'volatile.uuid': 'initial-uuid', 'user.agentor.recreation': options.recreationNonce } };
+    };
+    runtime.matchesWorkerIdentity = async () => true;
+    runtime.start = async (options: any, uuid: string) => {
+      expect(uuid).toBe('initial-uuid');
+      expect(store.get(options.userId, options.id)?.incusRecreation?.replacementIncarnation).toBe(uuid);
+      calls.push('start-captured');
+    };
+    runtime.rollbackRecreation = async (_owner: any, marker: any) => {
+      expect(marker.replacementIncarnation).toBe('initial-uuid'); expect(marker.nonce).toBe(state.options.recreationNonce);
+      calls.push('rollback-captured'); return { status: 'archived' };
+    };
+    runtime.remove = runtime.removeStorage = async () => { throw new Error('Initial failure must not use name-only/data cleanup'); };
+    const config = useWorkerConfigStore();
+    const original = { desired: config.resolveDesiredRevision, mark: config.markApplied, remove: config.remove };
+    config.resolveDesiredRevision = async () => ({ revision: undefined, values: [] });
+    config.markApplied = async () => { calls.push('applied'); };
+    config.remove = async () => { calls.push('remove-provisional-config'); };
+    state.owner = info.userId;
+    try { await run(manager, store, calls, state); }
+    finally { config.resolveDesiredRevision = original.desired; config.markApplied = original.mark; config.remove = original.remove; }
+  });
+}
+
+test('initial Incus create captures operation/UUID before start and merges pending edits without a final stale upsert', async () => {
+  await initialCreationFixture(async (manager, store, calls, state) => {
+    const runtime = (manager as any).incusRuntime, start = runtime.start;
+    runtime.start = async (options: any, uuid: string) => {
+      await start(options, uuid);
+      await store.upsert({ ...store.get(options.userId, options.id)!, pendingRebuild: true, initScript: 'newer desired' });
+    };
+    const created = await (manager as any).createForOwner({ userId: state.owner, displayName: 'new' });
+    expect(calls).toEqual(['create-stopped', 'start-captured', 'applied']);
+    expect(created).toMatchObject({ containerId: 'incus:initial-uuid', status: 'running', pendingRebuild: true, initScript: 'newer desired' });
+    expect(store.get(created.userId, created.id)?.incusRecreation).toBeUndefined();
+    expect(store.get(created.userId, created.id)?.desiredRuntimeStatus).toBe('running');
+  });
+});
+
+test('initial Incus lost/conflict response or unproven identity retains marker, compute and persistence', async () => {
+  for (const failure of ['conflict', 'lost-response', 'nonce', 'uuid', 'owner']) {
+    await initialCreationFixture(async (manager, store, calls, state) => {
+      const runtime = (manager as any).incusRuntime, create = runtime.create;
+      runtime.create = async (options: any) => {
+        const instance = await create(options);
+        if (failure === 'conflict' || failure === 'lost-response') throw Object.assign(new Error('ambiguous create'), { statusCode: failure === 'conflict' ? 409 : 503 });
+        if (failure === 'nonce') instance.config['user.agentor.recreation'] = 'wrong';
+        if (failure === 'uuid') delete instance.config['volatile.uuid'];
+        return instance;
+      };
+      if (failure === 'owner') runtime.matchesWorkerIdentity = async () => false;
+      await expect((manager as any).createForOwner({ userId: state.owner })).rejects.toMatchObject({ code: 'WORKER_CREATE_CONTAINER_RETAINED' });
+      const record = store.get(state.owner, state.options.id)!;
+      expect(record.incusRecreation?.nonce).toBe(state.options.recreationNonce);
+      expect(record.desiredRuntimeStatus).toBe('stopped');
+      expect(calls).toEqual(['create-stopped']);
+      expect(manager.get(record.id)?.status).toBe('error');
+    });
+  }
+});
+
+test('initial Incus UUID persistence/start/applied/final persistence failures roll back only proven compute and archive all data', async () => {
+  for (const failure of ['uuid-persist', 'start', 'applied', 'completion']) {
+    await initialCreationFixture(async (manager, store, calls, state) => {
+      const runtime = (manager as any).incusRuntime;
+      const transition = store.transitionIncusRecreation.bind(store);
+      store.transitionIncusRecreation = async (...args) => {
+        const change = args[2];
+        if ((failure === 'uuid-persist' && change.incusRecreation?.replacementIncarnation) ||
+            (failure === 'completion' && change.status === 'active' && !change.incusRecreation)) throw new Error('injected metadata failure');
+        return transition(...args);
+      };
+      if (failure === 'start') runtime.start = async () => { throw new Error('injected start failure'); };
+      const config = useWorkerConfigStore(), mark = config.markApplied;
+      if (failure === 'applied') config.markApplied = async () => { throw new Error('injected applied failure'); };
+      try {
+        await expect((manager as any).createForOwner({ userId: state.owner })).rejects.toThrow('injected');
+        const record = store.get(state.owner, state.options.id)!;
+        expect(record).toMatchObject({ status: 'archived', desiredRuntimeStatus: 'stopped' });
+        expect(record.incusRecreation).toBeUndefined();
+        expect(calls).toContain('rollback-captured');
+        expect(manager.get(record.id)).toBeUndefined();
+      } finally { config.markApplied = mark; }
+    });
+  }
+});
+
+test('initial Incus pre-request failure cleans only provisional application metadata', async () => {
+  await initialCreationFixture(async (manager, store, calls, state) => {
+    useWorkerConfigStore().resolveDesiredRevision = async () => { throw new Error('injected configuration failure'); };
+    await expect((manager as any).createForOwner({ userId: state.owner })).rejects.toThrow('injected configuration failure');
+    expect(calls).toEqual(['remove-provisional-config']);
+    expect(store.list()).toHaveLength(1); // only the independent pre-existing fixture
+  });
+});
+
+test('initial Incus nonce-persistence failure makes no runtime request and removes only provisional metadata', async () => {
+  await initialCreationFixture(async (manager, store, calls, state) => {
+    store.transitionIncusRecreation = async () => { throw new Error('injected first marker failure'); };
+    await expect((manager as any).createForOwner({ userId: state.owner })).rejects.toThrow('injected first marker failure');
+    expect(calls).toEqual(['remove-provisional-config']);
+    expect(store.list()).toHaveLength(1);
+  });
+});
+
+test('initial captured rollback/removal or archive persistence failure retains recovery identity and configuration', async () => {
+  for (const failure of ['rollback', 'archive']) await initialCreationFixture(async (manager, store, calls, state) => {
+    const runtime = (manager as any).incusRuntime;
+    runtime.start = async () => { throw new Error('injected startup failure'); };
+    if (failure === 'rollback') runtime.rollbackRecreation = async () => { throw new Error('unknown removal outcome'); };
+    if (failure === 'archive') {
+      const transition = store.transitionIncusRecreation.bind(store);
+      store.transitionIncusRecreation = async (...args) => {
+        if (args[2].status === 'archived') throw new Error('archive disk failure');
+        return transition(...args);
+      };
+    }
+    await expect((manager as any).createForOwner({ userId: state.owner })).rejects.toMatchObject({ code: 'WORKER_CREATE_ROLLBACK_INCOMPLETE' });
+    expect(store.get(state.owner, state.options.id)?.incusRecreation).toMatchObject({
+      nonce: state.options.recreationNonce, replacementIncarnation: 'initial-uuid' });
+    expect(manager.get(state.options.id)).toMatchObject({ status: 'error', containerId: 'incus:initial-uuid' });
+    expect(calls).not.toContain('remove-provisional-config'); expect(calls).not.toContain('applied');
+  });
+});
+
 test('healthy Incus reconciliation preserves VM/services and terminal lifecycle generation', async () => {
   await reconciliationFixture(async (manager, _store, calls, info) => {
     const generation = workerLifecycleGeneration(info.id);
@@ -481,7 +624,7 @@ test('Incus boot changes and repair failures defer convergence without stopping 
 test('real production-manager archive retains canonical volumes, source and pending settings without Docker', async () => {
   test.skip(process.env.INCUS_ARCHIVE_TEST !== 'true' && process.env.INCUS_RECREATION_TEST !== 'true' &&
     process.env.INCUS_REBOOT_TEST !== 'true' && process.env.INCUS_RECREATION_RECOVERY_TEST !== 'true' &&
-    process.env.INCUS_MISSING_RECOVERY_TEST !== 'true', 'Explicit disposable Incus lifecycle acceptance');
+    process.env.INCUS_MISSING_RECOVERY_TEST !== 'true' && process.env.INCUS_INITIAL_CREATE_TEST !== 'true', 'Explicit disposable Incus lifecycle acceptance');
   test.setTimeout(900_000);
   const root = await mkdtemp(join(tmpdir(), 'agentor-incus-archive-live-'));
   const config = { dataDir: root, incusEnabled: true, incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor',
@@ -490,6 +633,7 @@ test('real production-manager archive retains canonical volumes, source and pend
     incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase6-candidate',
     incusInternalGatewayUrl: 'http://10.159.68.1:3000', containerPrefix: 'agentor-worker', workerImage: 'agentor-worker:latest', workerImagePrefix: '' } as Config;
   const store = new WorkerStore(root); await store.init();
+  let cleanupStore = store;
   const runtime = new IncusWorkerRuntime(config);
   const manager = new ContainerManager(new Proxy({}, { get: () => () => { throw new Error('Docker fallback'); } }) as any, config);
   manager.setWorkerStore(store); manager.setIncusRuntime(runtime);
@@ -508,6 +652,51 @@ test('real production-manager archive retains canonical volumes, source and pend
     const created = await runtime.client.exec(info.containerName, ['sh', '-ec',
       'echo retained-workspace > /workspace/archive-fixture; echo retained-agents > /home/agent/.agent-data/archive-fixture']);
     expect(created.returnCode).toBe(0);
+    expect(store.get(info.userId, info.id)?.incusRecreation).toBeUndefined();
+    if (process.env.INCUS_INITIAL_CREATE_TEST === 'true') {
+      await manager.archive(info.id); // never allocate two root disks at once
+      const create = runtime.create.bind(runtime);
+      runtime.create = async (options, existing) => {
+        await create(options, existing);
+        throw Object.assign(new Error('accepted create response lost'), { statusCode: 503 });
+      };
+      try {
+        await expect((manager as any).createForOwner({ userId: info.userId, displayName: 'lost initial response' }))
+          .rejects.toMatchObject({ code: 'WORKER_CREATE_CONTAINER_RETAINED' });
+      } finally { runtime.create = create; }
+      const lost = store.list().find((record) => record.id !== info.id)!;
+      const lostName = manager.buildContainerName(lost.id);
+      expect(lost.incusRecreation?.replacementIncarnation).toBeUndefined();
+      expect((await runtime.client.getInstance(lostName)).config['user.agentor.recreation']).toBe(lost.incusRecreation?.nonce);
+      expect((await runtime.client.getInstanceState(lostName)).status).toBe('Stopped');
+      const reloadedStore = new WorkerStore(root); await reloadedStore.init();
+      const reloaded = new ContainerManager({ listContainers: async () => [] } as any, config);
+      reloaded.setWorkerStore(reloadedStore); reloaded.setIncusRuntime(runtime);
+      (reloaded as any).assertOwnerExists = async () => {};
+      await reloaded.sync(); await reloaded.reconcileIncusWorkers();
+      await expect(runtime.client.getInstance(lostName)).rejects.toMatchObject({ statusCode: 404 });
+      expect(reloadedStore.get(lost.userId, lost.id)).toMatchObject({ status: 'archived', desiredRuntimeStatus: 'stopped' });
+      expect(reloadedStore.get(lost.userId, lost.id)?.incusRecreation).toBeUndefined();
+      // Captured create followed by startup failure uses immediate proven
+      // rollback, retaining initial volumes/config instead of name cleanup.
+      manager.setWorkerStore(reloadedStore);
+      cleanupStore = reloadedStore;
+      const start = runtime.start.bind(runtime);
+      runtime.start = async () => { throw new Error('injected initial startup failure'); };
+      try {
+        await expect((manager as any).createForOwner({ userId: info.userId, displayName: 'captured initial failure' }))
+          .rejects.toThrow('injected initial startup failure');
+      } finally { runtime.start = start; }
+      const failed = reloadedStore.list().find((record) => record.id !== info.id && record.id !== lost.id)!;
+      expect(failed.status).toBe('archived'); expect(failed.incusRecreation).toBeUndefined();
+      const failedName = manager.buildContainerName(failed.id);
+      await expect(runtime.client.getInstance(failedName)).rejects.toMatchObject({ statusCode: 404 });
+      for (const worker of [lost, failed]) for (const role of ['workspace', 'agents']) {
+        const volume = await runtime.client.getCustomVolume(config.incusStoragePool, `${manager.buildContainerName(worker.id)}-${role}`);
+        expect(volume.config['user.agentor.id']).toBe(worker.id); expect(volume.used_by ?? []).toEqual([]);
+      }
+      return;
+    }
     if (process.env.INCUS_MISSING_RECOVERY_TEST === 'true') {
       info.pendingRebuild = true; info.initScript = 'touch /workspace/unapplied-recovery-init';
       await store.upsert((manager as any).containerInfoToWorkerRecord(info));
@@ -650,7 +839,7 @@ test('real production-manager archive retains canonical volumes, source and pend
       expect(retained.returnCode).toBe(0);
     }
   } finally {
-    for (const worker of store.list()) {
+    for (const worker of cleanupStore.list()) {
       const owner = { id: worker.id, userId: worker.userId, containerName: manager.buildContainerName(worker.id) };
       await runtime.remove(owner); await runtime.removeStorage(owner);
     }

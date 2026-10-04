@@ -1491,6 +1491,9 @@ export class ContainerManager {
     const runtimeKind: WorkerRuntimeKind = this.config.incusEnabled
       ? "incus-vm"
       : "legacy-docker";
+    const incusCreation = runtimeKind === 'incus-vm'
+      ? { attempted: false, nonce: undefined as string | undefined, incarnation: undefined as string | undefined }
+      : undefined;
 
     const containerInfo: ContainerInfo = {
       id,
@@ -1563,6 +1566,7 @@ export class ContainerManager {
           containerId: containerName,
           containerName,
           dockerEnabled,
+          incusCreation,
         });
         throw err;
       }
@@ -1610,11 +1614,23 @@ export class ContainerManager {
         sshAuthorizedKeys: runtimeKind === "incus-vm" ? await this.storageManager?.readSshAuthorizedKeys(userId) : undefined,
       };
       if (runtimeKind === "incus-vm") {
-        await this.incusRuntime.create(options);
+        if (!this.workerStore) throw new Error('WorkerStore is required for Incus creation');
+        const marker = { nonce: randomUUID(), replacementIncarnation: undefined as string | undefined };
+        await this.workerStore.transitionIncusRecreation(userId, id,
+          { status: 'active', desiredRuntimeStatus: 'stopped', incusRecreation: marker });
+        incusCreation!.nonce = marker.nonce; incusCreation!.attempted = true;
+        const instance = await this.incusRuntime.create({ ...options, start: false, recreationNonce: marker.nonce });
+        const incarnation = instance.config['volatile.uuid'];
+        if (!incarnation || instance.config['user.agentor.recreation'] !== marker.nonce ||
+            !await this.incusRuntime.matchesWorkerIdentity(instance, id, userId))
+          throw new Error('Incus initial creation incarnation or operation identity is unavailable');
+        incusCreation!.incarnation = incarnation;
+        containerInfo.containerId = `incus:${incarnation}`;
+        marker.replacementIncarnation = incarnation;
+        await this.workerStore.transitionIncusRecreation(userId, id,
+          { status: 'active', desiredRuntimeStatus: 'stopped', incusRecreation: marker });
+        await this.incusRuntime.start(options, incarnation);
         appliedBootstrap = this.appliedIncusBootstrap(options, containerInfo);
-        const instance = await this.incusRuntime.client.getInstance(containerName);
-        if (!instance.config["volatile.uuid"]) throw new Error("Incus worker incarnation is missing");
-        containerInfo.containerId = `incus:${instance.config["volatile.uuid"]}`;
       } else {
         const container = await this.dockerService.createWorkerContainer(options);
         containerInfo.containerId = container.id;
@@ -1628,6 +1644,7 @@ export class ContainerManager {
         containerId: containerName,
         containerName,
         dockerEnabled,
+        incusCreation,
       });
       throw err;
     }
@@ -1637,7 +1654,12 @@ export class ContainerManager {
     // fails, rather than converting a live worker into an untracked orphan.
     try {
       await workerConfigStore.markApplied(userId, id, appliedBootstrap, configurationRevision);
-      if (this.workerStore) {
+      if (runtimeKind === 'incus-vm') {
+        const resolved = await this.workerStore!.transitionIncusRecreation(userId, id,
+          { status: 'active', desiredRuntimeStatus: 'running', incusRecreation: undefined }, undefined,
+          { nonce: incusCreation!.nonce!, replacementIncarnation: incusCreation!.incarnation });
+        Object.assign(containerInfo, resolved, { status: 'running' });
+      } else if (this.workerStore) {
         await this.workerStore.upsert(
           this.containerInfoToWorkerRecord(containerInfo),
         );
@@ -1649,6 +1671,7 @@ export class ContainerManager {
         containerId: containerInfo.containerId,
         containerName,
         dockerEnabled,
+        incusCreation,
       });
       throw err;
     }
@@ -5265,11 +5288,45 @@ for p in sys.argv[1:]:
     containerName: string;
     dockerEnabled: boolean;
     importedImage?: string;
+    incusCreation?: { attempted: boolean; nonce?: string; incarnation?: string };
   }): Promise<void> {
     const { id, userId, containerId, containerName, dockerEnabled, importedImage } =
       input;
     const incus = this.containers.get(id)?.runtimeKind === "incus-vm" ||
       this.workerStore?.get(userId, id)?.runtimeKind === "incus-vm";
+    if (incus) {
+      const proof = input.incusCreation;
+      if (proof?.attempted === false) {
+        // No Incus request was attempted: clean only provisional app metadata.
+        // Never inspect/delete compute or storage by the freshly-minted name.
+        await cleanupWorkerMappings(containerName);
+        await useWorkerConfigStore().remove(userId, id);
+        await this.workerStore?.delete(userId, id);
+        this.containers.delete(id);
+        return;
+      }
+      const marker = this.workerStore?.get(userId, id)?.incusRecreation;
+      if (!proof?.incarnation || !proof.nonce || !marker || marker.nonce !== proof.nonce ||
+          marker.originalIncarnation || (marker.replacementIncarnation && marker.replacementIncarnation !== proof.incarnation)) {
+        const current = this.containers.get(id); if (current) current.status = 'error';
+        throw Object.assign(new Error('Incus creation retained ambiguous compute and all persistence for recovery'),
+          { code: 'WORKER_CREATE_CONTAINER_RETAINED' });
+      }
+      try {
+        await this.incusRuntime.rollbackRecreation({ id, userId, containerName },
+          { nonce: proof.nonce, replacementIncarnation: proof.incarnation });
+        await this.workerStore!.transitionIncusRecreation(userId, id,
+          { status: 'archived', desiredRuntimeStatus: 'stopped', incusRecreation: undefined }, undefined, marker);
+        this.containers.delete(id);
+      } catch (cause) {
+        const current = this.containers.get(id); if (current) current.status = 'error';
+        throw Object.assign(new Error('Incus creation rollback retained recovery metadata and all persistence'),
+          { code: 'WORKER_CREATE_ROLLBACK_INCOMPLETE', cause });
+      }
+      // Fresh worker persistence/config remain available for explicit unarchive;
+      // failure cleanup never destroys canonical data or silently retries boot.
+      return;
+    }
     try {
       await rollbackFailedWorkerImport({
         removeFromMemory: () => this.containers.delete(id),
@@ -5284,19 +5341,19 @@ for p in sys.argv[1:]:
         // A create failure may occur before Docker materializes the named
         // container. Absence is the desired rollback state.
         removeContainer: () =>
-          incus ? this.incusRuntime.remove(containerName) : removeDockerContainerIdempotently(() =>
+          removeDockerContainerIdempotently(() =>
             this.dockerService.removeContainer(containerId),
           ),
         removeWorkspace: () =>
-          incus ? this.incusRuntime.removeStorage({ id, userId, containerName }) : this.storageManager?.removeWorkerWorkspace(
+          this.storageManager?.removeWorkerWorkspace(
             userId,
             id,
             containerName,
           ) ?? Promise.resolve(),
         removeAgents: () =>
-          incus ? Promise.resolve() : this.storageManager?.removeWorkerAgents(userId, id, containerName) ??
+          this.storageManager?.removeWorkerAgents(userId, id, containerName) ??
           Promise.resolve(),
-        ...(!incus && dockerEnabled && this.storageManager
+        ...(dockerEnabled && this.storageManager
           ? {
               removeDocker: () =>
                 this.storageManager!.removeWorkerDocker(containerName),

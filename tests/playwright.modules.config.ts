@@ -9,7 +9,8 @@ import { join } from "node:path";
 if ((process.env.INCUS_LIVE_TEST === "true" || process.env.INCUS_COMMAND_TEST === "true" ||
     process.env.INCUS_OBSERVABILITY_TEST === "true" || process.env.INCUS_ARCHIVE_TEST === 'true' ||
     process.env.INCUS_RECREATION_TEST === 'true' || process.env.INCUS_REBOOT_TEST === 'true' ||
-    process.env.INCUS_RECREATION_RECOVERY_TEST === 'true' || process.env.INCUS_MISSING_RECOVERY_TEST === 'true') && !process.env.DATA_DIR) {
+    process.env.INCUS_RECREATION_RECOVERY_TEST === 'true' || process.env.INCUS_MISSING_RECOVERY_TEST === 'true' ||
+    process.env.INCUS_INITIAL_CREATE_TEST === 'true') && !process.env.DATA_DIR) {
   const fixtureData = mkdtempSync(join(tmpdir(), "agentor-incus-acceptance-"));
   process.env.DATA_DIR = fixtureData;
   process.once("exit", () => rmSync(fixtureData, { recursive: true, force: true }));
