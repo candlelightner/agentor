@@ -24,6 +24,13 @@ export class IncusWorkerStorage {
     }
   }
 
+  /** Inventory only: absence never authorizes allocating replacement data. */
+  async inspectVolume(owner: IncusStorageOwner, role: Role): Promise<IncusCustomVolume | undefined> {
+    const volume = await this.find(owner, role);
+    if (volume) this.validate(volume, owner, role);
+    return volume;
+  }
+
   private validate(volume: IncusCustomVolume, owner: IncusStorageOwner, role: Role): void {
     const c = volume.config;
     if (volume.name !== this.name(owner, role) || volume.type !== "custom" ||

@@ -7,7 +7,8 @@ import type {
   VolumeSizeMeasurement,
 } from "../../shared/managed-volumes";
 import { UserScopedJsonStore } from "./user-scoped-store";
-import { useConfig } from "./services";
+import { useConfig, useWorkerStore } from "./services";
+import { useManagedVolumeManager } from './managed-volume-manager';
 import { ManagedVolumeRuntime } from "./managed-volume-runtime";
 import {
   resolveManagedVolumeSizingResource,
@@ -79,6 +80,59 @@ try {
   const code=['time-limit','entry-limit','size-overflow'].includes(error?.message)?error.message:'scan-error';
   finish({ok:false,error:code}); process.exitCode=2;
 }
+`;
+
+/** Validate the already-open root, then traverse that same descriptor. Checking
+ * a pathname before opening it could size a replacement rootfs/mount instead. */
+export const INCUS_SCAN_ROOT_VALIDATION = String.raw`
+const mountId=(fd)=>{const m=fs.readFileSync('/proc/self/fdinfo/'+fd,'utf8').match(/^mnt_id:\s+(\d+)$/m);if(!m)throw new Error('mount-identity');return m[1];};
+const rootMount=mountId(rootFd);
+const line=fs.readFileSync('/proc/self/mountinfo','utf8').split('\n').find(l=>l.split(' ')[0]===rootMount);
+if(!line)throw new Error('mount-identity');
+const parts=line.split(' - '),fields=parts[0].split(' '),backing=parts[1]?.split(' ');
+const decode=(v)=>v.replace(/\\([0-7]{3})/g,(_,o)=>String.fromCharCode(parseInt(o,8)));
+if(decode(fields[4])!==ROOT||decode(fields[3])!=='/')throw new Error('mount-identity');
+if(process.argv[2]==='filesystem'){
+ if(backing?.[0]!=='virtiofs'||decode(backing[1])!==process.argv[3])throw new Error('mount-identity');
+}else{
+ if(process.argv[2]!=='block'||backing?.[0]!=='ext4')throw new Error('mount-identity');
+ const disks=fs.readdirSync('/dev/disk/by-id').filter(n=>n.includes('incus_docker')).map(n=>fs.realpathSync('/dev/disk/by-id/'+n));
+ const unique=[...new Set(disks)];if(unique.length!==1)throw new Error('mount-identity');
+ const st=fs.statSync(unique[0],{bigint:true});if(!st.isBlockDevice()||st.rdev!==fs.fstatSync(rootFd,{bigint:true}).dev)throw new Error('mount-identity');
+}
+`;
+
+/** ROOT/type/source remain separate literal arguments. Nested mounts (even
+ * same-device bind mounts) are skipped using descriptor mount identities. */
+export const INCUS_LIVE_VOLUME_SIZE_SCANNER = VOLUME_SIZE_SCANNER
+  .replace("ROOT='/volume'", 'ROOT=process.argv[1]')
+  .replace('count(fs.fstatSync(rootFd,{bigint:true}));',
+    INCUS_SCAN_ROOT_VALIDATION + '\ncount(fs.fstatSync(rootFd,{bigint:true}));')
+  .replace('count(st);', 'if(mountId(childFd)!==rootMount)continue;count(st);');
+
+/** Literal-path variant for the isolated offline helper's verified mount. */
+export const INCUS_PATH_VOLUME_SIZE_SCANNER = VOLUME_SIZE_SCANNER
+  .replace("ROOT='/volume'", 'ROOT=process.argv[1]')
+  .replace('count(fs.fstatSync(rootFd,{bigint:true}));',
+    'const rootStat=fs.fstatSync(rootFd,{bigint:true});const rootDev=rootStat.dev;count(rootStat);')
+  .replace('count(st);', 'if(st.dev!==rootDev)continue;count(st);');
+
+export const INCUS_VOLUME_SCAN_MOUNT_CHECK = String.raw`
+mountpoint -q -- "$1"
+fstype=$(findmnt -n -o FSTYPE --mountpoint "$1")
+if test "$2" = filesystem; then
+ test "$fstype" = virtiofs
+else
+ test "$2" = block; test "$fstype" = ext4
+ source=$(findmnt -n -o SOURCE --mountpoint "$1")
+ expected=$(for candidate in /dev/disk/by-id/*incus_docker*; do
+  test -b "$candidate" || continue
+  readlink -f -- "$candidate"
+ done | sort -u)
+ test -n "$expected"
+ test "$expected" = "$(readlink -f -- "$source")"
+fi
+exec /usr/bin/node --max-old-space-size=96 -e "$3" "$1" "$2" "$4"
 `;
 
 type VolumeSizePhase = PublicVolumeSizeJob["phase"];
@@ -571,6 +625,8 @@ export class ManagedVolumeSizingManager {
 
 
   private async scanVolume(jobId: string, resource: ManagedVolumeSizingResource, signal: AbortSignal) {
+    if (resource.runtimeKind === 'incus-vm')
+      return this.scanIncusVolume(jobId, resource, signal);
     await withOperationDeadline(
       (operationSignal) => this.docker.getVolume(resource.dockerName).inspect({ abortSignal: operationSignal }),
       DOCKER_TIMEOUT_MS, "Inspect volume before size scan", signal,
@@ -641,6 +697,50 @@ export class ManagedVolumeSizingManager {
       this.helpers.delete(jobId);
       await this.removeTrackedHelper(name, "Remove volume size helper");
     }
+  }
+
+  private async scanIncusVolume(jobId: string, resource: ManagedVolumeSizingResource, signal: AbortSignal) {
+    const descriptor = resource.incus;
+    if (!resource.userId || !resource.workerId || !resource.live || !descriptor?.attached || !descriptor.instanceIncarnation || !descriptor.deviceKey)
+      throw volumeError(409, 'Detached or stopped Incus storage requires an offline read-only scan. No guest directory or Docker fallback was used.');
+    const manager = useManagedVolumeManager();
+    const validate = () => {
+      const worker = useWorkerStore().get(resource.userId!, resource.workerId!);
+      if (!worker || worker.runtimeKind !== 'incus-vm' || worker.status !== 'active' || worker.deletionPending || worker.incusRecreation)
+        throw volumeError(409, 'Incus sizing WorkerRecord authority changed.');
+      manager.assertLiveRecoveryResolved(resource.userId!, resource.workerId!);
+      if (manager.isRecoveryBlocked(resource.workerId!)) throw volumeError(409, 'Resolve worker storage recovery before scanning its data.');
+    };
+    validate();
+    // run() already owns the owner/worker fence. Reusing ordinary setup here
+    // would reacquire that queue and deadlock.
+    const commands = manager.incusRuntime.worker.commands({ id: resource.workerId, userId: resource.userId,
+      containerName: `${useConfig().containerPrefix}-${resource.workerId}` }, descriptor.instanceIncarnation, validate, operation => operation());
+    const session = await commands.open(['systemd-run', '--scope', '--quiet', '--collect',
+      `--unit=agentor-volume-size-${jobId}`, '-p', 'MemoryMax=128M', '-p', 'CPUQuota=50%', '-p', 'TasksMax=16',
+      'timeout', '--kill-after=2', '60', 'bash', '-ec', INCUS_VOLUME_SCAN_MOUNT_CHECK, 'volume-size',
+      descriptor.target, descriptor.contentType, INCUS_LIVE_VOLUME_SIZE_SCANNER, `incus_${descriptor.deviceKey}`],
+    { user: 0, group: 0, signal, timeoutMs: SCAN_TIMEOUT_MS,
+      environment: { HOME: '/root', USER: 'root', PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' } });
+    let bytes = 0;
+    const capture = async (stream: NodeJS.ReadableStream) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of stream) {
+        const buffer = Buffer.from(chunk); bytes += buffer.length;
+        if (bytes > MAX_OUTPUT_BYTES) throw volumeError(409, 'Incus volume size scan returned excessive output.');
+        chunks.push(buffer);
+      }
+      return Buffer.concat(chunks).toString();
+    };
+    try {
+      session.stdin.end();
+      const [stdout, _stderr, code] = await Promise.all([capture(session.stdout), capture(session.stderr), session.result]);
+      signal.throwIfAborted(); validate();
+      const parsed = parseScannerOutput(stdout);
+      if (code !== 0 || !parsed.ok) throw volumeError(409, 'Incus volume size scan could not complete; no data was changed.');
+      return { allocatedBytes: parseBoundedInteger(parsed.allocatedBytes), logicalBytes: parseBoundedInteger(parsed.logicalBytes),
+        entriesScanned: parseBoundedInteger(String(parsed.entriesScanned), 1_000_000) };
+    } finally { session.close(); }
   }
 }
 

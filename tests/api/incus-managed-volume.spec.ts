@@ -15,6 +15,8 @@ import { useBackupManager } from '../../orchestrator/server/utils/backup-manager
 import { useManagedVolumeManager } from '../../orchestrator/server/utils/managed-volume-manager';
 import { useWorkerConfigStore } from '../../orchestrator/server/utils/worker-config-store';
 import { withOwnerWorkerLifecycleMutation } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
+import { managedVolumeInventory, resolveManagedVolumeSizingResource } from '../../orchestrator/server/utils/managed-volume-inventory';
+import { ManagedVolumeSizingManager } from '../../orchestrator/server/utils/managed-volume-sizing';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, error() {}, warn() {}, debug() {} });
 (globalThis as any).useLogCollector ??= () => ({ attach: async () => {}, detach() {} });
@@ -128,7 +130,7 @@ test('real retained compute seeds an Incus filesystem staging disk before any di
   }
 });
 
-async function productionManagerFixture() {
+async function productionManagerFixture(dockerEnabled = false) {
   const config = useConfig();
   Object.assign(config, { incusEnabled: true, incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor',
     incusClientCertPath: '/workspace/agentor-incus-tls/client.crt', incusClientKeyPath: '/workspace/agentor-incus-tls/client.key',
@@ -146,11 +148,89 @@ async function productionManagerFixture() {
   (manager as any).resolveAuthorizedHostMounts = async () => undefined;
   (manager as any).resolveHardwareDeviceAccess = async () => undefined;
   (manager as any).resolveUserEnvAndBinds = async () => ({ userEnv: zeroUserEnvVars('managed-live-owner'), credentialBinds: [], groupSecrets: [] });
-  (manager as any).resolveEnvironmentConfig = () => ({ dockerEnabled: false,
-    environmentJson: { networkMode: 'full', allowedDomains: [], dockerEnabled: false, setupScript: '', envVars: '', exposeApis: {} },
+  (manager as any).resolveEnvironmentConfig = () => ({ dockerEnabled,
+    environmentJson: { networkMode: 'full', allowedDomains: [], dockerEnabled, setupScript: '', envVars: '', exposeApis: {} },
     capabilitiesJson: [], instructionsJson: [] });
   return { config, manager, store, volumes, runtime };
 }
+
+test('production Incus inventory and active sizing measure canonical filesystem and native Docker data without lifecycle changes', async () => {
+  test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable production sizing gate');
+  test.setTimeout(600_000);
+  const { config, manager, store, volumes, runtime } = await productionManagerFixture(true);
+  let info: any, v: any, failed = false;
+  let dockerScans = 0;
+  const sizing = new ManagedVolumeSizingManager(config.dataDir, { docker: new Proxy({ listContainers: async () => [] },
+    { get(target: any, key) { if (key in target) return target[key]; return () => { dockerScans++; throw new Error('No Docker size helper is permitted'); }; } }) as any });
+  (volumes.runtime as any).docker = { listVolumes: async () => { throw new Error('test Docker unavailable'); },
+    listContainers: async () => { throw new Error('test Docker unavailable'); } };
+  const exec = async (command: string[]) => {
+    const result = await runtime.client.exec(info.containerName, command);
+    expect(result.returnCode, result.stdout + result.stderr).toBe(0); return result.stdout.trim();
+  };
+  const measure = async (id: string) => {
+    const authorize = async () => {
+      const resource = await resolveManagedVolumeSizingResource(id, { userId: info.userId });
+      expect(resource).toMatchObject({ runtimeKind: 'incus-vm', live: true }); return resource!;
+    };
+    const started = await sizing.create(info.userId, authorize, true);
+    await expect.poll(async () => (await sizing.get(started.id))?.status,
+      { timeout: 90_000, intervals: [200, 500] }).toMatch(/succeeded|failed/);
+    const finished = (await sizing.get(started.id))!;
+    expect(finished.status, finished.error).toBe('succeeded');
+    expect(finished.measurement).toMatchObject({ state: 'known', consistency: 'live-approximate' });
+    return finished;
+  };
+  try {
+    info = await (manager as any).createForOwner({ userId: 'managed-live-owner', displayName: 'canonical sizing gate' });
+    const before = await runtime.inspectGuestReadiness(info, info.containerId.slice(6));
+    const pid = await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'agentor-worker']);
+    await exec(['python3', '-c', String.raw`
+import os,pathlib
+p=pathlib.Path('/workspace/size-fixture');p.mkdir()
+f=p/'sparse';f.touch();os.truncate(f,128*1024*1024);os.link(f,p/'hardlink');os.symlink('/etc',p/'outside')
+(p/'private').write_bytes(b'private-size-data');os.chmod(p/'private',0)
+`]);
+    const inventory = await managedVolumeInventory({ userId: info.userId });
+    expect(inventory.dockerAvailable).toBe(false);
+    const mine = inventory.volumes.filter(resource => resource.workerId === info.id);
+    expect(mine).toHaveLength(3);
+    const workspace = mine.find(resource => resource.purpose === 'workspace')!;
+    const measured = await measure(workspace.id);
+    expect(measured.measurement!.logicalBytes).toBeGreaterThanOrEqual(128 * 1024 * 1024 + 17);
+    expect(measured.measurement!.logicalBytes).toBeLessThan(2 * 128 * 1024 * 1024); // Hardlink is counted once.
+    expect(measured.measurement!.allocatedBytes!).toBeLessThan(measured.measurement!.logicalBytes!);
+    await measure(mine.find(resource => resource.purpose === 'agent-data')!.id);
+    await measure(mine.find(resource => resource.purpose === 'docker-in-docker')!.id);
+    await exec(['bash', '-ec', 'mkdir /opt/size-managed; echo canonical-data >/opt/size-managed/sentinel']);
+    v = await volumes.add({ userId: info.userId, workerId: info.id, platformAdmin: true },
+      { target: '/opt/size-managed', mode: 'live', acknowledgePrivileged: true });
+    await expect.poll(() => volumes.store.get(info.userId, v.id)?.operation?.stage,
+      { timeout: 180_000, intervals: [200, 500] }).toBe('complete');
+    const managed = await measure(v.id);
+    expect(managed.measurement!.logicalBytes).toBe('canonical-data\n'.length);
+    expect(dockerScans).toBe(0);
+    expect((await runtime.inspectGuestReadiness(info, info.containerId.slice(6))).bootId).toBe(before.bootId);
+    expect(await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'agentor-worker'])).toBe(pid);
+    expect(await exec(['cat', '/opt/size-managed/sentinel'])).toBe('canonical-data');
+    console.info('Canonical workspace/agent state/managed path/native ext4 Docker sizing passed; no Docker helper, unchanged boot/service PID, sparse logical bytes and hardlink de-duplication verified.');
+  } catch (error) { failed = true; throw error; }
+  finally {
+    if (info) {
+      if (failed) {
+        const instance = await runtime.client.getInstance(info.containerName);
+        expect(await runtime.matchesWorkerIdentity(instance, info.id, info.userId)).toBe(true);
+        expect(instance.config['volatile.uuid']).toBe(info.containerId.slice(6));
+        await runtime.client.stopInstance(info.containerName, { force: true });
+        console.error('Retained canonical sizing fixture', info.containerName, config.dataDir, v?.id);
+      } else {
+        await manager.remove(info.id);
+        if (v) { const current = volumes.store.get(info.userId, v.id)!; await volumes.incusRuntime.delete(current); await volumes.store.forget(info.userId, v.id); }
+        if (store.get(info.userId, info.id)) await store.delete(info.userId, info.id);
+      }
+    }
+  }
+});
 
 test('real Incus filesystem hotplug capability preserves the running worker boot and service', async () => {
   test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable filesystem hotplug diagnostic');

@@ -1,12 +1,15 @@
 import { createHash } from "node:crypto";
 import type { VolumeInventoryItem } from "../../shared/managed-volumes";
 import { useManagedVolumeManager } from "./managed-volume-manager";
-import { useContainerManager, useStorageManager, useWorkerGroupStore, useWorkerStore } from "./services";
+import { useConfig, useContainerManager, useStorageManager, useWorkerGroupStore, useWorkerStore } from "./services";
 import { useAdminWorkspaceStore } from "./admin-workspace-store";
 import { administrativeWorkspaceResourceNames } from "./admin-workspace-runtime";
 import { useBackupManager } from "./backup-manager";
 import { withOperationDeadline } from "./operation-deadline";
 import { VOLUME_LABEL } from "./managed-volume-runtime";
+import { discoverIncusVolumes, type IncusVolumeInventoryResource } from './incus-volume-inventory';
+import { managedVolumeRuntimeKind } from './managed-volume-store';
+import { readBackupInstallationId } from './backup-installation';
 
 export interface ManagedVolumeSizingResource {
   /** Opaque public inventory id. Docker names never leave this server type. */
@@ -19,6 +22,8 @@ export interface ManagedVolumeSizingResource {
   classification: "managed" | "builtin" | "orphan";
   incarnation?: string;
   live: boolean;
+  runtimeKind?: 'legacy-docker' | 'incus-vm';
+  incus?: { target: string; deviceKey?: string; instanceIncarnation?: string; attached: boolean; contentType: 'filesystem' | 'block' };
 }
 
 export interface ManagedVolumeControlTarget {
@@ -37,6 +42,7 @@ type VolumeDiscovery = {
   referenced: Set<string>;
   liveReferenced: Set<string>;
   resources: Map<string, ManagedVolumeSizingResource>;
+  incus: Map<string, IncusVolumeInventoryResource>;
 };
 
 const opaqueVolumeId = (prefix: string, name: string) =>
@@ -72,7 +78,7 @@ export function resolveManagedVolumeControlTarget(id: string): ManagedVolumeCont
   for (const worker of useWorkerStore().list()) {
     const name = useContainerManager().buildContainerName(worker.id);
     const candidates = [
-      ...(useStorageManager().mode === "volume" ? [`${name}-workspace`, `${name}-agents`] : []),
+      ...(worker.runtimeKind === 'incus-vm' || useStorageManager().mode === "volume" ? [`${name}-workspace`, `${name}-agents`] : []),
       `${name}-docker`,
     ];
     for (const candidate of candidates) {
@@ -119,6 +125,28 @@ function volumeIncarnation(volume: any, identity: Record<string, string>, allowL
   })).digest("hex");
 }
 
+async function incusDiscovery(id?: string) {
+  const manager = useManagedVolumeManager(); await manager.init();
+  const workers = useWorkerStore().list();
+  const records = manager.store.list().filter(v => managedVolumeRuntimeKind(v) === 'incus-vm' && (!id || v.id === id));
+  const selectedWorkers = id ? workers.filter(w => records.some(v => v.workerId === w.id) ||
+    w.runtimeKind === 'incus-vm' && ['workspace', 'agents', 'docker'].some(role => opaqueVolumeId('builtin', `${useContainerManager().buildContainerName(w.id)}-${role}`) === id)) : workers;
+  if (!selectedWorkers.some(w => w.runtimeKind === 'incus-vm') && !records.length) return new Map<string, IncusVolumeInventoryResource>();
+  try {
+    return await discoverIncusVolumes(useConfig(), await readBackupInstallationId(useConfig().dataDir), selectedWorkers, records,
+      { managed: manager.incusRuntime, isRecoveryBlocked: workerId => manager.isRecoveryBlocked(workerId) });
+  } catch { return new Map<string, IncusVolumeInventoryResource>(); } // Missing config/identity is never Docker authority.
+}
+
+function incusSizingResource(resource: IncusVolumeInventoryResource): ManagedVolumeSizingResource | undefined {
+  if (resource.status !== 'present' || !resource.incarnation || !resource.volume) return;
+  return { id: resource.id, dockerName: resource.name, userId: resource.userId, workerId: resource.workerId,
+    purpose: resource.purpose, ownerKey: resource.ownerKey, classification: resource.classification,
+    incarnation: resource.incarnation, live: resource.live === true, runtimeKind: 'incus-vm',
+    incus: { target: resource.target, deviceKey: resource.deviceKey, instanceIncarnation: resource.instanceIncarnation,
+      attached: resource.attached === true, contentType: resource.volume.content_type } };
+}
+
 async function discoverSizingResources(): Promise<VolumeDiscovery> {
   const manager = useManagedVolumeManager(); await manager.init();
   let available = true;
@@ -139,6 +167,7 @@ async function discoverSizingResources(): Promise<VolumeDiscovery> {
     });
   };
   for (const v of manager.store.list()) {
+    if (managedVolumeRuntimeKind(v) === 'incus-vm') continue;
     const physical = volumes.get(v.dockerName);
     const labels = physical?.Labels ?? {};
     const owned = v.purpose === "legacy-backup-path"
@@ -158,6 +187,7 @@ async function discoverSizingResources(): Promise<VolumeDiscovery> {
       purpose, ownerKey: userId ?? "platform", classification: "builtin" },
       { purpose, ...(userId ? { ownerId: userId } : {}), ...(workerId ? { workerId } : {}) });
   for (const worker of useWorkerStore().list()) {
+    if (worker.runtimeKind === 'incus-vm') continue;
     const name = useContainerManager().buildContainerName(worker.id);
     if (useStorageManager().mode === "volume") {
       addBuiltin(`${name}-workspace`, "workspace", worker.userId, worker.id);
@@ -194,7 +224,12 @@ async function discoverSizingResources(): Promise<VolumeDiscovery> {
         ? { legacy: "true", workerId: labels["agentor.worker-id"] }
         : { volumeId: labels[VOLUME_LABEL], ownerId: labels["agentor.owner-id"], workerId: labels["agentor.worker-id"] });
   }
-  return { available, volumes, referenced, liveReferenced, resources };
+  const incus = await incusDiscovery();
+  for (const resource of incus.values()) {
+    const resolved = incusSizingResource(resource);
+    if (resolved) resources.set(resource.id, resolved);
+  }
+  return { available, volumes, referenced, liveReferenced, resources, incus };
 }
 
 /** Resolve only positively classified named volumes. The returned Docker name
@@ -203,9 +238,13 @@ export async function resolveManagedVolumeSizingResource(
   id: string,
   scope: { userId?: string; workerIds?: Set<string>; platform?: boolean },
 ): Promise<ManagedVolumeSizingResource | undefined> {
-  const discovery = await discoverSizingResources();
-  if (!discovery.available) return undefined;
-  const found = discovery.resources.get(id);
+  const manager = useManagedVolumeManager(); await manager.init();
+  const isIncus = manager.store.list().some(v => v.id === id && managedVolumeRuntimeKind(v) === 'incus-vm') ||
+    useWorkerStore().list().some(w => w.runtimeKind === 'incus-vm' && ['workspace', 'agents', 'docker'].some(role =>
+      opaqueVolumeId('builtin', `${useContainerManager().buildContainerName(w.id)}-${role}`) === id));
+  const discovered = isIncus ? (await incusDiscovery(id)).get(id) : undefined;
+  const discovery = isIncus ? undefined : await discoverSizingResources();
+  const found = isIncus ? discovered && incusSizingResource(discovered) : discovery?.available ? discovery.resources.get(id) : undefined;
   if (!found || !found.incarnation) return undefined;
   if (!scope.platform) {
     if (!scope.userId || found.userId !== scope.userId || found.classification === "orphan") return undefined;
@@ -245,6 +284,20 @@ export async function managedVolumeInventory(scope: { userId?: string; workerIds
     known.add(v.dockerName);
     if (v.retainedAfterAccountDeletion && !scope.platform) continue;
     if (!allowed(v.userId, v.workerId)) continue;
+    if (managedVolumeRuntimeKind(v) === 'incus-vm') {
+      const resource = discovery.incus.get(v.id), verified = resource?.status === 'present';
+      const worker = workers.find(w => w.id === v.workerId && w.userId === v.userId);
+      const size = sizing.measurementFor(v.id, resource?.incarnation, verified);
+      result.push({ id: v.id, name: v.name, userId: v.userId, purpose: v.purpose, workerId: v.workerId,
+        workerName: worker?.displayName, target: v.target, desired: v.attached,
+        observed: resource?.status === 'missing' ? 'missing' : verified ? resource.attached ? 'mounted' : 'unmounted' : 'unknown',
+        state: v.retainedAfterAccountDeletion ? 'retained after account deletion' : v.state,
+        sizeBytes: size.allocatedBytes, logicalSizeBytes: size.logicalBytes, size, sizeJob: sizing.latestJobFor(v.id),
+        canMeasureSize: verified, backupCoverage: await coverage(v.userId, v.workerId, v.target), createdAt: v.createdAt,
+        managed: true, canDelete: !v.attached && !v.incusLive && (resource?.status === 'missing' || verified && !resource.attached),
+        error: v.operation?.error });
+      continue;
+    }
     const physical = volumes.get(v.dockerName);
     const worker = workers.find((w) => w.id === v.workerId && w.userId === v.userId);
     const size = sizing.measurementFor(v.id, discovery.resources.get(v.id)?.incarnation, available);
@@ -274,6 +327,23 @@ export async function managedVolumeInventory(scope: { userId?: string; workerIds
   };
   for (const worker of workers) {
     const name = useContainerManager().buildContainerName(worker.id);
+    if (worker.runtimeKind === 'incus-vm') {
+      for (const [role, purpose, target] of [['workspace', 'workspace', '/workspace'],
+        ['agents', 'agent-data', '/home/agent/.agent-data'], ['docker', 'docker-in-docker', '/var/lib/docker']]) {
+        const id = opaqueVolumeId('builtin', `${name}-${role}`), resource = discovery.incus.get(id);
+        if (role === 'docker' && resource?.status === 'missing') continue;
+        if (!allowed(worker.userId, worker.id)) continue;
+        const verified = resource?.status === 'present', size = sizing.measurementFor(id, resource?.incarnation, verified);
+        result.push({ id, name: `${worker.displayName}: ${purpose}`, userId: worker.userId, workerId: worker.id,
+          workerName: worker.displayName, purpose: purpose!, target, desired: true,
+          observed: resource?.status === 'missing' ? 'missing' : verified ? resource.attached ? 'mounted' : 'unmounted' : 'unknown',
+          state: 'built-in', sizeBytes: size.allocatedBytes, logicalSizeBytes: size.logicalBytes, size,
+          sizeJob: sizing.latestJobFor(id), canMeasureSize: verified,
+          backupCoverage: await coverage(worker.userId, worker.id, target),
+          createdAt: verified ? resource.volume?.created_at : undefined, managed: false, canDelete: false });
+      }
+      continue;
+    }
     if (useStorageManager().mode === "volume") {
       await builtin(`${name}-workspace`, "workspace", worker.userId, worker.id, "/workspace", worker.displayName);
       await builtin(`${name}-agents`, "agent-data", worker.userId, worker.id, "/home/agent/.agent-data", worker.displayName);

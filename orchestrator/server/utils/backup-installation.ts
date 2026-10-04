@@ -2,6 +2,17 @@ import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+/** Read-only consumers must not manufacture a new identity for existing data. */
+export async function readBackupInstallationId(dataDir: string): Promise<string> {
+  const path = join(dataDir, "backup-installation-id");
+  const info = await lstat(path);
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error("Backup installation identity is unavailable");
+  const value = (await readFile(path, "utf8")).trim();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value))
+    throw new Error("Backup installation identity is unavailable");
+  return value;
+}
+
 /** Stable, non-secret source identity included in backup discovery metadata.
  * It identifies an Agentor installation without exposing its hostname, data
  * path, auth secret, or provider account. */
