@@ -103,14 +103,17 @@ test("real Dockerized Agentor routes editor/desktop/Traefik and authorizes filte
       ws.once("close", () => { clearTimeout(timeout); reject(new Error("noVNC relay closed before its RFB handshake")); });
     });
     expect(rfb).toMatch(/^RFB 003\./);
-    await checked(victim.containerName, "docker run -d --name agentor-route-test -p 18080:80 nginx:alpine");
+    await checked(victim.containerName, "docker run -d --restart unless-stopped --name agentor-route-test -p 18080:80 nginx:alpine");
     const domain = await api.post("/api/domain-mappings", { data: { workerId: victim.id, subdomain: "phase6", baseDomain: "incus.test", protocol: "http", internalPort: 18080 } });
     expect(domain.status(), await domain.text()).toBe(201);
     const tcpDomain = await api.post("/api/domain-mappings", { data: { workerId: victim.id, subdomain: "phase6tcp", baseDomain: "incus.test", protocol: "tcp", internalPort: 18080 } });
     expect(tcpDomain.status(), await tcpDomain.text()).toBe(201);
     const port = await api.post("/api/port-mappings", { data: { workerId: victim.id, externalPort: 38081, type: "localhost", internalPort: 18080 } });
     expect(port.status(), await port.text()).toBe(201);
-    await expect.poll(() => host("curl --noproxy '*' -fsS -H 'Host: phase6.incus.test' http://127.0.0.1/"), { timeout: 30_000 }).toContain("Welcome to nginx!");
+    // Creating a new port entrypoint can recreate Traefik after the mapping
+    // response. A transient curl failure is a negative poll observation, not
+    // an exception that prevents expect.poll from retrying readiness.
+    await expect.poll(() => host("curl --noproxy '*' -fsS --max-time 5 -H 'Host: phase6.incus.test' http://127.0.0.1/ || true"), { timeout: 30_000 }).toContain("Welcome to nginx!");
     expect(host("curl --noproxy '*' -fsS http://127.0.0.1:38081/")).toContain("Welcome to nginx!");
     // The TCP router terminates TLS but does not translate HTTP/2 frames for
     // its raw HTTP/1 backend. Exercise the intended TCP transport explicitly.
@@ -172,7 +175,7 @@ test("real Dockerized Agentor routes editor/desktop/Traefik and authorizes filte
     }
     // MAC/link testing can overlap the periodic backend refresh. Require
     // convergence after host identity recovers, not an unchanged route cache.
-    await expect.poll(() => host("curl --noproxy '*' -sS --max-time 5 -H 'Host: phase6.incus.test' http://127.0.0.1/"),
+    await expect.poll(() => host("curl --noproxy '*' -sS --max-time 5 -H 'Host: phase6.incus.test' http://127.0.0.1/ || true"),
       { timeout: 60_000, intervals: [1000] }).toContain("Welcome to nginx!");
     await expect.poll(async () => [await primary(victim.containerName), await primary(attacker.containerName)],
       { timeout: 10_000, intervals: [1000] }).toEqual([victimIP, attackerIP]);
@@ -180,6 +183,73 @@ test("real Dockerized Agentor routes editor/desktop/Traefik and authorizes filte
     await new Promise((resolve) => setTimeout(resolve, 2000));
     expect(await primary(victim.containerName)).toBe(victimIP);
     expect(await primary(attacker.containerName)).toBe(attackerIP);
+    if (process.env.INCUS_IP_CHANGE_TEST === 'true') {
+      // Operator-side reservation changes are runtime state, not WorkerRecord
+      // configuration. Discover a free test address; never alter a foreign VM.
+      const cidr = host('sudo incus network get incusbr0 ipv4.address');
+      expect(cidr).toMatch(/^\d+\.\d+\.\d+\.\d+\/24$/);
+      const subnet = cidr.split('/')[0]!.split('.').slice(0, 3).join('.');
+      const used = new Set<string>(JSON.parse(host('sudo incus query /1.0/networks/incusbr0/leases'))
+        .map((lease: any) => lease.address));
+      used.add(cidr.split('/')[0]!); used.add(victimIP); used.add(attackerIP);
+      const all = JSON.parse(host('sudo incus query "/1.0/instances?all-projects=true&recursion=1"'));
+      for (const instance of all) for (const device of Object.values(instance.expanded_devices ?? instance.devices) as any[]) {
+        if (device.type === 'nic' && device.network === 'incusbr0' && device['ipv4.address']) used.add(device['ipv4.address']);
+      }
+      const projects = JSON.parse(host('sudo incus query /1.0/projects?recursion=1'));
+      for (const project of projects) {
+        const profiles = JSON.parse(host(`sudo incus query ${quote('/1.0/profiles?recursion=1&project=' + encodeURIComponent(project.name))}`));
+        for (const profile of profiles) for (const device of Object.values(profile.devices ?? {}) as any[]) {
+          if (device.type === 'nic' && device.network === 'incusbr0' && device['ipv4.address']) used.add(device['ipv4.address']);
+        }
+      }
+      const newIP = Array.from({ length: 253 }, (_, i) => `${subnet}.${254 - i}`).find((address) => !used.has(address));
+      expect(newIP).toBeTruthy();
+      const readdress = async (worker: any, address: string) => {
+        const stop = await api.post(`/api/containers/${worker.id}/stop`, { data: {} });
+        expect(stop.status(), await stop.text()).toBe(200); expect(await stop.json()).toEqual({ ok: true });
+        const instance = await client.getInstance(worker.containerName);
+        expect(instance.config).toMatchObject({ 'user.agentor.id': worker.id, 'user.agentor.owner': owner,
+          'volatile.uuid': worker.containerId.slice(6) });
+        expect(instance.status).toBe('Stopped');
+        await client.updateInstanceDevices(worker.containerName, { ...instance.devices,
+          eth0: { ...instance.devices.eth0!, 'ipv4.address': address } });
+        const restart = await api.post(`/api/containers/${worker.id}/restart`, { data: {} });
+        expect(restart.status(), await restart.text()).toBe(200); expect(await restart.json()).toEqual({ ok: true });
+        await expect.poll(() => primary(worker.containerName), { timeout: 60_000 }).toBe(address);
+        expect(JSON.parse(await checked(worker.containerName,
+          `curl --noproxy '*' -fsS --max-time 5 ${quote(gateway + '/api/worker-self/info')}`)).workerId).toBe(worker.id);
+      };
+      await readdress(victim, newIP!);
+      // Reassign the retired source to a different owned fixture. Worker-self
+      // must now resolve that worker, while victim routes move to its new IP.
+      await readdress(attacker, victimIP);
+      // Make only this guest's desktop/editor ports unavailable. Keep service
+      // health intact so reconciliation does not undo the negative control.
+      // A stale target must fail, not pass through an identical worker UI.
+      await checked(attacker.containerName, 'iptables -I INPUT 1 -p tcp -m multiport --dports 6080,8443 -j REJECT; ! curl --noproxy "*" -fsS --max-time 3 http://127.0.0.1:6080/; ! curl --noproxy "*" -fsS --max-time 3 http://127.0.0.1:8443/');
+      await checked(attacker.containerName, "mkdir -p /tmp/agentor-stale-ip-fixture; printf stale-backend-attacker > /tmp/agentor-stale-ip-fixture/index.html; python3 -c \"import subprocess; subprocess.Popen(['python3','-m','http.server','18080','--directory','/tmp/agentor-stale-ip-fixture'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)\"");
+      await expect.poll(async () => (await client.exec(attacker.containerName,
+        ['curl', '--noproxy', '*', '-fsS', '--max-time', '5', 'http://127.0.0.1:18080/'])).stdout,
+      { timeout: 15_000 }).toBe('stale-backend-attacker');
+      await expect.poll(() => host("curl --noproxy '*' -sS --max-time 5 -H 'Host: phase6.incus.test' http://127.0.0.1/ || true"),
+        { timeout: 60_000, intervals: [1000] }).toContain('Welcome to nginx!');
+      expect(host("curl --noproxy '*' -fsS http://127.0.0.1:38081/")).toContain('Welcome to nginx!');
+      expect(host("curl --noproxy '*' --http1.1 -kfsS --resolve phase6tcp.incus.test:443:127.0.0.1 https://phase6tcp.incus.test/")).toContain('Welcome to nginx!');
+      expect([200, 302]).toContain((await api.get(`/editor/${victim.id}/`, { maxRedirects: 0 })).status());
+      expect((await api.get(`/desktop/${victim.id}/agentor.html`)).status()).toBe(200);
+      const noVnc = await new Promise<string>((resolve, reject) => {
+        const ws = new WebSocket(baseURL.replace(/^http/, 'ws') + `/ws/desktop/${victim.id}`, { headers: { Cookie: cookie, Origin: baseURL } });
+        const timer = setTimeout(() => { ws.terminate(); reject(new Error('Readdressed noVNC handshake timeout')); }, 15_000);
+        ws.once('message', (bytes: Buffer) => { clearTimeout(timer); ws.close(); resolve(bytes.toString()); });
+        ws.once('error', (error: Error) => { clearTimeout(timer); ws.terminate(); reject(error); });
+        ws.once('close', () => { clearTimeout(timer); reject(new Error('Readdressed noVNC closed before handshake')); });
+      });
+      expect(noVnc).toMatch(/^RFB 003\./);
+      // Confirm anti-spoofing survives the operator's address changes.
+      for (const worker of workers) expect((await client.getInstance(worker.containerName)).devices.eth0).toMatchObject({
+        'security.mac_filtering': 'true', 'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' });
+    }
   } catch (error) {
     primaryFailure = true;
     try { console.error(host("sudo docker logs --tail 60 agentor-traefik 2>&1 || true")); }
