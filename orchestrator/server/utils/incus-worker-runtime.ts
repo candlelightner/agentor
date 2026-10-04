@@ -199,13 +199,13 @@ export class IncusWorkerRuntime {
     return instance;
   }
 
-  commands(owner: IncusStorageOwner, incarnation: string, validateRecord: () => void,
+  commands(owner: IncusStorageOwner, incarnation: string, validateRecord: () => void | Promise<void>,
     setup?: <T>(operation: () => Promise<T>) => Promise<T>,
   ): IncusWorkerCommands {
     return new IncusWorkerCommands(this.client, owner.containerName, `incus:${incarnation}`, async () => {
-      validateRecord();
+      await validateRecord();
       const instance = await this.assertOwned(owner.containerName, owner.id);
-      validateRecord();
+      await validateRecord();
       if (instance.config['user.agentor.owner'] !== owner.userId ||
           instance.config['volatile.uuid'] !== incarnation || instance.status !== 'Running')
         throw new Error('Incus command target ownership, incarnation or running state changed');

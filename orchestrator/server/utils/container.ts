@@ -1246,7 +1246,13 @@ export class ContainerManager {
     if (info.runtimeKind !== 'incus-vm') return this.dockerService;
     const incarnation = info.containerId.slice('incus:'.length);
     const generation = workerLifecycleGeneration(id);
-    return this.incusRuntime.commands({ id, userId: info.userId, containerName: info.containerName }, incarnation, () => {
+    return this.incusRuntime.commands({ id, userId: info.userId, containerName: info.containerName }, incarnation, async () => {
+      // Validate inside command admission, including command objects captured
+      // before the intent was persisted. The exempt guest agent must not spawn
+      // new ordinary writers while a canonical mount has uncertain authority.
+      const { useManagedVolumeManager } = await import('./managed-volume-manager');
+      const volumes = useManagedVolumeManager(); await volumes.init();
+      volumes.assertLiveRecoveryResolved(info.userId, id);
       const current = this.get(id), record = this.workerStore?.findById(id);
       if (!record || record.runtimeKind !== 'incus-vm' || record.status !== 'active' || record.deletionPending ||
           record.userId !== info.userId || current?.runtimeKind !== 'incus-vm' || current.userId !== info.userId ||
@@ -2592,6 +2598,11 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    if (info.runtimeKind === 'incus-vm') {
+      const { useManagedVolumeManager } = await import('./managed-volume-manager');
+      const volumes = useManagedVolumeManager(); await volumes.init();
+      volumes.assertLiveRecoveryResolved(info.userId, info.id);
+    }
     const incarnation = info.runtimeKind === 'incus-vm' ? this.capturedIncusIncarnation(info) : undefined;
     await this.persistDesiredRuntimeStatus(info, "stopped");
     useLogCollector().detach(info.containerId);
@@ -3213,6 +3224,11 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    if (info.runtimeKind === 'incus-vm') {
+      const { useManagedVolumeManager } = await import('./managed-volume-manager');
+      const volumes = useManagedVolumeManager(); await volumes.init();
+      volumes.assertLiveRecoveryResolved(info.userId, info.id);
+    }
     const incarnation = info.runtimeKind === 'incus-vm' ? this.capturedIncusIncarnation(info) : undefined;
     // A graceful VM shutdown can finish after its bounded API response fails.
     // Withdraw running intent first so reconciliation cannot resurrect a VM
@@ -4169,6 +4185,11 @@ for p in sys.argv[1:]:
     }
 
     if (worker.incusRecreation) throw new Error('Interrupted Incus recreation must be resolved before deleting canonical data');
+    if (worker.runtimeKind === 'incus-vm') {
+      const { useManagedVolumeManager } = await import('./managed-volume-manager');
+      const volumes = useManagedVolumeManager(); await volumes.init();
+      volumes.assertLiveRecoveryResolved(userId, id);
+    }
 
     // This is the commit point before the first destructive operation. A
     // partial failure must never leave an apparently safe, unarchivable record.
@@ -5822,6 +5843,9 @@ for p in sys.argv[1:]:
         const record = this.workerStore?.get(snapshot.userId, snapshot.id), info = this.get(snapshot.id);
         if (!record || record.status !== 'active' || record.runtimeKind !== 'incus-vm' || record.deletionPending ||
             record.incusRecreation || !info || info.userId !== record.userId || info.runtimeKind !== 'incus-vm') return;
+        const { useManagedVolumeManager } = await import('./managed-volume-manager');
+        const volumes = useManagedVolumeManager(); await volumes.init();
+        volumes.assertLiveRecoveryResolved(record.userId, record.id);
         const incarnation = info.containerId.startsWith('incus:') ? info.containerId.slice(6) : '';
         if (!incarnation) throw new Error('Incus reconciliation incarnation is unavailable');
         observedHandle = info.containerId; observedGeneration = workerLifecycleGeneration(info.id);

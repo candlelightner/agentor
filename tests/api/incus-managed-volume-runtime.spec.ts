@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, symlink, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { IncusManagedVolumeRuntime, INCUS_PERSISTENCE_TARGET_CHECK, INCUS_SELECTION_DIRECTORY_CHECK } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
 import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volume-store';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
@@ -96,6 +97,19 @@ test('selection staging does not stop/start compute, keeps data unseeded and ref
     await runtime.seed('incus:original', v, async () => { v.seeded = true; });
     expect(calls.filter(c => c === 'copy')).toHaveLength(2);
     expect(v.seeded).toBe(true);
+  });
+});
+
+test('unresolved live intent never allocates missing data, deletes staging or starts a recopy', async () => {
+  await fixture(async (runtime, v, calls, state) => {
+    v.incusLive = { id: randomUUID(), incarnation: randomUUID(), bootId: randomUUID(), attachment: 'unknown' };
+    await expect(runtime.ensureVolume(v)).rejects.toThrow('no empty replacement');
+    state.volume = state.ownedVolume;
+    for (const operation of [() => runtime.removeStaging(v), () => runtime.delete(v),
+      () => runtime.stageSelection('incus:original', v), () => runtime.seed('incus:original', v, async () => { throw new Error('must not commit'); })])
+      await expect(operation()).rejects.toThrow('unresolved');
+    expect(calls).toEqual([]);
+    expect(state.volume).toBeTruthy(); expect(state.instance.status).toBe('Running');
   });
 });
 
@@ -202,6 +216,28 @@ test('Incus selection classification keeps files, root, protected and already-ba
     await manager.adoptIncusSelections(worker, ['/opt/project'], true);
     expect(manager.store.forWorker(worker.userId, worker.id)[0]).toMatchObject({
       target: '/opt/project', seeded: false, attached: true, state: 'pending', storageRuntimeKind: 'incus-vm', operation: { stage: 'complete' } });
+  });
+});
+
+test('durable live intent quarantines provisioning, recreation, snapshots and deletion even before startup recovery', async () => {
+  await selectionFixture(async (manager, worker, calls) => {
+    const v = await manager.store.create(worker.userId, worker.id, '/opt/live', undefined, 'incus-vm');
+    await manager.store.save({ ...v, attached: false, seeded: true,
+      incusLive: { id: randomUUID(), incarnation: randomUUID(), bootId: randomUUID(), attachment: 'settled' } });
+    expect(manager.isRecoveryBlocked(worker.id)).toBe(true);
+    expect(manager.isRecoveryBlocked('other-worker')).toBe(false);
+    expect(manager.hasActiveOperationsForInstanceSnapshot()).toBe(true);
+    expect(await manager.requiresRecreation(worker.userId, worker.id, worker.containerId)).toBe(true);
+    for (const operation of [() => manager.prepare(worker), () => manager.mounts(worker.userId, worker.id),
+      () => manager.currentIncusVolumes(worker.userId, worker.id, worker.containerId),
+      () => manager.markDeclared(worker.userId, worker.id, worker.containerId),
+      () => manager.workerDeleted(worker.userId, worker.id), () => manager.recoverWorker(worker.userId, worker.id)])
+      await expect(operation()).rejects.toThrow('unresolved');
+    expect(() => manager.assertLiveRecoveryResolved(worker.userId, worker.id)).toThrow('unresolved');
+    await manager.recoverStartup();
+    expect(manager.store.get(worker.userId, v.id)?.incusLive).toBeTruthy();
+    expect(manager.isRecoveryBlocked(worker.id)).toBe(true);
+    expect(calls).toEqual([]);
   });
 });
 

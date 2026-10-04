@@ -31,6 +31,17 @@ export function validatePersistenceTarget(input: unknown): string {
   return input;
 }
 
+/** One bounded private live-cutover intent, not a portable data authority.
+ * Unknown submission is distinct from a daemon operation whose identity was
+ * acknowledged. seeded remains the only committed copy authority. */
+export interface IncusLiveVolumeIntent {
+  id: string;
+  incarnation: string;
+  bootId: string;
+  attachment: 'not-submitted' | 'unknown' | 'accepted' | 'settled';
+  operation?: string;
+}
+
 export interface StoredManagedVolume extends ManagedVolume {
   /** Internal only. Never accepted from REST/MCP or exposed in public results. */
   dockerName: string;
@@ -41,6 +52,8 @@ export interface StoredManagedVolume extends ManagedVolume {
   /** A live mount is transient until a Docker-declared replacement exists. */
   liveContainerId?: string;
   previousRestartPolicy?: { Name: string; MaximumRetryCount?: number };
+  /** Persists before any guest freeze/attachment. Never expose/import it. */
+  incusLive?: IncusLiveVolumeIntent;
 }
 
 function validateRecord(v: StoredManagedVolume) {
@@ -54,6 +67,20 @@ function validateRecord(v: StoredManagedVolume) {
     throw new Error("Invalid managed volume record");
   if (v.storageRuntimeKind !== undefined && v.storageRuntimeKind !== 'legacy-docker' && v.storageRuntimeKind !== 'incus-vm')
     throw new Error('Invalid managed volume storage runtime');
+  if (v.incusLive !== undefined) {
+    const intent = v.incusLive, uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
+    if (!intent || typeof intent !== 'object' || Array.isArray(intent) ||
+        v.storageRuntimeKind !== 'incus-vm' || v.purpose !== 'persistent-path' ||
+        v.liveContainerId !== undefined || v.previousRestartPolicy !== undefined ||
+        Object.keys(intent).some(key => !['id', 'incarnation', 'bootId', 'attachment', 'operation'].includes(key)) ||
+        ![intent.id, intent.incarnation, intent.bootId].every(value => typeof value === 'string' && uuid.test(value)) ||
+        !['not-submitted', 'unknown', 'accepted', 'settled'].includes(intent.attachment) ||
+        (intent.operation !== undefined && (typeof intent.operation !== 'string' ||
+          !/^\/1\.0\/operations\/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(intent.operation))) ||
+        (intent.attachment === 'accepted' && !intent.operation) ||
+        (['not-submitted', 'unknown'].includes(intent.attachment) && intent.operation !== undefined))
+      throw new Error('Invalid Incus live-volume recovery intent');
+  }
   if (v.purpose === "persistent-path") validatePersistenceTarget(v.target);
   return v.id;
 }
@@ -73,6 +100,8 @@ export class ManagedVolumeStore extends UserScopedJsonStore<string, StoredManage
   /** Copy first, then remove the disposable owner partition. A crash with both
    * copies present is safe: the administrator-retained record wins on load. */
   async retainForDeletedOwner(userId: string) {
+    if (this.listForUser(userId).some(v => v.incusLive))
+      throw volumeError(409, 'Resolve live storage recovery before removing its owner. All data was retained.');
     for (const v of this.listForUser(userId))
       await this.retained.save({ ...v, attached: false, state: "detached", retainedAfterAccountDeletion: true });
     await super.removeForUser(userId);
@@ -108,7 +137,14 @@ export class ManagedVolumeStore extends UserScopedJsonStore<string, StoredManage
     await this.setItem(record.userId, { ...record, updatedAt: new Date().toISOString() });
   }
 
-  async forget(userId: string, id: string) { await this.deleteItem(userId, id); await this.retained.forget(userId, id); }
+  async forget(userId: string, id: string) {
+    assertIncusLiveResolved(this.get(userId, id));
+    await this.deleteItem(userId, id); await this.retained.forget(userId, id);
+  }
+  override async removeForUser(userId: string) {
+    for (const v of this.listForUser(userId)) assertIncusLiveResolved(v);
+    return super.removeForUser(userId);
+  }
 }
 
 function mergeVolumeRecords(ordinary: StoredManagedVolume[], retained: StoredManagedVolume[]) {
@@ -127,8 +163,12 @@ class RetainedVolumeRecords extends UserScopedJsonStore<string, StoredManagedVol
 
 export function publicVolume(v: StoredManagedVolume): ManagedVolume {
   const { dockerName: _docker, seeded: _seeded, liveContainerId: _live,
-    previousRestartPolicy: _restart, storageRuntimeKind: _runtime, ...result } = v;
+    previousRestartPolicy: _restart, storageRuntimeKind: _runtime, incusLive: _intent, ...result } = v;
   return result;
+}
+
+export function assertIncusLiveResolved(v: StoredManagedVolume | undefined) {
+  if (v?.incusLive) throw volumeError(409, 'Incus live storage recovery is unresolved. Compute, original source and volume data were retained.');
 }
 
 export function managedVolumeRuntimeKind(v: StoredManagedVolume): WorkerRuntimeKind {

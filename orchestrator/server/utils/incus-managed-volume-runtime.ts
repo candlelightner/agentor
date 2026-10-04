@@ -2,7 +2,7 @@ import type { Config } from './config';
 import type { IncusInstance, IncusCustomVolume, IncusDevice } from './incus-client';
 import { IncusWorkerRuntime } from './incus-worker-runtime';
 import { backupInstallationId } from './backup-installation';
-import { managedVolumeRuntimeKind, pathsOverlap, validatePersistenceTarget, volumeError, type StoredManagedVolume } from './managed-volume-store';
+import { managedVolumeRuntimeKind, pathsOverlap, validatePersistenceTarget, volumeError, assertIncusLiveResolved, type StoredManagedVolume } from './managed-volume-store';
 import type { IncusStorageOwner } from './incus-worker-storage';
 
 /** Managed paths keep their existing store/policy. This adapter owns only the
@@ -60,7 +60,7 @@ export class IncusManagedVolumeRuntime {
   async ensureVolume(v: StoredManagedVolume) {
     let found = await this.inspectVolume(v);
     if (!found) {
-      if (v.seeded) throw volumeError(409, 'Required persistent volume is missing. Restore it first; no empty replacement was created.');
+      if (v.seeded || v.incusLive) throw volumeError(409, 'Required persistent volume is missing. Restore it first; no empty replacement was created.');
       await this.worker.client.createCustomVolume(this.config.incusStoragePool, {
         name: v.dockerName, content_type: 'filesystem', config: {
           'user.agentor.installation': await this.installationId(), 'user.agentor.owner': v.userId,
@@ -122,6 +122,7 @@ export class IncusManagedVolumeRuntime {
   }
 
   async removeStaging(v: StoredManagedVolume) {
+    assertIncusLiveResolved(v);
     if (v.seeded) throw volumeError(409, 'Populated volumes cannot be removed as staging.');
     const found = await this.inspectVolume(v);
     if (!found) return;
@@ -130,6 +131,7 @@ export class IncusManagedVolumeRuntime {
   }
 
   async delete(v: StoredManagedVolume) {
+    assertIncusLiveResolved(v);
     const found = await this.inspectVolume(v);
     if (!found) return;
     if (found.used_by?.length) throw volumeError(409, 'Volume is still referenced by an Incus instance; it was not deleted.');
@@ -140,6 +142,7 @@ export class IncusManagedVolumeRuntime {
    * continue writing the original directory. seed() MUST recopy it before a
    * later rebuild/archive discards that root. Hotplug needs no VM reboot. */
   async stageSelection(handle: string, v: StoredManagedVolume) {
+    assertIncusLiveResolved(v);
     this.validateRecord(v);
     if (v.seeded) throw volumeError(409, 'Canonical managed data cannot be overwritten by a backup selection.');
     await this.validateTarget(v.userId, v.workerId, handle, v.target);
@@ -192,6 +195,7 @@ export class IncusManagedVolumeRuntime {
    * Standard Agentor units are quiesced by an unprovisioned new boot; arbitrary
    * guest-created boot units are not a VM-wide snapshot guarantee. */
   async seed(handle: string, v: StoredManagedVolume, commitSeeded: () => Promise<void>) {
+    assertIncusLiveResolved(v);
     this.validateRecord(v);
     if (v.seeded) { await this.ensureVolume(v); return; }
     const owner = this.owner(v), incarnation = handle.startsWith('incus:') ? handle.slice(6) : '';

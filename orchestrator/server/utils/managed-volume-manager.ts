@@ -2,7 +2,7 @@ import Docker from "dockerode";
 import { randomUUID } from "node:crypto";
 import type { VolumeApplyMode } from "../../shared/managed-volumes";
 import type { ContainerInfo } from "../../shared/types";
-import { ManagedVolumeStore, PersistencePolicyStore, VolumeRecreationStore, publicVolume, validatePersistenceTarget, volumeError, volumeName, pathsOverlap, managedVolumeRuntimeKind, type StoredManagedVolume } from "./managed-volume-store";
+import { ManagedVolumeStore, PersistencePolicyStore, VolumeRecreationStore, publicVolume, validatePersistenceTarget, volumeError, volumeName, pathsOverlap, managedVolumeRuntimeKind, assertIncusLiveResolved, type StoredManagedVolume } from "./managed-volume-store";
 import { ManagedVolumeRuntime } from "./managed-volume-runtime";
 import { IncusManagedVolumeRuntime } from './incus-managed-volume-runtime';
 import { useConfig, useContainerManager, useWorkerStore } from "./services";
@@ -59,15 +59,24 @@ export class ManagedVolumeManager {
 
   init() { return this.loading ??= Promise.all([this.store.init(), this.policies.init(), this.recreations.init()]).then(() => {}); }
 
-  hasActiveOperationsForInstanceSnapshot() { return this.operations.size > 0 || this.recreations.list().length > 0; }
-  isRecoveryBlocked(workerId: string) { return this.recoveryFailures.has(workerId); }
+  hasActiveOperationsForInstanceSnapshot() {
+    return this.operations.size > 0 || this.recreations.list().length > 0 || this.store.list().some(v => v.incusLive);
+  }
+  isRecoveryBlocked(workerId: string) {
+    return this.recoveryFailures.has(workerId) || this.store.list().some(v => v.workerId === workerId && v.incusLive);
+  }
+  /** Internal lifecycle guard: destructive compute changes lose the original
+   * directory/boot proof needed to resolve a pending live cutover. */
+  assertLiveRecoveryResolved(userId: string, workerId: string) {
+    for (const v of this.store.forWorker(userId, workerId)) assertIncusLiveResolved(v);
+  }
 
   /** Called after deleted-account worker cleanup under the owner's fence.
    * Retains both data and durable administrator handles; deletes no volume. */
   async retainDeletedOwner(userId: string) {
     await this.init();
     for (const v of this.store.listForUser(userId)) {
-      if (this.operations.has(v.id) || this.recreations.get(userId, v.workerId) || v.liveContainerId)
+      if (this.operations.has(v.id) || this.recreations.get(userId, v.workerId) || v.liveContainerId || v.incusLive)
         throw volumeError(409, "Complete storage recovery before retaining deleted-account volumes.");
       if (managedVolumeRuntimeKind(v) === 'incus-vm'
         ? (await this.incusRuntime.inspectVolume(v))?.used_by?.length
@@ -338,6 +347,7 @@ export class ManagedVolumeManager {
   /** Called inside the worker lifecycle fence, before discarding its rootfs. */
   async prepare(worker: Pick<ContainerInfo, "id" | "userId" | "containerId">) {
     await this.init();
+    this.assertLiveRecoveryResolved(worker.userId, worker.id);
     this.assertBackend(worker.userId, worker.id);
     const volumes = this.store.forWorker(worker.userId, worker.id).filter((v) => v.attached);
     if (useWorkerStore().get(worker.userId, worker.id)?.runtimeKind === 'incus-vm' || volumes.some(v => managedVolumeRuntimeKind(v) === 'incus-vm')) {
@@ -374,6 +384,7 @@ export class ManagedVolumeManager {
 
   async mounts(userId: string, workerId: string) {
     await this.init();
+    this.assertLiveRecoveryResolved(userId, workerId);
     this.assertBackend(userId, workerId);
     const result = [];
     for (const v of this.store.forWorker(userId, workerId).filter((v) => v.attached)) {
@@ -389,6 +400,7 @@ export class ManagedVolumeManager {
    * a deferred detach must not discard verification of the still-mounted data. */
   async currentIncusVolumes(userId: string, workerId: string, containerId: string) {
     await this.init(); this.assertBackend(userId, workerId);
+    this.assertLiveRecoveryResolved(userId, workerId);
     const records = this.store.forWorker(userId, workerId);
     if (!records.length) return [];
     const actual = await this.incusRuntime.inspect(userId, workerId, containerId);
@@ -499,7 +511,7 @@ export class ManagedVolumeManager {
       if (!v || v.workerId !== actor.workerId) throw volumeError(404, "Volume not found.");
       if (v.retainedAfterAccountDeletion && !actor.platformAdmin) throw volumeError(404, "Volume not found.");
       if (!v.retainedAfterAccountDeletion) await useWorkerProtectionLockStore().verify(actor.workerId, actor.lockPassword);
-      if (v.attached || v.liveContainerId || this.operations.has(v.id) || this.recreations.get(actor.userId, actor.workerId))
+      if (v.attached || v.liveContainerId || v.incusLive || this.operations.has(v.id) || this.recreations.get(actor.userId, actor.workerId))
         throw volumeError(409, "Detach and apply the worker configuration before deleting this volume.");
       if (managedVolumeRuntimeKind(v) === 'incus-vm') {
         if (useWorkerStore().get(actor.userId, actor.workerId)?.incusRecreation)
@@ -518,6 +530,7 @@ export class ManagedVolumeManager {
   /** Preserve user-created storage even when its worker is permanently removed. */
   async workerDeleted(userId: string, workerId: string) {
     await this.init();
+    this.assertLiveRecoveryResolved(userId, workerId);
     for (const v of this.store.forWorker(userId, workerId)) {
       v.attached = false; v.state = "detached";
       delete v.liveContainerId; delete v.previousRestartPolicy;
@@ -527,6 +540,7 @@ export class ManagedVolumeManager {
 
   async markDeclared(userId: string, workerId: string, containerId: string) {
     await this.init();
+    this.assertLiveRecoveryResolved(userId, workerId);
     if (!this.store.forWorker(userId, workerId).length) return;
     this.assertBackend(userId, workerId);
     if (useWorkerStore().get(userId, workerId)?.runtimeKind === 'incus-vm' ||
@@ -588,6 +602,9 @@ export class ManagedVolumeManager {
     const worker = useWorkerStore().get(userId, workerId);
     this.assertBackend(userId, workerId);
     const records = this.store.forWorker(userId, workerId);
+    // Until the live recovery path proves operation/boot/data authority, an
+    // interrupted intent is never permission to reseed or reprovision.
+    this.assertLiveRecoveryResolved(userId, workerId);
     if (worker?.runtimeKind === 'incus-vm' || records.some(v => managedVolumeRuntimeKind(v) === 'incus-vm')) {
       if (this.recreations.get(userId, workerId) || records.some(v => managedVolumeRuntimeKind(v) !== 'incus-vm' || v.liveContainerId || v.previousRestartPolicy))
         throw volumeError(409, 'Incus storage has incompatible legacy recovery state. All data was retained.');

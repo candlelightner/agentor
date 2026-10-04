@@ -2,6 +2,7 @@ import { test, expect } from '@playwright/test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { ContainerManager } from '../../orchestrator/server/utils/container';
 import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
 import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker-runtime';
@@ -522,6 +523,66 @@ async function reconciliationFixture(run: (manager: ContainerManager, store: Wor
     finally { config.markApplied = mark; }
   });
 }
+
+async function withLiveIntent(info: any, run: () => Promise<void>) {
+  const volumes = useManagedVolumeManager(); await volumes.init();
+  const volume = await volumes.store.create(info.userId, info.id, '/opt/live-admission-test', undefined, 'incus-vm');
+  await volumes.store.save({ ...volume, incusLive: { id: randomUUID(), incarnation: randomUUID(),
+    bootId: randomUUID(), attachment: 'unknown' } });
+  try { await run(); }
+  finally {
+    // Test-only metadata fixture: no Incus volume was allocated or attached.
+    await volumes.store.save({ ...volume, incusLive: undefined });
+    await volumes.store.forget(info.userId, volume.id);
+  }
+}
+
+test('unresolved live cutover rejects ordinary stop before persisting stopped intent or sending a graceful shutdown', async () => {
+  await fixture(async (manager, store, calls, info) => {
+    (manager as any).incusRuntime.stop = async () => { calls.push('unsafe-stop'); };
+    await withLiveIntent(info, async () => {
+      await expect(manager.stop(info.id)).rejects.toThrow('live storage recovery is unresolved');
+      expect(calls).toEqual([]);
+      expect(store.get(info.userId, info.id)?.desiredRuntimeStatus).toBe('running');
+      expect(manager.get(info.id)?.status).toBe('running');
+    });
+  });
+});
+
+test('unresolved live cutover blocks reconciliation stop, reprovisioning and healthy publication', async () => {
+  for (const desired of ['running', 'stopped'] as const) {
+    for (const provisioned of [true, false]) await reconciliationFixture(async (manager, store, calls, info, state) => {
+      info.status = 'unknown'; state.provisioned = provisioned;
+      await store.upsert({ ...store.get(info.userId, info.id)!, desiredRuntimeStatus: desired });
+      (manager as any).incusRuntime.client.getInstance = async () => { calls.push('unsafe-inspect'); throw new Error('Must reject before runtime access'); };
+      (manager as any).incusRuntime.stop = async () => { calls.push('unsafe-stop'); };
+      await withLiveIntent(info, async () => {
+        await manager.reconcileIncusWorkers();
+        expect(calls).toEqual([]);
+        expect(manager.get(info.id)?.status).toBe('unknown');
+        expect(store.get(info.userId, info.id)?.desiredRuntimeStatus).toBe(desired);
+      });
+    });
+  }
+});
+
+test('unresolved live cutover rejects both new and captured exec, file and terminal commands before any guest operation', async () => {
+  await fixture(async (manager, _store, calls, info) => {
+    // Use the real command adapter; every runtime call is a sentinel.
+    manager.setIncusRuntime(new IncusWorkerRuntime({} as Config, new Proxy({}, { get: () => async () => {
+      calls.push('unsafe-client-call'); throw new Error('No guest call may bypass live quarantine');
+    } }) as any));
+    const captured = manager.workerCommands(info.id);
+    await withLiveIntent(info, async () => {
+      for (const commands of [captured, manager.workerCommands(info.id)]) {
+        await expect(commands.execCapture(info.containerId, ['true'])).rejects.toThrow('live storage recovery is unresolved');
+        await expect(commands.getArchive(info.containerId, '/workspace')).rejects.toThrow('live storage recovery is unresolved');
+      }
+      await expect(manager.attachTerminal(info.id, 0)).rejects.toThrow('live storage recovery is unresolved');
+      expect(calls).toEqual([]);
+    });
+  });
+});
 
 test('interrupted-recreation reconciliation merges rollback without overwriting pending/revoked settings', async () => {
   for (const outcome of ['active', 'archived'] as const) await fixture(async (manager, store, calls, info) => {
