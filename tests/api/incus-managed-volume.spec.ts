@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker-runtime';
 import { IncusManagedVolumeRuntime } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
 import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volume-store';
@@ -204,6 +205,159 @@ test('real Incus filesystem hotplug capability preserves the running worker boot
         if (store.get(info.userId, info.id)) await store.delete(info.userId, info.id);
       } catch (error) {
         console.error('Preserving filesystem hotplug diagnostic fixture', info.containerName, v?.id, error);
+        if (!failed) throw error;
+      }
+    }
+  }
+});
+
+test('real Incus live declaration reports pre-declaration bind handle behavior', async () => {
+  test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable live-mount declaration probe');
+  test.setTimeout(300_000);
+  const { config, manager, store, volumes, runtime } = await productionManagerFixture();
+  let info: any, v: any, failed = false;
+  const target = '/opt/live-declaration-probe';
+  const exec = async (command: string[]) => {
+    const result = await runtime.client.exec(info.containerName, command);
+    expect(result.returnCode, result.stdout + result.stderr).toBe(0);
+    return result.stdout.trim();
+  };
+  try {
+    info = await (manager as any).createForOwner({ userId: 'managed-live-owner', displayName: 'live mount declaration probe' });
+    const incarnation = info.containerId.slice(6), managed = new IncusManagedVolumeRuntime(config, runtime);
+    const before = await runtime.inspectGuestReadiness(info, incarnation);
+    const pid = await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'agentor-worker']);
+    v = await volumes.store.create(info.userId, info.id, target, undefined, 'incus-vm');
+    await managed.ensureVolume(v);
+    const key = managed.deviceKey(v), staging = `/run/agentor-volume-seed/${v.id}`;
+    let instance = await managed.inspect(v.userId, v.workerId, info.containerId);
+    await runtime.client.updateInstanceDevices(info.containerName, { ...instance.devices, [key]: { ...managed.device(v), path: staging } });
+    await exec(['timeout', '15', 'bash', '-ec',
+      'until mountpoint -q -- "$1"; do sleep .1; done; mkdir -p -- "$2"; echo before-path-update > "$1/sentinel"; mount --bind "$1" "$2"',
+      'live-declaration-prepare', staging, target]);
+    // Observe old descriptors separately from the fresh canonical mount. A
+    // version that preserves them is fine; live safety cannot assume it does.
+    await exec(['bash', '-ec', 'nohup python3 -c "$1" "$2" >/run/agentor/live-declaration.log 2>&1 </dev/null &', 'hold-descriptor', String.raw`
+import os, pathlib, sys, time
+p=pathlib.Path(sys.argv[1]); f=open(p/'sentinel','r')
+pathlib.Path('/run/agentor/live-declaration-ready').touch()
+deadline=time.monotonic()+20
+try:
+    while time.monotonic()<deadline:
+        f.seek(0)
+        if f.read().strip()=='after-path-update':
+            pathlib.Path('/run/agentor/live-declaration-result').write_text('observed');sys.exit(0)
+        time.sleep(.1)
+except OSError as error:
+    print('Retired descriptor:',type(error).__name__,error.errno,flush=True)
+pathlib.Path('/run/agentor/live-declaration-result').write_text('retired')
+`, target]);
+    await exec(['timeout', '15', 'bash', '-ec', 'until test -f /run/agentor/live-declaration-ready; do sleep .1; done']);
+    instance = await managed.inspect(v.userId, v.workerId, info.containerId);
+    await runtime.client.updateInstanceDevices(info.containerName, { ...instance.devices, [key]: managed.device(v) });
+    await exec(['timeout', '15', 'bash', '-ec',
+      'until mountpoint -q -- "$1"; do sleep .1; done; test "$(cat "$1/sentinel")" = before-path-update; echo after-path-update > "$1/sentinel"', 'live-declaration-write', target]);
+    await exec(['timeout', '25', 'bash', '-ec', 'until test -f /run/agentor/live-declaration-result; do sleep .1; done']);
+    const descriptor = await exec(['cat', '/run/agentor/live-declaration-result']);
+    expect(['observed', 'retired']).toContain(descriptor);
+    expect((await runtime.inspectGuestReadiness(info, incarnation)).bootId).toBe(before.bootId);
+    expect(await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'agentor-worker'])).toBe(pid);
+    expect(managed.matchesDevice((await runtime.client.getInstance(info.containerName)).devices[key], v)).toBe(true);
+    console.info(`Live declaration: current data, boot and service PID retained; old bind descriptor ${descriptor}. Writers must remain frozen through declaration.`);
+  } catch (error) { failed = true; throw error; }
+  finally {
+    if (info) {
+      try {
+        const instance = await runtime.client.getInstance(info.containerName);
+        expect(await runtime.matchesWorkerIdentity(instance, info.id, info.userId)).toBe(true);
+        await runtime.remove(info, instance.config['volatile.uuid']);
+        if (v) { await volumes.incusRuntime.delete(v); await volumes.store.forget(v.userId, v.id); }
+        await runtime.removeStorage(info);
+        if (store.get(info.userId, info.id)) await store.delete(info.userId, info.id);
+      } catch (error) {
+        console.error('Preserving exact live-declaration fixture', info.containerName, v?.id, error);
+        if (!failed) throw error;
+      }
+    }
+  }
+});
+
+test('real Incus canonical hotplug works with guest writers frozen and independent watchdog thaw', async () => {
+  test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable guest-freezer capability probe');
+  test.setTimeout(300_000);
+  const { config, manager, store, volumes, runtime } = await productionManagerFixture();
+  let info: any, v: any, failed = false;
+  const target = '/opt/frozen-declaration-probe';
+  const exec = async (command: string[]) => {
+    const result = await runtime.client.exec(info.containerName, command);
+    expect(result.returnCode, result.stdout + result.stderr).toBe(0);
+    return result.stdout.trim();
+  };
+  try {
+    info = await (manager as any).createForOwner({ userId: 'managed-live-owner', displayName: 'guest freezer probe' });
+    const incarnation = info.containerId.slice(6), managed = new IncusManagedVolumeRuntime(config, runtime);
+    const before = await runtime.inspectGuestReadiness(info, incarnation);
+    const pid = await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'agentor-worker']);
+    const agentPid = await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'incus-agent']);
+    expect(Number(agentPid)).toBeGreaterThan(1);
+    const agentGroup = await exec(['cat', `/proc/${agentPid}/cgroup`]);
+    await exec(['bash', '-ec', 'mkdir /sys/fs/cgroup/agentor-already-frozen-probe; echo 1 > /sys/fs/cgroup/agentor-already-frozen-probe/cgroup.freeze']);
+    await exec(['bash', '-ec', 'nohup python3 -c "$1" >/run/agentor/freezer-writer.log 2>&1 </dev/null &', 'writer', String.raw`
+import pathlib,time
+p=pathlib.Path('/run/agentor/freezer-ticks'); count=0
+while True:
+    count+=1;p.write_text(str(count));time.sleep(.05)
+`]);
+    await exec(['timeout', '10', 'bash', '-ec', 'until test -s /run/agentor/freezer-ticks; do sleep .1; done']);
+    v = await volumes.store.create(info.userId, info.id, target, undefined, 'incus-vm');
+    await managed.ensureVolume(v);
+    const key = managed.deviceKey(v), staging = `/run/agentor-volume-seed/${v.id}`;
+    let instance = await managed.inspect(v.userId, v.workerId, info.containerId);
+    await runtime.client.updateInstanceDevices(info.containerName, { ...instance.devices, [key]: { ...managed.device(v), path: staging } });
+    await exec(['timeout', '15', 'bash', '-ec',
+      'until mountpoint -q -- "$1"; do sleep .1; done; echo frozen-data > "$1/sentinel"', 'prepare', staging]);
+    await runtime.client.pushFile(info.containerName, '/run/agentor/freezer-probe.py',
+      await readFile(new URL('../helpers/incus-live-freezer-probe.py', import.meta.url)), { mode: 0o600 });
+    await exec(['bash', '-ec', 'nohup python3 /run/agentor/freezer-probe.py "$1" 45 >/run/agentor/freezer-probe.log 2>&1 </dev/null &', 'freeze', agentPid]);
+    await exec(['timeout', '10', 'bash', '-ec', 'until test -f /run/agentor/freezer-probe/armed; do sleep .1; done']);
+    await exec(['touch', '/run/agentor/freezer-probe/begin']);
+    await exec(['timeout', '15', 'bash', '-ec', 'until test -f /run/agentor/freezer-probe/frozen; do sleep .1; done']);
+    const tick = await exec(['cat', '/run/agentor/freezer-ticks']);
+    instance = await managed.inspect(v.userId, v.workerId, info.containerId);
+    await runtime.client.updateInstanceDevices(info.containerName, { ...instance.devices, [key]: managed.device(v) });
+    await exec(['timeout', '15', 'bash', '-ec',
+      'until mountpoint -q -- "$1"; do sleep .1; done; test "$(cat "$1/sentinel")" = frozen-data; test ! -e /run/agentor/freezer-probe/thawed', 'verify', target]);
+    expect(await exec(['cat', '/run/agentor/freezer-ticks'])).toBe(tick);
+    // Kill the controller: only the independently exempt watchdog can rescue
+    // the frozen guest. Agent API/host operations must remain available.
+    await exec(['bash', '-ec', 'kill -KILL "$(cat /run/agentor/freezer-probe/controller)"']);
+    await exec(['timeout', '55', 'bash', '-ec', 'until test -f /run/agentor/freezer-probe/thawed; do sleep .1; done']);
+    expect(await exec(['cat', '/run/agentor/freezer-probe/thawed'])).toBe('watchdog');
+    await exec(['timeout', '10', 'bash', '-ec', 'until test -f /run/agentor/freezer-probe/restored; do sleep .1; done']);
+    expect(await exec(['cat', `/proc/${agentPid}/cgroup`])).toBe(agentGroup);
+    expect(await exec(['cat', '/sys/fs/cgroup/agentor-already-frozen-probe/cgroup.freeze'])).toBe('1');
+    await exec(['timeout', '10', 'bash', '-ec', 'until test "$(cat /run/agentor/freezer-ticks)" != "$1"; do sleep .1; done', 'thaw', tick]);
+    expect((await runtime.inspectGuestReadiness(info, incarnation)).bootId).toBe(before.bootId);
+    expect(await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'agentor-worker'])).toBe(pid);
+    expect(managed.matchesDevice((await runtime.client.getInstance(info.containerName)).devices[key], v)).toBe(true);
+    console.info('Frozen canonical declaration passed; normal writers stopped, agent hotplug/exec stayed available, SIGKILL watchdog rescue, same boot/service PID.');
+  } catch (error) {
+    failed = true;
+    if (info) try { console.error('Freezer probe diagnostic:', await runtime.client.exec(info.containerName, ['bash', '-ec',
+      'cat /run/agentor/freezer-probe.log; ls -l /run/agentor/freezer-probe; cat /sys/fs/cgroup/*/cgroup.events'])); } catch { /* exact fixture remains covered below */ }
+    throw error;
+  } finally {
+    if (info) {
+      try {
+        // Incus host-side removal stays operational even if guest rescue fails.
+        const instance = await runtime.client.getInstance(info.containerName);
+        expect(await runtime.matchesWorkerIdentity(instance, info.id, info.userId)).toBe(true);
+        await runtime.remove(info, instance.config['volatile.uuid']);
+        if (v) { await volumes.incusRuntime.delete(v); await volumes.store.forget(v.userId, v.id); }
+        await runtime.removeStorage(info);
+        if (store.get(info.userId, info.id)) await store.delete(info.userId, info.id);
+      } catch (error) {
+        console.error('Preserving exact freezer fixture', info.containerName, v?.id, error);
         if (!failed) throw error;
       }
     }
