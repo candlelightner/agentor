@@ -329,6 +329,50 @@ export class IncusWorkerRuntime {
     }
   }
 
+  /** Roll back interrupted replacement, never complete it using potentially
+   * newer desired settings. A lost response is recoverable only by the nonce
+   * written by our create request, authoritative owner and current UUID. */
+  async rollbackRecreation(owner: IncusStorageOwner,
+    marker: { nonce: string; originalIncarnation?: string; replacementIncarnation?: string }):
+    Promise<{ status: 'active' | 'archived'; incarnation?: string }> {
+    if (!marker || typeof marker.nonce !== 'string' || !marker.nonce || marker.nonce.length > 128 ||
+        [marker.originalIncarnation, marker.replacementIncarnation].some((id) =>
+          id !== undefined && (typeof id !== 'string' || !id || id.length > 128)) ||
+        (marker.originalIncarnation && marker.originalIncarnation === marker.replacementIncarnation))
+      throw new Error('Incus recreation recovery marker is invalid');
+    let instance: IncusInstance;
+    try { instance = await this.client.getInstance(owner.containerName); }
+    catch (error) {
+      // Only an authoritative lookup404 proves missing compute. Do not turn
+      // unavailable API/storage facts into permission to discard the marker.
+      if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+      const storage = await this.storage();
+      if (!await storage.imageIdentity(owner)) throw new Error('Incus recreation retained source is missing');
+      await storage.verifyExisting(owner);
+      return { status: 'archived' };
+    }
+    const uuid = instance.config['volatile.uuid'];
+    if (!uuid || !await this.matchesWorkerIdentity(instance, owner.id, owner.userId))
+      throw new Error('Incus recreation recovery instance identity is unavailable');
+    if (uuid === marker.originalIncarnation) {
+      await this.stop(owner, uuid);
+      await this.assertOwned(owner.containerName, owner.id, owner.userId, uuid);
+      return { status: 'active', incarnation: uuid };
+    }
+    const checkReplacement = async () => {
+      const current = await this.assertOwned(owner.containerName, owner.id, owner.userId, uuid);
+      if (current.config['user.agentor.recreation'] !== marker.nonce ||
+          (marker.replacementIncarnation && marker.replacementIncarnation !== uuid))
+        throw new Error('Incus recreation recovery replacement identity changed');
+    };
+    await checkReplacement();
+    await this.stop(owner, uuid);
+    // Revalidate nonce as well as UUID immediately before deletion.
+    await checkReplacement();
+    await this.client.deleteInstance(owner.containerName);
+    return { status: 'archived' };
+  }
+
   private async resolveImage(fingerprint?: string): Promise<string> {
     if (!fingerprint) {
       const alias = await this.client.getImageAlias(this.config.incusWorkerImage);

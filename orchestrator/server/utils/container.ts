@@ -5610,6 +5610,33 @@ for p in sys.argv[1:]:
   /** Read healthy guests without advancing their lifecycle generation. Only a
    * positive stopped/missing-provisioning/service observation admits repair. */
   async reconcileIncusWorkers(): Promise<void> {
+    // Both archived and active records can retain a marker after a lost create
+    // or metadata response. Roll back before ordinary desired-state recovery.
+    for (const snapshot of [...(this.workerStore?.listActive() ?? []), ...(this.workerStore?.listArchived() ?? [])]) {
+      if (snapshot.runtimeKind !== 'incus-vm' || snapshot.deletionPending || !snapshot.incusRecreation) continue;
+      try {
+        await withOwnerWorkerLifecycleMutation(snapshot.userId, snapshot.id, async () => {
+          const record = this.workerStore?.get(snapshot.userId, snapshot.id);
+          if (!record || record.runtimeKind !== 'incus-vm' || record.deletionPending || !record.incusRecreation) return;
+          await this.assertOwnerExists(record.userId);
+          const marker = structuredClone(record.incusRecreation);
+          await this.assertIncusPersistenceReady(record);
+          const result = await this.incusRuntime.rollbackRecreation({ id: record.id, userId: record.userId,
+            containerName: this.buildContainerName(record.id) }, marker);
+          const resolved = await this.workerStore!.transitionIncusRecreation(record.userId, record.id,
+            { status: result.status, desiredRuntimeStatus: 'stopped', incusRecreation: undefined }, undefined, marker);
+          const current = this.get(record.id);
+          if (current) useLogCollector().detach(current.containerId);
+          if (result.status === 'archived') this.containers.delete(record.id);
+          else this.containers.set(record.id, { ...current, ...resolved, runtimeKind: 'incus-vm',
+            containerName: this.buildContainerName(record.id), containerId: `incus:${result.incarnation}`,
+            imageName: current?.imageName ?? '', imageId: current?.imageId ?? '',
+            status: 'stopped', runtimeDiagnostic: undefined });
+        });
+      } catch (error) {
+        useLogger().warn(`[container] Incus recreation recovery quarantined ${snapshot.id}: ${(error as { code?: string })?.code ?? 'runtime unavailable'}`);
+      }
+    }
     for (const snapshot of this.workerStore?.listActive() ?? []) {
       if (snapshot.runtimeKind !== 'incus-vm' || snapshot.deletionPending || snapshot.incusRecreation) continue;
       let observedHandle: string | undefined, observedGeneration: number | undefined;

@@ -307,6 +307,73 @@ test('lifecycle mutations require matching account and original incarnation', as
   }
 });
 
+test('interrupted recreation retains original or deletes only nonce-owned replacement without data/config writes', async () => {
+  for (const mode of ['original', 'replacement', 'lost-response']) {
+    const { client, events } = fakeClient();
+    const runtime = new IncusWorkerRuntime(config, client as any), opts = options();
+    const instance = await runtime.create({ ...opts, start: false, recreationNonce: 'operation-nonce' });
+    events.length = 0;
+    const result = await runtime.rollbackRecreation(opts, { nonce: 'operation-nonce',
+      originalIncarnation: mode === 'original' ? 'original-uuid' : 'prior-uuid',
+      replacementIncarnation: mode === 'replacement' ? instance.config['volatile.uuid'] : undefined });
+    expect(result.status).toBe(mode === 'original' ? 'active' : 'archived');
+    expect(events.filter((e) => e.operation === 'remove')).toHaveLength(mode === 'original' ? 0 : 1);
+    expect(events.some((e) => ['create', 'start', 'file', 'exec', 'volume-create', 'volume-update'].includes(e.operation))).toBe(false);
+  }
+});
+
+test('interrupted recreation quarantines wrong owner, UUID, nonce, malformed marker and unavailable lookup', async () => {
+  for (const failure of ['owner', 'uuid', 'nonce', 'malformed', 'contradictory', 'lookup']) {
+    const { client, events } = fakeClient();
+    const runtime = new IncusWorkerRuntime(config, client as any), opts = options();
+    const instance = await runtime.create({ ...opts, start: false, recreationNonce: 'operation-nonce' });
+    const marker = { nonce: 'operation-nonce', originalIncarnation: 'prior-uuid', replacementIncarnation: 'original-uuid' };
+    if (failure === 'owner') instance.config['user.agentor.owner'] = 'foreign';
+    if (failure === 'uuid') marker.replacementIncarnation = 'unexpected-uuid';
+    if (failure === 'nonce') instance.config['user.agentor.recreation'] = 'foreign-nonce';
+    if (failure === 'malformed') marker.nonce = '';
+    if (failure === 'contradictory') marker.originalIncarnation = marker.replacementIncarnation;
+    if (failure === 'lookup') client.getInstance = async () => { throw Object.assign(new Error('API unavailable'), { statusCode: 503 }); };
+    events.length = 0;
+    await expect(runtime.rollbackRecreation(opts, marker)).rejects.toThrow();
+    expect(events.some((e) => ['stop', 'remove', 'create', 'start', 'file', 'exec', 'volume-create', 'volume-update'].includes(e.operation))).toBe(false);
+  }
+});
+
+test('absent interrupted compute requires canonical volumes and source metadata without allocating replacements', async () => {
+  for (const failure of ['none', 'agents', 'source']) {
+    const { client, events } = fakeClient();
+    const runtime = new IncusWorkerRuntime(config, client as any), opts = options();
+    await runtime.create({ ...opts, start: false });
+    client.getInstance = async () => { throw Object.assign(new Error('missing compute'), { statusCode: 404 }); };
+    const get = client.getCustomVolume;
+    client.getCustomVolume = async (pool, name) => {
+      if (failure === 'agents' && name.endsWith('-agents')) throw Object.assign(new Error('missing data'), { statusCode: 404 });
+      const volume = structuredClone(await get(pool, name));
+      if (failure === 'source') delete volume.config['user.agentor.image-source'];
+      return volume;
+    };
+    events.length = 0;
+    const rollback = runtime.rollbackRecreation(opts, { nonce: 'operation-nonce', originalIncarnation: 'prior-uuid' });
+    if (failure === 'none') await expect(rollback).resolves.toEqual({ status: 'archived' });
+    else await expect(rollback).rejects.toThrow();
+    expect(events.some((e) => ['stop', 'remove', 'create', 'start', 'volume-create', 'volume-update'].includes(e.operation))).toBe(false);
+  }
+});
+
+test('replacement nonce, UUID and owner are rechecked after stop before interrupted-recreation deletion', async () => {
+  for (const key of ['user.agentor.recreation', 'volatile.uuid', 'user.agentor.owner']) {
+    const { client, events } = fakeClient();
+    const runtime = new IncusWorkerRuntime(config, client as any), opts = options();
+    const instance = await runtime.create({ ...opts, start: false, recreationNonce: 'operation-nonce' });
+    client.getInstanceState = async () => ({ status: 'Running' });
+    client.stopInstance = async () => { instance.config[key] = 'changed'; };
+    events.length = 0;
+    await expect(runtime.rollbackRecreation(opts, { nonce: 'operation-nonce' })).rejects.toThrow();
+    expect(events.some((e) => e.operation === 'remove')).toBe(false);
+  }
+});
+
 test('guest readiness reads positive boot/config/service facts without lifecycle or storage writes', async () => {
   const { client, events } = fakeClient();
   const runtime = new IncusWorkerRuntime(config, client as any), opts = options();

@@ -290,6 +290,69 @@ async function reconciliationFixture(run: (manager: ContainerManager, store: Wor
   });
 }
 
+test('interrupted-recreation reconciliation merges rollback without overwriting pending/revoked settings', async () => {
+  for (const outcome of ['active', 'archived'] as const) await fixture(async (manager, store, calls, info) => {
+    const marker = { nonce: 'operation-nonce', originalIncarnation: 'original-uuid' };
+    await store.upsert({ ...store.get(info.userId, info.id)!, status: 'archived', incusRecreation: marker });
+    (manager as any).incusRuntime.rollbackRecreation = async () => {
+      calls.push('rollback');
+      await store.upsert({ ...store.get(info.userId, info.id)!, initScript: 'newer desired',
+        pendingRebuild: true, hostMountsRevoked: true, hardwareDevicesRevoked: true });
+      return { status: outcome, incarnation: outcome === 'active' ? 'original-uuid' : undefined };
+    };
+    // Ordinary convergence must not repair or promote a rolled-back worker.
+    (manager as any).incusRuntime.client = { getInstance: async () => ({ status: 'Stopped', config: { 'volatile.uuid': 'original-uuid' } }) };
+    (manager as any).incusRuntime.matchesWorkerIdentity = async () => true;
+    await manager.reconcileIncusWorkers();
+    expect(store.get(info.userId, info.id)).toMatchObject({ status: outcome, desiredRuntimeStatus: 'stopped',
+      pendingRebuild: true, initScript: 'newer desired', hostMountsRevoked: true, hardwareDevicesRevoked: true });
+    expect(store.get(info.userId, info.id)?.incusRecreation).toBeUndefined();
+    expect(calls).toEqual(['persistence-preflight', 'rollback']);
+    if (outcome === 'active') expect(manager.get(info.id)).toMatchObject({ status: 'stopped', containerId: 'incus:original-uuid' });
+    else expect(manager.get(info.id)).toBeUndefined();
+  });
+});
+
+test('interrupted-recreation persistence or lookup failure retains marker and runtime for safe retry', async () => {
+  for (const failure of ['persist', 'lookup']) await fixture(async (manager, store, _calls, info) => {
+    const marker = { nonce: 'operation-nonce', originalIncarnation: 'original-uuid' };
+    await store.upsert({ ...store.get(info.userId, info.id)!, incusRecreation: marker });
+    (manager as any).incusRuntime.rollbackRecreation = async () => {
+      if (failure === 'lookup') throw new Error('API unavailable');
+      return { status: 'archived' };
+    };
+    const transition = store.transitionIncusRecreation.bind(store);
+    if (failure === 'persist') store.transitionIncusRecreation = async () => { throw new Error('disk write failed'); };
+    await manager.reconcileIncusWorkers();
+    expect(store.get(info.userId, info.id)?.incusRecreation).toEqual(marker);
+    expect(manager.get(info.id)?.containerId).toBe('incus:original-uuid');
+    if (failure === 'persist') {
+      store.transitionIncusRecreation = transition;
+      await manager.reconcileIncusWorkers();
+      expect(store.get(info.userId, info.id)?.incusRecreation).toBeUndefined();
+      expect(store.get(info.userId, info.id)?.status).toBe('archived');
+    }
+  });
+});
+
+test('queued recreation rollback cannot clear a changed marker or resurrect deleted authority', async () => {
+  await fixture(async (_manager, store, _calls, info) => {
+    const original = { nonce: 'old-nonce', originalIncarnation: 'original-uuid' };
+    const change = { status: 'archived' as const, desiredRuntimeStatus: 'stopped' as const, incusRecreation: undefined };
+    await store.upsert({ ...store.get(info.userId, info.id)!, incusRecreation: original });
+    const changed = { ...original, nonce: 'new-nonce' };
+    const results = await Promise.allSettled([
+      store.upsert({ ...store.get(info.userId, info.id)!, incusRecreation: changed }),
+      store.transitionIncusRecreation(info.userId, info.id, change, undefined, original),
+    ]);
+    expect(results[1]!.status).toBe('rejected');
+    expect(store.get(info.userId, info.id)?.incusRecreation).toEqual(changed);
+    await store.delete(info.userId, info.id);
+    await expect(store.transitionIncusRecreation(info.userId, info.id, change, undefined, changed)).rejects.toThrow('authority');
+    expect(store.get(info.userId, info.id)).toBeUndefined();
+  });
+});
+
 test('healthy Incus reconciliation preserves VM/services and terminal lifecycle generation', async () => {
   await reconciliationFixture(async (manager, _store, calls, info) => {
     const generation = workerLifecycleGeneration(info.id);
@@ -334,7 +397,8 @@ test('Incus boot changes and repair failures defer convergence without stopping 
 });
 
 test('real production-manager archive retains canonical volumes, source and pending settings without Docker', async () => {
-  test.skip(process.env.INCUS_ARCHIVE_TEST !== 'true' && process.env.INCUS_RECREATION_TEST !== 'true' && process.env.INCUS_REBOOT_TEST !== 'true', 'Explicit disposable Incus lifecycle acceptance');
+  test.skip(process.env.INCUS_ARCHIVE_TEST !== 'true' && process.env.INCUS_RECREATION_TEST !== 'true' &&
+    process.env.INCUS_REBOOT_TEST !== 'true' && process.env.INCUS_RECREATION_RECOVERY_TEST !== 'true', 'Explicit disposable Incus lifecycle acceptance');
   test.setTimeout(900_000);
   const root = await mkdtemp(join(tmpdir(), 'agentor-incus-archive-live-'));
   const config = { dataDir: root, incusEnabled: true, incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor',
@@ -360,6 +424,46 @@ test('real production-manager archive retains canonical volumes, source and pend
     const created = await runtime.client.exec(info.containerName, ['sh', '-ec',
       'echo retained-workspace > /workspace/archive-fixture; echo retained-agents > /home/agent/.agent-data/archive-fixture']);
     expect(created.returnCode).toBe(0);
+    if (process.env.INCUS_RECREATION_RECOVERY_TEST === 'true') {
+      const originalUuid = info.containerId.slice(6);
+      const marker = { nonce: 'live-interrupted-recreation', originalIncarnation: originalUuid };
+      await store.upsert({ ...store.get(info.userId, info.id)!, incusRecreation: marker, pendingRebuild: true,
+        initScript: 'touch /workspace/pending-recovery-init' });
+      await manager.reconcileIncusWorkers();
+      expect((await runtime.client.getInstance(info.containerName)).config['volatile.uuid']).toBe(originalUuid);
+      expect((await runtime.client.getInstanceState(info.containerName)).status).toBe('Stopped');
+      expect(store.get(info.userId, info.id)).toMatchObject({ status: 'active', desiredRuntimeStatus: 'stopped', pendingRebuild: true });
+      expect(store.get(info.userId, info.id)?.incusRecreation).toBeUndefined();
+      // Simulate crash after original removal and a successful create whose
+      // response/UUID never reached the durable marker.
+      const options = await (manager as any).incusOptionsForWorker(manager.get(info.id), false);
+      const existing = await runtime.preflightRecreation(options);
+      await runtime.remove(info, originalUuid);
+      const replacement = await runtime.create({ ...options, start: false, recreationNonce: marker.nonce }, existing);
+      await store.upsert({ ...store.get(info.userId, info.id)!, incusRecreation: { ...marker, nonce: 'wrong-nonce' } });
+      await manager.reconcileIncusWorkers();
+      expect((await runtime.client.getInstance(info.containerName)).config['volatile.uuid']).toBe(replacement.config['volatile.uuid']);
+      expect(store.get(info.userId, info.id)?.incusRecreation?.nonce).toBe('wrong-nonce');
+      await store.upsert({ ...store.get(info.userId, info.id)!, incusRecreation: marker });
+      const reloadedStore = new WorkerStore(root); await reloadedStore.init();
+      const reloaded = new ContainerManager({ listContainers: async () => [] } as any, config);
+      reloaded.setWorkerStore(reloadedStore); reloaded.setIncusRuntime(runtime);
+      (reloaded as any).assertOwnerExists = async () => {};
+      await reloaded.sync(); await reloaded.reconcileIncusWorkers();
+      await expect(runtime.client.getInstance(info.containerName)).rejects.toMatchObject({ statusCode: 404 });
+      expect(reloadedStore.get(info.userId, info.id)).toMatchObject({ status: 'archived', desiredRuntimeStatus: 'stopped',
+        pendingRebuild: true, initScript: 'touch /workspace/pending-recovery-init' });
+      expect(reloadedStore.get(info.userId, info.id)?.incusRecreation).toBeUndefined();
+      // Simulate response loss after deletion: absent compute must converge
+      // only through the existing, identity-verified canonical storage/source.
+      await store.upsert({ ...reloadedStore.get(info.userId, info.id)!, incusRecreation: marker });
+      await manager.reconcileIncusWorkers();
+      expect(store.get(info.userId, info.id)?.incusRecreation).toBeUndefined();
+      expect(store.get(info.userId, info.id)?.pendingRebuild).toBe(true);
+      info = await manager.unarchive(info.userId, info.id);
+      expect((await runtime.client.exec(info.containerName, ['sh', '-ec',
+        'test "$(cat /workspace/archive-fixture)" = retained-workspace; test "$(cat /home/agent/.agent-data/archive-fixture)" = retained-agents'])).returnCode).toBe(0);
+    }
     if (process.env.INCUS_REBOOT_TEST === 'true') {
       const incarnation = info.containerId.slice(6);
       const original = await runtime.inspectGuestReadiness(info, incarnation);

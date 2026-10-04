@@ -4,6 +4,8 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
+Phase 8 lifecycle coverage in `api/incus-worker-lifecycle.spec.ts` now includes queued archive/recreation transitions, desired/applied revision preservation, guest reboot without automatic second reboot, diagnostic-only unknown probes, and interrupted-recreation rollback. Added rollback cases cover original/replacement/absent compute, nonce/owner/UUID quarantine and post-stop revalidation, failed lookup/persistence retries, changed/deleted markers, pending/revoked settings and a gated live manager reload/lost-response/data-retention flow. The live rollback gate uses `INCUS_RECREATION_RECOVERY_TEST=true`; only its exact newly-created fixtures are cleaned.
+
 The bounded Phase 8 observability slice adds `api/incus-worker-observability.spec.ts` (16 cases): native VM CPU/RAM/primary-NIC metrics, unavailable-agent guards, incarnation/counter-reset/out-of-order/stopped-state fences, bounded UTF8 journal reads, same-object owner changes, EOF reattachment and cancellation. **16/16 passed including live accepted-image guest diagnostics with missing `/run` and journal-follow process cleanup**. Latest full modules **320 passed / ten gated skips**, typecheck passed. This does not close the pending fresh-image/actual-dashboard Phase 7 gate or full Phase 8 lifecycle gate.
 
 Phase 7 integration adds `api/incus-worker-commands.spec.ts` (14 cases: legacy/default-runtime terminal compatibility, noisy multi-record app parsing and actionable late launch errors, literal environment precedence, native app logging with failed-sink drain, binary capture, installation/owner/incarnation/state/record authority, delayed-dispatch lifecycle fencing, shared plugin framing/size/stderr/no-fallback, and a gated real manager files/terminal/tmux/apps/plugin/isolated-desktop gate) and `api/incus-worker-experience.spec.ts` (one gated actual Dockerized Orchestrator terminal/files/apps/private UI and browser desktop acceptance). Expanded real-manager gate **10/10 passed (1.4m)** before the added logging case. Latest complete modules **302 passed / nine live-only skips**, subsequent commands **13 passed / one live skip**, typecheck passed; fresh-image/full-stack gate pending. The scoped disposable-stack replacement helper has seven passing safety/rollback unit tests and independent security review; live replacement remains pending.
@@ -14,7 +16,7 @@ Phase 6 adds `api/incus-worker-network.spec.ts` (17 cases: host lease/MAC/UUID a
 
 Incus migration coverage: `api/worker-runtime-kind.spec.ts` (6 cases), `api/incus-client.spec.ts` (15 cases, including disposable-host integration and default-project denial), `api/incus-derived-image.spec.ts` (one gated live boot/provisioning/service test), `api/incus-worker-runtime.spec.ts` (17 cases: ownership, provisioning, TLS, exact account grants, patched-daemon/image-generation/capability guards, missing-storage fail-closed, serialized SSH refresh, stale credential bind ordering and unsafe-source/busy-target rejection, plus real production-manager deletion retry/lifecycle and native Docker persistence), `api/incus-worker-storage.spec.ts` (6 core-volume ownership/type/attachment/reuse/deletion cases), `api/incus-account-sharing.spec.ts` (7 cases: nofollow/hardlink credential/reset protections, canonical writes, and gated same-account sharing acceptance), and `api/incus-private-storage.spec.ts` (one production-helper overlay-pruning/symlink test). Fresh rebuilt-image boot and native Docker restart/root-replacement/disable/re-enable gates passed; account sharing/reprovisioning and final manager lifecycle/deletion-retry gates also passed. Supported patched Incus (6.0 LTS >=6.0.5 or rolling >=6.10) preserves UID1000 on exact restricted exports without raw.idmap or lowlevel authority. After health-check rebase: 256 modules passed/four gated skipped (260 total), including main's running-worker observability regressions. Full API/UI acceptance remains required by Phase 13.
 
-- **2272 tests** across 230 test files (1641 API across 165 files + 631 UI across 65 files), as enumerated with the Playwright list reporter
+- **2327 tests** across 232 test files (1696 API across 167 files + 631 UI across 65 files), as enumerated with the Playwright list reporter
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -118,7 +120,7 @@ tests/
     worker-lifecycle.ts    # Container create/cleanup utilities
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
-    api/                     # API endpoint tests (1520 tests across 150 files)
+    api/                     # API endpoint tests (1696 tests across 167 files)
   ui/                      # UI interaction tests (631 tests across 65 files)
 ```
 

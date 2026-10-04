@@ -182,11 +182,16 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
    * store queue; a slow boot must never overwrite concurrently edited config. */
   async transitionIncusRecreation(userId: string, id: string,
     change: Pick<WorkerRecord, 'status' | 'desiredRuntimeStatus' | 'incusRecreation'>,
-    pendingAfterCompletion?: () => Promise<boolean>): Promise<WorkerRecord> {
+    pendingAfterCompletion?: () => Promise<boolean>,
+    expectedMarker?: NonNullable<WorkerRecord['incusRecreation']>): Promise<WorkerRecord> {
     return this.withUserMutation(userId, async () => {
       const map = this.items.get(userId), previous = map?.get(id);
       if (!map || !previous || previous.runtimeKind !== 'incus-vm' || previous.deletionPending)
         throw new Error('Incus recreation durable authority is unavailable');
+      if (expectedMarker && (previous.incusRecreation?.nonce !== expectedMarker.nonce ||
+          previous.incusRecreation.originalIncarnation !== expectedMarker.originalIncarnation ||
+          previous.incusRecreation.replacementIncarnation !== expectedMarker.replacementIncarnation))
+        throw new Error('Incus recreation recovery marker changed');
       const completion = pendingAfterCompletion ? { pendingRebuild: await pendingAfterCompletion(),
         hostMountsRevoked: false, hardwareDevicesRevoked: false } : {};
       const next = { ...previous, ...change, ...completion, updatedAt: new Date().toISOString() };
