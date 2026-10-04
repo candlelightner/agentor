@@ -3306,6 +3306,27 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    if (info.runtimeKind === 'incus-vm') {
+      if (!this.workerStore) throw new Error('WorkerStore is required before archiving Incus compute');
+      const record = this.workerStore.get(info.userId, info.id);
+      if (!record || record.status !== 'active' || record.runtimeKind !== 'incus-vm' || record.deletionPending)
+        throw new Error('Incus archive requires a matching active durable worker record');
+      await this.assertIncusPersistenceReady(info);
+      const incarnation = info.containerId.startsWith('incus:') ? info.containerId.slice(6) : '';
+      await this.incusRuntime.prepareArchive(info, incarnation);
+      await this.persistDesiredRuntimeStatus(info, 'stopped');
+      useLogCollector().detach(info.containerId);
+      await this.incusRuntime.remove(info, incarnation);
+      this.runtimeObservations.delete(info.containerId);
+      // Retain the proven UUID on persistence failure. A retry may observe no
+      // compute; it must not become authority over a new same-name instance.
+      info.status = 'error';
+      info.updatedAt = new Date().toISOString();
+      await this.workerStore.archive(info.userId, info.id);
+      this.containers.delete(id);
+      useLogger().info(`[container] archived ${info.containerName}`);
+      return;
+    }
     // A deferred persistence request must capture data before archive discards
     // the rootfs, just as an explicit rebuild does.
     await this.persistentBackupPathMounts(info, true);
@@ -3341,6 +3362,24 @@ for p in sys.argv[1:]:
 
     useLogger().info(`[container] archived ${info.containerName}`);
     this.containers.delete(id);
+  }
+
+  private async assertIncusPersistenceReady(info: Pick<ContainerInfo, 'id' | 'userId'>): Promise<void> {
+    const [{ useBackupManager }, { useManagedVolumeManager }] = await Promise.all([
+      import('./backup-manager'), import('./managed-volume-manager'),
+    ]);
+    const volumes = useManagedVolumeManager();
+    await volumes.init();
+    if (volumes.isRecoveryBlocked(info.id) || volumes.recreations.get(info.userId, info.id) ||
+        volumes.store.forWorker(info.userId, info.id).some((volume) => volume.attached || volume.liveContainerId))
+      throw new Error('Incus managed persistent storage must be integrated/recovered before replacing compute');
+    const backup = await useBackupManager().getConfig(info.userId);
+    const { normalizeBackupPaths } = await import('./backup-paths');
+    const selected = normalizeBackupPaths(backup?.persistSelectedDirectories === false ? [] : backup?.selectedPathsByWorkspace?.[info.id] ?? []);
+    // Do not infer persistent backing through guest-controlled symlinks while
+    // selected-directory/managed-volume integration is still pending.
+    if (selected.some((path) => !['/workspace', '/home/agent/.agent-data'].includes(path)))
+      throw new Error('Incus selected-directory persistence must be applied before replacing compute');
   }
 
   async rebuild(id: string): Promise<ContainerInfo> {

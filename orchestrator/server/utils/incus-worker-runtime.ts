@@ -261,6 +261,21 @@ export class IncusWorkerRuntime {
     await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
   }
 
+  async prepareArchive(owner: IncusStorageOwner, incarnation: string): Promise<void> {
+    if (!incarnation) throw new Error('Incus archive requires a verified runtime incarnation');
+    try { await this.preserveRecreationSource(owner, incarnation); }
+    catch (error) {
+      if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+      // A previous removal may have succeeded before archive persistence.
+      // Retry only when canonical storage and already-recorded source survive;
+      // absence of compute is never permission to allocate empty data.
+      const storage = await this.storage();
+      if (!await storage.imageIdentity(owner))
+        throw new Error('Incus archived image source is missing; explicit recovery is required');
+      await storage.verifyExisting(owner);
+    }
+  }
+
   private async resolveImage(fingerprint?: string): Promise<string> {
     if (!fingerprint) {
       const alias = await this.client.getImageAlias(this.config.incusWorkerImage);

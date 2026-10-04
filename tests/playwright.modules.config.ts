@@ -7,7 +7,7 @@ import { join } from "node:path";
 // Scope its service singletons before worker modules are imported; never use a
 // developer's /data merely because no installation stack is running.
 if ((process.env.INCUS_LIVE_TEST === "true" || process.env.INCUS_COMMAND_TEST === "true" ||
-    process.env.INCUS_OBSERVABILITY_TEST === "true") && !process.env.DATA_DIR) {
+    process.env.INCUS_OBSERVABILITY_TEST === "true" || process.env.INCUS_ARCHIVE_TEST === 'true') && !process.env.DATA_DIR) {
   const fixtureData = mkdtempSync(join(tmpdir(), "agentor-incus-acceptance-"));
   process.env.DATA_DIR = fixtureData;
   process.once("exit", () => rmSync(fixtureData, { recursive: true, force: true }));
@@ -45,6 +45,7 @@ export default defineConfig({
     "api/incus-worker-experience.spec.ts",
     "api/incus-derived-image.spec.ts",
     "api/incus-worker-runtime.spec.ts",
+    "api/incus-worker-lifecycle.spec.ts",
     "api/incus-applied-bootstrap.spec.ts",
     "api/incus-worker-observability.spec.ts",
     "api/incus-worker-network.spec.ts",

@@ -373,6 +373,26 @@ test('older owned compute captures original image before removal, with strict in
   expect(events.some((e) => ['stop', 'remove', 'create', 'start', 'file', 'exec'].includes(e.operation))).toBe(false);
 });
 
+test('archive retries missing compute only through known canonical source/data and never creates replacement volumes', async () => {
+  for (const missingDocker of [false, true]) {
+    const { client, events } = fakeClient();
+    const runtime = new IncusWorkerRuntime(config, client as any);
+    const opts = options(); opts.environmentJson.dockerEnabled = opts.dockerEnabled = true;
+    await runtime.create({ ...opts, start: false });
+    client.getInstance = async () => { throw Object.assign(new Error('compute already removed'), { statusCode: 404 }); };
+    const getVolume = client.getCustomVolume;
+    client.getCustomVolume = async (pool, name) => {
+      if (missingDocker && name.endsWith('-docker')) throw Object.assign(new Error('data missing'), { statusCode: 404 });
+      return getVolume(pool, name);
+    };
+    events.length = 0;
+    if (missingDocker) await expect(runtime.prepareArchive(opts, 'original-uuid')).rejects.toThrow('Existing Incus docker volume is missing');
+    else await runtime.prepareArchive(opts, 'original-uuid');
+    expect(events.some((e) => ['volume-create', 'volume-update', 'create', 'stop', 'remove', 'start'].includes(e.operation))).toBe(false);
+    await expect(runtime.prepareArchive(opts, '')).rejects.toThrow('verified runtime incarnation');
+  }
+});
+
 test('immutable image identity validates complete pinned conversion metadata', async () => {
   const { client } = fakeClient();
   const original = incusImageIdentity(await client.getImage('a'.repeat(64)) as any);
