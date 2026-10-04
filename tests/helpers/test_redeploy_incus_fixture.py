@@ -12,8 +12,9 @@ from unittest.mock import patch
 class RedeployFixtureTest(unittest.TestCase):
     def setUp(self):
         parent = "/var/tmp/agentor-phase6-production.SSkg3hQz"
-        self.old = {"Id": "old-fixture-id", "Config": {"Env": ["TEST_SECRET=fixture-only", "INCUS_WORKER_IMAGE=old"]},
+        self.old = {"Id": "old-fixture-id", "Config": {"Env": ["TEST_SECRET=fixture-only", "INCUS_WORKER_IMAGE=old", "INCUS_ENDPOINT=https://agentor-kata-preflight:8443"]},
                     "HostConfig": {"Binds": [parent + "/stack-data:/data", parent + "/tls:/tls:ro", "/var/run/docker.sock:/var/run/docker.sock"],
+                                   "ExtraHosts": ["agentor-kata-preflight:host-gateway"],
                                    "PortBindings": {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "38000"}, {"HostIp": "10.159.68.1", "HostPort": "38000"}]}},
                     "NetworkSettings": {"Networks": {"agentor-phase6-net": {"IPAddress": "172.22.0.2"}, "agentor-management": {"IPAddress": "172.20.0.2"}}}}
         self.calls = []
@@ -38,6 +39,7 @@ class RedeployFixtureTest(unittest.TestCase):
                 self.assertIn("TEST_SECRET=fixture-only", Path(self.envfile).read_text())
                 self.assertIn("INCUS_WORKER_IMAGE=agentor-worker-phase7-candidate", Path(self.envfile).read_text())
                 self.assertNotIn("TEST_SECRET=fixture-only", argv)
+                self.assertEqual(argv[argv.index("--add-host") + 1], "agentor-kata-preflight:host-gateway")
                 if self.ambiguous_create:
                     raise RuntimeError("lost create response")
                 return "new-fixture-id"
@@ -105,6 +107,26 @@ class RedeployFixtureTest(unittest.TestCase):
             self.execute()
         self.assertIn(["rm", "-f", "new-fixture-id"], self.calls)
         self.assertEqual(self.calls[-1], ["start", "old-fixture-id"])
+
+    def test_missing_host_mapping_repairs_only_helper_owned_fixture(self):
+        self.old["HostConfig"]["ExtraHosts"] = None
+        with self.assertRaises(SystemExit):
+            self.execute()
+        self.assertFalse(any(call[0] == "stop" for call in self.calls))
+        self.old["Config"]["Labels"] = {"agentor.incus.acceptance": "true"}
+        self.execute()
+        self.assertIn(["start", "new-fixture-id"], self.calls)
+
+    def test_other_hostname_mapping_or_endpoint_fails_before_mutation(self):
+        self.old["HostConfig"]["ExtraHosts"] = ["agentor-kata-preflight:192.0.2.1"]
+        with self.assertRaises(SystemExit):
+            self.execute()
+        self.assertFalse(any(call[0] == "stop" for call in self.calls))
+        self.old["HostConfig"]["ExtraHosts"] = ["agentor-kata-preflight:host-gateway"]
+        self.old["Config"]["Env"] = ["INCUS_ENDPOINT=https://elsewhere:8443"]
+        with self.assertRaises(SystemExit):
+            self.execute()
+        self.assertFalse(any(call[0] == "stop" for call in self.calls))
 
 
 if __name__ == "__main__":

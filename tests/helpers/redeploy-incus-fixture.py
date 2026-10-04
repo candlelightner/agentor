@@ -53,6 +53,14 @@ if any(networks[name].get("IPAddress") != address for name, address in
 ports = host["PortBindings"]
 if ports != {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "38000"}, {"HostIp": "10.159.68.1", "HostPort": "38000"}]}:
     raise SystemExit("Unexpected fixture listener scope")
+incus_hosts = ["agentor-kata-preflight:host-gateway"]
+if "INCUS_ENDPOINT=https://agentor-kata-preflight:8443" not in cfg["Env"]:
+    raise SystemExit("Unexpected fixture Incus endpoint")
+if (host.get("ExtraHosts") or []) != incus_hosts:
+    # Repair only our own earlier helper replacement, which omitted the
+    # original Incus hostname mapping. Never widen an unrelated source.
+    if host.get("ExtraHosts") or (cfg.get("Labels") or {}).get("agentor.incus.acceptance") != "true":
+        raise SystemExit("Unexpected fixture Incus hostname mapping")
 if docker("ps", "-a", "--filter", "name=^/" + args.retain_as + "$", "--format", "{{.ID}}"):
     raise SystemExit("Retained name already exists; never overwrite recovery")
 docker("image", "inspect", args.image)  # Preflight before stopping anything.
@@ -79,6 +87,8 @@ with tempfile.NamedTemporaryFile(mode="w", prefix="agentor-fixture-env-") as env
                    "--ip", networks["agentor-phase6-net"]["IPAddress"], "--env-file", env.name,
                    "--label", "agentor.incus.acceptance=true",
                    "--label", "agentor.incus.acceptance.attempt=" + attempt]
+        for entry in incus_hosts:
+            command += ["--add-host", entry]
         for bind in binds:
             command += ["-v", bind]
         for binding in ports["3000/tcp"]:
