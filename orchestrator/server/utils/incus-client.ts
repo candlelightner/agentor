@@ -624,7 +624,12 @@ export class IncusClient {
     return this.request<IncusNetworkLease[]>('GET', `/1.0/networks/${encodeURIComponent(name)}/leases`);
   }
 
-  async updateInstanceDevices(name: string, devices: Record<string, IncusDevice>): Promise<void> {
+  /** A live storage caller can persist the accepted operation before waiting.
+   * A failed observer is NOT cancellation: the daemon may still complete it.
+   * Never retry this mutation implicitly or start writers on an unknown result.
+   * Synchronous success reports undefined (there is no outstanding operation). */
+  async updateInstanceDevices(name: string, devices: Record<string, IncusDevice>,
+    onAccepted?: (operationPath: string | undefined) => Promise<void>): Promise<void> {
     const current = await this.getInstance(name);
     const raw = await this.rawRequest('PUT', `/1.0/instances/${encodeURIComponent(name)}`, {
       config: current.config, profiles: current.profiles, description: current.description, devices,
@@ -632,7 +637,16 @@ export class IncusClient {
     const json = JSON.parse(raw.body.toString('utf-8')) as IncusResponse<any>;
     if (json.type === 'error' || raw.statusCode >= 400)
       throw new IncusError(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code);
-    if (json.type === 'async' && json.operation) await this.waitForOperation(json.operation);
+    if (json.type === 'async') {
+      if (!json.operation) throw new IncusError('Incus accepted device update without an operation identity');
+      const operation = this.buildUrl(json.operation);
+      if (!/^\/1\.0\/operations\/[a-zA-Z0-9-]+$/.test(operation.pathname) ||
+          operation.searchParams.get('project') !== this.project)
+        throw new IncusError('Incus device operation must belong to the configured project');
+      await onAccepted?.(operation.pathname);
+      await this.waitForOperation(operation.pathname);
+    } else if (json.type === 'sync') await onAccepted?.(undefined);
+    else throw new IncusError('Incus device update did not return an authoritative result');
   }
 
   /** Guest-agent reports are diagnostic only. Guest root can falsify them;

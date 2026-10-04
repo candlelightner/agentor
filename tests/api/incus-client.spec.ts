@@ -480,6 +480,56 @@ test.describe("IncusClient mock server protocol tests", () => {
     await expect(client.createInstance({ name: "worker", source: { type: "none" } })).rejects.toThrow("Observation unavailable");
     expect(posts).toBe(2); // One mutation per distinct caller, no hidden resend.
   });
+
+  test('device updates persist accepted operation before waiting, never resend or treat observation failure as cancellation', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    client.getInstance = async () => ({ config: {}, profiles: [], devices: {} }) as any;
+    let puts = 0;
+    const order: string[] = [];
+    client.rawRequest = async (method, path) => {
+      expect([method, path]).toEqual(['PUT', '/1.0/instances/worker']); puts++;
+      return { statusCode: 202, headers: {}, body: Buffer.from(JSON.stringify({ type: 'async',
+        operation: 'https://mock.invalid/1.0/operations/device-cutover?project=agentor' })) };
+    };
+    client.waitForOperation = async (operation) => { order.push(`wait:${operation}`); return { status: 'Success' } as any; };
+    await client.updateInstanceDevices('worker', {}, async operation => { order.push(`persist:${operation}`); });
+    expect(order).toEqual(['persist:/1.0/operations/device-cutover', 'wait:/1.0/operations/device-cutover']);
+    expect(puts).toBe(1);
+    order.length = 0;
+    await expect(client.updateInstanceDevices('worker', {}, async operation => {
+      order.push(`persist:${operation}`); throw new Error('Durable intent write failed');
+    })).rejects.toThrow('Durable intent write failed');
+    expect(order).toEqual(['persist:/1.0/operations/device-cutover']);
+    expect(puts).toBe(2);
+    client.waitForOperation = async () => { throw new Error('Operation observation lost'); };
+    let recoveryOperation: string | undefined;
+    await expect(client.updateInstanceDevices('worker', {}, async operation => { recoveryOperation = operation; }))
+      .rejects.toThrow('Operation observation lost');
+    expect(recoveryOperation).toBe('/1.0/operations/device-cutover');
+    expect(puts).toBe(3);
+  });
+
+  test('device operation acceptance rejects missing, foreign or malformed authority and distinguishes synchronous completion', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    client.getInstance = async () => ({ config: {}, profiles: [], devices: {} }) as any;
+    let response: any;
+    let accepted = 0, waits = 0;
+    client.rawRequest = async () => ({ statusCode: 202, headers: {}, body: Buffer.from(JSON.stringify(response)) });
+    client.waitForOperation = async () => { waits++; return { status: 'Success' } as any; };
+    for (const operation of [undefined, '/1.0/operations/cutover?project=other',
+      'https://foreign.invalid/1.0/operations/cutover', '/1.0/instances/worker']) {
+      response = { type: 'async', operation };
+      await expect(client.updateInstanceDevices('worker', {}, async () => { accepted++; })).rejects.toThrow(/operation|configured server/);
+    }
+    response = { type: 'unknown' };
+    await expect(client.updateInstanceDevices('worker', {}, async () => { accepted++; })).rejects.toThrow('authoritative result');
+    expect([accepted, waits]).toEqual([0, 0]);
+    response = { type: 'sync', status_code: 200 };
+    let completion: unknown = 'not-called';
+    await client.updateInstanceDevices('worker', {}, async operation => { completion = operation; accepted++; });
+    expect(completion).toBeUndefined();
+    expect([accepted, waits]).toEqual([1, 0]);
+  });
 });
 
 test.describe("IncusClient live disposable integration tests", () => {

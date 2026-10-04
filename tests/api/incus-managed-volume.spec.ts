@@ -364,6 +364,126 @@ while True:
   }
 });
 
+test('real Incus direct canonical hotplug copies pinned rootfs and contains failed cutover without thaw', async () => {
+  test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable pinned-directory capability probe');
+  test.setTimeout(300_000);
+  const { config, manager, store, volumes, runtime } = await productionManagerFixture();
+  let info: any, v: any, failed = false;
+  const target = '/opt/pinned-source-probe';
+  const exec = async (command: string[]) => {
+    const result = await runtime.client.exec(info.containerName, command);
+    expect(result.returnCode, result.stdout + result.stderr).toBe(0);
+    return result.stdout.trim();
+  };
+  try {
+    info = await (manager as any).createForOwner({ userId: 'managed-live-owner', displayName: 'pinned rootfs probe' });
+    const incarnation = info.containerId.slice(6), managed = new IncusManagedVolumeRuntime(config, runtime);
+    const before = await runtime.inspectGuestReadiness(info, incarnation);
+    const pid = await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'agentor-worker']);
+    const agentPid = await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'incus-agent']);
+    const agentGroup = await exec(['cat', `/proc/${agentPid}/cgroup`]);
+    await exec(['python3', '-c', String.raw`
+import os,pathlib,sys
+p=pathlib.Path(sys.argv[1]);p.mkdir();(p/'sentinel').write_bytes(bytes([0,255,10,128]))
+os.chown(p/'sentinel',1000,1000);os.chmod(p/'sentinel',0o640)
+os.setxattr(p/'sentinel','user.agentor-pinned',b'preserved')
+os.utime(p/'sentinel',ns=(1700000000000000000,1700000000123456789))
+os.link(p/'sentinel',p/'hardlink');os.symlink('sentinel',p/'symlink')
+`, target]);
+    v = await volumes.store.create(info.userId, info.id, target, undefined, 'incus-vm');
+    await managed.ensureVolume(v);
+    const key = managed.deviceKey(v);
+    await runtime.client.pushFile(info.containerName, '/run/agentor/freezer-probe.py',
+      await readFile(new URL('../helpers/incus-live-freezer-probe.py', import.meta.url)), { mode: 0o600 });
+    await exec(['bash', '-ec', 'nohup python3 /run/agentor/freezer-probe.py "$1" 45 "$2" >/run/agentor/freezer-probe.log 2>&1 </dev/null &', 'freeze', agentPid, target]);
+    await exec(['timeout', '10', 'bash', '-ec', 'until test -f /run/agentor/freezer-probe/armed; do sleep .1; done']);
+    await exec(['touch', '/run/agentor/freezer-probe/begin']);
+    await exec(['timeout', '10', 'bash', '-ec', 'until test -f /run/agentor/freezer-probe/source-pinned; do sleep .1; done']);
+    const instance = await managed.inspect(v.userId, v.workerId, info.containerId);
+    let accepted = false, acceptedOperation: string | undefined;
+    await runtime.client.updateInstanceDevices(info.containerName, { ...instance.devices, [key]: managed.device(v) }, async operation => {
+      accepted = true; acceptedOperation = operation;
+    });
+    expect(accepted).toBe(true);
+    if (acceptedOperation) expect(acceptedOperation).toMatch(/^\/1\.0\/operations\/[a-f0-9-]{36}$/);
+    console.info('Direct mount accepted operation:', acceptedOperation ?? 'synchronous completion');
+    await exec(['timeout', '10', 'bash', '-ec', 'until mountpoint -q -- "$1"; do sleep .1; done; test -z "$(ls -A "$1")"', 'mount', target]);
+    await exec(['touch', '/run/agentor/freezer-probe/copy']);
+    await exec(['timeout', '15', 'bash', '-ec', 'until test -f /run/agentor/freezer-probe/copied; do sleep .1; done; test ! -e /run/agentor/freezer-probe/thawed']);
+    const verify = String.raw`
+import os,pathlib,sys
+p=pathlib.Path(sys.argv[1]);a=p/'sentinel'
+assert a.read_bytes()==bytes([0,255,10,128])
+assert os.stat(a).st_ino==os.stat(p/'hardlink').st_ino
+assert os.readlink(p/'symlink')=='sentinel'
+assert os.stat(a).st_uid==1000 and os.stat(a).st_gid==1000
+assert os.stat(a).st_mode & 0o777 == 0o640
+assert os.getxattr(a,'user.agentor-pinned')==b'preserved'
+assert os.stat(a).st_mtime_ns==1700000000123456789
+`;
+    await exec(['python3', '-c', verify, target]);
+    // Probe records no authority. A production path must persist seeded state
+    // before release and retain an ambiguity record on every lost response.
+    await exec(['touch', '/run/agentor/freezer-probe/release']);
+    await exec(['timeout', '10', 'bash', '-ec', 'until test -f /run/agentor/freezer-probe/restored; do sleep .1; done']);
+    expect(await exec(['cat', `/proc/${agentPid}/cgroup`])).toBe(agentGroup);
+    expect((await runtime.inspectGuestReadiness(info, incarnation)).bootId).toBe(before.bootId);
+    expect(await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'agentor-worker'])).toBe(pid);
+    await exec(['bash', '-ec', 'mkdir /run/agentor/pinned-original-root; mount --bind / /run/agentor/pinned-original-root']);
+    await exec(['python3', '-c', verify, `/run/agentor/pinned-original-root${target}`]);
+    console.info('Direct canonical hotplug: pinned rootfs source stays readable; original and metadata retained; same boot/service PID; one attachment.');
+    // Start a second, exact-owned TEST-ONLY freeze to prove failure containment.
+    // The first controller/watchdog must have exited and restored the agent.
+    await exec(['timeout', '10', 'bash', '-ec',
+      'until rmdir /sys/fs/cgroup/agentor-freezer-probe 2>/dev/null; do sleep .1; done; test -f /run/agentor/freezer-probe/restored; rm -r -- /run/agentor/freezer-probe']);
+    await exec(['bash', '-ec', 'nohup python3 /run/agentor/freezer-probe.py "$1" 15 "" poweroff >/run/agentor/freezer-poweroff.log 2>&1 </dev/null &', 'freeze', agentPid]);
+    await exec(['timeout', '10', 'bash', '-ec', 'until test -f /run/agentor/freezer-probe/armed; do sleep .1; done']);
+    await exec(['touch', '/run/agentor/freezer-probe/begin']);
+    await exec(['timeout', '10', 'bash', '-ec', 'until test -f /run/agentor/freezer-probe/frozen; do sleep .1; done']);
+    await exec(['bash', '-ec', 'kill -KILL "$(cat /run/agentor/freezer-probe/controller)"; test ! -e /run/agentor/freezer-probe/thawed']);
+    await expect.poll(async () => (await runtime.client.getInstanceState(info.containerName)).status,
+      { timeout: 45_000, intervals: [500, 1000] }).toBe('Stopped');
+    expect(managed.matchesDevice((await managed.inspect(v.userId, v.workerId, info.containerId)).devices[key], v)).toBe(true);
+    expect((await managed.inspectVolume(v))?.used_by).toHaveLength(1);
+    console.info('Independent watchdog contained killed controller by sync + guest kernel poweroff, without thawing uncertain writers.');
+    // Verify actual retained data after cold containment. This diagnostic boot
+    // is deliberately unprovisioned, never a production authority decision.
+    await runtime.client.startInstance(info.containerName);
+    await expect.poll(async () => {
+      try { return (await runtime.client.exec(info.containerName, ['true'])).returnCode; } catch { return -1; }
+    }, { timeout: 120_000, intervals: [500, 1000] }).toBe(0);
+    await exec(['bash', '-ec', 'test ! -e /run/agentor/provisioned; ! systemctl is-active --quiet agentor-worker; ! systemctl is-active --quiet docker']);
+    await exec(['python3', '-c', verify, target]);
+    await exec(['bash', '-ec', 'mkdir -p /run/agentor/pinned-original-root; mount --bind / /run/agentor/pinned-original-root']);
+    await exec(['python3', '-c', verify, `/run/agentor/pinned-original-root${target}`]);
+    console.info('Unprovisioned cold-recovery boot verified both original rootfs source and canonical volume metadata/data; worker/Docker stayed inactive.');
+  } catch (error) {
+    failed = true;
+    if (info) try { console.error('Pinned source diagnostic:', await runtime.client.exec(info.containerName, ['bash', '-ec',
+      'cat /run/agentor/freezer-probe.log; ls -l /run/agentor/freezer-probe'])); } catch { /* fixture cleanup below */ }
+    throw error;
+  } finally {
+    if (info) {
+      try {
+        const instance = await runtime.client.getInstance(info.containerName);
+        expect(await runtime.matchesWorkerIdentity(instance, info.id, info.userId)).toBe(true);
+        if (failed && (await runtime.client.getInstanceState(info.containerName)).status !== 'Stopped') {
+          // Failed cold-stop capability must never strand this frozen fixture
+          // while graceful stop waits on frozen PID1. Ownership proven above.
+          await runtime.client.stopInstance(info.containerName, { force: true });
+        }
+        await runtime.remove(info, instance.config['volatile.uuid']);
+        if (v) { await volumes.incusRuntime.delete(v); await volumes.store.forget(v.userId, v.id); }
+        await runtime.removeStorage(info);
+        if (store.get(info.userId, info.id)) await store.delete(info.userId, info.id);
+      } catch (error) {
+        console.error('Preserving exact pinned-source fixture', info.containerName, v?.id, error);
+        if (!failed) throw error;
+      }
+    }
+  }
+});
+
 test('real production backup selections hotplug without restart and refresh root data before storage recreation', async () => {
   test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable production selection gate');
   test.setTimeout(900_000);
