@@ -100,16 +100,23 @@ wait_for_port() {
 # clean shell + init script only after everything is fully ready.
 # ==========================================================================
 WINDOW_NAME="main"
+# Main belongs to the original provisioned account socket. Environment/local
+# TMUX_TMPDIR overrides still reach apps and panes, not bootstrap tmux clients.
+readonly _agentor_bootstrap_tmux_tmpdir="${TMUX_TMPDIR:-/tmp}"
+readonly _agentor_bootstrap_tmux="${TMUX-}"
+agentor_tmux() {
+    TMUX="$_agentor_bootstrap_tmux" TMUX_TMPDIR="$_agentor_bootstrap_tmux_tmpdir" command tmux "$@"
+}
 _boot
 _total 10
-tmux new-session -d -s main -n "$WINDOW_NAME" -c /workspace \
+agentor_tmux new-session -d -s main -n "$WINDOW_NAME" -c /workspace \
     "bash /home/agent/loading-screen.sh"
-tmux set -g mouse on
-tmux set -g status off
-tmux set -g extended-keys on
-tmux set -s terminal-features 'xterm*:extkeys'
-tmux bind-key -n S-Enter send-keys Escape '[13;2u'
-tmux set-option -w -t "main:$WINDOW_NAME" automatic-rename off
+agentor_tmux set -g mouse on
+agentor_tmux set -g status off
+agentor_tmux set -g extended-keys on
+agentor_tmux set -s terminal-features 'xterm*:extkeys'
+agentor_tmux bind-key -n S-Enter send-keys Escape '[13;2u'
+agentor_tmux set-option -w -t "main:$WINDOW_NAME" automatic-rename off
 _log "Tmux: ready"
 
 # ==========================================================================
@@ -296,9 +303,9 @@ expose_flag() {
 export EXPOSE_PORT_MAPPINGS=$(expose_flag portMappings)
 export EXPOSE_DOMAIN_MAPPINGS=$(expose_flag domainMappings)
 export EXPOSE_USAGE=$(expose_flag usage)
-tmux set-environment -g EXPOSE_PORT_MAPPINGS "$EXPOSE_PORT_MAPPINGS"
-tmux set-environment -g EXPOSE_DOMAIN_MAPPINGS "$EXPOSE_DOMAIN_MAPPINGS"
-tmux set-environment -g EXPOSE_USAGE "$EXPOSE_USAGE"
+agentor_tmux set-environment -g EXPOSE_PORT_MAPPINGS "$EXPOSE_PORT_MAPPINGS"
+agentor_tmux set-environment -g EXPOSE_DOMAIN_MAPPINGS "$EXPOSE_DOMAIN_MAPPINGS"
+agentor_tmux set-environment -g EXPOSE_USAGE "$EXPOSE_USAGE"
 
 # Export custom env vars from ENVIRONMENT.envVars
 ENV_VARS=$(echo "$ENVIRONMENT" | jq -r '.envVars // ""')
@@ -308,7 +315,7 @@ while IFS= read -r line; do
     case "${trimmed%%=*}" in
         AGENTOR_RUNTIME_ROLE|AGENTOR_TRUSTED_RUNTIME_ROLE) continue ;;
     esac
-    [[ "$trimmed" == *=* ]] && export "$trimmed" && tmux set-environment -g "${trimmed%%=*}" "${trimmed#*=}"
+    [[ "$trimmed" == *=* ]] && export "$trimmed" && agentor_tmux set-environment -g "${trimmed%%=*}" "${trimmed#*=}"
 done <<< "$ENV_VARS"
 
 # Worker-local values are baked into the container only on create/rebuild and
@@ -323,7 +330,7 @@ if [[ -n "${WORKER_LOCAL_ENV:-}" ]]; then
             AGENTOR_RUNTIME_ROLE|AGENTOR_TRUSTED_RUNTIME_ROLE) continue ;;
         esac
         export "$key=$value"
-        tmux set-environment -g "$key" "$value"
+        agentor_tmux set-environment -g "$key" "$value"
     done < <(printf '%s' "$WORKER_LOCAL_ENV" | base64 -d | jq -r '.[] | @base64')
 fi
 
@@ -390,7 +397,7 @@ if [[ "${AGENTOR_ADMIN_WORKSPACE:-}" == "1" ]]; then
 command = "/usr/local/bin/agentor-management-mcp"
 EOF
     fi
-    tmux set-environment -g AGENTOR_MANAGEMENT_MCP_URL \
+    agentor_tmux set-environment -g AGENTOR_MANAGEMENT_MCP_URL \
       "${AGENTOR_MANAGEMENT_MCP_URL:-http://agentor-orchestrator:3099/mcp}"
 fi
 
@@ -708,12 +715,12 @@ _ready
 sleep 0.6
 
 # Configure pane persistence — respawn a clean shell on exit (never re-run init script)
-tmux set-option -w -t "main:$WINDOW_NAME" remain-on-exit on
-tmux set-hook -t main pane-died \
+agentor_tmux set-option -w -t "main:$WINDOW_NAME" remain-on-exit on
+agentor_tmux set-hook -t main pane-died \
     "if-shell -F '#{==:#{window_name},main}' 'respawn-pane -k -c /workspace bash'"
 
 # Replace loading screen with init.sh (runs init script or falls back to bash)
-tmux respawn-pane -k -t "main:$WINDOW_NAME" -c /workspace "bash /home/agent/init.sh"
+agentor_tmux respawn-pane -k -t "main:$WINDOW_NAME" -c /workspace "bash /home/agent/init.sh"
 
 _log "Startup complete"
 

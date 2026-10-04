@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
-import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { execFileSync, spawnSync, spawn } from 'node:child_process';
+import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
@@ -15,6 +15,7 @@ import type { Config } from '../../orchestrator/server/utils/config';
 import { withOwnerWorkerLifecycleMutation, withOwnerWorkerRuntimeSetup } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
 import { DockerPluginWorkerExecutor } from '../../orchestrator/server/utils/plugin-runtime-manager';
 import { Duplex } from 'node:stream';
+import { EventEmitter } from 'node:events';
 import { parseAppInstances, assertAppManageOk } from '../../orchestrator/server/utils/apps';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
@@ -69,7 +70,7 @@ test('shared app errors retain legacy actionable errors rather than accepting fa
 
 test('exec wrapper applies existing precedence and literal values without shell evaluation', () => {
   const value = "quotes'\"\n$(not-executed)=literal";
-  const output = execFileSync('python3', ['-c', INCUS_EXEC_ENV_SCRIPT, 'python3', '-c', 'import os,json; print(json.dumps(dict(os.environ)))'], {
+  const output = execFileSync('python3', ['-c', INCUS_EXEC_ENV_SCRIPT, 'worker', 'python3', '-c', 'import os,json; print(json.dumps(dict(os.environ)))'], {
     env: { PATH: process.env.PATH, SHARED: 'account', ACCOUNT: 'account',
       ENVIRONMENT: JSON.stringify({ envVars: 'SHARED=environment\nENV_ONLY=environment\nAGENTOR_RUNTIME_ROLE=platform-admin', dockerEnabled: true, exposeApis: { usage: false } }),
       WORKER_LOCAL_ENV: Buffer.from(JSON.stringify([{ key: 'SHARED', value }, { key: 'AGENTOR_TRUSTED_RUNTIME_ROLE', value: 'platform-admin' }])).toString('base64') },
@@ -79,6 +80,69 @@ test('exec wrapper applies existing precedence and literal values without shell 
     AGENTOR_RUNTIME_ROLE: 'worker', AGENTOR_TRUSTED_RUNTIME_ROLE: 'worker', EXPOSE_USAGE: 'false', EXPOSE_PORT_MAPPINGS: 'true' });
   expect(incusWorkerCommand(['printf', value]).at(-1)).toBe(value);
   expect(incusWorkerCommand(['printf', value])[2]).not.toContain(value);
+});
+
+for (const account of [undefined, '', '/var/tmp'] as const) {
+  test(`managed tmux retains account socket selectors (${account ?? 'unset'}) without changing app precedence`, () => {
+    const supplied = { PATH: process.env.PATH,
+      ...(account === undefined ? {} : { TMUX_TMPDIR: account, TMUX: `${account}/account-socket,123,0` }),
+      ENVIRONMENT: JSON.stringify({ envVars: 'TMUX_TMPDIR=/environment\nTMUX=/environment/socket,456,0\nSHARED=environment' }),
+      WORKER_LOCAL_ENV: Buffer.from(JSON.stringify([{ key: 'TMUX_TMPDIR', value: '/local' },
+        { key: 'TMUX', value: '/local/socket,789,0' }, { key: 'SHARED', value: 'local' }])).toString('base64'),
+    };
+    for (const managed of [false, true]) {
+      const command = incusWorkerCommand(['python3', '-c', 'import os,json; print(json.dumps(dict(os.environ)))'], managed);
+      const env = JSON.parse(execFileSync('python3', ['-c', ...command.slice(4)], { env: supplied }).toString());
+      expect(env.SHARED).toBe('local');
+      expect(env.TMUX_TMPDIR).toBe(managed ? account : '/local');
+      expect(env.TMUX).toBe(managed ? supplied.TMUX : '/local/socket,789,0');
+    }
+  });
+}
+
+test('entrypoint tmux helper preserves original selectors after later exports', async () => {
+  const entrypoint = await readFile('../worker/entrypoint.sh', 'utf8');
+  const helper = entrypoint.slice(entrypoint.indexOf('readonly _agentor_bootstrap_tmux_tmpdir='), entrypoint.indexOf('\n_boot\n_total'));
+  for (const account of [undefined, '', '/var/tmp']) {
+    const result = spawnSync('bash', ['-ec', `${helper}
+# Intercept the command builtin to inspect exactly the helper's client env.
+command() { [ "$1" = tmux ]; printf '%s|%s' "$TMUX_TMPDIR" "$TMUX"; }
+export TMUX_TMPDIR=/local TMUX=/local/socket,999,0
+agentor_tmux has-session -t '=main'
+`], { env: { PATH: process.env.PATH, ...(account === undefined ? {} : { TMUX_TMPDIR: account, TMUX: '/account/socket,123,0' }) }, encoding: 'utf8' });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe(`${account || '/tmp'}|${account === undefined ? '' : '/account/socket,123,0'}`);
+  }
+  // No unpinned bootstrap invocation can slip back in after the override phase.
+  expect(entrypoint).not.toMatch(/^tmux\s/m);
+  expect(entrypoint).not.toContain('&& tmux ');
+});
+
+test('managed tmux dispatch and disconnect cleanup use bootstrap mode with existing authority fences', async () => {
+  const calls: string[][] = [];
+  let allow = true, closed = 0;
+  const socket = Object.assign(new EventEmitter(), { readyState: 1, _socket: undefined,
+    send(_bytes: unknown, callback?: () => void) { callback?.(); },
+    close() { this.readyState = 3; this.emit('close'); }, terminate() { this.close(); } });
+  const commands = new IncusWorkerCommands({
+    execStream: async (_name: string, command: string[]) => { calls.push(command); return fakeSession(); },
+    execInteractive: async (_name: string, command: string[], _options: unknown, connected: (socket: any) => void) => {
+      calls.push(command); connected(socket); return { resize() {}, close() { closed++; } };
+    },
+  } as any, 'fixture', 'incus:uuid', async () => { if (!allow) throw new Error('authority changed'); });
+  await commands.execTmux('incus:uuid', ['rename-window', '-t', 'main:0', 'new-name']);
+  await commands.execListTmuxWindows('incus:uuid');
+  const terminal = await commands.attachTerminal(0);
+  expect(calls[2]).toContain('agentor-terminal');
+  expect(calls[2].join(' ')).toContain('-t =main');
+  terminal.close(); terminal.close();
+  await expect.poll(() => calls.length).toBe(4);
+  expect(calls.every((command) => command[5] === 'bootstrap-tmux')).toBe(true);
+  expect(calls[3].slice(-3, -1)).toEqual(['kill-session', '-t']);
+  expect(closed).toBe(1);
+  allow = false;
+  await expect(commands.execTmux('incus:uuid', ['kill-session', '-t', 'ws-old'])).rejects.toThrow('authority changed');
+  expect(calls).toHaveLength(4);
 });
 
 test('native app logging uses the guest journal without contaminating NDJSON or closing app output', () => {
@@ -96,6 +160,63 @@ printf '{"status":"running"}\\n'
   expect(result.stdout).toBe('{"status":"running"}\n');
   expect(result.stderr).toBe('app-output\n');
 });
+
+for (const app of ['socks5', 'ssh', 'chromium', 'vscode-tunnel', 'vscode-desktop']) {
+  for (const native of [false, true]) {
+    test(`${app} background logging closes ${native ? 'VM' : 'legacy'} exec channels while retaining app/log/PID behavior`, async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'agentor-app-channel-'));
+      let child: ReturnType<typeof spawn> | undefined;
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        const source = await readFile(`../worker/apps/${app}/manage.sh`, 'utf8');
+        const pipeline = /> >\((.*)\) 2>&1 &/.exec(source)?.[1];
+        expect(pipeline).toBeDefined();
+        const library = (await readFile('../worker/apps/lib.sh', 'utf8')).replace('/proc/1/fd/1', `${dir}/legacy.log`);
+        const script = `${library}
+cat() { if [ "$1" = /proc/1/comm ]; then printf '${native ? 'systemd' : 'bash'}'; else command cat "$@"; fi; }
+logger() { [ "$1" = -t ] && [ "$2" = agentor-app ]; command cat >> "$FIXTURE_DIR/journal.log"; }
+ID=fixture LOG_FILE="$FIXTURE_DIR/tee.log"
+bash -c 'printf "stdout-line\\n"; printf "stderr-line\\n" >&2; exec sleep 20' > >(${pipeline}) 2>&1 &
+printf '{"pid":%d,"status":"running"}\\n' "$!"
+`;
+        child = spawn('bash', ['-ec', script], { detached: true, stdio: ['ignore', 'pipe', 'pipe'],
+          env: { PATH: process.env.PATH, FIXTURE_DIR: dir } });
+        let stdout = '', stderr = '';
+        child.stdout!.on('data', (bytes) => { stdout += bytes.toString(); });
+        child.stderr!.on('data', (bytes) => { stderr += bytes.toString(); });
+        await Promise.race([
+          new Promise<void>((resolve, reject) => {
+            child!.once('error', reject);
+            child!.once('close', (code) => code === 0 ? resolve() : reject(new Error(`Manager exited ${code}`)));
+          }),
+          new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('Background logger retained exec channels')), 1500); }),
+        ]);
+        expect(stderr).toBe('');
+        const record = JSON.parse(stdout);
+        expect(record.status).toBe('running');
+        expect(Number.isInteger(record.pid) && record.pid > 1).toBe(true);
+        expect(() => process.kill(record.pid, 0)).not.toThrow();
+        const log = `${dir}/${native ? 'journal' : 'legacy'}.log`;
+        const tag = app === 'ssh' ? 'sshd' : ['socks5', 'chromium'].includes(app) ? `${app}-fixture` : app;
+        await expect.poll(async () => readFile(log, 'utf8').catch(() => ''), { timeout: 1000 }).toContain(`[${tag}] stdout-line`);
+        expect(await readFile(log, 'utf8')).toContain(`[${tag}] stderr-line`);
+        if (app === 'ssh' || app === 'vscode-tunnel') expect(await readFile(`${dir}/tee.log`, 'utf8')).toContain('stdout-line');
+        process.kill(record.pid, 'SIGTERM');
+        await expect.poll(async () => {
+          const stat = await readFile(`/proc/${record.pid}/stat`, 'utf8').catch(() => '');
+          return !stat || /\) [ZX] /.test(stat);
+        }, { timeout: 1000 }).toBe(true);
+      } finally {
+        clearTimeout(timer);
+        // Only this newly spawned fixture's process group, never worker apps.
+        if (child?.pid) try { process.kill(-child.pid, 'SIGTERM'); } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+        }
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  }
+}
 
 function fakeSession() {
   const stdout = new PassThrough(), stderr = new PassThrough();
@@ -241,20 +362,30 @@ test('real production manager files and linked terminal use the accepted Incus g
   const store = new WorkerStore(dir); await store.init();
   const manager = new ContainerManager({ listContainers: async () => [], createWorkerContainer: async () => { throw new Error('Docker fallback'); } } as any, config);
   manager.setWorkerStore(store); manager.setIncusRuntime(runtime);
-  const environmentJson = { networkMode: 'full', allowedDomains: [], dockerEnabled: false, setupScript: '', envVars: 'COMMAND_PRECEDENCE=environment', exposeApis: {} };
+  const environmentJson = { networkMode: 'full', allowedDomains: [], dockerEnabled: false, setupScript: '',
+    envVars: 'COMMAND_PRECEDENCE=environment\nTMUX_TMPDIR=/tmp/agentor-environment-tmux\nTMUX=/tmp/environment-socket,456,0', exposeApis: {} };
   (manager as any).assertOwnerExists = async () => {};
   (manager as any).resolveGitIdentity = async () => ({ gitName: 'Command Test', gitEmail: 'test@example.invalid' });
-  (manager as any).resolveUserEnvAndBinds = async () => ({ userEnv: { ...zeroUserEnvVars('test-user'), envVars: [{ key: 'COMMAND_PRECEDENCE', value: 'account' }] }, credentialBinds: [], groupSecrets: [] });
+  (manager as any).resolveUserEnvAndBinds = async () => ({ userEnv: { ...zeroUserEnvVars('test-user'),
+    envVars: [{ key: 'COMMAND_PRECEDENCE', value: 'account' }, { key: 'TMUX_TMPDIR', value: '/var/tmp' }] }, credentialBinds: [], groupSecrets: [] });
   (manager as any).resolveAuthorizedHostMounts = async () => undefined;
   (manager as any).resolveHardwareDeviceAccess = async () => undefined;
   (manager as any).resolveEnvironmentConfig = () => ({ environmentJson, capabilitiesJson: [], instructionsJson: [], dockerEnabled: false });
   let terminal: Awaited<ReturnType<ContainerManager['attachTerminal']>> | undefined;
   let desktopStream: Duplex | undefined;
   let primaryFailure = false;
+  let stage = 'create';
   try {
-    const worker = await (manager as any).createForOwner({ userId: 'test-user', displayName: 'Incus files-terminal integration' });
+    const worker = await (manager as any).createForOwner({ userId: 'test-user', displayName: 'Incus files-terminal integration',
+      workerConfiguration: { variables: [{ key: 'TMUX_TMPDIR', value: '/tmp/agentor-local-tmux' },
+        { key: 'TMUX', value: '/tmp/local-socket,789,0' }] } });
     const commands = manager.workerCommands(worker.id);
+    stage = 'environment and main session';
     expect((await commands.execCapture(worker.containerId, ['printenv', 'COMMAND_PRECEDENCE'])).stdout.toString().trim()).toBe('environment');
+    expect((await commands.execCapture(worker.containerId, ['printenv', 'TMUX_TMPDIR'])).stdout.toString().trim()).toBe('/tmp/agentor-local-tmux');
+    expect((await commands.execCapture(worker.containerId, ['printenv', 'TMUX'])).stdout.toString().trim()).toBe('/tmp/local-socket,789,0');
+    expect(await manager.listTmuxWindows(worker.id)).toContainEqual(expect.objectContaining({ name: 'main' }));
+    stage = 'file operations';
     const binary = Buffer.from([0,255,10,13,128,0]);
     await manager.mkdirFiles(worker.id, 'binary');
     await manager.uploadFiles(worker.id, 'binary', [{ rel: 'bytes.bin', data: binary }], false);
@@ -269,37 +400,49 @@ test('real production manager files and linked terminal use the accepted Incus g
     await commands.execCapture(worker.containerId, ['ln', '-s', '/etc', '/workspace/escape']);
     await expect(manager.downloadFiles(worker.id, ['escape/passwd'])).rejects.toThrow(/escape/);
     await expect(manager.mkdirFiles(worker.id, '../outside')).rejects.toThrow();
+    stage = 'terminal input/resize/cleanup';
     terminal = await manager.attachTerminal(worker.id, 0);
     let text = '';
     terminal.stream.on('data', (chunk) => { text += chunk.toString(); });
     terminal.resize(120,40);
-    const nonce = randomUUID();
-    terminal.stream.write(Buffer.from(`printf '${nonce}\\n'; stty size\r`));
+    const nonce = randomUUID().replaceAll('-', '');
+    terminal.stream.write(Buffer.from(`printf '%s%s\\n' '${nonce.slice(0, 16)}' '${nonce.slice(16)}'; stty size\r`));
     await expect.poll(() => text, { timeout: 20_000 }).toContain(nonce);
     await expect.poll(() => text, { timeout: 20_000 }).toMatch(/40\s+120/);
     terminal.close(); terminal = undefined;
-    await expect.poll(async () => (await commands.execCapture(worker.containerId, ['tmux', 'list-sessions', '-F', '#{session_name}'])).stdout.toString(), { timeout: 15_000 }).not.toContain('ws-');
+    await expect.poll(async () => {
+      const result = await commands.execCapture(worker.containerId,
+        ['tmux', '-S', '/var/tmp/tmux-1000/default', 'list-sessions', '-F', '#{session_name}']);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.toString()).toContain('main');
+      return result.stdout.toString();
+    }, { timeout: 15_000 }).not.toContain('ws-');
     await manager.deleteFiles(worker.id, ['renamed.bin', 'binary']);
     expect((await manager.listFiles(worker.id, '')).entries.some((entry) => entry.name === 'renamed.bin')).toBe(false);
+    stage = 'tmux windows';
     const window = await manager.createTmuxWindow(worker.id, 'incus-command-test');
     await manager.renameTmuxWindow(worker.id, window.index, 'incus-renamed');
     expect((await manager.listTmuxWindows(worker.id)).some((item) => item.name === 'incus-renamed')).toBe(true);
     await manager.killTmuxWindow(worker.id, window.index);
+    stage = 'SOCKS app';
     const app = await manager.createAppInstance(worker.id, 'socks5');
     await expect.poll(async () => manager.listAppInstances(worker.id, 'socks5'), { timeout: 15_000 }).toContainEqual(expect.objectContaining({ id: app.id, status: 'running' }));
     expect((await commands.execCapture(worker.containerId, ['curl', '--noproxy', '', '--socks5-hostname', `127.0.0.1:${app.port}`, '--max-time', '10', `${config.incusInternalGatewayUrl}/api/health`])).exitCode).toBe(0);
     await manager.stopAppInstance(worker.id, 'socks5', app.id);
     if (process.env.INCUS_APP_LOG_TEST === 'true') {
       expect((await commands.execCapture(worker.containerId, ['test', '-w', '/proc/1/fd/1'])).exitCode).not.toBe(0);
+      stage = 'SSH app/logging';
       await commands.startAppInstance(worker.containerId, 'ssh', 'ssh', 2222);
       expect((await commands.execCapture(worker.containerId, ['python3', '-c',
         "import socket; s=socket.create_connection(('127.0.0.1',2222),5); print(s.recv(100).decode()); s.close()"])).stdout.toString()).toContain('SSH-2.0-');
       await commands.stopAppInstance(worker.containerId, 'ssh', 'ssh');
+      stage = 'Chromium app/logging';
       const chromium = await manager.createAppInstance(worker.id, 'chromium');
       await expect.poll(async () => (await commands.execCapture(worker.containerId,
         ['curl', '--noproxy', '*', '-fsS', '--max-time', '5', `http://127.0.0.1:${chromium.port}/json/version`])).stdout.toString(),
       { timeout: 20_000 }).toContain('webSocketDebuggerUrl');
       await manager.stopAppInstance(worker.id, 'chromium', chromium.id);
+      stage = 'VS Code tunnel app/logging';
       const tunnel = await manager.createAppInstance(worker.id, 'vscode');
       await expect.poll(async () => (await manager.listAppInstances(worker.id, 'vscode'))[0]?.status,
         { timeout: 60_000 }).toMatch(/auth_required|running/);
@@ -316,10 +459,12 @@ test('real production manager files and linked terminal use the accepted Incus g
         return { stream: transport.stream, demux: (stdout, stderr) => { transport.stream.pipe(stdout); transport.stderr.pipe(stderr); } };
       });
     const plugin = randomUUID(), signal = new AbortController().signal;
+    stage = 'plugin exec';
     const installed = await executor.execute({ workerId: worker.id, installationId: plugin, phase: 'install',
       command: { argv: ['python3', '-c', "import os; print(os.environ['COMMAND_PRECEDENCE'])"] },
       envKeys: ['COMMAND_PRECEDENCE'], secretKeys: [], systemEnvironment: {}, signal } as any);
     expect(installed).toMatchObject({ exitCode: 0, output: 'environment\n' });
+    stage = 'isolated desktop';
     const desktop = await executor.desktop({ workerId: worker.id, installationId: plugin, operation: 'ensure',
       config: { display: 100, width: 640, height: 480, depth: 24 }, signal });
     expect(desktop.exitCode).toBe(0);
@@ -337,6 +482,7 @@ test('real production manager files and linked terminal use the accepted Incus g
     console.log('Phase 7 manager feature assertions complete; cleaning exact fixture');
   } catch (error) {
     primaryFailure = true;
+    console.error('Phase 7 manager feature failure at', stage);
     throw error;
   } finally {
     terminal?.close();

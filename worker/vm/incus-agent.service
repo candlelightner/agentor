@@ -1,7 +1,10 @@
 [Unit]
 Description=Incus - agent
 Documentation=https://linuxcontainers.org/incus/docs/main/
-Before=multi-user.target cloud-init.target cloud-init.service cloud-init-local.service
+Before=multi-user.target cloud-init.target cloud-init.service cloud-init-local.service shutdown.target
+# DefaultDependencies=no preserves early guest readiness, but must not leave
+# the agent and background exec children alive during final unmount/poweroff.
+Conflicts=shutdown.target
 DefaultDependencies=no
 
 [Service]

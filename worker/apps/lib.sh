@@ -9,6 +9,9 @@
 # Keep app output out of the NDJSON command channel. Container PID 1 belongs
 # to agent; VM PID 1 is root-owned systemd, so use the guest journal instead.
 # If a log sink disappears, continue draining rather than SIGPIPE the app.
+# Background launchers first close inherited exec stdout/stderr inside their
+# process substitution. Closing only this sink leaves upstream tee/sed holding
+# those channels open after manage.sh has returned its NDJSON.
 app_log() {
   if [ "$(cat /proc/1/comm)" = systemd ]; then
     logger -t agentor-app || cat >/dev/null

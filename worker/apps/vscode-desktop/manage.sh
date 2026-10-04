@@ -79,7 +79,7 @@ case "$1" in
         --disable-dev-shm-usage \
         --disable-gpu \
         --disable-features=Translate \
-        > >(stdbuf -oL -eL sed -u 's/^/[vscode-desktop] /' | app_log) 2>&1 &
+        > >(exec >/dev/null 2>&1; stdbuf -oL -eL sed -u 's/^/[vscode-desktop] /' | app_log) 2>&1 &
     APP_PID=$!
 
     # Give it a moment to confirm the process did not exit immediately (e.g.

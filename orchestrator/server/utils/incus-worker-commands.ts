@@ -14,6 +14,7 @@ import type { AppInstanceInfo, TmuxWindow } from '../../shared/types';
 export const INCUS_EXEC_ENV_SCRIPT = String.raw`
 import os,sys,json,base64
 env=os.environ.copy()
+bootstrap_tmux={key:env.get(key) for key in ('TMUX_TMPDIR','TMUX')}
 environment=json.loads(env.get('ENVIRONMENT','{}'))
 for line in environment.get('envVars','').splitlines():
  line=line.strip()
@@ -29,13 +30,17 @@ env['AGENTOR_TRUSTED_RUNTIME_ROLE']='worker'
 for key,field in [('EXPOSE_PORT_MAPPINGS','portMappings'),('EXPOSE_DOMAIN_MAPPINGS','domainMappings'),('EXPOSE_USAGE','usage')]:
  env[key]='false' if environment.get('exposeApis',{}).get(field) is False else 'true'
 env['DOCKER_ENABLED']='true' if environment.get('dockerEnabled',False) else 'false'
-os.execvpe(sys.argv[1],sys.argv[1:],env)
+if sys.argv[1]=='bootstrap-tmux':
+ for key,value in bootstrap_tmux.items():
+  if value is None: env.pop(key,None)
+  else: env[key]=value
+os.execvpe(sys.argv[2],sys.argv[2:],env)
 `;
 
-export function incusWorkerCommand(command: string[]): string[] {
+export function incusWorkerCommand(command: string[], bootstrapTmux = false): string[] {
   return ['bash', '-ec',
     'test -f /run/agentor/provisioned; test -r /run/agentor/worker.env; set -a; . /run/agentor/worker.env; set +a; exec /usr/bin/python3 -c "$1" "${@:2}"',
-    'agentor-worker-exec', INCUS_EXEC_ENV_SCRIPT, ...command];
+    'agentor-worker-exec', INCUS_EXEC_ENV_SCRIPT, bootstrapTmux ? 'bootstrap-tmux' : 'worker', ...command];
 }
 
 /** Small structural file/command adapter, not a general runtime framework.
@@ -55,8 +60,8 @@ export class IncusWorkerCommands {
     const linked = `ws-${randomUUID()}`;
     let stream: Duplex | undefined;
     const session = await this.client.execInteractive(this.name, incusWorkerCommand(['sh', '-c',
-      'tmux new-session -d -t main -s "$1" && { tmux select-window -t "$1:$2" 2>/dev/null || true; } && exec tmux attach-session -t "$1"',
-      'agentor-terminal', linked, String(windowIndex)]), {
+      'tmux new-session -d -t =main -s "$1" && { tmux select-window -t "$1:$2" 2>/dev/null || true; } && exec tmux attach-session -t "$1"',
+      'agentor-terminal', linked, String(windowIndex)], true), {
       command: [], user: 1000, group: 1000, cwd: '/workspace',
       environment: { HOME: '/home/agent', USER: 'agent', LOGNAME: 'agent', DISPLAY: ':99', TERM: 'xterm-256color',
         PATH: '/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' },
@@ -68,7 +73,7 @@ export class IncusWorkerCommands {
       session.close(); stream?.destroy();
       // The validator rejects after replacement, deletion, owner changes or
       // lifecycle admission. Never kill a session in a same-name replacement.
-      void this.execCapture(this.handle, ['tmux', 'kill-session', '-t', linked]).catch(() => {});
+      void this.execTmux(this.handle, ['kill-session', '-t', linked]).catch(() => {});
     };
     try {
       await this.validate();
@@ -82,9 +87,9 @@ export class IncusWorkerCommands {
     return this.setup(() => this.openUnlocked(command, options));
   }
 
-  private async openUnlocked(command: string[], options: Omit<IncusInstanceExecOptions, 'command'> & { signal?: AbortSignal; timeoutMs?: number }): Promise<IncusStreamExecSession> {
+  private async openUnlocked(command: string[], options: Omit<IncusInstanceExecOptions, 'command'> & { signal?: AbortSignal; timeoutMs?: number }, bootstrapTmux = false): Promise<IncusStreamExecSession> {
     await this.validate();
-    const session = await this.client.execStream(this.name, incusWorkerCommand(command), {
+    const session = await this.client.execStream(this.name, incusWorkerCommand(command, bootstrapTmux), {
       command: [], user: 1000, group: 1000, cwd: '/workspace',
       environment: { HOME: '/home/agent', USER: 'agent', LOGNAME: 'agent', DISPLAY: ':99',
         TERM: 'xterm-256color', PATH: '/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' },
@@ -122,11 +127,11 @@ export class IncusWorkerCommands {
 
   async execTmux(handle: string, args: string[]): Promise<void> {
     // Legacy tmux mutations intentionally allow missing-window no-ops.
-    await this.execCapture(handle, ['tmux', ...args]);
+    await this.capture(handle, ['tmux', ...args], {}, true);
   }
 
   async execListTmuxWindows(handle: string): Promise<TmuxWindow[]> {
-    const result = await this.execCapture(handle, ['tmux', 'list-windows', '-t', 'main:', '-F', '#{window_index}:#{window_name}:#{window_active}']);
+    const result = await this.capture(handle, ['tmux', 'list-windows', '-t', '=main:', '-F', '#{window_index}:#{window_name}:#{window_active}'], {}, true);
     return result.stdout.toString().trim().split(/\r?\n/).filter(Boolean).map((line) => {
       const [index, name, active] = line.split(':');
       return { index: parseInt(index ?? '0', 10), name: name ?? '', active: active === '1' };
@@ -153,12 +158,16 @@ export class IncusWorkerCommands {
   }
 
   async execCapture(handle: string, command: string[], opts: Parameters<DockerService['execCapture']>[2] = {}): Promise<ExecCaptureResult> {
+    return this.capture(handle, command, opts);
+  }
+
+  private async capture(handle: string, command: string[], opts: NonNullable<Parameters<DockerService['execCapture']>[2]>, bootstrapTmux = false): Promise<ExecCaptureResult> {
     this.checkHandle(handle);
     if (opts.user && !['agent', '1000', 'root', '0'].includes(opts.user)) throw new Error('Unsupported Incus exec user');
     const root = opts.user === 'root' || opts.user === '0';
-    const session = await this.open(command, { user: root ? 0 : 1000, group: root ? 0 : 1000,
+    const session = await this.setup(() => this.openUnlocked(command, { user: root ? 0 : 1000, group: root ? 0 : 1000,
       ...(root ? { environment: { HOME: '/root', USER: 'root', LOGNAME: 'root', DISPLAY: ':99', PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' } } : {}),
-      cwd: opts.workdir ?? '/workspace', signal: opts.signal, timeoutMs: opts.timeoutMs ?? 30_000 });
+      cwd: opts.workdir ?? '/workspace', signal: opts.signal, timeoutMs: opts.timeoutMs ?? 30_000 }, bootstrapTmux));
     const capture = async (stream: Readable) => {
       const chunks: Buffer[] = [];
       let size = 0;

@@ -75,7 +75,7 @@ case "$1" in
     # land on stderr (captured by our redirect). Background it so the script
     # can return the running-status JSON while sshd keeps accepting clients.
     sudo /usr/sbin/sshd -D -e -f "$SSHD_CONFIG" -p "$PORT" \
-      > >(tee -a "$LOG_FILE" | stdbuf -oL -eL sed -u 's/^/[sshd] /' | app_log) 2>&1 &
+      > >(exec >/dev/null 2>&1; tee -a "$LOG_FILE" | stdbuf -oL -eL sed -u 's/^/[sshd] /' | app_log) 2>&1 &
 
     SSHD_PID=$!
 

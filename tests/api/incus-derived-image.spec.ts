@@ -1,5 +1,7 @@
 import { test, expect } from "@playwright/test";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { IncusClient } from "../../orchestrator/server/utils/incus-client";
 import { IncusWorkerStorage } from "../../orchestrator/server/utils/incus-worker-storage";
 import type { Config } from "../../orchestrator/server/utils/config";
@@ -29,6 +31,13 @@ function options() {
   };
 }
 
+test('early guest agent retains explicit shutdown ordering for background exec children', () => {
+  const unit = readFileSync(new URL('../../worker/vm/incus-agent.service', import.meta.url), 'utf8');
+  expect(unit).toMatch(/^DefaultDependencies=no$/m);
+  expect(unit).toMatch(/^Conflicts=.*\bshutdown\.target\b/m);
+  expect(unit).toMatch(/^Before=.*\bshutdown\.target\b/m);
+});
+
 test("real derived image boots unattended and waits for runtime provisioning", async () => {
   test.skip(process.env.INCUS_LIVE_TEST !== "true", "Explicit disposable-host acceptance run");
   test.setTimeout(600_000);
@@ -53,12 +62,29 @@ test("real derived image boots unattended and waits for runtime provisioning", a
     });
     created = true;
     await client.startInstance(name);
-    await expect.poll(async () => {
-      try { return (await client.exec(name, ["true"])).returnCode; } catch { return -1; }
-    }, { timeout: 120_000, intervals: [500, 1000] }).toBe(0);
+    let agentError = '';
+    try {
+      await expect.poll(async () => {
+        try { return (await client.exec(name, ["true"])).returnCode; }
+        catch (error) { agentError = String(error); return -1; }
+      }, { timeout: 120_000, intervals: [500, 1000] }).toBe(0);
+    } catch (error) {
+      console.error('Derived-image guest readiness failure', name, agentError);
+      // Capture the exact disposable fixture before teardown removes its
+      // console. CLI is diagnostic only; normal runtime stays API-based.
+      try {
+        console.error(execFileSync('ssh', ['-p', '22375', '-i', '/workspace/agentor-kata-vm-access.ZgLVo9uk/id_ed25519',
+          '-o', 'UserKnownHostsFile=/workspace/agentor-kata-vm-access.ZgLVo9uk/known_hosts', '-o', 'BatchMode=yes',
+          '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes', 'kata-test@172.19.0.1',
+          `sudo incus console ${name} --project agentor --show-log`], { encoding: 'utf8', timeout: 30_000 }));
+      } catch (diagnosticError) { console.error('Console diagnostic unavailable', String(diagnosticError)); }
+      throw error;
+    }
     const unconfigured = await client.exec(name, ["bash", "-ec", [
       "test \"$(cat /proc/1/comm)\" = systemd",
       "systemctl is-active --quiet incus-agent",
+      "systemctl show incus-agent -p Conflicts --value | grep -qw shutdown.target",
+      "systemctl show incus-agent -p Before --value | grep -qw shutdown.target",
       "test ! -e /run/agentor/worker.env",
       "! systemctl is-active --quiet agentor-worker docker docker.socket containerd",
       "systemctl start agentor-worker",
@@ -106,6 +132,11 @@ test("real derived image boots unattended and waits for runtime provisioning", a
       "getent ahostsv4 example.org",
     ].join("; ")]);
     expect(network.returnCode, `${network.stdout}\n${network.stderr}`).toBe(0);
+    // Background exec children used by apps/plugins must stop with the guest
+    // agent, before final shutdown/unmount. Keep the production stop bound.
+    expect((await client.exec(name, ["bash", "-ec", "cd /workspace; sleep 600 >/dev/null 2>&1 &"])).returnCode).toBe(0);
+    await client.stopInstance(name, { timeout: 30 });
+    expect((await client.getInstanceState(name)).status).toBe('Stopped');
   } finally {
     // A transport/operation timeout may occur after creation was accepted.
     // Cleanup only this exact generated test name, not an arbitrary inventory.
