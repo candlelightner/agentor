@@ -1,6 +1,8 @@
 import { test, expect } from "@playwright/test";
 import { IncusWorkerStorage } from "../../orchestrator/server/utils/incus-worker-storage";
 import type { Config } from "../../orchestrator/server/utils/config";
+import { IncusClient } from '../../orchestrator/server/utils/incus-client';
+import { randomUUID } from 'node:crypto';
 
 const owner = { id: "worker", userId: "owner", containerName: "agentor-worker-worker" };
 const config = { containerPrefix: "agentor-worker", incusProject: "agentor", incusStoragePool: "pool",
@@ -19,7 +21,9 @@ function fixture() {
       writes.push(`create:${spec.name}`);
       volumes.set(spec.name, { ...spec, type: "custom", used_by: [] });
     },
-    updateCustomVolume: async (_pool: string, name: string, value: any) => { volumes.get(name).config = value; },
+    updateCustomVolume: async (_pool: string, name: string, value: any) => {
+      writes.push(`update:${name}`); volumes.get(name).config = value;
+    },
     deleteCustomVolume: async (_pool: string, name: string) => { writes.push(`delete:${name}`); volumes.delete(name); },
   };
   return { volumes, writes, storage: new IncusWorkerStorage(client as any, config, "installation") };
@@ -45,7 +49,8 @@ test("Docker block storage remains on disable and is reused on re-enable", async
   expect(await storage.dockerInitializationAllowed(owner)).toBe(false);
   expect((await storage.devices(owner, false)).docker).toEqual(devices.docker);
   expect((await storage.devices(owner, true)).docker).toEqual(devices.docker);
-  expect(writes).toHaveLength(3);
+  expect(writes.filter((write) => write.startsWith('create:'))).toHaveLength(3);
+  expect(writes.filter((write) => write === `update:${owner.containerName}-workspace`)).toHaveLength(1);
 });
 
 test("foreign volume ownership fails closed without creating or deleting data", async () => {
@@ -87,4 +92,80 @@ test("mismatched worker names and filesystem/block types are rejected", async ()
   await storage.devices(owner, true);
   volumes.get(`${owner.containerName}-docker`).content_type = "filesystem";
   await expect(storage.devices(owner, true)).rejects.toThrow("ownership/type");
+});
+
+test('Docker allocation is sticky across capability disable and disposable compute removal', async () => {
+  const { storage, volumes, writes } = fixture();
+  await storage.devices(owner, true);
+  expect(volumes.get(`${owner.containerName}-workspace`).config['user.agentor.docker-data']).toBe('true');
+  await storage.devices(owner, false);
+  expect(await storage.verifyExisting(owner)).toEqual({ docker: true });
+  // No compute/attached devices are required to remember retained data.
+  volumes.delete(`${owner.containerName}-docker`);
+  writes.length = 0;
+  await expect(storage.verifyExisting(owner)).rejects.toThrow('Existing Incus docker volume is missing');
+  await expect(storage.devices(owner, false, { docker: false })).rejects.toThrow('Existing Incus docker volume is missing');
+  await expect(storage.devices(owner, true, { docker: false })).rejects.toThrow('Existing Incus docker volume is missing');
+  await expect(storage.devices(owner, true)).rejects.toThrow('Existing Incus docker volume is missing');
+  expect(writes).toEqual([]);
+});
+
+test('read-only preflight distinguishes never-allocated Docker and rejects corrupt retained-data metadata', async () => {
+  const { storage, volumes, writes } = fixture();
+  await storage.devices(owner, false);
+  writes.length = 0;
+  expect(await storage.verifyExisting(owner)).toEqual({ docker: false });
+  expect(writes).toEqual([]);
+  volumes.get(`${owner.containerName}-workspace`).config['user.agentor.docker-data'] = 'false';
+  await expect(storage.verifyExisting(owner)).rejects.toThrow('metadata is ambiguous');
+  await expect(storage.devices(owner, true, { docker: false })).rejects.toThrow('metadata is ambiguous');
+  expect(writes).toEqual([]);
+});
+
+test('failure persisting Docker expectation blocks compute attachment and retries the same block volume', async () => {
+  const { storage, volumes, writes } = fixture();
+  const client = (storage as any).client;
+  const update = client.updateCustomVolume;
+  client.updateCustomVolume = async () => { throw new Error('injected metadata failure'); };
+  await expect(storage.devices(owner, true)).rejects.toThrow('injected metadata failure');
+  expect(volumes.has(`${owner.containerName}-docker`)).toBe(true);
+  expect(volumes.get(`${owner.containerName}-workspace`).config['user.agentor.docker-data']).toBeUndefined();
+  client.updateCustomVolume = update;
+  writes.length = 0;
+  expect((await storage.devices(owner, false, { docker: false })).docker.source).toBe(`${owner.containerName}-docker`);
+  expect(volumes.get(`${owner.containerName}-workspace`).config['user.agentor.docker-data']).toBe('true');
+  expect(writes.some((write) => write.startsWith('create:'))).toBe(false);
+});
+
+test('real Incus retains Docker expectation without compute and refuses empty replacement after data loss', async () => {
+  test.skip(process.env.INCUS_RETENTION_TEST !== 'true', 'Explicit isolated disposable-volume acceptance');
+  test.setTimeout(120_000);
+  const id = randomUUID();
+  const target = { id, userId: 'retention-test', containerName: `${config.containerPrefix}-${id}` };
+  const installation = randomUUID();
+  const live = { ...config, incusStoragePool: 'default', incusEndpoint: 'https://127.0.0.1:18443',
+    incusClientCertPath: '/workspace/agentor-incus-tls/client.crt',
+    incusClientKeyPath: '/workspace/agentor-incus-tls/client.key',
+    incusServerCertPath: '/workspace/agentor-incus-tls/server.crt' } as Config;
+  const client = IncusClient.fromConfig(live);
+  const storage = new IncusWorkerStorage(client, live, installation);
+  try {
+    await storage.devices(target, true);
+    const workspace = await client.getCustomVolume(live.incusStoragePool, `${target.containerName}-workspace`);
+    expect(workspace.config['user.agentor.docker-data']).toBe('true');
+    await storage.devices(target, false, { docker: true });
+    // Re-instantiate the manager: expectation is daemon-persisted, not a
+    // process cache or inference from an attached/running VM device.
+    const reloaded = new IncusWorkerStorage(client, live, installation);
+    expect(await reloaded.verifyExisting(target)).toEqual({ docker: true });
+    const docker = await client.getCustomVolume(live.incusStoragePool, `${target.containerName}-docker`);
+    expect(docker.config['user.agentor.installation']).toBe(installation);
+    expect(docker.used_by ?? []).toEqual([]);
+    // Intentionally destroy only this nonce-owned empty test volume.
+    await client.deleteCustomVolume(live.incusStoragePool, docker.name);
+    await expect(reloaded.verifyExisting(target)).rejects.toThrow('Existing Incus docker volume is missing');
+    await expect(reloaded.devices(target, false, { docker: false })).rejects.toThrow('Existing Incus docker volume is missing');
+    await expect(reloaded.devices(target, true, { docker: false })).rejects.toThrow('Existing Incus docker volume is missing');
+    await expect(client.getCustomVolume(live.incusStoragePool, docker.name)).rejects.toMatchObject({ statusCode: 404 });
+  } finally { await storage.remove(target); }
 });

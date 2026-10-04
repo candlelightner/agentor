@@ -74,6 +74,12 @@ export class IncusWorkerStorage {
       if (existing) await requireExisting(role);
       else await this.ensure(owner, role);
     }
+    const workspace = await requireExisting('workspace');
+    const retainedDocker = this.expectsDocker(workspace);
+    // Once allocated, disabling Docker must never turn lost canonical Docker
+    // data into authority to create an empty replacement. The private-volume
+    // marker survives deletion of disposable compute and is never cleared.
+    if (retainedDocker) await requireExisting('docker');
     const devices: Record<string, IncusDevice> = {
       workspace: { type: "disk", pool: this.config.incusStoragePool, source: this.name(owner, "workspace"), path: "/workspace" },
       agents: { type: "disk", pool: this.config.incusStoragePool, source: this.name(owner, "agents"), path: "/home/agent/.agent-data" },
@@ -82,6 +88,8 @@ export class IncusWorkerStorage {
       : dockerEnabled ? await this.ensure(owner, "docker") : await this.find(owner, "docker");
     if (docker) {
       this.validate(docker, owner, "docker");
+      if (!retainedDocker) await this.client.updateCustomVolume(this.config.incusStoragePool, workspace.name,
+        { ...workspace.config, 'user.agentor.docker-data': 'true' });
       // Fixed device name, hence fixed guest serial; never guess an unused disk.
       devices.docker = { type: "disk", pool: this.config.incusStoragePool, source: this.name(owner, "docker") };
     }
@@ -103,9 +111,20 @@ export class IncusWorkerStorage {
       const volume = await this.find(owner, role);
       if (!volume && (role !== 'docker' || dockerRequired))
         throw new Error('Existing Incus ' + role + ' volume is missing; explicit recovery is required');
-      if (volume) { this.validate(volume, owner, role); if (role === 'docker') docker = true; }
+      if (volume) {
+        this.validate(volume, owner, role);
+        if (role === 'workspace') dockerRequired ||= this.expectsDocker(volume);
+        if (role === 'docker') docker = true;
+      }
     }
     return { docker };
+  }
+
+  private expectsDocker(workspace: IncusCustomVolume): boolean {
+    const marker = workspace.config['user.agentor.docker-data'];
+    if (marker !== undefined && marker !== 'true')
+      throw new Error('Incus retained Docker storage metadata is ambiguous; explicit recovery is required');
+    return marker === 'true';
   }
 
   async markDockerInitialized(owner: IncusStorageOwner): Promise<void> {
