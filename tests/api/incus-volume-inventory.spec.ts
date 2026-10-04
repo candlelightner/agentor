@@ -18,6 +18,8 @@ import { readBackupInstallationId } from '../../orchestrator/server/utils/backup
 import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker-runtime';
 import { PassThrough, Writable } from 'node:stream';
 import { execFileSync } from 'node:child_process';
+import { IncusVolumeSizeHelper } from '../../orchestrator/server/utils/incus-volume-size-helper';
+import { isOperationHelperActive } from '../../orchestrator/server/utils/operation-helper-registry';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, error() {}, warn() {}, debug() {} });
 
@@ -329,5 +331,36 @@ test('stopped/detached, changed instance and quarantined Incus sources never ope
     if (failure === 'record') f.worker.runtimeKind = 'legacy-docker';
     const job = await f.start(); expect((await f.terminal(job.id)).status).toBe('failed');
     expect(f.control.opens).toBe(0); expect(f.dockerCalls()).toBe(0);
+  });
+});
+
+test('offline scanner owns its cleanup handle before initial persistence and rechecks source before publication', async () => {
+  for (const change of [false, true]) await integratedFixture(async f => {
+    const manager = new ManagedVolumeSizingManager(f.config.dataDir, { docker: { listContainers: async () => [] } as any });
+    const originalScan = IncusVolumeSizeHelper.prototype.scan, originalCleanup = IncusVolumeSizeHelper.prototype.cleanup;
+    const persist = (manager as any).persistIncusHelper.bind(manager);
+    let initialWrites = 0, cleanups = 0;
+    (manager as any).persistIncusHelper = async (id: string, state: any) => {
+      if (state) { expect(isOperationHelperActive(id)).toBe(true); initialWrites++; }
+      await persist(id, state);
+      await manager.cleanupStaleHelpers(); // interleave exactly after initial store publication
+    };
+    IncusVolumeSizeHelper.prototype.cleanup = async () => { cleanups++; };
+    IncusVolumeSizeHelper.prototype.scan = async (id, _source, _state, save) => {
+      expect(isOperationHelperActive(id)).toBe(true);
+      await save(undefined);
+      if (change) f.physical.get(f.v.dockerName).created_at = '2026-01-03T12:00:00Z';
+      return 'AGENTOR_VOLUME_SIZE {"ok":true,"allocatedBytes":"8192","logicalBytes":"5000","entriesScanned":3}\n';
+    };
+    try {
+      const job = await manager.create(f.worker.userId, async () => {
+        const resource = await resolveManagedVolumeSizingResource(f.v.id, { userId: f.worker.userId });
+        expect(resource).toBeTruthy(); return resource!;
+      }, true);
+      await expect.poll(async () => (await manager.get(job.id))?.status).toMatch(/succeeded|failed/);
+      expect((await manager.get(job.id))?.status).toBe(change ? 'failed' : 'succeeded');
+      expect(initialWrites).toBe(1); expect(cleanups).toBe(0);
+      if (change) expect(manager.measurementFor(f.v.id, f.v.incarnation).state).toBe('unknown');
+    } finally { IncusVolumeSizeHelper.prototype.scan = originalScan; IncusVolumeSizeHelper.prototype.cleanup = originalCleanup; }
   });
 });

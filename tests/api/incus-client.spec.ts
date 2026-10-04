@@ -4,11 +4,41 @@ import { existsSync } from "node:fs";
 import {
   IncusClient,
   IncusError,
+  IncusRequestRejected,
   type IncusInstanceState,
 } from "../../orchestrator/server/utils/incus-client";
 import type { Config } from "../../orchestrator/server/utils/config";
 
 test.describe("IncusClient unit tests", () => {
+  test('size helper copy/create retain project-scoped acceptance and distinguish explicit rejection from uncertain responses', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    let response: any = { type: 'async', operation: '/1.0/operations/copy-accepted?project=agentor' };
+    let statusCode = 202;
+    const order: string[] = [], payloads: any[] = [];
+    client.rawRequest = async (_method, _path, body) => { payloads.push(body); return { statusCode, headers: {}, body: Buffer.from(JSON.stringify(response)) }; };
+    client.waitForOperation = async operation => { order.push('wait:' + operation); return { status: 'Success' } as any; };
+    client.getInstance = async () => ({ name: 'helper' } as any);
+    const accepted = async (path?: string) => { order.push('persist:' + path); };
+    const copy = () => client.copyCustomVolume('pool', 'original', 'temporary', { 'user.agentor.helper': 'volume-size' }, accepted);
+    await copy();
+    expect(payloads[0]).toMatchObject({ content_type: 'block', source: { type: 'copy', name: 'original', pool: 'pool', volume_only: true } });
+    expect(order).toEqual(['persist:/1.0/operations/copy-accepted', 'wait:/1.0/operations/copy-accepted']);
+    order.length = 0;
+    await client.createInstance({ name: 'helper', source: { type: 'none' }, profiles: [] }, accepted);
+    expect(order[0]).toBe('persist:/1.0/operations/copy-accepted');
+    for (const operation of ['/1.0/operations/copy?project=other', 'https://other.invalid/1.0/operations/copy', undefined]) {
+      response = { type: 'async', operation }; order.length = 0;
+      await expect(copy()).rejects.not.toBeInstanceOf(IncusRequestRejected);
+      expect(order).toEqual([]);
+    }
+    response = { type: 'error', error: 'restricted', error_code: 403 }; statusCode = 403;
+    await expect(copy()).rejects.toBeInstanceOf(IncusRequestRejected);
+    await expect(client.createInstance({ name: 'helper', source: { type: 'none' } }, accepted)).rejects.toBeInstanceOf(IncusRequestRejected);
+    response = { type: 'sync' }; statusCode = 502;
+    await expect(copy()).rejects.not.toBeInstanceOf(IncusRequestRejected);
+    response = { type: 'sync' }; statusCode = 200; order.length = 0;
+    await copy(); expect(order).toEqual(['persist:undefined']);
+  });
   test("response URLs cannot forward client credentials to another origin", async () => {
     const client = new IncusClient({ endpoint: "https://example.invalid", project: "agentor" });
     await expect(client.rawRequest("GET", "https://other.invalid/1.0")).rejects.toThrow("configured server");
@@ -538,6 +568,7 @@ test.describe("IncusClient live disposable integration tests", () => {
   const liveEndpoint = "https://127.0.0.1:18443";
 
   test("live Incus readiness, project restrictions, and image alias", async () => {
+    test.skip(process.env.INCUS_CLIENT_TEST !== 'true', 'Explicit disposable Incus client gate; credentials alone do not authorize live mutations');
     if (!existsSync(liveCertPath) || !existsSync(liveKeyPath)) {
       test.skip(true, "Live Incus credentials not available in environment");
       return;

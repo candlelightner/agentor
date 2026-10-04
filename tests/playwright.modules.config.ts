@@ -61,6 +61,7 @@ export default defineConfig({
     "api/incus-managed-volume.spec.ts",
     "api/incus-managed-volume-runtime.spec.ts",
     "api/incus-volume-inventory.spec.ts",
+    "api/incus-volume-size-helper.spec.ts",
     "api/incus-live-volume-helper.spec.ts",
     "api/incus-account-sharing.spec.ts",
     "api/incus-private-storage.spec.ts",

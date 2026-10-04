@@ -232,6 +232,125 @@ f=p/'sparse';f.touch();os.truncate(f,128*1024*1024);os.link(f,p/'hardlink');os.s
   }
 });
 
+test('production offline Incus sizing preserves stopped devices, archived Docker data and deleted-owner managed data', async () => {
+  test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable production offline sizing gate');
+  // Four serial full-image helpers plus worker lifecycle on a disk-bound host.
+  // Keep production operation deadlines unchanged; budget the whole gate.
+  test.setTimeout(1_800_000);
+  const { config, manager, store, volumes, runtime } = await productionManagerFixture(true);
+  config.incusDockerVolumeSize = '1GiB'; // bounded synthetic disk; never change retained production fixtures
+  (volumes.runtime as any).docker = { listVolumes: async () => { throw new Error('test Docker unavailable'); },
+    listContainers: async () => { throw new Error('test Docker unavailable'); } };
+  let info: any, v: any, failed = false;
+  const sizing = new ManagedVolumeSizingManager(config.dataDir, { docker: { listContainers: async () => [] } as any });
+  const exec = async (command: string[]) => {
+    const result = await runtime.client.exec(info.containerName, command);
+    expect(result.returnCode, result.stdout + result.stderr).toBe(0); return result.stdout.trim();
+  };
+  const measure = async (id: string, platform = false) => {
+    const authorize = async () => {
+      const resource = await resolveManagedVolumeSizingResource(id, platform ? { platform: true } : { userId: info.userId });
+      expect(resource).toMatchObject({ runtimeKind: 'incus-vm', live: false }); return resource!;
+    };
+    const job = await sizing.create(info.userId, authorize, true);
+    await expect.poll(async () => (await sizing.get(job.id))?.status, { timeout: 600_000, intervals: [500, 1000] }).toMatch(/succeeded|failed/);
+    const result = (await sizing.get(job.id))!;
+    expect(result.status, result.error).toBe('succeeded');
+    expect(result.measurement?.consistency).toBe('offline-read-only');
+    expect((result as any).incusHelper).toBeUndefined();
+    expect(sizing.getStored(job.id)?.incusHelper).toBeUndefined();
+    console.info('Offline size job passed', id, result.measurement?.logicalBytes);
+    return result.measurement!;
+  };
+  try {
+    info = await (manager as any).createForOwner({ userId: 'managed-live-owner', displayName: 'offline sizing gate' });
+    await exec(['python3', '-c', String.raw`
+import os,pathlib
+p=pathlib.Path('/workspace/offline-size');p.mkdir();f=p/'sparse';f.touch();os.truncate(f,64*1024*1024);os.link(f,p/'hardlink')
+q=pathlib.Path('/opt/offline-managed');q.mkdir();(q/'sentinel').write_bytes(b'canonical-offline-data')
+`]);
+    await exec(['docker', 'volume', 'create', 'offline-persisted']);
+    v = await volumes.add({ userId: info.userId, workerId: info.id, platformAdmin: true },
+      { target: '/opt/offline-managed', mode: 'live', acknowledgePrivileged: true });
+    await expect.poll(() => volumes.store.get(info.userId, v.id)?.operation?.stage,
+      { timeout: 180_000, intervals: [200, 500] }).toBe('complete');
+    const inventory = await managedVolumeInventory({ userId: info.userId });
+    const mine = inventory.volumes.filter(item => item.workerId === info.id);
+    const workspace = mine.find(item => item.purpose === 'workspace')!, docker = mine.find(item => item.purpose === 'docker-in-docker')!;
+    await manager.stop(info.id);
+    const stopped = await runtime.client.getInstance(info.containerName);
+    const measured = await measure(workspace.id);
+    expect(measured.logicalBytes).toBeGreaterThanOrEqual(64 * 1024 * 1024);
+    expect(measured.logicalBytes).toBeLessThan(128 * 1024 * 1024);
+    await measure(docker.id); // block native copy; original remains referenced by stopped compute
+    const after = await runtime.client.getInstance(info.containerName);
+    expect(after.status).toBe('Stopped'); expect(after.devices).toEqual(stopped.devices);
+    expect(after.config['volatile.uuid']).toBe(stopped.config['volatile.uuid']);
+    await manager.restart(info.id);
+    expect(await exec(['docker', 'volume', 'inspect', '--format', '{{.Name}}', 'offline-persisted'])).toBe('offline-persisted');
+    expect(await exec(['cat', '/opt/offline-managed/sentinel'])).toBe('canonical-offline-data');
+    expect(await exec(['stat', '-c', '%s', '/workspace/offline-size/sparse'])).toBe(String(64 * 1024 * 1024));
+    await manager.archive(info.id);
+    await measure(docker.id); // detached original read-only; no copy and no rootfs fallback
+    await manager.deleteArchived(info.userId, info.id);
+    const retained = volumes.store.get(info.userId, v.id)!;
+    expect(retained).toBeTruthy();
+    retained.retainedAfterAccountDeletion = true; await volumes.store.save(retained);
+    expect(await resolveManagedVolumeSizingResource(v.id, { userId: info.userId })).toBeUndefined();
+    expect((await measure(v.id, true)).logicalBytes).toBe('canonical-offline-data'.length);
+    expect((await runtime.client.listInstances()).some(instance => instance.name.startsWith('asz-'))).toBe(false);
+    console.info('Offline workspace/sparse-hardlink count, stopped native Docker copy/no device edits, archived direct Docker and platform-only deleted-owner managed sizing passed; helper resources cleaned.');
+  } catch (error) { failed = true; throw error; }
+  finally {
+    if (info) {
+      if (failed) {
+        console.error('Retained offline sizing fixture', info.containerName, config.dataDir, v?.id);
+      } else {
+        if (store.get(info.userId, info.id)?.status === 'archived') await manager.deleteArchived(info.userId, info.id);
+        else if (store.get(info.userId, info.id)) await manager.remove(info.id);
+        if (v) { const current = volumes.store.get(info.userId, v.id)!; await volumes.incusRuntime.delete(current); await volumes.store.forget(info.userId, v.id); }
+      }
+    }
+  }
+});
+
+test('production offline retained data sizing measures the exact interrupted fixture without old operation authority', async () => {
+  const id = process.env.INCUS_RETAINED_SIZING_TEST_VOLUME;
+  test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true' || !id || !process.env.DATA_DIR,
+    'Explicit exact retained disposable fixture and its durable metadata required');
+  test.setTimeout(900_000);
+  const { config, volumes, runtime } = await productionManagerFixture();
+  const volume = volumes.store.list().find(item => item.id === id)!;
+  expect(volume).toMatchObject({ storageRuntimeKind: 'incus-vm', seeded: true,
+    retainedAfterAccountDeletion: true, operation: { stage: 'complete' } });
+  const before = await volumes.incusRuntime.inspectVolume(volume);
+  expect(before?.used_by).toEqual([]);
+  // Root has separately verified daemon continuity and removed the exact
+  // completed helper. Do not retrofit terminal proof into the interrupted job:
+  // native Incus expires completed operations; that private record stays put.
+  const sizingData = await mkdtemp(join(tmpdir(), 'agentor-retained-sizing-'));
+  await backupInstallationId(sizingData);
+  const sizing = new ManagedVolumeSizingManager(sizingData, { docker: { listContainers: async () => [] } as any });
+  await sizing.init();
+  expect(await resolveManagedVolumeSizingResource(id!, { userId: volume.userId })).toBeUndefined();
+  const authorize = async () => {
+    const resource = await resolveManagedVolumeSizingResource(id!, { platform: true });
+    expect(resource).toMatchObject({ runtimeKind: 'incus-vm', live: false }); return resource!;
+  };
+  const job = await sizing.create('managed-live-owner', authorize, true);
+  await expect.poll(async () => (await sizing.get(job.id))?.status,
+    { timeout: 600_000, intervals: [500, 1000] }).toMatch(/succeeded|failed/);
+  const result = (await sizing.get(job.id))!;
+  expect(result.status, result.error).toBe('succeeded');
+  expect(result.measurement).toMatchObject({ consistency: 'offline-read-only', logicalBytes: 'canonical-offline-data'.length });
+  expect(await volumes.incusRuntime.inspectVolume(volume)).toEqual(before);
+  expect(sizing.getStored(job.id)?.incusHelper).toBeUndefined();
+  expect((await runtime.client.listInstances()).some(instance => instance.name.startsWith('asz-'))).toBe(false);
+  await volumes.incusRuntime.delete(volume); await volumes.store.forget(volume.userId, volume.id);
+  await rm(sizingData, { recursive: true, force: true });
+  console.info('Platform-only retained data measured without canonical changes or old operation authority; exact synthetic volume cleaned.');
+});
+
 test('real Incus filesystem hotplug capability preserves the running worker boot and service', async () => {
   test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable filesystem hotplug diagnostic');
   test.setTimeout(300_000);

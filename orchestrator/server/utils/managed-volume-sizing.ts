@@ -23,6 +23,8 @@ import {
 } from "./operation-deadline";
 import { isOperationHelperActive, registerOperationHelper } from "./operation-helper-registry";
 import { volumeError } from "./managed-volume-store";
+import { readBackupInstallationId } from './backup-installation';
+import { IncusVolumeSizeHelper, type IncusSizeHelperState } from './incus-volume-size-helper';
 
 const CACHE_FRESH_MS = 15 * 60 * 1000;
 const SCAN_TIMEOUT_MS = 60_000;
@@ -154,6 +156,7 @@ interface StoredVolumeSizeJob {
   completedAt?: string;
   error?: string;
   measurement?: VolumeSizeMeasurement;
+  incusHelper?: IncusSizeHelperState;
 }
 
 interface StoredVolumeSizeMeasurement {
@@ -282,6 +285,7 @@ export class ManagedVolumeSizingManager {
   }
 
   async cleanupStaleHelpers() {
+    const incusRemoved = await this.cleanupIncusHelpers();
     let found: Docker.ContainerInfo[];
     try {
       found = await withOperationDeadline(
@@ -290,7 +294,7 @@ export class ManagedVolumeSizingManager {
       );
     } catch {
       this.cleanupUncertain = true;
-      return 0;
+      return incusRemoved;
     }
     let removed = 0, failures = 0;
     const present = new Set<string>();
@@ -315,7 +319,35 @@ export class ManagedVolumeSizingManager {
     for (const [name, tracked] of this.unresolvedHelpers)
       if (tracked.cleanupRequired && !tracked.pendingCreate && !present.has(name)) this.releaseResolvedHelper(name);
     this.cleanupUncertain = failures > 0;
+    return removed + incusRemoved;
+  }
+
+  private async cleanupIncusHelpers() {
+    let removed = 0;
+    for (const job of this.jobs.list()) {
+      if (!job.incusHelper || isOperationHelperActive(job.id)) continue;
+      // Claim synchronously before reading identity or awaiting storage. A
+      // second cleanup pass or newly admitted scanner must not use stale state.
+      const release = registerOperationHelper(job.id);
+      try {
+        const installation = await readBackupInstallationId(this.dataDir);
+        const current = this.jobs.find(job.id);
+        if (!current?.incusHelper || current.incusHelper.installation !== installation) continue;
+        await new IncusVolumeSizeHelper(useConfig()).cleanup(job.id, current.incusHelper,
+          next => this.persistIncusHelper(job.id, next));
+        removed++;
+      } catch { /* durable reservation remains until exact cleanup succeeds */ }
+      finally { release(); }
+    }
     return removed;
+  }
+
+  private async persistIncusHelper(id: string, incusHelper?: IncusSizeHelperState) {
+    await this.withState(async () => {
+      const current = this.jobs.find(id);
+      if (!current) throw volumeError(409, 'Size helper cleanup record is unavailable.');
+      await this.jobs.save({ ...current, incusHelper });
+    });
   }
 
   private helperNames(item: Docker.ContainerInfo) {
@@ -344,7 +376,12 @@ export class ManagedVolumeSizingManager {
   }
 
   private cleanupReservations() {
-    return [...this.unresolvedHelpers.values()].filter((tracked) => tracked.cleanupRequired);
+    return [...this.unresolvedHelpers.values()].filter((tracked) => tracked.cleanupRequired).concat(
+      // Registry ownership also covers stale cleanup, not just a scanner.
+      // Recovered helpers remain charged while that cleanup is awaiting.
+      this.jobs.list().filter(job => job.incusHelper && !this.running.has(job.id)).map(job => ({
+        release: () => {}, ownerKey: job.ownerKey, volumeId: job.volumeId, pendingCreate: false, cleanupRequired: true,
+      })));
   }
 
   private reservationConflicts(ownerKey: string, volumeId?: string) {
@@ -358,7 +395,7 @@ export class ManagedVolumeSizingManager {
 
   hasActiveOperationsForInstanceSnapshot() {
     return this.cleanupUncertain || this.admissions > 0 || this.unresolvedHelpers.size > 0 ||
-      this.jobs.list().some((job) => job.status === "queued" || job.status === "running") || this.activeTasks.size > 0;
+      this.jobs.list().some((job) => job.incusHelper || job.status === "queued" || job.status === "running") || this.activeTasks.size > 0;
   }
 
   measurementFor(volumeId: string, incarnation: string | undefined, dockerAvailable = true): VolumeSizeMeasurement {
@@ -485,7 +522,9 @@ export class ManagedVolumeSizingManager {
         this.controllers.get(job.id)?.abort();
         if (job.status === "queued") this.authorizers.delete(job.id);
       }
-      await this.jobs.removeAffected(userId);
+      // Keep bounded cleanup authority until helper resources are gone; deleting
+      // the owner must not erase a cancelled helper's only durable handle.
+      if (!affected.some(job => job.incusHelper)) await this.jobs.removeAffected(userId);
       await this.cache.removeOwner(userId);
       return affected.map((job) => this.helpers.get(job.id)).filter(Boolean) as Docker.Container[];
     });
@@ -553,12 +592,16 @@ export class ManagedVolumeSizingManager {
           : await this.scanVolume(id, before, controller.signal);
         controller.signal.throwIfAborted();
         const after = await authorize(); this.assertSameIncarnation(queued, after);
+        if (before.runtimeKind === 'incus-vm' && !before.live && after.live)
+          throw volumeError(409, 'Offline sizing source became live; no measurement was published.');
         await this.withState(async () => {
           controller.signal.throwIfAborted();
           if (instanceSnapshotActive()) throw volumeError(409, "Instance backup or restore started before the size result was published.");
           const current = this.jobs.find(id);
           if (!current || current.status !== "running" || this.closedOwners.has(current.ownerKey)) return;
           const publish = await authorize(); this.assertSameIncarnation(queued, publish);
+          if (before.runtimeKind === 'incus-vm' && !before.live && publish.live)
+            throw volumeError(409, 'Offline sizing source became live; no measurement was published.');
           if (this.closedOwners.has(current.ownerKey)) return;
           controller.signal.throwIfAborted();
           if (instanceSnapshotActive()) throw volumeError(409, "Instance backup or restore started before the size result was published.");
@@ -701,6 +744,28 @@ export class ManagedVolumeSizingManager {
 
   private async scanIncusVolume(jobId: string, resource: ManagedVolumeSizingResource, signal: AbortSignal) {
     const descriptor = resource.incus;
+    if (descriptor && !resource.live) {
+      const initial: IncusSizeHelperState = { installation: await readBackupInstallationId(this.dataDir),
+        copy: descriptor.contentType === 'block' && descriptor.attached };
+      const assertSource = async () => {
+        signal.throwIfAborted();
+        const current = await resolveManagedVolumeSizingResource(resource.id, { platform: true });
+        if (!current || current.incarnation !== resource.incarnation || current.runtimeKind !== 'incus-vm' || current.live ||
+            current.incus?.attached !== descriptor.attached || current.incus?.instanceIncarnation !== descriptor.instanceIncarnation)
+          throw volumeError(409, 'Offline sizing source authority changed; no data was changed.');
+      };
+      const release = registerOperationHelper(jobId);
+      try {
+        await assertSource(); await this.persistIncusHelper(jobId, initial);
+        const stdout = await new IncusVolumeSizeHelper(useConfig()).scan(jobId, resource, initial,
+          next => this.persistIncusHelper(jobId, next), assertSource, signal, INCUS_LIVE_VOLUME_SIZE_SCANNER);
+        await assertSource();
+        const parsed = parseScannerOutput(stdout);
+        if (!parsed.ok) throw volumeError(409, 'Offline size scan did not complete; no data was changed.');
+        return { allocatedBytes: parseBoundedInteger(parsed.allocatedBytes), logicalBytes: parseBoundedInteger(parsed.logicalBytes),
+          entriesScanned: parseBoundedInteger(String(parsed.entriesScanned), 1_000_000) };
+      } finally { release(); }
+    }
     if (!resource.userId || !resource.workerId || !resource.live || !descriptor?.attached || !descriptor.instanceIncarnation || !descriptor.deviceKey)
       throw volumeError(409, 'Detached or stopped Incus storage requires an offline read-only scan. No guest directory or Docker fallback was used.');
     const manager = useManagedVolumeManager();
@@ -777,7 +842,7 @@ function safeSizingError(error: any) {
 }
 
 function publicJob(job: StoredVolumeSizeJob): PublicVolumeSizeJob {
-  const { userId: _user, requesterId: _requester, ownerKey: _owner, incarnation: _incarnation, ...result } = job;
+  const { userId: _user, requesterId: _requester, ownerKey: _owner, incarnation: _incarnation, incusHelper: _helper, ...result } = job;
   return result;
 }
 

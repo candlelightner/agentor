@@ -17,6 +17,10 @@ export class IncusError extends Error {
   }
 }
 
+/** Only an explicit error envelope proves that a mutation was rejected.
+ * Transport failures/invalid responses/timeouts leave submission ambiguous. */
+export class IncusRequestRejected extends IncusError {}
+
 export interface IncusResponse<T = unknown> {
   type: 'sync' | 'async' | 'error';
   status: string;
@@ -674,7 +678,8 @@ export class IncusClient {
     return undefined;
   }
 
-  async createInstance(spec: IncusInstanceCreateSpec): Promise<IncusInstance> {
+  async createInstance(spec: IncusInstanceCreateSpec,
+    onAccepted?: (operationPath: string | undefined) => Promise<void>): Promise<IncusInstance> {
     const payload = {
       name: spec.name,
       type: spec.type || 'virtual-machine',
@@ -689,14 +694,18 @@ export class IncusClient {
     const json = JSON.parse(raw.body.toString('utf-8')) as IncusResponse<any>;
 
     if (json.type === 'error' || raw.statusCode >= 400) {
-      throw new IncusError(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code);
+      throw json.type === 'error'
+        ? new IncusRequestRejected(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code)
+        : new IncusError(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code);
     }
 
     if (json.type === 'async' && json.operation) {
+      await onAccepted?.(this.projectOperationPath(json.operation));
       // Image unpacking is disk-bound and can exceed a short lifecycle wait
       // on a loaded host. Keep the accepted create, never resend it.
       await this.waitForOperation(json.operation, 300);
-    }
+    } else if (json.type === 'sync') await onAccepted?.(undefined);
+    else if (onAccepted) throw new IncusError('Incus create did not return an authoritative result');
 
     return this.getInstance(spec.name);
   }
@@ -1168,6 +1177,33 @@ export class IncusClient {
   }
 
   // --- Storage Volumes ---
+
+  private projectOperationPath(path: string) {
+    const operation = this.buildUrl(path);
+    if (!/^\/1\.0\/operations\/[a-zA-Z0-9-]+$/.test(operation.pathname) ||
+        operation.searchParams.get('project') !== this.project)
+      throw new IncusError('Incus operation must belong to the configured project');
+    return operation.pathname;
+  }
+
+  /** Native same-pool block copy: preserve inode allocation/overlay metadata.
+   * The caller records acceptance before waiting, never retries on timeout. */
+  async copyCustomVolume(pool: string, source: string, name: string, config: Record<string, string>,
+    onAccepted: (operationPath: string | undefined) => Promise<void>): Promise<void> {
+    const raw = await this.rawRequest('POST', `/1.0/storage-pools/${encodeURIComponent(pool)}/volumes/custom`, {
+      name, content_type: 'block', config, source: { type: 'copy', name: source, pool, volume_only: true },
+    });
+    const json = JSON.parse(raw.body.toString('utf8')) as IncusResponse<any>;
+    if (json.type === 'error' || raw.statusCode >= 400)
+      throw json.type === 'error'
+        ? new IncusRequestRejected(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code)
+        : new IncusError(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code);
+    if (json.type === 'async' && json.operation) {
+      const path = this.projectOperationPath(json.operation);
+      await onAccepted(path); await this.waitForOperation(path, 300);
+    } else if (json.type === 'sync') await onAccepted(undefined);
+    else throw new IncusError('Incus block copy did not return an authoritative result');
+  }
 
   async createCustomVolume(
     pool: string,
