@@ -3,7 +3,7 @@ import { PassThrough } from 'node:stream';
 import { randomUUID } from 'node:crypto';
 import type { Duplex, Readable } from 'node:stream';
 import type { Config } from './config';
-import { getAppType } from './apps';
+import { getAppType, parseAppInstances, assertAppManageOk } from './apps';
 import { renderUserEnvVars } from './user-env-store';
 import type { MountConfig, TmuxWindow, AppInstanceInfo, NetworkMode, ExposeApis, UserEnvVars, FileEntry, HardwareDeviceCandidate, ResolvedHardwareDevice } from '../../shared/types';
 import type { StorageManager } from './storage';
@@ -950,34 +950,7 @@ for item in json.loads(sys.stdin.readline()):
   }
 
   async listAppInstances(containerId: string, appTypeId: string): Promise<AppInstanceInfo[]> {
-    const output = await this.execAppManage(containerId, appTypeId, ['list']);
-    const trimmed = output.trim();
-    if (!trimmed) return [];
-
-    const entries: AppInstanceInfo[] = [];
-    for (const line of trimmed.split(/\r?\n/)) {
-      const clean = line.trim();
-      if (!clean) continue;
-      // Tolerate occasional non-JSON stdout lines (e.g. a stray shell warning)
-      // so a single bad line doesn't wipe the whole list.
-      if (clean[0] !== '{') continue;
-      try {
-        const parsed = JSON.parse(clean) as Partial<AppInstanceInfo>;
-        if (!parsed.id) continue;
-        entries.push({
-          id: String(parsed.id),
-          appType: appTypeId,
-          port: typeof parsed.port === 'number' ? parsed.port : parseInt(String(parsed.port ?? 0), 10) || 0,
-          status: (parsed.status as AppInstanceInfo['status']) ?? 'stopped',
-          ...(parsed.machineName ? { machineName: String(parsed.machineName) } : {}),
-          ...(parsed.authUrl ? { authUrl: String(parsed.authUrl) } : {}),
-          ...(parsed.authCode ? { authCode: String(parsed.authCode) } : {}),
-        });
-      } catch {
-        // Malformed JSON line — skip.
-      }
-    }
-    return entries;
+    return parseAppInstances(await this.execAppManage(containerId, appTypeId, ['list']), appTypeId);
   }
 
   async startAppInstance(
@@ -998,22 +971,7 @@ for item in json.loads(sys.stdin.readline()):
 
   /** Scan NDJSON output from manage.sh and throw if any line signals an error. */
   private assertManageOk(output: string, context: string): void {
-    const trimmed = output.trim();
-    if (!trimmed) return;
-    for (const line of trimmed.split(/\r?\n/)) {
-      const clean = line.trim();
-      if (!clean || clean[0] !== '{') continue;
-      let parsed: { status?: string; message?: string };
-      try {
-        parsed = JSON.parse(clean) as { status?: string; message?: string };
-      } catch {
-        // Non-JSON line or parse error — ignore (likely stderr noise).
-        continue;
-      }
-      if (parsed.status === 'error') {
-        throw new Error(parsed.message || `app manage failed: ${context}`);
-      }
-    }
+    assertAppManageOk(output, context);
   }
 
   // --- Workspace archive methods ---

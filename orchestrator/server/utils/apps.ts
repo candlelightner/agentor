@@ -1,3 +1,5 @@
+import type { AppInstanceInfo } from '../../shared/types';
+
 export interface AppPort {
   id: string;
   name: string;
@@ -105,4 +107,53 @@ export function getAppType(id: string): AppType | undefined {
 
 export function listAppTypes(): AppType[] {
   return Object.values(APP_REGISTRY);
+}
+
+export function parseAppInstances(output: string, appTypeId: string): AppInstanceInfo[] {
+  const trimmed = output.trim();
+  if (!trimmed) return [];
+
+  const entries: AppInstanceInfo[] = [];
+  for (const line of trimmed.split(/\r?\n/)) {
+    const clean = line.trim();
+    if (!clean) continue;
+    // Tolerate occasional non-JSON stdout lines (e.g. a stray shell warning)
+    // so a single bad line doesn't wipe the whole list.
+    if (clean[0] !== '{') continue;
+    try {
+      const parsed = JSON.parse(clean) as Partial<AppInstanceInfo>;
+      if (!parsed.id) continue;
+      entries.push({
+        id: String(parsed.id),
+        appType: appTypeId,
+        port: typeof parsed.port === 'number' ? parsed.port : parseInt(String(parsed.port ?? 0), 10) || 0,
+        status: (parsed.status as AppInstanceInfo['status']) ?? 'stopped',
+        ...(parsed.machineName ? { machineName: String(parsed.machineName) } : {}),
+        ...(parsed.authUrl ? { authUrl: String(parsed.authUrl) } : {}),
+        ...(parsed.authCode ? { authCode: String(parsed.authCode) } : {}),
+      });
+    } catch {
+      // Malformed JSON line — skip.
+    }
+  }
+  return entries;
+}
+
+export function assertAppManageOk(output: string, context: string): void {
+  const trimmed = output.trim();
+  if (!trimmed) return;
+  for (const line of trimmed.split(/\r?\n/)) {
+    const clean = line.trim();
+    if (!clean || clean[0] !== '{') continue;
+    let parsed: { status?: string; message?: string };
+    try {
+      parsed = JSON.parse(clean) as { status?: string; message?: string };
+    } catch {
+      // Non-JSON line or parse error — ignore (likely stderr noise).
+      continue;
+    }
+    if (parsed.status === 'error') {
+      throw new Error(parsed.message || `app manage failed: ${context}`);
+    }
+  }
 }

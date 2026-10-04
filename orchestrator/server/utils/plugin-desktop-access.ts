@@ -6,7 +6,7 @@ import type { PluginInstallationRecord } from "./plugin-installation-store";
  * client-supplied backend, display number, container name, or port is accepted. */
 export function resolvePluginDesktop(
   auth: AuthContext | null,
-  worker: { id: string; userId: string; status: string; containerId: string; containerName: string } | undefined,
+  worker: { id: string; userId: string; status: string; containerId: string; containerName: string; runtimeKind?: 'legacy-docker' | 'incus-vm' } | undefined,
   installation: PluginInstallationRecord | undefined,
   definition: PluginDefinitionRecord | undefined,
   target: { workerId: string; installationId: string; actionId: string; displayId: string },

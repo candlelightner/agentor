@@ -1,15 +1,13 @@
 import type { Duplex } from 'node:stream';
 import type { Peer } from 'crossws';
-import { useDockerService, useContainerManager } from './services';
+import { useContainerManager } from './services';
 import { getPeerId, getPeerUrl, toBuffer } from './ws-utils';
 import { authenticateWsPeer } from './auth-helpers';
 
 interface TerminalContext {
-  dockerStream?: Duplex;
-  execId?: string;
-  /** The Docker container id (resolved from the worker UUID) for tmux cleanup. */
-  dockerContainerId?: string;
-  tmuxSession?: string;
+  stream?: Duplex;
+  resize?: (cols: number, rows: number) => void;
+  close?: () => void;
   closed: boolean;
 }
 
@@ -29,8 +27,7 @@ function cleanupPeerContext(peer: Peer): void {
   peerContexts.delete(getPeerId(peer));
 }
 
-// The first capture is the worker's UUID `id` (the route segment), NOT a Docker
-// container id — the handler resolves the live Docker container id from it.
+// The first capture is the worker's UUID `id`, not a runtime handle.
 function parseWsParams(url: string | undefined): { workerId: string; windowIndex: number } | null {
   if (!url) return null;
   const match = url.match(/\/ws\/terminal\/([^/?]+)(?:\/([^/?]+))?/);
@@ -43,16 +40,12 @@ function parseWsParams(url: string | undefined): { workerId: string; windowIndex
 function cleanupTerminal(ctx: TerminalContext, peer: Peer): void {
   if (ctx.closed) return;
   ctx.closed = true;
-  ctx.dockerStream?.end();
-  if (ctx.dockerContainerId && ctx.tmuxSession) {
-    useDockerService().killTmuxSession(ctx.dockerContainerId, ctx.tmuxSession);
-  }
+  ctx.close?.();
   cleanupPeerContext(peer);
 }
 
 function handleTerminalOpen(peer: Peer): void {
   const ctx = getTerminalContext(peer);
-  const dockerService = useDockerService();
   const params = parseWsParams(getPeerUrl(peer));
 
   if (!params) {
@@ -61,7 +54,7 @@ function handleTerminalOpen(peer: Peer): void {
     return;
   }
 
-  // Authenticate & authorize before opening the Docker exec
+  // Authenticate & authorize before opening the runtime terminal.
   (async () => {
     const auth = await authenticateWsPeer(peer);
     if (!auth) {
@@ -81,22 +74,18 @@ function handleTerminalOpen(peer: Peer): void {
       return;
     }
 
-    // `params.workerId` is the worker's UUID `id` (the route segment); Docker
-    // exec needs the actual Docker container id, which lives on the resolved info.
-    const dockerContainerId = info.containerId;
-    dockerService
-    .execAttachTmuxWindow(dockerContainerId, params.windowIndex)
-    .then(({ exec, stream, tmuxSession }) => {
+    // Runtime-specific dispatch keeps the frontend protocol unchanged.
+    useContainerManager()
+    .attachTerminal(params.workerId, params.windowIndex)
+    .then(({ stream, resize, close }) => {
       if (ctx.closed) {
-        stream.end();
-        dockerService.killTmuxSession(dockerContainerId, tmuxSession);
+        close();
         return;
       }
 
-      ctx.dockerStream = stream;
-      ctx.execId = exec.id;
-      ctx.dockerContainerId = dockerContainerId;
-      ctx.tmuxSession = tmuxSession;
+      ctx.stream = stream;
+      ctx.resize = resize;
+      ctx.close = close;
 
       stream.on('data', (chunk: Buffer) => {
         if (ctx.closed) return;
@@ -114,7 +103,7 @@ function handleTerminalOpen(peer: Peer): void {
       });
 
       stream.on('error', (err) => {
-        useLogger().error(`[terminal-ws] Docker stream error: ${err.message}`);
+        useLogger().error('[terminal-ws] Worker terminal stream failed');
         cleanupTerminal(ctx, peer);
         try { peer.close(); } catch {}
       });
@@ -122,7 +111,7 @@ function handleTerminalOpen(peer: Peer): void {
     .catch((err) => {
       useContainerManager().reportRuntimeFailure(
         params.workerId,
-        'Docker terminal attach',
+        'Worker terminal attach',
         err,
       );
       useLogger().error(
@@ -138,9 +127,7 @@ function handleTerminalOpen(peer: Peer): void {
 
 function handleTerminalMessage(peer: Peer, message: unknown): void {
   const ctx = getTerminalContext(peer);
-  if (ctx.closed || !ctx.dockerStream) return;
-
-  const dockerService = useDockerService();
+  if (ctx.closed || !ctx.stream) return;
 
   // Try to detect JSON resize messages
   let text: string | undefined;
@@ -163,15 +150,16 @@ function handleTerminalMessage(peer: Peer, message: unknown): void {
   if (text && text.length < 200 && text.charCodeAt(0) === 0x7b /* '{' */) {
     try {
       const parsed = JSON.parse(text);
-      if (parsed.type === 'resize' && parsed.cols && parsed.rows && ctx.execId) {
-        dockerService.resizeExec(ctx.execId, parsed.cols, parsed.rows).catch(() => {});
+      if (parsed.type === 'resize' && Number.isInteger(parsed.cols) && Number.isInteger(parsed.rows) &&
+          parsed.cols > 0 && parsed.rows > 0 && parsed.cols <= 16384 && parsed.rows <= 16384) {
+        ctx.resize?.(parsed.cols, parsed.rows);
         return;
       }
     } catch {}
   }
 
   const raw = toBuffer(message);
-  if (raw) ctx.dockerStream.write(raw);
+  if (raw) ctx.stream.write(raw);
 }
 
 function handleTerminalClose(peer: Peer): void {

@@ -31,9 +31,9 @@ export class WorkerLifecycleCoordinator {
   withWorker<T>(
     workerId: string,
     operation: () => Promise<T>,
-    options: { holdTimeoutSettlement?: boolean } = {},
+    options: { holdTimeoutSettlement?: boolean; runtimeSetup?: boolean } = {},
   ): Promise<T> {
-    this.generations.set(workerId, ++this.sequence);
+    if (!options.runtimeSetup) this.generations.set(workerId, ++this.sequence);
     const previous = this.queues.get(workerId) ?? Promise.resolve();
     const result = previous.catch(() => undefined).then(operation);
     const tail = result.then(
@@ -107,4 +107,13 @@ export function withOwnerWorkerLifecycleMutation<T>(
     withWorkerLifecycleMutation(workerId, operation),
     { holdTimeoutSettlement: false },
   );
+}
+
+/** Brief name-based exec setup shares the existing lifecycle queues without
+ * claiming a lifecycle mutation. Release after channels attach, not command
+ * completion, so stop/rebuild can still cancel a long-running guest process. */
+export function withOwnerWorkerRuntimeSetup<T>(userId: string, workerId: string, operation: () => Promise<T>): Promise<T> {
+  return lifecycleCoordinator.withWorker(`owner:${userId}`, () =>
+    lifecycleCoordinator.withWorker(workerId, operation, { runtimeSetup: true }),
+    { runtimeSetup: true, holdTimeoutSettlement: false });
 }

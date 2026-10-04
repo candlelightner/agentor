@@ -46,7 +46,7 @@ case "$1" in
     # `stdbuf -oL` on tee forces line-buffering so the device-code prompt lands
     # in the log file immediately instead of waiting for a full buffer to fill.
     code tunnel --accept-server-license-terms --name "$NAME" \
-      > >(stdbuf -oL tee -a "$LOG_FILE" | stdbuf -oL -eL sed -u 's/^/[vscode-tunnel] /' >> /proc/1/fd/1) 2>&1 &
+      > >(stdbuf -oL tee -a "$LOG_FILE" | stdbuf -oL -eL sed -u 's/^/[vscode-tunnel] /' | app_log) 2>&1 &
 
     echo "$!" > "$PID_FILE"
     printf '{"id":"%s","port":0,"status":"running"}\n' "${ID:-vscode}"

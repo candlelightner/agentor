@@ -39,6 +39,7 @@ import { PersistentBackupPathManager } from "./persistent-backup-paths";
 import { HostMountStore } from "./host-mount-store";
 import { HardwareDeviceStore } from "./hardware-device-store";
 import { IncusClient } from "./incus-client";
+import { IncusWorkerCommands } from "./incus-worker-commands";
 
 function singleton<T>(factory: () => T): () => T {
   let instance: T | undefined;
@@ -159,6 +160,13 @@ export const usePluginRuntimeManager = singleton(
           return worker && worker.status === "running"
             ? worker.containerId
             : undefined;
+        },
+        async (workerId, command, signal) => {
+          if (useContainerManager().get(workerId)?.runtimeKind !== 'incus-vm') return undefined;
+          const commands = useContainerManager().workerCommands(workerId);
+          if (!(commands instanceof IncusWorkerCommands)) throw new Error('Worker plugin runtime changed');
+          const { stream, stderr: sourceError } = await commands.openDuplex(command, signal);
+          return { stream, demux: (stdout, stderr) => { stream.pipe(stdout); sourceError.pipe(stderr); } };
         },
       ),
       {

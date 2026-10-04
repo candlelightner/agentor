@@ -490,6 +490,10 @@ export class DockerPluginWorkerExecutor implements PluginWorkerExecutor {
     private readonly resolveContainerId: (
       workerId: string,
     ) => string | undefined,
+    private readonly openAlternate?: (workerId: string, command: string[], signal: AbortSignal) => Promise<{
+      stream: Duplex;
+      demux: (stdout: PassThrough, stderr: PassThrough) => void;
+    } | undefined>,
   ) {}
 
   execute(request: PluginExecutionRequest): Promise<PluginExecutionResult> {
@@ -551,9 +555,14 @@ export class DockerPluginWorkerExecutor implements PluginWorkerExecutor {
         504,
       );
     let stream: Duplex;
-    let container: Docker.Container;
+    let demux: (stdout: PassThrough, stderr: PassThrough) => void;
     try {
-      container = this.docker.getContainer(containerId);
+      const alternate = await this.openAlternate?.(workerId, ["/home/agent/apps/plugin-runner/runner.py", operation], signal);
+      if (alternate) {
+        stream = alternate.stream;
+        demux = alternate.demux;
+      } else {
+      const container = this.docker.getContainer(containerId);
       const exec = await withOperationDeadline(
         (operationSignal) => container.exec({
           Cmd: ["/home/agent/apps/plugin-runner/runner.py", operation],
@@ -585,6 +594,8 @@ export class DockerPluginWorkerExecutor implements PluginWorkerExecutor {
         "Docker plugin-runner start",
         signal,
       )) as Duplex;
+      demux = (stdout, stderr) => container.modem.demuxStream(stream, stdout, stderr);
+      }
     } catch (error) {
       if ((error as { code?: unknown })?.code === "PLUGIN_RUNTIME_TIMEOUT")
         throw error;
@@ -692,7 +703,7 @@ export class DockerPluginWorkerExecutor implements PluginWorkerExecutor {
       };
       stream.once("end", complete);
       stream.once("close", complete);
-      container.modem.demuxStream(stream, stdout, stderr);
+      demux(stdout, stderr);
       // The newline is the frame boundary. Docker hijacked sockets do not
       // reliably propagate a write-side EOF, so the runner reads exactly one
       // bounded record rather than waiting for stream.end().

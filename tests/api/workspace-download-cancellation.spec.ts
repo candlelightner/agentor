@@ -134,7 +134,7 @@ test("the worker-card workspace download forwards cancellation into Docker archi
       expect(id).toBe(info.id);
       return info;
     },
-    dockerService: {
+    workerCommands: () => ({
       getWorkspaceArchive: async (
         containerId: string,
         signal?: AbortSignal,
@@ -143,7 +143,7 @@ test("the worker-card workspace download forwards cancellation into Docker archi
         receivedSignal = signal;
         return dockerTar;
       },
-    },
+    }),
   };
 
   await expect(

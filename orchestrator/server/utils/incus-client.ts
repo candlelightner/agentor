@@ -1013,6 +1013,7 @@ export class IncusClient {
     name: string,
     command: string[],
     options?: IncusInstanceExecOptions,
+    attachData?: (socket: WebSocket) => void,
   ): Promise<IncusInteractiveExecSession> {
     const payload = {
       command,
@@ -1043,7 +1044,8 @@ export class IncusClient {
       throw new IncusError('Incus interactive exec did not return required websocket descriptors');
     }
 
-    const sockets = await this.openExecWebSockets(opId, { '0': fds['0'], control: fds.control });
+    const sockets = await this.openExecWebSockets(opId, { '0': fds['0'], control: fds.control },
+      (fd, socket) => { if (fd === '0') attachData?.(socket); });
     const dataWs = sockets['0']!;
     const controlWs = sockets.control!;
     // Incus signals output EOF with a TEXT frame, not a WebSocket close.

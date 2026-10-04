@@ -8,6 +8,8 @@ import { backupInstallationId } from "./backup-installation";
 import { IncusWorkerStorage, type IncusStorageOwner } from "./incus-worker-storage";
 import { resolveIncusPrimaryLease } from "./incus-worker-network";
 import type { ContainerStatus } from "../../shared/types";
+import { IncusWorkerCommands } from "./incus-worker-commands";
+import { withOwnerWorkerRuntimeSetup } from "./worker-lifecycle-coordinator";
 
 export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & { sshAuthorizedKeys?: string };
 
@@ -81,6 +83,19 @@ export class IncusWorkerRuntime {
     if (!id || !await this.matchesWorkerIdentity(instance, id))
       throw new Error("Refusing to manage an Incus instance without matching Agentor installation/worker identity");
     return instance;
+  }
+
+  commands(owner: IncusStorageOwner, incarnation: string, validateRecord: () => void,
+    setup?: <T>(operation: () => Promise<T>) => Promise<T>,
+  ): IncusWorkerCommands {
+    return new IncusWorkerCommands(this.client, owner.containerName, `incus:${incarnation}`, async () => {
+      validateRecord();
+      const instance = await this.assertOwned(owner.containerName, owner.id);
+      validateRecord();
+      if (instance.config['user.agentor.owner'] !== owner.userId ||
+          instance.config['volatile.uuid'] !== incarnation || instance.status !== 'Running')
+        throw new Error('Incus command target ownership, incarnation or running state changed');
+    }, setup ?? ((operation) => withOwnerWorkerRuntimeSetup(owner.userId, owner.id, operation)));
   }
 
   private validateOptions(opts: IncusWorkerOptions): void {

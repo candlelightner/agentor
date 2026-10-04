@@ -12,6 +12,7 @@ import { withOperationDeadline } from "./operation-deadline";
 import { pluginAuthorityForTarget } from "./plugin-api";
 import { definitionVisibleToPluginSelf } from "./plugin-scope";
 import { useWorkerGroupStore } from "./services";
+import { IncusWorkerCommands } from "./incus-worker-commands";
 
 const docker = new Docker({ socketPath: "/var/run/docker.sock" });
 type Target = { workerId: string; installationId: string; actionId: string; displayId: string };
@@ -86,18 +87,29 @@ export const pluginDesktopWebSocket = {
       const target = { workerId: match[1]!, installationId: match[2]!, actionId: match[3]!, displayId: match[4]! };
       const initial = resolve(await authenticateWsPeer(peer), target);
       if (!initial.ready || initial.mode !== "isolated") throw new Error("not ready");
-      const container = docker.getContainer(initial.worker.containerId);
-      const exec = await withOperationDeadline(signal => container.exec({
-        Cmd: ["python3", "/home/agent/apps/plugin-runner/desktop_runtime.py", "connect", initial.installation.id, String(initial.display)],
-        User: "agent", AttachStdin: true, AttachStdout: true, AttachStderr: true, Tty: false, abortSignal: signal,
-      }), 10_000, "Desktop connection", state.controller.signal);
-      const stream = await withOperationDeadline(signal => exec.start({ hijack: true, stdin: true, Tty: false, abortSignal: signal }), 10_000, "Desktop stream", state.controller.signal) as Duplex;
+      let stream: Duplex;
+      let demux: (stdout: PassThrough, stderr: PassThrough) => void;
+      if (initial.worker.runtimeKind === 'incus-vm') {
+        const commands = useContainerManager().workerCommands(initial.worker.id);
+        if (!(commands instanceof IncusWorkerCommands)) throw new Error('Worker desktop runtime changed');
+        const transport = await commands.openDuplex(["python3", "/home/agent/apps/plugin-runner/desktop_runtime.py", "connect", initial.installation.id, String(initial.display)], state.controller.signal);
+        stream = transport.stream;
+        demux = (stdout, stderr) => { stream.pipe(stdout); transport.stderr.pipe(stderr); };
+      } else {
+        const container = docker.getContainer(initial.worker.containerId);
+        const exec = await withOperationDeadline(signal => container.exec({
+          Cmd: ["python3", "/home/agent/apps/plugin-runner/desktop_runtime.py", "connect", initial.installation.id, String(initial.display)],
+          User: "agent", AttachStdin: true, AttachStdout: true, AttachStderr: true, Tty: false, abortSignal: signal,
+        }), 10_000, "Desktop connection", state.controller.signal);
+        stream = await withOperationDeadline(signal => exec.start({ hijack: true, stdin: true, Tty: false, abortSignal: signal }), 10_000, "Desktop stream", state.controller.signal) as Duplex;
+        demux = (stdout, stderr) => container.modem.demuxStream(stream, stdout, stderr);
+      }
       state.stream = stream;
       if (state.closed) { stream.destroy(); return; }
       const stdout = state.stdout = new PassThrough(); const stderr = state.stderr = new PassThrough(); stderr.resume();
       stdout.on("data", (bytes: Buffer) => { try { peer.send(bytes); } catch { close(peer, state); } });
       stream.on("error", () => close(peer, state)); stream.on("end", () => close(peer, state)); stream.on("close", () => close(peer, state));
-      container.modem.demuxStream(stream, stdout, stderr);
+      demux(stdout, stderr);
       for (const bytes of state.pending) stream.write(bytes); state.pending = []; state.bytes = 0;
       let checking = false;
       state.timer = setInterval(async () => {

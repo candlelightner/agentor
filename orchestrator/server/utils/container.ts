@@ -11,9 +11,10 @@ import { getAppType } from "./apps";
 import { createReadStream } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
-import type { Readable } from "node:stream";
+import type { Readable, Duplex } from "node:stream";
 import * as tar from "tar-stream";
 import { DockerService } from "./docker";
+import { IncusWorkerCommands } from "./incus-worker-commands";
 import type {
   EnvironmentJsonPayload,
   CapabilityJsonEntry,
@@ -109,6 +110,7 @@ import {
   isWorkerLifecycleMutationActive,
   withOwnerLifecycleMutation,
   withOwnerWorkerLifecycleMutation,
+  withOwnerWorkerRuntimeSetup,
   withWorkerLifecycleMutation,
   workerLifecycleGeneration,
   workerLifecycleSequence,
@@ -1175,6 +1177,40 @@ export class ContainerManager {
     return this.containers.get(id);
   }
 
+  /** Dispatch only command/file operations. Captured record and UUID fence a
+   * delayed exec or disconnect cleanup away from a replacement VM. */
+  workerCommands(id: string): DockerService | IncusWorkerCommands {
+    const info = this.assertRunning(id);
+    if (info.runtimeKind !== 'incus-vm') return this.dockerService;
+    const incarnation = info.containerId.slice('incus:'.length);
+    const generation = workerLifecycleGeneration(id);
+    return this.incusRuntime.commands({ id, userId: info.userId, containerName: info.containerName }, incarnation, () => {
+      const current = this.get(id), record = this.workerStore?.findById(id);
+      if (!record || record.runtimeKind !== 'incus-vm' || record.status !== 'active' || record.deletionPending ||
+          record.userId !== info.userId || current?.runtimeKind !== 'incus-vm' || current.userId !== info.userId ||
+          current.containerId !== info.containerId || current.status !== 'running' ||
+          workerLifecycleGeneration(id) !== generation)
+        throw new Error('Incus worker command authority changed; retry');
+    }, (operation) => withOwnerWorkerRuntimeSetup(info.userId, id, operation));
+  }
+
+  async attachTerminal(id: string, windowIndex: number): Promise<{ stream: Duplex; resize: (cols: number, rows: number) => void; close: () => void }> {
+    const info = this.assertRunning(id);
+    const commands = this.workerCommands(id);
+    if (commands instanceof IncusWorkerCommands) return commands.attachTerminal(windowIndex);
+    const session = await commands.execAttachTmuxWindow(info.containerId, windowIndex);
+    let closed = false;
+    return { stream: session.stream,
+      resize: (cols, rows) => { void commands.resizeExec(session.exec.id, cols, rows).catch(() => {}); },
+      close: () => {
+        if (closed) return;
+        closed = true;
+        session.stream.end();
+        void commands.killTmuxSession(info.containerId, session.tmuxSession).catch(() => {});
+      },
+    };
+  }
+
   /** Preserve legacy Docker DNS; VM destinations come from filtered host
    * leases and the current daemon incarnation, never guest-reported IPs. */
   async resolveWorkerHost(id: string): Promise<string> {
@@ -1615,7 +1651,7 @@ export class ContainerManager {
 
   async uploadToWorkspace(id: string, tarBuffer: Buffer): Promise<void> {
     const info = this.assertRunning(id);
-    await this.dockerService.putWorkspaceArchive(info.containerId, tarBuffer);
+    await this.workerCommands(id).putWorkspaceArchive(info.containerId, tarBuffer);
   }
 
   async downloadWorkspace(
@@ -1623,7 +1659,7 @@ export class ContainerManager {
     signal?: AbortSignal,
   ): Promise<NodeJS.ReadableStream> {
     const info = this.assertRunning(id);
-    return this.dockerService.getWorkspaceArchive(info.containerId, signal);
+    return this.workerCommands(id).getWorkspaceArchive(info.containerId, signal);
   }
 
   // --- Full /workspace file manager ---
@@ -1662,7 +1698,7 @@ export class ContainerManager {
   async listFiles(id: string, path: string): Promise<FileListing> {
     const containerId = this.dockerIdForFiles(id);
     const rel = normalizeClientPath(path, { allowRoot: true });
-    return probeList(this.dockerService, containerId, rel);
+    return probeList(this.workerCommands(id), containerId, rel);
   }
 
   /** A read-only absolute-path listing used solely by the backup selector.
@@ -1693,7 +1729,7 @@ try:
  print(json.dumps({'path':p,'entries':out[:1000]}))
 except FileNotFoundError: print(json.dumps({'error':'not_found'}))
 except PermissionError: print(json.dumps({'error':'forbidden'}))`;
-    const result = await this.dockerService.execCapture(containerId, ["python3", "-c", script, selected], { user: "agent" });
+    const result = await this.workerCommands(id).execCapture(containerId, ["python3", "-c", script, selected], { user: "agent" });
     if (result.exitCode !== 0) throw Object.assign(new Error("Backup path listing failed"), { statusCode: 502 });
     let value: any;
     try { value = JSON.parse(result.stdout.toString("utf8")); } catch { throw Object.assign(new Error("Backup path listing failed"), { statusCode: 502 }); }
@@ -1714,7 +1750,7 @@ for p in sys.argv[1:]:
   if not os.access(p,os.R_OK): raise PermissionError(p)
  except FileNotFoundError: print('missing',file=sys.stderr);sys.exit(2)
  except PermissionError: print('unreadable',file=sys.stderr);sys.exit(3)`;
-    const result = await this.dockerService.execCapture(containerId, ["python3", "-c", script, ...selected], { user: "agent" });
+    const result = await this.workerCommands(id).execCapture(containerId, ["python3", "-c", script, ...selected], { user: "agent" });
     if (result.exitCode === 2) throw Object.assign(new Error("Selected backup path was not found"), { statusCode: 404 });
     if (result.exitCode === 3) throw Object.assign(new Error("Selected backup path is not readable"), { statusCode: 403 });
     if (result.exitCode !== 0) throw Object.assign(new Error("Selected backup path could not be validated"), { statusCode: 409 });
@@ -1740,7 +1776,7 @@ for p in sys.argv[1:]:
     const dest = normalizeClientPath(destRel, { allowRoot: true });
 
     // Destination must exist and be a directory contained in /workspace.
-    const destEntry = await probeLstat(this.dockerService, containerId, dest);
+    const destEntry = await probeLstat(this.workerCommands(id), containerId, dest);
     if (destEntry.type !== "directory") {
       const err = new Error(
         "Upload destination is not a directory",
@@ -1792,7 +1828,7 @@ for p in sys.argv[1:]:
     // parent is an escaping symlink is rejected here — even when overwrite is
     // true). With overwrite=false it also surfaces conflicts.
     const { existing, escaping } = await runProbeCheckMany(
-      this.dockerService,
+      this.workerCommands(id),
       containerId,
       targets.map((t) => t.rel),
     );
@@ -1865,7 +1901,7 @@ for p in sys.argv[1:]:
     for await (const chunk of pack) chunks.push(chunk as Buffer);
     const tarBuffer = Buffer.concat(chunks);
 
-    await this.dockerService.putArchive(containerId, tarBuffer, "/workspace");
+    await this.workerCommands(id).putArchive(containerId, tarBuffer, "/workspace");
     return { uploaded: count };
   }
 
@@ -1882,7 +1918,7 @@ for p in sys.argv[1:]:
     // If the path already exists, honour idempotency (dir) or 409 (file).
     // probeLstat also enforces containment (realpath) for the existing path.
     try {
-      const entry = await probeLstat(this.dockerService, containerId, target);
+      const entry = await probeLstat(this.workerCommands(id), containerId, target);
       if (entry.type === "directory") return { ok: true };
       const err = new Error("A file already exists at that path") as Error & {
         statusCode?: number;
@@ -1900,7 +1936,7 @@ for p in sys.argv[1:]:
     // /workspace. check_many walks to the nearest existing ancestor for a
     // missing path and reports it as escaping when that ancestor escapes.
     const { escaping } = await runProbeCheckMany(
-      this.dockerService,
+      this.workerCommands(id),
       containerId,
       [target],
     );
@@ -1912,7 +1948,7 @@ for p in sys.argv[1:]:
       throw err;
     }
 
-    const res = await this.dockerService.execCapture(
+    const res = await this.workerCommands(id).execCapture(
       containerId,
       ["mkdir", "-p", full],
       { user: "agent" },
@@ -1947,13 +1983,13 @@ for p in sys.argv[1:]:
     const targetRel = parent === "" ? name : `${parent}/${name}`;
 
     // Source must exist and be contained.
-    await probeLstat(this.dockerService, containerId, src);
+    await probeLstat(this.workerCommands(id), containerId, src);
 
     // Target must not exist (no overwrite) and must not escape /workspace.
     // check_many reports a missing target as escaping when its nearest existing
     // ancestor escapes (e.g. renaming into a path under an escaping symlink).
     const { existing, escaping } = await runProbeCheckMany(
-      this.dockerService,
+      this.workerCommands(id),
       containerId,
       [targetRel],
     );
@@ -1976,7 +2012,7 @@ for p in sys.argv[1:]:
     const targetFull = toContainerPath(targetRel);
     // --no-target-directory (-T): treat the target as a file, not "move into dir".
     // --no-clobber (-n): never overwrite an existing target. Both via argv.
-    const res = await this.dockerService.execCapture(
+    const res = await this.workerCommands(id).execCapture(
       containerId,
       ["mv", "--no-target-directory", "--no-clobber", srcFull, targetFull],
       { user: "agent" },
@@ -1984,12 +2020,12 @@ for p in sys.argv[1:]:
     // GNU `mv -n` exits 0 even when it skipped because the target existed. We
     // already ruled out an existing target above, but a race could still cause a
     // skip — confirm the move actually happened by the post-move state.
-    const postSrc = await this.dockerService.execCapture(
+    const postSrc = await this.workerCommands(id).execCapture(
       containerId,
       ["test", "-e", srcFull],
       { user: "agent" },
     );
-    const postTarget = await this.dockerService.execCapture(
+    const postTarget = await this.workerCommands(id).execCapture(
       containerId,
       ["test", "-e", targetFull],
       { user: "agent" },
@@ -2027,7 +2063,7 @@ for p in sys.argv[1:]:
     const dest = normalizeClientPath(destRel, { allowRoot: true });
 
     // Destination must exist and be a directory.
-    const destEntry = await probeLstat(this.dockerService, containerId, dest);
+    const destEntry = await probeLstat(this.workerCommands(id), containerId, dest);
     if (destEntry.type !== "directory") {
       const err = new Error("Move destination is not a directory") as Error & {
         statusCode?: number;
@@ -2039,7 +2075,7 @@ for p in sys.argv[1:]:
     // Each source must exist and be contained; compute its target inside dest.
     const moves: { src: string; targetRel: string }[] = [];
     for (const src of srcs) {
-      await probeLstat(this.dockerService, containerId, src);
+      await probeLstat(this.workerCommands(id), containerId, src);
       const base = baseName(src);
       const targetRel = dest === "" ? base : `${dest}/${base}`;
       if (targetRel === src) continue; // already in the requested destination
@@ -2059,7 +2095,7 @@ for p in sys.argv[1:]:
     // under an escaping symlink is rejected) and, with overwrite=false, also
     // surfaces the conflict list.
     const { existing, escaping } = await runProbeCheckMany(
-      this.dockerService,
+      this.workerCommands(id),
       containerId,
       moves.map((m) => m.targetRel),
     );
@@ -2113,7 +2149,7 @@ for p in sys.argv[1:]:
       const srcFull = toContainerPath(m.src);
       const targetFull = toContainerPath(m.targetRel);
       if (overwrite && existing.includes(targetFull)) {
-        const removeTarget = await this.dockerService.execCapture(
+        const removeTarget = await this.workerCommands(id).execCapture(
           containerId,
           ["rm", "-rf", "--", targetFull],
           { user: "agent" },
@@ -2133,16 +2169,16 @@ for p in sys.argv[1:]:
         srcFull,
         targetFull,
       ];
-      const res = await this.dockerService.execCapture(containerId, mvArgs, {
+      const res = await this.workerCommands(id).execCapture(containerId, mvArgs, {
         user: "agent",
       });
       // Verify the move actually happened (defeats the mv -n exit-0-on-skip race).
-      const postSrc = await this.dockerService.execCapture(
+      const postSrc = await this.workerCommands(id).execCapture(
         containerId,
         ["test", "-e", srcFull],
         { user: "agent" },
       );
-      const postTarget = await this.dockerService.execCapture(
+      const postTarget = await this.workerCommands(id).execCapture(
         containerId,
         ["test", "-e", targetFull],
         { user: "agent" },
@@ -2175,7 +2211,7 @@ for p in sys.argv[1:]:
     // Probe existence (and containment) in one call so escaping symlinks are
     // rejected before any deletion, and missing paths are skipped idempotently.
     const { existing, escaping } = await runProbeCheckMany(
-      this.dockerService,
+      this.workerCommands(id),
       containerId,
       targets,
     );
@@ -2191,7 +2227,7 @@ for p in sys.argv[1:]:
     let deleted = 0;
     for (const rel of targets) {
       if (!existingSet.has(toContainerPath(rel))) continue;
-      const res = await this.dockerService.execCapture(
+      const res = await this.workerCommands(id).execCapture(
         containerId,
         ["rm", "-rf", "--", toContainerPath(rel)],
         { user: "agent" },
@@ -2240,7 +2276,7 @@ for p in sys.argv[1:]:
     for (const rel of targets) {
       signal?.throwIfAborted();
       const entry = await probeLstat(
-        this.dockerService,
+        this.workerCommands(id),
         containerId,
         rel,
         signal,
@@ -2252,7 +2288,7 @@ for p in sys.argv[1:]:
     // from the tar envelope into a plain file stream.
     if (entries.length === 1 && entries[0]!.type === "file") {
       const entry = entries[0]!;
-      const tarStream = await this.dockerService.getArchive(
+      const tarStream = await this.workerCommands(id).getArchive(
         containerId,
         toContainerPath(entry.path),
         signal,
@@ -2270,7 +2306,7 @@ for p in sys.argv[1:]:
     // sequential append/finalize detached so output backpressure cannot
     // deadlock; redundant descendant selections are filtered inside it.
     const zipStream = buildWorkspaceZip(
-      this.dockerService,
+      this.workerCommands(id),
       containerId,
       entries,
       signal,
@@ -2304,7 +2340,7 @@ for p in sys.argv[1:]:
     bytes: Buffer,
   ): Promise<{ ok: true }> {
     const containerId = this.dockerIdForFiles(id);
-    const res = await this.dockerService.execCapture(
+    const res = await this.workerCommands(id).execCapture(
       containerId,
       [
         "sh",
@@ -5434,7 +5470,7 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     try {
-      return await this.dockerService.execListTmuxWindows(info.containerId);
+      return await this.workerCommands(id).execListTmuxWindows(info.containerId);
     } catch (error) {
       this.markRuntimeUnknown(info, "Docker terminal inspection", error);
       throw error;
@@ -5447,14 +5483,14 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id)!;
     let windows: TmuxWindow[];
     try {
-      await this.dockerService.execTmux(containerId, [
+      await this.workerCommands(id).execTmux(containerId, [
         "new-window",
         "-t",
         "main:",
         "-n",
         windowName,
       ]);
-      windows = await this.dockerService.execListTmuxWindows(containerId);
+      windows = await this.workerCommands(id).execListTmuxWindows(containerId);
     } catch (error) {
       this.markRuntimeUnknown(info, "Docker terminal creation", error);
       throw error;
@@ -5471,7 +5507,7 @@ for p in sys.argv[1:]:
     windowIndex: number,
     newName: string,
   ): Promise<void> {
-    await this.dockerService.execTmux(this.dockerIdFor(id), [
+    await this.workerCommands(id).execTmux(this.dockerIdFor(id), [
       "rename-window",
       "-t",
       `main:${windowIndex}`,
@@ -5483,7 +5519,7 @@ for p in sys.argv[1:]:
     if (windowIndex === 0) {
       throw new Error("Cannot kill the main tmux window");
     }
-    await this.dockerService.execTmux(this.dockerIdFor(id), [
+    await this.workerCommands(id).execTmux(this.dockerIdFor(id), [
       "kill-window",
       "-t",
       `main:${windowIndex}`,
@@ -5506,7 +5542,7 @@ for p in sys.argv[1:]:
   ): Promise<AppInstanceInfo[]> {
     const info = this.containers.get(id);
     if (!info || info.status !== "running") return [];
-    const instances = await this.dockerService.listAppInstances(
+    const instances = await this.workerCommands(id).listAppInstances(
       info.containerId,
       appTypeId,
     );
@@ -5541,7 +5577,7 @@ for p in sys.argv[1:]:
       throw new Error(`Unknown app type: ${appTypeId}`);
     }
 
-    const existing = await this.dockerService.listAppInstances(
+    const existing = await this.workerCommands(id).listAppInstances(
       info.containerId,
       appTypeId,
     );
@@ -5615,7 +5651,7 @@ for p in sys.argv[1:]:
       );
     }
 
-    await this.dockerService.startAppInstance(
+    await this.workerCommands(id).startAppInstance(
       info.containerId,
       appTypeId,
       instanceId,
@@ -5698,7 +5734,7 @@ for p in sys.argv[1:]:
     instanceId: string,
   ): Promise<void> {
     const info = this.assertRunning(id);
-    await this.dockerService.stopAppInstance(
+    await this.workerCommands(id).stopAppInstance(
       info.containerId,
       appTypeId,
       instanceId,

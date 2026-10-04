@@ -119,7 +119,7 @@ export function demuxSingleFileFromTar(
  * backpressure and wires client-close cleanup.
  */
 export function buildWorkspaceZip(
-  docker: DockerService,
+  docker: Pick<DockerService, 'getArchive'>,
   containerId: string,
   entries: FileEntry[],
   signal?: AbortSignal,

@@ -54,11 +54,11 @@ case "$1" in
       {
         echo "[sshd] WARNING: $AUTH_KEYS_FILE does not exist — bind mount missing."
         echo "[sshd] WARNING: This worker predates the SSH app. Click 'Rebuild' on the worker to pick up the new bind mount."
-      } >> /proc/1/fd/1
+      } | app_log
       touch "$AUTH_KEYS_FILE"
       chmod 600 "$AUTH_KEYS_FILE"
     elif [ ! -s "$AUTH_KEYS_FILE" ]; then
-      echo "[sshd] WARNING: $AUTH_KEYS_FILE is empty — add a public key in 'Account → SSH Access' so sshd can accept logins." >> /proc/1/fd/1
+      echo "[sshd] WARNING: $AUTH_KEYS_FILE is empty — add a public key in 'Account → SSH Access' so sshd can accept logins." | app_log
     fi
 
     # Verbose diagnostic line — lands in the worker log pane so the operator
@@ -69,13 +69,13 @@ case "$1" in
       # Print the *type* of key(s) without revealing full material.
       awk '{print $1}' "$AUTH_KEYS_FILE" 2>/dev/null | sed 's/^/[sshd] key-type: /'
       /usr/sbin/sshd -t -f "$SSHD_CONFIG" 2>&1 | sed 's/^/[sshd] config-check: /' || true
-    } >> /proc/1/fd/1
+    } | app_log
 
     # Start sshd in the foreground (-D) with `-e` so connection diagnostics
     # land on stderr (captured by our redirect). Background it so the script
     # can return the running-status JSON while sshd keeps accepting clients.
     sudo /usr/sbin/sshd -D -e -f "$SSHD_CONFIG" -p "$PORT" \
-      > >(tee -a "$LOG_FILE" | stdbuf -oL -eL sed -u 's/^/[sshd] /' >> /proc/1/fd/1) 2>&1 &
+      > >(tee -a "$LOG_FILE" | stdbuf -oL -eL sed -u 's/^/[sshd] /' | app_log) 2>&1 &
 
     SSHD_PID=$!
 

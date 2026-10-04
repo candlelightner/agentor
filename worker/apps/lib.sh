@@ -6,6 +6,17 @@
 # `stop <id>`, `list`. These helpers cover the parts that were copy-pasted
 # across all four apps so a new app only has to define its launch line.
 
+# Keep app output out of the NDJSON command channel. Container PID 1 belongs
+# to agent; VM PID 1 is root-owned systemd, so use the guest journal instead.
+# If a log sink disappears, continue draining rather than SIGPIPE the app.
+app_log() {
+  if [ "$(cat /proc/1/comm)" = systemd ]; then
+    logger -t agentor-app || cat >/dev/null
+  else
+    cat >> /proc/1/fd/1 || cat >/dev/null
+  fi
+}
+
 # Emit a single-line `{"status":"error","message":"…"}` and exit non-zero.
 # Uses jq (the image's standard JSON tool) to escape the message — no Python
 # process spawn. Usage: emit_err "human-readable cause"
