@@ -26,6 +26,7 @@ COPY --from=builder /app/.output/ .output/
 # network-disabled helper uses it to stop/apply/restart an instance restore.
 COPY --from=builder /app/instance-restore-helper.mjs .output/server/instance-restore-helper.mjs
 COPY --from=builder /app/volume-mount-helper.py .output/server/volume-mount-helper.py
+COPY --from=builder /app/incus-volume-live-helper.py .output/server/incus-volume-live-helper.py
 
 EXPOSE 3000
 

@@ -484,6 +484,156 @@ assert os.stat(a).st_mtime_ns==1700000000123456789
   }
 });
 
+test('trusted production guest helper copies live metadata, rejects busy paths and cold-contains lost controller', async () => {
+  test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable production helper gate');
+  test.setTimeout(600_000);
+  const { config, manager, store, volumes, runtime } = await productionManagerFixture();
+  const managed = new IncusManagedVolumeRuntime(config, runtime);
+  let info: any, failed = false;
+  const records: any[] = [];
+  const exec = async (command: string[]) => {
+    const result = await runtime.client.exec(info.containerName, command);
+    expect(result.returnCode, result.stdout + result.stderr).toBe(0);
+    return result.stdout.trim();
+  };
+  const begin = async (v: any, bootId: string, agent: string) => {
+    const id = randomUUID(), path = `/run/agentor/live-volumes/${id}`;
+    v.incusLive = { id, incarnation: info.containerId.slice(6), bootId, attachment: 'not-submitted' };
+    await volumes.store.save(v);
+    await exec(['bash', '-ec', 'install -d -m 700 -- "$1"', 'helper-state', path]);
+    for (const name of ['volume-mount-helper.py', 'incus-volume-live-helper.py'])
+      await runtime.client.pushFile(info.containerName, `${path}/${name}`,
+        await readFile(new URL(`../../orchestrator/${name}`, import.meta.url)), { mode: 0o600 });
+    await exec(['bash', '-ec',
+      'umask 077; nohup python3 -I "$1/incus-volume-live-helper.py" "$2" new "$3" "$4" "$5" >"$1/log" 2>&1 </dev/null &',
+      'start-helper', path, v.target, agent, bootId, id]);
+    await exec(['timeout', '10', 'bash', '-ec', 'until test -f "$1/armed"; do test ! -f "$1/error"; sleep .05; done', 'arm', path]);
+    await exec(['touch', `${path}/begin`]);
+    return path;
+  };
+  const wait = async (path: string, marker: string) => exec(['timeout', '15', 'bash', '-ec',
+    'until test -f "$1/$2"; do test ! -f "$1/error"; sleep .05; done', 'wait-helper', path, marker]);
+  const attach = async (v: any, path: string) => {
+    await wait(path, 'ready');
+    await exec(['touch', `${path}/request-attach`]);
+    await wait(path, 'attach-armed');
+    v.incusLive.attachment = 'unknown'; await volumes.store.save(v);
+    const instance = await managed.inspect(v.userId, v.workerId, info.containerId);
+    await runtime.client.updateInstanceDevices(info.containerName, { ...instance.devices, [managed.deviceKey(v)]: managed.device(v) }, async operation => {
+      v.incusLive.attachment = operation ? 'accepted' : 'settled';
+      v.incusLive.operation = operation; await volumes.store.save(v);
+    });
+    v.incusLive.attachment = 'settled'; await volumes.store.save(v);
+    // Daemon operation completion is not guest mount convergence. The helper
+    // deliberately requires authoritative guest observation before copy.
+    await exec(['timeout', '15', 'bash', '-ec', 'until mountpoint -q -- "$1"; do sleep .05; done', 'canonical-mount-ready', v.target]);
+    await exec(['touch', `${path}/mount-settled`]);
+  };
+  try {
+    info = await (manager as any).createForOwner({ userId: 'managed-live-owner', displayName: 'production helper gate' });
+    const boot = (await runtime.inspectGuestReadiness(info, info.containerId.slice(6))).bootId!;
+    const service = await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'agentor-worker']);
+    const agent = await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'incus-agent']);
+    const agentGroup = await exec(['cat', `/proc/${agent}/cgroup`]);
+    await exec(['bash', '-ec', 'mkdir /sys/fs/cgroup/helper-prior-frozen; echo 1 > /sys/fs/cgroup/helper-prior-frozen/cgroup.freeze']);
+    const target = '/opt/production-helper-data';
+    await exec(['python3', '-c', String.raw`
+import os,pathlib,sys,struct
+p=pathlib.Path(sys.argv[1]);p.mkdir();a=p/'bytes';a.write_bytes(bytes([0,255,10,128]))
+os.chown(a,1000,1000);os.chmod(a,0o640);os.link(a,p/'hardlink');os.symlink('bytes',p/'symlink')
+os.setxattr(a,'user.agentor-helper',b'preserved')
+acl=struct.pack('<I',2)+b''.join(struct.pack('<HHI',*e) for e in [(1,6,0xffffffff),(2,4,1001),(4,0,0xffffffff),(16,4,0xffffffff),(32,0,0xffffffff)])
+os.setxattr(a,'system.posix_acl_access',acl);os.utime(a,ns=(1700000000000000000,1700000000123456789))
+`, target]);
+    await exec(['bash', '-ec', 'cp /bin/true "$1/capability-exec"; setcap cap_net_bind_service=ep "$1/capability-exec"', 'helper-capability', target]);
+    const verify = String.raw`
+import os,pathlib,sys,struct
+p=pathlib.Path(sys.argv[1]);a=p/'bytes'
+assert a.read_bytes()==bytes([0,255,10,128]);assert os.stat(a).st_ino==os.stat(p/'hardlink').st_ino
+assert os.readlink(p/'symlink')=='bytes';assert os.stat(a).st_uid==1000 and os.stat(a).st_gid==1000
+assert os.stat(a).st_mode & 0o777 == 0o640;assert os.getxattr(a,'user.agentor-helper')==b'preserved'
+acl=struct.pack('<I',2)+b''.join(struct.pack('<HHI',*e) for e in [(1,6,0xffffffff),(2,4,1001),(4,0,0xffffffff),(16,4,0xffffffff),(32,0,0xffffffff)])
+assert os.getxattr(a,'system.posix_acl_access')==acl;assert os.stat(a).st_mtime_ns==1700000000123456789
+`;
+    const v = await volumes.store.create(info.userId, info.id, target, undefined, 'incus-vm'); records.push(v);
+    await managed.ensureVolume(v);
+    const path = await begin(v, boot, agent);
+    await attach(v, path); await wait(path, 'copied');
+    await exec(['python3', '-c', verify, target]);
+    await exec(['bash', '-ec', 'getcap "$1/capability-exec" | grep -q cap_net_bind_service=ep', 'verify-helper-capability', target]);
+    expect(volumes.isRecoveryBlocked(info.id)).toBe(true);
+    await expect(manager.workerCommands(info.id).execCapture(info.containerId, ['true'])).rejects.toThrow('live storage recovery is unresolved');
+    v.seeded = true; await volumes.store.save(v); // Must precede writer release.
+    await exec(['touch', `${path}/release`]); await wait(path, 'restored');
+    delete v.incusLive; await volumes.store.save(v);
+    expect(await exec(['cat', `/proc/${agent}/cgroup`])).toBe(agentGroup);
+    expect(await exec(['cat', '/sys/fs/cgroup/helper-prior-frozen/cgroup.freeze'])).toBe('1');
+    expect((await runtime.inspectGuestReadiness(info, info.containerId.slice(6))).bootId).toBe(boot);
+    expect(await exec(['systemctl', 'show', '-p', 'MainPID', '--value', 'agentor-worker'])).toBe(service);
+    console.info('Production helper success: unchanged boot/service PID, metadata copy and prior frozen group preserved.');
+    // Busy FD rejection is before permission to attach and must safely thaw.
+    const busyTarget = '/opt/production-helper-busy';
+    await exec(['bash', '-ec', 'mkdir "$1"; echo busy >"$1/file"; nohup python3 -c "$2" "$1/file" >/run/helper-busy.log 2>&1 </dev/null &', 'busy', busyTarget,
+      'import pathlib,sys,time; f=open(sys.argv[1]); pathlib.Path("/run/helper-busy-ready").touch(); time.sleep(300)']);
+    await exec(['timeout', '10', 'bash', '-ec', 'until test -e /run/helper-busy-ready; do sleep .05; done']);
+    const busy = await volumes.store.create(info.userId, info.id, busyTarget, undefined, 'incus-vm'); records.push(busy);
+    await managed.ensureVolume(busy);
+    const busyPath = await begin(busy, boot, agent);
+    await exec(['timeout', '15', 'bash', '-ec', 'until test -e "$1/restored"; do sleep .05; done', 'busy-restored', busyPath]);
+    expect(JSON.parse(await exec(['cat', `${busyPath}/error`]))).toMatchObject({ beforeAttachment: true });
+    expect((await runtime.client.getInstance(info.containerName)).devices[managed.deviceKey(busy)]).toBeUndefined();
+    delete busy.incusLive; await volumes.store.save(busy);
+    expect(await exec(['cat', `/proc/${agent}/cgroup`])).toBe(agentGroup);
+    console.info('Production helper busy rejection: no attachment, original agent cgroup restored.');
+    // Lost controller after canonical attachment cannot thaw; the production
+    // watcher uses its real 180s budget and bounded sync, then guest poweroff.
+    const containedTarget = '/opt/production-helper-contained';
+    await exec(['bash', '-ec', 'mkdir "$1"; echo original >"$1/sentinel"', 'contained-source', containedTarget]);
+    const contained = await volumes.store.create(info.userId, info.id, containedTarget, undefined, 'incus-vm'); records.push(contained);
+    await managed.ensureVolume(contained);
+    const containedPath = await begin(contained, boot, agent);
+    await attach(contained, containedPath); await wait(containedPath, 'copied');
+    const armed = JSON.parse(await exec(['cat', `${containedPath}/armed`]));
+    await exec(['kill', '-KILL', String(armed.controller)]);
+    await expect.poll(async () => (await runtime.client.getInstanceState(info.containerName)).status,
+      { timeout: 210_000, intervals: [1000, 3000] }).toBe('Stopped');
+    expect(volumes.isRecoveryBlocked(info.id)).toBe(true);
+    await runtime.client.startInstance(info.containerName);
+    await expect.poll(async () => { try { return (await runtime.client.exec(info.containerName, ['true'])).returnCode; } catch { return -1; } },
+      { timeout: 120_000, intervals: [500, 1000] }).toBe(0);
+    await exec(['bash', '-ec', 'test ! -e /run/agentor/provisioned; ! systemctl is-active --quiet agentor-worker; ! systemctl is-active --quiet docker; test "$(cat "$1/sentinel")" = original', 'cold-check', containedTarget]);
+    await exec(['bash', '-ec', 'mkdir /run/helper-original; mount --bind / /run/helper-original; test "$(cat "/run/helper-original$1/sentinel")" = original', 'original-check', containedTarget]);
+    await exec(['python3', '-c', verify, target]);
+    await exec(['python3', '-c', verify, `/run/helper-original${target}`]);
+    await exec(['bash', '-ec', 'getcap "$1/capability-exec" | grep -q cap_net_bind_service=ep; getcap "/run/helper-original$1/capability-exec" | grep -q cap_net_bind_service=ep',
+      'cold-helper-capability', target]);
+    // TEST ONLY: settlement, exact identity and cold data are proven above;
+    // remove the fixture intent, not a claim of production recovery authority.
+    delete contained.incusLive; await volumes.store.save(contained);
+    console.info('Production guest helper: same-boot metadata copy; pre-frozen state; busy rejection/restoration; killed-controller cold containment and both data copies verified.');
+  } catch (error) {
+    failed = true;
+    if (info) try { console.error('Production-helper diagnostics:', await runtime.client.exec(info.containerName, ['bash', '-ec',
+      'for d in /run/agentor/live-volumes/*; do echo "$d"; cat "$d/log"; test ! -f "$d/error" || cat "$d/error"; test ! -f "$d/watchdog-error" || cat "$d/watchdog-error"; ls -l "$d"; done'])); } catch { /* retained below */ }
+    throw error;
+  } finally {
+    if (info) {
+      if (failed) {
+        // Failed proof retains all data and durable intent. Proven exact-owned
+        // fixture may be force-contained, never resumed or silently deleted.
+        const instance = await runtime.client.getInstance(info.containerName);
+        if (await runtime.matchesWorkerIdentity(instance, info.id, info.userId) && instance.config['volatile.uuid'] === info.containerId.slice(6))
+          await runtime.client.stopInstance(info.containerName, { force: true });
+        console.error('Retained production-helper fixture', info.containerName, records.map(v => v.id));
+      } else {
+        await runtime.remove(info, info.containerId.slice(6));
+        for (const v of records) { await managed.delete(v); await volumes.store.forget(v.userId, v.id); }
+        await runtime.removeStorage(info); await store.delete(info.userId, info.id);
+      }
+    }
+  }
+});
+
 test('real production backup selections hotplug without restart and refresh root data before storage recreation', async () => {
   test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable production selection gate');
   test.setTimeout(900_000);
