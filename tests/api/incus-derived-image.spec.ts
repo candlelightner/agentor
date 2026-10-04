@@ -36,6 +36,8 @@ test('early guest agent retains explicit shutdown ordering for background exec c
   expect(unit).toMatch(/^DefaultDependencies=no$/m);
   expect(unit).toMatch(/^Conflicts=.*\bshutdown\.target\b/m);
   expect(unit).toMatch(/^Before=.*\bshutdown\.target\b/m);
+  expect(unit).toMatch(/^After=.*\blocal-fs\.target\b/m);
+  expect(unit).toMatch(/^TimeoutStopSec=10s$/m);
 });
 
 test("real derived image boots unattended and waits for runtime provisioning", async () => {
@@ -85,6 +87,8 @@ test("real derived image boots unattended and waits for runtime provisioning", a
       "systemctl is-active --quiet incus-agent",
       "systemctl show incus-agent -p Conflicts --value | grep -qw shutdown.target",
       "systemctl show incus-agent -p Before --value | grep -qw shutdown.target",
+      "systemctl show incus-agent -p After --value | grep -qw local-fs.target",
+      "test \"$(systemctl show incus-agent -p TimeoutStopUSec --value)\" = 10s",
       "test ! -e /run/agentor/worker.env",
       "! systemctl is-active --quiet agentor-worker docker docker.socket containerd",
       "systemctl start agentor-worker",

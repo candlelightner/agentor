@@ -75,6 +75,34 @@ test('Incus archive preflight failures leave original compute and metadata activ
   });
 });
 
+test('failed Incus deletion withdraws running intent before shutdown and never resurrects late-stopped compute', async () => {
+  await fixture(async (manager, store, calls, info) => {
+    const runtime = (manager as any).incusRuntime;
+    runtime.remove = async () => {
+      expect(store.get(info.userId, info.id)?.desiredRuntimeStatus).toBe('stopped');
+      calls.push('attempt-remove'); throw new Error('bounded shutdown failure');
+    };
+    await expect(manager.remove(info.id)).rejects.toThrow('bounded shutdown failure');
+    expect(store.get(info.userId, info.id)).toMatchObject({ status: 'active', desiredRuntimeStatus: 'stopped' });
+    expect(manager.get(info.id)?.containerId).toBe('incus:original-uuid');
+    runtime.client = { getInstance: async () => ({ status: 'Stopped', config: { 'volatile.uuid': 'original-uuid' } }) };
+    runtime.matchesWorkerIdentity = async () => true;
+    runtime.start = async () => { throw new Error('Failed delete must not resurrect VM'); };
+    await manager.reconcileIncusWorkers();
+    expect(manager.get(info.id)?.status).toBe('stopped');
+    expect(calls).toEqual(['attempt-remove']);
+  });
+});
+
+test('Incus delete intent persistence failure never starts shutdown or storage cleanup', async () => {
+  await fixture(async (manager, store, calls, info) => {
+    store.setDesiredRuntimeStatus = async () => { throw new Error('intent write failed'); };
+    await expect(manager.remove(info.id)).rejects.toThrow('intent write failed');
+    expect(store.get(info.userId, info.id)).toMatchObject({ status: 'active', desiredRuntimeStatus: 'running' });
+    expect(calls).toEqual([]);
+  });
+});
+
 test('Incus archive requires matching active durable authority before touching compute', async () => {
   for (const invalid of ['missing', 'legacy', 'archived', 'deleting']) {
     await fixture(async (manager, store, calls, info) => {

@@ -3202,6 +3202,10 @@ for p in sys.argv[1:]:
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
     const incarnation = info.runtimeKind === 'incus-vm' ? this.capturedIncusIncarnation(info) : undefined;
+    // A graceful VM shutdown can finish after its bounded API response fails.
+    // Withdraw running intent first so reconciliation cannot resurrect a VM
+    // that the operator explicitly asked to delete. Retain data on failure.
+    if (info.runtimeKind === 'incus-vm') await this.persistDesiredRuntimeStatus(info, 'stopped');
     // Keep the authoritative entry when Docker removal fails. Dropping it in a
     // finally block made a retry resolve the stable worker UUID as though it
     // were a Docker container id, leaving the real container untracked and
