@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ManagedVolumeStore, PersistencePolicyStore, publicVolume, validatePersistenceTarget } from '../../orchestrator/server/utils/managed-volume-store';
+import { ManagedVolumeStore, PersistencePolicyStore, publicVolume, validatePersistenceTarget, managedVolumeRuntimeKind } from '../../orchestrator/server/utils/managed-volume-store';
 import { ManagedVolumeRuntime } from '../../orchestrator/server/utils/managed-volume-runtime';
 import { ManagedVolumeManager } from '../../orchestrator/server/utils/managed-volume-manager';
 
@@ -27,6 +27,26 @@ test('volume records survive restart and are owner scoped, idempotent and non-ov
     expect(publicVolume(first)).not.toHaveProperty('seeded');
     const reloaded = new ManagedVolumeStore(dir); await reloaded.init();
     expect(reloaded.get('owner-a', first.id)).toMatchObject({ target: '/opt/models', seeded: false, attached: true });
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('managed storage backend is durable internal authority and old records remain Docker', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'agentor-volume-runtime-'));
+  try {
+    const store = new ManagedVolumeStore(dir); await store.init();
+    const legacy = await store.create('legacy-owner', 'legacy-worker', '/opt/legacy');
+    expect(legacy.storageRuntimeKind).toBeUndefined();
+    expect(managedVolumeRuntimeKind(legacy)).toBe('legacy-docker');
+    const vm = await store.create('vm-owner', 'vm-worker', '/opt/vm', undefined, 'incus-vm');
+    expect(managedVolumeRuntimeKind(vm)).toBe('incus-vm');
+    expect(publicVolume(vm)).not.toHaveProperty('storageRuntimeKind');
+    await store.retainForDeletedOwner(vm.userId);
+    await rm(join(dir, 'users', vm.userId), { recursive: true, force: true });
+    const reloaded = new ManagedVolumeStore(dir); await reloaded.init();
+    expect(managedVolumeRuntimeKind(reloaded.get(vm.userId, vm.id)!)).toBe('incus-vm');
+    expect(managedVolumeRuntimeKind(reloaded.get(legacy.userId, legacy.id)!)).toBe('legacy-docker');
+    await expect(reloaded.save({ ...vm, storageRuntimeKind: 'foreign' as any })).rejects.toThrow('storage runtime');
+    expect(managedVolumeRuntimeKind(reloaded.get(vm.userId, vm.id)!)).toBe('incus-vm');
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 

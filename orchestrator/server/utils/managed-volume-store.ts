@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { join, posix } from "node:path";
 import type { ManagedVolume, PersistencePolicy } from "../../shared/managed-volumes";
+import type { WorkerRuntimeKind } from "../../shared/types";
 import { UserScopedJsonStore } from "./user-scoped-store";
 
 export function volumeError(statusCode: number, message: string) {
@@ -33,6 +34,9 @@ export function validatePersistenceTarget(input: unknown): string {
 export interface StoredManagedVolume extends ManagedVolume {
   /** Internal only. Never accepted from REST/MCP or exposed in public results. */
   dockerName: string;
+  /** Backend survives worker/account deletion. Missing historical value is Docker.
+   * Internal platform authority, never portable/public worker input. */
+  storageRuntimeKind?: WorkerRuntimeKind;
   seeded: boolean;
   /** A live mount is transient until a Docker-declared replacement exists. */
   liveContainerId?: string;
@@ -48,6 +52,8 @@ function validateRecord(v: StoredManagedVolume) {
       !["pending", "preparing", "ready", "failed", "detached"].includes(v.state) ||
       typeof v.attached !== "boolean" || typeof v.seeded !== "boolean")
     throw new Error("Invalid managed volume record");
+  if (v.storageRuntimeKind !== undefined && v.storageRuntimeKind !== 'legacy-docker' && v.storageRuntimeKind !== 'incus-vm')
+    throw new Error('Invalid managed volume storage runtime');
   if (v.purpose === "persistent-path") validatePersistenceTarget(v.target);
   return v.id;
 }
@@ -76,7 +82,7 @@ export class ManagedVolumeStore extends UserScopedJsonStore<string, StoredManage
     return this.listForUser(userId).filter((v) => v.workerId === workerId);
   }
 
-  async create(userId: string, workerId: string, target: string, name?: string) {
+  async create(userId: string, workerId: string, target: string, name?: string, storageRuntimeKind?: WorkerRuntimeKind) {
     validatePersistenceTarget(target);
     const volumes = this.forWorker(userId, workerId);
     const existing = volumes.find((v) => v.target === target && v.attached);
@@ -89,6 +95,7 @@ export class ManagedVolumeStore extends UserScopedJsonStore<string, StoredManage
     const record: StoredManagedVolume = {
       id, userId, workerId, target, name: volumeName(name, posix.basename(target)),
       dockerName: `agentor-persist-${id}`, purpose: "persistent-path",
+      ...(storageRuntimeKind ? { storageRuntimeKind } : {}),
       attached: true, seeded: false, state: "pending", createdAt: stamp, updatedAt: stamp,
     };
     await this.save(record);
@@ -120,8 +127,12 @@ class RetainedVolumeRecords extends UserScopedJsonStore<string, StoredManagedVol
 
 export function publicVolume(v: StoredManagedVolume): ManagedVolume {
   const { dockerName: _docker, seeded: _seeded, liveContainerId: _live,
-    previousRestartPolicy: _restart, ...result } = v;
+    previousRestartPolicy: _restart, storageRuntimeKind: _runtime, ...result } = v;
   return result;
+}
+
+export function managedVolumeRuntimeKind(v: StoredManagedVolume): WorkerRuntimeKind {
+  return v.storageRuntimeKind ?? 'legacy-docker';
 }
 
 export function volumeName(value: unknown, fallback: string) {
