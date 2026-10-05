@@ -40,7 +40,7 @@ export interface PortableManagedVolumeArchiveSummary {
 
 interface RawTarEntry {
   name: string;
-  type: "file" | "directory" | "symlink" | "hardlink";
+  type: "file" | "directory" | "symlink" | "hardlink" | "character-device" | "block-device" | "fifo";
   size: number;
   linkName?: string;
   headerOffset: number;
@@ -91,10 +91,36 @@ export async function validateIncusCanonicalRestoreArchive(
     requirePosixUstar: true,
     signal: limits.signal,
   });
+  validateNativeRootEntries(scan.entries, root, limits.signal);
+  return { entries: scan.entries.length, expandedBytes: scan.expandedBytes };
+}
+
+/** Docker logical filesystem bytes have a deliberately separate dialect:
+ * overlay whiteouts and named-volume devices/FIFOs are guest data. This grants
+ * no extraction authority. Only a fresh, exact worker-owned ext4 block inside
+ * an unprovisioned VM without shares may receive these unchanged bytes. Never
+ * expose this switch through the canonical/selected/managed validators. */
+export async function validateIncusDockerRestoreArchive(
+  archivePath: string,
+  limits: { maxEntries?: number; maxExpandedBytes?: number; signal?: AbortSignal } = {},
+): Promise<PortableManagedVolumeArchiveSummary> {
+  throwIfAborted(limits.signal);
+  const scan = await scanRawTar(archivePath, {
+    maxEntries: Math.min(limits.maxEntries ?? MAX_PORTABLE_MANAGED_VOLUME_ARCHIVE_ENTRIES,
+      MAX_PORTABLE_MANAGED_VOLUME_ARCHIVE_ENTRIES),
+    maxExpandedBytes: Math.min(limits.maxExpandedBytes ?? MAX_PORTABLE_MANAGED_VOLUME_EXPANDED_BYTES,
+      MAX_PORTABLE_MANAGED_VOLUME_EXPANDED_BYTES),
+    allowPortablePax: true, requirePosixUstar: true, allowDockerSpecials: true, signal: limits.signal,
+  });
+  validateNativeRootEntries(scan.entries, 'docker/', limits.signal);
+  return { entries: scan.entries.length, expandedBytes: scan.expandedBytes };
+}
+
+function validateNativeRootEntries(entries: RawTarEntry[], root: string, signal?: AbortSignal): void {
   const paths = new Map<string, RawTarEntry["type"]>(), regularFiles = new Set<string>();
   let rootSeen = false;
-  for (const entry of scan.entries) {
-    throwIfAborted(limits.signal);
+  for (const entry of entries) {
+    throwIfAborted(signal);
     const name = canonicalInnerName(entry.name, entry.type, root), bare = stripDirectorySlash(name);
     if (paths.has(bare)) throw invalidArchive("archive contains a duplicate or type-conflicting path");
     paths.set(bare, entry.type);
@@ -112,14 +138,13 @@ export async function validateIncusCanonicalRestoreArchive(
   }
   if (!rootSeen) throw invalidArchive(`archive is missing the ${root} root directory`);
   for (const path of paths.keys()) {
-    throwIfAborted(limits.signal);
+    throwIfAborted(signal);
     for (let ancestor = posix.dirname(path); ancestor !== "."; ancestor = posix.dirname(ancestor)) {
       const type = paths.get(ancestor);
       if (type !== undefined && type !== "directory")
         throw invalidArchive("archive writes below an explicit non-directory path");
     }
   }
-  return { entries: scan.entries.length, expandedBytes: scan.expandedBytes };
 }
 
 /** Explicit backup selections are not fixed-role archives. A selected file,
@@ -425,7 +450,8 @@ export async function validateAndExtractPortableManagedVolumePayload(
 
 async function scanRawTar(
   archivePath: string,
-  options: { maxEntries: number; maxExpandedBytes: number; allowPortablePax: boolean; requirePosixUstar?: boolean; signal?: AbortSignal },
+  options: { maxEntries: number; maxExpandedBytes: number; allowPortablePax: boolean; requirePosixUstar?: boolean;
+    allowDockerSpecials?: true; signal?: AbortSignal },
 ): Promise<RawTarScan> {
   if (!Number.isSafeInteger(options.maxEntries) || options.maxEntries < 0 ||
       !Number.isSafeInteger(options.maxExpandedBytes) || options.maxExpandedBytes < 0)
@@ -480,7 +506,20 @@ async function scanRawTar(
         offset = dataOffset + padded;
         continue;
       }
-      const type = parseType(typeFlag);
+      const type = parseType(typeFlag, options.allowDockerSpecials);
+      if (options.allowDockerSpecials) {
+        const device = type === 'character-device' || type === 'block-device';
+        // GNU POSIX headers leave these unused fields entirely NUL for normal
+        // entries. Device headers must carry actual, strictly parsed numbers.
+        const number = (offset: number, label: string) => !device && block.subarray(offset, offset + 8).every(byte => byte === 0)
+          ? 0 : readTarNumber(block, offset, 8, label);
+        const major = number(329, 'device major'), minor = number(337, 'device minor');
+        // Linux dev_t's public major/minor widths. Reject truncation/wrapping
+        // rather than letting GNU tar recreate a different device identity.
+        if (major > 0xfff || minor > 0xfffff ||
+            !device && (major !== 0 || minor !== 0))
+          throw invalidArchive('Docker archive contains invalid device numbers');
+      }
       const effectiveName = pendingPax?.path ?? name;
       const linkName = type === "symlink" || type === "hardlink"
         ? pendingPax?.linkpath ?? readTarString(block, 157, 100)
@@ -606,12 +645,15 @@ function canonicalLinkTarget(target: string, root = PORTABLE_MANAGED_VOLUME_ROOT
   return target;
 }
 
-function parseType(value: number): RawTarEntry["type"] {
+function parseType(value: number, allowDockerSpecials?: true): RawTarEntry["type"] {
   if (value === 0 || value === 48) return "file";
   if (value === 53) return "directory";
   if (value === 50) return "symlink";
   if (value === 49) return "hardlink";
-  // This explicitly rejects devices, FIFOs, GNU long names/links, sparse
+  if (allowDockerSpecials && value === 51) return 'character-device';
+  if (allowDockerSpecials && value === 52) return 'block-device';
+  if (allowDockerSpecials && value === 54) return 'fifo';
+  // Ordinary paths still reject devices/FIFOs. All dialects reject long
   // records and global PAX headers. A bounded per-file PAX allowlist is
   // consumed before this point for confined paths and filesystem metadata.
   throw invalidArchive("archive contains an unsupported tar entry type");
