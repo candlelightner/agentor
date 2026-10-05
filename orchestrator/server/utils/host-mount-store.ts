@@ -29,6 +29,7 @@ const PROTECTED_HOST_PATHS = [
   "/lib64",
   "/var/lib/docker",
   "/var/lib/containerd",
+  "/var/lib/incus",
 ] as const;
 
 export interface HostMountRevocation {
@@ -68,10 +69,12 @@ export function validateHostMountCatalogSource(
     );
   if (typeof input !== "string" || !input)
     throw statusError(400, "Host path is required");
-  if (/[\u0000-\u001f\u007f]/.test(input) || input.includes("\\") || input.includes(":"))
+  // Incus restricted.devices.disk.paths is a comma-separated allowlist. A
+  // catalog source must remain one exact entry when supplied to that policy.
+  if (/[\u0000-\u001f\u007f]/.test(input) || input.includes("\\") || input.includes(":") || input.includes(","))
     throw statusError(
       400,
-      "Host path must be an absolute POSIX path without control, backslash, or colon characters.",
+      "Host path must be an absolute POSIX path without control, backslash, colon, or comma characters.",
     );
   const canonical = posix.normalize(input);
   if (!posix.isAbsolute(input) || canonical !== input || input === "/")
