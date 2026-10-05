@@ -182,7 +182,8 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
     // Stopped synthetic VM: real native reference ownership, without another
     // boot/service fixture. Source images and original recovered VMs stay put.
     const peerConfig = { ...config, incusEnabled: true, incusEndpoint: 'https://127.0.0.1:18443',
-      containerPrefix: 'agentor-worker', incusStoragePool: 'default', incusWorkerImage: 'agentor-worker-phase7-bounded',
+      containerPrefix: 'agentor-worker', incusStoragePool: 'default',
+      incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase7-bounded',
       incusInternalGatewayUrl: 'http://10.159.68.1:38000', workerImagePrefix: '', workerImage: 'agentor-worker:latest' } as Config;
     const peerId = randomUUID(); peerOwner = { id: peerId, userId: network.userId, containerName: `agentor-worker-${peerId}` };
     await store.update(network.userId, network.id, { workerIds: [peerId] });
