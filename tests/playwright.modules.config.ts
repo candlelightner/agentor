@@ -34,6 +34,7 @@ export default defineConfig({
     "api/container-store-quarantine.spec.ts",
     "api/instance-backup-*.spec.ts",
     "api/instance-restore-helper.spec.ts",
+    "api/backup-original-runtime-fence.spec.ts",
     "api/managed-volume-store.spec.ts",
     "api/managed-network-update.spec.ts",
     "api/managed-network-authorization.spec.ts",

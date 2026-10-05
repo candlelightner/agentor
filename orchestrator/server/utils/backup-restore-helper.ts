@@ -4,7 +4,7 @@ import { createReadStream } from 'node:fs';
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { useConfig, useContainerManager, useDockerService, useStorageManager } from './services';
+import { useConfig, useContainerManager, useDockerService, useStorageManager, useWorkerStore } from './services';
 import { assertSafeUserId } from './user-id';
 import {
   operationSettlement,
@@ -49,12 +49,32 @@ except BaseException:
  raise
 `;
 
-/** Same-filesystem staged replacement for a stopped worker workspace. */
+/** This replacement helper only knows legacy storage. Never derive its source
+ * from a cached Docker handle when the durable worker has moved to Incus: that
+ * source may be retained migration rollback data, not the current workspace. */
+export async function assertLegacyOriginalRestoreTarget(userId: string, workerId: string) {
+ assertSafeUserId(userId);
+ const store = useWorkerStore();
+ await store.init();
+ const worker = useContainerManager().get(workerId);
+ const record = store.get(userId, workerId);
+ if (worker?.runtimeKind === 'incus-vm' || worker?.containerId.startsWith('incus:') || record?.runtimeKind === 'incus-vm')
+  throw Object.assign(new Error('Original workspace replacement for Incus workers is not available yet; restore into a new worker'), {
+   statusCode: 409, code: 'INCUS_ORIGINAL_RESTORE_CAPABILITY_PENDING',
+  });
+ if (!worker || worker.userId !== userId || worker.status !== 'stopped' ||
+     !record || record.userId !== userId || record.status !== 'active' || record.deletionPending || record.incusRecreation)
+  throw Object.assign(new Error('Original worker must be durably active and stopped for safe restore'), { statusCode: 409 });
+ return worker;
+}
+
+/** Same-filesystem staged replacement for a stopped legacy worker workspace. */
 export async function replaceStoppedWorkspace(userId:string,workerId:string,workspaceArchive:string,signal?:AbortSignal):Promise<void>{
  return withWorkerLifecycleMutation(workerId,async()=>{
  signal?.throwIfAborted();
- assertSafeUserId(userId);
- const cm=useContainerManager(),worker=cm.get(workerId);if(!worker||worker.userId!==userId||worker.status!=='stopped')throw new Error('Original worker must be stopped for safe restore');
+ await assertLegacyOriginalRestoreTarget(userId,workerId);
+ signal?.throwIfAborted();
+ const cm=useContainerManager();
  const storage=useStorageManager(),config=useConfig(),source=storage.mode==='directory'?join(storage.dataRef,'users',userId,'workspaces',workerId):`${cm.buildContainerName(workerId)}-workspace`;
  const docker=new Docker({socketPath:'/var/run/docker.sock'});
  if(storage.mode==='volume')await withOperationDeadline(docker.getVolume(source).inspect(),RESTORE_HELPER_DOCKER_TIMEOUT_MS,'Docker restore-workspace volume inspection',signal);else{const st=await lstat(source);if(!st.isDirectory()||st.isSymbolicLink())throw new Error('Workspace storage is not a safe directory');}

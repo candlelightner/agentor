@@ -64,7 +64,7 @@ import {
   extractBundle,
   readWorkerReconstruction,
 } from "./worker-export";
-import { replaceStoppedWorkspace } from "./backup-restore-helper";
+import { assertLegacyOriginalRestoreTarget, replaceStoppedWorkspace } from "./backup-restore-helper";
 import { useWorkerProtectionLockStore } from "./worker-protection-lock";
 import { useGoogleBackupOAuthConfigStore } from "./google-backup-oauth-config";
 import { useImageCatalogManager } from "./image-catalog";
@@ -2363,6 +2363,8 @@ export class BackupManager {
       throw new Error(
         "Original restore requires selecting exactly one backup workspace",
       );
+    if (target === "original")
+      await assertLegacyOriginalRestoreTarget(userId, source);
     if (target === "original" && extraBackupPaths(artifact.selectedPathsByWorkspace?.[source]).length)
       throw Object.assign(new Error("Original restore is unavailable for backups containing explicit absolute paths; restore into a new worker"), { statusCode: 409 });
     const normalizedResolutions = normalizeImageResolutions(
@@ -2404,11 +2406,7 @@ export class BackupManager {
     try {
       this.assertRestoreActive(userId, admission.controller.signal);
       if (target === "original") {
-        const worker = useContainerManager().get(source);
-        if (!worker || worker.userId !== userId || worker.status !== "stopped")
-          throw new Error(
-            "Selected original worker must be stopped for safe restore",
-          );
+        await assertLegacyOriginalRestoreTarget(userId, source);
         await useWorkerProtectionLockStore().verify(source, lockPassword);
         this.assertRestoreActive(userId, admission.controller.signal);
       }
