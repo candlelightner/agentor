@@ -450,11 +450,12 @@ export class ContainerManager {
   /** Reattach a freshly created/rebuilt worker to owner-managed networks. Failure
    * is logged only: the worker lifecycle succeeded and the network remains
    * inspectable/reconcilable rather than leaving a half-created worker. */
-  private async managedNetworkContext(info: ContainerInfo) {
+  private async managedNetworkContext(info: ContainerInfo, includeEmpty = false) {
     if (!this.workerStore || info.administrativeKind) return;
     const { ManagedNetworkStore } = await import('./managed-network-store');
     const networks = new ManagedNetworkStore(this.config.dataDir); await networks.loadUser(info.userId);
-    const records = networks.listForUser(info.userId); if (!records.length) return;
+    const records = networks.listForUser(info.userId);
+    if (!records.length && !includeEmpty) return;
     const { ManagedNetworkManager } = await import('./managed-network-manager');
     const manager = this.managedNetworks ??= new ManagedNetworkManager({ manager: () => this,
       workers: () => this.workerStore!, config: () => this.config });
@@ -462,7 +463,7 @@ export class ContainerManager {
   }
 
   private async managedNetworksNeedReconciliation(info: ContainerInfo) {
-    const context = await this.managedNetworkContext(info); if (!context) return false;
+    const context = await this.managedNetworkContext(info, true); if (!context) return false;
     const incarnation = this.capturedIncusIncarnation(info);
     for (const network of context.networks) {
       const expected = (await context.manager.members(network)).includes(info.id);
@@ -473,7 +474,7 @@ export class ContainerManager {
   }
 
   private async reconcileManagedNetworksForWorker(info: ContainerInfo) {
-    const context = await this.managedNetworkContext(info); if (!context) return;
+    const context = await this.managedNetworkContext(info, true); if (!context) return;
     const containerId = info.containerId;
     for (const network of context.networks)
       await context.manager.reconcileWorker(network, info.id, containerId, {
@@ -485,6 +486,53 @@ export class ContainerManager {
             `[container] managed network reconcile failed: ${error instanceof Error ? error.message : error}`,
           );
       });
+    await this.refreshManagedNetworkHostsFenced(info, true).catch(error => {
+      // Topology/service lifecycle succeeded. Ordinary optional hint failures
+      // must not turn that into a failed create/rebuild or unhealthy recipient.
+      // Unsettled operations still propagate through lifecycle admission.
+      if (error?.[operationSettlement]) throw error;
+      useLogger().warn(`[container] managed hostname refresh deferred for ${info.id}: ${(error as { code?: string })?.code ?? 'peer configuration unavailable'}`);
+    });
+  }
+
+  /** Control-plane-derived guest configuration only. The runtime setup queue
+   * serializes this with stop/rebuild; it neither admits a new topology change
+   * nor supplies protection-unlock authority for another worker. */
+  async refreshManagedNetworkHosts(id: string, containerId: string): Promise<void> {
+    const snapshot = this.get(id);
+    if (!snapshot || snapshot.containerId !== containerId) throw new Error('Managed hostname recipient changed');
+    return withOwnerWorkerRuntimeSetup(snapshot.userId, id, async () => {
+      const current = this.get(id);
+      if (!current || current.userId !== snapshot.userId || current.containerId !== containerId)
+        throw new Error('Managed hostname recipient changed before admission');
+      await this.refreshManagedNetworkHostsFenced(current, true);
+    });
+  }
+
+  private async refreshManagedNetworkHostsFenced(info: ContainerInfo, includeEmpty = false): Promise<void> {
+    if (!this.workerStore || info.administrativeKind) return;
+    const check = () => {
+      const current = this.get(info.id), record = this.workerStore!.get(info.userId, info.id);
+      if (current?.containerId !== info.containerId || current.userId !== info.userId ||
+          !record || record.status !== 'active' || record.deletionPending || record.incusRecreation ||
+          normalizeWorkerRuntimeKind(record.runtimeKind) !== normalizeWorkerRuntimeKind(info.runtimeKind))
+        throw new Error('Managed hostname runtime authority changed');
+    };
+    check();
+    const { ManagedVolumeStore, assertIncusLiveResolved } = await import('./managed-volume-store');
+    const volumes = new ManagedVolumeStore(this.config.dataDir); await volumes.loadUser(info.userId);
+    for (const volume of volumes.forWorker(info.userId, info.id)) assertIncusLiveResolved(volume);
+    const context = await this.managedNetworkContext(info, includeEmpty); if (!context) return;
+    const entries = await context.manager.workerHostEntries(info.id, info.containerId,
+      info.runtimeKind === 'incus-vm' ? { inspect: networkId => this.incusRuntime.inspectManagedNetwork(
+        info, this.capturedIncusIncarnation(info), networkId) } : undefined);
+    check();
+    if (info.runtimeKind === 'incus-vm') {
+      await this.incusRuntime.applyManagedHosts(info, this.capturedIncusIncarnation(info), entries);
+    } else {
+      await this.dockerService.applyManagedHosts(info.containerId, info.containerName, entries);
+    }
+    check();
   }
   private async reconcileWorkerPlugins(info: ContainerInfo) {
     if (info.status !== "running" || info.administrativeKind) return;
@@ -5842,6 +5890,13 @@ for p in sys.argv[1:]:
         )
           // Failed observability probes must not restart a running worker.
           await this.restart(info.id);
+        if (info.status === 'running')
+          await this.refreshManagedNetworkHosts(info.id, info.containerId).catch(error => {
+            // Optional peer-name configuration is not evidence that this
+            // positively observed container became unhealthy. Catch only
+            // after setup admission rejects, preserving late-writer fencing.
+            useLogger().warn(`[container] managed hostname refresh deferred for ${info.id}: ${(error as { code?: string })?.code ?? 'peer configuration unavailable'}`);
+          });
       } catch (error) {
         this.markRuntimeUnknown(info, "Worker startup reconciliation", error);
         useLogger().warn(
@@ -5950,7 +6005,20 @@ for p in sys.argv[1:]:
           info.status = 'running'; info.runtimeDiagnostic = undefined;
           return this.managedNetworksNeedReconciliation(info);
         });
-        if (!repair) continue;
+        if (!repair) {
+          const healthy = this.get(snapshot.id);
+          if (healthy?.status === 'running' && healthy.containerId === observedHandle &&
+              this.workerStore?.get(snapshot.userId, snapshot.id)?.desiredRuntimeStatus === 'running') {
+            // A healthy boot can outlive a peer's DHCP lease/incarnation.
+            // Refresh hints independently of guest-health classification.
+            // The setup operation must reject before diagnostics catch it so
+            // an unsettled guest writer retains its existing queue fence.
+            await this.refreshManagedNetworkHosts(healthy.id, healthy.containerId).catch(error => {
+              useLogger().warn(`[container] managed hostname refresh deferred for ${healthy.id}: ${(error as { code?: string })?.code ?? 'peer configuration unavailable'}`);
+            });
+          }
+          continue;
+        }
         await withOwnerWorkerLifecycleMutation(snapshot.userId, snapshot.id, async () => {
           const target = await inspect(); if (!target) return;
           const { record, info, instance, incarnation } = target;

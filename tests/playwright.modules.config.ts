@@ -36,6 +36,8 @@ export default defineConfig({
     "api/managed-network-update.spec.ts",
     "api/managed-network-authorization.spec.ts",
     "api/managed-network-manager.spec.ts",
+    "api/managed-network-hosts.spec.ts",
+    "api/managed-network-host-authority.spec.ts",
     "api/incus-managed-docker-bridge.spec.ts",
     "api/worker-group-network-coordinator.spec.ts",
     "api/host-mount-store.spec.ts",

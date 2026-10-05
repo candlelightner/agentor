@@ -16,6 +16,8 @@ import { normalizeWorkerRuntimeKind } from '../../shared/types';
 import { verifyWorkerMutationUnlocks } from './worker-protection-lock';
 import { withOwnerWorkerLifecycleMutation, isWorkerLifecycleMutationPending } from './worker-lifecycle-coordinator';
 import type { IncusManagedBridge } from './incus-managed-network-host';
+import { ManagedNetworkStore } from './managed-network-store';
+import { normalizeManagedNetworkHosts } from './managed-network-hosts';
 
 const DOCKER_READ_TIMEOUT_MS = 8_000;
 const DOCKER_MUTATION_TIMEOUT_MS = 30_000;
@@ -188,7 +190,82 @@ export class ManagedNetworkManager {
     for (const id of settled) if (!target.has(id)) failures.push(`detach ${id}: endpoint remains attached; retry reconciliation`);
     for (const id of target) if (this.manager().get(id) && !settled.has(id))
       failures.push(`attach ${id}: endpoint is not present; retry reconciliation`);
+    // Publish only after topology converges. Include detached recipients so
+    // their stale section is removed; each refresh recomputes its whole union,
+    // not just this one network. These are guest name hints, never identity.
+    if (bridge && !failures.length) {
+      for (const id of new Set([...target, ...actual])) {
+        await this.mutationCoverage(network, target, coverage);
+        const worker = this.authoritativeWorker(network, id);
+        if (!worker) continue;
+        try { await this.manager().refreshManagedNetworkHosts(id, worker.containerId); }
+        catch (error: any) {
+          if (error?.[operationSettlement]) throw error;
+          failures.push(`names ${id}: ${safeMessage(error)}`);
+        }
+      }
+    }
     return { workerIds: [...target], partialFailures: failures };
+  }
+
+  /** Derived guest lookup hints from settled, currently assigned endpoints.
+   * Caller supplies only its captured identity; no desired/persisted IP is
+   * used. Worker-local recovery may observe its own admitted native leaf. */
+  async workerHostEntries(workerId: string, containerId: string, own?: {
+    inspect: (networkId: string) => Promise<{ attached: boolean; ipv4Address?: string }>;
+  }) {
+    const recipient = this.manager().get(workerId);
+    if (!recipient || recipient.containerId !== containerId || recipient.administrativeKind)
+      throw new Error('Managed hostname recipient changed');
+    const store = new ManagedNetworkStore(this.config().dataDir);
+    await store.loadUser(recipient.userId);
+    const entries: Array<{ address: string; names: string[] }> = [];
+    const reserved = new Map(this.workers().listForUser(recipient.userId).map(record =>
+      [`${this.config().containerPrefix}-${record.id}`.toLowerCase(), record.id]));
+    for (const network of store.listForUser(recipient.userId)) {
+      const desired = new Set(await this.members(network));
+      if (!desired.has(workerId)) continue;
+      this.authoritativeWorker(network, workerId);
+      const native = await this.nativeBridge(network);
+      if (!native) continue; // legacy-only bridges retain Docker embedded DNS
+      const read = own ? { workerId, containerId, inspect: () => own.inspect(network.id) } : undefined;
+      const actual = await this.actualWorkerIds(network, read);
+      if (!actual.includes(workerId)) continue;
+      const shared = await new IncusManagedDockerBridge(this.docker).inspect(network, native);
+      for (const id of actual) {
+        if (id === workerId || !desired.has(id)) continue;
+        const peer = this.authoritativeWorker(network, id);
+        if (!peer) throw new Error('Managed hostname peer disappeared');
+        if (peer.runtimeKind === 'incus-vm') {
+          const observed = await this.manager().inspectIncusManagedNetwork(id, network.id);
+          if (!observed.attached) throw new Error('Managed hostname NIC changed');
+          if (observed.ipv4Address) entries.push({ address: observed.ipv4Address, names: [peer.containerName] });
+        } else {
+          const endpoint = shared?.Containers?.[peer.containerId];
+          if (!endpoint || endpoint.Name !== peer.containerName)
+            throw new Error('Managed hostname Docker endpoint changed');
+          const observed = await withOperationDeadline(this.docker.getContainer(peer.containerId).inspect(),
+            DOCKER_READ_TIMEOUT_MS, 'Managed hostname Docker endpoint inspection');
+          const attachment = observed.NetworkSettings?.Networks?.[shared!.Name];
+          if (observed.Id !== peer.containerId || attachment?.NetworkID !== shared!.Id ||
+              attachment.IPAddress !== endpoint.IPv4Address.split('/')[0])
+            throw new Error('Managed hostname Docker address changed');
+          const aliases = attachment.Aliases ?? [];
+          if (!Array.isArray(aliases) || aliases.some(name => typeof name !== 'string'))
+            throw new Error('Managed hostname Docker aliases unavailable');
+          // A retained alias cannot impersonate another canonical worker name.
+          if (aliases.some(name => reserved.has(name.toLowerCase()) && reserved.get(name.toLowerCase()) !== id))
+            throw new Error('Managed hostname alias conflicts with worker identity');
+          entries.push({ address: attachment.IPAddress, names: [peer.containerName, ...aliases] });
+        }
+      }
+      const confirmed = await this.actualWorkerIds(network, read);
+      if (confirmed.join('\n') !== actual.join('\n'))
+        throw new Error('Managed hostname membership changed during observation');
+    }
+    if (this.manager().get(workerId)?.containerId !== containerId)
+      throw new Error('Managed hostname recipient changed during observation');
+    return normalizeManagedNetworkHosts(entries);
   }
 
   async reconcileOwner(userId: string) {

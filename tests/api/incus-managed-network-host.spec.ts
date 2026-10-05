@@ -16,6 +16,7 @@ import type { IncusManagedBridge } from '../../orchestrator/server/utils/incus-m
 import { ManagedNetworkManager } from '../../orchestrator/server/utils/managed-network-manager';
 import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker-runtime';
 import { ContainerManager } from '../../orchestrator/server/utils/container';
+import { DockerService } from '../../orchestrator/server/utils/docker';
 import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
 import { zeroUserEnvVars } from '../../orchestrator/server/utils/user-env-store';
 import { authorizeManagedNetworkMutation } from '../../orchestrator/server/utils/managed-network-authorization';
@@ -196,11 +197,14 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
     peerIncarnation = peer.config['volatile.uuid']; expect(peerIncarnation).toBeTruthy();
     await workers.upsert({ id: peerId, userId: network.userId, status: 'active', desiredRuntimeStatus: running ? 'running' : 'stopped',
       runtimeKind: 'incus-vm', displayName: 'native reference gate' } as any);
-    const peerManager = new ContainerManager({} as any, peerConfig);
+    const peerDocker = new DockerService(peerConfig);
+    (peerDocker as any).docker = docker; // exact disposable Docker SDK forward
+    const peerManager = new ContainerManager(peerDocker, peerConfig);
     peerManager.setWorkerStore(workers); peerManager.setIncusRuntime(peerRuntime);
     peerManager.registerExternal({ ...peerOwner, containerId: `incus:${peerIncarnation}`, runtimeKind: 'incus-vm', status: running ? 'running' : 'stopped' } as any);
     (peerManager as any).assertOwnerExists = async (userId: string) => expect(userId).toBe(network.userId);
     observedManager = peerManager;
+    (peerManager as any).managedNetworks = actual; // same disposable SDK in own hostname projection
     if (running) {
       // A minimal real legacy compute peer exercises the existing manager's
       // connect-new/verify/disconnect-old path, not manual shared-bridge wiring.
@@ -219,6 +223,9 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
         containerId: legacyPeer.id, runtimeKind: 'legacy-docker', status: 'running' } as any);
       await store.update(network.userId, network.id, { workerIds: [peerId, legacyPeerId] });
     }
+    const refreshNames = peerManager.refreshManagedNetworkHosts.bind(peerManager);
+    if (running && process.env.INCUS_NETWORK_DNS_TEST === 'true')
+      peerManager.refreshManagedNetworkHosts = async () => {}; // exact pre-adaptation negative control
     const savedNetwork = store.get(network.userId, network.id)!;
     const peerCoverage = new Set([peerId, ...(legacyPeerId ? [legacyPeerId] : [])]);
     expect((await actual.reconcile(savedNetwork, undefined, peerCoverage)).partialFailures).toEqual([]);
@@ -228,8 +235,21 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
       expect(adapted[`${network.dockerName}-incus`].Aliases).toContain('retained-peer');
       expect((await docker.getNetwork(network.dockerName).inspect()).Containers).toEqual({});
       console.info('Production mixed bridge adaptation preserved aliases and original empty bridge');
+      if (process.env.INCUS_NETWORK_DNS_TEST === 'true') {
+        const legacyHost = (await legacyPeer.inspect()).Name.slice(1);
+        const absentName = await peerRuntime.client.exec(peerOwner.containerName,
+          ['curl', '--fail', '--max-time', '5', `http://${legacyHost}:18181/`]);
+        expect(absentName.returnCode, 'Without derived hints, the original VM resolver cannot resolve the legacy worker name').toBe(6);
+        peerManager.refreshManagedNetworkHosts = refreshNames;
+        expect((await actual.reconcile(savedNetwork, undefined, peerCoverage)).partialFailures).toEqual([]);
+        // Check the retained alias at migration, before the later deliberate
+        // detach/recreate drops endpoint-only aliases by Docker semantics.
+        const namedAlias = await peerRuntime.client.exec(peerOwner.containerName,
+          ['curl', '--fail', '--max-time', '5', 'http://retained-peer:18181/']);
+        expect(namedAlias.returnCode, namedAlias.stderr).toBe(0);
+        expect(namedAlias.stdout.trim()).toBe('mixed-manager-ok');
+      }
     }
-    (peerManager as any).managedNetworks = actual;
     const localHook = () => withOwnerWorkerLifecycleMutation(network.userId, peerId, () =>
       (peerManager as any).reconcileManagedNetworksForWorker(peerManager.get(peerId)!));
     const attachedDevices = (await peerRuntime.client.getInstance(peerOwner.containerName)).devices;
@@ -289,6 +309,17 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
         expect(vm.ipv4Address).toBeTruthy();
         const result = await root(`sudo docker exec '${(await legacyPeer.inspect()).Name.slice(1)}' node -e 'require("http").get("http://${vm.ipv4Address}:8443/",r=>{if(r.statusCode>=500)process.exit(1);r.resume();r.on("end",()=>console.log("vm-editor-ok"))}).on("error",()=>process.exit(1))'`);
         expect(result).toBe('vm-editor-ok');
+        if (process.env.INCUS_NETWORK_DNS_TEST === 'true') {
+          // The existing app UI advertises containerName as a resolvable
+          // on-network hostname. Endpoint alias metadata alone does not prove
+          // compatibility for VM peers after Docker bridge adaptation.
+          const namedLegacy = await runtime.client.exec(info.containerName,
+            ['curl', '--fail', '--max-time', '5', `http://${(await legacyPeer.inspect()).Name.slice(1)}:18181/`]);
+          expect(namedLegacy.returnCode, namedLegacy.stderr).toBe(0);
+          expect(namedLegacy.stdout.trim()).toBe('mixed-manager-ok');
+          const namedVm = await root(`sudo docker exec '${(await legacyPeer.inspect()).Name.slice(1)}' node -e 'require("http").get("http://${info.containerName}:8443/",r=>{if(r.statusCode>=500)process.exit(1);r.resume();r.on("end",()=>console.log("named-vm-editor-ok"))}).on("error",e=>{console.error(e.code);process.exit(1)})'`);
+          expect(namedVm).toBe('named-vm-editor-ok');
+        }
       };
       await mixedTraffic();
       expect(await checked(['ip', '-j', 'route', 'show', 'default'])).toBe(routes);
@@ -339,6 +370,9 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
     ensureSubmitted = false;
     expect(JSON.parse(await root('sudo incus query /1.0/projects/agentor')).config).toEqual(projectBefore.config);
     complete = true;
+  } catch (error) {
+    console.error('Host-service live gate failed before cleanup', error);
+    throw error;
   } finally {
     try {
       if (peerCreateSubmitted) {

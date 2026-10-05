@@ -14,6 +14,7 @@ import {
   validateHostMountTarget,
 } from './host-mount-store';
 import { withOperationDeadline } from './operation-deadline';
+import { MANAGED_NETWORK_HOSTS_SCRIPT, normalizeManagedNetworkHosts } from './managed-network-hosts';
 
 export interface EnvironmentJsonPayload {
   networkMode: string;
@@ -129,6 +130,22 @@ export class DockerService {
   constructor(config: Config) {
     this.docker = new Docker({ socketPath: '/var/run/docker.sock' });
     this.config = config;
+  }
+
+  async applyManagedHosts(containerId: string, containerName: string, entries: unknown): Promise<void> {
+    const inspect = async () => {
+      const info = await withOperationDeadline(this.docker.getContainer(containerId).inspect(),
+        DOCKER_READ_TIMEOUT_MS, 'Managed hostname Docker recipient inspection');
+      if (info.Id !== containerId || info.Name !== `/${containerName}`)
+        throw new Error('Managed hostname Docker recipient changed');
+      return info;
+    };
+    if (!(await inspect()).State.Running) return;
+    const result = await this.execCapture(containerId,
+      ['python3', '-c', MANAGED_NETWORK_HOSTS_SCRIPT, 'apply', JSON.stringify(normalizeManagedNetworkHosts(entries))],
+      { user: 'root', timeoutMs: 10_000, operationLabel: 'Managed hostname configuration' });
+    if (result.exitCode !== 0) throw new Error('Managed hostname configuration failed');
+    await inspect();
   }
 
   async ensureNetwork(): Promise<void> {

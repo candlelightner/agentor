@@ -5,6 +5,7 @@ import { AGENT_CREDENTIAL_MAPPINGS } from "./user-credentials";
 import { join } from "node:path";
 import { renderUserEnvVars } from "./user-env-store";
 import { backupInstallationId } from "./backup-installation";
+import { MANAGED_NETWORK_HOSTS_SCRIPT, normalizeManagedNetworkHosts } from './managed-network-hosts';
 import { IncusWorkerStorage, type IncusStorageOwner } from "./incus-worker-storage";
 import { resolveIncusPrimaryLease } from "./incus-worker-network";
 import type { ContainerStatus } from "../../shared/types";
@@ -128,6 +129,16 @@ export class IncusWorkerRuntime {
       instance.name === `${this.config.containerPrefix}-${workerId}` &&
       instance.config["user.agentor.installation"] === await this.installationId() &&
       (!userId || instance.config["user.agentor.owner"] === userId);
+  }
+
+  /** Caller owns the worker admission; no guest environment/provisioning or
+   * service restart is needed for these nonsecret, reconstructable hints. */
+  async applyManagedHosts(owner: IncusStorageOwner, incarnation: string, entries: unknown): Promise<void> {
+    const check = () => this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    if ((await check()).status !== 'Running') return;
+    await this.checkedExec(owner.containerName, ['python3', '-c', MANAGED_NETWORK_HOSTS_SCRIPT,
+      'apply', JSON.stringify(normalizeManagedNetworkHosts(entries))]);
+    await check();
   }
 
   /** Telemetry is diagnostic only. It never supplies routing/worker identity. */

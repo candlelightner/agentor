@@ -10,7 +10,9 @@ import { zeroUserEnvVars } from '../../orchestrator/server/utils/user-env-store'
 import { useBackupManager } from '../../orchestrator/server/utils/backup-manager';
 import { useManagedVolumeManager } from '../../orchestrator/server/utils/managed-volume-manager';
 import { useWorkerConfigStore } from '../../orchestrator/server/utils/worker-config-store';
-import { workerLifecycleGeneration } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
+import { workerLifecycleGeneration, withOwnerWorkerRuntimeSetup, withOwnerWorkerLifecycleMutation, isWorkerLifecycleMutationActive,
+  isWorkerLifecycleMutationPending } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
+import { operationSettlement } from '../../orchestrator/server/utils/operation-deadline';
 import type { Config } from '../../orchestrator/server/utils/config';
 import { usePersistentBackupPathManager } from '../../orchestrator/server/utils/services';
 
@@ -38,6 +40,7 @@ async function fixture(run: (manager: ContainerManager, store: WorkerStore, call
     remove: async (owner: any, uuid: string) => {
       expect(owner.id).toBe(info.id); expect(uuid).toBe('original-uuid'); calls.push('remove-compute'); },
     removeStorage: async () => { throw new Error('Archive must retain canonical volumes'); },
+    applyManagedHosts: async () => {},
   } as any);
   try { await run(manager, store, calls, info); }
   finally { await rm(root, { recursive: true, force: true }); }
@@ -50,6 +53,29 @@ test('Incus archive removes only proven compute and retains pending configuratio
     expect(manager.get(info.id)).toBeUndefined();
     expect(store.get(info.userId, info.id)).toMatchObject({ status: 'archived', runtimeKind: 'incus-vm',
       desiredRuntimeStatus: 'stopped', pendingRebuild: true });
+  });
+});
+
+test('last-network deletion while stopped clears derived names on later startup and healthy observation', async () => {
+  await fixture(async (manager, _store, _calls, info) => {
+    const published: unknown[] = [];
+    (manager as any).incusRuntime.applyManagedHosts = async (_owner: unknown, _uuid: string, entries: unknown) => {
+      if (info.status === 'running') published.push(entries);
+    };
+    // No records remain: a stopped VM may still carry the prior root-disk
+    // marked section, because no guest exec is possible during deletion.
+    info.status = 'stopped';
+    await manager.refreshManagedNetworkHosts(info.id, info.containerId);
+    expect(published).toEqual([]);
+    info.status = 'running';
+    await (manager as any).reconcileManagedNetworksForWorker(info);
+    expect(published).toEqual([[]]);
+    const generation = workerLifecycleGeneration(info.id);
+    expect(await (manager as any).managedNetworksNeedReconciliation(info)).toBe(false);
+    expect(published).toEqual([[]]);
+    await manager.refreshManagedNetworkHosts(info.id, info.containerId);
+    expect(published).toEqual([[], []]);
+    expect(workerLifecycleGeneration(info.id)).toBe(generation);
   });
 });
 
@@ -885,6 +911,137 @@ test('healthy Incus reconciliation preserves VM/services and terminal lifecycle 
     await manager.reconcileIncusWorkers();
     expect(calls).toEqual([]); expect(info.status).toBe('running'); expect(info.pendingRebuild).toBe(true);
     expect(workerLifecycleGeneration(info.id)).toBe(generation);
+  });
+});
+
+async function optionalHostsFixture(runtimeKind: 'incus-vm' | 'legacy-docker',
+  run: (manager: ContainerManager, store: WorkerStore, calls: string[], info: any, state: any) => Promise<void>) {
+  await reconciliationFixture(async (manager, store, calls, info, state) => {
+    if (runtimeKind === 'legacy-docker') {
+      info.runtimeKind = runtimeKind; info.containerId = 'healthy-legacy-container';
+      await store.upsert({ ...store.get(info.userId, info.id)!, runtimeKind });
+      (manager as any).resolveUserEnvAndBinds = async () => ({ groupSecrets: [] });
+      (manager as any).dockerService = {
+        inspectContainerRuntime: async () => ({ running: true, status: 'running', restartPolicy: 'unless-stopped' }),
+        updateContainerRestartPolicy: async () => { calls.push('unsafe-policy-change'); },
+        applyManagedHosts: async () => {},
+      };
+      manager.stop = async () => { calls.push('unsafe-stop'); };
+      manager.restart = async () => { calls.push('unsafe-restart'); };
+    }
+    const volumes = useManagedVolumeManager(), requiresRecreation = volumes.requiresRecreation;
+    const config = useWorkerConfigStore(), applied = config.resolveAppliedValues;
+    volumes.requiresRecreation = async () => false; config.resolveAppliedValues = async () => [];
+    try { await run(manager, store, calls, info, state); }
+    finally { volumes.requiresRecreation = requiresRecreation; config.resolveAppliedValues = applied; }
+  });
+}
+
+for (const runtimeKind of ['incus-vm', 'legacy-docker'] as const) {
+  test(runtimeKind + ' optional host projection and guest writer errors preserve positively healthy runtime', async () => {
+    for (const failure of ['projection', 'writer']) await optionalHostsFixture(runtimeKind, async (manager, store, calls, info, state) => {
+      const attempts: string[] = [], error = new Error('optional host ' + failure + ' unavailable');
+      (manager as any).managedNetworkContext = async () => ({
+        networks: [], manager: { workerHostEntries: async () => {
+          attempts.push('projection');
+          if (failure === 'projection') throw error;
+          return [{ address: '10.42.1.130', names: ['retained-peer'] }];
+        } },
+      });
+      const writer = async () => { attempts.push('writer'); throw error; };
+      if (runtimeKind === 'incus-vm') {
+        (manager as any).incusRuntime.applyManagedHosts = writer;
+        (manager as any).incusRuntime.stop = async () => { calls.push('unsafe-native-stop'); };
+      } else (manager as any).dockerService.applyManagedHosts = writer;
+      const generation = workerLifecycleGeneration(info.id), handle = info.containerId, boot = state.bootId;
+      if (runtimeKind === 'incus-vm') await manager.reconcileIncusWorkers();
+      else await manager.reconcileWorkers();
+      expect(attempts).toEqual(failure === 'projection' ? ['projection'] : ['projection', 'writer']);
+      expect(calls).toEqual([]);
+      expect(info).toMatchObject({ status: 'running', containerId: handle, pendingRebuild: true });
+      expect(info.runtimeDiagnostic).toBeUndefined();
+      expect(store.get(info.userId, info.id)).toMatchObject({ status: 'active', desiredRuntimeStatus: 'running' });
+      expect(state.bootId).toBe(boot);
+      expect(workerLifecycleGeneration(info.id)).toBe(generation);
+    });
+  });
+
+  test(runtimeKind + ' optional late host writer keeps setup queue fenced without health downgrade or generation change', async () => {
+    await optionalHostsFixture(runtimeKind, async (manager, _store, calls, info) => {
+      let release!: () => void;
+      const settlement = new Promise<void>(resolve => { release = resolve; });
+      const error = Object.assign(new Error('optional guest writer timed out'), { [operationSettlement]: settlement });
+      (manager as any).managedNetworkContext = async () => ({
+        networks: [], manager: { workerHostEntries: async () => [] },
+      });
+      const writer = async () => { throw error; };
+      if (runtimeKind === 'incus-vm') (manager as any).incusRuntime.applyManagedHosts = writer;
+      else (manager as any).dockerService.applyManagedHosts = writer;
+      const generation = workerLifecycleGeneration(info.id);
+      let admitted = false, next: Promise<void> | undefined;
+      try {
+        if (runtimeKind === 'incus-vm') await manager.reconcileIncusWorkers();
+        else await manager.reconcileWorkers();
+        expect(info.status).toBe('running'); expect(info.runtimeDiagnostic).toBeUndefined();
+        expect(calls).toEqual([]); expect(workerLifecycleGeneration(info.id)).toBe(generation);
+        expect(isWorkerLifecycleMutationActive(info.id)).toBe(true);
+        expect(isWorkerLifecycleMutationPending(info.id)).toBe(false);
+        next = withOwnerWorkerRuntimeSetup(info.userId, info.id, async () => { admitted = true; });
+        await new Promise<void>(resolve => setImmediate(resolve));
+        expect(admitted).toBe(false);
+        expect(workerLifecycleGeneration(info.id)).toBe(generation);
+      } finally {
+        release(); await next;
+        await withOwnerWorkerRuntimeSetup(info.userId, info.id, async () => {});
+      }
+      expect(admitted).toBe(true); expect(info.status).toBe('running');
+      expect(workerLifecycleGeneration(info.id)).toBe(generation);
+    });
+  });
+}
+
+test('successful admitted managed topology preserves healthy worker on ordinary hints errors but propagates raw settlement', async () => {
+  for (const failure of ['projection', 'writer', 'settlement']) await reconciliationFixture(async (manager, _store, calls, info) => {
+    let release!: () => void;
+    const settlement = new Promise<void>(resolve => { release = resolve; });
+    const error = failure === 'settlement'
+      ? Object.assign(new Error('late optional topology hints writer'), { [operationSettlement]: settlement })
+      : new Error('optional topology hints unavailable');
+    const attempts: string[] = [];
+    (manager as any).managedNetworkContext = async () => ({
+      networks: [{ id: 'managed-fixture' }],
+      manager: {
+        reconcileWorker: async (_network: unknown, workerId: string, handle: string) => {
+          expect(workerId).toBe(info.id); expect(handle).toBe(info.containerId);
+          expect(isWorkerLifecycleMutationPending(info.id)).toBe(true);
+          calls.push('topology-applied');
+        },
+        workerHostEntries: async () => {
+          attempts.push('projection');
+          if (failure === 'projection') throw error;
+          return [];
+        },
+      },
+    });
+    (manager as any).incusRuntime.applyManagedHosts = async () => { attempts.push('writer'); throw error; };
+    let admittedGeneration: number | undefined;
+    const invoke = () => withOwnerWorkerLifecycleMutation(info.userId, info.id, async () => {
+      admittedGeneration = workerLifecycleGeneration(info.id);
+      await (manager as any).reconcileManagedNetworksForWorker(info);
+    });
+    try {
+      if (failure === 'settlement') await expect(invoke()).rejects.toBe(error);
+      else await expect(invoke()).resolves.toBeUndefined();
+      expect(calls).toEqual(['topology-applied']);
+      expect(attempts).toEqual(failure === 'projection' ? ['projection'] : ['projection', 'writer']);
+      expect(info).toMatchObject({ status: 'running', containerId: 'incus:original-uuid', pendingRebuild: true });
+      expect(info.runtimeDiagnostic).toBeUndefined();
+      expect(workerLifecycleGeneration(info.id)).toBe(admittedGeneration);
+      if (failure === 'settlement') expect(isWorkerLifecycleMutationActive(info.id)).toBe(true);
+    } finally {
+      release();
+      await withOwnerWorkerRuntimeSetup(info.userId, info.id, async () => {});
+    }
   });
 });
 

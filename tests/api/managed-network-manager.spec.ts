@@ -73,6 +73,17 @@ test('failed new legacy attachment retains original endpoint and populated origi
   expect(fixture.bridges.has(fixture.network.dockerName)).toBe(true);
 });
 
+test('unsettled hostname publication preserves raw settlement and stops later recipients', async () => {
+  const fixture = dispatcherFixture({ vm: true });
+  const marked = Object.assign(new Error('late hostname writer'), { [operationSettlement]: new Promise(() => {}) });
+  const recipients: string[] = [];
+  const observed = (fixture.manager as any).manager();
+  observed.refreshManagedNetworkHosts = async (id: string) => { recipients.push(id); throw marked; };
+  (fixture.manager as any).dependencies.manager = () => observed;
+  await expect(fixture.manager.reconcile(fixture.network, undefined, fixture.coverage)).rejects.toBe(marked);
+  expect(recipients).toEqual(['docker']);
+});
+
 test('native bridge errors never attach Incus worker to legacy Docker bridge', async () => {
   const fixture = dispatcherFixture({ vm: true, failNative: true });
   await expect(fixture.manager.reconcile(fixture.network, undefined, fixture.coverage)).rejects.toThrow('native unavailable');
@@ -224,6 +235,7 @@ function dispatcherFixture(options: { vm?: boolean; failConnect?: boolean; failN
       const info = infos.find(info => info.id === id); return info && { ...info, status: 'active' };
     } }) as any,
     manager: () => ({ list: () => infos, get: (id: string) => infos.find(info => info.id === id),
+      refreshManagedNetworkHosts: async () => {},
       inspectIncusManagedNetwork: async (id: string) => ({ attached: attachedVms.has(id), ipv4Address: '' }),
       setIncusManagedNetwork: async (id: string, _networkId: string, attach: boolean) => {
         mutations.push(`vm:${attach ? 'attach' : 'detach'}`); if (attach) attachedVms.add(id); else attachedVms.delete(id);
