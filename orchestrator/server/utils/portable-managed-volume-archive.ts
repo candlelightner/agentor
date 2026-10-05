@@ -241,10 +241,34 @@ export async function extractIncusSelectedRestorePayload(
   destination: string,
   options: { signal?: AbortSignal } = {},
 ): Promise<Array<{ path: string; archivePath: string }>> {
+  return extractIncusRestorePayload(payloadPath, entries, destination, options, false);
+}
+
+/** Explicit Docker selection has a separate, fixed byte dialect. This only
+ * stages validated raw bytes; the fresh worker-owned block destination and
+ * quiescent guest extraction authority remain the runtime caller's duty. */
+export async function extractIncusExplicitRestorePayload(
+  payloadPath: string,
+  entries: Array<{ path: string; archive: string }>,
+  destination: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<Array<{ path: string; archivePath: string }>> {
+  return extractIncusRestorePayload(payloadPath, entries, destination, options, true);
+}
+
+async function extractIncusRestorePayload(
+  payloadPath: string,
+  entries: Array<{ path: string; archive: string }>,
+  destination: string,
+  options: { signal?: AbortSignal },
+  explicitDocker: boolean,
+): Promise<Array<{ path: string; archivePath: string }>> {
   if (!Array.isArray(entries) || entries.length > 32 ||
       new Set(entries.map(entry => entry?.path)).size !== entries.length ||
       new Set(entries.map(entry => entry?.archive)).size !== entries.length ||
-      entries.some(entry => !entry || !validSelectedPath(entry.path) || !/^paths\/[0-9]{1,2}\.tar$/.test(entry.archive)))
+      entries.some(entry => !entry || !validSelectedPath(entry.path) ||
+        entry.path.startsWith('/var/lib/docker/') || entry.path === '/var/lib/docker' && !explicitDocker ||
+        !/^paths\/[0-9]{1,2}\.tar$/.test(entry.archive)))
     throw invalidArchive("invalid selected backup manifest");
   const payload = await requireRegularFile(payloadPath);
   if (payload.size > MAX_PORTABLE_MANAGED_VOLUME_COMPRESSED_PAYLOAD_BYTES)
@@ -287,7 +311,9 @@ export async function extractIncusSelectedRestorePayload(
         await pipeline(createReadStream(rawPayload, { start: raw.dataOffset, end: raw.dataOffset + raw.size - 1 }),
           innerOutput.createWriteStream(), { signal: options.signal });
       } finally { await innerOutput.close(); }
-      await validateIncusSelectedRestoreArchive(archivePath, entry.path, { signal: options.signal });
+      if (explicitDocker && entry.path === '/var/lib/docker')
+        await validateIncusDockerRestoreArchive(archivePath, { signal: options.signal });
+      else await validateIncusSelectedRestoreArchive(archivePath, entry.path, { signal: options.signal });
       result.push({ path: entry.path, archivePath });
     }
     return result;

@@ -33,7 +33,9 @@ export class IncusWorkerStorage {
 
   /** Restore destinations are new identities. Never adopt even an owned but
    * previously populated volume, including after an ambiguous create reply. */
-  async freshRestoreDevices(owner: IncusStorageOwner): Promise<Record<string, IncusDevice>> {
+  async freshRestoreDevices(owner: IncusStorageOwner, dockerNonce?: string): Promise<Record<string, IncusDevice>> {
+    if (dockerNonce !== undefined && !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(dockerNonce))
+      throw new Error('Fresh Docker restore requires a valid import nonce');
     for (const role of ['workspace', 'agents', 'docker'] as const)
       if (await this.find(owner, role)) throw new Error('Incus restore requires absent destination storage');
     const devices: Record<string, IncusDevice> = {};
@@ -52,7 +54,35 @@ export class IncusWorkerStorage {
       devices[role] = { type: 'disk', pool: this.config.incusStoragePool, source: name,
         path: role === 'workspace' ? '/restore/workspace' : '/restore/.agent-data' };
     }
+    if (dockerNonce) {
+      const name = this.name(owner, 'docker');
+      await this.client.createCustomVolume(this.config.incusStoragePool, {
+        name, content_type: 'block', config: {
+          size: this.config.incusDockerVolumeSize,
+          'user.agentor.installation': this.installationId, 'user.agentor.id': owner.id,
+          'user.agentor.owner': owner.userId, 'user.agentor.storage-role': 'docker',
+          'user.agentor.restore-nonce': dockerNonce, 'user.agentor.allow-initialization': 'true',
+        },
+      });
+      const volume = await this.inspectVolume(owner, 'docker');
+      if (!volume || volume.used_by?.length || volume.config['user.agentor.restore-nonce'] !== dockerNonce ||
+          volume.config['user.agentor.allow-initialization'] !== 'true')
+        throw new Error('Fresh Docker restore storage authority is unavailable');
+      devices.docker = { type: 'disk', pool: this.config.incusStoragePool, source: name };
+    }
     return devices;
+  }
+
+  /** Only after the isolated extraction and native source proofs succeed.
+   * Partial writes remain fenced by importIncomplete, never reseeded. */
+  async markDockerRestored(owner: IncusStorageOwner, nonce: string): Promise<void> {
+    const volume = await this.inspectVolume(owner, 'docker'), workspace = await this.inspectVolume(owner, 'workspace');
+    if (!volume || !workspace || volume.config['user.agentor.restore-nonce'] !== nonce ||
+        volume.config['user.agentor.allow-initialization'] !== 'true')
+      throw new Error('Docker restore completion authority is unavailable');
+    await this.markDockerInitialized(owner);
+    await this.client.updateCustomVolume(this.config.incusStoragePool, workspace.name,
+      { ...workspace.config, 'user.agentor.docker-data': 'true' });
   }
 
   private validate(volume: IncusCustomVolume, owner: IncusStorageOwner, role: Role): void {

@@ -28,7 +28,8 @@ import { IncusOfflineArchiveHelper } from './incus-offline-archive-helper';
 import { writeGzipFile } from './worker-export';
 import { INCUS_CANONICAL_RESTORE_SCRIPT } from './incus-canonical-restore';
 import { validateIncusCanonicalRestoreArchive, validatePortableManagedVolumeArchive } from './portable-managed-volume-archive';
-import { inspectIncusSelectedRestoreArchive, validateIncusSelectedRestoreArchive } from './portable-managed-volume-archive';
+import { inspectIncusSelectedRestoreArchive, validateIncusSelectedRestoreArchive, validateIncusDockerRestoreArchive } from './portable-managed-volume-archive';
+import { INCUS_DOCKER_RESTORE_SCRIPT } from './incus-docker-restore';
 import { planIncusSelectedRestore, INCUS_SELECTED_RESTORE_SCRIPT } from './incus-selected-restore';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
@@ -959,7 +960,7 @@ export class IncusWorkerRuntime {
   /** Internal first-import primitive; caller persists the existing initialCreate
    * marker BEFORE this request and captures its returned UUID. No retry/adoption
    * of partially allocated destinations is permitted. */
-  async createCanonicalRestore(opts: IncusWorkerOptions, source?: WorkerBackupRuntimeSource): Promise<IncusInstance> {
+  async createCanonicalRestore(opts: IncusWorkerOptions, source?: WorkerBackupRuntimeSource, dockerData = false): Promise<IncusInstance> {
     if (!opts.recreationNonce || opts.start !== false)
       throw new Error('Incus restore requires durable nonce and stopped initial creation');
     this.validateOptions(opts);
@@ -984,11 +985,11 @@ export class IncusWorkerRuntime {
       }
       if (!fingerprint) throw new Error('Derived image for the immutable restore source is unavailable');
     }
-    return this.createWorker(opts, undefined, { fingerprint, source: verifiedSource });
+    return this.createWorker(opts, undefined, { fingerprint, source: verifiedSource, dockerData });
   }
 
   private async createWorker(opts: IncusWorkerOptions, existing?: { fingerprint: string; docker: boolean },
-    restore?: { fingerprint?: string; source?: WorkerBackupRuntimeSource }): Promise<IncusInstance> {
+    restore?: { fingerprint?: string; source?: WorkerBackupRuntimeSource; dockerData?: boolean }): Promise<IncusInstance> {
     await this.assertReady();
     // These features are integrated in the following storage/device phases.
     // Refuse them here rather than silently placing data on disposable rootfs.
@@ -1007,7 +1008,7 @@ export class IncusWorkerRuntime {
     const account = restore ? {} : await this.accountDevices(opts);
     const restoreManaged = restore ? await this.managedRestoreDevices(opts) : undefined;
     const hostMounts = restore ? undefined : await incusHostMountLayout(this.config, opts, 'ensure');
-    const persistent = restore ? await storage.freshRestoreDevices(opts)
+    const persistent = restore ? await storage.freshRestoreDevices(opts, restore.dockerData ? opts.recreationNonce : undefined)
       : await storage.devices(opts, opts.environmentJson.dockerEnabled, existing && { docker: existing.docker });
     await storage.recordImageIdentity(opts, identity);
     if (restore) for (const volume of opts.managedVolumes ?? [])
@@ -1055,6 +1056,11 @@ export class IncusWorkerRuntime {
     signal?: AbortSignal, managedPayloads: Array<{ volume: StoredManagedVolume; archivePath: string }> = [],
     selectedPayloads: Array<{ path: string; archivePath: string }> = []): Promise<void> {
     if (!incarnation || !opts.recreationNonce) throw new Error('Incus restore requires exact initial creation authority');
+    const dockerPayloads = selectedPayloads.filter(item => item.path === '/var/lib/docker');
+    if (dockerPayloads.length > 1) throw new Error('Duplicate Docker restore payload');
+    selectedPayloads = selectedPayloads.filter(item => item.path !== '/var/lib/docker');
+    const dockerPayload = dockerPayloads[0];
+    if (dockerPayload) await validateIncusDockerRestoreArchive(dockerPayload.archivePath, { signal });
     const storage = await this.storage();
     const managedRuntime = new IncusManagedVolumeRuntime(this.config, this);
     const managedDevices = await this.managedRestoreDevices(opts);
@@ -1088,6 +1094,7 @@ export class IncusWorkerRuntime {
         source: opts.containerName + '-workspace', path: '/restore/workspace' },
       agents: { type: 'disk', pool: this.config.incusStoragePool,
         source: opts.containerName + '-agents', path: '/restore/.agent-data' },
+      ...(dockerPayload ? { docker: { type: 'disk', pool: this.config.incusStoragePool, source: opts.containerName + '-docker' } } : {}),
       ...managedDevices,
     };
     const sameMap = (actual: Record<string, IncusDevice>) =>
@@ -1113,6 +1120,8 @@ export class IncusWorkerRuntime {
         validate: () => payloads[role] ? validateIncusCanonicalRestoreArchive(payloads[role]!, role, { signal }) : Promise.resolve() })),
       ...managedPayloads.map(({ volume, archivePath }) => ({ inspect: () => managedRuntime.inspectVolume(volume),
         validate: () => validatePortableManagedVolumeArchive(archivePath, { target: volume.target, signal, requirePosixUstar: true }) })),
+      ...(dockerPayload ? [{ inspect: () => storage.inspectVolume(opts, 'docker'),
+        validate: () => validateIncusDockerRestoreArchive(dockerPayload.archivePath, { signal }) }] : []),
     ];
     for (const source of sources) {
       const volume = await source.inspect();
@@ -1126,6 +1135,10 @@ export class IncusWorkerRuntime {
           [...reference.searchParams.keys()].some(key => key !== 'project'))
         throw new Error('Incus restore storage reference is foreign');
       volumes.push({ inspect: source.inspect, volume });
+      if (volume.config['user.agentor.storage-role'] === 'docker' &&
+          (volume.config['user.agentor.restore-nonce'] !== opts.recreationNonce ||
+           volume.config['user.agentor.allow-initialization'] !== 'true'))
+        throw new Error('Docker restore requires fresh nonce-owned block storage');
       await source.validate();
     }
     let started = false;
@@ -1159,6 +1172,20 @@ export class IncusWorkerRuntime {
         await new Promise(resolve => setTimeout(resolve, 500));
       }
       if (!ready) throw new Error('Incus canonical restore guest agent did not become ready');
+      if (dockerPayload) {
+        await stable();
+        const session = await this.client.execStream(opts.containerName,
+          ['/usr/bin/python3', '-c', INCUS_DOCKER_RESTORE_SCRIPT], {
+            command: [], user: 0, group: 0, cwd: '/', environment: { PATH: '/usr/bin:/bin', LC_ALL: 'C' },
+            signal, timeoutMs: 30 * 60_000,
+          });
+        session.stdout.resume(); session.stderr.resume();
+        try {
+          await Promise.all([pipeline(createReadStream(dockerPayload.archivePath), session.stdin, { signal }),
+            session.result.then(code => { if (code !== 0) throw new Error(`Incus Docker extraction failed (exit ${code})`); })]);
+          await stable();
+        } finally { session.close(); }
+      }
       const extracts = [
         ...(['workspace', 'agents'] as const).map(role => ({ role, archivePath: payloads[role] })),
         ...managedPayloads.map(item => ({ role: `managed:${item.volume.id}`, archivePath: item.archivePath })),
@@ -1205,6 +1232,18 @@ export class IncusWorkerRuntime {
         } finally { session.close(); }
       }
       await stable();
+      if (dockerPayload) {
+        await storage.markDockerRestored(opts, opts.recreationNonce);
+        // Only these two deliberate metadata writes are promoted. Keep the
+        // original creation/config/reference baselines for everything else.
+        for (const entry of volumes) {
+          if (entry.volume.config['user.agentor.storage-role'] === 'docker')
+            entry.volume.config['user.agentor.allow-initialization'] = 'false';
+          if (entry.volume.config['user.agentor.storage-role'] === 'workspace')
+            entry.volume.config['user.agentor.docker-data'] = 'true';
+        }
+        await stable();
+      }
       await storage.markPreserveOwnership(opts);
       await validateRecord();
     } catch (error) {
@@ -1230,6 +1269,13 @@ export class IncusWorkerRuntime {
     await this.assertReady();
     const storage = await this.storage();
     const restoreDevices = await this.managedRestoreDevices(opts);
+    const docker = await storage.inspectVolume(opts, 'docker');
+    const workspace = await storage.inspectVolume(opts, 'workspace');
+    if (docker && (docker.config['user.agentor.restore-nonce'] !== opts.recreationNonce ||
+        docker.config['user.agentor.allow-initialization'] !== 'false' || workspace?.config['user.agentor.docker-data'] !== 'true'))
+      throw new Error('Docker restore data must be committed before activation');
+    if (!docker && workspace?.config['user.agentor.docker-data'] !== undefined)
+      throw new Error('Retained Docker restore storage is missing');
     if ((opts.managedVolumes ?? []).some(v => !v.seeded || v.state !== 'ready'))
       throw new Error('Managed restore data must be committed before activation');
     const expected = {
@@ -1237,6 +1283,7 @@ export class IncusWorkerRuntime {
       root: { type: 'disk', path: '/', pool: this.config.incusStoragePool },
       workspace: { type: 'disk', path: '/restore/workspace', pool: this.config.incusStoragePool, source: opts.containerName + '-workspace' },
       agents: { type: 'disk', path: '/restore/.agent-data', pool: this.config.incusStoragePool, source: opts.containerName + '-agents' },
+      ...(docker ? { docker: { type: 'disk', pool: this.config.incusStoragePool, source: opts.containerName + '-docker' } } : {}),
     };
     const sameMap = (devices: Record<string, IncusDevice>) => Object.keys(devices).length === Object.keys(expected).length &&
       Object.entries(expected).every(([key, value]) => sameDevice(devices[key], value));
@@ -1271,6 +1318,20 @@ export class IncusWorkerRuntime {
         if (!current || current.project !== baseline.project || current.created_at !== baseline.created_at ||
             !isDeepStrictEqual(current.config, baseline.config) || !isDeepStrictEqual(current.used_by, baseline.used_by))
           throw new Error('Managed restore storage authority changed before activation');
+      }
+      if (docker) {
+        const current = await storage.inspectVolume(opts, 'docker'), currentWorkspace = await storage.inspectVolume(opts, 'workspace');
+        if (!current || current.project !== this.config.incusProject || !current.created_at || !Number.isFinite(Date.parse(current.created_at)) ||
+            current.created_at !== docker.created_at || !isDeepStrictEqual(current.config, docker.config) ||
+            !isDeepStrictEqual(current.used_by, docker.used_by) || current.used_by.length !== 1 ||
+            currentWorkspace?.config['user.agentor.docker-data'] !== 'true')
+          throw new Error('Docker restore storage authority changed before activation');
+        const reference = new URL(current.used_by[0]!, this.client.endpoint);
+        if (reference.origin !== new URL(this.client.endpoint).origin || reference.username || reference.password || reference.hash ||
+            reference.pathname !== `/1.0/instances/${opts.containerName}` ||
+            reference.searchParams.getAll('project').length !== 1 || reference.searchParams.get('project') !== this.config.incusProject ||
+            [...reference.searchParams.keys()].some(key => key !== 'project'))
+          throw new Error('Docker restore storage reference is foreign');
       }
       await validateRecord();
       return instance;

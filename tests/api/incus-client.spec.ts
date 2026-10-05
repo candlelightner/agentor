@@ -651,8 +651,13 @@ test.describe("IncusClient mock server protocol tests", () => {
       path: '/restore/managed/' + managedId + '/volume' };
     current = structuredClone(original); current.devices.m012345 = managed;
     await client.updateInstanceDevices('worker', devices, undefined, structuredClone(current), { nonce: 'nonce' });
+    current = structuredClone(original); current.devices.docker = { type: 'disk', pool: 'pool', source: 'worker-docker' };
+    await client.updateInstanceDevices('worker', { ...devices, docker: current.devices.docker }, undefined,
+      structuredClone(current), { nonce: 'nonce' });
+    expect(written.devices.docker).toEqual({ type: 'disk', pool: 'pool', source: 'worker-docker' });
     for (const mutation of ['running', 'nonce', 'marker', 'profile', 'foreign-device', 'missing-expected', 'invalid-host',
-      'managed-path', 'managed-key', 'managed-source', 'managed-option', 'managed-expanded-hidden', 'managed-local-hidden']) {
+      'managed-path', 'managed-key', 'managed-source', 'managed-option', 'managed-expanded-hidden', 'managed-local-hidden',
+      'docker-source', 'docker-pool', 'docker-option', 'docker-path', 'docker-type', 'docker-expanded-hidden']) {
       current = structuredClone(original);
       if (mutation === 'running') current.status = 'Running';
       if (mutation === 'nonce') current.config['user.agentor.recreation'] = 'other';
@@ -672,11 +677,22 @@ test.describe("IncusClient mock server protocol tests", () => {
         }
         if (mutation === 'managed-local-hidden') { current.expanded_devices = { ...current.devices }; delete current.expanded_devices.m012345; }
       }
+      if (mutation.startsWith('docker-')) {
+        current.devices.docker = { type: 'disk', pool: 'pool', source: 'worker-docker' };
+        if (mutation === 'docker-source') current.devices.docker.source = 'other-docker';
+        if (mutation === 'docker-pool') current.devices.docker.pool = 'foreign';
+        if (mutation === 'docker-option') current.devices.docker.readonly = 'true';
+        if (mutation === 'docker-path') current.devices.docker.path = '/host';
+        if (mutation === 'docker-type') current.devices.docker.type = 'nic';
+        if (mutation === 'docker-expanded-hidden') {
+          current.expanded_devices = structuredClone(current.devices); delete current.expanded_devices.docker;
+        }
+      }
       const expected = mutation === 'missing-expected' ? undefined : structuredClone(current);
       await expect(client.updateInstanceDevices('worker', devices, undefined, expected,
         { nonce: 'nonce', hostMountMetadata: mutation === 'invalid-host' ? '{"not":"array"}' : undefined })).rejects.toThrow();
     }
-    expect(puts).toBe(2);
+    expect(puts).toBe(3);
   });
 
   test('device PUT uses native mutation fences and matching caller snapshot/ETag without blocking exec', async () => {

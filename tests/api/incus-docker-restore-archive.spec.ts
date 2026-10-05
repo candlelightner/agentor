@@ -1,10 +1,12 @@
 import { expect, test } from '@playwright/test';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmod, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { gzipSync } from 'node:zlib';
 import { validateIncusDockerRestoreArchive, validateIncusCanonicalRestoreArchive,
-  validateIncusSelectedRestoreArchive, validatePortableManagedVolumeArchive } from '../../orchestrator/server/utils/portable-managed-volume-archive';
+  validateIncusSelectedRestoreArchive, validatePortableManagedVolumeArchive,
+  extractIncusSelectedRestorePayload, extractIncusExplicitRestorePayload } from '../../orchestrator/server/utils/portable-managed-volume-archive';
 
 type Item = { name: string; type?: string; body?: string | Buffer; link?: string;
   major?: number | Buffer; minor?: number | Buffer };
@@ -44,6 +46,10 @@ async function fixture(run: (directory: string, archive: string) => Promise<void
   const directory = await mkdtemp(join(tmpdir(), 'agentor-docker-restore-codec-'));
   try { await run(directory, join(directory, 'archive.tar')); }
   finally { await rm(directory, { recursive: true, force: true }); }
+}
+async function payload(directory: string, items: Item[]) {
+  const raw = join(directory, 'wrapper.tar'), compressed = join(directory, 'paths.tar.gz');
+  await writeTar(raw, items); await writeFile(compressed, gzipSync(await readFile(raw))); return compressed;
 }
 
 test('real GNU PAX Docker regular data, links, binary xattrs and ACL metadata validate without repacking', async () => {
@@ -224,5 +230,102 @@ test('Docker codec bounds/cancellation/checksums/framing reject without mutating
     }
     const corrupt = Buffer.from(bytes); corrupt[0] = corrupt[0]! ^ 1; await writeFile(archive, corrupt);
     await expect(validateIncusDockerRestoreArchive(archive)).rejects.toThrow(/checksum/);
+  });
+});
+
+test('explicit Docker wrapper stages mixed manifest unchanged raw special and binary PAX bytes, never extracting devices', async () => {
+  await fixture(async (directory, archive) => {
+    await writeTar(archive, [root,
+      { name: 'pax', type: 'x', body: pax('SCHILY.xattr.user.binary', Buffer.from([0, 255, 128, 10])) }, file,
+      { name: 'docker/whiteout', type: '3' }, { name: 'docker/device', type: '4', major: 7, minor: 4096 },
+      { name: 'docker/fifo', type: '6' }]);
+    const docker = await readFile(archive), selectedArchive = join(directory, 'selected.tar');
+    await writeTar(selectedArchive, [{ name: 'selected/', type: '5' }, { name: 'selected/data', body: 'selected data' }]);
+    const selected = await readFile(selectedArchive);
+    const compressed = await payload(directory, [{ name: 'paths/7.tar', body: selected }, { name: 'paths/0.tar', body: docker }]);
+    const original = await readFile(compressed), destination = join(directory, 'decoded');
+    const result = await extractIncusExplicitRestorePayload(compressed,
+      [{ path: '/var/lib/docker', archive: 'paths/0.tar' }, { path: '/tmp/selected', archive: 'paths/7.tar' }], destination);
+    expect(result.map(item => item.path)).toEqual(['/var/lib/docker', '/tmp/selected']);
+    expect(await readFile(result[0]!.archivePath)).toEqual(docker); expect(await readFile(result[1]!.archivePath)).toEqual(selected);
+    expect((await readdir(destination)).sort()).toEqual(['paths-0.tar', 'paths-7.tar']);
+    for (const item of result) expect((await lstat(item.archivePath)).mode & 0o777).toBe(0o600);
+    expect(await readFile(compressed)).toEqual(original);
+  });
+});
+
+test('ordinary selected wrapper rejects all Docker data before allocation and never inherits special authority', async () => {
+  await fixture(async (directory, archive) => {
+    for (const [index, items] of [[root, file], [root, { name: 'docker/whiteout', type: '3' }]].entries()) {
+      await writeTar(archive, items);
+      const compressed = await payload(directory, [{ name: 'paths/0.tar', body: await readFile(archive) }]);
+      const destination = join(directory, 'ordinary-' + index);
+      await expect(extractIncusSelectedRestorePayload(compressed,
+        [{ path: '/var/lib/docker', archive: 'paths/0.tar' }], destination, { allowDockerSpecials: true } as any)).rejects.toThrow(/manifest/);
+      await expect(lstat(destination)).rejects.toMatchObject({ code: 'ENOENT' });
+    }
+    await writeTar(archive, [{ name: 'selected/', type: '5' }, { name: 'selected/special', type: '3' }]);
+    const compressed = await payload(directory, [{ name: 'paths/0.tar', body: await readFile(archive) }]);
+    for (const [index, decode] of [extractIncusSelectedRestorePayload, extractIncusExplicitRestorePayload].entries()) {
+      const destination = join(directory, 'nonguest-docker-' + index);
+      await expect(decode(compressed, [{ path: '/tmp/selected', archive: 'paths/0.tar' }], destination)).rejects.toThrow(/unsupported/);
+      expect(await readdir(destination)).toEqual([]);
+    }
+  });
+});
+
+test('explicit Docker manifest accepts only exact canonical path and rejects malformed selections before allocation', async () => {
+  await fixture(async (directory, archive) => {
+    await writeTar(archive, [root, file]);
+    const compressed = await payload(directory, [{ name: 'paths/0.tar', body: await readFile(archive) }]);
+    const entry = { path: '/var/lib/docker', archive: 'paths/0.tar' };
+    const invalid = ['/var/lib/docker/', '/var/lib/docker/volumes', '/var/lib/docker/../docker',
+      '/var/lib//docker', '/var/lib/docker\\volumes', 'var/lib/docker'];
+    const manifests = [...invalid.map(path => [{ ...entry, path }]), [entry, entry],
+      [{ ...entry, archive: '../paths/0.tar' }]];
+    for (const [index, entries] of manifests.entries()) {
+      const destination = join(directory, 'invalid-' + index);
+      await expect(extractIncusExplicitRestorePayload(compressed, entries, destination)).rejects.toThrow(/manifest/);
+      await expect(lstat(destination)).rejects.toMatchObject({ code: 'ENOENT' });
+    }
+  });
+});
+
+test('explicit Docker wrapper framing and inner validation failures clean only own staged bytes', async () => {
+  await fixture(async (directory, archive) => {
+    await writeTar(archive, [root, file]); const docker = await readFile(archive);
+    const entries = [{ path: '/var/lib/docker', archive: 'paths/0.tar' }];
+    const cases: Item[][] = [[], [{ name: 'paths/1.tar', body: docker }],
+      [{ name: 'paths/0.tar', body: docker }, { name: 'paths/0.tar', body: docker }],
+      [{ name: '../paths/0.tar', body: docker }], [{ name: 'paths/0.tar', type: '2', link: '/etc' }],
+      [{ name: 'paths/0.tar', body: docker.subarray(0, 513) }]];
+    for (const [index, items] of cases.entries()) {
+      const compressed = await payload(directory, items), destination = join(directory, 'framing-' + index);
+      await expect(extractIncusExplicitRestorePayload(compressed, entries, destination)).rejects.toThrow();
+      expect(await readdir(destination)).toEqual([]);
+    }
+    await writeTar(archive, [{ name: 'workspace/', type: '5' }]);
+    let compressed = await payload(directory, [{ name: 'paths/0.tar', body: await readFile(archive) }]);
+    const wrongRoot = join(directory, 'wrong-root');
+    await expect(extractIncusExplicitRestorePayload(compressed, entries, wrongRoot)).rejects.toThrow(/docker/);
+    expect(await readdir(wrongRoot)).toEqual([]);
+    await writeTar(archive, [{ name: 'not-selected/', type: '5' }]);
+    compressed = await payload(directory, [{ name: 'paths/0.tar', body: docker }, { name: 'paths/1.tar', body: await readFile(archive) }]);
+    const laterFailure = join(directory, 'later-failure');
+    await expect(extractIncusExplicitRestorePayload(compressed, [...entries,
+      { path: '/tmp/selected', archive: 'paths/1.tar' }], laterFailure)).rejects.toThrow(/selected/);
+    expect(await readdir(laterFailure)).toEqual([]);
+    const corrupt = join(directory, 'corrupt.gz'); await writeFile(corrupt, gzipSync(docker).subarray(0, 16));
+    const corruptDestination = join(directory, 'corrupt');
+    await expect(extractIncusExplicitRestorePayload(corrupt, entries, corruptDestination)).rejects.toThrow();
+    expect(await readdir(corruptDestination)).toEqual([]);
+    const occupied = join(directory, 'occupied'); await mkdir(occupied); await writeFile(join(occupied, 'keep'), 'retained');
+    await expect(extractIncusExplicitRestorePayload(compressed, entries, occupied)).rejects.toThrow(/empty/);
+    expect(await readFile(join(occupied, 'keep'), 'utf8')).toBe('retained');
+    const cancelled = new AbortController(); cancelled.abort(new Error('explicit-Docker-cancelled'));
+    const cancelledDestination = join(directory, 'cancelled');
+    await expect(extractIncusExplicitRestorePayload(compressed, entries, cancelledDestination,
+      { signal: cancelled.signal })).rejects.toThrow(/explicit-Docker-cancelled/);
+    await expect(lstat(cancelledDestination)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });

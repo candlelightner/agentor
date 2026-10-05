@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile, readFile } from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { execFileSync } from 'node:child_process';
@@ -87,9 +87,9 @@ async function fixture(run: (f: any) => Promise<void>) {
   try {
     await run({ manager, store, info, calls, runtime, assertIncomplete,
       fail: (at: string) => { failure = at; },
-      import: (override?: any, principal?: () => Promise<void>, managed?: any[]) => (manager as any).importNativeCanonicalWorker(
+      import: (override?: any, principal?: () => Promise<void>, managed?: any[], selected?: any[]) => (manager as any).importNativeCanonicalWorker(
         info, { workspace: '/private/validated.tar' }, manifest, undefined, override,
-        principal ?? (async () => { checks++; }), managed), checks: () => checks });
+        principal ?? (async () => { checks++; }), managed, selected), checks: () => checks });
   } finally {
     configStore.markApplied = priorMarkApplied;
     const volumes = useManagedVolumeManager(); await volumes.init();
@@ -106,6 +106,22 @@ test('native importer retains initial incomplete authority through health, confi
     expect(f.store.get(f.info.userId, f.info.id).incusRecreation).toBeUndefined();
     expect(f.calls).toEqual(['current-grants', 'create', 'extract', 'health', 'applied', 'mappings', 'networks']);
     expect(f.checks()).toBeGreaterThan(5);
+  });
+});
+
+test('shared importer derives fresh Docker allocation only from decoded exact payload and keeps it behind initial fence', async () => {
+  await fixture(async f => {
+    const create = f.runtime.createCanonicalRestore, extract = f.runtime.restoreCanonicalArchives;
+    f.runtime.createCanonicalRestore = async (opts: any, source: any, dockerData: boolean) => {
+      expect(dockerData).toBe(true); f.assertIncomplete(); return create(opts, source);
+    };
+    f.runtime.restoreCanonicalArchives = async (...args: any[]) => {
+      expect(args[6]).toEqual([{ path: '/var/lib/docker', archivePath: '/private/docker.tar' }]);
+      f.assertIncomplete(); return extract(...args);
+    };
+    await f.import(undefined, undefined, [], [{ path: '/var/lib/docker', archivePath: '/private/docker.tar' }]);
+    expect(f.calls.indexOf('extract')).toBeLessThan(f.calls.indexOf('health'));
+    expect(f.store.get(f.info.userId, f.info.id).incusRecreation).toBeUndefined();
   });
 });
 
@@ -233,10 +249,11 @@ test('a forged built-in descriptor cannot select another owner custom environmen
   });
 });
 
-test('real shared portable/native backup importer restores byte-faithful canonical data and healthy fresh VM without Docker', async () => {
+test('real shared portable/native backup importer restores byte-faithful persistent data into healthy fresh VM', async () => {
   const managedImport = process.env.INCUS_MANAGED_IMPORT_TEST === 'true';
   const selectedImport = process.env.INCUS_SELECTED_IMPORT_TEST === 'true';
-  test.skip(process.env.INCUS_WORKER_IMPORT_TEST !== 'true' && !managedImport && !selectedImport, 'Explicit serial disposable production importer gate');
+  const dockerImport = process.env.INCUS_DOCKER_IMPORT_TEST === 'true';
+  test.skip(process.env.INCUS_WORKER_IMPORT_TEST !== 'true' && !managedImport && !selectedImport && !dockerImport, 'Explicit serial disposable production importer gate');
   test.setTimeout(1_200_000);
   await migrateAuth();
   const dataDir = await mkdtemp(join(tmpdir(), 'agentor-native-import-live-')), userId = randomUUID();
@@ -246,6 +263,7 @@ test('real shared portable/native backup importer restores byte-faithful canonic
   Object.assign(config, { containerPrefix: 'agentor-worker', incusEnabled: true, baseDomains: [],
     incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor', incusNetwork: 'incusbr0', incusStoragePool: 'default',
     incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase10-preserve-ownership',
+    incusDockerVolumeSize: '1GiB',
     incusInternalGatewayUrl: 'http://10.159.68.1:38000',
     incusClientCertPath: '/workspace/agentor-incus-tls/client.crt', incusClientKeyPath: '/workspace/agentor-incus-tls/client.key',
     incusServerCertPath: '/workspace/agentor-incus-tls/server.crt' });
@@ -265,7 +283,7 @@ test('real shared portable/native backup importer restores byte-faithful canonic
   db.prepare('INSERT INTO user (id,name,email,emailVerified,role,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?)')
     .run(userId, 'Native import fixture', userId + '@fixture.invalid', 0, 'user', now, now);
   const environment = { id: 'native-import-gate', name: 'Native import gate', builtIn: true, userId: null,
-    cpuLimit: 1, memoryLimit: '1GiB', networkMode: 'full', allowedDomains: [], includePackageManagerDomains: false,
+    cpuLimit: dockerImport ? 2 : 1, memoryLimit: dockerImport ? '2GiB' : '1GiB', networkMode: 'full', allowedDomains: [], includePackageManagerDomains: false,
     dockerEnabled: false, envVars: 'IMPORT_ENV=actual-native-import', setupScript: '',
     exposeApis: { portMappings: false, domainMappings: false, usage: false },
     enabledCapabilityIds: null, enabledInstructionIds: null, createdAt: now, updatedAt: now };
@@ -322,6 +340,14 @@ os.setxattr(p,'system.posix_acl_default',acl([(1,7,0xffffffff),(2,5,34567),(4,5,
       { path: '/etc/agentor-selected-import-fixture', archive: 'paths/2.tar' },
     ];
     const selectedPayload = join(dataDir, BUNDLE_FILES.backupPaths);
+    const dockerEntries = [{ path: '/var/lib/docker', archive: 'paths/0.tar' }];
+    if (dockerImport) {
+      if (selectedImport) throw new Error('Run Docker and ordinary selected fixtures serially');
+      if (!process.env.INCUS_DOCKER_IMPORT_RAW) throw new Error('Provide the logical archive produced by the real Docker capture gate');
+      const stage = join(dataDir, 'docker-selected-source'); await mkdir(join(stage, 'paths'), { recursive: true });
+      await writeFile(join(stage, 'paths/0.tar'), await readFile(process.env.INCUS_DOCKER_IMPORT_RAW), { mode: 0o600, flag: 'wx' });
+      execFileSync('tar', ['--format=ustar', '-C', stage, '-czf', selectedPayload, 'paths/0.tar']);
+    }
     let expectedSelected: any;
     if (selectedImport) {
       const selectedStage = join(dataDir, 'selected-source'), pathsDir = join(selectedStage, 'paths');
@@ -353,17 +379,18 @@ os.setxattr(p+'/bytes','system.posix_acl_access',acl);os.setxattr(p,'system.posi
         source: { id: 'descriptive-only', containerName: 'never-adopt', displayName: 'source', imageName: 'descriptive-only' },
         worker: { displayName: 'Native import', repos: [], mounts: [], initScript: '' },
         environment, contents: { rootfs: false, workspace: true, agents: false, ...(managedImport ? { managedVolumes: true } : {}),
-          ...(selectedImport ? { backupPaths: true } : {}) },
+          ...(selectedImport || dockerImport ? { backupPaths: true } : {}) },
         ...(managedImport ? { managedVolumes: [managedEntry] } : {}),
-        ...(selectedImport ? { backupPaths: selectedEntries } : {}),
+        ...(selectedImport || dockerImport ? { backupPaths: dockerImport ? dockerEntries : selectedEntries } : {}),
         portMappings: [], domainMappings: [], missingSecrets: ['EXCLUDED_SECRET'], runtime: runtimeMetadata } as any, manifest);
       await pipeline(packBundle([{ name: BUNDLE_FILES.manifest, path: manifest }, { name: BUNDLE_FILES.workspace, path: payload },
         ...(managedImport ? [{ name: BUNDLE_FILES.managedVolumes, path: managedPayload }] : []),
-        ...(selectedImport ? [{ name: BUNDLE_FILES.backupPaths, path: selectedPayload }] : [])]),
+        ...(selectedImport || dockerImport ? [{ name: BUNDLE_FILES.backupPaths, path: selectedPayload }] : [])]),
         createWriteStream(bundle, { mode: 0o600 }));
     };
     // Run serially; each exact completed fixture is removed before the next.
     for (const origin of ['portable-forged-legacy', 'native-local-backup']) {
+      environment.dockerEnabled = false;
       await write(origin === 'native-local-backup' ? descriptor : { version: 1, kind: 'legacy-docker', privileged: true });
       const imported = origin === 'native-local-backup'
         ? await manager.importWorkerFromBackup(userId, bundle, { provenance: 'local' })
@@ -388,6 +415,55 @@ print(json.dumps(dict(bytes=base64.b64encode(open(p,'rb').read()).decode(),uid=s
       const services = await runtime.client.exec(imported.containerName, ['bash', '-ec',
         'test -f /run/agentor/preserve-storage-ownership; systemctl is-active --quiet agentor-worker; curl -fsS http://127.0.0.1:8443/healthz; curl -fsS http://127.0.0.1:6080/agentor.html >/dev/null; runuser -u agent -- touch /home/agent/.agent-data/import-writable']);
       expect(services.returnCode, services.stderr).toBe(0);
+      if (dockerImport) {
+        const readVolume = () => runtime.client.getCustomVolume(config.incusStoragePool, imported.containerName + '-docker');
+        const block = await readVolume();
+        expect(block.content_type).toBe('block'); expect(block.config['user.agentor.allow-initialization']).toBe('false');
+        expect(block.config['user.agentor.restore-nonce']).toMatch(/^[a-f0-9-]{36}$/);
+        const disabled = await runtime.client.exec(imported.containerName, ['bash', '-ec',
+          'test "$(systemctl show --value --property=ActiveState docker.service)" = inactive; ! mountpoint -q /var/lib/docker']);
+        expect(disabled.returnCode, disabled.stderr).toBe(0);
+        await manager.restart(imported.id); expect(await readVolume()).toEqual(block);
+        const verifyDocker = async () => {
+          const result = await runtime.client.exec(imported.containerName, ['bash', '-ec', String.raw`
+test "$(docker info --format '{{.Driver}}')" = overlay2
+docker image inspect agentor-archive-lower:proof >/dev/null
+docker container inspect archive-layer archive-stopped >/dev/null
+docker volume inspect archive-data >/dev/null
+docker run --rm -v archive-data:/data busybox:1.37.0 sh -ec 'test "$(cat /data/ordinary)" = persistent'
+docker export archive-layer | tar -tf - | python3 -c 'import sys;n=set(sys.stdin.read().splitlines());assert "lowerfile" not in n and "lowerdir/old" not in n and "lowerdir/new" in n'
+python3 - <<'PY'
+import os,stat,struct
+p='/var/lib/docker/volumes/archive-data/_data';s=os.lstat(p+'/data')
+assert open(p+'/data','rb').read()==bytes([0,255,128,10,61,0])*1024
+assert (s.st_uid,s.st_gid,stat.S_IMODE(s.st_mode),s.st_mtime_ns)==(12345,23456,0o640,1710000000123456789)
+assert s.st_ino==os.stat(p+'/hard').st_ino
+assert os.getxattr(p+'/data','user.binary')==bytes([0,255,128,10,61,0])
+assert os.getxattr(p+'/data','security.capability')==struct.pack('<IIIII',0x02000001,1<<10,0,0,0)
+acl=struct.pack('<I',2)+b''.join(struct.pack('<HHI',t,m,i) for t,m,i in [(1,6,0xffffffff),(2,4,34567),(4,4,0xffffffff),(16,4,0xffffffff),(32,0,0xffffffff)])
+assert os.getxattr(p+'/data','system.posix_acl_access')==acl
+assert os.getxattr(p,'system.posix_acl_default')==acl
+assert os.getxattr(p,'user.directory')==bytes([0,255,128])
+root=os.lstat(p);assert (root.st_uid,root.st_gid,stat.S_IMODE(root.st_mode),root.st_mtime_ns)==(1000,1000,0o751,1710000000123456789)
+assert os.readlink(p+'/inert')=='/outside-guest-link'
+assert stat.S_ISFIFO(os.lstat(p+'/fifo').st_mode)
+assert stat.S_ISCHR(os.lstat(p+'/char').st_mode) and os.lstat(p+'/char').st_rdev==os.makedev(1,3)
+assert stat.S_ISBLK(os.lstat(p+'/block').st_mode) and os.lstat(p+'/block').st_rdev==os.makedev(7,199)
+PY`]);
+          expect(result.returnCode, result.stderr).toBe(0);
+          const current = await readVolume(); expect(current.config).toEqual(block.config); expect(current.created_at).toBe(block.created_at);
+        };
+        // Ordinary settings rebuild changes capability, never storage authority.
+        environment.dockerEnabled = true; await manager.rebuild(imported.id); Object.assign(imported, manager.get(imported.id));
+        await verifyDocker(); await manager.restart(imported.id); await verifyDocker();
+        const previous = imported.containerId; await manager.rebuild(imported.id); Object.assign(imported, manager.get(imported.id));
+        expect(imported.containerId).not.toBe(previous); await verifyDocker();
+        environment.dockerEnabled = false; await manager.rebuild(imported.id); Object.assign(imported, manager.get(imported.id));
+        expect((await readVolume()).config).toEqual(block.config);
+        environment.dockerEnabled = true; await manager.rebuild(imported.id); Object.assign(imported, manager.get(imported.id));
+        await verifyDocker();
+        console.info('Production Docker inverse metadata/whiteouts and disabled/re-enabled restart/rebuild passed', { origin, id: imported.id });
+      }
       if (selectedImport) {
         const verifySelected = async () => {
           for (const path of ['/workspace/selected-data', '/home/agent/.local/state/kilo']) {

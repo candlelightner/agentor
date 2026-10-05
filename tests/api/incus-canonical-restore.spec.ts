@@ -13,6 +13,7 @@ import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
 import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volume-store';
 import { INCUS_PERSISTENCE_TARGET_CHECK } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
 import { INCUS_SELECTED_RESTORE_SCRIPT } from '../../orchestrator/server/utils/incus-selected-restore';
+import { INCUS_DOCKER_RESTORE_SCRIPT } from '../../orchestrator/server/utils/incus-docker-restore';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 
@@ -210,6 +211,87 @@ test('managed promotion probes actual operational target ancestors before grants
         await expect(finished).rejects.toThrow();
         expect(f.events).not.toContain('promote'); expect(f.events).not.toContain('grants');
       }
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('Docker raw inverse uses fresh isolated block before ordinary paths and preserves disabled capability storage at promotion', async () => {
+  const f = await fixture(); try {
+    const stage = join(f.dataDir, 'docker-source'); await mkdir(join(stage, 'docker'), { recursive: true });
+    await writeFile(join(stage, 'docker', 'data'), 'Docker logical state');
+    const archivePath = join(f.dataDir, 'docker.tar');
+    execFileSync('tar', ['--format=pax', '-C', stage, '-cf', archivePath, 'docker']);
+    f.opts.environmentJson.dockerEnabled = false; f.opts.dockerEnabled = false;
+    const instance = await f.runtime.createCanonicalRestore(f.opts, undefined, true);
+    expect(Object.keys(instance.devices).sort()).toEqual(['agents', 'docker', 'root', 'workspace']);
+    const block = f.volumes.get(f.opts.containerName + '-docker');
+    expect(block.content_type).toBe('block'); expect(block.config['user.agentor.restore-nonce']).toBe(f.opts.recreationNonce);
+    await f.runtime.restoreCanonicalArchives(f.opts, instance.config['volatile.uuid']!, {}, () => {}, undefined, [],
+      [{ path: '/var/lib/docker', archivePath }]);
+    expect(f.inputs.map(input => input.command)).toEqual([['/usr/bin/python3', '-c', INCUS_DOCKER_RESTORE_SCRIPT]]);
+    expect(block.config['user.agentor.allow-initialization']).toBe('false');
+    expect(f.volumes.get(f.opts.containerName + '-workspace').config['user.agentor.docker-data']).toBe('true');
+    (f.runtime as any).accountDevices = async () => ({});
+    (f.runtime as any).managedDevices = async () => ({});
+    (f.runtime as any).start = async () => { f.events.push('activated'); };
+    await f.runtime.finishCanonicalRestore(f.opts, instance.config['volatile.uuid']!, () => {});
+    expect(f.current().devices.docker).toEqual(instance.devices.docker);
+    expect(f.events).toContain('activated');
+  } finally { await f.cleanup(); }
+});
+
+test('Docker inverse refuses foreign nonce, missing payload or initialized destinations before starting compute', async () => {
+  for (const scenario of ['nonce', 'initialized', 'payload-missing', 'duplicate'] as const) {
+    const f = await fixture(); try {
+      const stage = join(f.dataDir, 'docker-source'); await mkdir(join(stage, 'docker'), { recursive: true });
+      const archivePath = join(f.dataDir, 'docker.tar'); execFileSync('tar', ['--format=pax', '-C', stage, '-cf', archivePath, 'docker']);
+      const instance = await f.runtime.createCanonicalRestore(f.opts, undefined, true);
+      const block = f.volumes.get(f.opts.containerName + '-docker');
+      if (scenario === 'nonce') block.config['user.agentor.restore-nonce'] = randomUUID();
+      if (scenario === 'initialized') block.config['user.agentor.allow-initialization'] = 'false';
+      const item = { path: '/var/lib/docker', archivePath };
+      await expect(f.runtime.restoreCanonicalArchives(f.opts, instance.config['volatile.uuid']!, {}, () => {}, undefined, [],
+        scenario === 'payload-missing' ? [] : scenario === 'duplicate' ? [item, item] : [item])).rejects.toThrow();
+      expect(f.events).not.toContain('start'); expect(f.events).not.toContain('extract');
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('failed Docker extraction stops exact incomplete compute without promoting storage initialization or retained-data authority', async () => {
+  const f = await fixture(); try {
+    const stage = join(f.dataDir, 'docker-source'); await mkdir(join(stage, 'docker'), { recursive: true });
+    const archivePath = join(f.dataDir, 'docker.tar'); execFileSync('tar', ['--format=pax', '-C', stage, '-cf', archivePath, 'docker']);
+    const instance = await f.runtime.createCanonicalRestore(f.opts, undefined, true); f.failExec();
+    await expect(f.runtime.restoreCanonicalArchives(f.opts, instance.config['volatile.uuid']!, {}, () => {}, undefined, [],
+      [{ path: '/var/lib/docker', archivePath }])).rejects.toThrow('Docker extraction failed');
+    expect(f.current().status).toBe('Stopped'); expect(f.current().config['user.agentor.restore']).toBe('incomplete');
+    expect(f.volumes.get(f.opts.containerName + '-docker').config['user.agentor.allow-initialization']).toBe('true');
+    expect(f.volumes.get(f.opts.containerName + '-workspace').config['user.agentor.docker-data']).toBeUndefined();
+    expect(f.events).not.toContain('promote');
+  } finally { await f.cleanup(); }
+});
+
+test('Docker restore promotion rejects incomplete metadata and foreign storage references before granting network or shares', async () => {
+  for (const scenario of ['nonce', 'uninitialized', 'retained', 'reference', 'expanded-layout', 'created-at'] as const) {
+    const f = await fixture(); try {
+      const stage = join(f.dataDir, 'docker-source'); await mkdir(join(stage, 'docker'), { recursive: true });
+      const archivePath = join(f.dataDir, 'docker.tar'); execFileSync('tar', ['--format=pax', '-C', stage, '-cf', archivePath, 'docker']);
+      const instance = await f.runtime.createCanonicalRestore(f.opts, undefined, true);
+      await f.runtime.restoreCanonicalArchives(f.opts, instance.config['volatile.uuid']!, {}, () => {}, undefined, [],
+        [{ path: '/var/lib/docker', archivePath }]);
+      const block = f.volumes.get(f.opts.containerName + '-docker');
+      if (scenario === 'nonce') block.config['user.agentor.restore-nonce'] = randomUUID();
+      if (scenario === 'uninitialized') block.config['user.agentor.allow-initialization'] = 'true';
+      if (scenario === 'retained') delete f.volumes.get(f.opts.containerName + '-workspace').config['user.agentor.docker-data'];
+      if (scenario === 'reference') block.used_by = ['/1.0/instances/' + f.opts.containerName + '?project=foreign'];
+      if (scenario === 'created-at') block.created_at = 'unknown';
+      if (scenario === 'expanded-layout') {
+        f.current().expanded_devices = { ...f.current().devices, hidden: { type: 'nic', network: 'foreign' } };
+      }
+      (f.runtime as any).accountDevices = async () => { f.events.push('grants'); return {}; };
+      await expect(f.runtime.finishCanonicalRestore(f.opts, instance.config['volatile.uuid']!, () => {})).rejects.toThrow();
+      expect(f.events).not.toContain('grants'); expect(f.events).not.toContain('promote');
+      expect(f.current().config['user.agentor.restore']).toBe('incomplete');
     } finally { await f.cleanup(); }
   }
 });

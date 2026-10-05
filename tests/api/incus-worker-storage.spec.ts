@@ -38,6 +38,33 @@ test("filesystem persistence is separate from disposable root and Docker capabil
   expect(volumes.size).toBe(2);
 });
 
+test('Docker inverse allocates only fresh nonce-owned block storage and retains it even with Docker disabled', async () => {
+  const f = fixture(), nonce = randomUUID();
+  const devices = await f.storage.freshRestoreDevices(owner, nonce);
+  expect(devices.docker).toEqual({ type: 'disk', pool: 'pool', source: owner.containerName + '-docker' });
+  const block = f.volumes.get(owner.containerName + '-docker');
+  expect(block.config).toMatchObject({ size: '4GiB', 'user.agentor.restore-nonce': nonce,
+    'user.agentor.allow-initialization': 'true' });
+  await expect(f.storage.markDockerRestored(owner, randomUUID())).rejects.toThrow('authority');
+  const before = f.writes.length;
+  await expect(f.storage.freshRestoreDevices(owner, nonce)).rejects.toThrow('absent');
+  expect(f.writes).toHaveLength(before);
+  await f.storage.markDockerRestored(owner, nonce);
+  expect(block.config['user.agentor.allow-initialization']).toBe('false');
+  expect(f.volumes.get(owner.containerName + '-workspace').config['user.agentor.docker-data']).toBe('true');
+  expect((await f.storage.devices(owner, false, { docker: true })).docker).toEqual(devices.docker);
+  await expect(f.storage.markDockerRestored(owner, nonce)).rejects.toThrow('authority');
+});
+
+test('fresh inverse preflight denies even detached Docker data and invalid nonce before any allocations', async () => {
+  const f = fixture();
+  await expect(f.storage.freshRestoreDevices(owner, 'arbitrary')).rejects.toThrow('nonce');
+  expect(f.writes).toEqual([]);
+  f.volumes.set(owner.containerName + '-docker', { name: owner.containerName + '-docker' });
+  await expect(f.storage.freshRestoreDevices(owner, randomUUID())).rejects.toThrow('absent');
+  expect(f.writes).toEqual([]);
+});
+
 test('restored ownership preservation is durable on both exact private roots and refuses malformed/partial metadata', async () => {
   const { storage, volumes, writes } = fixture();
   await storage.devices(owner, false);

@@ -5097,7 +5097,7 @@ for p in sys.argv[1:]:
       }
       const extractedAdditionalPaths = backupPathsPath && manifest.backupPaths
         ? runtimeKind === 'incus-vm'
-          ? await (await import('./portable-managed-volume-archive')).extractIncusSelectedRestorePayload(
+          ? await (await import('./portable-managed-volume-archive')).extractIncusExplicitRestorePayload(
             backupPathsPath, manifest.backupPaths, join(workDir, 'backup-paths'))
           : await extractBackupPathArchives(backupPathsPath, join(workDir, "backup-paths"), manifest.backupPaths)
         : [];
@@ -5173,7 +5173,7 @@ for p in sys.argv[1:]:
       }
 
       if (runtimeKind === 'incus-vm') (await import('./incus-selected-restore')).planIncusSelectedRestore(
-        additionalPaths.map(item => item.path), { accountShares: !!this.storageManager,
+        additionalPaths.filter(item => item.path !== '/var/lib/docker').map(item => item.path), { accountShares: !!this.storageManager,
           hostTargets: mounts.map(item => item.target), managedTargets: nativeManagedPayloads.map(item => item.entry.target) });
 
       const reconstructionResolution = await resolveWorkerReconstruction(userId, reconstruction);
@@ -5721,7 +5721,8 @@ for p in sys.argv[1:]:
       }
       proof.attempted = true;
       const instance = await this.incusRuntime.createCanonicalRestore(options,
-        !imageResolution && manifest.runtime?.kind === 'incus-vm' ? manifest.runtime.source : undefined);
+        !imageResolution && manifest.runtime?.kind === 'incus-vm' ? manifest.runtime.source : undefined,
+        selectedPayloads.some(item => item.path === '/var/lib/docker'));
       const incarnation = instance.config['volatile.uuid'];
       if (!incarnation || instance.config['user.agentor.recreation'] !== marker.nonce ||
           !await this.incusRuntime.matchesWorkerIdentity(instance, id, userId))

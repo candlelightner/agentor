@@ -673,7 +673,10 @@ export class IncusClient {
     const config = { ...current.config };
     if (completeCanonicalRestore) {
       const managedLayout = (devices: Record<string, IncusDevice>) => {
-        const extra = Object.entries(devices).filter(([key]) => !['root', 'workspace', 'agents'].includes(key));
+        if (devices.docker && (devices.docker.type !== 'disk' ||
+            Object.keys(devices.docker).sort().join(',') !== 'pool,source,type' ||
+            devices.docker.pool !== devices.root?.pool || devices.docker.source !== name + '-docker')) return false;
+        const extra = Object.entries(devices).filter(([key]) => !['root', 'workspace', 'agents', 'docker'].includes(key));
         return extra.length <= 32 && extra.every(([key, device]) => {
           const id = /^agentor-persist-([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})$/.exec(device.source ?? '')?.[1];
           return id && key === `m${id.replaceAll('-', '').slice(0, 6)}` && device.type === 'disk' &&
