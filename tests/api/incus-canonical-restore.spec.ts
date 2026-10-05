@@ -119,6 +119,32 @@ test('fresh restore refuses preexisting data and conflicts, never converges by a
   } finally { await f.cleanup(); }
 });
 
+test('descriptive native source cannot select a cached private custom OCI outside the configured image authority', async () => {
+  const f = await fixture(); try {
+    const foreign = { ...f.image, fingerprint: 'd'.repeat(64), properties: {
+      ...f.image.properties, source_image_id: 'sha256:' + 'e'.repeat(64), recipe_id: 'f'.repeat(64) } };
+    f.client.listImages = async () => [foreign, f.image];
+    f.client.getImage = async (fingerprint: string) => fingerprint === foreign.fingerprint ? foreign : f.image;
+    await expect(f.runtime.createCanonicalRestore(f.opts, { sourceImageId: foreign.properties.source_image_id,
+      recipeId: foreign.properties.recipe_id, architecture: 'amd64', converterVersion: 'v0.4.0', bootstrapGeneration: '3' }))
+      .rejects.toMatchObject({ code: 'INCUS_RESTORE_IMAGE_NOT_AUTHORIZED' });
+    expect(f.events).toEqual([]); expect(f.volumes.size).toBe(0);
+  } finally { await f.cleanup(); }
+});
+
+test('authorized immutable OCI may reconstruct a cached older bootstrap recipe without granting another OCI source', async () => {
+  const f = await fixture(); try {
+    const old = { ...f.image, fingerprint: 'd'.repeat(64), properties: { ...f.image.properties, recipe_id: 'e'.repeat(64) } };
+    f.client.listImages = async () => [old, f.image];
+    f.client.getImage = async (fingerprint: string) => fingerprint === old.fingerprint ? old : f.image;
+    const create = f.client.createInstance;
+    f.client.createInstance = async (spec: any) => { expect(spec.source.fingerprint).toBe(old.fingerprint); return create(spec); };
+    await f.runtime.createCanonicalRestore(f.opts, { sourceImageId: old.properties.source_image_id,
+      recipeId: old.properties.recipe_id, architecture: 'amd64', converterVersion: 'v0.4.0', bootstrapGeneration: '3' });
+    expect(f.events).toContain('create');
+  } finally { await f.cleanup(); }
+});
+
 test('portable immutable source resolves only against real native image properties', async () => {
   const f = await fixture(); try {
     const source = { sourceImageId: 'sha256:' + 'b'.repeat(64), recipeId: 'c'.repeat(64), architecture: 'amd64' as const,

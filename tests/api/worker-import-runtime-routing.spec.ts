@@ -50,8 +50,8 @@ async function fixture(run: (importBundle: (runtime: any, origin: WorkerImportOr
 test('portable historical or forged legacy metadata cannot enter Docker when Incus is enabled', async () => {
   await fixture(async (importBundle, calls) => {
     for (const runtime of [undefined, { version: 1, kind: 'legacy-docker', privileged: true, adminLegacyAuthorized: true }])
-      await expect(importBundle(runtime, { kind: 'portable' })).rejects.toMatchObject({ code: 'INCUS_RESTORE_CAPABILITY_PENDING' });
-    expect(calls).toEqual([]);
+      await expect(importBundle(runtime, { kind: 'portable' })).rejects.toThrow('Reached legacy import preflight');
+    expect(calls).toEqual(['legacy-preflight', 'legacy-preflight']); // Shared grant preflight, never Docker.
   });
 });
 
@@ -60,8 +60,8 @@ test('captured disposable rootfs is rejected before backend selection unless del
     await expect(importBundle(undefined, { kind: 'portable' }, true)).rejects.toMatchObject({ code: 'INCUS_CAPTURED_ROOTFS_UNSUPPORTED' });
     for (const imageResolution of [{ mode: 'workspace-only' }, { mode: 'replacement', imageDefinitionId: 'catalog', imageVersion: 'v1' }])
       await expect(importBundle(undefined, { kind: 'portable' }, true, { imageResolution }))
-        .rejects.toMatchObject({ code: 'INCUS_RESTORE_CAPABILITY_PENDING' });
-    expect(calls).toEqual([]);
+        .rejects.toThrow('Reached legacy import preflight');
+    expect(calls).toEqual(['legacy-preflight', 'legacy-preflight']);
   });
 });
 

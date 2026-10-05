@@ -748,11 +748,20 @@ export class IncusWorkerRuntime {
   async createCanonicalRestore(opts: IncusWorkerOptions, source?: WorkerBackupRuntimeSource): Promise<IncusInstance> {
     if (!opts.recreationNonce || opts.start !== false)
       throw new Error('Incus restore requires durable nonce and stopped initial creation');
+    this.validateOptions(opts);
     let fingerprint: string | undefined;
     let verifiedSource: WorkerBackupRuntimeSource | undefined;
     if (source) {
       const parsed = parseWorkerBackupRuntime({ version: 1, kind: 'incus-vm', source });
       if (parsed?.kind !== 'incus-vm') throw new Error('Invalid Incus restore source');
+      // Portable descriptors (and backup provenance) never authorize another
+      // owner's cached custom OCI image. Until authorized catalog conversion
+      // is enabled, only the configured default OCI source can be reconstructed.
+      // Older recipes for that same immutable userspace remain reusable.
+      const authorized = incusImageIdentity(await this.client.getImage(await this.resolveImage()));
+      if (parsed.source.sourceImageId !== authorized.sourceImageId || parsed.source.architecture !== authorized.architecture)
+        throw Object.assign(new Error('The described restore OCI image is not authorized by the current default image; select an authorized replacement or workspace-only restore'),
+          { statusCode: 409, code: 'INCUS_RESTORE_IMAGE_NOT_AUTHORIZED' });
       verifiedSource = parsed.source;
       for (const image of await this.client.listImages()) {
         let identity: IncusWorkerImageIdentity;

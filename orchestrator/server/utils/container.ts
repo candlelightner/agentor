@@ -69,6 +69,7 @@ import type {
 } from "../../shared/types";
 import { normalizeWorkerRuntimeKind } from "../../shared/types";
 import { IncusWorkerRuntime, incusWorkerStatus, type IncusWorkerOptions } from "./incus-worker-runtime";
+import { prepareIncusCanonicalRestorePayload } from './incus-canonical-restore';
 import { selectWorkerImportRuntime, type WorkerImportOrigin } from './worker-import-runtime-policy';
 import { assertBackupRestoreRuntimePrincipal, validBackupRestoreRuntimePrincipal,
   type BackupRestoreRuntimePrincipal } from './backup-restore-runtime-authority';
@@ -5016,15 +5017,20 @@ for p in sys.argv[1:]:
         ignoreCapturedRootfs: opts.imageResolution?.mode === 'replacement' ? 'replacement-image'
           : opts.imageResolution?.mode === 'workspace-only' ? 'workspace-only' : undefined,
       });
-      if (runtimeKind === 'incus-vm')
-        throw Object.assign(new Error('Native Incus restore integration is not available yet; refusing a Docker runtime downgrade'),
+      if (runtimeKind === 'incus-vm' && (managedVolumesPath || backupPathsPath))
+        throw Object.assign(new Error('Native managed-volume and selected-path restore integration is pending; no data will be silently omitted'),
           { statusCode: 409, code: 'INCUS_RESTORE_CAPABILITY_PENDING' });
 
-      // Validate every compressed inner tar before any Docker image/container
-      // mutation. This catches gzip bombs, unsafe paths, and excessive entry
-      // counts while cleanup can still discard the entire import scratch dir.
-      for (const payload of [workspacePath, agentsPath]) {
-        if (payload) await validateGzipTarPayload(payload);
+      // Native GNU/PAX bytes are validated without tar-stream repacking: binary
+      // xattrs and ACLs must survive the inverse canonical extraction unchanged.
+      const canonicalPayloads: { workspace?: string; agents?: string } = {};
+      const nativePayloadDir = join(workDir, 'native-canonical');
+      if (runtimeKind === 'incus-vm') await mkdir(nativePayloadDir, { mode: 0o700 });
+      for (const [role, payload] of [['workspace', workspacePath], ['agents', agentsPath]] as const) {
+        if (!payload) continue;
+        if (runtimeKind === 'incus-vm') canonicalPayloads[role] = (await prepareIncusCanonicalRestorePayload(
+          payload, role, nativePayloadDir)).archivePath;
+        else await validateGzipTarPayload(payload);
       }
       const extractedAdditionalPaths = backupPathsPath && manifest.backupPaths
         ? await extractBackupPathArchives(backupPathsPath, join(workDir, "backup-paths"), manifest.backupPaths)
@@ -5108,7 +5114,7 @@ for p in sys.argv[1:]:
             reconstructionResolution,
             opts.imageResolution,
           );
-      if (resolvedImage.imageRuntimeReference)
+      if (runtimeKind === 'legacy-docker' && resolvedImage.imageRuntimeReference)
         await this.dockerService.ensureImage(
           resolvedImage.imageRuntimeReference,
         );
@@ -5116,6 +5122,7 @@ for p in sys.argv[1:]:
       const environment = await this.resolveImportEnvironment(
         userId,
         manifest.environment,
+        runtimeKind === 'incus-vm',
       );
       const environmentId = environment.id;
       if (environment.created) createdImportEnvironmentId = environment.id;
@@ -5156,6 +5163,18 @@ for p in sys.argv[1:]:
         userId,
         id,
       );
+
+      if (runtimeKind === 'incus-vm') {
+        const now = new Date().toISOString();
+        return this.importNativeCanonicalWorker({
+          id, userId, runtimeKind, createdAt: now, updatedAt: now,
+          containerId: containerName, containerName, displayName,
+          imageName: resolvedImage.imageRuntimeReference || this.config.incusWorkerImage,
+          imageId: '', status: 'creating', desiredRuntimeStatus: 'stopped', environmentId,
+          repos: repos.length ? repos : undefined, mounts: mounts.length ? mounts : undefined,
+          initScript: initScript || undefined, workerSelfApiAccess, pendingRebuild: false, ...resolvedImage,
+        }, canonicalPayloads, manifest, pluginConfiguration, opts.imageResolution, assertRuntimePrincipal);
+      }
 
       // Import the captured rootfs into a per-worker image. This is the exact
       // state the caller explicitly requested, so import failure is surfaced
@@ -5563,6 +5582,106 @@ for p in sys.argv[1:]:
     }
   }
 
+  /** Fresh canonical imports share ordinary owner/worker lifecycle admission.
+   * No archived instance identity or runtime authority comes from the bundle.
+   * The existing initial-create marker fences partial bytes through health. */
+  private async importNativeCanonicalWorker(
+    info: ContainerInfo,
+    payloads: { workspace?: string; agents?: string },
+    manifest: WorkerExportManifest,
+    plugins: Awaited<ReturnType<typeof readPortablePluginConfiguration>> | undefined,
+    imageResolution: WorkerImportOptions['imageResolution'],
+    assertPrincipal: () => Promise<void>,
+  ): Promise<ContainerInfo & { missingSecrets?: string[] }> {
+    if (!this.workerStore) throw new Error('WorkerStore is required for native worker import');
+    const { id, userId, containerName } = info;
+    const marker: NonNullable<WorkerRecord['incusRecreation']> = {
+      nonce: randomUUID(), initialCreate: true, importIncomplete: true,
+    };
+    const proof = { attempted: false, nonce: marker.nonce, incarnation: undefined as string | undefined };
+    let restoredPlugins: Awaited<ReturnType<typeof restoreWorkerPlugins>> | undefined;
+    this.containers.set(id, info);
+    const validate = async () => {
+      await assertPrincipal();
+      const current = this.workerStore!.get(userId, id), recovery = current?.incusRecreation;
+      if (!current || current.runtimeKind !== 'incus-vm' || current.status !== 'active' ||
+          current.deletionPending || current.hostMountsRevoked || current.hardwareDevicesRevoked ||
+          recovery?.nonce !== marker.nonce || recovery.initialCreate !== true || recovery.importIncomplete !== true ||
+          recovery.originalIncarnation !== undefined || recovery.replacementIncarnation !== proof.incarnation ||
+          this.containers.get(id) !== info)
+        throw new Error('Native import identity or initial recovery authority changed');
+    };
+    try {
+      // This durable marker predates image resolution/storage allocation/native
+      // create. Restart recovery must never boot a partially extracted import.
+      await this.workerStore.upsert({ ...this.containerInfoToWorkerRecord(info), incusRecreation: marker });
+      await validate();
+      info.mounts = await this.resolveAuthorizedHostMounts(userId, id, info.mounts);
+      const options: IncusWorkerOptions = {
+        ...await this.incusOptionsForWorker(info, false), start: false, recreationNonce: marker.nonce,
+      };
+      await validate();
+      proof.attempted = true;
+      const instance = await this.incusRuntime.createCanonicalRestore(options,
+        !imageResolution && manifest.runtime?.kind === 'incus-vm' ? manifest.runtime.source : undefined);
+      const incarnation = instance.config['volatile.uuid'];
+      if (!incarnation || instance.config['user.agentor.recreation'] !== marker.nonce ||
+          !await this.incusRuntime.matchesWorkerIdentity(instance, id, userId))
+        throw new Error('Native import incarnation or operation identity is unavailable');
+      // Capture before the next fallible record write so exact rollback remains
+      // possible even when durable UUID publication itself fails.
+      proof.incarnation = incarnation;
+      info.containerId = `incus:${incarnation}`;
+      info.imageId = instance.config['volatile.base_image'] ?? '';
+      marker.replacementIncarnation = incarnation;
+      await this.workerStore.transitionIncusRecreation(userId, id,
+        { status: 'active', desiredRuntimeStatus: 'stopped', incusRecreation: marker }, undefined,
+        { nonce: marker.nonce, initialCreate: true, importIncomplete: true });
+      await validate();
+      await this.incusRuntime.restoreCanonicalArchives(options, incarnation, payloads, validate);
+      await this.incusRuntime.finishCanonicalRestore(options, incarnation, validate);
+      await validate();
+      await useWorkerConfigStore().markApplied(userId, id, this.appliedIncusBootstrap(options, info), options.configurationRevision);
+      await this.recreateImportedMappings(userId, id, containerName, manifest);
+      if (plugins) {
+        const { usePluginDefinitionStore, usePluginInstallationStore } = await import('./services');
+        restoredPlugins = await restoreWorkerPlugins(plugins, userId, id,
+          usePluginDefinitionStore(), usePluginInstallationStore());
+      }
+      await validate();
+      const resolved = await this.workerStore.transitionIncusRecreation(userId, id,
+        { status: 'active', desiredRuntimeStatus: 'running', incusRecreation: undefined }, undefined, marker);
+      Object.assign(info, resolved, { status: 'running', updatedAt: new Date().toISOString() });
+    } catch (error) {
+      let pluginCleanupError: unknown;
+      if (restoredPlugins) {
+        const { usePluginDefinitionStore, usePluginInstallationStore } = await import('./services');
+        try { await rollbackRestoredWorkerPlugins(userId, id, restoredPlugins,
+          usePluginDefinitionStore(), usePluginInstallationStore()); }
+        catch (cleanupError) { pluginCleanupError = cleanupError; }
+      }
+      await this.rollbackFailedProvisionedWorker({ id, userId, containerId: info.containerId,
+        containerName, dockerEnabled: this.resolveEnvironmentConfig(info.environmentId).dockerEnabled ?? true,
+        incusCreation: proof });
+      if (pluginCleanupError) throw new Error('Imported plugin cleanup requires operator attention', { cause: pluginCleanupError });
+      throw error;
+    }
+    // Runtime authority is settled before plugin execution/normal routing.
+    // Deferred plugin lifecycle failures are recorded by its existing manager,
+    // not interpreted as permission to roll back completed canonical data.
+    await this.reconcileManagedNetworksForWorker(info);
+    if (plugins) {
+      const { usePluginRuntimeManager } = await import('./services');
+      await usePluginRuntimeManager().reconcileWorker(userId, id, info.containerId).catch(error => {
+        useLogger().warn(`[container] imported native plugin reconciliation deferred: ${(error as Error).message}`);
+      });
+    }
+    useLogCollector().attach(containerName, info.containerId, 'worker', info.displayName).catch(() => {});
+    const missingSecrets = [...new Set([...(manifest.missingSecrets ?? []),
+      ...(plugins?.installations.flatMap(item => item.secretKeys) ?? [])])].sort();
+    return { ...info, ...(missingSecrets.length ? { missingSecrets } : {}) };
+  }
+
   /** A recreated import environment stops being exclusively owned by the
    * failing import as soon as any durable or live worker references it. Keep it
    * in that case: deleting it would make a later rebuild silently fall back to
@@ -5783,12 +5902,25 @@ for p in sys.argv[1:]:
   private async resolveImportEnvironment(
     userId: string,
     env: Environment | undefined,
+    requireExactEnvironment = false,
   ): Promise<{ id: string; created: boolean }> {
+    if (requireExactEnvironment && (!this.environmentStore || !env))
+      throw Object.assign(new Error('The native import environment authority is unavailable'),
+        { statusCode: 409, code: 'INCUS_IMPORT_ENVIRONMENT_UNAVAILABLE' });
     if (!this.environmentStore || !env)
       return { id: DEFAULT_ENVIRONMENT_ID, created: false };
     if (env.builtIn) {
+      const existing = this.environmentStore.getById(env.id);
+      // The bundle's builtIn flag is descriptive. getById searches all owners,
+      // so existence alone must not expose a foreign custom environment.
+      if (existing && (existing.builtIn !== true || existing.userId !== null))
+        throw Object.assign(new Error('The described built-in environment is not a platform-owned built-in'),
+          { statusCode: 409, code: 'IMPORT_ENVIRONMENT_NOT_AUTHORIZED' });
+      if (requireExactEnvironment && !existing)
+        throw Object.assign(new Error('The native import environment is unavailable; refusing a default-policy substitution'),
+          { statusCode: 409, code: 'INCUS_IMPORT_ENVIRONMENT_UNAVAILABLE' });
       return {
-        id: this.environmentStore.getById(env.id)
+        id: existing
           ? env.id
           : DEFAULT_ENVIRONMENT_ID,
         created: false,
@@ -5816,6 +5948,9 @@ for p in sys.argv[1:]:
       });
       return { id: created.id, created: true };
     } catch (err) {
+      if (requireExactEnvironment) throw Object.assign(
+        new Error('The native import environment could not be recreated; refusing a default-policy substitution'),
+        { statusCode: 409, code: 'INCUS_IMPORT_ENVIRONMENT_UNAVAILABLE', cause: err });
       useLogger().warn(
         `[container] import: could not recreate environment '${env.name}', using default: ${err instanceof Error ? err.message : err}`,
       );
