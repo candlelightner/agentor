@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
-import { BUNDLE_FILES, extractBackupPathArchives, extractBundle, sanitizeBackupPathTarPayload, validateBackupPathTarPayload, validateGzipTarPayload, validateTarPayload, WORKER_EXPORT_VERSION } from '../../orchestrator/server/utils/worker-export';
+import { BUNDLE_FILES, extractBackupPathArchives, extractBundle, sanitizeBackupPathTarPayload, validateBackupPathTarPayload, validateGzipTarPayload, validateTarPayload, WORKER_EXPORT_VERSION, PORTABLE_MANAGED_VOLUME_EXPORT_VERSION } from '../../orchestrator/server/utils/worker-export';
 
 type Entry = { name: string; body: Buffer; type?: string; linkname?: string; uid?: number; gid?: number };
 
@@ -56,6 +56,35 @@ async function withBundle(entries: Entry[], action: (bundle: string, destination
 }
 
 test.describe('Worker export root filesystem format compatibility', () => {
+  test('old manifests keep runtime absent and portable runtime descriptions strip native authority', async () => {
+    const original = JSON.parse(manifest(WORKER_EXPORT_VERSION, false).toString());
+    const source = { sourceImageId: 'sha256:' + 'a'.repeat(64), recipeId: 'b'.repeat(64),
+      architecture: 'amd64', converterVersion: 'v0.4.0', bootstrapGeneration: '3' };
+    for (const runtime of [undefined, { version: 1, kind: 'legacy-docker', privileged: true },
+      { version: 1, kind: 'incus-vm', source: { ...source, fingerprint: 'c'.repeat(64), physicalDevice: '/dev/sdb' },
+        ipv4Address: '10.42.0.9', instanceUuid: 'foreign', clientKey: 'excluded' }]) {
+      await withBundle([{ name: BUNDLE_FILES.manifest, body: Buffer.from(JSON.stringify({ ...original, runtime })) }],
+        async (bundle, destination) => {
+          const extracted = await extractBundle(bundle, destination);
+          expect(extracted.manifest.runtime).toEqual(runtime === undefined ? undefined : runtime.kind === 'legacy-docker'
+            ? { version: 1, kind: 'legacy-docker' } : { version: 1, kind: 'incus-vm', source });
+        });
+    }
+  });
+
+  test('Incus descriptions reject disposable rootfs payloads and malformed immutable image sources', async () => {
+    const original = JSON.parse(manifest(WORKER_EXPORT_VERSION, false).toString());
+    const runtime = { version: 1, kind: 'incus-vm', source: { sourceImageId: 'sha256:' + 'a'.repeat(64),
+      recipeId: 'b'.repeat(64), architecture: 'amd64', converterVersion: 'v0.4.0', bootstrapGeneration: '3' } };
+    for (const value of [{ ...original, runtime, contents: { ...original.contents, rootfs: true } },
+      { ...original, runtime: { ...runtime, source: { ...runtime.source, sourceImageId: 'mutable:latest' } } }]) {
+      await withBundle([{ name: BUNDLE_FILES.manifest, body: Buffer.from(JSON.stringify(value)) }],
+        async (bundle, destination) => {
+          await expect(extractBundle(bundle, destination)).rejects.toThrow(/disposable root filesystem|immutable runtime source/);
+        });
+    }
+  });
+
   test('v2 accepts the transitional uncompressed rootfs.tar payload', async () => {
     const rawRootfs = await tarBuffer([{ name: 'etc/issue', body: Buffer.from('agentor\n') }]);
     await withBundle(
@@ -203,7 +232,7 @@ test.describe('Worker export root filesystem format compatibility', () => {
   });
 
   test('rejects bundle versions newer than the supported format', async () => {
-    await withBundle([{ name: BUNDLE_FILES.manifest, body: manifest(WORKER_EXPORT_VERSION + 1, false) }], async (bundle, destination) => {
+    await withBundle([{ name: BUNDLE_FILES.manifest, body: manifest(PORTABLE_MANAGED_VOLUME_EXPORT_VERSION + 1, false) }], async (bundle, destination) => {
       await expect(extractBundle(bundle, destination)).rejects.toThrow('newer than supported');
     });
   });

@@ -21,6 +21,7 @@ import {
   type PortableManagedVolumeEntry,
 } from './portable-managed-volume-format';
 import { MAX_PORTABLE_MANAGED_VOLUME_COMPRESSED_PAYLOAD_BYTES } from './portable-managed-volume-archive';
+import { parseWorkerBackupRuntime, type WorkerBackupRuntime } from './worker-backup-runtime';
 
 /** Bumped when the bundle layout changes incompatibly. */
 export const WORKER_EXPORT_VERSION = 5;
@@ -138,6 +139,9 @@ export function validateBundleOutputLayout(
 export interface WorkerExportManifest {
   version: number;
   exportedAt: string;
+  /** Descriptive portable inputs only; never import authorization. Missing
+   * historical runtime metadata must not be inferred from platform settings. */
+  runtime?: WorkerBackupRuntime;
   /** Identity of the source worker (informational; not reused on import). */
   source: {
     id: string;
@@ -268,11 +272,15 @@ export function packBundle(files: { name: string; path: string }[]): Readable {
 
 /** Write the manifest JSON to a file. */
 export async function writeManifest(manifest: WorkerExportManifest, dest: string): Promise<void> {
+  const runtime = parseWorkerBackupRuntime(manifest.runtime);
+  if (runtime?.kind === 'incus-vm' && manifest.contents.rootfs)
+    throw new Error('Incus disposable root filesystem is not portable backup data');
   // Domain basic-auth passwords are runtime credentials, not portable worker
   // configuration. Sanitize at the serialization boundary as defense in depth:
   // callers compiled against an older type cannot accidentally export them.
   const safeManifest = {
     ...manifest,
+    ...(runtime ? { runtime } : {}),
     domainMappings: manifest.domainMappings.map((mapping) => {
       const { basicAuth: _secret, ...safe } = mapping as ExportedDomainMapping & { basicAuth?: unknown };
       return safe;
@@ -801,6 +809,11 @@ function assertValidManifest(value: unknown): asserts value is WorkerExportManif
   }
   if (!isRecord(contents) || !['rootfs', 'workspace', 'agents'].every((k) => typeof contents[k] === 'boolean') || (contents.backupPaths !== undefined && typeof contents.backupPaths !== 'boolean') || (contents.plugins !== undefined && typeof contents.plugins !== 'boolean') || (contents.reconstruction !== undefined && typeof contents.reconstruction !== 'boolean') || (contents.managedVolumes !== undefined && typeof contents.managedVolumes !== 'boolean')) {
     throw new Error('Invalid worker export: manifest.contents is invalid');
+  }
+  if (value.runtime !== undefined) {
+    value.runtime = parseWorkerBackupRuntime(value.runtime);
+    if ((value.runtime as WorkerBackupRuntime).kind === 'incus-vm' && contents.rootfs)
+      throw new Error('Incus disposable root filesystem is not portable backup data');
   }
   if (value.backupPaths !== undefined && (!Array.isArray(value.backupPaths) || value.backupPaths.length > 32 || new Set(value.backupPaths.map((entry: any) => entry?.path)).size !== value.backupPaths.length || new Set(value.backupPaths.map((entry: any) => entry?.archive)).size !== value.backupPaths.length || value.backupPaths.some((entry) => !isRecord(entry) || !isString(entry.path) || !safeAbsoluteBackupPath(entry.path) || !isString(entry.archive) || !/^paths\/[0-9]{1,2}\.tar$/.test(entry.archive)))) {
     throw new Error('Invalid worker export: manifest.backupPaths is invalid');

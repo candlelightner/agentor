@@ -4634,6 +4634,34 @@ for p in sys.argv[1:]:
       throw err;
     }
 
+    const native = info.runtimeKind === 'incus-vm';
+    const capturedHandle = info.containerId, capturedGeneration = workerLifecycleGeneration(id);
+    const validateNativeCapture = async () => {
+      const check = () => {
+        const current = this.get(id), record = this.workerStore?.get(info.userId, id);
+        if (!current || current.containerId !== capturedHandle || current.userId !== info.userId ||
+            current.status !== 'running' || !record || record.status !== 'active' ||
+            record.runtimeKind !== 'incus-vm' || record.deletionPending || record.incusRecreation ||
+            workerLifecycleGeneration(id) !== capturedGeneration || !isWorkerLifecycleMutationPending(id))
+          throw new Error('Incus export canonical runtime authority changed');
+      };
+      check();
+      const { useManagedVolumeManager } = await import('./managed-volume-manager');
+      const managed = useManagedVolumeManager(); await managed.init();
+      managed.assertLiveRecoveryResolved(info.userId, id);
+      check();
+    };
+    if (native) {
+      if (opts.includeRootfs) throw Object.assign(new Error('Incus root filesystem is disposable, not backup data'),
+        { statusCode: 409, code: 'INCUS_DISPOSABLE_ROOTFS' });
+      if (info.status !== 'running' || opts.includeManagedVolumes)
+        throw Object.assign(new Error('Offline Incus or managed-volume archive capture is not available yet'),
+          { statusCode: 409, code: 'INCUS_ARCHIVE_CAPABILITY_PENDING' });
+      // Fence unresolved authority before creating staging files or opening
+      // archive exec, not after canonical bytes were already captured.
+      await validateNativeCapture();
+    }
+
     const env =
       this.environmentStore?.getById(
         info.environmentId || DEFAULT_ENVIRONMENT_ID,
@@ -4718,6 +4746,8 @@ for p in sys.argv[1:]:
           ? PORTABLE_MANAGED_VOLUME_EXPORT_VERSION
           : WORKER_EXPORT_VERSION,
         exportedAt: new Date().toISOString(),
+        runtime: native ? await this.incusRuntime.backupRuntime(info, this.capturedIncusIncarnation(info))
+          : { version: 1, kind: 'legacy-docker' },
         source: {
           id: info.id,
           displayName: info.displayName,
@@ -4790,11 +4820,11 @@ for p in sys.argv[1:]:
       files.push({ name: BUNDLE_FILES.reconstruction, path: reconstructionPath });
 
       if (includeWorkspace) {
-        const wsSrc = await this.dockerService.getArchive(
-          info.containerId,
-          EXPORT_WORKSPACE_PATH,
-          opts.signal,
-        );
+        const exclusions = [...(info.mounts ?? []).map(mount => mount.target),
+          ...persistence.store.forWorker(info.userId, id).filter(volume => volume.attached).map(volume => volume.target)];
+        const wsSrc = native ? await this.incusRuntime.openCanonicalArchive(info, this.capturedIncusIncarnation(info),
+          'workspace', validateNativeCapture, { exclusions, signal: opts.signal })
+          : await this.dockerService.getArchive(info.containerId, EXPORT_WORKSPACE_PATH, opts.signal);
         bytesProcessed += await writeGzipFile(
           wsSrc,
           join(tmpDir, BUNDLE_FILES.workspace),
@@ -4808,12 +4838,13 @@ for p in sys.argv[1:]:
       await report("workspace", opts.includeRootfs ? 30 : 45);
 
       if (includeAgents) {
-        const agSrc = await this.dockerService.getArchive(
-          info.containerId,
-          EXPORT_AGENTS_PATH,
-          opts.signal,
-        );
-        bytesProcessed += await writeFilteredAgentsGz(
+        const exclusions = [...(info.mounts ?? []).map(mount => mount.target),
+          ...persistence.store.forWorker(info.userId, id).filter(volume => volume.attached).map(volume => volume.target)];
+        const agSrc = native ? await this.incusRuntime.openCanonicalArchive(info, this.capturedIncusIncarnation(info),
+          'agents', validateNativeCapture, { exclusions, signal: opts.signal })
+          : await this.dockerService.getArchive(info.containerId, EXPORT_AGENTS_PATH, opts.signal);
+        bytesProcessed += native ? await writeGzipFile(agSrc, join(tmpDir, BUNDLE_FILES.agents), opts.signal)
+          : await writeFilteredAgentsGz(
           agSrc,
           join(tmpDir, BUNDLE_FILES.agents),
           CREDENTIAL_EXCLUDE_SUFFIXES,
@@ -4848,6 +4879,7 @@ for p in sys.argv[1:]:
       }
 
       opts.signal?.throwIfAborted();
+      if (native) await validateNativeCapture();
       const stream = packBundle(files);
       stream.on("end", cleanup);
       stream.on("close", cleanup);
@@ -4925,6 +4957,9 @@ for p in sys.argv[1:]:
       if (!manifest || typeof manifest.version !== "number") {
         throw new Error("Invalid worker export bundle");
       }
+      if (manifest.runtime?.kind === 'incus-vm')
+        throw Object.assign(new Error('Native Incus restore integration is not available yet; refusing a Docker runtime downgrade'),
+          { statusCode: 409, code: 'INCUS_RESTORE_CAPABILITY_PENDING' });
 
       // Validate every compressed inner tar before any Docker image/container
       // mutation. This catches gzip bombs, unsafe paths, and excessive entry

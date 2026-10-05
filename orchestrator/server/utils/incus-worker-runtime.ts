@@ -20,6 +20,9 @@ import { incusManagedNetworkAuthority, incusManagedBridgeIdentity, incusManagedN
 import { ManagedNetworkStore } from './managed-network-store';
 import { isIP } from 'node:net';
 import { incusHostMountLayout, incusHostMountMetadata, assertIncusHostMountLayout } from './incus-host-mount-runtime';
+import { INCUS_CANONICAL_ARCHIVE_SCRIPT } from './incus-canonical-archive';
+import { PassThrough } from 'node:stream';
+import { snapshotIncusWorkerBackupRuntime } from './worker-backup-runtime';
 
 export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & {
   sshAuthorizedKeys?: string;
@@ -122,6 +125,51 @@ export class IncusWorkerRuntime {
 
   async removeStorage(owner: IncusStorageOwner): Promise<void> {
     await (await this.storage()).remove(owner);
+  }
+
+  async backupRuntime(owner: IncusStorageOwner, incarnation: string) {
+    await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    const identity = await (await this.storage()).imageIdentity(owner);
+    if (!identity) throw new Error('Incus backup immutable source is missing');
+    await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    return snapshotIncusWorkerBackupRuntime(identity);
+  }
+
+  /** Caller holds existing export lifecycle admission. Never allocate/start
+   * storage, source guest environment, or enter a second worker setup queue. */
+  async openCanonicalArchive(owner: IncusStorageOwner, incarnation: string, role: 'workspace' | 'agents',
+    validateRecord: () => void | Promise<void>, options: { exclusions: string[]; signal?: AbortSignal }) {
+    if (role !== 'workspace' && role !== 'agents') throw new Error('Invalid canonical archive role');
+    const storage = await this.storage();
+    const validate = async () => {
+      await validateRecord();
+      const instance = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+      if (instance.status !== 'Running') throw new Error('Running Incus canonical archive requires a running VM');
+      const volume = await storage.inspectVolume(owner, role);
+      const device = instance.devices[role];
+      if (!volume || !device || !sameDevice(device, { type: 'disk', pool: this.config.incusStoragePool,
+        source: volume.name, path: role === 'workspace' ? '/workspace' : '/home/agent/.agent-data' }))
+        throw new Error('Incus canonical archive storage attachment is ambiguous');
+      await validateRecord();
+    };
+    await validate();
+    const session = await this.client.execStream(owner.containerName,
+      ['/usr/bin/python3', '-c', INCUS_CANONICAL_ARCHIVE_SCRIPT, role, JSON.stringify(options.exclusions)],
+      { command: [], user: 0, group: 0, cwd: '/', environment: { PATH: '/usr/bin:/bin', LC_ALL: 'C' },
+        signal: options.signal, timeoutMs: 10 * 60_000 });
+    const output = new PassThrough();
+    output.on('error', () => {});
+    output.once('close', () => session.close());
+    session.stderr.resume();
+    session.stdout.on('error', error => output.destroy(error));
+    session.stdout.pipe(output, { end: false });
+    session.stdin.end();
+    void session.result.then(async code => {
+      if (code !== 0) throw new Error('Incus canonical archive capture failed');
+      await validate();
+      output.end();
+    }).catch(error => output.destroy(error));
+    return output;
   }
 
   async matchesWorkerIdentity(instance: IncusInstance, workerId: string, userId?: string): Promise<boolean> {
