@@ -47,6 +47,8 @@ export interface Config {
   incusClientKeyPath: string;
   incusServerCertPath: string;
   incusNetwork: string;
+  incusNetworkHostEndpoint?: string;
+  incusNetworkHostServerCertPath?: string;
   incusStoragePool: string;
   incusWorkerImage: string;
   incusDockerVolumeSize: string;
@@ -168,6 +170,8 @@ export function loadConfig(): Config {
     incusClientKeyPath: process.env.INCUS_CLIENT_KEY_PATH || '',
     incusServerCertPath: process.env.INCUS_SERVER_CERT_PATH || '',
     incusNetwork: process.env.INCUS_NETWORK || '',
+    incusNetworkHostEndpoint: process.env.INCUS_NETWORK_HOST_ENDPOINT || '',
+    incusNetworkHostServerCertPath: process.env.INCUS_NETWORK_HOST_SERVER_CERT_PATH || '',
     incusStoragePool: process.env.INCUS_STORAGE_POOL || '',
     incusWorkerImage: process.env.INCUS_WORKER_IMAGE || 'agentor-worker',
     incusDockerVolumeSize: process.env.INCUS_DOCKER_VOLUME_SIZE || '20GiB',
