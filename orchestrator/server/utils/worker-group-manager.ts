@@ -13,6 +13,7 @@ import type { WorkerGroup } from "./worker-group-store";
 import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 import { verifyWorkerMutationUnlocks } from "./worker-protection-lock";
 import { withOwnerLifecycleMutation } from "./worker-lifecycle-coordinator";
+import { authorizeManagedNetworkMutation } from './managed-network-authorization';
 
 type WorkerGroupPatch = Pick<
   Partial<WorkerGroup>,
@@ -49,9 +50,11 @@ interface NetworkStoreLike {
   get(userId: string, networkId: string): ManagedNetwork | undefined;
 }
 interface NetworkManagerLike {
+  actualWorkerIds(network: ManagedNetwork): Promise<string[]>;
   reconcile(
     network: ManagedNetwork,
     workerIds?: Iterable<string>,
+    coveredWorkerIds?: ReadonlySet<string>,
   ): Promise<Reconciliation>;
 }
 export interface WorkerGroupNetworkDependencies {
@@ -180,7 +183,6 @@ export class WorkerGroupNetworkCoordinator {
         });
       authorize?.(source?.id, target?.id);
       if (source?.id === targetGroupId) return source;
-      await this.dependencies.verify([workerId], lockPasswords);
 
       const hierarchy = new WorkerGroupHierarchy(groups);
       const affectedGroups = new Set<string>();
@@ -194,9 +196,11 @@ export class WorkerGroupNetworkCoordinator {
         userId,
         networkIds,
       );
+      const coverage = await this.authorizeNetworks(userId, networkIds,
+        [workerId, ...[...previousTopology.values()].flat()], lockPasswords);
       await groups.assignWorker(userId, workerId, source?.id, targetGroupId);
 
-      const failures = await this.reconcileAll(userId, networkIds);
+      const failures = await this.reconcileAll(userId, networkIds, undefined, coverage);
       if (!failures.length) return target ?? null;
       const rollbackFailures: string[] = [];
       await groups
@@ -205,7 +209,7 @@ export class WorkerGroupNetworkCoordinator {
           rollbackFailures.push(`membership: ${safeMessage(error)}`),
         );
       rollbackFailures.push(
-        ...(await this.reconcileSnapshot(userId, previousTopology)),
+        ...(await this.reconcileSnapshot(userId, previousTopology, coverage)),
       );
       throw createError({
         statusCode: 409,
@@ -249,18 +253,14 @@ export class WorkerGroupNetworkCoordinator {
     const networkIds = this.networkIdsForGroups(userId, affectedGroups);
     const previousTopology = this.networkMembershipSnapshot(userId, networkIds);
 
-    if (networkIds.length)
-      await this.dependencies.verify(
-        patch.parentId !== undefined
-          ? hierarchy.subtreeWorkerIds(userId, groupId)
-          : [...new Set([...previous.workerIds, ...(patch.workerIds ?? [])])],
-        lockPasswords,
-      );
+    const coverage = networkIds.length ? await this.authorizeNetworks(userId, networkIds,
+      [...[...previousTopology.values()].flat(), ...hierarchy.subtreeWorkerIds(userId, groupId), ...(patch.workerIds ?? [])],
+      lockPasswords) : undefined;
 
     const updated = await groups.update(userId, groupId, patch);
     if (!networkIds.length) return updated;
 
-    const failures = await this.reconcileAll(userId, networkIds);
+    const failures = await this.reconcileAll(userId, networkIds, undefined, coverage);
     if (!failures.length) return updated;
 
     let storageRollbackFailure = "";
@@ -274,6 +274,7 @@ export class WorkerGroupNetworkCoordinator {
     const topologyRollbackFailures = await this.reconcileSnapshot(
       userId,
       previousTopology,
+      coverage,
     );
     const details = [
       storageRollbackFailure
@@ -322,44 +323,18 @@ export class WorkerGroupNetworkCoordinator {
     });
   }
 
-  /** Remove a permanently deleted worker from every direct membership and
-   * reconcile networks derived from those groups and their ancestors. The
-   * membership snapshot is restored on reconciliation failure so deletion
-   * remains safely retryable instead of committing a half-updated topology. */
+  /** Compute has already been removed by the fenced deletion operation. Only
+   * update its desired group references here: no sibling password authority is
+   * available to adapt or reconcile an owner-wide network during deletion. */
   removeDeletedWorker(userId: string, workerId: string) {
     return this.withOwner(userId, async () => {
       const containing = this.dependencies.groups
         .listForUser(userId)
         .filter((group) => group.workerIds.includes(workerId));
       if (!containing.length) return [];
-      const hierarchy = new WorkerGroupHierarchy(this.dependencies.groups);
-      const affectedGroups = new Set<string>();
-      for (const group of containing)
-        for (const item of hierarchy.ancestors(userId, group.id, true))
-          affectedGroups.add(item.id);
-      const networkIds = this.networkIdsForGroups(userId, affectedGroups);
-      const previousTopology = this.networkMembershipSnapshot(
-        userId,
-        networkIds,
-      );
       const previousGroupIds = containing.map((group) => group.id);
       await this.dependencies.groups.removeWorkerReferences(userId, workerId);
-      const failures = await this.reconcileAll(userId, networkIds);
-      if (!failures.length) return previousGroupIds;
-
-      const rollbackFailures: string[] = [];
-      await this.dependencies.groups
-        .setWorkerReferences(userId, workerId, previousGroupIds)
-        .catch((error) =>
-          rollbackFailures.push(`membership: ${safeMessage(error)}`),
-        );
-      rollbackFailures.push(
-        ...(await this.reconcileSnapshot(userId, previousTopology)),
-      );
-      throw createError({
-        statusCode: 409,
-        statusMessage: `Worker group network reconciliation failed during worker deletion: ${failures.join("; ")}. ${rollbackFailures.length ? `Rollback failed: ${rollbackFailures.join("; ")}` : "Previous memberships and topology restored."}`,
-      });
+      return previousGroupIds;
     });
   }
 
@@ -404,6 +379,7 @@ export class WorkerGroupNetworkCoordinator {
   private async reconcileSnapshot(
     userId: string,
     snapshot: Map<string, string[]>,
+    coverage?: ReadonlySet<string>,
   ) {
     const failures: string[] = [];
     for (const [networkId, workerIds] of snapshot) {
@@ -418,6 +394,7 @@ export class WorkerGroupNetworkCoordinator {
         const result = await this.dependencies.manager.reconcile(
           network,
           workerIds,
+          coverage,
         );
         failures.push(
           ...result.partialFailures.map(
@@ -464,6 +441,7 @@ export class WorkerGroupNetworkCoordinator {
     userId: string,
     networkIds: string[],
     workerIds?: Iterable<string>,
+    coverage?: ReadonlySet<string>,
   ) {
     const failures: string[] = [];
     for (const networkId of networkIds) {
@@ -478,6 +456,7 @@ export class WorkerGroupNetworkCoordinator {
         const result = await this.dependencies.manager.reconcile(
           network,
           workerIds,
+          coverage,
         );
         failures.push(
           ...result.partialFailures.map(
@@ -489,6 +468,18 @@ export class WorkerGroupNetworkCoordinator {
       }
     }
     return failures;
+  }
+
+  private authorizeNetworks(userId: string, networkIds: Iterable<string>, desiredIds: Iterable<string>, passwords: unknown) {
+    const networks = [...networkIds].map(id => {
+      const network = this.dependencies.networks.get(userId, id);
+      if (!network) throw createError({ statusCode: 409, statusMessage: 'Managed network disappeared before authorization' });
+      return network;
+    });
+    return authorizeManagedNetworkMutation(networks, desiredIds, passwords, {
+      actualWorkerIds: network => this.dependencies.manager.actualWorkerIds(network),
+      verify: (ids, supplied) => this.dependencies.verify(ids, supplied),
+    });
   }
 }
 

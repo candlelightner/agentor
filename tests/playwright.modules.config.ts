@@ -34,6 +34,7 @@ export default defineConfig({
     "api/instance-restore-helper.spec.ts",
     "api/managed-volume-store.spec.ts",
     "api/managed-network-update.spec.ts",
+    "api/managed-network-authorization.spec.ts",
     "api/managed-network-manager.spec.ts",
     "api/incus-managed-docker-bridge.spec.ts",
     "api/worker-group-network-coordinator.spec.ts",

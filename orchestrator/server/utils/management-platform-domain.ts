@@ -5,7 +5,7 @@ import {
   useWorkerStore,
 } from "./services";
 import { useStorageVisibilityManager } from "./storage-visibility";
-import { verifyWorkerMutationUnlocks } from "./worker-protection-lock";
+import { authorizeManagedNetworkMutation } from "./managed-network-authorization";
 import { withWorkerNetworkMutation } from "./worker-group-manager";
 import { reconcileCreatedManagedNetwork, updateManagedNetworkAtomically } from "./managed-network-update";
 import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
@@ -62,14 +62,16 @@ export class ManagementPlatformDomain {
       }
       validateWorkers(ownerId, args.workerIds);
       const prospective={userId:ownerId,scope,groupId,workerIds:strings(args.workerIds)};
-      await verifyWorkerMutationUnlocks(await affectedWorkerIds(prospective), args.lockPasswords);
+      const affected = await affectedWorkerIds(prospective);
+      await authorizeManagedNetworkMutation([], affected, args.lockPasswords);
       const network = await store.create(ownerId, label, scope as any, groupId);
       if (scope === "selected")
         await store.update(ownerId, network.id, { workerIds: strings(args.workerIds) });
       const saved = store.get(ownerId, network.id)!;
+      const coverage = await authorizeManagedNetworkMutation([saved], affected, args.lockPasswords);
       return reconcileCreatedManagedNetwork(saved, {
-        reconcile: value => manager.reconcile(value),
-        removeRuntime: value => manager.remove(value),
+        reconcile: value => manager.reconcile(value, undefined, coverage),
+        removeRuntime: value => manager.remove(value, coverage),
         removeRecord: (userId, networkId) => store.remove(userId, networkId),
       });
       }) };
@@ -83,8 +85,8 @@ export class ManagementPlatformDomain {
       return { handled: true, result: await withWorkerNetworkMutation(network.userId, async () => {
         scopeAuthorize(args);
         const current=store.findById(id);if(!current||current.userId!==network.userId)throw error(404,"Managed network not found");
-        await verifyWorkerMutationUnlocks(await affectedWorkerIds(current), args.lockPasswords);
-        await manager.remove(current);
+        const coverage = await authorizeManagedNetworkMutation([current], await affectedWorkerIds(current), args.lockPasswords);
+        await manager.remove(current, coverage);
         await store.remove(current.userId, id);
         return { id, deleted: true };
       }) };
@@ -93,8 +95,8 @@ export class ManagementPlatformDomain {
       return { handled: true, result: await withWorkerNetworkMutation(network.userId, async () => {
         scopeAuthorize(args);
         const current=store.findById(id);if(!current||current.userId!==network.userId)throw error(404,"Managed network not found");
-        await verifyWorkerMutationUnlocks(await affectedWorkerIds(current), args.lockPasswords);
-        return manager.reconcile(current);
+        const coverage = await authorizeManagedNetworkMutation([current], await affectedWorkerIds(current), args.lockPasswords);
+        return manager.reconcile(current, undefined, coverage);
       }) };
     return { handled: true, result: await withWorkerNetworkMutation(network.userId, async () => {
       scopeAuthorize(args);
@@ -121,8 +123,8 @@ export class ManagementPlatformDomain {
       }
       const prospective={...current,...patch};
       if(prospective.scope==="group"&&(!prospective.groupId||!useWorkerGroupStore().get(current.userId,prospective.groupId)))throw error(400,"Group not found");
-      await verifyWorkerMutationUnlocks([...await affectedWorkerIds(current), ...await affectedWorkerIds(prospective)], args.lockPasswords);
-      return updateManagedNetworkAtomically(current,patch,{update:(userId,networkId,value)=>store.update(userId,networkId,value),reconcile:value=>manager.reconcile(value)});
+      const coverage = await authorizeManagedNetworkMutation([current], [...await affectedWorkerIds(current), ...await affectedWorkerIds(prospective)], args.lockPasswords);
+      return updateManagedNetworkAtomically(current,patch,{update:(userId,networkId,value)=>store.update(userId,networkId,value),reconcile:value=>manager.reconcile(value, undefined, coverage)});
     }) };
   }
 }

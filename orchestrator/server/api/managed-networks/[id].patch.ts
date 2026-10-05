@@ -1,5 +1,6 @@
 defineRouteMeta({ openAPI: { tags: ['Managed networks'], summary: 'Update managed network membership', description: 'Serializes group references with worker-group mutation and reconciles actual Docker membership.', operationId: 'updateManagedNetwork', responses: { 200: { description: 'Updated reconciliation' }, 400: { description: 'Invalid scope, group, or workers' }, 409: { description: 'Docker reconciliation conflict' }, 423: { description: 'A worker affected by the membership change is protected' } } } });
-import { requireResourceAccess } from '../../utils/auth-helpers'; import { useManagedNetworkStore, useWorkerGroupStore, useWorkerStore } from '../../utils/services'; import { useManagedNetworkManager } from '../../utils/managed-network-manager'; import { verifyWorkerMutationUnlocks } from '../../utils/worker-protection-lock';
+import { requireResourceAccess } from '../../utils/auth-helpers'; import { useManagedNetworkStore, useWorkerGroupStore, useWorkerStore } from '../../utils/services'; import { useManagedNetworkManager } from '../../utils/managed-network-manager';
+import { authorizeManagedNetworkMutation } from '../../utils/managed-network-authorization';
 import { withWorkerNetworkMutation } from '../../utils/worker-group-manager';
 import { updateManagedNetworkAtomically } from '../../utils/managed-network-update';
 import { WorkerGroupHierarchy } from '../../utils/worker-group-hierarchy';
@@ -12,7 +13,7 @@ export default defineEventHandler(async event => { const id = getRouterParam(eve
   if (body?.name !== undefined && (typeof body.name !== 'string' || !body.name.trim() || body.name.length > 100)) throw createError({ statusCode: 400, statusMessage: 'Valid name required' });
   const affected=(value:any)=>value.scope==='selected'?(value.workerIds||[]):value.scope==='group'?new WorkerGroupHierarchy(useWorkerGroupStore()).subtreeWorkerIds(value.userId,value.groupId):useWorkerStore().listForUser(value.userId).map(worker=>worker.id);
   const proposed={...network,scope,groupId,workerIds:scope==='selected'?(body?.workerIds??network!.workerIds):[]};
-  await verifyWorkerMutationUnlocks([...affected(network),...affected(proposed)],body?.lockPasswords);
+  const coverage = await authorizeManagedNetworkMutation([network], [...affected(network),...affected(proposed)],body?.lockPasswords);
   const manager=useManagedNetworkManager();
-  return updateManagedNetworkAtomically(network,{ name: body?.name, scope, groupId, workerIds: scope === 'selected' ? body?.workerIds : [] },{update:(userId,networkId,patch)=>store.update(userId,networkId,patch),reconcile:value=>manager.reconcile(value)});
+  return updateManagedNetworkAtomically(network,{ name: body?.name, scope, groupId, workerIds: scope === 'selected' ? body?.workerIds : [] },{update:(userId,networkId,patch)=>store.update(userId,networkId,patch),reconcile:value=>manager.reconcile(value, undefined, coverage)});
 });});

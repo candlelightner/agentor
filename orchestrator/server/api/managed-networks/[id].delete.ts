@@ -18,7 +18,7 @@ import {
   useWorkerStore,
 } from "../../utils/services";
 import { useManagedNetworkManager } from "../../utils/managed-network-manager";
-import { verifyWorkerMutationUnlocks } from "../../utils/worker-protection-lock";
+import { authorizeManagedNetworkMutation } from "../../utils/managed-network-authorization";
 import { withWorkerNetworkMutation } from "../../utils/worker-group-manager";
 import { WorkerGroupHierarchy } from "../../utils/worker-group-hierarchy";
 export default defineEventHandler(async (e) => {
@@ -38,8 +38,8 @@ export default defineEventHandler(async (e) => {
         : useWorkerStore()
             .listForUser(current.userId)
             .map((w: any) => w.id);
-  await verifyWorkerMutationUnlocks(ids, b?.lockPasswords);
-  await useManagedNetworkManager().remove(current);
+  const coverage = await authorizeManagedNetworkMutation([current], ids, b?.lockPasswords);
+  await useManagedNetworkManager().remove(current, coverage);
   await s.remove(current.userId, id);
   setResponseStatus(e, 204);
   return null;

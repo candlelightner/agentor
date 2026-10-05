@@ -1,4 +1,5 @@
 import Docker from "dockerode";
+import { createError } from 'h3';
 import {
   useContainerManager,
   useManagedNetworkStore,
@@ -12,6 +13,7 @@ import { withOperationDeadline } from "./operation-deadline";
 import { IncusManagedNetworkHost } from './incus-managed-network-host';
 import { IncusManagedDockerBridge } from './incus-managed-docker-bridge';
 import { normalizeWorkerRuntimeKind } from '../../shared/types';
+import { verifyWorkerMutationUnlocks } from './worker-protection-lock';
 
 const DOCKER_READ_TIMEOUT_MS = 8_000;
 const DOCKER_MUTATION_TIMEOUT_MS = 30_000;
@@ -105,7 +107,7 @@ export class ManagedNetworkManager {
   async members(network: ManagedNetwork) {
     let ids: string[];
     if (network.scope === "all")
-      ids = useWorkerStore()
+      ids = this.workers()
         .listForUser(network.userId)
         .filter((worker) => worker.status !== "archived")
         .map((worker) => worker.id);
@@ -116,15 +118,17 @@ export class ManagedNetworkManager {
         : [];
     }
     else ids = network.workerIds;
-    return [...new Set(ids)].filter((id) => useWorkerStore().get(network.userId, id));
+    return [...new Set(ids)].filter((id) => this.workers().get(network.userId, id));
   }
 
-  async reconcile(network: ManagedNetwork, workerIds?: Iterable<string>) {
+  async reconcile(network: ManagedNetwork, workerIds?: Iterable<string>, coveredWorkerIds?: ReadonlySet<string>) {
     this.assertSafe(network);
-    const dockerNetwork = await this.ensure(network);
     const target = new Set(workerIds === undefined ? await this.members(network) : workerIds);
+    const coverage = await this.mutationCoverage(network, target, coveredWorkerIds);
+    const dockerNetwork = await this.ensure(network);
+    await this.mutationCoverage(network, target, coverage);
     const failures: string[] = [];
-    const manager = useContainerManager();
+    const manager = this.manager();
     const currentByName = new Map(
       Object.entries(dockerNetwork.Containers || {}).map(([id, member]) => [
         member.Name,
@@ -134,6 +138,8 @@ export class ManagedNetworkManager {
     for (const id of target) {
       const worker = manager.get(id);
       if (!worker || !worker.containerId || currentByName.has(worker.containerName)) continue;
+      if (normalizeWorkerRuntimeKind(worker.runtimeKind) !== 'legacy-docker' || worker.containerId.startsWith('incus:'))
+        throw new Error('Incus managed-network dispatch is not yet available; Docker attachment refused');
       await withOperationDeadline(
         this.docker.getNetwork(network.dockerName).connect({ Container: worker.containerId }),
         DOCKER_MUTATION_TIMEOUT_MS,
@@ -163,12 +169,14 @@ export class ManagedNetworkManager {
     return results;
   }
 
-  async remove(network: ManagedNetwork) {
+  async remove(network: ManagedNetwork, coveredWorkerIds?: ReadonlySet<string>) {
     this.assertSafe(network);
+    const coverage = await this.mutationCoverage(network, await this.members(network), coveredWorkerIds);
     try {
       const target=this.docker.getNetwork(network.dockerName);
       const inspection = await withOperationDeadline(target.inspect(), DOCKER_READ_TIMEOUT_MS, 'Docker managed-network inspection');
       this.assertDockerOwnership(network, inspection);
+      await this.mutationCoverage(network, await this.members(network), coverage);
       // Docker refuses to remove a bridge with attached endpoints. A managed
       // delete is explicitly the detach+remove operation, and this network has
       // already passed the Agentor label/name boundary above.
@@ -217,6 +225,20 @@ export class ManagedNetworkManager {
   private assertSafe(network: ManagedNetwork) {
     if (forbidden(network.dockerName))
       throw createError({ statusCode: 400, statusMessage: "Management networks cannot be managed or attached" });
+  }
+
+  private async mutationCoverage(network: ManagedNetwork, desiredIds: Iterable<string>, covered?: ReadonlySet<string>) {
+    const affected = new Set([...desiredIds, ...await this.actualWorkerIds(network)]);
+    if (covered) {
+      if ([...affected].some(id => !covered.has(id)))
+        throw createError({ statusCode: 409, statusMessage: 'Managed network acquired an uncovered worker; retry authorization before mutation' });
+      return covered;
+    }
+    // Internal/background callers have no password authority over protected
+    // siblings. They may only perform an owner-wide reconciliation if every
+    // affected worker is currently unlocked; worker-local hooks stay separate.
+    await verifyWorkerMutationUnlocks(affected, undefined);
+    return affected;
   }
 
   private async ensure(network: ManagedNetwork) {

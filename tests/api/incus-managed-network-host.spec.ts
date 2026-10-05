@@ -18,6 +18,7 @@ import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker
 import { ContainerManager } from '../../orchestrator/server/utils/container';
 import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
 import { zeroUserEnvVars } from '../../orchestrator/server/utils/user-env-store';
+import { authorizeManagedNetworkMutation } from '../../orchestrator/server/utils/managed-network-authorization';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 
@@ -194,6 +195,17 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
     await peerManager.setIncusManagedNetwork(peerId, network.id, true);
     expect((await host.inspect(network))!.references).toContain(`/1.0/instances/${peerOwner.containerName}?project=agentor`);
     expect(await actual.actualWorkerIds(network)).toEqual([peerId]);
+    const beforeDenied = await peerRuntime.client.getInstance(peerOwner.containerName);
+    const coverage = await authorizeManagedNetworkMutation([network], [], undefined, {
+      actualWorkerIds: value => actual.actualWorkerIds(value),
+      verify: async ids => expect([...ids]).toEqual([peerId]),
+    });
+    expect([...coverage]).toEqual([peerId]);
+    await expect(actual.reconcile(network, [], new Set())).rejects.toThrow('uncovered worker');
+    await expect(actual.remove(network, new Set())).rejects.toThrow('uncovered worker');
+    expect((await peerRuntime.client.getInstance(peerOwner.containerName)).devices).toEqual(beforeDenied.devices);
+    await expect(new Docker({ socketPath: dockerSocket }).getNetwork(legacyName).inspect())
+      .rejects.toMatchObject({ statusCode: 404 });
     observedManager = { list: () => [] }; // orphaned cache must not hide a real native attachment
     await expect(actual.actualWorkerIds(network)).rejects.toThrow('unmapped');
     observedManager = peerManager;
