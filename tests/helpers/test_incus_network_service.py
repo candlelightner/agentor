@@ -59,6 +59,9 @@ class TransportTests(unittest.TestCase):
             def remove(self, payload):
                 return self.ensure(payload)
 
+            def inspect(self, payload):
+                return self.ensure(payload)
+
         self.calls = []
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(self.root / "server.crt", self.root / "server.key")
@@ -100,6 +103,10 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(result["metadata"], {"name": "owned-bridge"})
         self.assertEqual(self.calls, [payload])
+        status, result = self.request("POST", "/v1/managed-networks/inspect?project=agentor", json.dumps(payload))
+        self.assertEqual(status, 200)
+        self.assertEqual(result["metadata"], {"name": "owned-bridge"})
+        self.assertEqual(self.calls, [payload, payload])
         self.assertEqual(self.request(identity="other")[0], 409)
         with self.assertRaises((ssl.SSLError, OSError, http.client.HTTPException)):
             self.request(identity=None)
@@ -108,8 +115,9 @@ class TransportTests(unittest.TestCase):
         for path in ("/1.0/instances", "/v1/managed-networks/readiness?project=default",
                      "/v1/managed-networks/readiness?project=agentor&project=agentor"):
             self.assertGreaterEqual(self.request(path=path)[0], 400)
-        for body in (b"x" * 4097, b"not-json", json.dumps({"path": "/etc"}).encode()):
-            self.assertGreaterEqual(self.request("POST", "/v1/managed-networks/ensure", body)[0], 400)
+        for endpoint in ("ensure", "inspect"):
+            for body in (b"x" * 4097, b"not-json", json.dumps({"path": "/etc"}).encode()):
+                self.assertGreaterEqual(self.request("POST", f"/v1/managed-networks/{endpoint}", body)[0], 400)
         self.assertEqual(self.calls, [])
 
     def test_unverified_handshake_stall_is_bounded(self):

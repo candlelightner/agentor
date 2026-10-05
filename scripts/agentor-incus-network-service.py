@@ -126,7 +126,7 @@ def handler(policy, client_fingerprint):
         def do_POST(self):
             try:
                 path = self.validate()
-                if path not in ("/v1/managed-networks/ensure", "/v1/managed-networks/remove"):
+                if path not in ("/v1/managed-networks/ensure", "/v1/managed-networks/remove", "/v1/managed-networks/inspect"):
                     self.reply(404)
                     return
                 lengths = self.headers.get_all("Content-Length", [])
@@ -135,7 +135,10 @@ def handler(policy, client_fingerprint):
                     self.reply(400)
                     return
                 payload = json.loads(self.rfile.read(int(length)))
-                result = policy.ensure(payload) if path.endswith("/ensure") else policy.remove(payload)
+                if path.endswith("/inspect"):
+                    result = policy.inspect(payload)
+                else:
+                    result = policy.ensure(payload) if path.endswith("/ensure") else policy.remove(payload)
                 self.reply(200, result)
             except (OSError, ValueError, POLICY.PolicyError, IncusRejected):
                 self.reply(409)

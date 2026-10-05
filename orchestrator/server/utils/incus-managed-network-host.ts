@@ -43,9 +43,21 @@ export class IncusManagedNetworkHost {
   }
 
   async ensure(network: ManagedNetwork): Promise<IncusManagedBridge> {
-    const identity = await this.identity(network);
+    await this.identity(network);
     const result = await this.client.request('POST', '/v1/managed-networks/ensure',
       { userId: network.userId, networkId: network.id });
+    return this.validateBridge(network, result);
+  }
+
+  async inspect(network: ManagedNetwork): Promise<IncusManagedBridge | null> {
+    await this.identity(network);
+    const result = await this.client.request('POST', '/v1/managed-networks/inspect',
+      { userId: network.userId, networkId: network.id });
+    return result === null ? null : this.validateBridge(network, result);
+  }
+
+  private async validateBridge(network: ManagedNetwork, result: any): Promise<IncusManagedBridge> {
+    const identity = await this.identity(network);
     if (!result || result.name !== identity.name || result.installation !== identity.installation ||
         result.networkId !== network.id || result.userId !== network.userId || typeof result.gateway !== 'string')
       throw new Error('Incus network host service returned foreign or ambiguous bridge authority');

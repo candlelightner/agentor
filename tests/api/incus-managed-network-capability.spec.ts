@@ -176,6 +176,7 @@ test('filtered secondary managed bridge preserves primary routing and supports m
     expect(mac).toBe(secondaryMac);
     const address = leases.find(lease => lease.type === 'dynamic' && lease.hwaddr === mac)?.address;
     expect(address).toBeTruthy();
+    expect(await manager.inspectIncusManagedNetwork(id, managedNetwork.id)).toEqual({ attached: true, ipv4Address: address });
     const request = `require("http").get("http://${address}:8443/",r=>{if(r.statusCode>=500)process.exit(1);r.resume();r.on("end",()=>console.log("vm-editor-ok"))}).on("error",()=>process.exit(1))`;
     expect((await root(`sudo docker exec '${peerName}' node -e '${request}'`)).trim()).toBe('vm-editor-ok');
     // Guest root must not turn an approved secondary NIC into spoof authority.
@@ -222,6 +223,7 @@ test('filtered secondary managed bridge preserves primary routing and supports m
     expect(await checked(['curl', '--fail', '--max-time', '5', target])).toBe('mixed-member-ok');
     expect((await root(`sudo docker exec '${peerName}' node -e '${request}'`)).trim()).toBe('vm-editor-ok');
     await setNetwork(false);
+    expect(await manager.inspectIncusManagedNetwork(id, managedNetwork.id)).toEqual({ attached: false, ipv4Address: '' });
     expect((await client.getInstance(owner.containerName)).devices).toEqual(current.devices);
     expect(await runtime.resolvePrimaryAddress(owner)).toEqual(primary);
     console.info('Mixed-member traffic passed; IPv4/MAC spoof traffic denied with healthy controls, primary route/DNS retained and detach restores identity.');

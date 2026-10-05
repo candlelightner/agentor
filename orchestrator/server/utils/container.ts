@@ -1259,6 +1259,23 @@ export class ContainerManager {
     });
   }
 
+  /** Read-only secondary topology; never supplies routing/worker identity. */
+  async inspectIncusManagedNetwork(id: string, networkId: string) {
+    const info = this.get(id), generation = workerLifecycleGeneration(id);
+    const userId = info?.userId, containerId = info?.containerId;
+    const check = () => {
+      const current = this.get(id), record = userId && this.workerStore?.get(userId, id);
+      if (!info || !current || current.userId !== userId || current.containerId !== containerId ||
+          current.runtimeKind !== 'incus-vm' || !record || record.runtimeKind !== 'incus-vm' ||
+          record.status !== 'active' || record.deletionPending || record.incusRecreation ||
+          isWorkerLifecycleMutationPending(id) || workerLifecycleGeneration(id) !== generation)
+        throw new Error('Incus worker changed or is unavailable during managed network observation');
+    };
+    check();
+    const result = await this.incusRuntime.inspectManagedNetwork(info!, this.capturedIncusIncarnation(info!), networkId);
+    check(); return result;
+  }
+
   /** Dispatch only command/file operations. Captured record and UUID fence a
    * delayed exec or disconnect cleanup away from a replacement VM. */
   workerCommands(id: string): DockerService | IncusWorkerCommands {

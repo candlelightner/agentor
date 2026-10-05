@@ -17,6 +17,7 @@ import type { StoredManagedVolume } from './managed-volume-store';
 import { incusManagedNetworkAuthority, incusManagedBridgeIdentity, incusManagedNetworkDevice,
   incusManagedNetworkRule } from './incus-managed-network-identity';
 import { ManagedNetworkStore } from './managed-network-store';
+import { isIP } from 'node:net';
 
 export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & {
   sshAuthorizedKeys?: string;
@@ -202,6 +203,46 @@ export class IncusWorkerRuntime {
     if (incarnation && instance.config['volatile.uuid'] !== incarnation)
       throw new Error('Incus worker incarnation changed; explicit recovery is required');
     return instance;
+  }
+
+  /** Managed-network topology is diagnostic, never primary routing or
+   * Worker-Self authority. Addresses come from host leases, not guest state. */
+  async inspectManagedNetwork(owner: IncusStorageOwner, incarnation: string, networkId: string):
+    Promise<{ attached: boolean; ipv4Address: string }> {
+    if (!incarnation) throw new Error('Incus network observation requires a captured worker incarnation');
+    const store = new ManagedNetworkStore(this.config.dataDir);
+    await store.loadUser(owner.userId);
+    const network = store.get(owner.userId, networkId);
+    if (!network || network.userId !== owner.userId) throw new Error('Managed network record is missing or foreign');
+    const identity = incusManagedBridgeIdentity(await this.installationId(), network);
+    const expected = incusManagedNetworkDevice(identity.installation, owner.id, network);
+    const check = async () => {
+      const instance = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+      const device = (instance.expanded_devices ?? instance.devices)[identity.key];
+      if (instance.profiles.length || (device && !sameDevice(device, expected)) ||
+          (instance.config[`volatile.${identity.key}.hwaddr`] &&
+           instance.config[`volatile.${identity.key}.hwaddr`]!.toLowerCase() !== expected.hwaddr))
+        throw new Error('Incus managed network observation has foreign or ambiguous device authority');
+      return { instance, device };
+    };
+    const initial = await check();
+    if (!initial.device) return { attached: false, ipv4Address: '' };
+    if (initial.instance.status === 'Stopped') return { attached: true, ipv4Address: '' };
+    if (initial.instance.status !== 'Running') throw new Error('Incus network observation state is unavailable');
+    const native = await this.client.getNetwork(identity.name);
+    if (native.name !== identity.name || native.type !== 'bridge' || !native.managed)
+      throw new Error('Incus managed network bridge is unavailable');
+    const leases = await this.client.getNetworkLeases(identity.name);
+    const matching = leases.filter(lease => isIP(lease.address) === 4 &&
+      lease.hwaddr.toLowerCase() === expected.hwaddr && ['dynamic', 'static'].includes(lease.type));
+    const addresses = [...new Set(matching.map(lease => lease.address))];
+    if (addresses.length > 1 || addresses.some(address => leases.some(lease =>
+        lease.address === address && lease.hwaddr.toLowerCase() !== expected.hwaddr)))
+      throw new Error('Incus managed network lease is ambiguous');
+    const confirmed = await check();
+    if (!confirmed.device || confirmed.instance.status !== 'Running')
+      throw new Error('Incus managed network changed during observation');
+    return { attached: true, ipv4Address: addresses[0] ?? '' };
   }
 
   /** Leaf operation under the caller's existing owner→worker lifecycle fence.

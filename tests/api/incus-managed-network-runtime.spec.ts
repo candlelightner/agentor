@@ -33,6 +33,8 @@ async function fixture(run: (f: any) => Promise<void>) {
     const calls: any[] = [];
     const client = {
       getInstance: async () => structuredClone(instance),
+      getNetwork: async (name: string) => ({ name, type: 'bridge', managed: true, config: {} }),
+      getNetworkLeases: async () => [],
       updateInstanceDevices: async (_name: string, devices: any) => { calls.push(['devices', devices]); instance.devices = structuredClone(devices); },
       pushFile: async (...args: any[]) => { calls.push(['file', ...args]); },
       exec: async (...args: any[]) => { calls.push(['exec', ...args]); return { returnCode: 0, stdout: args[1][0] === 'cat' ? state.boot : '', stderr: '' }; },
@@ -61,6 +63,31 @@ test('live managed NIC hotplug writes readable primary-safe MAC rule before upda
   });
 });
 
+test('managed topology uses only exact captured device and host leases; stopped and unattached states have no address', async () => {
+  await fixture(async f => {
+    f.client.getNetwork = async () => ({ name: f.identity.name, type: 'bridge', managed: true, config: {} });
+    let leases = [{ hwaddr: f.device.hwaddr, address: '10.123.45.128', type: 'dynamic' }];
+    f.client.getNetworkLeases = async () => leases;
+    const inspect = () => f.runtime.inspectManagedNetwork(f.owner, f.incarnation, f.network.id);
+    expect(await inspect()).toEqual({ attached: false, ipv4Address: '' });
+    f.instance.devices[f.identity.key] = f.device;
+    expect(await inspect()).toEqual({ attached: true, ipv4Address: '10.123.45.128' });
+    // Revoked desired membership must still be observable for detachment; it
+    // does not grant routing or worker-self authentication authority.
+    await f.store.update(f.owner.userId, f.network.id, { workerIds: [] });
+    expect(await inspect()).toEqual({ attached: true, ipv4Address: '10.123.45.128' });
+    leases = [...leases, { ...leases[0]!, address: '10.123.45.129' }];
+    await expect(inspect()).rejects.toThrow('ambiguous');
+    f.instance.status = 'Stopped';
+    expect(await inspect()).toEqual({ attached: true, ipv4Address: '' });
+    f.instance.devices[f.identity.key] = { ...f.device, 'security.mac_filtering': 'false' };
+    await expect(inspect()).rejects.toThrow('device authority');
+    f.instance.devices[f.identity.key] = f.device;
+    f.instance.config['volatile.uuid'] = randomUUID();
+    await expect(inspect()).rejects.toThrow('incarnation changed');
+  });
+});
+
 test('manager admission uses current durable Incus authority and lifecycle fence; pending storage blocks device mutation', async () => {
   await fixture(async f => {
     const dataDir = (f.runtime as any).config.dataDir;
@@ -74,10 +101,18 @@ test('manager admission uses current durable Incus authority and lifecycle fence
     const leaf = f.runtime.setManagedNetwork.bind(f.runtime);
     f.runtime.setManagedNetwork = async (...args: any[]) => {
       expect(isWorkerLifecycleMutationPending(f.owner.id)).toBe(true);
+      await expect(manager.inspectIncusManagedNetwork(f.owner.id, f.network.id)).rejects.toThrow('unavailable');
       return leaf(...args);
     };
     await manager.setIncusManagedNetwork(f.owner.id, f.network.id, true);
     expect(f.instance.devices[f.identity.key]).toEqual(f.device);
+    expect(await manager.inspectIncusManagedNetwork(f.owner.id, f.network.id)).toEqual({ attached: true, ipv4Address: '' });
+    const read = f.runtime.inspectManagedNetwork.bind(f.runtime);
+    f.runtime.inspectManagedNetwork = async (...args: any[]) => {
+      const result = await read(...args); info.containerId = `incus:${randomUUID()}`; return result;
+    };
+    await expect(manager.inspectIncusManagedNetwork(f.owner.id, f.network.id)).rejects.toThrow('changed');
+    info.containerId = `incus:${f.incarnation}`; f.runtime.inspectManagedNetwork = read;
     await manager.setIncusManagedNetwork(f.owner.id, f.network.id, false);
     f.calls.length = 0;
     const volumes = new ManagedVolumeStore(dataDir);

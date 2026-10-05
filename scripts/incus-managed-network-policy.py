@@ -151,9 +151,28 @@ class ManagedNetworkPolicy:
             self.request("PUT", f"/1.0/networks/{name}", {"config": config, "description": current.get("description", "")}, etag)
         self.desired(owner, network_id)
         self.allow(name, True)
-        return {"name": name, "subnet": str(subnet), "gateway": str(interface.ip),
-                "dockerRange": str(ipaddress.IPv4Network((int(subnet.network_address), 26))),
+        return self.bridge_result(name, owner, network_id, interface)
+
+    def bridge_result(self, name, owner, network_id, interface):
+        return {"name": name, "subnet": str(interface.network), "gateway": str(interface.ip),
+                "dockerRange": str(ipaddress.IPv4Network((int(interface.network.network_address), 26))),
                 "installation": self.installation, "networkId": network_id, "userId": owner}
+
+    def inspect(self, payload):
+        """Read-only topology/preflight; never create, repair or allowlist."""
+        owner, network_id, name = self.identity(payload)
+        self.desired(owner, network_id)
+        _, _, allowed = self.project_policy()
+        try:
+            network, interface, _ = self.inspect_owned(name, owner, network_id)
+        except Exception as error:
+            if getattr(error, "status_code", None) == 404:
+                return None
+            raise
+        expected_range = f"{interface.network.network_address + 128}-{interface.network.network_address + 254}"
+        if name not in allowed or network["config"].get("ipv4.dhcp.ranges") != expected_range:
+            raise PolicyError("Native bridge DHCP or project allowlist authority is unsettled")
+        return self.bridge_result(name, owner, network_id, interface)
 
     def remove(self, payload):
         owner, network_id, name = self.identity(payload)

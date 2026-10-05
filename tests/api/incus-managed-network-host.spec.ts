@@ -10,6 +10,11 @@ import { IncusManagedNetworkHost } from '../../orchestrator/server/utils/incus-m
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import type { Config } from '../../orchestrator/server/utils/config';
 import { ManagedNetworkStore, type ManagedNetwork } from '../../orchestrator/server/utils/managed-network-store';
+import { createRequire } from 'node:module';
+import { IncusManagedDockerBridge } from '../../orchestrator/server/utils/incus-managed-docker-bridge';
+import type { IncusManagedBridge } from '../../orchestrator/server/utils/incus-managed-network-host';
+
+const Docker = createRequire(new URL('../../orchestrator/package.json', import.meta.url))('dockerode');
 
 test('host network transport has only bounded owned bridge methods and verifies returned identity', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'agentor-network-host-'));
@@ -36,17 +41,21 @@ test('host network transport has only bounded owned bridge methods and verifies 
     response = bridge;
     expect(await host.ensure(network)).toEqual(bridge);
     expect(calls.pop()).toEqual(['POST', '/v1/managed-networks/ensure', { userId, networkId: id }]);
+    expect(await host.inspect(network)).toEqual(bridge);
+    expect(calls.pop()).toEqual(['POST', '/v1/managed-networks/inspect', { userId, networkId: id }]);
     for (const patch of [{ name: 'foreign' }, { installation: randomUUID() }, { userId: 'foreign' },
       { networkId: randomUUID() }, { gateway: '192.0.2.1' }, { gateway: '10.42.87.2' },
       { subnet: '10.42.87.0/16' }, { dockerRange: '10.42.87.0/24' }]) {
       response = { ...bridge, ...patch };
       await expect(host.ensure(network)).rejects.toThrow(/authority|geometry/);
+      await expect(host.inspect(network)).rejects.toThrow(/authority|geometry/);
     }
     calls.length = 0;
     for (const patch of [{ id: '../foreign' }, { userId: 'owner,/etc' }, { dockerName: 'forged' }])
       await expect(host.ensure({ ...network, ...patch })).rejects.toThrow('Invalid managed network');
     expect(calls).toEqual([]);
     response = null;
+    expect(await host.inspect(network)).toBe(null); calls.length = 0;
     await host.remove(network);
     expect(calls).toEqual([['POST', '/v1/managed-networks/remove', { userId, networkId: id }]]);
   } finally { await rm(dataDir, { recursive: true, force: true }); }
@@ -90,6 +99,9 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
   const unit = `agentor-network-host-test-${network.id}.service`;
   let remoteDir: string | undefined, submitted = false, ensureSubmitted = false, complete = false;
   let tunnel: ChildProcess | undefined;
+  const dockerSocket = join(dataDir, 'disposable-docker.sock');
+  const adapter = new IncusManagedDockerBridge(new Docker({ socketPath: dockerSocket }));
+  let adapterSubmitted = false, adapterReady = false, adapterBridge: IncusManagedBridge | undefined;
   const config = { dataDir, incusProject: 'agentor', incusNetwork: 'incusbr0',
     incusNetworkHostEndpoint: 'https://127.0.0.1:18444',
     incusClientCertPath: '/workspace/agentor-incus-tls/client.crt',
@@ -113,7 +125,8 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
     await root(`sudo systemd-run --no-block --collect --unit='${unit}' --property=RuntimeMaxSec=150 --property=TimeoutStopSec=10 /usr/bin/python3 '${remoteDir}/scripts/agentor-incus-network-service.py' --data-dir '${remoteDir}/data' --installation '${installation}' --project agentor --primary incusbr0 --bind 127.0.0.1 --port 18444 --server-cert /var/lib/incus/server.crt --server-key /var/lib/incus/server.key --client-cert '${remoteDir}/client.crt'`);
     let tunnelExit: number | null | undefined, tunnelError = '';
     tunnel = spawn('ssh', ['-N', '-p', '22375', ...access, '-o', 'ExitOnForwardFailure=yes',
-      '-L', '127.0.0.1:18444:127.0.0.1:18444', destination], { stdio: ['ignore', 'ignore', 'pipe'] });
+      '-L', '127.0.0.1:18444:127.0.0.1:18444', '-L', `${dockerSocket}:/var/run/docker.sock`, destination],
+      { stdio: ['ignore', 'ignore', 'pipe'] });
     tunnel.on('error', error => { tunnelError = error.message; });
     tunnel.on('exit', code => { tunnelExit = code; });
     tunnel.stderr!.on('data', chunk => { tunnelError = (tunnelError + chunk.toString()).slice(-1000); });
@@ -121,10 +134,23 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
       if (tunnelExit !== undefined || tunnelError) throw new Error(`Fixture tunnel failed: ${tunnelError}`);
       try { await host.readiness(); return true; } catch { return false; }
     }, { timeout: 15_000, intervals: [200, 500] }).toBe(true);
+    console.info('Host readiness verified; inspecting absent fixture bridge without mutation');
+    expect(await host.inspect(network)).toBe(null);
+    console.info('Read-only native404 verified; ensuring exact owned fixture bridge');
     ensureSubmitted = true; // uncertain acknowledgement must retain cleanup authority
     const bridge = await host.ensure(network);
     expect(bridge).toMatchObject({ name: expectedName, installation, userId: network.userId, networkId: network.id });
     expect(await host.ensure(network)).toEqual(bridge);
+    expect(await host.inspect(network)).toEqual(bridge);
+    adapterBridge = bridge; adapterSubmitted = true;
+    const dockerNetwork = await adapter.ensure(network, bridge); adapterReady = true;
+    expect(dockerNetwork.Name).toBe(`${network.dockerName}-incus`);
+    expect(await adapter.ensure(network, bridge)).toEqual(dockerNetwork);
+    const legacyName = network.dockerName;
+    // Real SDK over a private pinned SSH Unix forward to this disposable host
+    // only. Production still uses its existing Docker socket, never Incus's.
+    await expect(new Docker({ socketPath: dockerSocket }).getNetwork(legacyName).inspect())
+      .rejects.toMatchObject({ statusCode: 404 });
     const native = JSON.parse(await root(`sudo incus query /1.0/networks/${expectedName}`));
     expect(native).toMatchObject({ name: expectedName, type: 'bridge', managed: true, used_by: [], config: {
       'user.agentor.installation': installation, 'user.agentor.owner': network.userId, 'user.agentor.network-id': network.id } });
@@ -135,6 +161,9 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
     await expect(new IncusManagedNetworkHost({ ...config, incusProject: 'foreign' }).readiness()).rejects.toThrow();
     const absentId = randomUUID();
     await expect(host.ensure({ ...network, id: absentId, dockerName: `agentor-managed-${absentId}` })).rejects.toThrow();
+    await adapter.remove(network, bridge); adapterSubmitted = false;
+    const afterDocker = JSON.parse(await root(`sudo incus query /1.0/networks/${expectedName}`));
+    expect(afterDocker.config['ipv4.address']).toBe(`${bridge.gateway}/24`);
     await host.remove(network);
     await host.remove(network);
     ensureSubmitted = false;
@@ -142,6 +171,13 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
     complete = true;
   } finally {
     try {
+      if (adapterSubmitted) {
+        // Unknown Docker create acknowledgement is diagnostic authority, not
+        // permission to delete the backing bridge underneath a late request.
+        if (!adapterReady || !adapterBridge)
+          throw new Error('Unsettled Docker adapter fixture retained for exact inspection');
+        await adapter.remove(network, adapterBridge);
+      }
       if (ensureSubmitted) await host.remove(network); // exact owned native metadata still required
     } finally {
       try {

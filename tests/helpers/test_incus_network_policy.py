@@ -89,6 +89,24 @@ class PolicyTests(unittest.TestCase):
                 self.policy.ensure({**self.payload, "userId": owner})
         self.assertEqual(self.calls, [])
 
+    def test_inspect_is_read_only_and_never_repairs_absent_or_unsettled_authority(self):
+        self.assertIsNone(self.policy.inspect(self.payload))
+        self.assertTrue(all(call[0] == "GET" for call in self.calls))
+        result = self.policy.ensure(self.payload)
+        self.calls.clear()
+        self.assertEqual(self.policy.inspect(self.payload), result)
+        self.assertTrue(all(call[0] == "GET" for call in self.calls))
+        for config, key, replacement in [
+                (self.network["config"], "ipv4.dhcp.ranges", "10.200.30.2-10.200.30.254"),
+                (self.project["config"], "restricted.networks.access", "workers")]:
+            original = config[key]
+            config[key] = replacement
+            self.calls.clear()
+            with self.assertRaises(MODULE.PolicyError):
+                self.policy.inspect(self.payload)
+            self.assertTrue(all(call[0] == "GET" for call in self.calls))
+            config[key] = original
+
     def test_platform_record_or_installation_corruption_fails_closed(self):
         for records in [{}, [{"id": self.network_id, "userId": "foreign"}],
                         [{"id": self.network_id, "userId": self.owner, "dockerName": "foreign"}]]:
