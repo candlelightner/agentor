@@ -81,11 +81,17 @@ export class IncusManagedVolumeRuntime {
   }
 
   /** Initial import only: never reuse an existing owned or foreign volume.
-   * Its durable managed record and worker import fence must already exist. */
-  async freshRestoreVolume(v: StoredManagedVolume) {
+   * Its durable managed record and worker import fence must already exist.
+   * Whole-instance retained storage may explicitly remain detached; this does
+   * not change the ordinary attached import default or mutate desired state. */
+  async freshRestoreVolume(v: StoredManagedVolume, detached = false) {
+    if (typeof detached !== 'boolean') throw volumeError(409, 'Managed restore requires an explicit internal attachment mode.');
     assertIncusLiveResolved(v); this.validateRecord(v);
     if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(v.id) ||
-        v.seeded || !v.attached || v.state !== 'pending' || v.operation || await this.inspectVolume(v))
+        typeof v.userId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(v.userId) ||
+        typeof v.workerId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(v.workerId) ||
+        v.seeded !== false || v.attached !== !detached || v.state !== 'pending' ||
+        v.incusLive !== undefined || v.operation !== undefined || await this.inspectVolume(v))
       throw volumeError(409, 'Managed restore requires fresh pending storage; existing data was retained.');
     await this.worker.client.createCustomVolume(this.config.incusStoragePool, {
       name: v.dockerName, content_type: 'filesystem', config: {

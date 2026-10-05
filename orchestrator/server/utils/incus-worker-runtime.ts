@@ -829,21 +829,26 @@ export class IncusWorkerRuntime {
     return devices;
   }
 
-  private async managedRestoreDevices(opts: IncusWorkerOptions): Promise<Record<string, IncusDevice>> {
+  private async managedRestoreDevices(opts: IncusWorkerOptions,
+    detached: StoredManagedVolume[] = []): Promise<Record<string, IncusDevice>> {
     const runtime = new IncusManagedVolumeRuntime(this.config, this), devices: Record<string, IncusDevice> = {};
-    if ((opts.managedVolumes?.length ?? 0) > 32) throw new Error('Managed restore exceeds the worker volume limit');
+    if (!Array.isArray(detached) || (opts.managedVolumes?.length ?? 0) + detached.length > 32)
+      throw new Error('Managed restore exceeds the worker volume limit');
     const targets: string[] = [];
-    for (const v of opts.managedVolumes ?? []) {
-      if (v.userId !== opts.userId || v.workerId !== opts.id || !v.attached || v.incusLive || v.operation ||
+    const records = [...(opts.managedVolumes ?? []).map(volume => ({ volume, detached: false })),
+      ...detached.map(volume => ({ volume, detached: true }))];
+    for (const { volume: v, detached: historical } of records) {
+      if (v.userId !== opts.userId || v.workerId !== opts.id || v.attached !== !historical ||
+          v.incusLive !== undefined || v.operation !== undefined ||
           !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(v.id) || pathsOverlap(v.target, '/restore') ||
-          !((v.state === 'pending' && !v.seeded) || (v.state === 'ready' && v.seeded)))
-        throw new Error('Managed restore requires current attached records for the exact worker');
+          !((v.state === 'pending' && v.seeded === false) || (v.state === (historical ? 'detached' : 'ready') && v.seeded === true)))
+        throw new Error('Managed restore requires exact attached or explicitly detached records for the worker');
       const key = runtime.deviceKey(v);
       if (devices[key]) throw new Error('Managed restore device keys collide');
       if (Object.values(devices).some(d => d.source === v.dockerName)) throw new Error('Managed restore volume identity is duplicated');
-      if (targets.some(target => target === v.target || target.startsWith(v.target + '/') || v.target.startsWith(target + '/')))
+      if (!historical && targets.some(target => target === v.target || target.startsWith(v.target + '/') || v.target.startsWith(target + '/')))
         throw new Error('Managed restore operational targets overlap');
-      targets.push(v.target);
+      if (!historical) targets.push(v.target);
       devices[key] = { ...runtime.device(v), path: `/restore/managed/${v.id}/volume` };
     }
     return devices;
@@ -1006,7 +1011,8 @@ export class IncusWorkerRuntime {
   /** Internal first-import primitive; caller persists the existing initialCreate
    * marker BEFORE this request and captures its returned UUID. No retry/adoption
    * of partially allocated destinations is permitted. */
-  async createCanonicalRestore(opts: IncusWorkerOptions, source?: WorkerBackupRuntimeSource, dockerData = false): Promise<IncusInstance> {
+  async createCanonicalRestore(opts: IncusWorkerOptions, source?: WorkerBackupRuntimeSource, dockerData = false,
+    detachedManagedVolumes: StoredManagedVolume[] = []): Promise<IncusInstance> {
     if (!opts.recreationNonce || opts.start !== false)
       throw new Error('Incus restore requires durable nonce and stopped initial creation');
     this.validateOptions(opts);
@@ -1031,11 +1037,12 @@ export class IncusWorkerRuntime {
       }
       if (!fingerprint) throw new Error('Derived image for the immutable restore source is unavailable');
     }
-    return this.createWorker(opts, undefined, { fingerprint, source: verifiedSource, dockerData });
+    return this.createWorker(opts, undefined, { fingerprint, source: verifiedSource, dockerData, detachedManagedVolumes });
   }
 
   private async createWorker(opts: IncusWorkerOptions, existing?: { fingerprint: string; docker: boolean },
-    restore?: { fingerprint?: string; source?: WorkerBackupRuntimeSource; dockerData?: boolean }): Promise<IncusInstance> {
+    restore?: { fingerprint?: string; source?: WorkerBackupRuntimeSource; dockerData?: boolean;
+      detachedManagedVolumes?: StoredManagedVolume[] }): Promise<IncusInstance> {
     await this.assertReady();
     // These features are integrated in the following storage/device phases.
     // Refuse them here rather than silently placing data on disposable rootfs.
@@ -1052,13 +1059,15 @@ export class IncusWorkerRuntime {
     if (restore?.source && !sameIncusImageSource(restore.source, identity))
       throw new Error('Incus restore immutable image source changed before allocation');
     const account = restore ? {} : await this.accountDevices(opts);
-    const restoreManaged = restore ? await this.managedRestoreDevices(opts) : undefined;
+    const restoreManaged = restore ? await this.managedRestoreDevices(opts, restore.detachedManagedVolumes) : undefined;
     const hostMounts = restore ? undefined : await incusHostMountLayout(this.config, opts, 'ensure');
     const persistent = restore ? await storage.freshRestoreDevices(opts, restore.dockerData ? opts.recreationNonce : undefined)
       : await storage.devices(opts, opts.environmentJson.dockerEnabled, existing && { docker: existing.docker });
     await storage.recordImageIdentity(opts, identity);
     if (restore) for (const volume of opts.managedVolumes ?? [])
       await new IncusManagedVolumeRuntime(this.config, this).freshRestoreVolume(volume);
+    if (restore) for (const volume of restore.detachedManagedVolumes ?? [])
+      await new IncusManagedVolumeRuntime(this.config, this).freshRestoreVolume(volume, true);
     const instance = await this.client.createInstance({
       name: opts.containerName, type: "virtual-machine", profiles: [],
       source: { type: "image", fingerprint },
@@ -1100,7 +1109,8 @@ export class IncusWorkerRuntime {
   async restoreCanonicalArchives(opts: IncusWorkerOptions, incarnation: string,
     payloads: { workspace?: string; agents?: string }, validateRecord: () => void | Promise<void>,
     signal?: AbortSignal, managedPayloads: Array<{ volume: StoredManagedVolume; archivePath: string }> = [],
-    selectedPayloads: Array<{ path: string; archivePath: string }> = []): Promise<void> {
+    selectedPayloads: Array<{ path: string; archivePath: string }> = [],
+    detachedPayloads: Array<{ volume: StoredManagedVolume; archivePath: string }> = []): Promise<void> {
     if (!incarnation || !opts.recreationNonce) throw new Error('Incus restore requires exact initial creation authority');
     const dockerPayloads = selectedPayloads.filter(item => item.path === '/var/lib/docker');
     if (dockerPayloads.length > 1) throw new Error('Duplicate Docker restore payload');
@@ -1109,7 +1119,8 @@ export class IncusWorkerRuntime {
     if (dockerPayload) await validateIncusDockerRestoreArchive(dockerPayload.archivePath, { signal });
     const storage = await this.storage();
     const managedRuntime = new IncusManagedVolumeRuntime(this.config, this);
-    const managedDevices = await this.managedRestoreDevices(opts);
+    const managedDevices = await this.managedRestoreDevices(opts, detachedPayloads.map(item => item.volume));
+    const allManagedPayloads = [...managedPayloads, ...detachedPayloads];
     const selectedPlans = planIncusSelectedRestore(selectedPayloads.map(item => item.path), {
       accountShares: !!opts.storageManager, hostTargets: (opts.mounts ?? []).map(item => item.target),
       managedTargets: (opts.managedVolumes ?? []).map(item => item.target),
@@ -1164,7 +1175,7 @@ export class IncusWorkerRuntime {
     const sources = [
       ...(['workspace', 'agents'] as const).map(role => ({ inspect: () => storage.inspectVolume(opts, role),
         validate: () => payloads[role] ? validateIncusCanonicalRestoreArchive(payloads[role]!, role, { signal }) : Promise.resolve() })),
-      ...managedPayloads.map(({ volume, archivePath }) => ({ inspect: () => managedRuntime.inspectVolume(volume),
+      ...allManagedPayloads.map(({ volume, archivePath }) => ({ inspect: () => managedRuntime.inspectVolume(volume),
         validate: () => validatePortableManagedVolumeArchive(archivePath, { target: volume.target, signal, requirePosixUstar: true }) })),
       ...(dockerPayload ? [{ inspect: () => storage.inspectVolume(opts, 'docker'),
         validate: () => validateIncusDockerRestoreArchive(dockerPayload.archivePath, { signal }) }] : []),
@@ -1234,7 +1245,7 @@ export class IncusWorkerRuntime {
       }
       const extracts = [
         ...(['workspace', 'agents'] as const).map(role => ({ role, archivePath: payloads[role] })),
-        ...managedPayloads.map(item => ({ role: `managed:${item.volume.id}`, archivePath: item.archivePath })),
+        ...allManagedPayloads.map(item => ({ role: `managed:${item.volume.id}`, archivePath: item.archivePath })),
       ];
       for (const { role, archivePath } of extracts) {
         await stable();
@@ -1312,14 +1323,15 @@ export class IncusWorkerRuntime {
    * or starting worker/Docker services. Its caller retains the durable import
    * fence until the original desired state (including archive) is restored. */
   async finishCanonicalRestore(opts: IncusWorkerOptions, incarnation: string,
-    validateRecord: () => void | Promise<void>, activation: 'running' | 'stopped' = 'running'): Promise<void> {
+    validateRecord: () => void | Promise<void>, activation: 'running' | 'stopped' = 'running',
+    detachedManagedVolumes: StoredManagedVolume[] = []): Promise<void> {
     if (activation !== 'running' && activation !== 'stopped')
       throw new Error('Invalid canonical restore activation');
     if (!incarnation) throw new Error('Incus restore completion requires a captured incarnation');
     this.validateOptions(opts);
     await this.assertReady();
     const storage = await this.storage();
-    const restoreDevices = await this.managedRestoreDevices(opts);
+    const restoreDevices = await this.managedRestoreDevices(opts, detachedManagedVolumes);
     const docker = await storage.inspectVolume(opts, 'docker');
     const workspace = await storage.inspectVolume(opts, 'workspace');
     if (docker && (docker.config['user.agentor.restore-nonce'] !== opts.recreationNonce ||
@@ -1329,6 +1341,8 @@ export class IncusWorkerRuntime {
       throw new Error('Retained Docker restore storage is missing');
     if ((opts.managedVolumes ?? []).some(v => !v.seeded || v.state !== 'ready'))
       throw new Error('Managed restore data must be committed before activation');
+    if (detachedManagedVolumes.some(v => !v.seeded || v.state !== 'detached'))
+      throw new Error('Detached managed restore data must be committed before promotion');
     const expected = {
       ...restoreDevices,
       root: { type: 'disk', path: '/', pool: this.config.incusStoragePool },
@@ -1341,7 +1355,8 @@ export class IncusWorkerRuntime {
     const managedRuntime = new IncusManagedVolumeRuntime(this.config, this);
     const volumeBaselines = new Map<string, IncusCustomVolume>();
     await validateRecord();
-    for (const record of opts.managedVolumes ?? []) {
+    const allManaged = [...(opts.managedVolumes ?? []), ...detachedManagedVolumes];
+    for (const record of allManaged) {
       const volume = await managedRuntime.inspectVolume(record);
       if (!volume || volume.project !== this.config.incusProject || !volume.created_at ||
           !Number.isFinite(Date.parse(volume.created_at)) || volume.used_by.length !== 1)
@@ -1364,7 +1379,7 @@ export class IncusWorkerRuntime {
           Object.keys(instance.expanded_config ?? {}).some(key => key.startsWith('raw.')) ||
           !await storage.preserveOwnership(opts))
         throw new Error('Incus canonical restore data or destination authority is incomplete');
-      for (const record of opts.managedVolumes ?? []) {
+      for (const record of allManaged) {
         const baseline = volumeBaselines.get(record.id)!, current = await managedRuntime.inspectVolume(record);
         if (!current || current.project !== baseline.project || current.created_at !== baseline.created_at ||
             !isDeepStrictEqual(current.config, baseline.config) || !isDeepStrictEqual(current.used_by, baseline.used_by))
@@ -1420,6 +1435,12 @@ export class IncusWorkerRuntime {
         completed.config['user.agentor.recreation'] !== opts.recreationNonce)
       throw new Error('Incus restore activation result is unavailable; retain the initial import fence');
     assertIncusHostMountLayout(completed, host);
+    for (const record of detachedManagedVolumes) {
+      const baseline = volumeBaselines.get(record.id)!, detached = await managedRuntime.inspectVolume(record);
+      if (!detached || detached.project !== baseline.project || detached.created_at !== baseline.created_at ||
+          !isDeepStrictEqual(detached.config, baseline.config) || detached.used_by.length)
+        throw new Error('Restored detached storage removal is unconfirmed; retain the initial import fence');
+    }
     if (activation === 'stopped') {
       // Skipping start must not skip its operational-layout proof. No expanded
       // profile/device or raw option may become an unnoticed recovery grant.

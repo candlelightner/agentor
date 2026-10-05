@@ -71,6 +71,8 @@ async function fixture() {
     stopInstance: async () => { events.push('stop'); instance.status = 'Stopped'; },
     updateInstanceDevices: async (_name: string, devices: any, _accepted: any, _expected: any, complete: any) => {
       events.push('promote'); instance.devices = devices; instance.expanded_devices = devices;
+      for (const volume of volumes.values()) volume.used_by = Object.values(devices).some((device: any) => device.source === volume.name)
+        ? ['/1.0/instances/' + instance.name + '?project=agentor'] : [];
       if (complete) {
         delete instance.config['user.agentor.restore'];
         if (complete.hostMountMetadata) instance.config['user.agentor.host-mounts'] = complete.hostMountMetadata;
@@ -159,6 +161,136 @@ test('managed inverse uses fresh ordinary volumes at fixed UUID paths and stream
       .rejects.toThrow('committed');
     expect(f.events).not.toContain('promote');
   } finally { await f.cleanup(); }
+});
+
+test('explicit detached inverse uses the same isolated extractor without changing detached records or inventing workers', async () => {
+  const f = await fixture(); try {
+    f.opts.dockerEnabled = false; f.opts.environmentJson.dockerEnabled = false;
+    const original = await managedPayload(f);
+    f.opts.managedVolumes = [];
+    const volume = { ...original.volume, attached: false, retainedAfterAccountDeletion: true };
+    const snapshot = structuredClone(volume), detached = { volume, archivePath: original.archivePath };
+    const created = await f.runtime.createCanonicalRestore(f.opts, undefined, false, [volume]);
+    expect(created.devices['m' + volume.id.replaceAll('-', '').slice(0, 6)]?.path).toBe(`/restore/managed/${volume.id}/volume`);
+    expect(created.devices.eth0).toBeUndefined();
+    const records = new WorkerStore(f.dataDir); await records.init(); expect(records.list()).toEqual([]);
+    let checks = 0;
+    await f.runtime.restoreCanonicalArchives(f.opts, created.config['volatile.uuid']!, {}, () => {
+      checks++; expect(volume).toEqual(snapshot);
+    }, undefined, [], [], [detached]);
+    expect(checks).toBeGreaterThan(5);
+    expect(f.inputs).toHaveLength(1);
+    expect(f.inputs[0]!.command.at(-1)).toBe('managed:' + volume.id);
+    expect(Buffer.concat(f.inputs[0]!.chunks)).toEqual(await (await import('node:fs/promises')).readFile(original.archivePath));
+    expect(volume).toEqual(snapshot); expect(f.events).not.toContain('promote');
+    await expect(f.runtime.finishCanonicalRestore(f.opts, created.config['volatile.uuid']!, () => {}, 'stopped', [volume]))
+      .rejects.toThrow('committed');
+    expect(records.list()).toEqual([]);
+  } finally { await f.cleanup(); }
+});
+
+test('mixed inverse keeps historical target overlap separate and removes detached references only after acknowledged promotion', async () => {
+  const f = await fixture(); try {
+    f.opts.dockerEnabled = false; f.opts.environmentJson.dockerEnabled = false;
+    const attached = await managedPayload(f);
+    const id = randomUUID(), detached = { ...attached.volume, id, dockerName: 'agentor-persist-' + id,
+      attached: false, retainedAfterAccountDeletion: true };
+    const created = await f.runtime.createCanonicalRestore(f.opts, undefined, false, [detached]);
+    await f.runtime.restoreCanonicalArchives(f.opts, created.config['volatile.uuid']!, {}, () => {}, undefined,
+      [attached], [], [{ volume: detached, archivePath: attached.archivePath }]);
+    const name = detached.dockerName, baseline = structuredClone(f.volumes.get(name));
+    f.opts.managedVolumes = [{ ...attached.volume, seeded: true, state: 'ready' }];
+    (f.runtime as any).accountDevices = async () => ({});
+    (f.runtime as any).managedDevices = (IncusWorkerRuntime.prototype as any).managedDevices.bind(f.runtime);
+    (f.runtime as any).start = async () => { throw new Error('Stopped restore must never activate'); };
+    await f.runtime.finishCanonicalRestore(f.opts, created.config['volatile.uuid']!, () => {}, 'stopped',
+      [{ ...detached, seeded: true, state: 'detached' }]);
+    expect(f.current().status).toBe('Stopped');
+    expect(f.current().devices['m' + attached.volume.id.replaceAll('-', '').slice(0, 6)]?.path).toBe(attached.volume.target);
+    expect(f.current().devices['m' + detached.id.replaceAll('-', '').slice(0, 6)]).toBeUndefined();
+    expect(f.volumes.get(name)).toEqual({ ...baseline, used_by: [] });
+    expect(detached.attached).toBe(false); expect(detached.seeded).toBe(false);
+  } finally { await f.cleanup(); }
+});
+
+test('detached inverse rejects implicit admission, foreign identity, duplicate/private-key collisions and combined quota before allocation', async () => {
+  for (const violation of ['implicit', 'attached', 'foreign-owner', 'foreign-worker', 'duplicate', 'short-key', 'quota',
+    'null-operation', 'null-live', 'null-seeded'] as const) {
+    const f = await fixture(); try {
+      const original = await managedPayload(f);
+      const id = randomUUID();
+      const detached = { ...original.volume, id, dockerName: 'agentor-persist-' + id, attached: false };
+      let list = [detached];
+      if (violation === 'implicit') { f.opts.managedVolumes = [detached]; list = []; }
+      if (violation === 'attached') detached.attached = true;
+      if (violation === 'foreign-owner') detached.userId = 'foreign-owner';
+      if (violation === 'foreign-worker') detached.workerId = randomUUID();
+      if (violation === 'null-operation') (detached as any).operation = null;
+      if (violation === 'null-live') (detached as any).incusLive = null;
+      if (violation === 'null-seeded') (detached as any).seeded = null;
+      if (violation === 'duplicate') list = [detached, { ...detached }];
+      if (violation === 'short-key') {
+        const collision = id.slice(0, 8) + '-1111-2222-3333-444444444444';
+        list.push({ ...detached, id: collision, dockerName: 'agentor-persist-' + collision });
+      }
+      if (violation === 'quota') list = Array.from({ length: 32 }, () => {
+        const next = randomUUID(); return { ...detached, id: next, dockerName: 'agentor-persist-' + next };
+      });
+      await expect(f.runtime.createCanonicalRestore(f.opts, undefined, false, list)).rejects.toThrow();
+      expect(f.events).toEqual([]);
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('detached stream failure or durable-record drift stops exact incomplete compute without data publication', async () => {
+  for (const failure of ['stream', 'record']) {
+    const f = await fixture(); try {
+      const original = await managedPayload(f); f.opts.managedVolumes = [];
+      const volume = { ...original.volume, attached: false };
+      const created = await f.runtime.createCanonicalRestore(f.opts, undefined, false, [volume]);
+      let changed = false;
+      if (failure === 'stream') f.failExec();
+      else {
+        const stream = f.client.execStream;
+        f.client.execStream = async (...args: any[]) => { const result = await stream(...args); changed = true; return result; };
+      }
+      await expect(f.runtime.restoreCanonicalArchives(f.opts, created.config['volatile.uuid']!, {}, () => {
+        if (changed) throw new Error('Detached durable record changed');
+      }, undefined, [], [], [{ volume, archivePath: original.archivePath }])).rejects.toThrow();
+      expect(f.current().status).toBe('Stopped'); expect(f.current().config['user.agentor.restore']).toBe('incomplete');
+      expect(volume.attached).toBe(false); expect(volume.seeded).toBe(false); expect(f.events).not.toContain('promote');
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('detached promotion rejects changed data identity, remaining references and unknown acknowledgements', async () => {
+  for (const failure of ['config', 'creation', 'reference', 'unknown']) {
+    const f = await fixture(); try {
+      f.opts.dockerEnabled = false; f.opts.environmentJson.dockerEnabled = false;
+      const original = await managedPayload(f); f.opts.managedVolumes = [];
+      const volume = { ...original.volume, attached: false };
+      const created = await f.runtime.createCanonicalRestore(f.opts, undefined, false, [volume]);
+      await f.runtime.restoreCanonicalArchives(f.opts, created.config['volatile.uuid']!, {}, () => {}, undefined, [], [],
+        [{ volume, archivePath: original.archivePath }]);
+      (f.runtime as any).accountDevices = async () => ({});
+      (f.runtime as any).managedDevices = async () => ({});
+      (f.runtime as any).start = async () => { throw new Error('Stopped restore must never activate'); };
+      const promote = f.client.updateInstanceDevices;
+      f.client.updateInstanceDevices = async (...args: any[]) => {
+        await promote(...args);
+        const native = f.volumes.get(volume.dockerName);
+        if (failure === 'config') native.config['user.extra'] = 'changed';
+        if (failure === 'creation') native.created_at = '2026-10-06T00:00:00Z';
+        if (failure === 'reference') native.used_by = ['/1.0/instances/' + f.opts.containerName + '?project=agentor'];
+        if (failure === 'unknown') throw new Error('Unknown native promotion acknowledgement');
+      };
+      await expect(f.runtime.finishCanonicalRestore(f.opts, created.config['volatile.uuid']!, () => {}, 'stopped',
+        [{ ...volume, seeded: true, state: 'detached' }])).rejects.toThrow();
+      expect(f.current().status).toBe('Stopped');
+      expect(f.current().config['user.agentor.recreation']).toBe(f.opts.recreationNonce);
+      expect(f.events).not.toContain('activated');
+    } finally { await f.cleanup(); }
+  }
 });
 
 test('managed inverse rejects duplicate short keys and restore-path overlap before any storage allocation', async () => {
