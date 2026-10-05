@@ -5051,9 +5051,6 @@ for p in sys.argv[1:]:
         ignoreCapturedRootfs: opts.imageResolution?.mode === 'replacement' ? 'replacement-image'
           : opts.imageResolution?.mode === 'workspace-only' ? 'workspace-only' : undefined,
       });
-      if (runtimeKind === 'incus-vm' && backupPathsPath)
-        throw Object.assign(new Error('Native selected-path restore integration is pending; no data will be silently omitted'),
-          { statusCode: 409, code: 'INCUS_RESTORE_CAPABILITY_PENDING' });
 
       // Native GNU/PAX bytes are validated without tar-stream repacking: binary
       // xattrs and ACLs must survive the inverse canonical extraction unchanged.
@@ -5067,12 +5064,16 @@ for p in sys.argv[1:]:
         else await validateGzipTarPayload(payload);
       }
       const extractedAdditionalPaths = backupPathsPath && manifest.backupPaths
-        ? await extractBackupPathArchives(backupPathsPath, join(workDir, "backup-paths"), manifest.backupPaths)
+        ? runtimeKind === 'incus-vm'
+          ? await (await import('./portable-managed-volume-archive')).extractIncusSelectedRestorePayload(
+            backupPathsPath, manifest.backupPaths, join(workDir, 'backup-paths'))
+          : await extractBackupPathArchives(backupPathsPath, join(workDir, "backup-paths"), manifest.backupPaths)
         : [];
       // Backup artifacts may predate capture-side sanitization or originate
       // outside this orchestrator. Repack again before Docker extracts them.
       const additionalPaths = [] as typeof extractedAdditionalPaths;
       for (const [index, item] of extractedAdditionalPaths.entries()) {
+        if (runtimeKind === 'incus-vm') { additionalPaths.push(item); continue; }
         const sanitized = join(workDir, "backup-paths", `${index}.safe.tar`);
         await sanitizeBackupPathTarPayload(item.archivePath, sanitized, item.path);
         additionalPaths.push({ ...item, archivePath: sanitized });
@@ -5138,6 +5139,10 @@ for p in sys.argv[1:]:
         if (runtimeKind === 'incus-vm' && manifest.managedVolumes.some(entry => pathsOverlap(entry.target, '/restore')))
           throw new Error('Managed restore targets overlap the isolated restore layout');
       }
+
+      if (runtimeKind === 'incus-vm') (await import('./incus-selected-restore')).planIncusSelectedRestore(
+        additionalPaths.map(item => item.path), { accountShares: !!this.storageManager,
+          hostTargets: mounts.map(item => item.target), managedTargets: nativeManagedPayloads.map(item => item.entry.target) });
 
       const reconstructionResolution = await resolveWorkerReconstruction(userId, reconstruction);
       // An explicitly captured rootfs is itself the image dependency. Keep
@@ -5212,7 +5217,7 @@ for p in sys.argv[1:]:
           imageId: '', status: 'creating', desiredRuntimeStatus: 'stopped', environmentId,
           repos: repos.length ? repos : undefined, mounts: mounts.length ? mounts : undefined,
           initScript: initScript || undefined, workerSelfApiAccess, pendingRebuild: false, ...resolvedImage,
-        }, canonicalPayloads, manifest, pluginConfiguration, opts.imageResolution, assertRuntimePrincipal, nativeManagedPayloads);
+        }, canonicalPayloads, manifest, pluginConfiguration, opts.imageResolution, assertRuntimePrincipal, nativeManagedPayloads, additionalPaths);
       }
 
       // Import the captured rootfs into a per-worker image. This is the exact
@@ -5632,6 +5637,7 @@ for p in sys.argv[1:]:
     imageResolution: WorkerImportOptions['imageResolution'],
     assertPrincipal: () => Promise<void>,
     managedPayloads: Array<{ entry: PortableManagedVolumeEntry; archivePath: string }> = [],
+    selectedPayloads: Array<{ path: string; archivePath: string }> = [],
   ): Promise<ContainerInfo & { missingSecrets?: string[] }> {
     if (!this.workerStore) throw new Error('WorkerStore is required for native worker import');
     const { id, userId, containerName } = info;
@@ -5699,7 +5705,7 @@ for p in sys.argv[1:]:
         { nonce: marker.nonce, initialCreate: true, importIncomplete: true });
       await validate();
       await this.incusRuntime.restoreCanonicalArchives(options, incarnation, payloads, validate, undefined,
-        managedPayloads.map((item, index) => ({ volume: options.managedVolumes![index]!, archivePath: item.archivePath })));
+        managedPayloads.map((item, index) => ({ volume: options.managedVolumes![index]!, archivePath: item.archivePath })), selectedPayloads);
       await validate();
       // Publish only after ALL byte streams and final native proofs succeeded.
       // Partial publication remains behind the worker's durable import fence.

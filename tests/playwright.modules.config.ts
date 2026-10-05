@@ -13,7 +13,8 @@ if (!process.env.DATA_DIR) {
   // erase their service store automatically when failed fixture cleanup leaves
   // Incus resources for operator diagnosis; successful tests clean exact state.
   if (process.env.INCUS_MANAGED_VOLUME_TEST !== 'true' && process.env.INCUS_MANAGED_BACKUP_TEST !== 'true' &&
-      process.env.INCUS_MANAGED_IMPORT_TEST !== 'true' && process.env.INCUS_SELECTED_BACKUP_TEST !== 'true')
+      process.env.INCUS_MANAGED_IMPORT_TEST !== 'true' && process.env.INCUS_SELECTED_BACKUP_TEST !== 'true' &&
+      process.env.INCUS_SELECTED_IMPORT_TEST !== 'true')
     process.once("exit", () => rmSync(fixtureData, { recursive: true, force: true }));
 }
 
@@ -30,6 +31,7 @@ export default defineConfig({
     "api/incus-canonical-restore-payload.spec.ts",
     "api/incus-selected-restore-archive.spec.ts",
     "api/incus-selected-restore-payload.spec.ts",
+    "api/incus-selected-restore.spec.ts",
     "api/incus-selected-archive.spec.ts",
     "api/incus-selected-runtime.spec.ts",
     "api/incus-selected-backup-live.spec.ts",

@@ -12,6 +12,7 @@ import type { Config } from '../../orchestrator/server/utils/config';
 import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
 import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volume-store';
 import { INCUS_PERSISTENCE_TARGET_CHECK } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
+import { INCUS_SELECTED_RESTORE_SCRIPT } from '../../orchestrator/server/utils/incus-selected-restore';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 
@@ -32,6 +33,7 @@ async function fixture() {
     incusClientCertPath: '/provided/client.crt', incusClientKeyPath: '/provided/client.key', incusServerCertPath: '/provided/server.crt',
     incusWorkerImage: 'approved' } as Config;
   const volumes = new Map<string, any>(), events: string[] = [];
+  const inputs: Array<{ command: string[]; chunks: Buffer[] }> = [];
   let instance: any, conflict = false, execCode = 0;
   const image = { fingerprint: 'a'.repeat(64), type: 'virtual-machine', properties: {
     bootstrap_generation: '3', source_image_id: 'sha256:' + 'b'.repeat(64), recipe_id: 'c'.repeat(64),
@@ -68,12 +70,13 @@ async function fixture() {
       if (complete) delete instance.config['user.agentor.restore'];
     },
     exec: async () => ({ returnCode: 0, stdout: '', stderr: '' }),
-    execStream: async () => {
+    execStream: async (_name: string, command: string[]) => {
       events.push('extract');
+      const input = { command, chunks: [] as Buffer[] }; inputs.push(input);
       let resolve!: (value: number) => void;
       const result = new Promise<number>(yes => { resolve = yes; });
       const stdout = new PassThrough(), stderr = new PassThrough();
-      const stdin = new Writable({ write(_chunk, _encoding, done) { done(); }, final(done) {
+      const stdin = new Writable({ write(chunk, _encoding, done) { input.chunks.push(Buffer.from(chunk)); done(); }, final(done) {
         stdout.end(); stderr.end(); resolve(execCode); done();
       } });
       return { stdin, stdout, stderr, result, close() {} };
@@ -84,10 +87,36 @@ async function fixture() {
   (runtime as any).accountDevices = async () => { throw new Error('Account sharing is forbidden during extraction'); };
   (runtime as any).managedDevices = async () => { throw new Error('Managed sharing is forbidden during extraction'); };
   const opts = options();
-  return { dataDir, config, volumes, events, runtime, client, opts, image,
+  return { dataDir, config, volumes, events, inputs, runtime, client, opts, image,
     current: () => instance, conflict: () => { conflict = true; }, failExec: () => { execCode = 2; },
     cleanup: () => rm(dataDir, { recursive: true, force: true }) };
 }
+
+test('selected inverse uses one bounded validated-name prefix followed by unchanged tar in the existing isolated layout', async () => {
+  const f = await fixture(); try {
+    const archivePath = await rawArchive(f.dataDir, 'workspace'), instance = await f.runtime.createCanonicalRestore(f.opts);
+    await f.runtime.restoreCanonicalArchives(f.opts, instance.config['volatile.uuid']!, {}, () => {}, undefined, [],
+      [{ path: '/srv/workspace', archivePath }]);
+    expect(f.inputs).toHaveLength(1); expect(f.inputs[0]!.command).toEqual(['/usr/bin/python3', '-c', INCUS_SELECTED_RESTORE_SCRIPT]);
+    const bytes = Buffer.concat(f.inputs[0]!.chunks), size = bytes.readUInt32BE();
+    expect(JSON.parse(bytes.subarray(4, 4 + size).toString())).toEqual({ destination: '/srv/workspace', wrapper: 'workspace',
+      members: [{ name: 'workspace', type: 'directory' }, { name: 'workspace/data', type: 'file' }],
+      mounts: ['/restore/workspace', '/restore/.agent-data'] });
+    expect(bytes.subarray(4 + size)).toEqual(await (await import('node:fs/promises')).readFile(archivePath));
+    expect(f.events).not.toContain('promote');
+  } finally { await f.cleanup(); }
+});
+
+test('selected failed/truncated extraction stops exact destination and retains incomplete import authority', async () => {
+  const f = await fixture(); try {
+    const archivePath = await rawArchive(f.dataDir, 'workspace'), instance = await f.runtime.createCanonicalRestore(f.opts);
+    f.failExec();
+    await expect(f.runtime.restoreCanonicalArchives(f.opts, instance.config['volatile.uuid']!, {}, () => {}, undefined, [],
+      [{ path: '/srv/workspace', archivePath }])).rejects.toThrow('selected extraction failed');
+    expect(f.events).toContain('stop'); expect(f.current().status).toBe('Stopped');
+    expect(f.current().config['user.agentor.restore']).toBe('incomplete'); expect(f.events).not.toContain('promote');
+  } finally { await f.cleanup(); }
+});
 async function rawArchive(dir: string, role: 'workspace' | 'agents') {
   const base = role === 'workspace' ? 'workspace' : '.agent-data', stage = join(dir, 'stage-' + role);
   await mkdir(join(stage, base), { recursive: true }); await writeFile(join(stage, base, 'data'), 'native bytes');

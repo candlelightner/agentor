@@ -132,6 +132,16 @@ export async function validateIncusSelectedRestoreArchive(
   selectedPath: string,
   limits: { maxEntries?: number; maxExpandedBytes?: number; signal?: AbortSignal } = {},
 ): Promise<PortableManagedVolumeArchiveSummary> {
+  const { members: _members, ...summary } = await inspectIncusSelectedRestoreArchive(archivePath, selectedPath, limits);
+  return summary;
+}
+
+/** Destination preflight needs every validated write path, not a second tar
+ * dialect/parser. These names describe bytes only; they grant no mount access. */
+export async function inspectIncusSelectedRestoreArchive(
+  archivePath: string, selectedPath: string,
+  limits: { maxEntries?: number; maxExpandedBytes?: number; signal?: AbortSignal } = {},
+): Promise<PortableManagedVolumeArchiveSummary & { members: Array<{ name: string; type: RawTarEntry['type'] }> }> {
   if (!validSelectedPath(selectedPath)) throw invalidArchive("invalid selected backup path");
   const scan = await scanRawTar(archivePath, {
     maxEntries: Math.min(limits.maxEntries ?? MAX_PORTABLE_MANAGED_VOLUME_ARCHIVE_ENTRIES,
@@ -187,7 +197,8 @@ export async function validateIncusSelectedRestoreArchive(
         throw invalidArchive("archive writes below an explicit non-directory path");
     }
   }
-  return { entries: scan.entries.length, expandedBytes: scan.expandedBytes };
+  return { entries: scan.entries.length, expandedBytes: scan.expandedBytes,
+    members: [...paths].map(([name, type]) => ({ name, type })) };
 }
 
 function validSelectedPath(path: string): boolean {

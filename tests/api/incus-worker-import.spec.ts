@@ -235,7 +235,8 @@ test('a forged built-in descriptor cannot select another owner custom environmen
 
 test('real shared portable/native backup importer restores byte-faithful canonical data and healthy fresh VM without Docker', async () => {
   const managedImport = process.env.INCUS_MANAGED_IMPORT_TEST === 'true';
-  test.skip(process.env.INCUS_WORKER_IMPORT_TEST !== 'true' && !managedImport, 'Explicit serial disposable production importer gate');
+  const selectedImport = process.env.INCUS_SELECTED_IMPORT_TEST === 'true';
+  test.skip(process.env.INCUS_WORKER_IMPORT_TEST !== 'true' && !managedImport && !selectedImport, 'Explicit serial disposable production importer gate');
   test.setTimeout(1_200_000);
   await migrateAuth();
   const dataDir = await mkdtemp(join(tmpdir(), 'agentor-native-import-live-')), userId = randomUUID();
@@ -315,6 +316,35 @@ os.setxattr(p,'system.posix_acl_default',acl([(1,7,0xffffffff),(2,5,34567),(4,5,
         '--acls', '-C', managedStage, '-cf', '-', 'volume']));
       await writePortableManagedVolumePayload([{ entry: managedEntry, archivePath: raw }], managedPayload);
     }
+    const selectedEntries = [
+      { path: '/workspace/selected-data', archive: 'paths/0.tar' },
+      { path: '/home/agent/.local/state/kilo', archive: 'paths/1.tar' },
+      { path: '/etc/agentor-selected-import-fixture', archive: 'paths/2.tar' },
+    ];
+    const selectedPayload = join(dataDir, BUNDLE_FILES.backupPaths);
+    let expectedSelected: any;
+    if (selectedImport) {
+      const selectedStage = join(dataDir, 'selected-source'), pathsDir = join(selectedStage, 'paths');
+      await mkdir(pathsDir, { recursive: true });
+      execFileSync('sudo', ['cp', '-a', workspace, join(selectedStage, 'selected-data')]);
+      const selectedRoot = join(selectedStage, 'selected-data');
+      execFileSync('sudo', ['python3', '-c', String.raw`
+import os,struct,sys
+p=sys.argv[1]
+acl=struct.pack('<I',2)+b''.join(struct.pack('<HHI',tag,perm,ident) for tag,perm,ident in [(1,6,0xffffffff),(2,4,34567),(4,4,0xffffffff),(16,4,0xffffffff),(32,0,0xffffffff)])
+os.setxattr(p+'/bytes','system.posix_acl_access',acl);os.setxattr(p,'system.posix_acl_default',acl)
+`, selectedRoot]);
+      execFileSync('sudo', ['setcap', 'cap_net_bind_service=ep', join(selectedRoot, 'bytes')]);
+      expectedSelected = JSON.parse(execFileSync('sudo', ['python3', '-c', inspect, selectedRoot], { encoding: 'utf8' }));
+      execFileSync('sudo', ['cp', '-a', selectedRoot, join(selectedStage, 'kilo')]);
+      await writeFile(join(selectedStage, 'agentor-selected-import-fixture'), 'disposable-explicit-file');
+      for (const [index, name] of ['selected-data', 'kilo', 'agentor-selected-import-fixture'].entries()) {
+        await writeFile(join(pathsDir, index + '.tar'), execFileSync('sudo', ['tar', '--format=pax', '--numeric-owner',
+          '--xattrs', '--xattrs-include=*', '--acls', '-C', selectedStage, '-cf', '-', name]));
+      }
+      execFileSync('tar', ['--format=ustar', '-C', selectedStage, '-czf', selectedPayload,
+        'paths/0.tar', 'paths/1.tar', 'paths/2.tar']);
+    }
     const alias = await runtime.client.getImageAlias(config.incusWorkerImage);
     const descriptor = snapshotIncusWorkerBackupRuntime(incusImageIdentity(await runtime.client.getImage(alias.target)));
     const manifest = join(dataDir, 'manifest.json'), bundle = join(dataDir, 'bundle.tar');
@@ -322,11 +352,14 @@ os.setxattr(p,'system.posix_acl_default',acl([(1,7,0xffffffff),(2,5,34567),(4,5,
       await writeManifest({ version: managedImport ? 6 : WORKER_EXPORT_VERSION, exportedAt: now,
         source: { id: 'descriptive-only', containerName: 'never-adopt', displayName: 'source', imageName: 'descriptive-only' },
         worker: { displayName: 'Native import', repos: [], mounts: [], initScript: '' },
-        environment, contents: { rootfs: false, workspace: true, agents: false, ...(managedImport ? { managedVolumes: true } : {}) },
+        environment, contents: { rootfs: false, workspace: true, agents: false, ...(managedImport ? { managedVolumes: true } : {}),
+          ...(selectedImport ? { backupPaths: true } : {}) },
         ...(managedImport ? { managedVolumes: [managedEntry] } : {}),
+        ...(selectedImport ? { backupPaths: selectedEntries } : {}),
         portMappings: [], domainMappings: [], missingSecrets: ['EXCLUDED_SECRET'], runtime: runtimeMetadata } as any, manifest);
       await pipeline(packBundle([{ name: BUNDLE_FILES.manifest, path: manifest }, { name: BUNDLE_FILES.workspace, path: payload },
-        ...(managedImport ? [{ name: BUNDLE_FILES.managedVolumes, path: managedPayload }] : [])]),
+        ...(managedImport ? [{ name: BUNDLE_FILES.managedVolumes, path: managedPayload }] : []),
+        ...(selectedImport ? [{ name: BUNDLE_FILES.backupPaths, path: selectedPayload }] : [])]),
         createWriteStream(bundle, { mode: 0o600 }));
     };
     // Run serially; each exact completed fixture is removed before the next.
@@ -355,6 +388,24 @@ print(json.dumps(dict(bytes=base64.b64encode(open(p,'rb').read()).decode(),uid=s
       const services = await runtime.client.exec(imported.containerName, ['bash', '-ec',
         'test -f /run/agentor/preserve-storage-ownership; systemctl is-active --quiet agentor-worker; curl -fsS http://127.0.0.1:8443/healthz; curl -fsS http://127.0.0.1:6080/agentor.html >/dev/null; runuser -u agent -- touch /home/agent/.agent-data/import-writable']);
       expect(services.returnCode, services.stderr).toBe(0);
+      if (selectedImport) {
+        const verifySelected = async () => {
+          for (const path of ['/workspace/selected-data', '/home/agent/.local/state/kilo']) {
+            const result = await runtime.client.exec(imported.containerName, ['python3', '-c', inspect, path]);
+            expect(result.returnCode, result.stderr).toBe(0); expect(JSON.parse(result.stdout)).toEqual(expectedSelected);
+          }
+        };
+        await verifySelected();
+        const file = await runtime.client.exec(imported.containerName, ['cat', selectedEntries[2]!.path]);
+        expect(file).toMatchObject({ returnCode: 0, stdout: 'disposable-explicit-file' });
+        await manager.restart(imported.id); await verifySelected();
+        const before = manager.get(imported.id)!.containerId;
+        await manager.rebuild(imported.id); Object.assign(imported, manager.get(imported.id));
+        expect(imported.containerId).not.toBe(before); await verifySelected();
+        const disposable = await runtime.client.exec(imported.containerName, ['test', '!', '-e', selectedEntries[2]!.path]);
+        expect(disposable.returnCode).toBe(0);
+        console.info('Selected raw metadata, fixed Kilo inverse and persistence retained; explicit root file discarded on rebuild', { origin, id: imported.id });
+      }
       if (managedImport) {
         const records = managed.store.forWorker(userId, imported.id);
         expect(records).toHaveLength(1);

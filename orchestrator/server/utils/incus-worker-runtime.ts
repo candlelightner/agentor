@@ -22,12 +22,14 @@ import { isIP } from 'node:net';
 import { incusHostMountLayout, incusHostMountMetadata, assertIncusHostMountLayout } from './incus-host-mount-runtime';
 import { INCUS_CANONICAL_ARCHIVE_SCRIPT } from './incus-canonical-archive';
 import { INCUS_SELECTED_ARCHIVE_SCRIPT, nativeSelectedBackupPath } from './incus-selected-archive';
-import { PassThrough } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
 import { snapshotIncusWorkerBackupRuntime, parseWorkerBackupRuntime, type WorkerBackupRuntimeSource } from './worker-backup-runtime';
 import { IncusOfflineArchiveHelper } from './incus-offline-archive-helper';
 import { writeGzipFile } from './worker-export';
 import { INCUS_CANONICAL_RESTORE_SCRIPT } from './incus-canonical-restore';
 import { validateIncusCanonicalRestoreArchive, validatePortableManagedVolumeArchive } from './portable-managed-volume-archive';
+import { inspectIncusSelectedRestoreArchive, validateIncusSelectedRestoreArchive } from './portable-managed-volume-archive';
+import { planIncusSelectedRestore, INCUS_SELECTED_RESTORE_SCRIPT } from './incus-selected-restore';
 import { createReadStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { isDeepStrictEqual } from 'node:util';
@@ -953,11 +955,33 @@ export class IncusWorkerRuntime {
    * existing worker/owner fence and initialCreate marker remain caller-owned. */
   async restoreCanonicalArchives(opts: IncusWorkerOptions, incarnation: string,
     payloads: { workspace?: string; agents?: string }, validateRecord: () => void | Promise<void>,
-    signal?: AbortSignal, managedPayloads: Array<{ volume: StoredManagedVolume; archivePath: string }> = []): Promise<void> {
+    signal?: AbortSignal, managedPayloads: Array<{ volume: StoredManagedVolume; archivePath: string }> = [],
+    selectedPayloads: Array<{ path: string; archivePath: string }> = []): Promise<void> {
     if (!incarnation || !opts.recreationNonce) throw new Error('Incus restore requires exact initial creation authority');
     const storage = await this.storage();
     const managedRuntime = new IncusManagedVolumeRuntime(this.config, this);
     const managedDevices = await this.managedRestoreDevices(opts);
+    const selectedPlans = planIncusSelectedRestore(selectedPayloads.map(item => item.path), {
+      accountShares: !!opts.storageManager, hostTargets: (opts.mounts ?? []).map(item => item.target),
+      managedTargets: (opts.managedVolumes ?? []).map(item => item.target),
+    });
+    // Raw names and unchanged byte paths are private importer staging, never
+    // portable mount/device authority. Revalidate before starting compute.
+    for (const item of selectedPayloads) await validateIncusSelectedRestoreArchive(item.archivePath, item.path, { signal });
+    // Retain only the current bounded proof, never 32x64MiB buffers. Archives
+    // were already checked before boot; rescan the exact private bytes at use.
+    const selectedProof = async (item: { path: string; archivePath: string }, index: number) => {
+      const { members } = await inspectIncusSelectedRestoreArchive(item.archivePath, item.path, { signal });
+      if (members.reduce((bytes, member) => bytes + Buffer.byteLength(member.name) * 6 + 64, 0) > 64 * 1024 * 1024)
+        throw new Error('Selected destination member proof exceeds limit');
+      const proof = Buffer.from(JSON.stringify({ destination: selectedPlans[index]!.destination,
+        wrapper: item.path.slice(item.path.lastIndexOf('/') + 1), members,
+        mounts: ['/restore/workspace', '/restore/.agent-data',
+          ...Object.values(managedDevices).map(device => device.path!)] }));
+      if (proof.length > 64 * 1024 * 1024) throw new Error('Selected destination proof exceeds limit');
+      const size = Buffer.alloc(4); size.writeUInt32BE(proof.length);
+      return Buffer.concat([size, proof]);
+    };
     if (managedPayloads.length !== (opts.managedVolumes?.length ?? 0) ||
         managedPayloads.some((item, index) => JSON.stringify(item.volume) !== JSON.stringify(opts.managedVolumes![index])))
       throw new Error('Managed restore payloads do not match the planned storage records');
@@ -1059,6 +1083,27 @@ export class IncusWorkerRuntime {
         try {
           await Promise.all([pipeline(createReadStream(archivePath), session.stdin, { signal }),
             session.result.then(code => { if (code !== 0) throw new Error(`Incus canonical ${role} extraction failed (exit ${code})`); })]);
+          await stable();
+        } finally { session.close(); }
+      }
+      for (const [index, item] of selectedPayloads.entries()) {
+        await stable();
+        const prefix = await selectedProof(item, index);
+        await stable();
+        const session = await this.client.execStream(opts.containerName,
+          ['/usr/bin/python3', '-c', INCUS_SELECTED_RESTORE_SCRIPT], {
+            command: [], user: 0, group: 0, cwd: '/', environment: { PATH: '/usr/bin:/bin', LC_ALL: 'C' },
+            signal, timeoutMs: 30 * 60_000,
+          });
+        session.stdout.resume(); session.stderr.resume();
+        try {
+          const framed = Readable.from((async function* () {
+            yield prefix;
+            for await (const chunk of createReadStream(item.archivePath)) yield chunk;
+          })());
+          await Promise.all([pipeline(framed, session.stdin, { signal }), session.result.then(code => {
+            if (code !== 0) throw new Error(`Incus selected extraction failed (exit ${code}); verify destination ancestors and grants`);
+          })]);
           await stable();
         } finally { session.close(); }
       }
