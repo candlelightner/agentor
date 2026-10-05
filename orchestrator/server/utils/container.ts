@@ -2986,8 +2986,13 @@ for p in sys.argv[1:]:
             record.userId,
             record.id,
             next,
-            false,
+            revoked,
           );
+          if (revoked && record.status === 'active') {
+            await this.workerStore!.setDesiredRuntimeStatus(record.userId, record.id, 'stopped');
+            result.failures.push({ workerId: record.id,
+              message: 'Worker runtime is unavailable; revoked host access is fenced and shutdown remains pending.' });
+          }
           return;
         }
 

@@ -91,6 +91,25 @@ test('Incus archive preflight failures leave original compute and metadata activ
   });
 });
 
+test('uncached host-mount revocation fences active Incus compute durably without adopting or stopping unknown identity', async () => {
+  for (const status of ['active', 'archived'] as const) await fixture(async (manager, store, calls, info) => {
+    await store.upsert({ ...store.get(info.userId, info.id)!, status,
+      mounts: [{ pathId: randomUUID(), source: '/srv/unapproved-fixture', target: '/mnt/fixture', readOnly: true }] });
+    (manager as any).containers.delete(info.id);
+    const result = await manager.reconcileHostMountAccess(info.userId);
+    expect(result.affectedWorkerIds).toEqual([info.id]);
+    expect(result.stoppedWorkerIds).toEqual([]); expect(calls).toEqual([]);
+    const current = store.get(info.userId, info.id)!;
+    expect(current.mounts).toBeUndefined();
+    if (status === 'active') {
+      expect(current).toMatchObject({ hostMountsRevoked: true, pendingRebuild: true, desiredRuntimeStatus: 'stopped' });
+      expect(result.failures).toEqual([{ workerId: info.id, message: expect.stringContaining('shutdown remains pending') }]);
+    } else {
+      expect(current.hostMountsRevoked).not.toBe(true); expect(result.failures).toEqual([]);
+    }
+  });
+});
+
 test('failed Incus deletion withdraws running intent before shutdown and never resurrects late-stopped compute', async () => {
   await fixture(async (manager, store, calls, info) => {
     const runtime = (manager as any).incusRuntime;
