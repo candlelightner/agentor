@@ -5,7 +5,10 @@ export type InstanceBackupFormatVersion = 1 | 2;
 /** Describes logical bytes only; project, device and restore authority are
  * selected and verified by the current administrator-controlled runtime. */
 export type InstanceBackupNativeVolumeRuntime =
-  | { kind: 'incus-vm'; role: 'workspace' | 'agents' | 'docker'; source: WorkerBackupRuntimeSource }
+  | { kind: 'incus-vm'; role: 'workspace'; source: WorkerBackupRuntimeSource;
+      /** Descriptive canonical-data presence, not current Docker capability. */
+      dockerData?: boolean }
+  | { kind: 'incus-vm'; role: 'agents' | 'docker'; source: WorkerBackupRuntimeSource }
   | { kind: 'incus-vm'; role: 'managed'; managedVolumeId: string; target: string };
 
 export type InstanceBackupJobStatus =

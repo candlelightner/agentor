@@ -538,6 +538,29 @@ test.describe('native instance format boundary', () => {
     }
   });
 
+  test('Docker data presence is descriptive, optional and strictly boolean only on native workspace', async () => {
+    const path = await data(directory);
+    for (const dockerData of [false, true]) {
+      const workspace = nativeVolume('workspace');
+      if (workspace.runtime?.role !== 'workspace') throw new Error('Fixture workspace missing');
+      workspace.runtime.dockerData = dockerData;
+      const manifest = await manifestFor(path, { formatVersion: 2, volumes: [workspace] });
+      expect(validateInstanceManifest(manifest)).toEqual(manifest);
+      expect(() => validateInstanceManifest({ ...manifest, formatVersion: 1 })).toThrow(/manifest/);
+    }
+    // Historical v2 still parses; missing presence proof is fenced by restore planning.
+    const historical = await manifestFor(path, { formatVersion: 2, volumes: [nativeVolume('workspace')] });
+    expect(validateInstanceManifest(historical)).toEqual(historical);
+    for (const value of [undefined, null, 0, 1, 'true', 'false', {}, []]) {
+      const workspace: any = nativeVolume('workspace'); workspace.runtime.dockerData = value;
+      expect(() => validateInstanceManifest({ ...historical, volumes: [workspace] })).toThrow(/manifest/);
+    }
+    for (const role of ['agents', 'docker', 'managed'] as const) {
+      const volume: any = nativeVolume(role); volume.runtime.dockerData = false;
+      expect(() => validateInstanceManifest({ ...historical, volumes: [volume] })).toThrow(/manifest/);
+    }
+  });
+
   test('cheap live-fixture preflight preserves confined absolute links and rejects external managed links', async () => {
     const volume = nativeVolume('managed');
     const payload = join(directory, 'fixture-volume.tar.gz'), scratch = join(directory, 'fixture-raw');

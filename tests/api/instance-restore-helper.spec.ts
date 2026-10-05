@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { createRequire } from "node:module";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import {
   mkdir,
@@ -10,10 +11,13 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { pipeline } from "node:stream/promises";
 import { createGzip } from "node:zlib";
+import * as nativeAdapter from '../../orchestrator/instance-restore-native';
+import { createInstanceDataArchive, instanceVolumeArchiveName, sha256File, validateInstanceManifest } from '../../orchestrator/server/utils/instance-backup-bundle';
+import type { WorkerRecord } from '../../orchestrator/server/utils/worker-store';
 
 const orchestratorRoot = new URL("../../orchestrator/", import.meta.url);
 const helperPath = new URL(
@@ -31,6 +35,7 @@ const importHelper = new Function(
   runInstanceRestoreHelper(options: {
     env: Record<string, string>;
     docker: any;
+    nativeAdapter?: typeof nativeAdapter;
   }): Promise<{
     status: "succeeded" | "failed" | "cancelled";
     code?: string;
@@ -189,6 +194,7 @@ function fakeDocker(dataDir: string, orchestratorId: string, options?: {
   createVolumeError?: Error;
   createContainerOptions?: any[];
   containers?: Array<{ Id: string; Labels?: Record<string, string> }>;
+  recoveryMode?: boolean;
 }) {
   let running = true;
   let stops = 0;
@@ -202,7 +208,8 @@ function fakeDocker(dataDir: string, orchestratorId: string, options?: {
     inspect: async () => ({
       Id: orchestratorId,
       State: { Running: running },
-      Config: { Image: "agentor-orchestrator:test", Labels: {} },
+      Config: { Image: "agentor-orchestrator:test", Labels: {},
+        ...(options?.recoveryMode ? { Env: ['AGENTOR_INSTANCE_RECOVERY_MODE=true'] } : {}) },
       Mounts: [mount],
     }),
     stop: async () => {
@@ -283,6 +290,106 @@ async function seedPreservedBackupRecords(prepared: Awaited<ReturnType<typeof fi
   state.remoteBackups = [{ id: "staging-remote", userId: prepared.plan.stagingOwnerId },
     { id: "unrelated-remote", userId: "unrelated-principal" }];
   await writeFile(path, JSON.stringify(state));
+}
+
+async function nativeFixture(root: string, selection: { archived?: boolean; desired?: 'running' | 'stopped'; docker?: boolean; missingKey?: boolean } = {}) {
+  const savedKey = process.env.WORKER_CONFIG_ENCRYPTION_KEY;
+  const restoreKey = () => {
+    if (savedKey === undefined) delete process.env.WORKER_CONFIG_ENCRYPTION_KEY;
+    else process.env.WORKER_CONFIG_ENCRYPTION_KEY = savedKey;
+  };
+  delete process.env.WORKER_CONFIG_ENCRYPTION_KEY;
+  try {
+  const prepared = await fixture(root), sourceDir = join(root, 'source');
+  const config = { ...nativeAdapter.loadConfig(), dataDir: sourceDir, containerPrefix: 'agentor-worker' };
+  const stamp = '2026-10-05T12:00:00.000Z', installation = randomUUID(), id = randomUUID();
+  const worker: WorkerRecord = { id, userId: 'restored-admin', runtimeKind: 'incus-vm',
+    displayName: 'Native helper fixture', status: selection.archived ? 'archived' : 'active',
+    desiredRuntimeStatus: selection.desired ?? 'stopped', createdAt: stamp, updatedAt: stamp,
+    ...(selection.archived ? { archivedAt: stamp } : {}) };
+  const workers = new nativeAdapter.WorkerStore(sourceDir); await workers.upsert(worker);
+  const originalWorker = workers.get(worker.userId, id)!;
+  await writeFile(join(sourceDir, 'backup-installation-id'), installation);
+  await writeFile(join(sourceDir, 'auth.db'), Buffer.concat([Buffer.from('SQLite format 3\0'), Buffer.from('native-restored')]));
+  const configs = new nativeAdapter.WorkerConfigStore(config);
+  await configs.markApplied(worker.userId, id, { version: 1, cpuLimit: 1, memoryLimit: '1GiB', dockerEnabled: !!selection.docker,
+    userEnv: nativeAdapter.zeroUserEnvVars(worker.userId), capabilitiesJson: [], instructionsJson: [],
+    excludedGlobalEnvVarKeys: [], excludedGroupEnvVarKeys: [],
+    environmentJson: { dockerEnabled: !!selection.docker, networkMode: 'full', allowedDomains: [], setupScript: '', envVars: '',
+      exposeApis: { portMappings: false, domainMappings: false, usage: false } },
+    workerJson: { id, displayName: worker.displayName, repos: [], initScript: '', gitName: '', gitEmail: '' } });
+  if (selection.missingKey) await rm(join(sourceDir, 'worker-config.key'));
+  const backupOptions = { includeWorkers: true, includeAgentData: true, includeDockerVolumes: true,
+    includeLogs: false, includeLocalBackups: false };
+  const data = await createInstanceDataArchive({ dataDir: sourceDir, authSnapshotPath: join(sourceDir, 'auth.db'),
+    output: prepared.plan.dataArchive, options: backupOptions });
+  const source = { sourceImageId: 'sha256:' + 'a'.repeat(64), recipeId: 'b'.repeat(64), architecture: 'amd64' as const,
+    converterVersion: 'v0.4.0', bootstrapGeneration: '3' as const };
+  const descriptors = [];
+  for (const role of ['workspace', 'agents'] as const) {
+    const name = `agentor-worker-${id}-${role}`, wrapper = role === 'workspace' ? 'workspace' : '.agent-data';
+    const stage = join(root, role); await mkdir(join(stage, wrapper), { recursive: true });
+    await writeFile(join(stage, wrapper, 'bytes'), Buffer.from([0, 255, 128]));
+    const archive = instanceVolumeArchiveName(name), path = join(prepared.unpacked, nativeAdapter.instanceBundleFilename(archive));
+    await mkdir(dirname(path), { recursive: true });
+    execFileSync('tar', ['--format=pax', '--numeric-owner', '--xattrs', '--acls', '-C', stage, '-czf', path, wrapper]);
+    const size = (await (await import('node:fs/promises')).stat(path)).size;
+    descriptors.push({ name, archive, size, sha256: await sha256File(path), ownerId: worker.userId, workerId: id,
+      kind: role === 'workspace' ? 'worker-workspace' : 'worker-agent-data',
+      runtime: role === 'workspace' ? { kind: 'incus-vm', role, source, dockerData: false } : { kind: 'incus-vm', role, source } });
+  }
+  const manifest = validateInstanceManifest({ kind: 'agentor-instance-backup', formatVersion: 2, backupId: 'native-fixture',
+    sourceInstallationId: installation, createdByUserId: worker.userId, createdAt: stamp, agentorVersion: 'test',
+    storage: { mode: 'volume', containerPrefix: config.containerPrefix }, options: backupOptions,
+    dataArchive: { archive: 'data.tar.gz', ...data }, volumes: descriptors,
+    plugins: { platformDefinitionCount: 0, ownerDefinitionCount: 0, installationCount: 0 },
+    hostMounts: { configuredPaths: [], contentsIncluded: false }, images: { definitions: 0, immutableDigests: [], layersIncluded: false },
+    excludedDataPaths: data.excludedDataPaths });
+  const plan = { ...prepared.plan, formatVersion: 2, sourceInstallationId: installation, manifest,
+    volumes: manifest.volumes.map(volume => ({ ...volume, archive: join(prepared.unpacked, nativeAdapter.instanceBundleFilename(volume.archive)) })) };
+  await writeFile(join(prepared.stage, 'restore-plan.json'), JSON.stringify(plan));
+  const env = { ...prepared.env, HOSTNAME: 'restore-helper-container', AGENTOR_INSTANCE_RESTORE_NATIVE: 'true',
+    CONTAINER_PREFIX: config.containerPrefix, INCUS_ENDPOINT: 'https://native.invalid', INCUS_PROJECT: 'agentor',
+    INCUS_CLIENT_CERT_PATH: '/operator/client.crt', INCUS_CLIENT_KEY_PATH: '/operator/client.key', INCUS_SERVER_CERT_PATH: '/operator/server.crt',
+    INCUS_NETWORK: 'workers', INCUS_STORAGE_POOL: 'default', INCUS_WORKER_IMAGE: 'approved',
+    INCUS_DOCKER_VOLUME_SIZE: '1GiB', INCUS_INTERNAL_GATEWAY_URL: 'http://gateway.invalid:3000' };
+  const events: string[] = [], restorers: Array<() => void> = [];
+  const patch = (object: any, key: string, value: any) => {
+    const old = object[key]; object[key] = value; restorers.push(() => { object[key] = old; });
+  };
+  const ledger = async () => JSON.parse(await readFile(join(prepared.dataDir, 'admin', 'instance-backups.v1.json'), 'utf8'));
+  const installed = async () => { const store = new nativeAdapter.WorkerStore(prepared.dataDir); await store.loadUser(worker.userId); return store.get(worker.userId, id); };
+  const incarnation = randomUUID();
+  patch(nativeAdapter.IncusWorkerRuntime.prototype, 'preflightCanonicalRestore', async () => { events.push('preflight'); });
+  patch(nativeAdapter.IncusWorkerRuntime.prototype, 'createCanonicalRestore', async (options: any) => {
+    events.push('create');
+    if (!(await installed())?.incusRecreation?.importIncomplete) throw new Error('Missing durable initial import fence');
+    return { config: { 'volatile.uuid': incarnation, 'user.agentor.recreation': options.recreationNonce } };
+  });
+  patch(nativeAdapter.IncusWorkerRuntime.prototype, 'matchesWorkerIdentity', async () => true);
+  patch(nativeAdapter.IncusWorkerRuntime.prototype, 'restoreCanonicalArchives', async (_o: unknown, _i: unknown, roots: any, validate: () => Promise<void>) => {
+    events.push('extract'); await validate();
+    for (const path of Object.values(roots)) if (path) await readFile(path as string);
+  });
+  patch(nativeAdapter.IncusWorkerRuntime.prototype, 'finishCanonicalRestore', async (_o: unknown, _i: unknown, validate: () => Promise<void>, mode: string) => {
+    events.push('promote-' + mode); await validate();
+  });
+  patch(nativeAdapter.IncusWorkerRuntime.prototype, 'remove', async () => { events.push('remove-compute'); });
+  patch(nativeAdapter.IncusWorkerRuntime.prototype, 'rollbackRecreation', async () => {
+    events.push('rollback-compute');
+    if ((await readFile(join(prepared.dataDir, 'auth.db'))).subarray(16).toString() !== 'native-restored')
+      throw new Error('Data rollback preceded native cleanup');
+  });
+  patch(nativeAdapter.IncusWorkerRuntime.prototype, 'removeStorage', async () => { events.push('remove-core'); });
+  patch(nativeAdapter.IncusWorkerRuntime.prototype, 'start', async () => { events.push('unexpected-worker-start'); throw new Error('No early activation'); });
+  return { ...prepared, plan, env, worker: originalWorker, events, patch, ledger, installed,
+    run: async (docker: any) => (await importHelper(pathToFileURL(helperPath).href)).runInstanceRestoreHelper({ docker, env, nativeAdapter }),
+    cleanup: () => { for (const restore of restorers.reverse()) restore(); restoreKey(); } };
+  } catch (error) {
+    restoreKey();
+    await rm(root, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 test.describe("controlled instance restore helper", () => {
@@ -658,4 +765,92 @@ test.describe("controlled instance restore helper", () => {
     for (const records of [state.artifacts, state.remoteBackups])
       expect(records.map((record: any) => record.userId)).toEqual(["recovery-admin", "unrelated-principal"]);
   });
+});
+
+test('native helper uses real encrypted bootstrap/raw codec and commits stopped, running-intent and archived records without activation', async () => {
+  for (const selection of [{ desired: 'stopped' }, { desired: 'running' }, { archived: true, desired: 'stopped' }] as const) {
+    const root = await mkdtemp(join(tmpdir(), 'native-helper-commit-'));
+    const f = await nativeFixture(root, selection);
+    try {
+      const fake = fakeDocker(f.dataDir, f.env.AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR, { recoveryMode: true });
+      const result = await f.run(fake.docker);
+      expect(result).toEqual({ status: 'succeeded' });
+      expect(fake.state).toMatchObject({ stops: 1, starts: 1, running: true });
+      const record = await f.installed();
+      expect(record).toEqual(f.worker); expect(record?.incusRecreation).toBeUndefined();
+      expect((await f.ledger()).jobs[0]).toMatchObject({ status: 'succeeded', userId: f.worker.userId });
+      expect(f.events.filter(event => event === 'preflight')).toHaveLength(3);
+      expect(f.events).toContain('create'); expect(f.events).toContain('extract'); expect(f.events).toContain('promote-stopped');
+      expect(f.events.includes('remove-compute')).toBe('archived' in selection && selection.archived);
+      expect(f.events).not.toContain('unexpected-worker-start'); expect(f.events).not.toContain('rollback-compute');
+    } finally { f.cleanup(); await rm(root, { recursive: true, force: true }); }
+  }
+});
+
+test('native helper rejects missing source config key and omitted enabled-Docker data before stopping or allocating', async () => {
+  for (const selection of [{ missingKey: true }, { docker: true }]) {
+    const root = await mkdtemp(join(tmpdir(), 'native-helper-preflight-'));
+    const f = await nativeFixture(root, selection);
+    try {
+      const fake = fakeDocker(f.dataDir, f.env.AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR, { recoveryMode: true });
+      const result = await f.run(fake.docker);
+      expect(result.status).toBe('failed'); expect(fake.state).toMatchObject({ stops: 0, starts: 0, running: true });
+      expect(f.events).toEqual([]);
+      expect((await readFile(join(f.dataDir, 'auth.db'))).subarray(16).toString()).toBe('old');
+      if (selection.missingKey) await expect(readFile(join(f.stage, 'prepared-data', 'worker-config.key')))
+        .rejects.toMatchObject({ code: 'ENOENT' });
+      else expect(result.code).toBe('INSTANCE_RESTORE_INVALID_ARCHIVE');
+    } finally { f.cleanup(); await rm(root, { recursive: true, force: true }); }
+  }
+});
+
+test('acknowledged native cleanup precedes control-plane rollback after a later legacy-volume failure', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'native-helper-rollback-'));
+  const f = await nativeFixture(root);
+  try {
+    const name = 'legacy-worker-volume', archive = instanceVolumeArchiveName(name), path = join(f.unpacked, nativeAdapter.instanceBundleFilename(archive));
+    await writeTarGzip(path, [{ name: 'source', type: 'directory' }, { name: 'source/data', body: 'legacy' }]);
+    const descriptor = { name, archive, kind: 'worker-workspace' as const, sha256: await sha256File(path), size: 100, workerId: 'legacy-worker' };
+    f.plan.manifest.volumes.push(descriptor);
+    f.plan.volumes.push({ ...descriptor, archive: path } as any);
+    await writeFile(join(f.stage, 'restore-plan.json'), JSON.stringify(f.plan));
+    const fake = fakeDocker(f.dataDir, f.env.AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR,
+      { recoveryMode: true, createVolumeError: new Error('Synthetic later legacy-volume failure') });
+    const result = await f.run(fake.docker);
+    expect(result).toMatchObject({ status: 'failed', code: 'INSTANCE_RESTORE_APPLY_FAILED' });
+    expect(f.events.indexOf('rollback-compute')).toBeGreaterThan(f.events.indexOf('promote-stopped'));
+    expect(f.events.indexOf('remove-core')).toBeGreaterThan(f.events.indexOf('rollback-compute'));
+    expect((await readFile(join(f.dataDir, 'auth.db'))).subarray(16).toString()).toBe('old');
+    expect(await f.installed()).toBeUndefined();
+    expect((await f.ledger()).jobs[0]).toMatchObject({ status: 'failed', userId: 'recovery-admin' });
+    expect(fake.state).toMatchObject({ starts: 1, running: true });
+  } finally { f.cleanup(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('uncertain completion clear is refenced; uncertain refence acknowledgement leaves exact target stopped', async () => {
+  for (const lostRefence of [false, true]) {
+    const root = await mkdtemp(join(tmpdir(), 'native-helper-refence-'));
+    const f = await nativeFixture(root);
+    try {
+      const original = nativeAdapter.WorkerStore.prototype.upsert;
+      let completionLost = false, committedBeforeClear = false, refenceObserved = false;
+      f.patch(nativeAdapter.WorkerStore.prototype, 'upsert', async function(this: any, record: WorkerRecord) {
+        const completion = this.dataDir === f.dataDir && record.id === f.worker.id && !record.incusRecreation;
+        if (completion) committedBeforeClear = (await f.ledger()).jobs[0].status === 'succeeded';
+        await original.call(this, record);
+        if (completion && !completionLost) { completionLost = true; throw new Error('Lost clear acknowledgement'); }
+        if (completionLost && record.incusRecreation) {
+          refenceObserved = true;
+          if (lostRefence) throw new Error('Lost refence acknowledgement');
+        }
+      });
+      const fake = fakeDocker(f.dataDir, f.env.AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR, { recoveryMode: true });
+      const result = await f.run(fake.docker);
+      expect(result.status).toBe('failed'); expect(committedBeforeClear).toBe(true);
+      expect(completionLost).toBe(true); expect(refenceObserved).toBe(true);
+      expect((await f.installed())?.incusRecreation).toMatchObject({ initialCreate: true, importIncomplete: true });
+      expect(fake.state).toMatchObject({ stops: 1, starts: lostRefence ? 0 : 1, running: !lostRefence });
+      expect(f.events).not.toContain('unexpected-worker-start');
+    } finally { f.cleanup(); await rm(root, { recursive: true, force: true }); }
+  }
 });

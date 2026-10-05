@@ -68,7 +68,22 @@ test('durable native inventory never probes colliding retained Docker sources ev
     ]);
     expect(result.volumes.filter((v: any) => v.runtime).map((v: any) => v.runtime.role))
       .toEqual(['workspace', 'agents', 'docker', 'managed']);
+    expect(result.volumes[0].runtime.dockerData).toBe(true);
+    expect(result.volumes.slice(1).every((v: any) => !Object.hasOwn(v.runtime ?? {}, 'dockerData'))).toBe(true);
     expect(f.calls).toEqual(['native-core', 'native-managed', 'docker:legacy-path']);
+  });
+});
+
+test('native inventory explicitly records absence even if colliding legacy Docker storage remains', async () => {
+  await inventoryFixture(async f => {
+    f.patch(f.containers, 'inspectInstanceBackupStorageWithLifecycleFenceHeld', async () => ({
+      docker: false, runtime: { version: 1, kind: 'incus-vm', source },
+    }));
+    const result = await f.manager.inventory('admin');
+    const workspace = result.volumes.find((v: any) => v.runtime?.role === 'workspace');
+    expect(workspace.runtime.dockerData).toBe(false);
+    expect(result.volumes.some((v: any) => v.name === f.name + '-docker')).toBe(false);
+    expect(f.calls.some((call: string) => call === 'docker:' + f.name + '-docker')).toBe(false);
   });
 });
 
@@ -123,6 +138,31 @@ test('native canonical snapshot batches selected roles inside the existing lifec
     await expect(f.manager.snapshotNativeVolumes([{ volume: candidates[0], path: '/fixture/workspace.gz' }], new AbortController().signal))
       .rejects.toThrow('immutable source changed');
   });
+});
+
+test('native workspace capture rechecks Docker presence before and after bytes instead of retaining stale absence proof', async () => {
+  for (const inventoryPresence of [true, false]) for (const drift of ['before', 'after']) {
+    await inventoryFixture(async f => {
+      f.patch(f.containers, 'inspectInstanceBackupStorageWithLifecycleFenceHeld', async () => ({
+        docker: inventoryPresence, runtime: { version: 1, kind: 'incus-vm', source },
+      }));
+      const inventory = await f.manager.inventory('admin');
+      const workspace = inventory.volumes.find((v: any) => v.runtime?.role === 'workspace');
+      let captures = 0, reads = 0;
+      f.patch(f.containers, 'inspectInstanceBackupStorageWithLifecycleFenceHeld', async () => {
+        expect(instanceSnapshotActive()).toBe(true); expect(isWorkerLifecycleMutationPending(f.worker.id)).toBe(true);
+        reads++; return { docker: drift === 'before' || reads > 1 ? !inventoryPresence : inventoryPresence,
+          runtime: { version: 1, kind: 'incus-vm', source } };
+      });
+      f.patch(f.containers, 'captureInstanceCanonicalWithLifecycleFenceHeld', async () => {
+        captures++; return { runtime: { version: 1, kind: 'incus-vm', source }, bytes: {} };
+      });
+      await expect(f.manager.snapshotNativeVolumes([{ volume: workspace, path: '/fixture/workspace.gz' }],
+        new AbortController().signal)).rejects.toThrow('Docker data presence changed');
+      expect(captures).toBe(drift === 'before' ? 0 : 1);
+      expect(reads).toBe(drift === 'before' ? 1 : 2);
+    });
+  }
 });
 
 test('native control-plane-only instance backup retains authenticated v2 metadata and rejects legacy-only restore', async () => {

@@ -95,4 +95,10 @@ test('production build invokes adapter only after Nuxt, copying no builder depen
   expect(dockerfile).toContain('RUN npm run build');
   expect(dockerfile).toContain('COPY --from=builder /app/.output/ .output/');
   expect(dockerfile).not.toMatch(/COPY[^\n]*\/app\/node_modules/);
+  const helper = await readFile(join(dirname(buildScript), 'instance-restore-helper.mjs'), 'utf8');
+  // Cold CLI starts during module evaluation, unlike imported helper tests.
+  // Its fixed settings must exist before the top-level await invokes it.
+  const settings = helper.indexOf('const NATIVE_OPERATOR_FIELDS =');
+  const entrypoint = helper.indexOf('process.argv[1] &&');
+  expect(settings).toBeGreaterThanOrEqual(0); expect(entrypoint).toBeGreaterThan(settings);
 });

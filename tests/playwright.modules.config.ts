@@ -51,6 +51,8 @@ export default defineConfig({
     "api/admin-workspace-store-transactions.spec.ts",
     "api/container-store-quarantine.spec.ts",
     "api/instance-backup-*.spec.ts",
+    "api/instance-native-apply.spec.ts",
+    "api/instance-native-helper-process.spec.ts",
     "api/instance-restore-helper.spec.ts",
     "api/backup-original-runtime-fence.spec.ts",
     "api/backup-restore-safety.spec.ts",

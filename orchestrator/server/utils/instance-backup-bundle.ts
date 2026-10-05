@@ -42,6 +42,9 @@ const MAX_EXPANDED_BYTES = 8 * 1024 * 1024 * 1024 * 1024;
 const MAX_ENTRIES = 2_000_000;
 const MAX_VOLUMES = 100_000;
 
+/** Controlled helper reuses the inspector's private staged-name mapping. */
+export { safeBundleFilename as instanceBundleFilename };
+
 export interface InstanceBundleEntry {
   name: string;
   path: string;
@@ -761,7 +764,10 @@ function validNativeVolume(volume: any, prefix?: string): boolean {
     isCanonicalPortableManagedVolumeTarget(runtime.target) && volume.kind === 'persistent-path' &&
     volume.name === 'agentor-persist-' + runtime.managedVolumeId;
   const kinds = { workspace: 'worker-workspace', agents: 'worker-agent-data', docker: 'worker-dind' } as const;
-  if (!Object.hasOwn(kinds, runtime.role) || !exactKeys(runtime, ['kind', 'role', 'source']) ||
+  const fields = runtime.role === 'workspace' && Object.hasOwn(runtime, 'dockerData')
+    ? ['kind', 'role', 'source', 'dockerData'] : ['kind', 'role', 'source'];
+  if (!Object.hasOwn(kinds, runtime.role) || !exactKeys(runtime, fields) ||
+      Object.hasOwn(runtime, 'dockerData') && typeof runtime.dockerData !== 'boolean' ||
       !exactKeys(runtime.source, ['sourceImageId', 'recipeId', 'architecture', 'converterVersion', 'bootstrapGeneration']) ||
       volume.kind !== kinds[runtime.role as keyof typeof kinds]) return false;
   try { parseWorkerBackupRuntime({ version: 1, kind: 'incus-vm', source: runtime.source }); }

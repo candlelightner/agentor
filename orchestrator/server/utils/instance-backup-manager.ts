@@ -1173,12 +1173,14 @@ export class InstanceBackupManager {
               archive: inspected.volumeArchives.get(volume.name),
               kind: volume.kind,
               ...(volume.workerId ? { workerId: volume.workerId } : {}),
+              ...(volume.runtime ? { runtime: volume.runtime, ownerId: volume.ownerId } : {}),
             }))
           : [],
         restoreHostMountPolicies: options.restoreHostMountPolicies,
         sourceInstallationId: inspected.manifest.sourceInstallationId,
         restoredOwnerId: inspected.manifest.createdByUserId,
         stagingOwnerId: job.userId,
+        ...(inspected.manifest.formatVersion === 2 ? { manifest: inspected.manifest } : {}),
       };
       if (plan.volumes.some((volume) => !volume.archive))
         throw new Error("Instance restore staging is missing a declared volume archive");
@@ -1200,7 +1202,7 @@ export class InstanceBackupManager {
           70,
           "Controlled helper started and owns the staged restore.",
         );
-      });
+      }, inspected.manifest.formatVersion === 2);
       // The helper owns the terminal status because this process is about to be
       // stopped. It updates the persisted job before restarting the orchestrator.
     } finally {
@@ -1219,6 +1221,7 @@ export class InstanceBackupManager {
     stage: string,
     signal: AbortSignal,
     onHandoff: () => Promise<void>,
+    native = false,
   ) {
     const hostname = process.env.HOSTNAME;
     if (!hostname) throw new Error("Orchestrator container identity is unavailable");
@@ -1246,25 +1249,68 @@ export class InstanceBackupManager {
         Target: this.dataDir,
       } as Docker.MountSettings);
     else throw new Error("Unsupported orchestrator data mount type");
+    const environment = [
+      `AGENTOR_INSTANCE_RESTORE_JOB=${job.id}`,
+      `AGENTOR_INSTANCE_RESTORE_STAGE=${stage}`,
+      `AGENTOR_INSTANCE_RESTORE_DATA_DIR=${this.dataDir}`,
+      `AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR=${current.Id}`,
+    ];
+    let network = 'none';
+    let extraHosts: string[] | undefined;
+    if (native) {
+      const config = useConfig();
+      if (!config.incusEnabled || !config.incusEndpoint.startsWith('https://') ||
+          !config.dockerNetwork || !current.NetworkSettings?.Networks?.[config.dockerNetwork])
+        throw new Error('Native restore requires current restricted Incus configuration and the verified control-plane network');
+      network = config.dockerNetwork;
+      const hosts = new Set([config.incusEndpoint, ...(config.incusNetworkHostEndpoint ? [config.incusNetworkHostEndpoint] : [])]
+        .map(endpoint => new URL(endpoint).hostname));
+      // Preserve only operator-defined resolution for the two fixed endpoints,
+      // not arbitrary bindings from restored data or the full environment.
+      extraHosts = current.HostConfig?.ExtraHosts?.filter((entry: string) =>
+        [...hosts].some(host => entry.startsWith(host + ':')));
+      environment.push('AGENTOR_INSTANCE_RESTORE_NATIVE=true');
+      const fields = {
+        CONTAINER_PREFIX: config.containerPrefix, INCUS_ENDPOINT: config.incusEndpoint, INCUS_PROJECT: config.incusProject,
+        INCUS_CLIENT_CERT_PATH: config.incusClientCertPath, INCUS_CLIENT_KEY_PATH: config.incusClientKeyPath,
+        INCUS_SERVER_CERT_PATH: config.incusServerCertPath, INCUS_NETWORK: config.incusNetwork,
+        INCUS_STORAGE_POOL: config.incusStoragePool, INCUS_WORKER_IMAGE: config.incusWorkerImage,
+        INCUS_DOCKER_VOLUME_SIZE: config.incusDockerVolumeSize, INCUS_INTERNAL_GATEWAY_URL: config.incusInternalGatewayUrl,
+        INCUS_NETWORK_HOST_ENDPOINT: config.incusNetworkHostEndpoint || '',
+        INCUS_NETWORK_HOST_SERVER_CERT_PATH: config.incusNetworkHostServerCertPath || '',
+      };
+      environment.push(...Object.entries(fields).map(([key, value]) => `${key}=${value}`));
+      if (process.env.WORKER_CONFIG_ENCRYPTION_KEY)
+        environment.push(`WORKER_CONFIG_ENCRYPTION_KEY=${process.env.WORKER_CONFIG_ENCRYPTION_KEY}`);
+      const credentials = new Set([config.incusClientCertPath, config.incusClientKeyPath, config.incusServerCertPath,
+        ...(config.incusNetworkHostServerCertPath ? [config.incusNetworkHostServerCertPath] : [])]);
+      for (const path of credentials) {
+        if (!path.startsWith('/') || path === '/' || path.includes('\0'))
+          throw new Error('Native restore requires explicit credential file mounts');
+        const source = current.Mounts?.filter(mount => mount.Type === 'bind' && mount.Destination &&
+          (path === mount.Destination || path.startsWith(mount.Destination.replace(/\/$/, '') + '/')))
+          .sort((a, b) => b.Destination.length - a.Destination.length)[0];
+        if (!source?.Source || !source.Source.startsWith('/'))
+          throw new Error('Native restore credentials must use operator-controlled bind mounts');
+        mounts.push({ Type: 'bind', Source: join(source.Source, path.slice(source.Destination.length)),
+          Target: path, ReadOnly: true } as Docker.MountSettings);
+      }
+    }
     const helper = await withOperationDeadline((operationSignal) => this.docker.createContainer({
       Image: current.Config.Image,
       name: `agentor-instance-restore-${job.id}`,
       User: "0:0",
       Cmd: ["node", ".output/server/instance-restore-helper.mjs"],
       WorkingDir: "/app",
-      Env: [
-        `AGENTOR_INSTANCE_RESTORE_JOB=${job.id}`,
-        `AGENTOR_INSTANCE_RESTORE_STAGE=${stage}`,
-        `AGENTOR_INSTANCE_RESTORE_DATA_DIR=${this.dataDir}`,
-        `AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR=${current.Id}`,
-      ],
-      NetworkDisabled: true,
+      Env: environment,
+      NetworkDisabled: !native,
       Labels: {
         "agentor.instance-restore-helper": "true",
         "agentor.instance-restore-job": job.id,
       },
       HostConfig: {
-        NetworkMode: "none",
+        NetworkMode: network,
+        ...(extraHosts?.length ? { ExtraHosts: extraHosts } : {}),
         Binds: binds,
         Mounts: mounts.length ? mounts : undefined,
         AutoRemove: true,
@@ -1347,7 +1393,9 @@ export class InstanceBackupManager {
         for (const role of ['workspace', 'agents', ...(state.docker ? ['docker' as const] : [])] as const)
           add({ name: `${containerName}-${role}`, ownerId: worker.userId, workerId: worker.id,
             kind: role === 'workspace' ? 'worker-workspace' : role === 'agents' ? 'worker-agent-data' : 'worker-dind',
-            runtime: { kind: 'incus-vm', role, source: state.runtime.source } });
+            runtime: role === 'workspace'
+              ? { kind: 'incus-vm', role, source: state.runtime.source, dockerData: state.docker }
+              : { kind: 'incus-vm', role, source: state.runtime.source } });
         continue;
       }
       if (storage.mode === "volume") {
@@ -1513,9 +1561,19 @@ export class InstanceBackupManager {
             throw new Error('Native canonical instance capture roles disagree');
           paths[volume.runtime.role] = path;
         }
+        const workspace = outputs.find(({ volume }) => volume.runtime?.role === 'workspace')?.volume.runtime;
+        const proveDockerData = async () => {
+          if (workspace?.role !== 'workspace') return;
+          const state = await containers.inspectInstanceBackupStorageWithLifecycleFenceHeld(workerId);
+          if (typeof workspace.dockerData !== 'boolean' || state.docker !== workspace.dockerData ||
+              state.runtime.kind !== 'incus-vm' || !isDeepStrictEqual(state.runtime.source, workspace.source))
+            throw new Error('Native canonical Docker data presence changed after instance inventory');
+        };
+        await proveDockerData();
         const result = await containers.captureInstanceCanonicalWithLifecycleFenceHeld(workerId, paths, signal);
         if (result.runtime.kind !== 'incus-vm' || !isDeepStrictEqual(result.runtime.source, descriptor.source))
           throw new Error('Native immutable source changed after instance inventory');
+        await proveDockerData();
         return;
       }
       if (outputs.length !== 1) throw new Error('Native instance raw capture must select exactly one role');

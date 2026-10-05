@@ -24,7 +24,9 @@ function core(role: 'workspace' | 'agents' | 'docker', owner = worker()): Instan
   return { name, ownerId: owner.userId, workerId: owner.id,
     kind: { workspace: 'worker-workspace' as const, agents: 'worker-agent-data' as const, docker: 'worker-dind' as const }[role],
     archive: instanceVolumeArchiveName(name), sha256: 'c'.repeat(64), size: 100,
-    runtime: { kind: 'incus-vm', role, source: structuredClone(source) } };
+    runtime: role === 'workspace'
+      ? { kind: 'incus-vm', role, source: structuredClone(source), dockerData: false }
+      : { kind: 'incus-vm', role, source: structuredClone(source) } };
 }
 function descriptor(record: StoredManagedVolume): InstanceBackupVolumeManifest {
   return { name: record.dockerName, ownerId: record.userId, workerId: record.workerId, kind: 'persistent-path',
@@ -59,6 +61,8 @@ test('native logical core groups immutable roles with attached, detached and del
   const record = worker(), attached = managed(1), detached = managed(2, { attached: false, state: 'detached' });
   const retained = managed(3, { workerId: deletedId, userId: 'deleted-owner', attached: false, state: 'detached', retainedAfterAccountDeletion: true });
   const value = manifest([...canonical(), core('docker'), descriptor(attached), descriptor(detached), descriptor(retained)]);
+  if (value.volumes[0]!.runtime?.role !== 'workspace') throw new Error('Fixture workspace missing');
+  value.volumes[0]!.runtime.dockerData = true;
   const records = [record], volumes = [attached, detached, retained], before = structuredClone({ value, records, volumes });
   const result = planInstanceNativeRestore(value, records, volumes);
   expect(result).toHaveLength(2);
@@ -88,6 +92,22 @@ test('archived/stopped intent survives and intentionally omitted agents or unsee
   const orphan = managed(1, { workerId: deletedId, userId: 'deleted-owner', attached: false, seeded: false, state: 'detached' });
   expect(planInstanceNativeRestore(manifest([]), [], [orphan])).toEqual([]);
   expect(() => planInstanceNativeRestore(manifest([], { formatVersion: 1 }), [], [orphan])).toThrow(/version2|format|native/i);
+});
+
+test('Docker payload omission requires explicit canonical absence, not disabled current capability', () => {
+  const record = worker();
+  for (const presence of [undefined, true, false]) for (const hasPayload of [false, true]) {
+    const roles = canonical(), workspace = roles[0]!.runtime;
+    if (workspace?.role !== 'workspace') throw new Error('Fixture workspace missing');
+    if (presence === undefined) delete workspace.dockerData;
+    else workspace.dockerData = presence;
+    const value = manifest([...roles, ...(hasPayload ? [core('docker')] : [])]);
+    const before = structuredClone(value);
+    if (hasPayload ? presence !== false : presence === false) {
+      expect(planInstanceNativeRestore(value, [record], [])[0]!.core.docker !== undefined).toBe(hasPayload);
+    } else expect(() => planInstanceNativeRestore(value, [record], [])).toThrow(/Docker.*missing|absence.*unproven/i);
+    expect(value).toEqual(before);
+  }
 });
 
 test('missing canonical roles, managed bytes or selected filesystem gates fail closed', () => {
