@@ -38,6 +38,25 @@ const importHelper = new Function(
   }>;
 }>;
 
+test('Docker-only helper rejects native formats and descriptors before any archive or Docker access', async () => {
+  const helper = await importHelper(pathToFileURL(helperPath).href);
+  for (const descriptor of [false, true]) {
+    const root = await mkdtemp(join(tmpdir(), 'instance-helper-native-fence-'));
+    try {
+      const prepared = await fixture(root);
+      await writeFile(join(prepared.stage, 'restore-plan.json'), JSON.stringify({ ...prepared.plan,
+        ...(descriptor ? { volumes: [{ name: 'worker-data', archive: '/invalid', kind: 'worker-workspace',
+          runtime: { kind: 'incus-vm', role: 'workspace' } }] } : { formatVersion: 2 }) }));
+      let calls = 0;
+      const result = await helper.runInstanceRestoreHelper({ env: prepared.env,
+        docker: new Proxy({}, { get() { calls++; throw new Error('Native plan must not touch Docker'); } }) });
+      expect(result).toMatchObject({ status: 'failed', code: 'INSTANCE_RESTORE_NATIVE_UNAVAILABLE' });
+      expect(calls).toBe(0);
+      expect((await readFile(join(prepared.dataDir, 'auth.db'))).subarray(16).toString()).toBe('old');
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
+});
+
 async function runHelper(env: Record<string, string> = {}) {
   return await new Promise<{ code: number | null; stdout: string; stderr: string }>(
     (resolve, reject) => {

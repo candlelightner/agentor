@@ -147,6 +147,38 @@ test('runtime snapshot describes pinned conversion source without exporting nati
   });
 });
 
+test('whole-instance inventory requires stopped native roles and does not omit attached or retained Docker data', async () => {
+  await runtimeFixture(async f => {
+    f.instance.status = 'Stopped';
+    for (const volume of Object.values(f.volumes)) Object.assign(volume, { project: 'agentor', created_at: '2026-10-05T12:00:00Z' });
+    expect(await f.runtime.inspectOfflineBackupStorage(f.owner, f.incarnation)).toMatchObject({ docker: false, runtime: { kind: 'incus-vm' } });
+    f.instance.devices.docker = { type: 'disk', pool: 'default', source: f.owner.containerName + '-docker' };
+    await expect(f.runtime.inspectOfflineBackupStorage(f.owner, f.incarnation)).rejects.toThrow('docker volume is missing');
+    delete f.instance.devices.docker;
+    f.volumes[f.owner.containerName + '-workspace'].config['user.agentor.docker-data'] = 'true';
+    await expect(f.runtime.inspectOfflineBackupStorage(f.owner, f.incarnation)).rejects.toThrow('docker volume is missing');
+    delete f.volumes[f.owner.containerName + '-workspace'].config['user.agentor.docker-data'];
+    f.instance.status = 'Running';
+    await expect(f.runtime.inspectOfflineBackupStorage(f.owner, f.incarnation)).rejects.toThrow('stopped');
+    expect(f.executions).toEqual([]);
+  });
+});
+
+test('whole-instance native inventory rejects foreign references and local/expanded role drift', async () => {
+  for (const kind of ['reference', 'device', 'expanded', 'date', 'project']) await runtimeFixture(async f => {
+    f.instance.status = 'Stopped';
+    for (const volume of Object.values(f.volumes)) Object.assign(volume, { project: 'agentor', created_at: '2026-10-05T12:00:00Z' });
+    const workspace = f.volumes[f.owner.containerName + '-workspace'];
+    if (kind === 'reference') workspace.used_by = ['https://foreign.invalid/1.0/instances/' + f.owner.containerName + '?project=agentor'];
+    if (kind === 'device') f.instance.devices.workspace.readonly = 'true';
+    if (kind === 'expanded') f.instance.expanded_devices = { ...f.instance.devices, workspace: { ...f.instance.devices.workspace, path: '/wrong' } };
+    if (kind === 'date') workspace.created_at = 'invalid';
+    if (kind === 'project') workspace.project = 'foreign';
+    await expect(f.runtime.inspectOfflineBackupStorage(f.owner, f.incarnation)).rejects.toThrow();
+    expect(f.executions).toEqual([]);
+  });
+});
+
 async function guestFixture(run: (value: {
   root: string; workspace: string; agents: string; mountinfo: string;
   execute: (role: string, exclusions?: string[], offline?: boolean) => ReturnType<typeof spawnSync>;

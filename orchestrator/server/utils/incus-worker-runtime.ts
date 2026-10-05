@@ -155,6 +155,52 @@ export class IncusWorkerRuntime {
     return snapshotIncusWorkerBackupRuntime(identity);
   }
 
+  /** Whole-instance inventory is read-only and must not create missing data,
+   * convert images, or mistake retained legacy volumes for native authority. */
+  async inspectOfflineBackupStorage(owner: IncusStorageOwner, incarnation?: string) {
+    const validate = async () => {
+      if (!incarnation) return this.assertAbsentCompute(owner);
+      const instance = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+      if (instance.status !== 'Stopped') throw new Error('Instance backup requires stopped native compute');
+    };
+    await validate();
+    const original = incarnation ? await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation) : undefined;
+    const storage = await this.storage();
+    const existing = await storage.verifyExisting(owner, !!original?.devices.docker);
+    for (const role of ['workspace', 'agents', ...(existing.docker ? ['docker' as const] : [])] as const) {
+      const volume = await storage.inspectVolume(owner, role);
+      const attached = !!original && (role !== 'docker' || !!original.devices.docker);
+      const expected = { type: 'disk', pool: this.config.incusStoragePool, source: `${owner.containerName}-${role}`,
+        ...(role === 'docker' ? {} : { path: role === 'workspace' ? '/workspace' : '/home/agent/.agent-data' }) };
+      if (!volume || volume.project !== this.config.incusProject || !volume.created_at ||
+          !Number.isFinite(Date.parse(volume.created_at)) || !Array.isArray(volume.used_by) || volume.used_by.length !== (attached ? 1 : 0))
+        throw new Error('Native instance inventory storage authority is unavailable');
+      if (attached) {
+        const reference = new URL(volume.used_by[0]!, this.client.endpoint);
+        if (reference.origin !== new URL(this.client.endpoint).origin || reference.username || reference.password || reference.hash ||
+            reference.pathname !== `/1.0/instances/${owner.containerName}` || reference.searchParams.getAll('project').length !== 1 ||
+            reference.searchParams.get('project') !== this.config.incusProject || [...reference.searchParams.keys()].some(key => key !== 'project'))
+          throw new Error('Native instance inventory storage reference is foreign');
+      }
+      if (original) for (const devices of [original.devices, original.expanded_devices ?? original.devices]) {
+        const sources = Object.entries(devices).filter(([, device]) => device.type === 'disk' &&
+          device.pool === this.config.incusStoragePool && device.source === volume.name);
+        if (attached ? !sameDevice(devices[role], expected) || sources.length !== 1 || sources[0]?.[0] !== role
+            : sources.length !== 0 || devices[role] !== undefined)
+          throw new Error('Native instance inventory device authority is ambiguous');
+      }
+    }
+    const runtime = await this.backupRuntime(owner, incarnation);
+    await validate();
+    if (original) {
+      const current = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+      if (JSON.stringify(current.devices) !== JSON.stringify(original.devices) ||
+          JSON.stringify(current.expanded_devices) !== JSON.stringify(original.expanded_devices))
+        throw new Error('Native instance inventory compute devices changed');
+    }
+    return { ...existing, runtime };
+  }
+
   /** One networkless helper reads existing stopped/detached filesystem data.
    * Source volumes and original compute/devices are never changed. */
   async captureOfflineCanonical(owner: IncusStorageOwner, incarnation: string | undefined,

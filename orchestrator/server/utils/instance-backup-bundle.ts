@@ -8,6 +8,7 @@ import {
 import {
   lstat,
   mkdir,
+  mkdtemp,
   open,
   opendir,
   readFile,
@@ -26,6 +27,12 @@ import type {
   InstanceBackupOptions,
   InstanceBackupVolumeManifest,
 } from "./instance-backup-types";
+import { randomUUID } from 'node:crypto';
+import { parseWorkerBackupRuntime } from './worker-backup-runtime';
+import { isCanonicalPortableManagedVolumeTarget } from './portable-managed-volume-format';
+import { MAX_PORTABLE_MANAGED_VOLUME_COMPRESSED_PAYLOAD_BYTES, MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES,
+  validateIncusCanonicalRestoreArchive, validateIncusDockerRestoreArchive,
+  validatePortableManagedVolumeArchive } from './portable-managed-volume-archive';
 
 const MANIFEST = "manifest.json";
 const DATA_ARCHIVE = "data.tar.gz";
@@ -278,7 +285,11 @@ export async function inspectInstanceBundle(
   for (const volume of manifest.volumes) {
     const path = extracted.get(volume.archive)!;
     await verifyPayload(path, volume);
-    await validateTarGzip(path, false, signal);
+    if (volume.runtime) {
+      const privateScratch = await mkdtemp(join(destination, '.native-volume-check-'));
+      try { await prepareInstanceNativeVolumeArchive(path, volume, privateScratch, { signal }); }
+      finally { await rm(privateScratch, { recursive: true, force: true }); }
+    } else await validateTarGzip(path, false, signal);
     volumeArchives.set(volume.name, path);
   }
   return { manifest, dataArchivePath, volumeArchives };
@@ -291,7 +302,7 @@ export function validateInstanceManifest(
   if (
     !input ||
     input.kind !== "agentor-instance-backup" ||
-    input.formatVersion !== 1 ||
+    ![1, 2].includes(input.formatVersion) ||
     !safeId(input.backupId) ||
     !bounded(input.sourceInstallationId, 200) ||
     !safeId(input.createdByUserId) ||
@@ -306,7 +317,7 @@ export function validateInstanceManifest(
     !safeSize(input.dataArchive.size) ||
     !Array.isArray(input.volumes) ||
     input.volumes.length > MAX_VOLUMES ||
-    !input.volumes.every(validVolume) ||
+    !input.volumes.every((volume: unknown) => validVolume(volume, input.formatVersion, input.storage.containerPrefix)) ||
     new Set(input.volumes.map((item: any) => item.name)).size !==
       input.volumes.length ||
     new Set(input.volumes.map((item: any) => item.archive)).size !==
@@ -339,6 +350,53 @@ export function validateInstanceManifest(
   )
     throw new Error("Invalid instance backup manifest");
   return structuredClone(input) as InstanceBackupManifest;
+}
+
+/** Native volume validation/extraction receives unchanged raw bytes in private
+ * scratch. This grants no instance, mount, filesystem or worker-ID authority. */
+export async function prepareInstanceNativeVolumeArchive(
+  payloadPath: string,
+  volume: InstanceBackupVolumeManifest,
+  privateWorkDir: string,
+  options: { signal?: AbortSignal; maxRawBytes?: number } = {},
+): Promise<{ archivePath: string; rawBytes: number; entries: number; expandedBytes: number }> {
+  if (!validVolume(volume, 2) || !volume.runtime)
+    throw new Error('Invalid native instance volume descriptor');
+  const requested = options.maxRawBytes ?? MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES;
+  if (!Number.isSafeInteger(requested) || requested <= 0)
+    throw new Error('Invalid native instance volume raw-byte limit');
+  const maxRawBytes = Math.min(requested, MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES);
+  options.signal?.throwIfAborted();
+  const directory = await lstat(privateWorkDir);
+  if (!directory.isDirectory() || directory.isSymbolicLink() || (directory.mode & 0o077) !== 0 ||
+      directory.uid !== process.geteuid?.())
+    throw new Error('Native instance volume scratch must be a caller-owned private directory');
+  const archivePath = join(privateWorkDir, `native-${randomUUID()}.tar`);
+  let input: Awaited<ReturnType<typeof open>> | undefined, output: Awaited<ReturnType<typeof open>> | undefined;
+  let created = false, rawBytes = 0;
+  try {
+    input = await open(payloadPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const info = await input.stat();
+    if (!info.isFile() || info.size > MAX_PORTABLE_MANAGED_VOLUME_COMPRESSED_PAYLOAD_BYTES)
+      throw new Error('Native instance volume gzip input must be a bounded regular file');
+    output = await open(archivePath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    created = true;
+    const bounded = new Transform({ transform(chunk, _encoding, callback) {
+      rawBytes += Buffer.byteLength(chunk);
+      callback(rawBytes > maxRawBytes ? new Error('Native instance volume exceeds the raw-byte limit') : null, chunk);
+    } });
+    await pipeline(input.createReadStream(), createGunzip(), bounded, output.createWriteStream(), { signal: options.signal });
+    const runtime = volume.runtime, limits = { maxExpandedBytes: maxRawBytes, signal: options.signal };
+    const summary = runtime.role === 'managed'
+      ? await validatePortableManagedVolumeArchive(archivePath, { ...limits, target: runtime.target, requirePosixUstar: true })
+      : runtime.role === 'docker' ? await validateIncusDockerRestoreArchive(archivePath, limits)
+        : await validateIncusCanonicalRestoreArchive(archivePath, runtime.role, limits);
+    return { archivePath, rawBytes, ...summary };
+  } catch (error) {
+    await output?.close().catch(() => {});
+    if (created) await rm(archivePath, { force: true }).catch(() => {});
+    throw error;
+  } finally { await input?.close().catch(() => {}); await output?.close().catch(() => {}); }
 }
 
 async function addPathTree(
@@ -558,6 +616,11 @@ function excludedPaths(options: InstanceBackupOptions): string[] {
     "instance-backup-artifacts",
     "instance-restore-staging",
     "instance-restore-rollback",
+    // Host-local native operation/UUID cleanup receipts cannot become restore
+    // authority on another installation. Canonical data is captured separately.
+    "incus-backup-helpers",
+    "system-state/users/volume-sizing/volume-size-jobs.v1.json",
+    "system-state/users/volume-sizing/volume-size-cache.v1.json",
     "admin/instance-backups.v1.json",
     "export-artifacts",
   ];
@@ -658,7 +721,7 @@ function assertContainedSymlink(
     throw new Error("Instance backup archive contains a symlink outside its archive root");
 }
 
-function validVolume(value: any) {
+function validVolume(value: any, version: number, prefix?: string) {
   try {
     assertDockerVolumeName(value?.name);
   } catch {
@@ -679,8 +742,35 @@ function validVolume(value: any) {
     optionalId(value.groupId) &&
     value.archive === instanceVolumeArchiveName(value.name) &&
     sha(value.sha256) &&
-    safeSize(value.size)
+    safeSize(value.size) &&
+    (value.runtime === undefined ? true : version === 2 && validNativeVolume(value, prefix))
   );
+}
+
+function exactKeys(value: unknown, keys: string[]): boolean {
+  return !!value && typeof value === 'object' && !Array.isArray(value) &&
+    Object.keys(value).sort().join(',') === [...keys].sort().join(',');
+}
+
+function validNativeVolume(volume: any, prefix?: string): boolean {
+  const runtime = volume.runtime;
+  if (!runtime || runtime.kind !== 'incus-vm' || !safeId(volume.ownerId) || !safeId(volume.workerId) || volume.groupId !== undefined)
+    return false;
+  if (runtime.role === 'managed') return exactKeys(runtime, ['kind', 'role', 'managedVolumeId', 'target']) &&
+    typeof runtime.managedVolumeId === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(runtime.managedVolumeId) &&
+    isCanonicalPortableManagedVolumeTarget(runtime.target) && volume.kind === 'persistent-path' &&
+    volume.name === 'agentor-persist-' + runtime.managedVolumeId;
+  const kinds = { workspace: 'worker-workspace', agents: 'worker-agent-data', docker: 'worker-dind' } as const;
+  if (!Object.hasOwn(kinds, runtime.role) || !exactKeys(runtime, ['kind', 'role', 'source']) ||
+      !exactKeys(runtime.source, ['sourceImageId', 'recipeId', 'architecture', 'converterVersion', 'bootstrapGeneration']) ||
+      volume.kind !== kinds[runtime.role as keyof typeof kinds]) return false;
+  try { parseWorkerBackupRuntime({ version: 1, kind: 'incus-vm', source: runtime.source }); }
+  catch { return false; }
+  // A full manifest pins its authoring prefix. The private gzip decoder also
+  // rejects descriptors whose core name cannot have any safe source prefix.
+  const suffix = `-${volume.workerId}-${runtime.role}`;
+  return prefix !== undefined ? volume.name === prefix + suffix
+    : volume.name.endsWith(suffix) && /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(volume.name.slice(0, -suffix.length));
 }
 
 export function assertDockerVolumeName(value: unknown): asserts value is string {

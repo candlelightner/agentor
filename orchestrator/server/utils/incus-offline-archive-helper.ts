@@ -23,6 +23,23 @@ const fail = (message: string) => Object.assign(new Error(message), { statusCode
 const missing = (error: unknown) => (error as { statusCode?: number }).statusCode === 404;
 const safeName = (value: unknown) => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value);
 
+/** Whole-instance preflight must not drop unresolved private cleanup authority
+ * from the source. These local receipts are never portable backup metadata. */
+export async function assertOfflineArchiveHelpersSettled(dataDir: string) {
+  let directory: FileHandle;
+  try { directory = await open(join(dataDir, 'incus-backup-helpers'), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW); }
+  catch (error: any) { if (error.code === 'ENOENT') return; throw fail('Inspect the private offline helper directory before instance backup.'); }
+  try {
+    const info = await directory.stat();
+    if ((info.mode & 0o077) !== 0 || info.uid !== process.getuid?.())
+      throw fail('Offline helper recovery directory is not private.');
+    const entries = await opendir(`/proc/self/fd/${directory.fd}`);
+    try {
+      if (await entries.read()) throw fail('Resolve offline backup helper cleanup before creating an instance snapshot.');
+    } finally { await entries.close(); }
+  } finally { await directory.close(); }
+}
+
 /** One read-only, networkless guest; a private cleanup receipt, not a backup
  * transaction journal. Unknown submissions remain quarantined for operators. */
 export class IncusOfflineArchiveHelper {

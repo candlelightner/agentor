@@ -4,12 +4,30 @@ import { mkdtemp, rm, readdir, readFile, writeFile, mkdir, chmod, symlink, unlin
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
-import { IncusOfflineArchiveHelper } from '../../orchestrator/server/utils/incus-offline-archive-helper';
+import { IncusOfflineArchiveHelper, assertOfflineArchiveHelpersSettled } from '../../orchestrator/server/utils/incus-offline-archive-helper';
 import { IncusRequestRejected } from '../../orchestrator/server/utils/incus-client';
 import { isOperationHelperActive, registerOperationHelper } from '../../orchestrator/server/utils/operation-helper-registry';
 import type { Config } from '../../orchestrator/server/utils/config';
 import fsPromises from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
+
+test('whole-instance preflight rejects any unresolved private helper receipt without reading or replaying it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'instance-helper-settled-')), directory = join(root, 'incus-backup-helpers');
+  try {
+    await assertOfflineArchiveHelpersSettled(root);
+    await mkdir(directory, { mode: 0o700 }); await assertOfflineArchiveHelpersSettled(root);
+    for (const name of ['unknown.json', 'unfinished.tmp']) {
+      const path = join(directory, name); await writeFile(path, 'not portable authority', { mode: 0o600 });
+      await expect(assertOfflineArchiveHelpersSettled(root)).rejects.toMatchObject({ statusCode: 409 });
+      expect(await readFile(path, 'utf8')).toBe('not portable authority'); await unlink(path);
+    }
+    await chmod(directory, 0o755);
+    await expect(assertOfflineArchiveHelpersSettled(root)).rejects.toThrow('not private');
+    await chmod(directory, 0o700); await rm(directory, { recursive: true });
+    await symlink('/tmp', directory);
+    await expect(assertOfflineArchiveHelpersSettled(root)).rejects.toMatchObject({ statusCode: 409 });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 async function fixture(run: (fixture: any) => Promise<void>) {
   const dataDir = await mkdtemp(join(tmpdir(), 'incus-offline-backup-test-'));

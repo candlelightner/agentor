@@ -12,6 +12,8 @@ import { useWorkerProtectionLockStore } from "./worker-protection-lock";
 import { requireOrdinaryWorkerSelfAccess } from "./worker-auth";
 import { persistentPathVolumeName } from "./persistent-backup-paths";
 import { normalizeBackupPaths, isParentPath } from './backup-paths';
+import { isDeepStrictEqual } from 'node:util';
+import { isWorkerLifecycleMutationPending, workerLifecycleGeneration } from './worker-lifecycle-coordinator';
 
 function withOwnerWorkerLifecycleMutation<T>(userId: string, workerId: string, operation: () => Promise<T>) {
   return withWorkerMutation(userId, workerId, () => {
@@ -69,6 +71,38 @@ export class ManagedVolumeManager {
    * directory/boot proof needed to resolve a pending live cutover. */
   assertLiveRecoveryResolved(userId: string, workerId: string) {
     for (const v of this.store.forWorker(userId, workerId)) assertIncusLiveResolved(v);
+  }
+
+  /** Platform whole-instance snapshot includes settled detached and retained
+   * deleted-owner data. It never invents a WorkerRecord for retained storage. */
+  async captureInstanceArchiveWithLifecycleFenceHeld(v: StoredManagedVolume, archivePath: string, signal?: AbortSignal) {
+    await this.init();
+    const workers = useWorkerStore(), containers = useContainerManager();
+    const record = workers.findById(v.workerId), info = containers.get(v.workerId);
+    const absent = !record && !info;
+    const archived = record?.status === 'archived' && !info;
+    if (!instanceSnapshotActive() || !isWorkerLifecycleMutationPending(v.workerId) ||
+        managedVolumeRuntimeKind(v) !== 'incus-vm' || !isDeepStrictEqual(this.store.get(v.userId, v.id), v) ||
+        !absent && (!record || record.userId !== v.userId || record.runtimeKind !== 'incus-vm' ||
+          record.deletionPending || record.incusRecreation || !archived && (record.status !== 'active' ||
+            !info || info.userId !== v.userId || info.runtimeKind !== 'incus-vm' || info.status !== 'stopped')) ||
+        absent && v.attached)
+      throw volumeError(409, 'Instance managed capture requires settled stopped/archived or detached retained authority.');
+    this.assertLiveRecoveryResolved(v.userId, v.workerId);
+    const captured = structuredClone({ record, info, volumes: this.store.forWorker(v.userId, v.workerId) });
+    const generation = workerLifecycleGeneration(v.workerId);
+    const validate = () => {
+      if (!instanceSnapshotActive() || !isWorkerLifecycleMutationPending(v.workerId) || workerLifecycleGeneration(v.workerId) !== generation ||
+          !isDeepStrictEqual({ record: workers.findById(v.workerId), info: containers.get(v.workerId),
+            volumes: this.store.forWorker(v.userId, v.workerId) }, captured) ||
+          this.operations.has(v.id) || this.recreations.get(v.userId, v.workerId))
+        throw volumeError(409, 'Instance managed capture durable runtime/storage authority changed.');
+      this.assertLiveRecoveryResolved(v.userId, v.workerId);
+    };
+    validate();
+    const { MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES } = await import('./portable-managed-volume-archive');
+    return this.incusRuntime.captureArchive(v, { state: absent || archived ? 'archived' : 'stopped',
+      handle: info?.containerId, archivePath, maxBytes: MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES, signal }, validate);
   }
 
   /** Called after deleted-account worker cleanup under the owner's fence.

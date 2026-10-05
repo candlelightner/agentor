@@ -4,7 +4,10 @@ import { createReadStream, createWriteStream } from "node:fs";
 import {
   mkdir,
   mkdtemp,
+  lstat,
+  link,
   readFile,
+  readdir,
   rm,
   stat,
   symlink,
@@ -14,6 +17,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
+import { gzipSync } from 'node:zlib';
+import { execFileSync } from 'node:child_process';
 import {
   createInstanceDataArchive,
   inspectInstanceBundle,
@@ -21,11 +26,26 @@ import {
   packInstanceBundle,
   sha256File,
   validateInstanceManifest,
+  prepareInstanceNativeVolumeArchive,
 } from "../../orchestrator/server/utils/instance-backup-bundle";
 import type {
   InstanceBackupManifest,
   InstanceBackupOptions,
+  InstanceBackupVolumeManifest,
 } from "../../orchestrator/server/utils/instance-backup-types";
+
+const nativeWorker = '11111111-2222-3333-4444-555555555555';
+const nativeManaged = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+const nativeSource = { sourceImageId: 'sha256:' + 'a'.repeat(64), recipeId: 'b'.repeat(64),
+  architecture: 'amd64' as const, converterVersion: 'v0.4.0', bootstrapGeneration: '3' as const };
+function nativeVolume(role: 'workspace' | 'agents' | 'docker' | 'managed', bytes = Buffer.alloc(0)): InstanceBackupVolumeManifest {
+  const name = role === 'managed' ? 'agentor-persist-' + nativeManaged : 'agentor-worker-' + nativeWorker + '-' + role;
+  return { name, ownerId: 'native-owner', workerId: nativeWorker,
+    kind: ({ workspace: 'worker-workspace', agents: 'worker-agent-data', docker: 'worker-dind', managed: 'persistent-path' } as const)[role],
+    archive: instanceVolumeArchiveName(name), sha256: 'a'.repeat(64), size: bytes.length,
+    runtime: role === 'managed' ? { kind: 'incus-vm' as const, role, managedVolumeId: nativeManaged, target: '/srv/persisted' }
+      : { kind: 'incus-vm' as const, role, source: nativeSource } };
+}
 
 const orchestratorRequire = createRequire(
   new URL("../../orchestrator/package.json", import.meta.url),
@@ -136,6 +156,37 @@ test.describe("instance disaster-recovery bundle boundary", () => {
 
   test.afterEach(async () => {
     await rm(root, { recursive: true, force: true });
+  });
+
+  test("never includes private native cleanup receipts, regardless of data options", async () => {
+    const dataDir = join(root, "data"), authSnapshot = join(root, "auth-snapshot.db");
+    await mkdir(join(dataDir, "incus-backup-helpers"), { recursive: true, mode: 0o700 });
+    await writeFile(join(dataDir, "incus-backup-helpers", "receipt.json"), '{"nativeUUID":"host-local","operation":"pending"}', { mode: 0o600 });
+    await writeFile(join(dataDir, "incus-backup-helpers", "receipt.tmp"), "private partial receipt", { mode: 0o600 });
+    const sizing = "system-state/users/volume-sizing";
+    await mkdir(join(dataDir, sizing), { recursive: true });
+    await writeFile(join(dataDir, sizing, "volume-size-jobs.v1.json"), '{"nativeUUID":"source-only","helperOperation":"pending"}');
+    await writeFile(join(dataDir, sizing, "volume-size-cache.v1.json"), '{"incarnation":"source-only"}');
+    await writeFile(join(dataDir, sizing, "other-state.json"), "unrelated retained system state");
+    await writeFile(join(dataDir, "worker-state.json"), "canonical control-plane state");
+    await writeFile(authSnapshot, "sqlite snapshot");
+    for (const [index, options] of [defaultOptions,
+      { ...defaultOptions, includeLocalBackups: true, includeLogs: true },
+      { ...defaultOptions, includeWorkers: false, includeAgentData: false, includeDockerVolumes: false }].entries()) {
+      const archive = join(root, "without-native-receipts-" + index + ".gz");
+      const result = await createInstanceDataArchive({ dataDir, authSnapshotPath: authSnapshot, output: archive, options });
+      const entries = await readTarGzip(archive);
+      expect([...entries.keys()].some(name => name === "incus-backup-helpers" || name.startsWith("incus-backup-helpers/"))).toBe(false);
+      expect(entries.get("worker-state.json")?.toString()).toBe("canonical control-plane state");
+      expect(entries.get("auth.db")?.toString()).toBe("sqlite snapshot");
+      expect(result.excludedDataPaths).toContain("incus-backup-helpers");
+      for (const name of ["volume-size-jobs.v1.json", "volume-size-cache.v1.json"]) {
+        expect(entries.has(sizing + "/" + name)).toBe(false);
+        expect(result.excludedDataPaths).toContain(sizing + "/" + name);
+      }
+      expect(entries.get(sizing + "/other-state.json")?.toString()).toBe("unrelated retained system state");
+    }
+    expect(await readFile(join(dataDir, "incus-backup-helpers", "receipt.json"), "utf8")).toContain("host-local");
   });
 
   test("uses the SQLite snapshot and applies recursive-data exclusions without dropping plugin state", async () => {
@@ -430,5 +481,144 @@ test.describe("instance disaster-recovery bundle boundary", () => {
         excludedDataPaths: ["/absolute/exclusion"],
       }),
     ).toThrow(/invalid instance backup manifest/i);
+  });
+});
+
+test.describe('native instance format boundary', () => {
+  let directory: string;
+  test.beforeEach(async () => { directory = await mkdtemp(join(tmpdir(), 'agentor-native-instance-format-')); });
+  test.afterEach(async () => { await rm(directory, { recursive: true, force: true }); });
+  const data = async (directory: string) => {
+    const path = join(directory, 'data.tar.gz'); await writeTarGzip(path, [{ name: 'auth.db', body: 'sqlite snapshot' }]); return path;
+  };
+  const nativeRaw = async (directory: string, wrapper: string) => {
+    const stage = join(directory, 'stage-' + wrapper), path = join(stage, wrapper); await mkdir(path, { recursive: true });
+    await writeFile(join(path, 'data'), Buffer.from([0, 255, 128, 10, 61]));
+    await link(join(path, 'data'), join(path, 'hard')); await symlink('data', join(path, 'inert'));
+    execFileSync('python3', ['-c', 'import os,sys; os.setxattr(sys.argv[1],"user.binary",bytes([0,255,128,10,61,0]))', join(path, 'data')]);
+    const raw = join(directory, wrapper + '.tar');
+    execFileSync('/usr/bin/tar', ['--format=pax', '--numeric-owner', '--owner=12345', '--group=23456', '--mode=0640',
+      '--xattrs', '--xattrs-include=*', '--acls', '-cf', raw, '-C', stage, wrapper]);
+    return readFile(raw);
+  };
+
+  test('version1 remains legacy-only; version2 role, source, names and portable metadata are strict', async () => {
+    const path = await data(directory), volumes = ['workspace', 'agents', 'docker', 'managed'].map(role => nativeVolume(role as any));
+    const manifest = await manifestFor(path, { formatVersion: 2, volumes });
+    expect(validateInstanceManifest(manifest)).toEqual(manifest);
+    const legacy = await manifestFor(path); expect(validateInstanceManifest(legacy)).toEqual(legacy);
+    expect(() => validateInstanceManifest({ ...manifest, formatVersion: 1 })).toThrow(/manifest/);
+    expect(() => validateInstanceManifest({ ...manifest, formatVersion: 3 })).toThrow(/manifest/);
+    for (const mutation of ['kind', 'role', 'missing-source', 'mutable-source', 'source-fingerprint', 'runtime-ip',
+      'missing-owner', 'missing-worker', 'group', 'wrong-name', 'wrong-volume-kind', 'managed-fields']) {
+      const candidate: any = structuredClone(volumes[0]);
+      if (mutation === 'kind') candidate.runtime.kind = 'legacy-docker';
+      if (mutation === 'role') candidate.runtime.role = 'root';
+      if (mutation === 'missing-source') delete candidate.runtime.source;
+      if (mutation === 'mutable-source') candidate.runtime.source.sourceImageId = 'ubuntu:latest';
+      if (mutation === 'source-fingerprint') candidate.runtime.source.fingerprint = 'c'.repeat(64);
+      if (mutation === 'runtime-ip') candidate.runtime.ip = '10.0.0.1';
+      if (mutation === 'missing-owner') delete candidate.ownerId;
+      if (mutation === 'missing-worker') delete candidate.workerId;
+      if (mutation === 'group') candidate.groupId = 'group';
+      if (mutation === 'wrong-name') { candidate.name = 'agentor-worker-other-workspace'; candidate.archive = instanceVolumeArchiveName(candidate.name); }
+      if (mutation === 'wrong-volume-kind') candidate.kind = 'admin-workspace';
+      if (mutation === 'managed-fields') candidate.runtime.managedVolumeId = nativeManaged;
+      expect(() => validateInstanceManifest({ ...manifest, volumes: [candidate] }), mutation).toThrow(/manifest/);
+    }
+    for (const mutation of ['id', 'target', 'name', 'source', 'missing-owner', 'missing-worker']) {
+      const candidate: any = structuredClone(volumes[3]);
+      if (mutation === 'id') candidate.runtime.managedVolumeId = 'not-a-uuid';
+      if (mutation === 'target') candidate.runtime.target = '/srv/persisted/../foreign';
+      if (mutation === 'name') { candidate.name = 'agentor-persist-other'; candidate.archive = instanceVolumeArchiveName(candidate.name); }
+      if (mutation === 'source') candidate.runtime.source = nativeSource;
+      if (mutation === 'missing-owner') delete candidate.ownerId;
+      if (mutation === 'missing-worker') delete candidate.workerId;
+      expect(() => validateInstanceManifest({ ...manifest, volumes: [candidate] }), mutation).toThrow(/manifest/);
+    }
+  });
+
+  test('cheap live-fixture preflight preserves confined absolute links and rejects external managed links', async () => {
+    const volume = nativeVolume('managed');
+    const payload = join(directory, 'fixture-volume.tar.gz'), scratch = join(directory, 'fixture-raw');
+    await mkdir(scratch, { mode: 0o700 });
+    const write = (linkname: string) => writeTarGzip(payload, [
+      { name: 'volume/', type: 'directory' },
+      { name: 'volume/data', body: Buffer.from([0,255,128,10,61,0]) },
+      { name: 'volume/link', type: 'symlink', linkname },
+    ]);
+    await write('/absolute/inert/link');
+    await expect(prepareInstanceNativeVolumeArchive(payload, volume, scratch)).rejects.toThrow('absolute symlink escapes');
+    if (volume.runtime?.role !== 'managed') throw new Error('Fixture managed descriptor missing');
+    await write(volume.runtime.target + '/data');
+    const valid = await prepareInstanceNativeVolumeArchive(payload, volume, scratch);
+    expect(valid.entries).toBe(3);
+  });
+
+  test('mixed native version2 bundle and private raw decoder preserve GNU binary metadata and exact role wrappers', async () => {
+    const path = await data(directory), items = [];
+    for (const role of ['workspace', 'agents', 'docker', 'managed'] as const) {
+      const raw = await nativeRaw(directory, role === 'agents' ? '.agent-data' : role === 'managed' ? 'volume' : role);
+      const archive = join(directory, role + '.gz'); await writeFile(archive, gzipSync(raw));
+      const volume = { ...nativeVolume(role), size: (await stat(archive)).size, sha256: await sha256File(archive) };
+      const scratch = join(directory, role + '-scratch'); await mkdir(scratch, { mode: 0o700 });
+      const decoded = await prepareInstanceNativeVolumeArchive(archive, volume, scratch);
+      expect(await readFile(decoded.archivePath)).toEqual(raw); expect(decoded.rawBytes).toBe(raw.length);
+      expect(decoded.entries).toBe(4); expect(decoded.expandedBytes).toBe(5);
+      expect((await lstat(decoded.archivePath)).mode & 0o777).toBe(0o600);
+      items.push({ manifest: volume, path: archive });
+    }
+    const manifest = await manifestFor(path, { formatVersion: 2, volumes: items.map(item => item.manifest) });
+    const bundle = join(directory, 'native.tar'); await packInstanceBundle(manifest, path, items, bundle);
+    const inspected = await inspectInstanceBundle(bundle, join(directory, 'unpacked'));
+    expect(inspected.manifest).toEqual(manifest); expect(inspected.volumeArchives.size).toBe(4);
+    for (const item of items) expect(await readFile(inspected.volumeArchives.get(item.manifest.name)!)).toEqual(await readFile(item.path));
+    expect((await readdir(join(directory, 'unpacked'))).some(name => name.startsWith('.native-volume-check-'))).toBe(false);
+  });
+
+  test('Docker device bytes are native-only and untagged/version1 cannot reinterpret their archive', async () => {
+    const path = await data(directory), archive = join(directory, 'special.gz');
+    const raw: Buffer[] = [];
+    for (const [name, type] of [['docker/', '5'], ['docker/whiteout', '3'], ['docker/fifo', '6']]) {
+      const header = Buffer.alloc(512); header.write(name!, 0, 100);
+      for (const [offset, length, value] of [[100, 8, 0o700], [108, 8, 12345], [116, 8, 23456],
+        [124, 12, 0], [136, 12, 100], [329, 8, 0], [337, 8, 0]])
+        header.write(value!.toString(8).padStart(length! - 1, '0') + '\0', offset!, length!, 'ascii');
+      header[156] = type!.charCodeAt(0); header.write('ustar\0', 257, 6, 'ascii'); header.write('00', 263, 2, 'ascii');
+      header.fill(32, 148, 156); header.write([...header].reduce((sum, byte) => sum + byte, 0).toString(8).padStart(6, '0') + '\0 ', 148, 8, 'ascii');
+      raw.push(header);
+    }
+    const bytes = Buffer.concat([...raw, Buffer.alloc(1024)]); await writeFile(archive, gzipSync(bytes));
+    const volume = { ...nativeVolume('docker'), size: (await stat(archive)).size, sha256: await sha256File(archive) };
+    const scratch = join(directory, 'special-scratch'); await mkdir(scratch, { mode: 0o700 });
+    const decoded = await prepareInstanceNativeVolumeArchive(archive, volume, scratch); expect(await readFile(decoded.archivePath)).toEqual(bytes);
+    const manifest = await manifestFor(path, { formatVersion: 2, volumes: [volume] }), bundle = join(directory, 'special.tar');
+    await packInstanceBundle(manifest, path, [{ manifest: volume, path: archive }], bundle);
+    await expect(inspectInstanceBundle(bundle, join(directory, 'special-unpacked'))).resolves.toMatchObject({ manifest });
+    for (const version of [1, 2] as const) {
+      const legacy: any = { ...volume }; delete legacy.runtime;
+      const legacyManifest = await manifestFor(path, { formatVersion: version, volumes: [legacy] });
+      const legacyBundle = join(directory, 'untagged-' + version + '.tar');
+      await packInstanceBundle(legacyManifest, path, [{ manifest: legacy, path: archive }], legacyBundle);
+      await expect(inspectInstanceBundle(legacyBundle, join(directory, 'untagged-' + version))).rejects.toThrow(/special/);
+    }
+    // These remain byte fixtures only; no device or FIFO is created/extracted.
+  });
+
+  test('native decoder bounds, corrupt gzip, wrong roots and cancellation remove only their own partial scratch', async () => {
+    const raw = await nativeRaw(directory, 'workspace'), compressed = join(directory, 'workspace.gz');
+    await writeFile(compressed, gzipSync(raw)); const volume = nativeVolume('workspace', await readFile(compressed));
+    const scratch = join(directory, 'scratch'); await mkdir(scratch, { mode: 0o700 });
+    await writeFile(join(scratch, 'keep'), 'retained');
+    await expect(prepareInstanceNativeVolumeArchive(compressed, volume, scratch, { maxRawBytes: 512 })).rejects.toThrow(/raw-byte limit/);
+    await expect(prepareInstanceNativeVolumeArchive(compressed, { ...nativeVolume('docker'), size: volume.size }, scratch)).rejects.toThrow(/docker/);
+    const corrupt = join(directory, 'corrupt.gz'); await writeFile(corrupt, gzipSync(raw).subarray(0, 16));
+    await expect(prepareInstanceNativeVolumeArchive(corrupt, volume, scratch)).rejects.toThrow();
+    const cancelled = new AbortController(); cancelled.abort(new Error('native-instance-cancelled'));
+    await expect(prepareInstanceNativeVolumeArchive(compressed, volume, scratch, { signal: cancelled.signal })).rejects.toThrow(/cancelled/);
+    expect(await readdir(scratch)).toEqual(['keep']); expect(await readFile(join(scratch, 'keep'), 'utf8')).toBe('retained');
+    const linked = join(directory, 'linked'); await symlink(scratch, linked);
+    await expect(prepareInstanceNativeVolumeArchive(compressed, volume, linked)).rejects.toThrow(/private directory/);
+    await expect(prepareInstanceNativeVolumeArchive(compressed, volume, scratch, { maxRawBytes: 0 })).rejects.toThrow(/raw-byte limit/);
   });
 });

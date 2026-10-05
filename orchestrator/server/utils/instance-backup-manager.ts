@@ -12,6 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
+import { isDeepStrictEqual } from 'node:util';
 import { createGzip } from "node:zlib";
 import type { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -56,6 +57,8 @@ import {
   beginInstanceSnapshot,
 } from "./instance-snapshot-gate";
 import { withOperationDeadline } from "./operation-deadline";
+import { withOwnerWorkerLifecycleMutation } from './worker-lifecycle-coordinator';
+import { managedVolumeRuntimeKind, assertIncusLiveResolved } from './managed-volume-store';
 
 const MAX_CONCURRENT_JOBS = 1;
 const MAX_LOG_LINES = 1000;
@@ -63,6 +66,14 @@ const REMOTE_HEADER_BYTES = 16 * 1024;
 const INSTANCE_DOCKER_READ_TIMEOUT_MS = 8_000;
 const INSTANCE_DOCKER_MUTATION_TIMEOUT_MS = 30_000;
 const INSTANCE_RESTORE_HELPER_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
+/** Until the controlled native inverse ships, reject even control-plane-only
+ * v2 restore before querying or mutating any Docker destination volumes. */
+function assertSupportedInstanceRestore(manifest: InstanceBackupManifest) {
+  if (manifest.formatVersion !== 1 || manifest.volumes.some(volume => volume.runtime !== undefined))
+    throw Object.assign(new Error('Native whole-instance restore is not yet available. Retain this verified backup; do not use a legacy Docker restore helper.'),
+      { statusCode: 409, code: 'INSTANCE_RESTORE_NATIVE_UNAVAILABLE' });
+}
 
 interface QueuedOperation {
   jobId: string;
@@ -75,6 +86,7 @@ interface VolumeCandidate {
   ownerId?: string;
   workerId?: string;
   groupId?: string;
+  runtime?: InstanceBackupVolumeManifest['runtime'];
 }
 
 export interface InstanceBackupManagerOptions {
@@ -90,6 +102,8 @@ export interface InstanceBackupManagerOptions {
     hostMounts: InstanceBackupManifest["hostMounts"];
     images: InstanceBackupManifest["images"];
     storage: InstanceBackupManifest["storage"];
+    /** Gate native control-plane records even if filesystem bytes are omitted. */
+    nativeRuntime?: boolean;
   }>;
 }
 
@@ -385,6 +399,7 @@ export class InstanceBackupManager {
       throw Object.assign(new Error("Verified instance backup artifact not found"), {
         statusCode: 404,
       });
+    assertSupportedInstanceRestore(artifact.manifest);
     const restoreOptions = normalizeRestoreOptions(options, false);
     const services = await import("./services");
     const adminStore = await import("./admin-workspace-store");
@@ -645,27 +660,35 @@ export class InstanceBackupManager {
           includeVolumeCandidate(candidate, options),
         );
         let index = 0;
+        const captured = new Set<string>();
         for (const candidate of selectedVolumes) {
           signal.throwIfAborted();
-          const output = join(stage, `volume-${index}.tar.gz`);
-          const snapshotted = await this.snapshotVolume(candidate.name, output, signal);
-          if (!snapshotted) continue;
-          const info = await stat(output);
-          volumes.push({
-            manifest: {
-              ...candidate,
-              archive: instanceVolumeArchiveName(candidate.name),
-              sha256: await sha256File(output),
-              size: info.size,
-            },
-            path: output,
-          });
-          index += 1;
+          if (captured.has(candidate.name)) continue;
+          const group = candidate.runtime && candidate.runtime.role !== 'docker' && candidate.runtime.role !== 'managed'
+            ? selectedVolumes.filter(other => other.workerId === candidate.workerId && other.ownerId === candidate.ownerId &&
+              other.runtime && (other.runtime.role === 'workspace' || other.runtime.role === 'agents')) : [candidate];
+          const outputs = group.map((volume, offset) => ({ volume, path: join(stage, `volume-${index + offset}.tar.gz`) }));
+          if (candidate.runtime) await this.snapshotNativeVolumes(outputs, signal);
+          else if (!await this.snapshotVolume(candidate.name, outputs[0]!.path, signal)) continue;
+          for (const { volume, path: output } of outputs) {
+            const info = await stat(output);
+            volumes.push({
+              manifest: {
+                ...volume,
+                archive: instanceVolumeArchiveName(volume.name),
+                sha256: await sha256File(output),
+                size: info.size,
+              },
+              path: output,
+            });
+            captured.add(volume.name);
+            index += 1;
+          }
           await this.phase(
             job,
             "volume-snapshot",
             25 + Math.floor((index / Math.max(1, selectedVolumes.length)) * 35),
-            `Snapshotted persistent Docker volume ${index} of ${selectedVolumes.length}.`,
+            `Snapshotted persistent volume ${index} of ${selectedVolumes.length}.`,
           );
         }
       }
@@ -673,9 +696,10 @@ export class InstanceBackupManager {
       releaseSnapshot = undefined;
       const createdAt = new Date().toISOString();
       const sourceInstallationId = await backupInstallationId(this.dataDir);
+      const formatVersion = inventory.nativeRuntime || inventory.volumes.some(volume => volume.runtime) ? 2 : 1;
       const manifest: InstanceBackupManifest = {
         kind: "agentor-instance-backup",
-        formatVersion: 1,
+        formatVersion,
         backupId: job.id,
         sourceInstallationId,
         createdByUserId: job.userId,
@@ -709,7 +733,7 @@ export class InstanceBackupManager {
           backupId: job.id,
           sourceInstallationId,
           createdAt,
-          formatVersion: 1,
+          formatVersion,
         },
         (bytes) => {
           job.bytesProcessed = bytes;
@@ -739,7 +763,7 @@ export class InstanceBackupManager {
           {
             artifactKind: "instance",
             artifactId: job.id,
-            formatVersion: 1,
+            formatVersion,
             keyFingerprint: recovery.fingerprint,
             integritySha256: encryptedResult.sha256,
             createdAt,
@@ -766,7 +790,7 @@ export class InstanceBackupManager {
         sha256: encryptedResult.sha256,
         keyFingerprint: recovery.fingerprint,
         sourceInstallationId,
-        formatVersion: 1,
+        formatVersion,
         integrityStatus: "verified",
         provenance: "local",
         manifest,
@@ -933,7 +957,8 @@ export class InstanceBackupManager {
       if (
         inspected.manifest.backupId !== header.metadata.backupId ||
         inspected.manifest.sourceInstallationId !==
-          header.metadata.sourceInstallationId
+          header.metadata.sourceInstallationId || inspected.manifest.formatVersion !== header.metadata.formatVersion ||
+        inspected.manifest.createdAt !== header.metadata.createdAt
       )
         throw new Error("Instance backup header does not match its authenticated manifest");
       const localPath = this.artifactPath(inspected.manifest.backupId);
@@ -972,7 +997,7 @@ export class InstanceBackupManager {
         sha256: digest,
         keyFingerprint: header.keyFingerprint,
         sourceInstallationId: inspected.manifest.sourceInstallationId,
-        formatVersion: 1,
+        formatVersion: inspected.manifest.formatVersion,
         integrityStatus: "verified",
         provenance: "remote-adopted",
         manifest: inspected.manifest,
@@ -1029,7 +1054,8 @@ export class InstanceBackupManager {
       const inspected = await inspectInstanceBundle(bundle, unpacked, signal);
       if (
         inspected.manifest.backupId !== header.metadata.backupId ||
-        inspected.manifest.sourceInstallationId !== header.metadata.sourceInstallationId
+        inspected.manifest.sourceInstallationId !== header.metadata.sourceInstallationId ||
+        inspected.manifest.formatVersion !== header.metadata.formatVersion || inspected.manifest.createdAt !== header.metadata.createdAt
       )
         throw new Error("Instance backup header does not match its authenticated manifest");
       const digest = await encryptedInstancePayloadSha256(encrypted, signal);
@@ -1067,7 +1093,7 @@ export class InstanceBackupManager {
         sha256: digest,
         keyFingerprint: header.keyFingerprint,
         sourceInstallationId: inspected.manifest.sourceInstallationId,
-        formatVersion: 1,
+        formatVersion: inspected.manifest.formatVersion,
         integrityStatus: "verified",
         provenance: "remote-adopted",
         manifest: inspected.manifest,
@@ -1122,9 +1148,14 @@ export class InstanceBackupManager {
       const inspected = await inspectInstanceBundle(bundle, unpacked, signal);
       if (
         inspected.manifest.backupId !== artifact.id ||
-        inspected.manifest.sourceInstallationId !== artifact.sourceInstallationId
+        inspected.manifest.sourceInstallationId !== artifact.sourceInstallationId ||
+        inspected.manifest.formatVersion !== artifact.formatVersion || inspected.manifest.createdAt !== artifact.createdAt ||
+        inspected.manifest.backupId !== header.metadata.backupId ||
+        inspected.manifest.sourceInstallationId !== header.metadata.sourceInstallationId ||
+        inspected.manifest.formatVersion !== header.metadata.formatVersion || inspected.manifest.createdAt !== header.metadata.createdAt
       )
         throw new Error("Retained instance artifact identity does not match its manifest");
+      assertSupportedInstanceRestore(inspected.manifest);
       const preflight = await this.restorePreflight(job.userId, artifact.id, options);
       if (!preflight.ready)
         throw Object.assign(new Error(preflight.blockers.join(" ")), {
@@ -1133,6 +1164,7 @@ export class InstanceBackupManager {
         });
       const plan = {
         version: 1,
+        formatVersion: inspected.manifest.formatVersion,
         jobId: job.id,
         dataArchive: inspected.dataArchivePath,
         volumes: options.restoreDockerVolumes
@@ -1293,10 +1325,31 @@ export class InstanceBackupManager {
     ]);
     const storage = services.useStorageManager();
     await storage.init();
+    const { useManagedVolumeManager } = await import('./managed-volume-manager');
+    const managedVolumes = useManagedVolumeManager(); await managedVolumes.init();
+    const workers = services.useWorkerStore().list();
+    const managedRecords = managedVolumes.store.list();
+    const nativeWorkers = new Set(workers.filter(worker => worker.runtimeKind === 'incus-vm').map(worker => worker.id));
+    const managedNames = new Set(managedRecords.map(volume => volume.dockerName));
+    const nativeNames = new Set([...nativeWorkers].flatMap(id =>
+      ['workspace', 'agents', 'docker'].map(role => `${useConfig().containerPrefix}-${id}-${role}`)));
     const candidates = new Map<string, VolumeCandidate>();
-    const add = (candidate: VolumeCandidate) => candidates.set(candidate.name, candidate);
-    for (const worker of services.useWorkerStore().list()) {
+    const add = (candidate: VolumeCandidate) => {
+      if (candidates.has(candidate.name)) throw new Error('Instance backup has conflicting logical volume authority');
+      candidates.set(candidate.name, candidate);
+    };
+    for (const worker of workers) {
       const containerName = `${useConfig().containerPrefix}-${worker.id}`;
+      if (worker.runtimeKind === 'incus-vm') {
+        const state = await withOwnerWorkerLifecycleMutation(worker.userId, worker.id, () =>
+          services.useContainerManager().inspectInstanceBackupStorageWithLifecycleFenceHeld(worker.id));
+        if (state.runtime.kind !== 'incus-vm') throw new Error('Native instance inventory returned another runtime');
+        for (const role of ['workspace', 'agents', ...(state.docker ? ['docker' as const] : [])] as const)
+          add({ name: `${containerName}-${role}`, ownerId: worker.userId, workerId: worker.id,
+            kind: role === 'workspace' ? 'worker-workspace' : role === 'agents' ? 'worker-agent-data' : 'worker-dind',
+            runtime: { kind: 'incus-vm', role, source: state.runtime.source } });
+        continue;
+      }
       if (storage.mode === "volume") {
         add({ name: `${containerName}-workspace`, kind: "worker-workspace", ownerId: worker.userId, workerId: worker.id });
         add({ name: `${containerName}-agents`, kind: "worker-agent-data", ownerId: worker.userId, workerId: worker.id });
@@ -1327,22 +1380,34 @@ export class InstanceBackupManager {
       "Docker persistent backup-volume inventory",
     );
     for (const volume of persistent.Volumes ?? [])
-      if (volume.Name)
+      if (volume.Name && !nativeNames.has(volume.Name) && !managedNames.has(volume.Name) &&
+          !nativeWorkers.has(volume.Labels?.['agentor.worker-id'] ?? ''))
         add({
           name: volume.Name,
           kind: "persistent-path",
           workerId: volume.Labels?.["agentor.worker-id"],
         });
     const volumes: VolumeCandidate[] = [];
-    const { useManagedVolumeManager } = await import("./managed-volume-manager");
-    const managedVolumes = useManagedVolumeManager();
-    await managedVolumes.init();
-    for (const volume of managedVolumes.store.list()) {
+    for (const volume of managedRecords) {
+      if (managedVolumeRuntimeKind(volume) === 'incus-vm') {
+        assertIncusLiveResolved(volume);
+        const found = await managedVolumes.incusRuntime.inspectVolume(volume);
+        if (!found && !volume.seeded && ['pending', 'detached'].includes(volume.state) && !volume.operation) continue;
+        if (!volume.seeded || volume.state !== (volume.attached ? 'ready' : 'detached') ||
+            volume.operation && volume.operation.stage !== 'complete')
+          throw new Error('Complete pending native managed storage before creating an instance backup');
+        if (!found)
+          throw new Error('Canonical native managed storage is missing; restore it before creating an instance backup');
+        add({ name: volume.dockerName, kind: 'persistent-path', ownerId: volume.userId, workerId: volume.workerId,
+          runtime: { kind: 'incus-vm', role: 'managed', managedVolumeId: volume.id, target: volume.target } });
+        continue;
+      }
+      if (nativeWorkers.has(volume.workerId)) throw new Error('Worker and managed storage runtime authority disagree');
       if (!await managedVolumes.runtime.inspectVolume(volume)) continue;
       add({ name: volume.dockerName, kind: "persistent-path", ownerId: volume.userId, workerId: volume.workerId });
     }
     for (const candidate of candidates.values())
-      if (await this.volumeExists(candidate.name)) volumes.push(candidate);
+      if (candidate.runtime || await this.volumeExists(candidate.name)) volumes.push(candidate);
     const definitions = services.usePluginDefinitionStore().list();
     const installations = services.usePluginInstallationStore().list();
     const catalog = imageModule.useImageCatalogManager();
@@ -1359,6 +1424,7 @@ export class InstanceBackupManager {
     ];
     return {
       volumes,
+      nativeRuntime: nativeWorkers.size > 0 || managedRecords.some(volume => managedVolumeRuntimeKind(volume) === 'incus-vm'),
       plugins: {
         platformDefinitionCount: definitions.filter((item) => item.userId === null).length,
         ownerDefinitionCount: definitions.filter((item) => item.userId !== null).length,
@@ -1381,6 +1447,7 @@ export class InstanceBackupManager {
   }
 
   private async defaultPreflight() {
+    await (await import('./incus-offline-archive-helper')).assertOfflineArchiveHelpersSettled(this.dataDir);
     const [services, adminStoreModule, imageModule] = await Promise.all([
       import("./services"),
       import("./admin-workspace-store"),
@@ -1427,6 +1494,53 @@ export class InstanceBackupManager {
           code: "INSTANCE_BACKUP_JOBS_ACTIVE",
         },
       );
+  }
+
+  private async snapshotNativeVolumes(outputs: Array<{ volume: VolumeCandidate; path: string }>, signal: AbortSignal) {
+    const first = outputs[0]?.volume;
+    if (!first?.runtime || !first.ownerId || !first.workerId) throw new Error('Native instance capture identity is missing');
+    const descriptor = first.runtime, ownerId = first.ownerId, workerId = first.workerId;
+    const services = await import('./services');
+    await withOwnerWorkerLifecycleMutation(ownerId, workerId, async () => {
+      signal.throwIfAborted();
+      const containers = services.useContainerManager();
+      if (descriptor.role === 'workspace' || descriptor.role === 'agents') {
+        const paths: { workspace?: string; agents?: string } = {};
+        for (const { volume, path } of outputs) {
+          if (!volume.runtime || volume.ownerId !== first.ownerId || volume.workerId !== first.workerId ||
+              volume.runtime.role !== 'workspace' && volume.runtime.role !== 'agents' ||
+              !isDeepStrictEqual(volume.runtime.source, descriptor.source) || paths[volume.runtime.role])
+            throw new Error('Native canonical instance capture roles disagree');
+          paths[volume.runtime.role] = path;
+        }
+        const result = await containers.captureInstanceCanonicalWithLifecycleFenceHeld(workerId, paths, signal);
+        if (result.runtime.kind !== 'incus-vm' || !isDeepStrictEqual(result.runtime.source, descriptor.source))
+          throw new Error('Native immutable source changed after instance inventory');
+        return;
+      }
+      if (outputs.length !== 1) throw new Error('Native instance raw capture must select exactly one role');
+      const output = outputs[0]!.path, raw = output + '.raw';
+      try {
+        if (descriptor.role === 'docker') {
+          const state = await containers.inspectInstanceBackupStorageWithLifecycleFenceHeld(workerId);
+          if (!state.docker || state.runtime.kind !== 'incus-vm' ||
+              !isDeepStrictEqual(state.runtime.source, descriptor.source))
+            throw new Error('Native Docker instance inventory changed');
+          await containers.captureInstanceDockerWithLifecycleFenceHeld(workerId, raw, signal);
+        } else {
+          const { useManagedVolumeManager } = await import('./managed-volume-manager');
+          const managed = useManagedVolumeManager(); await managed.init();
+          if (descriptor.role !== 'managed') throw new Error('Unknown native instance archive role');
+          const record = managed.store.get(ownerId, descriptor.managedVolumeId);
+          if (!record || record.dockerName !== first.name || record.workerId !== first.workerId || record.target !== descriptor.target)
+            throw new Error('Native managed instance inventory changed');
+          await managed.captureInstanceArchiveWithLifecycleFenceHeld(record, raw, signal);
+        }
+        // Preserve every raw/PAX byte and its metadata. The authenticated role
+        // codec validates this stream during bundle inspection; never repack.
+        await pipeline(createReadStream(raw), createGzip(), createWriteStream(output, { flags: 'wx', mode: 0o600 }), { signal });
+      } finally { await rm(raw, { force: true }); }
+    });
   }
 
   private async snapshotVolume(

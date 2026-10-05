@@ -141,6 +141,25 @@ test.describe("instance disaster-recovery encryption boundary", () => {
     );
   });
 
+  test("preserves native format2 metadata while retaining envelope algorithm version1", async () => {
+    const input = join(root, "native.tar"), encrypted = join(root, "native.backup"), output = join(root, "native-restored.tar");
+    const recoveryMaterial = Buffer.alloc(32, 61).toString("base64");
+    const nativeMetadata = { ...metadata, formatVersion: 2 as const };
+    await writeFile(input, Buffer.from([0, 255, 128, 10]));
+    const result = await encryptInstanceBackup(input, encrypted, recoveryMaterial, nativeMetadata);
+    expect(result.header).toMatchObject({ version: 1, algorithm: "aes-256-gcm", metadata: nativeMetadata });
+    expect(await inspectInstanceBackup(encrypted)).toEqual(result.header);
+    expect(inspectInstanceBackupPrefix(await readFile(encrypted))).toEqual(result.header);
+    expect(await decryptInstanceBackup(encrypted, output, recoveryMaterial, result.sha256)).toEqual(result.header);
+    expect(await readFile(output)).toEqual(await readFile(input));
+
+    const invalid = { ...result.header, metadata: { ...nativeMetadata, formatVersion: 3 } };
+    expect(() => inspectInstanceBackupPrefix(Buffer.concat([Buffer.from("AGENTOR-INSTANCE-BACKUP-1\n" + JSON.stringify(invalid) + "\n"), Buffer.alloc(12)])))
+      .toThrow(/invalid|unsupported/i);
+    await expect(encryptInstanceBackup(input, join(root, "unsupported.backup"), recoveryMaterial,
+      { ...nativeMetadata, formatVersion: 3 } as any)).rejects.toThrow(/invalid|unsupported/i);
+  });
+
   test("honours cancellation without retaining partial encrypted or decrypted payloads", async () => {
     const input = join(root, "plain.tar");
     const encrypted = join(root, "instance.backup");

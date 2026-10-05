@@ -97,6 +97,32 @@ test('running, stopped and archived managed capture preserves raw bytes using on
   });
 });
 
+test('settled detached and deleted-owner managed data captures without source attachment or record invention', async () => {
+  for (const state of ['stopped', 'archived'] as State[]) await fixture(state, async f => {
+    f.record.attached = false; f.record.state = 'detached';
+    if (state === 'archived') f.record.retainedAfterAccountDeletion = true;
+    f.volume.used_by = []; f.original.devices = {}; f.original.expanded_devices = {};
+    const before = structuredClone(f.volume), original = structuredClone(f.original);
+    expect(await f.capture()).toBe(f.binary.length);
+    expect(await readFile(f.archivePath)).toEqual(f.binary);
+    expect(f.volume).toEqual(before); expect(f.original).toEqual(original);
+    expect(f.control.cleanupValidated).toBe(true);
+  });
+});
+
+test('detached archive rejects residual compute devices, stale state and references before helper allocation', async () => {
+  for (const kind of ['device', 'expanded', 'reference', 'state', 'seeded']) await fixture('stopped', async f => {
+    f.record.attached = false; f.record.state = 'detached';
+    f.volume.used_by = []; f.original.devices = {}; f.original.expanded_devices = {};
+    if (kind === 'device') f.original.devices[f.key] = f.runtime.device(f.record);
+    if (kind === 'expanded') f.original.expanded_devices[f.key] = f.runtime.device(f.record);
+    if (kind === 'reference') f.volume.used_by.push(f.reference(f.original.name));
+    if (kind === 'state') f.record.state = 'ready';
+    if (kind === 'seeded') f.record.seeded = false;
+    await expect(f.capture()).rejects.toThrow(); expect(f.calls).toEqual([]);
+  });
+});
+
 test('managed source preflight rejects unsettled, foreign and ambiguous storage before helper creation', async () => {
   for (const kind of ['pending', 'unseeded', 'owner', 'project', 'volume-id', 'target', 'reference-origin',
     'reference-project', 'reference-extra-query', 'reference-duplicate', 'reference-missing', 'duplicate-device', 'expanded-device', 'uuid'])

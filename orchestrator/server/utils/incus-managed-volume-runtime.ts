@@ -115,7 +115,7 @@ export class IncusManagedVolumeRuntime {
     handle?: string; archivePath: string; maxBytes: number; signal?: AbortSignal },
     validateRecords: () => void | Promise<void>) {
     assertIncusLiveResolved(v); this.validateRecord(v);
-    if (!v.attached || !v.seeded || v.state !== 'ready' || v.operation && v.operation.stage !== 'complete' ||
+    if (!v.seeded || v.state !== (v.attached ? 'ready' : 'detached') || v.operation && v.operation.stage !== 'complete' ||
         !Number.isSafeInteger(options.maxBytes) || options.maxBytes < 0)
       throw volumeError(409, 'Managed archive source is not settled canonical storage.');
     const owner = this.owner(v), key = this.deviceKey(v);
@@ -138,7 +138,8 @@ export class IncusManagedVolumeRuntime {
     if (original) for (const devices of [original.devices, original.expanded_devices ?? original.devices]) {
       const sources = Object.entries(devices).filter(([, device]) => device.type === 'disk' &&
         device.pool === this.config.incusStoragePool && device.source === v.dockerName);
-      if (!this.matchesDevice(devices[key], v) || sources.length !== 1 || sources[0]?.[0] !== key)
+      if (v.attached ? !this.matchesDevice(devices[key], v) || sources.length !== 1 || sources[0]?.[0] !== key
+          : sources.length !== 0 || devices[key] !== undefined)
         throw volumeError(409, 'Managed capture source attachment is ambiguous.');
     }
     const references = (values: string[]) => values.map(ref => {
@@ -149,7 +150,7 @@ export class IncusManagedVolumeRuntime {
         throw volumeError(409, 'Managed archive reference is foreign.');
       return url.pathname;
     }).sort();
-    const baseline = original ? [`/1.0/instances/${owner.containerName}`] : [];
+    const baseline = original && v.attached ? [`/1.0/instances/${owner.containerName}`] : [];
     if (JSON.stringify(references(before.used_by)) !== JSON.stringify(baseline))
       throw volumeError(409, 'Managed archive source references are ambiguous.');
     const configuration = (config: Record<string, string>) => JSON.stringify(Object.entries(config).sort(([a], [b]) => a.localeCompare(b)));

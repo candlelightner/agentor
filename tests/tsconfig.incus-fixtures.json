@@ -1,0 +1,10 @@
+{
+  "extends": "../orchestrator/.nuxt/tsconfig.json",
+  "compilerOptions": { "noEmit": true, "rootDir": "..", "esModuleInterop": true },
+  "include": [
+    "../orchestrator/.nuxt/**/*.d.ts",
+    "../orchestrator/server/types/**/*.d.ts",
+    "api/instance-backup-native-live.spec.ts"
+  ],
+  "exclude": ["node_modules", "dist"]
+}

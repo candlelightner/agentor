@@ -1,4 +1,12 @@
 import type { BackupProviderKind, RemoteBackupDescriptor } from "./backup-types";
+import type { WorkerBackupRuntimeSource } from './worker-backup-runtime';
+
+export type InstanceBackupFormatVersion = 1 | 2;
+/** Describes logical bytes only; project, device and restore authority are
+ * selected and verified by the current administrator-controlled runtime. */
+export type InstanceBackupNativeVolumeRuntime =
+  | { kind: 'incus-vm'; role: 'workspace' | 'agents' | 'docker'; source: WorkerBackupRuntimeSource }
+  | { kind: 'incus-vm'; role: 'managed'; managedVolumeId: string; target: string };
 
 export type InstanceBackupJobStatus =
   | "queued"
@@ -59,6 +67,7 @@ export interface InstanceBackupVolumeManifest {
   archive: string;
   sha256: string;
   size: number;
+  runtime?: InstanceBackupNativeVolumeRuntime;
 }
 
 export interface InstanceBackupHostMountInventory {
@@ -77,7 +86,7 @@ export interface InstanceBackupImageInventory {
 
 export interface InstanceBackupManifest {
   kind: "agentor-instance-backup";
-  formatVersion: 1;
+  formatVersion: InstanceBackupFormatVersion;
   backupId: string;
   sourceInstallationId: string;
   /** Platform administrator who created the encrypted instance artifact. This
@@ -150,7 +159,7 @@ export interface InstanceBackupArtifact {
   sha256: string;
   keyFingerprint: string;
   sourceInstallationId: string;
-  formatVersion: 1;
+  formatVersion: InstanceBackupFormatVersion;
   integrityStatus: "verified" | "failed" | "unavailable";
   provenance: "local" | "remote-adopted";
   manifest?: InstanceBackupManifest;

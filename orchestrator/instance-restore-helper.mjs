@@ -322,6 +322,11 @@ async function loadContext() {
 function validatePlan(value, expected) {
   if (!value || value.version !== 1 || value.jobId !== expected.jobId)
     throw new SafeRestoreError("Invalid restore plan", "INSTANCE_RESTORE_INVALID_PLAN");
+  // Missing format preserves historical v1 plans. A native control-plane-only
+  // bundle must never pass through this Docker-only helper either.
+  if (value.formatVersion !== undefined && value.formatVersion !== 1 ||
+      Array.isArray(value.volumes) && value.volumes.some(entry => entry && entry.runtime !== undefined))
+    throw new SafeRestoreError("Native whole-instance restore requires the native controlled helper", "INSTANCE_RESTORE_NATIVE_UNAVAILABLE");
   if (typeof value.restoreHostMountPolicies !== "boolean")
     throw new SafeRestoreError("Invalid host-mount restore selection", "INSTANCE_RESTORE_INVALID_PLAN");
   if (typeof value.sourceInstallationId !== "string" || !value.sourceInstallationId || value.sourceInstallationId.length > 200)

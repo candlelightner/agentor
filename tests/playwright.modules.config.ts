@@ -15,7 +15,7 @@ if (!process.env.DATA_DIR) {
   if (process.env.INCUS_MANAGED_VOLUME_TEST !== 'true' && process.env.INCUS_MANAGED_BACKUP_TEST !== 'true' &&
       process.env.INCUS_MANAGED_IMPORT_TEST !== 'true' && process.env.INCUS_SELECTED_BACKUP_TEST !== 'true' &&
       process.env.INCUS_SELECTED_IMPORT_TEST !== 'true' && process.env.INCUS_DOCKER_ARCHIVE_PROOF_TEST !== 'true' &&
-      process.env.INCUS_DOCKER_IMPORT_TEST !== 'true')
+      process.env.INCUS_DOCKER_IMPORT_TEST !== 'true' && process.env.INCUS_INSTANCE_BACKUP_TEST !== 'true')
     process.once("exit", () => rmSync(fixtureData, { recursive: true, force: true }));
 }
 

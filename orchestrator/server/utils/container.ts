@@ -2052,6 +2052,61 @@ for p in sys.argv[1:]:
       incarnation, validate, { archivePath, maxBytes: MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES, signal });
   }
 
+  /** Whole-instance capture has no dependency on the current environment or
+   * account secrets. Its caller owns the existing owner/worker fence for the
+   * complete helper lifetime; never reenter that worker queue here. */
+  private async instanceBackupSourceWithLifecycleFenceHeld(id: string) {
+    const record = this.workerStore?.findById(id), info = this.get(id);
+    const archived = record?.status === 'archived' && !info;
+    if (!instanceSnapshotActive() || !record || record.runtimeKind !== 'incus-vm' || record.deletionPending || record.incusRecreation ||
+        !isWorkerLifecycleMutationPending(id) || !archived && (record.status !== 'active' || !info ||
+          info.runtimeKind !== 'incus-vm' || info.userId !== record.userId || info.status !== 'stopped'))
+      throw Object.assign(new Error('Instance backup requires settled stopped/archived native worker authority'), { statusCode: 409 });
+    const incarnation = archived ? undefined : this.capturedIncusIncarnation(info!);
+    const owner = { id, userId: record.userId, containerName: this.buildContainerName(id) };
+    const capturedRecord = structuredClone(record), capturedInfo = info && structuredClone(info);
+    const generation = workerLifecycleGeneration(id);
+    const { useManagedVolumeManager } = await import('./managed-volume-manager');
+    const managed = useManagedVolumeManager(); await managed.init();
+    managed.assertLiveRecoveryResolved(record.userId, id);
+    const capturedVolumes = structuredClone(managed.store.forWorker(record.userId, id));
+    const validate = () => {
+      if (!instanceSnapshotActive() || !isDeepStrictEqual(this.workerStore?.findById(id), capturedRecord) ||
+          !isDeepStrictEqual(this.get(id), capturedInfo) ||
+          !isDeepStrictEqual(managed.store.forWorker(record.userId, id), capturedVolumes) ||
+          workerLifecycleGeneration(id) !== generation || !isWorkerLifecycleMutationPending(id))
+        throw new Error('Instance backup native runtime/storage authority changed');
+      managed.assertLiveRecoveryResolved(record.userId, id);
+    };
+    validate();
+    // Host contents are external. Include durable targets even when grants
+    // have been revoked: read-only capture must not expose those contents.
+    const exclusions = [...(record.mounts ?? []).map(mount => mount.target),
+      ...(info?.mounts ?? []).map(mount => mount.target),
+      ...capturedVolumes.filter(volume => volume.attached).map(volume => volume.target)];
+    return { owner, incarnation, validate, exclusions };
+  }
+
+  async inspectInstanceBackupStorageWithLifecycleFenceHeld(id: string) {
+    const source = await this.instanceBackupSourceWithLifecycleFenceHeld(id);
+    const result = await this.incusRuntime.inspectOfflineBackupStorage(source.owner, source.incarnation);
+    source.validate(); return result;
+  }
+
+  async captureInstanceCanonicalWithLifecycleFenceHeld(id: string,
+    outputs: { workspace?: string; agents?: string }, signal?: AbortSignal) {
+    const source = await this.instanceBackupSourceWithLifecycleFenceHeld(id);
+    return this.incusRuntime.captureOfflineCanonical(source.owner, source.incarnation, source.validate,
+      { ...outputs, exclusions: source.exclusions, signal });
+  }
+
+  async captureInstanceDockerWithLifecycleFenceHeld(id: string, archivePath: string, signal?: AbortSignal) {
+    const source = await this.instanceBackupSourceWithLifecycleFenceHeld(id);
+    const { MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES } = await import('./portable-managed-volume-archive');
+    return this.incusRuntime.captureOfflineDocker(source.owner, source.incarnation, source.validate,
+      { archivePath, maxBytes: MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES, signal });
+  }
+
   /**
    * `POST /api/containers/:id/files/upload` — extract uploaded files into the
    *  destination directory `destRel` (relative to /workspace). `entries` are
