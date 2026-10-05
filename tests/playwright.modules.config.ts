@@ -12,7 +12,8 @@ if (!process.env.DATA_DIR) {
   // Managed-storage tests retain bounded recovery records on ambiguity. Never
   // erase their service store automatically when failed fixture cleanup leaves
   // Incus resources for operator diagnosis; successful tests clean exact state.
-  if (process.env.INCUS_MANAGED_VOLUME_TEST !== 'true' && process.env.INCUS_MANAGED_BACKUP_TEST !== 'true')
+  if (process.env.INCUS_MANAGED_VOLUME_TEST !== 'true' && process.env.INCUS_MANAGED_BACKUP_TEST !== 'true' &&
+      process.env.INCUS_MANAGED_IMPORT_TEST !== 'true')
     process.once("exit", () => rmSync(fixtureData, { recursive: true, force: true }));
 }
 

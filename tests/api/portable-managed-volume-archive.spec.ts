@@ -156,10 +156,11 @@ except OSError as error:
     console.info('GNU PAX fixture keys:', [...new Set(pax.map(record => record.key))].sort().join(', '));
     expect(pax.some(record => record.key === 'SCHILY.xattr.user.binary' && record.value.equals(Buffer.from([0, 255, 128, 10, 61, 0])))).toBe(true);
     await expect(validatePortableManagedVolumeArchive(archive)).resolves.toMatchObject({ entries: 4, expandedBytes: 4 });
+    await expect(validatePortableManagedVolumeArchive(archive, { requirePosixUstar: true })).resolves.toMatchObject({ entries: 4, expandedBytes: 4 });
     const payload = join(dir, 'payload.gz'), destination = join(dir, 'payload-extracted');
     const entry = { target: '/srv/data', name: 'metadata', archive: 'volumes/0.tar' };
     await writePortableManagedVolumePayload([{ entry, archivePath: archive }], payload);
-    const unpacked = await validateAndExtractPortableManagedVolumePayload(payload, [entry], destination);
+    const unpacked = await validateAndExtractPortableManagedVolumePayload(payload, [entry], destination, { requirePosixUstar: true });
     expect(await readFile(unpacked[0]!.archivePath)).toEqual(original);
     const restored = join(dir, 'restored'); await mkdir(restored);
     execFileSync('tar', ['--numeric-owner', '--same-owner', '--same-permissions', '--xattrs', '--xattrs-include=*', '--acls', '-C', restored, '-xf', unpacked[0]!.archivePath]);
@@ -179,6 +180,62 @@ assert os.readlink(b+'/relative-link')=='file.bin'
 `, volume, join(restored, 'volume')]);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test('native strict managed validation rejects V7/GNU prefix disagreement without changing legacy defaults', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'portable-volume-native-dialect-'));
+  try {
+    const entry = { target: '/srv/data', name: 'dialect', archive: 'volumes/0.tar' };
+    for (const dialect of ['v7', 'gnu']) {
+      const archive = join(dir, dialect + '.tar'), payload = join(dir, dialect + '.gz');
+      await writeTar(archive, [{ name: 'volume/', type: 'directory', mode: 0o750 }, { name: 'entrypoint.sh', body: 'outside volume' }]);
+      const raw = await readFile(archive), header = raw.subarray(512, 1024);
+      setDialect(header, dialect, 'volume'); await writeFile(archive, raw);
+      // Legacy parsing remains deliberately unchanged; native callers opt in
+      // before GNU extracts files into destination persistent storage.
+      await expect(validatePortableManagedVolumeArchive(archive)).resolves.toEqual({ entries: 2, expandedBytes: 14 });
+      if (dialect === 'v7') {
+        const fresh = join(dir, 'extractor-disagreement'); await mkdir(fresh);
+        execFileSync('tar', ['-C', fresh, '-xf', archive]);
+        expect(await readFile(join(fresh, 'entrypoint.sh'), 'utf8')).toBe('outside volume');
+        await expect(lstat(join(fresh, 'volume/entrypoint.sh'))).rejects.toMatchObject({ code: 'ENOENT' });
+      }
+      await expect(validatePortableManagedVolumeArchive(archive, { requirePosixUstar: true })).rejects.toThrow(/POSIX USTAR/);
+      await writePortableManagedVolumePayload([{ entry, archivePath: archive }], payload);
+      const legacy = await validateAndExtractPortableManagedVolumePayload(payload, [entry], join(dir, dialect + '-legacy'));
+      expect(await readFile(legacy[0]!.archivePath)).toEqual(raw);
+      const strictDestination = join(dir, dialect + '-strict');
+      await expect(validateAndExtractPortableManagedVolumePayload(payload, [entry], strictDestination, { requirePosixUstar: true })).rejects.toThrow(/POSIX USTAR/);
+      expect(await readdir(strictDestination)).toEqual([]);
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('native strict wrapper validation rejects disguised V7/GNU outer member prefixes before staging volumes', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'portable-volume-native-wrapper-'));
+  try {
+    const inner = join(dir, 'inner.tar'); await writeTar(inner, ordinaryItems());
+    const body = await readFile(inner), entry = { target: '/srv/data', name: 'wrapper', archive: 'volumes/0.tar' };
+    for (const dialect of ['v7', 'gnu']) {
+      const outer = join(dir, dialect + '.tar'), payload = join(dir, dialect + '.gz');
+      await writeTar(outer, [{ name: '0.tar', body }]);
+      const bytes = await readFile(outer); setDialect(bytes.subarray(0, 512), dialect, 'volumes'); await writeFile(outer, bytes);
+      await pipeline(createReadStream(outer), createGzip(), createWriteStream(payload));
+      const legacy = await validateAndExtractPortableManagedVolumePayload(payload, [entry], join(dir, dialect + '-legacy'));
+      expect(await readFile(legacy[0]!.archivePath)).toEqual(body);
+      const strictDestination = join(dir, dialect + '-strict');
+      await expect(validateAndExtractPortableManagedVolumePayload(payload, [entry], strictDestination, { requirePosixUstar: true })).rejects.toThrow(/POSIX USTAR/);
+      expect(await readdir(strictDestination)).toEqual([]);
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+function setDialect(header: Buffer, dialect: string, prefix: string) {
+  header.fill(0, 257, 265);
+  if (dialect === 'gnu') header.write('ustar  \0', 257, 8, 'ascii');
+  header.fill(0, 345, 500); header.write(prefix, 345, 155, 'ascii');
+  header.fill(32, 148, 156);
+  header.write([...header].reduce((a, b) => a + b, 0).toString(8).padStart(6, '0') + '\0 ', 148, 8, 'ascii');
+}
 
 test('bounded PAX metadata rejects control fields, malformed text, duplicate keys and unsafe ACL application', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'portable-volume-pax-security-'));

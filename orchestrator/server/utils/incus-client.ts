@@ -672,12 +672,23 @@ export class IncusClient {
       throw new IncusError('Incus instance changed since the caller device snapshot; no update was submitted');
     const config = { ...current.config };
     if (completeCanonicalRestore) {
+      const managedLayout = (devices: Record<string, IncusDevice>) => {
+        const extra = Object.entries(devices).filter(([key]) => !['root', 'workspace', 'agents'].includes(key));
+        return extra.length <= 32 && extra.every(([key, device]) => {
+          const id = /^agentor-persist-([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})$/.exec(device.source ?? '')?.[1];
+          return id && key === `m${id.replaceAll('-', '').slice(0, 6)}` && device.type === 'disk' &&
+            Object.keys(device).sort().join(',') === 'path,pool,source,type' && device.pool === devices.root?.pool &&
+            device.path === `/restore/managed/${id}/volume`;
+        });
+      };
       const fixedLayout = (instance: IncusInstance) => instance.type === 'virtual-machine' && instance.status === 'Stopped' &&
         Array.isArray(instance.profiles) && instance.profiles.length === 0 &&
-        Object.keys(instance.expanded_devices ?? instance.devices).length === 3 &&
-        ['root', 'workspace', 'agents'].every(key => (instance.expanded_devices ?? instance.devices)[key]?.type === 'disk') &&
-        instance.devices.root?.path === '/' && instance.devices.workspace?.path === '/restore/workspace' &&
-        instance.devices.agents?.path === '/restore/.agent-data' &&
+        isDeepStrictEqual(instance.devices, instance.expanded_devices ?? instance.devices) &&
+        [instance.devices, instance.expanded_devices ?? instance.devices].every(devices =>
+          Object.keys(devices).length >= 3 && managedLayout(devices) &&
+          ['root', 'workspace', 'agents'].every(key => devices[key]?.type === 'disk') &&
+          devices.root?.path === '/' && devices.workspace?.path === '/restore/workspace' &&
+          devices.agents?.path === '/restore/.agent-data') &&
         instance.config['user.agentor.restore'] === 'incomplete' &&
         instance.config['user.agentor.recreation'] === completeCanonicalRestore.nonce;
       const host = completeCanonicalRestore.hostMountMetadata;

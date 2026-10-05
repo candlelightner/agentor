@@ -60,6 +60,117 @@ async function fixture(run: (runtime: IncusManagedVolumeRuntime, v: any, calls: 
   finally { await rm(root, { recursive: true, force: true }); }
 }
 
+/** Fresh import tests require the extra project/creation/reference authority
+ * of that seam. Do not weaken it to match older adapter fixtures. */
+async function freshRestoreFixture(run: (runtime: IncusManagedVolumeRuntime, v: any, calls: string[], state: any) => Promise<void>) {
+  await fixture(async (runtime, v, calls, state) => {
+    state.ownedVolume = { ...state.ownedVolume, project: 'agentor', created_at: '2026-10-05T12:00:00Z' };
+    runtime.worker.client.getCustomVolume = async (_pool: string, name: string) => {
+      calls.push('lookup'); expect(name).toBe(v.dockerName);
+      if (state.lookupError) throw state.lookupError;
+      if (!state.volume || state.created && state.missingAfterCreate)
+        throw Object.assign(new Error('missing'), { statusCode: 404 });
+      return structuredClone(state.volume);
+    };
+    runtime.worker.client.createCustomVolume = async (pool: string, spec: any) => {
+      calls.push('create'); expect(pool).toBe('default'); state.spec = structuredClone(spec);
+      if (!state.createError || state.createBeforeError) {
+        state.volume = { ...state.ownedVolume, ...structuredClone(spec), ...state.createdChanges };
+        state.created = true;
+      }
+      if (state.createError) throw state.createError;
+      return {} as any;
+    };
+    runtime.worker.client.getInstance = async () => { calls.push('compute'); throw new Error('Fresh storage allocation must not touch compute'); };
+    await run(runtime, v, calls, state);
+  });
+}
+
+test('fresh restore allocates exactly one pending attached unseeded UUID volume with strict native authority', async () => {
+  await freshRestoreFixture(async (runtime, v, calls, state) => {
+    const before = structuredClone(v), found = await runtime.freshRestoreVolume(v);
+    expect(found).toEqual(state.volume); expect(v).toEqual(before);
+    expect(found).toMatchObject({ project: 'agentor', created_at: '2026-10-05T12:00:00Z', used_by: [] });
+    expect(state.spec).toEqual({ name: v.dockerName, content_type: 'filesystem', config: state.ownedVolume.config });
+    expect(calls).toEqual(['lookup', 'create', 'lookup']);
+  });
+});
+
+test('fresh restore refuses seeded/detached/nonpending/operation/live-intent records before native mutation', async () => {
+  const changes = [{ seeded: true }, { attached: false },
+    ...['ready', 'preparing', 'failed', 'detached'].map(state => ({ state })),
+    { operation: { stage: 'complete' } },
+    ...['not-submitted', 'unknown', 'accepted', 'settled'].map(attachment => ({ incusLive: {
+      id: randomUUID(), incarnation: randomUUID(), bootId: randomUUID(), attachment,
+    } })),
+    { liveContainerId: 'legacy-source' }, { previousRestartPolicy: 'unless-stopped' },
+    { storageRuntimeKind: 'legacy-docker' },
+  ];
+  for (const change of changes) await freshRestoreFixture(async (runtime, v, calls, state) => {
+    await expect(runtime.freshRestoreVolume({ ...v, ...change } as any)).rejects.toThrow();
+    expect(calls).toEqual([]); expect(state.volume).toBeUndefined();
+  });
+  for (const id of ['-'.repeat(36), 'a'.repeat(36), 'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA'])
+    await freshRestoreFixture(async (runtime, v, calls) => {
+      await expect(runtime.freshRestoreVolume({ ...v, id, dockerName: `agentor-persist-${id}` })).rejects.toThrow();
+      expect(calls).toEqual([]);
+    });
+});
+
+test('fresh restore refuses all preexisting owned or foreign native data instead of adopting it', async () => {
+  for (const foreign of [false, true]) await freshRestoreFixture(async (runtime, v, calls, state) => {
+    state.volume = structuredClone(state.ownedVolume);
+    if (foreign) state.volume.config['user.agentor.owner'] = 'another-owner';
+    const before = structuredClone(state.volume);
+    await expect(runtime.freshRestoreVolume(v)).rejects.toThrow(foreign ? /ownership/ : /fresh pending/);
+    expect(calls).toEqual(['lookup']); expect(state.volume).toEqual(before);
+  });
+});
+
+test('fresh restore create conflict or lost acknowledgement never retries or adopts read-back data', async () => {
+  for (const lostAcknowledgement of [false, true]) await freshRestoreFixture(async (runtime, v, calls, state) => {
+    state.createError = Object.assign(new Error(lostAcknowledgement ? 'lost creation acknowledgement' : 'native create conflict'),
+      { statusCode: lostAcknowledgement ? 503 : 409 });
+    state.createBeforeError = lostAcknowledgement;
+    await expect(runtime.freshRestoreVolume(v)).rejects.toBe(state.createError);
+    expect(calls).toEqual(['lookup', 'create']);
+    // Even an exact owned volume found after an unknown acknowledgement is
+    // not fresh authority for a subsequent call; it must not be adopted.
+    if (lostAcknowledgement) {
+      const before = structuredClone(state.volume);
+      await expect(runtime.freshRestoreVolume(v)).rejects.toThrow(/fresh pending/);
+      expect(calls).toEqual(['lookup', 'create', 'lookup']); expect(state.volume).toEqual(before);
+    }
+    expect(calls.filter(call => call === 'create')).toHaveLength(1);
+  });
+});
+
+test('fresh restore requires project, creation time and unused reference authority after acknowledged allocation', async () => {
+  const changes = [{ project: undefined }, { project: 'foreign' },
+    { created_at: undefined }, { created_at: '' }, { created_at: 'not-a-timestamp' },
+    { used_by: undefined }, { used_by: null },
+    { used_by: ['/1.0/instances/agentor-worker-worker?project=agentor'] },
+    { used_by: ['/1.0/instances/foreign?project=agentor'] },
+    { used_by: ['/1.0/instances/agentor-worker-worker?project=foreign'] },
+  ];
+  for (const createdChanges of changes) await freshRestoreFixture(async (runtime, v, calls, state) => {
+    state.createdChanges = createdChanges;
+    await expect(runtime.freshRestoreVolume(v)).rejects.toThrow();
+    expect(calls).toEqual(['lookup', 'create', 'lookup']);
+    expect(state.volume).toBeTruthy(); expect(v.seeded).toBe(false); expect(v.state).toBe('pending');
+  });
+  await freshRestoreFixture(async (runtime, v, calls, state) => {
+    state.missingAfterCreate = true;
+    await expect(runtime.freshRestoreVolume(v)).rejects.toThrow(/authority is unavailable/);
+    expect(calls).toEqual(['lookup', 'create', 'lookup']);
+  });
+  await freshRestoreFixture(async (runtime, v, calls, state) => {
+    state.lookupError = Object.assign(new Error('API unavailable'), { statusCode: 503 });
+    await expect(runtime.freshRestoreVolume(v)).rejects.toBe(state.lookupError);
+    expect(calls).toEqual(['lookup']); expect(state.volume).toBeUndefined();
+  });
+});
+
 async function liveFixture(run: (runtime: IncusManagedVolumeRuntime, v: any, calls: string[], state: any,
   persist: (next: any) => Promise<void>) => Promise<void>) {
   await fixture(async (runtime, v, calls, state) => {

@@ -27,6 +27,9 @@ export interface PortableManagedVolumeArchiveLimits {
   maxExpandedBytes?: number;
   /** Original, unchanged mount target. Required to retain confined absolute symlinks. */
   target?: string;
+  /** Native GNU extraction must agree with the scanner's prefix dialect.
+   * Leave absent for existing legacy archive compatibility. */
+  requirePosixUstar?: true;
   signal?: AbortSignal;
 }
 
@@ -60,6 +63,7 @@ export async function validatePortableManagedVolumeArchive(
     maxEntries: limits.maxEntries ?? MAX_PORTABLE_MANAGED_VOLUME_ARCHIVE_ENTRIES,
     maxExpandedBytes: limits.maxExpandedBytes ?? MAX_PORTABLE_MANAGED_VOLUME_EXPANDED_BYTES,
     allowPortablePax: true,
+    requirePosixUstar: limits.requirePosixUstar,
     signal: limits.signal,
   });
   validateInnerEntries(scan.entries, limits.target);
@@ -197,6 +201,8 @@ export async function validateAndExtractPortableManagedVolumePayload(
     signal?: AbortSignal;
     /** Optional stricter caller ceiling; never raises the production maximum. */
     maxCompressedBytes?: number;
+    /** Native restore: constrain both wrapper and every unchanged inner tar. */
+    requirePosixUstar?: true;
   } = {},
 ): Promise<Array<{ entry: PortableManagedVolumeEntry; archivePath: string }>> {
   const entries = parsePortableManagedVolumeEntries(entriesInput);
@@ -229,6 +235,7 @@ export async function validateAndExtractPortableManagedVolumePayload(
       maxEntries: entries.length,
       maxExpandedBytes: MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES,
       allowPortablePax: false,
+      requirePosixUstar: options.requirePosixUstar,
       signal: options.signal,
     });
     validateOuterEntries(scan.entries, entries);
@@ -251,6 +258,7 @@ export async function validateAndExtractPortableManagedVolumePayload(
       );
       await validatePortableManagedVolumeArchive(archivePath, {
         target: entry.target,
+        requirePosixUstar: options.requirePosixUstar,
         signal: options.signal,
       });
       extracted.push({ entry, archivePath });

@@ -14,7 +14,7 @@ import { withOwnerWorkerRuntimeSetup } from "./worker-lifecycle-coordinator";
 import type { WorkerConfigRevision } from './worker-config-store';
 import { incusImageIdentity, sameIncusImageSource, type IncusWorkerImageIdentity } from './incus-worker-image';
 import { IncusManagedVolumeRuntime } from './incus-managed-volume-runtime';
-import type { StoredManagedVolume } from './managed-volume-store';
+import { pathsOverlap, type StoredManagedVolume } from './managed-volume-store';
 import { incusManagedNetworkAuthority, incusManagedBridgeIdentity, incusManagedNetworkDevice,
   incusManagedNetworkRule } from './incus-managed-network-identity';
 import { ManagedNetworkStore } from './managed-network-store';
@@ -26,9 +26,10 @@ import { snapshotIncusWorkerBackupRuntime, parseWorkerBackupRuntime, type Worker
 import { IncusOfflineArchiveHelper } from './incus-offline-archive-helper';
 import { writeGzipFile } from './worker-export';
 import { INCUS_CANONICAL_RESTORE_SCRIPT } from './incus-canonical-restore';
-import { validateIncusCanonicalRestoreArchive } from './portable-managed-volume-archive';
+import { validateIncusCanonicalRestoreArchive, validatePortableManagedVolumeArchive } from './portable-managed-volume-archive';
 import { createReadStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
+import { isDeepStrictEqual } from 'node:util';
 
 export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & {
   sshAuthorizedKeys?: string;
@@ -588,6 +589,26 @@ export class IncusWorkerRuntime {
     return devices;
   }
 
+  private async managedRestoreDevices(opts: IncusWorkerOptions): Promise<Record<string, IncusDevice>> {
+    const runtime = new IncusManagedVolumeRuntime(this.config, this), devices: Record<string, IncusDevice> = {};
+    if ((opts.managedVolumes?.length ?? 0) > 32) throw new Error('Managed restore exceeds the worker volume limit');
+    const targets: string[] = [];
+    for (const v of opts.managedVolumes ?? []) {
+      if (v.userId !== opts.userId || v.workerId !== opts.id || !v.attached || v.incusLive || v.operation ||
+          !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(v.id) || pathsOverlap(v.target, '/restore') ||
+          !((v.state === 'pending' && !v.seeded) || (v.state === 'ready' && v.seeded)))
+        throw new Error('Managed restore requires current attached records for the exact worker');
+      const key = runtime.deviceKey(v);
+      if (devices[key]) throw new Error('Managed restore device keys collide');
+      if (Object.values(devices).some(d => d.source === v.dockerName)) throw new Error('Managed restore volume identity is duplicated');
+      if (targets.some(target => target === v.target || target.startsWith(v.target + '/') || v.target.startsWith(target + '/')))
+        throw new Error('Managed restore operational targets overlap');
+      targets.push(v.target);
+      devices[key] = { ...runtime.device(v), path: `/restore/managed/${v.id}/volume` };
+    }
+    return devices;
+  }
+
   private async assertReady(): Promise<void> {
     const c = this.config;
     if (!c.incusEndpoint?.startsWith("https://") || !c.incusClientCertPath ||
@@ -791,10 +812,13 @@ export class IncusWorkerRuntime {
     if (restore?.source && !sameIncusImageSource(restore.source, identity))
       throw new Error('Incus restore immutable image source changed before allocation');
     const account = restore ? {} : await this.accountDevices(opts);
+    const restoreManaged = restore ? await this.managedRestoreDevices(opts) : undefined;
     const hostMounts = restore ? undefined : await incusHostMountLayout(this.config, opts, 'ensure');
     const persistent = restore ? await storage.freshRestoreDevices(opts)
       : await storage.devices(opts, opts.environmentJson.dockerEnabled, existing && { docker: existing.docker });
     await storage.recordImageIdentity(opts, identity);
+    if (restore) for (const volume of opts.managedVolumes ?? [])
+      await new IncusManagedVolumeRuntime(this.config, this).freshRestoreVolume(volume);
     const instance = await this.client.createInstance({
       name: opts.containerName, type: "virtual-machine", profiles: [],
       source: { type: "image", fingerprint },
@@ -814,7 +838,7 @@ export class IncusWorkerRuntime {
       devices: {
         ...persistent,
         ...account,
-        ...(restore ? {} : await this.managedDevices(opts)),
+        ...(restoreManaged ?? await this.managedDevices(opts)),
         ...hostMounts?.devices,
         root: { type: "disk", path: "/", pool: this.config.incusStoragePool },
         ...(restore ? {} : { eth0: { type: "nic", name: "eth0", network: this.config.incusNetwork,
@@ -835,18 +859,24 @@ export class IncusWorkerRuntime {
    * existing worker/owner fence and initialCreate marker remain caller-owned. */
   async restoreCanonicalArchives(opts: IncusWorkerOptions, incarnation: string,
     payloads: { workspace?: string; agents?: string }, validateRecord: () => void | Promise<void>,
-    signal?: AbortSignal): Promise<void> {
+    signal?: AbortSignal, managedPayloads: Array<{ volume: StoredManagedVolume; archivePath: string }> = []): Promise<void> {
     if (!incarnation || !opts.recreationNonce) throw new Error('Incus restore requires exact initial creation authority');
     const storage = await this.storage();
+    const managedRuntime = new IncusManagedVolumeRuntime(this.config, this);
+    const managedDevices = await this.managedRestoreDevices(opts);
+    if (managedPayloads.length !== (opts.managedVolumes?.length ?? 0) ||
+        managedPayloads.some((item, index) => JSON.stringify(item.volume) !== JSON.stringify(opts.managedVolumes![index])))
+      throw new Error('Managed restore payloads do not match the planned storage records');
     const expected = {
       root: { type: 'disk', path: '/', pool: this.config.incusStoragePool },
       workspace: { type: 'disk', pool: this.config.incusStoragePool,
         source: opts.containerName + '-workspace', path: '/restore/workspace' },
       agents: { type: 'disk', pool: this.config.incusStoragePool,
         source: opts.containerName + '-agents', path: '/restore/.agent-data' },
+      ...managedDevices,
     };
     const sameMap = (actual: Record<string, IncusDevice>) =>
-      Object.keys(actual).length === 3 && Object.entries(expected).every(([key, value]) => sameDevice(actual[key], value));
+      Object.keys(actual).length === Object.keys(expected).length && Object.entries(expected).every(([key, value]) => sameDevice(actual[key], value));
     const inspect = async () => {
       signal?.throwIfAborted();
       await validateRecord();
@@ -862,10 +892,17 @@ export class IncusWorkerRuntime {
     };
     const before = await inspect();
     if (before.status !== 'Stopped') throw new Error('Incus canonical restore requires new stopped compute');
-    const volumes: Array<{ role: 'workspace' | 'agents'; volume: IncusCustomVolume }> = [];
-    for (const role of ['workspace', 'agents'] as const) {
-      const volume = await storage.inspectVolume(opts, role);
-      if (!volume || !volume.created_at || !Array.isArray(volume.used_by) || volume.used_by.length !== 1)
+    const volumes: Array<{ inspect: () => Promise<IncusCustomVolume | undefined>; volume: IncusCustomVolume }> = [];
+    const sources = [
+      ...(['workspace', 'agents'] as const).map(role => ({ inspect: () => storage.inspectVolume(opts, role),
+        validate: () => payloads[role] ? validateIncusCanonicalRestoreArchive(payloads[role]!, role, { signal }) : Promise.resolve() })),
+      ...managedPayloads.map(({ volume, archivePath }) => ({ inspect: () => managedRuntime.inspectVolume(volume),
+        validate: () => validatePortableManagedVolumeArchive(archivePath, { target: volume.target, signal, requirePosixUstar: true }) })),
+    ];
+    for (const source of sources) {
+      const volume = await source.inspect();
+      if (!volume || volume.project !== this.config.incusProject || !volume.created_at || !Number.isFinite(Date.parse(volume.created_at)) ||
+          !Array.isArray(volume.used_by) || volume.used_by.length !== 1)
         throw new Error('Incus restore canonical volume authority is unavailable');
       const reference = new URL(volume.used_by[0]!, this.client.endpoint);
       if (reference.origin !== new URL(this.client.endpoint).origin || reference.username || reference.password ||
@@ -873,8 +910,8 @@ export class IncusWorkerRuntime {
           reference.searchParams.getAll('project').length !== 1 || reference.searchParams.get('project') !== this.config.incusProject ||
           [...reference.searchParams.keys()].some(key => key !== 'project'))
         throw new Error('Incus restore storage reference is foreign');
-      volumes.push({ role, volume });
-      if (payloads[role]) await validateIncusCanonicalRestoreArchive(payloads[role]!, role, { signal });
+      volumes.push({ inspect: source.inspect, volume });
+      await source.validate();
     }
     let started = false;
     const stable = async () => {
@@ -885,8 +922,8 @@ export class IncusWorkerRuntime {
       const computeConfig = (value: Record<string, string>) => config(Object.fromEntries(Object.entries(value)
         .filter(([key]) => !key.startsWith('volatile.') || ['volatile.uuid', 'volatile.base_image'].includes(key))));
       if (computeConfig(instance.config) !== computeConfig(before.config)) throw new Error('Incus restore compute configuration changed');
-      for (const { role, volume } of volumes) {
-        const current = await storage.inspectVolume(opts, role);
+      for (const { inspect: inspectVolume, volume } of volumes) {
+        const current = await inspectVolume();
         if (!current || current.created_at !== volume.created_at || current.project !== volume.project ||
             config(current.config) !== config(volume.config) ||
             JSON.stringify(current.used_by) !== JSON.stringify(volume.used_by))
@@ -907,9 +944,13 @@ export class IncusWorkerRuntime {
         await new Promise(resolve => setTimeout(resolve, 500));
       }
       if (!ready) throw new Error('Incus canonical restore guest agent did not become ready');
-      for (const role of ['workspace', 'agents'] as const) {
+      const extracts = [
+        ...(['workspace', 'agents'] as const).map(role => ({ role, archivePath: payloads[role] })),
+        ...managedPayloads.map(item => ({ role: `managed:${item.volume.id}`, archivePath: item.archivePath })),
+      ];
+      for (const { role, archivePath } of extracts) {
         await stable();
-        if (!payloads[role]) {
+        if (!archivePath) {
           await this.checkedExec(opts.containerName, ['/usr/bin/python3', '-c', INCUS_CANONICAL_RESTORE_SCRIPT, role, 'empty']);
           await stable();
           continue;
@@ -922,7 +963,7 @@ export class IncusWorkerRuntime {
           });
         session.stdout.resume(); session.stderr.resume();
         try {
-          await Promise.all([pipeline(createReadStream(payloads[role]!), session.stdin, { signal }),
+          await Promise.all([pipeline(createReadStream(archivePath), session.stdin, { signal }),
             session.result.then(code => { if (code !== 0) throw new Error(`Incus canonical ${role} extraction failed (exit ${code})`); })]);
           await stable();
         } finally { session.close(); }
@@ -952,29 +993,70 @@ export class IncusWorkerRuntime {
     this.validateOptions(opts);
     await this.assertReady();
     const storage = await this.storage();
+    const restoreDevices = await this.managedRestoreDevices(opts);
+    if ((opts.managedVolumes ?? []).some(v => !v.seeded || v.state !== 'ready'))
+      throw new Error('Managed restore data must be committed before activation');
+    const expected = {
+      ...restoreDevices,
+      root: { type: 'disk', path: '/', pool: this.config.incusStoragePool },
+      workspace: { type: 'disk', path: '/restore/workspace', pool: this.config.incusStoragePool, source: opts.containerName + '-workspace' },
+      agents: { type: 'disk', path: '/restore/.agent-data', pool: this.config.incusStoragePool, source: opts.containerName + '-agents' },
+    };
+    const sameMap = (devices: Record<string, IncusDevice>) => Object.keys(devices).length === Object.keys(expected).length &&
+      Object.entries(expected).every(([key, value]) => sameDevice(devices[key], value));
+    const managedRuntime = new IncusManagedVolumeRuntime(this.config, this);
+    const volumeBaselines = new Map<string, IncusCustomVolume>();
+    await validateRecord();
+    for (const record of opts.managedVolumes ?? []) {
+      const volume = await managedRuntime.inspectVolume(record);
+      if (!volume || volume.project !== this.config.incusProject || !volume.created_at ||
+          !Number.isFinite(Date.parse(volume.created_at)) || volume.used_by.length !== 1)
+        throw new Error('Managed restore storage authority is incomplete');
+      const reference = new URL(volume.used_by[0]!, this.client.endpoint);
+      if (reference.origin !== new URL(this.client.endpoint).origin || reference.username || reference.password || reference.hash ||
+          reference.pathname !== `/1.0/instances/${opts.containerName}` ||
+          reference.searchParams.getAll('project').length !== 1 || reference.searchParams.get('project') !== this.config.incusProject ||
+          [...reference.searchParams.keys()].some(key => key !== 'project'))
+        throw new Error('Managed restore storage reference is foreign');
+      volumeBaselines.set(record.id, structuredClone(volume));
+    }
     const check = async () => {
       await validateRecord();
       const instance = await this.assertOwned(opts.containerName, opts.id, opts.userId, incarnation);
-      const devices = instance.expanded_devices ?? instance.devices;
       if (!opts.recreationNonce || instance.config['user.agentor.recreation'] !== opts.recreationNonce ||
           instance.config['user.agentor.restore'] !== 'incomplete' || instance.type !== 'virtual-machine' ||
-          instance.profiles?.length || Object.keys(devices).length !== 3 ||
-          !sameDevice(devices.root, { type: 'disk', path: '/', pool: this.config.incusStoragePool }) ||
-          !sameDevice(devices.workspace, { type: 'disk', path: '/restore/workspace', pool: this.config.incusStoragePool, source: opts.containerName + '-workspace' }) ||
-          !sameDevice(devices.agents, { type: 'disk', path: '/restore/.agent-data', pool: this.config.incusStoragePool, source: opts.containerName + '-agents' }) ||
-          Object.keys(instance.expanded_config ?? instance.config).some(key => key.startsWith('raw.')) ||
+          instance.profiles?.length || !sameMap(instance.devices) || !sameMap(instance.expanded_devices ?? instance.devices) ||
+          Object.keys(instance.config).some(key => key.startsWith('raw.')) ||
+          Object.keys(instance.expanded_config ?? {}).some(key => key.startsWith('raw.')) ||
           !await storage.preserveOwnership(opts))
         throw new Error('Incus canonical restore data or destination authority is incomplete');
+      for (const record of opts.managedVolumes ?? []) {
+        const baseline = volumeBaselines.get(record.id)!, current = await managedRuntime.inspectVolume(record);
+        if (!current || current.project !== baseline.project || current.created_at !== baseline.created_at ||
+            !isDeepStrictEqual(current.config, baseline.config) || !isDeepStrictEqual(current.used_by, baseline.used_by))
+          throw new Error('Managed restore storage authority changed before activation');
+      }
       await validateRecord();
       return instance;
     };
-    await check();
+    const isolated = await check();
+    if ((opts.managedVolumes?.length ?? 0) && isolated.status !== 'Running')
+      throw new Error('Managed restore target validation requires the isolated running destination');
+    for (const volume of opts.managedVolumes ?? []) {
+      await managedRuntime.validateTarget(opts.userId, opts.id, `incus:${incarnation}`, volume.target);
+      await check();
+    }
     await this.stop(opts, incarnation);
     const stopped = await check();
     if (stopped.status !== 'Stopped') throw new Error('Incus restore destination shutdown is unconfirmed');
     const persistent = await storage.devices(opts, opts.environmentJson.dockerEnabled, { docker: false });
     const account = await this.accountDevices(opts), managed = await this.managedDevices(opts);
     const host = await incusHostMountLayout(this.config, opts, 'ensure');
+    for (const volume of opts.managedVolumes ?? []) {
+      if (Object.values({ ...persistent, ...account, ...host.devices }).some(device =>
+        device.type === 'disk' && device.path && device.path !== '/' && pathsOverlap(device.path, volume.target)))
+        throw new Error('Managed restore operational target overlaps a current storage grant');
+    }
     const current = await check();
     await this.client.updateInstanceDevices(opts.containerName, {
       ...persistent, ...account, ...managed, ...host.devices,

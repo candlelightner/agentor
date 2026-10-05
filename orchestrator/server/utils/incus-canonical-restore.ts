@@ -62,10 +62,16 @@ export async function prepareIncusCanonicalRestorePayload(
 export const INCUS_CANONICAL_RESTORE_SCRIPT = String.raw`
 import os,re,stat,subprocess,sys
 ROOTS={"workspace":"/restore/workspace","agents":"/restore/.agent-data"}
-if len(sys.argv) not in (2,3) or sys.argv[1] not in ROOTS or len(sys.argv)==3 and sys.argv[2]!="empty":
+if len(sys.argv) not in (2,3):
     raise ValueError("Invalid canonical restore role")
-root=ROOTS[sys.argv[1]]
-for path in ("/restore",)+tuple(ROOTS.values()):
+role=sys.argv[1];managed=re.fullmatch(r"managed:([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})",role)
+if managed:
+    ROOTS[role]="/restore/managed/"+managed.group(1)+"/volume"
+if role not in ROOTS or len(sys.argv)==3 and (sys.argv[2]!="empty" or managed):
+    raise ValueError("Invalid canonical restore role")
+root=ROOTS[role]
+parents=("/restore/managed",os.path.dirname(root)) if managed else ()
+for path in ("/restore",)+parents+tuple(ROOTS.values()):
     if not stat.S_ISDIR(os.lstat(path).st_mode) or os.path.realpath(path)!=path:
         raise ValueError("Canonical restore path must be a non-symlink directory")
 if os.path.lexists("/run/agentor/provisioned") or os.path.lexists("/run/agentor/worker.env"):
@@ -102,6 +108,6 @@ if len(sys.argv)==3:
     sys.exit(0)
 command=["/usr/bin/tar","--numeric-owner","--same-owner","--same-permissions",
     "--xattrs","--xattrs-include=*","--acls","--delay-directory-restore",
-    "-xpf","-","-C","/restore"]
+    "-xpf","-","-C",os.path.dirname(root)]
 os.execve(command[0],command,{"PATH":"/usr/bin:/bin","LC_ALL":"C","LANG":"C"})
 `;

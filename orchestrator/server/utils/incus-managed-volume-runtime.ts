@@ -80,6 +80,26 @@ export class IncusManagedVolumeRuntime {
     return found;
   }
 
+  /** Initial import only: never reuse an existing owned or foreign volume.
+   * Its durable managed record and worker import fence must already exist. */
+  async freshRestoreVolume(v: StoredManagedVolume) {
+    assertIncusLiveResolved(v); this.validateRecord(v);
+    if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(v.id) ||
+        v.seeded || !v.attached || v.state !== 'pending' || v.operation || await this.inspectVolume(v))
+      throw volumeError(409, 'Managed restore requires fresh pending storage; existing data was retained.');
+    await this.worker.client.createCustomVolume(this.config.incusStoragePool, {
+      name: v.dockerName, content_type: 'filesystem', config: {
+        'user.agentor.installation': await this.installationId(), 'user.agentor.owner': v.userId,
+        'user.agentor.id': v.workerId, 'user.agentor.volume-id': v.id, 'user.agentor.target': v.target,
+      },
+    });
+    const found = await this.inspectVolume(v);
+    if (!found || found.project !== this.config.incusProject || !found.created_at ||
+        !Number.isFinite(Date.parse(found.created_at)) || found.used_by.length)
+      throw volumeError(409, 'Fresh managed restore storage authority is unavailable. Data was retained.');
+    return found;
+  }
+
   async inspect(userId: string, workerId: string, handle: string): Promise<IncusInstance> {
     const incarnation = handle.startsWith('incus:') ? handle.slice(6) : '';
     const instance = await this.worker.client.getInstance(`${this.config.containerPrefix}-${workerId}`);

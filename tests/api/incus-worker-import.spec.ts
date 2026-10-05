@@ -17,6 +17,10 @@ import { incusImageIdentity } from '../../orchestrator/server/utils/incus-worker
 import { snapshotIncusWorkerBackupRuntime } from '../../orchestrator/server/utils/worker-backup-runtime';
 import { WORKER_EXPORT_VERSION, BUNDLE_FILES, writeManifest, packBundle } from '../../orchestrator/server/utils/worker-export';
 import { migrateAuth, getAuthDb } from '../../orchestrator/server/utils/auth';
+import { useManagedVolumeManager } from '../../orchestrator/server/utils/managed-volume-manager';
+import { IncusManagedVolumeRuntime } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
+import { writePortableManagedVolumePayload } from '../../orchestrator/server/utils/portable-managed-volume-archive';
+import { useConfig, useWorkerStore, reassignWorkerMappings, cleanupWorkerMappings } from '../../orchestrator/server/utils/services';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, error() {}, warn() {}, debug() {} });
 (globalThis as any).useLogCollector ??= () => ({ attach: async () => {}, detach() {} });
@@ -83,11 +87,13 @@ async function fixture(run: (f: any) => Promise<void>) {
   try {
     await run({ manager, store, info, calls, runtime, assertIncomplete,
       fail: (at: string) => { failure = at; },
-      import: (override?: any, principal?: () => Promise<void>) => (manager as any).importNativeCanonicalWorker(
+      import: (override?: any, principal?: () => Promise<void>, managed?: any[]) => (manager as any).importNativeCanonicalWorker(
         info, { workspace: '/private/validated.tar' }, manifest, undefined, override,
-        principal ?? (async () => { checks++; })), checks: () => checks });
+        principal ?? (async () => { checks++; }), managed), checks: () => checks });
   } finally {
     configStore.markApplied = priorMarkApplied;
+    const volumes = useManagedVolumeManager(); await volumes.init();
+    for (const volume of volumes.store.forWorker(userId, id)) await volumes.store.forget(userId, volume.id);
     await rm(dataDir, { recursive: true, force: true });
   }
 }
@@ -100,6 +106,57 @@ test('native importer retains initial incomplete authority through health, confi
     expect(f.store.get(f.info.userId, f.info.id).incusRecreation).toBeUndefined();
     expect(f.calls).toEqual(['current-grants', 'create', 'extract', 'health', 'applied', 'mappings', 'networks']);
     expect(f.checks()).toBeGreaterThan(5);
+  });
+});
+
+test('native managed importer publishes scoped pending records before allocation and seeded authority only after ALL extraction proofs', async () => {
+  await fixture(async f => {
+    const volumes = useManagedVolumeManager(); await volumes.init();
+    const pending = () => volumes.store.forWorker(f.info.userId, f.info.id);
+    const create = f.runtime.createCanonicalRestore, extract = f.runtime.restoreCanonicalArchives, finish = f.runtime.finishCanonicalRestore;
+    f.runtime.createCanonicalRestore = async (opts: any, source: any) => {
+      expect(pending()).toHaveLength(2);
+      expect(opts.managedVolumes).toEqual(pending());
+      for (const record of pending()) expect(record).toMatchObject({ storageRuntimeKind: 'incus-vm', seeded: false, state: 'pending', attached: true });
+      return create(opts, source);
+    };
+    f.runtime.restoreCanonicalArchives = async (...args: any[]) => {
+      const [opts, , , validate, , payloads] = args;
+      expect(payloads.map((item: any) => item.volume)).toEqual(opts.managedVolumes);
+      expect(payloads.map((item: any) => item.archivePath)).toEqual(['/private/one.tar', '/private/two.tar']);
+      await validate(); for (const record of pending()) expect(record.seeded).toBe(false);
+      return extract(...args);
+    };
+    f.runtime.finishCanonicalRestore = async (...args: any[]) => {
+      expect(args[0].managedVolumes).toEqual(pending());
+      for (const record of pending()) expect(record).toMatchObject({ seeded: true, state: 'ready' });
+      return finish(...args);
+    };
+    await f.import(undefined, undefined, [
+      { entry: { target: '/srv/one', name: 'One', archive: 'volumes/0.tar' }, archivePath: '/private/one.tar' },
+      { entry: { target: '/srv/two', name: 'Two', archive: 'volumes/1.tar' }, archivePath: '/private/two.tar' },
+    ]);
+    expect(f.store.get(f.info.userId, f.info.id).incusRecreation).toBeUndefined();
+  });
+});
+
+test('managed extraction failure or durable record drift leaves non-authoritative data behind deletion quarantine', async () => {
+  for (const kind of ['extract', 'drift']) await fixture(async f => {
+    const volumes = useManagedVolumeManager(); await volumes.init();
+    if (kind === 'extract') f.fail('extract');
+    else {
+      const extract = f.runtime.restoreCanonicalArchives;
+      f.runtime.restoreCanonicalArchives = async (...args: any[]) => {
+        await extract(...args);
+        const record = volumes.store.forWorker(f.info.userId, f.info.id)[0]!;
+        await volumes.store.save({ ...record, name: 'Externally changed record' });
+      };
+    }
+    await expect(f.import(undefined, undefined, [{ entry: { target: '/srv/data', name: 'Data', archive: 'volumes/0.tar' },
+      archivePath: '/private/data.tar' }])).rejects.toThrow();
+    expect(volumes.store.forWorker(f.info.userId, f.info.id)[0]).toMatchObject({ seeded: false, state: 'pending' });
+    expect(f.store.get(f.info.userId, f.info.id)).toMatchObject({ status: 'archived', deletionPending: true });
+    expect(f.calls).not.toContain('health'); expect(f.calls).toContain('exact-rollback');
   });
 });
 
@@ -177,21 +234,32 @@ test('a forged built-in descriptor cannot select another owner custom environmen
 });
 
 test('real shared portable/native backup importer restores byte-faithful canonical data and healthy fresh VM without Docker', async () => {
-  test.skip(process.env.INCUS_WORKER_IMPORT_TEST !== 'true', 'Explicit serial disposable production importer gate');
-  test.setTimeout(900_000);
+  const managedImport = process.env.INCUS_MANAGED_IMPORT_TEST === 'true';
+  test.skip(process.env.INCUS_WORKER_IMPORT_TEST !== 'true' && !managedImport, 'Explicit serial disposable production importer gate');
+  test.setTimeout(1_200_000);
   await migrateAuth();
   const dataDir = await mkdtemp(join(tmpdir(), 'agentor-native-import-live-')), userId = randomUUID();
-  const config = { dataDir, containerPrefix: 'agentor-worker', incusEnabled: true, baseDomains: [],
+  // Real lifecycle/storage services share the same isolated DATA_DIR registry;
+  // a separate WorkerStore would be unknown to selection/rebuild admission.
+  const config = useConfig();
+  Object.assign(config, { containerPrefix: 'agentor-worker', incusEnabled: true, baseDomains: [],
     incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor', incusNetwork: 'incusbr0', incusStoragePool: 'default',
     incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase10-preserve-ownership',
     incusInternalGatewayUrl: 'http://10.159.68.1:38000',
     incusClientCertPath: '/workspace/agentor-incus-tls/client.crt', incusClientKeyPath: '/workspace/agentor-incus-tls/client.key',
-    incusServerCertPath: '/workspace/agentor-incus-tls/server.crt' } as Config;
-  const store = new WorkerStore(dataDir); await store.init();
+    incusServerCertPath: '/workspace/agentor-incus-tls/server.crt' });
+  const store = useWorkerStore(); await store.init();
   const runtime = new IncusWorkerRuntime(config), manager = new ContainerManager(new Proxy({}, {
     get: () => () => { throw new Error('Production native import called Docker'); },
   }) as any, config);
   manager.setWorkerStore(store); manager.setIncusRuntime(runtime);
+  const managed = useManagedVolumeManager(); await managed.init();
+  const priorManagedRuntime = (managed as any).incus;
+  (managed as any).incus = new IncusManagedVolumeRuntime(config, runtime);
+  const priorReassign = (globalThis as any).reassignWorkerMappings;
+  (globalThis as any).reassignWorkerMappings = reassignWorkerMappings;
+  const priorCleanup = (globalThis as any).cleanupWorkerMappings;
+  (globalThis as any).cleanupWorkerMappings = cleanupWorkerMappings;
   const now = new Date().toISOString(), db = getAuthDb();
   db.prepare('INSERT INTO user (id,name,email,emailVerified,role,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?)')
     .run(userId, 'Native import fixture', userId + '@fixture.invalid', 0, 'user', now, now);
@@ -203,7 +271,8 @@ test('real shared portable/native backup importer restores byte-faithful canonic
   manager.setEnvironmentStore({ getById: (id: string) => id === environment.id ? environment : undefined } as any);
   let cleaned = false;
   try {
-    console.info('Exact production native import fixture', { dataDir, userId, installation: await backupInstallationId(dataDir) });
+    console.info('Exact production native import fixture', { dataDir: config.dataDir, scratch: dataDir, userId,
+      installation: await backupInstallationId(config.dataDir) });
     const staging = join(dataDir, 'source'), workspace = join(staging, 'workspace'); await mkdir(workspace, { recursive: true });
     execFileSync('sudo', ['python3', '-c', String.raw`
 import os,sys
@@ -215,16 +284,49 @@ os.link(p+'/bytes',p+'/hard');os.symlink('/not-a-host-grant/data',p+'/inert')
 `, workspace]);
     const payload = join(dataDir, BUNDLE_FILES.workspace);
     execFileSync('sudo', ['tar', '--format=pax', '--numeric-owner', '--xattrs', '--acls', '-C', staging, '-czf', payload, 'workspace']);
+    const target = '/srv/imported-managed-data', managedPayload = join(dataDir, BUNDLE_FILES.managedVolumes);
+    const managedEntry = { target, name: 'Imported native data', archive: 'volumes/0.tar' };
+    const inspect = String.raw`
+import base64,json,os,stat,sys
+p=sys.argv[1];s=os.lstat(p+'/bytes')
+print(json.dumps(dict(bytes=base64.b64encode(open(p+'/bytes','rb').read()).decode(),uid=s.st_uid,gid=s.st_gid,
+ mode=stat.S_IMODE(s.st_mode),mtime=str(s.st_mtime_ns),hard=s.st_ino==os.stat(p+'/hard').st_ino,
+ attrs={key:base64.b64encode(os.getxattr(p+'/bytes',key)).decode() for key in ('user.binary','system.posix_acl_access','security.capability')},
+ defaultAcl=base64.b64encode(os.getxattr(p,'system.posix_acl_default')).decode(),inert=os.readlink(p+'/inert'))))
+`;
+    let expectedManaged: any;
+    if (managedImport) {
+      const managedStage = join(dataDir, 'managed-source'), root = join(managedStage, 'volume');
+      await mkdir(managedStage);
+      execFileSync('sudo', ['cp', '-a', workspace, root]);
+      execFileSync('sudo', ['python3', '-c', 'import os,sys;os.unlink(sys.argv[1]+"/inert");os.symlink(sys.argv[2]+"/bytes",sys.argv[1]+"/inert")', root, target]);
+      execFileSync('sudo', ['python3', '-c', String.raw`
+import os,struct,sys
+p=sys.argv[1]
+def acl(entries):
+ return struct.pack('<I',2)+b''.join(struct.pack('<HHI',tag,perm,ident) for tag,perm,ident in entries)
+os.setxattr(p+'/bytes','system.posix_acl_access',acl([(1,6,0xffffffff),(2,4,34567),(4,4,0xffffffff),(16,4,0xffffffff),(32,0,0xffffffff)]))
+os.setxattr(p,'system.posix_acl_default',acl([(1,7,0xffffffff),(2,5,34567),(4,5,0xffffffff),(16,5,0xffffffff),(32,0,0xffffffff)]))
+`, root]);
+      execFileSync('sudo', ['setcap', 'cap_net_bind_service=ep', join(root, 'bytes')]);
+      expectedManaged = JSON.parse(execFileSync('sudo', ['python3', '-c', inspect, root], { encoding: 'utf8' }));
+      const raw = join(dataDir, 'managed-raw.tar');
+      await writeFile(raw, execFileSync('sudo', ['tar', '--format=pax', '--numeric-owner', '--xattrs', '--xattrs-include=*',
+        '--acls', '-C', managedStage, '-cf', '-', 'volume']));
+      await writePortableManagedVolumePayload([{ entry: managedEntry, archivePath: raw }], managedPayload);
+    }
     const alias = await runtime.client.getImageAlias(config.incusWorkerImage);
     const descriptor = snapshotIncusWorkerBackupRuntime(incusImageIdentity(await runtime.client.getImage(alias.target)));
     const manifest = join(dataDir, 'manifest.json'), bundle = join(dataDir, 'bundle.tar');
     const write = async (runtimeMetadata: any) => {
-      await writeManifest({ version: WORKER_EXPORT_VERSION, exportedAt: now,
+      await writeManifest({ version: managedImport ? 6 : WORKER_EXPORT_VERSION, exportedAt: now,
         source: { id: 'descriptive-only', containerName: 'never-adopt', displayName: 'source', imageName: 'descriptive-only' },
         worker: { displayName: 'Native import', repos: [], mounts: [], initScript: '' },
-        environment, contents: { rootfs: false, workspace: true, agents: false },
+        environment, contents: { rootfs: false, workspace: true, agents: false, ...(managedImport ? { managedVolumes: true } : {}) },
+        ...(managedImport ? { managedVolumes: [managedEntry] } : {}),
         portMappings: [], domainMappings: [], missingSecrets: ['EXCLUDED_SECRET'], runtime: runtimeMetadata } as any, manifest);
-      await pipeline(packBundle([{ name: BUNDLE_FILES.manifest, path: manifest }, { name: BUNDLE_FILES.workspace, path: payload }]),
+      await pipeline(packBundle([{ name: BUNDLE_FILES.manifest, path: manifest }, { name: BUNDLE_FILES.workspace, path: payload },
+        ...(managedImport ? [{ name: BUNDLE_FILES.managedVolumes, path: managedPayload }] : [])]),
         createWriteStream(bundle, { mode: 0o600 }));
     };
     // Run serially; each exact completed fixture is removed before the next.
@@ -253,8 +355,35 @@ print(json.dumps(dict(bytes=base64.b64encode(open(p,'rb').read()).decode(),uid=s
       const services = await runtime.client.exec(imported.containerName, ['bash', '-ec',
         'test -f /run/agentor/preserve-storage-ownership; systemctl is-active --quiet agentor-worker; curl -fsS http://127.0.0.1:8443/healthz; curl -fsS http://127.0.0.1:6080/agentor.html >/dev/null; runuser -u agent -- touch /home/agent/.agent-data/import-writable']);
       expect(services.returnCode, services.stderr).toBe(0);
+      if (managedImport) {
+        const records = managed.store.forWorker(userId, imported.id);
+        expect(records).toHaveLength(1);
+        expect(records[0]).toMatchObject({ storageRuntimeKind: 'incus-vm', seeded: true, state: 'ready', attached: true, target });
+        const verifyManaged = async () => {
+          const result = await runtime.client.exec(imported.containerName, ['python3', '-c', inspect, target]);
+          expect(result.returnCode, result.stderr).toBe(0); expect(JSON.parse(result.stdout)).toEqual(expectedManaged);
+          const instance = await runtime.client.getInstance(imported.containerName);
+          const key = 'm' + records[0]!.id.replaceAll('-', '').slice(0, 6);
+          expect(instance.devices[key]).toEqual({ type: 'disk', pool: 'default', source: records[0]!.dockerName, path: target });
+          const current = managed.store.forWorker(userId, imported.id);
+          // markDeclared refreshes the audit timestamp on rebuild. Every
+          // storage identity/grant/seed/state field must remain unchanged.
+          const authority = (items: typeof records) => items.map(({ updatedAt, ...record }) => record);
+          expect(authority(current)).toEqual(authority(records));
+          expect(Date.parse(current[0]!.updatedAt)).toBeGreaterThanOrEqual(Date.parse(records[0]!.updatedAt));
+        };
+        await verifyManaged();
+        await manager.restart(imported.id); await verifyManaged();
+        const before = manager.get(imported.id)!.containerId;
+        await manager.rebuild(imported.id); Object.assign(imported, manager.get(imported.id));
+        expect(imported.containerId).not.toBe(before); await verifyManaged();
+        console.info('Managed metadata and authoritative record retained through production import, restart and fresh-root rebuild', { origin, id: imported.id });
+      }
       await runtime.remove(imported, imported.containerId.slice('incus:'.length));
       await runtime.removeStorage(imported);
+      for (const volume of managed.store.forWorker(userId, imported.id)) {
+        await managed.incusRuntime.delete(volume); await managed.store.forget(userId, volume.id);
+      }
       await useWorkerConfigStore().remove(userId, imported.id); await store.delete(userId, imported.id);
       manager.unregisterExternal(imported.id);
     }
@@ -269,12 +398,18 @@ print(json.dumps(dict(bytes=base64.b64encode(open(p,'rb').read()).decode(),uid=s
         else if (info?.containerId.startsWith('incus:')) await runtime.remove(owner, info.containerId.slice(6));
         else throw new Error('Fixture has no captured cleanup authority');
         await runtime.removeStorage(owner); await useWorkerConfigStore().remove(userId, record.id);
+        for (const volume of managed.store.forWorker(userId, record.id)) {
+          await managed.incusRuntime.delete(volume); await managed.store.forget(userId, volume.id);
+        }
         await store.delete(userId, record.id); manager.unregisterExternal(record.id);
       } catch (error) { console.error('Retain exact import fixture for diagnosis', { dataDir, record, error }); }
     }
     if (!store.listForUser(userId).length) {
       db.prepare('DELETE FROM user WHERE id=?').run(userId);
       await rm(dataDir, { recursive: true, force: true });
-    } else console.error('Retain synthetic import owner and registry', { dataDir, userId, cleaned });
+    } else console.error('Retain synthetic import owner and registry', { dataDir: config.dataDir, scratch: dataDir, userId, cleaned });
+    (managed as any).incus = priorManagedRuntime;
+    (globalThis as any).reassignWorkerMappings = priorReassign;
+    (globalThis as any).cleanupWorkerMappings = priorCleanup;
   }
 });

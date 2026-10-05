@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { isIP } from "node:net";
+import { isDeepStrictEqual } from 'node:util';
 import { nanoid } from "nanoid";
 import {
   uniqueNamesGenerator,
@@ -52,6 +53,8 @@ import { recordWorkspaceTombstone } from "./workspace-tombstones";
 import type { WorkerExportManifest } from "./worker-export";
 import type { PreparedPortableManagedVolumeImport } from "./portable-managed-volume-runtime";
 import type { PortableManagedVolumeImportJournal } from "./portable-managed-volume-journal";
+import type { PortableManagedVolumeEntry } from './portable-managed-volume-format';
+import { pathsOverlap, type ManagedVolumeStore, type StoredManagedVolume } from './managed-volume-store';
 import {
   readPortablePluginConfiguration,
   rollbackRestoredWorkerPlugins,
@@ -5017,8 +5020,8 @@ for p in sys.argv[1:]:
         ignoreCapturedRootfs: opts.imageResolution?.mode === 'replacement' ? 'replacement-image'
           : opts.imageResolution?.mode === 'workspace-only' ? 'workspace-only' : undefined,
       });
-      if (runtimeKind === 'incus-vm' && (managedVolumesPath || backupPathsPath))
-        throw Object.assign(new Error('Native managed-volume and selected-path restore integration is pending; no data will be silently omitted'),
+      if (runtimeKind === 'incus-vm' && backupPathsPath)
+        throw Object.assign(new Error('Native selected-path restore integration is pending; no data will be silently omitted'),
           { statusCode: 409, code: 'INCUS_RESTORE_CAPABILITY_PENDING' });
 
       // Native GNU/PAX bytes are validated without tar-stream repacking: binary
@@ -5062,6 +5065,7 @@ for p in sys.argv[1:]:
           id,
           manifest.worker?.mounts,
         )) ?? [];
+      let nativeManagedPayloads: Array<{ entry: PortableManagedVolumeEntry; archivePath: string }> = [];
       if (managedVolumesPath && manifest.managedVolumes) {
         const [{ validateAndExtractPortableManagedVolumePayload }, {
           planPortableManagedVolumeImport,
@@ -5076,16 +5080,18 @@ for p in sys.argv[1:]:
         // importing an image, creating an environment, or journaling resources.
         const managedVolumePreflightDir = join(workDir, "managed-volumes-preflight");
         try {
-          await validateAndExtractPortableManagedVolumePayload(
+          const extracted = await validateAndExtractPortableManagedVolumePayload(
             managedVolumesPath,
             manifest.managedVolumes,
             managedVolumePreflightDir,
+            runtimeKind === 'incus-vm' ? { requirePosixUstar: true } : {},
           );
+          if (runtimeKind === 'incus-vm') nativeManagedPayloads = extracted;
         } finally {
-          // Preflight bytes are not restore input. Drop them before image or
-          // environment mutation so the later journalled extraction cannot
-          // double the managed-volume staging footprint.
-          await rm(managedVolumePreflightDir, { recursive: true, force: true }).catch(() => {});
+          // Legacy journals perform their own extraction. Native restore uses
+          // these unchanged strict bytes directly; never stage a second copy.
+          if (runtimeKind !== 'incus-vm')
+            await rm(managedVolumePreflightDir, { recursive: true, force: true }).catch(() => {});
         }
         planPortableManagedVolumeImport({
           operationId: randomUUID(),
@@ -5098,6 +5104,8 @@ for p in sys.argv[1:]:
             selectedBackupPaths: manifest.backupPaths?.map(({ path }) => path),
           }),
         });
+        if (runtimeKind === 'incus-vm' && manifest.managedVolumes.some(entry => pathsOverlap(entry.target, '/restore')))
+          throw new Error('Managed restore targets overlap the isolated restore layout');
       }
 
       const reconstructionResolution = await resolveWorkerReconstruction(userId, reconstruction);
@@ -5173,7 +5181,7 @@ for p in sys.argv[1:]:
           imageId: '', status: 'creating', desiredRuntimeStatus: 'stopped', environmentId,
           repos: repos.length ? repos : undefined, mounts: mounts.length ? mounts : undefined,
           initScript: initScript || undefined, workerSelfApiAccess, pendingRebuild: false, ...resolvedImage,
-        }, canonicalPayloads, manifest, pluginConfiguration, opts.imageResolution, assertRuntimePrincipal);
+        }, canonicalPayloads, manifest, pluginConfiguration, opts.imageResolution, assertRuntimePrincipal, nativeManagedPayloads);
       }
 
       // Import the captured rootfs into a per-worker image. This is the exact
@@ -5592,6 +5600,7 @@ for p in sys.argv[1:]:
     plugins: Awaited<ReturnType<typeof readPortablePluginConfiguration>> | undefined,
     imageResolution: WorkerImportOptions['imageResolution'],
     assertPrincipal: () => Promise<void>,
+    managedPayloads: Array<{ entry: PortableManagedVolumeEntry; archivePath: string }> = [],
   ): Promise<ContainerInfo & { missingSecrets?: string[] }> {
     if (!this.workerStore) throw new Error('WorkerStore is required for native worker import');
     const { id, userId, containerName } = info;
@@ -5600,6 +5609,8 @@ for p in sys.argv[1:]:
     };
     const proof = { attempted: false, nonce: marker.nonce, incarnation: undefined as string | undefined };
     let restoredPlugins: Awaited<ReturnType<typeof restoreWorkerPlugins>> | undefined;
+    let managedStore: ManagedVolumeStore | undefined;
+    let managedRecords: StoredManagedVolume[] = [];
     this.containers.set(id, info);
     const validate = async () => {
       await assertPrincipal();
@@ -5610,6 +5621,10 @@ for p in sys.argv[1:]:
           recovery.originalIncarnation !== undefined || recovery.replacementIncarnation !== proof.incarnation ||
           this.containers.get(id) !== info)
         throw new Error('Native import identity or initial recovery authority changed');
+      if (managedStore && !isDeepStrictEqual(
+        managedStore.forWorker(userId, id).sort((a, b) => a.id.localeCompare(b.id)),
+        [...managedRecords].sort((a, b) => a.id.localeCompare(b.id))))
+        throw new Error('Native import managed storage records changed; all destination data was retained');
     };
     try {
       // This durable marker predates image resolution/storage allocation/native
@@ -5621,6 +5636,20 @@ for p in sys.argv[1:]:
         ...await this.incusOptionsForWorker(info, false), start: false, recreationNonce: marker.nonce,
       };
       await validate();
+      if (managedPayloads.length) {
+        // Resolve normal options before publishing pending records: ordinary
+        // mounts reject unseeded data, rather than silently seeding an import.
+        const volumes = (await import('./managed-volume-manager')).useManagedVolumeManager();
+        await volumes.init(); managedStore = volumes.store;
+        await validate();
+        for (const { entry } of managedPayloads) {
+          await validate();
+          const record = await managedStore.create(userId, id, entry.target, entry.name, 'incus-vm');
+          managedRecords.push(structuredClone(managedStore.get(userId, record.id)!));
+          await validate();
+        }
+        options.managedVolumes = structuredClone(managedRecords);
+      }
       proof.attempted = true;
       const instance = await this.incusRuntime.createCanonicalRestore(options,
         !imageResolution && manifest.runtime?.kind === 'incus-vm' ? manifest.runtime.source : undefined);
@@ -5638,7 +5667,19 @@ for p in sys.argv[1:]:
         { status: 'active', desiredRuntimeStatus: 'stopped', incusRecreation: marker }, undefined,
         { nonce: marker.nonce, initialCreate: true, importIncomplete: true });
       await validate();
-      await this.incusRuntime.restoreCanonicalArchives(options, incarnation, payloads, validate);
+      await this.incusRuntime.restoreCanonicalArchives(options, incarnation, payloads, validate, undefined,
+        managedPayloads.map((item, index) => ({ volume: options.managedVolumes![index]!, archivePath: item.archivePath })));
+      await validate();
+      // Publish only after ALL byte streams and final native proofs succeeded.
+      // Partial publication remains behind the worker's durable import fence.
+      for (let index = 0; index < managedRecords.length; index++) {
+        await validate();
+        const record = managedRecords[index]!;
+        await managedStore!.save({ ...record, seeded: true, state: 'ready' });
+        managedRecords[index] = structuredClone(managedStore!.get(userId, record.id)!);
+        await validate();
+      }
+      if (managedRecords.length) options.managedVolumes = structuredClone(managedRecords);
       await this.incusRuntime.finishCanonicalRestore(options, incarnation, validate);
       await validate();
       await useWorkerConfigStore().markApplied(userId, id, this.appliedIncusBootstrap(options, info), options.configurationRevision);

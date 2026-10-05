@@ -585,18 +585,37 @@ test.describe("IncusClient mock server protocol tests", () => {
     await client.updateInstanceDevices('worker', devices, undefined, original, { nonce: 'nonce', hostMountMetadata: '[]' });
     expect(written.config).toEqual({ ...original.config, 'user.agentor.restore': undefined, 'user.agentor.host-mounts': '[]' });
     expect(Object.hasOwn(written.config, 'user.agentor.restore')).toBe(false);
-    for (const mutation of ['running', 'nonce', 'marker', 'profile', 'foreign-device', 'missing-expected', 'invalid-host']) {
+    const managedId = '01234567-1111-2222-3333-444444444444';
+    const managed = { type: 'disk', pool: 'pool', source: 'agentor-persist-' + managedId,
+      path: '/restore/managed/' + managedId + '/volume' };
+    current = structuredClone(original); current.devices.m012345 = managed;
+    await client.updateInstanceDevices('worker', devices, undefined, structuredClone(current), { nonce: 'nonce' });
+    for (const mutation of ['running', 'nonce', 'marker', 'profile', 'foreign-device', 'missing-expected', 'invalid-host',
+      'managed-path', 'managed-key', 'managed-source', 'managed-option', 'managed-expanded-hidden', 'managed-local-hidden']) {
       current = structuredClone(original);
       if (mutation === 'running') current.status = 'Running';
       if (mutation === 'nonce') current.config['user.agentor.recreation'] = 'other';
       if (mutation === 'marker') delete current.config['user.agentor.restore'];
       if (mutation === 'profile') current.profiles = ['host'];
       if (mutation === 'foreign-device') current.devices.foreign = { type: 'nic', network: 'external' };
+      if (mutation.startsWith('managed-')) {
+        current.devices.m012345 = structuredClone(managed);
+        if (mutation === 'managed-path') current.devices.m012345.path = '/srv/data';
+        if (mutation === 'managed-key') { current.devices.wrong = current.devices.m012345; delete current.devices.m012345; }
+        if (mutation === 'managed-source') current.devices.m012345.source = '/host';
+        if (mutation === 'managed-option') current.devices.m012345.readonly = 'true';
+        if (mutation === 'managed-expanded-hidden') {
+          current.expanded_devices = { ...current.devices,
+            mabcdef: { ...managed, source: 'agentor-persist-abcdefab-1111-2222-3333-444444444444',
+              path: '/restore/managed/abcdefab-1111-2222-3333-444444444444/volume' } };
+        }
+        if (mutation === 'managed-local-hidden') { current.expanded_devices = { ...current.devices }; delete current.expanded_devices.m012345; }
+      }
       const expected = mutation === 'missing-expected' ? undefined : structuredClone(current);
       await expect(client.updateInstanceDevices('worker', devices, undefined, expected,
         { nonce: 'nonce', hostMountMetadata: mutation === 'invalid-host' ? '{"not":"array"}' : undefined })).rejects.toThrow();
     }
-    expect(puts).toBe(1);
+    expect(puts).toBe(2);
   });
 
   test('device PUT uses native mutation fences and matching caller snapshot/ETag without blocking exec', async () => {

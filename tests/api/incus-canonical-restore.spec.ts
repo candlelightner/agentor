@@ -10,6 +10,8 @@ import { zeroUserEnvVars } from '../../orchestrator/server/utils/user-env-store'
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import type { Config } from '../../orchestrator/server/utils/config';
 import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
+import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volume-store';
+import { INCUS_PERSISTENCE_TARGET_CHECK } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 
@@ -93,6 +95,95 @@ async function rawArchive(dir: string, role: 'workspace' | 'agents') {
   execFileSync('tar', ['--format=pax', '--numeric-owner', '--xattrs', '--acls', '-C', stage, '-cf', path, base]);
   return path;
 }
+
+async function managedPayload(f: Awaited<ReturnType<typeof fixture>>, target = '/srv/restored-data') {
+  const store = new ManagedVolumeStore(f.dataDir); await store.init();
+  const volume = await store.create(f.opts.userId, f.opts.id, target, 'Restored data', 'incus-vm');
+  f.opts.managedVolumes = [volume];
+  const stage = join(f.dataDir, 'managed-stage'); await mkdir(join(stage, 'volume'), { recursive: true });
+  await writeFile(join(stage, 'volume', 'bytes'), Buffer.from([0, 255, 128]));
+  const archivePath = join(f.dataDir, 'managed.tar');
+  execFileSync('tar', ['--format=pax', '--numeric-owner', '--xattrs', '--acls', '-C', stage, '-cf', archivePath, 'volume']);
+  return { volume, archivePath };
+}
+
+test('managed inverse uses fresh ordinary volumes at fixed UUID paths and streams unchanged payload after canonical roots', async () => {
+  const f = await fixture(); try {
+    const managed = await managedPayload(f), created = await f.runtime.createCanonicalRestore(f.opts);
+    const key = 'm' + managed.volume.id.replaceAll('-', '').slice(0, 6);
+    expect(created.devices[key]).toEqual({ type: 'disk', pool: 'default', source: managed.volume.dockerName,
+      path: `/restore/managed/${managed.volume.id}/volume` });
+    expect(Object.keys(created.devices).sort()).toEqual(['agents', key, 'root', 'workspace'].sort());
+    expect(f.events).toEqual(['volume-create', 'volume-create', 'volume-create', 'create']);
+    await f.runtime.restoreCanonicalArchives(f.opts, created.config['volatile.uuid']!, {}, () => {}, undefined, [managed]);
+    expect(f.events.filter(x => x === 'extract')).toHaveLength(1);
+    expect(managed.volume.seeded).toBe(false);
+    await expect(f.runtime.finishCanonicalRestore(f.opts, created.config['volatile.uuid']!, () => {}))
+      .rejects.toThrow('committed');
+    expect(f.events).not.toContain('promote');
+  } finally { await f.cleanup(); }
+});
+
+test('managed inverse rejects duplicate short keys and restore-path overlap before any storage allocation', async () => {
+  for (const kind of ['collision', 'restore-target']) {
+    const f = await fixture(); try {
+      const { volume } = await managedPayload(f);
+      if (kind === 'collision') {
+        const id = volume.id.slice(0, 8) + '-1111-2222-3333-444444444444';
+        f.opts.managedVolumes!.push({ ...volume, id, dockerName: 'agentor-persist-' + id, target: '/srv/other-data' });
+      } else f.opts.managedVolumes![0] = { ...volume, target: '/restore/subtree' };
+      await expect(f.runtime.createCanonicalRestore(f.opts)).rejects.toThrow();
+      expect(f.events).toEqual([]);
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('managed extraction rejects hidden local layout drift, mismatched payload plans and foreign native storage references before boot', async () => {
+  for (const kind of ['local-device', 'payload', 'reference']) {
+    const f = await fixture(); try {
+      const managed = await managedPayload(f), created = await f.runtime.createCanonicalRestore(f.opts);
+      if (kind === 'local-device') f.current().devices = { ...f.current().devices, hidden: { type: 'nic', network: 'foreign' } };
+      if (kind === 'reference') f.volumes.get(managed.volume.dockerName).used_by = [
+        `/1.0/instances/${f.opts.containerName}?project=agentor&project=agentor`];
+      await expect(f.runtime.restoreCanonicalArchives(f.opts, created.config['volatile.uuid']!, {}, () => {}, undefined,
+        kind === 'payload' ? [{ ...managed, volume: { ...managed.volume, target: '/srv/different' } }] : [managed])).rejects.toThrow();
+      expect(f.events).not.toContain('start'); expect(f.events).not.toContain('extract');
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('managed promotion probes actual operational target ancestors before grants and fences both layouts and native data authority', async () => {
+  for (const kind of ['success', 'symlink', 'local-device', 'volume-drift']) {
+    const f = await fixture(); try {
+      const managed = await managedPayload(f), created = await f.runtime.createCanonicalRestore(f.opts);
+      await f.runtime.restoreCanonicalArchives(f.opts, created.config['volatile.uuid']!, {}, () => {}, undefined, [managed]);
+      f.opts.managedVolumes = [{ ...managed.volume, seeded: true, state: 'ready' }];
+      (f.runtime as any).accountDevices = async () => { f.events.push('grants'); return {}; };
+      (f.runtime as any).managedDevices = (IncusWorkerRuntime.prototype as any).managedDevices.bind(f.runtime);
+      (f.runtime as any).start = async () => { f.events.push('activated'); };
+      const exec = f.client.exec;
+      f.client.exec = async (...args: any[]) => {
+        if (args[1].includes(INCUS_PERSISTENCE_TARGET_CHECK)) {
+          f.events.push('target-probe'); expect(args[1].at(-2)).toBe('/srv/restored-data');
+          if (kind === 'symlink') return { returnCode: 1, stdout: '', stderr: 'target is symlink' };
+          if (kind === 'volume-drift') f.volumes.get(managed.volume.dockerName).config['user.foreign'] = 'changed';
+        }
+        return exec(...args);
+      };
+      if (kind === 'local-device') f.current().devices = { ...f.current().devices, hidden: { type: 'disk', path: '/foreign', source: '/host' } };
+      const finished = f.runtime.finishCanonicalRestore(f.opts, created.config['volatile.uuid']!, () => {});
+      if (kind === 'success') {
+        await finished;
+        expect(f.events.indexOf('target-probe')).toBeLessThan(f.events.indexOf('grants'));
+        expect(f.current().devices['m' + managed.volume.id.replaceAll('-', '').slice(0, 6)].path).toBe('/srv/restored-data');
+        expect(f.events).toContain('activated');
+      } else {
+        await expect(finished).rejects.toThrow();
+        expect(f.events).not.toContain('promote'); expect(f.events).not.toContain('grants');
+      }
+    } finally { await f.cleanup(); }
+  }
+});
 
 test('native destination has only fresh private filesystem devices, no Docker/network/account startup', async () => {
   const f = await fixture(); try {
