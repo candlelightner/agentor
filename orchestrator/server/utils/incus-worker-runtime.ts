@@ -1307,9 +1307,14 @@ export class IncusWorkerRuntime {
 
   /** Reattach current grants only after extraction has settled. The caller's
    * initial import marker stays incomplete through service health validation;
-   * an unknown native PUT is never inferred complete from device read-back. */
+   * an unknown native PUT is never inferred complete from device read-back.
+   * Whole-instance recovery may promote stopped compute without provisioning
+   * or starting worker/Docker services. Its caller retains the durable import
+   * fence until the original desired state (including archive) is restored. */
   async finishCanonicalRestore(opts: IncusWorkerOptions, incarnation: string,
-    validateRecord: () => void | Promise<void>): Promise<void> {
+    validateRecord: () => void | Promise<void>, activation: 'running' | 'stopped' = 'running'): Promise<void> {
+    if (activation !== 'running' && activation !== 'stopped')
+      throw new Error('Invalid canonical restore activation');
     if (!incarnation) throw new Error('Incus restore completion requires a captured incarnation');
     this.validateOptions(opts);
     await this.assertReady();
@@ -1401,18 +1406,41 @@ export class IncusWorkerRuntime {
         throw new Error('Managed restore operational target overlaps a current storage grant');
     }
     const current = await check();
-    await this.client.updateInstanceDevices(opts.containerName, {
+    const operationalDevices: Record<string, IncusDevice> = {
       ...persistent, ...account, ...managed, ...host.devices,
       root: { type: 'disk', path: '/', pool: this.config.incusStoragePool },
       eth0: { type: 'nic', name: 'eth0', network: this.config.incusNetwork,
         'security.mac_filtering': 'true', 'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' },
-    }, undefined, current, { nonce: opts.recreationNonce!, hostMountMetadata: incusHostMountMetadata(host)['user.agentor.host-mounts'] });
+    };
+    await this.client.updateInstanceDevices(opts.containerName, operationalDevices, undefined, current,
+      { nonce: opts.recreationNonce!, hostMountMetadata: incusHostMountMetadata(host)['user.agentor.host-mounts'] });
     await validateRecord();
     const completed = await this.assertOwned(opts.containerName, opts.id, opts.userId, incarnation);
     if (completed.status !== 'Stopped' || completed.config['user.agentor.restore'] !== undefined ||
         completed.config['user.agentor.recreation'] !== opts.recreationNonce)
       throw new Error('Incus restore activation result is unavailable; retain the initial import fence');
     assertIncusHostMountLayout(completed, host);
+    if (activation === 'stopped') {
+      // Skipping start must not skip its operational-layout proof. No expanded
+      // profile/device or raw option may become an unnoticed recovery grant.
+      const matches = (devices: Record<string, IncusDevice>) =>
+        Object.keys(devices).length === Object.keys(operationalDevices).length &&
+        Object.entries(operationalDevices).every(([key, expected]) => sameDevice(devices[key], expected));
+      if (completed.profiles?.length || !matches(completed.devices) ||
+          !matches(completed.expanded_devices ?? completed.devices) ||
+          Object.keys(completed.config).some(key => key.startsWith('raw.')) ||
+          Object.keys(completed.expanded_config ?? {}).some(key => key.startsWith('raw.')))
+        throw new Error('Stopped Incus restore operational layout changed; retain the initial import fence');
+      // Running completion rechecks these grants in start(). Stopped recovery
+      // needs the same fresh, read-only proof: platform revocation/source
+      // replacement can occur while the native promotion is in flight.
+      const currentHost = await incusHostMountLayout(this.config, opts, 'inspect', undefined, completed);
+      if (!isDeepStrictEqual(currentHost, host))
+        throw new Error('Stopped Incus restore host authority changed; retain the initial import fence');
+      assertIncusHostMountLayout(completed, currentHost);
+      await validateRecord();
+      return;
+    }
     // start rechecks current private/layout/grants and actual image support
     // before pushing config or running the ownership helper/service.
     await this.start(opts, incarnation);

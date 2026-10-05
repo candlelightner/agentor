@@ -15,13 +15,15 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     npm pkg delete scripts.postinstall && \
     npm ci --prefer-offline --no-audit --no-fund
 COPY . .
-RUN npx nuxt build
+RUN npm run build
 
 FROM node:22-alpine
 
 WORKDIR /app
 RUN apk add --no-cache pigz python3
 COPY --from=builder /app/.output/ .output/
+# npm run build includes a separately traced, import-checked native adapter at
+# .output/server/instance-restore-native/index.mjs; no full builder modules copy.
 # Kept outside the Nitro request process on purpose: a short-lived,
 # network-disabled helper uses it to stop/apply/restart an instance restore.
 COPY --from=builder /app/instance-restore-helper.mjs .output/server/instance-restore-helper.mjs

@@ -25,6 +25,13 @@ export class UserScopedJsonStore<K, V> {
     this.keyFn = keyFn;
   }
 
+  /** The controlled restore process deliberately has no Nitro/service
+   * bootstrap. Keep metadata errors fail-closed there too, instead of masking
+   * the original quarantine/persistence failure with an unbound autoimport. */
+  protected storeLogger(): Pick<Console, 'error' | 'warn' | 'info' | 'debug'> {
+    return typeof useLogger === 'function' ? useLogger() : console;
+  }
+
   async init(): Promise<void> {
     const usersDir = join(this.dataDir, 'users');
     let userIds: string[] = [];
@@ -44,7 +51,7 @@ export class UserScopedJsonStore<K, V> {
     );
     for (const result of results) {
       if (result.status === 'rejected') {
-        useLogger().error(
+        this.storeLogger().error(
           `[user-scoped-store] skipped a corrupt/unreadable ${this.filename} during init: ${result.reason instanceof Error ? result.reason.message : result.reason}`,
         );
       }
@@ -67,7 +74,7 @@ export class UserScopedJsonStore<K, V> {
         return;
       }
       this.unavailableUsers.add(userId);
-      useLogger().error(`[user-scoped-store] failed to load ${filePath}: ${err instanceof Error ? err.message : err}`);
+      this.storeLogger().error(`[user-scoped-store] failed to load ${filePath}: ${err instanceof Error ? err.message : err}`);
       throw err;
     }
     let parsed: V[];
@@ -77,13 +84,13 @@ export class UserScopedJsonStore<K, V> {
       // Corrupt JSON (e.g. a truncated write from a hard kill). Quarantine the
       // user (log + skip) instead of crashing every user's load.
       this.unavailableUsers.add(userId);
-      useLogger().error(`[user-scoped-store] corrupt ${filePath} — skipping this user: ${err instanceof Error ? err.message : err}`);
+      this.storeLogger().error(`[user-scoped-store] corrupt ${filePath} — skipping this user: ${err instanceof Error ? err.message : err}`);
       throw err;
     }
     if (!Array.isArray(parsed)) {
       this.unavailableUsers.add(userId);
       const error = new Error(`${filePath} must contain an array`);
-      useLogger().error(`[user-scoped-store] corrupt ${filePath} — skipping this user: ${error.message}`);
+      this.storeLogger().error(`[user-scoped-store] corrupt ${filePath} — skipping this user: ${error.message}`);
       throw error;
     }
     const map = new Map<K, V>();
@@ -109,7 +116,7 @@ export class UserScopedJsonStore<K, V> {
       // fields. Treat both an explicit validation failure and a thrown keyFn as
       // corruption of this owner partition, rather than failing open.
       this.unavailableUsers.add(userId);
-      useLogger().error(
+      this.storeLogger().error(
         `[user-scoped-store] corrupt ${filePath} — skipping this user: ${err instanceof Error ? err.message : err}`,
       );
       throw err;
@@ -325,7 +332,7 @@ export class UserScopedJsonStore<K, V> {
       await writeFile(tmpPath, JSON.stringify(items, null, 2));
       await rename(tmpPath, filePath);
     } catch (err) {
-      useLogger().error(`[user-scoped-store] failed to save ${filePath}: ${err instanceof Error ? err.message : err}`);
+      this.storeLogger().error(`[user-scoped-store] failed to save ${filePath}: ${err instanceof Error ? err.message : err}`);
       throw err;
     }
   }

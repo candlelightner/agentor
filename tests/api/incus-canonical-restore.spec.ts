@@ -14,6 +14,9 @@ import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volu
 import { INCUS_PERSISTENCE_TARGET_CHECK } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
 import { INCUS_SELECTED_RESTORE_SCRIPT } from '../../orchestrator/server/utils/incus-selected-restore';
 import { INCUS_DOCKER_RESTORE_SCRIPT } from '../../orchestrator/server/utils/incus-docker-restore';
+import { HostMountStore } from '../../orchestrator/server/utils/host-mount-store';
+import { WorkerGroupStore } from '../../orchestrator/server/utils/worker-group-store';
+import { IncusHostMountClient } from '../../orchestrator/server/utils/incus-host-mount-client';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 
@@ -68,7 +71,11 @@ async function fixture() {
     stopInstance: async () => { events.push('stop'); instance.status = 'Stopped'; },
     updateInstanceDevices: async (_name: string, devices: any, _accepted: any, _expected: any, complete: any) => {
       events.push('promote'); instance.devices = devices; instance.expanded_devices = devices;
-      if (complete) delete instance.config['user.agentor.restore'];
+      if (complete) {
+        delete instance.config['user.agentor.restore'];
+        if (complete.hostMountMetadata) instance.config['user.agentor.host-mounts'] = complete.hostMountMetadata;
+        else delete instance.config['user.agentor.host-mounts'];
+      }
     },
     exec: async () => ({ returnCode: 0, stdout: '', stderr: '' }),
     execStream: async (_name: string, command: string[]) => {
@@ -254,6 +261,123 @@ test('Docker inverse refuses foreign nonce, missing payload or initialized desti
         scenario === 'payload-missing' ? [] : scenario === 'duplicate' ? [item, item] : [item])).rejects.toThrow();
       expect(f.events).not.toContain('start'); expect(f.events).not.toContain('extract');
     } finally { await f.cleanup(); }
+  }
+});
+
+test('stopped restore completion retains canonical and Docker data without provisioning or service activation', async () => {
+  for (const docker of [false, true]) {
+    const f = await fixture(); try {
+      const selected: Array<{ path: string; archivePath: string }> = [];
+      if (docker) {
+        const stage = join(f.dataDir, 'docker-source'); await mkdir(join(stage, 'docker'), { recursive: true });
+        const archivePath = join(f.dataDir, 'docker.tar');
+        execFileSync('tar', ['--format=pax', '-C', stage, '-cf', archivePath, 'docker']);
+        selected.push({ path: '/var/lib/docker', archivePath });
+      } else { f.opts.dockerEnabled = false; f.opts.environmentJson.dockerEnabled = false; }
+      const created = await f.runtime.createCanonicalRestore(f.opts, undefined, docker);
+      await f.runtime.restoreCanonicalArchives(f.opts, created.config['volatile.uuid']!, {}, () => {}, undefined, [], selected);
+      (f.runtime as any).accountDevices = async () => ({});
+      (f.runtime as any).managedDevices = async () => ({});
+      (f.runtime as any).start = async () => { throw new Error('Stopped restore must never activate'); };
+      const priorStarts = f.events.filter(event => event === 'start').length;
+      await f.runtime.finishCanonicalRestore(f.opts, created.config['volatile.uuid']!, () => {}, 'stopped');
+      expect(f.current().status).toBe('Stopped');
+      expect(f.current().config['user.agentor.restore']).toBeUndefined();
+      expect(f.current().config['user.agentor.recreation']).toBe(f.opts.recreationNonce);
+      expect(f.current().devices.workspace.path).toBe('/workspace');
+      expect(f.current().devices.agents.path).toBe('/home/agent/.agent-data');
+      expect(f.current().devices.eth0['security.ipv4_filtering']).toBe('true');
+      expect(f.current().devices.eth0['security.mac_filtering']).toBe('true');
+      expect(f.events.filter(event => event === 'start')).toHaveLength(priorStarts);
+      expect(!!f.current().devices.docker).toBe(docker);
+      if (docker) expect(f.volumes.get(f.opts.containerName + '-docker').config['user.agentor.allow-initialization']).toBe('false');
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('stopped restore proves final local/expanded layout and durable authority without inferring an unknown promotion', async () => {
+  for (const drift of ['local', 'expanded', 'profile', 'raw', 'unknown-put', 'record'] as const) {
+    const f = await fixture(); try {
+      f.opts.dockerEnabled = false; f.opts.environmentJson.dockerEnabled = false;
+      const created = await f.runtime.createCanonicalRestore(f.opts);
+      await f.runtime.restoreCanonicalArchives(f.opts, created.config['volatile.uuid']!, {}, () => {});
+      (f.runtime as any).accountDevices = async () => ({});
+      (f.runtime as any).managedDevices = async () => ({});
+      (f.runtime as any).start = async () => { throw new Error('Stopped restore must never activate'); };
+      const promote = f.client.updateInstanceDevices;
+      f.client.updateInstanceDevices = async (...args: any[]) => {
+        await promote(...args);
+        if (drift === 'local') f.current().devices = { ...f.current().devices, foreign: { type: 'disk', source: '/host', path: '/foreign' } };
+        if (drift === 'expanded') f.current().expanded_devices = { ...f.current().devices, foreign: { type: 'nic', network: 'foreign' } };
+        if (drift === 'profile') f.current().profiles = ['foreign'];
+        if (drift === 'raw') f.current().expanded_config = { 'raw.qemu': 'foreign' };
+        if (drift === 'unknown-put') throw new Error('Unknown native PUT acknowledgement');
+      };
+      const validate = () => {
+        if (drift === 'record' && f.events.includes('promote')) throw new Error('Durable restore authority changed');
+      };
+      await expect(f.runtime.finishCanonicalRestore(f.opts, created.config['volatile.uuid']!, validate, 'stopped')).rejects.toThrow();
+      expect(f.current().status).toBe('Stopped');
+      expect(f.current().config['user.agentor.recreation']).toBe(f.opts.recreationNonce);
+      expect(f.events).not.toContain('activated');
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('invalid restore activation is rejected before native reads or mutations', async () => {
+  const f = await fixture(); try {
+    f.client.getReadiness = async () => { throw new Error('Invalid mode must not inspect native runtime'); };
+    await expect(f.runtime.finishCanonicalRestore(f.opts, randomUUID(), () => {}, 'invalid' as any))
+      .rejects.toThrow('Invalid canonical restore activation');
+    expect(f.events).toEqual([]);
+  } finally { await f.cleanup(); }
+});
+
+test('stopped completion rechecks host assignment and source identity after awaited native promotion', async () => {
+  const original = { ensure: IncusHostMountClient.prototype.ensure, inspect: IncusHostMountClient.prototype.inspect };
+  for (const change of ['unchanged', 'revoked', 'source-replaced'] as const) {
+    const f = await fixture(); try {
+      f.opts.dockerEnabled = false; f.opts.environmentJson.dockerEnabled = false;
+      const workers = new WorkerStore(f.dataDir), groups = new WorkerGroupStore(f.dataDir);
+      f.config.incusNetworkHostEndpoint = 'https://host-policy.invalid';
+      const host = new HostMountStore(f.dataDir, () => '/srv/agentor-stopped-restore-data', groups, workers);
+      await host.init();
+      const created = await f.runtime.createCanonicalRestore(f.opts);
+      await f.runtime.restoreCanonicalArchives(f.opts, created.config['volatile.uuid']!, {}, () => {});
+      await workers.upsert({ id: f.opts.id, userId: f.opts.userId, runtimeKind: 'incus-vm', status: 'active',
+        displayName: 'Stopped host grant test', createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(),
+        incusRecreation: { nonce: f.opts.recreationNonce!, replacementIncarnation: created.config['volatile.uuid'],
+          initialCreate: true, importIncomplete: true } });
+      const path = await host.createPath({ name: 'Approved stopped share', sourcePath: '/srv/approved-stopped-share' });
+      await host.setEntitlement(f.opts.userId, path.id, true);
+      const grant = await host.createOwnerGrant(f.opts.userId, { pathId: path.id, targetType: 'worker', targetId: f.opts.id });
+      f.opts.storageManager = { dataHostPath: '/srv/agentor-stopped-restore-data' } as IncusWorkerOptions['storageManager'];
+      f.opts.mounts = [{ pathId: path.id, source: '/caller-forged', target: '/mnt/approved' }];
+      let sourceIdentity = 'a'.repeat(64);
+      const observation = async () => ({ installation: 'test', project: 'agentor', pathId: path.id,
+        sourcePath: path.sourcePath, allowWrite: false, sourceIdentity });
+      IncusHostMountClient.prototype.ensure = observation;
+      IncusHostMountClient.prototype.inspect = observation;
+      (f.runtime as any).accountDevices = async () => ({});
+      (f.runtime as any).managedDevices = async () => ({});
+      (f.runtime as any).start = async () => { throw new Error('Stopped restore must never activate'); };
+      const promote = f.client.updateInstanceDevices;
+      f.client.updateInstanceDevices = async (...args: any[]) => {
+        await promote(...args);
+        if (change === 'revoked') await host.deleteGrant(f.opts.userId, grant.id);
+        if (change === 'source-replaced') sourceIdentity = 'b'.repeat(64);
+      };
+      const completed = f.runtime.finishCanonicalRestore(f.opts, created.config['volatile.uuid']!, () => {}, 'stopped');
+      if (change === 'unchanged') await completed;
+      else await expect(completed).rejects.toThrow(change === 'revoked' ? 'not assigned' : 'host authority changed');
+      expect(f.current().status).toBe('Stopped');
+      expect(f.current().config['user.agentor.recreation']).toBe(f.opts.recreationNonce);
+      expect(f.events).not.toContain('activated');
+    } finally {
+      IncusHostMountClient.prototype.ensure = original.ensure;
+      IncusHostMountClient.prototype.inspect = original.inspect;
+      await f.cleanup();
+    }
   }
 });
 

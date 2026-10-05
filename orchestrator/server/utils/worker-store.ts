@@ -146,11 +146,11 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     await this.setItem(normalized.userId, normalized);
     const label = normalized.displayName || normalized.id;
     if (isNew) {
-      useLogger().info(
+      this.storeLogger().info(
         `[worker-store] registered worker ${label} (status=${normalized.status}, runtime=${normalized.runtimeKind})`,
       );
     } else {
-      useLogger().debug(`[worker-store] updated worker ${label} (runtime=${normalized.runtimeKind})`);
+      this.storeLogger().debug(`[worker-store] updated worker ${label} (runtime=${normalized.runtimeKind})`);
     }
   }
 
@@ -278,7 +278,7 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
 
   async archive(userId: string, id: string): Promise<void> {
     const worker = await this.setArchiveStatus(userId, id, 'archived');
-    useLogger().info(
+    this.storeLogger().info(
       `[worker-store] archived worker ${worker.displayName || worker.id}`,
     );
   }
@@ -299,7 +299,7 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
 
   async unarchive(userId: string, id: string): Promise<void> {
     const worker = await this.setArchiveStatus(userId, id, 'active');
-    useLogger().info(
+    this.storeLogger().info(
       `[worker-store] unarchived worker ${worker.displayName || worker.id}`,
     );
   }
@@ -324,12 +324,12 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
   async delete(userId: string, id: string): Promise<void> {
     const existed = await this.deleteItem(userId, id);
     if (!existed) {
-      useLogger().warn(
+      this.storeLogger().warn(
         `[worker-store] delete failed — worker not found: ${userId}/${id}`,
       );
       throw new Error(`Worker not found: ${id}`);
     }
-    useLogger().info(`[worker-store] deleted worker ${userId}/${id}`);
+    this.storeLogger().info(`[worker-store] deleted worker ${userId}/${id}`);
   }
 }
 

@@ -4,7 +4,8 @@
   "include": [
     "../orchestrator/.nuxt/**/*.d.ts",
     "../orchestrator/server/types/**/*.d.ts",
-    "api/instance-backup-native-live.spec.ts"
+    "api/instance-backup-native-live.spec.ts",
+    "api/instance-backup-native-stopped.spec.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }

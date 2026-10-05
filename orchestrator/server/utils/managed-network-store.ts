@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { createError } from 'h3';
 import { UserScopedJsonStore } from "./user-scoped-store";
 
 export type ManagedNetworkScope = "all" | "selected" | "group";
