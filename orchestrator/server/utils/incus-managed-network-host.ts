@@ -49,11 +49,16 @@ export class IncusManagedNetworkHost {
     return this.validateBridge(network, result);
   }
 
-  async inspect(network: ManagedNetwork): Promise<IncusManagedBridge | null> {
+  async inspect(network: ManagedNetwork): Promise<(IncusManagedBridge & { references: string[] }) | null> {
     await this.identity(network);
     const result = await this.client.request('POST', '/v1/managed-networks/inspect',
       { userId: network.userId, networkId: network.id });
-    return result === null ? null : this.validateBridge(network, result);
+    if (result === null) return null;
+    const bridge = await this.validateBridge(network, result);
+    if (!Array.isArray(result.references) || result.references.length > 4096 ||
+        result.references.some((reference: unknown) => typeof reference !== 'string' || !reference || reference.length > 1024))
+      throw new Error('Incus managed bridge reference authority is unavailable');
+    return { ...bridge, references: result.references };
   }
 
   private async validateBridge(network: ManagedNetwork, result: any): Promise<IncusManagedBridge> {

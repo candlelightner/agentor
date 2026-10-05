@@ -31,3 +31,82 @@ test('owned bridge deletion retains existing bounded detach/remove semantics and
   await manager.remove(network);
   expect(mutations).toHaveLength(2);
 });
+
+test('actual network authority includes drifted peers by exact native ID and durable owner/runtime, not names', async () => {
+  const id = randomUUID(), network = { id, userId: 'owner', dockerName: `agentor-managed-${id}` } as any;
+  const worker = { id: 'worker', userId: 'owner', containerName: 'agentor-worker-worker', containerId: 'docker-id', runtimeKind: 'legacy-docker' };
+  const record = { id: 'worker', userId: 'owner', status: 'active', runtimeKind: 'legacy-docker' };
+  const inspection = { Name: network.dockerName, Driver: 'bridge', Internal: false,
+    Labels: { 'agentor.managed-network': 'true', 'agentor.owner': network.userId }, Containers: { 'docker-id': { Name: worker.containerName } } };
+  const manager = new ManagedNetworkManager({ manager: () => ({ list: () => [worker] }) as any,
+    workers: () => ({ get: () => record }) as any, config: () => ({ incusEnabled: false }) as any });
+  (manager as any).docker = { getNetwork: (name: string) => ({ inspect: async () => {
+    if (name === network.dockerName) return inspection;
+    throw { statusCode: 404 };
+  } }) };
+  expect(await manager.actualWorkerIds(network)).toEqual(['worker']);
+  for (const patch of [{ containerId: 'replacement' }, { userId: 'foreign' }, { runtimeKind: 'incus-vm' }]) {
+    const original = { ...worker }; Object.assign(worker, patch);
+    await expect(manager.actualWorkerIds(network)).rejects.toThrow(/foreign|stale|ambiguous/);
+    Object.assign(worker, original);
+  }
+  record.runtimeKind = 'incus-vm';
+  await expect(manager.actualWorkerIds(network)).rejects.toThrow('Docker endpoint');
+});
+
+test('actual network authority does not turn daemon errors or unknown endpoint maps into empty membership', async () => {
+  const id = randomUUID(), network = { id, userId: 'owner', dockerName: `agentor-managed-${id}` } as any;
+  const manager = new ManagedNetworkManager({ manager: () => ({ list: () => [] }) as any,
+    workers: () => ({ get: () => undefined }) as any, config: () => ({ incusEnabled: false }) as any });
+  (manager as any).docker = { getNetwork: () => ({ inspect: async () => { throw { statusCode: 500 }; } }) };
+  await expect(manager.actualWorkerIds(network)).rejects.toMatchObject({ statusCode: 500 });
+  (manager as any).docker = { getNetwork: (name: string) => ({ inspect: async () => {
+    if (name !== network.dockerName) throw { statusCode: 404 };
+    return { Name: network.dockerName, Driver: 'bridge', Internal: false,
+      Labels: { 'agentor.managed-network': 'true', 'agentor.owner': network.userId } };
+  } }) };
+  await expect(manager.actualWorkerIds(network)).rejects.toThrow('endpoint authority');
+});
+
+test('native actual membership rejects orphan or foreign references and does not probe unrelated unavailable VMs', async () => {
+  const id = randomUUID(), network = { id, userId: 'owner', dockerName: `agentor-managed-${id}` } as any;
+  const vm = { id: 'vm', userId: 'owner', runtimeKind: 'incus-vm', containerName: 'agentor-worker-vm' };
+  const unrelated = { ...vm, id: 'unrelated', containerName: 'agentor-worker-unrelated' };
+  const record = { id: 'vm', userId: 'owner', runtimeKind: 'incus-vm', status: 'active' };
+  let references = ['/1.0/instances/agentor-worker-vm?project=agentor'], bridgePresent = true;
+  const probes: string[] = [];
+  const manager = new ManagedNetworkManager({
+    manager: () => ({ list: () => [vm, unrelated], inspectIncusManagedNetwork: async (id: string) => {
+      probes.push(id); if (id !== 'vm') throw new Error('Unrelated VM unavailable'); return { attached: true };
+    } }) as any,
+    workers: () => ({ get: (_owner: string, id: string) => id === 'vm' ? record : undefined }) as any,
+    config: () => ({ incusProject: 'agentor', incusEnabled: true }) as any,
+    host: () => ({ inspect: async () => bridgePresent ? { references } : null }) as any,
+  });
+  (manager as any).docker = { getNetwork: () => ({ inspect: async () => { throw { statusCode: 404 }; } }) };
+  expect(await manager.actualWorkerIds(network)).toEqual(['vm']); expect(probes).toEqual(['vm']);
+  for (const reference of ['/1.0/instances/orphan?project=agentor', '/1.0/instances/agentor-worker-vm?project=foreign',
+    '/1.0/instances/agentor-worker-vm?project=agentor&project=agentor', '/1.0/profiles/default?project=agentor',
+    'https://incus.invalid/1.0/instances/agentor-worker-vm?project=agentor']) {
+    references = [reference]; probes.length = 0;
+    await expect(manager.actualWorkerIds(network)).rejects.toThrow(/foreign|unmapped|unsupported/);
+    expect(probes).toEqual([]);
+  }
+  references = ['/1.0/instances/agentor-worker-vm?project=agentor']; record.status = 'archived';
+  await expect(manager.actualWorkerIds(network)).rejects.toThrow('stale');
+  bridgePresent = false; probes.length = 0;
+  expect(await manager.actualWorkerIds(network)).toEqual([]); expect(probes).toEqual([]);
+});
+
+test('a shared Docker bridge without authoritative native backing is not empty or adoptable', async () => {
+  const id = randomUUID(), network = { id, userId: 'owner', dockerName: `agentor-managed-${id}` } as any;
+  const manager = new ManagedNetworkManager({ manager: () => ({ list: () => [] }) as any,
+    workers: () => ({ get: () => undefined }) as any,
+    config: () => ({ incusProject: 'agentor', incusEnabled: true }) as any,
+    host: () => ({ inspect: async () => null }) as any });
+  (manager as any).docker = { getNetwork: (name: string) => ({ inspect: async () => {
+    if (name === network.dockerName) throw { statusCode: 404 };
+    return { Name: `${network.dockerName}-incus` };
+  } }) };
+  await expect(manager.actualWorkerIds(network)).rejects.toThrow('no authoritative native backing bridge');
+});

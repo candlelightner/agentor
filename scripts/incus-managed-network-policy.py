@@ -172,7 +172,11 @@ class ManagedNetworkPolicy:
         expected_range = f"{interface.network.network_address + 128}-{interface.network.network_address + 254}"
         if name not in allowed or network["config"].get("ipv4.dhcp.ranges") != expected_range:
             raise PolicyError("Native bridge DHCP or project allowlist authority is unsettled")
-        return self.bridge_result(name, owner, network_id, interface)
+        references = network.get("used_by")
+        if not isinstance(references, list) or len(references) > 4096 or \
+                any(not isinstance(reference, str) or not 0 < len(reference) <= 1024 for reference in references):
+            raise PolicyError("Native bridge reference authority is unavailable")
+        return {**self.bridge_result(name, owner, network_id, interface), "references": references}
 
     def remove(self, payload):
         owner, network_id, name = self.identity(payload)

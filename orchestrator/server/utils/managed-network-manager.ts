@@ -4,10 +4,14 @@ import {
   useManagedNetworkStore,
   useWorkerGroupStore,
   useWorkerStore,
+  useConfig,
 } from "./services";
 import type { ManagedNetwork } from "./managed-network-store";
 import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 import { withOperationDeadline } from "./operation-deadline";
+import { IncusManagedNetworkHost } from './incus-managed-network-host';
+import { IncusManagedDockerBridge } from './incus-managed-docker-bridge';
+import { normalizeWorkerRuntimeKind } from '../../shared/types';
 
 const DOCKER_READ_TIMEOUT_MS = 8_000;
 const DOCKER_MUTATION_TIMEOUT_MS = 30_000;
@@ -17,6 +21,86 @@ const forbidden = (name: string) =>
 
 export class ManagedNetworkManager {
   private readonly docker = new Docker({ socketPath: "/var/run/docker.sock" });
+
+  constructor(private readonly dependencies: {
+    manager?: () => ReturnType<typeof useContainerManager>;
+    workers?: () => ReturnType<typeof useWorkerStore>;
+    host?: () => IncusManagedNetworkHost;
+    config?: () => ReturnType<typeof useConfig>;
+  } = {}) {}
+
+  private manager() { return this.dependencies.manager?.() ?? useContainerManager(); }
+  private workers() { return this.dependencies.workers?.() ?? useWorkerStore(); }
+  private host() { return this.dependencies.host?.() ?? new IncusManagedNetworkHost(this.dependencies.config?.() ?? useConfig()); }
+
+  /** Authorization preflight, not user-facing diagnostic topology. Every actual
+   * peer must map to current durable owner/runtime + captured native identity.
+   * Callers union these IDs with desired IDs before verifying protection locks,
+   * then repeat this read before dispatch to reject newly uncovered peers. */
+  async actualWorkerIds(network: ManagedNetwork): Promise<string[]> {
+    this.assertSafe(network);
+    const manager = this.manager(), workers = this.workers();
+    const ids = new Set<string>();
+    const inspect = async (name: string) => {
+      try { return await withOperationDeadline(this.docker.getNetwork(name).inspect(),
+        DOCKER_READ_TIMEOUT_MS, 'Docker managed-network authority inspection'); }
+      catch (error: any) { if (error?.statusCode === 404) return null; throw error; }
+    };
+    const legacy = await inspect(network.dockerName);
+    if (legacy) this.assertDockerOwnership(network, legacy);
+    const sharedProbe = await inspect(`${network.dockerName}-incus`);
+    const config = this.dependencies.config?.() ?? useConfig();
+    const native = sharedProbe || this.dependencies.host || config.incusEnabled || config.incusNetworkHostEndpoint
+      ? await this.host().inspect(network) : null;
+    let shared: Docker.NetworkInspectInfo | null = null;
+    if (sharedProbe) {
+      if (!native) throw new Error('Shared Docker network has no authoritative native backing bridge');
+      shared = await new IncusManagedDockerBridge(this.docker).inspect(network, native);
+      if (!shared) throw new Error('Shared Docker network changed during authority inspection');
+    }
+    for (const inspection of [legacy, shared]) {
+      if (!inspection) continue;
+      if (!inspection.Containers || typeof inspection.Containers !== 'object' || Array.isArray(inspection.Containers))
+        throw new Error('Managed network endpoint authority is unavailable');
+      for (const [containerId, endpoint] of Object.entries(inspection.Containers)) {
+        const candidates = manager.list().filter(worker => worker.containerId === containerId &&
+          worker.containerName === endpoint.Name);
+        const worker = candidates.length === 1 ? candidates[0] : undefined;
+        const record = worker && workers.get(network.userId, worker.id);
+        if (!worker || worker.userId !== network.userId || worker.administrativeKind || !record ||
+            record.id !== worker.id || record.userId !== network.userId || record.status !== 'active' || record.deletionPending || record.incusRecreation ||
+            normalizeWorkerRuntimeKind(record.runtimeKind) !== 'legacy-docker' ||
+            normalizeWorkerRuntimeKind(worker.runtimeKind) !== 'legacy-docker' || containerId.startsWith('incus:'))
+          throw new Error('Managed network has a foreign, stale or ambiguous Docker endpoint');
+        ids.add(worker.id);
+      }
+    }
+    // Native root-side references include VMs missing from our cache or in a
+    // foreign project. Reject them, never omit/adopt/name-manage them. Do not
+    // probe unrelated unavailable owner VMs that have no NIC on this bridge.
+    for (const reference of native?.references ?? []) {
+      if (!reference.startsWith('/1.0/instances/'))
+        throw new Error('Managed native bridge has a foreign or unsupported reference');
+      const url = new URL(reference, 'https://incus.invalid');
+      const match = /^\/1\.0\/instances\/([^/]+)$/.exec(url.pathname);
+      const project = url.searchParams.get('project') ?? 'default';
+      if (url.origin !== 'https://incus.invalid' || url.hash || !match || project !== config.incusProject ||
+          [...url.searchParams.keys()].some(key => key !== 'project') || url.searchParams.getAll('project').length > 1)
+        throw new Error('Managed native bridge has a foreign or unsupported reference');
+      const name = decodeURIComponent(match[1]!);
+      const candidates = manager.list().filter(worker => worker.containerName === name);
+      const worker = candidates.length === 1 ? candidates[0] : undefined;
+      const record = worker && workers.get(network.userId, worker.id);
+      if (!worker || worker.userId !== network.userId || worker.runtimeKind !== 'incus-vm' || worker.administrativeKind ||
+          !record || record.userId !== network.userId || record.id !== worker.id || record.runtimeKind !== 'incus-vm' ||
+          record.status !== 'active' || record.deletionPending || record.incusRecreation)
+        throw new Error('Managed native bridge has an unmapped, foreign or stale instance reference');
+      const state = await manager.inspectIncusManagedNetwork(worker.id, network.id);
+      if (!state.attached) throw new Error('Managed native bridge reference has no verified worker NIC');
+      ids.add(worker.id);
+    }
+    return [...ids].sort();
+  }
 
   async members(network: ManagedNetwork) {
     let ids: string[];

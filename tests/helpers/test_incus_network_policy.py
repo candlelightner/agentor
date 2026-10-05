@@ -94,8 +94,15 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(all(call[0] == "GET" for call in self.calls))
         result = self.policy.ensure(self.payload)
         self.calls.clear()
-        self.assertEqual(self.policy.inspect(self.payload), result)
+        self.assertEqual(self.policy.inspect(self.payload), {**result, "references": []})
         self.assertTrue(all(call[0] == "GET" for call in self.calls))
+        self.network["used_by"] = ["/1.0/instances/unmapped?project=foreign"]
+        self.assertEqual(self.policy.inspect(self.payload)["references"], self.network["used_by"])
+        for references in (None, {}, [1], [""], ["x" * 1025]):
+            self.network["used_by"] = references
+            with self.assertRaises(MODULE.PolicyError):
+                self.policy.inspect(self.payload)
+        self.network["used_by"] = []
         for config, key, replacement in [
                 (self.network["config"], "ipv4.dhcp.ranges", "10.200.30.2-10.200.30.254"),
                 (self.project["config"], "restricted.networks.access", "workers")]:
