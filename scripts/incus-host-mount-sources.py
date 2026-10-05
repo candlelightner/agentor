@@ -91,6 +91,18 @@ def validate_sources(catalog, *, data_path, incus_path, protected_paths, existin
     protected += [os.path.realpath(path) for path in protected]
     protected += list(SYSTEM_PATHS) + alias_mounts(mountinfo)
     exports = [canonical(path) for path in existing_exports]
+    for path in list(exports):
+        resolved = os.path.realpath(path)
+        if resolved != path and not any(
+                (path == safe or path.startswith(safe + "/")) and
+                resolved == os.path.realpath(safe) + path[len(safe):]
+                for safe in protected):
+            # The spelling may no longer identify the tree a prior export
+            # pinned. Only an operator-pinned parent alias is permitted (e.g.
+            # /var/run -> /run); symlinks beneath it remain ambiguous, even
+            # inside protected storage containing guest-writable state.
+            raise SourceRejected("Existing host export has ambiguous symlink authority")
+        exports.append(resolved)
     if not isinstance(catalog, list) or len(catalog) > 4096:
         raise SourceRejected("Bounded platform host-mount catalog required")
     result, ids, sources = [], set(), []

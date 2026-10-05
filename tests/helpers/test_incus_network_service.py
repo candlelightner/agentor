@@ -63,6 +63,29 @@ class TransportTests(unittest.TestCase):
                 return self.ensure(payload)
 
         self.calls = []
+        self.host_calls = []
+        self.path_id = str(uuid.uuid4())
+        self.selected_source = {"pathId": self.path_id, "source": "/srv/approved-fixture",
+                                "readOnly": True, "installation": self.installation}
+
+        class HostMountPolicy:
+            def selected(self, operation, payload):
+                if not isinstance(payload, dict) or set(payload) != {"pathId"} or payload["pathId"] != outer.path_id:
+                    raise MODULE.POLICY.PolicyError("Unexpected host mount authority")
+                outer.host_calls.append((operation, payload))
+                return dict(outer.selected_source)
+
+            def ensure(self, payload):
+                return self.selected("ensure", payload)
+
+            def inspect(self, payload):
+                return self.selected("inspect", payload)
+
+        self.policy = Policy()
+        self.host_mounts = HostMountPolicy()
+        self.start_server(self.host_mounts)
+
+    def start_server(self, host_mounts):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(self.root / "server.crt", self.root / "server.key")
         # Trust both test clients so the independent exact fingerprint fence
@@ -71,7 +94,7 @@ class TransportTests(unittest.TestCase):
         context.load_verify_locations(cafile=self.root / "other.crt")
         context.verify_mode = ssl.CERT_REQUIRED
         fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert((self.root / "client.crt").read_text())).hexdigest()
-        self.server = MODULE.TlsPolicyServer(("127.0.0.1", 0), MODULE.handler(Policy(), fingerprint), context,
+        self.server = MODULE.TlsPolicyServer(("127.0.0.1", 0), MODULE.handler(self.policy, fingerprint, host_mounts=host_mounts), context,
                                             request_timeout=0.25)
         thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
         thread.start()
@@ -118,6 +141,51 @@ class TransportTests(unittest.TestCase):
         for endpoint in ("ensure", "inspect"):
             for body in (b"x" * 4097, b"not-json", json.dumps({"path": "/etc"}).encode()):
                 self.assertGreaterEqual(self.request("POST", f"/v1/managed-networks/{endpoint}", body)[0], 400)
+        self.assertEqual(self.calls, [])
+
+    def test_host_mount_endpoints_forward_only_selected_catalog_identity(self):
+        payload = {"pathId": self.path_id}
+        for endpoint in ("ensure", "inspect"):
+            status, result = self.request("POST", f"/v1/host-mounts/{endpoint}?project=agentor", json.dumps(payload))
+            self.assertEqual(status, 200)
+            self.assertEqual(result["metadata"], self.selected_source)
+        self.assertEqual(self.host_calls, [("ensure", payload), ("inspect", payload)])
+        self.assertEqual(self.calls, [])
+
+    def test_host_mount_endpoints_cannot_accept_raw_source_project_or_commands(self):
+        for endpoint in ("ensure", "inspect"):
+            for payload in ({}, {"pathId": "unknown"}, [self.path_id],
+                            {"source": "/etc"}, {"pathId": self.path_id, "source": "/etc"},
+                            {"pathId": self.path_id, "project": "default"},
+                            {"pathId": self.path_id, "command": ["sh", "-c", "true"]},
+                            {"pathId": self.path_id, "readOnly": False}):
+                self.assertGreaterEqual(self.request("POST", f"/v1/host-mounts/{endpoint}", json.dumps(payload))[0], 400)
+            for body in (b"x" * 4097, b"not-json"):
+                self.assertGreaterEqual(self.request("POST", f"/v1/host-mounts/{endpoint}", body)[0], 400)
+            for query in ("?project=default", "?project=agentor&project=agentor", "?command=true"):
+                self.assertGreaterEqual(self.request("POST", f"/v1/host-mounts/{endpoint}{query}",
+                                                    json.dumps({"pathId": self.path_id}))[0], 400)
+        self.assertEqual(self.host_calls, [])
+        self.assertEqual(self.calls, [])
+
+    def test_host_mount_endpoints_retain_exact_mtls_fence(self):
+        for endpoint in ("ensure", "inspect"):
+            self.assertEqual(self.request("POST", f"/v1/host-mounts/{endpoint}",
+                                          json.dumps({"pathId": self.path_id}), identity="other")[0], 409)
+            with self.assertRaises((ssl.SSLError, OSError, http.client.HTTPException)):
+                self.request("POST", f"/v1/host-mounts/{endpoint}",
+                             json.dumps({"pathId": self.path_id}), identity=None)
+        self.assertEqual(self.host_calls, [])
+        self.assertEqual(self.calls, [])
+
+    def test_absent_optional_host_mount_policy_fails_closed_without_network_dispatch(self):
+        self.start_server(None)
+        for endpoint in ("ensure", "inspect"):
+            self.assertEqual(self.request("POST", f"/v1/host-mounts/{endpoint}",
+                                          json.dumps({"pathId": self.path_id}))[0], 503)
+        # Optional compatibility does not affect existing network transport.
+        self.assertEqual(self.request()[0], 200)
+        self.assertEqual(self.host_calls, [])
         self.assertEqual(self.calls, [])
 
     def test_unverified_handshake_stall_is_bounded(self):

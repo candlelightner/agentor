@@ -81,7 +81,30 @@ def incus_request(socket_path):
     return request
 
 
-def handler(policy, client_fingerprint):
+def docker_inventory(socket_path):
+    def get(path):
+        connection = UnixConnection(socket_path)
+        try:
+            connection.request("GET", path)
+            response = connection.getresponse()
+            content = response.read(4 * 1024 * 1024 + 1)
+            if response.status != 200 or len(content) > 4 * 1024 * 1024:
+                raise POLICY.PolicyError("Legacy host export authority is unavailable")
+            return json.loads(content)
+        finally:
+            connection.close()
+    def inventory():
+        # Three fixed reads only. Never accept an endpoint/method from HTTP.
+        info = get("/info")
+        volumes = get("/volumes")
+        if not isinstance(info, dict) or not isinstance(volumes, dict):
+            raise POLICY.PolicyError("Legacy host export authority is unavailable")
+        return {"root": info.get("DockerRootDir"), "containers": get("/containers/json?all=1"),
+                "volumes": volumes.get("Volumes")}
+    return inventory
+
+
+def handler(policy, client_fingerprint, host_mounts=None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "AgentorNetwork/1"
 
@@ -126,8 +149,12 @@ def handler(policy, client_fingerprint):
         def do_POST(self):
             try:
                 path = self.validate()
-                if path not in ("/v1/managed-networks/ensure", "/v1/managed-networks/remove", "/v1/managed-networks/inspect"):
+                mount_request = path in ("/v1/host-mounts/ensure", "/v1/host-mounts/inspect")
+                if not mount_request and path not in ("/v1/managed-networks/ensure", "/v1/managed-networks/remove", "/v1/managed-networks/inspect"):
                     self.reply(404)
+                    return
+                if mount_request and host_mounts is None:
+                    self.reply(503)
                     return
                 lengths = self.headers.get_all("Content-Length", [])
                 length = lengths[0] if len(lengths) == 1 else ""
@@ -135,7 +162,9 @@ def handler(policy, client_fingerprint):
                     self.reply(400)
                     return
                 payload = json.loads(self.rfile.read(int(length)))
-                if path.endswith("/inspect"):
+                if mount_request:
+                    result = host_mounts.inspect(payload) if path.endswith("/inspect") else host_mounts.ensure(payload)
+                elif path.endswith("/inspect"):
                     result = policy.inspect(payload)
                 else:
                     result = policy.ensure(payload) if path.endswith("/ensure") else policy.remove(payload)
@@ -151,6 +180,8 @@ def main():
         parser.add_argument("--" + argument, required=True)
     parser.add_argument("--port", type=int, default=8444)
     parser.add_argument("--incus-socket", default="/var/lib/incus/unix.socket")
+    parser.add_argument("--host-mounts", action="store_true", help="Enable catalog-ID-only host export policy")
+    parser.add_argument("--docker-socket", default="/var/run/docker.sock")
     args = parser.parse_args()
     if ipaddress.ip_address(args.bind).is_unspecified:
         parser.error("Explicit narrow listener address required; wildcard binding is forbidden")
@@ -158,6 +189,14 @@ def main():
     fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(client_pem)).hexdigest()
     policy = POLICY.ManagedNetworkPolicy(args.data_dir, args.installation, args.project, args.primary,
                                          incus_request(args.incus_socket))
+    mounts = None
+    if args.host_mounts:
+        spec = importlib.util.spec_from_file_location("incus_host_mount_policy", Path(__file__).with_name("incus-host-mount-policy.py"))
+        host_mounts = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(host_mounts)
+        mounts = host_mounts.HostMountPolicy(args.data_dir, args.installation, args.project,
+            str(Path(args.incus_socket).parent), [args.server_cert, args.server_key, args.client_cert],
+            incus_request(args.incus_socket), docker_inventory(args.docker_socket))
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(args.server_cert, args.server_key)
@@ -165,7 +204,7 @@ def main():
     context.verify_mode = ssl.CERT_REQUIRED
     # HTTPServer serializes bridge/policy updates; If-Match additionally fences
     # unrelated operator changes. No thread pool, scheduler or global journal.
-    server = TlsPolicyServer((args.bind, args.port), handler(policy, fingerprint), context)
+    server = TlsPolicyServer((args.bind, args.port), handler(policy, fingerprint, mounts), context)
     server.serve_forever()
 
 

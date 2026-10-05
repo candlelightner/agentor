@@ -72,6 +72,20 @@ class SourcesTests(unittest.TestCase):
             with self.assertRaises(MODULE.SourceRejected):
                 self.check([{**self.record, **patch}])
 
+    def test_protected_tree_does_not_bless_guest_writable_descendant_alias(self):
+        alias = self.root / "data" / "guest-link"
+        alias.symlink_to(self.root / "other", target_is_directory=True)
+        with self.assertRaises(MODULE.SourceRejected):
+            self.check(existing_exports=[str(alias)])
+        # Operator-pinned root aliases preserve ordinary control-plane binds,
+        # but never exempt additional symlinks below that root.
+        pinned = self.root / "pinned"
+        pinned.symlink_to(self.root / "data", target_is_directory=True)
+        self.assertEqual(len(self.check(protected_paths=[str(pinned)],
+            existing_exports=[str(pinned / "plain-file")])), 1)
+        with self.assertRaises(MODULE.SourceRejected):
+            self.check(protected_paths=[str(pinned)], existing_exports=[str(pinned / "guest-link")])
+
     def test_host_bind_alias_is_denied_but_ordinary_filesystem_mount_remains_supported(self):
         source = self.record["sourcePath"]
         with self.assertRaises(MODULE.SourceRejected):
