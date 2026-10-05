@@ -360,7 +360,10 @@ async function nativeFixture(root: string, selection: { archived?: boolean; desi
   const ledger = async () => JSON.parse(await readFile(join(prepared.dataDir, 'admin', 'instance-backups.v1.json'), 'utf8'));
   const installed = async () => { const store = new nativeAdapter.WorkerStore(prepared.dataDir); await store.loadUser(worker.userId); return store.get(worker.userId, id); };
   const incarnation = randomUUID();
-  patch(nativeAdapter.IncusWorkerRuntime.prototype, 'preflightCanonicalRestore', async () => { events.push('preflight'); });
+  patch(nativeAdapter.IncusWorkerRuntime.prototype, 'preflightCanonicalRestore', async (options: any) => {
+    expect(options.recreationNonce).toMatch(/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/);
+    events.push('preflight');
+  });
   patch(nativeAdapter.IncusWorkerRuntime.prototype, 'createCanonicalRestore', async (options: any) => {
     events.push('create');
     if (!(await installed())?.incusRecreation?.importIncomplete) throw new Error('Missing durable initial import fence');

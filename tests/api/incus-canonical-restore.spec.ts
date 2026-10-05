@@ -14,6 +14,7 @@ import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volu
 import { INCUS_PERSISTENCE_TARGET_CHECK } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
 import { INCUS_SELECTED_RESTORE_SCRIPT } from '../../orchestrator/server/utils/incus-selected-restore';
 import { INCUS_DOCKER_RESTORE_SCRIPT } from '../../orchestrator/server/utils/incus-docker-restore';
+import { INCUS_CANONICAL_RESTORE_SCRIPT } from '../../orchestrator/server/utils/incus-canonical-restore';
 import { HostMountStore } from '../../orchestrator/server/utils/host-mount-store';
 import { WorkerGroupStore } from '../../orchestrator/server/utils/worker-group-store';
 import { IncusHostMountClient } from '../../orchestrator/server/utils/incus-host-mount-client';
@@ -134,6 +135,28 @@ async function rawArchive(dir: string, role: 'workspace' | 'agents') {
   execFileSync('tar', ['--format=pax', '--numeric-owner', '--xattrs', '--acls', '-C', stage, '-cf', path, base]);
   return path;
 }
+
+test('account parent initialization is inside isolated canonical authority and precedes stopped promotion', async () => {
+  const f = await fixture(); try {
+    const instance = await f.runtime.createCanonicalRestore(f.opts);
+    await f.runtime.restoreCanonicalArchives(f.opts, instance.config['volatile.uuid']!, {}, () => {});
+    f.opts.storageManager = {} as NonNullable<IncusWorkerOptions['storageManager']>;
+    (f.runtime as any).accountDevices = async () => ({});
+    (f.runtime as any).managedDevices = async () => ({});
+    f.client.exec = async (_name: string, command: string[]) => {
+      if (command.at(-1) === 'account-parents') {
+        expect(command).toEqual(['/usr/bin/python3', '-c', INCUS_CANONICAL_RESTORE_SCRIPT, 'agents', 'account-parents']);
+        expect(f.current().status).toBe('Running'); expect(f.current().devices.agents.path).toBe('/restore/.agent-data');
+        expect(f.current().config['user.agentor.restore']).toBe('incomplete');
+        f.events.push('account-parents');
+      }
+      return { returnCode: 0, stdout: '', stderr: '' };
+    };
+    await f.runtime.finishCanonicalRestore(f.opts, instance.config['volatile.uuid']!, () => {}, 'stopped');
+    expect(f.events.indexOf('account-parents')).toBeLessThan(f.events.indexOf('stop'));
+    expect(f.events.indexOf('account-parents')).toBeLessThan(f.events.indexOf('promote'));
+  } finally { await f.cleanup(); }
+});
 
 async function managedPayload(f: Awaited<ReturnType<typeof fixture>>, target = '/srv/restored-data') {
   const store = new ManagedVolumeStore(f.dataDir); await store.init();

@@ -1,5 +1,5 @@
 import Docker from "dockerode";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants, createReadStream } from "node:fs";
 import {
   chmod,
@@ -469,7 +469,9 @@ async function prepareNativeRestore(injectedAdapter) {
     throw new SafeRestoreError('Canonical native payload selection is incomplete', 'INSTANCE_RESTORE_INVALID_PLAN');
   for (const group of groups) {
     await assertJobStillActive();
-    const nonce = randomBytes(16).toString('hex');
+    // Reuse the canonical inverse's UUID nonce contract, including the
+    // positively identified first-use Docker block initialization path.
+    const nonce = randomUUID();
     const bootstrap = group.worker ? await configStore.resolveAppliedBootstrap(group.userId, group.workerId) : undefined;
     if (group.worker && !bootstrap) throw new SafeRestoreError('Applied native worker configuration is unavailable', 'INSTANCE_RESTORE_NATIVE_CONFIG_MISSING');
     if (bootstrap && (bootstrap.dockerEnabled || bootstrap.environmentJson.dockerEnabled) && !group.core.docker)

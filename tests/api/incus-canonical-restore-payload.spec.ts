@@ -5,7 +5,45 @@ import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, wri
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
-import { MAX_INCUS_CANONICAL_RESTORE_RAW_BYTES, prepareIncusCanonicalRestorePayload } from '../../orchestrator/server/utils/incus-canonical-restore';
+import { INCUS_CANONICAL_RESTORE_SCRIPT, MAX_INCUS_CANONICAL_RESTORE_RAW_BYTES, prepareIncusCanonicalRestorePayload } from '../../orchestrator/server/utils/incus-canonical-restore';
+
+test('isolated canonical account parents initialize only absent directories and preserve existing numeric metadata', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'agentor-account-parents-'));
+  try {
+    await mkdir(join(dir, 'restore/.agent-data'), { recursive: true });
+    await mkdir(join(dir, 'restore/workspace'));
+    // Real local filesystem operations; only systemd/mount observation is
+    // substituted for deterministic execution outside an actual guest.
+    const script = INCUS_CANONICAL_RESTORE_SCRIPT.replaceAll('/restore', join(dir, 'restore'));
+    execFileSync('sudo', ['python3', '-c', String.raw`
+import os,sys,stat,types,io,base64
+from unittest.mock import patch
+source=base64.b64decode(sys.argv[1]).decode();base=sys.argv[2];root=base+'/.agent-data'
+assert os.path.isdir(root) and os.path.isdir(base+'/workspace')
+os.mkdir(root+'/.codex');os.chown(root+'/.codex',12345,23456);os.chmod(root+'/.codex',0o751)
+os.utime(root+'/.codex',ns=(1700000000123456789,1700000000987654321));os.setxattr(root+'/.codex','user.keep',b'unchanged')
+before=os.stat(root+'/.codex');original_open=open
+mounts=''.join('1 0 0:1 / '+p+' rw - virtiofs fixture rw\n' for p in (root,base+'/workspace'))
+def observed_open(path,*args,**kwargs):
+ return io.BytesIO(mounts.encode()) if path=='/proc/self/mountinfo' else original_open(path,*args,**kwargs)
+def run():
+ sys.argv=['script','agents','account-parents']
+ with patch('builtins.open',observed_open),patch('subprocess.run',return_value=types.SimpleNamespace(returncode=3)):
+  try: exec(compile(source,'canonical-account-parents','exec'),{})
+  except SystemExit as e: assert e.code==0
+run()
+for name in ('.kilo','.claude','.gemini'):
+ s=os.lstat(root+'/'+name);assert (s.st_uid,s.st_gid,stat.S_IMODE(s.st_mode))==(1000,1000,0o700)
+after=os.stat(root+'/.codex');assert (before.st_uid,before.st_gid,before.st_mode,before.st_mtime_ns)==(after.st_uid,after.st_gid,after.st_mode,after.st_mtime_ns)
+assert os.getxattr(root+'/.codex','user.keep')==b'unchanged'
+os.rmdir(root+'/.kilo');os.symlink('../workspace',root+'/.kilo')
+try: run()
+except ValueError as e: assert 'non-symlink' in str(e)
+else: raise AssertionError('Symlink account parent was accepted')
+assert os.path.islink(root+'/.kilo');assert os.listdir(base+'/workspace')==[]
+`, Buffer.from(script).toString('base64'), join(dir, 'restore')]);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
 
 async function fixture(run: (f: { dir: string; scratch: string; payload: string }) => Promise<void>) {
   const dir = await mkdtemp(join(tmpdir(), 'agentor-native-gzip-')), scratch = join(dir, 'private');

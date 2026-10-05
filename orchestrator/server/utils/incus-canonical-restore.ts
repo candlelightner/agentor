@@ -67,7 +67,9 @@ if len(sys.argv) not in (2,3):
 role=sys.argv[1];managed=re.fullmatch(r"managed:([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})",role)
 if managed:
     ROOTS[role]="/restore/managed/"+managed.group(1)+"/volume"
-if role not in ROOTS or len(sys.argv)==3 and (sys.argv[2]!="empty" or managed):
+mode=sys.argv[2] if len(sys.argv)==3 else "extract"
+if role not in ROOTS or mode not in ("extract","empty","account-parents") or \
+    mode=="empty" and managed or mode=="account-parents" and role!="agents":
     raise ValueError("Invalid canonical restore role")
 root=ROOTS[role]
 parents=("/restore/managed",os.path.dirname(root)) if managed else ()
@@ -97,12 +99,32 @@ for line in raw.splitlines():
 for path in ROOTS.values():
     if mounts.count(path)!=1 or any(m.startswith(path+"/") for m in mounts):
         raise ValueError("Canonical restore private mount is missing or has overlays")
+# Account overlays must not manufacture root-owned private ancestors after a
+# metadata-preserving restore. Initialize ONLY absent fixed private parents,
+# before any share is attached; never repair existing archive metadata or walk
+# a symlink. These are the existing credential/Kilo attachment parents only.
+if mode=="account-parents":
+    descriptor=os.open(root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:
+        for name in (".kilo",".claude",".codex",".gemini"):
+            try:
+                existing=os.stat(name,dir_fd=descriptor,follow_symlinks=False)
+            except FileNotFoundError:
+                os.mkdir(name,0o700,dir_fd=descriptor)
+                child=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=descriptor)
+                try: os.fchown(child,1000,1000)
+                finally: os.close(child)
+            else:
+                if not stat.S_ISDIR(existing.st_mode):
+                    raise ValueError("Canonical account parent must be a non-symlink directory")
+    finally: os.close(descriptor)
+    sys.exit(0)
 with os.scandir(root) as entries:
     if next(entries,None) is not None:
         raise ValueError("Canonical restore destination must be empty")
 # A missing payload is a fresh empty role, not authority to recursively alter
 # another restored tree. Initialize only this verified mount root for agent.
-if len(sys.argv)==3:
+if mode=="empty":
     os.chown(root,1000,1000)
     os.chmod(root,0o755 if sys.argv[1]=="workspace" else 0o700)
     sys.exit(0)

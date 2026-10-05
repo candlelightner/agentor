@@ -1432,6 +1432,14 @@ export class IncusWorkerRuntime {
       await managedRuntime.validateTarget(opts.userId, opts.id, `incus:${incarnation}`, volume.target);
       await check();
     }
+    if (opts.storageManager) {
+      if (isolated.status !== 'Running')
+        throw new Error('Canonical account parent initialization requires isolated running restore compute');
+      await check();
+      await this.checkedExec(opts.containerName,
+        ['/usr/bin/python3', '-c', INCUS_CANONICAL_RESTORE_SCRIPT, 'agents', 'account-parents']);
+      await check();
+    }
     await this.stop(opts, incarnation);
     const stopped = await check();
     if (stopped.status !== 'Stopped') throw new Error('Incus restore destination shutdown is unconfirmed');
