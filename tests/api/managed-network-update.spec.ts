@@ -1,9 +1,82 @@
 import { expect, test } from '@playwright/test';
 import { reconcileCreatedManagedNetwork, updateManagedNetworkAtomically } from '../../orchestrator/server/utils/managed-network-update';
+import { operationSettlement } from '../../orchestrator/server/utils/operation-deadline';
 
 const original = { id: 'network-a', userId: 'owner-a', name: 'before', scope: 'selected' as const,
   groupId: undefined, workerIds: ['worker-a'], dockerName: 'agentor-managed-network-a',
   createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString() };
+
+function pendingFailure() {
+  const settlement = new Promise<void>(() => {});
+  const error = Object.assign(new Error('native operation still pending'), { statusCode: 504 });
+  Object.defineProperty(error, operationSettlement, { value: settlement, enumerable: false });
+  return { error, settlement };
+}
+
+test('unsettled creation failure retains record without beginning runtime or record cleanup', async () => {
+  const { error, settlement } = pendingFailure(), calls: string[] = [];
+  const records = new Map([[original.id, original]]);
+  await expect(reconcileCreatedManagedNetwork(original, {
+    reconcile: async () => { calls.push('reconcile'); throw error; },
+    removeRuntime: async () => { calls.push('runtime cleanup'); },
+    removeRecord: async (_owner, id) => { calls.push('record cleanup'); records.delete(id); },
+  })).rejects.toBe(error);
+  expect(calls).toEqual(['reconcile']); expect(records.get(original.id)).toBe(original);
+  expect((error as any)[operationSettlement]).toBe(settlement);
+});
+
+test('unsettled runtime cleanup preserves raw settlement and prevents record deletion', async () => {
+  const { error, settlement } = pendingFailure(), calls: string[] = [];
+  await expect(reconcileCreatedManagedNetwork(original, {
+    reconcile: async () => { calls.push('reconcile'); throw new Error('settled attach failure'); },
+    removeRuntime: async () => { calls.push('runtime cleanup'); throw error; },
+    removeRecord: async () => { calls.push('record cleanup'); },
+  })).rejects.toBe(error);
+  expect(calls).toEqual(['reconcile', 'runtime cleanup']);
+  expect((error as any)[operationSettlement]).toBe(settlement);
+});
+
+test('unsettled record cleanup preserves exact failure authority without further runtime calls', async () => {
+  const { error, settlement } = pendingFailure(), calls: string[] = [];
+  await expect(reconcileCreatedManagedNetwork(original, {
+    reconcile: async () => { calls.push('reconcile'); throw new Error('settled attach failure'); },
+    removeRuntime: async () => { calls.push('runtime cleanup'); },
+    removeRecord: async () => { calls.push('record cleanup'); throw error; },
+  })).rejects.toBe(error);
+  expect(calls).toEqual(['reconcile', 'runtime cleanup', 'record cleanup']);
+  expect((error as any)[operationSettlement]).toBe(settlement);
+});
+
+test('unsettled update failure retains updated desired state without starting either rollback', async () => {
+  const { error, settlement } = pendingFailure(), calls: string[] = [];
+  let saved = original;
+  await expect(updateManagedNetworkAtomically(original, { name: 'after' }, {
+    update: async (_owner, _id, patch) => { calls.push('persist'); saved = { ...original, ...patch }; return saved; },
+    reconcile: async value => { calls.push(`reconcile ${value.name}`); throw error; },
+  })).rejects.toBe(error);
+  expect(calls).toEqual(['persist', 'reconcile after']); expect(saved.name).toBe('after');
+  expect((error as any)[operationSettlement]).toBe(settlement);
+});
+
+test('unsettled persistence rollback prevents topology rollback and preserves raw authority', async () => {
+  const { error, settlement } = pendingFailure(), calls: string[] = [];
+  await expect(updateManagedNetworkAtomically(original, { name: 'after' }, {
+    update: async (_owner, _id, patch) => { calls.push(`persist ${patch.name}`); if (patch.name === original.name) throw error; return { ...original, ...patch }; },
+    reconcile: async value => { calls.push(`reconcile ${value.name}`); throw new Error('settled attach failure'); },
+  })).rejects.toBe(error);
+  expect(calls).toEqual(['persist after', 'reconcile after', 'persist before']);
+  expect((error as any)[operationSettlement]).toBe(settlement);
+});
+
+test('unsettled topology rollback is not wrapped or followed by more runtime operations', async () => {
+  const { error, settlement } = pendingFailure(), calls: string[] = [];
+  await expect(updateManagedNetworkAtomically(original, { name: 'after' }, {
+    update: async (_owner, _id, patch) => { calls.push(`persist ${patch.name}`); return { ...original, ...patch }; },
+    reconcile: async value => { calls.push(`reconcile ${value.name}`); if (value.name === original.name) throw error; throw new Error('settled attach failure'); },
+  })).rejects.toBe(error);
+  expect(calls).toEqual(['persist after', 'reconcile after', 'persist before', 'reconcile before']);
+  expect((error as any)[operationSettlement]).toBe(settlement);
+});
 
 test('failed creation retains desired authority when runtime cleanup fails', async () => {
   const records = new Map([[original.id, original]]);

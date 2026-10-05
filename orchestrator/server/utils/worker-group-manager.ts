@@ -14,6 +14,7 @@ import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 import { verifyWorkerMutationUnlocks } from "./worker-protection-lock";
 import { withOwnerLifecycleMutation } from "./worker-lifecycle-coordinator";
 import { authorizeManagedNetworkMutation } from './managed-network-authorization';
+import { operationSettlement, type OperationFailureWithSettlement } from './operation-deadline';
 
 type WorkerGroupPatch = Pick<
   Partial<WorkerGroup>,
@@ -402,6 +403,10 @@ export class WorkerGroupNetworkCoordinator {
           ),
         );
       } catch (error) {
+        // A timed-out native client request can still be settling. Retain the
+        // desired group/network authority and let the existing lifecycle fence
+        // observe settlement; do not launch compensation under owner reentry.
+        if ((error as OperationFailureWithSettlement)?.[operationSettlement]) throw error;
         failures.push(`${network.name}: ${safeMessage(error)}`);
       }
     }
@@ -464,6 +469,7 @@ export class WorkerGroupNetworkCoordinator {
           ),
         );
       } catch (error) {
+        if ((error as OperationFailureWithSettlement)?.[operationSettlement]) throw error;
         failures.push(`${network.name}: ${safeMessage(error)}`);
       }
     }

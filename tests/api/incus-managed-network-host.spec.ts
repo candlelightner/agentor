@@ -192,7 +192,9 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
     peerManager.registerExternal({ ...peerOwner, containerId: `incus:${peerIncarnation}`, runtimeKind: 'incus-vm', status: 'stopped' } as any);
     (peerManager as any).assertOwnerExists = async (userId: string) => expect(userId).toBe(network.userId);
     observedManager = peerManager;
-    await peerManager.setIncusManagedNetwork(peerId, network.id, true);
+    const savedNetwork = store.get(network.userId, network.id)!;
+    const peerCoverage = new Set([peerId]);
+    expect((await actual.reconcile(savedNetwork, undefined, peerCoverage)).partialFailures).toEqual([]);
     expect((await host.inspect(network))!.references).toContain(`/1.0/instances/${peerOwner.containerName}?project=agentor`);
     expect(await actual.actualWorkerIds(network)).toEqual([peerId]);
     const beforeDenied = await peerRuntime.client.getInstance(peerOwner.containerName);
@@ -209,7 +211,7 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
     observedManager = { list: () => [] }; // orphaned cache must not hide a real native attachment
     await expect(actual.actualWorkerIds(network)).rejects.toThrow('unmapped');
     observedManager = peerManager;
-    await peerManager.setIncusManagedNetwork(peerId, network.id, false);
+    expect((await actual.reconcile(savedNetwork, [], peerCoverage)).partialFailures).toEqual([]);
     expect(await actual.actualWorkerIds(network)).toEqual([]);
     await peerRuntime.remove(peerOwner, peerIncarnation!); await peerRuntime.removeStorage(peerOwner);
     peerRuntime.client.dispose(); peerCreateSubmitted = false; peerIncarnation = undefined;
@@ -223,9 +225,8 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
     await expect(new IncusManagedNetworkHost({ ...config, incusProject: 'foreign' }).readiness()).rejects.toThrow();
     const absentId = randomUUID();
     await expect(host.ensure({ ...network, id: absentId, dockerName: `agentor-managed-${absentId}` })).rejects.toThrow();
-    await adapter.remove(network, bridge); adapterSubmitted = false;
-    const afterDocker = JSON.parse(await root(`sudo incus query /1.0/networks/${expectedName}`));
-    expect(afterDocker.config['ipv4.address']).toBe(`${bridge.gateway}/24`);
+    await actual.remove(savedNetwork, peerCoverage); adapterSubmitted = false; ensureSubmitted = false;
+    expect(await host.inspect(network)).toBe(null);
     await host.remove(network);
     await host.remove(network);
     ensureSubmitted = false;

@@ -6,6 +6,7 @@ import { authorizeManagedNetworkMutation } from '../../utils/managed-network-aut
 import { withWorkerNetworkMutation } from '../../utils/worker-group-manager';
 import { WorkerGroupHierarchy } from '../../utils/worker-group-hierarchy';
 import { reconcileCreatedManagedNetwork } from '../../utils/managed-network-update';
+import { operationSettlement } from '../../utils/operation-deadline';
 export default defineEventHandler(async event => {
   const { user } = requireAuth(event); const body: any = await readBody(event);
   return withWorkerNetworkMutation(user.id, async () => {
@@ -25,6 +26,7 @@ export default defineEventHandler(async event => {
     });
     setResponseStatus(event, 201); return result;
   } catch (error: any) {
+    if (error?.[operationSettlement]) throw error;
     throw createError({ statusCode: error?.statusCode === 500 ? 500 : 409, statusMessage: `Network creation failed: ${error?.message || 'Runtime reconciliation failed'}`, cause: error });
   }
   });

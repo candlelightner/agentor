@@ -6,6 +6,7 @@ import {
 import { WorkerGroupStore } from "../../orchestrator/server/utils/worker-group-store";
 import type { WorkerGroup } from "../../orchestrator/server/utils/worker-group-store";
 import type { ManagedNetwork } from "../../orchestrator/server/utils/managed-network-store";
+import { operationSettlement } from '../../orchestrator/server/utils/operation-deadline';
 
 const ownerId = "owner-a";
 const groupId = "group-a";
@@ -587,6 +588,21 @@ test('assignment rejects protected unchanged ancestor peer before desired member
   }));
   await expect(service.assignWorker(ownerId, 'moved', 'target')).rejects.toMatchObject({ statusCode: 423 });
   expect(seen).toEqual(['drifted', 'moved', 'sibling']); expect(assignments).toBe(0);
+});
+
+test('unsettled group dispatch retains desired references and does not immediately compensate', async () => {
+  let current = group(), updates = 0, reconciles = 0, release!: () => void;
+  const unsettled = new Promise<void>(resolve => { release = resolve; });
+  const error = Object.assign(new Error('native request unsettled'), { [operationSettlement]: unsettled });
+  const service = new WorkerGroupNetworkCoordinator(dependencies({
+    group: () => current, networks: () => [network],
+    update: async (_owner, _id, patch) => { updates++; current = { ...current, ...patch } as WorkerGroup; return current; },
+    reconcile: async () => { reconciles++; throw error; },
+  }));
+  try {
+    await expect(service.update(ownerId, groupId, { workerIds: ['new-worker'] })).rejects.toBe(error);
+    expect(updates).toBe(1); expect(reconciles).toBe(1); expect(current.workerIds).toEqual(['new-worker']);
+  } finally { release(); }
 });
 
 test("concurrent worker group patches preserve unrelated committed fields", async () => {
