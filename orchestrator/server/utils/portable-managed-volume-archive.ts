@@ -122,6 +122,145 @@ export async function validateIncusCanonicalRestoreArchive(
   return { entries: scan.entries.length, expandedBytes: scan.expandedBytes };
 }
 
+/** Explicit backup selections are not fixed-role archives. A selected file,
+ * directory or inert link keeps its basename wrapper; `/` has no wrapper.
+ * Validate unchanged GNU/PAX bytes, never repack binary filesystem metadata.
+ * This proves archive confinement only, not permission to write the selected
+ * guest destination or to attach account/host resources during restoration. */
+export async function validateIncusSelectedRestoreArchive(
+  archivePath: string,
+  selectedPath: string,
+  limits: { maxEntries?: number; maxExpandedBytes?: number; signal?: AbortSignal } = {},
+): Promise<PortableManagedVolumeArchiveSummary> {
+  if (!validSelectedPath(selectedPath)) throw invalidArchive("invalid selected backup path");
+  const scan = await scanRawTar(archivePath, {
+    maxEntries: Math.min(limits.maxEntries ?? MAX_PORTABLE_MANAGED_VOLUME_ARCHIVE_ENTRIES,
+      MAX_PORTABLE_MANAGED_VOLUME_ARCHIVE_ENTRIES),
+    maxExpandedBytes: Math.min(limits.maxExpandedBytes ?? MAX_PORTABLE_MANAGED_VOLUME_EXPANDED_BYTES,
+      MAX_PORTABLE_MANAGED_VOLUME_EXPANDED_BYTES),
+    allowPortablePax: true, requirePosixUstar: true, signal: limits.signal,
+  });
+  const paths = new Map<string, RawTarEntry["type"]>(), regularFiles = new Set<string>();
+  const wrapper = posix.basename(selectedPath);
+  const memberName = (raw: string, directory: boolean): string => {
+    if (!directory && raw.endsWith("/")) throw invalidArchive("archive contains a non-canonical non-directory path");
+    if (selectedPath === "/" && directory && (raw === "." || raw === "./")) return ".";
+    // GNU tar -C / . uses exactly one ./ prefix. Do not normalize traversal,
+    // repeated slashes or other aliases that might differ at extraction time.
+    let name = selectedPath === "/" && raw.startsWith("./") ? raw.slice(2) : raw;
+    if (directory && name.endsWith("/")) name = name.slice(0, -1);
+    if (!name || name.includes("\0") || name.includes("\\") || name.startsWith("/") ||
+        name === "." || name.endsWith("/") || name.split("/").includes("..") || posix.normalize(name) !== name ||
+        Buffer.byteLength(name) > MAX_PORTABLE_TAR_PATH_BYTES ||
+        selectedPath !== "/" && name !== wrapper && !name.startsWith(wrapper + "/"))
+      throw invalidArchive("archive path is outside the selected path or is non-canonical");
+    return name;
+  };
+  for (const entry of scan.entries) {
+    throwIfAborted(limits.signal);
+    const name = memberName(entry.name, entry.type === "directory");
+    if (paths.has(name)) throw invalidArchive("archive contains a duplicate or type-conflicting path");
+    paths.set(name, entry.type);
+    if (entry.type === "hardlink") {
+      if (!regularFiles.has(memberName(entry.linkName!, false)))
+        throw invalidArchive("hardlink must target an earlier regular file in the selected archive");
+    } else if (entry.type === "symlink") {
+      const target = entry.linkName;
+      if (!target || target.includes("\0") || target.includes("\\") || Buffer.byteLength(target) > MAX_PORTABLE_TAR_PATH_BYTES)
+        throw invalidArchive("archive contains an unsafe symlink");
+      const parent = posix.dirname(posix.join(selectedPath === "/" ? "/" : posix.dirname(selectedPath), name));
+      const absolute = target.startsWith("/") ? target : parent + "/" + target;
+      let depth = 0;
+      for (const part of absolute.split("/")) {
+        if (part === "..") { if (depth === 0) throw invalidArchive("archive symlink escapes the guest root"); depth -= 1; }
+        else if (part && part !== ".") depth += 1;
+      }
+    } else if (entry.type === "file") regularFiles.add(name);
+  }
+  if (selectedPath !== "/" && !paths.has(wrapper))
+    throw invalidArchive("archive is missing the selected path wrapper");
+  for (const path of paths.keys()) {
+    throwIfAborted(limits.signal);
+    for (let ancestor = posix.dirname(path); ancestor !== "."; ancestor = posix.dirname(ancestor)) {
+      const type = paths.get(ancestor);
+      if (type !== undefined && type !== "directory")
+        throw invalidArchive("archive writes below an explicit non-directory path");
+    }
+  }
+  return { entries: scan.entries.length, expandedBytes: scan.expandedBytes };
+}
+
+function validSelectedPath(path: string): boolean {
+  return typeof path === "string" && path.startsWith("/") && !path.includes("\0") && !path.includes("\\") &&
+    Buffer.byteLength(path) <= MAX_PORTABLE_TAR_PATH_BYTES && posix.normalize(path) === path &&
+    (path === "/" || !path.endsWith("/"));
+}
+
+/** Native selected-path wrapper decoding. Both dialects are checked before
+ * returning inner raw bytes; tar-stream's UTF-8 metadata repacking is never
+ * used for the native inverse. Legacy extraction remains unchanged. */
+export async function extractIncusSelectedRestorePayload(
+  payloadPath: string,
+  entries: Array<{ path: string; archive: string }>,
+  destination: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<Array<{ path: string; archivePath: string }>> {
+  if (!Array.isArray(entries) || entries.length > 32 ||
+      new Set(entries.map(entry => entry?.path)).size !== entries.length ||
+      new Set(entries.map(entry => entry?.archive)).size !== entries.length ||
+      entries.some(entry => !entry || !validSelectedPath(entry.path) || !/^paths\/[0-9]{1,2}\.tar$/.test(entry.archive)))
+    throw invalidArchive("invalid selected backup manifest");
+  const payload = await requireRegularFile(payloadPath);
+  if (payload.size > MAX_PORTABLE_MANAGED_VOLUME_COMPRESSED_PAYLOAD_BYTES)
+    throw invalidArchive("compressed selected backup payload exceeds the size limit");
+  throwIfAborted(options.signal);
+  await prepareEmptyDestination(destination);
+  const rawPayload = join(destination, ".selected-paths.payload.tar");
+  const staged: string[] = [];
+  let ownsRawPayload = false;
+  try {
+    let bytes = 0;
+    const counter = new Transform({ transform(chunk, _encoding, callback) {
+      bytes += Buffer.byteLength(chunk);
+      callback(bytes > MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES
+        ? invalidArchive("selected backup payload exceeds the aggregate size limit") : null, chunk);
+    } });
+    const output = await open(rawPayload, "wx", 0o600);
+    ownsRawPayload = true;
+    try {
+      await pipeline(createReadStream(payloadPath), createGunzip(), counter,
+        output.createWriteStream(), { signal: options.signal });
+    } finally { await output.close(); }
+    const scan = await scanRawTar(rawPayload, { maxEntries: entries.length,
+      maxExpandedBytes: MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES,
+      allowPortablePax: false, requirePosixUstar: true, signal: options.signal });
+    if (scan.entries.length !== entries.length || scan.entries.some(entry => entry.type !== "file" ||
+        !entries.some(expected => expected.archive === entry.name)) ||
+        new Set(scan.entries.map(entry => entry.name)).size !== entries.length)
+      throw invalidArchive("selected backup payload members do not match the manifest");
+    const result = [];
+    for (const entry of entries) {
+      throwIfAborted(options.signal);
+      const raw = scan.entries.find(item => item.name === entry.archive)!;
+      if (raw.size < 1024 || raw.size > MAX_PORTABLE_MANAGED_VOLUME_COMPRESSED_PAYLOAD_BYTES)
+        throw invalidArchive("selected backup member has an invalid size");
+      const archivePath = join(destination, entry.archive.replace("/", "-"));
+      const innerOutput = await open(archivePath, "wx", 0o600);
+      staged.push(archivePath);
+      try {
+        await pipeline(createReadStream(rawPayload, { start: raw.dataOffset, end: raw.dataOffset + raw.size - 1 }),
+          innerOutput.createWriteStream(), { signal: options.signal });
+      } finally { await innerOutput.close(); }
+      await validateIncusSelectedRestoreArchive(archivePath, entry.path, { signal: options.signal });
+      result.push({ path: entry.path, archivePath });
+    }
+    return result;
+  } catch (error) {
+    await Promise.all(staged.map(path => rm(path, { force: true }).catch(() => {})));
+    throw error;
+  } finally { if (ownsRawPayload) await rm(rawPayload, { force: true }).catch(() => {}); }
+}
+
 export async function writePortableManagedVolumePayload(
   items: Array<{ entry: PortableManagedVolumeEntry; archivePath: string }>,
   outputPath: string,

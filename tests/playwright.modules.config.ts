@@ -28,6 +28,8 @@ export default defineConfig({
     "api/portable-managed-volume-archive.spec.ts",
     "api/incus-canonical-restore-archive.spec.ts",
     "api/incus-canonical-restore-payload.spec.ts",
+    "api/incus-selected-restore-archive.spec.ts",
+    "api/incus-selected-restore-payload.spec.ts",
     "api/incus-canonical-restore.spec.ts",
     "api/incus-worker-import.spec.ts",
     "api/portable-managed-volume-plan.spec.ts",
