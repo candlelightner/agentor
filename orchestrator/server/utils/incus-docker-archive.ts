@@ -191,6 +191,72 @@ try:
 finally: os.close(fd)
 `;
 
+/** Fixed readonly offline block capture. Never initialize, replay the journal,
+ * repair a filesystem or inspect Docker internals. The owning helper is stopped
+ * and removed before the caller's lifecycle fence can be released. */
+export const INCUS_OFFLINE_DOCKER_ARCHIVE_SCRIPT = String.raw`
+import json,os,re,stat,subprocess,time
+env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C','LANG':'C'}
+deadline=time.monotonic()+560
+boot=open('/proc/sys/kernel/random/boot_id').read().strip()
+def command(args):
+ result=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,timeout=20)
+ if result.returncode or len(result.stdout)>65536: raise ValueError('Offline Docker observation failed: '+args[0])
+ return result.stdout.decode().strip()
+if os.path.lexists('/run/agentor/provisioned') or os.path.lexists('/run/agentor/worker.env'):
+ raise ValueError('Offline Docker helper is provisioned')
+# Only this disposable, networkless helper is changed. Native package units
+# can be pulled in on boot despite disablement; none may access the source.
+services=('agentor-worker.service','docker.socket','docker.service','containerd.service')
+command(['/usr/bin/systemctl','mask','--runtime',*services])
+command(['/usr/bin/systemctl','stop',*services])
+for service in services:
+ state=command(['/usr/bin/systemctl','show','--value','--property=ActiveState',service])
+ if state!='inactive': raise ValueError('Offline Docker helper unit is not inactive: '+service+' '+state)
+disks=set()
+for path in ('/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_incus_docker','/dev/disk/by-id/virtio-incus_docker'):
+ if os.path.exists(path):
+  disk=os.path.realpath(path)
+  if not stat.S_ISBLK(os.stat(disk).st_mode): raise ValueError('Invalid offline Docker block device')
+  disks.add(disk)
+if len(disks)!=1: raise ValueError('Offline Docker disk identity is ambiguous')
+disk=next(iter(disks));device=os.stat(disk).st_rdev
+if command(['/usr/bin/lsblk','-dn','-o','TYPE',disk])!='disk' or \
+ len(command(['/usr/bin/lsblk','-nr','-o','NAME',disk]).splitlines())!=1 or \
+ command(['/usr/sbin/blockdev','--getro',disk])!='1':
+ raise ValueError('Offline Docker disk must be one readonly whole block device')
+signature=dict(line.split('=',1) for line in command(['/usr/sbin/blkid','-p','-o','export',disk]).splitlines())
+if signature.get('TYPE')!='ext4': raise ValueError('Offline Docker filesystem must be existing ext4')
+header=command(['/usr/sbin/dumpe2fs','-h',disk])
+if not re.search(r'^Filesystem state:\s+clean\s*$',header,re.M):
+ raise ValueError('Offline Docker filesystem is not clean; no repair or journal replay is allowed')
+base='/run/agentor-docker-offline';root=base+'/docker'
+os.mkdir(base,0o700);os.mkdir(root,0o700)
+command(['/usr/bin/mount','-t','ext4','-o','ro,noload,nodev,nosuid,noexec',disk,root])
+def prove():
+ if open('/proc/sys/kernel/random/boot_id').read().strip()!=boot or os.path.realpath(root)!=root:
+  raise ValueError('Offline Docker boot/mount identity changed')
+ with open('/proc/self/mountinfo') as f: raw=f.read(1024*1024+1)
+ if len(raw)>1024*1024: raise ValueError('Offline Docker mount observation exceeds limit')
+ entries=[]
+ for line in raw.splitlines():
+  fields=line.split()
+  if len(fields)<10 or '-' not in fields: raise ValueError('Invalid offline Docker mount observation')
+  path=re.sub(r'\\([0-7]{3})',lambda m:chr(int(m.group(1),8)),fields[4])
+  if path.startswith(root+'/'): raise ValueError('Offline Docker has nested mounts')
+  if path==root: entries.append(fields)
+ if len(entries)!=1: raise ValueError('Offline Docker mount is ambiguous')
+ fields=entries[0];separator=fields.index('-')
+ if fields[2]!=str(os.major(device))+':'+str(os.minor(device)) or fields[3]!='/' or \
+  not {'ro','nodev','nosuid','noexec'}.issubset(fields[5].split(',')) or fields[separator+1]!='ext4':
+  raise ValueError('Offline Docker is not the exact readonly ext4 root')
+prove()
+result=subprocess.run(['/usr/bin/tar','--format=pax','--numeric-owner','--xattrs','--xattrs-include=*','--acls',
+ '--one-file-system','-cpf','-','-C',base,'docker'],env=env,timeout=max(1,deadline-time.monotonic()))
+if result.returncode: raise ValueError('Offline Docker logical archive failed')
+prove()
+`;
+
 /** Native ownership/boot/source proof is caller-owned. Cleanup intentionally
  * ignores caller cancellation, but must not mutate another VM incarnation. */
 export async function openIncusDockerArchive(client: IncusClient, name: string, volume: string, boot: string,

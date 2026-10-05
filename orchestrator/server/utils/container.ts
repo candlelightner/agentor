@@ -2022,6 +2022,36 @@ for p in sys.argv[1:]:
       : this.incusRuntime.openSelectedArchive(owner, incarnation, path, validate, signal);
   }
 
+  /** Fixed logical Docker root for stopped/archived native records only. The
+   * archive helper's entire lifetime remains inside existing backup admission. */
+  async captureOfflineDockerBackupWithLifecycleFenceHeld(id: string, archivePath: string, signal?: AbortSignal) {
+    const record = this.workerStore?.findById(id), info = this.get(id);
+    const archived = record?.status === 'archived' && !info;
+    if (!record || record.runtimeKind !== 'incus-vm' || record.deletionPending || record.incusRecreation ||
+        record.hostMountsRevoked || !isWorkerLifecycleMutationPending(id) ||
+        !archived && (record.status !== 'active' || !info || info.runtimeKind !== 'incus-vm' ||
+          info.userId !== record.userId || info.status !== 'stopped'))
+      throw Object.assign(new Error('Offline Docker backup requires settled stopped/archived authority and lifecycle admission'), { statusCode: 409 });
+    const incarnation = archived ? undefined : this.capturedIncusIncarnation(info!);
+    const capturedRecord = structuredClone(record), capturedInfo = info && structuredClone(info);
+    const generation = workerLifecycleGeneration(id);
+    const { useManagedVolumeManager } = await import('./managed-volume-manager');
+    const volumes = useManagedVolumeManager(); await volumes.init(); volumes.assertLiveRecoveryResolved(record.userId, id);
+    const capturedVolumes = structuredClone(volumes.store.forWorker(record.userId, id));
+    const validate = () => {
+      if (!isDeepStrictEqual(this.workerStore?.findById(id), capturedRecord) ||
+          !isDeepStrictEqual(this.get(id), capturedInfo) ||
+          !isDeepStrictEqual(volumes.store.forWorker(record.userId, id), capturedVolumes) ||
+          workerLifecycleGeneration(id) !== generation || !isWorkerLifecycleMutationPending(id))
+        throw new Error('Offline Docker backup runtime/storage authority changed');
+      volumes.assertLiveRecoveryResolved(record.userId, id);
+    };
+    validate();
+    const { MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES } = await import('./portable-managed-volume-archive');
+    return this.incusRuntime.captureOfflineDocker({ id, userId: record.userId, containerName: this.buildContainerName(id) },
+      incarnation, validate, { archivePath, maxBytes: MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES, signal });
+  }
+
   /**
    * `POST /api/containers/:id/files/upload` — extract uploaded files into the
    *  destination directory `destRel` (relative to /workspace). `entries` are

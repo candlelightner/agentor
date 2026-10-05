@@ -17,9 +17,13 @@ async function fixture(run: (fixture: any) => Promise<void>) {
   const owner = { id: randomUUID(), userId: randomUUID(), containerName: 'original-worker' };
   const sources = { workspace: 'canonical-workspace', agents: 'canonical-agents' };
   const calls: any[] = [], controller = new AbortController();
-  let instance: any;
+  let instance: any, copied: any;
+  const originalDocker = { name: 'canonical-docker', project: 'agentor', type: 'custom', content_type: 'block',
+    created_at: '2026-01-01T00:00:00Z', config: { 'volatile.uuid': randomUUID(), size: '5GiB' },
+    used_by: ['/1.0/instances/original-worker?project=agentor'], bytes: 'persisted Docker bytes' };
   const control = { failure: '', terminal: 'Success', operationMissing: false, capture: undefined as any,
-    source: undefined as any, acceptedPersistenceFailure: false, cancelledAfterCreate: false };
+    source: undefined as any, acceptedPersistenceFailure: false, cancelledAfterCreate: false,
+    cancelledAfterCopy: false };
   const receipt = async () => {
     const names = (await readdir(directory)).filter(name => name.endsWith('.json'));
     return names.length ? JSON.parse(await readFile(join(directory, names[0]), 'utf8')) : undefined;
@@ -36,6 +40,7 @@ async function fixture(run: (fixture: any) => Promise<void>) {
     if (control.failure === `pending-${kind}`) throw new Error('wait timed out');
   };
   const client: any = {
+    endpoint: 'https://incus.test',
     getImageAlias: async () => ({ target: 'a'.repeat(64) }),
     getImage: async () => ({ type: 'virtual-machine', fingerprint: 'a'.repeat(64), properties: {
       source_image_id: 'sha256:' + 'b'.repeat(64), recipe_id: 'c'.repeat(64), source_architecture: 'amd64',
@@ -43,23 +48,49 @@ async function fixture(run: (fixture: any) => Promise<void>) {
     getInstance: async (name: string) => { calls.push(['inspect', name]); return instance ? structuredClone(instance) : absent(); },
     createInstance: async (spec: any, accepted: any) => {
       calls.push(['spec', spec]);
+      if (spec.devices.docker && copied) {
+        expect((await receipt()).copy).toEqual({ created_at: copied.created_at, config: copied.config });
+        expect((await receipt()).pending).toEqual({ kind: 'create' });
+      }
       if (control.failure === 'rejected-create') { calls.push(['create']); throw new IncusRequestRejected('denied', 403, 403); }
       await mutate('create', accepted, () => { instance = { ...spec, status: 'Stopped',
-        config: { ...spec.config, 'volatile.uuid': randomUUID(), 'volatile.base_image': spec.source.fingerprint } }; });
+        config: { ...spec.config, 'volatile.uuid': randomUUID(), 'volatile.base_image': spec.source.fingerprint } };
+        if (copied) copied.used_by = [`/1.0/instances/${spec.name}?project=agentor`]; });
       if (control.cancelledAfterCreate) controller.abort(new Error('cancelled'));
       return structuredClone(instance);
     },
     startInstance: async (_name: string, accepted: any) => mutate('start', accepted, () => { instance.status = 'Running'; }),
     stopInstance: async (_name: string, _options: any, accepted: any) => mutate('stop', accepted, () => { instance.status = 'Stopped'; }),
-    deleteInstance: async (_name: string, accepted: any) => mutate('delete', accepted, () => { instance = undefined; }),
+    deleteInstance: async (_name: string, accepted: any) => mutate('delete', accepted, () => {
+      instance = undefined;
+      if (copied) copied.used_by = copied.used_by.filter((reference: string) =>
+        reference !== `/1.0/instances/${_name}?project=agentor`);
+    }),
+    getCustomVolume: async (pool: string, name: string) => {
+      calls.push(['volume', pool, name]);
+      if (name === originalDocker.name) return structuredClone(originalDocker);
+      return copied && copied.name === name ? structuredClone(copied) : absent();
+    },
+    copyCustomVolume: async (pool: string, source: string, name: string, config: any, accepted: any) => {
+      calls.push(['copy-spec', pool, source, name, config]);
+      if (control.failure === 'rejected-copy') { calls.push(['copy']); throw new IncusRequestRejected('copy denied', 403, 403); }
+      await mutate('copy', accepted, () => { copied = { name, project: 'agentor', type: 'custom', content_type: 'block',
+        created_at: '2026-02-01T00:00:00Z', config: { ...config, size: '5GiB', 'volatile.uuid': randomUUID() },
+        used_by: [], bytes: originalDocker.bytes }; });
+      if (control.cancelledAfterCopy) controller.abort(new Error('cancelled after copy'));
+    },
+    deleteCustomVolume: async (_pool: string, name: string, accepted: any) => {
+      expect(name).toBe(copied?.name); expect(copied?.used_by).toEqual([]);
+      return mutate('delete-copy', accepted, () => { copied = undefined; });
+    },
     request: async () => control.operationMissing ? absent() : { status: control.terminal, status_code: control.terminal === 'Running' ? 103 : 200 },
     execStream: async (_name: string, command: string[]) => {
       calls.push(['exec', command]); return { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
         result: Promise.resolve(0), close() { calls.push(['close']); } };
     },
   };
-  const helper = new IncusOfflineArchiveHelper({ dataDir, incusStoragePool: 'pool', incusWorkerImage: 'trusted-helper' } as Config, client, installation);
-  const invoke = (selected = sources) => helper.withGuest(owner, selected, async (name?: string) => {
+  const helper = new IncusOfflineArchiveHelper({ dataDir, incusStoragePool: 'pool', incusProject: 'agentor', incusWorkerImage: 'trusted-helper' } as Config, client, installation);
+  const invoke = (selected: any = sources) => helper.withGuest(owner, selected, async (name?: string) => {
     calls.push(['source', name]); if (control.source) await control.source(name);
   }, controller.signal, async (name: string, assertHelper: () => Promise<void>) => {
     calls.push(['capture', name]);
@@ -67,7 +98,8 @@ async function fixture(run: (fixture: any) => Promise<void>) {
     return control.capture ? control.capture(name, assertHelper) : 'archive';
   });
   try { await run({ helper, invoke, owner, sources, calls, control, receipt, directory, controller,
-    getInstance: () => instance, setInstance: (value: any) => { instance = value; } }); }
+    getInstance: () => instance, setInstance: (value: any) => { instance = value; },
+    getCopy: () => copied, getOriginalDocker: () => originalDocker }); }
   finally { await chmod(directory, 0o700).catch(() => {}); await rm(dataDir, { recursive: true, force: true }); }
 }
 
@@ -274,5 +306,109 @@ test('a peer receipt or temporary that vanishes after enumeration is skipped onl
       expect(disappeared).toBe(true);
       expect(calls.filter((item: any) => item[0] === 'create')).toHaveLength(1);
     } finally { fsPromises.opendir = original; syncBuiltinESMExports(); releasePeer(); }
+  });
+});
+
+test('Docker direct source is a fixed readonly block device with no copy, NIC or caller-selected mount path', async () => {
+  await fixture(async ({ invoke, calls, receipt, getOriginalDocker }) => {
+    const original = structuredClone(getOriginalDocker());
+    expect(await invoke({ docker: 'canonical-docker', copy: false })).toBe('archive');
+    const spec = calls.find((item: any) => item[0] === 'spec')[1];
+    expect(spec.profiles).toEqual([]);
+    expect(spec.devices).toEqual({ root: { type: 'disk', path: '/', pool: 'pool' },
+      docker: { type: 'disk', source: 'canonical-docker', pool: 'pool', readonly: 'true' } });
+    expect(calls.some((item: any) => ['copy', 'delete-copy'].includes(item[0]))).toBe(false);
+    expect(getOriginalDocker()).toEqual(original); expect(await receipt()).toBeUndefined();
+  });
+  for (const sources of [{ docker: 'canonical-docker' }, { docker: '../foreign', copy: false },
+    { docker: 'canonical-docker', copy: 'true' }, { docker: 'canonical-docker', copy: false, path: '/var/lib/docker' },
+    { docker: 'canonical-docker', copy: true, managed: 'canonical-managed' }]) await fixture(async ({ invoke, calls }) => {
+    await expect(invoke(sources)).rejects.toThrow('malformed');
+    expect(calls.some((item: any) => ['copy', 'create'].includes(item[0]))).toBe(false);
+  });
+});
+
+test('stopped Docker copy acknowledgement precedes helper create and cleanup removes helper before its exact copy', async () => {
+  await fixture(async ({ invoke, calls, receipt, owner, control, getCopy, getOriginalDocker }) => {
+    const original = structuredClone(getOriginalDocker());
+    control.capture = async (name: string, check: () => Promise<void>) => {
+      await check(); const state = await receipt(), copy = getCopy();
+      expect(state.copy).toEqual({ created_at: copy.created_at, config: copy.config });
+      expect(copy.bytes).toBe(original.bytes);
+      expect(copy.config).toMatchObject({ 'user.agentor.helper': 'offline-backup-copy',
+        'user.agentor.operation': state.id, 'user.agentor.worker': owner.id,
+        'user.agentor.owner': owner.userId, 'user.agentor.source': 'canonical-docker' });
+      expect(copy.used_by).toEqual([`/1.0/instances/${name}?project=agentor`]);
+      expect(getOriginalDocker()).toEqual(original); return 'Docker archive';
+    };
+    // A copied source must never require the helper in the original volume's references.
+    control.source = async () => { expect(getOriginalDocker()).toEqual(original); };
+    expect(await invoke({ docker: 'canonical-docker', copy: true })).toBe('Docker archive');
+    const spec = calls.find((item: any) => item[0] === 'spec')[1], copyCall = calls.find((item: any) => item[0] === 'copy-spec');
+    expect(copyCall.slice(1, 4)).toEqual(['pool', 'canonical-docker', spec.devices.docker.source]);
+    expect(spec.devices).toEqual({ root: { type: 'disk', path: '/', pool: 'pool' },
+      docker: { type: 'disk', source: copyCall[3], pool: 'pool', readonly: 'true' } });
+    expect(calls.filter((item: any) => ['copy', 'create', 'start', 'stop', 'delete', 'delete-copy'].includes(item[0]))
+      .map((item: any) => item[0])).toEqual(['copy', 'create', 'start', 'stop', 'delete', 'delete-copy']);
+    expect(getCopy()).toBeUndefined(); expect(await receipt()).toBeUndefined(); expect(getOriginalDocker()).toEqual(original);
+  });
+});
+
+test('lost, unresolved or expired Docker copy and removal acknowledgements quarantine without adoption or resubmission', async () => {
+  for (const kind of ['copy', 'delete-copy']) for (const mode of ['unknown', 'running', 'expired', 'terminal'])
+    await fixture(async ({ invoke, control, receipt, calls, getOriginalDocker }) => {
+      const original = structuredClone(getOriginalDocker());
+      control.failure = `${mode === 'unknown' ? 'unknown' : 'pending'}-${kind}`;
+      control.terminal = mode === 'terminal' ? 'Success' : 'Running'; control.operationMissing = mode === 'expired';
+      await expect(invoke({ docker: 'canonical-docker', copy: true })).rejects.toThrow();
+      const state = await receipt(); expect(state.pending.kind).toBe(kind);
+      if (mode === 'unknown') expect(state.pending.operation).toBeUndefined();
+      else expect(state.pending.operation).toMatch(/^\/1\.0\/operations\//);
+      if (kind === 'copy') expect(calls.some((item: any) => item[0] === 'create')).toBe(false);
+      const before = calls.filter((item: any) => ['copy', 'create', 'start', 'stop', 'delete', 'delete-copy'].includes(item[0]));
+      expect(before[before.length - 1][0]).toBe(kind);
+      await expect(invoke({ docker: 'canonical-docker', copy: true })).rejects.toThrow('Unresolved');
+      expect(calls.filter((item: any) => ['copy', 'create', 'start', 'stop', 'delete', 'delete-copy'].includes(item[0])))
+        .toEqual(before);
+      expect(getOriginalDocker()).toEqual(original);
+    });
+});
+
+test('Docker copy project, type, creation, configuration and reference drift retain nonauthoritative copy', async () => {
+  for (const drift of ['project', 'type', 'content', 'created', 'config', 'uuid', 'foreign-reference', 'extra-reference'])
+    await fixture(async ({ invoke, control, receipt, calls, getCopy, getOriginalDocker }) => {
+      const original = structuredClone(getOriginalDocker());
+      control.capture = async (_name: string, check: () => Promise<void>) => {
+        const copy = getCopy();
+        if (drift === 'project') copy.project = 'foreign';
+        if (drift === 'type') copy.type = 'image';
+        if (drift === 'content') copy.content_type = 'filesystem';
+        if (drift === 'created') copy.created_at = '2026-03-01T00:00:00Z';
+        if (drift === 'config') copy.config['raw.mount.options'] = 'rw';
+        if (drift === 'uuid') copy.config['volatile.uuid'] = randomUUID();
+        if (drift === 'foreign-reference') copy.used_by = ['https://foreign.test/1.0/instances/foreign?project=agentor'];
+        if (drift === 'extra-reference') copy.used_by.push('/1.0/instances/foreign?project=agentor');
+        await check(); return 'unsafe';
+      };
+      await expect(invoke({ docker: 'canonical-docker', copy: true })).rejects.toThrow(/copy .*changed|reference is foreign/);
+      expect(await receipt()).toBeDefined(); expect(getCopy()).toBeDefined();
+      expect(calls.some((item: any) => item[0] === 'delete-copy')).toBe(false);
+      expect(getOriginalDocker()).toEqual(original);
+    });
+});
+
+test('Docker cancellation after copy or capture removes only acknowledged copy; definitive rejection clears reservation', async () => {
+  for (const stage of ['copy', 'capture', 'rejected']) await fixture(async ({ invoke, control, receipt, calls, controller, getOriginalDocker }) => {
+    const original = structuredClone(getOriginalDocker());
+    if (stage === 'copy') control.cancelledAfterCopy = true;
+    if (stage === 'rejected') control.failure = 'rejected-copy';
+    if (stage === 'capture') control.capture = async (_name: string, check: () => Promise<void>) => {
+      controller.abort(new Error('capture cancelled')); await check(); return 'unsafe';
+    };
+    await expect(invoke({ docker: 'canonical-docker', copy: true })).rejects.toThrow();
+    expect(await receipt()).toBeUndefined(); expect(getOriginalDocker()).toEqual(original);
+    expect(calls.filter((item: any) => item[0] === 'delete-copy')).toHaveLength(stage === 'rejected' ? 0 : 1);
+    expect(calls.filter((item: any) => item[0] === 'create')).toHaveLength(stage === 'capture' ? 1 : 0);
+    expect(calls.filter((item: any) => item[0] === 'delete')).toHaveLength(stage === 'capture' ? 1 : 0);
   });
 });

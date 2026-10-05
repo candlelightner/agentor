@@ -1315,7 +1315,8 @@ export class IncusClient {
     );
   }
 
-  async deleteCustomVolume(pool: string, name: string): Promise<void> {
+  async deleteCustomVolume(pool: string, name: string,
+    onAccepted?: (operationPath: string | undefined) => Promise<void>): Promise<void> {
     const raw = await this.rawRequest(
       'DELETE',
       `/1.0/storage-pools/${encodeURIComponent(pool)}/volumes/custom/${encodeURIComponent(name)}`,
@@ -1323,11 +1324,18 @@ export class IncusClient {
 
     const json = JSON.parse(raw.body.toString('utf-8')) as IncusResponse<any>;
     if (json.type === 'error' || raw.statusCode >= 400) {
-      throw new IncusError(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code);
+      throw json.type === 'error'
+        ? new IncusRequestRejected(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code)
+        : new IncusError(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code);
     }
 
     if (json.type === 'async' && json.operation) {
-      await this.waitForOperation(json.operation);
+      const path = this.projectOperationPath(json.operation);
+      await onAccepted?.(path); await this.waitForOperation(path);
+    } else if (json.type === 'sync') {
+      await onAccepted?.(undefined);
+    } else if (onAccepted) {
+      throw new IncusError('Incus volume removal did not return an authoritative result');
     }
   }
 

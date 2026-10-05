@@ -22,7 +22,7 @@ import { isIP } from 'node:net';
 import { incusHostMountLayout, incusHostMountMetadata, assertIncusHostMountLayout } from './incus-host-mount-runtime';
 import { INCUS_CANONICAL_ARCHIVE_SCRIPT } from './incus-canonical-archive';
 import { INCUS_SELECTED_ARCHIVE_SCRIPT, nativeSelectedBackupPath } from './incus-selected-archive';
-import { PassThrough, Readable } from 'node:stream';
+import { PassThrough, Readable, Transform } from 'node:stream';
 import { snapshotIncusWorkerBackupRuntime, parseWorkerBackupRuntime, type WorkerBackupRuntimeSource } from './worker-backup-runtime';
 import { IncusOfflineArchiveHelper } from './incus-offline-archive-helper';
 import { writeGzipFile } from './worker-export';
@@ -30,10 +30,10 @@ import { INCUS_CANONICAL_RESTORE_SCRIPT } from './incus-canonical-restore';
 import { validateIncusCanonicalRestoreArchive, validatePortableManagedVolumeArchive } from './portable-managed-volume-archive';
 import { inspectIncusSelectedRestoreArchive, validateIncusSelectedRestoreArchive } from './portable-managed-volume-archive';
 import { planIncusSelectedRestore, INCUS_SELECTED_RESTORE_SCRIPT } from './incus-selected-restore';
-import { createReadStream } from 'node:fs';
+import { createReadStream, createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { isDeepStrictEqual } from 'node:util';
-import { openIncusDockerArchive } from './incus-docker-archive';
+import { openIncusDockerArchive, INCUS_OFFLINE_DOCKER_ARCHIVE_SCRIPT } from './incus-docker-archive';
 
 export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & {
   sshAuthorizedKeys?: string;
@@ -361,6 +361,77 @@ export class IncusWorkerRuntime {
       { statusCode: 409, code: 'INCUS_DOCKER_BACKUP_UNAVAILABLE' });
     return openIncusDockerArchive(this.client, owner.containerName, authority.dockerVolume,
       authority.boot.trim(), authority.validate, signal);
+  }
+
+  /** Retained Docker data is not an inactive disposable-root directory. Stop
+   * authority is read-only; a referenced block needs a private native copy,
+   * while an archived detached block can attach directly with readonly=true. */
+  async captureOfflineDocker(owner: IncusStorageOwner, incarnation: string | undefined,
+    validateRecord: () => void | Promise<void>, options: { archivePath: string; maxBytes: number; signal?: AbortSignal }) {
+    if (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 0) throw new Error('Invalid Docker archive byte limit');
+    await validateRecord();
+    const original = incarnation ? await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation) : undefined;
+    if (original && original.status !== 'Stopped') throw new Error('Offline Docker backup requires stopped compute');
+    if (!original) await this.assertAbsentCompute(owner);
+    const storage = await this.storage(), before = await storage.inspectVolume(owner, 'docker');
+    if (!before) throw Object.assign(new Error('Native Docker backup volume is unavailable'),
+      { statusCode: 409, code: 'INCUS_DOCKER_BACKUP_UNAVAILABLE' });
+    if (before.project !== this.config.incusProject || !Number.isFinite(Date.parse(before.created_at)) ||
+        !Array.isArray(before.used_by)) throw new Error('Offline Docker storage authority is unavailable');
+    const expectedDevice = { type: 'disk', pool: this.config.incusStoragePool, source: before.name };
+    if (original) for (const devices of [original.devices, original.expanded_devices ?? original.devices]) {
+      const matches = Object.entries(devices).filter(([, d]) => d.type === 'disk' &&
+        d.pool === this.config.incusStoragePool && d.source === before.name);
+      if (!sameDevice(devices.docker, expectedDevice) || matches.length !== 1 || matches[0]?.[0] !== 'docker')
+        throw new Error('Offline Docker source attachment is ambiguous');
+    }
+    const references = (values: string[]) => values.map(ref => {
+      const url = new URL(ref, this.client.endpoint);
+      if (url.origin !== new URL(this.client.endpoint).origin || url.username || url.password || url.hash ||
+          url.searchParams.getAll('project').length !== 1 || url.searchParams.get('project') !== this.config.incusProject ||
+          [...url.searchParams.keys()].some(key => key !== 'project')) throw new Error('Offline Docker reference is foreign');
+      return url.pathname;
+    }).sort();
+    const baseline = original ? [`/1.0/instances/${owner.containerName}`] : [];
+    if (!isDeepStrictEqual(references(before.used_by), baseline)) throw new Error('Offline Docker references are ambiguous');
+    const assertSource = async (helper?: string) => {
+      // Uncancelled cleanup must retain source proof, not resurrect compute.
+      await validateRecord();
+      if (original) {
+        const current = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+        if (current.status !== 'Stopped' || !isDeepStrictEqual(current.devices, original.devices) ||
+            !isDeepStrictEqual(current.expanded_devices, original.expanded_devices) ||
+            !isDeepStrictEqual(current.config, original.config)) throw new Error('Offline Docker source compute changed');
+      } else await this.assertAbsentCompute(owner);
+      const current = await this.client.getCustomVolume(this.config.incusStoragePool, before.name);
+      const expected = [...baseline, ...(!original && helper ? [`/1.0/instances/${helper}`] : [])].sort();
+      if (current.name !== before.name || current.project !== before.project || current.type !== before.type ||
+          current.content_type !== before.content_type || current.created_at !== before.created_at ||
+          !isDeepStrictEqual(current.config, before.config) || !Array.isArray(current.used_by) ||
+          !isDeepStrictEqual(references(current.used_by), expected)) throw new Error('Offline Docker source storage changed');
+      await validateRecord();
+    };
+    await assertSource(); let bytes = 0;
+    await new IncusOfflineArchiveHelper(this.config, this.client, await this.installationId())
+      .withGuest(owner, { docker: before.name, copy: !!original }, assertSource, options.signal, async (name, assertHelper) => {
+        const validate = async () => { await assertHelper(); await assertSource(name); };
+        await validate();
+        const session = await this.client.execStream(name, ['/usr/bin/python3', '-c', INCUS_OFFLINE_DOCKER_ARCHIVE_SCRIPT],
+          { command: [], user: 0, group: 0, cwd: '/', environment: { PATH: '/usr/bin:/bin', LC_ALL: 'C' },
+            signal: options.signal, timeoutMs: 10 * 60_000 });
+        let diagnostic = '';
+        session.stderr.on('data', chunk => { if (diagnostic.length < 4096) diagnostic += chunk.toString().slice(0, 4096 - diagnostic.length); });
+        session.stdin.end();
+        try {
+          await Promise.all([session.result.then(code => { if (code !== 0) throw Object.assign(
+            new Error('Offline Docker logical capture failed; verify clean readonly ext4'), { guestExitCode: code, guestDiagnostic: diagnostic }); }),
+            pipeline(session.stdout, new Transform({ transform(chunk, _encoding, done) {
+              bytes += chunk.length; done(bytes > options.maxBytes ? new Error('Docker archive exceeds byte limit') : null, chunk);
+            } }), createWriteStream(options.archivePath, { flags: 'wx', mode: 0o600 }), { signal: options.signal })]);
+          await validate();
+        } finally { session.close(); }
+      });
+    await assertSource(); return bytes;
   }
 
   /** Internal managed capture supplies the helper's exact UUID/isolation and

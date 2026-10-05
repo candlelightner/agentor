@@ -37,6 +37,7 @@ export default defineConfig({
     "api/incus-selected-backup-live.spec.ts",
     "api/incus-docker-archive-live.spec.ts",
     "api/incus-docker-archive.spec.ts",
+    "api/incus-offline-docker-script.spec.ts",
     "api/incus-docker-restore-archive.spec.ts",
     "api/incus-canonical-restore.spec.ts",
     "api/incus-worker-import.spec.ts",

@@ -124,3 +124,27 @@ test('cached legacy handles cannot export durable native or archived records thr
     await expect(lstat(join(dataDir, 'tmp'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });
+
+test('offline native Docker backup requires lifecycle admission and settled stopped or archived authority without repair', async () => {
+  for (const archived of [false, true]) await fixture(async (manager, dataDir, info) => {
+    const store = new WorkerStore(dataDir); await store.init(); manager.setWorkerStore(store);
+    if (archived) {
+      manager.unregisterExternal(info.id); await store.upsert({ ...store.get(info.userId, info.id)!, status: 'archived' });
+    } else info.status = 'stopped';
+    let calls = 0;
+    manager.setIncusRuntime({ captureOfflineDocker: async (owner: any, uuid: string | undefined, validate: () => void, options: any) => {
+      calls++; expect(owner).toEqual({ id: info.id, userId: info.userId, containerName: info.containerName });
+      expect(uuid).toBe(archived ? undefined : info.containerId.slice(6)); expect(options.archivePath).toBe('/tmp/owned-archive.tar');
+      expect(options.maxBytes).toBe(100 * 1024 ** 3); validate();
+      await store.upsert({ ...store.get(info.userId, info.id)!, hostMountsRevoked: true });
+      expect(validate).toThrow('authority changed'); return 1024;
+    } } as any);
+    await expect(manager.captureOfflineDockerBackupWithLifecycleFenceHeld(info.id, '/tmp/owned-archive.tar')).rejects.toThrow('lifecycle admission');
+    expect(calls).toBe(0);
+    await withWorkerLifecycleMutation(info.id, async () => {
+      expect(await manager.captureOfflineDockerBackupWithLifecycleFenceHeld(info.id, '/tmp/owned-archive.tar')).toBe(1024);
+      await expect(manager.captureOfflineDockerBackupWithLifecycleFenceHeld(info.id, '/tmp/owned-archive.tar')).rejects.toThrow('settled stopped/archived');
+    });
+    expect(calls).toBe(1);
+  });
+});

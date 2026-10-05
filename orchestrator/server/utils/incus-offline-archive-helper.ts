@@ -6,13 +6,15 @@ import type { Config } from './config';
 import { IncusClient, IncusRequestRejected, type IncusInstance } from './incus-client';
 import { incusImageIdentity } from './incus-worker-image';
 import { isOperationHelperActive, registerOperationHelper } from './operation-helper-registry';
+import { isDeepStrictEqual } from 'node:util';
 
 type Owner = { id: string; userId: string; containerName: string };
 type Sources = { workspace: string; agents: string; managed?: never } |
-  { managed: string; workspace?: never; agents?: never };
-type Kind = 'create' | 'start' | 'stop' | 'delete';
+  { managed: string; workspace?: never; agents?: never } | { docker: string; copy: boolean };
+type Kind = 'create' | 'start' | 'stop' | 'delete' | 'copy' | 'delete-copy';
 type Recovery = { version: 1; id: string; installation: string; owner: Owner; sources: Sources;
-  fingerprint: string; instance?: string; pending?: { kind: Kind; operation?: string } };
+  fingerprint: string; instance?: string; copy?: { created_at: string; config: Record<string, string> };
+  pending?: { kind: Kind; operation?: string } };
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 const operation = /^\/1\.0\/operations\/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 const temporaryReceipt = /^([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})\.[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.tmp$/;
@@ -29,22 +31,60 @@ export class IncusOfflineArchiveHelper {
   private validate(value: unknown): asserts value is Recovery {
     const v = value as Recovery;
     const keys = v?.sources && Object.keys(v.sources).sort().join(',');
-    const validSources = keys === 'agents,workspace'
+    const validSources = keys === 'agents,workspace' && 'workspace' in v.sources
       ? safeName(v.sources.workspace) && safeName(v.sources.agents) && v.sources.workspace !== v.sources.agents
-      : keys === 'managed' && safeName(v.sources.managed);
+      : keys === 'managed' && 'managed' in v.sources ? safeName(v.sources.managed)
+      : keys === 'copy,docker' && 'docker' in v.sources && safeName(v.sources.docker) && typeof v.sources.copy === 'boolean';
     if (!v || v.version !== 1 || !uuid.test(v.id ?? '') || v.installation !== this.installation ||
         !uuid.test(v.owner?.id ?? '') || !safeName(v.owner?.userId) || !safeName(v.owner?.containerName) ||
         !validSources ||
         !/^[a-f0-9]{64}$/.test(v.fingerprint ?? '') || v.instance !== undefined && !uuid.test(v.instance) ||
-        v.pending && (!['create', 'start', 'stop', 'delete'].includes(v.pending.kind) ||
+        v.copy && (!('docker' in v.sources) || !v.sources.copy || !Number.isFinite(Date.parse(v.copy.created_at)) ||
+          !v.copy.config || Object.keys(v.copy.config).length > 16 ||
+          Object.values(v.copy.config).some(value => typeof value !== 'string' || value.length > 2048)) ||
+        v.pending && (!['create', 'start', 'stop', 'delete', 'copy', 'delete-copy'].includes(v.pending.kind) ||
           v.pending.operation !== undefined && !operation.test(v.pending.operation)))
       throw fail('Offline backup helper recovery authority is malformed; retain it for operator recovery.');
   }
 
   private name(state: Recovery) { return `abk-${state.id}`; }
+  private copyName(state: Recovery) { return `adb-${state.id}`; }
+  private copyConfiguration(state: Recovery) {
+    if (!('docker' in state.sources) || !state.sources.copy) throw fail('Invalid Docker backup copy authority.');
+    return { 'user.agentor.installation': this.installation, 'user.agentor.helper': 'offline-backup-copy',
+      'user.agentor.operation': state.id, 'user.agentor.worker': state.owner.id,
+      'user.agentor.owner': state.owner.userId, 'user.agentor.source': state.sources.docker };
+  }
+  private async inspectCopy(state: Recovery, helperAttached: boolean, allowMissing = false) {
+    let value;
+    try { value = await this.client.getCustomVolume(this.config.incusStoragePool, this.copyName(state)); }
+    catch (error) { if (allowMissing && missing(error)) return; throw error; }
+    const expected = this.copyConfiguration(state), references = helperAttached ? [`/1.0/instances/${this.name(state)}`] : [];
+    if (value.name !== this.copyName(state) || value.project !== this.config.incusProject ||
+        value.type !== 'custom' || value.content_type !== 'block' || !Number.isFinite(Date.parse(value.created_at)) ||
+        !Object.entries(expected).every(([key, item]) => value.config[key] === item) ||
+        Object.keys(value.config).some(key => !(key in expected) && !['size', 'volatile.uuid'].includes(key)) ||
+        state.copy && (value.created_at !== state.copy.created_at || !isDeepStrictEqual(value.config, state.copy.config)) ||
+        !Array.isArray(value.used_by) || value.used_by.length !== references.length)
+      throw fail('Offline Docker copy ownership/type/configuration changed; resources retained.');
+    const paths = value.used_by.map(ref => {
+      const url = new URL(ref, this.client.endpoint);
+      if (url.origin !== new URL(this.client.endpoint).origin || url.username || url.password || url.hash ||
+          url.searchParams.getAll('project').length !== 1 || url.searchParams.get('project') !== this.config.incusProject ||
+          [...url.searchParams.keys()].some(key => key !== 'project')) throw fail('Offline Docker copy reference is foreign.');
+      return url.pathname;
+    });
+    if (!isDeepStrictEqual(paths.sort(), references.sort())) throw fail('Offline Docker copy references changed.');
+    return value;
+  }
   private devices(state: Recovery) {
     const devices: Record<string, Record<string, string>> = {
       root: { type: 'disk', path: '/', pool: this.config.incusStoragePool } };
+    if ('docker' in state.sources) {
+      devices.docker = { type: 'disk', pool: this.config.incusStoragePool, readonly: 'true',
+        source: state.sources.copy ? this.copyName(state) : state.sources.docker };
+      return devices;
+    }
     const mounts = state.sources.managed !== undefined ? { managed: [state.sources.managed, '/volume'] }
       : { workspace: [state.sources.workspace!, '/workspace'], agents: [state.sources.agents!, '/home/agent/.agent-data'] };
     for (const [key, [source, path]] of Object.entries(mounts))
@@ -103,21 +143,27 @@ export class IncusOfflineArchiveHelper {
       await rename(temporary, path()); await dir!.sync(); state = next;
     };
     const submit = async (kind: Kind, call: (accepted: (path?: string) => Promise<void>) => Promise<unknown>) => {
-      await persist({ ...state!, pending: { kind } }); submitted = true;
+      await persist({ ...state!, pending: { kind } });
+      if (kind !== 'copy' && kind !== 'delete-copy') submitted = true;
       try {
         await call(async acknowledged => {
           if (acknowledged !== undefined && !operation.test(acknowledged)) throw fail('Invalid accepted helper operation.');
-          await persist({ ...state!, pending: acknowledged ? { kind, operation: acknowledged } : undefined });
+          await persist({ ...state!, pending: acknowledged ? { kind, operation: acknowledged }
+            : kind === 'copy' ? { kind } : undefined });
         });
       } catch (error) {
         if (error instanceof IncusRequestRejected) { await persist({ ...state!, pending: undefined });
           if (kind === 'create') submitted = false; }
         throw error;
       }
-      await persist({ ...state!, pending: undefined });
+      // Keep the copy's submission proof until its exact created_at/config
+      // acknowledgement has been captured, including synchronous responses.
+      if (kind !== 'copy') await persist({ ...state!, pending: undefined });
     };
     const assertHelper = async () => { signal?.throwIfAborted();
-      if ((await this.inspect(state!))?.status !== 'Running') throw fail('Offline backup helper is not running.'); };
+      if ((await this.inspect(state!))?.status !== 'Running') throw fail('Offline backup helper is not running.');
+      if (state!.copy) await this.inspectCopy(state!, true);
+    };
     const cleanup = async () => {
       if (!reserved) return;
       if (state!.pending) {
@@ -125,8 +171,11 @@ export class IncusOfflineArchiveHelper {
         const observed = await this.client.request<{ status: string; status_code: number }>('GET', state!.pending.operation);
         if (!['Success', 'Failure', 'Cancelled'].includes(observed.status) || observed.status_code < 200)
           throw fail('Offline backup helper operation is unresolved; recovery retained.');
-        // Even terminal create readback cannot manufacture an incarnation.
-        if (!state!.instance) throw fail('Offline backup helper incarnation was not captured; recovery retained.');
+        // Terminal readback cannot manufacture create/copy authority.
+        if (state!.pending.kind === 'copy' && !state!.copy)
+          throw fail('Offline Docker copy acknowledgement was not captured; recovery retained.');
+        if (state!.pending.kind !== 'copy' && state!.pending.kind !== 'delete-copy' && !state!.instance)
+          throw fail('Offline backup helper incarnation was not captured; recovery retained.');
         await persist({ ...state!, pending: undefined });
       }
       if (submitted && !state!.instance) throw fail('Offline backup helper incarnation was not captured; recovery retained.');
@@ -141,6 +190,16 @@ export class IncusOfflineArchiveHelper {
           if (helper.status !== 'Stopped') throw fail('Offline backup helper is not stopped; recovery retained.');
           await submit('delete', accepted => this.client.deleteInstance(helper!.name, accepted));
           if (await this.inspect(state!, true)) throw fail('Offline backup helper removal is incomplete.');
+        }
+      }
+      if ('docker' in state!.sources && state!.sources.copy) {
+        await assertSource();
+        // Only after exact helper removal can a copy be unreferenced. Before
+        // acknowledgement, never adopt coincidentally same-named storage.
+        if (state!.copy && await this.inspectCopy(state!, false, true)) {
+          await submit('delete-copy', accepted => this.client.deleteCustomVolume(this.config.incusStoragePool,
+            this.copyName(state!), accepted));
+          if (await this.inspectCopy(state!, false, true)) throw fail('Offline Docker copy removal is incomplete.');
         }
       }
       // Source proof after known removal excludes the helper's former reference.
@@ -188,6 +247,17 @@ export class IncusOfflineArchiveHelper {
       state = { version: 1, id, installation: this.installation, owner: { ...owner }, sources: { ...sources }, fingerprint: image.fingerprint };
       this.validate(state); await persist(state); reserved = true;
       await assertSource(); signal?.throwIfAborted();
+      if ('docker' in sources && sources.copy) {
+        try { await this.client.getCustomVolume(this.config.incusStoragePool, this.copyName(state));
+          throw fail('Offline Docker backup requires absent temporary copy storage.');
+        } catch (error) { if (!missing(error)) throw error; }
+        await submit('copy', accepted => this.client.copyCustomVolume(this.config.incusStoragePool, sources.docker,
+          this.copyName(state!), this.copyConfiguration(state!), accepted));
+        const copied = await this.inspectCopy(state, false);
+        if (!copied) throw fail('Offline Docker copy acknowledgement is unavailable.');
+        await persist({ ...state!, copy: { created_at: copied.created_at, config: copied.config }, pending: undefined });
+        await assertSource(); signal?.throwIfAborted();
+      }
       let created: IncusInstance | undefined;
       await submit('create', async accepted => { created = await this.client.createInstance({
         name: this.name(state!), type: 'virtual-machine', profiles: [],

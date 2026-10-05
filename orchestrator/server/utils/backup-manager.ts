@@ -2591,12 +2591,12 @@ export class BackupManager {
     const native = live?.runtimeKind === 'incus-vm' || durable?.runtimeKind === 'incus-vm';
     if (native && (!durable || durable.userId !== userId)) throw new Error('Native backup owner changed');
     if (native && explicitPaths.length) {
-      if (live?.status !== 'running')
-        throw Object.assign(new Error('Explicit native paths require a running worker; disposable stopped/root disks are not backup storage'),
-          { statusCode: 409, code: 'INCUS_SELECTED_BACKUP_REQUIRES_RUNNING' });
       const { nativeExplicitBackupPath } = await import('./incus-selected-archive');
       for (let index = 0; index < explicitPaths.length; index++)
         explicitPaths[index] = nativeExplicitBackupPath(explicitPaths[index]!);
+      if (live?.status !== 'running' && explicitPaths.some(path => path !== '/var/lib/docker'))
+        throw Object.assign(new Error('Explicit native root paths require a running worker; retained Docker data has a separate logical backend'),
+          { statusCode: 409, code: 'INCUS_SELECTED_BACKUP_REQUIRES_RUNNING' });
     }
     if (live?.containerId || native && durable?.status === 'archived') {
       if (explicitPaths.length && !native)
@@ -2614,7 +2614,7 @@ export class BackupManager {
         { signal },
       );
       if (explicitPaths.length)
-        await this.appendExplicitBackupPaths(destination, live!.containerId, explicitPaths, signal, native ? id : undefined);
+        await this.appendExplicitBackupPaths(destination, live?.containerId ?? '', explicitPaths, signal, native ? id : undefined);
       return;
     }
     if (explicitPaths.length)
@@ -2945,7 +2945,9 @@ export class BackupManager {
       for (const [index, selected] of paths.entries()) {
         signal.throwIfAborted();
         const file = join(dir, `${index}.tar`);
-        await pipeline(
+        if (nativeWorkerId && selected === '/var/lib/docker' && useContainerManager().get(nativeWorkerId)?.status !== 'running')
+          await useContainerManager().captureOfflineDockerBackupWithLifecycleFenceHeld(nativeWorkerId, file, signal);
+        else await pipeline(
           nativeWorkerId ? await useContainerManager().getSelectedBackupArchiveWithLifecycleFenceHeld(nativeWorkerId, selected, signal)
             : await useDockerService().getArchive(containerId, selected, signal),
           createWriteStream(file, { mode: 0o600 }),

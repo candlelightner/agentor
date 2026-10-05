@@ -10,6 +10,67 @@ import {
 import type { Config } from "../../orchestrator/server/utils/config";
 
 test.describe("IncusClient unit tests", () => {
+  test('volume removal awaits private project acceptance before operation GET, including callback persistence failure', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    const operation = '/1.0/operations/12345678-1234-1234-1234-123456789abc', order: string[] = [];
+    let release!: () => void, entered!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const accepting = new Promise<void>(resolve => { entered = resolve; });
+    client.rawRequest = async (method, path) => {
+      // This observes the same project URL builder used by the real transport.
+      expect((client as any).buildUrl(path).searchParams.get('project')).toBe('agentor');
+      order.push(method + ':' + path);
+      return { statusCode: method === 'DELETE' ? 202 : 200, headers: {}, body: Buffer.from(JSON.stringify(method === 'DELETE'
+        ? { type: 'async', operation: operation + '?project=agentor' }
+        : { type: 'sync', metadata: { status: 'Success', status_code: 200 } })) };
+    };
+    const pending = client.deleteCustomVolume('pool', 'private copy', async path => {
+      expect(path).toBe(operation); order.push('accept:' + path); entered(); await barrier;
+    });
+    await accepting;
+    expect(order).toEqual(['DELETE:/1.0/storage-pools/pool/volumes/custom/private%20copy', 'accept:' + operation]);
+    release(); await pending;
+    expect(order[2]).toBe('GET:' + operation);
+    order.length = 0;
+    const error = new Error('private acknowledgement fsync failed');
+    await expect(client.deleteCustomVolume('pool', 'copy', async () => { throw error; })).rejects.toBe(error);
+    expect(order).toEqual(['DELETE:/1.0/storage-pools/pool/volumes/custom/copy']);
+  });
+
+  test('volume sync removal acknowledges undefined once; ambiguous replies never acknowledge or wait', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    const operation = '/1.0/operations/12345678-1234-1234-1234-123456789abc';
+    let body: any = { type: 'sync' }, statusCode = 200;
+    const acknowledgements: Array<string | undefined> = [], requests: string[] = [];
+    client.rawRequest = async (method, path) => {
+      requests.push(method + ':' + path);
+      return { statusCode, headers: {}, body: Buffer.from(typeof body === 'string' ? body : JSON.stringify(body)) };
+    };
+    const remove = () => client.deleteCustomVolume('pool', 'copy', async path => { acknowledgements.push(path); });
+    await remove(); expect(acknowledgements).toEqual([undefined]); expect(requests).toHaveLength(1);
+    for (const envelope of [{ type: 'async' }, { type: 'async', operation: operation + '?project=foreign' },
+      { type: 'async', operation: 'https://foreign.invalid' + operation },
+      { type: 'async', operation: '/1.0/instances/foreign?project=agentor' }, { type: 'unknown' }, 'not-json']) {
+      body = envelope; statusCode = 202; acknowledgements.length = 0; requests.length = 0;
+      await expect(remove()).rejects.not.toBeInstanceOf(IncusRequestRejected);
+      expect(acknowledgements).toEqual([]); expect(requests).toHaveLength(1);
+    }
+    body = { type: 'sync' }; statusCode = 502; acknowledgements.length = 0; requests.length = 0;
+    await expect(remove()).rejects.not.toBeInstanceOf(IncusRequestRejected);
+    expect(acknowledgements).toEqual([]); expect(requests).toHaveLength(1);
+  });
+
+  test('volume removal definitive daemon error preserves rejection type without callback or operation GET', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    let acknowledgements = 0, requests = 0;
+    client.rawRequest = async () => {
+      requests++;
+      return { statusCode: 403, headers: {}, body: Buffer.from(JSON.stringify({ type: 'error', error: 'restricted', error_code: 403 })) };
+    };
+    await expect(client.deleteCustomVolume('pool', 'copy', async () => { acknowledgements++; })).rejects.toBeInstanceOf(IncusRequestRejected);
+    expect(acknowledgements).toBe(0); expect(requests).toBe(1);
+  });
+
   test('offline helper lifecycle persists project-scoped acceptance before waiting and never treats uncertain replies as rejection', async () => {
     const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
     const operation = '/1.0/operations/12345678-1234-1234-1234-123456789abc';
