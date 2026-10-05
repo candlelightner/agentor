@@ -1239,6 +1239,26 @@ export class ContainerManager {
     return this.containers.get(id);
   }
 
+  /** Managed-network requests share the ordinary lifecycle fence. Startup
+   * hooks already inside that fence call the runtime leaf directly instead. */
+  async setIncusManagedNetwork(id: string, networkId: string, attach: boolean): Promise<void> {
+    return this.withExistingWorkerLifecycleMutation(id, async () => {
+      const info = this.get(id)!, record = this.workerStore?.get(info.userId, id);
+      if (!record || record.status !== 'active' || record.runtimeKind !== 'incus-vm' || record.deletionPending ||
+          record.incusRecreation || info.runtimeKind !== 'incus-vm')
+        throw new Error('Incus worker is not authoritative for managed network mutation');
+      // A network PUT includes the whole device map: do not touch it while
+      // existing managed-storage authority is unsettled. Read/fence only; no
+      // recovery, freezer or transaction machinery is reused here.
+      const { ManagedVolumeStore, assertIncusLiveResolved } = await import('./managed-volume-store');
+      const volumes = new ManagedVolumeStore(this.config.dataDir);
+      await volumes.loadUser(info.userId);
+      for (const volume of volumes.forWorker(info.userId, id)) assertIncusLiveResolved(volume);
+      await this.incusRuntime.setManagedNetwork({ id, userId: info.userId, containerName: info.containerName },
+        this.capturedIncusIncarnation(info), networkId, attach);
+    });
+  }
+
   /** Dispatch only command/file operations. Captured record and UUID fence a
    * delayed exec or disconnect cleanup away from a replacement VM. */
   workerCommands(id: string): DockerService | IncusWorkerCommands {

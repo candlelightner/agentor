@@ -8,6 +8,10 @@ import { ManagedNetworkStore } from '../../orchestrator/server/utils/managed-net
 import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker-runtime';
 import { incusManagedBridgeIdentity, incusManagedNetworkDevice } from '../../orchestrator/server/utils/incus-managed-network-identity';
 import type { Config } from '../../orchestrator/server/utils/config';
+import { ContainerManager } from '../../orchestrator/server/utils/container';
+import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
+import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volume-store';
+import { isWorkerLifecycleMutationPending } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 
@@ -54,6 +58,40 @@ test('live managed NIC hotplug writes readable primary-safe MAC rule before upda
     await f.runtime.setManagedNetwork(f.owner, f.incarnation, f.network.id, false);
     expect(f.instance.devices).toEqual(before);
     expect(f.calls.some((call: any[]) => call[0] === 'exec' && call[2][0] === 'rm')).toBe(true);
+  });
+});
+
+test('manager admission uses current durable Incus authority and lifecycle fence; pending storage blocks device mutation', async () => {
+  await fixture(async f => {
+    const dataDir = (f.runtime as any).config.dataDir;
+    const manager = new ContainerManager({} as any, { dataDir, containerPrefix: 'agentor-worker' } as Config);
+    manager.setIncusRuntime(f.runtime);
+    const workers = new WorkerStore(dataDir); await workers.init(); manager.setWorkerStore(workers);
+    await workers.upsert({ id: f.owner.id, userId: f.owner.userId, status: 'active', runtimeKind: 'incus-vm', displayName: 'test' } as any);
+    const info = { ...f.owner, containerId: `incus:${f.incarnation}`, runtimeKind: 'incus-vm', status: 'running' } as any;
+    manager.registerExternal(info);
+    (manager as any).assertOwnerExists = async (owner: string) => { expect(owner).toBe(f.owner.userId); };
+    const leaf = f.runtime.setManagedNetwork.bind(f.runtime);
+    f.runtime.setManagedNetwork = async (...args: any[]) => {
+      expect(isWorkerLifecycleMutationPending(f.owner.id)).toBe(true);
+      return leaf(...args);
+    };
+    await manager.setIncusManagedNetwork(f.owner.id, f.network.id, true);
+    expect(f.instance.devices[f.identity.key]).toEqual(f.device);
+    await manager.setIncusManagedNetwork(f.owner.id, f.network.id, false);
+    f.calls.length = 0;
+    const volumes = new ManagedVolumeStore(dataDir);
+    const volume = await volumes.create(f.owner.userId, f.owner.id, '/opt/pending-storage', undefined, 'incus-vm');
+    await volumes.save({ ...volume, incusLive: { id: randomUUID(), incarnation: f.incarnation, bootId: f.state.boot, attachment: 'unknown' } });
+    await expect(manager.setIncusManagedNetwork(f.owner.id, f.network.id, true)).rejects.toThrow();
+    expect(f.calls).toEqual([]);
+    await volumes.save({ ...volume, incusLive: undefined });
+    await workers.upsert({ ...workers.get(f.owner.userId, f.owner.id)!, deletionPending: true });
+    await expect(manager.setIncusManagedNetwork(f.owner.id, f.network.id, true)).rejects.toThrow('not authoritative');
+    expect(f.calls).toEqual([]);
+    await workers.upsert({ ...workers.get(f.owner.userId, f.owner.id)!, deletionPending: undefined, runtimeKind: 'legacy-docker' });
+    await expect(manager.setIncusManagedNetwork(f.owner.id, f.network.id, true)).rejects.toThrow('not authoritative');
+    expect(f.calls).toEqual([]);
   });
 });
 
