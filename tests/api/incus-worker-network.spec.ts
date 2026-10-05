@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveIncusPrimaryLease } from "../../orchestrator/server/utils/incus-worker-network";
@@ -12,6 +12,9 @@ import { ContainerManager } from "../../orchestrator/server/utils/container";
 import { WorkerStore } from "../../orchestrator/server/utils/worker-store";
 import { withWorkerLifecycleMutation, withOwnerWorkerRuntimeSetup, isWorkerLifecycleMutationActive,
   isWorkerLifecycleMutationPending, workerLifecycleGeneration } from "../../orchestrator/server/utils/worker-lifecycle-coordinator";
+import { ManagedNetworkStore } from '../../orchestrator/server/utils/managed-network-store';
+import { WorkerGroupStore } from '../../orchestrator/server/utils/worker-group-store';
+import { incusManagedBridgeIdentity, incusManagedNetworkDevice, incusManagedNetworkAuthority } from '../../orchestrator/server/utils/incus-managed-network-identity';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 
@@ -39,6 +42,83 @@ function fixture() {
   const leases: IncusNetworkLease[] = [{ address: "10.20.30.42", hwaddr: mac, type: "dynamic", hostname: "foreign-guest-claim" }];
   return { instance, network, leases, resolve: (peers: IncusInstance[] = []) => resolveIncusPrimaryLease(instance, peers, network, leases, "workers") };
 }
+
+test('secondary NIC authority comes from durable own-account all/selected/group membership and is revocable', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'agentor-secondary-authority-'));
+  try {
+    const installation = await backupInstallationId(dir), owner = { id: 'test', userId: 'owner' };
+    const store = new ManagedNetworkStore(dir), groups = new WorkerGroupStore(dir);
+    const all = await store.create(owner.userId, 'all', 'all');
+    const selected = await store.create(owner.userId, 'selected', 'selected');
+    await store.update(owner.userId, selected.id, { workerIds: [owner.id] });
+    const root = await groups.create(owner.userId, 'root'), child = await groups.create(owner.userId, 'child', root.id);
+    await groups.update(owner.userId, child.id, { workerIds: [owner.id] });
+    const grouped = await store.create(owner.userId, 'grouped', 'group', root.id);
+    const foreign = await store.create('other-owner', 'foreign', 'all');
+    const expected = Object.fromEntries([all, selected, grouped].map(network => [
+      incusManagedBridgeIdentity(installation, network).key, incusManagedNetworkDevice(installation, owner.id, network)]));
+    expect(await incusManagedNetworkAuthority(dir, owner)).toEqual(expected);
+    expect(Object.values(expected).every(nic => nic.network !== incusManagedBridgeIdentity(installation, foreign).name)).toBe(true);
+    await store.update(owner.userId, selected.id, { workerIds: [] });
+    await groups.update(owner.userId, child.id, { workerIds: [] });
+    expect(await incusManagedNetworkAuthority(dir, owner)).toEqual({
+      [incusManagedBridgeIdentity(installation, all).key]: incusManagedNetworkDevice(installation, owner.id, all) });
+    for (const patch of [{ workerIds: owner.id }, { workerIds: [42] }, { userId: undefined },
+      { parentId: 42 }, { parentId: 'missing-parent' }, { parentId: child.id }]) {
+      await writeFile(join(dir, 'users', owner.userId, 'worker-groups.json'), JSON.stringify([
+        { ...root, ...patch }, child ]));
+      await expect(incusManagedNetworkAuthority(dir, owner)).rejects.toThrow();
+    }
+    await writeFile(join(dir, 'users', owner.userId, 'worker-groups.json'), JSON.stringify([root, child]));
+    await writeFile(join(dir, 'users', owner.userId, 'managed-networks.json'), JSON.stringify([{ ...all, userId: undefined }]));
+    await expect(incusManagedNetworkAuthority(dir, owner)).rejects.toThrow('owner authority');
+    await writeFile(join(dir, 'users', owner.userId, 'managed-networks.json'), '[corrupt');
+    await expect(incusManagedNetworkAuthority(dir, owner)).rejects.toThrow();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('registered exact filtered secondary NIC preserves primary lease; foreign, modified and revoked NICs fail closed', () => {
+  const f = fixture();
+  const network = { id: '11111111-2222-4333-8444-555555555555', userId: 'owner',
+    dockerName: 'agentor-managed-11111111-2222-4333-8444-555555555555' } as any;
+  const installation = '11111111-2222-4333-8444-555555555556';
+  const key = incusManagedBridgeIdentity(installation, network).key;
+  const secondary = incusManagedNetworkDevice(installation, 'test', network);
+  f.instance.devices[key] = { ...secondary };
+  const resolve = (approved = { [key]: secondary }) => resolveIncusPrimaryLease(f.instance, [], f.network, f.leases, 'workers', approved);
+  expect(resolve()).toEqual({ address: '10.20.30.42', incarnation: uuid });
+  expect(() => resolve({})).toThrow('network identity');
+  for (const patch of [{ network: 'foreign' }, { hwaddr: '02:ff:ff:ff:ff:fe' },
+    { 'security.ipv4_filtering': 'false' }, { 'security.mac_filtering': 'false' },
+    { 'security.ipv6_filtering': 'false' }, { 'ipv4.routes': '10.0.0.0/8' }, { parent: 'host-interface' }]) {
+    f.instance.devices[key] = { ...secondary, ...patch };
+    expect(() => resolve()).toThrow('network identity');
+  }
+  f.instance.devices[key] = { ...secondary };
+  f.instance.config[`volatile.${key}.hwaddr`] = '02:ff:ff:ff:ff:fe';
+  expect(() => resolve()).toThrow('network identity');
+  delete f.instance.config[`volatile.${key}.hwaddr`];
+  f.instance.devices.eth0!.type = 'disk';
+  expect(() => resolve()).toThrow('network identity');
+});
+
+test('runtime rechecks durable membership when resolving an owned VM with a managed secondary NIC', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'agentor-secondary-runtime-'));
+  try {
+    const installation = await backupInstallationId(dir), f = fixture(), owner = { id: 'test', userId: 'owner', containerName: f.instance.name };
+    f.instance.config['user.agentor.installation'] = installation;
+    const store = new ManagedNetworkStore(dir), network = await store.create(owner.userId, 'registered', 'all');
+    const key = incusManagedBridgeIdentity(installation, network).key;
+    f.instance.devices[key] = incusManagedNetworkDevice(installation, owner.id, network);
+    const client = { getInstance: async () => structuredClone(f.instance), listInstances: async () => [f.instance],
+      getNetwork: async () => f.network, getNetworkLeases: async () => f.leases };
+    const runtime = new IncusWorkerRuntime({ dataDir: dir, containerPrefix: 'agentor-worker', incusNetwork: 'workers' } as Config, client as any);
+    expect(await runtime.resolvePrimaryAddress(owner)).toEqual({ address: '10.20.30.42', incarnation: uuid });
+    const read = client.getInstance; let calls = 0;
+    client.getInstance = async () => { if (++calls === 2) await store.remove(owner.userId, network.id); return read(); };
+    await expect(runtime.resolvePrimaryAddress(owner)).rejects.toThrow('network identity');
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
 
 test("host filtered dynamic lease is authority, not guest network reports or hostnames", () => {
   const f = fixture();

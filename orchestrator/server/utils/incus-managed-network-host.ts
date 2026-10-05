@@ -1,9 +1,9 @@
-import { createHash } from 'node:crypto';
 import { isIP } from 'node:net';
 import type { Config } from './config';
 import { IncusClient } from './incus-client';
 import { readBackupInstallationId } from './backup-installation';
 import type { ManagedNetwork } from './managed-network-store';
+import { incusManagedBridgeIdentity } from './incus-managed-network-identity';
 
 export interface IncusManagedBridge {
   name: string;
@@ -37,13 +37,8 @@ export class IncusManagedNetworkHost {
   }
 
   private async identity(network: ManagedNetwork) {
-    if (!/^[a-zA-Z0-9_-]{1,128}$/.test(network.userId) ||
-        !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(network.id) ||
-        network.dockerName !== `agentor-managed-${network.id}`)
-      throw new Error('Invalid managed network authority');
     const installation = await readBackupInstallationId(this.config.dataDir);
-    const name = 'am' + createHash('sha256').update(`${installation}:${network.userId}:${network.id}`)
-      .digest('hex').slice(0, 12);
+    const { name } = incusManagedBridgeIdentity(installation, network);
     return { installation, name };
   }
 

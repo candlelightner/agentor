@@ -9,6 +9,9 @@ import { IncusClient } from '../../orchestrator/server/utils/incus-client';
 import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker-runtime';
 import { zeroUserEnvVars } from '../../orchestrator/server/utils/user-env-store';
 import type { Config } from '../../orchestrator/server/utils/config';
+import { ManagedNetworkStore } from '../../orchestrator/server/utils/managed-network-store';
+import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
+import { incusManagedBridgeIdentity, incusManagedNetworkDevice } from '../../orchestrator/server/utils/incus-managed-network-identity';
 
 const run = promisify(execFile);
 const sshArguments = ['-p', '22375', '-i', '/workspace/agentor-kata-vm-access.ZgLVo9uk/id_ed25519',
@@ -73,7 +76,7 @@ test('restricted allowlist denies arbitrary bridge creation', async () => {
 test('filtered secondary managed bridge preserves primary routing and supports mixed Docker VM members', async () => {
   test.skip(process.env.INCUS_MANAGED_NETWORK_TEST !== 'true', 'Explicit disposable mixed network gate');
   test.setTimeout(600_000);
-  const id = randomUUID(), bridge = `amn${id.replaceAll('-', '').slice(0, 10)}`;
+  const id = randomUUID();
   const dockerName = `agentor-network-capability-${id}`, peerName = `agentor-network-peer-${id}`;
   const dataDir = await mkdtemp(join(tmpdir(), 'agentor-network-capability-'));
   const config = { dataDir, incusEnabled: true, incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor',
@@ -83,6 +86,12 @@ test('filtered secondary managed bridge preserves primary routing and supports m
     incusInternalGatewayUrl: 'http://10.159.68.1:38000', workerImagePrefix: '', workerImage: 'agentor-worker:latest' } as Config;
   const runtime = new IncusWorkerRuntime(config), client = runtime.client;
   const owner = { id, userId: 'managed-network-capability', containerName: `agentor-worker-${id}` };
+  const store = new ManagedNetworkStore(dataDir);
+  const managedNetwork = await store.create(owner.userId, 'registered mixed bridge gate', 'selected');
+  await store.update(owner.userId, managedNetwork.id, { workerIds: [id] });
+  const networkIdentity = incusManagedBridgeIdentity(await backupInstallationId(dataDir), managedNetwork);
+  const bridge = networkIdentity.name, deviceKey = networkIdentity.key;
+  const secondary = incusManagedNetworkDevice(networkIdentity.installation, id, managedNetwork);
   const options = { ...owner, dockerEnabled: false, userEnv: zeroUserEnvVars(owner.userId),
     environmentJson: { networkMode: 'full', allowedDomains: [], dockerEnabled: false, setupScript: '', envVars: '', exposeApis: {} },
     capabilitiesJson: [], instructionsJson: [], workerJson: { id, displayName: 'mixed bridge gate', repos: [], initScript: '', gitName: '', gitEmail: '' } };
@@ -95,7 +104,7 @@ test('filtered secondary managed bridge preserves primary routing and supports m
   let allowlisted = false, installation: string | undefined;
   const inspectBridge = async () => JSON.parse(await root(`sudo incus query '/1.0/networks/${bridge}'`));
   const assertBridge = async () => expect(await inspectBridge()).toMatchObject({ name: bridge, type: 'bridge', managed: true,
-    config: { 'user.agentor.network-id': id, 'user.agentor.owner': owner.userId,
+    config: { 'user.agentor.network-id': managedNetwork.id, 'user.agentor.owner': owner.userId,
       'user.agentor.installation': installation } });
   try {
     const instance = await runtime.create(options); incarnation = instance.config['volatile.uuid'];
@@ -106,7 +115,7 @@ test('filtered secondary managed bridge preserves primary routing and supports m
     const resolver = await checked(['resolvectl', 'dns', 'eth0']);
     await root(`sudo incus query -X POST /1.0/networks -d '${JSON.stringify({ name: bridge, type: 'bridge', config: {
       'ipv4.address': 'auto', 'ipv4.nat': 'false', 'ipv6.address': 'none',
-      'user.agentor.network-id': id, 'user.agentor.owner': owner.userId,
+      'user.agentor.network-id': managedNetwork.id, 'user.agentor.owner': owner.userId,
       'user.agentor.installation': installation } })}'`);
     bridgeCreated = true; await assertBridge();
     // Scope the diagnostic grant to this exact owned fixture, preserving
@@ -128,14 +137,13 @@ test('filtered secondary managed bridge preserves primary routing and supports m
     // Incus's NIC name is not a guest interface rename for QEMU VMs. Match a
     // host-assigned MAC before hotplug, earlier than image netplan catchalls.
     // Secondary DHCP receives no route, DNS, domain or IPv6 RA authority.
-    const secondaryMac = '02:' + id.replaceAll('-', '').slice(0, 10).match(/../g)!.join(':');
+    const secondaryMac = secondary.hwaddr!;
     await client.pushFile(owner.containerName, '/run/systemd/network/00-agentor-managed.network',
       `[Match]\nMACAddress=${secondaryMac}\n[Network]\nDHCP=ipv4\nIPv6AcceptRA=no\n[DHCPv4]\nUseRoutes=no\nUseDNS=no\nUseDomains=no\n`, { mode: 0o644 });
     await checked(['networkctl', 'reload']);
     const current = await client.getInstance(owner.containerName);
     await client.updateInstanceDevices(owner.containerName, { ...current.devices,
-      managed: { type: 'nic', name: 'agn0', hwaddr: secondaryMac, network: bridge, 'security.ipv4_filtering': 'true',
-        'security.mac_filtering': 'true', 'security.ipv6_filtering': 'true' } });
+      [deviceKey]: secondary });
     await expect.poll(async () => {
       const state = await client.getInstanceState(owner.containerName);
       return Object.values(state.network ?? {}).find(nic => nic.hwaddr === secondaryMac)
@@ -145,9 +153,14 @@ test('filtered secondary managed bridge preserves primary routing and supports m
       'networkctl status --all --no-pager; for f in /run/systemd/network/*.network /etc/systemd/network/*.network; do test ! -f "$f" || { echo "$f"; cat "$f"; }; done; ip -j route show default']));
     expect(await checked(['ip', '-j', 'route', 'show', 'default'])).toBe(routes);
     expect(await checked(['resolvectl', 'dns', 'eth0'])).toBe(resolver);
+    expect(await runtime.resolvePrimaryAddress(owner)).toEqual(primary);
+    await store.update(owner.userId, managedNetwork.id, { workerIds: [] });
+    await expect(runtime.resolvePrimaryAddress(owner)).rejects.toThrow('network identity');
+    await store.update(owner.userId, managedNetwork.id, { workerIds: [id] });
+    expect(await runtime.resolvePrimaryAddress(owner)).toEqual(primary);
     expect(await checked(['curl', '--fail', '--max-time', '5', `http://${prefix}.2:18181`])).toBe('mixed-member-ok');
     const leases = await client.getNetworkLeases(bridge), attached = await client.getInstance(owner.containerName);
-    const mac = attached.devices.managed.hwaddr || attached.config['volatile.managed.hwaddr'];
+    const mac = attached.devices[deviceKey].hwaddr || attached.config[`volatile.${deviceKey}.hwaddr`];
     expect(mac).toBe(secondaryMac);
     const address = leases.find(lease => lease.type === 'dynamic' && lease.hwaddr === mac)?.address;
     expect(address).toBeTruthy();

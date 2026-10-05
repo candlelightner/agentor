@@ -1,5 +1,5 @@
 import { isIP } from "node:net";
-import type { IncusInstance, IncusNetwork, IncusNetworkLease } from "./incus-client";
+import type { IncusDevice, IncusInstance, IncusNetwork, IncusNetworkLease } from "./incus-client";
 
 const macPattern = /^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/i;
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -11,7 +11,8 @@ function ipv4Number(address: string): number {
 /** Host-controlled inputs only. Guest state.network and lease hostnames are
  * deliberately irrelevant, even when supplied by an otherwise owned VM. */
 export function resolveIncusPrimaryLease(instance: IncusInstance, peers: IncusInstance[],
-  network: IncusNetwork, leases: IncusNetworkLease[], networkName: string): { address: string; incarnation: string } {
+  network: IncusNetwork, leases: IncusNetworkLease[], networkName: string,
+  approvedSecondary: Readonly<Record<string, IncusDevice>> = {}): { address: string; incarnation: string } {
   const fail: () => never = () => { throw new Error("Incus worker primary network identity is missing, unsafe or ambiguous"); };
   const config = instance.expanded_config ?? instance.config;
   const devices = instance.expanded_devices ?? instance.devices;
@@ -19,8 +20,18 @@ export function resolveIncusPrimaryLease(instance: IncusInstance, peers: IncusIn
   const nic = devices.eth0;
   const incarnation = config["volatile.uuid"];
   if (!nic || !incarnation) fail();
-  if (instance.status !== "Running" || !uuidPattern.test(incarnation) || nics.length !== 1 ||
-      nics[0]![0] !== "eth0" || nic.name !== "eth0" || nic.network !== networkName ||
+  for (const [key, secondary] of nics) {
+    if (key === 'eth0') continue;
+    const expected = approvedSecondary[key];
+    if (!expected || expected.type !== 'nic' || expected.network === networkName ||
+        expected['security.mac_filtering'] !== 'true' || expected['security.ipv4_filtering'] !== 'true' ||
+        expected['security.ipv6_filtering'] !== 'true' || !macPattern.test(expected.hwaddr ?? '') ||
+        Object.keys(secondary).length !== Object.keys(expected).length ||
+        Object.entries(expected).some(([field, value]) => secondary[field] !== value) ||
+        (config[`volatile.${key}.hwaddr`] && config[`volatile.${key}.hwaddr`]!.toLowerCase() !== expected.hwaddr!.toLowerCase())) fail();
+  }
+  if (instance.status !== "Running" || !uuidPattern.test(incarnation) ||
+      nic.type !== 'nic' || nic.name !== "eth0" || nic.network !== networkName ||
       nic["security.mac_filtering"] !== "true" || nic["security.ipv4_filtering"] !== "true" ||
       Object.keys(nic).some((key) => /^(ipv4|ipv6)\.routes/.test(key)) ||
       Object.keys(config).some((key) => key.startsWith("raw."))) fail();

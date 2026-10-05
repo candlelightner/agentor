@@ -14,6 +14,7 @@ import type { WorkerConfigRevision } from './worker-config-store';
 import { incusImageIdentity, sameIncusImageSource, type IncusWorkerImageIdentity } from './incus-worker-image';
 import { IncusManagedVolumeRuntime } from './incus-managed-volume-runtime';
 import type { StoredManagedVolume } from './managed-volume-store';
+import { incusManagedNetworkAuthority } from './incus-managed-network-identity';
 
 export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & {
   sshAuthorizedKeys?: string;
@@ -178,12 +179,14 @@ export class IncusWorkerRuntime {
     const [network, leases, peers] = await Promise.all([
       this.client.getNetwork(this.config.incusNetwork), this.client.getNetworkLeases(this.config.incusNetwork), this.client.listInstances(),
     ]);
-    const result = resolveIncusPrimaryLease(initial, peers, network, leases, this.config.incusNetwork);
+    const result = resolveIncusPrimaryLease(initial, peers, network, leases, this.config.incusNetwork,
+      await incusManagedNetworkAuthority(this.config.dataDir, owner));
     // A name survives recreation. Revalidate host incarnation/metadata after
     // the network reads rather than trusting a potentially stale name/IP pair.
     const current = await this.assertOwned(owner.containerName, owner.id);
     if (current.config["user.agentor.owner"] !== owner.userId) throw new Error("Incus worker account identity does not match");
-    const confirmed = resolveIncusPrimaryLease(current, peers, network, leases, this.config.incusNetwork);
+    const confirmed = resolveIncusPrimaryLease(current, peers, network, leases, this.config.incusNetwork,
+      await incusManagedNetworkAuthority(this.config.dataDir, owner));
     if (confirmed.incarnation !== result.incarnation || confirmed.address !== result.address)
       throw new Error("Incus worker changed during address resolution; retry");
     return confirmed;
