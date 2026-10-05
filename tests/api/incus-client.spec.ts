@@ -10,6 +10,31 @@ import {
 import type { Config } from "../../orchestrator/server/utils/config";
 
 test.describe("IncusClient unit tests", () => {
+  test('offline helper lifecycle persists project-scoped acceptance before waiting and never treats uncertain replies as rejection', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    const operation = '/1.0/operations/12345678-1234-1234-1234-123456789abc';
+    let response: any = { type: 'async', operation: operation + '?project=agentor' }, statusCode = 202;
+    const order: string[] = [];
+    client.rawRequest = async () => ({ statusCode, headers: {}, body: Buffer.from(JSON.stringify(response)) });
+    client.waitForOperation = async path => { order.push('wait:' + path); return {} as any; };
+    const accepted = async (path?: string) => { order.push('persist:' + path); };
+    const calls = [() => client.startInstance('helper', accepted),
+      () => client.stopInstance('helper', { force: true }, accepted), () => client.deleteInstance('helper', accepted)];
+    for (const call of calls) {
+      order.length = 0; response = { type: 'async', operation: operation + '?project=agentor' }; statusCode = 202;
+      await call(); expect(order).toEqual(['persist:' + operation, 'wait:' + operation + '?project=agentor']);
+      response = { type: 'async' }; order.length = 0;
+      await expect(call()).rejects.not.toBeInstanceOf(IncusRequestRejected); expect(order).toEqual([]);
+      response = { type: 'async', operation: operation + '?project=foreign' };
+      await expect(call()).rejects.not.toBeInstanceOf(IncusRequestRejected); expect(order).toEqual([]);
+      response = { type: 'error', error: 'denied', error_code: 403 }; statusCode = 403;
+      await expect(call()).rejects.toBeInstanceOf(IncusRequestRejected);
+      response = { type: 'sync' }; statusCode = 502;
+      await expect(call()).rejects.not.toBeInstanceOf(IncusRequestRejected);
+      statusCode = 200; order.length = 0;
+      await call(); expect(order).toEqual(['persist:undefined']);
+    }
+  });
   test('size helper copy/create retain project-scoped acceptance and distinguish explicit rejection from uncertain responses', async () => {
     const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
     let response: any = { type: 'async', operation: '/1.0/operations/copy-accepted?project=agentor' };

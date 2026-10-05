@@ -12,10 +12,10 @@ const exclusions = {
  * and same-filesystem bind overlays entering portable worker data. Filtering
  * happens before tar emits PAX records, preserving arbitrary binary xattrs. */
 export const INCUS_CANONICAL_ARCHIVE_SCRIPT = String.raw`
-import json,os,re,stat,sys
+import json,os,re,stat,subprocess,sys
 RULES=` + JSON.stringify(exclusions) + String.raw`
 ROOTS={"workspace":"/workspace","agents":"/home/agent/.agent-data"}
-if len(sys.argv)!=3 or sys.argv[1] not in ROOTS:
+if len(sys.argv) not in (3,4) or sys.argv[1] not in ROOTS or len(sys.argv)==4 and sys.argv[3]!="offline":
     raise ValueError("Invalid canonical archive role")
 root=ROOTS[sys.argv[1]]
 if not stat.S_ISDIR(os.lstat(root).st_mode) or os.path.realpath(root)!=root:
@@ -31,13 +31,24 @@ if len(raw)>1024*1024:
 def decode(value):
     return re.sub(rb"\\([0-7]{3})",lambda match:bytes([int(match.group(1),8)]),value).decode("utf-8","surrogateescape")
 mounts=[]
+readonly=[]
 for line in raw.splitlines():
     fields=line.split()
     if len(fields)<10 or b"-" not in fields:
         raise ValueError("Invalid canonical mount observation")
     mounts.append(decode(fields[4]))
+    if b"ro" in fields[5].split(b","):
+        readonly.append(decode(fields[4]))
 if mounts.count(root)!=1:
     raise ValueError("Canonical persistent root is not unambiguously mounted")
+if len(sys.argv)==4:
+    if root not in readonly or os.path.lexists("/run/agentor/provisioned"):
+        raise ValueError("Offline canonical archive requires readonly, unprovisioned storage")
+    for service in ("agentor-worker.service","docker.service"):
+        if subprocess.run(["/usr/bin/systemctl","is-active","--quiet",service],
+            env={"PATH":"/usr/bin:/bin","LC_ALL":"C"},stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL).returncode not in (3,4):
+            raise ValueError("Offline canonical archive helper service must be inactive")
 if any(path==root or root.startswith(path+"/") for path in extra):
     raise ValueError("An external overlay covers the canonical archive root")
 basename=os.path.basename(root)

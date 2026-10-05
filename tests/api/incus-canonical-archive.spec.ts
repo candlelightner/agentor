@@ -149,7 +149,7 @@ test('runtime snapshot describes pinned conversion source without exporting nati
 
 async function guestFixture(run: (value: {
   root: string; workspace: string; agents: string; mountinfo: string;
-  execute: (role: string, exclusions?: string[]) => ReturnType<typeof spawnSync>;
+  execute: (role: string, exclusions?: string[], offline?: boolean) => ReturnType<typeof spawnSync>;
 }) => Promise<void>) {
   const root = await mkdtemp(join(tmpdir(), 'agentor-canonical-guest-'));
   const workspace = join(root, 'workspace'), agents = join(root, 'home/agent/.agent-data'), mountinfo = join(root, 'mountinfo');
@@ -166,8 +166,9 @@ async function guestFixture(run: (value: {
     .replace('"agents":"/home/agent/.agent-data"', '"agents":' + JSON.stringify(agents))
     .replace('"/proc/self/mountinfo"', JSON.stringify(mountinfo));
   expect(script).not.toBe(INCUS_CANONICAL_ARCHIVE_SCRIPT);
-  const execute = (role: string, exclusions: string[] = []) =>
-    spawnSync('python3', ['-c', script, role, JSON.stringify(exclusions)], { timeout: 10_000, maxBuffer: 8 * 1024 * 1024 });
+  const execute = (role: string, exclusions: string[] = [], offline = false) =>
+    spawnSync('python3', ['-c', script, role, JSON.stringify(exclusions), ...(offline ? ['offline'] : [])],
+      { timeout: 10_000, maxBuffer: 8 * 1024 * 1024 });
   try { await run({ root, workspace, agents, mountinfo, execute }); }
   finally { await rm(root, { recursive: true, force: true }); }
 }
@@ -203,6 +204,14 @@ test('guest GNU tar preserves binary xattrs, uid/gid, permissions and links whil
       archive, join(target, 'private.bin')], { encoding: 'utf8' });
     expect(inspect.status, inspect.stderr).toBe(0);
     expect(JSON.parse(inspect.stdout)).toEqual({ uid: before.uid, gid: before.gid, attr: [0, 255, 128, 10] });
+  });
+});
+
+test('offline guest archive refuses writable roots before emitting archive bytes', async () => {
+  await guestFixture(async f => {
+    const result = f.execute('workspace', [], true);
+    expect(result.status).not.toBe(0); expect(result.stdout.length).toBe(0);
+    expect(result.stderr.toString()).toContain('readonly, unprovisioned storage');
   });
 });
 

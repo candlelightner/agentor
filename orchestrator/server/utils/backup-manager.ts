@@ -2551,6 +2551,7 @@ export class BackupManager {
   ) {
     assertSafeUserId(userId);
     const live = useContainerManager().get(id);
+    const durable = useWorkerStore().findById(id);
     // Archived records remain visible through ContainerManager, but they no
     // longer have a Docker container. Only take the native export path when
     // sync discovered an actual container; archived storage is handled by
@@ -2564,7 +2565,12 @@ export class BackupManager {
     const includeAgents =
       selectedPaths === undefined ||
       selectedPaths.includes("/home/agent/.agent-data");
-    if (live?.containerId) {
+    const native = live?.runtimeKind === 'incus-vm' || durable?.runtimeKind === 'incus-vm';
+    if (native && (!durable || durable.userId !== userId)) throw new Error('Native backup owner changed');
+    if (native && explicitPaths.length)
+      throw Object.assign(new Error('Explicit native backup path capture is not available yet'),
+        { statusCode: 409, code: 'INCUS_ARCHIVE_CAPABILITY_PENDING' });
+    if (live?.containerId || native && durable?.status === 'archived') {
       if (explicitPaths.length)
         await useContainerManager().assertBackupPathsReadable(id, explicitPaths);
       const result = await useContainerManager().exportWorkerWithLifecycleFenceHeld(id, {
@@ -2580,7 +2586,7 @@ export class BackupManager {
         { signal },
       );
       if (explicitPaths.length)
-        await this.appendExplicitBackupPaths(destination, live.containerId, explicitPaths, signal);
+        await this.appendExplicitBackupPaths(destination, live!.containerId, explicitPaths, signal);
       return;
     }
     if (explicitPaths.length)

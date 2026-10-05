@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { mkdtemp, mkdir, rm, readFile, lstat, readlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, readFile, lstat, readlink, readdir } from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { join } from 'node:path';
@@ -24,7 +24,7 @@ import { useWorkerConfigStore } from '../../orchestrator/server/utils/worker-con
 (globalThis as any).useDomainMappingStore ??= useDomainMappingStore;
 (globalThis as any).useWorkerConfigStore ??= useWorkerConfigStore;
 
-test('real production native export preserves canonical bytes and binary metadata without account or nested mount data', async () => {
+test('real production running, stopped and archived native export preserves canonical metadata without changing source compute', async () => {
   test.skip(process.env.INCUS_BACKUP_CAPTURE_TEST !== 'true', 'Explicit serial disposable native backup gate');
   test.setTimeout(600_000);
   const dataDir = await mkdtemp(join(tmpdir(), 'agentor-native-backup-live-'));
@@ -119,8 +119,77 @@ with tarfile.open(sys.argv[1],'r:gz') as archive:
     expect(await exec(['cat', '/proc/sys/kernel/random/boot_id'])).toBe(boot);
     expect(await exec(['systemctl', 'show', '--property=MainPID', '--value', 'agentor-worker.service'])).toBe(servicePid);
     expect(store.get(owner.userId, id)).toMatchObject({ runtimeKind: 'incus-vm', desiredRuntimeStatus: 'running' });
+    const info = manager.get(id)!;
+    await runtime.stop(owner, incarnation); info.status = 'stopped';
+    await store.upsert({ ...store.get(owner.userId, id)!, desiredRuntimeStatus: 'stopped' });
+    const original = await runtime.client.getInstance(owner.containerName);
+    expect(original.status).toBe('Stopped'); expect(original.config['volatile.uuid']).toBe(incarnation);
+    const canonical = async () => Promise.all(['workspace', 'agents'].map(role =>
+      runtime.client.getCustomVolume(config.incusStoragePool, owner.containerName + '-' + role)));
+    let baseline = await canonical();
+    const nativeExec = runtime.client.execStream.bind(runtime.client), seenHelpers = new Set<string>();
+    runtime.client.execStream = async (name, command, options) => {
+      if (name !== owner.containerName && command[0] === '/usr/bin/python3') {
+        const helper = await runtime.client.getInstance(name);
+        expect(helper.config['user.agentor.worker']).toBe(id);
+        expect(helper.profiles).toEqual([]);
+        expect(Object.values(helper.expanded_devices ?? helper.devices).some(device => device.type === 'nic')).toBe(false);
+        for (const role of ['workspace', 'agents']) expect(helper.devices[role]).toMatchObject({
+          source: owner.containerName + '-' + role, pool: config.incusStoragePool, readonly: 'true' });
+        const isolation = await runtime.client.exec(name, ['bash', '-ec',
+          'test ! -e /run/agentor/provisioned; ! systemctl is-active --quiet agentor-worker; ! systemctl is-active --quiet docker; findmnt -n -o OPTIONS --mountpoint /workspace; findmnt -n -o OPTIONS --mountpoint /home/agent/.agent-data']);
+        expect(isolation.returnCode, isolation.stderr).toBe(0);
+        expect(isolation.stdout.trim().split('\n').every(line => line.split(',').includes('ro'))).toBe(true);
+        if (store.get(owner.userId, id)?.status === 'active') {
+          const current = await runtime.client.getInstance(owner.containerName);
+          expect(current.status).toBe('Stopped'); expect(current.config['volatile.uuid']).toBe(incarnation);
+          expect(current.devices).toEqual(original.devices);
+        } else await expect(runtime.client.getInstance(owner.containerName)).rejects.toMatchObject({ statusCode: 404 });
+        const during = await canonical();
+        for (const [index, volume] of during.entries()) {
+          expect(volume.config).toEqual(baseline[index]!.config);
+          expect(volume.created_at).toBe(baseline[index]!.created_at);
+          expect(volume.used_by.length).toBe(baseline[index]!.used_by.length + 1);
+        }
+        seenHelpers.add(name);
+      }
+      return nativeExec(name, command, options);
+    };
+    for (const mode of ['stopped', 'archived']) {
+      if (mode === 'archived') {
+        await runtime.remove(owner, incarnation); manager.unregisterExternal(id);
+        await store.upsert({ ...store.get(owner.userId, id)!, status: 'archived', desiredRuntimeStatus: 'stopped' });
+        baseline = await canonical();
+      }
+      const target = join(dataDir, mode + '.tar'), captured = await manager.exportWorker(id, { includeRootfs: false });
+      await pipeline(captured.stream, createWriteStream(target, { mode: 0o600 }));
+      const offline = await extractBundle(target, join(dataDir, mode + '-bundle'));
+      expect(offline.manifest.runtime).toEqual(extracted.manifest.runtime);
+      const inspectDir = join(dataDir, mode + '-inspect'); await mkdir(inspectDir);
+      await run('/usr/bin/tar', ['--xattrs', '--xattrs-include=*', '--no-same-owner', '-xzpf', offline.workspacePath!, '-C', inspectDir]);
+      expect(await readFile(join(inspectDir, 'workspace/canonical.bin'))).toEqual(await readFile(join(restored, 'workspace/canonical.bin')));
+      expect((await lstat(join(inspectDir, 'workspace/canonical.bin'))).ino)
+        .toBe((await lstat(join(inspectDir, 'workspace/canonical-hardlink'))).ino);
+      expect(await readlink(join(inspectDir, 'workspace/canonical-symlink'))).toBe('canonical.bin');
+      const attr = await run('python3', ['-c',
+        "import os,sys,json; print(json.dumps(list(os.getxattr(sys.argv[1],'user.agentor_binary'))))", join(inspectDir, 'workspace/canonical.bin')]);
+      expect(JSON.parse(attr.stdout)).toEqual([0,255,128,10]);
+      const listing = await run('/usr/bin/tar', ['-tzf', offline.agentsPath!]);
+      expect(listing.stdout).not.toContain('/auth.json'); expect(listing.stdout).not.toContain('.kilo/config');
+      expect(listing.stdout).not.toContain('.kilo/shared-data');
+      expect((await run('/usr/bin/tar', ['-xzOf', offline.agentsPath!, '.agent-data/.codex/sessions'])).stdout)
+        .toBe('persistent-agent-session');
+      expect(await canonical()).toEqual(baseline);
+      expect(await readdir(join(dataDir, 'incus-backup-helpers'))).toEqual([]);
+      if (mode === 'stopped') {
+        const current = await runtime.client.getInstance(owner.containerName);
+        expect(current.status).toBe('Stopped'); expect(current.devices).toEqual(original.devices);
+        expect(current.config['volatile.uuid']).toBe(incarnation);
+      }
+    }
+    expect(seenHelpers.size).toBe(2);
     await runtime.remove(owner, incarnation); await runtime.removeStorage(owner); cleaned = true;
-    console.info('Production native export binary metadata, agent secrets, nested mounts and rootfs exclusion verified');
+    console.info('Production running/stopped/archived canonical exports, binary metadata, readonly networkless helpers and unchanged source authority verified');
   } catch (error) { failure = error; console.error('Native backup capture gate failed', error); throw error; }
   finally {
     let cleanupError: unknown;

@@ -23,6 +23,8 @@ import { incusHostMountLayout, incusHostMountMetadata, assertIncusHostMountLayou
 import { INCUS_CANONICAL_ARCHIVE_SCRIPT } from './incus-canonical-archive';
 import { PassThrough } from 'node:stream';
 import { snapshotIncusWorkerBackupRuntime } from './worker-backup-runtime';
+import { IncusOfflineArchiveHelper } from './incus-offline-archive-helper';
+import { writeGzipFile } from './worker-export';
 
 export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & {
   sshAuthorizedKeys?: string;
@@ -127,12 +129,91 @@ export class IncusWorkerRuntime {
     await (await this.storage()).remove(owner);
   }
 
-  async backupRuntime(owner: IncusStorageOwner, incarnation: string) {
-    await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+  private async assertAbsentCompute(owner: IncusStorageOwner) {
+    try { await this.client.getInstance(owner.containerName); }
+    catch (error) { if ((error as { statusCode?: number }).statusCode === 404) return; throw error; }
+    throw new Error('Archived Incus backup has unexpected compute; explicit recovery is required');
+  }
+
+  async backupRuntime(owner: IncusStorageOwner, incarnation?: string) {
+    const validate = () => incarnation ? this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation)
+      : this.assertAbsentCompute(owner);
+    await validate();
     const identity = await (await this.storage()).imageIdentity(owner);
     if (!identity) throw new Error('Incus backup immutable source is missing');
-    await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    await validate();
     return snapshotIncusWorkerBackupRuntime(identity);
+  }
+
+  /** One networkless helper reads existing stopped/detached filesystem data.
+   * Source volumes and original compute/devices are never changed. */
+  async captureOfflineCanonical(owner: IncusStorageOwner, incarnation: string | undefined,
+    validateRecord: () => void | Promise<void>, options: { workspace?: string; agents?: string;
+      exclusions: string[]; signal?: AbortSignal }) {
+    const storage = await this.storage();
+    const original = incarnation ? await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation) : undefined;
+    if (original && original.status !== 'Stopped') throw new Error('Offline Incus backup requires stopped compute');
+    if (!original) await this.assertAbsentCompute(owner);
+    const volumes = {} as Record<'workspace' | 'agents', NonNullable<Awaited<ReturnType<IncusWorkerStorage['inspectVolume']>>>>;
+    for (const role of ['workspace', 'agents'] as const) {
+      const volume = await storage.inspectVolume(owner, role);
+      if (!volume || volume.project !== this.config.incusProject || !volume.created_at ||
+          !Number.isFinite(Date.parse(volume.created_at)) || !Array.isArray(volume.used_by))
+        throw new Error('Offline Incus canonical storage identity is unavailable');
+      const expected = { type: 'disk', pool: this.config.incusStoragePool, source: volume.name,
+        path: role === 'workspace' ? '/workspace' : '/home/agent/.agent-data' };
+      const devices = original && Object.entries(original.expanded_devices ?? original.devices).filter(([, device]) =>
+        device.type === 'disk' && device.pool === this.config.incusStoragePool && device.source === volume.name);
+      if (volume.used_by.length !== (original ? 1 : 0) || original &&
+          (!sameDevice(original.devices[role], expected) || devices?.length !== 1 || devices[0]?.[0] !== role ||
+            !sameDevice(devices[0]?.[1], expected)))
+        throw new Error('Offline Incus canonical storage references are ambiguous');
+      volumes[role] = volume;
+    }
+    const runtime = await this.backupRuntime(owner, incarnation);
+    const normalizeConfig = (value: Record<string, string>) => JSON.stringify(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
+    const assertSource = async (helperName?: string) => {
+      await validateRecord();
+      if (original) {
+        const current = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+        if (current.status !== 'Stopped' || JSON.stringify(current.devices) !== JSON.stringify(original.devices))
+          throw new Error('Offline Incus source compute changed during capture');
+      } else await this.assertAbsentCompute(owner);
+      for (const role of ['workspace', 'agents'] as const) {
+        const before = volumes[role], current = await this.client.getCustomVolume(this.config.incusStoragePool, before.name);
+        const references = (value: string[]) => value.map(ref => {
+          const url = new URL(ref, this.client.endpoint);
+          if (url.origin !== new URL(this.client.endpoint).origin || url.username || url.password || url.hash ||
+              url.searchParams.getAll('project').length !== 1 || url.searchParams.get('project') !== this.config.incusProject ||
+              [...url.searchParams.keys()].some(key => key !== 'project'))
+            throw new Error('Offline canonical storage reference is foreign');
+          return url.pathname;
+        });
+        const expected = references(before.used_by);
+        if (expected.some(ref => ref !== `/1.0/instances/${owner.containerName}`) || new Set(expected).size !== expected.length)
+          throw new Error('Offline canonical source references are ambiguous');
+        if (helperName) expected.push(`/1.0/instances/${helperName}`);
+        if (current.name !== before.name || current.project !== before.project || current.type !== before.type ||
+            current.content_type !== before.content_type || current.created_at !== before.created_at ||
+            normalizeConfig(current.config) !== normalizeConfig(before.config) || !Array.isArray(current.used_by) ||
+            JSON.stringify(references(current.used_by).sort()) !== JSON.stringify(expected.sort()))
+          throw new Error('Offline Incus canonical source authority changed during capture');
+      }
+      await validateRecord();
+    };
+    await assertSource();
+    const bytes = { workspace: 0, agents: 0 };
+    if (options.workspace || options.agents) await new IncusOfflineArchiveHelper(this.config, this.client,
+      await this.installationId()).withGuest(owner, { workspace: volumes.workspace.name, agents: volumes.agents.name },
+      assertSource, options.signal, async (name, assertHelper) => {
+        const validate = async () => { await assertHelper(); await assertSource(name); };
+        for (const role of ['workspace', 'agents'] as const) if (options[role]) {
+          const stream = await this.archiveStream(name, role, validate, options, true);
+          bytes[role] = await writeGzipFile(stream, options[role]!, options.signal);
+        }
+      });
+    await assertSource();
+    return { runtime, bytes };
   }
 
   /** Caller holds existing export lifecycle admission. Never allocate/start
@@ -152,9 +233,14 @@ export class IncusWorkerRuntime {
         throw new Error('Incus canonical archive storage attachment is ambiguous');
       await validateRecord();
     };
+    return this.archiveStream(owner.containerName, role, validate, options);
+  }
+
+  private async archiveStream(name: string, role: 'workspace' | 'agents', validate: () => Promise<void>,
+    options: { exclusions: string[]; signal?: AbortSignal }, offline = false) {
     await validate();
-    const session = await this.client.execStream(owner.containerName,
-      ['/usr/bin/python3', '-c', INCUS_CANONICAL_ARCHIVE_SCRIPT, role, JSON.stringify(options.exclusions)],
+    const session = await this.client.execStream(name,
+      ['/usr/bin/python3', '-c', INCUS_CANONICAL_ARCHIVE_SCRIPT, role, JSON.stringify(options.exclusions), ...(offline ? ['offline'] : [])],
       { command: [], user: 0, group: 0, cwd: '/', environment: { PATH: '/usr/bin:/bin', LC_ALL: 'C' },
         signal: options.signal, timeoutMs: 10 * 60_000 });
     const output = new PassThrough();

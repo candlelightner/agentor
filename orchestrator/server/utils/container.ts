@@ -4593,9 +4593,12 @@ for p in sys.argv[1:]:
       }) => void | Promise<void>;
     },
   ): Promise<{ stream: Readable; filename: string }> {
-    const snapshot = this.containers.get(id);
+    const archived = this.workerStore?.findById(id);
+    const snapshot = this.containers.get(id) ?? (archived?.runtimeKind === 'incus-vm' && archived.status === 'archived' ? archived : undefined);
     if (!snapshot) throw new Error("Container not found");
     return withOwnerWorkerLifecycleMutation(snapshot.userId, id, async () => {
+      if ((this.containers.get(id)?.userId ?? this.workerStore?.findById(id)?.userId) !== snapshot.userId)
+        throw new Error('Worker export owner changed during admission');
       if (instanceSnapshotActive())
         throw Object.assign(
           new Error("Worker export is unavailable during instance backup or restore. Retry afterwards."),
@@ -4622,7 +4625,16 @@ for p in sys.argv[1:]:
       }) => void | Promise<void>;
     },
   ): Promise<{ stream: Readable; filename: string }> {
-    const info = this.containers.get(id);
+    const archivedRecord = this.workerStore?.findById(id);
+    const cached = this.containers.get(id);
+    if (cached && archivedRecord && (cached.userId !== archivedRecord.userId || archivedRecord.status !== 'active' ||
+        normalizeWorkerRuntimeKind(cached.runtimeKind) !== normalizeWorkerRuntimeKind(archivedRecord.runtimeKind)))
+      throw Object.assign(new Error('Worker export cached and durable runtime authority disagree'), { statusCode: 409 });
+    const archivedNative = !cached && archivedRecord?.runtimeKind === 'incus-vm' && archivedRecord.status === 'archived';
+    const info = cached ?? (archivedNative ? {
+      ...archivedRecord, containerName: this.buildContainerName(id), containerId: '', status: 'stopped',
+      imageName: this.config.incusWorkerImage, imageId: archivedRecord.imageDigest ?? '',
+    } as ContainerInfo : undefined);
     if (!info) throw new Error("Container not found");
     if (info.status !== "running" && info.status !== "stopped") {
       // A worker that is creating/removing/error has no exportable container —
@@ -4635,12 +4647,16 @@ for p in sys.argv[1:]:
     }
 
     const native = info.runtimeKind === 'incus-vm';
+    const captureStatus = info.status;
+    const offlineNative = native && captureStatus === 'stopped';
+    const nativeIncarnation = native && !archivedNative ? this.capturedIncusIncarnation(info) : undefined;
     const capturedHandle = info.containerId, capturedGeneration = workerLifecycleGeneration(id);
     const validateNativeCapture = async () => {
       const check = () => {
         const current = this.get(id), record = this.workerStore?.get(info.userId, id);
-        if (!current || current.containerId !== capturedHandle || current.userId !== info.userId ||
-            current.status !== 'running' || !record || record.status !== 'active' ||
+        if ((!archivedNative && (!current || current.containerId !== capturedHandle || current.userId !== info.userId ||
+            current.status !== captureStatus)) || (archivedNative && current) ||
+            !record || record.status !== (archivedNative ? 'archived' : 'active') ||
             record.runtimeKind !== 'incus-vm' || record.deletionPending || record.incusRecreation ||
             workerLifecycleGeneration(id) !== capturedGeneration || !isWorkerLifecycleMutationPending(id))
           throw new Error('Incus export canonical runtime authority changed');
@@ -4654,8 +4670,8 @@ for p in sys.argv[1:]:
     if (native) {
       if (opts.includeRootfs) throw Object.assign(new Error('Incus root filesystem is disposable, not backup data'),
         { statusCode: 409, code: 'INCUS_DISPOSABLE_ROOTFS' });
-      if (info.status !== 'running' || opts.includeManagedVolumes)
-        throw Object.assign(new Error('Offline Incus or managed-volume archive capture is not available yet'),
+      if (opts.includeManagedVolumes)
+        throw Object.assign(new Error('Incus managed-volume archive capture is not available yet'),
           { statusCode: 409, code: 'INCUS_ARCHIVE_CAPABILITY_PENDING' });
       // Fence unresolved authority before creating staging files or opening
       // archive exec, not after canonical bytes were already captured.
@@ -4692,7 +4708,7 @@ for p in sys.argv[1:]:
       }));
 
     const tmpDir = join(this.config.dataDir, "tmp", `export-${randomUUID()}`);
-    await mkdir(tmpDir, { recursive: true });
+    await mkdir(tmpDir, { recursive: true, mode: 0o700 });
 
     // Single-shot temp-dir cleanup — fires on stream end/close/error, and runs
     // immediately if materialising the bundle throws before streaming starts
@@ -4728,6 +4744,12 @@ for p in sys.argv[1:]:
         pluginConfiguration.installations.length > 0;
       const { useManagedVolumeManager } = await import("./managed-volume-manager");
       const persistence = useManagedVolumeManager(); await persistence.init();
+      const nativeExclusions = [...(info.mounts ?? []).map(mount => mount.target),
+        ...persistence.store.forWorker(info.userId, id).filter(volume => volume.attached).map(volume => volume.target)];
+      const offlineCapture = offlineNative ? await this.incusRuntime.captureOfflineCanonical(info, nativeIncarnation,
+        validateNativeCapture, { exclusions: nativeExclusions, signal: opts.signal,
+          ...(includeWorkspace ? { workspace: join(tmpDir, BUNDLE_FILES.workspace) } : {}),
+          ...(includeAgents ? { agents: join(tmpDir, BUNDLE_FILES.agents) } : {}) }) : undefined;
       const portableCapture = opts.includeManagedVolumes === true
         ? await (await import("./portable-managed-volume-runtime"))
             .usePortableManagedVolumeRuntime()
@@ -4746,7 +4768,7 @@ for p in sys.argv[1:]:
           ? PORTABLE_MANAGED_VOLUME_EXPORT_VERSION
           : WORKER_EXPORT_VERSION,
         exportedAt: new Date().toISOString(),
-        runtime: native ? await this.incusRuntime.backupRuntime(info, this.capturedIncusIncarnation(info))
+        runtime: native ? offlineCapture?.runtime ?? await this.incusRuntime.backupRuntime(info, nativeIncarnation)
           : { version: 1, kind: 'legacy-docker' },
         source: {
           id: info.id,
@@ -4820,16 +4842,17 @@ for p in sys.argv[1:]:
       files.push({ name: BUNDLE_FILES.reconstruction, path: reconstructionPath });
 
       if (includeWorkspace) {
-        const exclusions = [...(info.mounts ?? []).map(mount => mount.target),
-          ...persistence.store.forWorker(info.userId, id).filter(volume => volume.attached).map(volume => volume.target)];
-        const wsSrc = native ? await this.incusRuntime.openCanonicalArchive(info, this.capturedIncusIncarnation(info),
-          'workspace', validateNativeCapture, { exclusions, signal: opts.signal })
-          : await this.dockerService.getArchive(info.containerId, EXPORT_WORKSPACE_PATH, opts.signal);
-        bytesProcessed += await writeGzipFile(
-          wsSrc,
-          join(tmpDir, BUNDLE_FILES.workspace),
-          opts.signal,
-        );
+        if (offlineCapture) bytesProcessed += offlineCapture.bytes.workspace;
+        else {
+          const wsSrc = native ? await this.incusRuntime.openCanonicalArchive(info, nativeIncarnation!,
+            'workspace', validateNativeCapture, { exclusions: nativeExclusions, signal: opts.signal })
+            : await this.dockerService.getArchive(info.containerId, EXPORT_WORKSPACE_PATH, opts.signal);
+          bytesProcessed += await writeGzipFile(
+            wsSrc,
+            join(tmpDir, BUNDLE_FILES.workspace),
+            opts.signal,
+          );
+        }
         files.push({
           name: BUNDLE_FILES.workspace,
           path: join(tmpDir, BUNDLE_FILES.workspace),
@@ -4838,19 +4861,20 @@ for p in sys.argv[1:]:
       await report("workspace", opts.includeRootfs ? 30 : 45);
 
       if (includeAgents) {
-        const exclusions = [...(info.mounts ?? []).map(mount => mount.target),
-          ...persistence.store.forWorker(info.userId, id).filter(volume => volume.attached).map(volume => volume.target)];
-        const agSrc = native ? await this.incusRuntime.openCanonicalArchive(info, this.capturedIncusIncarnation(info),
-          'agents', validateNativeCapture, { exclusions, signal: opts.signal })
-          : await this.dockerService.getArchive(info.containerId, EXPORT_AGENTS_PATH, opts.signal);
-        bytesProcessed += native ? await writeGzipFile(agSrc, join(tmpDir, BUNDLE_FILES.agents), opts.signal)
-          : await writeFilteredAgentsGz(
-          agSrc,
-          join(tmpDir, BUNDLE_FILES.agents),
-          CREDENTIAL_EXCLUDE_SUFFIXES,
-          SHARED_DATA_EXCLUDE_PREFIXES,
-          opts.signal,
-        );
+        if (offlineCapture) bytesProcessed += offlineCapture.bytes.agents;
+        else {
+          const agSrc = native ? await this.incusRuntime.openCanonicalArchive(info, nativeIncarnation!,
+            'agents', validateNativeCapture, { exclusions: nativeExclusions, signal: opts.signal })
+            : await this.dockerService.getArchive(info.containerId, EXPORT_AGENTS_PATH, opts.signal);
+          bytesProcessed += native ? await writeGzipFile(agSrc, join(tmpDir, BUNDLE_FILES.agents), opts.signal)
+            : await writeFilteredAgentsGz(
+              agSrc,
+              join(tmpDir, BUNDLE_FILES.agents),
+              CREDENTIAL_EXCLUDE_SUFFIXES,
+              SHARED_DATA_EXCLUDE_PREFIXES,
+              opts.signal,
+            );
+        }
         files.push({
           name: BUNDLE_FILES.agents,
           path: join(tmpDir, BUNDLE_FILES.agents),

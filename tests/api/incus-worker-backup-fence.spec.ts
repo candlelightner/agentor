@@ -45,11 +45,21 @@ test('unresolved canonical managed storage rejects export before staging or gues
   });
 });
 
-test('native rootfs and not-yet-supported offline/managed capture fail explicitly without legacy fallback', async () => {
-  for (const option of ['rootfs', 'stopped', 'managed']) await fixture(async (manager, dataDir, info) => {
-    if (option === 'stopped') info.status = 'stopped';
+test('native rootfs and not-yet-supported managed capture fail explicitly without legacy fallback', async () => {
+  for (const option of ['rootfs', 'managed']) await fixture(async (manager, dataDir, info) => {
     await expect(manager.exportWorker(info.id, { includeRootfs: option === 'rootfs', includeManagedVolumes: option === 'managed' }))
       .rejects.toMatchObject({ code: option === 'rootfs' ? 'INCUS_DISPOSABLE_ROOTFS' : 'INCUS_ARCHIVE_CAPABILITY_PENDING' });
+    await expect(lstat(join(dataDir, 'tmp'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+});
+
+test('cached legacy handles cannot export durable native or archived records through Docker', async () => {
+  for (const status of ['active', 'archived'] as const) await fixture(async (manager, dataDir, info) => {
+    info.runtimeKind = 'legacy-docker'; info.containerId = 'cached-legacy';
+    const store = new WorkerStore(dataDir); await store.init();
+    await store.upsert({ ...store.get(info.userId, info.id)!, status });
+    manager.setWorkerStore(store);
+    await expect(manager.exportWorker(info.id, { includeRootfs: false })).rejects.toThrow('runtime authority disagree');
     await expect(lstat(join(dataDir, 'tmp'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });

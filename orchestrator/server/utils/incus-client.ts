@@ -744,20 +744,25 @@ export class IncusClient {
     return this.getInstance(spec.name);
   }
 
-  async startInstance(name: string): Promise<void> {
+  async startInstance(name: string, onAccepted?: (operationPath: string | undefined) => Promise<void>): Promise<void> {
     const raw = await this.rawRequest('PUT', `/1.0/instances/${encodeURIComponent(name)}/state`, {
       action: 'start',
     });
     const json = JSON.parse(raw.body.toString('utf-8')) as IncusResponse<any>;
     if (json.type === 'error' || raw.statusCode >= 400) {
-      throw new IncusError(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code);
+      throw json.type === 'error' && onAccepted
+        ? new IncusRequestRejected(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code)
+        : new IncusError(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code);
     }
     if (json.type === 'async' && json.operation) {
+      await onAccepted?.(this.projectOperationPath(json.operation));
       await this.waitForOperation(json.operation);
-    }
+    } else if (json.type === 'sync') await onAccepted?.(undefined);
+    else if (onAccepted) throw new IncusError('Incus start did not return an authoritative result');
   }
 
-  async stopInstance(name: string, options?: { force?: boolean; timeout?: number }): Promise<void> {
+  async stopInstance(name: string, options?: { force?: boolean; timeout?: number },
+    onAccepted?: (operationPath: string | undefined) => Promise<void>): Promise<void> {
     const raw = await this.rawRequest('PUT', `/1.0/instances/${encodeURIComponent(name)}/state`, {
       action: 'stop',
       force: options?.force ?? false,
@@ -765,11 +770,15 @@ export class IncusClient {
     });
     const json = JSON.parse(raw.body.toString('utf-8')) as IncusResponse<any>;
     if (json.type === 'error' || raw.statusCode >= 400) {
-      throw new IncusError(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code);
+      throw json.type === 'error' && onAccepted
+        ? new IncusRequestRejected(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code)
+        : new IncusError(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code);
     }
     if (json.type === 'async' && json.operation) {
+      await onAccepted?.(this.projectOperationPath(json.operation));
       await this.waitForOperation(json.operation);
-    }
+    } else if (json.type === 'sync') await onAccepted?.(undefined);
+    else if (onAccepted) throw new IncusError('Incus stop did not return an authoritative result');
   }
 
   async restartInstance(name: string, options?: { force?: boolean; timeout?: number }): Promise<void> {
@@ -787,15 +796,19 @@ export class IncusClient {
     }
   }
 
-  async deleteInstance(name: string): Promise<void> {
+  async deleteInstance(name: string, onAccepted?: (operationPath: string | undefined) => Promise<void>): Promise<void> {
     const raw = await this.rawRequest('DELETE', `/1.0/instances/${encodeURIComponent(name)}`);
     const json = JSON.parse(raw.body.toString('utf-8')) as IncusResponse<any>;
     if (json.type === 'error' || raw.statusCode >= 400) {
-      throw new IncusError(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code);
+      throw json.type === 'error' && onAccepted
+        ? new IncusRequestRejected(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code)
+        : new IncusError(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code);
     }
     if (json.type === 'async' && json.operation) {
+      await onAccepted?.(this.projectOperationPath(json.operation));
       await this.waitForOperation(json.operation);
-    }
+    } else if (json.type === 'sync') await onAccepted?.(undefined);
+    else if (onAccepted) throw new IncusError('Incus delete did not return an authoritative result');
   }
 
   // --- File Operations ---

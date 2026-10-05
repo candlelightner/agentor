@@ -65,6 +65,8 @@ export default defineConfig({
     "api/incus-derived-image.spec.ts",
     "api/incus-worker-runtime.spec.ts",
     "api/incus-canonical-archive.spec.ts",
+    "api/incus-offline-archive-helper.spec.ts",
+    "api/incus-offline-canonical.spec.ts",
     "api/incus-worker-backup-live.spec.ts",
     "api/incus-worker-backup-fence.spec.ts",
     "api/incus-worker-lifecycle.spec.ts",
