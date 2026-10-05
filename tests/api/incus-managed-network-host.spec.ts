@@ -19,6 +19,7 @@ import { ContainerManager } from '../../orchestrator/server/utils/container';
 import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
 import { zeroUserEnvVars } from '../../orchestrator/server/utils/user-env-store';
 import { authorizeManagedNetworkMutation } from '../../orchestrator/server/utils/managed-network-authorization';
+import { withOwnerWorkerLifecycleMutation } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 
@@ -195,6 +196,12 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
     const savedNetwork = store.get(network.userId, network.id)!;
     const peerCoverage = new Set([peerId]);
     expect((await actual.reconcile(savedNetwork, undefined, peerCoverage)).partialFailures).toEqual([]);
+    (peerManager as any).managedNetworks = actual;
+    const localHook = () => withOwnerWorkerLifecycleMutation(network.userId, peerId, () =>
+      (peerManager as any).reconcileManagedNetworksForWorker(peerManager.get(peerId)!));
+    const attachedDevices = (await peerRuntime.client.getInstance(peerOwner.containerName)).devices;
+    await localHook(); // own guarded native leaf, no queue reentry or unnecessary PUT
+    expect((await peerRuntime.client.getInstance(peerOwner.containerName)).devices).toEqual(attachedDevices);
     expect((await host.inspect(network))!.references).toContain(`/1.0/instances/${peerOwner.containerName}?project=agentor`);
     expect(await actual.actualWorkerIds(network)).toEqual([peerId]);
     const beforeDenied = await peerRuntime.client.getInstance(peerOwner.containerName);
@@ -212,6 +219,11 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
     await expect(actual.actualWorkerIds(network)).rejects.toThrow('unmapped');
     observedManager = peerManager;
     expect((await actual.reconcile(savedNetwork, [], peerCoverage)).partialFailures).toEqual([]);
+    expect(await actual.actualWorkerIds(network)).toEqual([]);
+    await localHook(); // lifecycle restores only the desired captured worker
+    expect(await actual.actualWorkerIds(network)).toEqual([peerId]);
+    await store.update(network.userId, network.id, { workerIds: [] });
+    await localHook(); // revoked membership is detached, never blessed by cache
     expect(await actual.actualWorkerIds(network)).toEqual([]);
     await peerRuntime.remove(peerOwner, peerIncarnation!); await peerRuntime.removeStorage(peerOwner);
     peerRuntime.client.dispose(); peerCreateSubmitted = false; peerIncarnation = undefined;

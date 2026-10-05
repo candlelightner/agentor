@@ -3,6 +3,11 @@ import { randomUUID } from 'node:crypto';
 import { ManagedNetworkManager } from '../../orchestrator/server/utils/managed-network-manager';
 import { incusManagedBridgeIdentity } from '../../orchestrator/server/utils/incus-managed-network-identity';
 import { operationSettlement } from '../../orchestrator/server/utils/operation-deadline';
+import { withOwnerWorkerLifecycleMutation } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
+import { WorkerGroupStore } from '../../orchestrator/server/utils/worker-group-store';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 (globalThis as any).createError ??= (options: any) => Object.assign(new Error(options.statusMessage), options);
 
@@ -123,6 +128,76 @@ test('delete preserves unsettled detach error and cannot return success on a lat
   fixture.failures.disconnect = undefined;
   fixture.failures.remove = Object.assign(new Error('captured bridge disappeared during removal'), { statusCode: 404 });
   await expect(fixture.manager.remove(fixture.network, fixture.coverage)).rejects.toMatchObject({ statusCode: 409 });
+});
+
+test('worker-local leaf requires caller lifecycle admission and defers populated legacy bridge adaptation', async () => {
+  const fixture = dispatcherFixture({ vm: true });
+  const leaf = { inspect: async () => ({ attached: false }), set: async () => { throw new Error('must not attach'); } };
+  await expect(fixture.manager.reconcileWorker(fixture.network, 'vm', 'incus:vm-uuid', leaf)).rejects.toThrow('lifecycle admission');
+  await expect(withOwnerWorkerLifecycleMutation('owner', 'vm', () =>
+    fixture.manager.reconcileWorker(fixture.network, 'vm', 'incus:vm-uuid', leaf)))
+    .rejects.toThrow('authorized mixed-bridge reconciliation');
+  expect(fixture.mutations).toEqual([]);
+});
+
+test('worker-local admission rejects foreign actual peers and wrong captured identity before grants or mutation', async () => {
+  const fixture = dispatcherFixture({ vm: true });
+  const leaf = { inspect: async () => ({ attached: false }), set: async () => { throw new Error('must not attach'); } };
+  await expect(withOwnerWorkerLifecycleMutation('owner', 'vm', () =>
+    fixture.manager.reconcileWorker(fixture.network, 'vm', 'incus:wrong', leaf))).rejects.toThrow('incarnation changed');
+  fixture.bridges.get(fixture.network.dockerName).Containers.foreign = { Name: 'foreign' };
+  await expect(withOwnerWorkerLifecycleMutation('owner', 'vm', () =>
+    fixture.manager.reconcileWorker(fixture.network, 'vm', 'incus:vm-uuid', leaf))).rejects.toThrow('Docker endpoint');
+  expect(fixture.mutations).toEqual([]);
+});
+
+test('worker-local leaf restores only its VM without touching desired legacy sibling or reacquiring queue', async () => {
+  const fixture = dispatcherFixture({ vm: true });
+  fixture.bridges.get(fixture.network.dockerName).Containers = {};
+  delete fixture.endpoints.get('docker-id')![fixture.network.dockerName];
+  await withOwnerWorkerLifecycleMutation('owner', 'vm', () => fixture.manager.reconcileWorker(fixture.network,
+    'vm', 'incus:vm-uuid', { inspect: async () => ({ attached: fixture.attachedVms.has('vm') }),
+      set: async attach => { expect(attach).toBe(true); fixture.attachedVms.add('vm'); fixture.mutations.push('vm:attach'); } }));
+  expect(fixture.mutations).toEqual(['native:ensure', 'vm:attach']);
+  expect(fixture.endpoints.get('docker-id')).toEqual({});
+});
+
+test('worker-local idempotence observes captured own VM through leaf, never sibling guarded observer', async () => {
+  const fixture = dispatcherFixture({ vm: true });
+  await fixture.manager.reconcile(fixture.network, undefined, fixture.coverage);
+  fixture.mutations.length = 0; let ownReads = 0;
+  await withOwnerWorkerLifecycleMutation('owner', 'vm', () => fixture.manager.reconcileWorker(fixture.network,
+    'vm', 'incus:vm-uuid', { inspect: async () => { ownReads++; return { attached: true }; },
+      set: async () => { throw new Error('must not mutate existing NIC'); } }));
+  expect(ownReads).toBeGreaterThanOrEqual(2); expect(fixture.mutations).toEqual([]);
+});
+
+test('group network membership loads scoped durable subtree, not unrelated global service state', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'agentor-network-groups-'));
+  try {
+    const groups = new WorkerGroupStore(dataDir);
+    const root = await groups.create('owner', 'root');
+    const child = await groups.create('owner', 'child', root.id);
+    await groups.update('owner', child.id, { workerIds: ['vm'] });
+    const fixture = dispatcherFixture({ vm: true });
+    (fixture.manager as any).dependencies.config = () => ({ dataDir, incusProject: 'agentor' });
+    fixture.network.scope = 'group'; fixture.network.groupId = root.id;
+    expect(await fixture.manager.members(fixture.network)).toEqual(['vm']);
+  } finally { await rm(dataDir, { recursive: true, force: true }); }
+});
+
+test('creating an empty managed network materializes backing while explicit detach/delete never does', async () => {
+  for (const incusEnabled of [false, true]) {
+    const fixture = dispatcherFixture(); fixture.network.workerIds = []; fixture.bridges.clear();
+    (fixture.manager as any).dependencies.config = () => ({ incusEnabled, incusProject: 'agentor' });
+    expect((await fixture.manager.reconcile(fixture.network)).partialFailures).toEqual([]);
+    expect((await fixture.manager.topology(fixture.network)).exists).toBe(true);
+    expect(fixture.mutations.some(value => value.startsWith('create:'))).toBe(true);
+    await fixture.manager.remove(fixture.network, new Set());
+    fixture.mutations.length = 0;
+    await fixture.manager.remove(fixture.network, new Set());
+    expect(fixture.mutations).toEqual([]);
+  }
 });
 
 function dispatcherFixture(options: { vm?: boolean; failConnect?: boolean; failNative?: boolean } = {}) {

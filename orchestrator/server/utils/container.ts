@@ -15,6 +15,7 @@ import type { Readable, Duplex } from "node:stream";
 import * as tar from "tar-stream";
 import { DockerService } from "./docker";
 import { IncusWorkerCommands } from "./incus-worker-commands";
+import type { ManagedNetworkManager } from './managed-network-manager';
 import type {
   EnvironmentJsonPayload,
   CapabilityJsonEntry,
@@ -427,6 +428,7 @@ export async function removeFailedImportedImage(
 }
 
 export class ContainerManager {
+  private managedNetworks?: ManagedNetworkManager;
   /** Restart-persistent ownership handles for custom environments created
    * implicitly by imports. */
   private importCreatedEnvironments = new Map<string, string>();
@@ -447,20 +449,41 @@ export class ContainerManager {
   /** Reattach a freshly created/rebuilt worker to owner-managed networks. Failure
    * is logged only: the worker lifecycle succeeded and the network remains
    * inspectable/reconcilable rather than leaving a half-created worker. */
-  private async reconcileManagedNetworksForWorker(userId: string) {
-    const [{ useManagedNetworkStore }, { useManagedNetworkManager }] =
-      await Promise.all([
-        import("./services"),
-        import("./managed-network-manager"),
-      ]);
-    for (const network of useManagedNetworkStore().listForUser(userId))
-      await useManagedNetworkManager()
-        .reconcile(network)
-        .catch((error) =>
+  private async managedNetworkContext(info: ContainerInfo) {
+    if (!this.workerStore || info.administrativeKind) return;
+    const { ManagedNetworkStore } = await import('./managed-network-store');
+    const networks = new ManagedNetworkStore(this.config.dataDir); await networks.loadUser(info.userId);
+    const records = networks.listForUser(info.userId); if (!records.length) return;
+    const { ManagedNetworkManager } = await import('./managed-network-manager');
+    const manager = this.managedNetworks ??= new ManagedNetworkManager({ manager: () => this,
+      workers: () => this.workerStore!, config: () => this.config });
+    return { manager, networks: records };
+  }
+
+  private async managedNetworksNeedReconciliation(info: ContainerInfo) {
+    const context = await this.managedNetworkContext(info); if (!context) return false;
+    const incarnation = this.capturedIncusIncarnation(info);
+    for (const network of context.networks) {
+      const expected = (await context.manager.members(network)).includes(info.id);
+      const actual = await this.incusRuntime.inspectManagedNetwork(info, incarnation, network.id);
+      if (actual.attached !== expected) return true;
+    }
+    return false;
+  }
+
+  private async reconcileManagedNetworksForWorker(info: ContainerInfo) {
+    const context = await this.managedNetworkContext(info); if (!context) return;
+    const containerId = info.containerId;
+    for (const network of context.networks)
+      await context.manager.reconcileWorker(network, info.id, containerId, {
+        inspect: () => this.incusRuntime.inspectManagedNetwork(info, this.capturedIncusIncarnation(info), network.id),
+        set: attach => this.setIncusManagedNetworkFenced(info.id, network.id, attach),
+      }).catch((error) => {
+        if (error?.[operationSettlement]) throw error;
           useLogger().warn(
             `[container] managed network reconcile failed: ${error instanceof Error ? error.message : error}`,
-          ),
-        );
+          );
+      });
   }
   private async reconcileWorkerPlugins(info: ContainerInfo) {
     if (info.status !== "running" || info.administrativeKind) return;
@@ -1242,7 +1265,10 @@ export class ContainerManager {
   /** Managed-network requests share the ordinary lifecycle fence. Startup
    * hooks already inside that fence call the runtime leaf directly instead. */
   async setIncusManagedNetwork(id: string, networkId: string, attach: boolean): Promise<void> {
-    return this.withExistingWorkerLifecycleMutation(id, async () => {
+    return this.withExistingWorkerLifecycleMutation(id, () => this.setIncusManagedNetworkFenced(id, networkId, attach));
+  }
+
+  private async setIncusManagedNetworkFenced(id: string, networkId: string, attach: boolean): Promise<void> {
       const info = this.get(id)!, record = this.workerStore?.get(info.userId, id);
       if (!record || record.status !== 'active' || record.runtimeKind !== 'incus-vm' || record.deletionPending ||
           record.incusRecreation || info.runtimeKind !== 'incus-vm')
@@ -1256,7 +1282,6 @@ export class ContainerManager {
       for (const volume of volumes.forWorker(info.userId, id)) assertIncusLiveResolved(volume);
       await this.incusRuntime.setManagedNetwork({ id, userId: info.userId, containerName: info.containerName },
         this.capturedIncusIncarnation(info), networkId, attach);
-    });
   }
 
   /** Read-only secondary topology; never supplies routing/worker identity. */
@@ -1777,8 +1802,8 @@ export class ContainerManager {
     useLogger().info(
       `[container] created worker ${containerName} (${containerInfo.containerId.slice(0, 12)})`,
     );
+    await this.reconcileManagedNetworksForWorker(containerInfo);
     if (runtimeKind === "legacy-docker") {
-      await this.reconcileManagedNetworksForWorker(userId);
       await this.reconcileWorkerPlugins(containerInfo);
     }
 
@@ -2692,6 +2717,7 @@ for p in sys.argv[1:]:
         info.updatedAt = new Date().toISOString();
         info.runtimeDiagnostic = undefined;
         useLogCollector().attach(info.containerName, info.containerId, 'worker', info.displayName).catch(() => {});
+        await this.reconcileManagedNetworksForWorker(info);
       } catch (error) {
         this.markRuntimeUnknown(info, "Incus worker start", error);
         throw error;
@@ -3895,7 +3921,7 @@ for p in sys.argv[1:]:
     useLogger().info(
       `[container] rebuilt ${info.containerName} (${containerInfo.containerId.slice(0, 12)})`,
     );
-    await this.reconcileManagedNetworksForWorker(info.userId);
+    await this.reconcileManagedNetworksForWorker(containerInfo);
     await this.reconcileWorkerPlugins(containerInfo);
 
     return containerInfo;
@@ -4078,7 +4104,7 @@ for p in sys.argv[1:]:
     useLogger().info(
       `[container] unarchived ${containerName} (${containerInfo.containerId.slice(0, 12)})`,
     );
-    await this.reconcileManagedNetworksForWorker(worker.userId);
+    await this.reconcileManagedNetworksForWorker(containerInfo);
     await this.reconcileWorkerPlugins(containerInfo);
 
     return containerInfo;
@@ -4199,6 +4225,7 @@ for p in sys.argv[1:]:
     }
     useLogCollector().attach(info.containerName, info.containerId, 'worker', info.displayName).catch(() => {});
     await reassignWorkerMappings(info.containerName).catch((error) => useLogger().warn(`[container] Incus route refresh failed: ${error}`));
+    await this.reconcileManagedNetworksForWorker(info);
     await this.reconcileWorkerPlugins(info);
     return info;
   }
@@ -5908,7 +5935,7 @@ for p in sys.argv[1:]:
           const guest = await this.incusRuntime.inspectGuestReadiness(info, incarnation);
           if (!guest.provisioned || !guest.serviceReady) return true;
           info.status = 'running'; info.runtimeDiagnostic = undefined;
-          return false;
+          return this.managedNetworksNeedReconciliation(info);
         });
         if (!repair) continue;
         await withOwnerWorkerLifecycleMutation(snapshot.userId, snapshot.id, async () => {
@@ -5924,7 +5951,9 @@ for p in sys.argv[1:]:
           let bootId: string | undefined;
           if (instance.status === 'Running') {
             const guest = await this.incusRuntime.inspectGuestReadiness(info, incarnation);
-            if (guest.provisioned && guest.serviceReady) { info.status = 'running'; return; }
+            if (guest.provisioned && guest.serviceReady) {
+              info.status = 'running'; await this.reconcileManagedNetworksForWorker(info); return;
+            }
             bootId = guest.bootId;
           } else if (instance.status !== 'Stopped') throw new Error('Incus guest is not ready for recovery');
           const options = await this.incusOptionsForWorker(info, true, info.containerId);
@@ -5935,6 +5964,7 @@ for p in sys.argv[1:]:
             throw new Error('Incus guest rebooted or remained unready during recovery; retry later');
           info.status = 'running'; info.runtimeDiagnostic = undefined; info.updatedAt = new Date().toISOString();
           useLogCollector().attach(info.containerName, info.containerId, 'worker', info.displayName).catch(() => {});
+          await this.reconcileManagedNetworksForWorker(info);
           await this.reconcileWorkerPlugins(info);
         });
       } catch (error) {

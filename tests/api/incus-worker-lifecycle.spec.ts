@@ -23,7 +23,7 @@ async function fixture(run: (manager: ContainerManager, store: WorkerStore, call
   const root = await mkdtemp(join(tmpdir(), 'agentor-incus-archive-'));
   const calls: string[] = [];
   const manager = new ContainerManager(new Proxy({}, { get: () => () => { throw new Error('Docker must not be called'); } }) as any,
-    { containerPrefix: 'agentor-worker', incusEnabled: false } as Config);
+    { dataDir: root, containerPrefix: 'agentor-worker', incusEnabled: false } as Config);
   const store = new WorkerStore(root); await store.init(); manager.setWorkerStore(store);
   (manager as any).assertOwnerExists = async () => {};
   const stamp = new Date().toISOString();
@@ -848,6 +848,21 @@ test('healthy Incus reconciliation preserves VM/services and terminal lifecycle 
     await manager.reconcileIncusWorkers();
     expect(calls).toEqual([]); expect(info.status).toBe('running'); expect(info.pendingRebuild).toBe(true);
     expect(workerLifecycleGeneration(info.id)).toBe(generation);
+  });
+});
+
+test('missing desired NIC repairs only network membership, not healthy guest boot or applied settings', async () => {
+  await reconciliationFixture(async (manager, _store, calls, info) => {
+    let missing = true;
+    (manager as any).managedNetworksNeedReconciliation = async () => missing;
+    (manager as any).reconcileManagedNetworksForWorker = async (target: any) => {
+      expect(target.containerId).toBe(info.containerId); calls.push('network-only'); missing = false;
+    };
+    await manager.reconcileIncusWorkers();
+    expect(calls).toEqual(['network-only']); expect(info.status).toBe('running');
+    const generation = workerLifecycleGeneration(info.id);
+    await manager.reconcileIncusWorkers();
+    expect(calls).toEqual(['network-only']); expect(workerLifecycleGeneration(info.id)).toBe(generation);
   });
 });
 

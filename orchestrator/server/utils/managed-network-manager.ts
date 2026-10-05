@@ -3,18 +3,18 @@ import { createError } from 'h3';
 import {
   useContainerManager,
   useManagedNetworkStore,
-  useWorkerGroupStore,
   useWorkerStore,
   useConfig,
 } from "./services";
 import type { ManagedNetwork } from "./managed-network-store";
 import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
+import { WorkerGroupStore } from './worker-group-store';
 import { withOperationDeadline, operationSettlement } from "./operation-deadline";
 import { IncusManagedNetworkHost } from './incus-managed-network-host';
 import { IncusManagedDockerBridge } from './incus-managed-docker-bridge';
 import { normalizeWorkerRuntimeKind } from '../../shared/types';
 import { verifyWorkerMutationUnlocks } from './worker-protection-lock';
-import { withOwnerWorkerLifecycleMutation } from './worker-lifecycle-coordinator';
+import { withOwnerWorkerLifecycleMutation, isWorkerLifecycleMutationPending } from './worker-lifecycle-coordinator';
 import type { IncusManagedBridge } from './incus-managed-network-host';
 
 const DOCKER_READ_TIMEOUT_MS = 8_000;
@@ -48,7 +48,9 @@ export class ManagedNetworkManager {
    * peer must map to current durable owner/runtime + captured native identity.
    * Callers union these IDs with desired IDs before verifying protection locks,
    * then repeat this read before dispatch to reject newly uncovered peers. */
-  async actualWorkerIds(network: ManagedNetwork): Promise<string[]> {
+  async actualWorkerIds(network: ManagedNetwork, lifecycleRead?: {
+    workerId: string; containerId: string; inspect: () => Promise<{ attached: boolean }>;
+  }): Promise<string[]> {
     this.assertSafe(network);
     const manager = this.manager(), workers = this.workers();
     const ids = new Set<string>();
@@ -106,7 +108,11 @@ export class ManagedNetworkManager {
           !record || record.userId !== network.userId || record.id !== worker.id || record.runtimeKind !== 'incus-vm' ||
           record.status !== 'active' || record.deletionPending || record.incusRecreation)
         throw new Error('Managed native bridge has an unmapped, foreign or stale instance reference');
-      const state = await manager.inspectIncusManagedNetwork(worker.id, network.id);
+      // Only this lifecycle's captured worker can use its already-fenced native
+      // leaf. Sibling reads still go through ordinary mutation/generation guards.
+      const state = lifecycleRead?.workerId === worker.id && lifecycleRead.containerId === worker.containerId &&
+        isWorkerLifecycleMutationPending(worker.id)
+        ? await lifecycleRead.inspect() : await manager.inspectIncusManagedNetwork(worker.id, network.id);
       if (!state.attached) throw new Error('Managed native bridge reference has no verified worker NIC');
       ids.add(worker.id);
     }
@@ -121,7 +127,7 @@ export class ManagedNetworkManager {
         .filter((worker) => worker.status !== "archived")
         .map((worker) => worker.id);
     else if (network.scope === "group" && network.groupId) {
-      const groups = useWorkerGroupStore();
+      const groups = new WorkerGroupStore(this.config().dataDir); await groups.loadUser(network.userId);
       ids = groups.get(network.userId, network.groupId)
         ? new WorkerGroupHierarchy(groups).subtreeWorkerIds(network.userId, network.groupId)
         : [];
@@ -134,18 +140,19 @@ export class ManagedNetworkManager {
     this.assertSafe(network);
     const target = new Set(workerIds === undefined ? await this.members(network) : workerIds);
     const coverage = await this.mutationCoverage(network, target, coveredWorkerIds);
-    if (!target.size && !(await this.actualWorkerIds(network)).length)
+    if (workerIds !== undefined && !target.size && !(await this.actualWorkerIds(network)).length)
       return { workerIds: [], partialFailures: [] };
     for (const id of target) this.authoritativeWorker(network, id);
     const existingNative = await this.nativeBridge(network);
-    const needsNative = existingNative || [...target].some(id =>
+    const needsNative = existingNative || (!target.size && this.config().incusEnabled) || [...target].some(id =>
       normalizeWorkerRuntimeKind(this.workers().get(network.userId, id)?.runtimeKind) === 'incus-vm');
     // Detach/delete only observes existing resources. Never create an adapter
     // or repair/regrant a host bridge just to remove a NIC from it.
-    const bridge = needsNative ? existingNative ?? (target.size ? await this.host().ensure(network) : undefined) : undefined;
+    const materialize = workerIds === undefined || target.size > 0;
+    const bridge = needsNative ? existingNative ?? (materialize ? await this.host().ensure(network) : undefined) : undefined;
     const adapter = new IncusManagedDockerBridge(this.docker);
-    const dockerNetwork = bridge ? target.size ? await adapter.ensure(network, bridge) : await adapter.inspect(network, bridge)
-      : target.size ? await this.ensure(network) : await this.inspectLegacy(network);
+    const dockerNetwork = bridge ? materialize ? await adapter.ensure(network, bridge) : await adapter.inspect(network, bridge)
+      : materialize ? await this.ensure(network) : await this.inspectLegacy(network);
     await this.mutationCoverage(network, target, coverage);
     const actual = new Set(await this.actualWorkerIds(network));
     const failures: string[] = [];
@@ -189,6 +196,39 @@ export class ManagedNetworkManager {
     for (const network of useManagedNetworkStore().listForUser(userId))
       results.push({ networkId: network.id, ...(await this.reconcile(network)) });
     return results;
+  }
+
+  /** Lifecycle-only leaf: the caller already owns owner→worker admission and
+   * any protection unlock. Restore only this captured worker, never adapt or
+   * detach siblings during create/rebuild/recovery. Do not reacquire its queue. */
+  async reconcileWorker(network: ManagedNetwork, workerId: string, containerId: string,
+    incus: { inspect: () => Promise<{ attached: boolean }>; set: (attach: boolean) => Promise<void> }) {
+    this.assertSafe(network);
+    if (!isWorkerLifecycleMutationPending(workerId))
+      throw new Error('Worker-local network reconciliation requires lifecycle admission');
+    const worker = this.authoritativeWorker(network, workerId);
+    if (!worker || worker.containerId !== containerId)
+      throw new Error('Worker-local network incarnation changed');
+    const attach = (await this.members(network)).includes(workerId);
+    const read = { workerId, containerId, inspect: incus.inspect };
+    await this.actualWorkerIds(network, read);
+    const native = await this.nativeBridge(network);
+    if (worker.runtimeKind === 'incus-vm') {
+      if (attach && !native) {
+        const legacy = await this.inspectLegacy(network);
+        if (legacy && (!legacy.Containers || Object.keys(legacy.Containers).length))
+          throw new Error('Managed network requires an authorized mixed-bridge reconciliation before this VM can join');
+        await this.host().ensure(network);
+      }
+      await this.actualWorkerIds(network, read);
+      if ((await incus.inspect()).attached !== attach) await incus.set(attach);
+    } else {
+      const adapter = new IncusManagedDockerBridge(this.docker);
+      const destination = native ? attach ? await adapter.ensure(network, native) : await adapter.inspect(network, native)
+        : attach ? await this.ensure(network) : await this.inspectLegacy(network);
+      await this.actualWorkerIds(network, read);
+      if (destination) await this.setDockerMembership(network, containerId, destination, attach, native ?? undefined);
+    }
   }
 
   async remove(network: ManagedNetwork, coveredWorkerIds?: ReadonlySet<string>) {
