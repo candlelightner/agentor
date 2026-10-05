@@ -24,6 +24,14 @@ export function nativeSelectedBackupPath(value: string): string {
   return path;
 }
 
+/** The exact Docker root is handled by the quiesced logical-storage backend,
+ * never by the ordinary selected tree walker. Partial Docker selections remain
+ * invalid; accepting this name alone grants no storage/runtime authority. */
+export function nativeExplicitBackupPath(value: string): string {
+  const path = normalizeBackupPath(value).replace(/\/$/, '') || '/';
+  return path === '/var/lib/docker' ? path : nativeSelectedBackupPath(path);
+}
+
 /** Selected GNU/PAX capture only: bounded non-recursive member list skips
  * specials and unselected nested mounts BEFORE emitting binary metadata.
  * Runtime proves native storage/grants; this script proves guest mount and

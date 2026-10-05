@@ -1,24 +1,36 @@
 import { expect, test } from '@playwright/test';
 import { randomUUID } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile, readFile } from 'node:fs/promises';
+import { pipeline } from 'node:stream/promises';
+import { Writable } from 'node:stream';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker-runtime';
 import { IncusWorkerStorage } from '../../orchestrator/server/utils/incus-worker-storage';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import { validateIncusSelectedRestoreArchive, validateIncusDockerRestoreArchive } from '../../orchestrator/server/utils/portable-managed-volume-archive';
 import { zeroUserEnvVars } from '../../orchestrator/server/utils/user-env-store';
-import { useConfig } from '../../orchestrator/server/utils/services';
+import { useConfig, useContainerManager, useWorkerStore, useDockerService, usePortMappingStore, useDomainMappingStore } from '../../orchestrator/server/utils/services';
+import { useWorkerConfigStore } from '../../orchestrator/server/utils/worker-config-store';
+import { BackupManager } from '../../orchestrator/server/utils/backup-manager';
+import { extractBundle } from '../../orchestrator/server/utils/worker-export';
+import { withOwnerWorkerLifecycleMutation } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
+(globalThis as any).useLogCollector ??= () => ({ attach: async () => {}, detach() {} });
+(globalThis as any).usePortMappingStore ??= usePortMappingStore;
+(globalThis as any).useDomainMappingStore ??= useDomainMappingStore;
+(globalThis as any).useWorkerConfigStore ??= useWorkerConfigStore;
 
-// Capability evidence only: this deliberately does not claim production backup
-// integration. All formatting and disk switching are confined to a fresh,
-// nonce-owned fixture. Canonical source storage is never formatted or detached
+// Production running capture plus fresh-ext4 inverse capability evidence, not
+// production restore parity. Formatting and disk switching are confined to a
+// fresh, nonce-owned fixture. Canonical storage is never formatted or detached
 // while running. No other fixture or production host is in scope.
 test('native Docker logical archive retains overlay deletions and special named-volume metadata on fresh ext4', async () => {
   test.skip(process.env.INCUS_DOCKER_ARCHIVE_PROOF_TEST !== 'true', 'Explicit serial disposable Docker archive proof');
   test.setTimeout(900_000);
-  const config = { ...useConfig(), containerPrefix: 'agentor-worker', incusEnabled: true,
+  const serviceConfig = useConfig(), priorConfig = { ...serviceConfig };
+  const config = { ...serviceConfig, containerPrefix: 'agentor-worker', incusEnabled: true,
     incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor', incusNetwork: 'incusbr0', incusStoragePool: 'default',
     incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase10-preserve-ownership',
     incusDockerVolumeSize: '1GiB', incusInternalGatewayUrl: 'http://10.159.68.1:38000',
@@ -34,6 +46,14 @@ test('native Docker logical archive retains overlay deletions and special named-
     environmentJson: { dockerEnabled: true, networkMode: 'full', allowedDomains: [], setupScript: '', envVars: '', exposeApis: {} },
     workerJson: { id, displayName: 'Docker archive proof', repos: [], initScript: '', gitName: '', gitEmail: '' },
     capabilitiesJson: [], instructionsJson: [] };
+  Object.assign(serviceConfig, config);
+  const manager = useContainerManager(), store = useWorkerStore(); await store.init();
+  const prior = { runtime: (manager as any).incusRuntime, storage: (manager as any).storageManager,
+    workerStore: (manager as any).workerStore, environmentStore: (manager as any).environmentStore };
+  manager.setIncusRuntime(runtime); manager.setWorkerStore(store); (manager as any).storageManager = undefined;
+  manager.setEnvironmentStore({ getById: () => ({ id: 'docker-proof', name: 'Docker archive proof', ...opts.environmentJson }) } as any);
+  const backup = new BackupManager({ dataDir: config.dataDir }), docker = useDockerService(), originalArchive = docker.getArchive;
+  docker.getArchive = async () => { throw new Error('Native Docker logical data must never use legacy getArchive'); };
   const copyName = 'docker-proof-' + id + '-docker';
   const copyConfig = { size: '1GiB', 'user.agentor.installation': installation, 'user.agentor.id': id,
     'user.agentor.owner': userId, 'user.agentor.archive-proof': nonce };
@@ -68,10 +88,15 @@ for name in ['.']+sorted(os.listdir(root)):
 assert os.stat(root+'/data').st_ino==os.stat(root+'/hard').st_ino
 print(json.dumps(out,sort_keys=True))`;
   try {
+    await store.upsert({ id, userId, runtimeKind: 'incus-vm', status: 'active', desiredRuntimeStatus: 'running',
+      displayName: 'Docker archive proof', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
     console.info('Exact Docker archive proof fixture', { dir, id, userId, nonce, installation, copyName });
     sourceSubmitted = true;
     const created = await runtime.create(opts); incarnation = created.config['volatile.uuid']; expect(incarnation).toBeTruthy();
     await runtime.start(opts, incarnation);
+    manager.registerExternal({ id, userId, containerName: name, containerId: 'incus:' + incarnation, runtimeKind: 'incus-vm',
+      status: 'running', displayName: 'Docker archive proof', environmentId: 'docker-proof', imageName: config.incusWorkerImage,
+      imageId: created.config['volatile.base_image'], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() } as any);
     expect(await shell('docker info --format "{{.Driver}}"')).toBe('overlay2');
     await shell(`docker pull busybox:1.37.0; mkdir -p /workspace/docker-archive-build
 printf 'FROM busybox:1.37.0\nRUN mkdir /lowerdir && echo old > /lowerdir/old && echo lower > /lowerfile\n' > /workspace/docker-archive-build/Dockerfile
@@ -113,16 +138,52 @@ assert stat.S_ISCHR(out['lowerfile']['mode']) and out['lowerfile']['rdev']==0 or
 assert out['lowerdir']['attrs'].get('trusted.overlay.opaque')=='79'
 print(json.dumps(out,sort_keys=True))`, upper]);
     console.info('Actual native overlay representation', overlay.stdout.trim());
-    // All test containers are already stopped. This does not pretend that
-    // daemon shutdown alone quiesces guest-root configured live-restore.
-    await shell(`test -z "$(docker ps -q)"; systemctl stop docker.socket docker.service containerd.service
-! systemctl is-active --quiet docker.socket; ! systemctl is-active --quiet docker.service; ! systemctl is-active --quiet containerd.service
-test -z "$(findmnt -rn -t overlay -o TARGET)"`);
-    const archive = await shell(`tar --format=pax --numeric-owner --xattrs --xattrs-include='*' --acls -cf /workspace/docker-proof.tar -C /var/lib docker
-stat -c %s /workspace/docker-proof.tar`);
-    expect(Number(archive)).toBeLessThan(64 * 1024 * 1024);
-    const bytes = (await client.pullFile(name, '/workspace/docker-proof.tar')).content;
-    const local = join(dir, 'docker.tar'); await writeFile(local, bytes, { mode: 0o600, flag: 'wx' });
+    const service = await shell('systemctl show --property=MainPID --value agentor-worker.service');
+    const dockerPid = await shell('systemctl show --property=MainPID --value docker.service');
+    await shell('docker create --restart=always --name archive-unsafe busybox:1.37.0 sh -ec "echo must-not-run"');
+    const denied = await runtime.openDockerArchive(opts, incarnation!, async () => { await prove(); });
+    await expect((async () => { for await (const _chunk of denied) { /* no capture authority */ } })()).rejects.toThrow();
+    expect(await shell('systemctl show --property=MainPID --value docker.service')).toBe(dockerPid);
+    expect(await shell('docker inspect --format "{{.State.Status}}" archive-unsafe')).toBe('created');
+    await shell('docker rm archive-unsafe; docker run -d --name archive-running busybox:1.37.0 sleep 3600; docker run -d --name archive-paused busybox:1.37.0 sleep 3600; docker pause archive-paused');
+    // Same-device bind and stack are ineligible BEFORE quiescing Docker.
+    for (const subdirectory of [false, true]) {
+      await shell('mkdir -p /var/lib/docker/agentor-proof-empty; mount --bind ' +
+        (subdirectory ? '/var/lib/docker/agentor-proof-empty' : '/var/lib/docker') + ' /var/lib/docker');
+      try {
+        const rejected = await runtime.openDockerArchive(opts, incarnation!, async () => { await prove(); });
+        await expect((async () => { for await (const _chunk of rejected) { /* no authority */ } })()).rejects.toThrow();
+      } finally { await shell('umount /var/lib/docker'); }
+      expect(await shell('systemctl show --property=MainPID --value docker.service')).toBe(dockerPid);
+    }
+    await shell('rmdir /var/lib/docker/agentor-proof-empty; dd if=/dev/zero of=/var/lib/docker/agentor-cancel-fixture bs=1M count=16 status=none');
+    const controller = new AbortController();
+    await withOwnerWorkerLifecycleMutation(userId, id, async () => {
+      const cancelled = await manager.getSelectedBackupArchiveWithLifecycleFenceHeld(id, '/var/lib/docker', controller.signal);
+      const sink = new Writable({ write(_chunk, _encoding, callback) {
+        controller.abort(new Error('Intentional exact Docker capture cancellation')); callback();
+      } });
+      await expect(pipeline(cancelled, sink, { signal: controller.signal })).rejects.toThrow(/cancellation|abort/i);
+      expect(await shell('docker inspect --format "{{.State.Running}} {{.State.Paused}}" archive-running')).toBe('true false');
+      expect(await shell('docker inspect --format "{{.State.Running}} {{.State.Paused}}" archive-paused')).toBe('true true');
+    });
+    await shell('rm -- /var/lib/docker/agentor-cancel-fixture');
+    // Exercise the actual shared BackupManager wire format, not just the
+    // production primitive. The bundle contains bytes, never host extraction.
+    const bundle = join(dir, 'native-docker-bundle.tar');
+    await withOwnerWorkerLifecycleMutation(userId, id, () =>
+      (backup as any).exportWorkspaceBundleWithLifecycleFenceHeld(userId, id, bundle, new AbortController().signal, ['/var/lib/docker/']));
+    const extracted = await extractBundle(bundle, join(dir, 'bundle'));
+    expect(extracted.manifest.runtime?.kind).toBe('incus-vm'); expect(extracted.manifest.contents.rootfs).toBe(false);
+    expect(extracted.manifest.backupPaths).toEqual([{ path: '/var/lib/docker', archive: 'paths/0.tar' }]);
+    const local = join(dir, 'docker.tar');
+    await writeFile(local, execFileSync('/usr/bin/tar', ['-xzOf', extracted.backupPathsPath!, 'paths/0.tar'],
+      { maxBuffer: 64 * 1024 * 1024 }), { mode: 0o600, flag: 'wx' });
+    expect(await shell('systemctl show --property=MainPID --value agentor-worker.service')).toBe(service);
+    expect(await shell('docker inspect --format "{{.State.Running}} {{.State.Paused}}" archive-running')).toBe('true false');
+    expect(await shell('docker inspect --format "{{.State.Running}} {{.State.Paused}}" archive-paused')).toBe('true true');
+    const bytes = await readFile(local); expect(bytes.length).toBeLessThan(64 * 1024 * 1024);
+    await client.pushFile(name, '/workspace/docker-proof.tar', bytes, { uid: 0, gid: 0, mode: 0o600 });
     // Generic selected/canonical dialect must continue rejecting devices/FIFOs.
     await expect(validateIncusSelectedRestoreArchive(local, '/var/lib/docker')).rejects.toThrow();
     const validated = await validateIncusDockerRestoreArchive(local);
@@ -188,6 +249,7 @@ docker run --rm agentor-archive-retained:proof sh -ec 'test ! -e /lowerfile; tes
     // Name read-back is never a substitute for an acknowledged incarnation.
     if (incarnation) {
       await prove(); await runtime.remove(opts, incarnation); await runtime.removeStorage(opts);
+      await store.delete(userId, id); manager.unregisterExternal(id);
     } else if (sourceSubmitted) throw new Error('Docker archive source creation authority unresolved; retain fixture registry');
     if (copyAcknowledged) {
       const copy = await client.getCustomVolume(config.incusStoragePool, copyName);
@@ -195,5 +257,8 @@ docker run --rm agentor-archive-retained:proof sh -ec 'test ! -e /lowerfile; tes
       for (const key of Object.keys(copyConfig).filter(key => key.startsWith('user.'))) expect(copy.config[key]).toBe(copyConfig[key as keyof typeof copyConfig]);
       await client.deleteCustomVolume(config.incusStoragePool, copyName);
     }
+    docker.getArchive = originalArchive;
+    Object.assign(serviceConfig, priorConfig); Object.assign(manager, { incusRuntime: prior.runtime, storageManager: prior.storage,
+      workerStore: prior.workerStore, environmentStore: prior.environmentStore });
   }
 });

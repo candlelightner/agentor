@@ -1993,8 +1993,8 @@ for p in sys.argv[1:]:
    * worker lifecycle fence across the base bundle and all explicit streams.
    * Never resolve runtime environment or ensure/repair storage during capture. */
   async getSelectedBackupArchiveWithLifecycleFenceHeld(id: string, path: string, signal?: AbortSignal): Promise<Readable> {
-    const { nativeSelectedBackupPath } = await import('./incus-selected-archive');
-    path = nativeSelectedBackupPath(path);
+    const { nativeExplicitBackupPath } = await import('./incus-selected-archive');
+    path = nativeExplicitBackupPath(path);
     const info = this.get(id), record = this.workerStore?.findById(id);
     if (!info || info.runtimeKind !== 'incus-vm' || info.status !== 'running' ||
         !record || record.userId !== info.userId || record.runtimeKind !== 'incus-vm' || record.status !== 'active' ||
@@ -2015,9 +2015,11 @@ for p in sys.argv[1:]:
       volumes.assertLiveRecoveryResolved(info.userId, id);
     };
     validate();
-    return this.incusRuntime.openSelectedArchive({ id, userId: info.userId, containerName: info.containerName,
+    const owner = { id, userId: info.userId, containerName: info.containerName,
       storageManager: this.storageManager, mounts: capturedMounts,
-      managedVolumes: capturedVolumes.filter(volume => volume.attached && volume.seeded) }, incarnation, path, validate, signal);
+      managedVolumes: capturedVolumes.filter(volume => volume.attached && volume.seeded) };
+    return path === '/var/lib/docker' ? this.incusRuntime.openDockerArchive(owner, incarnation, validate, signal)
+      : this.incusRuntime.openSelectedArchive(owner, incarnation, path, validate, signal);
   }
 
   /**

@@ -169,7 +169,7 @@ with tarfile.open(sys.argv[1],'r:') as t:
     expect(metadata.sha256)
       .toBe(createHash('sha256').update(Buffer.concat(Array.from({ length: 1024 }, () => Buffer.from([0,255,128,10,61,0])))).digest('hex'));
     for (const [path, code] of [['/', 'INCUS_DISPOSABLE_ROOTFS'], ['/run/agentor/worker.env', 'INCUS_EPHEMERAL_BACKUP_PATH'],
-      ['/var/lib/docker', 'INCUS_DOCKER_BACKUP_REQUIRED']] as const) await expect(capture([path], 'denied-' + code)).rejects.toMatchObject({ code });
+      ['/var/lib/docker', 'INCUS_DOCKER_BACKUP_UNAVAILABLE']] as const) await expect(capture([path], 'denied-' + code)).rejects.toMatchObject({ code });
     await exec(['python3', '-c', "open('/run/agentor/account-credentials/new-codex','wb').write(b'dummy-replaced');os=__import__('os');os.replace('/run/agentor/account-credentials/new-codex','/run/agentor/account-credentials/codex.json')"]);
     await expect(capture(['/home/agent/.codex/auth.json'], 'stale-bind')).rejects.toThrow(/Selected native archive capture failed/);
     // Capture must NOT repair the pinned bind or restart guest/services.

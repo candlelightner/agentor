@@ -2594,8 +2594,9 @@ export class BackupManager {
       if (live?.status !== 'running')
         throw Object.assign(new Error('Explicit native paths require a running worker; disposable stopped/root disks are not backup storage'),
           { statusCode: 409, code: 'INCUS_SELECTED_BACKUP_REQUIRES_RUNNING' });
-      const { nativeSelectedBackupPath } = await import('./incus-selected-archive');
-      for (const path of explicitPaths) nativeSelectedBackupPath(path);
+      const { nativeExplicitBackupPath } = await import('./incus-selected-archive');
+      for (let index = 0; index < explicitPaths.length; index++)
+        explicitPaths[index] = nativeExplicitBackupPath(explicitPaths[index]!);
     }
     if (live?.containerId || native && durable?.status === 'archived') {
       if (explicitPaths.length && !native)
@@ -2951,7 +2952,9 @@ export class BackupManager {
           { signal },
         );
         if (nativeWorkerId) {
-          await (await import('./portable-managed-volume-archive')).validateIncusSelectedRestoreArchive(file, selected, { signal });
+          const codec = await import('./portable-managed-volume-archive');
+          if (selected === '/var/lib/docker') await codec.validateIncusDockerRestoreArchive(file, { signal });
+          else await codec.validateIncusSelectedRestoreArchive(file, selected, { signal });
           archives.push({ path: selected, archive: `paths/${index}.tar`, file });
         } else {
           const sanitized = join(dir, `${index}.sanitized.tar`);

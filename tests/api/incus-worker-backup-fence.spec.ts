@@ -93,6 +93,27 @@ test('selected native getter captures durable records and existing source layout
   });
 });
 
+test('exact native Docker selection shares existing admission but never enters the ordinary selected or legacy archive backend', async () => {
+  await fixture(async (manager, _dataDir, info) => {
+    let calls = 0;
+    manager.setIncusRuntime({ openDockerArchive: async (owner: any, uuid: string, validate: () => void, signal?: AbortSignal) => {
+      calls++; expect(owner).toMatchObject({ id: info.id, userId: info.userId, containerName: info.containerName, mounts: [], managedVolumes: [] });
+      expect(uuid).toBe(info.containerId.slice(6)); expect(signal).toBeUndefined(); validate();
+      return Readable.from([Buffer.from([0,255,128,10])]);
+    }, openSelectedArchive: () => { throw new Error('Docker data must not enter selected tree walker'); } } as any);
+    await expect(manager.getSelectedBackupArchiveWithLifecycleFenceHeld(info.id, '/var/lib/docker')).rejects.toThrow('lifecycle admission');
+    expect(calls).toBe(0);
+    await withWorkerLifecycleMutation(info.id, async () => {
+      for (const path of ['/var/lib/docker/volumes', '/var/lib/docker/overlay2'])
+        await expect(manager.getSelectedBackupArchiveWithLifecycleFenceHeld(info.id, path)).rejects.toMatchObject({ code: 'INCUS_DOCKER_BACKUP_REQUIRED' });
+      const stream = await manager.getSelectedBackupArchiveWithLifecycleFenceHeld(info.id, '/var/lib/docker/');
+      const chunks = []; for await (const chunk of stream) chunks.push(chunk);
+      expect(Buffer.concat(chunks)).toEqual(Buffer.from([0,255,128,10]));
+    });
+    expect(calls).toBe(1);
+  });
+});
+
 test('cached legacy handles cannot export durable native or archived records through Docker', async () => {
   for (const status of ['active', 'archived'] as const) await fixture(async (manager, dataDir, info) => {
     info.runtimeKind = 'legacy-docker'; info.containerId = 'cached-legacy';

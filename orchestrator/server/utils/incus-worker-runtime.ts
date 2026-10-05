@@ -33,6 +33,7 @@ import { planIncusSelectedRestore, INCUS_SELECTED_RESTORE_SCRIPT } from './incus
 import { createReadStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { isDeepStrictEqual } from 'node:util';
+import { openIncusDockerArchive } from './incus-docker-archive';
 
 export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & {
   sshAuthorizedKeys?: string;
@@ -244,14 +245,12 @@ export class IncusWorkerRuntime {
     return this.archiveStream(owner.containerName, role, validate, options);
   }
 
-  /** Read-only selected capture while the caller holds the existing lifecycle
-   * fence. Exhaustive native disk authority precedes any guest archive exec;
-   * snapshots and guest boot identity are checked again before output EOF. */
-  async openSelectedArchive(owner: IncusStorageOwner & Pick<IncusWorkerOptions,
-    'storageManager' | 'mounts' | 'managedVolumes'>, incarnation: string, selected: string,
-    validateRecord: () => void | Promise<void>, signal?: AbortSignal) {
-    selected = nativeSelectedBackupPath(selected);
-    signal?.throwIfAborted(); await validateRecord();
+  /** Shared read-only native storage proof, not a transport or transaction
+   * abstraction. Cleanup uses the same proof without caller cancellation. */
+  private async nativeArchiveAuthority(owner: IncusStorageOwner & Pick<IncusWorkerOptions,
+    'storageManager' | 'mounts' | 'managedVolumes'>, incarnation: string,
+    validateRecord: () => void | Promise<void>) {
+    await validateRecord();
     const storage = await this.storage(), managed = new IncusManagedVolumeRuntime(this.config, this);
     const before = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
     const expected: Record<string, IncusDevice> = { root: { type: 'disk', path: '/', pool: this.config.incusStoragePool },
@@ -306,7 +305,7 @@ export class IncusWorkerRuntime {
     const config = (instance: IncusInstance) => Object.fromEntries(Object.entries(instance.config)
       .filter(([key]) => !key.startsWith('volatile.') || ['volatile.uuid', 'volatile.base_image'].includes(key)));
     const validate = async () => {
-      signal?.throwIfAborted(); await validateRecord();
+      await validateRecord();
       const current = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation); prove(current);
       if (!isDeepStrictEqual(current.devices, before.devices) ||
           !isDeepStrictEqual(current.expanded_devices ?? current.devices, before.expanded_devices ?? before.devices) ||
@@ -322,6 +321,20 @@ export class IncusWorkerRuntime {
     };
     await validate();
     const proof = { mounts: Object.values(expected).flatMap(device => device.path ? [device.path] : []), credentials: !!expected.cred };
+    return { validate, proof, boot, dockerVolume: before.devices.docker?.source };
+  }
+
+  /** Read-only selected capture while the caller holds the existing lifecycle
+   * fence. Exhaustive native disk authority precedes any guest archive exec;
+   * snapshots and guest boot identity are checked again before output EOF. */
+  async openSelectedArchive(owner: IncusStorageOwner & Pick<IncusWorkerOptions,
+    'storageManager' | 'mounts' | 'managedVolumes'>, incarnation: string, selected: string,
+    validateRecord: () => void | Promise<void>, signal?: AbortSignal) {
+    selected = nativeSelectedBackupPath(selected); signal?.throwIfAborted();
+    const authority = await this.nativeArchiveAuthority(owner, incarnation, validateRecord);
+    const { proof } = authority;
+    const validate = async () => { signal?.throwIfAborted(); await authority.validate(); };
+    await validate();
     const session = await this.client.execStream(owner.containerName,
       ['/usr/bin/python3', '-c', INCUS_SELECTED_ARCHIVE_SCRIPT, selected, JSON.stringify(proof)], {
         command: [], user: 0, group: 0, cwd: '/', environment: { PATH: '/usr/bin:/bin', LC_ALL: 'C' },
@@ -335,6 +348,19 @@ export class IncusWorkerRuntime {
       await validate(); output.end();
     }).catch(error => output.destroy(error));
     return output;
+  }
+
+  /** Exact logical Docker selection only. Rootfs, arbitrary subtrees and
+   * disabled/unmounted retained storage are not authority for this path. */
+  async openDockerArchive(owner: IncusStorageOwner & Pick<IncusWorkerOptions,
+    'storageManager' | 'mounts' | 'managedVolumes'>, incarnation: string,
+    validateRecord: () => void | Promise<void>, signal?: AbortSignal) {
+    signal?.throwIfAborted();
+    const authority = await this.nativeArchiveAuthority(owner, incarnation, validateRecord);
+    if (!authority.dockerVolume) throw Object.assign(new Error('Native Docker backup volume is unavailable'),
+      { statusCode: 409, code: 'INCUS_DOCKER_BACKUP_UNAVAILABLE' });
+    return openIncusDockerArchive(this.client, owner.containerName, authority.dockerVolume,
+      authority.boot.trim(), authority.validate, signal);
   }
 
   /** Internal managed capture supplies the helper's exact UUID/isolation and
