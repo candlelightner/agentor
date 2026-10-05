@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test';
 import { execFile } from 'node:child_process';
 import { promisify, isDeepStrictEqual } from 'node:util';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, writeFile, copyFile, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile, copyFile, cp, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -38,19 +38,26 @@ const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
 
 /** Explicit approved guest only. Real constrained helper process, Docker stop/
  * restart, compiled native adapter and Incus data inverse. The target is an
- * isolated inert recovery fixture, not the preserved acceptance installation;
- * full running-Orchestrator/public restore remains a separate required gate. */
-for (const mode of ['retained', 'ordinary', 'omitted', 'rollback'] as const) test(mode === 'ordinary'
+ * isolated fixture, never the preserved acceptance installation. The app
+ * variant runs the current production build; public REST restore remains a
+ * separate required gate while its production guard is retained. */
+for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained', 'app-ordinary', 'app-rollback'] as const) test(mode === 'ordinary'
   ? 'real controlled helper process restores ordinary worker Docker data with stopped intent and exact account shares'
   : mode === 'omitted' ? 'real controlled helper process restores omitted agent state with writable private account parents'
   : mode === 'rollback' ? 'real controlled helper process rolls back acknowledged native data before restoring original control plane'
+  : mode === 'app-retained' ? 'real running Orchestrator reloads authenticated native restore completion and retained data'
+  : mode === 'app-ordinary' ? 'real running Orchestrator starts restored ordinary VM through authenticated REST with native Docker and worker identity'
+  : mode === 'app-rollback' ? 'real running Orchestrator authenticates original control plane after witnessed native rollback'
   : 'real controlled helper process restores retained native data and restarts only its exact recovery target', async () => {
-  const ordinary = mode !== 'retained', rollback = mode === 'rollback';
+  const app = mode.startsWith('app-'), ordinary = mode === 'app-ordinary' || mode !== 'retained' && !app,
+    rollback = mode === 'rollback' || mode === 'app-rollback';
   test.skip(process.env.INCUS_INSTANCE_HELPER_PROCESS_TEST !== 'true', 'Explicit serial approved disposable helper-process gate');
   test.setTimeout(900_000);
   const local = await mkdtemp(join(tmpdir(), 'agentor-native-helper-process-'));
   const source = join(local, 'source'), targetData = join(local, 'data'), build = join(local, 'image');
-  const id = randomUUID(), volumeId = randomUUID(), jobId = randomUUID(), userId = (ordinary ? 'ordinary-' : 'retained-') + randomUUID();
+  const id = randomUUID(), volumeId = randomUUID(), jobId = randomUUID();
+  let userId = (ordinary ? 'ordinary-' : 'retained-') + randomUUID();
+  const appPort = 39000 + Number.parseInt(jobId.slice(0, 4), 16) % 1000;
   const remote = '/var/tmp/agentor-native-helper-process.' + jobId;
   const image = 'agentor-native-helper-process:' + jobId, targetName = 'native-recovery-' + jobId,
     helperName = 'agentor-instance-restore-' + jobId;
@@ -63,16 +70,102 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback'] as const) tes
   let targetId: string | undefined, helperId: string | undefined, imageId: string | undefined, completed = false, cleaned = false;
   let incarnation: string | undefined, policyAdded = false, computeSettled = true;
   let worker: WorkerRecord | undefined, options: IncusWorkerOptions | undefined;
+  let stagingOwner = 'recovery-admin', restoredOwner = 'restored-admin';
+  let originalInstallation: string | undefined;
+  const sourceTable = 'agentor_restore_' + jobId.slice(0, 8);
+  let sourceRuleBaseline: string | undefined;
+  const sourceRuleSnapshot = (value: string) => JSON.stringify(JSON.parse(value), (key, value) =>
+    key === 'metainfo' ? undefined : key === 'counter' ? {} : value);
   let dockerSource: string | undefined, dockerSourceDigest: string | undefined;
   let baseline: Awaited<ReturnType<IncusManagedVolumeRuntime['inspectVolume']>>;
-  const config = { ...loadConfig(), dataDir: source, containerPrefix: 'agentor-worker', incusEnabled: true,
+  const config = { ...loadConfig(), dataDir: source, containerPrefix: app ? 'aphr-' + jobId.slice(0, 8) : 'agentor-worker', incusEnabled: true,
     incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor', incusStoragePool: 'default', incusNetwork: 'incusbr0',
     incusWorkerImage: 'agentor-worker-phase10-preserve-ownership', incusClientCertPath: '/workspace/agentor-incus-tls/client.crt',
     incusClientKeyPath: '/workspace/agentor-incus-tls/client.key', incusServerCertPath: '/workspace/agentor-incus-tls/server.crt',
-    incusDockerVolumeSize: '1GiB', incusInternalGatewayUrl: 'http://10.159.68.1:38000' };
+    incusDockerVolumeSize: '1GiB', incusInternalGatewayUrl: 'http://10.159.68.1:' + (app ? appPort : 38000) };
   const runtime = new IncusWorkerRuntime(config), managedRuntime = new IncusManagedVolumeRuntime(config, runtime);
   const remoteData = remote + '/data';
-  const accountPaths = ['credentials', 'kilo/config', 'kilo/data'].map(path => remoteData + '/users/' + userId + '/' + path);
+  const tlsRoot = '/var/tmp/agentor-phase6-production.SSkg3hQz/tls';
+  const mounts = ['client.crt', 'client.key', 'server.crt'].map(file =>
+    `--mount type=bind,src=${tlsRoot}/${file},dst=/tls/${file},readonly`);
+  const admin = { email: `restore-${jobId}@agentor.test`, password: 'isolated-native-restore-' + jobId, name: 'Native Recovery Acceptance' };
+  const operatorEnv = ['CONTAINER_PREFIX=' + config.containerPrefix, 'DOCKER_NETWORK=agentor-phase6-net',
+    'INCUS_ENABLED=true', 'INCUS_ENDPOINT=https://agentor-kata-preflight:8443', 'INCUS_PROJECT=agentor',
+    'INCUS_NETWORK=incusbr0', 'INCUS_STORAGE_POOL=default', 'INCUS_WORKER_IMAGE=agentor-worker-phase10-preserve-ownership',
+    'INCUS_DOCKER_VOLUME_SIZE=1GiB', 'INCUS_INTERNAL_GATEWAY_URL=' + config.incusInternalGatewayUrl,
+    'INCUS_CLIENT_CERT_PATH=/tls/client.crt', 'INCUS_CLIENT_KEY_PATH=/tls/client.key', 'INCUS_SERVER_CERT_PATH=/tls/server.crt'];
+  const prepareImage = async () => {
+    await run(process.execPath, [fileURLToPath(new URL('../../orchestrator/build-instance-restore-native.mjs', import.meta.url)),
+      join(build, 'instance-restore-native')], { env: {}, timeout: 60_000 });
+    await copyFile(fileURLToPath(new URL('../../orchestrator/instance-restore-helper.mjs', import.meta.url)), join(build, 'instance-restore-helper.mjs'));
+    await copyFile(fileURLToPath(new URL(app ? '../fixtures/instance-native-app.Dockerfile' : '../fixtures/instance-native-helper.Dockerfile', import.meta.url)), join(build, 'Dockerfile'));
+    if (app) await cp(fileURLToPath(new URL('../../orchestrator/.output', import.meta.url)), join(build, 'app-output'),
+      { recursive: true, verbatimSymlinks: true });
+    if (app) for (const file of ['volume-mount-helper.py', 'incus-volume-live-helper.py'])
+      await copyFile(fileURLToPath(new URL('../../orchestrator/' + file, import.meta.url)), join(build, file));
+    await expect(runtime.client.getInstance(config.containerPrefix + '-' + id)).rejects.toMatchObject({ statusCode: 404 });
+    await expect(runtime.client.getCustomVolume(config.incusStoragePool, volume.dockerName)).rejects.toMatchObject({ statusCode: 404 });
+    expect((await runtime.client.request<{ driver: string }>('GET', '/1.0/storage-pools/' + config.incusStoragePool)).driver).toBe('dir');
+    await root(`test ! -e ${quote(remote)} && mkdir -m 700 ${quote(remote)}`);
+    await run('scp', [...scp, '-r', targetData, build, 'kata-test@172.19.0.1:' + remote + '/'], { timeout: 60_000 });
+    imageId = await root(`sudo docker build -q --label agentor.native-helper-fixture=${jobId} --build-arg REMOVE_VOLUME_HELPER_SLEEP=${rollback} -t ${quote(image)} ${quote(remote + '/image')}`, 120_000);
+    expect(imageId).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(await root(`sudo docker image inspect ${quote(image)} --format '{{.Id}} {{index .Config.Labels "agentor.native-helper-fixture"}}'`))
+      .toBe(imageId + ' ' + jobId);
+  };
+  const launchTarget = async () => {
+    const args = app ? `${operatorEnv.concat(['DATA_DIR=' + remoteData, 'BETTER_AUTH_URL=http://127.0.0.1:3000'])
+      .map(v => '-e ' + quote(v)).join(' ')} ` +
+      `--mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock ${mounts.join(' ')}` : '';
+    targetId = await root(`sudo docker run -d --name ${quote(targetName)} --label agentor.native-helper-fixture=${jobId} ` +
+      `--network agentor-phase6-net --add-host agentor-kata-preflight:172.22.0.1 -e AGENTOR_INSTANCE_RECOVERY_MODE=true ` +
+      `--mount type=bind,src=${remoteData},dst=${remoteData} ${app ? '-p 10.159.68.1:' + appPort + ':3000' : ''} ${args} ${quote(image)} ` +
+      (app ? 'node .output/server/index.mjs' : `node -e 'setInterval(()=>{},1000)'`));
+    expect(targetId).toMatch(/^[a-f0-9]{64}$/);
+    if (app) {
+      // Reuse the accepted Phase6 source-preservation rule on this exact App
+      // IP/internal port. Own table only; no edits to Docker/Incus chains and
+      // no blanket forwarding permission or worker-selected identity header.
+      // Restricted project clients intentionally cannot read inherited bridge
+      // configuration. Operator fixture discovery uses the authorized guest
+      // CLI, never broader application credentials or a socket mount.
+      const cidr = await root(`sudo incus network get ${quote(config.incusNetwork)} ipv4.address`);
+      expect(cidr).toMatch(/^(?:\d+\.){3}\d+\/\d+$/);
+      const dockerNetwork = JSON.parse(await root(`sudo docker network inspect agentor-phase6-net`)) as Array<{
+        Id: string; Options: Record<string, string>;
+      }>;
+      expect(dockerNetwork[0]!.Id).toMatch(/^[a-f0-9]{64}$/);
+      const bridge = dockerNetwork[0]!.Options['com.docker.network.bridge.name'] ?? 'br-' + dockerNetwork[0]!.Id.slice(0, 12);
+      expect(bridge).toMatch(/^[A-Za-z0-9_.-]{1,15}$/);
+      const ip = await root(`sudo docker inspect ${targetId} --format '{{(index .NetworkSettings.Networks "agentor-phase6-net").IPAddress}}'`);
+      expect(ip).toMatch(/^(?:\d+\.){3}\d+$/);
+      const spec = `table ip ${sourceTable} { chain postrouting { type nat hook postrouting priority 99; policy accept; ` +
+        `iifname "${config.incusNetwork}" oifname "${bridge}" ip saddr ${cidr} ip daddr ${ip} tcp dport 3000 ` +
+        `counter snat to ip saddr comment "agentor-restore-${jobId}";\n }\n}\n`;
+      expect(await root(`sudo nft list tables`)).not.toContain('table ip ' + sourceTable);
+      await root(`printf '%s\\n' ${quote(spec)} | sudo nft --check -f -`);
+      await root(`printf '%s\\n' ${quote(spec)} | sudo nft -f -`);
+      sourceRuleBaseline = sourceRuleSnapshot(await root(`sudo nft -j list table ip ${sourceTable}`));
+    }
+  };
+  // Requests execute on loopback INSIDE only the exact fixture container.
+  // Sign-in cookies never leave that process or appear in tool/test output.
+  const appRequest = async <T,>(path: string, body?: unknown, authenticated = true,
+    timeoutMs = 30_000): Promise<{ status: number; body: T }> => {
+    const script = `const base='http://127.0.0.1:3000';const headers={Origin:base,'Content-Type':'application/json'};` +
+      (authenticated ? `const signed=await fetch(base+'/api/auth/sign-in/email',{method:'POST',headers,body:${JSON.stringify(JSON.stringify(admin))}});` +
+        `if(!signed.ok)throw new Error('Fixture sign-in failed '+signed.status);headers.Cookie=signed.headers.getSetCookie().map(v=>v.split(';')[0]).join('; ');` : '') +
+      `const r=await fetch(base+${JSON.stringify(path)},{headers,redirect:'manual'${body === undefined ? '' : ",method:'POST',body:" + JSON.stringify(JSON.stringify(body))}});` +
+      `console.log(JSON.stringify({status:r.status,body:r.headers.get('content-type')?.includes('application/json')?await r.json():await r.text()}));`;
+    try {
+      return JSON.parse(await root(`sudo docker exec ${targetId} node --input-type=module -e ${quote(script)}`, timeoutMs));
+    } catch {
+      // execFile errors include command arguments. Never print the synthetic
+      // sign-in password or any cookie-bearing child-process diagnostics.
+      throw new Error('Running fixture request failed: ' + path);
+    }
+  };
+  const accountPaths = () => ['credentials', 'kilo/config', 'kilo/data'].map(path => remoteData + '/users/' + userId + '/' + path);
   // Same exact fixture-only ETag delta used by accepted native account gates.
   // No change to production restrictions or generic host-path authorization.
   const policy = (add: boolean) => root('sudo python3 -c ' + quote(String.raw`
@@ -92,9 +185,22 @@ assert paths;cfg['restricted.devices.disk.paths']=','.join(paths)
 c.request('PUT','/1.0/projects/agentor',json.dumps(dict(config=cfg,description=p['description'])),{'Content-Type':'application/json','If-Match':etag})
 r=c.getresponse();b=json.loads(r.read());assert r.status==200 and b['type']=='sync',b
 print('Exact account fixture delta confirmed')
-`) + ' ' + quote(JSON.stringify(accountPaths)) + ' ' + (add ? 'add' : 'remove'));
+`) + ' ' + quote(JSON.stringify(accountPaths())) + ' ' + (add ? 'add' : 'remove'));
   try {
     await Promise.all([mkdir(source), mkdir(join(targetData, 'admin'), { recursive: true }), mkdir(build)]);
+    if (app) {
+      await prepareImage(); await launchTarget();
+      await expect.poll(async () => {
+        try { return (await appRequest('/api/health', undefined, false)).status; } catch { return 0; }
+      }, { timeout: 60_000 }).toBe(200);
+      const created = await appRequest<{ id: string; role: string }>('/api/setup/create-admin', admin, false);
+      expect(created.status).toBe(201); expect(created.body.role).toBe('admin');
+      stagingOwner = restoredOwner = created.body.id; expect(stagingOwner).toMatch(/^[A-Za-z0-9_-]+$/);
+      originalInstallation = JSON.parse(await root(`sudo python3 -c ${quote(
+        'import json,os,sys; p=sys.argv[1]; print(json.dumps(open(p).read().strip() if os.path.exists(p) else None))')} ` +
+        quote(remoteData + '/backup-installation-id'))) ?? undefined;
+      if (ordinary) userId = volume.userId = stagingOwner;
+    }
     const installation = await backupInstallationId(source);
     const store = new ManagedVolumeStore(source); await store.init(); await store.save(volume);
     await writeFile(join(source, 'worker-config.key'), Buffer.alloc(32, 81).toString('base64') + '\n', { mode: 0o600 });
@@ -122,7 +228,20 @@ print('Exact account fixture delta confirmed')
         await mkdir(join(source, 'users', userId, path), { recursive: true, mode: 0o700 });
       await writeFile(join(source, 'users', userId, 'ssh/authorized_keys'), '', { mode: 0o600 });
     }
-    const auth = join(local, 'auth.db'); await writeFile(auth, Buffer.concat([Buffer.from('SQLite format 3\0'), Buffer.alloc(4096)]));
+    const auth = join(local, 'auth.db');
+    if (app) {
+      // Same SQLite online-backup primitive as production capture. No manually
+      // authored authentication schema or fabricated source account.
+      const snapshot = remoteData + '/auth-fixture.snapshot';
+      await root(`sudo docker exec ${targetId} node --input-type=module -e ${quote(
+        `import{createRequire}from'node:module';import{chmodSync}from'node:fs';const r=createRequire('/app/.output/server/package.json');` +
+        `const db=new(r('better-sqlite3'))(${JSON.stringify(remoteData + '/auth.db')},{readonly:true});await db.backup(${JSON.stringify(snapshot)});chmodSync(${JSON.stringify(snapshot)},0o600);db.close();`)}`);
+      const bytes = (await run('ssh', [...ssh, `sudo cat ${quote(snapshot)}`], { encoding: 'buffer', maxBuffer: 16 * 1024 * 1024 })).stdout;
+      await writeFile(auth, bytes, { mode: 0o600 });
+      const secret = (await run('ssh', [...ssh, `sudo cat ${quote(remoteData + '/auth.secret')}`],
+        { encoding: 'buffer', maxBuffer: 1024 })).stdout;
+      await writeFile(join(source, 'auth.secret'), secret, { mode: 0o600 });
+    } else await writeFile(auth, Buffer.concat([Buffer.from('SQLite format 3\0'), Buffer.alloc(4096)]));
     const stage = join(targetData, 'instance-restore-staging', 'restore-' + jobId), unpacked = join(stage, 'unpacked');
     await mkdir(unpacked, { recursive: true, mode: 0o700 });
     const backupOptions = { includeWorkers: true, includeAgentData: mode !== 'omitted', includeDockerVolumes: true, includeLocalBackups: false, includeLogs: false };
@@ -138,7 +257,7 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
     await run('sudo', ['tar', '--format=pax', '--numeric-owner', '--xattrs', '--xattrs-include=*', '--acls', '-C', payload, '-czf', archive, 'volume']);
     await run('sudo', ['chown', `${process.getuid!()}:${process.getgid!()}`, archive]);
     let manifest: InstanceBackupManifest = validateInstanceManifest({ kind: 'agentor-instance-backup', formatVersion: 2,
-      backupId: jobId, sourceInstallationId: installation, createdByUserId: 'restored-admin', createdAt: stamp, agentorVersion: 'test',
+      backupId: jobId, sourceInstallationId: installation, createdByUserId: restoredOwner, createdAt: stamp, agentorVersion: 'test',
       storage: { mode: 'directory', containerPrefix: config.containerPrefix }, options: backupOptions,
       dataArchive: { archive: 'data.tar.gz', sha256: data.sha256, size: data.size },
       volumes: [{ name: volume.dockerName, kind: 'persistent-path', ownerId: userId, workerId: id, archive: archiveName,
@@ -186,41 +305,36 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
     const remoteStage = remoteData + '/instance-restore-staging/restore-' + jobId;
     await writeFile(join(stage, 'restore-plan.json'), JSON.stringify({ version: 1, formatVersion: 2, jobId,
       dataArchive: remoteStage + '/unpacked/data.tar.gz', sourceInstallationId: installation,
-      restoredOwnerId: 'restored-admin', stagingOwnerId: 'recovery-admin', restoreHostMountPolicies: false, manifest,
+      restoredOwnerId: restoredOwner, stagingOwnerId: stagingOwner, restoreHostMountPolicies: false, manifest,
       volumes: manifest.volumes.map(v => ({ ...v, archive: remoteStage + '/unpacked/' + instanceBundleFilename(v.archive) })) }));
-    const job: InstanceBackupJob = { schemaVersion: 1, id: jobId, userId: 'recovery-admin', operation: 'restore', provider: 'fake',
+    const job: InstanceBackupJob = { schemaVersion: 1, id: jobId, userId: stagingOwner, operation: 'restore', provider: 'fake',
       status: 'running', phase: 'applying', progress: 70, bytesProcessed: 0, createdAt: stamp, updatedAt: stamp, logs: [] };
     await writeFile(join(targetData, 'admin/instance-backups.v1.json'), JSON.stringify({ schemaVersion: 1, jobs: [job], artifacts: [], remoteBackups: [] }));
-    await writeFile(join(targetData, 'auth.db'), Buffer.concat([Buffer.from('SQLite format 3\0'), Buffer.from('old-target')]));
-    await run(process.execPath, [fileURLToPath(new URL('../../orchestrator/build-instance-restore-native.mjs', import.meta.url)),
-      join(build, 'instance-restore-native')], { env: {}, timeout: 60_000 });
-    await copyFile(fileURLToPath(new URL('../../orchestrator/instance-restore-helper.mjs', import.meta.url)), join(build, 'instance-restore-helper.mjs'));
-    await copyFile(fileURLToPath(new URL('../fixtures/instance-native-helper.Dockerfile', import.meta.url)), join(build, 'Dockerfile'));
-    await expect(runtime.client.getInstance(config.containerPrefix + '-' + id)).rejects.toMatchObject({ statusCode: 404 });
-    await expect(runtime.client.getCustomVolume(config.incusStoragePool, volume.dockerName)).rejects.toMatchObject({ statusCode: 404 });
-    expect((await runtime.client.request<{ driver: string }>('GET', '/1.0/storage-pools/' + config.incusStoragePool)).driver).toBe('dir');
-    await root(`test ! -e ${quote(remote)} && mkdir -m 700 ${quote(remote)}`);
-    await run('scp', [...scp, '-r', targetData, build, 'kata-test@172.19.0.1:' + remote + '/'], { timeout: 60_000 });
+    if (app) {
+      // Normal App bootstrap owns DATA_DIR. Transfer through the exact private
+      // fixture parent, then guest-only sudo installs staged inputs; never
+      // widen production DATA or secret permissions to make scp succeed.
+      const incoming = remote + '/incoming';
+      await root(`test ! -e ${quote(incoming)} && mkdir -m 700 ${quote(incoming)}`);
+      await run('scp', [...scp, '-r', join(targetData, 'instance-restore-staging'), join(targetData, 'admin'),
+        'kata-test@172.19.0.1:' + incoming + '/'], { timeout: 60_000 });
+      await root(`sudo cp -a ${quote(incoming + '/instance-restore-staging')} ${quote(remoteData + '/')} && ` +
+        `sudo install -m 600 ${quote(incoming + '/admin/instance-backups.v1.json')} ${quote(remoteData + '/admin/instance-backups.v1.json')}`);
+    }
+    else {
+      await writeFile(join(targetData, 'auth.db'), Buffer.concat([Buffer.from('SQLite format 3\0'), Buffer.from('old-target')]));
+      await prepareImage();
+    }
     if (ordinary) { await policy(true); policyAdded = true; }
-    imageId = await root(`sudo docker build -q --label agentor.native-helper-fixture=${jobId} --build-arg REMOVE_VOLUME_HELPER_SLEEP=${rollback} -t ${quote(image)} ${quote(remote + '/image')}`, 120_000);
-    expect(imageId).toMatch(/^sha256:[a-f0-9]{64}$/);
-    expect(await root(`sudo docker image inspect ${quote(image)} --format '{{.Id}} {{index .Config.Labels "agentor.native-helper-fixture"}}'`))
-      .toBe(imageId + ' ' + jobId);
-    targetId = await root(`sudo docker run -d --name ${quote(targetName)} --label agentor.native-helper-fixture=${jobId} ` +
-      `--network agentor-phase6-net --add-host agentor-kata-preflight:172.22.0.1 -e AGENTOR_INSTANCE_RECOVERY_MODE=true ` +
-      `--mount type=bind,src=${remoteData},dst=${remoteData} ${quote(image)} node -e 'setInterval(()=>{},1000)'`);
-    expect(targetId).toMatch(/^[a-f0-9]{64}$/);
+    if (!app) await launchTarget();
     const env = [ 'AGENTOR_INSTANCE_RESTORE_NATIVE=true', `AGENTOR_INSTANCE_RESTORE_JOB=${jobId}`,
       `AGENTOR_INSTANCE_RESTORE_STAGE=${remoteStage}`, `AGENTOR_INSTANCE_RESTORE_DATA_DIR=${remoteData}`,
-      `AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR=${targetId}`, 'CONTAINER_PREFIX=agentor-worker',
+      `AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR=${targetId}`, 'CONTAINER_PREFIX=' + config.containerPrefix,
       'INCUS_ENDPOINT=https://agentor-kata-preflight:8443', 'INCUS_PROJECT=agentor', 'INCUS_NETWORK=incusbr0',
       'INCUS_STORAGE_POOL=default', 'INCUS_WORKER_IMAGE=agentor-worker-phase10-preserve-ownership',
-      'INCUS_DOCKER_VOLUME_SIZE=1GiB', 'INCUS_INTERNAL_GATEWAY_URL=http://10.159.68.1:38000',
+      'INCUS_DOCKER_VOLUME_SIZE=1GiB', 'INCUS_INTERNAL_GATEWAY_URL=' + config.incusInternalGatewayUrl,
       'INCUS_CLIENT_CERT_PATH=/tls/client.crt', 'INCUS_CLIENT_KEY_PATH=/tls/client.key', 'INCUS_SERVER_CERT_PATH=/tls/server.crt' ];
     // Exact assigned credential files only; never inject them into the guest.
-    const tlsRoot = '/var/tmp/agentor-phase6-production.SSkg3hQz/tls';
-    const mounts = ['client.crt', 'client.key', 'server.crt'].map(file =>
-      `--mount type=bind,src=${tlsRoot}/${file},dst=/tls/${file},readonly`);
     console.info('Exact native helper-process fixture', { remote, id, jobId, volumeId, installation, targetId });
     helperId = await root(`sudo docker create --name ${quote(helperName)} --label agentor.native-helper-fixture=${jobId} --user 0:0 ` +
       `--network agentor-phase6-net --add-host agentor-kata-preflight:172.22.0.1 --read-only --cap-drop ALL ` +
@@ -248,23 +362,36 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
       expect(witnesses[0]!.Actor.ID).toMatch(/^[a-f0-9]{64}$/);
       expect(witnesses[0]!.Actor.Attributes).toMatchObject({ name: witnessName, image,
         'agentor.instance-restore-volume-helper': 'true', 'agentor.instance-restore-job': jobId });
-      expect(ledger).toMatchObject({ id: jobId, userId: 'recovery-admin', status: 'failed', phase: 'failed', retryable: true });
+      expect(ledger).toMatchObject({ id: jobId, userId: stagingOwner, status: 'failed', phase: 'failed', retryable: true });
       expect(ledger.errorCode).not.toBe('INSTANCE_RESTORE_ROLLBACK_INCOMPLETE');
       expect(await root(`sudo docker inspect ${targetId} --format '{{.State.Running}}'`)).toBe('true');
-      const oldDb = await root(`sudo python3 -c ${quote('import sys; print(open(sys.argv[1],"rb").read().hex())')} ${quote(remoteData + '/auth.db')}`);
-      expect(oldDb).toBe(Buffer.concat([Buffer.from('SQLite format 3\0'), Buffer.from('old-target')]).toString('hex'));
-      await root(`test ! -e ${quote(remoteData + '/users')} && test ! -e ${quote(remoteData + '/instance-restore-rollback/' + jobId)}`);
+      if (app) {
+        const restoredIdentity = JSON.parse(await root(`sudo python3 -c ${quote(
+          'import json,os,sys; p=sys.argv[1]; print(json.dumps(open(p).read().strip() if os.path.exists(p) else None))')} ` +
+          quote(remoteData + '/backup-installation-id'))) ?? undefined;
+        expect(restoredIdentity).toBe(originalInstallation);
+        expect(originalInstallation).not.toBe(installation);
+        await expect.poll(async () => {
+          try { return (await appRequest('/api/health', undefined, false)).status; } catch { return 0; }
+        }, { timeout: 60_000 }).toBe(200);
+        const failed = await appRequest<InstanceBackupJob>('/api/admin/instance-backups/jobs/' + jobId);
+        expect(failed.status).toBe(200); expect(failed.body).toMatchObject({ id: jobId, userId: stagingOwner, status: 'failed', phase: 'failed' });
+      } else {
+        const oldDb = await root(`sudo python3 -c ${quote('import sys; print(open(sys.argv[1],"rb").read().hex())')} ${quote(remoteData + '/auth.db')}`);
+        expect(oldDb).toBe(Buffer.concat([Buffer.from('SQLite format 3\0'), Buffer.from('old-target')]).toString('hex'));
+      }
+      await root(`test ! -e ${quote(remoteData + '/users' + (app ? '/' + userId : ''))} && test ! -e ${quote(remoteData + '/instance-restore-rollback/' + jobId)}`);
       await expect(runtime.client.getInstance(config.containerPrefix + '-' + id)).rejects.toMatchObject({ statusCode: 404 });
       for (const name of [...['workspace', 'agents', 'docker'].map(role => config.containerPrefix + '-' + id + '-' + role), volume.dockerName])
         await expect(runtime.client.getCustomVolume(config.incusStoragePool, name)).rejects.toMatchObject({ statusCode: 404 });
       expect(await root(`sudo docker volume ls --format '{{.Name}}' --filter name=^${legacyName}$`)).toBe('');
       expect(await root(`sudo docker ps -aq --filter label=agentor.instance-restore-job=${jobId}`)).toBe('');
-      expect(await sha256File(dockerSource!)).toBe(dockerSourceDigest);
+      if (dockerSource) expect(await sha256File(dockerSource)).toBe(dockerSourceDigest);
       completed = true;
       console.info('Real legacy Docker start failure after acknowledged native apply: native cleanup settled BEFORE original control plane restored; only exact recovery target restarted');
       return;
     }
-    expect(ledger).toMatchObject({ id: jobId, userId: 'restored-admin', status: 'succeeded', phase: 'complete' });
+    expect(ledger).toMatchObject({ id: jobId, userId: restoredOwner, status: 'succeeded', phase: 'complete' });
     expect(await root(`sudo docker inspect ${targetId} --format '{{.State.Running}}'`)).toBe('true');
     const record = JSON.parse(await root(`sudo python3 -c ${quote('import json,sys; print(json.dumps(json.load(open(sys.argv[1]))[0]))')} ` +
         quote(remoteData + (ordinary ? '/users/' : '/retained-storage/users/') + userId + '/managed-volumes.v1.json'))) as StoredManagedVolume;
@@ -272,7 +399,7 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
       ...(!ordinary ? { retainedAfterAccountDeletion: true } : {}) });
     await root(`test ! -e ${quote(remoteData + '/instance-restore-rollback/' + jobId)}`);
     if (!ordinary) {
-      await root(`test ! -e ${quote(remoteData + '/users')}`);
+      await root(`test ! -e ${quote(remoteData + '/users' + (app ? '/' + userId : ''))}`);
       await expect(runtime.client.getInstance(config.containerPrefix + '-' + id)).rejects.toMatchObject({ statusCode: 404 });
       for (const role of ['workspace', 'agents', 'docker'])
         await expect(runtime.client.getCustomVolume(config.incusStoragePool, config.containerPrefix + '-' + id + '-' + role)).rejects.toMatchObject({ statusCode: 404 });
@@ -287,7 +414,18 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
       storage.mode = 'directory'; storage.dataHostPath = remoteData;
       options!.storageManager = storage; options!.managedVolumes = [record];
       computeSettled = false;
-      await runtime.start(options!, incarnation); computeSettled = true;
+      if (app) {
+        await expect.poll(async () => {
+          try { return (await appRequest('/api/health', undefined, false)).status; } catch { return 0; }
+        }, { timeout: 60_000 }).toBe(200);
+        // Existing dashboard restart starts stopped workers; no new endpoint
+        // or frontend protocol is required for restored compute.
+        const started = await appRequest<{ ok: boolean }>('/api/containers/' + id + '/restart', {}, true, 360_000);
+        expect(started.status).toBe(200); expect(started.body).toEqual({ ok: true });
+        const listed = await appRequest<Array<{ id: string; runtimeKind: string; status: string }>>('/api/containers');
+        expect(listed.status).toBe(200); expect(listed.body.find(v => v.id === id)).toMatchObject({ runtimeKind: 'incus-vm', status: 'running' });
+      } else await runtime.start(options!, incarnation);
+      computeSettled = true;
       const checked = await runtime.client.exec(options!.containerName, ['bash', '-ec',
         (mode === 'omitted' ? 'test ! -e /home/agent/.agent-data/marker; ' : 'cmp /workspace/marker /home/agent/.agent-data/marker; ') +
         'runuser -u agent -- touch /home/agent/.agent-data/.kilo/state/helper-writable /home/agent/.agent-data/.codex/helper-writable; ' +
@@ -298,6 +436,16 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
         'curl --fail --silent http://127.0.0.1:8443/ >/dev/null; curl --fail --silent http://127.0.0.1:6080/ >/dev/null']);
       expect(checked.returnCode, checked.stdout + checked.stderr).toBe(0); expect(checked.stdout.trim()).toBe('overlay2');
       expect(await sha256File(dockerSource!)).toBe(dockerSourceDigest);
+      if (app) {
+        const editor = await appRequest<string>('/editor/' + id + '/?folder=/workspace');
+        expect(editor.status).toBe(200); expect(editor.body).toContain('code-server');
+        const desktop = await appRequest<string>('/desktop/' + id + '/agentor.html');
+        expect(desktop.status).toBe(200); expect(desktop.body).toContain('noVNC');
+        const self = await runtime.client.exec(options!.containerName,
+          ['curl', '--noproxy', '*', '-fsS', config.incusInternalGatewayUrl + '/api/worker-self/info']);
+        expect(self.returnCode, self.stderr).toBe(0);
+        expect(JSON.parse(self.stdout)).toMatchObject({ workerId: id, userId });
+      }
     }
     baseline = await managedRuntime.inspectVolume(record); if (!ordinary) expect(baseline?.used_by).toEqual([]);
     const physical = '/var/lib/incus/storage-pools/default/custom/agentor_' + volume.dockerName;
@@ -308,6 +456,14 @@ mode=stat.S_IMODE(s.st_mode),mtime=s.st_mtime_ns,hard=s.st_ino==os.stat(p+'/hard
 xattr=base64.b64encode(os.getxattr(p+'/data','user.binary')).decode())))`)} ${quote(physical)}`));
     expect(contents).toEqual({ data: 'AP+ACj0A', uid: 12345, gid: 23456, mode: 0o640, mtime: 1700000000987654321,
       hard: true, xattr: 'AP+ACj0A' });
+    if (app) {
+      await expect.poll(async () => {
+        try { return (await appRequest('/api/health', undefined, false)).status; } catch { return 0; }
+      }, { timeout: 60_000 }).toBe(200);
+      const visible = await appRequest<InstanceBackupJob>('/api/admin/instance-backups/jobs/' + jobId);
+      expect(visible.status).toBe(200); expect(visible.body).toMatchObject({ id: jobId, userId: restoredOwner, status: 'succeeded', phase: 'complete' });
+      console.info('Current running Orchestrator authenticated against restored SQLite and exposed completed native job after exact restart');
+    }
     completed = true;
     console.info(ordinary ? 'Real constrained helper committed original stopped intent; explicit native start verified editor/desktop and Docker image/container/named-volume data'
       : 'Real constrained helper committed retained binary/native metadata, zero source references, no synthetic worker, exact Docker target restart');
@@ -334,6 +490,10 @@ xattr=base64.b64encode(os.getxattr(p+'/data','user.binary')).decode())))`)} ${qu
       for (const containerId of [helperId, targetId]) if (containerId) {
         expect(await root(`sudo docker inspect ${containerId} --format '{{index .Config.Labels "agentor.native-helper-fixture"}}'`)).toBe(jobId);
         await root(`sudo docker rm -f ${containerId}`);
+      }
+      if (sourceRuleBaseline) {
+        expect(sourceRuleSnapshot(await root(`sudo nft -j list table ip ${sourceTable}`))).toBe(sourceRuleBaseline);
+        await root(`sudo nft delete table ip ${sourceTable}`);
       }
       expect(await root(`sudo docker image inspect ${quote(image)} --format '{{.Id}} {{index .Config.Labels "agentor.native-helper-fixture"}}'`))
         .toBe(imageId + ' ' + jobId);
