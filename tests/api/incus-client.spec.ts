@@ -515,8 +515,11 @@ test.describe("IncusClient mock server protocol tests", () => {
     const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
     client.getInstance = async () => ({ config: {}, profiles: [], devices: {} }) as any;
     let puts = 0;
+    client.request = async () => ({}) as any;
     const order: string[] = [];
     client.rawRequest = async (method, path) => {
+      if (method === 'GET') return { statusCode: 200, headers: { etag: 'original-etag' }, body: Buffer.from(JSON.stringify({
+        type: 'sync', metadata: { config: {}, profiles: [], devices: {} } })) };
       expect([method, path]).toEqual(['PUT', '/1.0/instances/worker']); puts++;
       return { statusCode: 202, headers: {}, body: Buffer.from(JSON.stringify({ type: 'async',
         operation: 'https://mock.invalid/1.0/operations/device-cutover?project=agentor' })) };
@@ -539,12 +542,60 @@ test.describe("IncusClient mock server protocol tests", () => {
     expect(puts).toBe(3);
   });
 
+  test('device PUT uses native mutation fences and matching caller snapshot/ETag without blocking exec', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    const original = { config: { 'volatile.uuid': 'original' }, profiles: [], description: '',
+      devices: { root: { type: 'disk', path: '/', source: 'canonical' } } } as any;
+    let current = structuredClone(original), operations: any = {}, etag: string | undefined = 'original-etag', puts = 0;
+    let loseResponse = false, rejectEtag = false;
+    client.request = async () => operations;
+    client.rawRequest = async (method, _path, body, headers) => {
+      if (method === 'GET') return { statusCode: 200, headers: { etag },
+        body: Buffer.from(JSON.stringify({ type: 'sync', metadata: current })) };
+      expect(headers).toEqual({ 'If-Match': 'original-etag' }); puts++;
+      if (rejectEtag) return { statusCode: 412, headers: {}, body: Buffer.from(JSON.stringify({ type: 'error', error: 'ETag changed under native lock' })) };
+      current = { ...current, devices: (body as any).devices };
+      if (loseResponse) {
+        operations = { running: [{ status: 'Running', description: 'Updating instance',
+          resources: { instances: ['/1.0/instances/worker?project=agentor'] } }] };
+        throw new Error('Lost device response');
+      }
+      return { statusCode: 200, headers: {}, body: Buffer.from(JSON.stringify({ type: 'sync' })) };
+    };
+    const update = () => client.updateInstanceDevices('worker', { ...original.devices, nic: { type: 'nic', network: 'owned' } }, undefined, original);
+    operations = { running: [{ status: 'Running', description: 'Updating instance',
+      resources: { instances: ['/1.0/instances/worker?project=agentor'] } }] };
+    await expect(update()).rejects.toThrow('still unsettled'); expect(puts).toBe(0);
+    operations = { running: [{ status: 'Running', description: 'Executing command',
+      resources: { instances: ['/1.0/instances/worker?project=agentor'] } },
+      { status: 'Running', description: 'Updating instance', resources: { instances: ['/1.0/instances/other?project=agentor'] } }] };
+    await update(); expect(puts).toBe(1);
+    for (const patch of [{ devices: {} }, { config: { 'volatile.uuid': 'replacement' } }, { profiles: ['foreign'] }, { description: 'changed' }]) {
+      current = { ...original, ...patch }; await expect(update()).rejects.toThrow('caller device snapshot');
+    }
+    expect(puts).toBe(1); current = structuredClone(original); operations = {};
+    etag = undefined; await expect(update()).rejects.toThrow('ETag'); expect(puts).toBe(1);
+    etag = 'original-etag'; operations = { running: {} };
+    await expect(update()).rejects.toThrow('operation state'); expect(puts).toBe(1);
+    operations = {}; rejectEtag = true;
+    await expect(update()).rejects.toMatchObject({ statusCode: 412 }); expect(puts).toBe(2);
+    rejectEtag = false; loseResponse = true;
+    await expect(update()).rejects.toThrow('Lost device response'); expect(puts).toBe(3);
+    // Matching NIC readback is not permission to overtake the still-active PUT.
+    await expect(update()).rejects.toThrow('still unsettled'); expect(puts).toBe(3);
+    operations = {}; // Expiry is not interpreted as proof of the old outcome.
+    await expect(update()).rejects.toThrow('caller device snapshot'); expect(puts).toBe(3);
+  });
+
   test('device operation acceptance rejects missing, foreign or malformed authority and distinguishes synchronous completion', async () => {
     const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
     client.getInstance = async () => ({ config: {}, profiles: [], devices: {} }) as any;
     let response: any;
+    client.request = async () => ({}) as any;
     let accepted = 0, waits = 0;
-    client.rawRequest = async () => ({ statusCode: 202, headers: {}, body: Buffer.from(JSON.stringify(response)) });
+    client.rawRequest = async method => method === 'GET' ? { statusCode: 200, headers: { etag: 'original-etag' },
+      body: Buffer.from(JSON.stringify({ type: 'sync', metadata: { config: {}, profiles: [], devices: {} } })) } :
+      { statusCode: 202, headers: {}, body: Buffer.from(JSON.stringify(response)) };
     client.waitForOperation = async () => { waits++; return { status: 'Success' } as any; };
     for (const operation of [undefined, '/1.0/operations/cutover?project=other',
       'https://foreign.invalid/1.0/operations/cutover', '/1.0/instances/worker']) {

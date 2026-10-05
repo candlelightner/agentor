@@ -7,7 +7,7 @@ import {
 import { useStorageVisibilityManager } from "./storage-visibility";
 import { verifyWorkerMutationUnlocks } from "./worker-protection-lock";
 import { withWorkerNetworkMutation } from "./worker-group-manager";
-import { updateManagedNetworkAtomically } from "./managed-network-update";
+import { reconcileCreatedManagedNetwork, updateManagedNetworkAtomically } from "./managed-network-update";
 import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 
 export interface ManagementPlatformTool {
@@ -67,15 +67,11 @@ export class ManagementPlatformDomain {
       if (scope === "selected")
         await store.update(ownerId, network.id, { workerIds: strings(args.workerIds) });
       const saved = store.get(ownerId, network.id)!;
-      try {
-        const reconciliation = await manager.reconcile(saved);
-        if (reconciliation.partialFailures.length) throw error(409, reconciliation.partialFailures.join("; "));
-        return { ...saved, reconciliation };
-      } catch (cause) {
-        await manager.remove(saved).catch(() => {});
-        await store.remove(ownerId, saved.id).catch(() => {});
-        throw cause;
-      }
+      return reconcileCreatedManagedNetwork(saved, {
+        reconcile: value => manager.reconcile(value),
+        removeRuntime: value => manager.remove(value),
+        removeRecord: (userId, networkId) => store.remove(userId, networkId),
+      });
       }) };
     }
     const id = required(args.networkId, "networkId");

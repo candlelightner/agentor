@@ -25,6 +25,14 @@ export function incusManagedNetworkDevice(installation: string, workerId: string
     'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' };
 }
 
+/** Nonsensitive networkd configuration, readable by systemd-network. Secondary
+ * networks never supply default routes, resolver settings or IPv6 RA policy. */
+export function incusManagedNetworkRule(device: IncusDevice): string {
+  if (!/^02:(?:[0-9a-f]{2}:){4}[0-9a-f]{2}$/.test(device.hwaddr ?? ''))
+    throw new Error('Invalid managed network MAC authority');
+  return `[Match]\nMACAddress=${device.hwaddr}\n[Network]\nDHCP=ipv4\nIPv6AcceptRA=no\n[DHCPv4]\nClientIdentifier=mac\nUseRoutes=no\nUseDNS=no\nUseDomains=no\n`;
+}
+
 /** Load the durable owner partition rather than trusting instance metadata to
  * authorize its own extra NICs. Missing/revoked records never bless a device;
  * corrupt owner/group authority rejects the whole read. No writes or adoption. */

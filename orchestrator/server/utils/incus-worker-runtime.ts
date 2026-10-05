@@ -14,7 +14,9 @@ import type { WorkerConfigRevision } from './worker-config-store';
 import { incusImageIdentity, sameIncusImageSource, type IncusWorkerImageIdentity } from './incus-worker-image';
 import { IncusManagedVolumeRuntime } from './incus-managed-volume-runtime';
 import type { StoredManagedVolume } from './managed-volume-store';
-import { incusManagedNetworkAuthority } from './incus-managed-network-identity';
+import { incusManagedNetworkAuthority, incusManagedBridgeIdentity, incusManagedNetworkDevice,
+  incusManagedNetworkRule } from './incus-managed-network-identity';
+import { ManagedNetworkStore } from './managed-network-store';
 
 export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & {
   sshAuthorizedKeys?: string;
@@ -200,6 +202,122 @@ export class IncusWorkerRuntime {
     if (incarnation && instance.config['volatile.uuid'] !== incarnation)
       throw new Error('Incus worker incarnation changed; explicit recovery is required');
     return instance;
+  }
+
+  /** Leaf operation under the caller's existing owner→worker lifecycle fence.
+   * Never reacquire that fence from create/recovery. Bridge creation and exact
+   * project allowlisting are separate narrow host-service operations. */
+  async setManagedNetwork(owner: IncusStorageOwner, incarnation: string, networkId: string, attach: boolean): Promise<void> {
+    if (!incarnation) throw new Error('Incus network mutation requires a captured worker incarnation');
+    const store = new ManagedNetworkStore(this.config.dataDir);
+    await store.loadUser(owner.userId);
+    const network = store.get(owner.userId, networkId);
+    if (!network || network.userId !== owner.userId) throw new Error('Managed network record is missing or foreign');
+    const identity = incusManagedBridgeIdentity(await this.installationId(), network);
+    const expected = incusManagedNetworkDevice(identity.installation, owner.id, network);
+    if (attach && !sameDevice((await incusManagedNetworkAuthority(this.config.dataDir, owner))[identity.key], expected))
+      throw new Error('Worker is not an authorized managed network member');
+    const check = () => this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    let current = await check();
+    if (current.profiles.length || !['Running', 'Stopped'].includes(current.status))
+      throw new Error('Incus network target profiles or state are ambiguous');
+    if (current.devices[identity.key] && !sameDevice(current.devices[identity.key], expected))
+      throw new Error('Incus managed network device is foreign or modified');
+    // Put the matching /run rule in place BEFORE hotplug, not after DHCP can
+    // replace the worker's primary route/resolver settings.
+    const boot = current.status === 'Running' ? await this.managedNetworkBoot(owner, incarnation) : undefined;
+    if (attach && boot) {
+      await this.writeManagedNetworkRule(owner, incarnation, identity.key, expected);
+      await this.checkManagedNetworkBoot(owner, incarnation, boot, identity.key, expected);
+    }
+    current = await check();
+    if (current.devices[identity.key] && !sameDevice(current.devices[identity.key], expected))
+      throw new Error('Incus managed network device changed during setup');
+    if (attach && !sameDevice((await incusManagedNetworkAuthority(this.config.dataDir, owner))[identity.key], expected))
+      throw new Error('Managed network membership changed during setup');
+    const devices = { ...current.devices };
+    if (attach) devices[identity.key] = expected;
+    else delete devices[identity.key];
+    if (attach ? !current.devices[identity.key] : !!current.devices[identity.key])
+      await this.client.updateInstanceDevices(owner.containerName, devices, undefined, current);
+    current = await check();
+    if (attach ? !sameDevice(current.devices[identity.key], expected) : !!current.devices[identity.key])
+      throw new Error('Incus managed network attachment did not settle as requested');
+    if (current.status === 'Running') {
+      if (attach) {
+        if (!boot) throw new Error('Guest boot changed during managed network attachment');
+        await this.checkManagedNetworkBoot(owner, incarnation, boot, identity.key, expected);
+        await this.activateManagedNetworkRule(owner, incarnation, expected);
+        await this.checkManagedNetworkBoot(owner, incarnation, boot, identity.key, expected);
+      }
+      else {
+        await this.checkedExec(owner.containerName, ['rm', '-f', `/run/systemd/network/00-agentor-${identity.key}.network`]);
+        await check();
+        await this.checkedExec(owner.containerName, ['timeout', '15', 'networkctl', 'reload']);
+        await check();
+      }
+    }
+  }
+
+  private async writeManagedNetworkRule(owner: IncusStorageOwner, incarnation: string, key: string, device: IncusDevice) {
+    await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    await this.checkedExec(owner.containerName, ['mkdir', '-p', '/run/systemd/network']);
+    await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    await this.client.pushFile(owner.containerName, `/run/systemd/network/00-agentor-${key}.network`,
+      incusManagedNetworkRule(device), { uid: 0, gid: 0, mode: 0o644 });
+    await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    await this.checkedExec(owner.containerName, ['timeout', '15', 'networkctl', 'reload']);
+    await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+  }
+
+  private async activateManagedNetworkRule(owner: IncusStorageOwner, incarnation: string, device: IncusDevice) {
+    await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    // Guest interface discovery is used only for local networkd activation,
+    // never as host routing or Worker-Self authority.
+    await this.checkedExec(owner.containerName, ['timeout', '15', 'bash', '-ec',
+      'for p in /sys/class/net/*/address; do read -r mac < "$p"; if [ "$mac" = "$1" ]; then iface=${p%/address}; iface=${iface##*/}; networkctl reconfigure -- "$iface"; exit; fi; done; exit 1',
+      'agentor-managed-network', device.hwaddr!]);
+    await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+  }
+
+  private async managedNetworkBoot(owner: IncusStorageOwner, incarnation: string): Promise<string> {
+    await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    const result = await this.client.exec(owner.containerName, ['cat', '/proc/sys/kernel/random/boot_id']);
+    const boot = result.stdout.trim();
+    if (result.returnCode !== 0) throw new Error('Managed network guest boot identity is unavailable');
+    if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(boot)) throw new Error('Managed network guest boot identity is unavailable');
+    await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    return boot;
+  }
+
+  private async checkManagedNetworkBoot(owner: IncusStorageOwner, incarnation: string, boot: string, key: string, device: IncusDevice) {
+    if (await this.managedNetworkBoot(owner, incarnation) !== boot)
+      throw new Error('Guest rebooted during managed network configuration; reprovision before retry');
+    await this.checkedExec(owner.containerName, ['timeout', '5', 'bash', '-ec',
+      'test "$(cat /proc/sys/kernel/random/boot_id)" = "$1"; test "$(cat -- "$2")" = "$3"', 'agentor-managed-rule-proof',
+      boot, `/run/systemd/network/00-agentor-${key}.network`, incusManagedNetworkRule(device).trimEnd()]);
+    await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+  }
+
+  /** /run disappears on guest reboot. Rematerialize only attached, currently
+   * registry-authorized secondary NICs before worker services are activated. */
+  async reprovisionManagedNetworks(owner: IncusStorageOwner, incarnation: string): Promise<void> {
+    if (!incarnation) throw new Error('Incus network provisioning requires a captured worker incarnation');
+    const instance = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    const secondaries = Object.entries(instance.expanded_devices ?? instance.devices)
+      .filter(([key, device]) => device.type === 'nic' && key !== 'eth0');
+    if (!secondaries.length) return;
+    const allowed = await incusManagedNetworkAuthority(this.config.dataDir, owner);
+    for (const [key, device] of secondaries) {
+      if (!sameDevice(device, allowed[key] ?? {})) throw new Error('Incus secondary NIC is not registry-authorized');
+    }
+    const boot = await this.managedNetworkBoot(owner, incarnation);
+    for (const [key, device] of secondaries) {
+      await this.writeManagedNetworkRule(owner, incarnation, key, device);
+      await this.checkManagedNetworkBoot(owner, incarnation, boot, key, device);
+      await this.activateManagedNetworkRule(owner, incarnation, device);
+      await this.checkManagedNetworkBoot(owner, incarnation, boot, key, device);
+    }
   }
 
   commands(owner: IncusStorageOwner, incarnation: string, validateRecord: () => void | Promise<void>,
@@ -517,7 +635,7 @@ export class IncusWorkerRuntime {
       if (instance.devices.docker && (instance.devices.docker.source !== persistent.docker.source || instance.devices.docker.pool !== this.config.incusStoragePool))
         throw new Error("Incus Docker device identity is ambiguous");
       if (state.status === "Running") throw new Error("Restart the VM to attach native Docker storage");
-      await this.client.updateInstanceDevices(name, { ...instance.devices, ...persistent });
+      await this.client.updateInstanceDevices(name, { ...instance.devices, ...persistent }, undefined, instance);
     }
     if (state.status !== "Running") await this.client.startInstance(name);
     const deadline = Date.now() + 120_000;
@@ -535,6 +653,7 @@ export class IncusWorkerRuntime {
       for (const v of opts.managedVolumes ?? [])
         await this.checkedExec(name, ['timeout', '15', 'mountpoint', '-q', '--', v.target]);
       await this.checkedExec(name, ["systemctl", "stop", "agentor-worker.service"]);
+      await this.reprovisionManagedNetworks(opts, instance.config['volatile.uuid']!);
       if (Object.keys(account).length) {
         for (const device of Object.values(account)) await this.checkedExec(name, ["mountpoint", "-q", device.path!]);
         // Reproduce existing regular-file bind semantics. CLI atomic rename

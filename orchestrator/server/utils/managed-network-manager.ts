@@ -84,6 +84,7 @@ export class ManagedNetworkManager {
     try {
       const target=this.docker.getNetwork(network.dockerName);
       const inspection = await withOperationDeadline(target.inspect(), DOCKER_READ_TIMEOUT_MS, 'Docker managed-network inspection');
+      this.assertDockerOwnership(network, inspection);
       // Docker refuses to remove a bridge with attached endpoints. A managed
       // delete is explicitly the detach+remove operation, and this network has
       // already passed the Agentor label/name boundary above.
@@ -141,13 +142,7 @@ export class ManagedNetworkManager {
         DOCKER_READ_TIMEOUT_MS,
         'Docker managed-network inspection',
       );
-      if (
-        existing.Driver !== "bridge" ||
-        existing.Internal ||
-        existing.Labels?.["agentor.managed-network"] !== "true" ||
-        existing.Labels?.["agentor.owner"] !== network.userId
-      )
-        throw createError({ statusCode: 409, statusMessage: "Existing Docker network fails Agentor ownership policy" });
+      this.assertDockerOwnership(network, existing);
       return existing;
     } catch (error: any) {
       if (error?.statusCode !== 404) throw error;
@@ -164,6 +159,12 @@ export class ManagedNetworkManager {
       DOCKER_READ_TIMEOUT_MS,
       'Docker managed-network post-create inspection',
     );
+  }
+
+  private assertDockerOwnership(network: ManagedNetwork, inspection: Docker.NetworkInspectInfo) {
+    if (inspection.Name !== network.dockerName || inspection.Driver !== 'bridge' || inspection.Internal ||
+        inspection.Labels?.['agentor.managed-network'] !== 'true' || inspection.Labels?.['agentor.owner'] !== network.userId)
+      throw createError({ statusCode: 409, statusMessage: 'Existing Docker network fails Agentor ownership policy' });
   }
 }
 

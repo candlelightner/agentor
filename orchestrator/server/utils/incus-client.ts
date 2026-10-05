@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import WebSocket from 'ws';
 import { PassThrough, Writable } from 'node:stream';
 import type { Config } from './config';
+import { isDeepStrictEqual } from 'node:util';
 
 export class IncusError extends Error {
   statusCode: number;
@@ -633,11 +634,44 @@ export class IncusClient {
    * Never retry this mutation implicitly or start writers on an unknown result.
    * Synchronous success reports undefined (there is no outstanding operation). */
   async updateInstanceDevices(name: string, devices: Record<string, IncusDevice>,
-    onAccepted?: (operationPath: string | undefined) => Promise<void>): Promise<void> {
-    const current = await this.getInstance(name);
-    const raw = await this.rawRequest('PUT', `/1.0/instances/${encodeURIComponent(name)}`, {
+    onAccepted?: (operationPath: string | undefined) => Promise<void>, expected?: IncusInstance): Promise<void> {
+    // A previous device PUT can outlive its observer. Incus serializes native
+    // instance updates and checks ETag AFTER taking that lock. Do not queue a
+    // stale full-device map behind an unsettled mutation, or pair it with a
+    // fresh unrelated snapshot. Exec/console operations are not mutations.
+    const operations = await this.request<Record<string, IncusOperationMetadata[]>>('GET', '/1.0/operations', undefined, {}, { recursion: 1 });
+    if (!operations || typeof operations !== 'object' || Array.isArray(operations) ||
+        Object.values(operations).some(bucket => !Array.isArray(bucket)))
+      throw new IncusError('Incus instance operation state is unavailable');
+    const path = `/1.0/instances/${encodeURIComponent(name)}`;
+    for (const operation of Object.values(operations).flat()) {
+      if (['Success', 'Failure', 'Cancelled'].includes(operation.status)) continue;
+      if (['Executing command', 'Showing console'].includes(operation.description)) continue;
+      const references = operation.resources?.instances;
+      if (!Array.isArray(references)) {
+        if (operation.resources && Object.keys(operation.resources).length && !('instances' in operation.resources)) continue;
+        throw new IncusError('Incus mutation resource authority is unavailable');
+      }
+      for (const reference of references) {
+        const resource = new URL(reference, this.endpoint);
+        if (resource.origin !== new URL(this.endpoint).origin) throw new IncusError('Incus mutation resource server is ambiguous');
+        if (resource.pathname === path && (resource.searchParams.get('project') ?? 'default') === this.project)
+          throw new IncusError('Incus instance mutation is still unsettled; retry after the native operation completes');
+      }
+    }
+    const snapshot = await this.rawRequest('GET', path);
+    const envelope = JSON.parse(snapshot.body.toString('utf8')) as IncusResponse<IncusInstance>;
+    if (snapshot.statusCode >= 400 || envelope.type === 'error')
+      throw new IncusError(envelope.error || 'Incus instance snapshot is unavailable', snapshot.statusCode, envelope.error_code);
+    const current = envelope.metadata, etag = snapshot.headers.etag;
+    if (envelope.type !== 'sync' || !current || typeof etag !== 'string' || !etag)
+      throw new IncusError('Incus device update requires an authoritative instance snapshot and ETag');
+    const fields = (instance: IncusInstance) => [instance.config, instance.devices, instance.profiles, instance.description ?? ''];
+    if (expected && !isDeepStrictEqual(fields(expected), fields(current)))
+      throw new IncusError('Incus instance changed since the caller device snapshot; no update was submitted');
+    const raw = await this.rawRequest('PUT', path, {
       config: current.config, profiles: current.profiles, description: current.description, devices,
-    });
+    }, { 'If-Match': etag });
     const json = JSON.parse(raw.body.toString('utf-8')) as IncusResponse<any>;
     if (json.type === 'error' || raw.statusCode >= 400)
       throw new IncusError(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code);

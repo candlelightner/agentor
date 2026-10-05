@@ -5,6 +5,7 @@ import { useManagedNetworkManager } from '../../utils/managed-network-manager';
 import { verifyWorkerMutationUnlocks } from '../../utils/worker-protection-lock';
 import { withWorkerNetworkMutation } from '../../utils/worker-group-manager';
 import { WorkerGroupHierarchy } from '../../utils/worker-group-hierarchy';
+import { reconcileCreatedManagedNetwork } from '../../utils/managed-network-update';
 export default defineEventHandler(async event => {
   const { user } = requireAuth(event); const body: any = await readBody(event);
   return withWorkerNetworkMutation(user.id, async () => {
@@ -15,12 +16,15 @@ export default defineEventHandler(async event => {
   await verifyWorkerMutationUnlocks(affected, body.lockPasswords);
   const store = useManagedNetworkStore(); let network = await store.create(user.id, body.name, body.scope, body.scope === 'group' ? body.groupId : undefined); if(body.scope==='selected')network=await store.update(user.id,network.id,{workerIds:body.workerIds});
   try {
-    const reconciliation = await useManagedNetworkManager().reconcile(network);
-    if (reconciliation.partialFailures.length) throw new Error(reconciliation.partialFailures.join('; '));
-    setResponseStatus(event, 201); return { ...network, reconciliation };
+    const manager = useManagedNetworkManager();
+    const result = await reconcileCreatedManagedNetwork(network, {
+      reconcile: value => manager.reconcile(value),
+      removeRuntime: value => manager.remove(value),
+      removeRecord: (ownerId, networkId) => store.remove(ownerId, networkId),
+    });
+    setResponseStatus(event, 201); return result;
   } catch (error: any) {
-    await useManagedNetworkManager().remove(network).catch(() => {}); await store.remove(user.id, network.id).catch(() => {});
-    throw createError({ statusCode: 409, statusMessage: `Network creation failed: ${error?.message || 'Docker reconciliation failed'}` });
+    throw createError({ statusCode: error?.statusCode === 500 ? 500 : 409, statusMessage: `Network creation failed: ${error?.message || 'Runtime reconciliation failed'}`, cause: error });
   }
   });
 });

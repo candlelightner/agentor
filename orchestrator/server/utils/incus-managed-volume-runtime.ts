@@ -161,7 +161,7 @@ export class IncusManagedVolumeRuntime {
         const attachTo = await this.inspect(v.userId, v.workerId, handle);
         if (attachTo.devices[key]) throw new Error('Selection staging device changed before attachment.');
         await this.worker.client.updateInstanceDevices(attachTo.name, { ...attachTo.devices,
-          [key]: { ...this.device(v), path: staging } });
+          [key]: { ...this.device(v), path: staging } }, undefined, attachTo);
       } catch (error) { throw this.ambiguousStaging(error); }
       await this.exec(v.userId, v.workerId, handle, ['timeout', '15', 'mountpoint', '-q', '--', staging]);
       await this.exec(v.userId, v.workerId, handle, ['timeout', '150', 'bash', '-ec', INCUS_PERSISTENCE_COPY,
@@ -178,7 +178,7 @@ export class IncusManagedVolumeRuntime {
               Object.entries(expected).some(([field, value]) => device[field] !== value))
             throw volumeError(409, 'Selection staging identity changed. Compute and storage were retained.');
           const devices = { ...current.devices }; delete devices[key];
-          await this.worker.client.updateInstanceDevices(current.name, devices);
+          await this.worker.client.updateInstanceDevices(current.name, devices, undefined, current);
         }
         const detached = await this.inspect(v.userId, v.workerId, handle);
         if (detached.devices[key]) throw new Error('Selection staging device was not removed.');
@@ -250,7 +250,7 @@ export class IncusManagedVolumeRuntime {
       if (instance.devices[key]) throw volumeError(409, 'Canonical device changed before live attachment.');
       await this.worker.client.updateInstanceDevices(instance.name, { ...instance.devices, [key]: this.device(v) }, async operation => {
         await save({ ...v, incusLive: { ...v.incusLive!, attachment: operation ? 'accepted' : 'settled', operation } });
-      });
+      }, instance);
       await save({ ...v, incusLive: { ...v.incusLive!, attachment: 'settled' } });
       instance = await this.inspect(v.userId, v.workerId, handle);
       if (!this.matchesDevice(instance.devices[key], v)) throw volumeError(409, 'Canonical live attachment is not authoritative.');
@@ -349,7 +349,7 @@ export class IncusManagedVolumeRuntime {
       await save({ ...v, incusLive: { ...intent, attachment: 'unknown', operation: undefined } });
       await this.worker.client.updateInstanceDevices(instance.name, devices, async operation => {
         await save({ ...v, incusLive: { ...intent, attachment: operation ? 'accepted' : 'settled', operation } });
-      });
+      }, instance);
       await save({ ...v, incusLive: { ...intent, attachment: 'settled' } });
     }
     instance = await this.inspect(v.userId, v.workerId, handle);
@@ -382,12 +382,12 @@ export class IncusManagedVolumeRuntime {
     if (priorDevice) {
       await this.ensureVolume(v); // Validate the attachment before detaching it.
       const devices = { ...instance.devices }; delete devices[key];
-      await this.worker.client.updateInstanceDevices(owner.containerName, devices);
+      await this.worker.client.updateInstanceDevices(owner.containerName, devices, undefined, instance);
       instance = await this.inspect(v.userId, v.workerId, handle);
     }
     await this.removeStaging(v);
     await this.ensureVolume(v);
-    await this.worker.client.updateInstanceDevices(owner.containerName, { ...instance.devices, [key]: stageDevice });
+    await this.worker.client.updateInstanceDevices(owner.containerName, { ...instance.devices, [key]: stageDevice }, undefined, instance);
     await this.inspect(v.userId, v.workerId, handle);
     try {
       await this.worker.client.startInstance(owner.containerName);

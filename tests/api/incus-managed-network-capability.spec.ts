@@ -138,12 +138,8 @@ test('filtered secondary managed bridge preserves primary routing and supports m
     // host-assigned MAC before hotplug, earlier than image netplan catchalls.
     // Secondary DHCP receives no route, DNS, domain or IPv6 RA authority.
     const secondaryMac = secondary.hwaddr!;
-    await client.pushFile(owner.containerName, '/run/systemd/network/00-agentor-managed.network',
-      `[Match]\nMACAddress=${secondaryMac}\n[Network]\nDHCP=ipv4\nIPv6AcceptRA=no\n[DHCPv4]\nUseRoutes=no\nUseDNS=no\nUseDomains=no\n`, { mode: 0o644 });
-    await checked(['networkctl', 'reload']);
     const current = await client.getInstance(owner.containerName);
-    await client.updateInstanceDevices(owner.containerName, { ...current.devices,
-      [deviceKey]: secondary });
+    await runtime.setManagedNetwork(owner, incarnation!, managedNetwork.id, true);
     await expect.poll(async () => {
       const state = await client.getInstanceState(owner.containerName);
       return Object.values(state.network ?? {}).find(nic => nic.hwaddr === secondaryMac)
@@ -199,7 +195,18 @@ test('filtered secondary managed bridge preserves primary routing and supports m
       { timeout: 60_000, intervals: [500, 1000] }).toBe(0);
     expect(await checked(['ip', '-j', 'route', 'show', 'default'])).toBe(routes);
     expect(await checked(['resolvectl', 'dns', 'eth0'])).toBe(resolver);
-    await client.updateInstanceDevices(owner.containerName, current.devices);
+    const bootBefore = await checked(['cat', '/proc/sys/kernel/random/boot_id']);
+    await runtime.stop(owner, incarnation!);
+    await runtime.start(options, incarnation!);
+    expect(await checked(['cat', '/proc/sys/kernel/random/boot_id'])).not.toBe(bootBefore);
+    expect(await checked(['stat', '-c', '%a:%u:%g', `/run/systemd/network/00-agentor-${deviceKey}.network`])).toBe('644:0:0');
+    expect(await checked(['ip', '-j', 'route', 'show', 'default'])).toBe(routes);
+    expect(await checked(['resolvectl', 'dns', 'eth0'])).toBe(resolver);
+    expect(await runtime.resolvePrimaryAddress(owner)).toEqual(primary);
+    expect(await checked(['curl', '--fail', '--max-time', '5', target])).toBe('mixed-member-ok');
+    expect((await root(`sudo docker exec '${peerName}' node -e '${request}'`)).trim()).toBe('vm-editor-ok');
+    await runtime.setManagedNetwork(owner, incarnation!, managedNetwork.id, false);
+    expect((await client.getInstance(owner.containerName)).devices).toEqual(current.devices);
     expect(await runtime.resolvePrimaryAddress(owner)).toEqual(primary);
     console.info('Mixed-member traffic passed; IPv4/MAC spoof traffic denied with healthy controls, primary route/DNS retained and detach restores identity.');
   } catch (error) { failed = true; throw error; }
