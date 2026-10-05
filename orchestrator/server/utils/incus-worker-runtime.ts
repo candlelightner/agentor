@@ -21,6 +21,7 @@ import { ManagedNetworkStore } from './managed-network-store';
 import { isIP } from 'node:net';
 import { incusHostMountLayout, incusHostMountMetadata, assertIncusHostMountLayout } from './incus-host-mount-runtime';
 import { INCUS_CANONICAL_ARCHIVE_SCRIPT } from './incus-canonical-archive';
+import { INCUS_SELECTED_ARCHIVE_SCRIPT, nativeSelectedBackupPath } from './incus-selected-archive';
 import { PassThrough } from 'node:stream';
 import { snapshotIncusWorkerBackupRuntime, parseWorkerBackupRuntime, type WorkerBackupRuntimeSource } from './worker-backup-runtime';
 import { IncusOfflineArchiveHelper } from './incus-offline-archive-helper';
@@ -239,6 +240,99 @@ export class IncusWorkerRuntime {
       await validateRecord();
     };
     return this.archiveStream(owner.containerName, role, validate, options);
+  }
+
+  /** Read-only selected capture while the caller holds the existing lifecycle
+   * fence. Exhaustive native disk authority precedes any guest archive exec;
+   * snapshots and guest boot identity are checked again before output EOF. */
+  async openSelectedArchive(owner: IncusStorageOwner & Pick<IncusWorkerOptions,
+    'storageManager' | 'mounts' | 'managedVolumes'>, incarnation: string, selected: string,
+    validateRecord: () => void | Promise<void>, signal?: AbortSignal) {
+    selected = nativeSelectedBackupPath(selected);
+    signal?.throwIfAborted(); await validateRecord();
+    const storage = await this.storage(), managed = new IncusManagedVolumeRuntime(this.config, this);
+    const before = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    const expected: Record<string, IncusDevice> = { root: { type: 'disk', path: '/', pool: this.config.incusStoragePool },
+      ...await this.accountDevices(owner) };
+    const host = await incusHostMountLayout(this.config, owner, 'inspect');
+    Object.assign(expected, host.devices);
+    const volumes: Array<{ initial: IncusCustomVolume; inspect: () => Promise<IncusCustomVolume | undefined> }> = [];
+    const addVolume = async (key: string, device: IncusDevice, inspect: () => Promise<IncusCustomVolume | undefined>) => {
+      const volume = await inspect();
+      if (!volume || volume.project !== this.config.incusProject || !volume.created_at || !Number.isFinite(Date.parse(volume.created_at)) ||
+          !Array.isArray(volume.used_by) || volume.used_by.length !== 1 || expected[key])
+        throw new Error('Selected archive storage identity is unavailable or duplicated');
+      const reference = new URL(volume.used_by[0]!, this.client.endpoint);
+      if (reference.origin !== new URL(this.client.endpoint).origin || reference.username || reference.password || reference.hash ||
+          reference.pathname !== `/1.0/instances/${owner.containerName}` ||
+          reference.searchParams.getAll('project').length !== 1 || reference.searchParams.get('project') !== this.config.incusProject ||
+          [...reference.searchParams.keys()].some(key => key !== 'project'))
+        throw new Error('Selected archive storage has foreign references');
+      expected[key] = device; volumes.push({ initial: volume, inspect });
+    };
+    for (const role of ['workspace', 'agents'] as const)
+      await addVolume(role, { type: 'disk', pool: this.config.incusStoragePool, source: owner.containerName + '-' + role,
+        path: role === 'workspace' ? '/workspace' : '/home/agent/.agent-data' }, () => storage.inspectVolume(owner, role));
+    if (before.devices.docker) await addVolume('docker', {
+      type: 'disk', pool: this.config.incusStoragePool, source: owner.containerName + '-docker',
+    }, () => storage.inspectVolume(owner, 'docker'));
+    for (const record of owner.managedVolumes ?? []) {
+      if (record.userId !== owner.userId || record.workerId !== owner.id || !record.attached || !record.seeded || record.state !== 'ready' ||
+          record.incusLive || record.operation && record.operation.stage !== 'complete')
+        throw new Error('Selected archive managed storage is not settled authority');
+      await addVolume(managed.deviceKey(record), managed.device(record), () => managed.inspectVolume(record));
+    }
+    const prove = (instance: IncusInstance) => {
+      if (instance.status !== 'Running' || instance.profiles?.length ||
+          Object.keys(instance.config).some(key => key.startsWith('raw.')) ||
+          Object.keys(instance.expanded_config ?? {}).some(key => key.startsWith('raw.')))
+        throw new Error('Selected archive requires ordinary running native compute');
+      for (const devices of [instance.devices, instance.expanded_devices ?? instance.devices]) {
+        const disks = Object.entries(devices).filter(([, device]) => device.type === 'disk');
+        if (disks.length !== Object.keys(expected).length || disks.some(([key, device]) => !sameDevice(device, expected[key] ?? {})))
+          throw new Error('Selected archive native disk source or layout is foreign');
+      }
+      assertIncusHostMountLayout(instance, host);
+    };
+    prove(before);
+    const bootId = async () => {
+      const result = await this.client.exec(owner.containerName, ['/usr/bin/cat', '/proc/sys/kernel/random/boot_id']);
+      if (result.returnCode !== 0 || !/^[a-f0-9-]{36}\n?$/.test(result.stdout)) throw new Error('Selected archive guest boot is unavailable');
+      return result.stdout;
+    };
+    const boot = await bootId();
+    const config = (instance: IncusInstance) => Object.fromEntries(Object.entries(instance.config)
+      .filter(([key]) => !key.startsWith('volatile.') || ['volatile.uuid', 'volatile.base_image'].includes(key)));
+    const validate = async () => {
+      signal?.throwIfAborted(); await validateRecord();
+      const current = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation); prove(current);
+      if (!isDeepStrictEqual(current.devices, before.devices) ||
+          !isDeepStrictEqual(current.expanded_devices ?? current.devices, before.expanded_devices ?? before.devices) ||
+          !isDeepStrictEqual(config(current), config(before)) || !isDeepStrictEqual(await this.accountDevices(owner),
+            Object.fromEntries(Object.entries(expected).filter(([key]) => ['cred', 'kcfg', 'kdata'].includes(key)))))
+        throw new Error('Selected archive native configuration changed');
+      const currentHost = await incusHostMountLayout(this.config, owner, 'inspect');
+      if (!isDeepStrictEqual(currentHost, host)) throw new Error('Selected archive host grant or source identity changed');
+      for (const { initial, inspect } of volumes) if (!isDeepStrictEqual(await inspect(), initial))
+        throw new Error('Selected archive storage metadata or references changed');
+      if (await bootId() !== boot) throw new Error('Guest rebooted during selected archive capture');
+      await validateRecord();
+    };
+    await validate();
+    const proof = { mounts: Object.values(expected).flatMap(device => device.path ? [device.path] : []), credentials: !!expected.cred };
+    const session = await this.client.execStream(owner.containerName,
+      ['/usr/bin/python3', '-c', INCUS_SELECTED_ARCHIVE_SCRIPT, selected, JSON.stringify(proof)], {
+        command: [], user: 0, group: 0, cwd: '/', environment: { PATH: '/usr/bin:/bin', LC_ALL: 'C' },
+        signal, timeoutMs: 10 * 60_000,
+      });
+    const output = new PassThrough(); output.on('error', () => {}); output.once('close', () => session.close());
+    session.stderr.resume(); session.stdout.on('error', error => output.destroy(error));
+    session.stdout.pipe(output, { end: false }); session.stdin.end();
+    void session.result.then(async code => {
+      if (code !== 0) throw new Error('Selected native archive capture failed; verify path readability, approved mounts and current credential provisioning');
+      await validate(); output.end();
+    }).catch(error => output.destroy(error));
+    return output;
   }
 
   /** Internal managed capture supplies the helper's exact UUID/isolation and
@@ -547,7 +641,7 @@ export class IncusWorkerRuntime {
     if (opts.image) throw new Error("A custom OCI image requires its derived Incus image mapping");
   }
 
-  private async accountDevices(opts: IncusWorkerOptions): Promise<Record<string, IncusDevice>> {
+  private async accountDevices(opts: Pick<IncusWorkerOptions, 'storageManager' | 'userId' | 'credentialBinds'>): Promise<Record<string, IncusDevice>> {
     if (!opts.storageManager) return {};
     const userHost = opts.storageManager.getUserHostDir(opts.userId);
     const credentials = join(userHost, "credentials");

@@ -2590,11 +2590,15 @@ export class BackupManager {
       selectedPaths.includes("/home/agent/.agent-data");
     const native = live?.runtimeKind === 'incus-vm' || durable?.runtimeKind === 'incus-vm';
     if (native && (!durable || durable.userId !== userId)) throw new Error('Native backup owner changed');
-    if (native && explicitPaths.length)
-      throw Object.assign(new Error('Explicit native backup path capture is not available yet'),
-        { statusCode: 409, code: 'INCUS_ARCHIVE_CAPABILITY_PENDING' });
+    if (native && explicitPaths.length) {
+      if (live?.status !== 'running')
+        throw Object.assign(new Error('Explicit native paths require a running worker; disposable stopped/root disks are not backup storage'),
+          { statusCode: 409, code: 'INCUS_SELECTED_BACKUP_REQUIRES_RUNNING' });
+      const { nativeSelectedBackupPath } = await import('./incus-selected-archive');
+      for (const path of explicitPaths) nativeSelectedBackupPath(path);
+    }
     if (live?.containerId || native && durable?.status === 'archived') {
-      if (explicitPaths.length)
+      if (explicitPaths.length && !native)
         await useContainerManager().assertBackupPathsReadable(id, explicitPaths);
       const result = await useContainerManager().exportWorkerWithLifecycleFenceHeld(id, {
         includeRootfs: false,
@@ -2609,7 +2613,7 @@ export class BackupManager {
         { signal },
       );
       if (explicitPaths.length)
-        await this.appendExplicitBackupPaths(destination, live!.containerId, explicitPaths, signal);
+        await this.appendExplicitBackupPaths(destination, live!.containerId, explicitPaths, signal, native ? id : undefined);
       return;
     }
     if (explicitPaths.length)
@@ -2928,7 +2932,7 @@ export class BackupManager {
   /** Repackage an ordinary portable worker bundle with separately archived
    * explicit absolute paths. The ordinary workspace/agent payload is kept
    * byte-for-byte and old bundles continue to omit this optional member. */
-  private async appendExplicitBackupPaths(destination: string, containerId: string, paths: string[], signal: AbortSignal) {
+  private async appendExplicitBackupPaths(destination: string, containerId: string, paths: string[], signal: AbortSignal, nativeWorkerId?: string) {
     const dir = `${destination}.paths-${randomUUID()}`;
     const unpacked = join(dir, "bundle");
     const replacement = `${destination}.new-${randomUUID()}`;
@@ -2941,14 +2945,20 @@ export class BackupManager {
         signal.throwIfAborted();
         const file = join(dir, `${index}.tar`);
         await pipeline(
-          await useDockerService().getArchive(containerId, selected, signal),
+          nativeWorkerId ? await useContainerManager().getSelectedBackupArchiveWithLifecycleFenceHeld(nativeWorkerId, selected, signal)
+            : await useDockerService().getArchive(containerId, selected, signal),
           createWriteStream(file, { mode: 0o600 }),
           { signal },
         );
-        const sanitized = join(dir, `${index}.sanitized.tar`);
-        await sanitizeBackupPathTarPayload(file, sanitized, selected, signal);
-        await rm(file, { force: true });
-        archives.push({ path: selected, archive: `paths/${index}.tar`, file: sanitized });
+        if (nativeWorkerId) {
+          await (await import('./portable-managed-volume-archive')).validateIncusSelectedRestoreArchive(file, selected, { signal });
+          archives.push({ path: selected, archive: `paths/${index}.tar`, file });
+        } else {
+          const sanitized = join(dir, `${index}.sanitized.tar`);
+          await sanitizeBackupPathTarPayload(file, sanitized, selected, signal);
+          await rm(file, { force: true });
+          archives.push({ path: selected, archive: `paths/${index}.tar`, file: sanitized });
+        }
       }
       const payload = join(dir, BUNDLE_FILES.backupPaths);
       const pack = tar.pack();

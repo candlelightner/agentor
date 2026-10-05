@@ -1989,6 +1989,37 @@ for p in sys.argv[1:]:
     if (result.exitCode !== 0) throw Object.assign(new Error("Selected backup path could not be validated"), { statusCode: 409 });
   }
 
+  /** Internal selected backup seam: the BackupManager retains the owner and
+   * worker lifecycle fence across the base bundle and all explicit streams.
+   * Never resolve runtime environment or ensure/repair storage during capture. */
+  async getSelectedBackupArchiveWithLifecycleFenceHeld(id: string, path: string, signal?: AbortSignal): Promise<Readable> {
+    const { nativeSelectedBackupPath } = await import('./incus-selected-archive');
+    path = nativeSelectedBackupPath(path);
+    const info = this.get(id), record = this.workerStore?.findById(id);
+    if (!info || info.runtimeKind !== 'incus-vm' || info.status !== 'running' ||
+        !record || record.userId !== info.userId || record.runtimeKind !== 'incus-vm' || record.status !== 'active' ||
+        record.deletionPending || record.incusRecreation || record.hostMountsRevoked || !isWorkerLifecycleMutationPending(id))
+      throw Object.assign(new Error('Explicit native backup requires settled running worker authority and lifecycle admission'), { statusCode: 409 });
+    const incarnation = this.capturedIncusIncarnation(info), generation = workerLifecycleGeneration(id);
+    const capturedRecord = structuredClone(record), capturedMounts = structuredClone(info.mounts ?? []), handle = info.containerId;
+    const { useManagedVolumeManager } = await import('./managed-volume-manager');
+    const volumes = useManagedVolumeManager(); await volumes.init(); volumes.assertLiveRecoveryResolved(info.userId, id);
+    const capturedVolumes = structuredClone(volumes.store.forWorker(info.userId, id));
+    const validate = () => {
+      const current = this.get(id), durable = this.workerStore?.findById(id);
+      if (!current || current.userId !== info.userId || current.containerId !== handle || current.runtimeKind !== 'incus-vm' ||
+          current.status !== 'running' || !isDeepStrictEqual(durable, capturedRecord) ||
+          !isDeepStrictEqual(volumes.store.forWorker(info.userId, id), capturedVolumes) ||
+          !isDeepStrictEqual(current.mounts ?? [], capturedMounts) || workerLifecycleGeneration(id) !== generation ||
+          !isWorkerLifecycleMutationPending(id)) throw new Error('Selected native backup runtime or storage authority changed');
+      volumes.assertLiveRecoveryResolved(info.userId, id);
+    };
+    validate();
+    return this.incusRuntime.openSelectedArchive({ id, userId: info.userId, containerName: info.containerName,
+      storageManager: this.storageManager, mounts: capturedMounts,
+      managedVolumes: capturedVolumes.filter(volume => volume.attached && volume.seeded) }, incarnation, path, validate, signal);
+  }
+
   /**
    * `POST /api/containers/:id/files/upload` — extract uploaded files into the
    *  destination directory `destRel` (relative to /workspace). `entries` are

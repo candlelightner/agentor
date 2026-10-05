@@ -17,7 +17,8 @@ export interface IncusHostMountLayout {
 
 /** Re-read existing platform grant semantics, never authorize from VM labels
  * or a caller's raw source. The host service authorizes sources, not workers. */
-export async function incusHostMountLayout(config: Config, opts: IncusWorkerOptions,
+export async function incusHostMountLayout(config: Config, opts: Pick<IncusWorkerOptions,
+  'id' | 'userId' | 'mounts' | 'storageManager' | 'managedVolumes' | 'recreationNonce' | 'hostMountGroupId'>,
   operation: 'ensure' | 'inspect' | 'reconstruct-preflight', host?: Pick<IncusHostMountClient, 'ensure' | 'inspect'>,
   instance?: IncusInstance,
 ): Promise<IncusHostMountLayout> {
