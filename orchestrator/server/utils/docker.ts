@@ -1,4 +1,5 @@
 import Docker from 'dockerode';
+import { assertBackupRestoreRuntimePrincipal, type BackupRestoreRuntimePrincipal } from './backup-restore-runtime-authority';
 import { PassThrough } from 'node:stream';
 import { randomUUID } from 'node:crypto';
 import type { Duplex, Readable } from 'node:stream';
@@ -213,6 +214,9 @@ export class DockerService {
       workerId: string;
       operationId: string;
     };
+    /** Internal backup invocation only. Rechecked after image preparation;
+     * callers cannot turn a stale queued admin grant into legacy compute. */
+    restoreRuntimePrincipal?: BackupRestoreRuntimePrincipal;
     /** Runtime config to apply when running an imported image (which has no
      * baked entrypoint/env). Ignored for the standard image. */
     imageConfig?: ImageConfigOverride;
@@ -328,6 +332,7 @@ export class DockerService {
         !/^[a-f0-9-]{36}$/i.test(opts.portableImportIdentity.operationId)
       )
     ) throw new Error('Portable import identity does not match the worker creation request');
+    await assertBackupRestoreRuntimePrincipal(opts.restoreRuntimePrincipal);
     const container = await withOperationDeadline((operationSignal) => this.docker.createContainer({
       Image: image,
       name: opts.containerName,
@@ -385,6 +390,7 @@ export class DockerService {
 
     if (opts.start !== false) {
       try {
+        await assertBackupRestoreRuntimePrincipal(opts.restoreRuntimePrincipal);
         await withOperationDeadline(
           (operationSignal) => container.start({ abortSignal: operationSignal }),
           DOCKER_LIFECYCLE_TIMEOUT_MS,

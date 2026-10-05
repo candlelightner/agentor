@@ -7,6 +7,7 @@ defineRouteMeta({
     operationId: 'importWorker',
     parameters: [
       { name: 'displayName', in: 'query', required: false, schema: { type: 'string' }, description: 'Display name for the restored worker' },
+      { name: 'imageResolution', in: 'query', required: false, schema: { type: 'string', maxLength: 2048 } as any, description: 'JSON object: {"mode":"workspace-only","acknowledged":true} or {"mode":"replacement","imageDefinitionId":"...","imageVersion":"..."}. Never a runtime grant or raw image reference.' },
     ],
     requestBody: {
       required: true,
@@ -31,6 +32,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { useContainerManager, useConfig } from '../../utils/services';
 import { requireAuth } from '../../utils/auth-helpers';
+import { parseWorkerImportImageResolution } from '../../utils/worker-import-image-resolution';
 
 const MAX_IMPORT_UPLOAD_BYTES = 40 * 1024 * 1024 * 1024;
 const MIN_IMPORT_FREE_BYTES = 512 * 1024 * 1024;
@@ -40,6 +42,15 @@ export default defineEventHandler(async (event) => {
   const { user } = requireAuth(event);
   const q = getQuery(event);
   const displayName = typeof q.displayName === 'string' ? q.displayName : undefined;
+  let imageResolution;
+  if (q.imageResolution !== undefined) {
+    if (typeof q.imageResolution !== 'string' || q.imageResolution.length > 2048)
+      throw createError({ statusCode: 400, statusMessage: 'Invalid import image resolution' });
+    let value: unknown;
+    try { value = JSON.parse(q.imageResolution); }
+    catch { throw createError({ statusCode: 400, statusMessage: 'Invalid import image resolution JSON' }); }
+    imageResolution = parseWorkerImportImageResolution(value);
+  }
 
   if (activeImports.has(user.id)) {
     throw createError({ statusCode: 409, statusMessage: 'An import is already active for this user' });
@@ -72,7 +83,8 @@ export default defineEventHandler(async (event) => {
       },
     });
     await pipeline(event.node.req, limit, createWriteStream(bundlePath, { mode: 0o600 }));
-    const info = await useContainerManager().importWorker(user.id, bundlePath, { displayName });
+    const info = await useContainerManager().importWorker(user.id, bundlePath,
+      { displayName, ...(imageResolution ? { imageResolution } : {}) });
     setResponseStatus(event, 201);
     return info;
   } catch (err) {

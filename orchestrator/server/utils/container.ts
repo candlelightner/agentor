@@ -69,6 +69,16 @@ import type {
 } from "../../shared/types";
 import { normalizeWorkerRuntimeKind } from "../../shared/types";
 import { IncusWorkerRuntime, incusWorkerStatus, type IncusWorkerOptions } from "./incus-worker-runtime";
+import { selectWorkerImportRuntime, type WorkerImportOrigin } from './worker-import-runtime-policy';
+import { assertBackupRestoreRuntimePrincipal, validBackupRestoreRuntimePrincipal,
+  type BackupRestoreRuntimePrincipal } from './backup-restore-runtime-authority';
+
+export interface WorkerImportOptions {
+  displayName?: string;
+  imageResolution?:
+    | { mode: 'replacement'; imageDefinitionId: string; imageVersion: string; imageDigest?: string; imageRuntimeReference?: string }
+    | { mode: 'workspace-only' };
+}
 
 async function resolveImportedImage(
   userId: string,
@@ -4928,7 +4938,34 @@ for p in sys.argv[1:]:
   async importWorker(
     userId: string,
     bundlePath: string,
-    opts: { displayName?: string; imageResolution?: { mode: "replacement"; imageDefinitionId: string; imageVersion: string; imageDigest?: string; imageRuntimeReference?: string } | { mode: "workspace-only" } } = {},
+    opts: WorkerImportOptions = {},
+  ): Promise<ContainerInfo & { missingSecrets?: string[] }> {
+    // Portable bytes and request options can never establish runtime authority.
+    return this.importWorkerWithOrigin(userId, bundlePath, opts, { kind: 'portable' });
+  }
+
+  /** Internal backup entry: only the BackupManager supplies persisted artifact
+   * provenance after checking its exact ciphertext digest and decrypting it.
+   * Recovery-key ownership alone does not authorize remote legacy compute. */
+  async importWorkerFromBackup(
+    userId: string,
+    bundlePath: string,
+    backup: { provenance?: 'local' | 'remote-adopted'; runtimePrincipal?: BackupRestoreRuntimePrincipal },
+    opts: WorkerImportOptions = {},
+  ): Promise<ContainerInfo & { missingSecrets?: string[] }> {
+    if (!validBackupRestoreRuntimePrincipal(backup.runtimePrincipal))
+      throw Object.assign(new Error('Invalid internal restore runtime principal'), { statusCode: 400 });
+    return this.importWorkerWithOrigin(userId, bundlePath, opts,
+      { kind: 'backup', provenance: backup.provenance },
+      backup.runtimePrincipal ? structuredClone(backup.runtimePrincipal) : undefined);
+  }
+
+  private async importWorkerWithOrigin(
+    userId: string,
+    bundlePath: string,
+    opts: WorkerImportOptions,
+    origin: WorkerImportOrigin,
+    runtimePrincipal?: BackupRestoreRuntimePrincipal,
   ): Promise<ContainerInfo & { missingSecrets?: string[] }> {
     if (!userId) throw new Error("import: userId is required");
     // Environment recreation is visible owner-wide. Share the owner mutation
@@ -4939,7 +4976,7 @@ for p in sys.argv[1:]:
       return (await import("./portable-managed-volume-runtime"))
         .usePortableManagedVolumeRuntime()
         .withInstanceSnapshotAccounting(() =>
-          this.importWorkerForOwner(userId, bundlePath, opts),
+          this.importWorkerForOwner(userId, bundlePath, opts, origin, runtimePrincipal),
         );
     });
   }
@@ -4947,18 +4984,9 @@ for p in sys.argv[1:]:
   private async importWorkerForOwner(
     userId: string,
     bundlePath: string,
-    opts: {
-      displayName?: string;
-      imageResolution?:
-        | {
-            mode: "replacement";
-            imageDefinitionId: string;
-            imageVersion: string;
-            imageDigest?: string;
-            imageRuntimeReference?: string;
-          }
-        | { mode: "workspace-only" };
-    },
+    opts: WorkerImportOptions,
+    origin: WorkerImportOrigin,
+    runtimePrincipal?: BackupRestoreRuntimePrincipal,
   ): Promise<ContainerInfo & { missingSecrets?: string[] }> {
     const workDir = join(this.config.dataDir, "tmp", `import-${randomUUID()}`);
     let createdImportEnvironmentId: string | undefined;
@@ -4978,7 +5006,17 @@ for p in sys.argv[1:]:
       if (!manifest || typeof manifest.version !== "number") {
         throw new Error("Invalid worker export bundle");
       }
-      if (manifest.runtime?.kind === 'incus-vm')
+      const assertRuntimePrincipal = () => assertBackupRestoreRuntimePrincipal(runtimePrincipal);
+      // Resolve after the owner fence, not from a boolean captured before it.
+      await assertRuntimePrincipal();
+      const runtimeKind = selectWorkerImportRuntime({
+        runtime: manifest.runtime, incusEnabled: this.config.incusEnabled === true,
+        origin: origin.kind === 'backup' && runtimePrincipal ? { ...origin, adminLegacyAuthorized: true } : origin,
+        capturedRootfs: Boolean(rootfsPath && manifest.contents?.rootfs),
+        ignoreCapturedRootfs: opts.imageResolution?.mode === 'replacement' ? 'replacement-image'
+          : opts.imageResolution?.mode === 'workspace-only' ? 'workspace-only' : undefined,
+      });
+      if (runtimeKind === 'incus-vm')
         throw Object.assign(new Error('Native Incus restore integration is not available yet; refusing a Docker runtime downgrade'),
           { statusCode: 409, code: 'INCUS_RESTORE_CAPABILITY_PENDING' });
 
@@ -5125,6 +5163,7 @@ for p in sys.argv[1:]:
       let importedImage: string | undefined;
       let imageConfig: ImageConfigOverride | undefined;
       if (useCapturedRootfs && rootfsPath) {
+        await assertRuntimePrincipal();
         const repo = `${IMPORT_IMAGE_PREFIX}${id}`;
         const candidateImage = `${repo}:latest`;
         try {
@@ -5222,9 +5261,6 @@ for p in sys.argv[1:]:
         await this.rollbackFailedProvisionedWorker(input);
       };
       const now = new Date().toISOString();
-      // Existing backup formats reconstruct legacy Docker workers. Incus
-      // restore is added explicitly with runtime-aware metadata in Phase 10.
-      const runtimeKind: WorkerRuntimeKind = "legacy-docker";
       const containerInfo: ContainerInfo = {
         id,
         runtimeKind,
@@ -5286,6 +5322,9 @@ for p in sys.argv[1:]:
         mounts =
           (await this.resolveAuthorizedHostMounts(userId, id, mounts)) ?? [];
         containerInfo.mounts = mounts.length > 0 ? mounts : undefined;
+        // Image/environment preparation can take minutes; an admitted grant
+        // must still be current at the actual legacy compute boundary.
+        await assertRuntimePrincipal();
         await portableImport?.markWorkerCreatePending();
         container = await this.dockerService.createWorkerContainer({
           userId,
@@ -5315,6 +5354,7 @@ for p in sys.argv[1:]:
             : {}),
           image: importedImage || resolvedImage.imageRuntimeReference,
           imageConfig,
+          restoreRuntimePrincipal: runtimePrincipal,
           start: false,
         });
         await portableImport?.confirmWorkerCreated(container.id);
@@ -5378,6 +5418,7 @@ for p in sys.argv[1:]:
           const parent = item.path === "/" ? "/" : item.path.slice(0, item.path.lastIndexOf("/")) || "/";
           await this.dockerService.putArchive(container.id, createReadStream(item.archivePath), parent);
         }
+        await assertRuntimePrincipal();
         await this.dockerService.startContainer(container.id);
         await this.dockerService.materializeWorkerSecretFiles(
           container.id,

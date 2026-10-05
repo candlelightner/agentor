@@ -72,6 +72,7 @@ test('internal restore admission rejects native and stale legacy targets before 
     const artifact: any = { id: randomUUID(), userId: worker.userId, providerObjectId: 'fixture-object', workspaceId: worker.id };
     const manager: any = {
       init: async () => {}, assertOwnerAvailable() {}, store: { findArtifact: () => artifact },
+      assertRestoreRuntimePrincipal: (BackupManager.prototype as any).assertRestoreRuntimePrincipal,
       artifactWorkspaceIds: () => [worker.id], selectRestoreWorkspaceIds: () => [worker.id],
       pinRestoreArtifact() { calls.push('pin'); throw new Error('Must reject before pin'); },
       claimStartJob() { calls.push('job'); throw new Error('Must reject before job'); },

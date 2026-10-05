@@ -1567,6 +1567,8 @@ export class ManagementMcpStore {
     const imageBackup = await imageBackupDomain.execute(
       name,
       await compatibleDomainArguments(name, args),
+      identity?.scope === 'platform'
+        ? { kind: 'platform-workspace', workspaceId: identity.workspaceId } : undefined,
     );
     if (imageBackup.handled) return imageBackup.result;
     const platform = await platformDomain.execute(name, args);

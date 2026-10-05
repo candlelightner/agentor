@@ -5,6 +5,7 @@ import { useGitImageCatalogManager } from "./git-image-manager";
 import { useContainerManager, usePluginDefinitionStore } from "./services";
 import { useGroupAdminWorkspaceStore } from "./group-admin-workspace-store";
 import type { BackupProviderKind } from "./backup-types";
+import type { BackupRestoreRuntimePrincipal } from './backup-restore-runtime-authority';
 
 export interface ImageBackupTool {
   name: string;
@@ -298,7 +299,7 @@ export class ManagementImageBackupDomain {
       annotations: annotations as any,
     }));
   }
-  async execute(name: string, args: Record<string, unknown>) {
+  async execute(name: string, args: Record<string, unknown>, runtimePrincipal?: BackupRestoreRuntimePrincipal) {
     if (!this.tools().some((t) => t.name === name)) return { handled: false };
     if (name === "images.update") {
       const catalog = useImageCatalogManager();
@@ -317,7 +318,7 @@ export class ManagementImageBackupDomain {
       return { handled: true, result: await this.images(name, args) };
     if (name.startsWith("instance-backups."))
       return { handled: true, result: await this.instanceBackups(name, args) };
-    return { handled: true, result: await this.backups(name, args) };
+    return { handled: true, result: await this.backups(name, args, runtimePrincipal) };
   }
   private async images(name: string, a: Record<string, unknown>): Promise<any> {
     const catalog = useImageCatalogManager();
@@ -432,6 +433,7 @@ export class ManagementImageBackupDomain {
   private async backups(
     name: string,
     a: Record<string, unknown>,
+    runtimePrincipal?: BackupRestoreRuntimePrincipal,
   ): Promise<any> {
     const manager = useBackupManager();
     await manager.init();
@@ -545,6 +547,7 @@ export class ManagementImageBackupDomain {
             optionalUniqueStrings(a.workspaceIds, "workspaceIds"),
             imageResolutions(a.imageResolutions),
             string(a.requestId),
+            runtimePrincipal,
           ),
           owner,
         );
@@ -799,6 +802,7 @@ function createRecoveryRestore(
   workspaceIds: string[] | undefined,
   resolutions: unknown,
   requestId: string | undefined,
+  runtimePrincipal?: BackupRestoreRuntimePrincipal,
 ) {
   const createRestore = (manager as { createRestore?: unknown }).createRestore;
   if (typeof createRestore !== "function")
@@ -813,6 +817,7 @@ function createRecoveryRestore(
     workspaceIds,
     requestId,
     resolutions,
+    runtimePrincipal,
   );
 }
 function imageLogs(

@@ -1,3 +1,5 @@
+import type { BackupRestoreRuntimePrincipal } from './backup-restore-runtime-authority';
+
 export type BackupProviderKind = 'local' | 'fake' | 'google-drive';
 export type BackupArtifactKind = 'worker' | 'instance';
 export type BackupJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
@@ -115,6 +117,9 @@ export interface BackupJob {
   remoteBackupId?: string;
   dependencies?: BackupDependency[];
   imageResolutions?: Record<string, BackupImageResolution>;
+  /** Internal restore invocation principal, never taken from archive metadata
+   * or request JSON. Its current authority is rechecked before provisioning. */
+  restoreRuntimePrincipal?: BackupRestoreRuntimePrincipal;
   /** Result of an asynchronous portable image-definition recovery. The
    * recipe itself stays in the authenticated backup bundle, never here. */
   recoveredImageDefinitionId?: string;

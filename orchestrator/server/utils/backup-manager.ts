@@ -65,6 +65,8 @@ import {
   readWorkerReconstruction,
 } from "./worker-export";
 import { assertLegacyOriginalRestoreTarget, replaceStoppedWorkspace } from "./backup-restore-helper";
+import { assertBackupRestoreRuntimePrincipal,
+  type BackupRestoreRuntimePrincipal } from './backup-restore-runtime-authority';
 import { useWorkerProtectionLockStore } from "./worker-protection-lock";
 import { useGoogleBackupOAuthConfigStore } from "./google-backup-oauth-config";
 import { useImageCatalogManager } from "./image-catalog";
@@ -711,6 +713,7 @@ export class BackupManager {
           : undefined;
         if (!restoreArtifact || restoreArtifact.userId !== job.userId)
           throw new Error("The restore artifact is no longer available");
+        await this.assertRestoreRuntimePrincipal(job.restoreRuntimePrincipal);
         const retryWorkspaceIds = this.selectRestoreWorkspaceIds(
           this.artifactWorkspaceIds(restoreArtifact),
           job.selectedWorkspaceIds ?? job.workspaceIds,
@@ -2062,6 +2065,18 @@ export class BackupManager {
     return dependencies;
   }
 
+  private async assertRestoreRuntimePrincipal(principal?: BackupRestoreRuntimePrincipal): Promise<void> {
+    await assertBackupRestoreRuntimePrincipal(principal);
+  }
+
+  private async backupImportAuthority(artifact: BackupArtifact, principal?: BackupRestoreRuntimePrincipal) {
+    // Persisted ciphertext-digest-checked provenance, never bundle claims.
+    // Exportable recovery-key ownership is not authority for legacy compute.
+    await this.assertRestoreRuntimePrincipal(principal);
+    return { provenance: artifact.provenance,
+      ...(principal ? { runtimePrincipal: structuredClone(principal) } : {}) };
+  }
+
   private async decryptArtifact(
     userId: string,
     artifact: BackupArtifact,
@@ -2233,6 +2248,7 @@ export class BackupManager {
     mode: "new" | "original",
     displayName?: string,
     selectedWorkspaceIds?: string[],
+    runtimePrincipal?: BackupRestoreRuntimePrincipal,
   ) {
     await this.init();
     this.assertOwnerAvailable(userId);
@@ -2244,6 +2260,7 @@ export class BackupManager {
     )
       throw new Error("Backup artifact not found");
     artifact = currentArtifact;
+    await this.assertRestoreRuntimePrincipal(runtimePrincipal);
     if (mode === "original")
       throw new Error(
         "In-place restore is not safe while identity-preserving volume replacement is unavailable; restore into a new worker",
@@ -2257,6 +2274,7 @@ export class BackupManager {
           artifact,
           displayName,
           selectedWorkspaceIds,
+          runtimePrincipal,
         ),
       );
     } finally {
@@ -2268,6 +2286,7 @@ export class BackupManager {
     artifact: BackupArtifact,
     displayName?: string,
     selectedWorkspaceIds?: string[],
+    runtimePrincipal?: BackupRestoreRuntimePrincipal,
   ) {
     const dir = join(this.dataDir, "tmp", `restore-${randomUUID()}`);
     const encrypted = join(dir, "archive.enc");
@@ -2310,9 +2329,10 @@ export class BackupManager {
       const workers = [];
       for (const [index, bundle] of bundles.entries()) {
         assertActive();
-        const worker = await useContainerManager().importWorker(
+        const worker = await useContainerManager().importWorkerFromBackup(
           userId,
           bundle.path,
+          await this.backupImportAuthority(artifact, runtimePrincipal),
           { displayName: index === 0 ? displayName : undefined },
         );
         workers.push(worker);
@@ -2342,6 +2362,7 @@ export class BackupManager {
     selectedWorkspaceIds?: string[],
     requestId?: string,
     imageResolutions?: Record<string, BackupImageResolution>,
+    runtimePrincipal?: BackupRestoreRuntimePrincipal,
   ): Promise<BackupJob> {
     await this.init();
     this.assertOwnerAvailable(userId);
@@ -2353,6 +2374,7 @@ export class BackupManager {
     )
       throw new Error("Backup artifact not found");
     artifact = currentArtifact;
+    await this.assertRestoreRuntimePrincipal(runtimePrincipal);
     const artifactWorkspaceIds = this.artifactWorkspaceIds(artifact);
     const selected = this.selectRestoreWorkspaceIds(
       artifactWorkspaceIds,
@@ -2398,6 +2420,7 @@ export class BackupManager {
           left.localeCompare(right),
         ),
       ),
+      restoreRuntimePrincipal: runtimePrincipal,
     });
     const jobId = randomUUID();
     const restorePinOwner = this.restorePinOwner(jobId, 1);
@@ -2434,6 +2457,7 @@ export class BackupManager {
         target,
         displayName,
         dependencies,
+        ...(runtimePrincipal ? { restoreRuntimePrincipal: structuredClone(runtimePrincipal) } : {}),
         ...(normalizedResolutions
           ? { imageResolutions: normalizedResolutions }
           : {}),
@@ -2485,9 +2509,10 @@ export class BackupManager {
       await this.decryptArtifact(job.userId, artifact, enc, plain);
       job.integrityVerified = true;
       if (job.target === "new") {
-        const worker = await useContainerManager().importWorker(
+        const worker = await useContainerManager().importWorkerFromBackup(
           job.userId,
           plain,
+          await this.backupImportAuthority(artifact, job.restoreRuntimePrincipal),
           { displayName },
         );
         job.workerId = worker.id;
@@ -3422,9 +3447,10 @@ export class BackupManager {
               : resolution?.mode === "workspace-only"
                 ? { mode: "workspace-only" as const }
                 : undefined;
-          const worker = await useContainerManager().importWorker(
+          const worker = await useContainerManager().importWorkerFromBackup(
             job.userId,
             bundle.path,
+            await this.backupImportAuthority(artifact, job.restoreRuntimePrincipal),
             {
               displayName: index === 0 ? displayName : undefined,
               ...(imageResolution ? { imageResolution } : {}),
@@ -4717,6 +4743,7 @@ function sanitizeJob(job: BackupJob): BackupJob {
   delete publicJob.pendingProviderArtifactId;
   delete publicJob.pendingProviderUploadId;
   delete publicJob.providerUploadId;
+  delete publicJob.restoreRuntimePrincipal;
   return publicJob;
 }
 let singleton: BackupManager | undefined;

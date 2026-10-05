@@ -41,6 +41,25 @@ test("management import tool is mutating, bounded, and requires an owner", async
   await expect(domain.execute("imports.prepare", {}, "admin-workspace")).rejects.toMatchObject({ statusCode: 400 });
 });
 
+test('management portable handoff retains only validated image choices, never runtime authorization', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'agentor-management-import-image-'));
+  const options: unknown[] = [];
+  const domain = new ManagementImportDomain({ dataDir: () => dataDir,
+    importWorker: async (_owner, _path, selected) => { options.push(selected); return { id: 'restored' }; } });
+  try {
+    const imageResolution = { mode: 'replacement', imageDefinitionId: 'catalog-uuid', imageVersion: 'v1' };
+    const prepared: any = await domain.execute('imports.prepare', { ownerId: 'owner-a', imageResolution,
+      provenance: 'local', adminLegacyAuthorized: true }, 'admin-workspace');
+    imageResolution.imageDefinitionId = 'changed-after-prepare';
+    await domain.upload('admin-workspace', prepared.result.uploadPath.split('/').pop(), Readable.from('bundle'), 6);
+    expect(options).toEqual([{ displayName: undefined,
+      imageResolution: { mode: 'replacement', imageDefinitionId: 'catalog-uuid', imageVersion: 'v1' } }]);
+    await expect(domain.execute('imports.prepare', { ownerId: 'owner-a',
+      imageResolution: { mode: 'workspace-only', acknowledged: true, runtimeKind: 'legacy-docker' } }, 'admin-workspace'))
+      .rejects.toMatchObject({ statusCode: 400 });
+  } finally { await rm(dataDir, { recursive: true, force: true }); }
+});
+
 test("management import transport accepts only canonical tar uploads", () => {
   expect(parseImportUploadHeaders({ "content-type": "application/x-tar; charset=binary", "content-length": "12" })).toEqual({ declaredLength: 12 });
   expect(parseImportUploadHeaders({ "content-type": "application/x-tar" })).toEqual({ declaredLength: undefined });

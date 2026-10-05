@@ -24,7 +24,8 @@ export default defineEventHandler(async (event) => {
   if (body.displayName !== undefined && typeof body.displayName !== 'string')
     throw createError({ statusCode: 400, statusMessage: 'Invalid display name' });
   try {
-    const worker = await manager.restore(artifact.userId, artifact, 'new', body.displayName, body.workspaceIds);
+    const worker = await manager.restore(artifact.userId, artifact, 'new', body.displayName, body.workspaceIds,
+      user.role === 'admin' ? { kind: 'admin-user', userId: user.id } : undefined);
     setResponseStatus(event, 201);
     return worker;
   } catch (err) {
