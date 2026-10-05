@@ -4,7 +4,7 @@
 export const INCUS_CANONICAL_RESTORE_SCRIPT = String.raw`
 import os,re,stat,subprocess,sys
 ROOTS={"workspace":"/restore/workspace","agents":"/restore/.agent-data"}
-if len(sys.argv)!=2 or sys.argv[1] not in ROOTS:
+if len(sys.argv) not in (2,3) or sys.argv[1] not in ROOTS or len(sys.argv)==3 and sys.argv[2]!="empty":
     raise ValueError("Invalid canonical restore role")
 root=ROOTS[sys.argv[1]]
 for path in ("/restore",)+tuple(ROOTS.values()):
@@ -36,6 +36,12 @@ for path in ROOTS.values():
 with os.scandir(root) as entries:
     if next(entries,None) is not None:
         raise ValueError("Canonical restore destination must be empty")
+# A missing payload is a fresh empty role, not authority to recursively alter
+# another restored tree. Initialize only this verified mount root for agent.
+if len(sys.argv)==3:
+    os.chown(root,1000,1000)
+    os.chmod(root,0o755 if sys.argv[1]=="workspace" else 0o700)
+    sys.exit(0)
 command=["/usr/bin/tar","--numeric-owner","--same-owner","--same-permissions",
     "--xattrs","--xattrs-include=*","--acls","--delay-directory-restore",
     "-xpf","-","-C","/restore"]

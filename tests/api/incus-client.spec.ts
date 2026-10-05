@@ -567,6 +567,38 @@ test.describe("IncusClient mock server protocol tests", () => {
     expect(puts).toBe(3);
   });
 
+  test('canonical completion uses exact stopped nonce-owned snapshot and narrowly changes restore/host metadata with device PUT', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    const original = { type: 'virtual-machine', status: 'Stopped', profiles: [], config: {
+      'volatile.uuid': 'captured', 'user.agentor.recreation': 'nonce', 'user.agentor.restore': 'incomplete',
+      'user.agentor.id': 'worker', 'user.agentor.owner': 'owner', 'security.secureboot': 'false' }, devices: {
+        root: { type: 'disk', path: '/', pool: 'pool' }, workspace: { type: 'disk', path: '/restore/workspace', pool: 'pool', source: 'workspace' },
+        agents: { type: 'disk', path: '/restore/.agent-data', pool: 'pool', source: 'agents' } } } as any;
+    let current = structuredClone(original), puts = 0, written: any;
+    client.request = async () => ({}) as any;
+    client.rawRequest = async (method, _path, body, headers) => {
+      if (method === 'GET') return { statusCode: 200, headers: { etag: 'pinned' }, body: Buffer.from(JSON.stringify({ type: 'sync', metadata: current })) };
+      expect(headers).toEqual({ 'If-Match': 'pinned' }); puts++; written = body;
+      return { statusCode: 200, headers: {}, body: Buffer.from(JSON.stringify({ type: 'sync' })) };
+    };
+    const devices = { ...original.devices, workspace: { ...original.devices.workspace, path: '/workspace' } };
+    await client.updateInstanceDevices('worker', devices, undefined, original, { nonce: 'nonce', hostMountMetadata: '[]' });
+    expect(written.config).toEqual({ ...original.config, 'user.agentor.restore': undefined, 'user.agentor.host-mounts': '[]' });
+    expect(Object.hasOwn(written.config, 'user.agentor.restore')).toBe(false);
+    for (const mutation of ['running', 'nonce', 'marker', 'profile', 'foreign-device', 'missing-expected', 'invalid-host']) {
+      current = structuredClone(original);
+      if (mutation === 'running') current.status = 'Running';
+      if (mutation === 'nonce') current.config['user.agentor.recreation'] = 'other';
+      if (mutation === 'marker') delete current.config['user.agentor.restore'];
+      if (mutation === 'profile') current.profiles = ['host'];
+      if (mutation === 'foreign-device') current.devices.foreign = { type: 'nic', network: 'external' };
+      const expected = mutation === 'missing-expected' ? undefined : structuredClone(current);
+      await expect(client.updateInstanceDevices('worker', devices, undefined, expected,
+        { nonce: 'nonce', hostMountMetadata: mutation === 'invalid-host' ? '{"not":"array"}' : undefined })).rejects.toThrow();
+    }
+    expect(puts).toBe(1);
+  });
+
   test('device PUT uses native mutation fences and matching caller snapshot/ETag without blocking exec', async () => {
     const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
     const original = { config: { 'volatile.uuid': 'original' }, profiles: [], description: '',

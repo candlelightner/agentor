@@ -135,6 +135,35 @@ export class IncusWorkerStorage {
     return volume.config["user.agentor.allow-initialization"] === "true";
   }
 
+  /** Metadata preservation survives compute disposal. Partial writes must
+   * never permit a later recursive ownership repair over restored data. */
+  async preserveOwnership(owner: IncusStorageOwner): Promise<boolean> {
+    const flags: Array<string | undefined> = [];
+    for (const role of ['workspace', 'agents'] as const) {
+      const volume = await this.inspectVolume(owner, role);
+      if (!volume) throw new Error(`Existing Incus ${role} volume is missing; explicit recovery is required`);
+      flags.push(volume.config['user.agentor.preserve-ownership']);
+    }
+    if (flags.every(flag => flag === undefined)) return false;
+    if (flags.every(flag => flag === 'true')) return true;
+    throw new Error('Incus canonical ownership metadata is malformed or incomplete; explicit recovery is required');
+  }
+
+  async markPreserveOwnership(owner: IncusStorageOwner): Promise<void> {
+    const volumes: IncusCustomVolume[] = [];
+    for (const role of ['workspace', 'agents'] as const) {
+      const volume = await this.inspectVolume(owner, role);
+      if (!volume) throw new Error(`Existing Incus ${role} volume is missing; explicit recovery is required`);
+      const flag = volume.config['user.agentor.preserve-ownership'];
+      if (flag !== undefined && flag !== 'true') throw new Error('Incus canonical ownership metadata is malformed');
+      volumes.push(volume);
+    }
+    for (const volume of volumes) if (volume.config['user.agentor.preserve-ownership'] !== 'true')
+      await this.client.updateCustomVolume(this.config.incusStoragePool, volume.name,
+        { ...volume.config, 'user.agentor.preserve-ownership': 'true' });
+    if (!await this.preserveOwnership(owner)) throw new Error('Incus canonical ownership preservation was not persisted');
+  }
+
   /** Read-only reconstruction preflight. Missing known data is an error, never
    * permission to allocate an empty replacement. */
   async verifyExisting(owner: IncusStorageOwner, dockerRequired = false): Promise<{ docker: boolean }> {

@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -705,6 +705,114 @@ test('queued rollback cannot clear a changed initial-create discriminator', asyn
   });
 });
 
+test('incomplete import discriminator is initial-create-only and validated on durable reload', async () => {
+  await fixture(async (manager, store, _calls, info) => {
+    const original = store.get(info.userId, info.id)!;
+    for (const incusRecreation of [
+      { nonce: 'import', initialCreate: true, importIncomplete: false },
+      { nonce: 'import', importIncomplete: true },
+      { nonce: 'import', initialCreate: true, originalIncarnation: 'source', importIncomplete: true },
+      { nonce: '', initialCreate: true, importIncomplete: true },
+    ]) await expect(store.upsert({ ...original, incusRecreation } as any)).rejects.toThrow(/initial-create/);
+    const marker = { nonce: 'import', initialCreate: true as const, importIncomplete: true as const };
+    await expect(store.upsert({ ...original, runtimeKind: 'legacy-docker', incusRecreation: marker })).rejects.toThrow(/initial-create/);
+    await store.upsert({ ...original, incusRecreation: marker });
+    const root = (manager as any).config.dataDir, reloaded = new WorkerStore(root); await reloaded.init();
+    expect(reloaded.get(info.userId, info.id)?.incusRecreation).toEqual(marker);
+    await writeFile(join(root, 'users', info.userId, 'workers.json'), JSON.stringify([{ ...original,
+      incusRecreation: { ...marker, initialCreate: false } }]));
+    await expect(reloaded.loadUser(info.userId)).rejects.toThrow(/initial-create/);
+    expect(() => reloaded.get(info.userId, info.id)).toThrow(/unavailable for this owner/);
+  });
+});
+
+test('queued rollback cannot clear a changed incomplete-import discriminator', async () => {
+  await fixture(async (_manager, store, _calls, info) => {
+    const marker = { nonce: 'same', initialCreate: true as const, importIncomplete: true as const };
+    await store.upsert({ ...store.get(info.userId, info.id)!, incusRecreation: marker });
+    await store.upsert({ ...store.get(info.userId, info.id)!, incusRecreation: { nonce: marker.nonce, initialCreate: true } });
+    await expect(store.transitionIncusRecreation(info.userId, info.id,
+      { status: 'archived', desiredRuntimeStatus: 'stopped', incusRecreation: undefined }, undefined, marker))
+      .rejects.toThrow(/marker changed/);
+    expect(store.get(info.userId, info.id)?.status).toBe('active');
+    expect(store.get(info.userId, info.id)?.deletionPending).not.toBe(true);
+  });
+});
+
+test('failed or interrupted Incus import rollback fences partial data from ordinary unarchive', async () => {
+  for (const mode of ['failed', 'interrupted', 'no-create'] as const) await fixture(async (manager, store, calls, info) => {
+    const marker = { nonce: 'import-operation', initialCreate: true as const, importIncomplete: true as const,
+      ...(mode !== 'no-create' ? { replacementIncarnation: 'original-uuid' } : {}) };
+    await store.upsert({ ...store.get(info.userId, info.id)!, incusRecreation: marker });
+    (manager as any).incusRuntime.rollbackRecreation = async (_owner: unknown, proof: any) => {
+      expect(proof.nonce).toBe(marker.nonce); calls.push('exact-compute-rollback'); return { status: 'archived' };
+    };
+    if (mode === 'interrupted') await manager.reconcileIncusWorkers();
+    else await (manager as any).rollbackFailedProvisionedWorker({ id: info.id, userId: info.userId,
+      containerId: info.containerId, containerName: info.containerName, dockerEnabled: false,
+      incusCreation: { attempted: mode !== 'no-create', nonce: marker.nonce,
+        ...(mode !== 'no-create' ? { incarnation: 'original-uuid' } : {}) } });
+    const record = store.get(info.userId, info.id)!;
+    expect(record).toMatchObject({ status: 'archived', desiredRuntimeStatus: 'stopped', deletionPending: true });
+    expect(record.incusRecreation).toBeUndefined(); expect(manager.get(info.id)).toBeUndefined();
+    const reloaded = new WorkerStore((manager as any).config.dataDir); await reloaded.init();
+    expect(reloaded.get(info.userId, info.id)?.deletionPending).toBe(true);
+    await expect(store.unarchive(info.userId, info.id)).rejects.toMatchObject({ statusCode: 409 });
+    await expect(manager.unarchive(info.userId, info.id)).rejects.toMatchObject({ statusCode: 409 });
+    await manager.reconcileIncusWorkers();
+    expect(calls).toEqual(mode === 'no-create' ? [] : mode === 'interrupted'
+      ? ['persistence-preflight', 'exact-compute-rollback'] : ['exact-compute-rollback']);
+  });
+});
+
+test('incomplete import rollback metadata failure retains marker and cannot publish bootable archive', async () => {
+  await fixture(async (manager, store, _calls, info) => {
+    const marker = { nonce: 'import', initialCreate: true as const, importIncomplete: true as const, replacementIncarnation: 'original-uuid' };
+    await store.upsert({ ...store.get(info.userId, info.id)!, incusRecreation: marker });
+    (manager as any).incusRuntime.rollbackRecreation = async () => ({ status: 'archived' });
+    const persist = (store as any).persistUser;
+    (store as any).persistUser = async () => { throw new Error('injected receipt write failure'); };
+    try {
+      await expect((manager as any).rollbackFailedProvisionedWorker({ id: info.id, userId: info.userId,
+        containerId: info.containerId, containerName: info.containerName, dockerEnabled: false,
+        incusCreation: { attempted: true, nonce: marker.nonce, incarnation: 'original-uuid' } }))
+        .rejects.toMatchObject({ code: 'WORKER_CREATE_ROLLBACK_INCOMPLETE' });
+      expect(store.get(info.userId, info.id)?.incusRecreation).toEqual(marker);
+      expect(store.get(info.userId, info.id)?.status).toBe('active');
+      expect(manager.get(info.id)?.status).toBe('error');
+    } finally { (store as any).persistUser = persist; }
+  });
+});
+
+test('stale or missing no-create import nonce cannot quarantine a newer retained import', async () => {
+  for (const nonce of [undefined, 'stale-import-operation']) await fixture(async (manager, store, calls, info) => {
+    const marker = { nonce: 'current-import-operation', initialCreate: true as const, importIncomplete: true as const };
+    await store.upsert({ ...store.get(info.userId, info.id)!, incusRecreation: marker });
+    const transition = store.transitionIncusRecreation.bind(store);
+    store.transitionIncusRecreation = async (...args) => { calls.push('transition'); return transition(...args); };
+    store.delete = async () => { calls.push('delete-record'); throw new Error('Authority must remain untouched'); };
+    (manager as any).incusRuntime = new Proxy({}, { get: () => async () => { calls.push('runtime'); throw new Error('No runtime call is permitted'); } });
+    const original = store.get(info.userId, info.id);
+    await expect((manager as any).rollbackFailedProvisionedWorker({ id: info.id, userId: info.userId,
+      containerId: info.containerId, containerName: info.containerName, dockerEnabled: false,
+      incusCreation: { attempted: false, nonce } }))
+      .rejects.toMatchObject({ code: 'WORKER_CREATE_CONTAINER_RETAINED' });
+    expect(store.get(info.userId, info.id)).toEqual(original);
+    expect(manager.get(info.id)).toBe(info); expect(calls).toEqual([]);
+  });
+});
+
+test('successful complete import can clear the marker without deletion-pending authority', async () => {
+  await fixture(async (_manager, store, _calls, info) => {
+    const marker = { nonce: 'import', initialCreate: true as const, importIncomplete: true as const, replacementIncarnation: 'original-uuid' };
+    await store.upsert({ ...store.get(info.userId, info.id)!, incusRecreation: marker });
+    const result = await store.transitionIncusRecreation(info.userId, info.id,
+      { status: 'active', desiredRuntimeStatus: 'running', incusRecreation: undefined }, undefined, marker);
+    expect(result.incusRecreation).toBeUndefined(); expect(result.deletionPending).not.toBe(true);
+    expect(result.status).toBe('active');
+  });
+});
+
 test('queued recreation rollback cannot clear a changed marker or resurrect deleted authority', async () => {
   await fixture(async (_manager, store, _calls, info) => {
     const original = { nonce: 'old-nonce', originalIncarnation: 'original-uuid' };
@@ -859,6 +967,7 @@ test('initial Incus UUID persistence/start/applied/final persistence failures ro
         await expect((manager as any).createForOwner({ userId: state.owner })).rejects.toThrow('injected');
         const record = store.get(state.owner, state.options.id)!;
         expect(record).toMatchObject({ status: 'archived', desiredRuntimeStatus: 'stopped' });
+        expect(record.deletionPending).not.toBe(true); // Ordinary create retains a retryable archive.
         expect(record.incusRecreation).toBeUndefined();
         expect(calls).toContain('rollback-captured');
         expect(manager.get(record.id)).toBeUndefined();

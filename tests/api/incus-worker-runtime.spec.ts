@@ -225,6 +225,30 @@ test('workers without host mounts do not require the new guest ownership-prune s
   } finally { await f.cleanup(); }
 });
 
+test('restored ownership requires supported guest bootstrap before provisioning or service startup', async () => {
+  for (const supported of [false, true]) {
+    const { client, events } = fakeClient(), runtime = new IncusWorkerRuntime(config, client as any), opts = options();
+    const created = await runtime.create({ ...opts, start: false });
+    const storage = new IncusWorkerStorage(client as any, config, await backupInstallationId(config.dataDir));
+    await storage.markPreserveOwnership(opts);
+    events.length = 0;
+    const exec = client.exec;
+    client.exec = async (...args: any[]) => args[1][0] === 'grep' && args[1].includes('ownership_marker=/run/agentor/preserve-storage-ownership')
+      ? { returnCode: supported ? 0 : 1, stdout: '', stderr: '' } : exec(...args);
+    if (!supported) {
+      await expect(runtime.start(opts, created.config['volatile.uuid'])).rejects.toThrow('metadata-preserving');
+      expect(events.some(e => e.operation === 'file')).toBe(false);
+      expect(events.some(e => e.operation === 'exec' && JSON.stringify(e.args[1]) === JSON.stringify(['systemctl', 'start', 'agentor-worker.service']))).toBe(false);
+    } else {
+      await runtime.start(opts, created.config['volatile.uuid']);
+      const marker = events.findIndex(e => e.operation === 'file' && e.args[1] === '/run/agentor/preserve-storage-ownership');
+      expect(events[marker]!.args.slice(2)).toEqual(['agentor-preserve-storage-ownership-v1\n', { mode: 0o600, uid: 0, gid: 0 }]);
+      expect(marker).toBeLessThan(events.findIndex(e => e.operation === 'file' && e.args[1] === '/run/agentor/provisioned'));
+      expect(events.some(e => e.operation === 'exec' && e.args[1].includes('/run/agentor/preserve-storage-ownership') && e.args[1][0] === 'rm')).toBe(true);
+    }
+  }
+});
+
 test("VM creation enforces isolation and provisions files before service start", async () => {
   const { client, events } = fakeClient();
   const runtime = new IncusWorkerRuntime(config, client as any);

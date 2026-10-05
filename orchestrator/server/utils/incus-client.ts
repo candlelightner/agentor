@@ -634,7 +634,8 @@ export class IncusClient {
    * Never retry this mutation implicitly or start writers on an unknown result.
    * Synchronous success reports undefined (there is no outstanding operation). */
   async updateInstanceDevices(name: string, devices: Record<string, IncusDevice>,
-    onAccepted?: (operationPath: string | undefined) => Promise<void>, expected?: IncusInstance): Promise<void> {
+    onAccepted?: (operationPath: string | undefined) => Promise<void>, expected?: IncusInstance,
+    completeCanonicalRestore?: { nonce: string; hostMountMetadata?: string }): Promise<void> {
     // A previous device PUT can outlive its observer. Incus serializes native
     // instance updates and checks ETag AFTER taking that lock. Do not queue a
     // stale full-device map behind an unsettled mutation, or pair it with a
@@ -669,8 +670,27 @@ export class IncusClient {
     const fields = (instance: IncusInstance) => [instance.config, instance.devices, instance.profiles, instance.description ?? ''];
     if (expected && !isDeepStrictEqual(fields(expected), fields(current)))
       throw new IncusError('Incus instance changed since the caller device snapshot; no update was submitted');
+    const config = { ...current.config };
+    if (completeCanonicalRestore) {
+      const fixedLayout = (instance: IncusInstance) => instance.type === 'virtual-machine' && instance.status === 'Stopped' &&
+        Array.isArray(instance.profiles) && instance.profiles.length === 0 &&
+        Object.keys(instance.expanded_devices ?? instance.devices).length === 3 &&
+        ['root', 'workspace', 'agents'].every(key => (instance.expanded_devices ?? instance.devices)[key]?.type === 'disk') &&
+        instance.devices.root?.path === '/' && instance.devices.workspace?.path === '/restore/workspace' &&
+        instance.devices.agents?.path === '/restore/.agent-data' &&
+        instance.config['user.agentor.restore'] === 'incomplete' &&
+        instance.config['user.agentor.recreation'] === completeCanonicalRestore.nonce;
+      const host = completeCanonicalRestore.hostMountMetadata;
+      if (!expected || !fixedLayout(expected) || !fixedLayout(current) ||
+          typeof completeCanonicalRestore.nonce !== 'string' || !completeCanonicalRestore.nonce ||
+          completeCanonicalRestore.nonce.length > 128 ||
+          host !== undefined && (typeof host !== 'string' || Buffer.byteLength(host) > 65536 || !Array.isArray(JSON.parse(host))))
+        throw new IncusError('Canonical restore completion requires a stopped nonce-owned fixed-layout snapshot');
+      delete config['user.agentor.restore'];
+      if (host !== undefined) config['user.agentor.host-mounts'] = host;
+    }
     const raw = await this.rawRequest('PUT', path, {
-      config: current.config, profiles: current.profiles, description: current.description, devices,
+      config, profiles: current.profiles, description: current.description, devices,
     }, { 'If-Match': etag });
     const json = JSON.parse(raw.body.toString('utf-8')) as IncusResponse<any>;
     if (json.type === 'error' || raw.statusCode >= 400)

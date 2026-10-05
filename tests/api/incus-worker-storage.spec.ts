@@ -38,6 +38,25 @@ test("filesystem persistence is separate from disposable root and Docker capabil
   expect(volumes.size).toBe(2);
 });
 
+test('restored ownership preservation is durable on both exact private roots and refuses malformed/partial metadata', async () => {
+  const { storage, volumes, writes } = fixture();
+  await storage.devices(owner, false);
+  expect(await storage.preserveOwnership(owner)).toBe(false);
+  await storage.markPreserveOwnership(owner);
+  expect(await storage.preserveOwnership(owner)).toBe(true);
+  const before = writes.length; await storage.markPreserveOwnership(owner); expect(writes).toHaveLength(before);
+  const agents = volumes.get(owner.containerName + '-agents');
+  for (const flag of [undefined, 'false', '', '1']) {
+    if (flag === undefined) delete agents.config['user.agentor.preserve-ownership'];
+    else agents.config['user.agentor.preserve-ownership'] = flag;
+    await expect(storage.preserveOwnership(owner)).rejects.toThrow('malformed or incomplete');
+  }
+  agents.config['user.agentor.preserve-ownership'] = 'false'; writes.length = 0;
+  await expect(storage.markPreserveOwnership(owner)).rejects.toThrow('malformed'); expect(writes).toEqual([]);
+  agents.config['user.agentor.preserve-ownership'] = 'true'; agents.config['user.agentor.owner'] = 'foreign';
+  await expect(storage.preserveOwnership(owner)).rejects.toThrow('ownership/type');
+});
+
 test("Docker block storage remains on disable and is reused on re-enable", async () => {
   const { storage, volumes, writes } = fixture();
   const devices = await storage.devices(owner, true);

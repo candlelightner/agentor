@@ -676,12 +676,13 @@ export class IncusWorkerRuntime {
    * newer desired settings. A lost response is recoverable only by the nonce
    * written by our create request, authoritative owner and current UUID. */
   async rollbackRecreation(owner: IncusStorageOwner,
-    marker: { nonce: string; originalIncarnation?: string; replacementIncarnation?: string; initialCreate?: true }):
+    marker: { nonce: string; originalIncarnation?: string; replacementIncarnation?: string; initialCreate?: true; importIncomplete?: true }):
     Promise<{ status: 'active' | 'archived'; incarnation?: string }> {
     if (!marker || typeof marker.nonce !== 'string' || !marker.nonce || marker.nonce.length > 128 ||
         [marker.originalIncarnation, marker.replacementIncarnation].some((id) =>
           id !== undefined && (typeof id !== 'string' || !id || id.length > 128)) ||
         (marker.initialCreate !== undefined && marker.initialCreate !== true) ||
+        (marker.importIncomplete !== undefined && (marker.importIncomplete !== true || !marker.initialCreate)) ||
         (marker.initialCreate && marker.originalIncarnation !== undefined) ||
         (marker.originalIncarnation && marker.originalIncarnation === marker.replacementIncarnation))
       throw new Error('Incus recreation recovery marker is invalid');
@@ -897,8 +898,13 @@ export class IncusWorkerRuntime {
         await new Promise(resolve => setTimeout(resolve, 500));
       }
       if (!ready) throw new Error('Incus canonical restore guest agent did not become ready');
-      for (const role of ['workspace', 'agents'] as const) if (payloads[role]) {
+      for (const role of ['workspace', 'agents'] as const) {
         await stable();
+        if (!payloads[role]) {
+          await this.checkedExec(opts.containerName, ['/usr/bin/python3', '-c', INCUS_CANONICAL_RESTORE_SCRIPT, role, 'empty']);
+          await stable();
+          continue;
+        }
         const session = await this.client.execStream(opts.containerName,
           ['/usr/bin/python3', '-c', INCUS_CANONICAL_RESTORE_SCRIPT, role], {
             command: [],
@@ -913,6 +919,8 @@ export class IncusWorkerRuntime {
         } finally { session.close(); }
       }
       await stable();
+      await storage.markPreserveOwnership(opts);
+      await validateRecord();
     } catch (error) {
       // A start observer can fail while Incus still owns an operation. A
       // stopped read-back is not terminal proof: leave the initial-create
@@ -924,6 +932,57 @@ export class IncusWorkerRuntime {
       catch (stopError) { throw new AggregateError([error, stopError], 'Incus restore failed; destination shutdown is unconfirmed'); }
       throw error;
     }
+  }
+
+  /** Reattach current grants only after extraction has settled. The caller's
+   * initial import marker stays incomplete through service health validation;
+   * an unknown native PUT is never inferred complete from device read-back. */
+  async finishCanonicalRestore(opts: IncusWorkerOptions, incarnation: string,
+    validateRecord: () => void | Promise<void>): Promise<void> {
+    if (!incarnation) throw new Error('Incus restore completion requires a captured incarnation');
+    this.validateOptions(opts);
+    await this.assertReady();
+    const storage = await this.storage();
+    const check = async () => {
+      await validateRecord();
+      const instance = await this.assertOwned(opts.containerName, opts.id, opts.userId, incarnation);
+      const devices = instance.expanded_devices ?? instance.devices;
+      if (!opts.recreationNonce || instance.config['user.agentor.recreation'] !== opts.recreationNonce ||
+          instance.config['user.agentor.restore'] !== 'incomplete' || instance.type !== 'virtual-machine' ||
+          instance.profiles?.length || Object.keys(devices).length !== 3 ||
+          !sameDevice(devices.root, { type: 'disk', path: '/', pool: this.config.incusStoragePool }) ||
+          !sameDevice(devices.workspace, { type: 'disk', path: '/restore/workspace', pool: this.config.incusStoragePool, source: opts.containerName + '-workspace' }) ||
+          !sameDevice(devices.agents, { type: 'disk', path: '/restore/.agent-data', pool: this.config.incusStoragePool, source: opts.containerName + '-agents' }) ||
+          Object.keys(instance.expanded_config ?? instance.config).some(key => key.startsWith('raw.')) ||
+          !await storage.preserveOwnership(opts))
+        throw new Error('Incus canonical restore data or destination authority is incomplete');
+      await validateRecord();
+      return instance;
+    };
+    await check();
+    await this.stop(opts, incarnation);
+    const stopped = await check();
+    if (stopped.status !== 'Stopped') throw new Error('Incus restore destination shutdown is unconfirmed');
+    const persistent = await storage.devices(opts, opts.environmentJson.dockerEnabled, { docker: false });
+    const account = await this.accountDevices(opts), managed = await this.managedDevices(opts);
+    const host = await incusHostMountLayout(this.config, opts, 'ensure');
+    const current = await check();
+    await this.client.updateInstanceDevices(opts.containerName, {
+      ...persistent, ...account, ...managed, ...host.devices,
+      root: { type: 'disk', path: '/', pool: this.config.incusStoragePool },
+      eth0: { type: 'nic', name: 'eth0', network: this.config.incusNetwork,
+        'security.mac_filtering': 'true', 'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' },
+    }, undefined, current, { nonce: opts.recreationNonce!, hostMountMetadata: incusHostMountMetadata(host)['user.agentor.host-mounts'] });
+    await validateRecord();
+    const completed = await this.assertOwned(opts.containerName, opts.id, opts.userId, incarnation);
+    if (completed.status !== 'Stopped' || completed.config['user.agentor.restore'] !== undefined ||
+        completed.config['user.agentor.recreation'] !== opts.recreationNonce)
+      throw new Error('Incus restore activation result is unavailable; retain the initial import fence');
+    assertIncusHostMountLayout(completed, host);
+    // start rechecks current private/layout/grants and actual image support
+    // before pushing config or running the ownership helper/service.
+    await this.start(opts, incarnation);
+    await validateRecord();
   }
 
   /** Positive guest facts only. Timeout/transport failures are unknown, never
@@ -972,6 +1031,7 @@ export class IncusWorkerRuntime {
         throw new Error("Incus account share layout is missing or ambiguous; rebuild required");
     }
     const storage = await this.storage();
+    const preserveOwnership = await storage.preserveOwnership(opts);
     const persistent = await storage.devices(opts, opts.environmentJson.dockerEnabled, { docker: !!instance.devices.docker });
     for (const role of ["workspace", "agents"] as const) {
       if (!sameDevice(instance.devices[role], persistent[role]!))
@@ -1005,6 +1065,12 @@ export class IncusWorkerRuntime {
         if (supported.returnCode !== 0)
           throw new Error('Derived image predates safe host-mount ownership repair; rebuild the configured worker OCI image before starting');
       }
+      if (preserveOwnership) {
+        const supported = await this.client.exec(name, ['grep', '-Fxq', '--',
+          'ownership_marker=/run/agentor/preserve-storage-ownership', '/usr/lib/agentor/agentor-private-storage.sh']);
+        if (supported.returnCode !== 0)
+          throw new Error('Derived image predates metadata-preserving storage startup; rebuild the configured worker OCI image before starting');
+      }
       for (const v of opts.managedVolumes ?? [])
         await this.checkedExec(name, ['timeout', '15', 'mountpoint', '-q', '--', v.target]);
       for (const device of Object.values(hostMounts.devices))
@@ -1028,8 +1094,9 @@ export class IncusWorkerRuntime {
           ].join("; "), "agentor-bind", `/run/agentor/account-credentials/${mapping.fileName}`, mapping.containerPath]);
         }
       }
-      await this.checkedExec(name, ["rm", "-f", "/tmp/worker-events", "/run/agentor/provisioned", "/run/agentor/worker.env"]);
-      await this.provision(opts);
+      await this.checkedExec(name, ["rm", "-f", "/tmp/worker-events", "/run/agentor/provisioned", "/run/agentor/worker.env",
+        "/run/agentor/preserve-storage-ownership"]);
+      await this.provision(opts, preserveOwnership);
       await this.checkedExec(name, ["systemctl", "stop", "docker", "docker.socket", "containerd", "agentor-docker-storage"]);
       if (opts.environmentJson.dockerEnabled) {
         await this.client.pushFile(name, "/run/agentor/docker-storage.json", JSON.stringify({
@@ -1064,9 +1131,11 @@ export class IncusWorkerRuntime {
     }
   }
 
-  private async provision(opts: IncusWorkerOptions): Promise<void> {
+  private async provision(opts: IncusWorkerOptions, preserveOwnership = false): Promise<void> {
     const name = opts.containerName;
     await this.client.pushFile(name, "/run/agentor", "", { type: "directory", mode: 0o711 });
+    if (preserveOwnership) await this.client.pushFile(name, '/run/agentor/preserve-storage-ownership',
+      'agentor-preserve-storage-ownership-v1\n', { mode: 0o600, uid: 0, gid: 0 });
     const values: Record<string, string> = Object.fromEntries(renderUserEnvVars(opts.userEnv).map((line) => {
       const at = line.indexOf("="); return [line.slice(0, at), line.slice(at + 1)];
     }));

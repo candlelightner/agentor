@@ -4,6 +4,16 @@ set -euo pipefail
 # directories are prepared on the host; only private worker storage is ours.
 mountpoint -q /workspace
 mountpoint -q /home/agent/.agent-data
+# Restored numeric ownership/capabilities are canonical data. Only the control
+# plane's tmpfs marker selects this mode; never consume worker runtime env.
+ownership_marker=/run/agentor/preserve-storage-ownership
+if [ -e "$ownership_marker" ] || [ -L "$ownership_marker" ]; then
+    test -f "$ownership_marker"
+    test ! -L "$ownership_marker"
+    test "$(stat -c '%u:%g:%a:%h:%s' "$ownership_marker")" = '0:0:600:1:38'
+    test "$(cat "$ownership_marker")" = agentor-preserve-storage-ownership-v1
+    exit 0
+fi
 prune=( -path /home/agent/.agent-data/.kilo/config
         -o -path /home/agent/.agent-data/.kilo/shared-data
         -o -path /home/agent/.agent-data/.claude/.credentials.json

@@ -5627,7 +5627,19 @@ for p in sys.argv[1:]:
       this.workerStore?.get(userId, id)?.runtimeKind === "incus-vm";
     if (incus) {
       const proof = input.incusCreation;
+      const marker = this.workerStore?.get(userId, id)?.incusRecreation;
       if (proof?.attempted === false) {
+        if (marker?.importIncomplete) {
+          if (!proof.nonce || proof.nonce !== marker.nonce || marker.replacementIncarnation)
+            throw Object.assign(new Error('Incomplete import no-create proof does not match retained recovery authority'),
+              { code: 'WORKER_CREATE_CONTAINER_RETAINED' });
+          // Partial restore data is not a bootable archived worker. Keep all
+          // canonical state/config for the existing explicit deletion path.
+          await this.workerStore!.transitionIncusRecreation(userId, id,
+            { status: 'archived', desiredRuntimeStatus: 'stopped', incusRecreation: undefined }, undefined, marker);
+          this.containers.delete(id);
+          return;
+        }
         // No Incus request was attempted: clean only provisional app metadata.
         // Never inspect/delete compute or storage by the freshly-minted name.
         await cleanupWorkerMappings(containerName);
@@ -5636,7 +5648,6 @@ for p in sys.argv[1:]:
         this.containers.delete(id);
         return;
       }
-      const marker = this.workerStore?.get(userId, id)?.incusRecreation;
       if (!proof?.incarnation || !proof.nonce || !marker || marker.nonce !== proof.nonce ||
           marker.originalIncarnation || (marker.replacementIncarnation && marker.replacementIncarnation !== proof.incarnation)) {
         const current = this.containers.get(id); if (current) current.status = 'error';
@@ -5645,7 +5656,8 @@ for p in sys.argv[1:]:
       }
       try {
         await this.incusRuntime.rollbackRecreation({ id, userId, containerName },
-          { nonce: proof.nonce, replacementIncarnation: proof.incarnation, initialCreate: marker.initialCreate });
+          { nonce: proof.nonce, replacementIncarnation: proof.incarnation, initialCreate: marker.initialCreate,
+            ...(marker.importIncomplete ? { importIncomplete: true as const } : {}) });
         await this.workerStore!.transitionIncusRecreation(userId, id,
           { status: 'archived', desiredRuntimeStatus: 'stopped', incusRecreation: undefined }, undefined, marker);
         this.containers.delete(id);
@@ -5654,8 +5666,9 @@ for p in sys.argv[1:]:
         throw Object.assign(new Error('Incus creation rollback retained recovery metadata and all persistence'),
           { code: 'WORKER_CREATE_ROLLBACK_INCOMPLETE', cause });
       }
-      // Fresh worker persistence/config remain available for explicit unarchive;
-      // failure cleanup never destroys canonical data or silently retries boot.
+      // Ordinary fresh worker data remains available for explicit unarchive;
+      // incomplete imports instead retain deletion-pending private state.
+      // Failure cleanup never destroys canonical data or silently retries boot.
       return;
     }
     try {
@@ -6031,6 +6044,8 @@ for p in sys.argv[1:]:
           await this.assertIncusPersistenceReady(record);
           const result = await this.incusRuntime.rollbackRecreation({ id: record.id, userId: record.userId,
             containerName: this.buildContainerName(record.id) }, marker);
+          if (marker.importIncomplete && result.status !== 'archived')
+            throw new Error('Incomplete initial import rollback cannot recover active compute');
           const resolved = await this.workerStore!.transitionIncusRecreation(record.userId, record.id,
             { status: result.status, desiredRuntimeStatus: 'stopped', incusRecreation: undefined }, undefined, marker);
           const current = this.get(record.id);

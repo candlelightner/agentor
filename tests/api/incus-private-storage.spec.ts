@@ -33,6 +33,7 @@ test("private ownership repair prunes every account overlay and does not follow 
     await writeFile(join(commands, "mountpoint"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     await writeFile(join(commands, "chown"), '#!/bin/sh\nprintf "%s\\n" "$@" >> "$AGENTOR_OWNERSHIP_LOG"\n', { mode: 0o755 });
     const script = (await readFile("../worker/vm/agentor-private-storage.sh", "utf-8"))
+      .replaceAll('/run/agentor/preserve-storage-ownership', join(root, 'ownership-marker'))
       .replaceAll("/home/agent/.agent-data", agents).replaceAll("/workspace", workspace)
       .replaceAll('/proc/self/mountinfo', mountinfo)
       // Select fixture-owned files without changing their real ownership.
@@ -45,5 +46,34 @@ test("private ownership repair prunes every account overlay and does not follow 
     expect(repaired.some(path => path.startsWith(hostShare))).toBe(false);
     expect(repaired).toContain(join(agents, "private-symlink"));
     for (const overlay of overlays) expect(repaired.some((path) => path.startsWith(join(agents, overlay)))).toBe(false);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('ownership preservation requires exact trusted marker metadata and never falls back to repairing invalid markers', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agentor-preserve-ownership-'));
+  try {
+    const workspace = join(root, 'workspace'), agents = join(root, 'agents'), commands = join(root, 'commands');
+    const marker = join(root, 'marker'), log = join(root, 'chown-log');
+    await mkdir(workspace); await mkdir(agents); await mkdir(commands);
+    await writeFile(join(workspace, 'data'), 'private');
+    await writeFile(join(commands, 'mountpoint'), '#!/bin/sh\nexit "${MOUNTPOINT_EXIT:-0}"\n', { mode: 0o755 });
+    await writeFile(join(commands, 'stat'), '#!/bin/sh\nprintf "%s\\n" "$MARKER_STAT"\n', { mode: 0o755 });
+    await writeFile(join(commands, 'chown'), '#!/bin/sh\nprintf "%s\\n" "$@" >> "$OWNERSHIP_LOG"\n', { mode: 0o755 });
+    const script = (await readFile('../worker/vm/agentor-private-storage.sh', 'utf8'))
+      .replaceAll('/home/agent/.agent-data', agents).replaceAll('/workspace', workspace)
+      .replaceAll('/run/agentor/preserve-storage-ownership', marker);
+    const run = (extra: Record<string, string> = {}) => execFileSync('bash', ['-c', script], {
+      env: { ...process.env, PATH: commands + ':' + process.env.PATH, MARKER_STAT: '0:0:600:1:38', OWNERSHIP_LOG: log, ...extra },
+      stdio: 'pipe',
+    });
+    await writeFile(marker, 'agentor-preserve-storage-ownership-v1\n');
+    run(); await expect(readFile(log)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(() => run({ MOUNTPOINT_EXIT: '1' })).toThrow();
+    for (const MARKER_STAT of ['1000:0:600:1:38', '0:1000:600:1:38', '0:0:644:1:38', '0:0:600:2:38', '0:0:600:1:37'])
+      expect(() => run({ MARKER_STAT })).toThrow();
+    await writeFile(marker, 'invalid-preservation-configuration\n'); expect(() => run()).toThrow();
+    await rm(marker); await symlink(join(workspace, 'data'), marker); expect(() => run()).toThrow();
+    await rm(marker); await mkdir(marker); expect(() => run()).toThrow();
+    await expect(readFile(log)).rejects.toMatchObject({ code: 'ENOENT' });
   } finally { await rm(root, { recursive: true, force: true }); }
 });

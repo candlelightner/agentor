@@ -37,7 +37,10 @@ export interface WorkerRecord extends UserOwnedResource {
   deletionPending?: boolean;
   /** Bounded Incus compute-replacement recovery marker, not portable image or
    * storage authority. Unfinished replacements stay inaccessible until resolved. */
-  incusRecreation?: { nonce: string; originalIncarnation?: string; replacementIncarnation?: string; initialCreate?: true };
+  incusRecreation?: { nonce: string; originalIncarnation?: string; replacementIncarnation?: string; initialCreate?: true;
+    /** Initial restore bytes are not yet authoritative; rollback must fence
+     * partial data for deletion, never make it an ordinary archived worker. */
+    importIncomplete?: true };
   /** Foreign key to the assigned environment — the only environment data stored
    * on the worker. The environment's config (CPU/memory/network/docker/setup
    * script/env vars/exposed APIs/capabilities/instructions) lives in the
@@ -76,7 +79,7 @@ export interface WorkerRecord extends UserOwnedResource {
 
 export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
   constructor(dataDir: string) {
-    super(dataDir, "workers.json", (w) => w.id);
+    super(dataDir, "workers.json", (w) => { assertImportIncompleteMarker(w); return w.id; });
   }
 
   override get(userId: string, key: string): WorkerRecord | undefined {
@@ -138,6 +141,7 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
       ...worker,
       runtimeKind: normalizeWorkerRuntimeKind(worker.runtimeKind),
     };
+    assertImportIncompleteMarker(normalized);
     const isNew = !this.has(normalized.userId, normalized.id);
     await this.setItem(normalized.userId, normalized);
     const label = normalized.displayName || normalized.id;
@@ -191,11 +195,16 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
       if (expectedMarker && (previous.incusRecreation?.nonce !== expectedMarker.nonce ||
           previous.incusRecreation.originalIncarnation !== expectedMarker.originalIncarnation ||
           previous.incusRecreation.replacementIncarnation !== expectedMarker.replacementIncarnation ||
-          previous.incusRecreation.initialCreate !== expectedMarker.initialCreate))
+          previous.incusRecreation.initialCreate !== expectedMarker.initialCreate ||
+          previous.incusRecreation.importIncomplete !== expectedMarker.importIncomplete))
         throw new Error('Incus recreation recovery marker changed');
       const completion = pendingAfterCompletion ? { pendingRebuild: await pendingAfterCompletion(),
         hostMountsRevoked: false, hardwareDevicesRevoked: false } : {};
-      const next = { ...previous, ...change, ...completion, updatedAt: new Date().toISOString() };
+      const incompleteRollback = previous.incusRecreation?.importIncomplete === true &&
+        change.status === 'archived' && change.incusRecreation === undefined;
+      const next = { ...previous, ...change, ...completion,
+        ...(incompleteRollback ? { deletionPending: true } : {}), updatedAt: new Date().toISOString() };
+      assertImportIncompleteMarker(next);
       map.set(id, structuredClone(next));
       try { await this.persistUser(userId); }
       catch (error) { map.set(id, previous); throw error; }
@@ -322,4 +331,13 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     }
     useLogger().info(`[worker-store] deleted worker ${userId}/${id}`);
   }
+}
+
+function assertImportIncompleteMarker(record: WorkerRecord): void {
+  const marker = record.incusRecreation;
+  if (marker?.importIncomplete === undefined) return; // Existing records unchanged.
+  if (record.runtimeKind !== 'incus-vm' || marker.importIncomplete !== true ||
+      marker.initialCreate !== true || marker.originalIncarnation !== undefined ||
+      typeof marker.nonce !== 'string' || !marker.nonce || marker.nonce.length > 128)
+    throw new Error('Incomplete Incus import requires an initial-create recovery marker');
 }
