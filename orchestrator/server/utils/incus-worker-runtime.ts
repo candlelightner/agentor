@@ -18,6 +18,7 @@ import { incusManagedNetworkAuthority, incusManagedBridgeIdentity, incusManagedN
   incusManagedNetworkRule } from './incus-managed-network-identity';
 import { ManagedNetworkStore } from './managed-network-store';
 import { isIP } from 'node:net';
+import { incusHostMountLayout, incusHostMountMetadata, assertIncusHostMountLayout } from './incus-host-mount-runtime';
 
 export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & {
   sshAuthorizedKeys?: string;
@@ -25,6 +26,8 @@ export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer
   recreationNonce?: string;
   /** Authoritative internal records, never accepted from worker/user payloads. */
   managedVolumes?: StoredManagedVolume[];
+  /** Initial-create-only, previously validated direct group; never user VM configuration. */
+  hostMountGroupId?: string;
 };
 
 function sameDevice(actual: Record<string, string> | undefined, expected: Record<string, string>): boolean {
@@ -377,8 +380,10 @@ export class IncusWorkerRuntime {
   private validateOptions(opts: IncusWorkerOptions): void {
     // Refuse pending storage features on restart too; never put persistent
     // Docker/account data on disposable rootfs when settings change.
-    if (opts.mounts?.length || opts.hardwareDevices?.length)
-      throw new Error("Incus mounts and hardware require their feature integration");
+    if (opts.hardwareDevices?.length)
+      throw new Error("Incus hardware requires its feature integration");
+    if (opts.mounts?.length && !opts.storageManager?.dataHostPath)
+      throw new Error('Incus host mounts require authoritative platform storage');
     if (opts.credentialBinds?.length && !opts.storageManager)
       throw new Error("Incus account shares require authoritative platform storage");
     if (opts.dockerEnabled !== undefined && opts.dockerEnabled !== opts.environmentJson.dockerEnabled)
@@ -461,6 +466,7 @@ export class IncusWorkerRuntime {
     if (!source) throw new Error('Incus worker image source is missing; preserve the original source before compute removal');
     const fingerprint = await this.resolveStoredImage(source);
     await this.accountDevices(opts);
+    await incusHostMountLayout(this.config, opts, 'reconstruct-preflight');
     return { fingerprint, ...await storage.verifyExisting(opts, dockerRequired) };
   }
 
@@ -590,6 +596,7 @@ export class IncusWorkerRuntime {
     const identity = incusImageIdentity(await this.client.getImage(fingerprint));
     if (source && !sameIncusImageSource(source, identity)) throw new Error('Incus reconstruction image source changed');
     const account = await this.accountDevices(opts);
+    const hostMounts = await incusHostMountLayout(this.config, opts, 'ensure');
     const persistent = await storage.devices(opts, opts.environmentJson.dockerEnabled,
       existing && { docker: existing.docker });
     await storage.recordImageIdentity(opts, identity);
@@ -601,6 +608,7 @@ export class IncusWorkerRuntime {
         "user.agentor.owner": opts.userId,
         "user.agentor.installation": await this.installationId(),
         "user.agentor.runtime-generation": "1",
+        ...incusHostMountMetadata(hostMounts),
         ...(opts.recreationNonce ? { 'user.agentor.recreation': opts.recreationNonce } : {}),
         "security.secureboot": "false",
         "boot.autostart": "false",
@@ -611,6 +619,7 @@ export class IncusWorkerRuntime {
         ...persistent,
         ...account,
         ...await this.managedDevices(opts),
+        ...hostMounts.devices,
         root: { type: "disk", path: "/", pool: this.config.incusStoragePool },
         eth0: { type: "nic", name: "eth0", network: this.config.incusNetwork,
           "security.mac_filtering": "true", "security.ipv4_filtering": "true", "security.ipv6_filtering": "true" },
@@ -656,6 +665,8 @@ export class IncusWorkerRuntime {
     if (instance.config['user.agentor.owner'] !== opts.userId)
       throw new Error('Incus worker account identity does not match');
     const state = await this.client.getInstanceState(name);
+    const hostMounts = await incusHostMountLayout(this.config, opts, 'inspect', undefined, instance);
+    assertIncusHostMountLayout(instance, hostMounts);
     const account = await this.accountDevices(opts);
     const managed = await this.managedDevices(opts);
     for (const [key, expected] of Object.entries(managed)) {
@@ -691,8 +702,19 @@ export class IncusWorkerRuntime {
     if (!ready) throw new Error("Incus worker agent did not become ready");
     try {
       await this.checkedExec(name, ["bash", "-ec", 'test "$(cat /usr/lib/agentor/bootstrap-generation)" = 3; mountpoint -q /workspace; mountpoint -q /home/agent/.agent-data']);
+      // Bootstrap-generation3 images predating Host Mount integration used
+      // -xdev alone, which still chowns nested mount roots. Refuse that image
+      // before any ownership-repair service executes; never patch guest code.
+      if (Object.keys(hostMounts.devices).length) {
+        const supported = await this.client.exec(name, ['grep', '-Fq', '--', 'prune+=( -o -path "$literal" )',
+          '/usr/lib/agentor/agentor-private-storage.sh']);
+        if (supported.returnCode !== 0)
+          throw new Error('Derived image predates safe host-mount ownership repair; rebuild the configured worker OCI image before starting');
+      }
       for (const v of opts.managedVolumes ?? [])
         await this.checkedExec(name, ['timeout', '15', 'mountpoint', '-q', '--', v.target]);
+      for (const device of Object.values(hostMounts.devices))
+        await this.checkedExec(name, ['timeout', '15', 'mountpoint', '-q', '--', device.path!]);
       await this.checkedExec(name, ["systemctl", "stop", "agentor-worker.service"]);
       await this.reprovisionManagedNetworks(opts, instance.config['volatile.uuid']!);
       if (Object.keys(account).length) {

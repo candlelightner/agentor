@@ -260,13 +260,14 @@ export async function stopWorkerContainerIdempotently(
   info: ContainerInfo,
   stop: () => Promise<void>,
   attemptUncertain = false,
+  verifyStopped = false,
 ): Promise<void> {
   // Lifecycle retries may be in an error/removing/archive transition after a
   // successful stop. Archive/rebuild therefore stop only a known-running
   // container, while an explicit Stop request may make one bounded attempt
   // against an unknown/starting/recovering runtime.
   if (info.status !== "running" && !attemptUncertain) return;
-  if (info.status === "stopped") return;
+  if (info.status === "stopped" && !verifyStopped) return;
   try {
     await stop();
   } catch (error) {
@@ -1721,6 +1722,7 @@ export class ContainerManager {
         hardwareDevices,
         dockerEnabled,
         credentialBinds,
+        hostMountGroupId: request.targetWorkerGroupId,
         environmentJson: envConfig.environmentJson,
         capabilitiesJson: envConfig.capabilitiesJson,
         instructionsJson: envConfig.instructionsJson,
@@ -2656,7 +2658,7 @@ for p in sys.argv[1:]:
     }
   }
 
-  private async stopUnlocked(id: string): Promise<void> {
+  private async stopUnlocked(id: string, verifyRevokedIncus = false): Promise<void> {
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
@@ -2675,6 +2677,7 @@ for p in sys.argv[1:]:
           ? this.incusRuntime.stop(info, incarnation)
           : this.dockerService.stopContainer(info.containerId),
         true,
+        verifyRevokedIncus && info.runtimeKind === 'incus-vm',
       );
       // A list refresh may otherwise reuse the pre-stop task observation for
       // up to five seconds and overwrite the accurate in-memory `stopped`
@@ -3008,9 +3011,14 @@ for p in sys.argv[1:]:
           next,
           revoked,
         );
-        if (!revoked || live.status !== "running") return;
+        if (!revoked) return;
+        const native = live.runtimeKind === 'incus-vm' && record.status === 'active';
+        if (!native && live.status !== 'running') return;
+        // A stale cache is not evidence that a guest has lost revoked access.
+        // Keep stopped intent even if settled-storage fencing defers shutdown.
+        if (native) await this.workerStore!.setDesiredRuntimeStatus(record.userId, record.id, 'stopped');
         try {
-          await this.stopUnlocked(live.id);
+          await this.stopUnlocked(live.id, native);
           result.stoppedWorkerIds.push(live.id);
         } catch (error) {
           result.failures.push({
@@ -4182,7 +4190,7 @@ for p in sys.argv[1:]:
       marker.replacementIncarnation = incarnation;
       await this.workerStore.transitionIncusRecreation(info.userId, info.id,
         { status: 'active', desiredRuntimeStatus: 'stopped', incusRecreation: marker });
-      await this.incusRuntime.start(options, incarnation);
+      await this.incusRuntime.start({ ...options, recreationNonce: marker.nonce }, incarnation);
       await (await import('./managed-volume-manager')).useManagedVolumeManager().markDeclared(info.userId, info.id, info.containerId);
       if (!applied) await useWorkerConfigStore().markApplied(info.userId, info.id,
         this.appliedIncusBootstrap(options, info), options.configurationRevision);

@@ -40,6 +40,8 @@ export default defineConfig({
     "api/worker-group-network-coordinator.spec.ts",
     "api/host-mount-store.spec.ts",
     "api/incus-host-mount-client.spec.ts",
+    "api/incus-host-mount-runtime.spec.ts",
+    "api/incus-host-mount-live.spec.ts",
     "api/managed-volume-sizing-control.spec.ts",
     "api/managed-volume-sizing-mcp-authority.spec.ts",
     "api/managed-volume-sizing.spec.ts",

@@ -19,6 +19,9 @@ import { IncusWorkerStorage } from '../../orchestrator/server/utils/incus-worker
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volume-store';
 import { IncusManagedVolumeRuntime } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
+import { HostMountStore } from '../../orchestrator/server/utils/host-mount-store';
+import { WorkerGroupStore } from '../../orchestrator/server/utils/worker-group-store';
+import { IncusHostMountClient } from '../../orchestrator/server/utils/incus-host-mount-client';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 (globalThis as any).useLogCollector ??= () => ({ attach: async () => {}, detach() {} });
@@ -112,6 +115,115 @@ function fakeClient() {
   };
   return { client, events };
 }
+
+async function hostMountStartupFixture(hasMount = true) {
+  const dataDir = await mkdtemp(join(tmpdir(), 'agentor-incus-host-startup-'));
+  const scoped = { ...config, dataDir, incusNetworkHostEndpoint: 'https://host-policy.invalid' };
+  const fake = fakeClient(), runtime = new IncusWorkerRuntime(scoped, fake.client as any);
+  const id = randomUUID(), userId = 'host-startup-owner';
+  const opts = { ...options(), id, userId, containerName: `${config.containerPrefix}-${id}` };
+  opts.workerJson = { ...opts.workerJson, id };
+  const workers = new WorkerStore(dataDir); await workers.init();
+  const groups = new WorkerGroupStore(dataDir); await groups.loadUser(userId);
+  const store = new HostMountStore(dataDir, () => '/srv/agentor-startup-data', groups, workers); await store.init();
+  await workers.upsert({ id, userId, runtimeKind: 'incus-vm', status: 'active', displayName: 'startup fixture',
+    createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString() });
+  const path = await store.createPath({ name: 'Startup share', sourcePath: '/srv/approved-startup-share' });
+  await store.setEntitlement(userId, path.id, true);
+  await store.createOwnerGrant(userId, { pathId: path.id, targetType: 'worker', targetId: id });
+  if (hasMount) {
+    opts.mounts = [{ pathId: path.id, source: '/ignored-caller-source', target: '/workspace/approved-share' }];
+    opts.storageManager = { dataHostPath: '/srv/agentor-startup-data' } as StorageManager;
+    // This fixture targets the host ownership-repair guard, not account shares.
+    (runtime as any).accountDevices = async () => ({});
+  }
+  const installation = await backupInstallationId(dataDir);
+  const originalEnsure = IncusHostMountClient.prototype.ensure, originalInspect = IncusHostMountClient.prototype.inspect;
+  for (const operation of ['ensure', 'inspect'] as const) {
+    IncusHostMountClient.prototype[operation] = async mount => {
+      expect(mount).toEqual({ pathId: path.id, source: path.sourcePath, target: '/workspace/approved-share', readOnly: true });
+      fake.events.push({ operation: `host-${operation}`, args: [mount] });
+      return { installation, project: scoped.incusProject, pathId: path.id, sourcePath: path.sourcePath,
+        allowWrite: false, sourceIdentity: 'a'.repeat(64) };
+    };
+  }
+  return { ...fake, runtime, opts, cleanup: async () => {
+    IncusHostMountClient.prototype.ensure = originalEnsure;
+    IncusHostMountClient.prototype.inspect = originalInspect;
+    await rm(dataDir, { recursive: true, force: true });
+  } };
+}
+
+function ownershipGuardEvent(event: { operation: string; args: any[] }): boolean {
+  return event.operation === 'exec' && event.args[1]?.[0] === 'grep' &&
+    event.args[1]?.[3] === 'prune+=( -o -path "$literal" )' &&
+    event.args[1]?.[4] === '/usr/lib/agentor/agentor-private-storage.sh';
+}
+
+test('old host-mount guest image is rejected before ownership repair or worker-service startup', async () => {
+  const f = await hostMountStartupFixture();
+  try {
+    await f.runtime.create({ ...f.opts, start: false });
+    f.events.length = 0;
+    const exec = f.client.exec;
+    f.client.exec = async (...args: any[]) => {
+      const result = await exec(...args);
+      return ownershipGuardEvent({ operation: 'exec', args }) ? { ...result, returnCode: 1 } : result;
+    };
+    await expect(f.runtime.start(f.opts)).rejects.toThrow('rebuild the configured worker OCI image');
+    expect(f.events.filter(ownershipGuardEvent)).toHaveLength(1);
+    expect(f.events.some(event => event.operation === 'exec' && event.args[1]?.[0] === 'systemctl' &&
+      event.args[1]?.[1] === 'start')).toBe(false);
+    expect(f.events.some(event => event.operation === 'exec' && event.args[1]?.[0] === '/usr/lib/agentor/agentor-private-storage.sh')).toBe(false);
+    expect(f.events.some(event => event.operation === 'file')).toBe(false);
+  } finally { await f.cleanup(); }
+});
+
+test('modern host-mount guest guard precedes mount verification, provisioning and ownership-repair service', async () => {
+  const f = await hostMountStartupFixture();
+  try {
+    await f.runtime.create({ ...f.opts, start: false });
+    f.events.length = 0;
+    await f.runtime.start(f.opts);
+    const guard = f.events.findIndex(ownershipGuardEvent);
+    const bootstrap = f.events.findIndex(event => event.operation === 'exec' &&
+      event.args[1]?.[2]?.includes('bootstrap-generation'));
+    const mount = f.events.findIndex(event => event.operation === 'exec' &&
+      JSON.stringify(event.args[1]) === JSON.stringify(['timeout', '15', 'mountpoint', '-q', '--', '/workspace/approved-share']));
+    const stopService = f.events.findIndex(event => event.operation === 'exec' &&
+      JSON.stringify(event.args[1]) === JSON.stringify(['systemctl', 'stop', 'agentor-worker.service']));
+    const marker = f.events.findIndex(event => event.operation === 'file' && event.args[1] === '/run/agentor/provisioned');
+    const startService = f.events.findIndex(event => event.operation === 'exec' &&
+      JSON.stringify(event.args[1]) === JSON.stringify(['systemctl', 'start', 'agentor-worker.service']));
+    expect(bootstrap).toBeGreaterThanOrEqual(0);
+    expect(guard).toBeGreaterThan(bootstrap);
+    expect(mount).toBeGreaterThan(guard);
+    expect(stopService).toBeGreaterThan(mount);
+    expect(marker).toBeGreaterThan(stopService);
+    // The service's ExecStartPre performs ownership repair; no start precedes
+    // the image capability probe and freshly provisioned configuration.
+    expect(startService).toBeGreaterThan(marker);
+    expect(f.events.filter(ownershipGuardEvent)).toHaveLength(1);
+  } finally { await f.cleanup(); }
+});
+
+test('workers without host mounts do not require the new guest ownership-prune signature', async () => {
+  const f = await hostMountStartupFixture(false);
+  try {
+    await f.runtime.create({ ...f.opts, start: false });
+    f.events.length = 0;
+    const exec = f.client.exec;
+    f.client.exec = async (...args: any[]) => {
+      const result = await exec(...args);
+      return ownershipGuardEvent({ operation: 'exec', args }) ? { ...result, returnCode: 1 } : result;
+    };
+    await f.runtime.start(f.opts);
+    expect(f.events.filter(ownershipGuardEvent)).toEqual([]);
+    expect(f.events.some(event => event.operation.startsWith('host-'))).toBe(false);
+    expect(f.events.some(event => event.operation === 'exec' &&
+      JSON.stringify(event.args[1]) === JSON.stringify(['systemctl', 'start', 'agentor-worker.service']))).toBe(true);
+  } finally { await f.cleanup(); }
+});
 
 test("VM creation enforces isolation and provisions files before service start", async () => {
   const { client, events } = fakeClient();
@@ -223,9 +335,9 @@ test("foreign installation is never adopted, started, stopped or deleted", async
   expect(events.some((event) => ["start", "stop", "remove", "file", "exec"].includes(event.operation))).toBe(false);
 });
 
-test("start rejects unsupported persistent capabilities before any mutation", async () => {
+test("start rejects host mounts without platform storage before any mutation", async () => {
   const { client, events } = fakeClient();
-  await expect(new IncusWorkerRuntime(config, client as any).start({ ...options(), mounts: [{}] as any })).rejects.toThrow("feature integration");
+  await expect(new IncusWorkerRuntime(config, client as any).start({ ...options(), mounts: [{}] as any })).rejects.toThrow("authoritative platform storage");
   expect(events).toEqual([]);
 });
 

@@ -4,10 +4,27 @@ set -euo pipefail
 # directories are prepared on the host; only private worker storage is ours.
 mountpoint -q /workspace
 mountpoint -q /home/agent/.agent-data
+prune=( -path /home/agent/.agent-data/.kilo/config
+        -o -path /home/agent/.agent-data/.kilo/shared-data
+        -o -path /home/agent/.agent-data/.claude/.credentials.json
+        -o -path /home/agent/.agent-data/.codex/auth.json
+        -o -path /home/agent/.agent-data/.gemini/oauth_creds.json )
+# -xdev prevents descent but still evaluates the mounted directory itself.
+# Repairing that inode would chown an authorized host share's root. Capture
+# nested mountpoints once from the kernel; never spawn a probe for every file.
+while read -r _ _ _ _ target _; do
+    printf -v target '%b' "$target"
+    case "$target" in
+        /workspace/*|/home/agent/.agent-data/*)
+            # find -path uses glob syntax; keep kernel paths literal, including
+            # spaces and metacharacters in legitimate approved mount targets.
+            literal=${target//\\/\\\\}
+            literal=${literal//\*/\\*}
+            literal=${literal//\?/\\?}
+            literal=${literal//\[/\\[}
+            prune+=( -o -path "$literal" );;
+    esac
+done < /proc/self/mountinfo
 find /workspace /home/agent/.agent-data -xdev \
-    \( -path /home/agent/.agent-data/.kilo/config \
-       -o -path /home/agent/.agent-data/.kilo/shared-data \
-       -o -path /home/agent/.agent-data/.claude/.credentials.json \
-       -o -path /home/agent/.agent-data/.codex/auth.json \
-       -o -path /home/agent/.agent-data/.gemini/oauth_creds.json \) -prune \
+    \( "${prune[@]}" \) -prune \
     -o \( ! -uid 1000 -o ! -gid 1000 \) -exec chown -h agent:agent {} +

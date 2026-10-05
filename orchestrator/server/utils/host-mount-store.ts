@@ -132,6 +132,12 @@ export class HostMountStore extends UserScopedJsonStore<string, HostMountGrant> 
     await Promise.all([super.init(), this.loadCatalog()]);
   }
 
+  /** Read-only fresh authority for one runtime operation. Do not quarantine or
+   * scan unrelated owners just to validate this worker's host exports. */
+  async loadAuthority(userId: string) {
+    await Promise.all([this.loadUser(userId), this.loadCatalog()]);
+  }
+
   listCatalog() {
     this.assertCatalogAvailable();
     return [...this.catalog.values()]

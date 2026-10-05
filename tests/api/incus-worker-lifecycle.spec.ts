@@ -110,6 +110,24 @@ test('uncached host-mount revocation fences active Incus compute durably without
   });
 });
 
+test('revoked Incus access verifies captured shutdown even when cached worker status is stopped', async () => {
+  for (const status of ['stopped', 'unknown', 'running'] as const) await fixture(async (manager, store, calls, info) => {
+    info.status = status;
+    const mount = { pathId: randomUUID(), source: '/srv/unapproved-fixture', target: '/mnt/fixture', readOnly: true };
+    info.mounts = [mount];
+    await store.upsert({ ...store.get(info.userId, info.id)!, mounts: [mount] });
+    (manager as any).incusRuntime.stop = async (owner: any, uuid: string) => {
+      expect(owner.id).toBe(info.id); expect(uuid).toBe('original-uuid');
+      expect(store.get(info.userId, info.id)).toMatchObject({ hostMountsRevoked: true, desiredRuntimeStatus: 'stopped' });
+      calls.push('verified-native-stop');
+    };
+    const result = await manager.reconcileHostMountAccess(info.userId);
+    expect(calls).toEqual(['verified-native-stop']);
+    expect(result.stoppedWorkerIds).toEqual([info.id]); expect(result.failures).toEqual([]);
+    expect(info.status).toBe('stopped');
+  });
+});
+
 test('failed Incus deletion withdraws running intent before shutdown and never resurrects late-stopped compute', async () => {
   await fixture(async (manager, store, calls, info) => {
     const runtime = (manager as any).incusRuntime;
