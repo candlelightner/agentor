@@ -22,6 +22,7 @@ import { authorizeManagedNetworkMutation } from '../../orchestrator/server/utils
 import { withOwnerWorkerLifecycleMutation } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
+(globalThis as any).useLogCollector ??= () => ({ attach: async () => {}, detach() {} });
 
 const Docker = createRequire(new URL('../../orchestrator/package.json', import.meta.url))('dockerode');
 
@@ -91,7 +92,8 @@ test('missing endpoint or installation never silently uses Docker or manufacture
 
 test('real TypeScript client uses pinned mTLS for owned native host bridge lifecycle', async () => {
   test.skip(process.env.INCUS_NETWORK_HOST_TEST !== 'true', 'Explicit serial disposable host service gate');
-  test.setTimeout(420_000);
+  const running = process.env.INCUS_NETWORK_RUNNING_TEST === 'true';
+  test.setTimeout(running ? 720_000 : 420_000);
   const run = promisify(execFile);
   const access = ['-i', '/workspace/agentor-kata-vm-access.ZgLVo9uk/id_ed25519',
     '-o', 'UserKnownHostsFile=/workspace/agentor-kata-vm-access.ZgLVo9uk/known_hosts',
@@ -118,6 +120,9 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
   let adapterSubmitted = false, adapterReady = false, adapterBridge: IncusManagedBridge | undefined;
   let peerRuntime: IncusWorkerRuntime | undefined, peerOwner: { id: string; userId: string; containerName: string } | undefined;
   let peerIncarnation: string | undefined, peerCreateSubmitted = false;
+  let legacyPeer: any, legacyPeerId: string | undefined;
+  let legacySubmitted = false, legacyBackingSubmitted = false, legacyBridgeId: string | undefined;
+  const docker = new Docker({ socketPath: dockerSocket });
   const config = { dataDir, incusProject: 'agentor', incusNetwork: 'incusbr0',
     incusNetworkHostEndpoint: 'https://127.0.0.1:18444',
     incusClientCertPath: '/workspace/agentor-incus-tls/client.crt',
@@ -143,7 +148,7 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
     await copy([config.incusClientCertPath], `${remoteDir}/client.crt`);
     expect(await root(`sudo systemctl show '${unit}' --property=LoadState --value`)).toBe('not-found');
     submitted = true;
-    await root(`sudo systemd-run --no-block --collect --unit='${unit}' --property=RuntimeMaxSec=390 --property=TimeoutStopSec=10 /usr/bin/python3 '${remoteDir}/scripts/agentor-incus-network-service.py' --data-dir '${remoteDir}/data' --installation '${installation}' --project agentor --primary incusbr0 --bind 127.0.0.1 --port 18444 --server-cert /var/lib/incus/server.crt --server-key /var/lib/incus/server.key --client-cert '${remoteDir}/client.crt'`);
+    await root(`sudo systemd-run --no-block --collect --unit='${unit}' --property=RuntimeMaxSec=${running ? 690 : 390} --property=TimeoutStopSec=10 /usr/bin/python3 '${remoteDir}/scripts/agentor-incus-network-service.py' --data-dir '${remoteDir}/data' --installation '${installation}' --project agentor --primary incusbr0 --bind 127.0.0.1 --port 18444 --server-cert /var/lib/incus/server.crt --server-key /var/lib/incus/server.key --client-cert '${remoteDir}/client.crt'`);
     let tunnelExit: number | null | undefined, tunnelError = '';
     tunnel = spawn('ssh', ['-N', '-p', '22375', ...access, '-o', 'ExitOnForwardFailure=yes',
       '-L', '127.0.0.1:18444:127.0.0.1:18444', '-L', `${dockerSocket}:/var/run/docker.sock`, destination],
@@ -183,19 +188,46 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
     await store.update(network.userId, network.id, { workerIds: [peerId] });
     peerRuntime = new IncusWorkerRuntime(peerConfig);
     peerCreateSubmitted = true;
-    const peer = await peerRuntime.create({ ...peerOwner, start: false, dockerEnabled: false, userEnv: zeroUserEnvVars(network.userId),
+    const peerOptions = { ...peerOwner, start: running, dockerEnabled: false, userEnv: zeroUserEnvVars(network.userId),
       environmentJson: { networkMode: 'full', allowedDomains: [], dockerEnabled: false, setupScript: '', envVars: '', exposeApis: {} },
-      capabilitiesJson: [], instructionsJson: [], workerJson: { id: peerId, displayName: 'native reference gate', repos: [], initScript: '', gitName: '', gitEmail: '' } });
+      capabilitiesJson: [], instructionsJson: [], workerJson: { id: peerId, displayName: 'native reference gate', repos: [], initScript: '', gitName: '', gitEmail: '' } };
+    const peer = await peerRuntime.create(peerOptions);
     peerIncarnation = peer.config['volatile.uuid']; expect(peerIncarnation).toBeTruthy();
-    await workers.upsert({ id: peerId, userId: network.userId, status: 'active', runtimeKind: 'incus-vm', displayName: 'native reference gate' } as any);
+    await workers.upsert({ id: peerId, userId: network.userId, status: 'active', desiredRuntimeStatus: running ? 'running' : 'stopped',
+      runtimeKind: 'incus-vm', displayName: 'native reference gate' } as any);
     const peerManager = new ContainerManager({} as any, peerConfig);
     peerManager.setWorkerStore(workers); peerManager.setIncusRuntime(peerRuntime);
-    peerManager.registerExternal({ ...peerOwner, containerId: `incus:${peerIncarnation}`, runtimeKind: 'incus-vm', status: 'stopped' } as any);
+    peerManager.registerExternal({ ...peerOwner, containerId: `incus:${peerIncarnation}`, runtimeKind: 'incus-vm', status: running ? 'running' : 'stopped' } as any);
     (peerManager as any).assertOwnerExists = async (userId: string) => expect(userId).toBe(network.userId);
     observedManager = peerManager;
+    if (running) {
+      // A minimal real legacy compute peer exercises the existing manager's
+      // connect-new/verify/disconnect-old path, not manual shared-bridge wiring.
+      legacyPeerId = randomUUID();
+      const legacyName = `agentor-worker-${legacyPeerId}`;
+      legacyBackingSubmitted = true;
+      legacyBridgeId = (await (actual as any).ensure(network)).Id;
+      legacySubmitted = true;
+      legacyPeer = await docker.createContainer({ name: legacyName, Image: 'agentor-phase7-orchestrator:bounded',
+        Entrypoint: ['node'], Cmd: ['-e', 'require("http").createServer((q,r)=>r.end("mixed-manager-ok")).listen(18181,"0.0.0.0")'],
+        Labels: { 'agentor.network-running-fixture': network.id },
+        NetworkingConfig: { EndpointsConfig: { [network.dockerName]: { Aliases: ['retained-peer'] } } } });
+      await legacyPeer.start();
+      await workers.upsert({ id: legacyPeerId, userId: network.userId, status: 'active', runtimeKind: 'legacy-docker', displayName: 'mixed peer' } as any);
+      peerManager.registerExternal({ id: legacyPeerId, userId: network.userId, containerName: legacyName,
+        containerId: legacyPeer.id, runtimeKind: 'legacy-docker', status: 'running' } as any);
+      await store.update(network.userId, network.id, { workerIds: [peerId, legacyPeerId] });
+    }
     const savedNetwork = store.get(network.userId, network.id)!;
-    const peerCoverage = new Set([peerId]);
+    const peerCoverage = new Set([peerId, ...(legacyPeerId ? [legacyPeerId] : [])]);
     expect((await actual.reconcile(savedNetwork, undefined, peerCoverage)).partialFailures).toEqual([]);
+    if (running) {
+      const adapted = (await legacyPeer.inspect()).NetworkSettings.Networks;
+      expect(adapted[network.dockerName]).toBeUndefined();
+      expect(adapted[`${network.dockerName}-incus`].Aliases).toContain('retained-peer');
+      expect((await docker.getNetwork(network.dockerName).inspect()).Containers).toEqual({});
+      console.info('Production mixed bridge adaptation preserved aliases and original empty bridge');
+    }
     (peerManager as any).managedNetworks = actual;
     const localHook = () => withOwnerWorkerLifecycleMutation(network.userId, peerId, () =>
       (peerManager as any).reconcileManagedNetworksForWorker(peerManager.get(peerId)!));
@@ -203,30 +235,92 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
     await localHook(); // own guarded native leaf, no queue reentry or unnecessary PUT
     expect((await peerRuntime.client.getInstance(peerOwner.containerName)).devices).toEqual(attachedDevices);
     expect((await host.inspect(network))!.references).toContain(`/1.0/instances/${peerOwner.containerName}?project=agentor`);
-    expect(await actual.actualWorkerIds(network)).toEqual([peerId]);
+    expect(await actual.actualWorkerIds(network)).toEqual([...peerCoverage].sort());
     const beforeDenied = await peerRuntime.client.getInstance(peerOwner.containerName);
     const coverage = await authorizeManagedNetworkMutation([network], [], undefined, {
       actualWorkerIds: value => actual.actualWorkerIds(value),
-      verify: async ids => expect([...ids]).toEqual([peerId]),
+      verify: async ids => expect([...ids].sort()).toEqual([...peerCoverage].sort()),
     });
-    expect([...coverage]).toEqual([peerId]);
+    expect([...coverage].sort()).toEqual([...peerCoverage].sort());
     await expect(actual.reconcile(network, [], new Set())).rejects.toThrow('uncovered worker');
     await expect(actual.remove(network, new Set())).rejects.toThrow('uncovered worker');
     expect((await peerRuntime.client.getInstance(peerOwner.containerName)).devices).toEqual(beforeDenied.devices);
-    await expect(new Docker({ socketPath: dockerSocket }).getNetwork(legacyName).inspect())
+    if (!running) await expect(new Docker({ socketPath: dockerSocket }).getNetwork(legacyName).inspect())
       .rejects.toMatchObject({ statusCode: 404 });
     observedManager = { list: () => [] }; // orphaned cache must not hide a real native attachment
-    await expect(actual.actualWorkerIds(network)).rejects.toThrow('unmapped');
+    await expect(actual.actualWorkerIds(network)).rejects.toThrow(/unmapped|Docker endpoint/);
     observedManager = peerManager;
     expect((await actual.reconcile(savedNetwork, [], peerCoverage)).partialFailures).toEqual([]);
     expect(await actual.actualWorkerIds(network)).toEqual([]);
     await localHook(); // lifecycle restores only the desired captured worker
     expect(await actual.actualWorkerIds(network)).toEqual([peerId]);
+    if (running) {
+      const runtime = peerRuntime, info = peerManager.get(peerId)!;
+      // Minimal synthetic owner has no account/environment DB. Only fixture
+      // options resolution is supplied; recovery, native exec/provisioning,
+      // stores, queue admission and membership dispatch are production paths.
+      (peerManager as any).incusOptionsForWorker = async () => peerOptions;
+      const checked = async (command: string[]) => {
+        const result = await runtime.client.exec(info.containerName, command);
+        expect(result.returnCode, result.stdout + result.stderr).toBe(0); return result.stdout.trim();
+      };
+      const healthy = await runtime.inspectGuestReadiness(info, peerIncarnation!);
+      expect(healthy.provisioned && healthy.serviceReady).toBe(true);
+      const pid = await checked(['systemctl', 'show', '--property=MainPID', '--value', 'agentor-worker.service']);
+      expect(Number(pid)).toBeGreaterThan(0);
+      const primary = await runtime.resolvePrimaryAddress(info);
+      const routes = await checked(['ip', '-j', 'route', 'show', 'default']);
+      const resolver = await checked(['resolvectl', 'dns', 'eth0']);
+      await peerManager.setIncusManagedNetwork(peerId, network.id, false);
+      await peerManager.reconcileIncusWorkers();
+      expect((await peerManager.inspectIncusManagedNetwork(peerId, network.id)).attached).toBe(true);
+      expect((await runtime.inspectGuestReadiness(info, peerIncarnation!)).bootId).toBe(healthy.bootId);
+      expect(await checked(['systemctl', 'show', '--property=MainPID', '--value', 'agentor-worker.service'])).toBe(pid);
+      expect((await actual.reconcile(savedNetwork, undefined, peerCoverage)).partialFailures).toEqual([]);
+      const endpoints = (await legacyPeer.inspect()).NetworkSettings.Networks;
+      expect(endpoints[network.dockerName]).toBeUndefined();
+      expect((await docker.getNetwork(network.dockerName).inspect()).Containers).toEqual({});
+      const mixedTraffic = async () => {
+        await expect.poll(async () => (await runtime.client.exec(info.containerName,
+          ['curl', '--fail', '--max-time', '3', `http://${endpoints[`${network.dockerName}-incus`].IPAddress}:18181/`])).stdout.trim(),
+          { timeout: 60_000, intervals: [500, 1000] }).toBe('mixed-manager-ok');
+        const vm = await peerManager.inspectIncusManagedNetwork(peerId, network.id);
+        expect(vm.ipv4Address).toBeTruthy();
+        const result = await root(`sudo docker exec '${(await legacyPeer.inspect()).Name.slice(1)}' node -e 'require("http").get("http://${vm.ipv4Address}:8443/",r=>{if(r.statusCode>=500)process.exit(1);r.resume();r.on("end",()=>console.log("vm-editor-ok"))}).on("error",()=>process.exit(1))'`);
+        expect(result).toBe('vm-editor-ok');
+      };
+      await mixedTraffic();
+      expect(await checked(['ip', '-j', 'route', 'show', 'default'])).toBe(routes);
+      expect(await checked(['resolvectl', 'dns', 'eth0'])).toBe(resolver);
+      expect(await runtime.resolvePrimaryAddress(info)).toEqual(primary);
+      await runtime.client.exec(info.containerName, ['sh', '-c', 'nohup sh -c "sleep 1; reboot" >/dev/null 2>&1 &']);
+      await expect.poll(async () => {
+        try { const state = await runtime.inspectGuestReadiness(info, peerIncarnation!);
+          return state.bootId !== healthy.bootId && !state.provisioned;
+        } catch { return false; }
+      }, { timeout: 120_000, intervals: [1000, 2000] }).toBe(true);
+      await peerManager.reconcileIncusWorkers();
+      const recovered = await runtime.inspectGuestReadiness(info, peerIncarnation!);
+      expect(recovered).toMatchObject({ provisioned: true, serviceReady: true });
+      expect(recovered.bootId).not.toBe(healthy.bootId);
+      await mixedTraffic();
+      expect(await checked(['ip', '-j', 'route', 'show', 'default'])).toBe(routes);
+      expect(await checked(['resolvectl', 'dns', 'eth0'])).toBe(resolver);
+      expect(await runtime.resolvePrimaryAddress(info)).toEqual(primary);
+      console.info('Running production-manager mixed traffic, aliases, healthy network-only repair and guest reboot recovery passed');
+    }
     await store.update(network.userId, network.id, { workerIds: [] });
     await localHook(); // revoked membership is detached, never blessed by cache
-    expect(await actual.actualWorkerIds(network)).toEqual([]);
+    expect(await actual.actualWorkerIds(network)).toEqual(legacyPeerId ? [legacyPeerId] : []);
+    expect((await actual.reconcile(savedNetwork, [], peerCoverage)).partialFailures).toEqual([]);
     await peerRuntime.remove(peerOwner, peerIncarnation!); await peerRuntime.removeStorage(peerOwner);
     peerRuntime.client.dispose(); peerCreateSubmitted = false; peerIncarnation = undefined;
+    if (legacyPeer) {
+      const state = await legacyPeer.inspect();
+      expect(state.Id).toBe(legacyPeer.id);
+      expect(state.Config.Labels['agentor.network-running-fixture']).toBe(network.id);
+      await legacyPeer.remove({ force: true }); legacyPeer = undefined; legacySubmitted = false;
+    }
     const native = JSON.parse(await root(`sudo incus query /1.0/networks/${expectedName}`));
     expect(native).toMatchObject({ name: expectedName, type: 'bridge', managed: true, used_by: [], config: {
       'user.agentor.installation': installation, 'user.agentor.owner': network.userId, 'user.agentor.network-id': network.id } });
@@ -237,7 +331,7 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
     await expect(new IncusManagedNetworkHost({ ...config, incusProject: 'foreign' }).readiness()).rejects.toThrow();
     const absentId = randomUUID();
     await expect(host.ensure({ ...network, id: absentId, dockerName: `agentor-managed-${absentId}` })).rejects.toThrow();
-    await actual.remove(savedNetwork, peerCoverage); adapterSubmitted = false; ensureSubmitted = false;
+    await actual.remove(savedNetwork, peerCoverage); adapterSubmitted = false; ensureSubmitted = false; legacyBackingSubmitted = false;
     expect(await host.inspect(network)).toBe(null);
     await host.remove(network);
     await host.remove(network);
@@ -251,6 +345,25 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
           throw new Error('Unsettled native reference fixture retained for captured-identity recovery');
         await peerRuntime.remove(peerOwner, peerIncarnation); await peerRuntime.removeStorage(peerOwner);
         peerRuntime.client.dispose();
+      }
+      if (legacyPeer) {
+        const state = await legacyPeer.inspect();
+        expect(state.Id).toBe(legacyPeer.id);
+        expect(state.Config.Labels['agentor.network-running-fixture']).toBe(network.id);
+        await legacyPeer.remove({ force: true }); legacySubmitted = false;
+      }
+      if (legacySubmitted) throw new Error('Unacknowledged legacy peer create retained for captured-identity recovery');
+      if (legacyBackingSubmitted) {
+        if (!legacyBridgeId) throw new Error('Unacknowledged legacy backing create retained for exact inspection');
+        let legacy: any;
+        try { legacy = await docker.getNetwork(legacyBridgeId).inspect(); }
+        catch (error: any) { if (error?.statusCode !== 404) throw error; }
+        if (legacy) {
+          expect(legacy.Id).toBe(legacyBridgeId); expect(legacy.Name).toBe(network.dockerName);
+          expect(legacy.Labels).toMatchObject({ 'agentor.managed-network': 'true', 'agentor.owner': network.userId });
+          expect(Object.keys(legacy.Containers)).toEqual([]);
+          await docker.getNetwork(legacyBridgeId).remove();
+        }
       }
       if (adapterSubmitted) {
         // Unknown Docker create acknowledgement is diagnostic authority, not
