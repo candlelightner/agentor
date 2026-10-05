@@ -275,6 +275,16 @@ async function runInjected(
   });
 }
 
+async function seedPreservedBackupRecords(prepared: Awaited<ReturnType<typeof fixture>>) {
+  const path = join(prepared.dataDir, "admin", "instance-backups.v1.json");
+  const state = JSON.parse(await readFile(path, "utf8"));
+  state.artifacts = [{ id: "staging-artifact", userId: prepared.plan.stagingOwnerId },
+    { id: "unrelated-artifact", userId: "unrelated-principal" }];
+  state.remoteBackups = [{ id: "staging-remote", userId: prepared.plan.stagingOwnerId },
+    { id: "unrelated-remote", userId: "unrelated-principal" }];
+  await writeFile(path, JSON.stringify(state));
+}
+
 test.describe("controlled instance restore helper", () => {
   let root = "";
 
@@ -409,8 +419,9 @@ test.describe("controlled instance restore helper", () => {
     ).resolves.toBe("[]");
   });
 
-  test("applies a verified data snapshot, transfers job ownership, and restarts the exact container", async () => {
+  test("applies a verified snapshot, rereads restored job ownership, and restarts the exact container", async () => {
     const prepared = await fixture(root);
+    await seedPreservedBackupRecords(prepared);
     await writeFile(join(prepared.dataDir, "old-control-plane.txt"), "old");
     const sqlite = Buffer.concat([
       Buffer.from("SQLite format 3\0"),
@@ -446,6 +457,8 @@ test.describe("controlled instance restore helper", () => {
       phase: "complete",
       userId: "restored-admin",
     });
+    for (const records of [state.artifacts, state.remoteBackups])
+      expect(records.map((record: any) => record.userId)).toEqual(["restored-admin", "unrelated-principal"]);
     await expect(
       readFile(
         join(
@@ -564,8 +577,9 @@ test.describe("controlled instance restore helper", () => {
     expect(helper.HostConfig.Mounts).toHaveLength(1);
   });
 
-  test("rolls data and ownership back when a selected volume cannot be created", async () => {
+  test("preserves initial staging principal for rollback after migrated ledger reread and failed volume creation", async () => {
     const prepared = await fixture(root);
+    await seedPreservedBackupRecords(prepared);
     await writeFile(join(prepared.dataDir, "old-control-plane.txt"), "old");
     const sqlite = Buffer.concat([
       Buffer.from("SQLite format 3\0"),
@@ -603,9 +617,19 @@ test.describe("controlled instance restore helper", () => {
       prepared.env.AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR,
       { createVolumeError: new Error("synthetic volume creation failure") },
     );
+    // This callback occurs after the post-migration active-job readback. A
+    // subsequent failure must not use that observed owner as rollback authority.
+    let observedMigratedState: any;
+    fake.docker.createVolume = async () => {
+      observedMigratedState = JSON.parse(await readFile(join(prepared.dataDir, "admin", "instance-backups.v1.json"), "utf8"));
+      throw new Error("synthetic volume creation failure");
+    };
 
     const result = await runInjected(prepared, fake.docker);
 
+    expect(observedMigratedState?.jobs[0].userId).toBe("restored-admin");
+    for (const records of [observedMigratedState.artifacts, observedMigratedState.remoteBackups])
+      expect(records.map((record: any) => record.userId)).toEqual(["restored-admin", "unrelated-principal"]);
     expect(result).toMatchObject({
       status: "failed",
       code: "INSTANCE_RESTORE_APPLY_FAILED",
@@ -631,5 +655,7 @@ test.describe("controlled instance restore helper", () => {
       errorCode: "INSTANCE_RESTORE_APPLY_FAILED",
       retryable: true,
     });
+    for (const records of [state.artifacts, state.remoteBackups])
+      expect(records.map((record: any) => record.userId)).toEqual(["recovery-admin", "unrelated-principal"]);
   });
 });

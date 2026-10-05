@@ -134,6 +134,7 @@ export async function runInstanceRestoreHelper(options = {}) {
     );
     backupStateOwnerMigrated = true;
     await writeJobStore(context.dataDir, jobState.state);
+    await assertJobStillActive();
 
     for (const volume of context.plan.volumes)
       await restoreVolume(docker, target, context, volume);
@@ -827,8 +828,13 @@ async function readJobStore(dataDir, jobId) {
 
 async function assertJobStillActive() {
   const latest = await readJobStoreAllowCancelled(context.dataDir, context.jobId);
-  if (latest.job.userId !== context.plan.stagingOwnerId)
+  const expectedOwnerId = backupStateOwnerMigrated
+    ? context.plan.restoredOwnerId
+    : context.plan.stagingOwnerId;
+  if (latest.job.userId !== expectedOwnerId)
     throw new SafeRestoreError("Restore job ownership changed unexpectedly", "INSTANCE_RESTORE_JOB_STATE_INVALID");
+  // Later reads observe the restored owner, not the initial rollback principal.
+  latest.originalOwnerId = jobState.originalOwnerId;
   if (latest.job.status === "cancelled") {
     jobState = latest;
     throw new SafeRestoreError("Instance restore was cancelled before mutation", "INSTANCE_RESTORE_CANCELLED");
@@ -843,7 +849,7 @@ async function readJobStoreAllowCancelled(dataDir, jobId) {
   const job = state.jobs.find((entry) => entry?.id === jobId);
   if (!job || job.operation !== "restore" || !["queued", "running", "cancelled"].includes(job.status) || !Array.isArray(job.logs))
     throw new SafeRestoreError("Restore job is absent or no longer active", "INSTANCE_RESTORE_JOB_STATE_INVALID");
-  return { state, job, originalOwnerId: job.userId };
+  return { state, job };
 }
 
 /** The job ledger and encrypted artifacts belong to the temporary recovery

@@ -6,6 +6,9 @@ export { IncusManagedVolumeRuntime } from './server/utils/incus-managed-volume-r
 export { prepareInstanceNativeVolumeArchive } from './server/utils/instance-backup-bundle';
 export { WorkerStore } from './server/utils/worker-store';
 export { ManagedVolumeStore } from './server/utils/managed-volume-store';
+export { WorkerConfigStore } from './server/utils/worker-config-store-core';
+export { StorageManager } from './server/utils/storage';
+export { loadConfig } from './server/utils/config';
 
 import { validateInstanceManifest } from './server/utils/instance-backup-bundle';
 import type { InstanceBackupVolumeManifest } from './server/utils/instance-backup-types';

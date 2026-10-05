@@ -146,6 +146,158 @@ async function managedPayload(f: Awaited<ReturnType<typeof fixture>>, target = '
   return { volume, archivePath };
 }
 
+function restoreSource(f: Awaited<ReturnType<typeof fixture>>) {
+  const p = f.image.properties;
+  return { sourceImageId: p.source_image_id, recipeId: p.recipe_id, architecture: 'amd64' as const,
+    converterVersion: p.converter_version, bootstrapGeneration: '3' as const };
+}
+
+test('read-only restore preflight proves absent compute, all three core roles and attached/detached data without mutation', async () => {
+  const f = await fixture(); try {
+    const { volume } = await managedPayload(f), id = randomUUID();
+    const detached = { ...volume, id, dockerName: 'agentor-persist-' + id, attached: false };
+    const before = structuredClone({ opts: f.opts, detached }), reads: string[] = [];
+    const getVolume = f.client.getCustomVolume;
+    f.client.getCustomVolume = async (pool: string, name: string) => {
+      expect(pool).toBe(f.config.incusStoragePool); reads.push(name); return getVolume(pool, name);
+    };
+    const expected = ['workspace', 'agents', 'docker'].map(role => f.opts.containerName + '-' + role)
+      .concat(volume.dockerName, detached.dockerName);
+    for (const source of [undefined, restoreSource(f)]) {
+      reads.length = 0;
+      await f.runtime.preflightCanonicalRestore(f.opts, source, [detached]);
+      expect(reads).toEqual(expected); expect(f.current()).toBeUndefined();
+      expect(f.events).toEqual([]); expect(f.volumes.size).toBe(0);
+      expect({ opts: f.opts, detached }).toEqual(before);
+    }
+    // Disabled Docker still cannot overwrite previously retained block data.
+    f.opts.dockerEnabled = false; f.opts.environmentJson.dockerEnabled = false;
+    reads.length = 0; await f.runtime.preflightCanonicalRestore(f.opts, undefined, [detached]);
+    expect(reads).toEqual(expected); expect(f.events).toEqual([]);
+  } finally { await f.cleanup(); }
+});
+
+test('read-only preflight refuses existing owned or foreign compute/core/managed storage without allocation', async () => {
+  for (const ownership of ['owned', 'foreign']) {
+    for (const role of ['compute', 'workspace', 'agents', 'docker', 'attached', 'detached']) {
+      const f = await fixture(); try {
+        const { volume } = await managedPayload(f), id = randomUUID();
+        const detached = { ...volume, id, dockerName: 'agentor-persist-' + id, attached: false };
+        const config = { 'user.agentor.owner': ownership === 'owned' ? f.opts.userId : 'another-owner' };
+        if (role === 'compute') f.client.getInstance = async () => ({ name: f.opts.containerName, config });
+        else {
+          const name = role === 'attached' ? volume.dockerName : role === 'detached' ? detached.dockerName
+            : f.opts.containerName + '-' + role;
+          f.volumes.set(name, { name, config });
+        }
+        const before = structuredClone([...f.volumes]);
+        await expect(f.runtime.preflightCanonicalRestore(f.opts, undefined, [detached]))
+          .rejects.toThrow(role === 'compute' ? 'absent destination compute' : 'absent destination storage');
+        expect(f.events).toEqual([]); expect([...f.volumes]).toEqual(before);
+      } finally { await f.cleanup(); }
+    }
+  }
+});
+
+test('preflight native transport and non404 responses fail closed instead of treating destinations as absent', async () => {
+  for (const endpoint of ['compute', 'storage']) for (const statusCode of [undefined, 403, 500]) {
+    const f = await fixture(); try {
+      const failure = Object.assign(new Error('Native authority unavailable'), { statusCode });
+      f.client[endpoint === 'compute' ? 'getInstance' : 'getCustomVolume'] = async () => { throw failure; };
+      await expect(f.runtime.preflightCanonicalRestore(f.opts)).rejects.toBe(failure);
+      expect(f.events).toEqual([]); expect(f.current()).toBeUndefined(); expect(f.volumes.size).toBe(0);
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('preflight and create enforce the same default and explicit immutable-source availability/authorization', async () => {
+  for (const failure of ['readiness', 'default-missing', 'default-invalid', 'explicit-missing', 'explicit-foreign', 'explicit-invalid']) {
+    const f = await fixture(); try {
+      let source = failure.startsWith('explicit') ? restoreSource(f) : undefined;
+      if (failure === 'readiness') f.client.getReadiness = async () => ({ ready: false, serverVersion: '6.0.6' });
+      if (failure === 'default-missing') f.client.getImageAlias = async () => { throw Object.assign(new Error('Image unavailable'), { statusCode: 404 }); };
+      if (failure === 'default-invalid') f.image.properties.bootstrap_generation = 'invalid';
+      if (failure === 'explicit-missing') f.client.listImages = async () => [];
+      if (failure === 'explicit-foreign') source = { ...source!, sourceImageId: 'sha256:' + 'd'.repeat(64) };
+      if (failure === 'explicit-invalid') source = { ...source!, recipeId: 'mutable-tag' };
+      await expect(f.runtime.preflightCanonicalRestore(f.opts, source)).rejects.toThrow();
+      await expect(f.runtime.createCanonicalRestore(f.opts, source)).rejects.toThrow();
+      expect(f.events).toEqual([]); expect(f.volumes.size).toBe(0); expect(f.current()).toBeUndefined();
+    } finally { await f.cleanup(); }
+  }
+  const f = await fixture(); try {
+    const source = { ...restoreSource(f), recipeId: 'd'.repeat(64) };
+    const older = { ...f.image, fingerprint: 'e'.repeat(64), properties: { ...f.image.properties, recipe_id: source.recipeId } };
+    f.client.listImages = async () => [older];
+    f.client.getImage = async (fingerprint: string) => fingerprint === older.fingerprint ? older : f.image;
+    await f.runtime.preflightCanonicalRestore(f.opts, source);
+    expect(f.events).toEqual([]); expect(f.volumes.size).toBe(0);
+    // An available older recipe for the same authorized OCI image remains descriptive.
+    f.client.listImages = async () => [];
+    await expect(f.runtime.createCanonicalRestore(f.opts, source)).rejects.toThrow('unavailable');
+    expect(f.events).toEqual([]);
+  } finally { await f.cleanup(); }
+});
+
+test('preflight rejects mismatched compute names and invalid worker IDs before any native reads', async () => {
+  for (const identity of ['mismatched-name', '', '../unsafe', 'bad/id']) {
+    const f = await fixture(); try {
+      if (identity === 'mismatched-name') f.opts.containerName = 'agentor-worker-' + randomUUID();
+      else { f.opts.id = identity; f.opts.containerName = 'agentor-worker-' + identity; }
+      let reads = 0;
+      for (const name of Object.keys(f.client)) if (typeof f.client[name] === 'function') {
+        f.client[name] = async () => { reads++; throw new Error('Unexpected native read for invalid identity'); };
+      }
+      await expect(f.runtime.preflightCanonicalRestore(f.opts)).rejects.toThrow(/identity|name|worker/i);
+      expect(reads).toBe(0); expect(f.events).toEqual([]); expect(f.volumes.size).toBe(0);
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('preflight freshly resolves selected recipes and rejects deletion or changed fingerprint/source before destination admission', async () => {
+  for (const drift of ['deleted', 'fingerprint', 'recipe', 'oci-source']) {
+    const f = await fixture(); try {
+      const source = { ...restoreSource(f), recipeId: 'd'.repeat(64) };
+      const listed = { ...f.image, fingerprint: 'e'.repeat(64), properties: { ...f.image.properties, recipe_id: source.recipeId } };
+      let selectedReads = 0, destinationReads = 0;
+      f.client.listImages = async () => [structuredClone(listed)];
+      f.client.getImage = async (fingerprint: string) => {
+        if (fingerprint !== listed.fingerprint) return f.image;
+        selectedReads++;
+        if (drift === 'deleted') throw Object.assign(new Error('Selected image was deleted'), { statusCode: 404 });
+        if (drift === 'fingerprint') return { ...listed, fingerprint: 'f'.repeat(64) };
+        return { ...listed, properties: { ...listed.properties,
+          ...(drift === 'recipe' ? { recipe_id: 'f'.repeat(64) } : { source_image_id: 'sha256:' + 'f'.repeat(64) }) } };
+      };
+      f.client.getInstance = f.client.getCustomVolume = async () => { destinationReads++; throw new Error('Unexpected destination read'); };
+      await expect(f.runtime.preflightCanonicalRestore(f.opts, source)).rejects.toThrow(/deleted|changed/i);
+      expect(selectedReads).toBe(1); expect(destinationReads).toBe(0);
+      expect(f.events).toEqual([]); expect(f.volumes.size).toBe(0); expect(f.current()).toBeUndefined();
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('preflight rejects invalid nonce/start and managed layout before destination reads or allocation', async () => {
+  for (const failure of ['nonce', 'start', 'workspace', 'restore', 'collision', 'attached-overlap']) {
+    const f = await fixture(); try {
+      const { volume } = await managedPayload(f);
+      if (failure === 'nonce') delete f.opts.recreationNonce;
+      if (failure === 'start') f.opts.start = true;
+      if (failure === 'workspace') volume.target = '/workspace/private';
+      if (failure === 'restore') volume.target = '/restore/private';
+      if (failure === 'collision' || failure === 'attached-overlap') {
+        const id = failure === 'collision' ? volume.id.slice(0, 8) + '-1111-2222-3333-444444444444' : randomUUID();
+        f.opts.managedVolumes!.push({ ...volume, id, dockerName: 'agentor-persist-' + id,
+          target: failure === 'collision' ? '/srv/another' : volume.target + '/child' });
+      }
+      let destinationReads = 0;
+      f.client.getInstance = f.client.getCustomVolume = async () => { destinationReads++; throw new Error('Unexpected destination read'); };
+      await expect(f.runtime.preflightCanonicalRestore(f.opts)).rejects.toThrow();
+      expect(destinationReads).toBe(0); expect(f.events).toEqual([]); expect(f.volumes.size).toBe(0);
+    } finally { await f.cleanup(); }
+  }
+});
+
 test('managed inverse uses fresh ordinary volumes at fixed UUID paths and streams unchanged payload after canonical roots', async () => {
   const f = await fixture(); try {
     const managed = await managedPayload(f), created = await f.runtime.createCanonicalRestore(f.opts);

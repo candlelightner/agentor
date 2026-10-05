@@ -15,6 +15,8 @@ import type { IncusWorkerOptions } from '../../orchestrator/server/utils/incus-w
 import type { StoredManagedVolume } from '../../orchestrator/server/utils/managed-volume-store';
 import type { WorkerRecord } from '../../orchestrator/server/utils/worker-store';
 import type { IncusCustomVolume } from '../../orchestrator/server/utils/incus-client';
+import { incusImageIdentity } from '../../orchestrator/server/utils/incus-worker-image';
+import { snapshotIncusWorkerBackupRuntime } from '../../orchestrator/server/utils/worker-backup-runtime';
 import { validatePortableManagedVolumeArchive } from '../../orchestrator/server/utils/portable-managed-volume-archive';
 
 const run = promisify(execFile);
@@ -29,6 +31,48 @@ print(json.dumps(dict(bytes=base64.b64encode(open(p+'/data','rb').read()).decode
  hard=os.stat(p+'/data').st_ino==os.stat(p+'/hard').st_ino,
  attr=base64.b64encode(os.getxattr(p+'/data','user.binary')).decode())))
 `;
+
+test('real compiled controlled-restore preflight proves immutable source and all destination absence without allocating', async () => {
+  test.skip(process.env.INCUS_INSTANCE_PREFLIGHT_TEST !== 'true', 'Explicit approved disposable read-only gate');
+  test.setTimeout(120_000);
+  const dataDir = await mkdtemp(join(tmpdir(), 'agentor-instance-native-preflight-'));
+  const id = randomUUID(), userId = 'preflight-' + randomUUID();
+  const config = { ...loadConfig(), dataDir, containerPrefix: 'agentor-worker', incusEnabled: true,
+    incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor', incusStoragePool: 'default', incusNetwork: 'incusbr0',
+    incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase10-preserve-ownership',
+    incusInternalGatewayUrl: 'http://10.159.68.1:38000', incusClientCertPath: '/workspace/agentor-incus-tls/client.crt',
+    incusClientKeyPath: '/workspace/agentor-incus-tls/client.key', incusServerCertPath: '/workspace/agentor-incus-tls/server.crt' };
+  const options: IncusWorkerOptions = { id, userId, containerName: config.containerPrefix + '-' + id,
+    start: false, recreationNonce: randomUUID(), dockerEnabled: false, cpuLimit: 2, memoryLimit: '2GiB',
+    userEnv: zeroUserEnvVars(userId), capabilitiesJson: [], instructionsJson: [],
+    environmentJson: { dockerEnabled: false, networkMode: 'full', allowedDomains: [], setupScript: '', envVars: '',
+      exposeApis: { portMappings: false, domainMappings: false, usage: false } },
+    workerJson: { id, displayName: 'Readonly helper admission', repos: [], initScript: '', gitName: '', gitEmail: '' } };
+  const stamp = new Date().toISOString(), records: StoredManagedVolume[] = [true, false].map(attached => {
+    const volumeId = randomUUID();
+    return { id: volumeId, userId, workerId: id, dockerName: 'agentor-persist-' + volumeId,
+      target: '/srv/restored-data', name: 'Preflight', purpose: 'persistent-path', storageRuntimeKind: 'incus-vm',
+      state: 'pending', seeded: false, attached, createdAt: stamp, updatedAt: stamp };
+  });
+  options.managedVolumes = records.filter(v => v.attached);
+  const before = structuredClone(options), detached = records.filter(v => !v.attached), detachedBefore = structuredClone(detached);
+  try {
+    await run(process.execPath, [buildScript, join(dataDir, 'adapter')], { env: {}, timeout: 45_000 });
+    const native = await importNative(pathToFileURL(join(dataDir, 'adapter/index.mjs')).href);
+    const runtime = new native.IncusWorkerRuntime(config);
+    const target = await runtime.client.getImageAlias(config.incusWorkerImage);
+    const source = snapshotIncusWorkerBackupRuntime(incusImageIdentity(await runtime.client.getImage(target.target))).source;
+    console.info('Exact readonly compiled preflight fixture', { dataDir, id, userId });
+    await runtime.preflightCanonicalRestore(options, undefined, detached);
+    await runtime.preflightCanonicalRestore(options, source, detached);
+    expect(options).toEqual(before); expect(detached).toEqual(detachedBefore);
+    await expect(runtime.client.getInstance(options.containerName)).rejects.toMatchObject({ statusCode: 404 });
+    for (const name of [...['workspace', 'agents', 'docker'].map(role => options.containerName + '-' + role),
+      ...records.map(v => v.dockerName)])
+      await expect(runtime.client.getCustomVolume(config.incusStoragePool, name)).rejects.toMatchObject({ statusCode: 404 });
+    console.info('Actual restricted mTLS/default and immutable source preflight remained allocation-free');
+  } finally { await rm(dataDir, { recursive: true, force: true }); }
+});
 
 for (const retainedOnly of [false, true]) test(`real compiled detached inverse ${retainedOnly ? 'retains deleted-owner authority after temporary compute/core cleanup' : 'promotes mixed data without attaching historical volumes'}`, async () => {
   test.skip(process.env.INCUS_INSTANCE_DETACHED_RESTORE_TEST !== 'true', 'Explicit serial disposable native restore gate');

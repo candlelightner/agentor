@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { renderUserEnvVars } from "./user-env-store";
 import { backupInstallationId } from "./backup-installation";
 import { MANAGED_NETWORK_HOSTS_SCRIPT, normalizeManagedNetworkHosts } from './managed-network-hosts';
-import { IncusWorkerStorage, type IncusStorageOwner } from "./incus-worker-storage";
+import { IncusWorkerStorage, incusWorkerVolumeName, type IncusStorageOwner } from "./incus-worker-storage";
 import { resolveIncusPrimaryLease } from "./incus-worker-network";
 import type { ContainerStatus } from "../../shared/types";
 import { IncusWorkerCommands } from "./incus-worker-commands";
@@ -996,6 +996,49 @@ export class IncusWorkerRuntime {
     if (!opts.recreationNonce || opts.start !== false)
       throw new Error('Incus restore requires durable nonce and stopped initial creation');
     this.validateOptions(opts);
+    const { fingerprint, source: verifiedSource } = await this.canonicalRestoreImage(source);
+    return this.createWorker(opts, undefined, { fingerprint, source: verifiedSource, dockerData, detachedManagedVolumes });
+  }
+
+  /** Controlled whole-instance helper repeats this read-only admission before
+   * replacing DATA_DIR. Creation still repeats every authoritative proof; this
+   * does not reserve, adopt, format, or allocate a destination. */
+  async preflightCanonicalRestore(opts: IncusWorkerOptions, source?: WorkerBackupRuntimeSource,
+    detachedManagedVolumes: StoredManagedVolume[] = []): Promise<void> {
+    if (!opts.recreationNonce || opts.start !== false)
+      throw new Error('Incus restore requires durable nonce and stopped initial creation');
+    this.validateOptions(opts);
+    const names = (['workspace', 'agents', 'docker'] as const)
+      .map(role => incusWorkerVolumeName(opts, this.config.containerPrefix, role));
+    await this.assertReady();
+    const selected = await this.canonicalRestoreImage(source);
+    if (selected.fingerprint) {
+      const identity = incusImageIdentity(await this.client.getImage(selected.fingerprint));
+      if (identity.fingerprint !== selected.fingerprint || !sameIncusImageSource(identity, selected.source!))
+        throw new Error('Derived restore image changed after immutable source selection');
+    }
+    if (!source) incusImageIdentity(await this.client.getImage(await this.resolveImage()));
+    await this.managedRestoreDevices(opts, detachedManagedVolumes);
+    try {
+      await this.client.getInstance(opts.containerName);
+      throw new Error('Incus restore requires absent destination compute');
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+    }
+    names.push(...[...(opts.managedVolumes ?? []), ...detachedManagedVolumes].map(v => v.dockerName));
+    for (const name of names) {
+      try {
+        await this.client.getCustomVolume(this.config.incusStoragePool, name);
+        throw new Error('Incus restore requires absent destination storage');
+      } catch (error) {
+        if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+      }
+    }
+  }
+
+  private async canonicalRestoreImage(source?: WorkerBackupRuntimeSource): Promise<{
+    fingerprint?: string; source?: WorkerBackupRuntimeSource;
+  }> {
     let fingerprint: string | undefined;
     let verifiedSource: WorkerBackupRuntimeSource | undefined;
     if (source) {
@@ -1017,7 +1060,7 @@ export class IncusWorkerRuntime {
       }
       if (!fingerprint) throw new Error('Derived image for the immutable restore source is unavailable');
     }
-    return this.createWorker(opts, undefined, { fingerprint, source: verifiedSource, dockerData, detachedManagedVolumes });
+    return { fingerprint, source: verifiedSource };
   }
 
   private async createWorker(opts: IncusWorkerOptions, existing?: { fingerprint: string; docker: boolean },

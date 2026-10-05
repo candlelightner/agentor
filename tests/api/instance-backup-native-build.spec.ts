@@ -23,6 +23,7 @@ test('standalone native helper adapter imports isolated locked dependencies with
     expect(result.dependencyFiles).toBeGreaterThan(0); expect(result.dependencyFiles).toBeLessThan(2000);
     expect(result.bundleBytes).toBeLessThan(600_000);
     expect(result.bundledInputs).toContain('server/utils/incus-worker-runtime.ts');
+    expect(result.bundledInputs).toContain('server/utils/worker-config-store-core.ts');
     expect(result.bundledInputs).not.toContain('server/utils/services.ts');
     expect(result.bundledInputs).not.toContain('server/utils/container.ts');
     expect(result.bundledInputs.some((path: string) => /server\/(api|plugins|routes|middleware)\//.test(path))).toBe(false);
@@ -46,7 +47,7 @@ test('standalone native helper adapter imports isolated locked dependencies with
         if(info.isDirectory()) queue.push(path);
       }
       const adapter=await import(process.argv[2]);
-      const methods={IncusWorkerRuntime:['createCanonicalRestore','restoreCanonicalArchives','finishCanonicalRestore'],
+      const methods={IncusWorkerRuntime:['preflightCanonicalRestore','createCanonicalRestore','restoreCanonicalArchives','finishCanonicalRestore'],
         IncusWorkerStorage:['freshRestoreDevices'],IncusManagedVolumeRuntime:['freshRestoreVolume']};
       for(const [type,names] of Object.entries(methods)) for(const name of names)
         assert.equal(typeof adapter[type].prototype[name],'function');
@@ -56,6 +57,20 @@ test('standalone native helper adapter imports isolated locked dependencies with
       const store=new adapter.WorkerStore(data);
       await assert.rejects(store.loadUser('fixture-owner'), error => error instanceof SyntaxError && !(error instanceof ReferenceError));
       assert.throws(()=>store.listForUser('fixture-owner'),/unavailable|corrupt/);
+      // The same encrypted applied store is usable cold, without importing the
+      // app singleton or introducing a helper-specific configuration format.
+      const config={...adapter.loadConfig(),dataDir:data};
+      const bootstrap={version:1,dockerEnabled:false,cpuLimit:2,memoryLimit:'2GiB',
+        userEnv:{userId:'fixture-owner',createdAt:'2026-10-05',updatedAt:'2026-10-05',envVars:[]},
+        environmentJson:{dockerEnabled:false,networkMode:'full',allowedDomains:[],setupScript:'',envVars:'',exposeApis:{}},
+        workerJson:{id:'fixture-worker',displayName:'Restored',repos:[],initScript:'',gitName:'',gitEmail:''},
+        capabilitiesJson:[],instructionsJson:[],excludedGlobalEnvVarKeys:[],excludedGroupEnvVarKeys:[]};
+      await new adapter.WorkerConfigStore(config).markApplied('fixture-owner','fixture-worker',bootstrap);
+      assert.deepEqual(await new adapter.WorkerConfigStore(config).resolveAppliedBootstrap('fixture-owner','fixture-worker'),bootstrap);
+      await mkdir(join(data,'users','corrupt-owner'),{recursive:true});
+      await writeFile(join(data,'users','corrupt-owner','worker-configurations.json'),'{invalid-json');
+      const corrupt=new adapter.WorkerConfigStore(config);
+      await assert.rejects(corrupt.get('corrupt-owner','fixture-worker'),/unavailable|corrupt|quarantin/i);
       console.log('isolated-adapter-and-corrupt-owner-proof-passed');
     `, root, pathToFileURL(join(output, 'index.mjs')).href], { env: {}, cwd: root, timeout: 10_000 });
     expect(probe.stdout).toContain('isolated-adapter-and-corrupt-owner-proof-passed');

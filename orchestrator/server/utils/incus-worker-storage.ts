@@ -5,15 +5,20 @@ import { validateIncusImageIdentity, sameIncusImageSource, type IncusWorkerImage
 type Role = "workspace" | "agents" | "docker";
 export interface IncusStorageOwner { id: string; userId: string; containerName: string }
 
+/** Same naming admission before readonly restore preflight and allocation. */
+export function incusWorkerVolumeName(owner: IncusStorageOwner, containerPrefix: string, role: Role): string {
+  if (!/^[a-zA-Z0-9_-]+$/.test(owner.id) || owner.containerName !== `${containerPrefix}-${owner.id}`)
+    throw new Error('Invalid Incus worker storage identity');
+  return `${owner.containerName}-${role}`;
+}
+
 /** Only core worker storage: deliberately independent of disposable VM/root
  * lifetime. Managed volumes/account shares have their own existing ownership. */
 export class IncusWorkerStorage {
   constructor(private client: IncusClient, private config: Config, private installationId: string) {}
 
   private name(owner: IncusStorageOwner, role: Role): string {
-    if (!/^[a-zA-Z0-9_-]+$/.test(owner.id) || owner.containerName !== `${this.config.containerPrefix}-${owner.id}`)
-      throw new Error("Invalid Incus worker storage identity");
-    return `${owner.containerName}-${role}`;
+    return incusWorkerVolumeName(owner, this.config.containerPrefix, role);
   }
 
   private async find(owner: IncusStorageOwner, role: Role): Promise<IncusCustomVolume | undefined> {
