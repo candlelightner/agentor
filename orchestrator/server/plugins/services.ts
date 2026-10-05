@@ -55,6 +55,7 @@ import { useGitImageCatalogManager } from "../utils/git-image-manager";
 import { instanceSnapshotActive } from "../utils/instance-snapshot-gate";
 
 export default defineNitroPlugin(async (nitroApp) => {
+  await useInstanceBackupManager().assertStartupSafe();
   const instanceRecoveryMode =
     process.env.AGENTOR_INSTANCE_RECOVERY_MODE === "true";
   // Initialize logging infrastructure first

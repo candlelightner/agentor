@@ -227,6 +227,10 @@ function validJob(value: any): value is InstanceBackupJob {
     optionalText(value.remoteBackupId, 200) &&
     optionalText(value.error, 2048) &&
     optionalText(value.errorCode, 100) &&
+    (value.restoreHelper === undefined || value.operation === 'restore' &&
+      value.restoreHelper && Object.keys(value.restoreHelper).length === 2 &&
+      /^[a-f0-9]{64}$/.test(value.restoreHelper.containerId) &&
+      /^sha256:[a-f0-9]{64}$/.test(value.restoreHelper.imageId)) &&
     (value.retryable === undefined || typeof value.retryable === "boolean") &&
     Array.isArray(value.logs) &&
     value.logs.length <= 1000 &&

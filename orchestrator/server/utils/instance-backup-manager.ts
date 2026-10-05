@@ -118,6 +118,7 @@ export class InstanceBackupManager {
   private readonly preflightCreate: () => Promise<void>;
   private readonly inventoryOverride?: InstanceBackupManagerOptions["inventory"];
   private initialized?: Promise<void>;
+  private startupChecked?: Promise<void>;
   private accepting = true;
   private active = 0;
   private queue: QueuedOperation[] = [];
@@ -152,9 +153,13 @@ export class InstanceBackupManager {
       mkdir(this.stagingDir, { recursive: true, mode: 0o700 }),
       this.store.init(),
     ]);
+    const held = this.store.listJobs().filter(restoreMayOwnStage);
+    for (const job of held) this.restoreBarriers.set(job.id, beginInstanceRestore(job.id));
+    const retained = new Set(held.map(job => `restore-${job.id}`));
     for (const name of await readdir(this.stagingDir).catch(() => []))
-      await rm(join(this.stagingDir, name), { recursive: true, force: true });
+      if (!retained.has(name)) await rm(join(this.stagingDir, name), { recursive: true, force: true });
     for (const job of this.store.listJobs()) {
+      if (restoreMayOwnStage(job)) continue; // Never replay or overwrite a helper-owned ledger.
       if (job.status !== "queued" && job.status !== "running") continue;
       const stamp = new Date().toISOString();
       await this.store.saveJob({
@@ -171,10 +176,14 @@ export class InstanceBackupManager {
         logs: appendLog(job.logs, "Operation interrupted by orchestrator restart."),
       });
     }
+    // Settle acknowledged completed handoffs before the mutation barrier can
+    // block sign-in. Reuse exact terminal observation, never waive auth writes.
+    await this.refreshRestoreHolds();
   }
 
   async list(userId: string) {
     await this.init();
+    await this.refreshRestoreHolds();
     return {
       jobs: this.store.listJobs().filter((job) => job.userId === userId).map(publicJob),
       artifacts: this.store
@@ -192,12 +201,14 @@ export class InstanceBackupManager {
 
   async getJob(id: string) {
     await this.init();
+    await this.refreshRestoreHolds();
     const job = this.store.getJob(id);
     return job ? publicJob(job) : undefined;
   }
 
   async logs(id: string, after = 0, limit = 100) {
     await this.init();
+    await this.refreshRestoreHolds();
     const job = this.store.getJob(id);
     if (!job) return undefined;
     const start = Number.isSafeInteger(after) ? Math.max(0, after) : 0;
@@ -552,7 +563,7 @@ export class InstanceBackupManager {
     if (!current) throw Object.assign(new Error("Instance backup job not found"), { statusCode: 404 });
     if (["succeeded", "failed", "cancelled"].includes(current.status))
       return publicJob(current);
-    if (current.operation === "restore" && current.phase === "applying")
+    if (restoreMayOwnStage(current))
       throw Object.assign(
         new Error(
           "Instance restore can no longer be cancelled after control has been handed to the restart helper.",
@@ -610,8 +621,10 @@ export class InstanceBackupManager {
     this.accepting = false;
     for (const controller of this.controllers.values())
       controller.abort(Object.assign(new Error("Orchestrator is stopping"), { name: "AbortError" }));
-    for (const jobId of [...this.restoreBarriers.keys()])
-      this.releaseRestoreBarrier(jobId);
+    for (const jobId of [...this.restoreBarriers.keys()]) {
+      const job = this.store.getJob(jobId);
+      if (job && !restoreMayOwnStage(job)) this.releaseRestoreBarrier(jobId);
+    }
   }
 
   private async runCreate(
@@ -1205,8 +1218,11 @@ export class InstanceBackupManager {
       }, inspected.manifest.formatVersion === 2);
       // The helper owns the terminal status because this process is about to be
       // stopped. It updates the persisted job before restarting the orchestrator.
+    } catch (error) {
+      if ((error as { code?: string })?.code === 'INSTANCE_RESTORE_HELPER_NOT_STARTED') helperOwnsStage = false;
+      throw error;
     } finally {
-      // Before a successful helper start this process owns all decrypted data.
+      // Ownership transfers BEFORE a start request can execute remotely.
       // Never retain a plaintext auth.db/control-plane bundle after a failed
       // preflight, cancellation, or helper-launch failure. Once the helper has
       // started it alone owns the stage and may still need it after this
@@ -1296,8 +1312,10 @@ export class InstanceBackupManager {
           Target: path, ReadOnly: true } as Docker.MountSettings);
       }
     }
+    if (!/^sha256:[a-f0-9]{64}$/.test(current.Image))
+      throw new Error('Restore requires the inspected immutable orchestrator image');
     const helper = await withOperationDeadline((operationSignal) => this.docker.createContainer({
-      Image: current.Config.Image,
+      Image: current.Image,
       name: `agentor-instance-restore-${job.id}`,
       User: "0:0",
       Cmd: ["node", ".output/server/instance-restore-helper.mjs"],
@@ -1313,7 +1331,7 @@ export class InstanceBackupManager {
         ...(extraHosts?.length ? { ExtraHosts: extraHosts } : {}),
         Binds: binds,
         Mounts: mounts.length ? mounts : undefined,
-        AutoRemove: true,
+        AutoRemove: false, // Exact terminal evidence survives a parent restart/lost start acknowledgement.
         Init: true,
         ReadonlyRootfs: true,
         CapDrop: ["ALL"],
@@ -1328,7 +1346,11 @@ export class InstanceBackupManager {
       },
       abortSignal: operationSignal,
     }), INSTANCE_DOCKER_MUTATION_TIMEOUT_MS, "Docker instance-restore helper creation", signal);
+    if (!/^[a-f0-9]{64}$/.test(helper.id)) throw new Error('Restore helper creation lacks an exact identity');
+    job.restoreHelper = { containerId: helper.id, imageId: current.Image };
     try {
+      await onHandoff();
+      signal.throwIfAborted();
       await withOperationDeadline(
         (operationSignal) => helper.start({ abortSignal: operationSignal }),
         INSTANCE_DOCKER_MUTATION_TIMEOUT_MS,
@@ -1336,14 +1358,18 @@ export class InstanceBackupManager {
         signal,
       );
     } catch (error) {
-      await withOperationDeadline(
-        (operationSignal) => helper.remove({ force: true, abortSignal: operationSignal } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
-        INSTANCE_DOCKER_MUTATION_TIMEOUT_MS,
-        "Docker instance-restore failed-start cleanup",
-      ).catch(() => {});
-      throw error;
+      const observed = await this.inspectRestoreHelper(job).catch(() => undefined);
+      if (observed && restoreHelperNeverStarted(observed)) {
+        await withOperationDeadline((operationSignal) => helper.remove({ force: false, abortSignal: operationSignal } as
+          Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }), INSTANCE_DOCKER_MUTATION_TIMEOUT_MS,
+          'Docker exact never-started restore helper cleanup');
+        delete job.restoreHelper;
+        throw Object.assign(new Error('The restore helper never started; the original control plane was not replaced'),
+          { code: 'INSTANCE_RESTORE_HELPER_NOT_STARTED' });
+      }
+      throw Object.assign(new Error('Restore helper start acknowledgement is unsettled; retain exact helper and staging, do not retry'),
+        { code: 'INSTANCE_RESTORE_HELPER_UNCERTAIN' });
     }
-    await onHandoff();
     // If validation fails before the helper stops this container, remain
     // alive long enough to ingest the terminal ledger entry it wrote. On a
     // successful apply Docker stops this process, so this wait never turns a
@@ -1357,10 +1383,81 @@ export class InstanceBackupManager {
     );
     await this.store.reload();
     const persisted = this.store.getJob(job.id);
+    const completed = await this.inspectRestoreHelper(job);
+    if (persisted && restoreHelperSettled(persisted, completed) && result.StatusCode === completed.State.ExitCode) {
+      await helper.remove({ force: false });
+      delete persisted.restoreHelper;
+      await this.store.saveJob(persisted);
+    } else throw Object.assign(new Error('Restore helper exit and completion ledger disagree; retain helper, stage and fences'),
+      { code: 'INSTANCE_RESTORE_HELPER_UNCERTAIN' });
     if (result.StatusCode !== 0 && persisted?.status !== "failed")
       throw Object.assign(new Error("The controlled instance restore helper failed"), {
         code: "INSTANCE_RESTORE_HELPER_FAILED",
       });
+  }
+
+  /** Exact acknowledged identity only; a name or a404 never proves settlement. */
+  private async inspectRestoreHelper(job: InstanceBackupJob): Promise<Docker.ContainerInspectInfo> {
+    const identity = job.restoreHelper;
+    if (!identity) throw new Error('Restore helper acknowledgement is unavailable');
+    const info = await withOperationDeadline(signal => this.docker.getContainer(identity.containerId).inspect({ abortSignal: signal }),
+      INSTANCE_DOCKER_READ_TIMEOUT_MS, 'Docker exact restore helper inspection');
+    const env = info.Config?.Env ?? [];
+    if (info.Id !== identity.containerId || info.Image !== identity.imageId ||
+        info.Config?.Labels?.['agentor.instance-restore-helper'] !== 'true' ||
+        info.Config?.Labels?.['agentor.instance-restore-job'] !== job.id ||
+        !env.includes(`AGENTOR_INSTANCE_RESTORE_JOB=${job.id}`) ||
+        !env.includes(`AGENTOR_INSTANCE_RESTORE_DATA_DIR=${this.dataDir}`) ||
+        !env.includes(`AGENTOR_INSTANCE_RESTORE_STAGE=${join(this.stagingDir, `restore-${job.id}`)}`))
+      throw new Error('Exact restore helper authority differs from its acknowledgement');
+    return info;
+  }
+
+  /** Run before any startup writes/migrations: an unexpected parent restart
+   * must not open auth.db while a helper is swapping the same DATA mount. */
+  assertStartupSafe(): Promise<void> {
+    return (this.startupChecked ??= this.checkStartupSafe());
+  }
+
+  private async checkStartupSafe(): Promise<void> {
+    const hostname = process.env.HOSTNAME;
+    if (!hostname) throw new Error('Startup container identity is unavailable');
+    const current = await withOperationDeadline(signal => this.docker.getContainer(hostname).inspect({ abortSignal: signal }),
+      INSTANCE_DOCKER_READ_TIMEOUT_MS, 'Docker startup DATA mount inspection');
+    const data = current.Mounts?.find(mount => mount.Destination === this.dataDir);
+    if (!data) throw new Error('Startup DATA mount authority is unavailable');
+    const helpers = await withOperationDeadline(signal => this.docker.listContainers({ all: false,
+      filters: { label: ['agentor.instance-restore-helper=true'] }, abortSignal: signal }),
+      INSTANCE_DOCKER_READ_TIMEOUT_MS, 'Docker running restore helpers');
+    if (helpers.some(helper => helper.Id !== current.Id && helper.Mounts?.some(mount =>
+      mount.Destination === this.dataDir && mount.Type === data.Type && mount.Source === data.Source &&
+      (data.Type !== 'volume' || mount.Name === data.Name))))
+      throw Object.assign(new Error('A restore helper is still executing against this DATA mount; wait for it to exit before restarting Agentor'),
+        { code: 'INSTANCE_RESTORE_HELPER_ACTIVE', statusCode: 503 });
+  }
+
+  /** Status reads observe orphaned handoffs using existing job state, not a
+   * new watcher or replay mechanism. Success alone is not terminal proof while
+   * the helper may still be clearing fences/restarting its exact parent. */
+  private async refreshRestoreHolds(): Promise<void> {
+    if (!this.restoreBarriers.size) return;
+    const orphaned = [...this.restoreBarriers.keys()].filter(id => !this.tasks.has(id));
+    if (!orphaned.length) return;
+    await this.store.reload();
+    for (const id of orphaned) {
+      const job = this.store.getJob(id);
+      if (!job || restoreQuarantined(job) || !job.restoreHelper ||
+          !['succeeded', 'failed', 'cancelled'].includes(job.status)) continue;
+      const info = await this.inspectRestoreHelper(job).catch(() => undefined);
+      if (!info || !restoreHelperSettled(job, info)) continue;
+      await withOperationDeadline(signal => this.docker.getContainer(job.restoreHelper!.containerId)
+        .remove({ force: false, abortSignal: signal } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
+        INSTANCE_DOCKER_MUTATION_TIMEOUT_MS, 'Docker settled restore helper cleanup');
+      delete job.restoreHelper;
+      await this.store.saveJob(job);
+      await rm(join(this.stagingDir, `restore-${id}`), { recursive: true, force: true });
+      this.releaseRestoreBarrier(id);
+    }
   }
 
   private async inventory(userId: string) {
@@ -1757,7 +1854,7 @@ export class InstanceBackupManager {
         .run(job, controller.signal)
         .catch((error) => this.fail(job, error))
         .finally(() => {
-          this.releaseRestoreBarrier(job.id);
+          if (!restoreMayOwnStage(this.store.getJob(job.id) ?? job)) this.releaseRestoreBarrier(job.id);
           this.controllers.delete(job.id);
           this.tasks.delete(job.id);
           this.active -= 1;
@@ -1805,6 +1902,14 @@ export class InstanceBackupManager {
   }
 
   private async fail(job: InstanceBackupJob, error: unknown) {
+    if (job.restoreHelper && (error as { code?: string })?.code !== 'INSTANCE_RESTORE_HELPER_NOT_STARTED') {
+      await this.store.reload();
+      const helperLedger = this.store.getJob(job.id);
+      if (helperLedger && ['succeeded', 'failed', 'cancelled'].includes(helperLedger.status)) return;
+      // A possibly active helper owns this ledger. Do not abort its native
+      // mutation by replacing it from a stale parent cache on transport loss.
+      return;
+    }
     const persisted = this.store.getJob(job.id);
     if (persisted?.status === "cancelled") return;
     const cancelled =
@@ -1890,6 +1995,28 @@ function newJob(
     requestFingerprint: fingerprint,
     logs: [`${operation} queued.`],
   };
+}
+
+function restoreQuarantined(job: InstanceBackupJob): boolean {
+  return job.operation === 'restore' && ['INSTANCE_RESTORE_ROLLBACK_INCOMPLETE', 'INSTANCE_RESTORE_HELPER_UNCERTAIN']
+    .includes(job.errorCode ?? '');
+}
+
+function restoreMayOwnStage(job: InstanceBackupJob): boolean {
+  return job.operation === 'restore' && (restoreQuarantined(job) || !!job.restoreHelper ||
+    ['queued', 'running'].includes(job.status) && ['helper-starting', 'applying'].includes(job.phase));
+}
+
+function restoreHelperNeverStarted(info: Docker.ContainerInspectInfo): boolean {
+  return info.State.Status === 'created' && !info.State.Running && !info.State.Restarting && !info.State.Dead &&
+    /^0001-01-01T00:00:00(?:\.0+)?Z$/.test(info.State.StartedAt);
+}
+
+function restoreHelperSettled(job: InstanceBackupJob, info: Docker.ContainerInspectInfo): boolean {
+  return !restoreQuarantined(job) && ['succeeded', 'failed', 'cancelled'].includes(job.status) &&
+    !info.State.Running && !info.State.Restarting && info.State.Status === 'exited' &&
+    Number.isFinite(Date.parse(info.State.FinishedAt)) && !info.State.FinishedAt.startsWith('0001-') &&
+    (job.status === 'failed' ? info.State.ExitCode !== 0 : info.State.ExitCode === 0);
 }
 
 function normalizeOptions(
@@ -2009,12 +2136,18 @@ function publicJob(job: InstanceBackupJob): PublicInstanceBackupJob {
     logs,
     pendingProviderObjectId: _pendingProviderObjectId,
     pendingProviderUploadId: _pendingProviderUploadId,
+    restoreHelper: _restoreHelper,
     ...result
   } = structuredClone(job);
   return { ...result, logLineCount: logs.length };
 }
 
 function publicInstanceFailure(error: unknown) {
+  const restoreCode = (error as { code?: string })?.code;
+  if (restoreCode === 'INSTANCE_RESTORE_HELPER_NOT_STARTED')
+    return { code: restoreCode, message: 'The restore helper never started; original data remains untouched.', retryable: true };
+  if (restoreCode === 'INSTANCE_RESTORE_HELPER_UNCERTAIN')
+    return { code: restoreCode, message: 'Restore execution is unsettled. Retain the exact helper, staging and data; do not retry automatically.', retryable: false };
   const message = error instanceof Error ? error.message : "";
   const code = (error as any)?.code;
   if (

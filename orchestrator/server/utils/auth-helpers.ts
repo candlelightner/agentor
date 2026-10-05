@@ -183,6 +183,11 @@ export async function authenticateWsPeer(peer: any): Promise<AuthContext | null>
       ?? '';
     if (!cookieHeader) return null;
 
+    // WebSocket upgrades bypass Nitro's HTTP middleware. Reuse the same
+    // startup authority gate before opening the authentication database.
+    const manager = (await import('./instance-backup-manager')).useInstanceBackupManager();
+    await manager.assertStartupSafe();
+    await manager.init();
     const auth = useAuth();
     const session: any = await auth.api.getSession({ headers: new Headers({ cookie: cookieHeader }) });
     return toAuthContext(session);

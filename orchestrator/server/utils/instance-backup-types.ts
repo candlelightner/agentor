@@ -140,13 +140,15 @@ export interface InstanceBackupJob {
   logs: string[];
   pendingProviderObjectId?: string;
   pendingProviderUploadId?: string;
+  /** Private exact create acknowledgement; never imported runtime authority. */
+  restoreHelper?: { containerId: string; imageId: string };
 }
 
 /** Safe job shape returned through GUI/API/MCP status surfaces. Detailed log
  * lines are available only from the bounded incremental log operation. */
 export type PublicInstanceBackupJob = Omit<
   InstanceBackupJob,
-  "logs" | "pendingProviderObjectId" | "pendingProviderUploadId"
+  "logs" | "pendingProviderObjectId" | "pendingProviderUploadId" | "restoreHelper"
 > & {
   logLineCount: number;
 };
