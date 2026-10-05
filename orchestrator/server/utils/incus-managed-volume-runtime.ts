@@ -12,6 +12,43 @@ import { createWriteStream } from 'node:fs';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
+/** Shared pure admission: the controlled helper must reject the same layouts
+ * before replacing DATA_DIR that the existing inverse rejects before create. */
+export function incusManagedVolumeDeviceKey(v: StoredManagedVolume): string {
+  if (managedVolumeRuntimeKind(v) !== 'incus-vm' || v.purpose !== 'persistent-path' ||
+      !/^[a-f0-9-]{36}$/.test(v.id) || v.dockerName !== `agentor-persist-${v.id}` ||
+      v.liveContainerId || v.previousRestartPolicy)
+    throw volumeError(409, 'Managed storage backend or recovery identity is ambiguous. Data was retained.');
+  validatePersistenceTarget(v.target);
+  if (pathsOverlap(v.target, '/workspace'))
+    throw volumeError(409, 'Workspace already has canonical persistence; overlapping managed storage is not allowed.');
+  return `m${v.id.replaceAll('-', '').slice(0, 6)}`;
+}
+
+export function incusManagedRestoreDevices(owner: Pick<IncusStorageOwner, 'id' | 'userId'>, pool: string,
+  attached: StoredManagedVolume[] = [], detached: StoredManagedVolume[] = []): Record<string, IncusDevice> {
+  const devices: Record<string, IncusDevice> = {}, targets: string[] = [];
+  if (!Array.isArray(attached) || !Array.isArray(detached) || attached.length + detached.length > 32)
+    throw new Error('Managed restore exceeds the worker volume limit');
+  const records = [...attached.map(volume => ({ volume, detached: false })),
+    ...detached.map(volume => ({ volume, detached: true }))];
+  for (const { volume: v, detached: historical } of records) {
+    if (v.userId !== owner.userId || v.workerId !== owner.id || v.attached !== !historical ||
+        v.incusLive !== undefined || v.operation !== undefined ||
+        !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(v.id) || pathsOverlap(v.target, '/restore') ||
+        !((v.state === 'pending' && v.seeded === false) || (v.state === (historical ? 'detached' : 'ready') && v.seeded === true)))
+      throw new Error('Managed restore requires exact attached or explicitly detached records for the worker');
+    const key = incusManagedVolumeDeviceKey(v);
+    if (devices[key]) throw new Error('Managed restore device keys collide');
+    if (Object.values(devices).some(d => d.source === v.dockerName)) throw new Error('Managed restore volume identity is duplicated');
+    if (!historical && targets.some(target => pathsOverlap(target, v.target)))
+      throw new Error('Managed restore operational targets overlap');
+    if (!historical) targets.push(v.target);
+    devices[key] = { type: 'disk', pool, source: v.dockerName, path: `/restore/managed/${v.id}/volume` };
+  }
+  return devices;
+}
+
 /** Managed paths keep their existing store/policy. This adapter owns only the
  * Incus filesystem and retained-compute seeding operations, not a second
  * lifecycle/recovery coordinator. */
@@ -23,17 +60,11 @@ export class IncusManagedVolumeRuntime {
     return { id: v.workerId, userId: v.userId, containerName: `${this.config.containerPrefix}-${v.workerId}` };
   }
   private validateRecord(v: StoredManagedVolume) {
-    if (managedVolumeRuntimeKind(v) !== 'incus-vm' || v.purpose !== 'persistent-path' ||
-        !/^[a-f0-9-]{36}$/.test(v.id) || v.dockerName !== `agentor-persist-${v.id}` ||
-        v.liveContainerId || v.previousRestartPolicy)
-      throw volumeError(409, 'Managed storage backend or recovery identity is ambiguous. Data was retained.');
-    validatePersistenceTarget(v.target);
-    if (pathsOverlap(v.target, '/workspace'))
-      throw volumeError(409, 'Workspace already has canonical persistence; overlapping managed storage is not allowed.');
+    incusManagedVolumeDeviceKey(v);
   }
   // QEMU's virtiofs socket includes project/instance/device names (108 byte limit).
   // Short-key collisions are rejected before changing compute.
-  deviceKey(v: StoredManagedVolume) { this.validateRecord(v); return `m${v.id.replaceAll('-', '').slice(0, 6)}`; }
+  deviceKey(v: StoredManagedVolume) { return incusManagedVolumeDeviceKey(v); }
   device(v: StoredManagedVolume): IncusDevice {
     this.validateRecord(v);
     return { type: 'disk', pool: this.config.incusStoragePool, source: v.dockerName, path: v.target };

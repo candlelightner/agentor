@@ -6,7 +6,8 @@
     "../orchestrator/server/types/**/*.d.ts",
     "api/instance-backup-native-live.spec.ts",
     "api/instance-backup-native-stopped.spec.ts",
-    "api/instance-backup-detached-live.spec.ts"
+    "api/instance-backup-detached-live.spec.ts",
+    "api/instance-backup-native-plan.spec.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }

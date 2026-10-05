@@ -13,7 +13,7 @@ import { IncusWorkerCommands } from "./incus-worker-commands";
 import { withOwnerWorkerRuntimeSetup } from "./worker-lifecycle-coordinator";
 import type { WorkerConfigRevision } from './worker-config-store';
 import { incusImageIdentity, sameIncusImageSource, type IncusWorkerImageIdentity } from './incus-worker-image';
-import { IncusManagedVolumeRuntime } from './incus-managed-volume-runtime';
+import { IncusManagedVolumeRuntime, incusManagedRestoreDevices } from './incus-managed-volume-runtime';
 import { pathsOverlap, type StoredManagedVolume } from './managed-volume-store';
 import { incusManagedNetworkAuthority, incusManagedBridgeIdentity, incusManagedNetworkDevice,
   incusManagedNetworkRule } from './incus-managed-network-identity';
@@ -831,27 +831,7 @@ export class IncusWorkerRuntime {
 
   private async managedRestoreDevices(opts: IncusWorkerOptions,
     detached: StoredManagedVolume[] = []): Promise<Record<string, IncusDevice>> {
-    const runtime = new IncusManagedVolumeRuntime(this.config, this), devices: Record<string, IncusDevice> = {};
-    if (!Array.isArray(detached) || (opts.managedVolumes?.length ?? 0) + detached.length > 32)
-      throw new Error('Managed restore exceeds the worker volume limit');
-    const targets: string[] = [];
-    const records = [...(opts.managedVolumes ?? []).map(volume => ({ volume, detached: false })),
-      ...detached.map(volume => ({ volume, detached: true }))];
-    for (const { volume: v, detached: historical } of records) {
-      if (v.userId !== opts.userId || v.workerId !== opts.id || v.attached !== !historical ||
-          v.incusLive !== undefined || v.operation !== undefined ||
-          !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(v.id) || pathsOverlap(v.target, '/restore') ||
-          !((v.state === 'pending' && v.seeded === false) || (v.state === (historical ? 'detached' : 'ready') && v.seeded === true)))
-        throw new Error('Managed restore requires exact attached or explicitly detached records for the worker');
-      const key = runtime.deviceKey(v);
-      if (devices[key]) throw new Error('Managed restore device keys collide');
-      if (Object.values(devices).some(d => d.source === v.dockerName)) throw new Error('Managed restore volume identity is duplicated');
-      if (!historical && targets.some(target => target === v.target || target.startsWith(v.target + '/') || v.target.startsWith(target + '/')))
-        throw new Error('Managed restore operational targets overlap');
-      if (!historical) targets.push(v.target);
-      devices[key] = { ...runtime.device(v), path: `/restore/managed/${v.id}/volume` };
-    }
-    return devices;
+    return incusManagedRestoreDevices(opts, this.config.incusStoragePool, opts.managedVolumes, detached);
   }
 
   private async assertReady(): Promise<void> {
