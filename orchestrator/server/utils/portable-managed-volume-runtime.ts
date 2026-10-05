@@ -38,7 +38,9 @@ import {
   type OperationFailureWithSettlement,
 } from "./operation-deadline";
 import { registerOperationHelper } from "./operation-helper-registry";
-import { useConfig } from "./services";
+import { useConfig, useWorkerStore } from "./services";
+import { managedVolumeRuntimeKind } from './managed-volume-store';
+import type { PortableManagedVolumeCaptureObservation } from './portable-managed-volume-plan';
 import { MAX_LOCAL_PERSISTENCE_COVERAGE_ENTRIES } from "./worker-export";
 
 const DOCKER_TIMEOUT_MS = 30_000;
@@ -252,6 +254,15 @@ export class PortableManagedVolumeRuntime {
     try {
       input.signal?.throwIfAborted();
       await this.init();
+      const workerStore = useWorkerStore(); await workerStore.init();
+      const durableWorker = workerStore.get(input.userId, input.workerId);
+      if (!durableWorker || durableWorker.deletionPending || durableWorker.incusRecreation ||
+          durableWorker.status !== (input.state === 'archived' ? 'archived' : 'active'))
+        throw new Error('Portable managed capture has no settled durable worker authority');
+      if (durableWorker.runtimeKind === 'incus-vm')
+        return await this.captureNativeWithFenceHeld(input, workDir);
+      if (input.containerId?.startsWith('incus:'))
+        throw new Error('Portable managed capture runtime and handle differ');
       const managed = useManagedVolumeManager();
       const records = managed.store.forWorker(input.userId, input.workerId);
       if (records.length > MAX_LOCAL_PERSISTENCE_COVERAGE_ENTRIES)
@@ -265,6 +276,8 @@ export class PortableManagedVolumeRuntime {
       const observations = [];
       for (const record of records) {
         input.signal?.throwIfAborted();
+        if (managedVolumeRuntimeKind(record) !== 'legacy-docker')
+          throw new Error('Portable managed capture storage backend differs from durable runtime');
         let physical: Docker.VolumeInspectInfo | undefined;
         try {
           physical = await withOperationDeadline(
@@ -344,6 +357,82 @@ export class PortableManagedVolumeRuntime {
       await rm(workDir, { recursive: true, force: true }).catch(() => {});
       this.activeOperations.delete(operationId);
     }
+  }
+
+  private async captureNativeWithFenceHeld(input: PortableManagedVolumeCaptureInput, workDir: string):
+    Promise<PortableManagedVolumeCaptureResult> {
+    const managed = useManagedVolumeManager(), store = useWorkerStore();
+    const worker = store.get(input.userId, input.workerId)!;
+    const records = managed.store.forWorker(input.userId, input.workerId);
+    if (records.length > MAX_LOCAL_PERSISTENCE_COVERAGE_ENTRIES)
+      throw Object.assign(new Error('Portable managed-volume coverage exceeds the supported record limit'), { statusCode: 409 });
+    const snapshot = JSON.stringify(records);
+    const validateRecords = () => {
+      const current = store.get(input.userId, input.workerId);
+      if (!current || current.runtimeKind !== 'incus-vm' || JSON.stringify(current) !== JSON.stringify(worker) ||
+          managed.isRecoveryBlocked(input.workerId) || managed.recreations.get(input.userId, input.workerId) ||
+          JSON.stringify(managed.store.forWorker(input.userId, input.workerId)) !== snapshot)
+        throw new Error('Native portable managed capture durable authority changed');
+      managed.assertLiveRecoveryResolved(input.userId, input.workerId);
+    };
+    validateRecords();
+    if (input.state === 'archived' ? Boolean(input.containerId) : !/^incus:[a-f0-9-]{36}$/.test(input.containerId ?? ''))
+      throw new Error('Native portable managed capture has a mismatched compute handle');
+    const runtime = managed.incusRuntime, observations: PortableManagedVolumeCaptureObservation[] = [];
+    const instance = input.state === 'archived' ? undefined
+      : await runtime.inspect(input.userId, input.workerId, input.containerId!);
+    if (instance && instance.status !== (input.state === 'running' ? 'Running' : 'Stopped'))
+      throw new Error('Native portable managed capture compute state changed');
+    const validateSourceRecord = async () => {
+      validateRecords();
+      if (instance) {
+        const current = await runtime.inspect(input.userId, input.workerId, input.containerId!);
+        if (current.status !== instance.status || JSON.stringify(current.devices) !== JSON.stringify(instance.devices) ||
+            JSON.stringify(current.expanded_devices) !== JSON.stringify(instance.expanded_devices))
+          throw new Error('Native portable managed capture compute authority changed');
+      } else {
+        try { await runtime.worker.client.getInstance(`${useConfig().containerPrefix}-${input.workerId}`); }
+        catch (error) { if ((error as { statusCode?: number }).statusCode === 404) { validateRecords(); return; } throw error; }
+        throw new Error('Native archived managed capture has unexpected compute');
+      }
+      validateRecords();
+    };
+    await validateSourceRecord();
+    for (const record of records) {
+      input.signal?.throwIfAborted(); validateRecords();
+      if (managedVolumeRuntimeKind(record) !== 'incus-vm')
+        throw new Error('Native portable managed storage backend differs from durable runtime');
+      const eligible = record.attached && record.purpose === 'persistent-path';
+      const physical = eligible ? await runtime.inspectVolume(record) : undefined;
+      const device = eligible && instance?.devices[runtime.deviceKey(record)];
+      observations.push({ ...record, volumeId: record.id, backend: 'incus-vm',
+        physicalExists: Boolean(physical), nativeAuthorityVerified: Boolean(physical),
+        mountSourceVerified: !eligible || input.state === 'archived' || Boolean(device && runtime.matchesDevice(device, record)),
+        mountDestinationVerified: !eligible || input.state === 'archived' || Boolean(device && runtime.matchesDevice(device, record)),
+        operationDrift: Boolean(record.liveContainerId || record.operation && record.operation.stage !== 'complete'),
+        recoveryDrift: managed.isRecoveryBlocked(input.workerId) });
+    }
+    const plan = planPortableManagedVolumeCapture(observations);
+    await mkdir(workDir, { recursive: true, mode: 0o700 });
+    await mkdir(dirname(input.outputPath), { recursive: true, mode: 0o700 });
+    let stagedBytes = 0;
+    const archives: Array<{ entry: PortableManagedVolumeEntry; archivePath: string }> = [];
+    for (const [index, item] of plan.items.entries()) {
+      input.signal?.throwIfAborted(); validateRecords();
+      const archivePath = join(workDir, `${index}.tar`);
+      stagedBytes += await runtime.captureArchive(records.find(record => record.id === item.source.volumeId)!, {
+        state: input.state, handle: input.containerId, archivePath, signal: input.signal,
+        maxBytes: MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES - stagedBytes }, validateSourceRecord);
+      archives.push({ entry: item.entry, archivePath });
+    }
+    await validateSourceRecord();
+    const { bytes } = await writePortableManagedVolumePayload(archives, input.outputPath, { signal: input.signal });
+    await validateSourceRecord();
+    const included = new Set(plan.items.map(item => item.entry.target)), coverage = new Map<string, boolean>();
+    for (const record of records) coverage.set(record.target, Boolean(coverage.get(record.target)) || included.has(record.target));
+    return { entries: plan.items.map(item => item.entry), exclusions: plan.exclusions,
+      localPersistence: [...coverage].sort(([a], [b]) => a.localeCompare(b)).map(([path, included]) => ({ path, included })),
+      consistency: input.state === 'running' ? 'best-effort' : 'offline-read-only', bytes };
   }
 
   /** Validate the entire nested payload and static target plan before creating

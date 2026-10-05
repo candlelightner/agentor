@@ -12,7 +12,7 @@ if (!process.env.DATA_DIR) {
   // Managed-storage tests retain bounded recovery records on ambiguity. Never
   // erase their service store automatically when failed fixture cleanup leaves
   // Incus resources for operator diagnosis; successful tests clean exact state.
-  if (process.env.INCUS_MANAGED_VOLUME_TEST !== 'true')
+  if (process.env.INCUS_MANAGED_VOLUME_TEST !== 'true' && process.env.INCUS_MANAGED_BACKUP_TEST !== 'true')
     process.once("exit", () => rmSync(fixtureData, { recursive: true, force: true }));
 }
 
@@ -28,6 +28,8 @@ export default defineConfig({
     "api/portable-managed-volume-plan.spec.ts",
     "api/portable-managed-volume-journal.spec.ts",
     "api/portable-managed-volume-runtime.spec.ts",
+    "api/incus-managed-archive.spec.ts",
+    "api/incus-managed-backup-live.spec.ts",
     "api/admin-workspace-store-transactions.spec.ts",
     "api/container-store-quarantine.spec.ts",
     "api/instance-backup-*.spec.ts",

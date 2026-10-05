@@ -8,7 +8,8 @@ import {
   type PortableManagedVolumeImportConflicts,
 } from "../../orchestrator/server/utils/portable-managed-volume-plan";
 
-const observation = (overrides: Partial<PortableManagedVolumeCaptureObservation> = {}): PortableManagedVolumeCaptureObservation => ({
+type LegacyObservation = Extract<PortableManagedVolumeCaptureObservation, { labelsVerified: boolean }>;
+const observation = (overrides: Partial<LegacyObservation> = {}): LegacyObservation => ({
   volumeId: "source-private-id",
   dockerName: "source-private-name",
   target: "/srv/data",
@@ -57,7 +58,7 @@ test("capture includes only verified attached persistent volumes and exposes exc
 });
 
 test("any opted-in attached inconsistency fails the capture plan", () => {
-  const corruptions: Array<Partial<PortableManagedVolumeCaptureObservation>> = [
+  const corruptions: Array<Partial<LegacyObservation>> = [
     { seeded: false }, { state: "preparing" }, { physicalExists: false },
     { labelsVerified: false }, { driver: "nfs" }, { options: { device: "/host" } },
     { mountSourceVerified: false }, { mountDestinationVerified: false },
@@ -65,6 +66,15 @@ test("any opted-in attached inconsistency fails the capture plan", () => {
   ];
   for (const corruption of corruptions)
     expect(() => planPortableManagedVolumeCapture([observation(corruption)])).toThrow(/inconsistent attached target/i);
+});
+
+test('native source proof is explicit and never fabricates Docker local-driver authority', () => {
+  const { labelsVerified: _labels, driver: _driver, options: _options, ...facts } = observation();
+  const native: PortableManagedVolumeCaptureObservation = { ...facts, backend: 'incus-vm', nativeAuthorityVerified: true };
+  expect(planPortableManagedVolumeCapture([native]).items).toHaveLength(1);
+  expect(() => planPortableManagedVolumeCapture([{ ...native, nativeAuthorityVerified: false }])).toThrow('inconsistent');
+  for (const corruption of [{ driver: 'nfs' }, { options: { device: '/host' } }, { labelsVerified: false }])
+    expect(() => planPortableManagedVolumeCapture([observation(corruption)])).toThrow('inconsistent');
 });
 
 test("import allocates deterministic fresh UUIDs, Docker names, and positive labels", () => {

@@ -8,7 +8,8 @@ import { incusImageIdentity } from './incus-worker-image';
 import { isOperationHelperActive, registerOperationHelper } from './operation-helper-registry';
 
 type Owner = { id: string; userId: string; containerName: string };
-type Sources = { workspace: string; agents: string };
+type Sources = { workspace: string; agents: string; managed?: never } |
+  { managed: string; workspace?: never; agents?: never };
 type Kind = 'create' | 'start' | 'stop' | 'delete';
 type Recovery = { version: 1; id: string; installation: string; owner: Owner; sources: Sources;
   fingerprint: string; instance?: string; pending?: { kind: Kind; operation?: string } };
@@ -27,9 +28,13 @@ export class IncusOfflineArchiveHelper {
 
   private validate(value: unknown): asserts value is Recovery {
     const v = value as Recovery;
+    const keys = v?.sources && Object.keys(v.sources).sort().join(',');
+    const validSources = keys === 'agents,workspace'
+      ? safeName(v.sources.workspace) && safeName(v.sources.agents) && v.sources.workspace !== v.sources.agents
+      : keys === 'managed' && safeName(v.sources.managed);
     if (!v || v.version !== 1 || !uuid.test(v.id ?? '') || v.installation !== this.installation ||
         !uuid.test(v.owner?.id ?? '') || !safeName(v.owner?.userId) || !safeName(v.owner?.containerName) ||
-        !safeName(v.sources?.workspace) || !safeName(v.sources?.agents) || v.sources.workspace === v.sources.agents ||
+        !validSources ||
         !/^[a-f0-9]{64}$/.test(v.fingerprint ?? '') || v.instance !== undefined && !uuid.test(v.instance) ||
         v.pending && (!['create', 'start', 'stop', 'delete'].includes(v.pending.kind) ||
           v.pending.operation !== undefined && !operation.test(v.pending.operation)))
@@ -38,11 +43,13 @@ export class IncusOfflineArchiveHelper {
 
   private name(state: Recovery) { return `abk-${state.id}`; }
   private devices(state: Recovery) {
-    return { root: { type: 'disk', path: '/', pool: this.config.incusStoragePool },
-      workspace: { type: 'disk', path: '/workspace', source: state.sources.workspace,
-        pool: this.config.incusStoragePool, readonly: 'true' },
-      agents: { type: 'disk', path: '/home/agent/.agent-data', source: state.sources.agents,
-        pool: this.config.incusStoragePool, readonly: 'true' } };
+    const devices: Record<string, Record<string, string>> = {
+      root: { type: 'disk', path: '/', pool: this.config.incusStoragePool } };
+    const mounts = state.sources.managed !== undefined ? { managed: [state.sources.managed, '/volume'] }
+      : { workspace: [state.sources.workspace!, '/workspace'], agents: [state.sources.agents!, '/home/agent/.agent-data'] };
+    for (const [key, [source, path]] of Object.entries(mounts))
+      devices[key] = { type: 'disk', source, path, pool: this.config.incusStoragePool, readonly: 'true' };
+    return devices;
   }
   private metadata(state: Recovery) {
     return { 'user.agentor.installation': this.installation, 'user.agentor.helper': 'offline-backup',

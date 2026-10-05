@@ -7,7 +7,7 @@ import {
   type PortableManagedVolumeEntry,
 } from "./portable-managed-volume-format";
 
-export interface PortableManagedVolumeCaptureObservation {
+interface PortableManagedVolumeCaptureFacts {
   volumeId: string;
   dockerName: string;
   target: string;
@@ -17,14 +17,16 @@ export interface PortableManagedVolumeCaptureObservation {
   seeded: boolean;
   state: string;
   physicalExists: boolean;
-  labelsVerified: boolean;
-  driver: string;
-  options: Record<string, string> | null;
   mountSourceVerified: boolean;
   mountDestinationVerified: boolean;
   operationDrift: boolean;
   recoveryDrift: boolean;
 }
+
+export type PortableManagedVolumeCaptureObservation = PortableManagedVolumeCaptureFacts & (
+  { backend?: 'legacy-docker'; labelsVerified: boolean; driver: string; options: Record<string, string> | null } |
+  { backend: 'incus-vm'; nativeAuthorityVerified: boolean }
+);
 
 export interface PortableManagedVolumeCaptureItem {
   entry: PortableManagedVolumeEntry;
@@ -58,9 +60,10 @@ export function planPortableManagedVolumeCapture(
       exclusions.push({ target: observation.target, name: observation.name, reason: "legacy-backup-path" });
       continue;
     }
-    if (!observation.seeded || observation.state !== "ready" || !observation.physicalExists ||
-        !observation.labelsVerified || observation.driver !== "local" ||
-        (observation.options !== null && Object.keys(observation.options).length !== 0) ||
+    const backendVerified = observation.backend === 'incus-vm' ? observation.nativeAuthorityVerified === true
+      : (observation.backend === undefined || observation.backend === 'legacy-docker') && observation.labelsVerified &&
+        observation.driver === 'local' && (observation.options === null || Object.keys(observation.options).length === 0);
+    if (!observation.seeded || observation.state !== "ready" || !observation.physicalExists || !backendVerified ||
         !observation.mountSourceVerified || !observation.mountDestinationVerified ||
         observation.operationDrift || observation.recoveryDrift)
       throw new Error(`Portable managed-volume capture refused inconsistent attached target ${observation.target}`);

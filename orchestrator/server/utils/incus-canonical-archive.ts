@@ -14,9 +14,11 @@ const exclusions = {
 export const INCUS_CANONICAL_ARCHIVE_SCRIPT = String.raw`
 import json,os,re,stat,subprocess,sys
 RULES=` + JSON.stringify(exclusions) + String.raw`
-ROOTS={"workspace":"/workspace","agents":"/home/agent/.agent-data"}
+ROOTS={"workspace":"/workspace","agents":"/home/agent/.agent-data","managed":"/volume"}
 if len(sys.argv) not in (3,4) or sys.argv[1] not in ROOTS or len(sys.argv)==4 and sys.argv[3]!="offline":
     raise ValueError("Invalid canonical archive role")
+if sys.argv[1]=="managed" and len(sys.argv)!=4:
+    raise ValueError("Managed archive requires the fixed readonly helper")
 root=ROOTS[sys.argv[1]]
 if not stat.S_ISDIR(os.lstat(root).st_mode) or os.path.realpath(root)!=root:
     raise ValueError("Canonical archive root must be a non-symlink directory")

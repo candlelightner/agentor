@@ -59,7 +59,7 @@ async function fixture(run: (fixture: any) => Promise<void>) {
     },
   };
   const helper = new IncusOfflineArchiveHelper({ dataDir, incusStoragePool: 'pool', incusWorkerImage: 'trusted-helper' } as Config, client, installation);
-  const invoke = () => helper.withGuest(owner, sources, async (name?: string) => {
+  const invoke = (selected = sources) => helper.withGuest(owner, selected, async (name?: string) => {
     calls.push(['source', name]); if (control.source) await control.source(name);
   }, controller.signal, async (name: string, assertHelper: () => Promise<void>) => {
     calls.push(['capture', name]);
@@ -87,6 +87,23 @@ test('offline archive helper is pinned, networkless and read-only with exact rec
       .toEqual([undefined, undefined, spec.name, spec.name, undefined]);
     expect(calls.filter((item: any) => item[0] === 'inspect').every((item: any) => item[1] !== owner.containerName)).toBe(true);
     expect(calls.find((item: any) => item[0] === 'exec')[1]).toEqual(['true']);
+  });
+});
+
+test('managed capture permits only the fixed readonly volume layout, not mixed or caller-selected paths', async () => {
+  await fixture(async ({ invoke, calls, receipt }) => {
+    expect(await invoke({ managed: 'canonical-managed' })).toBe('archive');
+    expect(await receipt()).toBeUndefined();
+    const spec = calls.find((item: any) => item[0] === 'spec')[1];
+    expect(spec.profiles).toEqual([]);
+    expect(spec.devices).toEqual({ root: { type: 'disk', path: '/', pool: 'pool' },
+      managed: { type: 'disk', source: 'canonical-managed', pool: 'pool', path: '/volume', readonly: 'true' } });
+  });
+  for (const sources of [{ managed: 'canonical-managed', path: '/etc' },
+    { managed: 'canonical-managed', workspace: 'canonical-workspace', agents: 'canonical-agents' },
+    { managed: '../foreign' }]) await fixture(async ({ invoke, calls }) => {
+    await expect(invoke(sources)).rejects.toThrow('malformed');
+    expect(calls.some((item: any) => item[0] === 'create')).toBe(false);
   });
 });
 

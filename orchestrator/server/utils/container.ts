@@ -4670,9 +4670,6 @@ for p in sys.argv[1:]:
     if (native) {
       if (opts.includeRootfs) throw Object.assign(new Error('Incus root filesystem is disposable, not backup data'),
         { statusCode: 409, code: 'INCUS_DISPOSABLE_ROOTFS' });
-      if (opts.includeManagedVolumes)
-        throw Object.assign(new Error('Incus managed-volume archive capture is not available yet'),
-          { statusCode: 409, code: 'INCUS_ARCHIVE_CAPABILITY_PENDING' });
       // Fence unresolved authority before creating staging files or opening
       // archive exec, not after canonical bytes were already captured.
       await validateNativeCapture();
@@ -4756,8 +4753,8 @@ for p in sys.argv[1:]:
             .captureWithLifecycleFenceHeld({
               userId: info.userId,
               workerId: info.id,
-              state: info.status,
-              containerId: info.containerId,
+              state: archivedNative ? 'archived' : info.status,
+              containerId: archivedNative ? undefined : info.containerId,
               outputPath: join(tmpDir, BUNDLE_FILES.managedVolumes),
               signal: opts.signal,
             })

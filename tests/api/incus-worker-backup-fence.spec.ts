@@ -29,7 +29,7 @@ async function fixture(run: (manager: ContainerManager, dataDir: string, info: a
 }
 
 test('unresolved canonical managed storage rejects export before staging or guest exec', async () => {
-  await fixture(async (manager, dataDir, info) => {
+  for (const includeManagedVolumes of [false, true]) await fixture(async (manager, dataDir, info) => {
     const managed = useManagedVolumeManager(), init = managed.init, assert = managed.assertLiveRecoveryResolved;
     const calls: string[] = [];
     managed.init = async () => { calls.push('init'); };
@@ -38,17 +38,17 @@ test('unresolved canonical managed storage rejects export before staging or gues
       throw new Error('Unresolved cutover authority');
     };
     try {
-      await expect(manager.exportWorker(info.id, { includeRootfs: false })).rejects.toThrow('Unresolved cutover authority');
+      await expect(manager.exportWorker(info.id, { includeRootfs: false, includeManagedVolumes })).rejects.toThrow('Unresolved cutover authority');
       expect(calls).toEqual(['init', 'fence']);
       await expect(lstat(join(dataDir, 'tmp'))).rejects.toMatchObject({ code: 'ENOENT' });
     } finally { managed.init = init; managed.assertLiveRecoveryResolved = assert; }
   });
 });
 
-test('native rootfs and not-yet-supported managed capture fail explicitly without legacy fallback', async () => {
-  for (const option of ['rootfs', 'managed']) await fixture(async (manager, dataDir, info) => {
-    await expect(manager.exportWorker(info.id, { includeRootfs: option === 'rootfs', includeManagedVolumes: option === 'managed' }))
-      .rejects.toMatchObject({ code: option === 'rootfs' ? 'INCUS_DISPOSABLE_ROOTFS' : 'INCUS_ARCHIVE_CAPABILITY_PENDING' });
+test('native disposable rootfs capture fails explicitly without legacy fallback', async () => {
+  await fixture(async (manager, dataDir, info) => {
+    await expect(manager.exportWorker(info.id, { includeRootfs: true, includeManagedVolumes: true }))
+      .rejects.toMatchObject({ code: 'INCUS_DISPOSABLE_ROOTFS' });
     await expect(lstat(join(dataDir, 'tmp'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });

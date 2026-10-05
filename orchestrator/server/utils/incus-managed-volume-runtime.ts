@@ -7,6 +7,10 @@ import type { IncusStorageOwner } from './incus-worker-storage';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { IncusOfflineArchiveHelper } from './incus-offline-archive-helper';
+import { createWriteStream } from 'node:fs';
+import { Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 
 /** Managed paths keep their existing store/policy. This adapter owns only the
  * Incus filesystem and retained-compute seeding operations, not a second
@@ -83,6 +87,83 @@ export class IncusManagedVolumeRuntime {
         !await this.worker.matchesWorkerIdentity(instance, workerId, userId))
       throw volumeError(409, 'Incus managed-storage source ownership or incarnation changed. Data was retained.');
     return instance;
+  }
+
+  /** Fixed readonly helper capture; no source provisioning, lifecycle change,
+   * allocation/repair, freezer or weakening of general volume validation. */
+  async captureArchive(v: StoredManagedVolume, options: { state: 'running' | 'stopped' | 'archived';
+    handle?: string; archivePath: string; maxBytes: number; signal?: AbortSignal },
+    validateRecords: () => void | Promise<void>) {
+    assertIncusLiveResolved(v); this.validateRecord(v);
+    if (!v.attached || !v.seeded || v.state !== 'ready' || v.operation && v.operation.stage !== 'complete' ||
+        !Number.isSafeInteger(options.maxBytes) || options.maxBytes < 0)
+      throw volumeError(409, 'Managed archive source is not settled canonical storage.');
+    const owner = this.owner(v), key = this.deviceKey(v);
+    const absent = async () => {
+      try { await this.worker.client.getInstance(owner.containerName); }
+      catch (error) { if ((error as { statusCode?: number }).statusCode === 404) return; throw error; }
+      throw volumeError(409, 'Archived managed capture has unexpected compute.');
+    };
+    const original = options.state === 'archived' ? undefined
+      : await this.inspect(v.userId, v.workerId, options.handle ?? '');
+    if (!original) {
+      if (options.handle) throw volumeError(409, 'Archived managed capture has a stale compute handle.');
+      await absent();
+    } else if (original.status !== (options.state === 'running' ? 'Running' : 'Stopped'))
+      throw volumeError(409, 'Managed capture compute state changed.');
+    const before = await this.inspectVolume(v);
+    if (!before || before.project !== this.config.incusProject || !before.created_at ||
+        !Number.isFinite(Date.parse(before.created_at)))
+      throw volumeError(409, 'Managed capture storage identity is unavailable.');
+    if (original) for (const devices of [original.devices, original.expanded_devices ?? original.devices]) {
+      const sources = Object.entries(devices).filter(([, device]) => device.type === 'disk' &&
+        device.pool === this.config.incusStoragePool && device.source === v.dockerName);
+      if (!this.matchesDevice(devices[key], v) || sources.length !== 1 || sources[0]?.[0] !== key)
+        throw volumeError(409, 'Managed capture source attachment is ambiguous.');
+    }
+    const references = (values: string[]) => values.map(ref => {
+      const url = new URL(ref, this.worker.client.endpoint);
+      if (url.origin !== new URL(this.worker.client.endpoint).origin || url.username || url.password || url.hash ||
+          url.searchParams.getAll('project').length !== 1 || url.searchParams.get('project') !== this.config.incusProject ||
+          [...url.searchParams.keys()].some(key => key !== 'project'))
+        throw volumeError(409, 'Managed archive reference is foreign.');
+      return url.pathname;
+    }).sort();
+    const baseline = original ? [`/1.0/instances/${owner.containerName}`] : [];
+    if (JSON.stringify(references(before.used_by)) !== JSON.stringify(baseline))
+      throw volumeError(409, 'Managed archive source references are ambiguous.');
+    const configuration = (config: Record<string, string>) => JSON.stringify(Object.entries(config).sort(([a], [b]) => a.localeCompare(b)));
+    const assertSource = async (helperName?: string) => {
+      // Do not consult AbortSignal here: known helper removal still needs a
+      // source proof after cancellation, before clearing its private receipt.
+      await validateRecords();
+      if (original) {
+        const current = await this.inspect(v.userId, v.workerId, options.handle!);
+        if (current.status !== original.status || JSON.stringify(current.devices) !== JSON.stringify(original.devices) ||
+            JSON.stringify(current.expanded_devices) !== JSON.stringify(original.expanded_devices))
+          throw volumeError(409, 'Managed archive source compute changed.');
+      } else await absent();
+      const current = await this.worker.client.getCustomVolume(this.config.incusStoragePool, v.dockerName);
+      const expected = [...baseline, ...(helperName ? [`/1.0/instances/${helperName}`] : [])].sort();
+      if (current.name !== before.name || current.project !== before.project || current.type !== before.type ||
+          current.content_type !== before.content_type || current.created_at !== before.created_at ||
+          configuration(current.config) !== configuration(before.config) || !Array.isArray(current.used_by) ||
+          JSON.stringify(references(current.used_by)) !== JSON.stringify(expected))
+        throw volumeError(409, 'Managed archive source authority changed.');
+      await validateRecords();
+    };
+    await assertSource();
+    let bytes = 0;
+    await new IncusOfflineArchiveHelper(this.config, this.worker.client, await this.installationId())
+      .withGuest(owner, { managed: v.dockerName }, assertSource, options.signal, async (name, assertHelper) => {
+        const validate = async () => { await assertHelper(); await assertSource(name); };
+        const stream = await this.worker.openOfflineManagedArchive(name, validate, options.signal);
+        await pipeline(stream, new Transform({ transform(chunk, _encoding, done) {
+          bytes += chunk.length;
+          done(bytes > options.maxBytes ? new Error('Managed archive exceeds aggregate byte limit') : null, chunk);
+        } }), createWriteStream(options.archivePath, { flags: 'wx', mode: 0o600 }), { signal: options.signal });
+      });
+    await assertSource(); return bytes;
   }
 
   private async exec(userId: string, workerId: string, handle: string, command: string[]) {

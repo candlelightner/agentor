@@ -49,6 +49,8 @@ interface RawTarScan {
   expandedBytes: number;
 }
 
+interface PortablePax { path?: string; linkpath?: string; accessAcl?: boolean; defaultAcl?: boolean }
+
 /** Validate the exact raw tar dialect accepted for a portable volume. */
 export async function validatePortableManagedVolumeArchive(
   archivePath: string,
@@ -231,7 +233,7 @@ async function scanRawTar(
   let offset = 0;
   let expandedBytes = 0;
   let zeroBlocks = 0;
-  let pendingPax: Record<string, string> | undefined;
+  let pendingPax: PortablePax | undefined;
   try {
     while (offset < info.size) {
       throwIfAborted(options.signal);
@@ -270,6 +272,8 @@ async function scanRawTar(
         : undefined;
       if (pendingPax?.linkpath !== undefined && type !== "symlink" && type !== "hardlink")
         throw invalidArchive("PAX linkpath applies to a non-link entry");
+      if (pendingPax?.defaultAcl && type !== "directory" || pendingPax?.accessAcl && type === "symlink")
+        throw invalidArchive("PAX ACL metadata applies to an unsupported entry type");
       pendingPax = undefined;
       // Parse all numeric identity/mode fields strictly even though the values
       // are preserved verbatim for Docker rather than interpreted here.
@@ -394,18 +398,19 @@ function parseType(value: number): RawTarEntry["type"] {
   if (value === 49) return "hardlink";
   // This explicitly rejects devices, FIFOs, GNU long names/links, sparse
   // records and global PAX headers. A bounded per-file PAX allowlist is
-  // consumed before this point solely for path/linkpath fidelity.
+  // consumed before this point for confined paths and filesystem metadata.
   throw invalidArchive("archive contains an unsupported tar entry type");
 }
 
-function parsePortablePax(body: Buffer): Record<string, string> {
-  const values: Record<string, string> = {};
+function parsePortablePax(body: Buffer): PortablePax {
+  const values: PortablePax = {}, seen = new Set<string>();
   let offset = 0;
   while (offset < body.length) {
     const space = body.indexOf(0x20, offset);
     if (space < 0) throw invalidArchive("PAX record length is invalid");
-    const lengthText = body.subarray(offset, space).toString("ascii");
-    if (!/^[1-9][0-9]*$/.test(lengthText)) throw invalidArchive("PAX record length is invalid");
+    const rawLength = body.subarray(offset, space), lengthText = rawLength.toString("ascii");
+    if (!rawLength.every(byte => byte >= 48 && byte <= 57) || !/^[1-9][0-9]*$/.test(lengthText))
+      throw invalidArchive("PAX record length is invalid");
     const length = Number(lengthText);
     const end = offset + length;
     if (!Number.isSafeInteger(length) || end > body.length || body[end - 1] !== 0x0a)
@@ -413,21 +418,59 @@ function parsePortablePax(body: Buffer): Record<string, string> {
     const record = body.subarray(space + 1, end - 1);
     const equals = record.indexOf(0x3d);
     if (equals <= 0) throw invalidArchive("PAX record is invalid");
-    const key = record.subarray(0, equals).toString("ascii");
-    if (key !== "path" && key !== "linkpath")
-      throw invalidArchive("PAX metadata key is not allowed");
-    if (Object.prototype.hasOwnProperty.call(values, key))
+    const rawKey = record.subarray(0, equals), key = rawKey.toString("ascii");
+    if (!rawKey.every(byte => byte >= 33 && byte <= 126) || rawKey.length > 268)
+      throw invalidArchive("PAX metadata key is invalid");
+    if (seen.has(key))
       throw invalidArchive("PAX metadata contains a duplicate key");
+    seen.add(key);
     const rawValue = record.subarray(equals + 1);
-    const value = rawValue.toString("utf8");
-    if (!value || Buffer.from(value, "utf8").compare(rawValue) !== 0 ||
-        /[\u0000-\u001f\u007f]/.test(value) || Buffer.byteLength(value) > MAX_PORTABLE_TAR_PATH_BYTES)
-      throw invalidArchive("PAX path metadata is invalid");
-    values[key] = value;
+    if (key === "path" || key === "linkpath") {
+      const value = rawValue.toString("utf8");
+      if (!value || Buffer.from(value, "utf8").compare(rawValue) !== 0 ||
+          /[\u0000-\u001f\u007f]/.test(value) || rawValue.length > MAX_PORTABLE_TAR_PATH_BYTES)
+        throw invalidArchive("PAX path metadata is invalid");
+      values[key] = value;
+    } else if (["atime", "ctime", "mtime"].includes(key)) {
+      if (!rawValue.every(byte => byte < 128) || !/^-?[0-9]{1,15}(?:\.[0-9]{1,9})?$/.test(rawValue.toString("ascii")))
+        throw invalidArchive("PAX timestamp metadata is invalid");
+    } else if (key === "SCHILY.acl.access" || key === "SCHILY.acl.default") {
+      validatePortableAcl(rawValue);
+      values[key === "SCHILY.acl.access" ? "accessAcl" : "defaultAcl"] = true;
+    } else if (key.startsWith("SCHILY.xattr.")) {
+      const attribute = key.slice(13);
+      if (Buffer.byteLength(attribute) > 255 ||
+          !/^(?:(?:user|trusted|security)\.[A-Za-z0-9_.:@+-]+|system\.posix_acl_(?:access|default))$/.test(attribute))
+        throw invalidArchive("PAX xattr metadata key is not allowed");
+      // GNU's SCHILY.xattr values are arbitrary bytes, not UTF-8 text. Their
+      // record length and the per-entry PAX ceiling bound them; never decode or
+      // repack them. POSIX ACL xattrs have the same entry-type constraints.
+      if (attribute === "system.posix_acl_access") values.accessAcl = true;
+      if (attribute === "system.posix_acl_default") values.defaultAcl = true;
+    } else throw invalidArchive("PAX metadata key is not allowed");
     offset = end;
   }
-  if (Object.keys(values).length === 0) throw invalidArchive("PAX metadata is empty");
+  if (seen.size === 0) throw invalidArchive("PAX metadata is empty");
   return values;
+}
+
+function validatePortableAcl(raw: Buffer): void {
+  if (!raw.every(byte => byte >= 32 && byte <= 126 || byte === 10))
+    throw invalidArchive("PAX ACL metadata is invalid");
+  const entries = raw.toString("ascii").split(/[,\n]/), identities = new Set<string>();
+  for (const entry of entries) {
+    const match = /^(user|group|mask|other):([A-Za-z0-9_.@+-]{0,128}):[r-][w-][x-](?::([0-9]{1,10}))?$/.exec(entry);
+    if (!match || (["mask", "other"].includes(match[1]!) && (match[2] || match[3])) ||
+        match[3] && (!match[2] || Number(match[3]) > 0xfffffffe) ||
+        /^[0-9]+$/.test(match[2]!) && Number(match[2]) > 0xfffffffe)
+      throw invalidArchive("PAX ACL metadata is invalid");
+    const identity = `${match[1]}:${match[3] ?? match[2]}`;
+    if (identities.has(identity)) throw invalidArchive("PAX ACL metadata contains a duplicate identity");
+    identities.add(identity);
+  }
+  if (!["user:", "group:", "other:"].every(identity => identities.has(identity)) ||
+      entries.length > 3 && !identities.has("mask:"))
+    throw invalidArchive("PAX ACL metadata is incomplete");
 }
 
 function verifyChecksum(block: Buffer): void {

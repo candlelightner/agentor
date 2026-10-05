@@ -236,7 +236,13 @@ export class IncusWorkerRuntime {
     return this.archiveStream(owner.containerName, role, validate, options);
   }
 
-  private async archiveStream(name: string, role: 'workspace' | 'agents', validate: () => Promise<void>,
+  /** Internal managed capture supplies the helper's exact UUID/isolation and
+   * source proof. The role/path cannot come from a portable bundle. */
+  openOfflineManagedArchive(helperName: string, validate: () => Promise<void>, signal?: AbortSignal) {
+    return this.archiveStream(helperName, 'managed', validate, { exclusions: [], signal }, true);
+  }
+
+  private async archiveStream(name: string, role: 'workspace' | 'agents' | 'managed', validate: () => Promise<void>,
     options: { exclusions: string[]; signal?: AbortSignal }, offline = false) {
     await validate();
     const session = await this.client.execStream(name,

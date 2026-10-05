@@ -54,15 +54,35 @@ function writeOctal(buffer: Buffer, offset: number, length: number, value: numbe
   buffer.write(`${value.toString(8).padStart(length - 1, "0")}\0`, offset, length, "ascii");
 }
 
-function paxRecord(key: string, value: string): Buffer {
-  const content = `${key}=${value}\n`;
-  let length = Buffer.byteLength(content) + 2;
+function paxRecord(key: string, value: string | Buffer): Buffer {
+  const content = Buffer.concat([Buffer.from(`${key}=`), Buffer.from(value), Buffer.from('\n')]);
+  let length = content.length + 2;
   while (true) {
-    const candidate = `${length} ${content}`;
-    const actual = Buffer.byteLength(candidate);
-    if (actual === length) return Buffer.from(candidate);
+    const candidate = Buffer.concat([Buffer.from(`${length} `), content]);
+    const actual = candidate.length;
+    if (actual === length) return candidate;
     length = actual;
   }
+}
+
+function rawPaxRecords(archive: Buffer): Array<{ key: string; value: Buffer }> {
+  const records: Array<{ key: string; value: Buffer }> = [];
+  for (let offset = 0; offset + 512 <= archive.length;) {
+    const header = archive.subarray(offset, offset + 512);
+    if (header.every(byte => byte === 0)) break;
+    const size = Number.parseInt(header.subarray(124, 136).toString('ascii').replace(/\0.*$/s, '').trim(), 8);
+    if (header[156] === 120) {
+      const body = archive.subarray(offset + 512, offset + 512 + size);
+      for (let position = 0; position < body.length;) {
+        const space = body.indexOf(32, position), length = Number(body.subarray(position, space).toString('ascii'));
+        const record = body.subarray(space + 1, position + length - 1), equals = record.indexOf(61);
+        records.push({ key: record.subarray(0, equals).toString('ascii'), value: record.subarray(equals + 1) });
+        position += length;
+      }
+    }
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+  return records;
 }
 
 async function writeGzipTar(path: string, items: TarItem[]): Promise<void> {
@@ -107,6 +127,109 @@ test("validator interoperates with real GNU ustar output used by Docker-style ar
     const result = await validatePortableManagedVolumeArchive(archive);
     expect(result.entries).toBeGreaterThanOrEqual(5);
     expect(result.expandedBytes).toBe(Buffer.byteLength("gnu data"));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('real GNU PAX binary xattrs, ACLs and filesystem/link metadata roundtrip without repacking', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'portable-volume-gnu-pax-'));
+  try {
+    const stage = join(dir, 'stage'), volume = join(stage, 'volume'), archive = join(dir, 'gnu-pax.tar');
+    await mkdir(volume, { recursive: true });
+    await writeFile(join(volume, 'file.bin'), Buffer.from([0, 255, 128, 10]));
+    await chmod(join(volume, 'file.bin'), 0o640);
+    execFileSync('python3', ['-c', String.raw`
+import errno,os,struct,sys
+root=sys.argv[1]
+os.setxattr(root+'/file.bin', 'user.binary', bytes([0,255,128,10,61,0]))
+acl=struct.pack('<I',2)+b''.join(struct.pack('<HHI',tag,perm,ident) for tag,perm,ident in [(1,6,0xffffffff),(2,4,12345),(4,4,0xffffffff),(16,4,0xffffffff),(32,0,0xffffffff)])
+os.setxattr(root+'/file.bin','system.posix_acl_access',acl)
+os.setxattr(root,'system.posix_acl_default',acl)
+try:
+ os.setxattr(root+'/file.bin','security.capability',struct.pack('<IIIII',0x02000001,1<<10,0,0,0))
+except OSError as error:
+ if error.errno not in (errno.EPERM,errno.EACCES,errno.ENOTSUP): raise
+`, volume]);
+    await symlink('file.bin', join(volume, 'relative-link'));
+    await link(join(volume, 'file.bin'), join(volume, 'hard-link'));
+    execFileSync('tar', ['--format=pax', '--numeric-owner', '--xattrs', '--xattrs-include=*', '--acls', '-C', stage, '-cf', archive, 'volume']);
+    const original = await readFile(archive), pax = rawPaxRecords(original);
+    console.info('GNU PAX fixture keys:', [...new Set(pax.map(record => record.key))].sort().join(', '));
+    expect(pax.some(record => record.key === 'SCHILY.xattr.user.binary' && record.value.equals(Buffer.from([0, 255, 128, 10, 61, 0])))).toBe(true);
+    await expect(validatePortableManagedVolumeArchive(archive)).resolves.toMatchObject({ entries: 4, expandedBytes: 4 });
+    const payload = join(dir, 'payload.gz'), destination = join(dir, 'payload-extracted');
+    const entry = { target: '/srv/data', name: 'metadata', archive: 'volumes/0.tar' };
+    await writePortableManagedVolumePayload([{ entry, archivePath: archive }], payload);
+    const unpacked = await validateAndExtractPortableManagedVolumePayload(payload, [entry], destination);
+    expect(await readFile(unpacked[0]!.archivePath)).toEqual(original);
+    const restored = join(dir, 'restored'); await mkdir(restored);
+    execFileSync('tar', ['--numeric-owner', '--same-owner', '--same-permissions', '--xattrs', '--xattrs-include=*', '--acls', '-C', restored, '-xf', unpacked[0]!.archivePath]);
+    const sourceInfo = await lstat(join(volume, 'file.bin')), restoredInfo = await lstat(join(restored, 'volume/file.bin'));
+    expect([restoredInfo.uid, restoredInfo.gid, restoredInfo.mode & 0o7777]).toEqual([sourceInfo.uid, sourceInfo.gid, sourceInfo.mode & 0o7777]);
+    expect((await lstat(join(restored, 'volume/hard-link'))).ino).toBe(restoredInfo.ino);
+    expect((await lstat(join(restored, 'volume/relative-link'))).isSymbolicLink()).toBe(true);
+    execFileSync('python3', ['-c', String.raw`
+import os,sys
+a,b=sys.argv[1:]
+for relative,name in [('file.bin','user.binary'),('file.bin','system.posix_acl_access'),('','system.posix_acl_default')]:
+ assert os.getxattr(a+'/'+relative,name)==os.getxattr(b+'/'+relative,name),(relative,name)
+if 'security.capability' in os.listxattr(a+'/file.bin'):
+ assert os.getxattr(a+'/file.bin','security.capability')==os.getxattr(b+'/file.bin','security.capability')
+assert os.stat(a+'/file.bin').st_mtime_ns==os.stat(b+'/file.bin').st_mtime_ns
+assert os.readlink(b+'/relative-link')=='file.bin'
+`, volume, join(restored, 'volume')]);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('bounded PAX metadata rejects control fields, malformed text, duplicate keys and unsafe ACL application', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'portable-volume-pax-security-'));
+  try {
+    const acl = 'user::rw-\ngroup::r--\nother::---';
+    const cases: Array<{ name: string; body: Buffer; type?: string; linkname?: string; message: RegExp }> = [
+      ...['GNU.sparse.map', 'GNU.sparse.size', 'size', 'SCHILY.realsize', 'SCHILY.fflags'].map(key =>
+        ({ name: key, body: paxRecord(key, '1'), message: /metadata key/i })),
+      ...['SCHILY.xattr.invalid.bad', 'SCHILY.xattr.system.unknown', 'SCHILY.xattr.user.bad/path'].map(key =>
+        ({ name: key.replaceAll('/', '-'), body: paxRecord(key, 'data'), message: /xattr metadata key/i })),
+      { name: 'mtime-control', body: paxRecord('mtime', '1\npath=../escape'), message: /timestamp/i },
+      { name: 'mtime-exponent', body: paxRecord('mtime', '1e99'), message: /timestamp/i },
+      { name: 'mtime-huge', body: paxRecord('mtime', '1'.repeat(16)), message: /timestamp/i },
+      { name: 'mtime-fraction', body: paxRecord('mtime', '1.' + '1'.repeat(10)), message: /timestamp/i },
+      { name: 'binary-path', body: paxRecord('path', Buffer.from([255, 128])), message: /path metadata/i },
+      { name: 'path-control', body: paxRecord('path', 'volume/file\0'), message: /path metadata/i },
+      { name: 'traversal', body: paxRecord('path', 'volume/../escape'), message: /unsafe path/i },
+      { name: 'absolute', body: paxRecord('path', '/etc/passwd'), message: /unsafe path/i },
+      { name: 'duplicate-xattr', body: Buffer.concat([paxRecord('SCHILY.xattr.user.binary', Buffer.from([255])), paxRecord('SCHILY.xattr.user.binary', Buffer.from([128]))]), message: /duplicate key/i },
+      { name: 'duplicate-time', body: Buffer.concat([paxRecord('mtime', '1'), paxRecord('mtime', '2')]), message: /duplicate key/i },
+      { name: 'huge-xattr', body: paxRecord('SCHILY.xattr.user.binary', Buffer.alloc(64 * 1024)), message: /unsupported PAX/i },
+      { name: 'acl-control', body: paxRecord('SCHILY.acl.access', acl + '\npath=../escape'), message: /ACL/i },
+      { name: 'acl-invalid-mode', body: paxRecord('SCHILY.acl.access', acl.replace('rw-', 'rwxz')), message: /ACL/i },
+      { name: 'acl-binary', body: paxRecord('SCHILY.acl.access', Buffer.from([255])), message: /ACL/i },
+      { name: 'acl-duplicate', body: paxRecord('SCHILY.acl.access', acl + '\nuser::rwx'), message: /duplicate identity/i },
+      { name: 'acl-incomplete', body: paxRecord('SCHILY.acl.access', 'user::rwx'), message: /incomplete/i },
+      { name: 'acl-file-default', body: paxRecord('SCHILY.acl.default', acl), message: /unsupported entry type/i },
+      { name: 'acl-symlink-access', body: paxRecord('SCHILY.acl.access', acl), type: 'symlink', linkname: 'target', message: /unsupported entry type/i },
+      { name: 'acl-symlink-opaque', body: paxRecord('SCHILY.xattr.system.posix_acl_access', Buffer.from([0, 255])), type: 'symlink', linkname: 'target', message: /unsupported entry type/i },
+    ];
+    for (const item of cases) {
+      const archive = join(dir, item.name + '.tar');
+      await writeTar(archive, [{ name: 'volume/', type: 'directory' }, { name: 'pax', type: 'pax-header', body: item.body },
+        { name: 'volume/file', ...(item.type ? { type: item.type, linkname: item.linkname } : { body: 'x' }) }]);
+      await expect(validatePortableManagedVolumeArchive(archive), item.name).rejects.toThrow(item.message);
+    }
+    for (const field of ['key', 'length']) {
+      const body = paxRecord('path', 'volume/safe');
+      body[field === 'length' ? 0 : body.indexOf(32) + 1] |= 0x80;
+      const archive = join(dir, `${field}-high-bit.tar`);
+      await writeTar(archive, [{ name: 'volume/', type: 'directory' }, { name: 'pax', type: 'pax-header', body }, { name: 'volume/file', body: 'x' }]);
+      await expect(validatePortableManagedVolumeArchive(archive)).rejects.toThrow(/metadata key|record length/i);
+    }
+    const opaque = join(dir, 'opaque-capability.tar');
+    await writeTar(opaque, [{ name: 'volume/', type: 'directory' },
+      { name: 'pax', type: 'pax-header', body: Buffer.concat([
+        paxRecord('SCHILY.xattr.security.capability', Buffer.from([0, 255, 128, 10, 61])),
+        paxRecord('SCHILY.xattr.trusted.overlay.opaque', 'y'),
+        paxRecord('SCHILY.xattr.user.binary', Buffer.concat([Buffer.from([255, 0]), paxRecord('path', '../escape')])),
+      ]) }, { name: 'volume/file', body: 'x' }]);
+    await expect(validatePortableManagedVolumeArchive(opaque)).resolves.toMatchObject({ entries: 2, expandedBytes: 1 });
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -168,7 +291,7 @@ test("raw validator rejects traversal, duplicates, PAX/GNU extensions, specials,
     const cases: Array<{ name: string; items: TarItem[]; message: RegExp }> = [
       { name: "traversal", items: [{ name: "volume/", type: "directory" }, { name: "volume/../escape", body: "x" }], message: /unsafe path/i },
       { name: "duplicate", items: [{ name: "volume/", type: "directory" }, { name: "volume/file", body: "a" }, { name: "volume/file", body: "b" }], message: /duplicate/i },
-      { name: "pax-unknown", items: [{ name: "volume/", type: "directory" }, { name: "pax", type: "pax-header", body: paxRecord("SCHILY.xattr.user.bad", "value") }, { name: "volume/file", body: "x" }], message: /pax metadata key/i },
+      { name: "pax-unknown", items: [{ name: "volume/", type: "directory" }, { name: "pax", type: "pax-header", body: paxRecord("SCHILY.realsize", "123") }, { name: "volume/file", body: "x" }], message: /pax metadata key/i },
       { name: "global-pax", items: [{ name: "volume/", type: "directory" }, { name: "global", type: "global-pax" }], message: /unsupported/i },
       { name: "gnu-long", items: [{ name: "volume/", type: "directory" }, { name: "long", type: "gnu-long-path" }], message: /unsupported/i },
       { name: "fifo", items: [{ name: "volume/", type: "directory" }, { name: "volume/fifo", type: "fifo" }], message: /unsupported/i },
