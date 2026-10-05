@@ -31,6 +31,30 @@ export class IncusWorkerStorage {
     return volume;
   }
 
+  /** Restore destinations are new identities. Never adopt even an owned but
+   * previously populated volume, including after an ambiguous create reply. */
+  async freshRestoreDevices(owner: IncusStorageOwner): Promise<Record<string, IncusDevice>> {
+    for (const role of ['workspace', 'agents', 'docker'] as const)
+      if (await this.find(owner, role)) throw new Error('Incus restore requires absent destination storage');
+    const devices: Record<string, IncusDevice> = {};
+    for (const role of ['workspace', 'agents'] as const) {
+      const name = this.name(owner, role);
+      await this.client.createCustomVolume(this.config.incusStoragePool, {
+        name, content_type: 'filesystem', config: {
+          'user.agentor.installation': this.installationId, 'user.agentor.id': owner.id,
+          'user.agentor.owner': owner.userId, 'user.agentor.storage-role': role,
+        },
+      });
+      const volume = await this.find(owner, role);
+      if (!volume) throw new Error('Fresh Incus restore storage is missing');
+      this.validate(volume, owner, role);
+      if (volume.used_by?.length) throw new Error('Fresh Incus restore storage is already attached');
+      devices[role] = { type: 'disk', pool: this.config.incusStoragePool, source: name,
+        path: role === 'workspace' ? '/restore/workspace' : '/restore/.agent-data' };
+    }
+    return devices;
+  }
+
   private validate(volume: IncusCustomVolume, owner: IncusStorageOwner, role: Role): void {
     const c = volume.config;
     if (volume.name !== this.name(owner, role) || volume.type !== "custom" ||

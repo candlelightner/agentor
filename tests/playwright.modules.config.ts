@@ -25,6 +25,8 @@ export default defineConfig({
     "api/plugin-desktop-core.spec.ts",
     "api/portable-managed-volume-format.spec.ts",
     "api/portable-managed-volume-archive.spec.ts",
+    "api/incus-canonical-restore-archive.spec.ts",
+    "api/incus-canonical-restore.spec.ts",
     "api/portable-managed-volume-plan.spec.ts",
     "api/portable-managed-volume-journal.spec.ts",
     "api/portable-managed-volume-runtime.spec.ts",

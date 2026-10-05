@@ -31,7 +31,8 @@ export function incusImageIdentity(image: IncusImage): IncusWorkerImageIdentity 
     bootstrapGeneration: p.bootstrap_generation, fingerprint: image.fingerprint });
 }
 
-export function sameIncusImageSource(a: IncusWorkerImageIdentity, b: IncusWorkerImageIdentity): boolean {
+export function sameIncusImageSource(a: Omit<IncusWorkerImageIdentity, 'version' | 'fingerprint'>,
+  b: Omit<IncusWorkerImageIdentity, 'version' | 'fingerprint'>): boolean {
   return a.sourceImageId === b.sourceImageId && a.recipeId === b.recipeId && a.architecture === b.architecture &&
     a.converterVersion === b.converterVersion && a.bootstrapGeneration === b.bootstrapGeneration;
 }

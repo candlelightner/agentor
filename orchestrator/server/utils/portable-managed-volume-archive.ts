@@ -66,6 +66,58 @@ export async function validatePortableManagedVolumeArchive(
   return { entries: scan.entries.length, expandedBytes: scan.expandedBytes };
 }
 
+/** Validate unchanged canonical bytes before extracting into fresh private
+ * storage, never into a guest with account or host shares already attached.
+ * Symlink values are guest data and may be external; archive writes may not
+ * follow them. Runtime admission and empty-destination proof belong to caller. */
+export async function validateIncusCanonicalRestoreArchive(
+  archivePath: string,
+  role: "workspace" | "agents",
+  limits: { maxEntries?: number; maxExpandedBytes?: number; signal?: AbortSignal } = {},
+): Promise<PortableManagedVolumeArchiveSummary> {
+  if (role !== "workspace" && role !== "agents") throw invalidArchive("invalid canonical restore role");
+  throwIfAborted(limits.signal);
+  const root = role === "workspace" ? "workspace/" : ".agent-data/";
+  const scan = await scanRawTar(archivePath, {
+    maxEntries: Math.min(limits.maxEntries ?? MAX_PORTABLE_MANAGED_VOLUME_ARCHIVE_ENTRIES,
+      MAX_PORTABLE_MANAGED_VOLUME_ARCHIVE_ENTRIES),
+    maxExpandedBytes: Math.min(limits.maxExpandedBytes ?? MAX_PORTABLE_MANAGED_VOLUME_EXPANDED_BYTES,
+      MAX_PORTABLE_MANAGED_VOLUME_EXPANDED_BYTES),
+    allowPortablePax: true,
+    requirePosixUstar: true,
+    signal: limits.signal,
+  });
+  const paths = new Map<string, RawTarEntry["type"]>(), regularFiles = new Set<string>();
+  let rootSeen = false;
+  for (const entry of scan.entries) {
+    throwIfAborted(limits.signal);
+    const name = canonicalInnerName(entry.name, entry.type, root), bare = stripDirectorySlash(name);
+    if (paths.has(bare)) throw invalidArchive("archive contains a duplicate or type-conflicting path");
+    paths.set(bare, entry.type);
+    if (bare === stripDirectorySlash(root)) {
+      if (entry.type !== "directory") throw invalidArchive("canonical root must be a directory");
+      rootSeen = true;
+    }
+    if (entry.type === "symlink") {
+      if (!entry.linkName || entry.linkName.includes("\\") || Buffer.byteLength(entry.linkName) > MAX_PORTABLE_TAR_PATH_BYTES)
+        throw invalidArchive("archive contains an unsafe symlink");
+    } else if (entry.type === "hardlink") {
+      if (!regularFiles.has(canonicalLinkTarget(entry.linkName!, root)))
+        throw invalidArchive("hardlink must target an earlier regular file in the canonical root");
+    } else if (entry.type === "file") regularFiles.add(name);
+  }
+  if (!rootSeen) throw invalidArchive(`archive is missing the ${root} root directory`);
+  for (const path of paths.keys()) {
+    throwIfAborted(limits.signal);
+    for (let ancestor = posix.dirname(path); ancestor !== "."; ancestor = posix.dirname(ancestor)) {
+      const type = paths.get(ancestor);
+      if (type !== undefined && type !== "directory")
+        throw invalidArchive("archive writes below an explicit non-directory path");
+    }
+  }
+  return { entries: scan.entries.length, expandedBytes: scan.expandedBytes };
+}
+
 export async function writePortableManagedVolumePayload(
   items: Array<{ entry: PortableManagedVolumeEntry; archivePath: string }>,
   outputPath: string,
@@ -215,7 +267,7 @@ export async function validateAndExtractPortableManagedVolumePayload(
 
 async function scanRawTar(
   archivePath: string,
-  options: { maxEntries: number; maxExpandedBytes: number; allowPortablePax: boolean; signal?: AbortSignal },
+  options: { maxEntries: number; maxExpandedBytes: number; allowPortablePax: boolean; requirePosixUstar?: boolean; signal?: AbortSignal },
 ): Promise<RawTarScan> {
   if (!Number.isSafeInteger(options.maxEntries) || options.maxEntries < 0 ||
       !Number.isSafeInteger(options.maxExpandedBytes) || options.maxExpandedBytes < 0)
@@ -248,6 +300,11 @@ async function scanRawTar(
       }
       if (zeroBlocks !== 0) throw invalidArchive("non-zero data after tar end marker");
       verifyChecksum(block);
+      // Only POSIX USTAR/PAX interprets bytes 345–499 as a path prefix. GNU
+      // and V7 dialects give them different meaning; accepting their prefix
+      // would disagree with the GNU extractor about the destination path.
+      if (options.requirePosixUstar && !block.subarray(257, 265).equals(Buffer.from("ustar\0" + "00", "ascii")))
+        throw invalidArchive("canonical restore requires POSIX USTAR/PAX header magic and version");
       const name = readTarPath(block, 0, 100, block, 345, 155);
       const size = readTarNumber(block, 124, 12, "size");
       const typeFlag = block[156] ?? 0;
@@ -352,7 +409,7 @@ function validateOuterEntries(entries: RawTarEntry[], expected: PortableManagedV
   }
 }
 
-function canonicalInnerName(name: string, type: RawTarEntry["type"]): string {
+function canonicalInnerName(name: string, type: RawTarEntry["type"], root = PORTABLE_MANAGED_VOLUME_ROOT): string {
   if (!name || name.includes("\0") || name.includes("\\") || name.startsWith("/") ||
       name.startsWith("./") || Buffer.byteLength(name) > MAX_PORTABLE_TAR_PATH_BYTES ||
       name.split("/").includes(".."))
@@ -362,8 +419,8 @@ function canonicalInnerName(name: string, type: RawTarEntry["type"]): string {
   if (!bare || posix.normalize(bare) !== bare || (!directory && name.endsWith("/")))
     throw invalidArchive("archive contains a non-canonical path");
   const canonical = directory ? `${bare}/` : bare;
-  if (canonical !== PORTABLE_MANAGED_VOLUME_ROOT && !canonical.startsWith(PORTABLE_MANAGED_VOLUME_ROOT))
-    throw invalidArchive("archive path is outside volume/");
+  if (canonical !== root && !canonical.startsWith(root))
+    throw invalidArchive(`archive path is outside ${root}`);
   return canonical;
 }
 
@@ -382,11 +439,11 @@ function validateSymlink(name: string, linkTarget: string, mountTarget?: string)
     throw invalidArchive("archive symlink escapes volume/");
 }
 
-function canonicalLinkTarget(target: string): string {
+function canonicalLinkTarget(target: string, root = PORTABLE_MANAGED_VOLUME_ROOT): string {
   if (!target || target.includes("\0") || target.includes("\\") || target.startsWith("/") ||
       target.endsWith("/") || target.startsWith("./") || target.split("/").includes("..") ||
       Buffer.byteLength(target) > MAX_PORTABLE_TAR_PATH_BYTES ||
-      posix.normalize(target) !== target || !target.startsWith(PORTABLE_MANAGED_VOLUME_ROOT))
+      posix.normalize(target) !== target || !target.startsWith(root))
     throw invalidArchive("archive contains an unsafe hardlink");
   return target;
 }

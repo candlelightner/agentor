@@ -1,6 +1,6 @@
 import type { Config } from "./config";
 import type { DockerService } from "./docker";
-import { IncusClient, type IncusInstance, type IncusDevice } from "./incus-client";
+import { IncusClient, type IncusInstance, type IncusDevice, type IncusCustomVolume } from "./incus-client";
 import { AGENT_CREDENTIAL_MAPPINGS } from "./user-credentials";
 import { join } from "node:path";
 import { renderUserEnvVars } from "./user-env-store";
@@ -22,9 +22,13 @@ import { isIP } from 'node:net';
 import { incusHostMountLayout, incusHostMountMetadata, assertIncusHostMountLayout } from './incus-host-mount-runtime';
 import { INCUS_CANONICAL_ARCHIVE_SCRIPT } from './incus-canonical-archive';
 import { PassThrough } from 'node:stream';
-import { snapshotIncusWorkerBackupRuntime } from './worker-backup-runtime';
+import { snapshotIncusWorkerBackupRuntime, parseWorkerBackupRuntime, type WorkerBackupRuntimeSource } from './worker-backup-runtime';
 import { IncusOfflineArchiveHelper } from './incus-offline-archive-helper';
 import { writeGzipFile } from './worker-export';
+import { INCUS_CANONICAL_RESTORE_SCRIPT } from './incus-canonical-restore';
+import { validateIncusCanonicalRestoreArchive } from './portable-managed-volume-archive';
+import { createReadStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
 
 export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & {
   sshAuthorizedKeys?: string;
@@ -734,6 +738,33 @@ export class IncusWorkerRuntime {
   }
 
   async create(opts: IncusWorkerOptions, existing?: { fingerprint: string; docker: boolean }): Promise<IncusInstance> {
+    return this.createWorker(opts, existing);
+  }
+
+  /** Internal first-import primitive; caller persists the existing initialCreate
+   * marker BEFORE this request and captures its returned UUID. No retry/adoption
+   * of partially allocated destinations is permitted. */
+  async createCanonicalRestore(opts: IncusWorkerOptions, source?: WorkerBackupRuntimeSource): Promise<IncusInstance> {
+    if (!opts.recreationNonce || opts.start !== false)
+      throw new Error('Incus restore requires durable nonce and stopped initial creation');
+    let fingerprint: string | undefined;
+    let verifiedSource: WorkerBackupRuntimeSource | undefined;
+    if (source) {
+      const parsed = parseWorkerBackupRuntime({ version: 1, kind: 'incus-vm', source });
+      if (parsed?.kind !== 'incus-vm') throw new Error('Invalid Incus restore source');
+      verifiedSource = parsed.source;
+      for (const image of await this.client.listImages()) {
+        let identity: IncusWorkerImageIdentity;
+        try { identity = incusImageIdentity(image); } catch { continue; }
+        if (sameIncusImageSource(identity, parsed.source)) { fingerprint = identity.fingerprint; break; }
+      }
+      if (!fingerprint) throw new Error('Derived image for the immutable restore source is unavailable');
+    }
+    return this.createWorker(opts, undefined, { fingerprint, source: verifiedSource });
+  }
+
+  private async createWorker(opts: IncusWorkerOptions, existing?: { fingerprint: string; docker: boolean },
+    restore?: { fingerprint?: string; source?: WorkerBackupRuntimeSource }): Promise<IncusInstance> {
     await this.assertReady();
     // These features are integrated in the following storage/device phases.
     // Refuse them here rather than silently placing data on disposable rootfs.
@@ -741,15 +772,18 @@ export class IncusWorkerRuntime {
     if (opts.containerName !== `${this.config.containerPrefix}-${opts.id}`)
       throw new Error("Incus worker name must match its WorkerRecord identity");
     const storage = await this.storage();
-    const source = await storage.imageIdentity(opts);
-    const fingerprint = existing ? await this.resolveImage(existing.fingerprint)
+    if (restore) await this.assertAbsentCompute(opts);
+    const source = restore ? undefined : await storage.imageIdentity(opts);
+    const fingerprint = restore ? await this.resolveImage(restore.fingerprint) : existing ? await this.resolveImage(existing.fingerprint)
       : source ? await this.resolveStoredImage(source) : await this.resolveImage();
     const identity = incusImageIdentity(await this.client.getImage(fingerprint));
     if (source && !sameIncusImageSource(source, identity)) throw new Error('Incus reconstruction image source changed');
-    const account = await this.accountDevices(opts);
-    const hostMounts = await incusHostMountLayout(this.config, opts, 'ensure');
-    const persistent = await storage.devices(opts, opts.environmentJson.dockerEnabled,
-      existing && { docker: existing.docker });
+    if (restore?.source && !sameIncusImageSource(restore.source, identity))
+      throw new Error('Incus restore immutable image source changed before allocation');
+    const account = restore ? {} : await this.accountDevices(opts);
+    const hostMounts = restore ? undefined : await incusHostMountLayout(this.config, opts, 'ensure');
+    const persistent = restore ? await storage.freshRestoreDevices(opts)
+      : await storage.devices(opts, opts.environmentJson.dockerEnabled, existing && { docker: existing.docker });
     await storage.recordImageIdentity(opts, identity);
     const instance = await this.client.createInstance({
       name: opts.containerName, type: "virtual-machine", profiles: [],
@@ -759,7 +793,8 @@ export class IncusWorkerRuntime {
         "user.agentor.owner": opts.userId,
         "user.agentor.installation": await this.installationId(),
         "user.agentor.runtime-generation": "1",
-        ...incusHostMountMetadata(hostMounts),
+        ...(hostMounts ? incusHostMountMetadata(hostMounts) : {}),
+        ...(restore ? { 'user.agentor.restore': 'incomplete' } : {}),
         ...(opts.recreationNonce ? { 'user.agentor.recreation': opts.recreationNonce } : {}),
         "security.secureboot": "false",
         "boot.autostart": "false",
@@ -769,11 +804,11 @@ export class IncusWorkerRuntime {
       devices: {
         ...persistent,
         ...account,
-        ...await this.managedDevices(opts),
-        ...hostMounts.devices,
+        ...(restore ? {} : await this.managedDevices(opts)),
+        ...hostMounts?.devices,
         root: { type: "disk", path: "/", pool: this.config.incusStoragePool },
-        eth0: { type: "nic", name: "eth0", network: this.config.incusNetwork,
-          "security.mac_filtering": "true", "security.ipv4_filtering": "true", "security.ipv6_filtering": "true" },
+        ...(restore ? {} : { eth0: { type: "nic", name: "eth0", network: this.config.incusNetwork,
+          "security.mac_filtering": "true", "security.ipv4_filtering": "true", "security.ipv6_filtering": "true" } }),
       },
     });
     if (opts.start !== false) await this.start(opts);
@@ -783,6 +818,112 @@ export class IncusWorkerRuntime {
   private async checkedExec(name: string, command: string[]): Promise<void> {
     const result = await this.client.exec(name, command);
     if (result.returnCode !== 0) throw new Error(`Incus worker bootstrap command failed (${command[0]}, exit ${result.returnCode})`);
+  }
+
+  /** Raw paths must be private import scratch, not caller-selected host files.
+   * No account overlays or ordinary startup are allowed during extraction. The
+   * existing worker/owner fence and initialCreate marker remain caller-owned. */
+  async restoreCanonicalArchives(opts: IncusWorkerOptions, incarnation: string,
+    payloads: { workspace?: string; agents?: string }, validateRecord: () => void | Promise<void>,
+    signal?: AbortSignal): Promise<void> {
+    if (!incarnation || !opts.recreationNonce) throw new Error('Incus restore requires exact initial creation authority');
+    const storage = await this.storage();
+    const expected = {
+      root: { type: 'disk', path: '/', pool: this.config.incusStoragePool },
+      workspace: { type: 'disk', pool: this.config.incusStoragePool,
+        source: opts.containerName + '-workspace', path: '/restore/workspace' },
+      agents: { type: 'disk', pool: this.config.incusStoragePool,
+        source: opts.containerName + '-agents', path: '/restore/.agent-data' },
+    };
+    const sameMap = (actual: Record<string, IncusDevice>) =>
+      Object.keys(actual).length === 3 && Object.entries(expected).every(([key, value]) => sameDevice(actual[key], value));
+    const inspect = async () => {
+      signal?.throwIfAborted();
+      await validateRecord();
+      const instance = await this.assertOwned(opts.containerName, opts.id, opts.userId, incarnation);
+      if (instance.type !== 'virtual-machine' || instance.profiles?.length ||
+          instance.config['user.agentor.recreation'] !== opts.recreationNonce ||
+          instance.config['user.agentor.restore'] !== 'incomplete' || !sameMap(instance.devices) ||
+          !sameMap(instance.expanded_devices ?? instance.devices) ||
+          Object.keys(instance.config).some(key => key.startsWith('raw.')) ||
+          Object.keys(instance.expanded_config ?? {}).some(key => key.startsWith('raw.')))
+        throw new Error('Incus canonical restore layout or identity is ambiguous');
+      return instance;
+    };
+    const before = await inspect();
+    if (before.status !== 'Stopped') throw new Error('Incus canonical restore requires new stopped compute');
+    const volumes: Array<{ role: 'workspace' | 'agents'; volume: IncusCustomVolume }> = [];
+    for (const role of ['workspace', 'agents'] as const) {
+      const volume = await storage.inspectVolume(opts, role);
+      if (!volume || !volume.created_at || !Array.isArray(volume.used_by) || volume.used_by.length !== 1)
+        throw new Error('Incus restore canonical volume authority is unavailable');
+      const reference = new URL(volume.used_by[0]!, this.client.endpoint);
+      if (reference.origin !== new URL(this.client.endpoint).origin || reference.username || reference.password ||
+          reference.hash || reference.pathname !== `/1.0/instances/${opts.containerName}` ||
+          reference.searchParams.getAll('project').length !== 1 || reference.searchParams.get('project') !== this.config.incusProject ||
+          [...reference.searchParams.keys()].some(key => key !== 'project'))
+        throw new Error('Incus restore storage reference is foreign');
+      volumes.push({ role, volume });
+      if (payloads[role]) await validateIncusCanonicalRestoreArchive(payloads[role]!, role, { signal });
+    }
+    let started = false;
+    const stable = async () => {
+      const instance = await inspect();
+      if (instance.status !== (started ? 'Running' : 'Stopped'))
+        throw new Error('Incus restore runtime state changed');
+      const config = (value: Record<string, string>) => JSON.stringify(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
+      const computeConfig = (value: Record<string, string>) => config(Object.fromEntries(Object.entries(value)
+        .filter(([key]) => !key.startsWith('volatile.') || ['volatile.uuid', 'volatile.base_image'].includes(key))));
+      if (computeConfig(instance.config) !== computeConfig(before.config)) throw new Error('Incus restore compute configuration changed');
+      for (const { role, volume } of volumes) {
+        const current = await storage.inspectVolume(opts, role);
+        if (!current || current.created_at !== volume.created_at || current.project !== volume.project ||
+            config(current.config) !== config(volume.config) ||
+            JSON.stringify(current.used_by) !== JSON.stringify(volume.used_by))
+          throw new Error('Incus restore private storage changed');
+      }
+      await validateRecord();
+    };
+    await stable();
+    try {
+      await this.client.startInstance(opts.containerName);
+      started = true;
+      const deadline = Date.now() + 120_000;
+      let ready = false;
+      while (Date.now() < deadline) {
+        signal?.throwIfAborted();
+        try { ready = (await this.client.exec(opts.containerName, ['true'])).returnCode === 0; } catch { /* boot */ }
+        if (ready) break;
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      if (!ready) throw new Error('Incus canonical restore guest agent did not become ready');
+      for (const role of ['workspace', 'agents'] as const) if (payloads[role]) {
+        await stable();
+        const session = await this.client.execStream(opts.containerName,
+          ['/usr/bin/python3', '-c', INCUS_CANONICAL_RESTORE_SCRIPT, role], {
+            command: [],
+            user: 0, group: 0, cwd: '/', environment: { PATH: '/usr/bin:/bin', LC_ALL: 'C' },
+            signal, timeoutMs: 30 * 60_000,
+          });
+        session.stdout.resume(); session.stderr.resume();
+        try {
+          await Promise.all([pipeline(createReadStream(payloads[role]!), session.stdin, { signal }),
+            session.result.then(code => { if (code !== 0) throw new Error(`Incus canonical ${role} extraction failed (exit ${code})`); })]);
+          await stable();
+        } finally { session.close(); }
+      }
+      await stable();
+    } catch (error) {
+      // A start observer can fail while Incus still owns an operation. A
+      // stopped read-back is not terminal proof: leave the initial-create
+      // nonce quarantine intact rather than claim shutdown or retry start.
+      if (!started) throw new AggregateError([error], 'Incus restore start is unconfirmed; destination remains quarantined');
+      // A truncated archive/cancelled exec may have left a child process. Stop
+      // exact destination compute before any subsequent rollback/storage use.
+      try { await this.stop(opts, incarnation); }
+      catch (stopError) { throw new AggregateError([error, stopError], 'Incus restore failed; destination shutdown is unconfirmed'); }
+      throw error;
+    }
   }
 
   /** Positive guest facts only. Timeout/transport failures are unknown, never
@@ -813,6 +954,8 @@ export class IncusWorkerRuntime {
     await this.assertReady();
     const name = opts.containerName;
     const instance = await this.assertOwned(name, opts.id, opts.userId, incarnation);
+    if (instance.config['user.agentor.restore'] !== undefined)
+      throw new Error('Incus restore destination is incomplete; normal worker startup is forbidden');
     if (instance.config['user.agentor.owner'] !== opts.userId)
       throw new Error('Incus worker account identity does not match');
     const state = await this.client.getInstanceState(name);
