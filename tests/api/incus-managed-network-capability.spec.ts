@@ -14,6 +14,7 @@ import { backupInstallationId } from '../../orchestrator/server/utils/backup-ins
 import { incusManagedBridgeIdentity, incusManagedNetworkDevice } from '../../orchestrator/server/utils/incus-managed-network-identity';
 import { ContainerManager } from '../../orchestrator/server/utils/container';
 import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
+import { WorkerGroupNetworkCoordinator } from '../../orchestrator/server/utils/worker-group-manager';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 
@@ -120,6 +121,9 @@ test('filtered secondary managed bridge preserves primary routing and supports m
     // Fixture owner has no dashboard SQLite account. All real durable runtime,
     // lifecycle, native project and device authority checks remain in place.
     (manager as any).assertOwnerExists = async (userId: string) => expect(userId).toBe(owner.userId);
+    const groupQueue = new WorkerGroupNetworkCoordinator({} as any);
+    const setNetwork = (attach: boolean) => groupQueue.withOwner(owner.userId,
+      () => manager.setIncusManagedNetwork(id, managedNetwork.id, attach));
     installation = instance.config['user.agentor.installation'];
     expect(installation).toMatch(/^[0-9a-f-]{36}$/);
     const primary = await runtime.resolvePrimaryAddress(owner);
@@ -151,7 +155,7 @@ test('filtered secondary managed bridge preserves primary routing and supports m
     // Secondary DHCP receives no route, DNS, domain or IPv6 RA authority.
     const secondaryMac = secondary.hwaddr!;
     const current = await client.getInstance(owner.containerName);
-    await manager.setIncusManagedNetwork(id, managedNetwork.id, true);
+    await setNetwork(true);
     await expect.poll(async () => {
       const state = await client.getInstanceState(owner.containerName);
       return Object.values(state.network ?? {}).find(nic => nic.hwaddr === secondaryMac)
@@ -217,7 +221,7 @@ test('filtered secondary managed bridge preserves primary routing and supports m
     expect(await runtime.resolvePrimaryAddress(owner)).toEqual(primary);
     expect(await checked(['curl', '--fail', '--max-time', '5', target])).toBe('mixed-member-ok');
     expect((await root(`sudo docker exec '${peerName}' node -e '${request}'`)).trim()).toBe('vm-editor-ok');
-    await manager.setIncusManagedNetwork(id, managedNetwork.id, false);
+    await setNetwork(false);
     expect((await client.getInstance(owner.containerName)).devices).toEqual(current.devices);
     expect(await runtime.resolvePrimaryAddress(owner)).toEqual(primary);
     console.info('Mixed-member traffic passed; IPv4/MAC spoof traffic denied with healthy controls, primary route/DNS retained and detach restores identity.');

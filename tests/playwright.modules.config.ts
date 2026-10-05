@@ -35,6 +35,7 @@ export default defineConfig({
     "api/managed-volume-store.spec.ts",
     "api/managed-network-update.spec.ts",
     "api/managed-network-manager.spec.ts",
+    "api/worker-group-network-coordinator.spec.ts",
     "api/host-mount-store.spec.ts",
     "api/managed-volume-sizing-control.spec.ts",
     "api/managed-volume-sizing-mcp-authority.spec.ts",

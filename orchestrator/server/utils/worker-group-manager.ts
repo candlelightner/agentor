@@ -12,6 +12,7 @@ import { useImageCatalogManager } from "./image-catalog";
 import type { WorkerGroup } from "./worker-group-store";
 import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 import { verifyWorkerMutationUnlocks } from "./worker-protection-lock";
+import { withOwnerLifecycleMutation } from "./worker-lifecycle-coordinator";
 
 type WorkerGroupPatch = Pick<
   Partial<WorkerGroup>,
@@ -75,6 +76,12 @@ export class WorkerGroupNetworkCoordinator {
   ) {}
 
   withOwner<T>(userId: string, operation: () => Promise<T>): Promise<T> {
+    // Lifecycle batches already use owner→group→worker. All network/group
+    // entrypoints use the same order before managed NIC admission takes worker.
+    return withOwnerLifecycleMutation(userId, () => this.withGroupOwner(userId, operation));
+  }
+
+  private withGroupOwner<T>(userId: string, operation: () => Promise<T>): Promise<T> {
     const active = this.activeOwners.getStore();
     // Group-scoped management calls intentionally hold this queue across the
     // authorized operation. Cleanup performed by that operation may need to

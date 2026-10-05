@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   operationSettlement,
   type OperationFailureWithSettlement,
@@ -8,6 +9,7 @@ import {
  * mutation cannot strand every later lifecycle request for that worker. */
 export class WorkerLifecycleCoordinator {
   private queues = new Map<string, Promise<void>>();
+  private ownerContexts = new AsyncLocalStorage<ReadonlyMap<string, { active: boolean }>>();
   private mutations = new Map<string, number>();
   /** A monotonic admission marker lets inventory reconciliation distinguish a
    * Docker list snapshot taken before a worker mutation from current state.
@@ -31,6 +33,22 @@ export class WorkerLifecycleCoordinator {
 
   generation(workerId: string): number {
     return this.generations.get(workerId) ?? 0;
+  }
+
+  /** Only the owner boundary is reentrant. Network/group admission may already
+   * hold it before taking a worker fence; a worker fence must never reenter. */
+  withOwner<T>(userId: string, operation: () => Promise<T>,
+    options: { holdTimeoutSettlement?: boolean; runtimeSetup?: boolean } = {}): Promise<T> {
+    const contexts = this.ownerContexts.getStore();
+    if (contexts?.get(userId)?.active) return operation();
+    return this.withWorker(`owner:${userId}`, async () => {
+      const marker = { active: true }, next = new Map(contexts ?? []);
+      next.set(userId, marker);
+      return this.ownerContexts.run(next, async () => {
+        try { return await operation(); }
+        finally { marker.active = false; }
+      });
+    }, options);
   }
 
   withWorker<T>(
@@ -107,7 +125,7 @@ export function withOwnerLifecycleMutation<T>(
   userId: string,
   operation: () => Promise<T>,
 ): Promise<T> {
-  return lifecycleCoordinator.withWorker(`owner:${userId}`, operation);
+  return lifecycleCoordinator.withOwner(userId, operation);
 }
 
 /** Acquire lifecycle fences in the only supported nesting order. Keeping the
@@ -123,7 +141,7 @@ export function withOwnerWorkerLifecycleMutation<T>(
   // same owner indefinitely, despite each sibling having an independent
   // Docker task. Account cleanup still takes owner→worker in this order and
   // therefore waits for the affected worker fence before touching it.
-  return lifecycleCoordinator.withWorker(`owner:${userId}`, () =>
+  return lifecycleCoordinator.withOwner(userId, () =>
     withWorkerLifecycleMutation(workerId, operation),
     { holdTimeoutSettlement: false },
   );
@@ -133,7 +151,7 @@ export function withOwnerWorkerLifecycleMutation<T>(
  * claiming a lifecycle mutation. Release after channels attach, not command
  * completion, so stop/rebuild can still cancel a long-running guest process. */
 export function withOwnerWorkerRuntimeSetup<T>(userId: string, workerId: string, operation: () => Promise<T>): Promise<T> {
-  return lifecycleCoordinator.withWorker(`owner:${userId}`, () =>
+  return lifecycleCoordinator.withOwner(userId, () =>
     lifecycleCoordinator.withWorker(workerId, operation, { runtimeSetup: true }),
     { runtimeSetup: true, holdTimeoutSettlement: false });
 }
