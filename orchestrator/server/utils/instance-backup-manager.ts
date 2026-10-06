@@ -61,6 +61,7 @@ import { withOwnerWorkerLifecycleMutation } from './worker-lifecycle-coordinator
 import { managedVolumeRuntimeKind, assertIncusLiveResolved } from './managed-volume-store';
 import { IncusError } from './incus-client';
 import { incusWorkerVolumeName } from './incus-worker-storage';
+import { useManagedVolumeManager } from './managed-volume-manager';
 
 const MAX_CONCURRENT_JOBS = 1;
 const MAX_LOG_LINES = 1000;
