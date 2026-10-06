@@ -27,6 +27,7 @@ import { createInstanceDataArchive, instanceVolumeArchiveName, instanceBundleFil
 import { decryptInstanceBackup, encryptInstanceBackup, inspectInstanceBackup } from '../../orchestrator/server/utils/instance-backup-crypto';
 import { backupKeyFingerprint, validateRecoveryKit } from '../../orchestrator/server/utils/backup-keyring';
 import type { InstanceBackupArtifact, InstanceBackupJob, InstanceBackupManifest, InstanceRestorePreflight } from '../../orchestrator/server/utils/instance-backup-types';
+import type { BackupArtifact, BackupJob } from '../../orchestrator/server/utils/backup-types';
 
 const run = promisify(execFile);
 const ssh = ['-p', '22375', '-i', '/workspace/agentor-kata-vm-access.ZgLVo9uk/id_ed25519',
@@ -51,9 +52,12 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
   : mode === 'app-retained' ? 'real running Orchestrator reloads authenticated native restore completion and retained data'
   : mode === 'app-ordinary' ? 'real running Orchestrator starts restored ordinary VM through authenticated REST with native Docker and worker identity'
   : mode === 'app-rollback' ? 'real running Orchestrator authenticates original control plane after witnessed native rollback'
-  : mode === 'app-rest-ordinary' ? 'real public instance restore imports an encrypted native bundle and restores ordinary VM Docker data through authenticated REST'
+  : mode === 'app-rest-ordinary' ? process.env.INCUS_ORIGINAL_PUBLIC_TEST === 'true'
+    ? 'real authenticated worker backup restores its original Incus workspace without replacing other state'
+    : 'real public instance restore imports an encrypted native bundle and restores ordinary VM Docker data through authenticated REST'
   : 'real controlled helper process restores retained native data and restarts only its exact recovery target', async () => {
-  const rest = mode === 'app-rest-ordinary', app = mode.startsWith('app-'), ordinary = rest || mode === 'app-ordinary' || mode !== 'retained' && !app,
+  const originalPublic = mode === 'app-rest-ordinary' && process.env.INCUS_ORIGINAL_PUBLIC_TEST === 'true';
+  const rest = mode === 'app-rest-ordinary' && !originalPublic, app = mode.startsWith('app-'), ordinary = originalPublic || rest || mode === 'app-ordinary' || mode !== 'retained' && !app,
     rollback = mode === 'rollback' || mode === 'app-rollback';
   test.skip(process.env.INCUS_INSTANCE_HELPER_PROCESS_TEST !== 'true', 'Explicit serial approved disposable helper-process gate');
   test.setTimeout(900_000);
@@ -82,6 +86,23 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
         retained.volume.workerId !== retained.workerId || retained.volume.userId !== retained.ownerId)
       throw new Error('Retained producer parameters do not identify the explicitly approved fixture');
   }
+  // Admit every ordinary source input before creating even a local fixture,
+  // packaging an App or reaching SSH/Incus. Hash the verified regular file
+  // through its no-follow descriptor once; later setup reuses this proof.
+  let dockerSource: string | undefined, dockerSourceDigest: string | undefined;
+  if (ordinary) {
+    dockerSource = retained?.dockerArchive.path ?? process.env.INCUS_INSTANCE_HELPER_DOCKER_ARCHIVE;
+    if (!dockerSource) throw new Error('Ordinary gate requires the accepted raw Docker archive fixture');
+    const file = await open(dockerSource, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const info = await file.stat();
+      if (!info.isFile() || info.size <= 0) throw new Error('Ordinary gate requires a nonempty regular Docker archive fixture');
+      const hash = createHash('sha256');
+      for await (const chunk of file.createReadStream({ autoClose: false })) hash.update(chunk);
+      dockerSourceDigest = hash.digest('hex');
+      if (retained) expect(dockerSourceDigest).toBe(retained.dockerArchive.sha256);
+    } finally { await file.close(); }
+  }
   const local = await mkdtemp(join(tmpdir(), 'agentor-native-helper-process-'));
   const followupNonce = randomUUID();
   const source = join(retained?.localDir ?? local, 'source'), targetData = join(local, 'data'), build = join(local, 'image');
@@ -108,7 +129,6 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
   let sourceRuleBaseline: string | undefined;
   const sourceRuleSnapshot = (value: string) => JSON.stringify(JSON.parse(value), (key, value) =>
     key === 'metainfo' ? undefined : key === 'counter' ? {} : value);
-  let dockerSource: string | undefined, dockerSourceDigest: string | undefined;
   let baseline: Awaited<ReturnType<IncusManagedVolumeRuntime['inspectVolume']>>;
   const config = { ...loadConfig(), dataDir: source, containerPrefix: app ? 'aphr-' + jobId.slice(0, 8) : 'agentor-worker', incusEnabled: true,
     incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor', incusStoragePool: 'default', incusNetwork: 'incusbr0',
@@ -136,6 +156,8 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
     if (app) await run(process.execPath, ['--input-type=module', '-e',
       `const{default:WS}=await import(${JSON.stringify(join(build, 'app-output/server/node_modules/ws/wrapper.mjs'))});` +
       `if(typeof WS!=='function')throw Error('Fixture packaged WebSocket entry changed');`], { timeout: 10_000 });
+    if (originalPublic) expect(await readFile(join(build, 'app-output/server/chunks/nitro/nitro.mjs'), 'utf8'))
+      .toContain('replaceOriginalWorkspaceFromBackup'); // Cheap packaging seam before native source allocation.
     if (app) for (const file of ['volume-mount-helper.py', 'incus-volume-live-helper.py'])
       await copyFile(fileURLToPath(new URL('../../orchestrator/' + file, import.meta.url)), join(build, file));
     if (!retained) {
@@ -189,7 +211,8 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
   // Sign-in cookies stay inside the exact App fixture (including a private
   // producer session file) and never appear in tool/test output.
   const appRequest = async <T,>(path: string, body?: unknown, authenticated = true,
-    timeoutMs = 30_000, privateFile?: { path: string; format: 'json' | 'binary' }, sessionPath?: string): Promise<{ status: number; body: T }> => {
+    timeoutMs = 30_000, privateFile?: { path: string; format: 'json' | 'binary' }, sessionPath?: string,
+    method?: 'PUT'): Promise<{ status: number; body: T }> => {
     if (privateFile && body !== undefined) throw new Error('Fixture request cannot mix a private file and an inline body');
     if (sessionPath && !authenticated) throw new Error('Fixture private session requires an authenticated request');
     const script = `const base='http://127.0.0.1:3000';const headers={Origin:base,'Content-Type':'application/json'};` +
@@ -202,7 +225,7 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
         (privateFile.format === 'binary' ? `headers['Content-Type']='application/octet-stream';headers['Content-Length']=String(s.size);` : '') : '') +
       `const r=await fetch(base+${JSON.stringify(path)},{headers,redirect:'manual'` +
       (privateFile ? `,method:'POST',body:${privateFile.format === 'binary' ? "fs.createReadStream(p),duplex:'half'" : "fs.readFileSync(p,'utf8')"}`
-        : body === undefined ? '' : ",method:'POST',body:" + JSON.stringify(JSON.stringify(body))) + `});` +
+        : body === undefined ? '' : ",method:" + JSON.stringify(method ?? 'POST') + ',body:' + JSON.stringify(JSON.stringify(body))) + `});` +
       `console.log(JSON.stringify({status:r.status,body:r.headers.get('content-type')?.includes('application/json')?await r.json():await r.text()}));`;
     try {
       return JSON.parse(await root(`sudo docker exec ${targetId} node --input-type=module -e ${quote(script)}`, timeoutMs));
@@ -395,8 +418,6 @@ print('Exact account fixture delta confirmed')
       storage.mode = 'directory'; storage.dataHostPath = remoteData; options.storageManager = storage;
       incarnation = retained.incarnation; baseline = await managedRuntime.inspectVolume(volume);
       expect(baseline).toEqual(retained.volumes.find(v => v.name === volume.dockerName));
-      dockerSource = retained.dockerArchive.path; dockerSourceDigest = retained.dockerArchive.sha256;
-      expect(await sha256File(dockerSource)).toBe(dockerSourceDigest);
       if (retained.oldNft) {
         expect(retained.oldNft.table).toBe('agentor_restore_' + jobId.slice(0, 8));
         expect(sourceRuleSnapshot(await root(`sudo nft -j list table ip ${retained.oldNft.table}`)))
@@ -483,9 +504,7 @@ print('Exact account fixture delta confirmed')
     if (ordinary) {
       // Reuse an operator-selected, previously accepted logical Docker capture,
       // unchanged. Never fabricate Docker internals or copy a physical device.
-      dockerSource = process.env.INCUS_INSTANCE_HELPER_DOCKER_ARCHIVE;
-      if (!dockerSource) throw new Error('Ordinary gate requires the accepted raw Docker archive fixture');
-      dockerSourceDigest = await sha256File(dockerSource);
+      // Required archive/path/digest were admitted before any fixture resources.
       const workers = new WorkerStore(source); await workers.init();
       await workers.upsert({ id, userId, runtimeKind: 'incus-vm', status: 'active', desiredRuntimeStatus: 'stopped',
         displayName: 'Controlled instance restored worker', createdAt: stamp, updatedAt: stamp });
@@ -810,7 +829,7 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
         'curl --fail --silent http://127.0.0.1:8443/ >/dev/null; curl --fail --silent http://127.0.0.1:6080/ >/dev/null']);
       expect(checked.returnCode, checked.stdout + checked.stderr).toBe(0); expect(checked.stdout.trim()).toBe('overlay2');
       expect(await sha256File(dockerSource!)).toBe(dockerSourceDigest);
-      if (app) {
+      if (app && !originalPublic) {
         const editor = await appRequest<string>('/editor/' + id + '/?folder=/workspace');
         expect(editor.status).toBe(200); expect(editor.body).toContain('code-server');
         const desktop = await appRequest<string>('/desktop/' + id + '/agentor.html');
@@ -843,6 +862,95 @@ xattr=base64.b64encode(os.getxattr(p+'/data','user.binary')).decode())))`)} ${qu
       expect(await root(`sudo docker ps -aq --no-trunc --filter id=${helperId}`)).toBe('');
       helperRemovedByManager = true;
       console.info('Current running Orchestrator authenticated against restored SQLite and exposed completed native job after exact restart');
+    }
+    if (originalPublic) {
+      // The existing controlled source setup is required; public whole-instance
+      // inverse/producer acceptance is not repeated for this original-only gate.
+      const path = '/workspace/public-original-' + id;
+      await runtime.client.exec(options!.containerName, ['python3', '-c', String.raw`
+import os,sys
+p=sys.argv[1];os.mkdir(p);f=p+'/data';open(f,'wb').write(bytes([0,255,128,10,61,0]));os.link(f,p+'/hard')
+os.chown(f,12345,23456);os.chmod(f,0o640);os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]))
+os.utime(f,ns=(1700000000123456789,1700000000987654321))
+`, path]).then(result => expect(result.returnCode, result.stderr).toBe(0));
+      const capture = await appRequest<BackupJob>('/api/backups', { workspaceIds: [id], providerId: 'local', includeManagedVolumes: false });
+      expect(capture.status).toBe(202); expect(capture.body.id).toMatch(/^[a-f0-9-]{36}$/);
+      let captured: BackupJob | undefined;
+      await expect.poll(async () => {
+        const state = await appRequest<BackupJob>('/api/backup-jobs/' + capture.body.id); expect(state.status).toBe(200); captured = state.body;
+        if (state.body.status === 'failed') throw new Error('Public worker backup failed: ' + (state.body.errorCode ?? 'unknown'));
+        return state.body.status;
+      }, { timeout: 300_000, intervals: [1000] }).toBe('succeeded');
+      if (!captured?.artifactId) throw new Error('Actual worker backup artifact acknowledgement missing');
+      expect(captured).toMatchObject({ encrypted: true, integrityVerified: true });
+      const artifact = await appRequest<BackupArtifact>('/api/backups/' + captured.artifactId);
+      expect(artifact.status).toBe(200); expect(artifact.body).toMatchObject({ userId, provider: 'local', formatVersion: 2,
+        workspaceIds: [id], integrityStatus: 'verified' });
+      expect(artifact.body.providerObjectId).toMatch(/^[a-f0-9-]{36}$/);
+      const objectPath = remoteData + '/backup-objects/' + userId + '/' + artifact.body.providerObjectId + '.backup';
+      // Read only the bounded encrypted envelope, never raw key material.
+      // Creation's actual decrypt/inspect pass and restore's actual AES-GCM
+      // authentication provide authority, not this descriptive header alone.
+      const envelope = JSON.parse(await root(`sudo docker exec ${targetId} node --input-type=module -e ${quote(
+        `import fs from'node:fs';const p=${JSON.stringify(objectPath)};const s=fs.lstatSync(p);if(!s.isFile()||s.isSymbolicLink()||s.size!==${artifact.body.size})throw Error('Encrypted worker object differs');` +
+        `const fd=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);const b=Buffer.alloc(16400);const n=fs.readSync(fd,b,0,b.length,0);fs.closeSync(fd);` +
+        `const magic=Buffer.from('AGENTOR-BACKUP-2\\n');if(!b.subarray(0,magic.length).equals(magic))throw Error('Worker object is not encrypted v2');` +
+        `const e=b.indexOf(10,magic.length);if(e<0||e>=n)throw Error('Worker envelope invalid');console.log(b.subarray(magic.length,e).toString());`)}`));
+      expect(envelope).toMatchObject({ version: 2, algorithm: 'aes-256-gcm', keyFingerprint: artifact.body.keyFingerprint,
+        metadata: { workspaceIds: [id], formatVersion: 2 } });
+      await runtime.client.exec(options!.containerName, ['python3', '-c',
+        'import sys; p=sys.argv[1];open(p+"/data","wb").write(b"changed-after-capture");' +
+        'open("/workspace/extra-after-"+sys.argv[2],"wb").write(b"must disappear");' +
+        'open("/home/agent/.agent-data/marker","wb").write(b"agent-after-capture");' +
+        'open("/root/original-public-"+sys.argv[2],"wb").write(b"compute-root-after-capture")', path, id])
+        .then(result => expect(result.returnCode, result.stderr).toBe(0));
+      const stopped = await appRequest('/api/containers/' + id + '/stop', {}, true, 360_000); expect(stopped.status).toBe(200);
+      const before = await runtime.client.getInstance(options!.containerName); expect(before.status).toBe('Stopped');
+      expect(before.config['volatile.uuid']).toBe(incarnation);
+      const names = [...['workspace', 'agents', 'docker'].map(role => options!.containerName + '-' + role), volume.dockerName];
+      const beforeVolumes = await Promise.all(names.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)));
+      const lockPassword = 'original-fixture-' + jobId;
+      expect((await appRequest('/api/containers/' + id + '/protection', { password: lockPassword }, true, 30_000, undefined, undefined, 'PUT')).status).toBe(200);
+      const endpoint = '/api/backups/' + artifact.body.id + '/restore';
+      expect((await appRequest(endpoint, { target: 'original', workspaceIds: [id] })).status).toBe(409);
+      expect((await appRequest(endpoint, { target: 'original', workspaceIds: [id], confirmOverwrite: true })).status).toBe(423);
+      expect((await appRequest(endpoint, { target: 'original', workspaceIds: [id], confirmOverwrite: true, lockPassword: 'incorrect-fixture' })).status).toBe(423);
+      expect(await runtime.client.getInstance(options!.containerName)).toEqual(before);
+      expect(await Promise.all(names.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)))).toEqual(beforeVolumes);
+      {
+        computeSettled = false; // Any unknown native replacement keeps the exact original source/receipt.
+        const restored = await appRequest<{ jobId: string }> (endpoint, { target: 'original', workspaceIds: [id], confirmOverwrite: true,
+          lockPassword, requestId: jobId + '-original' });
+        expect(restored.status).toBe(202); expect(restored.body.jobId).toMatch(/^[a-f0-9-]{36}$/);
+        await expect.poll(async () => {
+          const state = await appRequest<BackupJob>('/api/backup-jobs/' + restored.body.jobId); expect(state.status).toBe(200);
+          if (state.body.status === 'failed') throw new Error('Public original restore failed: ' + (state.body.errorCode ?? 'unknown'));
+          return state.body.status;
+        }, { timeout: 300_000, intervals: [1000] }).toBe('succeeded');
+        expect(await runtime.client.getInstance(options!.containerName)).toEqual(before);
+        const expectedVolumes = structuredClone(beforeVolumes); expectedVolumes[0]!.config['user.agentor.workspace-preserve-ownership'] = 'true';
+        expect(await Promise.all(names.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)))).toEqual(expectedVolumes);
+        await root(`sudo test ! -e ${quote(remoteData + '/incus-backup-helpers')} || sudo test -z "$(sudo ls -A ${quote(remoteData + '/incus-backup-helpers')})"`);
+        const started = await appRequest('/api/containers/' + id + '/restart', { lockPassword }, true, 360_000); expect(started.status).toBe(200);
+        expect((await runtime.client.getInstance(options!.containerName)).config['volatile.uuid']).toBe(incarnation);
+        const checked = await runtime.client.exec(options!.containerName, ['python3', '-c', String.raw`
+import os,stat,sys
+p=sys.argv[1];f=p+'/data';s=os.stat(f)
+assert open(f,'rb').read()==bytes([0,255,128,10,61,0]) and s.st_ino==os.stat(p+'/hard').st_ino
+assert (s.st_uid,s.st_gid,stat.S_IMODE(s.st_mode),s.st_mtime_ns)==(12345,23456,0o640,1700000000987654321)
+assert os.getxattr(f,'user.binary')==bytes([0,255,128,10,61,0])
+assert not os.path.lexists('/workspace/extra-after-'+sys.argv[2])
+assert open('/home/agent/.agent-data/marker','rb').read()==b'agent-after-capture'
+assert open('/root/original-public-'+sys.argv[2],'rb').read()==b'compute-root-after-capture'
+`, path, id]);
+        expect(checked.returnCode, checked.stderr).toBe(0); computeSettled = true;
+        const retained = await runtime.client.exec(options!.containerName, ['bash', '-ec',
+          'docker image inspect agentor-archive-lower:proof >/dev/null; docker container inspect archive-layer archive-stopped >/dev/null; ' +
+          'docker run --rm -v archive-data:/data busybox:1.37.0 sh -ec \'test "$(cat /data/ordinary)" = persistent\'; ' +
+          'python3 -c \'import sys;assert open(sys.argv[1]+"/data","rb").read()==bytes([0,255,128,10,61,0])\' "$1"', 'bash', volume.target]);
+        expect(retained.returnCode, retained.stderr).toBe(0);
+      }
+      console.info('Actual encrypted worker backup/public original dispatch passed protection rejects, native kind/durable identity fence, stopped sameVM replacement and metadata-only workspace acknowledgement; agents/Docker/managed state retained');
     }
     if (rest) {
       const expectedSource = manifest.volumes.find(v => v.runtime?.role === 'workspace')!.runtime;
