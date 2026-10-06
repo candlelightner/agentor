@@ -5,6 +5,9 @@ import Docker from "dockerode";
 import { pack } from "tar-stream";
 import type { Readable } from "node:stream";
 import type { PluginCommand } from "./plugin-manifest";
+import type { IncusImageConverterReceipt } from './incus-image-converter';
+import { validateIncusImageIdentity, type IncusWorkerImageIdentity } from './incus-worker-image';
+import { isDeepStrictEqual } from 'node:util';
 
 export type ImageBuildStatus =
   "queued" | "running" | "succeeded" | "failed" | "cancelled";
@@ -173,6 +176,98 @@ export interface ImageBuild {
   diagnostic?: ImageProvisioningDiagnostic;
   warnings?: string[];
   workerId?: string;
+  /** Private acknowledged derivation in this existing job, never a portable
+   * image description or an authority field returned to ordinary clients. */
+  nativeDerivation?: NativeImageDerivation;
+}
+
+export interface NativeImageContext {
+  installationId: string; project: string; seedFingerprint: string; sourceImageId: string; recipeId: string;
+  architecture: 'amd64'; bootstrapGeneration: '3'; converterVersion: 'v0.4.0'; diskSize: '10G';
+}
+/** A description to reauthorize, not a bearer grant. Current caller authority
+ * is checked separately on every async acknowledgement/publication boundary. */
+export interface NativeImageSource {
+  requesterId: string; definitionId: string; definitionOwnerId: string; groupId?: string;
+  version: string; sourceBuildId: string; sourceImageId: string; createdAt: string;
+  scope: 'own' | 'group' | 'system-default';
+}
+interface NativeImageDerivation {
+  context: NativeImageContext; source: NativeImageSource; converter?: IncusImageConverterReceipt;
+  imageImport?: { pending: boolean; operation?: string; fingerprint?: string };
+}
+export interface NativeImageBinding {
+  context: NativeImageContext; identity: IncusWorkerImageIdentity; buildId: string;
+  capability: 'agentor-storage-ownership-v1';
+}
+const NATIVE_UUID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
+const NATIVE_HASH = /^[a-f0-9]{64}$/;
+const NATIVE_OCI = /^sha256:[a-f0-9]{64}$/;
+const NATIVE_OPERATION = /^\/1\.0\/operations\/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
+const nativeText = (value: unknown) => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value);
+function nativeKeys(value: unknown, allowed: string[]): value is Record<string, any> {
+  return !!value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => allowed.includes(key));
+}
+function validateNativeContext(value: NativeImageContext): void {
+  if (!nativeKeys(value, ['installationId', 'project', 'seedFingerprint', 'sourceImageId', 'recipeId', 'architecture', 'bootstrapGeneration', 'converterVersion', 'diskSize']) ||
+      !['installationId', 'seedFingerprint', 'sourceImageId', 'recipeId'].every(key => typeof value[key as keyof NativeImageContext] === 'string') ||
+      !NATIVE_UUID.test(value.installationId) || !nativeText(value.project) || value.project === 'default' ||
+      !NATIVE_HASH.test(value.seedFingerprint) || !NATIVE_OCI.test(value.sourceImageId) || !NATIVE_HASH.test(value.recipeId) ||
+      value.architecture !== 'amd64' || value.bootstrapGeneration !== '3' || value.converterVersion !== 'v0.4.0' || value.diskSize !== '10G')
+    throw new Error('Private native image context is malformed');
+}
+function nativeContextKey(context: NativeImageContext): string {
+  validateNativeContext(context);
+  return createHash('sha256').update(JSON.stringify([context.installationId, context.project, context.seedFingerprint,
+    context.sourceImageId, context.recipeId, context.architecture, context.bootstrapGeneration, context.converterVersion, context.diskSize])).digest('hex');
+}
+function validateNativeSource(source: NativeImageSource): void {
+  if (!nativeKeys(source, ['requesterId', 'definitionId', 'definitionOwnerId', 'groupId', 'version', 'sourceBuildId', 'sourceImageId', 'createdAt', 'scope']) ||
+      !['definitionId', 'sourceBuildId', 'sourceImageId', 'createdAt'].every(key => typeof source[key as keyof NativeImageSource] === 'string') ||
+      !nativeText(source.requesterId) || !NATIVE_UUID.test(source.definitionId) || !nativeText(source.definitionOwnerId) ||
+      source.groupId !== undefined && !nativeText(source.groupId) || !nativeText(source.version) ||
+      !NATIVE_UUID.test(source.sourceBuildId) || !NATIVE_OCI.test(source.sourceImageId) || !Number.isFinite(Date.parse(source.createdAt)) ||
+      !['own', 'group', 'system-default'].includes(source.scope)) throw new Error('Private native source is malformed');
+}
+function validateNativeDerivation(value: NativeImageDerivation, build: Pick<ImageBuild, 'id' | 'ownerId' | 'definitionId' | 'version' | 'digest'>): void {
+  if (!nativeKeys(value, ['context', 'source', 'converter', 'imageImport'])) throw new Error('Private native derivation is malformed');
+  validateNativeContext(value.context); validateNativeSource(value.source);
+  if (!NATIVE_UUID.test(build.id) || value.source.requesterId !== build.ownerId || value.source.definitionId !== build.definitionId ||
+      value.source.version !== build.version || value.source.sourceImageId !== build.digest || value.context.sourceImageId !== build.digest)
+    throw new Error('Private native derivation source differs from its job');
+  const converter = value.converter;
+  if (converter !== undefined && (!nativeKeys(converter, ['version', 'name', 'installationId', 'ownerId', 'sourceImageId', 'seedFingerprint', 'project', 'recipeId', 'incarnation', 'pending', 'removed']) ||
+      converter.version !== 1 || converter.name !== 'aic-' + build.id || converter.installationId !== value.context.installationId ||
+      converter.ownerId !== build.ownerId || converter.sourceImageId !== build.digest || converter.seedFingerprint !== value.context.seedFingerprint ||
+      converter.project !== value.context.project || converter.recipeId !== value.context.recipeId ||
+      converter.incarnation !== undefined && (typeof converter.incarnation !== 'string' || !NATIVE_UUID.test(converter.incarnation)) || converter.removed !== undefined && converter.removed !== true ||
+      converter.removed && converter.pending || converter.pending !== undefined &&
+        (!nativeKeys(converter.pending, ['kind', 'operation']) || !['create', 'start', 'stop', 'delete'].includes(converter.pending.kind) ||
+          converter.pending.operation !== undefined && (typeof converter.pending.operation !== 'string' || !NATIVE_OPERATION.test(converter.pending.operation)))))
+    throw new Error('Private converter acknowledgement is malformed');
+  const image = value.imageImport;
+  if (image !== undefined && (!nativeKeys(image, ['pending', 'operation', 'fingerprint']) || typeof image.pending !== 'boolean' ||
+      image.operation !== undefined && (typeof image.operation !== 'string' || !NATIVE_OPERATION.test(image.operation)) ||
+      image.fingerprint !== undefined && (typeof image.fingerprint !== 'string' || !NATIVE_HASH.test(image.fingerprint)) ||
+      !image.pending && !image.fingerprint || !converter?.removed || !converter.incarnation || converter.pending))
+    throw new Error('Private image import acknowledgement is malformed');
+}
+function normalizeNativeBindings(value: unknown): Record<string, NativeImageBinding> {
+  if (value === undefined) return {};
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > 4096)
+    throw new Error('Private native image bindings are malformed');
+  const bindings: Record<string, NativeImageBinding> = {};
+  for (const [key, candidate] of Object.entries(value)) {
+    if (!nativeKeys(candidate, ['context', 'identity', 'buildId', 'capability'])) throw new Error('Private native image binding is malformed');
+    validateNativeContext(candidate.context);
+    const identity = validateIncusImageIdentity(candidate.identity);
+    if (nativeContextKey(candidate.context) !== key || typeof candidate.buildId !== 'string' || !NATIVE_UUID.test(candidate.buildId) || candidate.capability !== 'agentor-storage-ownership-v1' ||
+        identity.sourceImageId !== candidate.context.sourceImageId || identity.recipeId !== candidate.context.recipeId ||
+        identity.architecture !== candidate.context.architecture || identity.bootstrapGeneration !== candidate.context.bootstrapGeneration ||
+        identity.converterVersion !== candidate.context.converterVersion) throw new Error('Private native image binding identity differs');
+    bindings[key] = { context: structuredClone(candidate.context), identity, buildId: candidate.buildId, capability: candidate.capability };
+  }
+  return bindings;
 }
 type ImageDefinitionSnapshot = Omit<ImageDefinition, "pluginComposition"> & {
   pluginComposition?: ImagePluginSnapshot[];
@@ -184,6 +279,9 @@ interface State {
   systemDefault?: { definitionId: string; version: string };
   faults: Record<string, { failPhase?: string; message?: string }>;
   deletions: ImageDeletion[];
+  /** Reconstructable physical hints, usable only after fresh source/caller
+   * authorization. Portable/catalog recovery never populates this map. */
+  nativeBindings: Record<string, NativeImageBinding>;
 }
 interface ImageDeletion {
   id: string;
@@ -415,7 +513,7 @@ function followDockerProgressBounded(
   });
 }
 function publicBuild(build: ImageBuild) {
-  const { logs: _logs, ...result } = build;
+  const { logs: _logs, nativeDerivation: _nativeDerivation, ...result } = build;
   return result;
 }
 
@@ -426,6 +524,7 @@ export class ImageCatalogManager {
     userDefaults: {},
     faults: {},
     deletions: [],
+    nativeBindings: {},
   };
   private initialized?: Promise<void>;
   private mutationChain = Promise.resolve();
@@ -458,6 +557,12 @@ export class ImageCatalogManager {
     await this.mutate(() => {
       for (const build of this.state.builds)
         if (build.status === "queued" || build.status === "running") {
+          if (build.nativeDerivation) {
+            build.status = 'failed'; build.phase = 'failed'; build.progress = 100;
+            build.outcome = 'build-failed'; build.error = 'Native derivation interrupted; acknowledged converter/import authority is retained.';
+            build.recovery = 'restart-failed-safe'; build.completedAt = build.updatedAt = now();
+            continue; // Never replay an import or alter the source OCI version.
+          }
           build.status = "failed";
           build.phase = "failed";
           build.progress = 100;
@@ -555,6 +660,7 @@ export class ImageCatalogManager {
     this.state.systemDefault = structuredClone(previous.systemDefault);
     this.state.faults = structuredClone(previous.faults);
     this.state.deletions = structuredClone(previous.deletions);
+    this.state.nativeBindings = structuredClone(previous.nativeBindings);
   }
 
   list(ownerId: string, admin: boolean) {
@@ -677,7 +783,7 @@ export class ImageCatalogManager {
       await this.finalizeDeletion(deletionId);
     await this.mutate(() => {
       this.state.builds = this.state.builds.filter(
-        (build) => build.ownerId !== ownerId,
+        (build) => build.ownerId !== ownerId || !!build.nativeDerivation,
       );
     });
   }
@@ -686,6 +792,196 @@ export class ImageCatalogManager {
     if (!item) httpError(404, "Image definition not found");
     if (!admin && item.ownerId !== ownerId) httpError(403, "Forbidden");
     return item;
+  }
+
+  /** External owner/group validation must not reenter asynchronous catalog
+   * methods: this uses the SAME serial queue as mutation/persistence. Holding
+   * that queue makes permission reads observe only settled catalog state. */
+  private nativeAuthorityRead<T>(validateAuthority: () => Promise<void>, read: () => Promise<T> | T): Promise<T> {
+    const result = this.mutationChain.then(async () => { await validateAuthority(); return read(); });
+    this.mutationChain = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  /** Current catalog permission plus a real controlled OCI build, not a
+   * recovered hash or a native image property's source claim. */
+  async authorizeNativeImageSource(requesterId: string, selection: {
+    definitionId?: string; version?: string; allowedGroupIds?: Iterable<string>;
+  }, validateAuthority: () => Promise<void>): Promise<NativeImageSource> {
+    selection = { ...selection, ...(selection.allowedGroupIds ? { allowedGroupIds: [...selection.allowedGroupIds] } : {}) };
+    await this.init();
+    return this.nativeAuthorityRead(validateAuthority, async () => {
+    const selected = selection.allowedGroupIds
+      ? this.resolveSelectionForGroupHierarchy(requesterId, selection.allowedGroupIds, selection.definitionId, selection.version)
+      : this.resolveSelection(requesterId, selection.definitionId, selection.version);
+    if (!selected) throw new Error('Native catalog source requires an authorized controlled version');
+    const definition = this.state.definitions.find(item => item.id === selected.definitionId)!;
+    const scope = !selection.definitionId && !this.state.userDefaults[requesterId] && this.state.systemDefault ? 'system-default'
+      : definition.groupId ? 'group' : 'own';
+    const version = findVersion(definition, selected.version);
+    const sourceBuild = this.state.builds.find(build => build.builder === 'controlled' && !build.nativeDerivation &&
+      (build.operation ?? 'build') === 'build' && build.imageCreated && build.definitionId === definition.id &&
+      build.ownerId === definition.ownerId && build.groupId === definition.groupId && build.version === version.version && build.digest === version.digest);
+    if (!sourceBuild || version.recovered || version.runtimeImage !== version.digest || !NATIVE_OCI.test(version.digest))
+      throw new Error('Native source requires the actual controlled OCI image acknowledgement');
+    const source: NativeImageSource = { requesterId, definitionId: definition.id, definitionOwnerId: definition.ownerId,
+      ...(definition.groupId ? { groupId: definition.groupId } : {}), version: version.version, sourceBuildId: sourceBuild.id,
+      sourceImageId: version.digest, createdAt: version.createdAt, scope };
+    this.assertNativeSource(source);
+    const image = await withBuildTimeout(this.docker.getImage(version.runtimeImage).inspect(), 'Native controlled source inspection');
+    if (image.Id !== source.sourceImageId || image.Architecture !== 'amd64')
+      throw new Error('Native source differs from the actual immutable OCI image');
+    await validateAuthority(); this.assertNativeSource(source);
+    return structuredClone(source);
+    });
+  }
+
+  private assertNativeSource(source: NativeImageSource): void {
+    validateNativeSource(source);
+    const definition = this.definition(source.definitionId, source.requesterId, source.scope === 'system-default');
+    if (definition.ownerId !== source.definitionOwnerId || definition.groupId !== source.groupId ||
+        source.scope === 'own' && definition.groupId || source.scope === 'group' && !definition.groupId ||
+        source.scope === 'system-default' && (definition.groupId || this.state.systemDefault?.definitionId !== definition.id ||
+          this.state.systemDefault.version !== source.version)) throw new Error('Native source catalog permission changed');
+    this.assertVersionAvailable(definition.id, source.version);
+    const version = findVersion(definition, source.version); this.assertVersionReady(version, 'derive a native worker image');
+    const build = this.state.builds.find(item => item.id === source.sourceBuildId);
+    if (version.recovered || version.digest !== source.sourceImageId || version.runtimeImage !== source.sourceImageId ||
+        version.createdAt !== source.createdAt || !build || build.nativeDerivation || build.builder !== 'controlled' ||
+        (build.operation ?? 'build') !== 'build' || !build.imageCreated || build.definitionId !== definition.id ||
+        build.ownerId !== definition.ownerId || build.groupId !== definition.groupId || build.digest !== source.sourceImageId || build.version !== source.version)
+      throw new Error('Native controlled source acknowledgement changed');
+  }
+
+  async readNativeImageBinding(source: NativeImageSource, context: NativeImageContext,
+    validateAuthority: () => Promise<void>): Promise<NativeImageBinding | undefined> {
+    source = structuredClone(source); context = structuredClone(context);
+    await this.init();
+    return this.nativeAuthorityRead(validateAuthority, () => {
+    this.assertNativeSource(source);
+    if (context.sourceImageId !== source.sourceImageId) throw new Error('Native binding source differs');
+    const binding = this.state.nativeBindings[nativeContextKey(context)];
+    if (binding) {
+      const job = this.state.builds.find(build => build.id === binding.buildId), ack = job?.nativeDerivation;
+      if (job?.status !== 'succeeded' || !ack || !isDeepStrictEqual(ack.context, context) ||
+          !ack.converter?.removed || !ack.converter.incarnation || ack.converter.pending || ack.imageImport?.pending !== false ||
+          ack.imageImport.fingerprint !== binding.identity.fingerprint)
+        throw new Error('Native cache hint lacks its exact settled import acknowledgement');
+    }
+    return binding ? structuredClone(binding) : undefined;
+    });
+  }
+
+  async openNativeImageDerivation(source: NativeImageSource, context: NativeImageContext,
+    validateAuthority: () => Promise<void>): Promise<string> {
+    source = structuredClone(source); context = structuredClone(context);
+    await this.init();
+    return this.mutate(async () => {
+      await validateAuthority();
+      this.assertNativeSource(source); const key = nativeContextKey(context);
+      if (context.sourceImageId !== source.sourceImageId) throw new Error('Native derivation source differs');
+      if (this.state.nativeBindings[key]) throw new Error('Native derived image already has a private binding');
+      if (this.state.builds.some(build => build.nativeDerivation && nativeContextKey(build.nativeDerivation.context) === key &&
+          (build.status === 'queued' || build.status === 'running' ||
+            !!build.nativeDerivation.converter && !build.nativeDerivation.converter.removed || !!build.nativeDerivation.imageImport)))
+        throw new Error('Native conversion already owns this immutable key; retain its exact acknowledgement');
+      const stamp = now(), id = randomUUID();
+      this.state.builds.push({ id, definitionId: source.definitionId, ownerId: source.requesterId, groupId: source.groupId,
+        operation: 'build', builder: 'controlled', status: 'running', phase: 'deriving-vm', progress: 0,
+        createdAt: stamp, updatedAt: stamp, startedAt: stamp, logs: [], digest: source.sourceImageId, version: source.version,
+        imageCreated: true, nativeDerivation: { source, context } });
+      return id;
+    });
+  }
+
+  private nativeBuild(id: string, acknowledgement = false): ImageBuild & { nativeDerivation: NativeImageDerivation } {
+    const build = this.state.builds.find(item => item.id === id);
+    if (!build?.nativeDerivation || (acknowledgement ? build.status === 'succeeded' : build.status !== 'running'))
+      throw new Error('Native derivation job is not active');
+    validateNativeDerivation(build.nativeDerivation, build);
+    if (!acknowledgement) this.assertNativeSource(build.nativeDerivation.source);
+    return build as ImageBuild & { nativeDerivation: NativeImageDerivation };
+  }
+
+  async acknowledgeNativeConverter(id: string, receipt: IncusImageConverterReceipt): Promise<void> {
+    receipt = structuredClone(receipt);
+    await this.mutate(() => {
+      // Revocation stops new work/publication, never capture of an exact
+      // already accepted resource needed for bounded cleanup.
+      const build = this.nativeBuild(id, true), previous = build.nativeDerivation.converter;
+      const next = { ...build.nativeDerivation, converter: receipt }; validateNativeDerivation(next, build);
+      if (previous?.incarnation && receipt.incarnation !== previous.incarnation ||
+          previous?.removed && !isDeepStrictEqual(previous, receipt) || build.nativeDerivation.imageImport ||
+          previous?.pending && receipt.pending && (previous.pending.kind !== receipt.pending.kind ||
+            previous.pending.operation !== undefined && previous.pending.operation !== receipt.pending.operation))
+        throw new Error('Native converter acknowledgement regressed');
+      build.nativeDerivation = next; build.updatedAt = now();
+    });
+  }
+
+  /** Called before POST, then on accepted native operation, then only after
+   * importImage returns its exact successful fingerprint/type acknowledgement. */
+  async acknowledgeNativeImageImport(id: string, acknowledgement: NonNullable<NativeImageDerivation['imageImport']>,
+    validateAuthority: () => Promise<void>): Promise<void> {
+    acknowledgement = structuredClone(acknowledgement);
+    const accepted = !!this.nativeBuild(id, true).nativeDerivation.imageImport;
+    await this.mutate(async () => {
+      if (!accepted) await validateAuthority();
+      const build = this.nativeBuild(id, accepted), previous = build.nativeDerivation.imageImport;
+      const next = { ...build.nativeDerivation, imageImport: acknowledgement }; validateNativeDerivation(next, build);
+      if (!previous && (!acknowledgement.pending || acknowledgement.operation || acknowledgement.fingerprint) ||
+          previous && (!previous.pending || previous.operation !== undefined && acknowledgement.operation !== previous.operation ||
+            previous.fingerprint !== undefined && acknowledgement.fingerprint !== previous.fingerprint))
+        throw new Error('Native image import acknowledgement regressed');
+      build.nativeDerivation = next; build.phase = 'importing-vm'; build.updatedAt = now();
+    });
+  }
+
+  async publishNativeImageBinding(id: string, identity: IncusWorkerImageIdentity,
+    capability: NativeImageBinding['capability'], validateAuthority: () => Promise<void>): Promise<NativeImageBinding> {
+    identity = validateIncusImageIdentity(identity);
+    return this.mutate(async () => {
+      await validateAuthority();
+      const build = this.nativeBuild(id), state = build.nativeDerivation;
+      if (!state.converter?.removed || !state.converter.incarnation || state.converter.pending || state.imageImport?.pending !== false ||
+          state.imageImport.fingerprint !== identity.fingerprint || capability !== 'agentor-storage-ownership-v1')
+        throw new Error('Native binding requires settled converter and exact acknowledged image import');
+      const binding: NativeImageBinding = { context: structuredClone(state.context), identity, buildId: id, capability };
+      const key = nativeContextKey(state.context); normalizeNativeBindings({ [key]: binding });
+      if (this.state.nativeBindings[key] && !isDeepStrictEqual(this.state.nativeBindings[key], binding))
+        throw new Error('Native binding changed during publication');
+      if (!this.state.nativeBindings[key] && Object.keys(this.state.nativeBindings).length >= 4096)
+        throw new Error('Native derived cache inventory exceeds its bounded catalog');
+      this.state.nativeBindings[key] = binding;
+      build.status = 'succeeded'; build.phase = 'complete'; build.progress = 100;
+      build.outcome = 'ready'; build.completedAt = build.updatedAt = now();
+      return structuredClone(binding);
+    });
+  }
+
+  /** Parent reuses the existing per-definition execution table for identical
+   * immutable keys. Every joining caller independently reauthorizes its source. */
+  async ensureNativeImageBinding(source: NativeImageSource, context: NativeImageContext, validateAuthority: () => Promise<void>,
+    execute: (buildId: string) => Promise<void>): Promise<NativeImageBinding> {
+    source = structuredClone(source); context = structuredClone(context);
+    const cached = await this.readNativeImageBinding(source, context, validateAuthority); if (cached) return cached;
+    const key = 'native:' + nativeContextKey(context), previous = this.definitionBuilds.get(key);
+    if (previous) { await previous; const binding = await this.readNativeImageBinding(source, context, validateAuthority);
+      if (!binding) throw new Error('Native conversion completed without a binding'); return binding; }
+    const execution = this.openNativeImageDerivation(source, context, validateAuthority).then(async id => {
+      try { await execute(id); if (!this.state.nativeBindings[nativeContextKey(context)]) throw new Error('Native derivation did not publish'); }
+      catch (error) {
+        await this.mutate(() => { const build = this.state.builds.find(item => item.id === id);
+          if (build && build.status === 'running') { build.status = 'failed'; build.phase = 'failed'; build.progress = 100;
+            build.outcome = 'build-failed'; build.error = 'Native image conversion failed; exact acknowledged authority is retained.';
+            build.completedAt = build.updatedAt = now(); } });
+        throw error;
+      }
+    });
+    this.definitionBuilds.set(key, execution);
+    try { await execution; const binding = await this.readNativeImageBinding(source, context, validateAuthority);
+      if (!binding) throw new Error('Native conversion completed without a binding'); return binding;
+    } finally { if (this.definitionBuilds.get(key) === execution) this.definitionBuilds.delete(key); }
   }
   private definitionDeletion(id: string) {
     return this.state.deletions.find(
@@ -2343,7 +2639,9 @@ export class ImageCatalogManager {
   }
   hasActiveOperationsForInstanceSnapshot() {
     return this.state.builds.some(
-      (build) => build.status === "queued" || build.status === "running",
+      (build) => build.status === "queued" || build.status === "running" ||
+        !!build.nativeDerivation && (!!build.nativeDerivation.converter && !build.nativeDerivation.converter.removed ||
+          !!build.nativeDerivation.imageImport && build.status !== 'succeeded'),
     );
   }
 
@@ -2693,7 +2991,7 @@ export class ImageCatalogManager {
           (definition) => definition.id !== current.definitionId,
         );
         this.state.builds = this.state.builds.filter(
-          (build) => build.definitionId !== current.definitionId,
+          (build) => build.definitionId !== current.definitionId || !!build.nativeDerivation,
         );
       } else {
         const definition = this.state.definitions.find(
@@ -2953,6 +3251,7 @@ function normalizeState(value: any): State {
           : [],
       }))
     : [];
+  for (const build of builds) if (build.nativeDerivation !== undefined) validateNativeDerivation(build.nativeDerivation, build);
   return {
     definitions,
     builds,
@@ -2964,6 +3263,7 @@ function normalizeState(value: any): State {
     faults:
       value?.faults && typeof value.faults === "object" ? value.faults : {},
     deletions: normalizeDeletions(value?.deletions, definitions, builds),
+    nativeBindings: normalizeNativeBindings(value?.nativeBindings),
   };
 }
 function normalizeDeletions(

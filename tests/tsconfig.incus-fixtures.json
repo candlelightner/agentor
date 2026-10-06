@@ -15,7 +15,12 @@
     "api/incus-original-workspace-live.spec.ts",
     "api/incus-original-workspace-runtime.spec.ts",
     "api/incus-image-import.spec.ts",
-    "api/incus-image-import-live.spec.ts"
+    "api/incus-image-import-live.spec.ts",
+    "api/incus-image-converter.spec.ts",
+    "api/incus-image-converter-live.spec.ts",
+    "api/incus-image-artifact.spec.ts",
+    "api/incus-worker-image-manager.spec.ts",
+    "api/catalog-native-binding.spec.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }
