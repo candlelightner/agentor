@@ -1,8 +1,11 @@
 import https from 'node:https';
 import http, { type IncomingHttpHeaders } from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, open, type FileHandle } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import WebSocket from 'ws';
-import { PassThrough, Writable } from 'node:stream';
+import { PassThrough, Writable, Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import type { Config } from './config';
 import { isDeepStrictEqual } from 'node:util';
 
@@ -1382,6 +1385,119 @@ export class IncusClient {
 
   async getImage(fingerprint: string): Promise<IncusImage> {
     return this.request<IncusImage>('GET', `/1.0/images/${encodeURIComponent(fingerprint)}`);
+  }
+
+  /** Only trusted converter-produced split VM artifacts. Caller proves the
+   * controlled conversion/source lineage; this transport does not attest an
+   * arbitrary guest-supplied qcow or metadata property. No aliases/adoption. */
+  async importImage(metadataTarPath: string, qcowPath: string,
+    onAccepted?: (operationPath: string | undefined) => Promise<void>, signal?: AbortSignal): Promise<IncusImage> {
+    this.validateTransport();
+    if (!this.endpoint.startsWith('https://') || !this.rejectUnauthorized || !this.project || this.project === 'default' ||
+        !(this.clientCert || this.clientCertPath) || !(this.clientKey || this.clientKeyPath) || !(this.serverCert || this.serverCertPath))
+      throw new IncusError('VM image import requires verified mTLS and a dedicated restricted project');
+    signal?.throwIfAborted();
+    let metadata: FileHandle | undefined, disk: FileHandle | undefined;
+    try {
+      metadata = await open(metadataTarPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      disk = await open(qcowPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      const before = [await metadata.stat(), await disk.stat()];
+      if (!before[0]!.isFile() || before[0]!.size <= 0 || before[0]!.size > 16 * 1024 ** 2 ||
+          !before[1]!.isFile() || before[1]!.size < 4 || before[1]!.size > 1024 ** 4)
+        throw new IncusError('Split VM image import requires bounded nonempty regular artifacts');
+      const magic = Buffer.alloc(4); await disk.read(magic, 0, 4, 0);
+      if (!magic.equals(Buffer.from([0x51, 0x46, 0x49, 0xfb]))) throw new IncusError('VM image import requires qcow2 rootfs bytes');
+      const boundary = 'agentor-vm-' + randomUUID();
+      const part = (name: string, filename: string) => Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"; filename="${filename}"\r\nContent-Type: application/octet-stream\r\n\r\n`);
+      // Incus 6.0 split-upload selects VM type by the multipart FORM NAME,
+      // not the qcow filename or X-Incus-type header. Never use "rootfs",
+      // which the daemon classifies as a container image.
+      const prefix = part('metadata', 'metadata.tar.gz'), middle = Buffer.concat([Buffer.from('\r\n'), part('rootfs.img', 'rootfs.img')]);
+      const suffix = Buffer.from(`\r\n--${boundary}--\r\n`);
+      const size = prefix.length + before[0]!.size + middle.length + before[1]!.size + suffix.length;
+      const url = this.buildUrl('/1.0/images'), agent = await this.getAgent(); signal?.throwIfAborted();
+      let request: http.ClientRequest | undefined, timer: ReturnType<typeof setTimeout> | undefined;
+      let uploading: Promise<void> | undefined;
+      let resolveResponse!: (value: { statusCode: number; body: Buffer }) => void, rejectResponse!: (error: Error) => void;
+      const response = new Promise<{ statusCode: number; body: Buffer }>((resolve, reject) => {
+        resolveResponse = resolve; rejectResponse = reject;
+      });
+      // Construction/pipeline setup can throw before response is awaited.
+      // Preserve its original error without a late unhandled rejection.
+      void response.catch(() => {});
+      try {
+        request = https.request(url, { method: 'POST', agent, timeout: this.timeoutMs, signal,
+          headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': String(size),
+            'X-Incus-public': 'false', 'X-Incus-type': 'virtual-machine' } }, reply => {
+          const chunks: Buffer[] = []; let bytes = 0;
+          reply.on('data', (chunk: Buffer) => {
+            bytes += chunk.length;
+            if (bytes > 1024 ** 2) { const error = new IncusError('Incus image import response exceeds limit');
+              rejectResponse(error); reply.destroy(error); request?.destroy(error); }
+            else chunks.push(chunk);
+          });
+          reply.on('end', () => resolveResponse({ statusCode: reply.statusCode ?? 0, body: Buffer.concat(chunks) }));
+          reply.on('error', rejectResponse); reply.on('aborted', () => rejectResponse(new IncusError('Incus image import response was interrupted')));
+        });
+        request.on('timeout', () => request?.destroy(new IncusError('Incus image import request timed out', 408)));
+        request.on('error', rejectResponse);
+        timer = setTimeout(() => request?.destroy(new IncusError('Incus image import upload deadline exceeded', 408)), 30 * 60_000);
+        timer.unref?.();
+        const body = Readable.from((async function* () {
+          yield prefix;
+          yield* metadata!.createReadStream({ autoClose: false, start: 0, end: before[0]!.size - 1 });
+          yield middle;
+          yield* disk!.createReadStream({ autoClose: false, start: 0, end: before[1]!.size - 1 });
+          yield suffix;
+        })());
+        uploading = pipeline(body, request, { signal });
+        void uploading.catch(() => {}); // Preserve failures until the caller observes the response/ack.
+        const raw = await response;
+        let envelope: IncusResponse<{ fingerprint?: unknown }>;
+        try { envelope = JSON.parse(raw.body.toString('utf8')); }
+        catch { throw new IncusError('Incus image import acknowledgement is not valid JSON', raw.statusCode); }
+        if (request.writableFinished) clearTimeout(timer);
+        if (envelope.type === 'error' || raw.statusCode < 200 || raw.statusCode >= 300) {
+          if (envelope.type === 'error' && raw.statusCode >= 400 && raw.statusCode < 500 &&
+              Number.isInteger(envelope.error_code) && envelope.error_code === raw.statusCode)
+            throw new IncusRequestRejected('Incus image import was rejected', raw.statusCode, envelope.error_code);
+          throw new IncusError('Incus image import HTTP acknowledgement is unavailable', raw.statusCode);
+        }
+        let operation: string | undefined;
+        if (envelope.type === 'async' && envelope.operation) {
+          const acknowledgedUrl = this.buildUrl(envelope.operation);
+          if (acknowledgedUrl.username || acknowledgedUrl.password || acknowledgedUrl.hash ||
+              acknowledgedUrl.searchParams.getAll('project').length !== 1 ||
+              acknowledgedUrl.searchParams.get('project') !== this.project ||
+              [...acknowledgedUrl.searchParams.keys()].some(key => key !== 'project'))
+            throw new IncusError('Incus image import operation project is ambiguous');
+          operation = this.projectOperationPath(envelope.operation);
+          if (!/^\/1\.0\/operations\/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(operation))
+            throw new IncusError('Incus image import operation identity is invalid');
+        } else if (envelope.type !== 'sync' || typeof envelope.metadata?.fingerprint !== 'string' ||
+            !/^[a-f0-9]{64}$/.test(envelope.metadata.fingerprint))
+          throw new IncusError('Incus image import did not acknowledge a native operation or fingerprint');
+        await onAccepted?.(operation); // Persist accepted authority BEFORE upload/wait observation may fail.
+        await uploading;
+        clearTimeout(timer);
+        const after = [await metadata.stat(), await disk.stat()];
+        if (after.some((value, index) => ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'].some(key =>
+          value[key as keyof typeof value] !== before[index]![key as keyof typeof value])))
+          throw new IncusError('VM image artifacts changed during upload; import result is not authoritative');
+        signal?.throwIfAborted();
+        const result = operation ? await this.waitForOperation(operation, 1800, signal) : undefined;
+        if (operation && (result?.id !== operation.split('/').pop() || result?.status !== 'Success' || result.status_code !== 200))
+          throw new IncusError('Incus image import operation did not prove successful completion');
+        const fingerprint: unknown = operation ? result?.metadata?.fingerprint : envelope.metadata?.fingerprint;
+        if (typeof fingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(fingerprint))
+          throw new IncusError('Incus image import completed without an acknowledged fingerprint');
+        signal?.throwIfAborted();
+        const image = await this.getImage(fingerprint); signal?.throwIfAborted();
+        if (image.fingerprint !== fingerprint || image.type !== 'virtual-machine')
+          throw new IncusError('Incus imported VM image does not match its acknowledged fingerprint/type');
+        return image;
+      } finally { clearTimeout(timer); if (request && !request.writableFinished) request.destroy(); await uploading?.catch(() => {}); }
+    } finally { await Promise.all([metadata?.close(), disk?.close()]); }
   }
 
   async listImages(): Promise<IncusImage[]> {

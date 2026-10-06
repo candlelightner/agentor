@@ -13,7 +13,9 @@
     "api/instance-backup-ws-startup.spec.ts",
     "api/instance-backup-native-preflight.spec.ts",
     "api/incus-original-workspace-live.spec.ts",
-    "api/incus-original-workspace-runtime.spec.ts"
+    "api/incus-original-workspace-runtime.spec.ts",
+    "api/incus-image-import.spec.ts",
+    "api/incus-image-import-live.spec.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }

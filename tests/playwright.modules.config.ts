@@ -90,6 +90,8 @@ export default defineConfig({
     "api/worker-reconstruction.spec.ts",
     "api/worker-lifecycle-coordinator.spec.ts",
     "api/incus-client.spec.ts",
+    "api/incus-image-import.spec.ts",
+    "api/incus-image-import-live.spec.ts",
     "api/incus-exec-transport.spec.ts",
     "api/incus-worker-commands.spec.ts",
     "api/incus-worker-experience.spec.ts",
