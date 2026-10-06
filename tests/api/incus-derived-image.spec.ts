@@ -1,6 +1,10 @@
 import { test, expect } from "@playwright/test";
 import { randomUUID } from "node:crypto";
+import { createHash } from 'node:crypto';
 import { readFileSync } from "node:fs";
+import { mkdtemp, mkdir, readFile, writeFile, copyFile, chmod, symlink, rename, rm, stat, lstat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { execFileSync } from "node:child_process";
 import { IncusClient } from "../../orchestrator/server/utils/incus-client";
 import { IncusWorkerStorage } from "../../orchestrator/server/utils/incus-worker-storage";
@@ -30,6 +34,191 @@ function options() {
     workerJson: { id: "test-worker", displayName: "Incus test", repos: [], initScript: "", gitName: "", gitEmail: "" },
   };
 }
+
+async function conversionCliFixture(run: (f: { invoke: (args: string[], cached?: boolean) => string;
+  log: () => Promise<string>; output: string; source: string; recipe: string }) => Promise<void>) {
+  const root = await mkdtemp(join(tmpdir(), 'agentor-image-cli-')), repo = resolve('..');
+  const bin = join(root, 'bin'), output = join(root, 'output'), log = join(root, 'commands');
+  await mkdir(bin); await mkdir(join(root, 'locks'));
+  const source = 'sha256:' + 'a'.repeat(64);
+  const recipe = execFileSync('bash', ['-c',
+    `{ printf '%s\\n' '${source}' amd64 3 v0.4.0 8G; sha256sum scripts/build-incus-worker-image.sh worker/entrypoint.sh worker/vm/*; } | sha256sum | cut -d' ' -f1`],
+    { cwd: repo, encoding: 'utf8' }).trim();
+  const script = join(root, 'convert.sh');
+  await writeFile(script, (await readFile(join(repo, 'scripts/build-incus-worker-image.sh'), 'utf8'))
+    .replace('REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"', 'REPO_ROOT="$FIXTURE_REPO"')
+    .replaceAll('/run/lock/agentor-vm-image-', join(root, 'locks/agentor-vm-image-')));
+  const mock = String.raw`#!/bin/bash
+set -euo pipefail
+tool="${'${'}0##*/}"
+printf '%s %s\n' "$tool" "$*" >> "$FIXTURE_LOG"
+case "$tool" in
+ id) echo 0;;
+ docker)
+  if [[ "$*" == 'image inspect -f {{.Architecture}} '* ]]; then echo amd64
+  elif [[ "$*" == 'image inspect -f '* ]]; then
+   if [[ "${'${'}@: -1}" == agentor-worker-vm-stage:* ]]; then printf 'sha256:%064d\n' 0; else echo "$FIXTURE_SOURCE"; fi
+  fi;;
+ d2vm)
+  if [[ "$1" == --version ]]; then echo 'd2vm version v0.4.0'; else
+   while [[ $# -gt 0 ]]; do if [[ "$1" == -o ]]; then printf 'raw-fixture\n' > "$2"; break; fi; shift; done
+  fi;;
+ qemu-img) if [[ "$1" == convert ]]; then printf 'qcow-fixture\n' > "${'${'}@: -1}"; fi;;
+ losetup) if [[ "$1" != -d ]]; then echo /dev/fixture-loop; fi;;
+ mktemp) /usr/bin/mktemp -d "$FIXTURE_ROOT/mnt.XXXXXX";;
+ mount) /bin/mkdir -p "${'${'}@: -1}";;
+ umount)
+  for target in "$@"; do case "$target" in
+   "$FIXTURE_ROOT"/mnt.??????/boot) /bin/rm -f "$target/startup.nsh"; /bin/rmdir "$target";;
+   "$FIXTURE_ROOT"/mnt.??????/dev|"$FIXTURE_ROOT"/mnt.??????/proc|"$FIXTURE_ROOT"/mnt.??????/sys) /bin/rmdir "$target";;
+   "$FIXTURE_ROOT"/mnt.??????) :;;
+   *) exit 99;;
+  esac; done;;
+ mountpoint) exit 1;;
+ incus)
+  if [[ "$FIXTURE_CACHED" != true ]]; then echo 'Unexpected Incus access' >&2; exit 98; fi
+  if [[ "$*" == 'image alias list '* ]]; then printf 'agentor-worker,%064d\n' 1
+  elif [[ "$*" == 'image show '* ]]; then printf 'source_image_id: %s\nrecipe_id: %s\n' "$FIXTURE_SOURCE" "$FIXTURE_RECIPE"
+  else exit 97; fi;;
+ sgdisk|chroot) :;;
+ *) exit 96;;
+esac
+`;
+  try {
+    for (const tool of ['docker', 'd2vm', 'qemu-img', 'sgdisk', 'losetup', 'mktemp', 'mount', 'umount', 'mountpoint', 'chroot', 'incus', 'id'])
+      await writeFile(join(bin, tool), mock, { mode: 0o755 });
+    await run({ source, recipe, output, log: () => readFile(log, 'utf8'), invoke: (args, cached = false) => execFileSync('bash',
+      [script, '--output-dir', output, ...args], { env: { ...process.env, PATH: bin + ':' + process.env.PATH, LC_ALL: 'C',
+        FIXTURE_ROOT: root, FIXTURE_REPO: repo, FIXTURE_LOG: log, FIXTURE_SOURCE: source, FIXTURE_RECIPE: recipe,
+        FIXTURE_CACHED: String(cached) }, encoding: 'utf8', stdio: 'pipe' }) });
+  } finally { await rm(root, { recursive: true, force: true }); }
+}
+
+test('raw-only CLI keeps finalized raw output and skips qcow metadata/import/cache while identities are pinned', async () => {
+  await conversionCliFixture(async f => {
+    const output = f.invoke(['--raw-only', '--expected-source-id', f.source, '--expected-recipe-id', f.recipe]);
+    expect(output).toContain('Raw conversion complete'); expect(await readFile(join(f.output, 'disk.raw'), 'utf8')).toBe('raw-fixture\n');
+    await expect(stat(join(f.output, 'disk.qcow2'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(join(f.output, 'metadata.tar.gz'))).rejects.toMatchObject({ code: 'ENOENT' });
+    const log = await f.log(); expect(log).toContain('d2vm convert --raw '); expect(log).toContain('qemu-img resize -f raw ');
+    expect(log).toContain('sgdisk -g '); expect(log).toContain('chroot '); expect(log).not.toContain('qemu-img convert '); expect(log).not.toContain('incus ');
+  });
+});
+
+test('controlled CLI source/recipe mismatch rejects before bootstrap build or raw allocation', async () => {
+  for (const field of ['source', 'recipe'] as const) await conversionCliFixture(async f => {
+    expect(() => f.invoke(['--raw-only', field === 'source' ? '--expected-source-id' : '--expected-recipe-id',
+      field === 'source' ? 'sha256:' + 'c'.repeat(64) : 'd'.repeat(64)])).toThrow(/expected immutable identity/);
+    expect(await f.log()).not.toMatch(/docker build|d2vm convert|incus /);
+    await expect(stat(f.output)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+});
+
+test('legacy no-import output and default matching Incus cache behavior remain compatible', async () => {
+  await conversionCliFixture(async f => {
+    f.invoke(['--no-import']); expect(await readFile(join(f.output, 'disk.qcow2'), 'utf8')).toBe('qcow-fixture\n');
+    expect(await readFile(join(f.output, 'metadata.yaml'), 'utf8')).toContain('source_image_id: "' + f.source + '"');
+    await expect(stat(join(f.output, 'disk.raw'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await f.log()).not.toContain('incus ');
+  });
+  await conversionCliFixture(async f => {
+    expect(f.invoke([], true)).toContain('already up to date'); expect(await f.log()).not.toContain('docker build');
+    await expect(stat(f.output)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+});
+
+const canonicalBootstrap = ['scripts/build-incus-worker-image.sh', 'worker/entrypoint.sh',
+  ...['99-incus-agent.rules', 'Dockerfile.vm', 'agentor-dnsmasq.service', 'agentor-docker-storage.service',
+    'agentor-docker-storage.sh', 'agentor-network.sh', 'agentor-private-storage.sh', 'agentor-worker.service',
+    'incus-agent-setup', 'incus-agent.service'].sort().map(name => 'worker/vm/' + name)];
+
+async function assetFixture(run: (f: { root: string; output: string; invoke: () => string }) => Promise<void>) {
+  const root = await mkdtemp(join(tmpdir(), 'incus-canonical-assets-')), repo = resolve('..'), output = join(root, 'packaged');
+  const module = join(root, 'orchestrator/build-incus-worker-assets.mjs');
+  try {
+    await mkdir(dirname(module)); await copyFile(join(repo, 'orchestrator/build-incus-worker-assets.mjs'), module);
+    for (const name of canonicalBootstrap) {
+      await mkdir(dirname(join(root, name)), { recursive: true });
+      await copyFile(join(repo, name), join(root, name));
+    }
+    await run({ root, output, invoke: () => execFileSync(process.execPath, [module, output], { encoding: 'utf8', stdio: 'pipe' }) });
+  } finally { await rm(root, { recursive: true, force: true }); }
+}
+
+test('canonical asset generator packages exactly twelve source files with verified hashes and modes', async () => {
+  await assetFixture(async f => {
+    await chmod(join(f.root, 'scripts/build-incus-worker-image.sh'), 0o751);
+    expect(f.invoke()).toContain('12 hashed source assets');
+    const manifest = JSON.parse(await readFile(join(f.output, 'manifest.json'), 'utf8')) as {
+      version: number; files: Array<{ name: string; size: number; mode: number; sha256: string }>;
+    };
+    expect(manifest.version).toBe(1); expect(manifest.files.map(file => file.name)).toEqual(canonicalBootstrap);
+    expect((await stat(f.output)).mode & 0o777).toBe(0o700);
+    expect((await stat(join(f.output, 'manifest.json'))).mode & 0o777).toBe(0o600);
+    for (const file of manifest.files) {
+      const source = await readFile(join(f.root, file.name)), packaged = await readFile(join(f.output, file.name));
+      expect(packaged).toEqual(source); expect(file.size).toBe(source.length);
+      expect(file.sha256).toBe(createHash('sha256').update(source).digest('hex'));
+      expect(file.mode).toBe((await lstat(join(f.root, file.name))).mode & 0o777);
+      expect((await stat(join(f.output, file.name))).mode & 0o777).toBe(file.mode);
+    }
+  });
+});
+
+test('canonical asset generator never overwrites an existing destination generation', async () => {
+  await assetFixture(async f => {
+    await mkdir(f.output, { mode: 0o700 }); await writeFile(join(f.output, 'keep'), 'previous generation');
+    expect(f.invoke).toThrow(/EEXIST/); expect(await readFile(join(f.output, 'keep'), 'utf8')).toBe('previous generation');
+    await expect(stat(join(f.output, 'manifest.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+});
+
+test('canonical asset generator rejects symlink, nonregular and unexpected source assets before creating output', async () => {
+  for (const mutation of ['vm-symlink', 'script-symlink', 'directory', 'unexpected', 'vm-parent', 'worker-parent', 'scripts-parent'] as const) await assetFixture(async f => {
+    const vm = join(f.root, 'worker/vm/incus-agent.service'), script = join(f.root, 'scripts/build-incus-worker-image.sh');
+    if (mutation.endsWith('-parent')) {
+      const name = mutation === 'vm-parent' ? 'worker/vm' : mutation === 'worker-parent' ? 'worker' : 'scripts';
+      const target = join(f.root, name), outside = join(f.root, 'outside-canonical-' + mutation);
+      await rename(target, outside); await symlink(outside, target);
+    } else if (mutation === 'unexpected') await writeFile(join(f.root, 'worker/vm/unapproved-os-definition'), 'must not ship');
+    else {
+      const target = mutation === 'script-symlink' ? script : vm;
+      await rm(target);
+      if (mutation === 'directory') await mkdir(target);
+      else await symlink(join(f.root, 'worker/entrypoint.sh'), target);
+    }
+    expect(f.invoke).toThrow(/unsupported assets|bounded regular file|real source directories/);
+    await expect(stat(f.output)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+});
+
+test('root image context uses explicit source rules and late known-secret exclusions with the correct CI build root', async () => {
+  const rules = (await readFile('../.dockerignore', 'utf8')).split('\n').map(line => line.trim()).filter(line => line && !line.startsWith('#'));
+  expect(rules[0]).toBe('**');
+  const allowed = rules.filter(line => line.startsWith('!'));
+  expect(allowed).toEqual(['!orchestrator/', ...['package.json', 'package-lock.json', 'tsconfig.json', 'nuxt.config.ts',
+    'app.config.ts', 'Dockerfile', 'build-instance-restore-native.mjs', 'build-incus-worker-assets.mjs', 'instance-restore-native.ts',
+    'instance-restore-helper.mjs', 'volume-mount-helper.py', 'incus-volume-live-helper.py'].map(name => '!orchestrator/' + name),
+    '!orchestrator/app/', '!orchestrator/app/**', '!orchestrator/server/', '!orchestrator/server/**',
+    '!orchestrator/shared/', '!orchestrator/shared/**', '!worker/', '!worker/vm/', '!worker/vm/**',
+    '!worker/entrypoint.sh', '!scripts/', '!scripts/build-incus-worker-image.sh']);
+  // Docker ignore has no knowledge of Git tracking. These rules protect the
+  // named secret/data categories, not arbitrary untracked source-like files;
+  // clean CI/scoped private build context remains a separate requirement.
+  const lastAllow = Math.max(...allowed.map(rule => rules.indexOf(rule)));
+  for (const rule of ['**/.git', '**/node_modules', '**/.output', '**/.env', '**/.env.*', '**/*.key', '**/*.pem', '**/*.crt',
+    '**/data', '**/.claude', '**/.codex', '**/.gemini', '**/.agents', '**/.agent-data', '**/.aws', '**/.config', '**/auth.db*',
+    '**/auth.secret', '**/secrets.json', '**/backup-objects', '**/backups', '**/instance-backup-staging', '**/instance-restore-staging',
+    '**/*.backup']) expect(rules.indexOf(rule)).toBeGreaterThan(lastAllow);
+  const dockerfile = await readFile('../orchestrator/Dockerfile', 'utf8');
+  expect(dockerfile).not.toMatch(/^COPY\s+\.\s+/m);
+  expect(dockerfile).toContain('worker/entrypoint.sh'); expect(dockerfile).toContain('worker/vm/');
+  expect(dockerfile).toContain('scripts/build-incus-worker-image.sh'); expect(dockerfile).toContain('RUN npm run build');
+  const packageJson = JSON.parse(await readFile('../orchestrator/package.json', 'utf8')) as { scripts: { build: string } };
+  expect(packageJson.scripts.build).toContain('build-incus-worker-assets.mjs');
+  const ci = await readFile('../.github/workflows/docker-build.yml', 'utf8');
+  expect(ci).toMatch(/context: \.\s*\n\s*file: \.\/orchestrator\/Dockerfile/);
+});
 
 test('early guest agent retains explicit shutdown ordering for background exec children', () => {
   const unit = readFileSync(new URL('../../worker/vm/incus-agent.service', import.meta.url), 'utf8');

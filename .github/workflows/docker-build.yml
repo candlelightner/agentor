@@ -200,7 +200,8 @@ jobs:
       - uses: docker/build-push-action@v6
         id: build
         with:
-          context: ./orchestrator
+          context: .
+          file: ./orchestrator/Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ github.repository_owner }}/agentor-orchestrator,push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}

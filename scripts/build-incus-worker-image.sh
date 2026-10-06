@@ -11,6 +11,9 @@ ALIAS="agentor-worker"
 INCUS_PROJECT="default"
 FORCE=false
 NO_IMPORT=false
+RAW_ONLY=false
+EXPECTED_SOURCE_ID=""
+EXPECTED_RECIPE_ID=""
 OUTPUT_DIR=""
 DISK_SIZE="8G"
 BOOTSTRAP_GENERATION="3"
@@ -32,6 +35,9 @@ Options:
   --size <size>            Disk size for VM rootfs (default: 8G)
   --force                  Force conversion even if Incus image is up to date
   --no-import              Only produce disk.qcow2 and metadata, skip incus import
+  --raw-only               Retain finalized disk.raw only; skip qcow2/metadata/import
+  --expected-source-id <id> Require the resolved immutable Docker sha256 image ID
+  --expected-recipe-id <id> Require the current sha256 bootstrap/converter recipe
   -h, --help               Show this help message
 EOF
     exit "${1:-0}"
@@ -67,6 +73,19 @@ while [[ $# -gt 0 ]]; do
             NO_IMPORT=true
             shift
             ;;
+        --raw-only)
+            RAW_ONLY=true
+            NO_IMPORT=true
+            shift
+            ;;
+        --expected-source-id)
+            EXPECTED_SOURCE_ID="$2"
+            shift 2
+            ;;
+        --expected-recipe-id)
+            EXPECTED_RECIPE_ID="$2"
+            shift 2
+            ;;
         -h|--help)
             usage 0
             ;;
@@ -83,6 +102,11 @@ if [[ ! "$ALIAS" =~ ^[A-Za-z0-9_.-]+$ ]]; then
 fi
 if [[ ! "$INCUS_PROJECT" =~ ^[A-Za-z0-9_.-]+$ ]]; then
     echo "Error: invalid Incus project name." >&2
+    exit 1
+fi
+if [[ -n "$EXPECTED_SOURCE_ID" && ! "$EXPECTED_SOURCE_ID" =~ ^sha256:[a-f0-9]{64}$ ]] ||
+   [[ -n "$EXPECTED_RECIPE_ID" && ! "$EXPECTED_RECIPE_ID" =~ ^[a-f0-9]{64}$ ]]; then
+    echo "Error: expected source/recipe identities must be immutable sha256 values." >&2
     exit 1
 fi
 
@@ -122,6 +146,11 @@ if ! docker image inspect "$SOURCE_IMAGE" >/dev/null 2>&1; then
 fi
 
 SOURCE_IMAGE_ID=$(docker image inspect -f '{{.Id}}' "$SOURCE_IMAGE")
+if [[ ! "$SOURCE_IMAGE_ID" =~ ^sha256:[a-f0-9]{64}$ ]] ||
+   [[ -n "$EXPECTED_SOURCE_ID" && "$SOURCE_IMAGE_ID" != "$EXPECTED_SOURCE_ID" ]]; then
+    echo "Error: resolved source image does not match the expected immutable identity." >&2
+    exit 1
+fi
 echo "==> Source image: $SOURCE_IMAGE ($SOURCE_IMAGE_ID)"
 SOURCE_ARCH=$(docker image inspect -f '{{.Architecture}}' "$SOURCE_IMAGE_ID")
 if [ "$SOURCE_ARCH" != amd64 ]; then
@@ -133,6 +162,10 @@ if [ "$(d2vm --version)" != "d2vm version $D2VM_VERSION" ]; then
     exit 1
 fi
 RECIPE_ID=$({ printf '%s\n' "$SOURCE_IMAGE_ID" "$SOURCE_ARCH" "$BOOTSTRAP_GENERATION" "$D2VM_VERSION" "$DISK_SIZE"; (cd "$REPO_ROOT" && sha256sum scripts/build-incus-worker-image.sh worker/entrypoint.sh worker/vm/*); } | sha256sum | cut -d' ' -f1)
+if [[ -n "$EXPECTED_RECIPE_ID" && "$RECIPE_ID" != "$EXPECTED_RECIPE_ID" ]]; then
+    echo "Error: bootstrap/converter recipe does not match the expected immutable identity." >&2
+    exit 1
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "Error: VM conversion requires root for loop mounts and GRUB installation." >&2
@@ -236,6 +269,16 @@ rmdir "$MNT_ROOT"
 MNT_ROOT=""
 losetup -d "$LOOP_DEV"
 LOOP_DEV=""
+
+# The controlled caller normalizes/imports raw bytes with trusted host tools.
+# This flag itself provides no isolation: operator CLI conversion still assumes
+# a trusted source; custom-image callers must run the converter in isolation.
+if [ "$RAW_ONLY" = true ]; then
+    CLEANUP_OUTPUT=false
+    echo "==> Raw conversion complete. Finalized artifact: $RAW_PATH"
+    ls -lh "$RAW_PATH"
+    exit 0
+fi
 
 echo "==> Step 2c: Compressing raw disk to qcow2..."
 QCOW2_PATH="$OUTPUT_DIR/disk.qcow2"
