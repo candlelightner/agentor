@@ -89,7 +89,11 @@ test ! -e /run/agentor/provisioned; test ! -e /run/agentor/worker.env
 systemctl mask --runtime agentor-worker.service agentor-docker-storage.service
 systemctl stop agentor-worker.service docker.service docker.socket containerd.service agentor-docker-storage.service
 mkdir -p /run/systemd/system/docker.service.d
-printf '[Unit]\nConditionPathExists=\nRequires=\n[Service]\nExecStartPre=\n' > /run/systemd/system/docker.service.d/zz-agentor-converter.conf
+install -d -m 0700 /run/agentor-converter-tools
+printf '{"features":{"containerd-snapshotter":true},"iptables":true,"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}\n' > /run/agentor-converter-tools/docker-daemon.json
+chmod 0600 /run/agentor-converter-tools/docker-daemon.json
+dockerd --validate --config-file=/run/agentor-converter-tools/docker-daemon.json
+printf '[Unit]\nConditionPathExists=\nRequires=\n[Service]\nExecStartPre=\nExecStart=\nExecStart=/usr/bin/dockerd --config-file=/run/agentor-converter-tools/docker-daemon.json -H fd:// --containerd=/run/containerd/containerd.sock\n' > /run/systemd/system/docker.service.d/zz-agentor-converter.conf
 systemctl daemon-reload
 systemctl unmask --runtime docker.service docker.socket containerd.service
 docker_diagnostics() {
@@ -98,6 +102,7 @@ docker_diagnostics() {
 }
 if ! systemctl start containerd.service docker.socket docker.service; then docker_diagnostics; exit 1; fi
 if ! timeout 30 docker info >/dev/null; then docker_diagnostics; exit 1; fi
+if ! docker info --format '{{json .DriverStatus}}' | python3 -c 'import json,sys; assert ["driver-type","io.containerd.snapshotter.v1"] in json.load(sys.stdin), "Converter requires native containerd image store for immutable source transfer"'; then docker_diagnostics; exit 1; fi
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qemu-utils gdisk grub-efi-amd64-bin curl ca-certificates coreutils util-linux xz-utils dosfstools cloud-guest-utils e2fsprogs
 # This guest has only its disposable 32GiB root disk. Resolve the currently
@@ -226,7 +231,7 @@ export class IncusImageConverter {
       catch (error) { if ((error as { statusCode?: number }).statusCode !== 404) throw error; }
       await persist({ ...receipt, removed: true });
     };
-    const execute = async (phase: 'agent-ready' | 'guest-tools' | 'guest-space' | 'OCI-load' | 'raw-convert', command: string[], stream?: NodeJS.ReadableStream) => {
+    const execute = async (phase: 'agent-ready' | 'guest-tools' | 'guest-space' | 'OCI-load' | 'OCI-identity' | 'raw-convert', command: string[], stream?: NodeJS.ReadableStream) => {
       await check();
       const session = await this.client.execStream(receipt.name, command, { command: [], user: 0, group: 0,
         cwd: '/', environment: { PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', LC_ALL: 'C' },
@@ -285,6 +290,14 @@ fi`, 'agentor-converter-space', String(required)]);
       const exported = await source.get();
       try { await execute('OCI-load', ['/usr/bin/docker', 'load'], exported); }
       finally { if (exported instanceof Readable) exported.destroy(); }
+      await execute('OCI-identity', ['/bin/bash', '-ec', String.raw`
+diagnose_source() {
+ docker info --format '{{json .DriverStatus}}' >&2 || true
+ docker image ls --quiet --no-trunc | head -n 32 >&2 || true
+}
+if ! actual=$(docker image inspect --format '{{.Id}}' "$1"); then diagnose_source; exit 1; fi
+if [ "$actual" != "$1" ]; then echo 'Loaded source OCI identity does not match the authorized immutable source' >&2; diagnose_source; exit 1; fi
+`, 'agentor-converter-source', request.sourceImageId]);
       await execute('raw-convert', ['/bin/bash', '/root/agentor-convert/scripts/build-incus-worker-image.sh',
         '--source-image', request.sourceImageId, '--expected-source-id', request.sourceImageId, '--expected-recipe-id', recipeId,
         '--size', '10G', '--raw-only', '--output-dir', '/root/agentor-convert/output']);

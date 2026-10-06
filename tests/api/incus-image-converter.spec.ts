@@ -85,10 +85,12 @@ async function fixture(run: (f: {
     commands.push(command); expect(options?.environment && Object.keys(options.environment)).toEqual(command[0] === '/usr/bin/cat' ? undefined : ['PATH', 'LC_ALL']);
     const stdin = new PassThrough(); stdin.resume(); const stdout = new PassThrough(), stderr = new PassThrough();
     stdout.end(command[0] === '/usr/bin/cat' ? Buffer.alloc(65536) : Buffer.alloc(0));
-    stderr.end(command[0] === '/usr/bin/docker' && failure === 'docker-load' ? Buffer.alloc(20_000, 65) : Buffer.alloc(0));
+    const identityFailure = command[2]?.includes('actual=$(docker image inspect') && failure === 'OCI-identity';
+    stderr.end(command[0] === '/usr/bin/docker' && failure === 'docker-load' ? Buffer.alloc(20_000, 65)
+      : identityFailure ? Buffer.from('Loaded immutable source ID is missing') : Buffer.alloc(0));
     if (command[0] === '/usr/bin/docker' && failure === 'revoke') revoked = true;
     return { stdin, stdout, stderr, operationId: randomUUID(), sendSignal() {}, close() {},
-      result: Promise.resolve(command[0] === '/usr/bin/docker' && failure === 'docker-load' ? 1 : 0) };
+      result: Promise.resolve(identityFailure || command[0] === '/usr/bin/docker' && failure === 'docker-load' ? 1 : 0) };
   };
   const docker = { getImage: (id: string) => {
     expect(id).toBe(sourceId);
@@ -187,6 +189,10 @@ test('isolated guest tools/native Docker/OCI stream use fixed trust inputs and k
     expect(setup).toContain('12a749cb96cada5a00bed759c120364ed92d1f38de67b557bb85ac67abd96ed8');
     expect(setup).toContain('/run/systemd/system/docker.service.d'); expect(setup).toContain('Requires=');
     expect(setup).toContain('/run/systemd/system/docker.service.d/zz-agentor-converter.conf');
+    expect(setup).toContain('"containerd-snapshotter":true'); expect(setup).toContain('io.containerd.snapshotter.v1');
+    expect(setup).toContain('ExecStart=\\nExecStart=/usr/bin/dockerd --config-file=/run/agentor-converter-tools/docker-daemon.json');
+    expect(setup).toContain('chmod 0600 /run/agentor-converter-tools/docker-daemon.json');
+    expect(setup).not.toContain('storage-driver'); expect(setup).not.toContain('> /etc/docker/daemon.json');
     expect('zz-agentor-converter.conf' > 'storage.conf').toBe(true);
     expect(setup).toContain('docker_diagnostics'); expect(setup).toContain('--lines=40');
     expect(setup).toContain('cloud-guest-utils'); expect(setup).toContain("os.stat('/').st_dev!=st.st_rdev");
@@ -196,11 +202,21 @@ test('isolated guest tools/native Docker/OCI stream use fixed trust inputs and k
     expect(setup).not.toMatch(/mkfs|e2fsck|\/dev\/sdb|wipefs/);
     const growth = /python3 - <<'PY'\n([\s\S]*?)\nPY\n/.exec(setup)![1]!;
     execFileSync('python3', ['-c', 'import ast,sys; ast.parse(sys.argv[1])', growth]); // Syntax preflight only; never execute host block operations.
+    execFileSync('bash', ['-n'], { input: setup });
     const space = f.commands.find(command => command[1] === '-ec' && command[2]?.includes('df -B1'))!;
     expect(space).toBeTruthy(); expect(f.commands.indexOf(space)).toBeLessThan(f.commands.findIndex(command => command[0] === '/usr/bin/docker'));
     expect(f.events.filter(event => event === 'asset')).toHaveLength(12); expect(f.events).toContain('export');
     expect(f.commands.some(command => command[0] === '/usr/bin/docker' && command[1] === 'load')).toBe(true);
     expect(f.events).toContain('stop'); expect(f.events).toContain('delete'); expect(f.receipts.at(-1)?.removed).toBe(true);
+  });
+});
+
+test('post-load immutable identity mismatch stops before conversion/pull/build and cleans only captured converter compute', async () => {
+  await fixture(async f => {
+    f.fail('OCI-identity'); await expect(f.converter.convert(f.input)).rejects.toThrow('OCI-identity failed');
+    expect(f.commands.some(command => command[1] === '/root/agentor-convert/scripts/build-incus-worker-image.sh')).toBe(false);
+    expect(f.commands.some(command => command[0] === '/usr/bin/cat')).toBe(false);
+    expect(f.receipts.at(-1)?.removed).toBe(true);
   });
 });
 
@@ -210,6 +226,11 @@ test('SAME raw-only bootstrap script produces no guest QCOW/metadata authority a
     const conversion = f.commands.find(command => command[1] === '/root/agentor-convert/scripts/build-incus-worker-image.sh')!;
     expect(conversion).toContain('--raw-only'); expect(conversion).toContain('--expected-source-id'); expect(conversion).toContain('--expected-recipe-id');
     expect(conversion).not.toContain('--force'); expect(conversion).not.toContain('--alias');
+    const loaded = f.commands.findIndex(command => command[0] === '/usr/bin/docker' && command[1] === 'load');
+    const identity = f.commands.findIndex(command => command[2]?.includes("actual=$(docker image inspect"));
+    expect(identity).toBeGreaterThan(loaded); expect(identity).toBeLessThan(f.commands.indexOf(conversion));
+    expect(f.commands[identity]?.at(-1)).toBe(sourceId); expect(f.commands[identity]?.[2]).toContain('head -n 32');
+    expect(f.commands[identity]?.[2]).not.toMatch(/docker pull|docker tag/);
     expect(f.commands.at(-1)).toEqual(['/usr/bin/cat', '/root/agentor-convert/output/disk.raw']);
     expect(f.receipts.at(-1)?.removed).toBe(true);
     const raw = join(f.directory, 'tmp/incus-image-' + f.input.jobId + '/disk.raw');
