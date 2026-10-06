@@ -35,7 +35,8 @@ async function fixture(run: (manager: ContainerManager, store: WorkerStore, call
   await store.upsert({ ...(manager as any).containerInfoToWorkerRecord(info), status: 'active' });
   (manager as any).containers.set(info.id, info);
   (manager as any).assertIncusPersistenceReady = async () => { calls.push('persistence-preflight'); };
-  manager.setIncusRuntime({ prepareArchive: async (owner: any, uuid: string) => {
+  manager.setIncusRuntime({ assertWorkspaceReplacementSettled: async () => {},
+    prepareArchive: async (owner: any, uuid: string) => {
     expect(owner.userId).toBe(info.userId); expect(uuid).toBe('original-uuid'); calls.push('source-preflight'); },
     remove: async (owner: any, uuid: string) => {
       expect(owner.id).toBe(info.id); expect(uuid).toBe('original-uuid'); calls.push('remove-compute'); },

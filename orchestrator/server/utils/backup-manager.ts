@@ -64,7 +64,8 @@ import {
   extractBundle,
   readWorkerReconstruction,
 } from "./worker-export";
-import { assertLegacyOriginalRestoreTarget, replaceStoppedWorkspace } from "./backup-restore-helper";
+import { assertOriginalRestoreTarget, assertOriginalRestoreSourceRuntime,
+  replaceStoppedWorkspace } from "./backup-restore-helper";
 import { assertBackupRestoreRuntimePrincipal,
   type BackupRestoreRuntimePrincipal } from './backup-restore-runtime-authority';
 import { useWorkerProtectionLockStore } from "./worker-protection-lock";
@@ -2386,7 +2387,7 @@ export class BackupManager {
         "Original restore requires selecting exactly one backup workspace",
       );
     if (target === "original")
-      await assertLegacyOriginalRestoreTarget(userId, source);
+      await assertOriginalRestoreTarget(userId, source);
     if (target === "original" && extraBackupPaths(artifact.selectedPathsByWorkspace?.[source]).length)
       throw Object.assign(new Error("Original restore is unavailable for backups containing explicit absolute paths; restore into a new worker"), { statusCode: 409 });
     const normalizedResolutions = normalizeImageResolutions(
@@ -2429,7 +2430,7 @@ export class BackupManager {
     try {
       this.assertRestoreActive(userId, admission.controller.signal);
       if (target === "original") {
-        await assertLegacyOriginalRestoreTarget(userId, source);
+        await assertOriginalRestoreTarget(userId, source);
         await useWorkerProtectionLockStore().verify(source, lockPassword);
         this.assertRestoreActive(userId, admission.controller.signal);
       }
@@ -3502,12 +3503,14 @@ export class BackupManager {
         if (!extracted.workspacePath)
           throw new Error("Backup workspace payload is missing");
         assertActive();
-        await replaceStoppedWorkspace(
-          job.userId,
-          source,
-          extracted.workspacePath,
-          execution.controller.signal,
-        );
+        const target = await assertOriginalRestoreTarget(job.userId, source);
+        assertOriginalRestoreSourceRuntime(target.runtimeKind, extracted.manifest.runtime);
+        if (target.runtimeKind === 'incus-vm') {
+          await useContainerManager().replaceOriginalWorkspaceFromBackup(job.userId, source,
+            extracted.workspacePath, extracted.manifest.runtime, assertActive, execution.controller.signal);
+        } else {
+          await replaceStoppedWorkspace(job.userId, source, extracted.workspacePath, execution.controller.signal);
+        }
         job.workerId = source;
         job.restoreMappings = [
           { sourceWorkspaceId: source, workerId: source },

@@ -20,7 +20,8 @@ async function fixture(run: (f: any) => Promise<void>) {
   try {
     const installation = await backupInstallationId(dataDir), incarnation = randomUUID();
     const state = { boot: randomUUID() };
-    const owner = { id: 'worker', userId: 'owner', containerName: 'agentor-worker-worker' };
+    const id = randomUUID();
+    const owner = { id, userId: 'owner', containerName: 'agentor-worker-' + id };
     const store = new ManagedNetworkStore(dataDir);
     const network = await store.create(owner.userId, 'managed test', 'selected');
     await store.update(owner.userId, network.id, { workerIds: [owner.id] });

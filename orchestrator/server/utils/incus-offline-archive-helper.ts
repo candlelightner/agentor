@@ -10,11 +10,12 @@ import { isDeepStrictEqual } from 'node:util';
 
 type Owner = { id: string; userId: string; containerName: string };
 type Sources = { workspace: string; agents: string; managed?: never } |
-  { managed: string; workspace?: never; agents?: never } | { docker: string; copy: boolean };
+  { managed: string; workspace?: never; agents?: never } | { docker: string; copy: boolean } |
+  { workspaceRestore: true };
 type Kind = 'create' | 'start' | 'stop' | 'delete' | 'copy' | 'delete-copy';
 type Recovery = { version: 1; id: string; installation: string; owner: Owner; sources: Sources;
   fingerprint: string; instance?: string; copy?: { created_at: string; config: Record<string, string> };
-  pending?: { kind: Kind; operation?: string } };
+  pending?: { kind: Kind; operation?: string }; writerSettled?: boolean };
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 const operation = /^\/1\.0\/operations\/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 const temporaryReceipt = /^([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})\.[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.tmp$/;
@@ -40,10 +41,17 @@ export async function assertOfflineArchiveHelpersSettled(dataDir: string) {
   } finally { await directory.close(); }
 }
 
-/** One read-only, networkless guest; a private cleanup receipt, not a backup
- * transaction journal. Unknown submissions remain quarantined for operators. */
+/** One pinned, networkless guest with readonly backup sources or one fixed
+ * workspace writer. The same private cleanup receipt fences unknown results;
+ * it is not a backup transaction journal or arbitrary writable helper. */
 export class IncusOfflineArchiveHelper {
   constructor(private config: Config, private client: IncusClient, private installation: string) {}
+
+  private canonicalWriterOwner(owner: Owner): boolean {
+    return !!owner && uuid.test(owner.id) && safeName(owner.userId) && safeName(owner.containerName) &&
+      typeof this.config.containerPrefix === 'string' && /^[A-Za-z0-9_-]+$/.test(this.config.containerPrefix) &&
+      owner.containerName === `${this.config.containerPrefix}-${owner.id}`;
+  }
 
   private validate(value: unknown): asserts value is Recovery {
     const v = value as Recovery;
@@ -51,10 +59,13 @@ export class IncusOfflineArchiveHelper {
     const validSources = keys === 'agents,workspace' && 'workspace' in v.sources
       ? safeName(v.sources.workspace) && safeName(v.sources.agents) && v.sources.workspace !== v.sources.agents
       : keys === 'managed' && 'managed' in v.sources ? safeName(v.sources.managed)
+      : keys === 'workspaceRestore' && 'workspaceRestore' in v.sources && v.sources.workspaceRestore === true
+      ? this.canonicalWriterOwner(v.owner)
       : keys === 'copy,docker' && 'docker' in v.sources && safeName(v.sources.docker) && typeof v.sources.copy === 'boolean';
+    const writer = keys === 'workspaceRestore';
     if (!v || v.version !== 1 || !uuid.test(v.id ?? '') || v.installation !== this.installation ||
         !uuid.test(v.owner?.id ?? '') || !safeName(v.owner?.userId) || !safeName(v.owner?.containerName) ||
-        !validSources ||
+        !validSources || (writer ? typeof v.writerSettled !== 'boolean' : Object.hasOwn(v, 'writerSettled')) ||
         !/^[a-f0-9]{64}$/.test(v.fingerprint ?? '') || v.instance !== undefined && !uuid.test(v.instance) ||
         v.copy && (!('docker' in v.sources) || !v.sources.copy || !Number.isFinite(Date.parse(v.copy.created_at)) ||
           !v.copy.config || Object.keys(v.copy.config).length > 16 ||
@@ -62,6 +73,65 @@ export class IncusOfflineArchiveHelper {
         v.pending && (!['create', 'start', 'stop', 'delete', 'copy', 'delete-copy'].includes(v.pending.kind) ||
           v.pending.operation !== undefined && !operation.test(v.pending.operation)))
       throw fail('Offline backup helper recovery authority is malformed; retain it for operator recovery.');
+  }
+
+  /** Same bounded no-follow receipt reader as helper admission. It neither
+   * replays mutations nor infers settlement from absent compute or an IP. */
+  private async scanReceipts(dir: FileHandle, visit: (state: Recovery) => void): Promise<void> {
+    const entries = await opendir(`/proc/self/fd/${dir.fd}`);
+    let count = 0;
+    for await (const item of entries) {
+      if (++count > 1024) throw fail('Offline helper recovery directory exceeds its bounded inventory.');
+      const entry = item.name, temporary = temporaryReceipt.exec(entry);
+      if (temporary && item.isFile() && isOperationHelperActive(temporary[1])) continue;
+      if (temporary) {
+        try { await lstat(`/proc/self/fd/${dir.fd}/${entry}`); }
+        catch (error: any) { if (error.code === 'ENOENT') continue; throw error; }
+      }
+      if (!/^[a-f0-9-]{36}\.json$/.test(entry)) throw fail('Offline helper recovery requires operator inspection.');
+      let file: FileHandle;
+      try { file = await open(`/proc/self/fd/${dir.fd}/${entry}`, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+      catch (error: any) { if (error.code === 'ENOENT') continue; throw error; }
+      try {
+        const info = await file.stat();
+        if (!info.isFile() || info.size > 8192 || (info.mode & 0o077) !== 0 || info.uid !== process.getuid?.())
+          throw fail('Offline helper recovery record is unsafe.');
+        const bytes = Buffer.alloc(8193), read = await file.read(bytes, 0, bytes.length, 0);
+        if (read.bytesRead > 8192) throw fail('Offline helper recovery record is too large.');
+        const previous: unknown = JSON.parse(bytes.subarray(0, read.bytesRead).toString('utf8')); this.validate(previous);
+        if (entry !== `${previous.id}.json`) throw fail('Offline helper recovery identity changed.');
+        visit(previous);
+      } finally { await file.close(); }
+    }
+  }
+
+  /** Read-only integration fence. Even known callback success cannot waive an
+   * unresolved helper cleanup receipt; only acknowledged cleanup removes it. */
+  async assertWorkspaceReplacementSettled(owner: Owner): Promise<void> {
+    owner = { ...owner };
+    if (!uuid.test(this.installation) || !this.canonicalWriterOwner(owner))
+      throw fail('Workspace replacement owner identity is malformed.');
+    const key = `${this.config.dataDir}:${owner.id}`;
+    const assertUnclaimed = () => {
+      if (owners.has(key)) throw fail('An offline helper actively owns this worker; retain the worker data fence.');
+    };
+    // A claim predates receipt fsync. Active .tmp entries intentionally remain
+    // unreadable to peers, so disk enumeration alone cannot prove settlement.
+    assertUnclaimed();
+    let dir: FileHandle;
+    try { dir = await open(join(this.config.dataDir, 'incus-backup-helpers'),
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW); }
+    catch (error: any) { if (error.code === 'ENOENT') { assertUnclaimed(); return; }
+      throw fail('Offline helper recovery directory is unavailable.'); }
+    try {
+      const info = await dir.stat();
+      if ((info.mode & 0o077) !== 0 || info.uid !== process.getuid?.()) throw fail('Offline helper recovery directory is not private.');
+      await this.scanReceipts(dir, state => {
+        if (state.owner.id === owner.id && 'workspaceRestore' in state.sources)
+          throw fail('Unsettled workspace replacement exists; retain the worker data fence.');
+      });
+    } finally { await dir.close(); }
+    assertUnclaimed();
   }
 
   private name(state: Recovery) { return `abk-${state.id}`; }
@@ -97,6 +167,11 @@ export class IncusOfflineArchiveHelper {
   private devices(state: Recovery) {
     const devices: Record<string, Record<string, string>> = {
       root: { type: 'disk', path: '/', pool: this.config.incusStoragePool } };
+    if ('workspaceRestore' in state.sources) {
+      devices.workspace = { type: 'disk', pool: this.config.incusStoragePool,
+        source: state.owner.containerName + '-workspace', path: '/target', readonly: 'false' };
+      return devices;
+    }
     if ('docker' in state.sources) {
       devices.docker = { type: 'disk', pool: this.config.incusStoragePool, readonly: 'true',
         source: state.sources.copy ? this.copyName(state) : state.sources.docker };
@@ -109,7 +184,8 @@ export class IncusOfflineArchiveHelper {
     return devices;
   }
   private metadata(state: Recovery) {
-    return { 'user.agentor.installation': this.installation, 'user.agentor.helper': 'offline-backup',
+    return { 'user.agentor.installation': this.installation,
+      'user.agentor.helper': 'workspaceRestore' in state.sources ? 'workspace-replace' : 'offline-backup',
       'user.agentor.operation': state.id, 'user.agentor.worker': state.owner.id,
       'user.agentor.owner': state.owner.userId, 'user.agentor.image': state.fingerprint };
   }
@@ -144,11 +220,15 @@ export class IncusOfflineArchiveHelper {
 
   async withGuest<T>(owner: Owner, sources: Sources, assertSource: (helperName?: string) => Promise<void>,
     signal: AbortSignal | undefined, capture: (helperName: string, assertHelper: () => Promise<void>) => Promise<T>): Promise<T> {
+    // Capture fixed primitive fields before awaits; caller object mutation
+    // cannot turn this writer into a Docker copy or change its owner later.
+    owner = { ...owner }; sources = { ...sources };
     // Claim before any await: concurrent callers cannot race recovery discovery.
     const key = `${this.config.dataDir}:${owner.id}`, id = randomUUID();
     if (owners.has(key)) throw fail('An offline backup helper already owns this worker.');
     owners.add(key); const release = registerOperationHelper(id);
-    let dir: FileHandle | undefined, state: Recovery | undefined, reserved = false, submitted = false;
+    let dir: FileHandle | undefined, state: Recovery | undefined, reserved = false, submitted = false, writerMayRun = false;
+    let primaryFailure: unknown, primaryFailed = false;
     const path = () => `/proc/self/fd/${dir!.fd}/${id}.json`;
     const persist = async (next: Recovery) => {
       this.validate(next);
@@ -220,7 +300,10 @@ export class IncusOfflineArchiveHelper {
         }
       }
       // Source proof after known removal excludes the helper's former reference.
-      await assertSource(); await unlink(path()); await dir!.sync(); reserved = false;
+      await assertSource();
+      if ('workspaceRestore' in state!.sources && writerMayRun && !state!.writerSettled)
+        throw fail('Workspace replacement callback is unsettled; helper removed but data fence retained.');
+      await unlink(path()); await dir!.sync(); reserved = false;
     };
     try {
       if (!uuid.test(this.installation)) throw fail('Offline backup installation identity is unavailable.');
@@ -229,39 +312,15 @@ export class IncusOfflineArchiveHelper {
       dir = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
       const info = await dir.stat();
       if ((info.mode & 0o077) !== 0 || info.uid !== process.getuid?.()) throw fail('Offline helper recovery directory is not private.');
-      const entries = await opendir(`/proc/self/fd/${dir.fd}`);
-      let count = 0;
-      for await (const item of entries) {
-        if (++count > 1024) throw fail('Offline helper recovery directory exceeds its bounded inventory.');
-        const entry = item.name;
-        const temporary = temporaryReceipt.exec(entry);
-        // Another worker may still be fsyncing its private receipt. Only the
-        // exact writer naming and a current request claim permit skipping it.
-        if (temporary && item.isFile() && isOperationHelperActive(temporary[1])) continue;
-        if (temporary) {
-          try { await lstat(`/proc/self/fd/${dir.fd}/${entry}`); }
-          catch (error: any) { if (error.code === 'ENOENT') continue; throw error; }
-        }
-        if (!/^[a-f0-9-]{36}\.json$/.test(entry)) throw fail('Offline helper recovery requires operator inspection.');
-        let file: FileHandle;
-        try { file = await open(`/proc/self/fd/${dir.fd}/${entry}`, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
-        catch (error: any) { if (error.code === 'ENOENT') continue; throw error; }
-        try {
-          const info = await file.stat();
-          if (!info.isFile() || info.size > 8192 || (info.mode & 0o077) !== 0 || info.uid !== process.getuid?.())
-            throw fail('Offline helper recovery record is unsafe.');
-          const bytes = Buffer.alloc(8193), read = await file.read(bytes, 0, bytes.length, 0);
-          if (read.bytesRead > 8192) throw fail('Offline helper recovery record is too large.');
-          const previous: unknown = JSON.parse(bytes.subarray(0, read.bytesRead).toString('utf8')); this.validate(previous);
-          if (entry !== `${previous.id}.json`) throw fail('Offline helper recovery identity changed.');
-          if (previous.owner.id === owner.id) throw fail('Unresolved offline backup helper exists; recover it before retrying.');
-        } finally { await file.close(); }
-      }
+      await this.scanReceipts(dir, previous => {
+        if (previous.owner.id === owner.id) throw fail('Unresolved offline backup helper exists; recover it before retrying.');
+      });
       signal?.throwIfAborted(); await assertSource();
       const alias = await this.client.getImageAlias(this.config.incusWorkerImage);
       const image = incusImageIdentity(await this.client.getImage(alias.target));
       if (image.fingerprint !== alias.target) throw fail('Trusted helper image fingerprint changed.');
-      state = { version: 1, id, installation: this.installation, owner: { ...owner }, sources: { ...sources }, fingerprint: image.fingerprint };
+      state = { version: 1, id, installation: this.installation, owner: { ...owner }, sources: { ...sources }, fingerprint: image.fingerprint,
+        ...('workspaceRestore' in sources ? { writerSettled: false } : {}) };
       this.validate(state); await persist(state); reserved = true;
       await assertSource(); signal?.throwIfAborted();
       if ('docker' in sources && sources.copy) {
@@ -283,7 +342,11 @@ export class IncusOfflineArchiveHelper {
       if (!uuid.test(created?.config['volatile.uuid'] ?? '')) throw fail('Helper create omitted its incarnation.');
       await persist({ ...state, instance: created!.config['volatile.uuid'] });
       signal?.throwIfAborted(); await this.inspect(state!);
-      await submit('start', accepted => this.client.startInstance(this.name(state!), accepted));
+      try { await submit('start', accepted => {
+        if ('workspaceRestore' in sources) writerMayRun = true;
+        return this.client.startInstance(this.name(state!), accepted);
+      }); }
+      catch (error) { if (error instanceof IncusRequestRejected) writerMayRun = false; throw error; }
       const deadline = Date.now() + 120_000;
       let ready = false;
       while (Date.now() < deadline) {
@@ -300,9 +363,22 @@ export class IncusOfflineArchiveHelper {
       if (!ready) throw fail('Offline backup guest agent did not become ready.');
       await assertHelper(); await assertSource(this.name(state));
       const result = await capture(this.name(state), assertHelper);
-      await assertHelper(); await assertSource(this.name(state)); return result;
+      await assertHelper(); await assertSource(this.name(state));
+      if ('workspaceRestore' in sources) await persist({ ...state!, writerSettled: true });
+      return result;
+    } catch (error) {
+      primaryFailed = true; primaryFailure = error; throw error;
     } finally {
-      try { await cleanup(); } finally { await dir?.close(); release(); owners.delete(key); }
+      try {
+        try { await cleanup(); }
+        catch (error) {
+          // Keep quarantine/cleanup failure authoritative. Its private cause
+          // preserves the original diagnostic without logging archive content
+          // or treating a failed callback as known filesystem settlement.
+          if (primaryFailed && error instanceof Error) error.cause = primaryFailure;
+          throw error;
+        }
+      } finally { await dir?.close(); release(); owners.delete(key); }
     }
   }
 }

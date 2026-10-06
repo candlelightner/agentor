@@ -26,7 +26,10 @@ import { PassThrough, Readable, Transform } from 'node:stream';
 import { snapshotIncusWorkerBackupRuntime, parseWorkerBackupRuntime, type WorkerBackupRuntimeSource } from './worker-backup-runtime';
 import { IncusOfflineArchiveHelper } from './incus-offline-archive-helper';
 import { writeGzipFile } from './worker-export';
-import { INCUS_CANONICAL_RESTORE_SCRIPT } from './incus-canonical-restore';
+import { INCUS_CANONICAL_RESTORE_SCRIPT, prepareIncusCanonicalRestorePayload } from './incus-canonical-restore';
+import { INCUS_WORKSPACE_REPLACE_SCRIPT } from './incus-workspace-replace';
+import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { validateIncusCanonicalRestoreArchive, validatePortableManagedVolumeArchive } from './portable-managed-volume-archive';
 import { inspectIncusSelectedRestoreArchive, validateIncusSelectedRestoreArchive, validateIncusDockerRestoreArchive } from './portable-managed-volume-archive';
 import { INCUS_DOCKER_RESTORE_SCRIPT } from './incus-docker-restore';
@@ -133,6 +136,128 @@ export class IncusWorkerRuntime {
 
   private async storage(): Promise<IncusWorkerStorage> {
     return new IncusWorkerStorage(this.client, this.config, await this.installationId());
+  }
+
+  /** The accepted helper's private receipt is the sole unsettled-writer fence.
+   * No lifecycle action may reinterpret unknown replacement as usable data. */
+  async assertWorkspaceReplacementSettled(owner: IncusStorageOwner): Promise<void> {
+    await new IncusOfflineArchiveHelper(this.config, this.client, await this.installationId())
+      .assertWorkspaceReplacementSettled(owner);
+  }
+
+  /** Caller owns owner→worker admission. Replace only the stopped original's
+   * workspace using the accepted isolated helper and canonical raw codec. */
+  async replaceOriginalWorkspace(owner: IncusStorageOwner, incarnation: string, archivePath: string,
+    validateRecord: () => void | Promise<void>, signal?: AbortSignal): Promise<void> {
+    owner = { ...owner };
+    await this.assertWorkspaceReplacementSettled(owner);
+    await validateRecord(); signal?.throwIfAborted(); await this.assertReady();
+    await this.inspectOfflineBackupStorage(owner, incarnation);
+    const original = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    const storage = await this.storage(), baseline = structuredClone(await storage.inspectVolume(owner, 'workspace'));
+    if (!baseline || original.status !== 'Stopped') throw new Error('Original workspace requires stopped native storage authority');
+    await storage.preserveOwnership(owner); // Reject incomplete whole-import flags before workspace writes.
+    // Recheck unchanged agents/Docker metadata and references too. Proving
+    // compute devices alone cannot fence native volume replacement/drift.
+    const cores = {
+      workspace: baseline,
+      agents: structuredClone(await storage.inspectVolume(owner, 'agents')),
+      docker: structuredClone(await storage.inspectVolume(owner, 'docker')),
+    };
+    if (!cores.agents) throw new Error('Original agents storage authority is unavailable');
+    const references = (values: string[]) => values.map(value => {
+      const url = new URL(value, this.client.endpoint);
+      if (url.origin !== new URL(this.client.endpoint).origin || url.username || url.password || url.hash ||
+          url.searchParams.getAll('project').length !== 1 || url.searchParams.get('project') !== this.config.incusProject ||
+          [...url.searchParams.keys()].some(key => key !== 'project'))
+        throw new Error('Original workspace reference is foreign');
+      return url.pathname;
+    }).sort();
+    for (const role of ['workspace', 'agents', 'docker'] as const) {
+      const before = cores[role];
+      const expected = role === 'docker' && !original.devices.docker ? [] : [`/1.0/instances/${owner.containerName}`];
+      if (before && (before.project !== this.config.incusProject || !before.created_at || !Number.isFinite(Date.parse(before.created_at)) ||
+          !isDeepStrictEqual(references(before.used_by), expected)))
+        throw new Error('Original ' + role + ' native storage reference is ambiguous');
+    }
+    const assertSource = async (helperName?: string) => {
+      await validateRecord(); signal?.throwIfAborted();
+      const current = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+      if (current.status !== 'Stopped' || !isDeepStrictEqual(current.config, original.config) ||
+          !isDeepStrictEqual(current.devices, original.devices) || !isDeepStrictEqual(current.profiles, original.profiles) ||
+          !isDeepStrictEqual(current.expanded_config, original.expanded_config) ||
+          !isDeepStrictEqual(current.expanded_devices, original.expanded_devices))
+        throw new Error('Original workspace compute identity or layout changed');
+      for (const role of ['workspace', 'agents', 'docker'] as const) {
+        const before = cores[role]; let volume: IncusCustomVolume | undefined;
+        try { volume = await this.client.getCustomVolume(this.config.incusStoragePool,
+          incusWorkerVolumeName(owner, this.config.containerPrefix, role)); }
+        catch (error) { if (role !== 'docker' || before || (error as { statusCode?: number }).statusCode !== 404) throw error; }
+        if (!before) {
+          if (volume) throw new Error('Original Docker storage absence changed');
+          continue;
+        }
+        const expected = references(before.used_by);
+        if (role === 'workspace' && helperName) expected.push(`/1.0/instances/${helperName}`);
+        if (!volume || !isDeepStrictEqual({ ...volume, used_by: undefined }, { ...before, used_by: undefined }) ||
+            !isDeepStrictEqual(references(volume.used_by), expected.sort()))
+          throw new Error('Original ' + role + ' native storage authority changed');
+      }
+      await validateRecord(); signal?.throwIfAborted();
+    };
+    await assertSource();
+    const scratchRoot = join(this.config.dataDir, 'tmp'); await mkdir(scratchRoot, { recursive: true, mode: 0o700 });
+    const scratch = await mkdtemp(join(scratchRoot, 'original-workspace-'));
+    try {
+      const raw = await prepareIncusCanonicalRestorePayload(archivePath, 'workspace', scratch, { signal });
+      await assertSource();
+      const nonce = randomUUID();
+      await new IncusOfflineArchiveHelper(this.config, this.client, await this.installationId())
+        .withGuest(owner, { workspaceRestore: true }, assertSource, signal, async (name, assertHelper) => {
+          const validate = async () => { await assertHelper(); await assertSource(name); };
+          await validate();
+          const helperImage = (await this.client.getInstance(name)).config['volatile.base_image'];
+          // Until conversion-controlled capability attestation is available,
+          // prove the original derives from the exact verified helper image.
+          // Never boot/switch an unproven original merely to inspect its root.
+          if (!/^[a-f0-9]{64}$/.test(helperImage ?? '') || original.config['volatile.base_image'] !== helperImage)
+            throw new Error('Original worker image ownership-preservation support is unproven; original data was not replaced');
+          const execute = async (command: string[], input?: string) => {
+            await validate();
+            const session = await this.client.execStream(name, command, { command: [], user: 0, group: 0,
+              cwd: '/', environment: { PATH: '/usr/bin:/bin', LC_ALL: 'C' }, signal, timeoutMs: 30 * 60_000 });
+            session.stdout.resume(); session.stderr.resume();
+            try {
+              if (input) await Promise.all([pipeline(createReadStream(input), session.stdin, { signal }),
+                session.result.then(code => { if (code !== 0) throw new Error('Original workspace extraction failed; replacement remains fenced'); })]);
+              else { session.stdin.end(); if (await session.result !== 0)
+                throw new Error('Original workspace replacement acknowledgement failed; replacement remains fenced'); }
+              await validate();
+            } finally { session.close(); }
+          };
+          await execute(['/usr/bin/grep', '-Fxq', '--', 'ownership_marker=/run/agentor/preserve-storage-ownership',
+            '/usr/lib/agentor/agentor-private-storage.sh']);
+          // Socket activation can outlive disabled boot units. Quiesce only
+          // the isolated helper before any workspace staging/write; original
+          // compute and its Docker state remain stopped and untouched.
+          const units = ['agentor-worker.service', 'docker.service', 'docker.socket', 'containerd.service'];
+          await execute(['/usr/bin/systemctl', 'mask', '--runtime', ...units]);
+          await execute(['/usr/bin/systemctl', 'stop', ...units]);
+          await execute(['/usr/bin/python3', '-c', INCUS_WORKSPACE_REPLACE_SCRIPT, 'prepare', nonce]);
+          await execute(['/usr/bin/tar', '--numeric-owner', '--same-owner', '--same-permissions', '--xattrs',
+            '--xattrs-include=*', '--acls', '--delay-directory-restore', '-xpf', '-', '-C', `/target/.agentor-restore-stage-${nonce}`], raw.archivePath);
+          await execute(['/usr/bin/python3', '-c', INCUS_WORKSPACE_REPLACE_SCRIPT, 'commit', nonce]);
+          await validate();
+          const current = await this.client.getCustomVolume(this.config.incusStoragePool, baseline.name);
+          const acknowledged = await storage.markWorkspacePreserveOwnership(owner, current, name);
+          baseline.config = acknowledged.config;
+          await validate();
+          // Only acknowledged commit may discard old bytes; unknown exec never
+          // reaches finish or clears the accepted helper's writer receipt.
+          await execute(['/usr/bin/python3', '-c', INCUS_WORKSPACE_REPLACE_SCRIPT, 'finish', nonce]);
+        });
+      await assertSource();
+    } finally { await rm(scratch, { recursive: true, force: true }); }
   }
 
   async removeStorage(owner: IncusStorageOwner): Promise<void> {
@@ -860,6 +985,7 @@ export class IncusWorkerRuntime {
   }
 
   async preflightRecreation(opts: IncusWorkerOptions, dockerRequired = false): Promise<{ fingerprint: string; docker: boolean }> {
+    await this.assertWorkspaceReplacementSettled(opts);
     await this.assertReady();
     this.validateOptions(opts);
     const storage = await this.storage();
@@ -1524,6 +1650,7 @@ export class IncusWorkerRuntime {
   async start(opts: IncusWorkerOptions, incarnation?: string,
     recovery: { leaveRunningOnFailure?: boolean } = {}): Promise<void> {
     this.validateOptions(opts);
+    await this.assertWorkspaceReplacementSettled(opts);
     await this.assertReady();
     const name = opts.containerName;
     const instance = await this.assertOwned(name, opts.id, opts.userId, incarnation);

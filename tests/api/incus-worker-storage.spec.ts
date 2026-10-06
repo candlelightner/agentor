@@ -26,7 +26,7 @@ function fixture() {
     },
     deleteCustomVolume: async (_pool: string, name: string) => { writes.push(`delete:${name}`); volumes.delete(name); },
   };
-  return { volumes, writes, storage: new IncusWorkerStorage(client as any, config, "installation") };
+  return { volumes, writes, client, storage: new IncusWorkerStorage(client as any, config, "installation") };
 }
 
 test("filesystem persistence is separate from disposable root and Docker capability", async () => {
@@ -82,6 +82,69 @@ test('restored ownership preservation is durable on both exact private roots and
   await expect(storage.markPreserveOwnership(owner)).rejects.toThrow('malformed'); expect(writes).toEqual([]);
   agents.config['user.agentor.preserve-ownership'] = 'true'; agents.config['user.agentor.owner'] = 'foreign';
   await expect(storage.preserveOwnership(owner)).rejects.toThrow('ownership/type');
+});
+
+test('workspace-only preservation is durable without changing agents and never waives incomplete whole-import flags', async () => {
+  const f = fixture(); await f.storage.devices(owner, false);
+  const workspace = f.volumes.get(owner.containerName + '-workspace'), agents = f.volumes.get(owner.containerName + '-agents');
+  const oldAgents = structuredClone(agents);
+  workspace.config['user.agentor.workspace-preserve-ownership'] = 'true';
+  expect(await f.storage.preserveOwnership(owner)).toBe(true); expect(agents).toEqual(oldAgents);
+  workspace.config['user.agentor.preserve-ownership'] = 'true';
+  await expect(f.storage.preserveOwnership(owner)).rejects.toThrow('malformed or incomplete');
+  delete workspace.config['user.agentor.preserve-ownership'];
+  workspace.config['user.agentor.workspace-preserve-ownership'] = 'false';
+  await expect(f.storage.preserveOwnership(owner)).rejects.toThrow('workspace ownership metadata');
+  workspace.config['user.agentor.workspace-preserve-ownership'] = 'true';
+  agents.config['user.agentor.workspace-preserve-ownership'] = 'true';
+  await expect(f.storage.preserveOwnership(owner)).rejects.toThrow('workspace ownership metadata');
+});
+
+test('workspace-only marker updates exactly one owned snapshot with ETag and requires exact fresh acknowledgement', async () => {
+  for (const scenario of ['valid', 'reference-order', 'ack-order', 'etag', 'foreign', 'created', 'reference', 'duplicate', 'conflict', 'unknown', 'changed-ack'] as const) {
+    const f = fixture(); await f.storage.devices(owner, false);
+    const helper = 'abk-' + randomUUID(), workspace = f.volumes.get(owner.containerName + '-workspace');
+    Object.assign(workspace, { project: 'agentor', created_at: new Date(0).toISOString(), description: '',
+      used_by: [`/1.0/instances/${owner.containerName}?project=agentor`, `/1.0/instances/${helper}?project=agentor`] });
+    const expected = structuredClone(workspace), agents = structuredClone(f.volumes.get(owner.containerName + '-agents'));
+    let put = false;
+    if (scenario === 'ack-order') {
+      const read = f.client.getCustomVolume;
+      f.client.getCustomVolume = async (pool, name) => {
+        const value = await read(pool, name); if (put) value.used_by.reverse(); return value;
+      };
+    }
+    (f.client as any).rawRequest = async (method: string, path: string, body: any, headers: any) => {
+      expect(path).toBe(`/1.0/storage-pools/pool/volumes/custom/${workspace.name}`);
+      if (method === 'GET') {
+        if (scenario === 'foreign') workspace.config['user.agentor.owner'] = 'other';
+        if (scenario === 'created') workspace.created_at = new Date().toISOString();
+        if (scenario === 'reference') workspace.used_by[1] = '/1.0/instances/foreign?project=agentor';
+        if (scenario === 'reference-order') workspace.used_by.reverse();
+        if (scenario === 'duplicate') workspace.used_by.push(workspace.used_by[0]);
+        return { statusCode: 200, headers: scenario === 'etag' ? {} : { etag: 'exact-volume-etag' },
+          body: Buffer.from(JSON.stringify({ type: 'sync', metadata: workspace })) };
+      }
+      expect(method).toBe('PUT'); expect(headers).toEqual({ 'If-Match': 'exact-volume-etag' });
+      expect(body).toEqual({ description: '', config: { ...expected.config, 'user.agentor.workspace-preserve-ownership': 'true' } });
+      put = true;
+      if (scenario === 'unknown') throw new Error('PUT acknowledgement lost');
+      if (scenario === 'conflict') return { statusCode: 412, body: Buffer.from(JSON.stringify({ type: 'error' })) };
+      workspace.config = body.config;
+      if (scenario === 'changed-ack') workspace.config['user.agentor.owner'] = 'foreign';
+      return { statusCode: 200, body: Buffer.from(JSON.stringify({ type: 'sync' })) };
+    };
+    if (scenario === 'valid' || scenario === 'reference-order' || scenario === 'ack-order') {
+      const acknowledged = await f.storage.markWorkspacePreserveOwnership(owner, expected, helper);
+      expect({ ...acknowledged, used_by: [...acknowledged.used_by].sort() })
+        .toEqual({ ...expected, used_by: [...expected.used_by].sort(), config: { ...expected.config, 'user.agentor.workspace-preserve-ownership': 'true' } });
+      expect(put).toBe(true);
+    } else {
+      await expect(f.storage.markWorkspacePreserveOwnership(owner, expected, helper)).rejects.toThrow();
+      expect(put).toBe(['conflict', 'unknown', 'changed-ack'].includes(scenario));
+    }
+    expect(f.volumes.get(owner.containerName + '-agents')).toEqual(agents);
+  }
 });
 
 test("Docker block storage remains on disable and is reused on re-enable", async () => {

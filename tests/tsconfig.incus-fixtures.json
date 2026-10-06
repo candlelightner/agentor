@@ -11,7 +11,9 @@
     "api/instance-native-helper-process.spec.ts",
     "api/instance-backup-helper-launch.spec.ts",
     "api/instance-backup-ws-startup.spec.ts",
-    "api/instance-backup-native-preflight.spec.ts"
+    "api/instance-backup-native-preflight.spec.ts",
+    "api/incus-original-workspace-live.spec.ts",
+    "api/incus-original-workspace-runtime.spec.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }

@@ -1316,7 +1316,44 @@ export class ContainerManager {
       if (!current || current.userId !== snapshot.userId) {
         throw new Error("Container not found");
       }
+      if (current.runtimeKind === 'incus-vm') await this.incusRuntime.assertWorkspaceReplacementSettled(current);
       return operation();
+    });
+  }
+
+  /** Authenticated original restore is not a runtime migration or rebuild.
+   * One existing owner→worker admission covers every destructive leaf. */
+  async replaceOriginalWorkspaceFromBackup(userId: string, id: string, archivePath: string,
+    authenticatedRuntime: unknown, validateJob: () => void | Promise<void>, signal?: AbortSignal): Promise<void> {
+    const { assertOriginalRestoreTarget, assertOriginalRestoreSourceRuntime } = await import('./backup-restore-helper');
+    await validateJob(); signal?.throwIfAborted();
+    const admitted = await assertOriginalRestoreTarget(userId, id);
+    assertOriginalRestoreSourceRuntime(admitted.runtimeKind, authenticatedRuntime);
+    if (admitted.runtimeKind !== 'incus-vm') throw new Error('Native workspace writer requires an Incus original');
+    await this.withExistingWorkerLifecycleMutation(id, async () => {
+      await validateJob(); signal?.throwIfAborted();
+      const current = await assertOriginalRestoreTarget(userId, id);
+      assertOriginalRestoreSourceRuntime(current.runtimeKind, authenticatedRuntime);
+      if (current.runtimeKind !== 'incus-vm' || current.incarnation !== admitted.incarnation)
+        throw new Error('Original restore incarnation changed before admission');
+      const record = structuredClone(current.record), worker = structuredClone(current.worker);
+      const validate = async () => {
+        await validateJob(); signal?.throwIfAborted(); await this.assertOwnerExists(userId);
+        const facts = await assertOriginalRestoreTarget(userId, id);
+        if (facts.runtimeKind !== 'incus-vm' || facts.incarnation !== current.incarnation ||
+            !isDeepStrictEqual(facts.record, record) || !isDeepStrictEqual(facts.worker, worker))
+          throw new Error('Original restore worker authority changed');
+        if (!isDeepStrictEqual(managed.store.forWorker(userId, id), managedRecords))
+          throw new Error('Original restore managed storage authority changed');
+      };
+      const { useManagedVolumeManager } = await import('./managed-volume-manager');
+      const managed = useManagedVolumeManager(); await managed.init();
+      const managedRecords = structuredClone(managed.store.forWorker(userId, id));
+      if (managed.isRecoveryBlocked(id) || managed.recreations.get(userId, id) ||
+          managed.store.forWorker(userId, id).some(volume => volume.incusLive || volume.liveContainerId || volume.state === 'preparing' || volume.state === 'failed'))
+        throw new Error('Original workspace restore requires settled managed storage authority');
+      await validate();
+      await this.incusRuntime.replaceOriginalWorkspace(worker, current.incarnation!, archivePath, validate, signal);
     });
   }
 
@@ -4306,6 +4343,7 @@ for p in sys.argv[1:]:
   /** Replace disposable Incus compute. All desired inputs and canonical data
    * are checked before removing a running original; no Docker helper is used. */
   private async recreateIncusWorker(snapshot: ContainerInfo, original?: ContainerInfo, applied = false): Promise<ContainerInfo> {
+    await this.incusRuntime.assertWorkspaceReplacementSettled(snapshot);
     if (!this.workerStore) throw new Error('WorkerStore is required for Incus recreation');
     const record = this.workerStore.get(snapshot.userId, snapshot.id);
     if (!record || record.runtimeKind !== 'incus-vm' || record.deletionPending || record.incusRecreation ||
@@ -6338,6 +6376,8 @@ for p in sys.argv[1:]:
       if (snapshot.runtimeKind !== 'incus-vm' || snapshot.deletionPending || !snapshot.incusRecreation) continue;
       try {
         await withOwnerWorkerLifecycleMutation(snapshot.userId, snapshot.id, async () => {
+          await this.incusRuntime.assertWorkspaceReplacementSettled({ ...snapshot,
+            containerName: this.buildContainerName(snapshot.id) });
           const record = this.workerStore?.get(snapshot.userId, snapshot.id);
           if (!record || record.runtimeKind !== 'incus-vm' || record.deletionPending || !record.incusRecreation) return;
           await this.assertOwnerExists(record.userId);
@@ -6404,6 +6444,7 @@ for p in sys.argv[1:]:
         const repair = await withOwnerWorkerRuntimeSetup(snapshot.userId, snapshot.id, async () => {
           const target = await inspect(); if (!target) return false;
           const { record, info, instance, incarnation } = target;
+          await this.incusRuntime.assertWorkspaceReplacementSettled(info);
           if (record.desiredRuntimeStatus === 'stopped') {
             if (instance.status === 'Stopped') { info.status = 'stopped'; info.runtimeDiagnostic = undefined; }
             return instance.status === 'Running';
@@ -6435,6 +6476,7 @@ for p in sys.argv[1:]:
         await withOwnerWorkerLifecycleMutation(snapshot.userId, snapshot.id, async () => {
           const target = await inspect(); if (!target) return;
           const { record, info, instance, incarnation } = target;
+          await this.incusRuntime.assertWorkspaceReplacementSettled(info);
           await this.assertOwnerExists(info.userId);
           if (record.desiredRuntimeStatus === 'stopped') {
             await this.incusRuntime.stop(info, incarnation); info.status = 'stopped'; return;

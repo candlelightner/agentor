@@ -43,13 +43,14 @@ test.beforeAll(async () => { config.dataDir = await mkdtemp(join(tmpdir(), "agen
 test.afterAll(async () => { await rm(config.dataDir, { recursive: true, force: true }); });
 
 function options(): IncusWorkerOptions {
+  const id = '0088f7d4-c6d2-46ba-b2f4-5b30a5e8d042';
   return {
-    userId: "test-user", id: "test-worker", containerName: "agentor-worker-test-worker", dockerEnabled: false,
+    userId: "test-user", id, containerName: "agentor-worker-" + id, dockerEnabled: false,
     userEnv: zeroUserEnvVars("test-user"),
     environmentJson: { networkMode: "full", allowedDomains: [], dockerEnabled: false,
       setupScript: "", envVars: "", exposeApis: { portMappings: true, domainMappings: true, usage: true } },
     capabilitiesJson: [], instructionsJson: [],
-    workerJson: { id: "test-worker", displayName: "Incus test", repos: [], initScript: "", gitName: "", gitEmail: "" },
+    workerJson: { id, displayName: "Incus test", repos: [], initScript: "", gitName: "", gitEmail: "" },
   };
 }
 

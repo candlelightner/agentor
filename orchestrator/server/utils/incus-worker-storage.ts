@@ -1,6 +1,7 @@
 import type { Config } from "./config";
 import type { IncusClient, IncusCustomVolume, IncusDevice } from "./incus-client";
 import { validateIncusImageIdentity, sameIncusImageSource, type IncusWorkerImageIdentity } from './incus-worker-image';
+import { isDeepStrictEqual } from 'node:util';
 
 type Role = "workspace" | "agents" | "docker";
 export interface IncusStorageOwner { id: string; userId: string; containerName: string }
@@ -174,14 +175,76 @@ export class IncusWorkerStorage {
    * never permit a later recursive ownership repair over restored data. */
   async preserveOwnership(owner: IncusStorageOwner): Promise<boolean> {
     const flags: Array<string | undefined> = [];
+    let workspaceOnly = false;
     for (const role of ['workspace', 'agents'] as const) {
       const volume = await this.inspectVolume(owner, role);
       if (!volume) throw new Error(`Existing Incus ${role} volume is missing; explicit recovery is required`);
+      const single = volume.config['user.agentor.workspace-preserve-ownership'];
+      if (single !== undefined && (role !== 'workspace' || single !== 'true'))
+        throw new Error('Incus workspace ownership metadata is malformed');
+      if (role === 'workspace') workspaceOnly = single === 'true';
       flags.push(volume.config['user.agentor.preserve-ownership']);
     }
-    if (flags.every(flag => flag === undefined)) return false;
+    if (flags.every(flag => flag === undefined)) return workspaceOnly;
     if (flags.every(flag => flag === 'true')) return true;
     throw new Error('Incus canonical ownership metadata is malformed or incomplete; explicit recovery is required');
+  }
+
+  /** Original workspace-only restore changes no agents/Docker metadata. The
+   * existing tmpfs preservation mode also leaves untouched agents unchanged.
+   * Caller holds the exact accepted helper/source fence; unknown PUT results
+   * remain quarantined in that helper's existing writer receipt. */
+  async markWorkspacePreserveOwnership(owner: IncusStorageOwner, expected: IncusCustomVolume, helperName: string): Promise<IncusCustomVolume> {
+    const path = `/1.0/storage-pools/${encodeURIComponent(this.config.incusStoragePool)}/volumes/custom/${encodeURIComponent(this.name(owner, 'workspace'))}`;
+    const snapshot = await this.client.rawRequest('GET', path);
+    const envelope = JSON.parse(snapshot.body.toString('utf8'));
+    const current = envelope.metadata as IncusCustomVolume, etag = snapshot.headers.etag;
+    // Native used_by ordering is not an incarnation/authority field. Preserve
+    // the full multiset (including duplicates), and compare everything else
+    // unchanged. Exact canonical source/helper references are proved below.
+    const sameSnapshot = (actual: IncusCustomVolume, before: IncusCustomVolume) =>
+      Array.isArray(actual.used_by) && Array.isArray(before.used_by) &&
+      isDeepStrictEqual({ ...actual, used_by: [...actual.used_by].sort() }, { ...before, used_by: [...before.used_by].sort() });
+    if (snapshot.statusCode >= 400 || envelope.type !== 'sync' || !current)
+      throw new Error('Original workspace ownership native snapshot is unavailable');
+    if (!etag || typeof etag !== 'string') throw new Error('Original workspace ownership native snapshot lacks ETag');
+    if (!sameSnapshot(current, expected)) {
+      // Only fixed native field names are diagnostic; never log config values
+      // or caller-supplied/unknown field names from native metadata.
+      const fields = (['name', 'type', 'content_type', 'description', 'created_at', 'project', 'config', 'used_by'] as const)
+        .filter(key => !isDeepStrictEqual(key === 'used_by' && Array.isArray(current[key]) ? [...current[key]].sort() : current[key],
+          key === 'used_by' && Array.isArray(expected[key]) ? [...expected[key]].sort() : expected[key]));
+      throw new Error('Original workspace ownership native snapshot metadata changed: ' + (fields.join(',') || 'other-native-fields'));
+    }
+    if (current.project !== this.config.incusProject || !current.created_at || !Number.isFinite(Date.parse(current.created_at)))
+      throw new Error('Original workspace ownership native snapshot project/created_at authority is invalid');
+    if (!/^abk-[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(helperName) ||
+        !Array.isArray(current.used_by) || current.used_by.length !== 2 ||
+        !isDeepStrictEqual(current.used_by.map(value => {
+          const url = new URL(value, this.client.endpoint);
+          if (url.origin !== new URL(this.client.endpoint).origin || url.username || url.password || url.hash ||
+              url.searchParams.getAll('project').length !== 1 || url.searchParams.get('project') !== this.config.incusProject ||
+              [...url.searchParams.keys()].some(key => key !== 'project'))
+            throw new Error('Original workspace ownership reference is foreign');
+          return url.pathname;
+        }).sort(), [`/1.0/instances/${owner.containerName}`, `/1.0/instances/${helperName}`].sort()))
+      throw new Error('Original workspace ownership references are ambiguous');
+    // Identity/config validation is independent of the caller's acknowledged
+    // writer reference, which the runtime checks on every source observation.
+    this.validate({ ...current, used_by: [] }, owner, 'workspace');
+    const previous = current.config['user.agentor.workspace-preserve-ownership'];
+    if (previous !== undefined && previous !== 'true') throw new Error('Incus workspace ownership metadata is malformed');
+    if (previous === 'true') return current;
+    const config = { ...current.config, 'user.agentor.workspace-preserve-ownership': 'true' };
+    const expectedAcknowledgement = structuredClone({ ...current, config });
+    const result = await this.client.rawRequest('PUT', path, { config, description: current.description ?? '' }, { 'If-Match': etag });
+    const response = JSON.parse(result.body.toString('utf8'));
+    if (result.statusCode >= 400 || response.type !== 'sync')
+      throw new Error('Original workspace ownership update acknowledgement is unavailable; retain writer fence');
+    const acknowledged = await this.client.getCustomVolume(this.config.incusStoragePool, current.name);
+    if (!sameSnapshot(acknowledged, expectedAcknowledgement))
+      throw new Error('Original workspace ownership update changed unexpected metadata; retain writer fence');
+    return acknowledged;
   }
 
   async markPreserveOwnership(owner: IncusStorageOwner): Promise<void> {

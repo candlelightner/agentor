@@ -107,7 +107,7 @@ async function fixture(run: (fixture: any) => Promise<void>) {
         result: Promise.resolve(0), close() { calls.push(['close']); } };
     },
   };
-  const helper = new IncusOfflineArchiveHelper({ dataDir, incusStoragePool: 'pool', incusProject: 'agentor', incusWorkerImage: 'trusted-helper' } as Config, client, installation);
+  const helper = new IncusOfflineArchiveHelper({ dataDir, containerPrefix: 'fixture-worker', incusStoragePool: 'pool', incusProject: 'agentor', incusWorkerImage: 'trusted-helper' } as Config, client, installation);
   const invoke = (selected: any = sources) => helper.withGuest(owner, selected, async (name?: string) => {
     calls.push(['source', name]); if (control.source) await control.source(name);
   }, controller.signal, async (name: string, assertHelper: () => Promise<void>) => {
@@ -137,6 +137,207 @@ test('offline archive helper is pinned, networkless and read-only with exact rec
       .toEqual([undefined, undefined, spec.name, spec.name, undefined]);
     expect(calls.filter((item: any) => item[0] === 'inspect').every((item: any) => item[1] !== owner.containerName)).toBe(true);
     expect(calls.find((item: any) => item[0] === 'exec')[1]).toEqual(['true']);
+  });
+});
+
+test('workspace writer derives only the canonical RW workspace with distinct purpose and settlement before cleanup', async () => {
+  await fixture(async ({ helper, invoke, owner, calls, control, receipt }) => {
+    owner.containerName = 'fixture-worker-' + owner.id;
+    let observedSettled = false;
+    control.source = async () => { if ((await receipt())?.writerSettled === true) observedSettled = true; };
+    control.capture = async (_name: string, check: () => Promise<void>) => {
+      const state = await receipt();
+      expect(state.sources).toEqual({ workspaceRestore: true }); expect(state.writerSettled).toBe(false);
+      await expect(helper.assertWorkspaceReplacementSettled(owner)).rejects.toThrow('retain the worker data fence');
+      await check(); return 'known replacement complete';
+    };
+    expect(await invoke({ workspaceRestore: true })).toBe('known replacement complete');
+    expect(observedSettled).toBe(true); expect(await receipt()).toBeUndefined();
+    await expect(helper.assertWorkspaceReplacementSettled(owner)).resolves.toBeUndefined();
+    const spec = calls.find((item: any) => item[0] === 'spec')[1];
+    expect(spec.profiles).toEqual([]); expect(spec.source).toEqual({ type: 'image', fingerprint: 'a'.repeat(64) });
+    expect(spec.devices).toEqual({ root: { type: 'disk', path: '/', pool: 'pool' },
+      workspace: { type: 'disk', source: owner.containerName + '-workspace', pool: 'pool', path: '/target', readonly: 'false' } });
+    expect(spec.config['user.agentor.helper']).toBe('workspace-replace');
+    expect(calls.some((item: any) => item[0] === 'inspect' && item[1] === owner.containerName)).toBe(false);
+  });
+});
+
+test('workspace writer cannot select another source, mount, pool, extra device or noncanonical owner', async () => {
+  for (const sources of [{ workspaceRestore: false }, { workspaceRestore: 'true' },
+    { workspaceRestore: true, workspace: 'foreign' }, { workspaceRestore: true, managed: 'foreign' },
+    { workspaceRestore: true, path: '/etc' }, { workspaceRestore: true, pool: 'foreign' },
+    { workspaceRestore: true, agents: 'foreign' }, { workspaceRestore: true, docker: 'foreign', copy: false }])
+    await fixture(async ({ invoke, owner, calls, receipt }) => {
+      owner.containerName = 'fixture-worker-' + owner.id;
+      await expect(invoke(sources)).rejects.toThrow('malformed'); expect(await receipt()).toBeUndefined();
+      expect(calls.some((item: any) => ['create', 'start', 'copy'].includes(item[0]))).toBe(false);
+    });
+  await fixture(async ({ invoke, calls, receipt }) => {
+    await expect(invoke({ workspaceRestore: true })).rejects.toThrow('malformed');
+    expect(await receipt()).toBeUndefined(); expect(calls.some((item: any) => item[0] === 'create')).toBe(false);
+  });
+});
+
+test('writer captures fixed owner and capability before asynchronous caller mutation', async () => {
+  await fixture(async ({ invoke, owner, control, calls }) => {
+    owner.containerName = 'fixture-worker-' + owner.id; const original = { ...owner };
+    const capability: any = { workspaceRestore: true };
+    control.source = async () => {
+      owner.containerName = 'foreign-worker'; owner.id = randomUUID();
+      capability.workspaceRestore = false; capability.docker = 'foreign-docker'; capability.copy = true;
+    };
+    expect(await invoke(capability)).toBe('archive');
+    const spec = calls.find((item: any) => item[0] === 'spec')[1];
+    expect(spec.devices.workspace.source).toBe(original.containerName + '-workspace');
+    expect(spec.config['user.agentor.worker']).toBe(original.id);
+    expect(calls.some((item: any) => ['copy', 'copy-spec', 'delete-copy'].includes(item[0]))).toBe(false);
+  });
+});
+
+test('workspace scanner rejects the synchronous owner claim before initial receipt rename', async () => {
+  await fixture(async ({ helper, invoke, owner, directory, calls }) => {
+    owner.containerName = 'fixture-worker-' + owner.id;
+    const original = fsPromises.rename;
+    let resume!: () => void, entered!: () => void;
+    const held = new Promise<void>(resolve => { resume = resolve; });
+    const initialFsync = new Promise<void>(resolve => { entered = resolve; });
+    let intercepted = false;
+    fsPromises.rename = (async (...args: Parameters<typeof original>) => {
+      if (!intercepted && String(args[1]).endsWith('.json')) {
+        intercepted = true; entered(); await held;
+      }
+      return original(...args);
+    }) as typeof original;
+    syncBuiltinESMExports();
+    let first: Promise<unknown> | undefined;
+    try {
+      first = invoke({ workspaceRestore: true }); await initialFsync;
+      expect((await readdir(directory)).some((name: string) => name.endsWith('.json'))).toBe(false);
+      expect((await readdir(directory)).some((name: string) => name.endsWith('.tmp'))).toBe(true);
+      await expect(helper.assertWorkspaceReplacementSettled(owner)).rejects.toThrow('actively owns this worker');
+      expect(calls.some((item: any) => item[0] === 'create')).toBe(false);
+    } finally {
+      resume(); fsPromises.rename = original; syncBuiltinESMExports(); await first;
+    }
+    await expect(helper.assertWorkspaceReplacementSettled(owner)).resolves.toBeUndefined();
+  });
+});
+
+test('workspace scanner rechecks the same owner claim acquired during receipt enumeration', async () => {
+  await fixture(async ({ helper, invoke, owner, directory, control }) => {
+    owner.containerName = 'fixture-worker-' + owner.id; await mkdir(directory, { mode: 0o700 });
+    const original = fsPromises.opendir;
+    let resume!: () => void;
+    const held = new Promise<void>(resolve => { resume = resolve; });
+    control.source = async () => { await held; };
+    let first: Promise<unknown> | undefined;
+    fsPromises.opendir = (async (...args: Parameters<typeof original>) => {
+      const dir = await original(...args);
+      if (!first) first = invoke({ workspaceRestore: true });
+      return dir;
+    }) as typeof original;
+    syncBuiltinESMExports();
+    try {
+      await expect(helper.assertWorkspaceReplacementSettled(owner)).rejects.toThrow('actively owns this worker');
+    } finally {
+      resume(); fsPromises.opendir = original; syncBuiltinESMExports(); await first;
+    }
+    await expect(helper.assertWorkspaceReplacementSettled(owner)).resolves.toBeUndefined();
+  });
+});
+
+test('workspace scanner captures owner before awaits so caller mutation cannot hide its retained receipt', async () => {
+  await fixture(async ({ helper, invoke, owner, control }) => {
+    owner.containerName = 'fixture-worker-' + owner.id; control.failure = 'unknown-start';
+    await expect(invoke({ workspaceRestore: true })).rejects.toThrow();
+    const probeOwner = { ...owner }, original = fsPromises.opendir;
+    fsPromises.opendir = (async (...args: Parameters<typeof original>) => {
+      const dir = await original(...args);
+      probeOwner.id = randomUUID(); probeOwner.containerName = 'fixture-worker-' + probeOwner.id;
+      return dir;
+    }) as typeof original;
+    syncBuiltinESMExports();
+    try {
+      await expect(helper.assertWorkspaceReplacementSettled(probeOwner)).rejects.toThrow('Unsettled workspace replacement');
+    } finally { fsPromises.opendir = original; syncBuiltinESMExports(); }
+  });
+});
+
+test('failed or cancelled writer callback removes only confirmed helper while retaining unsettled data receipt', async () => {
+  for (const cancelled of [false, true]) await fixture(async ({ helper, invoke, owner, control, controller, receipt, calls, getInstance }) => {
+    owner.containerName = 'fixture-worker-' + owner.id;
+    control.capture = async (_name: string, check: () => Promise<void>) => {
+      if (cancelled) { controller.abort(new Error('writer cancelled')); await check(); }
+      throw new Error('Lost workspace commit result');
+    };
+    await expect(invoke({ workspaceRestore: true })).rejects.toThrow('data fence retained');
+    const retained = await receipt(); expect(retained.writerSettled).toBe(false); expect(retained.pending).toBeUndefined();
+    expect(getInstance()).toBeUndefined(); expect(calls.filter((item: any) => item[0] === 'delete')).toHaveLength(1);
+    await expect(helper.assertWorkspaceReplacementSettled(owner)).rejects.toThrow('Unsettled workspace replacement');
+    const mutations = calls.filter((item: any) => ['create', 'start', 'stop', 'delete'].includes(item[0]));
+    await expect(invoke({ workspaceRestore: true })).rejects.toThrow('Unresolved');
+    expect(calls.filter((item: any) => ['create', 'start', 'stop', 'delete'].includes(item[0]))).toEqual(mutations);
+  });
+});
+
+test('unsettled writer cleanup preserves callback exception as private cause without clearing data authority', async () => {
+  await fixture(async ({ helper, invoke, owner, control, receipt, getInstance, calls }) => {
+    owner.containerName = 'fixture-worker-' + owner.id;
+    const original = new Error('Private callback diagnostic');
+    control.capture = async () => { throw original; };
+    const failure = await invoke({ workspaceRestore: true }).then(() => undefined, (error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain('data fence retained');
+    expect((failure as Error).cause).toBe(original);
+    expect((failure as Error).message).not.toContain(original.message);
+    expect((await receipt()).writerSettled).toBe(false); expect(getInstance()).toBeUndefined();
+    await expect(helper.assertWorkspaceReplacementSettled(owner)).rejects.toThrow('Unsettled workspace replacement');
+    const mutations = calls.filter((item: any) => ['create', 'start', 'stop', 'delete'].includes(item[0]));
+    await expect(invoke({ workspaceRestore: true })).rejects.toThrow('Unresolved');
+    expect(calls.filter((item: any) => ['create', 'start', 'stop', 'delete'].includes(item[0]))).toEqual(mutations);
+  });
+});
+
+test('unknown writer start or cleanup acknowledgement retains exact pending operation and data fence', async () => {
+  for (const stage of ['start', 'stop', 'delete']) await fixture(async ({ helper, invoke, owner, control, receipt }) => {
+    owner.containerName = 'fixture-worker-' + owner.id; control.failure = 'unknown-' + stage;
+    await expect(invoke({ workspaceRestore: true })).rejects.toThrow();
+    const state = await receipt(); expect(state.pending).toEqual({ kind: stage });
+    expect(state.writerSettled).toBe(stage !== 'start');
+    await expect(helper.assertWorkspaceReplacementSettled(owner)).rejects.toThrow('Unsettled workspace replacement');
+  });
+});
+
+test('definitive writer create rejection and cancellation before guest start clear only unused receipt', async () => {
+  for (const cancelled of [false, true]) await fixture(async ({ helper, invoke, owner, control, calls, receipt }) => {
+    owner.containerName = 'fixture-worker-' + owner.id;
+    if (cancelled) control.cancelledAfterCreate = true; else control.failure = 'rejected-create';
+    await expect(invoke({ workspaceRestore: true })).rejects.toThrow(); expect(await receipt()).toBeUndefined();
+    expect(calls.some((item: any) => ['start', 'capture'].includes(item[0]))).toBe(false);
+    await expect(helper.assertWorkspaceReplacementSettled(owner)).resolves.toBeUndefined();
+  });
+});
+
+test('workspace receipt scanner is read-only, source-specific and validates writer-only settlement flags', async () => {
+  for (const flag of ['missing', 'string', 'readonly']) await fixture(async ({ helper, invoke, owner, control, receipt, directory, calls }) => {
+    owner.containerName = 'fixture-worker-' + owner.id; control.failure = 'unknown-start';
+    await expect(invoke(flag === 'readonly' ? undefined : { workspaceRestore: true })).rejects.toThrow();
+    const state = await receipt(), path = join(directory, state.id + '.json');
+    if (flag === 'missing') delete state.writerSettled;
+    if (flag === 'string') state.writerSettled = 'true';
+    if (flag === 'readonly') state.writerSettled = true;
+    await writeFile(path, JSON.stringify(state), { mode: 0o600 });
+    const before = [...calls];
+    await expect(helper.assertWorkspaceReplacementSettled(owner)).rejects.toThrow('malformed');
+    expect(calls).toEqual(before); expect(JSON.parse(await readFile(path, 'utf8'))).toEqual(state);
+  });
+  await fixture(async ({ helper, invoke, owner, control, receipt, calls }) => {
+    owner.containerName = 'fixture-worker-' + owner.id; control.failure = 'unknown-start';
+    await expect(invoke()).rejects.toThrow(); const state = await receipt(), before = [...calls];
+    expect(state.writerSettled).toBeUndefined();
+    await expect(helper.assertWorkspaceReplacementSettled(owner)).resolves.toBeUndefined();
+    expect(calls).toEqual(before);
   });
 });
 
