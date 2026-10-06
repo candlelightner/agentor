@@ -42,6 +42,15 @@ async function fixture(run: (f: {
   client.getImage = async fingerprint => {
     events.push('seed'); return { fingerprint, type: 'virtual-machine', architecture: 'x86_64', size: 1024, aliases: [] };
   };
+  client.request = async <T>(method: string, path: string): Promise<T> => {
+    expect(method).toBe('GET'); expect(path).toBe('/1.0/storage-pools/images/resources');
+    events.push('capacity');
+    const space = failure === 'capacity-small' ? { total: 100 * 1024 ** 3, used: 84 * 1024 ** 3 }
+      : failure === 'capacity-invalid' ? { total: 100, used: 101 }
+      : failure === 'capacity-missing' ? undefined
+      : { total: 100 * 1024 ** 3, used: 0 };
+    return { space } as T;
+  };
   client.createInstance = async (spec: IncusInstanceCreateSpec, accepted) => {
     events.push('create'); expect(receipts.at(-1)?.pending?.kind).toBe('create');
     expect(spec.profiles).toEqual([]); expect(Object.keys(spec.devices!)).toEqual(['root', 'eth0']);
@@ -141,6 +150,15 @@ test('canonical asset intermediate directories cannot redirect packaged bytes ou
     await mkdir(outside); await rm(path, { recursive: true, force: true }); await symlink(outside, path);
     await expect(f.converter.convert(f.input)).rejects.toThrow('asset directory is not confined');
     expect(f.events).toEqual([]); expect(f.receipts).toEqual([]);
+  });
+});
+
+test('insufficient or malformed physical pool capacity fails before VM allocation, scratch creation or acknowledgements', async () => {
+  for (const mode of ['capacity-small', 'capacity-invalid', 'capacity-missing']) await fixture(async f => {
+    f.fail(mode);
+    await expect(f.converter.convert(f.input)).rejects.toThrow(/pool (has|capacity)/);
+    expect(f.events).toEqual(['seed', 'capacity']); expect(f.receipts).toEqual([]);
+    await expect(lstat(join(f.directory, 'tmp'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });
 

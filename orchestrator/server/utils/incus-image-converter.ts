@@ -37,6 +37,9 @@ const ASSETS = ['scripts/build-incus-worker-image.sh', 'worker/entrypoint.sh',
     'agentor-docker-storage.sh', 'agentor-network.sh', 'agentor-private-storage.sh', 'agentor-worker.service',
     'incus-agent-setup', 'incus-agent.service'].map(name => 'worker/vm/' + name).sort()];
 export const INCUS_CONVERSION_RAW_BYTES = 10 * 1024 ** 3 + 1024 ** 2;
+// One bounded admission observation, not a reservation or capacity ledger.
+// The isolated root can consume its full grant even when guest df has room.
+export const INCUS_CONVERTER_POOL_HEADROOM_BYTES = (32 + 4) * 1024 ** 3;
 
 /** Same canonical bytes/order used by build-incus-worker-image.sh; no guest
  * report, mutable tag, image property, or imported recipe grants authority. */
@@ -179,6 +182,14 @@ export class IncusImageConverter {
     if (!Number.isSafeInteger(required) || required <= 0) throw new Error('Converter required guest capacity is invalid');
     const seed = await this.client.getImage(request.seedFingerprint);
     if (seed.fingerprint !== request.seedFingerprint || seed.type !== 'virtual-machine') throw new Error('Trusted converter seed is unavailable');
+    const resources = await this.client.request<{ space?: { total?: number; used?: number } }>('GET',
+      '/1.0/storage-pools/' + encodeURIComponent(this.config.incusStoragePool) + '/resources');
+    const total = resources?.space?.total, used = resources?.space?.used;
+    if (!Number.isSafeInteger(total) || !Number.isSafeInteger(used) || total! <= 0 || used! < 0 || used! > total!)
+      throw new Error('Incus converter pool capacity is unavailable or invalid; host readiness must be checked');
+    const available = total! - used!;
+    if (available < INCUS_CONVERTER_POOL_HEADROOM_BYTES)
+      throw new Error(`Incus converter pool has ${available} bytes free; at least ${INCUS_CONVERTER_POOL_HEADROOM_BYTES} bytes are required before allocation. Add disposable scratch capacity or remove verified redundant artifacts.`);
     await active();
     let receipt: IncusImageConverterReceipt = { version: 1, name: 'aic-' + request.jobId,
       installationId: request.installationId, ownerId: request.ownerId, sourceImageId: request.sourceImageId,
