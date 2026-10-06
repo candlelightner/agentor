@@ -165,7 +165,7 @@ test('native workspace capture rechecks Docker presence before and after bytes i
   }
 });
 
-test('native control-plane-only instance backup retains authenticated v2 metadata and rejects legacy-only restore', async () => {
+test('native control-plane-only instance backup retains authenticated v2 metadata and requires canonical restore selection', async () => {
   const root = await mkdtemp(join(tmpdir(), 'instance-native-control-plane-'));
   const provider = new FakeBackupProvider(join(root, 'provider')), material = Buffer.alloc(32, 45).toString('base64');
   const manager = new InstanceBackupManager({ dataDir: root, authSnapshot: path => writeFile(path, 'snapshot'),
@@ -180,6 +180,6 @@ test('native control-plane-only instance backup retains authenticated v2 metadat
     const artifact = (await manager.list('admin')).artifacts[0]!;
     expect(artifact.formatVersion).toBe(2); expect(artifact.manifest?.formatVersion).toBe(2);
     await expect(manager.restorePreflight('admin', artifact.id, { restoreDockerVolumes: false }))
-      .rejects.toMatchObject({ code: 'INSTANCE_RESTORE_NATIVE_UNAVAILABLE', statusCode: 409 });
+      .rejects.toMatchObject({ code: 'INSTANCE_RESTORE_NATIVE_DATA_REQUIRED', statusCode: 409 });
   } finally { await rm(root, { recursive: true, force: true }); }
 });

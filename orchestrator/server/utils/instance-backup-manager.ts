@@ -59,6 +59,8 @@ import {
 import { withOperationDeadline } from "./operation-deadline";
 import { withOwnerWorkerLifecycleMutation } from './worker-lifecycle-coordinator';
 import { managedVolumeRuntimeKind, assertIncusLiveResolved } from './managed-volume-store';
+import { IncusError } from './incus-client';
+import { incusWorkerVolumeName } from './incus-worker-storage';
 
 const MAX_CONCURRENT_JOBS = 1;
 const MAX_LOG_LINES = 1000;
@@ -67,12 +69,12 @@ const INSTANCE_DOCKER_READ_TIMEOUT_MS = 8_000;
 const INSTANCE_DOCKER_MUTATION_TIMEOUT_MS = 30_000;
 const INSTANCE_RESTORE_HELPER_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
-/** Until the controlled native inverse ships, reject even control-plane-only
- * v2 restore before querying or mutating any Docker destination volumes. */
-function assertSupportedInstanceRestore(manifest: InstanceBackupManifest) {
-  if (manifest.formatVersion !== 1 || manifest.volumes.some(volume => volume.runtime !== undefined))
-    throw Object.assign(new Error('Native whole-instance restore is not yet available. Retain this verified backup; do not use a legacy Docker restore helper.'),
-      { statusCode: 409, code: 'INSTANCE_RESTORE_NATIVE_UNAVAILABLE' });
+function assertSupportedInstanceRestore(manifest: InstanceBackupManifest, options: InstanceRestoreOptions) {
+  if (manifest.formatVersion === 2 && !options.restoreDockerVolumes)
+    throw Object.assign(new Error('Native instance restore requires canonical persistent filesystem data. Enable persistent volume restoration; disposable VM roots cannot substitute for it.'),
+      { statusCode: 409, code: 'INSTANCE_RESTORE_NATIVE_DATA_REQUIRED' });
+  if (![1, 2].includes(manifest.formatVersion) || manifest.formatVersion === 1 && manifest.volumes.some(volume => volume.runtime))
+    throw new Error('Unsupported instance restore format');
 }
 
 interface QueuedOperation {
@@ -410,8 +412,8 @@ export class InstanceBackupManager {
       throw Object.assign(new Error("Verified instance backup artifact not found"), {
         statusCode: 404,
       });
-    assertSupportedInstanceRestore(artifact.manifest);
     const restoreOptions = normalizeRestoreOptions(options, false);
+    assertSupportedInstanceRestore(artifact.manifest, restoreOptions);
     const services = await import("./services");
     const adminStore = await import("./admin-workspace-store");
     const storage = services.useStorageManager();
@@ -448,8 +450,63 @@ export class InstanceBackupManager {
         `Worker container prefix differs: expected ${manifest.storage.containerPrefix}. Preserve CONTAINER_PREFIX before restore so named volumes remain addressable.`,
       );
     const volumeConflicts: string[] = [];
+    if (manifest.formatVersion === 2) {
+      const config = useConfig(), client = services.useIncusClient();
+      try {
+        if (!config.incusEnabled || !config.incusEndpoint.startsWith('https://') ||
+            !config.incusClientCertPath || !config.incusClientKeyPath || !config.incusServerCertPath ||
+            !config.incusProject || config.incusProject === 'default' || !config.incusStoragePool || !config.incusNetwork)
+          throw new Error('Native restore requires enabled restricted HTTPS/mTLS Incus configuration');
+        const readiness = await client.getReadiness();
+        if (!readiness.ready || readiness.auth !== 'trusted' || readiness.project !== config.incusProject)
+          throw new Error('Native restore destination is not ready in the configured Incus project');
+        const project = await client.request<{ name: string; config: Record<string, string> }>('GET',
+          '/1.0/projects/' + encodeURIComponent(config.incusProject));
+        if (project.name !== config.incusProject || project.config.restricted !== 'true' ||
+            project.config['features.storage.volumes'] !== 'true' || project.config['restricted.devices.nic'] !== 'managed' ||
+            !(project.config['restricted.networks.access'] ?? '').split(',').map(value => value.trim()).includes(config.incusNetwork))
+          throw new Error('Native restore requires the configured restricted project, managed NICs, worker network and private storage');
+        await client.request('GET', '/1.0/storage-pools/' + encodeURIComponent(config.incusStoragePool));
+        const network = await client.getNetwork(config.incusNetwork);
+        if (!network.managed || network.type !== 'bridge' || network.name !== config.incusNetwork)
+          throw new Error('The configured native worker network is unavailable');
+
+        // Descriptive bundle IDs determine names, never project/pool/device
+        // authority. Probe hidden core roles too: omitted agent/Docker data
+        // must not overwrite destination state created outside this manifest.
+        const native = manifest.volumes.filter(volume => volume.runtime);
+        const workers = new Map<string, string>(), names = new Set(native.map(volume => volume.name));
+        for (const volume of native) {
+          if (!volume.workerId || !volume.ownerId) throw new Error('Native restore storage identity is incomplete');
+          const owner = workers.get(volume.workerId);
+          if (owner && owner !== volume.ownerId) throw new Error('Native restore worker ownership is ambiguous');
+          workers.set(volume.workerId, volume.ownerId);
+        }
+        const absent = async (load: () => Promise<unknown>, name: string, volume: boolean) => {
+          try {
+            await load();
+            if (volume) volumeConflicts.push(name);
+            else blockers.push(`Destination Incus instance ${name} already exists; safe restore will not replace it.`);
+          } catch (error) {
+            if (!(error instanceof IncusError) || error.statusCode !== 404) throw error;
+          }
+        };
+        for (const [id, userId] of workers) {
+          const containerName = config.containerPrefix + '-' + id;
+          for (const role of ['workspace', 'agents', 'docker'] as const)
+            names.add(incusWorkerVolumeName({ id, userId, containerName }, config.containerPrefix, role));
+          await absent(() => client.getInstance(containerName), containerName, false);
+        }
+        for (const name of names) await absent(() => client.getCustomVolume(config.incusStoragePool, name), name, true);
+      } catch {
+        // Never reinterpret inaccessible native resources as absent or fall
+        // through to Docker. Staged helper freshness remains definitive.
+        blockers.push('Incus restore readiness or destination absence could not be verified. Check the configured restricted project, mTLS credentials, network and storage pool before retrying.');
+      }
+    }
+    const legacyVolumes = manifest.volumes.filter(volume => !volume.runtime);
     if (restoreOptions.restoreDockerVolumes) {
-      const existingVolumes = new Set(
+      const existingVolumes = legacyVolumes.length ? new Set(
         ((
           await withOperationDeadline(
             (operationSignal) => this.docker.listVolumes({
@@ -461,13 +518,13 @@ export class InstanceBackupManager {
         ).Volumes ?? [])
           .map((volume) => volume.Name)
           .filter((name): name is string => Boolean(name)),
-      );
-      for (const volume of manifest.volumes)
+      ) : new Set<string>();
+      for (const volume of legacyVolumes)
         if (existingVolumes.has(volume.name)) volumeConflicts.push(volume.name);
     }
     if (volumeConflicts.length)
       blockers.push(
-        "One or more destination Docker volumes already exist. Agentor will not overwrite them during a safe instance restore.",
+        "One or more destination persistent volumes already exist. Agentor will not overwrite them during a safe instance restore.",
       );
     if (!restoreOptions.restoreHostMountPolicies && manifest.hostMounts.configuredPaths.length)
       warnings.push(
@@ -1168,7 +1225,7 @@ export class InstanceBackupManager {
         inspected.manifest.formatVersion !== header.metadata.formatVersion || inspected.manifest.createdAt !== header.metadata.createdAt
       )
         throw new Error("Retained instance artifact identity does not match its manifest");
-      assertSupportedInstanceRestore(inspected.manifest);
+      assertSupportedInstanceRestore(inspected.manifest, options);
       const preflight = await this.restorePreflight(job.userId, artifact.id, options);
       if (!preflight.ready)
         throw Object.assign(new Error(preflight.blockers.join(" ")), {

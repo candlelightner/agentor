@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { execFile } from 'node:child_process';
 import { promisify, isDeepStrictEqual } from 'node:util';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, writeFile, copyFile, cp, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -23,8 +23,10 @@ import type { WorkerBackupRuntimeSource } from '../../orchestrator/server/utils/
 import { IncusManagedVolumeRuntime } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import { createInstanceDataArchive, instanceVolumeArchiveName, instanceBundleFilename,
-  sha256File, validateInstanceManifest } from '../../orchestrator/server/utils/instance-backup-bundle';
-import type { InstanceBackupJob, InstanceBackupManifest } from '../../orchestrator/server/utils/instance-backup-types';
+  packInstanceBundle, sha256File, validateInstanceManifest } from '../../orchestrator/server/utils/instance-backup-bundle';
+import { encryptInstanceBackup, inspectInstanceBackup } from '../../orchestrator/server/utils/instance-backup-crypto';
+import { backupKeyFingerprint, validateRecoveryKit } from '../../orchestrator/server/utils/backup-keyring';
+import type { InstanceBackupJob, InstanceBackupManifest, InstanceRestorePreflight } from '../../orchestrator/server/utils/instance-backup-types';
 
 const run = promisify(execFile);
 const ssh = ['-p', '22375', '-i', '/workspace/agentor-kata-vm-access.ZgLVo9uk/id_ed25519',
@@ -39,23 +41,26 @@ const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
 /** Explicit approved guest only. Real constrained helper process, Docker stop/
  * restart, compiled native adapter and Incus data inverse. The target is an
  * isolated fixture, never the preserved acceptance installation. The app
- * variant runs the current production build; public REST restore remains a
- * separate required gate while its production guard is retained. */
-for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained', 'app-ordinary', 'app-rollback'] as const) test(mode === 'ordinary'
+ * variants run the current production build. Only app-rest-ordinary enters
+ * through public kit import/upload/preflight/restore dispatch; other variants
+ * explicitly exercise the controlled helper without claiming REST admission. */
+for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained', 'app-ordinary', 'app-rollback', 'app-rest-ordinary'] as const) test(mode === 'ordinary'
   ? 'real controlled helper process restores ordinary worker Docker data with stopped intent and exact account shares'
   : mode === 'omitted' ? 'real controlled helper process restores omitted agent state with writable private account parents'
   : mode === 'rollback' ? 'real controlled helper process rolls back acknowledged native data before restoring original control plane'
   : mode === 'app-retained' ? 'real running Orchestrator reloads authenticated native restore completion and retained data'
   : mode === 'app-ordinary' ? 'real running Orchestrator starts restored ordinary VM through authenticated REST with native Docker and worker identity'
   : mode === 'app-rollback' ? 'real running Orchestrator authenticates original control plane after witnessed native rollback'
+  : mode === 'app-rest-ordinary' ? 'real public instance restore imports an encrypted native bundle and restores ordinary VM Docker data through authenticated REST'
   : 'real controlled helper process restores retained native data and restarts only its exact recovery target', async () => {
-  const app = mode.startsWith('app-'), ordinary = mode === 'app-ordinary' || mode !== 'retained' && !app,
+  const rest = mode === 'app-rest-ordinary', app = mode.startsWith('app-'), ordinary = rest || mode === 'app-ordinary' || mode !== 'retained' && !app,
     rollback = mode === 'rollback' || mode === 'app-rollback';
   test.skip(process.env.INCUS_INSTANCE_HELPER_PROCESS_TEST !== 'true', 'Explicit serial approved disposable helper-process gate');
   test.setTimeout(900_000);
   const local = await mkdtemp(join(tmpdir(), 'agentor-native-helper-process-'));
   const source = join(local, 'source'), targetData = join(local, 'data'), build = join(local, 'image');
   const id = randomUUID(), volumeId = randomUUID(), jobId = randomUUID();
+  let restoreJobId: string = jobId;
   let userId = (ordinary ? 'ordinary-' : 'retained-') + randomUUID();
   const appPort = 39000 + Number.parseInt(jobId.slice(0, 4), 16) % 1000;
   const remote = '/var/tmp/agentor-native-helper-process.' + jobId;
@@ -155,11 +160,17 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
   // Requests execute on loopback INSIDE only the exact fixture container.
   // Sign-in cookies never leave that process or appear in tool/test output.
   const appRequest = async <T,>(path: string, body?: unknown, authenticated = true,
-    timeoutMs = 30_000): Promise<{ status: number; body: T }> => {
+    timeoutMs = 30_000, privateFile?: { path: string; format: 'json' | 'binary' }): Promise<{ status: number; body: T }> => {
+    if (privateFile && body !== undefined) throw new Error('Fixture request cannot mix a private file and an inline body');
     const script = `const base='http://127.0.0.1:3000';const headers={Origin:base,'Content-Type':'application/json'};` +
       (authenticated ? `const signed=await fetch(base+'/api/auth/sign-in/email',{method:'POST',headers,body:${JSON.stringify(JSON.stringify(admin))}});` +
         `if(!signed.ok)throw new Error('Fixture sign-in failed '+signed.status);headers.Cookie=signed.headers.getSetCookie().map(v=>v.split(';')[0]).join('; ');` : '') +
-      `const r=await fetch(base+${JSON.stringify(path)},{headers,redirect:'manual'${body === undefined ? '' : ",method:'POST',body:" + JSON.stringify(JSON.stringify(body))}});` +
+      (privateFile ? `const fs=await import('node:fs');const p=${JSON.stringify(privateFile.path)};const s=fs.lstatSync(p);` +
+        `if(!s.isFile()||s.isSymbolicLink())throw Error('Fixture input is not a private regular file');` +
+        (privateFile.format === 'binary' ? `headers['Content-Type']='application/octet-stream';headers['Content-Length']=String(s.size);` : '') : '') +
+      `const r=await fetch(base+${JSON.stringify(path)},{headers,redirect:'manual'` +
+      (privateFile ? `,method:'POST',body:${privateFile.format === 'binary' ? "fs.createReadStream(p),duplex:'half'" : "fs.readFileSync(p,'utf8')"}`
+        : body === undefined ? '' : ",method:'POST',body:" + JSON.stringify(JSON.stringify(body))) + `});` +
       `console.log(JSON.stringify({status:r.status,body:r.headers.get('content-type')?.includes('application/json')?await r.json():await r.text()}));`;
     try {
       return JSON.parse(await root(`sudo docker exec ${targetId} node --input-type=module -e ${quote(script)}`, timeoutMs));
@@ -350,7 +361,81 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
         size: (await stat(archive)).size, sha256: await sha256File(archive) });
       manifest = validateInstanceManifest(manifest);
     }
-    const remoteStage = remoteData + '/instance-restore-staging/restore-' + jobId;
+    let remoteStage = remoteData + '/instance-restore-staging/restore-' + restoreJobId;
+    const readRestoreJob = async (): Promise<InstanceBackupJob | undefined> => JSON.parse(await root(
+      `sudo python3 -c ${quote('import json,sys; print(json.dumps(next((j for j in json.load(open(sys.argv[1]))["jobs"] if j["id"]==sys.argv[2]), None)))')} ` +
+      `${quote(remoteData + '/admin/instance-backups.v1.json')} ${quote(restoreJobId)}`)) ?? undefined;
+    if (rest) {
+      // Enter through actual authenticated transport. Source inputs use the
+      // accepted codecs, never an installed synthetic job/staged helper plan.
+      const material = randomBytes(32).toString('base64');
+      const kit = validateRecoveryKit({ kind: 'agentor-backup-recovery-kit', version: 1, encryptionFormat: 2,
+        keyMaterial: material, fingerprint: backupKeyFingerprint(material), createdAt: stamp });
+      const bundle = join(local, 'public-instance.tar'), encrypted = join(local, 'public-instance.backup'), kitPath = join(local, 'public-kit.json');
+      await packInstanceBundle(manifest, join(unpacked, 'data.tar.gz'),
+        manifest.volumes.map(v => ({ manifest: v, path: join(unpacked, instanceBundleFilename(v.archive)) })), bundle);
+      await encryptInstanceBackup(bundle, encrypted, material, { backupId: manifest.backupId,
+        sourceInstallationId: manifest.sourceInstallationId, createdAt: manifest.createdAt, formatVersion: manifest.formatVersion });
+      const header = await inspectInstanceBackup(encrypted);
+      expect(header.keyFingerprint).toBe(kit.fingerprint); expect(header.metadata.formatVersion).toBe(2);
+      await writeFile(kitPath, JSON.stringify({ kit }), { mode: 0o600 });
+      const incoming = remote + '/rest-incoming', transfer = remoteData + '/fixture-rest-input';
+      await root(`test ! -e ${quote(incoming)} && mkdir -m 700 ${quote(incoming)} && sudo test ! -e ${quote(transfer)}`);
+      await run('scp', [...scp, encrypted, kitPath, 'kata-test@172.19.0.1:' + incoming + '/'], { timeout: 60_000 });
+      await root(`sudo install -d -m 700 ${quote(transfer)} && ` +
+        `sudo install -m 600 ${quote(incoming + '/public-instance.backup')} ${quote(transfer + '/instance.backup')} && ` +
+        `sudo install -m 600 ${quote(incoming + '/public-kit.json')} ${quote(transfer + '/kit.json')}`);
+      // Key bytes and auth cookies remain inside the exact App child process.
+      const importedKit = await appRequest<{ imported: boolean; fingerprint: string }>('/api/backups/recovery-key/import',
+        undefined, true, 30_000, { path: transfer + '/kit.json', format: 'json' });
+      expect(importedKit.status).toBe(200); expect(importedKit.body).toMatchObject({ imported: true, fingerprint: kit.fingerprint });
+      const accepted = await appRequest<{ accepted: boolean; jobId: string }>('/api/admin/instance-backups/import?requestId=' + jobId + '-upload',
+        undefined, true, 180_000, { path: transfer + '/instance.backup', format: 'binary' });
+      expect(accepted.status).toBe(202); expect(accepted.body.accepted).toBe(true);
+      expect(accepted.body.jobId).toMatch(/^[a-f0-9-]{36}$/);
+      await expect.poll(async () => {
+        const verified = await appRequest<InstanceBackupJob>('/api/admin/instance-backups/jobs/' + accepted.body.jobId);
+        expect(verified.status).toBe(200); expect(verified.body).not.toHaveProperty('restoreHelper');
+        if (verified.body.status === 'failed') throw new Error('Public fixture import verification failed: ' + (verified.body.errorCode ?? 'unknown'));
+        return verified.body.status;
+      }, { timeout: 180_000, intervals: [500, 1000] }).toBe('succeeded');
+      if (ordinary) { await policy(true); policyAdded = true; }
+      const preflight = await appRequest<InstanceRestorePreflight>('/api/admin/instance-backups/artifacts/' + jobId +
+        '/preflight?restoreDockerVolumes=true&restoreHostMountPolicies=false');
+      expect(preflight.status).toBe(200); expect(preflight.body).toMatchObject({ ready: true, blockers: [], volumeConflicts: [],
+        sourceInstallationId: installation, destinationContainerPrefix: config.containerPrefix });
+      const restoring = await appRequest<{ accepted: boolean; jobId: string }>('/api/admin/instance-backups/artifacts/' + jobId + '/restore',
+        { options: { restoreDockerVolumes: true, restoreHostMountPolicies: false,
+          confirmReplaceControlPlane: true, confirmExternalDependencies: true }, requestId: jobId + '-restore' });
+      expect(restoring.status).toBe(202); expect(restoring.body.accepted).toBe(true);
+      restoreJobId = restoring.body.jobId; expect(restoreJobId).toMatch(/^[a-f0-9-]{36}$/); expect(restoreJobId).not.toBe(jobId);
+      remoteStage = remoteData + '/instance-restore-staging/restore-' + restoreJobId;
+      // Poll the private ledger, not public status (which may settle the
+      // helper). Never infer its identity from a name or disappearance.
+      let receipt: InstanceBackupJob['restoreHelper'];
+      await expect.poll(async () => {
+        try { receipt = (await readRestoreJob())?.restoreHelper; } catch { receipt = undefined; }
+        return Boolean(receipt);
+      }, { timeout: 180_000, intervals: [250, 500] }).toBe(true);
+      if (!receipt) throw new Error('Public restore helper acknowledgement was not observed');
+      helperId = receipt.containerId;
+      expect(helperId).toMatch(/^[a-f0-9]{64}$/); expect(receipt.imageId).toBe(imageId);
+      const info = JSON.parse(await root(`sudo docker inspect ${helperId} --format '{{json .}}'`)) as {
+        Id: string; Image: string; Config: { Labels: Record<string, string>; Env: string[] };
+        Mounts: Array<{ Type: string; Source: string; Destination: string; RW: boolean }>;
+      };
+      expect(info.Id).toBe(helperId); expect(info.Image).toBe(imageId);
+      expect(info.Config.Labels).toMatchObject({ 'agentor.instance-restore-helper': 'true', 'agentor.instance-restore-job': restoreJobId });
+      for (const required of [`AGENTOR_INSTANCE_RESTORE_JOB=${restoreJobId}`, `AGENTOR_INSTANCE_RESTORE_STAGE=${remoteStage}`,
+        `AGENTOR_INSTANCE_RESTORE_DATA_DIR=${remoteData}`, `AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR=${targetId}`])
+        expect(info.Config.Env.includes(required), 'Exact acknowledged helper environment matches operator authority').toBe(true);
+      expect(info.Mounts.some(m => m.Source.startsWith('/var/lib/incus') || m.Destination.startsWith('/var/lib/incus'))).toBe(false);
+      for (const path of ['/tls/client.crt', '/tls/client.key', '/tls/server.crt'])
+        expect(info.Mounts.some(m => m.Destination === path && m.Type === 'bind' && !m.RW)).toBe(true);
+      await expect.poll(() => root(`sudo docker inspect ${helperId} --format '{{.State.StartedAt}}'`),
+        { timeout: 30_000 }).not.toMatch(/^0001-/);
+      console.info('Public restore exact acknowledged fixture', { remote, id, jobId, restoreJobId, helperId, targetId });
+    } else {
     await writeFile(join(stage, 'restore-plan.json'), JSON.stringify({ version: 1, formatVersion: 2, jobId,
       dataArchive: remoteStage + '/unpacked/data.tar.gz', sourceInstallationId: installation,
       restoredOwnerId: restoredOwner, stagingOwnerId: stagingOwner, restoreHostMountPolicies: false, manifest,
@@ -401,10 +486,18 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
       'kata-test@172.19.0.1:' + acknowledgement], { timeout: 30_000 });
     await root(`sudo install -m 600 ${quote(acknowledgement)} ${quote(remoteData + '/admin/instance-backups.v1.json')}`);
     await root(`sudo docker start ${helperId}`);
+    }
+    if (!helperId) throw new Error('Exact helper acknowledgement is missing before terminal observation');
     const code = await root(`sudo docker wait ${helperId}`, 600_000);
-    const logs = await root(`sudo docker logs ${helperId}`);
+    // Parent startup may remove a settled helper between wait and logs. Only
+    // this acknowledged exact-ID terminal result permits optional diagnostics.
+    const logs = await root(`sudo docker logs ${helperId}`).catch(error => {
+      if (code === (rollback ? '1' : '0')) return 'Exact helper terminal result acknowledged; optional logs already removed';
+      throw error;
+    });
     expect(code, logs).toBe(rollback ? '1' : '0');
-    const ledger = JSON.parse(await root(`sudo python3 -c ${quote('import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["jobs"][0]))')} ${quote(remoteData + '/admin/instance-backups.v1.json')}`)) as InstanceBackupJob;
+    const ledger = await readRestoreJob();
+    if (!ledger) throw new Error('Exact restored job ledger is missing after helper completion');
     if (rollback) {
       // A prior native failure could otherwise satisfy rollback's final
       // absence assertions. This bounded exact-job daemon witness proves the
@@ -420,7 +513,7 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
       expect(witnesses[0]!.Actor.ID).toMatch(/^[a-f0-9]{64}$/);
       expect(witnesses[0]!.Actor.Attributes).toMatchObject({ name: witnessName, image,
         'agentor.instance-restore-volume-helper': 'true', 'agentor.instance-restore-job': jobId });
-      expect(ledger).toMatchObject({ id: jobId, userId: stagingOwner, status: 'failed', phase: 'failed', retryable: true });
+      expect(ledger).toMatchObject({ id: restoreJobId, userId: stagingOwner, status: 'failed', phase: 'failed', retryable: true });
       expect(ledger.errorCode).not.toBe('INSTANCE_RESTORE_ROLLBACK_INCOMPLETE');
       expect(await root(`sudo docker inspect ${targetId} --format '{{.State.Running}}'`)).toBe('true');
       if (app) {
@@ -432,10 +525,10 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
         await expect.poll(async () => {
           try { return (await appRequest('/api/health', undefined, false)).status; } catch { return 0; }
         }, { timeout: 60_000 }).toBe(200);
-        const failed = await appRequest<InstanceBackupJob>('/api/admin/instance-backups/jobs/' + jobId);
-        expect(failed.status).toBe(200); expect(failed.body).toMatchObject({ id: jobId, userId: stagingOwner, status: 'failed', phase: 'failed' });
+        const failed = await appRequest<InstanceBackupJob>('/api/admin/instance-backups/jobs/' + restoreJobId);
+        expect(failed.status).toBe(200); expect(failed.body).toMatchObject({ id: restoreJobId, userId: stagingOwner, status: 'failed', phase: 'failed' });
         expect(failed.body).not.toHaveProperty('restoreHelper');
-        const settled = JSON.parse(await root(`sudo python3 -c ${quote('import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["jobs"][0]))')} ${quote(remoteData + '/admin/instance-backups.v1.json')}`)) as InstanceBackupJob;
+        const settled = await readRestoreJob(); expect(settled).toBeDefined();
         expect(settled).not.toHaveProperty('restoreHelper');
         await root(`sudo test ! -e ${quote(remoteStage)}`);
         expect(await root(`sudo docker ps -aq --no-trunc --filter id=${helperId}`)).toBe('');
@@ -444,7 +537,7 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
         const oldDb = await root(`sudo python3 -c ${quote('import sys; print(open(sys.argv[1],"rb").read().hex())')} ${quote(remoteData + '/auth.db')}`);
         expect(oldDb).toBe(Buffer.concat([Buffer.from('SQLite format 3\0'), Buffer.from('old-target')]).toString('hex'));
       }
-      await root(`test ! -e ${quote(remoteData + '/users' + (app ? '/' + userId : ''))} && test ! -e ${quote(remoteData + '/instance-restore-rollback/' + jobId)}`);
+      await root(`test ! -e ${quote(remoteData + '/users' + (app ? '/' + userId : ''))} && test ! -e ${quote(remoteData + '/instance-restore-rollback/' + restoreJobId)}`);
       await expect(runtime.client.getInstance(config.containerPrefix + '-' + id)).rejects.toMatchObject({ statusCode: 404 });
       for (const name of [...['workspace', 'agents', 'docker'].map(role => config.containerPrefix + '-' + id + '-' + role), volume.dockerName])
         await expect(runtime.client.getCustomVolume(config.incusStoragePool, name)).rejects.toMatchObject({ statusCode: 404 });
@@ -455,13 +548,13 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
       console.info('Real legacy Docker start failure after acknowledged native apply: native cleanup settled BEFORE original control plane restored; only exact recovery target restarted');
       return;
     }
-    expect(ledger).toMatchObject({ id: jobId, userId: restoredOwner, status: 'succeeded', phase: 'complete' });
+    expect(ledger).toMatchObject({ id: restoreJobId, userId: restoredOwner, status: 'succeeded', phase: 'complete' });
     expect(await root(`sudo docker inspect ${targetId} --format '{{.State.Running}}'`)).toBe('true');
     const record = JSON.parse(await root(`sudo python3 -c ${quote('import json,sys; print(json.dumps(json.load(open(sys.argv[1]))[0]))')} ` +
         quote(remoteData + (ordinary ? '/users/' : '/retained-storage/users/') + userId + '/managed-volumes.v1.json'))) as StoredManagedVolume;
     expect(record).toMatchObject({ id: volumeId, workerId: id, userId, seeded: true, attached: ordinary, state: ordinary ? 'ready' : 'detached',
       ...(!ordinary ? { retainedAfterAccountDeletion: true } : {}) });
-    await root(`test ! -e ${quote(remoteData + '/instance-restore-rollback/' + jobId)}`);
+    await root(`test ! -e ${quote(remoteData + '/instance-restore-rollback/' + restoreJobId)}`);
     if (!ordinary) {
       await root(`test ! -e ${quote(remoteData + '/users' + (app ? '/' + userId : ''))}`);
       await expect(runtime.client.getInstance(config.containerPrefix + '-' + id)).rejects.toMatchObject({ statusCode: 404 });
@@ -524,10 +617,10 @@ xattr=base64.b64encode(os.getxattr(p+'/data','user.binary')).decode())))`)} ${qu
       await expect.poll(async () => {
         try { return (await appRequest('/api/health', undefined, false)).status; } catch { return 0; }
       }, { timeout: 60_000 }).toBe(200);
-      const visible = await appRequest<InstanceBackupJob>('/api/admin/instance-backups/jobs/' + jobId);
-      expect(visible.status).toBe(200); expect(visible.body).toMatchObject({ id: jobId, userId: restoredOwner, status: 'succeeded', phase: 'complete' });
+      const visible = await appRequest<InstanceBackupJob>('/api/admin/instance-backups/jobs/' + restoreJobId);
+      expect(visible.status).toBe(200); expect(visible.body).toMatchObject({ id: restoreJobId, userId: restoredOwner, status: 'succeeded', phase: 'complete' });
       expect(visible.body).not.toHaveProperty('restoreHelper');
-      const settled = JSON.parse(await root(`sudo python3 -c ${quote('import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["jobs"][0]))')} ${quote(remoteData + '/admin/instance-backups.v1.json')}`)) as InstanceBackupJob;
+      const settled = await readRestoreJob(); expect(settled).toBeDefined();
       expect(settled).not.toHaveProperty('restoreHelper');
       await root(`sudo test ! -e ${quote(remoteStage)}`);
       expect(await root(`sudo docker ps -aq --no-trunc --filter id=${helperId}`)).toBe('');
@@ -572,7 +665,7 @@ xattr=base64.b64encode(os.getxattr(p+'/data','user.binary')).decode())))`)} ${qu
       await root(`sudo rm -rf ${quote(remote)}`); cleaned = true;
     }
     if (cleaned || !targetId && !helperId && !startupHolderId) await rm(local, { recursive: true, force: true });
-    else console.error('Retained exact unconfirmed helper-process fixture', { local, remote, id, jobId, targetId, helperId, startupHolderId });
+    else console.error('Retained exact unconfirmed helper-process fixture', { local, remote, id, jobId, restoreJobId, targetId, helperId, startupHolderId });
     // Do not replace the primary assertion with a cleanup failure. Unknown
     // native submission deliberately keeps every exact fixture for diagnosis.
     if (completed) expect(cleaned, 'Acknowledged fixture cleanup must complete').toBe(true);

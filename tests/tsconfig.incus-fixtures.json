@@ -10,7 +10,8 @@
     "api/instance-backup-native-plan.spec.ts",
     "api/instance-native-helper-process.spec.ts",
     "api/instance-backup-helper-launch.spec.ts",
-    "api/instance-backup-ws-startup.spec.ts"
+    "api/instance-backup-ws-startup.spec.ts",
+    "api/instance-backup-native-preflight.spec.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }
