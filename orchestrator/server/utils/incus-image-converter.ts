@@ -91,6 +91,9 @@ set -euo pipefail
 test ! -e /run/agentor/provisioned; test ! -e /run/agentor/worker.env
 systemctl mask --runtime agentor-worker.service agentor-docker-storage.service
 systemctl stop agentor-worker.service docker.service docker.socket containerd.service agentor-docker-storage.service
+# Reuse the accepted VM networking primitive; never inherit Docker's embedded
+# resolver in an unprovisioned converter or create a worker-ready marker.
+/usr/lib/agentor/agentor-network.sh full '[]'
 mkdir -p /run/systemd/system/docker.service.d
 install -d -m 0700 /run/agentor-converter-tools
 printf '{"features":{"containerd-snapshotter":true},"iptables":true,"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}\n' > /run/agentor-converter-tools/docker-daemon.json

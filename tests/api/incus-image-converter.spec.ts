@@ -218,6 +218,8 @@ test('isolated guest tools/native Docker/OCI stream use fixed trust inputs and k
     expect(setup).toContain('12a749cb96cada5a00bed759c120364ed92d1f38de67b557bb85ac67abd96ed8');
     expect(setup).toContain('/run/systemd/system/docker.service.d'); expect(setup).toContain('Requires=');
     expect(setup).toContain('/run/systemd/system/docker.service.d/zz-agentor-converter.conf');
+    expect(setup).toContain("/usr/lib/agentor/agentor-network.sh full '[]'");
+    expect(setup.indexOf('/usr/lib/agentor/agentor-network.sh')).toBeLessThan(setup.indexOf('apt-get update'));
     expect(setup).toContain('"containerd-snapshotter":true'); expect(setup).toContain('io.containerd.snapshotter.v1');
     expect(setup).toContain('ExecStart=\\nExecStart=/usr/bin/dockerd --config-file=/run/agentor-converter-tools/docker-daemon.json');
     expect(setup).toContain('chmod 0600 /run/agentor-converter-tools/docker-daemon.json');
