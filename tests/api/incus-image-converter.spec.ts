@@ -47,6 +47,7 @@ async function fixture(run: (f: {
     expect(method).toBe('GET'); expect(path).toBe('/1.0/storage-pools/' + encodeURIComponent(expectedPool) + '/resources');
     events.push('capacity');
     const space = failure === 'capacity-small' ? { total: 100 * 1024 ** 3, used: 84 * 1024 ** 3 }
+      : failure === 'capacity-64-root' ? { total: 100 * 1024 ** 3, used: 40 * 1024 ** 3 }
       : failure === 'capacity-invalid' ? { total: 100, used: 101 }
       : failure === 'capacity-missing' ? undefined
       : { total: 100 * 1024 ** 3, used: 0 };
@@ -55,7 +56,7 @@ async function fixture(run: (f: {
   client.createInstance = async (spec: IncusInstanceCreateSpec, accepted) => {
     events.push('create'); expect(receipts.at(-1)?.pending?.kind).toBe('create');
     expect(spec.profiles).toEqual([]); expect(Object.keys(spec.devices!)).toEqual(['root', 'eth0']);
-    expect(spec.devices!.root).toEqual({ type: 'disk', path: '/', pool: expectedPool, size: '32GiB' });
+    expect(spec.devices!.root).toEqual({ type: 'disk', path: '/', pool: expectedPool, size: '64GiB' });
     expect(spec.devices!.eth0).toMatchObject({ 'security.mac_filtering': 'true', 'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' });
     expect(spec.config!['user.agentor.helper']).toBe('image-converter');
     expect(spec.config!['user.agentor.id']).toBeUndefined(); expect(spec.config!['user.agentor.worker']).toBeUndefined();
@@ -165,7 +166,7 @@ test('canonical asset intermediate directories cannot redirect packaged bytes ou
 });
 
 test('insufficient or malformed physical pool capacity fails before VM allocation, scratch creation or acknowledgements', async () => {
-  for (const mode of ['capacity-small', 'capacity-invalid', 'capacity-missing']) await fixture(async f => {
+  for (const mode of ['capacity-small', 'capacity-64-root', 'capacity-invalid', 'capacity-missing']) await fixture(async f => {
     f.fail(mode);
     await expect(f.converter.convert(f.input)).rejects.toThrow(/pool (has|capacity)/);
     expect(f.events).toEqual(['seed', 'capacity']); expect(f.receipts).toEqual([]);
@@ -229,7 +230,7 @@ test('isolated guest tools/native Docker/OCI stream use fixed trust inputs and k
     expect('zz-agentor-converter.conf' > 'storage.conf').toBe(true);
     expect(setup).toContain('docker_diagnostics'); expect(setup).toContain('--lines=40');
     expect(setup).toContain('cloud-guest-utils'); expect(setup).toContain("os.stat('/').st_dev!=st.st_rdev");
-    expect(setup).toContain("sys+'/partition'"); expect(setup).toContain("len(disks)!=1"); expect(setup).toContain('32*1024**3');
+    expect(setup).toContain("sys+'/partition'"); expect(setup).toContain("len(disks)!=1"); expect(setup).toContain('64*1024**3');
     expect(setup).toContain("['growpart',before[1],str(before[2])]"); expect(setup).toContain("['resize2fs',after[0]]");
     expect(setup).toContain("p.stdout.startswith(b'NOCHANGE:')"); expect(setup).toContain('after[9]-after[7]-after[8]<=2048');
     // Checking executable availability is not formatting a device.
@@ -249,7 +250,7 @@ test('isolated guest tools/native Docker/OCI stream use fixed trust inputs and k
 test('post-load immutable identity mismatch stops before conversion/pull/build and cleans only captured converter compute', async () => {
   await fixture(async f => {
     f.fail('OCI-identity'); await expect(f.converter.convert(f.input)).rejects.toThrow('OCI-identity failed');
-    expect(f.commands.some(command => command[1] === '/root/agentor-convert/scripts/build-incus-worker-image.sh')).toBe(false);
+    expect(f.commands.some(command => command.includes('/root/agentor-convert/scripts/build-incus-worker-image.sh'))).toBe(false);
     expect(f.commands.some(command => command[0] === '/usr/bin/cat')).toBe(false);
     expect(f.receipts.at(-1)?.removed).toBe(true);
   });
@@ -258,7 +259,12 @@ test('post-load immutable identity mismatch stops before conversion/pull/build a
 test('SAME raw-only bootstrap script produces no guest QCOW/metadata authority and short opaque RAW never publishes success', async () => {
   await fixture(async f => {
     await expect(f.converter.convert(f.input)).rejects.toThrow('RAW size');
-    const conversion = f.commands.find(command => command[1] === '/root/agentor-convert/scripts/build-incus-worker-image.sh')!;
+    const conversion = f.commands.find(command => command.includes('/root/agentor-convert/scripts/build-incus-worker-image.sh'))!;
+    expect(conversion.slice(0, 2)).toEqual(['/bin/bash', '-ec']);
+    expect(conversion[2]).toContain('exit "$converter_exit"');
+    expect(conversion[2]).toContain('df -B1 --output=source,size,avail,target /');
+    expect(conversion[2]).toContain('dmesg --level=err,warn | tail -n 20');
+    execFileSync('bash', ['-n'], { input: conversion[2] });
     expect(conversion).toContain('--raw-only'); expect(conversion).toContain('--expected-source-id'); expect(conversion).toContain('--expected-recipe-id');
     expect(conversion).not.toContain('--force'); expect(conversion).not.toContain('--alias');
     const loaded = f.commands.findIndex(command => command[0] === '/usr/bin/docker' && command[1] === 'load');

@@ -39,7 +39,7 @@ const ASSETS = ['scripts/build-incus-worker-image.sh', 'worker/entrypoint.sh',
 export const INCUS_CONVERSION_RAW_BYTES = 10 * 1024 ** 3 + 1024 ** 2;
 // One bounded admission observation, not a reservation or capacity ledger.
 // The isolated root can consume its full grant even when guest df has room.
-export const INCUS_CONVERTER_POOL_HEADROOM_BYTES = (32 + 4) * 1024 ** 3;
+export const INCUS_CONVERTER_POOL_HEADROOM_BYTES = (64 + 4) * 1024 ** 3;
 
 /** Same canonical bytes/order used by build-incus-worker-image.sh; no guest
  * report, mutable tag, image property, or imported recipe grants authority. */
@@ -114,7 +114,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qemu-u
 for tool in parted kpartx cryptsetup qemu-img sgdisk grub-install mkfs.ext4 mkfs.fat; do
  command -v "$tool" >/dev/null || { printf 'Missing fixed converter dependency: %s\n' "$tool" >&2; exit 1; }
 done
-# This guest has only its disposable 32GiB root disk. Resolve the currently
+# This guest has only its disposable 64GiB root disk. Resolve the currently
 # mounted ext4 root via kernel identity, never an unused-device candidate.
 python3 - <<'PY'
 import json,os,stat,subprocess
@@ -135,8 +135,8 @@ def proof():
  if number<1 or not stat.S_ISBLK(ps.st_mode) or ps.st_rdev!=os.makedev(major,minor): raise ValueError('Converter root parent is ambiguous')
  disks=json.loads(command(['lsblk','--json','--bytes','--nodeps','-o','NAME,TYPE,SIZE']))['blockdevices']
  disks=[d for d in disks if d['type']=='disk']
- if len(disks)!=1 or disks[0]['name']!=os.path.basename(parent) or int(disks[0]['size'])!=32*1024**3:
-  raise ValueError('Converter requires exactly its declared 32GiB root disk and no data disks')
+ if len(disks)!=1 or disks[0]['name']!=os.path.basename(parent) or int(disks[0]['size'])!=64*1024**3:
+  raise ValueError('Converter requires exactly its declared 64GiB root disk and no data disks')
  if command(['blkid','-p','-s','TYPE','-o','value',device])!='ext4': raise ValueError('Converter root signature is not ext4')
  uuid=command(['blkid','-p','-s','UUID','-o','value',device])
  with open('/proc/sys/kernel/random/boot_id') as f: boot=f.read().strip()
@@ -208,7 +208,7 @@ export class IncusImageConverter {
         'user.agentor.helper': 'image-converter', 'user.agentor.operation': request.jobId,
         'user.agentor.source-image': request.sourceImageId, 'user.agentor.seed-image': request.seedFingerprint,
         'security.secureboot': 'false', 'boot.autostart': 'false', 'limits.cpu': '2', 'limits.memory': '4GiB' },
-      devices: { root: { type: 'disk', path: '/', pool, size: '32GiB' },
+      devices: { root: { type: 'disk', path: '/', pool, size: '64GiB' },
         eth0: { type: 'nic', name: 'eth0', network: this.config.incusNetwork,
           'security.mac_filtering': 'true', 'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' } } };
     const check = async (requireActive = true) => {
@@ -316,7 +316,13 @@ diagnose_source() {
 if ! actual=$(docker image inspect --format '{{.Id}}' "$1"); then diagnose_source; exit 1; fi
 if [ "$actual" != "$1" ]; then echo 'Loaded source OCI identity does not match the authorized immutable source' >&2; diagnose_source; exit 1; fi
 `, 'agentor-converter-source', request.sourceImageId]);
-      await execute('raw-convert', ['/bin/bash', '/root/agentor-convert/scripts/build-incus-worker-image.sh',
+      await execute('raw-convert', ['/bin/bash', '-ec', String.raw`
+if /bin/bash "$@"; then exit 0; else converter_exit=$?; fi
+printf '\nConverter failure filesystem/kernel diagnostics:\n' >&2
+df -B1 --output=source,size,avail,target / >&2 || true
+dmesg --level=err,warn | tail -n 20 >&2 || true
+exit "$converter_exit"
+`, 'agentor-converter-raw', '/root/agentor-convert/scripts/build-incus-worker-image.sh',
         '--source-image', request.sourceImageId, '--expected-source-id', request.sourceImageId, '--expected-recipe-id', recipeId,
         '--size', '10G', '--raw-only', '--output-dir', '/root/agentor-convert/output']);
       await check();

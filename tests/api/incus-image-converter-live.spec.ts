@@ -62,7 +62,7 @@ test('real isolated SAME d2vm converter produces bounded RAW and parent-only nor
     });
     const resources = await client.request<{ space: { total: number; used: number } }>('GET',
       '/1.0/storage-pools/' + config.incusConverterStoragePool + '/resources');
-    expect(resources.space.total - resources.space.used, 'Converter scratch—not canonical worker pool').toBeGreaterThan(36 * 1024 ** 3);
+    expect(resources.space.total - resources.space.used, 'Converter scratch—not canonical worker pool').toBeGreaterThan(68 * 1024 ** 3);
     const directory = await mkdtemp('/workspace/agentor-isolated-image-gate.');
     config.dataDir = directory;
     const assets = join(directory, 'bootstrap');
