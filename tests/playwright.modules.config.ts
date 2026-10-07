@@ -98,6 +98,7 @@ export default defineConfig({
     "api/incus-image-artifact.spec.ts",
     "api/incus-worker-image-manager.spec.ts",
     "api/catalog-native-binding.spec.ts",
+    "api/image-catalog-hierarchy.spec.ts",
     "api/incus-exec-transport.spec.ts",
     "api/incus-worker-commands.spec.ts",
     "api/incus-worker-experience.spec.ts",

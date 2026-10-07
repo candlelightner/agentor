@@ -67,7 +67,8 @@ export async function buildInstanceRestoreNative(outputDirectory = join(sourceRo
       import assert from 'node:assert/strict';
       const adapter = await import(process.argv[1]);
       for (const name of ['IncusWorkerRuntime', 'IncusWorkerStorage', 'IncusManagedVolumeRuntime',
-        'prepareInstanceNativeVolumeArchive', 'WorkerStore', 'ManagedVolumeStore']) assert.equal(typeof adapter[name], 'function');
+        'prepareInstanceNativeVolumeArchive', 'WorkerStore', 'ManagedVolumeStore',
+        'ImageCatalogCore', 'IncusWorkerImageManager']) assert.equal(typeof adapter[name], 'function');
       for (const method of ['createCanonicalRestore', 'restoreCanonicalArchives', 'finishCanonicalRestore'])
         assert.equal(typeof adapter.IncusWorkerRuntime.prototype[method], 'function');
       assert.equal(typeof adapter.IncusWorkerStorage.prototype.freshRestoreDevices, 'function');

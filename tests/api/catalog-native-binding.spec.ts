@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { ImageCatalogManager, type ImageDefinition, type ImageBuild, type NativeImageContext,
+import { ImageCatalogManager, ImageCatalogCore, type ImageDefinition, type ImageBuild, type NativeImageContext,
   type NativeImageSource } from '../../orchestrator/server/utils/image-catalog';
 import type { IncusImageConverterReceipt } from '../../orchestrator/server/utils/incus-image-converter';
 import type { IncusWorkerImageIdentity } from '../../orchestrator/server/utils/incus-worker-image';
@@ -12,11 +12,11 @@ const digest = 'sha256:' + 'a'.repeat(64), stamp = '2026-10-06T10:00:00.000Z';
 const definitionInput = { name: 'Controlled source', description: '', baseImage: 'agentor-worker:approved-test',
   dockerfileFragment: '', contextFiles: [], provisioning: [{ type: 'command', command: 'true' }] };
 
-async function fixture() {
+async function fixture(cold = false) {
   const root = await mkdtemp(join(tmpdir(), 'catalog-native-binding-'));
   let failWrite = false, revoked = false, inspections = 0, actualImageId = digest, holdWrite: Promise<void> | undefined;
   const path = join(root, 'image-catalog.json');
-  const manager = new ImageCatalogManager(root, async state => {
+  const manager = new (cold ? ImageCatalogCore : ImageCatalogManager)(root, async state => {
     if (holdWrite) await holdWrite;
     if (failWrite) throw new Error('Controlled private catalog persistence failure');
     await writeFile(path, JSON.stringify(state), { mode: 0o600 });
@@ -54,6 +54,20 @@ async function fixture() {
     holdWrite: (value: Promise<void> | undefined) => { holdWrite = value; },
     cleanup: () => rm(root, { recursive: true, force: true }) };
 }
+
+test('cold catalog uses the same current source authority and private converter/import acknowledgements without application services', async () => {
+  const f = await fixture(true); try {
+    await expect(f.authorize('foreign-owner')).rejects.toThrow();
+    const source = await f.authorize();
+    const id = await f.manager.openNativeImageDerivation(source, f.context, f.validate);
+    await expect(f.manager.publishNativeImageBinding(id, f.identity, 'agentor-storage-ownership-v1', f.validate)).rejects.toThrow();
+    await f.imported(id);
+    const binding = await f.manager.publishNativeImageBinding(id, f.identity, 'agentor-storage-ownership-v1', f.validate);
+    expect(await f.manager.readNativeImageBinding(source, f.context, f.validate)).toEqual(binding);
+    f.revoke();
+    await expect(f.manager.readNativeImageBinding(source, f.context, f.validate)).rejects.toThrow('revoked');
+  } finally { await f.cleanup(); }
+});
 
 test('owned controlled source uses actual immutable Docker acknowledgement and public projections exclude native authority', async () => {
   const f = await fixture(); try {
@@ -107,6 +121,50 @@ test('group and system-default permission reuse existing selection and remain cu
     delete f.state.systemDefault;
     await expect(f.manager.publishNativeImageBinding(id, f.identity, 'agentor-storage-ownership-v1', f.validate)).rejects.toThrow('permission changed');
   } finally { await f.cleanup(); }
+});
+
+test('UI-expanded explicit selection authorizes only the exact effective foreign system default', async () => {
+  const f = await fixture(); try {
+    expect((await f.authorize()).scope).toBe('own');
+    f.state.systemDefault = { definitionId: f.definition.id, version: 'v1' };
+    const source = await f.authorize('system-recipient');
+    expect(source).toMatchObject({ scope: 'system-default', definitionId: f.definition.id,
+      version: 'v1', requesterId: 'system-recipient', definitionOwnerId: f.owner, sourceImageId: digest });
+    f.definition.versions.push({ ...f.definition.versions[0]!, version: 'v2' });
+    f.state.builds.push({ ...f.state.builds[0]!, id: randomUUID(), version: 'v2' });
+    const foreign = await f.manager.create('another-owner', definitionInput);
+    foreign.versions.push({ ...f.definition.versions[0]! });
+    f.state.builds.push({ ...f.state.builds[0]!, id: randomUUID(), ownerId: foreign.ownerId, definitionId: foreign.id });
+    const inspections = f.inspections();
+    for (const selection of [{ definitionId: f.definition.id, version: 'v2' },
+      { definitionId: foreign.id, version: 'v1' }])
+      await expect(f.manager.authorizeNativeImageSource('system-recipient', selection, f.validate)).rejects.toThrow();
+    expect(f.inspections()).toBe(inspections);
+  } finally { await f.cleanup(); }
+});
+
+test('revoking or changing the exact explicit system default prohibits cached reuse and publication', async () => {
+  for (const change of ['revoke', 'version', 'definition'] as const) for (const action of ['reuse', 'publish'] as const) {
+    const f = await fixture(); try {
+      f.state.systemDefault = { definitionId: f.definition.id, version: 'v1' };
+      const source = await f.authorize('system-recipient');
+      const id = await f.manager.openNativeImageDerivation(source, f.context, f.validate);
+      await f.manager.acknowledgeNativeConverter(id, { ...f.receipt(id), ownerId: source.requesterId });
+      await f.manager.acknowledgeNativeImageImport(id, { pending: true }, f.validate);
+      await f.manager.acknowledgeNativeImageImport(id, { pending: false, fingerprint: f.identity.fingerprint }, f.validate);
+      if (action === 'reuse') {
+        await f.manager.publishNativeImageBinding(id, f.identity, 'agentor-storage-ownership-v1', f.validate);
+        expect((await f.manager.readNativeImageBinding(source, f.context, f.validate))!.identity).toEqual(f.identity);
+      }
+      if (change === 'revoke') delete f.state.systemDefault;
+      if (change === 'version') f.state.systemDefault = { definitionId: f.definition.id, version: 'v2' };
+      if (change === 'definition') f.state.systemDefault = { definitionId: randomUUID(), version: 'v1' };
+      if (action === 'reuse') await expect(f.manager.readNativeImageBinding(source, f.context, f.validate)).rejects.toThrow('permission changed');
+      else await expect(f.manager.publishNativeImageBinding(id, f.identity, 'agentor-storage-ownership-v1', f.validate))
+          .rejects.toThrow('permission changed');
+      await expect(f.authorize('system-recipient')).rejects.toThrow();
+    } finally { await f.cleanup(); }
+  }
 });
 
 test('already accepted cleanup/import acknowledgements survive revocation but cannot grant publication', async () => {

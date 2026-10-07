@@ -12,6 +12,8 @@ export { StorageManager } from './server/utils/storage';
 export { loadConfig } from './server/utils/config';
 export { zeroUserEnvVars } from './server/utils/user-env-store';
 export { readBackupInstallationId } from './server/utils/backup-installation';
+export { ImageCatalogCore } from './server/utils/image-catalog-core';
+export { IncusWorkerImageManager } from './server/utils/incus-worker-image-manager';
 
 import { validateInstanceManifest } from './server/utils/instance-backup-bundle';
 import type { InstanceBackupVolumeManifest } from './server/utils/instance-backup-types';

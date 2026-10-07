@@ -21,9 +21,13 @@ test('standalone native helper adapter imports isolated locked dependencies with
     const result = JSON.parse(stdout.trim());
     expect(result.externalPackages).toEqual(['dockerode', 'h3', 'tar-stream', 'ws']);
     expect(result.dependencyFiles).toBeGreaterThan(0); expect(result.dependencyFiles).toBeLessThan(2000);
-    expect(result.bundleBytes).toBeLessThan(600_000);
+    // The shared catalog/converter leaf adds ~178KiB, not a second store or
+    // application bootstrap. Keep a bounded budget and exact graph checks.
+    expect(result.bundleBytes).toBeLessThan(800_000);
     expect(result.bundledInputs).toContain('server/utils/incus-worker-runtime.ts');
     expect(result.bundledInputs).toContain('server/utils/worker-config-store-core.ts');
+    expect(result.bundledInputs).toContain('server/utils/image-catalog-core.ts');
+    expect(result.bundledInputs).toContain('server/utils/incus-worker-image-manager.ts');
     expect(result.bundledInputs).not.toContain('server/utils/services.ts');
     expect(result.bundledInputs).not.toContain('server/utils/container.ts');
     expect(result.bundledInputs.some((path: string) => /server\/(api|plugins|routes|middleware)\//.test(path))).toBe(false);
@@ -52,6 +56,11 @@ test('standalone native helper adapter imports isolated locked dependencies with
       for(const [type,names] of Object.entries(methods)) for(const name of names)
         assert.equal(typeof adapter[type].prototype[name],'function');
       assert.equal(typeof adapter.prepareInstanceNativeVolumeArchive,'function');
+      assert.equal(typeof adapter.IncusWorkerImageManager,'function');
+      const catalog=new adapter.ImageCatalogCore(join(root,'catalog'));
+      await catalog.init();
+      await assert.rejects(catalog.authorizeNativeImageSource('fixture-owner',
+        {definitionId:'absent-definition',version:'v1'},async()=>{}));
       const data=join(root,'store'); await mkdir(join(data,'users','fixture-owner'),{recursive:true});
       await writeFile(join(data,'users','fixture-owner','workers.json'),'{invalid-json');
       const store=new adapter.WorkerStore(data);

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { Config } from './config';
 import { IncusClient, IncusError } from './incus-client';
 import { backupInstallationId } from './backup-installation';
-import { ImageCatalogManager, type NativeImageContext, type NativeImageBinding } from './image-catalog';
+import type { ImageCatalogCore, NativeImageContext, NativeImageBinding } from './image-catalog-core';
 import { IncusImageConverter, incusConversionRecipeId, readCanonicalIncusBootstrap } from './incus-image-converter';
 import { normalizeAndImportIncusImage } from './incus-image-artifact';
 import { incusImageIdentity } from './incus-worker-image';
@@ -15,7 +15,7 @@ import { incusImageIdentity } from './incus-worker-image';
 export class IncusWorkerImageManager {
   constructor(private config: Pick<Config, 'dataDir' | 'incusNetwork' | 'incusStoragePool' | 'incusConverterStoragePool'>,
     private client: IncusClient, private docker: Pick<Docker, 'getImage'>,
-    private catalog: ImageCatalogManager, private bootstrapDirectory: string,
+    private catalog: ImageCatalogCore, private bootstrapDirectory: string,
     private seedFingerprint: string) {}
 
   async ensure(requesterId: string, selection: {
