@@ -50,6 +50,8 @@ export interface Config {
   incusNetworkHostEndpoint?: string;
   incusNetworkHostServerCertPath?: string;
   incusStoragePool: string;
+  /** Optional operator-selected pool for disposable image conversion only. */
+  incusConverterStoragePool?: string;
   incusWorkerImage: string;
   incusDockerVolumeSize: string;
   incusInternalGatewayUrl: string;
@@ -173,6 +175,7 @@ export function loadConfig(): Config {
     incusNetworkHostEndpoint: process.env.INCUS_NETWORK_HOST_ENDPOINT || '',
     incusNetworkHostServerCertPath: process.env.INCUS_NETWORK_HOST_SERVER_CERT_PATH || '',
     incusStoragePool: process.env.INCUS_STORAGE_POOL || '',
+    incusConverterStoragePool: process.env.INCUS_CONVERTER_STORAGE_POOL || '',
     incusWorkerImage: process.env.INCUS_WORKER_IMAGE || 'agentor-worker',
     incusDockerVolumeSize: process.env.INCUS_DOCKER_VOLUME_SIZE || '20GiB',
     incusInternalGatewayUrl: process.env.INCUS_INTERNAL_GATEWAY_URL || '',

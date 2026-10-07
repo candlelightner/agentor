@@ -33,6 +33,7 @@ test('real isolated SAME d2vm converter produces bounded RAW and parent-only nor
   expect((await run('dd', ['--version'], { maxBuffer: 4096 })).stdout).toContain('coreutils');
   const config = { ...loadConfig(), incusEndpoint: 'https://127.0.0.1:18443', incusProject: project,
     incusNetwork: 'incusbr0', incusStoragePool: 'default',
+    incusConverterStoragePool: 'agentor-converter-gate-e983a414',
     incusClientCertPath: join(credentials, 'client.crt'), incusClientKeyPath: join(credentials, 'client.key'),
     incusServerCertPath: '/workspace/agentor-incus-tls/server.crt' };
   const client = IncusClient.fromConfig(config);
@@ -47,9 +48,21 @@ test('real isolated SAME d2vm converter produces bounded RAW and parent-only nor
       return JSON.parse(result.stdout)[0] as { Id: string; Architecture: string };
     };
     expect(await inspect()).toMatchObject({ Id: sourceImageId, Architecture: 'amd64' });
-    const disk = await run('ssh', [...ssh, 'df -B1 --output=avail /var/lib/incus'], { maxBuffer: 4096 });
-    const available = Number(disk.stdout.trim().split('\n').at(-1));
-    expect(available, 'Measured transient converter headroom; no storage guesses').toBeGreaterThan(12 * 1024 ** 3);
+    const pool = await client.request<{ name: string; driver: string; status: string }>('GET',
+      '/1.0/storage-pools/' + config.incusConverterStoragePool);
+    expect(pool).toMatchObject({ name: config.incusConverterStoragePool, driver: 'dir', status: 'Created' });
+    // Restricted native credentials deliberately redact pool configuration.
+    // Fixture-only operator SSH validates our exact setup marker/source; never
+    // broaden the production credential just to read global pool settings.
+    const ownedPool = JSON.parse((await run('ssh', [...ssh,
+      'sudo incus query /1.0/storage-pools/agentor-converter-gate-e983a414'], { maxBuffer: 16384 })).stdout);
+    expect(ownedPool.config).toMatchObject({
+      'user.agentor.image-gate': 'e983a414-4c7f-4fd4-805d-460f2bcbd6f0',
+      source: '/mnt/kata-extra/agentor-converter-gate-e983a414',
+    });
+    const resources = await client.request<{ space: { total: number; used: number } }>('GET',
+      '/1.0/storage-pools/' + config.incusConverterStoragePool + '/resources');
+    expect(resources.space.total - resources.space.used, 'Converter scratch—not canonical worker pool').toBeGreaterThan(36 * 1024 ** 3);
     const directory = await mkdtemp('/workspace/agentor-isolated-image-gate.');
     config.dataDir = directory;
     const assets = join(directory, 'bootstrap');

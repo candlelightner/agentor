@@ -32,18 +32,19 @@ async function fixture(run: (f: {
   converter: IncusImageConverter; input: IncusImageConversionInput; directory: string; assets: string;
   events: string[]; receipts: IncusImageConverterReceipt[]; commands: string[][];
   fail: (at: string) => void; revoke: () => void;
-}) => Promise<void>) {
+}) => Promise<void>, converterPool?: string) {
   const directory = await mkdtemp(join(tmpdir(), 'agentor-isolated-converter-')), assets = join(directory, 'assets');
   await packageAssets(assets);
   const jobId = randomUUID(), installationId = randomUUID(), incarnation = randomUUID();
   const events: string[] = [], receipts: IncusImageConverterReceipt[] = [], commands: string[][] = [];
   let instance: IncusInstance | undefined, failure: string | undefined, revoked = false;
+  const expectedPool = converterPool || 'images';
   const client = new IncusClient({ endpoint: 'https://fixture.invalid', project: 'agentor-images' });
   client.getImage = async fingerprint => {
     events.push('seed'); return { fingerprint, type: 'virtual-machine', architecture: 'x86_64', size: 1024, aliases: [] };
   };
   client.request = async <T>(method: string, path: string): Promise<T> => {
-    expect(method).toBe('GET'); expect(path).toBe('/1.0/storage-pools/images/resources');
+    expect(method).toBe('GET'); expect(path).toBe('/1.0/storage-pools/' + encodeURIComponent(expectedPool) + '/resources');
     events.push('capacity');
     const space = failure === 'capacity-small' ? { total: 100 * 1024 ** 3, used: 84 * 1024 ** 3 }
       : failure === 'capacity-invalid' ? { total: 100, used: 101 }
@@ -54,7 +55,7 @@ async function fixture(run: (f: {
   client.createInstance = async (spec: IncusInstanceCreateSpec, accepted) => {
     events.push('create'); expect(receipts.at(-1)?.pending?.kind).toBe('create');
     expect(spec.profiles).toEqual([]); expect(Object.keys(spec.devices!)).toEqual(['root', 'eth0']);
-    expect(spec.devices!.root).toEqual({ type: 'disk', path: '/', pool: 'images', size: '32GiB' });
+    expect(spec.devices!.root).toEqual({ type: 'disk', path: '/', pool: expectedPool, size: '32GiB' });
     expect(spec.devices!.eth0).toMatchObject({ 'security.mac_filtering': 'true', 'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' });
     expect(spec.config!['user.agentor.helper']).toBe('image-converter');
     expect(spec.config!['user.agentor.id']).toBeUndefined(); expect(spec.config!['user.agentor.worker']).toBeUndefined();
@@ -111,11 +112,21 @@ async function fixture(run: (f: {
     acknowledge: async receipt => {
       receipts.push(structuredClone(receipt)); events.push('ack:' + (receipt.pending?.kind ?? (receipt.removed ? 'removed' : 'settled')));
     } };
-  const converter = new IncusImageConverter({ dataDir: directory, incusStoragePool: 'images', incusNetwork: 'image-network' }, client, docker, assets);
+  const converter = new IncusImageConverter({ dataDir: directory, incusStoragePool: 'images',
+    incusConverterStoragePool: converterPool, incusNetwork: 'image-network' }, client, docker, assets);
   try { await run({ converter, input, directory, assets, events, receipts, commands,
     fail: at => { failure = at; }, revoke: () => { revoked = true; } }); }
   finally { client.dispose(); await rm(directory, { recursive: true, force: true }); }
 }
+
+test('operator-selected converter pool affects only disposable root and capacity checks, not canonical worker storage', async () => {
+  await fixture(async f => {
+    f.fail('docker-load');
+    await expect(f.converter.convert(f.input)).rejects.toThrow('OCI-load');
+    expect(f.events).toContain('capacity'); expect(f.events).toContain('create');
+    expect(f.receipts.at(-1)?.removed).toBe(true);
+  }, 'scratch-images');
+});
 
 test('canonical packaged assets and recipe use exact immutable source/hash/order and reject traversal or changed bytes before VM allocation', async () => {
   await fixture(async f => {

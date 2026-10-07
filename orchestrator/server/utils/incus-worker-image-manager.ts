@@ -13,7 +13,7 @@ import { incusImageIdentity } from './incus-worker-image';
  * aliases nor an image's own properties create this private authority. Uses
  * existing catalog build locking/acknowledgements, not another job store. */
 export class IncusWorkerImageManager {
-  constructor(private config: Pick<Config, 'dataDir' | 'incusNetwork' | 'incusStoragePool'>,
+  constructor(private config: Pick<Config, 'dataDir' | 'incusNetwork' | 'incusStoragePool' | 'incusConverterStoragePool'>,
     private client: IncusClient, private docker: Pick<Docker, 'getImage'>,
     private catalog: ImageCatalogManager, private bootstrapDirectory: string,
     private seedFingerprint: string) {}

@@ -162,11 +162,12 @@ install -d -m 0700 /root/agentor-convert/scripts /root/agentor-convert/worker/vm
  * executor. Guest-controlled output is only opaque bounded RAW; normalization,
  * metadata construction/import/publication remain trusted parent operations. */
 export class IncusImageConverter {
-  constructor(private config: Pick<Config, 'dataDir' | 'incusStoragePool' | 'incusNetwork'>,
+  constructor(private config: Pick<Config, 'dataDir' | 'incusStoragePool' | 'incusConverterStoragePool' | 'incusNetwork'>,
     private client: IncusClient, private docker: Pick<Docker, 'getImage'>, private bootstrapDirectory: string) {}
 
   async convert(input: IncusImageConversionInput): Promise<IncusConvertedRaw> {
     const request = { ...input };
+    const pool = this.config.incusConverterStoragePool || this.config.incusStoragePool;
     if (!UUID.test(request.jobId) || !UUID.test(request.installationId) || !HEX.test(request.seedFingerprint) ||
         !/^sha256:[a-f0-9]{64}$/.test(request.sourceImageId) || assertSafeUserId(request.ownerId).length > 128 ||
         !this.config.dataDir || !this.config.incusStoragePool || !this.config.incusNetwork || this.client.project === 'default')
@@ -183,7 +184,7 @@ export class IncusImageConverter {
     const seed = await this.client.getImage(request.seedFingerprint);
     if (seed.fingerprint !== request.seedFingerprint || seed.type !== 'virtual-machine') throw new Error('Trusted converter seed is unavailable');
     const resources = await this.client.request<{ space?: { total?: number; used?: number } }>('GET',
-      '/1.0/storage-pools/' + encodeURIComponent(this.config.incusStoragePool) + '/resources');
+      '/1.0/storage-pools/' + encodeURIComponent(pool) + '/resources');
     const total = resources?.space?.total, used = resources?.space?.used;
     if (!Number.isSafeInteger(total) || !Number.isSafeInteger(used) || total! <= 0 || used! < 0 || used! > total!)
       throw new Error('Incus converter pool capacity is unavailable or invalid; host readiness must be checked');
@@ -201,7 +202,7 @@ export class IncusImageConverter {
         'user.agentor.helper': 'image-converter', 'user.agentor.operation': request.jobId,
         'user.agentor.source-image': request.sourceImageId, 'user.agentor.seed-image': request.seedFingerprint,
         'security.secureboot': 'false', 'boot.autostart': 'false', 'limits.cpu': '2', 'limits.memory': '4GiB' },
-      devices: { root: { type: 'disk', path: '/', pool: this.config.incusStoragePool, size: '32GiB' },
+      devices: { root: { type: 'disk', path: '/', pool, size: '32GiB' },
         eth0: { type: 'nic', name: 'eth0', network: this.config.incusNetwork,
           'security.mac_filtering': 'true', 'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' } } };
     const check = async (requireActive = true) => {
