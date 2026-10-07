@@ -112,7 +112,7 @@ test('real isolated SAME d2vm converter produces bounded RAW and parent-only nor
     expect(receipts.at(-1)).toMatchObject({ removed: true, incarnation: expect.any(String) });
     expect(receipts.at(-1)?.pending).toBeUndefined();
     await expect(client.getInstance('aic-' + jobId)).rejects.toMatchObject({ statusCode: 404 });
-    const image = await normalizeAndImportIncusImage(client, raw, join(directory, 'tmp', 'incus-image-' + jobId, 'normalized'), {
+    const image = await normalizeAndImportIncusImage(client, raw, join(directory, 'incus-image-converters', 'incus-image-' + jobId, 'normalized'), {
       validateAuthority,
       acknowledgeImport: async ack => {
         imports.push(ack); await writeFile(join(directory, 'import-receipt.json'), JSON.stringify(ack), { mode: 0o600 });

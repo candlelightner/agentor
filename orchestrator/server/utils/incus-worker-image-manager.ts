@@ -45,7 +45,7 @@ export class IncusWorkerImageManager {
         throw new Error('Canonical conversion inputs changed during execution');
       await current();
       const image = await normalizeAndImportIncusImage(this.client, raw,
-        join(this.config.dataDir, 'tmp', 'incus-image-' + buildId, 'normalized'), {
+        join(this.config.dataDir, 'incus-image-converters', 'incus-image-' + buildId, 'normalized'), {
           validateAuthority: current,
           acknowledgeImport: acknowledgement => this.catalog.acknowledgeNativeImageImport(buildId, acknowledgement, current),
         }, signal);

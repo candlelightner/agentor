@@ -266,8 +266,8 @@ export class IncusImageConverter {
         await check();
       } finally { session.close(); }
     };
-    const directory = join(this.config.dataDir, 'tmp', 'incus-image-' + request.jobId), rawPath = join(directory, 'disk.raw');
-    const temporaryRoot = join(this.config.dataDir, 'tmp');
+    const temporaryRoot = join(this.config.dataDir, 'incus-image-converters');
+    const directory = join(temporaryRoot, 'incus-image-' + request.jobId), rawPath = join(directory, 'disk.raw');
     await mkdir(temporaryRoot, { mode: 0o700 }).catch(error => { if (error.code !== 'EEXIST') throw error; });
     const temporary = await lstat(temporaryRoot);
     if (!temporary.isDirectory() || temporary.isSymbolicLink() || temporary.uid !== process.getuid?.() || (temporary.mode & 0o077) !== 0)

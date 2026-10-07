@@ -170,16 +170,34 @@ test('insufficient or malformed physical pool capacity fails before VM allocatio
     f.fail(mode);
     await expect(f.converter.convert(f.input)).rejects.toThrow(/pool (has|capacity)/);
     expect(f.events).toEqual(['seed', 'capacity']); expect(f.receipts).toEqual([]);
-    await expect(lstat(join(f.directory, 'tmp'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(lstat(join(f.directory, 'incus-image-converters'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });
 
 test('converter temporary root rejects symlink or nonprivate directory before native allocation', async () => {
   for (const unsafe of ['symlink', 'public']) await fixture(async f => {
-    if (unsafe === 'symlink') { const outside = join(f.directory, 'outside'); await mkdir(outside); await symlink(outside, join(f.directory, 'tmp')); }
-    else await mkdir(join(f.directory, 'tmp'), { mode: 0o755 });
+    if (unsafe === 'symlink') { const outside = join(f.directory, 'outside'); await mkdir(outside); await symlink(outside, join(f.directory, 'incus-image-converters')); }
+    else await mkdir(join(f.directory, 'incus-image-converters'), { mode: 0o755 });
     await expect(f.converter.convert(f.input)).rejects.toThrow('private owned real directory');
     expect(f.events).not.toContain('create'); expect(f.receipts).toEqual([]);
+  });
+});
+
+test('converter keeps its private scratch separate from the existing shared backup temporary directory', async () => {
+  await fixture(async f => {
+    const shared = join(f.directory, 'tmp');
+    await mkdir(shared, { mode: 0o755 });
+    await writeFile(join(shared, 'backup-sentinel'), 'existing backup data');
+    const before = await lstat(shared);
+    f.fail('docker-load');
+    await expect(f.converter.convert(f.input)).rejects.toThrow('OCI-load');
+    expect(f.events).toContain('create');
+    expect(f.receipts.at(-1)?.removed).toBe(true);
+    expect((await lstat(join(f.directory, 'incus-image-converters'))).mode & 0o777).toBe(0o700);
+    expect((await lstat(join(f.directory, 'incus-image-converters', 'incus-image-' + f.input.jobId))).mode & 0o777).toBe(0o700);
+    const after = await lstat(shared);
+    expect([after.ino, after.uid, after.gid, after.mode]).toEqual([before.ino, before.uid, before.gid, before.mode]);
+    expect(await readFile(join(shared, 'backup-sentinel'), 'utf8')).toBe('existing backup data');
   });
 });
 
@@ -274,7 +292,7 @@ test('SAME raw-only bootstrap script produces no guest QCOW/metadata authority a
     expect(f.commands[identity]?.[2]).not.toMatch(/docker pull|docker tag/);
     expect(f.commands.at(-1)).toEqual(['/usr/bin/cat', '/root/agentor-convert/output/disk.raw']);
     expect(f.receipts.at(-1)?.removed).toBe(true);
-    const raw = join(f.directory, 'tmp/incus-image-' + f.input.jobId + '/disk.raw');
+    const raw = join(f.directory, 'incus-image-converters/incus-image-' + f.input.jobId + '/disk.raw');
     expect((await lstat(raw)).size).toBe(65536); expect((await lstat(raw)).mode & 0o777).toBe(0o600);
   });
 });
