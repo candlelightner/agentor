@@ -54,10 +54,14 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
   : mode === 'app-rollback' ? 'real running Orchestrator authenticates original control plane after witnessed native rollback'
   : mode === 'app-rest-ordinary' ? process.env.INCUS_ORIGINAL_PUBLIC_TEST === 'true'
     ? 'real authenticated worker backup restores its original Incus workspace without replacing other state'
+    : process.env.INCUS_NEW_PUBLIC_TEST === 'true'
+      ? 'real authenticated encrypted worker backup restores fresh Incus worker storage and selected native Docker data'
     : 'real public instance restore imports an encrypted native bundle and restores ordinary VM Docker data through authenticated REST'
   : 'real controlled helper process restores retained native data and restarts only its exact recovery target', async () => {
   const originalPublic = mode === 'app-rest-ordinary' && process.env.INCUS_ORIGINAL_PUBLIC_TEST === 'true';
-  const rest = mode === 'app-rest-ordinary' && !originalPublic, app = mode.startsWith('app-'), ordinary = originalPublic || rest || mode === 'app-ordinary' || mode !== 'retained' && !app,
+  const newPublic = mode === 'app-rest-ordinary' && process.env.INCUS_NEW_PUBLIC_TEST === 'true';
+  if (originalPublic && newPublic) throw new Error('Choose exactly one public worker restore gate');
+  const rest = mode === 'app-rest-ordinary' && !originalPublic && !newPublic, app = mode.startsWith('app-'), ordinary = originalPublic || newPublic || rest || mode === 'app-ordinary' || mode !== 'retained' && !app,
     rollback = mode === 'rollback' || mode === 'app-rollback';
   test.skip(process.env.INCUS_INSTANCE_HELPER_PROCESS_TEST !== 'true', 'Explicit serial approved disposable helper-process gate');
   test.setTimeout(900_000);
@@ -158,6 +162,8 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
       `if(typeof WS!=='function')throw Error('Fixture packaged WebSocket entry changed');`], { timeout: 10_000 });
     if (originalPublic) expect(await readFile(join(build, 'app-output/server/chunks/nitro/nitro.mjs'), 'utf8'))
       .toContain('replaceOriginalWorkspaceFromBackup'); // Cheap packaging seam before native source allocation.
+    if (newPublic) expect(await readFile(join(build, 'app-output/server/chunks/nitro/nitro.mjs'), 'utf8'))
+      .toContain('importWorkerFromBackup');
     if (app) for (const file of ['volume-mount-helper.py', 'incus-volume-live-helper.py'])
       await copyFile(fileURLToPath(new URL('../../orchestrator/' + file, import.meta.url)), join(build, file));
     if (!retained) {
@@ -863,17 +869,26 @@ xattr=base64.b64encode(os.getxattr(p+'/data','user.binary')).decode())))`)} ${qu
       helperRemovedByManager = true;
       console.info('Current running Orchestrator authenticated against restored SQLite and exposed completed native job after exact restart');
     }
-    if (originalPublic) {
+    if (originalPublic || newPublic) {
       // The existing controlled source setup is required; public whole-instance
       // inverse/producer acceptance is not repeated for this original-only gate.
       const path = '/workspace/public-original-' + id;
+      const selectedPath = '/opt/public-new-' + id, agentPath = '/home/agent/.agent-data/public-new-' + id;
       await runtime.client.exec(options!.containerName, ['python3', '-c', String.raw`
 import os,sys
 p=sys.argv[1];os.mkdir(p);f=p+'/data';open(f,'wb').write(bytes([0,255,128,10,61,0]));os.link(f,p+'/hard')
 os.chown(f,12345,23456);os.chmod(f,0o640);os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]))
 os.utime(f,ns=(1700000000123456789,1700000000987654321))
 `, path]).then(result => expect(result.returnCode, result.stderr).toBe(0));
-      const capture = await appRequest<BackupJob>('/api/backups', { workspaceIds: [id], providerId: 'local', includeManagedVolumes: false });
+      if (newPublic) await runtime.client.exec(options!.containerName, ['python3', '-c', String.raw`
+import os,sys
+for p in sys.argv[1:]:
+ os.mkdir(p);f=p+'/data';open(f,'wb').write(bytes([0,255,128,10,61,0]));os.link(f,p+'/hard')
+ os.chown(f,12345,23456);os.chmod(f,0o640);os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]))
+ os.utime(f,ns=(1700000000123456789,1700000000987654321))
+`, selectedPath, agentPath]).then(result => expect(result.returnCode, result.stderr).toBe(0));
+      const capture = await appRequest<BackupJob>('/api/backups', { workspaceIds: [id], providerId: 'local', includeManagedVolumes: newPublic,
+        ...(newPublic ? { selectedPathsByWorkspace: { [id]: ['/workspace', '/home/agent/.agent-data', '/var/lib/docker', selectedPath] } } : {}) });
       expect(capture.status).toBe(202); expect(capture.body.id).toMatch(/^[a-f0-9-]{36}$/);
       let captured: BackupJob | undefined;
       await expect.poll(async () => {
@@ -898,6 +913,95 @@ os.utime(f,ns=(1700000000123456789,1700000000987654321))
         `const e=b.indexOf(10,magic.length);if(e<0||e>=n)throw Error('Worker envelope invalid');console.log(b.subarray(magic.length,e).toString());`)}`));
       expect(envelope).toMatchObject({ version: 2, algorithm: 'aes-256-gcm', keyFingerprint: artifact.body.keyFingerprint,
         metadata: { workspaceIds: [id], formatVersion: 2 } });
+      if (newPublic) {
+        expect(artifact.body.includeManagedVolumes).toBe(true);
+        expect(artifact.body.selectedPathsByWorkspace?.[id]).toEqual(['/workspace', '/home/agent/.agent-data', '/var/lib/docker', selectedPath]);
+        const dockerProof = ['bash', '-ec', 'docker image inspect --format "{{.Id}}" agentor-archive-lower:proof; ' +
+          'docker container inspect --format "{{.Id}} {{.Image}} {{.Config.Image}}" archive-layer archive-stopped; ' +
+          'docker volume inspect --format "{{.Name}} {{.Driver}}" archive-data; ' +
+          'docker run --rm -v archive-data:/data busybox:1.37.0 cat /data/ordinary'];
+        const originalDocker = await runtime.client.exec(options!.containerName, dockerProof);
+        expect(originalDocker.returnCode, originalDocker.stderr).toBe(0);
+        expect((await appRequest('/api/containers/' + id + '/stop', {}, true, 360_000)).status).toBe(200);
+        const before = await runtime.client.getInstance(options!.containerName);
+        expect(before.status).toBe('Stopped'); expect(before.config['volatile.uuid']).toBe(incarnation);
+        const sourceNames = [...['workspace', 'agents', 'docker'].map(role => options!.containerName + '-' + role), volume.dockerName];
+        const beforeVolumes = await Promise.all(sourceNames.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)));
+        computeSettled = false; // Unknown new-worker allocation retains both exact source and destination.
+        const restored = await appRequest<{ jobId: string }>('/api/backups/' + artifact.body.id + '/restore',
+          { target: 'new', workspaceIds: [id], displayName: 'Public native new restore ' + jobId, requestId: jobId + '-new' });
+        expect(restored.status).toBe(202); expect(restored.body.jobId).toMatch(/^[a-f0-9-]{36}$/);
+        let result: BackupJob | undefined;
+        await expect.poll(async () => {
+          const state = await appRequest<BackupJob>('/api/backup-jobs/' + restored.body.jobId); expect(state.status).toBe(200); result = state.body;
+          if (state.body.status === 'failed') throw new Error('Public new restore failed: ' + (state.body.errorCode ?? 'unknown'));
+          return state.body.status;
+        }, { timeout: 360_000, intervals: [1000] }).toBe('succeeded');
+        expect(result).toMatchObject({ target: 'new', integrityVerified: true, selectedWorkspaceIds: [id] });
+        expect(result?.restoreMappings).toHaveLength(1);
+        const newId = result!.restoreMappings![0]!.workerId;
+        expect(result!.restoreMappings![0]!.sourceWorkspaceId).toBe(id); expect(newId).not.toBe(id); expect(newId).toMatch(/^[a-f0-9-]{36}$/);
+        const rows = JSON.parse(await root(`sudo python3 -c ${quote('import json,sys;print(json.dumps(json.load(open(sys.argv[1]))))')} ` +
+          quote(remoteData + '/users/' + userId + '/workers.json'))) as WorkerRecord[];
+        expect(rows.find(row => row.id === newId)).toMatchObject({ userId, runtimeKind: 'incus-vm', status: 'active', desiredRuntimeStatus: 'running' });
+        expect(rows.find(row => row.id === newId)?.incusRecreation).toBeUndefined();
+        const newOwner = { id: newId, userId, containerName: config.containerPrefix + '-' + newId };
+        const fresh = await runtime.client.getInstance(newOwner.containerName), freshUuid = fresh.config['volatile.uuid'];
+        expect(freshUuid).toMatch(/^[a-f0-9-]{36}$/); expect(freshUuid).not.toBe(incarnation);
+        expect(await runtime.matchesWorkerIdentity(fresh, newId, userId)).toBe(true); expect(fresh.status).toBe('Running');
+        expect(fresh.profiles).toEqual([]); expect(fresh.devices.eth0).toMatchObject({
+          'security.mac_filtering': 'true', 'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' });
+        const records = JSON.parse(await root(`sudo python3 -c ${quote('import json,sys;print(json.dumps(json.load(open(sys.argv[1]))))')} ` +
+          quote(remoteData + '/users/' + userId + '/managed-volumes.v1.json'))) as StoredManagedVolume[];
+        const newVolumes = records.filter(record => record.workerId === newId); expect(newVolumes).toHaveLength(1);
+        const newManaged = newVolumes[0]!;
+        expect(newManaged).toMatchObject({ userId, target: volume.target, storageRuntimeKind: 'incus-vm', attached: true, seeded: true, state: 'ready' });
+        expect(newManaged.id).not.toBe(volume.id); expect(newManaged.dockerName).not.toBe(volume.dockerName);
+        const nativeNames = [...['workspace', 'agents', 'docker'].map(role => newOwner.containerName + '-' + role), newManaged.dockerName];
+        const newNative = await Promise.all(nativeNames.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)));
+        for (const native of newNative) {
+          expect(sourceNames).not.toContain(native.name); expect(native.created_at).toBeTruthy();
+          expect(native.config).toMatchObject({ 'user.agentor.installation': installation, 'user.agentor.id': newId, 'user.agentor.owner': userId });
+          expect(native.used_by).toEqual(['/1.0/instances/' + newOwner.containerName + '?project=agentor']);
+        }
+        const metadataCheck = ['python3', '-c', String.raw`
+import os,stat,sys
+for p in sys.argv[1:]:
+ f=p+'/data';s=os.stat(f)
+ assert open(f,'rb').read()==bytes([0,255,128,10,61,0]) and s.st_ino==os.stat(p+'/hard').st_ino
+ assert (s.st_uid,s.st_gid,stat.S_IMODE(s.st_mode),s.st_mtime_ns)==(12345,23456,0o640,1700000000987654321)
+ assert os.getxattr(f,'user.binary')==bytes([0,255,128,10,61,0])
+`, path, agentPath, selectedPath, volume.target];
+        for (const command of [metadataCheck, dockerProof, ['bash', '-ec',
+          'cmp /workspace/marker /home/agent/.agent-data/marker; systemctl is-active --quiet incus-agent agentor-worker docker; ' +
+          'test ! -e /tls/client.crt; test ! -e /tls/client.key; curl -fsS http://127.0.0.1:8443/ >/dev/null; curl -fsS http://127.0.0.1:6080/ >/dev/null']]) {
+          const proof = await runtime.client.exec(newOwner.containerName, command); expect(proof.returnCode, proof.stderr).toBe(0);
+          if (command === dockerProof) expect(proof.stdout).toBe(originalDocker.stdout);
+        }
+        expect((await appRequest<string>('/editor/' + newId + '/?folder=/workspace')).body).toContain('code-server');
+        expect((await appRequest<string>('/desktop/' + newId + '/agentor.html')).body).toContain('noVNC');
+        const self = await runtime.client.exec(newOwner.containerName, ['curl', '--noproxy', '*', '-fsS', config.incusInternalGatewayUrl + '/api/worker-self/info']);
+        expect(self.returnCode, self.stderr).toBe(0); expect(JSON.parse(self.stdout)).toMatchObject({ workerId: newId, userId });
+        expect(await runtime.client.getInstance(options!.containerName)).toEqual(before);
+        expect(await Promise.all(sourceNames.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)))).toEqual(beforeVolumes);
+        expect((await appRequest('/api/containers/' + id + '/restart', {}, true, 360_000)).status).toBe(200);
+        expect((await runtime.client.getInstance(options!.containerName)).config['volatile.uuid']).toBe(incarnation);
+        for (const command of [metadataCheck, dockerProof]) {
+          const proof = await runtime.client.exec(options!.containerName, command); expect(proof.returnCode, proof.stderr).toBe(0);
+          if (command === dockerProof) expect(proof.stdout).toBe(originalDocker.stdout);
+        }
+        // Success-only destruction: recheck the captured destination incarnation,
+        // full configuration and every newly-created volume/ref before removal.
+        expect(await runtime.client.getInstance(newOwner.containerName)).toEqual(fresh);
+        expect(await Promise.all(nativeNames.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)))).toEqual(newNative);
+        await runtime.remove(newOwner, freshUuid); await runtime.removeStorage(newOwner);
+        const detached = await managedRuntime.inspectVolume(newManaged);
+        expect(detached).toEqual({ ...newNative[3]!, used_by: [] }); await managedRuntime.delete(newManaged);
+        await expect(runtime.client.getInstance(newOwner.containerName)).rejects.toMatchObject({ statusCode: 404 });
+        for (const name of nativeNames) await expect(runtime.client.getCustomVolume(config.incusStoragePool, name)).rejects.toMatchObject({ statusCode: 404 });
+        computeSettled = true;
+        console.info('Actual encrypted public target:new passed fresh native identity/storage, workspace/agents/managed/selected metadata, Docker image/container/named-volume state, services/proxies/self and unchanged source');
+      } else {
       await runtime.client.exec(options!.containerName, ['python3', '-c',
         'import sys; p=sys.argv[1];open(p+"/data","wb").write(b"changed-after-capture");' +
         'open("/workspace/extra-after-"+sys.argv[2],"wb").write(b"must disappear");' +
@@ -951,6 +1055,7 @@ assert open('/root/original-public-'+sys.argv[2],'rb').read()==b'compute-root-af
         expect(retained.returnCode, retained.stderr).toBe(0);
       }
       console.info('Actual encrypted worker backup/public original dispatch passed protection rejects, native kind/durable identity fence, stopped sameVM replacement and metadata-only workspace acknowledgement; agents/Docker/managed state retained');
+      }
     }
     if (rest) {
       const expectedSource = manifest.volumes.find(v => v.runtime?.role === 'workspace')!.runtime;
