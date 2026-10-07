@@ -220,6 +220,8 @@ test('isolated guest tools/native Docker/OCI stream use fixed trust inputs and k
     expect(setup).toContain('/run/systemd/system/docker.service.d/zz-agentor-converter.conf');
     expect(setup).toContain("/usr/lib/agentor/agentor-network.sh full '[]'");
     expect(setup.indexOf('/usr/lib/agentor/agentor-network.sh')).toBeLessThan(setup.indexOf('apt-get update'));
+    expect(setup).toContain('e2fsprogs parted kpartx cryptsetup');
+    expect(setup).toContain('for tool in parted kpartx cryptsetup qemu-img sgdisk grub-install mkfs.ext4 mkfs.fat');
     expect(setup).toContain('"containerd-snapshotter":true'); expect(setup).toContain('io.containerd.snapshotter.v1');
     expect(setup).toContain('ExecStart=\\nExecStart=/usr/bin/dockerd --config-file=/run/agentor-converter-tools/docker-daemon.json');
     expect(setup).toContain('chmod 0600 /run/agentor-converter-tools/docker-daemon.json');
@@ -230,7 +232,9 @@ test('isolated guest tools/native Docker/OCI stream use fixed trust inputs and k
     expect(setup).toContain("sys+'/partition'"); expect(setup).toContain("len(disks)!=1"); expect(setup).toContain('32*1024**3');
     expect(setup).toContain("['growpart',before[1],str(before[2])]"); expect(setup).toContain("['resize2fs',after[0]]");
     expect(setup).toContain("p.stdout.startswith(b'NOCHANGE:')"); expect(setup).toContain('after[9]-after[7]-after[8]<=2048');
-    expect(setup).not.toMatch(/mkfs|e2fsck|\/dev\/sdb|wipefs/);
+    // Checking executable availability is not formatting a device.
+    expect(setup).not.toMatch(/(?:^|\n)\s*(?:mkfs(?:\.[A-Za-z0-9]+)?|e2fsck|wipefs)(?:\s|$)/);
+    expect(setup).not.toContain('/dev/sdb');
     const growth = /python3 - <<'PY'\n([\s\S]*?)\nPY\n/.exec(setup)![1]!;
     execFileSync('python3', ['-c', 'import ast,sys; ast.parse(sys.argv[1])', growth]); // Syntax preflight only; never execute host block operations.
     execFileSync('bash', ['-n'], { input: setup });

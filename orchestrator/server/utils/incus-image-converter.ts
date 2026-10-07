@@ -110,7 +110,10 @@ if ! systemctl start containerd.service docker.socket docker.service; then docke
 if ! timeout 30 docker info >/dev/null; then docker_diagnostics; exit 1; fi
 if ! docker info --format '{{json .DriverStatus}}' | python3 -c 'import json,sys; assert ["driver-type","io.containerd.snapshotter.v1"] in json.load(sys.stdin), "Converter requires native containerd image store for immutable source transfer"'; then docker_diagnostics; exit 1; fi
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qemu-utils gdisk grub-efi-amd64-bin curl ca-certificates coreutils util-linux xz-utils dosfstools cloud-guest-utils e2fsprogs
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qemu-utils gdisk grub-efi-amd64-bin curl ca-certificates coreutils util-linux xz-utils dosfstools cloud-guest-utils e2fsprogs parted kpartx cryptsetup
+for tool in parted kpartx cryptsetup qemu-img sgdisk grub-install mkfs.ext4 mkfs.fat; do
+ command -v "$tool" >/dev/null || { printf 'Missing fixed converter dependency: %s\n' "$tool" >&2; exit 1; }
+done
 # This guest has only its disposable 32GiB root disk. Resolve the currently
 # mounted ext4 root via kernel identity, never an unused-device candidate.
 python3 - <<'PY'
