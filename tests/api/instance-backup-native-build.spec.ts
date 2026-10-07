@@ -85,7 +85,7 @@ test('standalone native helper adapter imports isolated locked dependencies with
 test('production build invokes adapter only after Nuxt, copying no builder dependency tree', async () => {
   const packageJson = JSON.parse(await readFile(join(dirname(buildScript), 'package.json'), 'utf8'));
   const lock = JSON.parse(await readFile(join(dirname(buildScript), 'package-lock.json'), 'utf8'));
-  expect(packageJson.scripts.build).toBe('nuxt build && node build-instance-restore-native.mjs');
+  expect(packageJson.scripts.build).toBe('nuxt build && node build-instance-restore-native.mjs && node build-incus-worker-assets.mjs');
   for (const [dependency, version] of Object.entries({ esbuild: '0.25.12', '@vercel/nft': '1.5.0' })) {
     expect(packageJson.devDependencies[dependency]).toBe(version);
     expect(lock.packages[''].devDependencies[dependency]).toBe(version);
@@ -93,8 +93,8 @@ test('production build invokes adapter only after Nuxt, copying no builder depen
   }
   const dockerfile = await readFile(join(dirname(buildScript), 'Dockerfile'), 'utf8');
   expect(dockerfile).toContain('RUN npm run build');
-  expect(dockerfile).toContain('COPY --from=builder /app/.output/ .output/');
-  expect(dockerfile).not.toMatch(/COPY[^\n]*\/app\/node_modules/);
+  expect(dockerfile).toContain('COPY --from=builder /app/orchestrator/.output/ .output/');
+  expect(dockerfile).not.toMatch(/COPY[^\n]*\/app\/(?:orchestrator\/)?node_modules/);
   const helper = await readFile(join(dirname(buildScript), 'instance-restore-helper.mjs'), 'utf8');
   // Cold CLI starts during module evaluation, unlike imported helper tests.
   // Its fixed settings must exist before the top-level await invokes it.

@@ -915,7 +915,9 @@ for p in sys.argv[1:]:
         metadata: { workspaceIds: [id], formatVersion: 2 } });
       if (newPublic) {
         expect(artifact.body.includeManagedVolumes).toBe(true);
-        expect(artifact.body.selectedPathsByWorkspace?.[id]).toEqual(['/workspace', '/home/agent/.agent-data', '/var/lib/docker', selectedPath]);
+        // Canonical workspace/agent roots are captured separately in this selection;
+        // the public artifact records only normalized additional selections.
+        expect(artifact.body.selectedPathsByWorkspace?.[id]).toEqual(['/var/lib/docker', selectedPath]);
         const dockerProof = ['bash', '-ec', 'docker image inspect --format "{{.Id}}" agentor-archive-lower:proof; ' +
           'docker container inspect --format "{{.Id}} {{.Image}} {{.Config.Image}}" archive-layer archive-stopped; ' +
           'docker volume inspect --format "{{.Name}} {{.Driver}}" archive-data; ' +
