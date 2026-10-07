@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { IncusClient, type IncusImage } from '../../orchestrator/server/utils/incus-client';
+import { IncusClient, IncusError, type IncusImage } from '../../orchestrator/server/utils/incus-client';
 import { IncusWorkerImageManager } from '../../orchestrator/server/utils/incus-worker-image-manager';
 import { type ImageCatalogManager, type NativeImageContext } from '../../orchestrator/server/utils/image-catalog';
 
@@ -59,4 +59,52 @@ test('private cache remains exact-project/exact-fingerprint and freshly authoriz
       client, docker, catalog, assets, 'mutable-alias');
     await expect(invalid.ensure('owner', {}, async () => {})).rejects.toThrow('operator-pinned');
   } finally { client.dispose(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('regeneration requires repeated typed native absence, never transport or lookalike errors', async () => {
+  for (const scenario of ['missing', 'transport', 'lookalike', 'reappeared'] as const) {
+    const root = await mkdtemp(join(tmpdir(), 'agentor-image-cache-missing-'));
+    const assets = join(root, 'assets');
+    await promisify(execFile)('node', ['../orchestrator/build-incus-worker-assets.mjs', assets]);
+    const sourceImageId = 'sha256:' + 'a'.repeat(64), fingerprint = 'b'.repeat(64);
+    const client = new IncusClient({ endpoint: 'https://fixture.invalid', project: 'agentor-private' });
+    let queries = 0, evictions = 0, ensures = 0, absent = true, recipe = '';
+    const catalog = {
+      authorizeNativeImageSource: async () => ({ sourceImageId }),
+      ensureNativeImageBinding: async (_source: unknown, context: NativeImageContext, current: () => Promise<void>) => {
+        await current(); ensures++; recipe = context.recipeId;
+        return { context, buildId: randomUUID(), capability: 'agentor-storage-ownership-v1',
+          identity: { version: 1, sourceImageId, recipeId: recipe, architecture: 'amd64',
+            converterVersion: 'v0.4.0', bootstrapGeneration: '3', fingerprint } };
+      },
+      forgetMissingNativeImageBinding: async (_source: unknown, _binding: unknown, current: () => Promise<void>,
+        verify: (value: string) => Promise<void>) => {
+        await current(); await verify(fingerprint); evictions++; absent = false;
+      },
+    } as unknown as ImageCatalogManager;
+    client.getImage = async value => {
+      expect(value).toBe(fingerprint); queries++;
+      if (scenario === 'transport') throw new IncusError('Incus unavailable', 503);
+      if (scenario === 'lookalike') throw Object.assign(new Error('Unknown transport'), { statusCode: 404 });
+      if (scenario === 'reappeared' && queries > 1) absent = false;
+      if (absent) throw new IncusError('Image not found', 404);
+      return { fingerprint, type: 'virtual-machine', architecture: 'x86_64', size: 1, aliases: [], properties: {
+        source_image_id: sourceImageId, recipe_id: recipe, source_architecture: 'amd64',
+        bootstrap_generation: '3', converter_version: 'v0.4.0',
+      } } satisfies IncusImage;
+    };
+    const manager = new IncusWorkerImageManager({ dataDir: root, incusNetwork: 'workers', incusStoragePool: 'workers' },
+      client, { getImage: () => { throw new Error('This cache test must not export'); } }, catalog, assets, 'c'.repeat(64));
+    try {
+      const result = manager.ensure('owner', {}, async () => {});
+      if (scenario === 'missing') {
+        expect((await result).identity.fingerprint).toBe(fingerprint);
+        expect(queries).toBe(3); expect(evictions).toBe(1); expect(ensures).toBe(2);
+      } else {
+        await expect(result).rejects.toThrow();
+        expect(evictions).toBe(0); expect(ensures).toBe(1);
+        expect(queries).toBe(scenario === 'reappeared' ? 2 : 1);
+      }
+    } finally { client.dispose(); await rm(root, { recursive: true, force: true }); }
+  }
 });

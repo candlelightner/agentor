@@ -261,3 +261,50 @@ test('queued publication and binding reads revalidate external membership after 
     } finally { await f.cleanup(); }
   }
 });
+
+test('verified-missing settled cache can regenerate without erasing prior successful acknowledgements', async () => {
+  const f = await fixture(); try {
+    const source = await f.authorize(), id = await f.manager.openNativeImageDerivation(source, f.context, f.validate);
+    await f.imported(id);
+    const binding = await f.manager.publishNativeImageBinding(id, f.identity, 'agentor-storage-ownership-v1', f.validate);
+    const before = structuredClone(f.manager.build(id, f.owner, false));
+    let checks = 0;
+    const missing = async (fingerprint: string) => { checks++; expect(fingerprint).toBe(f.identity.fingerprint); };
+    await f.manager.forgetMissingNativeImageBinding(source, binding, f.validate, missing);
+    expect(checks).toBe(1);
+    expect(f.manager.build(id, f.owner, false)).toEqual(before);
+    expect(await f.manager.readNativeImageBinding(source, f.context, f.validate)).toBeUndefined();
+    let executions = 0;
+    const replacement = await f.manager.ensureNativeImageBinding(source, f.context, f.validate, async next => {
+      executions++; expect(next).not.toBe(id); await f.imported(next);
+      await f.manager.publishNativeImageBinding(next, f.identity, 'agentor-storage-ownership-v1', f.validate);
+    });
+    expect(executions).toBe(1); expect(replacement.buildId).not.toBe(id);
+    await f.manager.forgetMissingNativeImageBinding(source, binding, f.validate, missing);
+    expect(checks).toBe(1); // Stale readers cannot evict the replacement.
+    expect(await f.manager.readNativeImageBinding(source, f.context, f.validate)).toEqual(replacement);
+    expect(f.manager.build(id, f.owner, false)).toEqual(before);
+  } finally { await f.cleanup(); }
+});
+
+test('missing-cache eviction preserves authority on unavailable native proof, revocation and persistence failure', async () => {
+  for (const failure of ['native', 'revoked', 'persist', 'unsettled'] as const) {
+    const f = await fixture(); try {
+      const source = await f.authorize(), id = await f.manager.openNativeImageDerivation(source, f.context, f.validate);
+      await f.imported(id);
+      const binding = await f.manager.publishNativeImageBinding(id, f.identity, 'agentor-storage-ownership-v1', f.validate);
+      if (failure === 'persist') f.fail(true);
+      if (failure === 'unsettled') f.manager.build(id, f.owner, false).nativeDerivation!.imageImport!.pending = true;
+      const bytes = await readFile(f.path, 'utf8');
+      const missing = async () => {
+        if (failure === 'native') throw new Error('Native absence is unproven');
+        if (failure === 'revoked') f.revoke();
+      };
+      await expect(f.manager.forgetMissingNativeImageBinding(source, binding, f.validate, missing)).rejects.toThrow();
+      expect(await readFile(f.path, 'utf8')).toBe(bytes);
+      if (failure === 'native' || failure === 'persist')
+        expect(await f.manager.readNativeImageBinding(source, f.context, f.validate)).toEqual(binding);
+      await expect(f.manager.openNativeImageDerivation(source, f.context, f.validate)).rejects.toThrow();
+    } finally { await f.cleanup(); }
+  }
+});

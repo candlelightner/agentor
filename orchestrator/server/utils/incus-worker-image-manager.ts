@@ -2,7 +2,7 @@ import type Docker from 'dockerode';
 import { isDeepStrictEqual } from 'node:util';
 import { join } from 'node:path';
 import type { Config } from './config';
-import { IncusClient } from './incus-client';
+import { IncusClient, IncusError } from './incus-client';
 import { backupInstallationId } from './backup-installation';
 import { ImageCatalogManager, type NativeImageContext, type NativeImageBinding } from './image-catalog';
 import { IncusImageConverter, incusConversionRecipeId, readCanonicalIncusBootstrap } from './incus-image-converter';
@@ -35,7 +35,7 @@ export class IncusWorkerImageManager {
     // mutation chain. This callback checks external owner/group/lifecycle
     // authority only: never reenter the catalog queue from a queued write.
     const current = active;
-    const binding = await this.catalog.ensureNativeImageBinding(source, context, current, async buildId => {
+    const execute = async (buildId: string) => {
       const converter = new IncusImageConverter(this.config, this.client, this.docker, this.bootstrapDirectory);
       const raw = await converter.convert({ jobId: buildId, ownerId: requesterId,
         installationId: context.installationId, sourceImageId: source.sourceImageId,
@@ -55,11 +55,28 @@ export class IncusWorkerImageManager {
         throw new Error('Trusted normalized image import does not match conversion inputs');
       await current();
       await this.catalog.publishNativeImageBinding(buildId, identity, 'agentor-storage-ownership-v1', current);
-    });
+    };
+    let binding = await this.catalog.ensureNativeImageBinding(source, context, current, execute);
     // A private cache entry is only a hint. Re-query this exact project and
     // fingerprint; never substitute another image by name/source properties.
     await current();
-    const actual = incusImageIdentity(await this.client.getImage(binding.identity.fingerprint));
+    let image;
+    try { image = await this.client.getImage(binding.identity.fingerprint); }
+    catch (error) {
+      if (!(error instanceof IncusError) || error.statusCode !== 404) throw error;
+      // Native 404 proves absence of this cache artifact, not completion of an
+      // operation. Only a previously successful, settled binding is evicted.
+      // Reuse existing catalog locking/conversion; attempt regeneration once.
+      await this.catalog.forgetMissingNativeImageBinding(source, binding, current, async fingerprint => {
+        try { await this.client.getImage(fingerprint); }
+        catch (missing) { if (missing instanceof IncusError && missing.statusCode === 404) return; throw missing; }
+        throw new Error('Native cache image reappeared before missing-cache eviction');
+      });
+      binding = await this.catalog.ensureNativeImageBinding(source, context, current, execute);
+      await current();
+      image = await this.client.getImage(binding.identity.fingerprint);
+    }
+    const actual = incusImageIdentity(image);
     if (!isDeepStrictEqual(actual, binding.identity)) throw new Error('Native catalog cache image changed or disappeared');
     await current();
     return binding;

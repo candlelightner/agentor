@@ -883,7 +883,10 @@ export class ImageCatalogManager {
       if (this.state.nativeBindings[key]) throw new Error('Native derived image already has a private binding');
       if (this.state.builds.some(build => build.nativeDerivation && nativeContextKey(build.nativeDerivation.context) === key &&
           (build.status === 'queued' || build.status === 'running' ||
-            !!build.nativeDerivation.converter && !build.nativeDerivation.converter.removed || !!build.nativeDerivation.imageImport)))
+            !!build.nativeDerivation.converter && !build.nativeDerivation.converter.removed ||
+            !!build.nativeDerivation.imageImport && (build.status !== 'succeeded' ||
+              build.nativeDerivation.imageImport.pending !== false || !build.nativeDerivation.converter?.incarnation ||
+              !!build.nativeDerivation.converter.pending))))
         throw new Error('Native conversion already owns this immutable key; retain its exact acknowledgement');
       const stamp = now(), id = randomUUID();
       this.state.builds.push({ id, definitionId: source.definitionId, ownerId: source.requesterId, groupId: source.groupId,
@@ -891,6 +894,29 @@ export class ImageCatalogManager {
         createdAt: stamp, updatedAt: stamp, startedAt: stamp, logs: [], digest: source.sourceImageId, version: source.version,
         imageCreated: true, nativeDerivation: { source, context } });
       return id;
+    });
+  }
+
+  /** Reconstructable cache eviction only. Keep the settled job/receipts as
+   * evidence; never clear an uncertain import or adopt another native image.
+   * The caller verifies this exact fingerprint's native absence while holding
+   * the existing catalog mutation chain, not a new recovery subsystem. */
+  async forgetMissingNativeImageBinding(source: NativeImageSource, expected: NativeImageBinding,
+    validateAuthority: () => Promise<void>, verifyMissing: (fingerprint: string) => Promise<void>): Promise<void> {
+    source = structuredClone(source); expected = structuredClone(expected);
+    await this.init();
+    await this.mutate(async () => {
+      await validateAuthority(); this.assertNativeSource(source);
+      const key = nativeContextKey(expected.context), current = this.state.nativeBindings[key];
+      if (!current || !isDeepStrictEqual(current, expected)) return; // Another caller already settled this hint.
+      const job = this.state.builds.find(build => build.id === current.buildId), ack = job?.nativeDerivation;
+      if (source.sourceImageId !== current.context.sourceImageId || job?.status !== 'succeeded' || !ack ||
+          !isDeepStrictEqual(ack.context, current.context) || !ack.converter?.removed || !ack.converter.incarnation ||
+          ack.converter.pending || ack.imageImport?.pending !== false || ack.imageImport.fingerprint !== current.identity.fingerprint)
+        throw new Error('Missing cache eviction requires exact settled import authority');
+      await verifyMissing(current.identity.fingerprint);
+      await validateAuthority(); this.assertNativeSource(source);
+      delete this.state.nativeBindings[key];
     });
   }
 
