@@ -15,7 +15,7 @@ import { readCanonicalIncusBootstrap, incusConversionRecipeId } from '../../orch
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import { zeroUserEnvVars } from '../../orchestrator/server/utils/user-env-store';
 
-const project = 'agentor-image-gate-e983a414', marker = 'e983a414-4c7f-4fd4-805d-460f2bcbd6f0';
+const project = 'agentor', sourceProject = 'agentor-image-gate-e983a414', marker = 'e983a414-4c7f-4fd4-805d-460f2bcbd6f0';
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/, hash = /^[a-f0-9]{64}$/;
 async function privateJson(path: string): Promise<Record<string, unknown>> {
   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -46,7 +46,7 @@ test('parent-normalized converted image boots through worker runtime with system
   const imported = await privateJson(join(converted, 'import-receipt.json'));
   const converter = await privateJson(join(converted, 'converter-receipt.json'));
   if (imported.pending !== false || typeof imported.fingerprint !== 'string' || !hash.test(imported.fingerprint) ||
-      converter.version !== 1 || converter.removed !== true || converter.pending !== undefined || converter.project !== project ||
+      converter.version !== 1 || converter.removed !== true || converter.pending !== undefined || converter.project !== sourceProject ||
       typeof converter.incarnation !== 'string' || !uuid.test(converter.incarnation) || typeof converter.name !== 'string' ||
       !/^aic-[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(converter.name) ||
       typeof converter.installationId !== 'string' || !uuid.test(converter.installationId) ||
@@ -73,9 +73,14 @@ test('parent-normalized converted image boots through worker runtime with system
   const dataDir = await mkdtemp(join(tmpdir(), 'agentor-converted-boot-')), id = randomUUID(), userId = 'converted-boot-' + randomUUID();
   const config = { ...loadConfig(), dataDir, containerPrefix: 'converted-boot', incusEnabled: true,
     incusEndpoint: 'https://127.0.0.1:18443', incusProject: project, incusNetwork: network, incusStoragePool: 'default',
-    incusInternalGatewayUrl: gateway, incusClientCertPath: join(credentials, 'client.crt'),
-    incusClientKeyPath: join(credentials, 'client.key'), incusServerCertPath: '/workspace/agentor-incus-tls/server.crt' };
+    incusInternalGatewayUrl: gateway, incusClientCertPath: '/workspace/agentor-incus-tls/client.crt',
+    incusClientKeyPath: '/workspace/agentor-incus-tls/client.key', incusServerCertPath: '/workspace/agentor-incus-tls/server.crt' };
   const client = IncusClient.fromConfig(config), runtime = new IncusWorkerRuntime(config, client);
+  // Fixture-only operator copies this exact acknowledged image into the
+  // existing inherited cache. Short production project names avoid Linux's
+  // 108-byte virtiofs socket limit; no certificate/project policy is widened.
+  const sourceClient = IncusClient.fromConfig({ ...config, incusProject: sourceProject,
+    incusClientCertPath: join(credentials, 'client.crt'), incusClientKeyPath: join(credentials, 'client.key') });
   const installation = await backupInstallationId(dataDir), storage = new IncusWorkerStorage(client, config, installation);
   const owner = { id, userId, containerName: config.containerPrefix + '-' + id };
   const probe = 'converted-' + id;
@@ -123,12 +128,15 @@ test('parent-normalized converted image boots through worker runtime with system
     }
   };
   try {
-    const scoped = await client.request<IncusProject>('GET', '/1.0/projects/' + project);
+    const scoped = await sourceClient.request<IncusProject>('GET', '/1.0/projects/' + sourceProject);
     expect(scoped.config).toMatchObject({ restricted: 'true', 'features.images': 'true', 'user.agentor.image-gate': marker });
+    expect((await client.request<IncusProject>('GET', '/1.0/projects/' + project)).config)
+      .toMatchObject({ restricted: 'true', 'features.images': 'false' });
     const image = await client.getImage(imported.fingerprint);
+    expect(incusImageIdentity(image)).toEqual(incusImageIdentity(await sourceClient.getImage(imported.fingerprint)));
     expect(incusImageIdentity(image)).toMatchObject({ fingerprint: imported.fingerprint, sourceImageId: converter.sourceImageId,
       recipeId: recipe, architecture: 'amd64', bootstrapGeneration: '3', converterVersion: 'v0.4.0' });
-    await absent(() => client.getInstance(converter.name as string));
+    await absent(() => sourceClient.getInstance(converter.name as string));
     await absent(() => client.getInstance(owner.containerName));
     for (const name of [...names, owner.containerName + '-docker']) await absent(() => client.getCustomVolume(config.incusStoragePool, name));
     console.info('Exact converted image boot fixture', { dataDir, id, installation, project, fingerprint: imported.fingerprint, recipe });
@@ -159,6 +167,7 @@ test('parent-normalized converted image boots through worker runtime with system
     const sudo = await commands.execCapture(handle, ['sudo', '-n', 'id', '-u']);
     expect(sudo.exitCode, sudo.stderr.toString()).toBe(0); expect(sudo.stdout.toString().trim()).toBe('0');
     const checked = await client.exec(owner.containerName, ['/bin/bash', '-ec', String.raw`
+trap 'printf "Converted-image guest assertion failed at line %s\n" "$LINENO" >&2' ERR
 test "$(cat /proc/1/comm)" = systemd
 systemctl is-active --quiet incus-agent agentor-worker
 test "$(id -u agent)" = 1000
@@ -171,7 +180,7 @@ mountpoint -q /workspace; mountpoint -q /home/agent/.agent-data
 test ! -e /tls/client.key; test ! -e /tls/client.crt
 ! systemctl is-active --quiet docker
 pgrep -x Xvfb >/dev/null; pgrep -x fluxbox >/dev/null; pgrep -x x11vnc >/dev/null
-curl --fail --silent http://127.0.0.1:8443/ | grep -q code-server
+curl --fail --silent --location http://127.0.0.1:8443/ | grep -q code-server
 curl --fail --silent http://127.0.0.1:6080/agentor.html | grep -q noVNC
 `, 'converted-boot', probe]);
     expect(checked.returnCode, checked.stderr).toBe(0);
@@ -191,7 +200,7 @@ curl --fail --silent http://127.0.0.1:6080/agentor.html | grep -q noVNC
         cleaned = true;
       }
     } finally {
-      client.dispose();
+      client.dispose(); sourceClient.dispose();
       if (!attempted || cleaned) await rm(dataDir, { recursive: true, force: true });
       else console.error('Retained exact converted boot fixture for root diagnosis', { dataDir, owner, incarnation, settled, completed });
     }
