@@ -164,7 +164,7 @@ def verify_package_key(shown):
 
 
 def install_packages(opt_in_lts, work):
-    required = ["ca-certificates", "curl", "gnupg", "openssl", "python3", "qemu-system-x86", "qemu-utils", "virtiofsd", "iptables", "nftables"]
+    required = ["ca-certificates", "curl", "gnupg", "openssl", "python3", "qemu-system-x86", "qemu-utils", "virtiofsd", "iptables", "nftables", "kmod"]
     missing = []
     for package in required:
         result = subprocess.run(["dpkg-query", "-W", "-f=${db:Status-Abbrev}", package], capture_output=True)
@@ -228,6 +228,23 @@ def resource_setup(config, paths):
     updated = sorted(set(old) | set(paths))
     if updated != sorted(old): incus("project", "set", project, "restricted.devices.disk.paths=" + ",".join(updated))
     return interface
+
+
+def bridge_netfilter(installation):
+    require(UUID.fullmatch(installation), "Bridge-netfilter installation identity is invalid")
+    command("modprobe", "br_netfilter")
+    require(Path("/sys/module/br_netfilter").is_dir(), "br_netfilter is unavailable; install matching host kernel modules before enabling NIC filtering")
+    prefix = "agentor-incus-" + installation.replace("-", "")[:8]
+    header = "# Agentor installation " + installation + "\n"
+    write_file(Path("/etc/modules-load.d") / ("90-" + prefix + ".conf"), header + "br_netfilter\n", 0o644)
+    sysctl = Path("/etc/sysctl.d") / ("90-" + prefix + ".conf")
+    body = header + "net.ipv4.ip_forward=1\nnet.bridge.bridge-nf-call-iptables=1\nnet.bridge.bridge-nf-call-ip6tables=1\n"
+    if sysctl.exists():
+        require(sysctl.read_text() in (header + "net.ipv4.ip_forward=1\n", body), "Existing sysctl file has unrelated configuration; preserve and reconcile it manually")
+    write_file(sysctl, body, 0o644, True)
+    for protocol in ("iptables", "ip6tables"):
+        command("sysctl", "-w", "net.bridge.bridge-nf-call-" + protocol + "=1")
+        require(Path("/proc/sys/net/bridge/bridge-nf-call-" + protocol).read_text().strip() == "1", "Required bridge netfilter sysctl is unavailable")
 
 
 def certificates(config, directory, gateway):
@@ -330,7 +347,6 @@ def install_units(config, directory, library):
         path = Path("/etc/systemd/system") / name
         if path.exists(): require(path.read_text().startswith(header), "Existing systemd unit is foreign; preserve it")
         write_file(path, body, 0o644, True)
-    write_file(Path("/etc/sysctl.d") / ("90-" + prefix + ".conf"), header + "net.ipv4.ip_forward=1\n", 0o644)
     command("systemctl", "daemon-reload"); command("systemctl", "enable", "--now", prefix + "-policy.service", prefix + "-routing.timer")
     command("systemctl", "restart", prefix + "-policy.service")
 
@@ -372,6 +388,7 @@ def main():
     if (directory / "config.json").exists():
         prior = json.loads((directory / "config.json").read_text()); require(all(prior.get(key) == value for key, value in config.items()), "Installed operator configuration differs; preserve and reconcile manually")
     install_packages(args.install_lts, directory)
+    bridge_netfilter(installation)
     paths = initial_share_paths(data, installation)
     interface = resource_setup(config, paths); certificates(config, directory, gateway)
     write_file(directory / "config.json", json.dumps(config, sort_keys=True) + "\n")

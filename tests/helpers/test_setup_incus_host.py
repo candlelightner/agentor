@@ -138,6 +138,32 @@ class InstallerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "foreign"): SETUP.resource_setup(self.config(), [])
             commands.assert_not_called(); self.assertEqual(record["config"][SETUP.MARKER], "foreign")
 
+    def test_bridge_netfilter_loads_and_persists_only_its_owned_module_and_sysctls(self):
+        writes = []; commands = []
+        header = "# Agentor installation " + INSTALLATION + "\n"
+        with patch.object(SETUP, "command", side_effect=lambda *args: commands.append(args)), \
+             patch.object(SETUP, "write_file", side_effect=lambda *args: writes.append(args)), \
+             patch.object(Path, "is_dir", return_value=True), patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "read_text", new=lambda path: header + "net.ipv4.ip_forward=1\n" if str(path).startswith("/etc/sysctl.d/") else "1\n"):
+            SETUP.bridge_netfilter(INSTALLATION)
+        self.assertEqual(commands, [("modprobe", "br_netfilter"), ("sysctl", "-w", "net.bridge.bridge-nf-call-iptables=1"),
+                                    ("sysctl", "-w", "net.bridge.bridge-nf-call-ip6tables=1")])
+        self.assertEqual(str(writes[0][0]), "/etc/modules-load.d/90-agentor-incus-12345678.conf")
+        self.assertEqual(writes[0][1], header + "br_netfilter\n")
+        self.assertEqual(str(writes[1][0]), "/etc/sysctl.d/90-agentor-incus-12345678.conf")
+        self.assertEqual(writes[1][1], header + "net.ipv4.ip_forward=1\nnet.bridge.bridge-nf-call-iptables=1\nnet.bridge.bridge-nf-call-ip6tables=1\n")
+
+    def test_unavailable_module_or_unrelated_sysctl_configuration_fails_closed(self):
+        with patch.object(SETUP, "command"), patch.object(SETUP, "write_file") as writes, patch.object(Path, "is_dir", return_value=False):
+            with self.assertRaisesRegex(ValueError, "unavailable"): SETUP.bridge_netfilter(INSTALLATION)
+            writes.assert_not_called()
+        with patch.object(SETUP, "command") as commands, patch.object(SETUP, "write_file") as writes, \
+             patch.object(Path, "is_dir", return_value=True), patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "read_text", return_value="unrelated administrator settings\n"):
+            with self.assertRaisesRegex(ValueError, "unrelated configuration"): SETUP.bridge_netfilter(INSTALLATION)
+            self.assertEqual(writes.call_count, 1); self.assertTrue(str(writes.call_args.args[0]).startswith("/etc/modules-load.d/"))
+            commands.assert_called_once_with("modprobe", "br_netfilter")
+
     def test_route_rules_are_directional_and_source_identity_is_port_specific(self):
         rules = SETUP.route_rules("workers", "br-control", "172.25.0.0/24", "10.25.0.0/24", "172.25.0.2", "eth0", "owned")
         self.assertEqual(len(rules), 6)

@@ -58,6 +58,18 @@ class CheckerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 CHECKER.restricted_certificate(record, "agentor-private")
 
+    def test_bridge_netfilter_readiness_is_read_only_and_rejects_missing_or_disabled_prerequisites(self):
+        with patch.object(Path, "is_dir", return_value=False), patch.object(CHECKER, "command") as commands:
+            with self.assertRaisesRegex(ValueError, "not loaded"): CHECKER.bridge_netfilter()
+            commands.assert_not_called()
+        for disabled in ("iptables", "ip6tables", None):
+            with patch.object(Path, "is_dir", return_value=True), patch.object(CHECKER, "command") as commands, \
+                 patch.object(Path, "read_text", new=lambda path: "0\n" if str(path).endswith("-" + str(disabled)) else "1\n"):
+                if disabled:
+                    with self.assertRaisesRegex(ValueError, "disabled"): CHECKER.bridge_netfilter()
+                else: CHECKER.bridge_netfilter()
+                commands.assert_not_called()
+
     def test_private_keys_are_owned_regular_files_without_group_access(self):
         with tempfile.TemporaryDirectory() as directory:
             key = Path(directory) / "client.key"; key.write_text("PRIVATE-SENTINEL"); key.chmod(0o600)
@@ -153,7 +165,8 @@ class CheckerTests(unittest.TestCase):
             original_read = Path.read_text; original_stat = CHECKER.os.stat; original_access = CHECKER.os.access
             stdout = io.StringIO()
             with patch.object(sys, "argv", argv), patch.dict(CHECKER.os.environ, {}, clear=True), \
-                 patch.object(Path, "read_text", lambda path, *a, **kw: 'ID=ubuntu\nVERSION_ID="24.04"\n' if str(path) == "/etc/os-release" else original_read(path, *a, **kw)), \
+                 patch.object(Path, "read_text", lambda path, *a, **kw: 'ID=ubuntu\nVERSION_ID="24.04"\n' if str(path) == "/etc/os-release" else "1\n" if str(path).startswith("/proc/sys/net/bridge/") else original_read(path, *a, **kw)), \
+                 patch.object(Path, "is_dir", return_value=True), \
                  patch.object(CHECKER.os, "stat", lambda path, *a, **kw: types.SimpleNamespace(st_mode=stat.S_IFCHR) if str(path) == "/dev/kvm" else original_stat(path, *a, **kw)), \
                  patch.object(CHECKER.os, "access", lambda path, mode: True if str(path) == "/dev/kvm" else original_access(path, mode)), \
                  patch.object(CHECKER.shutil, "which", return_value="virtiofsd"), patch.object(CHECKER, "command", return_value="virtiofsd 1.13.0"), \

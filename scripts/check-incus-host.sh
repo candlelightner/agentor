@@ -75,6 +75,12 @@ def supported(version):
             "Use signed Incus 6.0 LTS >=6.0.6 or >=6.10; early rolling releases lack required share fixes")
 
 
+def bridge_netfilter():
+    require(Path("/sys/module/br_netfilter").is_dir(), "br_netfilter is not loaded")
+    for protocol in ("iptables", "ip6tables"):
+        require(Path("/proc/sys/net/bridge/bridge-nf-call-" + protocol).read_text().strip() == "1", "Required bridge netfilter sysctl is disabled")
+
+
 def project_policy(project, name, network, account_paths=()):
     require(project.get("name") == name and name != "default", "Dedicated nondefault project required")
     config = project.get("config", {})
@@ -180,6 +186,7 @@ def main():
         require(virtiofs, "Install compatible Rust virtiofsd")
         require(re.match(r"^virtiofsd \d+\.\d+", command(virtiofs, "--version")), "Compatible Rust virtiofsd required")
     check("Ubuntu/KVM/QEMU/virtiofs", host, "Use supported Ubuntu 24.04 with accessible KVM, QEMU and compatible Rust virtiofsd; run as the host operator.")
+    check("bridge-netfilter NIC filtering prerequisites", bridge_netfilter, "Run the operator setup to load/persist br_netfilter and enable IPv4/IPv6 bridge filtering; missing kernel modules require a compatible host kernel. NIC filtering must not be disabled.")
 
     def configuration():
         global CONNECT_ADDRESS
