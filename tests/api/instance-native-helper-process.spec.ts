@@ -59,16 +59,22 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
     : process.env.INCUS_NEW_PUBLIC_TEST === 'true'
       ? 'real authenticated encrypted worker backup restores fresh Incus worker storage and selected native Docker data'
       : process.env.INCUS_CUSTOM_IMAGE_PUBLIC_TEST === 'true'
-        ? 'real controlled catalog OCI creates and rebuilds ordinary Incus worker with private derived image cache reuse'
+        ? process.env.INCUS_CUSTOM_IMAGE_BACKUP_TEST === 'true'
+          ? 'real authenticated encrypted custom worker backup restores fresh Incus worker from private cache'
+          : 'real controlled catalog OCI creates and rebuilds ordinary Incus worker with private derived image cache reuse'
     : 'real public instance restore imports an encrypted native bundle and restores ordinary VM Docker data through authenticated REST'
   : 'real controlled helper process restores retained native data and restarts only its exact recovery target', async () => {
   const originalPublic = mode === 'app-rest-ordinary' && process.env.INCUS_ORIGINAL_PUBLIC_TEST === 'true';
   const newPublic = mode === 'app-rest-ordinary' && process.env.INCUS_NEW_PUBLIC_TEST === 'true';
   const customPublic = mode === 'app-rest-ordinary' && process.env.INCUS_CUSTOM_IMAGE_PUBLIC_TEST === 'true';
+  const customBackup = customPublic && process.env.INCUS_CUSTOM_IMAGE_BACKUP_TEST === 'true';
   if ([originalPublic, newPublic, customPublic].filter(Boolean).length > 1) throw new Error('Choose exactly one public worker gate');
   const rest = mode === 'app-rest-ordinary' && !originalPublic && !newPublic && !customPublic, app = mode.startsWith('app-'), ordinary = originalPublic || newPublic || rest || mode === 'app-ordinary' || mode !== 'retained' && !app,
     rollback = mode === 'rollback' || mode === 'app-rollback';
   test.skip(process.env.INCUS_INSTANCE_HELPER_PROCESS_TEST !== 'true', 'Explicit serial approved disposable helper-process gate');
+  const retryArtifactId = process.env.INCUS_CUSTOM_IMAGE_BACKUP_RETRY_ARTIFACT_ID;
+  if (retryArtifactId && (!customBackup || retryArtifactId !== 'eab8a1c9-20f1-44dc-8d68-a9985fe6c8dc'))
+    throw new Error('Same-artifact retry requires the exact accepted custom encrypted artifact');
   test.setTimeout(customPublic ? 5_400_000 : 900_000);
   let custom: { version: 1; project: string; projectMarker: string; credentialsDir: string; tlsRoot: string;
     seedFingerprint: string; converterStoragePool: string; workerImage: string; workerImageId: string;
@@ -119,12 +125,14 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
         customRetained.workerId !== 'd958a3cd-4630-49ae-9a57-899dc01e5980' || customRetained.definitionId !== '2a7df365-2c7d-407b-9bab-96191906804f' ||
         customRetained.sourceImageId !== 'sha256:f0bfcd056c7d27ead09025f91e53678fc6172dabfd130f216a7dedd7d572e2fc' ||
         customRetained.fingerprint !== '30e74cf8f70888092ff94e6386c7f0a7d675ba464425882b0d151325c28326f2' ||
-        customRetained.app.Id !== '38271e5ea1ec10805ccb5bf14935a555f1e695ac66d1e0b12e283d26867f29de' ||
-        customRetained.instance.config['volatile.uuid'] !== '2486a933-3268-4caa-9614-c11dd1cb4b44' ||
+        customRetained.app.Id !== (retryArtifactId ? '08adb9546de808c17b2389ccd129435c8f2460560c07b0ee1d5a9b47ac49839e' : '38271e5ea1ec10805ccb5bf14935a555f1e695ac66d1e0b12e283d26867f29de') ||
+        retryArtifactId && customRetained.app.Image !== 'sha256:43640a77dfb2c8c2d63d74cfefee487210f86978e3735e2f52cb0e02c0753c54' ||
+        customRetained.instance.config['volatile.uuid'] !== (customBackup ? '8ad56682-4fb6-420d-8e85-b0d3be659f46' : '2486a933-3268-4caa-9614-c11dd1cb4b44') ||
         !/^a9defe44-[a-f0-9-]{27}$/.test(customRetained.sourceBuildId) || !/^432c08ba-[a-f0-9-]{27}$/.test(customRetained.nativeBuildId) ||
         !/^sha256:[a-f0-9]{64}$/.test(customRetained.app.Image) || customRetained.volumes.length !== 2 || custom?.project !== 'agimg10b')
       throw new Error('Retained custom proof does not identify the explicitly approved source fixture');
   }
+  if (customBackup && !customRetained) throw new Error('Custom backup gate requires the accepted retained source proof');
   let retained: { version: 1; fixtureId: string; workerId: string; ownerId: string; volume: StoredManagedVolume;
     localDir: string; remoteDir: string; parentId: string; parentImageId: string; restoreJobId: string;
     failedCaptureJobId: string; incarnation: string; installation: string; source: WorkerBackupRuntimeSource;
@@ -167,15 +175,15 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
       if (retained) expect(dockerSourceDigest).toBe(retained.dockerArchive.sha256);
     } finally { await file.close(); }
   }
-  const local = customRetained?.localDir ?? await mkdtemp(join(tmpdir(), 'agentor-native-helper-process-'));
+  const local = customRetained && !customBackup ? customRetained.localDir : await mkdtemp(join(tmpdir(), 'agentor-native-helper-process-'));
   const followupNonce = randomUUID();
-  const source = join(retained?.localDir ?? local, 'source'), targetData = join(local, 'data'), build = join(local, 'image');
+  const source = join(customRetained?.localDir ?? retained?.localDir ?? local, 'source'), targetData = join(local, 'data'), build = join(local, 'image');
   const id = retained?.workerId ?? randomUUID(), volumeId = retained?.volume.id ?? randomUUID(), jobId = customRetained?.jobId ?? retained?.fixtureId ?? randomUUID();
   let restoreJobId: string = retained?.restoreJobId ?? jobId;
   let userId = retained?.ownerId ?? (ordinary ? 'ordinary-' : 'retained-') + randomUUID();
   const appPort = 39000 + Number.parseInt(jobId.slice(0, 4), 16) % 1000;
-  const remote = customRetained?.remoteDir ?? (retained ? '/var/tmp/agentor-native-producer.' + followupNonce : '/var/tmp/agentor-native-helper-process.' + jobId);
-  const image = 'agentor-native-helper-process:' + (retained ? followupNonce : jobId), targetName = 'native-recovery-' + (retained ? followupNonce : jobId),
+  const remote = customBackup ? '/var/tmp/agentor-native-custom-backup.' + followupNonce : customRetained?.remoteDir ?? (retained ? '/var/tmp/agentor-native-producer.' + followupNonce : '/var/tmp/agentor-native-helper-process.' + jobId);
+  const image = 'agentor-native-helper-process:' + (retained || customBackup ? followupNonce : jobId), targetName = 'native-recovery-' + (retained || customBackup ? followupNonce : jobId),
     helperName = 'agentor-instance-restore-' + jobId;
   const legacyName = 'agentor-native-rollback-' + jobId;
   const stamp = new Date().toISOString();
@@ -189,7 +197,7 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
   let worker: WorkerRecord | undefined, options: IncusWorkerOptions | undefined;
   let stagingOwner = 'recovery-admin', restoredOwner = 'restored-admin';
   let originalInstallation: string | undefined;
-  const sourceTable = 'agentor_restore_' + (retained ? followupNonce : jobId).slice(0, 8);
+  const sourceTable = 'agentor_restore_' + (retained || customBackup ? followupNonce : jobId).slice(0, 8);
   let sourceRuleBaseline: string | undefined;
   const sourceRuleSnapshot = (value: string) => JSON.stringify(JSON.parse(value), (key, value) =>
     key === 'metainfo' ? undefined : key === 'counter' ? {} : value);
@@ -203,7 +211,7 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
     incusServerCertPath: custom ? join(custom.credentialsDir, 'server.crt') : '/workspace/agentor-incus-tls/server.crt',
     incusDockerVolumeSize: '1GiB', incusInternalGatewayUrl: 'http://10.159.68.1:' + (app ? appPort : 38000) };
   const runtime = new IncusWorkerRuntime(config), managedRuntime = new IncusManagedVolumeRuntime(config, runtime);
-  const remoteData = (retained?.remoteDir ?? remote) + '/data';
+  const remoteData = (customRetained?.remoteDir ?? retained?.remoteDir ?? remote) + '/data';
   const tlsRoot = custom?.tlsRoot ?? '/var/tmp/agentor-phase6-production.SSkg3hQz/tls';
   const mounts = ['client.crt', 'client.key', 'server.crt'].map(file =>
     `--mount type=bind,src=${tlsRoot}/${file},dst=/tls/${file},readonly`);
@@ -250,7 +258,7 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
     }
     expect((await runtime.client.request<{ driver: string }>('GET', '/1.0/storage-pools/' + config.incusStoragePool)).driver).toBe('dir');
     await root(`test ! -e ${quote(remote)} && mkdir -m 700 ${quote(remote)}`);
-    await run('scp', [...scp, '-r', targetData, build, 'kata-test@172.19.0.1:' + remote + '/'], { timeout: 60_000 });
+    await run('scp', [...scp, '-r', ...(customBackup ? [build] : [targetData, build]), 'kata-test@172.19.0.1:' + remote + '/'], { timeout: 60_000 });
     imageId = await root(`sudo docker build -q --label agentor.native-helper-fixture=${jobId} --build-arg REMOVE_VOLUME_HELPER_SLEEP=${rollback} ` +
       (custom?.appBaseImage ? '--build-arg BASE_IMAGE=' + quote(custom.appBaseImage) + ' ' : '') +
       `-t ${quote(image)} ${quote(remote + '/image')}`, 120_000);
@@ -395,12 +403,42 @@ print('Exact account fixture delta confirmed')
       expect(customRetained.binding.identity.fingerprint).toBe(customRetained.fingerprint);
       expect(await root(`sudo docker image inspect ${quote(customRetained.sourceImageId)} --format '{{.Id}} {{index .Config.Labels "agentor.image-definition"}} {{index .Config.Labels "agentor.image-owner-hash"}}'`))
         .toBe(`${customRetained.sourceImageId} ${customRetained.definitionId} ${createHash('sha256').update(userId).digest('hex')}`);
-      expect(customRetained.nft.table).toBe(sourceTable);
-      sourceRuleBaseline = sourceRuleSnapshot(typeof customRetained.nft.json === 'string' ? customRetained.nft.json : JSON.stringify(customRetained.nft.json));
-      expect(sourceRuleSnapshot(await root(`sudo nft -j list table ip ${sourceTable}`))).toBe(sourceRuleBaseline);
+      expect(customRetained.nft.table).toBe(retryArtifactId ? 'agentor_restore_76e0284c' : 'agentor_restore_' + jobId.slice(0, 8));
+      const oldRule = sourceRuleSnapshot(typeof customRetained.nft.json === 'string' ? customRetained.nft.json : JSON.stringify(customRetained.nft.json));
+      expect(sourceRuleSnapshot(await root(`sudo nft -j list table ip ${customRetained.nft.table}`))).toBe(oldRule);
+      if (!customBackup) sourceRuleBaseline = oldRule;
       const listed = await appRequest<Array<{ id: string; userId: string; runtimeKind: string }>>('/api/containers');
       expect(listed.status).toBe(200); expect(listed.body).toHaveLength(1);
       expect(listed.body[0]).toMatchObject({ id: customRetained.workerId, userId, runtimeKind: 'incus-vm' });
+    }
+    if (customBackup && customRetained) {
+      const boot = await runtime.client.exec(customRetained.instance.name, ['cat', '/proc/sys/kernel/random/boot_id']);
+      expect(boot.returnCode, boot.stderr).toBe(0);
+      await mkdir(build); await prepareImage(); // Fresh image/context only; never upload SAME DATA.
+      expect(await root(`sudo docker inspect ${customRetained.app.Id} --format '{{.Id}} {{.Image}} {{index .Config.Labels "agentor.native-helper-fixture"}} {{.State.Running}}'`))
+        .toBe(`${customRetained.app.Id} ${customRetained.app.Image} ${jobId} true`);
+      expect(await runtime.client.getInstance(customRetained.instance.name)).toEqual(customRetained.instance);
+      expect(await Promise.all(customRetained.volumes.map(v => runtime.client.getCustomVolume(config.incusStoragePool, v.name)))).toEqual(customRetained.volumes);
+      computeSettled = false;
+      await root(`sudo docker stop --time 30 ${customRetained.app.Id}`, 60_000);
+      expect(await root(`sudo docker inspect ${customRetained.app.Id} --format '{{.Id}} {{.Image}} {{.State.Running}}'`))
+        .toBe(`${customRetained.app.Id} ${customRetained.app.Image} false`);
+      await launchTarget();
+      await expect.poll(async () => {
+        try { return (await appRequest('/api/health', undefined, false)).status; } catch { return 0; }
+      }, { timeout: 60_000 }).toBe(200);
+      const app = JSON.parse(await root(`sudo docker inspect ${targetId} --format '{{json .}}'`)) as {
+        Id: string; Image: string; Config: { Labels: Record<string, string> }; Mounts: Array<{ Source: string; Destination: string; RW: boolean }> };
+      expect(app.Id).toBe(targetId); expect(app.Image).toBe(imageId); expect(app.Config.Labels['agentor.native-helper-fixture']).toBe(jobId);
+      expect(app.Mounts.some(m => m.Source === remoteData && m.Destination === remoteData && m.RW)).toBe(true);
+      expect(app.Mounts.some(m => m.Source.startsWith('/var/lib/incus') || m.Destination.startsWith('/var/lib/incus'))).toBe(false);
+      for (const file of ['client.crt', 'client.key', 'server.crt'])
+        expect(app.Mounts.some(m => m.Source === tlsRoot + '/' + file && m.Destination === '/tls/' + file && !m.RW)).toBe(true);
+      expect(await runtime.client.getInstance(customRetained.instance.name)).toEqual(customRetained.instance);
+      const sameBoot = await runtime.client.exec(customRetained.instance.name, ['cat', '/proc/sys/kernel/random/boot_id']);
+      expect(sameBoot.returnCode, sameBoot.stderr).toBe(0); expect(sameBoot.stdout).toBe(boot.stdout);
+      expect(sourceRuleSnapshot(await root(`sudo nft -j list table ip ${customRetained.nft.table}`)))
+        .toBe(sourceRuleSnapshot(typeof customRetained.nft.json === 'string' ? customRetained.nft.json : JSON.stringify(customRetained.nft.json)));
     }
     const project = await runtime.client.request<{ config: Record<string, string> }>('GET', '/1.0/projects/' + config.incusProject);
     expect(project.config).toMatchObject({ restricted: 'true', 'features.images': 'true', 'user.agentor.custom-image-fixture': custom.projectMarker });
@@ -490,14 +528,14 @@ print('Exact account fixture delta confirmed')
     for (const [index, volume] of volumes.entries()) expect(volume).toMatchObject({ project: custom.project, type: 'custom', content_type: 'filesystem',
       created_at: expect.any(String), config: { 'user.agentor.installation': installation, 'user.agentor.owner': userId, 'user.agentor.id': owner.id,
         'user.agentor.storage-role': index ? 'agents' : 'workspace' } });
-    const assertGuest = async (uuid: string) => {
-      const current = await runtime.client.getInstance(owner.containerName);
+    const assertGuest = async (uuid: string, examined = owner) => {
+      const current = await runtime.client.getInstance(examined.containerName);
       expect(current.config['volatile.uuid']).toBe(uuid); expect(current.config['volatile.base_image']).toBe(binding.identity.fingerprint);
-      expect(await runtime.matchesWorkerIdentity(current, owner.id, userId)).toBe(true); expect(current.profiles).toEqual([]);
+      expect(await runtime.matchesWorkerIdentity(current, examined.id, userId)).toBe(true); expect(current.profiles).toEqual([]);
       expect(current.devices.eth0).toMatchObject({ network: custom!.network, 'security.mac_filtering': 'true',
         'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' });
       for (const device of Object.values(current.devices)) expect(JSON.stringify(device)).not.toContain(custom!.tlsRoot);
-      const proof = await runtime.client.exec(owner.containerName, ['bash', '-ec',
+      const proof = await runtime.client.exec(examined.containerName, ['bash', '-ec',
         'test "$(cat /opt/agentor-custom-proof)" = "$1"; test "$(cat /proc/1/comm)" = systemd; ' +
         'systemctl is-active --quiet incus-agent agentor-worker; ! systemctl is-active --quiet docker; ' +
         'test ! -e /tls/client.key; test ! -e /tls/client.crt; . /run/agentor/worker.env; ' +
@@ -505,12 +543,122 @@ print('Exact account fixture delta confirmed')
         'test "$(runuser -u agent -- tmux show-environment -g CUSTOM_PUBLIC_RUNTIME_PROBE)" = "CUSTOM_PUBLIC_RUNTIME_PROBE=$1"; ' +
         'curl -fsS http://127.0.0.1:8443/ >/dev/null; curl -fsS http://127.0.0.1:6080/ >/dev/null', 'bash', marker]);
       expect(proof.returnCode, proof.stderr).toBe(0);
-      const editor = await appRequest<string>('/editor/' + owner.id + '/?folder=/workspace'); expect(editor.status).toBe(200); expect(editor.body).toContain('code-server');
-      const desktop = await appRequest<string>('/desktop/' + owner.id + '/agentor.html'); expect(desktop.status).toBe(200); expect(desktop.body).toContain('noVNC');
-      const self = await runtime.client.exec(owner.containerName, ['curl', '--noproxy', '*', '-fsS', config.incusInternalGatewayUrl + '/api/worker-self/info']);
-      expect(self.returnCode, self.stderr).toBe(0); expect(JSON.parse(self.stdout)).toMatchObject({ workerId: owner.id, userId });
+      const editor = await appRequest<string>('/editor/' + examined.id + '/?folder=/workspace'); expect(editor.status).toBe(200); expect(editor.body).toContain('code-server');
+      const desktop = await appRequest<string>('/desktop/' + examined.id + '/agentor.html'); expect(desktop.status).toBe(200); expect(desktop.body).toContain('noVNC');
+      const self = await runtime.client.exec(examined.containerName, ['curl', '--noproxy', '*', '-fsS', config.incusInternalGatewayUrl + '/api/worker-self/info']);
+      expect(self.returnCode, self.stderr).toBe(0); expect(JSON.parse(self.stdout)).toMatchObject({ workerId: examined.id, userId });
     };
     await assertGuest(firstUuid);
+    if (customBackup && customRetained) {
+      // Reuse the public encrypted worker-backup/new-restore flow, not instance
+      // restore setup or a fabricated portable/native authority record.
+      const markers = ['python3', '-c', String.raw`
+import os,sys,stat,json,base64
+out=[]
+for p in sys.argv[1:]:
+ s=os.stat(p);out.append(dict(data=base64.b64encode(open(p,'rb').read()).decode(),uid=s.st_uid,gid=s.st_gid,
+ mode=stat.S_IMODE(s.st_mode),mtime=str(s.st_mtime_ns)))
+print(json.dumps(out))
+`, '/workspace/custom-cache-proof', '/home/agent/.agent-data/custom-cache-proof'];
+      const original = await runtime.client.exec(owner.containerName, markers); expect(original.returnCode, original.stderr).toBe(0);
+      const originalMarkers = JSON.parse(original.stdout) as Array<{ data: string; uid: number; gid: number; mode: number; mtime: string }>;
+      expect(originalMarkers.map(value => value.data)).toEqual([Buffer.from(marker).toString('base64'), Buffer.from(marker).toString('base64')]);
+      computeSettled = false;
+      expect((await appRequest('/api/containers/' + owner.id + '/stop', {}, true, 360_000)).status).toBe(200);
+      const sourceBefore = await runtime.client.getInstance(owner.containerName); expect(sourceBefore.status).toBe('Stopped');
+      expect(sourceBefore.config['volatile.uuid']).toBe(firstUuid);
+      const sourceVolumes = await Promise.all(volumeNames.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)));
+      expect(sourceVolumes).toEqual(volumes);
+      let captured: BackupJob | undefined;
+      if (retryArtifactId) {
+        const capture = await appRequest<BackupJob>('/api/backup-jobs/1b996c89-518e-4a35-a135-2492c73a7843');
+        expect(capture.status).toBe(200); captured = capture.body;
+        expect(captured).toMatchObject({ id: '1b996c89-518e-4a35-a135-2492c73a7843', userId, status: 'succeeded',
+          artifactId: retryArtifactId, workspaceIds: [owner.id], encrypted: true, integrityVerified: true });
+      } else {
+      const capture = await appRequest<BackupJob>('/api/backups', { workspaceIds: [owner.id], providerId: 'local', includeManagedVolumes: false });
+      expect(capture.status).toBe(202);
+      await expect.poll(async () => {
+        const state = await appRequest<BackupJob>('/api/backup-jobs/' + capture.body.id); expect(state.status).toBe(200); captured = state.body;
+        if (state.body.status === 'failed') throw new Error('Custom worker encrypted backup failed: ' + (state.body.errorCode ?? 'unknown'));
+        return state.body.status;
+      }, { timeout: 360_000, intervals: [1000] }).toBe('succeeded');
+      }
+      if (!captured?.artifactId) throw new Error('Custom encrypted artifact acknowledgement is missing');
+      expect(captured).toMatchObject({ encrypted: true, integrityVerified: true });
+      const artifact = await appRequest<BackupArtifact>('/api/backups/' + captured.artifactId);
+      expect(artifact.status).toBe(200); expect(artifact.body).toMatchObject({ userId, provider: 'local', formatVersion: 2,
+        workspaceIds: [owner.id], integrityStatus: 'verified' });
+      if (retryArtifactId) {
+        expect(artifact.body).toMatchObject({ id: retryArtifactId, size: 242078, sourceWorkerId: owner.id, sourceInstallationId: installation });
+        expect(artifact.body.sha256).toMatch(/^[a-f0-9]{64}$/); expect(artifact.body.keyFingerprint).toMatch(/^sha256:[a-f0-9]{64}$/);
+      }
+      expect(artifact.body.reconstruction?.find(item => item.workspaceId === owner.id)?.image)
+        .toMatchObject({ kind: 'custom', definitionId: definition.body.id, version: built.version, digest: built.digest });
+      expect(artifact.body.providerObjectId).toMatch(/^[a-f0-9-]{36}$/);
+      const objectPath = remoteData + '/backup-objects/' + userId + '/' + artifact.body.providerObjectId + '.backup';
+      const envelope = JSON.parse(await root(`sudo docker exec ${targetId} node --input-type=module -e ${quote(
+        `import fs from'node:fs';const p=${JSON.stringify(objectPath)};const s=fs.lstatSync(p);if(!s.isFile()||s.isSymbolicLink()||s.size!==${artifact.body.size})throw Error('Encrypted custom object differs');` +
+        `const fd=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);const b=Buffer.alloc(16400);const n=fs.readSync(fd,b,0,b.length,0);fs.closeSync(fd);` +
+        `const magic=Buffer.from('AGENTOR-BACKUP-2'+String.fromCharCode(10));if(!b.subarray(0,magic.length).equals(magic))throw Error('Custom object is not encrypted v2');` +
+        `const e=b.indexOf(10,magic.length);if(e<0||e>=n)throw Error('Custom envelope invalid');console.log(b.subarray(magic.length,e).toString());`)}`));
+      expect(envelope).toMatchObject({ version: 2, algorithm: 'aes-256-gcm', keyFingerprint: artifact.body.keyFingerprint,
+        metadata: { workspaceIds: [owner.id], formatVersion: 2 } });
+      expect(await runtime.client.getInstance(owner.containerName)).toEqual(sourceBefore);
+      expect(await Promise.all(volumeNames.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)))).toEqual(sourceVolumes);
+      const restored = await appRequest<{ jobId: string }>('/api/backups/' + artifact.body.id + '/restore',
+        { target: 'new', workspaceIds: [owner.id], displayName: 'Custom encrypted restore ' + followupNonce, requestId: followupNonce + '-new' });
+      expect(restored.status).toBe(202); let result: BackupJob | undefined;
+      await expect.poll(async () => {
+        const state = await appRequest<BackupJob>('/api/backup-jobs/' + restored.body.jobId); expect(state.status).toBe(200); result = state.body;
+        if (state.body.status === 'failed') throw new Error('Custom public new restore failed: ' + (state.body.errorCode ?? 'unknown'));
+        return state.body.status;
+      }, { timeout: 360_000, intervals: [1000] }).toBe('succeeded');
+      expect(result).toMatchObject({ target: 'new', integrityVerified: true, selectedWorkspaceIds: [owner.id] });
+      expect(result?.restoreMappings).toHaveLength(1); const newId = result!.restoreMappings![0]!.workerId;
+      expect(result!.restoreMappings![0]!.sourceWorkspaceId).toBe(owner.id); expect(newId).not.toBe(owner.id); expect(newId).toMatch(/^[a-f0-9-]{36}$/);
+      const destination = { id: newId, userId, containerName: config.containerPrefix + '-' + newId };
+      const fresh = await runtime.client.getInstance(destination.containerName), freshUuid = fresh.config['volatile.uuid'];
+      if (typeof freshUuid !== 'string' || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(freshUuid))
+        throw new Error('Custom restore destination omitted exact incarnation');
+      expect(freshUuid).not.toBe(firstUuid); expect(fresh.status).toBe('Running'); await assertGuest(freshUuid, destination);
+      const restoredMarkers = await runtime.client.exec(destination.containerName, markers); expect(restoredMarkers.returnCode, restoredMarkers.stderr).toBe(0);
+      expect(JSON.parse(restoredMarkers.stdout)).toEqual(originalMarkers);
+      const destinationNames = ['workspace', 'agents'].map(role => destination.containerName + '-' + role);
+      const destinationVolumes = await Promise.all(destinationNames.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)));
+      for (const [index, nativeVolume] of destinationVolumes.entries()) {
+        expect(volumeNames).not.toContain(nativeVolume.name); expect(Number.isFinite(Date.parse(nativeVolume.created_at ?? ''))).toBe(true);
+        expect(nativeVolume).toMatchObject({ project: custom.project, type: 'custom', content_type: 'filesystem',
+          config: { 'user.agentor.installation': installation, 'user.agentor.owner': userId, 'user.agentor.id': newId,
+            'user.agentor.storage-role': index ? 'agents' : 'workspace' } });
+        expect(nativeVolume.used_by).toEqual(['/1.0/instances/' + destination.containerName + '?project=' + custom.project]);
+      }
+      const records = JSON.parse(await root(`sudo python3 -c ${quote('import json,sys;print(json.dumps(json.load(open(sys.argv[1]))))')} ` +
+        quote(remoteData + '/users/' + userId + '/workers.json'))) as WorkerRecord[];
+      expect(records.find(row => row.id === newId)).toMatchObject({ userId, runtimeKind: 'incus-vm', status: 'active', desiredRuntimeStatus: 'running',
+        imageDefinitionId: definition.body.id, imageVersion: built.version, imageDigest: built.digest });
+      expect(records.find(row => row.id === newId)?.incusRecreation).toBeUndefined();
+      const after = await privateCatalog(); expect(after.nativeBindings).toEqual(state.nativeBindings);
+      expect(after.builds.filter(build => build.nativeDerivation)).toEqual(native);
+      expect(await runtime.client.getInstance(owner.containerName)).toEqual(sourceBefore);
+      expect(await Promise.all(volumeNames.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)))).toEqual(sourceVolumes);
+      const cleanup = await runtime.client.getInstance(destination.containerName);
+      expect(cleanup.config['volatile.uuid']).toBe(freshUuid); expect(cleanup.devices).toEqual(fresh.devices); expect(cleanup.config).toEqual(fresh.config);
+      expect(await runtime.matchesWorkerIdentity(cleanup, newId, userId)).toBe(true);
+      expect(await Promise.all(destinationNames.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)))).toEqual(destinationVolumes);
+      expect((await appRequest('/api/containers/' + newId, {}, true, 360_000, undefined, undefined, 'DELETE')).status).toBe(200);
+      await expect(runtime.client.getInstance(destination.containerName)).rejects.toMatchObject({ statusCode: 404 });
+      for (const name of destinationNames) await expect(runtime.client.getCustomVolume(config.incusStoragePool, name)).rejects.toMatchObject({ statusCode: 404 });
+      expect(await runtime.client.getInstance(owner.containerName)).toEqual(sourceBefore);
+      expect((await appRequest('/api/containers/' + owner.id + '/restart', {}, true, 360_000)).status).toBe(200); await assertGuest(firstUuid);
+      const sourceMarkers = await runtime.client.exec(owner.containerName, markers); expect(sourceMarkers.returnCode, sourceMarkers.stderr).toBe(0);
+      expect(JSON.parse(sourceMarkers.stdout)).toEqual(originalMarkers);
+      expect(await Promise.all(volumeNames.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)))).toEqual(sourceVolumes);
+      computeSettled = true;
+      console.info('Actual custom encrypted backup -> public new passed fresh UUID/core storage/custom OCI, workspace/agent bytes+numeric metadata, services/proxies/self, unchanged stopped source and healthy original restart; only acknowledged destination deleted; source/old+current Apps/catalog/image/artifact retained',
+        { local, remote, sourceData: remoteData, oldApp: customRetained.app.Id, currentApp: targetId, artifactId: artifact.body.id });
+      return;
+    }
     const seeded = await runtime.client.exec(owner.containerName, ['bash', '-ec',
       'printf "%s" "$1" > /workspace/custom-cache-proof; printf "%s" "$1" > /home/agent/.agent-data/custom-cache-proof', 'bash', marker]);
     expect(seeded.returnCode, seeded.stderr).toBe(0);
