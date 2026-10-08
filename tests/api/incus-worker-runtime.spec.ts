@@ -8,7 +8,8 @@ import { IncusWorkerRuntime, serializeIncusWorkerEnv, INCUS_GUEST_READINESS_SCRI
 import { IncusClient } from "../../orchestrator/server/utils/incus-client";
 import { ContainerManager } from "../../orchestrator/server/utils/container";
 import { WorkerStore } from "../../orchestrator/server/utils/worker-store";
-import { cleanupWorkerMappings } from "../../orchestrator/server/utils/services";
+import { cleanupWorkerMappings, useWorkerGroupStore } from "../../orchestrator/server/utils/services";
+import { IncusWorkerImageManager } from '../../orchestrator/server/utils/incus-worker-image-manager';
 import { zeroUserEnvVars } from "../../orchestrator/server/utils/user-env-store";
 import type { Config } from "../../orchestrator/server/utils/config";
 import { withOwnerLifecycleMutation } from "../../orchestrator/server/utils/worker-lifecycle-coordinator";
@@ -91,6 +92,7 @@ function fakeClient() {
       source_architecture: 'amd64', converter_version: 'v0.4.0' } }),
     listImages: record('images', []),
     endpoint: config.incusEndpoint,
+    project: config.incusProject,
     getCustomVolume: async (_pool: string, name: string) => {
       if (!volumes.has(name)) throw Object.assign(new Error("Not found"), { statusCode: 404 });
       return volumes.get(name);
@@ -116,6 +118,119 @@ function fakeClient() {
   };
   return { client, events };
 }
+
+test('custom image resolver pins create, start and recreation without using mutable default aliases', async () => {
+  const fake = fakeClient(), runtime = new IncusWorkerRuntime(config, fake.client as any);
+  const image = incusImageIdentity(await fake.client.getImage('a'.repeat(64)));
+  const opts = { ...options(), image: image.sourceImageId,
+    imageSelection: { definitionId: randomUUID(), version: 'v1', digest: image.sourceImageId } };
+  let calls = 0, revoked = false;
+  runtime.setImageResolver(async (actual, stored, described) => {
+    calls++; expect(actual.imageSelection).toEqual(opts.imageSelection);
+    if (revoked) throw new Error('Current catalog image permission revoked');
+    if (stored) {
+      expect(stored).toEqual(image);
+      expect(described).toEqual({ sourceImageId: image.sourceImageId, recipeId: image.recipeId, architecture: image.architecture,
+        converterVersion: image.converterVersion, bootstrapGeneration: image.bootstrapGeneration });
+    } else expect(described).toBeUndefined();
+    return image;
+  });
+  fake.client.getImageAlias = async () => { throw new Error('Custom image must not use default alias'); };
+  await runtime.create({ ...opts, start: false });
+  expect(fake.events.find(event => event.operation === 'create')!.args[0].source.fingerprint).toBe(image.fingerprint);
+  expect(calls).toBe(1);
+  await runtime.start(opts); expect(calls).toBe(2);
+  expect((await runtime.preflightRecreation(opts)).fingerprint).toBe(image.fingerprint); expect(calls).toBe(3);
+  fake.events.length = 0; revoked = true;
+  await expect(runtime.start(opts)).rejects.toThrow('permission revoked');
+  await expect(runtime.preflightRecreation(opts)).rejects.toThrow('permission revoked');
+  expect(fake.events.some(event => ['start', 'file', 'remove', 'volume-create'].includes(event.operation))).toBe(false);
+});
+
+test('custom source mismatch fails before allocation or replacement and never downgrades to default', async () => {
+  const fake = fakeClient(), runtime = new IncusWorkerRuntime(config, fake.client as any);
+  const image = incusImageIdentity(await fake.client.getImage('a'.repeat(64))), opts = { ...options(), image: image.sourceImageId };
+  runtime.setImageResolver(async () => ({ ...image, sourceImageId: 'sha256:' + 'd'.repeat(64) }));
+  await expect(runtime.create({ ...opts, start: false })).rejects.toThrow('custom image changed');
+  expect(fake.events.some(event => ['create', 'volume-create', 'file'].includes(event.operation))).toBe(false);
+  runtime.setImageResolver(async () => image); await runtime.create({ ...opts, start: false });
+  fake.events.length = 0;
+  runtime.setImageResolver(async () => ({ ...image, recipeId: 'e'.repeat(64) }));
+  await expect(runtime.preflightRecreation(opts)).rejects.toThrow('stored immutable worker source');
+  await expect(runtime.start(opts)).rejects.toThrow('stored immutable worker source');
+  expect(fake.events.some(event => ['remove', 'start', 'file', 'volume-create'].includes(event.operation))).toBe(false);
+  fake.events.length = 0;
+  const restore = { ...opts, start: false, recreationNonce: randomUUID() };
+  runtime.setImageResolver(async () => { throw new Error('Current restore source permission revoked'); });
+  await expect(runtime.createCanonicalRestore(restore)).rejects.toThrow('permission revoked');
+  await expect(runtime.preflightCanonicalRestore(restore)).rejects.toThrow('permission revoked');
+  expect(fake.events.map(event => event.operation)).toEqual(['ready', 'project']);
+  // Read-only readiness is allowed; no default-image lookup or mutation.
+});
+
+test('production image callback rechecks durable tuple, lifecycle nonce and group hierarchy after asynchronous authorization', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agentor-image-wiring-'));
+  const cfg = { ...config, dataDir: root, incusConverterSeedFingerprint: 'd'.repeat(64) };
+  const fake = fakeClient(), runtime = new IncusWorkerRuntime(cfg, fake.client as any);
+  const id = randomUUID(), userId = 'image-wiring-' + randomUUID(), image = incusImageIdentity(await fake.client.getImage('a'.repeat(64)));
+  const selection = { definitionId: randomUUID(), version: 'v1', digest: image.sourceImageId };
+  const opts = { ...options(), id, userId, containerName: cfg.containerPrefix + '-' + id, image: selection.digest, imageSelection: selection };
+  const workers = new WorkerStore(root); await workers.init();
+  const record = { id, userId, runtimeKind: 'incus-vm' as const, status: 'active' as const,
+    imageDefinitionId: selection.definitionId, imageVersion: selection.version, imageDigest: selection.digest,
+    imageRuntimeReference: selection.digest, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString() };
+  await workers.upsert(record);
+  const manager = new ContainerManager({ workerOciImage: () => { throw new Error('Cache fixture must not export'); } } as any, cfg);
+  manager.setWorkerStore(workers); manager.setIncusRuntime(runtime);
+  const groups = useWorkerGroupStore(), oldList = groups.listForUser, oldGet = groups.get;
+  let membership: any[] = [], mutate: (() => Promise<void>) | undefined;
+  groups.listForUser = () => membership; groups.get = (_owner, gid) => membership.find(group => group.id === gid);
+  const ensure = IncusWorkerImageManager.prototype.ensure;
+  IncusWorkerImageManager.prototype.ensure = async (owner, requested, current) => {
+    expect(owner).toBe(userId); expect(requested).toMatchObject({ definitionId: selection.definitionId, version: selection.version });
+    await current(); await mutate?.(); await current();
+    return { identity: image, context: { project: cfg.incusProject } } as any;
+  };
+  const resolve = (runtime as any).imageResolver as Parameters<IncusWorkerRuntime['setImageResolver']>[0];
+  try {
+    expect(await resolve(opts)).toEqual(image);
+    for (const failure of ['image', 'nonce', 'group'] as const) {
+      await workers.upsert(record); membership = [];
+      mutate = async () => {
+        if (failure === 'image') await workers.upsert({ ...record, imageVersion: 'v2' });
+        if (failure === 'nonce') await workers.upsert({ ...record, incusRecreation: { nonce: randomUUID() } });
+        if (failure === 'group') membership = [{ id: randomUUID(), userId, workerIds: [id] }];
+      };
+      await expect(resolve(opts)).rejects.toThrow('authority changed');
+    }
+    mutate = undefined; membership = [];
+    const nonce = randomUUID(), imported = { ...record, incusRecreation: { nonce, initialCreate: true as const, importIncomplete: true as const } };
+    await workers.upsert(imported);
+    const importOptions = { ...opts, recreationNonce: nonce, start: false };
+    await expect(resolve(importOptions)).rejects.toThrow('authority changed');
+    const scoped = new IncusWorkerRuntime(cfg, fake.client as any);
+    let principalRevoked = false;
+    (manager as any).configureIncusImages(scoped, async () => {
+      if (principalRevoked) throw new Error('Import principal revoked');
+    });
+    const restoreResolve = (scoped as any).imageResolver as Parameters<IncusWorkerRuntime['setImageResolver']>[0];
+    expect(await restoreResolve(importOptions)).toEqual(image);
+    await expect(restoreResolve(opts)).rejects.toThrow('authority changed');
+    for (const failure of ['principal', 'nonce', 'marker'] as const) {
+      await workers.upsert(imported); principalRevoked = false;
+      mutate = async () => {
+        if (failure === 'principal') principalRevoked = true;
+        else await workers.upsert({ ...imported, incusRecreation: failure === 'nonce'
+          ? { ...imported.incusRecreation, nonce: randomUUID() } : { nonce, initialCreate: true } });
+      };
+      await expect(restoreResolve(importOptions)).rejects.toThrow(/authority changed|principal revoked/);
+    }
+    expect(fake.events.some(event => ['create', 'file', 'start', 'remove', 'volume-create'].includes(event.operation))).toBe(false);
+  } finally {
+    IncusWorkerImageManager.prototype.ensure = ensure; groups.listForUser = oldList; groups.get = oldGet;
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 async function hostMountStartupFixture(hasMount = true) {
   const dataDir = await mkdtemp(join(tmpdir(), 'agentor-incus-host-startup-'));

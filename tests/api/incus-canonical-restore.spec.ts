@@ -18,6 +18,7 @@ import { INCUS_CANONICAL_RESTORE_SCRIPT } from '../../orchestrator/server/utils/
 import { HostMountStore } from '../../orchestrator/server/utils/host-mount-store';
 import { WorkerGroupStore } from '../../orchestrator/server/utils/worker-group-store';
 import { IncusHostMountClient } from '../../orchestrator/server/utils/incus-host-mount-client';
+import { incusImageIdentity } from '../../orchestrator/server/utils/incus-worker-image';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 
@@ -749,6 +750,61 @@ test('fresh restore refuses preexisting data and conflicts, never converges by a
     f.volumes.clear(); f.conflict();
     await expect(f.runtime.createCanonicalRestore(f.opts)).rejects.toMatchObject({ statusCode: 409 });
     expect(f.events).toEqual(['volume-create']);
+  } finally { await f.cleanup(); }
+});
+
+test('custom canonical restore uses only private authorized source resolution and never the default image', async () => {
+  const f = await fixture(); try {
+    const identity = incusImageIdentity(f.image), definitionId = randomUUID();
+    const opts = { ...f.opts, image: identity.sourceImageId,
+      imageSelection: { definitionId, version: 'v1', digest: identity.sourceImageId } };
+    const source = { sourceImageId: identity.sourceImageId, recipeId: 'd'.repeat(64), architecture: 'amd64' as const,
+      converterVersion: 'v0.4.0', bootstrapGeneration: '3' as const };
+    let revoked = false, resolutions = 0;
+    f.runtime.setImageResolver(async (actual, stored, described) => {
+      expect(actual.imageSelection).toEqual(opts.imageSelection); expect(stored).toBeUndefined(); expect(described).toEqual(source);
+      if (revoked) throw new Error('Custom restore permission revoked');
+      resolutions++; return identity;
+    });
+    f.client.getImageAlias = async () => { throw new Error('Custom restore cannot use the default alias'); };
+    await expect(f.runtime.preflightCanonicalRestore(opts, { ...source, sourceImageId: 'sha256:' + 'e'.repeat(64) }))
+      .rejects.toMatchObject({ code: 'INCUS_RESTORE_IMAGE_NOT_AUTHORIZED' });
+    expect(resolutions).toBe(0); expect(f.events).toEqual([]);
+    await f.runtime.preflightCanonicalRestore(opts, source);
+    expect(f.events).toEqual([]); expect(f.volumes.size).toBe(0);
+    revoked = true;
+    await expect(f.runtime.createCanonicalRestore(opts, source)).rejects.toThrow('permission revoked');
+    expect(f.events).toEqual([]); expect(f.volumes.size).toBe(0);
+    revoked = false;
+    const created = await f.runtime.createCanonicalRestore(opts, source);
+    expect(created.config['volatile.base_image']).toBe(identity.fingerprint);
+    expect(resolutions).toBe(2);
+  } finally { await f.cleanup(); }
+});
+
+test('historical custom canonical create and promotion keep the same private source through normal activation', async () => {
+  const f = await fixture(); try {
+    f.image.properties.recipe_id = 'd'.repeat(64);
+    const image = incusImageIdentity(f.image), source = { sourceImageId: image.sourceImageId, recipeId: image.recipeId,
+      architecture: image.architecture, converterVersion: image.converterVersion, bootstrapGeneration: image.bootstrapGeneration };
+    const opts = { ...f.opts, dockerEnabled: false, environmentJson: { ...f.opts.environmentJson, dockerEnabled: false },
+      image: image.sourceImageId, imageSelection: { definitionId: randomUUID(), version: 'v1', digest: image.sourceImageId } };
+    let resolutions = 0;
+    f.runtime.setImageResolver(async (_actual, stored, described) => {
+      expect(described).toEqual(source); if (stored) expect(stored).toEqual(image);
+      resolutions++; return image;
+    });
+    f.client.getImageAlias = async () => { throw new Error('Historical custom source cannot use the default alias'); };
+    const instance = await f.runtime.createCanonicalRestore(opts, source);
+    await f.runtime.restoreCanonicalArchives(opts, instance.config['volatile.uuid']!, {
+      workspace: await rawArchive(f.dataDir, 'workspace'), agents: await rawArchive(f.dataDir, 'agents') }, () => {});
+    (f.runtime as any).accountDevices = async () => ({});
+    (f.runtime as any).managedDevices = async () => ({});
+    f.client.pushFile = async () => { f.events.push('provision'); };
+    await f.runtime.finishCanonicalRestore(opts, instance.config['volatile.uuid']!, () => {});
+    expect(resolutions).toBe(2); expect(f.events).toContain('provision'); expect(f.current().status).toBe('Running');
+    expect((await f.runtime.preflightRecreation(opts)).fingerprint).toBe(image.fingerprint);
+    expect(resolutions).toBe(3);
   } finally { await f.cleanup(); }
 });
 

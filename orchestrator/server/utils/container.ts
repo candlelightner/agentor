@@ -72,6 +72,9 @@ import type {
 } from "../../shared/types";
 import { normalizeWorkerRuntimeKind } from "../../shared/types";
 import { IncusWorkerRuntime, incusWorkerStatus, type IncusWorkerOptions } from "./incus-worker-runtime";
+import { IncusWorkerImageManager } from './incus-worker-image-manager';
+import { sameIncusImageSource } from './incus-worker-image';
+import { WorkerGroupHierarchy } from './worker-group-hierarchy';
 import { prepareIncusCanonicalRestorePayload } from './incus-canonical-restore';
 import { selectWorkerImportRuntime, type WorkerImportOrigin } from './worker-import-runtime-policy';
 import { assertBackupRestoreRuntimePrincipal, validBackupRestoreRuntimePrincipal,
@@ -615,10 +618,59 @@ export class ContainerManager {
     this.dockerService = dockerService;
     this.config = config;
     this.incusRuntime = new IncusWorkerRuntime(config);
+    this.configureIncusImages(this.incusRuntime);
   }
 
   setIncusRuntime(runtime: IncusWorkerRuntime): void {
     this.incusRuntime = runtime;
+    this.configureIncusImages(runtime);
+  }
+
+  private configureIncusImages(runtime: IncusWorkerRuntime, restoreAuthority?: () => Promise<void>): void {
+    if (!this.config.incusConverterSeedFingerprint) return;
+    runtime.setImageResolver(async (opts, stored, restoreSource) => {
+      const selection = opts.imageSelection;
+      if (!selection || opts.image !== selection.digest || !this.workerStore)
+        throw new Error('Custom Incus images require the authoritative durable catalog selection');
+      const { useWorkerGroupStore } = await import('./services');
+      const groups = useWorkerGroupStore();
+      const currentGroups = () => {
+        const direct = groups.listForUser(opts.userId).filter(group => group.workerIds.includes(opts.id));
+        if (direct.length > 1) throw new Error('Custom image worker membership is ambiguous');
+        if (opts.hostMountGroupId && direct.length && direct[0]!.id !== opts.hostMountGroupId)
+          throw new Error('Initial custom image group authority changed');
+        const id = opts.hostMountGroupId ?? direct[0]?.id;
+        return id ? new WorkerGroupHierarchy(groups).ancestors(opts.userId, id, true).map(group => group.id).sort() : [];
+      };
+      const allowedGroupIds = currentGroups();
+      const marker = this.workerStore.get(opts.userId, opts.id)?.incusRecreation?.nonce;
+      const current = async () => {
+        await restoreAuthority?.();
+        const record = this.workerStore?.get(opts.userId, opts.id);
+        const recovery = record?.incusRecreation;
+        const invalidImport = restoreAuthority
+          ? !opts.recreationNonce || recovery?.nonce !== opts.recreationNonce ||
+            recovery.initialCreate !== true || recovery.importIncomplete !== true
+          : recovery?.importIncomplete;
+        if (!record || record.runtimeKind !== 'incus-vm' || record.deletionPending || invalidImport ||
+            record.incusRecreation?.nonce !== marker || record.imageDefinitionId !== selection.definitionId ||
+            record.imageVersion !== selection.version || record.imageDigest !== selection.digest ||
+            record.imageRuntimeReference !== opts.image || !isDeepStrictEqual(currentGroups(), allowedGroupIds))
+          throw new Error('Custom Incus image owner, lifecycle, selection or group authority changed');
+      };
+      await current();
+      const catalog = useImageCatalogManager();
+      const manager = new IncusWorkerImageManager(this.config, runtime.client,
+        { getImage: id => this.dockerService.workerOciImage(id) }, catalog,
+        join(process.cwd(), '.output/server/incus-bootstrap'), this.config.incusConverterSeedFingerprint!);
+      const binding = await manager.ensure(opts.userId, { definitionId: selection.definitionId,
+        version: selection.version, allowedGroupIds }, current, undefined, restoreSource);
+      if (binding.context.project !== runtime.client.project || binding.identity.sourceImageId !== selection.digest ||
+          stored && !sameIncusImageSource(stored, binding.identity))
+        throw new Error('Private custom image binding does not match the worker immutable source');
+      await current();
+      return binding.identity;
+    });
   }
 
   async refreshIncusSshKeys(userId: string): Promise<void> {
@@ -913,6 +965,8 @@ export class ContainerManager {
       userEnv: bootstrap?.userEnv ?? userEnv, credentialBinds, workerConfig: [...groupSecrets, ...workerConfig], mounts: info.mounts,
       storageManager: this.storageManager,
       image: info.imageRuntimeReference,
+      imageSelection: info.imageDefinitionId && info.imageVersion && info.imageDigest
+        ? { definitionId: info.imageDefinitionId, version: info.imageVersion, digest: info.imageDigest } : undefined,
       configurationRevision: desired?.revision,
       sshAuthorizedKeys: await this.storageManager?.readSshAuthorizedKeys(info.userId),
       managedVolumes,
@@ -1830,6 +1884,8 @@ export class ContainerManager {
         userEnv,
         workerConfig: [...groupSecrets, ...workerConfig],
         image: request.imageRuntimeReference,
+        imageSelection: request.imageDefinitionId && request.imageVersion && request.imageDigest
+          ? { definitionId: request.imageDefinitionId, version: request.imageVersion, digest: request.imageDigest } : undefined,
         sshAuthorizedKeys: runtimeKind === "incus-vm" ? await this.storageManager?.readSshAuthorizedKeys(userId) : undefined,
       };
       if (runtimeKind === "incus-vm") {
@@ -5812,9 +5868,19 @@ for p in sys.argv[1:]:
         }
         options.managedVolumes = structuredClone(managedRecords);
       }
+      let importRuntime = this.incusRuntime;
+      const restoreSource = !imageResolution && manifest.runtime?.kind === 'incus-vm' ? manifest.runtime.source : undefined;
+      if (options.image) {
+        // Keep the ordinary callback's importIncomplete rejection intact. Only
+        // this short-lived import runtime receives the exact principal/nonce
+        // validation closure, never JSON-supplied authority or a global waiver.
+        importRuntime = new IncusWorkerRuntime(this.config, this.incusRuntime.client);
+        this.configureIncusImages(importRuntime, validate);
+        await importRuntime.preflightCanonicalRestore(options, restoreSource);
+        await validate();
+      }
       proof.attempted = true;
-      const instance = await this.incusRuntime.createCanonicalRestore(options,
-        !imageResolution && manifest.runtime?.kind === 'incus-vm' ? manifest.runtime.source : undefined,
+      const instance = await importRuntime.createCanonicalRestore(options, restoreSource,
         selectedPayloads.some(item => item.path === '/var/lib/docker'));
       const incarnation = instance.config['volatile.uuid'];
       if (!incarnation || instance.config['user.agentor.recreation'] !== marker.nonce ||
@@ -5830,7 +5896,7 @@ for p in sys.argv[1:]:
         { status: 'active', desiredRuntimeStatus: 'stopped', incusRecreation: marker }, undefined,
         { nonce: marker.nonce, initialCreate: true, importIncomplete: true });
       await validate();
-      await this.incusRuntime.restoreCanonicalArchives(options, incarnation, payloads, validate, undefined,
+      await importRuntime.restoreCanonicalArchives(options, incarnation, payloads, validate, undefined,
         managedPayloads.map((item, index) => ({ volume: options.managedVolumes![index]!, archivePath: item.archivePath })), selectedPayloads);
       await validate();
       // Publish only after ALL byte streams and final native proofs succeeded.
@@ -5843,7 +5909,7 @@ for p in sys.argv[1:]:
         await validate();
       }
       if (managedRecords.length) options.managedVolumes = structuredClone(managedRecords);
-      await this.incusRuntime.finishCanonicalRestore(options, incarnation, validate);
+      await importRuntime.finishCanonicalRestore(options, incarnation, validate);
       await validate();
       await useWorkerConfigStore().markApplied(userId, id, this.appliedIncusBootstrap(options, info), options.configurationRevision);
       await this.recreateImportedMappings(userId, id, containerName, manifest);

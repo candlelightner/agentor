@@ -1349,6 +1349,8 @@ export class InstanceBackupManager {
         INCUS_CLIENT_CERT_PATH: config.incusClientCertPath, INCUS_CLIENT_KEY_PATH: config.incusClientKeyPath,
         INCUS_SERVER_CERT_PATH: config.incusServerCertPath, INCUS_NETWORK: config.incusNetwork,
         INCUS_STORAGE_POOL: config.incusStoragePool, INCUS_WORKER_IMAGE: config.incusWorkerImage,
+        INCUS_CONVERTER_SEED_FINGERPRINT: config.incusConverterSeedFingerprint || '',
+        INCUS_CONVERTER_STORAGE_POOL: config.incusConverterStoragePool || '',
         INCUS_DOCKER_VOLUME_SIZE: config.incusDockerVolumeSize, INCUS_INTERNAL_GATEWAY_URL: config.incusInternalGatewayUrl,
         INCUS_NETWORK_HOST_ENDPOINT: config.incusNetworkHostEndpoint || '',
         INCUS_NETWORK_HOST_SERVER_CERT_PATH: config.incusNetworkHostServerCertPath || '',

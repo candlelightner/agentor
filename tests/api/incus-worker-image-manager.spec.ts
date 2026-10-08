@@ -8,6 +8,7 @@ import { promisify } from 'node:util';
 import { IncusClient, IncusError, type IncusImage } from '../../orchestrator/server/utils/incus-client';
 import { IncusWorkerImageManager } from '../../orchestrator/server/utils/incus-worker-image-manager';
 import { type ImageCatalogManager, type NativeImageContext } from '../../orchestrator/server/utils/image-catalog';
+import { incusConversionRecipeId, readCanonicalIncusBootstrap } from '../../orchestrator/server/utils/incus-image-converter';
 
 test('private cache remains exact-project/exact-fingerprint and freshly authorized, never a property-based substitute', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agentor-image-manager-'));
@@ -107,4 +108,71 @@ test('regeneration requires repeated typed native absence, never transport or lo
       }
     } finally { client.dispose(); await rm(root, { recursive: true, force: true }); }
   }
+});
+
+for (const scenario of ['source-mismatch', 'unsupported', 'older', 'current', 'no-binding', 'missing',
+  'transport', 'lookalike', 'reappeared', 'revoked', 'binding-drift', 'image-drift', 'unknown-ack'] as const)
+test(`descriptive restore source preserves current authorization and private historical authority: ${scenario}`, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agentor-image-restore-source-')), assets = join(root, 'assets');
+  await promisify(execFile)('node', ['../orchestrator/build-incus-worker-assets.mjs', assets]);
+  const sourceImageId = 'sha256:' + 'a'.repeat(64), oldFingerprint = 'b'.repeat(64), currentFingerprint = 'e'.repeat(64);
+  const client = new IncusClient({ endpoint: 'https://fixture.invalid', project: 'agentor-private' });
+  const currentRecipe = incusConversionRecipeId(sourceImageId, await readCanonicalIncusBootstrap(assets));
+  const descriptor = { sourceImageId: scenario === 'source-mismatch' ? 'sha256:' + 'f'.repeat(64) : sourceImageId,
+    recipeId: scenario === 'current' ? currentRecipe : 'd'.repeat(64), architecture: 'amd64' as const,
+    bootstrapGeneration: '3' as const, converterVersion: scenario === 'unsupported' ? 'v0.3.0' : 'v0.4.0' };
+  let revoked = false, reads = 0, oldQueries = 0, currentEnsures = 0;
+  const validate = async () => { if (revoked) throw new Error('Current source permission revoked'); };
+  const buildId = randomUUID(), currentBuildId = randomUUID();
+  const binding = (context: NativeImageContext, historical = true) => ({ context,
+    buildId: historical ? buildId : currentBuildId, capability: 'agentor-storage-ownership-v1' as const,
+    identity: { version: 1 as const, sourceImageId, recipeId: context.recipeId, architecture: 'amd64' as const,
+      converterVersion: 'v0.4.0', bootstrapGeneration: '3', fingerprint: historical ? oldFingerprint : currentFingerprint } });
+  const catalog = {
+    authorizeNativeImageSource: async (_owner: string, _selection: unknown, current: () => Promise<void>) => {
+      await current(); return { sourceImageId };
+    },
+    readNativeImageBinding: async (_source: unknown, context: NativeImageContext, current: () => Promise<void>) => {
+      await current(); reads++;
+      expect(context).toMatchObject({ project: client.project, seedFingerprint: 'c'.repeat(64), sourceImageId,
+        recipeId: descriptor.recipeId, bootstrapGeneration: '3', converterVersion: 'v0.4.0' });
+      if (scenario === 'unknown-ack') throw new Error('Native cache hint lacks exact settled import acknowledgement');
+      if (scenario === 'no-binding') return undefined;
+      const result = binding(context);
+      return scenario === 'binding-drift' && reads > 1 ? { ...result, buildId: randomUUID() } : result;
+    },
+    ensureNativeImageBinding: async (_source: unknown, context: NativeImageContext, current: () => Promise<void>) => {
+      await current(); currentEnsures++; expect(context.recipeId).toBe(currentRecipe); return binding(context, false);
+    },
+  } as unknown as ImageCatalogManager;
+  client.getImage = async fingerprint => {
+    const historical = fingerprint === oldFingerprint;
+    expect([oldFingerprint, currentFingerprint]).toContain(fingerprint);
+    if (historical) {
+      oldQueries++;
+      if (scenario === 'transport') throw new IncusError('Incus unavailable', 503);
+      if (scenario === 'lookalike') throw Object.assign(new Error('Transport uncertainty'), { statusCode: 404 });
+      if (scenario === 'missing' || scenario === 'reappeared' && oldQueries === 1) throw new IncusError('Image missing', 404);
+      if (scenario === 'revoked') revoked = true;
+    }
+    return { fingerprint, type: 'virtual-machine', architecture: 'x86_64', size: 1, aliases: [], properties: {
+      source_image_id: scenario === 'image-drift' ? 'sha256:' + 'f'.repeat(64) : sourceImageId,
+      recipe_id: historical ? descriptor.recipeId : currentRecipe, source_architecture: 'amd64',
+      bootstrap_generation: '3', converter_version: 'v0.4.0',
+    } } satisfies IncusImage;
+  };
+  const manager = new IncusWorkerImageManager({ dataDir: root, incusNetwork: 'workers', incusStoragePool: 'workers' },
+    client, { getImage: () => { throw new Error('Restore cache test must not export or allocate'); } }, catalog, assets, 'c'.repeat(64));
+  try {
+    const result = manager.ensure('owner', {}, validate, undefined, descriptor);
+    if (['older', 'current', 'no-binding', 'missing'].includes(scenario)) {
+      expect((await result).identity.fingerprint).toBe(scenario === 'older' ? oldFingerprint : currentFingerprint);
+      expect(currentEnsures).toBe(scenario === 'older' ? 0 : 1);
+      expect(oldQueries).toBe(scenario === 'missing' ? 2 : scenario === 'older' ? 1 : 0);
+      if (scenario === 'older') expect(reads).toBe(2);
+    } else {
+      await expect(result).rejects.toThrow(); expect(currentEnsures).toBe(0);
+      if (scenario === 'source-mismatch' || scenario === 'unsupported') { expect(reads).toBe(0); expect(oldQueries).toBe(0); }
+    }
+  } finally { client.dispose(); await rm(root, { recursive: true, force: true }); }
 });

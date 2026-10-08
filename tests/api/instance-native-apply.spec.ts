@@ -3,14 +3,16 @@ import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { applyInstanceNativeRestoreGroup, rollbackInstanceNativeRestoreGroup,
+import { applyInstanceNativeRestoreGroup, rollbackInstanceNativeRestoreGroup, configureInstanceNativeImageRestore,
   type InstanceNativeRestoreGroup, type InstanceNativeRestoreReceipt } from '../../orchestrator/instance-restore-native';
 import { IncusWorkerRuntime, type IncusWorkerOptions } from '../../orchestrator/server/utils/incus-worker-runtime';
 import { IncusManagedVolumeRuntime } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
 import { WorkerStore, type WorkerRecord } from '../../orchestrator/server/utils/worker-store';
 import { ManagedVolumeStore, type StoredManagedVolume } from '../../orchestrator/server/utils/managed-volume-store';
 import { loadConfig } from '../../orchestrator/server/utils/config';
-import type { IncusCustomVolume } from '../../orchestrator/server/utils/incus-client';
+import { IncusClient, type IncusCustomVolume } from '../../orchestrator/server/utils/incus-client';
+import { IncusWorkerImageManager } from '../../orchestrator/server/utils/incus-worker-image-manager';
+import { WorkerGroupStore } from '../../orchestrator/server/utils/worker-group-store';
 
 async function fixture(kind: 'stopped' | 'archived' | 'retained' = 'stopped', withManaged = true) {
   const dataDir = await mkdtemp(join(tmpdir(), 'agentor-native-apply-'));
@@ -260,4 +262,97 @@ test('each pending managed write freshly observes later installed record changes
     expect(records.find(record => record.id !== id)?.state).toBe('pending');
     expect(f.receipt.attempted).toBe(false); expect(f.events).toEqual([]);
   } finally { await f.cleanup(); }
+});
+
+test('controlled custom image wiring uses the operator seed and same authorized manager with current group hierarchy', async () => {
+  const f = await fixture('stopped', false), client = new IncusClient({ endpoint: 'https://fixture.invalid', project: 'restore-private' });
+  try {
+    f.patch(client, 'request', async () => { f.events.push('native-request'); throw new Error('Test forbids native requests'); });
+    const digest = 'sha256:' + 'a'.repeat(64), definitionId = randomUUID(), seed = 'b'.repeat(64);
+    f.config.incusConverterSeedFingerprint = seed;
+    const selection = { definitionId, version: 'v1', digest };
+    const worker = { ...f.group.worker!, imageDefinitionId: definitionId, imageVersion: 'v1', imageDigest: digest, imageRuntimeReference: digest };
+    const workers = new WorkerStore(f.config.dataDir); await workers.init(); await workers.upsert(worker);
+    const groups = new WorkerGroupStore(f.config.dataDir), parent = await groups.create(worker.userId, 'Parent');
+    const child = await groups.create(worker.userId, 'Child', parent.id); await groups.assignWorker(worker.userId, worker.id, undefined, child.id);
+    const options = { ...f.options, image: digest, imageSelection: selection }, runtime = new IncusWorkerRuntime(f.config, client);
+    let resolve!: Parameters<IncusWorkerRuntime['setImageResolver']>[0], callbacks = 0, calls = 0;
+    f.patch(runtime, 'setImageResolver', (fn: typeof resolve) => { resolve = fn; });
+    const identity = { version: 1 as const, sourceImageId: digest, recipeId: 'c'.repeat(64), architecture: 'amd64' as const,
+      bootstrapGeneration: '3' as const, converterVersion: 'v0.4.0', fingerprint: 'd'.repeat(64) };
+    const described = { sourceImageId: digest, recipeId: identity.recipeId, architecture: identity.architecture,
+      bootstrapGeneration: identity.bootstrapGeneration, converterVersion: identity.converterVersion };
+    f.patch(IncusWorkerImageManager.prototype, 'ensure', async function(this: IncusWorkerImageManager,
+      ...args: Parameters<IncusWorkerImageManager['ensure']>): Promise<Awaited<ReturnType<IncusWorkerImageManager['ensure']>>> {
+      calls++; expect(args[0]).toBe(worker.userId);
+      expect(args[1]).toEqual({ definitionId, version: 'v1', allowedGroupIds: [parent.id, child.id].sort() });
+      expect(args[3]).toBeUndefined(); expect(args[4]).toEqual(described);
+      expect((this as unknown as { seedFingerprint: string; client: IncusClient }).seedFingerprint).toBe(seed);
+      expect((this as unknown as { client: IncusClient }).client).toBe(client);
+      await args[2](); await new Promise<void>(r => setImmediate(r)); await args[2]();
+      return { context: { installationId: randomUUID(), project: client.project, seedFingerprint: seed,
+        sourceImageId: digest, recipeId: identity.recipeId, architecture: 'amd64', bootstrapGeneration: '3', converterVersion: 'v0.4.0', diskSize: '10G' },
+        identity, buildId: randomUUID(), capability: 'agentor-storage-ownership-v1' };
+    });
+    configureInstanceNativeImageRestore(runtime, f.config, options, worker, async () => { callbacks++; });
+    expect(await resolve(options, undefined, described)).toEqual(identity); expect(calls).toBe(1); expect(callbacks).toBeGreaterThanOrEqual(5);
+    expect(f.events).toEqual([]); expect(f.receipt.attempted).toBe(false);
+  } finally { client.dispose(); await f.cleanup(); }
+});
+
+test('controlled custom image wiring rechecks worker, group and job after asynchronous manager work', async () => {
+  for (const drift of ['worker-removed', 'worker-selection', 'group-membership', 'job-revoked', 'foreign-project', 'foreign-source'] as const) {
+    const f = await fixture('stopped', false), client = new IncusClient({ endpoint: 'https://fixture.invalid', project: 'restore-private' });
+    try {
+      f.patch(client, 'request', async () => { f.events.push('native-request'); throw new Error('Test forbids native requests'); });
+      const digest = 'sha256:' + 'a'.repeat(64), definitionId = randomUUID(); f.config.incusConverterSeedFingerprint = 'b'.repeat(64);
+      const selection = { definitionId, version: 'v1', digest };
+      const worker = { ...f.group.worker!, imageDefinitionId: definitionId, imageVersion: 'v1', imageDigest: digest, imageRuntimeReference: digest };
+      const workers = new WorkerStore(f.config.dataDir); await workers.init(); await workers.upsert(worker);
+      const groups = new WorkerGroupStore(f.config.dataDir), group = await groups.create(worker.userId, 'Restore group');
+      await groups.assignWorker(worker.userId, worker.id, undefined, group.id);
+      const options = { ...f.options, image: digest, imageSelection: selection }, runtime = new IncusWorkerRuntime(f.config, client);
+      let resolve!: Parameters<IncusWorkerRuntime['setImageResolver']>[0], revoked = false;
+      f.patch(runtime, 'setImageResolver', (fn: typeof resolve) => { resolve = fn; });
+      f.patch(IncusWorkerImageManager.prototype, 'ensure', async (...args: Parameters<IncusWorkerImageManager['ensure']>)
+        : Promise<Awaited<ReturnType<IncusWorkerImageManager['ensure']>>> => {
+        await args[2](); await new Promise<void>(r => setImmediate(r));
+        if (drift === 'worker-removed') await workers.delete(worker.userId, worker.id);
+        if (drift === 'worker-selection') await workers.upsert({ ...worker, imageVersion: 'v2' });
+        if (drift === 'group-membership') await groups.assignWorker(worker.userId, worker.id, group.id, null);
+        if (drift === 'job-revoked') revoked = true;
+        // Return after mutation: the adapter itself must repeat the fresh callback.
+        return { context: { installationId: randomUUID(), project: drift === 'foreign-project' ? 'foreign' : client.project,
+          seedFingerprint: f.config.incusConverterSeedFingerprint!, sourceImageId: digest, recipeId: 'c'.repeat(64), architecture: 'amd64',
+          bootstrapGeneration: '3', converterVersion: 'v0.4.0', diskSize: '10G' }, buildId: randomUUID(), capability: 'agentor-storage-ownership-v1',
+          identity: { version: 1, sourceImageId: drift === 'foreign-source' ? 'sha256:' + 'e'.repeat(64) : digest, recipeId: 'c'.repeat(64),
+            architecture: 'amd64', bootstrapGeneration: '3', converterVersion: 'v0.4.0', fingerprint: 'd'.repeat(64) } };
+      });
+      configureInstanceNativeImageRestore(runtime, f.config, options, worker, async () => { if (revoked) throw new Error('Restore job revoked'); });
+      await expect(resolve(options)).rejects.toThrow(drift === 'job-revoked' ? 'job revoked'
+        : drift.startsWith('foreign-') ? 'binding differs' : 'authority changed');
+      expect(f.events).toEqual([]); expect(f.receipt.attempted).toBe(false);
+    } finally { client.dispose(); await f.cleanup(); }
+  }
+});
+
+test('controlled custom image wiring rejects incomplete or foreign selection and missing operator seed', async () => {
+  const f = await fixture('stopped', false), client = new IncusClient({ endpoint: 'https://fixture.invalid', project: 'restore-private' });
+  try {
+    f.patch(client, 'request', async () => { f.events.push('native-request'); throw new Error('Test forbids native requests'); });
+    const digest = 'sha256:' + 'a'.repeat(64), definitionId = randomUUID(); f.config.incusConverterSeedFingerprint = 'b'.repeat(64);
+    const worker = { ...f.group.worker!, imageDefinitionId: definitionId, imageVersion: 'v1', imageDigest: digest, imageRuntimeReference: digest };
+    const options = { ...f.options, image: digest, imageSelection: { definitionId, version: 'v1', digest } };
+    const runtime = new IncusWorkerRuntime(f.config, client); let configured = false;
+    f.patch(runtime, 'setImageResolver', () => { configured = true; });
+    for (const [record, selected, seed] of [
+      [{ ...worker, imageVersion: undefined }, options, 'b'.repeat(64)],
+      [worker, { ...options, imageSelection: { ...options.imageSelection, definitionId: randomUUID() } }, 'b'.repeat(64)],
+      [undefined, options, 'b'.repeat(64)], [worker, options, ''],
+    ] as const) {
+      f.config.incusConverterSeedFingerprint = seed;
+      expect(() => configureInstanceNativeImageRestore(runtime, f.config, selected, record, async () => {})).toThrow('complete authorized');
+    }
+    expect(configured).toBe(false); expect(f.events).toEqual([]);
+  } finally { client.dispose(); await f.cleanup(); }
 });

@@ -29,6 +29,61 @@ import { WorkerStore } from './server/utils/worker-store';
 import { ManagedVolumeStore } from './server/utils/managed-volume-store';
 import type { Config } from './server/utils/config';
 import type { IncusCustomVolume } from './server/utils/incus-client';
+import { ImageCatalogCore } from './server/utils/image-catalog-core';
+import { IncusWorkerImageManager } from './server/utils/incus-worker-image-manager';
+import { sameIncusImageSource } from './server/utils/incus-worker-image';
+import { WorkerGroupStore } from './server/utils/worker-group-store';
+import { WorkerGroupHierarchy } from './server/utils/worker-group-hierarchy';
+import Docker from 'dockerode';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+/** The existing cold restore runtime uses the SAME authorized catalog leaf.
+ * Configuration comes from the current operator; the staged WorkerRecord
+ * supplies only its durable selection, never a native endpoint or device. */
+export function configureInstanceNativeImageRestore(runtime: IncusWorkerRuntime, config: Config,
+  options: IncusWorkerOptions, worker: WorkerRecord | undefined, validateJob: () => Promise<void>): void {
+  const hasSelection = worker && [worker.imageDefinitionId, worker.imageVersion, worker.imageDigest, worker.imageRuntimeReference].some(Boolean);
+  if (!hasSelection && !options.image) return;
+  const selection = options.imageSelection;
+  if (!worker || !selection || !config.incusConverterSeedFingerprint || options.image !== selection.digest ||
+      worker.imageDefinitionId !== selection.definitionId || worker.imageVersion !== selection.version ||
+      worker.imageDigest !== selection.digest || (worker.imageRuntimeReference ?? worker.imageDigest) !== options.image)
+    throw new Error('Controlled native restore requires a complete authorized custom image selection');
+  const expected = structuredClone(selection);
+  const groupsForWorker = async () => {
+    const groups = new WorkerGroupStore(config.dataDir); await groups.loadUser(options.userId);
+    const direct = groups.listForUser(options.userId).filter(group => group.workerIds.includes(options.id));
+    if (direct.length > 1) throw new Error('Controlled custom restore group membership is ambiguous');
+    return direct[0] ? new WorkerGroupHierarchy(groups).ancestors(options.userId, direct[0].id, true).map(group => group.id).sort() : [];
+  };
+  const catalog = new ImageCatalogCore(join(config.dataDir, 'image-catalog'));
+  const manager = new IncusWorkerImageManager(config, runtime.client, new Docker({ socketPath: '/var/run/docker.sock' }),
+    catalog, fileURLToPath(new URL('../incus-bootstrap', import.meta.url)), config.incusConverterSeedFingerprint);
+  runtime.setImageResolver(async (actual, stored, described) => {
+    await validateJob();
+    const allowedGroupIds = await groupsForWorker();
+    const current = async () => {
+      await validateJob();
+      const workers = new WorkerStore(config.dataDir); await workers.loadUser(options.userId);
+      const record = workers.get(options.userId, options.id);
+      if (actual.id !== options.id || actual.userId !== options.userId || actual.containerName !== options.containerName ||
+          !isDeepStrictEqual(actual.imageSelection, expected) || actual.image !== expected.digest ||
+          !record || record.runtimeKind !== 'incus-vm' || record.deletionPending ||
+          record.imageDefinitionId !== expected.definitionId || record.imageVersion !== expected.version ||
+          record.imageDigest !== expected.digest || (record.imageRuntimeReference ?? record.imageDigest) !== actual.image ||
+          !isDeepStrictEqual(await groupsForWorker(), allowedGroupIds))
+        throw new Error('Controlled custom restore image, owner or group authority changed');
+    };
+    await current();
+    const binding = await manager.ensure(options.userId, { definitionId: expected.definitionId, version: expected.version,
+      allowedGroupIds }, current, undefined, described);
+    if (binding.context.project !== runtime.client.project || binding.identity.sourceImageId !== expected.digest ||
+        stored && !sameIncusImageSource(stored, binding.identity))
+      throw new Error('Controlled custom restore binding differs from the authorized immutable source');
+    await current(); return binding.identity;
+  });
+}
 
 /** Private, one-helper-run acknowledgement evidence. Never serialized into a
  * bundle or used to recover/adopt a lost submission from a name lookup. */
@@ -100,6 +155,7 @@ export async function applyInstanceNativeRestoreGroup(input: {
       throw new Error('Controlled native managed restore authority changed');
   };
   await validate();
+  configureInstanceNativeImageRestore(runtime, config, options, group.worker, validate);
   const payload = (descriptor?: InstanceBackupVolumeManifest) => {
     if (!descriptor) return undefined;
     const path = archives.get(descriptor.name);

@@ -28,6 +28,8 @@ import { decryptInstanceBackup, encryptInstanceBackup, inspectInstanceBackup } f
 import { backupKeyFingerprint, validateRecoveryKit } from '../../orchestrator/server/utils/backup-keyring';
 import type { InstanceBackupArtifact, InstanceBackupJob, InstanceBackupManifest, InstanceRestorePreflight } from '../../orchestrator/server/utils/instance-backup-types';
 import type { BackupArtifact, BackupJob } from '../../orchestrator/server/utils/backup-types';
+import type { ImageBuild, ImageDefinition, NativeImageBinding } from '../../orchestrator/server/utils/image-catalog';
+import { readCanonicalIncusBootstrap, incusConversionRecipeId } from '../../orchestrator/server/utils/incus-image-converter';
 
 const run = promisify(execFile);
 const ssh = ['-p', '22375', '-i', '/workspace/agentor-kata-vm-access.ZgLVo9uk/id_ed25519',
@@ -56,15 +58,73 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
     ? 'real authenticated worker backup restores its original Incus workspace without replacing other state'
     : process.env.INCUS_NEW_PUBLIC_TEST === 'true'
       ? 'real authenticated encrypted worker backup restores fresh Incus worker storage and selected native Docker data'
+      : process.env.INCUS_CUSTOM_IMAGE_PUBLIC_TEST === 'true'
+        ? 'real controlled catalog OCI creates and rebuilds ordinary Incus worker with private derived image cache reuse'
     : 'real public instance restore imports an encrypted native bundle and restores ordinary VM Docker data through authenticated REST'
   : 'real controlled helper process restores retained native data and restarts only its exact recovery target', async () => {
   const originalPublic = mode === 'app-rest-ordinary' && process.env.INCUS_ORIGINAL_PUBLIC_TEST === 'true';
   const newPublic = mode === 'app-rest-ordinary' && process.env.INCUS_NEW_PUBLIC_TEST === 'true';
-  if (originalPublic && newPublic) throw new Error('Choose exactly one public worker restore gate');
-  const rest = mode === 'app-rest-ordinary' && !originalPublic && !newPublic, app = mode.startsWith('app-'), ordinary = originalPublic || newPublic || rest || mode === 'app-ordinary' || mode !== 'retained' && !app,
+  const customPublic = mode === 'app-rest-ordinary' && process.env.INCUS_CUSTOM_IMAGE_PUBLIC_TEST === 'true';
+  if ([originalPublic, newPublic, customPublic].filter(Boolean).length > 1) throw new Error('Choose exactly one public worker gate');
+  const rest = mode === 'app-rest-ordinary' && !originalPublic && !newPublic && !customPublic, app = mode.startsWith('app-'), ordinary = originalPublic || newPublic || rest || mode === 'app-ordinary' || mode !== 'retained' && !app,
     rollback = mode === 'rollback' || mode === 'app-rollback';
   test.skip(process.env.INCUS_INSTANCE_HELPER_PROCESS_TEST !== 'true', 'Explicit serial approved disposable helper-process gate');
-  test.setTimeout(900_000);
+  test.setTimeout(customPublic ? 5_400_000 : 900_000);
+  let custom: { version: 1; project: string; projectMarker: string; credentialsDir: string; tlsRoot: string;
+    seedFingerprint: string; converterStoragePool: string; workerImage: string; workerImageId: string;
+    incusWorkerImage: string; network: string; internalGatewayHost: string; appBaseImage?: string; appBaseImageId?: string } | undefined;
+  if (customPublic) {
+    if (!process.env.INCUS_CUSTOM_IMAGE_FIXTURE_JSON) throw new Error('Private root-owned custom-image context is required');
+    const file = await open(process.env.INCUS_CUSTOM_IMAGE_FIXTURE_JSON, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const s = await file.stat();
+      if (!s.isFile() || s.uid !== process.getuid?.() || (s.mode & 0o077) || s.size < 1 || s.size > 16_384)
+        throw new Error('Custom-image context must be a bounded private regular file');
+      custom = JSON.parse(await file.readFile('utf8'));
+    } finally { await file.close(); }
+    const sha = /^sha256:[a-f0-9]{64}$/, name = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+    if (custom?.version !== 1 || !/^agimg[A-Za-z0-9-]{1,8}$/.test(custom.project) || !/^[a-f0-9-]{36}$/.test(custom.projectMarker) ||
+        !/^\/workspace\/agentor-incus-[A-Za-z0-9._/-]+$/.test(custom.credentialsDir) || custom.credentialsDir.includes('..') ||
+        !/^\/var\/tmp\/agentor-[A-Za-z0-9._/-]+$/.test(custom.tlsRoot) || custom.tlsRoot.includes('..') ||
+        !/^[a-f0-9]{64}$/.test(custom.seedFingerprint) || !name.test(custom.converterStoragePool) || !name.test(custom.incusWorkerImage) ||
+        custom.workerImage !== 'agentor-custom-base:' + custom.projectMarker.slice(0, 8) || !sha.test(custom.workerImageId) || !name.test(custom.network) ||
+        custom.internalGatewayHost !== '10.159.68.1' ||
+        (custom.appBaseImage !== undefined ? custom.appBaseImage !== 'agentor-custom-app-base:' + custom.projectMarker.slice(0, 8) ||
+          typeof custom.appBaseImageId !== 'string' || !sha.test(custom.appBaseImageId) : custom.appBaseImageId !== undefined))
+      throw new Error('Custom-image fixture context is not the approved bounded operator configuration');
+    const directory = await lstat(custom.credentialsDir);
+    if (!directory.isDirectory() || directory.isSymbolicLink() || (directory.mode & 0o077)) throw new Error('Fixture credential directory is not private');
+  }
+  let customRetained: { version: 1; jobId: string; localDir: string; remoteDir: string; ownerId: string; installationId: string;
+    workerId: string; definitionId: string; sourceBuildId: string; nativeBuildId: string; sourceImageId: string; fingerprint: string;
+    app: { Id: string; Image: string; Config: { Labels: Record<string, string>; Env: string[] }; Mounts: unknown[];
+      NetworkSettings: { Networks: unknown } };
+    instance: Awaited<ReturnType<IncusWorkerRuntime['client']['getInstance']>>;
+    volumes: Array<Awaited<ReturnType<IncusWorkerRuntime['client']['getCustomVolume']>>>;
+    definition: ImageDefinition; sourceBuild: ImageBuild; nativeBuild: ImageBuild; binding: NativeImageBinding;
+    nft: { table: string; json: unknown } } | undefined;
+  if (process.env.INCUS_CUSTOM_IMAGE_RETAINED_JSON) {
+    if (!customPublic) throw new Error('Retained custom fixture requires its explicit public gate');
+    const file = await open(process.env.INCUS_CUSTOM_IMAGE_RETAINED_JSON, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const s = await file.stat();
+      if (!s.isFile() || s.uid !== process.getuid?.() || (s.mode & 0o077) || s.size < 1 || s.size > 1024 * 1024)
+        throw new Error('Retained custom proof must be a bounded private regular file');
+      customRetained = JSON.parse(await file.readFile('utf8'));
+    } finally { await file.close(); }
+    if (customRetained?.version !== 1 || customRetained.jobId !== '38172278-efe9-41f5-b6d0-742a4e2237dc' ||
+        customRetained.localDir !== '/tmp/agentor-native-helper-process-bJ2zXk' ||
+        customRetained.remoteDir !== '/var/tmp/agentor-native-helper-process.' + customRetained.jobId ||
+        customRetained.ownerId !== 'f915fa4a-8602-4597-a389-a1c5348195ae' || customRetained.installationId !== '2b4beed9-40fc-4456-948a-e630528c4fbb' ||
+        customRetained.workerId !== 'd958a3cd-4630-49ae-9a57-899dc01e5980' || customRetained.definitionId !== '2a7df365-2c7d-407b-9bab-96191906804f' ||
+        customRetained.sourceImageId !== 'sha256:f0bfcd056c7d27ead09025f91e53678fc6172dabfd130f216a7dedd7d572e2fc' ||
+        customRetained.fingerprint !== '30e74cf8f70888092ff94e6386c7f0a7d675ba464425882b0d151325c28326f2' ||
+        customRetained.app.Id !== '38271e5ea1ec10805ccb5bf14935a555f1e695ac66d1e0b12e283d26867f29de' ||
+        customRetained.instance.config['volatile.uuid'] !== '2486a933-3268-4caa-9614-c11dd1cb4b44' ||
+        !/^a9defe44-[a-f0-9-]{27}$/.test(customRetained.sourceBuildId) || !/^432c08ba-[a-f0-9-]{27}$/.test(customRetained.nativeBuildId) ||
+        !/^sha256:[a-f0-9]{64}$/.test(customRetained.app.Image) || customRetained.volumes.length !== 2 || custom?.project !== 'agimg10b')
+      throw new Error('Retained custom proof does not identify the explicitly approved source fixture');
+  }
   let retained: { version: 1; fixtureId: string; workerId: string; ownerId: string; volume: StoredManagedVolume;
     localDir: string; remoteDir: string; parentId: string; parentImageId: string; restoreJobId: string;
     failedCaptureJobId: string; incarnation: string; installation: string; source: WorkerBackupRuntimeSource;
@@ -107,14 +167,14 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
       if (retained) expect(dockerSourceDigest).toBe(retained.dockerArchive.sha256);
     } finally { await file.close(); }
   }
-  const local = await mkdtemp(join(tmpdir(), 'agentor-native-helper-process-'));
+  const local = customRetained?.localDir ?? await mkdtemp(join(tmpdir(), 'agentor-native-helper-process-'));
   const followupNonce = randomUUID();
   const source = join(retained?.localDir ?? local, 'source'), targetData = join(local, 'data'), build = join(local, 'image');
-  const id = retained?.workerId ?? randomUUID(), volumeId = retained?.volume.id ?? randomUUID(), jobId = retained?.fixtureId ?? randomUUID();
+  const id = retained?.workerId ?? randomUUID(), volumeId = retained?.volume.id ?? randomUUID(), jobId = customRetained?.jobId ?? retained?.fixtureId ?? randomUUID();
   let restoreJobId: string = retained?.restoreJobId ?? jobId;
   let userId = retained?.ownerId ?? (ordinary ? 'ordinary-' : 'retained-') + randomUUID();
   const appPort = 39000 + Number.parseInt(jobId.slice(0, 4), 16) % 1000;
-  const remote = retained ? '/var/tmp/agentor-native-producer.' + followupNonce : '/var/tmp/agentor-native-helper-process.' + jobId;
+  const remote = customRetained?.remoteDir ?? (retained ? '/var/tmp/agentor-native-producer.' + followupNonce : '/var/tmp/agentor-native-helper-process.' + jobId);
   const image = 'agentor-native-helper-process:' + (retained ? followupNonce : jobId), targetName = 'native-recovery-' + (retained ? followupNonce : jobId),
     helperName = 'agentor-instance-restore-' + jobId;
   const legacyName = 'agentor-native-rollback-' + jobId;
@@ -135,22 +195,34 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
     key === 'metainfo' ? undefined : key === 'counter' ? {} : value);
   let baseline: Awaited<ReturnType<IncusManagedVolumeRuntime['inspectVolume']>>;
   const config = { ...loadConfig(), dataDir: source, containerPrefix: app ? 'aphr-' + jobId.slice(0, 8) : 'agentor-worker', incusEnabled: true,
-    incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor', incusStoragePool: 'default', incusNetwork: 'incusbr0',
-    incusWorkerImage: 'agentor-worker-phase10-preserve-ownership', incusClientCertPath: '/workspace/agentor-incus-tls/client.crt',
-    incusClientKeyPath: '/workspace/agentor-incus-tls/client.key', incusServerCertPath: '/workspace/agentor-incus-tls/server.crt',
+    incusEndpoint: 'https://127.0.0.1:18443', incusProject: custom?.project ?? 'agentor', incusStoragePool: 'default', incusNetwork: custom?.network ?? 'incusbr0',
+    incusWorkerImage: custom?.incusWorkerImage ?? 'agentor-worker-phase10-preserve-ownership',
+    incusConverterSeedFingerprint: custom?.seedFingerprint, incusConverterStoragePool: custom?.converterStoragePool,
+    incusClientCertPath: custom ? join(custom.credentialsDir, 'client.crt') : '/workspace/agentor-incus-tls/client.crt',
+    incusClientKeyPath: custom ? join(custom.credentialsDir, 'client.key') : '/workspace/agentor-incus-tls/client.key',
+    incusServerCertPath: custom ? join(custom.credentialsDir, 'server.crt') : '/workspace/agentor-incus-tls/server.crt',
     incusDockerVolumeSize: '1GiB', incusInternalGatewayUrl: 'http://10.159.68.1:' + (app ? appPort : 38000) };
   const runtime = new IncusWorkerRuntime(config), managedRuntime = new IncusManagedVolumeRuntime(config, runtime);
   const remoteData = (retained?.remoteDir ?? remote) + '/data';
-  const tlsRoot = '/var/tmp/agentor-phase6-production.SSkg3hQz/tls';
+  const tlsRoot = custom?.tlsRoot ?? '/var/tmp/agentor-phase6-production.SSkg3hQz/tls';
   const mounts = ['client.crt', 'client.key', 'server.crt'].map(file =>
     `--mount type=bind,src=${tlsRoot}/${file},dst=/tls/${file},readonly`);
   const admin = { email: `restore-${jobId}@agentor.test`, password: 'isolated-native-restore-' + jobId, name: 'Native Recovery Acceptance' };
   const operatorEnv = ['CONTAINER_PREFIX=' + config.containerPrefix, 'DOCKER_NETWORK=agentor-phase6-net',
-    'INCUS_ENABLED=true', 'INCUS_ENDPOINT=https://agentor-kata-preflight:8443', 'INCUS_PROJECT=agentor',
-    'INCUS_NETWORK=incusbr0', 'INCUS_STORAGE_POOL=default', 'INCUS_WORKER_IMAGE=agentor-worker-phase10-preserve-ownership',
+    'INCUS_ENABLED=true', 'INCUS_ENDPOINT=https://agentor-kata-preflight:8443', 'INCUS_PROJECT=' + config.incusProject,
+    'INCUS_NETWORK=' + config.incusNetwork, 'INCUS_STORAGE_POOL=default', 'INCUS_WORKER_IMAGE=' + config.incusWorkerImage,
     'INCUS_DOCKER_VOLUME_SIZE=1GiB', 'INCUS_INTERNAL_GATEWAY_URL=' + config.incusInternalGatewayUrl,
     'INCUS_CLIENT_CERT_PATH=/tls/client.crt', 'INCUS_CLIENT_KEY_PATH=/tls/client.key', 'INCUS_SERVER_CERT_PATH=/tls/server.crt'];
+  if (custom) operatorEnv.push('WORKER_IMAGE=' + custom.workerImage, 'WORKER_IMAGE_PREFIX=',
+    'INCUS_CONVERTER_SEED_FINGERPRINT=' + custom.seedFingerprint, 'INCUS_CONVERTER_STORAGE_POOL=' + custom.converterStoragePool);
   const prepareImage = async () => {
+    // BuildKit cannot resolve a bare local config SHA in FROM. These exact
+    // fixture-owned tags are transport hints only, verified against immutable
+    // operator pins before App/catalog builds; derived cache authority is OCI ID.
+    if (custom) {
+      expect(await root(`sudo docker image inspect ${quote(custom.workerImage)} --format '{{.Id}}'`)).toBe(custom.workerImageId);
+      if (custom.appBaseImage) expect(await root(`sudo docker image inspect ${quote(custom.appBaseImage)} --format '{{.Id}}'`)).toBe(custom.appBaseImageId);
+    }
     await run(process.execPath, [fileURLToPath(new URL('../../orchestrator/build-instance-restore-native.mjs', import.meta.url)),
       join(build, 'instance-restore-native')], { env: {}, timeout: 60_000 });
     await copyFile(fileURLToPath(new URL('../../orchestrator/instance-restore-helper.mjs', import.meta.url)), join(build, 'instance-restore-helper.mjs'));
@@ -164,6 +236,12 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
       .toContain('replaceOriginalWorkspaceFromBackup'); // Cheap packaging seam before native source allocation.
     if (newPublic) expect(await readFile(join(build, 'app-output/server/chunks/nitro/nitro.mjs'), 'utf8'))
       .toContain('importWorkerFromBackup');
+    if (customPublic) {
+      expect(await readFile(join(build, 'app-output/server/chunks/nitro/nitro.mjs'), 'utf8')).toContain('IncusWorkerImageManager');
+      const current = join(local, 'current-bootstrap');
+      await run(process.execPath, [fileURLToPath(new URL('../../orchestrator/build-incus-worker-assets.mjs', import.meta.url)), current], { timeout: 30_000 });
+      expect(await readCanonicalIncusBootstrap(join(build, 'app-output/server/incus-bootstrap'))).toEqual(await readCanonicalIncusBootstrap(current));
+    }
     if (app) for (const file of ['volume-mount-helper.py', 'incus-volume-live-helper.py'])
       await copyFile(fileURLToPath(new URL('../../orchestrator/' + file, import.meta.url)), join(build, file));
     if (!retained) {
@@ -173,7 +251,9 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
     expect((await runtime.client.request<{ driver: string }>('GET', '/1.0/storage-pools/' + config.incusStoragePool)).driver).toBe('dir');
     await root(`test ! -e ${quote(remote)} && mkdir -m 700 ${quote(remote)}`);
     await run('scp', [...scp, '-r', targetData, build, 'kata-test@172.19.0.1:' + remote + '/'], { timeout: 60_000 });
-    imageId = await root(`sudo docker build -q --label agentor.native-helper-fixture=${jobId} --build-arg REMOVE_VOLUME_HELPER_SLEEP=${rollback} -t ${quote(image)} ${quote(remote + '/image')}`, 120_000);
+    imageId = await root(`sudo docker build -q --label agentor.native-helper-fixture=${jobId} --build-arg REMOVE_VOLUME_HELPER_SLEEP=${rollback} ` +
+      (custom?.appBaseImage ? '--build-arg BASE_IMAGE=' + quote(custom.appBaseImage) + ' ' : '') +
+      `-t ${quote(image)} ${quote(remote + '/image')}`, 120_000);
     expect(imageId).toMatch(/^sha256:[a-f0-9]{64}$/);
     expect(await root(`sudo docker image inspect ${quote(image)} --format '{{.Id}} {{index .Config.Labels "agentor.native-helper-fixture"}}'`))
       .toBe(imageId + ' ' + jobId);
@@ -218,21 +298,38 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
   // producer session file) and never appear in tool/test output.
   const appRequest = async <T,>(path: string, body?: unknown, authenticated = true,
     timeoutMs = 30_000, privateFile?: { path: string; format: 'json' | 'binary' }, sessionPath?: string,
-    method?: 'PUT'): Promise<{ status: number; body: T }> => {
+    method?: 'PUT' | 'DELETE'): Promise<{ status: number; body: T }> => {
     if (privateFile && body !== undefined) throw new Error('Fixture request cannot mix a private file and an inline body');
     if (sessionPath && !authenticated) throw new Error('Fixture private session requires an authenticated request');
+    // Node fetch has a shorter headers deadline than a real first conversion.
+    // Only this explicitly long custom create uses bounded built-in HTTP;
+    // authentication, request shape and all older fixture fetch paths stay put.
+    const longCreate = customPublic && path === '/api/containers' && timeoutMs > 300_000 && !privateFile && body !== undefined && method === undefined;
+    const requestScript = longCreate ?
+      `const{request}=await import('node:http');const payload=${JSON.stringify(JSON.stringify(body))};headers['Content-Length']=String(Buffer.byteLength(payload));` +
+      `const result=await new Promise((resolve,reject)=>{let timer;const req=request(base+${JSON.stringify(path)},{method:'POST',headers},r=>{` +
+      `const chunks=[];let bytes=0;r.on('error',reject);r.on('aborted',()=>reject(Error('Fixture response aborted')));` +
+      `r.on('data',b=>{bytes+=b.length;if(bytes>262144){r.destroy();req.destroy(Error('Fixture response too large'));return}chunks.push(b)});` +
+      `r.on('end',()=>{clearTimeout(timer);try{const text=Buffer.concat(chunks).toString('utf8');if(!Number.isInteger(r.statusCode))throw Error('Fixture response status invalid');` +
+      `resolve({status:r.statusCode,body:String(r.headers['content-type']??'').includes('application/json')?JSON.parse(text):text})}catch{reject(Error('Fixture response invalid'))}})});` +
+      `req.on('error',e=>{clearTimeout(timer);reject(e)});req.on('close',()=>clearTimeout(timer));` +
+      `timer=setTimeout(()=>req.destroy(Error('Fixture create deadline')),${timeoutMs});req.end(payload)});` +
+      `console.log(JSON.stringify(result));`
+      : `const r=await fetch(base+${JSON.stringify(path)},{headers,redirect:'manual'` +
+        (privateFile ? `,method:'POST',body:${privateFile.format === 'binary' ? "fs.createReadStream(p),duplex:'half'" : "fs.readFileSync(p,'utf8')"}`
+          : body === undefined ? '' : ",method:" + JSON.stringify(method ?? 'POST') + ',body:' + JSON.stringify(JSON.stringify(body))) + `});` +
+        `console.log(JSON.stringify({status:r.status,body:r.headers.get('content-type')?.includes('application/json')?await r.json():await r.text()}));`;
     const script = `const base='http://127.0.0.1:3000';const headers={Origin:base,'Content-Type':'application/json'};` +
       (sessionPath ? `const{readFileSync:readSession,lstatSync:statSession}=await import('node:fs');const sp=${JSON.stringify(sessionPath)};` +
         `const ss=statSession(sp);if(!ss.isFile()||ss.isSymbolicLink()||(ss.mode&63)!==0)throw Error('Fixture session is not private');headers.Cookie=readSession(sp,'utf8');`
         : authenticated ? `const signed=await fetch(base+'/api/auth/sign-in/email',{method:'POST',headers,body:${JSON.stringify(JSON.stringify(admin))}});` +
-        `if(!signed.ok)throw new Error('Fixture sign-in failed '+signed.status);headers.Cookie=signed.headers.getSetCookie().map(v=>v.split(';')[0]).join('; ');` : '') +
+        `if(!signed.ok)throw new Error('Fixture sign-in failed '+signed.status);` +
+        (customRetained ? `if((await signed.json()).user?.id!==${JSON.stringify(customRetained.ownerId)})throw Error('Fixture authenticated owner differs');` : '') +
+        `headers.Cookie=signed.headers.getSetCookie().map(v=>v.split(';')[0]).join('; ');` : '') +
       (privateFile ? `const fs=await import('node:fs');const p=${JSON.stringify(privateFile.path)};const s=fs.lstatSync(p);` +
         `if(!s.isFile()||s.isSymbolicLink())throw Error('Fixture input is not a private regular file');` +
         (privateFile.format === 'binary' ? `headers['Content-Type']='application/octet-stream';headers['Content-Length']=String(s.size);` : '') : '') +
-      `const r=await fetch(base+${JSON.stringify(path)},{headers,redirect:'manual'` +
-      (privateFile ? `,method:'POST',body:${privateFile.format === 'binary' ? "fs.createReadStream(p),duplex:'half'" : "fs.readFileSync(p,'utf8')"}`
-        : body === undefined ? '' : ",method:" + JSON.stringify(method ?? 'POST') + ',body:' + JSON.stringify(JSON.stringify(body))) + `});` +
-      `console.log(JSON.stringify({status:r.status,body:r.headers.get('content-type')?.includes('application/json')?await r.json():await r.text()}));`;
+      requestScript;
     try {
       return JSON.parse(await root(`sudo docker exec ${targetId} node --input-type=module -e ${quote(script)}`, timeoutMs));
     } catch {
@@ -249,7 +346,7 @@ import http.client,json,socket,sys
 class Unix(http.client.HTTPConnection):
  def connect(self):
   self.sock=socket.socket(socket.AF_UNIX);self.sock.connect('/var/lib/incus/unix.socket')
-c=Unix('localhost');c.request('GET','/1.0/projects/agentor');r=c.getresponse();b=json.loads(r.read());etag=r.getheader('ETag')
+c=Unix('localhost');c.request('GET','/1.0/projects/'+sys.argv[3]);r=c.getresponse();b=json.loads(r.read());etag=r.getheader('ETag')
 assert r.status==200 and etag and b['type']=='sync'
 p=b['metadata'];cfg=p['config'];assert cfg['restricted']=='true' and cfg['restricted.devices.disk']=='allow'
 delta=json.loads(sys.argv[1]);paths=cfg.get('restricted.devices.disk.paths','').split(',')
@@ -258,10 +355,209 @@ if sys.argv[2]=='add':
 else:
  assert all(x in paths for x in delta);paths=[x for x in paths if x not in delta]
 assert paths;cfg['restricted.devices.disk.paths']=','.join(paths)
-c.request('PUT','/1.0/projects/agentor',json.dumps(dict(config=cfg,description=p['description'])),{'Content-Type':'application/json','If-Match':etag})
+c.request('PUT','/1.0/projects/'+sys.argv[3],json.dumps(dict(config=cfg,description=p['description'])),{'Content-Type':'application/json','If-Match':etag})
 r=c.getresponse();b=json.loads(r.read());assert r.status==200 and b['type']=='sync',b
 print('Exact account fixture delta confirmed')
-`) + ' ' + quote(JSON.stringify(accountPaths())) + ' ' + (add ? 'add' : 'remove'));
+`) + ' ' + quote(JSON.stringify(accountPaths())) + ' ' + (add ? 'add' : 'remove') + ' ' + quote(config.incusProject));
+  const runCustomImage = async () => {
+    if (!custom || !targetId) throw new Error('Exact custom App context is unavailable');
+    userId = stagingOwner;
+    const privateCatalog = async () => JSON.parse(await root(`sudo python3 -c ${quote(
+      'import json,os,stat,sys;p=sys.argv[1];s=os.lstat(p);assert stat.S_ISREG(s.st_mode) and s.st_size<1048576;fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW);print(os.read(fd,1048576).decode());os.close(fd)')} ` +
+      quote(remoteData + '/image-catalog/image-catalog.json'))) as { definitions: ImageDefinition[]; builds: ImageBuild[]; nativeBindings: Record<string, NativeImageBinding> };
+    if (customRetained) {
+      const app = JSON.parse(await root(`sudo docker inspect ${targetId} --format '{{json .}}'`)) as typeof customRetained.app & { State: { Running: boolean } };
+      const envKeys = new Set(['DATA_DIR', 'CONTAINER_PREFIX', 'DOCKER_NETWORK', 'INCUS_ENABLED', 'INCUS_ENDPOINT', 'INCUS_PROJECT',
+        'INCUS_NETWORK', 'INCUS_STORAGE_POOL', 'INCUS_WORKER_IMAGE', 'INCUS_DOCKER_VOLUME_SIZE', 'INCUS_INTERNAL_GATEWAY_URL',
+        'INCUS_CLIENT_CERT_PATH', 'INCUS_CLIENT_KEY_PATH', 'INCUS_SERVER_CERT_PATH', 'INCUS_CONVERTER_SEED_FINGERPRINT',
+        'INCUS_CONVERTER_STORAGE_POOL', 'WORKER_IMAGE', 'WORKER_IMAGE_PREFIX', 'AGENTOR_INSTANCE_RECOVERY_MODE', 'BETTER_AUTH_URL']);
+      expect({ Id: app.Id, Image: app.Image, Config: { Labels: app.Config.Labels,
+        Env: app.Config.Env.filter(value => envKeys.has(value.split('=')[0]!)).sort() },
+        Mounts: [...app.Mounts].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+        NetworkSettings: { Networks: app.NetworkSettings.Networks } })
+        .toEqual({ ...customRetained.app, Config: { ...customRetained.app.Config, Env: [...customRetained.app.Config.Env].sort() },
+          Mounts: [...customRetained.app.Mounts].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))) });
+      expect(app.State.Running).toBe(true); expect(app.Config.Labels['agentor.native-helper-fixture']).toBe(jobId);
+      const mounts = app.Mounts as Array<{ Source: string; Destination: string; Type: string; RW: boolean }>;
+      expect(mounts.some(m => m.Type === 'bind' && m.Source === remoteData && m.Destination === remoteData && m.RW)).toBe(true);
+      expect(mounts.some(m => m.Source.startsWith('/var/lib/incus') || m.Destination.startsWith('/var/lib/incus'))).toBe(false);
+      for (const file of ['client.crt', 'client.key', 'server.crt'])
+        expect(mounts.some(m => m.Source === tlsRoot + '/' + file && m.Destination === '/tls/' + file && !m.RW)).toBe(true);
+      expect(await runtime.client.getInstance(customRetained.instance.name)).toEqual(customRetained.instance);
+      expect(await Promise.all(customRetained.volumes.map(v => runtime.client.getCustomVolume(config.incusStoragePool, v.name)))).toEqual(customRetained.volumes);
+      const catalog = await privateCatalog(), withoutLogs = (build: ImageBuild | undefined) => build && { ...build, logs: undefined };
+      expect(catalog.definitions.find(d => d.id === customRetained.definitionId)).toEqual(customRetained.definition);
+      expect(withoutLogs(catalog.builds.find(b => b.id === customRetained.sourceBuildId))).toEqual(withoutLogs(customRetained.sourceBuild));
+      expect(withoutLogs(catalog.builds.find(b => b.id === customRetained.nativeBuildId))).toEqual(withoutLogs(customRetained.nativeBuild));
+      expect(Object.values(catalog.nativeBindings)).toEqual([customRetained.binding]);
+      expect(customRetained.sourceBuild.digest).toBe(customRetained.sourceImageId);
+      expect(incusImageIdentity(await runtime.client.getImage(customRetained.fingerprint))).toEqual(customRetained.binding.identity);
+      expect(customRetained.binding.identity.fingerprint).toBe(customRetained.fingerprint);
+      expect(await root(`sudo docker image inspect ${quote(customRetained.sourceImageId)} --format '{{.Id}} {{index .Config.Labels "agentor.image-definition"}} {{index .Config.Labels "agentor.image-owner-hash"}}'`))
+        .toBe(`${customRetained.sourceImageId} ${customRetained.definitionId} ${createHash('sha256').update(userId).digest('hex')}`);
+      expect(customRetained.nft.table).toBe(sourceTable);
+      sourceRuleBaseline = sourceRuleSnapshot(typeof customRetained.nft.json === 'string' ? customRetained.nft.json : JSON.stringify(customRetained.nft.json));
+      expect(sourceRuleSnapshot(await root(`sudo nft -j list table ip ${sourceTable}`))).toBe(sourceRuleBaseline);
+      const listed = await appRequest<Array<{ id: string; userId: string; runtimeKind: string }>>('/api/containers');
+      expect(listed.status).toBe(200); expect(listed.body).toHaveLength(1);
+      expect(listed.body[0]).toMatchObject({ id: customRetained.workerId, userId, runtimeKind: 'incus-vm' });
+    }
+    const project = await runtime.client.request<{ config: Record<string, string> }>('GET', '/1.0/projects/' + config.incusProject);
+    expect(project.config).toMatchObject({ restricted: 'true', 'features.images': 'true', 'user.agentor.custom-image-fixture': custom.projectMarker });
+    expect((await runtime.client.getImage(custom.seedFingerprint)).fingerprint).toBe(custom.seedFingerprint);
+    const baselineImages = (await runtime.client.listImages()).map(image => image.fingerprint).filter(fp => fp !== customRetained?.fingerprint).sort();
+    expect(await runtime.client.listInstances()).toEqual(customRetained ? [customRetained.instance] : []);
+    // Cheap executable prerequisites precede the controlled build and expensive
+    // native conversion. The old App base may be used only if it has these tools.
+    await root(`sudo docker exec ${targetId} sh -ec 'qemu-img --version >/dev/null; dd --version | grep -q GNU; test -f /app/.output/server/incus-bootstrap/manifest.json'`);
+    expect(await root(`sudo docker image inspect ${quote(custom.workerImage)} --format '{{.Id}}'`)).toBe(custom.workerImageId);
+    const installation = JSON.parse(await root(`sudo python3 -c ${quote('import json,sys;print(json.dumps(open(sys.argv[1]).read().strip()))')} ` +
+      quote(remoteData + '/backup-installation-id'))) as string;
+    expect(installation).toMatch(/^[a-f0-9-]{36}$/);
+    if (customRetained) { expect(installation).toBe(customRetained.installationId); expect(await readBackupInstallationId(source)).toBe(installation); }
+    else { await writeFile(join(source, 'backup-installation-id'), installation + '\n', { mode: 0o600 }); await policy(true); policyAdded = true; }
+    const marker = 'custom-public-' + jobId;
+    const definition = customRetained ? { status: 201, body: customRetained.definition } : await appRequest<ImageDefinition>('/api/image-catalog/definitions', {
+      name: marker, description: 'Isolated real controlled OCI/native cache gate', baseImage: 'agentor-worker:approved-default',
+      dockerfileFragment: 'COPY proof.txt /opt/agentor-custom-proof',
+      contextFiles: [{ path: 'proof.txt', contentBase64: Buffer.from(marker + '\n').toString('base64') }], builder: 'controlled',
+    });
+    expect(definition.status).toBe(201); expect(definition.body.ownerId).toBe(userId);
+    let built: ImageBuild | undefined = customRetained?.sourceBuild;
+    if (!customRetained) {
+    const building = await appRequest<ImageBuild>('/api/image-catalog/definitions/' + definition.body.id + '/builds',
+      { builder: 'controlled', requestId: jobId + '-controlled' });
+    expect(building.status).toBe(202);
+    await expect.poll(async () => {
+      const state = await appRequest<ImageBuild>('/api/image-builds/' + building.body.id); expect(state.status).toBe(200); built = state.body;
+      expect(state.body).not.toHaveProperty('nativeDerivation');
+      if (state.body.status === 'failed') throw new Error('Actual controlled OCI build failed: ' + (state.body.phase ?? 'unknown'));
+      return state.body.status;
+    }, { timeout: 900_000, intervals: [2000] }).toBe('succeeded');
+    }
+    if (!built?.version || !built.digest || !built.artifactTag) throw new Error('Controlled source acknowledgement is incomplete');
+    expect(built).toMatchObject({ builder: 'controlled', ownerId: userId, dockerAttempted: true, imageCreated: true, compatibility: { coreState: 'passed' } });
+    let owner: { id: string; userId: string; containerName: string };
+    if (customRetained) owner = { id: customRetained.workerId, userId, containerName: customRetained.instance.name };
+    else {
+    const environment = await appRequest<{ id: string }>('/api/environments', { name: marker, dockerEnabled: false,
+      networkMode: 'full', memoryLimit: '2GiB', cpuLimit: 2, envVars: 'CUSTOM_PUBLIC_RUNTIME_PROBE=' + marker,
+      exposeApis: { portMappings: false, domainMappings: false, usage: false } });
+    expect(environment.status).toBe(201);
+    expect(Object.keys((await privateCatalog()).nativeBindings)).toHaveLength(0);
+    computeSettled = false;
+    const created = await appRequest<{ id: string; userId: string; runtimeKind: string; status: string; containerName: string }>('/api/containers',
+      { displayName: marker, environmentId: environment.body.id, imageDefinitionId: definition.body.id, imageVersion: built.version }, true, 3_600_000);
+    expect(created.status).toBe(201); expect(created.body).toMatchObject({ userId, runtimeKind: 'incus-vm', status: 'running' });
+    owner = { id: created.body.id, userId, containerName: created.body.containerName };
+    }
+    expect(owner.id).toMatch(/^[a-f0-9-]{36}$/); expect(owner.containerName).toBe(config.containerPrefix + '-' + owner.id);
+    const first = await runtime.client.getInstance(owner.containerName), firstUuid = first.config['volatile.uuid'];
+    if (typeof firstUuid !== 'string' || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(firstUuid))
+      throw new Error('Created custom worker omitted its exact native incarnation');
+    expect(firstUuid).toMatch(/^[a-f0-9-]{36}$/); expect(await runtime.matchesWorkerIdentity(first, owner.id, userId)).toBe(true);
+    const state = await privateCatalog(), bindings = Object.values(state.nativeBindings);
+    expect(bindings).toHaveLength(1); const binding = bindings[0]!;
+    expect(binding.capability).toBe('agentor-storage-ownership-v1');
+    expect(binding.context).toMatchObject({ installationId: installation, project: custom.project, seedFingerprint: custom.seedFingerprint,
+      sourceImageId: built.digest });
+    expect(binding.context.recipeId).toBe(incusConversionRecipeId(built.digest, await readCanonicalIncusBootstrap(join(local, 'current-bootstrap'))));
+    const native = state.builds.filter(build => build.nativeDerivation);
+    expect(native).toHaveLength(1); const conversion = native[0]!;
+    expect(conversion).toMatchObject({ id: binding.buildId, status: 'succeeded' });
+    expect(conversion.nativeDerivation?.source).toMatchObject({ requesterId: userId, definitionId: definition.body.id,
+      definitionOwnerId: userId, version: built.version, sourceBuildId: built.id, sourceImageId: built.digest, scope: 'own' });
+    expect(conversion.nativeDerivation?.converter).toMatchObject({ removed: true, project: custom.project, sourceImageId: built.digest,
+      installationId: installation, seedFingerprint: custom.seedFingerprint, name: 'aic-' + conversion.id, recipeId: binding.context.recipeId });
+    expect(conversion.nativeDerivation?.converter?.incarnation).toMatch(/^[a-f0-9-]{36}$/);
+    expect(conversion.nativeDerivation?.converter?.pending).toBeUndefined();
+    await expect(runtime.client.getInstance('aic-' + conversion.id)).rejects.toMatchObject({ statusCode: 404 });
+    expect(conversion.nativeDerivation?.imageImport).toMatchObject({ pending: false, fingerprint: binding.identity.fingerprint });
+    expect(first.config['volatile.base_image']).toBe(binding.identity.fingerprint);
+    const image = await runtime.client.getImage(binding.identity.fingerprint);
+    expect(incusImageIdentity(image)).toEqual(binding.identity); expect(image.aliases).toEqual([]);
+    expect(baselineImages).not.toContain(image.fingerprint);
+    const publicBuilds = await appRequest<ImageBuild[]>('/api/image-builds'); expect(publicBuilds.status).toBe(200);
+    for (const build of publicBuilds.body) expect(build).not.toHaveProperty('nativeDerivation');
+    const publicDefinition = await appRequest<ImageDefinition>('/api/image-catalog/definitions/' + definition.body.id);
+    expect(publicDefinition.status).toBe(200); expect(publicDefinition.body).not.toHaveProperty('nativeBindings');
+    const rows = JSON.parse(await root(`sudo python3 -c ${quote('import json,sys;print(json.dumps(json.load(open(sys.argv[1]))))')} ` +
+      quote(remoteData + '/users/' + userId + '/workers.json'))) as WorkerRecord[];
+    expect(rows).toHaveLength(1); expect(rows[0]).toMatchObject({ id: owner.id, userId, runtimeKind: 'incus-vm', imageDefinitionId: definition.body.id,
+      imageVersion: built.version, imageDigest: built.digest }); expect(rows[0]?.incusRecreation).toBeUndefined();
+    const volumeNames = ['workspace', 'agents'].map(role => owner.containerName + '-' + role);
+    const volumes = await Promise.all(volumeNames.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)));
+    for (const [index, volume] of volumes.entries()) expect(volume).toMatchObject({ project: custom.project, type: 'custom', content_type: 'filesystem',
+      created_at: expect.any(String), config: { 'user.agentor.installation': installation, 'user.agentor.owner': userId, 'user.agentor.id': owner.id,
+        'user.agentor.storage-role': index ? 'agents' : 'workspace' } });
+    const assertGuest = async (uuid: string) => {
+      const current = await runtime.client.getInstance(owner.containerName);
+      expect(current.config['volatile.uuid']).toBe(uuid); expect(current.config['volatile.base_image']).toBe(binding.identity.fingerprint);
+      expect(await runtime.matchesWorkerIdentity(current, owner.id, userId)).toBe(true); expect(current.profiles).toEqual([]);
+      expect(current.devices.eth0).toMatchObject({ network: custom!.network, 'security.mac_filtering': 'true',
+        'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' });
+      for (const device of Object.values(current.devices)) expect(JSON.stringify(device)).not.toContain(custom!.tlsRoot);
+      const proof = await runtime.client.exec(owner.containerName, ['bash', '-ec',
+        'test "$(cat /opt/agentor-custom-proof)" = "$1"; test "$(cat /proc/1/comm)" = systemd; ' +
+        'systemctl is-active --quiet incus-agent agentor-worker; ! systemctl is-active --quiet docker; ' +
+        'test ! -e /tls/client.key; test ! -e /tls/client.crt; . /run/agentor/worker.env; ' +
+        'test "$(printf "%s" "$ENVIRONMENT" | jq -r .envVars)" = "CUSTOM_PUBLIC_RUNTIME_PROBE=$1"; ' +
+        'test "$(runuser -u agent -- tmux show-environment -g CUSTOM_PUBLIC_RUNTIME_PROBE)" = "CUSTOM_PUBLIC_RUNTIME_PROBE=$1"; ' +
+        'curl -fsS http://127.0.0.1:8443/ >/dev/null; curl -fsS http://127.0.0.1:6080/ >/dev/null', 'bash', marker]);
+      expect(proof.returnCode, proof.stderr).toBe(0);
+      const editor = await appRequest<string>('/editor/' + owner.id + '/?folder=/workspace'); expect(editor.status).toBe(200); expect(editor.body).toContain('code-server');
+      const desktop = await appRequest<string>('/desktop/' + owner.id + '/agentor.html'); expect(desktop.status).toBe(200); expect(desktop.body).toContain('noVNC');
+      const self = await runtime.client.exec(owner.containerName, ['curl', '--noproxy', '*', '-fsS', config.incusInternalGatewayUrl + '/api/worker-self/info']);
+      expect(self.returnCode, self.stderr).toBe(0); expect(JSON.parse(self.stdout)).toMatchObject({ workerId: owner.id, userId });
+    };
+    await assertGuest(firstUuid);
+    const seeded = await runtime.client.exec(owner.containerName, ['bash', '-ec',
+      'printf "%s" "$1" > /workspace/custom-cache-proof; printf "%s" "$1" > /home/agent/.agent-data/custom-cache-proof', 'bash', marker]);
+    expect(seeded.returnCode, seeded.stderr).toBe(0);
+    expect((await appRequest('/api/containers/' + owner.id + '/stop', {}, true, 360_000)).status).toBe(200);
+    expect((await runtime.client.getInstance(owner.containerName)).status).toBe('Stopped');
+    expect((await appRequest('/api/containers/' + owner.id + '/restart', {}, true, 360_000)).status).toBe(200); await assertGuest(firstUuid);
+    const rebuilt = await appRequest<{ id: string; runtimeKind: string }>('/api/containers/' + owner.id + '/rebuild', {}, true, 360_000);
+    expect(rebuilt.status).toBe(200); expect(rebuilt.body).toMatchObject({ id: owner.id, runtimeKind: 'incus-vm' });
+    const final = await runtime.client.getInstance(owner.containerName), finalUuid = final.config['volatile.uuid'];
+    if (typeof finalUuid !== 'string' || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(finalUuid))
+      throw new Error('Rebuilt custom worker omitted its exact native incarnation');
+    expect(finalUuid).toMatch(/^[a-f0-9-]{36}$/); expect(finalUuid).not.toBe(firstUuid); await assertGuest(finalUuid);
+    const persisted = await runtime.client.exec(owner.containerName, ['bash', '-ec',
+      'test "$(cat /workspace/custom-cache-proof)" = "$1"; test "$(cat /home/agent/.agent-data/custom-cache-proof)" = "$1"', 'bash', marker]);
+    expect(persisted.returnCode, persisted.stderr).toBe(0);
+    const after = await privateCatalog(); expect(after.nativeBindings).toEqual(state.nativeBindings);
+    expect(after.builds.filter(build => build.nativeDerivation)).toEqual(native);
+    expect(await Promise.all(volumeNames.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)))).toEqual(volumes);
+    expect((await runtime.client.listImages()).map(image => image.fingerprint).sort()).toEqual([...baselineImages, image.fingerprint].sort());
+    if (customRetained) {
+      computeSettled = true;
+      console.info('Retained genuine custom source passed corrected runtime config/tmux, services/proxies/self, stop/start/rebuild, persistent markers and exact cached FP/binding/ACK/build count; source/App/catalog/DATA retained for Phase10c');
+      return;
+    }
+    // Success-only cleanup checks the last captured incarnation/config, original
+    // storage creation metadata/refs, private binding and exact imported image.
+    expect(await runtime.client.getInstance(owner.containerName)).toEqual(final);
+    await runtime.remove(owner, finalUuid); await runtime.removeStorage(owner);
+    await expect(runtime.client.getInstance(owner.containerName)).rejects.toMatchObject({ statusCode: 404 });
+    for (const name of volumeNames) await expect(runtime.client.getCustomVolume(config.incusStoragePool, name)).rejects.toMatchObject({ statusCode: 404 });
+    expect(await runtime.client.listInstances()).toEqual([]);
+    const cleanupImage = await runtime.client.getImage(image.fingerprint);
+    expect(incusImageIdentity(cleanupImage)).toEqual(binding.identity); expect(cleanupImage.aliases).toEqual([]);
+    expect(await runtime.client.getImage(image.fingerprint)).toEqual(cleanupImage);
+    await root(`sudo incus image delete ${quote(image.fingerprint)} --project ${quote(custom.project)}`, 120_000);
+    await expect(runtime.client.getImage(image.fingerprint)).rejects.toMatchObject({ statusCode: 404 });
+    expect((await runtime.client.listImages()).map(image => image.fingerprint).sort()).toEqual(baselineImages);
+    // Controlled OCI output is independently owned by this exact definition and
+    // owner hash; never remove the pinned base or adopt a tag as its identity.
+    const labels = await root(`sudo docker image inspect ${quote(built.artifactTag)} --format '{{.Id}} {{index .Config.Labels "agentor.image-definition"}} {{index .Config.Labels "agentor.image-owner-hash"}}'`);
+    expect(labels).toBe(`${built.digest} ${definition.body.id} ${createHash('sha256').update(userId).digest('hex')}`);
+    expect(built.digest).not.toBe(custom.workerImageId);
+    await root(`sudo docker image rm ${quote(built.artifactTag)}`, 120_000);
+    expect(await root(`sudo docker image inspect ${quote(custom.workerImage)} --format '{{.Id}}'`)).toBe(custom.workerImageId);
+    computeSettled = true;
+    console.info('Actual controlled catalog OCI -> normal Incus create/stop/start/rebuild passed marker, provisioning, services/proxies/self and unchanged private derivation cache; exact new native/OCI fixtures removed');
+  };
   const runProducer = async (expectedSource: WorkerBackupRuntimeSource, installation: string) => {
     // Exercise the actual producer as well as the inverse: default SQLite
     // online backup, real quiescence checks, native inventory/capture and
@@ -393,6 +689,14 @@ print('Exact account fixture delta confirmed')
     console.info('Actual REST producer passed: default SQLite integrity/admin, v2 native roles and immutable source, binary workspace/agent/managed and Docker image/container/named-volume bytes, unchanged stopped source incarnation/devices/storage');
   };
   try {
+    if (customRetained) {
+      targetId = customRetained.app.Id; imageId = customRetained.app.Image;
+      stagingOwner = restoredOwner = customRetained.ownerId;
+      const localProof = await lstat(local);
+      if (!localProof.isDirectory() || localProof.isSymbolicLink() || localProof.uid !== process.getuid?.() || (localProof.mode & 0o077))
+        throw new Error('Exact retained local fixture is not private');
+      await runCustomImage(); completed = true; return;
+    }
     if (retained) {
       // This one approved retained fixture bypasses all source setup, admin
       // creation, synthetic plans/jobs, imports and inverse operations.
@@ -447,6 +751,7 @@ print('Exact account fixture delta confirmed')
       return;
     }
     await Promise.all([mkdir(source), mkdir(join(targetData, 'admin'), { recursive: true }), mkdir(build)]);
+    if (customPublic) await backupInstallationId(targetData);
     if (app) {
       await prepareImage();
       if (mode === 'app-retained') {
@@ -503,6 +808,11 @@ print('Exact account fixture delta confirmed')
         'import json,os,sys; p=sys.argv[1]; print(json.dumps(open(p).read().strip() if os.path.exists(p) else None))')} ` +
         quote(remoteData + '/backup-installation-id'))) ?? undefined;
       if (ordinary) userId = volume.userId = stagingOwner;
+    }
+    if (customPublic) {
+      // Real catalog/ordinary lifecycle only: do not synthesize an instance
+      // manifest, restore ledger, helper acknowledgement or image binding.
+      await runCustomImage(); completed = true; return;
     }
     const installation = await backupInstallationId(source);
     const store = new ManagedVolumeStore(source); await store.init(); await store.save(volume);
@@ -1073,7 +1383,7 @@ assert open('/root/original-public-'+sys.argv[2],'rb').read()==b'compute-root-af
   } finally {
     // A failed helper may have unknown native acknowledgement. Keep every
     // exact source/installed record and fixture; absence alone is not cleanup.
-    if (completed && (rollback || baseline)) {
+    if (completed && !customRetained && (customPublic || rollback || baseline)) {
       if (ordinary && !rollback) {
         if (!computeSettled || !incarnation) throw new Error('Unconfirmed ordinary compute cleanup authority');
         const current = await runtime.client.getInstance(options!.containerName);
@@ -1081,7 +1391,7 @@ assert open('/root/original-public-'+sys.argv[2],'rb').read()==b'compute-root-af
         expect(await runtime.matchesWorkerIdentity(current, id, userId)).toBe(true);
         await runtime.remove(options!, incarnation); await runtime.removeStorage(options!);
       }
-      if (!rollback) {
+      if (!rollback && !customPublic) {
         const current = await managedRuntime.inspectVolume(volume);
         if (!current || current.used_by.length || current.project !== baseline!.project || current.created_at !== baseline!.created_at ||
             !isDeepStrictEqual(current.config, baseline!.config)) throw new Error('Exact fixture cleanup authority changed');
@@ -1115,9 +1425,10 @@ assert open('/root/original-public-'+sys.argv[2],'rb').read()==b'compute-root-af
       cleaned = true;
     }
     if (cleaned || !targetId && !helperId && !startupHolderId) await rm(local, { recursive: true, force: true });
+    else if (completed && customRetained) console.info('Exact accepted custom fixture retained for next gate', { local, remote, jobId, targetId });
     else console.error('Retained exact unconfirmed helper-process fixture', { local, remote, id, jobId, restoreJobId, targetId, helperId, startupHolderId });
     // Do not replace the primary assertion with a cleanup failure. Unknown
     // native submission deliberately keeps every exact fixture for diagnosis.
-    if (completed) expect(cleaned, 'Acknowledged fixture cleanup must complete').toBe(true);
+    if (completed && !customRetained) expect(cleaned, 'Acknowledged fixture cleanup must complete').toBe(true);
   }
 });

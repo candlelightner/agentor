@@ -47,6 +47,8 @@ export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer
   managedVolumes?: StoredManagedVolume[];
   /** Initial-create-only, previously validated direct group; never user VM configuration. */
   hostMountGroupId?: string;
+  /** Backend-only catalog selection from the durable WorkerRecord. */
+  imageSelection?: { definitionId: string; version: string; digest: string };
 };
 
 function sameDevice(actual: Record<string, string> | undefined, expected: Record<string, string>): boolean {
@@ -126,8 +128,31 @@ esac
 export class IncusWorkerRuntime {
   readonly client: IncusClient;
   private installation?: Promise<string>;
+  private imageResolver?: (opts: IncusWorkerOptions, stored?: IncusWorkerImageIdentity,
+    restoreSource?: WorkerBackupRuntimeSource) => Promise<IncusWorkerImageIdentity>;
   constructor(private config: Config, client = IncusClient.fromConfig(config)) {
     this.client = client;
+  }
+
+  /** Internal catalog integration, not an image authority accepted from JSON. */
+  setImageResolver(resolve: (opts: IncusWorkerOptions, stored?: IncusWorkerImageIdentity,
+    restoreSource?: WorkerBackupRuntimeSource) => Promise<IncusWorkerImageIdentity>): void {
+    this.imageResolver = resolve;
+  }
+
+  private async authorizedImage(opts: IncusWorkerOptions, stored?: IncusWorkerImageIdentity,
+    restoreSource?: WorkerBackupRuntimeSource): Promise<IncusWorkerImageIdentity | undefined> {
+    if (!opts.image) return undefined; // Preserve the configured operator default path.
+    if (!this.imageResolver) throw new Error('A custom OCI image requires its derived Incus image mapping');
+    const selected = await this.imageResolver(opts, stored,
+      restoreSource ?? (stored && snapshotIncusWorkerBackupRuntime(stored).source));
+    if (selected.sourceImageId !== opts.image)
+      throw new Error('Authorized custom image changed the immutable worker OCI source');
+    if (stored && !sameIncusImageSource(stored, selected))
+      throw new Error('Authorized custom image differs from the stored immutable worker source');
+    const actual = incusImageIdentity(await this.client.getImage(selected.fingerprint));
+    if (!isDeepStrictEqual(actual, selected)) throw new Error('Authorized custom image changed before runtime use');
+    return selected;
   }
 
   private installationId(): Promise<string> {
@@ -909,7 +934,7 @@ export class IncusWorkerRuntime {
       throw new Error("Incus account shares require authoritative platform storage");
     if (opts.dockerEnabled !== undefined && opts.dockerEnabled !== opts.environmentJson.dockerEnabled)
       throw new Error("Docker capability must match the resolved worker environment");
-    if (opts.image) throw new Error("A custom OCI image requires its derived Incus image mapping");
+    if (opts.image && !this.imageResolver) throw new Error("A custom OCI image requires its derived Incus image mapping");
   }
 
   private async accountDevices(opts: Pick<IncusWorkerOptions, 'storageManager' | 'userId' | 'credentialBinds'>): Promise<Record<string, IncusDevice>> {
@@ -991,7 +1016,8 @@ export class IncusWorkerRuntime {
     const storage = await this.storage();
     const source = await storage.imageIdentity(opts);
     if (!source) throw new Error('Incus worker image source is missing; preserve the original source before compute removal');
-    const fingerprint = await this.resolveStoredImage(source);
+    const selected = await this.authorizedImage(opts, source);
+    const fingerprint = selected?.fingerprint ?? await this.resolveStoredImage(source);
     await this.accountDevices(opts);
     await incusHostMountLayout(this.config, opts, 'reconstruct-preflight');
     return { fingerprint, ...await storage.verifyExisting(opts, dockerRequired) };
@@ -1122,7 +1148,7 @@ export class IncusWorkerRuntime {
     if (!opts.recreationNonce || opts.start !== false)
       throw new Error('Incus restore requires durable nonce and stopped initial creation');
     this.validateOptions(opts);
-    const { fingerprint, source: verifiedSource } = await this.canonicalRestoreImage(source);
+    const { fingerprint, source: verifiedSource } = await this.canonicalRestoreImage(opts, source);
     return this.createWorker(opts, undefined, { fingerprint, source: verifiedSource, dockerData, detachedManagedVolumes });
   }
 
@@ -1137,13 +1163,13 @@ export class IncusWorkerRuntime {
     const names = (['workspace', 'agents', 'docker'] as const)
       .map(role => incusWorkerVolumeName(opts, this.config.containerPrefix, role));
     await this.assertReady();
-    const selected = await this.canonicalRestoreImage(source);
+    const selected = await this.canonicalRestoreImage(opts, source);
     if (selected.fingerprint) {
       const identity = incusImageIdentity(await this.client.getImage(selected.fingerprint));
       if (identity.fingerprint !== selected.fingerprint || !sameIncusImageSource(identity, selected.source!))
         throw new Error('Derived restore image changed after immutable source selection');
     }
-    if (!source) incusImageIdentity(await this.client.getImage(await this.resolveImage()));
+    if (!source && !opts.image) incusImageIdentity(await this.client.getImage(await this.resolveImage()));
     await this.managedRestoreDevices(opts, detachedManagedVolumes);
     try {
       await this.client.getInstance(opts.containerName);
@@ -1162,17 +1188,29 @@ export class IncusWorkerRuntime {
     }
   }
 
-  private async canonicalRestoreImage(source?: WorkerBackupRuntimeSource): Promise<{
+  private async canonicalRestoreImage(opts: IncusWorkerOptions, source?: WorkerBackupRuntimeSource): Promise<{
     fingerprint?: string; source?: WorkerBackupRuntimeSource;
   }> {
     let fingerprint: string | undefined;
     let verifiedSource: WorkerBackupRuntimeSource | undefined;
+    const parsed = source ? parseWorkerBackupRuntime({ version: 1, kind: 'incus-vm', source }) : undefined;
+    if (source && parsed?.kind !== 'incus-vm') throw new Error('Invalid Incus restore source');
+    if (opts.image) {
+      if (parsed?.kind === 'incus-vm' && parsed.source.sourceImageId !== opts.image)
+        throw Object.assign(new Error('The described restore OCI source differs from the authorized selection'),
+          { statusCode: 409, code: 'INCUS_RESTORE_IMAGE_NOT_AUTHORIZED' });
+      const selected = await this.authorizedImage(opts, undefined, parsed?.kind === 'incus-vm' ? parsed.source : undefined);
+      if (!selected) throw new Error('Custom Incus restore source resolution is unavailable');
+      // The privately authorized resolver can reuse an exact historical cache
+      // or reconstruct the same immutable OCI with the supported current
+      // bootstrap. Bundle recipe fields never authorize native artifacts.
+      return { fingerprint: selected.fingerprint, source: snapshotIncusWorkerBackupRuntime(selected).source };
+    }
     if (source) {
-      const parsed = parseWorkerBackupRuntime({ version: 1, kind: 'incus-vm', source });
       if (parsed?.kind !== 'incus-vm') throw new Error('Invalid Incus restore source');
       // Portable descriptors (and backup provenance) never authorize another
-      // owner's cached custom OCI image. Until authorized catalog conversion
-      // is enabled, only the configured default OCI source can be reconstructed.
+      // owner's cached custom OCI image. Without a catalog selection, only
+      // the configured default OCI source can be reconstructed.
       // Older recipes for that same immutable userspace remain reusable.
       const authorized = incusImageIdentity(await this.client.getImage(await this.resolveImage()));
       if (parsed.source.sourceImageId !== authorized.sourceImageId || parsed.source.architecture !== authorized.architecture)
@@ -1201,9 +1239,12 @@ export class IncusWorkerRuntime {
     const storage = await this.storage();
     if (restore) await this.assertAbsentCompute(opts);
     const source = restore ? undefined : await storage.imageIdentity(opts);
-    const fingerprint = restore ? await this.resolveImage(restore.fingerprint) : existing ? await this.resolveImage(existing.fingerprint)
+    const selected = restore ? undefined : await this.authorizedImage(opts, source);
+    const fingerprint = restore ? await this.resolveImage(restore.fingerprint) : selected ? await this.resolveImage(selected.fingerprint)
+      : existing ? await this.resolveImage(existing.fingerprint)
       : source ? await this.resolveStoredImage(source) : await this.resolveImage();
     const identity = incusImageIdentity(await this.client.getImage(fingerprint));
+    if (selected && !isDeepStrictEqual(identity, selected)) throw new Error('Private custom image binding changed before allocation');
     if (source && !sameIncusImageSource(source, identity)) throw new Error('Incus reconstruction image source changed');
     if (restore?.source && !sameIncusImageSource(restore.source, identity))
       throw new Error('Incus restore immutable image source changed before allocation');
@@ -1654,6 +1695,12 @@ export class IncusWorkerRuntime {
     await this.assertReady();
     const name = opts.containerName;
     const instance = await this.assertOwned(name, opts.id, opts.userId, incarnation);
+    if (opts.image) {
+      const source = await (await this.storage()).imageIdentity(opts);
+      if (!source || instance.config['volatile.base_image'] !== source.fingerprint)
+        throw new Error('Custom worker source is not bound to its current instance');
+      await this.authorizedImage(opts, source);
+    }
     if (instance.config['user.agentor.restore'] !== undefined)
       throw new Error('Incus restore destination is incomplete; normal worker startup is forbidden');
     if (instance.config['user.agentor.owner'] !== opts.userId)

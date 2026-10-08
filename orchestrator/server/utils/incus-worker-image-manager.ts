@@ -7,7 +7,8 @@ import { backupInstallationId } from './backup-installation';
 import type { ImageCatalogCore, NativeImageContext, NativeImageBinding } from './image-catalog-core';
 import { IncusImageConverter, incusConversionRecipeId, readCanonicalIncusBootstrap } from './incus-image-converter';
 import { normalizeAndImportIncusImage } from './incus-image-artifact';
-import { incusImageIdentity } from './incus-worker-image';
+import { incusImageIdentity, sameIncusImageSource } from './incus-worker-image';
+import { parseWorkerBackupRuntime, type WorkerBackupRuntimeSource } from './worker-backup-runtime';
 
 /** Backend-only controlled source resolution. Neither portable descriptors,
  * aliases nor an image's own properties create this private authority. Uses
@@ -20,12 +21,19 @@ export class IncusWorkerImageManager {
 
   async ensure(requesterId: string, selection: {
     definitionId?: string; version?: string; allowedGroupIds?: Iterable<string>;
-  }, validateAuthority: () => Promise<void>, signal?: AbortSignal): Promise<NativeImageBinding> {
+  }, validateAuthority: () => Promise<void>, signal?: AbortSignal,
+  restoreSource?: WorkerBackupRuntimeSource): Promise<NativeImageBinding> {
     if (!/^[a-f0-9]{64}$/.test(this.seedFingerprint))
       throw new Error('Custom Incus conversion requires an operator-pinned converter seed fingerprint');
     selection = { ...selection, ...(selection.allowedGroupIds ? { allowedGroupIds: [...selection.allowedGroupIds] } : {}) };
+    restoreSource = restoreSource && structuredClone(restoreSource);
     const active = async () => { signal?.throwIfAborted(); await validateAuthority(); signal?.throwIfAborted(); };
     const source = await this.catalog.authorizeNativeImageSource(requesterId, selection, active);
+    if (restoreSource) {
+      parseWorkerBackupRuntime({ version: 1, kind: 'incus-vm', source: restoreSource });
+      if (restoreSource.sourceImageId !== source.sourceImageId || restoreSource.converterVersion !== 'v0.4.0')
+        throw new Error('Restore image source is not the currently authorized supported immutable OCI source');
+    }
     const files = await readCanonicalIncusBootstrap(this.bootstrapDirectory);
     const context: NativeImageContext = { installationId: await backupInstallationId(this.config.dataDir),
       project: this.client.project, seedFingerprint: this.seedFingerprint, sourceImageId: source.sourceImageId,
@@ -35,6 +43,38 @@ export class IncusWorkerImageManager {
     // mutation chain. This callback checks external owner/group/lifecycle
     // authority only: never reenter the catalog queue from a queued write.
     const current = active;
+    if (restoreSource && restoreSource.recipeId !== context.recipeId) {
+      const historicalContext = { ...context, recipeId: restoreSource.recipeId };
+      const historical = await this.catalog.readNativeImageBinding(source, historicalContext, current);
+      if (historical) {
+        await current();
+        let image;
+        try { image = await this.client.getImage(historical.identity.fingerprint); }
+        catch (error) {
+          if (!(error instanceof IncusError) || error.statusCode !== 404) throw error;
+          await current();
+          if (!isDeepStrictEqual(await this.catalog.readNativeImageBinding(source, historicalContext, current), historical))
+            throw new Error('Historical native binding changed before missing-cache fallback');
+          try {
+            await this.client.getImage(historical.identity.fingerprint);
+            throw new Error('Historical native image reappeared before missing-cache fallback');
+          } catch (missing) {
+            if (!(missing instanceof IncusError) || missing.statusCode !== 404) throw missing;
+          }
+        }
+        if (image) {
+          if (!sameIncusImageSource(historical.identity, restoreSource) ||
+              !isDeepStrictEqual(incusImageIdentity(image), historical.identity))
+            throw new Error('Historical native cache image changed or differs from the restore source');
+          if (!isDeepStrictEqual(await this.catalog.readNativeImageBinding(source, historicalContext, current), historical))
+            throw new Error('Historical native binding changed before reuse');
+          await current(); return historical;
+        }
+      }
+      // Never erase historical receipts or synthesize an arbitrary old recipe.
+      // Only the SAME authorized OCI may use the current canonical bootstrap.
+      await current();
+    }
     const execute = async (buildId: string) => {
       const converter = new IncusImageConverter(this.config, this.client, this.docker, this.bootstrapDirectory);
       const raw = await converter.convert({ jobId: buildId, ownerId: requesterId,

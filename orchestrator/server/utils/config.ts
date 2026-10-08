@@ -52,6 +52,8 @@ export interface Config {
   incusStoragePool: string;
   /** Optional operator-selected pool for disposable image conversion only. */
   incusConverterStoragePool?: string;
+  /** Operator-pinned trusted seed; never supplied by worker/import metadata. */
+  incusConverterSeedFingerprint?: string;
   incusWorkerImage: string;
   incusDockerVolumeSize: string;
   incusInternalGatewayUrl: string;
@@ -176,6 +178,7 @@ export function loadConfig(): Config {
     incusNetworkHostServerCertPath: process.env.INCUS_NETWORK_HOST_SERVER_CERT_PATH || '',
     incusStoragePool: process.env.INCUS_STORAGE_POOL || '',
     incusConverterStoragePool: process.env.INCUS_CONVERTER_STORAGE_POOL || '',
+    incusConverterSeedFingerprint: process.env.INCUS_CONVERTER_SEED_FINGERPRINT || '',
     incusWorkerImage: process.env.INCUS_WORKER_IMAGE || 'agentor-worker',
     incusDockerVolumeSize: process.env.INCUS_DOCKER_VOLUME_SIZE || '20GiB',
     incusInternalGatewayUrl: process.env.INCUS_INTERNAL_GATEWAY_URL || '',

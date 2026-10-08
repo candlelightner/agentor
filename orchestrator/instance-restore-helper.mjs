@@ -58,6 +58,7 @@ const NATIVE_OPERATOR_FIELDS = {
   incusClientCertPath: 'INCUS_CLIENT_CERT_PATH', incusClientKeyPath: 'INCUS_CLIENT_KEY_PATH',
   incusServerCertPath: 'INCUS_SERVER_CERT_PATH', incusNetwork: 'INCUS_NETWORK', incusStoragePool: 'INCUS_STORAGE_POOL',
   incusWorkerImage: 'INCUS_WORKER_IMAGE', incusDockerVolumeSize: 'INCUS_DOCKER_VOLUME_SIZE',
+  incusConverterSeedFingerprint: 'INCUS_CONVERTER_SEED_FINGERPRINT', incusConverterStoragePool: 'INCUS_CONVERTER_STORAGE_POOL',
   incusInternalGatewayUrl: 'INCUS_INTERNAL_GATEWAY_URL', incusNetworkHostEndpoint: 'INCUS_NETWORK_HOST_ENDPOINT',
   incusNetworkHostServerCertPath: 'INCUS_NETWORK_HOST_SERVER_CERT_PATH',
 };
@@ -483,6 +484,9 @@ async function prepareNativeRestore(injectedAdapter) {
         workerJson: { id: group.workerId, displayName: '', repos: [], initScript: '', gitName: '', gitEmail: '' } }),
       id: group.workerId, userId: group.userId, containerName: config.containerPrefix + '-' + group.workerId,
       start: false, recreationNonce: nonce, mounts: group.worker?.mounts,
+      image: group.worker?.imageRuntimeReference ?? group.worker?.imageDigest,
+      imageSelection: group.worker?.imageDefinitionId && group.worker?.imageVersion && group.worker?.imageDigest
+        ? { definitionId: group.worker.imageDefinitionId, version: group.worker.imageVersion, digest: group.worker.imageDigest } : undefined,
       managedVolumes: group.managed.filter(item => item.record.attached).map(item => {
         const pending = { ...item.record, seeded: false, state: 'pending' }; delete pending.operation; return pending;
       }),
@@ -500,6 +504,8 @@ async function preflightNativeRestore() {
     const detached = item.group.managed.filter(entry => !entry.record.attached).map(entry => {
       const pending = { ...entry.record, seeded: false, state: 'pending' }; delete pending.operation; return pending;
     });
+    nativeRestore.adapter.configureInstanceNativeImageRestore(runtime, nativeRestore.config, item.options,
+      item.group.worker, assertJobStillActive);
     await runtime.preflightCanonicalRestore(item.options, item.group.source, detached);
     await assertJobStillActive();
   }

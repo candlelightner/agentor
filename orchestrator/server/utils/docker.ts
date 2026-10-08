@@ -133,6 +133,11 @@ export class DockerService {
     this.config = config;
   }
 
+  /** Internal OCI export/inspection; caller must authorize the catalog source. */
+  workerOciImage(image: string): Docker.Image {
+    return this.docker.getImage(image);
+  }
+
   async applyManagedHosts(containerId: string, containerName: string, entries: unknown): Promise<void> {
     const inspect = async () => {
       const info = await withOperationDeadline(this.docker.getContainer(containerId).inspect(),
