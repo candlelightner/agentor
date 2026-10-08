@@ -7,6 +7,7 @@
     "api/legacy-incus-migration-admission.spec.ts",
     "api/legacy-incus-migration-finalize.spec.ts",
     "api/worker-incus-migration-service.spec.ts",
+    "api/legacy-incus-migration-public-live.spec.ts",
     "api/worker-incus-migration-fencing.spec.ts",
     "api/worker-incus-migration-store.spec.ts",
     "../orchestrator/.nuxt/types/nitro.d.ts",

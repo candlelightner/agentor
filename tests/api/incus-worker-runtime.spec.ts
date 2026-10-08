@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile, readFile, symlink, link } from "node:fs/promise
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { IncusWorkerRuntime, serializeIncusWorkerEnv, INCUS_GUEST_READINESS_SCRIPT, INCUS_MAIN_SESSION_PROBE, type IncusWorkerOptions } from "../../orchestrator/server/utils/incus-worker-runtime";
+import { IncusWorkerRuntime, incusWorkerMemoryLimit, serializeIncusWorkerEnv, INCUS_GUEST_READINESS_SCRIPT, INCUS_MAIN_SESSION_PROBE, type IncusWorkerOptions } from "../../orchestrator/server/utils/incus-worker-runtime";
 import { IncusClient } from "../../orchestrator/server/utils/incus-client";
 import { ContainerManager } from "../../orchestrator/server/utils/container";
 import { WorkerStore } from "../../orchestrator/server/utils/worker-store";
@@ -54,6 +54,15 @@ function options(): IncusWorkerOptions {
     workerJson: { id, displayName: "Incus test", repos: [], initScript: "", gitName: "", gitEmail: "" },
   };
 }
+
+test('native worker memory caps preserve Docker binary units and supported IEC values', () => {
+  for (const [input, expected] of [['1024m', '1073741824'], ['1.5GB', '1610612736'],
+    ['512 MB', '536870912'], ['2k', '2048'], ['7b', '7'], ['2GiB', '2GiB'],
+    ['512mib', '512MiB'], ['0g', undefined], ['', undefined]] as const)
+    expect(incusWorkerMemoryLimit(input), input).toBe(expected);
+  for (const input of ['-1g', 'x', '1TB', '9007199254740992b', 'Infinityg'])
+    expect(() => incusWorkerMemoryLimit(input), input).toThrow();
+});
 
 test('account onboarding is limited to explicit create/promotion, then rechecks the restricted leaf allowlist', async () => {
   const opts = options(), base = '/srv/agentor/users/' + opts.userId;

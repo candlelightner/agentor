@@ -75,6 +75,7 @@ import { normalizeWorkerRuntimeKind } from "../../shared/types";
 import { IncusWorkerRuntime, incusWorkerStatus, type IncusWorkerOptions } from "./incus-worker-runtime";
 import { IncusWorkerImageManager } from './incus-worker-image-manager';
 import { IncusRequestRejected } from './incus-client';
+import { legacyMigrationMountIdentity } from './legacy-incus-migration-capture';
 import { incusImageIdentity, sameIncusImageSource } from './incus-worker-image';
 import { WorkerGroupHierarchy } from './worker-group-hierarchy';
 import { prepareIncusCanonicalRestorePayload } from './incus-canonical-restore';
@@ -825,7 +826,8 @@ export class ContainerManager {
         const actual = await inspect();
         if (!current || current.runtimeKind !== 'legacy-docker' || !isDeepStrictEqual(current.incusMigration, marker) ||
             !isDeepStrictEqual(baseline(current), baseline(record)) || actual.Id !== source.Id ||
-            actual.Created !== source.Created || actual.Image !== source.Image || !isDeepStrictEqual(actual.Mounts, source.Mounts) ||
+            actual.Created !== source.Created || actual.Image !== source.Image ||
+            !isDeepStrictEqual(legacyMigrationMountIdentity(actual.Mounts), legacyMigrationMountIdentity(source.Mounts)) ||
             !isDeepStrictEqual(actual.Config.Labels, source.Config.Labels) || stopped && actual.State.Running ||
             !isDeepStrictEqual(volumes.store.forWorker(record.userId, id), sourceManaged))
           throw new Error('Legacy migration source, owner, configuration or storage authority changed');
@@ -995,7 +997,7 @@ export class ContainerManager {
           // replacement container selected by its human-readable name.
           const actual = await inspect();
           if (actual.Id !== source.Id || actual.Created !== source.Created || actual.Image !== source.Image ||
-              !isDeepStrictEqual(actual.Mounts, source.Mounts) || stopped && actual.State.Running)
+              !isDeepStrictEqual(legacyMigrationMountIdentity(actual.Mounts), legacyMigrationMountIdentity(source.Mounts)) || stopped && actual.State.Running)
             throw new Error('Migration rollback source identity or stop is unproven');
           if (source.State.Running && !actual.State.Running) await this.restartUnlocked(id, true, marker);
           await this.workerStore!.clearIncusMigration(record.userId, id, marker);
@@ -1003,7 +1005,8 @@ export class ContainerManager {
           await rm(scratch, { recursive: true });
         } catch (rollback) {
           await transition('recovery-required').catch(() => {});
-          throw Object.assign(new Error('Migration stopped safely; source and destination authority require administrator recovery', { cause: rollback }),
+          throw Object.assign(new Error('Migration stopped safely; source and destination authority require administrator recovery',
+            { cause: new AggregateError([cause, rollback], 'Migration failure and cleanup failure; both authorities retained') }),
             { statusCode: 409, code: 'WORKER_MIGRATION_RECOVERY_REQUIRED' });
         }
         throw cause;

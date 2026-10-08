@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { operationSettlement } from '../../orchestrator/server/utils/operation-deadline';
-import { captureLegacyMigrationArchive, type LegacyMigrationCaptureOptions,
+import { captureLegacyMigrationArchive, legacyMigrationMountIdentity, type LegacyMigrationCaptureOptions,
   type LegacyMigrationReaderOptions, type LegacyMigrationDockerClient } from '../../orchestrator/server/utils/legacy-incus-migration-capture';
 
 async function fixture(role: LegacyMigrationCaptureOptions['role'] = 'workspace') {
@@ -26,18 +26,25 @@ async function fixture(role: LegacyMigrationCaptureOptions['role'] = 'workspace'
   const detachedVolume = { Name: 'original-volume', Mountpoint: '/var/lib/docker/volumes/original-volume/_data',
     Driver: 'local', CreatedAt: '2026-10-08T00:00:00Z', Labels: { 'agentor.volume-owner': 'source-owner' }, Options: {} };
   let foreignReferences = false;
+  let shuffleMounts = false, sourceReads = 0, helperReads = 0;
+  const helperMounts = () => {
+    const mounts = spec!.HostConfig!.Mounts!.map(item => ({ Type: item.Type, Source: item.Source,
+      ...(item.Type === 'volume' ? { Name: item.Source } : {}), Destination: item.Target, RW: !item.ReadOnly }));
+    return shuffleMounts && helperReads++ % 2 ? mounts.reverse() : mounts;
+  };
   const helper = { id: helperId,
     inspect: async () => ({ Id: helperId, Created: '2026-10-08T01:00:00Z', Image: wrongHelper ? source.imageId : trustedImageId,
       Config: { User: spec!.User, Labels: spec!.Labels }, HostConfig: spec!.HostConfig,
-      Mounts: spec!.HostConfig!.Mounts!.map(item => ({ Type: item.Type, Source: item.Source,
-        ...(item.Type === 'volume' ? { Name: item.Source } : {}), Destination: item.Target, RW: !item.ReadOnly })),
+      Mounts: helperMounts(),
       State: { Running: running, Pid: running ? 42 : 0, Status: stopped ? 'exited' : running ? 'running' : 'created' } }),
     start: async () => { events.push('start'); running = true; },
     stop: async () => { events.push('stop'); if (failStop) throw new Error('Unknown stop'); running = false; stopped = true; },
     remove: async () => { events.push('remove'); if (failRemove) throw new Error('Unknown remove'); removed = true; },
   };
   const client = { getImage: () => ({ inspect: async () => ({ Id: trustedImageId, Config: { Env: ['PATH=/usr/bin:/bin', 'NODE_VERSION=22'] } }) }),
-    getContainer: (id: string) => { expect(id).toBe(sourceInfo.Id); return { inspect: async () => structuredClone(sourceInfo) }; },
+    getContainer: (id: string) => { expect(id).toBe(sourceInfo.Id); return { inspect: async () => {
+      const info = structuredClone(sourceInfo); if (shuffleMounts && sourceReads++ % 2) info.Mounts.reverse(); return info;
+    } }; },
     getVolume: () => ({ inspect: async () => structuredClone(detachedVolume) }),
     listContainers: async () => foreignReferences ? [{ Id: 'e'.repeat(64) }] : spec ? [{ Id: helperId }] : [],
     createContainer: async (options: LegacyMigrationReaderOptions) => { spec = options; events.push('create'); return helper; } };
@@ -52,12 +59,28 @@ async function fixture(role: LegacyMigrationCaptureOptions['role'] = 'workspace'
   mount: { Type: 'volume', Source: 'original-volume', Destination: '/workspace' }, outputPath: join(dir, 'capture.tar'),
   validate: async () => { events.push('validate'); if (++validateCount === revokeAt) throw new Error('Source authority changed'); } };
   return { dir, options, events, raw, sourceInfo, helperId, client, detachedVolume, settlement, spec: () => spec!, removed: () => removed,
+    shuffle: () => { shuffleMounts = true; sourceInfo.Mounts.push({ Type: 'volume', Name: 'other-volume',
+      Source: '/var/lib/docker/volumes/other-volume/_data', Destination: '/other', RW: false }); },
     fail: (mode: string) => { if (mode === 'helper') wrongHelper = true; if (mode === 'exec') failExec = true;
       if (mode === 'stop') failStop = true; if (mode === 'remove') failRemove = true; if (mode === 'archive') invalidRaw = true;
       if (mode === 'revoke') revokeAt = 4; if (mode === 'definite') definiteExecFailure = true;
       if (mode === 'references') foreignReferences = true; },
     cleanup: () => rm(dir, { recursive: true, force: true }) };
 }
+
+test('reordered Docker source and helper mounts preserve every identity field and still capture unchanged bytes', async () => {
+  const f = await fixture();
+  try {
+    f.shuffle();
+    const mounts = structuredClone(f.sourceInfo.Mounts);
+    expect(legacyMigrationMountIdentity([...mounts].reverse() as Parameters<typeof legacyMigrationMountIdentity>[0]))
+      .toEqual(legacyMigrationMountIdentity(mounts as Parameters<typeof legacyMigrationMountIdentity>[0]));
+    expect(legacyMigrationMountIdentity([{ ...mounts[0]!, RW: false }, mounts[1]!] as Parameters<typeof legacyMigrationMountIdentity>[0]))
+      .not.toEqual(legacyMigrationMountIdentity(mounts as Parameters<typeof legacyMigrationMountIdentity>[0]));
+    await captureLegacyMigrationArchive(f.options);
+    expect(await readFile(f.options.outputPath)).toEqual(f.raw); expect(f.removed()).toBe(true);
+  } finally { await f.cleanup(); }
+});
 
 for (const role of ['workspace', 'agents', 'docker', 'managed'] as const) test(`legacy ${role} migration capture keeps unchanged GNU/PAX bytes with fixed trusted reader`, async () => {
   const f = await fixture(role); try {

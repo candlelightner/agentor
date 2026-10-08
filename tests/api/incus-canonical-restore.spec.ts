@@ -137,6 +137,20 @@ async function rawArchive(dir: string, role: 'workspace' | 'agents') {
   return path;
 }
 
+test('canonical create normalizes legacy memory and rejects invalid limits before native allocation', async () => {
+  const f = await fixture();
+  try {
+    for (const memoryLimit of ['invalid', '9007199254740992b']) {
+      await expect(f.runtime.preflightCanonicalRestore({ ...f.opts, memoryLimit })).rejects.toThrow(/memory limit/);
+      await expect(f.runtime.createCanonicalRestore({ ...f.opts, memoryLimit })).rejects.toThrow(/memory limit/);
+      expect(f.events).toEqual([]);
+    }
+    f.opts.memoryLimit = '1024m';
+    const instance = await f.runtime.createCanonicalRestore(f.opts);
+    expect(instance.config['limits.memory']).toBe('1073741824');
+  } finally { await f.cleanup(); }
+});
+
 test('account parent initialization is inside isolated canonical authority and precedes stopped promotion', async () => {
   const f = await fixture(); try {
     const instance = await f.runtime.createCanonicalRestore(f.opts);

@@ -40,6 +40,20 @@ import { pipeline } from 'node:stream/promises';
 import { isDeepStrictEqual } from 'node:util';
 import { openIncusDockerArchive, INCUS_OFFLINE_DOCKER_ARCHIVE_SCRIPT } from './incus-docker-archive';
 
+/** Docker-style worker caps are binary units, not raw Incus unit strings. */
+export function incusWorkerMemoryLimit(value?: string): string | undefined {
+  if (!value) return undefined;
+  const match = /^(\d+(?:\.\d+)?)\s*(b|k|m|g|kb|mb|gb|kib|mib|gib)$/i.exec(value);
+  if (!match) throw new Error('Invalid worker memory limit');
+  const unit = match[2]!.toLowerCase();
+  const exponent = unit === 'b' ? 0 : unit.startsWith('k') ? 1 : unit.startsWith('m') ? 2 : 3;
+  const bytes = Math.floor(Number(match[1]) * 1024 ** exponent);
+  if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error('Worker memory limit exceeds the supported byte range');
+  if (!bytes) return undefined; // Historical zero/unrestricted uses the VM default.
+  if (unit.includes('i')) return `${match[1]}${exponent === 1 ? 'KiB' : exponent === 2 ? 'MiB' : 'GiB'}`;
+  return String(bytes);
+}
+
 export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer"]>[0] & {
   sshAuthorizedKeys?: string;
   configurationRevision?: WorkerConfigRevision;
@@ -925,6 +939,7 @@ export class IncusWorkerRuntime {
   }
 
   private validateOptions(opts: IncusWorkerOptions): void {
+    incusWorkerMemoryLimit(opts.memoryLimit);
     // Refuse pending storage features on restart too; never put persistent
     // Docker/account data on disposable rootfs when settings change.
     if (opts.hardwareDevices?.length)
@@ -1270,6 +1285,7 @@ export class IncusWorkerRuntime {
       await new IncusManagedVolumeRuntime(this.config, this).freshRestoreVolume(volume);
     if (restore) for (const volume of restore.detachedManagedVolumes ?? [])
       await new IncusManagedVolumeRuntime(this.config, this).freshRestoreVolume(volume, true);
+    const memoryLimit = incusWorkerMemoryLimit(opts.memoryLimit);
     const instance = await this.client.createInstance({
       name: opts.containerName, type: "virtual-machine", profiles: [],
       source: { type: "image", fingerprint },
@@ -1283,7 +1299,7 @@ export class IncusWorkerRuntime {
         ...(opts.recreationNonce ? { 'user.agentor.recreation': opts.recreationNonce } : {}),
         "security.secureboot": "false",
         "boot.autostart": "false",
-        ...(opts.memoryLimit ? { "limits.memory": opts.memoryLimit } : {}),
+        ...(memoryLimit ? { "limits.memory": memoryLimit } : {}),
         ...(opts.cpuLimit ? { "limits.cpu": String(Math.max(1, Math.ceil(opts.cpuLimit))) } : {}),
       },
       devices: {

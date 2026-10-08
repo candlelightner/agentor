@@ -29,6 +29,11 @@ export interface LegacyMigrationCaptureOptions {
 }
 export type LegacyMigrationReaderOptions = Docker.ContainerCreateOptions;
 export type LegacyMigrationDockerClient = Docker;
+/** Docker assembles Mounts from a map: wire order is not identity. Preserve
+ * every mount field/count while comparing the destination-keyed collection. */
+export function legacyMigrationMountIdentity(mounts: Docker.ContainerInspectInfo['Mounts']) {
+  return [...mounts].sort((left, right) => left.Destination.localeCompare(right.Destination));
+}
 
 /** Fixed trusted-reader leaf. GNU/PAX bytes are validated, never repacked.
  * Failure retains the exact helper/scratch for bounded manual recovery. */
@@ -71,7 +76,7 @@ export async function captureLegacyMigrationArchive(options: LegacyMigrationCapt
       client.getContainer(source.containerId).inspect({ abortSignal }));
     if (info.Id !== source.containerId || info.Created !== source.createdAt || info.Image !== source.imageId ||
         info.State.Running || info.State.Paused || info.State.Restarting || info.State.Pid !== 0 ||
-        !['exited', 'created'].includes(info.State.Status) || sourceMounts && !isDeepStrictEqual(info.Mounts, sourceMounts))
+        !['exited', 'created'].includes(info.State.Status) || sourceMounts && !isDeepStrictEqual(legacyMigrationMountIdentity(info.Mounts), sourceMounts))
       throw new Error('Legacy migration source identity or stopped state changed');
     const matches = info.Mounts.filter(item => item.Destination === mount.Destination);
     if (matches.length === 0 && allowDetached === true && mount.Type === 'volume') {
@@ -86,7 +91,7 @@ export async function captureLegacyMigrationArchive(options: LegacyMigrationCapt
     } else if (matches.length !== 1 || matches[0]!.Type !== mount.Type ||
         (mount.Type === 'volume' ? matches[0]!.Name : matches[0]!.Source) !== mount.Source)
       throw new Error('Legacy migration source mount changed');
-    sourceMounts ??= structuredClone(info.Mounts);
+    sourceMounts ??= structuredClone(legacyMigrationMountIdentity(info.Mounts));
   };
   await checkSource();
   const image = await io('Legacy migration trusted image inspection', abortSignal =>
@@ -128,7 +133,7 @@ export async function captureLegacyMigrationArchive(options: LegacyMigrationCapt
       const info = await io('Legacy migration reader identity inspection', abortSignal => helper!.inspect({ abortSignal }));
       if (!/^[a-f0-9]{64}$/.test(helper!.id) || info.Id !== helper!.id || info.Id !== acknowledged!.Id ||
           !acknowledged!.Created || info.Created !== acknowledged!.Created || info.Image !== trustedImageId ||
-          !isDeepStrictEqual(info.Mounts, acknowledged!.Mounts) ||
+          !isDeepStrictEqual(legacyMigrationMountIdentity(info.Mounts), legacyMigrationMountIdentity(acknowledged!.Mounts)) ||
           info.Config.Labels?.['agentor.helper.operation-id'] !== job ||
           info.Config.Labels?.['agentor.migration-capture-helper'] !== 'true' || info.Config.User !== '0:0' ||
           info.HostConfig.NetworkMode !== 'none' || !info.HostConfig.ReadonlyRootfs || info.HostConfig.Privileged ||
