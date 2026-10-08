@@ -28,6 +28,77 @@ class InstallerTests(unittest.TestCase):
                 "dataDir": "/srv/agentor", "container": "agentor-orchestrator", "dockerNetwork": "control", "internalPort": 3079,
                 "sourceTable": "agentor_source_12345678"}
 
+    def test_native_query_actual_argv_preserves_explicit_url_without_cli_project(self):
+        path = "/1.0/images/" + "a" * 64 + "?project=owned"
+        result = types.SimpleNamespace(returncode=0, stdout=b'{"fingerprint":"accepted"}', stderr=b"")
+        with patch.object(SETUP.subprocess, "run", return_value=result) as process:
+            self.assertEqual(SETUP.native(path), {"fingerprint": "accepted"})
+            self.assertEqual(process.call_args.args[0], ("incus", "--force-local", "query", path))
+            self.assertNotIn("--project", process.call_args.args[0])
+
+    def test_hostname_must_have_positive_openssl_output_not_merely_success_status(self):
+        config = {**self.config(), "tlsName": "incus.internal", "httpsPort": 8443}
+        server = {"environment": {"certificate": "PUBLIC CERTIFICATE"}, "config": {"core.https_address": "unrelated:8443"}}
+        for matched in (True, False):
+            with self.subTest(matched=matched), patch.object(SETUP, "native", return_value=server), patch.object(SETUP, "write_file"), \
+                 patch.object(SETUP, "command", return_value=("Hostname incus.internal does " + ("" if matched else "NOT ") + "match certificate\n").encode()) as commands, \
+                 patch.object(SETUP, "incus") as mutation:
+                with self.assertRaisesRegex(ValueError, "listener differs" if matched else "certificate does not match"):
+                    SETUP.certificates(config, Path("/owned"), "172.25.0.1")
+                commands.assert_called_once_with("openssl", "x509", "-in", "/owned/server.crt", "-noout", "-checkhost", "incus.internal")
+                mutation.assert_not_called()
+
+    def test_real_openssl_hostname_check_rejects_zero_exit_mismatch_on_python_without_match_hostname(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary); key, cert = directory / "throwaway.key", directory / "throwaway.crt"
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "ed25519", "-nodes", "-days", "1", "-subj", "/CN=unrelated",
+                "-addext", "subjectAltName=DNS:incus.internal", "-keyout", str(key), "-out", str(cert)], capture_output=True, check=True)
+            key.chmod(0o600)
+            server = {"environment": {"certificate": cert.read_text()}, "config": {"core.https_address": "unrelated:8443"}}
+            for name, matched in (("incus.internal", True), ("wrong.internal", False)):
+                result = subprocess.run(["openssl", "x509", "-in", str(cert), "-noout", "-checkhost", name], capture_output=True)
+                self.assertEqual(result.returncode, 0)  # Actual OpenSSL mismatch is not a process failure.
+                config = {**self.config(), "tlsName": name, "httpsPort": 8443}
+                with patch.object(SETUP, "native", return_value=server), patch.object(SETUP, "incus") as mutation:
+                    with self.assertRaisesRegex(ValueError, "listener differs" if matched else "certificate does not match"):
+                        SETUP.certificates(config, directory, "172.25.0.1")
+                    mutation.assert_not_called()
+
+    def test_certificate_registration_actual_argv_and_postregistration_project_restriction(self):
+        config = {**self.config(), "tlsName": "incus.internal", "httpsPort": 8443}
+        fingerprint = hashlib.sha256(b"fixture public DER").hexdigest()
+        for case in ("accepted", "unrestricted", "wrong-project"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                for purpose in ("client", "policy"):
+                    (directory / (purpose + ".key")).write_text("throwaway private fixture"); (directory / (purpose + ".key")).chmod(0o600)
+                    (directory / (purpose + ".crt")).write_text("throwaway public fixture"); (directory / (purpose + ".crt")).chmod(0o644)
+                calls = []; reads = []; original_stat = Path.lstat
+                def lstat(path, *args, **kwargs):
+                    info = original_stat(path, *args, **kwargs)
+                    if path.name in ("client.key", "client.crt", "policy.key", "policy.crt"):
+                        return types.SimpleNamespace(st_mode=info.st_mode, st_uid=0)
+                    return info
+                def command(*args, **kwargs):
+                    calls.append(args)
+                    if args[0] == "openssl": return b"Hostname incus.internal does match certificate\n"
+                    self.assertEqual(args, ("incus", "--force-local", "--project", "default", "config", "trust", "add-certificate",
+                        str(directory / "client.crt"), "--name=agentor-" + INSTALLATION, "--restricted", "--projects=owned"))
+                    return b""
+                def native(path):
+                    reads.append(path)
+                    if path == "/1.0": return {"environment": {"certificate": "public server fixture"}, "config": {"core.https_address": "172.25.0.1:8443"}}
+                    self.assertEqual(path, "/1.0/certificates?recursion=1")
+                    if not any(args[0] == "incus" for args in calls): return []
+                    return [{"fingerprint": fingerprint, "restricted": case != "unrestricted", "projects": ["foreign" if case == "wrong-project" else "owned"], "type": "client"}]
+                with patch.object(SETUP, "command", side_effect=command), patch.object(SETUP, "native", side_effect=native), \
+                     patch.object(Path, "lstat", lstat), patch.object(SETUP.ssl, "SSLContext"), patch.object(SETUP.ssl, "PEM_cert_to_DER_cert", return_value=b"fixture public DER"):
+                    if case == "accepted": SETUP.certificates(config, directory, "172.25.0.1")
+                    else:
+                        with self.assertRaisesRegex(ValueError, "restricted to exactly"): SETUP.certificates(config, directory, "172.25.0.1")
+                self.assertEqual(reads.count("/1.0/certificates?recursion=1"), 2)
+                self.assertEqual(len([args for args in calls if args[0] == "incus"]), 1)
+
     def test_help_is_available_without_root_or_host_mutation(self):
         result = subprocess.run(["bash", str(SCRIPT), "--help"], text=True, capture_output=True, check=True)
         self.assertIn("--install-lts", result.stdout); self.assertIn("never migrates", result.stdout)

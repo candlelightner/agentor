@@ -46,7 +46,8 @@ def incus(*argv):
 
 
 def native(path):
-    return json.loads(incus("query", path))
+    # Raw query uses its explicit URL/project; Incus rejects --project here.
+    return json.loads(command("incus", "--force-local", "query", path))
 
 
 def owned(record, installation, name):
@@ -258,7 +259,8 @@ def bridge_netfilter(installation):
 def certificates(config, directory, gateway):
     server = native("/1.0"); public = server["environment"]["certificate"]
     write_file(directory / "server.crt", public, 0o644)
-    ssl.match_hostname(ssl._ssl._test_decode_cert(str(directory / "server.crt")), config["tlsName"])
+    hostname = command("openssl", "x509", "-in", str(directory / "server.crt"), "-noout", "-checkhost", config["tlsName"]).decode().strip()
+    require(hostname == "Hostname " + config["tlsName"] + " does match certificate", "Existing Incus certificate does not match the configured TLS hostname; preserve it and choose its verified hostname")
     listener = gateway + ":" + str(config["httpsPort"])
     current = server.get("config", {}).get("core.https_address", "")
     require(not current or current == listener, "Existing Incus HTTPS listener differs; preserve unrelated configuration and resolve manually")
@@ -276,7 +278,7 @@ def certificates(config, directory, gateway):
     fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert((directory / "client.crt").read_text())).hexdigest()
     records = native("/1.0/certificates?recursion=1"); matches = [record for record in records if record.get("fingerprint") == fingerprint]
     if not matches:
-        incus("config", "trust", "add", str(directory / "client.crt"), "--name=agentor-" + config["installation"], "--restricted", "--projects=" + config["project"])
+        incus("config", "trust", "add-certificate", str(directory / "client.crt"), "--name=agentor-" + config["installation"], "--restricted", "--projects=" + config["project"])
         records = native("/1.0/certificates?recursion=1"); matches = [record for record in records if record.get("fingerprint") == fingerprint]
     require(len(matches) == 1 and matches[0].get("restricted") is True and matches[0].get("projects") == [config["project"]]
             and matches[0].get("type") == "client", "Client certificate is not restricted to exactly the owned project")
