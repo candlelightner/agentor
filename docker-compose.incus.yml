@@ -1,0 +1,52 @@
+# Opt-in override; apply with your existing production/Portainer stack.
+# Fill operator-generated values from setup-incus-host.sh. Never mount Incus's
+# Unix socket or its storage directory into the Orchestrator.
+services:
+  orchestrator:
+    image: ${AGENTOR_INCUS_ORCHESTRATOR_IMAGE:?Select an image containing the accepted Incus implementation}
+    ports:
+      - "${INCUS_WORKER_GATEWAY:?Use the managed worker bridge gateway}:${INCUS_INTERNAL_PORT:-3079}:3000"
+    extra_hosts:
+      - "${INCUS_TLS_NAME:?Use the setup certificate hostname}:${INCUS_API_HOST_ADDRESS:?Use the setup host-side API address}"
+    volumes:
+      - type: bind
+        source: ${INCUS_CLIENT_CERT_SOURCE:?Use the operator client certificate file}
+        target: /run/agentor-incus/client.crt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${INCUS_CLIENT_KEY_SOURCE:?Use the operator private client key file}
+        target: /run/agentor-incus/client.key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${INCUS_SERVER_CERT_SOURCE:?Use the verified Incus server certificate file}
+        target: /run/agentor-incus/server.crt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${INCUS_POLICY_CERT_SOURCE:?Use the verified host-policy certificate file}
+        target: /run/agentor-incus/policy.crt
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      WORKER_IMAGE_PREFIX: ${WORKER_IMAGE_PREFIX-ghcr.io/candlelightner/}
+      WORKER_IMAGE: ${WORKER_IMAGE:-agentor-worker:latest}
+      INCUS_ENABLED: "true"
+      INCUS_ENDPOINT: ${INCUS_ENDPOINT:?Use the setup HTTPS endpoint}
+      INCUS_PROJECT: ${INCUS_PROJECT:?Use the dedicated restricted project}
+      INCUS_NETWORK: ${INCUS_NETWORK:?Use the setup managed worker network}
+      INCUS_STORAGE_POOL: ${INCUS_STORAGE_POOL:?Use the setup storage pool}
+      INCUS_CONVERTER_STORAGE_POOL: ${INCUS_CONVERTER_STORAGE_POOL:?Use the operator converter pool}
+      INCUS_WORKER_IMAGE: ${INCUS_WORKER_IMAGE:?Use the verified derived-image alias}
+      INCUS_CONVERTER_SEED_FINGERPRINT: ${INCUS_CONVERTER_SEED_FINGERPRINT:?Use the verified trusted seed fingerprint}
+      INCUS_NETWORK_HOST_ENDPOINT: ${INCUS_NETWORK_HOST_ENDPOINT:?Use the setup HTTPS policy endpoint}
+      INCUS_INTERNAL_GATEWAY_URL: ${INCUS_INTERNAL_GATEWAY_URL:?Use the stable worker-facing URL}
+      INCUS_CLIENT_CERT_PATH: /run/agentor-incus/client.crt
+      INCUS_CLIENT_KEY_PATH: /run/agentor-incus/client.key
+      INCUS_SERVER_CERT_PATH: /run/agentor-incus/server.crt
+      INCUS_NETWORK_HOST_SERVER_CERT_PATH: /run/agentor-incus/policy.crt

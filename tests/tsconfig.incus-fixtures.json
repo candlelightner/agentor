@@ -2,6 +2,7 @@
   "extends": "../orchestrator/.nuxt/tsconfig.server.json",
   "compilerOptions": { "noEmit": true, "rootDir": "..", "esModuleInterop": true },
   "include": [
+    "api/incus-deployment-config.spec.ts",
     "api/legacy-incus-migration-capture-live.spec.ts",
     "api/legacy-incus-migration-capture.spec.ts",
     "api/legacy-incus-migration-admission.spec.ts",

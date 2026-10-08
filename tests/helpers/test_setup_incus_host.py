@@ -1,5 +1,8 @@
 """Installer preflights; external mutation commands are always mocked."""
+import contextlib
 import copy
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -7,6 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tarfile
 import types
 import unittest
 from unittest.mock import MagicMock, patch
@@ -28,6 +32,166 @@ class InstallerTests(unittest.TestCase):
         result = subprocess.run(["bash", str(SCRIPT), "--help"], text=True, capture_output=True, check=True)
         self.assertIn("--install-lts", result.stdout); self.assertIn("never migrates", result.stdout)
         self.assertIn("--routing", result.stdout)
+        self.assertIn("--trusted-worker-image", result.stdout); self.assertIn("NEVER choose", result.stdout)
+
+    def test_command_space_failure_is_actionable_without_raw_secret_diagnostics(self):
+        with patch.object(SETUP.subprocess, "run", return_value=types.SimpleNamespace(returncode=1, stdout=b"", stderr=b"PRIVATE-SENTINEL: No space left on device")):
+            with self.assertRaisesRegex(ValueError, "ENOSPC") as result: SETUP.command("bash", "trusted-builder")
+            self.assertNotIn("PRIVATE-SENTINEL", str(result.exception))
+
+    def test_portainer_output_keeps_api_and_worker_gateways_distinct_and_emits_only_file_paths(self):
+        config = {**self.config(), "listen": "172.25.0.1", "tlsName": "incus.internal", "httpsPort": 8443, "policyPort": 8444,
+                  "internalUrl": "http://10.25.0.1:3079"}
+        directory = Path("/etc/agentor/incus") / INSTALLATION
+        with patch.object(SETUP, "command") as commands:
+            values = SETUP.portainer_environment(config, directory, SETUP.ipaddress.IPv4Interface("10.25.0.1/24"),
+                                                {"alias": "owned-default", "fingerprint": "a" * 64})
+            commands.assert_not_called()
+        self.assertEqual(values["INCUS_API_HOST_ADDRESS"], "172.25.0.1"); self.assertEqual(values["INCUS_WORKER_GATEWAY"], "10.25.0.1")
+        self.assertEqual(values["INCUS_TLS_NAME"], "incus.internal"); self.assertEqual(values["INCUS_INTERNAL_PORT"], "3079")
+        for name, file in (("CLIENT_CERT", "client.crt"), ("CLIENT_KEY", "client.key"), ("SERVER_CERT", "server.crt"), ("POLICY_CERT", "policy.crt")):
+            self.assertEqual(values["INCUS_" + name + "_SOURCE"], str(directory / file))
+        self.assertEqual(values["INCUS_WORKER_IMAGE"], "owned-default"); self.assertEqual(values["INCUS_CONVERTER_SEED_FINGERPRINT"], "a" * 64)
+        self.assertNotIn("AGENTOR_INCUS_ORCHESTRATOR_IMAGE", values)
+
+    @contextlib.contextmanager
+    def default_fixture(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / INSTALLATION; SETUP.namespace(directory, INSTALLATION)
+            config = {**self.config(), "imageWorkDir": str(directory / "scratch")}
+            source, fingerprint = "sha256:" + "a" * 64, "b" * 64
+            recipe = SETUP.default_recipe(source); alias = "agentor-12345678-" + recipe[:16]
+            registry = {"aliases": [], "image": {"fingerprint": fingerprint, "type": "virtual-machine", "architecture": "x86_64",
+                "properties": {"source_image_id": source, "recipe_id": recipe, "source_architecture": "amd64", "bootstrap_generation": "3", "converter_version": "v0.4.0"}}}
+            calls = []; phases = []
+            def native(path):
+                self.assertIn("?project=owned", path)
+                if path.startswith("/1.0/images/aliases?"): return copy.deepcopy(registry["aliases"])
+                if path.startswith("/1.0/images/aliases/"): return copy.deepcopy(registry["aliases"][0])
+                self.assertTrue(path.startswith("/1.0/images/" + fingerprint + "?")); return copy.deepcopy(registry["image"])
+            def command(*args, **kwargs):
+                calls.append((args, kwargs))
+                if args[:2] == ("docker", "inspect"):
+                    return json.dumps([{"Config": {"Env": ["WORKER_IMAGE_PREFIX=operator/", "WORKER_IMAGE=default:stable", "GITHUB_TOKEN=PRIVATE-SENTINEL"]}}]).encode()
+                if args[:3] == ("docker", "image", "inspect"):
+                    self.assertEqual(args[-1], "operator/default:stable")
+                    return json.dumps([{"Id": source, "Architecture": "amd64", "Size": 2500 * 1024**2}]).encode()
+                phases.append(json.loads((directory / "config.json").read_text())["defaultImage"]["phase"])
+                if args[0] == "bash":
+                    self.assertEqual(args[args.index("--source-image") + 1], source); self.assertEqual(args[args.index("--expected-source-id") + 1], source)
+                    self.assertEqual(args[args.index("--expected-recipe-id") + 1], recipe); self.assertEqual(args[args.index("--size") + 1], "10G")
+                    self.assertIn("--no-import", args); self.assertNotIn("--force", args); self.assertNotIn("--alias", args)
+                    self.assertEqual(kwargs["timeout"], 2700); return b"Trusted conversion complete"
+                self.assertEqual(args[:4], ("incus", "--force-local", "--project", "owned"))
+                if args[4:6] == ("image", "import"): return ("Image imported with fingerprint: " + fingerprint).encode()
+                self.assertEqual(args[4:], ("image", "alias", "create", alias, fingerprint))
+                registry["aliases"] = [{"name": alias, "target": fingerprint, "type": "virtual-machine"}]; return b""
+            with patch.object(SETUP, "command", side_effect=command) as commands, patch.object(SETUP, "native", side_effect=native), \
+                 patch.object(SETUP, "pinned_d2vm", return_value=directory / "tools") as converter, \
+                 patch.object(SETUP.shutil, "disk_usage", return_value=types.SimpleNamespace(free=100 * 1024**3)), \
+                 patch.object(SETUP.shutil, "which", return_value="/usr/bin/tool"):
+                yield directory, config, registry, commands, converter, calls, phases
+
+    def test_default_bootstrap_pins_source_recipe_and_ack_before_reuse(self):
+        with self.default_fixture() as (directory, config, registry, commands, converter, calls, phases):
+            result = SETUP.bootstrap_default_image(config, directory, "operator/default:stable")
+            self.assertEqual(result["phase"], "ready"); self.assertEqual(result["fingerprint"], registry["image"]["fingerprint"])
+            self.assertEqual(phases, ["converting", "import-pending", "alias-pending"])
+            self.assertEqual(json.loads((directory / "config.json").read_text())["defaultImage"], result)
+            before = copy.deepcopy(config); old_calls = len(calls)
+            self.assertEqual(SETUP.bootstrap_default_image(config, directory), result); self.assertEqual(config, before)
+            self.assertTrue(all(call[0][0] == "docker" for call in calls[old_calls:])); converter.assert_called_once()
+
+    def test_default_recipe_matches_the_existing_builder_hash_expression(self):
+        source = "sha256:" + "a" * 64
+        expression = next(line for line in (SETUP.ROOT / "build-incus-worker-image.sh").read_text().splitlines() if line.startswith("RECIPE_ID="))
+        shell = 'set -euo pipefail; SOURCE_IMAGE_ID="$1"; REPO_ROOT="$2"; SOURCE_ARCH=amd64; BOOTSTRAP_GENERATION=3; D2VM_VERSION=v0.4.0; DISK_SIZE=10G; '
+        result = subprocess.run(["bash", "-c", shell + expression + '; printf "%s" "$RECIPE_ID"', "recipe-test", source, str(SETUP.ROOT.parent)],
+                                capture_output=True, text=True, check=True, env={**os.environ, "LC_ALL": "C"})
+        self.assertEqual(result.stdout, SETUP.default_recipe(source))
+
+    def test_default_collision_or_current_source_choice_never_runs_conversion(self):
+        for case in ("alias-collision", "different-source"):
+            with self.subTest(case=case), self.default_fixture() as (directory, config, registry, commands, converter, calls, phases):
+                if case == "alias-collision": registry["aliases"] = [{"name": "agentor-12345678-" + SETUP.default_recipe("sha256:" + "a" * 64)[:16], "target": "c" * 64}]
+                with self.assertRaises(ValueError): SETUP.bootstrap_default_image(config, directory, "catalog/untrusted:latest" if case == "different-source" else "")
+                converter.assert_not_called(); self.assertNotIn("defaultImage", config); self.assertEqual(phases, [])
+
+    def test_missing_default_or_scratch_space_or_tools_fails_before_dispatch(self):
+        for case in ("source-missing", "space", "tools", "size"):
+            with self.subTest(case=case), self.default_fixture() as (directory, config, registry, commands, converter, calls, phases):
+                original = commands.side_effect
+                def command(*args, **kwargs):
+                    if args[:3] == ("docker", "image", "inspect"):
+                        if case == "source-missing": raise SETUP.SetupFailure("image absent")
+                        if case == "size": return json.dumps([{"Id": "sha256:" + "a" * 64, "Architecture": "amd64", "Size": True}]).encode()
+                    return original(*args, **kwargs)
+                commands.side_effect = command
+                with patch.object(SETUP.shutil, "disk_usage", return_value=types.SimpleNamespace(free=0 if case == "space" else 100 * 1024**3)), \
+                     patch.object(SETUP.shutil, "which", return_value=None if case == "tools" else "/usr/bin/tool"):
+                    with self.assertRaises(ValueError): SETUP.bootstrap_default_image(config, directory)
+                converter.assert_not_called(); self.assertNotIn("defaultImage", config); self.assertEqual(phases, [])
+
+    def test_import_lost_ack_or_bad_metadata_stays_pending_without_alias_or_replay(self):
+        for case in ("lost-ack", "no-fingerprint", "wrong-type", "wrong-recipe"):
+            with self.subTest(case=case), self.default_fixture() as (directory, config, registry, commands, converter, calls, phases):
+                original = commands.side_effect
+                def command(*args, **kwargs):
+                    if args[4:6] == ("image", "import"):
+                        if case == "lost-ack": raise SETUP.SetupFailure("lost import response")
+                        if case == "no-fingerprint": return b"unexpected success-looking response"
+                    return original(*args, **kwargs)
+                commands.side_effect = command
+                if case == "wrong-type": registry["image"]["type"] = "container"
+                if case == "wrong-recipe": registry["image"]["properties"]["recipe_id"] = "c" * 64
+                with self.assertRaises(ValueError): SETUP.bootstrap_default_image(config, directory)
+                self.assertEqual(config["defaultImage"]["phase"], "import-pending"); self.assertEqual(registry["aliases"], [])
+                count = len(calls)
+                with self.assertRaisesRegex(ValueError, "never replay"): SETUP.bootstrap_default_image(config, directory)
+                self.assertTrue(all(call[0][0] == "docker" for call in calls[count:]))
+
+    def test_ready_record_native_identity_change_fails_without_mutation(self):
+        with self.default_fixture() as (directory, config, registry, commands, converter, calls, phases):
+            SETUP.bootstrap_default_image(config, directory); before = copy.deepcopy(config); count = len(calls)
+            registry["aliases"][0]["target"] = "c" * 64
+            with self.assertRaisesRegex(ValueError, "alias changed"): SETUP.bootstrap_default_image(config, directory)
+            self.assertEqual(config, before); self.assertTrue(all(call[0][0] == "docker" for call in calls[count:]))
+
+    def test_alias_lost_ack_retains_known_fingerprint_and_never_replays(self):
+        with self.default_fixture() as (directory, config, registry, commands, converter, calls, phases):
+            original = commands.side_effect
+            def command(*args, **kwargs):
+                result = original(*args, **kwargs)
+                if args[4:7] == ("image", "alias", "create"): raise SETUP.SetupFailure("alias response lost")
+                return result
+            commands.side_effect = command
+            with self.assertRaises(ValueError): SETUP.bootstrap_default_image(config, directory)
+            self.assertEqual(config["defaultImage"]["phase"], "alias-pending")
+            self.assertEqual(config["defaultImage"]["fingerprint"], registry["image"]["fingerprint"])
+            count = len(calls)
+            with self.assertRaisesRegex(ValueError, "never replay"): SETUP.bootstrap_default_image(config, directory)
+            self.assertTrue(all(call[0][0] == "docker" for call in calls[count:]))
+
+    def test_pinned_converter_hashes_are_verified_before_write_or_execute(self):
+        body = b"fixed official executable test fixture"; buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as packed:
+            member = tarfile.TarInfo("d2vm"); member.size = len(body); packed.addfile(member, io.BytesIO(body))
+        archive = buffer.getvalue()
+        for case in ("accepted", "archive-changed", "binary-changed", "version-changed"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary) / INSTALLATION; SETUP.namespace(directory, INSTALLATION)
+                response = MagicMock(); response.url = "https://release-assets.githubusercontent.com/pinned"; response.read.return_value = archive
+                with patch.object(SETUP, "urlopen") as download, patch.object(SETUP, "D2VM_ARCHIVE_SHA", "0" * 64 if case == "archive-changed" else hashlib.sha256(archive).hexdigest()), \
+                     patch.object(SETUP, "D2VM_BINARY_SHA", "0" * 64 if case == "binary-changed" else hashlib.sha256(body).hexdigest()), \
+                     patch.object(SETUP, "command", return_value=b"d2vm version " + (b"v0.4.1" if case == "version-changed" else b"v0.4.0")) as execute:
+                    download.return_value.__enter__.return_value = response
+                    if case == "accepted":
+                        self.assertEqual(SETUP.pinned_d2vm(directory), directory / "converter-tools")
+                        self.assertEqual((directory / "converter-tools/d2vm").read_bytes(), body)
+                    else:
+                        with self.assertRaises(ValueError): SETUP.pinned_d2vm(directory)
+                    download.assert_called_once_with(SETUP.D2VM_URL, timeout=30)
+                    if case in ("archive-changed", "binary-changed"): execute.assert_not_called(); self.assertFalse((directory / "converter-tools/d2vm").exists())
 
     def test_namespace_never_adopts_foreign_or_symlink_directories(self):
         with tempfile.TemporaryDirectory() as directory:

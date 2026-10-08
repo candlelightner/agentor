@@ -2,7 +2,7 @@
 # Operator-root only. Never migrates workers or writes canonical Agentor DATA.
 set -euo pipefail
 exec python3 - "$0" "$@" <<'PY'
-import argparse, hashlib, importlib.util, ipaddress, json, os, re, shlex, shutil, socket, ssl, stat, subprocess, sys, tempfile
+import argparse, hashlib, importlib.util, io, ipaddress, json, os, re, shlex, shutil, socket, ssl, stat, subprocess, sys, tarfile, tempfile
 from pathlib import Path
 from urllib.parse import quote
 from urllib.request import urlopen
@@ -17,6 +17,11 @@ MARKER = "user.agentor.installation"
 ZABBLY_FINGERPRINT = "4EFC590696CB15B87C73A3AD82CC8797C838DCFD"
 ZABBLY_URL = "https://pkgs.zabbly.com/incus/lts-6.0"
 EMPTY_SHARE_ROOT = Path("/var/lib/agentor-incus")
+D2VM_URL = "https://github.com/linka-cloud/d2vm/releases/download/v0.4.0/d2vm_v0.4.0_linux_amd64.tar.gz"
+D2VM_ARCHIVE_SHA = "9f2096bc7850367d063cbcf2da8ded6c5a23e70a9b0ecfdde150b2fbc9b8bd2f"
+D2VM_BINARY_SHA = "12a749cb96cada5a00bed759c120364ed92d1f38de67b557bb85ac67abd96ed8"
+VM_ASSETS = ["99-incus-agent.rules", "Dockerfile.vm", "agentor-dnsmasq.service", "agentor-docker-storage.service",
+             "agentor-docker-storage.sh", "agentor-network.sh", "agentor-private-storage.sh", "agentor-worker.service", "incus-agent-setup", "incus-agent.service"]
 
 
 class SetupFailure(ValueError):
@@ -27,8 +32,10 @@ def require(value, message):
     if not value: raise SetupFailure(message)
 
 
-def command(*argv, data=None):
-    result = subprocess.run(argv, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+def command(*argv, data=None, timeout=300, env=None):
+    result = subprocess.run(argv, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, env=env)
+    if result.returncode and (b"No space left on device" in result.stderr or b"ENOSPC" in result.stderr):
+        raise SetupFailure("Operator command reached ENOSPC; preserve incomplete bootstrap artifacts/record and settle manually before retrying")
     require(result.returncode == 0 and len(result.stdout) <= 4 * 1024 * 1024,
             Path(argv[0]).name + " failed; inspect operator diagnostics without printing credentials")
     return result.stdout
@@ -164,7 +171,8 @@ def verify_package_key(shown):
 
 
 def install_packages(opt_in_lts, work):
-    required = ["ca-certificates", "curl", "gnupg", "openssl", "python3", "qemu-system-x86", "qemu-utils", "virtiofsd", "iptables", "nftables", "kmod"]
+    required = ["ca-certificates", "curl", "gnupg", "openssl", "python3", "qemu-system-x86", "qemu-utils", "virtiofsd", "iptables", "nftables", "kmod",
+                "gdisk", "parted", "kpartx", "cryptsetup", "grub-efi-amd64-bin", "dosfstools", "e2fsprogs", "util-linux", "coreutils"]
     missing = []
     for package in required:
         result = subprocess.run(["dpkg-query", "-W", "-f=${db:Status-Abbrev}", package], capture_output=True)
@@ -351,11 +359,132 @@ def install_units(config, directory, library):
     command("systemctl", "restart", prefix + "-policy.service")
 
 
+def configured_default_source(container, explicit=""):
+    # Operator configuration only; never a WorkerRecord/catalog/bundle choice.
+    observed = json.loads(command("docker", "inspect", container))[0]
+    values = dict(entry.split("=", 1) for entry in observed.get("Config", {}).get("Env", []) if "=" in entry)
+    reference = values.get("WORKER_IMAGE_PREFIX", "") + values.get("WORKER_IMAGE", "agentor-worker:latest")
+    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9./:@_+-]{0,254}", reference) and (not explicit or explicit == reference),
+            "Trusted default must match the current operator-configured default, never a catalog/user OCI image")
+    try: image = json.loads(command("docker", "image", "inspect", reference))[0]
+    except SetupFailure: raise SetupFailure("Configured trusted default OCI is missing locally; build/pull the operator-authored default image before rerunning setup") from None
+    require(re.fullmatch(r"sha256:[a-f0-9]{64}", image.get("Id", "")) and image.get("Architecture") == "amd64"
+            and type(image.get("Size")) is int and 0 < image["Size"] <= 2**53 - 1, "Trusted default needs an immutable amd64 image and valid size")
+    return reference, image["Id"], image["Size"]
+
+
+def default_recipe(source):
+    root = ROOT.parent
+    for relative in ("scripts", "worker", "worker/vm"):
+        info = (root / relative).lstat(); require(stat.S_ISDIR(info.st_mode), "Run bootstrap from the real trusted repository directories")
+    require(sorted(path.name for path in (root / "worker/vm").iterdir()) == sorted(VM_ASSETS), "Canonical VM bootstrap asset set differs")
+    names = ["scripts/build-incus-worker-image.sh", "worker/entrypoint.sh", *["worker/vm/" + name for name in sorted(VM_ASSETS)]]
+    lines = [source, "amd64", "3", "v0.4.0", "10G"]
+    for name in names:
+        fd = os.open(root / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd); require(stat.S_ISREG(info.st_mode) and info.st_size <= 1024**2, "Canonical bootstrap needs bounded regular assets")
+            body = os.read(fd, 1024**2 + 1); require(len(body) == info.st_size, "Canonical bootstrap changed during inspection")
+        finally: os.close(fd)
+        lines.append(hashlib.sha256(body).hexdigest() + "  " + name)
+    return hashlib.sha256(("\n".join(lines) + "\n").encode()).hexdigest()
+
+
+def pinned_d2vm(directory):
+    tools = directory / "converter-tools"; namespace(tools, directory.name)
+    binary = tools / "d2vm"
+    if not binary.exists():
+        with urlopen(D2VM_URL, timeout=30) as response:
+            require(response.url.startswith("https://"), "Pinned converter download must remain HTTPS")
+            archive = response.read(64 * 1024**2 + 1)
+        require(len(archive) <= 64 * 1024**2 and hashlib.sha256(archive).hexdigest() == D2VM_ARCHIVE_SHA, "Pinned converter archive hash changed")
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as packed:
+            entries = [entry for entry in packed.getmembers() if entry.name == "d2vm"]
+            require(len(entries) == 1 and entries[0].isfile() and entries[0].size <= 64 * 1024**2, "Pinned converter executable is missing or ambiguous")
+            body = packed.extractfile(entries[0]).read(64 * 1024**2 + 1)
+        require(hashlib.sha256(body).hexdigest() == D2VM_BINARY_SHA, "Pinned converter executable hash changed")
+        write_file(binary, body, 0o700)
+    info = binary.lstat(); require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700
+                                   and info.st_size <= 64 * 1024**2 and hashlib.sha256(binary.read_bytes()).hexdigest() == D2VM_BINARY_SHA, "Pinned converter executable is unsafe or changed")
+    require(command(str(binary), "--version").decode().strip() == "d2vm version v0.4.0", "Pinned converter version changed")
+    return tools
+
+
+def bootstrap_default_image(config, directory, explicit=""):
+    reference, source, size = configured_default_source(config["container"], explicit)
+    recipe = default_recipe(source); alias = "agentor-" + config["installation"].replace("-", "")[:8] + "-" + recipe[:16]
+    context = {"sourceImageId": source, "recipeId": recipe, "alias": alias, "architecture": "amd64", "bootstrapGeneration": "3", "converterVersion": "v0.4.0"}
+    query = "?project=" + quote(config["project"])
+    def image_proof(fingerprint):
+        require(isinstance(fingerprint, str) and re.fullmatch(r"[a-f0-9]{64}", fingerprint), "Import fingerprint acknowledgement is missing or ambiguous")
+        image = native("/1.0/images/" + fingerprint + query)
+        require(image.get("fingerprint") == fingerprint and image.get("type") == "virtual-machine" and image.get("architecture") in ("x86_64", "amd64"), "Acknowledged default image is not the expected VM")
+        props = image.get("properties", {})
+        require(all(props.get(key) == value for key, value in {"source_image_id": source, "recipe_id": recipe, "source_architecture": "amd64",
+                    "bootstrap_generation": "3", "converter_version": "v0.4.0"}.items()), "Acknowledged default image immutable metadata differs")
+    prior = config.get("defaultImage")
+    aliases = native("/1.0/images/aliases" + query + "&recursion=1")
+    require(isinstance(aliases, list) and all(isinstance(item, dict) for item in aliases), "Default alias inventory is unavailable")
+    matches = [item for item in aliases if item.get("name") == alias]
+    if "defaultImage" in config:
+        require(isinstance(prior, dict) and all(prior.get(key) == value for key, value in context.items()), "Recorded default source/bootstrap differs; preserve it for explicit operator review")
+        require(prior.get("phase") == "ready", "Default bootstrap has an uncertain/incomplete dispatch; preserve artifacts and settle manually, never replay")
+        image_proof(prior.get("fingerprint", ""))
+        require(len(matches) == 1 and matches[0].get("target") == prior["fingerprint"] and matches[0].get("type") == "virtual-machine", "Recorded owned default alias changed or disappeared")
+        require(configured_default_source(config["container"], reference)[1] == source and default_recipe(source) == recipe, "Trusted default source/bootstrap changed before reuse")
+        return prior
+    require(not matches, "Default alias collides with an unrecorded image; no adoption or replacement is permitted")
+    work = Path(config["imageWorkDir"]); namespace(work, config["installation"])
+    required = max(32 * 1024**3, 3 * size + 24 * 1024**3)
+    require(shutil.disk_usage(work).free >= required, "Insufficient trusted conversion scratch space; provide an owned --image-work-dir with at least " + str(required // 1024**3 + 1) + " GiB free")
+    for tool in ("docker", "sgdisk", "qemu-img", "parted", "kpartx", "cryptsetup", "losetup", "mount", "umount", "grub-install", "mkfs.ext4", "mkfs.fat", "flock"):
+        require(shutil.which(tool), "Trusted default conversion prerequisite is missing: " + tool)
+    tools = pinned_d2vm(directory); output = work / ("image-" + recipe)
+    require(not os.path.lexists(output), "Unrecorded conversion scratch already exists; preserve it and review manually")
+    namespace(output, config["installation"])
+    def save(phase, **fields):
+        config["defaultImage"] = {**context, "phase": phase, **fields}
+        write_file(directory / "config.json", json.dumps(config, sort_keys=True) + "\n", replace=True)
+    save("converting")
+    env = {**os.environ, "PATH": str(tools) + ":" + os.environ.get("PATH", "/usr/sbin:/usr/bin:/sbin:/bin"), "LC_ALL": "C"}
+    command("bash", str(ROOT / "build-incus-worker-image.sh"), "--source-image", source, "--expected-source-id", source,
+            "--expected-recipe-id", recipe, "--size", "10G", "--no-import", "--output-dir", str(output), timeout=45 * 60, env=env)
+    require(configured_default_source(config["container"], reference)[1] == source and default_recipe(source) == recipe, "Trusted default source/bootstrap changed during conversion")
+    save("import-pending")
+    result = command("incus", "--force-local", "--project", config["project"], "image", "import", str(output / "metadata.tar.gz"), str(output / "disk.qcow2"))
+    fingerprints = re.findall(r"(?<![a-f0-9])[a-f0-9]{64}(?![a-f0-9])", result.decode())
+    require(len(fingerprints) == 1, "Import did not provide exactly one fingerprint acknowledgement; preserve artifacts/record, never replay")
+    fingerprint = fingerprints[0]; image_proof(fingerprint); save("alias-pending", fingerprint=fingerprint)
+    require(not any(item.get("name") == alias for item in native("/1.0/images/aliases" + query + "&recursion=1")), "Alias appeared before publication; do not replace it")
+    command("incus", "--force-local", "--project", config["project"], "image", "alias", "create", alias, fingerprint)
+    acknowledged = native("/1.0/images/aliases/" + quote(alias) + query)
+    require(acknowledged.get("target") == fingerprint and acknowledged.get("type") == "virtual-machine", "Default alias acknowledgement changed; preserve exact pending authority")
+    image_proof(fingerprint)
+    require(configured_default_source(config["container"], reference)[1] == source and default_recipe(source) == recipe, "Trusted default source/bootstrap changed before publication")
+    save("ready", fingerprint=fingerprint)
+    return config["defaultImage"]
+
+
+def portainer_environment(config, directory, interface, default_image):
+    return {"INCUS_ENABLED": "true", "INCUS_ENDPOINT": "https://" + config["tlsName"] + ":" + str(config["httpsPort"]),
+            "INCUS_PROJECT": config["project"], "INCUS_NETWORK": config["network"], "INCUS_STORAGE_POOL": config["pool"],
+            "INCUS_CONVERTER_STORAGE_POOL": config["pool"], "INCUS_NETWORK_HOST_ENDPOINT": "https://" + config["tlsName"] + ":" + str(config["policyPort"]),
+            "INCUS_INTERNAL_GATEWAY_URL": config["internalUrl"], "INCUS_WORKER_IMAGE": default_image["alias"],
+            "INCUS_CONVERTER_SEED_FINGERPRINT": default_image["fingerprint"], "INCUS_TLS_NAME": config["tlsName"],
+            "INCUS_API_HOST_ADDRESS": config["listen"], "INCUS_WORKER_GATEWAY": str(interface.ip), "INCUS_INTERNAL_PORT": str(config["internalPort"]),
+            **{"INCUS_" + name + "_SOURCE": str(directory / file) for name, file in
+               (("CLIENT_CERT", "client.crt"), ("CLIENT_KEY", "client.key"), ("SERVER_CERT", "server.crt"), ("POLICY_CERT", "policy.crt"))}}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Operator-root Ubuntu24/amd64 Incus setup. Preserves canonical DATA/legacy workers; never migrates or resets unrelated resources.")
     parser.add_argument("--install-lts", action="store_true", help="Explicitly offer fingerprint-pinned signed Zabbly Incus 6.0 LTS packages")
     parser.add_argument("--routing", action="store_true", help="Installed systemd use only: refresh this installation's exact routing")
     parser.add_argument("--config", help="Installed root-owned /etc/agentor/incus/<installationUUID>/config.json")
+    parser.add_argument("--trusted-worker-image", default=os.environ.get("AGENTOR_TRUSTED_WORKER_IMAGE", ""),
+                        help="Explicit matching current DEFAULT OCI reference. Running setup trusts that operator-authored default; NEVER choose user/catalog OCI for host-mounted conversion")
+    parser.add_argument("--image-work-dir", default=os.environ.get("AGENTOR_INCUS_IMAGE_WORK_DIR", ""),
+                        help="Optional absolute private operator-owned scratch outside canonical DATA; supports a large HDD without granting it to workers")
     for argument, variable, default in (("orchestrator-container", "INCUS_ORCHESTRATOR_CONTAINER", "agentor-orchestrator"), ("docker-network", "INCUS_DOCKER_NETWORK", ""),
                                       ("data-host-path", "AGENTOR_DATA_HOST_PATH", ""), ("project", "INCUS_PROJECT", "agentor"), ("network", "INCUS_NETWORK", ""),
                                       ("storage-pool", "INCUS_STORAGE_POOL", ""), ("tls-name", "INCUS_TLS_NAME", socket.gethostname())):
@@ -382,26 +511,30 @@ def main():
             and re.fullmatch(r"[A-Za-z0-9_-]{1,63}", pool), "Dedicated safe project/network/pool names required")
     require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", args.tls_name) and all(1 <= port <= 65535 for port in (args.https_port, args.policy_port, args.internal_port)), "Explicit certificate hostname and valid ports required")
     directory = Path("/etc/agentor/incus") / installation; namespace(directory, installation)
+    prior = json.loads((directory / "config.json").read_text()) if (directory / "config.json").exists() else {}
+    work = SOURCES.canonical(args.image_work_dir or prior.get("imageWorkDir") or str(directory / "image-work"))
+    require(not SOURCES.overlaps(work, data), "Image conversion scratch must not modify canonical DATA or its ancestors")
     config = {"installation": installation, "dataDir": data, "project": args.project, "network": network, "pool": pool, "container": args.orchestrator_container,
               "dockerNetwork": docker_network, "tlsName": args.tls_name, "httpsPort": args.https_port, "policyPort": args.policy_port, "internalPort": args.internal_port,
-              "listen": gateway, "sourceTable": "agentor_source_" + short}
+              "listen": gateway, "sourceTable": "agentor_source_" + short, "imageWorkDir": work}
     if (directory / "config.json").exists():
-        prior = json.loads((directory / "config.json").read_text()); require(all(prior.get(key) == value for key, value in config.items()), "Installed operator configuration differs; preserve and reconcile manually")
+        require(all(prior.get(key, value if key == "imageWorkDir" else None) == value for key, value in config.items()), "Installed operator configuration differs; preserve and reconcile manually")
+        if "defaultImage" in prior: config["defaultImage"] = prior["defaultImage"]
     install_packages(args.install_lts, directory)
     bridge_netfilter(installation)
     paths = initial_share_paths(data, installation)
     interface = resource_setup(config, paths); certificates(config, directory, gateway)
-    write_file(directory / "config.json", json.dumps(config, sort_keys=True) + "\n")
+    write_file(directory / "config.json", json.dumps(config, sort_keys=True) + "\n", replace=True)
     library = Path("/usr/local/lib/agentor-incus") / installation
     install_units(config, directory, library); routing(config)
     policy = json.loads(command("curl", "--fail", "--silent", "--show-error", "--max-time", "15", "--noproxy", "*", "--resolve", args.tls_name + ":" + str(args.policy_port) + ":" + gateway,
                     "--cert", str(directory / "client.crt"), "--key", str(directory / "client.key"), "--cacert", str(directory / "policy.crt"),
                     "https://" + args.tls_name + ":" + str(args.policy_port) + "/v1/managed-networks/readiness?project=" + quote(args.project)))
     require(policy.get("metadata") == {"ready": True, "installation": installation, "project": args.project, "primary": network}, "Owned policy readiness is incomplete")
+    default_image = bootstrap_default_image(config, directory, args.trusted_worker_image)
     print("Owned host setup installed; NOT a completed readiness/acceptance claim. Update Portainer, then run check-incus-host.sh and the real canary.")
-    for key, value in {"INCUS_ENABLED": "true", "INCUS_ENDPOINT": "https://" + args.tls_name + ":" + str(args.https_port), "INCUS_PROJECT": args.project,
-                       "INCUS_NETWORK": network, "INCUS_STORAGE_POOL": pool, "INCUS_CONVERTER_STORAGE_POOL": pool,
-                       "INCUS_NETWORK_HOST_ENDPOINT": "https://" + args.tls_name + ":" + str(args.policy_port), "INCUS_INTERNAL_GATEWAY_URL": config["internalUrl"]}.items(): print(key + "=" + value)
+    for key, value in portainer_environment(config, directory, interface, default_image).items(): print(key + "=" + value)
+    print("Set AGENTOR_INCUS_ORCHESTRATOR_IMAGE separately to the operator-approved updated control-plane image.")
     print("Read-only TLS file mounts (do NOT mount the whole credential directory or any Incus Unix socket):")
     for file, variable in (("client.crt", "INCUS_CLIENT_CERT_PATH"), ("client.key", "INCUS_CLIENT_KEY_PATH"), ("server.crt", "INCUS_SERVER_CERT_PATH"), ("policy.crt", "INCUS_NETWORK_HOST_SERVER_CERT_PATH")):
         print(str(directory / file) + ":/run/agentor-incus/" + file + ":ro; " + variable + "=/run/agentor-incus/" + file)
@@ -410,8 +543,7 @@ def main():
     print("Checker host inputs: AGENTOR_INSTALLATION_ID=" + installation + "; INCUS_DOCKER_NETWORK=" + docker_network
           + "; INCUS_ORCHESTRATOR_CONTAINER=" + args.orchestrator_container + "; INCUS_SOURCE_NAT_TABLE=" + config["sourceTable"]
           + "; INCUS_HOST_CHECK_CONNECT_ADDRESS=" + gateway + ". Use HOST certificate file paths, not container paths, when running the checker.")
-    print("Configure an operator-trusted converter seed fingerprint separately; no image is silently adopted.")
-    print("PENDING rollout integration: existing policy service/runtime must ensure the three exact directories for newly created account/owned-worker identities; no DATA/users parent grant is installed.")
+    print("Default worker alias and isolated-converter seed are the same acknowledged trusted VM image; custom/user OCI conversion remains isolated.")
 
 
 if __name__ == "__main__":
