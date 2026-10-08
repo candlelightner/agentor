@@ -21,6 +21,7 @@ import type { MountConfig, HostMountPath } from '../../orchestrator/shared/types
 import type { PortMapping } from '../../orchestrator/server/utils/port-mapping-store';
 import type { DomainMapping } from '../../orchestrator/server/utils/domain-mapping-store';
 import { validatePluginManifest } from '../../orchestrator/server/utils/plugin-manifest';
+import type { AdministrativeWorkspaceRecord } from '../../orchestrator/server/utils/admin-workspace-store';
 
 const run = promisify(execFile), q = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
 const ssh = ['-p', '22375', '-i', '/workspace/agentor-kata-vm-access.ZgLVo9uk/id_ed25519',
@@ -30,8 +31,9 @@ const scp = ['-P', '22375', ...ssh.slice(2, -1)];
 type Context = { project: string; projectMarker: string; network: string; tlsRoot: string; credentialsDir: string;
   workerImage: string; workerImageId: string; incusWorkerImage: string; seedFingerprint: string; appBaseImage: string; appBaseImageId: string };
 type Worker = { id: string; userId: string; containerId: string; containerName: string; runtimeKind: 'legacy-docker' | 'incus-vm'; status: string };
-type DockerInfo = { Id: string; Image: string; Created: string; Config: { Labels: Record<string, string> }; State: { Running: boolean };
-  Mounts: Array<{ Type: string; Source: string; Destination: string; Name?: string }>;
+type DockerInfo = { Id: string; Name: string; Image: string; Created: string; Config: { Labels: Record<string, string> };
+  State: { Running: boolean; Status: string; Paused: boolean; Restarting: boolean; Pid: number };
+  Mounts: Array<{ Type: string; Source: string; Destination: string; Name?: string; RW: boolean }>;
   NetworkSettings: { Networks: Record<string, { IPAddress: string; Aliases?: string[] | null }> } };
 type MigrationStatus = { kind: string; phase: string; sourceRetained: boolean; recoveryRequired: boolean };
 const metadataScript = String.raw`
@@ -55,7 +57,9 @@ const safeMigrationFailure = (status: number, input: unknown) => {
   return 'Migration POST failed: ' + JSON.stringify({ status, code, message: message ?? 'Non-allowlisted error body withheld' });
 };
 
-test('public explicit legacy migration preserves source through validation, native data and exact finalization', async () => {
+test(process.env.LEGACY_INCUS_MIGRATION_INTERRUPTION_TEST === 'true'
+  ? 'public validating migration remains fenced after exact controller restart with both authorities retained'
+  : 'public explicit legacy migration preserves source through validation, native data and exact finalization', async () => {
   test.skip(process.env.LEGACY_INCUS_MIGRATION_PUBLIC_TEST !== 'true', 'Explicit serial approved disposable migration gate');
   test.setTimeout(25 * 60_000);
   const contextFile = process.env.INCUS_CUSTOM_IMAGE_FIXTURE_JSON;
@@ -87,7 +91,11 @@ test('public explicit legacy migration preserves source through validation, nati
   const secret = randomBytes(32).toString('hex');
   const rollbackRequested = process.env.LEGACY_INCUS_MIGRATION_ROLLBACK_TEST === 'true';
   const parityRequested = process.env.LEGACY_INCUS_MIGRATION_PARITY_TEST === 'true';
-  if (parityRequested && rollbackRequested) throw new Error('Parity and accepted rollback variants are separate serial fixtures');
+  const interruptionRequested = process.env.LEGACY_INCUS_MIGRATION_INTERRUPTION_TEST === 'true';
+  if ([parityRequested, rollbackRequested, interruptionRequested].filter(Boolean).length > 1)
+    throw new Error('Parity, rollback and interrupted restart variants are separate serial fixtures');
+  if (interruptionRequested && process.env.LEGACY_INCUS_MIGRATION_DOCKER_TEST === 'true')
+    throw new Error('The bounded interrupted-restart fixture selects a simple legacy worker; Docker migration has separate accepted gates');
   const workerSecret = randomBytes(32).toString('base64url'), workerSecretHash = createHash('sha256').update(workerSecret).digest('hex');
   const secretProof = String.raw`import os,stat,hashlib,sys
 p='/run/agentor-secrets/migration/rollback-proof';s=os.stat(p,follow_symlinks=False)
@@ -100,6 +108,8 @@ if sys.argv[1]=='legacy':
 else:
  assert sys.argv[1]=='native' and open('/run/agentor/provisioned','rb').read()==b'agentor-runtime-v1\n'`;
   let appId = '', imageId = '', owner = '', gateway = '', internalPort = '', installation = '', completed = false, policyAdded = false;
+  let interruptionAccepted = false;
+  let globalAdminBaseline: DockerInfo | undefined, globalAdminVolumes = '';
   let bridge = '', dockerCidr = '', incusCidr = '', nftBaseline = '', forwardBaseline = '';
   let phase = 'deterministic preflight';
   const policyUnit = 'agentor-migration-policy-' + fixtureId + '.service', policyPort = 18446;
@@ -121,8 +131,9 @@ else:
   const inspect = async (id: string): Promise<DockerInfo> => {
     const value = JSON.parse(await root(`sudo docker inspect ${q(id)} --format '{{json .}}'`)) as DockerInfo;
     // Never expose Docker Config.Env (cookies/fixture auth secrets) in assertion diffs.
-    return { Id: value.Id, Image: value.Image, Created: value.Created, Config: { Labels: value.Config.Labels },
-      State: { Running: value.State.Running }, Mounts: value.Mounts, NetworkSettings: { Networks: value.NetworkSettings.Networks } };
+    return { Id: value.Id, Name: value.Name, Image: value.Image, Created: value.Created, Config: { Labels: value.Config.Labels },
+      State: { Running: value.State.Running, Status: value.State.Status, Paused: value.State.Paused,
+        Restarting: value.State.Restarting, Pid: value.State.Pid }, Mounts: value.Mounts, NetworkSettings: { Networks: value.NetworkSettings.Networks } };
   };
   const records = async () => JSON.parse(await root(`sudo docker exec ${appId} node -e ${q(
     `const f=require('node:fs');const p=${JSON.stringify(data + '/users/' + owner + '/workers.json')};const s=f.lstatSync(p);if(!s.isFile()||s.isSymbolicLink())throw Error('Record source changed');console.log(f.readFileSync(p,'utf8'));`)}`)) as WorkerRecord[];
@@ -152,7 +163,8 @@ c.request('PUT',path,json.dumps(dict(config=cfg,description=p['description'])),{
       await root(`sudo docker stop --time 30 ${appId}`); await root(`sudo docker rm ${appId}`); appId = '';
     }
     const env = ['DATA_DIR=' + data, 'CONTAINER_PREFIX=' + prefix, 'DOCKER_NETWORK=' + network, 'WORKER_IMAGE=' + context.workerImage,
-      'WORKER_IMAGE_PREFIX=', 'BETTER_AUTH_URL=http://127.0.0.1:3000', 'BETTER_AUTH_SECRET=' + secret, 'AGENTOR_INSTANCE_RECOVERY_MODE=true',
+      'WORKER_IMAGE_PREFIX=', 'BETTER_AUTH_URL=http://127.0.0.1:3000', 'BETTER_AUTH_SECRET=' + secret,
+      'AGENTOR_INSTANCE_RECOVERY_MODE=' + String(!(enabled && interruptionRequested)),
       'INCUS_ENABLED=' + String(enabled), 'INCUS_ENDPOINT=https://agentor-kata-preflight:8443', 'INCUS_PROJECT=' + context.project,
       'INCUS_NETWORK=' + context.network, 'INCUS_STORAGE_POOL=' + (process.env.INCUS_STORAGE_POOL || 'default'), 'INCUS_WORKER_IMAGE=' + context.incusWorkerImage,
       'INCUS_CLIENT_CERT_PATH=/tls/client.crt', 'INCUS_CLIENT_KEY_PATH=/tls/client.key', 'INCUS_SERVER_CERT_PATH=/tls/server.crt',
@@ -186,6 +198,14 @@ c.request('PUT',path,json.dumps(dict(config=cfg,description=p['description'])),{
     await expect.poll(async () => { try { return (await request('/api/health')).status; } catch { return 0; } }, { timeout: 60_000 }).toBe(200);
   };
   const dockerExec = (id: string, argv: string[], timeout = 30_000) => root(`sudo docker exec -u root ${id} ${argv.map(q).join(' ')}`, timeout);
+  const adminVolumeIdentity = () => root("sudo docker volume inspect agentor-admin-workspace-data agentor-admin-agent-data --format '{{.Name}} {{.CreatedAt}} {{.Driver}} {{.Mountpoint}}'");
+  const assertGlobalAdminUnchanged = async () => {
+    expect(globalAdminBaseline).toBeDefined();
+    const current = await inspect(globalAdminBaseline!.Id);
+    const mounts = (value: DockerInfo) => legacyMigrationMountIdentity(value.Mounts as Parameters<typeof legacyMigrationMountIdentity>[0]);
+    expect({ ...current, Mounts: mounts(current) }).toEqual({ ...globalAdminBaseline!, Mounts: mounts(globalAdminBaseline!) });
+    expect(await adminVolumeIdentity()).toBe(globalAdminVolumes);
+  };
   const create = async (dockerEnabled: boolean, mounts: MountConfig[] = []) => {
     const environment = await request<{ id: string }>('/api/environments', { name: 'Migration fixture ' + String(dockerEnabled), dockerEnabled,
       cpuLimit: 1, memoryLimit: '1024m', networkMode: 'full', exposeApis: { portMappings: true, domainMappings: true, usage: true } });
@@ -313,6 +333,113 @@ c.request('PUT',path,json.dumps(dict(config=cfg,description=p['description'])),{
     }
     console.info('Ordinary public rollback proved before retry', { workerId: worker.id, destinationIncarnation: captured!.incarnation, observedPhase: captured!.phase });
     await policy(true); policyAdded = true;
+  };
+  const interruptedRestart = async (worker: Worker) => {
+    phase = 'real validating-phase migration interruption';
+    const before = await inspect(worker.containerId);
+    expect(before.Config.Labels['agentor.id']).toBe(worker.id); expect(before.Image).toBe(context.workerImageId);
+    expect(before.State.Running).toBe(true);
+    const bytes = JSON.parse(await dockerExec(before.Id, ['python3', '-c', metadataScript, 'read']));
+    const sourceRoots = ['/workspace', '/home/agent/.agent-data'].map((target, index) => {
+      const matches = before.Mounts.filter(mount => mount.Destination === target);
+      expect(matches).toHaveLength(1); expect(matches[0]!.Type).toBe('bind');
+      expect(matches[0]!.Source).toBe(data + '/users/' + owner + '/' + (index ? 'agents' : 'workspaces') + '/' + worker.id);
+      return matches[0]!.Source;
+    });
+    const directoryProof = String.raw`import os,stat,json,sys
+paths=json.loads(sys.argv[1]);out=[]
+for p in paths:
+ s=os.lstat(p);assert stat.S_ISDIR(s.st_mode) and os.path.realpath(p)==p
+ out.append(dict(path=p,dev=s.st_dev,ino=s.st_ino,uid=s.st_uid,gid=s.st_gid,mode=stat.S_IMODE(s.st_mode)))
+print(json.dumps(out))`;
+    const directories = await root(`sudo python3 -c ${q(directoryProof)} ${q(JSON.stringify(sourceRoots))}`);
+    const hostMetadata = metadataScript.replace("paths=['/workspace/migration-proof','/home/agent/.agent-data/migration-proof']",
+      'paths=' + JSON.stringify(sourceRoots.map(path => path + '/migration-proof')));
+    const readSource = async () => {
+      expect(await root(`sudo python3 -c ${q(directoryProof)} ${q(JSON.stringify(sourceRoots))}`)).toBe(directories);
+      expect(JSON.parse(await root(`sudo python3 -c ${q(hostMetadata)} read`))).toEqual(bytes);
+    };
+    await readSource();
+    let settled = false;
+    const pending = request<MigrationStatus>('/api/admin/workers/' + worker.id + '/incus-migration', {}, 'POST', 600_000)
+      .then(result => ({ result }), () => ({ disconnected: true })).finally(() => { settled = true; });
+    let captured: { record: WorkerRecord; vm: Awaited<ReturnType<IncusClient['getInstance']>> } | undefined;
+    await expect.poll(async () => {
+      const record = (await records()).find(value => value.id === worker.id), marker = record?.incusMigration;
+      if (record?.runtimeKind === 'legacy-docker' && marker?.phase === 'validating' && marker.destinationIncarnation) {
+        const vm = await client.getInstance(worker.containerName);
+        expect(vm.config).toMatchObject({ 'volatile.uuid': marker.destinationIncarnation, 'user.agentor.recreation': marker.nonce,
+          'user.agentor.id': worker.id, 'user.agentor.owner': owner, 'user.agentor.installation': installation });
+        // Promotion must have attached the real filtered primary NIC. Kill
+        // during its fresh boot/provisioning, not while extraction is networkless.
+        if (vm.status === 'Running' && vm.devices.eth0?.network === context.network) {
+          expect(vm.devices.eth0).toMatchObject({ 'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true', 'security.mac_filtering': 'true' });
+          expect((await inspect(before.Id)).State).toMatchObject({ Running: false, Status: 'exited', Paused: false, Restarting: false, Pid: 0 });
+          captured = { record: structuredClone(record), vm }; return true;
+        }
+      }
+      if (settled) throw new Error('Migration settled before the validating-phase restart seam; retain the fixture without retry');
+      return false;
+    }, { timeout: 600_000, intervals: [50, 100, 200] }).toBe(true);
+    const marker = captured!.record.incusMigration!;
+    expect(marker.nonce).toMatch(/^[a-f0-9-]{36}$/); expect(marker.destinationIncarnation).toMatch(/^[a-f0-9-]{36}$/);
+    const controller = await inspect(appId);
+    expect(controller.Id).toBe(appId); expect(controller.Image).toBe(imageId); expect(controller.State.Running).toBe(true);
+    expect(controller.Config.Labels['agentor.migration-fixture']).toBe(fixtureId);
+    expect(controller.Mounts.filter(mount => mount.Source === data && mount.Destination === data && mount.Type === 'bind' && mount.RW)).toHaveLength(1);
+    expect(await root(`sudo docker inspect ${controller.Id} --format '{{range .Config.Env}}{{if eq . "AGENTOR_INSTANCE_RECOVERY_MODE=false"}}normal{{end}}{{end}}'`)).toBe('normal');
+    await assertGlobalAdminUnchanged();
+    expect((await records()).find(record => record.id === worker.id)?.incusMigration).toEqual(marker);
+    await writeFile(join(local, 'interrupted-migration.json'), JSON.stringify({ fixtureId, remote, appId, imageId, worker,
+      source: before, captured, sourceRoots, directories, bytes, network, chain, table, policyAdded, installation }, null, 2), { mode: 0o600, flag: 'wx' });
+    await root(`sudo docker kill --signal KILL ${controller.Id}`);
+    expect((await inspect(controller.Id)).State.Running).toBe(false);
+    await pending; // Disconnection is observed, never treated as rollback/success authority.
+    const sourceStopped = await inspect(before.Id); expect(sourceStopped.State).toMatchObject({ Running: false, Pid: 0 });
+    expect(sourceStopped).toMatchObject({ Id: before.Id, Image: before.Image, Created: before.Created, Config: before.Config });
+    expect(legacyMigrationMountIdentity(sourceStopped.Mounts as Parameters<typeof legacyMigrationMountIdentity>[0]))
+      .toEqual(legacyMigrationMountIdentity(before.Mounts as Parameters<typeof legacyMigrationMountIdentity>[0]));
+    await readSource();
+    phase = 'same controller normal startup after interrupted validating migration';
+    expect(await root(`sudo docker start ${controller.Id}`)).toBe(controller.Id);
+    await expect.poll(async () => { try { return (await request('/api/health')).status; } catch { return 0; } }, { timeout: 120_000 }).toBe(200);
+    const restarted = await inspect(controller.Id);
+    expect(restarted).toMatchObject({ Id: controller.Id, Image: controller.Image, Created: controller.Created, State: { Running: true } });
+    expect(legacyMigrationMountIdentity(restarted.Mounts as Parameters<typeof legacyMigrationMountIdentity>[0]))
+      .toEqual(legacyMigrationMountIdentity(controller.Mounts as Parameters<typeof legacyMigrationMountIdentity>[0]));
+    expect(restarted.NetworkSettings.Networks[network]!.IPAddress)
+      .toBe(controller.NetworkSettings.Networks[network]!.IPAddress); // Existing pinned source-preservation rules still apply.
+    expect(normalizedNft(await root(`sudo nft -j list table ip ${table}`))).toBe(nftBaseline);
+    expect(await root(`sudo iptables -w -S ${chain}`)).toBe(forwardBaseline);
+    const record = (await records()).find(value => value.id === worker.id)!;
+    expect(record.runtimeKind).toBe('legacy-docker'); expect(record.incusMigration).toEqual(marker); expect(record.incusRecreation).toBeUndefined();
+    const status = await request<MigrationStatus>('/api/admin/workers/' + worker.id + '/incus-migration');
+    expect(status.status).toBe(200); expect(status.body).toEqual({ kind: 'legacy-docker', phase: 'validating', recoveryRequired: true, sourceRetained: true });
+    expect((await request<Worker[]>('/api/containers')).body.find(value => value.id === worker.id))
+      .toMatchObject({ runtimeKind: 'legacy-docker', containerId: before.Id, status: 'error' });
+    for (const [path, body, method] of [
+      ['/api/containers/' + worker.id + '/restart', {}, 'POST'], ['/api/containers/' + worker.id + '/archive', {}, 'POST'],
+      ['/api/containers/' + worker.id + '/export?includeRootfs=false', undefined, 'GET'],
+      ['/api/containers/' + worker.id + '/files', undefined, 'GET'],
+    ] as const) expect((await request(path, body, method)).status).toBe(409);
+    const vm = await client.getInstance(worker.containerName);
+    expect(vm.config).toMatchObject({ 'volatile.uuid': marker.destinationIncarnation, 'user.agentor.recreation': marker.nonce,
+      'user.agentor.installation': installation, 'user.agentor.id': worker.id, 'user.agentor.owner': owner });
+    await expect.poll(async () => {
+      const current = await client.getInstance(worker.containerName);
+      expect(current.config['volatile.uuid']).toBe(marker.destinationIncarnation);
+      try {
+        const denied = await client.exec(worker.containerName, ['curl', '--max-time', '10', '-sS', '-o', '/dev/null', '-w', '%{http_code}',
+          'http://' + gateway + ':' + internalPort + '/api/worker-self/info']);
+        return denied.returnCode === 0 ? denied.stdout : 'guest-not-ready';
+      } catch { return 'guest-agent-not-ready'; }
+    }, { timeout: 90_000, intervals: [250, 500, 1000] }).toBe('401');
+    expect((await inspect(before.Id)).State).toMatchObject({ Running: false, Pid: 0 }); await readSource();
+    expect((await records()).find(value => value.id === worker.id)?.incusMigration).toEqual(marker);
+    await assertGlobalAdminUnchanged();
+    interruptionAccepted = true;
+    console.info('Interrupted validating migration remained fenced after exact controller restart; both authorities retained for root manual recovery',
+      { fixtureId, appId, imageId, workerId: worker.id, sourceId: before.Id, destinationIncarnation: marker.destinationIncarnation, local, remote });
   };
   const removeNative = async (worker: Worker) => {
     const vm = await client.getInstance(worker.containerName); expect(vm.config['volatile.uuid']).toBe(destinations.get(worker.id));
@@ -534,6 +661,23 @@ print(json.dumps(dict(config=v['config'],description=v['description'])))`;
     await run('scp', [...scp, '-r', build, join(local, 'data'), 'kata-test@172.19.0.1:' + remote + '/'], { timeout: 60_000 });
     imageId = await root(`sudo docker build -q --label agentor.migration-fixture=${fixtureId} --build-arg BASE_IMAGE=${q(context.appBaseImage)} -t ${q(image)} ${q(remote + '/image')}`, 180_000);
     expect(imageId).toMatch(/^sha256:[a-f0-9]{64}$/);
+    if (interruptionRequested) {
+      // Normal worker startup remains enabled. This deliberate isolated stopped
+      // admin record pins an EXISTING non-overlay image: the accepted provenance
+      // guard throws before any global admin inspect/create/build/volume mutation,
+      // whereas a missing image would fall back to an unrelated overlay build.
+      expect(await root(`sudo docker image inspect ${q(imageId)} --format '{{index .Config.Labels "agentor.admin.overlay"}}'`)).not.toBe('true');
+      globalAdminBaseline = await inspect('agentor-admin-workspace');
+      expect(globalAdminBaseline.Id).toMatch(/^[a-f0-9]{64}$/); expect(globalAdminBaseline.Name).toBe('/agentor-admin-workspace');
+      expect(globalAdminBaseline.Config.Labels['agentor.administrative']).toBe('true');
+      globalAdminVolumes = await adminVolumeIdentity();
+      const stamp = new Date().toISOString(), record: AdministrativeWorkspaceRecord = { schemaVersion: 1, id: randomUUID(),
+        kind: 'administrative', trusted: true, status: 'stopped', createdAt: stamp, updatedAt: stamp, imageDigest: imageId };
+      const adminData = join(local, 'data', 'admin'); await mkdir(adminData, { mode: 0o700 });
+      await writeFile(join(adminData, 'workspace.v1.json'), JSON.stringify(record), { mode: 0o600, flag: 'wx' });
+      await root(`test ! -e ${q(data + '/admin')}`);
+      await run('scp', [...scp, '-r', adminData, 'kata-test@172.19.0.1:' + data + '/'], { timeout: 30_000 });
+    }
     await root(`sudo docker network create --label agentor.migration-fixture=${fixtureId} ${q(network)}`);
     const net = JSON.parse(await root(`sudo docker network inspect ${q(network)}`)) as Array<{ Id: string; Options: Record<string, string>; IPAM: { Config: Array<{ Subnet: string }> } }>;
     bridge = net[0]!.Options['com.docker.network.bridge.name'] ?? 'br-' + net[0]!.Id.slice(0, 12); expect(bridge).toMatch(/^[A-Za-z0-9_.-]{1,15}$/);
@@ -566,6 +710,7 @@ print(json.dumps(dict(config=v['config'],description=v['description'])))`;
     expect((await request<Worker[]>('/api/containers')).body.find(worker => worker.id === simple.id)).toMatchObject({ runtimeKind: 'legacy-docker', containerId: simple.containerId });
     expect((await records()).find(record => record.id === simple.id)?.incusMigration).toBeUndefined(); expect((await inspect(simple.containerId)).Id).toBe(legacyBefore.Id);
     if (rollbackRequested) await rollback(simple, dockerEnabled);
+    if (interruptionRequested) { await interruptedRestart(simple); return; }
     await migrate(simple, dockerEnabled, parityRequested ? () => assertParity(simple) : undefined);
     if (parityRequested) { await assertDetachedReattach(simple); await cleanupParity(simple); }
     completed = true;
@@ -587,7 +732,7 @@ print(json.dumps(dict(config=v['config'],description=v['description'])))`;
       expect(await root(`sudo docker image inspect ${q(image)} --format '{{.Id}} {{index .Config.Labels "agentor.migration-fixture"}}'`)).toBe(imageId + ' ' + fixtureId); await root(`sudo docker image rm ${q(image)}`);
       await rm(local, { recursive: true, force: true });
       console.info('Owned public migration fixtures removed; exact private host DATA/transport retained for root-reviewed disposal', { remote, fixtureId });
-    } else console.error('Unconfirmed migration fixture retained; no guessed cleanup', { local, remote, fixtureId, appId, imageId, workers: workers.map(worker => worker.id) });
+    } else if (!interruptionAccepted) console.error('Unconfirmed migration fixture retained; no guessed cleanup', { local, remote, fixtureId, appId, imageId, workers: workers.map(worker => worker.id) });
     client.dispose();
   }
 });
