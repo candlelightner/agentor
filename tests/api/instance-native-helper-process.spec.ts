@@ -30,6 +30,9 @@ import type { InstanceBackupArtifact, InstanceBackupJob, InstanceBackupManifest,
 import type { BackupArtifact, BackupJob } from '../../orchestrator/server/utils/backup-types';
 import type { ImageBuild, ImageDefinition, NativeImageBinding } from '../../orchestrator/server/utils/image-catalog';
 import { readCanonicalIncusBootstrap, incusConversionRecipeId } from '../../orchestrator/server/utils/incus-image-converter';
+import { extractBundle, readWorkerReconstruction, validateGzipTarPayload } from '../../orchestrator/server/utils/worker-export';
+import { snapshotIncusWorkerBackupRuntime } from '../../orchestrator/server/utils/worker-backup-runtime';
+import type { PublicExportJob } from '../../orchestrator/server/utils/export-jobs';
 
 const run = promisify(execFile);
 const ssh = ['-p', '22375', '-i', '/workspace/agentor-kata-vm-access.ZgLVo9uk/id_ed25519',
@@ -59,7 +62,9 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
     : process.env.INCUS_NEW_PUBLIC_TEST === 'true'
       ? 'real authenticated encrypted worker backup restores fresh Incus worker storage and selected native Docker data'
       : process.env.INCUS_CUSTOM_IMAGE_PUBLIC_TEST === 'true'
-        ? process.env.INCUS_CUSTOM_IMAGE_BACKUP_TEST === 'true'
+        ? process.env.INCUS_CUSTOM_IMAGE_PORTABLE_TEST === 'true'
+          ? 'real authenticated portable custom worker export imports fresh Incus worker from private cache'
+          : process.env.INCUS_CUSTOM_IMAGE_BACKUP_TEST === 'true'
           ? 'real authenticated encrypted custom worker backup restores fresh Incus worker from private cache'
           : 'real controlled catalog OCI creates and rebuilds ordinary Incus worker with private derived image cache reuse'
     : 'real public instance restore imports an encrypted native bundle and restores ordinary VM Docker data through authenticated REST'
@@ -68,6 +73,8 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
   const newPublic = mode === 'app-rest-ordinary' && process.env.INCUS_NEW_PUBLIC_TEST === 'true';
   const customPublic = mode === 'app-rest-ordinary' && process.env.INCUS_CUSTOM_IMAGE_PUBLIC_TEST === 'true';
   const customBackup = customPublic && process.env.INCUS_CUSTOM_IMAGE_BACKUP_TEST === 'true';
+  const customPortable = customPublic && process.env.INCUS_CUSTOM_IMAGE_PORTABLE_TEST === 'true';
+  if (customBackup && customPortable) throw new Error('Choose one custom restore gate');
   if ([originalPublic, newPublic, customPublic].filter(Boolean).length > 1) throw new Error('Choose exactly one public worker gate');
   const rest = mode === 'app-rest-ordinary' && !originalPublic && !newPublic && !customPublic, app = mode.startsWith('app-'), ordinary = originalPublic || newPublic || rest || mode === 'app-ordinary' || mode !== 'retained' && !app,
     rollback = mode === 'rollback' || mode === 'app-rollback';
@@ -125,14 +132,15 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
         customRetained.workerId !== 'd958a3cd-4630-49ae-9a57-899dc01e5980' || customRetained.definitionId !== '2a7df365-2c7d-407b-9bab-96191906804f' ||
         customRetained.sourceImageId !== 'sha256:f0bfcd056c7d27ead09025f91e53678fc6172dabfd130f216a7dedd7d572e2fc' ||
         customRetained.fingerprint !== '30e74cf8f70888092ff94e6386c7f0a7d675ba464425882b0d151325c28326f2' ||
-        customRetained.app.Id !== (retryArtifactId ? '08adb9546de808c17b2389ccd129435c8f2460560c07b0ee1d5a9b47ac49839e' : '38271e5ea1ec10805ccb5bf14935a555f1e695ac66d1e0b12e283d26867f29de') ||
+        customRetained.app.Id !== (customPortable ? '576101a2d3381e136f699b085ddffd50f3fa9615779a355b8c28ab692acd5db3' : retryArtifactId ? '08adb9546de808c17b2389ccd129435c8f2460560c07b0ee1d5a9b47ac49839e' : '38271e5ea1ec10805ccb5bf14935a555f1e695ac66d1e0b12e283d26867f29de') ||
+        customPortable && customRetained.app.Image !== 'sha256:5ed3992c1027560b6ad5a303eed2d2d38671921f030f567a934cb1da7e0cd836' ||
         retryArtifactId && customRetained.app.Image !== 'sha256:43640a77dfb2c8c2d63d74cfefee487210f86978e3735e2f52cb0e02c0753c54' ||
-        customRetained.instance.config['volatile.uuid'] !== (customBackup ? '8ad56682-4fb6-420d-8e85-b0d3be659f46' : '2486a933-3268-4caa-9614-c11dd1cb4b44') ||
+        customRetained.instance.config['volatile.uuid'] !== (customBackup || customPortable ? '8ad56682-4fb6-420d-8e85-b0d3be659f46' : '2486a933-3268-4caa-9614-c11dd1cb4b44') ||
         !/^a9defe44-[a-f0-9-]{27}$/.test(customRetained.sourceBuildId) || !/^432c08ba-[a-f0-9-]{27}$/.test(customRetained.nativeBuildId) ||
         !/^sha256:[a-f0-9]{64}$/.test(customRetained.app.Image) || customRetained.volumes.length !== 2 || custom?.project !== 'agimg10b')
       throw new Error('Retained custom proof does not identify the explicitly approved source fixture');
   }
-  if (customBackup && !customRetained) throw new Error('Custom backup gate requires the accepted retained source proof');
+  if ((customBackup || customPortable) && !customRetained) throw new Error('Custom restore gate requires the accepted retained source proof');
   let retained: { version: 1; fixtureId: string; workerId: string; ownerId: string; volume: StoredManagedVolume;
     localDir: string; remoteDir: string; parentId: string; parentImageId: string; restoreJobId: string;
     failedCaptureJobId: string; incarnation: string; installation: string; source: WorkerBackupRuntimeSource;
@@ -305,10 +313,12 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
   // Sign-in cookies stay inside the exact App fixture (including a private
   // producer session file) and never appear in tool/test output.
   const appRequest = async <T,>(path: string, body?: unknown, authenticated = true,
-    timeoutMs = 30_000, privateFile?: { path: string; format: 'json' | 'binary' }, sessionPath?: string,
+    timeoutMs = 30_000, privateFile?: { path: string; format: 'json' | 'binary'; contentType?: 'application/x-tar' }, sessionPath?: string,
     method?: 'PUT' | 'DELETE'): Promise<{ status: number; body: T }> => {
     if (privateFile && body !== undefined) throw new Error('Fixture request cannot mix a private file and an inline body');
     if (sessionPath && !authenticated) throw new Error('Fixture private session requires an authenticated request');
+    if (privateFile?.contentType && (privateFile.format !== 'binary' || !path.startsWith('/api/containers/import?')))
+      throw new Error('Fixture tar content type is only valid for portable worker import');
     // Node fetch has a shorter headers deadline than a real first conversion.
     // Only this explicitly long custom create uses bounded built-in HTTP;
     // authentication, request shape and all older fixture fetch paths stay put.
@@ -336,7 +346,7 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
         `headers.Cookie=signed.headers.getSetCookie().map(v=>v.split(';')[0]).join('; ');` : '') +
       (privateFile ? `const fs=await import('node:fs');const p=${JSON.stringify(privateFile.path)};const s=fs.lstatSync(p);` +
         `if(!s.isFile()||s.isSymbolicLink())throw Error('Fixture input is not a private regular file');` +
-        (privateFile.format === 'binary' ? `headers['Content-Type']='application/octet-stream';headers['Content-Length']=String(s.size);` : '') : '') +
+        (privateFile.format === 'binary' ? `headers['Content-Type']=${JSON.stringify(privateFile.contentType ?? 'application/octet-stream')};headers['Content-Length']=String(s.size);` : '') : '') +
       requestScript;
     try {
       return JSON.parse(await root(`sudo docker exec ${targetId} node --input-type=module -e ${quote(script)}`, timeoutMs));
@@ -403,10 +413,15 @@ print('Exact account fixture delta confirmed')
       expect(customRetained.binding.identity.fingerprint).toBe(customRetained.fingerprint);
       expect(await root(`sudo docker image inspect ${quote(customRetained.sourceImageId)} --format '{{.Id}} {{index .Config.Labels "agentor.image-definition"}} {{index .Config.Labels "agentor.image-owner-hash"}}'`))
         .toBe(`${customRetained.sourceImageId} ${customRetained.definitionId} ${createHash('sha256').update(userId).digest('hex')}`);
-      expect(customRetained.nft.table).toBe(retryArtifactId ? 'agentor_restore_76e0284c' : 'agentor_restore_' + jobId.slice(0, 8));
+      expect(customRetained.nft.table).toBe(customPortable ? 'agentor_restore_021d9d16' : retryArtifactId ? 'agentor_restore_76e0284c' : 'agentor_restore_' + jobId.slice(0, 8));
       const oldRule = sourceRuleSnapshot(typeof customRetained.nft.json === 'string' ? customRetained.nft.json : JSON.stringify(customRetained.nft.json));
       expect(sourceRuleSnapshot(await root(`sudo nft -j list table ip ${customRetained.nft.table}`))).toBe(oldRule);
       if (!customBackup) sourceRuleBaseline = oldRule;
+      if (customPortable) expect(await root(`sudo docker exec ${targetId} node --input-type=module -e ${quote(
+        `import fs from'node:fs';import crypto from'node:crypto';const p='/app/.output/server/chunks/nitro/nitro.mjs';const s=fs.lstatSync(p);` +
+        `if(!s.isFile()||s.isSymbolicLink())throw Error('Current App program is not regular');const b=fs.readFileSync(p);` +
+        `if(b.includes(Buffer.from('AGENTOR_DIAGNOSTIC')))throw Error('Diagnostic program is not portable gate authority');console.log(crypto.createHash('sha256').update(b).digest('hex'));`)}`))
+        .toBe('d4bbceb4ee148308599e12cb4c8e47b16a6b9e2ea46a84a4c230ea61f65c96b9');
       const listed = await appRequest<Array<{ id: string; userId: string; runtimeKind: string }>>('/api/containers');
       expect(listed.status).toBe(200); expect(listed.body).toHaveLength(1);
       expect(listed.body[0]).toMatchObject({ id: customRetained.workerId, userId, runtimeKind: 'incus-vm' });
@@ -549,7 +564,7 @@ print('Exact account fixture delta confirmed')
       expect(self.returnCode, self.stderr).toBe(0); expect(JSON.parse(self.stdout)).toMatchObject({ workerId: examined.id, userId });
     };
     await assertGuest(firstUuid);
-    if (customBackup && customRetained) {
+    if ((customBackup || customPortable) && customRetained) {
       // Reuse the public encrypted worker-backup/new-restore flow, not instance
       // restore setup or a fabricated portable/native authority record.
       const markers = ['python3', '-c', String.raw`
@@ -569,6 +584,60 @@ print(json.dumps(out))
       expect(sourceBefore.config['volatile.uuid']).toBe(firstUuid);
       const sourceVolumes = await Promise.all(volumeNames.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)));
       expect(sourceVolumes).toEqual(volumes);
+      let newId: string, retainedArtifactId: string;
+      if (customPortable) {
+        const privateRoot = '/tmp/agentor-custom-portable-' + followupNonce, sessionFile = privateRoot + '/session', tarFile = privateRoot + '/worker.tar';
+        const sessionScript = `import fs from'node:fs';const base='http://127.0.0.1:3000';fs.mkdirSync(${JSON.stringify(privateRoot)},{mode:448});` +
+          `const signed=await fetch(base+'/api/auth/sign-in/email',{method:'POST',headers:{Origin:base,'Content-Type':'application/json'},body:${JSON.stringify(JSON.stringify(admin))}});` +
+          `if(!signed.ok||(await signed.json()).user?.id!==${JSON.stringify(userId)})throw Error('Private portable sign-in differs');` +
+          `fs.writeFileSync(${JSON.stringify(sessionFile)},signed.headers.getSetCookie().map(v=>v.split(';')[0]).join('; '),{mode:384,flag:'wx'});` +
+          `console.log('Private portable session prepared');`;
+        try { await root(`sudo docker exec ${targetId} node --input-type=module -e ${quote(sessionScript)}`); }
+        catch { throw new Error('Private portable session preparation failed'); }
+        const exported = await appRequest<PublicExportJob>('/api/containers/' + owner.id + '/export-jobs',
+          { includeRootfs: false, includeManagedVolumes: false }, true, 30_000, undefined, sessionFile);
+        expect(exported.status).toBe(202); expect(exported.body.workerId).toBe(owner.id); expect(exported.body.id).toMatch(/^[a-f0-9-]{36}$/);
+        let ready: PublicExportJob | undefined;
+        await expect.poll(async () => {
+          const state = await appRequest<PublicExportJob>('/api/export-jobs/' + exported.body.id, undefined, true, 30_000, undefined, sessionFile);
+          expect(state.status).toBe(200); ready = state.body;
+          if (state.body.status === 'failed') throw new Error('Portable custom export failed: ' + state.body.phase);
+          return state.body.status;
+        }, { timeout: 360_000, intervals: [1000] }).toBe('succeeded');
+        expect(ready).toMatchObject({ workerId: owner.id, includeRootfs: false, includeManagedVolumes: false, downloadReady: true });
+        const downloadScript = `import fs from'node:fs';import{Readable,Transform}from'node:stream';import{pipeline}from'node:stream/promises';` +
+          `const p=${JSON.stringify(sessionFile)},s=fs.lstatSync(p);if(!s.isFile()||s.isSymbolicLink()||(s.mode&63))throw Error('Private portable session differs');` +
+          `const r=await fetch('http://127.0.0.1:3000/api/export-jobs/${exported.body.id}/download',{headers:{Origin:'http://127.0.0.1:3000',Cookie:fs.readFileSync(p,'utf8')},redirect:'manual',signal:AbortSignal.timeout(180000)});` +
+          `const n=Number(r.headers.get('content-length'));if(r.status!==200||!r.body||!Number.isSafeInteger(n)||n<1||n>67108864||!r.headers.get('content-type')?.includes('application/x-tar'))throw Error('Private portable download invalid');` +
+          `let bytes=0;const limit=new Transform({transform(b,e,cb){bytes+=b.length;cb(bytes>n?Error('Portable size bound exceeded'):null,b)}});` +
+          `await pipeline(Readable.fromWeb(r.body),limit,fs.createWriteStream(${JSON.stringify(tarFile)},{mode:384,flags:'wx'}));` +
+          `if(bytes!==n||fs.statSync(${JSON.stringify(tarFile)}).size!==n)throw Error('Portable size differs');console.log('Private portable download complete');`;
+        try { await root(`sudo docker exec ${targetId} node --input-type=module -e ${quote(downloadScript)}`, 180_000); }
+        catch { throw new Error('Private portable download failed'); }
+        const remoteTar = customRetained.remoteDir + '/portable-' + followupNonce + '.tar', localTar = join(local, 'portable-' + followupNonce + '.tar');
+        await root(`test ! -e ${quote(remoteTar)} && sudo docker cp ${targetId}:${quote(tarFile)} ${quote(remoteTar)} && sudo chown kata-test ${quote(remoteTar)} && sudo chmod 600 ${quote(remoteTar)}`);
+        await expect(lstat(localTar)).rejects.toMatchObject({ code: 'ENOENT' });
+        await run('scp', [...scp, 'kata-test@172.19.0.1:' + remoteTar, localTar], { timeout: 60_000 });
+        const info = await lstat(localTar); expect(info.isFile() && !info.isSymbolicLink()).toBe(true); expect(info.mode & 0o077).toBe(0);
+        const unpacked = join(local, 'portable-unpacked-' + followupNonce), bundle = await extractBundle(localTar, unpacked);
+        const rawManifest = JSON.parse(await readFile(join(unpacked, 'manifest.json'), 'utf8')) as Record<string, unknown>;
+        expect(rawManifest.runtime).toEqual(snapshotIncusWorkerBackupRuntime(binding.identity));
+        expect(bundle.manifest.source.id).toBe(owner.id); expect(bundle.manifest.runtime).toEqual(snapshotIncusWorkerBackupRuntime(binding.identity));
+        expect(bundle.manifest.contents).toMatchObject({ rootfs: false, workspace: true, agents: true });
+        expect(bundle.rootfsPath).toBeUndefined(); expect(bundle.manifest.worker.mounts).toEqual([]);
+        for (const key of ['devices', 'profiles', 'incusClientKey', 'incusClientCert', 'nativeBindings']) expect(rawManifest).not.toHaveProperty(key);
+        if (!bundle.workspacePath || !bundle.agentsPath || !bundle.reconstructionPath) throw new Error('Portable custom canonical payload is incomplete');
+        await validateGzipTarPayload(bundle.workspacePath); await validateGzipTarPayload(bundle.agentsPath);
+        expect((await readWorkerReconstruction(bundle.reconstructionPath)).image)
+          .toMatchObject({ kind: 'custom', definitionId: definition.body.id, version: built.version, digest: built.digest });
+        expect(await runtime.client.getInstance(owner.containerName)).toEqual(sourceBefore);
+        expect(await Promise.all(volumeNames.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)))).toEqual(sourceVolumes);
+        const imported = await appRequest<{ id: string; userId: string; runtimeKind: string; status: string }>('/api/containers/import?displayName=' +
+          encodeURIComponent('Custom portable import ' + followupNonce), undefined, true, 360_000,
+          { path: tarFile, format: 'binary', contentType: 'application/x-tar' }, sessionFile);
+        expect(imported.status).toBe(201); expect(imported.body).toMatchObject({ userId, runtimeKind: 'incus-vm', status: 'running' });
+        newId = imported.body.id; retainedArtifactId = exported.body.id;
+      } else {
       let captured: BackupJob | undefined;
       if (retryArtifactId) {
         const capture = await appRequest<BackupJob>('/api/backup-jobs/1b996c89-518e-4a35-a135-2492c73a7843');
@@ -615,8 +684,10 @@ print(json.dumps(out))
         return state.body.status;
       }, { timeout: 360_000, intervals: [1000] }).toBe('succeeded');
       expect(result).toMatchObject({ target: 'new', integrityVerified: true, selectedWorkspaceIds: [owner.id] });
-      expect(result?.restoreMappings).toHaveLength(1); const newId = result!.restoreMappings![0]!.workerId;
-      expect(result!.restoreMappings![0]!.sourceWorkspaceId).toBe(owner.id); expect(newId).not.toBe(owner.id); expect(newId).toMatch(/^[a-f0-9-]{36}$/);
+      expect(result?.restoreMappings).toHaveLength(1); newId = result!.restoreMappings![0]!.workerId; retainedArtifactId = artifact.body.id;
+      expect(result!.restoreMappings![0]!.sourceWorkspaceId).toBe(owner.id);
+      }
+      expect(newId).not.toBe(owner.id); expect(newId).toMatch(/^[a-f0-9-]{36}$/);
       const destination = { id: newId, userId, containerName: config.containerPrefix + '-' + newId };
       const fresh = await runtime.client.getInstance(destination.containerName), freshUuid = fresh.config['volatile.uuid'];
       if (typeof freshUuid !== 'string' || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(freshUuid))
@@ -655,8 +726,9 @@ print(json.dumps(out))
       expect(JSON.parse(sourceMarkers.stdout)).toEqual(originalMarkers);
       expect(await Promise.all(volumeNames.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)))).toEqual(sourceVolumes);
       computeSettled = true;
-      console.info('Actual custom encrypted backup -> public new passed fresh UUID/core storage/custom OCI, workspace/agent bytes+numeric metadata, services/proxies/self, unchanged stopped source and healthy original restart; only acknowledged destination deleted; source/old+current Apps/catalog/image/artifact retained',
-        { local, remote, sourceData: remoteData, oldApp: customRetained.app.Id, currentApp: targetId, artifactId: artifact.body.id });
+      console.info(customPortable ? 'Actual custom portable export -> public import passed descriptive source/no rootfs, fresh native identity/core storage/custom OCI, workspace/agent bytes+metadata, services/proxies/self, unchanged stopped source and healthy original restart; only acknowledged destination deleted; source/current App/catalog/image/export retained'
+        : 'Actual custom encrypted backup -> public new passed fresh UUID/core storage/custom OCI, workspace/agent bytes+numeric metadata, services/proxies/self, unchanged stopped source and healthy original restart; only acknowledged destination deleted; source/old+current Apps/catalog/image/artifact retained',
+        { local, remote, sourceData: remoteData, oldApp: customRetained.app.Id, currentApp: targetId, artifactId: retainedArtifactId });
       return;
     }
     const seeded = await runtime.client.exec(owner.containerName, ['bash', '-ec',
