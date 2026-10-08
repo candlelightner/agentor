@@ -75,6 +75,40 @@ assert os.stat(a+'/file').st_mtime_ns==os.stat(b+'/file').st_mtime_ns
   });
 });
 
+for (const role of ['workspace', 'agents'] as const) test(`canonical GNU ${role} cross-record end padding remains bounded without rewriting bytes`, async () => {
+  await fixture(async (dir, archive) => {
+    const root = role === 'workspace' ? 'workspace' : '.agent-data', stage = join(dir, 'stage'), source = join(stage, root);
+    await mkdir(source, { recursive: true }); await writeFile(join(source, 'file'), '');
+    execFileSync('python3', ['-c', 'import os,sys;os.setxattr(sys.argv[1],"user.binary",bytes([0,255,128,10]))', join(source, 'file')]);
+    const observed = new Set<number>(); let boundary: Buffer | undefined;
+    for (let blocks = 0; blocks < 20; blocks++) {
+      await writeFile(join(source, 'file'), Buffer.alloc(blocks * 512, 0x78));
+      // Exactly the accepted offline/running canonical producer's tar flags.
+      const original = execFileSync('/usr/bin/tar', ['--numeric-owner', '--xattrs', '--acls', '--one-file-system',
+        '--no-wildcards', '--anchored', '-cpf', '-', '-C', stage, '--', root]);
+      let endBlocks = 0;
+      for (let offset = original.length - 512; offset >= 0 && original.subarray(offset, offset + 512).every(byte => byte === 0); offset -= 512)
+        endBlocks++;
+      observed.add(endBlocks); expect(endBlocks).toBeLessThanOrEqual(21);
+      await writeFile(archive, original);
+      await expect(validateIncusCanonicalRestoreArchive(archive, role, { maxEntries: 2, maxExpandedBytes: blocks * 512 }))
+        .resolves.toEqual({ entries: 2, expandedBytes: blocks * 512 });
+      expect(await readFile(archive)).toEqual(original);
+      if (endBlocks === 21) {
+        boundary = original;
+        await expect(validateIncusCanonicalRestoreArchive(archive, role, { maxEntries: 1 })).rejects.toThrow(/too many entries/);
+        await expect(validateIncusCanonicalRestoreArchive(archive, role, { maxExpandedBytes: blocks * 512 - 1 })).rejects.toThrow(/expanded size/);
+      }
+    }
+    expect(observed).toContain(21); expect(observed).toContain(2); expect(boundary).toBeDefined();
+    await writeFile(archive, Buffer.concat([boundary!, Buffer.alloc(512)]));
+    await expect(validateIncusCanonicalRestoreArchive(archive, role)).rejects.toThrow(/excessive trailing zero/);
+    const nonzero = Buffer.from(boundary!); nonzero[nonzero.length - 1] = 1;
+    await writeFile(archive, nonzero);
+    await expect(validateIncusCanonicalRestoreArchive(archive, role)).rejects.toThrow(/data after its end marker/);
+  });
+});
+
 test('canonical restoration rejects unsafe paths, root substitution and link writes in both orders', async () => {
   await fixture(async (_dir, archive) => {
     const root: Item = { name: 'workspace/', type: '5' }, file: Item = { name: 'workspace/file', body: 'x' };

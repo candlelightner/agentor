@@ -20,7 +20,9 @@ export const MAX_PORTABLE_MANAGED_VOLUME_COMPRESSED_PAYLOAD_BYTES = 20 * 1024 * 
 export const MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES = 100 * 1024 * 1024 * 1024;
 const MAX_PORTABLE_PAX_BYTES = 64 * 1024;
 const MAX_PORTABLE_TAR_PATH_BYTES = 4096;
-const MAX_TAR_END_BLOCKS = 20;
+// GNU tar's default 20-block record may need 21 zero blocks when the first
+// end marker fills one record and the second starts the following record.
+const MAX_TAR_END_BLOCKS = 21;
 
 export interface PortableManagedVolumeArchiveLimits {
   maxEntries?: number;

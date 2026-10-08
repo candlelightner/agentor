@@ -443,6 +443,8 @@ test("raw trailing-zero work and aggregate payload inputs are bounded before out
     const ordinary = join(dir, "ordinary.tar");
     await writeTar(ordinary, ordinaryItems());
     await appendFile(ordinary, Buffer.alloc(19 * 512));
+    await expect(validatePortableManagedVolumeArchive(ordinary)).resolves.toMatchObject({ entries: ordinaryItems().length });
+    await appendFile(ordinary, Buffer.alloc(512)); // 22 total: beyond GNU tar's cross-record maximum.
     await expect(validatePortableManagedVolumeArchive(ordinary)).rejects.toThrow(/trailing zero/i);
 
     const sparse = join(dir, "oversized.tar"), output = join(dir, "payload.gz");
