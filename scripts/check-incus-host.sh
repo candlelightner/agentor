@@ -2,13 +2,14 @@
 # Read-only operator diagnostics. No installs, resource allocation or repair.
 set -euo pipefail
 exec python3 - "$0" "$@" <<'PY'
-import argparse, hashlib, http.client, importlib.util, ipaddress, json, os, re, shutil, ssl, stat, subprocess, sys
+import argparse, hashlib, http.client, importlib.util, ipaddress, json, os, re, shutil, socket, ssl, stat, subprocess, sys
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 __file__ = sys.argv.pop(1)
 spec = importlib.util.spec_from_file_location("host_sources", Path(__file__).resolve().with_name("incus-host-mount-sources.py"))
 SOURCES = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(SOURCES)
+CONNECT_ADDRESS = ""
 
 
 def require(condition, message):
@@ -52,6 +53,8 @@ def https(base, path, cert, key, ca):
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(cert, key)
     connection = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, context=context, timeout=10)
+    if CONNECT_ADDRESS:  # Host diagnostic equivalent of curl --resolve; TLS hostname/CA verification stays enabled.
+        connection._create_connection = lambda target, timeout, source_address=None: socket.create_connection((CONNECT_ADDRESS, target[1]), timeout, source_address)
     try:
         connection.request("GET", path)
         response = connection.getresponse()
@@ -72,7 +75,7 @@ def supported(version):
             "Use signed Incus 6.0 LTS >=6.0.6 or >=6.10; early rolling releases lack required share fixes")
 
 
-def project_policy(project, name, network):
+def project_policy(project, name, network, account_paths=()):
     require(project.get("name") == name and name != "default", "Dedicated nondefault project required")
     config = project.get("config", {})
     for field, expected in {"restricted": "true", "features.images": "true", "features.storage.volumes": "true",
@@ -85,13 +88,36 @@ def project_policy(project, name, network):
     paths = config.get("restricted.devices.disk.paths", "").split(",")
     require(all(SOURCES.canonical(path) == path for path in paths),
             "Exact approved account/host-share paths must be configured; generic host access is forbidden")
-    require(not any(SOURCES.overlaps(path, protected) for path in paths for protected in SOURCES.SYSTEM_PATHS),
+    require(not any(SOURCES.overlaps(path, protected) for path in paths if path not in account_paths for protected in SOURCES.SYSTEM_PATHS),
             "Protected system/daemon trees must never be allowed guest shares")
+
+
+def account_paths(container_name):
+    if not container_name: return []
+    require(re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", container_name), "Explicit Orchestrator container required")
+    container = json.loads(command("docker", "inspect", container_name))[0]
+    mounts = [mount for mount in container.get("Mounts", []) if mount.get("Destination") == "/data" and mount.get("RW") is True]
+    require(len(mounts) == 1, "Exact Orchestrator DATA source required")
+    data = SOURCES.canonical(mounts[0]["Source"]); SOURCES.directory_identity(data); users = Path(data) / "users"
+    if not users.exists(): return []
+    SOURCES.directory_identity(str(users)); paths = []
+    for user in users.iterdir():
+        require(re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user.name), "Account identity is invalid")
+        for role in ("credentials", "kilo/config", "kilo/data"):
+            path = user / role
+            if os.path.lexists(path): SOURCES.directory_identity(str(path)); paths.append(str(path))
+    return paths
 
 
 def restricted_certificate(record, project):
     require(record.get("type") == "client" and record.get("restricted") is True and record.get("projects") == [project],
             "Client certificate must be restricted to exactly the Agentor project")
+
+
+def internal_publication(published, address, port):
+    expected = {"HostIp": address, "HostPort": str(port)}
+    require(published.count(expected) == 1 and all(entry == expected or entry.get("HostIp") in ("127.0.0.1", "::1") for entry in published),
+            "Internal endpoint must be bridge-only; existing loopback GUI publications may coexist")
 
 
 def network_policy(network, name):
@@ -132,10 +158,12 @@ def main():
               "network-host-endpoint": "INCUS_NETWORK_HOST_ENDPOINT", "network-host-server-cert-path": "INCUS_NETWORK_HOST_SERVER_CERT_PATH",
               "installation-id": "AGENTOR_INSTALLATION_ID", "docker-network": "INCUS_DOCKER_NETWORK",
               "orchestrator-container": "INCUS_ORCHESTRATOR_CONTAINER", "internal-gateway-url": "INCUS_INTERNAL_GATEWAY_URL",
-              "source-nat-table": "INCUS_SOURCE_NAT_TABLE"}
+              "source-nat-table": "INCUS_SOURCE_NAT_TABLE", "connect-address": "INCUS_HOST_CHECK_CONNECT_ADDRESS"}
     for argument, variable in inputs.items():
         parser.add_argument("--" + argument, default=os.environ.get(variable, ""), help=variable + " (operator configuration)")
     args = parser.parse_args(); failures = []; unknown = []
+    global CONNECT_ADDRESS
+    CONNECT_ADDRESS = ""
 
     def check(label, action, advice):
         try:
@@ -154,6 +182,8 @@ def main():
     check("Ubuntu/KVM/QEMU/virtiofs", host, "Use supported Ubuntu 24.04 with accessible KVM, QEMU and compatible Rust virtiofsd; run as the host operator.")
 
     def configuration():
+        global CONNECT_ADDRESS
+        CONNECT_ADDRESS = str(ipaddress.IPv4Address(args.connect_address)) if args.connect_address else ""
         require(re.fullmatch(r"[A-Za-z0-9_-]{1,63}", args.project) and args.project != "default", "Dedicated project required")
         require(re.fullmatch(r"[A-Za-z0-9_-]{1,15}", args.network) and re.fullmatch(r"[A-Za-z0-9_.-]{1,63}", args.storage_pool), "Explicit network/storage required")
         require(re.fullmatch(r"[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}", args.installation_id), "Pinned installation UUID required")
@@ -164,7 +194,7 @@ def main():
     if "operator configuration/credential files" in failures:
         return 1
     query = "?project=" + quote(args.project)
-    check("restricted project", lambda: project_policy(native("/1.0/projects/" + quote(args.project)), args.project, args.network), "Configure project features, managed NICs, exact disk/network allowlists and blocked unnecessary host devices.")
+    check("restricted project", lambda: project_policy(native("/1.0/projects/" + quote(args.project)), args.project, args.network, account_paths(args.orchestrator_container)), "Configure project features, managed NICs, exact disk/network allowlists and blocked unnecessary host devices.")
     def client_auth():
         fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(Path(args.client_cert_path).read_text())).hexdigest()
         restricted_certificate(native("/1.0/certificates/" + fingerprint), args.project)
@@ -204,7 +234,7 @@ def main():
         require(gateway.scheme == "http" and gateway.hostname == str(interface.ip) and gateway.port and not gateway.username
                 and not gateway.password and gateway.path in ("", "/") and not gateway.query and not gateway.fragment, "Stable bridge-only internal URL required")
         published = container["NetworkSettings"]["Ports"].get("3000/tcp") or []
-        require(published == [{"HostIp": str(interface.ip), "HostPort": str(gateway.port)}], "Internal endpoint must not be wildcard-published")
+        internal_publication(published, str(interface.ip), gateway.port)
         require(not any(mount.get("Source", "").startswith("/var/lib/incus") or mount.get("Destination", "").startswith("/var/lib/incus")
                         for mount in container.get("Mounts", [])), "Orchestrator must not receive the Incus Unix socket/storage")
         nft_source_rule(json.loads(command("nft", "-j", "list", "table", "ip", args.source_nat_table)),

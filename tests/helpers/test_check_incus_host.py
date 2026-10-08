@@ -69,6 +69,20 @@ class CheckerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 CHECKER.credential(str(link), True)
 
+    def test_gui_loopback_coexists_with_exact_internal_publish_but_wildcards_do_not(self):
+        internal = {"HostIp": "10.25.0.1", "HostPort": "3079"}; gui = {"HostIp": "127.0.0.1", "HostPort": "3000"}
+        CHECKER.internal_publication([gui, internal], "10.25.0.1", 3079)
+        for published in ([gui], [internal, internal], [internal, {"HostIp": "0.0.0.0", "HostPort": "3000"}],
+                          [internal, {"HostIp": "10.25.0.1", "HostPort": "9999"}]):
+            with self.assertRaises(ValueError): CHECKER.internal_publication(published, "10.25.0.1", 3079)
+
+    def test_exact_account_exception_never_grants_the_docker_data_parent(self):
+        root = "/var/lib/docker/volumes/platform/_data/users/account/credentials"
+        project = self.project(); project["config"]["restricted.devices.disk.paths"] = root
+        CHECKER.project_policy(project, "agentor-private", "workers", [root])
+        project["config"]["restricted.devices.disk.paths"] = "/var/lib/docker/volumes/platform/_data/users"
+        with self.assertRaises(ValueError): CHECKER.project_policy(project, "agentor-private", "workers", [root])
+
     def test_https_uses_verified_mutual_tls_and_get_only(self):
         context = MagicMock(); connection = MagicMock(); response = connection.getresponse.return_value
         response.status = 200; response.read.return_value = b'{"type":"sync","status_code":200,"metadata":{"ready":true}}'
