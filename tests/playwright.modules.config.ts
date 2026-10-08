@@ -126,6 +126,7 @@ export default defineConfig({
     "api/incus-worker-network.spec.ts",
     "api/incus-traefik-routing.spec.ts",
     "api/incus-deployment-config.spec.ts",
+    "api/incus-host-setup-live.spec.ts",
     "api/incus-guest-network.spec.ts",
     "api/incus-full-stack.spec.ts",
     "api/incus-worker-storage.spec.ts",
