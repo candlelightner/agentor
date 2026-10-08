@@ -138,15 +138,24 @@ export class ManagedNetworkManager {
     return [...new Set(ids)].filter((id) => this.workers().get(network.userId, id));
   }
 
-  async reconcile(network: ManagedNetwork, workerIds?: Iterable<string>, coveredWorkerIds?: ReadonlySet<string>) {
+  async reconcile(network: ManagedNetwork, workerIds?: Iterable<string>, coveredWorkerIds?: ReadonlySet<string>,
+    migrationWorkerId?: string) {
     this.assertSafe(network);
     const target = new Set(workerIds === undefined ? await this.members(network) : workerIds);
+    if (migrationWorkerId !== undefined) {
+      const record = this.workers().get(network.userId, migrationWorkerId);
+      const worker = this.authoritativeWorker(network, migrationWorkerId);
+      if (!record || !worker || !target.has(migrationWorkerId) || workerIds !== undefined || !coveredWorkerIds ||
+          record.runtimeKind !== 'legacy-docker' || record.status !== 'active' || record.deletionPending ||
+          record.incusMigration || record.incusRecreation || worker.administrativeKind)
+        throw new Error('Managed bridge migration preparation requires a settled owned legacy member and authorized peer coverage');
+    }
     const coverage = await this.mutationCoverage(network, target, coveredWorkerIds);
     if (workerIds !== undefined && !target.size && !(await this.actualWorkerIds(network)).length)
       return { workerIds: [], partialFailures: [] };
     for (const id of target) this.authoritativeWorker(network, id);
     const existingNative = await this.nativeBridge(network);
-    const needsNative = existingNative || (!target.size && this.config().incusEnabled) || [...target].some(id =>
+    const needsNative = migrationWorkerId !== undefined || existingNative || (!target.size && this.config().incusEnabled) || [...target].some(id =>
       normalizeWorkerRuntimeKind(this.workers().get(network.userId, id)?.runtimeKind) === 'incus-vm');
     // Detach/delete only observes existing resources. Never create an adapter
     // or repair/regrant a host bridge just to remove a NIC from it.

@@ -125,6 +125,8 @@ export class ManagedVolumeManager {
     actor.authorize?.();
     const worker = useWorkerStore().get(actor.userId, actor.workerId);
     if (!worker || worker.deletionPending) throw volumeError(404, "Worker not found.");
+    if (worker.incusMigration && worker.incusMigration.phase !== 'retained')
+      throw volumeError(409, 'Complete interrupted worker migration before changing managed storage.');
     if (worker.incusRecreation) throw volumeError(409, 'Complete interrupted VM recreation before changing managed storage.');
     this.assertBackend(actor.userId, actor.workerId);
     const live = useContainerManager().get(actor.workerId);

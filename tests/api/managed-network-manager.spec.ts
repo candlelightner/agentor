@@ -274,6 +274,27 @@ function dispatcherFixture(options: { vm?: boolean; failConnect?: boolean; failN
   return { manager, network, sharedName, coverage: new Set(network.workerIds) as Set<string>, mutations, endpoints, bridges, attachedVms, failures };
 }
 
+test('first legacy migration prepares the accepted shared bridge without switching durable worker runtime', async () => {
+  const f = dispatcherFixture();
+  const before = (f.manager as any).dependencies.workers().get('owner', 'docker');
+  const result = await f.manager.reconcile(f.network, undefined, f.coverage, 'docker');
+  expect(result.partialFailures).toEqual([]);
+  expect(f.mutations).toEqual(['native:ensure', `create:${f.sharedName}`,
+    `connect:${f.sharedName}:docker-id`, `disconnect:${f.network.dockerName}:docker-id`]);
+  expect((f.manager as any).dependencies.workers().get('owner', 'docker')).toEqual(before);
+  expect(f.endpoints.get('docker-id')[f.sharedName].Aliases).toEqual(['kept-alias']);
+  expect(f.bridges.has(f.network.dockerName)).toBe(true);
+});
+
+test('migration bridge preparation refuses missing coverage, foreign members and native runtime before writes', async () => {
+  for (const mode of ['coverage', 'foreign', 'native'] as const) {
+    const f = dispatcherFixture({ vm: mode === 'native' });
+    await expect(f.manager.reconcile(f.network, undefined, mode === 'coverage' ? undefined : f.coverage,
+      mode === 'foreign' ? 'foreign' : mode === 'native' ? 'vm' : 'docker')).rejects.toThrow('migration preparation');
+    expect(f.mutations).toEqual([]);
+  }
+});
+
 test('desired target outside captured authorization is rejected before bridge creation', async () => {
   const id = randomUUID(), network = { id, userId: 'owner', dockerName: `agentor-managed-${id}`, scope: 'selected', workerIds: [] } as any;
   const manager = new ManagedNetworkManager(); manager.actualWorkerIds = async () => [];

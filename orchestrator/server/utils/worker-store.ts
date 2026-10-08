@@ -218,6 +218,8 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
       if (expected.phase !== 'validated' || !expected.destinationIncarnation)
         throw new Error('Incus migration cutover requires validated captured destination');
       return this.persistMigration(userId, id, map, previous, { ...previous, runtimeKind: 'incus-vm',
+        importedImage: undefined,
+        desiredRuntimeStatus: previous.desiredRuntimeStatus ?? (expected.source.wasRunning ? 'running' : 'stopped'),
         incusMigration: { ...expected, phase: 'retained' } });
     });
   }

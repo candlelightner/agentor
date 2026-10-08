@@ -82,6 +82,19 @@ test('only validated captured destination cutover changes runtime authority and 
   });
 });
 
+test('validated migration drops only old disposable imported rootfs authority and preserves stopped intent', async () => {
+  await fixture(async ({ store, record, marker }) => {
+    await store.upsert({ ...record, desiredRuntimeStatus: 'stopped', importedImage: 'agentor-import-old-rootfs' });
+    const opened = await store.transitionIncusMigration(record.userId, record.id, undefined, marker);
+    const validated = await store.transitionIncusMigration(record.userId, record.id, opened.incusMigration!,
+      { ...opened.incusMigration!, phase: 'validated', destinationIncarnation: randomUUID() });
+    const migrated = await store.cutoverIncusMigration(record.userId, record.id, validated.incusMigration!);
+    expect(migrated.importedImage).toBeUndefined(); expect(migrated.desiredRuntimeStatus).toBe('stopped');
+    expect(migrated.incusMigration?.source).toEqual(marker.source);
+    expect(migrated.displayName).toBe(record.displayName); expect(migrated.userId).toBe(record.userId);
+  });
+});
+
 test('nonce, source facts and captured incarnation cannot be overwritten or removed through stale transitions/upsert', async () => {
   await fixture(async ({ store, record, marker }) => {
     const opened = await store.transitionIncusMigration(record.userId, record.id, undefined, { ...marker,

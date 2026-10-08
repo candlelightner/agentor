@@ -43,6 +43,7 @@ import {
 } from "./management-mcp-workspace-adapter";
 import { ManagementImageBackupDomain } from "./management-image-backup-domain";
 import { ManagementPlatformDomain } from "./management-platform-domain";
+import { ManagementWorkerMigrationDomain } from './management-worker-migration-domain';
 import {
   ManagementVolumeDomain,
   VOLUME_MCP_NAMES,
@@ -366,6 +367,7 @@ for (const name of GROUP_ADMIN_TOOLS) {
 type Group = (typeof GROUPS)[number];
 const workerDomain = new ManagementWorkerDomain();
 const imageBackupDomain = new ManagementImageBackupDomain();
+const migrationDomain = new ManagementWorkerMigrationDomain();
 const platformDomain = new ManagementPlatformDomain();
 const volumeDomain = new ManagementVolumeDomain();
 const catalogDomain = new ManagementConfigurationCatalogDomain();
@@ -487,6 +489,7 @@ const TOOL_GROUP: Record<string, Group> = {
   "admin-workspace.startup-script.set": "groups",
 };
 for (const tool of workerDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
+for (const tool of migrationDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 for (const tool of workspaceMcpTools)
   TOOL_GROUP[tool.name] = tool.group as Group;
 for (const tool of imageBackupDomain.tools())
@@ -740,6 +743,7 @@ export class ManagementMcpStore {
       )
       .map((name) => {
         const domain = workerDomain.tools().find((tool) => tool.name === name);
+        const migration = migrationDomain.tools().find(tool => tool.name === name);
         const workspace = workspaceMcpTools.find((tool) => tool.name === name);
         const imageBackup = imageBackupDomain
           .tools()
@@ -782,6 +786,7 @@ export class ManagementMcpStore {
                     : undefined) ||
             adminStartupScriptToolDescription(name) ||
             domain?.description ||
+            migration?.description ||
             workspace?.description ||
             imageBackup?.description ||
             platform?.description ||
@@ -810,6 +815,7 @@ export class ManagementMcpStore {
                     ? groupStructuralInputSchema(name)
                     : undefined) ||
             domain?.inputSchema ||
+            migration?.inputSchema ||
             workspace?.inputSchema ||
             imageBackup?.inputSchema ||
             platform?.inputSchema ||
@@ -827,6 +833,7 @@ export class ManagementMcpStore {
             toolInputSchema(name),
           annotations:
             domain?.annotations ||
+            migration?.annotations ||
             workspace?.annotations ||
             imageBackup?.annotations ||
             platform?.annotations ||
@@ -1549,6 +1556,9 @@ export class ManagementMcpStore {
     }
     const volume = await volumeDomain.execute(name, args, identity);
     if (volume.handled) return volume.result;
+    const migration = await migrationDomain.execute(name, args,
+      identity?.scope === 'platform' ? { kind: 'platform-workspace', workspaceId: identity.workspaceId } : undefined);
+    if (migration.handled) return migration.result;
     const domain = await workerDomain.execute(name, args);
     if (domain.handled) {
       if (identity?.scope === "group" && name === "groups.list") {
@@ -2546,6 +2556,7 @@ function groupStructuralDescription(name: string): string {
 function validateToolArguments(name: string, args: Record<string, unknown>) {
   const definitions = [
     ...workerDomain.tools(),
+    ...migrationDomain.tools(),
     ...workspaceMcpTools,
     ...imageBackupDomain.tools(),
     ...platformDomain.tools(),

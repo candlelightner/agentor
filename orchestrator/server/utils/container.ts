@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import Docker from 'dockerode';
 import { isIP } from "node:net";
 import { isDeepStrictEqual } from 'node:util';
 import { nanoid } from "nanoid";
@@ -10,7 +11,7 @@ import {
 import type { Config } from "./config";
 import { getAppType } from "./apps";
 import { createReadStream } from "node:fs";
-import { mkdir, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, realpath, rm, statfs } from "node:fs/promises";
 import { join } from "node:path";
 import type { Readable, Duplex } from "node:stream";
 import * as tar from "tar-stream";
@@ -73,7 +74,8 @@ import type {
 import { normalizeWorkerRuntimeKind } from "../../shared/types";
 import { IncusWorkerRuntime, incusWorkerStatus, type IncusWorkerOptions } from "./incus-worker-runtime";
 import { IncusWorkerImageManager } from './incus-worker-image-manager';
-import { sameIncusImageSource } from './incus-worker-image';
+import { IncusRequestRejected } from './incus-client';
+import { incusImageIdentity, sameIncusImageSource } from './incus-worker-image';
 import { WorkerGroupHierarchy } from './worker-group-hierarchy';
 import { prepareIncusCanonicalRestorePayload } from './incus-canonical-restore';
 import { selectWorkerImportRuntime, type WorkerImportOrigin } from './worker-import-runtime-policy';
@@ -137,6 +139,7 @@ import {
 import { instanceSnapshotActive } from "./instance-snapshot-gate";
 import {
   operationSettlement,
+  withOperationDeadline,
   type OperationFailureWithSettlement,
 } from "./operation-deadline";
 import { getAllGitCloneDomains } from "./git-providers";
@@ -146,7 +149,7 @@ import {
   DEFAULT_ENVIRONMENT_ID,
 } from "./environments";
 import type { EnvironmentStore, Environment } from "./environments";
-import type { WorkerStore, WorkerRecord } from "./worker-store";
+import type { WorkerStore, WorkerRecord, WorkerIncusMigration } from "./worker-store";
 import { isWorkerSelfApiAccess } from "./worker-self-access";
 import type { UserCredentialManager } from "./user-credentials";
 import type { UserEnvVarStore } from "./user-env-store";
@@ -626,7 +629,8 @@ export class ContainerManager {
     this.configureIncusImages(runtime);
   }
 
-  private configureIncusImages(runtime: IncusWorkerRuntime, restoreAuthority?: () => Promise<void>): void {
+  private configureIncusImages(runtime: IncusWorkerRuntime, restoreAuthority?: () => Promise<void>,
+    migrationAuthority?: () => Promise<void>): void {
     if (!this.config.incusConverterSeedFingerprint) return;
     runtime.setImageResolver(async (opts, stored, restoreSource) => {
       const selection = opts.imageSelection;
@@ -646,13 +650,18 @@ export class ContainerManager {
       const marker = this.workerStore.get(opts.userId, opts.id)?.incusRecreation?.nonce;
       const current = async () => {
         await restoreAuthority?.();
+        await migrationAuthority?.();
         const record = this.workerStore?.get(opts.userId, opts.id);
         const recovery = record?.incusRecreation;
         const invalidImport = restoreAuthority
           ? !opts.recreationNonce || recovery?.nonce !== opts.recreationNonce ||
             recovery.initialCreate !== true || recovery.importIncomplete !== true
           : recovery?.importIncomplete;
-        if (!record || record.runtimeKind !== 'incus-vm' || record.deletionPending || invalidImport ||
+        const validRuntime = migrationAuthority
+          ? record?.runtimeKind === 'legacy-docker' && record.incusMigration?.nonce === opts.recreationNonce &&
+            record.incusMigration?.phase !== 'retained' && record.incusMigration?.phase !== 'recovery-required'
+          : record?.runtimeKind === 'incus-vm';
+        if (!record || !validRuntime || record.deletionPending || invalidImport ||
             record.incusRecreation?.nonce !== marker || record.imageDefinitionId !== selection.definitionId ||
             record.imageVersion !== selection.version || record.imageDigest !== selection.digest ||
             record.imageRuntimeReference !== opts.image || !isDeepStrictEqual(currentGroups(), allowedGroupIds))
@@ -686,6 +695,425 @@ export class ContainerManager {
         // No guest exists; its next create/start uses current canonical keys.
       }
     }
+  }
+
+  /** Explicit offline ordinary-worker migration. The legacy record/source stay
+   * authoritative until the fresh destination has passed live validation. The
+   * existing lifecycle queues and canonical restore are the only coordinator
+   * and copy path; an ambiguous operation retains both sides for the admin. */
+  async migrateLegacyWorker(id: string, assertPrincipal: () => Promise<void>, lockPasswords?: unknown): Promise<ContainerInfo> {
+    const snapshot = this.workerStore?.findById(id);
+    if (!snapshot) throw Object.assign(new Error('Worker not found'), { statusCode: 404 });
+    const { withWorkerNetworkMutation } = await import('./worker-group-manager');
+    const { verifyWorkerMutationUnlocks } = await import('./worker-protection-lock');
+    return withWorkerNetworkMutation(snapshot.userId, async () => {
+      await assertPrincipal();
+      const sourceRecord = this.workerStore!.get(snapshot.userId, id), sourceInfo = this.containers.get(id);
+      if (!sourceRecord || !sourceInfo || sourceInfo.administrativeKind || sourceRecord.runtimeKind !== 'legacy-docker' ||
+          sourceRecord.status !== 'active' || sourceRecord.deletionPending || sourceRecord.incusMigration || sourceRecord.incusRecreation ||
+          sourceRecord.hostMountsRevoked || sourceRecord.hardwareDevicesRevoked || sourceRecord.hardwareDeviceIds?.length || !this.storageManager)
+        throw Object.assign(new Error('Migration requires a settled ordinary legacy worker and its configured OCI source'), { statusCode: 409 });
+      // Adapt a legacy-only network before taking this worker's non-reentrant
+      // queue. The accepted mixed-bridge dispatcher keeps peer aliases and
+      // requires coverage/unlocks of every desired and actual affected peer.
+      const topology = await this.managedNetworkContext(sourceInfo);
+      if (topology) for (const network of topology.networks) {
+        const desired = await topology.manager.members(network);
+        if (!desired.includes(id)) continue;
+        const coverage = new Set([...desired, ...await topology.manager.actualWorkerIds(network)]);
+        await verifyWorkerMutationUnlocks(coverage, lockPasswords); await assertPrincipal();
+        const prepared = await topology.manager.reconcile(network, undefined, coverage, id);
+        if (prepared.partialFailures.length)
+          throw Object.assign(new Error('Managed network preparation requires reconciliation before migration'), { statusCode: 409 });
+      }
+      return withWorkerLifecycleMutation(id, async () => {
+      await assertPrincipal();
+      const record = this.workerStore!.get(snapshot.userId, id), original = this.containers.get(id);
+      if (!record || !original || original.administrativeKind || record.runtimeKind !== 'legacy-docker' ||
+          record.status !== 'active' || record.deletionPending || record.incusMigration || record.incusRecreation ||
+          record.hostMountsRevoked || record.hardwareDevicesRevoked || record.hardwareDeviceIds?.length ||
+          !this.storageManager)
+        throw Object.assign(new Error('Migration requires a settled ordinary legacy worker and its configured OCI source'), { statusCode: 409 });
+      const { useManagedVolumeManager } = await import('./managed-volume-manager');
+      const volumes = useManagedVolumeManager(); await volumes.init();
+      volumes.assertLiveRecoveryResolved(record.userId, id);
+      const sourceManaged = structuredClone(volumes.store.forWorker(record.userId, id));
+      if (volumes.isRecoveryBlocked(id) || sourceManaged.some(v => !v.seeded || v.liveContainerId ||
+          v.operation || !['ready', 'detached'].includes(v.state) || v.storageRuntimeKind === 'incus-vm'))
+        throw Object.assign(new Error('Settle managed storage before migration; all source data was retained'), { statusCode: 409 });
+      const client = new Docker({ socketPath: '/var/run/docker.sock' });
+      const inspect = () => withOperationDeadline(signal => client.getContainer(original.containerId).inspect({ abortSignal: signal }),
+        15_000, 'Legacy migration source inspection');
+      const source = await inspect();
+      if (source.Id !== original.containerId || source.Name !== `/${original.containerName}` ||
+          source.Config.Labels?.['agentor.id'] !== id || !['running', 'exited', 'created'].includes(source.State.Status))
+        throw new Error('Legacy migration source identity or state is unavailable');
+      const configuredReference = record.imageRuntimeReference || this.config.workerImagePrefix + this.config.workerImage;
+      const configuredImage = await this.dockerService.workerOciImage(configuredReference).inspect();
+      if (record.imageDigest && record.imageDigest !== configuredImage.Id)
+        throw Object.assign(new Error('The configured custom OCI source no longer matches its durable immutable selection'), { statusCode: 409 });
+      let defaultFingerprint: string | undefined;
+      if (!record.imageRuntimeReference) {
+        const alias = await this.incusRuntime.client.getImageAlias(this.config.incusWorkerImage);
+        const derived = incusImageIdentity(await this.incusRuntime.client.getImage(alias.target));
+        if (derived.sourceImageId !== configuredImage.Id)
+          throw Object.assign(new Error('The configured default VM image does not derive from this authorized legacy OCI source'), { statusCode: 409 });
+        defaultFingerprint = derived.fingerprint;
+      }
+      const self = await withOperationDeadline(signal => client.getContainer(process.env.HOSTNAME || '').inspect({ abortSignal: signal }),
+        15_000, 'Migration trusted control-plane inspection');
+      const dataMount = self.Mounts.find(m => m.Destination === this.config.dataDir);
+      if (!dataMount || dataMount.Source !== this.storageManager.dataHostPath || !/^sha256:[a-f0-9]{64}$/.test(self.Image))
+        throw new Error('Migration control-plane image or private staging mount is unavailable');
+      const core = [
+        { role: 'workspace' as const, target: '/workspace', bind: this.storageManager.getWorkerWorkspaceBind(record.userId, id, original.containerName) },
+        { role: 'agents' as const, target: '/home/agent/.agent-data', bind: this.storageManager.getWorkerAgentsBind(record.userId, id, original.containerName) },
+      ];
+      const sources: Array<{ role: 'workspace' | 'agents' | 'docker' | 'managed'; mount: { Type: 'volume' | 'bind'; Source: string; Destination: string }; managed?: StoredManagedVolume }> = [];
+      for (const entry of core) {
+        const expected = entry.bind.slice(0, entry.bind.lastIndexOf(':'));
+        const matches = source.Mounts.filter(m => m.Destination === entry.target);
+        const mount = matches[0];
+        if (matches.length !== 1 || !mount || !['volume', 'bind'].includes(mount.Type) ||
+            (mount.Type === 'volume' ? mount.Name : mount.Source) !== expected)
+          throw new Error('Legacy persistent source does not match its authoritative storage layout');
+        sources.push({ role: entry.role, mount: { Type: mount.Type as 'volume' | 'bind', Source: expected, Destination: entry.target } });
+      }
+      for (const managed of sourceManaged) {
+        if (managed.attached && !source.Mounts.some(m => m.Type === 'volume' && m.Name === managed.dockerName && m.Destination === managed.target))
+          throw new Error('Legacy managed storage is not attached at its authoritative target');
+        sources.push({ role: 'managed', managed, mount: { Type: 'volume', Source: managed.dockerName, Destination: managed.target } });
+      }
+      const dockerName = `${original.containerName}-docker`;
+      try {
+        await client.getVolume(dockerName).inspect();
+        const mounted = source.Mounts.filter(m => m.Destination === '/var/lib/docker');
+        if (mounted.length && (mounted.length !== 1 || mounted[0]!.Type !== 'volume' || mounted[0]!.Name !== dockerName))
+          throw new Error('Legacy Docker storage is foreign');
+        sources.push({ role: 'docker', mount: { Type: 'volume', Source: dockerName, Destination: '/var/lib/docker' } });
+      } catch (error) { if ((error as { statusCode?: number }).statusCode !== 404) throw error; }
+      const sourceVolumes: NonNullable<WorkerIncusMigration['sourceVolumes']> = [];
+      for (const item of sources.filter(item => item.mount.Type === 'volume')) {
+        const volume = await client.getVolume(item.mount.Source).inspect() as Docker.VolumeInspectInfo & { CreatedAt?: string };
+        if (volume.Name !== item.mount.Source || volume.Driver !== 'local' || !volume.CreatedAt ||
+            Object.keys(volume.Options ?? {}).length)
+          throw new Error('Legacy volume identity or ordinary local storage authority is unavailable');
+        sourceVolumes.push({ name: volume.Name, createdAt: volume.CreatedAt });
+      }
+      const sourceDirectories: NonNullable<WorkerIncusMigration['sourceDirectories']> = [];
+      for (const item of sources.filter(item => item.mount.Type === 'bind')) {
+        const leaf = item.role === 'workspace' ? 'workspaces' : 'agents';
+        const path = join(this.config.dataDir, 'users', record.userId, leaf, id);
+        if (item.mount.Source !== join(dataMount.Source, 'users', record.userId, leaf, id))
+          throw new Error('Legacy directory source differs from the operator data mount');
+        const stat = await lstat(path);
+        if (!stat.isDirectory() || stat.isSymbolicLink() || await realpath(path) !== path)
+          throw new Error('Legacy directory source identity is unavailable');
+        sourceDirectories.push({ path, dev: stat.dev, ino: stat.ino });
+      }
+      let marker: WorkerIncusMigration = { nonce: randomUUID(), phase: 'preparing', source: {
+        containerId: source.Id, createdAt: source.Created, imageId: source.Image, wasRunning: source.State.Running,
+      }, sourceVolumes, sourceDirectories };
+      const baseline = (value: WorkerRecord) => { const { incusMigration, updatedAt, ...rest } = value; return rest; };
+      let stopped = false, creationAttempted = false, incarnation: string | undefined, cutover = false;
+      const nativeManaged = sourceManaged.map(v => ({ ...v, storageRuntimeKind: 'incus-vm' as const, seeded: false, state: 'pending' as StoredManagedVolume['state'] }));
+      const native: ContainerInfo = { ...original, runtimeKind: 'incus-vm', status: 'creating',
+        importedImage: undefined, runtimeDiagnostic: undefined };
+      const validate = async () => {
+        await assertPrincipal();
+        const current = this.workerStore!.get(record.userId, id);
+        const actual = await inspect();
+        if (!current || current.runtimeKind !== 'legacy-docker' || !isDeepStrictEqual(current.incusMigration, marker) ||
+            !isDeepStrictEqual(baseline(current), baseline(record)) || actual.Id !== source.Id ||
+            actual.Created !== source.Created || actual.Image !== source.Image || !isDeepStrictEqual(actual.Mounts, source.Mounts) ||
+            !isDeepStrictEqual(actual.Config.Labels, source.Config.Labels) || stopped && actual.State.Running ||
+            !isDeepStrictEqual(volumes.store.forWorker(record.userId, id), sourceManaged))
+          throw new Error('Legacy migration source, owner, configuration or storage authority changed');
+        if (defaultFingerprint) {
+          const alias = await this.incusRuntime.client.getImageAlias(this.config.incusWorkerImage);
+          const image = incusImageIdentity(await this.incusRuntime.client.getImage(alias.target));
+          if (image.fingerprint !== defaultFingerprint || image.sourceImageId !== configuredImage.Id)
+            throw new Error('The configured migration image changed');
+        }
+        if ((await this.dockerService.workerOciImage(configuredReference).inspect()).Id !== configuredImage.Id)
+          throw new Error('The configured immutable migration OCI source changed');
+        for (const volume of sourceVolumes) {
+          const found = await client.getVolume(volume.name).inspect() as Docker.VolumeInspectInfo & { CreatedAt?: string };
+          if (found.Name !== volume.name || found.CreatedAt !== volume.createdAt || found.Driver !== 'local' || Object.keys(found.Options ?? {}).length)
+            throw new Error('Legacy migration source volume was replaced');
+        }
+        for (const directory of sourceDirectories) {
+          const found = await lstat(directory.path);
+          if (!found.isDirectory() || found.isSymbolicLink() || found.dev !== directory.dev || found.ino !== directory.ino ||
+              await realpath(directory.path) !== directory.path) throw new Error('Legacy migration source directory was replaced');
+        }
+      };
+      const transition = async (phase: WorkerIncusMigration['phase']) => {
+        const next = { ...marker, phase, ...(incarnation ? { destinationIncarnation: incarnation } : {}) };
+        marker = (await this.workerStore!.transitionIncusMigration(record.userId, id, marker, next)).incusMigration!;
+      };
+      const runtime = new IncusWorkerRuntime(this.config, this.incusRuntime.client);
+      this.configureIncusImages(runtime, undefined, validate);
+      const options = { ...await this.incusOptionsForWorker(native, false, undefined, nativeManaged.filter(v => v.attached)),
+        start: false, recreationNonce: marker.nonce };
+      const detached = nativeManaged.filter(v => !v.attached);
+      const sourceEnvironment = source.Config.Env?.filter(value => value.startsWith('ENVIRONMENT=')) ?? [];
+      let sourceDockerEnabled = source.Mounts.some(mount => mount.Destination === '/var/lib/docker');
+      if (sourceEnvironment.length === 1) {
+        const environment = JSON.parse(sourceEnvironment[0]!.slice('ENVIRONMENT='.length)) as { dockerEnabled?: boolean };
+        if (environment.dockerEnabled === true) sourceDockerEnabled = true;
+      }
+      if (sourceDockerEnabled && !sources.some(item => item.role === 'docker'))
+        throw new Error('Required legacy Docker state is missing; no empty replacement was created');
+      const scratchRoot = join(this.config.dataDir, 'incus-migration-scratch');
+      await mkdir(scratchRoot, { mode: 0o700, recursive: true });
+      const root = await lstat(scratchRoot);
+      if (!root.isDirectory() || root.isSymbolicLink() || root.uid !== process.geteuid?.() || (root.mode & 0o077) ||
+          await realpath(scratchRoot) !== scratchRoot)
+        throw new Error('Migration scratch is not an owned private directory');
+      const free = await statfs(scratchRoot);
+      if (Number(free.bavail) * Number(free.bsize) < 64 * 1024 * 1024)
+        throw Object.assign(new Error('Insufficient migration scratch space; source data was retained'), { code: 'ENOSPC' });
+      const scratch = await mkdtemp(join(scratchRoot, `${marker.nonce}-`));
+      await this.workerStore!.transitionIncusMigration(record.userId, id, undefined, marker);
+      try {
+        await validate();
+        await runtime.preflightCanonicalRestore(options, undefined, detached);
+        await validate();
+        const dockerInventoryCommand = ['/usr/bin/python3', '-c',
+          'import json,subprocess\ndef run(args): return subprocess.check_output(["docker"]+args,text=True,timeout=30)\n' +
+          'info=json.loads(run(["info","--format","{{json .}}"])); result={"driver":info["Driver"],"root":info["DockerRootDir"]}\n' +
+          'for key,args in [("images",["image","ls","--no-trunc","--format","{{.ID}}"]),("containers",["container","ls","-a","--no-trunc","--format","{{.ID}}"]),("volumes",["volume","ls","--format","{{.Name}}"])]: result[key]=sorted(set(run(args).splitlines()))\n' +
+          'print(json.dumps(result))'];
+        const parseInventory = (value: string) => {
+          const result = JSON.parse(value) as { driver: string; root: string; images: string[]; containers: string[]; volumes: string[] };
+          if (!result || result.driver !== 'overlay2' || result.root !== '/var/lib/docker' ||
+              ![result.images, result.containers, result.volumes].every(list => Array.isArray(list) && list.length <= 10_000 &&
+                list.every(item => typeof item === 'string' && item.length <= 512)))
+            throw new Error('Migration Docker storage or inventory is unavailable');
+          return result;
+        };
+        let sourceDocker: ReturnType<typeof parseInventory> | undefined;
+        if (options.environmentJson.dockerEnabled && sourceDockerEnabled && source.State.Running) {
+          const inventory = await this.dockerService.execCapture(source.Id, dockerInventoryCommand, { user: 'root', timeoutMs: 120_000 });
+          if (inventory.exitCode !== 0) throw new Error('Legacy Docker inventory is unavailable; source was not migrated');
+          sourceDocker = parseInventory(inventory.stdout.toString('utf8')); await validate();
+        }
+        useLogCollector().detach(source.Id);
+        if (source.State.Running) await this.dockerService.stopContainer(source.Id);
+        stopped = true; await validate(); await transition('source-stopped');
+        const { captureLegacyMigrationArchive } = await import('./legacy-incus-migration-capture');
+        const payloads: { workspace?: string; agents?: string } = {};
+        const managedPayloads: Array<{ volume: StoredManagedVolume; archivePath: string }> = [];
+        const detachedPayloads: Array<{ volume: StoredManagedVolume; archivePath: string }> = [];
+        const selected: Array<{ path: string; archivePath: string }> = [];
+        for (const [index, item] of sources.entries()) {
+          const path = join(scratch, `${index}.tar`);
+          await captureLegacyMigrationArchive({ docker: this.dockerService, client, trustedImageId: self.Image,
+            source: marker.source, mount: item.mount, role: item.role, outputPath: path,
+            allowDetached: !source.Mounts.some(m => m.Destination === item.mount.Destination),
+            stagingHostPath: join(dataMount.Source, 'incus-migration-scratch', scratch.slice(scratch.lastIndexOf('/') + 1)), validate });
+          if (item.role === 'workspace' || item.role === 'agents') payloads[item.role] = path;
+          else if (item.role === 'docker') selected.push({ path: '/var/lib/docker', archivePath: path });
+          else {
+            const destination = nativeManaged.find(v => v.id === item.managed!.id)!;
+            (destination.attached ? managedPayloads : detachedPayloads).push({ volume: destination, archivePath: path });
+          }
+        }
+        await validate(); creationAttempted = true;
+        const instance = await runtime.createCanonicalRestore(options, undefined, selected.length > 0, detached);
+        incarnation = instance.config['volatile.uuid'];
+        if (!incarnation || instance.config['user.agentor.recreation'] !== marker.nonce ||
+            !await runtime.matchesWorkerIdentity(instance, id, record.userId)) throw new Error('Migration destination identity is unavailable');
+        native.containerId = `incus:${incarnation}`; native.imageId = instance.config['volatile.base_image'] ?? '';
+        await transition('destination-created');
+        await runtime.restoreCanonicalArchives(options, incarnation, payloads, validate, undefined, managedPayloads, selected, detachedPayloads);
+        for (const volume of nativeManaged) { volume.seeded = true; volume.state = volume.attached ? 'ready' : 'detached'; }
+        await transition('validating');
+        await runtime.finishCanonicalRestore(options, incarnation, validate, 'running', detached);
+        const guest = await runtime.inspectGuestReadiness(native, incarnation);
+        if (!guest.provisioned || !guest.serviceReady) throw new Error('Migrated worker services are not ready');
+        const topology = await this.managedNetworkContext(native);
+        if (topology) for (const network of topology.networks) {
+          if ((await topology.manager.members(network)).includes(id)) {
+            await validate(); await runtime.setManagedNetwork(native, incarnation, network.id, true);
+            if (!(await runtime.inspectManagedNetwork(native, incarnation, network.id)).attached)
+              throw new Error('Migrated managed network assignment is unavailable');
+          }
+        }
+        if (options.environmentJson.dockerEnabled) {
+          const docker = await runtime.client.exec(native.containerName, dockerInventoryCommand);
+          if (docker.returnCode !== 0) throw new Error('Migrated native Docker cannot read restored state');
+          const destinationDocker = parseInventory(docker.stdout);
+          if (sourceDocker && (['images', 'containers', 'volumes'] as const).some(role =>
+            sourceDocker![role].some(value => !destinationDocker[role].includes(value))))
+            throw new Error('Migrated Docker image, container or named volume metadata is missing');
+        }
+        const desired = record.desiredRuntimeStatus ?? (source.State.Running ? 'running' : 'stopped');
+        if (desired === 'stopped') await runtime.stop(native, incarnation);
+        await validate(); await transition('validated');
+        // Both stores remain behind the pending worker fence until the runtime
+        // switch. Ordinary pre-cutover failure restores these exact records.
+        for (const volume of nativeManaged) await volumes.store.save(volume);
+        const current = this.workerStore!.get(record.userId, id);
+        if (!current || !isDeepStrictEqual(current.incusMigration, marker)) throw new Error('Migration authority changed before cutover');
+        const resolved = await this.workerStore!.cutoverIncusMigration(record.userId, id, marker);
+        cutover = true; native.status = desired; native.desiredRuntimeStatus = desired; native.updatedAt = resolved.updatedAt;
+        this.containers.set(id, native); this.runtimeObservations.delete(id);
+        await useWorkerConfigStore().markApplied(record.userId, id, this.appliedIncusBootstrap(options, native), options.configurationRevision);
+        await rm(scratch, { recursive: true });
+        await reassignWorkerMappings(native.containerName).catch(error =>
+          useLogger().warn(`[container] migrated worker routing refresh deferred: ${(error as Error).message}`));
+        useLogCollector().attach(native.containerName, native.containerId, 'worker', native.displayName).catch(() => {});
+        await this.reconcileWorkerPlugins(native);
+        return { ...native };
+      } catch (cause) {
+        if (cutover || this.workerStore!.get(record.userId, id)?.runtimeKind === 'incus-vm') throw cause;
+        try {
+          if ((cause as OperationFailureWithSettlement)?.[operationSettlement] ||
+              (cause as { code?: string })?.code === 'LEGACY_MIGRATION_CAPTURE_RETAINED')
+            throw new Error('Unsettled migration operation requires administrator recovery');
+          if (creationAttempted) {
+            if (!incarnation && !(cause instanceof IncusRequestRejected))
+              throw new Error('Unacknowledged migration destination mutation requires administrator recovery');
+            if (!incarnation) {
+              // A typed rejection plus missing compute is positive no-create
+              // evidence. A timeout/404 alone never authorizes this cleanup.
+              try {
+                await runtime.client.getInstance(native.containerName);
+                throw new Error('Rejected creation has unexpected destination compute');
+              } catch (error) { if ((error as { statusCode?: number }).statusCode !== 404) throw error; }
+            }
+            await runtime.rollbackRecreation(native, { nonce: marker.nonce, replacementIncarnation: incarnation, initialCreate: true, importIncomplete: true });
+            const { IncusManagedVolumeRuntime } = await import('./incus-managed-volume-runtime');
+            const managed = new IncusManagedVolumeRuntime(this.config, runtime);
+            for (const volume of nativeManaged) await managed.delete(volume);
+            await runtime.removeStorage(native);
+          }
+          for (const volume of sourceManaged) await volumes.store.save(volume);
+          // Reread the exact source after destination cleanup; never start a
+          // replacement container selected by its human-readable name.
+          const actual = await inspect();
+          if (actual.Id !== source.Id || actual.Created !== source.Created || actual.Image !== source.Image ||
+              !isDeepStrictEqual(actual.Mounts, source.Mounts) || stopped && actual.State.Running)
+            throw new Error('Migration rollback source identity or stop is unproven');
+          if (source.State.Running && !actual.State.Running) await this.restartUnlocked(id, true, marker);
+          await this.workerStore!.clearIncusMigration(record.userId, id, marker);
+          original.status = source.State.Running ? 'running' : 'stopped';
+          await rm(scratch, { recursive: true });
+        } catch (rollback) {
+          await transition('recovery-required').catch(() => {});
+          throw Object.assign(new Error('Migration stopped safely; source and destination authority require administrator recovery', { cause: rollback }),
+            { statusCode: 409, code: 'WORKER_MIGRATION_RECOVERY_REQUIRED' });
+        }
+        throw cause;
+      }
+      });
+    });
+  }
+
+  /** Separate explicit finalization; successful migration never deletes its
+   * retained legacy source. Only source receipts from that validated cutover
+   * authorize cleanup. Shared account state is deliberately not a target. */
+  async finalizeLegacyMigration(id: string, assertPrincipal: () => Promise<void>): Promise<void> {
+    const snapshot = this.workerStore?.findById(id);
+    if (!snapshot) throw Object.assign(new Error('Worker not found'), { statusCode: 404 });
+    await withOwnerWorkerLifecycleMutation(snapshot.userId, id, async () => {
+      await assertPrincipal();
+      const record = this.workerStore!.get(snapshot.userId, id), marker = record?.incusMigration;
+      if (!record || record.runtimeKind !== 'incus-vm' || !marker || marker.phase !== 'retained' ||
+          record.incusRecreation || record.deletionPending)
+        throw Object.assign(new Error('Finalization requires a settled validated Incus migration'), { statusCode: 409 });
+      const owner = { id, userId: record.userId, containerName: this.buildContainerName(id) };
+      const info = this.containers.get(id);
+      // Never finalize the only surviving persistent copy. This accepted
+      // read-only primitive verifies all core ownership and image authority.
+      await this.incusRuntime.backupRuntime(owner,
+        info?.runtimeKind === 'incus-vm' ? this.capturedIncusIncarnation(info) : undefined);
+      const { useManagedVolumeManager } = await import('./managed-volume-manager');
+      const volumes = useManagedVolumeManager(); await volumes.init();
+      volumes.assertLiveRecoveryResolved(record.userId, id);
+      const { IncusManagedVolumeRuntime } = await import('./incus-managed-volume-runtime');
+      const managedRuntime = new IncusManagedVolumeRuntime(this.config, this.incusRuntime);
+      for (const volume of volumes.store.forWorker(record.userId, id)) {
+        if (volume.storageRuntimeKind !== 'incus-vm' || !volume.seeded ||
+            !await managedRuntime.inspectVolume(volume))
+          throw new Error('Canonical managed storage is missing or unsettled; retained source was not finalized');
+      }
+      const client = new Docker({ socketPath: '/var/run/docker.sock' });
+      const current = async () => {
+        await assertPrincipal();
+        const worker = this.workerStore!.get(record.userId, id);
+        if (!worker || worker.runtimeKind !== 'incus-vm' || !isDeepStrictEqual(worker.incusMigration, marker) ||
+            worker.incusRecreation || worker.deletionPending) throw new Error('Migration finalization authority changed');
+      };
+      await current();
+      let source: Docker.ContainerInspectInfo | undefined;
+      try { source = await withOperationDeadline(signal => client.getContainer(marker.source.containerId).inspect({ abortSignal: signal }),
+        15_000, 'Migration finalization source inspection'); }
+      catch (error) { if ((error as { statusCode?: number }).statusCode !== 404) throw error; }
+      if (source && (source.Id !== marker.source.containerId || source.Created !== marker.source.createdAt ||
+          source.Image !== marker.source.imageId || source.Config.Labels?.['agentor.id'] !== id ||
+          source.State.Running || source.State.Paused || source.State.Restarting || source.State.Pid !== 0))
+        throw new Error('Retained migration source identity or stop is unproven');
+      const inspectVolume = async (receipt: NonNullable<WorkerIncusMigration['sourceVolumes']>[number]) => {
+        try {
+          const found = await withOperationDeadline(signal => client.getVolume(receipt.name).inspect({ abortSignal: signal }),
+            15_000, 'Migration finalization volume inspection') as Docker.VolumeInspectInfo & { CreatedAt?: string };
+          if (found.Name !== receipt.name || found.CreatedAt !== receipt.createdAt || found.Driver !== 'local' ||
+              Object.keys(found.Options ?? {}).length) throw new Error('Retained migration volume identity changed');
+          return found;
+        } catch (error) { if ((error as { statusCode?: number }).statusCode !== 404) throw error; }
+      };
+      const inspectDirectory = async (receipt: NonNullable<WorkerIncusMigration['sourceDirectories']>[number]) => {
+        const allowed = ['workspaces', 'agents'].map(role => join(this.config.dataDir, 'users', record.userId, role, id));
+        if (!allowed.includes(receipt.path)) throw new Error('Retained migration directory is not worker-owned storage');
+        try {
+          const found = await lstat(receipt.path);
+          if (!found.isDirectory() || found.isSymbolicLink() || found.dev !== receipt.dev || found.ino !== receipt.ino ||
+              await realpath(receipt.path) !== receipt.path) throw new Error('Retained migration directory identity changed');
+          return found;
+        } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      };
+      for (const receipt of marker.sourceVolumes ?? []) await inspectVolume(receipt);
+      for (const receipt of marker.sourceDirectories ?? []) await inspectDirectory(receipt);
+      const references = await withOperationDeadline(signal => client.listContainers({ all: true, abortSignal: signal }),
+        15_000, 'Migration finalization source references');
+      const controller = await withOperationDeadline(signal => client.getContainer(process.env.HOSTNAME || '').inspect({ abortSignal: signal }),
+        15_000, 'Migration finalization current controller inspection');
+      const controllerData = controller.Mounts.find(mount => mount.Destination === this.config.dataDir);
+      if (!/^[a-f0-9]{64}$/.test(controller.Id) || !/^sha256:[a-f0-9]{64}$/.test(controller.Image) ||
+          !controller.State.Running || !controllerData || controllerData.Source !== this.storageManager?.dataHostPath)
+        throw new Error('Migration finalization trusted controller data mapping is unavailable');
+      for (const other of references.filter(item => item.Id !== marker.source.containerId)) {
+        if ((other.Mounts ?? []).some(mount => {
+          // The running trusted controller necessarily holds the DATA parent.
+          // This sole exact mount is not another consumer of worker data.
+          if (other.Id === controller.Id && mount.Type === controllerData.Type && mount.Source === controllerData.Source &&
+              mount.Destination === controllerData.Destination && mount.Name === controllerData.Name) return false;
+          return (marker.sourceVolumes ?? []).some(receipt => mount.Name === receipt.name) ||
+            (marker.sourceDirectories ?? []).some(receipt => {
+              if (!this.storageManager?.dataHostPath) throw new Error('Retained directory host mapping is unavailable');
+              const host = join(this.storageManager.dataHostPath, receipt.path.slice(this.config.dataDir.length));
+              return mount.Source && pathsOverlap(mount.Source, host);
+            });
+        })) throw new Error('Retained migration storage is still referenced by another container');
+      }
+      await current();
+      if (source) await withOperationDeadline(signal => client.getContainer(source!.Id).remove({ abortSignal: signal }),
+        30_000, 'Migration finalization stopped source removal');
+      for (const receipt of marker.sourceVolumes ?? []) {
+        await current();
+        if (await inspectVolume(receipt)) await withOperationDeadline(signal => client.getVolume(receipt.name).remove({ abortSignal: signal }),
+          30_000, 'Migration finalization source volume removal');
+      }
+      for (const receipt of marker.sourceDirectories ?? []) {
+        await current();
+        if (await inspectDirectory(receipt)) await rm(receipt.path, { recursive: true });
+      }
+      await current();
+      await this.workerStore!.clearRetainedIncusMigration(record.userId, id, marker);
+    });
   }
 
   setEnvironmentStore(store: EnvironmentStore): void {
@@ -934,7 +1362,8 @@ export class ContainerManager {
     };
   }
 
-  private async incusOptionsForWorker(info: ContainerInfo, applied: boolean, currentLayout?: string): Promise<IncusWorkerOptions> {
+  private async incusOptionsForWorker(info: ContainerInfo, applied: boolean, currentLayout?: string,
+    migrationVolumes?: StoredManagedVolume[]): Promise<IncusWorkerOptions> {
     const store = useWorkerConfigStore();
     const bootstrap = applied ? await store.resolveAppliedBootstrap(info.userId, info.id) : undefined;
     if (applied && !bootstrap)
@@ -950,10 +1379,10 @@ export class ContainerManager {
     const { gitName, gitEmail } = bootstrap?.workerJson ?? await this.resolveGitIdentity(info.userId);
     const { useManagedVolumeManager } = await import('./managed-volume-manager');
     const volumes = useManagedVolumeManager();
-    if (!currentLayout) await volumes.mounts(info.userId, info.id);
-    const managedVolumes = currentLayout
+    if (!currentLayout && !migrationVolumes) await volumes.mounts(info.userId, info.id);
+    const managedVolumes = migrationVolumes ?? (currentLayout
       ? await volumes.currentIncusVolumes(info.userId, info.id, currentLayout)
-      : volumes.store.forWorker(info.userId, info.id).filter(v => v.attached);
+      : volumes.store.forWorker(info.userId, info.id).filter(v => v.attached));
     return {
       userId: info.userId, id: info.id, containerName: info.containerName,
       ...(bootstrap ? { cpuLimit: bootstrap.cpuLimit, memoryLimit: bootstrap.memoryLimit, dockerEnabled: bootstrap.dockerEnabled }
@@ -2986,10 +3415,17 @@ for p in sys.argv[1:]:
     );
   }
 
-  private async restartUnlocked(id: string, storagePrepared = false): Promise<void> {
+  private async restartUnlocked(id: string, storagePrepared = false, migrationRollback?: WorkerIncusMigration): Promise<void> {
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
-    this.assertOrdinaryMutation(info);
+    if (migrationRollback) {
+      const record = this.workerStore?.get(info.userId, id);
+      if (!record || record.runtimeKind !== 'legacy-docker' || info.runtimeKind !== 'legacy-docker' ||
+          info.administrativeKind || record.deletionPending || record.hostMountsRevoked || record.hardwareDevicesRevoked ||
+          !isDeepStrictEqual(record.incusMigration, migrationRollback) ||
+          info.containerId !== migrationRollback.source.containerId || migrationRollback.phase === 'retained')
+        throw new Error('Exact legacy migration rollback restart authority changed');
+    } else this.assertOrdinaryMutation(info);
     if (info.runtimeKind === "incus-vm") {
       const incarnation = this.capturedIncusIncarnation(info);
       if (info.hostMountsRevoked || info.hardwareDevicesRevoked)
@@ -3119,7 +3555,7 @@ for p in sys.argv[1:]:
       .attach(info.containerName, info.containerId, "worker", info.displayName)
       .catch(() => {});
     useLogger().info(`[container] restarted ${info.containerName}`);
-    await this.reconcileWorkerPlugins(info);
+    if (!migrationRollback) await this.reconcileWorkerPlugins(info);
   }
 
   /** Explicit recovery for a task/shim that no longer accepts normal stop,
