@@ -62,7 +62,9 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
     : process.env.INCUS_NEW_PUBLIC_TEST === 'true'
       ? 'real authenticated encrypted worker backup restores fresh Incus worker storage and selected native Docker data'
       : process.env.INCUS_CUSTOM_IMAGE_PUBLIC_TEST === 'true'
-        ? process.env.INCUS_CUSTOM_IMAGE_PORTABLE_TEST === 'true'
+        ? process.env.INCUS_CUSTOM_IMAGE_INSTANCE_TEST === 'true'
+          ? 'real authenticated custom whole-instance producer validates encrypted SQLite and native cold-restore source'
+          : process.env.INCUS_CUSTOM_IMAGE_PORTABLE_TEST === 'true'
           ? 'real authenticated portable custom worker export imports fresh Incus worker from private cache'
           : process.env.INCUS_CUSTOM_IMAGE_BACKUP_TEST === 'true'
           ? 'real authenticated encrypted custom worker backup restores fresh Incus worker from private cache'
@@ -74,7 +76,8 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
   const customPublic = mode === 'app-rest-ordinary' && process.env.INCUS_CUSTOM_IMAGE_PUBLIC_TEST === 'true';
   const customBackup = customPublic && process.env.INCUS_CUSTOM_IMAGE_BACKUP_TEST === 'true';
   const customPortable = customPublic && process.env.INCUS_CUSTOM_IMAGE_PORTABLE_TEST === 'true';
-  if (customBackup && customPortable) throw new Error('Choose one custom restore gate');
+  const customInstance = customPublic && process.env.INCUS_CUSTOM_IMAGE_INSTANCE_TEST === 'true';
+  if ([customBackup, customPortable, customInstance].filter(Boolean).length > 1) throw new Error('Choose one custom restore gate');
   if ([originalPublic, newPublic, customPublic].filter(Boolean).length > 1) throw new Error('Choose exactly one public worker gate');
   const rest = mode === 'app-rest-ordinary' && !originalPublic && !newPublic && !customPublic, app = mode.startsWith('app-'), ordinary = originalPublic || newPublic || rest || mode === 'app-ordinary' || mode !== 'retained' && !app,
     rollback = mode === 'rollback' || mode === 'app-rollback';
@@ -132,15 +135,15 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
         customRetained.workerId !== 'd958a3cd-4630-49ae-9a57-899dc01e5980' || customRetained.definitionId !== '2a7df365-2c7d-407b-9bab-96191906804f' ||
         customRetained.sourceImageId !== 'sha256:f0bfcd056c7d27ead09025f91e53678fc6172dabfd130f216a7dedd7d572e2fc' ||
         customRetained.fingerprint !== '30e74cf8f70888092ff94e6386c7f0a7d675ba464425882b0d151325c28326f2' ||
-        customRetained.app.Id !== (customPortable ? '576101a2d3381e136f699b085ddffd50f3fa9615779a355b8c28ab692acd5db3' : retryArtifactId ? '08adb9546de808c17b2389ccd129435c8f2460560c07b0ee1d5a9b47ac49839e' : '38271e5ea1ec10805ccb5bf14935a555f1e695ac66d1e0b12e283d26867f29de') ||
-        customPortable && customRetained.app.Image !== 'sha256:5ed3992c1027560b6ad5a303eed2d2d38671921f030f567a934cb1da7e0cd836' ||
+        customRetained.app.Id !== (customPortable || customInstance ? '576101a2d3381e136f699b085ddffd50f3fa9615779a355b8c28ab692acd5db3' : retryArtifactId ? '08adb9546de808c17b2389ccd129435c8f2460560c07b0ee1d5a9b47ac49839e' : '38271e5ea1ec10805ccb5bf14935a555f1e695ac66d1e0b12e283d26867f29de') ||
+        (customPortable || customInstance) && customRetained.app.Image !== 'sha256:5ed3992c1027560b6ad5a303eed2d2d38671921f030f567a934cb1da7e0cd836' ||
         retryArtifactId && customRetained.app.Image !== 'sha256:43640a77dfb2c8c2d63d74cfefee487210f86978e3735e2f52cb0e02c0753c54' ||
-        customRetained.instance.config['volatile.uuid'] !== (customBackup || customPortable ? '8ad56682-4fb6-420d-8e85-b0d3be659f46' : '2486a933-3268-4caa-9614-c11dd1cb4b44') ||
+        customRetained.instance.config['volatile.uuid'] !== (customBackup || customPortable || customInstance ? '8ad56682-4fb6-420d-8e85-b0d3be659f46' : '2486a933-3268-4caa-9614-c11dd1cb4b44') ||
         !/^a9defe44-[a-f0-9-]{27}$/.test(customRetained.sourceBuildId) || !/^432c08ba-[a-f0-9-]{27}$/.test(customRetained.nativeBuildId) ||
         !/^sha256:[a-f0-9]{64}$/.test(customRetained.app.Image) || customRetained.volumes.length !== 2 || custom?.project !== 'agimg10b')
       throw new Error('Retained custom proof does not identify the explicitly approved source fixture');
   }
-  if ((customBackup || customPortable) && !customRetained) throw new Error('Custom restore gate requires the accepted retained source proof');
+  if ((customBackup || customPortable || customInstance) && !customRetained) throw new Error('Custom restore gate requires the accepted retained source proof');
   let retained: { version: 1; fixtureId: string; workerId: string; ownerId: string; volume: StoredManagedVolume;
     localDir: string; remoteDir: string; parentId: string; parentImageId: string; restoreJobId: string;
     failedCaptureJobId: string; incarnation: string; installation: string; source: WorkerBackupRuntimeSource;
@@ -183,7 +186,7 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
       if (retained) expect(dockerSourceDigest).toBe(retained.dockerArchive.sha256);
     } finally { await file.close(); }
   }
-  const local = customRetained && !customBackup ? customRetained.localDir : await mkdtemp(join(tmpdir(), 'agentor-native-helper-process-'));
+  const local = customRetained && !customBackup && !customInstance ? customRetained.localDir : await mkdtemp(join(tmpdir(), 'agentor-native-helper-process-'));
   const followupNonce = randomUUID();
   const source = join(customRetained?.localDir ?? retained?.localDir ?? local, 'source'), targetData = join(local, 'data'), build = join(local, 'image');
   const id = retained?.workerId ?? randomUUID(), volumeId = retained?.volume.id ?? randomUUID(), jobId = customRetained?.jobId ?? retained?.fixtureId ?? randomUUID();
@@ -413,11 +416,11 @@ print('Exact account fixture delta confirmed')
       expect(customRetained.binding.identity.fingerprint).toBe(customRetained.fingerprint);
       expect(await root(`sudo docker image inspect ${quote(customRetained.sourceImageId)} --format '{{.Id}} {{index .Config.Labels "agentor.image-definition"}} {{index .Config.Labels "agentor.image-owner-hash"}}'`))
         .toBe(`${customRetained.sourceImageId} ${customRetained.definitionId} ${createHash('sha256').update(userId).digest('hex')}`);
-      expect(customRetained.nft.table).toBe(customPortable ? 'agentor_restore_021d9d16' : retryArtifactId ? 'agentor_restore_76e0284c' : 'agentor_restore_' + jobId.slice(0, 8));
+      expect(customRetained.nft.table).toBe(customPortable || customInstance ? 'agentor_restore_021d9d16' : retryArtifactId ? 'agentor_restore_76e0284c' : 'agentor_restore_' + jobId.slice(0, 8));
       const oldRule = sourceRuleSnapshot(typeof customRetained.nft.json === 'string' ? customRetained.nft.json : JSON.stringify(customRetained.nft.json));
       expect(sourceRuleSnapshot(await root(`sudo nft -j list table ip ${customRetained.nft.table}`))).toBe(oldRule);
       if (!customBackup) sourceRuleBaseline = oldRule;
-      if (customPortable) expect(await root(`sudo docker exec ${targetId} node --input-type=module -e ${quote(
+      if (customPortable || customInstance) expect(await root(`sudo docker exec ${targetId} node --input-type=module -e ${quote(
         `import fs from'node:fs';import crypto from'node:crypto';const p='/app/.output/server/chunks/nitro/nitro.mjs';const s=fs.lstatSync(p);` +
         `if(!s.isFile()||s.isSymbolicLink())throw Error('Current App program is not regular');const b=fs.readFileSync(p);` +
         `if(b.includes(Buffer.from('AGENTOR_DIAGNOSTIC')))throw Error('Diagnostic program is not portable gate authority');console.log(crypto.createHash('sha256').update(b).digest('hex'));`)}`))
@@ -514,7 +517,7 @@ print('Exact account fixture delta confirmed')
     expect(binding.capability).toBe('agentor-storage-ownership-v1');
     expect(binding.context).toMatchObject({ installationId: installation, project: custom.project, seedFingerprint: custom.seedFingerprint,
       sourceImageId: built.digest });
-    expect(binding.context.recipeId).toBe(incusConversionRecipeId(built.digest, await readCanonicalIncusBootstrap(join(local, 'current-bootstrap'))));
+    expect(binding.context.recipeId).toBe(incusConversionRecipeId(built.digest, await readCanonicalIncusBootstrap(join(customInstance ? customRetained!.localDir : local, 'current-bootstrap'))));
     const native = state.builds.filter(build => build.nativeDerivation);
     expect(native).toHaveLength(1); const conversion = native[0]!;
     expect(conversion).toMatchObject({ id: binding.buildId, status: 'succeeded' });
@@ -564,6 +567,19 @@ print('Exact account fixture delta confirmed')
       expect(self.returnCode, self.stderr).toBe(0); expect(JSON.parse(self.stdout)).toMatchObject({ workerId: examined.id, userId });
     };
     await assertGuest(firstUuid);
+    if (customInstance && customRetained) {
+      computeSettled = false;
+      const produced = await runProducer(snapshotIncusWorkerBackupRuntime(binding.identity).source, installation,
+        { owner, incarnation: firstUuid, marker, catalog: state });
+      const same = await runtime.client.getInstance(owner.containerName);
+      expect(same.config['volatile.uuid']).toBe(firstUuid); expect(same.status).toBe('Stopped');
+      expect((await privateCatalog()).nativeBindings).toEqual(state.nativeBindings);
+      computeSettled = true;
+      console.info('Genuine custom encrypted whole-instance producer passed SQLite/admin, applied bootstrap, controlled catalog/native ACKs and two canonical archives; cold inverse pending; no source retirement/controller stop/data deletion',
+        { local, sourceData: remoteData, sourceApp: targetId, sourceWorker: owner.id, incarnation: firstUuid,
+          backupId: produced.manifest.backupId, ciphertext: produced.localEncrypted, privateKey: produced.localKey });
+      return;
+    }
     if ((customBackup || customPortable) && customRetained) {
       // Reuse the public encrypted worker-backup/new-restore flow, not instance
       // restore setup or a fabricated portable/native authority record.
@@ -778,7 +794,10 @@ print(json.dumps(out))
     computeSettled = true;
     console.info('Actual controlled catalog OCI -> normal Incus create/stop/start/rebuild passed marker, provisioning, services/proxies/self and unchanged private derivation cache; exact new native/OCI fixtures removed');
   };
-  const runProducer = async (expectedSource: WorkerBackupRuntimeSource, installation: string) => {
+  const runProducer = async (expectedSource: WorkerBackupRuntimeSource, installation: string, customCapture?: {
+    owner: { id: string; userId: string; containerName: string }; incarnation: string; marker: string;
+    catalog: { definitions: ImageDefinition[]; builds: ImageBuild[]; nativeBindings: Record<string, NativeImageBinding> };
+  }) => {
     // Exercise the actual producer as well as the inverse: default SQLite
     // online backup, real quiescence checks, native inventory/capture and
     // encrypted publication through the configured local provider.
@@ -792,24 +811,29 @@ print(json.dumps(out))
       expect(current.config['volatile.uuid']).toBe(retained.incarnation);
       expect(await runtime.matchesWorkerIdentity(current, id, userId)).toBe(true); computeSettled = true;
     }
-    const dockerProof = await runtime.client.exec(options!.containerName, ['bash', '-ec',
+    const capturedOwner = customCapture?.owner ?? options!, capturedId = capturedOwner.id;
+    let dockerIds: string[] = [], dockerVolumeBytes = Buffer.alloc(0);
+    if (!customCapture) {
+    const dockerProof = await runtime.client.exec(capturedOwner.containerName, ['bash', '-ec',
       'docker image inspect --format "{{.Id}}" agentor-archive-lower:proof; ' +
       'docker container inspect --format "{{.Id}}" archive-layer archive-stopped; ' +
       'base64 -w0 "$(docker volume inspect --format "{{.Mountpoint}}" archive-data)/ordinary"; echo']);
     expect(dockerProof.returnCode, dockerProof.stderr).toBe(0);
     const dockerProofLines = dockerProof.stdout.trim().split('\n'); expect(dockerProofLines).toHaveLength(4);
-    const dockerIds = dockerProofLines.slice(0, 3), dockerVolumeBytes = Buffer.from(dockerProofLines[3]!, 'base64');
+    dockerIds = dockerProofLines.slice(0, 3); dockerVolumeBytes = Buffer.from(dockerProofLines[3]!, 'base64');
     expect(dockerVolumeBytes.length).toBeGreaterThan(0); expect(dockerVolumeBytes.toString().trim()).toBe('persistent');
     expect(dockerIds[0]).toMatch(/^sha256:[a-f0-9]{64}$/);
     for (const container of dockerIds.slice(1)) expect(container).toMatch(/^[a-f0-9]{64}$/);
-    const stopped = await appRequest<{ ok: boolean }>('/api/containers/' + id + '/stop', {}, true, 360_000);
+    }
+    const stopped = await appRequest<{ ok: boolean }>('/api/containers/' + capturedId + '/stop', {}, true, 360_000);
     expect(stopped.status).toBe(200); expect(stopped.body).toEqual({ ok: true });
-    const sourceInstance = await runtime.client.getInstance(options!.containerName);
-    expect(sourceInstance.status).toBe('Stopped'); expect(sourceInstance.config['volatile.uuid']).toBe(incarnation);
-    expect(await runtime.matchesWorkerIdentity(sourceInstance, id, userId)).toBe(true);
-    const sourceNames = [...['workspace', 'agents', 'docker'].map(role => options!.containerName + '-' + role), volume.dockerName];
+    const sourceInstance = await runtime.client.getInstance(capturedOwner.containerName);
+    expect(sourceInstance.status).toBe('Stopped'); expect(sourceInstance.config['volatile.uuid']).toBe(customCapture?.incarnation ?? incarnation);
+    expect(await runtime.matchesWorkerIdentity(sourceInstance, capturedId, userId)).toBe(true);
+    const sourceNames = customCapture ? ['workspace', 'agents'].map(role => capturedOwner.containerName + '-' + role)
+      : [...['workspace', 'agents', 'docker'].map(role => capturedOwner.containerName + '-' + role), volume.dockerName];
     const sourceVolumes = await Promise.all(sourceNames.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)));
-    const privateRoot = '/tmp/agentor-producer-' + jobId, sessionFile = privateRoot + '/session',
+    const privateRoot = '/tmp/agentor-producer-' + (customCapture ? followupNonce : jobId), sessionFile = privateRoot + '/session',
       keyFile = privateRoot + '/recovery.json', encryptedFile = privateRoot + '/instance.backup';
     // Prepare one real session and freshly reauthenticated active key BEFORE
     // taking the write barrier. Polling uses that private cookie without an
@@ -817,7 +841,9 @@ print(json.dumps(out))
     const prepare = `const fs=await import('node:fs');const base='http://127.0.0.1:3000';` +
       `const h={Origin:base,'Content-Type':'application/json'};` +
       `const signed=await fetch(base+'/api/auth/sign-in/email',{method:'POST',headers:h,body:${JSON.stringify(JSON.stringify(admin))}});` +
-      `if(!signed.ok)throw Error('Private producer sign-in failed');h.Cookie=signed.headers.getSetCookie().map(v=>v.split(';')[0]).join('; ');` +
+      `if(!signed.ok)throw Error('Private producer sign-in failed');` +
+      (customCapture ? `if((await signed.json()).user?.id!==${JSON.stringify(userId)})throw Error('Private producer owner differs');` : '') +
+      `h.Cookie=signed.headers.getSetCookie().map(v=>v.split(';')[0]).join('; ');` +
       `const revealed=await fetch(base+'/api/backups/recovery-key/reveal',{method:'POST',headers:h,body:JSON.stringify({password:${JSON.stringify(admin.password)}})});` +
       `if(!revealed.ok)throw Error('Private producer reauthentication failed');const key=await revealed.json();` +
       `if(typeof key.keyMaterial!=='string'||typeof key.fingerprint!=='string')throw Error('Private producer key response invalid');` +
@@ -831,7 +857,7 @@ print(json.dumps(out))
     } catch { throw new Error('Private producer session/key preparation failed'); }
       const capture = await appRequest<{ accepted: boolean; jobId: string }>('/api/admin/instance-backups',
         { provider: 'local', options: { includeWorkers: true, includeAgentData: true, includeDockerVolumes: true,
-          includeLocalBackups: false, includeLogs: false }, requestId: (retained ? followupNonce : jobId) + '-capture' }, true, 30_000, undefined, sessionFile);
+          includeLocalBackups: false, includeLogs: false }, requestId: (retained || customCapture ? followupNonce : jobId) + '-capture' }, true, 30_000, undefined, sessionFile);
     expect(capture.status).toBe(202); expect(capture.body.accepted).toBe(true); expect(capture.body.jobId).toMatch(/^[a-f0-9-]{36}$/);
     await expect.poll(async () => {
       const state = await appRequest<InstanceBackupJob>('/api/admin/instance-backups/jobs/' + capture.body.jobId,
@@ -875,9 +901,9 @@ print(json.dumps(out))
     const captured = await inspectInstanceBundle(capturedBundle, capturedRoot);
     expect(captured.manifest).toMatchObject({ formatVersion: 2, backupId: capture.body.jobId, createdByUserId: userId,
       sourceInstallationId: installation, options: { includeWorkers: true, includeAgentData: true, includeDockerVolumes: true } });
-    expect(captured.manifest.volumes.map(v => v.runtime?.role).sort()).toEqual(['agents', 'docker', 'managed', 'workspace']);
+    expect(captured.manifest.volumes.map(v => v.runtime?.role).sort()).toEqual(customCapture ? ['agents', 'workspace'] : ['agents', 'docker', 'managed', 'workspace']);
     const capturedWorkers = JSON.parse((await run('tar', ['-xzOf', captured.dataArchivePath, '--', 'users/' + userId + '/workers.json'])).stdout) as WorkerRecord[];
-    expect(capturedWorkers).toHaveLength(1); expect(capturedWorkers[0]).toMatchObject({ id, userId, runtimeKind: 'incus-vm', desiredRuntimeStatus: 'stopped' });
+    expect(capturedWorkers).toHaveLength(1); expect(capturedWorkers[0]).toMatchObject({ id: capturedId, userId, runtimeKind: 'incus-vm', desiredRuntimeStatus: 'stopped' });
     const snapshotDb = join(local, 'captured-auth.db');
     await writeFile(snapshotDb, (await run('tar', ['-xzOf', captured.dataArchivePath, '--', 'auth.db'],
       { encoding: 'buffer', maxBuffer: 16 * 1024 * 1024 })).stdout, { mode: 0o600 });
@@ -887,26 +913,50 @@ print(json.dumps(out))
     expect(sqlite).toEqual({ integrity: 'ok', user: [userId, admin.email, 'admin'] });
     await mkdir(rawRoot, { mode: 0o700 });
     for (const descriptor of captured.manifest.volumes) {
-      expect(descriptor.ownerId).toBe(userId); expect(descriptor.workerId).toBe(id);
+      expect(descriptor.ownerId).toBe(userId); expect(descriptor.workerId).toBe(capturedId);
       if (!descriptor.runtime) throw new Error('Actual producer lost native volume authority');
       if (descriptor.runtime.role === 'managed') expect(descriptor.runtime).toEqual({ kind: 'incus-vm', role: 'managed', managedVolumeId: volumeId, target: volume.target });
       else expect(descriptor.runtime.source).toEqual(expectedSource);
       const raw = await prepareInstanceNativeVolumeArchive(captured.volumeArchives.get(descriptor.name)!, descriptor, rawRoot);
-      const entry = descriptor.runtime.role === 'workspace' ? 'workspace/marker' : descriptor.runtime.role === 'agents' ? '.agent-data/marker'
+      const entry = customCapture ? (descriptor.runtime.role === 'workspace' ? 'workspace/custom-cache-proof' : '.agent-data/custom-cache-proof')
+        : descriptor.runtime.role === 'workspace' ? 'workspace/marker' : descriptor.runtime.role === 'agents' ? '.agent-data/marker'
         : descriptor.runtime.role === 'managed' ? 'volume/data' : 'docker/volumes/archive-data/_data/ordinary';
       const bytes = (await run('tar', ['-xOf', raw.archivePath, '--', entry], { encoding: 'buffer', maxBuffer: 1024 * 1024 })).stdout;
-      expect(bytes).toEqual(descriptor.runtime.role === 'docker' ? dockerVolumeBytes : Buffer.from([0, 255, 128, 10, 61, 0]));
-      if (descriptor.runtime.role === 'workspace') expect(descriptor.runtime.dockerData).toBe(true);
+      expect(bytes).toEqual(customCapture ? Buffer.from(customCapture.marker) : descriptor.runtime.role === 'docker' ? dockerVolumeBytes : Buffer.from([0, 255, 128, 10, 61, 0]));
+      if (descriptor.runtime.role === 'workspace') expect(descriptor.runtime.dockerData).toBe(!customCapture);
       if (descriptor.runtime.role === 'docker') {
         const files = (await run('tar', ['-tf', raw.archivePath], { maxBuffer: 16 * 1024 * 1024 })).stdout.split('\n');
         expect(files).toContain('docker/image/overlay2/imagedb/content/sha256/' + dockerIds[0]!.slice(7));
         for (const container of dockerIds.slice(1)) expect(files).toContain('docker/containers/' + container + '/config.v2.json');
       }
     }
-    expect(await runtime.client.getInstance(options!.containerName)).toEqual(sourceInstance);
+    expect(await runtime.client.getInstance(capturedOwner.containerName)).toEqual(sourceInstance);
     expect(await Promise.all(sourceNames.map(name => runtime.client.getCustomVolume(config.incusStoragePool, name)))).toEqual(sourceVolumes);
-    expect(await sha256File(dockerSource!)).toBe(dockerSourceDigest);
-    console.info('Actual REST producer passed: default SQLite integrity/admin, v2 native roles and immutable source, binary workspace/agent/managed and Docker image/container/named-volume bytes, unchanged stopped source incarnation/devices/storage');
+    if (!customCapture) expect(await sha256File(dockerSource!)).toBe(dockerSourceDigest);
+    else {
+      const metadata = join(local, 'captured-metadata'); await mkdir(join(metadata, 'users', userId), { recursive: true, mode: 0o700 });
+      for (const member of ['backup-installation-id', 'worker-config.key', 'users/' + userId + '/worker-configurations.json']) {
+        const bytes = (await run('tar', ['-xzOf', captured.dataArchivePath, '--', member], { encoding: 'buffer', maxBuffer: 1024 * 1024 })).stdout;
+        await writeFile(join(metadata, member), bytes, { mode: 0o600 });
+      }
+      expect(await readBackupInstallationId(metadata)).toBe(installation);
+      const bootstrap = await new WorkerConfigStore({ ...config, dataDir: metadata }).resolveAppliedBootstrap(userId, capturedId);
+      expect(bootstrap?.dockerEnabled).toBe(false); expect(bootstrap?.workerJson.id).toBe(capturedId);
+      expect(bootstrap?.environmentJson.envVars).toBe('CUSTOM_PUBLIC_RUNTIME_PROBE=' + customCapture.marker);
+      const catalog = JSON.parse((await run('tar', ['-xzOf', captured.dataArchivePath, '--', 'image-catalog/image-catalog.json'],
+        { maxBuffer: 1024 * 1024 })).stdout) as typeof customCapture.catalog;
+      expect(catalog.nativeBindings).toEqual(customCapture.catalog.nativeBindings);
+      const withoutLogs = (build: ImageBuild) => ({ ...build, logs: undefined });
+      expect(catalog.builds.map(withoutLogs)).toEqual(customCapture.catalog.builds.map(withoutLogs));
+      expect(catalog.definitions).toEqual(customCapture.catalog.definitions);
+      const entries = (await run('tar', ['-tzf', captured.dataArchivePath], { maxBuffer: 1024 * 1024 })).stdout.split('\n');
+      expect(entries.some(name => name === 'tls/client.key' || name.startsWith('var/lib/incus/'))).toBe(false);
+      expect(captured.manifest.images.layersIncluded).toBe(false);
+    }
+    console.info(customCapture ? 'Actual custom REST producer passed: default SQLite integrity/admin, applied bootstrap, private controlled/native catalog acknowledgements, workspace/agent markers, exact immutable source and unchanged stopped incarnation/core storage'
+      : 'Actual REST producer passed: default SQLite integrity/admin, v2 native roles and immutable source, binary workspace/agent/managed and Docker image/container/named-volume bytes, unchanged stopped source incarnation/devices/storage');
+    return { manifest: captured.manifest, published: published.body, sessionFile, keyFile, encryptedFile,
+      localEncrypted: join(local, 'captured.backup'), localKey: join(local, 'captured-key.json'), sourceInstance, sourceVolumes };
   };
   try {
     if (customRetained) {
