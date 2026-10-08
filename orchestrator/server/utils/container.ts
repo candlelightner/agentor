@@ -727,7 +727,7 @@ export class ContainerManager {
         if (prepared.partialFailures.length)
           throw Object.assign(new Error('Managed network preparation requires reconciliation before migration'), { statusCode: 409 });
       }
-      return withWorkerLifecycleMutation(id, async () => {
+      const migrated = await withWorkerLifecycleMutation(id, async () => {
       await assertPrincipal();
       const record = this.workerStore!.get(snapshot.userId, id), original = this.containers.get(id);
       if (!record || !original || original.administrativeKind || record.runtimeKind !== 'legacy-docker' ||
@@ -740,7 +740,8 @@ export class ContainerManager {
       volumes.assertLiveRecoveryResolved(record.userId, id);
       const sourceManaged = structuredClone(volumes.store.forWorker(record.userId, id));
       if (volumes.isRecoveryBlocked(id) || sourceManaged.some(v => !v.seeded || v.liveContainerId ||
-          v.operation || !['ready', 'detached'].includes(v.state) || v.storageRuntimeKind === 'incus-vm'))
+          v.operation && v.operation.stage !== 'complete' || v.state !== (v.attached ? 'ready' : 'detached') ||
+          v.storageRuntimeKind === 'incus-vm'))
         throw Object.assign(new Error('Settle managed storage before migration; all source data was retained'), { statusCode: 409 });
       const client = new Docker({ socketPath: '/var/run/docker.sock' });
       const inspect = () => withOperationDeadline(signal => client.getContainer(original.containerId).inspect({ abortSignal: signal }),
@@ -817,7 +818,8 @@ export class ContainerManager {
       }, sourceVolumes, sourceDirectories };
       const baseline = (value: WorkerRecord) => { const { incusMigration, updatedAt, ...rest } = value; return rest; };
       let stopped = false, creationAttempted = false, incarnation: string | undefined, cutover = false;
-      const nativeManaged = sourceManaged.map(v => ({ ...v, storageRuntimeKind: 'incus-vm' as const, seeded: false, state: 'pending' as StoredManagedVolume['state'] }));
+      const nativeManaged = sourceManaged.map(({ operation: _completedSourceHistory, ...v }) =>
+        ({ ...v, storageRuntimeKind: 'incus-vm' as const, seeded: false, state: 'pending' as StoredManagedVolume['state'] }));
       const native: ContainerInfo = { ...original, runtimeKind: 'incus-vm', status: 'creating',
         importedImage: undefined, runtimeDiagnostic: undefined };
       const validate = async () => {
@@ -964,10 +966,7 @@ export class ContainerManager {
         this.containers.set(id, native); this.runtimeObservations.delete(id);
         await useWorkerConfigStore().markApplied(record.userId, id, this.appliedIncusBootstrap(options, native), options.configurationRevision);
         await rm(scratch, { recursive: true });
-        await reassignWorkerMappings(native.containerName).catch(error =>
-          useLogger().warn(`[container] migrated worker routing refresh deferred: ${(error as Error).message}`));
         useLogCollector().attach(native.containerName, native.containerId, 'worker', native.displayName).catch(() => {});
-        await this.reconcileWorkerPlugins(native);
         return { ...native };
       } catch (cause) {
         if (cutover || this.workerStore!.get(record.userId, id)?.runtimeKind === 'incus-vm') throw cause;
@@ -1012,6 +1011,26 @@ export class ContainerManager {
         throw cause;
       }
       });
+      // The cutover changes the authoritative runtime/address used by peer
+      // hints. Reuse the existing refresh only after releasing this worker's
+      // non-reentrant queue; the owner/network fence still protects topology.
+      const recipients = new Set([id]);
+      if (topology) for (const network of topology.networks)
+        for (const peer of await topology.manager.members(network)) recipients.add(peer);
+      for (const recipient of recipients) {
+        const worker = this.get(recipient);
+        if (!worker || worker.userId !== snapshot.userId || worker.status !== 'running') continue;
+        await this.refreshManagedNetworkHosts(worker.id, worker.containerId).catch(error => {
+          if (error?.[operationSettlement]) throw error;
+          useLogger().warn(`[container] migrated peer hostname refresh deferred for ${worker.id}: ${(error as { code?: string })?.code ?? 'peer configuration unavailable'}`);
+        });
+      }
+      // Plugin exec also uses the existing worker runtime-setup queue.
+      await this.reconcileWorkerPlugins(migrated);
+      // Backend lookup deliberately rejects an active lifecycle mutation.
+      await reassignWorkerMappings(migrated.containerName).catch(error =>
+        useLogger().warn(`[container] migrated worker routing refresh deferred: ${(error as Error).message}`));
+      return migrated;
     });
   }
 
@@ -1088,12 +1107,32 @@ export class ContainerManager {
       if (!/^[a-f0-9]{64}$/.test(controller.Id) || !/^sha256:[a-f0-9]{64}$/.test(controller.Image) ||
           !controller.State.Running || !controllerData || controllerData.Source !== this.storageManager?.dataHostPath)
         throw new Error('Migration finalization trusted controller data mapping is unavailable');
+      // The managed file-provider proxy also holds this installation's DATA
+      // parent read-only. Only its positively inspected exact mount is a
+      // config reader, never a generic exemption for foreign RO consumers.
+      const proxies = references.filter(item => item.Names?.includes('/agentor-traefik') &&
+        item.Labels?.['agentor.managed'] === 'traefik');
+      if (proxies.length > 1) throw new Error('Migration finalization proxy identity is ambiguous');
+      let proxyData: { id: string; mount: Docker.ContainerInspectInfo['Mounts'][number] } | undefined;
+      if (proxies[0] && this.config.traefikImage) {
+        const proxy = await withOperationDeadline(signal => client.getContainer(proxies[0]!.Id).inspect({ abortSignal: signal }),
+          15_000, 'Migration finalization managed proxy inspection');
+        const image = await withOperationDeadline(client.getImage(this.config.traefikImage).inspect(),
+          15_000, 'Migration finalization configured proxy image inspection');
+        const mount = proxy.Mounts.find(m => m.Type === 'bind' && m.Source === controllerData.Source && m.Destination === '/data' && m.RW === false);
+        if (proxy.Id === proxies[0].Id && /^[a-f0-9]{64}$/.test(proxy.Id) && proxy.Name === '/agentor-traefik' &&
+            proxy.Config.Labels?.['agentor.managed'] === 'traefik' && proxy.Image === image.Id && /^sha256:[a-f0-9]{64}$/.test(image.Id) &&
+            proxy.HostConfig.NetworkMode === this.config.dockerNetwork && mount)
+          proxyData = { id: proxy.Id, mount };
+      }
       for (const other of references.filter(item => item.Id !== marker.source.containerId)) {
         if ((other.Mounts ?? []).some(mount => {
           // The running trusted controller necessarily holds the DATA parent.
           // This sole exact mount is not another consumer of worker data.
           if (other.Id === controller.Id && mount.Type === controllerData.Type && mount.Source === controllerData.Source &&
               mount.Destination === controllerData.Destination && mount.Name === controllerData.Name) return false;
+          if (proxyData && other.Id === proxyData.id && mount.Type === proxyData.mount.Type && mount.Source === proxyData.mount.Source &&
+              mount.Destination === proxyData.mount.Destination && mount.Name === proxyData.mount.Name && mount.RW === false) return false;
           return (marker.sourceVolumes ?? []).some(receipt => mount.Name === receipt.name) ||
             (marker.sourceDirectories ?? []).some(receipt => {
               if (!this.storageManager?.dataHostPath) throw new Error('Retained directory host mapping is unavailable');
