@@ -1640,7 +1640,7 @@ export class IncusWorkerRuntime {
     if (stopped.status !== 'Stopped') throw new Error('Incus restore destination shutdown is unconfirmed');
     const persistent = await storage.devices(opts, opts.environmentJson.dockerEnabled, { docker: false });
     const account = await this.accountDevices(opts, true), managed = await this.managedDevices(opts);
-    const host = await incusHostMountLayout(this.config, opts, 'ensure');
+    const host = await incusHostMountLayout(this.config, opts, 'ensure', undefined, stopped);
     for (const volume of opts.managedVolumes ?? []) {
       if (Object.values({ ...persistent, ...account, ...host.devices }).some(device =>
         device.type === 'disk' && device.path && device.path !== '/' && pathsOverlap(device.path, volume.target)))

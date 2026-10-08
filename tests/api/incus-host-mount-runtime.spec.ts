@@ -12,6 +12,7 @@ import type { Config } from '../../orchestrator/server/utils/config';
 import type { IncusWorkerOptions } from '../../orchestrator/server/utils/incus-worker-runtime';
 import type { IncusInstance } from '../../orchestrator/server/utils/incus-client';
 import type { MountConfig } from '../../orchestrator/shared/types';
+import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 
@@ -51,6 +52,40 @@ async function fixture() {
 function native(layout: IncusHostMountLayout): IncusInstance {
   return { config: incusHostMountMetadata(layout), devices: structuredClone(layout.devices) } as IncusInstance;
 }
+
+test('existing host grants admit only the exact captured staged migration destination before cutover', async () => {
+  const f = await fixture();
+  try {
+    await f.grantWorker();
+    await f.workers.upsert({ ...f.record(), runtimeKind: 'legacy-docker' });
+    const nonce = randomUUID(), incarnation = randomUUID();
+    const opened = await f.workers.transitionIncusMigration(f.owner, f.id, undefined, { nonce, phase: 'preparing',
+      source: { containerId: 'a'.repeat(64), imageId: 'sha256:' + 'b'.repeat(64), createdAt: new Date(0).toISOString(), wasRunning: true } });
+    await f.workers.transitionIncusMigration(f.owner, f.id, opened.incusMigration!,
+      { ...opened.incusMigration!, phase: 'validating', destinationIncarnation: incarnation });
+    f.config.containerPrefix = 'agentor-worker'; f.options.recreationNonce = nonce;
+    const instance = { name: f.options.containerName, type: 'virtual-machine', status: 'Stopped', config: {
+      'volatile.uuid': incarnation, 'user.agentor.recreation': nonce, 'user.agentor.id': f.id,
+      'user.agentor.owner': f.owner, 'user.agentor.installation': await backupInstallationId(f.dataDir),
+    } } as IncusInstance;
+    for (const operation of ['ensure', 'inspect'] as const) {
+      const layout = await f.resolve(operation, f.options, instance);
+      expect(Object.values(layout.devices)).toEqual([{ type: 'disk', source: f.path.sourcePath, path: '/mnt/share', readonly: 'true' }]);
+    }
+    for (const wrong of [undefined, { ...instance, config: { ...instance.config, 'volatile.uuid': randomUUID() } },
+      { ...instance, config: { ...instance.config, 'user.agentor.owner': 'foreign' } },
+      { ...instance, config: { ...instance.config, 'user.agentor.installation': randomUUID() } }]) {
+      f.calls.length = 0;
+      await expect(f.resolve('ensure', f.options, wrong)).rejects.toThrow('authorized Incus WorkerRecord');
+      expect(f.calls).toEqual([]);
+    }
+    await expect(f.resolve('inspect', { ...f.options, recreationNonce: randomUUID() }, instance)).rejects.toThrow('authorized Incus WorkerRecord');
+    const current = f.record().incusMigration!;
+    await f.workers.transitionIncusMigration(f.owner, f.id, current, { ...current, phase: 'recovery-required' });
+    await expect(f.resolve('ensure', f.options, instance)).rejects.toThrow('authorized Incus WorkerRecord');
+    expect(f.record().runtimeKind).toBe('legacy-docker');
+  } finally { await f.cleanup(); }
+});
 
 test('layout requires both platform entitlement and worker assignment before host policy calls', async () => {
   const f = await fixture();

@@ -8,6 +8,7 @@ import { WorkerGroupStore } from './worker-group-store';
 import { WorkerGroupHierarchy } from './worker-group-hierarchy';
 import { WorkerStore } from './worker-store';
 import { pathsOverlap, validatePersistenceTarget } from './managed-volume-store';
+import { readBackupInstallationId } from './backup-installation';
 
 const METADATA = 'user.agentor.host-mounts';
 export interface IncusHostMountLayout {
@@ -18,7 +19,7 @@ export interface IncusHostMountLayout {
 /** Re-read existing platform grant semantics, never authorize from VM labels
  * or a caller's raw source. The host service authorizes sources, not workers. */
 export async function incusHostMountLayout(config: Config, opts: Pick<IncusWorkerOptions,
-  'id' | 'userId' | 'mounts' | 'storageManager' | 'managedVolumes' | 'recreationNonce' | 'hostMountGroupId'>,
+  'id' | 'userId' | 'containerName' | 'mounts' | 'storageManager' | 'managedVolumes' | 'recreationNonce' | 'hostMountGroupId'>,
   operation: 'ensure' | 'inspect' | 'reconstruct-preflight', host?: Pick<IncusHostMountClient, 'ensure' | 'inspect'>,
   instance?: IncusInstance,
 ): Promise<IncusHostMountLayout> {
@@ -31,7 +32,20 @@ export async function incusHostMountLayout(config: Config, opts: Pick<IncusWorke
     throw new Error('Host mount group authority is ambiguous');
   const record = workers.get(opts.userId, opts.id);
   const reconstruction = !!opts.recreationNonce && record?.incusRecreation?.nonce === opts.recreationNonce;
-  if (!record || record.runtimeKind !== 'incus-vm' || record.deletionPending ||
+  const migration = record?.incusMigration;
+  // A fresh, captured destination may receive existing grants during staged
+  // validation without publishing native runtime authority early. Neither a
+  // legacy worker nor a caller nonce alone grants this exception.
+  const stagedMigration = record?.runtimeKind === 'legacy-docker' && record.status === 'active' &&
+    !record.hostMountsRevoked && !record.incusRecreation && migration?.phase === 'validating' &&
+    !!opts.recreationNonce && migration.nonce === opts.recreationNonce && !!migration.destinationIncarnation &&
+    operation !== 'reconstruct-preflight' && instance?.type === 'virtual-machine' &&
+    instance.name === opts.containerName && instance.name === `${config.containerPrefix}-${opts.id}` &&
+    instance.config['volatile.uuid'] === migration.destinationIncarnation &&
+    instance.config['user.agentor.recreation'] === migration.nonce &&
+    instance.config['user.agentor.id'] === opts.id && instance.config['user.agentor.owner'] === opts.userId &&
+    instance.config['user.agentor.installation'] === await readBackupInstallationId(config.dataDir);
+  if (!record || (record.runtimeKind !== 'incus-vm' && !stagedMigration) || record.deletionPending ||
       (record.hostMountsRevoked && operation !== 'reconstruct-preflight' && !reconstruction) ||
       (operation === 'inspect' && record.status !== 'active'))
     throw new Error('Host mounts require an authorized Incus WorkerRecord; start requires active compute');
