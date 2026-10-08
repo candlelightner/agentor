@@ -1,8 +1,12 @@
 {
-  "extends": "../orchestrator/.nuxt/tsconfig.json",
+  "extends": "../orchestrator/.nuxt/tsconfig.server.json",
   "compilerOptions": { "noEmit": true, "rootDir": "..", "esModuleInterop": true },
   "include": [
-    "../orchestrator/.nuxt/**/*.d.ts",
+    "api/legacy-incus-migration-capture-live.spec.ts",
+    "api/worker-incus-migration-fencing.spec.ts",
+    "api/worker-incus-migration-store.spec.ts",
+    "../orchestrator/.nuxt/types/nitro.d.ts",
+    "../orchestrator/.nuxt/types/nitro-nuxt.d.ts",
     "../orchestrator/server/types/**/*.d.ts",
     "api/instance-backup-native-live.spec.ts",
     "api/instance-backup-native-stopped.spec.ts",

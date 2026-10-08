@@ -24,7 +24,7 @@ RUN npm run build
 FROM node:22-alpine
 
 WORKDIR /app
-RUN apk add --no-cache pigz python3 coreutils qemu-img
+RUN apk add --no-cache pigz python3 coreutils qemu-img tar acl
 COPY --from=builder /app/orchestrator/.output/ .output/
 # npm run build includes a separately traced, import-checked native adapter at
 # .output/server/instance-restore-native/index.mjs; no full builder modules copy.

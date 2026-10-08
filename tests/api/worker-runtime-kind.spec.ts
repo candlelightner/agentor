@@ -133,6 +133,7 @@ test.describe("Worker runtime kind", () => {
           status: "active",
         },
       ],
+      get: () => ({ id: 'legacy-1', userId: 'user-1', displayName: 'Legacy 1', status: 'active' }),
       findById: () => ({
         id: "legacy-1",
         userId: "user-1",
@@ -184,6 +185,7 @@ test.describe("Worker runtime kind", () => {
           runtimeKind: "incus-vm",
         },
       ],
+      get: () => ({ id: 'incus-1', userId: 'user-1', displayName: 'Incus 1', status: 'active', runtimeKind: 'incus-vm' }),
       findById: () => ({
         id: "incus-1",
         userId: "user-1",

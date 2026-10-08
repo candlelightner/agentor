@@ -1242,7 +1242,7 @@ export class ContainerManager {
         continue;
       }
       nextContainers.set(id, {
-        ...worker, runtimeKind: "incus-vm", containerId: `incus:${instance.config["volatile.uuid"]}`,
+        ...this.workerRuntimeRecord(worker), runtimeKind: "incus-vm", containerId: `incus:${instance.config["volatile.uuid"]}`,
         containerName: instance.name, displayName: worker.displayName || instance.name,
         imageName: instance.config["image.source_image"] || this.config.incusWorkerImage,
         imageId: instance.config["volatile.base_image"] || "",
@@ -1262,7 +1262,7 @@ export class ContainerManager {
       if (busyAtStart.has(worker.id) || workerLifecycleGeneration(worker.id) > lifecycleSequenceAtStart ||
           isWorkerLifecycleMutationActive(worker.id)) continue;
       const name = this.buildContainerName(worker.id);
-      nextContainers.set(worker.id, { ...worker, runtimeKind: 'incus-vm', containerName: name, containerId: name,
+      nextContainers.set(worker.id, { ...this.workerRuntimeRecord(worker), runtimeKind: 'incus-vm', containerName: name, containerId: name,
         imageName: this.config.incusWorkerImage, imageId: worker.imageDigest ?? '', status: 'unknown',
         runtimeDiagnostic: { code: worker.incusRecreation ? 'INCUS_RECREATION_RECOVERY_REQUIRED' : 'INCUS_COMPUTE_UNVERIFIED',
           operation: 'Incus inventory', message: 'VM identity is unavailable. Persistent data is retained; recovery requires authoritative runtime and storage checks.',
@@ -1302,7 +1302,7 @@ export class ContainerManager {
   }
 
   list(): ContainerInfo[] {
-    return Array.from(this.containers.values());
+    return Array.from(this.containers.keys(), id => this.get(id)!);
   }
   /** Register a platform-managed runtime (currently the trusted administrative
    * workspace) for reuse by terminal/editor/desktop APIs without persisting it
@@ -1314,6 +1314,7 @@ export class ContainerManager {
     this.containers.delete(id);
   }
   private assertOrdinaryMutation(info: ContainerInfo) {
+    this.assertMigrationSettled(info);
     if (info.runtimeKind === 'incus-vm' && this.workerStore?.get(info.userId, info.id)?.incusRecreation)
       throw new Error('Interrupted Incus recreation requires explicit recovery before lifecycle mutation');
     if (info.administrativeKind || info.userId === "__agentor_admin__") {
@@ -1323,6 +1324,13 @@ export class ContainerManager {
       error.statusCode = 409;
       throw error;
     }
+  }
+
+  private assertMigrationSettled(info: Pick<ContainerInfo, 'id' | 'userId'>): void {
+    const migration = this.workerStore?.get(info.userId, info.id)?.incusMigration;
+    if (migration && migration.phase !== 'retained')
+      throw Object.assign(new Error('Worker migration is incomplete; preserve both runtimes and use explicit administrator recovery'),
+        { statusCode: 409, code: 'WORKER_MIGRATION_RECOVERY_REQUIRED' });
   }
 
   private capturedIncusIncarnation(info: ContainerInfo): string {
@@ -1413,7 +1421,14 @@ export class ContainerManager {
 
   /** Look up a worker by its UUID `id`. */
   get(id: string): ContainerInfo | undefined {
-    return this.containers.get(id);
+    const info = this.containers.get(id);
+    if (!info) return undefined;
+    const migration = this.workerStore?.get(info.userId, info.id)?.incusMigration;
+    return migration && migration.phase !== 'retained' ? { ...info, status: 'error', runtimeDiagnostic: {
+      code: 'WORKER_MIGRATION_RECOVERY_REQUIRED',
+      message: 'Migration is incomplete; original source and destination are retained for explicit administrator recovery',
+      operation: 'Worker migration', retryable: false, observedAt: new Date().toISOString(),
+    } } : info;
   }
 
   /** Managed-network requests share the ordinary lifecycle fence. Startup
@@ -1969,6 +1984,7 @@ export class ContainerManager {
 
   private assertRunning(id: string): ContainerInfo {
     const info = this.containers.get(id);
+    if (info) this.assertMigrationSettled(info);
     if (!info || info.status !== "running") {
       throw new Error("Worker container is not running");
     }
@@ -3573,6 +3589,8 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    if (this.workerStore?.get(info.userId, info.id)?.incusMigration)
+      throw Object.assign(new Error('Finalize retained migration source before permanently deleting this worker'), { statusCode: 409 });
     if (info.runtimeKind === 'incus-vm') {
       const { useManagedVolumeManager } = await import('./managed-volume-manager');
       const volumes = useManagedVolumeManager(); await volumes.init();
@@ -4238,7 +4256,7 @@ for p in sys.argv[1:]:
     }
     if (worker.runtimeKind === 'incus-vm') {
       const containerName = this.buildContainerName(worker.id);
-      return this.recreateIncusWorker({ ...worker, runtimeKind: 'incus-vm',
+      return this.recreateIncusWorker({ ...this.workerRuntimeRecord(worker), runtimeKind: 'incus-vm',
         containerName, containerId: containerName, imageName: this.config.incusWorkerImage,
         imageId: worker.imageDigest ?? '', status: 'creating' });
     }
@@ -4536,6 +4554,8 @@ for p in sys.argv[1:]:
     }
 
     if (worker.incusRecreation) throw new Error('Interrupted Incus recreation must be resolved before deleting canonical data');
+    if (worker.incusMigration)
+      throw Object.assign(new Error('Resolve or finalize migration before permanently deleting canonical data'), { statusCode: 409 });
     if (worker.runtimeKind === 'incus-vm') {
       const { useManagedVolumeManager } = await import('./managed-volume-manager');
       const volumes = useManagedVolumeManager(); await volumes.init();
@@ -4858,10 +4878,11 @@ for p in sys.argv[1:]:
       throw Object.assign(new Error('Worker export cached and durable runtime authority disagree'), { statusCode: 409 });
     const archivedNative = !cached && archivedRecord?.runtimeKind === 'incus-vm' && archivedRecord.status === 'archived';
     const info = cached ?? (archivedNative ? {
-      ...archivedRecord, containerName: this.buildContainerName(id), containerId: '', status: 'stopped',
+      ...this.workerRuntimeRecord(archivedRecord), containerName: this.buildContainerName(id), containerId: '', status: 'stopped',
       imageName: this.config.incusWorkerImage, imageId: archivedRecord.imageDigest ?? '',
     } as ContainerInfo : undefined);
     if (!info) throw new Error("Container not found");
+    this.assertMigrationSettled(info);
     if (info.status !== "running" && info.status !== "stopped") {
       // A worker that is creating/removing/error has no exportable container —
       // surface this as a client error (409), not a 500.
@@ -6295,9 +6316,9 @@ for p in sys.argv[1:]:
     }
   }
 
-  listArchived(): WorkerRecord[] {
+  listArchived(): Omit<WorkerRecord, 'importCreatedEnvironmentId' | 'incusRecreation' | 'incusMigration'>[] {
     return (this.workerStore?.listArchived() ?? []).map((record) => {
-      const { importCreatedEnvironmentId: _internal, incusRecreation: _recovery, ...publicRecord } = record;
+      const { importCreatedEnvironmentId: _internal, incusRecreation: _recovery, incusMigration: _migration, ...publicRecord } = record;
       return publicRecord;
     });
   }
@@ -6313,6 +6334,7 @@ for p in sys.argv[1:]:
       // pending local edits or bounded recreation recovery metadata.
       if (info.runtimeKind === 'incus-vm') continue;
       const existing = this.workerStore.get(info.userId, info.id);
+      if (existing?.incusMigration && existing.incusMigration.phase !== 'retained') continue;
       if (!existing || existing.status === "active") {
         await this.workerStore.upsert(this.containerInfoToWorkerRecord(info));
       }
@@ -6323,6 +6345,7 @@ for p in sys.argv[1:]:
     for (const worker of this.workerStore.listActive()) {
       // Never feed missing Incus compute through Docker recovery.
       if (worker.runtimeKind === "incus-vm") continue;
+      if (worker.incusMigration) continue;
       if (storageManager().isRecoveryBlocked(worker.id)) continue;
       if (!activeContainerNames.has(this.buildContainerName(worker.id))) {
         // Acquire the same owner→worker fences as create/rebuild/recovery, then
@@ -6335,7 +6358,7 @@ for p in sys.argv[1:]:
           async () => {
             if (this.containers.has(worker.id)) return undefined;
             const current = this.workerStore?.get(worker.userId, worker.id);
-            if (!current || current.status !== "active") return undefined;
+            if (!current || current.status !== "active" || current.incusMigration) return undefined;
             await this.workerStore!.archive(worker.userId, worker.id);
             return current;
           },
@@ -6352,6 +6375,7 @@ for p in sys.argv[1:]:
     for (const worker of this.workerStore.listArchived())
       if (
         worker.runtimeKind !== "incus-vm" &&
+        !worker.incusMigration &&
         !storageManager().isRecoveryBlocked(worker.id) &&
         worker.desiredRuntimeStatus === "running" &&
         !missingDesiredWorkers.some((candidate) => candidate.id === worker.id)
@@ -6365,6 +6389,7 @@ for p in sys.argv[1:]:
     for (const info of [...this.containers.values()]) {
       if (info.administrativeKind) continue;
       if (info.runtimeKind === "incus-vm") continue;
+      if (this.workerStore.get(info.userId, info.id)?.incusMigration) continue;
       if (storageManager().isRecoveryBlocked(info.id)) {
         info.status = "error";
         info.runtimeDiagnostic = { code: "WORKER_STORAGE_RECOVERY_REQUIRED", operation: "Storage recovery",
@@ -6458,7 +6483,7 @@ for p in sys.argv[1:]:
           const current = this.get(record.id);
           if (current) useLogCollector().detach(current.containerId);
           if (result.status === 'archived') this.containers.delete(record.id);
-          else this.containers.set(record.id, { ...current, ...resolved, runtimeKind: 'incus-vm',
+          else this.containers.set(record.id, { ...current, ...this.workerRuntimeRecord(resolved), runtimeKind: 'incus-vm',
             containerName: this.buildContainerName(record.id), containerId: `incus:${result.incarnation}`,
             imageName: current?.imageName ?? '', imageId: current?.imageId ?? '',
             status: 'stopped', runtimeDiagnostic: undefined });
@@ -6479,7 +6504,7 @@ for p in sys.argv[1:]:
                 this.get(record.id)?.containerId.startsWith('incus:')) return;
             await this.assertOwnerExists(record.userId);
             const name = this.buildContainerName(record.id);
-            await this.recreateIncusWorker({ ...record, runtimeKind: 'incus-vm', containerName: name,
+            await this.recreateIncusWorker({ ...this.workerRuntimeRecord(record), runtimeKind: 'incus-vm', containerName: name,
               containerId: name, imageName: this.config.incusWorkerImage, imageId: record.imageDigest ?? '', status: 'unknown' }, undefined, true);
           });
         } catch (error) {
@@ -6582,6 +6607,11 @@ for p in sys.argv[1:]:
   /** Project the runtime ContainerInfo down to the minimal persisted record —
    * dropping everything Docker can re-discover (containerId, containerName,
    * imageName, imageId) and keeping only the worker's identity + config. */
+  private workerRuntimeRecord(record: WorkerRecord): Omit<WorkerRecord, 'incusMigration'> {
+    const { incusMigration: _migration, ...runtimeRecord } = record;
+    return runtimeRecord;
+  }
+
   private containerInfoToWorkerRecord(info: ContainerInfo): WorkerRecord {
     return {
       id: info.id,
@@ -6612,6 +6642,7 @@ for p in sys.argv[1:]:
       imageDigest: info.imageDigest,
       imageRuntimeReference: info.imageRuntimeReference,
       incusRecreation: this.workerStore?.get(info.userId, info.id)?.incusRecreation,
+      incusMigration: this.workerStore?.get(info.userId, info.id)?.incusMigration,
     };
   }
 

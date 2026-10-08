@@ -427,6 +427,9 @@ export class InstanceBackupManager {
       .list()
       .filter((worker) => worker.status === "running" || worker.status === "creating");
     const persistedWorkers = services.useWorkerStore().list();
+    if (persistedWorkers.some(worker => worker.incusMigration && worker.incusMigration.phase !== 'retained'))
+      throw Object.assign(new Error('Resolve incomplete worker migration before whole-instance recovery planning'),
+        { statusCode: 409, code: 'WORKER_MIGRATION_RECOVERY_REQUIRED' });
     const admin = adminStore.useAdminWorkspaceStore().getRecord();
     const groupAdmins = services
       .useWorkerGroupStore()
@@ -1662,6 +1665,9 @@ export class InstanceBackupManager {
       .useContainerManager()
       .list()
       .filter((worker) => worker.status === "running" || worker.status === "creating");
+    if (services.useWorkerStore().list().some(worker => worker.incusMigration && worker.incusMigration.phase !== 'retained'))
+      throw Object.assign(new Error('Resolve incomplete worker migration before whole-instance backup'),
+        { statusCode: 409, code: 'WORKER_MIGRATION_RECOVERY_REQUIRED' });
     const admin = adminStoreModule.useAdminWorkspaceStore().getRecord();
     const activeGroupAdmins = services
       .useWorkerGroupStore()

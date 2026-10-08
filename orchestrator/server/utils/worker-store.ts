@@ -7,6 +7,17 @@ import type {
   WorkerRuntimeKind,
 } from "../../shared/types";
 import { normalizeWorkerRuntimeKind } from "../../shared/types";
+import { isDeepStrictEqual } from "node:util";
+import { posix } from "node:path";
+
+export interface WorkerIncusMigration {
+  nonce: string;
+  phase: 'preparing' | 'source-stopped' | 'destination-created' | 'validating' | 'validated' | 'retained' | 'recovery-required';
+  source: { containerId: string; createdAt: string; imageId: string; wasRunning: boolean };
+  destinationIncarnation?: string;
+  sourceVolumes?: Array<{ name: string; createdAt: string }>;
+  sourceDirectories?: Array<{ path: string; dev: number; ino: number }>;
+}
 
 /** Persisted worker metadata — intentionally minimal. It stores ONLY what cannot
  * be discovered from Docker at runtime: the worker's identity, owner, editable
@@ -21,6 +32,9 @@ import { normalizeWorkerRuntimeKind } from "../../shared/types";
 export interface WorkerRecord extends UserOwnedResource {
   /** Worker compute runtime technology: legacy Docker container vs Incus VM. */
   runtimeKind?: WorkerRuntimeKind;
+  /** Server-only bounded offline migration/source-retention authority. Never a
+   * portable import grant, current IP or preservation of disposable rootfs. */
+  incusMigration?: WorkerIncusMigration;
   /** Editable, user-facing label. Free-form and not required to be unique. */
   displayName: string;
   /** Lifecycle marker. `active` = a Docker container exists for this worker;
@@ -79,7 +93,7 @@ export interface WorkerRecord extends UserOwnedResource {
 
 export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
   constructor(dataDir: string) {
-    super(dataDir, "workers.json", (w) => { assertImportIncompleteMarker(w); return w.id; });
+    super(dataDir, "workers.json", (w) => { assertImportIncompleteMarker(w); assertIncusMigration(w); return w.id; });
   }
 
   override get(userId: string, key: string): WorkerRecord | undefined {
@@ -88,6 +102,7 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     return {
       ...item,
       runtimeKind: normalizeWorkerRuntimeKind(item.runtimeKind),
+      ...(item.incusMigration ? { incusMigration: structuredClone(item.incusMigration) } : {}),
     };
   }
 
@@ -99,6 +114,7 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
       .map((w) => ({
         ...w,
         runtimeKind: normalizeWorkerRuntimeKind(w.runtimeKind),
+        ...(w.incusMigration ? { incusMigration: structuredClone(w.incusMigration) } : {}),
       }))
       .sort((a, b) => a.id.localeCompare(b.id));
   }
@@ -110,6 +126,7 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
       .map((w) => ({
         ...w,
         runtimeKind: normalizeWorkerRuntimeKind(w.runtimeKind),
+        ...(w.incusMigration ? { incusMigration: structuredClone(w.incusMigration) } : {}),
       }))
       .sort((a, b) =>
         (a.displayName || a.id).localeCompare(b.displayName || b.id),
@@ -133,17 +150,34 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     return {
       ...item,
       runtimeKind: normalizeWorkerRuntimeKind(item.runtimeKind),
+      ...(item.incusMigration ? { incusMigration: structuredClone(item.incusMigration) } : {}),
     };
   }
 
   async upsert(worker: WorkerRecord): Promise<void> {
-    const normalized: WorkerRecord = {
+    const normalized: WorkerRecord = structuredClone({
       ...worker,
       runtimeKind: normalizeWorkerRuntimeKind(worker.runtimeKind),
-    };
+    });
     assertImportIncompleteMarker(normalized);
+    assertIncusMigration(normalized);
     const isNew = !this.has(normalized.userId, normalized.id);
-    await this.setItem(normalized.userId, normalized);
+    await this.withUserMutation(normalized.userId, async () => {
+      let map = this.items.get(normalized.userId);
+      const created = !map;
+      const previous = map?.get(normalized.id);
+      if (previous?.incusMigration && (!isDeepStrictEqual(previous.incusMigration, normalized.incusMigration) ||
+          normalizeWorkerRuntimeKind(previous.runtimeKind) !== normalized.runtimeKind))
+        throw new Error('Incus migration authority requires its exact guarded transition');
+      if (!map) { map = new Map(); this.items.set(normalized.userId, map); }
+      map.set(normalized.id, structuredClone(normalized));
+      try { await this.persistUser(normalized.userId); }
+      catch (error) {
+        if (previous) map.set(normalized.id, previous); else map.delete(normalized.id);
+        if (created && !map.size) this.items.delete(normalized.userId);
+        throw error;
+      }
+    });
     const label = normalized.displayName || normalized.id;
     if (isNew) {
       this.storeLogger().info(
@@ -152,6 +186,73 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     } else {
       this.storeLogger().debug(`[worker-store] updated worker ${label} (runtime=${normalized.runtimeKind})`);
     }
+  }
+
+  /** Offline migration bookkeeping only; never starts, resumes or adopts runtime. */
+  async transitionIncusMigration(userId: string, id: string, expected: WorkerIncusMigration | undefined,
+    next: WorkerIncusMigration): Promise<WorkerRecord> {
+    expected = expected && cloneMigration(expected); next = structuredClone(next);
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId), previous = map?.get(id);
+      if (!map || !previous || normalizeWorkerRuntimeKind(previous.runtimeKind) !== 'legacy-docker' ||
+          previous.deletionPending || previous.incusRecreation)
+        throw new Error('Legacy migration durable authority is unavailable');
+      if (!isDeepStrictEqual(previous.incusMigration, expected)) throw new Error('Incus migration marker changed');
+      const candidate = { ...previous, incusMigration: next };
+      assertIncusMigration(candidate);
+      if (!expected && next.phase !== 'preparing') throw new Error('Initial Incus migration must be preparing');
+      if (expected && (expected.nonce !== next.nonce || !sameMigrationSource(expected, next) ||
+          expected.destinationIncarnation && expected.destinationIncarnation !== next.destinationIncarnation))
+        throw new Error('Incus migration source or captured destination changed');
+      return this.persistMigration(userId, id, map, previous, candidate);
+    });
+  }
+
+  async cutoverIncusMigration(userId: string, id: string, expected: WorkerIncusMigration): Promise<WorkerRecord> {
+    expected = cloneMigration(expected);
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId), previous = map?.get(id);
+      if (!map || !previous || normalizeWorkerRuntimeKind(previous.runtimeKind) !== 'legacy-docker' ||
+          previous.deletionPending || previous.incusRecreation || !isDeepStrictEqual(previous.incusMigration, expected))
+        throw new Error('Validated legacy migration authority changed');
+      if (expected.phase !== 'validated' || !expected.destinationIncarnation)
+        throw new Error('Incus migration cutover requires validated captured destination');
+      return this.persistMigration(userId, id, map, previous, { ...previous, runtimeKind: 'incus-vm',
+        incusMigration: { ...expected, phase: 'retained' } });
+    });
+  }
+
+  async clearIncusMigration(userId: string, id: string, expected: WorkerIncusMigration): Promise<WorkerRecord> {
+    expected = cloneMigration(expected);
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId), previous = map?.get(id);
+      if (!map || !previous || normalizeWorkerRuntimeKind(previous.runtimeKind) !== 'legacy-docker' ||
+          previous.deletionPending || expected.phase === 'retained' || !isDeepStrictEqual(previous.incusMigration, expected))
+        throw new Error('Only exact pre-cutover legacy migration authority may be cleared');
+      return this.persistMigration(userId, id, map, previous, { ...previous, incusMigration: undefined });
+    });
+  }
+
+  /** Caller first proves exact retained source cleanup. This is not rollback. */
+  async clearRetainedIncusMigration(userId: string, id: string, expected: WorkerIncusMigration): Promise<WorkerRecord> {
+    expected = cloneMigration(expected);
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId), previous = map?.get(id);
+      if (!map || !previous || normalizeWorkerRuntimeKind(previous.runtimeKind) !== 'incus-vm' ||
+          expected.phase !== 'retained' || !expected.destinationIncarnation || !isDeepStrictEqual(previous.incusMigration, expected))
+        throw new Error('Exact retained Incus migration source cleanup authority is unavailable');
+      return this.persistMigration(userId, id, map, previous, { ...previous, incusMigration: undefined });
+    });
+  }
+
+  private async persistMigration(userId: string, id: string, map: Map<string, WorkerRecord>, previous: WorkerRecord,
+    candidate: WorkerRecord): Promise<WorkerRecord> {
+    const next = { ...candidate, updatedAt: new Date().toISOString() };
+    assertImportIncompleteMarker(next); assertIncusMigration(next);
+    map.set(id, structuredClone(next));
+    try { await this.persistUser(userId); }
+    catch (error) { map.set(id, previous); throw error; }
+    return structuredClone(next);
   }
 
   /** Atomically mark an existing worker for rebuild without ever creating it.
@@ -217,16 +318,11 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     id: string,
     desiredRuntimeStatus: "running" | "stopped",
   ): Promise<WorkerRecord> {
-    const current = this.get(userId, id);
-    if (!current)
-      throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
-    const updated: WorkerRecord = {
-      ...current,
-      desiredRuntimeStatus,
-      updatedAt: new Date().toISOString(),
-    };
-    await this.setItem(userId, updated);
-    return updated;
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId), current = map?.get(id);
+      if (!map || !current) throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
+      return this.persistMigration(userId, id, map, current, { ...current, desiredRuntimeStatus });
+    });
   }
 
   /** Persist the desired host-mount set after a grant/hierarchy change. Active
@@ -238,19 +334,13 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     mounts: MountConfig[] | undefined,
     revoked: boolean,
   ): Promise<WorkerRecord> {
-    const current = this.get(userId, id);
-    if (!current)
-      throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
-    const updated: WorkerRecord = {
-      ...current,
-      mounts: mounts?.length ? structuredClone(mounts) : undefined,
-      ...(current.status === "active" && revoked
-        ? { pendingRebuild: true, hostMountsRevoked: true }
-        : {}),
-      updatedAt: new Date().toISOString(),
-    };
-    await this.setItem(userId, updated);
-    return updated;
+    mounts = mounts?.length ? structuredClone(mounts) : undefined;
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId), current = map?.get(id);
+      if (!map || !current) throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
+      return this.persistMigration(userId, id, map, current, { ...current, mounts,
+        ...(current.status === "active" && revoked ? { pendingRebuild: true, hostMountsRevoked: true } : {}) });
+    });
   }
 
   /** Persist desired device assignments after policy changes. Active workers
@@ -261,19 +351,13 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     hardwareDeviceIds: string[] | undefined,
     revoked: boolean,
   ): Promise<WorkerRecord> {
-    const current = this.get(userId, id);
-    if (!current)
-      throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
-    const updated: WorkerRecord = {
-      ...current,
-      hardwareDeviceIds: hardwareDeviceIds?.length ? [...hardwareDeviceIds] : undefined,
-      ...(current.status === "active" && revoked
-        ? { pendingRebuild: true, hardwareDevicesRevoked: true }
-        : {}),
-      updatedAt: new Date().toISOString(),
-    };
-    await this.setItem(userId, updated);
-    return updated;
+    hardwareDeviceIds = hardwareDeviceIds?.length ? [...hardwareDeviceIds] : undefined;
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId), current = map?.get(id);
+      if (!map || !current) throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
+      return this.persistMigration(userId, id, map, current, { ...current, hardwareDeviceIds,
+        ...(current.status === "active" && revoked ? { pendingRebuild: true, hardwareDevicesRevoked: true } : {}) });
+    });
   }
 
   async archive(userId: string, id: string): Promise<void> {
@@ -284,16 +368,12 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
   }
 
   async markDeletionPending(userId: string, id: string): Promise<void> {
-    const worker = this.get(userId, id);
-    if (!worker) throw new Error(`Worker not found: ${id}`);
-    const updatedAt = new Date().toISOString();
-    const archivedAt = worker.archivedAt ?? updatedAt;
-    await this.setItem(userId, {
-      ...worker,
-      status: "archived",
-      deletionPending: true,
-      archivedAt,
-      updatedAt,
+    await this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId), worker = map?.get(id);
+      if (!map || !worker) throw new Error(`Worker not found: ${id}`);
+      if (worker.incusMigration) throw new Error('Migration source-retention authority must be finalized before deletion');
+      await this.persistMigration(userId, id, map, worker, { ...worker, status: "archived", deletionPending: true,
+        archivedAt: worker.archivedAt ?? new Date().toISOString() });
     });
   }
 
@@ -340,4 +420,49 @@ function assertImportIncompleteMarker(record: WorkerRecord): void {
       marker.initialCreate !== true || marker.originalIncarnation !== undefined ||
       typeof marker.nonce !== 'string' || !marker.nonce || marker.nonce.length > 128)
     throw new Error('Incomplete Incus import requires an initial-create recovery marker');
+}
+
+function sameMigrationSource(left: WorkerIncusMigration, right: WorkerIncusMigration): boolean {
+  return isDeepStrictEqual(left.source, right.source) &&
+    isDeepStrictEqual(left.sourceVolumes ?? [], right.sourceVolumes ?? []) &&
+    isDeepStrictEqual(left.sourceDirectories ?? [], right.sourceDirectories ?? []);
+}
+
+function cloneMigration(marker: WorkerIncusMigration): WorkerIncusMigration {
+  const owned = structuredClone(marker);
+  if (owned.sourceVolumes === undefined) owned.sourceVolumes = [];
+  if (owned.sourceDirectories === undefined) owned.sourceDirectories = [];
+  return owned;
+}
+
+function assertIncusMigration(record: WorkerRecord): void {
+  const marker = record.incusMigration;
+  if (marker === undefined) return;
+  const invalid = () => { throw new Error('Invalid bounded Incus migration marker'); };
+  const object = (value: unknown, allowed: string[]): value is Record<string, unknown> => !!value && typeof value === 'object' &&
+    !Array.isArray(value) && Object.keys(value).every(key => allowed.includes(key));
+  const uuid = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
+  const iso = (value: unknown) => typeof value === 'string' && value.length <= 64 &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(value) && Number.isFinite(Date.parse(value));
+  if (!object(marker, ['nonce', 'phase', 'source', 'destinationIncarnation', 'sourceVolumes', 'sourceDirectories']) ||
+      !uuid(marker.nonce) || !['preparing', 'source-stopped', 'destination-created', 'validating', 'validated', 'retained', 'recovery-required'].includes(marker.phase) ||
+      !object(marker.source, ['containerId', 'createdAt', 'imageId', 'wasRunning']) ||
+      typeof marker.source.containerId !== 'string' || !/^[a-f0-9]{64}$/.test(marker.source.containerId) || !iso(marker.source.createdAt) ||
+      typeof marker.source.imageId !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(marker.source.imageId) || typeof marker.source.wasRunning !== 'boolean' ||
+      marker.destinationIncarnation !== undefined && !uuid(marker.destinationIncarnation)) invalid();
+  if (['destination-created', 'validating', 'validated', 'retained'].includes(marker.phase) && !marker.destinationIncarnation) invalid();
+  const runtime = normalizeWorkerRuntimeKind(record.runtimeKind);
+  if (marker.phase === 'retained' ? runtime !== 'incus-vm' : runtime !== 'legacy-docker' || !!record.incusRecreation) invalid();
+  const volumes = marker.sourceVolumes === undefined ? [] : marker.sourceVolumes;
+  const directories = marker.sourceDirectories === undefined ? [] : marker.sourceDirectories;
+  if (!Array.isArray(volumes) || !Array.isArray(directories) || volumes.length + directories.length > 35) invalid();
+  if (volumes.some(volume => !object(volume, ['name', 'createdAt']) || typeof volume.name !== 'string' ||
+      !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/.test(volume.name) || !iso(volume.createdAt)) ||
+      new Set(volumes.map(volume => volume.name)).size !== volumes.length) invalid();
+  if (directories.some(directory => !object(directory, ['path', 'dev', 'ino']) || typeof directory.path !== 'string' ||
+      directory.path.length > 4096 || !directory.path.startsWith('/') || directory.path.startsWith('//') || directory.path === '/' ||
+      /[\x00-\x1f\x7f]/.test(directory.path) || posix.normalize(directory.path) !== directory.path ||
+      !Number.isSafeInteger(directory.dev) || directory.dev < 0 || !Number.isSafeInteger(directory.ino) || directory.ino < 0) ||
+      new Set(directories.map(directory => directory.path)).size !== directories.length) invalid();
+  marker.sourceVolumes = structuredClone(volumes); marker.sourceDirectories = structuredClone(directories);
 }
