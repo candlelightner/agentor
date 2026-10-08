@@ -20,6 +20,7 @@ import { incusManagedNetworkAuthority, incusManagedBridgeIdentity, incusManagedN
 import { ManagedNetworkStore } from './managed-network-store';
 import { isIP } from 'node:net';
 import { incusHostMountLayout, incusHostMountMetadata, assertIncusHostMountLayout } from './incus-host-mount-runtime';
+import { IncusHostMountClient } from './incus-host-mount-client';
 import { INCUS_CANONICAL_ARCHIVE_SCRIPT } from './incus-canonical-archive';
 import { INCUS_SELECTED_ARCHIVE_SCRIPT, nativeSelectedBackupPath } from './incus-selected-archive';
 import { PassThrough, Readable, Transform } from 'node:stream';
@@ -937,7 +938,8 @@ export class IncusWorkerRuntime {
     if (opts.image && !this.imageResolver) throw new Error("A custom OCI image requires its derived Incus image mapping");
   }
 
-  private async accountDevices(opts: Pick<IncusWorkerOptions, 'storageManager' | 'userId' | 'credentialBinds'>): Promise<Record<string, IncusDevice>> {
+  private async accountDevices(opts: Pick<IncusWorkerOptions, 'storageManager' | 'userId' | 'id' | 'credentialBinds'>,
+    ensure = false): Promise<Record<string, IncusDevice>> {
     if (!opts.storageManager) return {};
     const userHost = opts.storageManager.getUserHostDir(opts.userId);
     const credentials = join(userHost, "credentials");
@@ -955,10 +957,20 @@ export class IncusWorkerRuntime {
       kcfg: { type: "disk", source: join(userHost, "kilo/config"), path: "/home/agent/.agent-data/.kilo/config" },
       kdata: { type: "disk", source: join(userHost, "kilo/data"), path: "/home/agent/.agent-data/.kilo/shared-data" },
     };
-    const project = await this.client.request<{ config: Record<string, string> }>("GET", `/1.0/projects/${encodeURIComponent(this.config.incusProject)}`);
-    const paths = project.config["restricted.devices.disk.paths"]?.split(",").map((path) => path.trim()) ?? [];
-    if (project.config.restricted !== "true" || project.config["restricted.devices.disk"] !== "allow" ||
-        Object.values(devices).some((device) => !paths.includes(device.source!)))
+    const inspect = () => this.client.request<{ config: Record<string, string> }>("GET", `/1.0/projects/${encodeURIComponent(this.config.incusProject)}`);
+    let project = await inspect();
+    const missing = () => {
+      const paths = project.config["restricted.devices.disk.paths"]?.split(",").map(path => path.trim()) ?? [];
+      return Object.values(devices).some(device => !paths.includes(device.source!));
+    };
+    if (project.config.restricted !== "true" || project.config["restricted.devices.disk"] !== "allow")
+      throw new Error("Host setup must explicitly allowlist this account's credential and Kilo directories in a restricted Incus project with exact disk paths");
+    if (missing() && ensure && this.config.incusNetworkHostEndpoint) {
+      await new IncusHostMountClient(this.config).ensureAccountShares(opts.userId, opts.id,
+        Object.values(devices).map(device => device.source!));
+      project = await inspect();
+    }
+    if (project.config.restricted !== "true" || project.config["restricted.devices.disk"] !== "allow" || missing())
       throw new Error("Host setup must explicitly allowlist this account's credential and Kilo directories in the restricted Incus project");
     return devices;
   }
@@ -1248,7 +1260,7 @@ export class IncusWorkerRuntime {
     if (source && !sameIncusImageSource(source, identity)) throw new Error('Incus reconstruction image source changed');
     if (restore?.source && !sameIncusImageSource(restore.source, identity))
       throw new Error('Incus restore immutable image source changed before allocation');
-    const account = restore ? {} : await this.accountDevices(opts);
+    const account = restore ? {} : await this.accountDevices(opts, true);
     const restoreManaged = restore ? await this.managedRestoreDevices(opts, restore.detachedManagedVolumes) : undefined;
     const hostMounts = restore ? undefined : await incusHostMountLayout(this.config, opts, 'ensure');
     const persistent = restore ? await storage.freshRestoreDevices(opts, restore.dockerData ? opts.recreationNonce : undefined)
@@ -1611,7 +1623,7 @@ export class IncusWorkerRuntime {
     const stopped = await check();
     if (stopped.status !== 'Stopped') throw new Error('Incus restore destination shutdown is unconfirmed');
     const persistent = await storage.devices(opts, opts.environmentJson.dockerEnabled, { docker: false });
-    const account = await this.accountDevices(opts), managed = await this.managedDevices(opts);
+    const account = await this.accountDevices(opts, true), managed = await this.managedDevices(opts);
     const host = await incusHostMountLayout(this.config, opts, 'ensure');
     for (const volume of opts.managedVolumes ?? []) {
       if (Object.values({ ...persistent, ...account, ...host.devices }).some(device =>

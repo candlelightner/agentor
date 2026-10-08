@@ -55,6 +55,47 @@ function options(): IncusWorkerOptions {
   };
 }
 
+test('account onboarding is limited to explicit create/promotion, then rechecks the restricted leaf allowlist', async () => {
+  const opts = options(), base = '/srv/agentor/users/' + opts.userId;
+  opts.storageManager = {
+    getUserHostDir: () => base, getSshAuthorizedKeysBind: () => 'ssh',
+    getKiloConfigBind: () => 'kilo-config', getKiloSharedDataBind: () => 'kilo-data',
+  } as unknown as StorageManager;
+  const paths = ['credentials', 'kilo/config', 'kilo/data'].map(path => base + '/' + path);
+  let project = { config: { restricted: 'true', 'restricted.devices.disk': 'allow', 'restricted.devices.disk.paths': '/srv/another-approved-share' } };
+  const fake = { request: async () => structuredClone(project) };
+  const runtime = new IncusWorkerRuntime({ ...config, incusNetworkHostEndpoint: 'https://host-policy.invalid' }, fake as any);
+  const original = IncusHostMountClient.prototype.ensureAccountShares;
+  const calls: unknown[][] = [];
+  let update = true;
+  IncusHostMountClient.prototype.ensureAccountShares = async (...args) => {
+    calls.push(args);
+    if (update) project.config['restricted.devices.disk.paths'] += ',' + paths.join(',');
+  };
+  try {
+    await expect((runtime as any).accountDevices(opts)).rejects.toThrow('allowlist');
+    await expect((runtime as any).accountDevices(opts, false)).rejects.toThrow('allowlist');
+    expect(calls).toEqual([]); // Archive/readiness checks never grant host access.
+    const devices = await (runtime as any).accountDevices(opts, true);
+    expect(calls).toEqual([[opts.userId, opts.id, paths]]);
+    expect(Object.values(devices).map((device: any) => device.source)).toEqual(paths);
+    await (runtime as any).accountDevices(opts, true); expect(calls).toHaveLength(1);
+    project.config['restricted.devices.disk.paths'] = '/srv/agentor/users'; update = false;
+    await expect((runtime as any).accountDevices(opts, true)).rejects.toThrow('allowlist');
+    project.config.restricted = 'false';
+    const before = calls.length;
+    await expect((runtime as any).accountDevices(opts, true)).rejects.toThrow('restricted Incus project');
+    expect(calls).toHaveLength(before);
+    project.config.restricted = 'true';
+    const unavailable = new IncusWorkerRuntime(config, fake as any);
+    await expect((unavailable as any).accountDevices(opts, true)).rejects.toThrow('allowlist');
+    expect(calls).toHaveLength(before);
+    opts.credentialBinds = ['/etc:/worker-secret'];
+    await expect((runtime as any).accountDevices(opts, true)).rejects.toThrow('unrecognized account share');
+    expect(calls).toHaveLength(before);
+  } finally { IncusHostMountClient.prototype.ensureAccountShares = original; }
+});
+
 test('declared managed disks require guest mountpoints before configuration or worker service startup', async () => {
   const fake = fakeClient(), runtime = new IncusWorkerRuntime(config, fake.client as any);
   const store = new ManagedVolumeStore(config.dataDir); await store.init();

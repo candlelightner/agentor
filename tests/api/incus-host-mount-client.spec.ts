@@ -46,3 +46,28 @@ test('missing host policy endpoint or installation fails closed without manufact
     expect(calls).toEqual([]);
   } finally { await rm(dataDir, { recursive: true, force: true }); }
 });
+
+test('account onboarding sends IDs only and pins the fixed owner/worker sources', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'agentor-account-share-client-'));
+  try {
+    const installation = await backupInstallationId(dataDir), userId = 'account-owner', workerId = randomUUID();
+    const config = { dataDir, incusProject: 'agentor', incusNetworkHostEndpoint: 'https://host.invalid' } as Config;
+    const sourcePaths = ['credentials', 'kilo/config', 'kilo/data'].map(path => '/srv/agentor/users/' + userId + '/' + path);
+    const selected = { installation, project: 'agentor', userId, workerId, sourcePaths };
+    let result: any = selected; const calls: any[] = [];
+    const host = new IncusHostMountClient(config, { request: async (...args: any[]) => { calls.push(args); return result; } });
+    await host.ensureAccountShares(userId, workerId, sourcePaths);
+    expect(calls).toEqual([['POST', '/v1/account-shares/ensure', { userId, workerId }]]);
+    for (const patch of [{ installation: randomUUID() }, { project: 'foreign' }, { userId: 'another-owner' },
+      { workerId: randomUUID() }, { sourcePaths: sourcePaths.slice(0, 2) }, { sourcePaths: ['/etc', ...sourcePaths.slice(1)] },
+      { sourcePaths: sourcePaths.toReversed() }, { sourcePaths: 'not-paths' }]) {
+      result = { ...selected, ...patch };
+      await expect(host.ensureAccountShares(userId, workerId, sourcePaths)).rejects.toThrow('authority');
+    }
+    calls.length = 0;
+    for (const [owner, worker, paths] of [['../owner', workerId, sourcePaths], [userId, '../worker', sourcePaths],
+      [userId, workerId, sourcePaths.slice(0, 2)], [userId, workerId, ['/srv/account,/etc', ...sourcePaths.slice(1)]]])
+      await expect(host.ensureAccountShares(owner as string, worker as string, paths as string[])).rejects.toThrow('exact worker');
+    expect(calls).toEqual([]);
+  } finally { await rm(dataDir, { recursive: true, force: true }); }
+});

@@ -11,6 +11,7 @@ import subprocess
 import threading
 import unittest
 import uuid
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location("incus_host_mount_policy",
     Path(__file__).resolve().parents[2] / "scripts/incus-host-mount-policy.py")
@@ -57,6 +58,14 @@ class PolicyTests(unittest.TestCase):
                 "containers": copy.deepcopy(self.legacy), "volumes": copy.deepcopy(self.volumes)},
             lambda: "1 0 8:1 / / rw - ext4 /dev/vda1 rw\n")
         self.payload = {"pathId": self.path_id}
+        self.owner, self.worker_id = "account", str(uuid.uuid4())
+        self.account_payload = {"userId": self.owner, "workerId": self.worker_id}
+        self.account_paths = [self.data / "users" / self.owner / role for role in ("credentials", "kilo/config", "kilo/data")]
+        for path in self.account_paths: path.mkdir(parents=True)
+        self.worker_file = self.data / "users" / self.owner / "workers.json"
+        self.worker = {"id": self.worker_id, "userId": self.owner, "runtimeKind": "incus-vm", "status": "active",
+                       "displayName": "Ordinary account fixture", "createdAt": "2026-10-08T00:00:00Z", "updatedAt": "2026-10-08T00:00:00Z"}
+        self.worker_file.write_text(json.dumps([self.worker]))
 
     def persist(self):
         (self.data / "admin" / "host-mount-paths.v1.json").write_text(json.dumps(self.catalog))
@@ -169,6 +178,84 @@ class PolicyTests(unittest.TestCase):
                 if kind == "owner": self.project["config"][MODULE.OWNED_ROOTS] = json.dumps({"installation": str(uuid.uuid4()), "sources": []})
                 with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.ensure(self.payload)
         self.assertEqual(self.mutations(), [])
+
+    def test_account_shares_are_exact_idempotent_and_do_not_modify_canonical_data_or_other_policy(self):
+        roots = {"installation": self.installation, "sources": [str(self.root / "share")]}
+        self.project["config"][MODULE.OWNED_ROOTS] = json.dumps(roots)
+        original = copy.deepcopy(self.project)
+        secret = self.account_paths[0] / "secret"; secret.write_text("SECRET-NOT-READ")
+        before = {str(path): (path.stat().st_mtime_ns, path.stat().st_mode, path.stat().st_uid) for path in self.data.rglob("*")}
+        with patch.object(MODULE.NETWORK, "read_bounded", wraps=MODULE.NETWORK.read_bounded) as reads:
+            result = self.policy.ensure_account_shares(self.account_payload)
+        self.assertTrue(all(call.args[1] in (["backup-installation-id"], ["users", self.owner, "workers.json"]) for call in reads.call_args_list))
+        self.assertEqual(result, {"installation": self.installation, "project": "agentor", **self.account_payload,
+                                  "sourcePaths": list(map(str, self.account_paths))})
+        self.assertNotIn("SECRET-NOT-READ", json.dumps(result))
+        self.assertEqual(self.policy.ensure_account_shares(self.account_payload), result)
+        self.assertEqual(len(self.mutations()), 1)
+        self.assertEqual(self.project["description"], original["description"])
+        for key, value in original["config"].items():
+            if key != "restricted.devices.disk.paths": self.assertEqual(self.project["config"][key], value)
+        self.assertEqual(set(self.project["config"]["restricted.devices.disk.paths"].split(",")),
+                         {str(self.root / "credentials"), *map(str, self.account_paths)})
+        self.assertNotIn(str(self.data / "users"), self.project["config"]["restricted.devices.disk.paths"].split(","))
+        self.assertEqual(before, {str(path): (path.stat().st_mtime_ns, path.stat().st_mode, path.stat().st_uid) for path in self.data.rglob("*")})
+
+    def test_account_shares_accept_recognized_ordinary_legacy_and_archived_records_without_migration(self):
+        for runtime in (None, "legacy-docker", "incus-vm"):
+            record = {**self.worker, "status": "archived"}
+            if runtime is None: del record["runtimeKind"]
+            else: record["runtimeKind"] = runtime
+            self.worker_file.write_text(json.dumps([record]))
+            self.policy.ensure_account_shares(self.account_payload)
+            self.assertEqual(json.loads(self.worker_file.read_text()), [record])
+        initial_import = {**self.worker, "incusRecreation": {"nonce": str(uuid.uuid4()), "initialCreate": True, "importIncomplete": True}}
+        self.worker_file.write_text(json.dumps([initial_import]))
+        self.policy.ensure_account_shares(self.account_payload)
+        self.assertEqual(json.loads(self.worker_file.read_text()), [initial_import])
+
+    def test_account_requests_never_accept_caller_paths_project_devices_or_extra_authority(self):
+        for payload in ({}, [], {**self.account_payload, "source": "/etc"}, {**self.account_payload, "project": "default"},
+                        {**self.account_payload, "devices": {}}, {**self.account_payload, "userId": "../other"},
+                        {**self.account_payload, "workerId": "../worker"}):
+            with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.ensure_account_shares(payload)
+        self.assertEqual(self.calls, [])
+
+    def test_account_worker_must_be_present_unambiguous_owned_and_not_admin_or_deleting(self):
+        for records in ([], [self.worker, self.worker], [{**self.worker, "userId": "foreign"}],
+                        [{**self.worker, "kind": "administrative"}], [{**self.worker, "deletionPending": True}],
+                        [{**self.worker, "runtimeKind": "foreign"}], [{**self.worker, "status": "unknown"}]):
+            self.worker_file.write_text(json.dumps(records))
+            with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.ensure_account_shares(self.account_payload)
+        self.assertEqual(self.mutations(), [])
+
+    def test_account_directories_must_exist_without_symlink_components_or_secret_file_reads(self):
+        source = self.account_paths[0]; source.rmdir()
+        with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.ensure_account_shares(self.account_payload)
+        self.assertFalse(source.exists())
+        source.symlink_to(self.root / "credentials", target_is_directory=True)
+        with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.ensure_account_shares(self.account_payload)
+        self.assertEqual(self.mutations(), [])
+
+    def test_second_account_etag_snapshot_rechecks_worker_installation_source_and_preserves_operator_change(self):
+        for drift in ("worker", "installation", "source"):
+            self.project_reads = 0
+            def change(read):
+                if read != 2: return
+                if drift == "worker": self.worker_file.write_text(json.dumps([{**self.worker, "deletionPending": True}]))
+                if drift == "installation": (self.data / "backup-installation-id").write_text(str(uuid.uuid4()))
+                if drift == "source": self.account_paths[1].rename(self.account_paths[1].with_name("previous")); self.account_paths[1].mkdir()
+            self.on_project_read = change
+            with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.ensure_account_shares(self.account_payload)
+            self.worker_file.write_text(json.dumps([self.worker])); (self.data / "backup-installation-id").write_text(self.installation)
+        self.assertEqual(self.mutations(), [])
+        self.project_reads = 0
+        def update(read):
+            if read == 2: self.etag = "latest-etag"; self.project["config"]["restricted.networks.access"] = "workers,approved-other"
+        self.on_project_read = update
+        self.policy.ensure_account_shares(self.account_payload)
+        self.assertEqual(self.mutations()[0][3], "latest-etag")
+        self.assertEqual(self.project["config"]["restricted.networks.access"], "workers,approved-other")
 
 
 @unittest.skipUnless(os.environ.get("INCUS_HOST_MOUNT_POLICY_TEST") == "true",

@@ -3,7 +3,8 @@
 Old exact export roots remain reserved against overlapping future exports. An
 empty instance list cannot prove an accepted create will never publish an old
 root. This is a small project policy field, not a filesystem/operation journal.
-Account shares and unrelated operator restrictions are never rewritten.
+Account shares use a separate fixed owner/worker-ID operation. Unrelated
+operator restrictions and approved host-mount roots are never rewritten.
 """
 import hashlib
 import importlib.util
@@ -169,3 +170,50 @@ class HostMountPolicy:
         if selected["sourcePath"] not in paths or selected["sourcePath"] not in roots:
             raise SOURCES.SourceRejected("Catalog export is not allowlisted by this installation")
         return self.result(selected)
+
+    def account_sources(self, payload):
+        if not isinstance(payload, dict) or set(payload) != {"userId", "workerId"} or \
+                not isinstance(payload["userId"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", payload["userId"]) or \
+                not isinstance(payload["workerId"], str) or not SOURCES.UUID.fullmatch(payload["workerId"]):
+            raise SOURCES.SourceRejected("Only safe account and ordinary worker IDs are accepted")
+        owner, worker_id = payload["userId"], payload["workerId"]
+        if self.read_authority(["backup-installation-id"], 128).strip() != self.installation:
+            raise SOURCES.SourceRejected("Installation identity changed")
+        records = json.loads(self.read_authority(["users", owner, "workers.json"]))
+        if not isinstance(records, list) or len(records) > 4096 or any(not isinstance(record, dict) for record in records):
+            raise SOURCES.SourceRejected("Ordinary worker authority is unavailable")
+        selected = [record for record in records if record.get("id") == worker_id]
+        if len(selected) != 1:
+            raise SOURCES.SourceRejected("Ordinary worker identity is missing or ambiguous")
+        worker = selected[0]
+        if worker.get("userId") != owner or worker.get("status") not in ("active", "archived") or \
+                worker.get("runtimeKind") not in (None, "legacy-docker", "incus-vm") or \
+                worker.get("deletionPending", False) is not False or "kind" in worker:
+            raise SOURCES.SourceRejected("Account shares require a current owned ordinary worker")
+        # These exact leaves are intentionally inside canonical account DATA,
+        # unlike user catalog exports. Never share DATA/users or read secrets.
+        sources = [str(Path(self.data_dir) / "users" / owner / role)
+                   for role in ("credentials", "kilo/config", "kilo/data")]
+        identities = [SOURCES.directory_identity(source) for source in sources]
+        if len(set(identities)) != 3:
+            raise SOURCES.SourceRejected("Fixed account directory identities are ambiguous")
+        return worker, sources, identities
+
+    def ensure_account_shares(self, payload):
+        selected = self.account_sources(payload)
+        self.project_policy()
+        # Repeat authority and no-follow source proofs on the ETag actually
+        # submitted. Existing host-mount reservations/network policy survive.
+        project, etag, paths, _roots = self.project_policy()
+        if self.account_sources(payload) != selected:
+            raise SOURCES.SourceRejected("Account worker or source identity changed before allowlisting")
+        updated = sorted(set([*paths, *selected[1]]))
+        if len(updated) > 4096:
+            raise SOURCES.SourceRejected("Exact account export bound exceeded; operator review required")
+        config = dict(project["config"])
+        config["restricted.devices.disk.paths"] = ",".join(updated)
+        if config != project["config"]:
+            self.request("PUT", "/1.0/projects/" + quote(self.project),
+                         {"config": config, "description": project.get("description", "")}, etag)
+        return {"installation": self.installation, "project": self.project, "userId": payload["userId"],
+                "workerId": payload["workerId"], "sourcePaths": selected[1]}

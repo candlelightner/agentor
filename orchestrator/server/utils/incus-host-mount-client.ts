@@ -30,6 +30,23 @@ export class IncusHostMountClient {
   ensure(mount: MountConfig): Promise<IncusHostExport> { return this.resolve('ensure', mount); }
   inspect(mount: MountConfig): Promise<IncusHostExport> { return this.resolve('inspect', mount); }
 
+  /** Normal account onboarding reuses the operator's fixed policy service.
+   * Only durable owner/worker IDs cross HTTPS; expected paths are local checks,
+   * never a request for caller-selected host filesystem authority. */
+  async ensureAccountShares(userId: string, workerId: string, sourcePaths: string[]): Promise<void> {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(userId) || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(workerId) ||
+        sourcePaths.length !== 3 || new Set(sourcePaths).size !== 3 || sourcePaths.some(path =>
+          !posix.isAbsolute(path) || path === '/' || path.startsWith('//') || posix.normalize(path) !== path ||
+          /[\u0000-\u001f\u007f\\:,]/.test(path)))
+      throw new Error('Account shares require exact worker identity and fixed local sources');
+    const installation = await readBackupInstallationId(this.config.dataDir);
+    const result = await this.client.request('POST', '/v1/account-shares/ensure', { userId, workerId });
+    if (!result || result.installation !== installation || result.project !== this.config.incusProject ||
+        result.userId !== userId || result.workerId !== workerId || !Array.isArray(result.sourcePaths) ||
+        result.sourcePaths.length !== sourcePaths.length || result.sourcePaths.some((path: unknown, index: number) => path !== sourcePaths[index]))
+      throw new Error('Incus host service returned foreign or ambiguous account share authority');
+  }
+
   private async resolve(operation: 'ensure' | 'inspect', mount: MountConfig): Promise<IncusHostExport> {
     if (!mount.pathId || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(mount.pathId) ||
         typeof mount.source !== 'string' || !posix.isAbsolute(mount.source) || mount.source === '/' ||

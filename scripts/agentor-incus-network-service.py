@@ -150,10 +150,11 @@ def handler(policy, client_fingerprint, host_mounts=None):
             try:
                 path = self.validate()
                 mount_request = path in ("/v1/host-mounts/ensure", "/v1/host-mounts/inspect")
-                if not mount_request and path not in ("/v1/managed-networks/ensure", "/v1/managed-networks/remove", "/v1/managed-networks/inspect"):
+                account_request = path == "/v1/account-shares/ensure"
+                if not mount_request and not account_request and path not in ("/v1/managed-networks/ensure", "/v1/managed-networks/remove", "/v1/managed-networks/inspect"):
                     self.reply(404)
                     return
-                if mount_request and host_mounts is None:
+                if (mount_request or account_request) and host_mounts is None:
                     self.reply(503)
                     return
                 lengths = self.headers.get_all("Content-Length", [])
@@ -162,7 +163,9 @@ def handler(policy, client_fingerprint, host_mounts=None):
                     self.reply(400)
                     return
                 payload = json.loads(self.rfile.read(int(length)))
-                if mount_request:
+                if account_request:
+                    result = host_mounts.ensure_account_shares(payload)
+                elif mount_request:
                     result = host_mounts.inspect(payload) if path.endswith("/inspect") else host_mounts.ensure(payload)
                 elif path.endswith("/inspect"):
                     result = policy.inspect(payload)

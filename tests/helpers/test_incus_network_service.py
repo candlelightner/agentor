@@ -64,6 +64,8 @@ class TransportTests(unittest.TestCase):
 
         self.calls = []
         self.host_calls = []
+        self.account_calls = []
+        self.worker_id = str(uuid.uuid4())
         self.path_id = str(uuid.uuid4())
         self.selected_source = {"pathId": self.path_id, "source": "/srv/approved-fixture",
                                 "readOnly": True, "installation": self.installation}
@@ -80,6 +82,13 @@ class TransportTests(unittest.TestCase):
 
             def inspect(self, payload):
                 return self.selected("inspect", payload)
+
+            def ensure_account_shares(self, payload):
+                if not isinstance(payload, dict) or set(payload) != {"userId", "workerId"} or payload != {"userId": "owner", "workerId": outer.worker_id}:
+                    raise MODULE.POLICY.PolicyError("Unexpected account share authority")
+                outer.account_calls.append(payload)
+                return {"installation": outer.installation, "project": "agentor", **payload,
+                        "sourcePaths": ["/fixed/credentials", "/fixed/kilo/config", "/fixed/kilo/data"]}
 
         self.policy = Policy()
         self.host_mounts = HostMountPolicy()
@@ -187,6 +196,29 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(self.request()[0], 200)
         self.assertEqual(self.host_calls, [])
         self.assertEqual(self.calls, [])
+
+    def test_account_endpoint_retains_exact_mtls_identity_and_bounded_id_only_body(self):
+        payload = {"userId": "owner", "workerId": self.worker_id}
+        status, result = self.request("POST", "/v1/account-shares/ensure?project=agentor", json.dumps(payload))
+        self.assertEqual(status, 200)
+        self.assertEqual(result["metadata"], {"installation": self.installation, "project": "agentor", **payload,
+                                             "sourcePaths": ["/fixed/credentials", "/fixed/kilo/config", "/fixed/kilo/data"]})
+        for invalid in ({}, [], {**payload, "paths": ["/etc"]}, {**payload, "project": "default"},
+                        {**payload, "command": ["sh"]}, {**payload, "workerId": str(uuid.uuid4())}):
+            self.assertGreaterEqual(self.request("POST", "/v1/account-shares/ensure", json.dumps(invalid))[0], 400)
+        for body in (b"x" * 4097, b"not-json"):
+            self.assertGreaterEqual(self.request("POST", "/v1/account-shares/ensure", body)[0], 400)
+        self.assertEqual(self.request("POST", "/v1/account-shares/ensure?project=default", json.dumps(payload))[0], 409)
+        self.assertEqual(self.request("POST", "/v1/account-shares/ensure", json.dumps(payload), identity="other")[0], 409)
+        with self.assertRaises((ssl.SSLError, OSError, http.client.HTTPException)):
+            self.request("POST", "/v1/account-shares/ensure", json.dumps(payload), identity=None)
+        self.assertEqual(self.account_calls, [payload]); self.assertEqual(self.calls, []); self.assertEqual(self.host_calls, [])
+
+    def test_missing_account_policy_fails_closed_without_dispatch_or_generic_routes(self):
+        self.start_server(None)
+        self.assertEqual(self.request("POST", "/v1/account-shares/ensure", json.dumps({"userId": "owner", "workerId": self.worker_id}))[0], 503)
+        self.assertEqual(self.request("POST", "/v1/account-shares/remove", json.dumps({"userId": "owner", "workerId": self.worker_id}))[0], 404)
+        self.assertEqual(self.account_calls, []); self.assertEqual(self.calls, [])
 
     def test_unverified_handshake_stall_is_bounded(self):
         with socket.create_connection(("127.0.0.1", self.port), timeout=2) as stalled:
