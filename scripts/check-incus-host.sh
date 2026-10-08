@@ -2,7 +2,7 @@
 # Read-only operator diagnostics. No installs, resource allocation or repair.
 set -euo pipefail
 exec python3 - "$0" "$@" <<'PY'
-import argparse, hashlib, http.client, importlib.util, ipaddress, json, os, re, shutil, socket, ssl, stat, subprocess, sys
+import argparse, hashlib, http.client, importlib.util, ipaddress, json, os, re, shlex, shutil, socket, ssl, stat, subprocess, sys
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 __file__ = sys.argv.pop(1)
@@ -157,6 +157,40 @@ def nft_source_rule(document, table, network, bridge, cidr, address, installatio
             "Exact owned narrow source-preservation rule is missing; other implementations require setup/check integration")
 
 
+def forwarding_policy(network, bridge, docker_subnet, primary, address, installation):
+    routes = json.loads(command("ip", "-j", "-4", "route", "show", "default"))
+    require(isinstance(routes, list) and routes and all(isinstance(route, dict) and isinstance(route.get("dev"), str) for route in routes),
+            "Default uplink observation is unavailable")
+    uplinks = {route["dev"] for route in routes}
+    require(len(uplinks) == 1, "Default uplink is ambiguous")
+    uplink = uplinks.pop()
+    require(re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", uplink) and len({network, bridge, uplink}) == 3, "Distinct primary, Docker bridge and uplink required")
+    chain = "AGINCUS_" + installation.replace("-", "")[:8]; marker = "agentor-forward-" + installation
+    observed = [shlex.split(line) for line in command("iptables", "-w", "-S").splitlines() if line]
+    require(["-N", "DOCKER-USER"] in observed and ["-N", chain] in observed, "Setup-owned forwarding chain is missing")
+    owned = [row for row in observed if row[:2] == ["-A", chain]]
+    require(len(owned) == 6 and all(row.count("--comment") == 1 and row.index("--comment") + 1 < len(row)
+                                  and row[row.index("--comment") + 1] == marker for row in owned), "Owned forwarding rows changed or are foreign")
+    require(owned[-1] == ["-A", chain, "-m", "comment", "--comment", marker, "-j", "RETURN"],
+            "Owned forwarding RETURN must be final so its required grants are reachable")
+    jump = ["-A", "DOCKER-USER", "-m", "comment", "--comment", marker, "-j", chain]
+    references = [row for row in observed if any(flag in row and row.index(flag) + 1 < len(row) and row[row.index(flag) + 1] == chain for flag in ("-j", "-g"))]
+    docker_rows = [row for row in observed if row[:2] == ["-A", "DOCKER-USER"]]
+    require(references == [jump] and docker_rows and docker_rows[0] == jump, "Exact first owned DOCKER-USER jump is missing or ambiguous")
+    comment = ["-m", "comment", "--comment", marker]
+    # Native -C is read-only and normalizes the same argv as the installer;
+    # matching all six plus the exact row count denies extra/broadened grants.
+    rules = [
+        ["-i", bridge, "-o", network, "-s", str(docker_subnet), "-d", str(primary), *comment, "-j", "ACCEPT"],
+        ["-i", network, "-o", bridge, "-s", str(primary), "-d", str(docker_subnet), "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", *comment, "-j", "ACCEPT"],
+        ["-i", network, "-o", bridge, "-s", str(primary), "-d", address, "-p", "tcp", "--dport", "3000", *comment, "-j", "ACCEPT"],
+        ["-i", network, "-o", uplink, "-s", str(primary), *comment, "-j", "ACCEPT"],
+        ["-i", uplink, "-o", network, "-d", str(primary), "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", *comment, "-j", "ACCEPT"],
+        [*comment, "-j", "RETURN"],
+    ]
+    for rule in rules: command("iptables", "-w", "-C", chain, *rule)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Read-only Agentor Incus host checks; never installs, repairs or allocates resources.")
     inputs = {"endpoint": "INCUS_ENDPOINT", "project": "INCUS_PROJECT", "network": "INCUS_NETWORK", "storage-pool": "INCUS_STORAGE_POOL",
@@ -234,9 +268,14 @@ def main():
                 and re.fullmatch(r"[A-Za-z0-9_]{1,63}", args.source_nat_table), "Explicit operator topology required")
         network = json.loads(command("docker", "network", "inspect", args.docker_network))[0]
         container = json.loads(command("docker", "inspect", args.orchestrator_container))[0]
+        require(network.get("Driver") == "bridge" and not network.get("Internal"), "Existing routed Docker bridge required")
+        ipv4 = [entry for entry in network["IPAM"]["Config"] if ":" not in entry.get("Subnet", ":")]
+        require(len(ipv4) == 1, "Docker IPv4 topology is ambiguous")
+        docker_subnet = ipaddress.IPv4Network(ipv4[0]["Subnet"])
         bridge = network.get("Options", {}).get("com.docker.network.bridge.name") or "br-" + network["Id"][:12]
         require(re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", bridge), "Docker bridge observation invalid")
         address = str(ipaddress.IPv4Address(container["NetworkSettings"]["Networks"][args.docker_network]["IPAddress"]))
+        require(ipaddress.IPv4Address(address) in docker_subnet and ipaddress.IPv4Address(ipv4[0]["Gateway"]) in docker_subnet, "Docker address/gateway differs from its subnet")
         gateway = urlsplit(args.internal_gateway_url)
         require(gateway.scheme == "http" and gateway.hostname == str(interface.ip) and gateway.port and not gateway.username
                 and not gateway.password and gateway.path in ("", "/") and not gateway.query and not gateway.fragment, "Stable bridge-only internal URL required")
@@ -246,11 +285,17 @@ def main():
                         for mount in container.get("Mounts", [])), "Orchestrator must not receive the Incus Unix socket/storage")
         nft_source_rule(json.loads(command("nft", "-j", "list", "table", "ip", args.source_nat_table)),
                         args.source_nat_table, args.network, bridge, interface.network, address, args.installation_id)
+        return bridge, docker_subnet, address
     if not all((args.docker_network, args.orchestrator_container, args.source_nat_table, args.internal_gateway_url)):
         unknown.append("routing"); print("UNKNOWN routing: supply discovered Docker network/container, bridge-only internal URL and owned source-NAT table; equivalent rules need setup/check integration.")
     else:
-        check("configured narrow source-preserving topology", routing, "Restore the exact owned source-preservation rule and bridge-only published internal listener; no blanket firewall ACCEPT is suggested.")
-        unknown.append("forwarding"); print("UNKNOWN forwarding: this preparatory checker does not yet prove setup-owned forwarding rules; complete setup integration and the real source-IP canary.")
+        topology = check("configured narrow source-preserving topology", routing, "Restore the exact owned source-preservation rule and bridge-only published internal listener; no blanket firewall ACCEPT is suggested.")
+        if topology is not None:
+            bridge, docker_subnet, address = topology
+            check("setup-owned directional forwarding", lambda: forwarding_policy(args.network, bridge, docker_subnet, interface.network, address, args.installation_id),
+                  "Run the installed owned routing refresh or correct its six narrow rows/first DOCKER-USER jump and unique default uplink; never substitute blanket ACCEPT rules.")
+        else:
+            unknown.append("forwarding"); print("UNKNOWN forwarding: valid configured source-preserving topology is required before forwarding can be verified.")
     if failures or unknown:
         print("NOT READY: correct failed checks and resolve unknown prerequisites; no host state was changed."); return 1 if failures else 2
     print("Read-only prerequisites checked; real VM anti-spoofing/source-identity canary is still required."); return 0
