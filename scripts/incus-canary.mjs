@@ -197,6 +197,8 @@ export async function runIncusCanary(rawInput, dependencies, signal = new AbortC
       return worker;
     };
     stage = 'create'; const victim = await create(input.dockerEnabled), attacker = await create(false);
+    for (const worker of input.dockerEnabled ? [attacker] : [victim, attacker])
+      await checked(worker, 'if systemctl is-active --quiet docker.service; then exit 1; fi');
     const self = async worker => {
       const deadline = Date.now() + 30_000;
       while (true) {

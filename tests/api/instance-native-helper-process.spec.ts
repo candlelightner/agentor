@@ -42,7 +42,7 @@ const ssh = ['-p', '22375', '-i', '/workspace/agentor-kata-vm-access.ZgLVo9uk/id
 const scp = ['-P', '22375', '-i', '/workspace/agentor-kata-vm-access.ZgLVo9uk/id_ed25519',
   '-o', 'UserKnownHostsFile=/workspace/agentor-kata-vm-access.ZgLVo9uk/known_hosts', '-o', 'BatchMode=yes',
   '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes'];
-const root = async (command: string, timeout = 30_000) => (await run('ssh', [...ssh, command], { timeout, maxBuffer: 1024 * 1024 })).stdout.trim();
+const hostRoot = async (command: string, timeout = 30_000) => (await run('ssh', [...ssh, command], { timeout, maxBuffer: 1024 * 1024 })).stdout.trim();
 const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
 
 /** Explicit approved guest only. Real constrained helper process, Docker stop/
@@ -96,6 +96,49 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
     rollback = mode === 'rollback' || mode === 'app-rollback';
   test.skip(process.env.INCUS_INSTANCE_HELPER_PROCESS_TEST !== 'true', 'Explicit serial approved disposable helper-process gate');
   if (historical && !process.env.INCUS_ENDPOINT) throw new Error('Historical compatibility gate requires the current approved Incus HTTPS forward');
+  const isolatedPath = process.env.INCUS_HISTORICAL_ISOLATED_JSON;
+  if (isolatedPath && (!historical || historicalOperatorCanary))
+    throw new Error('Isolated daemon is only for historical legacy restoration, never the VM operator canary');
+  let isolated: { version: 1; fixtureLabel: string; root: string; tlsRoot: string; hostUid: number; hostGid: number;
+    runner: { Id: string; Image: string; Created: string; Config: { Labels: Record<string, string> };
+      Mounts: Parameters<typeof legacyMigrationMountIdentity>[0] } } | undefined;
+  if (isolatedPath) {
+    const fd = await open(isolatedPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const s = await fd.stat();
+      if (!s.isFile() || s.uid !== process.getuid?.() || (s.mode & 0o077) || s.size < 1 || s.size > 16_384)
+        throw new Error('Isolated daemon receipt must be a bounded private owned regular file');
+      isolated = JSON.parse(await fd.readFile('utf8'));
+    } finally { await fd.close(); }
+    if (isolated?.version !== 1 || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(isolated.fixtureLabel) ||
+        isolated.root !== '/var/tmp/agentor-historical-isolated.' + isolated.fixtureLabel ||
+        !/^\/var\/tmp\/agentor-[A-Za-z0-9._/-]+$/.test(isolated.tlsRoot) || isolated.tlsRoot.includes('..') ||
+        !Number.isSafeInteger(isolated.hostUid) || isolated.hostUid < 1 || !Number.isSafeInteger(isolated.hostGid) || isolated.hostGid < 1 ||
+        !/^[a-f0-9]{64}$/.test(isolated.runner.Id) || !/^sha256:[a-f0-9]{64}$/.test(isolated.runner.Image) ||
+        !Number.isFinite(Date.parse(isolated.runner.Created)) || isolated.runner.Config.Labels['agentor.historical-runner'] !== isolated.fixtureLabel)
+      throw new Error('Isolated daemon receipt is not the approved exact runner');
+    expect(isolated.runner.Mounts.filter(v => v.Destination === isolated!.root)).toEqual([
+      expect.objectContaining({ Type: 'bind', Source: isolated.root, Destination: isolated.root, RW: true })]);
+    for (const file of ['client.crt', 'client.key', 'server.crt'])
+      expect(isolated.runner.Mounts.filter(v => v.Destination === isolated!.tlsRoot + '/' + file)).toEqual([
+        expect.objectContaining({ Type: 'bind', Source: isolated.tlsRoot + '/' + file, Destination: isolated.tlsRoot + '/' + file, RW: false })]);
+    expect(isolated.runner.Mounts.some(v => /(?:docker\.sock|\/var\/lib\/incus|\/var\/run\/incus)/.test(v.Source))).toBe(false);
+  }
+  // Recheck the outer runner before every command, then execute Docker AND
+  // filesystem operations in its real daemon namespace. SCP shares only the
+  // exact same-path fixture bind; no host daemon proxy or socket filtering.
+  const root = async (command: string, timeout = 30_000): Promise<string> => {
+    if (!isolated) return hostRoot(command, timeout);
+    const receipt = JSON.parse(await hostRoot(`sudo docker inspect ${isolated.runner.Id} --format '${'{{json .}}'}' | python3 -c ` + quote(
+      'import json,sys;c=json.load(sys.stdin);print(json.dumps({k:c[k] for k in ["Id","Image","Created","Mounts","State"]}|{"Config":{"Labels":c["Config"].get("Labels")}}))')));
+    expect(receipt).toMatchObject({ Id: isolated.runner.Id, Image: isolated.runner.Image, Created: isolated.runner.Created,
+      Config: isolated.runner.Config, State: { Running: true } });
+    expect(legacyMigrationMountIdentity(receipt.Mounts)).toEqual(legacyMigrationMountIdentity(isolated.runner.Mounts));
+    return hostRoot(`sudo docker exec ${isolated.runner.Id} bash -ec ` + quote('sudo(){ "$@"; }; export -f sudo; ' +
+      `test -d ${quote(isolated.root)} && test ! -L ${quote(isolated.root)} && test "$(readlink -f ${quote(isolated.root)})" = ${quote(isolated.root)} && ` +
+      `test "$(stat -c '%u:%g' ${quote(isolated.root)})" = ${isolated.hostUid}:${isolated.hostGid} && ` +
+      `test "$(id -u kata-test):$(id -g kata-test)" = ${isolated.hostUid}:${isolated.hostGid} || exit 1; ` + command), timeout);
+  };
   const retryArtifactId = process.env.INCUS_CUSTOM_IMAGE_BACKUP_RETRY_ARTIFACT_ID;
   if (retryArtifactId && (!customBackup || retryArtifactId !== 'eab8a1c9-20f1-44dc-8d68-a9985fe6c8dc'))
     throw new Error('Same-artifact retry requires the exact accepted custom encrypted artifact');
@@ -124,6 +167,11 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
       throw new Error('Custom-image fixture context is not the approved bounded operator configuration');
     const directory = await lstat(custom.credentialsDir);
     if (!directory.isDirectory() || directory.isSymbolicLink() || (directory.mode & 0o077)) throw new Error('Fixture credential directory is not private');
+    if (isolated) expect(custom.tlsRoot).toBe(isolated.tlsRoot);
+  }
+  if (isolated) {
+    expect(await root('docker ps -aq --filter label=agentor.id')).toBe('');
+    expect(await root('docker ps -aq --filter label=agentor.admin=true')).toBe('');
   }
   let customRetained: { version: 1; jobId: string; localDir: string; remoteDir: string; ownerId: string; installationId: string;
     workerId: string; definitionId: string; sourceBuildId: string; nativeBuildId: string; sourceImageId: string; fingerprint: string;
@@ -235,7 +283,7 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
   let restoreJobId: string = retained?.restoreJobId ?? jobId;
   let userId = retained?.ownerId ?? (ordinary ? 'ordinary-' : 'retained-') + randomUUID();
   let appPort = customCache ? customRetained!.gatewayPort! : 39000 + Number.parseInt(jobId.slice(0, 4), 16) % 1000;
-  const remote = customInverse ? '/var/tmp/agentor-native-custom-recovery.' + followupNonce : customBackup ? '/var/tmp/agentor-native-custom-backup.' + followupNonce : customRetained?.remoteDir ?? (retained ? '/var/tmp/agentor-native-producer.' + followupNonce : '/var/tmp/agentor-native-helper-process.' + jobId);
+  const remote = isolated ? isolated.root + '/agentor-native-helper-process.' + jobId : customInverse ? '/var/tmp/agentor-native-custom-recovery.' + followupNonce : customBackup ? '/var/tmp/agentor-native-custom-backup.' + followupNonce : customRetained?.remoteDir ?? (retained ? '/var/tmp/agentor-native-producer.' + followupNonce : '/var/tmp/agentor-native-helper-process.' + jobId);
   const image = 'agentor-native-helper-process:' + (retained || customBackup || customInverse ? followupNonce : jobId), targetName = 'native-recovery-' + (retained || customBackup || customInverse ? followupNonce : jobId),
     helperName = 'agentor-instance-restore-' + jobId;
   const legacyName = 'agentor-native-rollback-' + jobId;
@@ -318,6 +366,7 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
     }
     expect((await runtime.client.request<{ driver: string }>('GET', '/1.0/storage-pools/' + config.incusStoragePool)).driver).toBe('dir');
     await root(`test ! -e ${quote(remote)} && mkdir -m 700 ${quote(remote)}`);
+    if (isolated) await root(`chown ${isolated.hostUid}:${isolated.hostGid} ${quote(remote)}`);
     await run('scp', [...scp, '-r', ...(customBackup ? [build] : [targetData, build]), 'kata-test@172.19.0.1:' + remote + '/'], { timeout: 60_000 });
     imageId = await root(`sudo docker build -q --label agentor.native-helper-fixture=${jobId} --build-arg REMOVE_VOLUME_HELPER_SLEEP=${rollback} ` +
       (custom?.appBaseImage ? '--build-arg BASE_IMAGE=' + quote(custom.appBaseImage) + ' ' : '') +
@@ -334,10 +383,10 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
       `--mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock ${mounts.join(' ')}` : '';
     targetId = await root(`sudo docker run -d --name ${quote(name)} --label agentor.native-helper-fixture=${jobId} ` +
       `--network agentor-phase6-net --add-host agentor-kata-preflight:172.22.0.1 -e AGENTOR_INSTANCE_RECOVERY_MODE=${recoveryMode} ` +
-      `--mount type=bind,src=${remoteData},dst=${remoteData} ${app ? '-p 10.159.68.1:' + appPort + ':3000' : ''} ${args} ${quote(image)} ` +
+      `--mount type=bind,src=${remoteData},dst=${remoteData} ${app && !isolated ? '-p 10.159.68.1:' + appPort + ':3000' : ''} ${args} ${quote(image)} ` +
       (app ? 'node .output/server/index.mjs' : `node -e 'setInterval(()=>{},1000)'`));
     expect(targetId).toMatch(/^[a-f0-9]{64}$/);
-    if (app) {
+    if (app && !isolated) {
       // Reuse the accepted Phase6 source-preservation rule on this exact App
       // IP/internal port. Own table only; no edits to Docker/Incus chains and
       // no blanket forwarding permission or worker-selected identity header.
@@ -654,7 +703,7 @@ print('Exact account fixture delta confirmed')
       for (const device of Object.values(current.devices)) expect(JSON.stringify(device)).not.toContain(custom!.tlsRoot);
       const proof = await runtime.client.exec(examined.containerName, ['bash', '-ec',
         'test "$(cat /opt/agentor-custom-proof)" = "$1"; test "$(cat /proc/1/comm)" = systemd; ' +
-        'systemctl is-active --quiet incus-agent agentor-worker; ! systemctl is-active --quiet docker; ' +
+        'systemctl is-active --quiet incus-agent agentor-worker; if systemctl is-active --quiet docker; then exit 1; fi; ' +
         'test ! -e /tls/client.key; test ! -e /tls/client.crt; . /run/agentor/worker.env; ' +
         'test "$(printf "%s" "$ENVIRONMENT" | jq -r .envVars)" = "CUSTOM_PUBLIC_RUNTIME_PROBE=$1"; ' +
         'test "$(runuser -u agent -- tmux show-environment -g CUSTOM_PUBLIC_RUNTIME_PROBE)" = "CUSTOM_PUBLIC_RUNTIME_PROBE=$1"; ' +
@@ -1472,6 +1521,17 @@ print(json.dumps(out))
       await runCustomImage(); completed = true; return;
     }
     if (historical) {
+      if (isolated) {
+        // Actual inner App -> approved restricted HTTPS API, with hostname/CA
+        // verification and client mTLS; no injected client or mocked response.
+        expect(await root(`sudo docker exec ${targetId} node --input-type=module -e ${quote(
+          `const h=await import('node:https'),f=await import('node:fs');await new Promise((resolve,reject)=>{` +
+          `const q=h.get('https://agentor-kata-preflight:8443/1.0/instances?project='+encodeURIComponent(${JSON.stringify(config.incusProject)}),` +
+          `{cert:f.readFileSync('/tls/client.crt'),key:f.readFileSync('/tls/client.key'),ca:f.readFileSync('/tls/server.crt'),rejectUnauthorized:true},r=>{` +
+          `let b='';r.on('data',c=>{b+=c;if(b.length>65536)q.destroy(Error('Bounded readiness response exceeded'))});` +
+          `r.on('end',()=>{try{const v=JSON.parse(b);if(r.statusCode!==200||v.type!=='sync'||!Array.isArray(v.metadata))throw Error('Restricted API unavailable');resolve()}catch(e){reject(e)}})});` +
+          `q.setTimeout(10000,()=>q.destroy(Error('Restricted API timeout')));q.on('error',reject)});console.log('verified');`)}`, 20_000)).toBe('verified');
+      }
       const env = await appRequest<{ id: string }>('/api/environments', { name: 'Historical directory source', dockerEnabled: false, networkMode: 'full', memoryLimit: '1024m', cpuLimit: 1 });
       expect(env.status).toBe(201);
       const created = await appRequest<{ id: string; userId: string; containerId: string; containerName: string; runtimeKind: string }>('/api/containers',
@@ -1653,6 +1713,7 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
       await writeFile(kitPath, JSON.stringify({ kit }), { mode: 0o600 });
       const incoming = remote + '/rest-incoming', transfer = remoteData + '/fixture-rest-input';
       await root(`test ! -e ${quote(incoming)} && mkdir -m 700 ${quote(incoming)} && sudo test ! -e ${quote(transfer)}`);
+      if (isolated) await root(`chown ${isolated.hostUid}:${isolated.hostGid} ${quote(incoming)}`);
       await run('scp', [...scp, encrypted, kitPath, 'kata-test@172.19.0.1:' + incoming + '/'], { timeout: 60_000 });
       await root(`sudo install -d -m 700 ${quote(transfer)} && ` +
         `sudo install -m 600 ${quote(incoming + '/public-instance.backup')} ${quote(transfer + '/instance.backup')} && ` +
@@ -1835,7 +1896,9 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
       await root(`sudo docker exec ${targetId} node -e ${quote(`const f=require('node:fs');const p=${JSON.stringify(remoteData + '/admin/workspace.v1.json')};if(f.existsSync(p))throw Error('Unexpected admin record');f.writeFileSync(p,${JSON.stringify(JSON.stringify(guard))},{mode:384,flag:'wx'});`)}`);
       expect(await root(`sudo docker inspect ${targetId} --format '{{.Id}} {{.Image}} {{index .Config.Labels "agentor.native-helper-fixture"}}'`)).toBe(`${targetId} ${imageId} ${jobId}`);
       await root(`sudo docker stop --time 30 ${targetId}`); await root(`sudo docker rm ${targetId}`);
-      expect(sourceRuleSnapshot(await root(`sudo nft -j list table ip ${sourceTable}`))).toBe(sourceRuleBaseline); await root(`sudo nft delete table ip ${sourceTable}`); sourceRuleBaseline = undefined;
+      if (sourceRuleBaseline) {
+        expect(sourceRuleSnapshot(await root(`sudo nft -j list table ip ${sourceTable}`))).toBe(sourceRuleBaseline); await root(`sudo nft delete table ip ${sourceTable}`); sourceRuleBaseline = undefined;
+      }
       await launchTarget(true, targetName + '-v1', false);
       await expect.poll(async () => { try { return (await appRequest('/api/health', undefined, false)).status; } catch { return 0; } }, { timeout: 120_000 }).toBe(200);
       expect((await appRequest<WorkerRecord[]>('/api/archived')).body.find(v => v.id === id)).toMatchObject({ runtimeKind: 'legacy-docker', userId });

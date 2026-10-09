@@ -166,6 +166,18 @@ if ! docker info > /dev/null 2>&1; then
 fi
 log "Inner dockerd ready (pid $DOCKERD_PID)."
 
+# Explicit fixture-only daemon namespace: no stack, sweep or image build.
+# The caller supplies a bounded keepalive; all normal test-runner paths remain
+# unchanged. This daemon must use its own data volume and never the host socket.
+if [[ "${AGENTOR_TEST_DOCKER_ONLY:-false}" == "true" ]]; then
+    if [[ $# -eq 0 || ! "${AGENTOR_TEST_DOCKER_ONLY_SECONDS:-3600}" =~ ^[0-9]{1,4}$ ]] \
+        || (( ${AGENTOR_TEST_DOCKER_ONLY_SECONDS:-3600} < 60 || ${AGENTOR_TEST_DOCKER_ONLY_SECONDS:-3600} > 7200 )); then
+        err "Docker-only mode requires a command and a 60–7200 second bound."
+        exit 1
+    fi
+    exec timeout --signal=TERM --kill-after=10s "${AGENTOR_TEST_DOCKER_ONLY_SECONDS:-3600}s" "$@"
+fi
+
 # ---------------------------------------------------------------------------
 # Phase 1.5: wipe stale state from previous runs.
 #

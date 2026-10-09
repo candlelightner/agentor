@@ -21,7 +21,7 @@ const cookie = 'private-cookie=PRIVATE-CANARY-SESSION';
 type Worker = { id: string; userId: string; runtimeKind: string; containerId: string; containerName: string; environmentId: string };
 type PacketSpec = { nonce: string; destinationMac: string; cases: Array<{ label: string; family: number; source: string; target: string; mac: string }> };
 function fixture(options: { admin?: boolean; unknownCreate?: boolean; foreignCleanup?: boolean; readiness?: boolean; abort?: AbortController;
-  httpTarget?: string; guestGateway?: string; route?: unknown; brokenManualControl?: boolean; admittedSpoof?: string; ipv6?: boolean } = {}) {
+  httpTarget?: string; guestGateway?: string; route?: unknown; brokenManualControl?: boolean; admittedSpoof?: string; ipv6?: boolean; activeDockerWhenDisabled?: boolean } = {}) {
   const workers: Worker[] = [], environments: Array<{ id: string; userId: string; createdAt: string; dockerEnabled: boolean }> = [];
   const calls: Array<{ path: string; method: string; body?: unknown; authenticated: boolean }> = [], commands: string[] = [], removed: string[] = [];
   let count = 0, closed = false, restarted = false, marker = '';
@@ -86,6 +86,8 @@ function fixture(options: { admin?: boolean; unknownCreate?: boolean; foreignCle
       },
       exec: async (name: string, argv: string[]) => {
         const worker = workers.find(item => item.containerName === name)!; const command = argv.at(-1)!; commands.push(command);
+        if (options.activeDockerWhenDisabled && command === 'if systemctl is-active --quiet docker.service; then exit 1; fi')
+          return { returnCode: 1, stdout: '', stderr: '' };
         if (command.includes('>/workspace/incus-canary')) marker = command.match(/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}/)![0];
         let stdout = '';
         const packet = command.match(/ send '(\{.*\})' '([a-z0-9-]+)'$/s);
@@ -134,6 +136,14 @@ test('actual canary orchestration completes the stubbed native flow and deletes 
   expect(f.commands.some(command => command.includes('docker info'))).toBe(true);
   expect(f.calls.filter(call => call.method === 'POST' && call.path === '/api/environments').map(call => (call.body as { dockerEnabled: boolean }).dockerEnabled)).toEqual([true, false]);
   expect(f.commands.join('\n')).not.toContain(cookie); expect(JSON.stringify(result)).not.toContain('PRIVATE-');
+});
+
+test('Docker active in a disabled-capability worker fails the canary and retains captured resources', async () => {
+  const f = fixture({ activeDockerWhenDisabled: true });
+  const result = await canary.runIncusCanary({ sessionCookie: cookie, dockerEnabled: true }, f.dependencies);
+  expect(result.status).toBe('failed'); expect(result.stage).toBe('create');
+  expect(f.removed).toEqual([]); expect(result.workers).toHaveLength(2);
+  expect(f.commands).toContain('if systemctl is-active --quiet docker.service; then exit 1; fi');
 });
 
 test('non-admin or unavailable verified runtime never creates environment/worker resources', async () => {
