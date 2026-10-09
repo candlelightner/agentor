@@ -510,7 +510,7 @@ test("real native Docker and core data survive reboot, disposable root replaceme
     await runtime.stop(name);
     opts.dockerEnabled = opts.environmentJson.dockerEnabled = false;
     await runtime.start(opts);
-    await checked('! systemctl is-active --quiet docker; test "$(systemctl is-enabled docker)" = masked');
+    await checked('if systemctl is-active --quiet docker; then exit 1; fi; test "$(systemctl is-enabled docker)" = masked');
     expect((await runtime.client.getCustomVolume(config.incusStoragePool, `${name}-docker`)).content_type).toBe("block");
     await runtime.stop(name);
     opts.dockerEnabled = opts.environmentJson.dockerEnabled = true;
