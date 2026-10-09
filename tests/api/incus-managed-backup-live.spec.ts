@@ -25,7 +25,9 @@ import { validateAndExtractPortableManagedVolumePayload } from '../../orchestrat
 
 test('real production running/stopped/archived managed export retains v6 binary filesystem state with unchanged source authority', async () => {
   test.skip(process.env.INCUS_MANAGED_BACKUP_TEST !== 'true', 'Explicit serial disposable managed backup gate');
-  test.setTimeout(600_000);
+  // One source plus three offline helpers require four image allocations.
+  // HDD-backed fixtures need headroom without changing per-operation bounds.
+  test.setTimeout(1_200_000);
   const config = useConfig();
   Object.assign(config, { containerPrefix: 'agentor-worker', incusEnabled: true,
     incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor', incusNetwork: 'incusbr0',
