@@ -440,7 +440,8 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
       `console.log(JSON.stringify(result));`
       : `const r=await fetch(base+${JSON.stringify(path)},{headers,redirect:'manual'` +
         (privateFile ? `,method:'POST',body:${privateFile.format === 'binary' ? "fs.createReadStream(p),duplex:'half'" : "fs.readFileSync(p,'utf8')"}`
-          : body === undefined ? '' : ",method:" + JSON.stringify(method ?? 'POST') + ',body:' + JSON.stringify(JSON.stringify(body))) + `});` +
+          : body === undefined ? method ? ',method:' + JSON.stringify(method) : ''
+            : ",method:" + JSON.stringify(method ?? 'POST') + ',body:' + JSON.stringify(JSON.stringify(body))) + `});` +
         `console.log(JSON.stringify({status:r.status,body:r.headers.get('content-type')?.includes('application/json')?await r.json():await r.text()}));`;
     const script = `const base='http://127.0.0.1:3000';const headers={Origin:base,'Content-Type':'application/json'};` +
       (sessionPath ? `const{readFileSync:readSession,lstatSync:statSession}=await import('node:fs');const sp=${JSON.stringify(sessionPath)};` +
@@ -1925,6 +1926,8 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
       const originalRecords = JSON.parse(await root(`sudo cat ${quote(historicalSource!.dataDir + '/users/' + userId + '/workers.json')}`)) as WorkerRecord[];
       expect(originalRecords[0]).toMatchObject({ id, runtimeKind: 'legacy-docker', desiredRuntimeStatus: 'stopped' });
       expect((await appRequest('/api/containers/' + id, undefined, true, 120_000, undefined, undefined, 'DELETE')).status).toBe(200);
+      expect((await appRequest<WorkerRecord[]>('/api/containers')).body.some(v => v.id === id)).toBe(false);
+      expect(await root(`sudo docker ps -aq --no-trunc --filter id=${restored.containerId}`)).toBe('');
       expect(await historicalDirectories()).toBe(historicalSource!.directoryIdentity);
       if (historicalOperatorCanary) {
         const controller = JSON.parse(await root(`sudo docker inspect ${targetId} --format '{{json .}}'`)) as {
