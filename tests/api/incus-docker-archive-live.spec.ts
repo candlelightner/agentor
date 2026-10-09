@@ -5,7 +5,8 @@ import { pipeline } from 'node:stream/promises';
 import { Writable } from 'node:stream';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
-import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker-runtime';
+import { IncusWorkerRuntime, type IncusWorkerOptions } from '../../orchestrator/server/utils/incus-worker-runtime';
+import type { IncusInstance } from '../../orchestrator/server/utils/incus-client';
 import { IncusWorkerStorage } from '../../orchestrator/server/utils/incus-worker-storage';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import { validateIncusSelectedRestoreArchive, validateIncusDockerRestoreArchive } from '../../orchestrator/server/utils/portable-managed-volume-archive';
@@ -42,9 +43,10 @@ test('native Docker logical archive retains overlay deletions and special named-
   const runtime = new IncusWorkerRuntime(config), client = runtime.client;
   const storage = new IncusWorkerStorage(client, config, installation);
   const dir = join(config.dataDir, 'docker-archive-proof-' + id); await mkdir(dir, { mode: 0o700 });
-  const opts = { id, userId, containerName: name, dockerEnabled: true, start: false, recreationNonce: nonce,
+  const opts: IncusWorkerOptions = { id, userId, containerName: name, dockerEnabled: true, start: false, recreationNonce: nonce,
     cpuLimit: 2, memoryLimit: '2GiB', userEnv: zeroUserEnvVars(userId),
-    environmentJson: { dockerEnabled: true, networkMode: 'full', allowedDomains: [], setupScript: '', envVars: '', exposeApis: {} },
+    environmentJson: { dockerEnabled: true, networkMode: 'full', allowedDomains: [], setupScript: '', envVars: '',
+      exposeApis: { portMappings: false, domainMappings: false, usage: false } },
     workerJson: { id, displayName: 'Docker archive proof', repos: [], initScript: '', gitName: '', gitEmail: '' },
     capabilitiesJson: [], instructionsJson: [] };
   Object.assign(serviceConfig, config);
@@ -233,7 +235,7 @@ print(json.dumps(out,sort_keys=True))`, upper]);
     const fresh = await client.getCustomVolume(config.incusStoragePool, copyName);
     expect(fresh.content_type).toBe('block'); expect(fresh.used_by).toEqual([]);
     for (const [key, value] of Object.entries(copyConfig)) expect(fresh.config[key]).toBe(value);
-    const devices = { ...beforeCopy.devices, verifybackup: { type: 'disk', pool: config.incusStoragePool, source: copyName } };
+    const devices: IncusInstance['devices'] = { ...beforeCopy.devices, verifybackup: { type: 'disk', pool: config.incusStoragePool, source: copyName } };
     delete devices.eth0;
     await client.updateInstanceDevices(name, devices, undefined, beforeCopy);
     await client.startInstance(name); await waitAgent(); await prove();
@@ -248,7 +250,7 @@ tar --numeric-owner --same-owner --same-permissions --xattrs --xattrs-include='*
 sync; umount /restore/docker`);
     await runtime.stop(opts, incarnation);
     const beforeSwitch = await prove();
-    const switched = { ...beforeSwitch.devices, docker: { type: 'disk', pool: config.incusStoragePool, source: copyName }, eth0: beforeCopy.devices.eth0! };
+    const switched: IncusInstance['devices'] = { ...beforeSwitch.devices, docker: { type: 'disk', pool: config.incusStoragePool, source: copyName }, eth0: beforeCopy.devices.eth0! };
     delete switched.verifybackup;
     await client.updateInstanceDevices(name, switched, undefined, beforeSwitch);
     await client.startInstance(name); await waitAgent(); await prove();

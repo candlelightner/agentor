@@ -4,7 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readFile } from 'node:fs/promises';
-import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker-runtime';
+import { IncusWorkerRuntime, type IncusWorkerOptions } from '../../orchestrator/server/utils/incus-worker-runtime';
 import { IncusManagedVolumeRuntime } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
 import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volume-store';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
@@ -35,8 +35,9 @@ test('real retained compute seeds an Incus filesystem staging disk before any di
   const runtime = new IncusWorkerRuntime(config), client = runtime.client;
   const id = randomUUID();
   const owner = { id, userId: 'managed-volume-primitive', containerName: `${config.containerPrefix}-${id}` };
-  const options = { ...owner, dockerEnabled: false, userEnv: zeroUserEnvVars(owner.userId),
-    environmentJson: { networkMode: 'full', allowedDomains: [], dockerEnabled: false, setupScript: '', envVars: '', exposeApis: {} },
+  const options: IncusWorkerOptions = { ...owner, dockerEnabled: false, userEnv: zeroUserEnvVars(owner.userId),
+    environmentJson: { networkMode: 'full', allowedDomains: [], dockerEnabled: false, setupScript: '', envVars: '',
+      exposeApis: { portMappings: false, domainMappings: false, usage: false } },
     capabilitiesJson: [], instructionsJson: [], workerJson: { id, displayName: 'storage primitive', repos: [], initScript: '', gitName: '', gitEmail: '' } };
   const installation = await backupInstallationId(dataDir);
   const store = new ManagedVolumeStore(dataDir); await store.init();
@@ -149,7 +150,8 @@ async function productionManagerFixture(dockerEnabled = false) {
   (manager as any).resolveHardwareDeviceAccess = async () => undefined;
   (manager as any).resolveUserEnvAndBinds = async () => ({ userEnv: zeroUserEnvVars('managed-live-owner'), credentialBinds: [], groupSecrets: [] });
   (manager as any).resolveEnvironmentConfig = () => ({ dockerEnabled,
-    environmentJson: { networkMode: 'full', allowedDomains: [], dockerEnabled, setupScript: '', envVars: '', exposeApis: {} },
+    environmentJson: { networkMode: 'full', allowedDomains: [], dockerEnabled, setupScript: '', envVars: '',
+      exposeApis: { portMappings: false, domainMappings: false, usage: false } },
     capabilitiesJson: [], instructionsJson: [] });
   return { config, manager, store, volumes, runtime };
 }

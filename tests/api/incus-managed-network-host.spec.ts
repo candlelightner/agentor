@@ -14,7 +14,7 @@ import { createRequire } from 'node:module';
 import { IncusManagedDockerBridge } from '../../orchestrator/server/utils/incus-managed-docker-bridge';
 import type { IncusManagedBridge } from '../../orchestrator/server/utils/incus-managed-network-host';
 import { ManagedNetworkManager } from '../../orchestrator/server/utils/managed-network-manager';
-import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker-runtime';
+import { IncusWorkerRuntime, type IncusWorkerOptions } from '../../orchestrator/server/utils/incus-worker-runtime';
 import { ContainerManager } from '../../orchestrator/server/utils/container';
 import { DockerService } from '../../orchestrator/server/utils/docker';
 import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
@@ -190,8 +190,9 @@ test('real TypeScript client uses pinned mTLS for owned native host bridge lifec
     await store.update(network.userId, network.id, { workerIds: [peerId] });
     peerRuntime = new IncusWorkerRuntime(peerConfig);
     peerCreateSubmitted = true;
-    const peerOptions = { ...peerOwner, start: running, dockerEnabled: false, userEnv: zeroUserEnvVars(network.userId),
-      environmentJson: { networkMode: 'full', allowedDomains: [], dockerEnabled: false, setupScript: '', envVars: '', exposeApis: {} },
+    const peerOptions: IncusWorkerOptions = { ...peerOwner, start: running, dockerEnabled: false, userEnv: zeroUserEnvVars(network.userId),
+      environmentJson: { networkMode: 'full', allowedDomains: [], dockerEnabled: false, setupScript: '', envVars: '',
+        exposeApis: { portMappings: false, domainMappings: false, usage: false } },
       capabilitiesJson: [], instructionsJson: [], workerJson: { id: peerId, displayName: 'native reference gate', repos: [], initScript: '', gitName: '', gitEmail: '' } };
     const peer = await peerRuntime.create(peerOptions);
     peerIncarnation = peer.config['volatile.uuid']; expect(peerIncarnation).toBeTruthy();

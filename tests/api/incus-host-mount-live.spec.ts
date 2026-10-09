@@ -69,7 +69,8 @@ test('real production VM enforces granted host RO/RW exports against guest root'
     start: false, dockerEnabled: false, userEnv: zeroUserEnvVars(userId), hostMountGroupId: group.id, recreationNonce: nonce,
     mounts: [{ pathId: ro.id, source: ro.sourcePath, target: '/mnt/host-ro', readOnly: true },
       { pathId: rw.id, source: rw.sourcePath, target: '/workspace/host-rw', readOnly: false }],
-    environmentJson: { networkMode: 'full', allowedDomains: [], dockerEnabled: false, setupScript: '', envVars: '', exposeApis: {} },
+    environmentJson: { networkMode: 'full', allowedDomains: [], dockerEnabled: false, setupScript: '', envVars: '',
+      exposeApis: { portMappings: false, domainMappings: false, usage: false } },
     capabilitiesJson: [], instructionsJson: [], workerJson: { id, displayName: 'host gate', repos: [], initScript: '', gitName: '', gitEmail: '' } };
   const runtime = new IncusWorkerRuntime(config), host = new IncusHostMountClient(config);
   const execute = runtime.client.exec.bind(runtime.client), probeErrors = new Set<string>();

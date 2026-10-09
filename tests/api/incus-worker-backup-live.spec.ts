@@ -42,7 +42,8 @@ test('real production running, stopped and archived native export preserves cano
   const manager = new ContainerManager(docker as any, config);
   manager.setWorkerStore(store); manager.setIncusRuntime(runtime);
   const environment = { id: 'backup-gate', name: 'Backup gate', envVars: '', dockerEnabled: false,
-    networkMode: 'full', allowedDomains: [], setupScript: '', exposeApis: {}, cpuLimit: 1, memoryLimit: '1g' };
+    networkMode: 'full', allowedDomains: [], setupScript: '',
+    exposeApis: { portMappings: false, domainMappings: false, usage: false }, cpuLimit: 1, memoryLimit: '1g' };
   manager.setEnvironmentStore({ getById: () => environment } as any);
   let submitted = false, incarnation: string | undefined, cleaned = false, failure: unknown;
   try {

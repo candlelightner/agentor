@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { BackupManager } from '../../orchestrator/server/utils/backup-manager';
-import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker-runtime';
+import { IncusWorkerRuntime, type IncusWorkerOptions } from '../../orchestrator/server/utils/incus-worker-runtime';
 import { StorageManager } from '../../orchestrator/server/utils/storage';
 import { useConfig, useContainerManager, useDomainMappingStore, usePortMappingStore, useWorkerStore, useDockerService } from '../../orchestrator/server/utils/services';
 import { useWorkerConfigStore } from '../../orchestrator/server/utils/worker-config-store';
@@ -83,14 +83,14 @@ print('Exact fixture policy delta '+sys.argv[2]+' confirmed')
     workerStore: (manager as any).workerStore, environmentStore: (manager as any).environmentStore };
   manager.setIncusRuntime(runtime); manager.setStorageManager(storage); manager.setWorkerStore(store);
   const environment = { id: randomUUID(), name: 'Selected capture fixture', dockerEnabled: false, networkMode: 'full', allowedDomains: [],
-    setupScript: '', envVars: '', exposeApis: {}, cpuLimit: 1, memoryLimit: '1GiB' };
+    setupScript: '', envVars: '', exposeApis: { portMappings: false, domainMappings: false, usage: false }, cpuLimit: 1, memoryLimit: '1GiB' };
   manager.setEnvironmentStore({ getById: () => environment } as any);
   const backup = new BackupManager({ dataDir: config.dataDir }), docker = useDockerService(), originalArchive = docker.getArchive;
   docker.getArchive = async () => { throw new Error('Native selection must never call Docker archive'); };
   const opts = { id, userId, containerName: name, dockerEnabled: false, start: false, recreationNonce: randomUUID(),
     cpuLimit: 1, memoryLimit: '1GiB', userEnv: zeroUserEnvVars(userId), storageManager: storage,
     environmentJson: environment, workerJson: { id, displayName: 'Selected native capture', repos: [], initScript: '', gitName: '', gitEmail: '' },
-    capabilitiesJson: [], instructionsJson: [] };
+    capabilitiesJson: [], instructionsJson: [] } satisfies IncusWorkerOptions;
   let submitted = false, cleaned = false, policyAdded = false, incarnation: string | undefined;
   const exec = async (command: string[]) => {
     const result = await runtime.client.exec(name, command); expect(result.returnCode, result.stderr).toBe(0); return result.stdout;

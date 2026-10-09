@@ -42,7 +42,8 @@ test('real production running/stopped/archived managed export retains v6 binary 
   const manager = new ContainerManager(new Proxy({}, { get: () => () => { throw new Error('Native backup must not call Docker'); } }) as any, config);
   manager.setWorkerStore(store); manager.setIncusRuntime(runtime);
   const environment = { id: 'managed-backup-gate', name: 'Managed backup gate', envVars: '', dockerEnabled: false,
-    networkMode: 'full', allowedDomains: [], setupScript: '', exposeApis: {}, cpuLimit: 1, memoryLimit: '1g' };
+    networkMode: 'full', allowedDomains: [], setupScript: '',
+    exposeApis: { portMappings: false, domainMappings: false, usage: false }, cpuLimit: 1, memoryLimit: '1g' };
   manager.setEnvironmentStore({ getById: () => environment } as any);
   const target = '/srv/native-backup', stage = join(config.dataDir, 'managed-backup-gate-' + id);
   await mkdir(stage, { mode: 0o700 });
