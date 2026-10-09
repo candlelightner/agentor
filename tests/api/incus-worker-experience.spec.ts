@@ -167,7 +167,7 @@ http.server.ThreadingHTTPServer(('0.0.0.0',int(os.environ['AGENTOR_PLUGIN_PORT_U
         if (settled) return; settled = true; clearTimeout(timer); socket.close(); resolve(value);
       };
       const timer = setTimeout(() => finish(''), 15_000);
-      socket.onmessage = (event) => finish(typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data));
+      socket.onmessage = (event: MessageEvent<string | ArrayBuffer>) => finish(typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data));
       socket.onerror = socket.onclose = () => finish('');
     });
     const pluginSocketUrl = baseURL.replace(/^http/, 'ws') + privatePath;

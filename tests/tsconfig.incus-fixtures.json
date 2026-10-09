@@ -1,11 +1,14 @@
 {
   "extends": "../orchestrator/.nuxt/tsconfig.server.json",
-  "compilerOptions": { "noEmit": true, "rootDir": "..", "esModuleInterop": true },
+  "compilerOptions": { "noEmit": true, "rootDir": "..", "esModuleInterop": true,
+    "lib": ["ESNext", "DOM", "DOM.Iterable"] },
   "include": [
     "api/incus-worker-lifecycle.spec.ts",
     "api/incus-worker-runtime.spec.ts",
     "api/incus-worker-commands.spec.ts",
     "api/incus-exec-transport.spec.ts",
+    "api/incus-full-stack.spec.ts",
+    "api/incus-worker-experience.spec.ts",
     "api/incus-managed-volume.spec.ts",
     "api/incus-managed-network-host.spec.ts",
     "api/incus-host-mount-live.spec.ts",
