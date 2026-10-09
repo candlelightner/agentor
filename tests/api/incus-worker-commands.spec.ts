@@ -352,11 +352,21 @@ for (const mode of ['valid', 'too-large', 'setup-failure'] as const) {
 test('real production manager files and linked terminal use the accepted Incus guest', async () => {
   test.skip(process.env.INCUS_COMMAND_TEST !== 'true', 'Explicit disposable-host command integration');
   test.setTimeout(600_000);
+  const gateway = new URL(process.env.INCUS_STACK_GATEWAY || 'http://10.159.68.1:38000');
+  if (gateway.protocol !== 'http:' || gateway.username || gateway.password || gateway.pathname !== '/' || gateway.search || gateway.hash)
+    throw new Error('Fixture requires the approved internal HTTP gateway origin');
+  // Check the external fixture dependency before paying for another VM boot.
+  expect(execFileSync('ssh', ['-p', '22375', '-i', '/workspace/agentor-kata-vm-access.ZgLVo9uk/id_ed25519',
+    '-o', 'UserKnownHostsFile=/workspace/agentor-kata-vm-access.ZgLVo9uk/known_hosts', '-o', 'BatchMode=yes',
+    '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes', 'kata-test@172.19.0.1',
+    'curl', '--max-time', '5', '-fsS', '-o', '/dev/null', '-w', '%{http_code}',
+    "'" + (gateway.origin + '/api/health').replaceAll("'", "'\\''") + "'"],
+  { encoding: 'utf8', timeout: 10_000 })).toBe('200');
   const dir = await mkdtemp(join(tmpdir(), 'agentor-incus-commands-'));
   const config = { dataDir: dir, incusEnabled: true, incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor',
     incusClientCertPath: '/workspace/agentor-incus-tls/client.crt', incusClientKeyPath: '/workspace/agentor-incus-tls/client.key',
     incusServerCertPath: '/workspace/agentor-incus-tls/server.crt', incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase6-candidate',
-    incusNetwork: 'incusbr0', incusStoragePool: 'default', incusInternalGatewayUrl: 'http://10.159.68.1:38000',
+    incusNetwork: 'incusbr0', incusStoragePool: 'default', incusInternalGatewayUrl: gateway.origin,
     containerPrefix: 'agentor-worker', workerImagePrefix: '', workerImage: 'agentor-worker:latest' } as Config;
   const runtime = new IncusWorkerRuntime(config);
   const store = new WorkerStore(dir); await store.init();
