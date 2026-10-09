@@ -1,7 +1,12 @@
 # Incus worker rollout
 
-This is an opt-in upgrade for a single Ubuntu 24.04 amd64 host. Do not roll out
-until Phase 13 acceptance is recorded as passed in `incus-vm-status.md`.
+This is an opt-in upgrade for a single Ubuntu 24.04 amd64 host. The implementation
+handoff is complete with an operator-approved acceptance exception: the final
+full browser/routing/IP-change gate is deferred to
+[issue #5](https://github.com/candlelightner/agentor/issues/5). Other accepted
+evidence is recorded in `incus-vm-status.md`; the complete original Phase 13
+matrix is not claimed passed. The deployed canary below still precedes any
+production worker migration.
 The Admin Workspace stays on Docker. Existing ordinary workers remain on Docker
 until a platform administrator explicitly migrates them.
 
