@@ -69,6 +69,31 @@ test('cold catalog uses the same current source authority and private converter/
   } finally { await f.cleanup(); }
 });
 
+test('failed native conversion retains bounded sanitized cause logs and unchanged exact acknowledgements', async () => {
+  const f = await fixture(true); try {
+    const source = await f.authorize(); let id = '', acknowledged: IncusImageConverterReceipt | undefined;
+    const failure = new Error('Isolated converter raw-convert failed (exit 37):\nAPI_KEY=PRIVATE_API_SENTINEL PASSWORD=PRIVATE_PASSWORD_SENTINEL ' +
+      'authorization: Bearer PRIVATE_BEARER_SENTINEL authorization: Basic PRIVATE_BASIC_SENTINEL /var/run/docker.sock https://reader:PRIVATE_URL_SENTINEL@private.example/path ' +
+      'https://public.example/path?ordinary=user@example ' + 'x'.repeat(1000));
+    await expect(f.manager.ensureNativeImageBinding(source, f.context, f.validate, async buildId => {
+      id = buildId; acknowledged = f.receipt(id); await f.manager.acknowledgeNativeConverter(id, acknowledged);
+      f.manager.build(id, f.owner, false).logs.push(...Array.from({ length: 2000 }, (_, index) => 'existing-' + index));
+      throw failure;
+    })).rejects.toBe(failure);
+    const failed = f.manager.build(id, f.owner, false), diagnostic = failed.logs.at(-1)!;
+    expect(failed).toMatchObject({ status: 'failed', phase: 'failed', outcome: 'build-failed',
+      error: 'Native image conversion failed; exact acknowledged authority is retained.', nativeDerivation: { converter: acknowledged } });
+    expect(failed.logs).toHaveLength(2000); expect(failed.logs[0]).toBe('existing-1');
+    expect(diagnostic).toContain('[native] Isolated converter raw-convert failed (exit 37):');
+    expect(diagnostic.length).toBeLessThanOrEqual(509); expect(diagnostic).not.toMatch(/[\r\n]|PRIVATE_API_SENTINEL|PRIVATE_PASSWORD_SENTINEL|PRIVATE_BEARER_SENTINEL|PRIVATE_BASIC_SENTINEL|PRIVATE_URL_SENTINEL|reader:|docker\.sock/);
+    expect(diagnostic).toContain('[redacted]'); expect(diagnostic).toContain('[redacted-path]');
+    expect(diagnostic).toContain('[redacted]private.example/path'); expect(diagnostic).toContain('https://public.example/path?ordinary=user@example');
+    expect(await f.manager.readNativeImageBinding(source, f.context, f.validate)).toBeUndefined();
+    expect(f.manager.publicBuild(id, f.owner, false)).not.toHaveProperty('nativeDerivation');
+    expect(JSON.parse(await readFile(f.path, 'utf8')).builds.find((build: ImageBuild) => build.id === id).logs).toEqual(failed.logs);
+  } finally { await f.cleanup(); }
+});
+
 test('owned controlled source uses actual immutable Docker acknowledgement and public projections exclude native authority', async () => {
   const f = await fixture(); try {
     const source = await f.authorize(); expect(source.sourceImageId).toBe(digest); expect(f.inspections()).toBe(1);

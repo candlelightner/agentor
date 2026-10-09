@@ -309,7 +309,7 @@ const SAFE_DESTINATION_RE =
   /^\/opt\/agentor-context\/(?!\.\.(?:\/|$))(?!.*\/\.\.(?:\/|$))[a-zA-Z0-9._/-]+$/;
 const SAFE_PACKAGE_RE = /^[a-zA-Z0-9@._+:/=~^-]+$/;
 const REDACT =
-  /(?:\bauthorization\s*[:=]\s*(?:bearer\s+)?[^\s"'`]+|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}|\b[A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|API[_-]?KEY|PRIVATE[_-]?KEY)[A-Za-z0-9_]*\s*[=:]\s*["']?[^\s"']+|-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----|github_pat_[A-Za-z0-9_]{12,}|\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}|IMAGE_BUILD_MUST_NEVER_LEAK[^\s]*)/gi;
+  /(?:\b[a-z][a-z0-9+.-]*:\/\/[^\s"'`\/?#]*@|\bauthorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?[^\s"'`]+|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}|\b[A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|API[_-]?KEY|PRIVATE[_-]?KEY)[A-Za-z0-9_]*\s*[=:]\s*["']?[^\s"']+|-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----|github_pat_[A-Za-z0-9_]{12,}|\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}|IMAGE_BUILD_MUST_NEVER_LEAK[^\s]*)/gi;
 
 function now() {
   return new Date().toISOString();
@@ -1015,6 +1015,8 @@ export class ImageCatalogCore {
       catch (error) {
         await this.mutate(() => { const build = this.state.builds.find(item => item.id === id);
           if (build && build.status === 'running') { build.status = 'failed'; build.phase = 'failed'; build.progress = 100;
+            build.logs.push(`[native] ${safeBuildDiagnostic(error)}`);
+            if (build.logs.length > 2000) build.logs.splice(0, build.logs.length - 2000);
             build.outcome = 'build-failed'; build.error = 'Native image conversion failed; exact acknowledged authority is retained.';
             build.completedAt = build.updatedAt = now(); } });
         throw error;
