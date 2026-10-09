@@ -98,7 +98,7 @@ function fixture(options: { admin?: boolean; unknownCreate?: boolean; foreignCle
             observer!.seen.add(label); observer!.stdout.write(JSON.stringify({ type: 'seen', nonce: spec.nonce, label }) + '\n');
           }
         }
-        if (command === 'ip -j -4 route show default dev eth0') stdout = JSON.stringify(options.route ?? [{ dst: 'default', dev: 'eth0', gateway: options.guestGateway ?? '10.25.0.1', metric: 1024 }]);
+        if (command === 'ip -j -4 route show default') stdout = JSON.stringify(options.route ?? [{ dst: 'default', dev: 'eth0', gateway: options.guestGateway ?? '10.25.0.1', metric: 1024 }]);
         if (command.includes('/api/worker-self/info') && !command.includes('test "$code" = 28')) stdout = JSON.stringify({ workerId: worker.id, userId: 'owner' });
         if (command.includes('cat /data/proof')) stdout = marker;
         if (options.brokenManualControl && command.includes('systemctl stop systemd-networkd') && command.includes('ip link set eth0 address 02:00:00:00:00:02') && !command.includes('test "$code" = 28'))
@@ -156,7 +156,7 @@ test('non-admin or unavailable verified runtime never creates environment/worker
 test('distinct Orchestrator HTTP host never substitutes for captured guest default gateway and healthy manual route precedes MAC spoof', async () => {
   const f = fixture({ httpTarget: '172.22.0.1', guestGateway: '10.25.0.1' });
   expect((await canary.runIncusCanary({ sessionCookie: cookie }, f.dependencies)).status).toBe('passed');
-  const capture = f.commands.indexOf('ip -j -4 route show default dev eth0');
+  const capture = f.commands.indexOf('ip -j -4 route show default');
   const control = f.commands.findIndex(command => command.includes('systemctl stop systemd-networkd') && !command.includes('test "$code" = 28'));
   const spoof = f.commands.findIndex(command => command.endsWith("'mac-denied'"));
   expect(capture).toBeLessThan(f.commands.findIndex(command => command.endsWith("'ipv4-denied'")));

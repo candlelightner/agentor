@@ -231,7 +231,9 @@ export async function runIncusCanary(rawInput, dependencies, signal = new AbortC
     const state = await deps.client.getInstanceState(attacker.name);
     const prefix = state.network?.eth0?.addresses.find(item => item.address === a4.address)?.netmask;
     requireFact(/^\d{1,2}$/.test(prefix ?? '') && Number(prefix) <= 32, 'PRIMARY_PREFIX_UNAVAILABLE');
-    const routeOutput = await checked(attacker, 'ip -j -4 route show default dev eth0');
+    // A dev-filtered iproute2 query omits the dev field in its JSON output.
+    // Query defaults, then require the captured authoritative route is eth0.
+    const routeOutput = await checked(attacker, 'ip -j -4 route show default');
     requireFact(Buffer.byteLength(routeOutput) <= 8192, 'PRIMARY_ROUTE_LIMIT');
     const routes = JSON.parse(routeOutput);
     requireFact(Array.isArray(routes) && routes.length === 1 && routes[0].dst === 'default' && routes[0].dev === 'eth0' &&

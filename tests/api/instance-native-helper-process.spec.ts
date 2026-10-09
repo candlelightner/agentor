@@ -1969,7 +1969,7 @@ const output=await new Promise((resolve,reject)=>{const chunks=[];let bytes=0,er
 child.stdout.on('data',part=>{bytes+=part.length;if(bytes>65536){child.kill();reject(Error('Canary output bound'))}else chunks.push(part)});
 child.stderr.on('data',part=>{errors+=part.length;if(errors>65536){child.kill();reject(Error('Canary private error bound'))}});
 child.on('error',()=>reject(Error('Packaged canary launch failed')));child.on('close',code=>{clearTimeout(timer);try{const v=JSON.parse(Buffer.concat(chunks).toString());
-if(!['passed','failed'].includes(v.status)||typeof v.stage!=='string'||!/^[a-z-]{1,60}$/.test(v.stage)||!Array.isArray(v.workers)||!Array.isArray(v.environments))throw Error();
+if(!['passed','failed'].includes(v.status)||typeof v.stage!=='string'||!/^[a-z0-9-]{1,60}$/.test(v.stage)||!Array.isArray(v.workers)||!Array.isArray(v.environments))throw Error();
 const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;if(!v.workers.every(w=>uuid.test(w?.id)&&(!w.incarnation||uuid.test(w.incarnation)))||!v.environments.every(id=>uuid.test(id)))throw Error();
 resolve({code,status:v.status,stage:v.stage,workers:v.workers.map(w=>({id:w.id,incarnation:w.incarnation})),environments:v.environments})}catch{reject(Error('Canary response invalid'))}});
 timer=setTimeout(()=>{child.kill();reject(Error('Canary deadline'))},1250000);
