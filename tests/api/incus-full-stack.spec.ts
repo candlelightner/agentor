@@ -21,6 +21,9 @@ test("real Dockerized Agentor routes editor/desktop/Traefik and authorizes filte
   const data = process.env.INCUS_STACK_DATA_HOST;
   if (!data || !/^\/var\/tmp\/agentor-phase6-production\.[A-Za-z0-9]+\/stack-data$/.test(data))
     throw new Error("Explicit disposable fixture data path required");
+  const reuse = process.env.INCUS_STACK_REUSE_WORKERS?.split(',');
+  if (reuse && (reuse.length !== 2 || new Set(reuse).size !== 2 || reuse.some(id => !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(id))))
+    throw new Error('Two distinct acknowledged realm worker UUIDs required');
   const api = await playwrightRequest.newContext({ baseURL, extraHTTPHeaders: { Origin: baseURL }, timeout: 360_000 });
   const anonymous = await playwrightRequest.newContext({ baseURL });
   const client = new IncusClient({ endpoint: "https://127.0.0.1:18443", project: "agentor",
@@ -29,6 +32,25 @@ test("real Dockerized Agentor routes editor/desktop/Traefik and authorizes filte
   const workers: any[] = [], envs: string[] = [];
   let primaryFailure = false;
   let ipv6FixtureStarted = false;
+  let ownerId: string | undefined;
+  const incarnations = new Map<string, string>();
+  const fence = async (worker: { id: string; userId: string; runtimeKind: string; status: string; containerName: string; containerId: string; environmentId: string }) => {
+    if (!ownerId) throw new Error('Fixture session owner is unavailable');
+    expect(worker).toMatchObject({ userId: ownerId, runtimeKind: 'incus-vm', status: 'running', containerName: 'agentor-worker-' + worker.id });
+    expect(worker.containerId).toMatch(/^incus:[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/);
+    const durable = JSON.parse(host('sudo python3 -c ' + quote(String.raw`import os,json,sys
+d,u,w=sys.argv[1:];f=os.open(d+'/users/'+u+'/workers.json',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+with os.fdopen(f) as s:
+ assert os.fstat(s.fileno()).st_size<=4*1024*1024;matches=[r for r in json.load(s) if r.get('id')==w];assert len(matches)==1;r=matches[0]
+print(json.dumps(dict(id=r.get('id'),userId=r.get('userId'),runtimeKind=r.get('runtimeKind'),status=r.get('status'),environmentId=r.get('environmentId'),blocked=bool(r.get('deletionPending') or r.get('incusRecreation') or r.get('incusMigration') and r['incusMigration'].get('phase')!='retained'),installation=open(d+'/backup-installation-id').read().strip())))`) +
+      ' ' + quote(data) + ' ' + quote(ownerId) + ' ' + quote(worker.id)));
+    expect(durable).toMatchObject({ id: worker.id, userId: ownerId, runtimeKind: 'incus-vm', status: 'active', environmentId: worker.environmentId, blocked: false });
+    expect(durable.installation).toMatch(/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/);
+    expect(await client.getInstance(worker.containerName)).toMatchObject({ type: 'virtual-machine', status: 'Running', config: {
+      'volatile.uuid': worker.containerId.slice(6), 'user.agentor.id': worker.id, 'user.agentor.owner': ownerId, 'user.agentor.installation': durable.installation } });
+    if (incarnations.has(worker.id)) expect(worker.containerId).toBe('incus:' + incarnations.get(worker.id));
+    else incarnations.set(worker.id, worker.containerId.slice(6));
+  };
   const previousPaths = JSON.parse(host("sudo incus query /1.0/projects/agentor")).config["restricted.devices.disk.paths"] || "";
   const checked = async (name: string, script: string) => {
     const result = await client.exec(name, ["bash", "-ec", script]);
@@ -44,6 +66,7 @@ test("real Dockerized Agentor routes editor/desktop/Traefik and authorizes filte
   try {
     await expect.poll(async () => (await api.get("/api/health")).status(), { timeout: 60_000 }).toBe(200);
     if ((await (await api.get("/api/setup/status")).json()).needsSetup) {
+      if (reuse) throw new Error('Worker reuse requires the established authenticated fixture realm');
       const setup = await api.post("/api/setup/create-admin", { data: { email: "incus-stack@agentor.test", password: "isolated-incus-stack-test-password", name: "Incus Stack Test" } });
       expect(setup.ok(), await setup.text()).toBe(true);
     }
@@ -51,10 +74,21 @@ test("real Dockerized Agentor routes editor/desktop/Traefik and authorizes filte
     expect(signIn.ok(), await signIn.text()).toBe(true);
     const owner = (await signIn.json()).user.id;
     expect(owner).toMatch(/^[A-Za-z0-9_-]+$/);
+    ownerId = owner;
     const dirs = [`${data}/users/${owner}/credentials`, `${data}/users/${owner}/kilo/config`, `${data}/users/${owner}/kilo/data`];
     // Test-side operator authority, not the restricted production API client.
     host(`sudo incus project set agentor restricted.devices.disk.paths ${quote([previousPaths, ...dirs].filter(Boolean).join(","))}`);
-    for (const dockerEnabled of [true, false]) {
+    if (reuse) {
+      const listed = await api.get('/api/containers'); expect(listed.status()).toBe(200);
+      const records = await listed.json();
+      for (const [index, id] of reuse.entries()) {
+        const matches = records.filter((worker: { id: string }) => worker.id === id); expect(matches).toHaveLength(1);
+        const worker = matches[0]; await fence(worker);
+        const environment = await api.get('/api/environments/' + worker.environmentId); expect(environment.status()).toBe(200);
+        expect(await environment.json()).toMatchObject({ userId: owner, dockerEnabled: index === 0 });
+        workers.push(worker); // Existing realm environments are retained, not gratuitously deleted.
+      }
+    } else for (const dockerEnabled of [true, false]) {
       const env = await api.post("/api/environments", { data: { name: `Incus phase6 ${dockerEnabled}`, networkMode: "full", dockerEnabled, memoryLimit: "2GiB", cpuLimit: 2 } });
       expect(env.status(), await env.text()).toBe(201);
       const environment = await env.json(); envs.push(environment.id);
@@ -64,6 +98,7 @@ test("real Dockerized Agentor routes editor/desktop/Traefik and authorizes filte
       expect(worker.runtimeKind).toBe("incus-vm");
       expect(worker.status).toBe("running");
       expect(worker.userId).toBe(owner);
+      await fence(worker);
     }
     const [victim, attacker] = workers;
     // Exercise the unchanged dashboard panes in a real browser, not only the
@@ -259,12 +294,18 @@ test("real Dockerized Agentor routes editor/desktop/Traefik and authorizes filte
     const cleanupFailures: string[] = [];
     for (const worker of workers.reverse()) {
       try {
+        if (reuse && primaryFailure) throw new Error('Incomplete reused realm retained until explicit fixture diagnosis');
+        if (!incarnations.has(worker.id)) throw new Error('Worker creation/reuse incarnation was not positively acknowledged');
+        const listed = await api.get('/api/containers'); expect(listed.status()).toBe(200);
+        const matches = (await listed.json()).filter((value: { id: string }) => value.id === worker.id);
+        expect(matches).toHaveLength(1); await fence(matches[0]);
         const removed = await api.delete(`/api/containers/${worker.id}`);
         if (!removed.ok()) cleanupFailures.push(`Worker cleanup ${worker.id}: HTTP ${removed.status()}`);
       } catch { cleanupFailures.push(`Worker cleanup ${worker.id}: transport failure`); }
     }
     for (const id of envs) {
       try {
+        if (cleanupFailures.length) throw new Error('Owned environment retained while worker cleanup is unresolved');
         const removed = await api.delete(`/api/environments/${id}`);
         if (!removed.ok()) cleanupFailures.push(`Environment cleanup ${id}: HTTP ${removed.status()}`);
       } catch { cleanupFailures.push(`Environment cleanup ${id}: transport failure`); }

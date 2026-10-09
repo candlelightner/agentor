@@ -19,11 +19,33 @@ test('real Incus dashboard terminal/files/apps and authenticated plugin UI/deskt
   const data = process.env.INCUS_STACK_DATA_HOST;
   if (!data || !/^\/var\/tmp\/agentor-phase6-production\.[A-Za-z0-9]+\/stack-data$/.test(data))
     throw new Error('Explicit isolated disposable fixture data path required');
+  const reuseId = process.env.INCUS_EXPERIENCE_WORKER_ID;
+  if (reuseId && !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(reuseId))
+    throw new Error('Explicit acknowledged fixture worker UUID required');
   const api = await request.newContext({ baseURL, extraHTTPHeaders: { Origin: baseURL }, timeout: 360_000 });
   const anonymous = await request.newContext({ baseURL });
   const definitions: string[] = [], installations: string[] = [];
   let worker: any, environment: any, browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
   let terminal: any, primaryFailure = false, stage = 'login';
+  let ownerId: string | undefined, incarnation: string | undefined, directoryCreated = false;
+  const fence = (value: { id: string; userId: string; runtimeKind: string; status: string; containerName: string; containerId: string }) => {
+    if (!ownerId) throw new Error('Fixture session owner is unavailable');
+    expect(value).toMatchObject({ userId: ownerId, runtimeKind: 'incus-vm', status: 'running', containerName: 'agentor-worker-' + value.id });
+    expect(value.containerId).toMatch(/^incus:[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/);
+    const durable = JSON.parse(host('sudo python3 -c ' + quote(String.raw`import os,json,sys
+d,u,w=sys.argv[1:];f=os.open(d+'/users/'+u+'/workers.json',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+with os.fdopen(f) as s:
+ assert os.fstat(s.fileno()).st_size<=4*1024*1024;matches=[r for r in json.load(s) if r.get('id')==w];assert len(matches)==1;r=matches[0]
+print(json.dumps(dict(id=r.get('id'),userId=r.get('userId'),runtimeKind=r.get('runtimeKind'),status=r.get('status'),blocked=bool(r.get('deletionPending') or r.get('incusRecreation') or r.get('incusMigration') and r['incusMigration'].get('phase')!='retained'),installation=open(d+'/backup-installation-id').read().strip())))`) +
+      ' ' + quote(data) + ' ' + quote(ownerId) + ' ' + quote(value.id)));
+    expect(durable).toMatchObject({ id: value.id, userId: ownerId, runtimeKind: 'incus-vm', status: 'active', blocked: false });
+    expect(durable.installation).toMatch(/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/);
+    const observed = JSON.parse(host('sudo incus query ' + quote('/1.0/instances/' + encodeURIComponent(value.containerName) + '?project=agentor')));
+    expect(observed).toMatchObject({ type: 'virtual-machine', status: 'Running', config: { 'volatile.uuid': value.containerId.slice(6),
+      'user.agentor.id': value.id, 'user.agentor.owner': ownerId, 'user.agentor.installation': durable.installation } });
+    if (incarnation) expect(value.containerId).toBe('incus:' + incarnation);
+    else incarnation = value.containerId.slice(6);
+  };
   const previousPaths = JSON.parse(host('sudo incus query /1.0/projects/agentor')).config['restricted.devices.disk.paths'] || '';
   try {
     const login = await api.post('/api/auth/sign-in/email', { data: {
@@ -32,19 +54,32 @@ test('real Incus dashboard terminal/files/apps and authenticated plugin UI/deskt
     expect(login.ok(), await login.text()).toBe(true);
     const owner = (await login.json()).user.id;
     expect(owner).toMatch(/^[A-Za-z0-9_-]+$/);
+    ownerId = owner;
     const roots = ['credentials', 'kilo/config', 'kilo/data'].map((suffix) => `${data}/users/${owner}/${suffix}`);
     host(`sudo incus project set agentor restricted.devices.disk.paths ${quote([previousPaths, ...roots].filter(Boolean).join(','))}`);
-    const env = await api.post('/api/environments', { data: { name: `Incus experience ${randomUUID()}`, networkMode: 'full', dockerEnabled: false, memoryLimit: '2GiB', cpuLimit: 2 } });
-    expect(env.status(), await env.text()).toBe(201); environment = await env.json();
-    const created = await api.post('/api/containers', { data: { displayName: `Incus experience ${randomUUID()}`, environmentId: environment.id } });
-    expect(created.status(), await created.text()).toBe(201); worker = await created.json();
+    if (reuseId) {
+      const listed = await api.get('/api/containers'); expect(listed.status()).toBe(200);
+      const matches = (await listed.json()).filter((value: { id: string }) => value.id === reuseId);
+      expect(matches).toHaveLength(1); worker = matches[0];
+    } else {
+      const env = await api.post('/api/environments', { data: { name: `Incus experience ${randomUUID()}`, networkMode: 'full', dockerEnabled: false, memoryLimit: '2GiB', cpuLimit: 2 } });
+      expect(env.status(), await env.text()).toBe(201); environment = await env.json();
+      const created = await api.post('/api/containers', { data: { displayName: `Incus experience ${randomUUID()}`, environmentId: environment.id } });
+      expect(created.status(), await created.text()).toBe(201); worker = await created.json();
+    }
     expect(worker).toMatchObject({ runtimeKind: 'incus-vm', status: 'running', userId: owner });
+    fence(worker);
     const prefix = `/api/containers/${worker.id}`;
     stage = 'files';
     expect((await anonymous.get(`${prefix}/files`)).status()).toBe(401);
     const binary = Buffer.from([0, 255, 10, 13, 128]);
+    if (reuseId) {
+      const before = await api.get(`${prefix}/files`); expect(before.status()).toBe(200);
+      expect((await before.json()).entries.some((entry: { path: string }) => entry.path === 'experience')).toBe(false);
+    }
     const mkdir = await api.post(`${prefix}/files/mkdir`, { data: { path: 'experience' } });
     expect(mkdir.status(), await mkdir.text()).toBe(200);
+    directoryCreated = true;
     const upload = await api.post(`${prefix}/files/upload`, { multipart: {
       path: 'experience', file: { name: 'bytes.bin', mimeType: 'application/octet-stream', buffer: binary },
     } });
@@ -229,10 +264,22 @@ http.server.ThreadingHTTPServer(('0.0.0.0',int(os.environ['AGENTOR_PLUGIN_PORT_U
     try {
       await cleanup('terminal', async () => terminal?.close());
       await cleanup('browser', async () => browser?.close());
-      for (const id of installations) await remove(`/api/containers/${worker.id}/plugins/${id}`);
-      for (const id of definitions) await remove(`/api/plugins/definitions/${id}`);
-      if (worker) await remove(`/api/containers/${worker.id}`);
-      if (environment) await remove(`/api/environments/${environment.id}`);
+      let currentOwned = false;
+      if (worker && incarnation) await cleanup('captured worker incarnation', async () => {
+        const listed = await api.get('/api/containers'); expect(listed.status()).toBe(200);
+        const matches = (await listed.json()).filter((value: { id: string }) => value.id === worker.id);
+        expect(matches).toHaveLength(1); fence(matches[0]); currentOwned = true;
+      });
+      if (currentOwned) {
+        for (const id of installations) await remove(`/api/containers/${worker.id}/plugins/${id}`);
+        for (const id of definitions) await remove(`/api/plugins/definitions/${id}`);
+        if (reuseId && directoryCreated) await cleanup('owned experience files', async () => {
+          expect((await api.delete(`/api/containers/${worker.id}/files`, { data: { paths: ['experience'] } })).status()).toBe(200);
+        });
+        if (!reuseId) await remove(`/api/containers/${worker.id}`);
+      }
+      if (environment && currentOwned) await remove(`/api/environments/${environment.id}`);
+      if (reuseId && currentOwned) console.info('Acknowledged experience worker/environment retained for full-stack gate', { workerId: worker.id, incarnation });
     } finally {
       await cleanup('restricted project path restoration', async () => {
         host(`sudo incus project set agentor restricted.devices.disk.paths ${quote(previousPaths)}`);
