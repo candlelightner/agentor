@@ -1,21 +1,20 @@
 import { test, expect } from '@playwright/test';
-import { mkdtemp, mkdir, rm, readFile, lstat, readlink, readdir } from 'node:fs/promises';
+import { mkdir, readFile, lstat, readlink, readdir } from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
 import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker-runtime';
 import { ContainerManager } from '../../orchestrator/server/utils/container';
-import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
 import { zeroUserEnvVars } from '../../orchestrator/server/utils/user-env-store';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import { extractBundle } from '../../orchestrator/server/utils/worker-export';
-import type { Config } from '../../orchestrator/server/utils/config';
-import { usePortMappingStore, useDomainMappingStore } from '../../orchestrator/server/utils/services';
+import { useConfig, useWorkerStore, usePortMappingStore, useDomainMappingStore } from '../../orchestrator/server/utils/services';
 import { useWorkerConfigStore } from '../../orchestrator/server/utils/worker-config-store';
+import { useManagedVolumeManager } from '../../orchestrator/server/utils/managed-volume-manager';
+import { assertOfflineArchiveHelpersSettled } from '../../orchestrator/server/utils/incus-offline-archive-helper';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 (globalThis as any).useLogCollector ??= () => ({ attach: async () => {}, detach() {} });
@@ -27,16 +26,21 @@ import { useWorkerConfigStore } from '../../orchestrator/server/utils/worker-con
 test('real production running, stopped and archived native export preserves canonical metadata without changing source compute', async () => {
   test.skip(process.env.INCUS_BACKUP_CAPTURE_TEST !== 'true', 'Explicit serial disposable native backup gate');
   test.setTimeout(600_000);
-  const dataDir = await mkdtemp(join(tmpdir(), 'agentor-native-backup-live-'));
-  const config = { dataDir, containerPrefix: 'agentor-worker', incusEnabled: true,
+  // Core export also fences the global managed-storage registry. Share its
+  // actual config/store; never erase the explicit service DATA_DIR on cleanup.
+  const config = useConfig();
+  Object.assign(config, { containerPrefix: 'agentor-worker', incusEnabled: true,
     incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor', incusNetwork: 'incusbr0',
     incusStoragePool: 'default', incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase9-host-mounts',
     incusInternalGatewayUrl: 'http://10.159.68.1:38000',
     incusClientCertPath: '/workspace/agentor-incus-tls/client.crt',
     incusClientKeyPath: '/workspace/agentor-incus-tls/client.key',
-    incusServerCertPath: '/workspace/agentor-incus-tls/server.crt' } as Config;
-  const id = randomUUID(), owner = { id, userId: 'native-backup-gate', containerName: 'agentor-worker-' + id };
-  const store = new WorkerStore(dataDir); await store.init();
+    incusServerCertPath: '/workspace/agentor-incus-tls/server.crt' });
+  const id = randomUUID(), owner = { id, userId: 'native-backup-' + randomUUID(), containerName: 'agentor-worker-' + id };
+  const dataDir = join(config.dataDir, 'native-backup-proof-' + id);
+  await mkdir(dataDir, { mode: 0o700 });
+  const store = useWorkerStore(); await store.init(); await useManagedVolumeManager().init();
+  await assertOfflineArchiveHelpersSettled(config.dataDir);
   const runtime = new IncusWorkerRuntime(config);
   const docker = new Proxy({}, { get: () => () => { throw new Error('Native export must not use Docker'); } });
   const manager = new ContainerManager(docker as any, config);
@@ -49,7 +53,7 @@ test('real production running, stopped and archived native export preserves cano
   try {
     await store.upsert({ id, userId: owner.userId, status: 'active', runtimeKind: 'incus-vm',
       displayName: 'Native archive gate', desiredRuntimeStatus: 'running' } as any);
-    console.info('Exact native backup fixture', { dataDir, installation: await backupInstallationId(dataDir), ...owner });
+    console.info('Exact native backup fixture', { dataDir, serviceDataDir: config.dataDir, installation: await backupInstallationId(config.dataDir), ...owner });
     submitted = true;
     const instance = await runtime.create({ ...owner, start: true, dockerEnabled: false,
       userEnv: zeroUserEnvVars(owner.userId), environmentJson: environment, capabilitiesJson: [], instructionsJson: [],
@@ -181,7 +185,7 @@ with tarfile.open(sys.argv[1],'r:gz') as archive:
       expect((await run('/usr/bin/tar', ['-xzOf', offline.agentsPath!, '.agent-data/.codex/sessions'])).stdout)
         .toBe('persistent-agent-session');
       expect(await canonical()).toEqual(baseline);
-      expect(await readdir(join(dataDir, 'incus-backup-helpers'))).toEqual([]);
+      expect(await readdir(join(config.dataDir, 'incus-backup-helpers'))).toEqual([]);
       if (mode === 'stopped') {
         const current = await runtime.client.getInstance(owner.containerName);
         expect(current.status).toBe('Stopped'); expect(current.devices).toEqual(original.devices);
@@ -189,22 +193,26 @@ with tarfile.open(sys.argv[1],'r:gz') as archive:
       }
     }
     expect(seenHelpers.size).toBe(2);
-    await runtime.remove(owner, incarnation); await runtime.removeStorage(owner); cleaned = true;
+    await assertOfflineArchiveHelpersSettled(config.dataDir);
+    await runtime.remove(owner, incarnation); await runtime.removeStorage(owner);
+    await store.delete(owner.userId, id); manager.unregisterExternal(id); cleaned = true;
     console.info('Production running/stopped/archived canonical exports, binary metadata, readonly networkless helpers and unchanged source authority verified');
   } catch (error) { failure = error; console.error('Native backup capture gate failed', error); throw error; }
   finally {
     let cleanupError: unknown;
     try {
-      if (submitted && !cleaned && incarnation) {
-        await runtime.remove(owner, incarnation); await runtime.removeStorage(owner); cleaned = true;
+      if (!failure && submitted && !cleaned && incarnation) {
+        await assertOfflineArchiveHelpersSettled(config.dataDir);
+        await runtime.remove(owner, incarnation); await runtime.removeStorage(owner);
+        await store.delete(owner.userId, id); manager.unregisterExternal(id); cleaned = true;
       }
     } catch (error) {
       cleanupError = error;
       console.error('Captured native backup fixture cleanup failed; diagnostic authority retained', error);
     } finally {
       runtime.client.dispose();
-      if (cleaned || !submitted) await rm(dataDir, { recursive: true, force: true });
-      else console.error('Native backup fixture retained for identity recovery', { dataDir, incarnation, ...owner });
+      if (!cleaned && submitted) console.error('Native backup fixture and helper authority retained for identity recovery', {
+        dataDir, serviceDataDir: config.dataDir, incarnation, ...owner });
     }
     if (cleanupError && !failure) throw cleanupError;
   }
