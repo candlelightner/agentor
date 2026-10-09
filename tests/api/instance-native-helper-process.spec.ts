@@ -80,6 +80,8 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
   : 'real controlled helper process restores retained native data and restarts only its exact recovery target', async () => {
   const originalPublic = mode === 'app-rest-ordinary' && process.env.INCUS_ORIGINAL_PUBLIC_TEST === 'true';
   const historical = mode === 'app-rest-ordinary' && process.env.INCUS_HISTORICAL_INSTANCE_TEST === 'true';
+  const historicalOperatorCanary = process.env.INCUS_HISTORICAL_OPERATOR_CANARY_TEST === 'true';
+  if (historicalOperatorCanary && !historical) throw new Error('Operator canary tail requires the selected historical REST case');
   const newPublic = mode === 'app-rest-ordinary' && process.env.INCUS_NEW_PUBLIC_TEST === 'true';
   const customPublic = mode === 'app-rest-ordinary' && process.env.INCUS_CUSTOM_IMAGE_PUBLIC_TEST === 'true';
   const customBackup = customPublic && process.env.INCUS_CUSTOM_IMAGE_BACKUP_TEST === 'true';
@@ -97,7 +99,7 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
   const retryArtifactId = process.env.INCUS_CUSTOM_IMAGE_BACKUP_RETRY_ARTIFACT_ID;
   if (retryArtifactId && (!customBackup || retryArtifactId !== 'eab8a1c9-20f1-44dc-8d68-a9985fe6c8dc'))
     throw new Error('Same-artifact retry requires the exact accepted custom encrypted artifact');
-  test.setTimeout(customPublic ? 5_400_000 : 900_000);
+  test.setTimeout(customPublic ? 5_400_000 : historicalOperatorCanary ? 2_400_000 : 900_000);
   let custom: { version: 1; project: string; projectMarker: string; credentialsDir: string; tlsRoot: string;
     seedFingerprint: string; converterStoragePool: string; workerImage: string; workerImageId: string;
     incusWorkerImage: string; network: string; internalGatewayHost: string; appBaseImage?: string; appBaseImageId?: string } | undefined;
@@ -298,6 +300,8 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
       .toContain('replaceOriginalWorkspaceFromBackup'); // Cheap packaging seam before native source allocation.
     if (newPublic) expect(await readFile(join(build, 'app-output/server/chunks/nitro/nitro.mjs'), 'utf8'))
       .toContain('importWorkerFromBackup');
+    if (historicalOperatorCanary) expect(await readFile(join(build, 'app-output/server/incus-canary.mjs'), 'utf8'))
+      .toContain('runIncusCanary'); // Cheap packaging preflight before source/helper allocation.
     if (customPublic) {
       expect(await readFile(join(build, 'app-output/server/chunks/nitro/nitro.mjs'), 'utf8')).toContain('IncusWorkerImageManager');
       const current = join(local, 'current-bootstrap');
@@ -1850,6 +1854,71 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
       expect(originalRecords[0]).toMatchObject({ id, runtimeKind: 'legacy-docker', desiredRuntimeStatus: 'stopped' });
       expect((await appRequest('/api/containers/' + id, undefined, true, 120_000, undefined, undefined, 'DELETE')).status).toBe(200);
       expect(await historicalDirectories()).toBe(historicalSource!.directoryIdentity);
+      if (historicalOperatorCanary) {
+        const controller = JSON.parse(await root(`sudo docker inspect ${targetId} --format '{{json .}}'`)) as {
+          Id: string; Image: string; State: { Running: boolean }; Config: { Labels: Record<string, string>; Env: string[] };
+          Mounts: Array<{ Type: string; Source: string; Destination: string; RW: boolean }>;
+        };
+        expect(controller).toMatchObject({ Id: targetId, Image: imageId, State: { Running: true } });
+        expect(controller.Config.Labels['agentor.native-helper-fixture']).toBe(jobId);
+        expect(controller.Mounts).toContainEqual(expect.objectContaining({ Source: remoteData, Destination: remoteData, RW: true }));
+        for (const name of ['client.crt', 'client.key', 'server.crt']) expect(controller.Mounts)
+          .toContainEqual(expect.objectContaining({ Type: 'bind', Source: tlsRoot + '/' + name, Destination: '/tls/' + name, RW: false }));
+        for (const value of ['INCUS_ENABLED=true', 'INCUS_PROJECT=' + config.incusProject, 'INCUS_WORKER_IMAGE=' + config.incusWorkerImage,
+          'INCUS_INTERNAL_GATEWAY_URL=' + config.incusInternalGatewayUrl]) expect(controller.Config.Env.includes(value)).toBe(true);
+        const packagedHash = createHash('sha256').update(await readFile(join(build, 'app-output/server/incus-canary.mjs'))).digest('hex');
+        expect((await root(`sudo docker exec ${targetId} sha256sum /app/.output/server/incus-canary.mjs`)).split(/\s/)[0]).toBe(packagedHash);
+        const selected = await runtime.client.getImageAlias(config.incusWorkerImage);
+        const selectedImage = incusImageIdentity(await runtime.client.getImage(selected.target));
+        expect(selectedImage.bootstrapGeneration).toBe('3'); expect(selected.type).toBe('virtual-machine');
+        const capacity = await runtime.client.request<{ space: { total: number; used: number } }>('GET',
+          '/1.0/storage-pools/' + encodeURIComponent(config.incusStoragePool) + '/resources');
+        expect(Number.isSafeInteger(capacity.space.total) && Number.isSafeInteger(capacity.space.used) && capacity.space.used >= 0).toBe(true);
+        expect(capacity.space.total - capacity.space.used, 'Two default 10GiB roots, one 1GiB Docker block and bounded scratch headroom').toBeGreaterThanOrEqual(24 * 1024 ** 3);
+        const memory = Number(await root(`sudo awk '/^MemAvailable:/ {print $2}' /proc/meminfo`));
+        expect(Number.isSafeInteger(memory), 'Read-only available guest-host memory observation').toBe(true);
+        expect(memory * 1024, 'Two 1024m canary workers plus controller headroom').toBeGreaterThanOrEqual(2.5 * 1024 ** 3);
+        const beforeWorkers = (await appRequest<Array<{ id: string; userId: string; runtimeKind: string; containerId: string }>>('/api/containers')).body
+          .map(v => ({ id: v.id, userId: v.userId, runtimeKind: v.runtimeKind, containerId: v.containerId }));
+        // Existing fixed account policy only; historical restore itself grants
+        // no native runtime authority. Unknown canary outcomes retain this delta.
+        await policy(true); policyAdded = true;
+        const invoke = String.raw`import{spawn}from'node:child_process';
+const parts=[];let length=0;for await(const part of process.stdin){length+=part.length;if(length>16384)throw Error('Private auth input exceeds bound');parts.push(part)}
+const auth=JSON.parse(Buffer.concat(parts).toString());const base='http://127.0.0.1:3000';
+const signed=await fetch(base+'/api/auth/sign-in/email',{method:'POST',headers:{Origin:base,'Content-Type':'application/json'},body:JSON.stringify({email:auth.email,password:auth.password})});
+if(!signed.ok)throw Error('Private canary sign-in failed');const user=(await signed.json()).user;if(user?.id!==auth.owner||user?.role!=='admin')throw Error('Private canary owner changed');
+const cookie=signed.headers.getSetCookie().map(v=>v.split(';')[0]).join('; ');if(!cookie)throw Error('Private canary session missing');
+const child=spawn(process.execPath,['/app/.output/server/incus-canary.mjs'],{stdio:['pipe','pipe','pipe']});let timer;
+const output=await new Promise((resolve,reject)=>{const chunks=[];let bytes=0,errors=0;
+child.stdout.on('data',part=>{bytes+=part.length;if(bytes>65536){child.kill();reject(Error('Canary output bound'))}else chunks.push(part)});
+child.stderr.on('data',part=>{errors+=part.length;if(errors>65536){child.kill();reject(Error('Canary private error bound'))}});
+child.on('error',()=>reject(Error('Packaged canary launch failed')));child.on('close',code=>{clearTimeout(timer);try{const v=JSON.parse(Buffer.concat(chunks).toString());
+if(!['passed','failed'].includes(v.status)||typeof v.stage!=='string'||!/^[a-z-]{1,60}$/.test(v.stage)||!Array.isArray(v.workers)||!Array.isArray(v.environments))throw Error();
+const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;if(!v.workers.every(w=>uuid.test(w?.id)&&(!w.incarnation||uuid.test(w.incarnation)))||!v.environments.every(id=>uuid.test(id)))throw Error();
+resolve({code,status:v.status,stage:v.stage,workers:v.workers.map(w=>({id:w.id,incarnation:w.incarnation})),environments:v.environments})}catch{reject(Error('Canary response invalid'))}});
+timer=setTimeout(()=>{child.kill();reject(Error('Canary deadline'))},1250000);
+child.stdin.end(JSON.stringify({sessionCookie:cookie,dockerEnabled:true}));});console.log(JSON.stringify(output));`;
+        const response = await new Promise<string>((resolve, reject) => {
+          const child = execFile('ssh', [...ssh, `sudo docker exec -i ${targetId} node --input-type=module -e ${quote(invoke)}`],
+            { timeout: 1_300_000, maxBuffer: 65536 }, (error, stdout) => error ? reject(new Error('Exact packaged canary failed; private diagnostics withheld')) : resolve(stdout.trim()));
+          child.stdin!.on('error', () => reject(new Error('Private canary input failed')));
+          child.stdin!.end(JSON.stringify({ email: admin.email, password: admin.password, owner: userId }));
+        });
+        const canary = JSON.parse(response) as { code: number; status: string; stage: string; workers: Array<{ id: string }>; environments: string[] };
+        // Only safe, positively captured IDs are exposed on an unknown result.
+        console.info('Packaged operator canary result', { code: canary.code, status: canary.status, stage: canary.stage,
+          workers: canary.workers.map(v => v.id), environments: canary.environments });
+        expect(canary).toMatchObject({ code: 0, status: 'passed', stage: 'complete', workers: [], environments: [] });
+        expect((await appRequest<Array<{ id: string; userId: string; runtimeKind: string; containerId: string }>>('/api/containers')).body
+          .map(v => ({ id: v.id, userId: v.userId, runtimeKind: v.runtimeKind, containerId: v.containerId }))).toEqual(beforeWorkers);
+        expect(await root(`sudo docker inspect ${targetId} --format '{{.Id}} {{.Image}} {{index .Config.Labels "agentor.native-helper-fixture"}} {{.State.Running}}'`)).toBe(`${targetId} ${imageId} ${jobId} true`);
+        await policy(false); policyAdded = false;
+        expect(await historicalDirectories()).toBe(historicalSource!.directoryIdentity);
+        expect(JSON.parse(await root(`sudo python3 -c ${quote(historicalHostMetadata())} read`))).toEqual(historicalSource!.bytes);
+        expect(JSON.parse(await root(`sudo cat ${quote(historicalSource!.dataDir + '/users/' + userId + '/workers.json')}`))).toEqual(originalRecords);
+        expect((await runtime.client.getImageAlias(config.incusWorkerImage)).target).toBe(selected.target);
+      }
       completed = true;
       console.info('Supported runtime-less v1 public instance restore stayed legacy with Incus enabled; exact disposable source compute retired only after authenticated capture; original DATA/records/linked bytes/ciphertext and stopped controller retained',
         { local, remote, jobId, restoreJobId, targetId, sourceController: historicalSource!.controllerId, sourceData: historicalSource!.dataDir, workerId: id });
