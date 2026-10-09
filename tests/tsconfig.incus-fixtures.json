@@ -2,6 +2,7 @@
   "extends": "../orchestrator/.nuxt/tsconfig.server.json",
   "compilerOptions": { "noEmit": true, "rootDir": "..", "esModuleInterop": true },
   "include": [
+    "api/incus-startup-reconciliation.spec.ts",
     "api/incus-host-setup-live.spec.ts",
     "api/incus-deployment-config.spec.ts",
     "api/legacy-incus-migration-capture-live.spec.ts",

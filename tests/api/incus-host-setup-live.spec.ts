@@ -8,7 +8,7 @@ import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { IncusClient } from '../../orchestrator/server/utils/incus-client';
+import { IncusClient, type IncusInstance, type IncusCustomVolume } from '../../orchestrator/server/utils/incus-client';
 import { incusImageIdentity } from '../../orchestrator/server/utils/incus-worker-image';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import { resolveIncusPrimaryLease } from '../../orchestrator/server/utils/incus-worker-network';
@@ -351,15 +351,21 @@ test('operator Incus setup repeats without changing retained resources and boots
   }
 });
 
-test('accepted operator setup survives one host reboot and normal same-image redeploy with worker persistence', async () => {
-  test.skip(process.env.INCUS_HOST_SETUP_REBOOT_TEST !== 'true', 'Root-exclusive single approved host reboot follow-up');
+test(process.env.INCUS_HOST_SETUP_POSTBOOT_TEST === 'true'
+  ? process.env.INCUS_HOST_SETUP_POSTBOOT_REBOOT_TEST === 'true'
+    ? 'captured postboot canary validates one corrected-package reboot and same-image redeploy'
+    : 'captured postboot canary recovers through normal corrected startup and same-image redeploy without another reboot'
+  : 'accepted operator setup survives one host reboot and normal same-image redeploy with worker persistence', async () => {
+  const postboot = process.env.INCUS_HOST_SETUP_POSTBOOT_TEST === 'true';
+  test.skip(process.env.INCUS_HOST_SETUP_REBOOT_TEST !== 'true' && !postboot, 'Root-exclusive approved reboot/postboot follow-up');
   test.setTimeout(20 * 60_000);
   const contextPath = process.env.INCUS_HOST_SETUP_ACCEPTED_JSON;
   if (!contextPath) throw new Error('Explicit private accepted setup context required; do not rediscover/adopt a fixture');
   const fd = await open(contextPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   let c: { fixtureId: string; local: string; remote: string; hostData: string; installation: string; appId: string; imageId: string;
     project: string; network: string; pool: string; configPath: string; owner: string; workerImage: string; hostBootId: string; controller: DockerInfo;
-    first: Record<string, string>; firstConfig: { internalUrl: string; defaultImage: { phase: string; fingerprint: string; sourceImageId: string } }; certificates: string };
+    first: Record<string, string>; firstConfig: { internalUrl: string; defaultImage: { phase: string; fingerprint: string; sourceImageId: string } };
+    certificates: string; canaryInstance?: IncusInstance; guardImageId?: string };
   try { const s = await fd.stat(); expect(s.isFile() && s.uid === process.getuid?.() && !(s.mode & 0o077) && s.size < 128 * 1024).toBe(true);
     c = JSON.parse(await fd.readFile('utf8')) as typeof c;
   } finally { await fd.close(); }
@@ -381,7 +387,12 @@ test('accepted operator setup survives one host reboot and normal same-image red
   let client: IncusClient | undefined, tunnel: ChildProcess | undefined;
   const root = async (command: string, timeout = 30_000) => {
     try { return (await run('ssh', [...sshArgs, command], { timeout, maxBuffer: 4 * 1024 * 1024 })).stdout.trim(); }
-    catch { throw new Error('Owned setup reboot follow-up failed during ' + phase + '; credential-bearing diagnostics withheld'); }
+    catch (error) {
+      const failure = error as { code?: string | number; signal?: string; stdout?: string; stderr?: string };
+      await writeFile(join(c.local, 'failed-reboot-command-' + randomUUID() + '.json'), JSON.stringify({ phase, code: failure.code, signal: failure.signal,
+        stdout: failure.stdout?.slice(0, 4 * 1024 * 1024), stderr: failure.stderr?.slice(0, 4 * 1024 * 1024) }), { mode: 0o600, flag: 'wx' });
+      throw new Error('Owned setup reboot follow-up failed during ' + phase + '; credential-bearing diagnostics withheld');
+    }
   };
   const inspect = async (id: string): Promise<DockerInfo> => JSON.parse(await root(`sudo docker inspect ${q(id)} --format ${q(dockerInspectFormat)}`));
   const request = async <T,>(path: string, body?: unknown, method = body === undefined ? 'GET' : 'POST', timeout = 30_000): Promise<{ status: number; body: T }> =>
@@ -439,7 +450,7 @@ test('accepted operator setup survives one host reboot and normal same-image red
       INCUS_SERVER_CERT_PATH: '/run/agentor-incus/server.crt', INCUS_NETWORK_HOST_SERVER_CERT_PATH: '/run/agentor-incus/policy.crt' });
     const mounts = before.Mounts.map(m => { if (m.Type !== 'bind') throw new Error('Unexpected controller mount');
       return '--mount ' + q('type=bind,src=' + m.Source + ',dst=' + m.Destination + (m.RW ? '' : ',readonly')); }).join(' ');
-    appId = await root(`sudo docker run -d --name ${q('agentor-host-setup-' + c.fixtureId)} --label agentor.host-setup-fixture=${c.fixtureId} --network agentor-phase6-net ` +
+    appId = await root(`sudo docker run -d --restart unless-stopped --name ${q('agentor-host-setup-' + c.fixtureId)} --label agentor.host-setup-fixture=${c.fixtureId} --network agentor-phase6-net ` +
       `--add-host agentor-kata-preflight:172.22.0.1 ${mounts} -p ${q(c.first.INCUS_WORKER_GATEWAY + ':' + c.first.INCUS_INTERNAL_PORT + ':3000')} ` +
       `${Object.entries(env).map(([name, value]) => '-e ' + q(name + '=' + value)).join(' ')} ${q(c.imageId)} node .output/server/index.mjs`);
     expect(appId).toMatch(/^[a-f0-9]{64}$/);
@@ -449,15 +460,46 @@ test('accepted operator setup survives one host reboot and normal same-image red
     controllerReceipt = acknowledged;
     await expect.poll(async () => { try { return (await request('/api/health')).status; } catch { return 0; } }, { timeout: 120_000 }).toBe(200);
   };
+  let canary: { fixtureId: string; controller: DockerInfo; worker: Worker; incarnation: string; guestBoot: string;
+    volumes: IncusCustomVolume[]; hostBootId: string } | undefined;
+  if (postboot) {
+    const receipt = process.env.INCUS_HOST_SETUP_CANARY_JSON;
+    if (receipt !== join(c.local, 'reboot-canary.json')) throw new Error('Explicit exact original canary receipt required');
+    const fd = await open(receipt, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try { const s = await fd.stat(); expect(s.isFile() && s.uid === process.getuid?.() && !(s.mode & 0o077) && s.size < 32768).toBe(true);
+      canary = JSON.parse(await fd.readFile('utf8')) as NonNullable<typeof canary>;
+    } finally { await fd.close(); }
+    expect(canary.fixtureId).toBe(c.fixtureId); expect(canary.worker.id).toMatch(/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/);
+    expect(canary.incarnation).toMatch(/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/); expect(canary.worker.containerId).toBe('incus:' + canary.incarnation);
+    expect(canary.worker).toMatchObject({ runtimeKind: 'incus-vm', userId: c.owner, containerName: 'as' + short + '-' + canary.worker.id });
+    expect(canary.hostBootId).not.toBe(c.hostBootId); expect(canary.guestBoot).toMatch(/^[a-f0-9-]{36}$/);
+    expect(c.canaryInstance?.config).toMatchObject({ 'volatile.uuid': canary.incarnation, 'volatile.base_image': c.firstConfig.defaultImage.fingerprint,
+      'user.agentor.installation': c.installation, 'user.agentor.id': canary.worker.id, 'user.agentor.owner': c.owner });
+    expect(canary.volumes.map(volume => volume.name).sort()).toEqual(['workspace', 'agents'].map(role => canary!.worker.containerName + '-' + role).sort());
+  }
   try {
     expect(await root('hostname')).toBe('agentor-kata-preflight'); expect(await root('cat /proc/sys/kernel/random/boot_id')).toBe(c.hostBootId);
     expect(c.controller.Id).toBe(c.appId); expect(c.controller.Image).toBe(c.imageId); await controllerFence(c.controller);
     expect(await config()).toEqual(c.firstConfig); expect(await certHashes()).toBe(c.certificates);
     expect(await root(`sudo docker image inspect ${q(c.workerImage)} --format '{{.Id}}'`)).toBe(c.firstConfig.defaultImage.sourceImageId);
     const original = JSON.parse(await root(`sudo python3 -c ${q(baselineScript)} boot-authority`)) as Record<string, string>;
+    const foreignBaselinePath = join(c.local, 'foreign-reboot-baseline-' + randomUUID() + '.json');
+    await writeFile(foreignBaselinePath, JSON.stringify(original), { mode: 0o600, flag: 'wx' });
+    if (postboot) expect(c.canaryInstance!.devices.root).toMatchObject({ type: 'disk', path: '/', pool: c.pool });
+    const ownedPostbootKeys = new Set(postboot ? ['vm/' + c.project + '/' + canary!.worker.containerName,
+      'volume/' + c.canaryInstance!.devices.root!.pool + '/' + c.project + '/virtual-machine/' + canary!.worker.containerName,
+      ...canary!.volumes.map(volume => 'volume/' + c.pool + '/' + c.project + '/custom/' + volume.name)] : []);
     const assertOriginal = async () => { const now = JSON.parse(await root(`sudo python3 -c ${q(baselineScript)} boot-authority`)) as Record<string, string>;
-      for (const [key, value] of Object.entries(original)) if (key !== 'docker/' + c.appId) expect(now[key], key).toBe(value); };
+      for (const [key, value] of Object.entries(original)) if (key !== 'docker/' + c.appId && !ownedPostbootKeys.has(key)) expect(now[key], key).toBe(value); };
+    let vm: IncusInstance, volumes: IncusCustomVolume[], guestBoot: string, controller: DockerInfo, receiptPath: string, hostBoot = '';
+    if (!postboot) {
     expect(await root(`sudo docker image inspect ${q(c.imageId)} --format '{{index .Config.Labels "agentor.admin.overlay"}}'`)).not.toBe('true');
+    if (process.env.INCUS_HOST_SETUP_REBOOT_REUSE_GUARD_TEST === 'true') {
+      expect(c.guardImageId).toBe('sha256:e5fa074437f471c62b449d5df6733e98eaf6e185f2658c03e46a4886629cfdf2');
+      const guard = JSON.parse(await root(`sudo cat ${q(c.hostData + '/admin/workspace.v1.json')}`)) as AdministrativeWorkspaceRecord;
+      expect(guard).toMatchObject({ schemaVersion: 1, kind: 'administrative', trusted: true, status: 'stopped', imageDigest: c.guardImageId });
+      expect(await root(`sudo docker image inspect ${q(c.guardImageId!)} --format '{{index .Config.Labels "agentor.admin.overlay"}}'`)).not.toBe('true');
+    } else {
     const stamp = new Date().toISOString(), guard: AdministrativeWorkspaceRecord = { schemaVersion: 1, id: randomUUID(), kind: 'administrative',
       trusted: true, status: 'stopped', createdAt: stamp, updatedAt: stamp, imageDigest: c.imageId };
     // Deliberate existing provenance guard, not recovery mode: normal worker
@@ -466,25 +508,34 @@ test('accepted operator setup survives one host reboot and normal same-image red
     const guardPath = join(c.local, 'reboot-admin-guard.json'); await writeFile(guardPath, JSON.stringify(guard), { mode: 0o600, flag: 'wx' });
     await run('scp', [...scp, guardPath, 'kata-test@172.19.0.1:' + c.remote + '/transport/reboot-admin-guard.json'], { timeout: 30_000 });
     await root(`sudo mkdir -m 700 -p ${q(c.hostData + '/admin')} && sudo cp --no-clobber ${q(c.remote + '/transport/reboot-admin-guard.json')} ${q(c.hostData + '/admin/workspace.v1.json')}`);
+    }
     phase = 'normal controller startup before one host reboot'; await normalRedeploy(); await connect();
     const environment = await request<{ id: string }>('/api/environments', { name: 'Host reboot canary', networkMode: 'full', dockerEnabled: false, cpuLimit: 1, memoryLimit: '1024m' });
     expect(environment.status).toBe(201);
     const created = await request<Worker>('/api/containers', { displayName: 'Host reboot persistence', environmentId: environment.body.id }, 'POST', 300_000);
     expect(created.status).toBe(201); worker = created.body; expect(worker).toMatchObject({ runtimeKind: 'incus-vm', userId: c.owner, status: 'running' });
-    const vm = await client!.getInstance(worker.containerName); incarnation = vm.config['volatile.uuid']; expect(worker.containerId).toBe('incus:' + incarnation);
+    vm = await client!.getInstance(worker.containerName); incarnation = vm.config['volatile.uuid']; expect(worker.containerId).toBe('incus:' + incarnation);
     expect(vm.config).toMatchObject({ 'user.agentor.installation': c.installation, 'user.agentor.id': worker.id, 'user.agentor.owner': c.owner });
-    const volumes = await Promise.all(['workspace', 'agents'].map(role => client!.getCustomVolume(c.pool, worker!.containerName + '-' + role)));
+    volumes = await Promise.all(['workspace', 'agents'].map(role => client!.getCustomVolume(c.pool, worker!.containerName + '-' + role)));
     const initial = await client!.exec(worker.containerName, ['bash', '-ec', 'printf reboot-workspace >/workspace/reboot-proof; printf reboot-agent >/home/agent/.agent-data/reboot-proof; cat /proc/sys/kernel/random/boot_id']);
-    expect(initial.returnCode).toBe(0); const guestBoot = initial.stdout.trim(), controller = await inspect(appId);
+    expect(initial.returnCode).toBe(0); guestBoot = initial.stdout.trim(); controller = await inspect(appId);
     expect(guestBoot).toMatch(/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/);
-    const receiptPath = join(c.local, 'reboot-canary.json'); await writeFile(receiptPath, JSON.stringify({ fixtureId: c.fixtureId, appId, controller, worker, incarnation, guestBoot, volumes, hostBootId: c.hostBootId }), { mode: 0o600, flag: 'wx' });
+    receiptPath = join(c.local, 'reboot-canary.json'); await writeFile(receiptPath, JSON.stringify({ fixtureId: c.fixtureId, appId, controller, worker, incarnation, guestBoot, volumes, hostBootId: c.hostBootId }), { mode: 0o600, flag: 'wx' });
     await assertOriginal(); await closedTunnel();
     phase = 'one approved disposable host reboot; loss of SSH acknowledgement never authorizes replay';
     rebootDispatched = true; await root('sudo systemctl reboot', 15_000).catch(() => {});
-    let hostBoot = '';
     await expect.poll(async () => { try { expect(await root('hostname', 10_000)).toBe('agentor-kata-preflight');
       hostBoot = await root('cat /proc/sys/kernel/random/boot_id', 10_000); return /^[a-f0-9-]{36}$/.test(hostBoot) && hostBoot !== c.hostBootId;
     } catch { return false; } }, { timeout: 240_000, intervals: [1000, 2000] }).toBe(true);
+    } else {
+      worker = canary!.worker; incarnation = canary!.incarnation; guestBoot = canary!.guestBoot; volumes = canary!.volumes;
+      vm = c.canaryInstance!; controller = c.controller; receiptPath = join(c.local, 'reboot-canary.json'); hostBoot = c.hostBootId;
+      const guard = JSON.parse(await root(`sudo cat ${q(c.hostData + '/admin/workspace.v1.json')}`)) as AdministrativeWorkspaceRecord;
+      if (c.guardImageId !== undefined) expect(c.guardImageId).toBe('sha256:e5fa074437f471c62b449d5df6733e98eaf6e185f2658c03e46a4886629cfdf2');
+      expect(guard).toMatchObject({ schemaVersion: 1, kind: 'administrative', trusted: true, status: 'stopped', imageDigest: c.guardImageId ?? canary!.controller.Image });
+      expect(await root(`sudo docker image inspect ${q(guard.imageDigest!)} --format '{{index .Config.Labels "agentor.admin.overlay"}}'`)).not.toBe('true');
+      expect(await root(`sudo docker inspect ${controller.Id} --format '{{range .Config.Env}}{{if eq . "AGENTOR_INSTANCE_RECOVERY_MODE=false"}}normal{{end}}{{end}}'`)).toBe('normal');
+    }
     phase = 'normal automatic routing/filtering/provisioning after host reboot';
     const stopped = await controllerFence(controller);
     if (!stopped.State.Running) expect(await root(`sudo docker start ${controller.Id}`)).toBe(controller.Id); // Same acknowledged ID, not recreation.
@@ -509,15 +560,44 @@ test('accepted operator setup survives one host reboot and normal same-image red
     for (const volume of volumes) { const current = await client!.getCustomVolume(c.pool, volume.name);
       expect({ ...current, used_by: [...current.used_by].sort() }).toEqual({ ...volume, used_by: [...volume.used_by].sort() }); }
     expect(await config()).toEqual(c.firstConfig); expect(await certHashes()).toBe(c.certificates); await assertOriginal();
+    if (postboot && process.env.INCUS_HOST_SETUP_POSTBOOT_REBOOT_TEST === 'true') {
+      phase = 'corrected package actual host reboot after captured recovery validation';
+      const beforeHost = await root('cat /proc/sys/kernel/random/boot_id'), beforeGuest = afterBoot.stdout.trim(), rebootController = await controllerFence(controllerReceipt);
+      const currentVm = await client!.getInstance(worker.containerName); expect(currentVm.config['volatile.uuid']).toBe(incarnation);
+      const correctedReceipt = join(c.local, 'corrected-reboot-canary.json');
+      await writeFile(correctedReceipt, JSON.stringify({ fixtureId: c.fixtureId, appId, controller: rebootController, worker, incarnation,
+        guestBoot: beforeGuest, hostBootId: beforeHost, vm: currentVm, volumes }), { mode: 0o600, flag: 'wx' });
+      await closedTunnel(); rebootDispatched = true; await root('sudo systemctl reboot', 15_000).catch(() => {});
+      await expect.poll(async () => { try { expect(await root('hostname', 10_000)).toBe('agentor-kata-preflight');
+        hostBoot = await root('cat /proc/sys/kernel/random/boot_id', 10_000); return /^[a-f0-9-]{36}$/.test(hostBoot) && hostBoot !== beforeHost;
+      } catch { return false; } }, { timeout: 240_000, intervals: [1000, 2000] }).toBe(true);
+      const controlAfter = await controllerFence(rebootController);
+      if (!controlAfter.State.Running) expect(await root(`sudo docker start ${rebootController.Id}`)).toBe(rebootController.Id);
+      await expect.poll(async () => { try { return (await request('/api/health')).status; } catch { return 0; } }, { timeout: 120_000 }).toBe(200);
+      await expect.poll(async () => { try { return (await root(checker)).includes('Read-only prerequisites checked'); } catch { return false; } }, { timeout: 120_000, intervals: [1000, 2000] }).toBe(true);
+      await connect(); await expect.poll(async () => { try { await ready(); return true; } catch { return false; } }, { timeout: 240_000, intervals: [500, 1000] }).toBe(true);
+      const bootAfter = await client!.exec(worker.containerName, ['cat', '/proc/sys/kernel/random/boot_id']); expect(bootAfter.returnCode).toBe(0);
+      expect(bootAfter.stdout.trim()).toMatch(/^[a-f0-9-]{36}$/); expect(bootAfter.stdout.trim()).not.toBe(beforeGuest);
+      for (const volume of volumes) { const current = await client!.getCustomVolume(c.pool, volume.name);
+        expect({ ...current, used_by: [...current.used_by].sort() }).toEqual({ ...volume, used_by: [...volume.used_by].sort() }); }
+      expect((await request('/editor/' + worker.id + '/?folder=/workspace')).status).toBe(200); expect((await request('/desktop/' + worker.id + '/agentor.html')).status).toBe(200);
+      expect(await config()).toEqual(c.firstConfig); expect(await certHashes()).toBe(c.certificates); await assertOriginal();
+    }
     phase = 'same immutable controller image/DATA redeploy after reboot'; await normalRedeploy();
     await expect.poll(async () => { try { return (await root(checker)).includes('Read-only prerequisites checked'); } catch { return false; } }, { timeout: 120_000, intervals: [1000, 2000] }).toBe(true);
     await ready(); expect((await client!.getInstance(worker.containerName)).config['volatile.uuid']).toBe(incarnation);
     expect((await request('/editor/' + worker.id + '/?folder=/workspace')).status).toBe(200); expect((await request('/desktop/' + worker.id + '/agentor.html')).status).toBe(200);
     expect((await request('/api/containers/' + worker.id, undefined, 'DELETE', 120_000)).status).toBe(200);
-    await expect(client!.getInstance(worker.containerName)).rejects.toMatchObject({ statusCode: 404 }); await assertOriginal();
-    await writeFile(join(c.local, 'accepted-reboot.json'), JSON.stringify({ fixtureId: c.fixtureId, appId, controller: await inspect(appId), imageId: c.imageId, installation: c.installation,
-      hostBoot, retiredCanary: worker, incarnation, guestBoot, receiptPath }), { mode: 0o600, flag: 'wx' }); worker = undefined;
-    console.info('One host reboot and normal same-image redeploy preserved worker identity/data and automatic source routing', { fixtureId: c.fixtureId, appId, installation: c.installation, local: c.local });
+    await expect(client!.getInstance(worker.containerName)).rejects.toMatchObject({ statusCode: 404 });
+    for (const volume of volumes) await expect(client!.getCustomVolume(c.pool, volume.name)).rejects.toMatchObject({ statusCode: 404 });
+    await assertOriginal();
+    await writeFile(join(c.local, postboot ? 'accepted-postboot.json' : 'accepted-reboot.json'), JSON.stringify({ fixtureId: c.fixtureId, appId, controller: await inspect(appId), imageId: c.imageId, installation: c.installation,
+      hostBoot, retiredCanary: worker, incarnation, guestBoot, receiptPath, foreignBaselinePath,
+      correctedRebootPerformed: postboot && process.env.INCUS_HOST_SETUP_POSTBOOT_REBOOT_TEST === 'true' }), { mode: 0o600, flag: 'wx' }); worker = undefined;
+    console.info(postboot && process.env.INCUS_HOST_SETUP_POSTBOOT_REBOOT_TEST === 'true'
+      ? 'Captured recovery plus one separately acknowledged corrected-package reboot and same-image redeploy accepted'
+      : postboot ? 'Captured postboot recovery and corrected same-image redeploy accepted without a second reboot' :
+      'One host reboot and normal same-image redeploy preserved worker identity/data and automatic source routing', { fixtureId: c.fixtureId, appId, installation: c.installation, local: c.local });
   } finally {
     await closedTunnel();
     if (worker) console.error('Unknown reboot/redeploy canary retained for exact root recovery; reboot was never replayed', { phase, appId, workerId: worker.id, incarnation, rebootDispatched, contextPath });
