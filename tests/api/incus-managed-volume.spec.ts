@@ -29,7 +29,7 @@ test('real retained compute seeds an Incus filesystem staging disk before any di
   const dataDir = await mkdtemp(join(tmpdir(), 'agentor-incus-volume-seed-'));
   const config = { dataDir, incusEnabled: true, incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor',
     incusClientCertPath: '/workspace/agentor-incus-tls/client.crt', incusClientKeyPath: '/workspace/agentor-incus-tls/client.key',
-    incusServerCertPath: '/workspace/agentor-incus-tls/server.crt', incusNetwork: 'incusbr0', incusStoragePool: 'default',
+    incusServerCertPath: '/workspace/agentor-incus-tls/server.crt', incusNetwork: 'incusbr0', incusStoragePool: process.env.INCUS_TEST_STORAGE_POOL || 'default',
     incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase7-bounded', containerPrefix: 'agentor-worker',
     incusInternalGatewayUrl: 'http://10.159.68.1:38000', workerImagePrefix: '', workerImage: 'agentor-worker:latest' } as Config;
   const runtime = new IncusWorkerRuntime(config), client = runtime.client;
@@ -135,7 +135,7 @@ async function productionManagerFixture(dockerEnabled = false) {
   const config = useConfig();
   Object.assign(config, { incusEnabled: true, incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor',
     incusClientCertPath: '/workspace/agentor-incus-tls/client.crt', incusClientKeyPath: '/workspace/agentor-incus-tls/client.key',
-    incusServerCertPath: '/workspace/agentor-incus-tls/server.crt', incusNetwork: 'incusbr0', incusStoragePool: 'default',
+    incusServerCertPath: '/workspace/agentor-incus-tls/server.crt', incusNetwork: 'incusbr0', incusStoragePool: process.env.INCUS_TEST_STORAGE_POOL || 'default',
     incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase7-bounded', containerPrefix: 'agentor-worker',
     incusInternalGatewayUrl: 'http://10.159.68.1:38000', workerImagePrefix: '', workerImage: 'agentor-worker:latest' });
   const manager = useContainerManager(), store = useWorkerStore(), volumes = useManagedVolumeManager();
@@ -1172,7 +1172,9 @@ test('real production backup selections hotplug without restart and refresh root
 
 test('real production manager applies Incus persistence without promoting pending configuration and retains detached data', async () => {
   test.skip(process.env.INCUS_MANAGED_VOLUME_TEST !== 'true', 'Explicit disposable managed-storage integration gate');
-  test.setTimeout(900_000);
+  // Six independent VM allocations exceed fifteen minutes with HDD-backed
+  // image cache; retain per-operation bounds and the complete lifecycle proof.
+  test.setTimeout(1_800_000);
   const { config, manager, store, volumes, runtime } = await productionManagerFixture();
   let info: any, volumeId: string | undefined, failed = false;
   const target = '/opt/managed-integration';

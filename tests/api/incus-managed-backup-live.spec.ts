@@ -29,7 +29,7 @@ test('real production running/stopped/archived managed export retains v6 binary 
   const config = useConfig();
   Object.assign(config, { containerPrefix: 'agentor-worker', incusEnabled: true,
     incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor', incusNetwork: 'incusbr0',
-    incusStoragePool: 'default', incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase9-host-mounts',
+    incusStoragePool: process.env.INCUS_TEST_STORAGE_POOL || 'default', incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase9-host-mounts',
     incusInternalGatewayUrl: 'http://10.159.68.1:38000',
     incusClientCertPath: '/workspace/agentor-incus-tls/client.crt',
     incusClientKeyPath: '/workspace/agentor-incus-tls/client.key',

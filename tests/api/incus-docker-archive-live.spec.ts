@@ -33,7 +33,7 @@ test('native Docker logical archive retains overlay deletions and special named-
   test.setTimeout(900_000);
   const serviceConfig = useConfig(), priorConfig = { ...serviceConfig };
   const config = { ...serviceConfig, containerPrefix: 'agentor-worker', incusEnabled: true,
-    incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor', incusNetwork: 'incusbr0', incusStoragePool: 'default',
+    incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor', incusNetwork: 'incusbr0', incusStoragePool: process.env.INCUS_TEST_STORAGE_POOL || 'default',
     incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase10-preserve-ownership',
     incusDockerVolumeSize: '1GiB', incusInternalGatewayUrl: 'http://10.159.68.1:38000',
     incusClientCertPath: '/workspace/agentor-incus-tls/client.crt', incusClientKeyPath: '/workspace/agentor-incus-tls/client.key',

@@ -55,7 +55,7 @@ print('Exact fixture policy delta '+sys.argv[2]+' confirmed')
 `) + ' ' + quote(JSON.stringify(dirs)) + ' ' + (add ? 'add' : 'remove'));
   const serviceConfig = useConfig(), priorConfig = { ...serviceConfig };
   const config = { ...serviceConfig, containerPrefix: 'agentor-worker', incusEnabled: true,
-    incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor', incusNetwork: 'incusbr0', incusStoragePool: 'default',
+    incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor', incusNetwork: 'incusbr0', incusStoragePool: process.env.INCUS_TEST_STORAGE_POOL || 'default',
     incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase10-preserve-ownership',
     incusInternalGatewayUrl: 'http://10.159.68.1:38000',
     incusClientCertPath: '/workspace/agentor-incus-tls/client.crt', incusClientKeyPath: '/workspace/agentor-incus-tls/client.key',
