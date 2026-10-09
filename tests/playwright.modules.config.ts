@@ -122,6 +122,7 @@ export default defineConfig({
     "api/incus-worker-backup-fence.spec.ts",
     "api/incus-worker-lifecycle.spec.ts",
     "api/incus-startup-reconciliation.spec.ts",
+    "api/incus-production-canary.spec.ts",
     "api/incus-applied-bootstrap.spec.ts",
     "api/incus-worker-observability.spec.ts",
     "api/incus-worker-network.spec.ts",

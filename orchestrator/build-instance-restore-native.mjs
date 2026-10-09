@@ -1,6 +1,7 @@
 import { build } from 'esbuild';
 import { nodeFileTrace } from '@vercel/nft';
-import { mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -87,5 +88,13 @@ export async function buildInstanceRestoreNative(outputDirectory = join(sourceRo
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
   if (process.argv.length > 3) throw new Error('Usage: node build-instance-restore-native.mjs [new-output-directory]');
   const result = await buildInstanceRestoreNative(process.argv[2]);
+  // The operator canary uses this existing import-checked adapter, not another
+  // dependency/build pipeline. Keep its fixed entrypoint adjacent to the tree.
+  const canary = join(sourceRoot, '../scripts/incus-canary.mjs');
+  const info = await lstat(canary);
+  if (!info.isFile() || info.isSymbolicLink() || info.size > 128 * 1024)
+    throw new Error('Operator canary must be a bounded regular source file');
+  const destination = process.argv[2] ?? join(sourceRoot, '.output/server/instance-restore-native');
+  await copyFile(canary, join(dirname(resolve(destination)), 'incus-canary.mjs'), constants.COPYFILE_EXCL);
   console.log(`Native restore adapter: ${result.bundleBytes} bytes, ${result.dependencyFiles} dependency files`);
 }

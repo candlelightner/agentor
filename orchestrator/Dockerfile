@@ -19,6 +19,7 @@ COPY orchestrator/ .
 COPY worker/vm/ /app/worker/vm/
 COPY worker/entrypoint.sh /app/worker/entrypoint.sh
 COPY scripts/build-incus-worker-image.sh /app/scripts/build-incus-worker-image.sh
+COPY scripts/incus-canary.mjs /app/scripts/incus-canary.mjs
 RUN npm run build
 
 FROM node:22-alpine

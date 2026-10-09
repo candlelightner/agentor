@@ -58,9 +58,28 @@ until a platform administrator explicitly migrates them.
    and topology values printed by setup. Run it after redeploy: the checker must
    observe the actual bridge-only internal port publication and routing rules.
    Correct every failure/unknown result before creating ordinary Incus workers.
-6. Run the required real production canary, including worker-self source identity
-   and NIC anti-spoofing, before any production worker migration. A responding
-   Incus API or passing unit tests alone is not acceptance.
+6. Run the deployed automated canary before any production worker migration.
+   Prepare a private `0600` JSON file containing the Cookie header of your current
+   signed-in platform-admin session and optionally `"dockerEnabled": true`:
+
+   ```json
+   {"sessionCookie":"<current admin Cookie header>","dockerEnabled":true}
+   ```
+
+   Run it through the existing Orchestrator (never put the cookie in arguments,
+   environment variables or logs):
+
+   ```sh
+   sudo bash scripts/run-incus-canary.sh --input-file /absolute/private/canary.json
+   ```
+
+   The canary creates two temporary ordinary workers, verifies services/proxies,
+   authoritative worker-self identity, NIC spoofing negatives, persistence and
+   optional native Docker, then removes only its acknowledged resources. Require
+   `"status":"passed"`. A failure retains captured IDs for explicit inspection;
+   do not clear markers, adopt by name or repeat an unknown creation blindly.
+   Remove the private session file when finished. An API response or unit tests
+   alone are not acceptance; legacy migrations remain explicit.
 
 Incus access is verified HTTPS with restricted-project mTLS. Do not mount
 `/var/lib/incus`, its Unix socket, or Incus credentials into any worker. Inner
