@@ -2,7 +2,7 @@
 # Operator-root only. Never migrates workers or writes canonical Agentor DATA.
 set -euo pipefail
 exec python3 - "$0" "$@" <<'PY'
-import argparse, hashlib, importlib.util, io, ipaddress, json, os, re, shlex, shutil, socket, ssl, stat, subprocess, sys, tarfile, tempfile
+import argparse, fcntl, hashlib, importlib.util, io, ipaddress, json, os, re, shlex, shutil, socket, ssl, stat, subprocess, sys, tarfile, tempfile, time
 from pathlib import Path
 from urllib.parse import quote
 from urllib.request import urlopen
@@ -17,6 +17,8 @@ MARKER = "user.agentor.installation"
 ZABBLY_FINGERPRINT = "4EFC590696CB15B87C73A3AD82CC8797C838DCFD"
 ZABBLY_URL = "https://pkgs.zabbly.com/incus/lts-6.0"
 EMPTY_SHARE_ROOT = Path("/var/lib/agentor-incus")
+OPERATOR_ROOT = Path("/etc/agentor/incus")
+ROUTING_LOCK_WAIT_SECONDS = 30
 D2VM_URL = "https://github.com/linka-cloud/d2vm/releases/download/v0.4.0/d2vm_v0.4.0_linux_amd64.tar.gz"
 D2VM_ARCHIVE_SHA = "9f2096bc7850367d063cbcf2da8ded6c5a23e70a9b0ecfdde150b2fbc9b8bd2f"
 D2VM_BINARY_SHA = "12a749cb96cada5a00bed759c120364ed92d1f38de67b557bb85ac67abd96ed8"
@@ -297,6 +299,30 @@ def route_rules(network, bridge, docker_subnet, primary, address, uplink, marker
 
 
 def routing(config):
+    require(UUID.fullmatch(config["installation"]), "Routing needs its exact installation namespace")
+    directory = OPERATOR_ROOT / config["installation"]
+    SOURCES.directory_identity(str(directory)); info = directory.lstat(); owner = directory / "owner"; marker = owner.lstat()
+    require(info.st_uid == os.geteuid() and not info.st_mode & 0o077 and stat.S_ISREG(marker.st_mode)
+            and marker.st_uid == os.geteuid() and stat.S_IMODE(marker.st_mode) == 0o600 and marker.st_size <= 128
+            and owner.read_text().strip() == config["installation"], "Routing namespace is foreign or unprotected; preserve it")
+    fd = os.open(directory / "routing.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        lock = os.fstat(fd)
+        require(stat.S_ISREG(lock.st_mode) and lock.st_uid == os.geteuid() and stat.S_IMODE(lock.st_mode) == 0o600 and lock.st_size == 0,
+                "Existing routing lock is foreign or unsafe; preserve it")
+        deadline = time.monotonic() + ROUTING_LOCK_WAIT_SECONDS
+        while True:
+            try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB); break
+            except BlockingIOError:
+                require(time.monotonic() < deadline, "Owned routing is busy; retry after the current timer/operator run settles")
+                time.sleep(0.05)
+        # Timer and initial/repeated operator runs must share the whole native
+        # read/check/write boundary, not only nft's final atomic application.
+        routing_unlocked(config)
+    finally: os.close(fd)
+
+
+def routing_unlocked(config):
     require(installation_id(config["dataDir"]) == config["installation"], "Installation identity changed; preserve routing and reconfigure explicitly")
     _, _, bridge, docker_subnet, _, address = docker_context(config["container"], config["dockerNetwork"], config["dataDir"])
     network = native("/1.0/networks/" + quote(config["network"])); owned(network, config["installation"], config["network"])
@@ -512,7 +538,7 @@ def main():
     require(re.fullmatch(r"[A-Za-z0-9_-]{1,63}", args.project) and args.project != "default" and re.fullmatch(r"[A-Za-z0-9_-]{1,15}", network)
             and re.fullmatch(r"[A-Za-z0-9_-]{1,63}", pool), "Dedicated safe project/network/pool names required")
     require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", args.tls_name) and all(1 <= port <= 65535 for port in (args.https_port, args.policy_port, args.internal_port)), "Explicit certificate hostname and valid ports required")
-    directory = Path("/etc/agentor/incus") / installation; namespace(directory, installation)
+    directory = OPERATOR_ROOT / installation; namespace(directory, installation)
     prior = json.loads((directory / "config.json").read_text()) if (directory / "config.json").exists() else {}
     work = SOURCES.canonical(args.image_work_dir or prior.get("imageWorkDir") or str(directory / "image-work"))
     require(not SOURCES.overlaps(work, data), "Image conversion scratch must not modify canonical DATA or its ancestors")

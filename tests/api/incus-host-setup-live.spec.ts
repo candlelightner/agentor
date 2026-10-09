@@ -2,7 +2,8 @@ import { test, expect } from '@playwright/test';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { copyFile, cp, lstat, mkdir, mkdtemp, open, readFile, writeFile } from 'node:fs/promises';
-import { execFile } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { createServer } from 'node:net';
 import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +12,8 @@ import { IncusClient } from '../../orchestrator/server/utils/incus-client';
 import { incusImageIdentity } from '../../orchestrator/server/utils/incus-worker-image';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import { resolveIncusPrimaryLease } from '../../orchestrator/server/utils/incus-worker-network';
+import type { AdministrativeWorkspaceRecord } from '../../orchestrator/server/utils/admin-workspace-store';
+import { legacyMigrationMountIdentity } from '../../orchestrator/server/utils/legacy-incus-migration-capture';
 
 const run = promisify(execFile), q = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
 const ssh = ['-p', '22375', '-i', '/workspace/agentor-kata-vm-access.ZgLVo9uk/id_ed25519',
@@ -22,11 +25,23 @@ const scripts = ['setup-incus-host.sh', 'check-incus-host.sh', 'agentor-incus-ne
 type Context = { version: number; projectMarker: string; workerImage: string; workerImageId: string;
   appBaseImage: string; appBaseImageId: string };
 type DockerInfo = { Id: string; Image: string; Created: string; Config: { Labels: Record<string, string> };
-  State: { Running: boolean }; Mounts: Array<{ Type: string; Source: string; Destination: string; RW: boolean }> };
+  State: { Running: boolean }; Mounts: Parameters<typeof legacyMigrationMountIdentity>[0] };
 type Worker = { id: string; userId: string; runtimeKind: string; containerId: string; containerName: string; status: string };
+type SetupConfig = { installation: string; pool: string; project: string; network: string; listen: string; internalUrl: string; sourceTable: string;
+  defaultImage: { phase: string; fingerprint: string; recipeId: string; alias: string; sourceImageId: string } };
+type CompletedBootstrap = { fixtureId: string; local: string; remote: string; hostData: string; scratch: string; installation: string;
+  project: string; network: string; pool: string; appId: string; imageId: string; controller: DockerInfo; owner: string; hostBootId: string;
+  first: Record<string, string>; firstConfig: SetupConfig; certificates: string; quiescedController: DockerInfo };
+const dockerInspectFormat = '{"Id":{{json .Id}},"Image":{{json .Image}},"Created":{{json .Created}},"Config":{"Labels":{{json .Config.Labels}}},"State":{"Running":{{json .State.Running}}},"Mounts":{{json .Mounts}}}';
+function privateRequestScript(path: string, body: unknown, method: string, timeout: number) {
+  return `const fs=await import('node:fs');const{request}=await import('node:http');const p='/fixture/session';const h={Origin:'http://127.0.0.1:3000','Content-Type':'application/json'};` +
+    `if(fs.existsSync(p)){const s=fs.lstatSync(p);if(!s.isFile()||s.isSymbolicLink()||(s.mode&63))throw Error('Session is not private');h.Cookie=fs.readFileSync(p,'utf8')}` +
+    `const b=${JSON.stringify(body === undefined ? '' : JSON.stringify(body))};if(b)h['Content-Length']=String(Buffer.byteLength(b));` +
+    `const out=await new Promise((resolve,reject)=>{let t;const r=request({hostname:'127.0.0.1',port:3000,path:${JSON.stringify(path)},method:${JSON.stringify(method)},headers:h},s=>{const a=[];let n=0;s.on('data',x=>{n+=x.length;if(n>1048576){s.destroy();reject(Error('Response bound'))}else a.push(x)});s.on('error',reject);s.on('end',()=>{clearTimeout(t);const v=Buffer.concat(a).toString();resolve({status:s.statusCode,body:String(s.headers['content-type']).includes('application/json')?JSON.parse(v):v})})});r.on('error',reject);t=setTimeout(()=>r.destroy(Error('Deadline')),${timeout});r.end(b)});console.log(JSON.stringify(out));`;
+}
 // Existing operator-only Unix observation, not an application credential or proxy.
 // Output contains hashes, never guest config, Docker Env, private keys or data.
-const baselineScript = String.raw`import hashlib,http.client,json,socket,subprocess
+const baselineScript = String.raw`import hashlib,http.client,json,socket,subprocess,sys
 class Unix(http.client.HTTPConnection):
  def connect(self):self.sock=socket.socket(socket.AF_UNIX);self.sock.connect('/var/lib/incus/unix.socket')
 def get(path):
@@ -57,11 +72,13 @@ for container in json.loads(subprocess.check_output(['docker','inspect',*ids],te
  for n in networks.values():
   for key in ('Aliases','DNSNames'):
    if isinstance(n.get(key),list):n[key]=sorted(n[key])
+ if len(sys.argv)>1 and sys.argv[1]=='boot-authority':networks={'primary':container['HostConfig'].get('NetworkMode')}
  out['docker/'+container['Id']]=digest(value|{'labels':container['Config'].get('Labels'),'networks':networks})
 print(json.dumps(out,sort_keys=True))`;
 
 test('operator Incus setup repeats without changing retained resources and boots a public default-worker canary', async () => {
-  test.skip(process.env.INCUS_HOST_SETUP_TEST !== 'true', 'Root-exclusive approved disposable-host setup acceptance');
+  const continuing = process.env.INCUS_HOST_SETUP_CONTINUE_TEST === 'true';
+  test.skip(process.env.INCUS_HOST_SETUP_TEST !== 'true' && !continuing, 'Root-exclusive approved disposable-host setup acceptance');
   test.setTimeout(65 * 60_000);
   const path = process.env.INCUS_CUSTOM_IMAGE_FIXTURE_JSON;
   if (!path || !process.env.INCUS_ENDPOINT) throw new Error('Approved private source context and narrowed HTTPS forward required');
@@ -75,14 +92,34 @@ test('operator Incus setup repeats without changing retained resources and boots
   expect(context.appBaseImageId).toBe('sha256:99f3293534e6c68ccf4852fa665272087a992acbe00a784c87033b2537bfb816');
   expect(context.workerImage).toBe('agentor-custom-base:' + context.projectMarker.slice(0, 8));
   expect(context.appBaseImage).toBe('agentor-custom-app-base:' + context.projectMarker.slice(0, 8));
-  const fixtureId = randomUUID(), local = await mkdtemp(join(tmpdir(), 'agentor-host-setup-'));
+  let partial: CompletedBootstrap | undefined;
+  const continuationNonce = randomUUID();
+  if (continuing) {
+    const input = process.env.INCUS_HOST_SETUP_COMPLETED_JSON;
+    if (!input) throw new Error('Explicit private positively completed bootstrap context required');
+    const fd = await open(input, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try { const s = await fd.stat(); expect(s.isFile() && s.uid === process.getuid?.() && !(s.mode & 0o077) && s.size < 32768).toBe(true);
+      partial = JSON.parse(await fd.readFile('utf8')) as CompletedBootstrap;
+    } finally { await fd.close(); }
+    expect(partial.appId).toBe('16e049d42e43d3cda875be135c53df4224e0a54d1f8e88da4101489ce4e3100a');
+    expect(partial.imageId).toBe('sha256:e5fa074437f471c62b449d5df6733e98eaf6e185f2658c03e46a4886629cfdf2');
+    expect(partial.controller.Created).toBe('2026-10-08T23:27:05.459127277Z');
+    expect(partial.firstConfig.defaultImage.fingerprint).toBe('89648f4c29ae05725bb30e6aa4b73e306824815e7dacb7e28e5ce98dafe86d0d');
+    for (const id of [partial.fixtureId, partial.installation, partial.hostBootId]) expect(id).toMatch(/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/);
+    expect(partial.local).toBe('/tmp/agentor-host-setup-WANZSr');
+    expect(partial.remote).toBe('/home/kata-test/agentor-host-setup.' + partial.fixtureId); expect(partial.hostData).toBe(partial.remote + '/data');
+    expect(partial.scratch).toBe('/mnt/kata-extra/agentor-host-setup.' + partial.fixtureId);
+  }
+  const fixtureId = partial?.fixtureId ?? randomUUID(), local = partial?.local ?? await mkdtemp(join(tmpdir(), 'agentor-host-setup-'));
   const remote = '/home/kata-test/agentor-host-setup.' + fixtureId, hostData = remote + '/data', transport = remote + '/transport';
   const scratch = '/mnt/kata-extra/agentor-host-setup.' + fixtureId, build = join(local, 'image'), tree = join(local, 'trusted');
-  const installation = await backupInstallationId(join(local, 'data')), short = installation.replaceAll('-', '').slice(0, 8);
+  const installation = partial?.installation ?? await backupInstallationId(join(local, 'data')), short = installation.replaceAll('-', '').slice(0, 8);
   const project = 'as' + short, network = 'as' + short, pool = 'as' + short;
   const appName = 'agentor-host-setup-' + fixtureId, image = 'agentor-host-setup:' + fixtureId, prefix = 'as' + short;
   const certificateDir = '/etc/agentor/incus/' + installation, configPath = certificateDir + '/config.json';
-  let appId = '', imageId = '', worker: Worker | undefined, incarnation: string | undefined, complete = false, phase = 'read-only preflight';
+  let appId = partial?.appId ?? '', imageId = partial?.imageId ?? '', owner = partial?.owner ?? '';
+  let worker: Worker | undefined, incarnation: string | undefined, complete = false, phase = 'read-only preflight';
+  const retiredControllers = new Set<string>();
   let client: IncusClient | undefined;
   const root = async (command: string, timeout = 30_000) => {
     try { return (await run('ssh', [...ssh, command], { timeout, maxBuffer: 4 * 1024 * 1024 })).stdout.trim(); }
@@ -90,32 +127,40 @@ test('operator Incus setup repeats without changing retained resources and boots
       const failure = error as { code?: string | number; signal?: string; stdout?: string; stderr?: string };
       // Keep bounded operator diagnostics private; never print command output
       // that could contain session cookies or credential-bearing configuration.
-      await writeFile(join(local, 'failed-command-private.json'), JSON.stringify({ phase, ...failure,
+      await writeFile(join(local, continuing ? 'failed-command-continuation-' + continuationNonce + '.json' : 'failed-command-private.json'), JSON.stringify({ phase, ...failure,
         stdout: failure.stdout?.slice(0, 4 * 1024 * 1024), stderr: failure.stderr?.slice(0, 4 * 1024 * 1024) }), { mode: 0o600 });
       throw new Error('Owned host-setup fixture failed during ' + phase + '; secret-bearing diagnostics withheld');
     }
   };
-  const inspect = async (id: string): Promise<DockerInfo> => JSON.parse(await root(`sudo docker inspect ${q(id)} --format ` +
-    q('{"Id":{{json .Id}},"Image":{{json .Image}},"Created":{{json .Created}},"Config":{"Labels":{{json .Config.Labels}}},"State":{"Running":{{json .State.Running}}},"Mounts":{{json .Mounts}}}')));
+  const inspect = async (id: string): Promise<DockerInfo> => JSON.parse(await root(`sudo docker inspect ${q(id)} --format ${q(dockerInspectFormat)}`));
   const snapshot = async (): Promise<Record<string, string>> => JSON.parse(await root(`sudo python3 -c ${q(baselineScript)}`));
+  const quiescence = async () => {
+    if (!partial) return;
+    const expected = partial.quiescedController;
+    expect(expected.Id).toMatch(/^f556[a-f0-9]{60}$/); expect(expected.Image).toMatch(/^sha256:5dff[a-f0-9]{60}$/);
+    expect(expected.Created).toMatch(/^2026-10-08T21:38:08(?:\.[0-9]{1,9})?Z$/);
+    expect(expected.Config.Labels['agentor.migration-fixture']).toMatch(/^0c[a-f0-9-]{34}$/);
+    expect(expected.State.Running).toBe(false);
+    const current = await inspect(expected.Id);
+    expect(current).toMatchObject({ Id: expected.Id, Image: expected.Image, Created: expected.Created,
+      Config: expected.Config, State: { Running: false } });
+    expect(legacyMigrationMountIdentity(current.Mounts)).toEqual(legacyMigrationMountIdentity(expected.Mounts));
+  };
   const request = async <T,>(path: string, body?: unknown, method = body === undefined ? 'GET' : 'POST', timeout = 30_000): Promise<{ status: number; body: T }> => {
-    const script = `const fs=await import('node:fs');const{request}=await import('node:http');const p='/fixture/session';const h={Origin:'http://127.0.0.1:3000','Content-Type':'application/json'};` +
-      `if(fs.existsSync(p)){const s=fs.lstatSync(p);if(!s.isFile()||s.isSymbolicLink()||(s.mode&63))throw Error('Session is not private');h.Cookie=fs.readFileSync(p,'utf8')}` +
-      `const b=${JSON.stringify(body === undefined ? '' : JSON.stringify(body))};if(b)h['Content-Length']=String(Buffer.byteLength(b));` +
-      `const out=await new Promise((resolve,reject)=>{let t;const r=request({hostname:'127.0.0.1',port:3000,path:${JSON.stringify(path)},method:${JSON.stringify(method)},headers:h},s=>{const a=[];let n=0;s.on('data',x=>{n+=x.length;if(n>1048576){s.destroy();reject(Error('Response bound'))}else a.push(x)});s.on('error',reject);s.on('end',()=>{clearTimeout(t);const v=Buffer.concat(a).toString();resolve({status:s.statusCode,body:String(s.headers['content-type']).includes('application/json')?JSON.parse(v):v})})});r.on('error',reject);t=setTimeout(()=>r.destroy(Error('Deadline')),${timeout});r.end(b)});console.log(JSON.stringify(out));`;
+    const script = privateRequestScript(path, body, method, timeout);
     return JSON.parse(await root(`sudo docker exec ${appId} node --input-type=module -e ${q(script)}`, timeout + 10_000));
   };
   const outputs = (stdout: string) => Object.fromEntries(stdout.split('\n').flatMap(line => {
     const match = /^(INCUS_[A-Z_]+)=(.*)$/.exec(line); return match ? [[match[1]!, match[2]!]] : [];
   }));
-  const config = async () => JSON.parse(await root(`sudo cat ${q(configPath)}`)) as { installation: string; pool: string; project: string;
-    network: string; listen: string; internalUrl: string; sourceTable: string; defaultImage: { phase: string; fingerprint: string; recipeId: string; alias: string; sourceImageId: string } };
+  const config = async () => JSON.parse(await root(`sudo cat ${q(configPath)}`)) as SetupConfig;
   const launch = async (env: Record<string, string>, tls = false) => {
     if (appId) {
+      await quiescence();
       const previous = await inspect(appId); expect(previous.Id).toBe(appId); expect(previous.Image).toBe(imageId);
       expect(previous.Config.Labels['agentor.host-setup-fixture']).toBe(fixtureId);
       expect(previous.Mounts.find(mount => mount.Destination === '/data')).toMatchObject({ Type: 'bind', Source: hostData, RW: true });
-      await root(`sudo docker stop --time 30 ${appId}`); await root(`sudo docker rm ${appId}`); appId = '';
+      await root(`sudo docker stop --time 30 ${appId}`); await root(`sudo docker rm ${appId}`); retiredControllers.add(appId); appId = '';
     }
     const files = tls ? ['client.crt', 'client.key', 'server.crt', 'policy.crt'].map(name => '--mount ' +
       q('type=bind,src=' + certificateDir + '/' + name + ',dst=/run/agentor-incus/' + name + ',readonly')).join(' ') : '';
@@ -126,7 +171,7 @@ test('operator Incus setup repeats without changing retained resources and boots
     appId = await root(`sudo docker run -d --name ${q(appName)} --label agentor.host-setup-fixture=${fixtureId} --network agentor-phase6-net ` +
       `--add-host agentor-kata-preflight:172.22.0.1 --mount ${q('type=bind,src=' + hostData + ',dst=/data')} ` +
       `--mount ${q('type=bind,src=' + transport + ',dst=/fixture')} --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock ` +
-      `${files} ${publish} ${Object.entries(values).map(([name, value]) => '-e ' + q(name + '=' + value)).join(' ')} ${q(image)} node .output/server/index.mjs`);
+      `${files} ${publish} ${Object.entries(values).map(([name, value]) => '-e ' + q(name + '=' + value)).join(' ')} ${q(imageId)} node .output/server/index.mjs`);
     expect(appId).toMatch(/^[a-f0-9]{64}$/);
     await expect.poll(async () => { try { return (await request('/api/health')).status; } catch { return 0; } }, { timeout: 90_000 }).toBe(200);
   };
@@ -137,9 +182,43 @@ test('operator Incus setup repeats without changing retained resources and boots
       .toBe('3b92cc64-d51d-4111-93dd-6de56440529b');
     for (const pinned of [{ tag: context.workerImage, id: context.workerImageId }, { tag: context.appBaseImage, id: context.appBaseImageId }])
       expect(await root(`sudo docker image inspect ${q(pinned.tag)} --format '{{.Id}}'`)).toBe(pinned.id);
-    await root(`sudo python3 -c ${q("import shutil,socket;assert shutil.disk_usage('/mnt/kata-extra').free>=40*1024**3;s=socket.socket();s.bind(('172.22.0.1',18447));s.close()")}`);
-    const original = await snapshot(); await writeFile(join(local, 'original-resources.json'), JSON.stringify(original), { mode: 0o600, flag: 'wx' });
-    const assertOriginal = async () => { const now = await snapshot(); for (const [key, value] of Object.entries(original)) expect(now[key], key).toBe(value); };
+    if (!partial) await root(`sudo python3 -c ${q("import shutil,socket;assert shutil.disk_usage('/mnt/kata-extra').free>=40*1024**3;s=socket.socket();s.bind(('172.22.0.1',18447));s.close()")}`);
+    else {
+      phase = 'positive completed bootstrap/controller/source/session admission';
+      expect(await root('cat /proc/sys/kernel/random/boot_id')).toBe(partial.hostBootId);
+      expect({ project, network, pool }).toEqual({ project: partial.project, network: partial.network, pool: partial.pool });
+      const current = await inspect(appId);
+      expect(current).toMatchObject({ Id: partial.appId, Image: partial.imageId, Created: partial.controller.Created,
+        Config: { Labels: { 'agentor.host-setup-fixture': fixtureId } }, State: { Running: true } });
+      expect(legacyMigrationMountIdentity(current.Mounts)).toEqual(legacyMigrationMountIdentity(partial.controller.Mounts));
+      expect(current.Mounts.find(m => m.Destination === '/data')).toMatchObject({ Type: 'bind', Source: hostData, RW: true });
+      expect(await config()).toEqual(partial.firstConfig); expect(partial.firstConfig.defaultImage.phase).toBe('ready');
+      expect(partial.firstConfig.defaultImage.sourceImageId).toBe(context.workerImageId);
+      const imageProof = incusImageIdentity(JSON.parse(await root(`sudo incus --force-local query ${q('/1.0/images/' + partial.firstConfig.defaultImage.fingerprint + '?project=' + project)}`)));
+      expect(imageProof).toMatchObject({ fingerprint: partial.firstConfig.defaultImage.fingerprint, sourceImageId: context.workerImageId,
+        recipeId: partial.firstConfig.defaultImage.recipeId });
+      const alias = JSON.parse(await root(`sudo incus --force-local query ${q('/1.0/images/aliases/' + partial.firstConfig.defaultImage.alias + '?project=' + project)}`));
+      expect(alias).toMatchObject({ target: imageProof.fingerprint, type: 'virtual-machine' });
+      expect(await root(`sudo sha256sum ${['client.crt', 'client.key', 'server.crt', 'policy.crt'].map(name => q(certificateDir + '/' + name)).join(' ')}`)).toBe(partial.certificates);
+      const session = `const fs=await import('node:fs');const p='/fixture/session';const s=fs.lstatSync(p);if(!s.isFile()||s.isSymbolicLink()||(s.mode&63))throw Error('Private session differs');const r=await fetch('http://127.0.0.1:3000/api/auth/get-session',{headers:{Cookie:fs.readFileSync(p,'utf8')}});const v=await r.json();if(r.status!==200||v.user?.id!==${JSON.stringify(owner)}||v.user?.role!=='admin')throw Error('Current admin differs');console.log('Existing private admin authority verified')`;
+      expect(await root(`sudo docker exec ${appId} node --input-type=module -e ${q(session)}`)).toBe('Existing private admin authority verified');
+      await quiescence();
+    }
+    const original = await snapshot(), baselinePath = join(local, partial ? 'original-resources-continuation-' + continuationNonce + '.json' : 'original-resources.json');
+    await writeFile(baselinePath, JSON.stringify(original), { mode: 0o600, flag: 'wx' });
+    const expectedOriginal = partial ? JSON.parse(await readFile(join(local, 'original-resources.json'), 'utf8')) as Record<string, string> : original;
+    if (partial) {
+      // Retain ALL original values except the single diagnosed management
+      // endpoint delta, admitted only through the exact stopped receipt above.
+      const key = 'docker/' + partial.quiescedController.Id; expect(Object.hasOwn(expectedOriginal, key)).toBe(true);
+      expect(Object.hasOwn(original, key)).toBe(true); expectedOriginal[key] = original[key]!;
+    }
+    const protectedKeys = Object.keys(expectedOriginal);
+    for (const key of protectedKeys) expect(original[key], key).toBe(expectedOriginal[key]);
+    const assertOriginal = async () => { await quiescence(); const now = await snapshot();
+      await writeFile(join(local, 'resources-after-' + continuationNonce + '.json'), JSON.stringify(now), { mode: 0o600 });
+      for (const key of protectedKeys) if (![...retiredControllers].some(id => key === 'docker/' + id)) expect(now[key], key).toBe(expectedOriginal[key]); };
+    if (!partial) {
     const repo = fileURLToPath(new URL('../../', import.meta.url)), output = join(repo, 'orchestrator/.output');
     const manifest = JSON.parse(await readFile(join(output, 'server/incus-bootstrap/manifest.json'), 'utf8')) as
       { version: number; files: Array<{ name: string; size: number; mode: number; sha256: string }> };
@@ -170,19 +249,21 @@ test('operator Incus setup repeats without changing retained resources and boots
     expect(imageId).toMatch(/^sha256:[a-f0-9]{64}$/); await launch({ INCUS_ENABLED: 'false' });
     const admin = { email: 'setup-' + fixtureId + '@agentor.test', password: randomBytes(24).toString('base64url'), name: 'Host setup acceptance' };
     const created = await request<{ id: string; role: string }>('/api/setup/create-admin', admin); expect(created.status).toBe(201); expect(created.body.role).toBe('admin');
-    const owner = created.body.id; expect(owner).toMatch(/^[A-Za-z0-9_-]+$/);
+    owner = created.body.id; expect(owner).toMatch(/^[A-Za-z0-9_-]+$/);
     const login = `const fs=await import('node:fs');const b='http://127.0.0.1:3000';const r=await fetch(b+'/api/auth/sign-in/email',{method:'POST',headers:{Origin:b,'Content-Type':'application/json'},body:${JSON.stringify(JSON.stringify({ email: admin.email, password: admin.password }))}});if(!r.ok)throw Error('Sign-in failed');const v=await r.json();if(v.user?.id!==${JSON.stringify(owner)}||v.user?.role!=='admin')throw Error('Wrong session');const c=r.headers.getSetCookie().map(x=>x.split(';')[0]).join('; ');if(!c)throw Error('Missing cookie');fs.writeFileSync('/fixture/session',c,{mode:384,flag:'wx'});console.log('Private admin session prepared');`;
     expect(await root(`sudo docker exec ${appId} node --input-type=module -e ${q(login)}`)).toBe('Private admin session prepared');
+    }
     const installer = `sudo bash ${q(remote + '/trusted/scripts/setup-incus-host.sh')} --orchestrator-container ${q(appName)} --docker-network agentor-phase6-net ` +
       `--project ${project} --network ${network} --storage-pool ${pool} --tls-name agentor-kata-preflight --https-port 8443 --policy-port 18447 --internal-port 3079 ` +
       `--trusted-worker-image ${q(context.workerImage)} --image-work-dir ${q(scratch)}`;
     console.info('Exact owned setup progress context; root monitors private receipt/artifact progress without replay',
       { fixtureId, local, remote, scratch, installation, project, network, pool });
-    phase = 'first real operator setup/default conversion (monitor private phase/files; never replay unknown dispatch)';
+    phase = partial ? 'positively ready bootstrap admitted; cached installer reuse only' :
+      'first real operator setup/default conversion (monitor private phase/files; never replay unknown dispatch)';
     // The nested builder owns its 45-minute conversion deadline. Transport
     // also includes setup/download/import; expiration never authorizes replay.
-    const first = outputs(await root(installer, 55 * 60_000)), firstConfig = await config();
-    await writeFile(join(local, 'setup-config-first.json'), JSON.stringify(firstConfig), { mode: 0o600, flag: 'wx' });
+    const first = partial?.first ?? outputs(await root(installer, 55 * 60_000)), firstConfig = await config();
+    if (!partial) await writeFile(join(local, 'setup-config-first.json'), JSON.stringify(firstConfig), { mode: 0o600, flag: 'wx' });
     expect(firstConfig).toMatchObject({ installation, project, network, pool, listen: '172.22.0.1',
       defaultImage: { phase: 'ready', sourceImageId: context.workerImageId } });
     expect(first.INCUS_CONVERTER_SEED_FINGERPRINT).toBe(firstConfig.defaultImage.fingerprint);
@@ -258,7 +339,8 @@ test('operator Incus setup repeats without changing retained resources and boots
     for (const role of ['workspace', 'agents', 'docker']) await expect(client.getCustomVolume(pool, current.name + '-' + role)).rejects.toMatchObject({ statusCode: 404 });
     await assertOriginal(); complete = true;
     await writeFile(join(local, 'accepted-context.json'), JSON.stringify({ fixtureId, local, remote, hostData, scratch, installation, appId, imageId,
-      project, network, pool, configPath, first, firstConfig, checker, certificates, original }, null, 2), { mode: 0o600, flag: 'wx' });
+      project, network, pool, configPath, first, firstConfig, checker, certificates, original, controller: await inspect(appId), owner, workerImage: context.workerImage,
+      hostBootId: await root('cat /proc/sys/kernel/random/boot_id') }, null, 2), { mode: 0o600, flag: 'wx' });
     console.info('Actual setup/repeated reuse/checker/default canary accepted; exact installed fixtures retained for subsequent root-only gates',
       { fixtureId, local, remote, appId, imageId, installation, project, network, pool, fingerprint: derived.fingerprint });
   } finally {
@@ -266,5 +348,178 @@ test('operator Incus setup repeats without changing retained resources and boots
     // installation or replay uncertain image/guest operations from its names.
     if (!complete) console.error('Owned setup fixture retained without guessed cleanup', { fixtureId, local, remote, phase, appId, imageId, workerId: worker?.id, incarnation });
     client?.dispose();
+  }
+});
+
+test('accepted operator setup survives one host reboot and normal same-image redeploy with worker persistence', async () => {
+  test.skip(process.env.INCUS_HOST_SETUP_REBOOT_TEST !== 'true', 'Root-exclusive single approved host reboot follow-up');
+  test.setTimeout(20 * 60_000);
+  const contextPath = process.env.INCUS_HOST_SETUP_ACCEPTED_JSON;
+  if (!contextPath) throw new Error('Explicit private accepted setup context required; do not rediscover/adopt a fixture');
+  const fd = await open(contextPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  let c: { fixtureId: string; local: string; remote: string; hostData: string; installation: string; appId: string; imageId: string;
+    project: string; network: string; pool: string; configPath: string; owner: string; workerImage: string; hostBootId: string; controller: DockerInfo;
+    first: Record<string, string>; firstConfig: { internalUrl: string; defaultImage: { phase: string; fingerprint: string; sourceImageId: string } }; certificates: string };
+  try { const s = await fd.stat(); expect(s.isFile() && s.uid === process.getuid?.() && !(s.mode & 0o077) && s.size < 128 * 1024).toBe(true);
+    c = JSON.parse(await fd.readFile('utf8')) as typeof c;
+  } finally { await fd.close(); }
+  for (const value of [c.fixtureId, c.installation, c.hostBootId]) expect(value).toMatch(/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/);
+  expect(c.appId).toMatch(/^[a-f0-9]{64}$/); expect(c.imageId).toMatch(/^sha256:[a-f0-9]{64}$/); expect(c.owner).toMatch(/^[A-Za-z0-9_-]{1,128}$/);
+  expect(c.local).toMatch(/^\/tmp\/agentor-host-setup-[A-Za-z0-9]+$/); expect(c.remote).toBe('/home/kata-test/agentor-host-setup.' + c.fixtureId);
+  expect(c.hostData).toBe(c.remote + '/data'); expect(c.configPath).toBe('/etc/agentor/incus/' + c.installation + '/config.json');
+  const short = c.installation.replaceAll('-', '').slice(0, 8), certificateDir = '/etc/agentor/incus/' + c.installation;
+  for (const name of [c.project, c.network, c.pool]) expect(name).toBe('as' + short);
+  expect(c.firstConfig.defaultImage.phase).toBe('ready'); expect(c.first.INCUS_CONVERTER_SEED_FINGERPRINT).toBe(c.firstConfig.defaultImage.fingerprint);
+  expect(c.firstConfig.defaultImage.sourceImageId).toBe('sha256:38b656283e26e5b070b97a49ead034903480ccaf0fd465825f6e985819745b5f');
+  expect(c.workerImage).toMatch(/^agentor-custom-base:[a-f0-9]{8}$/);
+  for (const [name, expected] of Object.entries({ INCUS_PROJECT: c.project, INCUS_NETWORK: c.network, INCUS_STORAGE_POOL: c.pool,
+    INCUS_CONVERTER_STORAGE_POOL: c.pool, INCUS_INTERNAL_GATEWAY_URL: c.firstConfig.internalUrl, INCUS_INTERNAL_PORT: '3079' })) expect(c.first[name]).toBe(expected);
+  expect(c.first.INCUS_ENDPOINT).toBe('https://agentor-kata-preflight:8443'); expect(c.first.INCUS_NETWORK_HOST_ENDPOINT).toBe('https://agentor-kata-preflight:18447');
+  const sshArgs = [...ssh.slice(0, -1), '-o', 'ConnectTimeout=5', ssh[ssh.length - 1]!];
+  let phase = 'accepted context identity preflight', appId = c.appId, controllerReceipt = c.controller;
+  let worker: Worker | undefined, incarnation: string | undefined, rebootDispatched = false;
+  let client: IncusClient | undefined, tunnel: ChildProcess | undefined;
+  const root = async (command: string, timeout = 30_000) => {
+    try { return (await run('ssh', [...sshArgs, command], { timeout, maxBuffer: 4 * 1024 * 1024 })).stdout.trim(); }
+    catch { throw new Error('Owned setup reboot follow-up failed during ' + phase + '; credential-bearing diagnostics withheld'); }
+  };
+  const inspect = async (id: string): Promise<DockerInfo> => JSON.parse(await root(`sudo docker inspect ${q(id)} --format ${q(dockerInspectFormat)}`));
+  const request = async <T,>(path: string, body?: unknown, method = body === undefined ? 'GET' : 'POST', timeout = 30_000): Promise<{ status: number; body: T }> =>
+    JSON.parse(await root(`sudo docker exec ${appId} node --input-type=module -e ${q(privateRequestScript(path, body, method, timeout))}`, timeout + 10_000));
+  const config = async () => JSON.parse(await root(`sudo cat ${q(c.configPath)}`));
+  const certHashes = () => root(`sudo sha256sum ${['client.crt', 'client.key', 'server.crt', 'policy.crt'].map(name => q(certificateDir + '/' + name)).join(' ')}`);
+  const closedTunnel = async () => {
+    client?.dispose(); client = undefined;
+    if (tunnel && tunnel.exitCode === null && tunnel.signalCode === null) {
+      const child = tunnel;
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('Exact owned local tunnel termination is unconfirmed')), 5000);
+        child.once('exit', () => { clearTimeout(timer); resolve(); }); child.kill('SIGTERM');
+      });
+    }
+    tunnel = undefined;
+  };
+  const available = createServer(); await new Promise<void>(resolve => available.listen(0, '127.0.0.1', resolve));
+  const address = available.address(); if (!address || typeof address === 'string') throw new Error('Local fixed SSH forward address unavailable');
+  const port = address.port; await new Promise<void>((resolve, reject) => available.close(error => error ? reject(error) : resolve()));
+  const connect = async () => {
+    // Same bounded SSH-forward pattern as the accepted host-mount live gate;
+    // own exactly this local child, never adopt/restart root's shared tunnel.
+    tunnel = spawn('ssh', ['-N', ...sshArgs.slice(0, -1), '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=5',
+      '-o', 'ServerAliveCountMax=3', '-L', '127.0.0.1:' + port + ':172.22.0.1:8443', sshArgs[sshArgs.length - 1]!],
+    { stdio: ['ignore', 'ignore', 'ignore'] });
+    tunnel.on('error', () => {});
+    client = new IncusClient({ endpoint: 'https://127.0.0.1:' + port, project: c.project, clientCertPath: join(c.local, 'tls/client.crt'),
+      clientKeyPath: join(c.local, 'tls/client.key'), serverCertPath: join(c.local, 'tls/server.crt') });
+    await expect.poll(async () => (await client!.getReadiness()).ready, { timeout: 60_000 }).toBe(true);
+  };
+  const controllerFence = async (expected: DockerInfo) => {
+    const current = await inspect(expected.Id); expect(current.Id).toBe(expected.Id); expect(current.Image).toBe(c.imageId); expect(current.Created).toBe(expected.Created);
+    expect(current.Config.Labels['agentor.host-setup-fixture']).toBe(c.fixtureId);
+    expect(legacyMigrationMountIdentity(current.Mounts)).toEqual(legacyMigrationMountIdentity(expected.Mounts));
+    expect(current.Mounts.find(m => m.Destination === '/data')).toMatchObject({ Type: 'bind', Source: c.hostData, RW: true });
+    for (const name of ['client.crt', 'client.key', 'server.crt', 'policy.crt']) expect(current.Mounts.find(m => m.Destination === '/run/agentor-incus/' + name))
+      .toMatchObject({ Type: 'bind', Source: certificateDir + '/' + name, RW: false });
+    return current;
+  };
+  const checker = `sudo bash ${q(c.remote + '/trusted/scripts/check-incus-host.sh')} --endpoint ${q(c.first.INCUS_ENDPOINT!)} --project ${c.project} --network ${c.network} --storage-pool ${c.pool} ` +
+    `--client-cert-path ${q(certificateDir + '/client.crt')} --client-key-path ${q(certificateDir + '/client.key')} --server-cert-path ${q(certificateDir + '/server.crt')} ` +
+    `--network-host-endpoint ${q(c.first.INCUS_NETWORK_HOST_ENDPOINT!)} --network-host-server-cert-path ${q(certificateDir + '/policy.crt')} --installation-id ${c.installation} ` +
+    `--docker-network agentor-phase6-net --orchestrator-container ${q('agentor-host-setup-' + c.fixtureId)} --internal-gateway-url ${q(c.first.INCUS_INTERNAL_GATEWAY_URL!)} ` +
+    `--source-nat-table agentor_source_${short} --connect-address 172.22.0.1`;
+  const normalRedeploy = async () => {
+    const before = await controllerFence(controllerReceipt);
+    await root(`sudo docker stop --time 30 ${before.Id}`); await root(`sudo docker rm ${before.Id}`);
+    const whitelist = ['INCUS_ENDPOINT', 'INCUS_PROJECT', 'INCUS_NETWORK', 'INCUS_STORAGE_POOL', 'INCUS_CONVERTER_STORAGE_POOL',
+      'INCUS_WORKER_IMAGE', 'INCUS_CONVERTER_SEED_FINGERPRINT', 'INCUS_NETWORK_HOST_ENDPOINT', 'INCUS_INTERNAL_GATEWAY_URL'];
+    const env = Object.fromEntries(whitelist.map(name => [name, c.first[name]!])) as Record<string, string>;
+    Object.assign(env, { DATA_DIR: '/data', DOCKER_NETWORK: 'agentor-phase6-net', CONTAINER_PREFIX: 'as' + short, INCUS_ENABLED: 'true',
+      WORKER_IMAGE_PREFIX: '', WORKER_IMAGE: c.workerImage, BETTER_AUTH_URL: 'http://127.0.0.1:3000', AGENTOR_INSTANCE_RECOVERY_MODE: 'false',
+      INCUS_CLIENT_CERT_PATH: '/run/agentor-incus/client.crt', INCUS_CLIENT_KEY_PATH: '/run/agentor-incus/client.key',
+      INCUS_SERVER_CERT_PATH: '/run/agentor-incus/server.crt', INCUS_NETWORK_HOST_SERVER_CERT_PATH: '/run/agentor-incus/policy.crt' });
+    const mounts = before.Mounts.map(m => { if (m.Type !== 'bind') throw new Error('Unexpected controller mount');
+      return '--mount ' + q('type=bind,src=' + m.Source + ',dst=' + m.Destination + (m.RW ? '' : ',readonly')); }).join(' ');
+    appId = await root(`sudo docker run -d --name ${q('agentor-host-setup-' + c.fixtureId)} --label agentor.host-setup-fixture=${c.fixtureId} --network agentor-phase6-net ` +
+      `--add-host agentor-kata-preflight:172.22.0.1 ${mounts} -p ${q(c.first.INCUS_WORKER_GATEWAY + ':' + c.first.INCUS_INTERNAL_PORT + ':3000')} ` +
+      `${Object.entries(env).map(([name, value]) => '-e ' + q(name + '=' + value)).join(' ')} ${q(c.imageId)} node .output/server/index.mjs`);
+    expect(appId).toMatch(/^[a-f0-9]{64}$/);
+    const acknowledged = await inspect(appId); expect(acknowledged.Image).toBe(c.imageId);
+    expect(acknowledged.Config.Labels['agentor.host-setup-fixture']).toBe(c.fixtureId);
+    expect(legacyMigrationMountIdentity(acknowledged.Mounts)).toEqual(legacyMigrationMountIdentity(before.Mounts));
+    controllerReceipt = acknowledged;
+    await expect.poll(async () => { try { return (await request('/api/health')).status; } catch { return 0; } }, { timeout: 120_000 }).toBe(200);
+  };
+  try {
+    expect(await root('hostname')).toBe('agentor-kata-preflight'); expect(await root('cat /proc/sys/kernel/random/boot_id')).toBe(c.hostBootId);
+    expect(c.controller.Id).toBe(c.appId); expect(c.controller.Image).toBe(c.imageId); await controllerFence(c.controller);
+    expect(await config()).toEqual(c.firstConfig); expect(await certHashes()).toBe(c.certificates);
+    expect(await root(`sudo docker image inspect ${q(c.workerImage)} --format '{{.Id}}'`)).toBe(c.firstConfig.defaultImage.sourceImageId);
+    const original = JSON.parse(await root(`sudo python3 -c ${q(baselineScript)} boot-authority`)) as Record<string, string>;
+    const assertOriginal = async () => { const now = JSON.parse(await root(`sudo python3 -c ${q(baselineScript)} boot-authority`)) as Record<string, string>;
+      for (const [key, value] of Object.entries(original)) if (key !== 'docker/' + c.appId) expect(now[key], key).toBe(value); };
+    expect(await root(`sudo docker image inspect ${q(c.imageId)} --format '{{index .Config.Labels "agentor.admin.overlay"}}'`)).not.toBe('true');
+    const stamp = new Date().toISOString(), guard: AdministrativeWorkspaceRecord = { schemaVersion: 1, id: randomUUID(), kind: 'administrative',
+      trusted: true, status: 'stopped', createdAt: stamp, updatedAt: stamp, imageDigest: c.imageId };
+    // Deliberate existing provenance guard, not recovery mode: normal worker
+    // reconciliation runs, but this isolated DATA cannot adopt global admin899.
+    await root(`sudo test ! -e ${q(c.hostData + '/admin/workspace.v1.json')}`);
+    const guardPath = join(c.local, 'reboot-admin-guard.json'); await writeFile(guardPath, JSON.stringify(guard), { mode: 0o600, flag: 'wx' });
+    await run('scp', [...scp, guardPath, 'kata-test@172.19.0.1:' + c.remote + '/transport/reboot-admin-guard.json'], { timeout: 30_000 });
+    await root(`sudo mkdir -m 700 -p ${q(c.hostData + '/admin')} && sudo cp --no-clobber ${q(c.remote + '/transport/reboot-admin-guard.json')} ${q(c.hostData + '/admin/workspace.v1.json')}`);
+    phase = 'normal controller startup before one host reboot'; await normalRedeploy(); await connect();
+    const environment = await request<{ id: string }>('/api/environments', { name: 'Host reboot canary', networkMode: 'full', dockerEnabled: false, cpuLimit: 1, memoryLimit: '1024m' });
+    expect(environment.status).toBe(201);
+    const created = await request<Worker>('/api/containers', { displayName: 'Host reboot persistence', environmentId: environment.body.id }, 'POST', 300_000);
+    expect(created.status).toBe(201); worker = created.body; expect(worker).toMatchObject({ runtimeKind: 'incus-vm', userId: c.owner, status: 'running' });
+    const vm = await client!.getInstance(worker.containerName); incarnation = vm.config['volatile.uuid']; expect(worker.containerId).toBe('incus:' + incarnation);
+    expect(vm.config).toMatchObject({ 'user.agentor.installation': c.installation, 'user.agentor.id': worker.id, 'user.agentor.owner': c.owner });
+    const volumes = await Promise.all(['workspace', 'agents'].map(role => client!.getCustomVolume(c.pool, worker!.containerName + '-' + role)));
+    const initial = await client!.exec(worker.containerName, ['bash', '-ec', 'printf reboot-workspace >/workspace/reboot-proof; printf reboot-agent >/home/agent/.agent-data/reboot-proof; cat /proc/sys/kernel/random/boot_id']);
+    expect(initial.returnCode).toBe(0); const guestBoot = initial.stdout.trim(), controller = await inspect(appId);
+    expect(guestBoot).toMatch(/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/);
+    const receiptPath = join(c.local, 'reboot-canary.json'); await writeFile(receiptPath, JSON.stringify({ fixtureId: c.fixtureId, appId, controller, worker, incarnation, guestBoot, volumes, hostBootId: c.hostBootId }), { mode: 0o600, flag: 'wx' });
+    await assertOriginal(); await closedTunnel();
+    phase = 'one approved disposable host reboot; loss of SSH acknowledgement never authorizes replay';
+    rebootDispatched = true; await root('sudo systemctl reboot', 15_000).catch(() => {});
+    let hostBoot = '';
+    await expect.poll(async () => { try { expect(await root('hostname', 10_000)).toBe('agentor-kata-preflight');
+      hostBoot = await root('cat /proc/sys/kernel/random/boot_id', 10_000); return /^[a-f0-9-]{36}$/.test(hostBoot) && hostBoot !== c.hostBootId;
+    } catch { return false; } }, { timeout: 240_000, intervals: [1000, 2000] }).toBe(true);
+    phase = 'normal automatic routing/filtering/provisioning after host reboot';
+    const stopped = await controllerFence(controller);
+    if (!stopped.State.Running) expect(await root(`sudo docker start ${controller.Id}`)).toBe(controller.Id); // Same acknowledged ID, not recreation.
+    await expect.poll(async () => { try { return (await request('/api/health')).status; } catch { return 0; } }, { timeout: 120_000 }).toBe(200);
+    await expect.poll(async () => { try { return (await root(checker)).includes('Read-only prerequisites checked'); } catch { return false; } }, { timeout: 120_000, intervals: [1000, 2000] }).toBe(true);
+    await connect();
+    const ready = async () => {
+      const current = await client!.getInstance(worker!.containerName);
+      expect(current.config).toMatchObject({ 'volatile.uuid': incarnation, 'volatile.base_image': vm.config['volatile.base_image'],
+        'user.agentor.installation': c.installation, 'user.agentor.id': worker!.id, 'user.agentor.owner': c.owner });
+      expect(current.devices).toEqual(vm.devices); expect(current.profiles).toEqual(vm.profiles);
+      const guest = await client!.exec(worker!.containerName, ['bash', '-ec',
+        'systemctl is-active --quiet agentor-worker.service incus-agent; test -f /run/agentor/provisioned; ' +
+        'test "$(cat /workspace/reboot-proof)" = reboot-workspace; test "$(cat /home/agent/.agent-data/reboot-proof)" = reboot-agent; ' +
+        'curl --max-time 10 -fsS ' + q(c.first.INCUS_INTERNAL_GATEWAY_URL! + '/api/worker-self/info')]);
+      expect(guest.returnCode).toBe(0); expect(JSON.parse(guest.stdout).workerId).toBe(worker!.id);
+    };
+    await expect.poll(async () => { try { await ready(); return true; } catch { return false; } }, { timeout: 240_000, intervals: [500, 1000] }).toBe(true);
+    const afterBoot = await client!.exec(worker.containerName, ['cat', '/proc/sys/kernel/random/boot_id']); expect(afterBoot.returnCode).toBe(0);
+    expect(afterBoot.stdout.trim()).toMatch(/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/); expect(afterBoot.stdout.trim()).not.toBe(guestBoot);
+    expect((await request('/editor/' + worker.id + '/?folder=/workspace')).status).toBe(200); expect((await request('/desktop/' + worker.id + '/agentor.html')).status).toBe(200);
+    for (const volume of volumes) { const current = await client!.getCustomVolume(c.pool, volume.name);
+      expect({ ...current, used_by: [...current.used_by].sort() }).toEqual({ ...volume, used_by: [...volume.used_by].sort() }); }
+    expect(await config()).toEqual(c.firstConfig); expect(await certHashes()).toBe(c.certificates); await assertOriginal();
+    phase = 'same immutable controller image/DATA redeploy after reboot'; await normalRedeploy();
+    await expect.poll(async () => { try { return (await root(checker)).includes('Read-only prerequisites checked'); } catch { return false; } }, { timeout: 120_000, intervals: [1000, 2000] }).toBe(true);
+    await ready(); expect((await client!.getInstance(worker.containerName)).config['volatile.uuid']).toBe(incarnation);
+    expect((await request('/editor/' + worker.id + '/?folder=/workspace')).status).toBe(200); expect((await request('/desktop/' + worker.id + '/agentor.html')).status).toBe(200);
+    expect((await request('/api/containers/' + worker.id, undefined, 'DELETE', 120_000)).status).toBe(200);
+    await expect(client!.getInstance(worker.containerName)).rejects.toMatchObject({ statusCode: 404 }); await assertOriginal();
+    await writeFile(join(c.local, 'accepted-reboot.json'), JSON.stringify({ fixtureId: c.fixtureId, appId, controller: await inspect(appId), imageId: c.imageId, installation: c.installation,
+      hostBoot, retiredCanary: worker, incarnation, guestBoot, receiptPath }), { mode: 0o600, flag: 'wx' }); worker = undefined;
+    console.info('One host reboot and normal same-image redeploy preserved worker identity/data and automatic source routing', { fixtureId: c.fixtureId, appId, installation: c.installation, local: c.local });
+  } finally {
+    await closedTunnel();
+    if (worker) console.error('Unknown reboot/redeploy canary retained for exact root recovery; reboot was never replayed', { phase, appId, workerId: worker.id, incarnation, rebootDispatched, contextPath });
   }
 });

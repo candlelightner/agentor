@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import select
 import stat
 import subprocess
 import sys
@@ -419,8 +420,76 @@ class InstallerTests(unittest.TestCase):
         with patch.object(SETUP, "installation_id", return_value=INSTALLATION), patch.object(SETUP, "docker_context", return_value=context), \
              patch.object(SETUP, "native", return_value={"name": config["network"], "config": {SETUP.MARKER: INSTALLATION, "ipv4.address": "10.25.0.1/24"}}), \
              patch.object(SETUP, "command", side_effect=command):
-            with self.assertRaisesRegex(ValueError, "foreign"): SETUP.routing(config)
+            with self.assertRaisesRegex(ValueError, "foreign"): SETUP.routing_unlocked(config)
         self.assertEqual([item[0] for item in seen], ["ip", "iptables"])
+
+    def test_real_two_process_routing_writers_serialize_whole_operation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary); SETUP.namespace(base / INSTALLATION, INSTALLATION)
+            events, release = base / "events", base / "release"
+            child = r'''import sys,types,time
+from pathlib import Path
+script,base,ident,worker=sys.argv[1:];sys.argv=['installer',script]
+m=types.ModuleType('routing_child');code=Path(script).read_text().split("<<'PY'\n",1)[1].rsplit('\nPY',1)[0];exec(compile(code,script,'exec'),m.__dict__)
+m.OPERATOR_ROOT=Path(base);m.ROUTING_LOCK_WAIT_SECONDS=3
+def operation(config):
+ with open(Path(base)/'events','a') as f:f.write(worker+'-start\n')
+ print('entered',flush=True)
+ if worker=='A':
+  deadline=time.monotonic()+3
+  while not (Path(base)/'release').exists():
+   if time.monotonic()>deadline:raise RuntimeError('test release deadline')
+   time.sleep(.01)
+ with open(Path(base)/'events','a') as f:f.write(worker+'-end\n')
+m.routing_unlocked=operation
+print('attempting',flush=True);m.routing({'installation':ident})
+'''
+            writers = []
+            try:
+                first = subprocess.Popen([sys.executable, "-c", child, str(SCRIPT), str(base), INSTALLATION, "A"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True); writers.append(first)
+                for expected in ("attempting", "entered"):
+                    self.assertTrue(select.select([first.stdout], [], [], 3)[0]); self.assertEqual(first.stdout.readline().strip(), expected)
+                second = subprocess.Popen([sys.executable, "-c", child, str(SCRIPT), str(base), INSTALLATION, "B"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True); writers.append(second)
+                self.assertTrue(select.select([second.stdout], [], [], 3)[0]); self.assertEqual(second.stdout.readline().strip(), "attempting")
+                self.assertFalse(select.select([second.stdout], [], [], .1)[0]); self.assertEqual(events.read_text(), "A-start\n")
+                release.touch()
+                for writer in writers:
+                    stdout, stderr = writer.communicate(timeout=5); self.assertEqual(writer.returncode, 0, stderr)
+                self.assertEqual(events.read_text(), "A-start\nA-end\nB-start\nB-end\n")
+                self.assertEqual(stat.S_IMODE((base / INSTALLATION / "routing.lock").stat().st_mode), 0o600)
+            finally:
+                for writer in writers:
+                    if writer.poll() is None: writer.kill()
+                    writer.communicate(timeout=5)
+
+    def test_routing_lock_foreign_namespace_or_unsafe_leaf_never_dispatches(self):
+        for case in ("owner", "mode", "contents", "symlink", "fifo", "uid"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary); directory = base / INSTALLATION; SETUP.namespace(directory, INSTALLATION); lock = directory / "routing.lock"
+                if case == "owner": (directory / "owner").write_text("foreign-installation\n")
+                if case in ("mode", "contents", "uid"):
+                    lock.write_text("foreign" if case == "contents" else ""); lock.chmod(0o644 if case == "mode" else 0o600)
+                if case == "symlink": lock.symlink_to(directory / "owner")
+                if case == "fifo": os.mkfifo(lock, 0o600)
+                original_fstat = os.fstat
+                def fstat(fd):
+                    value = original_fstat(fd)
+                    return types.SimpleNamespace(st_mode=value.st_mode, st_uid=value.st_uid+1, st_size=value.st_size,
+                                                 st_dev=value.st_dev, st_ino=value.st_ino) if case == "uid" else value
+                with patch.object(SETUP, "OPERATOR_ROOT", base), patch.object(SETUP.os, "fstat", side_effect=fstat), patch.object(SETUP, "routing_unlocked") as operation:
+                    with self.assertRaises((ValueError, OSError)): SETUP.routing(self.config())
+                    operation.assert_not_called()
+
+    def test_routing_lock_busy_wait_is_bounded_and_never_dispatches(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary); directory = base / INSTALLATION; SETUP.namespace(directory, INSTALLATION)
+            fd = os.open(directory / "routing.lock", os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                SETUP.fcntl.flock(fd, SETUP.fcntl.LOCK_EX | SETUP.fcntl.LOCK_NB)
+                with patch.object(SETUP, "OPERATOR_ROOT", base), patch.object(SETUP, "ROUTING_LOCK_WAIT_SECONDS", .05), patch.object(SETUP, "routing_unlocked") as operation:
+                    with self.assertRaisesRegex(ValueError, "routing is busy"): SETUP.routing(self.config())
+                    operation.assert_not_called()
+            finally: os.close(fd)
 
     def test_systemd_argument_does_not_expand_path_variables_or_specifiers(self):
         value = SETUP.unit_argument('/srv/a b/$secret%name"file')
@@ -437,10 +506,29 @@ class InstallerTests(unittest.TestCase):
         context = (config["dataDir"], "control", "br-control", "172.25.0.0/24", "172.25.0.1", "172.25.0.2")
         with patch.object(SETUP, "installation_id", return_value=INSTALLATION), patch.object(SETUP, "docker_context", return_value=context), \
              patch.object(SETUP, "native", return_value={"name": config["network"], "config": {SETUP.MARKER: INSTALLATION, "ipv4.address": "10.25.0.1/24"}}), \
-             patch.object(SETUP, "command", side_effect=command): SETUP.routing(config)
+             patch.object(SETUP, "command", side_effect=command): SETUP.routing_unlocked(config)
         self.assertEqual(len(submitted), 2); self.assertEqual(submitted[0][0], ("nft", "--check", "-f", "-"))
         self.assertEqual(submitted[1][0], ("nft", "-f", "-")); self.assertEqual(submitted[0][1], submitted[1][1])
         self.assertTrue(submitted[0][1].endswith(b';\n }\n}\n')); self.assertNotIn(b"; } }", submitted[0][1])
+
+    def test_duplicate_owned_nft_rules_remain_rejected_without_auto_repair(self):
+        config = self.config(); mutations = []
+        entries = [{"chain": {"name": "postrouting", "hook": "postrouting", "type": "nat", "prio": 99}},
+                   {"rule": {"comment": "agentor-source-" + INSTALLATION}}, {"rule": {"comment": "agentor-source-" + INSTALLATION}}]
+        def command(*args, **kwargs):
+            if args[0] == "ip": return b'[{"dev":"eth0"}]'
+            if args[:3] == ("iptables", "-w", "-S"): return b"-N DOCKER-USER\n"
+            if args[:4] == ("nft", "-j", "list", "tables"):
+                return json.dumps({"nftables": [{"table": {"family": "ip", "name": config["sourceTable"]}}]}).encode()
+            if args[:4] == ("nft", "-j", "list", "table"): return json.dumps({"nftables": entries}).encode()
+            if args[0] == "nft": mutations.append(args)
+            return b""
+        context = (config["dataDir"], "control", "br-control", "172.25.0.0/24", "172.25.0.1", "172.25.0.2")
+        with patch.object(SETUP, "installation_id", return_value=INSTALLATION), patch.object(SETUP, "docker_context", return_value=context), \
+             patch.object(SETUP, "native", return_value={"name": config["network"], "config": {SETUP.MARKER: INSTALLATION, "ipv4.address": "10.25.0.1/24"}}), \
+             patch.object(SETUP, "command", side_effect=command):
+            with self.assertRaisesRegex(ValueError, "source-NAT table is foreign/ambiguous"): SETUP.routing_unlocked(config)
+        self.assertEqual(mutations, [])
 
 
 if __name__ == "__main__": unittest.main()
