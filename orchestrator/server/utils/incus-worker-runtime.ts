@@ -40,6 +40,13 @@ import { pipeline } from 'node:stream/promises';
 import { isDeepStrictEqual } from 'node:util';
 import { openIncusDockerArchive, INCUS_OFFLINE_DOCKER_ARCHIVE_SCRIPT } from './incus-docker-archive';
 
+/** Ubuntu's Incus virtiofs sockets include the project, instance and device key. */
+export function assertIncusWorkerSocketPath(project: string, instanceName: string): void {
+  const path = `/var/lib/incus/devices/${project}_${instanceName}/virtio-fs.workspace.sock`;
+  if (Buffer.byteLength(path) > 107)
+    throw new Error('Incus worker virtiofs socket path exceeds 107 bytes; use a shorter Incus project or worker container prefix before creating workers');
+}
+
 /** Docker-style worker caps are binary units, not raw Incus unit strings. */
 export function incusWorkerMemoryLimit(value?: string): string | undefined {
   if (!value) return undefined;
@@ -939,6 +946,7 @@ export class IncusWorkerRuntime {
   }
 
   private validateOptions(opts: IncusWorkerOptions): void {
+    assertIncusWorkerSocketPath(this.config.incusProject, opts.containerName);
     incusWorkerMemoryLimit(opts.memoryLimit);
     // Refuse pending storage features on restart too; never put persistent
     // Docker/account data on disposable rootfs when settings change.

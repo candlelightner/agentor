@@ -258,7 +258,7 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
   const sourceRuleSnapshot = (value: string) => JSON.stringify(JSON.parse(value), (key, value) =>
     key === 'metainfo' ? undefined : key === 'counter' ? {} : value);
   let baseline: Awaited<ReturnType<IncusManagedVolumeRuntime['inspectVolume']>>;
-  const config = { ...loadConfig(), dataDir: source, containerPrefix: app ? 'aphr-' + jobId.slice(0, 8) : 'agentor-worker', incusEnabled: true,
+  const config = { ...loadConfig(), dataDir: source, containerPrefix: app ? custom && !customRetained ? 'af-' + jobId.slice(0, 5) : 'aphr-' + jobId.slice(0, 8) : 'agentor-worker', incusEnabled: true,
     incusEndpoint: historical ? process.env.INCUS_ENDPOINT! : 'https://127.0.0.1:18443', incusProject: custom?.project ?? 'agentor', incusStoragePool: 'default', incusNetwork: custom?.network ?? 'incusbr0',
     incusWorkerImage: custom?.incusWorkerImage ?? 'agentor-worker-phase10-preserve-ownership',
     incusConverterSeedFingerprint: custom?.seedFingerprint, incusConverterStoragePool: custom?.converterStoragePool,
@@ -266,6 +266,8 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
     incusClientKeyPath: custom ? join(custom.credentialsDir, 'client.key') : '/workspace/agentor-incus-tls/client.key',
     incusServerCertPath: custom ? join(custom.credentialsDir, 'server.crt') : '/workspace/agentor-incus-tls/server.crt',
     incusDockerVolumeSize: '1GiB', incusInternalGatewayUrl: 'http://10.159.68.1:' + (app ? appPort : 38000) };
+  if (custom && !customRetained && Buffer.byteLength(`/var/lib/incus/devices/${config.incusProject}_${config.containerPrefix}-${id}/virtio-fs.workspace.sock`) > 107)
+    throw new Error('Disposable fixture naming exceeds the virtiofs socket budget; fail before image build/conversion');
   const runtime = new IncusWorkerRuntime(config), managedRuntime = new IncusManagedVolumeRuntime(config, runtime);
   let remoteData = (customRetained?.remoteDir ?? retained?.remoteDir ?? remote) + '/data';
   const tlsRoot = custom?.tlsRoot ?? '/var/tmp/agentor-phase6-production.SSkg3hQz/tls';

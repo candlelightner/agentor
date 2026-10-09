@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile, readFile, symlink, link } from "node:fs/promise
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { IncusWorkerRuntime, incusWorkerMemoryLimit, serializeIncusWorkerEnv, INCUS_GUEST_READINESS_SCRIPT, INCUS_MAIN_SESSION_PROBE, type IncusWorkerOptions } from "../../orchestrator/server/utils/incus-worker-runtime";
+import { IncusWorkerRuntime, assertIncusWorkerSocketPath, incusWorkerMemoryLimit, serializeIncusWorkerEnv, INCUS_GUEST_READINESS_SCRIPT, INCUS_MAIN_SESSION_PROBE, type IncusWorkerOptions } from "../../orchestrator/server/utils/incus-worker-runtime";
 import { IncusClient } from "../../orchestrator/server/utils/incus-client";
 import { ContainerManager } from "../../orchestrator/server/utils/container";
 import { WorkerStore } from "../../orchestrator/server/utils/worker-store";
@@ -54,6 +54,18 @@ function options(): IncusWorkerOptions {
     workerJson: { id, displayName: "Incus test", repos: [], initScript: "", gitName: "", gitEmail: "" },
   };
 }
+
+test('virtiofs socket admission accepts stock boundary and rejects overlong names before image resolution', async () => {
+  const opts = options();
+  expect(() => assertIncusWorkerSocketPath('agentor', opts.containerName)).not.toThrow();
+  expect(() => assertIncusWorkerSocketPath('agentorx', opts.containerName)).toThrow('107 bytes');
+  expect(() => assertIncusWorkerSocketPath('agentor', opts.containerName + 'é')).toThrow('107 bytes');
+  const client = {} as IncusClient;
+  const runtime = new IncusWorkerRuntime({ ...config, incusProject: 'agentorx' }, client);
+  (runtime as any).assertReady = async () => {};
+  (runtime as any).storage = async () => { throw new Error('Storage must not be touched'); };
+  await expect(runtime.create(opts)).rejects.toThrow('107 bytes');
+});
 
 test('native worker memory caps preserve Docker binary units and supported IEC values', () => {
   for (const [input, expected] of [['1024m', '1073741824'], ['1.5GB', '1610612736'],
