@@ -2,6 +2,10 @@
   "extends": "../orchestrator/.nuxt/tsconfig.server.json",
   "compilerOptions": { "noEmit": true, "rootDir": "..", "esModuleInterop": true },
   "include": [
+    "api/incus-worker-lifecycle.spec.ts",
+    "api/incus-worker-runtime.spec.ts",
+    "api/incus-worker-commands.spec.ts",
+    "api/incus-exec-transport.spec.ts",
     "api/incus-startup-reconciliation.spec.ts",
     "api/incus-production-canary.spec.ts",
     "api/incus-host-setup-live.spec.ts",

@@ -123,7 +123,7 @@ test('managed tmux dispatch and disconnect cleanup use bootstrap mode with exist
   let allow = true, closed = 0;
   const socket = Object.assign(new EventEmitter(), { readyState: 1, _socket: undefined,
     send(_bytes: unknown, callback?: () => void) { callback?.(); },
-    close() { this.readyState = 3; this.emit('close'); }, terminate() { this.close(); } });
+    close(): void { socket.readyState = 3; socket.emit('close'); }, terminate(): void { socket.close(); } });
   const commands = new IncusWorkerCommands({
     execStream: async (_name: string, command: string[]) => { calls.push(command); return fakeSession(); },
     execInteractive: async (_name: string, command: string[], _options: unknown, connected: (socket: any) => void) => {
@@ -134,11 +134,11 @@ test('managed tmux dispatch and disconnect cleanup use bootstrap mode with exist
   await commands.execListTmuxWindows('incus:uuid');
   const terminal = await commands.attachTerminal(0);
   expect(calls[2]).toContain('agentor-terminal');
-  expect(calls[2].join(' ')).toContain('-t =main');
+  expect(calls[2]!.join(' ')).toContain('-t =main');
   terminal.close(); terminal.close();
   await expect.poll(() => calls.length).toBe(4);
   expect(calls.every((command) => command[5] === 'bootstrap-tmux')).toBe(true);
-  expect(calls[3].slice(-3, -1)).toEqual(['kill-session', '-t']);
+  expect(calls[3]!.slice(-3, -1)).toEqual(['kill-session', '-t']);
   expect(closed).toBe(1);
   allow = false;
   await expect(commands.execTmux('incus:uuid', ['kill-session', '-t', 'ws-old'])).rejects.toThrow('authority changed');

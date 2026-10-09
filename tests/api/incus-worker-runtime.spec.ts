@@ -238,7 +238,7 @@ test('production image callback rechecks durable tuple, lifecycle nonce and grou
   const selection = { definitionId: randomUUID(), version: 'v1', digest: image.sourceImageId };
   const opts = { ...options(), id, userId, containerName: cfg.containerPrefix + '-' + id, image: selection.digest, imageSelection: selection };
   const workers = new WorkerStore(root); await workers.init();
-  const record = { id, userId, runtimeKind: 'incus-vm' as const, status: 'active' as const,
+  const record = { id, userId, displayName: 'Image wiring fixture', runtimeKind: 'incus-vm' as const, status: 'active' as const,
     imageDefinitionId: selection.definitionId, imageVersion: selection.version, imageDigest: selection.digest,
     imageRuntimeReference: selection.digest, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString() };
   await workers.upsert(record);
@@ -918,7 +918,8 @@ test('immutable image identity validates complete pinned conversion metadata', a
       : key === 'converterVersion' ? '' : 'invalid' };
     expect(() => validateIncusImageIdentity(malformed)).toThrow('immutable worker image metadata');
   }
-  expect(sameIncusImageSource(original, { ...original, fingerprint: 'd'.repeat(64) })).toBe(true);
+  const differentFingerprint = { ...original, fingerprint: 'd'.repeat(64) };
+  expect(sameIncusImageSource(original, differentFingerprint)).toBe(true);
   expect(sameIncusImageSource(original, { ...original, recipeId: 'd'.repeat(64) })).toBe(false);
 });
 

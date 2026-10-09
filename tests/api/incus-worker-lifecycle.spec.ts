@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { ContainerManager } from '../../orchestrator/server/utils/container';
 import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
 import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker-runtime';
+import { IncusManagedVolumeRuntime } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
 import { zeroUserEnvVars } from '../../orchestrator/server/utils/user-env-store';
 import { useBackupManager } from '../../orchestrator/server/utils/backup-manager';
 import { useManagedVolumeManager } from '../../orchestrator/server/utils/managed-volume-manager';
@@ -14,7 +15,7 @@ import { workerLifecycleGeneration, withOwnerWorkerRuntimeSetup, withOwnerWorker
   isWorkerLifecycleMutationPending } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
 import { operationSettlement } from '../../orchestrator/server/utils/operation-deadline';
 import type { Config } from '../../orchestrator/server/utils/config';
-import { usePersistentBackupPathManager } from '../../orchestrator/server/utils/services';
+import { useConfig, useContainerManager, useWorkerStore, usePersistentBackupPathManager } from '../../orchestrator/server/utils/services';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, error() {}, warn() {}, debug() {} });
 (globalThis as any).useLogCollector ??= () => ({ attach: async () => {}, detach() {} });
@@ -865,7 +866,7 @@ async function initialCreationFixture(run: (manager: ContainerManager, store: Wo
     runtime.remove = runtime.removeStorage = async () => { throw new Error('Initial failure must not use name-only/data cleanup'); };
     const config = useWorkerConfigStore();
     const original = { desired: config.resolveDesiredRevision, mark: config.markApplied, remove: config.remove };
-    config.resolveDesiredRevision = async () => ({ revision: undefined, values: [] });
+    config.resolveDesiredRevision = async (userId, workerId) => ({ revision: { userId, workerId, entries: [] }, values: [] });
     config.markApplied = async () => { calls.push('applied'); };
     config.remove = async () => { calls.push('remove-provisional-config'); };
     state.owner = info.userId;
@@ -1209,27 +1210,47 @@ test('real production-manager archive retains canonical volumes, source and pend
     process.env.INCUS_REBOOT_TEST !== 'true' && process.env.INCUS_RECREATION_RECOVERY_TEST !== 'true' &&
     process.env.INCUS_MISSING_RECOVERY_TEST !== 'true' && process.env.INCUS_INITIAL_CREATE_TEST !== 'true', 'Explicit disposable Incus lifecycle acceptance');
   test.setTimeout(900_000);
-  const root = await mkdtemp(join(tmpdir(), 'agentor-incus-archive-live-'));
-  const config = { dataDir: root, incusEnabled: true, incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor',
+  // Phase9 persistence consults these production singletons, not a private
+  // manager/store pair. Reload authoritative records while restart variants
+  // still construct fresh managers with genuinely empty runtime caches.
+  const config = useConfig();
+  Object.assign(config, { incusEnabled: true, incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor',
     incusClientCertPath: '/workspace/agentor-incus-tls/client.crt', incusClientKeyPath: '/workspace/agentor-incus-tls/client.key',
     incusServerCertPath: '/workspace/agentor-incus-tls/server.crt', incusNetwork: 'incusbr0', incusStoragePool: 'default',
     incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase6-candidate',
-    incusInternalGatewayUrl: 'http://10.159.68.1:3000', containerPrefix: 'agentor-worker', workerImage: 'agentor-worker:latest', workerImagePrefix: '' } as Config;
-  const store = new WorkerStore(root); await store.init();
-  let cleanupStore = store;
+    incusInternalGatewayUrl: 'http://10.159.68.1:3000', containerPrefix: 'agentor-worker', workerImage: 'agentor-worker:latest', workerImagePrefix: '' });
+  const store = useWorkerStore(), manager = useContainerManager(), volumes = useManagedVolumeManager();
+  await store.init(); await volumes.init();
+  const fixtureOwner = 'archive-live-' + randomUUID();
   const runtime = new IncusWorkerRuntime(config);
-  const manager = new ContainerManager(new Proxy({}, { get: () => () => { throw new Error('Docker fallback'); } }) as any, config);
+  const capturedIncarnations = new Map<string, string>();
+  const createNative = runtime.create.bind(runtime);
+  runtime.create = async (options, existing) => {
+    const instance = await createNative(options, existing);
+    expect(options.userId).toBe(fixtureOwner);
+    const incarnation = instance.config['volatile.uuid'];
+    if (typeof incarnation !== 'string' || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(incarnation))
+      throw new Error('Created fixture VM lacks its exact acknowledged incarnation');
+    capturedIncarnations.set(options.id, incarnation);
+    return instance;
+  };
+  const noDocker = new Proxy({ listContainers: async () => [] }, {
+    get(target, key) { if (key === 'listContainers') return target.listContainers; return () => { throw new Error('Docker fallback'); }; } });
+  (manager as any).dockerService = noDocker;
+  (volumes.runtime as any).docker = noDocker;
+  (volumes as unknown as { incus: IncusManagedVolumeRuntime }).incus = new IncusManagedVolumeRuntime(config, runtime);
   manager.setWorkerStore(store); manager.setIncusRuntime(runtime);
   (manager as any).assertOwnerExists = async () => {};
   (manager as any).resolveGitIdentity = async () => ({ gitName: '', gitEmail: '' });
   (manager as any).resolveAuthorizedHostMounts = async () => undefined;
   (manager as any).resolveHardwareDeviceAccess = async () => undefined;
-  (manager as any).resolveUserEnvAndBinds = async () => ({ userEnv: zeroUserEnvVars('archive-live-owner'), credentialBinds: [], groupSecrets: [] });
+  (manager as any).resolveUserEnvAndBinds = async () => ({ userEnv: zeroUserEnvVars(fixtureOwner), credentialBinds: [], groupSecrets: [] });
   (manager as any).resolveEnvironmentConfig = () => ({ dockerEnabled: false,
     environmentJson: { networkMode: 'full', allowedDomains: [], dockerEnabled: false, setupScript: '', envVars: '',
       exposeApis: { portMappings: true, domainMappings: true, usage: true } }, capabilitiesJson: [], instructionsJson: [] });
+  let completed = false;
   try {
-    let info = await (manager as any).createForOwner({ userId: 'archive-live-owner', displayName: 'archive acceptance',
+    let info = await (manager as any).createForOwner({ userId: fixtureOwner, displayName: 'archive acceptance',
       workerConfiguration: process.env.INCUS_REBOOT_TEST === 'true' || process.env.INCUS_MISSING_RECOVERY_TEST === 'true'
         ? { secrets: [{ key: 'BOOT_SECRET', value: 'applied' }] } : undefined });
     const created = await runtime.client.exec(info.containerName, ['sh', '-ec',
@@ -1247,14 +1268,14 @@ test('real production-manager archive retains canonical volumes, source and pend
         await expect((manager as any).createForOwner({ userId: info.userId, displayName: 'lost initial response' }))
           .rejects.toMatchObject({ code: 'WORKER_CREATE_CONTAINER_RETAINED' });
       } finally { runtime.create = create; }
-      const lost = store.list().find((record) => record.id !== info.id)!;
+      const lost = store.list().find((record) => record.userId === fixtureOwner && record.id !== info.id)!;
       const lostName = manager.buildContainerName(lost.id);
       expect(lost.incusRecreation?.replacementIncarnation).toBeUndefined();
       expect((await runtime.client.getInstance(lostName)).config['user.agentor.recreation']).toBe(lost.incusRecreation?.nonce);
       expect((await runtime.client.getInstanceState(lostName)).status).toBe('Stopped');
-      const reloadedStore = new WorkerStore(root); await reloadedStore.init();
-      const reloaded = new ContainerManager({ listContainers: async () => [] } as any, config);
-      reloaded.setWorkerStore(reloadedStore); reloaded.setIncusRuntime(runtime);
+      await store.loadUser(info.userId);
+      const reloadedStore = store, reloaded = new ContainerManager(noDocker as any, config);
+      reloaded.setWorkerStore(store); reloaded.setIncusRuntime(runtime);
       (reloaded as any).assertOwnerExists = async () => {};
       await reloaded.sync(); await reloaded.reconcileIncusWorkers();
       await expect(runtime.client.getInstance(lostName)).rejects.toMatchObject({ statusCode: 404 });
@@ -1263,14 +1284,13 @@ test('real production-manager archive retains canonical volumes, source and pend
       // Captured create followed by startup failure uses immediate proven
       // rollback, retaining initial volumes/config instead of name cleanup.
       manager.setWorkerStore(reloadedStore);
-      cleanupStore = reloadedStore;
       const start = runtime.start.bind(runtime);
       runtime.start = async () => { throw new Error('injected initial startup failure'); };
       try {
         await expect((manager as any).createForOwner({ userId: info.userId, displayName: 'captured initial failure' }))
           .rejects.toThrow('injected initial startup failure');
       } finally { runtime.start = start; }
-      const failed = reloadedStore.list().find((record) => record.id !== info.id && record.id !== lost.id)!;
+      const failed = reloadedStore.list().find((record) => record.userId === fixtureOwner && record.id !== info.id && record.id !== lost.id)!;
       expect(failed.status).toBe('archived'); expect(failed.incusRecreation).toBeUndefined();
       const failedName = manager.buildContainerName(failed.id);
       await expect(runtime.client.getInstance(failedName)).rejects.toMatchObject({ statusCode: 404 });
@@ -1298,10 +1318,10 @@ test('real production-manager archive retains canonical volumes, source and pend
             workerConfiguration: { secrets: [{ key: 'PARTIAL_SECRET', value: `retained-${allocation}` }] } }))
             .rejects.toMatchObject({ code: 'WORKER_CREATE_CONTAINER_RETAINED' });
         } finally { runtime.create = create; runtime.client.createCustomVolume = createVolume; }
-        expect(cleanupStore.get(info.userId, attemptedOptions.id)?.incusRecreation?.initialCreate).toBe(true);
-        const partialStore = new WorkerStore(root); await partialStore.init();
-        const recovery = new ContainerManager({ listContainers: async () => [] } as any, config);
-        recovery.setWorkerStore(partialStore); recovery.setIncusRuntime(runtime);
+        expect(store.get(info.userId, attemptedOptions.id)?.incusRecreation?.initialCreate).toBe(true);
+        await store.loadUser(info.userId);
+        const partialStore = store, recovery = new ContainerManager(noDocker as any, config);
+        recovery.setWorkerStore(store); recovery.setIncusRuntime(runtime);
         (recovery as any).assertOwnerExists = async () => {};
         await recovery.sync(); await recovery.reconcileIncusWorkers();
         expect(partialStore.get(info.userId, attemptedOptions.id)).toMatchObject({
@@ -1318,9 +1338,9 @@ test('real production-manager archive retains canonical volumes, source and pend
           expect(workspace.config['user.agentor.id']).toBe(attemptedOptions.id); expect(workspace.used_by ?? []).toEqual([]);
         } else await expect(runtime.client.getCustomVolume(config.incusStoragePool, `${attemptedOptions.containerName}-workspace`))
           .rejects.toMatchObject({ statusCode: 404 });
-        manager.setWorkerStore(partialStore); cleanupStore = partialStore;
+        manager.setWorkerStore(partialStore);
       }
-      return;
+      completed = true; return;
     }
     if (process.env.INCUS_MISSING_RECOVERY_TEST === 'true') {
       info.pendingRebuild = true; info.initScript = 'touch /workspace/unapplied-recovery-init';
@@ -1336,9 +1356,9 @@ test('real production-manager archive retains canonical volumes, source and pend
       await checkApplied(info);
       const removedHandle = info.containerId;
       await runtime.remove(info, info.containerId.slice(6));
-      const reloadedStore = new WorkerStore(root); await reloadedStore.init();
-      const reloaded = new ContainerManager({ listContainers: async () => [] } as any, config);
-      reloaded.setWorkerStore(reloadedStore); reloaded.setIncusRuntime(runtime);
+      await store.loadUser(info.userId);
+      const reloadedStore = store, reloaded = new ContainerManager(noDocker as any, config);
+      reloaded.setWorkerStore(store); reloaded.setIncusRuntime(runtime);
       (reloaded as any).assertOwnerExists = async () => {};
       (reloaded as any).resolveAuthorizedHostMounts = async () => undefined;
       (reloaded as any).resolveHardwareDeviceAccess = async () => undefined;
@@ -1351,7 +1371,7 @@ test('real production-manager archive retains canonical volumes, source and pend
       expect(reloadedStore.get(info.userId, info.id)).toMatchObject({ status: 'active', pendingRebuild: true, desiredRuntimeStatus: 'running' });
       expect((await useWorkerConfigStore().resolveValues(info.userId, info.id))[0]!.value).toBe('unapplied');
       await checkApplied(recovered);
-      return; // finally cleans only this test's newly-created runtime/volumes
+      completed = true; return; // finally cleans only this test's newly-created runtime/volumes
     }
     if (process.env.INCUS_RECREATION_RECOVERY_TEST === 'true') {
       const originalUuid = info.containerId.slice(6);
@@ -1374,9 +1394,9 @@ test('real production-manager archive retains canonical volumes, source and pend
       expect((await runtime.client.getInstance(info.containerName)).config['volatile.uuid']).toBe(replacement.config['volatile.uuid']);
       expect(store.get(info.userId, info.id)?.incusRecreation?.nonce).toBe('wrong-nonce');
       await store.upsert({ ...store.get(info.userId, info.id)!, incusRecreation: marker });
-      const reloadedStore = new WorkerStore(root); await reloadedStore.init();
-      const reloaded = new ContainerManager({ listContainers: async () => [] } as any, config);
-      reloaded.setWorkerStore(reloadedStore); reloaded.setIncusRuntime(runtime);
+      await store.loadUser(info.userId);
+      const reloadedStore = store, reloaded = new ContainerManager(noDocker as any, config);
+      reloaded.setWorkerStore(store); reloaded.setIncusRuntime(runtime);
       (reloaded as any).assertOwnerExists = async () => {};
       await reloaded.sync(); await reloaded.reconcileIncusWorkers();
       await expect(runtime.client.getInstance(info.containerName)).rejects.toMatchObject({ statusCode: 404 });
@@ -1398,9 +1418,9 @@ test('real production-manager archive retains canonical volumes, source and pend
       let original = await runtime.inspectGuestReadiness(info, incarnation);
       expect(original.provisioned && original.serviceReady).toBe(true);
       const servicePid = await runtime.client.exec(info.containerName, ['systemctl', 'show', '--property=MainPID', '--value', 'agentor-worker.service']);
-      const reloadedStore = new WorkerStore(root); await reloadedStore.init();
-      const reloaded = new ContainerManager({ listContainers: async () => [] } as any, config);
-      reloaded.setWorkerStore(reloadedStore); reloaded.setIncusRuntime(new IncusWorkerRuntime(config));
+      await store.loadUser(info.userId);
+      const reloaded = new ContainerManager(noDocker as any, config);
+      reloaded.setWorkerStore(store); reloaded.setIncusRuntime(new IncusWorkerRuntime(config));
       await reloaded.sync(); await reloaded.reconcileWorkers();
       expect(reloaded.get(info.id)?.status).toBe('running');
       expect((await runtime.client.exec(info.containerName, ['systemctl', 'show', '--property=MainPID', '--value', 'agentor-worker.service'])).stdout).toBe(servicePid.stdout);
@@ -1477,11 +1497,22 @@ test('real production-manager archive retains canonical volumes, source and pend
         'test "$(cat /workspace/archive-fixture)" = retained-workspace; test "$(cat /home/agent/.agent-data/archive-fixture)" = retained-agents; systemctl is-active --quiet agentor-worker']);
       expect(retained.returnCode).toBe(0);
     }
+    completed = true;
   } finally {
-    for (const worker of cleanupStore.list()) {
-      const owner = { id: worker.id, userId: worker.userId, containerName: manager.buildContainerName(worker.id) };
-      await runtime.remove(owner); await runtime.removeStorage(owner);
+    if (completed) {
+      for (const worker of store.list().filter(record => record.userId === fixtureOwner)) {
+        const owner = { id: worker.id, userId: worker.userId, containerName: manager.buildContainerName(worker.id) };
+        expect(worker.incusRecreation).toBeUndefined();
+        const incarnation = capturedIncarnations.get(worker.id);
+        if (incarnation) await runtime.remove(owner, incarnation);
+        else await expect(runtime.client.getInstance(owner.containerName)).rejects.toMatchObject({ statusCode: 404 });
+        await runtime.removeStorage(owner);
+        await store.delete(worker.userId, worker.id);
+      }
+    } else {
+      console.error('Incomplete lifecycle fixture retained without guessing cleanup authority', { dataDir: config.dataDir, fixtureOwner,
+        incarnations: [...capturedIncarnations] });
     }
-    await rm(root, { recursive: true, force: true });
+    // Never remove the singleton DATA_DIR or another fixture's records.
   }
 });
