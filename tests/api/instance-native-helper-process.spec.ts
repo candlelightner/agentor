@@ -1909,8 +1909,15 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
       // Historical DATA writes regular files independently: supported v1
       // semantics flatten inode links, but preserve both paths/bytes/metadata.
       expect(bytes).toEqual((historicalSource!.bytes as Array<Record<string, unknown>>).map(v => ({ ...v, hard: false })));
-      expect((await appRequest<string>('/editor/' + id + '/?folder=/workspace')).body).toContain('code-server');
-      expect((await appRequest<string>('/desktop/' + id + '/agentor.html')).body).toContain('noVNC');
+      // Legacy unarchive returns after compute starts, before its listeners
+      // necessarily bind. Keep the same worker and await each real proxy.
+      for (const [path, marker] of [['/editor/' + id + '/?folder=/workspace', 'code-server'],
+        ['/desktop/' + id + '/agentor.html', 'noVNC']] as const) {
+        await expect.poll(async () => {
+          const response = await appRequest<unknown>(path);
+          return { status: response.status, ready: typeof response.body === 'string' && response.body.includes(marker) };
+        }, { timeout: 120_000, intervals: [1000, 2000, 5000] }).toEqual({ status: 200, ready: true });
+      }
       await expect(runtime.client.getInstance(config.containerPrefix + '-' + id)).rejects.toMatchObject({ statusCode: 404 });
       expect(await historicalDirectories()).toBe(historicalSource!.directoryIdentity);
       expect(JSON.parse(await root(`sudo python3 -c ${quote(historicalHostMetadata())} read`))).toEqual(historicalSource!.bytes);
