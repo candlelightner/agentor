@@ -203,7 +203,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         while (Date.now() < deadline) {
             await this.assertOwned(record);
             try {
-                const result = await this.client.exec(record.nativeRuntime!.name, ['/usr/bin/true'], { command: [], user: 0, group: 0, timeoutMs: 5000 });
+                const result = await this.client.exec(record.nativeRuntime!.name, ['timeout', '5', '/usr/bin/true'], { command: [], user: 0, group: 0 });
                 if (result.returnCode === 0) { await this.assertOwned(record); return; }
             } catch { /* Only this harmless agent probe is safe to retry. */ }
             await this.assertOwned(record);
