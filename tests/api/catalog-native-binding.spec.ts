@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { ImageCatalogManager, ImageCatalogCore, type ImageDefinition, type ImageBuild, type NativeImageContext,
   type NativeImageSource } from '../../orchestrator/server/utils/image-catalog';
 import type { IncusImageConverterReceipt } from '../../orchestrator/server/utils/incus-image-converter';
@@ -66,6 +68,32 @@ test('cold catalog uses the same current source authority and private converter/
     expect(await f.manager.readNativeImageBinding(source, f.context, f.validate)).toEqual(binding);
     f.revoke();
     await expect(f.manager.readNativeImageBinding(source, f.context, f.validate)).rejects.toThrow('revoked');
+  } finally { await f.cleanup(); }
+});
+
+test('operator failed-abandonment survives catalog reload, permits authorized retry, and never grants publication or revoked access', async () => {
+  const f = await fixture(true); try {
+    const source = await f.authorize(); let id = '';
+    await expect(f.manager.ensureNativeImageBinding(source, f.context, f.validate, async buildId => {
+      id = buildId;
+      await f.manager.acknowledgeNativeConverter(id, { ...f.receipt(id), removed: undefined,
+        pending: { kind: 'start', operation: '/1.0/operations/' + randomUUID() } });
+      throw new Error('Lost native acknowledgement');
+    })).rejects.toThrow('Lost native acknowledgement');
+    await expect(f.manager.openNativeImageDerivation(source, f.context, f.validate)).rejects.toThrow();
+    const script = fileURLToPath(new URL('../../scripts/recover-incus-job.py', import.meta.url));
+    const changed = execFileSync('python3', ['-c',
+      'import importlib.util,json,sys;s=importlib.util.spec_from_file_location("recovery",sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);sys.stdout.buffer.write(m.replacement("converter",json.load(sys.stdin),sys.argv[2]))',
+      script, id], { input: await readFile(f.path), timeout: 10_000 });
+    await writeFile(f.path, changed, { mode: 0o600 });
+    const loaded = new ImageCatalogCore(f.root); await loaded.init();
+    expect(loaded.build(id, f.owner, false)).toMatchObject({ status: 'failed', nativeDerivation: { converter: { removed: true } } });
+    expect(loaded.build(id, f.owner, false).nativeDerivation!.converter).not.toHaveProperty('pending');
+    expect(await loaded.readNativeImageBinding(source, f.context, f.validate)).toBeUndefined();
+    await expect(loaded.publishNativeImageBinding(id, f.identity, 'agentor-storage-ownership-v1', f.validate)).rejects.toThrow();
+    const retry = await loaded.openNativeImageDerivation(source, f.context, f.validate); expect(retry).not.toBe(id);
+    f.revoke();
+    await expect(loaded.openNativeImageDerivation(source, { ...f.context, recipeId: 'f'.repeat(64) }, f.validate)).rejects.toThrow('revoked');
   } finally { await f.cleanup(); }
 });
 

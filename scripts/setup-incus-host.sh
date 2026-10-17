@@ -373,7 +373,7 @@ def unit_argument(value):
 
 def install_units(config, directory, library):
     short = config["installation"].replace("-", "")[:8]; prefix = "agentor-incus-" + short
-    scripts = ("setup-incus-host.sh", "check-incus-host.sh", "agentor-incus-network-service.py", "incus-managed-network-policy.py", "incus-host-mount-policy.py", "incus-host-mount-sources.py")
+    scripts = ("setup-incus-host.sh", "check-incus-host.sh", "recover-incus-job.py", "agentor-incus-network-service.py", "incus-managed-network-policy.py", "incus-host-mount-policy.py", "incus-host-mount-sources.py")
     namespace(library, config["installation"])
     for script in scripts: write_file(library / script, (ROOT / script).read_bytes(), 0o700 if script.endswith(".sh") else 0o600, True)
     policy = ["/usr/bin/python3", str(library / "agentor-incus-network-service.py"), "--data-dir", config["dataDir"], "--installation", config["installation"],

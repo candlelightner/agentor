@@ -24,6 +24,16 @@ INSTALLATION = "12345678-1234-1234-1234-123456789abc"
 
 
 class InstallerTests(unittest.TestCase):
+    def test_installs_operator_recovery_and_existing_source_module_as_private_files(self):
+        config=self.config();config.update(listen="172.25.0.1",policyPort=9444)
+        library=Path("/usr/local/lib/agentor-incus")/INSTALLATION
+        directory=Path("/etc/agentor/incus")/INSTALLATION
+        with patch.object(SETUP,"namespace"),patch.object(SETUP,"owned"), \
+             patch.object(SETUP,"write_file") as write,patch.object(SETUP,"command"):
+            SETUP.install_units(config,directory,library)
+        for name in ("recover-incus-job.py","incus-host-mount-sources.py"):
+            write.assert_any_call(library/name,(SCRIPT.parent/name).read_bytes(),0o600,True)
+
     def test_context_rejects_missing_or_stale_controller_endpoint_before_any_mutation(self):
         network = {"Id": "a" * 64, "Driver": "bridge", "Internal": False, "Options": {},
             "IPAM": {"Config": [{"Subnet": "172.25.0.0/24", "Gateway": "172.25.0.1"}]}}

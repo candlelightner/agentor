@@ -125,12 +125,11 @@ Retain quarantine until deliberate administrator cleanup is separately approved.
 It is retained disposable compute, never a new authoritative worker
 root filesystem, backup source, or migration image.
 
-## Quarantined native converter/storage-helper job (#2: triage only)
+## Quarantined native converter/storage-helper job (#2)
 
-This section collects evidence for administrator review. It does **not** add a
-receipt-settlement override. A safe general repair for expired/missing native
-acknowledgements is still tracked in #2; do not call the issue resolved merely
-because its helper is stopped or missing.
+Use the existing per-job authority below. A missing/stopped helper alone is not
+proof of settlement. The bounded operator command described afterward supports
+only **failed abandonment**, never successful result recovery or native cleanup.
 
 Use the existing Phase 8–10 per-job authority, not a new journal:
 
@@ -138,7 +137,7 @@ Use the existing Phase 8–10 per-job authority, not a new journal:
 | --- | --- | --- |
 | OCI converter/import | `image-catalog/image-catalog.json`, exact build's `nativeDerivation` | Catalog acknowledgements and `IncusImageConverter`; source authorization and exact converter UUID/import fingerprint |
 | Offline backup/restore helper | `incus-backup-helpers/<job-uuid>.json` under DATA | `IncusOfflineArchiveHelper`; exact helper UUID, optional copy identity, source rechecks and writer settlement |
-| Offline volume-size helper | `system-state/volume-size-jobs.v1.json`, exact job's `incusHelper` | `IncusVolumeSizeHelper.cleanup` via the sizing manager's existing recovery; pending native operation and copy/incarnation fences |
+| Offline volume-size helper | `system-state/users/volume-sizing/volume-size-jobs.v1.json`, exact job's `incusHelper` | `IncusVolumeSizeHelper.cleanup` via the sizing manager's existing recovery; pending native operation and copy/incarnation fences |
 
 1. Keep the exact DATA/installation and job record private and unchanged. Record
    its checksum, installation/project, owner, job ID, acknowledged operation,
@@ -172,9 +171,61 @@ Use the existing Phase 8–10 per-job authority, not a new journal:
    for a **job-specific reviewed recovery**. A host reboot can establish that old
    processes no longer survive, but it does not prove source data, an uncaptured
    UUID, callback success or image import success. There is deliberately no
-   blanket `404 = success`, force-clear, or receipt-edit command here.
+   blanket `404 = success` or force-clear command.
 
-This boundary permits safe manual investigation without weakening the existing
-fences. Adding a settlement action requires a concrete proof for that job type;
-it must reuse these stores/cleanup primitives and must not become a generic
-transaction/recovery framework.
+### Failed-abandonment after a full host reboot
+
+`setup-incus-host.sh` installs `recover-incus-job.py` beside its other host tools.
+This deliberately offline workflow can retire **one** existing cleanup fence
+after its disposable resources were already removed with proven identity. It
+does not delete resources, repair storage, replay operations, publish images,
+recover measurements, or establish a workspace writer's success.
+
+Supported cases are failed pre-import converters, read-only archive helpers and
+failed/cancelled offline size helpers on available directory pools. The original
+receipt must already contain the helper UUID and applicable copy acknowledgement.
+Uncaptured identities, active/imported images, workspace writers, remaining or
+orphaned helper disks, unavailable sources, pool mismatch and changed evidence
+are rejected. The historical c3a671a9 and 567f930b incidents are **not** authorized
+by this command; missing original acknowledgements/unavailable storage remain
+unresolved.
+
+1. Pause submissions. Explicitly stop the configured Orchestrator and **all**
+   other DATA writers, disable their automatic restart, and keep them offline
+   through the procedure. Include host/external writers, which the operator must
+   confirm; the command also checks overlapping Docker read-write mounts.
+   Keep the stack/configuration and source storage unchanged.
+2. Run an inspection using the root-owned installed configuration, exact job UUID
+   and one of `converter`, `archive`, `sizing`:
+
+   ```sh
+   sudo python3 /usr/local/lib/agentor-incus/<installation-uuid>/recover-incus-job.py \
+     --config /etc/agentor/incus/<installation-uuid>/config.json \
+     --kind <kind> --job <job-uuid> --confirm-submitters-offline
+   ```
+
+   This checks DATA installation, stopped controller identity/configuration,
+   current resource absence and source metadata/backing. It saves the byte-exact
+   original store and inspection in root-private
+   `/etc/agentor/incus/<installation-uuid>/native-job-<kind>-<job-uuid>/`.
+   Do not remove or replace that evidence to bypass a refusal.
+3. Perform a **full Incus host reboot**, keeping all submitters disabled. A daemon
+   restart is insufficient: old native subprocesses may survive it. Confirm the
+   original storage mounts returned normally. This is maintenance downtime for
+   the host; do not reboot merely to investigate an unsupported receipt.
+4. Repeat the exact command with `--apply`. It requires the same host with a new
+   boot ID and unchanged controller/configuration, entire store bytes/inode,
+   pool filesystem UUID, exact source backing inode and native source metadata.
+   It rechecks immediately before the bounded store change. Converter and sizing
+   jobs remain failed; only their cleanup fence is retired. An archive receipt
+   leaves the active directory but its exact original remains in private evidence.
+   No source data, unrelated job, image binding or native resource is changed.
+5. Resume the normal stack and retry through the existing authorized business
+   operation. The normal source/grant checks still apply; abandonment grants no
+   runtime or image authority. Retain the private original, intended replacement
+   and completion evidence for audit.
+
+If either step fails, stop and retain the evidence and data. In particular, a
+changed hash or interrupted apply is not permission to force-clear or repeat
+under a different job ID. The command is intentionally not a generalized
+transaction recovery facility.
