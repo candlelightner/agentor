@@ -28,7 +28,7 @@ test.beforeAll(async () => {
   const store = useAdminWorkspaceStore() as any, cm = useContainerManager() as any, docker = useDockerService();
   const path = join(dataDir,'admin/workspace.v1.json');
   const originalBytes = await readFile(path).catch(error => { if(error.code!=='ENOENT')throw error; return undefined; });
-  const state = {record:store.record,loading:store.loading,unavailable:store.unavailable,pendingCommit:store.pendingCommit};
+  const state = {record:store.record,loading:store.loading,unavailable:store.unavailable,pendingCommit:store.pendingCommit,runtime:store.runtime};
   const collaborators = {workerStore:cm.workerStore,resolveIncusCaller:cm.resolveIncusCaller,
     listContainers:docker.listContainers,listAdministrativeContainers:docker.listAdministrativeContainers};
   restoreSingletons = async () => {
@@ -41,6 +41,7 @@ test.beforeAll(async () => {
   await mkdir(join(dataDir, 'admin'), { recursive: true });
   await writeFile(join(dataDir, 'admin/workspace.v1.json'), JSON.stringify(platform), { mode: 0o600 });
   await useAdminWorkspaceStore().init(); await useWorkerGroupStore().init();
+  useAdminWorkspaceStore().setRuntimeAdapter({ async ensure() {}, async start() {}, async stop() {}, async rebuild() {} });
   // Every backend method that could reach Docker/Incus is replaced before use.
   useDockerService().listContainers = async () => [];
   useDockerService().listAdministrativeContainers = async () => [];
