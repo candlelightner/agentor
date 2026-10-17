@@ -114,16 +114,21 @@ export async function validateIncusDockerRestoreArchive(
       MAX_PORTABLE_MANAGED_VOLUME_EXPANDED_BYTES),
     allowPortablePax: true, requirePosixUstar: true, allowDockerSpecials: true, signal: limits.signal,
   });
-  validateNativeRootEntries(scan.entries, 'docker/', limits.signal);
+  validateNativeRootEntries(scan.entries, 'docker/', limits.signal, true);
   return { entries: scan.entries.length, expandedBytes: scan.expandedBytes };
 }
 
-function validateNativeRootEntries(entries: RawTarEntry[], root: string, signal?: AbortSignal): void {
+function validateNativeRootEntries(entries: RawTarEntry[], root: string, signal?: AbortSignal,
+  literalBackslashes = false): void {
+  // Only Docker's logical filesystem opts into literal Linux backslashes.
+  // GNU tar treats them as name bytes, never separators or escapes. Do not
+  // normalize/repack these names or broaden the other archive-role dialects.
+  literalBackslashes = literalBackslashes && root === 'docker/';
   const paths = new Map<string, RawTarEntry["type"]>(), regularFiles = new Set<string>();
   let rootSeen = false;
   for (const entry of entries) {
     throwIfAborted(signal);
-    const name = canonicalInnerName(entry.name, entry.type, root), bare = stripDirectorySlash(name);
+    const name = canonicalInnerName(entry.name, entry.type, root, literalBackslashes), bare = stripDirectorySlash(name);
     if (paths.has(bare)) throw invalidArchive("archive contains a duplicate or type-conflicting path");
     paths.set(bare, entry.type);
     if (bare === stripDirectorySlash(root)) {
@@ -131,10 +136,10 @@ function validateNativeRootEntries(entries: RawTarEntry[], root: string, signal?
       rootSeen = true;
     }
     if (entry.type === "symlink") {
-      if (!entry.linkName || entry.linkName.includes("\\") || Buffer.byteLength(entry.linkName) > MAX_PORTABLE_TAR_PATH_BYTES)
+      if (!entry.linkName || (!literalBackslashes && entry.linkName.includes("\\")) || Buffer.byteLength(entry.linkName) > MAX_PORTABLE_TAR_PATH_BYTES)
         throw invalidArchive("archive contains an unsafe symlink");
     } else if (entry.type === "hardlink") {
-      if (!regularFiles.has(canonicalLinkTarget(entry.linkName!, root)))
+      if (!regularFiles.has(canonicalLinkTarget(entry.linkName!, root, literalBackslashes)))
         throw invalidArchive("hardlink must target an earlier regular file in the canonical root");
     } else if (entry.type === "file") regularFiles.add(name);
   }
@@ -644,8 +649,9 @@ function validateOuterEntries(entries: RawTarEntry[], expected: PortableManagedV
   }
 }
 
-function canonicalInnerName(name: string, type: RawTarEntry["type"], root = PORTABLE_MANAGED_VOLUME_ROOT): string {
-  if (!name || name.includes("\0") || name.includes("\\") || name.startsWith("/") ||
+function canonicalInnerName(name: string, type: RawTarEntry["type"], root = PORTABLE_MANAGED_VOLUME_ROOT,
+  literalBackslashes = false): string {
+  if (!name || name.includes("\0") || (!literalBackslashes && name.includes("\\")) || name.startsWith("/") ||
       name.startsWith("./") || Buffer.byteLength(name) > MAX_PORTABLE_TAR_PATH_BYTES ||
       name.split("/").includes(".."))
     throw invalidArchive("archive contains an unsafe path");
@@ -674,8 +680,8 @@ function validateSymlink(name: string, linkTarget: string, mountTarget?: string)
     throw invalidArchive("archive symlink escapes volume/");
 }
 
-function canonicalLinkTarget(target: string, root = PORTABLE_MANAGED_VOLUME_ROOT): string {
-  if (!target || target.includes("\0") || target.includes("\\") || target.startsWith("/") ||
+function canonicalLinkTarget(target: string, root = PORTABLE_MANAGED_VOLUME_ROOT, literalBackslashes = false): string {
+  if (!target || target.includes("\0") || (!literalBackslashes && target.includes("\\")) || target.startsWith("/") ||
       target.endsWith("/") || target.startsWith("./") || target.split("/").includes("..") ||
       Buffer.byteLength(target) > MAX_PORTABLE_TAR_PATH_BYTES ||
       posix.normalize(target) !== target || !target.startsWith(root))

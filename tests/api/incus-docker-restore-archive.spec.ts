@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
@@ -67,6 +67,132 @@ os.setxattr(p,'system.posix_acl_access',acl)
     const bytes = await readFile(archive);
     await expect(validateIncusDockerRestoreArchive(archive)).resolves.toEqual({ entries: 4, expandedBytes: 4 });
     expect(await readFile(archive)).toEqual(bytes);
+  });
+});
+
+test('real GNU PAX Docker restore preserves literal systemd backslashes, distinct separators and link targets', async () => {
+  await fixture(async (directory, archive) => {
+    const stage = join(directory, 'stage'), docker = join(stage, 'docker'); await mkdir(docker, { recursive: true });
+    // Actual Linux/systemd unit basenames from Docker image layers. These
+    // contain four literal bytes \\x2d, not a hyphen or a path separator.
+    const names = [String.raw`system-systemd\x2dveritysetup.slice`, String.raw`system-systemd\x2dcryptsetup.slice`];
+    const parents = ['overlay2/' + 'a'.repeat(64) + '/diff/usr/lib/systemd/system',
+      'volumes/agentor-test-runner-docker/_data/overlay2/' + 'b'.repeat(26) + '/diff/usr/lib/systemd/system'];
+    for (const parent of parents) {
+      await mkdir(join(docker, parent), { recursive: true });
+      for (const name of names) await writeFile(join(docker, parent, name), Buffer.from([0, 255, 128, 10]));
+    }
+    const literal = String.raw`file\literal`, long = 'long-' + 'x'.repeat(120) + String.raw`\tail`;
+    await writeFile(join(docker, literal), 'literal'); await writeFile(join(docker, long), 'PAX link data');
+    await mkdir(join(docker, 'file'), { recursive: true }); await writeFile(join(docker, 'file/literal'), 'separator');
+    await link(join(docker, long), join(docker, String.raw`z-hard\literal`));
+    await symlink(long, join(docker, String.raw`symbolic\literal`));
+    await symlink(String.raw`/guest/external\literal`, join(docker, 'external'));
+    execFileSync('python3', ['-c', String.raw`
+import os,sys
+p=sys.argv[1];os.chown(p,12345,23456);os.chmod(p,0o640)
+os.utime(p,ns=(1700000000123456789,1700000000987654321))
+os.setxattr(p,'user.binary',bytes([0,255,128,10,61,0]))
+`, join(docker, long)]);
+    execFileSync('/usr/bin/tar', ['--sort=name', '--format=pax', '--numeric-owner', '--xattrs', '--xattrs-include=*', '--acls', '-C', stage, '-cf', archive, 'docker']);
+    const bytes = await readFile(archive);
+    await expect(validateIncusDockerRestoreArchive(archive)).resolves.toMatchObject({ expandedBytes: 16 + 7 + 9 + 13 });
+    expect(await readFile(archive)).toEqual(bytes);
+    const fresh = join(directory, 'fresh'); await mkdir(fresh);
+    // Same GNU inverse options as the production Docker block restore. Only
+    // temporary ordinary files/links are extracted; no devices or host mounts.
+    execFileSync('/usr/bin/tar', ['--numeric-owner', '--same-owner', '--same-permissions', '--xattrs', '--xattrs-include=*', '--acls',
+      '--delay-directory-restore', '-xpf', archive, '-C', fresh]);
+    const restored = join(fresh, 'docker');
+    for (const parent of parents) expect((await readdir(join(restored, parent))).sort()).toEqual([...names].sort());
+    expect(await readFile(join(restored, literal), 'utf8')).toBe('literal');
+    expect(await readFile(join(restored, 'file/literal'), 'utf8')).toBe('separator');
+    expect(await readlink(join(restored, String.raw`symbolic\literal`))).toBe(long);
+    expect(await readlink(join(restored, 'external'))).toBe(String.raw`/guest/external\literal`);
+    expect((await lstat(join(restored, String.raw`z-hard\literal`))).ino).toBe((await lstat(join(restored, long))).ino);
+    execFileSync('python3', ['-c', String.raw`
+import os,sys
+p,q=sys.argv[1:];a=os.stat(p);b=os.stat(q)
+assert (a.st_uid,a.st_gid,a.st_mode,a.st_mtime_ns)==(b.st_uid,b.st_gid,b.st_mode,b.st_mtime_ns)
+assert open(p,'rb').read()==open(q,'rb').read()
+assert os.getxattr(p,'user.binary')==os.getxattr(q,'user.binary')
+`, join(docker, long), join(restored, long)]);
+  });
+});
+
+test('Docker literal backslashes retain exact root, traversal, duplicate and non-directory ancestry guards', async () => {
+  await fixture(async (_directory, archive) => {
+    const literal: Item = { name: String.raw`docker/file\literal`, body: 'data' };
+    await writeTar(archive, [root, literal, { name: 'docker/file/', type: '5' }, { name: 'docker/file/literal', body: 'other' },
+      { name: String.raw`docker/hard\literal`, type: '1', link: literal.name }]);
+    await expect(validateIncusDockerRestoreArchive(archive)).resolves.toEqual({ entries: 5, expandedBytes: 9 });
+    for (const name of [String.raw`docker\outside/file`, String.raw`/docker/file\literal`, String.raw`./docker/file\literal`,
+      String.raw`docker/dir\literal/../escape`, String.raw`docker/a\/../escape`, String.raw`docker/dir\literal//file`, String.raw`docker/dir\literal/./file`]) {
+      await writeTar(archive, [root, { name, body: 'data' }]);
+      await expect(validateIncusDockerRestoreArchive(archive)).rejects.toThrow();
+    }
+    for (const pair of [[literal, literal], [literal, { name: literal.name + '/', type: '5' }]]) {
+      await writeTar(archive, [root, ...pair]); await expect(validateIncusDockerRestoreArchive(archive)).rejects.toThrow(/duplicate/);
+    }
+    for (const type of ['0', '1', '2', '3', '4', '6']) {
+      const parent: Item = { name: String.raw`docker/parent\literal`, type,
+        ...(type === '1' || type === '2' ? { link: literal.name } : {}) };
+      const child: Item = { name: parent.name + '/child', body: 'data' };
+      for (const pair of [[parent, child], [child, parent]]) {
+        await writeTar(archive, [root, literal, ...pair]);
+        await expect(validateIncusDockerRestoreArchive(archive)).rejects.toThrow(/non-directory/);
+      }
+    }
+    for (const target of [String.raw`docker\file`, String.raw`/docker/file\literal`, String.raw`docker/dir\literal/../file`,
+      String.raw`docker/missing\literal`, String.raw`docker/file\literal/`]) {
+      await writeTar(archive, [root, literal, { name: 'docker/hard', type: '1', link: target }]);
+      await expect(validateIncusDockerRestoreArchive(archive)).rejects.toThrow(/hardlink/);
+    }
+    await writeTar(archive, [root, { name: 'docker/hard', type: '1', link: literal.name }, literal]);
+    await expect(validateIncusDockerRestoreArchive(archive)).rejects.toThrow(/earlier regular/);
+  });
+});
+
+test('Docker PAX literal names and hardlink overrides agree with GNU extraction without rewriting bytes', async () => {
+  await fixture(async (directory, archive) => {
+    const name = String.raw`docker/..\literal`;
+    await writeTar(archive, [root, { name: 'pax', type: 'x', body: pax('path', name) }, { name: 'placeholder', body: 'literal PAX' },
+      { name: 'linkpax', type: 'x', body: pax('linkpath', name) }, { name: String.raw`docker/hard\literal`, type: '1', link: 'placeholder' }]);
+    const bytes = await readFile(archive);
+    await expect(validateIncusDockerRestoreArchive(archive)).resolves.toEqual({ entries: 3, expandedBytes: 11 });
+    const fresh = join(directory, 'fresh'); await mkdir(fresh);
+    execFileSync('/usr/bin/tar', ['--same-owner', '--same-permissions', '--delay-directory-restore', '-xpf', archive, '-C', fresh]);
+    expect(await readFile(join(fresh, name), 'utf8')).toBe('literal PAX');
+    expect((await lstat(join(fresh, String.raw`docker/hard\literal`))).ino).toBe((await lstat(join(fresh, name))).ino);
+    expect(await readFile(archive)).toEqual(bytes);
+    for (const path of [String.raw`docker/dir\literal/../escape`, String.raw`docker\outside/file`]) {
+      await writeTar(archive, [root, { name: 'pax', type: 'x', body: pax('path', path) }, file]);
+      await expect(validateIncusDockerRestoreArchive(archive)).rejects.toThrow();
+    }
+    await writeTar(archive, [root, file, { name: 'pax', type: 'x', body: pax('linkpath', String.raw`docker/..\literal/../file`) },
+      { name: 'docker/hard', type: '1', link: 'docker/file' }]);
+    await expect(validateIncusDockerRestoreArchive(archive)).rejects.toThrow(/hardlink/);
+  });
+});
+
+test('canonical, selected and portable roles keep rejecting backslashes despite caller-provided Docker flags', async () => {
+  await fixture(async (_directory, archive) => {
+    for (const wrapper of ['workspace', '.agent-data', 'selected', 'volume']) {
+      const flags = { literalBackslashes: true, allowDockerSpecials: true, requirePosixUstar: true } as any;
+      const validate = () => wrapper === 'workspace' || wrapper === '.agent-data'
+        ? validateIncusCanonicalRestoreArchive(archive, wrapper === 'workspace' ? 'workspace' : 'agents', flags)
+        : wrapper === 'selected' ? validateIncusSelectedRestoreArchive(archive, '/srv/selected', flags)
+          : validatePortableManagedVolumeArchive(archive, flags);
+      for (const items of [
+        [{ name: wrapper + String.raw`/file\literal`, body: 'data' }],
+        [{ name: wrapper + '/file', body: 'data' }, { name: wrapper + '/hard', type: '1', link: wrapper + String.raw`/file\literal` }],
+        [{ name: wrapper + '/symbolic', type: '2', link: String.raw`file\literal` }],
+        [{ name: 'pax', type: 'x', body: pax('path', wrapper + String.raw`/file\literal`) }, { name: 'placeholder', body: 'data' }],
+      ]) {
+        await writeTar(archive, [{ name: wrapper + '/', type: '5' }, ...items]);
+        await expect(validate()).rejects.toThrow();
+      }
+    }
   });
 });
 
