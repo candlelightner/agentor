@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Operator-installed mTLS service for owned bridge lifecycle/allowlisting only.
 
-Unrestricted Incus Unix access stays on the host. No command execution, raw
-Incus proxy, caller-selected project/path/config, or worker provisioning API.
+Unrestricted Incus Unix access and fixed firewall commands stay on the host.
+No caller-selected commands, raw Incus proxy, project/path/config, or worker
+provisioning API.
 """
 import argparse
 import hashlib
@@ -239,7 +240,7 @@ def main():
     context.load_cert_chain(args.server_cert, args.server_key)
     context.load_verify_locations(cafile=args.client_cert)
     context.verify_mode = ssl.CERT_REQUIRED
-    # HTTPServer serializes bridge/policy updates; If-Match additionally fences
+    # HTTPServer serializes bridge/firewall/policy updates; If-Match additionally fences
     # unrelated operator changes. No thread pool, scheduler or global journal.
     server = TlsPolicyServer((args.bind, args.port), handler(policy, fingerprint, mounts, admin_networks), context)
     server.serve_forever()
