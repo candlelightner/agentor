@@ -17,9 +17,19 @@ export interface WorkerGroup {
   createdAt: string;
   updatedAt: string;
 }
+function validatedGroupId(group: WorkerGroup): string {
+  const admin = group.adminWorkspace;
+  if (admin !== undefined && (!admin || admin.schemaVersion !== 1 || admin.kind !== "group-administrative" ||
+      typeof admin.id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(admin.id) ||
+      typeof admin.ownerId !== "string" || admin.ownerId !== group.userId ||
+      typeof admin.groupId !== "string" || admin.groupId !== group.id))
+    throw new Error("Invalid group administrative workspace identity");
+  return group.id;
+}
+
 export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
   constructor(dataDir: string) {
-    super(dataDir, "worker-groups.json", (group) => group.id);
+    super(dataDir, "worker-groups.json", validatedGroupId);
   }
   async create(
     userId: string,
@@ -83,6 +93,7 @@ export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
         group.workerSelfApiAccess = patch.workerSelfApiAccess;
       if (patch.adminWorkspace !== undefined)
         group.adminWorkspace = structuredClone(patch.adminWorkspace);
+      validatedGroupId(group);
       const map = this.items.get(userId)!;
       map.set(id, group);
       try {

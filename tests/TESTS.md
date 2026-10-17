@@ -2,6 +2,7 @@
 
 `api/incus-client.spec.ts` adds three loopback HTTP protocol cases for accepted create operations: running beyond the former five-minute bound then terminal success, finite 30-minute expiry, and terminal failure. Virtual elapsed time keeps the fixtures fast. Each proves one create POST, project-scoped polling, no final instance lookup/caller provisioning before success, and no cleanup mutation or resend. Existing runtime/lifecycle regressions cover nonce/UUID-fenced rollback. Client protocol tests: **27 passed / one live-gated skip**; unchanged runtime/lifecycle suites: **107 passed / four live-gated skips**; Nuxt typecheck passed. No live VM is launched by these cases.
 Archived image recovery: `api/worker-unarchive-image-resolution.spec.ts` adds nine actual-manager cases for immutable replacement/preserved settings, real catalog authorization/readiness denial, lifecycle queue authority, unsupported recovery modes, pre-create persistence failure, failed-create archival, strict public parsing and unchanged ordinary unarchive. Together with existing import-parser cases: **11 passed**; full Nuxt typecheck passed before the additional missing-runtime-alias regression. Real rebuilt-image migration remains pending.
+`api/ordinary-worker-identity.spec.ts` contains **26 isolated module cases** using real initialized platform/group administrative stores: cold-runtime archived-list and unarchive/delete/migration denial for both identities, unchanged shadow records and zero compute/storage calls, foreign ordinary IDs with identical display names, reconciliation preservation/no duplicate creation, unavailable target-owner authority rejection, queued lifecycle identity revalidation, and unfinished-migration unarchive rejection. The initial seven identity cases also cover admission/migration-fencing/lifecycle-coordinator boundaries. Identity/admin transaction modules: **39/39 passed**; connected quarantine/startup/group coordination/WorkerStore initialization modules: **45/45 passed**. Nuxt and strict fixture typechecks passed. These are manager/store tests; full API/UI acceptance remains pending. Run with `env -u DATA_DIR npx playwright test --config=playwright.modules.config.ts api/ordinary-worker-identity.spec.ts --workers=1` (the config creates private temporary metadata).
 
 Comprehensive end-to-end test suite for the Agentor platform using Playwright and TypeScript. Covers all API endpoints and UI interactions.
 
@@ -52,6 +53,7 @@ Incus migration coverage: `api/worker-runtime-kind.spec.ts` (6 cases), `api/incu
 - **2363 tests** across 234 test files (1729 API across 168 files + 634 UI across 66 files), as enumerated with the Playwright list reporter
 - **2374 tests** across 237 test files (1737 API across 170 files + 637 UI across 67 files), as enumerated with the Playwright list reporter
 - **3163 tests** across 319 test files (2529 API across 254 files + 634 UI across 65 files), as enumerated with the Playwright list reporter
+- **2370 tests** across 234 test files (1739 API across 169 files + 631 UI across 65 files), as enumerated with the Playwright list reporter
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
@@ -156,12 +158,14 @@ tests/
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
     api/                     # API endpoint tests (1730 tests across 168 files)
+    api/                     # API endpoint tests (1718 tests across 167 files)
   ui/                      # UI interaction tests (631 tests across 65 files)
 ```
 
 ## Test Categories
 
 ### API Tests (1541 tests, 151 files)
+### API Tests (1529 tests, 150 files)
 
 | File | Tests | Coverage |
 | --- | ---: | --- |
@@ -512,3 +516,8 @@ Disposable VM SSH log bounds add two local regressions (**26 launcher cases tota
 
 
 The disposable VM log fixture additionally proves suite-stage cancellation, timeout and unsettled-drain failures trigger zero report-transfer SSH requests before QEMU cleanup. Normal observed zero/nonzero exits still retrieve reports and retain their exit codes. The 26-case launcher set uses local Python producers and mocked VM/SSH/tools; no live launch is claimed.
+
+
+Administrative identity fault coverage includes nine platform-authority real-file cases in `ordinary-worker-identity.spec.ts`: invalid schema/kind/ID, empty/unsafe IDs, JSON corruption, directory/dangling-link authority, and legitimate ENOENT. Actual ordinary list/unarchive/delete/migration and dedicated ensure/start/rebuild all fail closed with 503 and unchanged bytes/zero runtime calls for existing invalid authority; a genuinely absent file remains absent until explicit ensure.
+
+Ten further real-file cases cover malformed nested group-admin schema/kind/ID/owner/group identity (including null), historical ordinary-shadow lifecycle denial, legacy IDs without services, and mixed healthy/quarantined-owner startup reconciliation (26 identity cases total). Invalid group files retain their exact bytes and expose no partial owner authority; invalid updates retain the last valid identity. Reconciliation continues for healthy owners while leaving quarantined Docker and Incus records unchanged with zero compute/storage calls; direct requests remain denied with 503. These checks use private temporary metadata and mocked runtimes, not production API/UI or native VM acceptance.

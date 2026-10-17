@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { useContainerManager } from "./services";
 import {
@@ -107,6 +107,7 @@ export class AdminWorkspaceStore {
   private record?: AdministrativeWorkspaceRecord;
   private readonly path: string;
   private loading?: Promise<void>;
+  private unavailable = false;
   private runtime?: AdminWorkspaceRuntimeAdapter;
   private identityMaterializer?: AdminWorkspaceIdentityMaterializer;
   private operationTail: Promise<void> = Promise.resolve();
@@ -140,16 +141,19 @@ export class AdminWorkspaceStore {
   async init() {
     if (this.loading) return this.loading;
     this.loading = (async () => {
+      let present = false;
       try {
+        const info = await lstat(this.path); present = true;
+        if (!info.isFile()) throw new Error('Invalid administrative workspace record');
         const parsed = JSON.parse(await readFile(this.path, "utf8"));
-        if (
-          parsed?.schemaVersion === 1 &&
-          typeof parsed.id === "string" &&
-          parsed.kind === "administrative"
-        )
-          this.record = parsed;
+        if (parsed?.schemaVersion !== 1 || parsed.kind !== "administrative" ||
+            typeof parsed.id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(parsed.id))
+          throw new Error('Invalid administrative workspace identity');
+        this.record = parsed;
       } catch (error: any) {
-        if (error?.code !== "ENOENT") throw error;
+        if (!present && error?.code === "ENOENT") return;
+        this.unavailable = true;
+        this.assertAvailable();
       }
     })();
     return this.loading;
@@ -214,7 +218,12 @@ export class AdminWorkspaceStore {
   }
   /** Read the persisted identity without provisioning or mutating the runtime. */
   getRecord() {
+    this.assertAvailable();
     return this.record ? structuredClone(this.record) : undefined;
+  }
+  private assertAvailable() {
+    if (this.unavailable)
+      throw Object.assign(new Error('Stored administrative workspace identity is unavailable'), { statusCode: 503 });
   }
   private async ensureLocked() {
     await this.init();
