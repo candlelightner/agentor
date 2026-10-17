@@ -1,3 +1,4 @@
+import { TMUX_TERMINAL_CLIPBOARD_SETUP } from './tmux-terminal-clipboard';
 import Docker from 'dockerode';
 import { assertBackupRestoreRuntimePrincipal, type BackupRestoreRuntimePrincipal } from './backup-restore-runtime-authority';
 import { PassThrough } from 'node:stream';
@@ -571,7 +572,7 @@ done`;
     const attachExec = await withOperationDeadline((operationSignal) => container.exec({
       Cmd: [
         'sh', '-c',
-        `tmux new-session -d -t main -s "${tmuxSession}" && { tmux select-window -t "${tmuxSession}:${windowIndex}" 2>/dev/null || true; } && exec tmux attach-session -t "${tmuxSession}"`,
+        TMUX_TERMINAL_CLIPBOARD_SETUP + `tmux new-session -d -t main -s "${tmuxSession}" && { tmux select-window -t "${tmuxSession}:${windowIndex}" 2>/dev/null || true; } && exec tmux attach-session -t "${tmuxSession}"`,
       ],
       AttachStdin: true,
       AttachStdout: true,

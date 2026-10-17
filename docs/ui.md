@@ -188,3 +188,31 @@ Centralized log viewer opened via the "Logs" button in the System tab's Quick Li
 - Filter bar: source toggles (orchestrator, worker, traefik), level toggles (debug, info, warn, error), text search (300ms debounce)
 - Color-coded badges: level (debug=gray, info=blue, warn=amber, error=red), source (orchestrator=purple, worker=green, traefik=orange)
 - Uses terminal CSS variables (`--terminal-*`) for seamless theme integration
+
+## Terminal response copy requests
+
+Agentor forwards typed `/copy` input to the selected agent CLI unchanged. When
+that CLI sends a standard OSC 52 clipboard write, xterm decodes a bounded UTF-8
+request and the Terminal pane shows **Copy response**. Clicking it provides the
+browser user gesture required to write the clipboard. If the browser blocks the
+write or the Clipboard API is unavailable (including insecure contexts), the
+pane exposes the complete response in a selectable text area. Dismissal,
+disconnect and terminal disposal clear pending copy text. Contents are neither
+logged nor persisted; queries never read the host clipboard or send it back to
+the worker. Malformed/empty/oversized requests show a content-free error; the
+limit is 1 MiB decoded text.
+
+Both legacy Docker and Incus terminal attachments enable tmux application
+clipboard forwarding for xterm clients, preserving existing terminal features
+and avoiding duplicate capability entries across reconnects. This takes effect
+on the next terminal attachment without changing running agent processes.
+
+This resolves the browser's missing standard clipboard-output path. It does
+not prove every CLI's `/copy` chooses that path: native VM/X11 clipboard writes
+alone do not reach the host browser. The [upstream Codex clipboard backend](https://github.com/openai/codex/blob/main/codex-rs/tui/src/clipboard_copy.rs)
+currently tries native copying and multiplexer/terminal forwarding independently,
+but the version and behavior of an existing worker can differ. CLI-specific
+`/copy` reproduction remains required for issue #7. Tests use the actual
+TerminalPane/useTerminal/xterm path and a simulated remote CLI, plus real tmux
+on a private temporary socket; no production conversation or credentials are
+used.

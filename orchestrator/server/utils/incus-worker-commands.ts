@@ -1,3 +1,4 @@
+import { TMUX_TERMINAL_CLIPBOARD_SETUP } from './tmux-terminal-clipboard';
 import { PassThrough, Readable, Duplex } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { posix } from 'node:path';
@@ -60,7 +61,7 @@ export class IncusWorkerCommands {
     const linked = `ws-${randomUUID()}`;
     let stream: Duplex | undefined;
     const session = await this.client.execInteractive(this.name, incusWorkerCommand(['sh', '-c',
-      'tmux new-session -d -t =main -s "$1" && { tmux select-window -t "$1:$2" 2>/dev/null || true; } && exec tmux attach-session -t "$1"',
+      TMUX_TERMINAL_CLIPBOARD_SETUP + 'tmux new-session -d -t =main -s "$1" && { tmux select-window -t "$1:$2" 2>/dev/null || true; } && exec tmux attach-session -t "$1"',
       'agentor-terminal', linked, String(windowIndex)], true), {
       command: [], user: 1000, group: 1000, cwd: '/workspace',
       environment: { HOME: '/home/agent', USER: 'agent', LOGNAME: 'agent', DISPLAY: ':99', TERM: 'xterm-256color',

@@ -818,6 +818,12 @@ An optional, additive **Workspace Files** popup (`WorkspaceFilesModal.vue`) open
 
 ---
 
+## 20a. Terminal response copy
+
+- Agent CLI clipboard-output requests prompt an explicit **Copy response** action; long/multiline UTF-8 text is preserved up to 1 MiB, with selectable-text fallback for blocked/unavailable clipboard APIs.
+- Typed slash commands remain transparent to the CLI. Pending text clears on dismissal, disconnect, and disposal; clipboard queries are ignored and no host clipboard read is sent to a worker.
+- Legacy Docker and Incus tmux attachments enable application clipboard forwarding idempotently. A CLI that only writes its native VM clipboard still needs separate CLI-specific diagnosis; issue #7 remains partially addressed pending a real CLI reproduction.
+
 ## 20b. Keyboard-transparent Clipboard Paste Bridge
 
 A keyboard-transparent Ctrl/Cmd+V bridge lets the host browser clipboard reach GUI apps (and the agent CLI) inside a worker without the user leaving the keyboard. It works in the **Agentor Terminal** (xterm.js) and in the **noVNC Desktop** / **Persistent VS Code** viewer.

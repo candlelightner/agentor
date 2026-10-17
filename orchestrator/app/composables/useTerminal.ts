@@ -1,3 +1,4 @@
+import { installTerminalClipboard } from './terminalClipboard';
 import type { Terminal, ITheme } from '@xterm/xterm';
 import type { FitAddon } from '@xterm/addon-fit';
 import { clipboardReadAvailable, useClipboardPaste } from './useClipboardPasteBridge';
@@ -47,6 +48,22 @@ const LIGHT_THEME: ITheme = {
 export function useTerminal() {
   const colorMode = useColorMode();
   const activeTerminal = shallowRef<TerminalState | null>(null);
+  const copyRequest = ref<{ text: string; error: string } | null>(null);
+  const copyMessage = ref('');
+
+  async function copyTerminalRequest() {
+    const requested = copyRequest.value;
+    if (!requested) return;
+    try {
+      if (!window.isSecureContext || typeof navigator.clipboard?.writeText !== 'function') throw new Error('Clipboard unavailable');
+      await navigator.clipboard.writeText(requested.text);
+      if (copyRequest.value === requested) { copyRequest.value = null; copyMessage.value = 'Terminal response copied.'; }
+    } catch {
+      if (copyRequest.value === requested) requested.error = 'Clipboard access is unavailable or blocked. Select and copy the text below.';
+    }
+  }
+  function dismissCopyRequest() { copyRequest.value = null; copyMessage.value = ''; }
+
   const { bridgeTerminalPaste, bridgeTerminalPasteEvent, runGuarded, isPasteInFlight } = useClipboardPaste();
 
   function getTheme(): ITheme {
@@ -115,12 +132,21 @@ export function useTerminal() {
     for (const type of eventTypes) {
       containerEl.addEventListener(type, overrideKey, { capture: true });
     }
+    const clipboardHandler = installTerminalClipboard(term, text => {
+      copyRequest.value = { text, error: '' };
+      copyMessage.value = '';
+    }, message => {
+      copyRequest.value = null;
+      copyMessage.value = message;
+    });
     let pasteCleanup = () => {};
     const eventCleanup = () => {
       for (const type of eventTypes) {
         containerEl.removeEventListener(type, overrideKey, { capture: true });
       }
       pasteCleanup();
+      clipboardHandler.dispose();
+      dismissCopyRequest();
     };
 
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -173,6 +199,7 @@ export function useTerminal() {
     };
 
     ws.onclose = () => {
+      dismissCopyRequest();
       term.write('\r\n\x1b[31m[Connection closed]\x1b[0m\r\n');
     };
 
@@ -328,6 +355,10 @@ export function useTerminal() {
 
   return {
     activeTerminal,
+    copyRequest,
+    copyMessage,
+    copyTerminalRequest,
+    dismissCopyRequest,
     openTerminal,
     closeTerminal,
     fitTerminal,
