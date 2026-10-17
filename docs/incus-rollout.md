@@ -218,3 +218,7 @@ empty/zero cap. This migration-discovered correction avoids Incus's implicit
 roughly 1 GiB default for previously uncapped Docker environments. Existing
 positive caps and Docker behavior remain unchanged; running VMs are not resized.
 See `docs/environments.md` for precedence, validation and effective UI reporting.
+
+## Optional hardware grants
+
+USB VM grants have a guarded, opt-in implementation; real-device acceptance is still pending. Keep `INCUS_USB_ENABLED=false` during ordinary rollout. See [hardware device permissions](hardware-devices.md#incus-vm-hardware-opt-in-physical-acceptance-pending) for the operator setup flag, exact serial matching, exclusive reservations and storage/controller rejection. Do not enable passthrough against disks containing Agentor data, backups or VM pools. Intel GVT-g mdev assignment is separately gated by an actual operator-selected host profile and matching restricted project policy; it remains disabled until reviewed host enablement and physical guest acceptance. Physical GPU/SR-IOV/native-context assignment remains unsupported. Migration preserves grants and rejects unavailable hardware before stopping the source. Issue #12 remains open until physical USB and supported-GPU acceptance can be demonstrated safely.

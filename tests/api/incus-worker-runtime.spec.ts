@@ -1,4 +1,5 @@
 import { MANAGED_KILO_PARENT, MANAGED_KILO_PARENT_CHECK } from '../../orchestrator/server/utils/managed-volume-kilo-parent';
+import { HardwareDeviceStore } from "../../orchestrator/server/utils/hardware-device-store";
 import { test, expect } from "@playwright/test";
 import { execFileSync } from "node:child_process";
 import { mkdtemp, rm, writeFile, readFile, symlink, link } from "node:fs/promises";
@@ -1326,4 +1327,56 @@ test("real production worker create/start, inventory and reprovisioning", async 
     }
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+
+for (const kind of ['usb', 'gpu'] as const) test(`${kind} runtime creates only exact authorized devices and rejects revoked start before native boot`, async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'agentor-usb-runtime-'));
+  try {
+    const profile = 'i915-GVTg_V5_4';
+    const local = { ...config, dataDir, incusUsbEnabled: kind === 'usb', incusGpuMdevProfile: kind === 'gpu' ? profile : '' };
+    const workers = new WorkerStore(dataDir), groups = new WorkerGroupStore(dataDir);
+    await Promise.all([workers.init(), groups.init()]);
+    const opts = options();
+    const device: import('../../orchestrator/shared/types').HardwareDeviceCandidate = kind === 'gpu' ? { kind, name: 'Intel GVT-g',
+      selector: 'drm:pci:0000:00:02.0', vendor: '8086', product: '5917', deviceNodes: ['/dev/dri/renderD128'], groupIds: [],
+      incus: { supported: true, mode: 'gpu-mdev', reason: 'fixture', evidence: { driver: 'i915', gvtEnabled: true,
+        mediatedProfiles: [profile], mediatedAvailable: { [profile]: 1 }, mediatedInstances: {} } } } : { kind: 'usb' as const, name: 'USB test', selector: 'usb:0403:6001:unique',
+      vendor: '0403', product: '6001', serial: 'unique', deviceNodes: ['/dev/bus/usb/001/005'], groupIds: [],
+      incus: { supported: true, mode: 'usb-exclusive' as const, reason: 'fixture' } };
+    const hardware = new HardwareDeviceStore(dataDir, async () => [device], groups, workers); await hardware.init();
+    const approved = await hardware.approveDevice({ selector: device.selector });
+    await hardware.setEntitlement(opts.userId, approved.id, true);
+    await hardware.createOwnerGrant(opts.userId, { deviceId: approved.id, targetType: 'all' });
+    await workers.upsert({ id: opts.id, userId: opts.userId, displayName: 'USB', status: 'active', runtimeKind: 'incus-vm',
+      hardwareDeviceIds: [approved.id], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+    opts.hardwareDevices = [{ deviceId: approved.id, deviceNodes: ['/dev/forged'], groupIds: [] }];
+    const fake = fakeClient();
+    fake.client.request = async () => ({ config: { restricted: 'true', ...(kind === 'usb' ? { 'restricted.devices.usb': 'allow' } :
+      { 'restricted.devices.gpu': 'allow', 'user.agentor.gpu-mdev-profile': profile }) } });
+    (fake.client as any).listInstances = async () => [];
+    const runtime = new IncusWorkerRuntime(local, fake.client as any); runtime.setHardwareDiscovery(async () => [device]);
+    const instance = await runtime.create(opts);
+    expect(Object.values(instance.devices).filter(device => device.type === kind)).toEqual([kind === 'usb'
+      ? { type: 'usb', vendorid: '0403', productid: '6001', serial: 'unique', required: 'true' }
+      : { type: 'gpu', gputype: 'mdev', pci: '0000:00:02.0', mdev: profile }]);
+    if (kind === 'gpu') {
+      const guestSetup = fake.events.findIndex(event => event.operation === 'exec' && JSON.stringify(event.args).includes('usermod -aG video,render agent'));
+      const workerStart = fake.events.findIndex(event => event.operation === 'exec' && JSON.stringify(event.args).includes('["systemctl","start","agentor-worker.service"]'));
+      expect(guestSetup).toBeGreaterThan(-1);
+      expect(workerStart).toBeGreaterThan(guestSetup);
+      const key = Object.keys(instance.devices).find(key => instance.devices[key]?.type === 'gpu')!, uuid = randomUUID();
+      instance.status = 'Running'; instance.config[`volatile.${key}.vgpu.uuid`] = uuid;
+      device.incus!.evidence!.mediatedAvailable = { [profile]: 0 };
+      device.incus!.evidence!.mediatedInstances = { [profile]: [uuid] };
+      await runtime.preflightRecreation(opts);
+    }
+    expect(fake.events.some(event => event.operation === 'start')).toBe(true);
+    await hardware.setEntitlement(opts.userId, approved.id, false); fake.events.length = 0;
+    await expect(runtime.start(opts)).rejects.toThrow('not assigned');
+    expect(fake.events.some(event => ['start', 'file', 'exec'].includes(event.operation))).toBe(false);
+    // Revocation must not make owned shutdown/deletion inaccessible.
+    await runtime.stop(opts, instance.config['volatile.uuid']);
+    expect(fake.events.some(event => event.operation === 'stop')).toBe(true);
+  } finally { await rm(dataDir, { recursive: true, force: true }); }
 });

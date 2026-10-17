@@ -11,6 +11,8 @@ __file__ = sys.argv.pop(1)
 ROOT = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("sources", ROOT / "incus-host-mount-sources.py")
 SOURCES = importlib.util.module_from_spec(spec); spec.loader.exec_module(SOURCES)
+spec = importlib.util.spec_from_file_location("gpu_mdev", ROOT / "incus-gpu-mdev.py")
+GPU_MDEV = importlib.util.module_from_spec(spec); spec.loader.exec_module(GPU_MDEV)
 UUID = re.compile(r"[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}")
 NAME = re.compile(r"[A-Za-z0-9_.-]{1,63}")
 MARKER = "user.agentor.installation"
@@ -230,15 +232,23 @@ def resource_setup(config, paths):
     require(interface.ip.is_private and not interface.ip.is_unspecified, "Managed primary gateway must be private and concrete")
     config["internalUrl"] = "http://" + str(interface.ip) + ":" + str(config["internalPort"])
     desired = {MARKER: installation, "features.images": "true", "features.storage.volumes": "true", "features.networks": "false",
-               "restricted": "true", "restricted.devices.nic": "managed", "restricted.devices.disk": "allow",
-               **{"restricted.devices." + device: "block" for device in ("pci", "usb", "gpu", "infiniband", "proxy", "unix-char", "unix-block")}}
+               "restricted": "true", "restricted.virtual-machines.lowlevel": "block", "restricted.devices.nic": "managed", "restricted.devices.disk": "allow",
+               **{"restricted.devices." + device: "block" for device in ("pci", "usb", "gpu", "infiniband", "proxy", "unix-char", "unix-block", "unix-hotplug")}}
+    if config.get("usbEnabled") is True: desired["restricted.devices.usb"] = "allow"
+    if config.get("gpuMdevProfile"):
+        desired.update({"restricted.devices.gpu": "allow", "user.agentor.gpu-mdev-profile": config["gpuMdevProfile"]})
     existing = resource("/1.0/projects", project)
     if existing is None:
         settings = {**desired, "restricted.networks.access": network, "restricted.devices.disk.paths": ",".join(paths)}
         incus("project", "create", project, *[argument for key, value in settings.items() for argument in ("-c", key + "=" + value)])
     existing = resource("/1.0/projects", project); owned(existing, installation, project)
-    require(all(existing["config"].get(key, "block" if key.startswith("restricted.devices.") and key not in ("restricted.devices.nic", "restricted.devices.disk") else None) == value
-                for key, value in desired.items()), "Owned project restrictions differ; preserve and resolve manually")
+    # Widen only after all existing installation/export policy is verified.
+    enable_usb = config.get("usbEnabled") is True and existing["config"].get("restricted.devices.usb", "block") == "block"
+    enable_gpu = bool(config.get("gpuMdevProfile")) and existing["config"].get("restricted.devices.gpu", "block") == "block"
+    if enable_gpu:
+        require(not existing["config"].get("user.agentor.gpu-mdev-profile"), "Existing GPU profile is ambiguous; preserve it")
+    require(all(existing["config"].get(key, "block" if key == "restricted.virtual-machines.lowlevel" or key.startswith("restricted.devices.") and key not in ("restricted.devices.nic", "restricted.devices.disk") else None) == value
+                for key, value in desired.items() if not (enable_usb and key == "restricted.devices.usb" or enable_gpu and key in ("restricted.devices.gpu", "user.agentor.gpu-mdev-profile"))), "Owned project restrictions differ; preserve and resolve manually")
     require(network in existing["config"].get("restricted.networks.access", "").split(","), "Owned project's primary allowlist differs")
     old = [SOURCES.canonical(path) for path in existing["config"].get("restricted.devices.disk.paths", "").split(",") if path]
     roots = json.loads(existing["config"].get("user.agentor.host-mount-roots", '{"installation":"' + installation + '","sources":[]}'))
@@ -246,6 +256,8 @@ def resource_setup(config, paths):
     require(set(old) <= set(paths) | set(roots["sources"]), "Unexpected project host exports; preserve and inspect their authority")
     updated = sorted(set(old) | set(paths))
     if updated != sorted(old): incus("project", "set", project, "restricted.devices.disk.paths=" + ",".join(updated))
+    if enable_usb: incus("project", "set", project, "restricted.devices.usb=allow")
+    if enable_gpu: incus("project", "set", project, "restricted.devices.gpu=allow", "user.agentor.gpu-mdev-profile=" + config["gpuMdevProfile"])
     return interface
 
 
@@ -377,7 +389,7 @@ def unit_argument(value):
 
 def install_units(config, directory, library):
     short = config["installation"].replace("-", "")[:8]; prefix = "agentor-incus-" + short
-    scripts = ("setup-incus-host.sh", "check-incus-host.sh", "recover-incus-job.py", "agentor-incus-network-service.py", "incus-managed-network-policy.py", "incus-host-mount-policy.py", "incus-host-mount-sources.py")
+    scripts = ("setup-incus-host.sh", "check-incus-host.sh", "recover-incus-job.py", "agentor-incus-network-service.py", "incus-managed-network-policy.py", "incus-host-mount-policy.py", "incus-host-mount-sources.py", "incus-gpu-mdev.py")
     namespace(library, config["installation"])
     for script in scripts: write_file(library / script, (ROOT / script).read_bytes(), 0o700 if script.endswith(".sh") else 0o600, True)
     policy = ["/usr/bin/python3", str(library / "agentor-incus-network-service.py"), "--data-dir", config["dataDir"], "--installation", config["installation"],
@@ -518,6 +530,8 @@ def portainer_environment(config, directory, interface, default_image):
 
 def main():
     parser = argparse.ArgumentParser(description="Operator-root Ubuntu24/amd64 Incus setup. Preserves canonical DATA/legacy workers; never migrates or resets unrelated resources.")
+    parser.add_argument("--enable-usb", action="store_true", help="Explicitly allow serial-numbered, non-storage USB VM grants; GPU requires a separate explicit mdev profile; PCI remains blocked")
+    parser.add_argument("--gpu-mdev-profile", default="", help="Explicit Intel GVT-g profile currently exposed with free capacity; never changes kernel/modules or creates mdevs")
     parser.add_argument("--install-lts", action="store_true", help="Explicitly offer fingerprint-pinned signed Zabbly Incus 6.0 LTS packages")
     parser.add_argument("--routing", action="store_true", help="Installed systemd use only: refresh this installation's exact routing")
     parser.add_argument("--config", help="Installed root-owned /etc/agentor/incus/<installationUUID>/config.json")
@@ -544,6 +558,7 @@ def main():
     release = dict(line.split("=", 1) for line in Path("/etc/os-release").read_text().splitlines() if "=" in line)
     require(release.get("ID", "").strip('"') == "ubuntu" and release.get("VERSION_ID", "").strip('"') == "24.04" and os.uname().machine == "x86_64", "Supported Ubuntu24 amd64 host required")
     require(stat.S_ISCHR(os.stat("/dev/kvm").st_mode), "KVM is unavailable; enable host virtualization before setup")
+    if args.gpu_mdev_profile: GPU_MDEV.require_profile(args.gpu_mdev_profile)
     data, docker_network, _, _, gateway, _ = docker_context(args.orchestrator_container, args.docker_network, args.data_host_path)
     installation = installation_id(data); short = installation.replace("-", "")[:8]
     network, pool = args.network or "ag" + short, args.storage_pool or "ag" + short
@@ -554,11 +569,13 @@ def main():
     prior = json.loads((directory / "config.json").read_text()) if (directory / "config.json").exists() else {}
     work = SOURCES.canonical(args.image_work_dir or prior.get("imageWorkDir") or str(directory / "image-work"))
     require(not SOURCES.overlaps(work, data), "Image conversion scratch must not modify canonical DATA or its ancestors")
-    config = {"installation": installation, "dataDir": data, "project": args.project, "network": network, "pool": pool, "container": args.orchestrator_container,
+    config = {"usbEnabled": args.enable_usb, "gpuMdevProfile": args.gpu_mdev_profile, "installation": installation, "dataDir": data, "project": args.project, "network": network, "pool": pool, "container": args.orchestrator_container,
               "dockerNetwork": docker_network, "tlsName": args.tls_name, "httpsPort": args.https_port, "policyPort": args.policy_port, "internalPort": args.internal_port,
               "listen": gateway, "sourceTable": "agentor_source_" + short, "imageWorkDir": work}
     if (directory / "config.json").exists():
-        require(all(prior.get(key, value if key == "imageWorkDir" else None) == value for key, value in config.items()), "Installed operator configuration differs; preserve and reconcile manually")
+        require(all(prior.get(key, value if key == "imageWorkDir" else False if key == "usbEnabled" else "" if key == "gpuMdevProfile" else None) == value
+                    or key in ("usbEnabled", "gpuMdevProfile") and not prior.get(key) and bool(value)
+                    for key, value in config.items()), "Installed operator configuration differs; preserve and reconcile manually")
         if "defaultImage" in prior: config["defaultImage"] = prior["defaultImage"]
     install_packages(args.install_lts, directory)
     bridge_netfilter(installation)
@@ -574,6 +591,8 @@ def main():
     default_image = bootstrap_default_image(config, directory, args.trusted_worker_image)
     print("Owned host setup installed; NOT a completed readiness/acceptance claim. Update Portainer, then run check-incus-host.sh and the real canary.")
     for key, value in portainer_environment(config, directory, interface, default_image).items(): print(key + "=" + value)
+    print("INCUS_USB_ENABLED=" + str(config.get("usbEnabled") is True).lower())
+    print("INCUS_GPU_MDEV_PROFILE=" + config.get("gpuMdevProfile", ""))
     print("Set AGENTOR_INCUS_ORCHESTRATOR_IMAGE separately to the operator-approved updated control-plane image.")
     print("Read-only TLS file mounts (do NOT mount the whole credential directory or any Incus Unix socket):")
     for file, variable in (("client.crt", "INCUS_CLIENT_CERT_PATH"), ("client.key", "INCUS_CLIENT_KEY_PATH"), ("server.crt", "INCUS_SERVER_CERT_PATH"), ("policy.crt", "INCUS_NETWORK_HOST_SERVER_CERT_PATH")):

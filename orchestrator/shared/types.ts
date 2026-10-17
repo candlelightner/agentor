@@ -58,6 +58,14 @@ export interface HardwareDevice {
   updatedAt: string;
 }
 
+export interface IncusHardwareCapability {
+  supported: boolean;
+  mode: "usb-exclusive" | "gpu-mdev" | "unsupported";
+  reason: string;
+  evidence?: { driver?: string; iommuGroup?: string; mediatedProfiles?: string[]; sriovTotalVfs?: number; bootVga?: boolean; gvtEnabled?: boolean;
+    mediatedAvailable?: Record<string, number>; mediatedInstances?: Record<string, string[]> };
+}
+
 export interface HardwareDeviceCandidate {
   name: string;
   kind: HardwareDeviceKind;
@@ -67,6 +75,8 @@ export interface HardwareDeviceCandidate {
   serial?: string;
   deviceNodes: string[];
   groupIds: number[];
+  /** Read-only host discovery evidence, never caller-supplied assignment authority. */
+  incus?: IncusHardwareCapability;
 }
 
 export type HardwareDeviceGrantTarget = HostMountGrantTarget;
@@ -86,6 +96,7 @@ export interface HardwareDeviceGrant {
 }
 
 export interface ResolvedHardwareDevice {
+  candidate?: HardwareDeviceCandidate;
   deviceId: string;
   deviceNodes: string[];
   groupIds: number[];

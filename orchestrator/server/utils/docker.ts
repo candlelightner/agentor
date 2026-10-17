@@ -1,3 +1,4 @@
+import { HARDWARE_DEVICE_PROBE } from "./hardware-device-probe";
 import Docker from 'dockerode';
 import { assertBackupRestoreRuntimePrincipal, type BackupRestoreRuntimePrincipal } from './backup-restore-runtime-authority';
 import { PassThrough } from 'node:stream';
@@ -422,42 +423,6 @@ export class DockerService {
     const image = this.config.workerImagePrefix + this.config.workerImage;
     await this.ensureImage(image);
     const name = `agentor-hardware-probe-${randomUUID()}`;
-    const script = `set -eu
-clean() { tr '\t\r\n' '   ' < "$1" 2>/dev/null || true; }
-for node in /host/dev/dri/renderD*; do
-  [ -e "$node" ] || continue
-  base="\${node##*/}"
-  sys="$(readlink -f "/host/sys/class/drm/$base/device")"
-  [ -n "$sys" ] || continue
-  pci="\${sys##*/}"
-  vendor="$(clean "$sys/vendor")"
-  product="$(clean "$sys/device")"
-  nodes=""; gids=""
-  for link in /host/sys/class/drm/card* /host/sys/class/drm/renderD*; do
-    [ -e "$link" ] || continue
-    [ "$(readlink -f "$link/device")" = "$sys" ] || continue
-    dev="/dev/dri/\${link##*/}"
-    [ -e "/host$dev" ] || continue
-    gid="$(stat -c %g "/host$dev")"
-    nodes="\${nodes}\${nodes:+,}$dev"; gids="\${gids}\${gids:+,}$gid"
-  done
-  printf 'gpu\tdrm:pci:%s\tGPU %s:%s (%s)\t%s\t%s\t\t%s\t%s\n' "$pci" "\${vendor#0x}" "\${product#0x}" "$pci" "\${vendor#0x}" "\${product#0x}" "$nodes" "$gids"
-done
-for sys in /host/sys/bus/usb/devices/*; do
-  [ -f "$sys/idVendor" ] && [ -f "$sys/idProduct" ] && [ -f "$sys/busnum" ] && [ -f "$sys/devnum" ] || continue
-  vendor="$(clean "$sys/idVendor")"; product="$(clean "$sys/idProduct")"; serial=""
-  [ ! -f "$sys/serial" ] || serial="$(clean "$sys/serial")"
-  bus="$(cat "$sys/busnum")"; devnum="$(cat "$sys/devnum")"
-  node="$(printf '/dev/bus/usb/%03d/%03d' "$bus" "$devnum")"
-  [ -e "/host$node" ] || continue
-  port="\${sys##*/}"; identity="\${serial:-port:$port}"
-  manufacturer=""; product_name=""
-  [ ! -f "$sys/manufacturer" ] || manufacturer="$(clean "$sys/manufacturer")"
-  [ ! -f "$sys/product" ] || product_name="$(clean "$sys/product")"
-  label="\${manufacturer:+$manufacturer }\${product_name:-USB $vendor:$product}"
-  gid="$(stat -c %g "/host$node")"
-  printf 'usb\tusb:%s:%s:%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vendor" "$product" "$identity" "$label" "$vendor" "$product" "$serial" "$node" "$gid"
-done`;
     let helper: Docker.Container | undefined;
     try {
       helper = await withOperationDeadline(
@@ -465,8 +430,8 @@ done`;
           Image: image,
           name,
           User: '0:0',
-          Entrypoint: ['sh', '-c'],
-          Cmd: [script],
+          Entrypoint: ['python3', '-c'],
+          Cmd: [HARDWARE_DEVICE_PROBE],
           Tty: true,
           NetworkDisabled: true,
           HostConfig: {
@@ -498,16 +463,9 @@ done`;
       );
       const output = await this.getLogs(helper.id, 10_000);
       if (result.StatusCode !== 0) throw new Error('Host hardware probe failed');
-      const discovered: HardwareDeviceCandidate[] = output.split(/\r?\n/).filter(Boolean).map((line) => {
-        const [kind, selector, deviceName, vendor, product, serial, nodes, gids] = line.split('\t');
-        return {
-          kind: kind as 'gpu' | 'usb', selector: selector!, name: deviceName!,
-          vendor: vendor || undefined, product: product || undefined,
-          serial: serial || undefined,
-          deviceNodes: (nodes || '').split(',').filter(Boolean),
-          groupIds: [...new Set((gids || '').split(',').filter(Boolean).map(Number))],
-        };
-      });
+      const discovered: HardwareDeviceCandidate[] = JSON.parse(output);
+      if (!Array.isArray(discovered) || discovered.length > 4096)
+        throw new Error('Host hardware probe returned invalid inventory');
       // Explicitly gated deterministic fixture for the isolated Docker E2E
       // stack. Requiring diagnostics mode prevents accidental production use.
       if (process.env.ALLOW_ADMIN_DIAGNOSTICS === 'true' &&
@@ -516,6 +474,7 @@ done`;
           kind: 'usb', selector: 'usb:agentor:test-device',
           name: 'Agentor test USB device', vendor: 'agentor', product: 'test',
           serial: 'deterministic', deviceNodes: ['/dev/null'], groupIds: [],
+          incus: { supported: false, mode: 'unsupported', reason: 'Fixture device has no physical USB passthrough capability.' },
         });
       return discovered;
     } finally {
@@ -528,6 +487,24 @@ done`;
       else
         await this.docker.getContainer(name).remove({ force: true } as Docker.ContainerRemoveOptions).catch(() => undefined);
     }
+  }
+
+  /** Runtime-only discovery also checks live legacy mappings: desired settings
+   * can have removed a selection while the old Docker worker awaits rebuild. */
+  async discoverIncusHardwareDevices(workerId: string): Promise<HardwareDeviceCandidate[]> {
+    const candidates = await this.discoverHardwareDevices();
+    const peers = (await this.listContainers()).filter(peer => peer.State === 'running' && peer.Labels[ID_LABEL] !== workerId);
+    for (const peer of peers) {
+      const inspected = await withOperationDeadline(signal => this.docker.getContainer(peer.Id).inspect({ abortSignal: signal }),
+        DOCKER_READ_TIMEOUT_MS, 'Docker hardware ownership inspection');
+      if (inspected.Id !== peer.Id || inspected.Config.Labels?.[MANAGED_LABEL] !== 'true')
+        throw new Error('Legacy hardware ownership changed during inspection');
+      if (!inspected.State.Running) continue;
+      const paths = (inspected.HostConfig.Devices ?? []).map((device: { PathOnHost?: string }) => device.PathOnHost);
+      for (const candidate of candidates) if (candidate.deviceNodes.some(node => paths.includes(node)))
+        candidate.incus = { supported: false, mode: 'unsupported', reason: 'Device is mapped to another running Docker worker; stop and rebuild or archive that worker first.' };
+    }
+    return candidates;
   }
 
   async listContainers(): Promise<Docker.ContainerInfo[]> {

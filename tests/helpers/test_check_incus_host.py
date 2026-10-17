@@ -66,6 +66,28 @@ class CheckerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 CHECKER.project_policy(project, "agentor-private", "workers")
 
+    def test_usb_opt_in_is_exact_and_never_allows_gpu_or_pci(self):
+        project = self.project()
+        with self.assertRaises(ValueError): CHECKER.project_policy(project, "agentor-private", "workers", usb_enabled=True)
+        project["config"]["restricted.devices.usb"] = "allow"
+        CHECKER.project_policy(project, "agentor-private", "workers", usb_enabled=True)
+        with self.assertRaises(ValueError): CHECKER.project_policy(project, "agentor-private", "workers")
+        for kind in ("gpu", "pci", "unix-char", "unix-block"):
+            changed = copy.deepcopy(project); changed["config"]["restricted.devices." + kind] = "allow"
+            with self.assertRaises(ValueError): CHECKER.project_policy(changed, "agentor-private", "workers", usb_enabled=True)
+
+    def test_gpu_profile_policy_requires_exact_opt_in_without_pci_usb_or_lowlevel_escape(self):
+        project = self.project(); profile = 'i915-GVTg_V5_4'
+        project['config'].update({'restricted.devices.gpu': 'allow', 'user.agentor.gpu-mdev-profile': profile})
+        CHECKER.project_policy(project, 'agentor-private', 'workers', gpu_mdev_profile=profile)
+        for selected in ['', 'i915-GVTg_V5_8']:
+            with self.assertRaises(ValueError): CHECKER.project_policy(project, 'agentor-private', 'workers', gpu_mdev_profile=selected)
+        for kind in ['pci', 'usb', 'unix-char', 'unix-block']:
+            changed = copy.deepcopy(project); changed['config']['restricted.devices.'+kind] = 'allow'
+            with self.assertRaises(ValueError): CHECKER.project_policy(changed, 'agentor-private', 'workers', gpu_mdev_profile=profile)
+        project['config']['restricted.virtual-machines.lowlevel'] = 'allow'
+        with self.assertRaises(ValueError): CHECKER.project_policy(project, 'agentor-private', 'workers', gpu_mdev_profile=profile)
+
     def test_certificate_is_restricted_to_exact_single_project(self):
         CHECKER.restricted_certificate({"type": "client", "restricted": True, "projects": ["agentor-private"]}, "agentor-private")
         for record in ({"type": "client", "restricted": False, "projects": ["agentor-private"]},

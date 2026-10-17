@@ -154,6 +154,8 @@ export interface WorkerExportManifest {
     displayName: string;
     repos: RepoConfig[];
     mounts: MountConfig[];
+    /** Opaque desired catalog IDs only; destination grants must authorize them again. */
+    hardwareDeviceIds?: string[];
     initScript: string;
     /** Orchestrator-side access policy. Missing legacy values inherit. */
     workerSelfApiAccess?: WorkerSelfApiAccess;
@@ -792,6 +794,11 @@ function assertValidManifest(value: unknown): asserts value is WorkerExportManif
   ) {
     throw new Error('Invalid worker export: manifest.worker.workerSelfApiAccess is invalid');
   }
+  if (worker.hardwareDeviceIds !== undefined && (!Array.isArray(worker.hardwareDeviceIds) ||
+      worker.hardwareDeviceIds.length > 128 || worker.hardwareDeviceIds.some(id => typeof id !== 'string' ||
+        !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(id)) ||
+      new Set(worker.hardwareDeviceIds).size !== worker.hardwareDeviceIds.length))
+    throw new Error('Invalid worker export: manifest.worker.hardwareDeviceIds is invalid');
   if (!worker.repos.every((repo) => isRecord(repo) && isString(repo.provider) && isString(repo.url) && (repo.branch === undefined || isString(repo.branch)))) {
     throw new Error('Invalid worker export: manifest.worker.repos is invalid');
   }

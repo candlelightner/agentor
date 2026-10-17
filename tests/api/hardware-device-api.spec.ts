@@ -13,7 +13,7 @@ test.describe.serial('Hardware device authorization API', () => {
     try {
       const denied = await account.context.post('/api/hardware-devices', { data: { selector: 'usb:agentor:test-device' } }); expect(denied.status()).toBe(403);
       const discovered = await request.get('/api/hardware-devices'); expect(discovered.status(), await discovered.text()).toBe(200);
-      expect((await discovered.json()).discovered).toEqual(expect.arrayContaining([expect.objectContaining({ selector: 'usb:agentor:test-device', deviceNodes: ['/dev/null'] })]));
+      expect((await discovered.json()).discovered).toEqual(expect.arrayContaining([expect.objectContaining({ selector: 'usb:agentor:test-device', deviceNodes: ['/dev/null'], incus: expect.objectContaining({ supported: false, mode: 'unsupported' }) })]));
       const approved = await request.post('/api/hardware-devices', { data: { selector: 'usb:agentor:test-device', name: `Test device ${Date.now()}` } }); expect(approved.status(), await approved.text()).toBe(201); deviceId = (await approved.json()).id;
       expect((await request.put('/api/hardware-devices/entitlements', { data: { ownerId: account.user.id, deviceId, enabled: true } })).status()).toBe(200);
       const granted = await account.context.post('/api/hardware-devices/grants', { data: { deviceId, targetType: 'all' } }); expect(granted.status(), await granted.text()).toBe(201); grantId = (await granted.json()).id;
