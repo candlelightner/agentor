@@ -161,3 +161,13 @@ budgets; malformed/duplicate sizes and size metadata on non-files are rejected.
 GNU sparse/global extensions, path/type/link rules and identity fields retain
 their existing restrictions. Validation uses positional reads, so a sparse raw
 TAR fixture can prove the 8 GiB boundary without an 8 GiB physical write.
+
+
+Accepted instance creation waits at most 30 minutes for image unpacking, using
+the existing 500 ms operation polls and 30-second HTTP transport bound. The
+accepted create is never resubmitted. Other operation bounds stay unchanged.
+If the create result remains unknown, its existing recreation nonce retains the
+worker recovery fence. The normal 30-second reconciliation pass can roll back
+a completed replacement only after fresh owner/installation/UUID/nonce proof;
+it retains canonical volumes and the legacy Docker source. Observe operation
+settlement and durable archived/stopped state before a new lifecycle request.

@@ -2,6 +2,8 @@
 
 Every user-facing feature of the Agentor web dashboard, organized by category. This document drives the Playwright test suite — every item below must have test coverage.
 
+Accepted Incus instance creation has a finite 30-minute operation wait for large image unpacking under disk load. It submits once, polls every 500 ms with the existing 30-second HTTP transport bound, and requires terminal success before returning compute for provisioning. Failure or expiry retains existing nonce/UUID-fenced ambiguity and recovery behavior; other operation deadlines are unchanged.
+
 Bounded Phase 8 interrupted-recreation recovery rolls back under the existing owner→worker fences before normal convergence. Verified original compute is retained stopped; replacement compute is removed only with installation/owner/worker/UUID and operation-nonce proof. Absent compute requires verified canonical storage and immutable source metadata. Unavailable or contradictory facts retain the recovery marker. Store-queue compare-and-merge preserves pending edits and revoked access; rollback never promotes desired secrets or deletes persistent volumes. Full Phase 8 and later parity gates remain open.
 
 Explicit Incus recovery and automatic missing-compute recreation reuse the nonce/UUID-fenced replacement path with applied bootstrap, not pending desired settings. Automatic recovery requires authoritative instance lookup404, existing canonical volumes and retained immutable source. Applied Docker capability requires its existing Docker volume even when desired settings disable Docker. Missing bootstrap/data, revoked access, unavailable or foreign compute and stopped intent fail closed; recovery does not promote configuration.

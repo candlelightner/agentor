@@ -772,9 +772,9 @@ export class IncusClient {
 
     if (json.type === 'async' && json.operation) {
       await onAccepted?.(this.projectOperationPath(json.operation));
-      // Image unpacking is disk-bound and can exceed a short lifecycle wait
-      // on a loaded host. Keep the accepted create, never resend it.
-      await this.waitForOperation(json.operation, 300);
+      // Large image unpacking under load can exceed five minutes. Keep a
+      // finite create-only wait without resending the accepted mutation.
+      await this.waitForOperation(json.operation, 30 * 60);
     } else if (json.type === 'sync') await onAccepted?.(undefined);
     else if (onAccepted) throw new IncusError('Incus create did not return an authoritative result');
 

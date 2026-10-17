@@ -587,7 +587,7 @@ test.describe("IncusClient mock server protocol tests", () => {
     };
     client.getInstance = async () => ({ name: "worker" }) as any;
     client.waitForOperation = async (operation, deadline) => {
-      expect([operation, deadline]).toEqual(["/1.0/operations/create-once", 300]);
+      expect([operation, deadline]).toEqual(["/1.0/operations/create-once", 30 * 60]);
       return { status: "Success" } as any;
     };
     expect((await client.createInstance({ name: "worker", source: { type: "none" } })).name).toBe("worker");
@@ -596,6 +596,58 @@ test.describe("IncusClient mock server protocol tests", () => {
     await expect(client.createInstance({ name: "worker", source: { type: "none" } })).rejects.toThrow("Observation unavailable");
     expect(posts).toBe(2); // One mutation per distinct caller, no hidden resend.
   });
+
+  for (const outcome of ['late-success', 'deadline', 'failure'] as const) {
+    test(`accepted create ${outcome} waits for terminal evidence without resend or premature caller work`, async () => {
+      const operation = '/1.0/operations/12345678-1234-1234-1234-123456789abc';
+      const requests: string[] = [], order: string[] = [];
+      const originalNow = Date.now;
+      let elapsed = 0, polls = 0, port = 0;
+      const server = http.createServer((req, res) => {
+        const url = new URL(req.url!, 'http://127.0.0.1');
+        requests.push(req.method + ':' + url.pathname);
+        expect(url.searchParams.get('project')).toBe('agentor');
+        res.setHeader('Content-Type', 'application/json');
+        if (req.method === 'POST' && url.pathname === '/1.0/instances') {
+          req.resume(); res.statusCode = 202;
+          res.end(JSON.stringify({ type: 'async', operation }));
+        } else if (req.method === 'GET' && url.pathname === operation) {
+          polls++; order.push('poll-' + polls);
+          // No real slow wait: the first running reply advances the observed
+          // operation beyond the former five-minute bound (or the new bound).
+          if (polls === 1) elapsed += (outcome === 'deadline' ? 1801 : 360) * 1000;
+          const status = polls === 1 ? 'Running' : outcome === 'failure' ? 'Failure' : 'Success';
+          res.end(JSON.stringify({ type: 'sync', metadata: { status,
+            status_code: status === 'Running' ? 103 : status === 'Failure' ? 400 : 200, err: 'unpack failed' } }));
+        } else if (req.method === 'GET' && url.pathname === '/1.0/instances/worker') {
+          order.push('instance');
+          res.end(JSON.stringify({ type: 'sync', metadata: { name: 'worker' } }));
+        } else { res.statusCode = 500; res.end(JSON.stringify({ type: 'error', error: 'unexpected mutation' })); }
+      });
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      port = (server.address() as { port: number }).port;
+      const client = new IncusClient({ endpoint: `http://127.0.0.1:${port}`, project: 'agentor', timeoutMs: 30_000 });
+      try {
+        Date.now = () => originalNow() + elapsed;
+        const pending = client.createInstance({ name: 'worker', type: 'virtual-machine',
+          source: { type: 'image', fingerprint: 'a'.repeat(64) } }, async path => {
+          expect(path).toBe(operation); order.push('accepted');
+        }).then(result => { order.push('caller-provision'); return result; });
+        if (outcome === 'late-success') {
+          expect(await pending).toMatchObject({ name: 'worker' });
+          expect(order).toEqual(['accepted', 'poll-1', 'poll-2', 'instance', 'caller-provision']);
+        } else {
+          await expect(pending).rejects.toThrow(outcome === 'deadline' ? 'did not finish within 1800s' : 'unpack failed');
+          expect(order).toEqual(outcome === 'deadline' ? ['accepted', 'poll-1'] : ['accepted', 'poll-1', 'poll-2']);
+        }
+        expect(requests.filter(request => request.startsWith('POST:'))).toEqual(['POST:/1.0/instances']);
+        expect(requests.filter(request => !request.startsWith('GET:') && !request.startsWith('POST:'))).toEqual([]);
+      } finally {
+        Date.now = originalNow;
+        await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+      }
+    });
+  }
 
   test('device updates persist accepted operation before waiting, never resend or treat observation failure as cancellation', async () => {
     const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
