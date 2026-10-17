@@ -1,0 +1,29 @@
+#!/bin/bash
+set -euo pipefail
+cd -- "$(dirname -- "$0")"
+vm_disk_dir=/mnt/agentor-vm-ssd/agentor-kata-preflight-20260928
+[[ "$(findmnt -rn -o UUID --target "$vm_disk_dir")" == 17b446d6-0931-49a9-84a9-f5edac5a723f ]] || { echo 'VM host SSD filesystem absent or wrong UUID' >&2; exit 1; }
+[[ -f "$vm_disk_dir/vm.qcow2" && -r "$vm_disk_dir/vm.qcow2" && -w "$vm_disk_dir/vm.qcow2" ]] || exit 1
+ssd_partition=/dev/disk/by-partuuid/d9327d7e-ce1e-4c1e-8054-6116dc631b24
+[[ -b "$ssd_partition" && -r "$ssd_partition" && -w "$ssd_partition" ]] || { echo 'VM SSD partition absent or inaccessible' >&2; exit 1; }
+node=$(readlink -f "$ssd_partition")
+parent=$(lsblk -ndo PKNAME "$node")
+[[ "$(cat "/sys/class/block/$parent/size")" == 1000215216 ]] || exit 1
+[[ "$(cat "/sys/class/block/$parent/queue/max_sectors_kb")" == 256 ]] || { echo 'Required 256 KiB SSD limit not active' >&2; exit 1; }
+[[ "$(lsblk -ndo SERIAL "/dev/$parent" | xargs)" == 4935263384603225 ]] || exit 1
+[[ "$(cat "/sys/class/block/${node##*/}/size")" == 244140625 ]] || exit 1
+[[ "$(blkid -p -s UUID -o value "$ssd_partition")" == 86a3359a-d825-4440-af45-55025d140402 ]] || exit 1
+if findmnt -rn -S "$ssd_partition" >/dev/null; then echo 'VM SSD partition is mounted on host; refusing startup' >&2; exit 1; fi
+exec qemu-system-x86_64 \
+  -name agentor-kata-preflight \
+  -machine q35,accel=kvm -cpu host -smp 4 -m 8192 \
+  -drive file="$vm_disk_dir/vm.qcow2",if=none,id=kata_os_disk,format=qcow2 \
+  -device virtio-blk-pci,drive=kata_os_disk,id=kata_os_disk_device,bootindex=1 \
+  -drive file="$vm_disk_dir/seed.img",if=virtio,format=raw,readonly=on \
+  -drive file=/dev/disk/by-partuuid/d9327d7e-ce1e-4c1e-8054-6116dc631b24,if=none,id=kata_ssd_data,format=raw,cache=none,aio=threads \
+  -device virtio-blk-pci,drive=kata_ssd_data,id=kata_ssd_data_disk,serial=kata-ssd-125gb \
+  -netdev user,id=net0,hostfwd=tcp:127.0.0.1:22374-:22 \
+  -device virtio-net-pci,netdev=net0 \
+  -display none -serial file:console.log \
+  -monitor none -qmp unix:qmp.sock,server=on,wait=off \
+  -pidfile qemu.pid -daemonize
