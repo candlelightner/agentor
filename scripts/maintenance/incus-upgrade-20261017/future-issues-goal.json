@@ -123,7 +123,8 @@
         "484f104d-4370-4d78-a5d6-dde517161c11",
         "26087985-9643-4564-a0e0-aff03c3e28b1"
       ],
-      "status": "USB legacy selector compatibility and gated Intel GVT-g/mdev path committed/pushed as500d241; affected tests/typechecks pass. Host enablement and physical attachment acceptance remain unresolved; no reboot, grant dropping, protected storage attachment or live boot-GPU unbinding."
+      "status": "Gated USB/GVT-g code committed; fresh host enablement, physical-device mapping and boot recovery assessment in progress. Complete ordinary migrations before disruptive host maintenance. Hardware acceptance and both migrations remain required.",
+      "requirement": "User explicitly requires both hardware workers to end up in VMs with required hardware access working. Retaining hardware workers on Docker is not an acceptable final state; do not drop grants or attach host storage holding backups/VM data."
     },
     "administrativeShadows": {
       "workerIds": [
