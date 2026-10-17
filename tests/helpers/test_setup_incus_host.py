@@ -31,7 +31,7 @@ class InstallerTests(unittest.TestCase):
         with patch.object(SETUP,"namespace"),patch.object(SETUP,"owned"), \
              patch.object(SETUP,"write_file") as write,patch.object(SETUP,"command"):
             SETUP.install_units(config,directory,library)
-        for name in ("recover-incus-job.py","incus-host-mount-sources.py"):
+        for name in ("recover-incus-job.py","incus-host-mount-sources.py","incus-gpu-mdev.py"):
             write.assert_any_call(library/name,(SCRIPT.parent/name).read_bytes(),0o600,True)
 
     def test_context_rejects_missing_or_stale_controller_endpoint_before_any_mutation(self):
@@ -418,6 +418,47 @@ class InstallerTests(unittest.TestCase):
             project["config"]["restricted.devices.usb"] = "block"; project["config"]["restricted.devices.gpu"] = "allow"
             with self.assertRaisesRegex(ValueError, "restrictions differ"): SETUP.resource_setup(config, ["/srv/approved"])
             self.assertEqual(commands.call_count, 1)
+
+    def test_explicit_gpu_profile_enables_only_gpu_and_binds_operator_profile(self):
+        config = self.config(); config["gpuMdevProfile"] = "i915-GVTg_V5_4"
+        project = {"name": config["project"], "config": {SETUP.MARKER: INSTALLATION,
+            "features.images": "true", "features.storage.volumes": "true", "features.networks": "false",
+            "restricted": "true", "restricted.devices.nic": "managed", "restricted.devices.disk": "allow",
+            "restricted.networks.access": config["network"], "restricted.devices.disk.paths": "/srv/approved"}}
+        pool = {"name": config["pool"], "driver": "dir", "status": "Created", "config": {SETUP.MARKER: INSTALLATION}}
+        network = {"name": config["network"], "managed": True, "type": "bridge", "config": {SETUP.MARKER: INSTALLATION,
+            "ipv4.nat": "true", "ipv6.address": "none", "ipv4.address": "10.25.0.1/24"}}
+        def resource(kind, name): return copy.deepcopy({"/1.0/projects": project, "/1.0/networks": network, "/1.0/storage-pools": pool}[kind])
+        def enable(*args):
+            self.assertEqual(args, ("project", "set", config["project"], "restricted.devices.gpu=allow", "user.agentor.gpu-mdev-profile=i915-GVTg_V5_4"))
+            project["config"].update({"restricted.devices.gpu": "allow", "user.agentor.gpu-mdev-profile": "i915-GVTg_V5_4"})
+        with patch.object(SETUP, "resource", side_effect=resource), patch.object(SETUP, "incus", side_effect=enable) as commands:
+            SETUP.resource_setup(config, ["/srv/approved"])
+            SETUP.resource_setup(config, ["/srv/approved"])
+            self.assertEqual(commands.call_count, 1)
+            project["config"]["restricted.devices.pci"] = "allow"
+            with self.assertRaisesRegex(ValueError, "restrictions differ"): SETUP.resource_setup(config, ["/srv/approved"])
+            self.assertEqual(commands.call_count, 1)
+
+    def test_gpu_profile_admission_reads_real_shaped_sysfs_without_writing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); params = root / 'module/i915/parameters'; params.mkdir(parents=True)
+            (params/'enable_gvt').write_text('N')
+            pci = root / 'bus/pci/devices/0000:00:02.0'; pci.mkdir(parents=True)
+            driver = root / 'bus/pci/drivers/i915'; driver.mkdir(parents=True)
+            (pci/'driver').symlink_to(driver); (pci/'vendor').write_text('0x8086')
+            path = pci / 'mdev_supported_types/i915-GVTg_V5_4'; path.mkdir(parents=True)
+            (path/'device_api').write_text('vfio-pci'); (path/'available_instances').write_text('1')
+            with self.assertRaisesRegex(ValueError, 'disabled'): SETUP.GPU_MDEV.require_profile('i915-GVTg_V5_4', root)
+            (params/'enable_gvt').write_text('Y')
+            before = {str(p): p.read_bytes() for p in root.rglob('*') if p.is_file()}
+            self.assertEqual(SETUP.GPU_MDEV.require_profile('i915-GVTg_V5_4', root), ['0000:00:02.0'])
+            self.assertEqual(before, {str(p): p.read_bytes() for p in root.rglob('*') if p.is_file()})
+            for value in ['0', '-1', 'unknown']:
+                (path/'available_instances').write_text(value)
+                with self.assertRaisesRegex(ValueError, 'no available'): SETUP.GPU_MDEV.require_profile('i915-GVTg_V5_4', root)
+            for value in ['', '../create', 'physical', 'i915-GVTg_V5_8']:
+                with self.assertRaises(ValueError): SETUP.GPU_MDEV.require_profile(value, root)
 
     def test_foreign_pool_never_gets_marked_adopted_or_recreated(self):
         record = {"name": "owned-pool", "driver": "dir", "config": {SETUP.MARKER: "foreign"}}

@@ -1253,14 +1253,18 @@ test("real production worker create/start, inventory and reprovisioning", async 
 });
 
 
-test('USB runtime creates only exact authorized devices and rejects revoked start before native boot', async () => {
+for (const kind of ['usb', 'gpu'] as const) test(`${kind} runtime creates only exact authorized devices and rejects revoked start before native boot`, async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'agentor-usb-runtime-'));
   try {
-    const local = { ...config, dataDir, incusUsbEnabled: true };
+    const profile = 'i915-GVTg_V5_4';
+    const local = { ...config, dataDir, incusUsbEnabled: kind === 'usb', incusGpuMdevProfile: kind === 'gpu' ? profile : '' };
     const workers = new WorkerStore(dataDir), groups = new WorkerGroupStore(dataDir);
     await Promise.all([workers.init(), groups.init()]);
     const opts = options();
-    const device = { kind: 'usb' as const, name: 'USB test', selector: 'usb:0403:6001:unique',
+    const device: import('../../orchestrator/shared/types').HardwareDeviceCandidate = kind === 'gpu' ? { kind, name: 'Intel GVT-g',
+      selector: 'drm:pci:0000:00:02.0', vendor: '8086', product: '5917', deviceNodes: ['/dev/dri/renderD128'], groupIds: [],
+      incus: { supported: true, mode: 'gpu-mdev', reason: 'fixture', evidence: { driver: 'i915', gvtEnabled: true,
+        mediatedProfiles: [profile], mediatedAvailable: { [profile]: 1 }, mediatedInstances: {} } } } : { kind: 'usb' as const, name: 'USB test', selector: 'usb:0403:6001:unique',
       vendor: '0403', product: '6001', serial: 'unique', deviceNodes: ['/dev/bus/usb/001/005'], groupIds: [],
       incus: { supported: true, mode: 'usb-exclusive' as const, reason: 'fixture' } };
     const hardware = new HardwareDeviceStore(dataDir, async () => [device], groups, workers); await hardware.init();
@@ -1271,13 +1275,25 @@ test('USB runtime creates only exact authorized devices and rejects revoked star
       hardwareDeviceIds: [approved.id], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
     opts.hardwareDevices = [{ deviceId: approved.id, deviceNodes: ['/dev/forged'], groupIds: [] }];
     const fake = fakeClient();
-    fake.client.request = async () => ({ config: { restricted: 'true', 'restricted.devices.usb': 'allow' } });
+    fake.client.request = async () => ({ config: { restricted: 'true', ...(kind === 'usb' ? { 'restricted.devices.usb': 'allow' } :
+      { 'restricted.devices.gpu': 'allow', 'user.agentor.gpu-mdev-profile': profile }) } });
     (fake.client as any).listInstances = async () => [];
     const runtime = new IncusWorkerRuntime(local, fake.client as any); runtime.setHardwareDiscovery(async () => [device]);
     const instance = await runtime.create(opts);
-    expect(Object.values(instance.devices).filter(device => device.type === 'usb')).toEqual([
-      { type: 'usb', vendorid: '0403', productid: '6001', serial: 'unique', required: 'true' },
-    ]);
+    expect(Object.values(instance.devices).filter(device => device.type === kind)).toEqual([kind === 'usb'
+      ? { type: 'usb', vendorid: '0403', productid: '6001', serial: 'unique', required: 'true' }
+      : { type: 'gpu', gputype: 'mdev', pci: '0000:00:02.0', mdev: profile }]);
+    if (kind === 'gpu') {
+      const guestSetup = fake.events.findIndex(event => event.operation === 'exec' && JSON.stringify(event.args).includes('usermod -aG video,render agent'));
+      const workerStart = fake.events.findIndex(event => event.operation === 'exec' && JSON.stringify(event.args).includes('["systemctl","start","agentor-worker.service"]'));
+      expect(guestSetup).toBeGreaterThan(-1);
+      expect(workerStart).toBeGreaterThan(guestSetup);
+      const key = Object.keys(instance.devices).find(key => instance.devices[key]?.type === 'gpu')!, uuid = randomUUID();
+      instance.status = 'Running'; instance.config[`volatile.${key}.vgpu.uuid`] = uuid;
+      device.incus!.evidence!.mediatedAvailable = { [profile]: 0 };
+      device.incus!.evidence!.mediatedInstances = { [profile]: [uuid] };
+      await runtime.preflightRecreation(opts);
+    }
     expect(fake.events.some(event => event.operation === 'start')).toBe(true);
     await hardware.setEntitlement(opts.userId, approved.id, false); fake.events.length = 0;
     await expect(runtime.start(opts)).rejects.toThrow('not assigned');

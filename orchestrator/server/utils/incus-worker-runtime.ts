@@ -1,4 +1,4 @@
-import { resolveIncusHardware, assertIncusHardwareLayout, assertIncusHardwareExclusive, type IncusHardwareOptions } from "./incus-hardware";
+import { resolveIncusHardware, assertIncusHardwareLayout, assertIncusHardwareExclusive, INCUS_MDEV_GUEST_SETUP, type IncusHardwareOptions } from "./incus-hardware";
 import type { HardwareDeviceCandidate } from "../../shared/types";
 import type { Config } from "./config";
 import type { DockerService } from "./docker";
@@ -167,10 +167,12 @@ export class IncusWorkerRuntime {
     if (!this.hardwareDiscovery) throw new Error('Incus hardware discovery is unavailable');
     const devices = await resolveIncusHardware(this.config, opts, () => this.hardwareDiscovery!(opts), operation, instance);
     const project = await this.client.request<{ config: Record<string, string> }>('GET', `/1.0/projects/${encodeURIComponent(this.config.incusProject)}`);
-    if (project.config.restricted !== 'true' || project.config['restricted.devices.usb'] !== 'allow' ||
+    if (project.config.restricted !== 'true' || (project.config['restricted.devices.usb'] ?? 'block') !== (this.config.incusUsbEnabled ? 'allow' : 'block') ||
+        (project.config['restricted.devices.gpu'] ?? 'block') !== (this.config.incusGpuMdevProfile ? 'allow' : 'block') ||
+        (project.config['user.agentor.gpu-mdev-profile'] ?? '') !== (this.config.incusGpuMdevProfile ?? '') ||
         (project.config['restricted.virtual-machines.lowlevel'] ?? 'block') !== 'block' ||
-        ['gpu', 'pci', 'unix-char', 'unix-block', 'unix-hotplug'].some(kind => (project.config['restricted.devices.' + kind] ?? 'block') !== 'block'))
-      throw new Error('Incus hardware requires explicit USB-only restricted project policy');
+        ['pci', 'unix-char', 'unix-block', 'unix-hotplug'].some(kind => (project.config['restricted.devices.' + kind] ?? 'block') !== 'block'))
+      throw new Error('Incus hardware requires explicit USB/mdev-only restricted project policy');
     assertIncusHardwareExclusive(opts.containerName, devices, await this.client.listInstances());
     return devices;
   }
@@ -1070,7 +1072,12 @@ export class IncusWorkerRuntime {
     await this.assertWorkspaceReplacementSettled(opts);
     await this.assertReady();
     this.validateOptions(opts);
-    await this.preflightHardware(opts);
+    let hardwareSource: IncusInstance | undefined;
+    if (opts.hardwareDevices?.length && this.config.incusGpuMdevProfile) {
+      try { hardwareSource = await this.assertOwned(opts.containerName, opts.id, opts.userId); }
+      catch (error) { if ((error as { statusCode?: number }).statusCode !== 404) throw error; }
+    }
+    await this.preflightHardware(opts, hardwareSource);
     const storage = await this.storage();
     const source = await storage.imageIdentity(opts);
     if (!source) throw new Error('Incus worker image source is missing; preserve the original source before compute removal');
@@ -1850,6 +1857,8 @@ export class IncusWorkerRuntime {
       for (const device of Object.values(hostMounts.devices))
         await this.checkedExec(name, ['timeout', '15', 'mountpoint', '-q', '--', device.path!]);
       await this.checkedExec(name, ["systemctl", "stop", "agentor-worker.service"]);
+      if (Object.values(hardware).some(device => device.type === 'gpu'))
+        await this.checkedExec(name, ['timeout', '30', 'bash', '-ec', INCUS_MDEV_GUEST_SETUP]);
       await this.reprovisionManagedNetworks(opts, instance.config['volatile.uuid']!);
       if (Object.keys(account).length) {
         for (const device of Object.values(account)) await this.checkedExec(name, ["mountpoint", "-q", device.path!]);

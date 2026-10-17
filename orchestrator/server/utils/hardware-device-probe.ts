@@ -23,15 +23,35 @@ for node in sorted((root/'dev/dri').glob('renderD*')):
              if re.fullmatch(r'(card|renderD)\d+', p.name) and link(p/'device') == sys and (root/'dev/dri'/p.name).exists()]
     driver, iommu = link(sys/'driver'), link(sys/'iommu_group')
     profiles = sorted(p.name for p in (sys/'mdev_supported_types').glob('*'))
+    available, instances = {}, {}
+    for profile in profiles:
+        path = sys/'mdev_supported_types'/profile
+        count = read(path/'available_instances')
+        if re.fullmatch(r'i915-GVTg_V[0-9]+_[0-9]+', profile) and read(path/'device_api') == 'vfio-pci' and count.isdigit():
+            available[profile] = int(count)
+            instances[profile] = sorted(p.name for p in (path/'devices').glob('*')
+                                        if re.fullmatch(r'[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}', p.name) and p.exists())
     vfs = read(sys/'sriov_totalvfs', '0')
+    gvt = read(root/'sys/module/i915/parameters/enable_gvt')
     evidence = dict(driver=driver.name if driver else '', iommuGroup=iommu.name if iommu else '',
-                    mediatedProfiles=profiles, sriovTotalVfs=int(vfs) if vfs.isdigit() else 0, bootVga=read(sys/'boot_vga') == '1')
+                    mediatedProfiles=profiles, mediatedAvailable=available, mediatedInstances=instances, sriovTotalVfs=int(vfs) if vfs.isdigit() else 0, bootVga=read(sys/'boot_vga') == '1',
+                    **({'gvtEnabled': gvt in {'Y','1'}} if read(sys/'vendor') == '0x8086' and gvt in {'Y','N','0','1'} else {}))
     vendor, product = read(sys/'vendor').removeprefix('0x'), read(sys/'device').removeprefix('0x')
     reason = 'GPU passthrough is unsupported: whole-device assignment needs an isolated, dedicated GPU; shared GPU modes require separate host/guest validation.'
-    if vendor == '8086': reason = 'Intel iGPU sharing is unsupported: a DRM render node does not prove VM acceleration; mdev, SR-IOV or native-context must be validated on suitable hardware.'
+    if vendor == '8086':
+        reason = 'Intel mediated GPU is unavailable on the current host; a DRM render node alone does not establish guest acceleration.'
+        if gvt in {'N','0'}:
+            reason += ' Host GVT-g is disabled; maintenance-time host enablement and an exposed, validated mdev profile are required before mediated sharing can be used.'
+        elif not profiles and not int(vfs if vfs.isdigit() else '0'):
+            reason += ' The host exposes no mdev profiles or SR-IOV capacity; verify the supported GVT-g host stack before selecting a profile.'
+        if evidence['bootVga']:
+            reason += ' The host boot GPU must not be detached for whole-device passthrough.'
+    capability = unsupported(reason, evidence)
+    if vendor == '8086' and driver and driver.name == 'i915' and gvt in {'Y','1'} and available:
+        capability = dict(supported=True, mode='gpu-mdev', reason='Intel GVT-g mediated GPU; an operator-selected profile and current capacity are required. Physical GPU stays bound to the host.', evidence=evidence)
     result.append(dict(kind='gpu', selector='drm:pci:'+sys.name, name='GPU '+vendor+':'+product+' ('+sys.name+')',
                        vendor=vendor, product=product, deviceNodes=[str(p).removeprefix('/host') for p in nodes],
-                       groupIds=sorted(set(p.stat().st_gid for p in nodes)), incus=unsupported(reason, evidence)))
+                       groupIds=sorted(set(p.stat().st_gid for p in nodes)), incus=capability))
 for sys in sorted((root/'sys/bus/usb/devices').glob('*')):
     vendor, product = read(sys/'idVendor'), read(sys/'idProduct')
     if not vendor or not product: continue

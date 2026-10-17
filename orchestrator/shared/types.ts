@@ -60,9 +60,10 @@ export interface HardwareDevice {
 
 export interface IncusHardwareCapability {
   supported: boolean;
-  mode: "usb-exclusive" | "unsupported";
+  mode: "usb-exclusive" | "gpu-mdev" | "unsupported";
   reason: string;
-  evidence?: { driver?: string; iommuGroup?: string; mediatedProfiles?: string[]; sriovTotalVfs?: number; bootVga?: boolean };
+  evidence?: { driver?: string; iommuGroup?: string; mediatedProfiles?: string[]; sriovTotalVfs?: number; bootVga?: boolean; gvtEnabled?: boolean;
+    mediatedAvailable?: Record<string, number>; mediatedInstances?: Record<string, string[]> };
 }
 
 export interface HardwareDeviceCandidate {

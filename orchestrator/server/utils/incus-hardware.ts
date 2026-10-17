@@ -15,10 +15,31 @@ function fail(message: string): never { throw Object.assign(new Error(message), 
 
 /** The public API accepts opaque catalog IDs only. Even internal resolved paths
  * are insufficient authority to assign a host device to a VM. */
-export function incusHardwareDevices(resolved: ResolvedHardwareDevice[]): Record<string, IncusDevice> {
+export function incusHardwareDevices(resolved: ResolvedHardwareDevice[], gpuProfile?: string, instance?: IncusInstance): Record<string, IncusDevice> {
   const devices: Record<string, IncusDevice> = {};
   for (const value of resolved) {
     const candidate = value.candidate;
+    const key = 'hw' + createHash('sha256').update(value.deviceId).digest('hex').slice(0, 12);
+    if (devices[key]) fail('Duplicate hardware device identity');
+    if (candidate?.kind === 'gpu') {
+      if (!candidate.incus?.supported) fail(candidate.incus?.reason || 'Intel mediated GPU host capability is unavailable');
+      if (!gpuProfile || !/^i915-GVTg_V[0-9]+_[0-9]+$/.test(gpuProfile))
+        fail('Intel mediated GPU requires an explicit INCUS_GPU_MDEV_PROFILE selected from current host profiles');
+      const pci = /^drm:pci:([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])$/.exec(candidate.selector)?.[1];
+      const evidence = candidate.incus?.evidence;
+      if (!candidate.incus?.supported || candidate.incus.mode !== 'gpu-mdev' || !pci ||
+          candidate.vendor !== '8086' || evidence?.driver !== 'i915' || evidence.gvtEnabled !== true ||
+          !evidence.mediatedProfiles?.includes(gpuProfile))
+        fail(candidate.incus?.reason || 'Intel mediated GPU host capability is unavailable');
+      const expected = { type: 'gpu', gputype: 'mdev', pci, mdev: gpuProfile };
+      const allocated = instance?.config[`volatile.${key}.vgpu.uuid`];
+      const ownedAllocation = instance?.status === 'Running' && isDeepStrictEqual(instance.devices[key], expected) &&
+        !!allocated && evidence.mediatedInstances?.[gpuProfile]?.includes(allocated);
+      if (!ownedAllocation && !(Number.isInteger(evidence.mediatedAvailable?.[gpuProfile]) && evidence.mediatedAvailable![gpuProfile]! > 0))
+        fail('Selected Intel mediated GPU profile has no available capacity; stop its current owner or select a genuinely available host profile');
+      devices[key] = expected;
+      continue;
+    }
     if (!candidate?.incus?.supported || candidate.incus.mode !== 'usb-exclusive' || candidate.kind !== 'usb')
       fail(candidate?.incus?.reason || 'Incus hardware capability is unavailable; device assignment is blocked');
     if (!/^[0-9a-f]{4}$/.test(candidate.vendor ?? '') || !/^[0-9a-f]{4}$/.test(candidate.product ?? '') ||
@@ -26,8 +47,6 @@ export function incusHardwareDevices(resolved: ResolvedHardwareDevice[]): Record
         candidate.selector !== `usb:${candidate.vendor}:${candidate.product}:${candidate.serial}` ||
         candidate.deviceNodes.length !== 1 || !/^\/dev\/bus\/usb\/\d{3}\/\d{3}$/.test(candidate.deviceNodes[0]!))
       fail('USB passthrough requires an exact, stable serial-numbered device');
-    const key = 'hw' + createHash('sha256').update(value.deviceId).digest('hex').slice(0, 12);
-    if (devices[key]) fail('Duplicate hardware device identity');
     devices[key] = { type: 'usb', vendorid: candidate.vendor!, productid: candidate.product!, serial: candidate.serial, required: 'true' };
   }
   return devices;
@@ -38,7 +57,8 @@ export async function resolveIncusHardware(config: Config, opts: IncusHardwareOp
 ): Promise<Record<string, IncusDevice>> {
   const requested = (opts.hardwareDevices ?? []).map(device => device.deviceId).sort();
   if (!requested.length) return {};
-  if (!config.incusUsbEnabled) fail('Incus USB passthrough is disabled; operator host setup and INCUS_USB_ENABLED=true are required. GPU assignment remains unsupported');
+  if (!config.incusUsbEnabled && !config.incusGpuMdevProfile)
+    fail('Incus hardware is disabled; explicit operator USB or mediated GPU setup is required');
   // Probe first: slow host discovery must not precede a stale authorization snapshot.
   const inventory = await discover();
   const workers = new WorkerStore(config.dataDir), groups = new WorkerGroupStore(config.dataDir);
@@ -77,7 +97,9 @@ export async function resolveIncusHardware(config: Config, opts: IncusHardwareOp
     if ((peer.hardwareDeviceIds ?? []).some(id => requested.includes(id)))
       fail('Hardware device is exclusively reserved by another active worker; archive or remove its device selection first');
   }
-  return incusHardwareDevices(resolved ?? []);
+  if (resolved?.some(value => value.candidate?.kind === 'usb') && !config.incusUsbEnabled)
+    fail('Incus USB passthrough is disabled; operator host setup and INCUS_USB_ENABLED=true are required');
+  return incusHardwareDevices(resolved ?? [], config.incusGpuMdevProfile, instance);
 }
 
 /** Local + expanded maps both matter: profiles may otherwise add broad devices.
@@ -98,9 +120,32 @@ export function assertIncusHardwareExclusive(name: string, expected: Record<stri
   for (const peer of peers) {
     if (peer.name === name) continue;
     for (const device of Object.values(peer.expanded_devices ?? peer.devices)) {
+      if ((device.type === 'gpu' || device.type === 'pci') && Object.values(expected).some(gpu => gpu.type === 'gpu' &&
+          (!device.pci && !device.address || (device.pci || device.address) === gpu.pci)))
+        fail('GPU is assigned to another Incus instance; release that assignment first');
       if (device.type !== 'usb') continue;
-      if (Object.values(expected).some(usb => ['vendorid', 'productid', 'serial'].every(key => !device[key] || device[key] === usb[key])))
+      if (Object.values(expected).some(usb => usb.type === 'usb' && ['vendorid', 'productid', 'serial'].every(key => !device[key] || device[key] === usb[key])))
         fail('USB device is assigned to another Incus instance; release that assignment first');
     }
   }
 }
+
+
+/** Runs inside the already-owned guest, never against host device paths. */
+export const INCUS_MDEV_GUEST_SETUP = `set -eu
+udevadm settle --timeout=15
+groupadd -f video
+groupadd -f render
+usermod -aG video,render agent
+found=false
+for node in /sys/class/drm/renderD*/device/driver; do
+  [ -L "$node" ] || continue
+  [ "$(basename "$(readlink -f "$node")")" = i915 ] || continue
+  card="$(basename "$(dirname "$(dirname "$node")")")"
+  test -c "/dev/dri/$card"
+  runuser -u agent -- test -r "/dev/dri/$card"
+  runuser -u agent -- test -w "/dev/dri/$card"
+  found=true
+done
+$found || { echo 'Intel mediated guest render device is unavailable to agent' >&2; exit 1; }
+`;

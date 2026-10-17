@@ -3,6 +3,7 @@ export interface HardwareDeviceView {
   ownerId: string;
   canManageCatalog: boolean;
   incusUsbEnabled?: boolean;
+  incusGpuMdevProfile?: string;
   catalog: Array<HardwareDevice & { entitled: boolean; available: boolean; incus?: IncusHardwareCapability; reserved?: boolean; reservedWorkerIds?: string[] }>;
   discovered: HardwareDeviceCandidate[];
   grants: HardwareDeviceGrant[];

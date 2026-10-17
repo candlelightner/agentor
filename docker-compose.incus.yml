@@ -38,6 +38,7 @@ services:
       WORKER_IMAGE: ${WORKER_IMAGE:-agentor-worker:latest}
       INCUS_ENABLED: "true"
       INCUS_USB_ENABLED: ${INCUS_USB_ENABLED:-false}
+      INCUS_GPU_MDEV_PROFILE: ${INCUS_GPU_MDEV_PROFILE:-}
       INCUS_ENDPOINT: ${INCUS_ENDPOINT:?Use the setup HTTPS endpoint}
       INCUS_PROJECT: ${INCUS_PROJECT:?Use the dedicated restricted project}
       INCUS_NETWORK: ${INCUS_NETWORK:?Use the setup managed worker network}
