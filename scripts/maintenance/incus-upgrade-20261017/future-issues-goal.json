@@ -1,6 +1,6 @@
 {
-  "objective": "After the backup-preserving VM migration, consolidate validated parallel code fixes into feature/incus-vm-workers and create a PR onto main when combined checks pass. Keep the verified backup, keys, original Docker data and rollback images.",
-  "state": "in-progress-in-parallel; activate follow-on tracker goal after the existing migration goal completes",
+  "objective": "Autonomously finish the Agentor VM-branch upgrade and migration of every safely eligible ordinary worker, verifying workspace, agent/editor state, managed volumes, native Docker data, preserved custom tools and intended stopped/archived state. Keep the verified encrypted backup fd9ff548-9a79-4b7c-979c-7906f0a0cf10, recovery keys, original Docker sources and rollback images. In parallel, have appropriately chosen sub-agents address as many remaining GitHub code issues as realistic in urgency/impact order, especially safe GPU/USB passthrough, backup correctness/performance and operational diagnostics. Require coherent committed and pushed branches, accurate supported-capability reporting and appropriate validation. After migration and sub-agent work finish, consolidate and review locally, merge only validated agent changes into feature/incus-vm-workers, run combined checks, and create a PR onto main if those checks pass. Report unresolved image, hardware and acceptance limitations honestly; do not delete the backup or prematurely finalize original data.",
+  "state": "combined authorized objective recorded; migration tracker active, follow-on tracker creation queued because the goal tool cannot edit an unfinished objective",
   "priority": [
     {
       "issues": [
