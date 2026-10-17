@@ -1,0 +1,12 @@
+/*
+!/.gitignore
+!/README.md
+!/monitor-backup.py
+!/prepare-incus-storage.py
+!/dockerignore-canary.patch
+!/maintenance/
+/maintenance/*
+!/maintenance/backup-verifier/
+/maintenance/backup-verifier/*
+!/maintenance/backup-verifier/*.js
+!/maintenance/backup-verifier/*.cjs

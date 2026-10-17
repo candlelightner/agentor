@@ -1,0 +1,5 @@
+--- a/.dockerignore
++++ b/.dockerignore
+@@ -31,1 +31,2 @@
+ !scripts/build-incus-worker-image.sh
++!scripts/incus-canary.mjs
