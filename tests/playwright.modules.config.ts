@@ -26,6 +26,7 @@ export default defineConfig({
   testDir: ".",
   testMatch: [
     "api/portable-pax-size.spec.ts",
+    "api/incus-admin-restore.spec.ts",
     "api/worker-memory-policy.spec.ts",
     "api/incus-hardware.spec.ts",
     "api/hardware-device-store.spec.ts",

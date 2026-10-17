@@ -68,8 +68,8 @@ role=sys.argv[1];managed=re.fullmatch(r"managed:([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}
 if managed:
     ROOTS[role]="/restore/managed/"+managed.group(1)+"/volume"
 mode=sys.argv[2] if len(sys.argv)==3 else "extract"
-if role not in ROOTS or mode not in ("extract","empty","account-parents") or \
-    mode=="empty" and managed or mode=="account-parents" and role!="agents":
+if role not in ROOTS or mode not in ("extract","empty","account-parents","legacy-source") or \
+    mode in ("empty","legacy-source") and managed or mode=="account-parents" and role!="agents":
     raise ValueError("Invalid canonical restore role")
 root=ROOTS[role]
 parents=("/restore/managed",os.path.dirname(root)) if managed else ()
@@ -131,5 +131,7 @@ if mode=="empty":
 command=["/usr/bin/tar","--numeric-owner","--same-owner","--same-permissions",
     "--xattrs","--xattrs-include=*","--acls","--delay-directory-restore",
     "-xpf","-","-C",os.path.dirname(root)]
+if mode=="legacy-source":
+    command.insert(1,r"--transform=flags=rh;s,^source\(/\|$\),"+os.path.basename(root)+r"\1,")
 os.execve(command[0],command,{"PATH":"/usr/bin:/bin","LC_ALL":"C","LANG":"C"})
 `;

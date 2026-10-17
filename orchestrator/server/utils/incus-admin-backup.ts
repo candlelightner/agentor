@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { Config } from './config';
 import type { AdministrativeWorkspaceRecord } from './admin-workspace-store';
-import { administrativeRuntimeOwner, validateAdminNativeState } from './admin-native-authority';
+import { administrativeRuntimeOwner, validateAdminNativeState } from './admin-native-identity';
 import type { IncusAdminWorkspaceRuntime } from './incus-admin-workspace-runtime';
 import type { IncusCustomVolume } from './incus-client';
 import { IncusOfflineArchiveHelper } from './incus-offline-archive-helper';

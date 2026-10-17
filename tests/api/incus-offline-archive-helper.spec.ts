@@ -639,3 +639,39 @@ test('Docker cancellation after copy or capture removes only acknowledged copy; 
     expect(calls.filter((item: any) => item[0] === 'delete')).toHaveLength(stage === 'capture' ? 1 : 0);
   });
 });
+
+test('administrative writer mounts only fixed canonical and selected roots without a NIC and settles before cleanup', async () => {
+  await fixture(async ({ invoke, calls, control, receipt }) => {
+    const id = randomUUID(), sources = { administrativeRestore: { workspace: 'fresh-admin-workspace', agents: 'fresh-admin-agents',
+      managed: { [id]: 'agentor-persist-' + id } } };
+    let settled = false;
+    control.source = async () => { if ((await receipt())?.writerSettled) settled = true; };
+    control.capture = async () => { expect((await receipt()).writerSettled).toBe(false); return 'restored'; };
+    expect(await invoke(sources)).toBe('restored'); expect(settled).toBe(true); expect(await receipt()).toBeUndefined();
+    const spec = calls.find((item: any) => item[0] === 'spec')[1];
+    expect(spec.config['user.agentor.helper']).toBe('administrative-restore'); expect(spec.profiles).toEqual([]);
+    expect(spec.devices).toEqual({ root: { type: 'disk', path: '/', pool: 'pool' },
+      workspace: { type: 'disk', source: sources.administrativeRestore.workspace, pool: 'pool', path: '/restore/workspace', readonly: 'false' },
+      agents: { type: 'disk', source: sources.administrativeRestore.agents, pool: 'pool', path: '/restore/.agent-data', readonly: 'false' },
+      ['persist-' + id]: { type: 'disk', source: 'agentor-persist-' + id, pool: 'pool', path: '/restore/managed/' + id + '/volume', readonly: 'false' } });
+  });
+});
+
+test('administrative writer rejects arbitrary paths, extra fields, duplicate storage and malformed selected IDs before allocation', async () => {
+  for (const value of [{ workspace: '/host', agents: 'agents', managed: {} }, { workspace: 'same', agents: 'same', managed: {} },
+    { workspace: 'workspace', agents: 'agents', managed: { bad: 'other' } }, { workspace: 'workspace', agents: 'agents', managed: {}, path: '/etc' }])
+    await fixture(async ({ invoke, calls, receipt }) => {
+      await expect(invoke({ administrativeRestore: value })).rejects.toThrow('malformed');
+      expect(calls.some((item: any) => item[0] === 'create')).toBe(false); expect(await receipt()).toBeUndefined();
+    });
+});
+
+test('administrative writer failure retains its unsettled data receipt after exact helper cleanup', async () => {
+  await fixture(async ({ invoke, calls, control, receipt }) => {
+    control.capture = async () => { throw Error('extract failed'); };
+    await expect(invoke({ administrativeRestore: { workspace: 'workspace', agents: 'agents', managed: {} } })).rejects.toThrow();
+    expect(calls.some((item: any) => item[0] === 'delete')).toBe(true);
+    expect((await receipt()).writerSettled).toBe(false);
+    expect((await receipt()).sources.administrativeRestore.workspace).toBe('workspace');
+  });
+});

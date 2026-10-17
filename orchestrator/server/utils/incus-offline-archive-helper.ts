@@ -11,7 +11,7 @@ import { isDeepStrictEqual } from 'node:util';
 type Owner = { id: string; userId: string; containerName: string };
 type Sources = { workspace: string; agents: string; managed?: never } |
   { managed: string; workspace?: never; agents?: never } | { docker: string; copy: boolean } |
-  { workspaceRestore: true };
+  { workspaceRestore: true } | { administrativeRestore: { workspace: string; agents: string; managed: Record<string, string> } };
 type Kind = 'create' | 'start' | 'stop' | 'delete' | 'copy' | 'delete-copy';
 type Recovery = { version: 1; id: string; installation: string; owner: Owner; sources: Sources;
   fingerprint: string; instance?: string; copy?: { created_at: string; config: Record<string, string> };
@@ -20,6 +20,15 @@ const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 const operation = /^\/1\.0\/operations\/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 const temporaryReceipt = /^([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})\.[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.tmp$/;
 const owners = new Set<string>();
+const writerSource = (sources: Sources) => 'workspaceRestore' in sources || 'administrativeRestore' in sources;
+function administrativeRestoreSources(value: unknown): boolean {
+  const v = value as Extract<Sources, { administrativeRestore: unknown }>['administrativeRestore'];
+  if (!v || Object.keys(v).sort().join(',') !== 'agents,managed,workspace' || !safeName(v.workspace) || !safeName(v.agents) ||
+      !v.managed || typeof v.managed !== 'object' || Array.isArray(v.managed) || Object.keys(v.managed).length > 32 ||
+      Object.entries(v.managed).some(([id, name]) => !uuid.test(id) || !safeName(name))) return false;
+  const names = [v.workspace, v.agents, ...Object.values(v.managed)];
+  return new Set(names).size === names.length;
+}
 const fail = (message: string) => Object.assign(new Error(message), { statusCode: 409 });
 const missing = (error: unknown) => (error as { statusCode?: number }).statusCode === 404;
 const safeName = (value: unknown) => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value);
@@ -61,8 +70,9 @@ export class IncusOfflineArchiveHelper {
       : keys === 'managed' && 'managed' in v.sources ? safeName(v.sources.managed)
       : keys === 'workspaceRestore' && 'workspaceRestore' in v.sources && v.sources.workspaceRestore === true
       ? this.canonicalWriterOwner(v.owner)
+      : keys === 'administrativeRestore' && 'administrativeRestore' in v.sources ? administrativeRestoreSources(v.sources.administrativeRestore)
       : keys === 'copy,docker' && 'docker' in v.sources && safeName(v.sources.docker) && typeof v.sources.copy === 'boolean';
-    const writer = keys === 'workspaceRestore';
+    const writer = keys === 'workspaceRestore' || keys === 'administrativeRestore';
     if (!v || v.version !== 1 || !uuid.test(v.id ?? '') || v.installation !== this.installation ||
         !uuid.test(v.owner?.id ?? '') || !safeName(v.owner?.userId) || !safeName(v.owner?.containerName) ||
         !validSources || (writer ? typeof v.writerSettled !== 'boolean' : Object.hasOwn(v, 'writerSettled')) ||
@@ -167,6 +177,14 @@ export class IncusOfflineArchiveHelper {
   private devices(state: Recovery) {
     const devices: Record<string, Record<string, string>> = {
       root: { type: 'disk', path: '/', pool: this.config.incusStoragePool } };
+    if ('administrativeRestore' in state.sources) {
+      const sources = state.sources.administrativeRestore;
+      devices.workspace = { type: 'disk', pool: this.config.incusStoragePool, source: sources.workspace, path: '/restore/workspace', readonly: 'false' };
+      devices.agents = { type: 'disk', pool: this.config.incusStoragePool, source: sources.agents, path: '/restore/.agent-data', readonly: 'false' };
+      for (const [id, source] of Object.entries(sources.managed)) devices['persist-' + id] = { type: 'disk', pool: this.config.incusStoragePool,
+        source, path: '/restore/managed/' + id + '/volume', readonly: 'false' };
+      return devices;
+    }
     if ('workspaceRestore' in state.sources) {
       devices.workspace = { type: 'disk', pool: this.config.incusStoragePool,
         source: state.owner.containerName + '-workspace', path: '/target', readonly: 'false' };
@@ -185,7 +203,7 @@ export class IncusOfflineArchiveHelper {
   }
   private metadata(state: Recovery) {
     return { 'user.agentor.installation': this.installation,
-      'user.agentor.helper': 'workspaceRestore' in state.sources ? 'workspace-replace' : 'offline-backup',
+      'user.agentor.helper': 'administrativeRestore' in state.sources ? 'administrative-restore' : 'workspaceRestore' in state.sources ? 'workspace-replace' : 'offline-backup',
       'user.agentor.operation': state.id, 'user.agentor.worker': state.owner.id,
       'user.agentor.owner': state.owner.userId, 'user.agentor.image': state.fingerprint };
   }
@@ -222,7 +240,7 @@ export class IncusOfflineArchiveHelper {
     signal: AbortSignal | undefined, capture: (helperName: string, assertHelper: () => Promise<void>) => Promise<T>): Promise<T> {
     // Capture fixed primitive fields before awaits; caller object mutation
     // cannot turn this writer into a Docker copy or change its owner later.
-    owner = { ...owner }; sources = { ...sources };
+    owner = { ...owner }; sources = structuredClone(sources);
     // Claim before any await: concurrent callers cannot race recovery discovery.
     const key = `${this.config.dataDir}:${owner.id}`, id = randomUUID();
     if (owners.has(key)) throw fail('An offline backup helper already owns this worker.');
@@ -301,7 +319,7 @@ export class IncusOfflineArchiveHelper {
       }
       // Source proof after known removal excludes the helper's former reference.
       await assertSource();
-      if ('workspaceRestore' in state!.sources && writerMayRun && !state!.writerSettled)
+      if (writerSource(state!.sources) && writerMayRun && !state!.writerSettled)
         throw fail('Workspace replacement callback is unsettled; helper removed but data fence retained.');
       await unlink(path()); await dir!.sync(); reserved = false;
     };
@@ -320,7 +338,7 @@ export class IncusOfflineArchiveHelper {
       const image = incusImageIdentity(await this.client.getImage(alias.target));
       if (image.fingerprint !== alias.target) throw fail('Trusted helper image fingerprint changed.');
       state = { version: 1, id, installation: this.installation, owner: { ...owner }, sources: { ...sources }, fingerprint: image.fingerprint,
-        ...('workspaceRestore' in sources ? { writerSettled: false } : {}) };
+        ...(writerSource(sources) ? { writerSettled: false } : {}) };
       this.validate(state); await persist(state); reserved = true;
       await assertSource(); signal?.throwIfAborted();
       if ('docker' in sources && sources.copy) {
@@ -343,7 +361,7 @@ export class IncusOfflineArchiveHelper {
       await persist({ ...state, instance: created!.config['volatile.uuid'] });
       signal?.throwIfAborted(); await this.inspect(state!);
       try { await submit('start', accepted => {
-        if ('workspaceRestore' in sources) writerMayRun = true;
+        if (writerSource(sources)) writerMayRun = true;
         return this.client.startInstance(this.name(state!), accepted);
       }); }
       catch (error) { if (error instanceof IncusRequestRejected) writerMayRun = false; throw error; }
@@ -364,7 +382,7 @@ export class IncusOfflineArchiveHelper {
       await assertHelper(); await assertSource(this.name(state));
       const result = await capture(this.name(state), assertHelper);
       await assertHelper(); await assertSource(this.name(state));
-      if ('workspaceRestore' in sources) await persist({ ...state!, writerSettled: true });
+      if (writerSource(sources)) await persist({ ...state!, writerSettled: true });
       return result;
     } catch (error) {
       primaryFailed = true; primaryFailure = error; throw error;

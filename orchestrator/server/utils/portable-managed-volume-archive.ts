@@ -83,8 +83,19 @@ export async function validateIncusCanonicalRestoreArchive(
   limits: { maxEntries?: number; maxExpandedBytes?: number; signal?: AbortSignal } = {},
 ): Promise<PortableManagedVolumeArchiveSummary> {
   if (role !== "workspace" && role !== "agents") throw invalidArchive("invalid canonical restore role");
+  return validateCanonicalRootArchive(archivePath, role === "workspace" ? "workspace/" : ".agent-data/", limits);
+}
+
+/** Historical instance-volume wrapper only. GNU receives unchanged PAX bytes;
+ * the trusted administrative writer transforms member/hardlink names only. */
+export function validateIncusLegacyAdministrativeRestoreArchive(archivePath: string,
+  limits: { maxEntries?: number; maxExpandedBytes?: number; signal?: AbortSignal } = {}) {
+  return validateCanonicalRootArchive(archivePath, 'source/', limits);
+}
+
+async function validateCanonicalRootArchive(archivePath: string, root: string,
+  limits: { maxEntries?: number; maxExpandedBytes?: number; signal?: AbortSignal }) {
   throwIfAborted(limits.signal);
-  const root = role === "workspace" ? "workspace/" : ".agent-data/";
   const scan = await scanRawTar(archivePath, {
     maxEntries: Math.min(limits.maxEntries ?? MAX_PORTABLE_MANAGED_VOLUME_ARCHIVE_ENTRIES,
       MAX_PORTABLE_MANAGED_VOLUME_ARCHIVE_ENTRIES),
