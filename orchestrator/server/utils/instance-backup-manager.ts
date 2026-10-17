@@ -11,7 +11,8 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createGzip } from "node:zlib";
 import type { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -20,6 +21,7 @@ import { MAX_BACKUP_PROVIDER_OBJECT_BYTES, publicBackupFailure } from "./backup-
 import type { BackupProviderKind } from "./backup-types";
 import { backupInstallationId } from "./backup-installation";
 import { useBackupManager, type BackupManager } from "./backup-manager";
+import { useManagedVolumeManager } from "./managed-volume-manager";
 import {
   createInstanceDataArchive,
   inspectInstanceBundle,
@@ -50,7 +52,7 @@ import {
 import { getAuthDb } from "./auth";
 import { administrativeWorkspaceResourceNames } from "./admin-workspace-runtime";
 import { sanitizeBackupPathTarPayload } from "./worker-export";
-import { useConfig } from "./services";
+import { useConfig, useLogger } from "./services";
 import {
   beginInstanceRestore,
   beginInstanceSnapshot,
@@ -84,6 +86,7 @@ export interface InstanceBackupManagerOptions {
   backupManager?: BackupManager;
   authSnapshot?: (destination: string) => Promise<void>;
   preflightCreate?: () => Promise<void>;
+  logError?: (message: string) => void;
   inventory?: (userId: string) => Promise<{
     volumes: VolumeCandidate[];
     plugins: InstanceBackupManifest["plugins"];
@@ -102,6 +105,7 @@ export class InstanceBackupManager {
   private readonly backupManager: BackupManager;
   private readonly authSnapshot: (destination: string) => Promise<void>;
   private readonly preflightCreate: () => Promise<void>;
+  private readonly logError: (message: string) => void;
   private readonly inventoryOverride?: InstanceBackupManagerOptions["inventory"];
   private initialized?: Promise<void>;
   private accepting = true;
@@ -125,6 +129,7 @@ export class InstanceBackupManager {
         await getAuthDb().backup(destination);
       });
     this.preflightCreate = options.preflightCreate ?? (() => this.defaultPreflight());
+    this.logError = options.logError ?? ((message) => useLogger().error(message));
     this.inventoryOverride = options.inventory;
   }
 
@@ -1334,7 +1339,6 @@ export class InstanceBackupManager {
           workerId: volume.Labels?.["agentor.worker-id"],
         });
     const volumes: VolumeCandidate[] = [];
-    const { useManagedVolumeManager } = await import("./managed-volume-manager");
     const managedVolumes = useManagedVolumeManager();
     await managedVolumes.init();
     for (const volume of managedVolumes.store.list()) {
@@ -1639,6 +1643,21 @@ export class InstanceBackupManager {
       error instanceof Error &&
       (error.name === "AbortError" || /cancelled/i.test(error.message));
     const publicFailure = publicInstanceFailure(error);
+    if (!cancelled) {
+      const diagnostic = `[instance-backup] ${JSON.stringify({
+        jobId: job.id,
+        operation: job.operation,
+        phase: job.phase,
+        code: publicFailure.code,
+        ...instanceFailureDiagnostic(error),
+      })}`;
+      try {
+        this.logError(diagnostic);
+      } catch {
+        // Logging must not prevent the terminal job state from being saved.
+        console.error(diagnostic);
+      }
+    }
     const stamp = new Date().toISOString();
     job.status = cancelled ? "cancelled" : "failed";
     job.phase = cancelled ? "cancelled" : "failed";
@@ -1830,6 +1849,31 @@ function safeMessage(value: string) {
     .replace(/[A-Za-z0-9+/=_-]{80,}/g, "[redacted]")
     .replace(/[\r\n]+/g, " ")
     .slice(0, 2048);
+}
+
+function instanceFailureDiagnostic(error: unknown) {
+  // Arbitrary exception messages, causes, provider responses, and stack headers
+  // may contain credentials or decrypted recovery material. Keep only a known
+  // error class, a missing manager symbol, and locations in this source module
+  // (or its production chunk). No exception-supplied paths reach the logger.
+  const type = error instanceof ReferenceError ? "ReferenceError"
+    : error instanceof TypeError ? "TypeError"
+    : error instanceof RangeError ? "RangeError"
+    : error instanceof SyntaxError ? "SyntaxError"
+    : error instanceof Error ? "Error" : "NonError";
+  const reference = error instanceof ReferenceError
+    ? /^use[A-Za-z0-9_$]{1,100}(?:Manager|Runtime) is not defined$/.exec(error.message)?.[0]
+    : undefined;
+  const modulePath = fileURLToPath(import.meta.url);
+  const locations = error instanceof Error
+    ? (error.stack ?? "").split("\n").slice(1).flatMap((line) => {
+        if (!/^\s+at /.test(line)) return [];
+        const suffix = line.split(`${modulePath}:`)[1];
+        const position = suffix && /^(\d+):(\d+)\)?$/.exec(suffix);
+        return position ? [`${basename(modulePath)}:${position[1]}:${position[2]}`] : [];
+      }).slice(0, 8)
+    : [];
+  return { type, ...(reference ? { reference } : {}), locations };
 }
 
 function publicJob(job: InstanceBackupJob): PublicInstanceBackupJob {
