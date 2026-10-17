@@ -31,8 +31,12 @@ class InstallerTests(unittest.TestCase):
         with patch.object(SETUP,"namespace"),patch.object(SETUP,"owned"), \
              patch.object(SETUP,"write_file") as write,patch.object(SETUP,"command"):
             SETUP.install_units(config,directory,library)
-        for name in ("recover-incus-job.py","incus-host-mount-sources.py","incus-gpu-mdev.py"):
+        for name in ("recover-incus-job.py","incus-host-mount-sources.py","incus-gpu-mdev.py","incus-admin-network-policy.py"):
             write.assert_any_call(library/name,(SCRIPT.parent/name).read_bytes(),0o600,True)
+        units = [call.args[1] for call in write.call_args_list if str(call.args[0]).endswith("-policy.service")]
+        self.assertEqual(len(units), 1)
+        self.assertIn('"--admin-pool" "owned-pool"', units[0])
+        self.assertIn('"--orchestrator-container" "agentor-orchestrator"', units[0])
 
     def test_context_rejects_missing_or_stale_controller_endpoint_before_any_mutation(self):
         network = {"Id": "a" * 64, "Driver": "bridge", "Internal": False, "Options": {},

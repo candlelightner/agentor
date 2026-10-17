@@ -92,9 +92,22 @@ class TransportTests(unittest.TestCase):
 
         self.policy = Policy()
         self.host_mounts = HostMountPolicy()
-        self.start_server(self.host_mounts)
+        self.admin_calls = []
+        class AdminNetworkPolicy:
+            def ensure(self, payload):
+                if not isinstance(payload, dict) or set(payload) != {"workspaceId"} or payload["workspaceId"] != outer.worker_id:
+                    raise MODULE.POLICY.PolicyError("Unexpected administrative authority")
+                outer.admin_calls.append(("ensure", payload))
+                return {"network": "private-admin", "workspaceId": outer.worker_id}
 
-    def start_server(self, host_mounts):
+            def inspect(self, payload):
+                result = self.ensure(payload)
+                outer.admin_calls[-1] = ("inspect", payload)
+                return result
+        self.admin_networks = AdminNetworkPolicy()
+        self.start_server(self.host_mounts, self.admin_networks)
+
+    def start_server(self, host_mounts, admin_networks=None):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(self.root / "server.crt", self.root / "server.key")
         # Trust both test clients so the independent exact fingerprint fence
@@ -103,7 +116,7 @@ class TransportTests(unittest.TestCase):
         context.load_verify_locations(cafile=self.root / "other.crt")
         context.verify_mode = ssl.CERT_REQUIRED
         fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert((self.root / "client.crt").read_text())).hexdigest()
-        self.server = MODULE.TlsPolicyServer(("127.0.0.1", 0), MODULE.handler(self.policy, fingerprint, host_mounts=host_mounts), context,
+        self.server = MODULE.TlsPolicyServer(("127.0.0.1", 0), MODULE.handler(self.policy, fingerprint, host_mounts=host_mounts, admin_networks=admin_networks), context,
                                             request_timeout=0.25)
         thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
         thread.start()
@@ -111,6 +124,26 @@ class TransportTests(unittest.TestCase):
         self.addCleanup(thread.join, 2)
         self.addCleanup(self.server.shutdown)
         self.port = self.server.server_address[1]
+
+    def test_admin_network_routes_accept_only_workspace_identity_and_keep_other_routes_separate(self):
+        for operation in ("ensure", "inspect"):
+            status, envelope = self.request("POST", "/v1/admin-networks/" + operation,
+                                            json.dumps({"workspaceId": self.worker_id}))
+            self.assertEqual(status, 200)
+            self.assertEqual(envelope["metadata"]["workspaceId"], self.worker_id)
+        self.assertEqual([operation for operation, _ in self.admin_calls], ["ensure", "inspect"])
+        self.assertEqual(self.calls + self.host_calls + self.account_calls, [])
+        for payload in ({"workspaceId": self.worker_id, "network": "workers"}, {"userId": "owner"}, []):
+            status, _ = self.request("POST", "/v1/admin-networks/ensure", json.dumps(payload))
+            self.assertEqual(status, 409)
+        status, _ = self.request("POST", "/v1/admin-networks/remove", json.dumps({"workspaceId": self.worker_id}))
+        self.assertEqual(status, 404)
+
+    def test_admin_network_routes_are_disabled_without_pinned_host_adapter(self):
+        self.start_server(self.host_mounts)
+        status, _ = self.request("POST", "/v1/admin-networks/ensure", json.dumps({"workspaceId": self.worker_id}))
+        self.assertEqual(status, 503)
+        self.assertEqual(self.admin_calls, [])
 
     def context(self, identity="client"):
         context = ssl.create_default_context(cafile=self.root / "server.crt")

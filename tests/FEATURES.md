@@ -4,6 +4,8 @@ Native administrative terminal, files, editor/desktop proxy, plugin transport, j
 
 Archived legacy workers can explicitly select an authorized catalog replacement while unarchiving when the original custom image is unavailable. The replacement uses the existing strict recovery parser, preserves worker identity and persistent data, and is saved as desired configuration before compute creation. Invalid/foreign/incompatible selections and persistence failures allocate no compute; failed creation retains the selected desired image and archived data. Native/imported-rootfs/workspace-only replacement is not enabled by this operation.
 
+Native administrative VM host networking now has a workspace-ID-only policy boundary: fresh dedicated authority, one private bridge/orchestrator peer, fixed filtered NIC, canonical device admission, explicit host and sibling isolation, and no automatic resource deletion. This is source/stub-tested support; real firewall/bridge/MCP acceptance remains pending. See `docs/incus-admin-private-networks.md`.
+
 Every user-facing feature of the Agentor web dashboard, organized by category. This document drives the Playwright test suite — every item below must have test coverage.
 
 Accepted Incus instance creation has a finite 30-minute operation wait for large image unpacking under disk load. It submits once, polls every 500 ms with the existing 30-second HTTP transport bound, and requires terminal success before returning compute for provisioning. Failure or expiry retains existing nonce/UUID-fenced ambiguity and recovery behavior; other operation deadlines are unchanged.

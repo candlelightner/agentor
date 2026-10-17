@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Operator-installed mTLS service for owned bridge lifecycle/allowlisting only.
 
-Unrestricted Incus Unix access stays on the host. No command execution, raw
-Incus proxy, caller-selected project/path/config, or worker provisioning API.
+Unrestricted Incus Unix access and fixed firewall commands stay on the host.
+No caller-selected commands, raw Incus proxy, project/path/config, or worker
+provisioning API.
 """
 import argparse
 import hashlib
@@ -104,7 +105,25 @@ def docker_inventory(socket_path):
     return inventory
 
 
-def handler(policy, client_fingerprint, host_mounts=None):
+def docker_request(socket_path):
+    def request(method, path, body=None):
+        connection = UnixConnection(socket_path)
+        try:
+            connection.request(method, path, None if body is None else json.dumps(body).encode(),
+                               {"Content-Type": "application/json"})
+            response = connection.getresponse()
+            content = response.read(4 * 1024 * 1024 + 1)
+            if len(content) > 4 * 1024 * 1024:
+                raise POLICY.PolicyError("Private network Docker response exceeded its bound")
+            if response.status >= 400:
+                raise IncusRejected(response.status)
+            return json.loads(content) if content else None
+        finally:
+            connection.close()
+    return request
+
+
+def handler(policy, client_fingerprint, host_mounts=None, admin_networks=None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "AgentorNetwork/1"
 
@@ -151,10 +170,11 @@ def handler(policy, client_fingerprint, host_mounts=None):
                 path = self.validate()
                 mount_request = path in ("/v1/host-mounts/ensure", "/v1/host-mounts/inspect")
                 account_request = path == "/v1/account-shares/ensure"
-                if not mount_request and not account_request and path not in ("/v1/managed-networks/ensure", "/v1/managed-networks/remove", "/v1/managed-networks/inspect"):
+                admin_request = path in ("/v1/admin-networks/ensure", "/v1/admin-networks/inspect")
+                if not mount_request and not account_request and not admin_request and path not in ("/v1/managed-networks/ensure", "/v1/managed-networks/remove", "/v1/managed-networks/inspect"):
                     self.reply(404)
                     return
-                if (mount_request or account_request) and host_mounts is None:
+                if ((mount_request or account_request) and host_mounts is None) or (admin_request and admin_networks is None):
                     self.reply(503)
                     return
                 lengths = self.headers.get_all("Content-Length", [])
@@ -163,7 +183,9 @@ def handler(policy, client_fingerprint, host_mounts=None):
                     self.reply(400)
                     return
                 payload = json.loads(self.rfile.read(int(length)))
-                if account_request:
+                if admin_request:
+                    result = admin_networks.inspect(payload) if path.endswith("/inspect") else admin_networks.ensure(payload)
+                elif account_request:
                     result = host_mounts.ensure_account_shares(payload)
                 elif mount_request:
                     result = host_mounts.inspect(payload) if path.endswith("/inspect") else host_mounts.ensure(payload)
@@ -185,6 +207,8 @@ def main():
     parser.add_argument("--incus-socket", default="/var/lib/incus/unix.socket")
     parser.add_argument("--host-mounts", action="store_true", help="Enable catalog-ID-only host export policy")
     parser.add_argument("--docker-socket", default="/var/run/docker.sock")
+    parser.add_argument("--admin-pool")
+    parser.add_argument("--orchestrator-container")
     args = parser.parse_args()
     if ipaddress.ip_address(args.bind).is_unspecified:
         parser.error("Explicit narrow listener address required; wildcard binding is forbidden")
@@ -200,14 +224,25 @@ def main():
         mounts = host_mounts.HostMountPolicy(args.data_dir, args.installation, args.project,
             str(Path(args.incus_socket).parent), [args.server_cert, args.server_key, args.client_cert],
             incus_request(args.incus_socket), docker_inventory(args.docker_socket))
+    admin_networks = None
+    if args.admin_pool or args.orchestrator_container:
+        if not args.admin_pool or not args.orchestrator_container:
+            parser.error("Admin networking requires both the pinned pool and orchestrator container")
+        spec = importlib.util.spec_from_file_location("incus_admin_network_policy", Path(__file__).with_name("incus-admin-network-policy.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        # Share the existing exception type with the redacted HTTP boundary.
+        module.PolicyError = module.BASE.PolicyError = POLICY.PolicyError
+        admin_networks = module.AdminNetworkPolicy(policy, args.admin_pool, args.orchestrator_container,
+                                                   docker_request(args.docker_socket))
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(args.server_cert, args.server_key)
     context.load_verify_locations(cafile=args.client_cert)
     context.verify_mode = ssl.CERT_REQUIRED
-    # HTTPServer serializes bridge/policy updates; If-Match additionally fences
+    # HTTPServer serializes bridge/firewall/policy updates; If-Match additionally fences
     # unrelated operator changes. No thread pool, scheduler or global journal.
-    server = TlsPolicyServer((args.bind, args.port), handler(policy, fingerprint, mounts), context)
+    server = TlsPolicyServer((args.bind, args.port), handler(policy, fingerprint, mounts, admin_networks), context)
     server.serve_forever()
 
 
