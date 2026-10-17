@@ -51,6 +51,7 @@ export default defineConfig({
     "api/incus-managed-archive.spec.ts",
     "api/incus-managed-backup-live.spec.ts",
     "api/admin-workspace-store-transactions.spec.ts",
+    "api/admin-native-*.spec.ts",
     "api/container-store-quarantine.spec.ts",
     "api/instance-backup-*.spec.ts",
     "api/instance-native-apply.spec.ts",

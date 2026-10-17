@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { useContainerManager } from "./services";
+import { applyAdminNativePatch, validateAdminNativeState, type AdminNativeRuntimeIdentity,
+  type AdminNativeMigration, type AdminNativeAcknowledge } from './admin-native-authority';
 import {
   operationSettlement,
   type OperationFailureWithSettlement,
@@ -16,6 +18,9 @@ export interface AdministrativeWorkspaceRecord {
   marker?: string;
   createdAt: string;
   updatedAt: string;
+  runtimeKind?: 'legacy-docker' | 'incus-vm';
+  nativeRuntime?: AdminNativeRuntimeIdentity;
+  nativeMigration?: AdminNativeMigration;
   imageName?: string;
   imageDigest?: string;
   /** Account whose worker environment variables are injected on recreation. */
@@ -74,15 +79,18 @@ export type AdminWorkspaceIdentityMaterializer = (
 export interface AdminWorkspaceRuntimeAdapter {
   ensure(
     record: Readonly<AdministrativeWorkspaceRecord>,
+    acknowledge?: AdminNativeAcknowledge,
   ): Promise<AdminWorkspaceRuntimeImage | void>;
   start(
     record: Readonly<AdministrativeWorkspaceRecord>,
+    acknowledge?: AdminNativeAcknowledge,
   ): Promise<AdminWorkspaceRuntimeImage | void>;
-  stop(record: Readonly<AdministrativeWorkspaceRecord>): Promise<void>;
+  stop(record: Readonly<AdministrativeWorkspaceRecord>, acknowledge?: AdminNativeAcknowledge): Promise<void>;
   rebuild(
     record: Readonly<AdministrativeWorkspaceRecord>,
+    acknowledge?: AdminNativeAcknowledge,
   ): Promise<AdminWorkspaceRuntimeImage | void>;
-  remove?(record: Readonly<AdministrativeWorkspaceRecord>): Promise<void>;
+  remove?(record: Readonly<AdministrativeWorkspaceRecord>, acknowledge?: AdminNativeAcknowledge): Promise<void>;
   startupScriptStatus?(
     record: Readonly<AdministrativeWorkspaceRecord>,
   ): Promise<AdminWorkspaceStartupScriptRuntimeStatus>;
@@ -149,6 +157,7 @@ export class AdminWorkspaceStore {
         if (parsed?.schemaVersion !== 1 || parsed.kind !== "administrative" ||
             typeof parsed.id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(parsed.id))
           throw new Error('Invalid administrative workspace identity');
+        validateAdminNativeState(parsed);
         this.record = parsed;
       } catch (error: any) {
         if (!present && error?.code === "ENOENT") return;
@@ -213,6 +222,21 @@ export class AdminWorkspaceStore {
       throw error;
     }
   }
+  private nativeAcknowledge(record: AdministrativeWorkspaceRecord): AdminNativeAcknowledge {
+    return async patch => {
+      if (applyAdminNativePatch(record, patch)) await this.commitExternal('native-runtime', record);
+    };
+  }
+  /** Dedicated migration/restore hook; caller cannot enter ordinary-worker lifecycle. */
+  async withNativeRuntimeTransaction<T>(operation: (record: AdministrativeWorkspaceRecord, acknowledge: AdminNativeAcknowledge) => Promise<T>): Promise<T> {
+    return this.exclusive(async () => {
+      await this.init();
+      await this.flushPendingCommit('native-runtime');
+      if (!this.record) throw Object.assign(new Error('Administrative workspace is not provisioned'), { statusCode: 404 });
+      const record = structuredClone(this.record);
+      return operation(record, this.nativeAcknowledge(record));
+    });
+  }
   async ensure() {
     return this.exclusive(() => this.ensureLocked());
   }
@@ -236,6 +260,7 @@ export class AdminWorkspaceStore {
         id: randomUUID(),
         kind: "administrative",
         trusted: true,
+        runtimeKind: "incus-vm",
         status: "running",
         createdAt: now,
         updatedAt: now,
@@ -249,7 +274,7 @@ export class AdminWorkspaceStore {
           structuredClone(candidate),
           "prepare-start",
         );
-      const image = await this.runtime.ensure(structuredClone(candidate));
+      const image = await this.runtime.ensure(structuredClone(candidate), this.nativeAcknowledge(candidate));
       if (this.applyRuntimeImage(candidate, image))
         await this.commitExternal("ensure", candidate);
       // Startup/readiness may consume most of the short identity TTL. Refresh
@@ -281,13 +306,13 @@ export class AdminWorkspaceStore {
             );
           this.applyRuntimeImage(
             candidate,
-            await this.runtime.start(structuredClone(candidate)),
+            await this.runtime.start(structuredClone(candidate), this.nativeAcknowledge(candidate)),
           );
           await this.identityMaterializer?.(
             structuredClone(candidate),
             "refresh-running",
           );
-        } else await this.runtime.stop(structuredClone(candidate));
+        } else await this.runtime.stop(structuredClone(candidate), this.nativeAcknowledge(candidate));
       }
       candidate.status = status;
       candidate.updatedAt = new Date().toISOString();
@@ -319,7 +344,7 @@ export class AdminWorkspaceStore {
         );
       this.applyRuntimeImage(
         candidate,
-        await this.runtime.rebuild(structuredClone(candidate)),
+        await this.runtime.rebuild(structuredClone(candidate), this.nativeAcknowledge(candidate)),
       );
       await this.identityMaterializer?.(
         structuredClone(candidate),
@@ -420,6 +445,8 @@ export class AdminWorkspaceStore {
     return {
       ...structuredClone(record),
       ownerId: undefined,
+      nativeRuntime: undefined,
+      nativeMigration: undefined,
       marker: undefined,
       startupScript: undefined,
       startupScriptRevision: undefined,
