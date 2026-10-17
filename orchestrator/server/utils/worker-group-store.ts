@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { validateAdminNativeState } from "./admin-native-authority";
 import { UserScopedJsonStore } from "./user-scoped-store";
 import type { WorkerSelfApiAccess } from "../../shared/types";
 
@@ -24,6 +25,7 @@ function validatedGroupId(group: WorkerGroup): string {
       typeof admin.ownerId !== "string" || admin.ownerId !== group.userId ||
       typeof admin.groupId !== "string" || admin.groupId !== group.id))
     throw new Error("Invalid group administrative workspace identity");
+  if (admin) validateAdminNativeState(admin as any);
   return group.id;
 }
 

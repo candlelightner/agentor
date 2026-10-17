@@ -524,3 +524,6 @@ from `scripts/maintenance/incus-upgrade-20261017`. Sixteen isolated tests cover 
 immutable custom images, environment equivalence, private receipts, bounded sample exclusions,
 mocked lifecycle success/ambiguity, retained-source identity, native acceptance, legacy managed
 shape refusal, same-worker editor redirects, guarded post-unarchive continuation and normal execution delegation. These tests do not execute production migration.
+
+
+`api/admin-native-authority.spec.ts` adds seven module cases covering native-before-provision global/group records, private durable acknowledgements, dedicated legacy cutover, acknowledgement failure before side effects, malformed metadata quarantine preserving bytes, and identity-preserving runtime patches. Existing 13 administrative store transaction cases pass.
