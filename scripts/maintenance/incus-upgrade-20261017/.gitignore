@@ -5,6 +5,7 @@
 !/prepare-incus-storage.py
 !/restore-worker-home.py
 !/test_restore_worker_home.py
+!/worker-init-prefix.sh
 !/dockerignore-canary.patch
 !/maintenance/
 /maintenance/*

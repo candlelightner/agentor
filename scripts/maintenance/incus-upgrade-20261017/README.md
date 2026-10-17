@@ -37,3 +37,6 @@ renamed before linking preserved paths. The original worker init script follows
 this setup step without being committed here. Source Docker containers and SSD
 copies of the archives remain available for recovery. Archive path and symlink
 validation is covered by `python3 -m unittest test_restore_worker_home.py`.
+`worker-init-prefix.sh` is prepended to the original private init script through
+the worker settings API. Its enable file is created only after migration commits;
+the operator then runs restoration to completion before restoring stopped intent.
