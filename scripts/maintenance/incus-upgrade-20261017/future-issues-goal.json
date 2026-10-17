@@ -1,0 +1,53 @@
+{
+  "objective": "After the backup-preserving VM migration, consolidate validated parallel code fixes into feature/incus-vm-workers and create a PR onto main when combined checks pass. Keep the verified backup, keys, original Docker data and rollback images.",
+  "state": "in-progress-in-parallel; activate follow-on tracker goal after the existing migration goal completes",
+  "priority": [
+    {
+      "issues": [
+        11,
+        6,
+        10
+      ],
+      "owner": "backup_issues",
+      "branch": "fix/backup-reliability-performance-20261017",
+      "model": "gpt-6.1-sol",
+      "reasoning": "high",
+      "focus": "Backup correctness, usable archived selections, then throughput and disk efficiency"
+    },
+    {
+      "issues": [
+        12
+      ],
+      "owner": "hardware_passthrough",
+      "branch": "fix/incus-hardware-grants-20261017",
+      "model": "gpt-6-astra",
+      "reasoning": "xhigh",
+      "focus": "Authorized GPU/USB support and honest capability detection without risking host storage"
+    },
+    {
+      "issues": [
+        8,
+        9,
+        7
+      ],
+      "owner": "diagnostics_terminal",
+      "branch": "fix/admin-logs-terminal-20261017",
+      "model": "gpt-6.1-sol",
+      "reasoning": "high",
+      "focus": "Global-admin diagnostics and downloads, then clipboard usability"
+    }
+  ],
+  "completion": [
+    "Eligible production migration and validation finished with accurate exceptions",
+    "Agent branches committed/pushed and reviewed",
+    "Combined tests/typecheck/build and appropriate isolated integration checks pass",
+    "Consolidate only validated work; document unsupported or unverified hardware paths",
+    "Create PR from consolidated VM feature branch onto main; report any remaining acceptance gaps"
+  ],
+  "production_guards": [
+    "Agents do not mutate production stack, workers, Incus policy, hardware or backup data",
+    "Never pass through mounted host storage, especially the JMicron controller/disks containing recovery artifacts and VM SSD",
+    "Keep GPU/USB and administrative workers on Docker until separately supported and verified",
+    "No backup/source finalization or deletion"
+  ]
+}
