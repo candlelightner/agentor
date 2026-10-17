@@ -10,6 +10,7 @@
     "api/admin-native-authority.spec.ts",
     "api/admin-native-runtime.spec.ts",
     "api/admin-native-backup.spec.ts",
+    "api/admin-native-image.spec.ts",
     "api/incus-worker-lifecycle.spec.ts",
     "api/incus-worker-runtime.spec.ts",
     "api/incus-worker-commands.spec.ts",
