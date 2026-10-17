@@ -1,3 +1,5 @@
+import { incusDefaultMemoryLimit } from '../../shared/worker-memory';
+
 export type ChallengeType = 'none' | 'http' | 'dns' | 'selfsigned';
 
 export interface BaseDomainConfig {
@@ -54,6 +56,8 @@ export interface Config {
   incusConverterStoragePool?: string;
   /** Operator-pinned trusted seed; never supplied by worker/import metadata. */
   incusConverterSeedFingerprint?: string;
+  /** Finite RAM assigned when a native worker has no positive cap. */
+  incusDefaultMemoryLimit: string;
   incusWorkerImage: string;
   incusDockerVolumeSize: string;
   incusInternalGatewayUrl: string;
@@ -179,6 +183,7 @@ export function loadConfig(): Config {
     incusStoragePool: process.env.INCUS_STORAGE_POOL || '',
     incusConverterStoragePool: process.env.INCUS_CONVERTER_STORAGE_POOL || '',
     incusConverterSeedFingerprint: process.env.INCUS_CONVERTER_SEED_FINGERPRINT || '',
+    incusDefaultMemoryLimit: incusDefaultMemoryLimit(process.env.INCUS_DEFAULT_MEMORY_LIMIT),
     incusWorkerImage: process.env.INCUS_WORKER_IMAGE || 'agentor-worker',
     incusDockerVolumeSize: process.env.INCUS_DOCKER_VOLUME_SIZE || '20GiB',
     incusInternalGatewayUrl: process.env.INCUS_INTERNAL_GATEWAY_URL || '',

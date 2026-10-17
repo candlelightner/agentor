@@ -26,6 +26,7 @@ export default defineConfig({
   testDir: ".",
   testMatch: [
     "api/portable-pax-size.spec.ts",
+    "api/worker-memory-policy.spec.ts",
     "api/plugin-core.spec.ts",
     "api/plugin-desktop-core.spec.ts",
     "api/portable-managed-volume-format.spec.ts",

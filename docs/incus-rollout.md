@@ -212,3 +212,9 @@ worker recovery fence. The normal 30-second reconciliation pass can roll back
 a completed replacement only after fresh owner/installation/UUID/nonce proof;
 it retains canonical volumes and the legacy Docker source. Observe operation
 settlement and durable archived/stopped state before a new lifecycle request.
+Native VM allocations now always send a finite `limits.memory`: the resolved
+positive worker cap, or `INCUS_DEFAULT_MEMORY_LIMIT` (default `4GiB`) for an
+empty/zero cap. This migration-discovered correction avoids Incus's implicit
+roughly 1 GiB default for previously uncapped Docker environments. Existing
+positive caps and Docker behavior remain unchanged; running VMs are not resized.
+See `docs/environments.md` for precedence, validation and effective UI reporting.
