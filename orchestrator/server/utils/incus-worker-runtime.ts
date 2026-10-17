@@ -1643,7 +1643,10 @@ export class IncusWorkerRuntime {
         ['/usr/bin/python3', '-c', INCUS_CANONICAL_RESTORE_SCRIPT, 'agents', 'account-parents']);
       await check();
     }
-    await this.stop(opts, incarnation);
+    // Restored VirtioFS data can take longer than an ordinary worker shutdown
+    // to flush and unmount. Keep the shutdown graceful and require its native
+    // acknowledgement before promoting the isolated restore layout.
+    await this.stop(opts, incarnation, 120);
     const stopped = await check();
     if (stopped.status !== 'Stopped') throw new Error('Incus restore destination shutdown is unconfirmed');
     const persistent = await storage.devices(opts, opts.environmentJson.dockerEnabled, { docker: false });
@@ -1897,12 +1900,12 @@ export class IncusWorkerRuntime {
     await this.client.pushFile(name, "/run/agentor/provisioned", "agentor-runtime-v1\n", { mode: 0o600, uid: 0, gid: 0 });
   }
 
-  async stop(target: string | IncusStorageOwner, incarnation?: string): Promise<void> {
+  async stop(target: string | IncusStorageOwner, incarnation?: string, timeout = 30): Promise<void> {
     const name = typeof target === 'string' ? target : target.containerName;
     await this.assertOwned(name, typeof target === 'string' ? undefined : target.id,
       typeof target === 'string' ? undefined : target.userId, incarnation);
     const state = await this.client.getInstanceState(name);
-    if (state.status !== "Stopped") await this.client.stopInstance(name, { timeout: 30 });
+    if (state.status !== "Stopped") await this.client.stopInstance(name, { timeout });
   }
 
   async refreshSshKeys(owner: IncusStorageOwner, content: string): Promise<void> {

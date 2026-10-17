@@ -173,6 +173,35 @@ test('account parent initialization is inside isolated canonical authority and p
   } finally { await f.cleanup(); }
 });
 
+test('canonical promotion gives restored filesystems a bounded graceful shutdown and retains failed authority', async () => {
+  for (const shutdownFails of [false, true]) {
+    const f = await fixture(); try {
+      const instance = await f.runtime.createCanonicalRestore(f.opts);
+      await f.runtime.restoreCanonicalArchives(f.opts, instance.config['volatile.uuid']!, {}, () => {});
+      (f.runtime as any).accountDevices = async () => ({});
+      (f.runtime as any).managedDevices = async () => ({});
+      let calls = 0;
+      f.client.stopInstance = async (_name: string, options: { timeout: number; force?: boolean }) => {
+        calls++;
+        expect(options).toEqual({ timeout: 120 });
+        expect(f.events).not.toContain('promote');
+        if (shutdownFails) throw new Error('Graceful shutdown acknowledgement unavailable');
+        f.events.push('stop'); f.current().status = 'Stopped';
+      };
+      const finish = f.runtime.finishCanonicalRestore(f.opts, instance.config['volatile.uuid']!, () => {}, 'stopped');
+      if (shutdownFails) {
+        await expect(finish).rejects.toThrow('Graceful shutdown acknowledgement unavailable');
+        expect(f.events).not.toContain('promote');
+        expect(f.current().config['user.agentor.restore']).toBe('incomplete');
+      } else {
+        await finish;
+        expect(f.events.indexOf('stop')).toBeLessThan(f.events.indexOf('promote'));
+      }
+      expect(calls).toBe(1); // An error never authorizes a forced retry.
+    } finally { await f.cleanup(); }
+  }
+});
+
 async function managedPayload(f: Awaited<ReturnType<typeof fixture>>, target = '/srv/restored-data') {
   const store = new ManagedVolumeStore(f.dataDir); await store.init();
   const volume = await store.create(f.opts.userId, f.opts.id, target, 'Restored data', 'incus-vm');

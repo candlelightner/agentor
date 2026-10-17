@@ -119,6 +119,11 @@ An ambiguous interruption fails closed and retains both sides for explicit
 administrator recovery; never clear its marker or replay an unknown operation
 based only on a missing instance or expired Incus operation record.
 
+Canonical restore allows up to 120 seconds for the isolated VM to shut down
+gracefully and flush its restored filesystems before operational devices are
+attached. A failed shutdown does not authorize promotion or a forced power-off.
+Ordinary worker stop operations retain their 30-second timeout.
+
 The VM root is disposable. Backups, rebuilds and migrations preserve canonical
 workspace, agent/editor state, managed data and applicable native Docker state,
 not arbitrary root-disk mutations. Historical backups missing runtime metadata
