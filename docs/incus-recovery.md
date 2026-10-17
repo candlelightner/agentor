@@ -124,3 +124,57 @@ the orphan safely rather than claiming to fix Incus internals.
 Retain quarantine until deliberate administrator cleanup is separately approved.
 It is retained disposable compute, never a new authoritative worker
 root filesystem, backup source, or migration image.
+
+## Quarantined native converter/storage-helper job (#2: triage only)
+
+This section collects evidence for administrator review. It does **not** add a
+receipt-settlement override. A safe general repair for expired/missing native
+acknowledgements is still tracked in #2; do not call the issue resolved merely
+because its helper is stopped or missing.
+
+Use the existing Phase 8–10 per-job authority, not a new journal:
+
+| Job | Existing private authority | Existing cleanup boundary |
+| --- | --- | --- |
+| OCI converter/import | `image-catalog/image-catalog.json`, exact build's `nativeDerivation` | Catalog acknowledgements and `IncusImageConverter`; source authorization and exact converter UUID/import fingerprint |
+| Offline backup/restore helper | `incus-backup-helpers/<job-uuid>.json` under DATA | `IncusOfflineArchiveHelper`; exact helper UUID, optional copy identity, source rechecks and writer settlement |
+| Offline volume-size helper | `system-state/volume-size-jobs.v1.json`, exact job's `incusHelper` | `IncusVolumeSizeHelper.cleanup` via the sizing manager's existing recovery; pending native operation and copy/incarnation fences |
+
+1. Keep the exact DATA/installation and job record private and unchanged. Record
+   its checksum, installation/project, owner, job ID, acknowledged operation,
+   original helper UUID, source identities and copy creation identity **only when
+   these were actually captured**. Do not fill absent fields from a resource
+   which merely has the expected name. Backup bundles and image descriptions are
+   not authority for the endpoint, project, device or receipt.
+2. Confirm the configured pools/sources are mounted and available, and source
+   WorkerRecord/volume authority is unchanged. If disk replacement left the old
+   pool unavailable, stop: creating empty paths or new volumes would not restore
+   the original data. A new pool does not validate old private receipts.
+3. Query the exact recorded operation against the local daemon with the explicit
+   configured project. Keep the output private:
+
+   ```sh
+   sudo incus --force-local query '/1.0/operations/<recorded-operation-uuid>?project=<project>'
+   ```
+
+   A live nonterminal operation is not permission to replay it. A terminal
+   response can only support existing cleanup when the required exact resource
+   acknowledgement was also captured. An expired/404 operation, missing response,
+   lost daemon continuity, or missing create/copy UUID remains **unresolved**.
+4. Use the existing job cleanup/recovery only for its already-supported proven
+   cases. It must retain all existing ownership, incarnation, reference and
+   source checks. A workspace writer additionally requires its callback/data
+   authority to be settled; stopping/deleting the helper does not establish that.
+   Do not turn a failed build into a successful import, publish a guessed image,
+   remove an active receipt, or retry using a different job ID to evade the fence.
+5. For an unsupported ambiguous case, preserve the receipt and both resource
+   sides. Collect exact native identities, daemon/host boot and operation evidence
+   for a **job-specific reviewed recovery**. A host reboot can establish that old
+   processes no longer survive, but it does not prove source data, an uncaptured
+   UUID, callback success or image import success. There is deliberately no
+   blanket `404 = success`, force-clear, or receipt-edit command here.
+
+This boundary permits safe manual investigation without weakening the existing
+fences. Adding a settlement action requires a concrete proof for that job type;
+it must reuse these stores/cleanup primitives and must not become a generic
+transaction/recovery framework.
