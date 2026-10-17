@@ -1409,3 +1409,8 @@ Nested group administrative identities are validated before their owner partitio
 
 
 Native administrative runtime authority now marks newly persisted global/group identities as Incus before provisioning, preserves legacy selectors until an explicit dedicated transaction, persists bounded runtime acknowledgements, and quarantines malformed native metadata. Runtime/network/proxy/DR integration remains in progress.
+
+
+Native administrative core (fixed 4 GiB RAM / 2 vCPU profile) now binds fresh global/group workspaces to Incus only, with no Docker provisioning fallback; preserves retained Docker sources pending explicit migration; owns canonical private volumes, approved-native/OCI image identity and server-generated overlay6; persists lifecycle acknowledgements/UUIDs, gates service start on a fresh tmpfs credential, and validates the dedicated network before boot and guest access. Existing control representation and startup revision behavior are shared across transports. Private host policy, proxy/plugin dispatch, complete native admin migration/DR and real VM acceptance remain separate integration gates.
+
+Native admin authority preserves bounded legacy IDs through deterministic DNS-safe native names. Group-store bootstrap is singleflight/once-only; explicit per-owner reload/recovery remains available. Fresh empty canonical root initialization and subsequent ownership-preservation markers protect restored numeric metadata from the ordinary VM bootstrap chown.
