@@ -1,0 +1,146 @@
+{
+  "objective": "Autonomously finish the Agentor VM-branch upgrade and migration of every safely eligible ordinary worker, verifying workspace, agent/editor state, managed volumes, native Docker data, preserved custom tools and intended stopped/archived state. Keep the verified encrypted backup fd9ff548-9a79-4b7c-979c-7906f0a0cf10, recovery keys, original Docker sources and rollback images. In parallel, have appropriately chosen sub-agents address as many remaining GitHub code issues as realistic in urgency/impact order, especially safe GPU/USB passthrough, backup correctness/performance and operational diagnostics. Require coherent committed and pushed branches, accurate supported-capability reporting and appropriate validation. After migration and sub-agent work finish, consolidate and review locally, merge only validated agent changes into feature/incus-vm-workers, run combined checks, and create a PR onto main if those checks pass. Report unresolved image, hardware and acceptance limitations honestly; do not delete the backup or prematurely finalize original data. Latest scope: both hardware workers must migrate to VMs with required hardware working; Docker is not their acceptable final state. Implement and validate dedicated VM admin runtimes as feasible, preserving their trusted management boundary.",
+  "state": "active combined goal; four production workers verified, updater retry capturing, isolated agent fixes finished and reviewed; consolidation follows eligible migration",
+  "priority": [
+    {
+      "issues": [
+        11,
+        6,
+        10
+      ],
+      "owner": "backup_issues",
+      "branch": "fix/backup-reliability-performance-20261017",
+      "model": "gpt-6.1-sol",
+      "reasoning": "high",
+      "focus": "Backup correctness, usable archived selections, then throughput and disk efficiency"
+    },
+    {
+      "issues": [
+        12
+      ],
+      "owner": "hardware_passthrough",
+      "branch": "fix/incus-hardware-grants-20261017",
+      "model": "gpt-6-astra",
+      "reasoning": "xhigh",
+      "focus": "Authorized GPU/USB support and honest capability detection without risking host storage"
+    },
+    {
+      "issues": [
+        8,
+        9,
+        7
+      ],
+      "owner": "diagnostics_terminal",
+      "branch": "fix/admin-logs-terminal-20261017",
+      "model": "gpt-6.1-sol",
+      "reasoning": "high",
+      "focus": "Global-admin diagnostics and downloads, then clipboard usability"
+    }
+  ],
+  "completion": [
+    "Ordinary production migration finished, including both hardware workers with required hardware access verified; no permanent hardware Docker exclusion",
+    "Agent branches committed/pushed and reviewed",
+    "Combined tests/typecheck/build and appropriate isolated integration checks pass",
+    "Consolidate only validated work; implement and validate dedicated admin VM support where feasible, preserving security and reporting actual acceptance gaps",
+    "Create PR from consolidated VM feature branch onto main; report any remaining acceptance gaps"
+  ],
+  "production_guards": [
+    "Agents do not mutate production stack, workers, Incus policy, hardware or backup data",
+    "Never pass through mounted host storage, especially the JMicron controller/disks containing recovery artifacts and VM SSD",
+    "Keep existing hardware and administrative sources retained until their dedicated VM support, device/network boundaries and migration are validated; this is temporary staging, not an acceptable final hardware state",
+    "No backup/source finalization or deletion"
+  ],
+  "lastVerifiedProductionWorker": {
+    "id": "e9737f4c-28e7-4862-956b-83c83a526071",
+    "name": "agentor-updater",
+    "runtime": "incus-vm",
+    "state": "stopped",
+    "incarnation": "f5325882-33e9-4db0-9b8b-98dcb8bc1237",
+    "guestKernel": "7.0.0-38-generic",
+    "checks": [
+      "Codex0.163.0 and qemu-utils restored",
+      "GitHub configuration retained without printing credentials",
+      "native/shebang shared execution, worker session and desktop RFB",
+      "editor and desktop proxies200",
+      "Docker10images/0containers/3volumes with16 metadata-complete samples",
+      "eight workspace and eight agent-data hash samples matched; not full-tree verification",
+      "original exact stopped Docker source, canonical volumes and encrypted instance backup retained"
+    ]
+  },
+  "verifiedProductionWorkers": [
+    "6eea5aa9-2d0d-454a-a91b-21b35d5b84fc",
+    "cd4170f6-21aa-4494-b886-640494ff1f30",
+    "834db661-cff3-402b-8daa-b0ba4738abeb",
+    "2eb7b5c5-5df6-412d-81cd-a88e7a9a92a5",
+    "e9737f4c-28e7-4862-956b-83c83a526071"
+  ],
+  "migrationFollowUps": {
+    "updater": "Fully verified native and returned to original stopped intent. Source Docker exact/stopped retained, migration phase retained, no pending rebuild/recreation. Five-minute create deadline caused safe rollback while unpacking; create-only bounded 30-minute fix is committed/pushed/deployed as4ba49778. Codex0.163.0, qemu-utils, GitHub configuration, worker session, desktop RFB, editor/desktop proxies and shared execution passed. Native Docker retained10images/0containers/3volumes;16 hash+size+uid+gid+mode+mtime samples and8workspace+8agent-data hashes matched. Sampling is not full-tree proof.",
+    "3d": "Fully verified and archived natively after supported rebuild; original Docker source retained. Initial failure reproduced: a read-only migration status request reloaded shared worker authority and dropped own undefined keys.",
+    "metod": "Archived legacy managed parent /home/agent/.local/share overlaps protected Kilo data. Do not bypass admission or drop data; source and legacy volume retained for reviewed handling.",
+    "remainingArchivedEligible": [
+      "2ecd0b20-faf9-422f-95a1-1db08c812669",
+      "b71d012c-4d77-4a7a-8e8b-4626d11ed5d8",
+      "a9812e5e-7316-4de6-9c6b-bf3ec11dcee2"
+    ]
+  },
+  "additionalBranches": {
+    "memoryPolicy": "fix/incus-default-memory-20261017",
+    "paxSize": "fix/incus-pax-size-20261017",
+    "migrationDiagnostics": "fix/incus-migration-diagnostics-20261017",
+    "legacyManagedMigration": "fix/incus-legacy-managed-migration-20261017",
+    "isolatedIntegration": "fix/backup-integration-harness-20261017",
+    "workerStoreInitialization": "fix/worker-store-init-once-20261017",
+    "dockerLiteralPaths": "fix/incus-docker-literal-paths-20261017",
+    "realCliClipboard": "fix/terminal-copy-real-cli-20261017",
+    "createUnpackDeadline": "fix/incus-create-unpack-deadline-20261018",
+    "managedKiloParent": "fix/incus-managed-kilo-parent-20261017",
+    "archivedImageRecovery": "fix/archived-worker-image-recovery-20261017",
+    "adminIdentity": "fix/ordinary-worker-admin-identity-20261017",
+    "nativeDockerVerifier": "ops/incus-docker-verification-20261017"
+  },
+  "deployedSourceRevision": "4ba49778c6505b5825410dca2264164b2a8171c2",
+  "reviewedInitializationFix": "11906c9 passed 138 affected tests and both typechecks. Independent peer proved twenty concurrent startup status requests perform one load and later reads preserve live authority; explicit private readers remain fresh.",
+  "terminalAcceptance": "Committed and pushed 167fab9: installed Codex 0.163.0 actual /copy picker through tmux, WebSocket and TerminalPane/xterm to explicit Chromium clipboard action; exact 1000-line UTF-8 response also matches successful X11 clipboard. All 30 diagnostics tests and typecheck pass. Other CLI versions unverified.",
+  "consolidationReview": "Static peer review found no new security blocker. From current production lineage, merge legacy-managed, memory, hardware, real-CLI management (includes diagnostics), then backup integration (includes reliability/performance). Retain both memory allocation and final hardware reauthorization, both Docker imports, and union all test registrations. Migration tests must retain both baseline drift rejection and historical-volume handling. Do not remerge already cherry-picked urgent branches.",
+  "allWorkerBlockers": {
+    "scope": "User explicitly requested fixing all reasons for all workers; prior exclusions are active work, not assumed permanent exceptions. Preserve backup, source data and actual trusted admin workspaces.",
+    "ordinaryMissingImages": {
+      "workerIds": [
+        "2d3c4841-893e-46a9-ad03-a5c50b08258c",
+        "192e1624-fecf-4bf8-bda7-512ff0b9c542",
+        "6f54ddcc-eee1-40f9-b151-afb8d9dd84e0",
+        "ab2164f1-5e5d-4998-8eb9-ee9045b70b84"
+      ],
+      "status": "Four explicit replacement catalog definitions preserve saved recipes and versions. First two replacement builds verified ready with actual Docker digest/ownership labels; original image SHAs are not claimed recovered. Builds3/4 and original worker retarget/migration remain pending validated image-recovery+admin-identity deployment."
+    },
+    "METOD": {
+      "workerId": "a05a29a7-fb5c-487a-8202-a13af60e7836",
+      "status": "Whole-parent preservation and exact canonical Kilo symlink handling committed/pushed asba141602, peer review passed. Production deployment/migration/restore acceptance pending; original volume untouched."
+    },
+    "hardware": {
+      "workerIds": [
+        "484f104d-4370-4d78-a5d6-dde517161c11",
+        "26087985-9643-4564-a0e0-aff03c3e28b1"
+      ],
+      "status": "Gated USB/GVT-g code committed; fresh host enablement, physical-device mapping and boot recovery assessment in progress. Complete ordinary migrations before disruptive host maintenance. Hardware acceptance and both migrations remain required.",
+      "requirement": "User explicitly requires both hardware workers to end up in VMs with required hardware access working. Retaining hardware workers on Docker is not an acceptable final state; do not drop grants or attach host storage holding backups/VM data."
+    },
+    "administrativeShadows": {
+      "workerIds": [
+        "8b5c936e-a859-4039-873a-6f7af0960b61",
+        "c631e03a-f5a9-47d8-ab72-b3d6cb766287"
+      ],
+      "status": "Authoritative identity/quarantine fixes committed/pushed d63f1bcd and independently54cases passed. User prefers actual global/group admins in VMs too; dedicated runtime feasibility/scope assessment in progress. Never ordinary-migrate their archived shadow IDs; preserve trusted management boundary."
+    },
+    "testRunner": {
+      "branch": "fix/backup-vm-failed-drain-stop-20261018",
+      "commit": "a9c57f71601ac292f47416c85a704c2c32526ee8",
+      "status": "Fresh direct-QEMU runner reviewed with externalQCOW2, signal cleanup, bounded SSH logs and no report-SSH after unsettled/cancelled suite. Independent26puretests pass; committed/pushed. Real launch/full suites remain pending consolidated committed source."
+    },
+    "ponytail": {
+      "version": "5.3.2",
+      "status": "Complete plugin installed/enabled, six skills and three hooks, full default. Automatic hook trust remains user-facing Codex review step; all agents instructed to read/apply installed full-mode skill."
+    }
+  }
+}
