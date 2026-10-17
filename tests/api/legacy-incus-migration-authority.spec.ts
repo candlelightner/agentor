@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type Docker from 'dockerode';
 import { assertLegacyMigrationAuthority } from '../../orchestrator/server/utils/legacy-incus-migration-authority';
+import { useWorkerStore } from '../../orchestrator/server/utils/services';
+import { WorkerIncusMigrationService, type WorkerIncusMigrationDependencies } from '../../orchestrator/server/utils/worker-incus-migration-service';
 import { WorkerStore, type WorkerRecord, type WorkerIncusMigration } from '../../orchestrator/server/utils/worker-store';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
@@ -75,4 +77,47 @@ test('real WorkerStore transitions preserve freshly unarchived undefined keys; d
     f.current = reloaded.get(f.record.userId, f.record.id)! as typeof f.current;
     expect(() => assertLegacyMigrationAuthority(f)).toThrow('fields=archivedAt,initScript');
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+
+test('status of another worker preserves pending migration authority in the real shared WorkerStore', async () => {
+  // Module config supplies private DATA_DIR. Only authentication is substituted;
+  // status/inspect and the production default findWorker use the real singleton.
+  const store = useWorkerStore(); await store.init();
+  const f = fixture(), otherId = randomUUID(), otherOwner = 'status-other-' + randomUUID();
+  f.record.userId = 'status-read-' + randomUUID();
+  f.marker.source.containerId = 'a'.repeat(64); f.marker.source.imageId = 'sha256:' + 'b'.repeat(64);
+  f.marker.sourceVolumes = []; f.marker.sourceDirectories = [];
+  f.marker.destinationIncarnation = randomUUID();
+  try {
+    await store.upsert({ ...f.record, status: 'archived', initScript: undefined });
+    await store.unarchive(f.record.userId, f.record.id);
+    await store.upsert({ ...f.record, id: otherId, userId: otherOwner });
+    f.record = store.get(f.record.userId, f.record.id)!;
+    f.marker.phase = 'preparing';
+    f.marker = (await store.transitionIncusMigration(f.record.userId, f.record.id, undefined, f.marker)).incusMigration!;
+    const validating = { ...f.marker, phase: 'validating' as const };
+    f.marker = (await store.transitionIncusMigration(f.record.userId, f.record.id, f.marker, validating)).incusMigration!;
+    f.current = store.get(f.record.userId, f.record.id)! as typeof f.current;
+    expect(Object.hasOwn(f.current, 'initScript')).toBe(true);
+    expect(Object.hasOwn(f.current, 'archivedAt')).toBe(true);
+    expect(() => assertLegacyMigrationAuthority(f)).not.toThrow();
+    const service = new WorkerIncusMigrationService();
+    const internals = service as unknown as { dependencies: WorkerIncusMigrationDependencies };
+    internals.dependencies = { ...internals.dependencies, isAdminUser: () => true };
+    expect(await service.status(otherId, { kind: 'admin-user', userId: 'fixture-admin' })).toEqual({
+      kind: 'legacy-docker', phase: 'none', recoveryRequired: false, sourceRetained: false });
+    expect(useWorkerStore()).toBe(store);
+    f.current = store.get(f.record.userId, f.record.id)! as typeof f.current;
+    expect(() => assertLegacyMigrationAuthority(f)).not.toThrow();
+    expect(Object.hasOwn(f.current, 'initScript')).toBe(true);
+    expect(Object.hasOwn(f.current, 'archivedAt')).toBe(true);
+    expect(await service.status(f.record.id, { kind: 'admin-user', userId: 'fixture-admin' })).toEqual({
+      kind: 'legacy-docker', phase: 'validating', recoveryRequired: true, sourceRetained: true });
+    // Status is observational: it neither clears the marker nor normalizes
+    // record shape, and does not invoke any container/runtime cleanup.
+    expect(store.get(f.record.userId, f.record.id)).toEqual(f.current);
+  } finally {
+    await store.delete(f.record.userId, f.record.id); await store.delete(otherOwner, otherId);
+  }
 });

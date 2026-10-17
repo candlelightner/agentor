@@ -1349,3 +1349,5 @@ The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/ap
 - Decimal syntax/size budgets, duplicate metadata, non-file size overrides and sparse/global extensions remain fail-closed; path, link, type, ownership and mode rules are unchanged.
 
 Migration authority failures identify the violated record, marker, source identity/state, or managed-storage category. Record-baseline differences expose only bounded schema field names (including missing-versus-undefined differences); configuration, credentials, IDs, labels and mount values remain private. All original fail-closed guards and rollback authority remain unchanged.
+
+Migration status reads use the WorkerStore already loaded by service startup; polling any worker cannot reload other owners or change a pending migration record’s property shape. Strict migration authority checks remain unchanged.
