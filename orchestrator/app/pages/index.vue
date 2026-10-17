@@ -95,6 +95,7 @@ function handleOpenTab(
   type: "terminal" | "desktop" | "apps" | "editor",
 ) {
   const container = containers.value.find((c) => c.id === containerId);
+  if (type === "terminal" && container?.status === "unknown") return;
   const name =
     container?.displayName ||
     shortName(container?.id || containerId.slice(0, 12));

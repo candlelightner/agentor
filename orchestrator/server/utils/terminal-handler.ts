@@ -74,6 +74,16 @@ function handleTerminalOpen(peer: Peer): void {
       return;
     }
 
+    // Reject before attempting exec or reporting an attach failure. In
+    // particular, unknown inventory is not permission to probe the runtime.
+    if (ctx.closed) return;
+    if (info.status !== 'running') {
+      try { peer.send('\r\nWorker is not confirmed running. Refresh its status before opening a terminal.\r\n'); } catch {}
+      cleanupTerminal(ctx, peer);
+      try { peer.close(); } catch {}
+      return;
+    }
+
     // Runtime-specific dispatch keeps the frontend protocol unchanged.
     useContainerManager()
     .attachTerminal(params.workerId, params.windowIndex)

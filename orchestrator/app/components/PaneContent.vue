@@ -1,11 +1,17 @@
 <script setup lang="ts">
-import type { PaneLeafNode } from '~/types';
+import type { ContainerInfo, PaneLeafNode } from '~/types';
 
 const props = defineProps<{
   group: PaneLeafNode;
 }>();
 
 const activeTabId = computed(() => props.group.activeTabId);
+// Share the dashboard inventory, without starting another poll per pane.
+// Missing/unknown inventory must not mount a terminal (including restored tabs).
+const { data: workers } = useNuxtData<ContainerInfo[]>('workers');
+function terminalAvailable(id: string): boolean {
+  return workers.value?.some(worker => worker.id === id && worker.status === 'running') ?? false;
+}
 
 // Track tabs that have been activated at least once.
 // v-if creates the component on first activation (proper dimensions available),
@@ -34,9 +40,17 @@ watch(() => props.group.tabs, (tabs) => {
         class="absolute inset-0"
       >
         <TerminalPane
-          v-if="tab.type === 'terminal'"
+          v-if="tab.type === 'terminal' && terminalAvailable(tab.containerId)"
           :container-id="tab.containerId"
         />
+        <div
+          v-else-if="tab.type === 'terminal'"
+          class="flex h-full items-center justify-center text-sm text-gray-400"
+          role="status"
+          data-testid="terminal-unavailable"
+        >
+          Worker is not confirmed running. Terminal access will resume when its status is verified.
+        </div>
         <ServicePane
           v-else-if="tab.type === 'desktop'"
           :container-id="tab.containerId"

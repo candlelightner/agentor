@@ -87,6 +87,7 @@ export default defineConfig({
     "api/resource-monitor-lifecycle.spec.ts",
     "api/worker-self-access-policy.spec.ts",
     "api/ws-relay-origin.spec.ts",
+    "api/terminal-admission.spec.ts",
     "api/worker-runtime-kind.spec.ts",
     "api/worker-incus-migration-fencing.spec.ts",
     "api/worker-incus-migration-store.spec.ts",
