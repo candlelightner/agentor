@@ -1,11 +1,11 @@
 import { test, expect } from '@playwright/test';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile, symlink, lstat, readlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { ContainerManager } from '../../orchestrator/server/utils/container';
 import { WorkerStore, type WorkerRecord } from '../../orchestrator/server/utils/worker-store';
-import { useAdminWorkspaceStore } from '../../orchestrator/server/utils/admin-workspace-store';
+import { AdminWorkspaceStore, useAdminWorkspaceStore } from '../../orchestrator/server/utils/admin-workspace-store';
 import { useGroupAdminWorkspaceStore } from '../../orchestrator/server/utils/group-admin-workspace-store';
 import { useWorkerGroupStore } from '../../orchestrator/server/utils/services';
 import { assertOrdinaryWorkerIdentity, isAdministrativeWorkspaceId } from '../../orchestrator/server/utils/ordinary-worker-identity';
@@ -163,4 +163,60 @@ test('archived unfinished migration rejects unarchive before compute or record c
     await expect(f.manager.unarchive(owner, id)).rejects.toMatchObject({ statusCode: 409, code: 'WORKER_MIGRATION_RECOVERY_REQUIRED' });
     expect(f.store.get(owner, id)).toEqual(before); expect(f.sideEffects()).toBe(0);
   } finally { await rm(f.dataDir, { recursive: true, force: true }); }
+});
+
+
+for (const failure of ['schema', 'kind', 'id-type', 'empty-id', 'unsafe-id', 'json', 'directory', 'dangling-link'] as const)
+test(`malformed existing platform authority ${failure} quarantines ordinary and dedicated mutation without overwriting bytes`, async () => {
+  const f = await fixture(), dir = await mkdtemp(join(tmpdir(), 'agentor-admin-authority-fault-'));
+  const globalStore = useAdminWorkspaceStore(), originalReader = globalStore.getRecord;
+  const path = join(dir, 'admin/workspace.v1.json'), id = randomUUID();
+  const record: Record<string, unknown> = { schemaVersion: 1, id, kind: 'administrative', trusted: true, status: 'stopped', createdAt: stamp, updatedAt: stamp };
+  try {
+    await mkdir(join(dir, 'admin'));
+    if (failure === 'schema') record.schemaVersion = 2;
+    if (failure === 'kind') record.kind = 'group-administrative';
+    if (failure === 'id-type') record.id = 123;
+    if (failure === 'empty-id') record.id = '';
+    if (failure === 'unsafe-id') record.id = '../authority';
+    const bytes = failure === 'json' ? '{invalid' : JSON.stringify(record);
+    if (failure === 'directory') await mkdir(path);
+    else if (failure === 'dangling-link') await symlink(join(dir, 'absent'), path);
+    else await writeFile(path, bytes);
+    const faulted = new AdminWorkspaceStore(dir); let runtimeCalls = 0;
+    const refuse = async () => { runtimeCalls++; throw new Error('Unexpected dedicated runtime mutation'); };
+    faulted.setRuntimeAdapter({ ensure: refuse, start: refuse, stop: refuse, rebuild: refuse });
+    await expect(faulted.init()).rejects.toMatchObject({ statusCode: 503 });
+    expect(() => faulted.getRecord()).toThrow('unavailable');
+    globalStore.getRecord = faulted.getRecord.bind(faulted);
+    await f.store.upsert(f.record(id, 'Unknown platform identity'));
+    const before = await readFile(join(f.dataDir, 'users', owner, 'workers.json'), 'utf8');
+    expect(() => isAdministrativeWorkspaceId(id, owner)).toThrow('unavailable');
+    expect(() => f.manager.listArchived()).toThrow('unavailable');
+    await expect(f.manager.unarchive(owner, id)).rejects.toMatchObject({ statusCode: 503 });
+    await expect(f.manager.deleteArchived(owner, id)).rejects.toMatchObject({ statusCode: 503 });
+    await expect(f.manager.migrateLegacyWorker(id, async () => {})).rejects.toMatchObject({ statusCode: 503 });
+    await expect(faulted.ensure()).rejects.toMatchObject({ statusCode: 503 });
+    await expect(faulted.setStatus('running')).rejects.toMatchObject({ statusCode: 503 });
+    await expect(faulted.rebuild()).rejects.toMatchObject({ statusCode: 503 });
+    expect(runtimeCalls).toBe(0); expect(f.sideEffects()).toBe(0);
+    expect(await readFile(join(f.dataDir, 'users', owner, 'workers.json'), 'utf8')).toBe(before);
+    if (failure === 'directory') expect((await lstat(path)).isDirectory()).toBe(true);
+    else if (failure === 'dangling-link') expect(await readlink(path)).toBe(join(dir, 'absent'));
+    else expect(await readFile(path, 'utf8')).toBe(bytes);
+  } finally {
+    globalStore.getRecord = originalReader;
+    await rm(dir, { recursive: true, force: true }); await rm(f.dataDir, { recursive: true, force: true });
+  }
+});
+
+test('legitimately absent platform authority remains unprovisioned until explicit ensure', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'agentor-admin-authority-absent-'));
+  try {
+    const store = new AdminWorkspaceStore(dir); await store.init();
+    expect(store.getRecord()).toBeUndefined();
+    await expect(readFile(join(dir, 'admin/workspace.v1.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    const created = await store.ensure(); expect(created.id).toBeTruthy();
+    const fresh = new AdminWorkspaceStore(dir); await fresh.init(); expect(fresh.getRecord()?.id).toBe(created.id);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

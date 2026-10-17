@@ -2,8 +2,8 @@ import { useAdminWorkspaceStore } from './admin-workspace-store';
 import { useGroupAdminWorkspaceStore } from './group-admin-workspace-store';
 import { useWorkerGroupStore } from './services';
 
-/** Startup loads these stores before ordinary APIs/reconciliation. Historical
- * WorkerRecords may share their IDs without carrying administrative metadata. */
+/** Startup loads authority before binding the ordinary manager or reconciling.
+ * Historical WorkerRecords may share IDs without administrative metadata. */
 export function isAdministrativeWorkspaceId(id: string, ownerId: string): boolean {
   // Global list() omits quarantined owner partitions. Never treat an unknown
   // group identity as ordinary when this owner's authoritative file is unreadable.

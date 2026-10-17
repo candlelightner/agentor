@@ -1,6 +1,6 @@
 # Agentor Test Suite
 
-`api/ordinary-worker-identity.spec.ts` adds **7 isolated module cases** using real initialized platform/group administrative stores: cold-runtime archived-list and unarchive/delete/migration denial for both identities, unchanged shadow records and zero compute/storage calls, foreign ordinary IDs with identical display names, reconciliation preservation/no duplicate creation, unavailable target-owner authority rejection, queued lifecycle identity revalidation, and unfinished-migration unarchive rejection. Affected identity/admission/migration-fencing/lifecycle-coordinator modules: **32/32 passed**; Nuxt typecheck passed. These are manager/store tests; full API/UI acceptance remains pending. Run with `env -u DATA_DIR npx playwright test --config=playwright.modules.config.ts api/ordinary-worker-identity.spec.ts --workers=1` (the config creates private temporary metadata).
+`api/ordinary-worker-identity.spec.ts` contains **16 isolated module cases** using real initialized platform/group administrative stores: cold-runtime archived-list and unarchive/delete/migration denial for both identities, unchanged shadow records and zero compute/storage calls, foreign ordinary IDs with identical display names, reconciliation preservation/no duplicate creation, unavailable target-owner authority rejection, queued lifecycle identity revalidation, and unfinished-migration unarchive rejection. The initial seven identity cases also cover admission/migration-fencing/lifecycle-coordinator boundaries. Expanded identity/store/quarantine/migration-service modules: **53/53 passed**; Nuxt and strict fixture typechecks passed. These are manager/store tests; full API/UI acceptance remains pending. Run with `env -u DATA_DIR npx playwright test --config=playwright.modules.config.ts api/ordinary-worker-identity.spec.ts --workers=1` (the config creates private temporary metadata).
 
 Comprehensive end-to-end test suite for the Agentor platform using Playwright and TypeScript. Covers all API endpoints and UI interactions.
 
@@ -136,13 +136,13 @@ tests/
     worker-lifecycle.ts    # Container create/cleanup utilities
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
-    api/                     # API endpoint tests (1709 tests across 167 files)
+    api/                     # API endpoint tests (1718 tests across 167 files)
   ui/                      # UI interaction tests (631 tests across 65 files)
 ```
 
 ## Test Categories
 
-### API Tests (1520 tests, 150 files)
+### API Tests (1529 tests, 150 files)
 
 | File | Tests | Coverage |
 | --- | ---: | --- |
@@ -459,3 +459,6 @@ The authority suite additionally exercises the production migration-service stat
 WorkerStore initialization: `api/worker-store-initialization.spec.ts` adds seven isolated cases covering one shared first-load promise, mutations while initialization settles, retry after an overall directory-scan failure, empty-directory startup, explicit refresh and quarantine/recovery, fresh authorization stores, pending default migration-status/bootstrap without Nitro, controlled original-restore initialization, and actual cross-owner portable managed capture preserving strict pending migration authority. Capture writes a real empty managed-volume payload with only source Docker inspection mocked; explicit `loadUser` still reproduces the own-undefined baseline difference. The detached native restore live fixture now explicitly reloads its owner rather than using `init()` as a refresh operation. These checks do not claim a fresh live Docker/Incus migration or full API/UI acceptance.
 
 Docker literal Linux paths: `api/incus-docker-restore-archive.spec.ts` adds four cases with actual GNU PAX capture/unchanged-byte validation/extraction of systemd `\x2d` unit names, distinct slash/backslash names, PAX hardlinks, inert symlink values, exact binary contents/UID/GID/mode/nanosecond mtime/xattrs, and negative root/traversal/duplicate/link-ancestor checks in both orders. Synthetic USTAR/PAX overrides also prove no escape, no forward/nonregular hardlinks, and no permission flag broadening for canonical, selected or portable roles. These temporary regular-file tests do not allocate Docker/Incus resources or replace live native migration acceptance.
+
+
+Administrative identity fault coverage adds nine real-file cases to `ordinary-worker-identity.spec.ts` (16 total): invalid schema/kind/ID, empty/unsafe IDs, JSON corruption, directory/dangling-link authority, and legitimate ENOENT. Actual ordinary list/unarchive/delete/migration and dedicated ensure/start/rebuild all fail closed with 503 and unchanged bytes/zero runtime calls for existing invalid authority; a genuinely absent file remains absent until explicit ensure.
