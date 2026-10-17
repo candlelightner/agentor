@@ -145,7 +145,7 @@ class AdminNetworkPolicy:
                 and len(set(ids)) == len(ids), "Administrative selected volume identities are invalid")
         require("deleting" not in native or native["deleting"] is True, "Administrative deletion intent is invalid")
         operation = native.get("selectedOperation")
-        if operation is not None:
+        if "selectedOperation" in native:
             require(isinstance(operation, dict) and set(operation) <= {"volumeId", "operationId", "incarnation", "kind", "device", "canonical"}
                     and operation.get("volumeId") in ids and operation.get("kind") in ("snapshot", "seed")
                     and isinstance(operation.get("operationId"), str) and re.fullmatch(UUID, operation["operationId"])
@@ -203,7 +203,7 @@ class AdminNetworkPolicy:
             keys.add(key)
             targets.append(target)
             receipt = value.get("operation")
-            if receipt is not None:
+            if "operation" in value:
                 require(isinstance(receipt, dict) and set(receipt) <= {"id", "mode", "stage", "error"}
                         and isinstance(receipt.get("id"), str) and re.fullmatch(UUID, receipt["id"])
                         and receipt.get("mode") == "recreate", "Selected volume operation is invalid")

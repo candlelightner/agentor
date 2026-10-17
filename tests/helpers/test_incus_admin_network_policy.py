@@ -299,6 +299,19 @@ class AdminNetworkTests(unittest.TestCase):
         path.write_text(json.dumps([{**volume, "target": "/home/agent/.local/share"}]))
         self.assertEqual(self.policy.authority(self.payload)["selected"][0]["target"], "/home/agent/.local/share")
 
+    def test_explicit_null_selected_receipts_fail_before_host_calls(self):
+        volume, path = self.selected()
+        self.record["nativeRuntime"]["selectedOperation"] = None
+        self.save()
+        with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+        with self.assertRaises(MODULE.PolicyError): self.policy.inspect(self.payload)
+        del self.record["nativeRuntime"]["selectedOperation"]
+        self.save()
+        path.write_text(json.dumps([{**volume, "operation": None}]))
+        with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+        with self.assertRaises(MODULE.PolicyError): self.policy.inspect(self.payload)
+        self.assertEqual(self.calls, [])
+
     def test_selected_identity_bounds_collisions_duplicates_and_overlap(self):
         volume, path = self.selected()
         original = copy.deepcopy(self.record)
