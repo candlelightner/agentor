@@ -49,6 +49,17 @@ def validate_archive(path, top):
                 raise ValueError('Archive writes through a symlink')
 
 
+def reconcile_claude_preferences(claude, canonical, backup):
+    # An existing canonical symlink already carries the newest preferences.
+    # Only atomic-write replacements outside the volume need copying back.
+    if claude.is_symlink() or not claude.is_file():
+        return
+    json.loads(claude.read_text())
+    if canonical.exists() and not backup.exists():
+        shutil.copy2(canonical, backup)
+    shutil.copy2(claude, canonical)
+
+
 def main():
     if os.geteuid() == 0 or Path.home() != Path('/home/agent'):
         raise SystemExit('Run as agent inside its worker guest')
@@ -59,33 +70,31 @@ def main():
     manifest = json.loads((root / 'manifest.json').read_text())
     restored = root / 'restored'
     if not (root / 'restored.json').exists():
-        if restored.exists():
-            raise SystemExit('Incomplete previous restoration requires inspection')
-        staging = root / 'restoring'
-        staging.mkdir(mode=0o700)
-        for entry in manifest['archives']:
-            top = entry['top']
-            if top not in ALLOWED:
-                raise ValueError('Unexpected home entry')
-            archive = root / 'archives' / (top + '.tar')
-            with archive.open('rb') as stream:
-                digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-            if digest != entry['sha256']:
-                raise ValueError('Home archive digest mismatch')
-            validate_archive(archive, top)
-            subprocess.run(['tar', '--extract', '--file', str(archive), '--directory', str(staging),
-                            '--no-same-owner', '--no-overwrite-dir'], check=True)
-        staging.rename(restored)
+        if not restored.exists():
+            staging = root / 'restoring'
+            # A partial extraction never authorizes overwrite or deletion.
+            staging.mkdir(mode=0o700)
+            for entry in manifest['archives']:
+                top = entry['top']
+                if top not in ALLOWED:
+                    raise ValueError('Unexpected home entry')
+                archive = root / 'archives' / (top + '.tar')
+                with archive.open('rb') as stream:
+                    digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+                if digest != entry['sha256']:
+                    raise ValueError('Home archive digest mismatch')
+                validate_archive(archive, top)
+                subprocess.run(['tar', '--extract', '--file', str(archive), '--directory', str(staging),
+                                '--no-same-owner', '--no-overwrite-dir'], check=True)
+            # This rename acknowledges that every archive was extracted. A
+            # later settings-copy failure can resume without re-extracting.
+            staging.rename(restored)
+        if restored.is_symlink() or not restored.is_dir():
+            raise ValueError('Restored home must be a real directory')
         # Claude's atomic writes can leave the newest preferences outside its
         # canonical volume. Reconcile that one file before relinking it.
         claude = restored / '.claude.json'
-        if claude.is_file():
-            json.loads(claude.read_text())
-            canonical = root.parent / '.claude.json'
-            backup = root / 'claude-before-migration.json'
-            if canonical.exists() and not backup.exists():
-                shutil.copy2(canonical, backup)
-            shutil.copy2(claude, canonical)
+        reconcile_claude_preferences(claude, root.parent / '.claude.json', root / 'claude-before-migration.json')
         (root / 'restored.json').write_text(json.dumps({'workerId': manifest['workerId']}))
     for entry in manifest['archives']:
         top = entry['top']

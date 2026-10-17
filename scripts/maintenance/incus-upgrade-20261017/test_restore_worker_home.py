@@ -50,5 +50,39 @@ class ArchiveValidation(unittest.TestCase):
         self.check_entries(list(reversed(entries)), False)
 
 
+class ClaudePreferences(unittest.TestCase):
+    def test_already_canonical_symlink_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical, captured, backup = (root / name for name in ['canonical', 'captured', 'backup'])
+            canonical.write_text('{"latest":true}')
+            captured.symlink_to(canonical)
+            restore.reconcile_claude_preferences(captured, canonical, backup)
+            self.assertEqual(canonical.read_text(), '{"latest":true}')
+            self.assertFalse(backup.exists())
+
+    def test_atomic_write_replacement_preserves_previous_canonical_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical, captured, backup = (root / name for name in ['canonical', 'captured', 'backup'])
+            canonical.write_text('{"old":true}')
+            captured.write_text('{"new":true}')
+            restore.reconcile_claude_preferences(captured, canonical, backup)
+            restore.reconcile_claude_preferences(captured, canonical, backup)
+            self.assertEqual(canonical.read_text(), '{"new":true}')
+            self.assertEqual(backup.read_text(), '{"old":true}')
+
+    def test_invalid_captured_json_does_not_overwrite_canonical(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical, captured, backup = (root / name for name in ['canonical', 'captured', 'backup'])
+            canonical.write_text('{"old":true}')
+            captured.write_text('incomplete JSON')
+            with self.assertRaises(ValueError):
+                restore.reconcile_claude_preferences(captured, canonical, backup)
+            self.assertEqual(canonical.read_text(), '{"old":true}')
+            self.assertFalse(backup.exists())
+
+
 if __name__ == '__main__':
     unittest.main()
