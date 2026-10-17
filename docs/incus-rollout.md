@@ -78,8 +78,10 @@ until a platform administrator explicitly migrates them.
    ```
 
    The canary creates two temporary ordinary workers, verifies services/proxies,
-   authoritative worker-self identity, NIC spoofing negatives, persistence and
-   optional native Docker, then removes only its acknowledged resources. Require
+   authoritative worker-self identity, NIC spoofing negatives, execution of both
+   native binaries and shebang scripts from workspace and agent-data volumes
+   (including after restart), persistence and optional native Docker, then
+   removes only its acknowledged resources. Require
    `"status":"passed"`. A failure retains captured IDs for explicit inspection;
    do not clear markers, adopt by name or repeat an unknown creation blindly.
    Remove the private session file when finished. An API response or unit tests
@@ -133,3 +135,11 @@ The VM root is disposable. Backups, rebuilds and migrations preserve canonical
 workspace, agent/editor state, managed data and applicable native Docker state,
 not arbitrary root-disk mutations. Historical backups missing runtime metadata
 restore as legacy Docker; migration is a separate explicit operation.
+
+The VM image uses Ubuntu 24.04's supported HWE virtual kernel. The GA 6.8
+kernel can return `EFAULT` when executing files on the `cache=never` VirtioFS
+shares used for workspace and agent data. Reading files or executing an image
+root binary does not detect this problem. Rebuild the derived VM image and
+redeploy the matching Orchestrator bootstrap, default-image alias and converter
+seed together; preserve the previous image/configuration for rollback. Changing
+the worker VM kernel does not require changing the host kernel.
