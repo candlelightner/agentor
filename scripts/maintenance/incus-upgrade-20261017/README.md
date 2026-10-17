@@ -27,3 +27,13 @@ the repair. Neither the production image nor the prepared VM image was changed.
 The equivalence test passed 52,274 comparisons and a million-entry workload. The
 inspector test proved continued validation with the same process ID. These are
 operational regression checks, not a claim that the whole migration is complete.
+
+`restore-worker-home.py` runs as the unprivileged agent inside a migrated guest.
+Its private manifest and individually hashed Docker home archives live in the
+canonical agent-data volume under `.incus-migration-home`. It preserves selected
+home settings and locally installed CLIs, reconciles newer Claude preferences,
+and installs the audited additional APT packages. Existing guest defaults are
+renamed before linking preserved paths. The original worker init script follows
+this setup step without being committed here. Source Docker containers and SSD
+copies of the archives remain available for recovery. Archive path and symlink
+validation is covered by `python3 -m unittest test_restore_worker_home.py`.
