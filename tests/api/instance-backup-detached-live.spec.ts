@@ -138,7 +138,7 @@ os.setxattr(f,'user.binary',bytes([0,255,128,10,61,0]));os.utime(f,ns=(170000000
     if (!retainedOnly) await workers.upsert({ id, userId, runtimeKind: 'incus-vm', status: 'active', desiredRuntimeStatus: 'stopped',
       displayName: 'Mixed restored data', createdAt: stamp, updatedAt: stamp, incusRecreation: marker });
     const validate = async () => {
-      await Promise.all([managed.init(), workers.init(), jobs.reload()]);
+      await Promise.all([managed.init(), workers.loadUser(userId), jobs.reload()]);
       const currentJob = jobs.getJob(nonce);
       if (!currentJob || currentJob.operation !== 'restore' || currentJob.status !== 'running' || currentJob.userId !== job.userId)
         throw new Error('Controlled restore job authority changed');

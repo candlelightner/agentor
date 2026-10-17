@@ -92,6 +92,21 @@ export interface WorkerRecord extends UserOwnedResource {
 }
 
 export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
+  private initialization?: Promise<void>;
+
+  /** Bootstrap this store once. Repeated live reads must not reload another
+   * owner's in-flight lifecycle state from its JSON representation (which
+   * omits own undefined keys). Explicit loadUser remains the reload/recovery
+   * boundary; separately constructed authorization stores still load afresh. */
+  override init(): Promise<void> {
+    return this.initialization ??= super.init().catch(error => {
+      // A failed directory scan did not initialize the store. Allow a later
+      // caller to retry; per-owner quarantine remains loadUser's responsibility.
+      this.initialization = undefined;
+      throw error;
+    });
+  }
+
   constructor(dataDir: string) {
     super(dataDir, "workers.json", (w) => { assertImportIncompleteMarker(w); assertIncusMigration(w); return w.id; });
   }

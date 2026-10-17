@@ -22,10 +22,10 @@ const defaults: WorkerIncusMigrationDependencies = {
     return (await (await import('./management-mcp-store')).useManagementMcpStore().getPolicy()).groups['worker-lifecycle'].enabled;
   },
   async findWorker(id) {
-    // Nitro's services plugin loads this shared store before serving requests.
-    // init() reloads every owner from JSON and can replace in-flight authority
-    // (including own undefined keys) while another worker is being migrated.
-    return (await import('./services')).useWorkerStore().findById(id);
+    // HTTP may arrive before asynchronous services bootstrap finishes. init()
+    // awaits that single first load without reloading live lifecycle authority.
+    const store = (await import('./services')).useWorkerStore();
+    await store.init(); return store.findById(id);
   },
   async verifyUnlock(id, password) { return (await import('./worker-protection-lock')).useWorkerProtectionLockStore().verify(id, password); },
   async migrate(id, current, passwords) { return (await import('./services')).useContainerManager().migrateLegacyWorker(id, current, passwords); },
