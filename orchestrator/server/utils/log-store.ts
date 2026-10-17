@@ -18,6 +18,8 @@ export interface LogQueryOptions {
   search?: string;
   /** Exclusive stable key for bounded management/export pagination. */
   before?: string;
+  /** Diagnostics/export callers distinguish unavailable storage from no match. */
+  strict?: boolean;
 }
 
 export class LogStore {
@@ -159,7 +161,9 @@ export class LogStore {
           }
         } catch {}
       }
-    } catch {}
+    } catch (error) {
+      if (options.strict) throw error;
+    }
 
     return entries;
   }
@@ -234,8 +238,14 @@ export class LogStore {
 
 /** Opaque ordering key: never embed raw log messages (which may contain secrets)
  * in a pagination cursor returned to a client. */
+const cursorKeys = new WeakMap<LogEntry, string>();
 export function logEntryCursor(entry: LogEntry): string {
-  return `${entry.timestamp}|${createHash('sha256').update(JSON.stringify([entry.id, entry.source, entry.sourceId, entry.message])).digest('hex')}`;
+  let key = cursorKeys.get(entry);
+  if (!key) {
+    key = `${entry.timestamp}|${createHash('sha256').update(JSON.stringify([entry.id, entry.source, entry.sourceId, entry.message])).digest('hex')}`;
+    cursorKeys.set(entry, key);
+  }
+  return key;
 }
 function compareLogEntries(a: LogEntry, b: LogEntry): number {
   return logEntryCursor(b).localeCompare(logEntryCursor(a));

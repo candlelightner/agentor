@@ -93,5 +93,13 @@ test.describe.serial('Isolated server log listeners', () => {
       expect(response.status).toBe(status);
       expect(response.headers.get('content-disposition')).toBeNull();
     }
+    const query = useLogStore().query;
+    useLogStore().query = async () => { throw new Error('private storage path TOKEN=must-not-leak'); };
+    try {
+      const failed = await fetch(downloadUrl, { headers: { Cookie: 'isolated-session=admin' } });
+      expect(failed.status).toBe(503);
+      expect(await failed.text()).not.toContain('must-not-leak');
+      expect(failed.headers.get('content-disposition')).toBeNull();
+    } finally { useLogStore().query = query; }
   });
 });

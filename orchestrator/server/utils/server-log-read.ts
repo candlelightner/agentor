@@ -38,7 +38,7 @@ export async function readServerLogs(args: Record<string, unknown>, deps: Depend
   if (since && until && since >= until) throw failure(400, 'since must precede until');
   const before = args.cursor;
   if (before !== undefined && (typeof before !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z\|[a-f0-9]{64}$/.test(before))) throw failure(400, 'Invalid log cursor');
-  const page = await deps.query({ sources: ['orchestrator'], levels: levels as LogLevel[] | undefined, search: args.search as string | undefined, since, until, limit: limit as number, before: before as string | undefined });
+  const page = await deps.query({ sources: ['orchestrator'], strict: true, levels: levels as LogLevel[] | undefined, search: args.search as string | undefined, since, until, limit: limit as number, before: before as string | undefined });
   const entries: LogEntry[] = [];
   const secrets = deps.secretValues();
   let bytes = 0, redactedSecrets = 0;
@@ -52,9 +52,18 @@ export async function readServerLogs(args: Record<string, unknown>, deps: Depend
       if (entries.length) break;
       // A single oversized entry must make progress while keeping valid UTF-8.
       const marker = '\n[entry truncated]';
-      let text = entry.message;
-      while (Buffer.byteLength(JSON.stringify({ ...entry, message: text + marker }) + '\n') > SERVER_LOG_MAX_BYTES) text = text.slice(0, Math.max(0, text.length - 1024));
-      entry.message = text + marker;
+      // Restrict candidates before measuring JSON escaping, then search only
+      // that bounded prefix. Huge entries never cause repeated whole copies.
+      const candidate = entry.message.slice(0, SERVER_LOG_MAX_BYTES);
+      let low = 0, high = candidate.length;
+      while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        const size = Buffer.byteLength(JSON.stringify({ ...entry, message: candidate.slice(0, middle) + marker }) + '\n');
+        if (size <= SERVER_LOG_MAX_BYTES) low = middle;
+        else high = middle - 1;
+      }
+      if (low && candidate.charCodeAt(low - 1) >= 0xd800 && candidate.charCodeAt(low - 1) <= 0xdbff) low--;
+      entry.message = candidate.slice(0, low) + marker;
       truncated = true;
     }
     entries.push(entry);
