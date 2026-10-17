@@ -437,12 +437,28 @@ export class BackupManager {
       input.selectedPathsByWorkspace === undefined
         ? undefined
         : normalizeSelectedPaths(input.selectedPathsByWorkspace);
-    // Seed every newly selected directory before committing configuration.
-    // A failed copy therefore leaves both the old container and the previous
-    // backup settings authoritative, and no rebuild can attach an empty volume.
-    if (persistDirectories && this.pathPersistence &&
-        (input.selectedPathsByWorkspace !== undefined || previousConfig?.persistSelectedDirectories === false))
-      await this.pathPersistence.reconcileSelections(userId, normalizedPaths ?? previousConfig?.selectedPathsByWorkspace);
+    // Reconcile only newly enabled directory coverage. Browser saves include
+    // the complete path map (including deselected/archived workers); unchanged
+    // paths must not require live compute just to change unrelated settings.
+    // Keep inactive path preferences and all existing persistent data intact.
+    if (persistDirectories && this.pathPersistence) {
+      const selected = input.selectedWorkspaceIds === undefined
+        ? previousConfig?.selectedWorkspaceIds ?? null : input.selectedWorkspaceIds;
+      const effectivePaths = normalizedPaths ?? previousConfig?.selectedPathsByWorkspace ?? {};
+      const additions: Record<string, string[]> = {};
+      for (const [id, paths] of Object.entries(effectivePaths)) {
+        if (selected !== null && !selected.includes(id)) continue;
+        const previouslySelected = previousConfig?.selectedWorkspaceIds == null ||
+          previousConfig.selectedWorkspaceIds.includes(id);
+        const previousPaths = new Set(previousConfig?.persistSelectedDirectories !== false && previouslySelected
+          ? previousConfig?.selectedPathsByWorkspace?.[id] ?? [] : []);
+        const added = paths.filter(path => !previousPaths.has(path));
+        if (added.length) additions[id] = added;
+      }
+      // Failed seeding still leaves the previous configuration authoritative.
+      if (Object.keys(additions).length)
+        await this.pathPersistence.reconcileSelections(userId, additions);
+    }
     const now = new Date().toISOString();
     const config = await this.store.update(userId, (data) => {
       const old = data.config;

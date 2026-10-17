@@ -61,6 +61,7 @@ export default defineConfig({
     "api/worker-incus-migration-service.spec.ts",
     "api/legacy-incus-migration-public-live.spec.ts",
     "api/instance-restore-helper.spec.ts",
+    "api/backup-settings.spec.ts",
     "api/backup-original-runtime-fence.spec.ts",
     "api/backup-restore-safety.spec.ts",
     "api/backup-restore-cancellation.spec.ts",

@@ -4,6 +4,8 @@ import { goToDashboard } from '../helpers/ui-helpers';
 
 async function mock(page: Page) {
   let jobs:any[]=[]; let backups:any[]=[{id:'backup-1',workspaceIds:['worker-1','worker-2'],provider:'fake',createdAt:'2026-01-01T00:00:00Z',sizeBytes:4096,integrityVerified:true,missingSecrets:['API_TOKEN']}];
+  await page.route('**/api/backups/recovery-key', r => r.fulfill({ json: { keys: [] } }));
+  await page.route('**/api/backups/remote', r => r.fulfill({ json: [] }));
   await page.route('**/api/backup-providers',r=>r.fulfill({json:[{id:'fake',type:'fake',connected:true},{id:'google',type:'google-drive',connected:false}]}));
   await page.route('**/api/admin/backup-providers/google-oauth',async r=>r.fulfill({json:r.request().method()==='PUT'?{configured:true,source:'installation',clientId:'dashboard-client',redirectUri:'https://dash.example/api/backup-providers/google/oauth/callback',clientSecretConfigured:true}:{configured:false,source:'none',clientSecretConfigured:false}}));
   await page.route('**/api/backup-settings',async r=>r.fulfill({json:r.request().method()==='PUT'?await r.request().postDataJSON():{providerId:'fake',enabled:false,selection:'all',workspaceIds:[],intervalMinutes:1440,retentionCount:7,nextRunAt:null}}));
@@ -52,6 +54,23 @@ test('saves draft settings and uses the selected provider when backing up immedi
   await m.getByRole('button',{name:'Back up now'}).click();
   await expect.poll(()=>saved?.providerId).toBe('google-drive');
   await expect.poll(()=>started?.providerId).toBe('google-drive');
+});
+test('removes an unavailable archived selection while retaining independent path and schedule settings', async ({ page }) => {
+  let stored: any = { providerId: 'fake', enabled: false, selection: 'selected', workspaceIds: ['archived-old', 'worker-1'],
+    selectedPathsByWorkspace: { 'archived-old': ['/opt/retained'], 'worker-1': ['/workspace'] },
+    persistSelectedDirectories: true, intervalMinutes: 53, retentionCount: 9, nextRunAt: null };
+  await page.route('**/api/backup-settings', async route => {
+    if (route.request().method() === 'PUT') stored = await route.request().postDataJSON();
+    await route.fulfill({ json: stored });
+  });
+  const m = await open(page);
+  await expect(m.getByTestId('backup-path-settings')).toContainText('archived-old');
+  await selectWorkspace(page, m, 'archived-old', /archived-old.*unavailable/i);
+  await m.getByRole('button', { name: 'Save schedule' }).click();
+  await expect.poll(() => stored.workspaceIds).toEqual(['worker-1']);
+  expect(stored).toMatchObject({ intervalMinutes: 53, retentionCount: 9, persistSelectedDirectories: true,
+    selectedPathsByWorkspace: { 'archived-old': ['/opt/retained'], 'worker-1': ['/workspace'] } });
+  await expect(m.getByTestId('backup-path-settings')).not.toContainText('archived-old');
 });
 test('selects files and any browsed directory including root from a picker rooted at workspace', async ({ page }) => {
   const m = await open(page);
