@@ -6,7 +6,9 @@ The private cgroup delegation proof is useful for nested Docker. It does not pro
 
 ## What is guarded now
 
-Explicitly enabling `INCUS_INSTANCE_BACKUP_TEST`, `INCUS_INSTANCE_PREFLIGHT_TEST`, `INCUS_INSTANCE_DETACHED_RESTORE_TEST` or `INCUS_INSTANCE_HELPER_PROCESS_TEST` now fails before native API/build/SSH work unless `/run/agentor-native-dr/fixture.json` passes the shared private-fixture guard. Unenabled gates retain their existing skips. Existing capture/restore assertions remain present.
+Default Playwright global setup rejects the four native DR flags before creating a request context, probing localhost or authenticating, and directs callers to `playwright.modules.config.ts`. Its normal non-native startup is unchanged.
+
+With that explicit module configuration, enabling `INCUS_INSTANCE_BACKUP_TEST`, `INCUS_INSTANCE_PREFLIGHT_TEST`, `INCUS_INSTANCE_DETACHED_RESTORE_TEST` or `INCUS_INSTANCE_HELPER_PROCESS_TEST` now fails before native API/build/SSH work unless `/run/agentor-native-dr/fixture.json` passes the shared private-fixture guard. Unenabled gates retain their existing skips. Existing capture/restore assertions remain present.
 
 The receipt and its directory must be root-owned, private and free of symlink redirection. JSON and certificate reads use `O_NOFOLLOW`, regular-file/owner/mode checks and bounded reads. The receipt must match the running guest's boot ID, machine ID and exactly one kernel command-line parameter `agentor.native_dr_fixture=<nonce>`. Its nonce fixes `/var/lib/agentor-native-dr/<nonce>`, private control/TLS directories, `agdr<nonce-prefix>` project/pool/network/image names and exact loopback Incus endpoint. Public native host-service and converter fallbacks are explicitly empty. The complete schema is in `tests/helpers/private-native-dr-fixture.ts`; this receipt is a test boundary, not a production recovery credential.
 
@@ -25,7 +27,7 @@ cd orchestrator
   ../tests/api/instance-native-helper-process.spec.ts --workers=1 --retries=0
 ```
 
-Expected result: seven guard cases pass; the twelve explicitly gated native cases remain skipped. This is guard validation, not native acceptance. Run from a clean source snapshot with a minimal environment and fresh dependencies; do not inherit production `DATA_DIR` or live gate flags.
+Expected result: nine guard cases pass; the twelve explicitly gated native cases remain skipped. This is guard validation, not native acceptance. Run from a clean source snapshot with a minimal environment and fresh dependencies; do not inherit production `DATA_DIR` or live gate flags.
 
 ## Minimum safe alternative to investigate
 

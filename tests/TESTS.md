@@ -460,3 +460,5 @@ done
 ```
 
 Native DR fixture boundary: `api/private-native-dr-fixture.spec.ts` adds seven no-daemon cases for matching guest/nonce/context, wrong boot/machine/UID, duplicate kernel parameters, forbidden historical endpoints/credentials/project/image/host-helper fallbacks, regular root-private bounded files, actual nofollow/permissions/size rejection and explicit unsupported SSH transport. The three existing native DR live spec files retain twelve gated cases and their assertions; default discovery skips them. See `docs/native-backup-integration-isolation.md` for the unverified direct-KVM alternative and missing native acceptance gates.
+
+Native DR startup guard adds two stubbed `request.newContext` regressions to `private-native-dr-fixture.spec.ts` (nine total): each of the four native flags fails the actual default global setup with zero request-factory calls, while unset/false gates retain ordinary setup behavior and reach only a throwing stub. No HTTP request or native operation is executed.

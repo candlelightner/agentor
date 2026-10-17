@@ -1,8 +1,9 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, request as playwrightRequest, type FullConfig } from '@playwright/test';
+import globalSetup from '../global-setup';
 import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { validatePrivateNativeDrFixture, validatePrivateNativeDrFile, readPrivateNativeDrFile, rejectNativeDrSshTransport,
+import { validatePrivateNativeDrFixture, validatePrivateNativeDrFile, readPrivateNativeDrFile, rejectNativeDrSshTransport, NATIVE_DR_LIVE_FLAGS,
   type PrivateNativeDrFixture } from '../helpers/private-native-dr-fixture';
 
 function fixture() {
@@ -88,4 +89,48 @@ test('every existing whole-instance native live gate checks context before its f
   const guard = await readFile(new URL('../helpers/private-native-dr-fixture.ts', import.meta.url), 'utf8');
   expect(guard).toContain('constants.O_NOFOLLOW | constants.O_NONBLOCK');
   expect(guard).toContain('Buffer.alloc(maxBytes + 1)');
+});
+
+
+test('default global setup rejects every native DR opt-in before creating any request context', async () => {
+  const originalFactory = playwrightRequest.newContext;
+  const originalFlags = Object.fromEntries(NATIVE_DR_LIVE_FLAGS.map(flag => [flag, process.env[flag]]));
+  let factoryCalls = 0;
+  playwrightRequest.newContext = async () => { factoryCalls++; throw new Error('BLOCKED_FIXTURE_REQUEST_FACTORY'); };
+  try {
+    for (const flag of NATIVE_DR_LIVE_FLAGS) delete process.env[flag];
+    for (const flag of NATIVE_DR_LIVE_FLAGS) {
+      process.env[flag] = 'true';
+      await expect(globalSetup({} as FullConfig)).rejects.toMatchObject({ code: 'NATIVE_DR_REQUIRES_MODULES_CONFIG',
+        message: expect.stringContaining('--config=playwright.modules.config.ts') });
+      expect(factoryCalls).toBe(0);
+      delete process.env[flag];
+    }
+  } finally {
+    playwrightRequest.newContext = originalFactory;
+    for (const flag of NATIVE_DR_LIVE_FLAGS) {
+      if (originalFlags[flag] === undefined) delete process.env[flag]; else process.env[flag] = originalFlags[flag];
+    }
+  }
+});
+
+test('ordinary global setup still reaches its request factory when native gates are not enabled', async () => {
+  const originalFactory = playwrightRequest.newContext;
+  const originalFlags = Object.fromEntries(NATIVE_DR_LIVE_FLAGS.map(flag => [flag, process.env[flag]]));
+  let factoryCalls = 0;
+  playwrightRequest.newContext = async () => { factoryCalls++; throw new Error('BLOCKED_FIXTURE_REQUEST_FACTORY'); };
+  try {
+    for (const value of [undefined, 'false']) {
+      for (const flag of NATIVE_DR_LIVE_FLAGS) {
+        if (value === undefined) delete process.env[flag]; else process.env[flag] = value;
+      }
+      await expect(globalSetup({} as FullConfig)).rejects.toThrow('BLOCKED_FIXTURE_REQUEST_FACTORY');
+    }
+    expect(factoryCalls).toBe(2); // The stub throws before any network request.
+  } finally {
+    playwrightRequest.newContext = originalFactory;
+    for (const flag of NATIVE_DR_LIVE_FLAGS) {
+      if (originalFlags[flag] === undefined) delete process.env[flag]; else process.env[flag] = originalFlags[flag];
+    }
+  }
 });

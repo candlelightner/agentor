@@ -3,6 +3,17 @@ import { lstat, open, readFile, realpath } from 'node:fs/promises';
 import type { Config } from '../../orchestrator/server/utils/config';
 
 export const PRIVATE_NATIVE_DR_RECEIPT = '/run/agentor-native-dr/fixture.json';
+export const NATIVE_DR_LIVE_FLAGS = ['INCUS_INSTANCE_BACKUP_TEST', 'INCUS_INSTANCE_PREFLIGHT_TEST',
+  'INCUS_INSTANCE_DETACHED_RESTORE_TEST', 'INCUS_INSTANCE_HELPER_PROCESS_TEST'] as const;
+
+/** Default setup authenticates against BASE_URL before test bodies execute.
+ * Native gates must use the module config, which has no HTTP global setup. */
+export function assertNativeDrUsesModulesConfig(environment: NodeJS.ProcessEnv = process.env): void {
+  if (NATIVE_DR_LIVE_FLAGS.some(flag => environment[flag] === 'true'))
+    throw Object.assign(new Error('Native DR live flags cannot use the default Playwright setup; use --config=playwright.modules.config.ts with a fresh private fixture.'),
+      { code: 'NATIVE_DR_REQUIRES_MODULES_CONFIG' });
+}
+
 export interface PrivateNativeDrFixture {
   version: 1;
   kind: 'agentor-private-native-dr-vm';
