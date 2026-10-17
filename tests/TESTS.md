@@ -1,6 +1,7 @@
 # Agentor Test Suite
 
 `api/incus-client.spec.ts` adds three loopback HTTP protocol cases for accepted create operations: running beyond the former five-minute bound then terminal success, finite 30-minute expiry, and terminal failure. Virtual elapsed time keeps the fixtures fast. Each proves one create POST, project-scoped polling, no final instance lookup/caller provisioning before success, and no cleanup mutation or resend. Existing runtime/lifecycle regressions cover nonce/UUID-fenced rollback. Client protocol tests: **27 passed / one live-gated skip**; unchanged runtime/lifecycle suites: **107 passed / four live-gated skips**; Nuxt typecheck passed. No live VM is launched by these cases.
+Archived image recovery: `api/worker-unarchive-image-resolution.spec.ts` adds nine actual-manager cases for immutable replacement/preserved settings, real catalog authorization/readiness denial, lifecycle queue authority, unsupported recovery modes, pre-create persistence failure, failed-create archival, strict public parsing and unchanged ordinary unarchive. Together with existing import-parser cases: **11 passed**; full Nuxt typecheck passed before the additional missing-runtime-alias regression. Real rebuilt-image migration remains pending.
 
 Comprehensive end-to-end test suite for the Agentor platform using Playwright and TypeScript. Covers all API endpoints and UI interactions.
 
