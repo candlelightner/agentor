@@ -254,7 +254,11 @@ export class AdminWorkspaceStore {
     if (this.unavailable)
       throw Object.assign(new Error('Stored administrative workspace identity is unavailable'), { statusCode: 503 });
   }
+  private requireRuntime() {
+    if (!this.runtime) throw Object.assign(new Error('Administrative workspace runtime is not ready'), { statusCode: 503 });
+  }
   private async ensureLocked() {
+    this.requireRuntime();
     await this.init();
     if (await this.flushPendingCommit("ensure")) return this.publicRecord();
     let candidate = this.record ? structuredClone(this.record) : undefined;
@@ -295,6 +299,7 @@ export class AdminWorkspaceStore {
   }
   async setStatus(status: "running" | "stopped") {
     return this.exclusive(async () => {
+      this.requireRuntime();
       await this.init();
       const operation = `status:${status}`;
       if (await this.flushPendingCommit(operation)) return this.publicRecord();
@@ -328,6 +333,7 @@ export class AdminWorkspaceStore {
   }
   async rebuild(ownerId?: string) {
     return this.exclusive(async () => {
+      this.requireRuntime();
       await this.init();
       if (await this.flushPendingCommit("rebuild")) return this.publicRecord();
       // Rebuild itself is the application boundary; do not auto-start stale

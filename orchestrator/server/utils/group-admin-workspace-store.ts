@@ -190,7 +190,11 @@ export class GroupAdminWorkspaceStore {
       }),
     );
   }
+  private requireRuntime() {
+    if (!this.runtime) throw Object.assign(new Error('Group administrative workspace runtime is not ready'), { statusCode: 503 });
+  }
   private async ensureLocked(group: WorkerGroup) {
+    this.requireRuntime();
     const pending = await this.flushPendingCommit(group.id, "ensure");
     if (pending?.matched) {
       if (pending.record.status === "running" && this.identityMaterializer)
@@ -250,6 +254,7 @@ export class GroupAdminWorkspaceStore {
     return this.run(groupId, () =>
       this.withGroup(groupId, false, async (group) => {
         authorize?.();
+        this.requireRuntime();
         const operation = `status:${status}`;
         const pending = await this.flushPendingCommit(groupId, operation);
         if (pending?.matched) {
@@ -293,6 +298,7 @@ export class GroupAdminWorkspaceStore {
     return this.run(groupId, () =>
       this.withGroup(groupId, false, async (group) => {
         authorize?.();
+        this.requireRuntime();
         const pending = await this.flushPendingCommit(groupId, "rebuild");
         if (pending?.matched) {
           if (this.identityMaterializer)
@@ -417,6 +423,7 @@ export class GroupAdminWorkspaceStore {
   async remove(groupId: string, serialized = false) {
     const operation = () =>
       this.withGroup(groupId, serialized, async () => {
+        if (this.record(groupId) || this.pendingCommits.has(groupId)) this.requireRuntime();
         const pending = await this.flushPendingCommit(groupId, "remove");
         const record = pending?.record ?? this.record(groupId);
         if (record && this.runtime?.remove)
@@ -434,6 +441,7 @@ export class GroupAdminWorkspaceStore {
   ) {
     const operation = () =>
       this.withGroup(groupId, serialized, async (group) => {
+        if (!this.record(groupId) && !this.pendingCommits.has(groupId)) return;
         await this.ensureLocked(group);
         if (status !== "stopped") return;
         const record = this.record(groupId)!;

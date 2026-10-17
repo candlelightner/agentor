@@ -1,3 +1,4 @@
+import { refreshAdministrativeWorkspaceIdentities } from '../utils/admin-workspace-refresh';
 import {
   useConfig,
   useDockerService,
@@ -330,7 +331,7 @@ export default defineNitroPlugin(async (nitroApp) => {
         ),
       );
 
-  // The administrative workspace uses a separate, generated Docker boundary:
+  // The administrative workspace uses its dedicated runtime boundary:
   // its image/mount/network inputs are not accepted from dashboard requests.
   // The MCP listener binds only to the orchestrator's address on the internal
   // management network and still authenticates + authorizes every JSON-RPC
@@ -368,17 +369,14 @@ export default defineNitroPlugin(async (nitroApp) => {
   let adminIdentityTimer: NodeJS.Timeout | undefined;
   const refreshAdminIdentity = async () => {
     if (instanceSnapshotActive()) return;
-    try {
-      const workspace = await adminWorkspace.ensure();
-      for (const group of useWorkerGroupStore().list()) {
-        if (!group.adminWorkspace) continue;
-        await groupAdminWorkspaces.ensure(group.id);
-      }
-    } catch (error) {
-      logger.error(
+    await refreshAdministrativeWorkspaceIdentities(
+      () => adminWorkspace.ensure(),
+      () => useWorkerGroupStore().list(),
+      (groupId) => groupAdminWorkspaces.ensure(groupId),
+      (error) => logger.error(
         `[agentor] administrative workspace identity refresh failed: ${error instanceof Error ? error.message : error}`,
-      );
-    }
+      ),
+    );
   };
   if (!instanceRecoveryMode) {
     await refreshAdminIdentity();

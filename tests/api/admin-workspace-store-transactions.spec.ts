@@ -232,6 +232,7 @@ test("global admin persistence rejection does not publish an uncommitted script"
       throw new Error("injected workspace persistence failure");
     }
   });
+  store.setRuntimeAdapter({ ensure: async () => {}, start: async () => {}, stop: async () => {}, rebuild: async () => {} });
   await store.ensure();
   failNextWrite = true;
   await expect(store.setStartupScript("echo unsafe")).rejects.toThrow(

@@ -216,6 +216,7 @@ test('legitimately absent platform authority remains unprovisioned until explici
     const store = new AdminWorkspaceStore(dir); await store.init();
     expect(store.getRecord()).toBeUndefined();
     await expect(readFile(join(dir, 'admin/workspace.v1.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    store.setRuntimeAdapter({ensure:async()=>{},start:async()=>{},stop:async()=>{},rebuild:async()=>{}});
     const created = await store.ensure(); expect(created.id).toBeTruthy();
     const fresh = new AdminWorkspaceStore(dir); await fresh.init(); expect(fresh.getRecord()?.id).toBe(created.id);
   } finally { await rm(dir, { recursive: true, force: true }); }

@@ -1432,3 +1432,7 @@ Administrative native restore has one shared networkless filesystem inverse for 
 - Failed/cancelled native image builds expose explicit owner/admin converter recovery via `POST /api/image-builds/:id/recover-converter` with `{}`. Only the exact acknowledged disposable VM may be cleaned up; unknown operations, foreign layouts and image-import receipts remain blocked. Source images, custom volumes, scratch and backups are retained. Covered by module/route mocks; live Incus acceptance remains pending.
 
 Docker packaging now retains the 23 tracked TypeScript backup REST routes beneath `server/api/backups` while runtime backup storage and secret files remain excluded. The builder checks the primary and remote-discovery source files before compilation, so this omission fails the image build instead of producing a healthy web UI with missing backup routes.
+
+Administrative identity refresh isolates each global/group runtime failure so healthy later group admins retain their short-lived management identities. Unavailable group authority is reported without inferring or provisioning other identities; each dedicated store keeps its own admission checks.
+
+Admin lifecycle requests fail with 503 until their shared runtime adapter is bound, preventing startup races from reporting metadata-only create/start/stop/rebuild success. Dedicated read-only identity bootstrap remains available.
