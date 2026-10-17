@@ -76,6 +76,39 @@ test('native worker memory caps preserve Docker binary units and supported IEC v
     expect(() => incusWorkerMemoryLimit(input), input).toThrow();
 });
 
+test('native allocation always applies a finite VM fallback and preserves explicit binary caps across recreation/import', async () => {
+  for (const [memoryLimit, fallback, expected] of [
+    [undefined, undefined, '4GiB'], ['', undefined, '4GiB'], ['0g', undefined, '4GiB'],
+    ['0m', '6GiB', '6GiB'], [undefined, '6g', '6442450944'],
+    ['512m', '8GiB', '536870912'], ['1.5GB', '8GiB', '1610612736'], ['2GiB', '8GiB', '2GiB'],
+  ] as const) {
+    const fake = fakeClient(), runtime = new IncusWorkerRuntime({ ...config, incusDefaultMemoryLimit: fallback } as Config, fake.client as any);
+    const opts = { ...options(), memoryLimit, start: false };
+    await runtime.create(opts);
+    expect(fake.events.find(event => event.operation === 'create')!.args[0].config['limits.memory']).toBe(expected);
+    const preflight = await runtime.preflightRecreation(opts);
+    fake.events.length = 0;
+    await runtime.create(opts, preflight);
+    expect(fake.events.find(event => event.operation === 'create')!.args[0].config['limits.memory']).toBe(expected);
+    // The canonical import/migration allocation converges on the same policy.
+    const restored = fakeClient(), restoreRuntime = new IncusWorkerRuntime({ ...config, incusDefaultMemoryLimit: fallback } as Config, restored.client as any);
+    restored.client.getInstance = async () => { throw Object.assign(new Error('absent'), { statusCode: 404 }); };
+    await restoreRuntime.createCanonicalRestore({ ...opts, recreationNonce: randomUUID() });
+    expect(restored.events.find(event => event.operation === 'create')!.args[0].config['limits.memory']).toBe(expected);
+  }
+});
+
+test('invalid VM defaults fail before canonical volume or compute allocation even with an explicit worker cap', async () => {
+  for (const fallback of ['', '0g', '-1g', 'unlimited', '10%', '1TB', 'Infinityg', '9007199254740992b']) {
+    const fake = fakeClient(), runtime = new IncusWorkerRuntime({ ...config, incusDefaultMemoryLimit: fallback }, fake.client as any);
+    for (const memoryLimit of [undefined, '2GiB']) {
+      await expect(runtime.create({ ...options(), memoryLimit, start: false })).rejects.toThrow('INCUS_DEFAULT_MEMORY_LIMIT');
+      await expect(runtime.preflightCanonicalRestore({ ...options(), memoryLimit, start: false, recreationNonce: randomUUID() })).rejects.toThrow('INCUS_DEFAULT_MEMORY_LIMIT');
+    }
+    expect(fake.events.some(event => ['volume-create', 'volume-update', 'create', 'remove', 'start', 'stop'].includes(event.operation))).toBe(false);
+  }
+});
+
 test('account onboarding is limited to explicit create/promotion, then rechecks the restricted leaf allowlist', async () => {
   const opts = options(), base = '/srv/agentor/users/' + opts.userId;
   opts.storageManager = {

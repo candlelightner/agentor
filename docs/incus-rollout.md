@@ -151,3 +151,10 @@ image before removing compute, and rechecks both before allocation and metadata
 publication. Archive/unarchive, storage-only recreation and recovery retain the
 captured recipe. This lets a deliberate Rebuild apply a kernel/bootstrap fix
 without silently changing the worker software or canonical volumes.
+
+Native VM allocations now always send a finite `limits.memory`: the resolved
+positive worker cap, or `INCUS_DEFAULT_MEMORY_LIMIT` (default `4GiB`) for an
+empty/zero cap. This migration-discovered correction avoids Incus's implicit
+roughly 1 GiB default for previously uncapped Docker environments. Existing
+positive caps and Docker behavior remain unchanged; running VMs are not resized.
+See `docs/environments.md` for precedence, validation and effective UI reporting.

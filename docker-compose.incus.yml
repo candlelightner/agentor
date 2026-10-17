@@ -37,6 +37,7 @@ services:
       WORKER_IMAGE_PREFIX: ${WORKER_IMAGE_PREFIX-ghcr.io/candlelightner/}
       WORKER_IMAGE: ${WORKER_IMAGE:-agentor-worker:latest}
       INCUS_ENABLED: "true"
+      INCUS_DEFAULT_MEMORY_LIMIT: ${INCUS_DEFAULT_MEMORY_LIMIT:-4GiB}
       INCUS_ENDPOINT: ${INCUS_ENDPOINT:?Use the setup HTTPS endpoint}
       INCUS_PROJECT: ${INCUS_PROJECT:?Use the dedicated restricted project}
       INCUS_NETWORK: ${INCUS_NETWORK:?Use the setup managed worker network}

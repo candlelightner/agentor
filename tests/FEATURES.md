@@ -399,7 +399,7 @@ The worker "detail" view is a fully editable **Worker Settings modal** (no more 
 
 ### 7.2 Editor View (EnvironmentEditor)
 - **Name** — text input (disabled in read-only/view mode)
-- **Resource Limits** — CPU (number, step 0.5, "0 = unrestricted"), Memory (text, "e.g. 4g, 512m")
+- **Resource Limits** — CPU (number, step 0.5, "0 = unrestricted"), Memory (text, "e.g. 4g, 512m"). Native VM allocations use a finite 4 GiB fallback (`INCUS_DEFAULT_MEMORY_LIMIT` override) when the resolved cap is empty/zero; explicit positive binary caps and all Docker behavior stay unchanged. The editor displays effective VM memory on next create/rebuild, or an explicit unavailable/invalid state, using an authenticated non-secret policy read. All native create/rebuild/unarchive/migration/import allocations share the same parser and fallback.
 - **Docker** — "Enable Docker-in-Docker" checkbox with description
 - **Credentials** — read-only display of credential file status per agent (configured/not set)
 - **Network Access** — radio button group styled as cards:
