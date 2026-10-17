@@ -1,3 +1,4 @@
+import { rejectHistoricalNativeDrSshTransport } from '../helpers/private-native-dr-fixture';
 import { test, expect } from '@playwright/test';
 import { execFile } from 'node:child_process';
 import { promisify, isDeepStrictEqual } from 'node:util';
@@ -95,6 +96,7 @@ for (const mode of ['retained', 'ordinary', 'omitted', 'rollback', 'app-retained
   const rest = mode === 'app-rest-ordinary' && !originalPublic && !newPublic && !customPublic, app = mode.startsWith('app-'), ordinary = !historical && (originalPublic || newPublic || rest || mode === 'app-ordinary' || mode !== 'retained' && !app),
     rollback = mode === 'rollback' || mode === 'app-rollback';
   test.skip(process.env.INCUS_INSTANCE_HELPER_PROCESS_TEST !== 'true', 'Explicit serial approved disposable helper-process gate');
+  await rejectHistoricalNativeDrSshTransport(); // No historical host/SSH fallback, even with a receipt.
   if (historical && !process.env.INCUS_ENDPOINT) throw new Error('Historical compatibility gate requires the current approved Incus HTTPS forward');
   const isolatedPath = process.env.INCUS_HISTORICAL_ISOLATED_JSON;
   if (isolatedPath && (!historical || historicalOperatorCanary))
