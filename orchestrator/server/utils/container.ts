@@ -79,6 +79,10 @@ import { IncusWorkerImageManager } from './incus-worker-image-manager';
 import { IncusRequestRejected } from './incus-client';
 import { legacyMigrationMountIdentity } from './legacy-incus-migration-capture';
 import { assertOrdinaryWorkerIdentity, isAdministrativeWorkspaceId } from './ordinary-worker-identity';
+import { readAdministrativeRuntimeRecord, administrativeRuntimeOwner } from './admin-native-authority';
+import { useAdministrativeWorkspaceRuntime } from './services';
+import { useAdminWorkspaceStore } from './admin-workspace-store';
+import { useGroupAdminWorkspaceStore } from './group-admin-workspace-store';
 import { assertLegacyMigrationAuthority } from './legacy-incus-migration-authority';
 import { incusImageIdentity, sameIncusImageSource } from './incus-worker-image';
 import { WorkerGroupHierarchy } from './worker-group-hierarchy';
@@ -1907,6 +1911,13 @@ export class ContainerManager {
   get(id: string): ContainerInfo | undefined {
     const info = this.containers.get(id);
     if (!info) return undefined;
+    if (info.administrativeKind) {
+      if (info.runtimeKind !== 'incus-vm') {
+        try { this.legacyAdministrativeValidator(info, false)(); }
+        catch { return { ...info, status: 'unknown' }; }
+      }
+      return info;
+    }
     const migration = this.workerStore?.get(info.userId, info.id)?.incusMigration;
     return migration && migration.phase !== 'retained' ? { ...info, status: 'error', runtimeDiagnostic: {
       code: 'WORKER_MIGRATION_RECOVERY_REQUIRED',
@@ -1954,11 +1965,81 @@ export class ContainerManager {
     check(); return result;
   }
 
+  private legacyAdministrativeValidator(info: ContainerInfo, running = true): () => void {
+    const { id, userId, containerId, containerName, administrativeKind } = info;
+    const generation = workerLifecycleGeneration(id);
+    return () => {
+      const current = this.containers.get(id);
+      const record = administrativeKind === 'group' ? useGroupAdminWorkspaceStore().findByWorkspaceId(id)
+        : useAdminWorkspaceStore().getRecord();
+      if (!record || record.id !== id || (running ? record.status !== 'running' : !['running', 'stopped'].includes(record.status)) ||
+          record.runtimeKind === 'incus-vm' || record.nativeRuntime ||
+          record.nativeMigration && record.nativeMigration.phase !== 'retained' ||
+          (record.kind === 'group-administrative' ? 'group' : 'platform') !== administrativeKind ||
+          (record.kind === 'group-administrative' ? record.ownerId : record.ownerId ?? '__agentor_admin__') !== userId ||
+          current?.containerId !== containerId || current.userId !== userId || current.containerName !== containerName ||
+          current.runtimeKind === 'incus-vm' || (running ? current.status !== 'running' : current.status !== record.status) ||
+          current.administrativeKind !== administrativeKind ||
+          workerLifecycleGeneration(id) !== generation || isWorkerLifecycleMutationPending(id))
+        throw new Error('Administrative legacy runtime authority changed; explicit native recovery may be required');
+    };
+  }
+
+  /** External admin entries are projections; only dedicated records authorize use. */
+  private administrativeNativeTarget(info: ContainerInfo) {
+    const native = useAdministrativeWorkspaceRuntime().native;
+    const { id, userId, containerName, administrativeKind } = info;
+    const generation = workerLifecycleGeneration(id), handle = info.containerId;
+    const incarnation = handle.startsWith('incus:') ? handle.slice(6) : '';
+    const currentRegistry = () => {
+      const current = this.containers.get(id);
+      if (!incarnation || !current || current.runtimeKind !== 'incus-vm' || current.status !== 'running' ||
+          current.containerId !== handle || current.userId !== userId || current.containerName !== containerName ||
+          current.administrativeKind !== administrativeKind || !administrativeKind ||
+          workerLifecycleGeneration(id) !== generation || isWorkerLifecycleMutationPending(id))
+        throw new Error('Administrative runtime authority changed; retry');
+    };
+    const record = async () => {
+      currentRegistry();
+      const value = await readAdministrativeRuntimeRecord(id), owner = administrativeRuntimeOwner(value);
+      if (value.runtimeKind !== 'incus-vm' || value.status !== 'running' || value.nativeRuntime?.pending ||
+          value.nativeMigration && value.nativeMigration.phase !== 'retained' ||
+          value.nativeRuntime?.name !== containerName || value.nativeRuntime.incarnation !== incarnation ||
+          owner.userId !== userId || (owner.kind === 'group-administrative' ? 'group' : 'platform') !== administrativeKind)
+        throw new Error('Administrative runtime authority changed; retry');
+      currentRegistry(); return value;
+    };
+    const validate = async () => {
+      const captured = await record();
+      const instance = await native.assertRunning(captured, incarnation);
+      const fresh = await record();
+      if (!isDeepStrictEqual(fresh.nativeRuntime, captured.nativeRuntime) || fresh.ownerId !== captured.ownerId)
+        throw new Error('Administrative runtime authority changed; retry');
+      return { record: fresh, instance };
+    };
+    return { native, incarnation, generation, validate,
+      isCurrent: () => { try { currentRegistry(); return true; } catch { return false; } } };
+  }
+
   /** Dispatch only command/file operations. Captured record and UUID fence a
    * delayed exec or disconnect cleanup away from a replacement VM. */
   workerCommands(id: string): DockerService | IncusWorkerCommands {
     const info = this.assertRunning(id);
-    if (info.runtimeKind !== 'incus-vm') return this.dockerService;
+    if (info.runtimeKind !== 'incus-vm') {
+      if (!info.administrativeKind) return this.dockerService;
+      const validate = this.legacyAdministrativeValidator(info); validate();
+      return new Proxy(this.dockerService, { get: (target, key) => {
+        const value = Reflect.get(target, key);
+        return typeof value !== 'function' ? value : (...args: unknown[]) => { validate(); return value.apply(target, args); };
+      } });
+    }
+    if (info.administrativeKind) {
+      const target = this.administrativeNativeTarget(info);
+      return new IncusWorkerCommands(target.native.client, info.containerName, info.containerId,
+        async () => { await target.validate(); },
+        operation => withOwnerWorkerRuntimeSetup(info.userId, id, operation),
+        info.administrativeKind === 'group' ? 'group-admin' : 'platform-admin');
+    }
     const incarnation = info.containerId.slice('incus:'.length);
     const generation = workerLifecycleGeneration(id);
     return this.incusRuntime.commands({ id, userId: info.userId, containerName: info.containerName }, incarnation, async () => {
@@ -1982,15 +2063,22 @@ export class ContainerManager {
     const commands = this.workerCommands(id);
     if (commands instanceof IncusWorkerCommands) return commands.attachTerminal(windowIndex);
     const session = await commands.execAttachTmuxWindow(info.containerId, windowIndex);
-    let closed = false;
+    let closed = false, timer: ReturnType<typeof setInterval> | undefined;
+    const close = () => {
+      if (closed) return;
+      closed = true; clearInterval(timer);
+      session.stream.end();
+      try { void commands.killTmuxSession(info.containerId, session.tmuxSession).catch(() => {}); } catch {}
+    };
+    if (info.administrativeKind) {
+      const validate = this.legacyAdministrativeValidator(info);
+      try { validate(); } catch (error) { close(); throw error; }
+      timer = setInterval(() => { try { validate(); } catch { close(); } }, 1000); timer.unref();
+      session.stream.once('close', () => clearInterval(timer));
+    }
     return { stream: session.stream,
-      resize: (cols, rows) => { void commands.resizeExec(session.exec.id, cols, rows).catch(() => {}); },
-      close: () => {
-        if (closed) return;
-        closed = true;
-        session.stream.end();
-        void commands.killTmuxSession(info.containerId, session.tmuxSession).catch(() => {});
-      },
+      resize: (cols, rows) => { if (!closed) try { void commands.resizeExec(session.exec.id, cols, rows).catch(() => {}); } catch {} },
+      close,
     };
   }
 
@@ -2000,6 +2088,14 @@ export class ContainerManager {
     const info = this.get(id);
     if (!info || info.status !== "running") throw new Error("Worker backend is not running");
     if (info.runtimeKind !== "incus-vm") return info.containerName;
+    if (info.administrativeKind) {
+      const target = this.administrativeNativeTarget(info);
+      const { record } = await target.validate();
+      const resolved = await target.native.resolveHost(record);
+      await target.validate();
+      if (resolved.incarnation !== target.incarnation) throw new Error('Administrative backend incarnation changed');
+      return resolved.address;
+    }
     const record = this.workerStore?.findById(id);
     if (!record || record.runtimeKind !== "incus-vm" || record.status !== "active" || record.deletionPending ||
         record.userId !== info.userId || isWorkerLifecycleMutationPending(id)) throw new Error("Incus worker is not authoritative");
@@ -2467,8 +2563,8 @@ export class ContainerManager {
   }
 
   private assertRunning(id: string): ContainerInfo {
-    const info = this.containers.get(id);
-    if (info) this.assertMigrationSettled(info);
+    const info = this.get(id);
+    if (info && !info.administrativeKind) this.assertMigrationSettled(info);
     if (!info || info.status !== "running") {
       throw new Error("Worker container is not running");
     }
@@ -7202,8 +7298,11 @@ for p in sys.argv[1:]:
         return Buffer.concat(chunks).toString('utf8');
       } finally { session.close(); }
     }
+    const validate = info.administrativeKind ? this.legacyAdministrativeValidator(info) : () => {};
+    validate();
     try {
-      return await this.dockerService.getLogs(info.containerId, tail);
+      const output = await this.dockerService.getLogs(info.containerId, tail);
+      validate(); return output;
     } catch (error) {
       this.markRuntimeUnknown(info, "Docker worker log read", error);
       throw error;
@@ -7227,6 +7326,17 @@ for p in sys.argv[1:]:
   }
 
   async incusWorkerMetrics(id: string) {
+    const info = this.containers.get(id);
+    if (info?.runtimeKind === 'incus-vm' && info.administrativeKind) {
+      const target = this.administrativeNativeTarget(info);
+      const { instance } = await target.validate();
+      const state = await target.native.client.getInstanceState(info.containerName);
+      await target.validate();
+      const limit = (instance.expanded_config ?? instance.config)['limits.cpu'] ?? '1';
+      const nic = (instance.expanded_devices ?? instance.devices).eth0;
+      return { state, cpuCount: /^[1-9][0-9]*$/.test(limit) ? Number(limit) : 0,
+        primaryMac: nic?.hwaddr ?? instance.config['volatile.eth0.hwaddr'] };
+    }
     const target = this.incusObservationTarget(id);
     const result = await this.incusRuntime.inspectState(target.owner, target.incarnation);
     target.validate();
@@ -7244,7 +7354,21 @@ for p in sys.argv[1:]:
     return Number(total.split(/\s+/)[0]) * 1024;
   }
 
-  openWorkerJournal(id: string, options: Parameters<IncusWorkerRuntime['openJournal']>[3] = {}) {
+  async openWorkerJournal(id: string, options: Parameters<IncusWorkerRuntime['openJournal']>[3] = {}) {
+    const info = this.containers.get(id);
+    if (info?.runtimeKind === 'incus-vm' && info.administrativeKind) {
+      const target = this.administrativeNativeTarget(info);
+      const commands = this.workerCommands(id) as IncusWorkerCommands;
+      const command = ['journalctl', '--boot', '--no-pager', '--output=short-iso-precise',
+        '_SYSTEMD_UNIT=agentor-worker.service', '+', 'SYSLOG_IDENTIFIER=agentor-app',
+        '--lines=' + Math.min(10_000, Math.max(1, Math.trunc(options.tail ?? 200)))];
+      if (options.follow) command.push('--follow');
+      if (options.sinceNow) command.push('--since=now');
+      const session = await commands.open(command, { user: 0, group: 0, signal: options.signal,
+        timeoutMs: options.follow ? 24 * 60 * 60_000 : 10_000 });
+      session.stdin.end();
+      return Object.assign(session, { isCurrent: target.isCurrent });
+    }
     const target = this.incusObservationTarget(id);
     return this.incusRuntime.openJournal(target.owner, target.incarnation, target.validate, options);
   }

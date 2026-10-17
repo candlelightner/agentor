@@ -558,10 +558,16 @@ export class DockerPluginWorkerExecutor implements PluginWorkerExecutor {
     let demux: (stdout: PassThrough, stderr: PassThrough) => void;
     try {
       const alternate = await this.openAlternate?.(workerId, ["/home/agent/apps/plugin-runner/runner.py", operation], signal);
+      if (this.resolveContainerId(workerId) !== containerId) {
+        alternate?.stream.destroy();
+        throw runtimeError('PLUGIN_WORKER_UNAVAILABLE', 'Worker runtime authority changed', 409);
+      }
       if (alternate) {
         stream = alternate.stream;
         demux = alternate.demux;
       } else {
+      if (containerId.startsWith('incus:'))
+        throw runtimeError('PLUGIN_WORKER_UNAVAILABLE', 'Native plugin transport is unavailable', 409);
       const container = this.docker.getContainer(containerId);
       const exec = await withOperationDeadline(
         (operationSignal) => container.exec({

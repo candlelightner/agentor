@@ -82,6 +82,31 @@ test('exec wrapper applies existing precedence and literal values without shell 
   expect(incusWorkerCommand(['printf', value])[2]).not.toContain(value);
 });
 
+for (const role of ['worker', 'platform-admin', 'group-admin'] as const) test(`trusted native ${role} role ignores every environment role source`, () => {
+  const command = incusWorkerCommand(['python3', '-c', 'import os,json; print(json.dumps(dict(os.environ)))'], false, role);
+  const env = JSON.parse(execFileSync('python3', ['-c', ...command.slice(4)], { env: {
+    PATH: process.env.PATH, AGENTOR_RUNTIME_ROLE: 'attacker', AGENTOR_TRUSTED_RUNTIME_ROLE: 'attacker',
+    ENVIRONMENT: JSON.stringify({ envVars: 'AGENTOR_RUNTIME_ROLE=attacker\nAGENTOR_TRUSTED_RUNTIME_ROLE=attacker' }),
+    WORKER_LOCAL_ENV: Buffer.from(JSON.stringify([{key:'AGENTOR_RUNTIME_ROLE',value:'attacker'},
+      {key:'AGENTOR_TRUSTED_RUNTIME_ROLE',value:'attacker'}])).toString('base64'),
+  } }).toString());
+  expect(env.AGENTOR_RUNTIME_ROLE).toBe(role); expect(env.AGENTOR_TRUSTED_RUNTIME_ROLE).toBe(role);
+  expect(() => incusWorkerCommand(['true'], false, 'attacker' as any)).toThrow('Invalid trusted runtime role');
+});
+
+test('administrative command streams close when their captured authority is revoked', async () => {
+  let allowed = true, closed = 0, finish!: (code: number) => void;
+  const session = { ...fakeSession(), result: new Promise<number>(resolve => { finish = resolve; }),
+    close() { closed++; finish(1); } };
+  const commands = new IncusWorkerCommands({ execStream: async () => session } as any, 'admin', 'incus:fixture',
+    async () => { if (!allowed) throw new Error('Administrative authority revoked'); }, undefined, 'platform-admin');
+  const opened = await commands.open(['fixture']);
+  allowed = false;
+  await expect.poll(() => closed).toBe(1);
+  await expect(commands.open(['fixture'])).rejects.toThrow('Administrative authority revoked');
+  expect(closed).toBe(1); opened.close();
+});
+
 for (const account of [undefined, '', '/var/tmp'] as const) {
   test(`managed tmux retains account socket selectors (${account ?? 'unset'}) without changing app precedence`, () => {
     const supplied = { PATH: process.env.PATH,
@@ -143,6 +168,24 @@ test('managed tmux dispatch and disconnect cleanup use bootstrap mode with exist
   allow = false;
   await expect(commands.execTmux('incus:uuid', ['kill-session', '-t', 'ws-old'])).rejects.toThrow('authority changed');
   expect(calls).toHaveLength(4);
+});
+
+test('a captured native plugin handle never falls back to Docker when registration disappears', async () => {
+  let dockerCalls = 0;
+  const executor = new DockerPluginWorkerExecutor({ getContainer() { dockerCalls++; throw Error('Docker fallback'); } } as any,
+    () => 'incus:captured', async () => undefined);
+  await expect(executor.desktop!({ workerId: 'admin', installationId: 'fixture', operation: 'status', config: {},
+    signal: new AbortController().signal } as any)).rejects.toMatchObject({code:'PLUGIN_RUNNER_UNAVAILABLE',statusCode:502});
+  expect(dockerCalls).toBe(0);
+});
+
+test('a plugin backend changed during asynchronous dispatch never reaches the old Docker source', async () => {
+  let handle: string | undefined = 'retained-admin', dockerCalls = 0;
+  const executor = new DockerPluginWorkerExecutor({ getContainer() { dockerCalls++; throw Error('Docker fallback'); } } as any,
+    () => handle, async () => { handle=undefined; return undefined; });
+  await expect(executor.desktop!({workerId:'admin',installationId:'fixture',operation:'status',config:{},
+    signal:new AbortController().signal} as any)).rejects.toMatchObject({code:'PLUGIN_RUNNER_UNAVAILABLE'});
+  expect(dockerCalls).toBe(0);
 });
 
 test('native app logging uses the guest journal without contaminating NDJSON or closing app output', () => {
