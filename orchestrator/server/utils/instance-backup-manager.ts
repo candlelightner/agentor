@@ -46,11 +46,12 @@ import {
   type InstanceRestoreOptions,
   type InstanceRestorePreflight,
   type InstanceBackupVolumeManifest,
+  type InstanceBackupVolumeProgress,
   type RemoteInstanceBackupRecord,
 } from "./instance-backup-types";
 import { getAuthDb } from "./auth";
 import { administrativeWorkspaceResourceNames } from "./admin-workspace-runtime";
-import { sanitizeBackupPathTarPayload } from "./worker-export";
+import { sanitizeBackupPathTarGzip } from "./worker-export";
 import { useConfig, useLogger } from "./services";
 import {
   beginInstanceRestore,
@@ -129,6 +130,7 @@ export class InstanceBackupManager {
   private queue: QueuedOperation[] = [];
   private controllers = new Map<string, AbortController>();
   private tasks = new Map<string, Promise<void>>();
+  private volumeProgress = new Map<string, InstanceBackupVolumeProgress>();
   private restoreBarriers = new Map<string, () => void>();
 
   constructor(options: InstanceBackupManagerOptions = {}) {
@@ -191,7 +193,7 @@ export class InstanceBackupManager {
     await this.init();
     await this.refreshRestoreHolds();
     return {
-      jobs: this.store.listJobs().filter((job) => job.userId === userId).map(publicJob),
+      jobs: this.store.listJobs().filter((job) => job.userId === userId).map(job => this.publicJobWithProgress(job)),
       artifacts: this.store
         .listArtifacts()
         .filter((artifact) => artifact.userId === userId),
@@ -209,7 +211,13 @@ export class InstanceBackupManager {
     await this.init();
     await this.refreshRestoreHolds();
     const job = this.store.getJob(id);
-    return job ? publicJob(job) : undefined;
+    return job ? this.publicJobWithProgress(job) : undefined;
+  }
+
+  private publicJobWithProgress(job: InstanceBackupJob): PublicInstanceBackupJob {
+    const result = publicJob(job), progress = this.volumeProgress.get(job.id);
+    if (job.status === "running" && progress) result.volumeProgress = { ...progress };
+    return result;
   }
 
   async logs(id: string, after = 0, limit = 100) {
@@ -746,7 +754,23 @@ export class InstanceBackupManager {
               other.runtime && (other.runtime.role === 'workspace' || other.runtime.role === 'agents')) : [candidate];
           const outputs = group.map((volume, offset) => ({ volume, path: join(stage, `volume-${index + offset}.tar.gz`) }));
           if (candidate.runtime) await this.snapshotNativeVolumes(outputs, signal);
-          else if (!await this.snapshotVolume(candidate.name, outputs[0]!.path, signal)) continue;
+          else {
+            await this.phase(job, "volume-snapshot", 25 + Math.floor((index / Math.max(1, selectedVolumes.length)) * 35),
+              `Streaming persistent volume ${index + 1} of ${selectedVolumes.length}.`);
+            const progress: InstanceBackupVolumeProgress = {
+              name: candidate.name, index: index + 1, count: selectedVolumes.length, phase: "sanitizing-compressing",
+              uncompressedBytes: 0, expectedBytes: null, bytesPerSecond: null, percentage: null, etaSeconds: null,
+            };
+            this.volumeProgress.set(job.id, progress);
+            const started = performance.now();
+            try {
+              if (!await this.snapshotVolume(candidate.name, outputs[0]!.path, signal, bytes => {
+                progress.uncompressedBytes = Math.max(progress.uncompressedBytes, bytes);
+                const seconds = (performance.now() - started) / 1000;
+                progress.bytesPerSecond = seconds >= 1 ? progress.uncompressedBytes / seconds : null;
+              })) continue;
+            } finally { this.volumeProgress.delete(job.id); }
+          }
           for (const { volume, path: output } of outputs) {
             const info = await stat(output);
             volumes.push({
@@ -1771,6 +1795,7 @@ export class InstanceBackupManager {
     volumeName: string,
     output: string,
     signal: AbortSignal,
+    onBytes?: (uncompressedBytes: number) => void,
   ): Promise<boolean> {
     if (!(await this.volumeExists(volumeName))) return false;
     const hostname = process.env.HOSTNAME;
@@ -1811,8 +1836,6 @@ export class InstanceBackupManager {
       },
       abortSignal: operationSignal,
     }), INSTANCE_DOCKER_MUTATION_TIMEOUT_MS, "Docker instance-snapshot helper creation", signal);
-    const raw = `${output}.raw`;
-    const sanitized = `${output}.tar`;
     try {
       await withOperationDeadline(
         (operationSignal) => helper.start({ abortSignal: operationSignal }),
@@ -1820,26 +1843,19 @@ export class InstanceBackupManager {
         "Docker instance-snapshot helper start",
         signal,
       );
-      await pipeline(
-        (await withOperationDeadline(
-          (operationSignal) => helper.getArchive({
-            path: "/source",
-            abortSignal: operationSignal,
-          }),
-          INSTANCE_DOCKER_READ_TIMEOUT_MS,
-          "Docker instance-snapshot archive setup",
-          signal,
-        )) as NodeJS.ReadableStream,
-        createWriteStream(raw, { mode: 0o600 }),
-        { signal },
+      const archive = await withOperationDeadline(
+        (operationSignal) => helper.getArchive({ path: "/source", abortSignal: operationSignal }),
+        INSTANCE_DOCKER_READ_TIMEOUT_MS,
+        "Docker instance-snapshot archive setup",
+        signal,
       );
-      await sanitizeBackupPathTarPayload(raw, sanitized, "/", signal);
-      await pipeline(
-        createReadStream(sanitized),
-        createGzip({ level: 6 }),
-        createWriteStream(output, { mode: 0o600 }),
-        { signal },
-      );
+      await sanitizeBackupPathTarGzip({
+        source: archive as Readable,
+        destination: output,
+        selectedPath: "/",
+        signal,
+        onBytes,
+      });
       return true;
     } finally {
       await withOperationDeadline(
@@ -1847,8 +1863,6 @@ export class InstanceBackupManager {
         INSTANCE_DOCKER_MUTATION_TIMEOUT_MS,
         "Docker instance-snapshot helper cleanup",
       ).catch(() => {});
-      await rm(raw, { force: true }).catch(() => {});
-      await rm(sanitized, { force: true }).catch(() => {});
     }
   }
 
@@ -1926,6 +1940,7 @@ export class InstanceBackupManager {
           if (!restoreMayOwnStage(this.store.getJob(job.id) ?? job)) this.releaseRestoreBarrier(job.id);
           this.controllers.delete(job.id);
           this.tasks.delete(job.id);
+          this.volumeProgress.delete(job.id);
           this.active -= 1;
           this.dispatch();
         });

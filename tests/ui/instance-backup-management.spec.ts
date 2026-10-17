@@ -420,3 +420,25 @@ test("renders preflight blockers and keeps destructive restore disabled", async 
     }),
   ).toBeDisabled();
 });
+
+test("shows volume-specific uncompressed progress and explicit unknown ETA without using output bytes", async ({ page }) => {
+  await page.route("**/api/admin/instance-backups", route => route.fulfill({ json: {
+    jobs: [{ id: "volume-progress-job", operation: "create", provider: "local", status: "running", phase: "volume-snapshot",
+      progress: 25, bytesProcessed: 1024, createdAt: "2026-09-01T00:00:00Z", updatedAt: "2026-09-01T00:00:01Z",
+      volumeProgress: { name: "agentor-fixture-volume", index: 2, count: 3, phase: "sanitizing-compressing",
+        uncompressedBytes: 10485760, expectedBytes: null, bytesPerSecond: 2097152, percentage: null, etaSeconds: null } },
+      { id: "volume-no-rate-job", operation: "create", provider: "local", status: "running", phase: "volume-snapshot",
+        progress: 25, bytesProcessed: 0, createdAt: "2026-09-01T00:00:00Z", updatedAt: "2026-09-01T00:00:00Z",
+        volumeProgress: { name: "agentor-fixture-starting", index: 1, count: 1, phase: "sanitizing-compressing",
+          uncompressedBytes: 0, expectedBytes: null, bytesPerSecond: null, percentage: null, etaSeconds: null } }],
+    artifacts: [], remoteBackups: [], options: artifact.manifest.options,
+  } }));
+  const modal = await openInstanceRecovery(page), progress = modal.getByTestId("instance-job-volume-progress-job").getByTestId("instance-volume-progress");
+  await expect(progress).toContainText("Volume 2 of 3: agentor-fixture-volume");
+  await expect(progress).toContainText("10 MB uncompressed input");
+  await expect(progress).toContainText("2.0 MB/s");
+  await expect(progress).toContainText("expected size unknown");
+  await expect(progress).toContainText("percentage unknown");
+  await expect(progress).toContainText("ETA unknown");
+  await expect(modal.getByTestId("instance-job-volume-no-rate-job").getByTestId("instance-volume-progress")).toContainText("throughput unavailable");
+});

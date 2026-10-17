@@ -316,6 +316,39 @@ test.describe("instance disaster-recovery bundle boundary", () => {
     ).toBe(volume.sha256);
   });
 
+  test("accepts implicit parents, late explicit directories and independent archives with overlapping names", async () => {
+    // Each nested archive needs its own parent index: a parent in data must not
+    // prevent a regular file at that path in a different volume archive.
+    const data = join(root, "parents-data.gz"), volumePath = join(root, "parents-volume.gz");
+    await writeTarGzip(data, [
+      { name: "auth.db", body: "db" },
+      { name: "source/parent/child", body: "nested" },
+      { name: "source/parent/", type: "directory" },
+      { name: "source/sibling", body: "sibling" },
+      { name: "source/", type: "directory" },
+    ]);
+    await writeTarGzip(volumePath, [{ name: "source", type: "directory" }, { name: "source/parent", body: "independent" }]);
+    const volume = { name: "parent-index-test", kind: "persistent-path" as const,
+      archive: instanceVolumeArchiveName("parent-index-test"), size: (await stat(volumePath)).size, sha256: await sha256File(volumePath) };
+    const bundle = join(root, "parents.bundle.tar");
+    await packInstanceBundle(await manifestFor(data, { volumes: [volume] }), data, [{ manifest: volume, path: volumePath }], bundle);
+    const result = await inspectInstanceBundle(bundle, join(root, "parents-output"));
+    expect(result.volumeArchives.size).toBe(1);
+  });
+
+  test("verifies a file-heavy archive with 24000 nested entries", async () => {
+    // Assert correctness, not machine-specific throughput. The accompanying
+    // benchmark records performance without a fragile CI timing threshold.
+    const data = join(root, "many-files.gz"), bundle = join(root, "many-files.tar");
+    await writeTarGzip(data, [{ name: "auth.db", body: "db" },
+      ...Array.from({ length: 24_000 }, (_, index) => ({ name: `files/group-${index % 128}/file-${index}`, body: "entry" }))]);
+    const manifest = await manifestFor(data);
+    await packInstanceBundle(manifest, data, [], bundle);
+    const result = await inspectInstanceBundle(bundle, join(root, "many-files-output"));
+    expect(result.manifest).toEqual(manifest);
+    expect(await sha256File(result.dataArchivePath)).toBe(manifest.dataArchive.sha256);
+  });
+
   test("rejects traversal, reserved recovery paths, special entries, duplicate paths, and non-directory ancestors", async () => {
     const cases: Array<{
       name: string;
@@ -329,6 +362,21 @@ test.describe("instance disaster-recovery bundle boundary", () => {
           { name: "../outside", body: "escape" },
         ],
         error: /unsafe path/i,
+      },
+      {
+        name: "absolute path",
+        entries: [{ name: "auth.db", body: "db" }, { name: "/outside", body: "escape" }],
+        error: /unsafe path/i,
+      },
+      {
+        name: "reverse parent conflict",
+        entries: [{ name: "auth.db", body: "db" }, { name: "parent/child", body: "child" }, { name: "parent", body: "file" }],
+        error: /replaces an existing parent/i,
+      },
+      {
+        name: "duplicate normalized directory",
+        entries: [{ name: "auth.db", body: "db" }, { name: "parent/", type: "directory" }, { name: "parent", type: "directory" }],
+        error: /duplicate entry/i,
       },
       {
         name: "reserved path",

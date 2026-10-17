@@ -1,3 +1,4 @@
+import { requirePrivateNativeDrFixture } from '../helpers/private-native-dr-fixture';
 import { test, expect } from '@playwright/test';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
@@ -29,13 +30,9 @@ import { instanceSnapshotActive } from '../../orchestrator/server/utils/instance
 test('production native whole-instance capture preserves stopped canonical, disabled Docker, detached and deleted-owner managed data', async () => {
   test.skip(process.env.INCUS_INSTANCE_BACKUP_TEST !== 'true', 'Explicit serial disposable whole-instance capture gate');
   test.setTimeout(1_500_000);
+  const fixture = await requirePrivateNativeDrFixture();
   const config = useConfig(), priorConfig = { ...config };
-  Object.assign(config, { containerPrefix: 'agentor-worker', incusEnabled: true,
-    incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor', incusNetwork: 'incusbr0', incusStoragePool: 'default',
-    incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase10-preserve-ownership',
-    incusDockerVolumeSize: '1GiB', incusInternalGatewayUrl: 'http://10.159.68.1:38000',
-    incusClientCertPath: '/workspace/agentor-incus-tls/client.crt', incusClientKeyPath: '/workspace/agentor-incus-tls/client.key',
-    incusServerCertPath: '/workspace/agentor-incus-tls/server.crt' });
+  Object.assign(config, fixture.config, { incusDockerVolumeSize: '1GiB' });
   const id = randomUUID(), userId = randomUUID(), nonce = randomUUID();
   const owner = { id, userId, containerName: config.containerPrefix + '-' + id };
   const stage = join(config.dataDir, 'instance-native-gate-' + id); await mkdir(stage, { mode: 0o700 });

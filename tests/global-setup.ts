@@ -1,3 +1,4 @@
+import { assertNativeDrUsesModulesConfig } from './helpers/private-native-dr-fixture';
 import { chromium, request as playwrightRequest, type FullConfig } from '@playwright/test';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -18,6 +19,7 @@ export const TEST_ADMIN_NAME = 'Test Admin';
  * that file so every test runs as the admin user by default.
  */
 export default async function globalSetup(config: FullConfig) {
+  assertNativeDrUsesModulesConfig(); // Must precede request contexts, setup probes and authentication.
   const baseURL = process.env.BASE_URL || 'http://localhost:3000';
 
   // Use a shared request context so cookies persist across calls

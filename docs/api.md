@@ -92,6 +92,8 @@ The **Worker Self** group contains the unauthenticated, source-IP-identified rou
 
 ### Backup-directory persistence
 
+Backup settings reconcile only newly enabled directory coverage for currently selected workspaces. Existing coverage on an archived worker does not block unrelated saves or deselection, and inactive path preferences and retained backup/persistent data are preserved. Adding a new directory or enabling persistence still requires successful source validation before saving. Archived workers remain eligible for default workspace/agent-data backups; explicit extra paths continue to require running compute and fail rather than silently dropping requested coverage.
+
 Saving backup settings first copies each additional directory into an Agentor-managed local volume, which is mounted at the same absolute path across ordinary-worker and administrative rebuilds. Individual files and `/` remain backup-only; paths already covered by `/workspace`, agent-data, DinD, or another configured persistent mount need no extra volume. Deselecting a directory detaches but does not delete its volume. If it is selected again, current files merge into the retained volume and current same-named files replace their older persisted versions. Changes made while detached remain temporary and are lost on another rebuild unless the directory is reselected or backed up first.
 
 ### Adding Docs to a New Route

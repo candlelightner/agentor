@@ -1,3 +1,4 @@
+import { requirePrivateNativeDrFixture } from '../helpers/private-native-dr-fixture';
 import { expect, test } from '@playwright/test';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
@@ -35,13 +36,10 @@ print(json.dumps(dict(bytes=base64.b64encode(open(p+'/data','rb').read()).decode
 test('real compiled controlled-restore preflight proves immutable source and all destination absence without allocating', async () => {
   test.skip(process.env.INCUS_INSTANCE_PREFLIGHT_TEST !== 'true', 'Explicit approved disposable read-only gate');
   test.setTimeout(120_000);
+  const fixture = await requirePrivateNativeDrFixture();
   const dataDir = await mkdtemp(join(tmpdir(), 'agentor-instance-native-preflight-'));
   const id = randomUUID(), userId = 'preflight-' + randomUUID();
-  const config = { ...loadConfig(), dataDir, containerPrefix: 'agentor-worker', incusEnabled: true,
-    incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor', incusStoragePool: 'default', incusNetwork: 'incusbr0',
-    incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase10-preserve-ownership',
-    incusInternalGatewayUrl: 'http://10.159.68.1:38000', incusClientCertPath: '/workspace/agentor-incus-tls/client.crt',
-    incusClientKeyPath: '/workspace/agentor-incus-tls/client.key', incusServerCertPath: '/workspace/agentor-incus-tls/server.crt' };
+  const config = { ...loadConfig(), ...fixture.config, dataDir };
   const options: IncusWorkerOptions = { id, userId, containerName: config.containerPrefix + '-' + id,
     start: false, recreationNonce: randomUUID(), dockerEnabled: false, cpuLimit: 2, memoryLimit: '2GiB',
     userEnv: zeroUserEnvVars(userId), capabilitiesJson: [], instructionsJson: [],
@@ -76,14 +74,11 @@ test('real compiled controlled-restore preflight proves immutable source and all
 
 for (const retainedOnly of [false, true]) test(`real compiled detached inverse ${retainedOnly ? 'retains deleted-owner authority after temporary compute/core cleanup' : 'promotes mixed data without attaching historical volumes'}`, async () => {
   test.skip(process.env.INCUS_INSTANCE_DETACHED_RESTORE_TEST !== 'true', 'Explicit serial disposable native restore gate');
+  const fixture = await requirePrivateNativeDrFixture();
   test.setTimeout(900_000);
   const dataDir = await mkdtemp(join(tmpdir(), 'agentor-instance-detached-inverse-'));
   const id = randomUUID(), userId = 'detached-restore-' + randomUUID(), nonce = randomUUID();
-  const config = { ...loadConfig(), dataDir, containerPrefix: 'agentor-worker', incusEnabled: true,
-    incusEndpoint: 'https://127.0.0.1:18443', incusProject: 'agentor', incusStoragePool: 'default', incusNetwork: 'incusbr0',
-    incusWorkerImage: process.env.INCUS_TEST_IMAGE || 'agentor-worker-phase10-preserve-ownership',
-    incusInternalGatewayUrl: 'http://10.159.68.1:38000', incusClientCertPath: '/workspace/agentor-incus-tls/client.crt',
-    incusClientKeyPath: '/workspace/agentor-incus-tls/client.key', incusServerCertPath: '/workspace/agentor-incus-tls/server.crt' };
+  const config = { ...loadConfig(), ...fixture.config, dataDir };
   const options: IncusWorkerOptions = { id, userId, containerName: config.containerPrefix + '-' + id, start: false, recreationNonce: nonce,
     dockerEnabled: false, cpuLimit: 2, memoryLimit: '2GiB', userEnv: zeroUserEnvVars(userId),
     capabilitiesJson: [], instructionsJson: [],
