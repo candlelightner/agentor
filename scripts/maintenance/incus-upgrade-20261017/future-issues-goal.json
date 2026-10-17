@@ -51,19 +51,37 @@
     "No backup/source finalization or deletion"
   ],
   "lastVerifiedProductionWorker": {
-    "id": "6eea5aa9-2d0d-454a-a91b-21b35d5b84fc",
-    "name": "Logik - UE",
+    "id": "cd4170f6-21aa-4494-b886-640494ff1f30",
+    "name": "AMRC - UE",
     "runtime": "incus-vm",
     "state": "stopped",
     "guestKernel": "7.0.0-38-generic",
     "checks": [
       "restored Codex 0.162.1",
-      "extra packages",
+      "all nine extra packages",
       "PDF compilation",
+      "R rmarkdown and robustbase",
+      "Pandoc",
       "shared-volume execution",
       "shared host mount",
       "editor and desktop proxies",
       "retained original Docker source"
     ]
+  },
+  "verifiedProductionWorkers": [
+    "6eea5aa9-2d0d-454a-a91b-21b35d5b84fc",
+    "cd4170f6-21aa-4494-b886-640494ff1f30"
+  ],
+  "migrationFollowUps": {
+    "updater": "Safely rolled back to stopped Docker: exact 8 GiB file emits legitimate PAX size. Fix 15e19cca passed 68 affected tests, pushed separately and cherry-picked as 5f68ed5; image built, deployment awaits idle stack and precise migration diagnostic. Offline source Docker inventory: 10 images, 0 containers, 3 volumes.",
+    "3d": "Safely rolled back to stopped Docker after final source-authority check. Source ID/image/creation/mounts unchanged. Precise non-secret validation categories are being added before another attempt.",
+    "metod": "Archived legacy managed parent /home/agent/.local/share overlaps protected Kilo data. Do not bypass admission or drop data; source and legacy volume retained for reviewed handling."
+  },
+  "additionalBranches": {
+    "memoryPolicy": "fix/incus-default-memory-20261017",
+    "paxSize": "fix/incus-pax-size-20261017",
+    "migrationDiagnostics": "fix/incus-migration-diagnostics-20261017",
+    "legacyManagedMigration": "fix/incus-legacy-managed-migration-20261017",
+    "isolatedIntegration": "fix/backup-integration-harness-20261017"
   }
 }
