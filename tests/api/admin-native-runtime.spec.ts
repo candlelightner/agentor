@@ -274,3 +274,48 @@ test('fresh-root initialization rejects populated or symlinked canonical data be
  const outside=join(directory,'outside');await mkdir(outside);await writeFile(join(outside,'retained'),'outside');await rm(agents,{recursive:true});await symlink(outside,agents);const symlinkResult=spawnSync('python3',['-c',script],{encoding:'utf8',timeout:5000});expect(symlinkResult.status).not.toBe(0);expect(await readFile(join(outside,'retained'),'utf8')).toBe('outside');
  }finally{await rm(directory,{recursive:true,force:true});}
 });
+
+test('cold guest agent transient retries only the harmless probe before preparation', async () => {
+    const f = await fixture();
+    try {
+        const execute = f.client.exec; let probes = 0;
+        f.client.exec = async (name: string, command: string[], options: any) => {
+            if (command.length === 3 && command[0] === 'timeout' && command[2] === '/usr/bin/true' && ++probes === 1)
+                throw Object.assign(Error('Guest agent not ready'), { statusCode: 503 });
+            return execute(name, command, options);
+        };
+        await f.prepare(); await f.runtime.ensure(f.record, f.ack);
+        expect(probes).toBe(2); expect(f.instance.status).toBe('Running');
+        expect(f.events).toContain('credential-write'); expect(f.events).not.toContain('vm-stop');
+    } finally { await f.cleanup(); }
+});
+test('explicit remove retains storage cleanup authority after a partial volume deletion', async () => {
+    const f = await fixture();
+    try {
+        await f.prepare(); await f.runtime.ensure(f.record, f.ack); await f.runtime.stop(f.record, f.ack);
+        let calls = 0;
+        f.client.deleteCustomVolume = async (_pool: string, name: string) => {
+            if (++calls === 2) throw Error('temporary storage failure'); f.volumes.delete(name);
+        };
+        await expect(f.runtime.remove(f.record, f.ack)).rejects.toThrow('temporary storage failure');
+        expect(f.instance).toBeUndefined(); expect(f.record.nativeRuntime?.deleting).toBe(true);
+        expect(f.volumes.size).toBe(1);
+        await expect(f.runtime.start(f.record, f.ack)).rejects.toThrow('explicit recovery');
+        // Avoid service singleton access after the final cleanup, without masking storage work.
+        const { useContainerManager } = await import('../../orchestrator/server/utils/services');
+        const manager = useContainerManager(), unregister = manager.unregisterExternal;
+        manager.unregisterExternal = () => {};
+        try { await f.runtime.remove(f.record, f.ack); } finally { manager.unregisterExternal = unregister; }
+        expect(f.volumes.size).toBe(0); expect(f.events.filter(x => x === 'vm-delete')).toHaveLength(1);
+    } finally { await f.cleanup(); }
+});
+test('fresh VM without a daemon incarnation never starts or provisions', async () => {
+    const f = await fixture();
+    try {
+        const create = f.client.createInstance;
+        f.client.createInstance = async (...args: any[]) => { const value = await create(...args); delete value.config['volatile.uuid']; return value; };
+        await f.prepare(); await expect(f.runtime.ensure(f.record, f.ack)).rejects.toThrow('incarnation is unavailable');
+        expect(f.record.nativeRuntime?.pending?.kind).toBe('create');
+        expect(f.events).not.toContain('vm-start'); expect(f.events).not.toContain('credential-write');
+    } finally { await f.cleanup(); }
+});

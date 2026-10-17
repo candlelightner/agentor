@@ -14,6 +14,8 @@ export interface AdminNativeRuntimeIdentity {
   overlaySha256: string;
   storageReady?: true;
   storageInitialized?: true;
+  /** Retains exact storage deletion authority across a partial explicit remove. */
+  deleting?: true;
   appliedStartupScriptRevision?: number;
   pending?: { kind: 'create' | 'start' | 'stop' | 'delete'; operation?: string };
 }
@@ -62,6 +64,7 @@ export function validateAdminNativeState(record: Readonly<AdministrativeWorkspac
         v.overlayVersion !== '6' || !hex.test(v.overlaySha256) ||
         v.storageReady !== undefined && v.storageReady !== true ||
         v.storageInitialized !== undefined && v.storageInitialized !== true ||
+        v.deleting !== undefined && v.deleting !== true ||
         v.appliedStartupScriptRevision !== undefined && (!Number.isSafeInteger(v.appliedStartupScriptRevision) || v.appliedStartupScriptRevision < 0) ||
         v.pending && (!['create', 'start', 'stop', 'delete'].includes(v.pending.kind) ||
           v.pending.operation !== undefined && !/^\/1\.0\/operations\/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}(?:\?project=[A-Za-z0-9_-]+)?$/.test(v.pending.operation)))
