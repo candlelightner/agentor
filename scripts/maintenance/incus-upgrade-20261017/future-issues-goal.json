@@ -1,5 +1,5 @@
 {
-  "objective": "Autonomously finish the Agentor VM-branch upgrade and migration of every safely eligible ordinary worker, verifying workspace, agent/editor state, managed volumes, native Docker data, preserved custom tools and intended stopped/archived state. Keep the verified encrypted backup fd9ff548-9a79-4b7c-979c-7906f0a0cf10, recovery keys, original Docker sources and rollback images. In parallel, have appropriately chosen sub-agents address as many remaining GitHub code issues as realistic in urgency/impact order, especially safe GPU/USB passthrough, backup correctness/performance and operational diagnostics. Require coherent committed and pushed branches, accurate supported-capability reporting and appropriate validation. After migration and sub-agent work finish, consolidate and review locally, merge only validated agent changes into feature/incus-vm-workers, run combined checks, and create a PR onto main if those checks pass. Report unresolved image, hardware and acceptance limitations honestly; do not delete the backup or prematurely finalize original data.",
+  "objective": "Autonomously finish the Agentor VM-branch upgrade and migration of every safely eligible ordinary worker, verifying workspace, agent/editor state, managed volumes, native Docker data, preserved custom tools and intended stopped/archived state. Keep the verified encrypted backup fd9ff548-9a79-4b7c-979c-7906f0a0cf10, recovery keys, original Docker sources and rollback images. In parallel, have appropriately chosen sub-agents address as many remaining GitHub code issues as realistic in urgency/impact order, especially safe GPU/USB passthrough, backup correctness/performance and operational diagnostics. Require coherent committed and pushed branches, accurate supported-capability reporting and appropriate validation. After migration and sub-agent work finish, consolidate and review locally, merge only validated agent changes into feature/incus-vm-workers, run combined checks, and create a PR onto main if those checks pass. Report unresolved image, hardware and acceptance limitations honestly; do not delete the backup or prematurely finalize original data. Latest scope: both hardware workers must migrate to VMs with required hardware working; Docker is not their acceptable final state. Implement and validate dedicated VM admin runtimes as feasible, preserving their trusted management boundary.",
   "state": "active combined goal; four production workers verified, updater retry capturing, isolated agent fixes finished and reviewed; consolidation follows eligible migration",
   "priority": [
     {
@@ -38,16 +38,16 @@
     }
   ],
   "completion": [
-    "Eligible production migration and validation finished with accurate exceptions",
+    "Ordinary production migration finished, including both hardware workers with required hardware access verified; no permanent hardware Docker exclusion",
     "Agent branches committed/pushed and reviewed",
     "Combined tests/typecheck/build and appropriate isolated integration checks pass",
-    "Consolidate only validated work; document unsupported or unverified hardware paths",
+    "Consolidate only validated work; implement and validate dedicated admin VM support where feasible, preserving security and reporting actual acceptance gaps",
     "Create PR from consolidated VM feature branch onto main; report any remaining acceptance gaps"
   ],
   "production_guards": [
     "Agents do not mutate production stack, workers, Incus policy, hardware or backup data",
     "Never pass through mounted host storage, especially the JMicron controller/disks containing recovery artifacts and VM SSD",
-    "Keep GPU/USB and administrative workers on Docker until separately supported and verified",
+    "Keep existing hardware and administrative sources retained until their dedicated VM support, device/network boundaries and migration are validated; this is temporary staging, not an acceptable final hardware state",
     "No backup/source finalization or deletion"
   ],
   "lastVerifiedProductionWorker": {
@@ -131,12 +131,12 @@
         "8b5c936e-a859-4039-873a-6f7af0960b61",
         "c631e03a-f5a9-47d8-ab72-b3d6cb766287"
       ],
-      "status": "Authoritative identity guards and malformed global admin quarantine committed/pushed ascb5662ea. Independent review found nested group identity validation fail-open and quarantined owner startup propagation; narrow fixes in progress before deployment. Actual trusted admin resources remain Docker."
+      "status": "Authoritative identity/quarantine fixes committed/pushed d63f1bcd and independently54cases passed. User prefers actual global/group admins in VMs too; dedicated runtime feasibility/scope assessment in progress. Never ordinary-migrate their archived shadow IDs; preserve trusted management boundary."
     },
     "testRunner": {
-      "branch": "fix/disposable-vm-backup-tests-20261017",
-      "commit": "81686d0f786632a3acb709ed20841521833b248f",
-      "status": "Fresh isolated direct-QEMU runner and external-data/signal fixes committed/pushed;24 isolated tests pass. Independent review found unbounded SSH log sinks; minimum fix in progress before any actual launch. Full suites pending consolidated committed source."
+      "branch": "fix/backup-vm-failed-drain-stop-20261018",
+      "commit": "a9c57f71601ac292f47416c85a704c2c32526ee8",
+      "status": "Fresh direct-QEMU runner reviewed with externalQCOW2, signal cleanup, bounded SSH logs and no report-SSH after unsettled/cancelled suite. Independent26puretests pass; committed/pushed. Real launch/full suites remain pending consolidated committed source."
     },
     "ponytail": {
       "version": "5.3.2",
