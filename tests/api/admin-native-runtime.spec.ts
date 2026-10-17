@@ -280,7 +280,7 @@ test('cold guest agent transient retries only the harmless probe before preparat
     try {
         const execute = f.client.exec; let probes = 0;
         f.client.exec = async (name: string, command: string[], options: any) => {
-            if (command.length === 1 && command[0] === '/usr/bin/true' && ++probes === 1)
+            if (command.length === 3 && command[0] === 'timeout' && command[2] === '/usr/bin/true' && ++probes === 1)
                 throw Object.assign(Error('Guest agent not ready'), { statusCode: 503 });
             return execute(name, command, options);
         };
