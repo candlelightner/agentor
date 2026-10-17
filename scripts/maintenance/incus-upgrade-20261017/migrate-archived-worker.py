@@ -217,7 +217,10 @@ class Migration:
             headers['Content-Type'] = 'application/json'
         redirects = 0
         while True:
-            connection = http.client.HTTPConnection('127.0.0.1', 3000, timeout=1800)
+            # A same-owner migration can hold the lifecycle queue while large
+            # archives copy/restore. Keep the observer alive through that wait;
+            # server-side operation deadlines and no-retry receipts still apply.
+            connection = http.client.HTTPConnection('127.0.0.1', 3000, timeout=7200)
             try:
                 connection.request(method, path, body=payload, headers=headers)
                 response = connection.getresponse()
