@@ -55,6 +55,25 @@ test('saves draft settings and uses the selected provider when backing up immedi
   await expect.poll(()=>saved?.providerId).toBe('google-drive');
   await expect.poll(()=>started?.providerId).toBe('google-drive');
 });
+test('waits for canonical settings and workspace names before enabling draft edits', async ({ page }) => {
+  let releaseNames!: () => void;
+  const namesReady = new Promise<void>(resolve => { releaseNames = resolve; });
+  await page.route('**/api/containers', async route => {
+    await namesReady;
+    await route.fulfill({ json: [{ id: 'worker-1', userId: 'test-user', displayName: 'Alpha', status: 'running' }] });
+  });
+  const m = await open(page);
+  try {
+    await expect(m.getByLabel('Provider')).toBeDisabled();
+    await expect(m.getByRole('button', { name: 'Save schedule' })).toBeDisabled();
+    releaseNames();
+    await expect(m.getByLabel('Provider')).toBeEnabled();
+    await m.getByLabel('Provider').selectOption('google-drive');
+    const saving = page.waitForRequest(request => request.url().endsWith('/api/backup-settings') && request.method() === 'PUT');
+    await m.getByRole('button', { name: 'Save schedule' }).click();
+    expect((await saving).postDataJSON().providerId).toBe('google-drive');
+  } finally { releaseNames(); }
+});
 test('removes an unavailable archived selection while retaining independent path and schedule settings', async ({ page }) => {
   let stored: any = { providerId: 'fake', enabled: false, selection: 'selected', workspaceIds: ['archived-old', 'worker-1'],
     selectedPathsByWorkspace: { 'archived-old': ['/opt/retained'], 'worker-1': ['/workspace'] },
@@ -90,7 +109,7 @@ test('selects files and any browsed directory including root from a picker roote
   await picker.getByRole('button', { name: 'Done' }).click();
   await expect(m).toContainText('2 additional');
 });
-test('warns precisely which retained and detached data can change when persistence is deselected', async ({ page }) => {
+test('warns that removing backup coverage preserves persistent volumes and attachments', async ({ page }) => {
   const m = await open(page);
   await m.getByLabel('Selected workspaces').check();
   await selectWorkspace(page,m,'worker-1',/Alpha worker.*worker-1/i);
@@ -111,10 +130,8 @@ test('warns precisely which retained and detached data can change when persisten
   let warning = '';
   page.once('dialog', async dialog => { warning = dialog.message(); await dialog.accept(); });
   await saveButton.click();
-  await expect.poll(() => warning).toContain('No persisted data is deleted now');
-  expect(warning).toContain('changes made there are lost by another rebuild');
-  expect(warning).toContain('current same-named files overwrite their older persisted versions');
-  expect(warning).toContain('other old and new files are kept');
+  await expect.poll(() => warning).toContain('Existing local persistent volumes and their attachments are unchanged');
+  expect(warning).toContain('Manage local persistence separately in Worker Settings');
 });
 test('restores safely into a new or lock-protected original worker without retaining its password',async({page})=>{
   const lockPassword='UI_BACKUP_LOCK_DO_NOT_RENDER';let restoreBody:any;

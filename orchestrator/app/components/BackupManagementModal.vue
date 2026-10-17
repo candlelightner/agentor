@@ -14,6 +14,7 @@ const api = useBackups(),
     intervalMinutes: 1440,
     retentionCount: 7,
   });
+const settingsLoading = ref(false);
 const busy = ref(""),
   restoreItem = ref<any>(null),
   restoreTarget = ref<"new" | "original">("new"),
@@ -44,14 +45,17 @@ function clonePathSelections(value: Record<string, string[]> | undefined) {
 }
 watch(open, async (shown) => {
   if (shown) {
-    await api.refresh();
-    await refreshWorkspaceNames();
-    Object.assign(draft, {
-      ...api.settings.value,
-      workspaceIds: [...api.settings.value.workspaceIds],
-      selectedPathsByWorkspace: clonePathSelections(api.settings.value.selectedPathsByWorkspace),
-    });
-    savedNotice.value = "";
+    settingsLoading.value = true;
+    try {
+      await api.refresh();
+      await refreshWorkspaceNames();
+      Object.assign(draft, {
+        ...api.settings.value,
+        workspaceIds: [...api.settings.value.workspaceIds],
+        selectedPathsByWorkspace: clonePathSelections(api.settings.value.selectedPathsByWorkspace),
+      });
+      savedNotice.value = "";
+    } finally { settingsLoading.value = false; }
   } else {
     api.stop();
     restoreLockPassword.value = "";
@@ -544,7 +548,8 @@ watch(restoreTarget, (target) => {
         >
           {{ api.error.value || actionError }}
         </p>
-        <section class="border rounded-md p-4 space-y-3">
+        <fieldset :disabled="settingsLoading" :aria-busy="settingsLoading" class="border rounded-md p-4 space-y-3">
+          <p v-if="settingsLoading" class="text-xs text-gray-500" role="status">Loading backup settings…</p>
           <div class="flex justify-between">
             <h3 class="font-medium">Provider and schedule</h3>
             <span data-testid="next-backup"
@@ -706,7 +711,7 @@ watch(restoreTarget, (target) => {
               >Back up now</UButton
             >
           </div>
-        </section>
+        </fieldset>
         <BackupPathPickerModal v-if="pickerWorkspaceId" :open="Boolean(pickerWorkspaceId)" v-model:paths="draft.selectedPathsByWorkspace[pickerWorkspaceId]" :worker-id="pickerWorkspaceId" @update:open="shown => { if (!shown) pickerWorkspaceId = '' }" />
         <section class="border rounded-md p-4 space-y-3" data-testid="backup-recovery-keys">
           <div>
