@@ -154,6 +154,7 @@ class CheckerTests(unittest.TestCase):
             "-i workers -o br-control -s 10.25.0.0/24 -d 172.25.0.2 -p tcp --dport 3000",
             "-i workers -o eth0 -s 10.25.0.0/24",
             "-i eth0 -o workers -d 10.25.0.0/24 -m conntrack --ctstate ESTABLISHED,RELATED",
+            "-i workers -o workers -s 10.25.0.0/24 -d 10.25.0.0/24",
         ): rows.append("-A " + chain + " " + rule + " " + comment + " -j ACCEPT")
         rows.append("-A " + chain + " " + comment + " -j RETURN")
         return installation, rows
@@ -174,17 +175,18 @@ class CheckerTests(unittest.TestCase):
                                       ipaddress.IPv4Network("10.25.0.0/24"), "172.25.0.2", installation)
         return calls
 
-    def test_owned_forwarding_six_checks_are_read_only_and_leave_unrelated_rules_alone(self):
+    def test_owned_forwarding_seven_checks_are_read_only_with_docker_default_drop(self):
         _, rows = self.forwarding_rows()
-        rows += ["-A DOCKER-USER -s 192.168.10.0/24 -j RETURN", "-N FOREIGN", "-A FOREIGN -j DROP"]
+        rows += ["-P FORWARD DROP", "-A DOCKER-USER -s 192.168.10.0/24 -j RETURN", "-N FOREIGN", "-A FOREIGN -j DROP"]
         calls = self.check_forwarding(rows)
-        self.assertEqual(len(calls), 8); self.assertTrue(all(call[0] == "ip" or call[2] in ("-S", "-C") for call in calls))
+        self.assertEqual(len(calls), 9); self.assertTrue(all(call[0] == "ip" or call[2] in ("-S", "-C") for call in calls))
         tcp = calls[4]; self.assertIn("--dport", tcp); self.assertEqual(tcp[tcp.index("--dport") + 1], "3000")
         self.assertEqual(tcp[tcp.index("-d") + 1], "172.25.0.2")
 
     def test_missing_extra_foreign_or_broadened_owned_forwarding_fails_closed(self):
         _, baseline = self.forwarding_rows()
-        for case in ("missing", "extra", "foreign", "wrong-ip", "broadened", "wrong-uplink", "wrong-return"):
+        for case in ("missing", "extra", "foreign", "wrong-ip", "broadened", "wrong-uplink", "wrong-return",
+                     "missing-peer", "peer-source", "peer-destination", "peer-input", "peer-output"):
             with self.subTest(case=case):
                 rows = list(baseline)
                 if case == "missing": rows.pop()
@@ -194,6 +196,11 @@ class CheckerTests(unittest.TestCase):
                 if case == "broadened": rows[5] = rows[5].replace(" --dport 3000", "")
                 if case == "wrong-uplink": rows[6] = rows[6].replace("eth0", "eth1")
                 if case == "wrong-return": rows[-1] = rows[-1].replace("RETURN", "ACCEPT")
+                if case == "missing-peer": rows.pop(-2)
+                if case == "peer-source": rows[-2] = rows[-2].replace("-s 10.25.0.0/24", "-s 0.0.0.0/0")
+                if case == "peer-destination": rows[-2] = rows[-2].replace("-d 10.25.0.0/24", "-d 0.0.0.0/0")
+                if case == "peer-input": rows[-2] = rows[-2].replace("-i workers", "-i br-control")
+                if case == "peer-output": rows[-2] = rows[-2].replace("-o workers", "-o eth0")
                 with self.assertRaises((ValueError, subprocess.CalledProcessError)): self.check_forwarding(rows)
 
     def test_owned_jump_must_be_unique_first_and_have_exact_installation_authority(self):

@@ -432,10 +432,15 @@ class InstallerTests(unittest.TestCase):
 
     def test_route_rules_are_directional_and_source_identity_is_port_specific(self):
         rules = SETUP.route_rules("workers", "br-control", "172.25.0.0/24", "10.25.0.0/24", "172.25.0.2", "eth0", "owned")
-        self.assertEqual(len(rules), 6)
+        self.assertEqual(len(rules), 7)
         self.assertIn("--ctstate", rules[1]); self.assertIn("--ctstate", rules[4])
         self.assertEqual(rules[2][rules[2].index("--dport") + 1], "3000")
         self.assertEqual(rules[2][rules[2].index("-d") + 1], "172.25.0.2")
+        peer = rules[-2]
+        self.assertEqual(peer[peer.index("-i") + 1], "workers")
+        self.assertEqual(peer[peer.index("-o") + 1], "workers")
+        self.assertEqual(peer[peer.index("-s") + 1], "10.25.0.0/24")
+        self.assertEqual(peer[peer.index("-d") + 1], "10.25.0.0/24")
         self.assertTrue(all("-m" in rule and "--comment" in rule for rule in rules))
         self.assertEqual(rules[-1][-1], "RETURN")
 

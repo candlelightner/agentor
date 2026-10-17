@@ -191,7 +191,7 @@ def forwarding_policy(network, bridge, docker_subnet, primary, address, installa
     observed = [shlex.split(line) for line in command("iptables", "-w", "-S").splitlines() if line]
     require(["-N", "DOCKER-USER"] in observed and ["-N", chain] in observed, "Setup-owned forwarding chain is missing")
     owned = [row for row in observed if row[:2] == ["-A", chain]]
-    require(len(owned) == 6 and all(row.count("--comment") == 1 and row.index("--comment") + 1 < len(row)
+    require(len(owned) == 7 and all(row.count("--comment") == 1 and row.index("--comment") + 1 < len(row)
                                   and row[row.index("--comment") + 1] == marker for row in owned), "Owned forwarding rows changed or are foreign")
     require(owned[-1] == ["-A", chain, "-m", "comment", "--comment", marker, "-j", "RETURN"],
             "Owned forwarding RETURN must be final so its required grants are reachable")
@@ -201,13 +201,14 @@ def forwarding_policy(network, bridge, docker_subnet, primary, address, installa
     require(references == [jump] and docker_rows and docker_rows[0] == jump, "Exact first owned DOCKER-USER jump is missing or ambiguous")
     comment = ["-m", "comment", "--comment", marker]
     # Native -C is read-only and normalizes the same argv as the installer;
-    # matching all six plus the exact row count denies extra/broadened grants.
+    # Matching all seven plus the exact row count denies extra/broadened grants.
     rules = [
         ["-i", bridge, "-o", network, "-s", str(docker_subnet), "-d", str(primary), *comment, "-j", "ACCEPT"],
         ["-i", network, "-o", bridge, "-s", str(primary), "-d", str(docker_subnet), "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", *comment, "-j", "ACCEPT"],
         ["-i", network, "-o", bridge, "-s", str(primary), "-d", address, "-p", "tcp", "--dport", "3000", *comment, "-j", "ACCEPT"],
         ["-i", network, "-o", uplink, "-s", str(primary), *comment, "-j", "ACCEPT"],
         ["-i", uplink, "-o", network, "-d", str(primary), "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", *comment, "-j", "ACCEPT"],
+        ["-i", network, "-o", network, "-s", str(primary), "-d", str(primary), *comment, "-j", "ACCEPT"],
         [*comment, "-j", "RETURN"],
     ]
     for rule in rules: command("iptables", "-w", "-C", chain, *rule)
@@ -317,7 +318,7 @@ def main():
         if topology is not None:
             bridge, docker_subnet, address = topology
             check("setup-owned directional forwarding", lambda: forwarding_policy(args.network, bridge, docker_subnet, interface.network, address, args.installation_id),
-                  "Run the installed owned routing refresh or correct its six narrow rows/first DOCKER-USER jump and unique default uplink; never substitute blanket ACCEPT rules.")
+                  "Run the installed owned routing refresh or correct its seven narrow rows/first DOCKER-USER jump and unique default uplink; never substitute blanket ACCEPT rules.")
         else:
             unknown.append("forwarding"); print("UNKNOWN forwarding: valid configured source-preserving topology is required before forwarding can be verified.")
     if failures or unknown:

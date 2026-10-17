@@ -302,6 +302,10 @@ def route_rules(network, bridge, docker_subnet, primary, address, uplink, marker
         ["-i", network, "-o", bridge, "-s", str(primary), "-d", address, "-p", "tcp", "--dport", "3000", *comment, "-j", "ACCEPT"],
         ["-i", network, "-o", uplink, "-s", str(primary), *comment, "-j", "ACCEPT"],
         ["-i", uplink, "-o", network, "-d", str(primary), "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", *comment, "-j", "ACCEPT"],
+        # br_netfilter also sends same-bridge VM traffic through Docker's
+        # FORWARD policy. Keep valid primary peers reachable with NIC source
+        # filtering still enforced by Incus at the bridge ingress.
+        ["-i", network, "-o", network, "-s", str(primary), "-d", str(primary), *comment, "-j", "ACCEPT"],
         [*comment, "-j", "RETURN"],
     ]
 

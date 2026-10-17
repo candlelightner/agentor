@@ -90,6 +90,12 @@ Incus access is verified HTTPS with restricted-project mTLS. Do not mount
 Docker privileges remain inside the VM; host access requires an explicit grant
 or exploitation of the Incus/QEMU/KVM/host boundary.
 
+With bridge netfilter enabled, Docker's `FORWARD DROP` policy also applies to
+VM traffic within the primary bridge. Setup includes an owned forwarding rule
+limited to that bridge in both directions and its source/destination subnet.
+Incus NIC source filtering remains enabled; the deployed canary checks valid
+peer traffic and rejected spoofed traffic before migration.
+
 ## Explicit migration
 
 For failed control-plane connectivity or ambiguous interrupted operations, see
