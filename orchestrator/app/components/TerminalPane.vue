@@ -22,10 +22,14 @@ const {
 } = useTmuxTabs(containerIdRef);
 
 // Map of window index -> terminal instance + element ref
-const terminals = new Map<
+const terminals = shallowReactive(new Map<
   number,
   { instance: ReturnType<typeof useTerminal>; el: HTMLElement | null }
->();
+>());
+
+const activeCopyTerminal = computed(() => activeWindowIndex.value == null ? undefined : terminals.get(activeWindowIndex.value)?.instance);
+const copyRequest = computed(() => activeCopyTerminal.value?.copyRequest.value);
+const copyMessage = computed(() => activeCopyTerminal.value?.copyMessage.value);
 
 // Template refs for terminal containers
 const terminalRefs = new Map<number, HTMLElement>();
@@ -218,6 +222,24 @@ onUnmounted(() => {
         >
       </label>
       <span v-if="paneMutationError" role="alert" class="text-xs text-red-300">{{ paneMutationError }}</span>
+    </div>
+
+    <div v-if="copyRequest || copyMessage" class="border-b border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100">
+      <div class="flex items-center gap-3" role="status">
+        <span class="flex-1">{{ copyRequest ? 'The terminal requested to copy a response.' : copyMessage }}</span>
+        <button v-if="copyRequest" class="rounded bg-blue-700 px-3 py-1" @click="activeCopyTerminal?.copyTerminalRequest()">Copy response</button>
+        <button class="rounded px-2 py-1" aria-label="Dismiss terminal copy" @click="activeCopyTerminal?.dismissCopyRequest()">Dismiss</button>
+      </div>
+      <template v-if="copyRequest?.error">
+        <p role="alert" class="mt-2 text-amber-200">{{ copyRequest.error }}</p>
+        <textarea
+          readonly
+          aria-label="Terminal response to copy"
+          class="mt-2 max-h-48 w-full rounded bg-black p-2 font-mono text-xs"
+          :value="copyRequest.text"
+          @focus="($event.target as HTMLTextAreaElement).select()"
+        />
+      </template>
     </div>
 
     <div ref="terminalsContainer" class="relative flex-1 min-h-0">

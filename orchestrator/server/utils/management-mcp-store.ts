@@ -1018,6 +1018,10 @@ export class ManagementMcpStore {
           ),
           { statusCode: 423, code: "INSTANCE_SNAPSHOT_ACTIVE" },
         );
+      // Installation logs are never delegated, even if group tool patterns
+      // or the general logs policy are expanded in a future release.
+      if (name === "logs.server-read" && identity.scope !== "platform")
+        throw Object.assign(new Error("Platform administrator required"), { statusCode: 403 });
       if (identity.scope === "group" && name === "workers.create") {
         // A group principal never selects an owner or group. Both are derived
         // from its live workload identity, closing owner-wide confused-deputy

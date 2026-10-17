@@ -821,6 +821,12 @@ An optional, additive **Workspace Files** popup (`WorkspaceFilesModal.vue`) open
 
 ---
 
+## 20a. Terminal response copy
+
+- Agent CLI clipboard-output requests prompt an explicit **Copy response** action; long/multiline UTF-8 text is preserved up to 1 MiB, with selectable-text fallback for blocked/unavailable clipboard APIs.
+- Typed slash commands remain transparent to the CLI. Pending text clears on dismissal, disconnect, and disposal; clipboard queries are ignored and no host clipboard read is sent to a worker.
+- Legacy Docker and Incus tmux attachments enable application clipboard forwarding idempotently. Installed Codex 0.163.0 `/copy` is verified through its own Whole response picker, real isolated tmux/WebSocket, actual TerminalPane/xterm, and browser clipboard, with a synthetic local provider and private home. A temporary Xvfb run proves successful native copying also forwards to the browser; other CLI versions remain unverified.
+
 ## 20b. Keyboard-transparent Clipboard Paste Bridge
 
 A keyboard-transparent Ctrl/Cmd+V bridge lets the host browser clipboard reach GUI apps (and the agent CLI) inside a worker without the user leaving the keyboard. It works in the **Agentor Terminal** (xterm.js) and in the **noVNC Desktop** / **Persistent VS Code** viewer.
@@ -967,6 +973,8 @@ See §20b for the bridge. The endpoint sets the worker's X11 CLIPBOARD selection
 - Filters are applied both server-side (so paginated fetches only return matching entries) and client-side (so live WebSocket entries are gated immediately). Changing filters refetches the most recent matching page from scratch.
 
 ### 23.6 Actions
+- Platform-admin server-log JSONL download applies level/search filters to retained server history (up to 1000 entries / 256 KiB); empty, denied, failed, and partial downloads have explicit feedback. REST supports time bounds and opaque continuation cursors; actual saved bytes preserve multiline/Unicode messages and redact credentials.
+- Global administrative management MCP exposes `logs.server-read` with bounded level/search/time filtering and paging; group administrators and ordinary workers are denied even when the logs policy is enabled.
 - Clear button: clears all log files (with confirmation dialog)
 - Status bar: green/red connection dot + "Connected"/"Disconnected" text + entry count
 

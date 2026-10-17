@@ -146,3 +146,34 @@ The LogCollector integrates with all container lifecycle events in `ContainerMan
 - **unarchive**: attach after new container starts
 
 TraefikManager also calls `attach()`/`detach()` when creating/removing the Traefik container.
+
+## Server diagnostics and downloads
+
+The platform administrative workspace discovers `logs.server-read` in management
+MCP. The `logs` policy group must be enabled; group administrators and ordinary
+worker identities cannot discover or invoke this installation-wide operation.
+It accepts `levels` (an array), `search`, inclusive `since`, exclusive `until`,
+`limit` (1–1000, default 200), and an opaque `cursor`. Responses include timestamp,
+level and message entries, `hasMore`, `nextCursor`, byte/entry caps and truncation
+metadata. Keep the same filters when following `nextCursor`. Managed server
+environment credentials and recognizable credential-bearing diagnostics are
+redacted; source paths, arbitrary containers and commands are not accepted.
+
+The Log pane's **Download server logs** action saves the newest matching
+orchestrator entries as UTF-8 JSONL, applying the current level and search filters
+independently of the source display toggles. It exports up to 1000 entries and
+256 KiB; the UI reports empty results, transfer/access failures, and when more
+matching history exists. Multiline messages remain JSON strings without losing
+line breaks. This downloads retained server history rather than only the entries
+currently loaded in the pane.
+
+`GET /api/logs/download` is session-authenticated and platform-admin-only. It
+accepts the same filters (`levels` is comma-separated; default limit 1000), sends
+an attachment filename and `application/x-ndjson; charset=utf-8`, and reports
+`X-Log-Entries`, `X-Log-Has-More`, `X-Log-Truncated`, and, when available,
+`X-Log-Next-Cursor`. Pass that cursor to download the next page. Empty selections
+return 404, malformed filters 400, unauthorized callers 401/403, and unavailable
+storage 503. New records receive durable IDs so identical messages in the same
+millisecond can be paged separately. Legacy records without IDs use content-based
+ordering; indistinguishable legacy duplicates at a page boundary cannot be
+separated reliably. Retention/rotation can remove older history between pages.
