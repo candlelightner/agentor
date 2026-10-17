@@ -1,6 +1,6 @@
 {
   "objective": "Autonomously finish the Agentor VM-branch upgrade and migration of every safely eligible ordinary worker, verifying workspace, agent/editor state, managed volumes, native Docker data, preserved custom tools and intended stopped/archived state. Keep the verified encrypted backup fd9ff548-9a79-4b7c-979c-7906f0a0cf10, recovery keys, original Docker sources and rollback images. In parallel, have appropriately chosen sub-agents address as many remaining GitHub code issues as realistic in urgency/impact order, especially safe GPU/USB passthrough, backup correctness/performance and operational diagnostics. Require coherent committed and pushed branches, accurate supported-capability reporting and appropriate validation. After migration and sub-agent work finish, consolidate and review locally, merge only validated agent changes into feature/incus-vm-workers, run combined checks, and create a PR onto main if those checks pass. Report unresolved image, hardware and acceptance limitations honestly; do not delete the backup or prematurely finalize original data.",
-  "state": "combined authorized objective recorded; migration tracker active, follow-on tracker creation queued because the goal tool cannot edit an unfinished objective",
+  "state": "active combined goal in Codex tracker; production migration and isolated agent fixes in progress",
   "priority": [
     {
       "issues": [
@@ -49,5 +49,21 @@
     "Never pass through mounted host storage, especially the JMicron controller/disks containing recovery artifacts and VM SSD",
     "Keep GPU/USB and administrative workers on Docker until separately supported and verified",
     "No backup/source finalization or deletion"
-  ]
+  ],
+  "lastVerifiedProductionWorker": {
+    "id": "6eea5aa9-2d0d-454a-a91b-21b35d5b84fc",
+    "name": "Logik - UE",
+    "runtime": "incus-vm",
+    "state": "stopped",
+    "guestKernel": "7.0.0-38-generic",
+    "checks": [
+      "restored Codex 0.162.1",
+      "extra packages",
+      "PDF compilation",
+      "shared-volume execution",
+      "shared host mount",
+      "editor and desktop proxies",
+      "retained original Docker source"
+    ]
+  }
 }
