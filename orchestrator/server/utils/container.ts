@@ -6806,13 +6806,23 @@ for p in sys.argv[1:]:
     });
   }
 
+  private canReconcileOrdinaryWorker(worker: Pick<WorkerRecord, 'id' | 'userId'>): boolean {
+    try {
+      return !isAdministrativeWorkspaceId(worker.id, worker.userId);
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode !== 503) throw error;
+      useLogger().warn(`[container] reconciliation deferred for ${worker.id}: administrative identity authority is unavailable`);
+      return false;
+    }
+  }
+
   async reconcileWorkers(): Promise<void> {
     if (!this.workerStore) return;
     await this.reconcileIncusWorkers();
 
     const activeContainerNames = new Set<string>();
     for (const [, info] of this.containers) {
-      if (isAdministrativeWorkspaceId(info.id, info.userId)) continue;
+      if (!this.canReconcileOrdinaryWorker(info)) continue;
       activeContainerNames.add(info.containerName);
       // Incus runtime inventory has no config authority. It must not overwrite
       // pending local edits or bounded recreation recovery metadata.
@@ -6827,7 +6837,7 @@ for p in sys.argv[1:]:
     const missingDesiredWorkers: WorkerRecord[] = [];
     const { useManagedVolumeManager: storageManager } = await import("./managed-volume-manager");
     for (const worker of this.workerStore.listActive()) {
-      if (isAdministrativeWorkspaceId(worker.id, worker.userId)) continue;
+      if (!this.canReconcileOrdinaryWorker(worker)) continue;
       // Never feed missing Incus compute through Docker recovery.
       if (worker.runtimeKind === "incus-vm") continue;
       if (worker.incusMigration) continue;
@@ -6859,7 +6869,7 @@ for p in sys.argv[1:]:
     // intent and is therefore never auto-unarchived.
     for (const worker of this.workerStore.listArchived())
       if (
-        !isAdministrativeWorkspaceId(worker.id, worker.userId) &&
+        this.canReconcileOrdinaryWorker(worker) &&
         worker.runtimeKind !== "incus-vm" &&
         !worker.incusMigration &&
         !storageManager().isRecoveryBlocked(worker.id) &&
@@ -6873,7 +6883,7 @@ for p in sys.argv[1:]:
     // available. Each worker is isolated so one damaged task cannot prevent
     // every other worker from recovering.
     for (const info of [...this.containers.values()]) {
-      if (info.administrativeKind || isAdministrativeWorkspaceId(info.id, info.userId)) continue;
+      if (info.administrativeKind || !this.canReconcileOrdinaryWorker(info)) continue;
       if (info.runtimeKind === "incus-vm") continue;
       if (this.workerStore.get(info.userId, info.id)?.incusMigration) continue;
       if (storageManager().isRecoveryBlocked(info.id)) {
@@ -6950,7 +6960,7 @@ for p in sys.argv[1:]:
     // Both archived and active records can retain a marker after a lost create
     // or metadata response. Roll back before ordinary desired-state recovery.
     for (const snapshot of [...(this.workerStore?.listActive() ?? []), ...(this.workerStore?.listArchived() ?? [])]) {
-      if (isAdministrativeWorkspaceId(snapshot.id, snapshot.userId) || snapshot.runtimeKind !== 'incus-vm' || snapshot.deletionPending || !snapshot.incusRecreation) continue;
+      if (!this.canReconcileOrdinaryWorker(snapshot) || snapshot.runtimeKind !== 'incus-vm' || snapshot.deletionPending || !snapshot.incusRecreation) continue;
       try {
         await withOwnerWorkerLifecycleMutation(snapshot.userId, snapshot.id, async () => {
           await this.incusRuntime.assertWorkspaceReplacementSettled({ ...snapshot,
@@ -6979,7 +6989,7 @@ for p in sys.argv[1:]:
       }
     }
     for (const snapshot of this.workerStore?.listActive() ?? []) {
-      if (isAdministrativeWorkspaceId(snapshot.id, snapshot.userId) || snapshot.runtimeKind !== 'incus-vm' || snapshot.deletionPending || snapshot.incusRecreation) continue;
+      if (!this.canReconcileOrdinaryWorker(snapshot) || snapshot.runtimeKind !== 'incus-vm' || snapshot.deletionPending || snapshot.incusRecreation) continue;
       let observedHandle: string | undefined, observedGeneration: number | undefined;
       if (!this.get(snapshot.id)?.containerId.startsWith('incus:')) {
         try {

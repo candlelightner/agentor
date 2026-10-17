@@ -42,7 +42,7 @@ async function fixture() {
   let sideEffects = 0;
   const forbidden = new Proxy({}, { get() { return () => { sideEffects++; throw new Error('Unexpected compute/storage operation'); }; } });
   const manager = new ContainerManager(forbidden as any, { dataDir } as Config);
-  manager.setWorkerStore(store); (manager as any).storageManager = forbidden;
+  manager.setWorkerStore(store); (manager as any).storageManager = forbidden; (manager as any).incusRuntime = forbidden;
   (manager as any).assertOwnerExists = async () => {};
   const record = (id: string, displayName: string, userId = owner): WorkerRecord => ({
     id, userId, displayName, status: 'archived', runtimeKind: 'legacy-docker',
@@ -143,7 +143,7 @@ test('queued ordinary lifecycle rechecks an administrative identity assigned bef
     await ready;
     const stopped = f.manager.stop(id);
     const group = await useWorkerGroupStore().create(owner, 'Identity assigned while queued');
-    await useWorkerGroupStore().update(owner, group.id, { adminWorkspace: { id,
+    await useWorkerGroupStore().update(owner, group.id, { adminWorkspace: { schemaVersion: 1, id,
       kind: 'group-administrative', ownerId: owner, groupId: group.id } });
     const result = expect(stopped).rejects.toMatchObject(denied);
     release(); await blocker; await result;
@@ -219,4 +219,89 @@ test('legitimately absent platform authority remains unprovisioned until explici
     const created = await store.ensure(); expect(created.id).toBeTruthy();
     const fresh = new AdminWorkspaceStore(dir); await fresh.init(); expect(fresh.getRecord()?.id).toBe(created.id);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+
+for (const failure of ['schema', 'kind', 'id-type', 'empty-id', 'unsafe-id', 'owner', 'group', 'null'] as const)
+test(`malformed nested group identity ${failure} quarantines its owner and denies the historical ordinary shadow`, async () => {
+  const f = await fixture(), targetOwner = randomUUID(), id = randomUUID(), groupId = randomUUID();
+  const groups = useWorkerGroupStore(), directory = join(process.env.DATA_DIR!, 'users', targetOwner);
+  const path = join(directory, 'worker-groups.json');
+  const admin: Record<string, unknown> = { schemaVersion: 1, id, kind: 'group-administrative',
+    ownerId: targetOwner, groupId, trusted: true, status: 'stopped', createdAt: stamp, updatedAt: stamp };
+  if (failure === 'schema') admin.schemaVersion = 2;
+  if (failure === 'kind') admin.kind = 'administrative';
+  if (failure === 'id-type') admin.id = 123;
+  if (failure === 'empty-id') admin.id = '';
+  if (failure === 'unsafe-id') admin.id = '../unknown';
+  if (failure === 'owner') admin.ownerId = randomUUID();
+  if (failure === 'group') admin.groupId = randomUUID();
+  const bytes = JSON.stringify([{ id: groupId, userId: targetOwner, name: 'Stored group', workerIds: [],
+    adminWorkspace: failure === 'null' ? null : admin, createdAt: stamp, updatedAt: stamp }]);
+  try {
+    await mkdir(directory, { recursive: true }); await writeFile(path, bytes);
+    await f.store.upsert(f.record(id, 'Historical administrative shadow', targetOwner));
+    const before = await readFile(join(f.dataDir, 'users', targetOwner, 'workers.json'), 'utf8');
+    await expect(groups.loadUser(targetOwner)).rejects.toThrow('Invalid group administrative workspace identity');
+    expect(() => groups.listForUser(targetOwner)).toThrow('unavailable');
+    expect(() => isAdministrativeWorkspaceId(id, targetOwner)).toThrow('unavailable');
+    await expect(f.manager.unarchive(targetOwner, id)).rejects.toMatchObject({ statusCode: 503 });
+    await expect(f.manager.deleteArchived(targetOwner, id)).rejects.toMatchObject({ statusCode: 503 });
+    await expect(f.manager.migrateLegacyWorker(id, async () => {})).rejects.toMatchObject({ statusCode: 503 });
+    await expect(groups.update(targetOwner, groupId, { name: 'Must not rewrite partial data' })).rejects.toMatchObject({ statusCode: 503 });
+    expect(f.sideEffects()).toBe(0);
+    expect(await readFile(path, 'utf8')).toBe(bytes);
+    expect(await readFile(join(f.dataDir, 'users', targetOwner, 'workers.json'), 'utf8')).toBe(before);
+  } finally {
+    await rm(directory, { recursive: true, force: true }); await groups.loadUser(targetOwner);
+    await rm(f.dataDir, { recursive: true, force: true });
+  }
+});
+
+test('valid legacy group identity without services remains authoritative and rejects an invalid in-memory replacement', async () => {
+  const targetOwner = randomUUID(), groupId = randomUUID(), id = 'legacy-admin_' + randomUUID();
+  const groups = useWorkerGroupStore(), directory = join(process.env.DATA_DIR!, 'users', targetOwner);
+  const path = join(directory, 'worker-groups.json');
+  const admin = { schemaVersion: 1, id, kind: 'group-administrative', ownerId: targetOwner, groupId,
+    trusted: true, status: 'stopped', createdAt: stamp, updatedAt: stamp };
+  const bytes = JSON.stringify([{ id: groupId, userId: targetOwner, name: 'Legacy group', workerIds: [],
+    adminWorkspace: admin, createdAt: stamp, updatedAt: stamp }]);
+  try {
+    await mkdir(directory, { recursive: true }); await writeFile(path, bytes); await groups.loadUser(targetOwner);
+    expect(isAdministrativeWorkspaceId(id, targetOwner)).toBe(true);
+    expect(groups.get(targetOwner, groupId)?.adminWorkspace).not.toHaveProperty('services');
+    await expect(groups.update(targetOwner, groupId, { adminWorkspace: { ...admin, id: '' } }))
+      .rejects.toThrow('Invalid group administrative workspace identity');
+    expect(isAdministrativeWorkspaceId(id, targetOwner)).toBe(true);
+    expect(await readFile(path, 'utf8')).toBe(bytes);
+  } finally { await rm(directory, { recursive: true, force: true }); await groups.loadUser(targetOwner); }
+});
+
+test('startup reconciliation preserves quarantined owners while processing healthy ordinary workers', async () => {
+  const f = await fixture(), targetOwner = randomUUID(), healthyOwner = randomUUID();
+  const groups = useWorkerGroupStore(), directory = join(process.env.DATA_DIR!, 'users', targetOwner);
+  const path = join(directory, 'worker-groups.json'), damaged = '{invalid';
+  const blockedLegacy = randomUUID(), blockedNative = randomUUID(), healthy = randomUUID();
+  try {
+    await mkdir(directory, { recursive: true }); await writeFile(path, damaged);
+    await groups.init();
+    expect(() => groups.listForUser(targetOwner)).toThrow('unavailable');
+    for (const [id, runtimeKind] of [[blockedLegacy, 'legacy-docker'], [blockedNative, 'incus-vm']] as const)
+      await f.store.upsert({ ...f.record(id, 'Quarantined worker', targetOwner), status: 'active', runtimeKind,
+        desiredRuntimeStatus: 'stopped' });
+    await f.store.upsert({ ...f.record(healthy, 'Healthy missing stopped worker', healthyOwner), status: 'active',
+      desiredRuntimeStatus: 'stopped' });
+    const before = await readFile(join(f.dataDir, 'users', targetOwner, 'workers.json'), 'utf8');
+    await expect(f.manager.reconcileWorkers()).resolves.toBeUndefined();
+    expect(f.store.get(healthyOwner, healthy)).toMatchObject({ status: 'archived', desiredRuntimeStatus: 'stopped' });
+    expect(f.store.get(targetOwner, blockedLegacy)?.status).toBe('active');
+    expect(f.store.get(targetOwner, blockedNative)?.status).toBe('active');
+    expect(await readFile(join(f.dataDir, 'users', targetOwner, 'workers.json'), 'utf8')).toBe(before);
+    expect(await readFile(path, 'utf8')).toBe(damaged);
+    expect(f.sideEffects()).toBe(0);
+    await expect(f.manager.unarchive(targetOwner, blockedLegacy)).rejects.toMatchObject({ statusCode: 503 });
+  } finally {
+    await rm(directory, { recursive: true, force: true }); await groups.loadUser(targetOwner);
+    await rm(f.dataDir, { recursive: true, force: true });
+  }
 });
