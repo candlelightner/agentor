@@ -207,12 +207,33 @@ clipboard forwarding for xterm clients, preserving existing terminal features
 and avoiding duplicate capability entries across reconnects. This takes effect
 on the next terminal attachment without changing running agent processes.
 
-This resolves the browser's missing standard clipboard-output path. It does
-not prove every CLI's `/copy` chooses that path: native VM/X11 clipboard writes
-alone do not reach the host browser. The [upstream Codex clipboard backend](https://github.com/openai/codex/blob/main/codex-rs/tui/src/clipboard_copy.rs)
-currently tries native copying and multiplexer/terminal forwarding independently,
-but the version and behavior of an existing worker can differ. CLI-specific
-`/copy` reproduction remains required for issue #7. Tests use the actual
-TerminalPane/useTerminal/xterm path and a simulated remote CLI, plus real tmux
-on a private temporary socket; no production conversation or credentials are
-used.
+The installed Codex CLI 0.163.0 has now been exercised with a synthetic local
+Responses provider and a private HOME/CODEX_HOME. Its `/copy` command opens a
+**Copy to clipboard** picker; select **Whole response**, then click Agentor's
+**Copy response** prompt. The acceptance test drives the actual CLI through
+isolated tmux, a real WebSocket, TerminalPane/useTerminal/xterm, and Chromium.
+It verifies exact browser clipboard bytes for a long multiline UTF-8 response.
+A separate run with a temporary Xvfb display also verifies the native X11
+clipboard contains the same bytes while terminal forwarding still succeeds.
+No account authentication, real model request or production worker is involved.
+Other CLI versions still require their own acceptance check.
+
+The normal diagnostics suite retains deterministic malformed/oversized/query and
+permission-denied fallback coverage. The real CLI case is opt-in: supply an
+application-only Codex binary as `AGENTOR_CODEX_COPY_BINARY` and run the test in a
+fresh network namespace containing only loopback. The Python fixture refuses
+ambient networking, creates its own home/config/workspace and tmux server, and
+uses an unauthenticated provider bound to 127.0.0.1. For example, from `tests/`
+after dependency installation and `npm run typecheck` in `orchestrator/`:
+
+```sh
+sudo unshare --net -- sh -ec 'ip link set lo up; exec env -u DATA_DIR AGENTOR_CODEX_COPY_BINARY=/path/to/application/codex npx playwright test --config=playwright.diagnostics.config.ts ui/terminal-copy-isolated.spec.ts --grep "real installed" --workers=1'
+```
+
+Native clipboard verification is optional: set `AGENTOR_COPY_FIXTURE_DISPLAY` to
+an independently created test Xvfb display and `AGENTOR_COPY_FIXTURE_XCLIP` to its
+xclip binary. `AGENTOR_COPY_FIXTURE_X11_LIBS` can supply a private library directory.
+Use a disposable test display, never an existing desktop clipboard. Chromium and
+its system libraries must already be available. See the official
+[Codex copy command](https://learn.chatgpt.com/docs/developer-commands?surface=cli)
+and [custom provider configuration](https://learn.chatgpt.com/docs/config-file/config-advanced).

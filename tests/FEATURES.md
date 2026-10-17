@@ -822,7 +822,7 @@ An optional, additive **Workspace Files** popup (`WorkspaceFilesModal.vue`) open
 
 - Agent CLI clipboard-output requests prompt an explicit **Copy response** action; long/multiline UTF-8 text is preserved up to 1 MiB, with selectable-text fallback for blocked/unavailable clipboard APIs.
 - Typed slash commands remain transparent to the CLI. Pending text clears on dismissal, disconnect, and disposal; clipboard queries are ignored and no host clipboard read is sent to a worker.
-- Legacy Docker and Incus tmux attachments enable application clipboard forwarding idempotently. A CLI that only writes its native VM clipboard still needs separate CLI-specific diagnosis; issue #7 remains partially addressed pending a real CLI reproduction.
+- Legacy Docker and Incus tmux attachments enable application clipboard forwarding idempotently. Installed Codex 0.163.0 `/copy` is verified through its own Whole response picker, real isolated tmux/WebSocket, actual TerminalPane/xterm, and browser clipboard, with a synthetic local provider and private home. A temporary Xvfb run proves successful native copying also forwards to the browser; other CLI versions remain unverified.
 
 ## 20b. Keyboard-transparent Clipboard Paste Bridge
 
