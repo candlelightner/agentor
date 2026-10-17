@@ -40,7 +40,7 @@ async function fixture(run: (fixture: any) => Promise<void>) {
     created_at: '2026-01-01T00:00:00Z', config: { 'volatile.uuid': randomUUID(), size: '5GiB' },
     used_by: ['/1.0/instances/original-worker?project=agentor'], bytes: 'persisted Docker bytes' };
   const control = { failure: '', terminal: 'Success', operationMissing: false, capture: undefined as any,
-    source: undefined as any, acceptedPersistenceFailure: false, cancelledAfterCreate: false,
+    source: undefined as any, cancelledAfterCreate: false,
     cancelledAfterCopy: false };
   const receipt = async () => {
     const names = (await readdir(directory)).filter(name => name.endsWith('.json'));
@@ -52,7 +52,6 @@ async function fixture(run: (fixture: any) => Promise<void>) {
     expect((await receipt()).pending).toEqual({ kind });
     action();
     if (control.failure === `unknown-${kind}`) throw new Error('lost acknowledgement');
-    if (control.acceptedPersistenceFailure) await chmod(directory, 0o500);
     await accepted('/1.0/operations/' + randomUUID());
     expect((await receipt()).pending.kind).toBe(kind);
     if (control.failure === `pending-${kind}`) throw new Error('wait timed out');
@@ -428,11 +427,20 @@ test('foreign UUID, image, profiles, raw config or writable devices prohibit cap
 });
 
 test('accepted receipt persistence failure keeps unknown authority instead of cleanup', async () => {
-  await fixture(async ({ invoke, control, receipt, calls }) => {
-    control.acceptedPersistenceFailure = true;
-    await expect(invoke()).rejects.toThrow('acknowledgement is unknown');
-    expect((await receipt()).pending).toEqual({ kind: 'create' });
-    expect(calls.some((item: any) => item[0] === 'start' || item[0] === 'delete')).toBe(false);
+  await fixture(async ({ invoke, receipt, calls }) => {
+    const original = fsPromises.rename;
+    // Inject the write failure itself: chmod cannot deny a root-run fixture.
+    fsPromises.rename = (async (...args: Parameters<typeof original>) => {
+      if (String(args[1]).endsWith('.json') && (await receipt())?.pending?.kind === 'create')
+        throw Object.assign(new Error('receipt write denied'), { code: 'EACCES' });
+      return original(...args);
+    }) as typeof original;
+    syncBuiltinESMExports();
+    try {
+      await expect(invoke()).rejects.toThrow('acknowledgement is unknown');
+      expect((await receipt()).pending).toEqual({ kind: 'create' });
+      expect(calls.some((item: any) => item[0] === 'start' || item[0] === 'delete')).toBe(false);
+    } finally { fsPromises.rename = original; syncBuiltinESMExports(); }
   });
 });
 

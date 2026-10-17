@@ -21,9 +21,9 @@ test('standalone native helper adapter imports isolated locked dependencies with
     const result = JSON.parse(stdout.trim());
     expect(result.externalPackages).toEqual(['dockerode', 'h3', 'tar-stream', 'ws']);
     expect(result.dependencyFiles).toBeGreaterThan(0); expect(result.dependencyFiles).toBeLessThan(2000);
-    // The shared catalog/converter leaf adds ~178KiB, not a second store or
-    // application bootstrap. Keep a bounded budget and exact graph checks.
-    expect(result.bundleBytes).toBeLessThan(800_000);
+    // Catalog, memory and hardware policy share the standalone adapter; bound
+    // their combined size while retaining the exact dependency graph checks.
+    expect(result.bundleBytes).toBeLessThan(850_000);
     expect(result.bundledInputs).toContain('server/utils/incus-worker-runtime.ts');
     expect(result.bundledInputs).toContain('server/utils/worker-config-store-core.ts');
     expect(result.bundledInputs).toContain('server/utils/image-catalog-core.ts');

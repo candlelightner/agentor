@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 import { spawnSync } from 'node:child_process';
 import { chmod, link, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, unlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { INCUS_SELECTED_ALIASES, INCUS_SELECTED_ARCHIVE_SCRIPT, nativeSelectedBackupPath } from '../../orchestrator/server/utils/incus-selected-archive';
 import { validateIncusSelectedRestoreArchive } from '../../orchestrator/server/utils/portable-managed-volume-archive';
@@ -12,12 +12,14 @@ async function fixture(run: (f: {
   root: string; source: string; mountinfo: string;
   execute: (selected?: string, proof?: unknown, aliases?: Record<string, string>) => ReturnType<typeof spawnSync>;
 }) => Promise<void>) {
+  expect(userInfo().uid, 'Run this root/agent permission fixture as an unprivileged sudo-capable user').not.toBe(0);
   const root = await mkdtemp(join(tmpdir(), 'agentor-selected-guest-'));
   const source = join(root, 'selected'), mountinfo = join(root, 'mountinfo');
   await mkdir(source); await writeFile(mountinfo, '1 0 8:1 / / rw - ext4 fixture rw\n');
   const execute = (selected = source, proof: unknown = { mounts: ['/'], credentials: false }, aliases: Record<string, string> = {}) => {
     // Fixed test-local literals only, never production path overrides or real account directories.
     const script = INCUS_SELECTED_ARCHIVE_SCRIPT
+      .replace("'-u','agent'", "'-u'," + JSON.stringify(userInfo().username))
       .replace('ALIASES=' + JSON.stringify(INCUS_SELECTED_ALIASES), 'ALIASES=' + JSON.stringify(aliases))
       .replace("open('/proc/self/mountinfo','rb')", 'open(' + JSON.stringify(mountinfo) + ",'rb')");
     expect(script).not.toBe(INCUS_SELECTED_ARCHIVE_SCRIPT);

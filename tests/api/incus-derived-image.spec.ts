@@ -201,7 +201,7 @@ test('root image context uses explicit source rules and late known-secret exclus
     'instance-restore-helper.mjs', 'volume-mount-helper.py', 'incus-volume-live-helper.py'].map(name => '!orchestrator/' + name),
     '!orchestrator/app/', '!orchestrator/app/**', '!orchestrator/server/', '!orchestrator/server/**',
     '!orchestrator/shared/', '!orchestrator/shared/**', '!worker/', '!worker/vm/', '!worker/vm/**',
-    '!worker/entrypoint.sh', '!scripts/', '!scripts/build-incus-worker-image.sh']);
+    '!worker/entrypoint.sh', '!scripts/', '!scripts/build-incus-worker-image.sh', '!scripts/incus-canary.mjs']);
   // Docker ignore has no knowledge of Git tracking. These rules protect the
   // named secret/data categories, not arbitrary untracked source-like files;
   // clean CI/scoped private build context remains a separate requirement.

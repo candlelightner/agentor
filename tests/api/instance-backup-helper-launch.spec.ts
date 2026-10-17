@@ -8,6 +8,13 @@ import { InstanceBackupStore } from '../../orchestrator/server/utils/instance-ba
 import type { InstanceBackupJob } from '../../orchestrator/server/utils/instance-backup-types';
 import { beginInstanceRestore, instanceSnapshotActive } from '../../orchestrator/server/utils/instance-snapshot-gate';
 
+test.beforeEach(() => { process.env.HOSTNAME = 'isolated-orchestrator-helper-fixture'; });
+const originalHostname = process.env.HOSTNAME;
+test.afterEach(() => {
+  if (originalHostname === undefined) delete process.env.HOSTNAME;
+  else process.env.HOSTNAME = originalHostname;
+});
+
 async function fixture(mode: 'success' | 'running-error' | 'never-started' = 'success') {
   const dataDir = await mkdtemp(join(tmpdir(), 'agentor-helper-launch-')), id = randomUUID();
   const stage = join(dataDir, 'instance-restore-staging', 'restore-' + id);
