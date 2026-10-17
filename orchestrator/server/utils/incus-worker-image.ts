@@ -36,3 +36,12 @@ export function sameIncusImageSource(a: Omit<IncusWorkerImageIdentity, 'version'
   return a.sourceImageId === b.sourceImageId && a.recipeId === b.recipeId && a.architecture === b.architecture &&
     a.converterVersion === b.converterVersion && a.bootstrapGeneration === b.bootstrapGeneration;
 }
+
+/** Explicit rebuild may refresh the VM recipe while retaining the same OCI
+ * base and supported bootstrap/converter contract. Recovery uses the full
+ * immutable source comparison above instead. */
+export function sameIncusImageBase(a: Omit<IncusWorkerImageIdentity, 'version' | 'fingerprint'>,
+  b: Omit<IncusWorkerImageIdentity, 'version' | 'fingerprint'>): boolean {
+  return a.sourceImageId === b.sourceImageId && a.architecture === b.architecture &&
+    a.converterVersion === b.converterVersion && a.bootstrapGeneration === b.bootstrapGeneration;
+}

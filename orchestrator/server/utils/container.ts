@@ -4921,7 +4921,9 @@ for p in sys.argv[1:]:
       if (!originalIncarnation) throw new Error('Incus rebuild requires a captured original incarnation');
       await this.incusRuntime.prepareArchive(info, originalIncarnation);
     }
-    const existing = await this.incusRuntime.preflightRecreation(options, applied && options.dockerEnabled);
+    // Only explicit Rebuild selects the current bootstrap. Storage-only
+    // recreation and unarchive retain their captured immutable VM recipe.
+    const existing = await this.incusRuntime.preflightRecreation(options, applied && options.dockerEnabled, !!original && !applied);
     if (applied && !original) await assertMissing();
     const marker = { nonce: randomUUID(), originalIncarnation,
       replacementIncarnation: undefined as string | undefined };

@@ -306,6 +306,10 @@ async function recreationFixture(run: (manager: ContainerManager, store: WorkerS
 
 test('Incus rebuild preflights before original removal and captures replacement UUID before start', async () => {
   await recreationFixture(async (manager, store, calls, info) => {
+    const runtime = (manager as any).incusRuntime, preflight = runtime.preflightRecreation;
+    runtime.preflightRecreation = async (options: any, dockerRequired: boolean, refreshBootstrap: boolean) => {
+      expect(refreshBootstrap).toBe(true); return preflight(options, dockerRequired);
+    };
     const replacement = await manager.rebuild(info.id);
     expect(calls).toEqual(['persistence-preflight', 'source-preflight', 'preflight', 'remove-original-uuid', 'create', 'start', 'applied', 'plugins']);
     expect(replacement).toMatchObject({ containerId: 'incus:replacement-uuid', status: 'running', pendingRebuild: false });
@@ -319,6 +323,10 @@ test('Incus managed-storage application uses applied bootstrap and never promote
     (manager as any).incusOptionsForWorker = async (_info: any, applied: boolean) => {
       expect(applied).toBe(true);
       return { id: info.id, userId: info.userId, containerName: info.containerName };
+    };
+    const runtime = (manager as any).incusRuntime, preflight = runtime.preflightRecreation;
+    runtime.preflightRecreation = async (options: any, dockerRequired: boolean, refreshBootstrap: boolean) => {
+      expect(refreshBootstrap).toBe(false); return preflight(options, dockerRequired);
     };
     await manager.applyManagedStorageUnlocked(info.id);
     expect(calls).not.toContain('applied');

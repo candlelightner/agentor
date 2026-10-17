@@ -1,6 +1,6 @@
 import type { Config } from "./config";
 import type { IncusClient, IncusCustomVolume, IncusDevice } from "./incus-client";
-import { validateIncusImageIdentity, sameIncusImageSource, type IncusWorkerImageIdentity } from './incus-worker-image';
+import { validateIncusImageIdentity, sameIncusImageSource, sameIncusImageBase, type IncusWorkerImageIdentity } from './incus-worker-image';
 import { isDeepStrictEqual } from 'node:util';
 
 type Role = "workspace" | "agents" | "docker";
@@ -318,13 +318,17 @@ export class IncusWorkerStorage {
     catch { throw new Error('Incus worker image metadata is invalid; explicit recovery is required'); }
   }
 
-  async recordImageIdentity(owner: IncusStorageOwner, identity: IncusWorkerImageIdentity): Promise<void> {
+  async recordImageIdentity(owner: IncusStorageOwner, identity: IncusWorkerImageIdentity,
+    expectedPrevious?: IncusWorkerImageIdentity): Promise<void> {
     const normalized = validateIncusImageIdentity(identity);
     const workspace = await this.find(owner, 'workspace');
     if (!workspace) throw new Error('Existing Incus workspace volume is missing; explicit recovery is required');
     this.validate(workspace, owner, 'workspace');
     const previous = await this.imageIdentity(owner);
-    if (previous && !sameIncusImageSource(previous, normalized))
+    if (expectedPrevious && (!previous || !isDeepStrictEqual(previous, validateIncusImageIdentity(expectedPrevious))))
+      throw new Error('Incus rebuild image source changed after preflight');
+    if (previous && !sameIncusImageSource(previous, normalized) &&
+        !(expectedPrevious && sameIncusImageBase(previous, normalized)))
       throw new Error('Incus reconstruction image source changed; explicit image selection is required');
     const serialized = JSON.stringify(normalized);
     if (workspace.config['user.agentor.image-source'] !== serialized)

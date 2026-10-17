@@ -12,7 +12,7 @@ import type { ContainerStatus } from "../../shared/types";
 import { IncusWorkerCommands } from "./incus-worker-commands";
 import { withOwnerWorkerRuntimeSetup } from "./worker-lifecycle-coordinator";
 import type { WorkerConfigRevision } from './worker-config-store';
-import { incusImageIdentity, sameIncusImageSource, type IncusWorkerImageIdentity } from './incus-worker-image';
+import { incusImageIdentity, sameIncusImageSource, sameIncusImageBase, type IncusWorkerImageIdentity } from './incus-worker-image';
 import { IncusManagedVolumeRuntime, incusManagedRestoreDevices } from './incus-managed-volume-runtime';
 import { pathsOverlap, type StoredManagedVolume } from './managed-volume-store';
 import { incusManagedNetworkAuthority, incusManagedBridgeIdentity, incusManagedNetworkDevice,
@@ -144,6 +144,13 @@ case "$result" in
  *) exit 70;;
 esac
 `;
+
+/** Backend-only acknowledgement captured before an explicit rebuild removes compute. */
+export interface IncusRecreationPreflight {
+  fingerprint: string;
+  docker: boolean;
+  bootstrapRefresh?: { previous: IncusWorkerImageIdentity; selected: IncusWorkerImageIdentity };
+}
 
 /** Ordinary worker VM lifecycle. Incus credentials stay in the control plane;
  * guest configuration crosses only the agent file API after each boot. */
@@ -1044,18 +1051,22 @@ export class IncusWorkerRuntime {
     if (project.config.restricted !== "true") throw new Error("Agentor Incus project must be restricted");
   }
 
-  async preflightRecreation(opts: IncusWorkerOptions, dockerRequired = false): Promise<{ fingerprint: string; docker: boolean }> {
+  async preflightRecreation(opts: IncusWorkerOptions, dockerRequired = false, refreshBootstrap = false): Promise<IncusRecreationPreflight> {
     await this.assertWorkspaceReplacementSettled(opts);
     await this.assertReady();
     this.validateOptions(opts);
     const storage = await this.storage();
     const source = await storage.imageIdentity(opts);
     if (!source) throw new Error('Incus worker image source is missing; preserve the original source before compute removal');
-    const selected = await this.authorizedImage(opts, source);
-    const fingerprint = selected?.fingerprint ?? await this.resolveStoredImage(source);
+    const selected = await this.authorizedImage(opts, refreshBootstrap ? undefined : source);
+    const fingerprint = selected?.fingerprint ?? (refreshBootstrap ? await this.resolveImage() : await this.resolveStoredImage(source));
+    const refreshed = refreshBootstrap ? incusImageIdentity(await this.client.getImage(fingerprint)) : undefined;
+    if (refreshed && !sameIncusImageBase(source, refreshed))
+      throw new Error('Explicit rebuild must retain the worker immutable OCI base');
     await this.accountDevices(opts);
     await incusHostMountLayout(this.config, opts, 'reconstruct-preflight');
-    return { fingerprint, ...await storage.verifyExisting(opts, dockerRequired) };
+    return { fingerprint, ...await storage.verifyExisting(opts, dockerRequired),
+      ...(refreshed ? { bootstrapRefresh: { previous: source, selected: refreshed } } : {}) };
   }
 
   private async resolveStoredImage(source: IncusWorkerImageIdentity): Promise<string> {
@@ -1171,7 +1182,7 @@ export class IncusWorkerRuntime {
     return fingerprint;
   }
 
-  async create(opts: IncusWorkerOptions, existing?: { fingerprint: string; docker: boolean }): Promise<IncusInstance> {
+  async create(opts: IncusWorkerOptions, existing?: IncusRecreationPreflight): Promise<IncusInstance> {
     return this.createWorker(opts, existing);
   }
 
@@ -1262,7 +1273,7 @@ export class IncusWorkerRuntime {
     return { fingerprint, source: verifiedSource };
   }
 
-  private async createWorker(opts: IncusWorkerOptions, existing?: { fingerprint: string; docker: boolean },
+  private async createWorker(opts: IncusWorkerOptions, existing?: IncusRecreationPreflight,
     restore?: { fingerprint?: string; source?: WorkerBackupRuntimeSource; dockerData?: boolean;
       detachedManagedVolumes?: StoredManagedVolume[] }): Promise<IncusInstance> {
     await this.assertReady();
@@ -1274,13 +1285,21 @@ export class IncusWorkerRuntime {
     const storage = await this.storage();
     if (restore) await this.assertAbsentCompute(opts);
     const source = restore ? undefined : await storage.imageIdentity(opts);
-    const selected = restore ? undefined : await this.authorizedImage(opts, source);
+    const refresh = !restore && existing?.bootstrapRefresh;
+    if (refresh && (!source || !isDeepStrictEqual(source, refresh.previous)))
+      throw new Error('Incus rebuild image source changed after preflight');
+    const selected = restore ? undefined : await this.authorizedImage(opts, refresh ? undefined : source);
     const fingerprint = restore ? await this.resolveImage(restore.fingerprint) : selected ? await this.resolveImage(selected.fingerprint)
+      : refresh ? await this.resolveImage()
       : existing ? await this.resolveImage(existing.fingerprint)
       : source ? await this.resolveStoredImage(source) : await this.resolveImage();
     const identity = incusImageIdentity(await this.client.getImage(fingerprint));
     if (selected && !isDeepStrictEqual(identity, selected)) throw new Error('Private custom image binding changed before allocation');
-    if (source && !sameIncusImageSource(source, identity)) throw new Error('Incus reconstruction image source changed');
+    if (refresh && (fingerprint !== existing!.fingerprint || !isDeepStrictEqual(identity, refresh.selected) ||
+        !sameIncusImageBase(refresh.previous, identity)))
+      throw new Error('Incus rebuild bootstrap changed after preflight');
+    if (source && !sameIncusImageSource(source, identity) && !(refresh && sameIncusImageBase(source, identity)))
+      throw new Error('Incus reconstruction image source changed');
     if (restore?.source && !sameIncusImageSource(restore.source, identity))
       throw new Error('Incus restore immutable image source changed before allocation');
     const account = restore ? {} : await this.accountDevices(opts, true);
@@ -1288,7 +1307,7 @@ export class IncusWorkerRuntime {
     const hostMounts = restore ? undefined : await incusHostMountLayout(this.config, opts, 'ensure');
     const persistent = restore ? await storage.freshRestoreDevices(opts, restore.dockerData ? opts.recreationNonce : undefined)
       : await storage.devices(opts, opts.environmentJson.dockerEnabled, existing && { docker: existing.docker });
-    await storage.recordImageIdentity(opts, identity);
+    await storage.recordImageIdentity(opts, identity, refresh ? refresh.previous : undefined);
     if (restore) for (const volume of opts.managedVolumes ?? [])
       await new IncusManagedVolumeRuntime(this.config, this).freshRestoreVolume(volume);
     if (restore) for (const volume of restore.detachedManagedVolumes ?? [])

@@ -143,3 +143,11 @@ root binary does not detect this problem. Rebuild the derived VM image and
 redeploy the matching Orchestrator bootstrap, default-image alias and converter
 seed together; preserve the previous image/configuration for rollback. Changing
 the worker VM kernel does not require changing the host kernel.
+
+Explicit Rebuild selects the current VM bootstrap recipe while requiring the
+same immutable worker OCI base, architecture and bootstrap/converter contract.
+The control plane captures the previous storage identity and selected native
+image before removing compute, and rechecks both before allocation and metadata
+publication. Archive/unarchive, storage-only recreation and recovery retain the
+captured recipe. This lets a deliberate Rebuild apply a kernel/bootstrap fix
+without silently changing the worker software or canonical volumes.

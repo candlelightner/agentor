@@ -230,6 +230,66 @@ test('custom source mismatch fails before allocation or replacement and never do
   // Read-only readiness is allowed; no default-image lookup or mutation.
 });
 
+test('explicit rebuild refreshes only the VM recipe for default and custom bases while ordinary recovery remains pinned', async () => {
+  for (const custom of [false, true]) {
+    const fake = fakeClient(), runtime = new IncusWorkerRuntime(config, fake.client as any);
+    const oldRaw = await fake.client.getImage('a'.repeat(64));
+    const nextRaw = { ...oldRaw, fingerprint: 'd'.repeat(64), properties: { ...oldRaw.properties, recipe_id: 'e'.repeat(64) } };
+    const old = incusImageIdentity(oldRaw), next = incusImageIdentity(nextRaw);
+    let current = old;
+    const opts = { ...options(), ...(custom ? { image: old.sourceImageId } : {}) };
+    if (custom) runtime.setImageResolver(async (_opts, stored) => stored ?? current);
+    await runtime.create({ ...opts, start: false });
+    fake.events.length = 0;
+    fake.client.getImage = async (fingerprint: string) => fingerprint === next.fingerprint ? nextRaw : oldRaw;
+    fake.client.getImageAlias = async () => {
+      if (custom) throw new Error('Custom image must never use mutable default');
+      return { target: next.fingerprint, type: 'virtual-machine' };
+    };
+    current = next;
+    expect(await runtime.preflightRecreation(opts)).toMatchObject({ fingerprint: old.fingerprint });
+    const preflight = await runtime.preflightRecreation(opts, false, true);
+    expect(preflight).toMatchObject({ fingerprint: next.fingerprint, bootstrapRefresh: { previous: old, selected: next } });
+    expect(fake.events.some(event => ['create', 'volume-create', 'volume-update', 'remove'].includes(event.operation))).toBe(false);
+    await runtime.create({ ...opts, start: false }, preflight);
+    expect(fake.events.find(event => event.operation === 'create')!.args[0].source.fingerprint).toBe(next.fingerprint);
+    const storage = new IncusWorkerStorage(fake.client as any, config, await backupInstallationId(config.dataDir));
+    expect(await storage.imageIdentity(opts)).toEqual(next);
+    expect(fake.events.some(event => event.operation === 'volume-create')).toBe(false);
+  }
+});
+
+test('explicit bootstrap refresh rejects another OCI base before mutation and rechecks the exact selected image before allocation', async () => {
+  const fake = fakeClient(), runtime = new IncusWorkerRuntime(config, fake.client as any), opts = options();
+  const oldRaw = await fake.client.getImage('a'.repeat(64));
+  const nextRaw = { ...oldRaw, fingerprint: 'd'.repeat(64), properties: { ...oldRaw.properties, recipe_id: 'e'.repeat(64) } };
+  await runtime.create({ ...opts, start: false }); fake.events.length = 0;
+  fake.client.getImageAlias = async () => ({ target: nextRaw.fingerprint, type: 'virtual-machine' });
+  fake.client.getImage = async (fingerprint: string) => fingerprint === nextRaw.fingerprint ? nextRaw : oldRaw;
+  nextRaw.properties.source_image_id = 'sha256:' + 'f'.repeat(64);
+  await expect(runtime.preflightRecreation(opts, false, true)).rejects.toThrow('immutable OCI base');
+  nextRaw.properties.source_image_id = oldRaw.properties.source_image_id;
+  const preflight = await runtime.preflightRecreation(opts, false, true);
+  nextRaw.properties.recipe_id = 'f'.repeat(64);
+  await expect(runtime.create({ ...opts, start: false }, preflight)).rejects.toThrow('bootstrap changed after preflight');
+  expect(fake.events.some(event => ['create', 'volume-create', 'volume-update', 'remove'].includes(event.operation))).toBe(false);
+});
+
+test('bootstrap refresh requires an unchanged previous storage identity and never permits an implicit recipe or OCI replacement', async () => {
+  const fake = fakeClient(), runtime = new IncusWorkerRuntime(config, fake.client as any), opts = options();
+  const old = incusImageIdentity(await fake.client.getImage('a'.repeat(64)));
+  const next = { ...old, fingerprint: 'd'.repeat(64), recipeId: 'e'.repeat(64) };
+  await runtime.create({ ...opts, start: false }); fake.events.length = 0;
+  const storage = new IncusWorkerStorage(fake.client as any, config, await backupInstallationId(config.dataDir));
+  await expect(storage.recordImageIdentity(opts, next)).rejects.toThrow('explicit image selection');
+  await expect(storage.recordImageIdentity(opts, { ...next, sourceImageId: 'sha256:' + 'f'.repeat(64) }, old)).rejects.toThrow('explicit image selection');
+  await expect(storage.recordImageIdentity(opts, next, { ...old, fingerprint: 'f'.repeat(64) })).rejects.toThrow('changed after preflight');
+  expect(fake.events.some(event => event.operation === 'volume-update')).toBe(false);
+  await storage.recordImageIdentity(opts, next, old);
+  expect(await storage.imageIdentity(opts)).toEqual(next);
+  await expect(storage.recordImageIdentity(opts, old, old)).rejects.toThrow('changed after preflight');
+});
+
 test('production image callback rechecks durable tuple, lifecycle nonce and group hierarchy after asynchronous authorization', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agentor-image-wiring-'));
   const cfg = { ...config, dataDir: root, incusConverterSeedFingerprint: 'd'.repeat(64) };
