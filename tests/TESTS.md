@@ -449,3 +449,5 @@ for f in api/*.spec.ts ui/*.spec.ts; do
   echo "$f: $count"
 done
 ```
+
+Hardware catalog compatibility adds two module regressions (five store cases total): exact historical USB newline-padding resolution with unchanged catalog/grants, no serial substitution, duplicate approval prevention and normalized-alias quarantine. The affected hardware/store suite has 16 passing cases; physical USB/GPU and full API/UI acceptance remain pending.

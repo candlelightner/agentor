@@ -33,6 +33,17 @@ function validateCandidate(input: HardwareDeviceCandidate) {
   return input;
 }
 
+/** Old shell discovery converted each sysfs newline to one trailing space. */
+export function hardwareDeviceSelector(device: Pick<HardwareDevice, 'kind' | 'selector' | 'vendor' | 'product' | 'serial'>): string {
+  if (device.kind !== 'usb' || !/^[0-9a-f]{4} $/.test(device.vendor ?? '') ||
+      !/^[0-9a-f]{4} $/.test(device.product ?? '')) return device.selector;
+  const identity = device.serial || device.selector.split(':').slice(3).join(':');
+  if (device.selector !== `usb:${device.vendor}:${device.product}:${identity}`) return device.selector;
+  if (device.serial && !/^[\x20-\x7e]{1,128} $/.test(device.serial)) return device.selector;
+  if (!device.serial && !/^port:[0-9]+-[0-9]+(?:\.[0-9]+)*$/.test(identity)) return device.selector;
+  return `usb:${device.vendor!.slice(0, -1)}:${device.product!.slice(0, -1)}:${device.serial ? identity.slice(0, -1) : identity}`;
+}
+
 /** Persistent platform device catalog plus owner-partitioned entitlements and assignments. */
 export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDeviceGrant> {
   private catalog = new Map<string, HardwareDevice>();
@@ -114,7 +125,7 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
       updatedAt: now,
     };
     await this.mutateCatalog((catalog) => {
-      if ([...catalog.values()].some((existing) => existing.selector === item.selector))
+      if ([...catalog.values()].some((existing) => hardwareDeviceSelector(existing) === hardwareDeviceSelector(item)))
         throw statusError(409, "This hardware device is already approved");
       catalog.set(item.id, item);
     });
@@ -307,7 +318,8 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
     this.authorizeDeviceIds(userId, workerId, authorized, directGroupId);
     return authorized.map((deviceId) => {
       const device = this.getDevice(deviceId)!;
-      const matches = candidates.filter((item) => item.selector === device.selector);
+      const selector = hardwareDeviceSelector(device);
+      const matches = candidates.filter((item) => item.selector === selector);
       if (matches.length > 1) throw statusError(409, `Hardware device "${device.name}" has an ambiguous identity`);
       const candidate = matches[0];
       if (!candidate)
@@ -529,7 +541,7 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
       for (const item of raw) {
         validatePersistedDevice(item);
         if (next.has(item.id)) throw new Error("Duplicate approved hardware device id");
-        if ([...next.values()].some((existing) => existing.selector === item.selector))
+        if ([...next.values()].some((existing) => hardwareDeviceSelector(existing) === hardwareDeviceSelector(item)))
           throw new Error("Duplicate approved hardware selector");
         next.set(item.id, structuredClone(item));
       }

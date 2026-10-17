@@ -1345,3 +1345,5 @@ The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/ap
 
 ### 29.5 Worker export/import exclusion
 - Worker export **strips** `.kilo/config`, `.kilo/shared-data`, and the legacy `.kilo/data/auth.json` from `agents.tar.gz` — an export never carries another user's tokens, provider keys, Kilo sessions/history, or account-level Kilo configuration. Per-worker Kilo state/cache and code-server user-data are retained.
+
+- Existing opaque USB grants survive the historical shell probe's newline-padding format. Exact legacy selectors resolve against current discovery without rewriting catalog or grants; altered serials, duplicate normalized catalog entries and duplicate discovered identities remain rejected. Storage/hub restrictions remain enforced.
