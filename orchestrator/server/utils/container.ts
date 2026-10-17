@@ -1913,7 +1913,7 @@ export class ContainerManager {
     if (!info) return undefined;
     if (info.administrativeKind) {
       if (info.runtimeKind !== 'incus-vm') {
-        try { this.legacyAdministrativeValidator(info)(); }
+        try { this.legacyAdministrativeValidator(info, false)(); }
         catch { return { ...info, status: 'unknown' }; }
       }
       return info;
@@ -1965,19 +1965,21 @@ export class ContainerManager {
     check(); return result;
   }
 
-  private legacyAdministrativeValidator(info: ContainerInfo): () => void {
+  private legacyAdministrativeValidator(info: ContainerInfo, running = true): () => void {
     const { id, userId, containerId, containerName, administrativeKind } = info;
     const generation = workerLifecycleGeneration(id);
     return () => {
       const current = this.containers.get(id);
       const record = administrativeKind === 'group' ? useGroupAdminWorkspaceStore().findByWorkspaceId(id)
         : useAdminWorkspaceStore().getRecord();
-      if (!record || record.id !== id || record.status !== 'running' || record.runtimeKind === 'incus-vm' || record.nativeRuntime ||
+      if (!record || record.id !== id || (running ? record.status !== 'running' : !['running', 'stopped'].includes(record.status)) ||
+          record.runtimeKind === 'incus-vm' || record.nativeRuntime ||
           record.nativeMigration && record.nativeMigration.phase !== 'retained' ||
           (record.kind === 'group-administrative' ? 'group' : 'platform') !== administrativeKind ||
           (record.kind === 'group-administrative' ? record.ownerId : record.ownerId ?? '__agentor_admin__') !== userId ||
           current?.containerId !== containerId || current.userId !== userId || current.containerName !== containerName ||
-          current.runtimeKind === 'incus-vm' || current.status !== 'running' || current.administrativeKind !== administrativeKind ||
+          current.runtimeKind === 'incus-vm' || (running ? current.status !== 'running' : current.status !== record.status) ||
+          current.administrativeKind !== administrativeKind ||
           workerLifecycleGeneration(id) !== generation || isWorkerLifecycleMutationPending(id))
         throw new Error('Administrative legacy runtime authority changed; explicit native recovery may be required');
     };

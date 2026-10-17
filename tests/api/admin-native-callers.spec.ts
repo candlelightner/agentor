@@ -198,6 +198,9 @@ test('native cutover immediately revokes a settled legacy admin projection, capt
     await store.withNativeRuntimeTransaction(async (_record, acknowledge) => acknowledge({runtimeKind:'legacy-docker'}));
     f.info.runtimeKind='legacy-docker'; f.info.containerId='e'.repeat(64); f.info.containerName='retained-admin';
     expect(f.cm.get(f.info.id)?.status).toBe('running');
+    await store.setStatus('stopped'); f.info.status='stopped';
+    expect(f.cm.get(f.info.id)?.status).toBe('stopped');
+    await store.setStatus('running'); f.info.status='running';
     const captured = f.cm.workerCommands(f.info.id), terminal = await f.cm.attachTerminal(f.info.id,0);
     expect((await captured.execCapture(f.info.containerId,['fixture'])).stdout.toString()).toBe('legacy');
     await store.withNativeRuntimeTransaction(async (_record, acknowledge) => acknowledge({runtimeKind:'incus-vm',nativeRuntime:identity}));
