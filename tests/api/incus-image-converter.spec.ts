@@ -76,7 +76,7 @@ async function fixture(run: (f: {
   };
   client.getInstance = async () => {
     events.push('inspect');
-    if (!instance) throw Object.assign(new Error('Missing'), { statusCode: 404 });
+    if (!instance) throw new IncusError('Missing', 404);
     if (failure === 'foreign-uuid') instance.config['volatile.uuid'] = randomUUID();
     return structuredClone(instance);
   };
@@ -295,4 +295,86 @@ test('SAME raw-only bootstrap script produces no guest QCOW/metadata authority a
     const raw = join(f.directory, 'incus-image-converters/incus-image-' + f.input.jobId + '/disk.raw');
     expect((await lstat(raw)).size).toBe(65536); expect((await lstat(raw)).mode & 0o777).toBe(0o600);
   });
+});
+
+function cleanupFixture(status = 'Stopped') {
+  const receipt: IncusImageConverterReceipt = { version: 1, name: 'aic-' + randomUUID(), installationId: randomUUID(),
+    ownerId: 'converter-owner', sourceImageId: sourceId, seedFingerprint: seed, project: 'agentor-images',
+    recipeId: 'c'.repeat(64), incarnation: randomUUID() };
+  const config = { dataDir: '/unused', incusStoragePool: 'images', incusNetwork: 'image-network' };
+  const events: string[] = [], receipts: IncusImageConverterReceipt[] = [];
+  let current: any = { name: receipt.name, type: 'virtual-machine', status, profiles: [],
+    config: { 'user.agentor.installation': receipt.installationId, 'user.agentor.owner': receipt.ownerId,
+      'user.agentor.helper': 'image-converter', 'user.agentor.operation': receipt.name.slice(4),
+      'user.agentor.source-image': sourceId, 'user.agentor.seed-image': seed, 'security.secureboot': 'false',
+      'boot.autostart': 'false', 'limits.cpu': '2', 'limits.memory': '4GiB', 'volatile.uuid': receipt.incarnation, 'volatile.base_image': seed },
+    devices: { root: { type: 'disk', path: '/', pool: 'images', size: '64GiB' },
+      eth0: { type: 'nic', name: 'eth0', network: 'image-network',
+        'security.mac_filtering': 'true', 'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' } } };
+  const client = new IncusClient({ endpoint: 'https://fixture.invalid', project: receipt.project });
+  client.getInstance = async name => { expect(name).toBe(receipt.name); events.push('inspect');
+    if (!current) throw new IncusError('Missing', 404); return structuredClone(current); };
+  client.stopInstance = async (name, _options, accepted) => { expect(name).toBe(receipt.name); events.push('stop');
+    expect(receipts.at(-1)?.pending).toEqual({ kind: 'stop' }); await accepted?.('/1.0/operations/' + randomUUID()); current.status = 'Stopped'; };
+  client.deleteInstance = async (name, accepted) => { expect(name).toBe(receipt.name); events.push('delete');
+    expect(receipts.at(-1)?.pending).toEqual({ kind: 'delete' }); await accepted?.('/1.0/operations/' + randomUUID()); current = undefined; };
+  const acknowledge = async (value: IncusImageConverterReceipt) => { receipts.push(structuredClone(value)); events.push('ack:' + (value.pending?.kind ?? (value.removed ? 'removed' : 'settled'))); };
+  return { receipt, config, client, events, receipts, acknowledge, get current() { return current; },
+    recover: (validate = async () => {}) => IncusImageConverter.cleanup(config, client, receipt, validate, acknowledge) };
+}
+
+for (const status of ['Stopped', 'Running']) test(`explicit converter recovery removes only the captured ${status} disposable VM`, async () => {
+  const f = cleanupFixture(status);
+  try { await f.recover(); expect(f.current).toBeUndefined(); expect(f.events.filter(value => value === 'stop')).toHaveLength(status === 'Running' ? 1 : 0);
+    expect(f.events.filter(value => value === 'delete')).toHaveLength(1); expect(f.receipts.at(-1)).toEqual({ ...f.receipt, removed: true });
+    expect(f.receipts.some(value => value.pending?.kind === 'delete' && value.pending.operation)).toBe(true);
+  } finally { f.client.dispose(); }
+});
+
+test('converter recovery refuses missing incarnation, pending and foreign identity before mutations', async () => {
+  for (const variant of ['incarnation', 'pending', 'removed', 'uuid', 'source', 'pool', 'profiles', 'raw', 'disk', 'expanded', 'status'] as const) {
+    const f = cleanupFixture();
+    try {
+      if (variant === 'incarnation') delete f.receipt.incarnation;
+      if (variant === 'pending') f.receipt.pending = { kind: 'delete', operation: '/1.0/operations/' + randomUUID() };
+      if (variant === 'removed') f.receipt.removed = true;
+      if (variant === 'uuid') f.current.config['volatile.uuid'] = randomUUID();
+      if (variant === 'source') f.current.config['user.agentor.source-image'] = 'sha256:' + 'd'.repeat(64);
+      if (variant === 'pool') f.current.devices.root.pool = 'foreign';
+      if (variant === 'profiles') f.current.profiles = ['default'];
+      if (variant === 'raw') f.current.config['raw.qemu'] = 'foreign';
+      if (variant === 'disk') f.current.devices.source = { type: 'disk', source: '/host' };
+      if (variant === 'expanded') f.current.expanded_devices = { ...f.current.devices, foreign: { type: 'nic', network: 'foreign' } };
+      if (variant === 'status') f.current.status = 'Starting';
+      await expect(f.recover()).rejects.toThrow(); expect(f.events).not.toContain('stop'); expect(f.events).not.toContain('delete'); expect(f.receipts).toEqual([]);
+    } finally { f.client.dispose(); }
+  }
+});
+
+test('converter recovery retains unknown accepted deletion and refuses replay even when VM disappeared', async () => {
+  const f = cleanupFixture();
+  try {
+    const original = f.client.deleteInstance.bind(f.client);
+    f.client.deleteInstance = async (...args) => { await original(...args); throw new IncusError('lost delete result'); };
+    await expect(f.recover()).rejects.toThrow('lost delete result');
+    const pending = f.receipts.at(-1)!; expect(pending.pending).toMatchObject({ kind: 'delete' }); expect(pending.removed).toBeUndefined();
+    f.events.length = 0;
+    await expect(IncusImageConverter.cleanup(f.config, f.client, pending, async () => {}, f.acknowledge)).rejects.toThrow('captured');
+    expect(f.events).toEqual([]);
+  } finally { f.client.dispose(); }
+});
+
+test('converter recovery acknowledges only typed settled absence and stops on authority or persistence failure', async () => {
+  for (const variant of ['typed-absence', 'lookalike-absence', 'authority', 'write'] as const) {
+    const f = cleanupFixture();
+    try {
+      if (variant.endsWith('absence')) f.client.getInstance = async () => { throw variant === 'typed-absence' ? new IncusError('Missing', 404) : Object.assign(Error('transport'), { statusCode: 404 }); };
+      const operation = IncusImageConverter.cleanup(f.config, f.client, f.receipt,
+        async () => { if (variant === 'authority') throw Error('authority changed'); },
+        async value => { if (variant === 'write') throw Error('disk full'); await f.acknowledge(value); });
+      if (variant === 'typed-absence') { await operation; expect(f.receipts.at(-1)?.removed).toBe(true); }
+      else await expect(operation).rejects.toThrow();
+      expect(f.events).not.toContain('stop'); expect(f.events).not.toContain('delete');
+    } finally { f.client.dispose(); }
+  }
 });

@@ -8,7 +8,7 @@ import { pipeline } from 'node:stream/promises';
 import { spawn } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import type { Config } from './config';
-import { IncusClient, IncusRequestRejected, type IncusInstance, type IncusInstanceCreateSpec } from './incus-client';
+import { IncusClient, IncusError, IncusRequestRejected, type IncusInstance, type IncusInstanceCreateSpec } from './incus-client';
 import { assertSafeUserId } from './user-id';
 
 /** Private acknowledgement in the EXISTING ImageBuild, never portable image
@@ -164,12 +164,88 @@ test "$(d2vm --version)" = 'd2vm version v0.4.0'
 install -d -m 0700 /root/agentor-convert/scripts /root/agentor-convert/worker/vm /root/agentor-convert/output
 `;
 
+type ConverterConfig = Pick<Config, 'dataDir' | 'incusStoragePool' | 'incusConverterStoragePool' | 'incusNetwork'>;
+function converterSpec(config: ConverterConfig, client: IncusClient, receipt: IncusImageConverterReceipt): IncusInstanceCreateSpec {
+  if (receipt.version !== 1 || !receipt.name.startsWith('aic-') || !UUID.test(receipt.name.slice(4)) ||
+      !UUID.test(receipt.installationId) || !HEX.test(receipt.seedFingerprint) || !HEX.test(receipt.recipeId) ||
+      !/^sha256:[a-f0-9]{64}$/.test(receipt.sourceImageId) || assertSafeUserId(receipt.ownerId).length > 128 ||
+      receipt.project !== client.project || client.project === 'default' || !config.incusStoragePool || !config.incusNetwork)
+    throw new Error('Converter recovery identity or project is invalid');
+  return { name: receipt.name, type: 'virtual-machine', profiles: [],
+      source: { type: 'image', fingerprint: receipt.seedFingerprint },
+      config: { 'user.agentor.installation': receipt.installationId, 'user.agentor.owner': receipt.ownerId,
+        'user.agentor.helper': 'image-converter', 'user.agentor.operation': receipt.name.slice(4),
+        'user.agentor.source-image': receipt.sourceImageId, 'user.agentor.seed-image': receipt.seedFingerprint,
+        'security.secureboot': 'false', 'boot.autostart': 'false', 'limits.cpu': '2', 'limits.memory': '4GiB' },
+      devices: { root: { type: 'disk', path: '/', pool: config.incusConverterStoragePool || config.incusStoragePool, size: '64GiB' },
+        eth0: { type: 'nic', name: 'eth0', network: config.incusNetwork,
+          'security.mac_filtering': 'true', 'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' } } };
+}
+async function inspectConverter(client: IncusClient, receipt: IncusImageConverterReceipt, spec: IncusInstanceCreateSpec) {
+  if (!UUID.test(receipt.incarnation ?? '')) throw new Error('Converter incarnation was not acknowledged; retain private job');
+  const instance = await client.getInstance(receipt.name);
+  const configMatches = (values: Record<string, string>) => Object.entries(spec.config!).every(([key, value]) => values[key] === value) &&
+    Object.keys(values).every(key => key in spec.config! || key.startsWith('image.') || key.startsWith('volatile.')) &&
+    values['volatile.uuid'] === receipt.incarnation && values['volatile.base_image'] === receipt.seedFingerprint;
+  if (instance.name !== receipt.name || instance.type !== 'virtual-machine' || instance.profiles.length ||
+      !isDeepStrictEqual(instance.devices, spec.devices) || !isDeepStrictEqual(instance.expanded_devices ?? instance.devices, spec.devices) ||
+      !configMatches(instance.config) || !configMatches(instance.expanded_config ?? instance.config))
+    throw new Error('Converter isolation/identity changed; retain private job');
+  return instance;
+}
+async function mutateConverter(current: () => IncusImageConverterReceipt,
+  persist: (value: IncusImageConverterReceipt) => Promise<void>, kind: NonNullable<IncusImageConverterReceipt['pending']>['kind'],
+  operation: (acknowledged: (path?: string) => Promise<void>) => Promise<unknown>) {
+  await persist({ ...current(), pending: { kind } });
+  try {
+    await operation(async path => {
+      if (path !== undefined && !/^\/1\.0\/operations\/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(path))
+        throw new Error('Converter operation acknowledgement is invalid');
+      await persist({ ...current(), pending: path ? { kind, operation: path } : { kind } });
+    });
+  } catch (error) {
+    if (error instanceof IncusRequestRejected && error.statusCode >= 400 && error.statusCode < 500 && error.errorCode === error.statusCode)
+      await persist({ ...current(), pending: undefined });
+    throw error;
+  }
+  await persist({ ...current(), pending: undefined });
+}
+
 /** One isolated disposable converter, not a worker and never a host command
  * executor. Guest-controlled output is only opaque bounded RAW; normalization,
  * metadata construction/import/publication remain trusted parent operations. */
 export class IncusImageConverter {
-  constructor(private config: Pick<Config, 'dataDir' | 'incusStoragePool' | 'incusConverterStoragePool' | 'incusNetwork'>,
+  constructor(private config: ConverterConfig,
     private client: IncusClient, private docker: Pick<Docker, 'getImage'>, private bootstrapDirectory: string) {}
+
+  /** Explicit cleanup never resumes unknown work or touches imported images,
+   * source OCI data, custom volumes or local conversion scratch. */
+  static async cleanup(config: ConverterConfig, client: IncusClient, input: Readonly<IncusImageConverterReceipt>,
+    validateAuthority: () => Promise<void>, acknowledge: (value: IncusImageConverterReceipt) => Promise<void>): Promise<void> {
+    let receipt = structuredClone(input);
+    if (!UUID.test(receipt.incarnation ?? '') || receipt.pending || receipt.removed)
+      throw Object.assign(new Error('Converter cleanup requires a captured incarnation without pending work'), { statusCode: 409 });
+    const spec = converterSpec(config, client, receipt);
+    const persist = async (value: IncusImageConverterReceipt) => { await acknowledge(structuredClone(value)); receipt = value; };
+    const check = async () => { await validateAuthority(); return inspectConverter(client, receipt, spec); };
+    let instance: IncusInstance;
+    try { instance = await check(); }
+    catch (error) {
+      // A settled receipt and typed absence may acknowledge already-removed
+      // compute; pending native operations are rejected before this read.
+      if (!(error instanceof IncusError) || error.statusCode !== 404) throw error;
+      await validateAuthority(); await persist({ ...receipt, removed: true }); return;
+    }
+    if (instance.status === 'Running') {
+      await mutateConverter(() => receipt, persist, 'stop', accepted => client.stopInstance(receipt.name, { force: true, timeout: 30 }, accepted));
+    }
+    if ((await check()).status !== 'Stopped') throw new Error('Converter shutdown is not confirmed');
+    await mutateConverter(() => receipt, persist, 'delete', accepted => client.deleteInstance(receipt.name, accepted));
+    await validateAuthority();
+    try { await client.getInstance(receipt.name); throw new Error('Converter removal is not confirmed'); }
+    catch (error) { if (!(error instanceof IncusError) || error.statusCode !== 404) throw error; }
+    await validateAuthority(); await persist({ ...receipt, removed: true });
+  }
 
   async convert(input: IncusImageConversionInput): Promise<IncusConvertedRaw> {
     const request = { ...input };
@@ -202,53 +278,15 @@ export class IncusImageConverter {
       installationId: request.installationId, ownerId: request.ownerId, sourceImageId: request.sourceImageId,
       seedFingerprint: request.seedFingerprint, project: this.client.project, recipeId };
     const persist = async (value: IncusImageConverterReceipt) => { receipt = value; await request.acknowledge(structuredClone(value)); };
-    const spec: IncusInstanceCreateSpec = { name: receipt.name, type: 'virtual-machine', profiles: [],
-      source: { type: 'image', fingerprint: request.seedFingerprint },
-      config: { 'user.agentor.installation': request.installationId, 'user.agentor.owner': request.ownerId,
-        'user.agentor.helper': 'image-converter', 'user.agentor.operation': request.jobId,
-        'user.agentor.source-image': request.sourceImageId, 'user.agentor.seed-image': request.seedFingerprint,
-        'security.secureboot': 'false', 'boot.autostart': 'false', 'limits.cpu': '2', 'limits.memory': '4GiB' },
-      devices: { root: { type: 'disk', path: '/', pool, size: '64GiB' },
-        eth0: { type: 'nic', name: 'eth0', network: this.config.incusNetwork,
-          'security.mac_filtering': 'true', 'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' } } };
-    const check = async (requireActive = true) => {
-      if (requireActive) await active();
-      if (!receipt.incarnation) throw new Error('Converter incarnation was not acknowledged; retain private job');
-      const instance = await this.client.getInstance(receipt.name);
-      const configMatches = (values: Record<string, string>) => Object.entries(spec.config!).every(([key, value]) => values[key] === value) &&
-        Object.keys(values).every(key => key in spec.config! || key.startsWith('image.') || key.startsWith('volatile.')) &&
-        values['volatile.uuid'] === receipt.incarnation && values['volatile.base_image'] === request.seedFingerprint;
-      if (instance.name !== receipt.name || instance.type !== 'virtual-machine' || instance.profiles.length ||
-          !isDeepStrictEqual(instance.devices, spec.devices) || !isDeepStrictEqual(instance.expanded_devices ?? instance.devices, spec.devices) ||
-          !configMatches(instance.config) || !configMatches(instance.expanded_config ?? instance.config))
-        throw new Error('Converter isolation/identity changed; retain private job');
-      return instance;
+    const spec = converterSpec(this.config, this.client, receipt);
+    const check = async () => {
+      await active();
+      return inspectConverter(this.client, receipt, spec);
     };
-    const submit = async (kind: NonNullable<IncusImageConverterReceipt['pending']>['kind'],
-      operation: (acknowledged: (path?: string) => Promise<void>) => Promise<unknown>) => {
-      await persist({ ...receipt, pending: { kind } });
-      try {
-        await operation(async path => {
-          if (path !== undefined && !/^\/1\.0\/operations\/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(path))
-            throw new Error('Converter operation acknowledgement is invalid');
-          await persist({ ...receipt, pending: path ? { kind, operation: path } : { kind } });
-        });
-      } catch (error) {
-        if (error instanceof IncusRequestRejected && error.statusCode >= 400 && error.statusCode < 500 && error.errorCode === error.statusCode)
-          await persist({ ...receipt, pending: undefined });
-        throw error;
-      }
-      await persist({ ...receipt, pending: undefined });
-    };
-    const removeConverter = async () => {
-      const current = await check(false);
-      if (current.status === 'Running') await submit('stop', accepted => this.client.stopInstance(receipt.name, { force: true, timeout: 30 }, accepted));
-      if ((await check(false)).status !== 'Stopped') throw new Error('Converter shutdown is not confirmed');
-      await submit('delete', accepted => this.client.deleteInstance(receipt.name, accepted));
-      try { await this.client.getInstance(receipt.name); throw new Error('Converter removal is not confirmed'); }
-      catch (error) { if ((error as { statusCode?: number }).statusCode !== 404) throw error; }
-      await persist({ ...receipt, removed: true });
-    };
+    const submit = (kind: NonNullable<IncusImageConverterReceipt['pending']>['kind'],
+      operation: (acknowledged: (path?: string) => Promise<void>) => Promise<unknown>) =>
+      mutateConverter(() => receipt, persist, kind, operation);
+    const removeConverter = () => IncusImageConverter.cleanup(this.config, this.client, receipt, async () => {}, persist);
     const execute = async (phase: 'agent-ready' | 'guest-tools' | 'guest-space' | 'OCI-load' | 'OCI-identity' | 'raw-convert', command: string[], stream?: NodeJS.ReadableStream) => {
       await check();
       const session = await this.client.execStream(receipt.name, command, { command: [], user: 0, group: 0,
