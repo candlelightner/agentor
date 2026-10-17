@@ -1361,3 +1361,6 @@ The default Playwright global setup rejects any enabled native DR gate before cr
 - A separate disposable-QEMU backup runner now plans both full API/UI suite selections with a fresh finite 80 GiB overlay, private cloud-init/SSH keys, loopback-only inbound SSH and guest-owned Docker. Execution requires explicit review/`--execute`; host DinD stays blocked. Plan/nonce/host/refusal/resource-bound tests pass, while VM boot and complete live suites remain unverified.
 
 Disposable VM launcher safety adds bounded QCOW2 header rejection before any QEMU tool (external data/backing/encryption) and SIGINT/SIGTERM/SIGHUP cleanup with child-handle capture, repeated-signal protection and confirmed-exit-before-unlink ordering. Three new pure/owned-temp regressions make 24 launcher cases total; subprocess signal cases run Python children with stub VM/tools only. Real VM boot/Docker suites remain unverified.
+
+
+Disposable backup VM console, readiness and suite host logs each retain at most 64 MiB plus one omission note. SSH output continues draining after the cap; retries share the readiness-log bound. Captured SSH children are killed/reaped on timeout or cancellation before the existing captured-QEMU cleanup. Full suite selections and live-acceptance requirements are unchanged.

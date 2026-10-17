@@ -164,6 +164,95 @@ class BackupVmLauncherTests(unittest.TestCase):
             self.assertLess(target.stat().st_size, 1200)
 
 
+    def test_log_append_preserves_one_cap_and_drains_every_readiness_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'bootstrap.log'
+            for index in range(3):
+                stream = io.BytesIO(b'x' * 10000)
+                runner.copy_log(stream, target, 1024, append=True)
+                self.assertEqual(stream.tell(), 10000)
+                if index == 0: first = target.read_bytes()
+                else: self.assertEqual(target.read_bytes(), first)
+            self.assertLess(target.stat().st_size, 1200)
+
+    def test_execute_caps_ssh_logs_and_reaps_ssh_on_timeout_or_spawn_cancellation(self):
+        import signal
+        import tarfile
+        real_popen, real_thread = subprocess.Popen, runner.threading.Thread
+        for outcome in ('overlimit', 'timeout', 'cancel', 'drain-timeout'):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                base, root = Path(directory)/'base.qcow2', Path(directory)/'run'
+                header = bytearray(104); header[:4] = b'QFI\xfb'
+                struct.pack_into('>I', header, 4, 3); struct.pack_into('>Q', header, 24, 1024*1024)
+                base.write_bytes(header)
+                proposed = runner.plan(root, base, hashlib.sha256(header).hexdigest(), 22941, NONCE)
+                children, events = [], []
+                class VM:
+                    stdout = io.BytesIO()
+                    stopped = False
+                    def poll(self): return 0 if self.stopped else None
+                    def terminate(self): events.append('terminate')
+                    def wait(self, timeout): self.stopped = True; events.append('wait'); return 0
+                vm = VM()
+                def command(args, **kwargs):
+                    if args[0] == 'qemu-img': Path(args[-2]).write_bytes(b'owned disk')
+                    elif args[0] == 'ssh-keygen':
+                        Path(args[-1]).write_text('private key'); Path(args[-1]+'.pub').write_text('ssh-ed25519 public key')
+                    elif args[0] == 'cloud-localds': Path(args[1]).write_bytes(b'owned seed')
+                    elif args[0] == 'git' and 'archive' in args or args[0] == 'ssh' and 'tar -cf' in args[-1]:
+                        with tarfile.open(fileobj=kwargs['stdout'], mode='w'): pass
+                    return types.SimpleNamespace(returncode=0)
+                def popen(args, **kwargs):
+                    if args[0] == 'qemu-system-x86_64': return vm
+                    self.assertEqual(args[0], 'ssh')
+                    suite = '--inside-guest' in args[-1]
+                    if outcome == 'overlimit':
+                        # Two verbose readiness attempts share the same cap;
+                        # the complete suite still drains a third full stream.
+                        script = "import sys; [sys.stdout.buffer.write(b'x'*(1024*1024)) for _ in range(65)]"
+                        if not children: script += '; sys.exit(1)'
+                    else: script = "import time; print('fixture',flush=True); time.sleep(60)" if suite or outcome == 'cancel' else "print('ready')"
+                    child = real_popen([sys.executable, '-c', script], **kwargs); children.append(child)
+                    if outcome == 'timeout' and suite:
+                        wait = child.wait
+                        child.wait = lambda timeout=None: wait(timeout=0.05 if timeout == 4*3600 else timeout)
+                    if outcome == 'cancel': os.kill(os.getpid(), signal.SIGTERM)
+                    return child
+                def thread(*args, **kwargs):
+                    if outcome == 'drain-timeout' and children:
+                        return types.SimpleNamespace(start=lambda: None, is_alive=lambda: True, join=lambda timeout: None)
+                    return real_thread(*args, **kwargs)
+                try:
+                    with mock.patch.object(runner.shutil, 'which', return_value='/stub'), \
+                         mock.patch.object(runner.shutil, 'disk_usage', return_value=types.SimpleNamespace(free=100*runner.GIB)), \
+                         mock.patch.object(runner.os, 'access', return_value=True), mock.patch.object(runner.socket, 'socket'), \
+                         mock.patch.object(runner, 'command', side_effect=command), \
+                         mock.patch.object(runner.subprocess, 'check_output', side_effect=lambda args, **kwargs: 'a'*40 if args[0] == 'git' else json.dumps({'format':'qcow2','virtual-size':1024*1024})), \
+                         mock.patch.object(runner.subprocess, 'Popen', side_effect=popen), mock.patch.object(runner.threading, 'Thread', side_effect=thread):
+                        if outcome == 'overlimit':
+                            self.assertEqual(runner.execute(proposed), 0)
+                            self.assertEqual(len(children), 3)
+                            for name in ('bootstrap.log', 'run.log'):
+                                self.assertGreater((root/name).stat().st_size, 64*1024*1024)
+                                self.assertLess((root/name).stat().st_size, 64*1024*1024+128)
+                        elif outcome == 'timeout':
+                            with self.assertRaises(subprocess.TimeoutExpired): runner.execute(proposed)
+                        elif outcome == 'drain-timeout':
+                            with self.assertRaisesRegex(RuntimeError, 'further attempts refused'): runner.execute(proposed)
+                            self.assertEqual(len(children), 1)
+                        else:
+                            with self.assertRaises(SystemExit) as stopped: runner.execute(proposed)
+                            self.assertEqual(stopped.exception.code, 128+signal.SIGTERM)
+                    self.assertEqual(events, ['terminate', 'wait'])
+                    self.assertTrue(all(child.poll() is not None for child in children))
+                    for name in ('root.qcow2', 'base.qcow2', 'seed.img', 'client-key', 'host-key', 'user-data', 'source.tar'):
+                        self.assertFalse((root/name).exists(), name)
+                    self.assertEqual(base.read_bytes(), header)
+                finally:
+                    for child in children:
+                        if child.poll() is None: child.kill(); child.wait(timeout=5)
+                        child.stdout.close()
+
     def test_base_header_rejects_external_data_before_qemu_opens_the_format(self):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / 'base.qcow2'

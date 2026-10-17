@@ -146,14 +146,15 @@ def inside_guest(nonce, suite):
     return result
 
 
-def copy_log(stream, destination, limit=64 * 1024 * 1024):
-    size = 0
-    with destination.open('wb') as output:
+def copy_log(stream, destination, limit=64 * 1024 * 1024, *, append=False):
+    initial = destination.stat().st_size if append and destination.exists() else 0
+    size = initial
+    with destination.open('ab' if append else 'wb') as output:
         while chunk := stream.read(65536):
             if size < limit:
                 output.write(chunk[:limit - size])
             size += len(chunk)
-        if size > limit:
+        if size > limit and initial <= limit:
             output.write(b'\n[remaining process output omitted after log limit]\n')
 
 
@@ -210,6 +211,38 @@ def execute(proposed):
             raise SystemExit(128 + number)
     for number in previous_handlers:
         signal.signal(number, cancel)
+
+    def run_logged(args, destination, timeout, *, append=False):
+        nonlocal spawning
+        child, reader = None, None
+        try:
+            spawning = True
+            try:
+                child = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            finally:
+                spawning = False
+            if cancelled is not None:
+                raise SystemExit(128 + cancelled)
+            reader = threading.Thread(target=copy_log, args=(child.stdout, destination), kwargs={'append': append}, daemon=True)
+            reader.start()
+            return child.wait(timeout=timeout)
+        finally:
+            # Defer cancellation until the captured SSH child is reaped.
+            spawning = True
+            try:
+                if child is not None and child.poll() is None:
+                    child.kill(); child.wait(timeout=5)
+                if reader and reader.is_alive():
+                    reader.join(timeout=5)
+                    if reader.is_alive():
+                        raise RuntimeError('SSH log drain did not finish; further attempts refused')
+                if child is not None:
+                    child.stdout.close()
+            finally:
+                spawning = False
+            if cancelled is not None:
+                raise SystemExit(128 + cancelled)
+
     try:
         (root / 'plan.json').write_text(json.dumps({**proposed, 'commit': commit}, indent=2))
         digest = hashlib.sha256()
@@ -255,27 +288,24 @@ def execute(proposed):
                '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'HostKeyAlgorithms=ssh-ed25519', '-o', 'ConnectTimeout=5', '-o', 'ConnectionAttempts=1',
                '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2', 'backup-test@127.0.0.1']
         ready = time.monotonic() + 900
-        with (root / 'bootstrap.log').open('wb') as log:
-            while True:
-                if process.poll() is not None:
-                    raise RuntimeError('QEMU exited before guest readiness; inspect console.log')
-                try:
-                    probe = subprocess.run(ssh + ['sudo -n cloud-init status --wait'], stdout=log, stderr=log, timeout=30)
-                    if probe.returncode == 0:
-                        break
-                except subprocess.TimeoutExpired:
-                    pass
-                if time.monotonic() >= ready:
-                    raise RuntimeError('Guest provisioning did not finish within 15 minutes')
-                time.sleep(2)
+        while True:
+            if process.poll() is not None:
+                raise RuntimeError('QEMU exited before guest readiness; inspect console.log')
+            try:
+                if run_logged(ssh + ['sudo -n cloud-init status --wait'], root / 'bootstrap.log', 30, append=True) == 0:
+                    break
+            except subprocess.TimeoutExpired:
+                pass
+            if time.monotonic() >= ready:
+                raise RuntimeError('Guest provisioning did not finish within 15 minutes')
+            time.sleep(2)
         command(ssh + ['sudo -n install -d -m 0755 ' + str(GUEST_SOURCE)])
         with (root / 'source.tar').open('rb') as archive:
             command(ssh + ['sudo -n tar -xpf - --no-same-owner -C ' + str(GUEST_SOURCE)], stdin=archive)
         remote = f'sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root python3 {GUEST_SOURCE}/scripts/test-backup-integration-vm.py --inside-guest {proposed["nonce"]} --suite ' + ('both' if len(proposed['suites']) == 2 else next(iter(proposed['suites'])))
         code = 1
         try:
-            with (root / 'run.log').open('wb') as log:
-                code = subprocess.run(ssh + [remote], stdout=log, stderr=log, timeout=4 * 3600).returncode
+            code = run_logged(ssh + [remote], root / 'run.log', 4 * 3600)
         finally:
             with (root / 'reports.tar').open('wb') as report:
                 # Bound report storage separately from the 80 GiB virtual disk.

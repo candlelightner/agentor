@@ -115,8 +115,15 @@ QEMU process, waits 30 seconds and uses that same process handle for a final kil
 if needed. It never searches PID files/names, prunes host Docker or deletes a
 parent directory. After confirmed process exit and run-directory identity checks,
 it removes only its own disk copies, seed, private keys and transfer archives.
-`plan.json`, bounded console/bootstrap/run logs, result JSON and extracted suite
-reports remain in the private directory. Report transfer is capped at 1 GiB and
+`plan.json`, console/bootstrap/run logs, result JSON and extracted suite
+reports remain in the private directory. Each host log is capped at 64 MiB plus
+one omission note; readiness retries append under the same bootstrap-log cap.
+Excess SSH output is drained and discarded so verbose suites can still finish.
+A drain that fails to finish within five seconds after child exit stops the run;
+no further SSH attempt may overlap its log writer.
+Timeout or cancellation kills and reaps the captured SSH child within a
+five-second wait before the existing QEMU cleanup. Cancellation during SSH
+process creation is deferred until its handle is captured. Report transfer is capped at 1 GiB and
 100,000 entries; `.auth` is not included as a separate artifact. A hard host
 power loss/SIGKILL can leave this run's files/process for manual inspection;
 there is deliberately no broad resume/adoption/cleanup command.
@@ -130,7 +137,7 @@ python3 -m unittest discover -s tests/helpers -p 'test_backup*launcher.py' -v
 The guards cover unchanged full arrays, side-effect-free plans, disk/network
 attachments, private keys/nonce bootstrap, wrong-host/DMI/metadata rejection,
 existing-resource/free-space refusal, external-data-file header rejection before QEMU,
-actual catchable signals with stub VM cleanup/forced-kill ordering, bounded log capture, and both-suite
+actual catchable signals with stub VM cleanup/forced-kill ordering, real local producer overlimit/timeout/cancellation cleanup, bounded log capture, and both-suite
 execution after a first-suite failure. A successful real VM boot, guest Docker
 nesting, complete suite reports and cleanup proof remain the next acceptance
 step after plan review. Cloud-init's supported host-key bootstrap is described
@@ -162,6 +169,6 @@ These are not generic nested-Docker gates. Several still bind a prior disposable
 
 ## Evidence and remaining acceptance
 
-Twenty-four local launcher/VM plan cases pass without Docker access, including both full suite arrays, zero-subprocess execution refusal, unsafe namespace/capability/device/mount rejection, device-backed/external/reused-volume rejection, source export and exclusive leases. No test container, daemon, VM, build, mount, cgroup or device was created or changed. There are no runtime reports or cleanup receipts to claim from this change.
+Twenty-six local launcher/VM plan cases pass without Docker access, including both full suite arrays, zero-subprocess execution refusal, unsafe namespace/capability/device/mount rejection, device-backed/external/reused-volume rejection, source export and exclusive leases. No test container, daemon, VM, build, mount, cgroup or device was created or changed. There are no runtime reports or cleanup receipts to claim from this change.
 
 Neither acceptance stack has been started. The real whole-instance UI/API spec and repaired real-worker UI spec remain **prepared, not live-validated**, pending a safe execution environment and successful complete runs. Comparative ≥2× complete-backup throughput, single-core/small-volume behavior and native VM portability remain additional gates; the synthetic 2.36× volume-pipeline benchmark does not substitute for them.
