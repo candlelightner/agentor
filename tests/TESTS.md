@@ -524,3 +524,5 @@ from `scripts/maintenance/incus-upgrade-20261017`. Sixteen isolated tests cover 
 immutable custom images, environment equivalence, private receipts, bounded sample exclusions,
 mocked lifecycle success/ambiguity, retained-source identity, native acceptance, legacy managed
 shape refusal, same-worker editor redirects, guarded post-unarchive continuation and normal execution delegation. These tests do not execute production migration.
+
+Docker backup API packaging regression (2026-10-18): the full isolated baseline workspace suite failed its first backup start with HTTP 200/HTML instead of 202/JSON; inspection of the actual guest image proved `/api/backups` handlers were absent. A real Docker scratch COPY/export using the fixed root `.dockerignore` preserved exactly all 23 tracked backup API sources and excluded temporary `.env`, key, backup artifact and backup-object TypeScript canaries. The Dockerfile now asserts primary and nested remote-discovery sources exist before compilation. Full fixed-image API/UI suites remain required and are not claimed passed by this context probe.

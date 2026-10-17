@@ -26,6 +26,11 @@
 !scripts/
 !scripts/build-incus-worker-image.sh
 !scripts/incus-canary.mjs
+# Backup API source shares a name with runtime backup storage.
+**/backups
+!orchestrator/server/api/backups/
+!orchestrator/server/api/backups/**/
+!orchestrator/server/api/backups/**/*.ts
 **/.git
 **/node_modules
 **/.nuxt
@@ -49,7 +54,6 @@
 **/auth.secret
 **/secrets.json
 **/backup-objects
-**/backups
 **/instance-backup-staging
 **/instance-restore-staging
 **/*.backup
