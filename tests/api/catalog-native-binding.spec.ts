@@ -419,3 +419,120 @@ test('missing-cache eviction preserves authority on unavailable native proof, re
     } finally { await f.cleanup(); }
   }
 });
+
+test('terminal converter recovery is owner/admin scoped, serial and durable, then permits a fresh same-key build', async () => {
+  const f = await fixture(true);
+  try {
+    const source = await f.authorize(); let id = '';
+    await expect(f.manager.ensureNativeImageBinding(source, f.context, f.validate, async buildId => {
+      id = buildId; await f.manager.acknowledgeNativeConverter(id, { ...f.receipt(id), removed: undefined }); throw Error('conversion interrupted');
+    })).rejects.toThrow('interrupted');
+    let called = 0, release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    await expect(f.manager.withNativeConverterRecovery(id, 'foreign', false, async () => { called++; })).rejects.toMatchObject({ statusCode: 403 });
+    const recovery = f.manager.withNativeConverterRecovery(id, 'operator', true, async (receipt, validate, acknowledge) => {
+      called++; await held; await validate();
+      await acknowledge({ ...receipt, pending: { kind: 'delete' } });
+      await acknowledge({ ...receipt, pending: { kind: 'delete', operation: '/1.0/operations/' + randomUUID() } });
+      await acknowledge({ ...receipt, pending: undefined });
+      await acknowledge({ ...receipt, removed: true });
+    });
+    await expect.poll(() => called).toBe(1);
+    await expect(f.manager.withNativeConverterRecovery(id, f.owner, false, async () => { called++; })).rejects.toThrow('still active');
+    release(); const result = await recovery;
+    expect(result.status).toBe('failed'); expect(result).not.toHaveProperty('nativeDerivation'); expect(called).toBe(1);
+    const loaded = new ImageCatalogCore(f.root); await loaded.init();
+    expect(loaded.build(id, f.owner, false).nativeDerivation!.converter?.removed).toBe(true);
+    expect(await loaded.openNativeImageDerivation(source, f.context, f.validate)).not.toBe(id);
+  } finally { await f.cleanup(); }
+});
+
+test('recovery refuses active, unknown, imported, removed or malformed receipts without invoking cleanup', async () => {
+  for (const condition of ['running','pending','missing-incarnation','import','removed','source','context'] as const) {
+    const f = await fixture(true);
+    try {
+      const source = await f.authorize(), id = await f.manager.openNativeImageDerivation(source, f.context, f.validate);
+      const receipt = { ...f.receipt(id), removed: undefined };
+      await f.manager.acknowledgeNativeConverter(id, receipt);
+      const build = f.manager.build(id, f.owner, false); build.status = condition === 'running' ? 'running' : 'failed';
+      if (condition === 'pending') build.nativeDerivation!.converter!.pending = { kind: 'stop' };
+      if (condition === 'missing-incarnation') delete build.nativeDerivation!.converter!.incarnation;
+      if (condition === 'removed') build.nativeDerivation!.converter!.removed = true;
+      if (condition === 'source') build.nativeDerivation!.converter!.sourceImageId = 'sha256:' + 'e'.repeat(64);
+      if (condition === 'context') build.nativeDerivation!.context.recipeId = 'f'.repeat(64);
+      if (condition === 'import') { build.nativeDerivation!.converter!.removed = true; build.nativeDerivation!.imageImport = { pending: true }; }
+      let calls = 0;
+      await expect(f.manager.withNativeConverterRecovery(id, f.owner, false, async () => { calls++; })).rejects.toThrow();
+      expect(calls).toBe(0);
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('failed cleanup retains its last acknowledged pending receipt in memory and after restart', async () => {
+  const f = await fixture(true);
+  try {
+    const source = await f.authorize(), id = await f.manager.openNativeImageDerivation(source, f.context, f.validate);
+    await f.manager.acknowledgeNativeConverter(id, { ...f.receipt(id), removed: undefined });
+    f.manager.build(id, f.owner, false).status = 'cancelled';
+    await expect(f.manager.withNativeConverterRecovery(id, f.owner, false, async (receipt, _validate, acknowledge) => {
+      await acknowledge({ ...receipt, pending: { kind: 'delete', operation: '/1.0/operations/' + randomUUID() } });
+      throw Error('lost observation');
+    })).rejects.toThrow('lost observation');
+    const pending = f.manager.build(id, f.owner, false).nativeDerivation!.converter!;
+    expect(pending.pending?.operation).toBeTruthy(); expect(pending.removed).toBeUndefined();
+    const loaded = new ImageCatalogCore(f.root); await loaded.init();
+    expect(loaded.build(id, f.owner, false).nativeDerivation!.converter).toEqual(pending);
+    await expect(loaded.withNativeConverterRecovery(id, f.owner, false, async () => {})).rejects.toThrow('without pending');
+  } finally { await f.cleanup(); }
+});
+
+test('actual converter recovery route requires authentication, exact path and empty body and forwards trusted owner/admin context', async () => {
+  const { useImageCatalogManager } = await import('../../orchestrator/server/utils/image-catalog');
+  const manager = useImageCatalogManager(), originalInit = manager.init, originalRecover = manager.recoverNativeConverter;
+  const calls: unknown[][] = [], globals = globalThis as any;
+  const values: Record<string, unknown> = { defineRouteMeta: () => {}, defineEventHandler: (handler: unknown) => handler,
+    getRouterParam: (event: any) => event.path, readBody: async (event: any) => event.body,
+    createError: (value: any) => Object.assign(Error(value.statusMessage), value) };
+  const previous = Object.fromEntries(Object.keys(values).map(key => [key, Object.getOwnPropertyDescriptor(globals, key)]));
+  Object.assign(globals, values);
+  manager.init = async () => {};
+  manager.recoverNativeConverter = async (...args) => { calls.push(args); return { id: args[0] } as any; };
+  try {
+    const route = (await import('../../orchestrator/server/api/image-builds/[...path]')).default as any;
+    const id = randomUUID(), event = { method: 'POST', path: id + '/recover-converter', body: {},
+      context: { auth: { user: { id: 'owner', role: 'user' }, session: {} } } };
+    await expect(route({ ...event, context: {} })).rejects.toMatchObject({ statusCode: 401 });
+    expect(calls).toEqual([]);
+    expect(await route(event)).toEqual({ id }); expect(calls.at(-1)).toEqual([id, 'owner', false]);
+    expect(await route({ ...event, context: { auth: { user: { id: 'operator', role: 'admin' }, session: {} } } })).toEqual({ id });
+    expect(calls.at(-1)).toEqual([id, 'operator', true]);
+    for (const body of [undefined, null, [], { name: 'arbitrary' }, { force: true }])
+      await expect(route({ ...event, body })).rejects.toMatchObject({ statusCode: 400 });
+    await expect(route({ ...event, path: event.path + '/extra' })).rejects.toMatchObject({ statusCode: 404 });
+    expect(calls).toHaveLength(2);
+  } finally {
+    manager.init = originalInit; manager.recoverNativeConverter = originalRecover;
+    for (const [key, descriptor] of Object.entries(previous)) {
+      if (descriptor) Object.defineProperty(globals, key, descriptor); else delete globals[key];
+    }
+  }
+});
+
+test('application recovery reads existing installation identity without creating a missing identity or invoking native cleanup', async () => {
+  const f = await fixture();
+  const { useConfig } = await import('../../orchestrator/server/utils/services');
+  const { IncusImageConverter } = await import('../../orchestrator/server/utils/incus-image-converter');
+  const config = useConfig(), previous = { dataDir: config.dataDir, incusEnabled: config.incusEnabled };
+  const original = IncusImageConverter.cleanup;
+  let calls = 0;
+  IncusImageConverter.cleanup = async () => { calls++; throw Error('Must not touch native client'); };
+  Object.assign(config, { dataDir: f.root, incusEnabled: true });
+  try {
+    const source = await f.authorize(), id = await f.manager.openNativeImageDerivation(source, f.context, f.validate);
+    await f.manager.acknowledgeNativeConverter(id, { ...f.receipt(id), removed: undefined });
+    f.manager.build(id, f.owner, false).status = 'failed';
+    await expect((f.manager as ImageCatalogManager).recoverNativeConverter(id, f.owner, false)).rejects.toMatchObject({ statusCode: 409 });
+    await expect(readFile(join(f.root, 'backup-installation-id'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(calls).toBe(0);
+  } finally { Object.assign(config, previous); IncusImageConverter.cleanup = original; await f.cleanup(); }
+});

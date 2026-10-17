@@ -945,6 +945,46 @@ export class ImageCatalogCore {
     return build as ImageBuild & { nativeDerivation: NativeImageDerivation };
   }
 
+  /** Explicit terminal-job cleanup shares the native-key execution table and
+   * persists every acknowledgement through the existing mutation chain. */
+  async withNativeConverterRecovery(id: string, ownerId: string, admin: boolean,
+    cleanup: (receipt: IncusImageConverterReceipt, validate: () => Promise<void>,
+      acknowledge: (receipt: IncusImageConverterReceipt) => Promise<void>) => Promise<void>) {
+    await this.init();
+    const expected = await this.nativeAuthorityRead(async () => {}, () => {
+      const build = this.build(id, ownerId, admin);
+      if (!['failed', 'cancelled'].includes(build.status) || !build.nativeDerivation)
+        httpError(409, 'Converter recovery requires a failed or cancelled native image build');
+      validateNativeDerivation(build.nativeDerivation, build);
+      const state = build.nativeDerivation;
+      if (!state.converter?.incarnation || state.converter.pending || state.converter.removed || state.imageImport)
+        httpError(409, 'Converter recovery requires a captured converter without pending work or image import');
+      return structuredClone(state);
+    });
+    const key = 'native:' + nativeContextKey(expected.context);
+    if (this.definitionBuilds.has(key)) httpError(409, 'Native conversion or recovery is still active');
+    const validate = () => this.nativeAuthorityRead(async () => {}, () => {
+      const build = this.build(id, ownerId, admin);
+      if (!['failed', 'cancelled'].includes(build.status) || !build.nativeDerivation || !isDeepStrictEqual(build.nativeDerivation, expected))
+        httpError(409, 'Native converter recovery authority changed');
+      validateNativeDerivation(build.nativeDerivation, build);
+    });
+    const execution = (async () => {
+      await validate();
+      await cleanup(structuredClone(expected.converter!), validate, async receipt => {
+        await validate();
+        await this.acknowledgeNativeConverter(id, receipt);
+        expected.converter = structuredClone(receipt);
+      });
+      await validate();
+      if (!expected.converter?.removed || expected.converter.pending)
+        httpError(409, 'Native converter cleanup was not acknowledged');
+    })();
+    this.definitionBuilds.set(key, execution);
+    try { await execution; return this.publicBuild(id, ownerId, admin); }
+    finally { if (this.definitionBuilds.get(key) === execution) this.definitionBuilds.delete(key); }
+  }
+
   async acknowledgeNativeConverter(id: string, receipt: IncusImageConverterReceipt): Promise<void> {
     receipt = structuredClone(receipt);
     await this.mutate(() => {
