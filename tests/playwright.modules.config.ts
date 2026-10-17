@@ -91,6 +91,7 @@ export default defineConfig({
     "api/ws-relay-origin.spec.ts",
     "api/terminal-admission.spec.ts",
     "api/worker-runtime-kind.spec.ts",
+    "api/ordinary-worker-identity.spec.ts",
     "api/worker-store-initialization.spec.ts",
     "api/worker-incus-migration-fencing.spec.ts",
     "api/worker-incus-migration-store.spec.ts",

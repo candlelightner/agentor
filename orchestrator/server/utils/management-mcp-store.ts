@@ -1644,7 +1644,7 @@ export class ManagementMcpStore {
     const visibleWorkers = () =>
       identity?.scope === "group"
         ? this.groupWorkers(identity)
-        : [...useContainerManager().list(), ...useWorkerStore().listArchived()];
+        : [...useContainerManager().list(), ...useContainerManager().listArchived()];
     if (name === "status.system")
       return {
         status: "ok",
@@ -2068,7 +2068,7 @@ export class ManagementMcpStore {
         statusCode: 403,
       });
     const owned = new Set(
-      [...useContainerManager().list(), ...useWorkerStore().listArchived()]
+      [...useContainerManager().list(), ...useContainerManager().listArchived()]
         .filter((worker) => worker.userId === identity.ownerId)
         .map((worker) => worker.id),
     );
@@ -2083,7 +2083,7 @@ export class ManagementMcpStore {
     const ids = this.groupWorkerIds(identity);
     return [
       ...useContainerManager().list(),
-      ...useWorkerStore().listArchived(),
+      ...useContainerManager().listArchived(),
     ].filter(
       (worker) => ids.has(worker.id) && worker.userId === identity.ownerId,
     );

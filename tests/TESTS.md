@@ -1,5 +1,7 @@
 # Agentor Test Suite
 
+`api/ordinary-worker-identity.spec.ts` adds **7 isolated module cases** using real initialized platform/group administrative stores: cold-runtime archived-list and unarchive/delete/migration denial for both identities, unchanged shadow records and zero compute/storage calls, foreign ordinary IDs with identical display names, reconciliation preservation/no duplicate creation, unavailable target-owner authority rejection, queued lifecycle identity revalidation, and unfinished-migration unarchive rejection. Affected identity/admission/migration-fencing/lifecycle-coordinator modules: **32/32 passed**; Nuxt typecheck passed. These are manager/store tests; full API/UI acceptance remains pending. Run with `env -u DATA_DIR npx playwright test --config=playwright.modules.config.ts api/ordinary-worker-identity.spec.ts --workers=1` (the config creates private temporary metadata).
+
 Comprehensive end-to-end test suite for the Agentor platform using Playwright and TypeScript. Covers all API endpoints and UI interactions.
 
 ## Overview
@@ -30,7 +32,7 @@ Phase 6 adds `api/incus-worker-network.spec.ts` (17 cases: host lease/MAC/UUID a
 
 Incus migration coverage: `api/worker-runtime-kind.spec.ts` (6 cases), `api/incus-client.spec.ts` (15 cases, including disposable-host integration and default-project denial), `api/incus-derived-image.spec.ts` (one gated live boot/provisioning/service test), `api/incus-worker-runtime.spec.ts` (17 cases: ownership, provisioning, TLS, exact account grants, patched-daemon/image-generation/capability guards, missing-storage fail-closed, serialized SSH refresh, stale credential bind ordering and unsafe-source/busy-target rejection, plus real production-manager deletion retry/lifecycle and native Docker persistence), `api/incus-worker-storage.spec.ts` (6 core-volume ownership/type/attachment/reuse/deletion cases), `api/incus-account-sharing.spec.ts` (7 cases: nofollow/hardlink credential/reset protections, canonical writes, and gated same-account sharing acceptance), and `api/incus-private-storage.spec.ts` (one production-helper overlay-pruning/symlink test). Fresh rebuilt-image boot and native Docker restart/root-replacement/disable/re-enable gates passed; account sharing/reprovisioning and final manager lifecycle/deletion-retry gates also passed. Supported patched Incus (6.0 LTS >=6.0.5 or rolling >=6.10) preserves UID1000 on exact restricted exports without raw.idmap or lowlevel authority. After health-check rebase: 256 modules passed/four gated skipped (260 total), including main's running-worker observability regressions. Full API/UI acceptance remains required by Phase 13.
 
-- **2363 tests** across 233 test files (1732 API across 168 files + 631 UI across 65 files), as enumerated with the Playwright list reporter
+- **2370 tests** across 234 test files (1739 API across 169 files + 631 UI across 65 files), as enumerated with the Playwright list reporter
 - **API tests**: headless, no browser needed, fast execution
 - **UI tests**: Desktop Chrome (1920x1080), real browser interactions
 - **Terminal tests**: WebSocket-based command execution and agent CLI prompting
