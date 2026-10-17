@@ -25,6 +25,7 @@
 !worker/entrypoint.sh
 !scripts/
 !scripts/build-incus-worker-image.sh
+!scripts/incus-canary.mjs
 **/.git
 **/node_modules
 **/.nuxt
