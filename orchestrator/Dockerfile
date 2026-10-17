@@ -20,7 +20,10 @@ COPY worker/vm/ /app/worker/vm/
 COPY worker/entrypoint.sh /app/worker/entrypoint.sh
 COPY scripts/build-incus-worker-image.sh /app/scripts/build-incus-worker-image.sh
 COPY scripts/incus-canary.mjs /app/scripts/incus-canary.mjs
-RUN npm run build
+# Fail before compilation if build-context rules omit the backup REST API.
+RUN test -f server/api/backups/index.post.ts && \
+    test -f server/api/backups/remote/index.post.ts && \
+    npm run build
 
 FROM node:22-alpine
 
