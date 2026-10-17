@@ -5,6 +5,7 @@
   "include": [
     "api/admin-native-proxy.spec.ts",
     "api/admin-native-callers.spec.ts",
+    "api/admin-native-owner-remap.spec.ts",
     "api/incus-admin-restore.spec.ts",
     "api/incus-hardware.spec.ts",
     "api/hardware-device-store.spec.ts",

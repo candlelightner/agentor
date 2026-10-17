@@ -1436,3 +1436,7 @@ Docker packaging now retains the 23 tracked TypeScript backup REST routes beneat
 Administrative identity refresh isolates each global/group runtime failure so healthy later group admins retain their short-lived management identities. Unavailable group authority is reported without inferring or provisioning other identities; each dedicated store keeps its own admission checks.
 
 Admin lifecycle requests fail with 503 until their shared runtime adapter is bound, preventing startup races from reporting metadata-only create/start/stop/rebuild success. Dedicated read-only identity bootstrap remains available.
+
+Administrative native-base resolution verifies the server-approved immutable OCI identity against the packaged bootstrap recipe and the exact native alias fingerprint before data-only restore preparation. Existing-admin migration and live integration remain separate acceptance work.
+
+Historical global-admin plugin installations can transfer to the native admin namespace under a dedicated stopped migration/restore fence. Installation IDs and desired/desktop settings are preserved; private definitions receive worker-scoped clones visible to the trusted admin. Groups remain unchanged, and partial failures retain byte-exact private metadata evidence for manual recovery.
