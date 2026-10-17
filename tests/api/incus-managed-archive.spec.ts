@@ -1,6 +1,8 @@
+import { execFileSync } from 'node:child_process';
+import { MANAGED_KILO_PARENT, MANAGED_KILO_LINK } from '../../orchestrator/server/utils/managed-volume-kilo-parent';
 import { test, expect } from '@playwright/test';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, mkdir, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -14,28 +16,36 @@ import { useConfig, useWorkerStore } from '../../orchestrator/server/utils/servi
 import type { Config } from '../../orchestrator/server/utils/config';
 import type { IncusClient, IncusInstance, IncusCustomVolume } from '../../orchestrator/server/utils/incus-client';
 import type { StoredManagedVolume } from '../../orchestrator/server/utils/managed-volume-store';
+import { prepareLegacyManagedMigration } from '../../orchestrator/server/utils/legacy-incus-managed-migration';
+import { persistentPathVolumeName } from '../../orchestrator/server/utils/persistent-backup-paths';
 
 type State = 'running' | 'stopped' | 'archived';
 
-async function fixture(state: State, run: (f: any) => Promise<void>) {
+async function fixture(state: State, run: (f: any) => Promise<void>, migratedLegacy = false, parentArchive?: Buffer) {
   const dataDir = await mkdtemp(join(tmpdir(), 'incus-managed-archive-'));
   const installation = await backupInstallationId(dataDir), workerId = randomUUID(), incarnation = randomUUID();
   const config = { dataDir, containerPrefix: 'worker', incusStoragePool: 'pool', incusProject: 'agentor',
     incusEndpoint: 'https://native.invalid' } as Config;
   const record: StoredManagedVolume = { id: randomUUID(), userId: randomUUID(), workerId,
-    name: 'models', target: '/opt/models', purpose: 'persistent-path', attached: true,
+    name: 'models', target: parentArchive ? MANAGED_KILO_PARENT : '/opt/models', purpose: 'persistent-path', attached: true,
     seeded: true, state: 'ready', storageRuntimeKind: 'incus-vm', dockerName: '',
     createdAt: '2026-10-05T12:00:00.000Z', updatedAt: '2026-10-05T12:00:00.000Z' };
   record.dockerName = 'agentor-persist-' + record.id;
+  if (migratedLegacy) {
+    const source = { ...record, purpose: 'legacy-backup-path' as const, storageRuntimeKind: 'legacy-docker' as const,
+      dockerName: persistentPathVolumeName(record.workerId, record.target) };
+    Object.assign(record, prepareLegacyManagedMigration({ id: workerId, userId: record.userId }, [source])[0],
+      { seeded: true, state: 'ready' });
+  }
   const name = 'worker-' + workerId, reference = (instance: string) => `/1.0/instances/${instance}?project=agentor`;
-  const volume = { name: record.dockerName, project: 'agentor', type: 'custom', content_type: 'filesystem',
+  const volume = { name: record.dockerName, description: '', project: 'agentor', type: 'custom', content_type: 'filesystem',
     created_at: '2026-10-05T12:00:00Z', used_by: state === 'archived' ? [] : [reference(name)],
     config: { 'user.agentor.installation': installation, 'user.agentor.owner': record.userId,
       'user.agentor.id': workerId, 'user.agentor.volume-id': record.id, 'user.agentor.target': record.target } } as IncusCustomVolume;
-  const original = { name, type: 'virtual-machine', status: state === 'running' ? 'Running' : 'Stopped',
+  const original = { name, description: '', status_code: 102, architecture: 'x86_64', ephemeral: false, profiles: [], type: 'virtual-machine', status: state === 'running' ? 'Running' : 'Stopped',
     config: { 'user.agentor.installation': installation, 'user.agentor.owner': record.userId,
       'user.agentor.id': workerId, 'volatile.uuid': incarnation }, devices: {}, expanded_devices: {} } as IncusInstance;
-  const calls: any[] = [], controller = new AbortController(), binary = Buffer.from([0, 255, 128, 10, 13, 0]);
+  const calls: any[] = [], controller = new AbortController(), binary = parentArchive ?? Buffer.from([0, 255, 128, 10, 13, 0]);
   const control = { present: state !== 'archived', mutation: undefined as (() => void) | undefined,
     cleanupValidated: false, proofs: 0, maxBytes: 4096, recordError: false };
   const client: Pick<IncusClient, 'endpoint' | 'getInstance' | 'getCustomVolume' | 'execStream'> = {
@@ -54,7 +64,7 @@ async function fixture(state: State, run: (f: any) => Promise<void>) {
         stdout.end(binary); stderr.end(Buffer.from('diagnostic'));
         control.mutation?.(); resolve(0);
       }));
-      return { stdin, stdout, stderr, result, close() { calls.push(['close']); } };
+      return { stdin, stdout, stderr, result, operationId: randomUUID(), sendSignal: () => {}, close() { calls.push(['close']); } };
     },
   };
   const worker = new IncusWorkerRuntime(config, client as IncusClient);
@@ -95,6 +105,17 @@ test('running, stopped and archived managed capture preserves raw bytes using on
     expect(exec[3]).toMatchObject({ user: 0, group: 0, cwd: '/', timeoutMs: 600_000 });
     expect(f.control.cleanupValidated).toBe(true); expect(f.control.proofs).toBeGreaterThan(4);
   });
+});
+
+test('normalized legacy selection retains native managed archive compatibility across running stopped and archived workers', async () => {
+  for (const state of ['running', 'stopped', 'archived'] as State[]) await fixture(state, async f => {
+    expect(f.record.purpose).toBe('persistent-path');
+    expect(f.record.dockerName).toBe('agentor-persist-' + f.record.id);
+    expect(await f.capture()).toBe(f.binary.length);
+    expect(await readFile(f.archivePath)).toEqual(f.binary);
+    expect(f.calls.find((call: any) => call[0] === 'helper')[2]).toEqual({ managed: f.record.dockerName });
+    expect(f.control.cleanupValidated).toBe(true);
+  }, true);
 });
 
 test('settled detached and deleted-owner managed data captures without source attachment or record invention', async () => {
@@ -220,4 +241,22 @@ test('native portable dispatch proves archived absence even with zero or nonelig
     if (logger === undefined) delete (globalThis as any).useLogger; else (globalThis as any).useLogger = logger;
     await rm(dataDir, { recursive: true, force: true });
   }
+});
+
+
+for (const canonical of [true, false]) test(`native parent capture validates unchanged source leaf for running stopped and archived (${canonical})`, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'incus-kilo-parent-capture-'));
+  try {
+    await mkdir(join(dir, 'volume'));
+    if (canonical) await symlink(MANAGED_KILO_LINK, join(dir, 'volume/kilo'));
+    const bytes = execFileSync('/usr/bin/tar', ['--numeric-owner', '--xattrs', '--acls', '--one-file-system', '-cpf', '-', '-C', dir, 'volume']);
+    for (const state of ['running', 'stopped', 'archived'] as State[]) await fixture(state, async f => {
+      f.control.maxBytes = bytes.length + 1;
+      const volume = structuredClone(f.volume), original = structuredClone(f.original);
+      if (canonical) {
+        expect(await f.capture()).toBe(bytes.length); expect(await readFile(f.archivePath)).toEqual(bytes);
+      } else await expect(f.capture()).rejects.toThrow('canonical Kilo');
+      expect(f.control.cleanupValidated).toBe(true); expect(f.volume).toEqual(volume); expect(f.original).toEqual(original);
+    }, false, bytes);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

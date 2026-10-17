@@ -1,3 +1,4 @@
+import { MANAGED_KILO_PARENT, MANAGED_KILO_PARENT_CHECK } from '../../orchestrator/server/utils/managed-volume-kilo-parent';
 import { test, expect } from "@playwright/test";
 import { execFileSync } from "node:child_process";
 import { mkdtemp, rm, writeFile, readFile, symlink, link } from "node:fs/promises";
@@ -136,6 +137,49 @@ test('declared managed disks require guest mountpoints before configuration or w
   await expect(runtime.start({ ...opts, managedVolumes: [v] })).rejects.toThrow('bootstrap command failed');
   expect(fake.events.some(event => event.operation === 'file')).toBe(false);
   expect(fake.events.some(event => event.operation === 'exec' && event.args[1]?.includes('start'))).toBe(false);
+});
+
+test('retained XDG parent is verified before ordinary VM allocation and rebuild preflight', async () => {
+  const fake = fakeClient(), runtime = new IncusWorkerRuntime(config, fake.client as any), opts = options();
+  const v = { id: randomUUID(), userId: opts.userId, workerId: opts.id, target: MANAGED_KILO_PARENT,
+    name: 'XDG', dockerName: '', purpose: 'persistent-path' as const, attached: true, seeded: true,
+    state: 'ready' as const, storageRuntimeKind: 'incus-vm' as const, createdAt: '', updatedAt: '' };
+  v.dockerName = 'agentor-persist-' + v.id;
+  const original = IncusManagedVolumeRuntime.prototype.verifyKiloParent;
+  let checks = 0;
+  IncusManagedVolumeRuntime.prototype.verifyKiloParent = async function(record) {
+    expect(record).toEqual(v); checks++; throw new Error('canonical Kilo fixture failure');
+  };
+  try {
+    await expect(runtime.create({ ...opts, start: false, managedVolumes: [v] })).rejects.toThrow('canonical Kilo fixture failure');
+    expect(checks).toBe(1); expect(fake.events.some(e => e.operation === 'create')).toBe(false);
+    await runtime.create({ ...opts, start: false });
+    fake.events.length = 0;
+    await expect(runtime.preflightRecreation({ ...opts, managedVolumes: [v] })).rejects.toThrow('canonical Kilo fixture failure');
+    expect(checks).toBe(2); expect(fake.events.some(e => ['delete', 'start', 'stop'].includes(e.operation))).toBe(false);
+  } finally { IncusManagedVolumeRuntime.prototype.verifyKiloParent = original; }
+});
+
+test('changed Kilo leaf blocks actual native startup before provisioning and any entrypoint or service start', async () => {
+  const fake = fakeClient(), runtime = new IncusWorkerRuntime(config, fake.client as any), opts = options();
+  const id = randomUUID(), v = { id, userId: opts.userId, workerId: opts.id, target: MANAGED_KILO_PARENT,
+    name: 'XDG', dockerName: 'agentor-persist-' + id, purpose: 'persistent-path' as const, attached: true, seeded: true,
+    state: 'ready' as const, storageRuntimeKind: 'incus-vm' as const, createdAt: '', updatedAt: '' };
+  const original = IncusManagedVolumeRuntime.prototype.verifyKiloParent;
+  IncusManagedVolumeRuntime.prototype.verifyKiloParent = async () => {};
+  try {
+    await fake.client.createCustomVolume(config.incusStoragePool, { name: v.dockerName, content_type: 'filesystem', config: {
+      'user.agentor.installation': await backupInstallationId(config.dataDir), 'user.agentor.owner': v.userId,
+      'user.agentor.id': v.workerId, 'user.agentor.volume-id': v.id, 'user.agentor.target': v.target } });
+    await runtime.create({ ...opts, start: false, managedVolumes: [v] });
+    fake.events.length = 0;
+    const exec = fake.client.exec;
+    fake.client.exec = async (...args: any[]) => args[1].includes(MANAGED_KILO_PARENT_CHECK)
+      ? { returnCode: 1, stdout: '', stderr: '' } : exec(...args);
+    await expect(runtime.start({ ...opts, managedVolumes: [v] })).rejects.toThrow('bootstrap command failed');
+    expect(fake.events.some(e => e.operation === 'file')).toBe(false);
+    expect(fake.events.some(e => e.operation === 'exec' && ['start', 'agentor-worker.service'].some(x => e.args[1]?.includes(x)))).toBe(false);
+  } finally { IncusManagedVolumeRuntime.prototype.verifyKiloParent = original; }
 });
 
 function fakeClient() {

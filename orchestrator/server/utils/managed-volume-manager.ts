@@ -1,3 +1,4 @@
+import { MANAGED_KILO_PARENT } from './managed-volume-kilo-parent';
 import Docker from "dockerode";
 import { randomUUID } from "node:crypto";
 import type { VolumeApplyMode } from "../../shared/managed-volumes";
@@ -272,7 +273,10 @@ export class ManagedVolumeManager {
       return;
     }
     const before = await this.runtime.validateTarget(worker.containerId, v.target, v.seeded ? v.dockerName : undefined);
+    if (v.target === MANAGED_KILO_PARENT) await this.runtime.ensureVolume(v);
     if (v.seeded && before.Mounts.some((m) => m.Name === v.dockerName && m.Destination === v.target)) return;
+    if (v.target === MANAGED_KILO_PARENT)
+      throw volumeError(409, 'Apply the retained XDG parent through recreation, with its canonical Kilo link verified.');
     if (!before.State.Running || before.State.Paused) throw volumeError(409, "Live mounting requires a running, unpaused worker.");
     if (v.liveContainerId) await this.recoverLive(v);
     if (v.seeded && v.liveContainerId === worker.containerId) return;
@@ -518,7 +522,10 @@ export class ManagedVolumeManager {
       if (managedVolumeRuntimeKind(v) === 'incus-vm')
         await this.incusRuntime.validateTarget(actor.userId, actor.workerId, live.containerId, v.target, v);
       else await this.runtime.validateTarget(live.containerId, v.target, v.dockerName);
-      if (v.seeded) await this.volumeRuntime(v).ensureVolume(v);
+      if (v.seeded) {
+        await this.volumeRuntime(v).ensureVolume(v);
+        if (managedVolumeRuntimeKind(v) === 'incus-vm') await this.incusRuntime.verifyKiloParent(v);
+      }
       const selected = this.resolveMode(actor, mode, acknowledgePrivileged);
       v.attached = true; v.state = "pending";
       v.operation = { id: randomUUID(), mode: selected, stage: "queued" };

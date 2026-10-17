@@ -1,3 +1,4 @@
+import { MANAGED_KILO_PARENT } from './managed-volume-kilo-parent';
 import { randomUUID } from "node:crypto";
 import Docker from 'dockerode';
 import { isIP } from "node:net";
@@ -56,6 +57,7 @@ import type { PreparedPortableManagedVolumeImport } from "./portable-managed-vol
 import type { PortableManagedVolumeImportJournal } from "./portable-managed-volume-journal";
 import type { PortableManagedVolumeEntry } from './portable-managed-volume-format';
 import { pathsOverlap, type ManagedVolumeStore, type StoredManagedVolume } from './managed-volume-store';
+import { prepareLegacyManagedMigration } from './legacy-incus-managed-migration';
 import {
   readPortablePluginConfiguration,
   rollbackRestoredWorkerPlugins,
@@ -744,6 +746,7 @@ export class ContainerManager {
           v.operation && v.operation.stage !== 'complete' || v.state !== (v.attached ? 'ready' : 'detached') ||
           v.storageRuntimeKind === 'incus-vm'))
         throw Object.assign(new Error('Settle managed storage before migration; all source data was retained'), { statusCode: 409 });
+      const nativeManaged = prepareLegacyManagedMigration(record, sourceManaged);
       const client = new Docker({ socketPath: '/var/run/docker.sock' });
       const inspect = () => withOperationDeadline(signal => client.getContainer(original.containerId).inspect({ abortSignal: signal }),
         15_000, 'Legacy migration source inspection');
@@ -818,8 +821,6 @@ export class ContainerManager {
         containerId: source.Id, createdAt: source.Created, imageId: source.Image, wasRunning: source.State.Running,
       }, sourceVolumes, sourceDirectories };
       let stopped = false, creationAttempted = false, incarnation: string | undefined, cutover = false;
-      const nativeManaged = sourceManaged.map(({ operation: _completedSourceHistory, ...v }) =>
-        ({ ...v, storageRuntimeKind: 'incus-vm' as const, seeded: false, state: 'pending' as StoredManagedVolume['state'] }));
       const native: ContainerInfo = { ...original, runtimeKind: 'incus-vm', status: 'creating',
         importedImage: undefined, runtimeDiagnostic: undefined };
       const validate = async () => {
@@ -3510,6 +3511,11 @@ for p in sys.argv[1:]:
         new Error("Hardware device access was revoked. Rebuild this worker before starting it again so Docker removes the old device mapping."),
         { statusCode: 409, statusMessage: "Hardware device access was revoked. Rebuild this worker before starting it again so Docker removes the old device mapping." },
       );
+    if (!migrationRollback) {
+      const volumes = useManagedVolumeManager(); await volumes.init();
+      if (volumes.store.forWorker(info.userId, id).some(v => v.attached && v.target === MANAGED_KILO_PARENT))
+        await volumes.mounts(info.userId, id);
+    }
     await this.persistDesiredRuntimeStatus(info, "running");
     const { groupSecrets } = await this.resolveUserEnvAndBinds(
       info.userId,
@@ -6356,9 +6362,9 @@ for p in sys.argv[1:]:
         const volumes = (await import('./managed-volume-manager')).useManagedVolumeManager();
         await volumes.init(); managedStore = volumes.store;
         await validate();
-        for (const { entry } of managedPayloads) {
+        for (const { entry, archivePath } of managedPayloads) {
           await validate();
-          const record = await managedStore.create(userId, id, entry.target, entry.name, 'incus-vm');
+          const record = await managedStore.create(userId, id, entry.target, entry.name, 'incus-vm', archivePath);
           managedRecords.push(structuredClone(managedStore.get(userId, record.id)!));
           await validate();
         }

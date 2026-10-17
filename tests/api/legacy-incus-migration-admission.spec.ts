@@ -12,6 +12,8 @@ import type { StoredManagedVolume } from '../../orchestrator/server/utils/manage
 import { createRequire } from 'node:module';
 import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker-runtime';
 import { incusManagedRestoreDevices } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
+import { persistentPathVolumeName } from '../../orchestrator/server/utils/persistent-backup-paths';
+import { IncusRequestRejected } from '../../orchestrator/server/utils/incus-client';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 
@@ -76,6 +78,7 @@ for (const condition of ['complete-attached', 'complete-detached', 'no-operation
         purpose: 'persistent-path', storageRuntimeKind: 'legacy-docker', seeded: true, attached: true,
         state: 'ready', createdAt: f.record.createdAt, updatedAt: f.record.updatedAt,
         operation: { id: randomUUID(), mode: 'recreate', stage: 'complete' } };
+      volume.dockerName = 'agentor-persist-' + volume.id;
       if (condition === 'complete-detached') { volume.attached = false; volume.state = 'detached'; }
       if (condition === 'no-operation') delete volume.operation;
       if (condition === 'active') volume.operation!.stage = 'queued';
@@ -123,8 +126,9 @@ test('private secret-aware rollback start does not waive a changed migration non
   } finally { await f.cleanup(); }
 });
 
+for (const historical of [false, true])
 for (const changedBaseline of [false, true])
-test(`settled managed migration preflight ${changedBaseline ? 'rejects a changed baseline without allocation or destination cleanup' : 'stages attached and detached devices without source history'}`, async () => {
+test(`settled ${historical ? 'historical' : 'managed'} migration preflight ${changedBaseline ? 'rejects a changed baseline without allocation or destination cleanup' : 'stages attached and detached devices without source history'}`, async () => {
   const f = await fixture(), volumes = useManagedVolumeManager();
   const original = { init: volumes.init, assert: volumes.assertLiveRecoveryResolved, blocked: volumes.isRecoveryBlocked,
     records: volumes.store.forWorker, save: volumes.store.save, preflight: IncusWorkerRuntime.prototype.preflightCanonicalRestore,
@@ -143,6 +147,11 @@ test(`settled managed migration preflight ${changedBaseline ? 'rejects a changed
   let destinationMutations = 0;
   let preflights = 0, attachedSeen: StoredManagedVolume[] = [], detachedSeen: StoredManagedVolume[] = [];
   try {
+    if (historical) for (const record of records) {
+      record.purpose = 'legacy-backup-path';
+      record.dockerName = persistentPathVolumeName(record.workerId, record.target);
+    }
+    baseline.splice(0, baseline.length, ...structuredClone(records));
     await f.store.upsert({ ...f.record, imageRuntimeReference: f.info.imageId });
     const workerBefore = structuredClone(f.store.get(f.record.userId, f.record.id));
     const mounts = [{ Type: 'volume', Name: 'source-workspace', Destination: '/workspace', RW: true },
@@ -178,19 +187,22 @@ test(`settled managed migration preflight ${changedBaseline ? 'rejects a changed
         expect(staged.operation).toBeUndefined(); expect(staged).toMatchObject({ storageRuntimeKind: 'incus-vm', seeded: false, state: 'pending' });
       }
       const devices = incusManagedRestoreDevices(options, 'approved-pool', options.managedVolumes, detached);
-      expect(Object.values(devices).map(device => device.source).sort()).toEqual(records.map(volume => volume.dockerName).sort());
+      expect(Object.values(devices).map(device => device.source).sort()).toEqual(records.map(volume => 'agentor-persist-' + volume.id).sort());
       expect(records).toEqual(baseline); // The source's completed history is still authoritative.
       if (changedBaseline) {
         await f.store.upsert({ ...f.store.get(f.record.userId, f.record.id)!, initScript: 'PRIVATE-migration-config-value' });
         return;
       }
-      throw new Error('Validated staged managed-device preflight sentinel');
+      throw new (historical ? IncusRequestRejected : Error)('Validated staged managed-device preflight sentinel');
     };
     const failure = f.manager.migrateLegacyWorker(f.record.id, async () => {});
     if (changedBaseline) await expect(failure).rejects.toMatchObject({ code: 'LEGACY_MIGRATION_AUTHORITY_CHANGED',
       category: 'record-baseline', changedFields: ['initScript'],
       message: expect.not.stringContaining('PRIVATE-migration-config-value') });
-    else await expect(failure).rejects.toThrow('Validated staged managed-device preflight sentinel');
+    else {
+      await expect(failure).rejects.toThrow('Validated staged managed-device preflight sentinel');
+      await expect(failure).rejects.toBeInstanceOf(historical ? IncusRequestRejected : Error);
+    }
     expect(destinationMutations).toBe(0);
     expect(preflights).toBe(1); expect(records).toEqual(baseline); expect(saved).toEqual(baseline);
     expect(f.store.get(f.record.userId, f.record.id)).toMatchObject({ ...workerBefore, ...(changedBaseline ? { initScript: 'PRIVATE-migration-config-value' } : {}), updatedAt: expect.any(String), incusMigration: undefined });
@@ -204,6 +216,32 @@ test(`settled managed migration preflight ${changedBaseline ? 'rejects a changed
     IncusWorkerRuntime.prototype.rollbackRecreation = original.rollback;
     IncusWorkerRuntime.prototype.removeStorage = original.remove;
     Docker.prototype.getContainer = dockerOriginal.container; Docker.prototype.getVolume = dockerOriginal.volume;
+    await f.cleanup();
+  }
+});
+
+for (const failure of ['malformed-name', 'protected-parent'] as const)
+test(`legacy backup ${failure} rejects before source inspection, stopping, capture or durable migration`, async () => {
+  const f = await fixture(), volumes = useManagedVolumeManager();
+  const original = { init: volumes.init, assert: volumes.assertLiveRecoveryResolved,
+    blocked: volumes.isRecoveryBlocked, records: volumes.store.forWorker };
+  try {
+    const target = failure === 'protected-parent' ? '/home/agent/.local' : '/opt/data';
+    const source: StoredManagedVolume = { id: randomUUID(), userId: f.record.userId, workerId: f.record.id,
+      target, name: 'legacy', dockerName: persistentPathVolumeName(f.record.id, target), purpose: 'legacy-backup-path',
+      attached: true, seeded: true, state: 'ready', createdAt: f.record.createdAt, updatedAt: f.record.updatedAt };
+    if (failure === 'malformed-name') source.dockerName += '-foreign';
+    volumes.init = async () => {}; volumes.assertLiveRecoveryResolved = () => {}; volumes.isRecoveryBlocked = () => false;
+    volumes.store.forWorker = () => [source];
+    (f.manager as any).managedNetworkContext = async () => undefined;
+    const before = f.store.get(f.record.userId, f.record.id);
+    await expect(f.manager.migrateLegacyWorker(f.record.id, async () => {})).rejects.toThrow(
+      failure === 'protected-parent' ? 'protected system, runtime, or credential' : 'source name or identity');
+    expect(f.store.get(f.record.userId, f.record.id)).toEqual(before);
+    expect(f.info.status).toBe('running');
+  } finally {
+    volumes.init = original.init; volumes.assertLiveRecoveryResolved = original.assert;
+    volumes.isRecoveryBlocked = original.blocked; volumes.store.forWorker = original.records;
     await f.cleanup();
   }
 });

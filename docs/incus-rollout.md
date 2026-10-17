@@ -121,6 +121,47 @@ An ambiguous interruption fails closed and retains both sides for explicit
 administrator recovery; never clear its marker or replay an unknown operation
 based only on a missing instance or expired Incus operation record.
 
+Explicit migration translates eligible historical `legacy-backup-path` records
+into fresh native `persistent-path` copies named `agentor-persist-<volume UUID>`.
+The historical Docker name must exactly match the worker/path-derived name.
+Source records, Docker volume names and completed operation history remain
+unchanged for capture, source revalidation and rollback; retained-source receipts
+continue to name the original Docker volumes. Attached and detached copies retain
+their identity and target. No ordinary Incus lifecycle operation accepts a legacy
+name, and finalization never uses the new native name as Docker deletion authority.
+
+Native protected-target checks run before source inspection, stop or capture.
+The one historical exception is the entire `/home/agent/.local/share` managed
+volume, with `kilo` required to be the exact inert symlink
+`/home/agent/.agent-data/.kilo/shared-data`. This preserves all FreeCAD, Claude,
+code-server and other parent entries, root metadata and cross-directory hardlinks
+without copying shared account data. Ordinary new persistence requests still
+reject the parent and every other protected target.
+
+Before operational migration, prove the source's exact owner/container/mount,
+ordinary local volume name/options/incarnation, and no-follow `kilo` leaf/readlink.
+The stopped-source capture revalidates the complete unchanged GNU/PAX archive
+before allocating native storage. A missing link, real Kilo directory, different
+link or archive write below the link fails; other external managed-volume links
+remain rejected. Capture failure uses the existing exact-source rollback and
+never drops an entry to make migration pass.
+
+Native retained-volume recreation rechecks the leaf with the existing
+acknowledged networkless read-only helper before normal attachment. Isolated
+restore checks it before operational promotion, and startup checks it before
+provisioning or the worker entrypoint can replace a non-symlink Kilo path.
+Portable export/import uses the same unchanged parent archive and exact-link
+contract; reconstruction checks every existing destination conflict except the
+one protected canonical Kilo leaf. Docker starts/rebuilds use an acknowledged,
+never-started read-only/no-copy probe and a bounded single-leaf TAR to check the
+literal link (Docker HEAD metadata resolves aliases). Parent reattachment uses
+recreation; a new live hotplug remains refused. Helper ambiguity retains the
+existing recovery authority and data.
+
+Focused module tests and a real isolated GNU/PAX metadata round trip cover this
+contract. A real native migration, rebuild and portable restore remain operator
+acceptance steps; these changes do not claim live acceptance.
+
 Canonical restore allows up to 120 seconds for the isolated VM to shut down
 gracefully and flush its restored filesystems before operational devices are
 attached. A failed shutdown does not authorize promotion or a forced power-off.

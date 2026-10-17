@@ -1,3 +1,4 @@
+import { MANAGED_KILO_PARENT, MANAGED_KILO_LINK } from '../../orchestrator/server/utils/managed-volume-kilo-parent';
 import { test, expect } from '@playwright/test';
 import { mkdtemp, mkdir, readFile, writeFile, rm, readdir, symlink } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
@@ -15,7 +16,7 @@ async function fixture(role: LegacyMigrationCaptureOptions['role'] = 'workspace'
   await mkdir(join(dir, root), { mode: 0o700 });
   const bytes = Buffer.from([0, 255, 128, 10, 61, 0]); await writeFile(join(dir, root, 'data'), bytes, { mode: 0o640 });
   execFileSync('python3', ['-c', 'import os,sys; p=sys.argv[1]; os.link(p+"/data",p+"/hard");os.symlink("data",p+"/sym");os.setxattr(p+"/data","user.binary",bytes([0,255,128,10,61,0]));os.utime(p+"/data",ns=(1700000000123456789,1700000000987654321))', join(dir, root)]);
-  const raw = execFileSync('tar', ['--sort=name', '--format=pax', '--numeric-owner', '--owner=12345', '--group=23456',
+  let raw: Buffer = execFileSync('tar', ['--sort=name', '--format=pax', '--numeric-owner', '--owner=12345', '--group=23456',
     '--acls', '--xattrs', '--xattrs-include=*', '-cpf', '-', '-C', dir, root]);
   const events: string[] = [], sourceInfo = { Id: source.containerId, Created: source.createdAt, Image: source.imageId,
     State: { Running: false, Paused: false, Restarting: false, Pid: 0, Status: 'exited' },
@@ -65,6 +66,7 @@ async function fixture(role: LegacyMigrationCaptureOptions['role'] = 'workspace'
       if (mode === 'stop') failStop = true; if (mode === 'remove') failRemove = true; if (mode === 'archive') invalidRaw = true;
       if (mode === 'revoke') revokeAt = 4; if (mode === 'definite') definiteExecFailure = true;
       if (mode === 'references') foreignReferences = true; },
+    replaceRaw: (value: Buffer) => { raw = value; },
     cleanup: () => rm(dir, { recursive: true, force: true }) };
 }
 
@@ -169,4 +171,24 @@ test('credential-bearing trusted image and already cancelled capture allocate no
       await expect(captureLegacyMigrationArchive(f.options)).rejects.toThrow(); expect(f.events).not.toContain('create');
     } finally { await f.cleanup(); }
   }
+});
+
+
+for (const leaf of ['canonical', 'missing', 'directory', 'different'] as const)
+test(`historical parent migration capture ${leaf} validates exact Kilo leaf before publishing candidate data`, async () => {
+  const f = await fixture('managed');
+  try {
+    f.options.mount.Destination = MANAGED_KILO_PARENT; f.sourceInfo.Mounts[0]!.Destination = MANAGED_KILO_PARENT;
+    if (leaf === 'canonical' || leaf === 'different') await symlink(leaf === 'canonical' ? MANAGED_KILO_LINK : '/different', join(f.dir, 'volume/kilo'));
+    if (leaf === 'directory') await mkdir(join(f.dir, 'volume/kilo'));
+    const raw = execFileSync('tar', ['--sort=name', '--format=pax', '--numeric-owner', '--acls', '--xattrs', '--xattrs-include=*', '-cpf', '-', '-C', f.dir, 'volume']);
+    f.replaceRaw(raw); const source = structuredClone(f.sourceInfo);
+    if (leaf === 'canonical') {
+      await captureLegacyMigrationArchive(f.options); expect(await readFile(f.options.outputPath)).toEqual(raw);
+    } else {
+      await expect(captureLegacyMigrationArchive(f.options)).rejects.toThrow(/canonical Kilo/);
+      await expect(readFile(f.options.outputPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    }
+    expect(f.sourceInfo).toEqual(source); expect(f.removed()).toBe(true);
+  } finally { await f.cleanup(); }
 });

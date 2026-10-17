@@ -21,7 +21,6 @@ import { MAX_BACKUP_PROVIDER_OBJECT_BYTES, publicBackupFailure } from "./backup-
 import type { BackupProviderKind } from "./backup-types";
 import { backupInstallationId } from "./backup-installation";
 import { useBackupManager, type BackupManager } from "./backup-manager";
-import { useManagedVolumeManager } from "./managed-volume-manager";
 import {
   createInstanceDataArchive,
   inspectInstanceBundle,

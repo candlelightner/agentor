@@ -1,3 +1,4 @@
+import { MANAGED_KILO_PARENT, MANAGED_KILO_LINK } from './managed-volume-kilo-parent';
 import { createReadStream, createWriteStream } from "node:fs";
 import { lstat, mkdir, open, readdir, rm, stat } from "node:fs/promises";
 import { join, posix } from "node:path";
@@ -610,7 +611,7 @@ async function scanRawTar(
 function validateInnerEntries(entries: RawTarEntry[], target?: string): void {
   const paths = new Map<string, RawTarEntry["type"]>();
   const regularFiles = new Set<string>();
-  let rootSeen = false;
+  let rootSeen = false, kiloSeen = false;
   for (const entry of entries) {
     const name = canonicalInnerName(entry.name, entry.type);
     const bareName = stripDirectorySlash(name);
@@ -620,7 +621,11 @@ function validateInnerEntries(entries: RawTarEntry[], target?: string): void {
       if (entry.type !== "directory") throw invalidArchive("volume root must be a directory");
       rootSeen = true;
     }
-    if (entry.type === "symlink") {
+    if (target === MANAGED_KILO_PARENT && bareName === 'volume/kilo') {
+      if (entry.type !== 'symlink' || entry.linkName !== MANAGED_KILO_LINK)
+        throw invalidArchive('managed XDG parent requires the exact canonical Kilo symlink');
+      kiloSeen = true;
+    } else if (entry.type === "symlink") {
       validateSymlink(name, entry.linkName!, target);
     } else if (entry.type === "hardlink") {
       const target = canonicalLinkTarget(entry.linkName!);
@@ -631,6 +636,8 @@ function validateInnerEntries(entries: RawTarEntry[], target?: string): void {
     }
   }
   if (!rootSeen) throw invalidArchive("archive is missing the volume/ root directory");
+  if (target === MANAGED_KILO_PARENT && !kiloSeen)
+    throw invalidArchive('managed XDG parent is missing the canonical Kilo symlink');
   for (const [ancestor, type] of paths) {
     if (type === "directory") continue;
     for (const path of paths.keys()) {

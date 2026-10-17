@@ -1,3 +1,4 @@
+import { MANAGED_KILO_PARENT } from './managed-volume-kilo-parent';
 import { createHash } from "node:crypto";
 import {
   MAX_PORTABLE_MANAGED_VOLUMES,
@@ -136,7 +137,8 @@ export function planPortableManagedVolumeImport(
     const entry = entries[index]!;
     if (entry.target === "/")
       throw new Error("Portable managed-volume target / is not allowed");
-    if (conflictPaths.some((path) => portablePathsOverlap(entry.target, path)))
+    if (conflictKeys.some(key => input.conflicts[key].some(path => portablePathsOverlap(entry.target, path) &&
+        !(key === 'protectedPaths' && entry.target === MANAGED_KILO_PARENT && path === MANAGED_KILO_PARENT + '/kilo'))))
       throw new Error(`Portable managed-volume target ${entry.target} overlaps destination storage`);
     if (entries.slice(0, index).some((other) => portablePathsOverlap(entry.target, other.target)))
       throw new Error(`Portable managed-volume target ${entry.target} overlaps another imported volume`);
