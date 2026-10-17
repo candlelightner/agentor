@@ -1,3 +1,5 @@
+import { incusManagedVolumeDeviceKey } from './incus-managed-volume-device';
+export { incusManagedVolumeDeviceKey } from './incus-managed-volume-device';
 import { MANAGED_KILO_PARENT, MANAGED_KILO_PARENT_CHECK } from './managed-volume-kilo-parent';
 import type { Config } from './config';
 import type { IncusInstance, IncusCustomVolume, IncusDevice } from './incus-client';
@@ -16,17 +18,6 @@ import { pipeline } from 'node:stream/promises';
 
 /** Shared pure admission: the controlled helper must reject the same layouts
  * before replacing DATA_DIR that the existing inverse rejects before create. */
-export function incusManagedVolumeDeviceKey(v: StoredManagedVolume): string {
-  if (managedVolumeRuntimeKind(v) !== 'incus-vm' || v.purpose !== 'persistent-path' ||
-      !/^[a-f0-9-]{36}$/.test(v.id) || v.dockerName !== `agentor-persist-${v.id}` ||
-      v.liveContainerId || v.previousRestartPolicy)
-    throw volumeError(409, 'Managed storage backend or recovery identity is ambiguous. Data was retained.');
-  validateStoredPersistenceTarget(v.target);
-  if (pathsOverlap(v.target, '/workspace'))
-    throw volumeError(409, 'Workspace already has canonical persistence; overlapping managed storage is not allowed.');
-  return `m${v.id.replaceAll('-', '').slice(0, 6)}`;
-}
-
 export function incusManagedRestoreDevices(owner: Pick<IncusStorageOwner, 'id' | 'userId'>, pool: string,
   attached: StoredManagedVolume[] = [], detached: StoredManagedVolume[] = []): Record<string, IncusDevice> {
   const devices: Record<string, IncusDevice> = {}, targets: string[] = [];
@@ -54,11 +45,17 @@ export function incusManagedRestoreDevices(owner: Pick<IncusStorageOwner, 'id' |
 /** Managed paths keep their existing store/policy. This adapter owns only the
  * Incus filesystem and retained-compute seeding operations, not a second
  * lifecycle/recovery coordinator. */
+export interface IncusManagedVolumeAuthority {
+  owner(userId: string, workerId: string): IncusStorageOwner;
+  inspect(userId: string, workerId: string, handle: string): Promise<IncusInstance>;
+}
+type ManagedWorkerRuntime = Pick<IncusWorkerRuntime, 'client' | 'matchesWorkerIdentity' | 'stop' | 'openOfflineManagedArchive' | 'commands'>;
 export class IncusManagedVolumeRuntime {
   private installation?: Promise<string>;
-  constructor(private config: Config, readonly worker = new IncusWorkerRuntime(config)) {}
+  constructor(private config: Config, readonly worker: ManagedWorkerRuntime = new IncusWorkerRuntime(config), private authority?: IncusManagedVolumeAuthority) {}
   private installationId() { return this.installation ??= backupInstallationId(this.config.dataDir); }
   private owner(v: StoredManagedVolume): IncusStorageOwner {
+    if (this.authority) return this.authority.owner(v.userId, v.workerId);
     return { id: v.workerId, userId: v.userId, containerName: `${this.config.containerPrefix}-${v.workerId}` };
   }
   private validateRecord(v: StoredManagedVolume) {
@@ -174,6 +171,7 @@ export class IncusManagedVolumeRuntime {
   }
 
   async inspect(userId: string, workerId: string, handle: string): Promise<IncusInstance> {
+    if (this.authority) return this.authority.inspect(userId, workerId, handle);
     const incarnation = handle.startsWith('incus:') ? handle.slice(6) : '';
     const instance = await this.worker.client.getInstance(`${this.config.containerPrefix}-${workerId}`);
     if (!incarnation || instance.config['volatile.uuid'] !== incarnation ||

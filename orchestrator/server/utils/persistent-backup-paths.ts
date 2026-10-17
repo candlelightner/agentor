@@ -45,6 +45,24 @@ export class PersistentBackupPathManager {
       const worker = this.resolveWorker(workerId);
       if (!worker || worker.userId !== userId)
         throw Object.assign(new Error("Workspace not found"), { statusCode: 404 });
+      if (worker.administrativeKind && worker.runtimeKind === 'incus-vm') {
+        const { readAdministrativeRuntimeRecord, administrativeRuntimeOwner } = await import('./admin-native-authority');
+        const record = await readAdministrativeRuntimeRecord(workerId),owner = administrativeRuntimeOwner(record);
+        if(owner.userId !== userId) throw Object.assign(new Error('Workspace not found'),{statusCode:404});
+        const operation = async (current: typeof record,ack: import('./admin-native-authority').AdminNativeAcknowledge) => {
+          if(current.id !== workerId || administrativeRuntimeOwner(current).userId !== userId) throw Object.assign(new Error('Workspace not found'),{statusCode:404});
+          const { useAdministrativeWorkspaceRuntime } = await import('./services');
+          await useAdministrativeWorkspaceRuntime().native.adoptSelections(current,rawPaths,ack);
+        };
+        if(owner.groupId) {
+          const { useGroupAdminWorkspaceStore } = await import('./group-admin-workspace-store');
+          await useGroupAdminWorkspaceStore().withNativeRuntimeTransaction(owner.groupId,operation);
+        } else {
+          const { useAdminWorkspaceStore } = await import('./admin-workspace-store');
+          await useAdminWorkspaceStore().withNativeRuntimeTransaction(operation);
+        }
+        continue;
+      }
       const { withOwnerWorkerLifecycleMutation } = await import("./worker-lifecycle-coordinator");
       const { useManagedVolumeManager } = await import("./managed-volume-manager");
       await withOwnerWorkerLifecycleMutation(userId, workerId, async () => {

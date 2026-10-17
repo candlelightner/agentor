@@ -53,9 +53,10 @@ test('malformed persisted native metadata quarantines the global identity and pr
  const directory=await mkdtemp(join(tmpdir(),'admin-native-'));const r=record();const bytes=JSON.stringify({...r,runtimeKind:'incus-vm',nativeRuntime:{bad:true}});
  try {await mkdir(join(directory,'admin'));const path=join(directory,'admin/workspace.v1.json');await writeFile(path,bytes);const store=new AdminWorkspaceStore(directory);await expect(store.init()).rejects.toMatchObject({statusCode:503});expect(()=>store.getRecord()).toThrow();expect(await readFile(path,'utf8')).toBe(bytes);}finally{await rm(directory,{recursive:true,force:true});}
 });
-test('runtime patch cannot change administrative identity, status or startup script',()=>{
+test('runtime patch preserves identity and startup script and validates explicit internal status acknowledgement',()=>{
  const r=record();r.startupScript='echo unchanged';const before=structuredClone(r);applyAdminNativePatch(r,{runtimeKind:'incus-vm',nativeRuntime:identity(r),id:randomUUID(),status:'running',startupScript:'bad'} as any);
- expect(r.id).toBe(before.id);expect(r.status).toBe(before.status);expect(r.startupScript).toBe(before.startupScript);
+ expect(r.id).toBe(before.id);expect(r.status).toBe('running');
+ expect(()=>applyAdminNativePatch(r,{runtimeKind:'incus-vm',nativeRuntime:r.nativeRuntime,status:'arbitrary'} as any)).toThrow('status acknowledgement');expect(r.startupScript).toBe(before.startupScript);
 });
 
 test('bounded legacy administrative and group IDs retain authority and deterministic bounded native names',()=>{
@@ -81,4 +82,30 @@ test('explicit group reload refreshes and quarantines/recoveries remain explicit
 });
 test('overall group bootstrap scan failure is retryable without manufacturing healthy authority',async()=>{
  const directory=await mkdtemp(join(tmpdir(),'admin-group-retry-'));try{const users=join(directory,'users');await writeFile(users,'not a directory');const store=new WorkerGroupStore(directory);await expect(store.init()).rejects.toBeTruthy();await rm(users);await mkdir(users);await expect(store.init()).resolves.toBeUndefined();expect(store.list()).toEqual([]);}finally{await rm(directory,{recursive:true,force:true});}
+});
+
+test('selected admin references and temporary device receipts reject malformed or cross-incarnation authority',()=>{
+ const r=record(),id=randomUUID(),incarnation=randomUUID(),native={...identity(r),incarnation,selectedVolumeIds:[id]};
+ const operation={volumeId:id,operationId:randomUUID(),incarnation,kind:'seed' as const};
+ const valid={...r,runtimeKind:'incus-vm' as const,nativeRuntime:{...native,selectedOperation:operation}};
+ expect(()=>validateAdminNativeState(valid)).not.toThrow();
+ for(const patch of [{selectedOperation:null},{selectedOperation:{...operation,device:null}},{selectedVolumeIds:[id,id]},{selectedVolumeIds:['../bad']},{selectedVolumeIds:Array.from({length:33},()=>randomUUID())},
+  {selectedOperation:{...operation,volumeId:randomUUID()}},{selectedOperation:{...operation,incarnation:randomUUID()}},
+  {selectedOperation:{...operation,kind:'snapshot',canonical:true}},{selectedOperation:{...operation,device:{state:'accepted'}}},
+  {selectedOperation:{...operation,device:{state:'unknown',operation:'/1.0/operations/'+randomUUID()}}},
+  {selectedOperation:{...operation,device:{state:'accepted',operation:'https://foreign/1.0/operations/'+randomUUID()}}}])
+  expect(()=>validateAdminNativeState({...valid,nativeRuntime:{...native,...patch} as any})).toThrow();
+});
+
+test('dedicated migration remembers source running intent and acknowledges stopped state atomically',()=>{
+ const r=record(),native=identity(r),source={containerId:'1'.repeat(64),imageId:'sha256:'+'2'.repeat(64),createdAt:stamp,wasRunning:true};
+ applyAdminNativePatch(r,{runtimeKind:'incus-vm',status:'stopped',nativeRuntime:native,nativeMigration:{version:1,nonce:randomUUID(),phase:'captured',source}});
+ expect(r.status).toBe('stopped');expect(r.nativeMigration!.source.wasRunning).toBe(true);
+ expect(()=>validateAdminNativeState({...r,nativeMigration:{...r.nativeMigration!,source:{...source,wasRunning:'true'} as any}})).toThrow();
+});
+
+test('pure legacy administrative resource naming retains exact global and bounded group names',async()=>{
+ const {administrativeWorkspaceResourceNames}=await import('../../orchestrator/server/utils/admin-workspace-resources');
+ expect(administrativeWorkspaceResourceNames(record())).toEqual({groupId:undefined,container:'agentor-admin-workspace',workspaceVolume:'agentor-admin-workspace-data',agentsVolume:'agentor-admin-agent-data',managementNetwork:'agentor-management',egressNetwork:'agentor-admin-egress-v1'});
+ expect(administrativeWorkspaceResourceNames({...record(),kind:'group-administrative',groupId:'legacy_group'} as any).workspaceVolume).toBe('agentor-admin-group-legacy_group-data');
 });

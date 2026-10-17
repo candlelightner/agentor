@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { AdministrativeWorkspaceRecord } from './admin-workspace-store';
-import { administrativeRuntimeOwner } from './admin-native-authority';
+import { administrativeRuntimeOwner } from './admin-native-identity';
 
 export function administrativeNativeOverlay(record: Readonly<AdministrativeWorkspaceRecord>) {
     const owner = administrativeRuntimeOwner(record);

@@ -8,6 +8,10 @@ import { IncusClient, IncusRequestRejected, type IncusInstance, type IncusDevice
 import type { AdministrativeWorkspaceRecord, AdminWorkspaceRuntimeAdapter, AdminWorkspaceRuntimeImage, AdminWorkspaceStartupScriptRuntimeStatus } from './admin-workspace-store';
 import { normalizedRevision } from './admin-workspace-store';
 import { administrativeRuntimeOwner, adminNativeInstanceName, readAdministrativeRuntimeRecord, applyAdminNativePatch, validateAdminNativeState, type AdminNativeAcknowledge, type AdminNativeRuntimeIdentity } from './admin-native-authority';
+import { ManagedVolumeStore, pathsOverlap, validatePersistenceTarget, type StoredManagedVolume } from './managed-volume-store';
+import { IncusManagedVolumeRuntime, incusManagedVolumeDeviceKey } from './incus-managed-volume-runtime';
+import { normalizeBackupPaths } from './backup-paths';
+import { MANAGED_KILO_PARENT, MANAGED_KILO_PARENT_CHECK } from './managed-volume-kilo-parent';
 import { IncusAdminWorkspaceStorage } from './incus-admin-workspace-storage';
 import { IncusAdminNetworkBoundary, type AdminNativeNetwork } from './incus-admin-network';
 import { incusImageIdentity, type IncusWorkerImageIdentity } from './incus-worker-image';
@@ -67,7 +71,7 @@ try:
  finally: os.close(directory)
 finally: os.close(root)
 `;
-export const ADMIN_NATIVE_INITIALIZE_ROOTS=String.raw`import os
+export const ADMIN_NATIVE_INITIALIZE_ROOTS = String.raw `import os
 roots=['/workspace','/home/agent/.agent-data']
 flags=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW
 opened=[]
@@ -105,6 +109,7 @@ try:
 finally: os.close(fd)
 `;
 interface Dependencies {
+    managedStore?: () => Promise<ManagedVolumeStore>;
     readRecord?: (id: string) => Promise<AdministrativeWorkspaceRecord>;
     resolveImage?: (record: Readonly<AdministrativeWorkspaceRecord>, refresh: boolean) => Promise<IncusWorkerImageIdentity>;
     ownerEnvironment?: (ownerId: string) => UserEnvVars;
@@ -119,7 +124,12 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
     private listener?: (host: string) => Promise<void>;
     constructor(private config: Config, client = IncusClient.fromConfig(config), network = new IncusAdminNetworkBoundary(config), private dependencies: Dependencies = {}) {
         this.client = client;
-        this.storage = new IncusAdminWorkspaceStorage(config, client);
+        this.storage = new IncusAdminWorkspaceStorage(config, client, dependencies.managedStore ?? (async () => {
+            const { useManagedVolumeManager } = await import('./managed-volume-manager');
+            const manager = useManagedVolumeManager();
+            await manager.init();
+            return manager.store;
+        }));
         this.network = network;
     }
     setManagementListener(listener: (host: string) => Promise<void>) { this.listener = listener; }
@@ -166,7 +176,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
     async prepareCredential(record: Readonly<AdministrativeWorkspaceRecord>, issuer: () => Promise<string>) {
         await this.validateAuthority(record);
         this.issuers.set(record.id, issuer);
-        if (record.nativeRuntime?.pending)
+        if (record.nativeRuntime?.pending || record.nativeRuntime?.selectedOperation || record.nativeRuntime?.deleting)
             return;
         if (record.nativeRuntime?.incarnation) {
             let instance: IncusInstance;
@@ -194,8 +204,12 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
             await this.assertOwned(record);
             try {
                 const result = await this.client.exec(record.nativeRuntime!.name, ['timeout', '5', '/usr/bin/true'], { command: [], user: 0, group: 0 });
-                if (result.returnCode === 0) { await this.assertOwned(record); return; }
-            } catch { /* Only this harmless agent probe is safe to retry. */ }
+                if (result.returnCode === 0) {
+                    await this.assertOwned(record);
+                    return;
+                }
+            }
+            catch { /* Only this harmless agent probe is safe to retry. */ }
             await this.assertOwned(record);
             await new Promise(resolve => setTimeout(resolve, 250));
         }
@@ -252,7 +266,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
     async assertOwned(record: Readonly<AdministrativeWorkspaceRecord>, incarnation = record.nativeRuntime?.incarnation): Promise<IncusInstance> {
         return this.inspectOwned(record, incarnation);
     }
-    private async inspectOwned(record: Readonly<AdministrativeWorkspaceRecord>, incarnation = record.nativeRuntime?.incarnation, allowPending = false): Promise<IncusInstance> {
+    private async inspectOwned(record: Readonly<AdministrativeWorkspaceRecord>, incarnation = record.nativeRuntime?.incarnation, allowPending = false, allowSelectedOperation = false): Promise<IncusInstance> {
         await this.validateAuthority(record, incarnation);
         const native = record.nativeRuntime, owner = administrativeRuntimeOwner(record);
         if (!native || native.deleting || native.pending && !allowPending || native.name !== adminNativeInstanceName(record) || native.installationId !== await this.installation() ||
@@ -271,7 +285,22 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
             Object.keys(instance.expanded_config ?? {}).some(k => k.startsWith('raw.')))
             throw failure('Administrative VM ownership or incarnation is ambiguous');
         const network = await this.network.boundary(record, 'inspect');
-        const persistent = await this.storage.devices(record, native, false);
+        const persistent = await this.storage.devices(record, native, false, allowSelectedOperation);
+        const operation = native.selectedOperation;
+        if(operation?.canonical && instance.status !== 'Stopped') throw failure('Administrative canonical seed transition requires stopped compute');
+        if (operation && allowSelectedOperation) {
+            const v = (await this.storage.selectedRecords(record)).find(value => value.id === operation.volumeId)!;
+            const key = incusManagedVolumeDeviceKey(v);
+            if (!instance.devices[key]) {
+                if (v.seeded && operation.canonical)
+                    throw failure('Committed administrative selection is unexpectedly detached');
+                delete persistent[key];
+            }
+            else if (operation.canonical && v.seeded && instance.status === 'Stopped' &&
+                isDeepStrictEqual(instance.devices[key], { ...persistent[key], path: `/run/agentor-volume-seed/${v.id}` })) {
+                persistent[key] = instance.devices[key];
+            }
+        }
         const expected = { ...persistent, root: { type: 'disk', path: '/', pool: this.config.incusStoragePool }, eth0: this.network.device(network) };
         if (!isDeepStrictEqual(instance.devices, expected) || !isDeepStrictEqual(instance.expanded_devices ?? instance.devices, expected))
             throw failure('Administrative VM storage or network boundary changed');
@@ -284,7 +313,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         const record = structuredClone(input), ack = this.patch(record, acknowledge);
         await this.installation();
         await this.validateAuthority(record);
-        if (record.nativeRuntime?.deleting || record.nativeRuntime?.pending)
+        if (record.nativeRuntime?.deleting || record.nativeRuntime?.selectedOperation || record.nativeRuntime?.pending)
             throw failure('Administrative VM operation requires explicit recovery');
         if (!record.nativeRuntime) {
             const image = await this.image(record);
@@ -304,6 +333,8 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         if (!instance) {
             if (native.incarnation)
                 throw failure('Administrative compute is missing; explicit recovery is required');
+            await this.storage.verifySelectedBeforeMount(record, () => this.validateAuthority(record));
+            await this.storage.selectedDevices(record);
             const network = await this.network.boundary(record, 'ensure');
             const devices = await this.storage.devices(record, native, !native.storageReady);
             if (!native.storageReady)
@@ -312,7 +343,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
                 source: { type: 'image', fingerprint: native.image.fingerprint }, config: { 'user.agentor.installation': native.installationId,
                     'user.agentor.id': owner.id, 'user.agentor.owner': owner.userId, 'user.agentor.administrative': owner.kind,
                     'user.agentor.admin-group': owner.groupId ?? '', 'user.agentor.admin-nonce': native.nonce,
-                    'user.agentor.admin-overlay-sha256': native.overlaySha256, 'security.secureboot': 'false', 'boot.autostart': 'false', 'limits.memory':'4GiB','limits.cpu':'2' },
+                    'user.agentor.admin-overlay-sha256': native.overlaySha256, 'security.secureboot': 'false', 'boot.autostart': 'false', 'limits.memory': '4GiB', 'limits.cpu': '2' },
                 devices: { ...devices, root: { type: 'disk', path: '/', pool: this.config.incusStoragePool }, eth0: this.network.device(network) } }, onAccepted).then(async (created) => {
                 if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(created.config['volatile.uuid'] ?? ''))
                     throw failure('Administrative VM incarnation is unavailable');
@@ -340,6 +371,9 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         await this.listener?.(boundary.managementAddress);
         if (instance.status === 'Running')
             return this.waitReady(record);
+        if ((await this.storage.selectedRecords(record)).some(v => !v.seeded))
+            throw failure('Apply administrative selected directories through explicit rebuild before starting');
+        await this.storage.verifySelectedBeforeMount(record, () => this.validateAuthority(record));
         const issuer = this.issuers.get(record.id);
         if (!issuer)
             throw failure('Administrative start identity was not prepared');
@@ -348,11 +382,15 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
             instance = await this.assertOwned(record);
             await this.waitAgent(record);
             await this.execute(record, ['/bin/sh', '-ec', PREPARE]);
-            if(!record.nativeRuntime!.storageInitialized){
-                await this.execute(record,['/usr/bin/python3','-c',ADMIN_NATIVE_INITIALIZE_ROOTS]);
-                await ack({...record.nativeRuntime!,storageInitialized:true});
+            if (!record.nativeRuntime!.storageInitialized) {
+                await this.execute(record, ['/usr/bin/python3', '-c', ADMIN_NATIVE_INITIALIZE_ROOTS]);
+                await ack({ ...record.nativeRuntime!, storageInitialized: true });
             }
-            await this.client.pushFile(instance.name,'/run/agentor/preserve-storage-ownership','agentor-preserve-storage-ownership-v1\n',{uid:0,gid:0,mode:0o600});
+            for (const v of await this.storage.selectedRecords(record, true)) {
+                if (v.target === MANAGED_KILO_PARENT)
+                    await this.execute(record, ['/usr/bin/python3', '-c', MANAGED_KILO_PARENT_CHECK, v.target]);
+            }
+            await this.client.pushFile(instance.name, '/run/agentor/preserve-storage-ownership', 'agentor-preserve-storage-ownership-v1\n', { uid: 0, gid: 0, mode: 0o600 });
             for (const [path, file] of Object.entries(administrativeNativeOverlay(record))) {
                 await this.client.pushFile(instance.name, path, file.content, { uid: 0, gid: 0, mode: file.mode });
             }
@@ -433,7 +471,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
             }
             throw failure('Administrative removal is not complete');
         }
-        const instance = await this.inspectOwned(record, native.incarnation, true);
+        const instance = await this.inspectOwned(record, native.incarnation, true, !!native.selectedOperation);
         if (pending.kind === 'start' && instance.status !== 'Running' || pending.kind === 'stop' && instance.status !== 'Stopped')
             throw failure('Administrative operation state is unsettled');
         await ack({ ...native, pending: undefined });
@@ -442,6 +480,14 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         const record = structuredClone(input), ack = this.patch(record, acknowledge);
         if (record.nativeRuntime?.pending)
             await this.settlePending(record, async (patch) => { await acknowledge!(patch); applyAdminNativePatch(record, patch); });
+        if (record.nativeRuntime?.deleting)
+            throw failure('Administrative deletion requires cleanup before rebuild');
+        if (record.nativeRuntime?.selectedOperation)
+            await this.recoverSelectedStorage(record, async (patch) => { await acknowledge!(patch); applyAdminNativePatch(record, patch); });
+        for (const volume of await this.storage.selectedRecords(record)) {
+            if (!volume.seeded)
+                await this.copySelection(record, volume, 'seed', ack);
+        }
         let present = true;
         try {
             await this.assertOwned(record);
@@ -454,7 +500,8 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
             present = false;
         }
         const selected = await this.image(record, true);
-        if (present) await this.mutation(record, 'delete', ack, accepted => this.client.deleteInstance(record.nativeRuntime!.name, accepted));
+        if (present)
+            await this.mutation(record, 'delete', ack, accepted => this.client.deleteInstance(record.nativeRuntime!.name, accepted));
         await ack({ ...record.nativeRuntime!, incarnation: undefined, image: selected });
         return this.ensureRecord(record, acknowledge, true, true);
     }
@@ -498,14 +545,18 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
             session.close();
         }
     }
-    async assertRunning(record:Readonly<AdministrativeWorkspaceRecord>,incarnation=record.nativeRuntime?.incarnation):Promise<IncusInstance>{
-        if(record.status!=='running' || !incarnation || !record.nativeRuntime?.storageInitialized)throw failure('Administrative runtime is not ready');
-        const instance=await this.assertOwned(record,incarnation);
-        if(instance.status!=='Running')throw failure('Administrative VM is not running');
-        const result=await this.client.exec(instance.name,['/bin/bash','-c',INCUS_GUEST_READINESS_SCRIPT,'admin-ready',
-          '/bin/bash','-ec','set -a; . /run/agentor/worker.env; set +a; exec /bin/sh -c "$1"','admin-session',INCUS_MAIN_SESSION_PROBE],{command:[],user:0,group:0});
-        if(result.returnCode!==0 || !/^[a-f0-9-]{36} 1 1\s*$/.test(result.stdout))throw failure('Administrative guest service is not ready');
-        await this.assertOwned(record,incarnation);return instance;
+    async assertRunning(record: Readonly<AdministrativeWorkspaceRecord>, incarnation = record.nativeRuntime?.incarnation): Promise<IncusInstance> {
+        if (record.status !== 'running' || !incarnation || !record.nativeRuntime?.storageInitialized)
+            throw failure('Administrative runtime is not ready');
+        const instance = await this.assertOwned(record, incarnation);
+        if (instance.status !== 'Running')
+            throw failure('Administrative VM is not running');
+        const result = await this.client.exec(instance.name, ['/bin/bash', '-c', INCUS_GUEST_READINESS_SCRIPT, 'admin-ready',
+            '/bin/bash', '-ec', 'set -a; . /run/agentor/worker.env; set +a; exec /bin/sh -c "$1"', 'admin-session', INCUS_MAIN_SESSION_PROBE], { command: [], user: 0, group: 0 });
+        if (result.returnCode !== 0 || !/^[a-f0-9-]{36} 1 1\s*$/.test(result.stdout))
+            throw failure('Administrative guest service is not ready');
+        await this.assertOwned(record, incarnation);
+        return instance;
     }
     async resolveHost(record: Readonly<AdministrativeWorkspaceRecord>): Promise<{
         address: string;
@@ -551,26 +602,260 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         await this.validateAuthority(record);
         if (!record.nativeRuntime?.deleting) {
             const instance = await this.assertOwned(record);
-            if (instance.status !== 'Stopped') throw failure('Stop administrative workspace before deletion');
+            if (instance.status !== 'Stopped')
+                throw failure('Stop administrative workspace before deletion');
             await ack({ ...record.nativeRuntime!, deleting: true });
-            await this.mutation(record, 'delete', ack, accepted => this.client.deleteInstance(instance.name, accepted));
-        } else {
+            try {
+                await this.mutation(record, 'delete', ack, accepted => this.client.deleteInstance(instance.name, accepted));
+            } catch(error) {
+                if(error instanceof IncusRequestRejected && !record.nativeRuntime!.pending)
+                    await ack({...record.nativeRuntime!,deleting:undefined});
+                throw error;
+            }
+        }
+        else {
             // A lost delete result still requires its exact terminal receipt.
             if (record.nativeRuntime.pending) {
-                await this.settlePending(record, async patch => { await acknowledge!(patch); applyAdminNativePatch(record, patch); });
+                await this.settlePending(record, async (patch) => { await acknowledge!(patch); applyAdminNativePatch(record, patch); });
             }
             // A durable intent does not authorize retrying an ambiguous delete.
-            try { await this.client.getInstance(record.nativeRuntime.name); throw failure('Administrative compute deletion requires explicit recovery'); }
-            catch (error) { if (!absent(error)) throw error; }
+            try {
+                await this.client.getInstance(record.nativeRuntime.name);
+                throw failure('Administrative compute deletion requires explicit recovery');
+            }
+            catch (error) {
+                if (!absent(error))
+                    throw error;
+            }
         }
         for (const role of ['workspace', 'agents'] as const) {
             await this.validateAuthority(record);
             const volume = await this.storage.inspect(record, record.nativeRuntime!, role);
-            if (!volume) continue; // Earlier acknowledged deletion may already have completed.
-            if (volume.used_by?.length) throw failure('Administrative storage deletion authority is unavailable');
+            if (!volume)
+                continue; // Earlier acknowledged deletion may already have completed.
+            if (volume.used_by?.length)
+                throw failure('Administrative storage deletion authority is unavailable');
             await this.client.deleteCustomVolume(this.config.incusStoragePool, volume.name);
         }
+        const owner = administrativeRuntimeOwner(record), ids = record.nativeRuntime!.selectedVolumeIds ?? [];
+        if (ids.length) {
+            const store = await this.storage.store();
+            for (const id of ids) {
+                await this.validateAuthority(record);
+                const v = store.get(owner.userId, id);
+                if (!v)
+                    continue;
+                const volume = await this.storage.inspectSelectedVolume(record, v);
+                if (volume?.used_by?.length)
+                    throw failure('Administrative selected deletion source is still referenced');
+                if (volume)
+                    await this.client.deleteCustomVolume(this.config.incusStoragePool, volume.name);
+            }
+            for (const id of ids)
+                await store.forget(owner.userId, id);
+            await ack({ ...record.nativeRuntime!, selectedVolumeIds: [] });
+        }
         (await import('./services')).useContainerManager().unregisterExternal(record.id);
+    }
+    /** Private adapter: all source reads use dedicated authority, never WorkerStore. */
+    private selectedAdapter(record: AdministrativeWorkspaceRecord, ack: ReturnType<IncusAdminWorkspaceRuntime['patch']>) {
+        const owner = administrativeRuntimeOwner(record);
+        const check = (userId: string, workerId: string) => {
+            if (userId !== owner.userId || workerId !== owner.id)
+                throw failure('Administrative selected owner changed');
+            return { id: owner.id, userId: owner.userId, containerName: record.nativeRuntime!.name };
+        };
+        const client = new Proxy(this.client, { get: (target, key) => {
+                if(key === 'startInstance') return async (name: string) => {
+                    if(name !== record.nativeRuntime!.name) throw failure('Administrative selected boot identity changed');
+                    await this.mutation(record,'start',ack,accepted => target.startInstance(name,accepted));
+                };
+                if (key !== 'updateInstanceDevices') {
+                    const value = Reflect.get(target, key);
+                    return typeof value === 'function' ? value.bind(target) : value;
+                }
+                return async (name: string, devices: Record<string, IncusDevice>, _accepted?: unknown, before?: IncusInstance) => {
+                    const intent = record.nativeRuntime!.selectedOperation!;
+                    if (intent.device && intent.device.state !== 'settled')
+                        throw failure('Administrative selected device acknowledgement requires explicit recovery');
+                    await ack({ ...record.nativeRuntime!, selectedOperation: { ...intent, device: { state: 'unknown' } } });
+                    await target.updateInstanceDevices(name, devices, async (operation) => {
+                        await ack({ ...record.nativeRuntime!, selectedOperation: { ...record.nativeRuntime!.selectedOperation!, device: operation ? { state: 'accepted', operation } : { state: 'settled' } } });
+                    }, before);
+                    await ack({ ...record.nativeRuntime!, selectedOperation: { ...record.nativeRuntime!.selectedOperation!, device: { state: 'settled' } } });
+                };
+            } });
+        return new IncusManagedVolumeRuntime(this.config, {
+            client, matchesWorkerIdentity: async () => false,
+            commands: () => { throw failure('Use the dedicated administrative command authority'); },
+            openOfflineManagedArchive: async () => { throw failure('Use the dedicated administrative archive capture adapter'); },
+            stop: async (_owner, incarnation) => {
+                const current = await this.inspectOwned(record, incarnation, false, true);
+                if (current.status === 'Running')
+                    await this.mutation(record, 'stop', ack, accepted => this.client.stopInstance(current.name, { timeout: 15 }, accepted));
+            },
+        }, { owner: check, inspect: async (userId, workerId, handle) => {
+                check(userId, workerId);
+                if (handle !== `incus:${record.nativeRuntime!.incarnation}`)
+                    throw failure('Administrative selected source incarnation changed');
+                return this.inspectOwned(record, record.nativeRuntime!.incarnation, false, true);
+            } });
+    }
+    private async copySelection(record: AdministrativeWorkspaceRecord, input: StoredManagedVolume, kind: 'snapshot' | 'seed', ack: ReturnType<IncusAdminWorkspaceRuntime['patch']>) {
+        const store = await this.storage.store(), operationId = randomUUID(), native = record.nativeRuntime!;
+        if (kind === 'seed') await this.network.boundary(record, 'ensure');
+        let v: StoredManagedVolume = { ...input, state: 'preparing', operation: { id: operationId, mode: 'recreate', stage: 'copying' } };
+        const previous = structuredClone(store.get(v.userId,v.id))!;
+        try {
+            await store.save(v);
+            await ack({ ...native, selectedOperation: { volumeId: v.id, operationId, incarnation: native.incarnation!, kind } });
+        } catch(error) {
+            // No daemon mutation has been submitted at this boundary. Restore
+            // only our exact prepared metadata when no native receipt adopted it.
+            try {
+                await this.validateAuthority(record);
+                const current = store.get(v.userId,v.id);
+                if(current && isDeepStrictEqual(current,{...v,updatedAt:current.updatedAt})) await store.save(previous);
+            } catch { /* Preserve an adopted receipt or unresolved store fault. */ }
+            throw error;
+        }
+        const adapter = this.selectedAdapter(record, ack), handle = `incus:${native.incarnation}`;
+        try {
+            if (kind === 'snapshot')
+                await adapter.stageSelection(handle, v);
+            else {
+                await adapter.seed(handle, v, async () => {
+                    if (v.target === MANAGED_KILO_PARENT) {
+                        const result = await this.client.exec(native.name, ['timeout', '15', 'python3', '-c', MANAGED_KILO_PARENT_CHECK, `/run/agentor-volume-seed/${v.id}`]);
+                        if (result.returnCode !== 0)
+                            throw failure('Administrative XDG parent requires the exact canonical Kilo symlink');
+                    }
+                    v = { ...v, seeded: true, state: 'ready' };
+                    await store.save(v);
+                });
+                const current = await this.inspectOwned(record, native.incarnation, false, true), key = adapter.deviceKey(v);
+                if (current.status !== 'Stopped' || !isDeepStrictEqual(current.devices[key], { ...adapter.device(v), path: `/run/agentor-volume-seed/${v.id}` }))
+                    throw failure('Administrative selection seed is unsettled; retained source was preserved');
+                await ack({ ...record.nativeRuntime!, selectedOperation: { ...record.nativeRuntime!.selectedOperation!, canonical: true } });
+                await adapter.worker.client.updateInstanceDevices(current.name, { ...current.devices, [key]: adapter.device(v) }, undefined, current);
+                // The fixed canonical device is checked only after the staging receipt is cleared.
+            }
+            await store.save({ ...v, state: v.seeded ? 'ready' : 'pending', operation: { ...v.operation!, stage: 'complete' } });
+            await ack({ ...record.nativeRuntime!, selectedOperation: undefined });
+            await this.assertOwned(record);
+        }
+        catch (error) {
+            await store.save({ ...v, state: 'failed', operation: { ...v.operation!, stage: 'failed', error: 'Selected directory copy requires explicit recovery' } }).catch(() => { });
+            throw error;
+        }
+    }
+    /** Caller holds the dedicated store transaction and its owner/worker fence. */
+    async adoptSelections(input: Readonly<AdministrativeWorkspaceRecord>, rawPaths: string[], acknowledge: AdminNativeAcknowledge) {
+        const record = structuredClone(input), ack = this.patch(record, acknowledge), owner = administrativeRuntimeOwner(record);
+        if (record.nativeRuntime?.selectedOperation || record.nativeRuntime?.deleting)
+            throw failure('Recover administrative selected storage before changing selections');
+        const instance = await this.assertOwned(record);
+        const store = await this.storage.store(), adapter = this.selectedAdapter(record, ack);
+        for (const target of normalizeBackupPaths(rawPaths)) {
+            const known = await this.storage.selectedRecords(record);
+            if (['/workspace', '/home/agent/.agent-data'].some(root => target === root || target.startsWith(root + '/')))
+                continue;
+            const covered = known.find(v => target === v.target || target.startsWith(v.target+'/'));
+            if(covered) {
+                if(!covered.seeded && !covered.operation) {
+                    if(instance.status !== 'Running') throw failure('Start the retained administrative VM before refreshing its selected directory');
+                    await this.copySelection(record,covered,'snapshot',ack);
+                }
+                continue;
+            }
+            try {
+                validatePersistenceTarget(target);
+            }
+            catch (error) {
+                if ((error as {
+                    statusCode?: number;
+                }).statusCode === 400)
+                    continue;
+                throw error;
+            }
+            if (known.some(v => pathsOverlap(v.target, target)))
+                throw failure('Administrative selected directories overlap retained persistence');
+            if (!await adapter.isSelectionDirectory(owner.userId, owner.id, `incus:${instance.config['volatile.uuid']}`, target))
+                continue;
+            if (store.forWorker(owner.userId, owner.id).some(v => v.attached && v.target === target))
+                throw failure('Migrate the retained historical selection before adopting this administrative path');
+            const v = await store.create(owner.userId, owner.id, target, undefined, 'incus-vm');
+            incusManagedVolumeDeviceKey(v);
+            const created = structuredClone(store.get(owner.userId,v.id));
+            try {
+                await ack({ ...record.nativeRuntime!, selectedVolumeIds: [...(record.nativeRuntime!.selectedVolumeIds ?? []), v.id] });
+            } catch(error) {
+                // Roll back only this new, still-unallocated record when the
+                // fresh durable admin authority proves the ref was not adopted.
+                try {
+                    await this.validateAuthority(record);
+                    if (!isDeepStrictEqual(store.get(owner.userId,v.id),created)) throw failure('Administrative selection changed');
+                    let absentVolume = false;
+                    try {await this.client.getCustomVolume(this.config.incusStoragePool,v.dockerName);}
+                    catch(inspectError) {if(absent(inspectError)) absentVolume=true;else throw inspectError;}
+                    if(absentVolume) await store.forget(owner.userId,v.id);
+                } catch { /* An acknowledged or ambiguous ref remains quarantined. */ }
+                throw error;
+            }
+            await this.copySelection(record, v, 'snapshot', ack);
+        }
+    }
+    /** Backup/migration callers receive only fully seeded, settled canonical sources. */
+    async inspectSelectedStorage(record: Readonly<AdministrativeWorkspaceRecord>) {
+        await this.assertOwned(record);
+        return this.storage.inspectSelected(record);
+    }
+    /** Explicit recovery never guesses data completion or deletes either copy. */
+    async recoverSelectedStorage(input: Readonly<AdministrativeWorkspaceRecord>, acknowledge: AdminNativeAcknowledge) {
+        const record = structuredClone(input), ack = this.patch(record, acknowledge), intent = record.nativeRuntime?.selectedOperation;
+        if (!intent)
+            return;
+        if (record.nativeRuntime?.pending)
+            await this.settlePending(record, async (patch) => { await acknowledge(patch); applyAdminNativePatch(record, patch); });
+        const device = record.nativeRuntime!.selectedOperation!.device;
+        if (device && device.state !== 'settled') {
+            if (device.state === 'unknown')
+                throw failure('Unacknowledged administrative device change requires operator recovery');
+            const operation = await this.client.request<{
+                status: string;
+                status_code: number;
+            }>('GET', device.operation!);
+            if (!['Success', 'Failure'].includes(operation.status) || ![200, 400].includes(operation.status_code))
+                throw failure('Administrative selected device operation is not terminal');
+            await ack({ ...record.nativeRuntime!, selectedOperation: { ...record.nativeRuntime!.selectedOperation!, device: { state: 'settled' } } });
+        }
+        const store = await this.storage.store(), v = (await this.storage.selectedRecords(record)).find(v => v.id === intent.volumeId)!;
+        let instance = await this.inspectOwned(record, intent.incarnation, false, true);
+        const adapter = this.selectedAdapter(record, ack);
+        if (instance.status === 'Running') {
+            await adapter.worker.stop({ id: v.workerId, userId: v.userId, containerName: instance.name }, intent.incarnation);
+            instance = await this.inspectOwned(record, intent.incarnation, false, true);
+        }
+        if (instance.status !== 'Stopped')
+            throw failure('Administrative selected recovery requires stopped captured compute');
+        const key = incusManagedVolumeDeviceKey(v), stage = { type: 'disk', pool: this.config.incusStoragePool, source: v.dockerName, path: `/run/agentor-volume-seed/${v.id}` };
+        if (instance.devices[key]) {
+            if (!isDeepStrictEqual(instance.devices[key], stage) && !(v.seeded && intent.canonical && isDeepStrictEqual(instance.devices[key], { ...stage, path: v.target })))
+                throw failure('Administrative selected recovery attachment changed');
+            const devices = { ...instance.devices };
+            if (v.seeded)
+                devices[key] = { ...stage, path: v.target };
+            else
+                delete devices[key];
+            if (v.seeded)
+                await ack({ ...record.nativeRuntime!, selectedOperation: { ...record.nativeRuntime!.selectedOperation!, canonical: true } });
+            if(!isDeepStrictEqual(devices,instance.devices)) await adapter.worker.client.updateInstanceDevices(instance.name, devices, undefined, instance);
+        }
+        else if (v.seeded)
+            throw failure('Committed administrative selected storage is unexpectedly detached');
+        await store.save({ ...v, state: v.seeded ? 'ready' : 'pending', operation: undefined });
+        await ack({ ...record.nativeRuntime!, selectedOperation: undefined });
+        await this.assertOwned(record);
     }
     async startupScriptStatus(record: Readonly<AdministrativeWorkspaceRecord>): Promise<AdminWorkspaceStartupScriptRuntimeStatus> {
         if (!record.startupScript)

@@ -1,3 +1,5 @@
+import { administrativeWorkspaceResourceNames, MANAGEMENT_NETWORK, EGRESS_NETWORK, ADMIN_CONTAINER } from "./admin-workspace-resources";
+export { administrativeWorkspaceResourceNames } from "./admin-workspace-resources";
 import Docker from "dockerode";
 import { createHash } from "node:crypto";
 import { hostname } from "node:os";
@@ -22,16 +24,11 @@ import type {
 import { normalizedRevision } from "./admin-workspace-store";
 import { withOperationDeadline } from "./operation-deadline";
 
-const MANAGEMENT_NETWORK = "agentor-management";
-const EGRESS_NETWORK = "agentor-admin-egress-v1";
 // Bump this whenever the trusted overlay/base contract changes in a way that
 // must be materialized for existing persistent administrative workspaces.
 // The workspace volume remains untouched; only its disposable compute image
 // is refreshed.
 export const ADMIN_OVERLAY_VERSION = "6";
-const ADMIN_CONTAINER = "agentor-admin-workspace";
-const ADMIN_WORKSPACE_VOLUME = "agentor-admin-workspace-data";
-const ADMIN_AGENTS_VOLUME = "agentor-admin-agent-data";
 const ADMIN_LABEL = "agentor.administrative";
 const STARTUP_REVISION_LABEL = "agentor.admin.startup-script-revision";
 const STARTUP_STATUS_PATH =
@@ -71,35 +68,6 @@ export function administrativeOwnerEnvironment(env: UserEnvVars): string[] {
     const key = separator < 0 ? line : line.slice(0, separator);
     return !ADMIN_CONTROL_PLANE_ENV_KEYS.has(key);
   });
-}
-
-/** Stable Docker resource identities are also used by instance disaster
- * recovery to inventory the administrative workspace volumes without
- * duplicating their naming contract. */
-export function administrativeWorkspaceResourceNames(
-  record: Readonly<AdministrativeWorkspaceRecord>,
-) {
-  const groupId =
-    record.kind === "group-administrative"
-      ? ((record as any).groupId as string)
-      : undefined;
-  const suffix = groupId ? `group-${groupId}` : "workspace";
-  return {
-    groupId,
-    container: groupId ? `agentor-admin-${suffix}` : ADMIN_CONTAINER,
-    workspaceVolume: groupId
-      ? `agentor-admin-${suffix}-data`
-      : ADMIN_WORKSPACE_VOLUME,
-    agentsVolume: groupId
-      ? `agentor-admin-${suffix}-agent-data`
-      : ADMIN_AGENTS_VOLUME,
-    managementNetwork: groupId
-      ? `agentor-management-group-${groupId}`
-      : MANAGEMENT_NETWORK,
-    egressNetwork: groupId
-      ? `agentor-admin-egress-group-${groupId}`
-      : EGRESS_NETWORK,
-  };
 }
 
 export async function administrativeControlRepresentation(record: Readonly<AdministrativeWorkspaceRecord>, image: string, workerNetwork: string): Promise<Record<string,string>> {
