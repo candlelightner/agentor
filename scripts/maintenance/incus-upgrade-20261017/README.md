@@ -114,3 +114,33 @@ The helper has **not** been executed against production as part of implementatio
 real migrations, custom-image conversion and archival acceptance remain operator
 run evidence. Incus command options follow the upstream
 [exec reference](https://linuxcontainers.org/incus/docs/main/reference/manpages/incus/exec/).
+
+### Offline inventory namespace correction
+
+Two read-only Docker inventory files were originally saved under the lifecycle
+receipt prefix and therefore correctly blocked the strict rerun guards. On
+October 18 the operator renamed only these observations, preserving their bytes,
+root ownership and mode 0600, then fsynced the directory:
+
+| Worker | Old filename | Retained filename |
+| --- | --- | --- |
+| `b71d012c-4d77-4a7a-8e8b-4626d11ed5d8` | `migration-b71d012c-4d77-4a7a-8e8b-4626d11ed5d8.docker-source-inventory.private.json` | `offline-docker-inventory-b71d012c-4d77-4a7a-8e8b-4626d11ed5d8.private.json` |
+| `a9812e5e-7316-4de6-9c6b-bf3ec11dcee2` | `migration-a9812e5e-7316-4de6-9c6b-bf3ec11dcee2.docker-source-inventory.private.json` | `offline-docker-inventory-a9812e5e-7316-4de6-9c6b-bf3ec11dcee2.private.json` |
+
+Each file was verified as a root-private regular file with matching `workerId`, exact
+`agentor-worker-ID-docker` named-volume identity and local/no-options storage,
+`overlay2` driver, empty image/container/volume arrays, and the scope
+`Offline retained Docker metadata; no full named-volume content hashes`.
+These observations do not authorize migration or claim full data verification.
+
+The byte-preservation checks are:
+
+- `b71d012c-4d77-4a7a-8e8b-4626d11ed5d8`: 544 bytes,
+  SHA256 `8dda9d3f3bcdd5517f02265e7f3ca1d82f2e943b5f3df3d26480d5a4de528dba`.
+- `a9812e5e-7316-4de6-9c6b-bf3ec11dcee2`: 543 bytes,
+  SHA256 `da1c99917b1febcc1ca1512464a1485a8dd09079c2a51032b41e2f1e4c0134cc`.
+
+No lifecycle receipt was renamed, hidden or deleted. Both `preflight` and
+`execute` still refuse every `migration-ID.*` entry, including unknown files;
+there is no code exception for inventory-shaped JSON and no unarchive retry.
+New read-only offline inventories use `offline-docker-inventory-ID.private.json`.
