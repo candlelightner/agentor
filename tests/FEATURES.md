@@ -1343,3 +1343,7 @@ The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/ap
 
 ### 29.5 Worker export/import exclusion
 - Worker export **strips** `.kilo/config`, `.kilo/shared-data`, and the legacy `.kilo/data/auth.json` from `agents.tar.gz` — an export never carries another user's tokens, provider keys, Kilo sessions/history, or account-level Kilo configuration. Per-worker Kilo state/cache and code-server user-data are retained.
+
+### Native migration PAX regular-file sizes
+- Unchanged GNU/PAX captures support bounded regular-file `size` overrides, including the exact 8 GiB boundary. Effective size drives body/padding alignment, truncation checks, reported bytes and existing aggregate limits across canonical, selected, managed and Docker archive validators.
+- Decimal syntax/size budgets, duplicate metadata, non-file size overrides and sparse/global extensions remain fail-closed; path, link, type, ownership and mode rules are unchanged.

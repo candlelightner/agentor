@@ -151,3 +151,13 @@ image before removing compute, and rechecks both before allocation and metadata
 publication. Archive/unarchive, storage-only recreation and recovery retain the
 captured recipe. This lets a deliberate Rebuild apply a kernel/bootstrap fix
 without silently changing the worker software or canonical volumes.
+
+Migration capture retains GNU `--format=pax` bytes unchanged, including regular
+files at or above the 8 GiB USTAR size boundary. Bounded per-file decimal PAX
+`size` overrides are interpreted for body offsets, 512-byte padding, truncation,
+and expanded-byte accounting, rather than merely accepted as inert metadata.
+Overrides remain subject to the existing 100 GiB ceiling and tighter caller
+budgets; malformed/duplicate sizes and size metadata on non-files are rejected.
+GNU sparse/global extensions, path/type/link rules and identity fields retain
+their existing restrictions. Validation uses positional reads, so a sparse raw
+TAR fixture can prove the 8 GiB boundary without an 8 GiB physical write.

@@ -150,8 +150,8 @@ test('selected restore rejects tar dialect disagreement, specials and PAX path/l
       await expect(validateIncusSelectedRestoreArchive(archive, '/srv/selected')).rejects.toThrow(/unsupported/);
     }
     for (const body of [
-      ...['GNU.sparse.map', 'size', 'SCHILY.realsize', 'SCHILY.fflags'].map(key => pax(key, '1')),
-      pax('path', 'sibling'), pax('path', 'selected/../escape'), pax('path', Buffer.from([255])),
+      ...['GNU.sparse.map', 'SCHILY.realsize', 'SCHILY.fflags'].map(key => pax(key, '1')),
+      pax('size', '1e3'), pax('path', 'sibling'), pax('path', 'selected/../escape'), pax('path', Buffer.from([255])),
       Buffer.concat([pax('path', 'selected/a'), pax('path', 'selected/b')]), pax('linkpath', '/etc/config'),
     ]) {
       await writeTar(archive, [root, { name: 'pax', type: 'x', body }, { name: 'selected/file', body: 'x' }]);

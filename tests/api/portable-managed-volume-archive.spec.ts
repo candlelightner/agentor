@@ -242,10 +242,11 @@ test('bounded PAX metadata rejects control fields, malformed text, duplicate key
   try {
     const acl = 'user::rw-\ngroup::r--\nother::---';
     const cases: Array<{ name: string; body: Buffer; type?: string; linkname?: string; message: RegExp }> = [
-      ...['GNU.sparse.map', 'GNU.sparse.size', 'size', 'SCHILY.realsize', 'SCHILY.fflags'].map(key =>
+      ...['GNU.sparse.map', 'GNU.sparse.size', 'SCHILY.realsize', 'SCHILY.fflags'].map(key =>
         ({ name: key, body: paxRecord(key, '1'), message: /metadata key/i })),
       ...['SCHILY.xattr.invalid.bad', 'SCHILY.xattr.system.unknown', 'SCHILY.xattr.user.bad/path'].map(key =>
         ({ name: key.replaceAll('/', '-'), body: paxRecord(key, 'data'), message: /xattr metadata key/i })),
+      { name: 'size-exponent', body: paxRecord('size', '1e3'), message: /PAX size/i },
       { name: 'mtime-control', body: paxRecord('mtime', '1\npath=../escape'), message: /timestamp/i },
       { name: 'mtime-exponent', body: paxRecord('mtime', '1e99'), message: /timestamp/i },
       { name: 'mtime-huge', body: paxRecord('mtime', '1'.repeat(16)), message: /timestamp/i },

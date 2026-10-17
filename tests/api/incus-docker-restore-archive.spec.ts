@@ -183,8 +183,8 @@ test('Docker dialect does not admit sparse/global PAX, control metadata or heade
       await writeTar(archive, [root, { name: 'docker/unsupported', type }]);
       await expect(validateIncusDockerRestoreArchive(archive)).rejects.toThrow(/unsupported/);
     }
-    for (const body of [...['GNU.sparse.map', 'GNU.sparse.name', 'size', 'SCHILY.realsize', 'SCHILY.fflags', 'SCHILY.devmajor'].map(key => pax(key, '1')),
-      pax('path', 'docker/../escape'), pax('path', Buffer.from([255])), pax('linkpath', '/etc'),
+    for (const body of [...['GNU.sparse.map', 'GNU.sparse.name', 'SCHILY.realsize', 'SCHILY.fflags', 'SCHILY.devmajor'].map(key => pax(key, '1')),
+      pax('size', '1e3'), pax('path', 'docker/../escape'), pax('path', Buffer.from([255])), pax('linkpath', '/etc'),
       Buffer.concat([pax('path', 'docker/a'), pax('path', 'docker/b')])]) {
       await writeTar(archive, [root, { name: 'pax', type: 'x', body }, file]);
       await expect(validateIncusDockerRestoreArchive(archive)).rejects.toThrow();

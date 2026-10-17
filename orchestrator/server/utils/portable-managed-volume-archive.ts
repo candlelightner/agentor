@@ -54,7 +54,7 @@ interface RawTarScan {
   expandedBytes: number;
 }
 
-interface PortablePax { path?: string; linkpath?: string; accessAcl?: boolean; defaultAcl?: boolean }
+interface PortablePax { size?: number; path?: string; linkpath?: string; accessAcl?: boolean; defaultAcl?: boolean }
 
 /** Validate the exact raw tar dialect accepted for a portable volume. */
 export async function validatePortableManagedVolumeArchive(
@@ -518,23 +518,33 @@ async function scanRawTar(
       if (options.requirePosixUstar && !block.subarray(257, 265).equals(Buffer.from("ustar\0" + "00", "ascii")))
         throw invalidArchive("canonical restore requires POSIX USTAR/PAX header magic and version");
       const name = readTarPath(block, 0, 100, block, 345, 155);
-      const size = readTarNumber(block, 124, 12, "size");
+      const headerSize = readTarNumber(block, 124, 12, "size");
       const typeFlag = block[156] ?? 0;
       const dataOffset = offset + 512;
-      const padded = Math.ceil(size / 512) * 512;
-      if (!Number.isSafeInteger(padded) || dataOffset + padded > info.size)
-        throw invalidArchive("truncated tar entry");
       if (typeFlag === 120) {
-        if (!options.allowPortablePax || pendingPax || size > MAX_PORTABLE_PAX_BYTES)
+        // An extended header describes its own body with the raw USTAR size.
+        // Its parsed override applies only to the following regular member.
+        const padded = Math.ceil(headerSize / 512) * 512;
+        if (!Number.isSafeInteger(padded) || !Number.isSafeInteger(dataOffset + padded) || dataOffset + padded > info.size)
+          throw invalidArchive("truncated tar entry");
+        if (!options.allowPortablePax || pendingPax || headerSize > MAX_PORTABLE_PAX_BYTES)
           throw invalidArchive("archive contains unsupported PAX metadata");
-        const body = Buffer.alloc(size);
-        const { bytesRead: paxBytesRead } = await handle.read(body, 0, size, dataOffset);
-        if (paxBytesRead !== size) throw invalidArchive("truncated PAX metadata");
-        pendingPax = parsePortablePax(body);
+        const body = Buffer.alloc(headerSize);
+        const { bytesRead: paxBytesRead } = await handle.read(body, 0, headerSize, dataOffset);
+        if (paxBytesRead !== headerSize) throw invalidArchive("truncated PAX metadata");
+        pendingPax = parsePortablePax(body, Math.min(options.maxExpandedBytes, MAX_PORTABLE_MANAGED_VOLUME_EXPANDED_BYTES));
         offset = dataOffset + padded;
         continue;
       }
       const type = parseType(typeFlag, options.allowDockerSpecials);
+      if (pendingPax?.size !== undefined && type !== "file")
+        throw invalidArchive("PAX size applies to a non-file entry");
+      // POSIX PAX size is authoritative even when the USTAR placeholder is
+      // zero or larger. GNU extraction uses this value for body and padding.
+      const size = pendingPax?.size ?? headerSize;
+      const padded = Math.ceil(size / 512) * 512;
+      if (!Number.isSafeInteger(padded) || !Number.isSafeInteger(dataOffset + padded) || dataOffset + padded > info.size)
+        throw invalidArchive("truncated tar entry");
       if (options.allowDockerSpecials) {
         const device = type === 'character-device' || type === 'block-device';
         // GNU POSIX headers leave these unused fields entirely NUL for normal
@@ -687,7 +697,7 @@ function parseType(value: number, allowDockerSpecials?: true): RawTarEntry["type
   throw invalidArchive("archive contains an unsupported tar entry type");
 }
 
-function parsePortablePax(body: Buffer): PortablePax {
+function parsePortablePax(body: Buffer, maxSize: number): PortablePax {
   const values: PortablePax = {}, seen = new Set<string>();
   let offset = 0;
   while (offset < body.length) {
@@ -716,6 +726,16 @@ function parsePortablePax(body: Buffer): PortablePax {
           /[\u0000-\u001f\u007f]/.test(value) || rawValue.length > MAX_PORTABLE_TAR_PATH_BYTES)
         throw invalidArchive("PAX path metadata is invalid");
       values[key] = value;
+    } else if (key === "size") {
+      // GNU --format=pax emits decimal size once the USTAR octal field cannot
+      // represent a regular file (including the exact 8 GiB boundary). Bound
+      // both lexical work and the effective body before any positional read.
+      if (!rawValue.length || rawValue.length > 12 || !rawValue.every(byte => byte >= 48 && byte <= 57))
+        throw invalidArchive("PAX size metadata is invalid");
+      const size = Number(rawValue.toString("ascii"));
+      if (!Number.isSafeInteger(size) || size > maxSize)
+        throw invalidArchive("PAX size exceeds the expanded size limit");
+      values.size = size;
     } else if (["atime", "ctime", "mtime"].includes(key)) {
       if (!rawValue.every(byte => byte < 128) || !/^-?[0-9]{1,15}(?:\.[0-9]{1,9})?$/.test(rawValue.toString("ascii")))
         throw invalidArchive("PAX timestamp metadata is invalid");

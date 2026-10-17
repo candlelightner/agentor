@@ -159,8 +159,8 @@ test('native validation retains managed-volume confinement and rejects tar exten
       await expect(validateIncusCanonicalRestoreArchive(archive, 'workspace')).rejects.toThrow(/unsupported/);
     }
     const bodies = [
-      ...['GNU.sparse.map', 'GNU.sparse.size', 'size', 'SCHILY.realsize', 'SCHILY.fflags'].map(key => pax(key, '1')),
-      pax('path', 'workspace/../escape'), pax('path', Buffer.from([255, 128])),
+      ...['GNU.sparse.map', 'GNU.sparse.size', 'SCHILY.realsize', 'SCHILY.fflags'].map(key => pax(key, '1')),
+      pax('size', '1e3'), pax('path', 'workspace/../escape'), pax('path', Buffer.from([255, 128])),
       pax('linkpath', '/etc/passwd'), Buffer.concat([pax('path', 'workspace/file'), pax('path', 'workspace/duplicate')]),
       pax('SCHILY.acl.default', 'user::rw-\ngroup::r--\nother::---'),
     ];
