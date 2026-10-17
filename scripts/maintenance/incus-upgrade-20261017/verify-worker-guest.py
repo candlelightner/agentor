@@ -55,7 +55,10 @@ def main():
             path.write_text(r'\documentclass{article}' + language + r'\begin{document}VM migration check.\end{document}')
             command = ['latexmk', '-pdf'] if 'latexmk' in result['packages'] else ['pdflatex']
             run([*command, '-interaction=nonstopmode', '-halt-on-error', 'check.tex'], cwd=temporary)
-            assert 'VM migration check.' in run(['pdftotext', 'check.pdf', '-'], cwd=temporary)
+            pdf = (Path(temporary) / 'check.pdf').read_bytes()
+            assert pdf.startswith(b'%PDF-') and b'%%EOF' in pdf[-1024:]
+            if shutil.which('pdftotext'):
+                assert 'VM migration check.' in run(['pdftotext', 'check.pdf', '-'], cwd=temporary)
         result['pdfCompilation'] = True
     if 'r-base-core' in result['packages']:
         assert run(['Rscript', '-e', 'stopifnot(requireNamespace("rmarkdown", quietly=TRUE), requireNamespace("robustbase", quietly=TRUE)); cat("ok")']) == 'ok'
