@@ -51,30 +51,29 @@
     "No backup/source finalization or deletion"
   ],
   "lastVerifiedProductionWorker": {
-    "id": "cd4170f6-21aa-4494-b886-640494ff1f30",
-    "name": "AMRC - UE",
+    "id": "834db661-cff3-402b-8daa-b0ba4738abeb",
+    "name": "3D modelling",
     "runtime": "incus-vm",
-    "state": "stopped",
+    "state": "archived",
     "guestKernel": "7.0.0-38-generic",
     "checks": [
-      "restored Codex 0.162.1",
-      "all nine extra packages",
-      "PDF compilation",
-      "R rmarkdown and robustbase",
-      "Pandoc",
-      "shared-volume execution",
-      "shared host mount",
+      "Codex 0.147.0 from immutable base",
+      "native and shebang execution on both canonical volumes",
+      "worker tmux session and desktop RFB",
       "editor and desktop proxies",
-      "retained original Docker source"
+      "eight workspace and five agent-data file samples matched before and after archive (not a full-tree hash comparison)",
+      "native compute absent after supported archive",
+      "canonical volumes and exact stopped Docker source retained"
     ]
   },
   "verifiedProductionWorkers": [
     "6eea5aa9-2d0d-454a-a91b-21b35d5b84fc",
-    "cd4170f6-21aa-4494-b886-640494ff1f30"
+    "cd4170f6-21aa-4494-b886-640494ff1f30",
+    "834db661-cff3-402b-8daa-b0ba4738abeb"
   ],
   "migrationFollowUps": {
-    "updater": "Safely rolled back to stopped Docker: exact 8 GiB file emits legitimate PAX size. Fix 15e19cca passed 68 affected tests, pushed separately and cherry-picked as 5f68ed5; image built, deployment awaits idle stack and precise migration diagnostic. Offline source Docker inventory: 10 images, 0 containers, 3 volumes.",
-    "3d": "Safely rolled back to stopped Docker after final source-authority check. Source ID/image/creation/mounts unchanged. Precise non-secret validation categories are being added before another attempt.",
+    "updater": "Retry is actively capturing after exact source/manifest/init/environment checks, on deployed 5851158 with PAX-size and initialize-once WorkerStore fixes. Offline Docker inventory retained for later comparison: 10 images, 0 containers, 3 volumes.",
+    "3d": "Fully verified and archived natively after supported rebuild; original Docker source retained. Initial failure reproduced: a read-only migration status request reloaded shared worker authority and dropped own undefined keys.",
     "metod": "Archived legacy managed parent /home/agent/.local/share overlaps protected Kilo data. Do not bypass admission or drop data; source and legacy volume retained for reviewed handling."
   },
   "additionalBranches": {
@@ -82,6 +81,9 @@
     "paxSize": "fix/incus-pax-size-20261017",
     "migrationDiagnostics": "fix/incus-migration-diagnostics-20261017",
     "legacyManagedMigration": "fix/incus-legacy-managed-migration-20261017",
-    "isolatedIntegration": "fix/backup-integration-harness-20261017"
-  }
+    "isolatedIntegration": "fix/backup-integration-harness-20261017",
+    "workerStoreInitialization": "fix/worker-store-init-once-20261017"
+  },
+  "deployedSourceRevision": "5851158fbe31f98a33f1e1ec63554c53255c2aea",
+  "reviewedInitializationFix": "11906c9 passed 138 affected tests and both typechecks. Independent peer proved twenty concurrent startup status requests perform one load and later reads preserve live authority; explicit private readers remain fresh."
 }
