@@ -76,6 +76,7 @@ import { IncusWorkerRuntime, incusWorkerStatus, type IncusWorkerOptions } from "
 import { IncusWorkerImageManager } from './incus-worker-image-manager';
 import { IncusRequestRejected } from './incus-client';
 import { legacyMigrationMountIdentity } from './legacy-incus-migration-capture';
+import { assertLegacyMigrationAuthority } from './legacy-incus-migration-authority';
 import { incusImageIdentity, sameIncusImageSource } from './incus-worker-image';
 import { WorkerGroupHierarchy } from './worker-group-hierarchy';
 import { prepareIncusCanonicalRestorePayload } from './incus-canonical-restore';
@@ -816,7 +817,6 @@ export class ContainerManager {
       let marker: WorkerIncusMigration = { nonce: randomUUID(), phase: 'preparing', source: {
         containerId: source.Id, createdAt: source.Created, imageId: source.Image, wasRunning: source.State.Running,
       }, sourceVolumes, sourceDirectories };
-      const baseline = (value: WorkerRecord) => { const { incusMigration, updatedAt, ...rest } = value; return rest; };
       let stopped = false, creationAttempted = false, incarnation: string | undefined, cutover = false;
       const nativeManaged = sourceManaged.map(({ operation: _completedSourceHistory, ...v }) =>
         ({ ...v, storageRuntimeKind: 'incus-vm' as const, seeded: false, state: 'pending' as StoredManagedVolume['state'] }));
@@ -826,13 +826,8 @@ export class ContainerManager {
         await assertPrincipal();
         const current = this.workerStore!.get(record.userId, id);
         const actual = await inspect();
-        if (!current || current.runtimeKind !== 'legacy-docker' || !isDeepStrictEqual(current.incusMigration, marker) ||
-            !isDeepStrictEqual(baseline(current), baseline(record)) || actual.Id !== source.Id ||
-            actual.Created !== source.Created || actual.Image !== source.Image ||
-            !isDeepStrictEqual(legacyMigrationMountIdentity(actual.Mounts), legacyMigrationMountIdentity(source.Mounts)) ||
-            !isDeepStrictEqual(actual.Config.Labels, source.Config.Labels) || stopped && actual.State.Running ||
-            !isDeepStrictEqual(volumes.store.forWorker(record.userId, id), sourceManaged))
-          throw new Error('Legacy migration source, owner, configuration or storage authority changed');
+        assertLegacyMigrationAuthority({ current, record, marker, actual, source, stopped,
+          managed: () => volumes.store.forWorker(record.userId, id), sourceManaged });
         if (defaultFingerprint) {
           const alias = await this.incusRuntime.client.getImageAlias(this.config.incusWorkerImage);
           const image = incusImageIdentity(await this.incusRuntime.client.getImage(alias.target));

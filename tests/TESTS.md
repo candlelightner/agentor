@@ -449,3 +449,5 @@ for f in api/*.spec.ts ui/*.spec.ts; do
   echo "$f: $count"
 done
 ```
+
+Migration diagnostics: `api/legacy-incus-migration-authority.spec.ts` covers every validation category, diagnostic redaction, strict own-key presence, unchanged comparison order, and freshly unarchived WorkerStore transitions versus JSON reload. `legacy-incus-migration-admission.spec.ts` also injects a configuration change after native preflight and proves the real manager returns its category, retains the source/configuration, clears only its exact migration marker, and performs no destination allocation/cleanup. These isolated tests do not claim a live Incus migration or reproduce the production late-stop cause.

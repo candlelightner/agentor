@@ -123,10 +123,13 @@ test('private secret-aware rollback start does not waive a changed migration non
   } finally { await f.cleanup(); }
 });
 
-test('settled attached and detached legacy histories pass the real native staged-device preflight without copying source operations', async () => {
+for (const changedBaseline of [false, true])
+test(`settled managed migration preflight ${changedBaseline ? 'rejects a changed baseline without allocation or destination cleanup' : 'stages attached and detached devices without source history'}`, async () => {
   const f = await fixture(), volumes = useManagedVolumeManager();
   const original = { init: volumes.init, assert: volumes.assertLiveRecoveryResolved, blocked: volumes.isRecoveryBlocked,
-    records: volumes.store.forWorker, save: volumes.store.save, preflight: IncusWorkerRuntime.prototype.preflightCanonicalRestore };
+    records: volumes.store.forWorker, save: volumes.store.save, preflight: IncusWorkerRuntime.prototype.preflightCanonicalRestore,
+    create: IncusWorkerRuntime.prototype.createCanonicalRestore, rollback: IncusWorkerRuntime.prototype.rollbackRecreation,
+    remove: IncusWorkerRuntime.prototype.removeStorage };
   const Docker = createRequire(new URL('../../orchestrator/package.json', import.meta.url))('dockerode');
   const dockerOriginal = { container: Docker.prototype.getContainer, volume: Docker.prototype.getVolume };
   const records = [true, false].map((attached, index): StoredManagedVolume => {
@@ -137,6 +140,7 @@ test('settled attached and detached legacy histories pass the real native staged
       operation: { id: randomUUID(), mode: 'recreate', stage: 'complete' } };
   });
   const baseline = structuredClone(records), saved: StoredManagedVolume[] = [];
+  let destinationMutations = 0;
   let preflights = 0, attachedSeen: StoredManagedVolume[] = [], detachedSeen: StoredManagedVolume[] = [];
   try {
     await f.store.upsert({ ...f.record, imageRuntimeReference: f.info.imageId });
@@ -163,6 +167,10 @@ test('settled attached and detached legacy histories pass the real native staged
     (f.manager as any).incusOptionsForWorker = async (_native: ContainerInfo, _start: boolean, _source: unknown, attached: StoredManagedVolume[]) =>
       ({ id: f.record.id, userId: f.record.userId, containerName: f.info.containerName, managedVolumes: attached,
         environmentJson: { dockerEnabled: false } });
+    const unexpectedDestinationMutation = async () => { destinationMutations++; throw new Error('Unexpected destination mutation'); };
+    IncusWorkerRuntime.prototype.createCanonicalRestore = unexpectedDestinationMutation;
+    IncusWorkerRuntime.prototype.rollbackRecreation = unexpectedDestinationMutation;
+    IncusWorkerRuntime.prototype.removeStorage = unexpectedDestinationMutation;
     IncusWorkerRuntime.prototype.preflightCanonicalRestore = async (options, _source, detached = []) => {
       preflights++; attachedSeen = structuredClone(options.managedVolumes ?? []); detachedSeen = structuredClone(detached);
       expect(attachedSeen).toHaveLength(1); expect(detachedSeen).toHaveLength(1);
@@ -172,17 +180,29 @@ test('settled attached and detached legacy histories pass the real native staged
       const devices = incusManagedRestoreDevices(options, 'approved-pool', options.managedVolumes, detached);
       expect(Object.values(devices).map(device => device.source).sort()).toEqual(records.map(volume => volume.dockerName).sort());
       expect(records).toEqual(baseline); // The source's completed history is still authoritative.
+      if (changedBaseline) {
+        await f.store.upsert({ ...f.store.get(f.record.userId, f.record.id)!, initScript: 'PRIVATE-migration-config-value' });
+        return;
+      }
       throw new Error('Validated staged managed-device preflight sentinel');
     };
-    await expect(f.manager.migrateLegacyWorker(f.record.id, async () => {})).rejects.toThrow('Validated staged managed-device preflight sentinel');
+    const failure = f.manager.migrateLegacyWorker(f.record.id, async () => {});
+    if (changedBaseline) await expect(failure).rejects.toMatchObject({ code: 'LEGACY_MIGRATION_AUTHORITY_CHANGED',
+      category: 'record-baseline', changedFields: ['initScript'],
+      message: expect.not.stringContaining('PRIVATE-migration-config-value') });
+    else await expect(failure).rejects.toThrow('Validated staged managed-device preflight sentinel');
+    expect(destinationMutations).toBe(0);
     expect(preflights).toBe(1); expect(records).toEqual(baseline); expect(saved).toEqual(baseline);
-    expect(f.store.get(f.record.userId, f.record.id)).toMatchObject({ ...workerBefore, updatedAt: expect.any(String), incusMigration: undefined });
+    expect(f.store.get(f.record.userId, f.record.id)).toMatchObject({ ...workerBefore, ...(changedBaseline ? { initScript: 'PRIVATE-migration-config-value' } : {}), updatedAt: expect.any(String), incusMigration: undefined });
     expect(f.info.runtimeKind).toBe('legacy-docker'); expect(f.info.status).toBe('running');
     expect([...attachedSeen, ...detachedSeen].map(volume => volume.id).sort()).toEqual(records.map(volume => volume.id).sort());
   } finally {
     volumes.init = original.init; volumes.assertLiveRecoveryResolved = original.assert; volumes.isRecoveryBlocked = original.blocked;
     volumes.store.forWorker = original.records; volumes.store.save = original.save;
     IncusWorkerRuntime.prototype.preflightCanonicalRestore = original.preflight;
+    IncusWorkerRuntime.prototype.createCanonicalRestore = original.create;
+    IncusWorkerRuntime.prototype.rollbackRecreation = original.rollback;
+    IncusWorkerRuntime.prototype.removeStorage = original.remove;
     Docker.prototype.getContainer = dockerOriginal.container; Docker.prototype.getVolume = dockerOriginal.volume;
     await f.cleanup();
   }
