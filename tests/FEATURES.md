@@ -1357,3 +1357,5 @@ The default Playwright global setup rejects any enabled native DR gate before cr
 ### Backup acceptance environment boundary
 
 - The combined backup launcher preserves the complete workspace and whole-instance API/UI suites, but explicit execution fails before any Docker/Git/resource operation while outer device isolation remains unverified. Its standalone plan forbids privileged mode, added capabilities, device mappings/rules, host namespace/socket/cgroup/device binds, and external/device-backed volumes. This is a safety stop, not completed end-to-end acceptance or a functioning cap-drop-all DinD implementation; see `docs/backup-integration-acceptance.md`.
+
+- A separate disposable-QEMU backup runner now plans both full API/UI suite selections with a fresh finite 80 GiB overlay, private cloud-init/SSH keys, loopback-only inbound SSH and guest-owned Docker. Execution requires explicit review/`--execute`; host DinD stays blocked. Plan/nonce/host/refusal/resource-bound tests pass, while VM boot and complete live suites remain unverified.
