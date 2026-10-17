@@ -4,7 +4,7 @@ This is a reviewed maintenance proposal, not an executed host change. The requir
 
 The owner subsequently retired the JMicron worker from this migration: leave it archived, preserve its workspace/agent/Docker data, plugin, catalog entries and grants, and do not evacuate the SSD, remap its serial or attach its devices. No deletion was requested. This supersedes the earlier requirement to migrate both hardware workers.
 
-## Fresh evidence
+## Recorded evidence
 
 Read-only checks inspected the two workers' persisted records/grants, sysfs, boot configuration, mounts, package metadata from the stopped GPU container, and relevant workspace documentation. They did not start a container, probe USB control endpoints, load modules, change settings or access credentials.
 
@@ -18,15 +18,17 @@ Read-only checks inspected the two workers' persisted records/grants, sysfs, boo
 | IOMMU | 14 host groups; kernel defaults Intel IOMMU on | The host does not lack IOMMU globally. Missing physical GPU grouping alone does not reject emulated-IOMMU mdev support. |
 | Boot recovery | EFI, Secure Boot disabled, GRUB hidden with timeout zero, default entry selects the newer `147`; both kernels have recovery entries | Explicitly choose the known `139` for the first test; do not accidentally combine it with a host kernel upgrade. |
 | Access | SSH socket enabled/active and local tty1 getty enabled; no IPMI device or enabled serial getty found | Verify working local console access with the operator before reboot. SSH alone cannot recover a failed boot. |
-| Protected storage | USB `152d:0551`, currently serial `493526338460`, contains `/dev/sdc2`, mounted at `/mnt/agentor-vm-ssd` and `/var/lib/incus` | Do not detach the USB device or its host controller. Existing Incus service requires `/var/lib/incus`; verify the same backing mount after reboot. |
+| Protected storage | The original assessment saw USB `152d:0551`, serial `493526338460`, backing the Incus SSD. The later recovery receipt identifies filesystem UUID `17b446d6-0931-49a9-84a9-f5edac5a723f` after reconnection. | Follow the current recovery receipt and stable filesystem UUID, never the old `/dev/sdc2` name or enclosure serial. Verify `/mnt/agentor-vm-ssd` and the `/var/lib/incus` bind after reboot; do not detach either connector/controller. |
 
-The current USB serial differs from the historical catalog/descriptor-read serial `DCC4E54AFFFF`, but the owner reports using only one JBOD enclosure. That difference does **not** establish two physical enclosures. Historical captures and current sysfs both identify port `2-1` and VID/PID `152d:0551`; firmware/descriptor-state provenance remains unresolved. No grant was rebound. This investigation is no longer a migration prerequisite after the owner's retirement instruction.
+The originally observed USB serial differed from the historical catalog/descriptor-read serial `DCC4E54AFFFF`, but the owner reports using only one JBOD enclosure. That difference does **not** establish two physical enclosures. Historical captures and current sysfs both identify port `2-1` and VID/PID `152d:0551`; firmware/descriptor-state provenance remains unresolved. No grant was rebound. This investigation is no longer a migration prerequisite after the owner's retirement instruction.
 
 ## Minimum GPU maintenance sequence
 
+The kernel/module evidence above is the recorded pre-maintenance assessment; this update performed no fresh host probe. It supports one controlled trial on the known `139` kernel without installing a kernel, changing IOMMU flags or reloading the display driver. Local-console recovery has **not** been confirmed, so the reboot remains blocked until an operator demonstrates it. The later SSD recovery receipt is `ssd-reconnection-recovery.private.json` in the private preparation directory; use its stable filesystem identity for the mount checks.
+
 1. Finish ordinary migrations, rebuilds and image builds. Save current worker desired states and the source/image/data receipts; verify that backups and their recovery keys remain available. Record the GPU source Docker ID/image and canonical data hashes. Stop/settle guests through their supported lifecycle before the host maintenance; do not finalize migrations or delete retained sources.
-2. Confirm an operator can actually use the EliteBook console and select a recovery boot. Preserve normal `139` and `147` boot entries. The first trial should use a **one-boot edit** of the known `6.8.0-139-generic` entry, adding `i915.enable_gvt=1 i915.enable_guc=0`. A temporary edit avoids changing every fallback entry. If remote-only boot management is required, prepare and review a visible timed boot menu and an explicit unchanged fallback first; do not assume the current hidden zero-timeout menu supplies recovery.
-3. After that authorized boot, first verify SSH, host display, root and exact Incus backing mounts. Confirm the intended kernel and parameters. Load the already installed `kvmgt` module using the normal module loader; its reported dependencies are i915, vfio, kvm and mdev. Do not unbind i915, load vfio-pci for the physical GPU, or create an mdev by writing sysfs.
+2. Confirm an operator can actually use the EliteBook console and select a recovery boot. Preserve normal `139` and `147` boot entries. The first trial should use a **one-boot edit** of the known `6.8.0-139-generic` entry, adding `i915.enable_gvt=1 i915.enable_guc=0`. A temporary edit avoids changing every fallback entry. If console recovery cannot be demonstrated, stop here; the current hidden zero-timeout menu and SSH alone are insufficient.
+3. After that authorized boot, first verify SSH, host display, root and exact Incus backing mounts. Confirm the intended kernel and parameters. Load the already installed module once with `sudo modprobe kvmgt`; its reported dependencies are i915, vfio, kvm and mdev. Do not unbind i915, load vfio-pci for the physical GPU, or create an mdev by writing sysfs.
 4. Read `/sys/bus/pci/devices/0000:00:02.0/mdev_supported_types`. Require real `i915-GVTg_V…_…` entries with `device_api=vfio-pci`, readable descriptions and positive `available_instances`. Select a profile with enough graphics memory for the real workload, not merely the smallest profile that boots. If none appear, inspect the bounded i915/KVMGT initialization diagnostics and stop the trial. Do not invent a profile or remove IOMMU protections to make checks pass.
 5. Integrate/deploy the hardware branch through `500d241e` and its existing safety checks. Run the owned `setup-incus-host.sh` and `check-incus-host.sh` with their exact existing installation/project/storage arguments plus `--gpu-mdev-profile <observed-profile>`, and set the same `INCUS_GPU_MDEV_PROFILE`. Keep USB disabled for this GPU-only task. The profile marker and restricted-project policy must agree before activation.
 6. Prove physical GPU behavior in a reviewed disposable owned guest first, with the exact PCI address/profile and captured instance UUID. Keep the real source stopped and preserve its catalog ID, grants, selected IDs and Docker container. Current application admission reserves its GPU for this active stopped worker; do not bypass that rule in application code or archive/delete the source to free the fixture. An explicitly reviewed operator-created fixture may prove the host/guest hardware path, but direct Incus creation does not count as application authorization acceptance. Remove only that captured fixture and prove capacity returns before the real worker starts. The subsequent real migration and lifecycle test must exercise application admission.
@@ -41,7 +43,30 @@ Do not add `intel_iommu=off`, `intel_iommu=igfx_off`, ACS overrides, `kvm.ignore
 
 The worker has an existing Vulkan-enabled whisper.cpp build and a wrapper with explicit `--gpu`. Its workspace documentation records a successful Intel UHD 620/Vulkan0 run on the bundled public 11-second JFK sample. CPU was chosen as the default for a short benchmark, but CPU success does not satisfy this migration's hardware requirement. Do not use private recordings/transcripts as acceptance artifacts.
 
-The wrapper, `build/bin/whisper-cli` and `src/whisper.cpp-1.9.4/samples/jfk.wav` are present. The required `models/ggml-small.bin` is currently absent. Restore that public model in the owned test/guest environment from its publisher and verify the documented SHA-256 `1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b` before running; missing model data must not be mistaken for a GPU failure. The stopped source has ffmpeg, libvulkan1, mesa-vulkan-drivers, libgomp1 and libstdc++6 installed; verify those dependencies and the Intel ICD in the destination rather than assuming conversion preserves Docker upper-layer package changes.
+The wrapper, `build/bin/whisper-cli` and `src/whisper.cpp-1.9.4/samples/jfk.wav` are present. The required `models/ggml-small.bin` is currently absent. Use the publisher's multilingual, nonquantized **small** GGML model, which matches that filename; neither `small.en` nor a quantized variant is the same acceptance asset. The upstream [model instructions](https://github.com/ggml-org/whisper.cpp/blob/v1.8.4/models/README.md) identify this publisher. Its [immutable file pointer](https://huggingface.co/ggerganov/whisper.cpp/raw/c521a4b02f422512d734391fdf08bb08c0862f68/ggml-small.bin) confirms these bytes:
+
+- Revision: `c521a4b02f422512d734391fdf08bb08c0862f68` in `ggerganov/whisper.cpp`.
+- File: `ggml-small.bin`, exactly `487601967` bytes.
+- SHA-256: `1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b`.
+- [Immutable model download](https://huggingface.co/ggerganov/whisper.cpp/resolve/c521a4b02f422512d734391fdf08bb08c0862f68/ggml-small.bin).
+
+Only in the reviewed owned guest, from the existing Whisper project root as the normal agent user, download to a temporary file and publish without overwriting an existing model:
+
+```bash
+set -eu
+test -d models && test ! -L models
+model_tmp="$(mktemp models/.ggml-small.XXXXXX)"
+trap 'rm -f -- "$model_tmp"' EXIT
+curl --fail --location --proto '=https' --proto-redir '=https' \
+  --connect-timeout 30 --max-time 1800 --output "$model_tmp" \
+  'https://huggingface.co/ggerganov/whisper.cpp/resolve/c521a4b02f422512d734391fdf08bb08c0862f68/ggml-small.bin'
+test "$(wc -c < "$model_tmp")" -eq 487601967
+printf '%s  %s\n' \
+  '1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b' "$model_tmp" | sha256sum --check -
+ln -- "$model_tmp" models/ggml-small.bin
+```
+
+The immutable metadata was checked on 2026-10-18; this documentation update did not download the model or execute inference. Keep the existing pinned public JFK sample. Missing model data must not be mistaken for a GPU failure. The stopped source has ffmpeg, libvulkan1, mesa-vulkan-drivers, libgomp1 and libstdc++6 installed; verify those dependencies and the Intel ICD in the destination rather than assuming conversion preserves Docker upper-layer package changes.
 
 Inside the owned VM, as the normal agent user:
 
