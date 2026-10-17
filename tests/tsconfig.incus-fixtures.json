@@ -3,6 +3,8 @@
   "compilerOptions": { "noEmit": true, "rootDir": "..", "esModuleInterop": true,
     "lib": ["ESNext", "DOM", "DOM.Iterable"] },
   "include": [
+    "api/admin-native-proxy.spec.ts",
+    "api/admin-native-callers.spec.ts",
     "api/incus-hardware.spec.ts",
     "api/hardware-device-store.spec.ts",
     "api/worker-export-format.spec.ts",

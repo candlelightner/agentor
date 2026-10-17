@@ -12,8 +12,11 @@ import type { AppInstanceInfo, TmuxWindow } from '../../shared/types';
 
 /** Same account -> environment -> worker precedence as entrypoint.sh, without
  * shell-evaluating user values. Exec does not inherit the worker service env. */
+export type IncusRuntimeRole = 'worker' | 'platform-admin' | 'group-admin';
+
 export const INCUS_EXEC_ENV_SCRIPT = String.raw`
 import os,sys,json,base64
+runtime_role='worker'
 env=os.environ.copy()
 bootstrap_tmux={key:env.get(key) for key in ('TMUX_TMPDIR','TMUX')}
 environment=json.loads(env.get('ENVIRONMENT','{}'))
@@ -26,8 +29,8 @@ for line in environment.get('envVars','').splitlines():
 for entry in json.loads(base64.b64decode(env.get('WORKER_LOCAL_ENV','W10='))):
  if entry['key'] not in ('AGENTOR_RUNTIME_ROLE','AGENTOR_TRUSTED_RUNTIME_ROLE'):
   env[entry['key']]=entry['value']
-env['AGENTOR_RUNTIME_ROLE']='worker'
-env['AGENTOR_TRUSTED_RUNTIME_ROLE']='worker'
+env['AGENTOR_RUNTIME_ROLE']=runtime_role
+env['AGENTOR_TRUSTED_RUNTIME_ROLE']=runtime_role
 for key,field in [('EXPOSE_PORT_MAPPINGS','portMappings'),('EXPOSE_DOMAIN_MAPPINGS','domainMappings'),('EXPOSE_USAGE','usage')]:
  env[key]='false' if environment.get('exposeApis',{}).get(field) is False else 'true'
 env['DOCKER_ENABLED']='true' if environment.get('dockerEnabled',False) else 'false'
@@ -38,10 +41,12 @@ if sys.argv[1]=='bootstrap-tmux':
 os.execvpe(sys.argv[2],sys.argv[2:],env)
 `;
 
-export function incusWorkerCommand(command: string[], bootstrapTmux = false): string[] {
+export function incusWorkerCommand(command: string[], bootstrapTmux = false, role: IncusRuntimeRole = 'worker'): string[] {
+  if (!['worker', 'platform-admin', 'group-admin'].includes(role)) throw new Error('Invalid trusted runtime role');
+  const script = INCUS_EXEC_ENV_SCRIPT.replace("runtime_role='worker'", 'runtime_role=' + JSON.stringify(role));
   return ['bash', '-ec',
     'test -f /run/agentor/provisioned; test -r /run/agentor/worker.env; set -a; . /run/agentor/worker.env; set +a; exec /usr/bin/python3 -c "$1" "${@:2}"',
-    'agentor-worker-exec', INCUS_EXEC_ENV_SCRIPT, bootstrapTmux ? 'bootstrap-tmux' : 'worker', ...command];
+    'agentor-worker-exec', script, bootstrapTmux ? 'bootstrap-tmux' : 'worker', ...command];
 }
 
 /** Small structural file/command adapter, not a general runtime framework.
@@ -49,7 +54,22 @@ export function incusWorkerCommand(command: string[], bootstrapTmux = false): st
 export class IncusWorkerCommands {
   constructor(private client: IncusClient, private name: string, private handle: string,
     private validate: () => Promise<void>,
-    private setup: <T>(operation: () => Promise<T>) => Promise<T> = (operation) => operation()) {}
+    private setup: <T>(operation: () => Promise<T>) => Promise<T> = (operation) => operation(),
+    private role: IncusRuntimeRole = 'worker') {}
+
+  /** Administrative streams retain their captured authority after setup. */
+  private watchAuthority(close: () => void): () => void {
+    if (this.role === 'worker') return () => {};
+    let checking = false, stopped = false;
+    const timer = setInterval(() => {
+      if (checking || stopped) return;
+      checking = true;
+      void this.validate().catch(() => { stop(); try { close(); } catch {} }).finally(() => { checking = false; });
+    }, 1000);
+    timer.unref();
+    const stop = () => { stopped = true; clearInterval(timer); };
+    return stop;
+  }
 
   async attachTerminal(windowIndex: number): Promise<{ stream: Duplex; resize: (cols: number, rows: number) => void; close: () => void }> {
     return this.setup(() => this.attachTerminalUnlocked(windowIndex));
@@ -62,15 +82,15 @@ export class IncusWorkerCommands {
     let stream: Duplex | undefined;
     const session = await this.client.execInteractive(this.name, incusWorkerCommand(['sh', '-c',
       TMUX_TERMINAL_CLIPBOARD_SETUP + 'tmux new-session -d -t =main -s "$1" && { tmux select-window -t "$1:$2" 2>/dev/null || true; } && exec tmux attach-session -t "$1"',
-      'agentor-terminal', linked, String(windowIndex)], true), {
+      'agentor-terminal', linked, String(windowIndex)], true, this.role), {
       command: [], user: 1000, group: 1000, cwd: '/workspace',
       environment: { HOME: '/home/agent', USER: 'agent', LOGNAME: 'agent', DISPLAY: ':99', TERM: 'xterm-256color',
         PATH: '/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' },
     }, (socket) => { stream = createWebSocketStream(socket); stream.on('error', () => {}); });
-    let closed = false;
+    let closed = false, stopWatching = () => {};
     const close = () => {
       if (closed) return;
-      closed = true;
+      closed = true; stopWatching();
       session.close(); stream?.destroy();
       // The validator rejects after replacement, deletion, owner changes or
       // lifecycle admission. Never kill a session in a same-name replacement.
@@ -79,6 +99,8 @@ export class IncusWorkerCommands {
     try {
       await this.validate();
       if (!stream || stream.destroyed) throw new Error('Incus terminal closed during setup');
+      stopWatching = this.watchAuthority(close);
+      stream.once('close', stopWatching);
     }
     catch (error) { close(); throw error; }
     return { stream: stream!, resize: session.resize, close };
@@ -90,13 +112,21 @@ export class IncusWorkerCommands {
 
   private async openUnlocked(command: string[], options: Omit<IncusInstanceExecOptions, 'command'> & { signal?: AbortSignal; timeoutMs?: number }, bootstrapTmux = false): Promise<IncusStreamExecSession> {
     await this.validate();
-    const session = await this.client.execStream(this.name, incusWorkerCommand(command, bootstrapTmux), {
+    const session = await this.client.execStream(this.name, incusWorkerCommand(command, bootstrapTmux, this.role), {
       command: [], user: 1000, group: 1000, cwd: '/workspace',
       environment: { HOME: '/home/agent', USER: 'agent', LOGNAME: 'agent', DISPLAY: ':99',
         TERM: 'xterm-256color', PATH: '/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' },
       ...options,
     });
-    try { await this.validate(); return session; }
+    try {
+      await this.validate();
+      const close = session.close.bind(session);
+      const stopWatching = this.watchAuthority(() => session.close());
+      let closed = false;
+      session.close = () => { if (closed) return; closed = true; stopWatching(); close(); };
+      void session.result.then(stopWatching, stopWatching);
+      return session;
+    }
     catch (error) { session.close(); throw error; }
   }
 

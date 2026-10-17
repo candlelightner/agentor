@@ -1,5 +1,7 @@
 # Agentor — Comprehensive Feature List
 
+Native administrative terminal, files, editor/desktop proxy, plugin transport, journal and resource calls use fresh dedicated global/group records plus the current VM UUID, trusted role and lifecycle generation. Private plugin-self identity requires the fixed host-controlled administrative NIC and a running service; ordinary worker-self cannot grant an administrative role. Administrative streams and WebSocket proxies recheck authority while open. Selecting a VM or beginning migration withdraws a retained Docker projection and revokes captured command/proxy handles; it cannot become a fallback for a new administrative VM.
+
 Archived legacy workers can explicitly select an authorized catalog replacement while unarchiving when the original custom image is unavailable. The replacement uses the existing strict recovery parser, preserves worker identity and persistent data, and is saved as desired configuration before compute creation. Invalid/foreign/incompatible selections and persistence failures allocate no compute; failed creation retains the selected desired image and archived data. Native/imported-rootfs/workspace-only replacement is not enabled by this operation.
 
 Every user-facing feature of the Agentor web dashboard, organized by category. This document drives the Playwright test suite — every item below must have test coverage.

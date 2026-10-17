@@ -2,6 +2,7 @@ import { WebSocket } from 'ws';
 import type { Peer } from 'crossws';
 import { useContainerManager } from './services';
 import { authenticateWsPeer } from './auth-helpers';
+import { workerLifecycleGeneration, isWorkerLifecycleMutationPending } from './worker-lifecycle-coordinator';
 
 export function getPeerId(peer: Peer): string {
   return peer.id ?? String(peer);
@@ -45,6 +46,7 @@ interface RelayContext {
   bufferedMessages: Buffer[];
   bufferedBytes: number;
   closed: boolean;
+  stopAuthority?: () => void;
 }
 
 const relayContexts = new Map<string, RelayContext>();
@@ -91,30 +93,59 @@ export function createWsRelayHandlers(
         return;
       }
 
+      const generation = workerLifecycleGeneration(workerId);
+      const handle = info.containerId, ownerId = info.userId, administrativeKind = info.administrativeKind;
       // Authenticate and verify ownership before opening the relay
       authenticateWsPeer(peer).then(async (auth) => {
         if (ctx.closed) return;
         if (!auth) {
-          ctx.closed = true;
+          ctx.closed = true; ctx.stopAuthority?.();
           relayContexts.delete(id);
           try { peer.close(); } catch {}
           return;
         }
-        if (auth.user.role !== 'admin' && info.userId !== auth.user.id) {
-          ctx.closed = true;
+        if (auth.user.role !== 'admin' && ownerId !== auth.user.id) {
+          ctx.closed = true; ctx.stopAuthority?.();
           relayContexts.delete(id);
           try { peer.close(); } catch {}
           return;
         }
         if (authorize && !(await authorize(workerId, peer))) {
-          ctx.closed = true;
+          ctx.closed = true; ctx.stopAuthority?.();
           relayContexts.delete(id);
           try { peer.close(); } catch {}
           return;
         }
 
+        const checkAdministrative = () => {
+          if (!administrativeKind) return;
+          const current = useContainerManager().get(workerId);
+          if (!current || current.status !== 'running' || current.containerId !== handle ||
+              current.userId !== ownerId || current.administrativeKind !== administrativeKind ||
+              workerLifecycleGeneration(workerId) !== generation || isWorkerLifecycleMutationPending(workerId))
+            throw new Error('Administrative proxy authority changed');
+        };
+        checkAdministrative();
         const host = await useContainerManager().resolveWorkerHost(workerId);
+        checkAdministrative();
         if (ctx.closed) return;
+        if (administrativeKind) {
+          let checking = false;
+          const timer = setInterval(() => {
+            if (checking || ctx.closed) return;
+            checking = true;
+            void (async () => {
+              checkAdministrative();
+              if (await useContainerManager().resolveWorkerHost(workerId) !== host) throw new Error('Administrative proxy peer changed');
+              checkAdministrative();
+            })().catch(() => {
+              ctx.closed = true; ctx.stopAuthority?.(); relayContexts.delete(id);
+              try { ctx.containerWs?.close(); } catch {}
+              try { peer.close(); } catch {}
+            }).finally(() => { checking = false; });
+          }, 1000);
+          timer.unref(); ctx.stopAuthority = () => clearInterval(timer);
+        }
         const ws = new WebSocket(getTargetWsUrl(host, workerId, peer));
         ctx.containerWs = ws;
 
@@ -131,19 +162,19 @@ export function createWsRelayHandlers(
 
         ws.on('close', () => {
           if (ctx.closed) return;
-          ctx.closed = true;
+          ctx.closed = true; ctx.stopAuthority?.();
           relayContexts.delete(id);
           try { peer.close(); } catch {}
         });
 
         ws.on('error', () => {
           if (ctx.closed) return;
-          ctx.closed = true;
+          ctx.closed = true; ctx.stopAuthority?.();
           relayContexts.delete(id);
           try { peer.close(); } catch {}
         });
       }).catch(() => {
-        ctx.closed = true;
+        ctx.closed = true; ctx.stopAuthority?.();
         relayContexts.delete(id);
         try { peer.close(); } catch {}
       });
@@ -163,7 +194,7 @@ export function createWsRelayHandlers(
         // Backend WS not open yet (still resolving auth or mid-handshake) —
         // buffer, but bail out if a flood blows past the cap.
         if (ctx.bufferedBytes + raw.length > MAX_BUFFERED_BYTES) {
-          ctx.closed = true;
+          ctx.closed = true; ctx.stopAuthority?.();
           relayContexts.delete(id);
           try { ctx.containerWs?.close(); } catch {}
           try { peer.close(); } catch {}
@@ -178,7 +209,7 @@ export function createWsRelayHandlers(
       const id = getPeerId(peer);
       const ctx = relayContexts.get(id);
       if (!ctx) return;
-      ctx.closed = true;
+      ctx.closed = true; ctx.stopAuthority?.();
       try { ctx.containerWs?.close(); } catch {}
       relayContexts.delete(id);
     },
@@ -187,7 +218,7 @@ export function createWsRelayHandlers(
       const id = getPeerId(peer);
       const ctx = relayContexts.get(id);
       if (!ctx) return;
-      ctx.closed = true;
+      ctx.closed = true; ctx.stopAuthority?.();
       try { ctx.containerWs?.close(); } catch {}
       relayContexts.delete(id);
     },
