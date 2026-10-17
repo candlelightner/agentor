@@ -1,5 +1,7 @@
 # Agentor — Comprehensive Feature List
 
+Native administrative VM host networking now has a workspace-ID-only policy boundary: fresh dedicated authority, one private bridge/orchestrator peer, fixed filtered NIC, canonical device admission, explicit host and sibling isolation, and no automatic resource deletion. This is source/stub-tested support; real firewall/bridge/MCP acceptance remains pending. See `docs/incus-admin-private-networks.md`.
+
 Every user-facing feature of the Agentor web dashboard, organized by category. This document drives the Playwright test suite — every item below must have test coverage.
 
 Bounded Phase 8 interrupted-recreation recovery rolls back under the existing owner→worker fences before normal convergence. Verified original compute is retained stopped; replacement compute is removed only with installation/owner/worker/UUID and operation-nonce proof. Absent compute requires verified canonical storage and immutable source metadata. Unavailable or contradictory facts retain the recovery marker. Store-queue compare-and-merge preserves pending edits and revoked access; rollback never promotes desired secrets or deletes persistent volumes. Full Phase 8 and later parity gates remain open.

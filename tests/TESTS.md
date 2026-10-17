@@ -1,5 +1,7 @@
 # Agentor Test Suite
 
+Native admin private-network host policy adds 17 owned-temp/stub tests in `helpers/test_incus_admin_network_policy.py`, two real local TLS dispatch tests, and installer assertions for the pinned adapter. Focused checks cover identity/quarantine, exact layouts, stale authority, foreign peers, failure/publication ordering, read-only idempotence, firewall drift, and representative host/ordinary/sibling/spoof denials. These tests execute no Docker, Incus, iptables, nftables, or host route commands; real networking and full API/UI/MCP acceptance remain pending.
+
 Comprehensive end-to-end test suite for the Agentor platform using Playwright and TypeScript. Covers all API endpoints and UI interactions.
 
 ## Overview
