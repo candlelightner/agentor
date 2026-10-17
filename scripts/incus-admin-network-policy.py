@@ -198,7 +198,8 @@ class AdminNetworkPolicy:
         config = instance["config"]
         labels = {**self.labels(identity), "user.agentor.admin-nonce": native["nonce"],
                   "user.agentor.admin-overlay-sha256": native["overlaySha256"],
-                  "boot.autostart": "false", "security.secureboot": "false"}
+                  "boot.autostart": "false", "security.secureboot": "false",
+                  "limits.memory": "4GiB", "limits.cpu": "2"}
         require(instance.get("name") == native["name"] and instance.get("type") == "virtual-machine"
                 and instance.get("profiles") == [] and all(config.get(key) == value for key, value in labels.items())
                 and all(key in labels or key.startswith(("volatile.", "image.")) for key in config),

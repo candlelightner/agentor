@@ -128,7 +128,7 @@ class AdminNetworkTests(unittest.TestCase):
 
     def owned_instance(self, result):
         labels = {**self.policy.labels(self.policy.authority(self.payload)), 'user.agentor.admin-nonce': self.nonce,
-                  'user.agentor.admin-overlay-sha256': 'e' * 64, 'boot.autostart': 'false', 'security.secureboot': 'false'}
+                  'user.agentor.admin-overlay-sha256': 'e' * 64, 'boot.autostart': 'false', 'security.secureboot': 'false', 'limits.memory': '4GiB', 'limits.cpu': '2'}
         name = self.record['nativeRuntime']['name']
         devices = {'root': {'type': 'disk', 'path': '/', 'pool': 'owned-pool'},
                    'workspace': {'type': 'disk', 'path': '/workspace', 'pool': 'owned-pool', 'source': name + '-workspace'},
@@ -250,7 +250,7 @@ class AdminNetworkTests(unittest.TestCase):
         result = self.policy.ensure(self.payload)
         original = self.owned_instance(result)
         variants = []
-        for key, value in [('raw.qemu', 'injected'), ('boot.autostart', 'true'), ('user.agentor.owner', 'foreign')]:
+        for key, value in [('raw.qemu', 'injected'), ('boot.autostart', 'true'), ('user.agentor.owner', 'foreign'), ('limits.memory', '1GiB'), ('limits.cpu', '8')]:
             changed = copy.deepcopy(original)
             changed['config'][key] = value
             variants.append(changed)
