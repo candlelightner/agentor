@@ -1,6 +1,6 @@
 {
   "objective": "Autonomously finish the Agentor VM-branch upgrade and migration of every safely eligible ordinary worker, verifying workspace, agent/editor state, managed volumes, native Docker data, preserved custom tools and intended stopped/archived state. Keep the verified encrypted backup fd9ff548-9a79-4b7c-979c-7906f0a0cf10, recovery keys, original Docker sources and rollback images. In parallel, have appropriately chosen sub-agents address as many remaining GitHub code issues as realistic in urgency/impact order, especially safe GPU/USB passthrough, backup correctness/performance and operational diagnostics. Require coherent committed and pushed branches, accurate supported-capability reporting and appropriate validation. After migration and sub-agent work finish, consolidate and review locally, merge only validated agent changes into feature/incus-vm-workers, run combined checks, and create a PR onto main if those checks pass. Report unresolved image, hardware and acceptance limitations honestly; do not delete the backup or prematurely finalize original data.",
-  "state": "active combined goal in Codex tracker; production migration and isolated agent fixes in progress",
+  "state": "active combined goal; four production workers verified, updater retry capturing, isolated agent fixes finished and reviewed; consolidation follows eligible migration",
   "priority": [
     {
       "issues": [
@@ -51,8 +51,8 @@
     "No backup/source finalization or deletion"
   ],
   "lastVerifiedProductionWorker": {
-    "id": "834db661-cff3-402b-8daa-b0ba4738abeb",
-    "name": "3D modelling",
+    "id": "2eb7b5c5-5df6-412d-81cd-a88e7a9a92a5",
+    "name": "conlang-thinking",
     "runtime": "incus-vm",
     "state": "archived",
     "guestKernel": "7.0.0-38-generic",
@@ -69,12 +69,18 @@
   "verifiedProductionWorkers": [
     "6eea5aa9-2d0d-454a-a91b-21b35d5b84fc",
     "cd4170f6-21aa-4494-b886-640494ff1f30",
-    "834db661-cff3-402b-8daa-b0ba4738abeb"
+    "834db661-cff3-402b-8daa-b0ba4738abeb",
+    "2eb7b5c5-5df6-412d-81cd-a88e7a9a92a5"
   ],
   "migrationFollowUps": {
-    "updater": "Retry is actively capturing after exact source/manifest/init/environment checks, on deployed 5851158 with PAX-size and initialize-once WorkerStore fixes. Offline Docker inventory retained for later comparison: 10 images, 0 containers, 3 volumes.",
+    "updater": "Second retry is actively capturing on deployed 5bf6550. First retry passed workspace (including 8 GiB PAX size) and agent-data validation, then safely rolled back on four legitimate literal-backslash systemd unit filenames in nested Docker layers. Committed Docker-only path fix passed 76 affected tests, full typecheck, independent 63-fixture security matrix, GNU extraction proof and image build. Exact source remains stopped/unchanged. Offline Docker inventory: 10 images, 0 containers, 3 volumes.",
     "3d": "Fully verified and archived natively after supported rebuild; original Docker source retained. Initial failure reproduced: a read-only migration status request reloaded shared worker authority and dropped own undefined keys.",
-    "metod": "Archived legacy managed parent /home/agent/.local/share overlaps protected Kilo data. Do not bypass admission or drop data; source and legacy volume retained for reviewed handling."
+    "metod": "Archived legacy managed parent /home/agent/.local/share overlaps protected Kilo data. Do not bypass admission or drop data; source and legacy volume retained for reviewed handling.",
+    "remainingArchivedEligible": [
+      "2ecd0b20-faf9-422f-95a1-1db08c812669",
+      "b71d012c-4d77-4a7a-8e8b-4626d11ed5d8",
+      "a9812e5e-7316-4de6-9c6b-bf3ec11dcee2"
+    ]
   },
   "additionalBranches": {
     "memoryPolicy": "fix/incus-default-memory-20261017",
@@ -82,8 +88,12 @@
     "migrationDiagnostics": "fix/incus-migration-diagnostics-20261017",
     "legacyManagedMigration": "fix/incus-legacy-managed-migration-20261017",
     "isolatedIntegration": "fix/backup-integration-harness-20261017",
-    "workerStoreInitialization": "fix/worker-store-init-once-20261017"
+    "workerStoreInitialization": "fix/worker-store-init-once-20261017",
+    "dockerLiteralPaths": "fix/incus-docker-literal-paths-20261017",
+    "realCliClipboard": "fix/terminal-copy-real-cli-20261017"
   },
-  "deployedSourceRevision": "5851158fbe31f98a33f1e1ec63554c53255c2aea",
-  "reviewedInitializationFix": "11906c9 passed 138 affected tests and both typechecks. Independent peer proved twenty concurrent startup status requests perform one load and later reads preserve live authority; explicit private readers remain fresh."
+  "deployedSourceRevision": "5bf655071b439a2ec6a9157c2a52f01a708ec922",
+  "reviewedInitializationFix": "11906c9 passed 138 affected tests and both typechecks. Independent peer proved twenty concurrent startup status requests perform one load and later reads preserve live authority; explicit private readers remain fresh.",
+  "terminalAcceptance": "Committed and pushed 167fab9: installed Codex 0.163.0 actual /copy picker through tmux, WebSocket and TerminalPane/xterm to explicit Chromium clipboard action; exact 1000-line UTF-8 response also matches successful X11 clipboard. All 30 diagnostics tests and typecheck pass. Other CLI versions unverified.",
+  "consolidationReview": "Static peer review found no new security blocker. From current production lineage, merge legacy-managed, memory, hardware, real-CLI management (includes diagnostics), then backup integration (includes reliability/performance). Retain both memory allocation and final hardware reauthorization, both Docker imports, and union all test registrations. Migration tests must retain both baseline drift rejection and historical-volume handling. Do not remerge already cherry-picked urgent branches."
 }
