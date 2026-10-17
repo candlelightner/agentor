@@ -78,7 +78,8 @@ network interfaces or cgroups. The parent directory must exist with at least
 limits are insufficient, the run fails; changing them requires a new review.
 
 The cloud image must be an ordinary standalone qcow2 file no larger than 1 GiB,
-with no backing chain or encryption. The runner copies it into the new directory,
+with no backing chain, external data file or encryption. A bounded header check rejects
+external references before any QEMU tool opens the image format. The runner copies it into the new directory,
 verifies the supplied SHA256, makes that private copy read-only, and uses a new
 80 GiB qcow2 overlay. The original image and any prior preflight VM are never
 modified. A new NoCloud seed contains only fresh client/public and guest host
@@ -107,7 +108,9 @@ fresh recovery-installation flow are retained. Native DR flags are not forwarded
 this does not verify Incus/native disaster recovery.
 
 Provisioning has a 15-minute bound and the guest suite command a four-hour bound.
-On completion, failure or interruption, the host terminates only its captured
+SIGINT, SIGTERM and SIGHUP enter the same bounded cleanup; a signal during process
+creation waits until its handle is captured, and repeated cancellation cannot
+interrupt cleanup. On completion, failure or interruption, the host terminates only its captured
 QEMU process, waits 30 seconds and uses that same process handle for a final kill
 if needed. It never searches PID files/names, prunes host Docker or deletes a
 parent directory. After confirmed process exit and run-directory identity checks,
@@ -126,7 +129,8 @@ python3 -m unittest discover -s tests/helpers -p 'test_backup*launcher.py' -v
 
 The guards cover unchanged full arrays, side-effect-free plans, disk/network
 attachments, private keys/nonce bootstrap, wrong-host/DMI/metadata rejection,
-existing-resource/free-space refusal, bounded log capture, and both-suite
+existing-resource/free-space refusal, external-data-file header rejection before QEMU,
+actual catchable signals with stub VM cleanup/forced-kill ordering, bounded log capture, and both-suite
 execution after a first-suite failure. A successful real VM boot, guest Docker
 nesting, complete suite reports and cleanup proof remain the next acceptance
 step after plan review. Cloud-init's supported host-key bootstrap is described
@@ -158,6 +162,6 @@ These are not generic nested-Docker gates. Several still bind a prior disposable
 
 ## Evidence and remaining acceptance
 
-Twenty-one local launcher/VM plan cases pass without Docker access, including both full suite arrays, zero-subprocess execution refusal, unsafe namespace/capability/device/mount rejection, device-backed/external/reused-volume rejection, source export and exclusive leases. No test container, daemon, VM, build, mount, cgroup or device was created or changed. There are no runtime reports or cleanup receipts to claim from this change.
+Twenty-four local launcher/VM plan cases pass without Docker access, including both full suite arrays, zero-subprocess execution refusal, unsafe namespace/capability/device/mount rejection, device-backed/external/reused-volume rejection, source export and exclusive leases. No test container, daemon, VM, build, mount, cgroup or device was created or changed. There are no runtime reports or cleanup receipts to claim from this change.
 
 Neither acceptance stack has been started. The real whole-instance UI/API spec and repaired real-worker UI spec remain **prepared, not live-validated**, pending a safe execution environment and successful complete runs. Comparative ≥2× complete-backup throughput, single-core/small-volume behavior and native VM portability remain additional gates; the synthetic 2.36× volume-pipeline benchmark does not substitute for them.

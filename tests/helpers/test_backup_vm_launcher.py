@@ -1,11 +1,13 @@
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -160,6 +162,125 @@ class BackupVmLauncherTests(unittest.TestCase):
             self.assertEqual(stream.tell(), 10000)
             self.assertTrue(target.read_bytes().startswith(b'a' * 1024))
             self.assertLess(target.stat().st_size, 1200)
+
+
+    def test_base_header_rejects_external_data_before_qemu_opens_the_format(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / 'base.qcow2'
+            header = bytearray(104); header[:4] = b'QFI\xfb'
+            struct.pack_into('>I', header, 4, 3)
+            struct.pack_into('>Q', header, 24, 1024 * 1024)
+            struct.pack_into('>I', header, 100, 104)
+            image.write_bytes(header); runner.validate_base_header(image)
+            # Qcow2 v3 incompatible feature bit 2 authorizes an external file.
+            for offset, encoding, value in [(72, '>Q', 4), (8, '>Q', 104),
+                                             (16, '>I', 10), (32, '>I', 2), (24, '>Q', 81 * runner.GIB)]:
+                changed = header.copy(); struct.pack_into(encoding, changed, offset, value)
+                image.write_bytes(changed)
+                with self.subTest(offset=offset), self.assertRaises(RuntimeError):
+                    runner.validate_base_header(image)
+            for value in [b'', header[:71], header[:103], b'not-qcow' + header[8:]]:
+                image.write_bytes(value)
+                with self.assertRaises(RuntimeError): runner.validate_base_header(image)
+            struct.pack_into('>I', header, 4, 2)
+            image.write_bytes(header[:72]); runner.validate_base_header(image)
+
+    def test_execute_rejects_external_header_before_any_qemu_tool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)/'base.qcow2'; root = Path(directory)/'run'
+            header = bytearray(104); header[:4] = b'QFI\xfb'
+            struct.pack_into('>I', header, 4, 3); struct.pack_into('>Q', header, 24, 1024*1024)
+            struct.pack_into('>Q', header, 72, 4); base.write_bytes(header)
+            proposed = runner.plan(root, base, hashlib.sha256(header).hexdigest(), 22941, NONCE)
+            with mock.patch.object(runner.shutil, 'which', return_value='/stub'), \
+                 mock.patch.object(runner.shutil, 'disk_usage', return_value=types.SimpleNamespace(free=100*runner.GIB)), \
+                 mock.patch.object(runner.os, 'access', return_value=True), mock.patch.object(runner.socket, 'socket'), \
+                 mock.patch.object(runner, 'command') as command, \
+                 mock.patch.object(runner.subprocess, 'check_output', return_value='a'*40) as output, \
+                 mock.patch.object(runner.subprocess, 'Popen') as launch:
+                with self.assertRaisesRegex(RuntimeError, 'External qcow2'):
+                    runner.execute(proposed)
+                command.assert_called_once_with(['git', '-C', str(runner.REPO), 'diff', '--quiet', 'HEAD', '--'])
+                output.assert_called_once_with(['git', '-C', str(runner.REPO), 'rev-parse', 'HEAD'], text=True)
+                launch.assert_not_called()
+            self.assertEqual(base.read_bytes(), header)
+            self.assertFalse((root/'base.qcow2').exists())
+
+    def test_catchable_termination_cleans_captured_vm_and_keys_after_confirmed_exit(self):
+        # A real Python child receives real signals; all VM/tools/socket calls
+        # are stubs and every file belongs to this test's temporary directory.
+        script = r'''import hashlib, importlib.util, io, json, os, signal, struct, sys, tarfile, types
+from pathlib import Path
+module, directory, number, trigger, force = sys.argv[1:]
+number = int(number); force = force == 'true'; directory = Path(directory)
+spec = importlib.util.spec_from_file_location('runner', module)
+r = importlib.util.module_from_spec(spec); spec.loader.exec_module(r)
+base = directory/'original.qcow2'; root = directory/'run'; trace = directory/'trace'
+header = bytearray(104); header[:4] = b'QFI\xfb'; struct.pack_into('>I', header, 4, 3)
+struct.pack_into('>Q', header, 24, 1024*1024); struct.pack_into('>I', header, 100, 104)
+base.write_bytes(header)
+proposed = r.plan(root, base, hashlib.sha256(header).hexdigest(), 22941, '01234567-89ab-4cde-8fab-0123456789ab')
+r.shutil.which = lambda tool: '/stub'
+r.shutil.disk_usage = lambda path: types.SimpleNamespace(free=100*r.GIB)
+r.os.access = lambda *args: True
+class Socket:
+    def bind(self, address): pass
+    def close(self): pass
+r.socket.socket = Socket
+
+def command(args, **kwargs):
+    if args[0] == 'qemu-img': Path(args[-2]).write_bytes(b'owned disk')
+    elif args[0] == 'ssh-keygen':
+        Path(args[-1]).write_text('private key'); Path(args[-1]+'.pub').write_text('ssh-ed25519 public key')
+    elif args[0] == 'cloud-localds': Path(args[1]).write_bytes(b'owned seed')
+    elif args[0] == 'git' and 'archive' in args:
+        with tarfile.open(fileobj=kwargs['stdout'], mode='w'): pass
+    return types.SimpleNamespace(returncode=0)
+r.command = command
+r.subprocess.check_output = lambda args, **kwargs: 'a'*40 if args[0] == 'git' else json.dumps({'format':'qcow2','virtual-size':1024*1024})
+class VM:
+    def __init__(self, *args, **kwargs):
+        self.stdout = io.BytesIO(); self.sent = False; self.stopped = False; self.waits = 0
+        if trigger == 'spawn': os.kill(os.getpid(), number)
+    def poll(self):
+        if trigger == 'poll' and not self.sent:
+            self.sent = True; os.kill(os.getpid(), number)
+        return 0 if self.stopped else None
+    def event(self, name):
+        assert (root/'root.qcow2').exists() and (root/'client-key').exists()
+        with trace.open('a') as output: output.write(name+'\n')
+    def terminate(self):
+        self.event('terminate')
+        # A repeated cancellation cannot interrupt the cleanup boundary.
+        os.kill(os.getpid(), number)
+    def wait(self, timeout):
+        self.event('wait'); self.waits += 1
+        if force and self.waits == 1: raise r.subprocess.TimeoutExpired('owned stub', timeout)
+        self.stopped = True; return 0
+    def kill(self): self.event('kill')
+r.subprocess.Popen = VM
+if trigger == 'thread':
+    class InterruptedThread(r.threading.Thread):
+        def start(self): os.kill(os.getpid(), number)
+    r.threading.Thread = InterruptedThread
+r.execute(proposed)
+'''
+        import signal
+        for number, trigger, force in [(signal.SIGTERM, 'spawn', False), (signal.SIGHUP, 'poll', False),
+                                        (signal.SIGTERM, 'poll', True), (signal.SIGINT, 'spawn', False),
+                                        (signal.SIGTERM, 'thread', False)]:
+            with self.subTest(number=number, trigger=trigger, force=force), tempfile.TemporaryDirectory() as directory:
+                result = subprocess.run([sys.executable, '-c', script, str(SCRIPT), directory, str(number), trigger,
+                                         str(force).lower()], capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 128 + number, result.stderr)
+                root = Path(directory)/'run'
+                self.assertEqual((Path(directory)/'trace').read_text().splitlines(),
+                                 ['terminate', 'wait', 'kill', 'wait'] if force else ['terminate', 'wait'])
+                self.assertTrue((Path(directory)/'original.qcow2').exists())
+                self.assertTrue((root/'plan.json').exists())
+                for name in ['root.qcow2', 'base.qcow2', 'seed.img', 'client-key', 'host-key', 'user-data', 'source.tar']:
+                    self.assertFalse((root/name).exists(), name)
+
 
 
 if __name__ == '__main__':

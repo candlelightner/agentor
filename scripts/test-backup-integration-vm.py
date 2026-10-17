@@ -7,8 +7,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -159,6 +161,21 @@ def command(args, **kwargs):
     return subprocess.run(args, check=True, timeout=120, **kwargs)
 
 
+def validate_base_header(path):
+    # Reject external references before any QEMU tool can open the image format.
+    with Path(path).open('rb') as image:
+        header = image.read(104)
+    if len(header) < 72 or header[:4] != b'QFI\xfb':
+        raise RuntimeError('Expected a complete ordinary qcow2 header')
+    version = struct.unpack_from('>I', header, 4)[0]
+    backing, backing_size = struct.unpack_from('>QI', header, 8)
+    size, encryption = struct.unpack_from('>QI', header, 24)
+    if version not in (2, 3) or backing or backing_size or encryption or not 0 < size <= 80 * GIB:
+        raise RuntimeError('Only a standalone unencrypted bounded qcow2 image is accepted')
+    if version == 3 and (len(header) < 104 or struct.unpack_from('>Q', header, 72)[0] & 4):
+        raise RuntimeError('External qcow2 data files or truncated headers are forbidden')
+
+
 def execute(proposed):
     root, base = Path(proposed['root']), Path(proposed['base']).resolve(strict=True)
     for tool in ('qemu-system-x86_64', 'qemu-img', 'cloud-localds', 'ssh', 'ssh-keygen', 'git'):
@@ -180,6 +197,19 @@ def execute(proposed):
     owned = root.stat()
     process = None
     log_thread = None
+    spawning = False
+    cancelled = None
+    previous_handlers = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    def cancel(number, _frame):
+        nonlocal cancelled
+        if cancelled is not None:
+            return
+        cancelled = number
+        # Capture the child handle before unwinding a signal during Popen.
+        if not spawning:
+            raise SystemExit(128 + number)
+    for number in previous_handlers:
+        signal.signal(number, cancel)
     try:
         (root / 'plan.json').write_text(json.dumps({**proposed, 'commit': commit}, indent=2))
         digest = hashlib.sha256()
@@ -189,8 +219,9 @@ def execute(proposed):
         if digest.hexdigest() != proposed['sha256']:
             raise RuntimeError('Cloud image SHA256 does not match the reviewed base')
         os.chmod(root / 'base.qcow2', 0o400)
+        validate_base_header(root / 'base.qcow2')
         info = json.loads(subprocess.check_output(['qemu-img', 'info', '--output=json', str(root / 'base.qcow2')]))
-        if info.get('format') != 'qcow2' or info.get('backing-filename') or info.get('encrypted') or info.get('virtual-size', 0) > 80 * GIB:
+        if info.get('format') != 'qcow2' or info.get('backing-filename') or info.get('encrypted') or info.get('virtual-size', 0) > 80 * GIB or info.get('format-specific', {}).get('data', {}).get('data-file'):
             raise RuntimeError('Only a standalone ordinary qcow2 cloud image is accepted')
         command(['qemu-img', 'create', '-f', 'qcow2', '-F', 'qcow2', '-b', str(root / 'base.qcow2'), str(root / 'root.qcow2'), '80G'], stdout=subprocess.DEVNULL)
         for name in ('client-key', 'host-key'):
@@ -210,7 +241,13 @@ def execute(proposed):
             with tarfile.open(root / 'source.tar') as archive:
                 archive.extractall(scratch, filter='data')
         reservation.close()
-        process = subprocess.Popen(proposed['qemu'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        spawning = True
+        try:
+            process = subprocess.Popen(proposed['qemu'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        finally:
+            spawning = False
+        if cancelled is not None:
+            raise SystemExit(128 + cancelled)
         log_thread = threading.Thread(target=copy_log, args=(process.stdout, root / 'console.log'), daemon=True); log_thread.start()
         ssh = ['ssh', '-F', '/dev/null', '-T', '-p', str(proposed['sshPort']), '-i', str(root / 'client-key'),
                '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none', '-o', 'BatchMode=yes',
@@ -258,21 +295,28 @@ def execute(proposed):
         (root / 'result.json').write_text(json.dumps({'exitCode': code, 'commit': commit, 'nonce': proposed['nonce']}))
         return code
     finally:
-        reservation.close()
-        if process is not None and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                process.kill(); process.wait(timeout=5)
-        if log_thread:
-            log_thread.join(timeout=5)
-        # No PID-file lookup, name search, Docker prune or ancestor-directory deletion.
-        if root.stat().st_ino != owned.st_ino or root.stat().st_dev != owned.st_dev:
-            raise RuntimeError('Run directory identity changed; file cleanup refused')
-        for name in ('root.qcow2', 'base.qcow2', 'seed.img', 'client-key', 'host-key', 'user-data', 'source.tar', 'reports.tar'):
-            (root / name).unlink(missing_ok=True)
-        print('Backup VM stopped; logs and reports retained at ' + str(root), flush=True)
+        # Repeated cancellation must not interrupt confirmed-exit/key cleanup.
+        for number in previous_handlers:
+            signal.signal(number, signal.SIG_IGN)
+        try:
+            reservation.close()
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    process.kill(); process.wait(timeout=5)
+            if log_thread and log_thread.is_alive():
+                log_thread.join(timeout=5)
+            # No PID-file lookup, name search, Docker prune or ancestor-directory deletion.
+            if root.stat().st_ino != owned.st_ino or root.stat().st_dev != owned.st_dev:
+                raise RuntimeError('Run directory identity changed; file cleanup refused')
+            for name in ('root.qcow2', 'base.qcow2', 'seed.img', 'client-key', 'host-key', 'user-data', 'source.tar', 'reports.tar'):
+                (root / name).unlink(missing_ok=True)
+            print('Backup VM stopped; logs and reports retained at ' + str(root), flush=True)
+        finally:
+            for number, handler in previous_handlers.items():
+                signal.signal(number, handler)
 
 
 def main(argv=None):
