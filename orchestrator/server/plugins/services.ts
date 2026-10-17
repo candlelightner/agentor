@@ -48,7 +48,7 @@ import {
   type AdminWorkspaceIdentityMaterializationIntent,
 } from "../utils/admin-workspace-store";
 import { useGroupAdminWorkspaceStore } from "../utils/group-admin-workspace-store";
-import { DockerAdminWorkspaceRuntime } from "../utils/admin-workspace-runtime";
+import { useAdministrativeWorkspaceRuntime } from "../utils/services";
 import { useManagementMcpStore } from "../utils/management-mcp-store";
 import { ManagementMcpTransport } from "../utils/management-mcp-transport";
 import { useGitImageCatalogManager } from "../utils/git-image-manager";
@@ -335,7 +335,7 @@ export default defineNitroPlugin(async (nitroApp) => {
   // The MCP listener binds only to the orchestrator's address on the internal
   // management network and still authenticates + authorizes every JSON-RPC
   // call through ManagementMcpStore.
-  const adminRuntime = new DockerAdminWorkspaceRuntime(useConfig());
+  const adminRuntime = useAdministrativeWorkspaceRuntime();
   const managementMcp = new ManagementMcpTransport(useManagementMcpStore());
   adminRuntime.setManagementListener((host) => managementMcp.start(host));
   const adminWorkspace = useAdminWorkspaceStore();
@@ -357,14 +357,14 @@ export default defineNitroPlugin(async (nitroApp) => {
     }
     await adminRuntime.materializeCredential(
       await issueCredential(),
-      record.kind === "group-administrative" ? record : undefined,
+      record,
       intent,
     );
   };
   adminWorkspace.setIdentityMaterializer(materializeAdminIdentity);
   groupAdminWorkspaces.setIdentityMaterializer(materializeAdminIdentity);
   await adminRuntime.initializeBoundary();
-  await managementMcp.start(await adminRuntime.managementAddress());
+
   let adminIdentityTimer: NodeJS.Timeout | undefined;
   const refreshAdminIdentity = async () => {
     if (instanceSnapshotActive()) return;

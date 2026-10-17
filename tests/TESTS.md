@@ -524,3 +524,11 @@ from `scripts/maintenance/incus-upgrade-20261017`. Sixteen isolated tests cover 
 immutable custom images, environment equivalence, private receipts, bounded sample exclusions,
 mocked lifecycle success/ambiguity, retained-source identity, native acceptance, legacy managed
 shape refusal, same-worker editor redirects, guarded post-unarchive continuation and normal execution delegation. These tests do not execute production migration.
+
+
+`api/admin-native-authority.spec.ts` adds seven module cases covering native-before-provision global/group records, private durable acknowledgements, dedicated legacy cutover, acknowledgement failure before side effects, malformed metadata quarantine preserving bytes, and identity-preserving runtime patches. Existing 13 administrative store transaction cases pass.
+
+
+`api/admin-native-runtime.spec.ts` adds 15 isolated module cases for acknowledged native create/start ordering, unavailable-Incus no-fallback, credential failure cleanup, unknown-operation fences and explicit settlement, stale VM/missing storage refusal, group trusted-role/environment protection, desired/applied script revisions, exact network identity, and real Python no-follow control-file writes in owned temporary directories. No Docker/Incus/host networking or guest lifecycle commands execute. Expanded fixture typechecks include both native-admin module files.
+
+Native admin authority coverage is now 11 cases including legacy-ID admission/name bounds and group bootstrap singleflight, retry, private readers, explicit reload and quarantine recovery. The existing ordinary-identity quarantine fixture intentionally reloads via `loadUser` rather than bootstrap `init`. Combined affected run: 80 cases passed, including the fixed resource-profile assertion.

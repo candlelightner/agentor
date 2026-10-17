@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { withWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
+import { applyAdminNativePatch, type AdminNativeAcknowledge } from './admin-native-authority';
 import type {
   AdminWorkspaceIdentityMaterializationIntent,
   AdminWorkspaceRuntimeAdapter,
@@ -149,7 +151,9 @@ export class GroupAdminWorkspaceStore {
     this.running.add(groupId);
     let deferredRelease = false;
     try {
-      return await operation();
+      const snapshot = this.group(groupId);
+      return await this.serializeOwner(snapshot.userId, () => withWorkerLifecycleMutation(
+        snapshot.adminWorkspace?.id ?? `admin-group-bootstrap:${groupId}`, operation));
     } catch (error) {
       const settlement = (error as OperationFailureWithSettlement)?.[
         operationSettlement
@@ -162,6 +166,21 @@ export class GroupAdminWorkspaceStore {
     } finally {
       if (!deferredRelease) this.running.delete(groupId);
     }
+  }
+  private nativeAcknowledge(record: GroupAdministrativeWorkspaceRecord): AdminNativeAcknowledge {
+    return async patch => {
+      if (applyAdminNativePatch(record, patch)) await this.commitExternal('native-runtime', record);
+    };
+  }
+  async withNativeRuntimeTransaction<T>(groupId: string,
+    operation: (record: GroupAdministrativeWorkspaceRecord, acknowledge: AdminNativeAcknowledge) => Promise<T>, authorize?: () => void): Promise<T> {
+    return this.run(groupId, () => this.withGroup(groupId, false, async () => {
+      authorize?.();
+      await this.flushPendingCommit(groupId, 'native-runtime');
+      const record = this.record(groupId);
+      if (!record) throw Object.assign(new Error('Group administrative workspace is not provisioned'), { statusCode: 404 });
+      return operation(record, this.nativeAcknowledge(record));
+    }));
   }
   async ensure(groupId: string, _ownerId?: string, authorize?: () => void) {
     return this.run(groupId, () =>
@@ -189,6 +208,7 @@ export class GroupAdminWorkspaceStore {
         id: randomUUID(),
         kind: "group-administrative",
         trusted: true,
+        runtimeKind: "incus-vm",
         groupId: group.id,
         ownerId: group.userId,
         services: ["terminal", "editor", "desktop"],
@@ -211,7 +231,7 @@ export class GroupAdminWorkspaceStore {
         );
       const changed = this.applyImage(
         record,
-        await this.runtime.ensure(structuredClone(record)),
+        await this.runtime.ensure(structuredClone(record), this.nativeAcknowledge(record)),
       );
       if (changed) await this.commitExternal("ensure", record);
       if (record.status === "running" && this.identityMaterializer)
@@ -253,13 +273,13 @@ export class GroupAdminWorkspaceStore {
               );
             this.applyImage(
               record,
-              await this.runtime.start(structuredClone(record)),
+              await this.runtime.start(structuredClone(record), this.nativeAcknowledge(record)),
             );
             await this.identityMaterializer?.(
               structuredClone(record),
               "refresh-running",
             );
-          } else await this.runtime.stop(structuredClone(record));
+          } else await this.runtime.stop(structuredClone(record), this.nativeAcknowledge(record));
         }
         record.status = status;
         record.updatedAt = new Date().toISOString();
@@ -301,7 +321,7 @@ export class GroupAdminWorkspaceStore {
           );
         this.applyImage(
           record,
-          await this.runtime.rebuild(structuredClone(record)),
+          await this.runtime.rebuild(structuredClone(record), this.nativeAcknowledge(record)),
         );
         await this.identityMaterializer?.(
           structuredClone(record),
@@ -400,7 +420,7 @@ export class GroupAdminWorkspaceStore {
         const pending = await this.flushPendingCommit(groupId, "remove");
         const record = pending?.record ?? this.record(groupId);
         if (record && this.runtime?.remove)
-          await this.runtime.remove(structuredClone(record));
+          await this.runtime.remove(structuredClone(record), this.nativeAcknowledge(record));
       });
     return serialized ? operation() : this.run(groupId, operation);
   }
@@ -417,7 +437,7 @@ export class GroupAdminWorkspaceStore {
         await this.ensureLocked(group);
         if (status !== "stopped") return;
         const record = this.record(groupId)!;
-        if (this.runtime) await this.runtime.stop(structuredClone(record));
+        if (this.runtime) await this.runtime.stop(structuredClone(record), this.nativeAcknowledge(record));
         record.status = "stopped";
         record.updatedAt = new Date().toISOString();
         if (this.runtime)
@@ -457,6 +477,8 @@ export class GroupAdminWorkspaceStore {
       ...record,
       userId: record.ownerId,
       ownerId: undefined,
+      nativeRuntime: undefined,
+      nativeMigration: undefined,
       startupScript: undefined,
       startupScriptRevision: undefined,
       appliedStartupScriptRevision: undefined,
