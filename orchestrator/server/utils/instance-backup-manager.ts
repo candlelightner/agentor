@@ -11,8 +11,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { basename, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { createGzip } from "node:zlib";
 import type { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -1855,7 +1854,7 @@ function instanceFailureDiagnostic(error: unknown) {
   // Arbitrary exception messages, causes, provider responses, and stack headers
   // may contain credentials or decrypted recovery material. Keep only a known
   // error class, a missing manager symbol, and locations in this source module
-  // (or its production chunk). No exception-supplied paths reach the logger.
+  // (or its production chunk). Only known source filenames reach the logger.
   const type = error instanceof ReferenceError ? "ReferenceError"
     : error instanceof TypeError ? "TypeError"
     : error instanceof RangeError ? "RangeError"
@@ -1864,13 +1863,13 @@ function instanceFailureDiagnostic(error: unknown) {
   const reference = error instanceof ReferenceError
     ? /^use[A-Za-z0-9_$]{1,100}(?:Manager|Runtime) is not defined$/.exec(error.message)?.[0]
     : undefined;
-  const modulePath = fileURLToPath(import.meta.url);
   const locations = error instanceof Error
     ? (error.stack ?? "").split("\n").slice(1).flatMap((line) => {
         if (!/^\s+at /.test(line)) return [];
-        const suffix = line.split(`${modulePath}:`)[1];
-        const position = suffix && /^(\d+):(\d+)\)?$/.exec(suffix);
-        return position ? [`${basename(modulePath)}:${position[1]}:${position[2]}`] : [];
+        // Nitro rewrites import.meta.url to the entrypoint, so match the two
+        // known source locations rather than resolving paths from that URL.
+        const position = /\/server\/(?:utils\/(instance-backup-manager\.ts)|chunks\/nitro\/(nitro\.mjs)):(\d+):(\d+)\)?$/.exec(line);
+        return position ? [`${position[1] ?? position[2]}:${position[3]}:${position[4]}`] : [];
       }).slice(0, 8)
     : [];
   return { type, ...(reference ? { reference } : {}), locations };

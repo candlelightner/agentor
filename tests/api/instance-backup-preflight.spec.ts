@@ -184,3 +184,15 @@ test("a failed diagnostic logger cannot prevent persistence of the failed job", 
     console.error = original;
   }
 });
+
+test("diagnostics recognize production Nitro chunk locations without exposing stack paths", async () => {
+  const error = new Error("private response");
+  error.stack = "Error: private response\n    at runCreate (/app/.output/server/chunks/nitro/nitro.mjs:45678:12)\n    at provider (/private/short-secret.mjs:1:2)";
+  const job = await create(manager({ authSnapshot: async () => { throw error; } }));
+  expect(job.status).toBe("failed");
+  expect(JSON.parse(diagnostics[0]!.replace("[instance-backup] ", ""))).toMatchObject({
+    phase: "database-snapshot", locations: ["nitro.mjs:45678:12"],
+  });
+  expect(diagnostics[0]).not.toContain("private");
+  expect(diagnostics[0]).not.toContain("short-secret");
+});
