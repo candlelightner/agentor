@@ -104,3 +104,63 @@ The helper has **not** been executed against production as part of implementatio
 real migrations, custom-image conversion and archival acceptance remain operator
 run evidence. Incus command options follow the upstream
 [exec reference](https://linuxcontainers.org/incus/docs/main/reference/manpages/incus/exec/).
+
+## Guest-only native Docker verification
+
+`verify-native-docker-guest.py` is a root-only, read-only guest helper. The host
+caller must separately prove the exact installation, owner, source identity and
+**current** Incus rebuild incarnation before executing it. It accepts one bounded
+JSON object on stdin: `{version: 1, expectedIncarnation, inventory, samples}`.
+`inventory` and `samples` retain the source inventory/sample shapes; their worker
+and source-container identities must match. The mandatory lower-case UUID is the
+current `volatile.uuid`, never the migration marker's old UUID after Rebuild.
+
+The first protected read is the fixed DMI product UUID. It must match before any
+Docker command, sample or filesystem-space observation. Incus passes its
+`volatile.uuid` as QEMU `-uuid` (see the [upstream QEMU driver](https://github.com/lxc/incus/blob/main/internal/server/instance/drivers/driver_qemu.go)).
+The approved read-only operator probe also confirmed an exact match between the
+restoring updater's host-side UUID and its lower-case guest DMI product UUID.
+This proof must be repeated with the **new current** UUID after a supported
+Rebuild; a stale value deliberately refuses verification. No source inventory,
+credentials, recovery material or private init contents are committed here.
+
+Docker access uses only `/usr/bin/docker --host unix:///var/run/docker.sock` with
+a minimal environment and no user Docker configuration. The only accepted CLI
+forms are info, image/container/volume listings and named-volume inspection.
+`overlay2` and `/var/lib/docker` are mandatory; source image/container IDs and
+volume names must be subsets of strictly parsed current inventories. Inspected
+sampled volumes must be ordinary local volumes with no driver options and the
+exact fixed Docker mountpoint. Output is bounded at 4 MiB per command, each
+command has a 30-second deadline with child cleanup, and the entire helper has
+a five-minute deadline. Input is limited to 2 MiB and duplicate JSON keys fail.
+
+Samples are restricted to `/var/lib/docker/volumes/NAME/_data/<relative-path>`.
+Every component is opened through directory file descriptors with `O_NOFOLLOW`;
+regular-file reads also use `O_NONBLOCK` and `O_NOATIME`. Absolute/traversal/empty
+components, symlinks, special files, oversized data, changed inode/metadata or
+replaced named ancestors fail closed. SHA256 and exact size are mandatory;
+optional `uid`, `gid`, `mode` (integer permission bits) and `mtimeNs` (integer
+nanoseconds) are compared without floating-point conversion. Limits are 8 MiB per
+file, 16 files per volume, 128 samples and 64 MiB total across at most 256 sampled
+volumes. Source samples may need deliberate bounded selection before submission.
+
+The helper writes no guest files, runs no agent CLI or Docker mutation, and has
+no host wrapper. It returns private JSON with IDs, volume/file names, hashes,
+counts and available Docker-filesystem bytes/inodes. The caller should retain
+that JSON privately and print counts only. Success is explicitly marked
+`samplingIsNotFullTreeVerification: true`; no full-tree or full-migration claim
+is made. The operator owns actual post-cutover and post-Rebuild guest execution.
+
+Run the local tests with:
+
+```sh
+python3 -m unittest discover -s scripts/maintenance/incus-upgrade-20261017 -p test_verify_native_docker_guest.py -v
+```
+
+Fourteen cases use an owned temporary filesystem, stub Docker observations and
+small controlled subprocesses only. They cover early incarnation/root refusal,
+exact content/metadata and inventory subsets, every path-component symlink,
+traversal, FIFO/directory/size rejection, replacement during hashing, malformed
+source/current inventories, duplicate JSON, fixed-socket/minimal-environment
+arguments, bounded subprocess output/timeouts and child cleanup. These tests do
+not execute Docker, Incus or a production guest.
