@@ -237,3 +237,17 @@ test.describe('Worker export root filesystem format compatibility', () => {
     });
   });
 });
+
+
+test('portable hardware intent retains opaque IDs but rejects raw paths, duplicates and malformed IDs', async () => {
+  const id = '81a5d371-8682-440b-8359-472e24ebd66c';
+  for (const value of [[id], ['/dev/bus/usb/001/001'], [id, id], 'all', [null]]) {
+    const payload = JSON.parse(manifest(WORKER_EXPORT_VERSION, false).toString());
+    payload.worker.hardwareDeviceIds = value;
+    await withBundle([{ name: BUNDLE_FILES.manifest, body: Buffer.from(JSON.stringify(payload)) }], async (bundle, destination) => {
+      if (Array.isArray(value) && value.length === 1 && value[0] === id)
+        expect((await extractBundle(bundle, destination)).manifest.worker.hardwareDeviceIds).toEqual([id]);
+      else await expect(extractBundle(bundle, destination)).rejects.toThrow('hardwareDeviceIds');
+    });
+  }
+});

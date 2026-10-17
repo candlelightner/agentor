@@ -398,6 +398,27 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(records["/1.0/projects"][0]["config"]["restricted.devices.nic"], "managed")
         self.assertEqual(records["/1.0/projects"][0]["config"]["restricted.devices.pci"], "block")
 
+    def test_explicit_usb_enablement_preserves_other_restrictions_and_rejects_foreign_policy(self):
+        config = self.config(); config["usbEnabled"] = True
+        project = {"name": config["project"], "config": {SETUP.MARKER: INSTALLATION,
+            "features.images": "true", "features.storage.volumes": "true", "features.networks": "false",
+            "restricted": "true", "restricted.devices.nic": "managed", "restricted.devices.disk": "allow",
+            "restricted.devices.usb": "block", "restricted.networks.access": config["network"],
+            "restricted.devices.disk.paths": "/srv/approved"}}
+        pool = {"name": config["pool"], "driver": "dir", "status": "Created", "config": {SETUP.MARKER: INSTALLATION}}
+        network = {"name": config["network"], "managed": True, "type": "bridge", "config": {SETUP.MARKER: INSTALLATION,
+            "ipv4.nat": "true", "ipv6.address": "none", "ipv4.address": "10.25.0.1/24"}}
+        def resource(kind, name): return copy.deepcopy({"/1.0/projects": project, "/1.0/networks": network, "/1.0/storage-pools": pool}[kind])
+        def enable(*args):
+            self.assertEqual(args, ("project", "set", config["project"], "restricted.devices.usb=allow"))
+            project["config"]["restricted.devices.usb"] = "allow"
+        with patch.object(SETUP, "resource", side_effect=resource), patch.object(SETUP, "incus", side_effect=enable) as commands:
+            SETUP.resource_setup(config, ["/srv/approved"]); self.assertEqual(commands.call_count, 1)
+            SETUP.resource_setup(config, ["/srv/approved"]); self.assertEqual(commands.call_count, 1)
+            project["config"]["restricted.devices.usb"] = "block"; project["config"]["restricted.devices.gpu"] = "allow"
+            with self.assertRaisesRegex(ValueError, "restrictions differ"): SETUP.resource_setup(config, ["/srv/approved"])
+            self.assertEqual(commands.call_count, 1)
+
     def test_foreign_pool_never_gets_marked_adopted_or_recreated(self):
         record = {"name": "owned-pool", "driver": "dir", "config": {SETUP.MARKER: "foreign"}}
         with patch.object(SETUP, "native", return_value=[record]), patch.object(SETUP, "incus") as commands:

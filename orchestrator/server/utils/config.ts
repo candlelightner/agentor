@@ -40,6 +40,7 @@ export interface Config {
   betterAuthUrl: string;
   betterAuthTrustedOrigins: string[];
   betterAuthRpId: string;
+  incusUsbEnabled?: boolean;
   incusEnabled: boolean;
   incusEndpoint: string;
   incusProject: string;
@@ -167,6 +168,7 @@ export function loadConfig(): Config {
       ? process.env.BETTER_AUTH_TRUSTED_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
       : [],
     betterAuthRpId: process.env.BETTER_AUTH_RP_ID?.trim() || '',
+    incusUsbEnabled: process.env.INCUS_USB_ENABLED === 'true',
     incusEnabled: process.env.INCUS_ENABLED === 'true',
     incusEndpoint: process.env.INCUS_ENDPOINT || '',
     incusProject: process.env.INCUS_PROJECT || 'agentor',

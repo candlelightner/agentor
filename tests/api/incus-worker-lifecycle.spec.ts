@@ -156,6 +156,43 @@ test('revoked Incus access verifies captured shutdown even when cached worker st
   });
 });
 
+test('uncached hardware revocation fences active Incus compute durably without adopting or stopping unknown identity', async () => {
+  for (const status of ['active', 'archived'] as const) await fixture(async (manager, store, calls, info) => {
+    await store.upsert({ ...store.get(info.userId, info.id)!, status,
+      hardwareDeviceIds: [randomUUID()] });
+    (manager as any).containers.delete(info.id);
+    const result = await manager.reconcileHardwareDeviceAccess(info.userId);
+    expect(result.affectedWorkerIds).toEqual([info.id]);
+    expect(result.stoppedWorkerIds).toEqual([]); expect(calls).toEqual([]);
+    const current = store.get(info.userId, info.id)!;
+    expect(current.hardwareDeviceIds).toBeUndefined();
+    if (status === 'active') {
+      expect(current).toMatchObject({ hardwareDevicesRevoked: true, pendingRebuild: true, desiredRuntimeStatus: 'stopped' });
+      expect(result.failures).toEqual([{ workerId: info.id, message: expect.stringContaining('shutdown remains pending') }]);
+    } else {
+      expect(current.hardwareDevicesRevoked).not.toBe(true); expect(result.failures).toEqual([]);
+    }
+  });
+});
+
+test('revoked Incus hardware access verifies captured shutdown even when cached worker status is stopped', async () => {
+  for (const status of ['stopped', 'unknown', 'running'] as const) await fixture(async (manager, store, calls, info) => {
+    info.status = status;
+    const device = randomUUID();
+    info.hardwareDeviceIds = [device];
+    await store.upsert({ ...store.get(info.userId, info.id)!, hardwareDeviceIds: [device] });
+    (manager as any).incusRuntime.stop = async (owner: any, uuid: string) => {
+      expect(owner.id).toBe(info.id); expect(uuid).toBe('original-uuid');
+      expect(store.get(info.userId, info.id)).toMatchObject({ hardwareDevicesRevoked: true, desiredRuntimeStatus: 'stopped' });
+      calls.push('verified-native-stop');
+    };
+    const result = await manager.reconcileHardwareDeviceAccess(info.userId);
+    expect(calls).toEqual(['verified-native-stop']);
+    expect(result.stoppedWorkerIds).toEqual([info.id]); expect(result.failures).toEqual([]);
+    expect(info.status).toBe('stopped');
+  });
+});
+
 test('failed Incus deletion withdraws running intent before shutdown and never resurrects late-stopped compute', async () => {
   await fixture(async (manager, store, calls, info) => {
     const runtime = (manager as any).incusRuntime;

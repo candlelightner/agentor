@@ -1,3 +1,5 @@
+import { resolveIncusHardware, assertIncusHardwareLayout, assertIncusHardwareExclusive, type IncusHardwareOptions } from "./incus-hardware";
+import type { HardwareDeviceCandidate } from "../../shared/types";
 import type { Config } from "./config";
 import type { DockerService } from "./docker";
 import { IncusClient, type IncusInstance, type IncusDevice, type IncusCustomVolume } from "./incus-client";
@@ -157,6 +159,21 @@ export interface IncusRecreationPreflight {
 export class IncusWorkerRuntime {
   readonly client: IncusClient;
   private installation?: Promise<string>;
+  private hardwareDiscovery?: (opts: IncusHardwareOptions) => Promise<HardwareDeviceCandidate[]>;
+  setHardwareDiscovery(discover: (opts: IncusHardwareOptions) => Promise<HardwareDeviceCandidate[]>): void { this.hardwareDiscovery = discover; }
+
+  async preflightHardware(opts: IncusHardwareOptions, instance?: IncusInstance, operation: 'preflight' | 'attach' = 'preflight'): Promise<Record<string, IncusDevice>> {
+    if (!opts.hardwareDevices?.length) return {};
+    if (!this.hardwareDiscovery) throw new Error('Incus hardware discovery is unavailable');
+    const devices = await resolveIncusHardware(this.config, opts, () => this.hardwareDiscovery!(opts), operation, instance);
+    const project = await this.client.request<{ config: Record<string, string> }>('GET', `/1.0/projects/${encodeURIComponent(this.config.incusProject)}`);
+    if (project.config.restricted !== 'true' || project.config['restricted.devices.usb'] !== 'allow' ||
+        (project.config['restricted.virtual-machines.lowlevel'] ?? 'block') !== 'block' ||
+        ['gpu', 'pci', 'unix-char', 'unix-block', 'unix-hotplug'].some(kind => (project.config['restricted.devices.' + kind] ?? 'block') !== 'block'))
+      throw new Error('Incus hardware requires explicit USB-only restricted project policy');
+    assertIncusHardwareExclusive(opts.containerName, devices, await this.client.listInstances());
+    return devices;
+  }
   private imageResolver?: (opts: IncusWorkerOptions, stored?: IncusWorkerImageIdentity,
     restoreSource?: WorkerBackupRuntimeSource) => Promise<IncusWorkerImageIdentity>;
   constructor(private config: Config, client = IncusClient.fromConfig(config)) {
@@ -957,8 +974,6 @@ export class IncusWorkerRuntime {
     incusWorkerMemoryLimit(opts.memoryLimit);
     // Refuse pending storage features on restart too; never put persistent
     // Docker/account data on disposable rootfs when settings change.
-    if (opts.hardwareDevices?.length)
-      throw new Error("Incus hardware requires its feature integration");
     if (opts.mounts?.length && !opts.storageManager?.dataHostPath)
       throw new Error('Incus host mounts require authoritative platform storage');
     if (opts.credentialBinds?.length && !opts.storageManager)
@@ -1055,6 +1070,7 @@ export class IncusWorkerRuntime {
     await this.assertWorkspaceReplacementSettled(opts);
     await this.assertReady();
     this.validateOptions(opts);
+    await this.preflightHardware(opts);
     const storage = await this.storage();
     const source = await storage.imageIdentity(opts);
     if (!source) throw new Error('Incus worker image source is missing; preserve the original source before compute removal');
@@ -1302,6 +1318,7 @@ export class IncusWorkerRuntime {
       throw new Error('Incus reconstruction image source changed');
     if (restore?.source && !sameIncusImageSource(restore.source, identity))
       throw new Error('Incus restore immutable image source changed before allocation');
+    const hardware = restore ? {} : await this.preflightHardware(opts, undefined, 'attach');
     const account = restore ? {} : await this.accountDevices(opts, true);
     const restoreManaged = restore ? await this.managedRestoreDevices(opts, restore.detachedManagedVolumes) : undefined;
     const hostMounts = restore ? undefined : await incusHostMountLayout(this.config, opts, 'ensure');
@@ -1313,6 +1330,8 @@ export class IncusWorkerRuntime {
     if (restore) for (const volume of restore.detachedManagedVolumes ?? [])
       await new IncusManagedVolumeRuntime(this.config, this).freshRestoreVolume(volume, true);
     const memoryLimit = incusWorkerMemoryLimit(opts.memoryLimit);
+    if (!restore && !isDeepStrictEqual(hardware, await this.preflightHardware(opts, undefined, 'attach')))
+      throw new Error('Hardware authority changed during worker creation');
     const instance = await this.client.createInstance({
       name: opts.containerName, type: "virtual-machine", profiles: [],
       source: { type: "image", fingerprint },
@@ -1334,6 +1353,7 @@ export class IncusWorkerRuntime {
         ...account,
         ...(restoreManaged ?? await this.managedDevices(opts)),
         ...hostMounts?.devices,
+        ...hardware,
         root: { type: "disk", path: "/", pool: this.config.incusStoragePool },
         ...(restore ? {} : { eth0: { type: "nic", name: "eth0", network: this.config.incusNetwork,
           "security.mac_filtering": "true", "security.ipv4_filtering": "true", "security.ipv6_filtering": "true" } }),
@@ -1670,6 +1690,7 @@ export class IncusWorkerRuntime {
     if (stopped.status !== 'Stopped') throw new Error('Incus restore destination shutdown is unconfirmed');
     const persistent = await storage.devices(opts, opts.environmentJson.dockerEnabled, { docker: false });
     const account = await this.accountDevices(opts, true), managed = await this.managedDevices(opts);
+    const hardware = await this.preflightHardware(opts, stopped, 'attach');
     const host = await incusHostMountLayout(this.config, opts, 'ensure', undefined, stopped);
     for (const volume of opts.managedVolumes ?? []) {
       if (Object.values({ ...persistent, ...account, ...host.devices }).some(device =>
@@ -1678,7 +1699,7 @@ export class IncusWorkerRuntime {
     }
     const current = await check();
     const operationalDevices: Record<string, IncusDevice> = {
-      ...persistent, ...account, ...managed, ...host.devices,
+      ...persistent, ...account, ...managed, ...host.devices, ...hardware,
       root: { type: 'disk', path: '/', pool: this.config.incusStoragePool },
       eth0: { type: 'nic', name: 'eth0', network: this.config.incusNetwork,
         'security.mac_filtering': 'true', 'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' },
@@ -1715,6 +1736,7 @@ export class IncusWorkerRuntime {
       if (!isDeepStrictEqual(currentHost, host))
         throw new Error('Stopped Incus restore host authority changed; retain the initial import fence');
       assertIncusHostMountLayout(completed, currentHost);
+      assertIncusHardwareLayout(completed, await this.preflightHardware(opts, completed, 'attach'));
       await validateRecord();
       return;
     }
@@ -1763,6 +1785,8 @@ export class IncusWorkerRuntime {
       throw new Error('Incus restore destination is incomplete; normal worker startup is forbidden');
     if (instance.config['user.agentor.owner'] !== opts.userId)
       throw new Error('Incus worker account identity does not match');
+    const hardware = await this.preflightHardware(opts, instance, 'attach');
+    assertIncusHardwareLayout(instance, hardware);
     const state = await this.client.getInstanceState(name);
     const hostMounts = await incusHostMountLayout(this.config, opts, 'inspect', undefined, instance);
     assertIncusHostMountLayout(instance, hostMounts);
@@ -1788,6 +1812,10 @@ export class IncusWorkerRuntime {
         throw new Error("Incus Docker device identity is ambiguous");
       if (state.status === "Running") throw new Error("Restart the VM to attach native Docker storage");
       await this.client.updateInstanceDevices(name, { ...instance.devices, ...persistent }, undefined, instance);
+    }
+    if (opts.hardwareDevices?.length) {
+      const current = await this.assertOwned(name, opts.id, opts.userId, instance.config['volatile.uuid']);
+      assertIncusHardwareLayout(current, await this.preflightHardware(opts, current, 'attach'));
     }
     if (state.status !== "Running") await this.client.startInstance(name);
     const deadline = Date.now() + 120_000;

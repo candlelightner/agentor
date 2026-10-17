@@ -231,14 +231,17 @@ def resource_setup(config, paths):
     config["internalUrl"] = "http://" + str(interface.ip) + ":" + str(config["internalPort"])
     desired = {MARKER: installation, "features.images": "true", "features.storage.volumes": "true", "features.networks": "false",
                "restricted": "true", "restricted.devices.nic": "managed", "restricted.devices.disk": "allow",
-               **{"restricted.devices." + device: "block" for device in ("pci", "usb", "gpu", "infiniband", "proxy", "unix-char", "unix-block")}}
+               **{"restricted.devices." + device: "block" for device in ("pci", "usb", "gpu", "infiniband", "proxy", "unix-char", "unix-block", "unix-hotplug")}}
+    if config.get("usbEnabled") is True: desired["restricted.devices.usb"] = "allow"
     existing = resource("/1.0/projects", project)
     if existing is None:
         settings = {**desired, "restricted.networks.access": network, "restricted.devices.disk.paths": ",".join(paths)}
         incus("project", "create", project, *[argument for key, value in settings.items() for argument in ("-c", key + "=" + value)])
     existing = resource("/1.0/projects", project); owned(existing, installation, project)
+    # Widen only after all existing installation/export policy is verified.
+    enable_usb = config.get("usbEnabled") is True and existing["config"].get("restricted.devices.usb", "block") == "block"
     require(all(existing["config"].get(key, "block" if key.startswith("restricted.devices.") and key not in ("restricted.devices.nic", "restricted.devices.disk") else None) == value
-                for key, value in desired.items()), "Owned project restrictions differ; preserve and resolve manually")
+                for key, value in desired.items() if not (enable_usb and key == "restricted.devices.usb")), "Owned project restrictions differ; preserve and resolve manually")
     require(network in existing["config"].get("restricted.networks.access", "").split(","), "Owned project's primary allowlist differs")
     old = [SOURCES.canonical(path) for path in existing["config"].get("restricted.devices.disk.paths", "").split(",") if path]
     roots = json.loads(existing["config"].get("user.agentor.host-mount-roots", '{"installation":"' + installation + '","sources":[]}'))
@@ -246,6 +249,7 @@ def resource_setup(config, paths):
     require(set(old) <= set(paths) | set(roots["sources"]), "Unexpected project host exports; preserve and inspect their authority")
     updated = sorted(set(old) | set(paths))
     if updated != sorted(old): incus("project", "set", project, "restricted.devices.disk.paths=" + ",".join(updated))
+    if enable_usb: incus("project", "set", project, "restricted.devices.usb=allow")
     return interface
 
 
@@ -518,6 +522,7 @@ def portainer_environment(config, directory, interface, default_image):
 
 def main():
     parser = argparse.ArgumentParser(description="Operator-root Ubuntu24/amd64 Incus setup. Preserves canonical DATA/legacy workers; never migrates or resets unrelated resources.")
+    parser.add_argument("--enable-usb", action="store_true", help="Explicitly allow serial-numbered, non-storage USB VM grants; GPUs and PCI remain blocked")
     parser.add_argument("--install-lts", action="store_true", help="Explicitly offer fingerprint-pinned signed Zabbly Incus 6.0 LTS packages")
     parser.add_argument("--routing", action="store_true", help="Installed systemd use only: refresh this installation's exact routing")
     parser.add_argument("--config", help="Installed root-owned /etc/agentor/incus/<installationUUID>/config.json")
@@ -554,7 +559,7 @@ def main():
     prior = json.loads((directory / "config.json").read_text()) if (directory / "config.json").exists() else {}
     work = SOURCES.canonical(args.image_work_dir or prior.get("imageWorkDir") or str(directory / "image-work"))
     require(not SOURCES.overlaps(work, data), "Image conversion scratch must not modify canonical DATA or its ancestors")
-    config = {"installation": installation, "dataDir": data, "project": args.project, "network": network, "pool": pool, "container": args.orchestrator_container,
+    config = {"usbEnabled": args.enable_usb, "installation": installation, "dataDir": data, "project": args.project, "network": network, "pool": pool, "container": args.orchestrator_container,
               "dockerNetwork": docker_network, "tlsName": args.tls_name, "httpsPort": args.https_port, "policyPort": args.policy_port, "internalPort": args.internal_port,
               "listen": gateway, "sourceTable": "agentor_source_" + short, "imageWorkDir": work}
     if (directory / "config.json").exists():
@@ -574,6 +579,7 @@ def main():
     default_image = bootstrap_default_image(config, directory, args.trusted_worker_image)
     print("Owned host setup installed; NOT a completed readiness/acceptance claim. Update Portainer, then run check-incus-host.sh and the real canary.")
     for key, value in portainer_environment(config, directory, interface, default_image).items(): print(key + "=" + value)
+    print("INCUS_USB_ENABLED=" + str(config.get("usbEnabled") is True).lower())
     print("Set AGENTOR_INCUS_ORCHESTRATOR_IMAGE separately to the operator-approved updated control-plane image.")
     print("Read-only TLS file mounts (do NOT mount the whole credential directory or any Incus Unix socket):")
     for file, variable in (("client.crt", "INCUS_CLIENT_CERT_PATH"), ("client.key", "INCUS_CLIENT_KEY_PATH"), ("server.crt", "INCUS_SERVER_CERT_PATH"), ("policy.crt", "INCUS_NETWORK_HOST_SERVER_CERT_PATH")):

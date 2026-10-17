@@ -1,7 +1,7 @@
 defineRouteMeta({ openAPI: { tags: ["Hardware devices"], summary: "List discovered and approved hardware devices", operationId: "listHardwareDevices" } });
 import { requireAuth } from "../../utils/auth-helpers";
 import { getUserById } from "../../utils/auth";
-import { useHardwareDeviceStore, useWorkerGroupStore, useWorkerStore } from "../../utils/services";
+import { useConfig, useHardwareDeviceStore, useWorkerGroupStore, useWorkerStore } from "../../utils/services";
 
 export default defineEventHandler(async (event) => {
   const { user } = requireAuth(event);
@@ -27,7 +27,14 @@ export default defineEventHandler(async (event) => {
   return {
     ownerId,
     canManageCatalog: user.role === "admin",
-    catalog: baseCatalog.map((item) => ({ ...item, entitled: entitled.has(item.id), available: liveSelectors.has(item.selector) })),
+    incusUsbEnabled: useConfig().incusUsbEnabled === true,
+    catalog: baseCatalog.map((item) => {
+      const occupants = useWorkerStore().list().filter(worker => worker.status !== 'archived' && worker.hardwareDeviceIds?.includes(item.id));
+      return { ...item, entitled: entitled.has(item.id), available: liveSelectors.has(item.selector),
+        incus: discovered.find(candidate => candidate.selector === item.selector)?.incus,
+        reserved: occupants.length > 0,
+        reservedWorkerIds: occupants.filter(worker => user.role === 'admin' || worker.userId === ownerId).map(worker => worker.id) };
+    }),
     discovered: user.role === "admin" ? discovered.filter((item) => !approvedSelectors.has(item.selector)) : [],
     grants: store.listGrants(ownerId),
     effectiveDeviceIds: effective.map((item) => item.id),

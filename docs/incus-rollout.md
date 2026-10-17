@@ -151,3 +151,8 @@ image before removing compute, and rechecks both before allocation and metadata
 publication. Archive/unarchive, storage-only recreation and recovery retain the
 captured recipe. This lets a deliberate Rebuild apply a kernel/bootstrap fix
 without silently changing the worker software or canonical volumes.
+
+
+## Optional USB grants
+
+USB VM grants have a guarded, opt-in implementation; real-device acceptance is still pending. Keep `INCUS_USB_ENABLED=false` during ordinary rollout. See [hardware device permissions](hardware-devices.md#incus-vm-hardware-opt-in-physical-acceptance-pending) for the operator setup flag, exact serial matching, exclusive reservations and storage/controller rejection. Do not enable passthrough against disks containing Agentor data, backups or VM pools. GPU assignment, including shared Intel iGPU acceleration, remains unsupported; migration preserves these grants and rejects the unsupported worker before stopping it. Issue #12 remains open until physical USB and supported-GPU acceptance can be demonstrated safely.

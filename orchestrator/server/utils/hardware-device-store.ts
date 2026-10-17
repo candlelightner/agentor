@@ -304,13 +304,17 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
     const authorized = this.authorizeDeviceIds(userId, workerId, deviceIds, directGroupId);
     if (!authorized?.length) return undefined;
     const candidates = await this.listDiscoveredDevices();
+    this.authorizeDeviceIds(userId, workerId, authorized, directGroupId);
     return authorized.map((deviceId) => {
       const device = this.getDevice(deviceId)!;
-      const candidate = candidates.find((item) => item.selector === device.selector);
+      const matches = candidates.filter((item) => item.selector === device.selector);
+      if (matches.length > 1) throw statusError(409, `Hardware device "${device.name}" has an ambiguous identity`);
+      const candidate = matches[0];
       if (!candidate)
         throw statusError(409, `Hardware device \"${device.name}\" is unavailable. Reconnect it, then rebuild the worker.`);
       return {
         deviceId,
+        candidate: structuredClone(candidate),
         deviceNodes: [...candidate.deviceNodes],
         groupIds: [...candidate.groupIds],
       };

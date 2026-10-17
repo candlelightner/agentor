@@ -103,7 +103,7 @@ def bridge_netfilter():
         require(Path("/proc/sys/net/bridge/bridge-nf-call-" + protocol).read_text().strip() == "1", "Required bridge netfilter sysctl is disabled")
 
 
-def project_policy(project, name, network, account_paths=()):
+def project_policy(project, name, network, account_paths=(), usb_enabled=False):
     require(project.get("name") == name and name != "default", "Dedicated nondefault project required")
     config = project.get("config", {})
     for field, expected in {"restricted": "true", "features.images": "true", "features.storage.volumes": "true",
@@ -111,8 +111,9 @@ def project_policy(project, name, network, account_paths=()):
         require(config.get(field) == expected, "Project setting requires setup: " + field)
     require(network in config.get("restricted.networks.access", "").split(","), "Primary network is not allowlisted")
     for field in ("restricted.devices.pci", "restricted.devices.usb", "restricted.devices.gpu", "restricted.devices.infiniband",
-                  "restricted.devices.proxy", "restricted.devices.unix-char", "restricted.devices.unix-block"):
-        require(config.get(field, "block") == "block", "Unneeded host device authority must remain blocked: " + field)
+                  "restricted.devices.proxy", "restricted.devices.unix-char", "restricted.devices.unix-block", "restricted.devices.unix-hotplug"):
+        expected = "allow" if field == "restricted.devices.usb" and usb_enabled else "block"
+        require(config.get(field, "block") == expected, "Host device authority differs from explicit policy: " + field)
     paths = config.get("restricted.devices.disk.paths", "").split(",")
     require(all(SOURCES.canonical(path) == path for path in paths),
             "Exact approved account/host-share paths must be configured; generic host access is forbidden")
@@ -216,6 +217,7 @@ def forwarding_policy(network, bridge, docker_subnet, primary, address, installa
 
 def main():
     parser = argparse.ArgumentParser(description="Read-only Agentor Incus host checks; never installs, repairs or allocates resources.")
+    parser.add_argument("--enable-usb", action="store_true", default=os.environ.get("INCUS_USB_ENABLED") == "true", help="Expect explicit USB-only restricted project access")
     inputs = {"endpoint": "INCUS_ENDPOINT", "project": "INCUS_PROJECT", "network": "INCUS_NETWORK", "storage-pool": "INCUS_STORAGE_POOL",
               "client-cert-path": "INCUS_CLIENT_CERT_PATH", "client-key-path": "INCUS_CLIENT_KEY_PATH", "server-cert-path": "INCUS_SERVER_CERT_PATH",
               "network-host-endpoint": "INCUS_NETWORK_HOST_ENDPOINT", "network-host-server-cert-path": "INCUS_NETWORK_HOST_SERVER_CERT_PATH",
@@ -260,7 +262,7 @@ def main():
     if "operator configuration/credential files" in failures:
         return 1
     query = "?project=" + quote(args.project)
-    check("restricted project", lambda: project_policy(native("/1.0/projects/" + quote(args.project)), args.project, args.network, account_paths(args.orchestrator_container)), "Configure project features, managed NICs, exact disk/network allowlists and blocked unnecessary host devices.")
+    check("restricted project", lambda: project_policy(native("/1.0/projects/" + quote(args.project)), args.project, args.network, account_paths(args.orchestrator_container), args.enable_usb), "Configure project features, managed NICs, exact disk/network allowlists and blocked unnecessary host devices.")
     def client_auth():
         fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(Path(args.client_cert_path).read_text())).hexdigest()
         restricted_certificate(native("/1.0/certificates/" + fingerprint), args.project)

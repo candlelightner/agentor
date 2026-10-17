@@ -66,6 +66,16 @@ class CheckerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 CHECKER.project_policy(project, "agentor-private", "workers")
 
+    def test_usb_opt_in_is_exact_and_never_allows_gpu_or_pci(self):
+        project = self.project()
+        with self.assertRaises(ValueError): CHECKER.project_policy(project, "agentor-private", "workers", usb_enabled=True)
+        project["config"]["restricted.devices.usb"] = "allow"
+        CHECKER.project_policy(project, "agentor-private", "workers", usb_enabled=True)
+        with self.assertRaises(ValueError): CHECKER.project_policy(project, "agentor-private", "workers")
+        for kind in ("gpu", "pci", "unix-char", "unix-block"):
+            changed = copy.deepcopy(project); changed["config"]["restricted.devices." + kind] = "allow"
+            with self.assertRaises(ValueError): CHECKER.project_policy(changed, "agentor-private", "workers", usb_enabled=True)
+
     def test_certificate_is_restricted_to_exact_single_project(self):
         CHECKER.restricted_certificate({"type": "client", "restricted": True, "projects": ["agentor-private"]}, "agentor-private")
         for record in ({"type": "client", "restricted": False, "projects": ["agentor-private"]},

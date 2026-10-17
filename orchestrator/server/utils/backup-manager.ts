@@ -2807,6 +2807,7 @@ export class BackupManager {
           displayName: worker.displayName,
           repos: worker.repos ?? [],
           mounts: worker.mounts ?? [],
+          hardwareDeviceIds: worker.hardwareDeviceIds?.length ? [...worker.hardwareDeviceIds] : undefined,
           initScript: worker.initScript ?? "",
           workerSelfApiAccess: worker.workerSelfApiAccess ?? "inherit",
         },

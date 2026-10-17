@@ -632,6 +632,7 @@ export class ContainerManager {
 
   private configureIncusImages(runtime: IncusWorkerRuntime, restoreAuthority?: () => Promise<void>,
     migrationAuthority?: () => Promise<void>): void {
+    runtime.setHardwareDiscovery?.(opts => this.dockerService.discoverIncusHardwareDevices(opts.id));
     if (!this.config.incusConverterSeedFingerprint) return;
     runtime.setImageResolver(async (opts, stored, restoreSource) => {
       const selection = opts.imageSelection;
@@ -712,8 +713,14 @@ export class ContainerManager {
       const sourceRecord = this.workerStore!.get(snapshot.userId, id), sourceInfo = this.containers.get(id);
       if (!sourceRecord || !sourceInfo || sourceInfo.administrativeKind || sourceRecord.runtimeKind !== 'legacy-docker' ||
           sourceRecord.status !== 'active' || sourceRecord.deletionPending || sourceRecord.incusMigration || sourceRecord.incusRecreation ||
-          sourceRecord.hostMountsRevoked || sourceRecord.hardwareDevicesRevoked || sourceRecord.hardwareDeviceIds?.length || !this.storageManager)
+          sourceRecord.hostMountsRevoked || sourceRecord.hardwareDevicesRevoked || !this.storageManager)
         throw Object.assign(new Error('Migration requires a settled ordinary legacy worker and its configured OCI source'), { statusCode: 409 });
+      // Capability/ownership admission precedes any topology, shutdown or migration mutation.
+      // Unsupported devices preserve the legacy worker and its desired grants.
+      if (sourceRecord.hardwareDeviceIds?.length) await this.incusRuntime.preflightHardware({
+        id, userId: sourceRecord.userId, containerName: sourceInfo.containerName,
+        hardwareDevices: sourceRecord.hardwareDeviceIds.map(deviceId => ({ deviceId, deviceNodes: [], groupIds: [] })),
+      });
       // Adapt a legacy-only network before taking this worker's non-reentrant
       // queue. The accepted mixed-bridge dispatcher keeps peer aliases and
       // requires coverage/unlocks of every desired and actual affected peer.
@@ -732,9 +739,13 @@ export class ContainerManager {
       const record = this.workerStore!.get(snapshot.userId, id), original = this.containers.get(id);
       if (!record || !original || original.administrativeKind || record.runtimeKind !== 'legacy-docker' ||
           record.status !== 'active' || record.deletionPending || record.incusMigration || record.incusRecreation ||
-          record.hostMountsRevoked || record.hardwareDevicesRevoked || record.hardwareDeviceIds?.length ||
+          record.hostMountsRevoked || record.hardwareDevicesRevoked ||
           !this.storageManager)
         throw Object.assign(new Error('Migration requires a settled ordinary legacy worker and its configured OCI source'), { statusCode: 409 });
+      if (record.hardwareDeviceIds?.length) await this.incusRuntime.preflightHardware({
+        id, userId: record.userId, containerName: original.containerName,
+        hardwareDevices: record.hardwareDeviceIds.map(deviceId => ({ deviceId, deviceNodes: [], groupIds: [] })),
+      });
       const { useManagedVolumeManager } = await import('./managed-volume-manager');
       const volumes = useManagedVolumeManager(); await volumes.init();
       volumes.assertLiveRecoveryResolved(record.userId, id);
@@ -1441,6 +1452,7 @@ export class ContainerManager {
       configurationRevision: desired?.revision,
       sshAuthorizedKeys: await this.storageManager?.readSshAuthorizedKeys(info.userId),
       managedVolumes,
+      hardwareDevices: info.hardwareDeviceIds?.map(deviceId => ({ deviceId, deviceNodes: [], groupIds: [] })),
     };
   }
 
@@ -3512,8 +3524,8 @@ for p in sys.argv[1:]:
       );
     if (info.hardwareDevicesRevoked)
       throw Object.assign(
-        new Error("Hardware device access was revoked. Rebuild this worker before starting it again so Docker removes the old device mapping."),
-        { statusCode: 409, statusMessage: "Hardware device access was revoked. Rebuild this worker before starting it again so Docker removes the old device mapping." },
+        new Error("Hardware device access was revoked. Rebuild this worker before starting it again so the runtime removes the old device mapping."),
+        { statusCode: 409, statusMessage: "Hardware device access was revoked. Rebuild this worker before starting it again so the runtime removes the old device mapping." },
       );
     await this.persistDesiredRuntimeStatus(info, "running");
     const { groupSecrets } = await this.resolveUserEnvAndBinds(
@@ -3833,16 +3845,24 @@ for p in sys.argv[1:]:
         result.affectedWorkerIds.push(record.id);
         const live = this.containers.get(record.id);
         if (!live) {
-          await this.workerStore!.updateHardwareDeviceAccess(record.userId, record.id, next, false);
+          await this.workerStore!.updateHardwareDeviceAccess(record.userId, record.id, next, revoked);
+          if (revoked && record.status === 'active') {
+            await this.workerStore!.setDesiredRuntimeStatus(record.userId, record.id, 'stopped');
+            result.failures.push({ workerId: record.id,
+              message: 'Worker runtime is unavailable; revoked hardware access is fenced and shutdown remains pending.' });
+          }
           return;
         }
         live.hardwareDeviceIds = next;
         if (revoked) { live.pendingRebuild = true; live.hardwareDevicesRevoked = true; }
         live.updatedAt = new Date().toISOString();
         await this.workerStore!.updateHardwareDeviceAccess(record.userId, record.id, next, revoked);
-        if (!revoked || live.status !== "running") return;
+        if (!revoked) return;
+        const native = live.runtimeKind === 'incus-vm' && record.status === 'active';
+        if (!native && live.status !== 'running') return;
+        if (native) await this.workerStore!.setDesiredRuntimeStatus(record.userId, record.id, 'stopped');
         try {
-          await this.stopUnlocked(live.id);
+          await this.stopUnlocked(live.id, native);
           result.stoppedWorkerIds.push(live.id);
         } catch (error) {
           result.failures.push({ workerId: live.id, message: error instanceof Error ? error.message : "Worker could not be stopped" });
@@ -4912,8 +4932,8 @@ for p in sys.argv[1:]:
     const info: ContainerInfo = structuredClone(snapshot);
     info.mounts = await this.resolveAuthorizedHostMounts(info.userId, info.id, info.mounts);
     info.hardwareDeviceIds = await this.resolveHardwareDeviceAccess(info.userId, info.id, info.hardwareDeviceIds);
-    if (info.importedImage || info.hardwareDeviceIds?.length)
-      throw new Error('Incus captured OCI images and hardware require their feature integration');
+    if (info.importedImage)
+      throw new Error('Incus captured OCI images require their feature integration');
     await this.assertIncusPersistenceReady(info, !!original);
     const options = await this.incusOptionsForWorker(info, applied);
     const originalIncarnation = original?.containerId.startsWith('incus:') ? original.containerId.slice(6) : undefined;
@@ -5504,6 +5524,7 @@ for p in sys.argv[1:]:
           displayName: info.displayName,
           repos: info.repos ?? [],
           mounts: info.mounts ?? [],
+          hardwareDeviceIds: info.hardwareDeviceIds?.length ? [...info.hardwareDeviceIds] : undefined,
           initScript: info.initScript ?? "",
           workerSelfApiAccess: info.workerSelfApiAccess ?? "inherit",
         },
@@ -5845,6 +5866,7 @@ for p in sys.argv[1:]:
           resolvedImage.imageRuntimeReference,
         );
 
+      const hardwareDeviceIds = await this.resolveHardwareDeviceAccess(userId, id, manifest.worker.hardwareDeviceIds);
       const environment = await this.resolveImportEnvironment(
         userId,
         manifest.environment,
@@ -5897,7 +5919,7 @@ for p in sys.argv[1:]:
           containerId: containerName, containerName, displayName,
           imageName: resolvedImage.imageRuntimeReference || this.config.incusWorkerImage,
           imageId: '', status: 'creating', desiredRuntimeStatus: 'stopped', environmentId,
-          repos: repos.length ? repos : undefined, mounts: mounts.length ? mounts : undefined,
+          repos: repos.length ? repos : undefined, mounts: mounts.length ? mounts : undefined, hardwareDeviceIds,
           initScript: initScript || undefined, workerSelfApiAccess, pendingRebuild: false, ...resolvedImage,
         }, canonicalPayloads, manifest, pluginConfiguration, opts.imageResolution, assertRuntimePrincipal, nativeManagedPayloads, additionalPaths);
       }
@@ -6021,6 +6043,7 @@ for p in sys.argv[1:]:
         desiredRuntimeStatus: "running",
         repos: repos.length > 0 ? repos : undefined,
         mounts: mounts.length > 0 ? mounts : undefined,
+        hardwareDeviceIds,
         initScript: initScript || undefined,
         workerSelfApiAccess,
         environmentId,
@@ -6078,6 +6101,7 @@ for p in sys.argv[1:]:
           cpuLimit,
           memoryLimit,
           mounts,
+          hardwareDevices: await this.resolveHardwareDeviceAccess(userId, id, hardwareDeviceIds, undefined, true),
           dockerEnabled,
           credentialBinds,
           environmentJson: envConfig.environmentJson,

@@ -26,7 +26,7 @@ test('hardware catalog approves only discovered stable selectors and resolves li
     const device = await store.approveDevice({ selector: candidate.selector });
     await store.setEntitlement(owner, device.id, true);
     await store.createOwnerGrant(owner, { deviceId: device.id, targetType: 'worker', targetId: 'root-worker' });
-    await expect(store.resolveAuthorizedDevices(owner, 'root-worker', [device.id], 'root')).resolves.toEqual([{ deviceId: device.id, deviceNodes: candidate.deviceNodes, groupIds: candidate.groupIds }]);
+    await expect(store.resolveAuthorizedDevices(owner, 'root-worker', [device.id], 'root')).resolves.toEqual([{ deviceId: device.id, candidate, deviceNodes: candidate.deviceNodes, groupIds: candidate.groupIds }]);
     expect(() => store.authorizeDeviceIds(owner, 'child-worker', [device.id], 'child')).toThrow(/not assigned/);
     disconnect();
     await expect(store.resolveAuthorizedDevices(owner, 'root-worker', [device.id], 'root')).rejects.toThrow(/unavailable/);
