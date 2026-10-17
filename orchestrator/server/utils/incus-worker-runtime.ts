@@ -1,3 +1,4 @@
+import { MANAGED_KILO_PARENT, MANAGED_KILO_PARENT_CHECK } from './managed-volume-kilo-parent';
 import type { Config } from "./config";
 import type { DockerService } from "./docker";
 import { IncusClient, type IncusInstance, type IncusDevice, type IncusCustomVolume } from "./incus-client";
@@ -1063,6 +1064,8 @@ export class IncusWorkerRuntime {
     const refreshed = refreshBootstrap ? incusImageIdentity(await this.client.getImage(fingerprint)) : undefined;
     if (refreshed && !sameIncusImageBase(source, refreshed))
       throw new Error('Explicit rebuild must retain the worker immutable OCI base');
+    for (const volume of opts.managedVolumes ?? [])
+      await new IncusManagedVolumeRuntime(this.config, this).verifyKiloParent(volume);
     await this.accountDevices(opts);
     await incusHostMountLayout(this.config, opts, 'reconstruct-preflight');
     return { fingerprint, ...await storage.verifyExisting(opts, dockerRequired),
@@ -1302,6 +1305,8 @@ export class IncusWorkerRuntime {
       throw new Error('Incus reconstruction image source changed');
     if (restore?.source && !sameIncusImageSource(restore.source, identity))
       throw new Error('Incus restore immutable image source changed before allocation');
+    if (!restore) for (const volume of opts.managedVolumes ?? [])
+      await new IncusManagedVolumeRuntime(this.config, this).verifyKiloParent(volume);
     const account = restore ? {} : await this.accountDevices(opts, true);
     const restoreManaged = restore ? await this.managedRestoreDevices(opts, restore.detachedManagedVolumes) : undefined;
     const hostMounts = restore ? undefined : await incusHostMountLayout(this.config, opts, 'ensure');
@@ -1651,6 +1656,9 @@ export class IncusWorkerRuntime {
     if ((opts.managedVolumes?.length ?? 0) && isolated.status !== 'Running')
       throw new Error('Managed restore target validation requires the isolated running destination');
     for (const volume of opts.managedVolumes ?? []) {
+      if (volume.target === MANAGED_KILO_PARENT)
+        await this.checkedExec(opts.containerName, ['timeout', '15', '/usr/bin/python3', '-c', MANAGED_KILO_PARENT_CHECK,
+          `/restore/managed/${volume.id}/volume`]);
       await managedRuntime.validateTarget(opts.userId, opts.id, `incus:${incarnation}`, volume.target);
       await check();
     }
@@ -1801,6 +1809,8 @@ export class IncusWorkerRuntime {
     }
     if (!ready) throw new Error("Incus worker agent did not become ready");
     try {
+      for (const volume of opts.managedVolumes ?? []) if (volume.target === MANAGED_KILO_PARENT)
+        await this.checkedExec(name, ['timeout', '15', '/usr/bin/python3', '-c', MANAGED_KILO_PARENT_CHECK, volume.target]);
       await this.checkedExec(name, ["bash", "-ec", 'test "$(cat /usr/lib/agentor/bootstrap-generation)" = 3; mountpoint -q /workspace; mountpoint -q /home/agent/.agent-data']);
       // Bootstrap-generation3 images predating Host Mount integration used
       // -xdev alone, which still chowns nested mount roots. Refuse that image

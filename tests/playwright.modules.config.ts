@@ -68,6 +68,7 @@ export default defineConfig({
     "api/backup-cross-instance-manager.spec.ts",
     "api/backup-restore-runtime-authority.spec.ts",
     "api/managed-volume-store.spec.ts",
+    "api/managed-kilo-parent.spec.ts",
     "api/managed-network-update.spec.ts",
     "api/managed-network-authorization.spec.ts",
     "api/managed-network-manager.spec.ts",

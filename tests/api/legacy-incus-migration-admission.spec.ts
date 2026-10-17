@@ -204,7 +204,7 @@ test(`legacy backup ${failure} rejects before source inspection, stopping, captu
   const original = { init: volumes.init, assert: volumes.assertLiveRecoveryResolved,
     blocked: volumes.isRecoveryBlocked, records: volumes.store.forWorker };
   try {
-    const target = failure === 'protected-parent' ? '/home/agent/.local/share' : '/opt/data';
+    const target = failure === 'protected-parent' ? '/home/agent/.local' : '/opt/data';
     const source: StoredManagedVolume = { id: randomUUID(), userId: f.record.userId, workerId: f.record.id,
       target, name: 'legacy', dockerName: persistentPathVolumeName(f.record.id, target), purpose: 'legacy-backup-path',
       attached: true, seeded: true, state: 'ready', createdAt: f.record.createdAt, updatedAt: f.record.updatedAt };

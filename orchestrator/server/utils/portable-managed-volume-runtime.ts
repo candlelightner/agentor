@@ -1,3 +1,5 @@
+import * as tar from 'tar-stream';
+import { MANAGED_KILO_PARENT, MANAGED_KILO_LINK } from './managed-volume-kilo-parent';
 import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -587,6 +589,52 @@ export class PortableManagedVolumeRuntime {
         }
       },
     };
+  }
+
+  /** Reuse the never-started import probe and its acknowledged cleanup path. */
+  async verifyKiloParent(v: StoredManagedVolume, validate: () => Promise<void>): Promise<void> {
+    if (v.target !== MANAGED_KILO_PARENT) return;
+    v = structuredClone(v);
+    await validate();
+    const helperOperationId = randomUUID(), helperName = `agentor-portable-volume-probe-${helperOperationId}`;
+    const releaseHelper = registerOperationHelper(helperOperationId);
+    let probe: Docker.Container | undefined;
+    try {
+      probe = await this.createHelperWithSettlement(helperName, helperOperationId, undefined, {
+        Image: await this.trustedImage(), name: helperName, Entrypoint: ['/bin/true'], Cmd: [], Env: [], NetworkDisabled: true,
+        Labels: this.helperLabels(helperOperationId, { operationId: helperOperationId,
+          userId: v.userId, workerId: v.workerId, volumeId: 'probe' }),
+        HostConfig: { NetworkMode: 'none', ReadonlyRootfs: true, CapDrop: ['ALL'],
+          SecurityOpt: ['no-new-privileges:true'], PidsLimit: 8, Memory: 64 * 1024 * 1024,
+          LogConfig: { Type: 'none', Config: {} }, Mounts: [{ Type: 'volume', Source: v.dockerName,
+            Target: '/volume', ReadOnly: true, VolumeOptions: { NoCopy: true } }] as any },
+      });
+      await validate();
+      // HEAD resolves aliases; only the bounded single-leaf TAR proves literal readlink bytes.
+      const archive = await withOperationDeadline(signal => probe!.getArchive({ path: '/volume/kilo', abortSignal: signal } as any),
+        DOCKER_TIMEOUT_MS, 'Read canonical Kilo link');
+      const extract = tar.extract(); let entries = 0, bytes = 0;
+      extract.on('entry', (header, stream, next) => {
+        stream.on('error', error => extract.destroy(error));
+        if (++entries !== 1 || header.name !== 'kilo' || header.type !== 'symlink' || header.linkname !== MANAGED_KILO_LINK) {
+          extract.destroy(new Error('Managed XDG parent requires the literal canonical Kilo symlink. Data was retained.')); return;
+        }
+        stream.resume(); stream.on('end', next);
+      });
+      try {
+        await withOperationDeadline(signal => pipeline(archive as Readable, new Transform({ transform(chunk, _encoding, done) {
+          bytes += chunk.length; done(bytes > 64 * 1024 ? new Error('Canonical Kilo link archive exceeds limit') : null, chunk);
+        } }), extract, { signal }), DOCKER_TIMEOUT_MS, 'Validate canonical Kilo link');
+        if (entries !== 1) throw new Error('Canonical Kilo link is missing. Data was retained.');
+      } finally { (archive as Readable).destroy(); }
+      await validate();
+    } finally {
+      try {
+        await this.removeOwnedHelper(probe?.id ?? helperName, helperOperationId);
+        this.cleanupDebt.delete(helperName);
+      } catch (error) { this.cleanupDebt.add(helperName); throw error; }
+      finally { releaseHelper(); }
+    }
   }
 
   private async validateImageTargetsWithProbe(

@@ -62,7 +62,7 @@ test(`legacy managed normalization rejects ${invalid} without changing source re
   if (invalid === 'unseeded') sources[0]!.seeded = false;
   if (invalid === 'duplicate-id') sources[1]!.id = sources[0]!.id;
   if (invalid === 'duplicate-source') { sources[1]!.target = sources[0]!.target; sources[1]!.dockerName = sources[0]!.dockerName; }
-  if (invalid === 'protected-parent') { sources[0]!.target = '/home/agent/.local/share'; sources[0]!.dockerName = persistentPathVolumeName(owner.id, sources[0]!.target); }
+  if (invalid === 'protected-parent') { sources[0]!.target = '/home/agent/.local'; sources[0]!.dockerName = persistentPathVolumeName(owner.id, sources[0]!.target); }
   const original = structuredClone(sources);
   expect(() => prepareLegacyManagedMigration(owner, sources)).toThrow();
   expect(sources).toEqual(original);

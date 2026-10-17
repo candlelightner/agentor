@@ -31,7 +31,7 @@ export function prepareLegacyManagedMigration(
   });
   // Includes protected path, overlap, duplicate-device and native naming checks.
   // Reject before inspecting/stopping/capturing source or creating scratch.
-  // In particular /home/agent/.local/share still overlaps protected Kilo state.
+  // The exact XDG parent additionally requires its canonical link in the archive.
   incusManagedRestoreDevices(owner, 'migration-preflight', result.filter(v => v.attached), result.filter(v => !v.attached));
   return result;
 }

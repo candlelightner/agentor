@@ -1,3 +1,4 @@
+import { MANAGED_KILO_PARENT } from './managed-volume-kilo-parent';
 import { randomUUID } from "node:crypto";
 import Docker from 'dockerode';
 import { isIP } from "node:net";
@@ -3515,6 +3516,11 @@ for p in sys.argv[1:]:
         new Error("Hardware device access was revoked. Rebuild this worker before starting it again so Docker removes the old device mapping."),
         { statusCode: 409, statusMessage: "Hardware device access was revoked. Rebuild this worker before starting it again so Docker removes the old device mapping." },
       );
+    if (!migrationRollback) {
+      const volumes = useManagedVolumeManager(); await volumes.init();
+      if (volumes.store.forWorker(info.userId, id).some(v => v.attached && v.target === MANAGED_KILO_PARENT))
+        await volumes.mounts(info.userId, id);
+    }
     await this.persistDesiredRuntimeStatus(info, "running");
     const { groupSecrets } = await this.resolveUserEnvAndBinds(
       info.userId,
@@ -6361,9 +6367,9 @@ for p in sys.argv[1:]:
         const volumes = (await import('./managed-volume-manager')).useManagedVolumeManager();
         await volumes.init(); managedStore = volumes.store;
         await validate();
-        for (const { entry } of managedPayloads) {
+        for (const { entry, archivePath } of managedPayloads) {
           await validate();
-          const record = await managedStore.create(userId, id, entry.target, entry.name, 'incus-vm');
+          const record = await managedStore.create(userId, id, entry.target, entry.name, 'incus-vm', archivePath);
           managedRecords.push(structuredClone(managedStore.get(userId, record.id)!));
           await validate();
         }

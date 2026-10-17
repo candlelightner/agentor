@@ -1,10 +1,12 @@
+import { MANAGED_KILO_PARENT, MANAGED_KILO_PARENT_CHECK } from './managed-volume-kilo-parent';
 import type { Config } from './config';
 import type { IncusInstance, IncusCustomVolume, IncusDevice } from './incus-client';
 import { IncusWorkerRuntime } from './incus-worker-runtime';
 import { backupInstallationId } from './backup-installation';
-import { managedVolumeRuntimeKind, pathsOverlap, validatePersistenceTarget, volumeError, assertIncusLiveResolved, type StoredManagedVolume } from './managed-volume-store';
+import { managedVolumeRuntimeKind, pathsOverlap, validateStoredPersistenceTarget, volumeError, assertIncusLiveResolved, type StoredManagedVolume } from './managed-volume-store';
 import type { IncusStorageOwner } from './incus-worker-storage';
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { IncusOfflineArchiveHelper } from './incus-offline-archive-helper';
@@ -19,7 +21,7 @@ export function incusManagedVolumeDeviceKey(v: StoredManagedVolume): string {
       !/^[a-f0-9-]{36}$/.test(v.id) || v.dockerName !== `agentor-persist-${v.id}` ||
       v.liveContainerId || v.previousRestartPolicy)
     throw volumeError(409, 'Managed storage backend or recovery identity is ambiguous. Data was retained.');
-  validatePersistenceTarget(v.target);
+  validateStoredPersistenceTarget(v.target);
   if (pathsOverlap(v.target, '/workspace'))
     throw volumeError(409, 'Workspace already has canonical persistence; overlapping managed storage is not allowed.');
   return `m${v.id.replaceAll('-', '').slice(0, 6)}`;
@@ -93,6 +95,40 @@ export class IncusManagedVolumeRuntime {
         throw volumeError(409, 'Incus managed volume is referenced by another runtime. Data was retained.');
     }
     return found;
+  }
+
+  /** Read only the special leaf through the existing fixed, isolated helper. */
+  async verifyKiloParent(v: StoredManagedVolume) {
+    if (v.target !== MANAGED_KILO_PARENT) return;
+    v = structuredClone(v);
+    const before = await this.inspectVolume(v);
+    if (!before || before.project !== this.config.incusProject || !v.seeded || !before.created_at || !Number.isFinite(Date.parse(before.created_at)))
+      throw volumeError(409, 'Managed XDG parent storage authority is unavailable. Data was retained.');
+    const references = (values: string[]) => values.map(ref => {
+      const url = new URL(ref, this.worker.client.endpoint);
+      if (url.origin !== new URL(this.worker.client.endpoint).origin || url.username || url.password || url.hash ||
+          url.searchParams.getAll('project').length !== 1 || url.searchParams.get('project') !== this.config.incusProject ||
+          [...url.searchParams.keys()].some(key => key !== 'project')) throw volumeError(409, 'Managed XDG parent reference is foreign.');
+      return url.pathname;
+    }).sort();
+    const baseline = references(before.used_by);
+    const assertSource = async (helper?: string) => {
+      const current = await this.worker.client.getCustomVolume(this.config.incusStoragePool, v.dockerName);
+      if (current.name !== before.name || current.project !== before.project || current.type !== before.type ||
+          current.content_type !== before.content_type || current.created_at !== before.created_at ||
+          !isDeepStrictEqual(current.config, before.config) || !Array.isArray(current.used_by) ||
+          !isDeepStrictEqual(references(current.used_by), [...baseline, ...(helper ? [`/1.0/instances/${helper}`] : [])].sort()))
+        throw volumeError(409, 'Managed XDG parent source changed. Data was retained.');
+    };
+    await assertSource();
+    await new IncusOfflineArchiveHelper(this.config, this.worker.client, await this.installationId())
+      .withGuest(this.owner(v), { managed: v.dockerName }, assertSource, undefined, async (name, assertHelper) => {
+        await assertHelper(); await assertSource(name);
+        const result = await this.worker.client.exec(name, ['timeout', '15', '/usr/bin/python3', '-c', MANAGED_KILO_PARENT_CHECK, '/volume']);
+        if (result.returnCode !== 0) throw volumeError(409, 'Managed XDG parent requires the exact canonical Kilo symlink. Data was retained.');
+        await assertHelper(); await assertSource(name);
+      });
+    await assertSource();
   }
 
   async ensureVolume(v: StoredManagedVolume) {
@@ -221,7 +257,13 @@ export class IncusManagedVolumeRuntime {
           done(bytes > options.maxBytes ? new Error('Managed archive exceeds aggregate byte limit') : null, chunk);
         } }), createWriteStream(options.archivePath, { flags: 'wx', mode: 0o600 }), { signal: options.signal });
       });
-    await assertSource(); return bytes;
+    await assertSource();
+    if (v.target === MANAGED_KILO_PARENT) {
+      const { validatePortableManagedVolumeArchive } = await import('./portable-managed-volume-archive');
+      await validatePortableManagedVolumeArchive(options.archivePath, { target: v.target, requirePosixUstar: true, signal: options.signal });
+      await assertSource();
+    }
+    return bytes;
   }
 
   private async exec(userId: string, workerId: string, handle: string, command: string[]) {
@@ -251,7 +293,7 @@ export class IncusManagedVolumeRuntime {
   }
 
   async validateTarget(userId: string, workerId: string, handle: string, target: string, allow?: StoredManagedVolume) {
-    validatePersistenceTarget(target);
+    validateStoredPersistenceTarget(target);
     const instance = await this.inspect(userId, workerId, handle);
     for (const [key, device] of Object.entries(instance.expanded_devices ?? instance.devices)) {
       if (device.type !== 'disk' || !device.path || device.path === '/') continue;
@@ -352,8 +394,12 @@ export class IncusManagedVolumeRuntime {
     if (initial.seeded && this.matchesDevice(instance.devices[key], initial)) {
       await this.ensureVolume(initial);
       await this.exec(initial.userId, initial.workerId, handle, ['mountpoint', '-q', '--', initial.target]);
+      if (initial.target === MANAGED_KILO_PARENT)
+        await this.exec(initial.userId, initial.workerId, handle, ['timeout', '15', 'python3', '-c', MANAGED_KILO_PARENT_CHECK, initial.target]);
       return;
     }
+    if (initial.target === MANAGED_KILO_PARENT)
+      throw volumeError(409, 'Apply the retained XDG parent through recreation, with its canonical Kilo link verified.');
     if (instance.devices[key]) throw volumeError(409, 'Live persistence device conflicts with retained compute.');
     // Provisional selection copies are not canonical. Never reuse their stale
     // bytes when live adoption follows continued rootfs writes/deletions.

@@ -1345,3 +1345,6 @@ The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/ap
 
 ### 29.5 Worker export/import exclusion
 - Worker export **strips** `.kilo/config`, `.kilo/shared-data`, and the legacy `.kilo/data/auth.json` from `agents.tar.gz` — an export never carries another user's tokens, provider keys, Kilo sessions/history, or account-level Kilo configuration. Per-worker Kilo state/cache and code-server user-data are retained.
+
+
+Historical XDG managed-volume preservation: explicit legacy migration and validated portable reconstruction retain the complete `/home/agent/.local/share` volume only with the exact canonical `kilo` symlink to `.agent-data/.kilo/shared-data`. Ordinary protected-path creation stays refused. Native pre-attachment/restore/start and Docker restart/rebuild proofs prevent destructive entrypoint replacement; capture/restore reject missing/changed/real-directory Kilo leaves, other external links, and writes below symlinks. Parent reattachment requires recreation. Pure/mocked module gates and real temporary GNU/PAX content, hardlink and numeric metadata round trip pass; real native lifecycle/DR acceptance remains unverified.

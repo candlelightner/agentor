@@ -1,5 +1,6 @@
+import { MANAGED_KILO_PARENT, MANAGED_KILO_LINK, MANAGED_KILO_PARENT_CHECK } from '../../orchestrator/server/utils/managed-volume-kilo-parent';
 import { test, expect } from '@playwright/test';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile, symlink } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { PassThrough, Writable } from 'node:stream';
 import { tmpdir } from 'node:os';
@@ -11,7 +12,7 @@ import { backupInstallationId } from '../../orchestrator/server/utils/backup-ins
 import type { Config } from '../../orchestrator/server/utils/config';
 import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
 import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volume-store';
-import { INCUS_PERSISTENCE_TARGET_CHECK } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
+import { INCUS_PERSISTENCE_TARGET_CHECK, IncusManagedVolumeRuntime } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
 import { INCUS_SELECTED_RESTORE_SCRIPT } from '../../orchestrator/server/utils/incus-selected-restore';
 import { INCUS_DOCKER_RESTORE_SCRIPT } from '../../orchestrator/server/utils/incus-docker-restore';
 import { INCUS_CANONICAL_RESTORE_SCRIPT } from '../../orchestrator/server/utils/incus-canonical-restore';
@@ -1165,4 +1166,41 @@ test('real workspace-only native restore initializes only missing fresh agents r
     if (cleaned) await rm(dataDir, { recursive: true, force: true });
   }
   expect(cleaned).toBe(true);
+});
+
+
+for (const leafValid of [false, true]) test(`isolated parent promotion rechecks canonical Kilo before operational mount (${leafValid})`, async () => {
+  const f = await fixture();
+  try {
+    f.opts.dockerEnabled = false; f.opts.environmentJson.dockerEnabled = false;
+    const stage = join(f.dataDir, 'parent'); await mkdir(join(stage, 'volume'), { recursive: true });
+    await symlink(MANAGED_KILO_LINK, join(stage, 'volume/kilo'));
+    const archivePath = join(f.dataDir, 'parent.tar'); execFileSync('tar', ['--format=pax', '-cpf', archivePath, '-C', stage, 'volume']);
+    const store = new ManagedVolumeStore(f.dataDir); await store.init();
+    const volume = await store.create(f.opts.userId, f.opts.id, MANAGED_KILO_PARENT, 'XDG', 'incus-vm', archivePath);
+    f.opts.managedVolumes = [volume];
+    const created = await f.runtime.createCanonicalRestore(f.opts), uuid = created.config['volatile.uuid']!;
+    await f.runtime.restoreCanonicalArchives(f.opts, uuid, {}, () => {}, undefined, [{ volume, archivePath }]);
+    volume.seeded = true; volume.state = 'ready';
+    (f.runtime as any).accountDevices = async () => ({});
+    (f.runtime as any).managedDevices = async () => ({ [new IncusManagedVolumeRuntime(f.config, f.runtime).deviceKey(volume)]:
+      new IncusManagedVolumeRuntime(f.config, f.runtime).device(volume) });
+    let checked = false;
+    f.client.exec = async (_name: string, command: string[]) => {
+      if (command.includes(MANAGED_KILO_PARENT_CHECK)) {
+        checked = true; expect(command.at(-1)).toBe(`/restore/managed/${volume.id}/volume`);
+        expect(f.current().config['user.agentor.restore']).toBe('incomplete');
+        expect(f.events).not.toContain('promote'); return { returnCode: leafValid ? 0 : 1, stdout: '', stderr: '' };
+      }
+      return { returnCode: 0, stdout: '', stderr: '' };
+    };
+    if (leafValid) {
+      await f.runtime.finishCanonicalRestore(f.opts, uuid, () => {}, 'stopped');
+      expect(f.current().devices[new IncusManagedVolumeRuntime(f.config, f.runtime).deviceKey(volume)].path).toBe(MANAGED_KILO_PARENT);
+    } else {
+      await expect(f.runtime.finishCanonicalRestore(f.opts, uuid, () => {}, 'stopped')).rejects.toThrow('bootstrap command failed');
+      expect(f.events).not.toContain('promote'); expect(f.current().config['user.agentor.restore']).toBe('incomplete');
+    }
+    expect(checked).toBe(true);
+  } finally { await f.cleanup(); }
 });

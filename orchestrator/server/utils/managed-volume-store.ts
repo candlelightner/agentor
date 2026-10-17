@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { join, posix } from "node:path";
 import type { ManagedVolume, PersistencePolicy } from "../../shared/managed-volumes";
 import type { WorkerRuntimeKind } from "../../shared/types";
+import { MANAGED_KILO_PARENT } from './managed-volume-kilo-parent';
 import { UserScopedJsonStore } from "./user-scoped-store";
 
 export function volumeError(statusCode: number, message: string) {
@@ -29,6 +30,12 @@ export function validatePersistenceTarget(input: unknown): string {
   if (PROTECTED.some((path) => pathsOverlap(input, path)))
     throw volumeError(400, "This path overlaps protected system, runtime, or credential storage. Choose an application data directory.");
   return input;
+}
+
+/** Stored migration/import records retain the whole historical XDG parent.
+ * Callers must prove its canonical Kilo link before mounting or worker startup. */
+export function validateStoredPersistenceTarget(input: unknown): string {
+  return input === MANAGED_KILO_PARENT ? input : validatePersistenceTarget(input);
 }
 
 /** One bounded private live-cutover intent, not a portable data authority.
@@ -85,7 +92,7 @@ function validateRecord(v: StoredManagedVolume) {
         (['not-submitted', 'unknown'].includes(intent.attachment) && intent.operation !== undefined))
       throw new Error('Invalid Incus live-volume recovery intent');
   }
-  if (v.purpose === "persistent-path") validatePersistenceTarget(v.target);
+  if (v.purpose === "persistent-path") validateStoredPersistenceTarget(v.target);
   return v.id;
 }
 
@@ -115,8 +122,11 @@ export class ManagedVolumeStore extends UserScopedJsonStore<string, StoredManage
     return this.listForUser(userId).filter((v) => v.workerId === workerId);
   }
 
-  async create(userId: string, workerId: string, target: string, name?: string, storageRuntimeKind?: WorkerRuntimeKind) {
-    validatePersistenceTarget(target);
+  async create(userId: string, workerId: string, target: string, name?: string, storageRuntimeKind?: WorkerRuntimeKind, archivePath?: string) {
+    if (target === MANAGED_KILO_PARENT && archivePath) {
+      const { validatePortableManagedVolumeArchive } = await import('./portable-managed-volume-archive');
+      await validatePortableManagedVolumeArchive(archivePath, { target, requirePosixUstar: true });
+    } else validatePersistenceTarget(target);
     const volumes = this.forWorker(userId, workerId);
     const existing = volumes.find((v) => v.target === target && v.attached);
     if (existing) return existing;

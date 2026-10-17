@@ -4,7 +4,9 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-Historical managed-volume migration adds `legacy-incus-managed-migration.spec.ts` (12 cases) plus attached/detached legacy-name admission, typed rejection rollback, malformed-name/protected-parent early rejection, exact old-name finalization, missing native-copy retention, and normalized running/stopped/archived archive capture. Tests use private scratch and mocked runtime boundaries; no production migration is performed. Protected Kilo-parent mounts remain intentionally unsupported.
+Historical XDG parent contract adds `managed-kilo-parent.spec.ts` (11 cases), two actual native create/rebuild/start regressions, four stopped-source capture cases, two isolated restore promotion cases, and two running/stopped/archived native capture cases (21 added cases). Coverage includes exact legacy normalization and durable reload; ordinary creation refusal; complete GNU/PAX portable round trip with cross-directory hardlinks, UID/GID/mode/nanosecond mtime/xattrs; missing/real/different Kilo leaves; both-order writes below links and other external links; exact conflict-category boundaries; actual no-follow guest script; native readonly helper authority and cleanup; never-started Docker probe, literal single-leaf TAR versus normalized metadata, lost-create settlement/unknown cleanup; and actual Docker restart ordering. Existing wider-parent admission negatives now use `/home/agent/.local`. All resources are mocks or private temporary files; native execution remains unverified.
+
+Historical managed-volume migration adds `legacy-incus-managed-migration.spec.ts` (12 cases) plus attached/detached legacy-name admission, typed rejection rollback, malformed-name/protected-parent early rejection, exact old-name finalization, missing native-copy retention, and normalized running/stopped/archived archive capture. Tests use private scratch and mocked runtime boundaries; no production migration is performed. The exact historical Kilo-parent contract is covered below; other protected parents remain refused.
 
 Guest shutdown coverage adds one static unit-ordering regression plus installed-unit checks and a background-exec graceful stop to the rebuilt-image live gate. Serial modules **401 passed / thirteen gated skips (39s)** and typecheck passed. `INCUS_REBOOT_TEST=true` additionally exercises unexpected-stop recovery without changing running intent, applied secrets, pending settings or instance UUID. The retained experience gate can use `INCUS_STACK_RESTART_TEST=true` to restart the exact helper-owned Orchestrator and verify unchanged guest boot/service identity and plugin HTTP/RFB survival. These latest live extensions remain pending.
 
@@ -134,13 +136,13 @@ tests/
     worker-lifecycle.ts    # Container create/cleanup utilities
     ui-helpers.ts          # Page navigation and interaction helpers
     terminal-ws.ts         # WebSocket terminal client + ANSI stripping + credential checks
-    api/                     # API endpoint tests (1709 tests across 167 files)
+    api/                     # API endpoint tests (1730 tests across 168 files)
   ui/                      # UI interaction tests (631 tests across 65 files)
 ```
 
 ## Test Categories
 
-### API Tests (1520 tests, 150 files)
+### API Tests (1541 tests, 151 files)
 
 | File | Tests | Coverage |
 | --- | ---: | --- |
@@ -252,6 +254,7 @@ tests/
 | `backup-restore-cancellation.spec.ts` | 6 | Restore admission/cancellation safety: setup-time cancellation cannot be overwritten, queued cancellation removes admission/pins even when status persistence fails, queued in-place restores are removable, shared-artifact pins are independently job-owned, concurrent retry calls admit one execution/pin, and the legacy synchronous restore contract runs through the same bounded queue. |
 | `google-backup-oauth-installation.spec.ts` | 2 | Admin-only installation Google OAuth configuration: encrypted write-only client secret status, non-disclosure, and a mocked authorization challenge without a Google account. |
 | `managed-volumes.spec.ts` | 12 | Managed local persistence API: safe/additive targets, owner isolation, live/recreation authorization, detach/reattach and confirmed deletion, bounded allocated/logical on-demand sizing without Docker-identity disclosure, protection locks, restart/archive survival, and deleted-account administrator retention. |
+| `managed-kilo-parent.spec.ts` | 11 | Historical parent contract, whole-tree GNU/PAX portable round trip, exact inert Kilo link, no-follow checks, readonly helper/probe authority and actual Docker restart ordering; no production execution. |
 | `managed-volume-store.spec.ts` | 6 | No-server managed-volume store/module coverage: protected-path validation, owner-scoped idempotence/overlap rejection, policy defaults, fail-closed missing-volume behavior, startup recovery isolation, and retained deleted-owner records across restart. |
 | `managed-volume-sizing.spec.ts` | 20 | No-server sizing coverage: known/stale/unknown cache and incarnation invalidation, global/per-owner admission and helper-cleanup reservations, cancellation/publication and snapshot fencing, restart interruption, live authorization revocation, immutable read-only networkless helper options with only `DAC_READ_SEARCH`, bounded scanner parsing, Docker timeout/cleanup settlement, fail-closed startup reconciliation, and pre-create trusted-image failure releases snapshot/owner/global accounting. A test-scoped orchestrator identity is restored after each test, so mocked helper tests do not depend on the runner exporting `HOSTNAME`. |
 | `managed-volume-sizing-control.spec.ts` | 9 | Durable metadata-only REST/MCP job-control authorization, platform-only and owner/subtree boundaries, live credential/role/workspace/policy revocation after manager initialization and state-queue waits, no private-field disclosure, Docker-outage inspection, and cancellation without physical-volume discovery. |
