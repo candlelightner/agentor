@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { withWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
 import { applyAdminNativePatch, type AdminNativeAcknowledge } from './admin-native-authority';
 import type {
   AdminWorkspaceIdentityMaterializationIntent,
@@ -150,7 +151,9 @@ export class GroupAdminWorkspaceStore {
     this.running.add(groupId);
     let deferredRelease = false;
     try {
-      return await operation();
+      const snapshot = this.group(groupId);
+      return await this.serializeOwner(snapshot.userId, () => withWorkerLifecycleMutation(
+        snapshot.adminWorkspace?.id ?? `admin-group-bootstrap:${groupId}`, operation));
     } catch (error) {
       const settlement = (error as OperationFailureWithSettlement)?.[
         operationSettlement
@@ -171,7 +174,7 @@ export class GroupAdminWorkspaceStore {
   }
   async withNativeRuntimeTransaction<T>(groupId: string,
     operation: (record: GroupAdministrativeWorkspaceRecord, acknowledge: AdminNativeAcknowledge) => Promise<T>, authorize?: () => void): Promise<T> {
-    return this.run(groupId, () => this.withGroup(groupId, true, async () => {
+    return this.run(groupId, () => this.withGroup(groupId, false, async () => {
       authorize?.();
       await this.flushPendingCommit(groupId, 'native-runtime');
       const record = this.record(groupId);

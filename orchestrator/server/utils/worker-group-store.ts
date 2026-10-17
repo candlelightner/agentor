@@ -30,6 +30,14 @@ function validatedGroupId(group: WorkerGroup): string {
 }
 
 export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
+  private initialization?: Promise<void>;
+  /** Live administrative reads await bootstrap without reloading in-flight records. */
+  override init(): Promise<void> {
+    return this.initialization ??= super.init().catch(error => {
+      this.initialization = undefined;
+      throw error;
+    });
+  }
   constructor(dataDir: string) {
     super(dataDir, "worker-groups.json", validatedGroupId);
   }

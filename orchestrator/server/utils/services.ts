@@ -1,3 +1,4 @@
+import { AdministrativeWorkspaceRuntime } from "./administrative-workspace-runtime";
 import Docker from "dockerode";
 import { loadConfig } from "./config";
 import { DockerService } from "./docker";
@@ -58,6 +59,9 @@ export const useStorageManager = singleton(
       new Docker({ socketPath: "/var/run/docker.sock" }),
       useConfig(),
     ),
+);
+export const useAdministrativeWorkspaceRuntime = singleton(
+  () => new AdministrativeWorkspaceRuntime(useConfig()),
 );
 export const useContainerManager = singleton(
   () => new ContainerManager(useDockerService(), useConfig()),

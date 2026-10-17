@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { useContainerManager } from "./services";
+import { withOwnerWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
 import { applyAdminNativePatch, validateAdminNativeState, type AdminNativeRuntimeIdentity,
   type AdminNativeMigration, type AdminNativeAcknowledge } from './admin-native-authority';
 import {
@@ -180,7 +181,11 @@ export class AdminWorkspaceStore {
     await rename(temp, this.path);
   }
   private exclusive<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.operationTail.then(operation, operation);
+    const execute = async () => {
+      await this.init();
+      return withOwnerWorkerLifecycleMutation('__agentor_admin__', this.record?.id ?? '__admin-bootstrap__', operation);
+    };
+    const result = this.operationTail.then(execute, execute);
     this.operationTail = result.then(
       () => undefined,
       async (error: OperationFailureWithSettlement) => {
@@ -329,7 +334,10 @@ export class AdminWorkspaceStore {
       // disposable compute first merely to ensure the durable record exists.
       if (!this.record) await this.ensureLocked();
       const candidate = structuredClone(this.record!);
-      if (ownerId) candidate.ownerId = ownerId;
+      if (ownerId && candidate.ownerId !== ownerId) {
+        candidate.ownerId = ownerId;
+        if (candidate.runtimeKind === 'incus-vm') await this.commitExternal('native-owner', candidate);
+      }
       if (!this.runtime)
         throw Object.assign(
           new Error("Administrative workspace runtime is unavailable"),

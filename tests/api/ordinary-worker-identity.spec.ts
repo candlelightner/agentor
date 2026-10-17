@@ -284,7 +284,7 @@ test('startup reconciliation preserves quarantined owners while processing healt
   const blockedLegacy = randomUUID(), blockedNative = randomUUID(), healthy = randomUUID();
   try {
     await mkdir(directory, { recursive: true }); await writeFile(path, damaged);
-    await groups.init();
+    await expect(groups.loadUser(targetOwner)).rejects.toBeTruthy();
     expect(() => groups.listForUser(targetOwner)).toThrow('unavailable');
     for (const [id, runtimeKind] of [[blockedLegacy, 'legacy-docker'], [blockedNative, 'incus-vm']] as const)
       await f.store.upsert({ ...f.record(id, 'Quarantined worker', targetOwner), status: 'active', runtimeKind,
