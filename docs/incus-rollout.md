@@ -124,6 +124,11 @@ gracefully and flush its restored filesystems before operational devices are
 attached. A failed shutdown does not authorize promotion or a forced power-off.
 Ordinary worker stop operations retain their 30-second timeout.
 
+Existing Docker backup containers may have a read-only root bind. The host
+policy recognizes only an explicit `RW: false` bind of `/` as a read-only
+observer, never as authority to export the host root to workers. Writable or
+ambiguous root binds and overlapping writable exports still reject grants.
+
 The VM root is disposable. Backups, rebuilds and migrations preserve canonical
 workspace, agent/editor state, managed data and applicable native Docker state,
 not arbitrary root-disk mutations. Historical backups missing runtime metadata

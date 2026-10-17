@@ -96,6 +96,14 @@ class HostMountPolicy:
             for mount in container["Mounts"]:
                 if not isinstance(mount, dict) or not isinstance(mount.get("Type"), str):
                     raise SOURCES.SourceRejected("Legacy export authority is malformed")
+                # Host backup readers commonly bind '/' read-only. That mount
+                # cannot rename a catalog root or its parent through the bind,
+                # and must never become authority to export '/' to a worker.
+                # Require Docker's explicit boolean; unknown/writable roots
+                # still fail canonical validation below. Other exports retain
+                # the existing conservative collision checks.
+                if mount["Type"] == "bind" and mount.get("Source") == "/" and mount.get("RW") is False:
+                    continue
                 if mount["Type"] in ("bind", "volume"):
                     exports.append(SOURCES.canonical(mount.get("Source")))
         # Local bind-backed named volumes expose their device tree too, despite

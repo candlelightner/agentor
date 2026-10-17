@@ -92,6 +92,34 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.inspect(self.payload)
         self.assertEqual(self.mutations(), [])
 
+    def test_existing_read_only_host_backup_root_is_not_worker_export_authority(self):
+        self.legacy = [{"Mounts": [{"Type": "bind", "Source": "/", "Destination": "/source", "RW": False}]}]
+        result = self.policy.ensure(self.payload)
+        self.assertEqual(result["sourcePath"], str(self.root / "share"))
+        self.assertEqual(self.policy.inspect(self.payload), result)
+        self.assertNotIn("/", self.project["config"]["restricted.devices.disk.paths"].split(","))
+        self.catalog[0]["sourcePath"] = "/"; self.persist()
+        with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.ensure(self.payload)
+
+    def test_writable_unknown_or_non_bind_backup_root_still_rejects_before_grant(self):
+        for mount in [{"Type": "bind", "Source": "/", "RW": True},
+                      {"Type": "bind", "Source": "/"},
+                      {"Type": "bind", "Source": "/", "RW": "false"},
+                      {"Type": "bind", "Source": "/", "RW": 0},
+                      {"Type": "volume", "Source": "/", "RW": False}]:
+            with self.subTest(mount=mount):
+                self.legacy = [{"Mounts": [mount]}]
+                with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.ensure(self.payload)
+                self.assertEqual(self.mutations(), [])
+
+    def test_read_only_root_does_not_hide_another_overlapping_write_export(self):
+        nested = self.root / "share" / "nested"; nested.mkdir()
+        self.catalog[0]["sourcePath"] = str(nested); self.persist()
+        self.legacy = [{"Mounts": [{"Type": "bind", "Source": "/", "RW": False},
+                                  {"Type": "bind", "Source": str(nested.parent), "RW": True}]}]
+        with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.ensure(self.payload)
+        self.assertEqual(self.mutations(), [])
+
     def test_only_known_catalog_id_can_request_export(self):
         for payload in [{}, {"pathId": "../foreign"}, {"pathId": self.path_id, "source": "/etc"},
                         {"pathId": self.path_id, "project": "default"}, {"pathId": self.path_id, "allowWrite": True},
