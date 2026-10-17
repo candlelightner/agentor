@@ -3,6 +3,7 @@
 !/README.md
 !/monitor-backup.py
 !/prepare-incus-storage.py
+!/verify-worker-guest.py
 !/restore-worker-home.py
 !/test_restore_worker_home.py
 !/worker-init-prefix.sh

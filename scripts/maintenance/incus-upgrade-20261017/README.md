@@ -45,3 +45,12 @@ the operator then runs restoration to completion before restoring stopped intent
 VM workers. Apply it through the environment APIs, preserve other settings and
 existing caps, and clone shared environments to leave retained Docker workers
 unchanged. An existing VM needs a supported rebuild to apply the new allocation.
+
+Guest acceptance uses `verify-worker-guest.py`, executed as `agent` after setup
+finishes. It checks actual native and shebang execution on both canonical
+volumes, Codex, the worker session and desktop handshake, current-boot home
+restoration and manually installed packages. For the applicable workers it also
+compiles/extracts a PDF, loads R packages or checks QEMU and preserved updater
+GitHub configuration without emitting credentials. Host-side ownership, API
+proxies, retained Docker sources and final stopped/archived intent are checked
+separately.
