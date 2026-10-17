@@ -1343,3 +1343,6 @@ The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/ap
 
 ### 29.5 Worker export/import exclusion
 - Worker export **strips** `.kilo/config`, `.kilo/shared-data`, and the legacy `.kilo/data/auth.json` from `agents.tar.gz` — an export never carries another user's tokens, provider keys, Kilo sessions/history, or account-level Kilo configuration. Per-worker Kilo state/cache and code-server user-data are retained.
+
+### Installation maintenance: October 17 archived-worker migration
+- The operational `migrate-archived-worker.py` helper allows one explicitly reviewed worker per invocation, defaults to read-only preflight, and records private exclusive receipts. It retains source Docker data and rejects ambiguous reruns, unsupported legacy managed-volume names, hardware, image drift, or environment drift. Implementation tests use mocks; production acceptance is operator-run evidence.

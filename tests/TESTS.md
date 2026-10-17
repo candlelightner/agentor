@@ -446,3 +446,9 @@ for f in api/*.spec.ts ui/*.spec.ts; do
   echo "$f: $count"
 done
 ```
+
+Operational archived-worker migration: run `python3 -m unittest -v test_migrate_archived_worker.py`
+from `scripts/maintenance/incus-upgrade-20261017`. Thirteen isolated tests cover admission,
+immutable custom images, environment equivalence, private receipts, bounded sample exclusions,
+mocked lifecycle success/ambiguity, retained-source identity, native acceptance, legacy managed
+shape refusal and same-worker editor redirects. These tests do not execute production migration.

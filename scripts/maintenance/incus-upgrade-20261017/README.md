@@ -54,3 +54,53 @@ compiles/extracts a PDF, loads R packages or checks QEMU and preserved updater
 GitHub configuration without emitting credentials. Host-side ownership, API
 proxies, retained Docker sources and final stopped/archived intent are checked
 separately.
+
+`migrate-archived-worker.py --worker UUID` performs read-only preflight for one of
+six reviewed archived worker IDs. Add `--execute` only after reviewing the helper
+and preflight. Run as root on this installation; it uses the root-private canary
+session in memory, the exact deployed authentication origin, and localhost port
+3000. It never obtains GitHub credentials. The fixed owner, project, pool,
+environment clones and two custom OCI digests prevent a broader migration.
+An absent legacy desired-runtime field is accepted for archived workers; final
+archived state must explicitly have stopped intent.
+
+Execution claims exclusive, fsynced mode-0600 `migration-ID.*.private.json`
+receipts before the first mutation and before/after each supported API call.
+Existing receipts refuse reruns, including manual migration receipts. A local
+lock serializes helper invocations; it cannot fence unrelated administrator
+actions. Do not edit worker settings/environments concurrently. A lost response
+or verification failure stops for operator inspection, without automatic retry,
+rollback, finalization, or deletion. Keep all receipts and retained Docker data.
+
+The sequence is unarchive, select the behavior-identical 4 GiB clone, stop and
+capture exact Docker identity/mounts plus bounded file samples, migrate, rebuild,
+verify the guest as uid 1000, verify editor/desktop HTTP paths, then archive using
+the supported API. Final checks require absent native compute, retained canonical
+volumes and unchanged stopped Docker source/image/volumes. Native memory must be
+4 GiB, the converted image must derive from the exact captured OCI digest, and
+the guest kernel must be HWE 6.11+ or 7–9 rather than the problematic 6.8 series.
+Generic archived workers must have no home-restore manifest or additional package
+manifest. Guest verification creates only temporary execution probes.
+
+Samples are at most eight regular files of at most 8 MiB from each canonical
+source, scanned without following links. Credential names, agent runtime state,
+session/log databases, caches and generated `.agentor` paths are excluded. Empty
+or entirely excluded trees legitimately yield zero samples; receipts state each
+count. This is partial preservation evidence, not a full recursive checksum or
+application/browser interaction test. Source/API migration validation still runs.
+Native shared/account mounts are checked against exact owner paths and captured
+inherited shared-skills mounts. Desktop requires HTTP 200; editor redirects are
+limited to five within that same worker's same-origin editor path before 200.
+
+The helper currently refuses METOD's `legacy-backup-path` volume naming before
+unarchive: the deployed native migration requires normalized managed volume
+identity. A separately reviewed and deployed source fix is needed before that
+guard can be changed. Already migrated workers are also deliberately refused.
+
+Operational regression tests run with
+`python3 -m unittest -v test_migrate_archived_worker.py` from this directory. All
+API/host/guest lifecycle effects in these tests are mocked or use temporary files.
+The helper has **not** been executed against production as part of implementation;
+real migrations, custom-image conversion and archival acceptance remain operator
+run evidence. Incus command options follow the upstream
+[exec reference](https://linuxcontainers.org/incus/docs/main/reference/manpages/incus/exec/).

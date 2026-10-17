@@ -4,6 +4,8 @@
 !/monitor-backup.py
 !/prepare-incus-storage.py
 !/verify-worker-guest.py
+!/migrate-archived-worker.py
+!/test_migrate_archived_worker.py
 !/restore-worker-home.py
 !/test_restore_worker_home.py
 !/worker-init-prefix.sh
