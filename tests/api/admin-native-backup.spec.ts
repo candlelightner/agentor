@@ -95,9 +95,10 @@ test('bounded historical admin IDs get stable domain-separated helper IDs withou
   }
 });
 
-for (const condition of ['pending','migration','uninitialized','missing-storage','missing-incarnation','invalid-kind'] as const)
+for (const condition of ['pending','deleting','migration','uninitialized','missing-storage','missing-incarnation','invalid-kind'] as const)
   test(`instance snapshot refuses administrative ${condition}`, () => {
     const f = fixture();
+    if (condition === 'deleting') f.record.nativeRuntime!.deleting = true;
     if (condition === 'pending') f.record.nativeRuntime!.pending = { kind: 'create' };
     if (condition === 'migration') f.record.nativeMigration = { version: 1, nonce: randomUUID(), phase: 'captured',
       source: { containerId: 'a'.repeat(64), imageId: 'sha256:'+'b'.repeat(64), createdAt: new Date(0).toISOString() } };

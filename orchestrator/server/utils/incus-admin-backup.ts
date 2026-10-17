@@ -14,7 +14,7 @@ export function assertAdministrativeSnapshotSettled(value: unknown): asserts val
   const record = value as AdministrativeWorkspaceRecord;
   administrativeRuntimeOwner(record);
   validateAdminNativeState(record);
-  if (record.nativeMigration && record.nativeMigration.phase !== 'retained' || record.nativeRuntime?.pending)
+  if (record.nativeMigration && record.nativeMigration.phase !== 'retained' || record.nativeRuntime?.pending || record.nativeRuntime?.deleting)
     throw failure('Resolve administrative VM migration or lifecycle recovery before whole-instance backup');
   if (record.runtimeKind === 'incus-vm' && (!record.nativeRuntime?.incarnation ||
       record.nativeRuntime.storageReady !== true || record.nativeRuntime.storageInitialized !== true))
