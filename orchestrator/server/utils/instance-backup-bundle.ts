@@ -520,6 +520,9 @@ async function validateTarGzip(
   let entries = 0;
   let authDb = false;
   const tree = new Map<string, "file" | "directory" | "symlink" | "hardlink">();
+  // Paths used as implicit or explicit parents are scoped to this archive.
+  // This avoids scanning every preceding entry when checking reverse conflicts.
+  const parents = new Set<string>();
   const extract = tar.extract();
   const expanded = new Transform({
     transform(chunk, _encoding, callback) {
@@ -549,7 +552,7 @@ async function validateTarGzip(
         throw new Error("Instance backup data archive uses a reserved recovery path");
       const kind = normalizedEntryKind(header.type);
       if (!kind) throw new Error("Instance backup archive contains a special entry");
-      assertTreeEntry(tree, name, kind);
+      assertTreeEntry(tree, parents, name, kind);
       if (kind === "symlink") {
         assertContainedSymlink(
           name,
@@ -584,19 +587,20 @@ async function validateTarGzip(
 
 function assertTreeEntry(
   tree: Map<string, "file" | "directory" | "symlink" | "hardlink">,
+  parents: Set<string>,
   name: string,
   kind: "file" | "directory" | "symlink" | "hardlink",
 ) {
   if (tree.has(name)) throw new Error("Instance backup archive has a duplicate entry");
-  const parts = name.split("/");
-  for (let index = 1; index < parts.length; index += 1) {
-    const ancestor = tree.get(parts.slice(0, index).join("/"));
+  for (let offset = name.indexOf("/"); offset !== -1; offset = name.indexOf("/", offset + 1)) {
+    const parent = name.slice(0, offset);
+    const ancestor = tree.get(parent);
     if (ancestor && ancestor !== "directory")
       throw new Error("Instance backup archive traverses a non-directory");
+    parents.add(parent);
   }
-  for (const existing of tree.keys())
-    if (existing.startsWith(`${name}/`) && kind !== "directory")
-      throw new Error("Instance backup archive replaces an existing parent");
+  if (kind !== "directory" && parents.has(name))
+    throw new Error("Instance backup archive replaces an existing parent");
 }
 
 function excluded(path: string, exclusions: string[]) {
