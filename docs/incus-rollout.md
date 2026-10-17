@@ -1,12 +1,11 @@
 # Incus worker rollout
 
 This is an opt-in upgrade for a single Ubuntu 24.04 amd64 host. The implementation
-handoff is complete with an operator-approved acceptance exception: the final
-full browser/routing/IP-change gate is deferred to
-[issue #5](https://github.com/candlelightner/agentor/issues/5). Other accepted
-evidence is recorded in `incus-vm-status.md`; the complete original Phase 13
-matrix is not claimed passed. The deployed canary below still precedes any
-production worker migration.
+handoff is complete. The final full browser/routing/IP-change gate passed on
+2026-10-17 (8.3 minutes), resolving
+[issue #5](https://github.com/candlelightner/agentor/issues/5). Accepted evidence
+and remaining deferred stability items are recorded in `incus-vm-status.md`.
+The deployed production canary below still precedes any production worker migration.
 The Admin Workspace stays on Docker. Existing ordinary workers remain on Docker
 until a platform administrator explicitly migrates them.
 
