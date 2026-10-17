@@ -51,29 +51,31 @@
     "No backup/source finalization or deletion"
   ],
   "lastVerifiedProductionWorker": {
-    "id": "2eb7b5c5-5df6-412d-81cd-a88e7a9a92a5",
-    "name": "conlang-thinking",
+    "id": "e9737f4c-28e7-4862-956b-83c83a526071",
+    "name": "agentor-updater",
     "runtime": "incus-vm",
-    "state": "archived",
+    "state": "stopped",
+    "incarnation": "f5325882-33e9-4db0-9b8b-98dcb8bc1237",
     "guestKernel": "7.0.0-38-generic",
     "checks": [
-      "Codex 0.147.0 from immutable base",
-      "native and shebang execution on both canonical volumes",
-      "worker tmux session and desktop RFB",
-      "editor and desktop proxies",
-      "eight workspace and five agent-data file samples matched before and after archive (not a full-tree hash comparison)",
-      "native compute absent after supported archive",
-      "canonical volumes and exact stopped Docker source retained"
+      "Codex0.163.0 and qemu-utils restored",
+      "GitHub configuration retained without printing credentials",
+      "native/shebang shared execution, worker session and desktop RFB",
+      "editor and desktop proxies200",
+      "Docker10images/0containers/3volumes with16 metadata-complete samples",
+      "eight workspace and eight agent-data hash samples matched; not full-tree verification",
+      "original exact stopped Docker source, canonical volumes and encrypted instance backup retained"
     ]
   },
   "verifiedProductionWorkers": [
     "6eea5aa9-2d0d-454a-a91b-21b35d5b84fc",
     "cd4170f6-21aa-4494-b886-640494ff1f30",
     "834db661-cff3-402b-8daa-b0ba4738abeb",
-    "2eb7b5c5-5df6-412d-81cd-a88e7a9a92a5"
+    "2eb7b5c5-5df6-412d-81cd-a88e7a9a92a5",
+    "e9737f4c-28e7-4862-956b-83c83a526071"
   ],
   "migrationFollowUps": {
-    "updater": "Second retry is actively capturing on deployed 5bf6550. First retry passed workspace (including 8 GiB PAX size) and agent-data validation, then safely rolled back on four legitimate literal-backslash systemd unit filenames in nested Docker layers. Committed Docker-only path fix passed 76 affected tests, full typecheck, independent 63-fixture security matrix, GNU extraction proof and image build. Exact source remains stopped/unchanged. Offline Docker inventory: 10 images, 0 containers, 3 volumes.",
+    "updater": "Fully verified native and returned to original stopped intent. Source Docker exact/stopped retained, migration phase retained, no pending rebuild/recreation. Five-minute create deadline caused safe rollback while unpacking; create-only bounded 30-minute fix is committed/pushed/deployed as4ba49778. Codex0.163.0, qemu-utils, GitHub configuration, worker session, desktop RFB, editor/desktop proxies and shared execution passed. Native Docker retained10images/0containers/3volumes;16 hash+size+uid+gid+mode+mtime samples and8workspace+8agent-data hashes matched. Sampling is not full-tree proof.",
     "3d": "Fully verified and archived natively after supported rebuild; original Docker source retained. Initial failure reproduced: a read-only migration status request reloaded shared worker authority and dropped own undefined keys.",
     "metod": "Archived legacy managed parent /home/agent/.local/share overlaps protected Kilo data. Do not bypass admission or drop data; source and legacy volume retained for reviewed handling.",
     "remainingArchivedEligible": [
@@ -90,9 +92,14 @@
     "isolatedIntegration": "fix/backup-integration-harness-20261017",
     "workerStoreInitialization": "fix/worker-store-init-once-20261017",
     "dockerLiteralPaths": "fix/incus-docker-literal-paths-20261017",
-    "realCliClipboard": "fix/terminal-copy-real-cli-20261017"
+    "realCliClipboard": "fix/terminal-copy-real-cli-20261017",
+    "createUnpackDeadline": "fix/incus-create-unpack-deadline-20261018",
+    "managedKiloParent": "fix/incus-managed-kilo-parent-20261017",
+    "archivedImageRecovery": "fix/archived-worker-image-recovery-20261017",
+    "adminIdentity": "fix/ordinary-worker-admin-identity-20261017",
+    "nativeDockerVerifier": "ops/incus-docker-verification-20261017"
   },
-  "deployedSourceRevision": "5bf655071b439a2ec6a9157c2a52f01a708ec922",
+  "deployedSourceRevision": "4ba49778c6505b5825410dca2264164b2a8171c2",
   "reviewedInitializationFix": "11906c9 passed 138 affected tests and both typechecks. Independent peer proved twenty concurrent startup status requests perform one load and later reads preserve live authority; explicit private readers remain fresh.",
   "terminalAcceptance": "Committed and pushed 167fab9: installed Codex 0.163.0 actual /copy picker through tmux, WebSocket and TerminalPane/xterm to explicit Chromium clipboard action; exact 1000-line UTF-8 response also matches successful X11 clipboard. All 30 diagnostics tests and typecheck pass. Other CLI versions unverified.",
   "consolidationReview": "Static peer review found no new security blocker. From current production lineage, merge legacy-managed, memory, hardware, real-CLI management (includes diagnostics), then backup integration (includes reliability/performance). Retain both memory allocation and final hardware reauthorization, both Docker imports, and union all test registrations. Migration tests must retain both baseline drift rejection and historical-volume handling. Do not remerge already cherry-picked urgent branches.",
@@ -105,30 +112,30 @@
         "6f54ddcc-eee1-40f9-b151-afb8d9dd84e0",
         "ab2164f1-5e5d-4998-8eb9-ee9045b70b84"
       ],
-      "status": "Original immutable images and old base images absent from inspected host/old-VM/updater caches; saved recipes available. Explicit authorized catalog replacement implemented on fix/archived-worker-image-recovery-20261017, tested11cases; rebuilding images and migrations pending."
+      "status": "Four explicit replacement catalog definitions preserve saved recipes and versions. First two replacement builds verified ready with actual Docker digest/ownership labels; original image SHAs are not claimed recovered. Builds3/4 and original worker retarget/migration remain pending validated image-recovery+admin-identity deployment."
     },
     "METOD": {
       "workerId": "a05a29a7-fb5c-487a-8202-a13af60e7836",
-      "status": "Exact canonical Kilo symlink verified readonly in complete legacy .local/share volume. Narrow whole-parent compatibility implementation in progress on fix/incus-managed-kilo-parent-20261017; no data split or deletion."
+      "status": "Whole-parent preservation and exact canonical Kilo symlink handling committed/pushed asba141602, peer review passed. Production deployment/migration/restore acceptance pending; original volume untouched."
     },
     "hardware": {
       "workerIds": [
         "484f104d-4370-4d78-a5d6-dde517161c11",
         "26087985-9643-4564-a0e0-aff03c3e28b1"
       ],
-      "status": "USB legacy selector normalization fix tested; gated real GVT-g/mdev support in progress. Host enablement/physical device availability/real attachment acceptance unresolved. Host storage and unsafe hubs must not be attached; grants preserved."
+      "status": "USB legacy selector compatibility and gated Intel GVT-g/mdev path committed/pushed as500d241; affected tests/typechecks pass. Host enablement and physical attachment acceptance remain unresolved; no reboot, grant dropping, protected storage attachment or live boot-GPU unbinding."
     },
     "administrativeShadows": {
       "workerIds": [
         "8b5c936e-a859-4039-873a-6f7af0960b61",
         "c631e03a-f5a9-47d8-ab72-b3d6cb766287"
       ],
-      "status": "Authoritative admin and group stores prove exact trusted identities, despite ordinary archived shadow records lacking roles. Dedicated admin resources remain Docker. Ordinary list/recovery/migration/deletion guards in progress; never ordinary-migrate these IDs."
+      "status": "Authoritative identity guards and malformed global admin quarantine committed/pushed ascb5662ea. Independent review found nested group identity validation fail-open and quarantined owner startup propagation; narrow fixes in progress before deployment. Actual trusted admin resources remain Docker."
     },
     "testRunner": {
       "branch": "fix/disposable-vm-backup-tests-20261017",
-      "commit": "aa3add013c84330a81a8b8e0d217c40507ea61b0",
-      "status": "Reviewed fresh isolated direct-QEMU VM design; all21plan/guard tests pass; pushed. Both complete suites retained. Actual VM launch and acceptance pending consolidated committed source."
+      "commit": "81686d0f786632a3acb709ed20841521833b248f",
+      "status": "Fresh isolated direct-QEMU runner and external-data/signal fixes committed/pushed;24 isolated tests pass. Independent review found unbounded SSH log sinks; minimum fix in progress before any actual launch. Full suites pending consolidated committed source."
     },
     "ponytail": {
       "version": "5.3.2",
