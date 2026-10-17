@@ -95,5 +95,44 @@
   "deployedSourceRevision": "5bf655071b439a2ec6a9157c2a52f01a708ec922",
   "reviewedInitializationFix": "11906c9 passed 138 affected tests and both typechecks. Independent peer proved twenty concurrent startup status requests perform one load and later reads preserve live authority; explicit private readers remain fresh.",
   "terminalAcceptance": "Committed and pushed 167fab9: installed Codex 0.163.0 actual /copy picker through tmux, WebSocket and TerminalPane/xterm to explicit Chromium clipboard action; exact 1000-line UTF-8 response also matches successful X11 clipboard. All 30 diagnostics tests and typecheck pass. Other CLI versions unverified.",
-  "consolidationReview": "Static peer review found no new security blocker. From current production lineage, merge legacy-managed, memory, hardware, real-CLI management (includes diagnostics), then backup integration (includes reliability/performance). Retain both memory allocation and final hardware reauthorization, both Docker imports, and union all test registrations. Migration tests must retain both baseline drift rejection and historical-volume handling. Do not remerge already cherry-picked urgent branches."
+  "consolidationReview": "Static peer review found no new security blocker. From current production lineage, merge legacy-managed, memory, hardware, real-CLI management (includes diagnostics), then backup integration (includes reliability/performance). Retain both memory allocation and final hardware reauthorization, both Docker imports, and union all test registrations. Migration tests must retain both baseline drift rejection and historical-volume handling. Do not remerge already cherry-picked urgent branches.",
+  "allWorkerBlockers": {
+    "scope": "User explicitly requested fixing all reasons for all workers; prior exclusions are active work, not assumed permanent exceptions. Preserve backup, source data and actual trusted admin workspaces.",
+    "ordinaryMissingImages": {
+      "workerIds": [
+        "2d3c4841-893e-46a9-ad03-a5c50b08258c",
+        "192e1624-fecf-4bf8-bda7-512ff0b9c542",
+        "6f54ddcc-eee1-40f9-b151-afb8d9dd84e0",
+        "ab2164f1-5e5d-4998-8eb9-ee9045b70b84"
+      ],
+      "status": "Original immutable images and old base images absent from inspected host/old-VM/updater caches; saved recipes available. Explicit authorized catalog replacement implemented on fix/archived-worker-image-recovery-20261017, tested11cases; rebuilding images and migrations pending."
+    },
+    "METOD": {
+      "workerId": "a05a29a7-fb5c-487a-8202-a13af60e7836",
+      "status": "Exact canonical Kilo symlink verified readonly in complete legacy .local/share volume. Narrow whole-parent compatibility implementation in progress on fix/incus-managed-kilo-parent-20261017; no data split or deletion."
+    },
+    "hardware": {
+      "workerIds": [
+        "484f104d-4370-4d78-a5d6-dde517161c11",
+        "26087985-9643-4564-a0e0-aff03c3e28b1"
+      ],
+      "status": "USB legacy selector normalization fix tested; gated real GVT-g/mdev support in progress. Host enablement/physical device availability/real attachment acceptance unresolved. Host storage and unsafe hubs must not be attached; grants preserved."
+    },
+    "administrativeShadows": {
+      "workerIds": [
+        "8b5c936e-a859-4039-873a-6f7af0960b61",
+        "c631e03a-f5a9-47d8-ab72-b3d6cb766287"
+      ],
+      "status": "Authoritative admin and group stores prove exact trusted identities, despite ordinary archived shadow records lacking roles. Dedicated admin resources remain Docker. Ordinary list/recovery/migration/deletion guards in progress; never ordinary-migrate these IDs."
+    },
+    "testRunner": {
+      "branch": "fix/disposable-vm-backup-tests-20261017",
+      "commit": "aa3add013c84330a81a8b8e0d217c40507ea61b0",
+      "status": "Reviewed fresh isolated direct-QEMU VM design; all21plan/guard tests pass; pushed. Both complete suites retained. Actual VM launch and acceptance pending consolidated committed source."
+    },
+    "ponytail": {
+      "version": "5.3.2",
+      "status": "Complete plugin installed/enabled, six skills and three hooks, full default. Automatic hook trust remains user-facing Codex review step; all agents instructed to read/apply installed full-mode skill."
+    }
+  }
 }
