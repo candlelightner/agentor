@@ -198,6 +198,19 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         if (instance.status === 'Running')
             await this.writeCredential(record, credential);
     }
+    private async waitAgent(record: Readonly<AdministrativeWorkspaceRecord>) {
+        const deadline = Date.now() + 90000;
+        while (Date.now() < deadline) {
+            await this.assertOwned(record);
+            try {
+                const result = await this.client.exec(record.nativeRuntime!.name, ['/usr/bin/true'], { command: [], user: 0, group: 0, timeoutMs: 5000 });
+                if (result.returnCode === 0) { await this.assertOwned(record); return; }
+            } catch { /* Only this harmless agent probe is safe to retry. */ }
+            await this.assertOwned(record);
+            await new Promise(resolve => setTimeout(resolve, 250));
+        }
+        throw failure('Administrative VM agent did not become ready');
+    }
     private async execute(record: Readonly<AdministrativeWorkspaceRecord>, command: string[]) {
         await this.assertOwned(record);
         const result = await this.client.exec(record.nativeRuntime!.name, command, { user: 0, group: 0, environment: { PATH: '/usr/sbin:/usr/bin:/sbin:/bin', LC_ALL: 'C' }, command: [] });
@@ -252,10 +265,12 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
     private async inspectOwned(record: Readonly<AdministrativeWorkspaceRecord>, incarnation = record.nativeRuntime?.incarnation, allowPending = false): Promise<IncusInstance> {
         await this.validateAuthority(record, incarnation);
         const native = record.nativeRuntime, owner = administrativeRuntimeOwner(record);
-        if (!native || native.pending && !allowPending || native.name !== adminNativeInstanceName(record) || native.installationId !== await this.installation() ||
+        if (!native || native.deleting || native.pending && !allowPending || native.name !== adminNativeInstanceName(record) || native.installationId !== await this.installation() ||
             native.overlaySha256 !== administrativeNativeOverlaySha256(record))
             throw failure('Administrative native identity is unavailable');
         const instance = await this.client.getInstance(native.name), c = instance.config;
+        if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(c['volatile.uuid'] ?? ''))
+            throw failure('Administrative VM incarnation is unavailable');
         if (instance.name !== native.name || instance.type !== 'virtual-machine' || instance.profiles?.length ||
             c['user.agentor.installation'] !== native.installationId || c['user.agentor.id'] !== owner.id ||
             c['user.agentor.owner'] !== owner.userId || c['user.agentor.administrative'] !== owner.kind ||
@@ -279,7 +294,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         const record = structuredClone(input), ack = this.patch(record, acknowledge);
         await this.installation();
         await this.validateAuthority(record);
-        if (record.nativeRuntime?.pending)
+        if (record.nativeRuntime?.deleting || record.nativeRuntime?.pending)
             throw failure('Administrative VM operation requires explicit recovery');
         if (!record.nativeRuntime) {
             const image = await this.image(record);
@@ -309,6 +324,8 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
                     'user.agentor.admin-group': owner.groupId ?? '', 'user.agentor.admin-nonce': native.nonce,
                     'user.agentor.admin-overlay-sha256': native.overlaySha256, 'security.secureboot': 'false', 'boot.autostart': 'false', 'limits.memory':'4GiB','limits.cpu':'2' },
                 devices: { ...devices, root: { type: 'disk', path: '/', pool: this.config.incusStoragePool }, eth0: this.network.device(network) } }, onAccepted).then(async (created) => {
+                if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(created.config['volatile.uuid'] ?? ''))
+                    throw failure('Administrative VM incarnation is unavailable');
                 await ack({ ...record.nativeRuntime!, incarnation: created.config['volatile.uuid'] });
                 return created;
             }));
@@ -339,6 +356,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         try {
             await this.mutation(record, 'start', ack, accepted => this.client.startInstance(record.nativeRuntime!.name, accepted));
             instance = await this.assertOwned(record);
+            await this.waitAgent(record);
             await this.execute(record, ['/bin/sh', '-ec', PREPARE]);
             if(!record.nativeRuntime!.storageInitialized){
                 await this.execute(record,['/usr/bin/python3','-c',ADMIN_NATIVE_INITIALIZE_ROOTS]);
@@ -540,14 +558,26 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
     }
     async remove(input: Readonly<AdministrativeWorkspaceRecord>, acknowledge?: AdminNativeAcknowledge) {
         const record = structuredClone(input), ack = this.patch(record, acknowledge);
-        const instance = await this.assertOwned(record);
-        if (instance.status !== 'Stopped')
-            throw failure('Stop administrative workspace before deletion');
-        await this.mutation(record, 'delete', ack, accepted => this.client.deleteInstance(instance.name, accepted));
+        await this.validateAuthority(record);
+        if (!record.nativeRuntime?.deleting) {
+            const instance = await this.assertOwned(record);
+            if (instance.status !== 'Stopped') throw failure('Stop administrative workspace before deletion');
+            await ack({ ...record.nativeRuntime!, deleting: true });
+            await this.mutation(record, 'delete', ack, accepted => this.client.deleteInstance(instance.name, accepted));
+        } else {
+            // A lost delete result still requires its exact terminal receipt.
+            if (record.nativeRuntime.pending) {
+                await this.settlePending(record, async patch => { await acknowledge!(patch); applyAdminNativePatch(record, patch); });
+            }
+            // A durable intent does not authorize retrying an ambiguous delete.
+            try { await this.client.getInstance(record.nativeRuntime.name); throw failure('Administrative compute deletion requires explicit recovery'); }
+            catch (error) { if (!absent(error)) throw error; }
+        }
         for (const role of ['workspace', 'agents'] as const) {
+            await this.validateAuthority(record);
             const volume = await this.storage.inspect(record, record.nativeRuntime!, role);
-            if (!volume || volume.used_by?.length)
-                throw failure('Administrative storage deletion authority is unavailable');
+            if (!volume) continue; // Earlier acknowledged deletion may already have completed.
+            if (volume.used_by?.length) throw failure('Administrative storage deletion authority is unavailable');
             await this.client.deleteCustomVolume(this.config.incusStoragePool, volume.name);
         }
         (await import('./services')).useContainerManager().unregisterExternal(record.id);
