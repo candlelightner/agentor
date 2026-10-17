@@ -246,6 +246,270 @@ class AdminNetworkTests(unittest.TestCase):
             self.policy.ensure(self.payload)
         self.assertEqual(self.calls, [])
 
+    def selected(self, *, seeded=True, target="/opt/application-data"):
+        identity = str(uuid.uuid4())
+        volume = {"id": identity, "userId": "__agentor_admin__", "workerId": self.workspace,
+                  "storageRuntimeKind": "incus-vm", "purpose": "persistent-path", "attached": True,
+                  "dockerName": "agentor-persist-" + identity, "seeded": seeded,
+                  "state": "ready" if seeded else "pending", "target": target}
+        self.record["nativeRuntime"]["selectedVolumeIds"] = [identity]
+        self.save()
+        directory = self.root / "users" / "__agentor_admin__"
+        directory.mkdir(exist_ok=True)
+        path = directory / "managed-volumes.v1.json"
+        path.write_text(json.dumps([volume]))
+        return volume, path
+
+    def test_selected_seeded_disk_and_pending_selection_use_exact_devices(self):
+        for seeded in (False, True):
+            with self.subTest(seeded=seeded):
+                volume, path = self.selected(seeded=seeded)
+                result = self.policy.ensure(self.payload)
+                self.instance = self.owned_instance(result)
+                key = "m" + volume["id"].replace("-", "")[:6]
+                device = {"type": "disk", "pool": "owned-pool", "source": volume["dockerName"], "path": volume["target"]}
+                if seeded:
+                    for field in ("devices", "expanded_devices"):
+                        self.instance[field][key] = copy.deepcopy(device)
+                self.calls.clear()
+                self.assertEqual(self.policy.inspect(self.payload), result)
+                self.assertEqual(self.mutations(), [])
+                for field in ("devices", "expanded_devices"):
+                    self.instance[field][key] = {**device, "source": "/host"}
+                with self.assertRaises(MODULE.PolicyError): self.policy.inspect(self.payload)
+                self.instance = None
+
+    def test_selected_volume_authority_and_protected_targets_fail_before_host_calls(self):
+        volume, path = self.selected()
+        variants = []
+        for field, value in (("userId", "foreign"), ("workerId", str(uuid.uuid4())), ("storageRuntimeKind", "legacy-docker"),
+                             ("purpose", "legacy-backup-path"), ("attached", False), ("seeded", 1),
+                             ("state", "detached"), ("dockerName", "/host"), ("incusLive", {}),
+                             ("liveContainerId", None), ("previousRestartPolicy", {}), ("retainedAfterAccountDeletion", True)):
+            variants.append({**volume, field: value})
+        for target in ("/", "/workspace", "/workspace/child", "/home/agent", "/home/agent/.local",
+                       "/home/agent/.local/share/kilo", "/etc", "/run/data", "/opt/../data", "//opt/data",
+                       "/opt/data/", "/opt/with\\slash", "/opt/with:colon", "/opt/with\nnewline"):
+            variants.append({**volume, "target": target})
+        for changed in variants:
+            with self.subTest(changed=changed):
+                path.write_text(json.dumps([changed]))
+                with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+                self.assertEqual(self.calls, [])
+        path.write_text(json.dumps([{**volume, "target": "/home/agent/.local/share"}]))
+        self.assertEqual(self.policy.authority(self.payload)["selected"][0]["target"], "/home/agent/.local/share")
+
+    def test_selected_identity_bounds_collisions_duplicates_and_overlap(self):
+        volume, path = self.selected()
+        original = copy.deepcopy(self.record)
+        for ids in ([volume["id"], volume["id"]], ["../foreign"], [str(uuid.uuid4())] * 33, "invalid"):
+            self.record["nativeRuntime"]["selectedVolumeIds"] = ids
+            self.save()
+            with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+        self.record = original
+        self.save()
+        for values in ([], [volume, volume], {}, [{"id": 1}]):
+            path.write_text(json.dumps(values))
+            with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+        for collision in (False, True):
+            other_id = str(uuid.uuid4())
+            if collision: other_id = volume["id"][:6] + other_id[6:]
+            other = {**volume, "id": other_id, "dockerName": "agentor-persist-" + other_id,
+                     "target": "/opt/other" if collision else volume["target"] + "/child"}
+            self.record["nativeRuntime"]["selectedVolumeIds"] = [volume["id"], other_id]
+            self.save()
+            path.write_text(json.dumps([volume, other]))
+            with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+        self.assertEqual(self.calls, [])
+
+    def test_selected_authority_reader_rejects_symlink_fifo_and_oversized_file(self):
+        _, path = self.selected()
+        path.unlink()
+        path.symlink_to(self.root / "backup-installation-id")
+        with self.assertRaises(OSError): self.policy.ensure(self.payload)
+        path.unlink()
+        os.mkfifo(path)
+        with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+        path.unlink()
+        path.write_bytes(b"x" * (1024 * 1024 + 1))
+        with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+        self.assertEqual(self.calls, [])
+
+    def test_selected_staging_requires_exact_receipt_and_never_allows_start(self):
+        volume, path = self.selected(seeded=False)
+        result = self.policy.ensure(self.payload)
+        self.record["nativeRuntime"]["incarnation"] = str(uuid.uuid4())
+        receipt = {"volumeId": volume["id"], "operationId": str(uuid.uuid4()),
+                   "incarnation": self.record["nativeRuntime"]["incarnation"], "kind": "snapshot"}
+        self.record["nativeRuntime"]["selectedOperation"] = receipt
+        volume.update(state="preparing", operation={"id": receipt["operationId"], "mode": "recreate", "stage": "copying"})
+        path.write_text(json.dumps([volume]))
+        self.save()
+        self.instance = self.owned_instance(result)
+        self.instance["config"]["volatile.uuid"] = receipt["incarnation"]
+        key = "m" + volume["id"].replace("-", "")[:6]
+        device = {"type": "disk", "pool": "owned-pool", "source": volume["dockerName"],
+                  "path": "/run/agentor-volume-seed/" + volume["id"]}
+        for kind in ("snapshot", "seed"):
+            receipt["kind"] = kind
+            self.save()
+            for attached in (False, True):
+                for field in ("devices", "expanded_devices"):
+                    self.instance[field].pop(key, None)
+                    if attached: self.instance[field][key] = copy.deepcopy(device)
+                self.calls.clear()
+                self.assertEqual(self.policy.inspect(self.payload), result)
+                self.assertEqual(self.mutations(), [])
+                with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+        for changed in ({**device, "path": volume["target"]}, {**device, "readonly": "true"}):
+            for field in ("devices", "expanded_devices"): self.instance[field][key] = changed
+            with self.assertRaises(MODULE.PolicyError): self.policy.inspect(self.payload)
+        for field in ("devices", "expanded_devices"): self.instance[field][key] = copy.deepcopy(device)
+        volume["operation"]["id"] = str(uuid.uuid4())
+        path.write_text(json.dumps([volume]))
+        self.calls.clear()
+        with self.assertRaises(MODULE.PolicyError): self.policy.inspect(self.payload)
+        self.assertEqual(self.calls, [])
+
+    def test_group_selected_records_use_authoritative_owner_partition(self):
+        volume, path = self.selected()
+        self.record.update(kind="group-administrative", ownerId="healthy-owner", groupId="legacy_group")
+        group_path = self.root / "users" / "healthy-owner" / "worker-groups.json"
+        group_path.write_text(json.dumps([{"id": "legacy_group", "userId": "healthy-owner", "adminWorkspace": self.record}]))
+        self.path.unlink()
+        volume["userId"] = "healthy-owner"
+        group_volumes = group_path.with_name("managed-volumes.v1.json")
+        group_volumes.write_text(json.dumps([volume]))
+        self.assertEqual(self.policy.authority(self.payload)["selected"], [volume])
+        group_volumes.unlink()
+        with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+        self.assertEqual(self.calls, [])
+        self.assertTrue(path.exists())  # Foreign platform-owner copy is never a fallback.
+
+    def test_selected_receipt_shape_incarnation_and_unsettled_copy_deny(self):
+        volume, path = self.selected(seeded=False)
+        native = self.record["nativeRuntime"]
+        native["incarnation"] = str(uuid.uuid4())
+        operation = {"volumeId": volume["id"], "operationId": str(uuid.uuid4()),
+                     "incarnation": native["incarnation"], "kind": "seed"}
+        volume.update(state="preparing", operation={"id": operation["operationId"], "mode": "recreate", "stage": "copying"})
+        path.write_text(json.dumps([volume]))
+        self.save()
+        with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+        variants = [{**operation, field: value} for field, value in (
+            ("volumeId", str(uuid.uuid4())), ("operationId", "not-a-uuid"), ("incarnation", str(uuid.uuid4())),
+            ("kind", "mount"), ("arbitraryPath", "/host"))]
+        for receipt in variants:
+            native["selectedOperation"] = receipt
+            self.save()
+            with self.assertRaises(MODULE.PolicyError): self.policy.inspect(self.payload)
+        native["selectedOperation"] = operation
+        self.save()
+        for state, stage, seeded in (("pending", "copying", False), ("ready", "failed", True),
+                                     ("ready", "complete", False), ("preparing", "mounting", False)):
+            path.write_text(json.dumps([{**volume, "state": state, "seeded": seeded,
+                                         "operation": {**volume["operation"], "stage": stage}}]))
+            with self.assertRaises(MODULE.PolicyError): self.policy.inspect(self.payload)
+        operation["kind"] = "snapshot"
+        self.save()
+        path.write_text(json.dumps([{**volume, "seeded": True}]))
+        with self.assertRaises(MODULE.PolicyError): self.policy.inspect(self.payload)
+        self.assertEqual(self.calls, [])
+
+    def test_unreferenced_attached_native_volume_is_not_silently_omitted(self):
+        volume, path = self.selected()
+        del self.record["nativeRuntime"]["selectedVolumeIds"]
+        self.save()
+        with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+        self.assertEqual(self.calls, [])
+        for changed in ({**volume, "storageRuntimeKind": "legacy-docker"}, {**volume, "attached": False, "state": "detached"}):
+            path.write_text(json.dumps([changed]))
+            self.assertEqual(self.policy.authority(self.payload)["selected"], [])
+        self.assertEqual(self.calls, [])
+
+    def test_selected_device_receipts_are_strict_and_inspection_never_replays(self):
+        volume, path = self.selected(seeded=False)
+        result = self.policy.ensure(self.payload)
+        native = self.record["nativeRuntime"]
+        native["incarnation"] = str(uuid.uuid4())
+        operation = {"volumeId": volume["id"], "operationId": str(uuid.uuid4()),
+                     "incarnation": native["incarnation"], "kind": "seed"}
+        native["selectedOperation"] = operation
+        volume.update(state="preparing", operation={"id": operation["operationId"], "mode": "recreate", "stage": "copying"})
+        path.write_text(json.dumps([volume]))
+        self.save()
+        self.instance = self.owned_instance(result)
+        self.instance["config"]["volatile.uuid"] = native["incarnation"]
+        for device in ({"state": "unknown"}, {"state": "accepted", "operation": "/1.0/operations/" + str(uuid.uuid4())}, {"state": "settled"}):
+            operation["device"] = device
+            self.save()
+            self.calls.clear()
+            self.assertEqual(self.policy.inspect(self.payload), result)
+            self.assertEqual(self.mutations(), [])
+            with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+        for device in ({}, {"state": "accepted"}, {"state": "unknown", "operation": "/1.0/operations/" + str(uuid.uuid4())},
+                       {"state": "accepted", "operation": "https://foreign/1.0/operations/" + str(uuid.uuid4())},
+                       {"state": "settled", "path": "/host"}):
+            operation["device"] = device
+            self.save()
+            self.calls.clear()
+            with self.assertRaises(MODULE.PolicyError): self.policy.inspect(self.payload)
+            self.assertEqual(self.calls, [])
+
+    def test_seed_canonical_transition_requires_stopped_seeded_exact_same_volume(self):
+        volume, path = self.selected()
+        result = self.policy.ensure(self.payload)
+        native = self.record["nativeRuntime"]
+        native["incarnation"] = str(uuid.uuid4())
+        operation = {"volumeId": volume["id"], "operationId": str(uuid.uuid4()), "incarnation": native["incarnation"],
+                     "kind": "seed", "canonical": True, "device": {"state": "settled"}}
+        native["selectedOperation"] = operation
+        volume["operation"] = {"id": operation["operationId"], "mode": "recreate", "stage": "copying"}
+        path.write_text(json.dumps([volume]))
+        self.save()
+        self.instance = self.owned_instance(result)
+        self.instance.update(status="Stopped")
+        self.instance["config"]["volatile.uuid"] = native["incarnation"]
+        key = "m" + volume["id"].replace("-", "")[:6]
+        for target in ("/run/agentor-volume-seed/" + volume["id"], volume["target"]):
+            for field in ("devices", "expanded_devices"):
+                self.instance[field][key] = {"type": "disk", "pool": "owned-pool", "source": volume["dockerName"], "path": target}
+            self.calls.clear()
+            self.assertEqual(self.policy.inspect(self.payload), result)
+            self.assertEqual(self.mutations(), [])
+            with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+        self.instance["status"] = "Running"
+        with self.assertRaises(MODULE.PolicyError): self.policy.inspect(self.payload)
+        self.instance["status"] = "Stopped"
+        for field in ("devices", "expanded_devices"): self.instance[field].pop(key)
+        with self.assertRaises(MODULE.PolicyError): self.policy.inspect(self.payload)
+        operation["kind"] = "snapshot"
+        self.save()
+        self.calls.clear()
+        with self.assertRaises(MODULE.PolicyError): self.policy.inspect(self.payload)
+        self.assertEqual(self.calls, [])
+
+    def test_selected_record_change_during_admission_is_fenced(self):
+        volume, path = self.selected()
+        def change(kind, method, route):
+            if kind == "incus" and method == "POST":
+                path.write_text(json.dumps([{**volume, "target": "/opt/changed"}]))
+        self.after_call = change
+        with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+        self.assertIsNone(self.wrapper)
+        self.assertEqual(self.tables, [])
+        self.assertEqual(self.project["config"]["restricted.networks.access"], "workers")
+
+    def test_deletion_intent_blocks_ensure_without_host_mutation(self):
+        result = self.policy.ensure(self.payload)
+        self.record["nativeRuntime"]["deleting"] = True
+        self.save()
+        self.calls.clear()
+        with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.policy.inspect(self.payload), result)
+        self.assertEqual(self.mutations(), [])
+
     def test_native_profiles_rawconfig_other_networks_and_disks_are_rejected(self):
         result = self.policy.ensure(self.payload)
         original = self.owned_instance(result)

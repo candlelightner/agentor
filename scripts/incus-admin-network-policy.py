@@ -10,6 +10,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import shlex
 import subprocess
@@ -133,7 +134,95 @@ class AdminNetworkPolicy:
                 and native.get("overlayVersion") == "6", "Durable native administrative intent is unavailable")
         key = hashlib.sha256(f"{self.installation}:{owner}:{group}:{workspace}".encode()).hexdigest()[:12]
         return {"record": record, "owner": owner, "group": group, "name": "aa" + key,
-                "dockerName": "agentor-admin-network-" + key, "key": key}
+                "dockerName": "agentor-admin-network-" + key, "key": key,
+                "selected": self.selected_records(record, owner)}
+
+    def selected_records(self, record, owner):
+        native = record["nativeRuntime"]
+        ids = native.get("selectedVolumeIds", [])
+        require(isinstance(ids, list) and len(ids) <= 32
+                and all(isinstance(value, str) and re.fullmatch(UUID, value) for value in ids)
+                and len(set(ids)) == len(ids), "Administrative selected volume identities are invalid")
+        require("deleting" not in native or native["deleting"] is True, "Administrative deletion intent is invalid")
+        operation = native.get("selectedOperation")
+        if operation is not None:
+            require(isinstance(operation, dict) and set(operation) <= {"volumeId", "operationId", "incarnation", "kind", "device", "canonical"}
+                    and operation.get("volumeId") in ids and operation.get("kind") in ("snapshot", "seed")
+                    and isinstance(operation.get("operationId"), str) and re.fullmatch(UUID, operation["operationId"])
+                    and isinstance(operation.get("incarnation"), str) and re.fullmatch(UUID, operation["incarnation"])
+                    and operation["incarnation"] == native.get("incarnation"),
+                    "Administrative selected operation identity is invalid")
+            require("canonical" not in operation or operation["canonical"] is True and operation["kind"] == "seed",
+                    "Selected canonical transition is invalid")
+            if "device" in operation:
+                device = operation["device"]
+                require(isinstance(device, dict) and set(device) <= {"state", "operation"}
+                        and device.get("state") in ("unknown", "accepted", "settled")
+                        and (isinstance(device.get("operation"), str)
+                             and re.fullmatch(r"/1\.0/operations/" + UUID, device["operation"])
+                             if device.get("state") == "accepted" else "operation" not in device),
+                        "Selected device acknowledgement is invalid")
+        try:
+            records = json.loads(BASE.read_bounded(self.data_dir, ["users", owner, "managed-volumes.v1.json"]))
+        except FileNotFoundError:
+            require(not ids, "Selected volume authority is missing")
+            return []
+        require(isinstance(records, list) and len(records) <= 4096
+                and all(isinstance(value, dict) and isinstance(value.get("id"), str) for value in records)
+                and len({value["id"] for value in records}) == len(records), "Selected volume authority is corrupt")
+        require(all(value["id"] in ids for value in records if value.get("userId") == owner
+                    and value.get("workerId") == record["id"] and value.get("storageRuntimeKind") == "incus-vm"
+                    and value.get("attached") is True), "Attached native storage is missing from administrative authority")
+        selected, targets, keys = [], [], set()
+        protected = ("/proc", "/sys", "/dev", "/run", "/var/run", "/boot", "/etc", "/root",
+                     "/bin", "/sbin", "/lib", "/lib64", "/usr", "/var/lib/docker", "/var/lib/containerd",
+                     "/home/agent/.agent-data", "/home/agent/.ssh", "/home/agent/.claude", "/home/agent/.codex",
+                     "/home/agent/.gemini", "/home/agent/.agents", "/home/agent/.config/kilo", "/home/agent/.local/share/kilo",
+                     "/workspace")
+        def overlap(left, right):
+            return left == right or left.startswith(right + "/") or right.startswith(left + "/")
+        for identity in ids:
+            matches = [value for value in records if value["id"] == identity]
+            require(len(matches) == 1, "Selected volume record is missing")
+            value = matches[0]
+            require(value.get("userId") == owner and value.get("workerId") == record["id"]
+                    and value.get("storageRuntimeKind") == "incus-vm" and value.get("purpose") == "persistent-path"
+                    and value.get("dockerName") == "agentor-persist-" + identity and value.get("attached") is True
+                    and type(value.get("seeded")) is bool
+                    and not any(field in value for field in ("incusLive", "liveContainerId", "previousRestartPolicy", "retainedAfterAccountDeletion")),
+                    "Selected volume ownership or backend differs")
+            target = value.get("target")
+            require(isinstance(target, str) and 1 < len(target) <= 4096 and target.startswith("/")
+                    and not target.endswith("/") and not re.search(r"[\x00-\x1f\x7f\\:]", target)
+                    and posixpath.normpath(target) == target and not target.startswith("//")
+                    and (target == "/home/agent/.local/share" or not any(overlap(target, path) for path in protected))
+                    and not any(overlap(target, previous) for previous in targets),
+                    "Selected volume target is protected, overlapping or noncanonical")
+            key = "m" + identity.replace("-", "")[:6]
+            require(key not in keys, "Selected volume device identities collide")
+            keys.add(key)
+            targets.append(target)
+            receipt = value.get("operation")
+            if receipt is not None:
+                require(isinstance(receipt, dict) and set(receipt) <= {"id", "mode", "stage", "error"}
+                        and isinstance(receipt.get("id"), str) and re.fullmatch(UUID, receipt["id"])
+                        and receipt.get("mode") == "recreate", "Selected volume operation is invalid")
+            if operation is not None and operation["volumeId"] == identity:
+                require(isinstance(receipt, dict) and receipt.get("id") == operation["operationId"]
+                        and receipt.get("mode") == "recreate" and receipt.get("stage") in ("copying", "failed", "complete")
+                        and value.get("state") in ("preparing", "failed", "ready")
+                        and (operation["kind"] != "snapshot" or value["seeded"] is False)
+                        and (value["state"] != "ready" or value["seeded"] is True
+                             and (receipt["stage"] == "complete" or operation["kind"] == "seed" and receipt["stage"] == "copying"))
+                        and (not operation.get("canonical") or value["seeded"] is True),
+                        "Selected volume copy receipt differs")
+            else:
+                require((receipt is None or isinstance(receipt, dict) and receipt.get("stage") == "complete")
+                        and ((value["seeded"] is True and value.get("state") == "ready")
+                             or (value["seeded"] is False and value.get("state") == "pending")),
+                        "Selected volume copy is unsettled")
+            selected.append(value)
+        return selected
 
     @staticmethod
     def validate_record(record, kind):
@@ -212,6 +301,21 @@ class AdminNetworkPolicy:
                    "eth0": {"type": "nic", "name": "eth0", "network": result["network"],
                             "ipv4.address": result["guestAddress"], "hwaddr": result["guestMac"],
                             "security.mac_filtering": "true", "security.ipv4_filtering": "true", "security.ipv6_filtering": "true"}}
+        for value in identity["selected"]:
+            key = "m" + value["id"].replace("-", "")[:6]
+            operation = native.get("selectedOperation")
+            staging = operation is not None and operation["volumeId"] == value["id"]
+            canonical = staging and operation.get("canonical") is True
+            if canonical:
+                require(instance.get("status") == "Stopped" and value["seeded"] is True,
+                        "Selected canonical transition requires stopped seeded storage")
+            if staging and key not in instance.get("devices", {}) and not canonical:
+                continue
+            if staging or value["seeded"]:
+                target = "/run/agentor-volume-seed/" + value["id"] if staging else value["target"]
+                if canonical and instance.get("devices", {}).get(key, {}).get("path") == value["target"]:
+                    target = value["target"]
+                devices[key] = {"type": "disk", "pool": self.pool, "source": value["dockerName"], "path": target}
         require(instance.get("devices") == devices and instance.get("expanded_devices") == devices,
                 "Native admin devices differ from its private canonical layout")
         if native.get("incarnation"):
@@ -278,7 +382,9 @@ class AdminNetworkPolicy:
 
     def admit(self, payload, create):
         identity = self.authority(payload)
-        require(not create or not identity["record"]["nativeRuntime"].get("pending"), "Native administrative operation is pending")
+        require(not create or not any(identity["record"]["nativeRuntime"].get(field)
+                                      for field in ("pending", "selectedOperation", "deleting")),
+                "Native administrative operation is pending")
         self.managed.project_policy()
         controller = self.controller()
         try:
