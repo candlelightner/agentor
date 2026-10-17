@@ -25,7 +25,7 @@ import { ManagedNetworkStore } from './managed-network-store';
 import { isIP } from 'node:net';
 import { incusHostMountLayout, incusHostMountMetadata, assertIncusHostMountLayout } from './incus-host-mount-runtime';
 import { IncusHostMountClient } from './incus-host-mount-client';
-import { INCUS_CANONICAL_ARCHIVE_SCRIPT } from './incus-canonical-archive';
+import { openIncusCanonicalArchive } from './incus-canonical-archive';
 import { INCUS_SELECTED_ARCHIVE_SCRIPT, nativeSelectedBackupPath } from './incus-selected-archive';
 import { PassThrough, Readable, Transform } from 'node:stream';
 import { snapshotIncusWorkerBackupRuntime, parseWorkerBackupRuntime, type WorkerBackupRuntimeSource } from './worker-backup-runtime';
@@ -679,24 +679,7 @@ export class IncusWorkerRuntime {
 
   private async archiveStream(name: string, role: 'workspace' | 'agents' | 'managed', validate: () => Promise<void>,
     options: { exclusions: string[]; signal?: AbortSignal }, offline = false) {
-    await validate();
-    const session = await this.client.execStream(name,
-      ['/usr/bin/python3', '-c', INCUS_CANONICAL_ARCHIVE_SCRIPT, role, JSON.stringify(options.exclusions), ...(offline ? ['offline'] : [])],
-      { command: [], user: 0, group: 0, cwd: '/', environment: { PATH: '/usr/bin:/bin', LC_ALL: 'C' },
-        signal: options.signal, timeoutMs: 10 * 60_000 });
-    const output = new PassThrough();
-    output.on('error', () => {});
-    output.once('close', () => session.close());
-    session.stderr.resume();
-    session.stdout.on('error', error => output.destroy(error));
-    session.stdout.pipe(output, { end: false });
-    session.stdin.end();
-    void session.result.then(async code => {
-      if (code !== 0) throw new Error('Incus canonical archive capture failed');
-      await validate();
-      output.end();
-    }).catch(error => output.destroy(error));
-    return output;
+    return openIncusCanonicalArchive(this.client, name, role, validate, options, offline);
   }
 
   async matchesWorkerIdentity(instance: IncusInstance, workerId: string, userId?: string): Promise<boolean> {
