@@ -1347,3 +1347,5 @@ The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/ap
 
 ### 29.5 Worker export/import exclusion
 - Worker export **strips** `.kilo/config`, `.kilo/shared-data`, and the legacy `.kilo/data/auth.json` from `agents.tar.gz` — an export never carries another user's tokens, provider keys, Kilo sessions/history, or account-level Kilo configuration. Per-worker Kilo state/cache and code-server user-data are retained.
+
+- Whole-instance Docker acceptance has an explicit private-daemon opt-in gate and a plan-by-default launcher that mounts only committed source with unique test volumes and no outer published ports/socket; it prepares real UI capture, encrypted artifact import and empty-installation restore with exact multi-volume contents/metadata and stopped/archived intent checks. Live acceptance remains pending after consolidation.
