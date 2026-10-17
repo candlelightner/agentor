@@ -120,7 +120,10 @@ reports remain in the private directory. Each host log is capped at 64 MiB plus
 one omission note; readiness retries append under the same bootstrap-log cap.
 Excess SSH output is drained and discarded so verbose suites can still finish.
 A drain that fails to finish within five seconds after child exit stops the run;
-no further SSH attempt may overlap its log writer.
+no further SSH attempt may overlap its log writer. Reports are retrieved after
+an observed suite SSH exit (including a nonzero suite result). Cancellation,
+timeout or an unsettled drain proceeds directly to VM cleanup without another
+SSH request; already retained host logs remain available.
 Timeout or cancellation kills and reaps the captured SSH child within a
 five-second wait before the existing QEMU cleanup. Cancellation during SSH
 process creation is deferred until its handle is captured. Report transfer is capped at 1 GiB and

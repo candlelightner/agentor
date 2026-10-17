@@ -1364,3 +1364,6 @@ Disposable VM launcher safety adds bounded QCOW2 header rejection before any QEM
 
 
 Disposable backup VM console, readiness and suite host logs each retain at most 64 MiB plus one omission note. SSH output continues draining after the cap; retries share the readiness-log bound. Captured SSH children are killed/reaped on timeout or cancellation before the existing captured-QEMU cleanup. Full suite selections and live-acceptance requirements are unchanged.
+
+
+Disposable VM report retrieval follows an observed suite SSH exit and settled log drain. Cancellation, timeout and unsettled-drain failures stop further SSH activity and enter captured-VM cleanup directly; existing host logs remain available. Observed nonzero suite exits still retain reports.

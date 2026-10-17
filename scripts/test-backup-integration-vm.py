@@ -303,25 +303,23 @@ def execute(proposed):
         with (root / 'source.tar').open('rb') as archive:
             command(ssh + ['sudo -n tar -xpf - --no-same-owner -C ' + str(GUEST_SOURCE)], stdin=archive)
         remote = f'sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root python3 {GUEST_SOURCE}/scripts/test-backup-integration-vm.py --inside-guest {proposed["nonce"]} --suite ' + ('both' if len(proposed['suites']) == 2 else next(iter(proposed['suites'])))
-        code = 1
-        try:
-            code = run_logged(ssh + [remote], root / 'run.log', 4 * 3600)
-        finally:
-            with (root / 'reports.tar').open('wb') as report:
-                # Bound report storage separately from the 80 GiB virtual disk.
-                import resource
-                def report_limit():
-                    resource.setrlimit(resource.RLIMIT_FSIZE, (GIB, GIB))
-                command(ssh + [f'sudo -n tar -cf - -C {GUEST_RESULTS} .'], stdout=report, preexec_fn=report_limit)
-            (root / 'reports').mkdir(mode=0o700)
-            with tarfile.open(root / 'reports.tar') as report:
-                members, size = [], 0
-                for member in report:
-                    size += member.size
-                    if len(members) >= 100_000 or size > GIB:
-                        raise RuntimeError('Guest report archive exceeds its file/byte limit')
-                    members.append(member)
-                report.extractall(root / 'reports', members=members, filter='data')
+        code = run_logged(ssh + [remote], root / 'run.log', 4 * 3600)
+        # Retrieve reports only after an observed SSH exit and settled log drain.
+        with (root / 'reports.tar').open('wb') as report:
+            # Bound report storage separately from the 80 GiB virtual disk.
+            import resource
+            def report_limit():
+                resource.setrlimit(resource.RLIMIT_FSIZE, (GIB, GIB))
+            command(ssh + [f'sudo -n tar -cf - -C {GUEST_RESULTS} .'], stdout=report, preexec_fn=report_limit)
+        (root / 'reports').mkdir(mode=0o700)
+        with tarfile.open(root / 'reports.tar') as report:
+            members, size = [], 0
+            for member in report:
+                size += member.size
+                if len(members) >= 100_000 or size > GIB:
+                    raise RuntimeError('Guest report archive exceeds its file/byte limit')
+                members.append(member)
+            report.extractall(root / 'reports', members=members, filter='data')
         (root / 'result.json').write_text(json.dumps({'exitCode': code, 'commit': commit, 'nonce': proposed['nonce']}))
         return code
     finally:

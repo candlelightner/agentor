@@ -469,3 +469,6 @@ Disposable VM launcher safety adds bounded QCOW2 header rejection before any QEM
 
 
 Disposable VM SSH log bounds add two local regressions (**26 launcher cases total**): repeated append attempts share one byte cap, and actual `execute()` drains three 65 MiB Python fixture streams while retaining at most 64 MiB plus one omission note per host log. The same fixture proves timed-out SSH children and cancellation during SSH creation are reaped before owned VM/file cleanup, and an unsettled log drain blocks further attempts. QEMU, SSH, Docker and provisioning commands remain stubbed; no real VM or suite execution is claimed.
+
+
+The disposable VM log fixture additionally proves suite-stage cancellation, timeout and unsettled-drain failures trigger zero report-transfer SSH requests before QEMU cleanup. Normal observed zero/nonzero exits still retrieve reports and retain their exit codes. The 26-case launcher set uses local Python producers and mocked VM/SSH/tools; no live launch is claimed.

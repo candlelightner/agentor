@@ -179,7 +179,7 @@ class BackupVmLauncherTests(unittest.TestCase):
         import signal
         import tarfile
         real_popen, real_thread = subprocess.Popen, runner.threading.Thread
-        for outcome in ('overlimit', 'timeout', 'cancel', 'drain-timeout'):
+        for outcome in ('overlimit', 'observed-failure', 'timeout', 'cancel', 'suite-cancel', 'drain-timeout', 'suite-drain-timeout'):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
                 base, root = Path(directory)/'base.qcow2', Path(directory)/'run'
                 header = bytearray(104); header[:4] = b'QFI\xfb'
@@ -199,7 +199,10 @@ class BackupVmLauncherTests(unittest.TestCase):
                     elif args[0] == 'ssh-keygen':
                         Path(args[-1]).write_text('private key'); Path(args[-1]+'.pub').write_text('ssh-ed25519 public key')
                     elif args[0] == 'cloud-localds': Path(args[1]).write_bytes(b'owned seed')
-                    elif args[0] == 'git' and 'archive' in args or args[0] == 'ssh' and 'tar -cf' in args[-1]:
+                    elif args[0] == 'git' and 'archive' in args:
+                        with tarfile.open(fileobj=kwargs['stdout'], mode='w'): pass
+                    elif args[0] == 'ssh' and 'tar -cf' in args[-1]:
+                        events.append('reports')
                         with tarfile.open(fileobj=kwargs['stdout'], mode='w'): pass
                     return types.SimpleNamespace(returncode=0)
                 def popen(args, **kwargs):
@@ -211,15 +214,19 @@ class BackupVmLauncherTests(unittest.TestCase):
                         # the complete suite still drains a third full stream.
                         script = "import sys; [sys.stdout.buffer.write(b'x'*(1024*1024)) for _ in range(65)]"
                         if not children: script += '; sys.exit(1)'
-                    else: script = "import time; print('fixture',flush=True); time.sleep(60)" if suite or outcome == 'cancel' else "print('ready')"
+                    elif outcome == 'observed-failure':
+                        script = "import sys; print('observed exit'); sys.exit(" + ('7' if suite else '0') + ')'
+                    else:
+                        waiting = outcome == 'cancel' or suite and outcome in ('timeout', 'suite-cancel')
+                        script = "import time; print('fixture',flush=True); time.sleep(60)" if waiting else "print('ready')"
                     child = real_popen([sys.executable, '-c', script], **kwargs); children.append(child)
                     if outcome == 'timeout' and suite:
                         wait = child.wait
                         child.wait = lambda timeout=None: wait(timeout=0.05 if timeout == 4*3600 else timeout)
-                    if outcome == 'cancel': os.kill(os.getpid(), signal.SIGTERM)
+                    if outcome == 'cancel' or outcome == 'suite-cancel' and suite: os.kill(os.getpid(), signal.SIGTERM)
                     return child
                 def thread(*args, **kwargs):
-                    if outcome == 'drain-timeout' and children:
+                    if outcome == 'drain-timeout' and children or outcome == 'suite-drain-timeout' and len(children) >= 2:
                         return types.SimpleNamespace(start=lambda: None, is_alive=lambda: True, join=lambda timeout: None)
                     return real_thread(*args, **kwargs)
                 try:
@@ -235,15 +242,19 @@ class BackupVmLauncherTests(unittest.TestCase):
                             for name in ('bootstrap.log', 'run.log'):
                                 self.assertGreater((root/name).stat().st_size, 64*1024*1024)
                                 self.assertLess((root/name).stat().st_size, 64*1024*1024+128)
+                        elif outcome == 'observed-failure':
+                            self.assertEqual(runner.execute(proposed), 7)
+                            self.assertEqual(json.loads((root/'result.json').read_text())['exitCode'], 7)
                         elif outcome == 'timeout':
                             with self.assertRaises(subprocess.TimeoutExpired): runner.execute(proposed)
-                        elif outcome == 'drain-timeout':
+                        elif outcome in ('drain-timeout', 'suite-drain-timeout'):
                             with self.assertRaisesRegex(RuntimeError, 'further attempts refused'): runner.execute(proposed)
-                            self.assertEqual(len(children), 1)
+                            self.assertEqual(len(children), 1 if outcome == 'drain-timeout' else 2)
                         else:
                             with self.assertRaises(SystemExit) as stopped: runner.execute(proposed)
                             self.assertEqual(stopped.exception.code, 128+signal.SIGTERM)
-                    self.assertEqual(events, ['terminate', 'wait'])
+                    expected = ['reports', 'terminate', 'wait'] if outcome in ('overlimit', 'observed-failure') else ['terminate', 'wait']
+                    self.assertEqual(events, expected)
                     self.assertTrue(all(child.poll() is not None for child in children))
                     for name in ('root.qcow2', 'base.qcow2', 'seed.img', 'client-key', 'host-key', 'user-data', 'source.tar'):
                         self.assertFalse((root/name).exists(), name)
