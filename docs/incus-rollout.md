@@ -92,6 +92,10 @@ or exploitation of the Incus/QEMU/KVM/host boundary.
 
 ## Explicit migration
 
+For failed control-plane connectivity or ambiguous interrupted operations, see
+[bounded operator recovery](incus-recovery.md). Local HTTP health alone is not
+evidence that the Orchestrator has a usable Docker network endpoint.
+
 Use the shared platform-admin REST or Management MCP controls:
 
 - `GET /api/admin/workers/{id}/incus-migration` reports status.

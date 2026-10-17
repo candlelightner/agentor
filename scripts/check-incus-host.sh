@@ -23,6 +23,28 @@ def command(*argv):
     return result.stdout.decode()
 
 
+class DockerEndpointError(ValueError):
+    # Only fixed, secret-free operator messages may bypass check()'s generic
+    # exception redaction. Never include Docker output or caller input.
+    def __init__(self, reason):
+        super().__init__({
+            "stopped": "Orchestrator is not running; start/redeploy the exact configured stack before checking routing",
+            "endpoint": "Orchestrator Docker network endpoint is missing or stale; preserve DATA and read-only TLS mounts, then explicitly redeploy the exact stack (see docs/incus-recovery.md)",
+            "address": "Orchestrator Docker network IPv4 address is unavailable; loopback HTTP health does not prove worker connectivity (see docs/incus-recovery.md)",
+        }[reason])
+
+
+def docker_endpoint(container, network, name):
+    if container.get("State", {}).get("Running") is not True: raise DockerEndpointError("stopped")
+    link = container.get("NetworkSettings", {}).get("Networks", {}).get(name, {})
+    if not (re.fullmatch(r"[a-f0-9]{64}", network.get("Id", ""))
+            and link.get("NetworkID") == network["Id"]
+            and re.fullmatch(r"[a-f0-9]{64}", link.get("EndpointID", ""))): raise DockerEndpointError("endpoint")
+    try: return ipaddress.IPv4Address(link.get("IPAddress", ""))
+    except ipaddress.AddressValueError:
+        raise DockerEndpointError("address") from None
+
+
 def endpoint(value):
     parsed = urlsplit(value)
     require(parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password
@@ -208,6 +230,8 @@ def main():
     def check(label, action, advice):
         try:
             value = action(); print("PASS " + label); return value
+        except DockerEndpointError as error:
+            failures.append(label); print("FAIL " + label + ": " + str(error)); return None
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, ssl.SSLError, http.client.HTTPException):
             failures.append(label); print("FAIL " + label + ": " + advice); return None
 
@@ -274,7 +298,7 @@ def main():
         docker_subnet = ipaddress.IPv4Network(ipv4[0]["Subnet"])
         bridge = network.get("Options", {}).get("com.docker.network.bridge.name") or "br-" + network["Id"][:12]
         require(re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", bridge), "Docker bridge observation invalid")
-        address = str(ipaddress.IPv4Address(container["NetworkSettings"]["Networks"][args.docker_network]["IPAddress"]))
+        address = str(docker_endpoint(container, network, args.docker_network))
         require(ipaddress.IPv4Address(address) in docker_subnet and ipaddress.IPv4Address(ipv4[0]["Gateway"]) in docker_subnet, "Docker address/gateway differs from its subnet")
         gateway = urlsplit(args.internal_gateway_url)
         require(gateway.scheme == "http" and gateway.hostname == str(interface.ip) and gateway.port and not gateway.username

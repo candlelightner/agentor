@@ -126,7 +126,15 @@ def docker_context(container_name, network_name, data_dir):
     subnet = ipaddress.IPv4Network(ipv4[0]["Subnet"]); gateway = ipaddress.IPv4Address(ipv4[0]["Gateway"])
     bridge = network.get("Options", {}).get("com.docker.network.bridge.name") or "br-" + network["Id"][:12]
     require(re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", bridge), "Docker bridge interface is invalid")
-    address = ipaddress.IPv4Address(container["NetworkSettings"]["Networks"][name]["IPAddress"])
+    link = container["NetworkSettings"]["Networks"][name]
+    require(container.get("State", {}).get("Running") is True, "Orchestrator is not running; start/redeploy the exact configured stack before setting up routing")
+    require(re.fullmatch(r"[a-f0-9]{64}", network.get("Id", ""))
+            and link.get("NetworkID") == network["Id"]
+            and re.fullmatch(r"[a-f0-9]{64}", link.get("EndpointID", "")),
+            "Orchestrator Docker network endpoint is missing or stale; preserve DATA and read-only TLS mounts, then explicitly redeploy the exact stack (see docs/incus-recovery.md)")
+    try: address = ipaddress.IPv4Address(link.get("IPAddress", ""))
+    except ipaddress.AddressValueError:
+        raise SetupFailure("Orchestrator Docker network IPv4 address is unavailable; loopback HTTP health does not prove worker connectivity (see docs/incus-recovery.md)") from None
     require(address in subnet and gateway in subnet, "Docker address/gateway differs from its subnet")
     return observed_data, name, bridge, subnet, str(gateway), str(address)
 

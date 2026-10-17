@@ -23,6 +23,20 @@ with patch.object(sys, "argv", ["checker", str(SCRIPT)]):
 
 
 class CheckerTests(unittest.TestCase):
+    def test_controller_endpoint_requires_live_exact_network_not_just_loopback_health(self):
+        network = {"Id": "a" * 64}
+        container = {"State": {"Running": True}, "NetworkSettings": {"Networks": {"control": {
+            "NetworkID": network["Id"], "EndpointID": "b" * 64, "IPAddress": "172.25.0.2"}}}}
+        self.assertEqual(str(CHECKER.docker_endpoint(container, network, "control")), "172.25.0.2")
+        for key, value in (("NetworkID", ""), ("NetworkID", "c" * 64), ("EndpointID", ""), ("IPAddress", "")):
+            changed = copy.deepcopy(container)
+            changed["NetworkSettings"]["Networks"]["control"][key] = value
+            with self.assertRaisesRegex(ValueError, "endpoint|IPv4 address"):
+                CHECKER.docker_endpoint(changed, network, "control")
+        container["State"]["Running"] = False
+        with self.assertRaisesRegex(ValueError, "not running"):
+            CHECKER.docker_endpoint(container, network, "control")
+
     def project(self):
         return {"name": "agentor-private", "config": {
             "restricted": "true", "features.images": "true", "features.storage.volumes": "true", "features.networks": "false",
@@ -219,7 +233,7 @@ class CheckerTests(unittest.TestCase):
         self.assertIn("INCUS_NETWORK_HOST_ENDPOINT", result.stdout); self.assertIn("AGENTOR_INSTALLATION_ID", result.stdout)
         self.assertIn("never installs, repairs or allocates", result.stdout)
 
-    def run_ready_configuration(self, complete=False, forwarding_error=None):
+    def run_ready_configuration(self, complete=False, forwarding_error=None, endpoint_changes=None):
         with tempfile.TemporaryDirectory() as directory:
             cert = Path(directory) / "cert"; cert.write_text("PRIVATE-SENTINEL"); cert.chmod(0o600)
             argv = ["checker", "--endpoint", "https://incus.internal:8443", "--project", "agentor-private", "--network", "workers",
@@ -250,8 +264,10 @@ class CheckerTests(unittest.TestCase):
                         "Options": {"com.docker.network.bridge.name": "br-control"},
                         "IPAM": {"Config": [{"Subnet": "172.25.0.0/24", "Gateway": "172.25.0.1"}]}}])
                 if args[:2] == ("docker", "inspect"):
-                    return json.dumps([{"Mounts": [{"Destination": "/data", "Source": directory, "RW": True}],
-                        "NetworkSettings": {"Networks": {"control": {"IPAddress": "172.25.0.2"}},
+                    link = {"NetworkID": "a" * 64, "EndpointID": "b" * 64, "IPAddress": "172.25.0.2"}
+                    link.update(endpoint_changes or {})
+                    return json.dumps([{"State": {"Running": True}, "Mounts": [{"Destination": "/data", "Source": directory, "RW": True}],
+                        "NetworkSettings": {"Networks": {"control": link},
                         "Ports": {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "3000"}, {"HostIp": "10.25.0.1", "HostPort": "3079"}]}}}])
                 if args[:2] == ("nft", "-j"): return '{"nftables":[]}'
                 return "virtiofsd 1.13.0"
@@ -265,7 +281,7 @@ class CheckerTests(unittest.TestCase):
                  patch.object(CHECKER, "nft_source_rule"), patch.object(CHECKER, "forwarding_policy", side_effect=forwarding_error) as forward, \
                  patch.object(CHECKER.ssl, "PEM_cert_to_DER_cert", return_value=b"fake DER"), contextlib.redirect_stdout(stdout):
                 status = CHECKER.main()
-            if complete:
+            if complete and not endpoint_changes:
                 forward.assert_called_once_with("workers", "br-control", ipaddress.IPv4Network("172.25.0.0/24"),
                     ipaddress.IPv4Network("10.25.0.0/24"), "172.25.0.2", "12345678-1234-1234-1234-123456789abc")
             else: forward.assert_not_called()
@@ -276,6 +292,15 @@ class CheckerTests(unittest.TestCase):
     def test_missing_routing_stays_unknown_even_when_basic_prerequisites_pass(self):
         status, output = self.run_ready_configuration()
         self.assertEqual(status, 2); self.assertNotIn("FAIL ", output); self.assertIn("UNKNOWN routing", output); self.assertIn("NOT READY", output)
+
+    def test_real_checker_output_identifies_endpoint_failure_without_secret_output_or_firewall_repair(self):
+        for changes in ({"EndpointID": ""}, {"NetworkID": "c" * 64}, {"IPAddress": ""}):
+            status, output = self.run_ready_configuration(complete=True, endpoint_changes=changes)
+            self.assertEqual(status, 1)
+            self.assertIn("endpoint is missing or stale" if "IPAddress" not in changes else "IPv4 address is unavailable", output)
+            self.assertIn("docs/incus-recovery.md", output)
+            self.assertNotIn("Restore the exact owned source-preservation rule", output)
+            self.assertNotIn("PRIVATE-SENTINEL", output)
 
     def test_configured_topology_clears_forwarding_unknown_only_after_its_checks_pass(self):
         status, output = self.run_ready_configuration(complete=True)

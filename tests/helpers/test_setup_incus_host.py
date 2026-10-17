@@ -24,6 +24,26 @@ INSTALLATION = "12345678-1234-1234-1234-123456789abc"
 
 
 class InstallerTests(unittest.TestCase):
+    def test_context_rejects_missing_or_stale_controller_endpoint_before_any_mutation(self):
+        network = {"Id": "a" * 64, "Driver": "bridge", "Internal": False, "Options": {},
+            "IPAM": {"Config": [{"Subnet": "172.25.0.0/24", "Gateway": "172.25.0.1"}]}}
+        container = {"State": {"Running": True}, "Mounts": [{"Destination": "/data", "Source": "/srv/agentor", "RW": True, "Type": "bind"}],
+            "NetworkSettings": {"Networks": {"control": {"NetworkID": network["Id"], "EndpointID": "b" * 64, "IPAddress": "172.25.0.2"}}}}
+        for key, value in ((None, None), ("NetworkID", ""), ("NetworkID", "c" * 64), ("EndpointID", ""), ("IPAddress", ""), ("running", False)):
+            changed = copy.deepcopy(container)
+            if key == "running": changed["State"]["Running"] = value
+            elif key: changed["NetworkSettings"]["Networks"]["control"][key] = value
+            with patch.object(SETUP, "command", side_effect=[json.dumps([changed]).encode(), json.dumps([network]).encode()]) as commands, \
+                 patch.object(SETUP.SOURCES, "canonical", side_effect=lambda path: path), \
+                 patch.object(SETUP.SOURCES, "directory_identity"), patch.object(SETUP, "incus") as mutation:
+                if key is None:
+                    self.assertEqual(SETUP.docker_context("agentor-orchestrator", "control", "/srv/agentor")[-1], "172.25.0.2")
+                else:
+                    with self.assertRaisesRegex(ValueError, "endpoint|IPv4 address|not running"):
+                        SETUP.docker_context("agentor-orchestrator", "control", "/srv/agentor")
+                mutation.assert_not_called()
+                self.assertTrue(all(call.args[:2] in (("docker", "inspect"), ("docker", "network")) for call in commands.call_args_list))
+
     def config(self):
         return {"installation": INSTALLATION, "project": "owned", "network": "ag12345678", "pool": "owned-pool",
                 "dataDir": "/srv/agentor", "container": "agentor-orchestrator", "dockerNetwork": "control", "internalPort": 3079,
