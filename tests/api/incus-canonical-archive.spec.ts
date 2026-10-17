@@ -95,6 +95,32 @@ test('canonical runtime streams binary bytes, sends stdin EOF and waits for exit
   });
 });
 
+test('successful command status cannot truncate unread stdout bytes', async () => {
+  await runtimeFixture(async f => {
+    const output = await f.open(), received = collect(output);
+    let ended = false; output.once('end', () => { ended = true; });
+    f.resolve(0);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(ended).toBe(false);
+    const bytes = Buffer.alloc(128 * 1024, 255);
+    f.session.stdout.end(bytes);
+    expect(await received).toEqual(bytes);
+    expect(f.closed()).toBeGreaterThan(0);
+  });
+});
+
+test('command completion waits for buffered stdout under downstream backpressure', async () => {
+  await runtimeFixture(async f => {
+    const output = await f.open();
+    const bytes = Buffer.alloc(512 * 1024, 255);
+    f.session.stdout.end(bytes);
+    f.resolve(0);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(await collect(output)).toEqual(bytes);
+    expect(f.closed()).toBeGreaterThan(0);
+  });
+});
+
 test('canonical runtime refuses wrong native incarnation, stopped compute, foreign volume and ambiguous source device before exec', async () => {
   const mutations = [
     (f: any) => { f.instance.config['volatile.uuid'] = 'foreign'; },

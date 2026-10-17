@@ -1,3 +1,6 @@
+import type { IncusClient } from './incus-client';
+import { PassThrough } from 'node:stream';
+import { finished } from 'node:stream/promises';
 import { AGENT_CREDENTIAL_MAPPINGS } from './user-credentials';
 import { SHARED_DIRECTORY_MOUNT_POINTS } from './storage';
 
@@ -69,3 +72,28 @@ if sys.argv[1]=="agents":
 command.extend(["-cpf","-","-C",os.path.dirname(root),"--",basename])
 os.execve(command[0],command,{"PATH":"/usr/bin:/bin","LC_ALL":"C","LANG":"C"})
 `;
+
+/** Fixed canonical command and final authority proof shared by native workers
+ * and dedicated administrative capture. No guest environment is sourced. */
+export async function openIncusCanonicalArchive(client: IncusClient, name: string,
+  role: 'workspace' | 'agents' | 'managed', validate: () => Promise<void>,
+  options: { exclusions: string[]; signal?: AbortSignal }, offline = false) {
+  await validate();
+  const session = await client.execStream(name,
+    ['/usr/bin/python3', '-c', INCUS_CANONICAL_ARCHIVE_SCRIPT, role, JSON.stringify(options.exclusions), ...(offline ? ['offline'] : [])],
+    { command: [], user: 0, group: 0, cwd: '/', environment: { PATH: '/usr/bin:/bin', LC_ALL: 'C' },
+      signal: options.signal, timeoutMs: 10 * 60_000 });
+  const output = new PassThrough();
+  output.on('error', () => {});
+  output.once('close', () => session.close());
+  session.stderr.resume();
+  session.stdout.on('error', error => output.destroy(error));
+  session.stdout.pipe(output, { end: false });
+  session.stdin.end();
+  void Promise.all([session.result, finished(session.stdout, { cleanup: true })]).then(async ([code]) => {
+    if (code !== 0) throw new Error('Incus canonical archive capture failed');
+    await validate();
+    output.end();
+  }).catch(error => output.destroy(error));
+  return output;
+}

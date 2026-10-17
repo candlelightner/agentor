@@ -1,0 +1,159 @@
+import { test, expect } from '@playwright/test';
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { PassThrough, Readable } from 'node:stream';
+import { gunzipSync } from 'node:zlib';
+import type { AdministrativeWorkspaceRecord } from '../../orchestrator/server/utils/admin-workspace-store';
+import { adminNativeInstanceName } from '../../orchestrator/server/utils/admin-native-authority';
+import { administrativeNativeOverlaySha256 } from '../../orchestrator/server/utils/incus-admin-workspace-runtime';
+import { IncusAdminBackup, administrativeArchiveHelperOwner, assertAdministrativeSnapshotSettled } from '../../orchestrator/server/utils/incus-admin-backup';
+import { INCUS_CANONICAL_ARCHIVE_SCRIPT } from '../../orchestrator/server/utils/incus-canonical-archive';
+
+function fixture(group = false, id: string = randomUUID()) {
+  const stamp = new Date(0).toISOString();
+  const record: AdministrativeWorkspaceRecord = { schemaVersion: 1, id, trusted: true,
+    kind: group ? 'group-administrative' : 'administrative', status: 'stopped', runtimeKind: 'incus-vm',
+    ...(group ? { groupId: 'legacy_group', ownerId: 'owner' } : {}), createdAt: stamp, updatedAt: stamp };
+  record.nativeRuntime = { version: 1, name: adminNativeInstanceName(record), installationId: randomUUID(), nonce: randomUUID(),
+    incarnation: randomUUID(), overlayVersion: '6', overlaySha256: administrativeNativeOverlaySha256(record),
+    storageReady: true, storageInitialized: true,
+    image: { version: 1, fingerprint: '1'.repeat(64), sourceImageId: 'sha256:'+'2'.repeat(64), recipeId: '3'.repeat(64),
+      architecture: 'amd64', converterVersion: 'v0.4.0', bootstrapGeneration: '3' } };
+  const name = record.nativeRuntime.name, endpoint = 'https://incus.invalid', config: any = { incusProject: 'agentor', incusStoragePool: 'pool' };
+  const ref = (name: string) => `/1.0/instances/${name}?project=agentor`;
+  const instance: any = { name, type: 'virtual-machine', status: 'Stopped', profiles: [],
+    config: { 'volatile.uuid': record.nativeRuntime.incarnation }, devices: {} };
+  const volumes: Record<string, any> = Object.fromEntries(['workspace','agents'].map(role => [role, { name: `${name}-${role}`,
+    type: 'custom', content_type: 'filesystem', project: 'agentor', created_at: stamp,
+    config: { 'user.agentor.admin-storage-nonce': record.nativeRuntime!.nonce }, used_by: [ref(name)] }]));
+  let fresh = structuredClone(record), helperCalls = 0, execCalls = 0, closeCalls = 0;
+  let mutate: (() => void) | undefined, code = 0, helperAttached = false;
+  const runtime: any = {
+    validateAuthority: async (captured: any) => { expect(captured).toEqual(fresh); },
+    assertOwned: async () => { expect(helperAttached).toBe(false); return structuredClone(instance); },
+    storage: { inspect: async (_record: any, _identity: any, role: string) => structuredClone(volumes[role]) },
+    client: { endpoint, getInstance: async () => structuredClone(instance),
+      getCustomVolume: async (_pool: string, name: string) => structuredClone(Object.values(volumes).find((v: any) => v.name === name)),
+      execStream: async (target: string, command: string[], options: any) => {
+        execCalls++;
+        expect(target).toBe('abk-fixture');
+        expect(command.slice(0,3)).toEqual(['/usr/bin/python3','-c',INCUS_CANONICAL_ARCHIVE_SCRIPT]);
+        expect(command[5]).toBe('offline');
+        expect(JSON.parse(command[4]!)).toEqual(['/workspace/account']);
+        expect(options).toMatchObject({ user: 0, group: 0, cwd: '/', environment: { PATH: '/usr/bin:/bin', LC_ALL: 'C' } });
+        return { stdin: new PassThrough(), stdout: Readable.from([Buffer.from(command[3]!+' bytes')]), stderr: Readable.from([]),
+          result: Promise.resolve().then(() => { mutate?.(); return code; }), close() { closeCalls++; } };
+      } },
+  };
+  const helper: any = { withGuest: async (owner: any, sources: any, assertSource: any, _signal: any, capture: any) => {
+    helperCalls++;
+    expect(owner).toEqual(administrativeArchiveHelperOwner(record));
+    expect(owner.id).toMatch(/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/);
+    expect(owner.userId).toMatch(/^[a-zA-Z0-9][a-zA-Z0-9_.-]+$/);
+    expect(sources).toEqual({ workspace: volumes.workspace.name, agents: volumes.agents.name });
+    await assertSource();
+    helperAttached = true;
+    for (const volume of Object.values(volumes) as any[]) volume.used_by.push(ref('abk-fixture'));
+    try { await assertSource('abk-fixture'); return await capture('abk-fixture', async () => {}); }
+    finally {
+      helperAttached = false;
+      for (const volume of Object.values(volumes) as any[]) volume.used_by = volume.used_by.filter((r: string) => r !== ref('abk-fixture'));
+    }
+  } };
+  return { record, instance, volumes, runtime, config, backup: new IncusAdminBackup(config, runtime, helper),
+    mutate: (f: () => void) => { mutate = f; }, setFresh: (r: any) => { fresh = r; }, setCode: (n: number) => { code = n; },
+    counts: () => ({ helperCalls, execCalls, closeCalls }) };
+}
+
+for (const group of [false, true]) test(`dedicated ${group ? 'group' : 'platform'} canonical capture retains source and uses readonly helper`, async () => {
+  const f = fixture(group), directory = await mkdtemp(join(tmpdir(),'admin-backup-'));
+  try {
+    const paths = { workspace: join(directory,'workspace.gz'), agents: join(directory,'agents.gz') };
+    const before = structuredClone({ instance: f.instance, volumes: f.volumes });
+    const result = await f.backup.capture(f.record, paths, { exclusions: ['/workspace/account'] });
+    for (const role of ['workspace','agents'] as const) {
+      expect(gunzipSync(await readFile(paths[role])).toString()).toBe(role+' bytes');
+      expect(result.bytes[role]).toBeGreaterThan(0);
+    }
+    expect(result.image).toEqual(f.record.nativeRuntime!.image);
+    expect(result.overlaySha256).toBe(f.record.nativeRuntime!.overlaySha256);
+    expect({ instance: f.instance, volumes: f.volumes }).toEqual(before);
+    expect(f.counts()).toEqual({ helperCalls: 1, execCalls: 2, closeCalls: 2 });
+  } finally { await rm(directory,{recursive:true,force:true}); }
+});
+
+test('bounded historical admin IDs get stable domain-separated helper IDs without widening worker admission', () => {
+  for (const id of ['legacy_admin','A'.repeat(128)]) {
+    const platform = fixture(false,id), group = fixture(true,id);
+    const owner = administrativeArchiveHelperOwner(platform.record);
+    expect(administrativeArchiveHelperOwner(structuredClone(platform.record))).toEqual(owner);
+    expect(owner.id).not.toBe(administrativeArchiveHelperOwner(group.record).id);
+    expect(owner.id).not.toBe(id);
+    expect(owner.containerName).toBe(adminNativeInstanceName(platform.record));
+  }
+});
+
+for (const condition of ['pending','migration','uninitialized','missing-storage','missing-incarnation','invalid-kind'] as const)
+  test(`instance snapshot refuses administrative ${condition}`, () => {
+    const f = fixture();
+    if (condition === 'pending') f.record.nativeRuntime!.pending = { kind: 'create' };
+    if (condition === 'migration') f.record.nativeMigration = { version: 1, nonce: randomUUID(), phase: 'captured',
+      source: { containerId: 'a'.repeat(64), imageId: 'sha256:'+'b'.repeat(64), createdAt: new Date(0).toISOString() } };
+    if (condition === 'uninitialized') delete f.record.nativeRuntime!.storageInitialized;
+    if (condition === 'missing-storage') delete f.record.nativeRuntime!.storageReady;
+    if (condition === 'missing-incarnation') delete f.record.nativeRuntime!.incarnation;
+    if (condition === 'invalid-kind') (f.record as any).kind = 'ordinary';
+    expect(() => assertAdministrativeSnapshotSettled(f.record)).toThrow();
+  });
+
+test('settled legacy administrative records remain compatible', () => {
+  const f = fixture(); delete f.record.runtimeKind; delete f.record.nativeRuntime;
+  expect(() => assertAdministrativeSnapshotSettled(f.record)).not.toThrow();
+});
+
+for (const condition of ['running-intent','running-compute','missing-volume','foreign-project','unbound-reference','missing-created-time'] as const)
+  test(`capture refuses ${condition} before helper creation`, async () => {
+    const f = fixture();
+    if (condition === 'running-intent') f.record.status = 'running';
+    if (condition === 'running-compute') f.instance.status = 'Running';
+    if (condition === 'missing-volume') delete f.volumes.workspace;
+    if (condition === 'foreign-project') f.volumes.workspace.project = 'other';
+    if (condition === 'unbound-reference') f.volumes.workspace.used_by = [];
+    if (condition === 'missing-created-time') delete f.volumes.workspace.created_at;
+    f.setFresh(structuredClone(f.record));
+    await expect(f.backup.capture(f.record, { workspace: '/unused' }, { exclusions: [] })).rejects.toThrow();
+    expect(f.counts().helperCalls).toBe(0);
+  });
+
+for (const condition of ['record-replaced','vm-replaced','volume-replaced','foreign-reference','duplicate-reference','device-drift','exec-failure'] as const)
+  test(`capture rejects ${condition} at final authority proof and closes stream`, async () => {
+    const f = fixture(), directory = await mkdtemp(join(tmpdir(),'admin-backup-drift-'));
+    try {
+      f.mutate(() => {
+        if (condition === 'record-replaced') f.setFresh({ ...f.record, status: 'running' });
+        if (condition === 'vm-replaced') f.instance.config['volatile.uuid'] = randomUUID();
+        if (condition === 'volume-replaced') f.volumes.workspace.created_at = new Date(1000).toISOString();
+        if (condition === 'foreign-reference') f.volumes.workspace.used_by.push('https://foreign.invalid/1.0/instances/same?project=agentor');
+        if (condition === 'duplicate-reference') f.volumes.workspace.used_by.push(f.volumes.workspace.used_by[0]);
+        if (condition === 'device-drift') f.instance.devices.extra = { type: 'disk', path: '/host' };
+      });
+      if (condition === 'exec-failure') f.setCode(1);
+      await expect(f.backup.capture(f.record, { workspace: join(directory,'archive.gz') }, { exclusions: ['/workspace/account'] })).rejects.toThrow();
+      expect(f.counts().closeCalls).toBe(1);
+    } finally { await rm(directory,{recursive:true,force:true}); }
+  });
+
+test('cancelled capture does not allocate helper or execute commands', async () => {
+  const f = fixture(), controller = new AbortController(); controller.abort();
+  await expect(f.backup.capture(f.record, { workspace: '/unused' }, { exclusions: [], signal: controller.signal })).rejects.toThrow();
+  expect(f.counts()).toEqual({ helperCalls: 0, execCalls: 0, closeCalls: 0 });
+});
+
+test('ambiguous archive output roles fail before source inspection', async () => {
+  const f = fixture();
+  for (const outputs of [{}, { workspace: '/same', agents: '/same' }, { workspace: '' }, { docker: '/unused' }])
+    await expect(f.backup.capture(f.record, outputs, { exclusions: [] })).rejects.toThrow();
+  expect(f.counts().helperCalls).toBe(0);
+});

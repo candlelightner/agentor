@@ -51,6 +51,7 @@ import {
 } from "./instance-backup-types";
 import { getAuthDb } from "./auth";
 import { administrativeWorkspaceResourceNames } from "./admin-workspace-runtime";
+import { assertAdministrativeSnapshotSettled } from "./incus-admin-backup";
 import { sanitizeBackupPathTarGzip } from "./worker-export";
 import { useConfig, useLogger } from "./services";
 import {
@@ -1593,6 +1594,7 @@ export class InstanceBackupManager {
     }
     const admin = adminStoreModule.useAdminWorkspaceStore().getRecord();
     if (admin) {
+      assertAdministrativeSnapshotSettled(admin);
       const names = administrativeWorkspaceResourceNames(admin);
       add({ name: names.workspaceVolume, kind: "admin-workspace" });
       add({ name: names.agentsVolume, kind: "admin-agent-data" });
@@ -1600,6 +1602,7 @@ export class InstanceBackupManager {
     for (const group of services.useWorkerGroupStore().list()) {
       const record = group.adminWorkspace as any;
       if (!record) continue;
+      assertAdministrativeSnapshotSettled(record);
       const names = administrativeWorkspaceResourceNames(record);
       add({ name: names.workspaceVolume, kind: "admin-workspace", ownerId: group.userId, groupId: group.id });
       add({ name: names.agentsVolume, kind: "admin-agent-data", ownerId: group.userId, groupId: group.id });
@@ -1696,6 +1699,9 @@ export class InstanceBackupManager {
       throw Object.assign(new Error('Resolve incomplete worker migration before whole-instance backup'),
         { statusCode: 409, code: 'WORKER_MIGRATION_RECOVERY_REQUIRED' });
     const admin = adminStoreModule.useAdminWorkspaceStore().getRecord();
+    if (admin) assertAdministrativeSnapshotSettled(admin);
+    for (const group of services.useWorkerGroupStore().list())
+      if (group.adminWorkspace) assertAdministrativeSnapshotSettled(group.adminWorkspace);
     const activeGroupAdmins = services
       .useWorkerGroupStore()
       .list()

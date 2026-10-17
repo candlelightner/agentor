@@ -68,3 +68,18 @@ test('real default instance producer preflight rejects active managed and every 
     } finally { await f.cleanup(); }
   }
 });
+
+for (const scope of ['platform', 'group']) test(`default preflight fences pending ${scope} administrative VM recovery`, async () => {
+  const f = await fixture();
+  try {
+    const record = { schemaVersion: 1, id: 'admin-id', trusted: true, kind: scope === 'platform' ? 'administrative' : 'group-administrative',
+      ...(scope === 'group' ? { ownerId: 'owner', groupId: 'group' } : {}),
+      status: 'stopped', runtimeKind: 'incus-vm', nativeMigration: { version: 1,
+        nonce: '11111111-1111-1111-1111-111111111111', phase: 'captured',
+        source: { containerId: 'a'.repeat(64), imageId: 'sha256:'+'b'.repeat(64), createdAt: new Date(0).toISOString() } } };
+    if (scope === 'platform') f.patch(useAdminWorkspaceStore(), 'getRecord', () => record);
+    else f.patch(useWorkerGroupStore(), 'list', () => [{ adminWorkspace: record }]);
+    await expect(f.preflight()).rejects.toThrow('Resolve administrative VM migration or lifecycle recovery');
+    expect(f.calls).toEqual([]);
+  } finally { await f.cleanup(); }
+});
