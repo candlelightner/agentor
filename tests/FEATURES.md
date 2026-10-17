@@ -2,6 +2,8 @@
 
 Every user-facing feature of the Agentor web dashboard, organized by category. This document drives the Playwright test suite — every item below must have test coverage.
 
+Explicit Incus migration normalizes eligible legacy backup-directory volume names only on fresh native copies. Exact historical source names/records remain capture, rollback and finalization authority. Native device admission remains strict; protected parents such as `/home/agent/.local/share` are refused before source stop/capture. Historical-shape live acceptance remains pending.
+
 Bounded Phase 8 interrupted-recreation recovery rolls back under the existing owner→worker fences before normal convergence. Verified original compute is retained stopped; replacement compute is removed only with installation/owner/worker/UUID and operation-nonce proof. Absent compute requires verified canonical storage and immutable source metadata. Unavailable or contradictory facts retain the recovery marker. Store-queue compare-and-merge preserves pending edits and revoked access; rollback never promotes desired secrets or deletes persistent volumes. Full Phase 8 and later parity gates remain open.
 
 Explicit Incus recovery and automatic missing-compute recreation reuse the nonce/UUID-fenced replacement path with applied bootstrap, not pending desired settings. Automatic recovery requires authoritative instance lookup404, existing canonical volumes and retained immutable source. Applied Docker capability requires its existing Docker volume even when desired settings disable Docker. Missing bootstrap/data, revoked access, unavailable or foreign compute and stopped intent fail closed; recovery does not promote configuration.

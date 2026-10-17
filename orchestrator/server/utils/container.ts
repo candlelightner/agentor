@@ -56,6 +56,7 @@ import type { PreparedPortableManagedVolumeImport } from "./portable-managed-vol
 import type { PortableManagedVolumeImportJournal } from "./portable-managed-volume-journal";
 import type { PortableManagedVolumeEntry } from './portable-managed-volume-format';
 import { pathsOverlap, type ManagedVolumeStore, type StoredManagedVolume } from './managed-volume-store';
+import { prepareLegacyManagedMigration } from './legacy-incus-managed-migration';
 import {
   readPortablePluginConfiguration,
   rollbackRestoredWorkerPlugins,
@@ -743,6 +744,7 @@ export class ContainerManager {
           v.operation && v.operation.stage !== 'complete' || v.state !== (v.attached ? 'ready' : 'detached') ||
           v.storageRuntimeKind === 'incus-vm'))
         throw Object.assign(new Error('Settle managed storage before migration; all source data was retained'), { statusCode: 409 });
+      const nativeManaged = prepareLegacyManagedMigration(record, sourceManaged);
       const client = new Docker({ socketPath: '/var/run/docker.sock' });
       const inspect = () => withOperationDeadline(signal => client.getContainer(original.containerId).inspect({ abortSignal: signal }),
         15_000, 'Legacy migration source inspection');
@@ -818,8 +820,6 @@ export class ContainerManager {
       }, sourceVolumes, sourceDirectories };
       const baseline = (value: WorkerRecord) => { const { incusMigration, updatedAt, ...rest } = value; return rest; };
       let stopped = false, creationAttempted = false, incarnation: string | undefined, cutover = false;
-      const nativeManaged = sourceManaged.map(({ operation: _completedSourceHistory, ...v }) =>
-        ({ ...v, storageRuntimeKind: 'incus-vm' as const, seeded: false, state: 'pending' as StoredManagedVolume['state'] }));
       const native: ContainerInfo = { ...original, runtimeKind: 'incus-vm', status: 'creating',
         importedImage: undefined, runtimeDiagnostic: undefined };
       const validate = async () => {

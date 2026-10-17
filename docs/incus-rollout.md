@@ -121,6 +121,25 @@ An ambiguous interruption fails closed and retains both sides for explicit
 administrator recovery; never clear its marker or replay an unknown operation
 based only on a missing instance or expired Incus operation record.
 
+Explicit migration translates eligible historical `legacy-backup-path` records
+into fresh native `persistent-path` copies named `agentor-persist-<volume UUID>`.
+The historical Docker name must exactly match the worker/path-derived name.
+Source records, Docker volume names and completed operation history remain
+unchanged for capture, source revalidation and rollback; retained-source receipts
+continue to name the original Docker volumes. Attached and detached copies retain
+their identity and target. No ordinary Incus lifecycle operation accepts a legacy
+name, and finalization never uses the new native name as Docker deletion authority.
+
+Native protected-target checks run before source inspection, stop or capture.
+In particular a historical `/home/agent/.local/share` selection (as observed on
+METOD) overlaps the protected account Kilo path and remains unsupported. Migration
+refuses it while keeping the worker and all Docker data. An explicitly reviewed
+split into safe child directories or another preservation plan is required; do
+not bypass the protected target or silently drop the old mount. The normalization
+change has isolated admission, typed-rejection rollback, retention/finalization,
+store, device and backup/export regression coverage. A real migration with these
+historical records remains an operator acceptance step.
+
 Canonical restore allows up to 120 seconds for the isolated VM to shut down
 gracefully and flush its restored filesystems before operational devices are
 attached. A failed shutdown does not authorize promotion or a forced power-off.

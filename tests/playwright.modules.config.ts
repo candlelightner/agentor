@@ -57,6 +57,7 @@ export default defineConfig({
     "api/legacy-incus-migration-capture-live.spec.ts",
     "api/legacy-incus-migration-capture.spec.ts",
     "api/legacy-incus-migration-admission.spec.ts",
+    "api/legacy-incus-managed-migration.spec.ts",
     "api/legacy-incus-migration-finalize.spec.ts",
     "api/worker-incus-migration-service.spec.ts",
     "api/legacy-incus-migration-public-live.spec.ts",

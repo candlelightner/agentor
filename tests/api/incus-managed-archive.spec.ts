@@ -14,10 +14,12 @@ import { useConfig, useWorkerStore } from '../../orchestrator/server/utils/servi
 import type { Config } from '../../orchestrator/server/utils/config';
 import type { IncusClient, IncusInstance, IncusCustomVolume } from '../../orchestrator/server/utils/incus-client';
 import type { StoredManagedVolume } from '../../orchestrator/server/utils/managed-volume-store';
+import { prepareLegacyManagedMigration } from '../../orchestrator/server/utils/legacy-incus-managed-migration';
+import { persistentPathVolumeName } from '../../orchestrator/server/utils/persistent-backup-paths';
 
 type State = 'running' | 'stopped' | 'archived';
 
-async function fixture(state: State, run: (f: any) => Promise<void>) {
+async function fixture(state: State, run: (f: any) => Promise<void>, migratedLegacy = false) {
   const dataDir = await mkdtemp(join(tmpdir(), 'incus-managed-archive-'));
   const installation = await backupInstallationId(dataDir), workerId = randomUUID(), incarnation = randomUUID();
   const config = { dataDir, containerPrefix: 'worker', incusStoragePool: 'pool', incusProject: 'agentor',
@@ -27,6 +29,12 @@ async function fixture(state: State, run: (f: any) => Promise<void>) {
     seeded: true, state: 'ready', storageRuntimeKind: 'incus-vm', dockerName: '',
     createdAt: '2026-10-05T12:00:00.000Z', updatedAt: '2026-10-05T12:00:00.000Z' };
   record.dockerName = 'agentor-persist-' + record.id;
+  if (migratedLegacy) {
+    const source = { ...record, purpose: 'legacy-backup-path' as const, storageRuntimeKind: 'legacy-docker' as const,
+      dockerName: persistentPathVolumeName(record.workerId, record.target) };
+    Object.assign(record, prepareLegacyManagedMigration({ id: workerId, userId: record.userId }, [source])[0],
+      { seeded: true, state: 'ready' });
+  }
   const name = 'worker-' + workerId, reference = (instance: string) => `/1.0/instances/${instance}?project=agentor`;
   const volume = { name: record.dockerName, project: 'agentor', type: 'custom', content_type: 'filesystem',
     created_at: '2026-10-05T12:00:00Z', used_by: state === 'archived' ? [] : [reference(name)],
@@ -95,6 +103,17 @@ test('running, stopped and archived managed capture preserves raw bytes using on
     expect(exec[3]).toMatchObject({ user: 0, group: 0, cwd: '/', timeoutMs: 600_000 });
     expect(f.control.cleanupValidated).toBe(true); expect(f.control.proofs).toBeGreaterThan(4);
   });
+});
+
+test('normalized legacy selection retains native managed archive compatibility across running stopped and archived workers', async () => {
+  for (const state of ['running', 'stopped', 'archived'] as State[]) await fixture(state, async f => {
+    expect(f.record.purpose).toBe('persistent-path');
+    expect(f.record.dockerName).toBe('agentor-persist-' + f.record.id);
+    expect(await f.capture()).toBe(f.binary.length);
+    expect(await readFile(f.archivePath)).toEqual(f.binary);
+    expect(f.calls.find((call: any) => call[0] === 'helper')[2]).toEqual({ managed: f.record.dockerName });
+    expect(f.control.cleanupValidated).toBe(true);
+  }, true);
 });
 
 test('settled detached and deleted-owner managed data captures without source attachment or record invention', async () => {
