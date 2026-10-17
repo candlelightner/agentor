@@ -21,7 +21,7 @@ const cookie = 'private-cookie=PRIVATE-CANARY-SESSION';
 type Worker = { id: string; userId: string; runtimeKind: string; containerId: string; containerName: string; environmentId: string };
 type PacketSpec = { nonce: string; destinationMac: string; cases: Array<{ label: string; family: number; source: string; target: string; mac: string }> };
 function fixture(options: { admin?: boolean; unknownCreate?: boolean; foreignCleanup?: boolean; readiness?: boolean; abort?: AbortController;
-  httpTarget?: string; guestGateway?: string; route?: unknown; brokenManualControl?: boolean; admittedSpoof?: string; ipv6?: boolean; activeDockerWhenDisabled?: boolean } = {}) {
+  httpTarget?: string; guestGateway?: string; route?: unknown; brokenManualControl?: boolean; admittedSpoof?: string; ipv6?: boolean; activeDockerWhenDisabled?: boolean; brokenSharedExecution?: boolean } = {}) {
   const workers: Worker[] = [], environments: Array<{ id: string; userId: string; createdAt: string; dockerEnabled: boolean }> = [];
   const calls: Array<{ path: string; method: string; body?: unknown; authenticated: boolean }> = [], commands: string[] = [], removed: string[] = [];
   let count = 0, closed = false, restarted = false, marker = '';
@@ -88,6 +88,8 @@ function fixture(options: { admin?: boolean; unknownCreate?: boolean; foreignCle
         const worker = workers.find(item => item.containerName === name)!; const command = argv.at(-1)!; commands.push(command);
         if (options.activeDockerWhenDisabled && command === 'if systemctl is-active --quiet docker.service; then exit 1; fi')
           return { returnCode: 1, stdout: '', stderr: '' };
+        if (options.brokenSharedExecution && command.includes('incus-canary-exec-'))
+          return { returnCode: 14, stdout: '', stderr: 'PRIVATE-GUEST-DETAILS' };
         if (command.includes('>/workspace/incus-canary')) marker = command.match(/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}/)![0];
         let stdout = '';
         const packet = command.match(/ send '(\{.*\})' '([a-z0-9-]+)'$/s);
@@ -134,8 +136,17 @@ test('actual canary orchestration completes the stubbed native flow and deletes 
   expect(f.commands.some(command => command.endsWith("'mac-denied'"))).toBe(true);
   expect(f.commands.some(command => command.includes('test "$code" = 28'))).toBe(false); expect(f.observerClosed()).toBe(true);
   expect(f.commands.some(command => command.includes('docker info'))).toBe(true);
+  expect(f.commands.filter(command => command.includes('incus-canary-exec-'))).toHaveLength(3);
   expect(f.calls.filter(call => call.method === 'POST' && call.path === '/api/environments').map(call => (call.body as { dockerEnabled: boolean }).dockerEnabled)).toEqual([true, false]);
   expect(f.commands.join('\n')).not.toContain(cookie); expect(JSON.stringify(result)).not.toContain('PRIVATE-');
+});
+
+test('shared-volume executable failures fail the canary before persistence and retain its workers', async () => {
+  const f = fixture({ brokenSharedExecution: true });
+  const result = await canary.runIncusCanary({ sessionCookie: cookie }, f.dependencies);
+  expect(result.status).toBe('failed'); expect(result.stage).toBe('shared-volume-execution');
+  expect(result.retained).toBe(true); expect(result.workers).toHaveLength(2);
+  expect(f.removed).toEqual([]); expect(JSON.stringify(result)).not.toContain('PRIVATE-');
 });
 
 test('Docker active in a disabled-capability worker fails the canary and retains captured resources', async () => {

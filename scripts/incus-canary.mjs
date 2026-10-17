@@ -308,6 +308,13 @@ export async function runIncusCanary(rawInput, dependencies, signal = new AbortC
       await fence(victim);
     } finally { observer.close(); }
     await self(attacker); await self(victim);
+    stage = 'shared-volume-execution';
+    const executableProbe = 'for directory in /workspace /home/agent/.agent-data; do ' +
+      'probe="$directory/incus-canary-exec-' + nonce + '"; ' +
+      'install -o agent -g agent -m 755 /usr/bin/true "$probe"; runuser -u agent -- "$probe"; ' +
+      'printf "#!/bin/sh\\nexit 0\\n" >"$probe.sh"; chown agent:agent "$probe.sh"; chmod 755 "$probe.sh"; ' +
+      'runuser -u agent -- "$probe.sh"; done';
+    for (const worker of workers) await checked(worker, executableProbe);
     stage = 'persistence';
     await checked(victim, 'printf ' + quote(nonce) + ' >/workspace/incus-canary; printf ' + quote(nonce) + ' >/home/agent/.agent-data/incus-canary');
     if (input.dockerEnabled) await checked(victim, 'test "$(docker info --format "{{.Driver}}")" = overlay2; docker pull busybox:1.37.0; ' +
@@ -316,6 +323,7 @@ export async function runIncusCanary(rawInput, dependencies, signal = new AbortC
     await fence(victim); requireFact((await api('/api/containers/' + victim.id + '/restart', {})).status === 200, 'START_UNACKNOWLEDGED');
     await checked(victim, 'test "$(cat /workspace/incus-canary)" = ' + quote(nonce) + '; test "$(cat /home/agent/.agent-data/incus-canary)" = ' + quote(nonce) +
       '; systemctl is-active --quiet agentor-worker; test -f /run/agentor/provisioned'); await self(victim);
+    await checked(victim, executableProbe);
     if (input.dockerEnabled) requireFact(await checked(victim, 'docker run --rm -v incus-canary:/data busybox:1.37.0 cat /data/proof') === nonce, 'DOCKER_PERSISTENCE_FAILED');
     stage = 'cleanup';
     for (const worker of [...workers].reverse()) {

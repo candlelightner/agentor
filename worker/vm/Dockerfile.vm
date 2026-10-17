@@ -3,10 +3,12 @@ FROM ${BASE_IMAGE}
 USER root
 COPY --from=worker-source entrypoint.sh /home/agent/entrypoint.sh
 
+# Ubuntu 24.04 GA 6.8 fails execve on cache=never virtiofs mounts (EFAULT).
+# Use the supported HWE virtual kernel so workspace and agent-data executables run.
 # Install Linux kernel, systemd init, bootloader, netplan, and core networking
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get -y install --no-install-recommends \
-    linux-image-virtual \
+    linux-image-virtual-hwe-24.04 \
     initramfs-tools \
     systemd-sysv \
     systemd \
