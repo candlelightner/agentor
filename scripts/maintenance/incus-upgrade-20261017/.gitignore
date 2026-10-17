@@ -6,6 +6,7 @@
 !/restore-worker-home.py
 !/test_restore_worker_home.py
 !/worker-init-prefix.sh
+!/vm-memory-policy.json
 !/dockerignore-canary.patch
 !/maintenance/
 /maintenance/*

@@ -40,3 +40,8 @@ validation is covered by `python3 -m unittest test_restore_worker_home.py`.
 `worker-init-prefix.sh` is prepended to the original private init script through
 the worker settings API. Its enable file is created only after migration commits;
 the operator then runs restoration to completion before restoring stopped intent.
+
+`vm-memory-policy.json` records the explicit allocation for previously uncapped
+VM workers. Apply it through the environment APIs, preserve other settings and
+existing caps, and clone shared environments to leave retained Docker workers
+unchanged. An existing VM needs a supported rebuild to apply the new allocation.
