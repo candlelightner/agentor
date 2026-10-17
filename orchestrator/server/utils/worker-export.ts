@@ -22,6 +22,7 @@ import {
 } from './portable-managed-volume-format';
 import { MAX_PORTABLE_MANAGED_VOLUME_COMPRESSED_PAYLOAD_BYTES } from './portable-managed-volume-archive';
 import { parseWorkerBackupRuntime, type WorkerBackupRuntime } from './worker-backup-runtime';
+import { compressBackupStream, type BackupCompressionOptions } from './backup-compression';
 
 /** Bumped when the bundle layout changes incompatibly. */
 export const WORKER_EXPORT_VERSION = 5;
@@ -414,9 +415,40 @@ export async function sanitizeBackupPathTarPayload(
   selectedPath: string,
   signal?: AbortSignal,
 ): Promise<{ omittedSpecialEntries: number }> {
+  return sanitizeBackupPathTar(source, destination, selectedPath, signal);
+}
+
+/** Same sanitizer and archive contract, without raw/sanitized TAR staging. */
+export async function sanitizeBackupPathTarGzip(input: {
+  source: Readable;
+  destination: string;
+  selectedPath: string;
+  signal?: AbortSignal;
+  onBytes?: (uncompressedBytes: number) => void;
+  compression?: Omit<BackupCompressionOptions, 'signal'>;
+}): Promise<{ omittedSpecialEntries: number }> {
+  try {
+    return await sanitizeBackupPathTar(input.source, input.destination, input.selectedPath,
+      input.signal, { ...input.compression, signal: input.signal }, input.onBytes);
+  } catch (error) {
+    input.source.destroy();
+    throw error;
+  }
+}
+
+async function sanitizeBackupPathTar(
+  source: string | Readable,
+  destination: string,
+  selectedPath: string,
+  signal?: AbortSignal,
+  compression?: BackupCompressionOptions,
+  onBytes?: (uncompressedBytes: number) => void,
+): Promise<{ omittedSpecialEntries: number }> {
   if (!safeAbsoluteBackupPath(selectedPath))
     throw new Error("Invalid selected backup path");
   signal?.throwIfAborted();
+  const controller = new AbortController();
+  const operationSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
   let expandedBytes = 0;
   let entries = 0;
   let omittedSpecialEntries = 0;
@@ -428,6 +460,7 @@ export async function sanitizeBackupPathTarPayload(
   const counter = new Transform({
     transform(chunk, _encoding, callback) {
       expandedBytes += Buffer.byteLength(chunk);
+      try { onBytes?.(expandedBytes); } catch (error) { callback(error as Error); return; }
       callback(
         expandedBytes > MAX_INNER_ARCHIVE_BYTES
           ? new Error("Invalid backup path archive: expanded archive exceeds the size limit")
@@ -440,13 +473,14 @@ export async function sanitizeBackupPathTarPayload(
   const fail = (error: unknown) => {
     if (failed) return;
     failed = error instanceof Error ? error : new Error(String(error));
-    // The pipeline that observed the original error will reject. Destroy the
-    // peer streams without re-emitting that error: tar-stream can otherwise
-    // surface a second unhandled error from a nested `next()` callback.
+    // Keep the original validation error while aborting both pipelines.
+    // Every nested entry has an error listener before cancellation can fire.
+    controller.abort();
     extract.destroy();
     pack.destroy();
   };
   extract.on("entry", (header, stream, next) => {
+    stream.on("error", fail);
     entries += 1;
     try {
       if (entries > MAX_INNER_ARCHIVE_ENTRIES)
@@ -507,7 +541,6 @@ export async function sanitizeBackupPathTarPayload(
         if (error) fail(error);
         next(error || undefined);
       });
-      stream.on("error", fail);
       entry.on("error", fail);
       stream.pipe(entry);
     } catch (error) {
@@ -518,12 +551,17 @@ export async function sanitizeBackupPathTarPayload(
   extract.on("finish", () => pack.finalize());
   extract.on("error", fail);
   pack.on("error", fail);
+  const operations = [
+    pipeline(typeof source === 'string' ? createReadStream(source) : source, counter, extract, { signal: operationSignal }),
+    compression ? compressBackupStream(pack, destination, { ...compression, signal: operationSignal })
+      : pipeline(pack, createWriteStream(destination, { mode: 0o600 }), { signal: operationSignal }),
+  ];
   try {
-    await Promise.all([
-      pipeline(createReadStream(source), counter, extract, { signal }),
-      pipeline(pack, createWriteStream(destination, { mode: 0o600 }), { signal }),
-    ]);
+    await Promise.all(operations);
   } catch (error) {
+    fail(error);
+    // Stop peers and await compressor exit before helper or scratch cleanup.
+    await Promise.allSettled(operations);
     throw failed ?? error;
   }
   return { omittedSpecialEntries };

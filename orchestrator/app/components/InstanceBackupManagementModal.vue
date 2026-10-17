@@ -566,6 +566,11 @@ const statusClass = (status: string) => {
                 <span class="text-xs">{{ job.progress }}% · {{ size(job.bytesProcessed) }}</span>
               </div>
               <progress class="mt-2 w-full" max="100" :value="job.progress" />
+              <div v-if="job.volumeProgress" class="mt-2 text-xs text-gray-500" data-testid="instance-volume-progress">
+                <p>Volume {{ job.volumeProgress.index }} of {{ job.volumeProgress.count }}: {{ job.volumeProgress.name }} · sanitizing and compressing</p>
+                <p>{{ size(job.volumeProgress.uncompressedBytes) }} uncompressed input · expected size unknown ·
+                  {{ job.volumeProgress.bytesPerSecond === null ? 'throughput unavailable' : size(job.volumeProgress.bytesPerSecond) + '/s' }} · percentage unknown · ETA unknown</p>
+              </div>
               <p v-if="job.error" class="mt-1 text-xs text-red-700 dark:text-red-300">
                 <code v-if="job.errorCode">{{ job.errorCode }}</code> {{ job.error }}
               </p>

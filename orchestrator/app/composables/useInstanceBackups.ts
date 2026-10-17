@@ -101,6 +101,11 @@ export interface InstanceBackupJob {
   phase: string;
   progress: number;
   bytesProcessed: number;
+  volumeProgress?: {
+    name: string; index: number; count: number; phase: "sanitizing-compressing";
+    uncompressedBytes: number; expectedBytes: null; bytesPerSecond: number | null;
+    percentage: null; etaSeconds: null;
+  };
   createdAt: string;
   updatedAt: string;
   durationMs?: number;

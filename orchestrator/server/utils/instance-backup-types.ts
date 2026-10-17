@@ -144,6 +144,18 @@ export interface InstanceBackupJob {
   restoreHelper?: { containerId: string; imageId: string };
 }
 
+export interface InstanceBackupVolumeProgress {
+  name: string;
+  index: number;
+  count: number;
+  phase: "sanitizing-compressing";
+  uncompressedBytes: number;
+  expectedBytes: null;
+  bytesPerSecond: number | null;
+  percentage: null;
+  etaSeconds: null;
+}
+
 /** Safe job shape returned through GUI/API/MCP status surfaces. Detailed log
  * lines are available only from the bounded incremental log operation. */
 export type PublicInstanceBackupJob = Omit<
@@ -151,6 +163,8 @@ export type PublicInstanceBackupJob = Omit<
   "logs" | "pendingProviderObjectId" | "pendingProviderUploadId" | "restoreHelper"
 > & {
   logLineCount: number;
+  /** Live-only telemetry; never replayed as durable recovery authority. */
+  volumeProgress?: InstanceBackupVolumeProgress;
 };
 
 export interface InstanceBackupArtifact {

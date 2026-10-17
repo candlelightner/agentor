@@ -283,3 +283,10 @@ artifacts, and remote discovery records live in the additive
 `<DATA_DIR>/admin/instance-backups.v1.json` store. The store and retained
 encrypted artifacts are deliberately preserved across the control-plane swap
 so the terminal restore outcome remains inspectable after restart.
+
+
+### Volume compression, staging and progress
+
+Docker volume capture streams the existing sanitizer directly into standard level-6 gzip, using the runtime image's pigz with at most four compression workers and a Node gzip fallback when absent. It stages no uncompressed Docker volume TAR copies. Native archive codecs retain their existing byte-preserving behavior. Partial compressed files and compressor processes are cleaned on failure/cancellation; nested archive validation and encryption still precede artifact publication.
+
+The job display labels uncompressed per-volume bytes and observed input throughput separately from other transfer counters. Recursive input size is unavailable from Docker's archive response, so volume percentage and ETA remain explicitly unknown. See [the reproducible compression/staging benchmark and acceptance limits](backup-compression-benchmark.md).
