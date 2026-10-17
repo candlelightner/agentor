@@ -1353,3 +1353,7 @@ The session-authenticated `/api/port-mappings`, `/api/domain-mappings`, and `/ap
 Native whole-instance live acceptance gates now require a root-private, nofollow, bounded fresh system-VM fixture receipt matching the current boot, machine and kernel nonce. Local capture/preflight/inverse configuration comes only from its exact private context; historical endpoint/TLS/image and host-helper fallbacks are removed. The historical remote SSH/SCP helper gate fails explicitly before transport even with a receipt, retaining its assertions pending safe transport refactoring. Unenabled live gates remain skipped; real native DR acceptance remains unverified.
 
 The default Playwright global setup rejects any enabled native DR gate before creating an HTTP request context, setup/admin probes or authentication; it directs callers to the module configuration with the private receipt guard. Ordinary non-native setup is unchanged.
+
+### Backup acceptance environment boundary
+
+- The combined backup launcher preserves the complete workspace and whole-instance API/UI suites, but explicit execution fails before any Docker/Git/resource operation while outer device isolation remains unverified. Its standalone plan forbids privileged mode, added capabilities, device mappings/rules, host namespace/socket/cgroup/device binds, and external/device-backed volumes. This is a safety stop, not completed end-to-end acceptance or a functioning cap-drop-all DinD implementation; see `docs/backup-integration-acceptance.md`.

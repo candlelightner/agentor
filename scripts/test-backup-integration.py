@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Plan (default) or run backup acceptance in a fresh private DinD namespace.
+"""Plan backup acceptance; execution is blocked pending a safe runner.
 
-Only a committed git archive is mounted. No checkout .env, keys, volumes,
-Docker socket, credentials, or published ports enter the outer runner.
+Rootful DinD on the production host has no validated device-isolation boundary.
+--execute fails before any subprocess, resource creation, or cleanup. The full
+workspace and instance suites remain in the plan for a future reviewed runner.
 """
 import argparse
 from contextlib import contextmanager
@@ -10,11 +11,11 @@ import os
 import json
 import pathlib
 import re
-import shutil
 import subprocess
 import tarfile
 import tempfile
 import uuid
+import sys
 
 SUITES = {
     "workspace": ["api/backups.spec.ts", "api/instance-backups-api.spec.ts",
@@ -24,6 +25,66 @@ SUITES = {
 }
 
 
+BLOCK_CODE = "BACKUP_RUNNER_DEVICE_ISOLATION_UNVERIFIED"
+BLOCK_REASON = (
+    "Rootful nested Docker has no validated outer device-isolation boundary. "
+    "Privileged runners expose host devices; SYS_ADMIN/BPF and writable cgroup "
+    "delegation require a separate isolation design. No Docker operation was run. "
+    "See docs/backup-integration-acceptance.md."
+)
+
+
+def validate_outer_service(service, source, volumes):
+    """Reject unsafe generated/resolved outer services without contacting Docker.
+
+    This is a configuration check, not proof of kernel/device-cgroup isolation.
+    In particular it cannot authorize execution or enable any added capability.
+    """
+    if not isinstance(service, dict) or service.get("privileged") is not False:
+        raise ValueError("Outer runner must explicitly disable privileged mode")
+    if service.get("cgroup") != "private" or service.get("ipc") != "private":
+        raise ValueError("Outer cgroup and IPC namespaces must be private")
+    allowed = {"build", "image", "container_name", "privileged", "cgroup", "ipc", "cap_drop",
+               "security_opt", "shm_size", "volumes", "environment"}
+    if set(service) - allowed:
+        raise ValueError("Outer runner has unsupported configuration fields")
+    name = service.get("container_name", "")
+    if not re.fullmatch(r"agentor-backup-[a-z0-9][a-z0-9-]{1,30}-runner", name):
+        raise ValueError("Outer runner requires its exact isolated name")
+    prefix = name.removesuffix("-runner")
+    if service.get("image") != "agentor-test-runner:" + prefix:
+        raise ValueError("Outer runner requires an isolated image tag")
+    if service.get("build") != str(pathlib.Path(source) / "tests/docker"):
+        raise ValueError("Outer runner build must use only the tracked snapshot")
+    # Omitting PID/network/UTS modes retains private defaults. The allowlist also
+    # forbids devices, device-cgroup rules, host binds outside the exact mounts,
+    # added capabilities, namespace sharing, hooks and alternate runtimes.
+    if service.get("cap_drop") != ["ALL"] or service.get("security_opt") != ["no-new-privileges:true"]:
+        raise ValueError("Outer runner must retain the blocked plan's capability/security limits")
+    expected = source_mounts(source) + [
+        "test-runner-docker:/var/lib/docker",
+        "orchestrator-test-node-modules:/work/node_modules",
+        "backup-test-node-modules:/work/tests/node_modules",
+    ]
+    if service.get("volumes") != expected:
+        raise ValueError("Outer runner accepts only the exact tracked snapshot and fresh volumes")
+    if set(volumes) != {"test-runner-docker", "orchestrator-test-node-modules", "backup-test-node-modules"}:
+        raise ValueError("Unexpected outer volume declaration")
+    for key, suffix in (("test-runner-docker", "docker"),
+                        ("orchestrator-test-node-modules", "orchestrator-deps"),
+                        ("backup-test-node-modules", "test-deps")):
+        if volumes[key] != {"name": prefix + "-" + suffix}:
+            raise ValueError("Outer volumes must have exact isolated names and no driver options")
+
+
+def source_mounts(source):
+    return [str(pathlib.Path(source) / path) + ":" + target for path, target in [
+        ("orchestrator", "/src/orchestrator:ro"), ("orchestrator", "/work/orchestrator:ro"),
+        ("worker", "/src/worker:ro"), ("scripts", "/src/scripts:ro"),
+        (".dockerignore", "/src/.dockerignore:ro"), ("tests", "/work/tests"),
+    ]]
+
+
 def plan(suite, run_id, source):
     if suite not in SUITES or not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,30}", run_id):
         raise ValueError("Invalid suite or isolated run ID")
@@ -31,20 +92,29 @@ def plan(suite, run_id, source):
     volumes = {"test-runner-docker": prefix + "-docker",
                "orchestrator-test-node-modules": prefix + "-orchestrator-deps",
                "backup-test-node-modules": prefix + "-test-deps"}
+    # Standalone Compose document: never merge with the privileged generic runner.
     override = {
         "services": {"test-runner": {
+            "build": str(pathlib.Path(source) / "tests/docker"),
             "image": "agentor-test-runner:" + prefix,
             "container_name": prefix + "-runner",
-            "volumes": ["backup-test-node-modules:/work/tests/node_modules"],
+            "privileged": False, "cgroup": "private", "ipc": "private",
+            "cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"],
+            "shm_size": "2gb",
+            "volumes": source_mounts(source) + ["test-runner-docker:/var/lib/docker",
+                        "orchestrator-test-node-modules:/work/node_modules",
+                        "backup-test-node-modules:/work/tests/node_modules"],
             "environment": {"INSTANCE_DOCKER_BACKUP_TEST": "true" if suite == "instance" else "false",
+                            "BASE_URL": "http://localhost:3000", "NODE_TLS_REJECT_UNAUTHORIZED": "0",
                             "TEST_WORKERS": "1", "RUN_REFERENCE_WORKFLOW": ""},
         }},
         "volumes": {key: {"name": value} for key, value in volumes.items()},
     }
+    validate_outer_service(override["services"]["test-runner"], source, override["volumes"])
     compose = ["docker", "--host", "unix:///var/run/docker.sock", "compose", "--project-directory", str(source),
-               "--project-name", prefix, "-f", str(pathlib.Path(source) / "docker-compose.tests.yml"),
-               "-f", "<override.json>"]
+               "--project-name", prefix, "-f", "<override.json>"]
     return {"suite": suite, "prefix": prefix, "volumes": list(volumes.values()), "override": override,
+            "execution": {"status": "blocked", "code": BLOCK_CODE, "reason": BLOCK_REASON},
             "build": compose + ["build", "test-runner"],
             "run": compose + ["run", "--rm", "--name", prefix + "-runner", "test-runner"] + SUITES[suite],
             "cleanup": compose + ["down", "--volumes", "--remove-orphans"]}
@@ -76,64 +146,16 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=SUITES, default="workspace")
     parser.add_argument("--run-id", default=uuid.uuid4().hex[:12])
-    parser.add_argument("--execute", action="store_true", help="Actually build/run the private stack; default only prints a plan")
+    parser.add_argument("--execute", action="store_true", help="Currently refused: safe outer device isolation has not been validated")
     args = parser.parse_args(argv)
-    repo = pathlib.Path(__file__).resolve().parents[1]
     proposed = plan(args.suite, args.run_id, "<tracked-source-snapshot>")
     if not args.execute:
         print(json.dumps(proposed, indent=2))
         return 0
-    env = dict(os.environ)
-    for key in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH",
-                "COMPOSE_FILE", "COMPOSE_PROJECT_NAME", "COMPOSE_ENV_FILES", "COMPOSE_PROFILES"):
-        env.pop(key, None)
-    env["COMPOSE_DISABLE_ENV_FILE"] = "1"
-    subprocess.run(["git", "-C", str(repo), "diff", "--quiet", "HEAD", "--"], check=True)
-    commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
-    with exclusive_run(proposed["prefix"]):
-        return execute(repo, args, proposed, env, commit)
-
-
-def execute(repo, args, proposed, env, commit):
-    docker = ["docker", "--host", "unix:///var/run/docker.sock"]
-    # A requested run ID must never adopt or clean someone else's resources.
-    for kind, name in [("container", proposed["prefix"] + "-runner")] + [("volume", name) for name in proposed["volumes"]]:
-        if subprocess.run(docker + [kind, "inspect", name], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-            raise RuntimeError("Isolated test resource already exists; choose a fresh run ID: " + name)
-    reports = pathlib.Path(tempfile.mkdtemp(prefix=proposed["prefix"] + "-results-"))
-    (reports / "source.json").write_text(json.dumps({"commit": commit, "suite": args.suite, "runId": args.run_id}))
-    print("Private backup acceptance reports:", reports, flush=True)
-    print("Testing committed source:", commit, flush=True)
-    with tempfile.TemporaryDirectory(prefix=proposed["prefix"] + "-source-") as scratch:
-        snapshot = pathlib.Path(scratch) / "repository"
-        archive_source(repo, snapshot)
-        actual = plan(args.suite, args.run_id, snapshot)
-        override = pathlib.Path(scratch) / "override.json"
-        override.write_text(json.dumps(actual["override"]))
-        for key in ("build", "run", "cleanup"):
-            actual[key] = [str(override) if value == "<override.json>" else value for value in actual[key]]
-        exit_code = 1
-        try:
-            subprocess.run(actual["build"], env=env, check=True)
-            with (reports / "runner.log").open("w") as log:
-                result = subprocess.run(actual["run"], env=env, stdout=log, stderr=subprocess.STDOUT)
-                exit_code = result.returncode
-        finally:
-            # A cancelled CLI can leave its one-off runner alive. Stop this
-            # exact newly reserved name before removing its daemon volume.
-            subprocess.run(docker + ["container", "rm", "--force", proposed["prefix"] + "-runner"],
-                           env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            try:
-                for name in ("test-results", "playwright-report"):
-                    path = snapshot / "tests" / name
-                    if path.exists():
-                        shutil.copytree(path, reports / name)
-            finally:
-                # Report-copy failures cannot bypass scoped resource cleanup.
-                subprocess.run(actual["cleanup"], env=env, check=True)
-        print("Private backup acceptance reports:", reports)
-        print("Exit code:", exit_code)
-        return exit_code
+    # No environment flag, receipt, root UID, or weaker suite can bypass this.
+    # A new runner must be implemented and reviewed before execution is restored.
+    print(BLOCK_CODE + ": " + BLOCK_REASON, file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

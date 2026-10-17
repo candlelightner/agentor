@@ -4,7 +4,7 @@ Comprehensive end-to-end test suite for the Agentor platform using Playwright an
 
 ## Overview
 
-Prepared combined backup acceptance: `scripts/test-backup-integration.py` plans by default and, only with `--execute`, builds a fresh private DinD namespace from tracked committed source. Six launcher isolation unit tests and the pure daemon-marker module case run without Docker access. The new real whole-instance UI/API capture→encrypted upload→empty recovery restore spec is opt-in and remains live-pending; native live gates still require a fresh reviewed Incus fixture. See `docs/backup-integration-acceptance.md`.
+Prepared combined backup acceptance: `scripts/test-backup-integration.py` preserves both complete suite arrays but blocks `--execute` before any subprocess because outer rootful DinD device isolation is unverified. Eleven launcher cases pass without Docker access: blocked plans, no side effects on explicit execute, namespace/capability/device/mount/volume rejection, exact suite scope, source export and exclusive leases. The whole-instance UI/API spec and real-worker UI case remain live-pending. The generic privileged test runner must not be substituted on production; see `docs/backup-integration-acceptance.md`.
 
 Whole-instance streaming compression: 80 affected settings/archive/crypto/provider/native/restore-helper module cases pass, including 12 new compression/stream/manager cases. All six whole-instance browser cases pass with the real component/composable and mock APIs in an isolated fixture. The three-volume benchmark records a 2.36× synthetic volume-pipeline speedup and zero TAR staging; see `docs/backup-compression-benchmark.md` for CPU/disk measurements and explicit real Dockerized restore/full-backup performance gaps.
 

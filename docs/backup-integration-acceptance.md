@@ -1,6 +1,6 @@
 # Isolated combined backup acceptance
 
-Run this only after the production migration has finished and the future-code branches have been consolidated into a committed integration branch. These commands create test resources; they do not deploy the branch or reuse production backups, keys, DATA mounts, Docker volumes, Incus projects, or published host ports.
+The full workspace and whole-instance suites are preserved, but their same-host rootful DinD launcher is **blocked**. A device-isolated execution environment has not been implemented or accepted. Finishing migration and consolidating the branches does not remove this blocker. Only the plan commands below are currently supported; they do not contact Docker or Git.
 
 ## Concrete commands
 
@@ -11,16 +11,13 @@ python3 scripts/test-backup-integration.py --suite workspace
 python3 scripts/test-backup-integration.py --suite instance
 ```
 
-After reviewing the generated names/mounts, run the two independent acceptance suites:
+The plan reports `execution.status: blocked` and `BACKUP_RUNNER_DEVICE_ISOLATION_UNVERIFIED`. `--execute` exits with code 2 before any subprocess, lease, source export, build, container/volume creation or cleanup, even as root or with environment flags. There is no privileged fallback or receipt bypass. Do not copy the advisory `build`, `run` or `cleanup` arrays into a shell: they describe the preserved suite/resource scope, not an accepted execution procedure.
 
-```sh
-sudo -n python3 scripts/test-backup-integration.py --suite workspace --execute
-sudo -n python3 scripts/test-backup-integration.py --suite instance --execute
-```
+Each plan selects a fresh random run ID; `--run-id readable-id` chooses an explicit ID. Its standalone Compose document does not inherit `docker-compose.tests.yml`. It explicitly sets `privileged: false`, private cgroup/IPC namespaces, drops all capabilities, and retains no-new-privileges. There are no device requests, device-cgroup overrides, host namespace selections, host ports or host socket/cgroup/device binds. Only a future tracked source snapshot and uniquely named local volumes are allowed. The strict configuration validator rejects extra privilege/device/mount fields and external or device-backed volumes. **This is an intentionally non-executable isolation requirement, not a claim that cap-drop-all can run rootful Docker.**
 
-Each invocation selects a fresh random run ID. `--run-id readable-id` can make the names easier to identify; pre-existing container/volume names are refused, and an exclusive local lease prevents concurrent reuse of one run ID. The launcher requires clean tracked source, records the exact tested commit, and exports only `git archive HEAD` into a private temporary directory. Untracked/ignored `.env`, credentials, keys, developer dependencies, and generated output are not mounted. The runner installs its own dependencies into new volumes. Each suite gets a separate fresh nested Docker data volume, so tests cannot inherit another suite's installation.
+The source-export and exclusive-lease helpers remain unit tested for a future runner. No execution path currently calls them. A future reviewed implementation must preserve clean committed source export, ignore untracked secrets, independently reserve/inspect exact newly created resource identities before start, and clean up only resources whose ownership was established.
 
-The workspace invocation runs:
+The workspace plan retains:
 
 ```text
 api/backups.spec.ts
@@ -31,7 +28,7 @@ ui/backup-management-real.spec.ts
 --workers=1 --retries=0
 ```
 
-The dedicated whole-instance invocation enables `INSTANCE_DOCKER_BACKUP_TEST=true` and runs only:
+The dedicated whole-instance plan enables `INSTANCE_DOCKER_BACKUP_TEST=true` and runs only:
 
 ```text
 api/instance-backup-docker-live.spec.ts --project=api --workers=1 --retries=0
@@ -41,13 +38,17 @@ Do not append other tests to that invocation: the whole-instance test deliberate
 
 ## Isolation and build contract
 
-The outer runner is a new privileged DinD container, with private network/cgroup namespaces, an exclusive daemon-data volume, and no outer `ports`, host network, host Docker socket, production DATA, Incus credentials, or device-selection configuration. The standard runner still requires delegated cgroup-v2 CPU/memory/PID controllers and proves the exact constrained sizing-helper permissions before starting Agentor. A failing infrastructure preflight is a blocked acceptance environment, not a passing feature check.
+The earlier launcher inherited `privileged: true` from the generic runner. Docker documents that privileged containers gain all host-device access, so absence of a host socket or bind mount was insufficient to protect production disks and backups. That execution path has been removed. The generic `docker-compose.tests.yml` is still a privileged development runner and must not be substituted on the production host.
 
-The entrypoint refuses a pre-existing/mounted Docker socket before opening its cache lock or changing cgroups. It clears Docker context/TLS overrides and uses only its newly started local socket. It records that daemon's identity in a private regular marker. The whole-instance spec validates marker ownership/mode/type, daemon ID/root directory/hostname, and the private cgroup root before any mutating Docker call. It also requires the expected `agentor-test` source compose labels and DATA volume and an initially worker-free installation.
+Simply adding `SYS_ADMIN` to an unprivileged runner is also not an accepted fix. The current entrypoint requires writable private cgroup-v2 delegation, and rootful nested runc manages device restrictions using BPF. Docker's default seccomp profile enables BPF with `SYS_ADMIN`; the cgroup library can query, replace and detach existing device filters. A private cgroup namespace and `HostConfig.Privileged=false` therefore do not by themselves prove the outer filter remains protected. Denying all BPF operations breaks ordinary nested-container device setup; running only privileged inner containers would discard the required constrained-helper and worker behavior. See the [Docker privilege contract](https://docs.docker.com/reference/cli/docker/container/run/#privileged), [default seccomp capability rules](https://github.com/moby/profiles/blob/main/seccomp/default.json), [kernel device-controller semantics](https://docs.kernel.org/admin-guide/cgroup-v2.html#device-controller), and [runc cgroup device-filter management](https://github.com/opencontainers/cgroups/blob/main/devices/ebpf_linux.go).
 
-The Orchestrator image builds with `docker build -f /src/orchestrator/Dockerfile /src`, including the repository-root `.dockerignore`, canonical `worker/vm`, worker entrypoint, and required scripts. The worker image retains its worker-directory build context. The runner's own image tag, container name, daemon volume, and both dependency volumes are unique to this invocation.
+This assessment establishes a missing isolation design, not a proof that every possible constrained DinD implementation is impossible. No host capability probe, Docker create/start, cgroup mutation or device-access experiment was performed for this change. There is no validated minimum capability/security-option set to publish.
 
-Source HTTP 3000, Traefik 80/443, and destination recovery HTTP 3401 exist only inside the outer runner's private network namespace. No host listener is published. The destination's Docker socket bind is the inner test daemon's socket, not the host socket. Both source and destination use images built inside that private daemon; the recovery app is pinned to the captured source image ID.
+A practical next design is a disposable full VM with only fresh virtual disks, a private network and a guest-owned Docker daemon. Copy only tracked source into that guest; do not attach physical disks, production paths/sockets, credentials or old test volumes. Run the same two suite arrays against a fresh guest stack, retain the exact sizing-helper and daemon-identity assertions, and preserve independent source/destination recovery installations. This needs a reviewed VM fixture/bootstrap and cleanup implementation; the existing native DR receipt guards do not provision one. An existing independently isolated test machine is another option. Neither is an execute-ready procedure in this branch, and neither authorizes host services/cgroups/daemon changes.
+
+Before restoring execution, require evidence of actual namespace and device isolation (including inherited restrictions for inner privileged workers), exact source/resource ownership, bounded cancellation/cleanup, and full unchanged suite behavior. A stopped-container inspect alone cannot establish these runtime properties. No privileged mode, host-cgroup bind, broad device rule or reduced test suite is an acceptable fallback.
+
+The intended build remains `docker build -f /src/orchestrator/Dockerfile /src` with canonical worker/VM sources; the worker image retains its worker-directory context. The existing entrypoint's exact constrained sizing-helper check, fresh local Docker-socket check, daemon marker and whole-instance identity checks are retained for a future safe runner. These checks protect against accidental daemon confusion; they cannot repair privileged outer-device exposure.
 
 ## Real whole-instance path being prepared
 
@@ -73,8 +74,8 @@ Existing module suites cover native format/role bounds, exact raw/PAX/ownership 
 
 These are not generic nested-Docker gates. Several still bind a prior disposable endpoint (`127.0.0.1:18443`), project name `agentor`, `/workspace/agentor-incus-tls` paths, and/or exact retained fixture IDs. Do **not** simply enable these flags, reuse their old credentials, or point them at the migrated production Incus project. A fresh restricted disposable Incus project/image/network and reviewed fixture descriptor/refactoring are required first. No native live command is safe to prescribe for the current production host from those hard-coded defaults. Native real-VM portability therefore remains a separate pending acceptance gate.
 
-## Evidence and cleanup
+## Evidence and remaining acceptance
 
-The launcher prints the private result directory and tested commit before execution. It retains `source.json`, `runner.log`, Playwright results/screenshots/traces and the HTML report; it does not copy authentication-state files. The whole-instance spec disables tracing/video because its API flow reveals/imports a generated fixture recovery key; no key file or raw key log is produced. It removes only its new UUID-scoped compose project/volumes in `finally`, including on build/test failure. The source snapshot is then removed. The outer test-runner image tag may remain as a harmless cached test image; production image tags are never changed.
+Eleven local launcher unit cases pass without Docker access, including both full suite arrays, zero-subprocess execution refusal, unsafe namespace/capability/device/mount rejection, device-backed/external/reused-volume rejection, source export and exclusive leases. No test container, daemon, VM, build, mount, cgroup or device was created or changed. There are no runtime reports or cleanup receipts to claim from this change.
 
-Before consolidation, only static/local checks are authorized and have been exercised: launcher unit tests, shell syntax, pure daemon-identity tests, TypeScript checking and default skipped discovery of the real spec. Neither acceptance stack has been started. The opt-in whole-instance spec and repaired real-worker UI spec are **prepared, not live-validated**. Final acceptance requires actual successful runs of both commands above and review of any failures. Comparative ≥2× complete-backup throughput, single-core/small-volume behavior and native VM portability are additional gates; the existing synthetic 2.36× volume-pipeline benchmark does not substitute for them.
+Neither acceptance stack has been started. The real whole-instance UI/API spec and repaired real-worker UI spec remain **prepared, not live-validated**, pending a safe execution environment and successful complete runs. Comparative ≥2× complete-backup throughput, single-core/small-volume behavior and native VM portability remain additional gates; the synthetic 2.36× volume-pipeline benchmark does not substitute for them.

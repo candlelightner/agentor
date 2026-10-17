@@ -1,10 +1,12 @@
 import importlib.util
+import copy
 import json
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[2] / 'scripts/test-backup-integration.py'
 spec = importlib.util.spec_from_file_location('backup_integration', SCRIPT)
@@ -21,7 +23,13 @@ class BackupIntegrationLauncherTests(unittest.TestCase):
         self.assertNotIn('ports', service)
         self.assertNotIn('network_mode', service)
         self.assertNotIn('/var/run/docker.sock', json.dumps(service))
-        self.assertEqual(service['volumes'], ['backup-test-node-modules:/work/tests/node_modules'])
+        self.assertIn('backup-test-node-modules:/work/tests/node_modules', service['volumes'])
+        self.assertIs(service['privileged'], False)
+        self.assertEqual(service['cgroup'], 'private')
+        self.assertEqual(service['ipc'], 'private')
+        self.assertEqual(service['cap_drop'], ['ALL'])
+        self.assertEqual(p['execution']['status'], 'blocked')
+        self.assertNotIn('docker-compose.tests.yml', ' '.join(p['run']))
         self.assertIn('api/instance-backup-docker-live.spec.ts', p['run'])
         self.assertIn('--retries=0', p['run'])
 
@@ -50,6 +58,67 @@ class BackupIntegrationLauncherTests(unittest.TestCase):
                         self.fail('concurrent lease admitted')
                 self.assertTrue(lock.is_file())
             self.assertFalse(lock.exists())
+
+    def test_execute_fails_before_any_process_or_cleanup_for_both_full_suites(self):
+        for suite in launcher.SUITES:
+            with self.subTest(suite=suite), mock.patch.object(launcher.subprocess, 'run') as run, \
+                    mock.patch.object(launcher.subprocess, 'check_output') as output, \
+                    mock.patch.object(launcher, 'exclusive_run') as lease, \
+                    mock.patch.object(launcher, 'archive_source') as archive:
+                self.assertEqual(launcher.main(['--suite', suite, '--run-id', 'blocked', '--execute']), 2)
+                run.assert_not_called(); output.assert_not_called()
+                lease.assert_not_called(); archive.assert_not_called()
+
+    def test_explicit_execute_fails_without_docker_git_or_privileged_bypass(self):
+        result = subprocess.run([sys.executable, str(SCRIPT), '--execute'],
+                                env={'PATH': '/nonexistent', 'DOCKER_HOST': 'tcp://production:2375',
+                                     'AGENTOR_ALLOW_PRIVILEGED': 'true'}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(launcher.BLOCK_CODE, result.stderr)
+        self.assertEqual(result.stdout, '')
+
+    def test_outer_guard_rejects_host_devices_privilege_namespace_and_mount_overrides(self):
+        p = launcher.plan('workspace', 'guard-case', '/tracked-source')
+        service = p['override']['services']['test-runner']
+        unsafe = [
+            ('privileged', True), ('privileged', 'false'), ('cgroup', 'host'), ('ipc', 'host'),
+            ('pid', 'host'), ('pid', 'container:production'), ('network_mode', 'host'),
+            ('network_mode', 'container:production'), ('uts', 'host'), ('userns_mode', 'host'),
+            ('cgroup_parent', '/system.slice'), ('devices', ['/dev/sda:/dev/sda']),
+            ('device_cgroup_rules', ['b *:* rwm']), ('gpus', 'all'), ('cap_add', ['SYS_ADMIN']),
+            ('cap_add', ['BPF']), ('cap_add', ['ALL']), ('cap_drop', []),
+            ('security_opt', ['seccomp=unconfined']), ('security_opt', ['apparmor=unconfined']),
+            ('ports', ['3000:3000']), ('volumes_from', ['production']), ('runtime', 'unsafe'),
+            ('use_api_socket', True), ('post_start', [{'command': 'mount /dev/sda /data'}]),
+            ('build', {'context': '/tracked-source/tests/docker', 'privileged': True}),
+        ]
+        for field, value in unsafe:
+            changed = copy.deepcopy(service); changed[field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                launcher.validate_outer_service(changed, '/tracked-source', p['override']['volumes'])
+        for mount in ['/dev:/dev', '/sys/fs/cgroup:/sys/fs/cgroup', '/proc:/proc',
+                      '/var/run/docker.sock:/var/run/docker.sock', '/production:/data',
+                      '/tracked-source/tests:/work/tests:rshared']:
+            changed = copy.deepcopy(service); changed['volumes'].append(mount)
+            with self.subTest(mount=mount), self.assertRaises(ValueError):
+                launcher.validate_outer_service(changed, '/tracked-source', p['override']['volumes'])
+
+    def test_outer_guard_rejects_device_backed_external_and_reused_named_volumes(self):
+        p = launcher.plan('workspace', 'guard-case', '/tracked-source')
+        for unsafe in [{'name': 'production'}, {'name': p['volumes'][0], 'external': True},
+                       {'name': p['volumes'][0], 'driver_opts': {'type': 'ext4', 'device': '/dev/sda'}},
+                       {'name': p['volumes'][0], 'driver_opts': {'type': 'none', 'o': 'bind', 'device': '/production'}}]:
+            changed = copy.deepcopy(p['override']['volumes']); changed['test-runner-docker'] = unsafe
+            with self.subTest(volume=unsafe), self.assertRaises(ValueError):
+                launcher.validate_outer_service(p['override']['services']['test-runner'], '/tracked-source', changed)
+
+    def test_both_suite_test_arrays_are_preserved_exactly(self):
+        self.assertEqual(launcher.SUITES, {
+            'workspace': ['api/backups.spec.ts', 'api/instance-backups-api.spec.ts',
+                          'ui/backup-management.spec.ts', 'ui/instance-backup-management.spec.ts',
+                          'ui/backup-management-real.spec.ts', '--workers=1', '--retries=0'],
+            'instance': ['api/instance-backup-docker-live.spec.ts', '--project=api', '--workers=1', '--retries=0'],
+        })
 
     def test_git_archive_excludes_untracked_and_ignored_credentials(self):
         with tempfile.TemporaryDirectory() as root:
