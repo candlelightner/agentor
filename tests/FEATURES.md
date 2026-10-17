@@ -1,5 +1,7 @@
 # Agentor — Comprehensive Feature List
 
+Archived legacy workers can explicitly select an authorized catalog replacement while unarchiving when the original custom image is unavailable. The replacement uses the existing strict recovery parser, preserves worker identity and persistent data, and is saved as desired configuration before compute creation. Invalid/foreign/incompatible selections and persistence failures allocate no compute; failed creation retains the selected desired image and archived data. Native/imported-rootfs/workspace-only replacement is not enabled by this operation.
+
 Every user-facing feature of the Agentor web dashboard, organized by category. This document drives the Playwright test suite — every item below must have test coverage.
 
 Bounded Phase 8 interrupted-recreation recovery rolls back under the existing owner→worker fences before normal convergence. Verified original compute is retained stopped; replacement compute is removed only with installation/owner/worker/UUID and operation-nonce proof. Absent compute requires verified canonical storage and immutable source metadata. Unavailable or contradictory facts retain the recovery marker. Store-queue compare-and-merge preserves pending edits and revoked access; rollback never promotes desired secrets or deletes persistent volumes. Full Phase 8 and later parity gates remain open.

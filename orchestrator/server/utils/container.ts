@@ -4704,20 +4704,21 @@ for p in sys.argv[1:]:
     return containerInfo;
   }
 
-  async unarchive(userId: string, id: string): Promise<ContainerInfo> {
+  async unarchive(userId: string, id: string, imageResolution?: WorkerImportOptions['imageResolution']): Promise<ContainerInfo> {
     return withOwnerWorkerLifecycleMutation(userId, id, async () => {
       await this.assertOwnerExists(userId);
-      return this.unarchiveUnlocked(userId, id);
+      return this.unarchiveUnlocked(userId, id, imageResolution);
     });
   }
 
   private async unarchiveUnlocked(
     userId: string,
     id: string,
+    imageResolution?: WorkerImportOptions['imageResolution'],
   ): Promise<ContainerInfo> {
     if (!this.workerStore) throw new Error("WorkerStore not available");
 
-    const worker = this.workerStore.get(userId, id);
+    let worker = this.workerStore.get(userId, id);
     if (!worker || worker.status !== "archived") {
       throw new Error("Archived worker not found");
     }
@@ -4726,6 +4727,13 @@ for p in sys.argv[1:]:
         new Error("Worker deletion cleanup is still pending"),
         { statusCode: 409 },
       );
+    }
+    if (imageResolution) {
+      if (imageResolution.mode !== 'replacement' || worker.runtimeKind === 'incus-vm' || worker.importedImage)
+        throw Object.assign(new Error('Archived image recovery requires an explicit catalog replacement for a legacy worker'), { statusCode: 400 });
+      const image = await resolveImportedImage(userId, { state: 'platform-default' }, imageResolution);
+      worker = { ...worker, ...image, imageRuntimeReference: image.imageRuntimeReference || image.imageDigest,
+        updatedAt: new Date().toISOString() };
     }
     if (worker.runtimeKind === 'incus-vm') {
       const containerName = this.buildContainerName(worker.id);
@@ -4825,6 +4833,9 @@ for p in sys.argv[1:]:
       false,
     );
 
+    // Persist an explicit replacement as desired configuration before compute
+    // creation, so interruption never leaves a new image paired with old metadata.
+    if (imageResolution) await this.workerStore.upsert(worker);
     // Make the active provisional identity authoritative before asking Docker
     // to create anything. This closes the post-create/pre-persistence leak.
     await this.workerStore.unarchive(worker.userId, worker.id);

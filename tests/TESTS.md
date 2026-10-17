@@ -1,5 +1,7 @@
 # Agentor Test Suite
 
+Archived image recovery: `api/worker-unarchive-image-resolution.spec.ts` adds nine actual-manager cases for immutable replacement/preserved settings, real catalog authorization/readiness denial, lifecycle queue authority, unsupported recovery modes, pre-create persistence failure, failed-create archival, strict public parsing and unchanged ordinary unarchive. Together with existing import-parser cases: **11 passed**; full Nuxt typecheck passed before the additional missing-runtime-alias regression. Real rebuilt-image migration remains pending.
+
 Comprehensive end-to-end test suite for the Agentor platform using Playwright and TypeScript. Covers all API endpoints and UI interactions.
 
 ## Overview

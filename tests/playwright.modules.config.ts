@@ -98,6 +98,7 @@ export default defineConfig({
     "api/worker-import-runtime-policy.spec.ts",
     "api/worker-import-runtime-routing.spec.ts",
     "api/worker-import-image-resolution.spec.ts",
+    "api/worker-unarchive-image-resolution.spec.ts",
     "api/management-import-domain.spec.ts",
     "api/worker-export-format.spec.ts",
     "api/worker-reconstruction.spec.ts",
