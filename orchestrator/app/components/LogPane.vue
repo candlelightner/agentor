@@ -16,6 +16,48 @@ const {
 
 const scrollContainer = ref<HTMLElement>();
 const searchInput = ref('');
+const downloading = ref(false);
+const downloadMessage = ref('');
+const downloadError = ref(false);
+
+async function downloadServerLogs() {
+  downloading.value = true;
+  downloadMessage.value = '';
+  downloadError.value = false;
+  const params = new URLSearchParams({ limit: '1000' });
+  if (filters.levels.length) params.set('levels', filters.levels.join(','));
+  // Use the visible input so a click during the search debounce uses the text
+  // the operator actually requested.
+  if (searchInput.value) params.set('search', searchInput.value);
+  try {
+    const response = await fetch(`/api/logs/download?${params}`, { credentials: 'same-origin' });
+    if (!response.ok) {
+      downloadError.value = true;
+      downloadMessage.value = response.status === 404 ? 'No server logs match these filters.'
+        : response.status === 401 || response.status === 403 ? 'Administrator access is required to download server logs.'
+        : 'Server log download failed. Please retry.';
+      return;
+    }
+    const blob = await response.blob();
+    if (!blob.size) throw new Error('Empty log download');
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = response.headers.get('Content-Disposition')?.match(/filename="([^"]+)"/)?.[1] || 'agentor-server-logs.jsonl';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30_000);
+    downloadMessage.value = response.headers.get('X-Log-Has-More') === 'true'
+      ? 'Downloaded the newest matching server logs. More matching entries exist; narrow the level or search filters to download another selection.'
+      : response.headers.get('X-Log-Truncated') === 'true' ? 'Downloaded server logs; an oversized entry was truncated.' : 'Server logs downloaded.';
+  } catch {
+    downloadError.value = true;
+    downloadMessage.value = 'Server log download failed. Please retry.';
+  } finally {
+    downloading.value = false;
+  }
+}
 const SCROLL_TRIGGER_PX = 80;
 let searchTimeout: ReturnType<typeof setTimeout> | null = null;
 
@@ -180,6 +222,15 @@ const levels: { id: LogLevel; label: string }[] = [
       <div class="log-filter-actions">
         <button
           class="log-filter-btn"
+          title="Download server logs (latest 1000; uses level and search filters)"
+          :disabled="downloading"
+          @click="downloadServerLogs"
+        >
+          <UIcon name="i-lucide-download" class="size-3.5" />
+          {{ downloading ? 'Downloading…' : 'Download server logs' }}
+        </button>
+        <button
+          class="log-filter-btn"
           :class="{ 'log-filter-btn-active': autoScroll }"
           title="Auto-scroll to bottom"
           @click="autoScroll = !autoScroll"
@@ -195,6 +246,8 @@ const levels: { id: LogLevel; label: string }[] = [
         </button>
       </div>
     </div>
+
+    <p v-if="downloadMessage" role="status" class="px-3 py-1 text-xs" :class="{ 'text-red-500': downloadError }">{{ downloadMessage }}</p>
 
     <!-- Log entries -->
     <div ref="scrollContainer" class="log-entries" @scroll="onScroll">

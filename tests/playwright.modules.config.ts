@@ -25,6 +25,11 @@ if (!process.env.DATA_DIR) {
 export default defineConfig({
   testDir: ".",
   testMatch: [
+    "ui/server-log-download-isolated.spec.ts",
+    "api/management-logs-domain.spec.ts",
+    "api/management-mcp-transport.spec.ts",
+    "api/server-log-read.spec.ts",
+    "api/server-log-listeners.spec.ts",
     "api/plugin-core.spec.ts",
     "api/plugin-desktop-core.spec.ts",
     "api/portable-managed-volume-format.spec.ts",

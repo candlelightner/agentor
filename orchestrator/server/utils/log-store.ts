@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream, existsSync, mkdirSync, statSync, renameSync, unlinkSync, createReadStream } from 'node:fs';
 import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -15,6 +16,8 @@ export interface LogQueryOptions {
   until?: string;
   limit?: number;
   search?: string;
+  /** Exclusive stable key for bounded management/export pagination. */
+  before?: string;
 }
 
 export class LogStore {
@@ -41,7 +44,7 @@ export class LogStore {
   append(entry: LogEntry, file: 'orchestrator' | 'containers'): void {
     if (!shouldLog(entry.level, this.logLevel)) return;
 
-    const line = JSON.stringify(entry) + '\n';
+    const line = JSON.stringify({ ...entry, id: entry.id || randomUUID() }) + '\n';
     this.writeQueue = this.writeQueue.then(() => this.writeLine(file, line)).catch(() => {});
   }
 
@@ -103,6 +106,7 @@ export class LogStore {
 
   async query(options: LogQueryOptions = {}): Promise<{ entries: LogEntry[]; hasMore: boolean }> {
     const limit = Math.min(options.limit || 500, 5000);
+    await this.writeQueue;
     const entries: LogEntry[] = [];
 
     // Read files newest-first: current, then .1, .2, etc.
@@ -119,11 +123,14 @@ export class LogStore {
       const fileEntries = await this.readLogFile(filePath, options);
       entries.push(...fileEntries);
 
-      if (entries.length > limit) break;
+      // Keep only the newest candidates across every source and rotated file.
+      // Stopping at the first full file can hide newer entries in other files.
+      entries.sort(compareLogEntries);
+      if (entries.length > limit + 1) entries.length = limit + 1;
     }
 
     // Sort by timestamp descending (newest first)
-    entries.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    entries.sort(compareLogEntries);
 
     const hasMore = entries.length > limit;
     return { entries: entries.slice(0, limit), hasMore };
@@ -144,6 +151,11 @@ export class LogStore {
           const entry = JSON.parse(line) as LogEntry;
           if (this.matchesFilter(entry, options)) {
             entries.push(entry);
+            // The retained result is bounded even when a rotated file is large.
+            if (entries.length > 2 * ((options.limit || 500) + 1)) {
+              entries.sort(compareLogEntries);
+              entries.length = (options.limit || 500) + 1;
+            }
           }
         } catch {}
       }
@@ -153,6 +165,7 @@ export class LogStore {
   }
 
   private matchesFilter(entry: LogEntry, options: LogQueryOptions): boolean {
+    if (options.before && logEntryCursor(entry) >= options.before) return false;
     if (options.sources && options.sources.length > 0 && !options.sources.includes(entry.source)) return false;
     if (options.sourceIds && options.sourceIds.length > 0 && entry.sourceId && !options.sourceIds.includes(entry.sourceId)) return false;
     if (options.levels && options.levels.length > 0 && !options.levels.includes(entry.level)) return false;
@@ -217,4 +230,13 @@ export class LogStore {
     );
     this.streams.clear();
   }
+}
+
+/** Opaque ordering key: never embed raw log messages (which may contain secrets)
+ * in a pagination cursor returned to a client. */
+export function logEntryCursor(entry: LogEntry): string {
+  return `${entry.timestamp}|${createHash('sha256').update(JSON.stringify([entry.id, entry.source, entry.sourceId, entry.message])).digest('hex')}`;
+}
+function compareLogEntries(a: LogEntry, b: LogEntry): number {
+  return logEntryCursor(b).localeCompare(logEntryCursor(a));
 }

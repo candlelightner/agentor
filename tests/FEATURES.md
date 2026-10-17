@@ -964,6 +964,8 @@ See §20b for the bridge. The endpoint sets the worker's X11 CLIPBOARD selection
 - Filters are applied both server-side (so paginated fetches only return matching entries) and client-side (so live WebSocket entries are gated immediately). Changing filters refetches the most recent matching page from scratch.
 
 ### 23.6 Actions
+- Platform-admin server-log JSONL download applies level/search filters to retained server history (up to 1000 entries / 256 KiB); empty, denied, failed, and partial downloads have explicit feedback. REST supports time bounds and opaque continuation cursors; actual saved bytes preserve multiline/Unicode messages and redact credentials.
+- Global administrative management MCP exposes `logs.server-read` with bounded level/search/time filtering and paging; group administrators and ordinary workers are denied even when the logs policy is enabled.
 - Clear button: clears all log files (with confirmation dialog)
 - Status bar: green/red connection dot + "Connected"/"Disconnected" text + entry count
 

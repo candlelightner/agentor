@@ -506,6 +506,8 @@ export type LogLevel = "debug" | "info" | "warn" | "error";
 export type LogSource = "orchestrator" | "worker" | "traefik";
 
 export interface LogEntry {
+  /** Durable identity for stable same-timestamp log pagination. */
+  id?: string;
   timestamp: string;
   level: LogLevel;
   source: LogSource;
