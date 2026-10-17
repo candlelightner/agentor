@@ -72,6 +72,16 @@ actions. Do not edit worker settings/environments concurrently. A lost response
 or verification failure stops for operator inspection, without automatic retry,
 rollback, finalization, or deletion. Keep all receipts and retained Docker data.
 
+`Migration.continue_from_unarchive(before, cid)` exposes only that existing
+post-unarchive sequence for a separately reviewed operator continuation. It
+requires explicit execution state and an exact Docker ID, then checks the
+original source image, worker label and hardware before any further mutation.
+It does not unarchive, run preflight, retry, claim a new receipt namespace, or
+catch errors: the operator must first prove prior operation/owner-queue settlement
+and supply distinct continuation receipts and error handling. Normal `execute`
+still rejects all existing receipts and retains its original error receipt.
+There is no resume CLI or automatic continuation.
+
 The sequence is unarchive, select the behavior-identical 4 GiB clone, stop and
 capture exact Docker identity/mounts plus bounded file samples, migrate, rebuild,
 verify the guest as uid 1000, verify editor/desktop HTTP paths, then archive using

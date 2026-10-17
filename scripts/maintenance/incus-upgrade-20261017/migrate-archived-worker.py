@@ -433,6 +433,59 @@ class Migration:
             proxies[path] = self.api('GET', path, html=True)
         return {'instance': instance, 'guest': result, 'proxies': proxies}
 
+    def continue_from_unarchive(self, before, cid):
+        require(self.executing, 'Mutations require explicit --execute')
+        require(isinstance(cid, str) and re.fullmatch(r'[a-f0-9]{64}', cid),
+                'Unarchive did not return an exact Docker ID')
+        created = command_json(['docker', 'inspect', cid])[0]
+        require(created['Config']['Labels'].get('agentor.id') == self.id and created['Image'] == before['sourceDockerImage'],
+                'Unarchived Docker source identity/image differs')
+        require(not created['HostConfig'].get('Devices') and not created['HostConfig'].get('DeviceRequests'),
+                'Unexpected Docker hardware assignment')
+        self.mutate('environment', 'PATCH', f'/api/containers/{self.id}', {'environmentId': before['environmentClone']['id']})
+        self.mutate('stop-source', 'POST', f'/api/containers/{self.id}/stop', {})
+        stopped = command_json(['docker', 'inspect', cid])[0]
+        snapshot = source_identity(stopped)
+        self.docker_retained(snapshot)
+        samples = {}
+        for role, target in [('workspace', '/workspace'), ('agents', '/home/agent/.agent-data')]:
+            mounts = [m for m in stopped['Mounts'] if m.get('Destination') == target]
+            require(len(mounts) == 1 and mounts[0]['Type'] == 'volume', 'Expected exact Docker canonical named volume')
+            mount = mounts[0]
+            volume = command_json(['docker', 'volume', 'inspect', mount['Name']])[0]
+            require(volume['Mountpoint'] == mount['Source'] and volume['Driver'] == 'local'
+                    and not volume.get('Options'), 'Docker canonical volume differs')
+            samples[role] = sample_files(Path(mount['Source']))
+        # Every user host mount must have appeared in the reviewed Docker
+        # source; account shares are compared separately after migration.
+        before['sourceHostMounts'] = [m for m in stopped['Mounts'] if m.get('Type') == 'bind']
+        self.receipt('source-stopped', {'docker': snapshot, 'samples': samples, 'record': self.record()})
+        migrated = self.mutate('migrate', 'POST', f'/api/admin/workers/{self.id}/incus-migration', {})
+        require(migrated == {'kind': 'incus-vm', 'phase': 'retained', 'sourceRetained': True, 'recoveryRequired': False},
+                'Migration did not reach retained state')
+        self.docker_retained(snapshot)
+        require(self.record()['incusMigration']['source'] == {'containerId': cid, 'createdAt': snapshot['Created'],
+                'imageId': snapshot['Image'], 'wasRunning': False}, 'Migration source receipt differs')
+        self.mutate('rebuild', 'POST', f'/api/containers/{self.id}/rebuild', {})
+        self.preserved(before)
+        verification = self.verify_native(before)
+        verification['samples'] = self.compare_samples(samples)
+        self.docker_retained(snapshot)
+        self.receipt('verified-before-archive', verification)
+        self.mutate('archive', 'POST', f'/api/containers/{self.id}/archive', {})
+        self.preserved(before, archived=True)
+        self.assert_no_compute()
+        self.docker_retained(snapshot)
+        evidence = self.compare_samples(samples)
+        for item in evidence.values():
+            require(item['volume'].get('used_by') == [], 'Archived canonical volume is still attached')
+        for v in self.managed():
+            volume = self.incus(f'/1.0/storage-pools/{POOL}/volumes/custom/{v["dockerName"]}')
+            require(volume.get('config', {}).get('user.agentor.volume-id') == v['id'] and volume.get('used_by') == [],
+                    'Archived managed volume retention is ambiguous')
+        self.receipt('complete', {'record': self.record(), 'canonical': evidence, 'retainedDocker': snapshot,
+                                 'status': 'archived-native-source-retained', 'samplingIsNotFullVerification': True})
+
     def execute(self, before):
         require(not list(self.base.glob(f'migration-{self.id}.*')), 'Existing receipt makes rerun ambiguous')
         self.receipt('before', before)
@@ -443,54 +496,7 @@ class Migration:
             cid = result.get('containerId', '')
             require(re.fullmatch(r'[a-f0-9]{64}', cid), 'Unarchive did not return an exact Docker ID')
             require(result.get('id') == self.id and result.get('userId') == OWNER, 'Unarchive returned another worker')
-            created = command_json(['docker', 'inspect', cid])[0]
-            require(created['Config']['Labels'].get('agentor.id') == self.id and created['Image'] == before['sourceDockerImage'],
-                    'Unarchived Docker source identity/image differs')
-            require(not created['HostConfig'].get('Devices') and not created['HostConfig'].get('DeviceRequests'),
-                    'Unexpected Docker hardware assignment')
-            self.mutate('environment', 'PATCH', f'/api/containers/{self.id}', {'environmentId': before['environmentClone']['id']})
-            self.mutate('stop-source', 'POST', f'/api/containers/{self.id}/stop', {})
-            stopped = command_json(['docker', 'inspect', cid])[0]
-            snapshot = source_identity(stopped)
-            self.docker_retained(snapshot)
-            samples = {}
-            for role, target in [('workspace', '/workspace'), ('agents', '/home/agent/.agent-data')]:
-                mounts = [m for m in stopped['Mounts'] if m.get('Destination') == target]
-                require(len(mounts) == 1 and mounts[0]['Type'] == 'volume', 'Expected exact Docker canonical named volume')
-                mount = mounts[0]
-                volume = command_json(['docker', 'volume', 'inspect', mount['Name']])[0]
-                require(volume['Mountpoint'] == mount['Source'] and volume['Driver'] == 'local'
-                        and not volume.get('Options'), 'Docker canonical volume differs')
-                samples[role] = sample_files(Path(mount['Source']))
-            # Every user host mount must have appeared in the reviewed Docker
-            # source; account shares are compared separately after migration.
-            before['sourceHostMounts'] = [m for m in stopped['Mounts'] if m.get('Type') == 'bind']
-            self.receipt('source-stopped', {'docker': snapshot, 'samples': samples, 'record': self.record()})
-            migrated = self.mutate('migrate', 'POST', f'/api/admin/workers/{self.id}/incus-migration', {})
-            require(migrated == {'kind': 'incus-vm', 'phase': 'retained', 'sourceRetained': True, 'recoveryRequired': False},
-                    'Migration did not reach retained state')
-            self.docker_retained(snapshot)
-            require(self.record()['incusMigration']['source'] == {'containerId': cid, 'createdAt': snapshot['Created'],
-                    'imageId': snapshot['Image'], 'wasRunning': False}, 'Migration source receipt differs')
-            self.mutate('rebuild', 'POST', f'/api/containers/{self.id}/rebuild', {})
-            self.preserved(before)
-            verification = self.verify_native(before)
-            verification['samples'] = self.compare_samples(samples)
-            self.docker_retained(snapshot)
-            self.receipt('verified-before-archive', verification)
-            self.mutate('archive', 'POST', f'/api/containers/{self.id}/archive', {})
-            self.preserved(before, archived=True)
-            self.assert_no_compute()
-            self.docker_retained(snapshot)
-            evidence = self.compare_samples(samples)
-            for item in evidence.values():
-                require(item['volume'].get('used_by') == [], 'Archived canonical volume is still attached')
-            for v in self.managed():
-                volume = self.incus(f'/1.0/storage-pools/{POOL}/volumes/custom/{v["dockerName"]}')
-                require(volume.get('config', {}).get('user.agentor.volume-id') == v['id'] and volume.get('used_by') == [],
-                        'Archived managed volume retention is ambiguous')
-            self.receipt('complete', {'record': self.record(), 'canonical': evidence, 'retainedDocker': snapshot,
-                                     'status': 'archived-native-source-retained', 'samplingIsNotFullVerification': True})
+            self.continue_from_unarchive(before, cid)
         except BaseException as error:
             self.receipt('error', {'errorType': type(error).__name__,
                          'reason': str(error) if isinstance(error, Refusal) else 'Unexpected failure; inspect private receipts and resource state',

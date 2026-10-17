@@ -187,6 +187,48 @@ class MigrationTests(unittest.TestCase):
         return {'record': record(), 'sourceDockerImage': IMAGE, 'managed': [],
                 'environmentClone': {'id': m.ENV_CLONES[m.DEFAULT_ENV]}}
 
+    def test_execute_delegates_once_after_exact_unarchive_identity(self):
+        with tempfile.TemporaryDirectory() as root:
+            migration = FakeMigration(Path(root))
+            before = self.before(migration)
+            def continued(received, cid):
+                self.assertTrue(migration.executing)
+                self.assertIs(received, before)
+                self.assertEqual(cid, CID)
+            with patch.object(migration, 'continue_from_unarchive', side_effect=continued) as proceed, \
+                 patch.object(m, 'command_json', side_effect=AssertionError('delegation must not inspect')):
+                migration.execute(before)
+            proceed.assert_called_once_with(before, CID)
+            self.assertEqual(migration.calls, [f'/api/archived/{WORKER}/unarchive'])
+            self.assertFalse(list(Path(root).glob('*error.private.json')))
+
+    def test_continuation_requires_execution_and_exact_container_id_before_any_effect(self):
+        with tempfile.TemporaryDirectory() as root:
+            migration = FakeMigration(Path(root))
+            with patch.object(m, 'command_json', side_effect=AssertionError('must not inspect')):
+                with self.assertRaisesRegex(m.Refusal, 'explicit --execute'):
+                    migration.continue_from_unarchive(self.before(migration), CID)
+                migration.executing = True
+                for cid in ('', 'c' * 63, 'C' * 64, 'container-name', None, []):
+                    with self.subTest(cid=cid), self.assertRaisesRegex(m.Refusal, 'exact Docker ID'):
+                        migration.continue_from_unarchive(self.before(migration), cid)
+            self.assertEqual(migration.calls, [])
+            self.assertFalse(list(Path(root).glob('migration-*')))
+
+    def test_continuation_preserves_source_identity_image_and_hardware_checks(self):
+        for field, value in [('Image', 'sha256:' + 'b' * 64),
+                             ('Config', {'Labels': {'agentor.id': 'another-worker'}}),
+                             ('HostConfig', {'Devices': [{'PathOnHost': '/fixture'}]}),
+                             ('HostConfig', {'DeviceRequests': [{'Count': -1}]})]:
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as root:
+                migration = FakeMigration(Path(root)); migration.executing = True
+                migration.source[field] = value
+                with patch.object(m, 'command_json', side_effect=migration.host_json):
+                    with self.assertRaises(m.Refusal):
+                        migration.continue_from_unarchive(self.before(migration), CID)
+                self.assertEqual(migration.calls, [])
+                self.assertFalse(list(Path(root).glob('migration-*')))
+
     def test_complete_mocked_lifecycle_retains_source_and_rearchives(self):
         with tempfile.TemporaryDirectory() as root:
             migration = FakeMigration(Path(root))
