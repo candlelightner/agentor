@@ -16,7 +16,7 @@ import { IncusAdminWorkspaceStorage } from './incus-admin-workspace-storage';
 import { IncusAdminNetworkBoundary, type AdminNativeNetwork } from './incus-admin-network';
 import { incusImageIdentity, type IncusWorkerImageIdentity } from './incus-worker-image';
 import { readBackupInstallationId } from './backup-installation';
-import { readCanonicalIncusBootstrap, incusConversionRecipeId } from './incus-image-converter';
+import { resolveAdministrativeNativeBase } from './admin-native-image';
 import { serializeIncusWorkerEnv, INCUS_GUEST_READINESS_SCRIPT, INCUS_MAIN_SESSION_PROBE } from './incus-worker-runtime';
 import { administrativeOwnerEnvironment, renderAdministrativeStartupScript, administrativeControlRepresentation } from './admin-workspace-runtime';
 import type { ContainerInfo, UserEnvVars } from '../../shared/types';
@@ -165,13 +165,8 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         const reference = this.config.workerImagePrefix + this.config.workerImage;
         await useDockerService().ensureImage(reference);
         const source = await useDockerService().workerOciImage(reference).inspect();
-        const alias = await this.client.getImageAlias(this.config.incusWorkerImage);
-        const image = incusImageIdentity(await this.client.getImage(alias.target));
-        const files = await readCanonicalIncusBootstrap(join(process.cwd(), '.output/server/incus-bootstrap'));
-        if (image.sourceImageId !== source.Id || image.recipeId !== incusConversionRecipeId(source.Id, files) ||
-            image.converterVersion !== 'v0.4.0')
-            throw failure('Approved native administrative base is not available for the exact worker OCI source');
-        return image;
+        return resolveAdministrativeNativeBase(this.config, this.client, source.Id,
+            join(process.cwd(), '.output/server/incus-bootstrap'));
     }
     async prepareCredential(record: Readonly<AdministrativeWorkspaceRecord>, issuer: () => Promise<string>) {
         await this.validateAuthority(record);
