@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { useContainerManager } from "./services";
-import { withWorkerLifecycleMutation, withOwnerWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
+import { withWorkerRuntimeSetup, withOwnerWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
 import { applyAdminNativePatch, validateAdminNativeState, type AdminNativeRuntimeIdentity,
   type AdminNativeMigration, type AdminNativeAcknowledge } from './admin-native-authority';
 import {
@@ -256,7 +256,7 @@ export class AdminWorkspaceStore {
     this.requireRuntime(); await this.init();
     const before = this.getRecord();
     if (!before || before.runtimeKind !== 'incus-vm') throw Object.assign(new Error('Native administrative identity is unavailable'), { statusCode: 409 });
-    return withWorkerLifecycleMutation(before.id, async () => {
+    return withWorkerRuntimeSetup(before.id, async () => {
       const record = this.getRecord();
       if (!record || !isDeepStrictEqual(record, before) || this.pendingCommit ||
           record.nativeRuntime?.pending || record.nativeRuntime?.deleting || record.nativeRuntime?.selectedOperation)

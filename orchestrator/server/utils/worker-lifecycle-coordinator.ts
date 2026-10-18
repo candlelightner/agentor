@@ -95,6 +95,12 @@ export function withWorkerLifecycleMutation<T>(
   return lifecycleCoordinator.withWorker(workerId, operation);
 }
 
+/** Credential-only work shares the worker queue without revoking healthy
+ * handles or acquiring an owner-wide network/lifecycle lock. */
+export function withWorkerRuntimeSetup<T>(workerId: string, operation: () => Promise<T>): Promise<T> {
+  return lifecycleCoordinator.withWorker(workerId, operation, { runtimeSetup: true });
+}
+
 /** Read-only reconciliation must not reinterpret a worker that is between
  * Docker mutations as missing. This exposes only lock occupancy, never the
  * queued operation or any caller data. */

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { PassThrough } from 'node:stream';
 import { useConfig, useContainerManager, useDockerService, useAdministrativeWorkspaceRuntime, useWorkerGroupStore } from '../../orchestrator/server/utils/services';
+import { useGroupAdminWorkspaceStore } from '../../orchestrator/server/utils/group-admin-workspace-store';
 import { useAdminWorkspaceStore } from '../../orchestrator/server/utils/admin-workspace-store';
 import { readAdministrativeRuntimeRecord, administrativeRuntimeOwner } from '../../orchestrator/server/utils/admin-native-authority';
 import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
@@ -117,6 +118,27 @@ for (const kind of ['platform', 'group'] as const) {
       try { await expect(requireWorkerSelf(event)).rejects.toMatchObject({ statusCode: 401 }); }
       finally { f.cm.resolveIncusCaller = resolve; }
     } finally { await f.cleanup(); }
+  });
+  test(`${kind} healthy native command and journal handles survive identity refresh but a real lifecycle mutation revokes them`, async () => {
+    const f = await fixture(kind), store = kind === 'platform' ? useAdminWorkspaceStore() : useGroupAdminWorkspaceStore();
+    const privateStore = store as any, original = { runtime: privateStore.runtime, identityMaterializer: privateStore.identityMaterializer };
+    let journal: Awaited<ReturnType<typeof f.cm.openWorkerJournal>> | undefined, materialized = 0;
+    try {
+      const commands = f.cm.workerCommands(f.info.id);
+      journal = await f.cm.openWorkerJournal(f.info.id, { tail: 5 });
+      store.setRuntimeAdapter({ async ensure() {}, async start() {}, async stop() {}, async rebuild() {} });
+      store.setIdentityMaterializer(async record => {
+        expect(record.id).toBe(f.info.id); materialized++;
+        expect(journal!.isCurrent()).toBe(true);
+      });
+      if (kind === 'platform') await useAdminWorkspaceStore().refreshRunningIdentity();
+      else await useGroupAdminWorkspaceStore().refreshRunningIdentity((f.record as any).groupId);
+      expect(materialized).toBe(1); expect(journal.isCurrent()).toBe(true);
+      expect((await commands.execCapture(f.info.containerId, ['fixture'])).stdout.toString()).toBe('fixture-output');
+      await withOwnerWorkerLifecycleMutation(f.info.userId, f.info.id, async () => {});
+      expect(journal.isCurrent()).toBe(false);
+      await expect(commands.execCapture(f.info.containerId, ['fixture'])).rejects.toThrow('authority changed');
+    } finally { journal?.close(); Object.assign(privateStore, original); await f.cleanup(); }
   });
   test(`${kind} captured commands reject a lifecycle fence before dispatch`, async () => {
     const f = await fixture(kind);

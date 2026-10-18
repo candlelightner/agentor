@@ -1,6 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from "node:crypto";
-import { withWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
+import { withWorkerRuntimeSetup, withWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
 import { applyAdminNativePatch, type AdminNativeAcknowledge } from './admin-native-authority';
 import type {
   AdminWorkspaceIdentityMaterializationIntent,
@@ -196,7 +196,7 @@ export class GroupAdminWorkspaceStore {
     this.requireRuntime();
     const before = this.record(groupId);
     if (!before || before.runtimeKind !== 'incus-vm') throw Object.assign(new Error('Native group administrative identity is unavailable'), { statusCode: 409 });
-    return withWorkerLifecycleMutation(before.id, async () => {
+    return withWorkerRuntimeSetup(before.id, async () => {
       const record = this.record(groupId);
       if (!record || !isDeepStrictEqual(record, before) || this.pendingCommits.has(groupId) ||
           record.nativeRuntime?.pending || record.nativeRuntime?.deleting || record.nativeRuntime?.selectedOperation)
