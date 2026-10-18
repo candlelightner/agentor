@@ -10,6 +10,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { Config } from './config';
 import { IncusClient, IncusError, IncusRequestRejected, type IncusInstance, type IncusInstanceCreateSpec } from './incus-client';
 import { assertSafeUserId } from './user-id';
+import { withOperationDeadline } from './operation-deadline';
 
 /** Private acknowledgement in the EXISTING ImageBuild, never portable image
  * metadata or a second operation store. Pending authority survives uncertainty. */
@@ -299,8 +300,21 @@ export class IncusImageConverter {
         if (code !== 0) throw new Error(`Isolated converter ${phase} failed (exit ${code}): ${stderr.toString('utf8')}`);
       };
       try {
-        if (stream) await Promise.all([pipeline(stream, session.stdin, { signal: request.signal }), session.result.then(exit)]);
-        else { session.stdin.end(); exit(await session.result); }
+        if (stream) {
+          try { await Promise.all([pipeline(stream, session.stdin, { signal: request.signal }), session.result.then(exit)]); }
+          catch (error) {
+            request.signal?.throwIfAborted();
+            // A guest that exits early closes stdin before its exit/stderr arrive.
+            // Keep the session open briefly for those diagnostics, never retry input.
+            let code: number | undefined;
+            try { code = await withOperationDeadline(session.result, 10_000, 'Isolated converter exec completion', request.signal); }
+            catch { /* A failed/unresponsive exec still preserves the input failure. */ }
+            request.signal?.throwIfAborted();
+            if (code !== undefined) exit(code);
+            const detail = error instanceof Error ? error.message.slice(0, 1024) : 'Input transfer failed';
+            throw new Error(`Isolated converter ${phase} stream failed${code === 0 ? ' (guest exit 0)' : ''}: ${detail}; ${stderr.toString('utf8')}`, { cause: error });
+          }
+        } else { session.stdin.end(); exit(await session.result); }
         await check();
       } finally { session.close(); }
     };

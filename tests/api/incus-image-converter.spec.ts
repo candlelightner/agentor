@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomUUID, createHash } from 'node:crypto';
-import { PassThrough, Readable } from 'node:stream';
+import { PassThrough, Readable, Writable } from 'node:stream';
 import { execFileSync } from 'node:child_process';
 import { IncusClient, IncusError, type IncusInstance, type IncusInstanceCreateSpec } from '../../orchestrator/server/utils/incus-client';
 import { IncusImageConverter, readCanonicalIncusBootstrap, incusConversionRecipeId,
@@ -94,6 +94,22 @@ async function fixture(run: (f: {
   };
   client.execStream = async (_name, command, options) => {
     commands.push(command); expect(options?.environment && Object.keys(options.environment)).toEqual(command[0] === '/usr/bin/cat' ? undefined : ['PATH', 'LC_ALL']);
+    if (command[0] === '/usr/bin/docker' && failure?.startsWith('stdin-')) {
+      const stdout = new PassThrough(), stderr = new PassThrough(); stdout.resume();
+      let resolve!: (code: number) => void, reject!: (error: Error) => void;
+      const result = new Promise<number>((yes, no) => { resolve = yes; reject = no; });
+      const stdin = new Writable({ write(_chunk, _encoding, callback) {
+        events.push('input-closed'); callback(new IncusError('Incus exec stdin closed', 502));
+        if (failure === 'stdin-never') return;
+        setTimeout(() => {
+          stderr.end('docker load: guest diagnostic'); stdout.end(); events.push('guest-result');
+          if (failure === 'stdin-transport') reject(new IncusError('Incus exec channel failed', 502));
+          else resolve(failure === 'stdin-zero' ? 0 : 1);
+        }, 25);
+      } });
+      return { stdin, stdout, stderr, operationId: randomUUID(), sendSignal() {}, result,
+        close() { events.push('exec-close'); reject(new Error('Session closed before guest observation')); stdout.destroy(); stderr.destroy(); } };
+    }
     const stdin = new PassThrough(); stdin.resume(); const stdout = new PassThrough(), stderr = new PassThrough();
     stdout.end(command[0] === '/usr/bin/cat' ? Buffer.alloc(65536) : Buffer.alloc(0));
     const identityFailure = command[2]?.includes('actual=$(docker image inspect') && failure === 'OCI-identity';
@@ -208,6 +224,46 @@ test('guest command diagnostics retain a fixed phase/exit code and bounded stder
     try { await f.converter.convert(f.input); } catch (error) { failure = error as Error; }
     expect(failure?.message).toContain('OCI-load failed (exit 1)');
     expect(Buffer.byteLength(failure!.message)).toBeLessThan(8400);
+    expect(f.receipts.at(-1)?.removed).toBe(true);
+  });
+});
+
+test('early closed OCI stdin preserves the later guest exit and stderr before exact converter cleanup', async () => {
+  await fixture(async f => {
+    f.fail('stdin-exit');
+    await expect(f.converter.convert(f.input)).rejects.toThrow('OCI-load failed (exit 1): docker load: guest diagnostic');
+    expect(f.events.indexOf('input-closed')).toBeLessThan(f.events.indexOf('guest-result'));
+    expect(f.events.indexOf('guest-result')).toBeLessThan(f.events.indexOf('exec-close'));
+    expect(f.events.indexOf('exec-close')).toBeLessThan(f.events.indexOf('stop'));
+    expect(f.receipts.at(-1)?.removed).toBe(true);
+    expect(f.commands.some(command => command[2]?.includes('actual=$(docker image inspect'))).toBe(false);
+  });
+});
+
+test('a failed OCI transfer remains a failure even with guest exit zero or a lost exec result', async () => {
+  for (const mode of ['stdin-zero', 'stdin-transport']) await fixture(async f => {
+    f.fail(mode);
+    await expect(f.converter.convert(f.input)).rejects.toThrow(mode === 'stdin-zero'
+      ? 'OCI-load stream failed (guest exit 0): Incus exec stdin closed; docker load: guest diagnostic'
+      : 'OCI-load stream failed: Incus exec stdin closed; docker load: guest diagnostic');
+    expect(f.events.indexOf('guest-result')).toBeLessThan(f.events.indexOf('exec-close'));
+    expect(f.receipts.at(-1)?.removed).toBe(true);
+    expect(f.commands.filter(command => command[0] === '/usr/bin/docker')).toHaveLength(1);
+  });
+});
+
+test('missing OCI exec result is bounded and cancellation interrupts the diagnostic wait', async () => {
+  for (const cancel of [false, true]) await fixture(async f => {
+    f.fail('stdin-never'); const controller = new AbortController();
+    const started = Date.now();
+    const pending = f.converter.convert({ ...f.input, signal: controller.signal });
+    const cancellation = cancel ? setInterval(() => {
+      if (f.events.includes('input-closed')) controller.abort(new Error('Test cancellation'));
+    }, 5) : undefined;
+    try { await expect(pending).rejects.toThrow(cancel ? 'Test cancellation' : 'OCI-load stream failed: Incus exec stdin closed'); }
+    finally { clearInterval(cancellation); }
+    expect(Date.now() - started).toBeLessThan(cancel ? 2000 : 15_000);
+    expect(f.events).not.toContain('guest-result'); expect(f.events).toContain('exec-close');
     expect(f.receipts.at(-1)?.removed).toBe(true);
   });
 });
