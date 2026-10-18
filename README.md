@@ -2,7 +2,7 @@
 
 [![Build and Push Docker Images](https://github.com/candlelightner/agentor/actions/workflows/docker-build.yml/badge.svg?branch=main)](https://github.com/candlelightner/agentor/actions/workflows/docker-build.yml)
 
-Self-hosted alternative to Claude Code Web, Codex in the Cloud, and similar managed agent environments. Spawns isolated AI coding agent workers in Docker containers, each with a live terminal, VS Code editor (browser + native tunnel), virtual desktop, TCP port + domain mapping, and GitHub integration, all managed through a web dashboard. Full control over the runtime environment.
+Self-hosted alternative to Claude Code Web, Codex in the Cloud, and similar managed agent environments. Runs isolated AI coding workers in Incus virtual machines, with explicit migration from existing Docker workers. Each worker has a live terminal, VS Code editor (browser + native tunnel), virtual desktop, TCP port + domain mapping, and GitHub integration, all managed through a web dashboard. Full control over the runtime environment.
 
 ![Agentor Dashboard](docs/screenshot.png)
 
@@ -19,7 +19,7 @@ All agents are installed in a single unified worker image. Start any agent via i
 ## Features
 
 - **User authentication & RBAC** — email/password/passkey login powered by [better-auth](https://www.better-auth.com/) with admin and user roles; admins create and manage other users, each user sees only their own workers/mappings/environments/etc. First-run setup creates the initial admin.
-- **Live terminal** — xterm.js WebSocket terminal with tmux session management
+- **Live terminal** — xterm.js WebSocket terminal with tmux session management, OSC52 clipboard handling with a selectable fallback, and resize handling during asynchronous attachment
 - **VS Code editor** — code-server per worker with Kilo Code preinstalled and per-user config, provider keys, login, and Kilo sessions shared across that user's workers
 - **Virtual desktop** — Xvfb + fluxbox + noVNC, accessible in-browser, with a keyboard-transparent Ctrl/Cmd+V clipboard bridge (host-clipboard images/text synced to the worker's X11 CLIPBOARD, then the paste key is replayed so GUI apps and Codex paste the synced content)
 - **Workspace file manager** — an optional Files popup on each running worker card to browse `/workspace`, upload/download (single file or true ZIP), mkdir, rename, move, and delete with symlink-escape protection (the quick Upload/Download/Export card actions remain)
@@ -30,30 +30,63 @@ All agents are installed in a single unified worker image. Start any agent via i
 - **Port & domain mapping** — unified Traefik reverse proxy handling both TCP port forwarding (localhost- or network-bound) and subdomain-based HTTP/HTTPS/TCP routing with TLS (Let's Encrypt HTTP-01/DNS-01 or self-signed CA), optional HTTP basic auth
 - **Auto-updates** — per-image or bulk image updates in production mode with registry-agnostic digest comparison (GHCR + Docker Hub), orchestrator self-replaces
 - **Resource limits** — per-environment CPU and memory constraints applied to every worker on that environment (plus a global default)
+- **Hardware grants** — cataloged, authorized devices with capability reporting and ownership checks; supported Intel GVT-g sharing and serial USB are explicit operator opt-ins, while VM grants reject storage and unsupported passthrough modes; see [Hardware permissions](docs/hardware-devices.md)
 - **Governed host mounts** — an empty-by-default platform path catalog, per-account entitlements, all/group/worker assignments, read-only-by-default access, downward-only group-admin delegation, and immediate stop/rebuild enforcement on revocation; see [Host mount permissions](docs/host-mounts.md)
-- **Persistent workspaces** — workspace data survives container stops, restarts, and archiving via named Docker volumes
-- **Bounded worker recovery** — durable running/stopped intent survives daemon restarts; unresponsive runtimes report safe diagnostics and can be recovered through UI/API/MCP without deleting persistent workspace, agent-data, or DinD volumes
+- **Persistent VM storage** — workspace, agent/editor state, selected persistent paths, managed volumes and optional native Docker data survive compute rebuilds and archiving; the VM root disk is disposable
+- **Bounded worker recovery** — durable running/stopped intent survives daemon restarts; unresponsive runtimes report safe diagnostics and can be recovered through UI/API/MCP while preserving canonical data; ambiguous operations retain explicit recovery fences
 - **Worker archiving** — archive workers to free resources while preserving workspace data; unarchive to restore
 - **Worker groups and managed networks** — organize related experiments, create all/group/selected-worker bridge networks, keep the internal management network unavailable to ordinary workers, and allow/deny the worker-self orchestrator API live per worker or inherited group
 - **Worker protection locks** — optional write-only per-worker passwords protect lifecycle/configuration, running-workspace file changes, apps/exposure mappings, rebuilds, archive/unarchive, in-place restore, and deletion across UI, API, and MCP routes
 - **File upload/download** — upload files/folders to running workers or during creation, download workspace as `.tar.gz`
-- **Docker-in-Docker** — opt-in per-environment, full Docker daemon inside workers (build, run, compose)
+- **Docker inside VMs** — opt-in per-environment Docker daemon for build, run and Compose, with a separate persistent guest block volume; legacy Docker workers retain Docker-in-Docker support
 - **Usage monitoring** — real-time usage/rate limit indicators for OAuth-authenticated agents (Claude, Codex, Gemini)
-- **Per-worker resource monitoring** — live CPU / RAM / disk / network metrics on each worker card, sourced entirely from the Docker API (OS-independent)
+- **Per-worker resource monitoring** — live CPU / RAM / disk / network metrics through the selected Incus or Docker runtime
 - **Durable worker export/import** — background jobs with progress, cancellation, expiry, and browser-streamed downloads produce portable `.tar` bundles; workspace-only is fast/default and advanced rootfs capture uses parallel level-1 gzip to avoid the historical single-core compression timeout, with legacy and transitional bundle import compatibility
 - **Storage visibility and cleanup** — administrator disk inventory covers workspace, images, cache, staging, and helpers, with conservative cleanup that preserves referenced images, active jobs, workspaces, and retained artifacts
-- **Encrypted backup and restore** — manual or exact-minute scheduled multi-workspace backups, retention, retry/resume/cancel, integrity verification, retroactive per-worker selection from existing multi-workspace artifacts, safe original/new-worker restore, local/fake providers, and independently linked Google Drive OAuth (administrator-configured in the dashboard with a write-only encrypted client secret)
-- **Whole-instance disaster recovery** — platform-admin encrypted snapshots combine a consistent `auth.db` backup, versioned `DATA_DIR` state (including image/template/plugin catalogs and desired plugin installations), and optional Agentor-owned Docker volumes; snapshots can be downloaded or synchronized through Google Drive, discovered/adopted on an empty installation, preflighted, and applied by a rollback-capable helper. Host files, deployment secrets, and Docker image layers remain explicit external dependencies; see [Instance disaster recovery](docs/instance-disaster-recovery.md)
+- **Encrypted backup and restore** — manual or exact-minute scheduled multi-workspace backups, retention, retry/resume/cancel, integrity verification, retroactive per-worker selection from existing multi-workspace artifacts, safe original/new-worker restore, local/fake providers, and independently linked Google Drive OAuth (administrator-configured in the dashboard with a write-only encrypted client secret). Archived-worker selections no longer block settings updates, and indexed archive verification avoids the previous slowdown on file-heavy backups.
+- **Whole-instance disaster recovery** — platform-admin encrypted snapshots combine a consistent `auth.db` backup, versioned `DATA_DIR` state (including image/template/plugin catalogs and desired plugin installations), and optional Agentor-owned Docker/native persistent data; snapshots can be downloaded or synchronized through Google Drive, discovered/adopted on an empty installation, preflighted, and applied by a rollback-capable helper. Host files, deployment secrets, and Docker image layers remain explicit external dependencies; see [Instance disaster recovery](docs/instance-disaster-recovery.md)
 - **Google Drive backup setup** — follow the [step-by-step OAuth guide](docs/google-drive-backups.md) to configure the Google Cloud client, link an account, and verify recovery
-- **Controlled custom images** — approved-base Dockerfile fragments and bounded uploaded contexts build asynchronously into immutable digest-pinned catalog versions with test workers, promotion/rollback, defaults, usage cleanup, and worker selection
+- **Controlled custom images** — approved-base Dockerfile fragments and bounded uploaded contexts build asynchronously into immutable digest-pinned OCI catalog versions; the approved OCI source and packaged VM bootstrap produce a local Incus image, with test workers, promotion/rollback and source retention
 - **Git-backed image recovery** — optional public/private GitHub catalog sync with conflict preservation, fine-grained PAT or short-lived GitHub App authentication, branch/PR workflows, Actions dispatch, and immutable GHCR recovery references
-- **Administrative workspace and internal MCP** — a persistent red `ADMIN / ORCHESTRATOR` terminal/editor/desktop workspace, isolated management network, Codex auto-discovery with rotating short-lived workload identity, live fail-closed tool policy, audited calls, worker-console access, and optional dashboard review of immutable configuration proposals
+- **Administrative VMs and internal MCP** — dedicated platform and group admin VMs with persistent terminal/editor/desktop workspaces, private management networks, Codex auto-discovery with rotating short-lived workload identity, live fail-closed tool policy, audited calls, native worker-console access, and optional dashboard review of immutable configuration proposals
 - **Worker plugin catalog** — scoped, versioned declarative plugins with bounded command/resource manifests, authenticated sandboxed private panes, per-worker lifecycle control, and a narrow worker-self MCP interface; see [Worker plugins](docs/plugins.md)
-- **Centralized logging** — collects logs from all containers (orchestrator, workers, traefik) with NDJSON storage, log rotation, and a live-streaming log viewer in the dashboard
+- **Centralized logging** — runtime-aware worker logs plus orchestrator/Traefik logs, NDJSON storage, rotation and live dashboard viewing; platform admins can read bounded, redacted server logs through MCP and download filtered JSONL
 - **Theme toggle** — switch between system default, light, and dark mode
 - **API docs** — auto-generated OpenAPI 3.1.0 spec with interactive Scalar UI at `/api/docs`
 
 ---
+
+## VM runtime and migration
+
+The orchestrator and Traefik still run in Docker. On a prepared host, enable Incus
+through the [rollout guide](docs/incus-rollout.md) and
+[`docker-compose.incus.yml`](docker-compose.incus.yml). The tested VM deployment
+is Ubuntu 24.04 amd64 with KVM; publishing an arm64 OCI image does not establish
+arm64 VM support. Native VMs use a 4 GiB memory default when no environment or
+shared limit is set; operator configuration can override it.
+
+Existing ordinary Docker workers migrate only through an explicit platform-admin
+operation. Successful migration retains the stopped Docker source for rollback
+until deliberate finalization. New and rebuilt platform/group admins require
+Incus VMs and fail closed when native provisioning is unavailable; existing Docker
+admin data needs an explicit operator transfer. See
+[administrative networking](docs/incus-admin-private-networks.md).
+
+Approved custom images remain OCI software sources. Agentor derives a local VM
+image using the packaged bootstrap rather than treating a Docker image as a VM
+disk. Rebuild preserves canonical persistent volumes; arbitrary changes to the
+root filesystem need a custom image, setup script or selected persistent path.
+
+Intel UHD620 mediated GPU use has passed real migration, rebuild, host reboot and
+Whisper/Vulkan workload checks. Physical GPU/PCI, SR-IOV and native-context
+assignment are unsupported. Physical USB attach/detach/revocation acceptance is
+still open in [#12](https://github.com/candlelightner/agentor/issues/12). Native-admin
+encrypted disaster recovery and compound updater/recovery tests remain tracked
+in [#13](https://github.com/candlelightner/agentor/issues/13); representative backup
+performance in [#10](https://github.com/candlelightner/agentor/issues/10); browser
+terminal retests in [#7](https://github.com/candlelightner/agentor/issues/7),
+[#14](https://github.com/candlelightner/agentor/issues/14) and
+[#15](https://github.com/candlelightner/agentor/issues/15).
 
 ## Management MCP parity
 
@@ -71,7 +104,8 @@ export remain fresh-reauthenticated human actions. See
 
 ## Quick Start
 
-No need to clone the repo — all images are pulled from GHCR.
+Start the Docker control plane from GHCR; VM operation also requires the host
+preparation linked below.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/candlelightner/agentor/main/install.sh | bash
@@ -83,6 +117,10 @@ This downloads `docker-compose.yml` and `.env` into the current directory. Then:
 2. Open **http://localhost:3000** and create your admin account
 3. Click your name in the sidebar footer → **Account** → fill in API keys / GitHub token, or follow the [Agent login (per user)](#agent-login-per-user) section to sign in via OAuth
 
+The installer downloads the Docker control-plane configuration; it does not prepare Incus. Follow
+the [VM rollout guide](docs/incus-rollout.md) before creating VMs or administrative
+workspaces.
+
 `.env` only contains orchestrator-wide settings (logging, Traefik, dashboard auth). All agent API keys, the GitHub token, and any custom env vars are configured per user from the dashboard.
 
 ---
@@ -91,7 +129,10 @@ This downloads `docker-compose.yml` and `.env` into the current directory. Then:
 
 ### Prerequisites
 
-- Docker Engine 24+ with Compose v2
+- Docker Engine 24+ with Compose v2 for the control plane
+- For VM workers and administrative workspaces: a prepared Linux/KVM host, Incus
+  and the operator-generated restricted-project/TLS configuration from the
+  [rollout guide](docs/incus-rollout.md)
 
 ### Configure
 
@@ -101,7 +142,7 @@ This downloads `docker-compose.yml` and `.env` into the current directory. Then:
    cp .env.example .env
    ```
 
-2. Edit `.env` if you want to override any orchestrator-wide settings (everything works out of the box). All user-scoped secrets — agent API keys, GitHub token, custom env vars — are configured per user from the **Account** modal in the dashboard, not via `.env`.
+2. Edit `.env` if you want to override any orchestrator-wide settings (VM settings require host preparation). All user-scoped secrets — agent API keys, GitHub token, custom env vars — are configured per user from the **Account** modal in the dashboard, not via `.env`.
 
 ---
 
@@ -127,7 +168,8 @@ Development mode mounts the orchestrator source code into the container with hot
 
 ### Production
 
-Production mode uses pre-built images from GHCR — no local builds needed.
+Production mode uses pre-built OCI images from GHCR. Native VM image conversion
+happens locally after host preparation; see the [rollout guide](docs/incus-rollout.md).
 
 ```bash
 docker compose -f docker-compose.prod.yml up -d
@@ -142,6 +184,24 @@ Open **http://localhost:3000**
 > The Traefik reverse proxy (`agentor-traefik`) is managed automatically by the orchestrator and handles both port mappings and domain mappings on the same container. It is created when the first port/domain mapping is added (or the dashboard subdomain is configured) and removed when all of those are gone. Mapped ports are arbitrary — no fixed ranges — but `80`/`443` are reserved when domain routing is active.
 
 ---
+
+## Image publishing and updates
+
+The [image workflow](.github/workflows/docker-build.yml) builds these OCI images
+for amd64 and arm64:
+
+- `ghcr.io/candlelightner/agentor-worker` — the worker software base used by the VM converter.
+- `ghcr.io/candlelightner/agentor-orchestrator` — the control plane and its matching VM bootstrap assets.
+
+Pull requests validate and build without publishing. Applicable successful main,
+release-tag and manual runs publish multiarchitecture manifests to GHCR. Main
+uses `latest`, `main` and `sha-…` tags; releases also use semantic-version tags.
+VM disks, workspaces and backup data stay on the host and are never published.
+
+Publishing does not rebuild existing VMs. Worker **Apply** stages and converts the
+approved OCI update before promoting the native default; existing workers retain
+their pinned source. See [native image updates](docs/production.md#native-worker-image-updates)
+for configuration, failure handling and remaining live acceptance.
 
 ## Agent login (per user)
 
@@ -243,7 +303,13 @@ only the account holder can complete.
 
 ## Storage
 
-By default, all persistent data lives in `./data/` on the host — easy to browse, back up, and migrate. To use a Docker named volume instead, change the `/data` mount in your compose file:
+The control plane keeps account/configuration state and backup metadata in its
+`/data` mount, backed by `./data/` or a named Docker volume. Native VM disks and
+persistent worker volumes live separately in the configured Incus storage pool
+(`INCUS_STORAGE_POOL`); set that pool up on the intended host drive or SSD.
+Converter scratch can use a separate `INCUS_CONVERTER_STORAGE_POOL`.
+
+To use a Docker named volume for the control plane, change its `/data` mount:
 
 ```yaml
 # Directory mode (default):
@@ -253,7 +319,18 @@ By default, all persistent data lives in `./data/` on the host — easy to brows
 - agentor-data:/data
 ```
 
-The storage mode is auto-detected from the mount type — no env var changes needed. In directory mode, each worker's workspace lives at `./data/users/<userId>/workspaces/<workerId>/` and can be accessed directly from the host.
+The control-plane storage mode is auto-detected from the mount type. Legacy
+Docker workers in directory mode use
+`./data/users/<userId>/workspaces/<workerId>/`. Native workspace/agent state uses
+Incus custom filesystem volumes, while optional Docker data uses a guest block
+volume; rebuild replaces compute while retaining those volumes. Other root-disk
+paths are not automatically persistent.
+
+Canonical workspace/agent virtiofs mounts currently use `io.cache=unsafe` for
+SQLite shared-memory compatibility and require exclusive access by the owning
+guest while running. Shared account and authorized host mounts retain their own
+policies. Back up control-plane state, native persistent data and recovery keys;
+`./data/` alone is not a complete VM backup.
 
 ## Ports
 
