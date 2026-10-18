@@ -56,7 +56,15 @@ test('production Incus override preserves legacy control plane and grants only i
 });
 
 test('Incus override fails configuration before deployment without required operator image authority', async () => {
-  const env = { ...process.env }; delete env.AGENTOR_INCUS_ORCHESTRATOR_IMAGE;
+  const env: NodeJS.ProcessEnv = { ...process.env,
+    INCUS_WORKER_GATEWAY: '10.45.0.1', INCUS_TLS_NAME: 'incus.internal', INCUS_API_HOST_ADDRESS: '172.30.0.1',
+    INCUS_CLIENT_CERT_SOURCE: '/tmp/client.crt', INCUS_CLIENT_KEY_SOURCE: '/tmp/client.key',
+    INCUS_SERVER_CERT_SOURCE: '/tmp/server.crt', INCUS_POLICY_CERT_SOURCE: '/tmp/policy.crt',
+    INCUS_ENDPOINT: 'https://incus.internal:8443', INCUS_PROJECT: 'agentor-private', INCUS_NETWORK: 'owned-workers',
+    INCUS_STORAGE_POOL: 'owned-data', INCUS_CONVERTER_STORAGE_POOL: 'owned-scratch', INCUS_WORKER_IMAGE: 'owned-derived',
+    INCUS_CONVERTER_SEED_FINGERPRINT: 'a'.repeat(64), INCUS_NETWORK_HOST_ENDPOINT: 'https://incus.internal:8444',
+    INCUS_INTERNAL_GATEWAY_URL: 'http://10.45.0.1:3079' };
+  delete env.AGENTOR_INCUS_ORCHESTRATOR_IMAGE;
   const result = spawnSync('docker', ['compose', '-f', '../docker-compose.incus.yml', 'config', '--quiet'], { env, encoding: 'utf8' });
   expect(result.status).not.toBe(0);
   expect(result.stderr).toContain('AGENTOR_INCUS_ORCHESTRATOR_IMAGE');
