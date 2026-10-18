@@ -18,7 +18,7 @@ export function useDomainMappings() { return { mappings: ref([]) }; }
 export function useWorkerGroups() {
   const groups = ref([
     { id: 'root-group', name: 'Research', workerIds: ['ordinary-fixture'], memberCounts: { total: 1, active: 1, archived: 0 }, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
-    { id: 'nested-group', name: 'Nested team', parentId: 'root-group', workerIds: ['nested-fixture', 'archived-fixture'], memberCounts: { total: 2, active: 1, archived: 1 }, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
+    { id: 'nested-group', ...(window.location.search.includes('groupAdmin') ? { adminWorkspace: { id: 'group-admin-fixture' } } : {}), name: 'Nested team', parentId: 'root-group', workerIds: ['nested-fixture', 'archived-fixture'], memberCounts: { total: 2, active: 1, archived: 1 }, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
   ]);
   return { groups, refresh: () => {} };
 }

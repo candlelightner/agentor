@@ -116,3 +116,22 @@ for (const theme of ['light', 'dark'] as const) {
     expect(overflow).toEqual([]);
   });
 }
+
+for (const status of ['running', 'stopped']) test(`admin ${status} card uses confirmed management instead of worker lifecycle`, async ({ page }) => {
+  await page.goto(`/?role=admin&adminStatus=${status}`);
+  if (status === 'stopped') await page.locator('aside [data-tab-id="stopped"]').click();
+  const card = page.locator('.sidebar-worker-card-admin');
+  await expect(card).toBeVisible();
+  await expect(card.getByRole('button')).toHaveCount(status === 'stopped' ? 1 : 9);
+  await card.getByRole('button', { name: 'Manage administrative workspace', exact: true }).click();
+  expect(await page.evaluate(() => (window as any).__lastAction)).toBe('openAdminWorkspace');
+});
+
+for (const status of ['running', 'stopped']) test(`nested group admin ${status} card opens group administration`, async ({ page }) => {
+  await page.goto(`/?role=admin&groupAdmin=1&adminStatus=${status}`);
+  if (status === 'stopped') await page.locator('aside [data-tab-id="stopped"]').click();
+  const card = page.locator('.sidebar-worker-card').filter({ hasText: 'Group admin' });
+  await expect(card).toBeVisible();
+  await card.getByRole('button', { name: 'Manage administrative workspace', exact: true }).click();
+  expect(await page.evaluate(() => (window as any).__lastAction)).toBe('manageWorkerGroups');
+});

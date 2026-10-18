@@ -1,11 +1,13 @@
 <script setup lang="ts">
 const query = new URLSearchParams(window.location.search);
 const role = query.get('role') === 'ordinary' ? 'ordinary' : 'admin';
+const adminStatus = query.get('adminStatus') === 'stopped' ? 'stopped' : 'running';
 const width = query.get('width') === 'narrow' ? 200 : 420;
 const containers = [
   { id: 'ordinary-fixture', displayName: 'Research worker', status: 'running', imageId: 'sha256:1234567890abcdef' },
   { id: 'nested-fixture', displayName: 'Nested worker', status: 'running', imageId: 'sha256:67890abcdef12345' },
-  ...(role === 'admin' ? [{ id: 'platform-fixture', displayName: 'Platform admin', status: 'running', administrativeKind: 'platform', imageId: 'sha256:abcdef1234567890' }] : []),
+  ...(query.has('groupAdmin') ? [{ id: 'group-admin-fixture', displayName: 'Group admin', status: adminStatus, administrativeKind: 'group', imageId: 'sha256:abcdef1234567890' }] : []),
+  ...(role === 'admin' ? [{ id: 'platform-fixture', displayName: 'Platform admin', status: adminStatus, administrativeKind: 'platform', imageId: 'sha256:abcdef1234567890' }] : []),
 ];
 const archivedWorkers = [
   { id: 'archived-fixture', displayName: 'Archived worker', archivedAt: '2026-09-01T00:00:00Z', createdAt: '2026-08-01T00:00:00Z' },
@@ -32,6 +34,7 @@ useHead({ title: 'Sidebar QA fixture' });
         :archived-workers="archivedWorkers as any"
         @new-worker="record('newWorker')"
         @open-admin-workspace="record('openAdminWorkspace')"
+        @manage-worker-groups="record('manageWorkerGroups')"
       />
       <section class="flex-1 p-8 bg-gray-100 dark:bg-gray-950 text-gray-500">Sidebar style QA fixture</section>
     </main>

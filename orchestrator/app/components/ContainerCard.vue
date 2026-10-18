@@ -9,6 +9,7 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
+  manageAdministration: [kind: "platform" | "group"];
   openTerminal: [containerId: string];
   openDesktop: [containerId: string];
   openApps: [containerId: string];
@@ -112,7 +113,7 @@ function onHScrollWheel(e: WheelEvent) {
       <h3
         class="text-sm font-semibold text-gray-900 dark:text-white whitespace-nowrap flex-shrink-0 cursor-pointer hover:opacity-80 transition-opacity"
         :title="displayLabel"
-        @click="showDetail = true"
+        @click="container.administrativeKind ? emit('manageAdministration', container.administrativeKind) : showDetail = true"
       >
         {{ displayLabel }}
       </h3>
@@ -209,6 +210,10 @@ function onHScrollWheel(e: WheelEvent) {
         <span class="w-px h-4 bg-gray-300 dark:bg-gray-600 flex-shrink-0" />
       </template>
 
+      <UTooltip v-if="container.administrativeKind" text="Manage administrative workspace">
+        <UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-shield" aria-label="Manage administrative workspace" @click="emit('manageAdministration', container.administrativeKind)" />
+      </UTooltip>
+      <template v-else>
       <!-- Lifecycle -->
       <div class="flex items-center gap-0.5 flex-shrink-0">
         <UTooltip v-if="isStopped" text="Export worker">
@@ -242,6 +247,7 @@ function onHScrollWheel(e: WheelEvent) {
           <UButton size="xs" color="error" variant="subtle" icon="i-lucide-trash-2" @click="emit('remove', container.id)" />
         </UTooltip>
       </div>
+      </template>
     </div>
 
     <div v-if="isRunning && cardPluginActions.length" class="card-plugin-actions mt-2 flex items-center gap-1.5 overflow-x-auto" data-testid="worker-plugin-actions" @wheel="onHScrollWheel">

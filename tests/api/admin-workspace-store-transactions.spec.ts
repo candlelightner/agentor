@@ -529,3 +529,28 @@ for (const scoped of [false, true]) test(`${scoped ? 'group' : 'platform'} admin
   expect(await get()).toEqual({ memoryLimit: '8GiB', appliedMemoryLimit: '4GiB', pendingRebuild: true });
   expect(scoped ? fake.findById(group.id)?.adminWorkspace?.memoryLimit : global.getRecord()?.memoryLimit).toBe('8GiB');
 });
+
+for (const scoped of [false, true]) test(`${scoped ? 'group' : 'platform'} admin status observes stopped compute without changing desired state and rejects a concurrent lifecycle`, async () => {
+  const global = new AdminWorkspaceStore('/unused', async () => {});
+  const fake = new FakeGroups(), { group } = groupRecord('status-owner', 'status-group');
+  fake.records.set(group.id, group);
+  const groups = new GroupAdminWorkspaceStore(fake as any);
+  let observe: () => Promise<'running' | 'stopped'> = async () => 'stopped';
+  const adapter = runtime({ observeStatus: () => observe() });
+  global.setRuntimeAdapter(adapter); groups.setRuntimeAdapter(adapter);
+  await global.ensure();
+  const get = () => scoped ? groups.getStatus(group.id) : global.getStatus();
+  const desired = () => scoped ? fake.findById(group.id)?.adminWorkspace?.status : global.getRecord()?.status;
+  await expect(get()).resolves.toMatchObject({ status: 'stopped' });
+  expect(desired()).toBe('running');
+  observe = async () => { throw Object.assign(new Error('Host policy rejected inspection'), { statusCode: 409 }); };
+  await expect(get()).rejects.toThrow('Host policy rejected');
+  let release!: (value: 'running') => void;
+  observe = () => new Promise(resolve => { release = resolve; });
+  const stale = get();
+  await expect.poll(() => Boolean(release)).toBe(true);
+  if (scoped) fake.records.get(group.id)!.adminWorkspace!.status = 'stopped';
+  else await global.setStatus('stopped');
+  release('running');
+  await expect(stale).rejects.toMatchObject({ statusCode: 503 });
+});

@@ -226,7 +226,11 @@ export class GroupAdminWorkspaceStore {
         throw Object.assign(new Error('Group administrative workspace operation is not settled; retry'), { statusCode: 503 });
       if (!record)
         throw Object.assign(new Error('Group administrative workspace not provisioned'), { statusCode: 404 });
-      return this.publicRecord(record);
+      const status = await this.runtime?.observeStatus?.(record) ?? record.status;
+      authorize?.();
+      if (this.running.has(groupId) || this.pendingCommits.has(groupId) || !isDeepStrictEqual(record, this.record(groupId)))
+        throw Object.assign(new Error('Group administrative workspace changed during status inspection; refresh status'), { statusCode: 503 });
+      return { ...this.publicRecord(record), status };
     });
   }
   private requireRuntime() {

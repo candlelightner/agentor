@@ -534,6 +534,7 @@ def main():
     parser.add_argument("--enable-usb", action="store_true", help="Explicitly allow serial-numbered, non-storage USB VM grants; GPU requires a separate explicit mdev profile; PCI remains blocked")
     parser.add_argument("--gpu-mdev-profile", default="", help="Explicit Intel GVT-g profile currently exposed with free capacity; never changes kernel/modules or creates mdevs")
     parser.add_argument("--install-lts", action="store_true", help="Explicitly offer fingerprint-pinned signed Zabbly Incus 6.0 LTS packages")
+    parser.add_argument("--update-policy", action="store_true", help="Update installed host policy/scripts using --config; no resource provisioning, image conversion or routing changes")
     parser.add_argument("--routing", action="store_true", help="Installed systemd use only: refresh this installation's exact routing")
     parser.add_argument("--config", help="Installed root-owned /etc/agentor/incus/<installationUUID>/config.json")
     parser.add_argument("--trusted-worker-image", default=os.environ.get("AGENTOR_TRUSTED_WORKER_IMAGE", ""),
@@ -547,15 +548,22 @@ def main():
     for argument, default in (("https-port", 8443), ("policy-port", 8444), ("internal-port", 3079)): parser.add_argument("--" + argument, type=int, default=default)
     args = parser.parse_args(); require(os.geteuid() == 0, "Run this operator installer with sudo")
     os.umask(0o077)
-    if args.routing:
+    require(not (args.routing and args.update_policy), "Choose either --routing or --update-policy")
+    if args.routing or args.update_policy:
         require(args.config and re.fullmatch(r"/etc/agentor/incus/[a-f0-9-]{36}/config.json", args.config), "Routing requires its exact installed operator config")
         path = Path(args.config); SOURCES.directory_identity(str(path.parent))
         info = path.lstat(); require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= 16384, "Routing config is not private/owned/regular")
         config = json.loads(path.read_text()); require(UUID.fullmatch(config["installation"]) and path.parent.name == config["installation"], "Routing installation identity differs")
         require(config["sourceTable"] == "agentor_source_" + config["installation"].replace("-", "")[:8]
                 and re.fullmatch(r"[A-Za-z0-9_-]{1,15}", config["network"]), "Installed routing namespace is invalid")
-        routing(config); print("Owned routing refreshed; no worker/data changes."); return
-    require(not args.config, "--config is only for the installed bounded --routing mode")
+        if args.update_policy:
+            require(installation_id(config["dataDir"]) == config["installation"], "Installation identity changed")
+            install_units(config, path.parent, Path("/usr/local/lib/agentor-incus") / config["installation"])
+            print("Owned host policy updated and restarted; no VM, image, routing or canonical data changes.")
+        else:
+            routing(config); print("Owned routing refreshed; no worker/data changes.")
+        return
+    require(not args.config, "--config requires the installed bounded --routing or --update-policy mode")
     release = dict(line.split("=", 1) for line in Path("/etc/os-release").read_text().splitlines() if "=" in line)
     require(release.get("ID", "").strip('"') == "ubuntu" and release.get("VERSION_ID", "").strip('"') == "24.04" and os.uname().machine == "x86_64", "Supported Ubuntu24 amd64 host required")
     require(stat.S_ISCHR(os.stat("/dev/kvm").st_mode), "KVM is unavailable; enable host virtualization before setup")

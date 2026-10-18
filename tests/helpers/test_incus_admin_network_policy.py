@@ -276,6 +276,51 @@ class AdminNetworkTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assertEqual(self.mutations(), [])
 
+    def test_applied_memory_admits_rebuilt_vm_and_ignores_pending_desired_limit(self):
+        result = self.policy.ensure(self.payload)
+        self.instance = self.owned_instance(result)
+        # A saved desired limit must not authorize different existing compute.
+        self.record['memoryLimit'] = '6GiB'
+        self.save()
+        self.policy.inspect(self.payload)
+        self.instance['config']['limits.memory'] = '6GiB'
+        with self.assertRaises(MODULE.PolicyError):
+            self.policy.inspect(self.payload)
+        self.record['nativeRuntime']['memoryLimit'] = '6GiB'
+        self.save()
+        for operation in (self.policy.inspect, self.policy.ensure):
+            self.assertEqual(operation(self.payload), result)
+        for limit in ('1.5GiB', '6442450944B', '6144MiB', '6291456KiB'):
+            self.record['nativeRuntime']['memoryLimit'] = limit
+            self.instance['config']['limits.memory'] = limit
+            self.save()
+            self.policy.inspect(self.payload)
+
+    def test_invalid_applied_memory_rejects_before_host_calls(self):
+        for limit in ('', '0B', '0GiB', '-1GiB', 'unlimited', '50%', 'NaNGiB',
+                      '9007199254740992B', '999999999999999999999999999GiB', '6gb', 6, None):
+            with self.subTest(limit=limit):
+                self.record['nativeRuntime']['memoryLimit'] = limit
+                self.save()
+                self.calls.clear()
+                with self.assertRaisesRegex(MODULE.PolicyError, 'memory limit'):
+                    self.policy.ensure(self.payload)
+                self.assertEqual(self.calls, [])
+
+    def test_group_rebuilt_vm_uses_applied_memory_authority(self):
+        self.path.unlink()
+        self.record.update(kind='group-administrative', groupId='group-fixture', ownerId='healthy-owner')
+        self.record['nativeRuntime']['memoryLimit'] = '6GiB'
+        (self.root / 'users' / 'healthy-owner' / 'worker-groups.json').write_text(json.dumps([
+            {'id': 'group-fixture', 'userId': 'healthy-owner', 'adminWorkspace': self.record}]))
+        result = self.policy.ensure(self.payload)
+        self.instance = self.owned_instance(result)
+        self.instance['config']['limits.memory'] = '6GiB'
+        self.policy.inspect(self.payload)
+        self.instance['config']['limits.memory'] = '4GiB'
+        with self.assertRaises(MODULE.PolicyError):
+            self.policy.inspect(self.payload)
+
     def test_absent_read_only_inspection_does_not_allocate(self):
         self.assertIsNone(self.policy.inspect(self.payload))
         self.assertEqual(self.mutations(), [])

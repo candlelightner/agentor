@@ -1,6 +1,6 @@
 import { isIP } from 'node:net';
 import type { Config } from './config';
-import { IncusClient, type IncusDevice } from './incus-client';
+import { IncusClient, IncusError, type IncusDevice } from './incus-client';
 import type { AdministrativeWorkspaceRecord } from './admin-workspace-store';
 import { administrativeRuntimeOwner } from './admin-native-authority';
 export interface AdminNativeNetwork {
@@ -28,7 +28,13 @@ export class IncusAdminNetworkBoundary {
         const owner = administrativeRuntimeOwner(record), native = record.nativeRuntime;
         if (!native || record.runtimeKind !== 'incus-vm')
             throw new Error('Native administrative intent must be durable before network admission');
-        const v = await this.client.request<AdminNativeNetwork>('POST', `/v1/admin-networks/${action}`, { workspaceId: record.id });
+        let v: AdminNativeNetwork;
+        try { v = await this.client.request<AdminNativeNetwork>('POST', `/v1/admin-networks/${action}`, { workspaceId: record.id }); }
+        catch (error) {
+            if (!(error instanceof IncusError) || error.statusCode !== 409) throw error;
+            const message = 'Administrative host policy rejected the VM identity. Verify the installed Incus host policy and VM identity before retrying.';
+            throw Object.assign(new Error(message), { statusCode: 409, statusMessage: message });
+        }
         const prefix = v?.gateway?.split('.').slice(0, 3).join('.');
         if (!v || v.installation !== native.installationId || v.workspaceId !== record.id || v.ownerId !== owner.userId ||
             v.kind !== record.kind || v.groupId !== owner.groupId || !/^[A-Za-z0-9_-]{1,15}$/.test(v.network) ||
