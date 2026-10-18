@@ -1356,6 +1356,21 @@ test("real production worker create/start, inventory and reprovisioning", async 
     expect(services.returnCode).toBe(0);
     expect(services.stdout).toContain("302");
     expect(services.stdout).toContain("200");
+    const walCommand = ["python3", "-c", `from contextlib import closing
+from tempfile import TemporaryDirectory
+import sqlite3
+for path in ("/workspace", "/home/agent/.agent-data"):
+    with TemporaryDirectory(prefix=".agentor-sqlite-wal-", dir=path) as directory:
+        with closing(sqlite3.connect(directory + "/probe.sqlite")) as writer:
+            assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+            writer.execute("CREATE TABLE probe (value TEXT)")
+            writer.execute("INSERT INTO probe VALUES ('accepted')")
+            writer.commit()
+            with closing(sqlite3.connect(directory + "/probe.sqlite")) as reader:
+                assert reader.execute("SELECT value FROM probe").fetchone()[0] == "accepted"
+`];
+    const wal = await runtime.client.exec(name!, walCommand, { command: walCommand, user: 1000, group: 1000 });
+    expect(wal.returnCode, wal.stderr).toBe(0);
     accountSetting = 'new-account';
     const current = manager.get(info.id)!;
     current.initScript = ': # pending-init'; current.environmentId = 'pending-or-deleted-environment'; current.pendingRebuild = true;
@@ -1457,4 +1472,21 @@ for (const kind of ['usb', 'gpu'] as const) test(`${kind} runtime creates only e
     await runtime.stop(opts, instance.config['volatile.uuid']);
     expect(fake.events.some(event => event.operation === 'stop')).toBe(true);
   } finally { await rm(dataDir, { recursive: true, force: true }); }
+});
+
+
+test('normal startup accepts existing and SQLite-capable canonical shares but rejects other cache modes before starting services', async () => {
+  const { client, events } = fakeClient(), runtime = new IncusWorkerRuntime(config, client as any), opts = options();
+  await runtime.create(opts);
+  const instance = await client.getInstance(opts.containerName);
+  expect(instance.devices.workspace['io.cache']).toBe('unsafe');
+  expect(instance.devices.agents['io.cache']).toBe('unsafe');
+  delete instance.devices.workspace['io.cache']; delete instance.devices.agents['io.cache'];
+  await runtime.start(opts, 'original-uuid');
+  instance.devices.agents['io.cache'] = 'unsafe';
+  await runtime.start(opts, 'original-uuid');
+  instance.devices.agents['io.cache'] = 'metadata';
+  const before = events.length;
+  await expect(runtime.start(opts, 'original-uuid')).rejects.toThrow('persistent layout');
+  expect(events.slice(before).some(event => ['start', 'file', 'exec'].includes(event.operation))).toBe(false);
 });

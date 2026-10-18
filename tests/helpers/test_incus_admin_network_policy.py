@@ -321,6 +321,24 @@ class AdminNetworkTests(unittest.TestCase):
         self.policy.network(identity)
         self.policy.inspect_instance(identity, result)
 
+    def test_filesystem_cache_unsafe_or_legacy_omission_preserves_exact_admin_layout(self):
+        result = self.policy.ensure(self.payload)
+        identity = self.policy.authority(self.payload)
+        self.instance = self.owned_instance(result)
+        self.policy.inspect_instance(identity, result)
+        for devices in (self.instance['devices'], self.instance['expanded_devices']):
+            for role in ('workspace', 'agents'):
+                devices[role]['io.cache'] = 'unsafe'
+        self.policy.inspect_instance(identity, result)
+        for mode in ('none', 'metadata', 'writeback', '', None):
+            self.instance['devices']['agents']['io.cache'] = mode
+            with self.assertRaises(MODULE.PolicyError):
+                self.policy.inspect_instance(identity, result)
+        self.instance['devices']['agents']['io.cache'] = 'unsafe'
+        self.instance['devices']['agents']['source'] = 'foreign'
+        with self.assertRaises(MODULE.PolicyError):
+            self.policy.inspect_instance(identity, result)
+
     def test_group_incus_label_is_required_exactly_for_bridge_and_vm(self):
         self.path.unlink()
         self.record.update(kind='group-administrative', ownerId='healthy-owner', groupId='legacy_group')

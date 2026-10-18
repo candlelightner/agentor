@@ -225,7 +225,7 @@ export class IncusAdminWorkspaceStorage {
             }
             if (!volume)
                 throw new Error('Administrative persistent data is missing; explicit recovery is required');
-            devices[role] = { type: 'disk', pool: this.config.incusStoragePool, source: volume.name,
+            devices[role] = { type: 'disk', 'io.cache': 'unsafe', pool: this.config.incusStoragePool, source: volume.name,
                 path: role === 'workspace' ? '/workspace' : '/home/agent/.agent-data' };
         }
         return { ...devices, ...selected };

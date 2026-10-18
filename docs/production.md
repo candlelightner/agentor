@@ -287,3 +287,13 @@ Default promotion records exact approved historical OCI/recipe tuples in the exi
 Historical archives captured before these private approvals existed may lack proof for a different old OCI in a cold recovery installation. They require an exact retained local approval or an explicitly operator-approved restore source; the portable descriptor alone is insufficient. Local history supports old backups after normal default promotion, and future default creation/promotion includes the approval in subsequent whole-instance snapshots.
 
 Before moving the mutable default, native Apply retains the exact previous local amd64 OCI under `agentor-native-source:sha256-<image-id>`. Existing conflicting tags fail closed; a lost tag response is accepted only after exact readback. This keeps original rebuild userspace through Agentor’s existing dangling-image prune, without re-pulling historical sources or broadening image authority. Removing these retention tags or running an external destructive full prune can still make an original source unavailable.
+
+Canonical Incus workspace and agent-data shares use `io.cache=unsafe` (virtiofsd
+`--cache=always`) so SQLite WAL shared-memory mappings work. These private volumes
+belong to one worker or administrative VM; lifecycle checks reject foreign
+attachments, and offline archive/restore helpers require the owning VM stopped.
+Do not modify their contents through host paths or attach another running guest.
+Explicit stop/device update/start or rebuild is required for existing VMs; the
+application does not change their cache policy automatically. Account Kilo shares,
+host exports and managed selections retain their existing cache mode and may not
+support SQLite WAL. `metadata` alone still uses direct I/O and does not fix WAL.

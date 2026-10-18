@@ -1,3 +1,4 @@
+import { sameIncusDevice, sameIncusDevices } from '../../orchestrator/server/utils/incus-device-layout';
 import { test, expect } from "@playwright/test";
 import { IncusWorkerStorage } from "../../orchestrator/server/utils/incus-worker-storage";
 import type { Config } from "../../orchestrator/server/utils/config";
@@ -32,8 +33,9 @@ function fixture() {
 test("filesystem persistence is separate from disposable root and Docker capability", async () => {
   const { storage, volumes } = fixture();
   const devices = await storage.devices(owner, false);
-  expect(devices.workspace).toEqual({ type: "disk", pool: "pool", source: `${owner.containerName}-workspace`, path: "/workspace" });
+  expect(devices.workspace).toEqual({ type: "disk", 'io.cache': 'unsafe', pool: "pool", source: `${owner.containerName}-workspace`, path: "/workspace" });
   expect(devices.agents.path).toBe("/home/agent/.agent-data");
+  expect(devices.agents['io.cache']).toBe('unsafe');
   expect(devices.docker).toBeUndefined();
   expect(volumes.size).toBe(2);
 });
@@ -318,4 +320,22 @@ test('real Incus retains Docker expectation without compute and refuses empty re
     await expect(reloaded.devices(target, true, { docker: false })).rejects.toThrow('Existing Incus docker volume is missing');
     await expect(client.getCustomVolume(live.incusStoragePool, docker.name)).rejects.toMatchObject({ statusCode: 404 });
   } finally { await storage.remove(target); }
+});
+
+test('native filesystem layout permits legacy cache omission or unsafe while keeping every other field exact', () => {
+  const legacy = { type: 'disk', pool: 'pool', source: 'owned-agents', path: '/home/agent/.agent-data' };
+  const current = { ...legacy, 'io.cache': 'unsafe' };
+  for (const actual of [legacy, current]) {
+    expect(sameIncusDevice(actual, current)).toBe(true);
+    expect(sameIncusDevices({ agents: actual }, { agents: current })).toBe(true);
+  }
+  for (const mode of ['none', 'metadata', 'writeback', ''])
+    expect(sameIncusDevice({ ...legacy, 'io.cache': mode }, current)).toBe(false);
+  for (const changed of [{ source: 'foreign' }, { path: '/other' }, { pool: 'other' }, { readonly: 'true' }, { extra: 'value' }])
+    expect(sameIncusDevice({ ...current, ...changed }, current)).toBe(false);
+  expect(sameIncusDevices({ agents: current, foreign: current }, { agents: current })).toBe(false);
+  for (const strict of [{ type: 'disk', path: '/', pool: 'pool' }, { type: 'disk', source: 'docker', pool: 'pool' },
+    { ...legacy, readonly: 'true' }, { type: 'disk', source: '/host/account', path: '/shared' },
+    { type: 'disk', pool: 'pool', source: 'managed', path: '/managed' }, { type: 'nic', network: 'private' }])
+    expect(sameIncusDevice({ ...strict, 'io.cache': 'unsafe' }, strict)).toBe(false);
 });

@@ -149,8 +149,8 @@ export class IncusWorkerStorage {
     // marker survives deletion of disposable compute and is never cleared.
     if (retainedDocker) await requireExisting('docker');
     const devices: Record<string, IncusDevice> = {
-      workspace: { type: "disk", pool: this.config.incusStoragePool, source: this.name(owner, "workspace"), path: "/workspace" },
-      agents: { type: "disk", pool: this.config.incusStoragePool, source: this.name(owner, "agents"), path: "/home/agent/.agent-data" },
+      workspace: { type: "disk", 'io.cache': 'unsafe', pool: this.config.incusStoragePool, source: this.name(owner, "workspace"), path: "/workspace" },
+      agents: { type: "disk", 'io.cache': 'unsafe', pool: this.config.incusStoragePool, source: this.name(owner, "agents"), path: "/home/agent/.agent-data" },
     };
     const docker = existing?.docker ? await requireExisting("docker")
       : dockerEnabled ? await this.ensure(owner, "docker") : await this.find(owner, "docker");
