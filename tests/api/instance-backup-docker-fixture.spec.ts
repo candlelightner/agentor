@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, link, symlink, chmod, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -54,4 +54,36 @@ test('actual admin-volume snapshot includes pre-existing nested data, exact link
     execFileSync('mkfifo', [join(root, 'special')]);
     expect(() => inspect()).toThrow();
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+
+test('stale Unix socket is omitted without losing portable admin data, while FIFO diagnostics retain its type and path', async () => {
+  const scratch = await mkdtemp(join(tmpdir(), 'instance-admin-socket-'));
+  const root = join(scratch, 'source'), restored = join(scratch, 'restored');
+  const inspect = (path: string) => spawnSync('python3', ['-c', INSPECT_ADMIN_VOLUME, path], { encoding: 'utf8', timeout: 10_000 });
+  try {
+    await mkdir(root); await mkdir(restored); await mkdir(join(root, '.code-server'));
+    await writeFile(join(root, '.code-server', 'settings.json'), 'persistent editor settings');
+    await link(join(root, '.code-server', 'settings.json'), join(root, 'hard'));
+    await symlink('.code-server/settings.json', join(root, 'link'));
+    execFileSync('python3', ['-c', 'import socket,sys;s=socket.socket(socket.AF_UNIX);s.bind(sys.argv[1]);s.close()', join(root, '.code-server', 'stale.sock')]);
+    const before = inspect(root);
+    expect(before.status, before.stderr).toBe(0);
+    expect(before.stderr).toContain("Omitted fixture Unix socket path='.code-server/stale.sock'");
+    const rows = JSON.parse(before.stdout);
+    expect(rows.some((r: any) => r.path === '.code-server/stale.sock')).toBe(false);
+    expect(rows.find((r: any) => r.path === '.code-server/settings.json').hash).toMatch(/^[a-f0-9]{64}$/);
+    const archive = join(scratch, 'portable.tar');
+    const capture = spawnSync('tar', ['--format=pax', '--numeric-owner', '-cpf', archive, '-C', root, '.'], { encoding: 'utf8', timeout: 10_000 });
+    expect(capture.status, capture.stderr).toBe(0);
+    expect(capture.stderr).toContain('socket ignored');
+    execFileSync('tar', ['-xpf', archive, '-C', restored]);
+    const after = inspect(restored);
+    expect(after.status, after.stderr).toBe(0); expect(after.stderr).toBe('');
+    expect(JSON.parse(after.stdout)).toEqual(rows);
+    execFileSync('mkfifo', [join(root, '.code-server', 'unexpected.pipe')]);
+    const rejected = inspect(root);
+    expect(rejected.status).not.toBe(0);
+    expect(rejected.stderr).toContain("Special fixture entry type=fifo path='.code-server/unexpected.pipe'");
+  } finally { await rm(scratch, { recursive: true, force: true }); }
 });

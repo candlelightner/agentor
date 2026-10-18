@@ -1466,3 +1466,5 @@ The historical Docker whole-instance acceptance gate includes the automatically 
 Fresh native global administration accepts a valid dedicated DATA root before any `users` directory exists. Only that absent owner inventory is empty; no metadata is manufactured, and missing roots, symlink/non-directory users paths, foreign installation identity and other read errors still fail closed before host operations.
 
 - Legacy Docker-to-Incus RAW capture readers stop with one-second grace only after GNU exec settlement; exact helper identity, fifteen-second API deadline, confirmed termination and retained uncertainty safeguards remain mandatory.
+
+Historical Docker admin DR fidelity checks include every portable persistent file, directory and link, omit Unix sockets without opening them, and continue to reject other special types with relative-path diagnostics. No source entries are removed or changed to satisfy the fixture.

@@ -25,15 +25,22 @@ export function historicalDockerAdmin(containers: any, record: any, info: any) {
   return { id: record.id as string, containerId: admin.containerId as string, containerName: admin.containerName as string };
 }
 
-/** Snapshot all bytes/metadata in the two fresh fixture admin volumes, including
+/** Snapshot all portable bytes/metadata in the two fresh fixture admin volumes, including
  * pre-existing control data. Historical TAR timestamps use whole seconds. */
 export const INSPECT_ADMIN_VOLUME = String.raw`import hashlib,json,os,stat,sys
-root=sys.argv[1];rows=[];inodes={};total=0
+root=sys.argv[1];rows=[];inodes={};total=0;entries=0
 if os.path.realpath(root)!=root or not stat.S_ISDIR(os.lstat(root).st_mode): raise ValueError('Unsafe fixture volume root')
 def inspect(relative):
- global total
+ global total,entries
  path=root+('/'+relative if relative else '');s=os.lstat(path);kind=stat.S_IFMT(s.st_mode)
- if kind not in (stat.S_IFDIR,stat.S_IFREG,stat.S_IFLNK): raise ValueError('Special fixture entry')
+ entries+=1
+ if entries>20000: raise ValueError('Fixture entry bound exceeded')
+ # Stopped editors can leave Unix sockets; TAR omits them, never persistent file data.
+ if stat.S_ISSOCK(s.st_mode):
+  print('Omitted fixture Unix socket path='+repr(relative),file=sys.stderr);return
+ if kind not in (stat.S_IFDIR,stat.S_IFREG,stat.S_IFLNK):
+  label={stat.S_IFIFO:'fifo',stat.S_IFCHR:'character-device',stat.S_IFBLK:'block-device'}.get(kind,str(kind))
+  raise ValueError('Special fixture entry type='+label+' path='+repr(relative))
  row=dict(path=relative,mode=stat.S_IMODE(s.st_mode),uid=s.st_uid,gid=s.st_gid,mtime=int(s.st_mtime),kind=kind)
  if stat.S_ISLNK(s.st_mode): row['link']=os.readlink(path)
  if stat.S_ISREG(s.st_mode):
@@ -44,7 +51,6 @@ def inspect(relative):
    for chunk in iter(lambda:f.read(1024*1024),b''): digest.update(chunk)
   row.update(size=s.st_size,hash=digest.hexdigest(),hardlink=inodes.setdefault((s.st_dev,s.st_ino),relative))
  rows.append(row)
- if len(rows)>20000: raise ValueError('Fixture entry bound exceeded')
  if stat.S_ISDIR(s.st_mode):
   for name in sorted(os.listdir(path)): inspect(relative+'/'+name if relative else name)
 inspect('');print(json.dumps(rows,sort_keys=True))
