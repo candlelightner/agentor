@@ -17,7 +17,7 @@ import { IncusAdminNetworkBoundary, type AdminNativeNetwork } from './incus-admi
 import { incusImageIdentity, type IncusWorkerImageIdentity } from './incus-worker-image';
 import { readBackupInstallationId } from './backup-installation';
 import { resolveAdministrativeNativeBase } from './admin-native-image';
-import { serializeIncusWorkerEnv, INCUS_GUEST_READINESS_SCRIPT, INCUS_MAIN_SESSION_PROBE } from './incus-worker-runtime';
+import { assertIncusWorkerSocketPath, serializeIncusWorkerEnv, INCUS_GUEST_READINESS_SCRIPT, INCUS_MAIN_SESSION_PROBE } from './incus-worker-runtime';
 import { administrativeOwnerEnvironment, renderAdministrativeStartupScript, administrativeControlRepresentation } from './admin-workspace-runtime';
 import type { ContainerInfo, UserEnvVars } from '../../shared/types';
 const failure = (message: string) => Object.assign(new Error(message), { statusCode: 503 });
@@ -306,6 +306,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
     }
     private async ensureRecord(input: Readonly<AdministrativeWorkspaceRecord>, acknowledge: AdminNativeAcknowledge | undefined, running: boolean, explicitStart = false): Promise<AdminWorkspaceRuntimeImage> {
         const record = structuredClone(input), ack = this.patch(record, acknowledge);
+        assertIncusWorkerSocketPath(this.config.incusProject, adminNativeInstanceName(record));
         await this.installation();
         await this.validateAuthority(record);
         if (record.nativeRuntime?.deleting || record.nativeRuntime?.selectedOperation || record.nativeRuntime?.pending)
@@ -473,6 +474,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
     }
     async rebuild(input: Readonly<AdministrativeWorkspaceRecord>, acknowledge?: AdminNativeAcknowledge) {
         const record = structuredClone(input), ack = this.patch(record, acknowledge);
+        assertIncusWorkerSocketPath(this.config.incusProject, adminNativeInstanceName(record));
         if (record.nativeRuntime?.pending)
             await this.settlePending(record, async (patch) => { await acknowledge!(patch); applyAdminNativePatch(record, patch); });
         if (record.nativeRuntime?.deleting)

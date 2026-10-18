@@ -1,3 +1,4 @@
+import { adminNativeInstanceName } from '../../orchestrator/server/utils/admin-native-identity';
 import { test, expect } from '@playwright/test';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -237,7 +238,8 @@ test('real restricted Incus readonly admission verifies native destinations with
 
 for (const historical of [false, true]) test(`public preflight routes ${historical ? 'historical' : 'tagged native'} admin storage to configured native recovery without Docker destination adoption`, async () => {
   const f = await fixture(); try {
-    const id = randomUUID(), name = historical ? 'agentor-admin-workspace-data' : 'agentor-admin-' + id + '-workspace';
+    const id = randomUUID(), nativeName = adminNativeInstanceName({ schemaVersion: 1, id, kind: 'administrative', trusted: true } as any),
+      name = historical ? 'agentor-admin-workspace-data' : nativeName + '-workspace';
     const descriptor: InstanceBackupVolumeManifest = { name, kind: 'admin-workspace', archive: instanceVolumeArchiveName(name),
       sha256: 'a'.repeat(64), size: 100, ...(!historical ? { workerId: id, ownerId: '__agentor_admin__',
         runtime: { kind: 'incus-vm' as const, role: 'workspace' as const, source,
@@ -253,8 +255,8 @@ for (const historical of [false, true]) test(`public preflight routes ${historic
     expect((await f.manager.restorePreflight('destination-admin', artifact, { restoreDockerVolumes: true })).ready).toBe(true);
     expect(f.calls).toContain('ready'); expect(f.calls).not.toContain('docker-volumes');
     if (!historical) {
-      expect(instances).toEqual(['agentor-admin-' + id]);
-      expect(volumes).toEqual(['agentor-admin-' + id + '-workspace', 'agentor-admin-' + id + '-agents']);
+      expect(instances).toEqual([nativeName]);
+      expect(volumes).toEqual([nativeName + '-workspace', nativeName + '-agents']);
     }
     f.patch(f.config, 'incusEnabled', false);
     const blocked = await f.manager.restorePreflight('destination-admin', artifact, { restoreDockerVolumes: true });

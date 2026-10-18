@@ -49,9 +49,10 @@ export function administrativeRuntimeOwner(record: Readonly<AdministrativeWorksp
 }
 export function adminNativeInstanceName(record: Readonly<AdministrativeWorkspaceRecord>): string {
   administrativeRuntimeOwner(record);
+  // Leave room for project-qualified virtiofs sockets, not just Incus names.
   const name = `agentor-admin-${record.id}`;
-  return name.length <= 53 && /^[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9]$/.test(name) ? name
-    : `agentor-admin-${createHash('sha256').update(record.id).digest('hex').slice(0,32)}`;
+  return name.length <= 44 && /^[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9]$/.test(name) ? name
+    : `agentor-admin-${createHash('sha256').update(record.id).digest('hex').slice(0,30)}`;
 }
 export function validateAdminNativeState(record: Readonly<AdministrativeWorkspaceRecord>): void {
   if (record.runtimeKind === undefined) {

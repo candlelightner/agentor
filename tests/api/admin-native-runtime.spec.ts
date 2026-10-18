@@ -34,7 +34,7 @@ async function fixture() {
                 throw Object.assign(Error('absent'), { statusCode: 404 });
             return structuredClone(volumes.get(name));
         },
-        createCustomVolume: async (_pool: string, v: any) => { events.push('volume-create'); volumes.set(v.name, { ...structuredClone(v), config: incusConfig(v.config), type: 'custom', project: 'agentor', created_at: stamp, used_by: [] }); },
+        createCustomVolume: async (_pool: string, v: any) => { events.push('volume-create'); volumes.set(v.name, { ...structuredClone(v), config: incusConfig(v.config), type: 'custom', project: config.incusProject, created_at: stamp, used_by: [] }); },
         deleteCustomVolume: async (_pool: string, name: string) => { events.push('volume-delete'); volumes.delete(name); },
         updateInstanceDevices: async (_name: string, devices: any, accepted: any) => { await accepted?.('/1.0/operations/' + randomUUID()); instance.devices = structuredClone(devices); events.push('devices'); },
         getInstance: async () => {
@@ -76,6 +76,50 @@ async function fixture() {
     const prepare = () => runtime.prepareCredential(structuredClone(record), async () => { events.push('credential-issue'); return 'mcp1.' + 'a'.repeat(43); });
     return { runtime, client, managed, config, boundary, events, files, volumes, image, ack, prepare, get record() { return record; }, get instance() { return instance; }, set failCredential(v: boolean) { failCredential = v; }, set unknownStart(v: boolean) { unknownStart = v; }, cleanup: () => rm(directory, { recursive: true, force: true }) };
 }
+for (const project of ['agdr1cf75b31', 'agdr1cf75b31r']) test(`native admin compute and canonical storage fit virtiofs in ${project}`, async () => {
+    const f = await fixture();
+    try {
+        f.config.incusProject = project;
+        f.record.id = '1524edb5-320e-4d6e-a032-542dfe16258b';
+        f.record.status = 'stopped';
+        await f.runtime.ensure(f.record, f.ack);
+        const name = 'agentor-admin-b53020e559e68e3fb2634e3a7b2708';
+        expect(f.instance.name).toBe(name);
+        expect([...f.volumes.keys()].sort()).toEqual([name + '-agents', name + '-workspace']);
+        for (const key of Object.keys(f.instance.devices).filter(key => f.instance.devices[key].type === 'disk'))
+            expect(Buffer.byteLength(`/var/lib/incus/devices/${project}_${name}/virtio-fs.${key}.sock`)).toBeLessThanOrEqual(107);
+        expect(f.record.nativeRuntime?.pending).toBeUndefined();
+        expect(f.events).not.toContain('vm-start');
+    } finally { await f.cleanup(); }
+});
+test('overlong admin socket paths reject before image resolution, acknowledgement or native resources', async () => {
+    const f = await fixture();
+    try {
+        f.config.incusProject = 'p'.repeat(15);
+        const before = structuredClone(f.record);
+        await expect(f.runtime.ensure(f.record, f.ack)).rejects.toThrow('107 bytes');
+        expect(f.events).toEqual([]);
+        expect(f.record).toEqual(before);
+        expect(f.volumes.size).toBe(0);
+        expect(f.instance).toBeUndefined();
+    } finally { await f.cleanup(); }
+});
+test('overlong project rebuild retains the existing admin compute, canonical roots and pending authority', async () => {
+    const f = await fixture();
+    try {
+        f.record.status = 'stopped';
+        await f.runtime.ensure(f.record, f.ack);
+        f.record.nativeRuntime!.pending = { kind: 'start', operation: '/1.0/operations/' + randomUUID() };
+        const before = structuredClone(f.record), instance = structuredClone(f.instance), volumes = structuredClone(f.volumes);
+        f.config.incusProject = 'p'.repeat(15);
+        f.events.length = 0;
+        await expect(f.runtime.rebuild(f.record, f.ack)).rejects.toThrow('107 bytes');
+        expect(f.events).toEqual([]);
+        expect(f.record).toEqual(before);
+        expect(f.instance).toEqual(instance);
+        expect(f.volumes).toEqual(volumes);
+    } finally { await f.cleanup(); }
+});
 test('fresh admin VM persists authority, proves network, and mints tmpfs identity only at actual gated start', async () => {
     const f = await fixture();
     try {

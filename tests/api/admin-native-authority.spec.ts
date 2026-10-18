@@ -9,7 +9,7 @@ import { GroupAdminWorkspaceStore } from '../../orchestrator/server/utils/group-
 import { validateAdminNativeState, administrativeRuntimeOwner, applyAdminNativePatch, adminNativeInstanceName } from '../../orchestrator/server/utils/admin-native-authority';
 const stamp = new Date(0).toISOString();
 const record = (): AdministrativeWorkspaceRecord => ({schemaVersion:1,id:randomUUID(),kind:'administrative',trusted:true,status:'stopped',createdAt:stamp,updatedAt:stamp});
-const identity = (r: AdministrativeWorkspaceRecord) => ({version:1 as const,name:`agentor-admin-${r.id}`,installationId:randomUUID(),nonce:randomUUID(),overlayVersion:'6' as const,overlaySha256:'f'.repeat(64),image:{version:1 as const,sourceImageId:'sha256:'+'1'.repeat(64),recipeId:'2'.repeat(64),architecture:'amd64' as const,converterVersion:'v0.4.0',bootstrapGeneration:'3' as const,fingerprint:'3'.repeat(64)}});
+const identity = (r: AdministrativeWorkspaceRecord) => ({version:1 as const,name:adminNativeInstanceName(r),installationId:randomUUID(),nonce:randomUUID(),overlayVersion:'6' as const,overlaySha256:'f'.repeat(64),image:{version:1 as const,sourceImageId:'sha256:'+'1'.repeat(64),recipeId:'2'.repeat(64),architecture:'amd64' as const,converterVersion:'v0.4.0',bootstrapGeneration:'3' as const,fingerprint:'3'.repeat(64)}});
 test('new global administrative identity is durably native before provisioning', async () => {
  const directory=await mkdtemp(join(tmpdir(),'admin-native-'));
  try {
@@ -59,8 +59,22 @@ test('runtime patch preserves identity and startup script and validates explicit
  expect(()=>applyAdminNativePatch(r,{runtimeKind:'incus-vm',nativeRuntime:r.nativeRuntime,status:'arbitrary'} as any)).toThrow('status acknowledgement');expect(r.startupScript).toBe(before.startupScript);
 });
 
+test('admin names bound virtiofs sockets without changing opaque identity or short legacy names', () => {
+ const id='1524edb5-320e-4d6e-a032-542dfe16258b', r={...record(),id};
+ expect(adminNativeInstanceName(r)).toBe('agentor-admin-b53020e559e68e3fb2634e3a7b2708');
+ expect(adminNativeInstanceName({...r,id:'a'.repeat(30)})).toBe('agentor-admin-'+'a'.repeat(30));
+ for(const value of [id,'a'.repeat(31),'a'.repeat(128),'legacy_admin','legacy-']) {
+  const name=adminNativeInstanceName({...r,id:value});
+  expect(name).toMatch(/^agentor-admin-[a-f0-9]{30}$/); expect(name.length).toBe(44);
+  for(const project of ['agdr1cf75b31','agdr1cf75b31r','p'.repeat(14)])
+   for(const key of ['workspace','agents','m123456'])
+    expect(Buffer.byteLength(`/var/lib/incus/devices/${project}_${name}/virtio-fs.${key}.sock`)).toBeLessThanOrEqual(107);
+ }
+ expect(r.id).toBe(id);
+});
+
 test('bounded legacy administrative and group IDs retain authority and deterministic bounded native names',()=>{
- for(const id of ['legacy-admin','A'.repeat(128)]){const r={...record(),id};expect(administrativeRuntimeOwner(r).id).toBe(id);expect(adminNativeInstanceName(r).length).toBeLessThanOrEqual(63);expect(adminNativeInstanceName(r)).toBe(adminNativeInstanceName(r));
+ for(const id of ['legacy-admin','A'.repeat(128)]){const r={...record(),id};expect(administrativeRuntimeOwner(r).id).toBe(id);expect(adminNativeInstanceName(r).length).toBeLessThanOrEqual(44);expect(adminNativeInstanceName(r)).toBe(adminNativeInstanceName(r));
  const native={...identity(r),name:adminNativeInstanceName(r)};expect(()=>validateAdminNativeState({...r,runtimeKind:'incus-vm',nativeRuntime:native})).not.toThrow();
  expect(administrativeRuntimeOwner({...r,kind:'group-administrative',ownerId:'owner',groupId:'legacy-group'} as any).groupId).toBe('legacy-group');}
  for(const id of ['../unsafe','','x'.repeat(129)])expect(()=>administrativeRuntimeOwner({...record(),id})).toThrow();

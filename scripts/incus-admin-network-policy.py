@@ -26,9 +26,9 @@ UUID = r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}"
 
 def native_name(workspace):
     literal = "agentor-admin-" + workspace
-    if len(literal) <= 53 and re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9]", literal):
+    if len(literal) <= 44 and re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9]", literal):
         return literal
-    return "agentor-admin-" + hashlib.sha256(workspace.encode()).hexdigest()[:32]
+    return "agentor-admin-" + hashlib.sha256(workspace.encode()).hexdigest()[:30]
 
 
 def require(condition, message):
@@ -144,6 +144,8 @@ class AdminNetworkPolicy:
                 and isinstance(native.get("overlaySha256"), str)
                 and re.fullmatch(r"[0-9a-f]{64}", native["overlaySha256"]) is not None
                 and native.get("overlayVersion") == "6", "Durable native administrative intent is unavailable")
+        require(len(f"/var/lib/incus/devices/{self.project}_{native['name']}/virtio-fs.workspace.sock".encode()) <= 107,
+                "Administrative virtiofs socket path exceeds 107 bytes; use a shorter Incus project")
         key = hashlib.sha256(f"{self.installation}:{owner}:{group}:{workspace}".encode()).hexdigest()[:12]
         return {"record": record, "owner": owner, "group": group, "name": "aa" + key,
                 "dockerName": "agentor-admin-network-" + key, "key": key,

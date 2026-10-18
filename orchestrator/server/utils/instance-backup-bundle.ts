@@ -813,8 +813,8 @@ function validAdministrativeNativeVolume(volume: any): boolean {
   catch { return false; }
   // Logical names derive from identity, never an archived host device or UUID.
   const raw = 'agentor-admin-' + admin.workspaceId;
-  const name = raw.length <= 53 && /^[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9]$/.test(raw) ? raw
-    : 'agentor-admin-' + createHash('sha256').update(admin.workspaceId).digest('hex').slice(0, 32);
+  const name = raw.length <= 44 && /^[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9]$/.test(raw) ? raw
+    : 'agentor-admin-' + createHash('sha256').update(admin.workspaceId).digest('hex').slice(0, 30);
   return volume.name === name + '-' + runtime.role;
 }
 

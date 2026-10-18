@@ -32,7 +32,7 @@ class AdminNetworkTests(unittest.TestCase):
         self.path = self.root / 'admin' / 'workspace.v1.json'
         self.record = {'schemaVersion': 1, 'id': self.workspace, 'kind': 'administrative', 'trusted': True,
                        'status': 'stopped', 'runtimeKind': 'incus-vm', 'nativeRuntime': {'version': 1,
-                           'name': 'agentor-admin-' + self.workspace, 'installationId': self.installation,
+                           'name': MODULE.native_name(self.workspace), 'installationId': self.installation,
                            'nonce': self.nonce, 'image': 'f' * 64, 'overlayVersion': '6', 'overlaySha256': 'e' * 64}}
         self.save()
         self.payload = {'workspaceId': self.workspace}
@@ -247,18 +247,34 @@ class AdminNetworkTests(unittest.TestCase):
         self.assertEqual(self.policy.inspect(self.payload), result)
         self.assertEqual(self.mutations(), [])
 
-    def test_legacy_identity_names_preserve_uuid_and_hash_only_dns_incompatible_names(self):
-        self.assertEqual(MODULE.native_name(self.workspace), 'agentor-admin-' + self.workspace)
-        for workspace in ('legacy-admin', 'legacy_admin', 'legacy-', 'a' * 128):
+    def test_legacy_identity_names_preserve_short_names_and_hash_socket_overflow(self):
+        self.assertEqual(MODULE.native_name('1524edb5-320e-4d6e-a032-542dfe16258b'),
+                         'agentor-admin-b53020e559e68e3fb2634e3a7b2708')
+        self.assertEqual(MODULE.native_name('a' * 30), 'agentor-admin-' + 'a' * 30)
+        for workspace in (self.workspace, 'a' * 31, 'legacy-admin', 'legacy_admin', 'legacy-', 'a' * 128):
             self.record['id'] = workspace
             self.record['nativeRuntime']['name'] = MODULE.native_name(workspace)
             self.save()
             identity = self.policy.authority({'workspaceId': workspace})
             self.assertEqual(identity['record']['id'], workspace)
-            self.assertLessEqual(len(identity['record']['nativeRuntime']['name'] + '-workspace'), 63)
+            self.assertLessEqual(len(identity['record']['nativeRuntime']['name']), 44)
             self.assertRegex(identity['record']['nativeRuntime']['name'], r'^[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9]$')
         with self.assertRaises(MODULE.PolicyError): self.policy.authority({'workspaceId': 'a' * 129})
         self.assertEqual(self.calls, [])
+
+    def test_admin_socket_budget_covers_both_fixture_projects_and_rejects_oversize_before_reads(self):
+        name = self.record['nativeRuntime']['name']
+        for project in ('agdr1cf75b31', 'agdr1cf75b31r', 'p' * 14):
+            self.policy.project = project
+            self.assertEqual(self.policy.authority(self.payload)['record'], self.record)
+            for device in ('workspace', 'agents', 'm123456'):
+                self.assertLessEqual(len(f'/var/lib/incus/devices/{project}_{name}/virtio-fs.{device}.sock'.encode()), 107)
+        self.policy.project = 'p' * 15
+        for operation in (self.policy.ensure, self.policy.inspect):
+            with self.assertRaisesRegex(MODULE.PolicyError, '107 bytes'):
+                operation(self.payload)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.mutations(), [])
 
     def test_absent_read_only_inspection_does_not_allocate(self):
         self.assertIsNone(self.policy.inspect(self.payload))

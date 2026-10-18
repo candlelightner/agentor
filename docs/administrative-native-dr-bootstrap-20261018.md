@@ -15,6 +15,7 @@ Before writes, require root, the exact DMI UUID, exactly one `agentor.native_dr_
 - `DR_ROOT=/var/lib/agentor-native-dr/$DR_NONCE`, `DR_BASE=agdr<first-eight-nonce-characters>`.
 - Source DATA/project/primary: `$DR_ROOT/control`, `$DR_BASE`, `${DR_BASE}n`.
 - Recovery DATA/project/primary: `$DR_ROOT/recovery`, `${DR_BASE}r`, `${DR_BASE}rn`.
+- Use the current bounded native-admin naming code and matching host policy: UUID admin names hash to 44 bytes, so source/recovery workspace socket paths are 105/106 bytes. Builds or private capture helpers from before this fix retain overlong names. Any already-created old fixture VM and its two canonical roots require explicit exact-identity operator reconciliation; do not just edit their record or reuse an old helper.
 - Shared **guest directory-backed** pool `${DR_BASE}p`; alias `${DR_BASE}-worker` in each project.
 - One new fixture installation UUID `DR_INSTALLATION`, persisted in each otherwise independent DATA root as `backup-installation-id`. This deliberately restores the same installation identity; accounts, files and projects are independent. It lets the existing installer enforce one pool ownership label. Do not copy any source auth, runtime record or credential into the initially empty recovery DATA. A separate destination VM uses the source artifact's installation UUID instead of minting a different value.
 
