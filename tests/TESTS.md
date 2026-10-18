@@ -596,3 +596,5 @@ Historical Docker instance fixture: four pure/owned-temp cases in `instance-back
 
 
 Fresh administrative owner-inventory regression: actual `AdminNetworkPolicy.ensure` previously raised `FileNotFoundError` for a valid new DATA root without `users`. The new owned-temp case proves global ensure/inspect and unchanged data, plus refusal of symlink/dangling/non-directory users paths, missing/symlinked DATA roots and foreign installation identity before host calls. Connected admin/managed policy, local TLS service and mocked installer checks pass 92 cases; the one explicit live Incus gate remains skipped.
+
+Legacy migration reader stop-budget regression: `api/legacy-incus-migration-capture.spec.ts` now has 17 cases. A held GNU exec proves neither successful nor definite-failure cleanup stops the reader before exec settlement; both then request a one-second grace with the bounded operation signal. Existing uncertain exec/stop/removal cases retain exact reader/staging without retry. This avoids spending ten of the existing fifteen API-deadline seconds waiting for idle sleep under I/O load; no live migration was run for this source fix.

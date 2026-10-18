@@ -155,8 +155,9 @@ export async function captureLegacyMigrationArchive(options: LegacyMigrationCapt
     execSettled = true;
     if (result.exitCode !== 0) throw new Error('Legacy migration GNU metadata capture failed');
     await checkSource(); await checkHelper();
+    // Tar has settled; idle sleep needs no graceful shutdown, leaving time for kill/ACK within the 15s IO bound.
     stopAttempted = true;
-    await io('Legacy migration reader stop', abortSignal => helper!.stop({ t: 10, abortSignal }));
+    await io('Legacy migration reader stop', abortSignal => helper!.stop({ t: 1, abortSignal }));
     const stopped = await checkHelper();
     if (stopped.State.Running || stopped.State.Pid !== 0 || stopped.State.Status !== 'exited')
       throw new Error('Legacy migration reader termination is unconfirmed');
@@ -190,7 +191,7 @@ export async function captureLegacyMigrationArchive(options: LegacyMigrationCapt
         let current = await checkHelper();
         if (current.State.Running) {
           stopAttempted = true;
-          await io('Legacy migration failed reader stop', abortSignal => helper!.stop({ t: 10, abortSignal }));
+          await io('Legacy migration failed reader stop', abortSignal => helper!.stop({ t: 1, abortSignal }));
           current = await checkHelper();
         }
         if (current.State.Running || current.State.Pid !== 0 || current.State.Status !== 'exited')

@@ -18,6 +18,7 @@ async function fixture(role: LegacyMigrationCaptureOptions['role'] = 'workspace'
   execFileSync('python3', ['-c', 'import os,sys; p=sys.argv[1]; os.link(p+"/data",p+"/hard");os.symlink("data",p+"/sym");os.setxattr(p+"/data","user.binary",bytes([0,255,128,10,61,0]));os.utime(p+"/data",ns=(1700000000123456789,1700000000987654321))', join(dir, root)]);
   let raw: Buffer = execFileSync('tar', ['--sort=name', '--format=pax', '--numeric-owner', '--owner=12345', '--group=23456',
     '--acls', '--xattrs', '--xattrs-include=*', '-cpf', '-', '-C', dir, root]);
+  const stopOptions: { t: number; abortSignal?: AbortSignal }[] = [];
   const events: string[] = [], sourceInfo = { Id: source.containerId, Created: source.createdAt, Image: source.imageId,
     State: { Running: false, Paused: false, Restarting: false, Pid: 0, Status: 'exited' },
     Mounts: [{ Type: 'volume', Name: 'original-volume', Source: '/var/lib/docker/volumes/original-volume/_data', Destination: '/workspace', RW: true }] };
@@ -39,7 +40,7 @@ async function fixture(role: LegacyMigrationCaptureOptions['role'] = 'workspace'
       Mounts: helperMounts(),
       State: { Running: running, Pid: running ? 42 : 0, Status: stopped ? 'exited' : running ? 'running' : 'created' } }),
     start: async () => { events.push('start'); running = true; },
-    stop: async () => { events.push('stop'); if (failStop) throw new Error('Unknown stop'); running = false; stopped = true; },
+    stop: async (options: { t: number; abortSignal?: AbortSignal }) => { stopOptions.push(options); events.push('stop'); if (failStop) throw new Error('Unknown stop'); running = false; stopped = true; },
     remove: async () => { events.push('remove'); if (failRemove) throw new Error('Unknown remove'); removed = true; },
   };
   const client = { getImage: () => ({ inspect: async () => ({ Id: trustedImageId, Config: { Env: ['PATH=/usr/bin:/bin', 'NODE_VERSION=22'] } }) }),
@@ -59,7 +60,7 @@ async function fixture(role: LegacyMigrationCaptureOptions['role'] = 'workspace'
   } }, client: client as unknown as LegacyMigrationDockerClient, trustedImageId, source, role,
   mount: { Type: 'volume', Source: 'original-volume', Destination: '/workspace' }, outputPath: join(dir, 'capture.tar'),
   validate: async () => { events.push('validate'); if (++validateCount === revokeAt) throw new Error('Source authority changed'); } };
-  return { dir, options, events, raw, sourceInfo, helperId, client, detachedVolume, settlement, spec: () => spec!, removed: () => removed,
+  return { dir, options, events, stopOptions, raw, sourceInfo, helperId, client, detachedVolume, settlement, spec: () => spec!, removed: () => removed,
     shuffle: () => { shuffleMounts = true; sourceInfo.Mounts.push({ Type: 'volume', Name: 'other-volume',
       Source: '/var/lib/docker/volumes/other-volume/_data', Destination: '/other', RW: false }); },
     fail: (mode: string) => { if (mode === 'helper') wrongHelper = true; if (mode === 'exec') failExec = true;
@@ -98,6 +99,37 @@ for (const role of ['workspace', 'agents', 'docker', 'managed'] as const) test(`
     expect(f.spec().HostConfig!.Mounts![0]).toMatchObject({ ReadOnly: true, VolumeOptions: { NoCopy: true } });
     expect(f.spec().HostConfig!.Mounts).toHaveLength(2); expect(f.events.filter(event => event === 'exec')).toHaveLength(1);
   } finally { await f.cleanup(); }
+});
+
+test('idle reader gets one-second stop grace only after successful or definite failed GNU exec settles', async () => {
+  for (const mode of ['success', 'definite']) {
+    const f = await fixture();
+    let release!: () => void, entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    try {
+      if (mode === 'definite') f.fail(mode);
+      const capture = f.options.docker.execCapture;
+      f.options.docker.execCapture = async (...args) => {
+        entered(); await gate;
+        const result = await capture(...args);
+        f.events.push('exec-settled'); return result;
+      };
+      const result = captureLegacyMigrationArchive(f.options).catch(error => error);
+      await started;
+      expect(f.stopOptions).toHaveLength(0); expect(f.removed()).toBe(false);
+      release();
+      const outcome = await result;
+      if (mode === 'success') expect(outcome).toBe(f.options.outputPath);
+      else expect(outcome).toBeInstanceOf(Error);
+      expect(f.stopOptions).toHaveLength(1);
+      expect(f.stopOptions[0]!.t).toBe(1);
+      expect(f.stopOptions[0]!.abortSignal).toBeInstanceOf(AbortSignal);
+      expect(f.stopOptions[0]!.abortSignal!.aborted).toBe(false);
+      expect(f.events.indexOf('stop')).toBeGreaterThan(f.events.indexOf('exec-settled'));
+      expect(f.removed()).toBe(true);
+    } finally { release(); await f.cleanup(); }
+  }
 });
 
 test('running, replaced and wrong-mount sources are rejected before helper creation', async () => {
