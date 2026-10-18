@@ -9,6 +9,7 @@ import type { AdministrativeWorkspaceRecord } from '../../orchestrator/server/ut
 import { adminNativeInstanceName } from '../../orchestrator/server/utils/admin-native-authority';
 import { administrativeNativeOverlaySha256 } from '../../orchestrator/server/utils/incus-admin-workspace-runtime';
 import { IncusAdminBackup, administrativeArchiveHelperOwner, assertAdministrativeSnapshotSettled } from '../../orchestrator/server/utils/incus-admin-backup';
+import { IncusAdminWorkspaceStorage } from '../../orchestrator/server/utils/incus-admin-workspace-storage';
 import { INCUS_CANONICAL_ARCHIVE_SCRIPT } from '../../orchestrator/server/utils/incus-canonical-archive';
 
 function fixture(group = false, id: string = randomUUID()) {
@@ -50,6 +51,8 @@ function fixture(group = false, id: string = randomUUID()) {
           result: Promise.resolve().then(() => { mutate?.(); return code; }), close() { closeCalls++; } };
       } },
   };
+  const detachedStorage = new IncusAdminWorkspaceStorage(config, runtime.client, async () => runtime.storage.store());
+  runtime.storage.inspectDetachedSelectedVolume = detachedStorage.inspectDetachedSelectedVolume.bind(detachedStorage);
   const helper: any = { withGuest: async (owner: any, sources: any, assertSource: any, _signal: any, capture: any) => {
     helperCalls++;
     expect(owner).toEqual(administrativeArchiveHelperOwner(record));
@@ -242,6 +245,7 @@ for (const drift of [false, true]) test(`stopped portable seeded leaf ${drift ? 
     const seeded = await store.create('__agentor_admin__', f.record.id, '/opt/seeded', undefined, 'incus-vm');
     await store.save({ ...seeded, seeded: true, state: 'ready' });
     const pending = await store.create('__agentor_admin__', f.record.id, '/opt/pending', undefined, 'incus-vm');
+    const pendingBefore = structuredClone(store.get('__agentor_admin__', pending.id));
     f.record.nativeRuntime!.selectedVolumeIds = [seeded.id, pending.id]; f.setFresh(structuredClone(f.record));
     const storage = new IncusAdminWorkspaceStorage(f.config, f.runtime.client, async () => store);
     Object.assign(f.runtime.storage, { selectedRecords: storage.selectedRecords.bind(storage), inspectSelectedVolume: storage.inspectSelectedVolume.bind(storage) });
@@ -267,6 +271,6 @@ for (const drift of [false, true]) test(`stopped portable seeded leaf ${drift ? 
       expect(gunzipSync(await readFile(output)).toString()).toBe('managed bytes');
     }
     expect(f.counts()).toEqual({ helperCalls: 1, execCalls: 1, closeCalls: 1 });
-    expect(store.get('__agentor_admin__', pending.id)).toEqual(pending);
+    expect(store.get('__agentor_admin__', pending.id)).toEqual(pendingBefore);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

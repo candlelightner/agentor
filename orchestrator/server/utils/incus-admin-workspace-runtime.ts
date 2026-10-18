@@ -807,6 +807,32 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         await this.assertOwned(record);
         return this.storage.inspectSelected(record);
     }
+    /** Startup verifies dedicated admin storage without ordinary shadow authority or mutations. */
+    async inspectManagedStorage(record: Readonly<AdministrativeWorkspaceRecord>) {
+        await this.validateAuthority(record);
+        const owner = administrativeRuntimeOwner(record), native = record.nativeRuntime;
+        if (!native || native.pending || native.deleting || native.selectedOperation || native.installationId !== await this.installation())
+            throw failure('Administrative storage requires explicit recovery');
+        const store = await this.storage.store(), records = store.forWorker(owner.userId, owner.id);
+        if (records.some(v => v.storageRuntimeKind !== 'incus-vm' || v.incusLive || v.liveContainerId || v.previousRestartPolicy))
+            throw failure('Administrative storage has incompatible recovery state');
+        if (native.incarnation) await this.assertOwned(record);
+        else {
+            // Controlled restore publishes stopped storage before allocating fresh compute.
+            if (record.status !== 'stopped' || !native.storageReady || !native.storageInitialized)
+                throw failure('Administrative restored storage is not ready');
+            try { await this.client.getInstance(native.name); throw failure('Administrative restored compute is uncaptured'); }
+            catch (error) { if (!absent(error)) throw error; }
+            const devices = await this.storage.devices(record, native, false);
+            for (const device of Object.values(devices)) {
+                const volume = await this.client.getCustomVolume(this.config.incusStoragePool, device.source!);
+                if (!Array.isArray(volume.used_by) || volume.used_by.length)
+                    throw failure('Administrative restored storage has unexpected references');
+            }
+        }
+        for (const v of records.filter(v => !v.attached)) await this.storage.inspectDetachedSelectedVolume(record, v);
+        await this.validateAuthority(record);
+    }
     /** Explicit recovery never guesses data completion or deletes either copy. */
     async recoverSelectedStorage(input: Readonly<AdministrativeWorkspaceRecord>, acknowledge: AdminNativeAcknowledge) {
         const record = structuredClone(input), ack = this.patch(record, acknowledge), intent = record.nativeRuntime?.selectedOperation;

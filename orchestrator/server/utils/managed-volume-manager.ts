@@ -645,6 +645,23 @@ export class ManagedVolumeManager {
   /** Explicit retries use the same recovery as boot, under the worker fence. */
   async recoverWorker(userId: string, workerId: string) {
     await this.init();
+    // Administrative storage belongs to its dedicated runtime, even when an
+    // archived ordinary WorkerRecord shares the workspace ID.
+    const [{ useAdminWorkspaceStore }, { useWorkerGroupStore, useAdministrativeWorkspaceRuntime },
+      { isAdministrativeWorkspaceId }, { readAdministrativeRuntimeRecord, administrativeRuntimeOwner }] = await Promise.all([
+      import('./admin-workspace-store'), import('./services'), import('./ordinary-worker-identity'), import('./admin-native-authority')]);
+    await Promise.all([useAdminWorkspaceStore().init(), useWorkerGroupStore().init()]);
+    if (isAdministrativeWorkspaceId(workerId, userId)) {
+      const records = this.store.forWorker(userId, workerId);
+      if (records.length) {
+        const record = await readAdministrativeRuntimeRecord(workerId);
+        if (record.runtimeKind !== 'incus-vm' || administrativeRuntimeOwner(record).userId !== userId || this.recreations.get(userId, workerId))
+          throw volumeError(409, 'Administrative storage requires dedicated recovery. All data was retained.');
+        await useAdministrativeWorkspaceRuntime().native.inspectManagedStorage(record);
+      }
+      this.recoveryFailures.delete(workerId);
+      return;
+    }
     // Adopt without renaming or recopying before any backup edit can remove
     // the old coupling. Actual mounts also recover paths removed from a legacy
     // backup selection while their volume was still attached.

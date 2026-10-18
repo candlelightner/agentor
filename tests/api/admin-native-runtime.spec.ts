@@ -841,3 +841,107 @@ test('selected seeding journals retained-guest start and never stops or detaches
   }finally{await f.cleanup();}
  }
 });
+
+// Exercise the real startup coordinator with dedicated storage and historical shadows.
+async function startupStorageFixture(kind: 'platform' | 'group') {
+    const f = await fixture();
+    f.record.status = 'stopped';
+    f.config.containerPrefix = 'agentor';
+    const human = randomUUID();
+    if (kind === 'group') Object.assign(f.record, { kind: 'group-administrative', ownerId: human, groupId: randomUUID() });
+    await f.runtime.ensure(f.record, f.ack);
+    const { administrativeRuntimeOwner } = await import('../../orchestrator/server/utils/admin-native-authority');
+    const owner = administrativeRuntimeOwner(f.record);
+    const rows = [];
+    for (const [target, attached] of [['/opt/attached', true], ['/opt/history', false]] as const) {
+        const created = await f.managed.create(owner.userId, owner.id, target, undefined, 'incus-vm');
+        const row = { ...created, attached, seeded: true, state: attached ? 'ready' as const : 'detached' as const,
+            operation: { id: randomUUID(), mode: 'recreate' as const, stage: 'complete' as const } };
+        await f.managed.save(row); rows.push(row);
+        f.volumes.set(row.dockerName, { name: row.dockerName, project: f.config.incusProject, type: 'custom', content_type: 'filesystem',
+            created_at: row.createdAt, config: { 'user.agentor.installation': f.record.nativeRuntime!.installationId,
+                'user.agentor.owner': owner.userId, 'user.agentor.id': owner.id, 'user.agentor.volume-id': row.id, 'user.agentor.target': target },
+            used_by: attached ? [`/1.0/instances/${f.instance.name}?project=${f.config.incusProject}`] : [] });
+        if (attached) f.instance.devices[(await import('../../orchestrator/server/utils/incus-managed-volume-device')).incusManagedVolumeDeviceKey(row)] =
+            { type: 'disk', pool: f.config.incusStoragePool, source: row.dockerName, path: target };
+    }
+    const pending = await f.managed.create(owner.userId, owner.id, '/opt/not-applied', undefined, 'incus-vm');
+    f.record.nativeRuntime!.selectedVolumeIds = [rows[0]!.id, pending.id];
+    const { ManagedVolumeManager } = await import('../../orchestrator/server/utils/managed-volume-manager');
+    const { useWorkerStore, useWorkerGroupStore, useAdministrativeWorkspaceRuntime } = await import('../../orchestrator/server/utils/services');
+    const { useAdminWorkspaceStore } = await import('../../orchestrator/server/utils/admin-workspace-store');
+    const admin = useAdminWorkspaceStore(), groups = useWorkerGroupStore(), workers = useWorkerStore(), native = useAdministrativeWorkspaceRuntime().native;
+    const previous = { adminInit: admin.init, getRecord: admin.getRecord, groupInit: groups.init, listForUser: groups.listForUser,
+        groupList: groups.list, workerList: workers.list, workerGet: workers.get, inspect: native.inspectManagedStorage };
+    admin.init = async () => {}; admin.getRecord = () => kind === 'platform' ? structuredClone(f.record) : undefined;
+    groups.init = async () => {}; groups.listForUser = () => [];
+    groups.list = () => kind === 'group' ? [{ id: (f.record as any).groupId, userId: human, adminWorkspace: structuredClone(f.record) } as any] : [];
+    // Global shadow uses its old human namespace; group shadow shares the human owner.
+    const shadow = { id: owner.id, userId: human, status: 'archived', runtimeKind: 'legacy-docker' } as any;
+    let ordinaryReads = 0;
+    workers.list = () => [shadow];
+    workers.get = (userId, id) => { ordinaryReads++; return userId === human && id === owner.id ? shadow : undefined; };
+    native.inspectManagedStorage = f.runtime.inspectManagedStorage.bind(f.runtime);
+    const manager = new ManagedVolumeManager(f.config.dataDir, {} as any); await manager.init();
+    (f.runtime.storage as any).managedStore = async () => manager.store;
+    const { IncusManagedVolumeRuntime } = await import('../../orchestrator/server/utils/incus-managed-volume-runtime');
+    (manager as any).incus = new IncusManagedVolumeRuntime(f.config, { client: f.client } as any);
+    return { ...f, owner, rows, pending, manager, ordinaryReads: () => ordinaryReads, cleanup: async () => {
+        admin.init = previous.adminInit; admin.getRecord = previous.getRecord; groups.init = previous.groupInit;
+        groups.listForUser = previous.listForUser; groups.list = previous.groupList; workers.list = previous.workerList; workers.get = previous.workerGet;
+        native.inspectManagedStorage = previous.inspect; await f.cleanup();
+    } };
+}
+for (const kind of ['platform', 'group'] as const) {
+    test(`${kind} startup preserves attached, pending and detached native admin storage despite archived ordinary shadow`, async () => {
+        const f = await startupStorageFixture(kind);
+        try {
+            const before = structuredClone(f.manager.store.forWorker(f.owner.userId, f.owner.id));
+            const path = join(f.config.dataDir, 'users', f.owner.userId, 'managed-volumes.v1.json'), bytes = await readFile(path);
+            const physical = structuredClone([...f.volumes]), record = structuredClone(f.record), devices = structuredClone(f.instance.devices);
+            const events = [...f.events];
+            await f.manager.recoverStartup();
+            expect(f.manager.store.forWorker(f.owner.userId, f.owner.id)).toEqual(before);
+            expect(await readFile(path)).toEqual(bytes);
+            expect(f.manager.isRecoveryBlocked(f.owner.id)).toBe(false);
+            expect(f.ordinaryReads()).toBe(0);
+            expect(f.record).toEqual(record); expect([...f.volumes]).toEqual(physical); expect(f.instance.devices).toEqual(devices);
+            expect(f.events.slice(events.length).every(event => event === 'network')).toBe(true);
+        } finally { await f.cleanup(); }
+    });
+    test(`${kind} startup refuses foreign attached and detached admin storage without changing physical data`, async () => {
+        const f = await startupStorageFixture(kind);
+        try {
+            const detached = f.volumes.get(f.rows[1]!.dockerName);
+            detached.used_by = ['/1.0/instances/foreign?project=' + f.config.incusProject];
+            await expect(f.runtime.inspectManagedStorage(f.record)).rejects.toThrow('ownership');
+            detached.used_by = [];
+            const attached = f.volumes.get(f.rows[0]!.dockerName);
+            attached.config['user.agentor.owner'] = 'foreign';
+            await expect(f.runtime.inspectManagedStorage(f.record)).rejects.toThrow('ownership');
+            attached.config['user.agentor.owner'] = f.owner.userId;
+            detached.used_by = ['/1.0/instances/foreign?project=' + f.config.incusProject];
+            const physical = structuredClone([...f.volumes]);
+            await f.manager.recoverStartup();
+            expect(f.manager.isRecoveryBlocked(f.owner.id)).toBe(true);
+            expect(f.manager.store.forWorker(f.owner.userId, f.owner.id).every(v => v.state === 'failed')).toBe(true);
+            expect([...f.volumes]).toEqual(physical);
+            await expect(f.runtime.inspectManagedStorage(f.record)).rejects.toThrow('explicit recovery');
+        } finally { await f.cleanup(); }
+    });
+}
+test('startup accepts only stopped owned restored admin storage before fresh compute exists', async () => {
+    const f = await startupStorageFixture('platform');
+    try {
+        f.record.nativeRuntime!.incarnation = undefined;
+        f.record.nativeRuntime!.storageInitialized = true;
+        f.client.getInstance = async () => { throw Object.assign(Error('absent'), { statusCode: 404 }); };
+        for (const volume of f.volumes.values()) volume.used_by = [];
+        const before = structuredClone(f.manager.store.list());
+        await f.manager.recoverStartup();
+        expect(f.manager.store.list()).toEqual(before);
+        expect(f.manager.isRecoveryBlocked(f.owner.id)).toBe(false);
+        f.client.getInstance = async () => structuredClone(f.instance);
+        await expect(f.runtime.inspectManagedStorage(f.record)).rejects.toThrow('uncaptured');
+    } finally { await f.cleanup(); }
+});

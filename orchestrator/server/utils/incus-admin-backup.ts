@@ -4,10 +4,9 @@ import type { Config } from './config';
 import type { AdministrativeWorkspaceRecord } from './admin-workspace-store';
 import { administrativeRuntimeOwner, validateAdminNativeState } from './admin-native-identity';
 import type { IncusAdminWorkspaceRuntime } from './incus-admin-workspace-runtime';
-import { IncusError, type IncusCustomVolume } from './incus-client';
+import type { IncusCustomVolume } from './incus-client';
 import { IncusOfflineArchiveHelper } from './incus-offline-archive-helper';
 import { openIncusCanonicalArchive } from './incus-canonical-archive';
-import { incusManagedVolumeDeviceKey } from './incus-managed-volume-device';
 import { incusManagedRestoreDevices } from './incus-managed-volume-runtime';
 import { writeGzipFile } from './worker-export';
 
@@ -68,20 +67,8 @@ export class IncusAdminBackup {
     const result = await this.runtime.inspectSelectedStorage(record), owner = administrativeRuntimeOwner(record);
     const store = await this.runtime.storage.store();
     for (const value of store.forWorker(owner.userId, owner.id).filter(v => !v.attached && v.storageRuntimeKind === 'incus-vm')) {
-      incusManagedVolumeDeviceKey(value);
-      if (value.incusLive || value.liveContainerId || value.previousRestartPolicy || value.operation && value.operation.stage !== 'complete' ||
-          (value.seeded ? value.state !== 'detached' : !['pending', 'detached'].includes(value.state)))
-        throw failure('Administrative detached storage is unsettled');
-      let volume;
-      try { volume = await this.runtime.client.getCustomVolume(this.config.incusStoragePool, value.dockerName); }
-      catch (error) { if (error instanceof IncusError && error.statusCode === 404 && !value.seeded) continue; throw error; }
-      if (!value.seeded || volume.name !== value.dockerName || volume.project !== this.config.incusProject ||
-          volume.type !== 'custom' || volume.content_type !== 'filesystem' || !Number.isFinite(Date.parse(volume.created_at)) ||
-          !Array.isArray(volume.used_by) || volume.used_by.length || Object.entries({
-            'user.agentor.installation': record.nativeRuntime!.installationId, 'user.agentor.owner': owner.userId,
-            'user.agentor.id': owner.id, 'user.agentor.volume-id': value.id, 'user.agentor.target': value.target,
-          }).some(([key, expected]) => volume.config[key] !== expected))
-        throw failure('Administrative detached storage ownership is ambiguous');
+      const volume = await this.runtime.storage.inspectDetachedSelectedVolume(record, value);
+      if (!volume) continue;
       result.push({ record: structuredClone(value), volume });
     }
     const portable = result.map(item => ({ ...item.record, operation: undefined }));

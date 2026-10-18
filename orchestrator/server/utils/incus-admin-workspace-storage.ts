@@ -78,6 +78,27 @@ export class IncusAdminWorkspaceStorage {
             throw new Error('Administrative selected volume ownership or references changed');
         return volume;
     }
+    /** Detached history is verified identically at startup and whole-instance capture. */
+    async inspectDetachedSelectedVolume(record: Readonly<AdministrativeWorkspaceRecord>, value: StoredManagedVolume): Promise<IncusCustomVolume | undefined> {
+        const owner = administrativeRuntimeOwner(record);
+        if (value.attached || value.storageRuntimeKind !== 'incus-vm' || value.userId !== owner.userId || value.workerId !== owner.id || value.retainedAfterAccountDeletion)
+            throw new Error('Administrative detached storage authority changed');
+        incusManagedVolumeDeviceKey(value);
+        if (value.incusLive || value.liveContainerId || value.previousRestartPolicy || value.operation && value.operation.stage !== 'complete' ||
+            (value.seeded ? value.state !== 'detached' : !['pending', 'detached'].includes(value.state)))
+          throw new Error('Administrative detached storage is unsettled');
+        let volume;
+        try { volume = await this.client.getCustomVolume(this.config.incusStoragePool, value.dockerName); }
+        catch (error) { if ((error as { statusCode?: number }).statusCode === 404 && !value.seeded) return; throw error; }
+        if (!value.seeded || volume.name !== value.dockerName || volume.project !== this.config.incusProject ||
+            volume.type !== 'custom' || volume.content_type !== 'filesystem' || !Number.isFinite(Date.parse(volume.created_at)) ||
+            !Array.isArray(volume.used_by) || volume.used_by.length || Object.entries({
+              'user.agentor.installation': record.nativeRuntime!.installationId, 'user.agentor.owner': owner.userId,
+              'user.agentor.id': owner.id, 'user.agentor.volume-id': value.id, 'user.agentor.target': value.target,
+            }).some(([key, expected]) => volume.config[key] !== expected))
+          throw new Error('Administrative detached storage ownership is ambiguous');
+        return volume;
+    }
     async selectedDevices(record: Readonly<AdministrativeWorkspaceRecord>, allowOperation = false) {
         const native = record.nativeRuntime!, operation = native.selectedOperation;
         if (operation && !allowOperation)
