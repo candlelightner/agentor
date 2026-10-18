@@ -5,7 +5,7 @@ import type { Config } from './config';
 import type { AdministrativeWorkspaceRecord } from './admin-workspace-store';
 import { ManagedVolumeStore, type StoredManagedVolume } from './managed-volume-store';
 import { administrativeRuntimeOwner, validateAdminNativeState } from './admin-native-identity';
-import { IncusAdminWorkspaceStorage } from './incus-admin-workspace-storage';
+import { IncusAdminWorkspaceStorage, matchesIncusAdminConfig } from './incus-admin-workspace-storage';
 import { IncusClient, type IncusCustomVolume } from './incus-client';
 import { IncusOfflineArchiveHelper } from './incus-offline-archive-helper';
 import { administrativeArchiveHelperOwner } from './incus-admin-backup';
@@ -42,7 +42,7 @@ export async function restoreAdministrativeArchives(config: Config, client: Incu
     if (volume.name !== name || volume.project !== config.incusProject || volume.type !== 'custom' ||
         volume.content_type !== 'filesystem' || !Number.isFinite(Date.parse(volume.created_at)) ||
         !Array.isArray(volume.used_by) || volume.used_by.length ||
-        Object.entries(metadata).some(([key, value]) => volume.config[key] !== value) || baselines.has(name))
+        !matchesIncusAdminConfig(volume.config, metadata) || baselines.has(name))
       throw new Error('Administrative restore destination is not fresh owned filesystem storage');
     baselines.set(name, structuredClone(volume));
   };

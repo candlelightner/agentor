@@ -12,7 +12,7 @@ import { ManagedVolumeStore, pathsOverlap, validatePersistenceTarget, type Store
 import { IncusManagedVolumeRuntime, incusManagedVolumeDeviceKey } from './incus-managed-volume-runtime';
 import { normalizeBackupPaths } from './backup-paths';
 import { MANAGED_KILO_PARENT, MANAGED_KILO_PARENT_CHECK } from './managed-volume-kilo-parent';
-import { IncusAdminWorkspaceStorage } from './incus-admin-workspace-storage';
+import { IncusAdminWorkspaceStorage, matchesIncusAdminConfig } from './incus-admin-workspace-storage';
 import { IncusAdminNetworkBoundary, type AdminNativeNetwork } from './incus-admin-network';
 import { incusImageIdentity, type IncusWorkerImageIdentity } from './incus-worker-image';
 import { readBackupInstallationId } from './backup-installation';
@@ -273,7 +273,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         if (instance.name !== native.name || instance.type !== 'virtual-machine' || instance.profiles?.length ||
             c['user.agentor.installation'] !== native.installationId || c['user.agentor.id'] !== owner.id ||
             c['user.agentor.owner'] !== owner.userId || c['user.agentor.administrative'] !== owner.kind ||
-            c['user.agentor.admin-group'] !== (owner.groupId ?? '') || c['user.agentor.admin-nonce'] !== native.nonce ||
+            !matchesIncusAdminConfig(c, { 'user.agentor.admin-group': owner.groupId ?? '' }) || c['user.agentor.admin-nonce'] !== native.nonce ||
             c['volatile.base_image'] !== native.image.fingerprint || c['boot.autostart'] !== 'false' ||
             c['user.agentor.admin-overlay-sha256'] !== native.overlaySha256 || c['limits.memory'] !== '4GiB' || c['limits.cpu'] !== '2' ||
             incarnation && c['volatile.uuid'] !== incarnation || Object.keys(c).some(k => k.startsWith('raw.')) ||

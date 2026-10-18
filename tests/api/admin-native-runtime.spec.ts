@@ -15,6 +15,7 @@ import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volu
 import { INCUS_SELECTION_DIRECTORY_CHECK, INCUS_PERSISTENCE_COPY } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
 import { INCUS_GUEST_READINESS_SCRIPT } from '../../orchestrator/server/utils/incus-worker-runtime';
 import type { AdministrativeWorkspaceRecord } from '../../orchestrator/server/utils/admin-workspace-store';
+const incusConfig = (config: Record<string, string>) => Object.fromEntries(Object.entries(config).filter(([, value]) => value !== ''));
 async function fixture() {
     const directory = await mkdtemp(join(tmpdir(), 'admin-vm-core-')), installation = randomUUID(), incarnation = randomUUID();
     await writeFile(join(directory, 'backup-installation-id'), installation);
@@ -33,7 +34,7 @@ async function fixture() {
                 throw Object.assign(Error('absent'), { statusCode: 404 });
             return structuredClone(volumes.get(name));
         },
-        createCustomVolume: async (_pool: string, v: any) => { events.push('volume-create'); volumes.set(v.name, { ...structuredClone(v), type: 'custom', project: 'agentor', created_at: stamp, used_by: [] }); },
+        createCustomVolume: async (_pool: string, v: any) => { events.push('volume-create'); volumes.set(v.name, { ...structuredClone(v), config: incusConfig(v.config), type: 'custom', project: 'agentor', created_at: stamp, used_by: [] }); },
         deleteCustomVolume: async (_pool: string, name: string) => { events.push('volume-delete'); volumes.delete(name); },
         updateInstanceDevices: async (_name: string, devices: any, accepted: any) => { await accepted?.('/1.0/operations/' + randomUUID()); instance.devices = structuredClone(devices); events.push('devices'); },
         getInstance: async () => {
@@ -41,7 +42,7 @@ async function fixture() {
                 throw Object.assign(Error('absent'), { statusCode: 404 });
             return structuredClone(instance);
         },
-        createInstance: async (spec: any, accepted: any) => { events.push('vm-create'); await accepted?.('/1.0/operations/' + randomUUID()); instance = { ...structuredClone(spec), status: 'Stopped', config: { ...spec.config, 'volatile.uuid': randomUUID(), 'volatile.base_image': image.fingerprint } }; return structuredClone(instance); },
+        createInstance: async (spec: any, accepted: any) => { events.push('vm-create'); await accepted?.('/1.0/operations/' + randomUUID()); instance = { ...structuredClone(spec), status: 'Stopped', config: { ...incusConfig(spec.config), 'volatile.uuid': randomUUID(), 'volatile.base_image': image.fingerprint } }; return structuredClone(instance); },
         startInstance: async (_name: string, accepted: any) => {
             events.push('vm-start');
             await accepted?.('/1.0/operations/' + randomUUID());
@@ -101,6 +102,27 @@ test('fresh admin VM persists authority, proves network, and mints tmpfs identit
     finally {
         await f.cleanup();
     }
+});
+for (const group of [false, true]) test(`Incus empty-label removal preserves ${group ? 'group exact' : 'global absent-or-empty'} VM and canonical storage authority`, async () => {
+    const f = await fixture();
+    try {
+        f.record.status = 'stopped';
+        if (group) Object.assign(f.record, { kind: 'group-administrative', groupId: 'fixture-group', ownerId: 'fixture-owner' });
+        await f.runtime.ensure(f.record, f.ack);
+        const key = 'user.agentor.admin-group', expected = group ? 'fixture-group' : '';
+        const configs = [f.instance.config, ...[...f.volumes.values()].map(v => v.config)];
+        for (const config of configs) {
+            expect(config[key]).toBe(group ? expected : undefined);
+            for (const value of [undefined, '', null, 'foreign']) {
+                if (value === undefined) delete config[key]; else config[key] = value;
+                if (!group && (value === undefined || value === '')) await expect(f.runtime.assertOwned(f.record)).resolves.toBeTruthy();
+                else await expect(f.runtime.assertOwned(f.record)).rejects.toThrow(/ambiguous/);
+            }
+            if (group) config[key] = expected; else delete config[key];
+        }
+        await expect(f.runtime.assertOwned(f.record)).resolves.toBeTruthy();
+        expect(f.volumes.size).toBe(2);
+    } finally { await f.cleanup(); }
 });
 test('unavailable Incus never calls the retained Docker provisioning backend', async () => {
     const f = await fixture();

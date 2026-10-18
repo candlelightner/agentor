@@ -7,6 +7,11 @@ import type { AdministrativeWorkspaceRecord } from './admin-workspace-store';
 import { ManagedVolumeStore, pathsOverlap, type StoredManagedVolume } from './managed-volume-store';
 import { incusManagedVolumeDeviceKey } from './incus-managed-volume-device';
 import { administrativeRuntimeOwner, type AdminNativeRuntimeIdentity } from './admin-native-identity';
+/** Incus drops empty configuration values; global administration has no group. */
+export function matchesIncusAdminConfig(actual: Record<string, string>, expected: Record<string, string>): boolean {
+    return Object.entries(expected).every(([key, value]) => actual[key] === value ||
+        key === 'user.agentor.admin-group' && value === '' && !Object.hasOwn(actual, key));
+}
 /** Administrative roots retain ordinary canonical archive roles, with an
  * additional dedicated authority that cannot adopt historical worker data. */
 export class IncusAdminWorkspaceStorage {
@@ -177,7 +182,7 @@ export class IncusAdminWorkspaceStorage {
             throw error;
         }
         if (volume.name !== name || volume.type !== 'custom' || volume.content_type !== 'filesystem' ||
-            Object.entries(this.metadata(record, identity, role)).some(([key, value]) => volume.config[key] !== value) ||
+            !matchesIncusAdminConfig(volume.config, this.metadata(record, identity, role)) ||
             !Array.isArray(volume.used_by) || new Set(volume.used_by).size !== volume.used_by.length ||
             volume.used_by.some(ref => {
                 const url = new URL(ref, this.client.endpoint);

@@ -69,12 +69,14 @@ class AdminNetworkTests(unittest.TestCase):
         if method == 'POST':
             self.network = {**copy.deepcopy(body), 'managed': True, 'used_by': []}
             self.network['config']['ipv4.address'] = '10.210.19.1/24'
+            self.network['config'] = {key: value for key, value in self.network['config'].items() if value != ''}
             return {}, None
         if self.network is None:
             raise Missing()
         if method == 'PUT':
             self.assertEqual(etag, 'network-etag')
             self.network.update(copy.deepcopy(body))
+            self.network['config'] = {key: value for key, value in self.network['config'].items() if value != ''}
         return copy.deepcopy(self.network), 'network-etag'
 
     def docker(self, method, path, body=None):
@@ -135,7 +137,7 @@ class AdminNetworkTests(unittest.TestCase):
                    'agents': {'type': 'disk', 'path': '/home/agent/.agent-data', 'pool': 'owned-pool', 'source': name + '-agents'},
                    'eth0': {'type': 'nic', 'name': 'eth0', 'network': result['network'], 'ipv4.address': result['guestAddress'],
                             'hwaddr': result['guestMac'], 'security.mac_filtering': 'true', 'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true'}}
-        return {'name': name, 'type': 'virtual-machine', 'profiles': [], 'config': labels,
+        return {'name': name, 'type': 'virtual-machine', 'profiles': [], 'config': {key: value for key, value in labels.items() if value != ''},
                 'devices': devices, 'expanded_devices': copy.deepcopy(devices)}
 
     def mutations(self):
@@ -245,6 +247,51 @@ class AdminNetworkTests(unittest.TestCase):
         with self.assertRaises(MODULE.PolicyError):
             self.policy.ensure(self.payload)
         self.assertEqual(self.calls, [])
+
+    def test_global_incus_group_label_may_be_absent_or_empty_but_never_foreign_or_null(self):
+        result = self.policy.ensure(self.payload)
+        identity = self.policy.authority(self.payload)
+        self.instance = self.owned_instance(result)
+        key = 'user.agentor.admin-group'
+        self.assertNotIn(key, self.network['config'])
+        self.assertNotIn(key, self.instance['config'])
+        for config in (self.network['config'], self.instance['config']):
+            for value in ('', 'foreign', None):
+                config[key] = value
+                self.calls.clear()
+                if value == '':
+                    self.policy.network(identity)
+                    self.policy.inspect_instance(identity, result)
+                else:
+                    with self.assertRaises(MODULE.PolicyError):
+                        self.policy.network(identity)
+                        self.policy.inspect_instance(identity, result)
+                self.assertEqual(self.mutations(), [])
+            del config[key]
+        self.policy.network(identity)
+        self.policy.inspect_instance(identity, result)
+
+    def test_group_incus_label_is_required_exactly_for_bridge_and_vm(self):
+        self.path.unlink()
+        self.record.update(kind='group-administrative', ownerId='healthy-owner', groupId='legacy_group')
+        path = self.root / 'users' / 'healthy-owner' / 'worker-groups.json'
+        path.write_text(json.dumps([{'id': 'legacy_group', 'userId': 'healthy-owner', 'adminWorkspace': self.record}]))
+        result = self.policy.ensure(self.payload)
+        identity = self.policy.authority(self.payload)
+        self.instance = self.owned_instance(result)
+        key = 'user.agentor.admin-group'
+        for config in (self.network['config'], self.instance['config']):
+            for value in ('', 'foreign', None, 'absent'):
+                if value == 'absent': config.pop(key, None)
+                else: config[key] = value
+                self.calls.clear()
+                with self.assertRaises(MODULE.PolicyError):
+                    self.policy.network(identity)
+                    self.policy.inspect_instance(identity, result)
+                self.assertEqual(self.mutations(), [])
+            config[key] = 'legacy_group'
+        self.policy.network(identity)
+        self.policy.inspect_instance(identity, result)
 
     def test_group_binding_duplicate_and_unrelated_quarantine_deny(self):
         self.path.unlink()

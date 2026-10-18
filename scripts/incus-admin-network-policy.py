@@ -36,6 +36,12 @@ def require(condition, message):
         raise PolicyError(message)
 
 
+def matches_incus_config(actual, expected):
+    # Incus removes empty config values; only the global group label is optional.
+    return all(actual.get(key) == value or key == "user.agentor.admin-group" and value == "" and key not in actual
+               for key, value in expected.items())
+
+
 def command(*args, data=None):
     try:
         result = subprocess.run(args, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -254,7 +260,7 @@ class AdminNetworkPolicy:
         allowed = {"ipv4.address", "ipv4.nat", "ipv4.dhcp", "ipv4.dhcp.ranges", "ipv6.address", *self.labels(identity)}
         require(network.get("name") == identity["name"] and network.get("managed") is True
                 and network.get("type") == "bridge" and etag and not set(config) - allowed
-                and all(config.get(key) == value for key, value in self.labels(identity).items())
+                and matches_incus_config(config, self.labels(identity))
                 and config.get("ipv4.nat") == "true" and config.get("ipv4.dhcp") in (None, "true")
                 and config.get("ipv6.address") == "none", "Private bridge ownership or configuration differs")
         interface = ipaddress.IPv4Interface(config.get("ipv4.address", ""))
@@ -296,7 +302,7 @@ class AdminNetworkPolicy:
                   "boot.autostart": "false", "security.secureboot": "false",
                   "limits.memory": "4GiB", "limits.cpu": "2"}
         require(instance.get("name") == native["name"] and instance.get("type") == "virtual-machine"
-                and instance.get("profiles") == [] and all(config.get(key) == value for key, value in labels.items())
+                and instance.get("profiles") == [] and matches_incus_config(config, labels)
                 and all(key in labels or key.startswith(("volatile.", "image.")) for key in config),
                 "Native admin identity, profiles or configuration differs")
         devices = {"root": {"type": "disk", "path": "/", "pool": self.pool},

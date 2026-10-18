@@ -62,7 +62,7 @@ async function samples(f:AdminDrFixture,side:AdminDrSide,current:State):Promise<
   const {IncusOfflineArchiveHelper}=await import('../../orchestrator/server/utils/incus-offline-archive-helper');
   const {administrativeArchiveHelperOwner}=await import('../../orchestrator/server/utils/incus-admin-backup');
   const {administrativeRuntimeOwner}=await import('../../orchestrator/server/utils/admin-native-identity');
-  const {IncusAdminWorkspaceStorage}=await import('../../orchestrator/server/utils/incus-admin-workspace-storage');
+  const {IncusAdminWorkspaceStorage,matchesIncusAdminConfig}=await import('../../orchestrator/server/utils/incus-admin-workspace-storage');
   const {ManagedVolumeStore}=await import('../../orchestrator/server/utils/managed-volume-store');
   const output:Record<string,unknown>={};
   for(const r of current.records) {
@@ -75,7 +75,8 @@ async function samples(f:AdminDrFixture,side:AdminDrSide,current:State):Promise<
       metadata:{'user.agentor.installation':n.installationId,'user.agentor.owner':owner.userId,'user.agentor.id':r.id,
         'user.agentor.volume-id':v.id,'user.agentor.target':v.target}}))]) {
       const baseline=await client.getCustomVolume(config.incusStoragePool,item.name);
-      expect(baseline).toMatchObject({name:item.name,type:'custom',content_type:'filesystem',project:config.incusProject,config:item.metadata});
+      expect(baseline).toMatchObject({name:item.name,type:'custom',content_type:'filesystem',project:config.incusProject});
+      expect(matchesIncusAdminConfig(baseline.config,item.metadata)).toBe(true);
       const expected=n.incarnation && item.role!=='detached' ? ['/1.0/instances/'+n.name+'?project='+config.incusProject] : [];
       expect(baseline.used_by).toEqual(expected);
       const proof=async(helper?:string)=>{
@@ -88,7 +89,8 @@ async function samples(f:AdminDrFixture,side:AdminDrSide,current:State):Promise<
       // The established helper mounts both canonical roots; prove both below.
       const other=core?await client.getCustomVolume(config.incusStoragePool,n.name+(item.role==='workspace'?'-agents':'-workspace')):undefined;
       if(other)expect(other).toMatchObject({name:n.name+(item.role==='workspace'?'-agents':'-workspace'),type:'custom',content_type:'filesystem',project:config.incusProject,
-        config:storage.metadata(r,n,item.role==='workspace'?'agents':'workspace'),used_by:expected});
+        used_by:expected});
+      if(other)expect(matchesIncusAdminConfig(other.config,storage.metadata(r,n,item.role==='workspace'?'agents':'workspace'))).toBe(true);
       const validate=async(helper?:string)=>{
         await proof(helper);
         if(other){const value=await client.getCustomVolume(config.incusStoragePool,other.name);

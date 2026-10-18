@@ -82,7 +82,7 @@ async function writerFixture() {
   for (const role of ['workspace', 'agents'] as const) {
     const name = storage.names(record.nativeRuntime)[role];
     volumes.set(name, { name, project: config.incusProject, type: 'custom', content_type: 'filesystem',
-      created_at: '2026-10-18T00:00:00Z', config: storage.metadata(record, record.nativeRuntime, role), used_by: [] });
+      created_at: '2026-10-18T00:00:00Z', config: Object.fromEntries(Object.entries(storage.metadata(record, record.nativeRuntime, role)).filter(([, value]) => value !== '')), used_by: [] });
   }
   const stage = join(root, 'stage'); await mkdir(stage); await mkdir(join(stage, 'workspace'));
   execFileSync('python3', ['-c', "import pathlib,sys;pathlib.Path(sys.argv[1],'workspace','file').write_bytes(b'known payload')", stage]);

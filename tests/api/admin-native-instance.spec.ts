@@ -175,7 +175,7 @@ async function applyFixture(legacy: boolean, options: { group?: boolean; selecte
     getInstance: async () => { throw new IncusError('absent',404); },
     getCustomVolume: async (_pool: string, name: string) => { const volume = volumes.get(name); if (!volume) throw new IncusError('absent',404); return structuredClone(volume); },
     createCustomVolume: async (_pool: string, spec: any) => { events.push('allocate-volume'); volumes.set(spec.name, {
-      ...structuredClone(spec), type: 'custom', project: 'private', used_by: [], created_at: stamp }); },
+      ...structuredClone(spec), config: Object.fromEntries(Object.entries(spec.config).filter(([, value]) => value !== '')), type: 'custom', project: 'private', used_by: [], created_at: stamp }); },
     deleteCustomVolume: async (_pool: string, name: string) => { events.push('remove-volume'); volumes.delete(name); if (deletionUnknown) throw Error('lost deletion acknowledgement'); },
     createInstance: async () => { throw Error('No admin compute during filesystem recovery'); },
     startInstance: async () => { throw Error('No service or credential provisioning during filesystem recovery'); } };

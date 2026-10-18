@@ -12,7 +12,7 @@ import type { Config } from './config';
 import type { AdministrativeWorkspaceRecord } from './admin-workspace-store';
 import { administrativeRuntimeOwner, adminNativeInstanceName, validateAdminNativeState } from './admin-native-identity';
 import { administrativeNativeOverlaySha256 } from './incus-admin-overlay';
-import { IncusAdminWorkspaceStorage } from './incus-admin-workspace-storage';
+import { IncusAdminWorkspaceStorage, matchesIncusAdminConfig } from './incus-admin-workspace-storage';
 import { IncusClient, IncusError, type IncusCustomVolume } from './incus-client';
 
 import { WorkerGroupStore } from './worker-group-store';
@@ -263,7 +263,7 @@ export async function applyInstanceAdministrativeRestore(input: { config: Config
     const created = await client.getCustomVolume(config.incusStoragePool, spec.name);
     if (created.name !== spec.name || created.project !== config.incusProject || created.type !== 'custom' || created.content_type !== 'filesystem' ||
         !Number.isFinite(Date.parse(created.created_at)) || !Array.isArray(created.used_by) || created.used_by.length ||
-        Object.entries(spec.config).some(([key,value]) => created.config[key] !== value)) throw new Error('Administrative storage create acknowledgement differs');
+        !matchesIncusAdminConfig(created.config, spec.config)) throw new Error('Administrative storage create acknowledgement differs');
     receipt.volumes.set(spec.name, structuredClone(created)); receipt.unsettled = false;
   }
   const payload = (descriptor?: InstanceBackupVolumeManifest) => {
