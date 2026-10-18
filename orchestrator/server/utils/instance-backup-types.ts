@@ -4,7 +4,16 @@ import type { WorkerBackupRuntimeSource } from './worker-backup-runtime';
 export type InstanceBackupFormatVersion = 1 | 2;
 /** Describes logical bytes only; project, device and restore authority are
  * selected and verified by the current administrator-controlled runtime. */
+export interface InstanceBackupAdministrativeIdentity {
+  kind: 'administrative' | 'group-administrative';
+  workspaceId: string;
+  groupId?: string;
+}
+export type InstanceBackupAdministrativeVolumeRuntime =
+  | { kind: 'incus-vm'; administrative: InstanceBackupAdministrativeIdentity; role: 'workspace' | 'agents'; source: WorkerBackupRuntimeSource; dockerData?: never }
+  | { kind: 'incus-vm'; administrative: InstanceBackupAdministrativeIdentity; role: 'managed'; managedVolumeId: string; target: string };
 export type InstanceBackupNativeVolumeRuntime =
+  | InstanceBackupAdministrativeVolumeRuntime
   | { kind: 'incus-vm'; role: 'workspace'; source: WorkerBackupRuntimeSource;
       /** Descriptive canonical-data presence, not current Docker capability. */
       dockerData?: boolean }

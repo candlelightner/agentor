@@ -857,3 +857,77 @@ test('uncertain completion clear is refenced; uncertain refence acknowledgement 
     } finally { f.cleanup(); await rm(root, { recursive: true, force: true }); }
   }
 });
+
+import { Writable, PassThrough } from 'node:stream';
+import { IncusError } from '../../orchestrator/server/utils/incus-client';
+import { WorkerGroupStore } from '../../orchestrator/server/utils/worker-group-store';
+import { adminNativeInstanceName } from '../../orchestrator/server/utils/admin-native-identity';
+import { administrativeNativeOverlaySha256 } from '../../orchestrator/server/utils/incus-admin-overlay';
+import { administrativeWorkspaceResourceNames } from '../../orchestrator/server/utils/admin-workspace-resources';
+
+for (const group of [false,true]) for (const legacy of [false,true]) test(`controlled helper restores ${group ? 'group' : 'global'} ${legacy ? 'historical' : 'tagged native'} admin bytes into fresh native authority and preserves ordinary shadows`, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'admin-native-controlled-helper-')), savedKey = process.env.WORKER_CONFIG_ENCRYPTION_KEY;
+  delete process.env.WORKER_CONFIG_ENCRYPTION_KEY;
+  try {
+    const f = await fixture(root), sourceDir = join(root,'source'), stamp = '2026-10-18T00:00:00.000Z', id = randomUUID(), installation = randomUUID();
+    await mkdir(join(sourceDir,'admin'), { recursive: true }); await writeFile(join(sourceDir,'backup-installation-id'),installation);
+    await writeFile(join(sourceDir,'auth.db'), Buffer.concat([Buffer.from('SQLite format 3\0'),Buffer.from('admin-native-restored')]));
+    const image = { version: 1 as const, fingerprint: 'a'.repeat(64), sourceImageId: 'sha256:'+'b'.repeat(64), recipeId: 'c'.repeat(64),
+      architecture: 'amd64' as const, converterVersion: 'v0.4.0', bootstrapGeneration: '3' as const };
+    const source = { sourceImageId: image.sourceImageId, recipeId: image.recipeId, architecture: image.architecture,
+      converterVersion: image.converterVersion, bootstrapGeneration: image.bootstrapGeneration };
+    const record: any = { schemaVersion: 1,id,kind: group ? 'group-administrative' : 'administrative',trusted:true,status:'stopped',
+      ownerId:'source-owner',createdAt:stamp,updatedAt:stamp };
+    const groups = new WorkerGroupStore(sourceDir);
+    if(group) record.groupId=(await groups.create('source-owner','Restored group')).id;
+    if(!legacy) record.runtimeKind='incus-vm',record.nativeRuntime={version:1,name:adminNativeInstanceName(record),nonce:randomUUID(),installationId:installation,
+      incarnation:randomUUID(),image,overlayVersion:'6',overlaySha256:administrativeNativeOverlaySha256(record),storageReady:true,storageInitialized:true};
+    if(group) await groups.update('source-owner',record.groupId,{adminWorkspace:record});
+    else await writeFile(join(sourceDir,'admin','workspace.v1.json'),JSON.stringify(record));
+    const workers = new nativeAdapter.WorkerStore(sourceDir); await workers.upsert({id,userId:'source-owner',displayName:'Historical duplicate',status:'archived',
+      importedImage:'sha256:'+'d'.repeat(64),createdAt:stamp,updatedAt:stamp});
+    const shadow=JSON.parse(JSON.stringify(workers.get('source-owner',id)));
+    const options={includeWorkers:true,includeAgentData:true,includeDockerVolumes:true,includeLogs:false,includeLocalBackups:false};
+    const data=await createInstanceDataArchive({dataDir:sourceDir,authSnapshotPath:join(sourceDir,'auth.db'),output:f.plan.dataArchive,options});
+    const names=administrativeWorkspaceResourceNames(record), descriptors:any[]=[];
+    for(const role of ['workspace','agents'] as const){
+      const name=legacy ? role==='workspace' ? names.workspaceVolume : names.agentsVolume : record.nativeRuntime.name+'-'+role;
+      const wrapper=legacy ? 'source' : role==='workspace' ? 'workspace' : '.agent-data', archive=instanceVolumeArchiveName(name), path=join(f.unpacked,nativeAdapter.instanceBundleFilename(archive));
+      await writeTarGzip(path,[{name:wrapper,type:'directory'},{name:wrapper+'/bytes',body:'admin-fixture-known-'+role}]);
+      descriptors.push({name,archive,sha256:await sha256File(path),size:(await (await import('node:fs/promises')).stat(path)).size,
+        kind:role==='workspace'?'admin-workspace':'admin-agent-data',...(group?{ownerId:'source-owner',groupId:record.groupId}:{}),
+        ...(!legacy?{ownerId:group?'source-owner':'__agentor_admin__',workerId:id,runtime:{kind:'incus-vm',role,source,
+          administrative:{kind:record.kind,workspaceId:id,...(group?{groupId:record.groupId}:{})}}}:{})});
+    }
+    const manifest=validateInstanceManifest({kind:'agentor-instance-backup',formatVersion:legacy?1:2,backupId:'admin-helper-fixture',sourceInstallationId:installation,
+      createdByUserId:f.plan.restoredOwnerId,createdAt:stamp,agentorVersion:'test',storage:{mode:'volume',containerPrefix:'agentor-worker'},options,
+      dataArchive:{archive:'data.tar.gz',...data},volumes:descriptors,plugins:{platformDefinitionCount:0,ownerDefinitionCount:0,installationCount:0},
+      hostMounts:{configuredPaths:[],contentsIncluded:false},images:{definitions:0,immutableDigests:[],layersIncluded:false},excludedDataPaths:data.excludedDataPaths});
+    await writeFile(join(f.stage,'restore-plan.json'),JSON.stringify({...f.plan,formatVersion:2,sourceInstallationId:installation,manifest,
+      volumes:manifest.volumes.map(volume=>({...volume,archive:join(f.unpacked,nativeAdapter.instanceBundleFilename(volume.archive))}))}));
+    const env={...f.env,HOSTNAME:'isolated-controller',AGENTOR_INSTANCE_RESTORE_NATIVE:'true',CONTAINER_PREFIX:'agentor-worker',WORKER_IMAGE:'approved-docker',WORKER_IMAGE_PREFIX:'',
+      INCUS_ENDPOINT:'https://fixture.invalid',INCUS_PROJECT:'private',INCUS_STORAGE_POOL:'pool',INCUS_NETWORK:'unused',INCUS_WORKER_IMAGE:'approved',
+      INCUS_CLIENT_CERT_PATH:'/fixture/cert',INCUS_CLIENT_KEY_PATH:'/fixture/key',INCUS_SERVER_CERT_PATH:'/fixture/server'};
+    const volumes=new Map<string,any>(), inputs:Buffer[]=[];
+    const client:any={endpoint:env.INCUS_ENDPOINT,getReadiness:async()=>({ready:true,auth:'trusted',project:'private'}),request:async()=>({config:{restricted:'true','features.storage.volumes':'true'}}),
+      getInstance:async()=>{throw new IncusError('absent',404);},getCustomVolume:async(_pool:string,name:string)=>{if(!volumes.has(name))throw new IncusError('absent',404);return structuredClone(volumes.get(name));},
+      createCustomVolume:async(_pool:string,spec:any)=>{volumes.set(spec.name,{...structuredClone(spec),type:'custom',project:'private',used_by:[],created_at:stamp});},
+      execStream:async()=>{let resolve!:(code:number)=>void;const result=new Promise<number>(yes=>{resolve=yes;});return{result,stdout:new PassThrough(),stderr:new PassThrough(),
+        stdin:new Writable({write(chunk,_encoding,done){inputs.push(Buffer.from(chunk));done();},final(done){resolve(0);done();}}),close(){}};}};
+    const helper:any={withGuest:async(_owner:any,sources:any,validate:any,_signal:any,copy:any)=>{expect(Object.keys(sources)).toEqual(['administrativeRestore']);await validate();
+      for(const volume of volumes.values())volume.used_by=['/1.0/instances/private-helper?project=private'];
+      try{return await copy('private-helper',async()=>{});}finally{for(const volume of volumes.values())volume.used_by=[];await validate();}}};
+    const adapter={...nativeAdapter,preflightInstanceAdministrativeRestore:async(config:any,planned:any,fresh:any)=>nativeAdapter.preflightInstanceAdministrativeRestore(config,planned,fresh,client,async()=>image),
+      applyInstanceAdministrativeRestore:async(input:any)=>nativeAdapter.applyInstanceAdministrativeRestore({...input,client,resolveImage:async()=>image,
+        restore:(config:any,client:any,record:any,payloads:any,validate:any,signal:any)=>nativeAdapter.restoreAdministrativeArchives(config,client,record,payloads,validate,signal,helper)})};
+    const docker=fakeDocker(f.dataDir,f.env.AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR,{recoveryMode:true,createVolumeError:Error('Administrative bytes must never target Docker')});
+    const result=await (await importHelper(pathToFileURL(helperPath).href)).runInstanceRestoreHelper({env,docker:docker.docker,nativeAdapter:adapter});
+    expect(result).toEqual({status:'succeeded'});expect(docker.state).toMatchObject({stops:1,starts:1,running:true});
+    const restored=(await nativeAdapter.readInstanceAdministrativeRecords(f.dataDir))[0]!;
+    expect(restored.runtimeKind).toBe('incus-vm');expect(restored.status).toBe('stopped');expect(restored.nativeRuntime!.storageInitialized).toBe(true);
+    expect(restored.nativeRuntime!.incarnation).toBeUndefined();expect(restored.nativeRuntime!.pending).toBeUndefined();expect(restored.nativeRuntime!.nonce).not.toBe(record.nativeRuntime?.nonce);
+    const restoredWorkers=new nativeAdapter.WorkerStore(f.dataDir);await restoredWorkers.loadUser('source-owner');expect(restoredWorkers.get('source-owner',id)).toEqual(shadow);
+    expect(volumes.size).toBe(2);expect(Buffer.concat(inputs).includes(Buffer.from('admin-fixture-known-workspace'))).toBe(true);
+    await expect(readFile(join(f.dataDir,'worker-config.key'))).rejects.toMatchObject({code:'ENOENT'});
+  } finally {if(savedKey===undefined)delete process.env.WORKER_CONFIG_ENCRYPTION_KEY;else process.env.WORKER_CONFIG_ENCRYPTION_KEY=savedKey;await rm(root,{recursive:true,force:true});}
+});

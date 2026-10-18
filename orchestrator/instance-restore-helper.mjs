@@ -54,6 +54,7 @@ const HOST_MOUNT_CATALOG_RELATIVE = "admin/host-mount-paths.v1.json";
 // Initialize before the CLI's top-level await invokes the helper. Module
 // import tests alone do not exercise this entrypoint ordering.
 const NATIVE_OPERATOR_FIELDS = {
+  workerImage: 'WORKER_IMAGE', workerImagePrefix: 'WORKER_IMAGE_PREFIX',
   containerPrefix: 'CONTAINER_PREFIX', incusEndpoint: 'INCUS_ENDPOINT', incusProject: 'INCUS_PROJECT',
   incusClientCertPath: 'INCUS_CLIENT_CERT_PATH', incusClientKeyPath: 'INCUS_CLIENT_KEY_PATH',
   incusServerCertPath: 'INCUS_SERVER_CERT_PATH', incusNetwork: 'INCUS_NETWORK', incusStoragePool: 'INCUS_STORAGE_POOL',
@@ -115,7 +116,7 @@ export async function runInstanceRestoreHelper(options = {}) {
     docker = options.docker ?? new Docker({ socketPath: "/var/run/docker.sock" });
     target = docker.getContainer(context.orchestratorId);
     const targetMount = await validateContainerBoundary(docker, target, context.dataDir);
-    await assertVolumesAbsent(docker, context.plan.volumes.filter(volume => !volume.runtime));
+    await assertVolumesAbsent(docker, context.plan.volumes.filter(volume => !volume.runtime && !nativeRestore?.adminNames?.has(volume.name)));
     if (nativeRestore) {
       nativeRestore.targetMount = targetMount;
       await preflightNativeRestore();
@@ -141,7 +142,7 @@ export async function runInstanceRestoreHelper(options = {}) {
       context.dataDir,
       context.orchestratorId,
     );
-    await assertVolumesAbsent(docker, context.plan.volumes.filter(volume => !volume.runtime));
+    await assertVolumesAbsent(docker, context.plan.volumes.filter(volume => !volume.runtime && !nativeRestore?.adminNames?.has(volume.name)));
     if (nativeRestore) await preflightNativeRestore();
     await updateJob("running", "restore-applying", 82, "Orchestrator stopped. Applying the verified control-plane snapshot and selected volumes.");
 
@@ -159,7 +160,7 @@ export async function runInstanceRestoreHelper(options = {}) {
     await assertJobStillActive();
 
     if (nativeRestore) await applyNativeRestore(docker);
-    for (const volume of context.plan.volumes.filter(volume => !volume.runtime))
+    for (const volume of context.plan.volumes.filter(volume => !volume.runtime && !nativeRestore?.adminNames?.has(volume.name)))
       await restoreVolume(docker, target, context, volume);
 
     await updateJob("succeeded", "complete", 100, "Instance restore completed. Agentor is restarting with the restored control plane.");
@@ -411,7 +412,9 @@ function validatePlan(value, expected) {
       archive,
       kind: entry.kind,
       ...(entry.workerId ? { workerId: entry.workerId } : {}),
-      ...(native && entry.runtime ? { runtime: entry.runtime, ownerId: entry.ownerId } : {}),
+      ...(native && entry.runtime ? { runtime: entry.runtime } : {}),
+      ...(native && entry.ownerId ? { ownerId: entry.ownerId } : {}),
+      ...(native && entry.groupId ? { groupId: entry.groupId } : {}),
     };
   });
   return {
@@ -439,8 +442,6 @@ async function prepareNativeRestore(injectedAdapter) {
     throw new SafeRestoreError('Native source installation or naming authority disagrees with the staged snapshot', 'INSTANCE_RESTORE_INVALID_PLAN');
   // Never let ordinary decrypt's first-use key generation substitute for a
   // missing source key. The override is passed only from current operator config.
-  if (!activeEnvironment.WORKER_CONFIG_ENCRYPTION_KEY)
-    await assertRegularNoFollow(join(context.preparedData, 'worker-config.key'), 1024);
   if ((activeEnvironment.WORKER_CONFIG_ENCRYPTION_KEY ?? '') !== (process.env.WORKER_CONFIG_ENCRYPTION_KEY ?? ''))
     throw new SafeRestoreError('Worker configuration key launch boundary disagrees', 'INSTANCE_RESTORE_INVALID_CONTEXT');
   const workers = new adapter.WorkerStore(context.preparedData), managed = new adapter.ManagedVolumeStore(context.preparedData);
@@ -452,18 +453,28 @@ async function prepareNativeRestore(injectedAdapter) {
     if (!safeId(owner)) throw new SafeRestoreError('Invalid staged account identity', 'INSTANCE_RESTORE_INVALID_ARCHIVE');
     await Promise.all([workers.loadUser(owner), managed.loadUser(owner)]);
   }
-  const groups = adapter.planInstanceNativeRestore(context.plan.manifest, workers.list(), managed.list(), true);
+  const adminRecords = await adapter.readInstanceAdministrativeRecords(context.preparedData);
+  const administrative = adapter.planInstanceAdministrativeRestore(context.plan.manifest, adminRecords, managed.list(), true);
+  const adminIds = new Set(adminRecords.map(record => record.id));
+  const groups = adapter.planInstanceNativeRestore(context.plan.manifest, workers.list().filter(worker => !adminIds.has(worker.id)),
+    managed.list().filter(volume => !adminIds.has(volume.workerId)), true);
+  if (groups.some(group => group.worker) && !activeEnvironment.WORKER_CONFIG_ENCRYPTION_KEY)
+    await assertRegularNoFollow(join(context.preparedData, 'worker-config.key'), 1024);
+  const adminNames = new Set(administrative.flatMap(group => [group.core.workspace.name, ...(group.core.agents ? [group.core.agents.name] : []),
+    ...group.managed.map(item => item.descriptor.name)]));
   const configStore = new adapter.WorkerConfigStore(config);
   const archives = new Map(), prepared = [];
   const scratch = join(context.stage, 'native-archives');
   await mkdir(scratch, { mode: 0o700, recursive: false });
-  for (const volume of context.plan.volumes.filter(volume => volume.runtime)) {
+  for (const volume of context.plan.volumes.filter(volume => volume.runtime || adminNames.has(volume.name))) {
     const descriptor = context.plan.manifest.volumes.find(item => item.name === volume.name);
     if (!descriptor || !isDeepStrictEqual(descriptor.runtime, volume.runtime) || descriptor.ownerId !== volume.ownerId ||
-        descriptor.kind !== volume.kind || descriptor.workerId !== volume.workerId ||
+        descriptor.kind !== volume.kind || descriptor.workerId !== volume.workerId || descriptor.groupId !== volume.groupId ||
         volume.archive !== join(context.stage, 'unpacked', adapter.instanceBundleFilename(descriptor.archive)))
       throw new SafeRestoreError('Native payload does not match its authenticated descriptor', 'INSTANCE_RESTORE_INVALID_PLAN');
-    const raw = await adapter.prepareInstanceNativeVolumeArchive(volume.archive, descriptor, scratch);
+    const raw = !descriptor.runtime && adminNames.has(volume.name)
+      ? await adapter.prepareInstanceLegacyAdministrativeVolumeArchive(volume.archive, descriptor, scratch)
+      : await adapter.prepareInstanceNativeVolumeArchive(volume.archive, descriptor, scratch);
     archives.set(volume.name, raw.archivePath);
   }
   if (context.plan.manifest.volumes.filter(volume => volume.runtime).some(volume => !archives.has(volume.name)))
@@ -494,11 +505,17 @@ async function prepareNativeRestore(injectedAdapter) {
     prepared.push({ group, options, receipt: { attempted: false, unsettled: false,
       marker: { nonce, initialCreate: true, importIncomplete: true }, volumes: new Map() } });
   }
-  return { adapter, config, archives, prepared };
+  const preparedAdministrative = administrative.map(group => ({ group, fresh: adapter.freshInstanceAdministrativeRestore(group),
+    receipt: { managed: [], volumes: new Map(), unsettled: false } }));
+  return { adapter, config, archives, prepared, preparedAdministrative, adminNames };
 }
 
 async function preflightNativeRestore() {
   await assertJobStillActive();
+  for (const item of nativeRestore.preparedAdministrative) {
+    await nativeRestore.adapter.preflightInstanceAdministrativeRestore(nativeRestore.config, item.group, item.fresh);
+    await assertJobStillActive();
+  }
   const runtime = new nativeRestore.adapter.IncusWorkerRuntime(nativeRestore.config);
   for (const item of nativeRestore.prepared) {
     const detached = item.group.managed.filter(entry => !entry.record.attached).map(entry => {
@@ -524,6 +541,9 @@ async function applyNativeRestore(docker) {
     throw new SafeRestoreError('Authoritative host data path is unavailable', 'INSTANCE_RESTORE_INVALID_CONTEXT');
   storage.dataHostPath = mount.Source; storage.dataRef = mount.Type === 'bind' ? mount.Source : mount.Name;
   storage.mode = mount.Type === 'bind' ? 'directory' : 'volume';
+  for (const item of nativeRestore.preparedAdministrative) await adapter.applyInstanceAdministrativeRestore({
+    config: nativeRestore.config, group: item.group, fresh: item.fresh, archives: nativeRestore.archives,
+    receipt: item.receipt, validateJob: assertJobStillActive });
   for (const item of nativeRestore.prepared) {
     if (item.group.worker) item.options.storageManager = storage;
     await adapter.applyInstanceNativeRestoreGroup({ config: nativeRestore.config, group: item.group, options: item.options,
@@ -531,8 +551,19 @@ async function applyNativeRestore(docker) {
   }
 }
 
+async function assertJobTerminalSuccess() {
+  const state = await readBoundedJson(join(context.dataDir, JOB_STORE_RELATIVE), MAX_STORE_BYTES, 'restore job store');
+  const job = state.jobs?.find(entry => entry?.id === context.jobId);
+  if (job?.userId !== context.plan.restoredOwnerId || job.operation !== 'restore' || job.status !== 'succeeded' || job.phase !== 'complete')
+    throw new SafeRestoreError('Native terminal completion ledger changed', 'INSTANCE_RESTORE_JOB_STATE_INVALID');
+}
+
 async function completeNativeRestore() {
   const { adapter, config } = nativeRestore;
+  for (const item of nativeRestore.preparedAdministrative) {
+    await assertJobTerminalSuccess();
+    await adapter.completeInstanceAdministrativeRestore(config, item.receipt);
+  }
   for (const item of nativeRestore.prepared) {
     if (!item.group.worker) continue;
     const state = await readBoundedJson(join(context.dataDir, JOB_STORE_RELATIVE), MAX_STORE_BYTES, 'restore job store');
@@ -567,10 +598,13 @@ async function refenceNativeCompletion() {
     if (!isDeepStrictEqual(item.receipt.worker?.incusRecreation, item.receipt.marker))
       throw new SafeRestoreError('Native completion recovery fence is unconfirmed', 'INSTANCE_RESTORE_NATIVE_UNSETTLED');
   }
+  for (const item of nativeRestore.preparedAdministrative) await adapter.refenceInstanceAdministrativeRestore(config, item.receipt);
   nativeRestore.restartSafe = true;
 }
 
 async function rollbackNativeRestore() {
+  for (const item of [...nativeRestore.preparedAdministrative].reverse()) await nativeRestore.adapter.rollbackInstanceAdministrativeRestore(
+    nativeRestore.config, item.receipt, assertJobStillActive);
   for (const item of [...nativeRestore.prepared].reverse())
     await nativeRestore.adapter.rollbackInstanceNativeRestoreGroup(nativeRestore.config, item.group, item.options,
       item.receipt, assertJobStillActive);

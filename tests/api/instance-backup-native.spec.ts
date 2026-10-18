@@ -183,3 +183,69 @@ test('native control-plane-only instance backup retains authenticated v2 metadat
       .rejects.toMatchObject({ code: 'INSTANCE_RESTORE_NATIVE_DATA_REQUIRED', statusCode: 409 });
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+
+import { IncusAdminBackup } from '../../orchestrator/server/utils/incus-admin-backup';
+import { useGroupAdminWorkspaceStore } from '../../orchestrator/server/utils/group-admin-workspace-store';
+import { adminNativeInstanceName } from '../../orchestrator/server/utils/admin-native-identity';
+
+for (const grouped of [false, true]) test(`whole-instance producer routes ${grouped ? 'group' : 'global'} native admin canonical and selected bytes through dedicated authority`, async () => {
+  await inventoryFixture(async f => {
+    const ownerId = grouped ? f.worker.userId : '__agentor_admin__', groupId = grouped ? randomUUID() : undefined;
+    const record: any = { schemaVersion: 1, id: f.worker.id, kind: grouped ? 'group-administrative' : 'administrative',
+      trusted: true, ownerId: f.worker.userId, groupId, status: 'stopped', runtimeKind: 'incus-vm',
+      nativeRuntime: { version: 1, installationId: randomUUID(), nonce: randomUUID(), incarnation: randomUUID(),
+        image: { version: 1, ...source, fingerprint: 'e'.repeat(64) }, overlayVersion: '6', overlaySha256: 'f'.repeat(64),
+        storageReady: true, storageInitialized: true } };
+    record.nativeRuntime.name = adminNativeInstanceName(record);
+    const attached = { ...f.managed, userId: ownerId, attached: true, state: 'ready' };
+    const detached = { ...attached, id: randomUUID(), attached: false, state: 'detached', target: '/srv/history' };
+    detached.dockerName = 'agentor-persist-' + detached.id;
+    let locked = false, inspections = 0;
+    f.patch(f.volumes.store, 'list', () => [attached, detached]);
+    f.patch(useAdminWorkspaceStore(), 'init', async () => {});
+    f.patch(useWorkerGroupStore(), 'init', async () => {});
+    f.patch(useAdminWorkspaceStore(), 'getRecord', () => grouped ? undefined : record);
+    f.patch(useWorkerGroupStore(), 'list', () => grouped ? [{ id: groupId, userId: ownerId, adminWorkspace: record }] : []);
+    const transaction = async (...args: any[]) => {
+      const operation = args.at(-1); expect(locked).toBe(false); locked = true;
+      try { return await operation(record); } finally { locked = false; }
+    };
+    f.patch(useAdminWorkspaceStore(), 'withNativeRuntimeTransaction', transaction);
+    f.patch(useGroupAdminWorkspaceStore(), 'withNativeRuntimeTransaction', transaction);
+    f.patch(IncusAdminBackup.prototype, 'inspect', async (current: any) => {
+      expect(locked).toBe(true); expect(current).toBe(record); inspections++; return {} as any;
+    });
+    f.patch(IncusAdminBackup.prototype, 'inspectSelected', async (current: any) => {
+      expect(locked).toBe(true); expect(current).toBe(record); return [attached, detached].map(record => ({ record, volume: {} }));
+    });
+    f.patch(f.containers, 'inspectInstanceBackupStorageWithLifecycleFenceHeld', async () => { throw Error('Admin shadows are not ordinary workers'); });
+    f.patch(f.volumes.incusRuntime, 'inspectVolume', async () => { throw Error('Admin storage is not ordinary managed storage'); });
+    f.patch(f.manager.docker, 'listVolumes', async () => ({ Volumes: [] }));
+    const inventory = await f.manager.inventory('admin');
+    expect(inspections).toBe(1); expect(inventory.nativeRuntime).toBe(true);
+    expect(inventory.volumes).toHaveLength(4);
+    expect(inventory.volumes.map((v: any) => v.name)).toEqual([record.nativeRuntime.name + '-workspace',
+      record.nativeRuntime.name + '-agents', attached.dockerName, detached.dockerName]);
+    for (const volume of inventory.volumes) {
+      expect(volume.ownerId).toBe(ownerId); expect(volume.workerId).toBe(record.id);
+      expect(volume.runtime.administrative).toEqual({ kind: record.kind, workspaceId: record.id, ...(groupId ? { groupId } : {}) });
+      expect(volume.runtime).not.toHaveProperty('incarnation');
+    }
+    const paths: any[] = [];
+    f.patch(IncusAdminBackup.prototype, 'capture', async (current: any, output: any) => {
+      expect(locked).toBe(true); expect(current).toBe(record); paths.push(output); return { image: record.nativeRuntime.image } as any;
+    });
+    f.patch(IncusAdminBackup.prototype, 'captureSelected', async (current: any, id: string, path: string) => {
+      expect(locked).toBe(true); expect(current).toBe(record); paths.push(path); return [attached, detached].find(v => v.id === id)!;
+    });
+    const canonical = inventory.volumes.filter((v: any) => v.runtime.role !== 'managed');
+    await f.manager.snapshotNativeVolumes(canonical.map((volume: any) => ({ volume, path: '/fixture/' + volume.runtime.role })), new AbortController().signal);
+    for (const volume of inventory.volumes.filter((v: any) => v.runtime.role === 'managed'))
+      await f.manager.snapshotNativeVolumes([{ volume, path: '/fixture/' + volume.runtime.managedVolumeId }], new AbortController().signal);
+    expect(paths).toEqual([{ workspace: '/fixture/workspace', agents: '/fixture/agents' }, '/fixture/' + attached.id, '/fixture/' + detached.id]);
+    record.kind = grouped ? 'administrative' : 'group-administrative';
+    await expect(f.manager.snapshotNativeVolumes([{ volume: canonical[0], path: '/fixture/refused' }], new AbortController().signal))
+      .rejects.toThrow(/authority changed|authority is invalid/i);
+  });
+});

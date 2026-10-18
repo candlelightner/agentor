@@ -406,7 +406,7 @@ const statusClass = (status: string) => {
             <div class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
               <label class="text-sm"><input v-model="options.includeWorkers" type="checkbox" /> Worker workspaces</label>
               <label class="text-sm" :class="{ 'opacity-50': !options.includeWorkers }"><input v-model="options.includeAgentData" type="checkbox" :disabled="!options.includeWorkers" /> Worker agent data</label>
-              <label class="text-sm"><input v-model="options.includeDockerVolumes" type="checkbox" /> Agentor Docker volumes</label>
+              <label class="text-sm"><input v-model="options.includeDockerVolumes" type="checkbox" /> Agentor persistent volumes</label>
               <label class="text-sm"><input v-model="options.includeLocalBackups" type="checkbox" /> Existing local worker backups</label>
               <label class="text-sm"><input v-model="options.includeLogs" type="checkbox" /> Orchestrator logs</label>
             </div>
@@ -654,7 +654,7 @@ const statusClass = (status: string) => {
           </div>
 
           <details v-if="selectedArtifact.manifest?.volumes.length" class="text-xs">
-            <summary class="cursor-pointer font-medium">Contained Docker volumes</summary>
+            <summary class="cursor-pointer font-medium">Contained persistent volumes</summary>
             <ul class="mt-1 list-disc pl-5">
               <li v-for="volume in selectedArtifact.manifest.volumes" :key="volume.name"><code>{{ volume.name }}</code> · {{ volume.kind }} · {{ size(volume.size) }}</li>
             </ul>
@@ -670,7 +670,8 @@ const statusClass = (status: string) => {
 
           <fieldset class="rounded border p-3 space-y-2">
             <legend class="px-1 text-sm font-medium">Restore scope</legend>
-            <label class="block text-sm"><input v-model="restoreDockerVolumes" type="checkbox" /> Restore contained Agentor-owned Docker volumes</label>
+            <label class="block text-sm"><input v-model="restoreDockerVolumes" type="checkbox" /> Restore contained Agentor-owned persistent volumes</label>
+            <p v-if="selectedArtifact.manifest?.volumes.some(volume => volume.kind === 'admin-workspace')" class="text-xs text-gray-500">Administrative workspace data restores into fresh native storage with stopped intent. Native setup provisions a fresh VM and private network from this installation’s approved base. Explicit Start launches its service and management identity.</p>
             <label class="block text-sm"><input v-model="restoreHostMountPolicies" type="checkbox" /> Restore host-mount allowlists and grants</label>
             <p v-if="restoreHostMountPolicies" class="text-xs font-medium text-amber-700 dark:text-amber-300">
               This restores only policy references. Copy and validate external

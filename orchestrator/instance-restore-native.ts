@@ -1,3 +1,7 @@
+export { restoreAdministrativeArchives } from './server/utils/incus-admin-restore';
+export { remapAdministrativeOwnerMetadata } from './server/utils/admin-owner-metadata-remap';
+export * from './server/utils/instance-restore-administrative';
+export { prepareInstanceLegacyAdministrativeVolumeArchive } from './server/utils/instance-backup-bundle';
 /** Standalone controlled-helper imports only. Descriptive archive metadata
  * grants no worker, storage or runtime authority; existing adapters enforce it. */
 export { IncusWorkerRuntime } from './server/utils/incus-worker-runtime';
@@ -345,6 +349,7 @@ export function planInstanceNativeRestore(manifestValue: unknown, workers: Worke
   }
   for (const descriptor of manifest.volumes) {
     const runtime = descriptor.runtime;
+    if (runtime && 'administrative' in runtime) continue;
     if (!runtime) {
       if (descriptor.workerId && workerRecords.get(descriptor.workerId)?.runtimeKind === 'incus-vm' ||
           nativeManagedNames.has(descriptor.name))

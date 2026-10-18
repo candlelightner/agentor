@@ -4,6 +4,40 @@
 
 The optional internal `legacySourceWrapper` flag accepts only the historical instance `source/` wrapper. The existing bounded raw TAR scanner validates its entries, PAX metadata and hardlinks. The fixed GNU transform changes member and hardlink names into `workspace/` or `.agent-data/`; symlink targets and original RAW/PAX bytes remain unchanged. Ordinary canonical and managed archives keep their existing codecs and target admission. No request can select a transform, mount path, pool or host device.
 
-Private helper receipts retain unknown operations and unsettled extraction. An unchanged stopped destination with no captured VM UUID is required; already initialized storage cannot be copied again through this inverse. Real native admin migration and complete encrypted disaster-recovery API/UI acceptance remain deployment gates. Module tests exercise the actual GNU inverse with binary xattrs, numeric owners, root metadata, hardlinks and unchanged symlink text, plus isolated backend/receipt mocks.
+Private helper receipts retain unknown operations and unsettled extraction. An unchanged stopped destination with no captured VM UUID is required; already initialized storage cannot be copied again through this inverse. The whole-instance producer, planner and controlled-helper integration use this inverse. Real native admin migration and complete encrypted disaster-recovery API/UI acceptance remain deployment gates. Module tests exercise the actual GNU inverse with binary xattrs, numeric owners, root metadata, hardlinks and unchanged symlink text, plus isolated backend/receipt mocks.
 
 `remapAdministrativeOwnerMetadata(dataDir, record, newPrivateEvidenceDirectory, validateAuthority)` is a one-time global-admin desired-state transfer. Group owners stay unchanged. The caller holds the dedicated stopped native migration/restore fence and reloads application plugin stores after success. Referenced private definitions are cloned into the new admin's worker scope; original shared definitions stay available to ordinary workers. Installation IDs, desired state, key names, allocations and desktop observations are preserved. The source active installation is removed before publishing its destination copy, so IDs never occupy both active namespaces. An exclusive private receipt maps byte-exact original source/destination files to relative DATA paths. Partial failure retains this evidence and requires the caller to keep its migration fence for manual recovery; it is not an automatic retry protocol.
+
+
+## Whole-instance capture and recovery
+
+The whole-instance producer reads dedicated global/group records under their existing lifecycle transactions. Native canonical roots and attached or detached seeded selected volumes use the readonly networkless helper. Ordinary worker shadows with the same administrative IDs remain unchanged and are excluded from ordinary capture. Unfinished administrative operations, foreign references, incomplete selected data and layouts outside the existing 32-volume restore bound block publication.
+
+Format 2 administrative volume descriptors carry a strict administrative kind/workspace/group tag, canonical role or managed ID/target, and descriptive immutable image provenance. They cannot carry a VM UUID, storage nonce, private address, device layout or management credential. The encrypted DATA snapshot still preserves the dedicated source records; the restore planner joins descriptors to those exact trusted records before making fresh destination authority. Ordinary worker formats and admission remain unchanged.
+
+Recovery accepts both these native descriptors and historical format 1 `admin-workspace` / `admin-agent-data` descriptors joined to staged dedicated trusted records. Historical compressed `source/` payloads retain their original raw bytes and use the fixed GNU inverse above. Current operator configuration and an inspected, approved native base select the future disposable VM image; the historical image is provenance, not executable authority. Missing Incus readiness, approved image, canonical payloads or trusted records fails before the current orchestrator stops.
+
+The controlled helper replaces DATA only in the existing empty recovery-mode workflow. It writes a stopped native record with a fresh nonce and whole-job pending fence, creates exact unused canonical/selected filesystem volumes, validates and extracts bytes, then acknowledges initialized storage. Selected records get fresh managed IDs; only attached selections enter native runtime refs. Detached seeded history is copied but remains unmounted. Backup selections use stable workspace IDs and absolute paths, so these managed-ID changes do not rewrite user backup schedules or selections. Global plugin desired-state ownership uses the remap above; group ownership is unchanged.
+
+The helper clears the administrative pending fence only after its successful terminal job ledger is durable. It provisions no administrative VM, NIC or management credential. Later native setup (including startup ensure after leaving recovery mode) creates fresh stopped compute and current private networking. Explicit Start launches the service with a fresh short-lived identity; no Docker fallback is permitted. Keep recovery mode enabled until destination setup is reviewed. Taking another full native filesystem backup requires native setup to have created its stopped VM, so current VM/storage authority can be proven.
+
+An uncertain volume creation, extraction/cleanup or deletion acknowledgement retains installed recovery fences and staged DATA rather than deleting an unproven resource or restarting unsafe state. Only exact acknowledged unused volumes are rolled back. Original encrypted backup artifacts remain available for diagnosis/recovery; the helper never adopts a same-named native resource or an ordinary administrative shadow.
+
+## Checks and live acceptance gate
+
+No-server module cases cover strict tags, historical/native global/group planning, fresh selected IDs, attached/detached admission, private-store apply/rollback, and the actual controlled-helper entrypoint with known raw archive bytes and fake Incus operations. `ui/admin-native-instance-isolated.spec.ts` renders the production modal/composable in Chromium with a private HTTP API fixture; it checks the stopped-native notice and blocked apply. Run it without an application stack:
+
+```bash
+cd tests
+npx playwright test --config=playwright.instance-recovery.config.ts
+```
+
+The existing complete workspace and instance API/UI suites remain required. Native administrative parity additionally needs an isolated Incus environment with nested KVM and its own approved image, restricted project/storage, private network service and recovery installation. This gate has not been run by the source-only fixtures:
+
+1. Create one global and one group native admin. Write known canonical and agent files with numeric owners/modes, a binary xattr, a hardlink and a literal symlink. Seed one attached and one detached selected path with distinct known contents, then Stop both admins.
+2. Through the existing whole-instance UI/API, create and inspect an encrypted backup with persistent volumes and agent data. Restore it into an empty recovery-mode installation using the controlled helper.
+3. Check stopped dedicated records, fresh storage nonces and selected IDs, exact bytes/metadata, absent admin compute/incarnations and unchanged ordinary shadow records. Detached history must be restored without an active runtime reference.
+4. Finish destination operator setup, leave recovery mode, and use the supported Start, Stop and Rebuild operations. Verify fresh VM UUID/private NIC/short-lived management identity, canonical and attached selected contents, detached data remaining unmounted, commands/desktop/plugin access, and authority revocation of stale streams/proxies.
+5. Repeat recovery with a historical format 1 backup containing dedicated global/group Docker admin canonical descriptors. Verify the same native result without creating Docker admin compute or requiring the missing historical image.
+
+No administrative Archive operation is introduced. Ordinary archive/restore acceptance remains in its existing suites. Private test accounts, source data and credentials must belong only to the disposable installation.

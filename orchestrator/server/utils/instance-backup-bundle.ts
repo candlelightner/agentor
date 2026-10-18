@@ -28,6 +28,7 @@ import type {
   InstanceBackupVolumeManifest,
 } from "./instance-backup-types";
 import { randomUUID } from 'node:crypto';
+import { validateIncusLegacyAdministrativeRestoreArchive } from './portable-managed-volume-archive';
 import { parseWorkerBackupRuntime } from './worker-backup-runtime';
 import { isCanonicalPortableManagedVolumeTarget } from './portable-managed-volume-format';
 import { MAX_PORTABLE_MANAGED_VOLUME_COMPRESSED_PAYLOAD_BYTES, MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES,
@@ -363,8 +364,18 @@ export async function prepareInstanceNativeVolumeArchive(
   privateWorkDir: string,
   options: { signal?: AbortSignal; maxRawBytes?: number } = {},
 ): Promise<{ archivePath: string; rawBytes: number; entries: number; expandedBytes: number }> {
-  if (!validVolume(volume, 2) || !volume.runtime)
-    throw new Error('Invalid native instance volume descriptor');
+  return prepareInstanceRoleArchive(payloadPath, volume, privateWorkDir, options, false);
+}
+
+export function prepareInstanceLegacyAdministrativeVolumeArchive(payloadPath: string, volume: InstanceBackupVolumeManifest,
+  privateWorkDir: string, options: { signal?: AbortSignal; maxRawBytes?: number } = {}) {
+  return prepareInstanceRoleArchive(payloadPath, volume, privateWorkDir, options, true);
+}
+
+async function prepareInstanceRoleArchive(payloadPath: string, volume: InstanceBackupVolumeManifest, privateWorkDir: string,
+  options: { signal?: AbortSignal; maxRawBytes?: number }, legacyAdministrative: boolean) {
+  if (legacyAdministrative ? !validVolume(volume, 1) || volume.runtime || !['admin-workspace', 'admin-agent-data'].includes(volume.kind)
+      : !validVolume(volume, 2) || !volume.runtime) throw new Error('Invalid native instance volume descriptor');
   const requested = options.maxRawBytes ?? MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES;
   if (!Number.isSafeInteger(requested) || requested <= 0)
     throw new Error('Invalid native instance volume raw-byte limit');
@@ -389,8 +400,9 @@ export async function prepareInstanceNativeVolumeArchive(
       callback(rawBytes > maxRawBytes ? new Error('Native instance volume exceeds the raw-byte limit') : null, chunk);
     } });
     await pipeline(input.createReadStream(), createGunzip(), bounded, output.createWriteStream(), { signal: options.signal });
-    const runtime = volume.runtime, limits = { maxExpandedBytes: maxRawBytes, signal: options.signal };
-    const summary = runtime.role === 'managed'
+    const runtime = volume.runtime!, limits = { maxExpandedBytes: maxRawBytes, signal: options.signal };
+    const summary = legacyAdministrative ? await validateIncusLegacyAdministrativeRestoreArchive(archivePath, limits)
+      : runtime.role === 'managed'
       ? await validatePortableManagedVolumeArchive(archivePath, { ...limits, target: runtime.target, requirePosixUstar: true })
       : runtime.role === 'docker' ? await validateIncusDockerRestoreArchive(archivePath, limits)
         : await validateIncusCanonicalRestoreArchive(archivePath, runtime.role, limits);
@@ -761,6 +773,7 @@ function exactKeys(value: unknown, keys: string[]): boolean {
 
 function validNativeVolume(volume: any, prefix?: string): boolean {
   const runtime = volume.runtime;
+  if (runtime && Object.hasOwn(runtime, 'administrative')) return validAdministrativeNativeVolume(volume);
   if (!runtime || runtime.kind !== 'incus-vm' || !safeId(volume.ownerId) || !safeId(volume.workerId) || volume.groupId !== undefined)
     return false;
   if (runtime.role === 'managed') return exactKeys(runtime, ['kind', 'role', 'managedVolumeId', 'target']) &&
@@ -781,6 +794,28 @@ function validNativeVolume(volume: any, prefix?: string): boolean {
   const suffix = `-${volume.workerId}-${runtime.role}`;
   return prefix !== undefined ? volume.name === prefix + suffix
     : volume.name.endsWith(suffix) && /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(volume.name.slice(0, -suffix.length));
+}
+
+function validAdministrativeNativeVolume(volume: any): boolean {
+  const runtime = volume.runtime, admin = runtime?.administrative;
+  if (runtime.kind !== 'incus-vm' || !safeId(volume.ownerId) || !safeId(volume.workerId) ||
+      !admin || !['administrative', 'group-administrative'].includes(admin.kind) || admin.workspaceId !== volume.workerId ||
+      !/^[A-Za-z0-9_-]{1,128}$/.test(admin.workspaceId)) return false;
+  if (admin.kind === 'administrative' ? !exactKeys(admin, ['kind', 'workspaceId']) || volume.ownerId !== '__agentor_admin__' || volume.groupId !== undefined
+      : !exactKeys(admin, ['kind', 'workspaceId', 'groupId']) || !/^[A-Za-z0-9_-]{1,128}$/.test(admin.groupId) || volume.groupId !== admin.groupId) return false;
+  if (runtime.role === 'managed') return exactKeys(runtime, ['kind', 'administrative', 'role', 'managedVolumeId', 'target']) &&
+    /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(runtime.managedVolumeId) &&
+    isCanonicalPortableManagedVolumeTarget(runtime.target) && volume.kind === 'persistent-path' && volume.name === 'agentor-persist-' + runtime.managedVolumeId;
+  if (!['workspace', 'agents'].includes(runtime.role) || !exactKeys(runtime, ['kind', 'administrative', 'role', 'source']) ||
+      !exactKeys(runtime.source, ['sourceImageId', 'recipeId', 'architecture', 'converterVersion', 'bootstrapGeneration']) ||
+      volume.kind !== (runtime.role === 'workspace' ? 'admin-workspace' : 'admin-agent-data')) return false;
+  try { parseWorkerBackupRuntime({ version: 1, kind: 'incus-vm', source: runtime.source }); }
+  catch { return false; }
+  // Logical names derive from identity, never an archived host device or UUID.
+  const raw = 'agentor-admin-' + admin.workspaceId;
+  const name = raw.length <= 53 && /^[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9]$/.test(raw) ? raw
+    : 'agentor-admin-' + createHash('sha256').update(admin.workspaceId).digest('hex').slice(0, 32);
+  return volume.name === name + '-' + runtime.role;
 }
 
 export function assertDockerVolumeName(value: unknown): asserts value is string {

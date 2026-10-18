@@ -28,12 +28,15 @@ function fixture(group = false, id: string = randomUUID()) {
   const volumes: Record<string, any> = Object.fromEntries(['workspace','agents'].map(role => [role, { name: `${name}-${role}`,
     type: 'custom', content_type: 'filesystem', project: 'agentor', created_at: stamp,
     config: { 'user.agentor.admin-storage-nonce': record.nativeRuntime!.nonce }, used_by: [ref(name)] }]));
+  const selected: any[] = [];
   let fresh = structuredClone(record), helperCalls = 0, execCalls = 0, closeCalls = 0;
   let mutate: (() => void) | undefined, code = 0, helperAttached = false;
   const runtime: any = {
     validateAuthority: async (captured: any) => { expect(captured).toEqual(fresh); },
     assertOwned: async () => { expect(helperAttached).toBe(false); return structuredClone(instance); },
-    storage: { inspect: async (_record: any, _identity: any, role: string) => structuredClone(volumes[role]) },
+    storage: { inspect: async (_record: any, _identity: any, role: string) => structuredClone(volumes[role]),
+      store: async () => ({ forWorker: () => selected.map(item => structuredClone(item.record)) }) },
+    inspectSelectedStorage: async () => selected.filter(item => item.record.attached).map(item => structuredClone(item)),
     client: { endpoint, getInstance: async () => structuredClone(instance),
       getCustomVolume: async (_pool: string, name: string) => structuredClone(Object.values(volumes).find((v: any) => v.name === name)),
       execStream: async (target: string, command: string[], options: any) => {
@@ -41,7 +44,7 @@ function fixture(group = false, id: string = randomUUID()) {
         expect(target).toBe('abk-fixture');
         expect(command.slice(0,3)).toEqual(['/usr/bin/python3','-c',INCUS_CANONICAL_ARCHIVE_SCRIPT]);
         expect(command[5]).toBe('offline');
-        expect(JSON.parse(command[4]!)).toEqual(['/workspace/account']);
+        expect(JSON.parse(command[4]!)).toEqual(command[3] === 'managed' ? [] : ['/workspace/account']);
         expect(options).toMatchObject({ user: 0, group: 0, cwd: '/', environment: { PATH: '/usr/bin:/bin', LC_ALL: 'C' } });
         return { stdin: new PassThrough(), stdout: Readable.from([Buffer.from(command[3]!+' bytes')]), stderr: Readable.from([]),
           result: Promise.resolve().then(() => { mutate?.(); return code; }), close() { closeCalls++; } };
@@ -52,17 +55,18 @@ function fixture(group = false, id: string = randomUUID()) {
     expect(owner).toEqual(administrativeArchiveHelperOwner(record));
     expect(owner.id).toMatch(/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/);
     expect(owner.userId).toMatch(/^[a-zA-Z0-9][a-zA-Z0-9_.-]+$/);
-    expect(sources).toEqual({ workspace: volumes.workspace.name, agents: volumes.agents.name });
+    const attached = sources.managed ? [Object.values(volumes).find((v: any) => v.name === sources.managed)] : [volumes.workspace, volumes.agents];
+    if (!sources.managed) expect(sources).toEqual({ workspace: volumes.workspace.name, agents: volumes.agents.name });
     await assertSource();
     helperAttached = true;
-    for (const volume of Object.values(volumes) as any[]) volume.used_by.push(ref('abk-fixture'));
+    for (const volume of attached as any[]) volume.used_by.push(ref('abk-fixture'));
     try { await assertSource('abk-fixture'); return await capture('abk-fixture', async () => {}); }
     finally {
       helperAttached = false;
-      for (const volume of Object.values(volumes) as any[]) volume.used_by = volume.used_by.filter((r: string) => r !== ref('abk-fixture'));
+      for (const volume of attached as any[]) volume.used_by = volume.used_by.filter((r: string) => r !== ref('abk-fixture'));
     }
   } };
-  return { record, instance, volumes, runtime, config, backup: new IncusAdminBackup(config, runtime, helper),
+  return { record, instance, volumes, selected, runtime, config, backup: new IncusAdminBackup(config, runtime, helper),
     mutate: (f: () => void) => { mutate = f; }, setFresh: (r: any) => { fresh = r; }, setCode: (n: number) => { code = n; },
     counts: () => ({ helperCalls, execCalls, closeCalls }) };
 }
@@ -162,4 +166,69 @@ test('ambiguous archive output roles fail before source inspection', async () =>
   for (const outputs of [{}, { workspace: '/same', agents: '/same' }, { workspace: '' }, { docker: '/unused' }])
     await expect(f.backup.capture(f.record, outputs, { exclusions: [] })).rejects.toThrow();
   expect(f.counts().helperCalls).toBe(0);
+});
+
+for (const group of [false,true]) for (const attached of [false,true]) test(`administrative ${group ? 'group' : 'global'} capture retains ${attached ? 'attached' : 'detached'} selected bytes without changing active references`, async () => {
+  const f = fixture(group), directory = await mkdtemp(join(tmpdir(), 'admin-selected-backup-'));
+  try {
+    const id = randomUUID(), owner = group ? 'owner' : '__agentor_admin__';
+    const record: any = { id, userId: owner, workerId: f.record.id, target: '/srv/selected', name: 'Selected',
+      dockerName: 'agentor-persist-' + id, purpose: 'persistent-path', storageRuntimeKind: 'incus-vm', seeded: true,
+      attached, state: attached ? 'ready' : 'detached', createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString() };
+    const volume = { name: record.dockerName, project: 'agentor', type: 'custom', content_type: 'filesystem', created_at: record.createdAt,
+      used_by: attached ? ['/1.0/instances/' + f.instance.name + '?project=agentor'] : [],
+      config: { 'user.agentor.installation': f.record.nativeRuntime!.installationId, 'user.agentor.owner': owner,
+        'user.agentor.id': f.record.id, 'user.agentor.volume-id': id, 'user.agentor.target': record.target } };
+    f.selected.push({ record, volume }); f.volumes.selected = volume;
+    const before = structuredClone({ record: f.record, volume });
+    const output = join(directory, 'selected.gz');
+    expect(await f.backup.captureSelected(f.record, id, output)).toEqual(record);
+    expect(gunzipSync(await readFile(output)).toString()).toBe('managed bytes');
+    expect({ record: f.record, volume }).toEqual(before); expect(f.counts().helperCalls).toBe(1);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('detached administrative storage with foreign metadata, references or provisional data cannot be silently omitted', async () => {
+  for (const condition of ['owner','reference','unseeded']) {
+    const f = fixture(), id = randomUUID();
+    const record: any = { id, userId: '__agentor_admin__', workerId: f.record.id, dockerName: 'agentor-persist-' + id,
+      name: 'Detached', target: '/srv/detached', purpose: 'persistent-path', storageRuntimeKind: 'incus-vm',
+      attached: false, seeded: condition !== 'unseeded', state: 'detached' };
+    const volume: any = { name: record.dockerName, project: 'agentor', type: 'custom', content_type: 'filesystem', created_at: new Date(0).toISOString(),
+      used_by: condition === 'reference' ? ['/1.0/instances/foreign?project=agentor'] : [], config: {
+        'user.agentor.installation': f.record.nativeRuntime!.installationId, 'user.agentor.owner': condition === 'owner' ? 'foreign' : '__agentor_admin__',
+        'user.agentor.id': f.record.id, 'user.agentor.volume-id': id, 'user.agentor.target': record.target } };
+    f.selected.push({ record, volume }); f.volumes.selected = volume;
+    await expect(f.backup.inspectSelected(f.record)).rejects.toThrow(); expect(f.counts().helperCalls).toBe(0);
+  }
+});
+
+
+test('administrative producer refuses selected history beyond the existing restore bound before publishing an unusable snapshot', async () => {
+  const f = fixture();
+  for (let index = 0; index < 33; index++) f.selected.push({ record: { attached: true }, volume: {} });
+  await expect(f.backup.inspectSelected(f.record)).rejects.toThrow('volume limit');
+  expect(f.counts().helperCalls).toBe(0);
+});
+
+
+for (const revoked of [false,true]) test(`explicit portable live selected capture ${revoked ? 'rejects late state revocation' : 'preserves known bytes'} without changing the stopped default`, async () => {
+  const f = fixture(), directory = await mkdtemp(join(tmpdir(), 'admin-selected-live-backup-'));
+  try {
+    f.record.status = 'running'; f.instance.status = 'Running'; f.setFresh(structuredClone(f.record));
+    const id = randomUUID(), owner = '__agentor_admin__', record: any = { id, userId: owner, workerId: f.record.id, target: '/srv/live',
+      dockerName: 'agentor-persist-' + id, purpose: 'persistent-path', storageRuntimeKind: 'incus-vm', seeded: true, attached: true, state: 'ready' };
+    const volume = { name: record.dockerName, project: 'agentor', type: 'custom', content_type: 'filesystem', created_at: new Date(0).toISOString(),
+      used_by: ['/1.0/instances/' + f.instance.name + '?project=agentor'], config: {
+        'user.agentor.installation': f.record.nativeRuntime!.installationId, 'user.agentor.owner': owner,
+        'user.agentor.id': f.record.id, 'user.agentor.volume-id': id, 'user.agentor.target': record.target } };
+    f.selected.push({ record, volume }); f.volumes.selected = volume;
+    await expect(f.backup.captureSelected(f.record, id, join(directory, 'default.gz'))).rejects.toThrow('stopped');
+    expect(f.counts().helperCalls).toBe(0);
+    if (revoked) f.mutate(() => { f.instance.status = 'Stopped'; });
+    const output = join(directory, 'live.gz'), capture = f.backup.captureSelected(f.record, id, output, undefined, { allowRunning: true });
+    if (revoked) await expect(capture).rejects.toThrow('compute changed');
+    else { expect(await capture).toEqual(record); expect(gunzipSync(await readFile(output)).toString()).toBe('managed bytes'); }
+    expect(f.counts().helperCalls).toBe(1);
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });

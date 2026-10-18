@@ -4,9 +4,11 @@ import type { Config } from './config';
 import type { AdministrativeWorkspaceRecord } from './admin-workspace-store';
 import { administrativeRuntimeOwner, validateAdminNativeState } from './admin-native-identity';
 import type { IncusAdminWorkspaceRuntime } from './incus-admin-workspace-runtime';
-import type { IncusCustomVolume } from './incus-client';
+import { IncusError, type IncusCustomVolume } from './incus-client';
 import { IncusOfflineArchiveHelper } from './incus-offline-archive-helper';
 import { openIncusCanonicalArchive } from './incus-canonical-archive';
+import { incusManagedVolumeDeviceKey } from './incus-managed-volume-device';
+import { incusManagedRestoreDevices } from './incus-managed-volume-runtime';
 import { writeGzipFile } from './worker-export';
 
 const failure = (message: string) => Object.assign(new Error(message), { statusCode: 409 });
@@ -59,6 +61,84 @@ export class IncusAdminBackup {
     }
     await this.runtime.validateAuthority(record);
     return { instance, volumes };
+  }
+
+  /** Detached seeded data remains portable without becoming an active VM ref. */
+  async inspectSelected(record: Readonly<AdministrativeWorkspaceRecord>) {
+    const result = await this.runtime.inspectSelectedStorage(record), owner = administrativeRuntimeOwner(record);
+    const store = await this.runtime.storage.store();
+    for (const value of store.forWorker(owner.userId, owner.id).filter(v => !v.attached && v.storageRuntimeKind === 'incus-vm')) {
+      incusManagedVolumeDeviceKey(value);
+      if (value.incusLive || value.liveContainerId || value.previousRestartPolicy || value.operation && value.operation.stage !== 'complete' ||
+          (value.seeded ? value.state !== 'detached' : !['pending', 'detached'].includes(value.state)))
+        throw failure('Administrative detached storage is unsettled');
+      let volume;
+      try { volume = await this.runtime.client.getCustomVolume(this.config.incusStoragePool, value.dockerName); }
+      catch (error) { if (error instanceof IncusError && error.statusCode === 404 && !value.seeded) continue; throw error; }
+      if (!value.seeded || volume.name !== value.dockerName || volume.project !== this.config.incusProject ||
+          volume.type !== 'custom' || volume.content_type !== 'filesystem' || !Number.isFinite(Date.parse(volume.created_at)) ||
+          !Array.isArray(volume.used_by) || volume.used_by.length || Object.entries({
+            'user.agentor.installation': record.nativeRuntime!.installationId, 'user.agentor.owner': owner.userId,
+            'user.agentor.id': owner.id, 'user.agentor.volume-id': value.id, 'user.agentor.target': value.target,
+          }).some(([key, expected]) => volume.config[key] !== expected))
+        throw failure('Administrative detached storage ownership is ambiguous');
+      result.push({ record: structuredClone(value), volume });
+    }
+    const portable = result.map(item => ({ ...item.record, operation: undefined }));
+    incusManagedRestoreDevices(owner, this.config.incusStoragePool, portable.filter(v => v.attached), portable.filter(v => !v.attached));
+    await this.runtime.validateAuthority(record, record.nativeRuntime!.incarnation);
+    return result;
+  }
+
+  async captureSelected(record: Readonly<AdministrativeWorkspaceRecord>, id: string, output: string, signal?: AbortSignal,
+    options: { allowRunning?: true } = {}) {
+    record = structuredClone(record);
+    if (!options || Object.keys(options).some(key => key !== 'allowRunning') ||
+        options.allowRunning !== undefined && options.allowRunning !== true) throw failure('Invalid administrative selected capture mode');
+    const allowRunning = options.allowRunning === true;
+    // Portable scheduled backups may explicitly accept best-effort live bytes;
+    // whole-instance capture keeps the stopped-only default.
+    if (allowRunning) {
+      assertAdministrativeSnapshotSettled(record);
+      if (record.runtimeKind !== 'incus-vm' || record.status !== 'running') throw failure('Administrative live capture requires running native authority');
+      await this.runtime.validateAuthority(record);
+    }
+    const instance = allowRunning ? await this.runtime.assertOwned(record) : (await this.inspect(record)).instance;
+    if (allowRunning && instance.status !== 'Running') throw failure('Administrative live capture state changed');
+    const selected = await this.inspectSelected(record);
+    const found = selected.find(item => item.record.id === id);
+    if (!found) throw failure('Administrative selected archive identity is unavailable');
+    const before = structuredClone(found.volume);
+    const refs = (values: string[]) => values.map(ref => {
+      const url = new URL(ref, this.runtime.client.endpoint);
+      if (url.origin !== new URL(this.runtime.client.endpoint).origin || url.username || url.password || url.hash ||
+          url.searchParams.getAll('project').length !== 1 || url.searchParams.get('project') !== this.config.incusProject ||
+          [...url.searchParams.keys()].some(key => key !== 'project')) throw failure('Administrative selected reference is foreign');
+      return url.pathname;
+    }).sort();
+    const baselineRefs = found.record.attached ? ['/1.0/instances/' + instance.name] : [];
+    if (!isDeepStrictEqual(refs(before.used_by), baselineRefs)) throw failure('Administrative selected references are ambiguous');
+    const assertSource = async (helperName?: string) => {
+      await this.runtime.validateAuthority(record, record.nativeRuntime!.incarnation);
+      const currentInstance = await this.runtime.client.getInstance(instance.name);
+      if (!isDeepStrictEqual(currentInstance, instance)) throw failure('Administrative selected compute changed');
+      const current = await this.runtime.client.getCustomVolume(this.config.incusStoragePool, before.name);
+      if (!isDeepStrictEqual({ ...current, used_by: undefined }, { ...before, used_by: undefined }) ||
+          !isDeepStrictEqual(refs(current.used_by), [...baselineRefs, ...(helperName ? ['/1.0/instances/' + helperName] : [])].sort()))
+        throw failure('Administrative selected storage changed');
+      await this.runtime.validateAuthority(record, record.nativeRuntime!.incarnation);
+    };
+    await assertSource();
+    const helper = this.helper ?? new IncusOfflineArchiveHelper(this.config, this.runtime.client, record.nativeRuntime!.installationId);
+    await helper.withGuest(administrativeArchiveHelperOwner(record), { managed: before.name }, assertSource, signal,
+      async (name, assertHelper) => {
+        const stream = await openIncusCanonicalArchive(this.runtime.client, name, 'managed', async () => {
+          await assertHelper(); await assertSource(name);
+        }, { exclusions: [], signal }, true);
+        await writeGzipFile(stream, output, signal);
+      });
+    await assertSource();
+    return structuredClone(found.record);
   }
 
   async capture(record: Readonly<AdministrativeWorkspaceRecord>,

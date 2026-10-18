@@ -248,3 +248,8 @@
 - `tests/ui/*.spec.ts` - UI integration tests (56 files; incl. workspace-files-modal, clipboard-paste, worker-card-actions, import-worker-modal, github-autocomplete-refresh — 570 tests)
 - `tests/FEATURES.md` - Feature inventory driving test coverage
 - `tests/TESTS.md` - Test suite documentation with counts per file (1568 total tests)
+
+- `orchestrator/server/utils/instance-restore-administrative.ts` - pure dedicated-admin whole-instance planner and fresh stopped native filesystem apply/rollback; historical admin data never targets Docker or WorkerStore authority.
+- `orchestrator/server/utils/incus-admin-backup.ts` - dedicated readonly canonical and selected administrative capture under existing lifecycle/snapshot fences.
+- `orchestrator/server/utils/incus-admin-restore.ts` - shared networkless administrative raw filesystem inverse, including the fixed historical source-root transform.
+- `tests/playwright.instance-recovery.config.ts` - actual recovery modal/composable Chromium fixture, without a live installation.

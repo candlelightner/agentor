@@ -233,3 +233,31 @@ test('real restricted Incus readonly admission verifies native destinations with
     expect(result.blockers).toEqual([]); expect(result.ready).toBe(true); expect(result.volumeConflicts).toEqual([]);
   } finally { await f.cleanup(); }
 });
+
+
+for (const historical of [false, true]) test(`public preflight routes ${historical ? 'historical' : 'tagged native'} admin storage to configured native recovery without Docker destination adoption`, async () => {
+  const f = await fixture(); try {
+    const id = randomUUID(), name = historical ? 'agentor-admin-workspace-data' : 'agentor-admin-' + id + '-workspace';
+    const descriptor: InstanceBackupVolumeManifest = { name, kind: 'admin-workspace', archive: instanceVolumeArchiveName(name),
+      sha256: 'a'.repeat(64), size: 100, ...(!historical ? { workerId: id, ownerId: '__agentor_admin__',
+        runtime: { kind: 'incus-vm' as const, role: 'workspace' as const, source,
+          administrative: { kind: 'administrative' as const, workspaceId: id } } } : {}) };
+    const instances: string[] = [], volumes: string[] = [];
+    f.patch(f.client, 'getInstance', async name => { instances.push(name); throw new IncusError('Exact absence', 404); });
+    f.patch(f.client, 'getCustomVolume', async (_pool, name) => { volumes.push(name); throw new IncusError('Exact absence', 404); });
+    f.state.dockerNames = [name];
+    const artifact = await f.artifact([descriptor], historical ? 1 : 2);
+    await expect(f.manager.restorePreflight('destination-admin', artifact, { restoreDockerVolumes: false }))
+      .rejects.toMatchObject({ code: 'INSTANCE_RESTORE_NATIVE_DATA_REQUIRED' });
+    expect(f.calls).toEqual([]);
+    expect((await f.manager.restorePreflight('destination-admin', artifact, { restoreDockerVolumes: true })).ready).toBe(true);
+    expect(f.calls).toContain('ready'); expect(f.calls).not.toContain('docker-volumes');
+    if (!historical) {
+      expect(instances).toEqual(['agentor-admin-' + id]);
+      expect(volumes).toEqual(['agentor-admin-' + id + '-workspace', 'agentor-admin-' + id + '-agents']);
+    }
+    f.patch(f.config, 'incusEnabled', false);
+    const blocked = await f.manager.restorePreflight('destination-admin', artifact, { restoreDockerVolumes: true });
+    expect(blocked.ready).toBe(false); expect(blocked.blockers.join(' ')).toContain('Incus restore readiness');
+  } finally { await f.cleanup(); }
+});
