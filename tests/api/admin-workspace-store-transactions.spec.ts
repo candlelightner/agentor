@@ -215,6 +215,9 @@ test("global admin runtime success is durably retried without repeating the side
   );
   expect(stopCalls).toBe(1);
   expect(persisted?.status).toBe("running");
+  await expect(store.getStatus()).rejects.toMatchObject({ statusCode: 503 });
+  await expect(store.getStartupScript()).rejects.toMatchObject({ statusCode: 503 });
+  expect(persisted?.status).toBe("running");
 
   await expect(store.setStatus("stopped")).resolves.toMatchObject({
     status: "stopped",
@@ -377,6 +380,8 @@ test("group admin rebuild acknowledgement retry does not rebuild twice", async (
   expect(fake.findById(groupId)?.adminWorkspace).not.toHaveProperty(
     "imageDigest",
   );
+  await expect(store.getStatus(groupId)).rejects.toMatchObject({ statusCode: 503 });
+  expect(fake.findById(groupId)?.adminWorkspace).not.toHaveProperty("imageDigest");
 
   await expect(store.rebuild(groupId, ownerId)).resolves.toMatchObject({
     image: { digest: `sha256:${"a".repeat(64)}` },
@@ -467,12 +472,26 @@ test("group admin authorization is evaluated inside the owner hierarchy queue", 
   });
   const preceding = withWorkerNetworkMutation(ownerId, () => gate);
   let authorized = true;
-  const attempted = store.getStartupScript(groupId, () => {
+  const authorize = () => {
     if (!authorized)
       throw Object.assign(new Error("Resource not found"), { statusCode: 404 });
-  });
+  };
+  const attempted = store.getStartupScript(groupId, authorize);
+  const status = store.getStatus(groupId, authorize);
   authorized = false;
   release();
   await preceding;
   await expect(attempted).rejects.toMatchObject({ statusCode: 404 });
+  await expect(status).rejects.toMatchObject({ statusCode: 404 });
+});
+
+test("read-only admin status distinguishes absence without provisioning", async () => {
+  const global = new AdminWorkspaceStore("/unused", async () => { throw Error("Read must not persist"); });
+  await expect(global.getStatus()).resolves.toBeNull();
+  await expect(global.getStartupScript()).rejects.toMatchObject({ statusCode: 404 });
+  const fake = new FakeGroups(), { group } = groupRecord("read-owner", "read-group");
+  delete group.adminWorkspace;
+  fake.records.set(group.id, group);
+  const scoped = new GroupAdminWorkspaceStore(fake as any);
+  await expect(scoped.getStatus(group.id)).rejects.toMatchObject({ statusCode: 404 });
 });

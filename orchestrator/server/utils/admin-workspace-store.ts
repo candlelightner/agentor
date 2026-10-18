@@ -182,11 +182,13 @@ export class AdminWorkspaceStore {
     await rename(temp, this.path);
   }
   private exclusive<T>(operation: () => Promise<T>): Promise<T> {
-    const execute = async () => {
+    return this.serialize(async () => {
       await this.init();
       return withOwnerWorkerLifecycleMutation('__agentor_admin__', this.record?.id ?? '__admin-bootstrap__', operation);
-    };
-    const result = this.operationTail.then(execute, execute);
+    });
+  }
+  private serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.operationTail.then(operation, operation);
     this.operationTail = result.then(
       () => undefined,
       async (error: OperationFailureWithSettlement) => {
@@ -269,6 +271,20 @@ export class AdminWorkspaceStore {
   }
   async ensure() {
     return this.exclusive(() => this.ensureLocked());
+  }
+  async getStatus() {
+    return this.serialize(async () => {
+      await this.init();
+      const record = this.readSettledRecord();
+      return record ? this.publicRecord(record) : null;
+    });
+  }
+  private readSettledRecord() {
+    const record = this.getRecord();
+    if (this.pendingCommit || record?.nativeRuntime?.pending || record?.nativeRuntime?.deleting ||
+        record?.nativeRuntime?.selectedOperation || record?.nativeMigration && record.nativeMigration.phase !== 'retained')
+      throw Object.assign(new Error('Administrative workspace operation is not settled; retry'), { statusCode: 503 });
+    return record;
   }
   /** Read the persisted identity without provisioning or mutating the runtime. */
   getRecord() {
@@ -421,14 +437,14 @@ export class AdminWorkspaceStore {
     return { marker: this.record!.marker ?? null };
   }
   async getStartupScript() {
-    return this.exclusive(async () => {
+    return this.serialize(async () => {
       await this.init();
-      await this.flushPendingCommit("startup-script:get");
-      if (!this.record)
+      const record = this.readSettledRecord();
+      if (!record)
         throw Object.assign(new Error("Administrative workspace not provisioned"), {
           statusCode: 404,
         });
-      return this.startupScriptRecord(structuredClone(this.record));
+      return this.startupScriptRecord(record);
     });
   }
   async setStartupScript(value: unknown) {

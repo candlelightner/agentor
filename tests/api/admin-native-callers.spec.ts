@@ -9,7 +9,7 @@ import { useAdminWorkspaceStore } from '../../orchestrator/server/utils/admin-wo
 import { readAdministrativeRuntimeRecord, administrativeRuntimeOwner, adminNativeInstanceName } from '../../orchestrator/server/utils/admin-native-authority';
 import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
 import { requirePluginSelf, requireWorkerSelf } from '../../orchestrator/server/utils/worker-auth';
-import { withOwnerWorkerLifecycleMutation } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
+import { workerLifecycleGeneration, withOwnerWorkerLifecycleMutation } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
 import type { AdministrativeWorkspaceRecord } from '../../orchestrator/server/utils/admin-workspace-store';
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
@@ -121,14 +121,22 @@ for (const kind of ['platform', 'group'] as const) {
       finally { f.cm.resolveIncusCaller = resolve; }
     } finally { await f.cleanup(); }
   });
-  test(`${kind} healthy native command and journal handles survive identity refresh but a real lifecycle mutation revokes them`, async () => {
+  test(`${kind} healthy native command and journal handles survive status, script and identity reads but start and stop revoke them`, async () => {
     const f = await fixture(kind), store = kind === 'platform' ? useAdminWorkspaceStore() : useGroupAdminWorkspaceStore();
     const privateStore = store as any, original = { runtime: privateStore.runtime, identityMaterializer: privateStore.identityMaterializer };
-    let journal: Awaited<ReturnType<typeof f.cm.openWorkerJournal>> | undefined, materialized = 0;
+    let journal: Awaited<ReturnType<typeof f.cm.openWorkerJournal>> | undefined, materialized = 0, starts = 0, stops = 0;
     try {
       const commands = f.cm.workerCommands(f.info.id);
       journal = await f.cm.openWorkerJournal(f.info.id, { tail: 5 });
-      store.setRuntimeAdapter({ async ensure() {}, async start() {}, async stop() {}, async rebuild() {} });
+      store.setRuntimeAdapter({ async ensure() { throw Error('Reads must not ensure compute'); }, async start() { starts++; }, async stop() { stops++; }, async rebuild() {} });
+      const generation = workerLifecycleGeneration(f.info.id);
+      const status = kind === 'platform' ? await useAdminWorkspaceStore().getStatus()
+        : await useGroupAdminWorkspaceStore().getStatus((f.record as any).groupId);
+      expect(status).toMatchObject({ id: f.info.id, status: 'running' });
+      expect(status!.nativeRuntime).toBeUndefined();
+      if (kind === 'platform') await useAdminWorkspaceStore().getStartupScript();
+      expect(workerLifecycleGeneration(f.info.id)).toBe(generation);
+      expect(journal.isCurrent()).toBe(true);
       store.setIdentityMaterializer(async record => {
         expect(record.id).toBe(f.info.id); materialized++;
         expect(journal!.isCurrent()).toBe(true);
@@ -137,10 +145,22 @@ for (const kind of ['platform', 'group'] as const) {
       else await useGroupAdminWorkspaceStore().refreshRunningIdentity((f.record as any).groupId);
       expect(materialized).toBe(1); expect(journal.isCurrent()).toBe(true);
       expect((await commands.execCapture(f.info.containerId, ['fixture'])).stdout.toString()).toBe('fixture-output');
-      await withOwnerWorkerLifecycleMutation(f.info.userId, f.info.id, async () => {});
-      expect(journal.isCurrent()).toBe(false);
+      store.setIdentityMaterializer(async () => {});
+      if (kind === 'platform') await useAdminWorkspaceStore().setStatus('running');
+      else await useGroupAdminWorkspaceStore().setStatus((f.record as any).groupId, 'running');
+      expect(starts).toBe(1); expect(journal.isCurrent()).toBe(false);
       await expect(commands.execCapture(f.info.containerId, ['fixture'])).rejects.toThrow('authority changed');
-    } finally { journal?.close(); Object.assign(privateStore, original); await f.cleanup(); }
+      const startedCommands = f.cm.workerCommands(f.info.id);
+      expect((await startedCommands.execCapture(f.info.containerId, ['fixture'])).stdout.toString()).toBe('fixture-output');
+      if (kind === 'platform') await useAdminWorkspaceStore().setStatus('stopped');
+      else await useGroupAdminWorkspaceStore().setStatus((f.record as any).groupId, 'stopped');
+      expect(stops).toBe(1); expect(workerLifecycleGeneration(f.info.id)).not.toBe(generation);
+      await expect(startedCommands.execCapture(f.info.containerId, ['fixture'])).rejects.toThrow('authority changed');
+    } finally {
+      journal?.close(); Object.assign(privateStore, original);
+      if (kind === 'platform') await useAdminWorkspaceStore().setStatus('running');
+      await f.cleanup();
+    }
   });
   test(`${kind} captured commands reject a lifecycle fence before dispatch`, async () => {
     const f = await fixture(kind);
@@ -184,26 +204,37 @@ test('deleted group authority rejects a captured group-admin command before nati
   } finally { await f.cleanup(); }
 });
 
-test('a pending administrative operation denies even a fresh backend request before probing the guest', async () => {
-  const f = await fixture(), store = useAdminWorkspaceStore();
-  try {
-    await store.withNativeRuntimeTransaction(async (record, acknowledge) => {
-      await acknowledge({runtimeKind:'incus-vm',nativeRuntime:{...record.nativeRuntime!,pending:{kind:'stop'}}});
-    });
-    await expect(f.cm.resolveWorkerHost(f.info.id)).rejects.toThrow('authority changed');
-    expect(f.probes()).toBe(0);
-  } finally {
-    await store.withNativeRuntimeTransaction(async (record, acknowledge) => {
-      await acknowledge({runtimeKind:'incus-vm',nativeRuntime:{...record.nativeRuntime!,pending:undefined}});
-    });
-    await f.cleanup();
-  }
-});
+for (const kind of ['platform', 'group'] as const) {
+  test(`${kind} pending administrative operation blocks reads without settling its receipt`, async () => {
+    const f = await fixture(kind), global = useAdminWorkspaceStore(), scoped = useGroupAdminWorkspaceStore();
+    const transaction = (operation: Parameters<typeof global.withNativeRuntimeTransaction>[0]) => kind === 'platform'
+      ? global.withNativeRuntimeTransaction(operation)
+      : scoped.withNativeRuntimeTransaction((f.record as any).groupId, operation);
+    try {
+      await transaction(async (record, acknowledge) => {
+        await acknowledge({runtimeKind:'incus-vm',nativeRuntime:{...record.nativeRuntime!,pending:{kind:'stop'}}});
+      });
+      const pending = await readAdministrativeRuntimeRecord(f.info.id);
+      await expect(kind === 'platform' ? global.getStatus() : scoped.getStatus((f.record as any).groupId)).rejects.toMatchObject({ statusCode: 503 });
+      if (kind === 'platform') await expect(global.getStartupScript()).rejects.toMatchObject({ statusCode: 503 });
+      expect(await readAdministrativeRuntimeRecord(f.info.id)).toEqual(pending);
+      await expect(f.cm.resolveWorkerHost(f.info.id)).rejects.toThrow('authority changed');
+      expect(f.probes()).toBe(0);
+    } finally {
+      await transaction(async (record, acknowledge) => {
+        await acknowledge({runtimeKind:'incus-vm',nativeRuntime:{...record.nativeRuntime!,pending:undefined}});
+      });
+      await f.cleanup();
+    }
+  });
+}
 
 test('quarantined dedicated authority cannot fall back to a registered runtime or ordinary shadow', async () => {
   const f = await fixture(), store = useAdminWorkspaceStore() as any;
   try {
     store.unavailable = true;
+    await expect(store.getStatus()).rejects.toMatchObject({ statusCode: 503 });
+    await expect(store.getStartupScript()).rejects.toMatchObject({ statusCode: 503 });
     await expect(f.cm.resolveWorkerHost(f.info.id)).rejects.toMatchObject({statusCode:503});
     await expect(f.cm.workerCommands(f.info.id).execCapture(f.info.containerId,['fixture'])).rejects.toMatchObject({statusCode:503});
     expect(f.calls).toEqual([]); expect(f.probes()).toBe(0);

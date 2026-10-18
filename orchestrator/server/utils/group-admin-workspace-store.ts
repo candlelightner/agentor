@@ -215,6 +215,19 @@ export class GroupAdminWorkspaceStore {
       }),
     );
   }
+  async getStatus(groupId: string, authorize?: () => void) {
+    return this.withGroup(groupId, false, async () => {
+      authorize?.();
+      const record = this.record(groupId);
+      if (this.running.has(groupId) || this.pendingCommits.has(groupId) || record?.nativeRuntime?.pending ||
+          record?.nativeRuntime?.deleting || record?.nativeRuntime?.selectedOperation ||
+          record?.nativeMigration && record.nativeMigration.phase !== 'retained')
+        throw Object.assign(new Error('Group administrative workspace operation is not settled; retry'), { statusCode: 503 });
+      if (!record)
+        throw Object.assign(new Error('Group administrative workspace not provisioned'), { statusCode: 404 });
+      return this.publicRecord(record);
+    });
+  }
   private requireRuntime() {
     if (!this.runtime) throw Object.assign(new Error('Group administrative workspace runtime is not ready'), { statusCode: 503 });
   }
