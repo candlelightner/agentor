@@ -9,6 +9,7 @@ import shlex
 import tempfile
 import unittest
 import uuid
+from unittest.mock import Mock, patch
 
 SPEC = importlib.util.spec_from_file_location('admin_network_policy', Path(__file__).resolve().parents[2] / 'scripts/incus-admin-network-policy.py')
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -144,6 +145,39 @@ class AdminNetworkTests(unittest.TestCase):
         return [call for call in self.calls if (call[0] in ('incus', 'docker') and call[1] != 'GET')
                 or (call[0] == 'host' and (call[1] == 'iptables-restore' or ('-f' in call and '--check' not in call)
                     or '-I' in call or '-N' in call))]
+
+    def test_old_docker_api_rejects_at_controller_read_before_any_host_mutation(self):
+        spec = importlib.util.spec_from_file_location('admin_docker_transport',
+            Path(__file__).resolve().parents[2] / 'scripts/agentor-incus-network-service.py')
+        service = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(service)
+        connection = Mock()
+        connection.getresponse.return_value.status = 400
+        connection.getresponse.return_value.read.return_value = b'{"message":"client version 1.54 is too new"}'
+        self.policy.docker = service.docker_request('/fixture-only.sock')
+        before = self.path.read_bytes()
+        with patch.object(service, 'UnixConnection', return_value=connection):
+            with self.assertRaises(service.IncusRejected):
+                self.policy.ensure(self.payload)
+        connection.request.assert_called_once_with('GET', '/v1.54/containers/agentor-orchestrator/json', None,
+                                                   {'Content-Type': 'application/json'})
+        connection.close.assert_called_once()
+        self.assertEqual(self.mutations(), [])
+        self.assertIsNone(self.network)
+        self.assertIsNone(self.wrapper)
+        self.assertEqual(self.tables, [])
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_existing_wrong_mac_is_retained_without_reconnect_or_policy_changes(self):
+        self.policy.ensure(self.payload)
+        self.wrapper['Containers'][self.controller['Id']]['MacAddress'] = '9a:98:dd:92:7e:fd'
+        original = copy.deepcopy(self.wrapper)
+        for operation in (self.policy.inspect, self.policy.ensure):
+            self.calls.clear()
+            with self.assertRaisesRegex(MODULE.PolicyError, 'private address is unsettled'):
+                operation(self.payload)
+            self.assertEqual(self.mutations(), [])
+            self.assertEqual(self.wrapper, original)
 
     def test_fresh_global_without_users_directory_preserves_closed_path_admission(self):
         users = self.root / 'users'

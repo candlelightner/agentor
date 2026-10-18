@@ -12,11 +12,50 @@ import tempfile
 import threading
 import unittest
 import uuid
+from unittest.mock import Mock, patch
 
 SPEC = importlib.util.spec_from_file_location(
     "agentor_network_service", Path(__file__).resolve().parents[2] / "scripts/agentor-incus-network-service.py")
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+
+
+class PrivateDockerTransportTests(unittest.TestCase):
+    def test_private_requests_pin_mac_capable_api_and_keep_exact_connect_body(self):
+        connection = Mock()
+        response = connection.getresponse.return_value
+        response.status = 200
+        response.read.return_value = b'{}'
+        body = {"Container": "a" * 64, "EndpointConfig": {
+            "MacAddress": "06:01:23:45:67:89", "IPAMConfig": {"IPv4Address": "10.210.19.2"}}}
+        with patch.object(MODULE, "UnixConnection", return_value=connection) as factory:
+            request = MODULE.docker_request("/fixture-only.sock")
+            for method, path, value in (("GET", "/containers/controller/json", None),
+                                        ("POST", "/networks/create", {"Name": "owned"}),
+                                        ("POST", "/networks/" + "b" * 64 + "/connect", body)):
+                self.assertEqual(request(method, path, value), {})
+                connection.request.assert_called_with(method, "/v1.54" + path,
+                    None if value is None else json.dumps(value).encode(), {"Content-Type": "application/json"})
+            self.assertEqual(factory.call_count, 3)
+            factory.assert_called_with("/fixture-only.sock")
+            self.assertEqual(connection.close.call_count, 3)
+            response.read.assert_called_with(4 * 1024 * 1024 + 1)
+
+    def test_old_or_rejected_api_has_no_unversioned_retry_and_closes_connection(self):
+        for status in (400, 403, 404, 500):
+            with self.subTest(status=status):
+                connection = Mock()
+                connection.getresponse.return_value.status = status
+                connection.getresponse.return_value.read.return_value = b'{"message":"private daemon details"}'
+                with patch.object(MODULE, "UnixConnection", return_value=connection) as factory:
+                    with self.assertRaises(MODULE.IncusRejected) as failure:
+                        MODULE.docker_request("/fixture-only.sock")("GET", "/containers/controller/json")
+                self.assertEqual(failure.exception.status_code, status)
+                self.assertNotIn("private daemon details", str(failure.exception))
+                factory.assert_called_once()
+                connection.request.assert_called_once_with("GET", "/v1.54/containers/controller/json", None,
+                                                           {"Content-Type": "application/json"})
+                connection.close.assert_called_once()
 
 
 class TransportTests(unittest.TestCase):

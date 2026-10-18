@@ -109,7 +109,8 @@ def docker_request(socket_path):
     def request(method, path, body=None):
         connection = UnixConnection(socket_path)
         try:
-            connection.request(method, path, None if body is None else json.dumps(body).encode(),
+            # Before API 1.54, network connect silently ignored the requested endpoint MAC.
+            connection.request(method, "/v1.54" + path, None if body is None else json.dumps(body).encode(),
                                {"Content-Type": "application/json"})
             response = connection.getresponse()
             content = response.read(4 * 1024 * 1024 + 1)
