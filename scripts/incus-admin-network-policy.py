@@ -330,7 +330,20 @@ class AdminNetworkPolicy:
                 if canonical and instance.get("devices", {}).get(key, {}).get("path") == value["target"]:
                     target = value["target"]
                 devices[key] = {"type": "disk", "pool": self.pool, "source": value["dockerName"], "path": target}
-        require(instance.get("devices") == devices and instance.get("expanded_devices") == devices,
+        def same_devices(actual):
+            if not isinstance(actual, dict) or actual.keys() != devices.keys():
+                return False
+            for key, expected in devices.items():
+                if not isinstance(actual[key], dict):
+                    return False
+                observed = dict(actual[key])
+                if key in ("workspace", "agents"):
+                    if "io.cache" in observed and observed.pop("io.cache") != "unsafe":
+                        return False
+                if observed != expected:
+                    return False
+            return True
+        require(same_devices(instance.get("devices")) and same_devices(instance.get("expanded_devices")),
                 "Native admin devices differ from its private canonical layout")
         if native.get("incarnation"):
             require(config.get("volatile.uuid") == native["incarnation"], "Native admin incarnation changed")

@@ -1,3 +1,4 @@
+import { sameIncusDevices } from './incus-device-layout';
 import { administrativeNativeOverlay, administrativeNativeOverlaySha256 } from './incus-admin-overlay';
 export { administrativeNativeOverlay, administrativeNativeOverlaySha256 } from './incus-admin-overlay';
 import { randomUUID } from 'node:crypto';
@@ -299,7 +300,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
             }
         }
         const expected = { ...persistent, root: { type: 'disk', path: '/', pool: this.config.incusStoragePool }, eth0: this.network.device(network) };
-        if (!isDeepStrictEqual(instance.devices, expected) || !isDeepStrictEqual(instance.expanded_devices ?? instance.devices, expected))
+        if (!sameIncusDevices(instance.devices, expected) || !sameIncusDevices(instance.expanded_devices ?? instance.devices, expected))
             throw failure('Administrative VM storage or network boundary changed');
         return instance;
     }

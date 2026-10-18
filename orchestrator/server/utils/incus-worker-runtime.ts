@@ -1,3 +1,4 @@
+import { sameIncusDevice as sameDevice } from './incus-device-layout';
 import { MANAGED_KILO_PARENT, MANAGED_KILO_PARENT_CHECK } from './managed-volume-kilo-parent';
 import { effectiveIncusWorkerMemoryLimit } from '../../shared/worker-memory';
 import { resolveIncusHardware, assertIncusHardwareLayout, assertIncusHardwareExclusive, INCUS_MDEV_GUEST_SETUP, type IncusHardwareOptions } from "./incus-hardware";
@@ -66,11 +67,6 @@ export type IncusWorkerOptions = Parameters<DockerService["createWorkerContainer
   /** Backend-only catalog selection from the durable WorkerRecord. */
   imageSelection?: { definitionId: string; version: string; digest: string };
 };
-
-function sameDevice(actual: Record<string, string> | undefined, expected: Record<string, string>): boolean {
-  return !!actual && Object.keys(actual).length === Object.keys(expected).length &&
-    Object.entries(expected).every(([key, value]) => actual[key] === value);
-}
 
 /** Config is a shell file consumed only by entrypoint.sh, never systemd's
  * EnvironmentFile parser. Quote values literally, including newlines. */
@@ -363,7 +359,7 @@ export class IncusWorkerRuntime {
       const volume = await storage.inspectVolume(owner, role);
       const attached = !!original && (role !== 'docker' || !!original.devices.docker);
       const expected = { type: 'disk', pool: this.config.incusStoragePool, source: `${owner.containerName}-${role}`,
-        ...(role === 'docker' ? {} : { path: role === 'workspace' ? '/workspace' : '/home/agent/.agent-data' }) };
+        ...(role === 'docker' ? {} : { 'io.cache': 'unsafe', path: role === 'workspace' ? '/workspace' : '/home/agent/.agent-data' }) };
       if (!volume || volume.project !== this.config.incusProject || !volume.created_at ||
           !Number.isFinite(Date.parse(volume.created_at)) || !Array.isArray(volume.used_by) || volume.used_by.length !== (attached ? 1 : 0))
         throw new Error('Native instance inventory storage authority is unavailable');
@@ -408,7 +404,7 @@ export class IncusWorkerRuntime {
       if (!volume || volume.project !== this.config.incusProject || !volume.created_at ||
           !Number.isFinite(Date.parse(volume.created_at)) || !Array.isArray(volume.used_by))
         throw new Error('Offline Incus canonical storage identity is unavailable');
-      const expected = { type: 'disk', pool: this.config.incusStoragePool, source: volume.name,
+      const expected = { type: 'disk', 'io.cache': 'unsafe', pool: this.config.incusStoragePool, source: volume.name,
         path: role === 'workspace' ? '/workspace' : '/home/agent/.agent-data' };
       const devices = original && Object.entries(original.expanded_devices ?? original.devices).filter(([, device]) =>
         device.type === 'disk' && device.pool === this.config.incusStoragePool && device.source === volume.name);
@@ -476,7 +472,7 @@ export class IncusWorkerRuntime {
       if (instance.status !== 'Running') throw new Error('Running Incus canonical archive requires a running VM');
       const volume = await storage.inspectVolume(owner, role);
       const device = instance.devices[role];
-      if (!volume || !device || !sameDevice(device, { type: 'disk', pool: this.config.incusStoragePool,
+      if (!volume || !device || !sameDevice(device, { type: 'disk', 'io.cache': 'unsafe', pool: this.config.incusStoragePool,
         source: volume.name, path: role === 'workspace' ? '/workspace' : '/home/agent/.agent-data' }))
         throw new Error('Incus canonical archive storage attachment is ambiguous');
       await validateRecord();
@@ -511,7 +507,7 @@ export class IncusWorkerRuntime {
       expected[key] = device; volumes.push({ initial: volume, inspect });
     };
     for (const role of ['workspace', 'agents'] as const)
-      await addVolume(role, { type: 'disk', pool: this.config.incusStoragePool, source: owner.containerName + '-' + role,
+      await addVolume(role, { type: 'disk', 'io.cache': 'unsafe', pool: this.config.incusStoragePool, source: owner.containerName + '-' + role,
         path: role === 'workspace' ? '/workspace' : '/home/agent/.agent-data' }, () => storage.inspectVolume(owner, role));
     if (before.devices.docker) await addVolume('docker', {
       type: 'disk', pool: this.config.incusStoragePool, source: owner.containerName + '-docker',
