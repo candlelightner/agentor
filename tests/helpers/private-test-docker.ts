@@ -23,6 +23,13 @@ export function validatePrivateDocker(marker: PrivateDockerMarker, info: { ID: s
     throw new Error('Whole-instance acceptance requires its exact private nested Docker daemon');
 }
 
+export function validatePrivateDockerCgroup(cgroup: string): void {
+  // Phase 0 proves the private namespace root, then delegates its processes
+  // into init before dockerd and Playwright inherit this exact child cgroup.
+  if (cgroup.trim() !== '0::/init')
+    throw new Error('Whole-instance acceptance requires the runner delegated private cgroup');
+}
+
 /** No Docker access occurs until the fresh runner's private regular marker is
  * proven. Every subsequent CLI call pins the local socket and drops overrides. */
 export async function privateTestDocker() {
@@ -35,8 +42,7 @@ export async function privateTestDocker() {
     marker = JSON.parse(await markerFile.readFile('utf8'));
   } finally { await markerFile.close(); }
   validatePrivateDockerMarker(marker!);
-  if ((await readFile('/proc/self/cgroup', 'utf8')).trim() !== '0::/')
-    throw new Error('Whole-instance acceptance requires a private cgroup namespace');
+  validatePrivateDockerCgroup(await readFile('/proc/self/cgroup', 'utf8'));
   const environment = { ...process.env };
   for (const key of ['DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH']) delete environment[key];
   const docker = async (...args: string[]) => (await run('docker', ['--host', 'unix:///var/run/docker.sock', ...args],
