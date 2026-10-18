@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
-import { promoteNativeWorkerUpdate, nativeWorkerUpdateStatus } from '../../orchestrator/server/utils/native-worker-update';
+import { promoteNativeWorkerUpdate, nativeWorkerUpdateStatus, retainNativeWorkerSource } from '../../orchestrator/server/utils/native-worker-update';
 import { UpdateChecker } from '../../orchestrator/server/utils/update-checker';
 import { IncusClient, type IncusImageAlias } from '../../orchestrator/server/utils/incus-client';
 import { ImageCatalogCore, type NativeImageContext } from '../../orchestrator/server/utils/image-catalog-core';
@@ -42,18 +42,27 @@ async function fixture() {
     await catalog.acknowledgeNativeImageImport(id, { pending: false, fingerprint }, noOp);
     await catalog.publishNativeImageBinding(id, identity, 'agentor-storage-ownership-v1', noOp);
   });
-  const events: string[] = [];
+  const events: string[] = [], retained = new Map<string, string>(), retentionSnapshots: Array<{ source: string; configured: string; alias: string }> = [];
   let configuredId = oldId, aliasTarget = previousFingerprint, stagedInspections = 0;
   let candidateDrift = false, unsupportedArchitecture = false;
   let failAlias = false, failTag = false, lostTagResponse = false, revoked = false, recipeDrift = false;
   const docker = { getImage: (reference: string) => ({
     inspect: async () => {
+      if (reference.startsWith('agentor-native-source:')) {
+        if (!retained.has(reference)) throw Object.assign(new Error('No such image'), { statusCode: 404 });
+        return { Id: retained.get(reference)!, Architecture: 'amd64' };
+      }
+      if (reference === oldId) return { Id: oldId, Architecture: unsupportedArchitecture ? 'arm64' : 'amd64' };
       const configured = reference === config.workerImagePrefix + config.workerImage;
       if (!configured) stagedInspections++;
       return { Id: configured ? configuredId : candidateDrift && stagedInspections > 1 ? oldId : sourceId,
         Architecture: unsupportedArchitecture ? 'arm64' : 'amd64' };
     },
     tag: async (input: { repo: string; tag: string }) => {
+      if (input.repo === 'agentor-native-source') {
+        retentionSnapshots.push({ source: reference, configured: configuredId, alias: aliasTarget });
+        retained.set(`${input.repo}:${input.tag}`, reference); return;
+      }
       events.push('tag'); expect(aliasTarget).toBe(fingerprint);
       expect(input).toEqual({ repo: 'registry.fixture/agentor/worker', tag: 'latest' });
       if (failTag) throw new Error('Tag unavailable'); configuredId = sourceId;
@@ -81,7 +90,7 @@ async function fixture() {
     events.push('pull'); expect(reference).toBe('registry.fixture/agentor/worker@' + remote);
     expect(configuredId).toBe(oldId);
   }, validate, assets);
-  return { root, config, catalog, context, source, identity, client, events, run, validate,
+  return { root, config, catalog, context, source, identity, client, events, run, validate, retained, retentionSnapshots,
     imports: () => imports, state: () => ({ configuredId, aliasTarget }),
     loseTagResponse: () => { lostTagResponse = true; }, failAlias: (value: boolean) => { failAlias = value; }, failTag: (value: boolean) => { failTag = value; },
     revoke: () => { revoked = true; }, drift: () => { recipeDrift = true; }, sourceDrift: () => { candidateDrift = true; }, unsupportedArchitecture: () => { unsupportedArchitecture = true; },
@@ -91,6 +100,8 @@ async function fixture() {
 test('worker Apply stages an immutable OCI, reuses settled native receipts, then publishes alias before Docker tag', async () => {
   const f = await fixture(); try {
     await f.run(); expect(f.events).toEqual(['pull', 'alias', 'tag']);
+    expect(f.retentionSnapshots).toEqual([{ source: oldId, configured: oldId, alias: previousFingerprint }]);
+    expect(f.retained.get('agentor-native-source:sha256-' + oldId.slice(7))).toBe(oldId);
     expect(f.state()).toEqual({ configuredId: sourceId, aliasTarget: fingerprint }); expect(f.imports()).toBe(1);
     // Source remains exact upstream OCI, not a fabricated catalog build.
     const cold = new ImageCatalogCore(join(f.root, 'catalog'));
@@ -267,4 +278,39 @@ test('Apply All defers native worker preparation until the updated orchestrator 
   expect(calls).toEqual(['registry/orchestrator:latest']);
   internal.status.orchestrator.updateAvailable = false;
   const next = await checker.applyUpdates(['worker'], noOp); expect(next.workerPulled).toBe(true); expect(calls).toEqual(['registry/orchestrator:latest', 'native']);
+});
+
+for (const scenario of ['absent', 'matching', 'conflict', 'lost-ack', 'failed-ack', 'unavailable'] as const) test(`native default source retention: ${scenario}`, async () => {
+  const reference = 'agentor-native-source:sha256-' + oldId.slice(7);
+  const tags = new Map<string, string>(scenario === 'matching' ? [[reference, oldId]] : scenario === 'conflict' ? [[reference, sourceId]] : []);
+  let mutations = 0, sourcePresent = true;
+  const image = (id: string) => ({ Id: id, Architecture: 'amd64' });
+  const docker = { getImage: (value: string) => ({
+    inspect: async () => {
+      if (value === oldId && sourcePresent) return image(oldId);
+      if (scenario === 'unavailable') throw Object.assign(new Error('Daemon unavailable'), { statusCode: 503 });
+      if (!tags.has(value)) throw Object.assign(new Error('No such image'), { statusCode: 404 });
+      return image(tags.get(value)!);
+    },
+    tag: async (input: { repo: string; tag: string }) => {
+      mutations++; expect(value).toBe(oldId); expect(`${input.repo}:${input.tag}`).toBe(reference);
+      if (scenario !== 'failed-ack') tags.set(reference, oldId);
+      if (scenario === 'lost-ack' || scenario === 'failed-ack') throw new Error('Tag response lost');
+    },
+  }), pruneImages: async (input: unknown) => {
+    expect(input).toEqual({ filters: { dangling: ['true'] } });
+    if (![...tags.values()].includes(oldId)) sourcePresent = false;
+    return { ImagesDeleted: sourcePresent ? [] : [{ Deleted: oldId }], SpaceReclaimed: sourcePresent ? 0 : 123 };
+  } } as unknown as Parameters<typeof retainNativeWorkerSource>[0];
+  if (['conflict', 'failed-ack', 'unavailable'].includes(scenario)) await expect(retainNativeWorkerSource(docker, oldId, noOp)).rejects.toThrow();
+  else {
+    expect(await retainNativeWorkerSource(docker, oldId, noOp)).toBe(reference);
+    // Model classic Docker dangling prune: A's mutable tag is gone and there
+    // are no Docker containers; a real NamedTagged retention still keeps A.
+    const checker = new UpdateChecker({ workerImagePrefix: '', baseDomains: [] } as unknown as Config);
+    (checker as unknown as { docker: unknown }).docker = docker;
+    expect(await checker.pruneImages()).toEqual({ imagesDeleted: 0, spaceReclaimed: 0 });
+    expect((await docker.getImage(oldId).inspect()).Id).toBe(oldId);
+  }
+  expect(mutations).toBe(['matching', 'conflict', 'unavailable'].includes(scenario) ? 0 : 1);
 });

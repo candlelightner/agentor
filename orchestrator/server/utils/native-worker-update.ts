@@ -10,6 +10,33 @@ import { resolveAdministrativeNativeBase } from './admin-native-image';
 import type { ImageUpdateInfo } from '../../shared/types';
 import { withOperationDeadline } from './operation-deadline';
 
+/** Keep rebuild source bytes named when the mutable default moves. Docker's
+ * normal dangling prune can remove digest-only images without a container. */
+export async function retainNativeWorkerSource(docker: Pick<Docker, 'getImage'>, sourceImageId: string,
+  validateAuthority: () => Promise<void>): Promise<string> {
+  if (!/^sha256:[a-f0-9]{64}$/.test(sourceImageId)) throw new Error('Native source retention requires an immutable OCI identity');
+  const repo = 'agentor-native-source', tag = 'sha256-' + sourceImageId.slice(7), reference = `${repo}:${tag}`;
+  const inspect = (value: string) => withOperationDeadline(docker.getImage(value).inspect(), 8_000, 'Native source retention inspection');
+  const matches = (value: { Id: string; Architecture: string }) => value.Id === sourceImageId && value.Architecture === 'amd64';
+  await validateAuthority();
+  try {
+    const existing = await inspect(reference);
+    if (!matches(existing)) throw new Error('Native source retention tag conflicts with another image; no tag was changed');
+    return reference;
+  } catch (error) { if ((error as { statusCode?: number }).statusCode !== 404) throw error; }
+  if (!matches(await inspect(sourceImageId))) throw new Error('Native source retention requires the exact local amd64 image');
+  await validateAuthority();
+  try {
+    await withOperationDeadline(docker.getImage(sourceImageId).tag({ repo, tag }), 30_000, 'Native source retention tag');
+  } catch (error) {
+    let observed = false;
+    try { observed = matches(await inspect(reference)); } catch { /* Preserve ambiguous acknowledgement. */ }
+    if (!observed) throw error; // Observe only; never repeat a tag mutation automatically.
+  }
+  if (!matches(await inspect(reference))) throw new Error('Native source retention tag was not observed');
+  return reference;
+}
+
 /** Publish only a completely converted upstream default. Pulling by digest
  * preserves the old Docker tag throughout the potentially long conversion. */
 export async function promoteNativeWorkerUpdate(config: Config, remoteDigest: string,
@@ -31,6 +58,7 @@ export async function promoteNativeWorkerUpdate(config: Config, remoteDigest: st
   const previousImage = await inspect(reference);
   const previousNative = incusImageIdentity(await client.getImage(previousAlias.target));
   if (previousNative.fingerprint !== previousAlias.target) throw new Error('Configured native default alias changed');
+  await retainNativeWorkerSource(docker, previousImage.Id, validateAuthority);
   // A prior failed tag publication may already have promoted the alias. Only
   // matching configured OCI/native pairs grant historical default approval.
   if (previousNative.sourceImageId === previousImage.Id && previousImage.Architecture === 'amd64')
