@@ -1,8 +1,11 @@
 import { test, expect } from '@playwright/test';
-import { cp, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+
+const { parse } = createRequire(new URL('../../orchestrator/package.json', import.meta.url))('yaml');
 
 test('production Incus override preserves legacy control plane and grants only individual readonly TLS files', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'agentor-incus-compose-'));
@@ -22,6 +25,7 @@ test('production Incus override preserves legacy control plane and grants only i
       { cwd: dir, env, encoding: 'utf8' });
     expect(result.status, result.stderr).toBe(0);
     const app = JSON.parse(result.stdout).services.orchestrator;
+    const raw = parse(await readFile(join(dir, 'docker-compose.incus.yml'), 'utf8')).services.orchestrator;
     expect(app.image).toBe(env.AGENTOR_INCUS_ORCHESTRATOR_IMAGE);
     expect(app.environment).toMatchObject({ INCUS_ENABLED: 'true', WORKER_IMAGE_PREFIX: '', WORKER_IMAGE: env.WORKER_IMAGE,
       INCUS_PROJECT: env.INCUS_PROJECT, INCUS_CONVERTER_SEED_FINGERPRINT: env.INCUS_CONVERTER_SEED_FINGERPRINT });
@@ -31,9 +35,15 @@ test('production Incus override preserves legacy control plane and grants only i
     ]));
     expect(app.ports.every((port: { host_ip: string }) => port.host_ip && !['0.0.0.0', '::'].includes(port.host_ip))).toBe(true);
     expect(app.volumes).toEqual(expect.arrayContaining([expect.objectContaining({ source: '/var/run/docker.sock', target: '/var/run/docker.sock' })]));
-    for (const file of ['client.crt', 'client.key', 'server.crt', 'policy.crt'])
-      expect(app.volumes.find((volume: { target: string }) => volume.target === '/run/agentor-incus/' + file))
-        .toMatchObject({ type: 'bind', source: dir + '/' + file, read_only: true, bind: { create_host_path: false } });
+    for (const file of ['client.crt', 'client.key', 'server.crt', 'policy.crt']) {
+      const target = '/run/agentor-incus/' + file;
+      expect(raw.volumes.find((volume: { target: string }) => volume.target === target))
+        .toMatchObject({ type: 'bind', read_only: true, bind: { create_host_path: false } });
+      const volume = app.volumes.find((volume: { target: string }) => volume.target === target);
+      expect(volume).toMatchObject({ type: 'bind', source: dir + '/' + file, read_only: true });
+      // Compose versions may omit false boolean fields from normalized JSON.
+      expect([undefined, false]).toContain(volume.bind?.create_host_path);
+    }
     expect(app.volumes.some((volume: { source: string; target: string }) =>
       volume.source.startsWith('/var/lib/incus') || volume.target.startsWith('/var/lib/incus'))).toBe(false);
     const hosts = app.extra_hosts;
