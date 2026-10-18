@@ -1461,3 +1461,6 @@ Pending native administrative path selections do not block portable backup of al
 Native administrative encrypted DR has an explicit private-system-VM capture/restore/lifecycle gate. It drives actual HTTP encryption/import/controlled-helper restore, verifies fresh stopped authority and all canonical/selected sample metadata, and keeps source data. Live acceptance remains unverified; same-daemon two-project round trips exclude private-network lifecycle.
 
 The historical Docker whole-instance acceptance gate includes the automatically created trusted platform admin and both persistent volumes. Ordinary source/destination emptiness remains strict; native-default admin creation and native DR require their separate private native gate.
+
+
+Fresh native global administration accepts a valid dedicated DATA root before any `users` directory exists. Only that absent owner inventory is empty; no metadata is manufactured, and missing roots, symlink/non-directory users paths, foreign installation identity and other read errors still fail closed before host operations.

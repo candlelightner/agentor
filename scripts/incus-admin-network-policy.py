@@ -52,7 +52,13 @@ def directory_names(root, parts):
     descriptor = os.open(root, flags)
     try:
         for part in parts:
-            following = os.open(part, flags, dir_fd=descriptor)
+            try:
+                following = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                # Fresh global administration precedes the first account directory.
+                if parts == ["users"]:
+                    return []
+                raise
             os.close(descriptor)
             descriptor = following
         names = []

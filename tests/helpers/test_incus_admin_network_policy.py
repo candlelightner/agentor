@@ -143,6 +143,45 @@ class AdminNetworkTests(unittest.TestCase):
                 or (call[0] == 'host' and (call[1] == 'iptables-restore' or ('-f' in call and '--check' not in call)
                     or '-I' in call or '-N' in call))]
 
+    def test_fresh_global_without_users_directory_preserves_closed_path_admission(self):
+        users = self.root / 'users'
+        (users / 'healthy-owner').rmdir()
+        users.rmdir()
+        before = self.path.read_bytes()
+        result = self.policy.ensure(self.payload)
+        self.assertEqual(result['ownerId'], '__agentor_admin__')
+        self.assertEqual(result['managementAddress'], '10.210.19.2')
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertFalse(users.exists())  # Authority reads never manufacture user metadata.
+        self.calls.clear()
+        self.assertEqual(self.policy.inspect(self.payload), result)
+        self.assertEqual(self.mutations(), [])
+        foreign = self.root / 'foreign'
+        foreign.mkdir()
+        for target in (foreign, self.root / 'missing-target'):
+            with self.subTest(symlink_target=target.name):
+                users.symlink_to(target)
+                self.calls.clear()
+                with self.assertRaises(OSError):
+                    self.policy.ensure(self.payload)
+                self.assertEqual(self.calls, [])
+                users.unlink()
+        users.write_text('not a directory')
+        with self.assertRaises(OSError):
+            self.policy.ensure(self.payload)
+        self.assertEqual(self.calls, [])
+        users.unlink()
+        with self.assertRaises(FileNotFoundError):
+            MODULE.directory_names(str(self.root / 'missing-root'), ['users'])
+        alias = self.root / 'root-alias'
+        alias.symlink_to(self.root)
+        with self.assertRaises(OSError):
+            MODULE.directory_names(str(alias), ['users'])
+        (self.root / 'backup-installation-id').write_text(str(uuid.uuid4()))
+        with self.assertRaises(MODULE.PolicyError):
+            self.policy.ensure(self.payload)
+        self.assertEqual(self.calls, [])
+
     def test_ensure_private_geometry_order_and_idempotent_inspect(self):
         result = self.policy.ensure(self.payload)
         self.assertEqual(result['managementAddress'], '10.210.19.2')
