@@ -232,3 +232,41 @@ for (const revoked of [false,true]) test(`explicit portable live selected captur
     expect(f.counts().helperCalls).toBe(1);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
+
+for (const drift of [false, true]) test(`stopped portable seeded leaf ${drift ? 'refuses durable source drift' : 'retains known bytes'} beside a pending selection while instance capture stays strict`, async () => {
+  const { ManagedVolumeStore } = await import('../../orchestrator/server/utils/managed-volume-store');
+  const { IncusAdminWorkspaceStorage } = await import('../../orchestrator/server/utils/incus-admin-workspace-storage');
+  const f = fixture(), directory = await mkdtemp(join(tmpdir(), 'admin-selected-pending-'));
+  try {
+    const store = new ManagedVolumeStore(directory); await store.init();
+    const seeded = await store.create('__agentor_admin__', f.record.id, '/opt/seeded', undefined, 'incus-vm');
+    await store.save({ ...seeded, seeded: true, state: 'ready' });
+    const pending = await store.create('__agentor_admin__', f.record.id, '/opt/pending', undefined, 'incus-vm');
+    f.record.nativeRuntime!.selectedVolumeIds = [seeded.id, pending.id]; f.setFresh(structuredClone(f.record));
+    const storage = new IncusAdminWorkspaceStorage(f.config, f.runtime.client, async () => store);
+    Object.assign(f.runtime.storage, { selectedRecords: storage.selectedRecords.bind(storage), inspectSelectedVolume: storage.inspectSelectedVolume.bind(storage) });
+    f.runtime.inspectSelectedStorage = storage.inspectSelected.bind(storage);
+    f.volumes.selected = { name: seeded.dockerName, project: 'agentor', type: 'custom', content_type: 'filesystem', created_at: new Date(0).toISOString(),
+      used_by: ['/1.0/instances/' + f.instance.name + '?project=agentor'], config: {
+        'user.agentor.installation': f.record.nativeRuntime!.installationId, 'user.agentor.owner': '__agentor_admin__',
+        'user.agentor.id': f.record.id, 'user.agentor.volume-id': seeded.id, 'user.agentor.target': seeded.target } };
+    await expect(f.backup.captureSelected(f.record, seeded.id, join(directory, 'instance.gz'))).rejects.toThrow('Apply administrative selected directories');
+    await expect(f.backup.capturePortableSelected(f.record, pending.id, join(directory, 'pending.gz'))).rejects.toThrow('ready seeded');
+    expect(f.counts().helperCalls).toBe(0);
+    if (drift) {
+      const execStream = f.runtime.client.execStream;
+      f.runtime.client.execStream = async (...args: any[]) => {
+        await store.save({ ...store.get('__agentor_admin__', seeded.id)!, name: 'Changed during capture' });
+        return execStream(...args);
+      };
+    }
+    const output = join(directory, 'portable.gz'), capture = f.backup.capturePortableSelected(f.record, seeded.id, output);
+    if (drift) await expect(capture).rejects.toThrow('portable selected record changed');
+    else {
+      expect((await capture).id).toBe(seeded.id);
+      expect(gunzipSync(await readFile(output)).toString()).toBe('managed bytes');
+    }
+    expect(f.counts()).toEqual({ helperCalls: 1, execCalls: 1, closeCalls: 1 });
+    expect(store.get('__agentor_admin__', pending.id)).toEqual(pending);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});

@@ -1455,3 +1455,5 @@ Account-owned portable backups retain dedicated native administrative workspace 
 Long running administrative captures renew the already-bound short management identity within the held lifecycle transaction, without starting compute or changing metadata. Renewal failures/revocation abort capture, timers clear and drain before release, and unrelated admins refresh concurrently with one in-flight ensure per admin.
 
 Periodic native administrative identity refresh serializes with lifecycle work without advancing its generation, so healthy terminal/proxy/journal handles are retained; real lifecycle mutations preserve their revocation behavior.
+
+Pending native administrative path selections do not block portable backup of already seeded data. They remain excluded until applied; whole-instance snapshot readiness is unchanged.

@@ -110,7 +110,7 @@ export async function exportAdministrativeWorkspaceBundle(config: Config, runtim
         } });
         if (record.status === 'running') await pipeline(await openAdministrativeSelectedArchive(runtime, record, item.record.target, check, signal, 'volume'), limit, createWriteStream(raw, { mode: 0o600 }), { signal });
         else {
-          await backup.captureSelected(record, item.record.id, gzip, signal); await check();
+          await backup.capturePortableSelected(record, item.record.id, gzip, signal); await check();
           await pipeline(createReadStream(gzip), createGunzip(), limit, createWriteStream(raw, { mode: 0o600 }), { signal });
         }
         const entry = { target: item.record.target, name: item.record.name, archive: portableManagedVolumeArchiveName(index) };

@@ -61,7 +61,8 @@ for (const running of [false, true]) test(`${running ? 'running' : 'stopped'} de
       workspace: { type: 'disk', path: '/workspace' }, agents: { type: 'disk', path: '/home/agent/.agent-data' }, managed: { type: 'disk', path: '/opt/data' },
     } };
     const managed = { record: { id: randomUUID(), target: '/opt/data', name: 'Persistent data', attached: true, seeded: true }, volume: { name: 'private', used_by: ['owned'] } };
-    const runtime: any = { validateAuthority: async () => {}, assertOwned: async () => structuredClone(state), storage: { selectedRecords: async () => [managed.record], inspectSelectedVolume: async () => managed.volume },
+    const pending = { id: randomUUID(), target: '/opt/pending', name: 'Pending data', attached: true, seeded: false };
+    const runtime: any = { validateAuthority: async () => {}, assertOwned: async () => structuredClone(state), storage: { selectedRecords: async () => [managed.record, pending], inspectSelectedVolume: async (r: any, value: any) => { expect(value.id).toBe(managed.record.id); return managed.volume; } },
       client: { exec: async () => ({ returnCode: 0, stdout: 'aaaaaaaa-1111-1111-1111-111111111111\n' }), execStream: async (_name: string, command: string[]) => {
         live++; expect(command[5]).toBeUndefined();
         const isManaged = command[3] === '/opt/data';
@@ -72,7 +73,7 @@ for (const running of [false, true]) test(`${running ? 'running' : 'stopped'} de
     const backup: any = { capture: async (_record: any, outputs: any, options: any) => {
       offline++; expect(options.exclusions).toEqual(['/opt/data']);
       for (const [role, path] of Object.entries(outputs)) await writeFile(path as string, gzipSync(await raw(role === 'workspace' ? 'workspace' : '.agent-data')));
-    }, captureSelected: async (_record: any, id: string, path: string, _signal: any, options: any) => {
+    }, capturePortableSelected: async (_record: any, id: string, path: string, _signal: any, options: any) => {
       selected++; expect(id).toBe(managed.record.id); expect(options).toBeUndefined();
       await writeFile(path, gzipSync(await raw('volume')));
     } };
@@ -83,6 +84,7 @@ for (const running of [false, true]) test(`${running ? 'running' : 'stopped'} de
     expect(bundle.manifest.source.id).toBe(r.id); expect(bundle.manifest.runtime!.kind).toBe('incus-vm');
     expect(bundle.manifest.environment.envVars).toBe(''); expect(JSON.stringify(bundle.manifest)).not.toContain(r.nativeRuntime!.incarnation);
     expect(bundle.manifest.managedVolumes).toEqual([{ target: '/opt/data', name: 'Persistent data', archive: 'volumes/0.tar' }]);
+    expect(bundle.manifest.localPersistence).toEqual([{ path: '/opt/data', included: true }, { path: '/opt/pending', included: false }]);
     expect(bundle.manifest.contents).toMatchObject({ rootfs: false, workspace: true, agents: true, managedVolumes: true });
     expect(bundle.managedVolumesPath).toBeTruthy(); expect(checks).toBeGreaterThan(3);
     expect({ offline, live, selected }).toEqual({ offline: running ? 0 : 1, live: running ? 3 : 0, selected: running ? 0 : 1 });

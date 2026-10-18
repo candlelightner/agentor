@@ -92,10 +92,20 @@ export class IncusAdminBackup {
 
   async captureSelected(record: Readonly<AdministrativeWorkspaceRecord>, id: string, output: string, signal?: AbortSignal,
     options: { allowRunning?: true } = {}) {
-    record = structuredClone(record);
     if (!options || Object.keys(options).some(key => key !== 'allowRunning') ||
         options.allowRunning !== undefined && options.allowRunning !== true) throw failure('Invalid administrative selected capture mode');
-    const allowRunning = options.allowRunning === true;
+    return this.captureSelectedArchive(record, id, output, signal, options.allowRunning === true);
+  }
+
+  /** Portable backups include only the requested ready attached leaf. Pending
+   * selections remain explicit-path data and do not weaken instance snapshots. */
+  async capturePortableSelected(record: Readonly<AdministrativeWorkspaceRecord>, id: string, output: string, signal?: AbortSignal) {
+    return this.captureSelectedArchive(record, id, output, signal, false, true);
+  }
+
+  private async captureSelectedArchive(record: Readonly<AdministrativeWorkspaceRecord>, id: string, output: string,
+    signal?: AbortSignal, allowRunning = false, portable = false) {
+    record = structuredClone(record);
     // Portable scheduled backups may explicitly accept best-effort live bytes;
     // whole-instance capture keeps the stopped-only default.
     if (allowRunning) {
@@ -105,8 +115,14 @@ export class IncusAdminBackup {
     }
     const instance = allowRunning ? await this.runtime.assertOwned(record) : (await this.inspect(record)).instance;
     if (allowRunning && instance.status !== 'Running') throw failure('Administrative live capture state changed');
-    const selected = await this.inspectSelected(record);
-    const found = selected.find(item => item.record.id === id);
+    let found;
+    if (portable) {
+      const value = (await this.runtime.storage.selectedRecords(record)).find(value => value.id === id);
+      if (!value?.seeded || value.state !== 'ready' || value.operation && value.operation.stage !== 'complete')
+        throw failure('Administrative portable selected archive requires ready seeded storage');
+      const volume = await this.runtime.storage.inspectSelectedVolume(record, value);
+      if (volume) found = { record: value, volume };
+    } else found = (await this.inspectSelected(record)).find(item => item.record.id === id);
     if (!found) throw failure('Administrative selected archive identity is unavailable');
     const before = structuredClone(found.volume);
     const refs = (values: string[]) => values.map(ref => {
@@ -120,6 +136,8 @@ export class IncusAdminBackup {
     if (!isDeepStrictEqual(refs(before.used_by), baselineRefs)) throw failure('Administrative selected references are ambiguous');
     const assertSource = async (helperName?: string) => {
       await this.runtime.validateAuthority(record, record.nativeRuntime!.incarnation);
+      if (portable && !isDeepStrictEqual((await this.runtime.storage.selectedRecords(record)).find(value => value.id === id), found.record))
+        throw failure('Administrative portable selected record changed');
       const currentInstance = await this.runtime.client.getInstance(instance.name);
       if (!isDeepStrictEqual(currentInstance, instance)) throw failure('Administrative selected compute changed');
       const current = await this.runtime.client.getCustomVolume(this.config.incusStoragePool, before.name);
