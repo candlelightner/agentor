@@ -53,13 +53,11 @@ export function useAdminWorkspace() {
     action.value = operation;
     error.value = "";
     try {
-      workspace.value = await $fetch<AdminWorkspace>(path, { method });
+      workspace.value = await $fetch<AdminWorkspace>(path, { method, timeout: 120_000, retry: 0 });
       return workspace.value;
     } catch (cause) {
-      error.value = adminError(
-        cause,
-        "Administrative workspace operation failed.",
-      );
+      error.value = 'The operation has no confirmed outcome and may still complete. Refresh status before retrying. ' +
+        adminError(cause, "Administrative workspace operation failed.");
       throw cause;
     } finally {
       action.value = "";
@@ -70,7 +68,7 @@ export function useAdminWorkspace() {
     loading.value = true;
     error.value = "";
     try {
-      workspace.value = await $fetch<AdminWorkspace | null>("/api/admin/workspace");
+      workspace.value = await $fetch<AdminWorkspace | null>("/api/admin/workspace", { timeout: 15_000, retry: 0 });
       return workspace.value;
     } catch (cause) {
       error.value = adminError(

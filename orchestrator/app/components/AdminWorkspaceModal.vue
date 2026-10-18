@@ -15,6 +15,8 @@ watch(open, async (shown) => {
   if (shown) await admin.refresh().catch(() => undefined);
 });
 
+const lifecycleBlocked = computed(() => admin.loading.value || Boolean(admin.action.value) || Boolean(admin.error.value));
+
 const statusTone = computed(() =>
   admin.workspace.value?.status === "running" ? "bg-red-600" : "bg-gray-600",
 );
@@ -36,13 +38,11 @@ function close() {
   open.value = false;
 }
 async function confirmAction() {
-  if (!acknowledged.value || !pendingAction.value) return;
+  if (!acknowledged.value || !pendingAction.value || lifecycleBlocked.value) return;
   const result = await admin[pendingAction.value]().catch(() => undefined);
-  if (result) {
-    emit("changed", result);
-    pendingAction.value = "";
-    acknowledged.value = false;
-  }
+  pendingAction.value = "";
+  acknowledged.value = false;
+  if (result) emit("changed", result);
 }
 async function ensureWorkspace() {
   const result = await admin.ensure().catch(() => undefined);
@@ -101,6 +101,9 @@ function openService(service: string) {
             class="rounded bg-red-100 p-3 text-sm font-medium text-red-900"
           >
             {{ admin.error.value }}
+            <UButton color="neutral" :loading="admin.loading.value" :disabled="Boolean(admin.action.value)" @click="void admin.refresh().catch(() => undefined)">
+              Refresh status
+            </UButton>
           </p>
           <div v-if="admin.loading.value" class="py-12 text-center">
             Loading administrative workspace…
@@ -124,6 +127,7 @@ function openService(service: string) {
             <UButton
               color="error"
               :loading="admin.action.value === 'ensure'"
+              :disabled="lifecycleBlocked"
               @click="ensureWorkspace"
               >Provision trusted workspace</UButton
             >
@@ -167,15 +171,17 @@ function openService(service: string) {
                   <UButton
                     v-if="admin.workspace.value.status === 'stopped'"
                     color="error"
+                    :disabled="lifecycleBlocked"
                     @click="requestAction('start')"
                     >Start admin workspace</UButton
                   >
-                  <UButton v-else color="error" @click="requestAction('stop')"
+                  <UButton v-else color="error" :disabled="lifecycleBlocked" @click="requestAction('stop')"
                     >Stop admin workspace</UButton
                   >
                   <UButton
                     color="neutral"
                     variant="outline"
+                    :disabled="lifecycleBlocked"
                     @click="requestAction('rebuild')"
                     >Rebuild trusted image</UButton
                   >
@@ -260,6 +266,7 @@ function openService(service: string) {
               </div>
             </section>
 
+            <AdminMemoryEditor endpoint="/api/admin/workspace/resources" />
             <AdminStartupScriptEditor
               endpoint="/api/admin/workspace/startup-script"
               label="Platform-admin startup script"
@@ -298,7 +305,7 @@ function openService(service: string) {
               >
               <UButton
                 color="error"
-                :disabled="!acknowledged"
+                :disabled="!acknowledged || lifecycleBlocked"
                 :loading="admin.action.value === pendingAction"
                 @click="confirmAction"
                 >Confirm {{ pendingAction }}</UButton

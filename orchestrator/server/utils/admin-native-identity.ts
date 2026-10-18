@@ -1,3 +1,4 @@
+import { validateAdminMemoryLimit } from '../../shared/admin-workspace-memory';
 import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
 import type { AdministrativeWorkspaceRecord } from './admin-workspace-store';
@@ -18,6 +19,7 @@ export interface AdminNativeRuntimeIdentity {
   deleting?: true;
   selectedVolumeIds?: string[];
   selectedOperation?: { volumeId: string; operationId: string; incarnation: string; kind: 'snapshot' | 'seed'; canonical?: true; device?: { state: 'unknown' | 'accepted' | 'settled'; operation?: string } };
+  memoryLimit?: string;
   appliedStartupScriptRevision?: number;
   pending?: { kind: 'create' | 'start' | 'stop' | 'delete'; operation?: string };
 }
@@ -55,6 +57,8 @@ export function adminNativeInstanceName(record: Readonly<AdministrativeWorkspace
     : `agentor-admin-${createHash('sha256').update(record.id).digest('hex').slice(0,30)}`;
 }
 export function validateAdminNativeState(record: Readonly<AdministrativeWorkspaceRecord>): void {
+  if (record.memoryLimit !== undefined) validateAdminMemoryLimit(record.memoryLimit);
+  if (record.nativeRuntime?.memoryLimit !== undefined) validateAdminMemoryLimit(record.nativeRuntime.memoryLimit);
   if (record.runtimeKind === undefined) {
     if (record.nativeRuntime || record.nativeMigration) throw new Error('Administrative runtime selector is missing');
     return;

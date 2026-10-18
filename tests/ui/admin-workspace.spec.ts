@@ -34,6 +34,9 @@ async function mockAdminWorkspace(page: Page) {
     pendingRebuild: false,
     runtime: { state: "not-configured" },
   };
+  await page.route("**/api/admin/workspace/resources", route => route.fulfill({
+    json: { memoryLimit: '4GiB', appliedMemoryLimit: '4GiB', pendingRebuild: false },
+  }));
   await page.route("**/api/admin/workspace/startup-script", async (route) => {
     if (route.request().method() === "PUT") {
       const body = route.request().postDataJSON();

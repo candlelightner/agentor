@@ -1,3 +1,4 @@
+import { adminMemorySettings, validateAdminMemoryLimit } from '../../shared/admin-workspace-memory';
 import { isDeepStrictEqual } from 'node:util';
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -8,6 +9,7 @@ import { applyAdminNativePatch, validateAdminNativeState, type AdminNativeRuntim
   type AdminNativeMigration, type AdminNativeAcknowledge } from './admin-native-authority';
 import {
   operationSettlement,
+  withOperationDeadline,
   type OperationFailureWithSettlement,
 } from "./operation-deadline";
 
@@ -27,6 +29,8 @@ export interface AdministrativeWorkspaceRecord {
   imageDigest?: string;
   /** Account whose worker environment variables are injected on recreation. */
   ownerId?: string;
+  /** Desired VM memory, applied only on explicit rebuild. */
+  memoryLimit?: string;
   /** User-authored, non-secret shell launched in the admin tmux pane. */
   startupScript?: string;
   /** Monotonic desired/applied revisions keep Docker's immutable Env explicit. */
@@ -121,6 +125,7 @@ export class AdminWorkspaceStore {
   private runtime?: AdminWorkspaceRuntimeAdapter;
   private identityMaterializer?: AdminWorkspaceIdentityMaterializer;
   private operationTail: Promise<void> = Promise.resolve();
+  private pendingOperations = 0;
   private pendingCommit?: {
     operation: string;
     record: AdministrativeWorkspaceRecord;
@@ -182,20 +187,23 @@ export class AdminWorkspaceStore {
     await rename(temp, this.path);
   }
   private exclusive<T>(operation: () => Promise<T>): Promise<T> {
-    return this.serialize(async () => {
+    if (this.pendingOperations) return Promise.reject(Object.assign(
+      new Error('Administrative workspace operation is already in progress. Refresh status before retrying.'), { statusCode: 409 }));
+    return withOperationDeadline(this.serialize(async () => {
       await this.init();
       return withOwnerWorkerLifecycleMutation('__agentor_admin__', this.record?.id ?? '__admin-bootstrap__', operation);
-    });
+    }), 120_000, 'Administrative workspace operation');
   }
   private serialize<T>(operation: () => Promise<T>): Promise<T> {
+    this.pendingOperations++;
     const result = this.operationTail.then(operation, operation);
     this.operationTail = result.then(
-      () => undefined,
+      () => { this.pendingOperations--; },
       async (error: OperationFailureWithSettlement) => {
         // Return the bounded timeout to the caller, but do not admit another
         // administrative mutation until the aborted Docker request has truly
         // settled. This mirrors the ordinary per-worker lifecycle fence.
-        await error?.[operationSettlement];
+        try { await error?.[operationSettlement]; } finally { this.pendingOperations--; }
       },
     );
     return result;
@@ -273,11 +281,11 @@ export class AdminWorkspaceStore {
     return this.exclusive(() => this.ensureLocked());
   }
   async getStatus() {
-    return this.serialize(async () => {
-      await this.init();
-      const record = this.readSettledRecord();
-      return record ? this.publicRecord(record) : null;
-    });
+    await this.init();
+    if (this.pendingOperations) throw Object.assign(
+      new Error('Administrative workspace operation is in progress or awaiting settlement. Refresh status before retrying.'), { statusCode: 503 });
+    const record = this.readSettledRecord();
+    return record ? this.publicRecord(record) : null;
   }
   private readSettledRecord() {
     const record = this.getRecord();
@@ -435,6 +443,24 @@ export class AdminWorkspaceStore {
   async readMarker() {
     await this.ensure();
     return { marker: this.record!.marker ?? null };
+  }
+  async getResources() {
+    await this.getStatus();
+    const record = this.readSettledRecord();
+    if (!record) throw Object.assign(new Error('Administrative workspace not provisioned'), { statusCode: 404 });
+    return adminMemorySettings(record);
+  }
+  async setResources(value: unknown) {
+    const memoryLimit = validateAdminMemoryLimit(value);
+    return this.exclusive(async () => {
+      const record = this.readSettledRecord();
+      if (!record) throw Object.assign(new Error('Administrative workspace not provisioned'), { statusCode: 404 });
+      if (record.runtimeKind !== 'incus-vm') throw Object.assign(new Error('Migrate the administrative workspace to a native VM before changing memory'), { statusCode: 409 });
+      record.memoryLimit = memoryLimit;
+      record.updatedAt = new Date().toISOString();
+      await this.commit(record);
+      return adminMemorySettings(record);
+    });
   }
   async getStartupScript() {
     return this.serialize(async () => {

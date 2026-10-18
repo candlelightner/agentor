@@ -22,6 +22,8 @@
     "api/terminal-admission.spec.ts",
     "api/admin-native-authority.spec.ts",
     "api/admin-native-runtime.spec.ts",
+    "api/admin-workspace-resources.spec.ts",
+    "ui/admin-workspace-isolated.spec.ts",
     "api/admin-native-backup.spec.ts",
     "api/admin-native-image.spec.ts",
     "api/admin-native-refresh.spec.ts",
