@@ -13,6 +13,7 @@ import { zeroUserEnvVars } from '../../orchestrator/server/utils/user-env-store'
 import { useWorkerConfigStore } from '../../orchestrator/server/utils/worker-config-store';
 import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker-runtime';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
+import { readCanonicalIncusBootstrap, incusConversionRecipeId } from '../../orchestrator/server/utils/incus-image-converter';
 import { incusImageIdentity } from '../../orchestrator/server/utils/incus-worker-image';
 import { snapshotIncusWorkerBackupRuntime } from '../../orchestrator/server/utils/worker-backup-runtime';
 import { WORKER_EXPORT_VERSION, BUNDLE_FILES, writeManifest, packBundle } from '../../orchestrator/server/utils/worker-export';
@@ -83,20 +84,64 @@ async function fixture(run: (f: any) => Promise<void>) {
       calls.push('exact-rollback'); return { status: 'archived' };
     },
   };
+  // Native imports use short-lived runtimes with their own authority closure.
+  // Keep this fixture's compute/extraction doubles across those instances.
+  const methods = ['preflightCanonicalRestore', 'createCanonicalRestore', 'restoreCanonicalArchives', 'finishCanonicalRestore'] as const;
+  const originals = methods.map(name => IncusWorkerRuntime.prototype[name]);
+  for (const name of methods) (IncusWorkerRuntime.prototype as any)[name] = async (...args: any[]) =>
+    name === 'preflightCanonicalRestore' ? void assertIncomplete() : (runtime as any)[name](...args);
   manager.setIncusRuntime(runtime as any);
   try {
-    await run({ manager, store, info, calls, runtime, assertIncomplete,
+    await run({ manager, store, info, calls, runtime, config, manifest, dataDir, assertIncomplete,
       fail: (at: string) => { failure = at; },
       import: (override?: any, principal?: () => Promise<void>, managed?: any[], selected?: any[]) => (manager as any).importNativeCanonicalWorker(
         info, { workspace: '/private/validated.tar' }, manifest, undefined, override,
         principal ?? (async () => { checks++; }), managed, selected), checks: () => checks });
   } finally {
+    methods.forEach((name, index) => { (IncusWorkerRuntime.prototype as any)[name] = originals[index]; });
     configStore.markApplied = priorMarkApplied;
     const volumes = useManagedVolumeManager(); await volumes.init();
     for (const volume of volumes.store.forWorker(userId, id)) await volumes.store.forget(userId, volume.id);
     await rm(dataDir, { recursive: true, force: true });
   }
 }
+
+test('default workspace-only import uses its scoped resolver with configured seed and no native source descriptor', async () => {
+  await fixture(async f => {
+    const previousCwd = process.cwd(), assets = join(f.dataDir, '.output/server/incus-bootstrap');
+    await mkdir(join(f.dataDir, '.output/server'), { recursive: true });
+    execFileSync(process.execPath, [join(previousCwd, '../orchestrator/build-incus-worker-assets.mjs'), assets]);
+    f.config.incusConverterSeedFingerprint = 'f'.repeat(64);
+    f.manifest.runtime = { version: 1, kind: 'legacy-docker' };
+    const source = 'sha256:' + 'd'.repeat(64), fingerprint = 'c'.repeat(64);
+    const image = { fingerprint, type: 'virtual-machine', architecture: 'x86_64', aliases: [], size: 1, properties: {
+      source_image_id: source, recipe_id: incusConversionRecipeId(source, await readCanonicalIncusBootstrap(assets)),
+      source_architecture: 'amd64', converter_version: 'v0.4.0', bootstrap_generation: '3' } };
+    const client = { getImageAlias: async () => ({ target: fingerprint, type: image.type }), getImage: async () => image };
+    (f.manager as any).dockerService = { workerOciImage: () => ({ inspect: async () => ({ Id: source, Architecture: 'amd64' }) }) };
+    const ordinary = new IncusWorkerRuntime(f.config, client as any);
+    ordinary.matchesWorkerIdentity = f.runtime.matchesWorkerIdentity;
+    f.manager.setIncusRuntime(ordinary);
+    let scopedChecks = 0;
+    IncusWorkerRuntime.prototype.preflightCanonicalRestore = async function(opts, described) {
+      f.assertIncomplete(); expect(described).toBeUndefined(); expect(this).not.toBe(ordinary);
+      await expect((ordinary as any).imageResolver(opts)).rejects.toThrow('lifecycle');
+      await (this as any).canonicalRestoreImage(opts, described); scopedChecks++;
+    };
+    IncusWorkerRuntime.prototype.createCanonicalRestore = async function(opts, described) {
+      // Exercise real default image authority before the fixture's compute ACK.
+      await (this as any).canonicalRestoreImage(opts, described);
+      return f.runtime.createCanonicalRestore(opts, described);
+    };
+    try {
+      process.chdir(f.dataDir);
+      const imported = await f.import();
+      expect(imported.status).toBe('running'); expect(scopedChecks).toBe(1);
+      expect(f.store.get(f.info.userId, f.info.id).incusRecreation).toBeUndefined();
+      expect(f.calls).toContain('extract'); expect(f.calls).toContain('health');
+    } finally { process.chdir(previousCwd); }
+  });
+});
 
 test('native importer retains initial incomplete authority through health, configuration and mappings', async () => {
   await fixture(async f => {

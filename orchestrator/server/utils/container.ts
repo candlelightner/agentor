@@ -6531,17 +6531,14 @@ for p in sys.argv[1:]:
         }
         options.managedVolumes = structuredClone(managedRecords);
       }
-      let importRuntime = this.incusRuntime;
       const restoreSource = !imageResolution && manifest.runtime?.kind === 'incus-vm' ? manifest.runtime.source : undefined;
-      if (options.image || restoreSource) {
-        // Keep the ordinary callback's importIncomplete rejection intact. Only
-        // this short-lived import runtime receives the exact principal/nonce
-        // validation closure, never JSON-supplied authority or a global waiver.
-        importRuntime = new IncusWorkerRuntime(this.config, this.incusRuntime.client);
-        this.configureIncusImages(importRuntime, validate);
-        await importRuntime.preflightCanonicalRestore(options, restoreSource);
-        await validate();
-      }
+      // Every import, including workspace-only data without native source
+      // metadata, needs the exact principal/nonce fence. Keep the ordinary
+      // callback's importIncomplete rejection intact.
+      const importRuntime = new IncusWorkerRuntime(this.config, this.incusRuntime.client);
+      this.configureIncusImages(importRuntime, validate);
+      await importRuntime.preflightCanonicalRestore(options, restoreSource);
+      await validate();
       proof.attempted = true;
       const instance = await importRuntime.createCanonicalRestore(options, restoreSource,
         selectedPayloads.some(item => item.path === '/var/lib/docker'));
