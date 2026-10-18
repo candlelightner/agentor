@@ -33,6 +33,11 @@ jobs:
           filters: |
             orchestrator:
               - 'orchestrator/**'
+              - 'worker/vm/**'
+              - 'worker/entrypoint.sh'
+              - 'scripts/build-incus-worker-image.sh'
+              - 'scripts/incus-canary.mjs'
+              - '.dockerignore'
               - '.github/workflows/docker-build.yml'
             worker:
               - 'worker/**'
@@ -40,6 +45,9 @@ jobs:
             validation:
               - 'orchestrator/**'
               - 'worker/**'
+              - 'scripts/build-incus-worker-image.sh'
+              - 'scripts/incus-canary.mjs'
+              - '.dockerignore'
               - 'tests/**'
               - 'docker-compose.tests.yml'
               - '.github/workflows/docker-build.yml'
