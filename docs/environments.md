@@ -4,6 +4,35 @@
 
 Environments bundle per-worker configuration: CPU/memory limits, network access policy, Docker-in-Docker toggle, custom env vars, setup script (pre-agent), API exposure flags, and capability/instruction selections. The init script (which agent to launch) is configured per-worker at creation time via the Create Worker modal, not in environments. Managed via `orchestrator/server/utils/environments.ts` (`EnvironmentStore`), stored as JSON in `<DATA_DIR>/environments.json`. Follows the built-in store pattern: a built-in `default.json` file in `orchestrator/server/built-in/environments/` defines the default environment, `EnvironmentStore` has a `builtIn` field and `seedBuiltIns()` method (same pattern as capabilities, instructions, and init-scripts). Built-in environments cannot be edited or deleted, but their content is updated on startup.
 
+### Memory policy for native VMs
+
+A legacy Docker environment can leave memory empty or set a zero cap such as
+`0g` to run without a Docker memory ceiling. A VM always needs finite assigned
+RAM. Native worker allocation therefore uses **4 GiB** when its resolved memory
+cap is empty or zero, rather than inheriting Incus's small implicit default.
+This migration-discovered regression caused browser/TeX setup to stall in a
+roughly 1 GiB guest; the policy avoids repeating that failure for new VMs.
+
+Set `INCUS_DEFAULT_MEMORY_LIMIT` on the Orchestrator to override the finite VM
+fallback (for example `6GiB`). It must be a positive finite binary memory size;
+empty, zero, percentages, unsupported units and unsafe byte ranges fail before
+allocation. Positive environment caps are preserved exactly, including caps
+below the fallback. Docker allocations and their existing defaults are unchanged.
+
+Precedence is the environment cap, then `DEFAULT_MEMORY_LIMIT` when the
+environment is empty, then the VM-only fallback when that resolved cap is empty
+or zero. Units `k/m/g` and `KB/MB/GB` retain Docker's binary interpretation;
+`KiB/MiB/GiB` are also supported for native workers. All native allocation paths
+(create, rebuild/unarchive, migration, canonical import and missing-compute
+recovery) share this policy. It does not resize running VMs, rewrite environments,
+or infer an allocation from host RAM.
+
+The Environment editor shows effective VM memory for the next create/rebuild,
+including empty/zero inputs and operator overrides, using the authenticated
+`GET /api/worker-memory-policy` projection. Unavailable policy is shown explicitly.
+System Settings distinguishes the shared/Docker default from finite VM fallback;
+worker metrics remain the source for actual running guest memory.
+
 ### Network Firewall
 
 Uses **dnsmasq + ipset + iptables** for network-level domain filtering (not a bypassable proxy):

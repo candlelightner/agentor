@@ -45,6 +45,20 @@ _ready() {
     echo "READY|" >> /tmp/worker-events
 }
 
+# Source worker environment files if present (used in Incus VM mode)
+if [ -f /run/agentor/worker.env ]; then
+    set -a
+    . /run/agentor/worker.env
+    set +a
+fi
+
+# A VM keeps guest firewall/resolver state across worker-service restarts.
+# Reset our guest-only policy before the same bootstrap network operations that
+# precede firewall activation in the legacy entrypoint.
+if [ -d /run/systemd/system ]; then
+    sudo /usr/lib/agentor/agentor-network.sh full
+fi
+
 # Capture the server-provisioned runtime role before ENVIRONMENT.envVars or
 # worker-local values are exported. Only these three internal values exist;
 # missing or invalid values fail closed to the ordinary-worker role.
@@ -86,16 +100,23 @@ wait_for_port() {
 # clean shell + init script only after everything is fully ready.
 # ==========================================================================
 WINDOW_NAME="main"
+# Main belongs to the original provisioned account socket. Environment/local
+# TMUX_TMPDIR overrides still reach apps and panes, not bootstrap tmux clients.
+readonly _agentor_bootstrap_tmux_tmpdir="${TMUX_TMPDIR:-/tmp}"
+readonly _agentor_bootstrap_tmux="${TMUX-}"
+agentor_tmux() {
+    TMUX="$_agentor_bootstrap_tmux" TMUX_TMPDIR="$_agentor_bootstrap_tmux_tmpdir" command tmux "$@"
+}
 _boot
 _total 10
-tmux new-session -d -s main -n "$WINDOW_NAME" -c /workspace \
+agentor_tmux new-session -d -s main -n "$WINDOW_NAME" -c /workspace \
     "bash /home/agent/loading-screen.sh"
-tmux set -g mouse on
-tmux set -g status off
-tmux set -g extended-keys on
-tmux set -s terminal-features 'xterm*:extkeys'
-tmux bind-key -n S-Enter send-keys Escape '[13;2u'
-tmux set-option -w -t "main:$WINDOW_NAME" automatic-rename off
+agentor_tmux set -g mouse on
+agentor_tmux set -g status off
+agentor_tmux set -g extended-keys on
+agentor_tmux set -s terminal-features 'xterm*:extkeys'
+agentor_tmux bind-key -n S-Enter send-keys Escape '[13;2u'
+agentor_tmux set-option -w -t "main:$WINDOW_NAME" automatic-rename off
 _log "Tmux: ready"
 
 # ==========================================================================
@@ -107,7 +128,9 @@ _log "Tmux: ready"
 AGENT_DATA=/home/agent/.agent-data
 if [ -d "$AGENT_DATA" ]; then
     # Fix ownership (Docker may create subdirs as root for credential bind mounts)
-    sudo chown -R agent:agent "$AGENT_DATA"
+    if [ "$(cat /proc/1/comm)" != systemd ]; then
+        sudo chown -R agent:agent "$AGENT_DATA"
+    fi
 
     # Ensure subdirectories exist in the per-worker volume. Kilo's config and
     # shared-data are overlaid by per-user bind mounts (config = global config,
@@ -115,7 +138,10 @@ if [ -d "$AGENT_DATA" ]; then
     # workers). state/cache stay private to this worker.
     mkdir -p "$AGENT_DATA"/{.claude,.gemini,.codex,.agents,.vscode,.code-server}
     mkdir -p "$AGENT_DATA/.kilo"/{config,shared-data,state,cache}
-    chmod 700 "$AGENT_DATA/.code-server" "$AGENT_DATA/.kilo" "$AGENT_DATA/.kilo"/{config,shared-data,state,cache}
+    chmod 700 "$AGENT_DATA/.code-server" "$AGENT_DATA/.kilo" "$AGENT_DATA/.kilo"/{state,cache}
+    if [ "$(cat /proc/1/comm)" != systemd ]; then
+        chmod 700 "$AGENT_DATA/.kilo"/{config,shared-data}
+    fi
 
     # Symlink agent config dirs to persistent volume
     for dir in .claude .gemini .codex .agents .vscode; do
@@ -277,9 +303,9 @@ expose_flag() {
 export EXPOSE_PORT_MAPPINGS=$(expose_flag portMappings)
 export EXPOSE_DOMAIN_MAPPINGS=$(expose_flag domainMappings)
 export EXPOSE_USAGE=$(expose_flag usage)
-tmux set-environment -g EXPOSE_PORT_MAPPINGS "$EXPOSE_PORT_MAPPINGS"
-tmux set-environment -g EXPOSE_DOMAIN_MAPPINGS "$EXPOSE_DOMAIN_MAPPINGS"
-tmux set-environment -g EXPOSE_USAGE "$EXPOSE_USAGE"
+agentor_tmux set-environment -g EXPOSE_PORT_MAPPINGS "$EXPOSE_PORT_MAPPINGS"
+agentor_tmux set-environment -g EXPOSE_DOMAIN_MAPPINGS "$EXPOSE_DOMAIN_MAPPINGS"
+agentor_tmux set-environment -g EXPOSE_USAGE "$EXPOSE_USAGE"
 
 # Export custom env vars from ENVIRONMENT.envVars
 ENV_VARS=$(echo "$ENVIRONMENT" | jq -r '.envVars // ""')
@@ -289,7 +315,7 @@ while IFS= read -r line; do
     case "${trimmed%%=*}" in
         AGENTOR_RUNTIME_ROLE|AGENTOR_TRUSTED_RUNTIME_ROLE) continue ;;
     esac
-    [[ "$trimmed" == *=* ]] && export "$trimmed" && tmux set-environment -g "${trimmed%%=*}" "${trimmed#*=}"
+    [[ "$trimmed" == *=* ]] && export "$trimmed" && agentor_tmux set-environment -g "${trimmed%%=*}" "${trimmed#*=}"
 done <<< "$ENV_VARS"
 
 # Worker-local values are baked into the container only on create/rebuild and
@@ -304,7 +330,7 @@ if [[ -n "${WORKER_LOCAL_ENV:-}" ]]; then
             AGENTOR_RUNTIME_ROLE|AGENTOR_TRUSTED_RUNTIME_ROLE) continue ;;
         esac
         export "$key=$value"
-        tmux set-environment -g "$key" "$value"
+        agentor_tmux set-environment -g "$key" "$value"
     done < <(printf '%s' "$WORKER_LOCAL_ENV" | base64 -d | jq -r '.[] | @base64')
 fi
 
@@ -371,9 +397,82 @@ if [[ "${AGENTOR_ADMIN_WORKSPACE:-}" == "1" ]]; then
 command = "/usr/local/bin/agentor-management-mcp"
 EOF
     fi
-    tmux set-environment -g AGENTOR_MANAGEMENT_MCP_URL \
+    agentor_tmux set-environment -g AGENTOR_MANAGEMENT_MCP_URL \
       "${AGENTOR_MANAGEMENT_MCP_URL:-http://agentor-orchestrator:3099/mcp}"
 fi
+
+# Codex filters MCP child environments. Amend only Agentor's canonical commands,
+# including existing sections, without persisting endpoint values or credentials.
+python3 - /home/agent/.codex/config.toml "${CODEX_HOME:-/home/agent/.codex}/config.toml" <<'CODEX_MCP_ENV' || echo "[agent] Warning: managed Codex MCP environment reconciliation failed" >&2
+import copy, json, os, re, stat, sys, tempfile, tomllib
+from pathlib import Path
+
+def reconcile(text):
+    for name, command, variables in (
+        ('agentor-management', '/usr/local/bin/agentor-management-mcp', ['AGENTOR_MANAGEMENT_MCP_URL']),
+        ('agentor-worker', '/usr/local/bin/agentor-worker-mcp', ['AGENTOR_WORKER_MCP_URL', 'ORCHESTRATOR_URL']),
+    ):
+        parsed = tomllib.loads(text)
+        section = parsed.get('mcp_servers', {}).get(name, {})
+        if not isinstance(section, dict) or section.get('command') != command:
+            continue
+        existing = section.get('env_vars', [])
+        if not isinstance(existing, list) or any(not isinstance(value, str) for value in existing):
+            raise ValueError('Invalid managed MCP environment allowlist')
+        merged = existing + [value for value in variables if value not in existing]
+        if merged == existing:
+            continue
+        expected = copy.deepcopy(parsed)
+        expected['mcp_servers'][name]['env_vars'] = merged
+        header = re.search(r'(?m)^[ \t]*\[mcp_servers\.' + re.escape(name) + r'\][ \t]*(?:#[^\n]*)?(?:\n|$)', text)
+        if not header:
+            raise ValueError('Managed MCP section is not a canonical table')
+        assignment = 'env_vars = ' + json.dumps(merged) + '\n'
+        if 'env_vars' not in section:
+            candidate = text[:header.end()] + assignment + text[header.end():]
+        else:
+            field = re.search(r'(?m)^[ \t]*env_vars[ \t]*=', text[header.end():])
+            if not field:
+                raise ValueError('Managed MCP allowlist assignment is not canonical')
+            start = header.end() + field.start()
+            # Validate each possible multiline-array end instead of parsing TOML syntax ourselves.
+            for end in [match.end() for match in re.finditer(r'\n|$', text) if match.end() > start]:
+                candidate = text[:start] + assignment + text[end:]
+                try:
+                    if tomllib.loads(candidate) == expected:
+                        break
+                except tomllib.TOMLDecodeError:
+                    pass
+            else:
+                raise ValueError('Managed MCP allowlist cannot be updated without other changes')
+        if tomllib.loads(candidate) != expected:
+            raise ValueError('Managed MCP update changed unrelated configuration')
+        text = candidate
+    return text
+
+for path in dict.fromkeys(Path(value).resolve() for value in sys.argv[1:]):
+    if not path.exists():
+        continue
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError('Codex configuration is not a regular file')
+    before = path.read_text()
+    after = reconcile(before)
+    if after == before:
+        continue
+    descriptor, stage = tempfile.mkstemp(prefix=path.name + '.agentor-mcp-', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'w') as output:
+            os.fchown(output.fileno(), info.st_uid, info.st_gid)
+            os.fchmod(output.fileno(), stat.S_IMODE(info.st_mode))
+            output.write(after); output.flush(); os.fsync(output.fileno())
+        if path.read_text() != before:
+            raise ValueError('Codex configuration changed during reconciliation')
+        os.replace(stage, path)
+    finally:
+        if os.path.exists(stage):
+            os.unlink(stage)
+CODEX_MCP_ENV
 
 _done agents "Agent setup"
 _log "Agent setup: done"
@@ -384,12 +483,19 @@ _log "Agent setup: done"
 DOCKER_ENABLED=$(echo "$ENVIRONMENT" | jq -r '.dockerEnabled // false')
 if [ "$DOCKER_ENABLED" = "true" ]; then
     _step docker "Docker daemon"
-    _log "DinD: starting dockerd..."
-    sudo find /run /var/run -iname 'docker*.pid' -delete 2>/dev/null || true
-    sudo find /run /var/run -path '*/containerd*' -delete 2>/dev/null || true
-    sudo rm -rf /var/run/docker /var/run/docker.sock 2>/dev/null || true
-    sudo mkdir -p /var/lib/docker /etc/docker
-    sudo tee /etc/docker/daemon.json > /dev/null <<'DOCKERCONF'
+    _log "Docker: starting dockerd..."
+    if [ -d /run/systemd/system ]; then
+        # Running under systemd (Incus VM native Docker)
+        sudo systemctl start docker
+        # A skipped systemd condition must not report a successful capability.
+        docker info >/dev/null || { echo "[agent] ERROR: native Docker storage/daemon is not ready" >&2; exit 70; }
+    else
+        # Running in container (legacy DinD)
+        sudo find /run /var/run -iname 'docker*.pid' -delete 2>/dev/null || true
+        sudo find /run /var/run -path '*/containerd*' -delete 2>/dev/null || true
+        sudo rm -rf /var/run/docker /var/run/docker.sock 2>/dev/null || true
+        sudo mkdir -p /var/lib/docker /etc/docker
+        sudo tee /etc/docker/daemon.json > /dev/null <<'DOCKERCONF'
 {
     "storage-driver": "overlay2",
     "iptables": true,
@@ -398,11 +504,8 @@ if [ "$DOCKER_ENABLED" = "true" ]; then
     "log-opts": { "max-size": "10m", "max-file": "3" }
 }
 DOCKERCONF
-    # Mirror dockerd output to both /tmp/dockerd.log (for in-container
-    # debugging) and the container's stdout (so the orchestrator's log
-    # collector captures it). The "[dockerd] " prefix tags entries so they
-    # are distinguishable from other entrypoint output.
-    ( sudo dockerd 2>&1 | stdbuf -oL -eL sed -u 's/^/[dockerd] /' | tee -a /tmp/dockerd.log ) &
+        ( sudo dockerd 2>&1 | stdbuf -oL -eL sed -u 's/^/[dockerd] /' | tee -a /tmp/dockerd.log ) &
+    fi
     tries=300  # 300 * 0.1s = 30s (matches the "within 30s" warn message below)
     while [ ! -S /var/run/docker.sock ] && [ $tries -gt 0 ]; do
         sleep 0.1
@@ -414,12 +517,15 @@ DOCKERCONF
                 || echo "[docker] Warning: GHCR login failed, continuing"
         fi
         _done docker "Docker daemon"
-        _log "DinD: dockerd ready"
+        _log "Docker: dockerd ready"
     else
         _warn docker "Docker daemon (failed to start)"
-        _log "DinD: WARNING — dockerd failed to start within 30s"
+        _log "Docker: WARNING — dockerd failed to start within 30s"
     fi
 else
+    if [ -d /run/systemd/system ]; then
+        sudo systemctl stop docker docker.socket containerd 2>/dev/null || true
+    fi
     _skip docker "Docker daemon"
 fi
 
@@ -591,7 +697,12 @@ fi
 # ==========================================================================
 FIREWALL_MODE=$(echo "$ENVIRONMENT" | jq -r '.networkMode // "full"')
 
-if [ "$FIREWALL_MODE" != "full" ]; then
+if [ -d /run/systemd/system ]; then
+    _step firewall "Network firewall"
+    ALLOWED_DOMAINS=$(echo "$ENVIRONMENT" | jq -c '.allowedDomains // []')
+    sudo /usr/lib/agentor/agentor-network.sh "$FIREWALL_MODE" "$ALLOWED_DOMAINS"
+    _done firewall "Network firewall ($FIREWALL_MODE)"
+elif [ "$FIREWALL_MODE" != "full" ]; then
     _step firewall "Network firewall"
     _log "Firewall: start ($FIREWALL_MODE)"
 
@@ -677,12 +788,12 @@ _ready
 sleep 0.6
 
 # Configure pane persistence — respawn a clean shell on exit (never re-run init script)
-tmux set-option -w -t "main:$WINDOW_NAME" remain-on-exit on
-tmux set-hook -t main pane-died \
+agentor_tmux set-option -w -t "main:$WINDOW_NAME" remain-on-exit on
+agentor_tmux set-hook -t main pane-died \
     "if-shell -F '#{==:#{window_name},main}' 'respawn-pane -k -c /workspace bash'"
 
 # Replace loading screen with init.sh (runs init script or falls back to bash)
-tmux respawn-pane -k -t "main:$WINDOW_NAME" -c /workspace "bash /home/agent/init.sh"
+agentor_tmux respawn-pane -k -t "main:$WINDOW_NAME" -c /workspace "bash /home/agent/init.sh"
 
 _log "Startup complete"
 

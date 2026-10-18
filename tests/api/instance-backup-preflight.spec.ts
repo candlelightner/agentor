@@ -17,12 +17,19 @@ import { instanceSnapshotActive } from "../../orchestrator/server/utils/instance
 let root: string;
 let active: string;
 let workers: Array<{ status: string }>;
-let admin: { status: string } | undefined;
-let groups: Array<{ adminWorkspace: { status: string } }>;
+let admin: ReturnType<typeof administrativeFixture> | undefined;
+let groups: Array<{ adminWorkspace: ReturnType<typeof administrativeFixture> }>;
 let calls: string[];
 let diagnostics: string[];
 let undo: Array<() => void>;
 const guards = ["backup", "managed", "sizing", "portable", "export", "image", "usage", "orphan"];
+
+function administrativeFixture(status = "stopped", group = false) {
+  return { schemaVersion: 1, id: group ? "group-admin" : "platform-admin", trusted: true,
+    kind: group ? "group-administrative" : "administrative", status,
+    ...(group ? { ownerId: "owner", groupId: "group" } : {}),
+    createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString() };
+}
 
 function replace(target: any, key: string, value: any) {
   const original = Object.getOwnPropertyDescriptor(target, key);
@@ -37,8 +44,8 @@ test.beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "agentor-instance-preflight-"));
   active = "";
   workers = [{ status: "stopped" }, { status: "archived" }];
-  admin = { status: "stopped" };
-  groups = [{ adminWorkspace: { status: "stopped" } }];
+  admin = administrativeFixture();
+  groups = [{ adminWorkspace: administrativeFixture("stopped", true) }];
   calls = [];
   diagnostics = [];
   undo = [];
@@ -114,14 +121,14 @@ for (const status of ["running", "creating"]) {
 }
 
 test("real default preflight blocks a running platform-admin workspace", async () => {
-  admin = { status: "running" };
+  admin = administrativeFixture("running");
   expect(await create(manager())).toMatchObject({ status: "failed", errorCode: "INSTANCE_BACKUP_WORKSPACES_ACTIVE" });
   expect(calls).toEqual([]);
 });
 
 for (const status of ["running", "creating"]) {
   test(`real default preflight blocks a group-admin workspace that is ${status}`, async () => {
-    groups.push({ adminWorkspace: { status } });
+    groups.push({ adminWorkspace: administrativeFixture(status, true) });
     expect(await create(manager())).toMatchObject({ status: "failed", errorCode: "INSTANCE_BACKUP_WORKSPACES_ACTIVE" });
     expect(calls).toEqual([]);
   });

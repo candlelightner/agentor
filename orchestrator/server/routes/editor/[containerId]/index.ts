@@ -15,6 +15,7 @@ defineRouteMeta({
 
 import { createWsRelayHandlers } from '../../../utils/ws-utils';
 import { resolveOwnedRunningContainer } from '../../../utils/auth-helpers';
+import { useContainerManager } from '../../../utils/services';
 
 const wsHandlers = createWsRelayHandlers(
   // The worker id is a UUID (with hyphens) — match the whole segment, not just hex.
@@ -38,7 +39,8 @@ export default defineEventHandler({
       return sendRedirect(event, `${url.pathname}/${url.search}`, 301);
     }
 
-    const target = `http://${info.containerName}:8443/${url.search}`;
+    const host = await useContainerManager().resolveWorkerHost(info.id);
+    const target = `http://${host}:8443/${url.search}`;
     return proxyRequest(event, target);
   },
 

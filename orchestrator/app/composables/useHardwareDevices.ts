@@ -1,8 +1,10 @@
-import type { HardwareDevice, HardwareDeviceCandidate, HardwareDeviceGrant } from "../../shared/types";
+import type { HardwareDevice, HardwareDeviceCandidate, HardwareDeviceGrant, IncusHardwareCapability } from "../../shared/types";
 export interface HardwareDeviceView {
   ownerId: string;
   canManageCatalog: boolean;
-  catalog: Array<HardwareDevice & { entitled: boolean; available: boolean }>;
+  incusUsbEnabled?: boolean;
+  incusGpuMdevProfile?: string;
+  catalog: Array<HardwareDevice & { entitled: boolean; available: boolean; incus?: IncusHardwareCapability; reserved?: boolean; reservedWorkerIds?: string[] }>;
   discovered: HardwareDeviceCandidate[];
   grants: HardwareDeviceGrant[];
   effectiveDeviceIds: string[];

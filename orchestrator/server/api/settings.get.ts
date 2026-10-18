@@ -17,6 +17,7 @@ import { useConfig, useInitScriptStore } from '../utils/services';
 import { listGitProviders } from '../utils/git-providers';
 import { listAppTypes } from '../utils/apps';
 import { requireAdmin } from '../utils/auth-helpers';
+import { incusDefaultMemoryLimit } from '../../shared/worker-memory';
 
 interface SettingItem {
   key: string;
@@ -64,7 +65,8 @@ export default defineEventHandler(async (event) => {
     label: 'Worker Defaults',
     items: [
       { key: 'DEFAULT_CPU_LIMIT', label: 'Default CPU Limit', value: config.defaultCpuLimit || 'unlimited', type: config.defaultCpuLimit ? 'number' : 'string' },
-      { key: 'DEFAULT_MEMORY_LIMIT', label: 'Default Memory Limit', value: config.defaultMemoryLimit || 'unlimited', type: 'string' },
+      { key: 'DEFAULT_MEMORY_LIMIT', label: 'Shared Memory Cap (Docker: empty = unlimited)', value: config.defaultMemoryLimit || 'unset; Docker unlimited, VM default applies', type: 'string' },
+      { key: 'INCUS_DEFAULT_MEMORY_LIMIT', label: 'Default VM Memory (empty or zero cap)', value: incusDefaultMemoryLimit(config.incusDefaultMemoryLimit), type: 'string' },
     ],
   });
 

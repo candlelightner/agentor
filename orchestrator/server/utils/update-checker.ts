@@ -3,6 +3,7 @@ import type { Readable } from 'node:stream';
 import type { Config } from './config';
 import type { ImageUpdateInfo, UpdateStatus, ApplyResult, UpdatableImage, PruneResult } from '../../shared/types';
 import { withOperationDeadline } from './operation-deadline';
+import { promoteNativeWorkerUpdate, nativeWorkerUpdateStatus } from './native-worker-update';
 
 interface ImageRef {
   registry: string;
@@ -21,10 +22,12 @@ export class UpdateChecker {
   private docker: Docker;
   private config: Config;
   private status: UpdateStatus;
+  private workerUpdate?: Promise<void>;
   private pollInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: Config) {
-    this.docker = new Docker({ socketPath: '/var/run/docker.sock' });
+    // Match the private administrative network service's endpoint-MAC contract.
+    this.docker = new Docker({ socketPath: '/var/run/docker.sock', version: config.incusEnabled ? 'v1.54' : undefined });
     this.config = config;
     this.status = {
       orchestrator: null,
@@ -118,6 +121,10 @@ export class UpdateChecker {
     }
 
     const results = await Promise.all(checks);
+    if (this.config.incusEnabled && hasPrefix && results[1]) {
+      const { useIncusClient } = await import('./services');
+      results[1] = await nativeWorkerUpdateStatus(this.config, results[1], this.docker, useIncusClient());
+    }
 
     // Preserve existing local-only entries for images not checked remotely
     this.status = {
@@ -308,7 +315,16 @@ export class UpdateChecker {
     });
   }
 
-  async applyUpdates(images?: UpdatableImage[]): Promise<ApplyResult> {
+  private async updateWorkerImage(validateAuthority?: () => Promise<void>): Promise<void> {
+    if (!this.config.incusEnabled) return this.pullImage(this.config.workerImagePrefix + this.config.workerImage);
+    if (!validateAuthority) throw new Error('Native worker Apply requires current platform administrator authority');
+    const { useIncusClient } = await import('./services');
+    const { useImageCatalogManager } = await import('./image-catalog');
+    await promoteNativeWorkerUpdate(this.config, this.status.worker!.remoteDigest || this.status.worker!.localDigest, this.docker,
+      useIncusClient(), useImageCatalogManager(), image => this.pullImage(image), validateAuthority);
+  }
+
+  async applyUpdates(images?: UpdatableImage[], validateWorkerAuthority?: () => Promise<void>): Promise<ApplyResult> {
     const result: ApplyResult = {
       orchestratorPulled: false,
       workerPulled: false,
@@ -328,13 +344,27 @@ export class UpdateChecker {
     const shouldUpdate = (key: UpdatableImage) => !images || images.includes(key);
     const prefix = this.config.workerImagePrefix;
 
-    // Pull worker image if update available
-    if (hasPrefix && shouldUpdate('worker') && this.status.worker?.updateAvailable) {
+    // A new package owns the new bootstrap. Do not derive with old assets
+    // immediately before replacing this process during Apply All.
+    const deferWorker = this.config.incusEnabled && shouldUpdate('orchestrator') && this.status.orchestrator?.updateAvailable;
+    if (deferWorker && shouldUpdate('worker') && this.status.worker?.updateAvailable) result.workerDeferred = true;
+    // Publish the complete worker default if an update is available.
+    if (!deferWorker && hasPrefix && shouldUpdate('worker') && this.status.worker?.updateAvailable) {
       try {
-        await this.pullImage(prefix + this.config.workerImage);
+        if (this.config.incusEnabled) {
+          if (!validateWorkerAuthority) throw new Error('Native worker Apply requires current platform administrator authority');
+          await validateWorkerAuthority();
+        }
+        if (!this.workerUpdate) {
+          const execution = this.updateWorkerImage(validateWorkerAuthority);
+          this.workerUpdate = execution;
+          void execution.finally(() => { if (this.workerUpdate === execution) this.workerUpdate = undefined; }).catch(() => {});
+        }
+        await this.workerUpdate;
+        if (this.config.incusEnabled) await validateWorkerAuthority!();
         result.workerPulled = true;
       } catch (err: unknown) {
-        result.errors.push(`Worker pull failed: ${err instanceof Error ? err.message : String(err)}`);
+        result.errors.push(`Worker update failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 
@@ -382,14 +412,15 @@ export class UpdateChecker {
       HostConfig: info.HostConfig,
     };
 
-    // Reconstruct network config
+    // Copy requested endpoint settings, not Docker's allocated endpoint/DNS IDs.
+    // Static IPs are allocated only when the replacement starts after the old peer exits.
     const networks = info.NetworkSettings?.Networks;
     if (networks && Object.keys(networks).length > 0) {
-      const endpointsConfig: Record<string, { Aliases?: string[] }> = {};
+      const endpointsConfig: Record<string, Docker.EndpointSettings & { GwPriority?: number }> = {};
       for (const [netName, netConfig] of Object.entries(networks)) {
-        endpointsConfig[netName] = {
-          Aliases: (netConfig as { Aliases?: string[] }).Aliases,
-        };
+        const { NetworkID, IPAMConfig, MacAddress, Aliases, Links, DriverOpts, GwPriority } =
+          netConfig as Docker.EndpointSettings & { GwPriority?: number };
+        endpointsConfig[netName] = { NetworkID, IPAMConfig, MacAddress, Aliases, Links, DriverOpts, GwPriority };
       }
       createOpts.NetworkingConfig = { EndpointsConfig: endpointsConfig };
     }
@@ -407,28 +438,32 @@ export class UpdateChecker {
     // We can't do this in-process because stopping our own container kills this process.
     const swapScript = [
       'const http = require("http");',
-      'function api(method, path) {',
+      'function api(method, path, allowNotModified = false) {',
       '  return new Promise((resolve, reject) => {',
-      '    const req = http.request({ socketPath: "/var/run/docker.sock", method, path }, (res) => {',
+      `    const req = http.request({ socketPath: "/var/run/docker.sock", method, path: ${JSON.stringify(this.config.incusEnabled ? '/v1.54' : '')} + path }, (res) => {`,
       '      let d = ""; res.on("data", c => d += c);',
-      '      res.on("end", () => resolve({ status: res.statusCode, data: d }));',
+      '      res.on("error", reject);',
+      '      res.on("end", () => {',
+      '        if ((res.statusCode >= 200 && res.statusCode < 300) || (allowNotModified && res.statusCode === 304)) resolve({ status: res.statusCode, data: d });',
+      '        else reject(new Error(`Docker update ${method} failed (HTTP ${res.statusCode})`));',
+      '      });',
       '    });',
       '    req.on("error", reject);',
+      '    req.setTimeout(90000, () => req.destroy(new Error("Docker update request timed out")));',
       '    req.end();',
       '  });',
       '}',
       '(async () => {',
       `  console.log("[swapper] stopping ${containerName}...");`,
-      `  await api("POST", "/containers/${containerName}/stop?t=30");`,
-      `  await api("POST", "/containers/${containerName}/wait");`,
+      `  await api("POST", "/containers/${info.Id}/stop?t=30", true);`,
+      `  await api("POST", "/containers/${info.Id}/wait");`,
       `  console.log("[swapper] removing old container...");`,
-      `  await api("DELETE", "/containers/${containerName}");`,
+      `  await api("DELETE", "/containers/${info.Id}");`,
       `  console.log("[swapper] renaming ${tempName} -> ${containerName}...");`,
       `  await api("POST", "/containers/${newContainer.id}/rename?name=${containerName}");`,
       `  console.log("[swapper] starting new orchestrator...");`,
-      `  const r = await api("POST", "/containers/${newContainer.id}/start");`,
-      '  if (r.status < 300) console.log("[swapper] orchestrator replaced successfully");',
-      '  else { console.error("[swapper] start failed:", r.status, r.data); process.exit(1); }',
+      `  await api("POST", "/containers/${newContainer.id}/start", true);`,
+      '  console.log("[swapper] orchestrator replaced successfully");',
       '})().catch(e => { console.error("[swapper] fatal:", e.message || e); process.exit(1); });',
     ].join('\n');
 

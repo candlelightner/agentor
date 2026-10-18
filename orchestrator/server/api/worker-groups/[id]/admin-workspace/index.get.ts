@@ -9,5 +9,7 @@ export default defineEventHandler(async (event) => {
       statusCode: 404,
       statusMessage: "Group administrative workspace not provisioned",
     });
-  return useGroupAdminWorkspaceStore().ensure(group.id);
+  return useGroupAdminWorkspaceStore().getStatus(group.id, () =>
+    requireResourceAccess(event, useWorkerGroupStore().findById(group.id), { allowGlobal: false }),
+  );
 });

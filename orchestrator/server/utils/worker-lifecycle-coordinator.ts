@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   operationSettlement,
   type OperationFailureWithSettlement,
@@ -8,6 +9,8 @@ import {
  * mutation cannot strand every later lifecycle request for that worker. */
 export class WorkerLifecycleCoordinator {
   private queues = new Map<string, Promise<void>>();
+  private ownerContexts = new AsyncLocalStorage<ReadonlyMap<string, { active: boolean }>>();
+  private mutations = new Map<string, number>();
   /** A monotonic admission marker lets inventory reconciliation distinguish a
    * Docker list snapshot taken before a worker mutation from current state.
    * Queue occupancy alone is insufficient: a mutation can complete while
@@ -20,6 +23,10 @@ export class WorkerLifecycleCoordinator {
     return this.queues.has(workerId);
   }
 
+  hasMutation(workerId: string): boolean {
+    return (this.mutations.get(workerId) ?? 0) > 0;
+  }
+
   currentSequence(): number {
     return this.sequence;
   }
@@ -28,12 +35,31 @@ export class WorkerLifecycleCoordinator {
     return this.generations.get(workerId) ?? 0;
   }
 
+  /** Only the owner boundary is reentrant. Network/group admission may already
+   * hold it before taking a worker fence; a worker fence must never reenter. */
+  withOwner<T>(userId: string, operation: () => Promise<T>,
+    options: { holdTimeoutSettlement?: boolean; runtimeSetup?: boolean } = {}): Promise<T> {
+    const contexts = this.ownerContexts.getStore();
+    if (contexts?.get(userId)?.active) return operation();
+    return this.withWorker(`owner:${userId}`, async () => {
+      const marker = { active: true }, next = new Map(contexts ?? []);
+      next.set(userId, marker);
+      return this.ownerContexts.run(next, async () => {
+        try { return await operation(); }
+        finally { marker.active = false; }
+      });
+    }, options);
+  }
+
   withWorker<T>(
     workerId: string,
     operation: () => Promise<T>,
-    options: { holdTimeoutSettlement?: boolean } = {},
+    options: { holdTimeoutSettlement?: boolean; runtimeSetup?: boolean } = {},
   ): Promise<T> {
-    this.generations.set(workerId, ++this.sequence);
+    if (!options.runtimeSetup) {
+      this.generations.set(workerId, ++this.sequence);
+      this.mutations.set(workerId, (this.mutations.get(workerId) ?? 0) + 1);
+    }
     const previous = this.queues.get(workerId) ?? Promise.resolve();
     const result = previous.catch(() => undefined).then(operation);
     const tail = result.then(
@@ -49,6 +75,11 @@ export class WorkerLifecycleCoordinator {
     );
     this.queues.set(workerId, tail);
     void tail.finally(() => {
+      if (!options.runtimeSetup) {
+        const remaining = (this.mutations.get(workerId) ?? 1) - 1;
+        if (remaining) this.mutations.set(workerId, remaining);
+        else this.mutations.delete(workerId);
+      }
       if (this.queues.get(workerId) === tail) this.queues.delete(workerId);
     });
     return result;
@@ -64,11 +95,24 @@ export function withWorkerLifecycleMutation<T>(
   return lifecycleCoordinator.withWorker(workerId, operation);
 }
 
+/** Credential-only work shares the worker queue without revoking healthy
+ * handles or acquiring an owner-wide network/lifecycle lock. */
+export function withWorkerRuntimeSetup<T>(workerId: string, operation: () => Promise<T>): Promise<T> {
+  return lifecycleCoordinator.withWorker(workerId, operation, { runtimeSetup: true });
+}
+
 /** Read-only reconciliation must not reinterpret a worker that is between
  * Docker mutations as missing. This exposes only lock occupancy, never the
  * queued operation or any caller data. */
 export function isWorkerLifecycleMutationActive(workerId: string): boolean {
   return lifecycleCoordinator.isBusy(workerId);
+}
+
+/** Routes deny queued/running mutations (including late timeout settlement),
+ * not brief exec setup or healthy read-only guest observations. Inventory
+ * continues using the stricter all-queue occupancy check above. */
+export function isWorkerLifecycleMutationPending(workerId: string): boolean {
+  return lifecycleCoordinator.hasMutation(workerId);
 }
 
 /** Snapshot markers for read-only inventory work. They contain no worker
@@ -87,7 +131,7 @@ export function withOwnerLifecycleMutation<T>(
   userId: string,
   operation: () => Promise<T>,
 ): Promise<T> {
-  return lifecycleCoordinator.withWorker(`owner:${userId}`, operation);
+  return lifecycleCoordinator.withOwner(userId, operation);
 }
 
 /** Acquire lifecycle fences in the only supported nesting order. Keeping the
@@ -103,8 +147,17 @@ export function withOwnerWorkerLifecycleMutation<T>(
   // same owner indefinitely, despite each sibling having an independent
   // Docker task. Account cleanup still takes owner→worker in this order and
   // therefore waits for the affected worker fence before touching it.
-  return lifecycleCoordinator.withWorker(`owner:${userId}`, () =>
+  return lifecycleCoordinator.withOwner(userId, () =>
     withWorkerLifecycleMutation(workerId, operation),
     { holdTimeoutSettlement: false },
   );
+}
+
+/** Brief name-based exec setup shares the existing lifecycle queues without
+ * claiming a lifecycle mutation. Release after channels attach, not command
+ * completion, so stop/rebuild can still cancel a long-running guest process. */
+export function withOwnerWorkerRuntimeSetup<T>(userId: string, workerId: string, operation: () => Promise<T>): Promise<T> {
+  return lifecycleCoordinator.withOwner(userId, () =>
+    lifecycleCoordinator.withWorker(workerId, operation, { runtimeSetup: true }),
+    { runtimeSetup: true, holdTimeoutSettlement: false });
 }

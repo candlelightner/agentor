@@ -1,4 +1,6 @@
+import { MANAGED_KILO_PARENT } from './managed-volume-kilo-parent';
 import Docker from "dockerode";
+import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
@@ -8,7 +10,7 @@ import { Transform } from "node:stream";
 import * as tar from "tar-stream";
 import { sanitizeBackupPathTarPayload } from "./worker-export";
 import { withOperationDeadline } from "./operation-deadline";
-import { pathsOverlap, validatePersistenceTarget, volumeError, type StoredManagedVolume } from "./managed-volume-store";
+import { pathsOverlap, validatePersistenceTarget, validateStoredPersistenceTarget, volumeError, type StoredManagedVolume } from "./managed-volume-store";
 
 const READ_TIMEOUT = 15_000;
 const HELPER_TIMEOUT = 150_000;
@@ -47,7 +49,10 @@ export class ManagedVolumeRuntime {
 
   async ensureVolume(v: StoredManagedVolume) {
     const found = await this.inspectVolume(v);
-    if (found) return;
+    if (found) {
+      if (v.target === MANAGED_KILO_PARENT) await this.verifyKiloParent(v, found);
+      return;
+    }
     if (v.seeded) throw volumeError(409, "Required persistent volume is missing. Restore it before starting the worker; no empty replacement was created.");
     await withOperationDeadline(this.docker.createVolume({ Name: v.dockerName, Driver: "local", Labels: {
       [VOLUME_LABEL]: v.id, "agentor.owner-id": v.userId, "agentor.worker-id": v.workerId,
@@ -55,8 +60,27 @@ export class ManagedVolumeRuntime {
     await this.inspectVolume(v);
   }
 
+  private async verifyKiloParent(v: StoredManagedVolume, before: Docker.VolumeInspectInfo) {
+    v = structuredClone(v);
+    const identity = (value: Docker.VolumeInspectInfo) => ({ Name: value.Name, Driver: value.Driver,
+      Mountpoint: value.Mountpoint, Options: value.Options, Labels: value.Labels,
+      CreatedAt: (value as Docker.VolumeInspectInfo & { CreatedAt?: string }).CreatedAt });
+    const original = identity(before);
+    if (!original.CreatedAt || !Number.isFinite(Date.parse(original.CreatedAt)))
+      throw volumeError(409, 'Managed XDG parent volume incarnation is unavailable.');
+    const validate = async () => {
+      const current = await this.inspectVolume(v);
+      if (!current || !isDeepStrictEqual(identity(current), original))
+        throw volumeError(409, 'Managed XDG parent source changed. Data was retained.');
+    };
+    const { PortableManagedVolumeRuntime } = await import('./portable-managed-volume-runtime');
+    await new PortableManagedVolumeRuntime(this.dataDir, this.docker, { trustedImage: () => this.trustedImage() })
+      .verifyKiloParent(v, validate);
+  }
+
   async validateTarget(containerId: string, target: string, allowVolume?: string) {
-    validatePersistenceTarget(target);
+    if (target === MANAGED_KILO_PARENT && allowVolume) validateStoredPersistenceTarget(target);
+    else validatePersistenceTarget(target);
     const inspection = await this.inspect(containerId);
     for (const mount of inspection.Mounts ?? []) {
       if (mount.Name === allowVolume && mount.Destination === target) continue;

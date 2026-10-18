@@ -29,6 +29,7 @@ COPY stack.yml /opt/test-stack/stack.yml
 # Test runner entrypoint — boots dockerd, builds images, brings up the
 # inner stack, runs playwright with passthrough args, tears down on exit.
 COPY --chmod=755 test-entrypoint.sh /usr/local/bin/test-entrypoint.sh
+COPY load-prebuilt-images.mjs /usr/local/lib/agentor-load-prebuilt-images.mjs
 
 # Workdir for the playwright invocation. The host bind-mount lands here.
 WORKDIR /work/tests

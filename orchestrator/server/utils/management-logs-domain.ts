@@ -1,3 +1,4 @@
+import { readServerLogs, serverLogInputSchema } from "./server-log-read";
 import { useContainerManager, useWorkerStore } from "./services";
 import { redactManagedOutput, workerOutputRedactionValues } from "./worker-output-redaction";
 
@@ -29,10 +30,17 @@ export class ManagementLogsDomain {
         tail: { type: "integer", minimum: 1, maximum: MAX_TAIL, description: `Maximum lines, capped at ${MAX_TAIL}.` },
       } },
       annotations: readOnly,
+    }, {
+      name: "logs.server-read",
+      group: "logs",
+      description: "Platform administrator only: read recent orchestrator/server log entries, with level/search/time filters, opaque pagination and credential redaction. Maximum 1000 entries and 256 KiB per page.",
+      inputSchema: serverLogInputSchema,
+      annotations: readOnly,
     }];
   }
 
   async execute(name: string, args: Record<string, unknown>) {
+    if (name === "logs.server-read") return { handled: true, result: await readServerLogs(args) };
     if (name !== "logs.read") return { handled: false };
     const workerId = required(args.workerId, "workerId");
     const ownerId = required(args.ownerId, "ownerId");

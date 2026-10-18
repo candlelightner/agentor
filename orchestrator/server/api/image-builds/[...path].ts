@@ -4,9 +4,9 @@ import { useImageCatalogManager } from "../../utils/image-catalog";
 defineRouteMeta({
   openAPI: {
     tags: ["Image catalog"],
-    summary: "Inspect, cancel, or stream logs for an image build",
+    summary: "Inspect, cancel, recover a converter, or stream image-build logs",
     description:
-      "Owner-scoped asynchronous build status, cancellation, and redacted incremental logs.",
+      "Owner-scoped build status, cancellation, redacted logs, and explicit cleanup of an acknowledged failed native converter.",
     responses: {
       200: { description: "Image build response" },
       401: { description: "Unauthorized" },
@@ -30,6 +30,12 @@ export default defineEventHandler(async (event) => {
       return manager.publicBuild(id, ctx.user.id, admin);
     if (parts.length === 1 && event.method === "DELETE")
       return manager.cancelBuild(id, ctx.user.id, admin);
+    if (parts.length === 2 && parts[1] === "recover-converter" && event.method === "POST") {
+      const body = await readBody(event);
+      if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length)
+        throw createError({ statusCode: 400, statusMessage: "Converter recovery accepts an empty object only" });
+      return await manager.recoverNativeConverter(id, ctx.user.id, admin);
+    }
     if (parts[1] === "logs" && event.method === "GET") {
       const query = getQuery(event);
       if (query.limit !== undefined || query.format === "json")

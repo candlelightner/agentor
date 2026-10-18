@@ -1,3 +1,4 @@
+import { MANAGED_KILO_PARENT } from './managed-volume-kilo-parent';
 import { createHash } from "node:crypto";
 import {
   MAX_PORTABLE_MANAGED_VOLUMES,
@@ -7,7 +8,7 @@ import {
   type PortableManagedVolumeEntry,
 } from "./portable-managed-volume-format";
 
-export interface PortableManagedVolumeCaptureObservation {
+interface PortableManagedVolumeCaptureFacts {
   volumeId: string;
   dockerName: string;
   target: string;
@@ -17,14 +18,16 @@ export interface PortableManagedVolumeCaptureObservation {
   seeded: boolean;
   state: string;
   physicalExists: boolean;
-  labelsVerified: boolean;
-  driver: string;
-  options: Record<string, string> | null;
   mountSourceVerified: boolean;
   mountDestinationVerified: boolean;
   operationDrift: boolean;
   recoveryDrift: boolean;
 }
+
+export type PortableManagedVolumeCaptureObservation = PortableManagedVolumeCaptureFacts & (
+  { backend?: 'legacy-docker'; labelsVerified: boolean; driver: string; options: Record<string, string> | null } |
+  { backend: 'incus-vm'; nativeAuthorityVerified: boolean }
+);
 
 export interface PortableManagedVolumeCaptureItem {
   entry: PortableManagedVolumeEntry;
@@ -58,9 +61,10 @@ export function planPortableManagedVolumeCapture(
       exclusions.push({ target: observation.target, name: observation.name, reason: "legacy-backup-path" });
       continue;
     }
-    if (!observation.seeded || observation.state !== "ready" || !observation.physicalExists ||
-        !observation.labelsVerified || observation.driver !== "local" ||
-        (observation.options !== null && Object.keys(observation.options).length !== 0) ||
+    const backendVerified = observation.backend === 'incus-vm' ? observation.nativeAuthorityVerified === true
+      : (observation.backend === undefined || observation.backend === 'legacy-docker') && observation.labelsVerified &&
+        observation.driver === 'local' && (observation.options === null || Object.keys(observation.options).length === 0);
+    if (!observation.seeded || observation.state !== "ready" || !observation.physicalExists || !backendVerified ||
         !observation.mountSourceVerified || !observation.mountDestinationVerified ||
         observation.operationDrift || observation.recoveryDrift)
       throw new Error(`Portable managed-volume capture refused inconsistent attached target ${observation.target}`);
@@ -133,7 +137,8 @@ export function planPortableManagedVolumeImport(
     const entry = entries[index]!;
     if (entry.target === "/")
       throw new Error("Portable managed-volume target / is not allowed");
-    if (conflictPaths.some((path) => portablePathsOverlap(entry.target, path)))
+    if (conflictKeys.some(key => input.conflicts[key].some(path => portablePathsOverlap(entry.target, path) &&
+        !(key === 'protectedPaths' && entry.target === MANAGED_KILO_PARENT && path === MANAGED_KILO_PARENT + '/kilo'))))
       throw new Error(`Portable managed-volume target ${entry.target} overlaps destination storage`);
     if (entries.slice(0, index).some((other) => portablePathsOverlap(entry.target, other.target)))
       throw new Error(`Portable managed-volume target ${entry.target} overlaps another imported volume`);

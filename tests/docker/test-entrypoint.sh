@@ -10,14 +10,24 @@ set -euo pipefail
 # The inner Docker data volume is intentionally persistent for build cache but
 # cannot be opened by two dockerd processes. Hold a volume-scoped lock for the
 # entire run and fail clearly instead of racing/corrupting containerd metadata.
+log() { echo -e "\033[1;36m[test-runner]\033[0m $*"; }
+err() { echo -e "\033[1;31m[test-runner]\033[0m $*" >&2; }
+
+# Never borrow an outer daemon, even if this script is invoked incorrectly.
+# A new runner has no socket until its own dockerd creates one below.
+if [ ! -e /.dockerenv ] || [ -S /var/run/docker.sock ] || mountpoint -q /var/run/docker.sock; then
+    err "Docker E2E requires a fresh Docker container without a mounted/existing Docker socket."
+    exit 1
+fi
+unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+export DOCKER_HOST=unix:///var/run/docker.sock
+
 exec 9>/var/lib/docker/.agentor-test-runner.lock
 if ! flock -n 9; then
     echo -e '\033[1;31m[test-runner]\033[0m Another isolated test runner is already using the Docker cache volume.' >&2
     exit 1
 fi
 
-log() { echo -e "\033[1;36m[test-runner]\033[0m $*"; }
-err() { echo -e "\033[1;31m[test-runner]\033[0m $*" >&2; }
 
 # ---------------------------------------------------------------------------
 # Phase 0: private cgroup v2 delegation and nesting
@@ -140,7 +150,6 @@ log "Starting inner dockerd..."
 mkdir -p /var/lib/docker /etc/docker
 # Clean stale state from a previous run on the same persistent volume.
 find /run /var/run -iname 'docker*.pid' -delete 2>/dev/null || true
-rm -f /var/run/docker.sock 2>/dev/null || true
 
 dockerd > /var/log/dockerd.log 2>&1 &
 DOCKERD_PID=$!
@@ -165,6 +174,24 @@ if ! docker info > /dev/null 2>&1; then
     exit 1
 fi
 log "Inner dockerd ready (pid $DOCKERD_PID)."
+# Opt-in destructive restore tests require proof of this exact private daemon.
+# This is a test capability marker, never an installation credential.
+AGENTOR_TEST_DAEMON_ID=$(docker info --format '{{.ID}}')
+export AGENTOR_TEST_DAEMON_ID
+node -e 'require("node:fs").writeFileSync("/run/agentor-isolated-docker.json", JSON.stringify({kind:"agentor-isolated-test-dind",daemonId:process.env.AGENTOR_TEST_DAEMON_ID,hostname:require("node:os").hostname(),dockerRootDir:"/var/lib/docker"}), {mode:0o600})'
+
+
+# Explicit fixture-only daemon namespace: no stack, sweep or image build.
+# The caller supplies a bounded keepalive; all normal test-runner paths remain
+# unchanged. This daemon must use its own data volume and never the host socket.
+if [[ "${AGENTOR_TEST_DOCKER_ONLY:-false}" == "true" ]]; then
+    if [[ $# -eq 0 || ! "${AGENTOR_TEST_DOCKER_ONLY_SECONDS:-3600}" =~ ^[0-9]{1,4}$ ]] \
+        || (( ${AGENTOR_TEST_DOCKER_ONLY_SECONDS:-3600} < 60 || ${AGENTOR_TEST_DOCKER_ONLY_SECONDS:-3600} > 7200 )); then
+        err "Docker-only mode requires a command and a 60–7200 second bound."
+        exit 1
+    fi
+    exec timeout --signal=TERM --kill-after=10s "${AGENTOR_TEST_DOCKER_ONLY_SECONDS:-3600}s" "$@"
+fi
 
 # ---------------------------------------------------------------------------
 # Phase 1.5: wipe stale state from previous runs.
@@ -192,7 +219,6 @@ docker ps -aq --filter "label=agentor.managed=traefik" | xargs -r docker rm -f >
 # Phase 2: build agentor images inside inner dockerd
 # Cached on the persistent /var/lib/docker volume — fast on subsequent runs.
 # ---------------------------------------------------------------------------
-log "Building agentor images (cached after first run)..."
 
 # Retry wrapper — first builds need to pull base images from docker.io,
 # and the inner-DinD network path to that registry can be slow enough to
@@ -201,9 +227,10 @@ log "Building agentor images (cached after first run)..."
 build_with_retry() {
     local img=$1
     local ctx=$2
+    shift 2
     local attempt
     for attempt in 1 2 3 4; do
-        if docker build -t "$img" "$ctx"; then
+        if docker build -t "$img" "$@" "$ctx"; then
             return 0
         fi
         log "Build of $img failed (attempt $attempt/4) — retrying in 5s..."
@@ -213,9 +240,14 @@ build_with_retry() {
     return 1
 }
 
-build_with_retry agentor-worker:latest /src/worker
-build_with_retry agentor-orchestrator:latest /src/orchestrator
-log "Images built."
+if [[ "${AGENTOR_TEST_PREBUILT_IMAGES:-false}" == "true" ]]; then
+    node /usr/local/lib/agentor-load-prebuilt-images.mjs
+else
+    log "Building agentor images (cached after first run)..."
+    build_with_retry agentor-worker:latest /src/worker
+    build_with_retry agentor-orchestrator:latest /src -f /src/orchestrator/Dockerfile
+    log "Images built."
+fi
 
 # Exercise the exact production sizing-helper ceilings before starting the
 # stack. A daemon that accepts ordinary containers but cannot apply one of

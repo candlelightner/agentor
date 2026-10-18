@@ -14,6 +14,18 @@ Automatic image update detection and per-image or bulk updates for production de
 2. Traefik: pull new image → recreate Traefik container (via `TraefikManager.forceRecreate()`) → TLS certs persist on named volume
 3. Orchestrator: pull new image → create replacement container with temp name (`-next`) → spawn a one-shot swapper container (`-swapper`, `AutoRemove: true`) that uses the Docker socket to stop→remove→rename→start the replacement → UI polls `/api/health` until server returns. The swapper is needed because stopping the orchestrator's own container kills the Node.js process, so the remaining steps (remove, create, start) can't run in-process.
 
+Orchestrator replacement retains each network's configured IPAM addresses, MAC,
+network ID, aliases, links, driver options and gateway priority. Docker allocates
+these endpoints only when the replacement starts, after the old container has
+stopped and been removed; private administrative peers therefore retain their
+required addresses without relaxing host-policy checks. Incus-enabled installs
+use [Docker API 1.54](https://docs.docker.com/reference/api/engine/version-history/#v154-api-changes) (Engine 29.3+) for updater reads and writes, matching the
+private administrative networking requirement. Unsupported daemons fail before
+replacement allocation. The swapper uses inspected container IDs, checks every
+Docker response, and uses a 90-second socket timeout for each request. This remains a
+stop/remove/start update: it does not roll back a replacement that fails to
+become healthy. Retain the previous image and configuration for operator recovery.
+
 **Per-image updates:** The apply endpoint accepts an optional `{ images: UpdatableImage[] }` body to pull only specific images. The `UpdatableImage` type (`'orchestrator' | 'worker' | 'traefik'`) is defined in `shared/types.ts`.
 
 **No version numbers** — only image digest hashes (sha256) are compared and displayed. Workers are NOT automatically restarted; they pick up the new image when next created or unarchived.
@@ -252,6 +264,47 @@ For Git recovery, optionally set `GIT_IMAGE_CATALOG_ENCRYPTION_KEY` or preserve 
 
 ## Administrative boundary
 
-The orchestrator generates and pins the trusted administrative overlay (`AGENTOR_ADMIN_WORKER_IMAGE` controls only its server-side name). Its primary Docker network is the internal `agentor-management` network; the orchestrator proxies the existing terminal/editor/desktop services from that network. A dedicated admin-only egress bridge provides outbound package and model API access while keeping the workspace off the ordinary worker network. The MCP address has no published port or Traefik route, and ordinary workers never join the management network. The admin container has no Docker socket, host bind, privilege, or public port. On an explicit rebuild, the invoking administrator becomes the singleton workspace's environment owner and that account's worker environment variables are injected into the recreated container. Codex discovers the MCP through a preconfigured stdio bridge that reads the rotating tmpfs-only workload identity for each request, so no universal management bearer token is persisted in the workspace.
+New and rebuilt global and group administrative workspaces require Incus and use dedicated VMs from the operator-approved base and server-owned administrative overlay. Provisioning fails closed when native authority or readiness cannot be established. Each VM uses its own private bridge and pinned orchestrator peer; the orchestrator proxies terminal/editor/desktop services and binds the management listener to that peer. See [private administrative networking](incus-admin-private-networks.md) for the exact admission and egress policy. Ordinary workers do not join these bridges. Admins receive no host Docker socket, arbitrary host mount or public port. An explicit global-admin rebuild uses the invoking administrator as environment owner while retaining persistent data. Codex's stdio bridge reads the rotating tmpfs-only workload identity for each request.
+
+Retained legacy Docker admins use the internal `agentor-management` network plus a dedicated egress bridge. They may be inspected/stopped; Start/Rebuild requires explicit transfer to native authority, even when Incus is disabled. `AGENTOR_ADMIN_WORKER_IMAGE` controls that server-owned overlay's image name; it does not select a user image for a native admin. Historical Docker admin data requires an operator transfer before native use.
 
 Mutating MCP groups default off. Every invocation rechecks current policy and creates a sanitized audit record. Configuration application uses immutable proposals; dashboard review is available, while confirmation policy belongs to the invoking harness. Worker log bodies are intentionally omitted from MCP responses because generic log text cannot be proven free of bare secrets. Console output redaction is best effort for exact managed worker-local secret values only, not a guarantee for transformed output or account/environment values; console access remains privileged.
+
+### Native worker image updates
+
+With Incus enabled, worker **Apply** stages the registry's immutable OCI digest, verifies its amd64 image ID, and derives the native image through the existing catalog converter/import acknowledgements. It requires the configured `INCUS_CONVERTER_SEED_FINGERPRINT` and a mutable `WORKER_IMAGE` tag; digest-only references require an explicit configuration update. The old Docker tag and approved Incus alias remain in use throughout conversion. Only after a verified native import does Apply compare-and-swap the existing alias and then tag the exact OCI as the Docker default. Concurrent Apply requests share the worker operation. Current platform-admin role is rechecked across asynchronous work.
+
+A conversion failure preserves the old default and its exact recovery receipts. Alias/tag publication spans two daemons: a short mismatch can reject a simultaneous fresh administrative create, and an ambiguous acknowledgement is inspected without automatically resending it. If publication fails before tagging, the Docker update remains available; an explicit Apply retry reuses the settled conversion and already-promoted alias. Unknown converter/import operations still require their existing explicit recovery path. Existing ordinary workers retain their pinned OCI source on rebuild; updating the default does not change their provenance.
+
+If OCI streaming closes early, converter errors retain the phase and bounded guest stderr and wait at most ten seconds for the guest exit before existing cleanup. A zero guest exit does not waive a failed transfer. This improves diagnosis; it does not establish whether a particular guest ran out of memory or disk.
+
+Source/mocked acceptance covers publication order, conversion/publication failure, retry, current authority, concurrent Apply, durable receipts and real local alias HTTP/ETag responses. A live worker Apply followed by fresh ordinary/global/group creation and pinned ordinary rebuild remains required before claiming end-to-end acceptance.
+
+Default promotion records exact approved historical OCI/recipe tuples in the existing private image catalog. Ordinary rebuild uses its original OCI and refreshes only the supported bootstrap; its preflight-selected fingerprint is retained through allocation. Captured old-default backups use that private approval history, or the current operator default, rather than source descriptors alone. Fresh creation records the current default approval so later whole-instance snapshots can retain it. An unavailable original OCI/artifact fails explicitly rather than switching to a newer userspace.
+
+**Apply All updates the orchestrator first** and reports a deferred worker update. After reconnecting, apply the worker update under the new package. Native readiness also compares the approved alias against the current OCI and packaged bootstrap, so an orchestrator-only bootstrap change remains actionable even when registry and Docker digests agree. The UI shows VM preparation separately from OCI digest movement.
+
+Historical archives captured before these private approvals existed may lack proof for a different old OCI in a cold recovery installation. They require an exact retained local approval or an explicitly operator-approved restore source; the portable descriptor alone is insufficient. Local history supports old backups after normal default promotion, and future default creation/promotion includes the approval in subsequent whole-instance snapshots.
+
+Before moving the mutable default, native Apply retains the exact previous local amd64 OCI under `agentor-native-source:sha256-<image-id>`. Existing conflicting tags fail closed; a lost tag response is accepted only after exact readback. This keeps original rebuild userspace through Agentor’s existing dangling-image prune, without re-pulling historical sources or broadening image authority. Removing these retention tags or running an external destructive full prune can still make an original source unavailable.
+
+Canonical Incus workspace and agent-data shares use `io.cache=unsafe` (virtiofsd
+`--cache=always`) so SQLite WAL shared-memory mappings work. These private volumes
+belong to one worker or administrative VM; lifecycle checks reject foreign
+attachments, and offline archive/restore helpers require the owning VM stopped.
+Do not modify their contents through host paths or attach another running guest.
+Explicit stop/device update/start or rebuild is required for existing VMs; the
+application does not change their cache policy automatically. Account Kilo shares,
+host exports and managed selections retain their existing cache mode and may not
+support SQLite WAL. `metadata` alone still uses direct I/O and does not fix WAL.
+
+Codex filters the environment of stdio MCP subprocesses. Worker startup reconciles
+Agentor's canonical MCP commands with explicit `env_vars`: management forwards
+`AGENTOR_MANAGEMENT_MCP_URL`; worker-self forwards `AGENTOR_WORKER_MCP_URL` and
+`ORCHESTRATOR_URL`. Existing allowlists, required flags and unrelated configuration
+are preserved; endpoint values and workload credentials are not written to config.
+Existing custom account homes are amended only when they already contain a
+canonical Agentor MCP command. This startup correction is part of the canonical
+VM bootstrap recipe; fresh native images must be derived from the updated inputs.
+Existing pinned VM images remain retained and existing configurations can be
+reconciled without rebuilding compute.

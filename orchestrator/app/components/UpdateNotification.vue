@@ -8,6 +8,7 @@ const {
   isPruning,
   isRestarting,
   applyErrors,
+  workerUpdateDeferred,
   applyingImages,
   lastPruneResult,
   updatesAvailable,
@@ -62,6 +63,7 @@ const anyApplyingImage = computed(() => applyingImages.value.size > 0);
     </div>
 
     <template v-else>
+      <p v-if="workerUpdateDeferred" class="text-xs text-amber-700 dark:text-amber-400 mb-2">Apply the worker update after the orchestrator reconnects to prepare the updated VM image.</p>
       <!-- Image list (grid: name column auto-sizes, hash column left-aligned) -->
       <div class="grid gap-x-3 gap-y-1.5 text-xs items-center" style="grid-template-columns: auto 1fr">
         <template v-for="{ info, key } in imageList" :key="info.name">
@@ -70,7 +72,8 @@ const anyApplyingImage = computed(() => applyingImages.value.size > 0);
             <template v-if="isProductionMode && info.updateAvailable">
               <div class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse flex-shrink-0" />
               <span class="text-amber-600 dark:text-amber-400 font-mono text-[10px]">
-                {{ shortDigest(info.localDigest) }} &rarr; {{ shortDigest(info.remoteDigest) }}
+                <template v-if="info.nativeUpdateRequired">VM image preparation required</template>
+                <template v-else>{{ shortDigest(info.localDigest) }} &rarr; {{ shortDigest(info.remoteDigest) }}</template>
               </span>
               <button
                 class="ml-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-200 dark:bg-amber-800 text-amber-800 dark:text-amber-200 hover:bg-amber-300 dark:hover:bg-amber-700 disabled:opacity-50"

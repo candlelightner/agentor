@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { formatBytes } from '../utils/format';
+import { effectiveIncusWorkerMemoryLimit, type WorkerMemoryPolicy } from '../../shared/worker-memory';
 import type { EnvironmentInfo, NetworkMode, WorkerSystemEnvVar, ExposeApis, CapabilityInfo, InstructionInfo, CredentialInfo } from '~/types';
 
 const props = defineProps<{
@@ -24,6 +26,17 @@ const form = reactive({
   exposeApis: { portMappings: true, domainMappings: true, usage: true } as ExposeApis,
   enabledCapabilityIds: null as string[] | null,
   enabledInstructionIds: null as string[] | null,
+});
+
+const { data: memoryPolicy } = useFetch<WorkerMemoryPolicy>('/api/worker-memory-policy');
+const effectiveVmMemory = computed(() => {
+  if (!memoryPolicy.value) return 'VM memory policy is unavailable.';
+  try {
+    const cap = form.memoryLimit || memoryPolicy.value.defaultMemoryLimit || undefined;
+    const memory = effectiveIncusWorkerMemoryLimit(cap, memoryPolicy.value.incusDefaultMemoryLimit);
+    const label = /^\d+$/.test(memory) ? formatBytes(Number(memory)).replace(/\b([KMGTPE])B$/, '$1iB') : memory;
+    return `VM memory on next create or rebuild: ${label}.`;
+  } catch { return 'Enter a valid memory size for VM workers (e.g. 4g or 512MiB).'; }
 });
 
 const systemEnvVars = ref<WorkerSystemEnvVar[]>([]);
@@ -163,8 +176,9 @@ function handleSave() {
         <UFormField label="CPU" hint="0 = unrestricted">
           <UInput v-model.number="form.cpuLimit" type="number" :min="0" :step="0.5" placeholder="0" class="w-full" :disabled="readOnly" />
         </UFormField>
-        <UFormField label="Memory" hint="e.g. 4g, 512m, empty = unrestricted">
+        <UFormField label="Memory" hint="e.g. 4g, 512m; empty inherits defaults, zero leaves Docker uncapped">
           <UInput v-model="form.memoryLimit" placeholder="" class="w-full" :disabled="readOnly" />
+          <p data-testid="effective-vm-memory" class="mt-1 text-xs text-gray-500">{{ effectiveVmMemory }}</p>
         </UFormField>
       </div>
     </fieldset>

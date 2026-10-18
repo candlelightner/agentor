@@ -33,6 +33,11 @@ jobs:
           filters: |
             orchestrator:
               - 'orchestrator/**'
+              - 'worker/vm/**'
+              - 'worker/entrypoint.sh'
+              - 'scripts/build-incus-worker-image.sh'
+              - 'scripts/incus-canary.mjs'
+              - '.dockerignore'
               - '.github/workflows/docker-build.yml'
             worker:
               - 'worker/**'
@@ -40,6 +45,9 @@ jobs:
             validation:
               - 'orchestrator/**'
               - 'worker/**'
+              - 'scripts/build-incus-worker-image.sh'
+              - 'scripts/incus-canary.mjs'
+              - '.dockerignore'
               - 'tests/**'
               - 'docker-compose.tests.yml'
               - '.github/workflows/docker-build.yml'
@@ -79,13 +87,32 @@ jobs:
         working-directory: tests
         run: npm ci --no-audit --no-fund
 
+      - name: Install module test system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-utils
+
+      - name: Install locked Playwright Chromium and system dependencies
+        working-directory: tests
+        run: npx --no-install playwright install --with-deps chromium
+
       - name: Typecheck orchestrator
         working-directory: orchestrator
         run: npm run typecheck
 
       - name: Run no-server module and helper tests
         working-directory: tests
-        run: npm run test:modules
+        run: npm run test:modules -- --grep-invert 'api/(incus-admin-restore|incus-derived-image|incus-docker-restore-archive|incus-selected-restore|managed-kilo-parent|portable-pax-size)\.spec\.ts'
+
+      - name: Run root-owned archive metadata fixtures
+        working-directory: tests
+        run: >-
+          sudo -- "$(command -v node)" ./node_modules/@playwright/test/cli.js test
+          --config=playwright.modules.config.ts
+          api/incus-admin-restore.spec.ts api/incus-derived-image.spec.ts
+          api/incus-docker-restore-archive.spec.ts api/incus-selected-restore.spec.ts
+          api/managed-kilo-parent.spec.ts
+          api/portable-pax-size.spec.ts
 
   docker_regression:
     name: Isolated Docker API and UI regression
@@ -200,7 +227,8 @@ jobs:
       - uses: docker/build-push-action@v6
         id: build
         with:
-          context: ./orchestrator
+          context: .
+          file: ./orchestrator/Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ github.repository_owner }}/agentor-orchestrator,push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}

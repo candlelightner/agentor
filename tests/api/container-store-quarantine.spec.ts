@@ -39,6 +39,7 @@ test("managed runtimes without authoritative worker records stay quarantined", a
   manager.setWorkerStore({
     list: () => [],
     findById: () => undefined,
+    get: () => undefined,
   } as any);
 
   await manager.sync();
@@ -70,6 +71,47 @@ function dockerWorker() {
     Labels: { "agentor.id": "worker-1" },
   };
 }
+
+test('native inventory quietly excludes only exact verified stopped retained migration sources', async () => {
+  const logger = (globalThis as any).useLogger;
+  try {
+    for (const scenario of ['retained', 'wrong-id', 'wrong-image', 'running', 'unavailable', 'no-receipt'] as const) {
+      const errors: string[] = [];
+      (globalThis as any).useLogger = () => ({ error(message: string) { errors.push(message); }, warn() {}, info() {}, debug() {} });
+      const source = { containerId: 'a'.repeat(64), imageId: 'sha256:' + 'c'.repeat(64),
+        createdAt: '2026-01-01T00:00:00.000Z', wasRunning: false };
+      const record = { ...workerRecord(), runtimeKind: 'incus-vm' as const,
+        incusMigration: scenario === 'no-receipt' ? undefined : { nonce: '11111111-1111-4111-8111-111111111111',
+          phase: 'retained' as const, source, destinationIncarnation: '22222222-2222-4222-8222-222222222222' } };
+      const before = structuredClone(record), writes: string[] = [];
+      const docker = { ...dockerWorker(), Id: scenario === 'wrong-id' ? 'b'.repeat(64) : source.containerId,
+        ImageID: scenario === 'wrong-image' ? 'sha256:' + 'd'.repeat(64) : source.imageId,
+        State: scenario === 'running' ? 'running' : 'exited' };
+      const manager = new ContainerManager({
+        listContainers: async () => [docker],
+        inspectContainerRuntime: async () => {
+          if (scenario === 'unavailable') throw Error('Docker observation unavailable');
+          return { status: docker.State, running: scenario === 'running' };
+        },
+        probeContainerTask: async () => undefined,
+      } as any, { containerPrefix: 'agentor-worker' } as any);
+      manager.setWorkerStore({
+        list: () => [record], findById: () => record,
+        get: (owner: string, id: string) => owner === record.userId && id === record.id ? record : undefined,
+        upsert: async () => { writes.push('upsert'); },
+        setDesiredRuntimeStatus: async () => { writes.push('desired'); },
+      } as any);
+      await manager.sync();
+      expect(errors, scenario).toEqual(scenario === 'retained' ? [] : [
+        `[container] quarantined Docker runtime with Incus worker identity ${record.id}`,
+      ]);
+      expect(manager.get(record.id), scenario).toMatchObject({ runtimeKind: 'incus-vm',
+        containerId: 'agentor-worker-worker-1', status: 'unknown' });
+      expect(record, scenario).toEqual(before);
+      expect(writes, scenario).toEqual([]);
+    }
+  } finally { (globalThis as any).useLogger = logger; }
+});
 
 test('a late runtime probe overlapping recreation cannot repopulate the stale status cache', async () => {
   let finish!: (value: unknown) => void;
@@ -109,6 +151,7 @@ test("legacy workers persist desired running state after a verified task observa
   manager.setWorkerStore({
     list: () => [record],
     findById: () => record,
+    get: (owner: string, id: string) => owner === record.userId && id === record.id ? record : undefined,
     setDesiredRuntimeStatus: async (_owner: string, _id: string, desired: string) => {
       saved.push(desired);
     },
@@ -142,6 +185,7 @@ test("legacy crash-looping workers retain running intent for managed bootstrap r
   manager.setWorkerStore({
     list: () => [record],
     findById: () => record,
+    get: (owner: string, id: string) => owner === record.userId && id === record.id ? record : undefined,
     setDesiredRuntimeStatus: async (_owner: string, _id: string, desired: string) => {
       saved.push(desired);
     },
@@ -190,6 +234,7 @@ test("a directly started secret worker is unknown until its bootstrap handshake 
   manager.setWorkerStore({
     list: () => [record],
     findById: () => record,
+    get: (owner: string, id: string) => owner === record.userId && id === record.id ? record : undefined,
   } as any);
 
   await manager.sync();
@@ -230,6 +275,7 @@ test("a failed live-task probe exposes unknown rather than stale running health"
   manager.setWorkerStore({
     list: () => [record],
     findById: () => record,
+    get: (owner: string, id: string) => owner === record.userId && id === record.id ? record : undefined,
     setDesiredRuntimeStatus: async () => {
       throw new Error("unknown observations must not become desired state");
     },
@@ -271,6 +317,7 @@ test("sync cannot overwrite a lifecycle replacement with its older Docker snapsh
   manager.setWorkerStore({
     list: () => [record],
     findById: () => record,
+    get: (owner: string, id: string) => owner === record.userId && id === record.id ? record : undefined,
     setDesiredRuntimeStatus: async () => undefined,
   } as any);
   (manager as any).containers.set("worker-1", {
@@ -319,7 +366,8 @@ for (const delayedPhase of ['list', 'inspect', 'missing']) test(`sync starting d
     listContainers: async () => { if (delayedPhase !== 'inspect') await delay(); return delayedPhase === 'missing' ? [] : [dockerWorker()]; },
     inspectContainerRuntime: async () => { if (delayedPhase === 'inspect') await delay(); return { status: 'created', running: false }; },
   } as any, { containerPrefix: 'agentor-worker' } as any);
-  manager.setWorkerStore({ list: () => [record], findById: () => record } as any);
+  manager.setWorkerStore({ list: () => [record], findById: () => record,
+    get: (owner: string, id: string) => owner === record.userId && id === record.id ? record : undefined } as any);
   const current = { ...record, containerId: 'docker-worker-1', containerName: 'agentor-worker-worker-1', status: 'starting' };
   (manager as any).containers.set(record.id, current);
   let syncing!: Promise<void>;
@@ -350,7 +398,8 @@ test("sync never revives an archived worker from an older Docker list response",
     } as any,
     { containerPrefix: "agentor-worker" } as any,
   );
-  manager.setWorkerStore({ list: () => [record], findById: () => record } as any);
+  manager.setWorkerStore({ list: () => [record], findById: () => record,
+    get: (owner: string, id: string) => owner === record.userId && id === record.id ? record : undefined } as any);
   const syncing = manager.sync();
   for (let i = 0; !inspecting && i < 10; i++) await Promise.resolve();
   expect(inspecting).toBe(true);

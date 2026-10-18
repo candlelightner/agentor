@@ -12,6 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
+import { isDeepStrictEqual } from 'node:util';
 import { createGzip } from "node:zlib";
 import type { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -20,7 +21,6 @@ import { MAX_BACKUP_PROVIDER_OBJECT_BYTES, publicBackupFailure } from "./backup-
 import type { BackupProviderKind } from "./backup-types";
 import { backupInstallationId } from "./backup-installation";
 import { useBackupManager, type BackupManager } from "./backup-manager";
-import { useManagedVolumeManager } from "./managed-volume-manager";
 import {
   createInstanceDataArchive,
   inspectInstanceBundle,
@@ -46,17 +46,27 @@ import {
   type InstanceRestoreOptions,
   type InstanceRestorePreflight,
   type InstanceBackupVolumeManifest,
+  type InstanceBackupVolumeProgress,
   type RemoteInstanceBackupRecord,
 } from "./instance-backup-types";
 import { getAuthDb } from "./auth";
 import { administrativeWorkspaceResourceNames } from "./admin-workspace-runtime";
-import { sanitizeBackupPathTarPayload } from "./worker-export";
+import { IncusAdminBackup, assertAdministrativeSnapshotSettled } from "./incus-admin-backup";
+import { sanitizeBackupPathTarGzip } from "./worker-export";
 import { useConfig, useLogger } from "./services";
 import {
   beginInstanceRestore,
   beginInstanceSnapshot,
 } from "./instance-snapshot-gate";
 import { withOperationDeadline } from "./operation-deadline";
+import { withOwnerWorkerLifecycleMutation } from './worker-lifecycle-coordinator';
+import { managedVolumeRuntimeKind, assertIncusLiveResolved } from './managed-volume-store';
+import { IncusError } from './incus-client';
+import { incusWorkerVolumeName } from './incus-worker-storage';
+import { useManagedVolumeManager } from './managed-volume-manager';
+import { administrativeRuntimeOwner } from './admin-native-authority';
+import { snapshotIncusWorkerBackupRuntime } from './worker-backup-runtime';
+import type { AdministrativeWorkspaceRecord } from './admin-workspace-store';
 
 const MAX_CONCURRENT_JOBS = 1;
 const MAX_LOG_LINES = 1000;
@@ -64,6 +74,18 @@ const REMOTE_HEADER_BYTES = 16 * 1024;
 const INSTANCE_DOCKER_READ_TIMEOUT_MS = 8_000;
 const INSTANCE_DOCKER_MUTATION_TIMEOUT_MS = 30_000;
 const INSTANCE_RESTORE_HELPER_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
+function instanceRequiresNativeRestore(manifest: InstanceBackupManifest) {
+  return manifest.formatVersion === 2 || manifest.volumes.some(volume => ['admin-workspace', 'admin-agent-data'].includes(volume.kind));
+}
+
+function assertSupportedInstanceRestore(manifest: InstanceBackupManifest, options: InstanceRestoreOptions) {
+  if (instanceRequiresNativeRestore(manifest) && !options.restoreDockerVolumes)
+    throw Object.assign(new Error('Native instance restore requires canonical persistent filesystem data. Enable persistent volume restoration; disposable VM roots cannot substitute for it.'),
+      { statusCode: 409, code: 'INSTANCE_RESTORE_NATIVE_DATA_REQUIRED' });
+  if (![1, 2].includes(manifest.formatVersion) || manifest.formatVersion === 1 && manifest.volumes.some(volume => volume.runtime))
+    throw new Error('Unsupported instance restore format');
+}
 
 interface QueuedOperation {
   jobId: string;
@@ -76,6 +98,7 @@ interface VolumeCandidate {
   ownerId?: string;
   workerId?: string;
   groupId?: string;
+  runtime?: InstanceBackupVolumeManifest['runtime'];
 }
 
 export interface InstanceBackupManagerOptions {
@@ -92,6 +115,8 @@ export interface InstanceBackupManagerOptions {
     hostMounts: InstanceBackupManifest["hostMounts"];
     images: InstanceBackupManifest["images"];
     storage: InstanceBackupManifest["storage"];
+    /** Gate native control-plane records even if filesystem bytes are omitted. */
+    nativeRuntime?: boolean;
   }>;
 }
 
@@ -107,11 +132,13 @@ export class InstanceBackupManager {
   private readonly logError: (message: string) => void;
   private readonly inventoryOverride?: InstanceBackupManagerOptions["inventory"];
   private initialized?: Promise<void>;
+  private startupChecked?: Promise<void>;
   private accepting = true;
   private active = 0;
   private queue: QueuedOperation[] = [];
   private controllers = new Map<string, AbortController>();
   private tasks = new Map<string, Promise<void>>();
+  private volumeProgress = new Map<string, InstanceBackupVolumeProgress>();
   private restoreBarriers = new Map<string, () => void>();
 
   constructor(options: InstanceBackupManagerOptions = {}) {
@@ -142,9 +169,13 @@ export class InstanceBackupManager {
       mkdir(this.stagingDir, { recursive: true, mode: 0o700 }),
       this.store.init(),
     ]);
+    const held = this.store.listJobs().filter(restoreMayOwnStage);
+    for (const job of held) this.restoreBarriers.set(job.id, beginInstanceRestore(job.id));
+    const retained = new Set(held.map(job => `restore-${job.id}`));
     for (const name of await readdir(this.stagingDir).catch(() => []))
-      await rm(join(this.stagingDir, name), { recursive: true, force: true });
+      if (!retained.has(name)) await rm(join(this.stagingDir, name), { recursive: true, force: true });
     for (const job of this.store.listJobs()) {
+      if (restoreMayOwnStage(job)) continue; // Never replay or overwrite a helper-owned ledger.
       if (job.status !== "queued" && job.status !== "running") continue;
       const stamp = new Date().toISOString();
       await this.store.saveJob({
@@ -161,12 +192,16 @@ export class InstanceBackupManager {
         logs: appendLog(job.logs, "Operation interrupted by orchestrator restart."),
       });
     }
+    // Settle acknowledged completed handoffs before the mutation barrier can
+    // block sign-in. Reuse exact terminal observation, never waive auth writes.
+    await this.refreshRestoreHolds();
   }
 
   async list(userId: string) {
     await this.init();
+    await this.refreshRestoreHolds();
     return {
-      jobs: this.store.listJobs().filter((job) => job.userId === userId).map(publicJob),
+      jobs: this.store.listJobs().filter((job) => job.userId === userId).map(job => this.publicJobWithProgress(job)),
       artifacts: this.store
         .listArtifacts()
         .filter((artifact) => artifact.userId === userId),
@@ -182,12 +217,20 @@ export class InstanceBackupManager {
 
   async getJob(id: string) {
     await this.init();
+    await this.refreshRestoreHolds();
     const job = this.store.getJob(id);
-    return job ? publicJob(job) : undefined;
+    return job ? this.publicJobWithProgress(job) : undefined;
+  }
+
+  private publicJobWithProgress(job: InstanceBackupJob): PublicInstanceBackupJob {
+    const result = publicJob(job), progress = this.volumeProgress.get(job.id);
+    if (job.status === "running" && progress) result.volumeProgress = { ...progress };
+    return result;
   }
 
   async logs(id: string, after = 0, limit = 100) {
     await this.init();
+    await this.refreshRestoreHolds();
     const job = this.store.getJob(id);
     if (!job) return undefined;
     const start = Number.isSafeInteger(after) ? Math.max(0, after) : 0;
@@ -390,6 +433,7 @@ export class InstanceBackupManager {
         statusCode: 404,
       });
     const restoreOptions = normalizeRestoreOptions(options, false);
+    assertSupportedInstanceRestore(artifact.manifest, restoreOptions);
     const services = await import("./services");
     const adminStore = await import("./admin-workspace-store");
     const storage = services.useStorageManager();
@@ -402,6 +446,9 @@ export class InstanceBackupManager {
       .list()
       .filter((worker) => worker.status === "running" || worker.status === "creating");
     const persistedWorkers = services.useWorkerStore().list();
+    if (persistedWorkers.some(worker => worker.incusMigration && worker.incusMigration.phase !== 'retained'))
+      throw Object.assign(new Error('Resolve incomplete worker migration before whole-instance recovery planning'),
+        { statusCode: 409, code: 'WORKER_MIGRATION_RECOVERY_REQUIRED' });
     const admin = adminStore.useAdminWorkspaceStore().getRecord();
     const groupAdmins = services
       .useWorkerGroupStore()
@@ -426,8 +473,68 @@ export class InstanceBackupManager {
         `Worker container prefix differs: expected ${manifest.storage.containerPrefix}. Preserve CONTAINER_PREFIX before restore so named volumes remain addressable.`,
       );
     const volumeConflicts: string[] = [];
+    if (instanceRequiresNativeRestore(manifest)) {
+      const config = useConfig(), client = services.useIncusClient();
+      try {
+        if (!config.incusEnabled || !config.incusEndpoint.startsWith('https://') ||
+            !config.incusClientCertPath || !config.incusClientKeyPath || !config.incusServerCertPath ||
+            !config.incusProject || config.incusProject === 'default' || !config.incusStoragePool || !config.incusNetwork)
+          throw new Error('Native restore requires enabled restricted HTTPS/mTLS Incus configuration');
+        const readiness = await client.getReadiness();
+        if (!readiness.ready || readiness.auth !== 'trusted' || readiness.project !== config.incusProject)
+          throw new Error('Native restore destination is not ready in the configured Incus project');
+        const project = await client.request<{ name: string; config: Record<string, string> }>('GET',
+          '/1.0/projects/' + encodeURIComponent(config.incusProject));
+        if (project.name !== config.incusProject || project.config.restricted !== 'true' ||
+            project.config['features.storage.volumes'] !== 'true' || project.config['restricted.devices.nic'] !== 'managed' ||
+            !(project.config['restricted.networks.access'] ?? '').split(',').map(value => value.trim()).includes(config.incusNetwork))
+          throw new Error('Native restore requires the configured restricted project, managed NICs, worker network and private storage');
+        await client.request('GET', '/1.0/storage-pools/' + encodeURIComponent(config.incusStoragePool));
+        const network = await client.getNetwork(config.incusNetwork);
+        if (!network.managed || network.type !== 'bridge' || network.name !== config.incusNetwork)
+          throw new Error('The configured native worker network is unavailable');
+
+        // Descriptive bundle IDs determine names, never project/pool/device
+        // authority. Probe hidden core roles too: omitted agent/Docker data
+        // must not overwrite destination state created outside this manifest.
+        const native = manifest.volumes.filter(volume => volume.runtime);
+        const workers = new Map<string, string>(), names = new Set(native.map(volume => volume.name));
+        for (const volume of native) {
+          if (!volume.workerId || !volume.ownerId) throw new Error('Native restore storage identity is incomplete');
+          const owner = workers.get(volume.workerId);
+          if (owner && owner !== volume.ownerId) throw new Error('Native restore worker ownership is ambiguous');
+          if (!('administrative' in volume.runtime!)) workers.set(volume.workerId, volume.ownerId);
+        }
+        const absent = async (load: () => Promise<unknown>, name: string, volume: boolean) => {
+          try {
+            await load();
+            if (volume) volumeConflicts.push(name);
+            else blockers.push(`Destination Incus instance ${name} already exists; safe restore will not replace it.`);
+          } catch (error) {
+            if (!(error instanceof IncusError) || error.statusCode !== 404) throw error;
+          }
+        };
+        for (const [id, userId] of workers) {
+          const containerName = config.containerPrefix + '-' + id;
+          for (const role of ['workspace', 'agents', 'docker'] as const)
+            names.add(incusWorkerVolumeName({ id, userId, containerName }, config.containerPrefix, role));
+          await absent(() => client.getInstance(containerName), containerName, false);
+        }
+        for (const volume of native) if (volume.runtime && 'administrative' in volume.runtime && volume.runtime.role !== 'managed') {
+          const instanceName = volume.name.slice(0, -('-' + volume.runtime.role).length);
+          await absent(() => client.getInstance(instanceName), instanceName, false);
+          names.add(instanceName + '-workspace'); names.add(instanceName + '-agents');
+        }
+        for (const name of names) await absent(() => client.getCustomVolume(config.incusStoragePool, name), name, true);
+      } catch {
+        // Never reinterpret inaccessible native resources as absent or fall
+        // through to Docker. Staged helper freshness remains definitive.
+        blockers.push('Incus restore readiness or destination absence could not be verified. Check the configured restricted project, mTLS credentials, network and storage pool before retrying.');
+      }
+    }
+    const legacyVolumes = manifest.volumes.filter(volume => !volume.runtime && !['admin-workspace', 'admin-agent-data'].includes(volume.kind));
     if (restoreOptions.restoreDockerVolumes) {
-      const existingVolumes = new Set(
+      const existingVolumes = legacyVolumes.length ? new Set(
         ((
           await withOperationDeadline(
             (operationSignal) => this.docker.listVolumes({
@@ -439,13 +546,13 @@ export class InstanceBackupManager {
         ).Volumes ?? [])
           .map((volume) => volume.Name)
           .filter((name): name is string => Boolean(name)),
-      );
-      for (const volume of manifest.volumes)
+      ) : new Set<string>();
+      for (const volume of legacyVolumes)
         if (existingVolumes.has(volume.name)) volumeConflicts.push(volume.name);
     }
     if (volumeConflicts.length)
       blockers.push(
-        "One or more destination Docker volumes already exist. Agentor will not overwrite them during a safe instance restore.",
+        "One or more destination persistent volumes already exist. Agentor will not overwrite them during a safe instance restore.",
       );
     if (!restoreOptions.restoreHostMountPolicies && manifest.hostMounts.configuredPaths.length)
       warnings.push(
@@ -541,7 +648,7 @@ export class InstanceBackupManager {
     if (!current) throw Object.assign(new Error("Instance backup job not found"), { statusCode: 404 });
     if (["succeeded", "failed", "cancelled"].includes(current.status))
       return publicJob(current);
-    if (current.operation === "restore" && current.phase === "applying")
+    if (restoreMayOwnStage(current))
       throw Object.assign(
         new Error(
           "Instance restore can no longer be cancelled after control has been handed to the restart helper.",
@@ -599,8 +706,10 @@ export class InstanceBackupManager {
     this.accepting = false;
     for (const controller of this.controllers.values())
       controller.abort(Object.assign(new Error("Orchestrator is stopping"), { name: "AbortError" }));
-    for (const jobId of [...this.restoreBarriers.keys()])
-      this.releaseRestoreBarrier(jobId);
+    for (const jobId of [...this.restoreBarriers.keys()]) {
+      const job = this.store.getJob(jobId);
+      if (job && !restoreMayOwnStage(job)) this.releaseRestoreBarrier(jobId);
+    }
   }
 
   private async runCreate(
@@ -649,27 +758,52 @@ export class InstanceBackupManager {
           includeVolumeCandidate(candidate, options),
         );
         let index = 0;
+        const captured = new Set<string>();
         for (const candidate of selectedVolumes) {
           signal.throwIfAborted();
-          const output = join(stage, `volume-${index}.tar.gz`);
-          const snapshotted = await this.snapshotVolume(candidate.name, output, signal);
-          if (!snapshotted) continue;
-          const info = await stat(output);
-          volumes.push({
-            manifest: {
-              ...candidate,
-              archive: instanceVolumeArchiveName(candidate.name),
-              sha256: await sha256File(output),
-              size: info.size,
-            },
-            path: output,
-          });
-          index += 1;
+          if (captured.has(candidate.name)) continue;
+          const group = candidate.runtime && candidate.runtime.role !== 'docker' && candidate.runtime.role !== 'managed'
+            ? selectedVolumes.filter(other => other.workerId === candidate.workerId && other.ownerId === candidate.ownerId &&
+              other.runtime && ('administrative' in other.runtime) === ('administrative' in candidate.runtime!) &&
+              (other.runtime.role === 'workspace' || other.runtime.role === 'agents')) : [candidate];
+          const outputs = group.map((volume, offset) => ({ volume, path: join(stage, `volume-${index + offset}.tar.gz`) }));
+          if (candidate.runtime) await this.snapshotNativeVolumes(outputs, signal);
+          else {
+            await this.phase(job, "volume-snapshot", 25 + Math.floor((index / Math.max(1, selectedVolumes.length)) * 35),
+              `Streaming persistent volume ${index + 1} of ${selectedVolumes.length}.`);
+            const progress: InstanceBackupVolumeProgress = {
+              name: candidate.name, index: index + 1, count: selectedVolumes.length, phase: "sanitizing-compressing",
+              uncompressedBytes: 0, expectedBytes: null, bytesPerSecond: null, percentage: null, etaSeconds: null,
+            };
+            this.volumeProgress.set(job.id, progress);
+            const started = performance.now();
+            try {
+              if (!await this.snapshotVolume(candidate.name, outputs[0]!.path, signal, bytes => {
+                progress.uncompressedBytes = Math.max(progress.uncompressedBytes, bytes);
+                const seconds = (performance.now() - started) / 1000;
+                progress.bytesPerSecond = seconds >= 1 ? progress.uncompressedBytes / seconds : null;
+              })) continue;
+            } finally { this.volumeProgress.delete(job.id); }
+          }
+          for (const { volume, path: output } of outputs) {
+            const info = await stat(output);
+            volumes.push({
+              manifest: {
+                ...volume,
+                archive: instanceVolumeArchiveName(volume.name),
+                sha256: await sha256File(output),
+                size: info.size,
+              },
+              path: output,
+            });
+            captured.add(volume.name);
+            index += 1;
+          }
           await this.phase(
             job,
             "volume-snapshot",
             25 + Math.floor((index / Math.max(1, selectedVolumes.length)) * 35),
-            `Snapshotted persistent Docker volume ${index} of ${selectedVolumes.length}.`,
+            `Snapshotted persistent volume ${index} of ${selectedVolumes.length}.`,
           );
         }
       }
@@ -677,9 +811,10 @@ export class InstanceBackupManager {
       releaseSnapshot = undefined;
       const createdAt = new Date().toISOString();
       const sourceInstallationId = await backupInstallationId(this.dataDir);
+      const formatVersion = inventory.nativeRuntime || inventory.volumes.some(volume => volume.runtime) ? 2 : 1;
       const manifest: InstanceBackupManifest = {
         kind: "agentor-instance-backup",
-        formatVersion: 1,
+        formatVersion,
         backupId: job.id,
         sourceInstallationId,
         createdByUserId: job.userId,
@@ -713,7 +848,7 @@ export class InstanceBackupManager {
           backupId: job.id,
           sourceInstallationId,
           createdAt,
-          formatVersion: 1,
+          formatVersion,
         },
         (bytes) => {
           job.bytesProcessed = bytes;
@@ -743,7 +878,7 @@ export class InstanceBackupManager {
           {
             artifactKind: "instance",
             artifactId: job.id,
-            formatVersion: 1,
+            formatVersion,
             keyFingerprint: recovery.fingerprint,
             integritySha256: encryptedResult.sha256,
             createdAt,
@@ -770,7 +905,7 @@ export class InstanceBackupManager {
         sha256: encryptedResult.sha256,
         keyFingerprint: recovery.fingerprint,
         sourceInstallationId,
-        formatVersion: 1,
+        formatVersion,
         integrityStatus: "verified",
         provenance: "local",
         manifest,
@@ -937,7 +1072,8 @@ export class InstanceBackupManager {
       if (
         inspected.manifest.backupId !== header.metadata.backupId ||
         inspected.manifest.sourceInstallationId !==
-          header.metadata.sourceInstallationId
+          header.metadata.sourceInstallationId || inspected.manifest.formatVersion !== header.metadata.formatVersion ||
+        inspected.manifest.createdAt !== header.metadata.createdAt
       )
         throw new Error("Instance backup header does not match its authenticated manifest");
       const localPath = this.artifactPath(inspected.manifest.backupId);
@@ -976,7 +1112,7 @@ export class InstanceBackupManager {
         sha256: digest,
         keyFingerprint: header.keyFingerprint,
         sourceInstallationId: inspected.manifest.sourceInstallationId,
-        formatVersion: 1,
+        formatVersion: inspected.manifest.formatVersion,
         integrityStatus: "verified",
         provenance: "remote-adopted",
         manifest: inspected.manifest,
@@ -1033,7 +1169,8 @@ export class InstanceBackupManager {
       const inspected = await inspectInstanceBundle(bundle, unpacked, signal);
       if (
         inspected.manifest.backupId !== header.metadata.backupId ||
-        inspected.manifest.sourceInstallationId !== header.metadata.sourceInstallationId
+        inspected.manifest.sourceInstallationId !== header.metadata.sourceInstallationId ||
+        inspected.manifest.formatVersion !== header.metadata.formatVersion || inspected.manifest.createdAt !== header.metadata.createdAt
       )
         throw new Error("Instance backup header does not match its authenticated manifest");
       const digest = await encryptedInstancePayloadSha256(encrypted, signal);
@@ -1071,7 +1208,7 @@ export class InstanceBackupManager {
         sha256: digest,
         keyFingerprint: header.keyFingerprint,
         sourceInstallationId: inspected.manifest.sourceInstallationId,
-        formatVersion: 1,
+        formatVersion: inspected.manifest.formatVersion,
         integrityStatus: "verified",
         provenance: "remote-adopted",
         manifest: inspected.manifest,
@@ -1126,9 +1263,14 @@ export class InstanceBackupManager {
       const inspected = await inspectInstanceBundle(bundle, unpacked, signal);
       if (
         inspected.manifest.backupId !== artifact.id ||
-        inspected.manifest.sourceInstallationId !== artifact.sourceInstallationId
+        inspected.manifest.sourceInstallationId !== artifact.sourceInstallationId ||
+        inspected.manifest.formatVersion !== artifact.formatVersion || inspected.manifest.createdAt !== artifact.createdAt ||
+        inspected.manifest.backupId !== header.metadata.backupId ||
+        inspected.manifest.sourceInstallationId !== header.metadata.sourceInstallationId ||
+        inspected.manifest.formatVersion !== header.metadata.formatVersion || inspected.manifest.createdAt !== header.metadata.createdAt
       )
         throw new Error("Retained instance artifact identity does not match its manifest");
+      assertSupportedInstanceRestore(inspected.manifest, options);
       const preflight = await this.restorePreflight(job.userId, artifact.id, options);
       if (!preflight.ready)
         throw Object.assign(new Error(preflight.blockers.join(" ")), {
@@ -1137,6 +1279,7 @@ export class InstanceBackupManager {
         });
       const plan = {
         version: 1,
+        formatVersion: instanceRequiresNativeRestore(inspected.manifest) ? 2 : inspected.manifest.formatVersion,
         jobId: job.id,
         dataArchive: inspected.dataArchivePath,
         volumes: options.restoreDockerVolumes
@@ -1145,12 +1288,16 @@ export class InstanceBackupManager {
               archive: inspected.volumeArchives.get(volume.name),
               kind: volume.kind,
               ...(volume.workerId ? { workerId: volume.workerId } : {}),
+              ...(volume.groupId ? { groupId: volume.groupId } : {}),
+              ...(volume.ownerId ? { ownerId: volume.ownerId } : {}),
+              ...(volume.runtime ? { runtime: volume.runtime } : {}),
             }))
           : [],
         restoreHostMountPolicies: options.restoreHostMountPolicies,
         sourceInstallationId: inspected.manifest.sourceInstallationId,
         restoredOwnerId: inspected.manifest.createdByUserId,
         stagingOwnerId: job.userId,
+        ...(instanceRequiresNativeRestore(inspected.manifest) ? { manifest: inspected.manifest } : {}),
       };
       if (plan.volumes.some((volume) => !volume.archive))
         throw new Error("Instance restore staging is missing a declared volume archive");
@@ -1172,11 +1319,14 @@ export class InstanceBackupManager {
           70,
           "Controlled helper started and owns the staged restore.",
         );
-      });
+      }, instanceRequiresNativeRestore(inspected.manifest));
       // The helper owns the terminal status because this process is about to be
       // stopped. It updates the persisted job before restarting the orchestrator.
+    } catch (error) {
+      if ((error as { code?: string })?.code === 'INSTANCE_RESTORE_HELPER_NOT_STARTED') helperOwnsStage = false;
+      throw error;
     } finally {
-      // Before a successful helper start this process owns all decrypted data.
+      // Ownership transfers BEFORE a start request can execute remotely.
       // Never retain a plaintext auth.db/control-plane bundle after a failed
       // preflight, cancellation, or helper-launch failure. Once the helper has
       // started it alone owns the stage and may still need it after this
@@ -1191,6 +1341,7 @@ export class InstanceBackupManager {
     stage: string,
     signal: AbortSignal,
     onHandoff: () => Promise<void>,
+    native = false,
   ) {
     const hostname = process.env.HOSTNAME;
     if (!hostname) throw new Error("Orchestrator container identity is unavailable");
@@ -1218,28 +1369,76 @@ export class InstanceBackupManager {
         Target: this.dataDir,
       } as Docker.MountSettings);
     else throw new Error("Unsupported orchestrator data mount type");
+    const environment = [
+      `AGENTOR_INSTANCE_RESTORE_JOB=${job.id}`,
+      `AGENTOR_INSTANCE_RESTORE_STAGE=${stage}`,
+      `AGENTOR_INSTANCE_RESTORE_DATA_DIR=${this.dataDir}`,
+      `AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR=${current.Id}`,
+    ];
+    let network = 'none';
+    let extraHosts: string[] | undefined;
+    if (native) {
+      const config = useConfig();
+      if (!config.incusEnabled || !config.incusEndpoint.startsWith('https://') ||
+          !config.dockerNetwork || !current.NetworkSettings?.Networks?.[config.dockerNetwork])
+        throw new Error('Native restore requires current restricted Incus configuration and the verified control-plane network');
+      network = config.dockerNetwork;
+      const hosts = new Set([config.incusEndpoint, ...(config.incusNetworkHostEndpoint ? [config.incusNetworkHostEndpoint] : [])]
+        .map(endpoint => new URL(endpoint).hostname));
+      // Preserve only operator-defined resolution for the two fixed endpoints,
+      // not arbitrary bindings from restored data or the full environment.
+      extraHosts = current.HostConfig?.ExtraHosts?.filter((entry: string) =>
+        [...hosts].some(host => entry.startsWith(host + ':')));
+      environment.push('AGENTOR_INSTANCE_RESTORE_NATIVE=true');
+      const fields = {
+        WORKER_IMAGE: config.workerImage, WORKER_IMAGE_PREFIX: config.workerImagePrefix,
+        CONTAINER_PREFIX: config.containerPrefix, INCUS_ENDPOINT: config.incusEndpoint, INCUS_PROJECT: config.incusProject,
+        INCUS_CLIENT_CERT_PATH: config.incusClientCertPath, INCUS_CLIENT_KEY_PATH: config.incusClientKeyPath,
+        INCUS_SERVER_CERT_PATH: config.incusServerCertPath, INCUS_NETWORK: config.incusNetwork,
+        INCUS_STORAGE_POOL: config.incusStoragePool, INCUS_WORKER_IMAGE: config.incusWorkerImage,
+        INCUS_CONVERTER_SEED_FINGERPRINT: config.incusConverterSeedFingerprint || '',
+        INCUS_CONVERTER_STORAGE_POOL: config.incusConverterStoragePool || '',
+        INCUS_DOCKER_VOLUME_SIZE: config.incusDockerVolumeSize, INCUS_INTERNAL_GATEWAY_URL: config.incusInternalGatewayUrl,
+        INCUS_NETWORK_HOST_ENDPOINT: config.incusNetworkHostEndpoint || '',
+        INCUS_NETWORK_HOST_SERVER_CERT_PATH: config.incusNetworkHostServerCertPath || '',
+      };
+      environment.push(...Object.entries(fields).map(([key, value]) => `${key}=${value}`));
+      if (process.env.WORKER_CONFIG_ENCRYPTION_KEY)
+        environment.push(`WORKER_CONFIG_ENCRYPTION_KEY=${process.env.WORKER_CONFIG_ENCRYPTION_KEY}`);
+      const credentials = new Set([config.incusClientCertPath, config.incusClientKeyPath, config.incusServerCertPath,
+        ...(config.incusNetworkHostServerCertPath ? [config.incusNetworkHostServerCertPath] : [])]);
+      for (const path of credentials) {
+        if (!path.startsWith('/') || path === '/' || path.includes('\0'))
+          throw new Error('Native restore requires explicit credential file mounts');
+        const source = current.Mounts?.filter(mount => mount.Type === 'bind' && mount.Destination &&
+          (path === mount.Destination || path.startsWith(mount.Destination.replace(/\/$/, '') + '/')))
+          .sort((a, b) => b.Destination.length - a.Destination.length)[0];
+        if (!source?.Source || !source.Source.startsWith('/'))
+          throw new Error('Native restore credentials must use operator-controlled bind mounts');
+        mounts.push({ Type: 'bind', Source: join(source.Source, path.slice(source.Destination.length)),
+          Target: path, ReadOnly: true } as Docker.MountSettings);
+      }
+    }
+    if (!/^sha256:[a-f0-9]{64}$/.test(current.Image))
+      throw new Error('Restore requires the inspected immutable orchestrator image');
     const helper = await withOperationDeadline((operationSignal) => this.docker.createContainer({
-      Image: current.Config.Image,
+      Image: current.Image,
       name: `agentor-instance-restore-${job.id}`,
       User: "0:0",
       Cmd: ["node", ".output/server/instance-restore-helper.mjs"],
       WorkingDir: "/app",
-      Env: [
-        `AGENTOR_INSTANCE_RESTORE_JOB=${job.id}`,
-        `AGENTOR_INSTANCE_RESTORE_STAGE=${stage}`,
-        `AGENTOR_INSTANCE_RESTORE_DATA_DIR=${this.dataDir}`,
-        `AGENTOR_INSTANCE_RESTORE_ORCHESTRATOR=${current.Id}`,
-      ],
-      NetworkDisabled: true,
+      Env: environment,
+      NetworkDisabled: !native,
       Labels: {
         "agentor.instance-restore-helper": "true",
         "agentor.instance-restore-job": job.id,
       },
       HostConfig: {
-        NetworkMode: "none",
+        NetworkMode: network,
+        ...(extraHosts?.length ? { ExtraHosts: extraHosts } : {}),
         Binds: binds,
         Mounts: mounts.length ? mounts : undefined,
-        AutoRemove: true,
+        AutoRemove: false, // Exact terminal evidence survives a parent restart/lost start acknowledgement.
         Init: true,
         ReadonlyRootfs: true,
         CapDrop: ["ALL"],
@@ -1254,7 +1453,11 @@ export class InstanceBackupManager {
       },
       abortSignal: operationSignal,
     }), INSTANCE_DOCKER_MUTATION_TIMEOUT_MS, "Docker instance-restore helper creation", signal);
+    if (!/^[a-f0-9]{64}$/.test(helper.id)) throw new Error('Restore helper creation lacks an exact identity');
+    job.restoreHelper = { containerId: helper.id, imageId: current.Image };
     try {
+      await onHandoff();
+      signal.throwIfAborted();
       await withOperationDeadline(
         (operationSignal) => helper.start({ abortSignal: operationSignal }),
         INSTANCE_DOCKER_MUTATION_TIMEOUT_MS,
@@ -1262,14 +1465,18 @@ export class InstanceBackupManager {
         signal,
       );
     } catch (error) {
-      await withOperationDeadline(
-        (operationSignal) => helper.remove({ force: true, abortSignal: operationSignal } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
-        INSTANCE_DOCKER_MUTATION_TIMEOUT_MS,
-        "Docker instance-restore failed-start cleanup",
-      ).catch(() => {});
-      throw error;
+      const observed = await this.inspectRestoreHelper(job).catch(() => undefined);
+      if (observed && restoreHelperNeverStarted(observed)) {
+        await withOperationDeadline((operationSignal) => helper.remove({ force: false, abortSignal: operationSignal } as
+          Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }), INSTANCE_DOCKER_MUTATION_TIMEOUT_MS,
+          'Docker exact never-started restore helper cleanup');
+        delete job.restoreHelper;
+        throw Object.assign(new Error('The restore helper never started; the original control plane was not replaced'),
+          { code: 'INSTANCE_RESTORE_HELPER_NOT_STARTED' });
+      }
+      throw Object.assign(new Error('Restore helper start acknowledgement is unsettled; retain exact helper and staging, do not retry'),
+        { code: 'INSTANCE_RESTORE_HELPER_UNCERTAIN' });
     }
-    await onHandoff();
     // If validation fails before the helper stops this container, remain
     // alive long enough to ingest the terminal ledger entry it wrote. On a
     // successful apply Docker stops this process, so this wait never turns a
@@ -1283,10 +1490,81 @@ export class InstanceBackupManager {
     );
     await this.store.reload();
     const persisted = this.store.getJob(job.id);
+    const completed = await this.inspectRestoreHelper(job);
+    if (persisted && restoreHelperSettled(persisted, completed) && result.StatusCode === completed.State.ExitCode) {
+      await helper.remove({ force: false });
+      delete persisted.restoreHelper;
+      await this.store.saveJob(persisted);
+    } else throw Object.assign(new Error('Restore helper exit and completion ledger disagree; retain helper, stage and fences'),
+      { code: 'INSTANCE_RESTORE_HELPER_UNCERTAIN' });
     if (result.StatusCode !== 0 && persisted?.status !== "failed")
       throw Object.assign(new Error("The controlled instance restore helper failed"), {
         code: "INSTANCE_RESTORE_HELPER_FAILED",
       });
+  }
+
+  /** Exact acknowledged identity only; a name or a404 never proves settlement. */
+  private async inspectRestoreHelper(job: InstanceBackupJob): Promise<Docker.ContainerInspectInfo> {
+    const identity = job.restoreHelper;
+    if (!identity) throw new Error('Restore helper acknowledgement is unavailable');
+    const info = await withOperationDeadline(signal => this.docker.getContainer(identity.containerId).inspect({ abortSignal: signal }),
+      INSTANCE_DOCKER_READ_TIMEOUT_MS, 'Docker exact restore helper inspection');
+    const env = info.Config?.Env ?? [];
+    if (info.Id !== identity.containerId || info.Image !== identity.imageId ||
+        info.Config?.Labels?.['agentor.instance-restore-helper'] !== 'true' ||
+        info.Config?.Labels?.['agentor.instance-restore-job'] !== job.id ||
+        !env.includes(`AGENTOR_INSTANCE_RESTORE_JOB=${job.id}`) ||
+        !env.includes(`AGENTOR_INSTANCE_RESTORE_DATA_DIR=${this.dataDir}`) ||
+        !env.includes(`AGENTOR_INSTANCE_RESTORE_STAGE=${join(this.stagingDir, `restore-${job.id}`)}`))
+      throw new Error('Exact restore helper authority differs from its acknowledgement');
+    return info;
+  }
+
+  /** Run before any startup writes/migrations: an unexpected parent restart
+   * must not open auth.db while a helper is swapping the same DATA mount. */
+  assertStartupSafe(): Promise<void> {
+    return (this.startupChecked ??= this.checkStartupSafe());
+  }
+
+  private async checkStartupSafe(): Promise<void> {
+    const hostname = process.env.HOSTNAME;
+    if (!hostname) throw new Error('Startup container identity is unavailable');
+    const current = await withOperationDeadline(signal => this.docker.getContainer(hostname).inspect({ abortSignal: signal }),
+      INSTANCE_DOCKER_READ_TIMEOUT_MS, 'Docker startup DATA mount inspection');
+    const data = current.Mounts?.find(mount => mount.Destination === this.dataDir);
+    if (!data) throw new Error('Startup DATA mount authority is unavailable');
+    const helpers = await withOperationDeadline(signal => this.docker.listContainers({ all: false,
+      filters: { label: ['agentor.instance-restore-helper=true'] }, abortSignal: signal }),
+      INSTANCE_DOCKER_READ_TIMEOUT_MS, 'Docker running restore helpers');
+    if (helpers.some(helper => helper.Id !== current.Id && helper.Mounts?.some(mount =>
+      mount.Destination === this.dataDir && mount.Type === data.Type && mount.Source === data.Source &&
+      (data.Type !== 'volume' || mount.Name === data.Name))))
+      throw Object.assign(new Error('A restore helper is still executing against this DATA mount; wait for it to exit before restarting Agentor'),
+        { code: 'INSTANCE_RESTORE_HELPER_ACTIVE', statusCode: 503 });
+  }
+
+  /** Status reads observe orphaned handoffs using existing job state, not a
+   * new watcher or replay mechanism. Success alone is not terminal proof while
+   * the helper may still be clearing fences/restarting its exact parent. */
+  private async refreshRestoreHolds(): Promise<void> {
+    if (!this.restoreBarriers.size) return;
+    const orphaned = [...this.restoreBarriers.keys()].filter(id => !this.tasks.has(id));
+    if (!orphaned.length) return;
+    await this.store.reload();
+    for (const id of orphaned) {
+      const job = this.store.getJob(id);
+      if (!job || restoreQuarantined(job) || !job.restoreHelper ||
+          !['succeeded', 'failed', 'cancelled'].includes(job.status)) continue;
+      const info = await this.inspectRestoreHelper(job).catch(() => undefined);
+      if (!info || !restoreHelperSettled(job, info)) continue;
+      await withOperationDeadline(signal => this.docker.getContainer(job.restoreHelper!.containerId)
+        .remove({ force: false, abortSignal: signal } as Docker.ContainerRemoveOptions & { abortSignal: AbortSignal }),
+        INSTANCE_DOCKER_MUTATION_TIMEOUT_MS, 'Docker settled restore helper cleanup');
+      delete job.restoreHelper;
+      await this.store.saveJob(job);
+      await rm(join(this.stagingDir, `restore-${id}`), { recursive: true, force: true });
+      this.releaseRestoreBarrier(id);
+    }
   }
 
   private async inventory(userId: string) {
@@ -1297,28 +1575,66 @@ export class InstanceBackupManager {
     ]);
     const storage = services.useStorageManager();
     await storage.init();
+    const { useManagedVolumeManager } = await import('./managed-volume-manager');
+    const managedVolumes = useManagedVolumeManager(); await managedVolumes.init();
+    const adminStore = adminStoreModule.useAdminWorkspaceStore();
+    await Promise.all([adminStore.init(), services.useWorkerGroupStore().init()]);
+    const administrative = [adminStore.getRecord(), ...services.useWorkerGroupStore().list().map(group => group.adminWorkspace)]
+      .filter(Boolean) as AdministrativeWorkspaceRecord[];
+    const adminIds = new Set(administrative.map(record => record.id));
+    const workers = services.useWorkerStore().list().filter(worker => !adminIds.has(worker.id));
+    const nativeAdmins = new Set(administrative.filter(record => record.runtimeKind === 'incus-vm').map(record => record.id));
+    const managedRecords = managedVolumes.store.list();
+    const nativeWorkers = new Set(workers.filter(worker => worker.runtimeKind === 'incus-vm').map(worker => worker.id));
+    const managedNames = new Set(managedRecords.map(volume => volume.dockerName));
+    const nativeNames = new Set([...nativeWorkers].flatMap(id =>
+      ['workspace', 'agents', 'docker'].map(role => `${useConfig().containerPrefix}-${id}-${role}`)));
     const candidates = new Map<string, VolumeCandidate>();
-    const add = (candidate: VolumeCandidate) => candidates.set(candidate.name, candidate);
-    for (const worker of services.useWorkerStore().list()) {
+    const add = (candidate: VolumeCandidate) => {
+      if (candidates.has(candidate.name)) throw new Error('Instance backup has conflicting logical volume authority');
+      candidates.set(candidate.name, candidate);
+    };
+    for (const worker of workers) {
       const containerName = `${useConfig().containerPrefix}-${worker.id}`;
+      if (worker.runtimeKind === 'incus-vm') {
+        const state = await withOwnerWorkerLifecycleMutation(worker.userId, worker.id, () =>
+          services.useContainerManager().inspectInstanceBackupStorageWithLifecycleFenceHeld(worker.id));
+        if (state.runtime.kind !== 'incus-vm') throw new Error('Native instance inventory returned another runtime');
+        for (const role of ['workspace', 'agents', ...(state.docker ? ['docker' as const] : [])] as const)
+          add({ name: `${containerName}-${role}`, ownerId: worker.userId, workerId: worker.id,
+            kind: role === 'workspace' ? 'worker-workspace' : role === 'agents' ? 'worker-agent-data' : 'worker-dind',
+            runtime: role === 'workspace'
+              ? { kind: 'incus-vm', role, source: state.runtime.source, dockerData: state.docker }
+              : { kind: 'incus-vm', role, source: state.runtime.source } });
+        continue;
+      }
       if (storage.mode === "volume") {
         add({ name: `${containerName}-workspace`, kind: "worker-workspace", ownerId: worker.userId, workerId: worker.id });
         add({ name: `${containerName}-agents`, kind: "worker-agent-data", ownerId: worker.userId, workerId: worker.id });
       }
       add({ name: `${containerName}-docker`, kind: "worker-dind", ownerId: worker.userId, workerId: worker.id });
     }
-    const admin = adminStoreModule.useAdminWorkspaceStore().getRecord();
-    if (admin) {
-      const names = administrativeWorkspaceResourceNames(admin);
-      add({ name: names.workspaceVolume, kind: "admin-workspace" });
-      add({ name: names.agentsVolume, kind: "admin-agent-data" });
-    }
-    for (const group of services.useWorkerGroupStore().list()) {
-      const record = group.adminWorkspace as any;
-      if (!record) continue;
-      const names = administrativeWorkspaceResourceNames(record);
-      add({ name: names.workspaceVolume, kind: "admin-workspace", ownerId: group.userId, groupId: group.id });
-      add({ name: names.agentsVolume, kind: "admin-agent-data", ownerId: group.userId, groupId: group.id });
+    for (const record of administrative) {
+      assertAdministrativeSnapshotSettled(record);
+      const owner = administrativeRuntimeOwner(record);
+      if (record.runtimeKind === 'incus-vm') {
+        await this.withAdministrativeBackupRecord({ kind: owner.kind, workspaceId: owner.id, ...(owner.groupId ? { groupId: owner.groupId } : {}) }, async current => {
+          const backup = new IncusAdminBackup(useConfig(), services.useAdministrativeWorkspaceRuntime().native);
+          await backup.inspect(current);
+          const source = snapshotIncusWorkerBackupRuntime(current.nativeRuntime!.image).source;
+          const administrative = { kind: owner.kind, workspaceId: owner.id, ...(owner.groupId ? { groupId: owner.groupId } : {}) };
+          for (const role of ['workspace', 'agents'] as const) add({ name: current.nativeRuntime!.name + '-' + role,
+            kind: role === 'workspace' ? 'admin-workspace' : 'admin-agent-data', ownerId: owner.userId, workerId: owner.id,
+            ...(owner.groupId ? { groupId: owner.groupId } : {}), runtime: { kind: 'incus-vm', administrative, role, source } });
+          for (const { record: volume } of await backup.inspectSelected(current))
+            add({ name: volume.dockerName, kind: 'persistent-path', ownerId: owner.userId, workerId: owner.id,
+              ...(owner.groupId ? { groupId: owner.groupId } : {}), runtime: { kind: 'incus-vm', administrative, role: 'managed', managedVolumeId: volume.id, target: volume.target } });
+        });
+      } else {
+        const names = administrativeWorkspaceResourceNames(record);
+        add({ name: names.workspaceVolume, kind: 'admin-workspace', ...(owner.groupId ? { ownerId: owner.userId, groupId: owner.groupId } : {}) });
+        add({ name: names.agentsVolume, kind: 'admin-agent-data', ...(owner.groupId ? { ownerId: owner.userId, groupId: owner.groupId } : {}) });
+      }
     }
     if (storage.mode === "volume")
       add({ name: "agentor-traefik-certs", kind: "traefik-certificates" });
@@ -1331,21 +1647,39 @@ export class InstanceBackupManager {
       "Docker persistent backup-volume inventory",
     );
     for (const volume of persistent.Volumes ?? [])
-      if (volume.Name)
+      if (volume.Name && !nativeNames.has(volume.Name) && !managedNames.has(volume.Name) &&
+          !nativeWorkers.has(volume.Labels?.['agentor.worker-id'] ?? '') && !nativeAdmins.has(volume.Labels?.['agentor.worker-id'] ?? ''))
         add({
           name: volume.Name,
           kind: "persistent-path",
           workerId: volume.Labels?.["agentor.worker-id"],
         });
     const volumes: VolumeCandidate[] = [];
-    const managedVolumes = useManagedVolumeManager();
-    await managedVolumes.init();
-    for (const volume of managedVolumes.store.list()) {
+    for (const volume of managedRecords) {
+      if (nativeAdmins.has(volume.workerId)) {
+        if (volume.userId !== administrativeRuntimeOwner(administrative.find(record => record.id === volume.workerId)!).userId)
+          throw new Error('Administrative selected storage has conflicting owner authority');
+        continue;
+      } // Dedicated admin inventory owns its selected volumes.
+      if (managedVolumeRuntimeKind(volume) === 'incus-vm') {
+        assertIncusLiveResolved(volume);
+        const found = await managedVolumes.incusRuntime.inspectVolume(volume);
+        if (!found && !volume.seeded && ['pending', 'detached'].includes(volume.state) && !volume.operation) continue;
+        if (!volume.seeded || volume.state !== (volume.attached ? 'ready' : 'detached') ||
+            volume.operation && volume.operation.stage !== 'complete')
+          throw new Error('Complete pending native managed storage before creating an instance backup');
+        if (!found)
+          throw new Error('Canonical native managed storage is missing; restore it before creating an instance backup');
+        add({ name: volume.dockerName, kind: 'persistent-path', ownerId: volume.userId, workerId: volume.workerId,
+          runtime: { kind: 'incus-vm', role: 'managed', managedVolumeId: volume.id, target: volume.target } });
+        continue;
+      }
+      if (nativeWorkers.has(volume.workerId)) throw new Error('Worker and managed storage runtime authority disagree');
       if (!await managedVolumes.runtime.inspectVolume(volume)) continue;
       add({ name: volume.dockerName, kind: "persistent-path", ownerId: volume.userId, workerId: volume.workerId });
     }
     for (const candidate of candidates.values())
-      if (await this.volumeExists(candidate.name)) volumes.push(candidate);
+      if (candidate.runtime || await this.volumeExists(candidate.name)) volumes.push(candidate);
     const definitions = services.usePluginDefinitionStore().list();
     const installations = services.usePluginInstallationStore().list();
     const catalog = imageModule.useImageCatalogManager();
@@ -1362,6 +1696,7 @@ export class InstanceBackupManager {
     ];
     return {
       volumes,
+      nativeRuntime: nativeWorkers.size > 0 || nativeAdmins.size > 0 || managedRecords.some(volume => managedVolumeRuntimeKind(volume) === 'incus-vm'),
       plugins: {
         platformDefinitionCount: definitions.filter((item) => item.userId === null).length,
         ownerDefinitionCount: definitions.filter((item) => item.userId !== null).length,
@@ -1384,6 +1719,7 @@ export class InstanceBackupManager {
   }
 
   private async defaultPreflight() {
+    await (await import('./incus-offline-archive-helper')).assertOfflineArchiveHelpersSettled(this.dataDir);
     const [services, adminStoreModule, imageModule] = await Promise.all([
       import("./services"),
       import("./admin-workspace-store"),
@@ -1393,7 +1729,13 @@ export class InstanceBackupManager {
       .useContainerManager()
       .list()
       .filter((worker) => worker.status === "running" || worker.status === "creating");
+    if (services.useWorkerStore().list().some(worker => worker.incusMigration && worker.incusMigration.phase !== 'retained'))
+      throw Object.assign(new Error('Resolve incomplete worker migration before whole-instance backup'),
+        { statusCode: 409, code: 'WORKER_MIGRATION_RECOVERY_REQUIRED' });
     const admin = adminStoreModule.useAdminWorkspaceStore().getRecord();
+    if (admin) assertAdministrativeSnapshotSettled(admin);
+    for (const group of services.useWorkerGroupStore().list())
+      if (group.adminWorkspace) assertAdministrativeSnapshotSettled(group.adminWorkspace);
     const activeGroupAdmins = services
       .useWorkerGroupStore()
       .list()
@@ -1432,10 +1774,105 @@ export class InstanceBackupManager {
       );
   }
 
+  private async withAdministrativeBackupRecord<T>(identity: import('./instance-backup-types').InstanceBackupAdministrativeIdentity,
+    operation: (record: AdministrativeWorkspaceRecord) => Promise<T>): Promise<T> {
+    const check = async (record: AdministrativeWorkspaceRecord) => {
+      const owner = administrativeRuntimeOwner(record);
+      if (record.id !== identity.workspaceId || record.kind !== identity.kind || owner.groupId !== identity.groupId)
+        throw new Error('Administrative instance inventory authority changed');
+      assertAdministrativeSnapshotSettled(record);
+      return operation(record);
+    };
+    if (identity.kind === 'administrative') return (await import('./admin-workspace-store')).useAdminWorkspaceStore().withNativeRuntimeTransaction(check);
+    if (!identity.groupId) throw new Error('Administrative group identity is missing');
+    return (await import('./group-admin-workspace-store')).useGroupAdminWorkspaceStore().withNativeRuntimeTransaction(identity.groupId, check);
+  }
+
+  private async snapshotNativeVolumes(outputs: Array<{ volume: VolumeCandidate; path: string }>, signal: AbortSignal) {
+    const first = outputs[0]?.volume;
+    if (!first?.runtime || !first.ownerId || !first.workerId) throw new Error('Native instance capture identity is missing');
+    const descriptor = first.runtime, ownerId = first.ownerId, workerId = first.workerId;
+    const services = await import('./services');
+    if ('administrative' in descriptor) {
+      await this.withAdministrativeBackupRecord(descriptor.administrative, async record => {
+        const backup = new IncusAdminBackup(useConfig(), services.useAdministrativeWorkspaceRuntime().native);
+        if (descriptor.role === 'managed') {
+          if (outputs.length !== 1) throw new Error('Administrative selected capture requires one output');
+          const captured = await backup.captureSelected(record, descriptor.managedVolumeId, outputs[0]!.path, signal);
+          if (captured.target !== descriptor.target || captured.dockerName !== first.name) throw new Error('Administrative selected inventory changed');
+        } else {
+          const paths: { workspace?: string; agents?: string } = {};
+          for (const { volume, path } of outputs) {
+            const runtime = volume.runtime;
+            if (!runtime || !('administrative' in runtime) || !isDeepStrictEqual(runtime.administrative, descriptor.administrative) ||
+                runtime.role === 'managed' || !isDeepStrictEqual(runtime.source, descriptor.source) || paths[runtime.role])
+              throw new Error('Administrative canonical inventory changed');
+            paths[runtime.role] = path;
+          }
+          const result = await backup.capture(record, paths, { exclusions: [], signal });
+          if (!isDeepStrictEqual(snapshotIncusWorkerBackupRuntime(result.image).source, descriptor.source))
+            throw new Error('Administrative immutable source changed');
+        }
+      });
+      return;
+    }
+    await withOwnerWorkerLifecycleMutation(ownerId, workerId, async () => {
+      signal.throwIfAborted();
+      const containers = services.useContainerManager();
+      if (descriptor.role === 'workspace' || descriptor.role === 'agents') {
+        const paths: { workspace?: string; agents?: string } = {};
+        for (const { volume, path } of outputs) {
+          if (!volume.runtime || volume.ownerId !== first.ownerId || volume.workerId !== first.workerId ||
+              volume.runtime.role !== 'workspace' && volume.runtime.role !== 'agents' ||
+              !isDeepStrictEqual(volume.runtime.source, descriptor.source) || paths[volume.runtime.role])
+            throw new Error('Native canonical instance capture roles disagree');
+          paths[volume.runtime.role] = path;
+        }
+        const workspace = outputs.find(({ volume }) => volume.runtime?.role === 'workspace')?.volume.runtime;
+        const proveDockerData = async () => {
+          if (workspace?.role !== 'workspace') return;
+          const state = await containers.inspectInstanceBackupStorageWithLifecycleFenceHeld(workerId);
+          if (typeof workspace.dockerData !== 'boolean' || state.docker !== workspace.dockerData ||
+              state.runtime.kind !== 'incus-vm' || !isDeepStrictEqual(state.runtime.source, workspace.source))
+            throw new Error('Native canonical Docker data presence changed after instance inventory');
+        };
+        await proveDockerData();
+        const result = await containers.captureInstanceCanonicalWithLifecycleFenceHeld(workerId, paths, signal);
+        if (result.runtime.kind !== 'incus-vm' || !isDeepStrictEqual(result.runtime.source, descriptor.source))
+          throw new Error('Native immutable source changed after instance inventory');
+        await proveDockerData();
+        return;
+      }
+      if (outputs.length !== 1) throw new Error('Native instance raw capture must select exactly one role');
+      const output = outputs[0]!.path, raw = output + '.raw';
+      try {
+        if (descriptor.role === 'docker') {
+          const state = await containers.inspectInstanceBackupStorageWithLifecycleFenceHeld(workerId);
+          if (!state.docker || state.runtime.kind !== 'incus-vm' ||
+              !isDeepStrictEqual(state.runtime.source, descriptor.source))
+            throw new Error('Native Docker instance inventory changed');
+          await containers.captureInstanceDockerWithLifecycleFenceHeld(workerId, raw, signal);
+        } else {
+          const { useManagedVolumeManager } = await import('./managed-volume-manager');
+          const managed = useManagedVolumeManager(); await managed.init();
+          if (descriptor.role !== 'managed') throw new Error('Unknown native instance archive role');
+          const record = managed.store.get(ownerId, descriptor.managedVolumeId);
+          if (!record || record.dockerName !== first.name || record.workerId !== first.workerId || record.target !== descriptor.target)
+            throw new Error('Native managed instance inventory changed');
+          await managed.captureInstanceArchiveWithLifecycleFenceHeld(record, raw, signal);
+        }
+        // Preserve every raw/PAX byte and its metadata. The authenticated role
+        // codec validates this stream during bundle inspection; never repack.
+        await pipeline(createReadStream(raw), createGzip(), createWriteStream(output, { flags: 'wx', mode: 0o600 }), { signal });
+      } finally { await rm(raw, { force: true }); }
+    });
+  }
+
   private async snapshotVolume(
     volumeName: string,
     output: string,
     signal: AbortSignal,
+    onBytes?: (uncompressedBytes: number) => void,
   ): Promise<boolean> {
     if (!(await this.volumeExists(volumeName))) return false;
     const hostname = process.env.HOSTNAME;
@@ -1476,8 +1913,6 @@ export class InstanceBackupManager {
       },
       abortSignal: operationSignal,
     }), INSTANCE_DOCKER_MUTATION_TIMEOUT_MS, "Docker instance-snapshot helper creation", signal);
-    const raw = `${output}.raw`;
-    const sanitized = `${output}.tar`;
     try {
       await withOperationDeadline(
         (operationSignal) => helper.start({ abortSignal: operationSignal }),
@@ -1485,26 +1920,19 @@ export class InstanceBackupManager {
         "Docker instance-snapshot helper start",
         signal,
       );
-      await pipeline(
-        (await withOperationDeadline(
-          (operationSignal) => helper.getArchive({
-            path: "/source",
-            abortSignal: operationSignal,
-          }),
-          INSTANCE_DOCKER_READ_TIMEOUT_MS,
-          "Docker instance-snapshot archive setup",
-          signal,
-        )) as NodeJS.ReadableStream,
-        createWriteStream(raw, { mode: 0o600 }),
-        { signal },
+      const archive = await withOperationDeadline(
+        (operationSignal) => helper.getArchive({ path: "/source", abortSignal: operationSignal }),
+        INSTANCE_DOCKER_READ_TIMEOUT_MS,
+        "Docker instance-snapshot archive setup",
+        signal,
       );
-      await sanitizeBackupPathTarPayload(raw, sanitized, "/", signal);
-      await pipeline(
-        createReadStream(sanitized),
-        createGzip({ level: 6 }),
-        createWriteStream(output, { mode: 0o600 }),
-        { signal },
-      );
+      await sanitizeBackupPathTarGzip({
+        source: archive as Readable,
+        destination: output,
+        selectedPath: "/",
+        signal,
+        onBytes,
+      });
       return true;
     } finally {
       await withOperationDeadline(
@@ -1512,8 +1940,6 @@ export class InstanceBackupManager {
         INSTANCE_DOCKER_MUTATION_TIMEOUT_MS,
         "Docker instance-snapshot helper cleanup",
       ).catch(() => {});
-      await rm(raw, { force: true }).catch(() => {});
-      await rm(sanitized, { force: true }).catch(() => {});
     }
   }
 
@@ -1588,9 +2014,10 @@ export class InstanceBackupManager {
         .run(job, controller.signal)
         .catch((error) => this.fail(job, error))
         .finally(() => {
-          this.releaseRestoreBarrier(job.id);
+          if (!restoreMayOwnStage(this.store.getJob(job.id) ?? job)) this.releaseRestoreBarrier(job.id);
           this.controllers.delete(job.id);
           this.tasks.delete(job.id);
+          this.volumeProgress.delete(job.id);
           this.active -= 1;
           this.dispatch();
         });
@@ -1636,6 +2063,14 @@ export class InstanceBackupManager {
   }
 
   private async fail(job: InstanceBackupJob, error: unknown) {
+    if (job.restoreHelper && (error as { code?: string })?.code !== 'INSTANCE_RESTORE_HELPER_NOT_STARTED') {
+      await this.store.reload();
+      const helperLedger = this.store.getJob(job.id);
+      if (helperLedger && ['succeeded', 'failed', 'cancelled'].includes(helperLedger.status)) return;
+      // A possibly active helper owns this ledger. Do not abort its native
+      // mutation by replacing it from a stale parent cache on transport loss.
+      return;
+    }
     const persisted = this.store.getJob(job.id);
     if (persisted?.status === "cancelled") return;
     const cancelled =
@@ -1736,6 +2171,28 @@ function newJob(
     requestFingerprint: fingerprint,
     logs: [`${operation} queued.`],
   };
+}
+
+function restoreQuarantined(job: InstanceBackupJob): boolean {
+  return job.operation === 'restore' && ['INSTANCE_RESTORE_ROLLBACK_INCOMPLETE', 'INSTANCE_RESTORE_HELPER_UNCERTAIN']
+    .includes(job.errorCode ?? '');
+}
+
+function restoreMayOwnStage(job: InstanceBackupJob): boolean {
+  return job.operation === 'restore' && (restoreQuarantined(job) || !!job.restoreHelper ||
+    ['queued', 'running'].includes(job.status) && ['helper-starting', 'applying'].includes(job.phase));
+}
+
+function restoreHelperNeverStarted(info: Docker.ContainerInspectInfo): boolean {
+  return info.State.Status === 'created' && !info.State.Running && !info.State.Restarting && !info.State.Dead &&
+    /^0001-01-01T00:00:00(?:\.0+)?Z$/.test(info.State.StartedAt);
+}
+
+function restoreHelperSettled(job: InstanceBackupJob, info: Docker.ContainerInspectInfo): boolean {
+  return !restoreQuarantined(job) && ['succeeded', 'failed', 'cancelled'].includes(job.status) &&
+    !info.State.Running && !info.State.Restarting && info.State.Status === 'exited' &&
+    Number.isFinite(Date.parse(info.State.FinishedAt)) && !info.State.FinishedAt.startsWith('0001-') &&
+    (job.status === 'failed' ? info.State.ExitCode !== 0 : info.State.ExitCode === 0);
 }
 
 function normalizeOptions(
@@ -1880,12 +2337,18 @@ function publicJob(job: InstanceBackupJob): PublicInstanceBackupJob {
     logs,
     pendingProviderObjectId: _pendingProviderObjectId,
     pendingProviderUploadId: _pendingProviderUploadId,
+    restoreHelper: _restoreHelper,
     ...result
   } = structuredClone(job);
   return { ...result, logLineCount: logs.length };
 }
 
 function publicInstanceFailure(error: unknown) {
+  const restoreCode = (error as { code?: string })?.code;
+  if (restoreCode === 'INSTANCE_RESTORE_HELPER_NOT_STARTED')
+    return { code: restoreCode, message: 'The restore helper never started; original data remains untouched.', retryable: true };
+  if (restoreCode === 'INSTANCE_RESTORE_HELPER_UNCERTAIN')
+    return { code: restoreCode, message: 'Restore execution is unsettled. Retain the exact helper, staging and data; do not retry automatically.', retryable: false };
   const message = error instanceof Error ? error.message : "";
   const code = (error as any)?.code;
   if (

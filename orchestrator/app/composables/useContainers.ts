@@ -2,6 +2,7 @@ import type { ContainerInfo, CreateContainerRequest, UpdateContainerSettingsRequ
 
 export function useContainers() {
   const { data: containers, refresh } = useFetch<ContainerInfo[]>('/api/containers', {
+    key: 'workers',
     default: () => [],
   });
 

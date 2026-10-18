@@ -10,6 +10,7 @@ import {
 import { InstanceBackupStore } from "../../orchestrator/server/utils/instance-backup-store";
 import type {
   InstanceBackupArtifact,
+  InstanceBackupManifest,
   InstanceBackupJob,
   RemoteInstanceBackupRecord,
 } from "../../orchestrator/server/utils/instance-backup-types";
@@ -366,5 +367,47 @@ test.describe("instance backup durable store", () => {
     expect(await readFile(join(admin, "instance-backups.v1.json"), "utf8")).not.toContain(
       "client-secret",
     );
+  });
+
+  test("preserves native format2 manifests and rejects inconsistent or legacy-tagged durable state", async () => {
+    const store = new InstanceBackupStore(root); await store.init();
+    const manifest: InstanceBackupManifest = {
+      kind: "agentor-instance-backup", formatVersion: 2, backupId: "native-artifact",
+      sourceInstallationId: "source-installation", createdByUserId: "platform-admin", createdAt,
+      agentorVersion: "test", storage: { mode: "volume", containerPrefix: "agentor-worker" },
+      options: { includeWorkers: true, includeAgentData: true, includeDockerVolumes: true, includeLocalBackups: false, includeLogs: false },
+      dataArchive: { archive: "data.tar.gz", sha256: "a".repeat(64), size: 1 },
+      volumes: [{ name: "agentor-persist-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", kind: "persistent-path", ownerId: "owner",
+        workerId: "11111111-2222-3333-4444-555555555555", sha256: "b".repeat(64), size: 1,
+        archive: "volumes/" + Buffer.from("agentor-persist-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").toString("base64url") + ".tar.gz",
+        runtime: { kind: "incus-vm", role: "managed", managedVolumeId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", target: "/srv/persisted" } }],
+      plugins: { platformDefinitionCount: 0, ownerDefinitionCount: 0, installationCount: 0 },
+      hostMounts: { configuredPaths: [], contentsIncluded: false }, images: { definitions: 0, immutableDigests: [], layersIncluded: false },
+      excludedDataPaths: [],
+    };
+    const native: InstanceBackupArtifact = { ...artifact("native-artifact"), formatVersion: 2, manifest };
+    await store.saveArtifact(native); await store.saveArtifact(artifact("historical"));
+    const reloaded = new InstanceBackupStore(root); await reloaded.init();
+    expect(reloaded.getArtifact("native-artifact")).toEqual(native);
+    expect(reloaded.getArtifact("historical")?.formatVersion).toBe(1);
+    for (const malformed of [
+      { ...native, formatVersion: 1 }, { ...native, formatVersion: 3 },
+      { ...native, sourceInstallationId: "different-installation" },
+      { ...native, id: "different-backup-id" }, { ...native, createdAt: "2026-09-05T12:00:00.000Z" },
+      { ...native, manifest: { ...manifest, formatVersion: 1 } },
+      { ...native, manifest: { ...manifest, volumes: [{ ...manifest.volumes[0], runtime: { ...manifest.volumes[0]!.runtime, target: "/srv/../etc" } }] } },
+    ]) await expect(store.saveArtifact(malformed as any)).rejects.toThrow(/invalid instance backup artifact/i);
+    expect(store.listArtifacts()).toHaveLength(2);
+    // Keep the historical v1 minimal store shape/identity tolerance unchanged.
+    // Native v2 strengthens this boundary rather than reinterpreting old state.
+    const historical = { ...artifact("historical-with-manifest"), manifest: { ...manifest, formatVersion: 1 as const,
+      backupId: "old-manifest-id", createdAt: "2026-09-01T12:00:00.000Z", volumes: [] } };
+    await store.saveArtifact(historical);
+    const historicalReloaded = new InstanceBackupStore(root); await historicalReloaded.init();
+    expect(historicalReloaded.getArtifact(historical.id)).toEqual(historical);
+    const file = join(root, "admin", "instance-backups.v1.json");
+    await writeFile(file, JSON.stringify({ schemaVersion: 1, jobs: [], remoteBackups: [],
+      artifacts: [{ ...native, manifest: { ...manifest, formatVersion: 1 } }] }));
+    await expect(new InstanceBackupStore(root).init()).rejects.toThrow(/state is unavailable/);
   });
 });

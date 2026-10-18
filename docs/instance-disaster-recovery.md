@@ -8,7 +8,7 @@ portable worker backups; they do not replace them.
   selected workers without replacing the destination control plane.
 - Use an **instance backup** when recovering the orchestrator database,
   catalogs, configuration stores, plugin state, and optionally the
-  Agentor-owned Docker volumes as one coordinated installation.
+  Agentor-owned persistent volumes as one coordinated installation.
 
 Instance disaster recovery is restricted to platform administrators. Workspace
 and group administrators cannot create, inspect, adopt, or apply an instance
@@ -16,7 +16,7 @@ snapshot.
 
 ## What an instance snapshot contains
 
-The version-1 instance manifest identifies the source installation, creator,
+The versioned instance manifest identifies the source installation, creator,
 Agentor version, storage mode, `CONTAINER_PREFIX`, options, and the exact
 SHA-256 digest and size of each payload. The encrypted bundle contains:
 
@@ -28,9 +28,8 @@ SHA-256 digest and size of each payload. The encrypted bundle contains:
   and other control-plane records stored below `DATA_DIR`;
 - an inventory of immutable image digests, without Docker image layers;
 - an inventory of configured host-mount source paths, without the host files;
-- optionally, selected Agentor-owned Docker volumes, including directory-mode
-  gaps such as DinD, administrative workspaces, and declared persistent-path
-  volumes.
+- optionally, Agentor-owned Docker volumes and native canonical/selected filesystem
+  volumes, including directory-mode gaps such as DinD and administrative data.
 
 The default selection includes worker data, persistent agent data, and Docker
 volumes. Logs, local portable-worker backup objects, export artifacts, active
@@ -131,7 +130,7 @@ local ledger.
    group-administrator workspaces. This is required for a coherent snapshot;
    merely stopping the web browser is not sufficient.
 2. Open **Instance disaster recovery** and choose Local or Google Drive.
-3. Keep Docker volumes enabled for a faithful migration. Decide explicitly
+3. Keep Agentor persistent volumes enabled for a faithful migration. Decide explicitly
    whether logs or existing portable-worker backup objects are worth the extra
    size.
 4. Start the backup. Creation returns immediately as a durable job. Monitor its
@@ -178,7 +177,7 @@ can be corrected and the same verified snapshot retried.
 
 ### 4. Apply the snapshot
 
-The safe default restores contained Docker volumes but omits host-mount
+The safe default restores contained Agentor persistent volumes but omits host-mount
 allowlists and grants. This prevents source paths from becoming authorized on a
 different host merely because their strings match. Copy and verify external
 host data first; select host-mount policy restoration only when those source
@@ -283,3 +282,17 @@ artifacts, and remote discovery records live in the additive
 `<DATA_DIR>/admin/instance-backups.v1.json` store. The store and retained
 encrypted artifacts are deliberately preserved across the control-plane swap
 so the terminal restore outcome remains inspectable after restart.
+
+
+### Volume compression, staging and progress
+
+Docker volume capture streams the existing sanitizer directly into standard level-6 gzip, using the runtime image's pigz with at most four compression workers and a Node gzip fallback when absent. It stages no uncompressed Docker volume TAR copies. Native archive codecs retain their existing byte-preserving behavior. Partial compressed files and compressor processes are cleaned on failure/cancellation; nested archive validation and encryption still precede artifact publication.
+
+The job display labels uncompressed per-volume bytes and observed input throughput separately from other transfer counters. Recursive input size is unavailable from Docker's archive response, so volume percentage and ETA remain explicitly unknown. See [the reproducible compression/staging benchmark and acceptance limits](backup-compression-benchmark.md).
+
+
+### Native administrative recovery
+
+Global and group administrative data is captured from dedicated trusted records, never ordinary-worker shadows. Native canonical and selected-volume descriptors use strict format-2 administrative tags. Historical format-1 Docker administrative canonical archives are also joined to the authenticated dedicated records and restored into fresh native filesystem volumes. The current operator-approved base determines future VM compute; source UUIDs, nonces, NICs and management credentials are never adopted.
+
+Administrative records finish stopped with initialized data and no compute. Later native setup creates fresh stopped compute/private networking; explicit Start launches the service with a fresh management identity. Detached selected history is restored as retained data, outside active VM references. The UI calls these Agentor persistent volumes; this scope is required for native and historical administrative recovery. See [the inverse, ownership rules and pending live acceptance gate](administrative-native-restore.md).

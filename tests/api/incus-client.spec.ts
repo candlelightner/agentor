@@ -1,0 +1,898 @@
+import { expect, test } from "@playwright/test";
+import http from "node:http";
+import { existsSync } from "node:fs";
+import {
+  IncusClient,
+  IncusError,
+  IncusRequestRejected,
+  type IncusInstanceState,
+} from "../../orchestrator/server/utils/incus-client";
+import type { Config } from "../../orchestrator/server/utils/config";
+
+test.describe("IncusClient unit tests", () => {
+  test('volume removal awaits private project acceptance before operation GET, including callback persistence failure', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    const operation = '/1.0/operations/12345678-1234-1234-1234-123456789abc', order: string[] = [];
+    let release!: () => void, entered!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const accepting = new Promise<void>(resolve => { entered = resolve; });
+    client.rawRequest = async (method, path) => {
+      // This observes the same project URL builder used by the real transport.
+      expect((client as any).buildUrl(path).searchParams.get('project')).toBe('agentor');
+      order.push(method + ':' + path);
+      return { statusCode: method === 'DELETE' ? 202 : 200, headers: {}, body: Buffer.from(JSON.stringify(method === 'DELETE'
+        ? { type: 'async', operation: operation + '?project=agentor' }
+        : { type: 'sync', metadata: { status: 'Success', status_code: 200 } })) };
+    };
+    const pending = client.deleteCustomVolume('pool', 'private copy', async path => {
+      expect(path).toBe(operation); order.push('accept:' + path); entered(); await barrier;
+    });
+    await accepting;
+    expect(order).toEqual(['DELETE:/1.0/storage-pools/pool/volumes/custom/private%20copy', 'accept:' + operation]);
+    release(); await pending;
+    expect(order[2]).toBe('GET:' + operation);
+    order.length = 0;
+    const error = new Error('private acknowledgement fsync failed');
+    await expect(client.deleteCustomVolume('pool', 'copy', async () => { throw error; })).rejects.toBe(error);
+    expect(order).toEqual(['DELETE:/1.0/storage-pools/pool/volumes/custom/copy']);
+  });
+
+  test('volume sync removal acknowledges undefined once; ambiguous replies never acknowledge or wait', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    const operation = '/1.0/operations/12345678-1234-1234-1234-123456789abc';
+    let body: any = { type: 'sync' }, statusCode = 200;
+    const acknowledgements: Array<string | undefined> = [], requests: string[] = [];
+    client.rawRequest = async (method, path) => {
+      requests.push(method + ':' + path);
+      return { statusCode, headers: {}, body: Buffer.from(typeof body === 'string' ? body : JSON.stringify(body)) };
+    };
+    const remove = () => client.deleteCustomVolume('pool', 'copy', async path => { acknowledgements.push(path); });
+    await remove(); expect(acknowledgements).toEqual([undefined]); expect(requests).toHaveLength(1);
+    for (const envelope of [{ type: 'async' }, { type: 'async', operation: operation + '?project=foreign' },
+      { type: 'async', operation: 'https://foreign.invalid' + operation },
+      { type: 'async', operation: '/1.0/instances/foreign?project=agentor' }, { type: 'unknown' }, 'not-json']) {
+      body = envelope; statusCode = 202; acknowledgements.length = 0; requests.length = 0;
+      await expect(remove()).rejects.not.toBeInstanceOf(IncusRequestRejected);
+      expect(acknowledgements).toEqual([]); expect(requests).toHaveLength(1);
+    }
+    body = { type: 'sync' }; statusCode = 502; acknowledgements.length = 0; requests.length = 0;
+    await expect(remove()).rejects.not.toBeInstanceOf(IncusRequestRejected);
+    expect(acknowledgements).toEqual([]); expect(requests).toHaveLength(1);
+  });
+
+  test('volume removal definitive daemon error preserves rejection type without callback or operation GET', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    let acknowledgements = 0, requests = 0;
+    client.rawRequest = async () => {
+      requests++;
+      return { statusCode: 403, headers: {}, body: Buffer.from(JSON.stringify({ type: 'error', error: 'restricted', error_code: 403 })) };
+    };
+    await expect(client.deleteCustomVolume('pool', 'copy', async () => { acknowledgements++; })).rejects.toBeInstanceOf(IncusRequestRejected);
+    expect(acknowledgements).toBe(0); expect(requests).toBe(1);
+  });
+
+  test('offline helper lifecycle persists project-scoped acceptance before waiting and never treats uncertain replies as rejection', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    const operation = '/1.0/operations/12345678-1234-1234-1234-123456789abc';
+    let response: any = { type: 'async', operation: operation + '?project=agentor' }, statusCode = 202;
+    const order: string[] = [];
+    client.rawRequest = async () => ({ statusCode, headers: {}, body: Buffer.from(JSON.stringify(response)) });
+    client.waitForOperation = async path => { order.push('wait:' + path); return {} as any; };
+    const accepted = async (path?: string) => { order.push('persist:' + path); };
+    const calls = [() => client.startInstance('helper', accepted),
+      () => client.stopInstance('helper', { force: true }, accepted), () => client.deleteInstance('helper', accepted)];
+    for (const call of calls) {
+      order.length = 0; response = { type: 'async', operation: operation + '?project=agentor' }; statusCode = 202;
+      await call(); expect(order).toEqual(['persist:' + operation, 'wait:' + operation + '?project=agentor']);
+      response = { type: 'async' }; order.length = 0;
+      await expect(call()).rejects.not.toBeInstanceOf(IncusRequestRejected); expect(order).toEqual([]);
+      response = { type: 'async', operation: operation + '?project=foreign' };
+      await expect(call()).rejects.not.toBeInstanceOf(IncusRequestRejected); expect(order).toEqual([]);
+      response = { type: 'error', error: 'denied', error_code: 403 }; statusCode = 403;
+      await expect(call()).rejects.toBeInstanceOf(IncusRequestRejected);
+      response = { type: 'sync' }; statusCode = 502;
+      await expect(call()).rejects.not.toBeInstanceOf(IncusRequestRejected);
+      statusCode = 200; order.length = 0;
+      await call(); expect(order).toEqual(['persist:undefined']);
+    }
+  });
+  test('size helper copy/create retain project-scoped acceptance and distinguish explicit rejection from uncertain responses', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    let response: any = { type: 'async', operation: '/1.0/operations/copy-accepted?project=agentor' };
+    let statusCode = 202;
+    const order: string[] = [], payloads: any[] = [];
+    client.rawRequest = async (_method, _path, body) => { payloads.push(body); return { statusCode, headers: {}, body: Buffer.from(JSON.stringify(response)) }; };
+    client.waitForOperation = async operation => { order.push('wait:' + operation); return { status: 'Success' } as any; };
+    client.getInstance = async () => ({ name: 'helper' } as any);
+    const accepted = async (path?: string) => { order.push('persist:' + path); };
+    const copy = () => client.copyCustomVolume('pool', 'original', 'temporary', { 'user.agentor.helper': 'volume-size' }, accepted);
+    await copy();
+    expect(payloads[0]).toMatchObject({ content_type: 'block', source: { type: 'copy', name: 'original', pool: 'pool', volume_only: true } });
+    expect(order).toEqual(['persist:/1.0/operations/copy-accepted', 'wait:/1.0/operations/copy-accepted']);
+    order.length = 0;
+    await client.createInstance({ name: 'helper', source: { type: 'none' }, profiles: [] }, accepted);
+    expect(order[0]).toBe('persist:/1.0/operations/copy-accepted');
+    for (const operation of ['/1.0/operations/copy?project=other', 'https://other.invalid/1.0/operations/copy', undefined]) {
+      response = { type: 'async', operation }; order.length = 0;
+      await expect(copy()).rejects.not.toBeInstanceOf(IncusRequestRejected);
+      expect(order).toEqual([]);
+    }
+    response = { type: 'error', error: 'restricted', error_code: 403 }; statusCode = 403;
+    await expect(copy()).rejects.toBeInstanceOf(IncusRequestRejected);
+    await expect(client.createInstance({ name: 'helper', source: { type: 'none' } }, accepted)).rejects.toBeInstanceOf(IncusRequestRejected);
+    response = { type: 'sync' }; statusCode = 502;
+    await expect(copy()).rejects.not.toBeInstanceOf(IncusRequestRejected);
+    response = { type: 'sync' }; statusCode = 200; order.length = 0;
+    await copy(); expect(order).toEqual(['persist:undefined']);
+  });
+  test("response URLs cannot forward client credentials to another origin", async () => {
+    const client = new IncusClient({ endpoint: "https://example.invalid", project: "agentor" });
+    await expect(client.rawRequest("GET", "https://other.invalid/1.0")).rejects.toThrow("configured server");
+  });
+
+  test("isConfigured reflects presence of endpoint", () => {
+    const unconfigured = new IncusClient({ endpoint: "" });
+    expect(unconfigured.isConfigured()).toBe(false);
+
+    const configured = new IncusClient({ endpoint: "https://127.0.0.1:8443" });
+    expect(configured.isConfigured()).toBe(true);
+    expect(configured.project).toBe("agentor");
+  });
+
+  test("fromConfig correctly initializes client properties", () => {
+    const mockConfig: Partial<Config> = {
+      incusEndpoint: "https://incus.internal:8443",
+      incusProject: "custom-agentor",
+      incusClientCertPath: "/certs/client.crt",
+      incusClientKeyPath: "/certs/client.key",
+      incusServerCertPath: "/certs/server.crt",
+    };
+
+    const client = IncusClient.fromConfig(mockConfig as Config);
+    expect(client.endpoint).toBe("https://incus.internal:8443");
+    expect(client.project).toBe("custom-agentor");
+  });
+
+  test("getPrimaryIp extracts eth0 IPv4 and ignores docker0 and link-local", async () => {
+    const client = new IncusClient({ endpoint: "https://mock:8443" });
+
+    const mockState: IncusInstanceState = {
+      status: "Running",
+      status_code: 103,
+      pid: 1000,
+      processes: 10,
+      network: {
+        lo: {
+          hwaddr: "",
+          mtu: 65536,
+          state: "up",
+          type: "loopback",
+          addresses: [
+            { family: "inet", address: "127.0.0.1", netmask: "8", scope: "local" },
+            { family: "inet6", address: "::1", netmask: "128", scope: "local" },
+          ],
+        },
+        docker0: {
+          hwaddr: "02:42:1a:2b:3c:4d",
+          mtu: 1500,
+          state: "up",
+          type: "broadcast",
+          addresses: [
+            { family: "inet", address: "172.17.0.1", netmask: "16", scope: "global" },
+            { family: "inet6", address: "fe80::1", netmask: "64", scope: "link" },
+          ],
+        },
+        eth0: {
+          hwaddr: "00:16:3e:11:22:33",
+          mtu: 1500,
+          state: "up",
+          type: "broadcast",
+          addresses: [
+            { family: "inet6", address: "fe80::216:3eff:fe11:2233", netmask: "64", scope: "link" },
+            { family: "inet", address: "10.159.68.42", netmask: "24", scope: "global" },
+          ],
+        },
+      },
+    };
+
+    (client as any).getInstanceState = async () => mockState;
+
+    const ip = await client.getPrimaryIp("worker-1");
+    expect(ip).toBe("10.159.68.42");
+  });
+
+  test("getPrimaryIp falls back to non-docker/non-bridge interface when eth0 absent", async () => {
+    const client = new IncusClient({ endpoint: "https://mock:8443" });
+
+    const mockState: IncusInstanceState = {
+      status: "Running",
+      status_code: 103,
+      pid: 1000,
+      processes: 10,
+      network: {
+        docker0: {
+          hwaddr: "02:42:1a:2b:3c:4d",
+          mtu: 1500,
+          state: "up",
+          type: "broadcast",
+          addresses: [
+            { family: "inet", address: "172.17.0.1", netmask: "16", scope: "global" },
+          ],
+        },
+        veth123: {
+          hwaddr: "02:42:1a:2b:3c:4e",
+          mtu: 1500,
+          state: "up",
+          type: "broadcast",
+          addresses: [
+            { family: "inet", address: "172.17.0.2", netmask: "16", scope: "global" },
+          ],
+        },
+        enp5s0: {
+          hwaddr: "00:16:3e:44:55:66",
+          mtu: 1500,
+          state: "up",
+          type: "broadcast",
+          addresses: [
+            { family: "inet", address: "10.159.68.99", netmask: "24", scope: "global" },
+          ],
+        },
+      },
+    };
+
+    (client as any).getInstanceState = async () => mockState;
+
+    const ip = await client.getPrimaryIp("worker-2");
+    expect(ip).toBe("10.159.68.99");
+  });
+
+  test("getPrimaryIp returns undefined when no global IPv4 is found", async () => {
+    const client = new IncusClient({ endpoint: "https://mock:8443" });
+
+    const mockState: IncusInstanceState = {
+      status: "Running",
+      status_code: 103,
+      pid: 1000,
+      processes: 10,
+      network: {
+        eth0: {
+          hwaddr: "00:16:3e:11:22:33",
+          mtu: 1500,
+          state: "up",
+          type: "broadcast",
+          addresses: [
+            { family: "inet6", address: "fe80::216:3eff:fe11:2233", netmask: "64", scope: "link" },
+          ],
+        },
+      },
+    };
+
+    (client as any).getInstanceState = async () => mockState;
+
+    const ip = await client.getPrimaryIp("worker-3");
+    expect(ip).toBeUndefined();
+  });
+});
+
+test.describe("IncusClient mock server protocol tests", () => {
+  let server: http.Server;
+  let serverPort: number;
+
+  test.beforeAll(async () => {
+    server = http.createServer((req, res) => {
+      const url = new URL(req.url || "", `http://${req.headers.host}`);
+      const path = url.pathname;
+
+      if (req.method === "GET" && (path === "/1.0/networks/workers" || path === "/1.0/networks/workers/leases")) {
+        const allowed = url.searchParams.get("project") === "agentor";
+        res.writeHead(allowed ? 200 : 403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(allowed ? { type: "sync", metadata: path.endsWith("/leases")
+          ? [{ address: "10.20.30.42", hwaddr: "10:66:6a:11:22:33", hostname: "untrusted", type: "dynamic" }]
+          : { name: "workers", managed: true, type: "bridge", config: { "ipv4.address": "10.20.30.1/24" } } }
+          : { type: "error", error_code: 403, error: "Project scope required" }));
+        return;
+      }
+
+      // GET /1.0
+      if (req.method === "GET" && path === "/1.0") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            type: "sync",
+            status: "Success",
+            status_code: 200,
+            metadata: {
+              api_status: "stable",
+              api_version: "1.0",
+              auth: "trusted",
+              public: false,
+              environment: {
+                server_version: "6.0.0",
+                driver: "qemu",
+              },
+            },
+          }),
+        );
+        return;
+      }
+
+      // GET /1.0/projects/agentor
+      if (req.method === "GET" && path === "/1.0/projects/agentor") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            type: "sync",
+            status: "Success",
+            status_code: 200,
+            metadata: {
+              name: "agentor",
+              config: { restricted: "true" },
+            },
+          }),
+        );
+        return;
+      }
+
+      // GET /1.0/projects/forbidden
+      if (req.method === "GET" && path === "/1.0/projects/forbidden") {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            type: "error",
+            error_code: 403,
+            error: 'User does not have permission for project "forbidden"',
+          }),
+        );
+        return;
+      }
+
+      // GET /1.0/instances
+      if (req.method === "GET" && path === "/1.0/instances") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            type: "sync",
+            status: "Success",
+            status_code: 200,
+            metadata: [
+              {
+                name: "worker-test-1",
+                status: "Running",
+                status_code: 103,
+                type: "virtual-machine",
+              },
+            ],
+          }),
+        );
+        return;
+      }
+
+      // POST /1.0/instances/worker-test-1/files
+      if (req.method === "POST" && path === "/1.0/instances/worker-test-1/files") {
+        const mode = req.headers["x-incus-mode"];
+        const uid = req.headers["x-incus-uid"];
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+          const body = Buffer.concat(chunks).toString();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              type: "sync",
+              status: "Success",
+              status_code: 200,
+              metadata: { receivedLength: body.length, mode, uid },
+            }),
+          );
+        });
+        return;
+      }
+
+      // GET /1.0/instances/worker-test-1/files
+      if (req.method === "GET" && path === "/1.0/instances/worker-test-1/files") {
+        const filePath = url.searchParams.get("path");
+        if (filePath === "/missing.txt") {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ type: "error", error_code: 404, error: "Not Found" }));
+          return;
+        }
+        res.writeHead(200, {
+          "Content-Type": "application/octet-stream",
+          "x-incus-uid": "1000",
+          "x-incus-gid": "1000",
+          "x-incus-mode": "0644",
+          "x-incus-type": "file",
+        });
+        res.end("mock file content");
+        return;
+      }
+
+      if (req.method === 'GET' && path === '/1.0/images') {
+        if (url.searchParams.get('project') !== 'agentor' || url.searchParams.get('recursion') !== '1') {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: 'Forbidden', error_code: 403 }));
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'sync', status_code: 200,
+            metadata: [{ fingerprint: 'a'.repeat(64), type: 'virtual-machine' }] }));
+        }
+        return;
+      }
+
+      // GET /1.0/operations/op-success
+      if (req.method === "GET" && path === "/1.0/operations/op-success") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            type: "sync",
+            status: "Success",
+            status_code: 200,
+            metadata: {
+              id: "op-success",
+              status: "Success",
+              status_code: 200,
+              err: "",
+            },
+          }),
+        );
+        return;
+      }
+
+      // GET /1.0/operations/op-failure
+      if (req.method === "GET" && path === "/1.0/operations/op-failure") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            type: "sync",
+            status: "Success",
+            status_code: 200,
+            metadata: {
+              id: "op-failure",
+              status: "Failure",
+              status_code: 400,
+              err: "QEMU failed to allocate disk",
+            },
+          }),
+        );
+        return;
+      }
+
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ type: "error", error: "Not Found", error_code: 404 }));
+    });
+
+    await new Promise<void>((resolve) => {
+      server.listen(0, "127.0.0.1", () => {
+        const addr = server.address() as any;
+        serverPort = addr.port;
+        resolve();
+      });
+    });
+  });
+
+  test.afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  test("getReadiness returns ready: true when server trusted and project accessible", async () => {
+    const client = new IncusClient({
+      endpoint: `http://127.0.0.1:${serverPort}`,
+      project: "agentor",
+    });
+
+    const readiness = await client.getReadiness();
+    expect(readiness.ready).toBe(true);
+    expect(readiness.auth).toBe("trusted");
+    expect(readiness.project).toBe("agentor");
+    expect(readiness.serverVersion).toBe("6.0.0");
+    expect(readiness.driver).toBe("qemu");
+  });
+
+  test("getReadiness returns ready: false when project is forbidden", async () => {
+    const client = new IncusClient({
+      endpoint: `http://127.0.0.1:${serverPort}`,
+      project: "forbidden",
+    });
+
+    const readiness = await client.getReadiness();
+    expect(readiness.ready).toBe(false);
+    expect(readiness.auth).toBe("trusted");
+    expect(readiness.details).toContain("forbidden");
+  });
+
+  test("listInstances queries instances with recursion and project scoping", async () => {
+    const client = new IncusClient({
+      endpoint: `http://127.0.0.1:${serverPort}`,
+      project: "agentor",
+    });
+
+    const list = await client.listInstances();
+    expect(list).toHaveLength(1);
+    expect(list[0].name).toBe("worker-test-1");
+  });
+
+  test("network and host lease reads preserve project scoping", async () => {
+    const client = new IncusClient({ endpoint: `http://127.0.0.1:${serverPort}`, project: "agentor" });
+    expect((await client.getNetwork("workers")).managed).toBe(true);
+    expect(await client.getNetworkLeases("workers")).toMatchObject([{ address: "10.20.30.42", type: "dynamic" }]);
+  });
+
+  test('image cache inventory remains recursive and project-scoped', async () => {
+    const endpoint = `http://127.0.0.1:${serverPort}`;
+    expect(await new IncusClient({ endpoint, project: 'agentor' }).listImages())
+      .toEqual([{ fingerprint: 'a'.repeat(64), type: 'virtual-machine' }]);
+    await expect(new IncusClient({ endpoint, project: 'forbidden' }).listImages()).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  test("pushFile and pullFile handle headers and content correctly", async () => {
+    const client = new IncusClient({
+      endpoint: `http://127.0.0.1:${serverPort}`,
+      project: "agentor",
+    });
+
+    // pushFile with numeric mode
+    await client.pushFile("worker-test-1", "/test.txt", "hello test", {
+      mode: 0o755,
+      uid: 1000,
+      gid: 1000,
+    });
+
+    // pullFile
+    const pulled = await client.pullFile("worker-test-1", "/test.txt");
+    expect(pulled.content.toString()).toBe("mock file content");
+    expect(pulled.mode).toBe(0o644);
+    expect(pulled.uid).toBe(1000);
+    expect(pulled.gid).toBe(1000);
+
+    // pullFile 404 throws IncusError
+    await expect(client.pullFile("worker-test-1", "/missing.txt")).rejects.toThrow(IncusError);
+  });
+
+  test("waitForOperation handles success and throws on failure", async () => {
+    const client = new IncusClient({
+      endpoint: `http://127.0.0.1:${serverPort}`,
+      project: "agentor",
+    });
+
+    const opSuccess = await client.waitForOperation("/1.0/operations/op-success");
+    expect(opSuccess.status).toBe("Success");
+
+    await expect(
+      client.waitForOperation("/1.0/operations/op-failure"),
+    ).rejects.toThrow(/QEMU failed to allocate disk/);
+  });
+
+  test("long operations poll within the transport deadline and require terminal success", async () => {
+    const client = new IncusClient({ endpoint: "https://mock.invalid", timeoutMs: 30_000 });
+    const paths: string[] = [];
+    (client as any).request = async (method: string, path: string) => {
+      expect(method).toBe("GET");
+      paths.push(path);
+      return { status: paths.length === 1 ? "Running" : "Success", status_code: paths.length === 1 ? 103 : 200 };
+    };
+    expect((await client.waitForOperation("long-create", 120)).status).toBe("Success");
+    expect(paths).toEqual(["/1.0/operations/long-create", "/1.0/operations/long-create"]);
+    (client as any).request = async () => ({ status: "Cancelled", status_code: 401, err: "cancelled" });
+    await expect(client.waitForOperation("cancelled")).rejects.toThrow("cancelled");
+    (client as any).request = async () => ({ status: "Running", status_code: 103 });
+    await expect(client.waitForOperation("unfinished", 0.15)).rejects.toThrow("did not finish");
+  });
+
+  test("image create waits on its accepted operation with a bounded longer deadline and never resends", async () => {
+    const client = new IncusClient({ endpoint: "https://mock.invalid" });
+    let posts = 0;
+    client.rawRequest = async (method, path) => {
+      expect([method, path]).toEqual(["POST", "/1.0/instances"]); posts++;
+      return { statusCode: 202, headers: {}, body: Buffer.from(JSON.stringify({ type: "async", operation: "/1.0/operations/create-once" })) };
+    };
+    client.getInstance = async () => ({ name: "worker" }) as any;
+    client.waitForOperation = async (operation, deadline) => {
+      expect([operation, deadline]).toEqual(["/1.0/operations/create-once", 30 * 60]);
+      return { status: "Success" } as any;
+    };
+    expect((await client.createInstance({ name: "worker", source: { type: "none" } })).name).toBe("worker");
+    expect(posts).toBe(1);
+    client.waitForOperation = async () => { throw new Error("Observation unavailable"); };
+    await expect(client.createInstance({ name: "worker", source: { type: "none" } })).rejects.toThrow("Observation unavailable");
+    expect(posts).toBe(2); // One mutation per distinct caller, no hidden resend.
+  });
+
+  for (const outcome of ['late-success', 'deadline', 'failure'] as const) {
+    test(`accepted create ${outcome} waits for terminal evidence without resend or premature caller work`, async () => {
+      const operation = '/1.0/operations/12345678-1234-1234-1234-123456789abc';
+      const requests: string[] = [], order: string[] = [];
+      const originalNow = Date.now;
+      let elapsed = 0, polls = 0, port = 0;
+      const server = http.createServer((req, res) => {
+        const url = new URL(req.url!, 'http://127.0.0.1');
+        requests.push(req.method + ':' + url.pathname);
+        expect(url.searchParams.get('project')).toBe('agentor');
+        res.setHeader('Content-Type', 'application/json');
+        if (req.method === 'POST' && url.pathname === '/1.0/instances') {
+          req.resume(); res.statusCode = 202;
+          res.end(JSON.stringify({ type: 'async', operation }));
+        } else if (req.method === 'GET' && url.pathname === operation) {
+          polls++; order.push('poll-' + polls);
+          // No real slow wait: the first running reply advances the observed
+          // operation beyond the former five-minute bound (or the new bound).
+          if (polls === 1) elapsed += (outcome === 'deadline' ? 1801 : 360) * 1000;
+          const status = polls === 1 ? 'Running' : outcome === 'failure' ? 'Failure' : 'Success';
+          res.end(JSON.stringify({ type: 'sync', metadata: { status,
+            status_code: status === 'Running' ? 103 : status === 'Failure' ? 400 : 200, err: 'unpack failed' } }));
+        } else if (req.method === 'GET' && url.pathname === '/1.0/instances/worker') {
+          order.push('instance');
+          res.end(JSON.stringify({ type: 'sync', metadata: { name: 'worker' } }));
+        } else { res.statusCode = 500; res.end(JSON.stringify({ type: 'error', error: 'unexpected mutation' })); }
+      });
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      port = (server.address() as { port: number }).port;
+      const client = new IncusClient({ endpoint: `http://127.0.0.1:${port}`, project: 'agentor', timeoutMs: 30_000 });
+      try {
+        Date.now = () => originalNow() + elapsed;
+        const pending = client.createInstance({ name: 'worker', type: 'virtual-machine',
+          source: { type: 'image', fingerprint: 'a'.repeat(64) } }, async path => {
+          expect(path).toBe(operation); order.push('accepted');
+        }).then(result => { order.push('caller-provision'); return result; });
+        if (outcome === 'late-success') {
+          expect(await pending).toMatchObject({ name: 'worker' });
+          expect(order).toEqual(['accepted', 'poll-1', 'poll-2', 'instance', 'caller-provision']);
+        } else {
+          await expect(pending).rejects.toThrow(outcome === 'deadline' ? 'did not finish within 1800s' : 'unpack failed');
+          expect(order).toEqual(outcome === 'deadline' ? ['accepted', 'poll-1'] : ['accepted', 'poll-1', 'poll-2']);
+        }
+        expect(requests.filter(request => request.startsWith('POST:'))).toEqual(['POST:/1.0/instances']);
+        expect(requests.filter(request => !request.startsWith('GET:') && !request.startsWith('POST:'))).toEqual([]);
+      } finally {
+        Date.now = originalNow;
+        await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+      }
+    });
+  }
+
+  test('device updates persist accepted operation before waiting, never resend or treat observation failure as cancellation', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    client.getInstance = async () => ({ config: {}, profiles: [], devices: {} }) as any;
+    let puts = 0;
+    client.request = async () => ({}) as any;
+    const order: string[] = [];
+    client.rawRequest = async (method, path) => {
+      if (method === 'GET') return { statusCode: 200, headers: { etag: 'original-etag' }, body: Buffer.from(JSON.stringify({
+        type: 'sync', metadata: { config: {}, profiles: [], devices: {} } })) };
+      expect([method, path]).toEqual(['PUT', '/1.0/instances/worker']); puts++;
+      return { statusCode: 202, headers: {}, body: Buffer.from(JSON.stringify({ type: 'async',
+        operation: 'https://mock.invalid/1.0/operations/device-cutover?project=agentor' })) };
+    };
+    client.waitForOperation = async (operation) => { order.push(`wait:${operation}`); return { status: 'Success' } as any; };
+    await client.updateInstanceDevices('worker', {}, async operation => { order.push(`persist:${operation}`); });
+    expect(order).toEqual(['persist:/1.0/operations/device-cutover', 'wait:/1.0/operations/device-cutover']);
+    expect(puts).toBe(1);
+    order.length = 0;
+    await expect(client.updateInstanceDevices('worker', {}, async operation => {
+      order.push(`persist:${operation}`); throw new Error('Durable intent write failed');
+    })).rejects.toThrow('Durable intent write failed');
+    expect(order).toEqual(['persist:/1.0/operations/device-cutover']);
+    expect(puts).toBe(2);
+    client.waitForOperation = async () => { throw new Error('Operation observation lost'); };
+    let recoveryOperation: string | undefined;
+    await expect(client.updateInstanceDevices('worker', {}, async operation => { recoveryOperation = operation; }))
+      .rejects.toThrow('Operation observation lost');
+    expect(recoveryOperation).toBe('/1.0/operations/device-cutover');
+    expect(puts).toBe(3);
+  });
+
+  test('canonical completion uses exact stopped nonce-owned snapshot and narrowly changes restore/host metadata with device PUT', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    const original = { type: 'virtual-machine', status: 'Stopped', profiles: [], config: {
+      'volatile.uuid': 'captured', 'user.agentor.recreation': 'nonce', 'user.agentor.restore': 'incomplete',
+      'user.agentor.id': 'worker', 'user.agentor.owner': 'owner', 'security.secureboot': 'false' }, devices: {
+        root: { type: 'disk', path: '/', pool: 'pool' }, workspace: { type: 'disk', path: '/restore/workspace', pool: 'pool', source: 'workspace' },
+        agents: { type: 'disk', path: '/restore/.agent-data', pool: 'pool', source: 'agents' } } } as any;
+    let current = structuredClone(original), puts = 0, written: any;
+    client.request = async () => ({}) as any;
+    client.rawRequest = async (method, _path, body, headers) => {
+      if (method === 'GET') return { statusCode: 200, headers: { etag: 'pinned' }, body: Buffer.from(JSON.stringify({ type: 'sync', metadata: current })) };
+      expect(headers).toEqual({ 'If-Match': 'pinned' }); puts++; written = body;
+      return { statusCode: 200, headers: {}, body: Buffer.from(JSON.stringify({ type: 'sync' })) };
+    };
+    const devices = { ...original.devices, workspace: { ...original.devices.workspace, path: '/workspace' } };
+    await client.updateInstanceDevices('worker', devices, undefined, original, { nonce: 'nonce', hostMountMetadata: '[]' });
+    expect(written.config).toEqual({ ...original.config, 'user.agentor.restore': undefined, 'user.agentor.host-mounts': '[]' });
+    expect(Object.hasOwn(written.config, 'user.agentor.restore')).toBe(false);
+    const managedId = '01234567-1111-2222-3333-444444444444';
+    const managed = { type: 'disk', pool: 'pool', source: 'agentor-persist-' + managedId,
+      path: '/restore/managed/' + managedId + '/volume' };
+    current = structuredClone(original); current.devices.m012345 = managed;
+    await client.updateInstanceDevices('worker', devices, undefined, structuredClone(current), { nonce: 'nonce' });
+    current = structuredClone(original); current.devices.docker = { type: 'disk', pool: 'pool', source: 'worker-docker' };
+    await client.updateInstanceDevices('worker', { ...devices, docker: current.devices.docker }, undefined,
+      structuredClone(current), { nonce: 'nonce' });
+    expect(written.devices.docker).toEqual({ type: 'disk', pool: 'pool', source: 'worker-docker' });
+    for (const mutation of ['running', 'nonce', 'marker', 'profile', 'foreign-device', 'missing-expected', 'invalid-host',
+      'managed-path', 'managed-key', 'managed-source', 'managed-option', 'managed-expanded-hidden', 'managed-local-hidden',
+      'docker-source', 'docker-pool', 'docker-option', 'docker-path', 'docker-type', 'docker-expanded-hidden']) {
+      current = structuredClone(original);
+      if (mutation === 'running') current.status = 'Running';
+      if (mutation === 'nonce') current.config['user.agentor.recreation'] = 'other';
+      if (mutation === 'marker') delete current.config['user.agentor.restore'];
+      if (mutation === 'profile') current.profiles = ['host'];
+      if (mutation === 'foreign-device') current.devices.foreign = { type: 'nic', network: 'external' };
+      if (mutation.startsWith('managed-')) {
+        current.devices.m012345 = structuredClone(managed);
+        if (mutation === 'managed-path') current.devices.m012345.path = '/srv/data';
+        if (mutation === 'managed-key') { current.devices.wrong = current.devices.m012345; delete current.devices.m012345; }
+        if (mutation === 'managed-source') current.devices.m012345.source = '/host';
+        if (mutation === 'managed-option') current.devices.m012345.readonly = 'true';
+        if (mutation === 'managed-expanded-hidden') {
+          current.expanded_devices = { ...current.devices,
+            mabcdef: { ...managed, source: 'agentor-persist-abcdefab-1111-2222-3333-444444444444',
+              path: '/restore/managed/abcdefab-1111-2222-3333-444444444444/volume' } };
+        }
+        if (mutation === 'managed-local-hidden') { current.expanded_devices = { ...current.devices }; delete current.expanded_devices.m012345; }
+      }
+      if (mutation.startsWith('docker-')) {
+        current.devices.docker = { type: 'disk', pool: 'pool', source: 'worker-docker' };
+        if (mutation === 'docker-source') current.devices.docker.source = 'other-docker';
+        if (mutation === 'docker-pool') current.devices.docker.pool = 'foreign';
+        if (mutation === 'docker-option') current.devices.docker.readonly = 'true';
+        if (mutation === 'docker-path') current.devices.docker.path = '/host';
+        if (mutation === 'docker-type') current.devices.docker.type = 'nic';
+        if (mutation === 'docker-expanded-hidden') {
+          current.expanded_devices = structuredClone(current.devices); delete current.expanded_devices.docker;
+        }
+      }
+      const expected = mutation === 'missing-expected' ? undefined : structuredClone(current);
+      await expect(client.updateInstanceDevices('worker', devices, undefined, expected,
+        { nonce: 'nonce', hostMountMetadata: mutation === 'invalid-host' ? '{"not":"array"}' : undefined })).rejects.toThrow();
+    }
+    expect(puts).toBe(3);
+  });
+
+  test('device PUT uses native mutation fences and matching caller snapshot/ETag without blocking exec', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    const original = { config: { 'volatile.uuid': 'original' }, profiles: [], description: '',
+      devices: { root: { type: 'disk', path: '/', source: 'canonical' } } } as any;
+    let current = structuredClone(original), operations: any = {}, etag: string | undefined = 'original-etag', puts = 0;
+    let loseResponse = false, rejectEtag = false;
+    client.request = async () => operations;
+    client.rawRequest = async (method, _path, body, headers) => {
+      if (method === 'GET') return { statusCode: 200, headers: { etag },
+        body: Buffer.from(JSON.stringify({ type: 'sync', metadata: current })) };
+      expect(headers).toEqual({ 'If-Match': 'original-etag' }); puts++;
+      if (rejectEtag) return { statusCode: 412, headers: {}, body: Buffer.from(JSON.stringify({ type: 'error', error: 'ETag changed under native lock' })) };
+      current = { ...current, devices: (body as any).devices };
+      if (loseResponse) {
+        operations = { running: [{ status: 'Running', description: 'Updating instance',
+          resources: { instances: ['/1.0/instances/worker?project=agentor'] } }] };
+        throw new Error('Lost device response');
+      }
+      return { statusCode: 200, headers: {}, body: Buffer.from(JSON.stringify({ type: 'sync' })) };
+    };
+    const update = () => client.updateInstanceDevices('worker', { ...original.devices, nic: { type: 'nic', network: 'owned' } }, undefined, original);
+    operations = { running: [{ status: 'Running', description: 'Updating instance',
+      resources: { instances: ['/1.0/instances/worker?project=agentor'] } }] };
+    await expect(update()).rejects.toThrow('still unsettled'); expect(puts).toBe(0);
+    operations = { running: [{ status: 'Running', description: 'Executing command',
+      resources: { instances: ['/1.0/instances/worker?project=agentor'] } },
+      { status: 'Running', description: 'Updating instance', resources: { instances: ['/1.0/instances/other?project=agentor'] } }] };
+    await update(); expect(puts).toBe(1);
+    for (const patch of [{ devices: {} }, { config: { 'volatile.uuid': 'replacement' } }, { profiles: ['foreign'] }, { description: 'changed' }]) {
+      current = { ...original, ...patch }; await expect(update()).rejects.toThrow('caller device snapshot');
+    }
+    expect(puts).toBe(1); current = structuredClone(original); operations = {};
+    etag = undefined; await expect(update()).rejects.toThrow('ETag'); expect(puts).toBe(1);
+    etag = 'original-etag'; operations = { running: {} };
+    await expect(update()).rejects.toThrow('operation state'); expect(puts).toBe(1);
+    operations = {}; rejectEtag = true;
+    await expect(update()).rejects.toMatchObject({ statusCode: 412 }); expect(puts).toBe(2);
+    rejectEtag = false; loseResponse = true;
+    await expect(update()).rejects.toThrow('Lost device response'); expect(puts).toBe(3);
+    // Matching NIC readback is not permission to overtake the still-active PUT.
+    await expect(update()).rejects.toThrow('still unsettled'); expect(puts).toBe(3);
+    operations = {}; // Expiry is not interpreted as proof of the old outcome.
+    await expect(update()).rejects.toThrow('caller device snapshot'); expect(puts).toBe(3);
+  });
+
+  test('device operation acceptance rejects missing, foreign or malformed authority and distinguishes synchronous completion', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    client.getInstance = async () => ({ config: {}, profiles: [], devices: {} }) as any;
+    let response: any;
+    client.request = async () => ({}) as any;
+    let accepted = 0, waits = 0;
+    client.rawRequest = async method => method === 'GET' ? { statusCode: 200, headers: { etag: 'original-etag' },
+      body: Buffer.from(JSON.stringify({ type: 'sync', metadata: { config: {}, profiles: [], devices: {} } })) } :
+      { statusCode: 202, headers: {}, body: Buffer.from(JSON.stringify(response)) };
+    client.waitForOperation = async () => { waits++; return { status: 'Success' } as any; };
+    for (const operation of [undefined, '/1.0/operations/cutover?project=other',
+      'https://foreign.invalid/1.0/operations/cutover', '/1.0/instances/worker']) {
+      response = { type: 'async', operation };
+      await expect(client.updateInstanceDevices('worker', {}, async () => { accepted++; })).rejects.toThrow(/operation|configured server/);
+    }
+    response = { type: 'unknown' };
+    await expect(client.updateInstanceDevices('worker', {}, async () => { accepted++; })).rejects.toThrow('authoritative result');
+    expect([accepted, waits]).toEqual([0, 0]);
+    response = { type: 'sync', status_code: 200 };
+    let completion: unknown = 'not-called';
+    await client.updateInstanceDevices('worker', {}, async operation => { completion = operation; accepted++; });
+    expect(completion).toBeUndefined();
+    expect([accepted, waits]).toEqual([1, 0]);
+  });
+});
+
+test.describe("IncusClient live disposable integration tests", () => {
+  const liveCertPath = "/workspace/agentor-incus-tls/client.crt";
+  const liveKeyPath = "/workspace/agentor-incus-tls/client.key";
+  const liveEndpoint = "https://127.0.0.1:18443";
+
+  test("live Incus readiness, project restrictions, and image alias", async () => {
+    test.skip(process.env.INCUS_CLIENT_TEST !== 'true', 'Explicit disposable Incus client gate; credentials alone do not authorize live mutations');
+    if (!existsSync(liveCertPath) || !existsSync(liveKeyPath)) {
+      test.skip(true, "Live Incus credentials not available in environment");
+      return;
+    }
+
+    const client = new IncusClient({
+      endpoint: liveEndpoint,
+      project: "agentor",
+      clientCertPath: liveCertPath,
+      clientKeyPath: liveKeyPath,
+      rejectUnauthorized: false,
+      timeoutMs: 10_000,
+    });
+
+    let isLiveReachable = false;
+    try {
+      const ping = await client.getReadiness();
+      isLiveReachable = ping.ready;
+    } catch {
+      isLiveReachable = false;
+    }
+
+    if (!isLiveReachable) {
+      test.skip(true, "Live Incus endpoint not reachable on 127.0.0.1:18443");
+      return;
+    }
+
+    const readiness = await client.getReadiness();
+    expect(readiness.ready).toBe(true);
+    expect(readiness.auth).toBe("trusted");
+    expect(readiness.project).toBe("agentor");
+    expect(readiness.driver).toContain("qemu");
+
+    // Project restriction verification: unauthorized project returns ready: false
+    const forbiddenClient = new IncusClient({
+      endpoint: liveEndpoint,
+      project: "default",
+      clientCertPath: liveCertPath,
+      clientKeyPath: liveKeyPath,
+      rejectUnauthorized: false,
+      timeoutMs: 10_000,
+    });
+    const forbiddenReadiness = await forbiddenClient.getReadiness();
+    expect(forbiddenReadiness.ready).toBe(false);
+
+    // Image alias verification: agentor-worker alias resolves
+    const hasAlias = await client.hasImageAlias("agentor-worker");
+    expect(hasAlias).toBe(true);
+    const aliasInfo = await client.getImageAlias("agentor-worker");
+    expect(aliasInfo.type).toBe("virtual-machine");
+
+    // Custom volume lifecycle in agentor project
+    const testVolName = `test-vol-${Date.now()}`;
+    await client.createCustomVolume("default", {
+      name: testVolName,
+      content_type: "block",
+      config: { size: "1GiB" },
+    });
+
+    const vol = await client.getCustomVolume("default", testVolName);
+    expect(vol.name).toBe(testVolName);
+    expect(vol.content_type).toBe("block");
+
+    const vols = await client.listCustomVolumes("default");
+    expect(vols).toContain(testVolName);
+
+    await client.deleteCustomVolume("default", testVolName);
+    const volsAfter = await client.listCustomVolumes("default");
+    expect(volsAfter).not.toContain(testVolName);
+  });
+});

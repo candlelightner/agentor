@@ -1,10 +1,11 @@
 import type { H3Event } from 'h3';
 import { createError } from 'h3';
-import { useDockerService, useContainerManager, useConfig, useWorkerGroupStore, useWorkerStore } from './services';
+import { useDockerService, useContainerManager, useConfig, useWorkerGroupStore, useWorkerStore, useAdministrativeWorkspaceRuntime } from './services';
 import { useAdminWorkspaceStore } from './admin-workspace-store';
 import { useGroupAdminWorkspaceStore } from './group-admin-workspace-store';
 import type { ContainerInfo } from '../../shared/types';
 import { effectiveWorkerSelfApiAccess } from './worker-self-access';
+import { readAdministrativeRuntimeRecord, administrativeRuntimeOwner } from './admin-native-authority';
 
 export interface WorkerSelfContext {
   container: ContainerInfo;
@@ -91,7 +92,7 @@ async function resolveCallerByIp(remoteIp: string): Promise<ContainerInfo | null
   // A recreated worker reuses its name but not its Docker identity. Never
   // authorize an old address against the replacement's current name: Docker
   // may already have reassigned that address to another worker.
-  if (container?.containerId === entry.containerId) return container;
+  if (container?.runtimeKind !== 'incus-vm' && container?.containerId === entry.containerId) return container;
 
   // Cache hit for a name that no longer resolves to a running worker (e.g. the
   // container was rebuilt and got a new id under the same name) — force one
@@ -100,7 +101,7 @@ async function resolveCallerByIp(remoteIp: string): Promise<ContainerInfo | null
   const retry = ipCache.get(remoteIp);
   if (!retry) return null;
   const current = containerManager.findByContainerName(retry.containerName);
-  return current?.containerId === retry.containerId ? current : null;
+  return current?.runtimeKind !== 'incus-vm' && current?.containerId === retry.containerId ? current : null;
 }
 
 /** Enforce the durable policy on every request rather than trusting the
@@ -142,8 +143,8 @@ export async function requireWorkerSelf(event: H3Event): Promise<WorkerSelfConte
     throw createError({ statusCode: 401, statusMessage: 'Unable to determine caller IP' });
   }
 
-  const container = await resolveCallerByIp(remoteIp);
-  if (!container) {
+  const container = await resolveCallerByIp(remoteIp).catch(() => null) ?? await useContainerManager().resolveIncusCaller(remoteIp);
+  if (!container || container.administrativeKind) {
     throw createError({
       statusCode: 401,
       statusMessage: `No managed worker container found for caller IP ${remoteIp}. Worker-self endpoints can only be reached from inside a managed agentor worker on the Docker bridge network.`,
@@ -177,14 +178,42 @@ export async function requirePluginSelf(event: H3Event): Promise<WorkerSelfConte
   if (!remoteIp) throw createError({ statusCode: 401, statusMessage: 'Unable to determine caller IP' });
   // Preserve ordinary-worker behavior exactly; admin resolution below is a
   // separate capability on private management networks.
-  const ordinary = await resolveCallerByIp(remoteIp);
-  if (ordinary) {
+  const ordinary = await resolveCallerByIp(remoteIp).catch(() => null) ?? await useContainerManager().resolveIncusCaller(remoteIp);
+  if (ordinary && !ordinary.administrativeKind) {
     requireOrdinaryWorkerSelfAccess(ordinary);
     if (ordinary.status !== 'running') throw createError({ statusCode: 409, statusMessage: 'Worker container is not running', data: { status: ordinary.status, diagnostic: ordinary.runtimeDiagnostic } });
     return { container: ordinary, userId: ordinary.userId, containerName: ordinary.containerName, workerId: ordinary.id, authority: { kind: 'ordinary', userId: ordinary.userId, workerId: ordinary.id } };
   }
   const docker = useDockerService();
   const cm = useContainerManager();
+  const nativeMatches: WorkerSelfContext[] = [];
+  const nativeRuntimes = cm.list().filter(info => info.runtimeKind === 'incus-vm' && info.administrativeKind && info.status === 'running');
+  // Narrow candidates with host-owned NIC configuration before any guest
+  // readiness probe. Unknown-IP requests must not execute in every admin VM.
+  const instances = nativeRuntimes.length ? await useAdministrativeWorkspaceRuntime().native.client.listInstances().catch(() => []) : [];
+  for (const runtime of nativeRuntimes) {
+    const candidates = instances.filter(instance => instance.config['user.agentor.id'] === runtime.id &&
+      runtime.containerId === 'incus:'+instance.config['volatile.uuid'] &&
+      (instance.expanded_devices ?? instance.devices).eth0?.['ipv4.address'] === remoteIp);
+    if (candidates.length !== 1) continue;
+    try {
+      // The adapter proves the fixed private management NIC, guest service,
+      // dedicated owner and live UUID; a guest-reported IP never grants trust.
+      if (await cm.resolveWorkerHost(runtime.id) !== remoteIp) continue;
+      const record = await readAdministrativeRuntimeRecord(runtime.id), owner = administrativeRuntimeOwner(record);
+      if (record.runtimeKind !== 'incus-vm' || record.status !== 'running' || owner.userId !== runtime.userId ||
+          record.nativeRuntime?.incarnation !== runtime.containerId.slice(6) ||
+          (owner.kind === 'group-administrative' ? 'group' : 'platform') !== runtime.administrativeKind) continue;
+      const authority: WorkerSelfAuthority = owner.kind === 'group-administrative'
+        ? { kind: 'group-admin', workspaceId: runtime.id, groupId: owner.groupId!, ownerId: owner.userId }
+        : { kind: 'platform-admin', workspaceId: runtime.id };
+      if (await cm.resolveWorkerHost(runtime.id) !== remoteIp || cm.get(runtime.id)?.containerId !== runtime.containerId) continue;
+      nativeMatches.push({ container: runtime, userId: runtime.userId, containerName: runtime.containerName,
+        workerId: runtime.id, authority });
+    } catch { /* Unavailable or changing authority never authenticates a peer. */ }
+  }
+  if (nativeMatches.length === 1) return nativeMatches[0]!;
+  if (nativeMatches.length > 1) throw createError({ statusCode: 401, statusMessage: 'Administrative peer identity is ambiguous' });
   const containers = await docker.listAdministrativeContainers();
   for (const raw of containers) {
     const labels = raw.Labels ?? {};
@@ -205,11 +234,13 @@ export async function requirePluginSelf(event: H3Event): Promise<WorkerSelfConte
     if (runtime.administrativeKind === 'group') {
       const groupId = labels['agentor.admin.group-id'];
       const record = groupId ? useGroupAdminWorkspaceStore().findByWorkspaceId(workspaceId) : undefined;
-      if (!groupId || !record || record.groupId !== groupId || record.status !== 'running') continue;
+      if (!groupId || !record || record.groupId !== groupId || record.status !== 'running' || record.ownerId !== runtime.userId ||
+          record.runtimeKind === 'incus-vm' || record.nativeMigration && record.nativeMigration.phase !== 'retained') continue;
       authority = { kind: 'group-admin', workspaceId, groupId, ownerId: record.ownerId };
     } else {
       const record = useAdminWorkspaceStore().getRecord();
-      if (!record || record.id !== workspaceId) continue;
+      if (!record || record.id !== workspaceId || record.status !== 'running' || record.runtimeKind === 'incus-vm' ||
+          record.nativeMigration && record.nativeMigration.phase !== 'retained') continue;
       authority = { kind: 'platform-admin', workspaceId };
     }
     return { container: runtime, userId: runtime.userId, containerName: name, workerId: runtime.id, authority };

@@ -20,7 +20,7 @@ import type { FileEntry, FileListing } from '../../shared/types';
  *   other          -> 500
  */
 export async function runProbe(
-  docker: DockerService,
+  docker: Pick<DockerService, 'execCapture'>,
   containerId: string,
   subcommand: 'lstat' | 'list',
   rel: string,
@@ -41,7 +41,7 @@ export async function runProbe(
  * as JSON on stdin — never interpolated.
  */
 export async function runProbeCheckMany(
-  docker: DockerService,
+  docker: Pick<DockerService, 'execCapture'>,
   containerId: string,
   rels: string[],
   signal?: AbortSignal,
@@ -105,7 +105,7 @@ export function probeErrorToHttp(result: Extract<ProbeResult, { ok: false }>): n
 }
 
 /** `lstat` a single relative path; throws an h3 error on failure. */
-export async function probeLstat(docker: DockerService, containerId: string, rel: string, signal?: AbortSignal): Promise<FileEntry> {
+export async function probeLstat(docker: Pick<DockerService, 'execCapture'>, containerId: string, rel: string, signal?: AbortSignal): Promise<FileEntry> {
   const r = await runProbe(docker, containerId, 'lstat', rel, signal);
   if (!r.ok) throw probeErrorToHttp(r);
   if (!r.entry) throw createError({ statusCode: 500, statusMessage: 'Workspace probe returned no entry' });
@@ -113,7 +113,7 @@ export async function probeLstat(docker: DockerService, containerId: string, rel
 }
 
 /** One-level directory listing; throws an h3 error on failure. */
-export async function probeList(docker: DockerService, containerId: string, rel: string, signal?: AbortSignal): Promise<FileListing> {
+export async function probeList(docker: Pick<DockerService, 'execCapture'>, containerId: string, rel: string, signal?: AbortSignal): Promise<FileListing> {
   const r = await runProbe(docker, containerId, 'list', rel, signal);
   if (!r.ok) throw probeErrorToHttp(r);
   return { path: rel, entries: r.entries ?? [] };

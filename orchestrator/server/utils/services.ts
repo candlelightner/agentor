@@ -1,3 +1,4 @@
+import { AdministrativeWorkspaceRuntime } from "./administrative-workspace-runtime";
 import Docker from "dockerode";
 import { loadConfig } from "./config";
 import { DockerService } from "./docker";
@@ -38,6 +39,8 @@ import { useGroupAdminWorkspaceStore } from "./group-admin-workspace-store";
 import { PersistentBackupPathManager } from "./persistent-backup-paths";
 import { HostMountStore } from "./host-mount-store";
 import { HardwareDeviceStore } from "./hardware-device-store";
+import { IncusClient } from "./incus-client";
+import { IncusWorkerCommands } from "./incus-worker-commands";
 
 function singleton<T>(factory: () => T): () => T {
   let instance: T | undefined;
@@ -49,12 +52,16 @@ function singleton<T>(factory: () => T): () => T {
 
 export const useConfig = singleton(() => loadConfig());
 export const useDockerService = singleton(() => new DockerService(useConfig()));
+export const useIncusClient = singleton(() => IncusClient.fromConfig(useConfig()));
 export const useStorageManager = singleton(
   () =>
     new StorageManager(
       new Docker({ socketPath: "/var/run/docker.sock" }),
       useConfig(),
     ),
+);
+export const useAdministrativeWorkspaceRuntime = singleton(
+  () => new AdministrativeWorkspaceRuntime(useConfig()),
 );
 export const useContainerManager = singleton(
   () => new ContainerManager(useDockerService(), useConfig()),
@@ -85,14 +92,26 @@ export const useSelfSignedCertManager = singleton(
   () => new SelfSignedCertManager(useConfig().dataDir),
 );
 export const useTraefikManager = singleton(
-  () =>
-    new TraefikManager(
+  () => {
+    const manager = new TraefikManager(
       useConfig(),
       useDomainMappingStore(),
       usePortMappingStore(),
       useStorageManager(),
       useSelfSignedCertManager(),
-    ),
+    );
+    manager.setWorkerBackendResolver(async (mapping) => {
+      const workers = useContainerManager();
+      const info = workers.get(mapping.workerId) ?? workers.findByContainerName(mapping.containerName);
+      if (!info || info.userId !== mapping.userId || info.containerName !== mapping.containerName) return null;
+      if (info.runtimeKind === "incus-vm") {
+        if (info.id !== mapping.workerId) return null;
+        return workers.resolveWorkerHost(info.id);
+      }
+      return info.containerName;
+    });
+    return manager;
+  },
 );
 export const useEnvironmentStore = singleton(
   () => new EnvironmentStore(useConfig().dataDir),
@@ -145,6 +164,13 @@ export const usePluginRuntimeManager = singleton(
           return worker && worker.status === "running"
             ? worker.containerId
             : undefined;
+        },
+        async (workerId, command, signal) => {
+          if (useContainerManager().get(workerId)?.runtimeKind !== 'incus-vm') return undefined;
+          const commands = useContainerManager().workerCommands(workerId);
+          if (!(commands instanceof IncusWorkerCommands)) throw new Error('Worker plugin runtime changed');
+          const { stream, stderr: sourceError } = await commands.openDuplex(command, signal);
+          return { stream, demux: (stdout, stderr) => { stream.pipe(stdout); sourceError.pipe(stderr); } };
         },
       ),
       {

@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HostMountStore, validateHostMountCatalogSource } from "../../orchestrator/server/utils/host-mount-store";
+import { HostMountStore, validateHostMountCatalogSource, validateHostMountTarget } from "../../orchestrator/server/utils/host-mount-store";
 import type { WorkerGroup } from "../../orchestrator/server/utils/worker-group-store";
 import { ManagementWorkerDomain } from "../../orchestrator/server/utils/management-worker-domain";
 import { ManagementHostMountDomain } from "../../orchestrator/server/utils/management-host-mount-domain";
@@ -36,7 +36,7 @@ test("host mount catalog starts empty and rejects authority surfaces and Agentor
   const { dir, store } = await fixture();
   try {
     expect(store.listCatalog()).toEqual([]);
-    for (const source of ["/", "/etc", "/etc/ssh", "/var", "/var/lib/docker/volumes", "/srv", "/srv/agentor-data/users"])
+    for (const source of ["/", "/etc", "/etc/ssh", "/var", "/var/lib", "/var/lib/docker/volumes", "/var/lib/incus", "/var/lib/incus/storage-pools", "/srv", "/srv/agentor-data/users"])
       expect(() => validateHostMountCatalogSource(source, "/srv/agentor-data")).toThrow();
     for (const source of ["/srv/line\nbreak", "/srv/tab\tpath", "/srv/data:rw"])
       expect(() => validateHostMountCatalogSource(source, "/srv/agentor-data")).toThrow(/control|colon/);
@@ -46,6 +46,25 @@ test("host mount catalog starts empty and rejects authority surfaces and Agentor
       sourcePath: "/srv/bad-write-flag",
       allowWrite: "true",
     })).rejects.toThrow(/boolean/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("host mount sources cannot widen the Incus disk-path allowlist", async () => {
+  const { dir, store } = await fixture();
+  try {
+    for (const source of ["/srv/shared,/etc", "/srv/shared,other", "/srv/shared,"]) {
+      expect(() => validateHostMountCatalogSource(source, "/srv/agentor-data"))
+        .toThrow(/comma/);
+      await expect(store.createPath({ name: "Invalid source", sourcePath: source }))
+        .rejects.toThrow(/comma/);
+    }
+    expect(store.listCatalog()).toEqual([]);
+    const path = await store.createPath({ name: "Dedicated", sourcePath: "/srv/dedicated-data" });
+    expect(path.sourcePath).toBe("/srv/dedicated-data");
+    // Targets are not used to build the host-source policy allowlist.
+    expect(validateHostMountTarget("/mnt/shared,other")).toBe("/mnt/shared,other");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

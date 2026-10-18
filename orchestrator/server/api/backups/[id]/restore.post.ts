@@ -104,6 +104,7 @@ export default defineEventHandler(async (event) => {
       body?.workspaceIds,
       body?.requestId,
       body?.imageResolutions,
+      user.role === 'admin' ? { kind: 'admin-user', userId: user.id } : undefined,
     );
   } catch (error: any) {
     if (typeof error?.statusCode === "number") throw error;

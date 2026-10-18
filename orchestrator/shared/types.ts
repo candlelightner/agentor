@@ -58,6 +58,14 @@ export interface HardwareDevice {
   updatedAt: string;
 }
 
+export interface IncusHardwareCapability {
+  supported: boolean;
+  mode: "usb-exclusive" | "gpu-mdev" | "unsupported";
+  reason: string;
+  evidence?: { driver?: string; iommuGroup?: string; mediatedProfiles?: string[]; sriovTotalVfs?: number; bootVga?: boolean; gvtEnabled?: boolean;
+    mediatedAvailable?: Record<string, number>; mediatedInstances?: Record<string, string[]> };
+}
+
 export interface HardwareDeviceCandidate {
   name: string;
   kind: HardwareDeviceKind;
@@ -67,6 +75,8 @@ export interface HardwareDeviceCandidate {
   serial?: string;
   deviceNodes: string[];
   groupIds: number[];
+  /** Read-only host discovery evidence, never caller-supplied assignment authority. */
+  incus?: IncusHardwareCapability;
 }
 
 export type HardwareDeviceGrantTarget = HostMountGrantTarget;
@@ -86,6 +96,7 @@ export interface HardwareDeviceGrant {
 }
 
 export interface ResolvedHardwareDevice {
+  candidate?: HardwareDeviceCandidate;
   deviceId: string;
   deviceNodes: string[];
   groupIds: number[];
@@ -191,11 +202,21 @@ export interface WorkerGroupLifecycleResult {
   failures: Array<{ workerId: string; message: string }>;
 }
 
+export type WorkerRuntimeKind = "legacy-docker" | "incus-vm";
+
+export function normalizeWorkerRuntimeKind(
+  runtimeKind?: unknown,
+): WorkerRuntimeKind {
+  return runtimeKind === "incus-vm" ? "incus-vm" : "legacy-docker";
+}
+
 /** A worker. `id` is the worker's stable UUID identity (immutable across
  * rebuild/unarchive); `containerId`/`containerName` describe the current Docker
  * container (the `containerId` changes on every rebuild). Extends
  * `UserOwnedResource` so it carries `id`/`userId`/`createdAt`/`updatedAt`. */
 export interface ContainerInfo extends UserOwnedResource {
+  /** Worker compute runtime technology: legacy Docker container vs Incus VM. */
+  runtimeKind: WorkerRuntimeKind;
   /** Trusted orchestrator-managed workspace; never eligible for ordinary worker lifecycle mutations. */
   administrativeKind?: "platform" | "group";
   /** Current Docker container ID (64-hex; the short form is the in-container
@@ -326,6 +347,8 @@ export interface ImageUpdateInfo {
   remoteDigest: string;
   updateAvailable: boolean;
   lastChecked: string;
+  /** OCI may be current while the native bootstrap still needs Apply. */
+  nativeUpdateRequired?: boolean;
   error?: string;
 }
 
@@ -341,6 +364,8 @@ export interface UpdateStatus {
 export interface ApplyResult {
   orchestratorPulled: boolean;
   workerPulled: boolean;
+  /** Apply All prepares the worker under the new orchestrator package. */
+  workerDeferred?: boolean;
   traefikPulled: boolean;
   orchestratorRestarting: boolean;
   errors: string[];
@@ -469,8 +494,9 @@ export interface WorkerMetrics {
   containerName: string;
   displayName: string;
   status: ContainerStatus;
-  /** 0-100 — fraction of total host CPU capacity used by this worker. */
+  /** 0-100; legacy workers use total host capacity, VMs allocated vCPU capacity. */
   cpuUtilization: number;
+  cpuCapacity?: 'host' | 'worker';
   memoryUsedBytes: number;
   /** The worker's memory limit (cgroup limit; equals host memory when uncapped). */
   memoryLimitBytes: number;
@@ -484,6 +510,8 @@ export interface WorkerMetrics {
   blkReadBytesPerSec: number;
   blkWriteBytesPerSec: number;
   lastChecked: string;
+  /** OCI may be current while the native bootstrap still needs Apply. */
+  nativeUpdateRequired?: boolean;
   error?: string;
 }
 
@@ -495,6 +523,8 @@ export type LogLevel = "debug" | "info" | "warn" | "error";
 export type LogSource = "orchestrator" | "worker" | "traefik";
 
 export interface LogEntry {
+  /** Durable identity for stable same-timestamp log pagination. */
+  id?: string;
   timestamp: string;
   level: LogLevel;
   source: LogSource;

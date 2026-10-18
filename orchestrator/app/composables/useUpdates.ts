@@ -6,6 +6,7 @@ export function useUpdates() {
   const isApplying = ref(false);
   const isPruning = ref(false);
   const isRestarting = ref(false);
+  const workerUpdateDeferred = ref(false);
   const applyErrors = ref<string[]>([]);
   const applyingImages = ref(new Set<UpdatableImage>());
   const lastPruneResult = ref<PruneResult | null>(null);
@@ -41,6 +42,7 @@ export function useUpdates() {
     try {
       const result = await $fetch<ApplyResult>('/api/updates/apply', { method: 'POST' });
       applyErrors.value = result.errors;
+      workerUpdateDeferred.value = Boolean(result.workerDeferred);
 
       if (result.orchestratorRestarting) {
         isRestarting.value = true;
@@ -64,6 +66,7 @@ export function useUpdates() {
         body: { images: [image] },
       });
       applyErrors.value = result.errors;
+      workerUpdateDeferred.value = Boolean(result.workerDeferred);
 
       if (result.orchestratorRestarting) {
         isRestarting.value = true;
@@ -159,6 +162,7 @@ export function useUpdates() {
     isPruning,
     isRestarting,
     applyErrors,
+    workerUpdateDeferred,
     applyingImages,
     lastPruneResult,
     updatesAvailable,

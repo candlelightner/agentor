@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { join, posix } from "node:path";
 import type { ManagedVolume, PersistencePolicy } from "../../shared/managed-volumes";
+import type { WorkerRuntimeKind } from "../../shared/types";
+import { MANAGED_KILO_PARENT } from './managed-volume-kilo-parent';
 import { UserScopedJsonStore } from "./user-scoped-store";
 
 export function volumeError(statusCode: number, message: string) {
@@ -30,13 +32,38 @@ export function validatePersistenceTarget(input: unknown): string {
   return input;
 }
 
+/** Stored migration/import records retain the whole historical XDG parent.
+ * Callers must prove its canonical Kilo link before mounting or worker startup. */
+export function validateStoredPersistenceTarget(input: unknown): string {
+  return input === MANAGED_KILO_PARENT ? input : validatePersistenceTarget(input);
+}
+
+/** One bounded private live-cutover intent, not a portable data authority.
+ * Unknown submission is distinct from a daemon operation whose identity was
+ * acknowledged. seeded remains the only committed copy authority. */
+export interface IncusLiveVolumeIntent {
+  id: string;
+  incarnation: string;
+  bootId: string;
+  attachment: 'not-submitted' | 'unknown' | 'accepted' | 'settled';
+  operation?: string;
+  /** Set only after proven source sync/freezer state and terminal cold stop.
+   * Allows interrupted rollback to continue without recopying either source. */
+  rollback?: true;
+}
+
 export interface StoredManagedVolume extends ManagedVolume {
   /** Internal only. Never accepted from REST/MCP or exposed in public results. */
   dockerName: string;
+  /** Backend survives worker/account deletion. Missing historical value is Docker.
+   * Internal platform authority, never portable/public worker input. */
+  storageRuntimeKind?: WorkerRuntimeKind;
   seeded: boolean;
   /** A live mount is transient until a Docker-declared replacement exists. */
   liveContainerId?: string;
   previousRestartPolicy?: { Name: string; MaximumRetryCount?: number };
+  /** Persists before any guest freeze/attachment. Never expose/import it. */
+  incusLive?: IncusLiveVolumeIntent;
 }
 
 function validateRecord(v: StoredManagedVolume) {
@@ -48,7 +75,24 @@ function validateRecord(v: StoredManagedVolume) {
       !["pending", "preparing", "ready", "failed", "detached"].includes(v.state) ||
       typeof v.attached !== "boolean" || typeof v.seeded !== "boolean")
     throw new Error("Invalid managed volume record");
-  if (v.purpose === "persistent-path") validatePersistenceTarget(v.target);
+  if (v.storageRuntimeKind !== undefined && v.storageRuntimeKind !== 'legacy-docker' && v.storageRuntimeKind !== 'incus-vm')
+    throw new Error('Invalid managed volume storage runtime');
+  if (v.incusLive !== undefined) {
+    const intent = v.incusLive, uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
+    if (!intent || typeof intent !== 'object' || Array.isArray(intent) ||
+        v.storageRuntimeKind !== 'incus-vm' || v.purpose !== 'persistent-path' ||
+        v.liveContainerId !== undefined || v.previousRestartPolicy !== undefined ||
+        Object.keys(intent).some(key => !['id', 'incarnation', 'bootId', 'attachment', 'operation', 'rollback'].includes(key)) ||
+        ![intent.id, intent.incarnation, intent.bootId].every(value => typeof value === 'string' && uuid.test(value)) ||
+        !['not-submitted', 'unknown', 'accepted', 'settled'].includes(intent.attachment) ||
+        (intent.rollback !== undefined && (intent.rollback !== true || v.seeded)) ||
+        (intent.operation !== undefined && (typeof intent.operation !== 'string' ||
+          !/^\/1\.0\/operations\/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(intent.operation))) ||
+        (intent.attachment === 'accepted' && !intent.operation) ||
+        (['not-submitted', 'unknown'].includes(intent.attachment) && intent.operation !== undefined))
+      throw new Error('Invalid Incus live-volume recovery intent');
+  }
+  if (v.purpose === "persistent-path") validateStoredPersistenceTarget(v.target);
   return v.id;
 }
 
@@ -67,6 +111,8 @@ export class ManagedVolumeStore extends UserScopedJsonStore<string, StoredManage
   /** Copy first, then remove the disposable owner partition. A crash with both
    * copies present is safe: the administrator-retained record wins on load. */
   async retainForDeletedOwner(userId: string) {
+    if (this.listForUser(userId).some(v => v.incusLive))
+      throw volumeError(409, 'Resolve live storage recovery before removing its owner. All data was retained.');
     for (const v of this.listForUser(userId))
       await this.retained.save({ ...v, attached: false, state: "detached", retainedAfterAccountDeletion: true });
     await super.removeForUser(userId);
@@ -76,8 +122,11 @@ export class ManagedVolumeStore extends UserScopedJsonStore<string, StoredManage
     return this.listForUser(userId).filter((v) => v.workerId === workerId);
   }
 
-  async create(userId: string, workerId: string, target: string, name?: string) {
-    validatePersistenceTarget(target);
+  async create(userId: string, workerId: string, target: string, name?: string, storageRuntimeKind?: WorkerRuntimeKind, archivePath?: string) {
+    if (target === MANAGED_KILO_PARENT && archivePath) {
+      const { validatePortableManagedVolumeArchive } = await import('./portable-managed-volume-archive');
+      await validatePortableManagedVolumeArchive(archivePath, { target, requirePosixUstar: true });
+    } else validatePersistenceTarget(target);
     const volumes = this.forWorker(userId, workerId);
     const existing = volumes.find((v) => v.target === target && v.attached);
     if (existing) return existing;
@@ -89,6 +138,7 @@ export class ManagedVolumeStore extends UserScopedJsonStore<string, StoredManage
     const record: StoredManagedVolume = {
       id, userId, workerId, target, name: volumeName(name, posix.basename(target)),
       dockerName: `agentor-persist-${id}`, purpose: "persistent-path",
+      ...(storageRuntimeKind ? { storageRuntimeKind } : {}),
       attached: true, seeded: false, state: "pending", createdAt: stamp, updatedAt: stamp,
     };
     await this.save(record);
@@ -101,7 +151,14 @@ export class ManagedVolumeStore extends UserScopedJsonStore<string, StoredManage
     await this.setItem(record.userId, { ...record, updatedAt: new Date().toISOString() });
   }
 
-  async forget(userId: string, id: string) { await this.deleteItem(userId, id); await this.retained.forget(userId, id); }
+  async forget(userId: string, id: string) {
+    assertIncusLiveResolved(this.get(userId, id));
+    await this.deleteItem(userId, id); await this.retained.forget(userId, id);
+  }
+  override async removeForUser(userId: string) {
+    for (const v of this.listForUser(userId)) assertIncusLiveResolved(v);
+    return super.removeForUser(userId);
+  }
 }
 
 function mergeVolumeRecords(ordinary: StoredManagedVolume[], retained: StoredManagedVolume[]) {
@@ -120,8 +177,16 @@ class RetainedVolumeRecords extends UserScopedJsonStore<string, StoredManagedVol
 
 export function publicVolume(v: StoredManagedVolume): ManagedVolume {
   const { dockerName: _docker, seeded: _seeded, liveContainerId: _live,
-    previousRestartPolicy: _restart, ...result } = v;
+    previousRestartPolicy: _restart, storageRuntimeKind: _runtime, incusLive: _intent, ...result } = v;
   return result;
+}
+
+export function assertIncusLiveResolved(v: StoredManagedVolume | undefined) {
+  if (v?.incusLive) throw volumeError(409, 'Incus live storage recovery is unresolved. Compute, original source and volume data were retained.');
+}
+
+export function managedVolumeRuntimeKind(v: StoredManagedVolume): WorkerRuntimeKind {
+  return v.storageRuntimeKind ?? 'legacy-docker';
 }
 
 export function volumeName(value: unknown, fallback: string) {

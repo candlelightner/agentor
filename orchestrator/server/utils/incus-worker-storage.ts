@@ -1,0 +1,359 @@
+import type { Config } from "./config";
+import type { IncusClient, IncusCustomVolume, IncusDevice } from "./incus-client";
+import { validateIncusImageIdentity, sameIncusImageSource, sameIncusImageBase, type IncusWorkerImageIdentity } from './incus-worker-image';
+import { isDeepStrictEqual } from 'node:util';
+
+type Role = "workspace" | "agents" | "docker";
+export interface IncusStorageOwner { id: string; userId: string; containerName: string }
+
+/** Same naming admission before readonly restore preflight and allocation. */
+export function incusWorkerVolumeName(owner: IncusStorageOwner, containerPrefix: string, role: Role): string {
+  if (!/^[a-zA-Z0-9_-]+$/.test(owner.id) || owner.containerName !== `${containerPrefix}-${owner.id}`)
+    throw new Error('Invalid Incus worker storage identity');
+  return `${owner.containerName}-${role}`;
+}
+
+/** Only core worker storage: deliberately independent of disposable VM/root
+ * lifetime. Managed volumes/account shares have their own existing ownership. */
+export class IncusWorkerStorage {
+  constructor(private client: IncusClient, private config: Config, private installationId: string) {}
+
+  private name(owner: IncusStorageOwner, role: Role): string {
+    return incusWorkerVolumeName(owner, this.config.containerPrefix, role);
+  }
+
+  private async find(owner: IncusStorageOwner, role: Role): Promise<IncusCustomVolume | undefined> {
+    try { return await this.client.getCustomVolume(this.config.incusStoragePool, this.name(owner, role)); }
+    catch (error) {
+      if ((error as { statusCode?: number }).statusCode === 404) return undefined;
+      throw error;
+    }
+  }
+
+  /** Inventory only: absence never authorizes allocating replacement data. */
+  async inspectVolume(owner: IncusStorageOwner, role: Role): Promise<IncusCustomVolume | undefined> {
+    const volume = await this.find(owner, role);
+    if (volume) this.validate(volume, owner, role);
+    return volume;
+  }
+
+  /** Restore destinations are new identities. Never adopt even an owned but
+   * previously populated volume, including after an ambiguous create reply. */
+  async freshRestoreDevices(owner: IncusStorageOwner, dockerNonce?: string): Promise<Record<string, IncusDevice>> {
+    if (dockerNonce !== undefined && !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(dockerNonce))
+      throw new Error('Fresh Docker restore requires a valid import nonce');
+    for (const role of ['workspace', 'agents', 'docker'] as const)
+      if (await this.find(owner, role)) throw new Error('Incus restore requires absent destination storage');
+    const devices: Record<string, IncusDevice> = {};
+    for (const role of ['workspace', 'agents'] as const) {
+      const name = this.name(owner, role);
+      await this.client.createCustomVolume(this.config.incusStoragePool, {
+        name, content_type: 'filesystem', config: {
+          'user.agentor.installation': this.installationId, 'user.agentor.id': owner.id,
+          'user.agentor.owner': owner.userId, 'user.agentor.storage-role': role,
+        },
+      });
+      const volume = await this.find(owner, role);
+      if (!volume) throw new Error('Fresh Incus restore storage is missing');
+      this.validate(volume, owner, role);
+      if (volume.used_by?.length) throw new Error('Fresh Incus restore storage is already attached');
+      devices[role] = { type: 'disk', pool: this.config.incusStoragePool, source: name,
+        path: role === 'workspace' ? '/restore/workspace' : '/restore/.agent-data' };
+    }
+    if (dockerNonce) {
+      const name = this.name(owner, 'docker');
+      await this.client.createCustomVolume(this.config.incusStoragePool, {
+        name, content_type: 'block', config: {
+          size: this.config.incusDockerVolumeSize,
+          'user.agentor.installation': this.installationId, 'user.agentor.id': owner.id,
+          'user.agentor.owner': owner.userId, 'user.agentor.storage-role': 'docker',
+          'user.agentor.restore-nonce': dockerNonce, 'user.agentor.allow-initialization': 'true',
+        },
+      });
+      const volume = await this.inspectVolume(owner, 'docker');
+      if (!volume || volume.used_by?.length || volume.config['user.agentor.restore-nonce'] !== dockerNonce ||
+          volume.config['user.agentor.allow-initialization'] !== 'true')
+        throw new Error('Fresh Docker restore storage authority is unavailable');
+      devices.docker = { type: 'disk', pool: this.config.incusStoragePool, source: name };
+    }
+    return devices;
+  }
+
+  /** Only after the isolated extraction and native source proofs succeed.
+   * Partial writes remain fenced by importIncomplete, never reseeded. */
+  async markDockerRestored(owner: IncusStorageOwner, nonce: string): Promise<void> {
+    const volume = await this.inspectVolume(owner, 'docker'), workspace = await this.inspectVolume(owner, 'workspace');
+    if (!volume || !workspace || volume.config['user.agentor.restore-nonce'] !== nonce ||
+        volume.config['user.agentor.allow-initialization'] !== 'true')
+      throw new Error('Docker restore completion authority is unavailable');
+    await this.markDockerInitialized(owner);
+    await this.client.updateCustomVolume(this.config.incusStoragePool, workspace.name,
+      { ...workspace.config, 'user.agentor.docker-data': 'true' });
+  }
+
+  private validate(volume: IncusCustomVolume, owner: IncusStorageOwner, role: Role): void {
+    const c = volume.config;
+    if (volume.name !== this.name(owner, role) || volume.type !== "custom" ||
+        volume.content_type !== (role === "docker" ? "block" : "filesystem") ||
+        c["user.agentor.installation"] !== this.installationId || c["user.agentor.id"] !== owner.id ||
+        c["user.agentor.owner"] !== owner.userId || c["user.agentor.storage-role"] !== role)
+      throw new Error("Incus persistent volume ownership/type is ambiguous; refusing to use it");
+    if ((volume.used_by ?? []).some((ref) => {
+      const url = new URL(ref, this.client.endpoint);
+      return url.pathname !== `/1.0/instances/${owner.containerName}` || url.searchParams.get("project") !== this.config.incusProject;
+    })) throw new Error("Incus worker volume is attached to another runtime");
+  }
+
+  private async ensure(owner: IncusStorageOwner, role: Role): Promise<IncusCustomVolume> {
+    let volume = await this.find(owner, role);
+    if (!volume) {
+      try {
+        await this.client.createCustomVolume(this.config.incusStoragePool, {
+          name: this.name(owner, role), content_type: role === "docker" ? "block" : "filesystem",
+          config: {
+            "user.agentor.installation": this.installationId, "user.agentor.id": owner.id,
+            "user.agentor.owner": owner.userId, "user.agentor.storage-role": role,
+            ...(role === "docker" ? { size: this.config.incusDockerVolumeSize,
+              "user.agentor.allow-initialization": "true" } : {}),
+          },
+        });
+      } catch (error) {
+        // A concurrent/retried create converges only through an ownership
+        // check. Do not retry ambiguous transport errors as a second write.
+        if ((error as { statusCode?: number }).statusCode !== 409) throw error;
+      }
+      volume = await this.find(owner, role);
+    }
+    if (!volume) throw new Error("Incus persistent volume was not created");
+    this.validate(volume, owner, role);
+    return volume;
+  }
+
+  async devices(owner: IncusStorageOwner, dockerEnabled: boolean, existing?: { docker: boolean }): Promise<Record<string, IncusDevice>> {
+    const requireExisting = async (role: Role) => {
+      const volume = await this.find(owner, role);
+      if (!volume) throw new Error(`Existing Incus ${role} volume is missing; explicit recovery is required`);
+      this.validate(volume, owner, role);
+      return volume;
+    };
+    // Starting known compute is not authority to replace missing canonical
+    // data with an empty volume. Validate both private roots before any write.
+    for (const role of ["workspace", "agents"] as const) {
+      if (existing) await requireExisting(role);
+      else await this.ensure(owner, role);
+    }
+    const workspace = await requireExisting('workspace');
+    const retainedDocker = this.expectsDocker(workspace);
+    // Once allocated, disabling Docker must never turn lost canonical Docker
+    // data into authority to create an empty replacement. The private-volume
+    // marker survives deletion of disposable compute and is never cleared.
+    if (retainedDocker) await requireExisting('docker');
+    const devices: Record<string, IncusDevice> = {
+      workspace: { type: "disk", 'io.cache': 'unsafe', pool: this.config.incusStoragePool, source: this.name(owner, "workspace"), path: "/workspace" },
+      agents: { type: "disk", 'io.cache': 'unsafe', pool: this.config.incusStoragePool, source: this.name(owner, "agents"), path: "/home/agent/.agent-data" },
+    };
+    const docker = existing?.docker ? await requireExisting("docker")
+      : dockerEnabled ? await this.ensure(owner, "docker") : await this.find(owner, "docker");
+    if (docker) {
+      this.validate(docker, owner, "docker");
+      if (!retainedDocker) await this.client.updateCustomVolume(this.config.incusStoragePool, workspace.name,
+        { ...workspace.config, 'user.agentor.docker-data': 'true' });
+      // Fixed device name, hence fixed guest serial; never guess an unused disk.
+      devices.docker = { type: "disk", pool: this.config.incusStoragePool, source: this.name(owner, "docker") };
+    }
+    return devices;
+  }
+
+  async dockerInitializationAllowed(owner: IncusStorageOwner): Promise<boolean> {
+    const volume = await this.find(owner, "docker");
+    if (!volume) throw new Error("Authoritative Docker volume is missing");
+    this.validate(volume, owner, "docker");
+    return volume.config["user.agentor.allow-initialization"] === "true";
+  }
+
+  /** Metadata preservation survives compute disposal. Partial writes must
+   * never permit a later recursive ownership repair over restored data. */
+  async preserveOwnership(owner: IncusStorageOwner): Promise<boolean> {
+    const flags: Array<string | undefined> = [];
+    let workspaceOnly = false;
+    for (const role of ['workspace', 'agents'] as const) {
+      const volume = await this.inspectVolume(owner, role);
+      if (!volume) throw new Error(`Existing Incus ${role} volume is missing; explicit recovery is required`);
+      const single = volume.config['user.agentor.workspace-preserve-ownership'];
+      if (single !== undefined && (role !== 'workspace' || single !== 'true'))
+        throw new Error('Incus workspace ownership metadata is malformed');
+      if (role === 'workspace') workspaceOnly = single === 'true';
+      flags.push(volume.config['user.agentor.preserve-ownership']);
+    }
+    if (flags.every(flag => flag === undefined)) return workspaceOnly;
+    if (flags.every(flag => flag === 'true')) return true;
+    throw new Error('Incus canonical ownership metadata is malformed or incomplete; explicit recovery is required');
+  }
+
+  /** Original workspace-only restore changes no agents/Docker metadata. The
+   * existing tmpfs preservation mode also leaves untouched agents unchanged.
+   * Caller holds the exact accepted helper/source fence; unknown PUT results
+   * remain quarantined in that helper's existing writer receipt. */
+  async markWorkspacePreserveOwnership(owner: IncusStorageOwner, expected: IncusCustomVolume, helperName: string): Promise<IncusCustomVolume> {
+    const path = `/1.0/storage-pools/${encodeURIComponent(this.config.incusStoragePool)}/volumes/custom/${encodeURIComponent(this.name(owner, 'workspace'))}`;
+    const snapshot = await this.client.rawRequest('GET', path);
+    const envelope = JSON.parse(snapshot.body.toString('utf8'));
+    const current = envelope.metadata as IncusCustomVolume, etag = snapshot.headers.etag;
+    // Native used_by ordering is not an incarnation/authority field. Preserve
+    // the full multiset (including duplicates), and compare everything else
+    // unchanged. Exact canonical source/helper references are proved below.
+    const sameSnapshot = (actual: IncusCustomVolume, before: IncusCustomVolume) =>
+      Array.isArray(actual.used_by) && Array.isArray(before.used_by) &&
+      isDeepStrictEqual({ ...actual, used_by: [...actual.used_by].sort() }, { ...before, used_by: [...before.used_by].sort() });
+    if (snapshot.statusCode >= 400 || envelope.type !== 'sync' || !current)
+      throw new Error('Original workspace ownership native snapshot is unavailable');
+    if (!etag || typeof etag !== 'string') throw new Error('Original workspace ownership native snapshot lacks ETag');
+    if (!sameSnapshot(current, expected)) {
+      // Only fixed native field names are diagnostic; never log config values
+      // or caller-supplied/unknown field names from native metadata.
+      const fields = (['name', 'type', 'content_type', 'description', 'created_at', 'project', 'config', 'used_by'] as const)
+        .filter(key => !isDeepStrictEqual(key === 'used_by' && Array.isArray(current[key]) ? [...current[key]].sort() : current[key],
+          key === 'used_by' && Array.isArray(expected[key]) ? [...expected[key]].sort() : expected[key]));
+      throw new Error('Original workspace ownership native snapshot metadata changed: ' + (fields.join(',') || 'other-native-fields'));
+    }
+    if (current.project !== this.config.incusProject || !current.created_at || !Number.isFinite(Date.parse(current.created_at)))
+      throw new Error('Original workspace ownership native snapshot project/created_at authority is invalid');
+    if (!/^abk-[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(helperName) ||
+        !Array.isArray(current.used_by) || current.used_by.length !== 2 ||
+        !isDeepStrictEqual(current.used_by.map(value => {
+          const url = new URL(value, this.client.endpoint);
+          if (url.origin !== new URL(this.client.endpoint).origin || url.username || url.password || url.hash ||
+              url.searchParams.getAll('project').length !== 1 || url.searchParams.get('project') !== this.config.incusProject ||
+              [...url.searchParams.keys()].some(key => key !== 'project'))
+            throw new Error('Original workspace ownership reference is foreign');
+          return url.pathname;
+        }).sort(), [`/1.0/instances/${owner.containerName}`, `/1.0/instances/${helperName}`].sort()))
+      throw new Error('Original workspace ownership references are ambiguous');
+    // Identity/config validation is independent of the caller's acknowledged
+    // writer reference, which the runtime checks on every source observation.
+    this.validate({ ...current, used_by: [] }, owner, 'workspace');
+    const previous = current.config['user.agentor.workspace-preserve-ownership'];
+    if (previous !== undefined && previous !== 'true') throw new Error('Incus workspace ownership metadata is malformed');
+    if (previous === 'true') return current;
+    const config = { ...current.config, 'user.agentor.workspace-preserve-ownership': 'true' };
+    const expectedAcknowledgement = structuredClone({ ...current, config });
+    const result = await this.client.rawRequest('PUT', path, { config, description: current.description ?? '' }, { 'If-Match': etag });
+    const response = JSON.parse(result.body.toString('utf8'));
+    if (result.statusCode >= 400 || response.type !== 'sync')
+      throw new Error('Original workspace ownership update acknowledgement is unavailable; retain writer fence');
+    const acknowledged = await this.client.getCustomVolume(this.config.incusStoragePool, current.name);
+    if (!sameSnapshot(acknowledged, expectedAcknowledgement))
+      throw new Error('Original workspace ownership update changed unexpected metadata; retain writer fence');
+    return acknowledged;
+  }
+
+  async markPreserveOwnership(owner: IncusStorageOwner): Promise<void> {
+    const volumes: IncusCustomVolume[] = [];
+    for (const role of ['workspace', 'agents'] as const) {
+      const volume = await this.inspectVolume(owner, role);
+      if (!volume) throw new Error(`Existing Incus ${role} volume is missing; explicit recovery is required`);
+      const flag = volume.config['user.agentor.preserve-ownership'];
+      if (flag !== undefined && flag !== 'true') throw new Error('Incus canonical ownership metadata is malformed');
+      volumes.push(volume);
+    }
+    for (const volume of volumes) if (volume.config['user.agentor.preserve-ownership'] !== 'true')
+      await this.client.updateCustomVolume(this.config.incusStoragePool, volume.name,
+        { ...volume.config, 'user.agentor.preserve-ownership': 'true' });
+    if (!await this.preserveOwnership(owner)) throw new Error('Incus canonical ownership preservation was not persisted');
+  }
+
+  /** Read-only reconstruction preflight. Missing known data is an error, never
+   * permission to allocate an empty replacement. */
+  async verifyExisting(owner: IncusStorageOwner, dockerRequired = false): Promise<{ docker: boolean }> {
+    let docker = false;
+    for (const role of ['workspace', 'agents', 'docker'] as const) {
+      const volume = await this.find(owner, role);
+      if (!volume && (role !== 'docker' || dockerRequired))
+        throw new Error('Existing Incus ' + role + ' volume is missing; explicit recovery is required');
+      if (volume) {
+        this.validate(volume, owner, role);
+        if (role === 'workspace') dockerRequired ||= this.expectsDocker(volume);
+        if (role === 'docker') docker = true;
+      }
+    }
+    return { docker };
+  }
+
+  private expectsDocker(workspace: IncusCustomVolume): boolean {
+    const marker = workspace.config['user.agentor.docker-data'];
+    if (marker !== undefined && marker !== 'true')
+      throw new Error('Incus retained Docker storage metadata is ambiguous; explicit recovery is required');
+    return marker === 'true';
+  }
+
+  /** Failed first creation may not have allocated all canonical roots yet.
+   * This read-only check is never a rebuild/unarchive allocation preflight. */
+  async verifyPartialInitial(owner: IncusStorageOwner): Promise<void> {
+    for (const role of ['workspace', 'agents', 'docker'] as const) {
+      const volume = await this.find(owner, role);
+      if (!volume) continue;
+      this.validate(volume, owner, role);
+      if (volume.used_by?.length)
+        throw new Error('Incus initial storage is still attached; explicit recovery is required');
+      if (role === 'workspace') {
+        this.expectsDocker(volume);
+        this.readImageIdentity(volume);
+      }
+    }
+  }
+
+  async imageIdentity(owner: IncusStorageOwner): Promise<IncusWorkerImageIdentity | undefined> {
+    const workspace = await this.find(owner, 'workspace');
+    if (!workspace) return undefined;
+    this.validate(workspace, owner, 'workspace');
+    return this.readImageIdentity(workspace);
+  }
+
+  private readImageIdentity(workspace: IncusCustomVolume): IncusWorkerImageIdentity | undefined {
+    const stored = workspace.config['user.agentor.image-source'];
+    if (stored === undefined) return undefined;
+    if (typeof stored !== 'string' || stored.length > 2048)
+      throw new Error('Incus worker image metadata is invalid; explicit recovery is required');
+    try { return validateIncusImageIdentity(JSON.parse(stored)); }
+    catch { throw new Error('Incus worker image metadata is invalid; explicit recovery is required'); }
+  }
+
+  async recordImageIdentity(owner: IncusStorageOwner, identity: IncusWorkerImageIdentity,
+    expectedPrevious?: IncusWorkerImageIdentity): Promise<void> {
+    const normalized = validateIncusImageIdentity(identity);
+    const workspace = await this.find(owner, 'workspace');
+    if (!workspace) throw new Error('Existing Incus workspace volume is missing; explicit recovery is required');
+    this.validate(workspace, owner, 'workspace');
+    const previous = await this.imageIdentity(owner);
+    if (expectedPrevious && (!previous || !isDeepStrictEqual(previous, validateIncusImageIdentity(expectedPrevious))))
+      throw new Error('Incus rebuild image source changed after preflight');
+    if (previous && !sameIncusImageSource(previous, normalized) &&
+        !(expectedPrevious && sameIncusImageBase(previous, normalized)))
+      throw new Error('Incus reconstruction image source changed; explicit image selection is required');
+    const serialized = JSON.stringify(normalized);
+    if (workspace.config['user.agentor.image-source'] !== serialized)
+      await this.client.updateCustomVolume(this.config.incusStoragePool, workspace.name,
+        { ...workspace.config, 'user.agentor.image-source': serialized });
+  }
+
+  async markDockerInitialized(owner: IncusStorageOwner): Promise<void> {
+    const volume = await this.find(owner, "docker");
+    if (!volume) throw new Error("Authoritative Docker volume is missing");
+    this.validate(volume, owner, "docker");
+    await this.client.updateCustomVolume(this.config.incusStoragePool, volume.name,
+      { ...volume.config, "user.agentor.allow-initialization": "false" });
+  }
+
+  async remove(owner: IncusStorageOwner): Promise<void> {
+    const volumes: IncusCustomVolume[] = [];
+    // Validate the entire bounded set before any irreversible deletion.
+    for (const role of ["workspace", "agents", "docker"] as const) {
+      const volume = await this.find(owner, role);
+      if (!volume) continue;
+      this.validate(volume, owner, role);
+      if (volume.used_by?.length) throw new Error("Refusing to delete attached Incus worker storage");
+      volumes.push(volume);
+    }
+    for (const volume of volumes) await this.client.deleteCustomVolume(this.config.incusStoragePool, volume.name);
+  }
+}

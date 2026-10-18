@@ -10,6 +10,7 @@ import { open, rm, stat, writeFile } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
 import { backupKeyFingerprint } from "./backup-keyring";
+import type { InstanceBackupFormatVersion } from './instance-backup-types';
 
 const PREFIX = Buffer.from("AGENTOR-INSTANCE-BACKUP-1\n");
 const MAX_HEADER_BYTES = 16 * 1024;
@@ -22,7 +23,7 @@ export interface InstanceBackupHeader {
     backupId: string;
     sourceInstallationId: string;
     createdAt: string;
-    formatVersion: 1;
+    formatVersion: InstanceBackupFormatVersion;
   };
 }
 
@@ -253,7 +254,7 @@ function validateInstanceBackupHeader(value: unknown): InstanceBackupHeader {
     !metadata ||
     typeof metadata !== "object" ||
     Array.isArray(metadata) ||
-    metadata.formatVersion !== 1 ||
+    ![1, 2].includes(metadata.formatVersion) ||
     !bounded(metadata.backupId, 200) ||
     !bounded(metadata.sourceInstallationId, 200) ||
     !bounded(metadata.createdAt, 64) ||
@@ -268,7 +269,7 @@ function validateInstanceBackupHeader(value: unknown): InstanceBackupHeader {
       backupId: metadata.backupId,
       sourceInstallationId: metadata.sourceInstallationId,
       createdAt: metadata.createdAt,
-      formatVersion: 1,
+      formatVersion: metadata.formatVersion,
     },
   };
 }

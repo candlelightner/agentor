@@ -2,9 +2,11 @@ defineRouteMeta({ openAPI: { tags: ['Managed networks'], summary: 'Create a mana
 import { requireAuth } from '../../utils/auth-helpers';
 import { useManagedNetworkStore, useWorkerGroupStore, useWorkerStore } from '../../utils/services';
 import { useManagedNetworkManager } from '../../utils/managed-network-manager';
-import { verifyWorkerMutationUnlocks } from '../../utils/worker-protection-lock';
+import { authorizeManagedNetworkMutation } from '../../utils/managed-network-authorization';
 import { withWorkerNetworkMutation } from '../../utils/worker-group-manager';
 import { WorkerGroupHierarchy } from '../../utils/worker-group-hierarchy';
+import { reconcileCreatedManagedNetwork } from '../../utils/managed-network-update';
+import { operationSettlement } from '../../utils/operation-deadline';
 export default defineEventHandler(async event => {
   const { user } = requireAuth(event); const body: any = await readBody(event);
   return withWorkerNetworkMutation(user.id, async () => {
@@ -12,15 +14,20 @@ export default defineEventHandler(async event => {
   if (body.scope === 'group' && (typeof body.groupId !== 'string' || !useWorkerGroupStore().get(user.id, body.groupId))) throw createError({ statusCode: 400, statusMessage: 'Group not found' });
   if(body.scope==='selected'){if(!Array.isArray(body.workerIds)||body.workerIds.some((id:any)=>typeof id!=='string'||!useWorkerStore().get(user.id,id)))throw createError({statusCode:400,statusMessage:'Selected workers must belong to the network owner'});}
   const affected = body.scope === 'selected' ? body.workerIds || [] : body.scope === 'group' ? new WorkerGroupHierarchy(useWorkerGroupStore()).subtreeWorkerIds(user.id, body.groupId) : useWorkerStore().listForUser(user.id).map(worker=>worker.id);
-  await verifyWorkerMutationUnlocks(affected, body.lockPasswords);
+  await authorizeManagedNetworkMutation([], affected, body.lockPasswords);
   const store = useManagedNetworkStore(); let network = await store.create(user.id, body.name, body.scope, body.scope === 'group' ? body.groupId : undefined); if(body.scope==='selected')network=await store.update(user.id,network.id,{workerIds:body.workerIds});
+  const coverage = await authorizeManagedNetworkMutation([network], affected, body.lockPasswords);
   try {
-    const reconciliation = await useManagedNetworkManager().reconcile(network);
-    if (reconciliation.partialFailures.length) throw new Error(reconciliation.partialFailures.join('; '));
-    setResponseStatus(event, 201); return { ...network, reconciliation };
+    const manager = useManagedNetworkManager();
+    const result = await reconcileCreatedManagedNetwork(network, {
+      reconcile: value => manager.reconcile(value, undefined, coverage),
+      removeRuntime: value => manager.remove(value, coverage),
+      removeRecord: (ownerId, networkId) => store.remove(ownerId, networkId),
+    });
+    setResponseStatus(event, 201); return result;
   } catch (error: any) {
-    await useManagedNetworkManager().remove(network).catch(() => {}); await store.remove(user.id, network.id).catch(() => {});
-    throw createError({ statusCode: 409, statusMessage: `Network creation failed: ${error?.message || 'Docker reconciliation failed'}` });
+    if (error?.[operationSettlement]) throw error;
+    throw createError({ statusCode: error?.statusCode === 500 ? 500 : 409, statusMessage: `Network creation failed: ${error?.message || 'Runtime reconciliation failed'}`, cause: error });
   }
   });
 });

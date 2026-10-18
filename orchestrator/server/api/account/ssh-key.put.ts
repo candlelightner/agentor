@@ -24,7 +24,8 @@ defineRouteMeta({
 });
 
 import { requireAuth } from '../../utils/auth-helpers';
-import { useStorageManager } from '../../utils/services';
+import { useStorageManager, useContainerManager } from '../../utils/services';
+import { withOwnerLifecycleMutation } from '../../utils/worker-lifecycle-coordinator';
 import type { UserSshKey } from '../../../shared/types';
 
 export default defineEventHandler(async (event): Promise<UserSshKey> => {
@@ -37,6 +38,9 @@ export default defineEventHandler(async (event): Promise<UserSshKey> => {
     throw createError({ statusCode: 400, statusMessage: 'sshPublicKey must be a string' });
   }
   const storage = useStorageManager();
-  await storage.writeSshAuthorizedKeys(user.id, (body.sshPublicKey as string) ?? '');
-  return { sshPublicKey: await storage.readSshAuthorizedKeys(user.id) };
+  return withOwnerLifecycleMutation(user.id, async () => {
+    await storage.writeSshAuthorizedKeys(user.id, (body.sshPublicKey as string) ?? '');
+    await useContainerManager().refreshIncusSshKeys(user.id);
+    return { sshPublicKey: await storage.readSshAuthorizedKeys(user.id) };
+  });
 });

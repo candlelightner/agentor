@@ -1,3 +1,5 @@
+import { administrativeWorkspaceResourceNames, MANAGEMENT_NETWORK, EGRESS_NETWORK, ADMIN_CONTAINER } from "./admin-workspace-resources";
+export { administrativeWorkspaceResourceNames } from "./admin-workspace-resources";
 import Docker from "dockerode";
 import { createHash } from "node:crypto";
 import { hostname } from "node:os";
@@ -22,16 +24,11 @@ import type {
 import { normalizedRevision } from "./admin-workspace-store";
 import { withOperationDeadline } from "./operation-deadline";
 
-const MANAGEMENT_NETWORK = "agentor-management";
-const EGRESS_NETWORK = "agentor-admin-egress-v1";
 // Bump this whenever the trusted overlay/base contract changes in a way that
 // must be materialized for existing persistent administrative workspaces.
 // The workspace volume remains untouched; only its disposable compute image
 // is refreshed.
-const ADMIN_OVERLAY_VERSION = "6";
-const ADMIN_CONTAINER = "agentor-admin-workspace";
-const ADMIN_WORKSPACE_VOLUME = "agentor-admin-workspace-data";
-const ADMIN_AGENTS_VOLUME = "agentor-admin-agent-data";
+export const ADMIN_OVERLAY_VERSION = "6";
 const ADMIN_LABEL = "agentor.administrative";
 const STARTUP_REVISION_LABEL = "agentor.admin.startup-script-revision";
 const STARTUP_STATUS_PATH =
@@ -58,6 +55,7 @@ const ADMIN_CONTROL_PLANE_ENV_KEYS = new Set([
   "ORCHESTRATOR_URL",
   "WORKER_CONTAINER_NAME",
   "AGENTOR_RUNTIME_ROLE",
+  "AGENTOR_TRUSTED_RUNTIME_ROLE",
 ]);
 
 /** Filter legacy/directly-written owner env data before it crosses into an
@@ -72,32 +70,50 @@ export function administrativeOwnerEnvironment(env: UserEnvVars): string[] {
   });
 }
 
-/** Stable Docker resource identities are also used by instance disaster
- * recovery to inventory the administrative workspace volumes without
- * duplicating their naming contract. */
-export function administrativeWorkspaceResourceNames(
-  record: Readonly<AdministrativeWorkspaceRecord>,
-) {
-  const groupId =
-    record.kind === "group-administrative"
-      ? ((record as any).groupId as string)
-      : undefined;
-  const suffix = groupId ? `group-${groupId}` : "workspace";
+export async function administrativeControlRepresentation(record: Readonly<AdministrativeWorkspaceRecord>, image: string, workerNetwork: string): Promise<Record<string,string>> {
+  const resources = administrativeWorkspaceResourceNames(record);
+    const catalog = useImageCatalogManager();
+    await catalog.init();
+    const definitions = catalog
+      .list(
+        resources.groupId ? record.ownerId || "" : "__agentor_admin__",
+        !resources.groupId,
+      )
+      .map((definition) => ({
+        id: definition.id,
+        ownerId: definition.ownerId,
+        name: definition.name,
+        description: definition.description,
+        baseImage: definition.baseImage,
+        dockerfileFragment: definition.dockerfileFragment,
+        contextPaths: definition.contextFiles.map((file) => file.path),
+        promotedVersion: definition.promotedVersion,
+        versions: definition.versions.map(
+          ({
+            version,
+            digest,
+            baseImage,
+            createdAt,
+            promoted,
+            runtimeImage,
+            recovered,
+          }) => ({
+            version,
+            digest,
+            baseImage,
+            createdAt,
+            promoted,
+            runtimeImage,
+            recovered,
+          }),
+        ),
+      }));
   return {
-    groupId,
-    container: groupId ? `agentor-admin-${suffix}` : ADMIN_CONTAINER,
-    workspaceVolume: groupId
-      ? `agentor-admin-${suffix}-data`
-      : ADMIN_WORKSPACE_VOLUME,
-    agentsVolume: groupId
-      ? `agentor-admin-${suffix}-agent-data`
-      : ADMIN_AGENTS_VOLUME,
-    managementNetwork: groupId
-      ? `agentor-management-group-${groupId}`
-      : MANAGEMENT_NETWORK,
-    egressNetwork: groupId
-      ? `agentor-admin-egress-group-${groupId}`
-      : EGRESS_NETWORK,
+    'README.md': resources.groupId
+      ? `# GROUP ADMIN\n\nThis workspace is restricted to worker group ${resources.groupId}. Its management identity is checked against live membership on every call.\n`
+      : '# ADMIN / ORCHESTRATOR\n\nThis directory is an orchestrator-generated, read-only-in-intent representation of image definitions and runtime topology. Use the management MCP proposal/approval workflow for changes. It never contains account credentials or worker secret values.\n',
+    'image-definitions.json': `${JSON.stringify({schemaVersion:1,generatedAt:new Date().toISOString(),definitions},null,2)}\n`,
+    'runtime.json': `${JSON.stringify({schemaVersion:1,managementNetwork:resources.managementNetwork,adminImage:image,...(resources.groupId?{groupId:resources.groupId}:{workerNetwork})},null,2)}\n`,
   };
 }
 
@@ -1010,6 +1026,7 @@ export class DockerAdminWorkspaceRuntime
     const inspection = await this.read("admin service registration inspect", container.inspect());
     const resources = this.resources(record);
     const info: ContainerInfo = {
+      runtimeKind: "legacy-docker",
       administrativeKind: resources.groupId ? "group" : "platform",
       id: record.id,
       userId: record.ownerId || "__agentor_admin__",
@@ -1035,64 +1052,12 @@ export class DockerAdminWorkspaceRuntime
     );
   }
 
-  private async syncControlRepresentation(
-    container: Docker.Container,
-    record: Readonly<AdministrativeWorkspaceRecord>,
-  ) {
-    const resources = this.resources(record);
-    const catalog = useImageCatalogManager();
-    await catalog.init();
-    const definitions = catalog
-      .list(
-        resources.groupId ? record.ownerId || "" : "__agentor_admin__",
-        !resources.groupId,
-      )
-      .map((definition) => ({
-        id: definition.id,
-        ownerId: definition.ownerId,
-        name: definition.name,
-        description: definition.description,
-        baseImage: definition.baseImage,
-        dockerfileFragment: definition.dockerfileFragment,
-        contextPaths: definition.contextFiles.map((file) => file.path),
-        promotedVersion: definition.promotedVersion,
-        versions: definition.versions.map(
-          ({
-            version,
-            digest,
-            baseImage,
-            createdAt,
-            promoted,
-            runtimeImage,
-            recovered,
-          }) => ({
-            version,
-            digest,
-            baseImage,
-            createdAt,
-            promoted,
-            runtimeImage,
-            recovered,
-          }),
-        ),
-      }));
-    const archive = pack();
-    archive.entry(
-      { name: "agentor-control/README.md", mode: 0o444 },
-      resources.groupId
-        ? `# GROUP ADMIN\n\nThis workspace is restricted to worker group ${resources.groupId}. Its management identity is checked against live membership on every call.\n`
-        : "# ADMIN / ORCHESTRATOR\n\nThis directory is an orchestrator-generated, read-only-in-intent representation of image definitions and runtime topology. Use the management MCP proposal/approval workflow for changes. It never contains account credentials or worker secret values.\n",
-    );
-    archive.entry(
-      { name: "agentor-control/image-definitions.json", mode: 0o444 },
-      `${JSON.stringify({ schemaVersion: 1, generatedAt: new Date().toISOString(), definitions }, null, 2)}\n`,
-    );
-    archive.entry(
-      { name: "agentor-control/runtime.json", mode: 0o444 },
-      `${JSON.stringify({ schemaVersion: 1, managementNetwork: resources.managementNetwork, adminImage: this.image, ...(resources.groupId ? { groupId: resources.groupId } : { workerNetwork: this.config.dockerNetwork }) }, null, 2)}\n`,
-    );
+  private async syncControlRepresentation(container: Docker.Container, record: Readonly<AdministrativeWorkspaceRecord>) {
+    const files=await administrativeControlRepresentation(record,this.image,this.config.dockerNetwork);
+    const archive=pack();
+    for(const [name,content]of Object.entries(files))archive.entry({name:'agentor-control/'+name,mode:0o444},content);
     archive.finalize();
-    await this.lifecycle("admin control representation upload", container.putArchive(archive as any, { path: "/workspace" }));
+    await this.lifecycle('admin control representation upload',container.putArchive(archive as any,{path:'/workspace'}));
   }
 
   private async ensureManagementNetwork(networkName = MANAGEMENT_NETWORK) {
@@ -1496,7 +1461,7 @@ function isTrustedOverlay(inspection: Docker.ImageInspectInfo): boolean {
  * semantics, while the small status file exposes only revision/timing/exit
  * metadata. A foreground service remains `running`; a completed script leaves
  * a clean interactive shell. Neither outcome can block container readiness. */
-function renderAdministrativeStartupScript(
+export function renderAdministrativeStartupScript(
   record: Readonly<AdministrativeWorkspaceRecord>,
 ) {
   const script = record.startupScript || "";

@@ -1,3 +1,5 @@
+import { incusDefaultMemoryLimit } from '../../shared/worker-memory';
+
 export type ChallengeType = 'none' | 'http' | 'dns' | 'selfsigned';
 
 export interface BaseDomainConfig {
@@ -40,6 +42,27 @@ export interface Config {
   betterAuthUrl: string;
   betterAuthTrustedOrigins: string[];
   betterAuthRpId: string;
+  incusUsbEnabled?: boolean;
+  incusGpuMdevProfile?: string;
+  incusEnabled: boolean;
+  incusEndpoint: string;
+  incusProject: string;
+  incusClientCertPath: string;
+  incusClientKeyPath: string;
+  incusServerCertPath: string;
+  incusNetwork: string;
+  incusNetworkHostEndpoint?: string;
+  incusNetworkHostServerCertPath?: string;
+  incusStoragePool: string;
+  /** Optional operator-selected pool for disposable image conversion only. */
+  incusConverterStoragePool?: string;
+  /** Operator-pinned trusted seed; never supplied by worker/import metadata. */
+  incusConverterSeedFingerprint?: string;
+  /** Finite RAM assigned when a native worker has no positive cap. */
+  incusDefaultMemoryLimit: string;
+  incusWorkerImage: string;
+  incusDockerVolumeSize: string;
+  incusInternalGatewayUrl: string;
 }
 
 const DEFAULT_LOG_MAX_SIZE = 50 * 1024 * 1024;
@@ -150,5 +173,23 @@ export function loadConfig(): Config {
       ? process.env.BETTER_AUTH_TRUSTED_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
       : [],
     betterAuthRpId: process.env.BETTER_AUTH_RP_ID?.trim() || '',
+    incusUsbEnabled: process.env.INCUS_USB_ENABLED === 'true',
+    incusGpuMdevProfile: process.env.INCUS_GPU_MDEV_PROFILE || '',
+    incusEnabled: process.env.INCUS_ENABLED === 'true',
+    incusEndpoint: process.env.INCUS_ENDPOINT || '',
+    incusProject: process.env.INCUS_PROJECT || 'agentor',
+    incusClientCertPath: process.env.INCUS_CLIENT_CERT_PATH || '',
+    incusClientKeyPath: process.env.INCUS_CLIENT_KEY_PATH || '',
+    incusServerCertPath: process.env.INCUS_SERVER_CERT_PATH || '',
+    incusNetwork: process.env.INCUS_NETWORK || '',
+    incusNetworkHostEndpoint: process.env.INCUS_NETWORK_HOST_ENDPOINT || '',
+    incusNetworkHostServerCertPath: process.env.INCUS_NETWORK_HOST_SERVER_CERT_PATH || '',
+    incusStoragePool: process.env.INCUS_STORAGE_POOL || '',
+    incusConverterStoragePool: process.env.INCUS_CONVERTER_STORAGE_POOL || '',
+    incusConverterSeedFingerprint: process.env.INCUS_CONVERTER_SEED_FINGERPRINT || '',
+    incusDefaultMemoryLimit: incusDefaultMemoryLimit(process.env.INCUS_DEFAULT_MEMORY_LIMIT),
+    incusWorkerImage: process.env.INCUS_WORKER_IMAGE || 'agentor-worker',
+    incusDockerVolumeSize: process.env.INCUS_DOCKER_VOLUME_SIZE || '20GiB',
+    incusInternalGatewayUrl: process.env.INCUS_INTERNAL_GATEWAY_URL || '',
   };
 }

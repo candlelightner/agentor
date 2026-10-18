@@ -516,6 +516,7 @@ test("archive retries after stop/remove and persistence failures without restopp
     const fakeManager = {
       containers,
       assertOrdinaryMutation: () => {},
+      persistentBackupPathMounts: async () => [],
       persistDesiredRuntimeStatus: async (current: any, desired: string) => {
         current.desiredRuntimeStatus = desired;
       },
@@ -601,6 +602,7 @@ test("rebuild retries Docker removal without stopping an already-stopped worker"
       current.desiredRuntimeStatus = desired;
     },
     resolveAuthorizedHostMounts: async () => [],
+    resolveHardwareDeviceAccess: async () => [],
     persistentBackupPathMounts: async () => [],
     dockerService: {
       ensureImage: async (image: string) => {

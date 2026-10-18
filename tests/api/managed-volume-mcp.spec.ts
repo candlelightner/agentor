@@ -2,22 +2,26 @@ import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { createWorker, cleanupWorker } from '../helpers/worker-lifecycle';
 import { createTestUser, deleteTestUser } from '../helpers/test-users';
 import { ApiClient } from '../helpers/api-client';
+import { legacyGroupMcpPrincipal } from '../helpers/legacy-group-mcp-fixture';
 
-test('delegated volume MCP confines inventory and mutations to the current group subtree', async ({ request }) => {
-  test.setTimeout(180_000);
+test('legacy diagnostic group-principal volume MCP confines inventory and mutations to the current group subtree', async ({ request }) => {
+  test.setTimeout(300_000);
   const owner = await createTestUser('Volume MCP owner');
   const ownerRequest = await playwrightRequest.newContext({ baseURL: process.env.BASE_URL || 'http://localhost:3000', storageState: { cookies: [], origins: [] } });
   const workers: string[] = [], volumes: string[] = [];
   let groupId = '', previous: boolean | undefined;
+  let principal: Awaited<ReturnType<typeof legacyGroupMcpPrincipal>> | undefined;
   try {
     expect((await new ApiClient(ownerRequest).signInEmail(owner.email, owner.password)).status).toBe(200);
     for (const suffix of ['member', 'sibling']) workers.push((await createWorker(ownerRequest, { displayName: `Volume MCP ${suffix} ${Date.now()}` })).id);
     const group = await ownerRequest.post('/api/worker-groups', { data: { name: `Volume MCP ${Date.now()}` } });
     expect(group.status()).toBe(201); groupId = (await group.json()).id;
     expect((await ownerRequest.patch(`/api/worker-groups/${groupId}`, { data: { workerIds: [workers[0]] } })).status()).toBe(200);
-    const workspace = await ownerRequest.post(`/api/worker-groups/${groupId}/admin-workspace`, { data: {} });
-    expect([200, 201], await workspace.text()).toContain(workspace.status());
-    const workspaceId = (await workspace.json()).id;
+    // This diagnostic HTTP authorization test needs dedicated principal metadata,
+    // not new admin compute. Fresh admin provisioning remains native-only.
+    principal = await legacyGroupMcpPrincipal(ownerRequest, owner.id, groupId);
+    await principal.insert();
+    const workspaceId = principal.workspaceId;
     const policy = await (await request.get('/api/admin/management-mcp/policy')).json();
     previous = policy.groups['storage-maintenance'].enabled;
     expect((await request.put('/api/admin/management-mcp/policy', { data: { groups: { 'storage-maintenance': true } } })).status()).toBe(200);
@@ -59,6 +63,8 @@ test('delegated volume MCP confines inventory and mutations to the current group
     expect((await ownerRequest.patch(`/api/worker-groups/${groupId}`, { data: { workerIds: [] } })).status()).toBe(200);
     expect((await invoke('volumes.inspect', { volumeId: own.id })).status()).toBe(404);
   } finally {
+    // Remove only the exact seeded binding before ordinary group/user cleanup.
+    if (principal) await principal.remove();
     if (groupId) await ownerRequest.patch(`/api/worker-groups/${groupId}`, { data: { workerIds: [] } });
     for (const worker of workers) await cleanupWorker(ownerRequest, worker);
     for (const id of volumes) await ownerRequest.post(`/api/volumes/${id}`, { data: { action: 'delete', confirmed: true } });

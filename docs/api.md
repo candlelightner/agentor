@@ -16,6 +16,17 @@ Worker-group list/get responses retain `workerIds` for direct membership and add
 
 Container responses distinguish durable `desiredRuntimeStatus` (`running`/`stopped`) from the current Docker observation. Besides normal states, `starting`, `recovering`, and `unknown` may be returned; `unknown` carries only a safe retryable runtime diagnostic. `POST /api/containers/:id/recover` is the bounded, owner/lock-checked recovery endpoint for an unresponsive worker: persistent mounts are verified, only the disposable container is replaced, managed secrets are bootstrapped, and desired plugins are reconciled. It returns 409 when persistence cannot be verified and 503 when Docker cannot yet clear stale runtime state; it never removes persistent volumes. Management MCP provides the equivalent `workers.recover` tool and projects only structured safe diagnostics (code, operation/phase, retryability, timeout, and preservation state), never Docker command text, environment values, or credentials.
 
+
+`POST /api/archived/:id/unarchive` accepts an optional explicit catalog recovery choice:
+`{"imageResolution":{"mode":"replacement","imageDefinitionId":"<owned-or-authorized-catalog-id>","imageVersion":"v2"}}`.
+This repairs a legacy worker whose original custom image is unavailable while preserving its UUID,
+workspace, agent data, Docker data and other settings. The server resolves the selected catalog version
+under the worker owner's current permissions and saves its immutable image as desired configuration
+before creating compute. If creation fails, the worker returns to archived state with that desired
+replacement retained for a later explicit retry. Invalid or unauthorized selections fail before any
+compute or configuration mutation. Ordinary unarchive keeps the existing image selection. This option
+does not authorize native image changes, imported-rootfs replacement or workspace-only recovery.
+
 The **Host mounts** API (`/api/host-mounts*`) separates the platform raw-path
 catalog, per-account entitlements, and owner all/group/worker assignments.
 Catalog creation is the only route that accepts a raw host source. Worker create
@@ -91,6 +102,8 @@ The **Worker Self** group contains the unauthenticated, source-IP-identified rou
 **Shared schemas:** Defined via `$global.components.schemas` in anchor files (typically the "list" endpoint for each group). Other routes in the same group reference these via `$ref`. Schemas: `ContainerInfo`, `RepoConfig`, `MountConfig`, `TmuxWindow`, `AppInstanceInfo`, `PortMapping`, `DomainMapping`, `Environment`, `Capability`, `Instruction`, `ArchivedWorker`, `ImageUpdateInfo`, `ErrorResponse`, `SuccessResponse`, plus the workspace file-manager schemas (`FileEntry`, `FileListing`, `MkdirRequest`, `RenameRequest`, `MoveRequest`, `MoveConflict`, `MoveConflictResponse`, `MoveResult`, `DeleteFilesRequest`, `DeleteFilesResult`, `DownloadFilesRequest`, `UploadFilesResult`) defined in the `files` list route.
 
 ### Backup-directory persistence
+
+Backup settings reconcile only newly enabled directory coverage for currently selected workspaces. Existing coverage on an archived worker does not block unrelated saves or deselection, and inactive path preferences and retained backup/persistent data are preserved. Adding a new directory or enabling persistence still requires successful source validation before saving. Archived workers remain eligible for default workspace/agent-data backups; explicit extra paths continue to require running compute and fail rather than silently dropping requested coverage.
 
 Saving backup settings first copies each additional directory into an Agentor-managed local volume, which is mounted at the same absolute path across ordinary-worker and administrative rebuilds. Individual files and `/` remain backup-only; paths already covered by `/workspace`, agent-data, DinD, or another configured persistent mount need no extra volume. Deselecting a directory detaches but does not delete its volume. If it is selected again, current files merge into the retained volume and current same-named files replace their older persisted versions. Changes made while detached remain temporary and are lost on another rebuild unless the directory is reselected or backed up first.
 

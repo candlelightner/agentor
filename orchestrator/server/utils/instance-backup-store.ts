@@ -7,6 +7,7 @@ import type {
   InstanceBackupState,
   RemoteInstanceBackupRecord,
 } from "./instance-backup-types";
+import { validateInstanceManifest } from './instance-backup-bundle';
 
 const MAX_STORE_BYTES = 32 * 1024 * 1024;
 
@@ -226,6 +227,10 @@ function validJob(value: any): value is InstanceBackupJob {
     optionalText(value.remoteBackupId, 200) &&
     optionalText(value.error, 2048) &&
     optionalText(value.errorCode, 100) &&
+    (value.restoreHelper === undefined || value.operation === 'restore' &&
+      value.restoreHelper && Object.keys(value.restoreHelper).length === 2 &&
+      /^[a-f0-9]{64}$/.test(value.restoreHelper.containerId) &&
+      /^sha256:[a-f0-9]{64}$/.test(value.restoreHelper.imageId)) &&
     (value.retryable === undefined || typeof value.retryable === "boolean") &&
     Array.isArray(value.logs) &&
     value.logs.length <= 1000 &&
@@ -248,10 +253,12 @@ function validArtifact(value: any): value is InstanceBackupArtifact {
     /^[a-f0-9]{64}$/.test(value.sha256) &&
     /^sha256:[a-f0-9]{64}$/.test(value.keyFingerprint) &&
     text(value.sourceInstallationId, 200) &&
-    value.formatVersion === 1 &&
+    [1, 2].includes(value.formatVersion) &&
     ["verified", "failed", "unavailable"].includes(value.integrityStatus) &&
     ["local", "remote-adopted"].includes(value.provenance) &&
-    (value.manifest === undefined || validManifestShape(value.manifest))
+    (value.manifest === undefined || validManifestShape(value.manifest) &&
+      value.manifest.formatVersion === value.formatVersion && value.manifest.sourceInstallationId === value.sourceInstallationId &&
+      (value.formatVersion !== 2 || value.manifest.backupId === value.id && value.manifest.createdAt === value.createdAt))
   );
 }
 
@@ -289,6 +296,9 @@ function validRemote(value: any): value is RemoteInstanceBackupRecord {
 }
 
 function validManifestShape(value: any) {
+  if (value?.formatVersion === 2) {
+    try { validateInstanceManifest(value); return true; } catch { return false; }
+  }
   return (
     value?.kind === "agentor-instance-backup" &&
     value.formatVersion === 1 &&
@@ -297,7 +307,7 @@ function validManifestShape(value: any) {
     id(value.createdByUserId) &&
     iso(value.createdAt) &&
     Array.isArray(value.volumes) &&
-    value.volumes.length <= 100_000
+    value.volumes.length <= 100_000 && value.volumes.every((volume: any) => volume && volume.runtime === undefined)
   );
 }
 

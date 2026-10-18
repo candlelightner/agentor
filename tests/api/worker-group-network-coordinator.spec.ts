@@ -6,6 +6,7 @@ import {
 import { WorkerGroupStore } from "../../orchestrator/server/utils/worker-group-store";
 import type { WorkerGroup } from "../../orchestrator/server/utils/worker-group-store";
 import type { ManagedNetwork } from "../../orchestrator/server/utils/managed-network-store";
+import { operationSettlement } from '../../orchestrator/server/utils/operation-deadline';
 
 const ownerId = "owner-a";
 const groupId = "group-a";
@@ -237,7 +238,7 @@ test("group deletion prunes only missing worker records before the non-empty gua
   expect(removed).toBe(false);
 });
 
-test("permanent worker deletion clears membership and reconciles descendant and ancestor networks", async () => {
+test("permanent worker deletion clears only its references without mutating sibling networks", async () => {
   let groups = [
     { ...group([]), id: "root" },
     { ...group(["deleted-worker"]), id: "child", parentId: "root" },
@@ -288,9 +289,7 @@ test("permanent worker deletion clears membership and reconciles descendant and 
     ]),
   ).resolves.toEqual(["child"]);
   expect(groups.find((candidate) => candidate.id === "child")?.workerIds).toEqual([]);
-  expect(new Set(reconciled)).toEqual(
-    new Set(["root-network", "child-network"]),
-  );
+  expect(reconciled).toEqual([]);
 
   let releaseLate!: () => void;
   const lateGate = new Promise<void>((resolve) => { releaseLate = resolve; });
@@ -321,7 +320,7 @@ test("permanent worker deletion clears membership and reconciles descendant and 
   expect(order).toEqual(["blocker-start", "blocker-end", "late"]);
 });
 
-test("worker deletion restores exact memberships when network reconciliation fails", async () => {
+test("worker deletion does not invoke owner-wide reconciliation or require sibling unlocks", async () => {
   let groups = [
     { ...group(["deleted-worker"]), id: "first" },
     { ...group(["deleted-worker"]), id: "legacy-duplicate" },
@@ -356,13 +355,12 @@ test("worker deletion restores exact memberships when network reconciliation fai
       }),
     }),
   );
-  await expect(
-    service.removeDeletedWorker(ownerId, "deleted-worker"),
-  ).rejects.toMatchObject({ statusCode: 409 });
+  expect(await service.removeDeletedWorker(ownerId, "deleted-worker")).toEqual(['first', 'legacy-duplicate']);
+  expect(calls).toBe(0);
   expect(
     groups.filter((candidate) => candidate.workerIds.includes("deleted-worker"))
       .map((candidate) => candidate.id),
-  ).toEqual(["first", "legacy-duplicate"]);
+  ).toEqual([]);
 });
 
 test("reconciliation failure restores topology even when group storage rollback fails", async () => {
@@ -556,6 +554,57 @@ test("assignment reconciliation rollback restores both memberships atomically", 
   ).toEqual([]);
 });
 
+test('group update unlocks complete ancestor and drifted native peer scope and retains it for rollback', async () => {
+  let groups = [{ ...group(['sibling']), id: 'root' }, { ...group(['old-worker']), id: 'child', parentId: 'root' }];
+  const networks = [{ ...network, id: 'root-network', groupId: 'root' }, { ...network, id: 'child-network', groupId: 'child' }];
+  let verified: string[] = [], calls = 0;
+  const scopes: Array<ReadonlySet<string> | undefined> = [];
+  const service = new WorkerGroupNetworkCoordinator(dependencies({
+    groups: () => groups, networks: () => networks,
+    actualWorkerIds: async candidate => candidate.id === 'root-network' ? ['drifted'] : [],
+    verify: async ids => { verified = [...ids].sort(); },
+    update: async (_owner, id, patch) => {
+      const updated = { ...groups.find(candidate => candidate.id === id)!, ...patch } as WorkerGroup;
+      groups = groups.map(candidate => candidate.id === id ? updated : candidate); return updated;
+    },
+    reconcile: async (_network, _targets, coverage) => {
+      scopes.push(coverage); return { workerIds: [], partialFailures: calls++ === 0 ? ['injected'] : [] };
+    },
+  }));
+  await expect(service.update(ownerId, 'child', { workerIds: ['new-worker'] })).rejects.toMatchObject({ statusCode: 409 });
+  expect(verified).toEqual(['drifted', 'new-worker', 'old-worker', 'sibling']);
+  expect(scopes).toHaveLength(4); expect(scopes.every(scope => scope === scopes[0])).toBe(true);
+});
+
+test('assignment rejects protected unchanged ancestor peer before desired membership mutation', async () => {
+  const groups = [{ ...group(['moved']), id: 'source', parentId: 'root' }, { ...group(['sibling']), id: 'root' },
+    { ...group([]), id: 'target' }];
+  const networks = [{ ...network, id: 'root-network', groupId: 'root' }];
+  let assignments = 0, seen: string[] = [];
+  const service = new WorkerGroupNetworkCoordinator(dependencies({
+    groups: () => groups, networks: () => networks, actualWorkerIds: async () => ['drifted'],
+    verify: async ids => { seen = [...ids].sort(); throw Object.assign(new Error('protected sibling'), { statusCode: 423 }); },
+    assignWorker: async () => { assignments++; return null; },
+  }));
+  await expect(service.assignWorker(ownerId, 'moved', 'target')).rejects.toMatchObject({ statusCode: 423 });
+  expect(seen).toEqual(['drifted', 'moved', 'sibling']); expect(assignments).toBe(0);
+});
+
+test('unsettled group dispatch retains desired references and does not immediately compensate', async () => {
+  let current = group(), updates = 0, reconciles = 0, release!: () => void;
+  const unsettled = new Promise<void>(resolve => { release = resolve; });
+  const error = Object.assign(new Error('native request unsettled'), { [operationSettlement]: unsettled });
+  const service = new WorkerGroupNetworkCoordinator(dependencies({
+    group: () => current, networks: () => [network],
+    update: async (_owner, _id, patch) => { updates++; current = { ...current, ...patch } as WorkerGroup; return current; },
+    reconcile: async () => { reconciles++; throw error; },
+  }));
+  try {
+    await expect(service.update(ownerId, groupId, { workerIds: ['new-worker'] })).rejects.toBe(error);
+    expect(updates).toBe(1); expect(reconciles).toBe(1); expect(current.workerIds).toEqual(['new-worker']);
+  } finally { release(); }
+});
+
 test("concurrent worker group patches preserve unrelated committed fields", async () => {
   class PausingStore extends WorkerGroupStore {
     writes = 0;
@@ -599,6 +648,8 @@ function dependencies(
     removeWorkerReferences?: WorkerGroupNetworkDependencies["groups"]["removeWorkerReferences"];
     remove?: WorkerGroupNetworkDependencies["groups"]["remove"];
     reconcile?: WorkerGroupNetworkDependencies["manager"]["reconcile"];
+    actualWorkerIds?: WorkerGroupNetworkDependencies["manager"]["actualWorkerIds"];
+    verify?: WorkerGroupNetworkDependencies["verify"];
     workerExists?: WorkerGroupNetworkDependencies["workerExists"];
   } = {},
 ): WorkerGroupNetworkDependencies {
@@ -635,6 +686,7 @@ function dependencies(
         (overrides.networks?.() ?? []).find((candidate) => candidate.id === id),
     },
     manager: {
+      actualWorkerIds: overrides.actualWorkerIds ?? (async () => []),
       reconcile:
         overrides.reconcile ??
         (async (_network, workerIds) => ({
@@ -642,7 +694,7 @@ function dependencies(
           partialFailures: [],
         })),
     },
-    verify: async () => undefined,
+    verify: overrides.verify ?? (async () => undefined),
     workerExists: overrides.workerExists ?? (() => true),
   };
 }

@@ -1,3 +1,4 @@
+import type { Readable } from 'node:stream';
 import { createReadStream, createWriteStream } from "node:fs";
 import { lstat, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -64,7 +65,10 @@ import {
   extractBundle,
   readWorkerReconstruction,
 } from "./worker-export";
-import { replaceStoppedWorkspace } from "./backup-restore-helper";
+import { assertOriginalRestoreTarget, assertOriginalRestoreSourceRuntime,
+  replaceStoppedWorkspace } from "./backup-restore-helper";
+import { assertBackupRestoreRuntimePrincipal,
+  type BackupRestoreRuntimePrincipal } from './backup-restore-runtime-authority';
 import { useWorkerProtectionLockStore } from "./worker-protection-lock";
 import { useGoogleBackupOAuthConfigStore } from "./google-backup-oauth-config";
 import { useImageCatalogManager } from "./image-catalog";
@@ -434,11 +438,28 @@ export class BackupManager {
       input.selectedPathsByWorkspace === undefined
         ? undefined
         : normalizeSelectedPaths(input.selectedPathsByWorkspace);
-    // Seed every newly selected directory before committing configuration.
-    // A failed copy therefore leaves both the old container and the previous
-    // backup settings authoritative, and no rebuild can attach an empty volume.
-    if (persistDirectories && input.selectedPathsByWorkspace !== undefined && this.pathPersistence)
-      await this.pathPersistence.reconcileSelections(userId, normalizedPaths);
+    // Reconcile only newly enabled directory coverage. Browser saves include
+    // the complete path map (including deselected/archived workers); unchanged
+    // paths must not require live compute just to change unrelated settings.
+    // Keep inactive path preferences and all existing persistent data intact.
+    if (persistDirectories && this.pathPersistence) {
+      const selected = input.selectedWorkspaceIds === undefined
+        ? previousConfig?.selectedWorkspaceIds ?? null : input.selectedWorkspaceIds;
+      const effectivePaths = normalizedPaths ?? previousConfig?.selectedPathsByWorkspace ?? {};
+      const additions: Record<string, string[]> = {};
+      for (const [id, paths] of Object.entries(effectivePaths)) {
+        if (selected !== null && !selected.includes(id)) continue;
+        const previouslySelected = previousConfig?.selectedWorkspaceIds == null ||
+          previousConfig.selectedWorkspaceIds.includes(id);
+        const previousPaths = new Set(previousConfig?.persistSelectedDirectories !== false && previouslySelected
+          ? previousConfig?.selectedPathsByWorkspace?.[id] ?? [] : []);
+        const added = paths.filter(path => !previousPaths.has(path));
+        if (added.length) additions[id] = added;
+      }
+      // Failed seeding still leaves the previous configuration authoritative.
+      if (Object.keys(additions).length)
+        await this.pathPersistence.reconcileSelections(userId, additions);
+    }
     const now = new Date().toISOString();
     const config = await this.store.update(userId, (data) => {
       const old = data.config;
@@ -496,6 +517,26 @@ export class BackupManager {
     });
     return sanitizeConfig(config);
   }
+  /** Shared account-scoped discovery for API all-selection and schedules.
+   * Dedicated admin IDs stay stable while their runtime namespace changes. */
+  async listWorkspaces(userId: string) {
+    const authority = await import('./admin-backup-authority');
+    const admins = await authority.administrativeBackupRecords(userId), adminIds = new Set(admins.map(record => record.id));
+    const ordinary = new Map([...useWorkerStore().list(), ...useContainerManager().list()]
+      .filter(worker => worker.userId === userId && !adminIds.has(worker.id)).map(worker => [worker.id, {
+        id: worker.id, displayName: worker.displayName, status: worker.status === 'active' ? 'stopped' : worker.status, administrativeKind: undefined as 'platform'|'group'|undefined,
+      }]));
+    for (const record of admins) {
+      // Unavailable foreign workspaces are omitted, never adopted via shadows.
+      const { isPlatformAdminUser } = await import('./auth');
+      try { authority.assertAdministrativeBackupPrincipal(userId, record, record.kind === 'administrative' && isPlatformAdminUser(userId)); }
+      catch (error) { if ((error as {statusCode?:number}).statusCode === 404) continue; throw error; }
+      if (record.runtimeKind !== 'incus-vm') continue;
+      ordinary.set(record.id, { id: record.id, displayName: record.kind === 'administrative' ? 'ADMIN / ORCHESTRATOR' : 'GROUP ADMIN',
+        status: record.status, administrativeKind: record.kind === 'administrative' ? 'platform' : 'group' });
+    }
+    return [...ordinary.values()];
+  }
   async create(userId: string, workspaceId: string, includeManagedVolumes = false) {
     return this.createMany(userId, [workspaceId], undefined, 1, 0, undefined, undefined, includeManagedVolumes);
   }
@@ -513,9 +554,16 @@ export class BackupManager {
     this.assertOwnerAvailable(userId);
     const unique = [...new Set(workspaceIds)];
     if (!unique.length) throw new Error("At least one workspace is required");
+    const states: string[] = [];
     for (const id of unique) {
+      const { resolveAdministrativeBackup } = await import('./admin-backup-authority');
+      const administrative = await resolveAdministrativeBackup(userId, id);
+      if (administrative) { states.push(administrative.status); continue; }
       const w = useContainerManager().get(id) ?? useWorkerStore().findById(id);
       if (!w || w.userId !== userId) throw new Error("Workspace not found");
+      const { assertOrdinaryWorkerIdentity } = await import('./ordinary-worker-identity');
+      assertOrdinaryWorkerIdentity(id, userId);
+      states.push(w.status === 'running' ? 'running' : w.status === 'archived' ? 'archived' : 'stopped');
     }
     const paths = normalizeSelectedPaths(selectedPathsByWorkspace);
     for (const id of Object.keys(paths ?? {}))
@@ -525,13 +573,6 @@ export class BackupManager {
       providerOverride ?? this.store.get(userId).config?.provider ?? "local";
     if (provider === "fake" && !this.fakeUsers.has(userId))
       throw new Error("Fake provider is not connected");
-    const states = unique.map(
-      (id) =>
-        useContainerManager().get(id)?.status ??
-        (useWorkerStore().findById(id)?.status === "archived"
-          ? "archived"
-          : "stopped"),
-    );
     const state = states.includes("running")
       ? "running"
       : states.every((candidate) => candidate === "stopped")
@@ -710,6 +751,7 @@ export class BackupManager {
           : undefined;
         if (!restoreArtifact || restoreArtifact.userId !== job.userId)
           throw new Error("The restore artifact is no longer available");
+        await this.assertRestoreRuntimePrincipal(job.restoreRuntimePrincipal);
         const retryWorkspaceIds = this.selectRestoreWorkspaceIds(
           this.artifactWorkspaceIds(restoreArtifact),
           job.selectedWorkspaceIds ?? job.workspaceIds,
@@ -2061,6 +2103,18 @@ export class BackupManager {
     return dependencies;
   }
 
+  private async assertRestoreRuntimePrincipal(principal?: BackupRestoreRuntimePrincipal): Promise<void> {
+    await assertBackupRestoreRuntimePrincipal(principal);
+  }
+
+  private async backupImportAuthority(artifact: BackupArtifact, principal?: BackupRestoreRuntimePrincipal) {
+    // Persisted ciphertext-digest-checked provenance, never bundle claims.
+    // Exportable recovery-key ownership is not authority for legacy compute.
+    await this.assertRestoreRuntimePrincipal(principal);
+    return { provenance: artifact.provenance,
+      ...(principal ? { runtimePrincipal: structuredClone(principal) } : {}) };
+  }
+
   private async decryptArtifact(
     userId: string,
     artifact: BackupArtifact,
@@ -2232,6 +2286,7 @@ export class BackupManager {
     mode: "new" | "original",
     displayName?: string,
     selectedWorkspaceIds?: string[],
+    runtimePrincipal?: BackupRestoreRuntimePrincipal,
   ) {
     await this.init();
     this.assertOwnerAvailable(userId);
@@ -2243,6 +2298,7 @@ export class BackupManager {
     )
       throw new Error("Backup artifact not found");
     artifact = currentArtifact;
+    await this.assertRestoreRuntimePrincipal(runtimePrincipal);
     if (mode === "original")
       throw new Error(
         "In-place restore is not safe while identity-preserving volume replacement is unavailable; restore into a new worker",
@@ -2256,6 +2312,7 @@ export class BackupManager {
           artifact,
           displayName,
           selectedWorkspaceIds,
+          runtimePrincipal,
         ),
       );
     } finally {
@@ -2267,6 +2324,7 @@ export class BackupManager {
     artifact: BackupArtifact,
     displayName?: string,
     selectedWorkspaceIds?: string[],
+    runtimePrincipal?: BackupRestoreRuntimePrincipal,
   ) {
     const dir = join(this.dataDir, "tmp", `restore-${randomUUID()}`);
     const encrypted = join(dir, "archive.enc");
@@ -2309,9 +2367,10 @@ export class BackupManager {
       const workers = [];
       for (const [index, bundle] of bundles.entries()) {
         assertActive();
-        const worker = await useContainerManager().importWorker(
+        const worker = await useContainerManager().importWorkerFromBackup(
           userId,
           bundle.path,
+          await this.backupImportAuthority(artifact, runtimePrincipal),
           { displayName: index === 0 ? displayName : undefined },
         );
         workers.push(worker);
@@ -2341,6 +2400,7 @@ export class BackupManager {
     selectedWorkspaceIds?: string[],
     requestId?: string,
     imageResolutions?: Record<string, BackupImageResolution>,
+    runtimePrincipal?: BackupRestoreRuntimePrincipal,
   ): Promise<BackupJob> {
     await this.init();
     this.assertOwnerAvailable(userId);
@@ -2352,6 +2412,7 @@ export class BackupManager {
     )
       throw new Error("Backup artifact not found");
     artifact = currentArtifact;
+    await this.assertRestoreRuntimePrincipal(runtimePrincipal);
     const artifactWorkspaceIds = this.artifactWorkspaceIds(artifact);
     const selected = this.selectRestoreWorkspaceIds(
       artifactWorkspaceIds,
@@ -2362,6 +2423,8 @@ export class BackupManager {
       throw new Error(
         "Original restore requires selecting exactly one backup workspace",
       );
+    if (target === "original")
+      await assertOriginalRestoreTarget(userId, source);
     if (target === "original" && extraBackupPaths(artifact.selectedPathsByWorkspace?.[source]).length)
       throw Object.assign(new Error("Original restore is unavailable for backups containing explicit absolute paths; restore into a new worker"), { statusCode: 409 });
     const normalizedResolutions = normalizeImageResolutions(
@@ -2395,6 +2458,7 @@ export class BackupManager {
           left.localeCompare(right),
         ),
       ),
+      restoreRuntimePrincipal: runtimePrincipal,
     });
     const jobId = randomUUID();
     const restorePinOwner = this.restorePinOwner(jobId, 1);
@@ -2403,11 +2467,7 @@ export class BackupManager {
     try {
       this.assertRestoreActive(userId, admission.controller.signal);
       if (target === "original") {
-        const worker = useContainerManager().get(source);
-        if (!worker || worker.userId !== userId || worker.status !== "stopped")
-          throw new Error(
-            "Selected original worker must be stopped for safe restore",
-          );
+        await assertOriginalRestoreTarget(userId, source);
         await useWorkerProtectionLockStore().verify(source, lockPassword);
         this.assertRestoreActive(userId, admission.controller.signal);
       }
@@ -2435,6 +2495,7 @@ export class BackupManager {
         target,
         displayName,
         dependencies,
+        ...(runtimePrincipal ? { restoreRuntimePrincipal: structuredClone(runtimePrincipal) } : {}),
         ...(normalizedResolutions
           ? { imageResolutions: normalizedResolutions }
           : {}),
@@ -2486,9 +2547,10 @@ export class BackupManager {
       await this.decryptArtifact(job.userId, artifact, enc, plain);
       job.integrityVerified = true;
       if (job.target === "new") {
-        const worker = await useContainerManager().importWorker(
+        const worker = await useContainerManager().importWorkerFromBackup(
           job.userId,
           plain,
+          await this.backupImportAuthority(artifact, job.restoreRuntimePrincipal),
           { displayName },
         );
         job.workerId = worker.id;
@@ -2523,6 +2585,30 @@ export class BackupManager {
     selectedPaths?: string[],
     includeManagedVolumes = false,
   ) {
+    const authority = await import('./admin-backup-authority');
+    const administrative = await authority.resolveAdministrativeBackup(userId, id);
+    if (administrative) return authority.withAdministrativeBackup(userId, administrative, async (record, _acknowledge, refreshIdentity) => {
+      if (instanceSnapshotActive()) throw Object.assign(new Error('Portable backup capture is unavailable during instance backup or restore.'), { statusCode: 409 });
+      const { exportAdministrativeWorkspaceBundle, openAdministrativeSelectedArchive } = await import('./admin-portable-backup');
+      const runtime = (await import('./services')).useAdministrativeWorkspaceRuntime().native;
+      const validate = () => authority.validateAdministrativeBackup(userId, record);
+      const explicitPaths = extraBackupPaths(selectedPaths);
+      // Reject unsupported offline/ephemeral selections before any capture.
+      const { nativeSelectedBackupPath } = await import('./incus-selected-archive');
+      for (const path of explicitPaths) nativeSelectedBackupPath(path);
+      if (explicitPaths.length && record.status !== 'running') throw Object.assign(new Error('Explicit native paths require a running administrative workspace'), { statusCode: 409 });
+      const capture = async (captureSignal: AbortSignal) => {
+        await exportAdministrativeWorkspaceBundle(useConfig(), runtime, record, destination, captureSignal, validate, {
+          includeWorkspace: selectedPaths === undefined || selectedPaths.includes('/workspace'),
+          includeAgents: selectedPaths === undefined || selectedPaths.includes('/home/agent/.agent-data'), includeManagedVolumes,
+        });
+        if (explicitPaths.length) await this.appendExplicitBackupPaths(destination, '', explicitPaths, captureSignal, undefined,
+          path => openAdministrativeSelectedArchive(runtime, record, path, validate, captureSignal));
+        await validate();
+      };
+      if (record.status === 'running') await authority.withAdministrativeBackupIdentity(signal, validate, refreshIdentity, capture);
+      else await capture(signal);
+    });
     return withOwnerWorkerLifecycleMutation(userId, id, async () => {
       if (instanceSnapshotActive())
         throw Object.assign(
@@ -2550,6 +2636,7 @@ export class BackupManager {
   ) {
     assertSafeUserId(userId);
     const live = useContainerManager().get(id);
+    const durable = useWorkerStore().findById(id);
     // Archived records remain visible through ContainerManager, but they no
     // longer have a Docker container. Only take the native export path when
     // sync discovered an actual container; archived storage is handled by
@@ -2563,8 +2650,18 @@ export class BackupManager {
     const includeAgents =
       selectedPaths === undefined ||
       selectedPaths.includes("/home/agent/.agent-data");
-    if (live?.containerId) {
-      if (explicitPaths.length)
+    const native = live?.runtimeKind === 'incus-vm' || durable?.runtimeKind === 'incus-vm';
+    if (native && (!durable || durable.userId !== userId)) throw new Error('Native backup owner changed');
+    if (native && explicitPaths.length) {
+      const { nativeExplicitBackupPath } = await import('./incus-selected-archive');
+      for (let index = 0; index < explicitPaths.length; index++)
+        explicitPaths[index] = nativeExplicitBackupPath(explicitPaths[index]!);
+      if (live?.status !== 'running' && explicitPaths.some(path => path !== '/var/lib/docker'))
+        throw Object.assign(new Error('Explicit native root paths require a running worker; retained Docker data has a separate logical backend'),
+          { statusCode: 409, code: 'INCUS_SELECTED_BACKUP_REQUIRES_RUNNING' });
+    }
+    if (live?.containerId || native && durable?.status === 'archived') {
+      if (explicitPaths.length && !native)
         await useContainerManager().assertBackupPathsReadable(id, explicitPaths);
       const result = await useContainerManager().exportWorkerWithLifecycleFenceHeld(id, {
         includeRootfs: false,
@@ -2579,7 +2676,7 @@ export class BackupManager {
         { signal },
       );
       if (explicitPaths.length)
-        await this.appendExplicitBackupPaths(destination, live.containerId, explicitPaths, signal);
+        await this.appendExplicitBackupPaths(destination, live?.containerId ?? '', explicitPaths, signal, native ? id : undefined);
       return;
     }
     if (explicitPaths.length)
@@ -2771,6 +2868,7 @@ export class BackupManager {
           displayName: worker.displayName,
           repos: worker.repos ?? [],
           mounts: worker.mounts ?? [],
+          hardwareDeviceIds: worker.hardwareDeviceIds?.length ? [...worker.hardwareDeviceIds] : undefined,
           initScript: worker.initScript ?? "",
           workerSelfApiAccess: worker.workerSelfApiAccess ?? "inherit",
         },
@@ -2898,7 +2996,7 @@ export class BackupManager {
   /** Repackage an ordinary portable worker bundle with separately archived
    * explicit absolute paths. The ordinary workspace/agent payload is kept
    * byte-for-byte and old bundles continue to omit this optional member. */
-  private async appendExplicitBackupPaths(destination: string, containerId: string, paths: string[], signal: AbortSignal) {
+  private async appendExplicitBackupPaths(destination: string, containerId: string, paths: string[], signal: AbortSignal, nativeWorkerId?: string, nativeArchive?: (path: string) => Promise<Readable>) {
     const dir = `${destination}.paths-${randomUUID()}`;
     const unpacked = join(dir, "bundle");
     const replacement = `${destination}.new-${randomUUID()}`;
@@ -2910,15 +3008,25 @@ export class BackupManager {
       for (const [index, selected] of paths.entries()) {
         signal.throwIfAborted();
         const file = join(dir, `${index}.tar`);
-        await pipeline(
-          await useDockerService().getArchive(containerId, selected, signal),
+        if (nativeWorkerId && selected === '/var/lib/docker' && useContainerManager().get(nativeWorkerId)?.status !== 'running')
+          await useContainerManager().captureOfflineDockerBackupWithLifecycleFenceHeld(nativeWorkerId, file, signal);
+        else await pipeline(
+          nativeArchive ? await nativeArchive(selected) : nativeWorkerId ? await useContainerManager().getSelectedBackupArchiveWithLifecycleFenceHeld(nativeWorkerId, selected, signal)
+            : await useDockerService().getArchive(containerId, selected, signal),
           createWriteStream(file, { mode: 0o600 }),
           { signal },
         );
-        const sanitized = join(dir, `${index}.sanitized.tar`);
-        await sanitizeBackupPathTarPayload(file, sanitized, selected, signal);
-        await rm(file, { force: true });
-        archives.push({ path: selected, archive: `paths/${index}.tar`, file: sanitized });
+        if (nativeWorkerId || nativeArchive) {
+          const codec = await import('./portable-managed-volume-archive');
+          if (selected === '/var/lib/docker') await codec.validateIncusDockerRestoreArchive(file, { signal });
+          else await codec.validateIncusSelectedRestoreArchive(file, selected, { signal });
+          archives.push({ path: selected, archive: `paths/${index}.tar`, file });
+        } else {
+          const sanitized = join(dir, `${index}.sanitized.tar`);
+          await sanitizeBackupPathTarPayload(file, sanitized, selected, signal);
+          await rm(file, { force: true });
+          archives.push({ path: selected, archive: `paths/${index}.tar`, file: sanitized });
+        }
       }
       const payload = join(dir, BUNDLE_FILES.backupPaths);
       const pack = tar.pack();
@@ -2939,7 +3047,8 @@ export class BackupManager {
       manifest.contents.backupPaths = true;
       manifest.backupPaths = archives.map(({ path, archive }) => ({ path, archive }));
       if (manifest.localPersistence) manifest.localPersistence = manifest.localPersistence.map((v) => ({
-        ...v, included: paths.some((path) => path === "/" || path === v.path || v.path.startsWith(`${path}/`)),
+        ...v, included: v.included || paths.some((path) => path === v.path ||
+          !(nativeWorkerId || nativeArchive) && (path === "/" || v.path.startsWith(`${path}/`))),
       }));
       const manifestPath = join(dir, BUNDLE_FILES.manifest);
       await writeManifest(manifest, manifestPath);
@@ -3417,9 +3526,10 @@ export class BackupManager {
               : resolution?.mode === "workspace-only"
                 ? { mode: "workspace-only" as const }
                 : undefined;
-          const worker = await useContainerManager().importWorker(
+          const worker = await useContainerManager().importWorkerFromBackup(
             job.userId,
             bundle.path,
+            await this.backupImportAuthority(artifact, job.restoreRuntimePrincipal),
             {
               displayName: index === 0 ? displayName : undefined,
               ...(imageResolution ? { imageResolution } : {}),
@@ -3456,12 +3566,14 @@ export class BackupManager {
         if (!extracted.workspacePath)
           throw new Error("Backup workspace payload is missing");
         assertActive();
-        await replaceStoppedWorkspace(
-          job.userId,
-          source,
-          extracted.workspacePath,
-          execution.controller.signal,
-        );
+        const target = await assertOriginalRestoreTarget(job.userId, source);
+        assertOriginalRestoreSourceRuntime(target.runtimeKind, extracted.manifest.runtime);
+        if (target.runtimeKind === 'incus-vm') {
+          await useContainerManager().replaceOriginalWorkspaceFromBackup(job.userId, source,
+            extracted.workspacePath, extracted.manifest.runtime, assertActive, execution.controller.signal);
+        } else {
+          await replaceStoppedWorkspace(job.userId, source, extracted.workspacePath, execution.controller.signal);
+        }
         job.workerId = source;
         job.restoreMappings = [
           { sourceWorkspaceId: source, workerId: source },
@@ -4086,14 +4198,9 @@ export class BackupManager {
       const c = data.config;
       if (!c?.enabled || (c.nextRunAt && Date.parse(c.nextRunAt) > now))
         continue;
-      const selected =
-        c.selectedWorkspaceIds ??
-        useWorkerStore()
-          .list()
-          .filter((worker) => worker.userId === c.userId)
-          .map((worker) => worker.id);
       let scheduleError: string | undefined;
       try {
+        const selected = c.selectedWorkspaceIds ?? (await this.listWorkspaces(c.userId)).map(worker => worker.id);
         await this.createMany(c.userId, selected, undefined, 1, 0, pickSelectedPaths(c.selectedPathsByWorkspace, selected), undefined, c.includeManagedVolumes);
       } catch (error) {
         scheduleError = safeError(error);
@@ -4712,6 +4819,7 @@ function sanitizeJob(job: BackupJob): BackupJob {
   delete publicJob.pendingProviderArtifactId;
   delete publicJob.pendingProviderUploadId;
   delete publicJob.providerUploadId;
+  delete publicJob.restoreRuntimePrincipal;
   return publicJob;
 }
 let singleton: BackupManager | undefined;

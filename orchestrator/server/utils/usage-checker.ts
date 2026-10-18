@@ -319,7 +319,7 @@ export class UsageChecker {
   private async readCredFile<T>(userId: string, fileName: string): Promise<T | null> {
     if (!this.credMgr) return null;
     try {
-      const raw = await readFile(this.credMgr.filePath(userId, fileName), 'utf-8');
+      const raw = await this.credMgr.readForUser(userId, fileName);
       const trimmed = raw.trim();
       if (trimmed.length <= 2) return null;
       return JSON.parse(trimmed) as T;
@@ -542,7 +542,7 @@ export class UsageChecker {
       last_refresh: new Date().toISOString(),
     };
     if (this.credMgr) {
-      await writeFile(this.credMgr.filePath(userId, 'codex.json'), JSON.stringify(updated, null, 2));
+      await this.credMgr.writeForUser(userId, 'codex.json', JSON.stringify(updated, null, 2));
     }
     useLogger().info(`[usage-checker] refreshed Codex OAuth token for user ${userId}`);
     return data.access_token;

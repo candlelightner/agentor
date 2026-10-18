@@ -16,6 +16,7 @@ defineRouteMeta({
 });
 
 import { resolveOwnedRunningContainer } from '../../../utils/auth-helpers';
+import { useContainerManager } from '../../../utils/services';
 
 export default defineEventHandler(async (event) => {
   const containerId = getRouterParam(event, 'containerId')!;
@@ -24,6 +25,7 @@ export default defineEventHandler(async (event) => {
   const info = await resolveOwnedRunningContainer(event, containerId);
 
   const url = getRequestURL(event);
-  const target = `http://${info.containerName}:6080/${path}${url.search}`;
+  const host = await useContainerManager().resolveWorkerHost(info.id);
+  const target = `http://${host}:6080/${path}${url.search}`;
   return proxyRequest(event, target);
 });

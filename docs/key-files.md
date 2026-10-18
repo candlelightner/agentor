@@ -21,7 +21,7 @@
 - `orchestrator/server/utils/setup-token-store.ts` - In-memory 5-minute one-shot tokens used as opaque `context` for passkey-first registration when no session exists. Consumed by `/api/setup/create-admin-passkey-token` and the `resolveUser` callback.
 - `orchestrator/server/utils/auth-helpers.ts` - `requireAuth`, `requireAdmin`, `requireContainerAccess`, `canAccessResource`, `authenticateWsPeer`
 - `orchestrator/server/middleware/auth.ts` - Global Nitro middleware enforcing auth on `/api/*` (skips auth/setup/health/docs/worker-self)
-- `orchestrator/server/utils/worker-auth.ts` - `requireWorkerSelf(event)` — identifies the calling worker by source IP on the agentor-net Docker network (no session needed). Used by every `/api/worker-self/*` route.
+- `orchestrator/server/utils/worker-auth.ts` - `requireWorkerSelf(event)` identifies ordinary workers by runtime-owned source IP (no session needed); `requirePluginSelf(event)` separately checks dedicated platform/group administrative authority and the exact private native NIC/UUID. Administrative roles cannot enter ordinary worker-self routes.
 - `orchestrator/server/api/worker-self/info.get.ts` - Worker identity diagnostic endpoint
 - `orchestrator/server/api/worker-self/port-mappings/*.ts` - Worker-self port mapping CRUD (`index.get`, `index.post`, `[port].delete`)
 - `orchestrator/server/api/worker-self/port-mapper/status.get.ts` - Worker-self port mapper status
@@ -233,6 +233,8 @@
 - `worker/agents/gemini/setup.sh` - Gemini auth + config + capabilities/instructions writing
 
 ## Tests
+- `tests/api/admin-native-callers.spec.ts` - Dedicated-store administrative command, proxy, metrics/journal and plugin-self authority with revocation and Docker cutover fixtures.
+- `tests/api/admin-native-proxy.spec.ts` - Loopback administrative WebSocket revocation and asynchronous backend lookup races.
 - `tests/playwright.config.ts` - Playwright config (two projects: api + ui, parallel workers, timeouts)
 - `tests/playwright.modules.config.ts` - focused no-server Playwright config for instance-backup crypto, bundle, provider/store, and manager module tests
 - `tests/helpers/api-client.ts` - Typed API wrapper for all endpoints (returns `{ status, body }`)
@@ -246,3 +248,8 @@
 - `tests/ui/*.spec.ts` - UI integration tests (56 files; incl. workspace-files-modal, clipboard-paste, worker-card-actions, import-worker-modal, github-autocomplete-refresh — 570 tests)
 - `tests/FEATURES.md` - Feature inventory driving test coverage
 - `tests/TESTS.md` - Test suite documentation with counts per file (1568 total tests)
+
+- `orchestrator/server/utils/instance-restore-administrative.ts` - pure dedicated-admin whole-instance planner and fresh stopped native filesystem apply/rollback; historical admin data never targets Docker or WorkerStore authority.
+- `orchestrator/server/utils/incus-admin-backup.ts` - dedicated readonly canonical and selected administrative capture under existing lifecycle/snapshot fences.
+- `orchestrator/server/utils/incus-admin-restore.ts` - shared networkless administrative raw filesystem inverse, including the fixed historical source-root transform.
+- `tests/playwright.instance-recovery.config.ts` - actual recovery modal/composable Chromium fixture, without a live installation.

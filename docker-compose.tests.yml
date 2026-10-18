@@ -26,6 +26,9 @@ services:
       # dependency mount outside the read-only orchestrator source tree.
       - orchestrator-test-node-modules:/work/node_modules
       - ./worker:/src/worker:ro
+      # Orchestrator now builds from the repository-root context.
+      - ./scripts:/src/scripts:ro
+      - ./.dockerignore:/src/.dockerignore:ro
       # Test source. Read-write so playwright can write reports / .auth
       # back to the host for inspection.
       - ./tests:/work/tests

@@ -318,10 +318,9 @@ export class StorageManager {
     const userDir = this.getUserDir(userId);
     const credDir = join(userDir, 'credentials');
     await mkdir(credDir, { recursive: true, mode: 0o700 });
-    if (this.mode === 'directory') {
-      await this.chownDir(userDir);
-      await this.chownDir(credDir);
-    }
+    if (this.mode === 'directory') await this.chownDir(userDir);
+    // Also directory-shared into Incus guests in volume-backed installations.
+    await this.chownDir(credDir);
   }
 
   /** Remove a user's entire data directory (credentials, workers, mappings,

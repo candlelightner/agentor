@@ -2,6 +2,7 @@ import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promise
 import { join } from 'node:path';
 import type { BackupArtifact, BackupConfig, BackupJob, RemoteBackupRecord } from './backup-types';
 import { assertSafeUserId, isSafeUserId } from './user-id';
+import { validBackupRestoreRuntimePrincipal } from './backup-restore-runtime-authority';
 
 interface UserBackupData { schemaVersion: 1; config?: BackupConfig; jobs: BackupJob[]; artifacts: BackupArtifact[]; remoteBackups: RemoteBackupRecord[] }
 export class BackupStore {
@@ -189,6 +190,8 @@ function validRemoteDescriptor(value: any): boolean {
     (value.incomplete === undefined || typeof value.incomplete === 'boolean');
 }
 function validJobAdditions(value: any): boolean {
+  if (!validBackupRestoreRuntimePrincipal(value.restoreRuntimePrincipal) ||
+      value.restoreRuntimePrincipal !== undefined && value.operation !== 'restore') return false;
   if (value.includeManagedVolumes !== undefined && typeof value.includeManagedVolumes !== 'boolean') return false;
   if (value.operation !== undefined && !['backup', 'restore', 'discovery', 'adoption', 'dependency-resolution'].includes(value.operation)) return false;
   if (value.requestId !== undefined && !validOpaqueProviderId(value.requestId)) return false;

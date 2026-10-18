@@ -1,3 +1,4 @@
+import { refreshAdministrativeWorkspaceIdentities } from '../utils/admin-workspace-refresh';
 import {
   useConfig,
   useDockerService,
@@ -48,13 +49,15 @@ import {
   type AdminWorkspaceIdentityMaterializationIntent,
 } from "../utils/admin-workspace-store";
 import { useGroupAdminWorkspaceStore } from "../utils/group-admin-workspace-store";
-import { DockerAdminWorkspaceRuntime } from "../utils/admin-workspace-runtime";
+import { useAdministrativeWorkspaceRuntime } from "../utils/services";
 import { useManagementMcpStore } from "../utils/management-mcp-store";
 import { ManagementMcpTransport } from "../utils/management-mcp-transport";
 import { useGitImageCatalogManager } from "../utils/git-image-manager";
 import { instanceSnapshotActive } from "../utils/instance-snapshot-gate";
+import { IncusError } from "../utils/incus-client";
 
 export default defineNitroPlugin(async (nitroApp) => {
+  await useInstanceBackupManager().assertStartupSafe();
   const instanceRecoveryMode =
     process.env.AGENTOR_INSTANCE_RECOVERY_MODE === "true";
   // Initialize logging infrastructure first
@@ -214,7 +217,23 @@ export default defineNitroPlugin(async (nitroApp) => {
     );
     await useManagedVolumeManager().recoverStartup();
   }
-  await containerManager.sync();
+  let startupInventoryDeferred = false;
+  try {
+    await containerManager.sync();
+  } catch (error) {
+    const config = useConfig();
+    const failure = error as NodeJS.ErrnoException & { port?: number };
+    const transientIncus = config.incusEnabled && config.incusEndpoint.startsWith("https://") &&
+      (error instanceof IncusError && error.statusCode === 408 ||
+        ["ECONNREFUSED", "ETIMEDOUT"].includes(failure.code ?? "") && failure.syscall === "connect" &&
+        failure.port === Number(new URL(config.incusEndpoint).port || 443));
+    if (!transientIncus) throw error;
+    // Incus retries a bridge-bound HTTPS listener after Docker restores its
+    // bridge on host boot. No successful inventory means no startup adoption
+    // or desired-state action; the existing periodic pass must remain alive.
+    startupInventoryDeferred = true;
+    logger.warn("[agentor] initial Incus inventory unavailable; worker startup deferred to the existing reconciliation timer (verify Incus HTTPS/project readiness if it persists)");
+  }
   // Re-evaluate every persisted bind before ordinary startup reconciliation.
   // This both adopts exact approved legacy mounts and retries stopping any
   // container whose revocation guard survived a previous Docker failure or an
@@ -237,12 +256,12 @@ export default defineNitroPlugin(async (nitroApp) => {
   useBackupManager().setPathPersistenceAdapter(
     usePersistentBackupPathManager(),
   );
-  if (!instanceRecoveryMode) await containerManager.reconcileWorkers();
-  else
+  if (!instanceRecoveryMode && !startupInventoryDeferred) await containerManager.reconcileWorkers();
+  else if (instanceRecoveryMode)
     logger.warn(
       "[agentor] instance recovery mode active: worker and administrative workspace startup is suspended",
     );
-  for (const worker of instanceRecoveryMode ? [] : containerManager.list()) {
+  for (const worker of instanceRecoveryMode || startupInventoryDeferred ? [] : containerManager.list()) {
     if (
       worker.status !== "running" ||
       worker.administrativeKind ||
@@ -269,6 +288,7 @@ export default defineNitroPlugin(async (nitroApp) => {
       void (async () => {
         await containerManager.sync();
         await containerManager.reconcileWorkers();
+        await useLogCollector().reconcileIncus();
         for (const worker of containerManager.list()) {
           if (worker.status === "running" && usePluginInstallationStore().listForWorker(worker.userId, worker.id).length)
             await usePluginRuntimeManager().reconcileWorker(worker.userId, worker.id, worker.containerId).catch(() => undefined);
@@ -279,8 +299,18 @@ export default defineNitroPlugin(async (nitroApp) => {
             `[agentor] worker reconciliation pass deferred: ${(error as { code?: string })?.code || "Docker unavailable"}`,
           ),
         )
-        .finally(() => {
-          workerReconcileRunning = false;
+        .finally(async () => {
+          try {
+            // Durable runtime selection survives INCUS_ENABLED=false and
+            // inventory failures. Re-observe route authority independently so
+            // stale destinations are withdrawn even when sync was unavailable.
+            if (useWorkerStore().list().some((worker) => worker.runtimeKind === "incus-vm"))
+              await useTraefikManager().refreshWorkerBackends().catch(() =>
+                logger.warn("[agentor] worker route refresh deferred; retrying next reconciliation"),
+              );
+          } finally {
+            workerReconcileRunning = false;
+          }
         });
     }, 30_000);
     workerReconcileTimer.unref?.();
@@ -301,12 +331,12 @@ export default defineNitroPlugin(async (nitroApp) => {
         ),
       );
 
-  // The administrative workspace uses a separate, generated Docker boundary:
+  // The administrative workspace uses its dedicated runtime boundary:
   // its image/mount/network inputs are not accepted from dashboard requests.
   // The MCP listener binds only to the orchestrator's address on the internal
   // management network and still authenticates + authorizes every JSON-RPC
   // call through ManagementMcpStore.
-  const adminRuntime = new DockerAdminWorkspaceRuntime(useConfig());
+  const adminRuntime = useAdministrativeWorkspaceRuntime();
   const managementMcp = new ManagementMcpTransport(useManagementMcpStore());
   adminRuntime.setManagementListener((host) => managementMcp.start(host));
   const adminWorkspace = useAdminWorkspaceStore();
@@ -328,28 +358,31 @@ export default defineNitroPlugin(async (nitroApp) => {
     }
     await adminRuntime.materializeCredential(
       await issueCredential(),
-      record.kind === "group-administrative" ? record : undefined,
+      record,
       intent,
     );
   };
   adminWorkspace.setIdentityMaterializer(materializeAdminIdentity);
   groupAdminWorkspaces.setIdentityMaterializer(materializeAdminIdentity);
   await adminRuntime.initializeBoundary();
-  await managementMcp.start(await adminRuntime.managementAddress());
+
   let adminIdentityTimer: NodeJS.Timeout | undefined;
+  const adminIdentityRefreshes = new Map<string, Promise<void>>();
+  const initializedAdminIdentities = new Set<string>();
   const refreshAdminIdentity = async () => {
     if (instanceSnapshotActive()) return;
-    try {
-      const workspace = await adminWorkspace.ensure();
-      for (const group of useWorkerGroupStore().list()) {
-        if (!group.adminWorkspace) continue;
-        await groupAdminWorkspaces.ensure(group.id);
-      }
-    } catch (error) {
-      logger.error(
+    await refreshAdministrativeWorkspaceIdentities(
+      (initialized) => initialized && adminWorkspace.getRecord()?.runtimeKind === 'incus-vm'
+        ? adminWorkspace.refreshRunningIdentity() : adminWorkspace.ensure(),
+      () => useWorkerGroupStore().list(),
+      (groupId, initialized) => initialized && useWorkerGroupStore().findById(groupId)?.adminWorkspace?.runtimeKind === 'incus-vm'
+        ? groupAdminWorkspaces.refreshRunningIdentity(groupId) : groupAdminWorkspaces.ensure(groupId),
+      (error) => logger.error(
         `[agentor] administrative workspace identity refresh failed: ${error instanceof Error ? error.message : error}`,
-      );
-    }
+      ),
+      adminIdentityRefreshes,
+      initializedAdminIdentities,
+    );
   };
   if (!instanceRecoveryMode) {
     await refreshAdminIdentity();

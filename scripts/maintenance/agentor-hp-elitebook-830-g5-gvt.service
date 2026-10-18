@@ -1,0 +1,23 @@
+[Unit]
+Description=Keep EliteBook 830 G5 UHD 620 awake before GVT initialization
+ConditionKernelCommandLine=i915.enable_gvt=1
+ConditionKernelCommandLine=i915.enable_guc=0
+After=systemd-modules-load.service
+Before=incus.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/grep -Fxq 0x8086 /sys/bus/pci/devices/0000:00:02.0/vendor
+ExecStartPre=/usr/bin/grep -Fxq 0x5917 /sys/bus/pci/devices/0000:00:02.0/device
+ExecStartPre=/usr/bin/test /sys/bus/pci/devices/0000:00:02.0/driver -ef /sys/bus/pci/drivers/i915
+ExecStartPre=/usr/bin/grep -Fxq Y /sys/module/i915/parameters/enable_gvt
+ExecStartPre=/usr/bin/grep -Fxq 0 /sys/module/i915/parameters/enable_guc
+ExecStart=/bin/sh -ec 'echo on > /sys/bus/pci/devices/0000:00:02.0/power/control'
+ExecStart=/usr/bin/grep -Fxq active /sys/bus/pci/devices/0000:00:02.0/power/runtime_status
+ExecStart=/usr/bin/grep -Fxq D0 /sys/bus/pci/devices/0000:00:02.0/power_state
+ExecStart=/sbin/modprobe kvmgt
+RemainAfterExit=yes
+TimeoutStartSec=30s
+
+[Install]
+WantedBy=incus.service

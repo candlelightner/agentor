@@ -106,6 +106,15 @@ function openService(service: string) {
             Loading administrative workspace…
           </div>
           <div
+            v-else-if="admin.error.value && !admin.workspace.value"
+            class="rounded border border-red-400 p-5 text-center"
+          >
+            <p class="mb-3">Administrative workspace status could not be loaded.</p>
+            <UButton color="neutral" @click="void admin.refresh().catch(() => undefined)">
+              Retry status
+            </UButton>
+          </div>
+          <div
             v-else-if="!admin.workspace.value"
             class="rounded border border-red-400 p-5 text-center"
           >

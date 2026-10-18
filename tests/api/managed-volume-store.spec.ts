@@ -2,7 +2,8 @@ import { test, expect } from '@playwright/test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ManagedVolumeStore, PersistencePolicyStore, publicVolume, validatePersistenceTarget } from '../../orchestrator/server/utils/managed-volume-store';
+import { randomUUID } from 'node:crypto';
+import { ManagedVolumeStore, PersistencePolicyStore, publicVolume, validatePersistenceTarget, managedVolumeRuntimeKind } from '../../orchestrator/server/utils/managed-volume-store';
 import { ManagedVolumeRuntime } from '../../orchestrator/server/utils/managed-volume-runtime';
 import { ManagedVolumeManager } from '../../orchestrator/server/utils/managed-volume-manager';
 
@@ -30,6 +31,26 @@ test('volume records survive restart and are owner scoped, idempotent and non-ov
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test('managed storage backend is durable internal authority and old records remain Docker', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'agentor-volume-runtime-'));
+  try {
+    const store = new ManagedVolumeStore(dir); await store.init();
+    const legacy = await store.create('legacy-owner', 'legacy-worker', '/opt/legacy');
+    expect(legacy.storageRuntimeKind).toBeUndefined();
+    expect(managedVolumeRuntimeKind(legacy)).toBe('legacy-docker');
+    const vm = await store.create('vm-owner', 'vm-worker', '/opt/vm', undefined, 'incus-vm');
+    expect(managedVolumeRuntimeKind(vm)).toBe('incus-vm');
+    expect(publicVolume(vm)).not.toHaveProperty('storageRuntimeKind');
+    await store.retainForDeletedOwner(vm.userId);
+    await rm(join(dir, 'users', vm.userId), { recursive: true, force: true });
+    const reloaded = new ManagedVolumeStore(dir); await reloaded.init();
+    expect(managedVolumeRuntimeKind(reloaded.get(vm.userId, vm.id)!)).toBe('incus-vm');
+    expect(managedVolumeRuntimeKind(reloaded.get(legacy.userId, legacy.id)!)).toBe('legacy-docker');
+    await expect(reloaded.save({ ...vm, storageRuntimeKind: 'foreign' as any })).rejects.toThrow('storage runtime');
+    expect(managedVolumeRuntimeKind(reloaded.get(vm.userId, vm.id)!)).toBe('incus-vm');
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test('self-service, recreation and privileged helper authorizations default off and are independent', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'agentor-persistence-policy-'));
   try {
@@ -44,6 +65,36 @@ test('self-service, recreation and privileged helper authorizations default off 
     expect(store.policy('owner-a', 'worker-a').selfService).toBe(true);
     const reloaded = new PersistencePolicyStore(dir); await reloaded.init();
     expect(reloaded.policy('owner-a', 'worker-a').selfService).toBe(true);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('Incus live intent survives reload, remains private and cannot be forgotten or removed with its owner', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'agentor-incus-live-intent-'));
+  try {
+    const store = new ManagedVolumeStore(dir); await store.init();
+    const v = await store.create('live-owner', 'live-worker', '/opt/models', undefined, 'incus-vm');
+    const intent = { id: randomUUID(), incarnation: randomUUID(), bootId: randomUUID(), attachment: 'unknown' as const };
+    await store.save({ ...v, incusLive: intent });
+    const reloaded = new ManagedVolumeStore(dir); await reloaded.init();
+    expect(reloaded.get(v.userId, v.id)?.incusLive).toEqual(intent);
+    expect(publicVolume(reloaded.get(v.userId, v.id)!)).not.toHaveProperty('incusLive');
+    await expect(reloaded.forget(v.userId, v.id)).rejects.toThrow('unresolved');
+    await expect(reloaded.removeForUser(v.userId)).rejects.toThrow('unresolved');
+    await expect(reloaded.retainForDeletedOwner(v.userId)).rejects.toThrow('recovery');
+    expect(reloaded.get(v.userId, v.id)?.incusLive).toEqual(intent);
+    for (const bad of [null, {}, { ...intent, id: 'not-a-uuid' }, { ...intent, attachment: 'accepted' },
+      { ...intent, operation: `/1.0/operations/${randomUUID()}` }, { ...intent, attachment: 'settled', operation: 'https://foreign/operation' },
+      { ...intent, authority: 'discard-source' }, { ...intent, bootId: 'old-boot' }, { ...intent, rollback: false }])
+      await expect(reloaded.save({ ...v, incusLive: bad as any })).rejects.toThrow('recovery intent');
+    for (const fields of [{ storageRuntimeKind: undefined }, { liveContainerId: 'container' }, { previousRestartPolicy: { Name: 'always' } }, { purpose: 'legacy-backup-path' }])
+      await expect(reloaded.save({ ...v, incusLive: intent, ...fields } as any)).rejects.toThrow('recovery intent');
+    const accepted = { ...intent, attachment: 'accepted' as const, operation: `/1.0/operations/${randomUUID()}` };
+    await expect(reloaded.save({ ...v, seeded: true, incusLive: { ...accepted, rollback: true } })).rejects.toThrow('recovery intent');
+    await reloaded.save({ ...v, incusLive: accepted });
+    await reloaded.save({ ...v, incusLive: { ...accepted, attachment: 'settled' }, seeded: true });
+    const committed = new ManagedVolumeStore(dir); await committed.init();
+    expect(committed.get(v.userId, v.id)).toMatchObject({ seeded: true, incusLive: { attachment: 'settled' } });
+    await expect(committed.forget(v.userId, v.id)).rejects.toThrow('unresolved');
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -66,21 +117,30 @@ test('a missing populated volume is never silently replaced by empty storage', a
 test('startup quarantines only the worker whose storage recovery fails', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'agentor-volume-quarantine-'));
   try {
-    const manager = new ManagedVolumeManager(dir, {} as any); await manager.init();
+    const visited: string[] = [], sources = new Map<string, { id: string; userId: string; workerId: string }>();
+    const manager = new ManagedVolumeManager(dir, {
+      getVolume: (name: string) => ({ inspect: async () => {
+        const source = sources.get(name)!;
+        visited.push(source.workerId);
+        if (source.workerId === 'broken-worker') throw new Error('internal detail must not escape');
+        return { Name: name, Driver: 'local', Labels: { 'agentor.volume-id': source.id,
+          'agentor.owner-id': source.userId, 'agentor.worker-id': source.workerId } };
+      } }),
+      createVolume: async () => { throw new Error('Seeded storage must never be replaced'); },
+    } as any); await manager.init();
     const broken = await manager.store.create('owner-a', 'broken-worker', '/opt/models');
     const healthy = await manager.store.create('owner-a', 'healthy-worker', '/opt/models');
-    const visited: string[] = [];
-    manager.recoverWorker = async (_owner, worker) => {
-      visited.push(worker);
-      if (worker === 'broken-worker') throw new Error('internal detail must not escape');
-    };
+    for (const source of [broken, healthy]) {
+      sources.set(source.dockerName, source);
+      await manager.store.save({ ...source, seeded: true, state: 'ready' });
+    }
     await manager.recoverStartup();
     expect(visited).toEqual(expect.arrayContaining(['broken-worker', 'healthy-worker']));
     expect(manager.isRecoveryBlocked('broken-worker')).toBe(true);
     expect(manager.isRecoveryBlocked('healthy-worker')).toBe(false);
     expect(manager.store.get('owner-a', broken.id)).toMatchObject({ state: 'failed' });
     expect(JSON.stringify(publicVolume(manager.store.get('owner-a', broken.id)!))).not.toContain('internal detail');
-    expect(manager.store.get('owner-a', healthy.id)).toMatchObject({ state: 'pending' });
+    expect(manager.store.get('owner-a', healthy.id)).toMatchObject({ state: 'ready', seeded: true });
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 

@@ -40,10 +40,18 @@ test("real browser configures fake provider, backs up, and starts restore", asyn
     const modal = page.locator('[data-testid="backup-management"]');
     await modal.getByLabel("Provider").selectOption("fake");
     await modal.getByLabel("Selected workspaces").check();
-    await modal
-      .getByPlaceholder("workspace-a, workspace-b")
-      .fill(`${workerA.id}, ${workerB.id}`);
-    await modal.getByRole("button", { name: "Save schedule" }).click();
+    for (const worker of [workerA, workerB]) {
+      const selector = modal.getByTestId("backup-workspace-selector");
+      await selector.click();
+      await selector.fill(worker.id);
+      await page.getByRole("option", { name: new RegExp(worker.id) }).click();
+      await page.keyboard.press("Escape");
+    }
+    await Promise.all([
+      page.waitForResponse(response => response.url().endsWith("/api/backup-settings") && response.request().method() === "PUT"),
+      modal.getByRole("button", { name: "Save schedule" }).click(),
+    ]);
+    await expect(modal.getByRole("button", { name: "Save schedule" })).toBeEnabled();
     await modal.getByRole("button", { name: "Back up now" }).click();
     await expect(modal).toContainText("succeeded", { timeout: 120_000 });
     await expect(modal).toContainText("Integrity verified");
@@ -72,12 +80,13 @@ test("real browser configures fake provider, backs up, and starts restore", asyn
         response.request().method() === "POST",
     );
     await restorePanel.getByRole("button", { name: "Start restore" }).click();
-    expect((await restoreRequest).postDataJSON()).toEqual({
+    expect((await restoreRequest).postDataJSON()).toMatchObject({
       target: "new",
       displayName: restoreName,
       confirmOverwrite: false,
       workspaceIds: [workerB.id],
     });
+    expect((await restoreRequest).postDataJSON().requestId).toMatch(/^ui-restore-/);
     expect((await restoreAccepted).status()).toBe(202);
     await expect(restorePanel).toBeHidden();
     await expect

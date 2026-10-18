@@ -70,7 +70,7 @@ export function useAdminWorkspace() {
     loading.value = true;
     error.value = "";
     try {
-      workspace.value = await $fetch<AdminWorkspace>("/api/admin/workspace");
+      workspace.value = await $fetch<AdminWorkspace | null>("/api/admin/workspace");
       return workspace.value;
     } catch (cause) {
       error.value = adminError(

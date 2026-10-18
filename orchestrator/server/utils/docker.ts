@@ -1,9 +1,12 @@
+import { HARDWARE_DEVICE_PROBE } from "./hardware-device-probe";
+import { TMUX_TERMINAL_CLIPBOARD_SETUP } from './tmux-terminal-clipboard';
 import Docker from 'dockerode';
+import { assertBackupRestoreRuntimePrincipal, type BackupRestoreRuntimePrincipal } from './backup-restore-runtime-authority';
 import { PassThrough } from 'node:stream';
 import { randomUUID } from 'node:crypto';
 import type { Duplex, Readable } from 'node:stream';
 import type { Config } from './config';
-import { getAppType } from './apps';
+import { getAppType, parseAppInstances, assertAppManageOk } from './apps';
 import { renderUserEnvVars } from './user-env-store';
 import type { MountConfig, TmuxWindow, AppInstanceInfo, NetworkMode, ExposeApis, UserEnvVars, FileEntry, HardwareDeviceCandidate, ResolvedHardwareDevice } from '../../shared/types';
 import type { StorageManager } from './storage';
@@ -14,6 +17,7 @@ import {
   validateHostMountTarget,
 } from './host-mount-store';
 import { withOperationDeadline } from './operation-deadline';
+import { MANAGED_NETWORK_HOSTS_SCRIPT, normalizeManagedNetworkHosts } from './managed-network-hosts';
 
 export interface EnvironmentJsonPayload {
   networkMode: string;
@@ -131,6 +135,27 @@ export class DockerService {
     this.config = config;
   }
 
+  /** Internal OCI export/inspection; caller must authorize the catalog source. */
+  workerOciImage(image: string): Docker.Image {
+    return this.docker.getImage(image);
+  }
+
+  async applyManagedHosts(containerId: string, containerName: string, entries: unknown): Promise<void> {
+    const inspect = async () => {
+      const info = await withOperationDeadline(this.docker.getContainer(containerId).inspect(),
+        DOCKER_READ_TIMEOUT_MS, 'Managed hostname Docker recipient inspection');
+      if (info.Id !== containerId || info.Name !== `/${containerName}`)
+        throw new Error('Managed hostname Docker recipient changed');
+      return info;
+    };
+    if (!(await inspect()).State.Running) return;
+    const result = await this.execCapture(containerId,
+      ['python3', '-c', MANAGED_NETWORK_HOSTS_SCRIPT, 'apply', JSON.stringify(normalizeManagedNetworkHosts(entries))],
+      { user: 'root', timeoutMs: 10_000, operationLabel: 'Managed hostname configuration' });
+    if (result.exitCode !== 0) throw new Error('Managed hostname configuration failed');
+    await inspect();
+  }
+
   async ensureNetwork(): Promise<void> {
     const networks = await withOperationDeadline(
       (operationSignal) => this.docker.listNetworks({
@@ -196,6 +221,9 @@ export class DockerService {
       workerId: string;
       operationId: string;
     };
+    /** Internal backup invocation only. Rechecked after image preparation;
+     * callers cannot turn a stale queued admin grant into legacy compute. */
+    restoreRuntimePrincipal?: BackupRestoreRuntimePrincipal;
     /** Runtime config to apply when running an imported image (which has no
      * baked entrypoint/env). Ignored for the standard image. */
     imageConfig?: ImageConfigOverride;
@@ -311,6 +339,7 @@ export class DockerService {
         !/^[a-f0-9-]{36}$/i.test(opts.portableImportIdentity.operationId)
       )
     ) throw new Error('Portable import identity does not match the worker creation request');
+    await assertBackupRestoreRuntimePrincipal(opts.restoreRuntimePrincipal);
     const container = await withOperationDeadline((operationSignal) => this.docker.createContainer({
       Image: image,
       name: opts.containerName,
@@ -368,6 +397,7 @@ export class DockerService {
 
     if (opts.start !== false) {
       try {
+        await assertBackupRestoreRuntimePrincipal(opts.restoreRuntimePrincipal);
         await withOperationDeadline(
           (operationSignal) => container.start({ abortSignal: operationSignal }),
           DOCKER_LIFECYCLE_TIMEOUT_MS,
@@ -394,42 +424,6 @@ export class DockerService {
     const image = this.config.workerImagePrefix + this.config.workerImage;
     await this.ensureImage(image);
     const name = `agentor-hardware-probe-${randomUUID()}`;
-    const script = `set -eu
-clean() { tr '\t\r\n' '   ' < "$1" 2>/dev/null || true; }
-for node in /host/dev/dri/renderD*; do
-  [ -e "$node" ] || continue
-  base="\${node##*/}"
-  sys="$(readlink -f "/host/sys/class/drm/$base/device")"
-  [ -n "$sys" ] || continue
-  pci="\${sys##*/}"
-  vendor="$(clean "$sys/vendor")"
-  product="$(clean "$sys/device")"
-  nodes=""; gids=""
-  for link in /host/sys/class/drm/card* /host/sys/class/drm/renderD*; do
-    [ -e "$link" ] || continue
-    [ "$(readlink -f "$link/device")" = "$sys" ] || continue
-    dev="/dev/dri/\${link##*/}"
-    [ -e "/host$dev" ] || continue
-    gid="$(stat -c %g "/host$dev")"
-    nodes="\${nodes}\${nodes:+,}$dev"; gids="\${gids}\${gids:+,}$gid"
-  done
-  printf 'gpu\tdrm:pci:%s\tGPU %s:%s (%s)\t%s\t%s\t\t%s\t%s\n' "$pci" "\${vendor#0x}" "\${product#0x}" "$pci" "\${vendor#0x}" "\${product#0x}" "$nodes" "$gids"
-done
-for sys in /host/sys/bus/usb/devices/*; do
-  [ -f "$sys/idVendor" ] && [ -f "$sys/idProduct" ] && [ -f "$sys/busnum" ] && [ -f "$sys/devnum" ] || continue
-  vendor="$(clean "$sys/idVendor")"; product="$(clean "$sys/idProduct")"; serial=""
-  [ ! -f "$sys/serial" ] || serial="$(clean "$sys/serial")"
-  bus="$(cat "$sys/busnum")"; devnum="$(cat "$sys/devnum")"
-  node="$(printf '/dev/bus/usb/%03d/%03d' "$bus" "$devnum")"
-  [ -e "/host$node" ] || continue
-  port="\${sys##*/}"; identity="\${serial:-port:$port}"
-  manufacturer=""; product_name=""
-  [ ! -f "$sys/manufacturer" ] || manufacturer="$(clean "$sys/manufacturer")"
-  [ ! -f "$sys/product" ] || product_name="$(clean "$sys/product")"
-  label="\${manufacturer:+$manufacturer }\${product_name:-USB $vendor:$product}"
-  gid="$(stat -c %g "/host$node")"
-  printf 'usb\tusb:%s:%s:%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vendor" "$product" "$identity" "$label" "$vendor" "$product" "$serial" "$node" "$gid"
-done`;
     let helper: Docker.Container | undefined;
     try {
       helper = await withOperationDeadline(
@@ -437,8 +431,8 @@ done`;
           Image: image,
           name,
           User: '0:0',
-          Entrypoint: ['sh', '-c'],
-          Cmd: [script],
+          Entrypoint: ['python3', '-c'],
+          Cmd: [HARDWARE_DEVICE_PROBE],
           Tty: true,
           NetworkDisabled: true,
           HostConfig: {
@@ -470,16 +464,9 @@ done`;
       );
       const output = await this.getLogs(helper.id, 10_000);
       if (result.StatusCode !== 0) throw new Error('Host hardware probe failed');
-      const discovered: HardwareDeviceCandidate[] = output.split(/\r?\n/).filter(Boolean).map((line) => {
-        const [kind, selector, deviceName, vendor, product, serial, nodes, gids] = line.split('\t');
-        return {
-          kind: kind as 'gpu' | 'usb', selector: selector!, name: deviceName!,
-          vendor: vendor || undefined, product: product || undefined,
-          serial: serial || undefined,
-          deviceNodes: (nodes || '').split(',').filter(Boolean),
-          groupIds: [...new Set((gids || '').split(',').filter(Boolean).map(Number))],
-        };
-      });
+      const discovered: HardwareDeviceCandidate[] = JSON.parse(output);
+      if (!Array.isArray(discovered) || discovered.length > 4096)
+        throw new Error('Host hardware probe returned invalid inventory');
       // Explicitly gated deterministic fixture for the isolated Docker E2E
       // stack. Requiring diagnostics mode prevents accidental production use.
       if (process.env.ALLOW_ADMIN_DIAGNOSTICS === 'true' &&
@@ -488,6 +475,7 @@ done`;
           kind: 'usb', selector: 'usb:agentor:test-device',
           name: 'Agentor test USB device', vendor: 'agentor', product: 'test',
           serial: 'deterministic', deviceNodes: ['/dev/null'], groupIds: [],
+          incus: { supported: false, mode: 'unsupported', reason: 'Fixture device has no physical USB passthrough capability.' },
         });
       return discovered;
     } finally {
@@ -500,6 +488,24 @@ done`;
       else
         await this.docker.getContainer(name).remove({ force: true } as Docker.ContainerRemoveOptions).catch(() => undefined);
     }
+  }
+
+  /** Runtime-only discovery also checks live legacy mappings: desired settings
+   * can have removed a selection while the old Docker worker awaits rebuild. */
+  async discoverIncusHardwareDevices(workerId: string): Promise<HardwareDeviceCandidate[]> {
+    const candidates = await this.discoverHardwareDevices();
+    const peers = (await this.listContainers()).filter(peer => peer.State === 'running' && peer.Labels[ID_LABEL] !== workerId);
+    for (const peer of peers) {
+      const inspected = await withOperationDeadline(signal => this.docker.getContainer(peer.Id).inspect({ abortSignal: signal }),
+        DOCKER_READ_TIMEOUT_MS, 'Docker hardware ownership inspection');
+      if (inspected.Id !== peer.Id || inspected.Config.Labels?.[MANAGED_LABEL] !== 'true')
+        throw new Error('Legacy hardware ownership changed during inspection');
+      if (!inspected.State.Running) continue;
+      const paths = (inspected.HostConfig.Devices ?? []).map((device: { PathOnHost?: string }) => device.PathOnHost);
+      for (const candidate of candidates) if (candidate.deviceNodes.some(node => paths.includes(node)))
+        candidate.incus = { supported: false, mode: 'unsupported', reason: 'Device is mapped to another running Docker worker; stop and rebuild or archive that worker first.' };
+    }
+    return candidates;
   }
 
   async listContainers(): Promise<Docker.ContainerInfo[]> {
@@ -543,7 +549,7 @@ done`;
     const attachExec = await withOperationDeadline((operationSignal) => container.exec({
       Cmd: [
         'sh', '-c',
-        `tmux new-session -d -t main -s "${tmuxSession}" && { tmux select-window -t "${tmuxSession}:${windowIndex}" 2>/dev/null || true; } && exec tmux attach-session -t "${tmuxSession}"`,
+        TMUX_TERMINAL_CLIPBOARD_SETUP + `tmux new-session -d -t main -s "${tmuxSession}" && { tmux select-window -t "${tmuxSession}:${windowIndex}" 2>/dev/null || true; } && exec tmux attach-session -t "${tmuxSession}"`,
       ],
       AttachStdin: true,
       AttachStdout: true,
@@ -669,7 +675,8 @@ done`;
       DOCKER_READ_TIMEOUT_MS,
       'Docker worker log read',
     );
-    return logs.toString();
+    // Dockerode parses JSON log bodies; their original formatting is unavailable here.
+    return typeof logs === 'string' || Buffer.isBuffer(logs) ? logs.toString() : JSON.stringify(logs);
   }
 
   async stopContainer(containerId: string): Promise<void> {
@@ -950,34 +957,7 @@ for item in json.loads(sys.stdin.readline()):
   }
 
   async listAppInstances(containerId: string, appTypeId: string): Promise<AppInstanceInfo[]> {
-    const output = await this.execAppManage(containerId, appTypeId, ['list']);
-    const trimmed = output.trim();
-    if (!trimmed) return [];
-
-    const entries: AppInstanceInfo[] = [];
-    for (const line of trimmed.split(/\r?\n/)) {
-      const clean = line.trim();
-      if (!clean) continue;
-      // Tolerate occasional non-JSON stdout lines (e.g. a stray shell warning)
-      // so a single bad line doesn't wipe the whole list.
-      if (clean[0] !== '{') continue;
-      try {
-        const parsed = JSON.parse(clean) as Partial<AppInstanceInfo>;
-        if (!parsed.id) continue;
-        entries.push({
-          id: String(parsed.id),
-          appType: appTypeId,
-          port: typeof parsed.port === 'number' ? parsed.port : parseInt(String(parsed.port ?? 0), 10) || 0,
-          status: (parsed.status as AppInstanceInfo['status']) ?? 'stopped',
-          ...(parsed.machineName ? { machineName: String(parsed.machineName) } : {}),
-          ...(parsed.authUrl ? { authUrl: String(parsed.authUrl) } : {}),
-          ...(parsed.authCode ? { authCode: String(parsed.authCode) } : {}),
-        });
-      } catch {
-        // Malformed JSON line — skip.
-      }
-    }
-    return entries;
+    return parseAppInstances(await this.execAppManage(containerId, appTypeId, ['list']), appTypeId);
   }
 
   async startAppInstance(
@@ -998,22 +978,7 @@ for item in json.loads(sys.stdin.readline()):
 
   /** Scan NDJSON output from manage.sh and throw if any line signals an error. */
   private assertManageOk(output: string, context: string): void {
-    const trimmed = output.trim();
-    if (!trimmed) return;
-    for (const line of trimmed.split(/\r?\n/)) {
-      const clean = line.trim();
-      if (!clean || clean[0] !== '{') continue;
-      let parsed: { status?: string; message?: string };
-      try {
-        parsed = JSON.parse(clean) as { status?: string; message?: string };
-      } catch {
-        // Non-JSON line or parse error — ignore (likely stderr noise).
-        continue;
-      }
-      if (parsed.status === 'error') {
-        throw new Error(parsed.message || `app manage failed: ${context}`);
-      }
-    }
+    assertAppManageOk(output, context);
   }
 
   // --- Workspace archive methods ---

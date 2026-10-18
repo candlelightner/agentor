@@ -3,7 +3,7 @@ defineRouteMeta({
     tags: ["Containers"],
     summary: "Recover an unresponsive worker runtime",
     description:
-      "Performs bounded, worker-scoped recovery. Agentor verifies persistent mounts, replaces only the disposable container, re-runs managed secret bootstrap, and reconciles plugins. No workspace or volume is deleted.",
+      "Performs bounded, worker-scoped recovery. Agentor verifies persistent storage, replaces only disposable compute, re-runs managed bootstrap, and reconciles plugins. Incus recovery uses applied configuration and preserves pending edits. No workspace or volume is deleted.",
     operationId: "recoverContainer",
     parameters: [
       {
@@ -23,7 +23,7 @@ defineRouteMeta({
         },
       },
       409: { description: "Persistent mounts could not be verified" },
-      503: { description: "Docker daemon state still blocks scoped recovery" },
+      503: { description: "Runtime control-plane state still blocks scoped recovery" },
     },
   },
 });

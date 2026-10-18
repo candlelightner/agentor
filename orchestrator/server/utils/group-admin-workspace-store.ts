@@ -1,4 +1,7 @@
+import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from "node:crypto";
+import { withWorkerRuntimeSetup, withWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
+import { applyAdminNativePatch, type AdminNativeAcknowledge } from './admin-native-authority';
 import type {
   AdminWorkspaceIdentityMaterializationIntent,
   AdminWorkspaceRuntimeAdapter,
@@ -149,7 +152,9 @@ export class GroupAdminWorkspaceStore {
     this.running.add(groupId);
     let deferredRelease = false;
     try {
-      return await operation();
+      const snapshot = this.group(groupId);
+      return await this.serializeOwner(snapshot.userId, () => withWorkerLifecycleMutation(
+        snapshot.adminWorkspace?.id ?? `admin-group-bootstrap:${groupId}`, operation));
     } catch (error) {
       const settlement = (error as OperationFailureWithSettlement)?.[
         operationSettlement
@@ -163,6 +168,45 @@ export class GroupAdminWorkspaceStore {
       if (!deferredRelease) this.running.delete(groupId);
     }
   }
+  private nativeAcknowledge(record: GroupAdministrativeWorkspaceRecord): AdminNativeAcknowledge {
+    return async patch => {
+      if (applyAdminNativePatch(record, patch)) await this.commitExternal('native-runtime', record);
+    };
+  }
+  async withNativeRuntimeTransaction<T>(groupId: string,
+    operation: (record: GroupAdministrativeWorkspaceRecord, acknowledge: AdminNativeAcknowledge, refreshRunningIdentity: () => Promise<void>) => Promise<T>, authorize?: () => void): Promise<T> {
+    return this.run(groupId, () => this.withGroup(groupId, false, async () => {
+      authorize?.();
+      await this.flushPendingCommit(groupId, 'native-runtime');
+      const record = this.record(groupId);
+      if (!record) throw Object.assign(new Error('Group administrative workspace is not provisioned'), { statusCode: 404 });
+      let active = true, refresh: Promise<void> | undefined;
+      const refreshRunningIdentity = () => {
+        if (!active || record.runtimeKind !== 'incus-vm' || record.status !== 'running' || record.nativeRuntime?.pending || record.nativeRuntime?.deleting || record.nativeRuntime?.selectedOperation || !this.identityMaterializer)
+          return Promise.reject(Object.assign(new Error('Group administrative running identity refresh is unavailable'), { statusCode: 503 }));
+        this.requireRuntime();
+        return refresh ??= this.identityMaterializer(structuredClone(record), 'refresh-running').finally(() => { refresh = undefined; });
+      };
+      try { return await operation(record, this.nativeAcknowledge(record), refreshRunningIdentity); }
+      finally { active = false; await refresh?.catch(() => {}); }
+    }));
+  }
+  /** Credential-only refresh: no owner network lock or provisioning. */
+  async refreshRunningIdentity(groupId: string) {
+    this.requireRuntime();
+    const before = this.record(groupId);
+    if (!before || before.runtimeKind !== 'incus-vm') throw Object.assign(new Error('Native group administrative identity is unavailable'), { statusCode: 409 });
+    return withWorkerRuntimeSetup(before.id, async () => {
+      const record = this.record(groupId);
+      if (!record || !isDeepStrictEqual(record, before) || this.pendingCommits.has(groupId) ||
+          record.nativeRuntime?.pending || record.nativeRuntime?.deleting || record.nativeRuntime?.selectedOperation)
+        throw Object.assign(new Error('Group administrative identity changed'), { statusCode: 409 });
+      if (record.status !== 'running') return;
+      if (!this.identityMaterializer) throw Object.assign(new Error('Group administrative identity materializer is unavailable'), { statusCode: 503 });
+      await this.identityMaterializer(structuredClone(record), 'refresh-running');
+      if (!isDeepStrictEqual(this.record(groupId), record)) throw Object.assign(new Error('Group administrative identity changed'), { statusCode: 409 });
+    });
+  }
   async ensure(groupId: string, _ownerId?: string, authorize?: () => void) {
     return this.run(groupId, () =>
       this.withGroup(groupId, false, (group) => {
@@ -171,7 +215,24 @@ export class GroupAdminWorkspaceStore {
       }),
     );
   }
+  async getStatus(groupId: string, authorize?: () => void) {
+    return this.withGroup(groupId, false, async () => {
+      authorize?.();
+      const record = this.record(groupId);
+      if (this.running.has(groupId) || this.pendingCommits.has(groupId) || record?.nativeRuntime?.pending ||
+          record?.nativeRuntime?.deleting || record?.nativeRuntime?.selectedOperation ||
+          record?.nativeMigration && record.nativeMigration.phase !== 'retained')
+        throw Object.assign(new Error('Group administrative workspace operation is not settled; retry'), { statusCode: 503 });
+      if (!record)
+        throw Object.assign(new Error('Group administrative workspace not provisioned'), { statusCode: 404 });
+      return this.publicRecord(record);
+    });
+  }
+  private requireRuntime() {
+    if (!this.runtime) throw Object.assign(new Error('Group administrative workspace runtime is not ready'), { statusCode: 503 });
+  }
   private async ensureLocked(group: WorkerGroup) {
+    this.requireRuntime();
     const pending = await this.flushPendingCommit(group.id, "ensure");
     if (pending?.matched) {
       if (pending.record.status === "running" && this.identityMaterializer)
@@ -189,6 +250,7 @@ export class GroupAdminWorkspaceStore {
         id: randomUUID(),
         kind: "group-administrative",
         trusted: true,
+        runtimeKind: "incus-vm",
         groupId: group.id,
         ownerId: group.userId,
         services: ["terminal", "editor", "desktop"],
@@ -211,7 +273,7 @@ export class GroupAdminWorkspaceStore {
         );
       const changed = this.applyImage(
         record,
-        await this.runtime.ensure(structuredClone(record)),
+        await this.runtime.ensure(structuredClone(record), this.nativeAcknowledge(record)),
       );
       if (changed) await this.commitExternal("ensure", record);
       if (record.status === "running" && this.identityMaterializer)
@@ -230,6 +292,7 @@ export class GroupAdminWorkspaceStore {
     return this.run(groupId, () =>
       this.withGroup(groupId, false, async (group) => {
         authorize?.();
+        this.requireRuntime();
         const operation = `status:${status}`;
         const pending = await this.flushPendingCommit(groupId, operation);
         if (pending?.matched) {
@@ -253,13 +316,13 @@ export class GroupAdminWorkspaceStore {
               );
             this.applyImage(
               record,
-              await this.runtime.start(structuredClone(record)),
+              await this.runtime.start(structuredClone(record), this.nativeAcknowledge(record)),
             );
             await this.identityMaterializer?.(
               structuredClone(record),
               "refresh-running",
             );
-          } else await this.runtime.stop(structuredClone(record));
+          } else await this.runtime.stop(structuredClone(record), this.nativeAcknowledge(record));
         }
         record.status = status;
         record.updatedAt = new Date().toISOString();
@@ -273,6 +336,7 @@ export class GroupAdminWorkspaceStore {
     return this.run(groupId, () =>
       this.withGroup(groupId, false, async (group) => {
         authorize?.();
+        this.requireRuntime();
         const pending = await this.flushPendingCommit(groupId, "rebuild");
         if (pending?.matched) {
           if (this.identityMaterializer)
@@ -301,7 +365,7 @@ export class GroupAdminWorkspaceStore {
           );
         this.applyImage(
           record,
-          await this.runtime.rebuild(structuredClone(record)),
+          await this.runtime.rebuild(structuredClone(record), this.nativeAcknowledge(record)),
         );
         await this.identityMaterializer?.(
           structuredClone(record),
@@ -397,10 +461,11 @@ export class GroupAdminWorkspaceStore {
   async remove(groupId: string, serialized = false) {
     const operation = () =>
       this.withGroup(groupId, serialized, async () => {
+        if (this.record(groupId) || this.pendingCommits.has(groupId)) this.requireRuntime();
         const pending = await this.flushPendingCommit(groupId, "remove");
         const record = pending?.record ?? this.record(groupId);
         if (record && this.runtime?.remove)
-          await this.runtime.remove(structuredClone(record));
+          await this.runtime.remove(structuredClone(record), this.nativeAcknowledge(record));
       });
     return serialized ? operation() : this.run(groupId, operation);
   }
@@ -414,10 +479,11 @@ export class GroupAdminWorkspaceStore {
   ) {
     const operation = () =>
       this.withGroup(groupId, serialized, async (group) => {
+        if (!this.record(groupId) && !this.pendingCommits.has(groupId)) return;
         await this.ensureLocked(group);
         if (status !== "stopped") return;
         const record = this.record(groupId)!;
-        if (this.runtime) await this.runtime.stop(structuredClone(record));
+        if (this.runtime) await this.runtime.stop(structuredClone(record), this.nativeAcknowledge(record));
         record.status = "stopped";
         record.updatedAt = new Date().toISOString();
         if (this.runtime)
@@ -457,6 +523,8 @@ export class GroupAdminWorkspaceStore {
       ...record,
       userId: record.ownerId,
       ownerId: undefined,
+      nativeRuntime: undefined,
+      nativeMigration: undefined,
       startupScript: undefined,
       startupScriptRevision: undefined,
       appliedStartupScriptRevision: undefined,

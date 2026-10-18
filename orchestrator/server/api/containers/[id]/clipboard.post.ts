@@ -109,8 +109,9 @@ export default defineEventHandler(async (event) => {
   const containerManager = useContainerManager();
   const adminWorkspace = useAdminWorkspaceStore();
   const groupAdminWorkspaces = useGroupAdminWorkspaceStore();
-  const adminRecord = await adminWorkspace.ensure();
-  const isAdministrative = id === adminRecord.id;
+  await adminWorkspace.init();
+  const adminRecord = adminWorkspace.getRecord();
+  const isAdministrative = id === adminRecord?.id;
   const groupAdminRecord = groupAdminWorkspaces.findByWorkspaceId(id);
 
   // Ownership/404/401/403 checks BEFORE the body is read, so an unauthenticated
@@ -123,7 +124,7 @@ export default defineEventHandler(async (event) => {
     const auth = requireAuth(event);
     if (auth.user.role !== 'admin') throw createError({ statusCode: 403, statusMessage: 'Forbidden' });
   } else requireContainerAccess(event, containerInfo);
-  if ((!isAdministrative && !containerInfo) || (!isAdministrative && containerInfo!.status !== 'running') || (isAdministrative && adminRecord.status !== 'running') || (groupAdminRecord && groupAdminRecord.status !== 'running')) {
+  if ((!isAdministrative && !containerInfo) || (!isAdministrative && containerInfo!.status !== 'running') || (isAdministrative && adminRecord?.status !== 'running') || (groupAdminRecord && groupAdminRecord.status !== 'running')) {
     throw createError({ statusCode: 409, statusMessage: 'Worker container is not running' });
   }
 

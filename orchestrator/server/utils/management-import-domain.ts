@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { Transform, type Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { useConfig, useContainerManager } from "./services";
+import type { WorkerImportOptions } from './container';
+import { parseWorkerImportImageResolution, WORKER_IMPORT_IMAGE_RESOLUTION_SCHEMA } from './worker-import-image-resolution';
 
 const MAX_UPLOAD = 40 * 1024 * 1024 * 1024;
 const MIN_FREE = 512 * 1024 * 1024;
@@ -15,11 +17,12 @@ interface PreparedImport {
   workspaceId: string;
   ownerId: string;
   displayName?: string;
+  imageResolution?: WorkerImportOptions['imageResolution'];
   expiresAt: number;
 }
 interface ImportDependencies {
   dataDir: () => string;
-  importWorker: (ownerId: string, bundlePath: string, options: { displayName?: string }) => Promise<unknown>;
+  importWorker: (ownerId: string, bundlePath: string, options: WorkerImportOptions) => Promise<unknown>;
 }
 
 /** Controlled binary handoff for management MCP worker imports. Archive bytes
@@ -46,6 +49,7 @@ export class ManagementImportDomain {
         properties: {
           ownerId: { type: "string", description: "Owner for the newly imported worker." },
           displayName: { type: "string", minLength: 1, maxLength: 100 },
+          imageResolution: WORKER_IMPORT_IMAGE_RESOLUTION_SCHEMA,
         },
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -56,11 +60,12 @@ export class ManagementImportDomain {
     if (name !== "imports.prepare") return { handled: false };
     const ownerId = required(args.ownerId, "ownerId");
     const displayName = optionalName(args.displayName);
+    const imageResolution = parseWorkerImportImageResolution(args.imageResolution);
     this.expire();
     if (this.prepared.size >= MAX_PREPARED) throw fail(429, "Too many pending import uploads");
     const token = randomUUID();
     const expiresAt = Date.now() + TOKEN_TTL_MS;
-    this.prepared.set(token, { workspaceId, ownerId, displayName, expiresAt });
+    this.prepared.set(token, { workspaceId, ownerId, displayName, imageResolution, expiresAt });
     return { handled: true, result: {
       method: "PUT",
       uploadPath: `/imports/${token}`,
@@ -96,7 +101,8 @@ export class ManagementImportDomain {
       });
       await pipeline(source, limit, createWriteStream(bundle, { mode: 0o600 }));
       if (!uploaded) throw fail(400, "Worker import bundle is empty");
-      return await this.deps.importWorker(prepared.ownerId, bundle, { displayName: prepared.displayName });
+      return await this.deps.importWorker(prepared.ownerId, bundle, { displayName: prepared.displayName,
+        ...(prepared.imageResolution ? { imageResolution: prepared.imageResolution } : {}) });
     } catch (error: any) {
       if (Number.isInteger(error?.statusCode)) throw error;
       const message = error instanceof Error ? error.message : "";

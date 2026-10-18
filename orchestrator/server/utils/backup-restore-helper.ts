@@ -4,8 +4,11 @@ import { createReadStream } from 'node:fs';
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { useConfig, useContainerManager, useDockerService, useStorageManager } from './services';
+import { useConfig, useContainerManager, useDockerService, useStorageManager, useWorkerStore } from './services';
 import { assertSafeUserId } from './user-id';
+import { normalizeWorkerRuntimeKind, type ContainerInfo, type WorkerRuntimeKind } from '../../shared/types';
+import type { WorkerRecord } from './worker-store';
+import { parseWorkerBackupRuntime } from './worker-backup-runtime';
 import {
   operationSettlement,
   type OperationFailureWithSettlement,
@@ -49,12 +52,75 @@ except BaseException:
  raise
 `;
 
-/** Same-filesystem staged replacement for a stopped worker workspace. */
+/** This replacement helper only knows legacy storage. Never derive its source
+ * from a cached Docker handle when the durable worker has moved to Incus: that
+ * source may be retained migration rollback data, not the current workspace. */
+export async function assertLegacyOriginalRestoreTarget(userId: string, workerId: string) {
+ const { worker, record } = await originalRestoreFacts(userId, workerId);
+ if (worker?.runtimeKind === 'incus-vm' || worker?.containerId.startsWith('incus:') || record?.runtimeKind === 'incus-vm')
+  throw Object.assign(new Error('Original workspace replacement for Incus workers is not available yet; restore into a new worker'), {
+   statusCode: 409, code: 'INCUS_ORIGINAL_RESTORE_CAPABILITY_PENDING',
+  });
+ assertSettledOriginalRestoreFacts(userId, workerId, worker, record);
+ return worker;
+}
+
+async function originalRestoreFacts(userId: string, workerId: string) {
+ assertSafeUserId(userId);
+ const store = useWorkerStore();
+ await store.init();
+ return { worker: useContainerManager().get(workerId), record: store.get(userId, workerId) };
+}
+
+function assertSettledOriginalRestoreFacts(userId: string, workerId: string,
+ worker: ContainerInfo | undefined, record: WorkerRecord | undefined): asserts worker is ContainerInfo {
+ if (!worker || worker.id !== workerId || worker.userId !== userId || worker.status !== 'stopped' ||
+     !record || record.id !== workerId || record.userId !== userId || record.status !== 'active' ||
+     record.deletionPending || record.incusRecreation || worker.administrativeKind)
+  throw Object.assign(new Error('Original worker must be durably active and stopped for safe restore'), { statusCode: 409 });
+}
+
+/** Read-only current-runtime admission, not authority to create compute or
+ * overwrite storage. The writer must repeat these facts under the existing
+ * owner→worker fence and prove native installation/storage/UUID identity. */
+export async function assertOriginalRestoreTarget(userId: string, workerId: string): Promise<Readonly<{
+ worker: ContainerInfo; record: WorkerRecord; runtimeKind: WorkerRuntimeKind; incarnation?: string;
+}>> {
+ const { worker, record } = await originalRestoreFacts(userId, workerId);
+ assertSettledOriginalRestoreFacts(userId, workerId, worker, record);
+ const invalid = () => Object.assign(new Error('Original restore durable and current runtime identity disagree'),
+  { statusCode: 409, code: 'ORIGINAL_RESTORE_RUNTIME_IDENTITY_MISMATCH' });
+ const validKind = (kind: unknown) => kind === undefined || kind === 'legacy-docker' || kind === 'incus-vm';
+ if (!record || !validKind(record.runtimeKind) || !validKind(worker.runtimeKind)) throw invalid();
+ const runtimeKind = normalizeWorkerRuntimeKind(record.runtimeKind);
+ if (runtimeKind !== normalizeWorkerRuntimeKind(worker.runtimeKind) || typeof worker.containerId !== 'string' || !worker.containerId)
+  throw invalid();
+ if (runtimeKind === 'legacy-docker') {
+  if (worker.containerId.startsWith('incus:')) throw invalid();
+  return { worker, record, runtimeKind };
+ }
+ const incarnation = /^incus:([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})$/.exec(worker.containerId)?.[1];
+ if (!incarnation || worker.containerName !== useContainerManager().buildContainerName(workerId)) throw invalid();
+ return { worker, record, runtimeKind, incarnation };
+}
+
+/** Authenticated source metadata describes bytes, never destination runtime
+ * or image authority. Historical missing metadata remains legacy; an original
+ * restore cannot serve as an implicit runtime migration in either direction. */
+export function assertOriginalRestoreSourceRuntime(targetKind: WorkerRuntimeKind, authenticatedRuntime: unknown): void {
+ const sourceKind = parseWorkerBackupRuntime(authenticatedRuntime)?.kind ?? 'legacy-docker';
+ if (sourceKind !== targetKind)
+  throw Object.assign(new Error('Backup and original worker runtime differ; original restore cannot migrate a worker'),
+   { statusCode: 409, code: 'ORIGINAL_RESTORE_SOURCE_RUNTIME_MISMATCH' });
+}
+
+/** Same-filesystem staged replacement for a stopped legacy worker workspace. */
 export async function replaceStoppedWorkspace(userId:string,workerId:string,workspaceArchive:string,signal?:AbortSignal):Promise<void>{
  return withWorkerLifecycleMutation(workerId,async()=>{
  signal?.throwIfAborted();
- assertSafeUserId(userId);
- const cm=useContainerManager(),worker=cm.get(workerId);if(!worker||worker.userId!==userId||worker.status!=='stopped')throw new Error('Original worker must be stopped for safe restore');
+ await assertLegacyOriginalRestoreTarget(userId,workerId);
+ signal?.throwIfAborted();
+ const cm=useContainerManager();
  const storage=useStorageManager(),config=useConfig(),source=storage.mode==='directory'?join(storage.dataRef,'users',userId,'workspaces',workerId):`${cm.buildContainerName(workerId)}-workspace`;
  const docker=new Docker({socketPath:'/var/run/docker.sock'});
  if(storage.mode==='volume')await withOperationDeadline(docker.getVolume(source).inspect(),RESTORE_HELPER_DOCKER_TIMEOUT_MS,'Docker restore-workspace volume inspection',signal);else{const st=await lstat(source);if(!st.isDirectory()||st.isSymbolicLink())throw new Error('Workspace storage is not a safe directory');}

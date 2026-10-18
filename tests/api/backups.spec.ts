@@ -618,9 +618,32 @@ test.describe
           ])
         ).status,
       ).toBe(200);
+      const savedPaths = { [archived]: ["/workspace", "/home/agent/.agent-data", "/tmp"], [workspaceA]: ["/workspace"] };
+      const selected = await ownerCtx.put("/api/backup-settings", { data: {
+        providerId: "fake", enabled: false, selection: "selected", workspaceIds: [archived, workspaceA],
+        persistSelectedDirectories: true, selectedPathsByWorkspace: savedPaths, intervalMinutes: 53, retentionCount: 9,
+      } });
+      expect(selected.status(), await selected.text()).toBe(200);
       expect(
         (await new ApiClient(ownerCtx).archiveContainer(archived)).status,
       ).toBe(200);
+      // Browser saves send the full path map, even when deselecting a worker.
+      // Existing explicit coverage remains recorded, but it must not be seeded
+      // from an archived worker merely to save unrelated schedule settings.
+      for (const workspaceIds of [[archived, workspaceA], [workspaceA]]) {
+        const saved = await ownerCtx.put("/api/backup-settings", { data: {
+          selection: "selected", workspaceIds, selectedPathsByWorkspace: savedPaths, retentionCount: 12,
+        } });
+        expect(saved.status(), await saved.text()).toBe(200);
+        expect(await saved.json()).toMatchObject({ providerId: "fake", enabled: false, intervalMinutes: 53,
+          retentionCount: 12, workspaceIds, selectedPathsByWorkspace: savedPaths });
+      }
+      // Additional paths require running compute; saving archived selections
+      // never silently removes those paths or relaxes that capture policy.
+      const explicit = await ownerCtx.post("/api/backups", { data: { workspaceIds: [archived], providerId: "fake",
+        selectedPathsByWorkspace: { [archived]: ["/tmp"] } } });
+      expect(explicit.status()).toBe(202);
+      expect((await waitForJob(ownerCtx, (await explicit.json()).id)).status).toBe("failed");
       const created = await startBackup(ownerCtx, {
         workspaceIds: [archived],
         providerId: "fake",

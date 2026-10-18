@@ -29,7 +29,7 @@ export function instanceBackupHttpJob(job: PublicInstanceBackupJob) {
   const id = encodeURIComponent(job.id);
   const active = job.status === "queued" || job.status === "running";
   const cancellable =
-    active && !(job.operation === "restore" && job.phase === "applying");
+    active && !(job.operation === "restore" && ['helper-starting', 'applying'].includes(job.phase));
   return {
     ...job,
     nextActions: {

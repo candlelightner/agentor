@@ -21,6 +21,8 @@ import {
   type PortableManagedVolumeEntry,
 } from './portable-managed-volume-format';
 import { MAX_PORTABLE_MANAGED_VOLUME_COMPRESSED_PAYLOAD_BYTES } from './portable-managed-volume-archive';
+import { parseWorkerBackupRuntime, type WorkerBackupRuntime } from './worker-backup-runtime';
+import { compressBackupStream, type BackupCompressionOptions } from './backup-compression';
 
 /** Bumped when the bundle layout changes incompatibly. */
 export const WORKER_EXPORT_VERSION = 5;
@@ -138,6 +140,9 @@ export function validateBundleOutputLayout(
 export interface WorkerExportManifest {
   version: number;
   exportedAt: string;
+  /** Descriptive portable inputs only; never import authorization. Missing
+   * historical runtime metadata must not be inferred from platform settings. */
+  runtime?: WorkerBackupRuntime;
   /** Identity of the source worker (informational; not reused on import). */
   source: {
     id: string;
@@ -150,6 +155,8 @@ export interface WorkerExportManifest {
     displayName: string;
     repos: RepoConfig[];
     mounts: MountConfig[];
+    /** Opaque desired catalog IDs only; destination grants must authorize them again. */
+    hardwareDeviceIds?: string[];
     initScript: string;
     /** Orchestrator-side access policy. Missing legacy values inherit. */
     workerSelfApiAccess?: WorkerSelfApiAccess;
@@ -268,11 +275,15 @@ export function packBundle(files: { name: string; path: string }[]): Readable {
 
 /** Write the manifest JSON to a file. */
 export async function writeManifest(manifest: WorkerExportManifest, dest: string): Promise<void> {
+  const runtime = parseWorkerBackupRuntime(manifest.runtime);
+  if (runtime?.kind === 'incus-vm' && manifest.contents.rootfs)
+    throw new Error('Incus disposable root filesystem is not portable backup data');
   // Domain basic-auth passwords are runtime credentials, not portable worker
   // configuration. Sanitize at the serialization boundary as defense in depth:
   // callers compiled against an older type cannot accidentally export them.
   const safeManifest = {
     ...manifest,
+    ...(runtime ? { runtime } : {}),
     domainMappings: manifest.domainMappings.map((mapping) => {
       const { basicAuth: _secret, ...safe } = mapping as ExportedDomainMapping & { basicAuth?: unknown };
       return safe;
@@ -406,9 +417,40 @@ export async function sanitizeBackupPathTarPayload(
   selectedPath: string,
   signal?: AbortSignal,
 ): Promise<{ omittedSpecialEntries: number }> {
+  return sanitizeBackupPathTar(source, destination, selectedPath, signal);
+}
+
+/** Same sanitizer and archive contract, without raw/sanitized TAR staging. */
+export async function sanitizeBackupPathTarGzip(input: {
+  source: Readable;
+  destination: string;
+  selectedPath: string;
+  signal?: AbortSignal;
+  onBytes?: (uncompressedBytes: number) => void;
+  compression?: Omit<BackupCompressionOptions, 'signal'>;
+}): Promise<{ omittedSpecialEntries: number }> {
+  try {
+    return await sanitizeBackupPathTar(input.source, input.destination, input.selectedPath,
+      input.signal, { ...input.compression, signal: input.signal }, input.onBytes);
+  } catch (error) {
+    input.source.destroy();
+    throw error;
+  }
+}
+
+async function sanitizeBackupPathTar(
+  source: string | Readable,
+  destination: string,
+  selectedPath: string,
+  signal?: AbortSignal,
+  compression?: BackupCompressionOptions,
+  onBytes?: (uncompressedBytes: number) => void,
+): Promise<{ omittedSpecialEntries: number }> {
   if (!safeAbsoluteBackupPath(selectedPath))
     throw new Error("Invalid selected backup path");
   signal?.throwIfAborted();
+  const controller = new AbortController();
+  const operationSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
   let expandedBytes = 0;
   let entries = 0;
   let omittedSpecialEntries = 0;
@@ -420,6 +462,7 @@ export async function sanitizeBackupPathTarPayload(
   const counter = new Transform({
     transform(chunk, _encoding, callback) {
       expandedBytes += Buffer.byteLength(chunk);
+      try { onBytes?.(expandedBytes); } catch (error) { callback(error as Error); return; }
       callback(
         expandedBytes > MAX_INNER_ARCHIVE_BYTES
           ? new Error("Invalid backup path archive: expanded archive exceeds the size limit")
@@ -432,13 +475,14 @@ export async function sanitizeBackupPathTarPayload(
   const fail = (error: unknown) => {
     if (failed) return;
     failed = error instanceof Error ? error : new Error(String(error));
-    // The pipeline that observed the original error will reject. Destroy the
-    // peer streams without re-emitting that error: tar-stream can otherwise
-    // surface a second unhandled error from a nested `next()` callback.
+    // Keep the original validation error while aborting both pipelines.
+    // Every nested entry has an error listener before cancellation can fire.
+    controller.abort();
     extract.destroy();
     pack.destroy();
   };
   extract.on("entry", (header, stream, next) => {
+    stream.on("error", fail);
     entries += 1;
     try {
       if (entries > MAX_INNER_ARCHIVE_ENTRIES)
@@ -499,7 +543,6 @@ export async function sanitizeBackupPathTarPayload(
         if (error) fail(error);
         next(error || undefined);
       });
-      stream.on("error", fail);
       entry.on("error", fail);
       stream.pipe(entry);
     } catch (error) {
@@ -510,12 +553,17 @@ export async function sanitizeBackupPathTarPayload(
   extract.on("finish", () => pack.finalize());
   extract.on("error", fail);
   pack.on("error", fail);
+  const operations = [
+    pipeline(typeof source === 'string' ? createReadStream(source) : source, counter, extract, { signal: operationSignal }),
+    compression ? compressBackupStream(pack, destination, { ...compression, signal: operationSignal })
+      : pipeline(pack, createWriteStream(destination, { mode: 0o600 }), { signal: operationSignal }),
+  ];
   try {
-    await Promise.all([
-      pipeline(createReadStream(source), counter, extract, { signal }),
-      pipeline(pack, createWriteStream(destination, { mode: 0o600 }), { signal }),
-    ]);
+    await Promise.all(operations);
   } catch (error) {
+    fail(error);
+    // Stop peers and await compressor exit before helper or scratch cleanup.
+    await Promise.allSettled(operations);
     throw failed ?? error;
   }
   return { omittedSpecialEntries };
@@ -784,6 +832,11 @@ function assertValidManifest(value: unknown): asserts value is WorkerExportManif
   ) {
     throw new Error('Invalid worker export: manifest.worker.workerSelfApiAccess is invalid');
   }
+  if (worker.hardwareDeviceIds !== undefined && (!Array.isArray(worker.hardwareDeviceIds) ||
+      worker.hardwareDeviceIds.length > 128 || worker.hardwareDeviceIds.some(id => typeof id !== 'string' ||
+        !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(id)) ||
+      new Set(worker.hardwareDeviceIds).size !== worker.hardwareDeviceIds.length))
+    throw new Error('Invalid worker export: manifest.worker.hardwareDeviceIds is invalid');
   if (!worker.repos.every((repo) => isRecord(repo) && isString(repo.provider) && isString(repo.url) && (repo.branch === undefined || isString(repo.branch)))) {
     throw new Error('Invalid worker export: manifest.worker.repos is invalid');
   }
@@ -801,6 +854,11 @@ function assertValidManifest(value: unknown): asserts value is WorkerExportManif
   }
   if (!isRecord(contents) || !['rootfs', 'workspace', 'agents'].every((k) => typeof contents[k] === 'boolean') || (contents.backupPaths !== undefined && typeof contents.backupPaths !== 'boolean') || (contents.plugins !== undefined && typeof contents.plugins !== 'boolean') || (contents.reconstruction !== undefined && typeof contents.reconstruction !== 'boolean') || (contents.managedVolumes !== undefined && typeof contents.managedVolumes !== 'boolean')) {
     throw new Error('Invalid worker export: manifest.contents is invalid');
+  }
+  if (value.runtime !== undefined) {
+    value.runtime = parseWorkerBackupRuntime(value.runtime);
+    if ((value.runtime as WorkerBackupRuntime).kind === 'incus-vm' && contents.rootfs)
+      throw new Error('Incus disposable root filesystem is not portable backup data');
   }
   if (value.backupPaths !== undefined && (!Array.isArray(value.backupPaths) || value.backupPaths.length > 32 || new Set(value.backupPaths.map((entry: any) => entry?.path)).size !== value.backupPaths.length || new Set(value.backupPaths.map((entry: any) => entry?.archive)).size !== value.backupPaths.length || value.backupPaths.some((entry) => !isRecord(entry) || !isString(entry.path) || !safeAbsoluteBackupPath(entry.path) || !isString(entry.archive) || !/^paths\/[0-9]{1,2}\.tar$/.test(entry.archive)))) {
     throw new Error('Invalid worker export: manifest.backupPaths is invalid');

@@ -1,0 +1,407 @@
+"""Real TLS transport tests; no Incus host or platform credentials required."""
+import hashlib
+import http.client
+import importlib.util
+import json
+import os
+from pathlib import Path
+import socket
+import ssl
+import subprocess
+import tempfile
+import threading
+import unittest
+import uuid
+from unittest.mock import Mock, patch
+
+SPEC = importlib.util.spec_from_file_location(
+    "agentor_network_service", Path(__file__).resolve().parents[2] / "scripts/agentor-incus-network-service.py")
+MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(MODULE)
+
+
+class PrivateDockerTransportTests(unittest.TestCase):
+    def test_private_requests_pin_mac_capable_api_and_keep_exact_connect_body(self):
+        connection = Mock()
+        response = connection.getresponse.return_value
+        response.status = 200
+        response.read.return_value = b'{}'
+        body = {"Container": "a" * 64, "EndpointConfig": {
+            "MacAddress": "06:01:23:45:67:89", "IPAMConfig": {"IPv4Address": "10.210.19.2"}}}
+        with patch.object(MODULE, "UnixConnection", return_value=connection) as factory:
+            request = MODULE.docker_request("/fixture-only.sock")
+            for method, path, value in (("GET", "/containers/controller/json", None),
+                                        ("POST", "/networks/create", {"Name": "owned"}),
+                                        ("POST", "/networks/" + "b" * 64 + "/connect", body)):
+                self.assertEqual(request(method, path, value), {})
+                connection.request.assert_called_with(method, "/v1.54" + path,
+                    None if value is None else json.dumps(value).encode(), {"Content-Type": "application/json"})
+            self.assertEqual(factory.call_count, 3)
+            factory.assert_called_with("/fixture-only.sock")
+            self.assertEqual(connection.close.call_count, 3)
+            response.read.assert_called_with(4 * 1024 * 1024 + 1)
+
+    def test_old_or_rejected_api_has_no_unversioned_retry_and_closes_connection(self):
+        for status in (400, 403, 404, 500):
+            with self.subTest(status=status):
+                connection = Mock()
+                connection.getresponse.return_value.status = status
+                connection.getresponse.return_value.read.return_value = b'{"message":"private daemon details"}'
+                with patch.object(MODULE, "UnixConnection", return_value=connection) as factory:
+                    with self.assertRaises(MODULE.IncusRejected) as failure:
+                        MODULE.docker_request("/fixture-only.sock")("GET", "/containers/controller/json")
+                self.assertEqual(failure.exception.status_code, status)
+                self.assertNotIn("private daemon details", str(failure.exception))
+                factory.assert_called_once()
+                connection.request.assert_called_once_with("GET", "/v1.54/containers/controller/json", None,
+                                                           {"Content-Type": "application/json"})
+                connection.close.assert_called_once()
+
+
+class TransportTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.scratch = tempfile.TemporaryDirectory(prefix="agentor-network-tls-")
+        cls.root = Path(cls.scratch.name)
+        for identity in ("server", "client", "other"):
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                            "-keyout", str(cls.root / (identity + ".key")),
+                            "-out", str(cls.root / (identity + ".crt")), "-days", "1",
+                            "-subj", "/CN=" + ("localhost" if identity == "server" else identity),
+                            "-addext", "subjectAltName=DNS:localhost"],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.scratch.cleanup()
+
+    def setUp(self):
+        self.installation = str(uuid.uuid4())
+        (self.root / "backup-installation-id").write_text(self.installation)
+        outer = self
+
+        class Policy:
+            data_dir = str(outer.root)
+            installation = outer.installation
+            project = "agentor"
+            primary = "workers"
+
+            def project_policy(self):
+                pass
+
+            def ensure(self, payload):
+                if not isinstance(payload, dict) or set(payload) != {"networkId", "userId"}:
+                    raise MODULE.POLICY.PolicyError("Unexpected authority")
+                outer.calls.append(payload)
+                return {"name": "owned-bridge"}
+
+            def remove(self, payload):
+                return self.ensure(payload)
+
+            def inspect(self, payload):
+                return self.ensure(payload)
+
+        self.calls = []
+        self.host_calls = []
+        self.account_calls = []
+        self.worker_id = str(uuid.uuid4())
+        self.path_id = str(uuid.uuid4())
+        self.selected_source = {"pathId": self.path_id, "source": "/srv/approved-fixture",
+                                "readOnly": True, "installation": self.installation}
+
+        class HostMountPolicy:
+            def selected(self, operation, payload):
+                if not isinstance(payload, dict) or set(payload) != {"pathId"} or payload["pathId"] != outer.path_id:
+                    raise MODULE.POLICY.PolicyError("Unexpected host mount authority")
+                outer.host_calls.append((operation, payload))
+                return dict(outer.selected_source)
+
+            def ensure(self, payload):
+                return self.selected("ensure", payload)
+
+            def inspect(self, payload):
+                return self.selected("inspect", payload)
+
+            def ensure_account_shares(self, payload):
+                if not isinstance(payload, dict) or set(payload) != {"userId", "workerId"} or payload != {"userId": "owner", "workerId": outer.worker_id}:
+                    raise MODULE.POLICY.PolicyError("Unexpected account share authority")
+                outer.account_calls.append(payload)
+                return {"installation": outer.installation, "project": "agentor", **payload,
+                        "sourcePaths": ["/fixed/credentials", "/fixed/kilo/config", "/fixed/kilo/data"]}
+
+        self.policy = Policy()
+        self.host_mounts = HostMountPolicy()
+        self.admin_calls = []
+        class AdminNetworkPolicy:
+            def ensure(self, payload):
+                if not isinstance(payload, dict) or set(payload) != {"workspaceId"} or payload["workspaceId"] != outer.worker_id:
+                    raise MODULE.POLICY.PolicyError("Unexpected administrative authority")
+                outer.admin_calls.append(("ensure", payload))
+                return {"network": "private-admin", "workspaceId": outer.worker_id}
+
+            def inspect(self, payload):
+                result = self.ensure(payload)
+                outer.admin_calls[-1] = ("inspect", payload)
+                return result
+        self.admin_networks = AdminNetworkPolicy()
+        self.start_server(self.host_mounts, self.admin_networks)
+
+    def start_server(self, host_mounts, admin_networks=None):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(self.root / "server.crt", self.root / "server.key")
+        # Trust both test clients so the independent exact fingerprint fence
+        # must reject the other certificate even after a valid TLS handshake.
+        context.load_verify_locations(cafile=self.root / "client.crt")
+        context.load_verify_locations(cafile=self.root / "other.crt")
+        context.verify_mode = ssl.CERT_REQUIRED
+        fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert((self.root / "client.crt").read_text())).hexdigest()
+        self.server = MODULE.TlsPolicyServer(("127.0.0.1", 0), MODULE.handler(self.policy, fingerprint, host_mounts=host_mounts, admin_networks=admin_networks), context,
+                                            request_timeout=0.25)
+        thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
+        thread.start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(self.server.shutdown)
+        self.port = self.server.server_address[1]
+
+    def test_admin_network_routes_accept_only_workspace_identity_and_keep_other_routes_separate(self):
+        for operation in ("ensure", "inspect"):
+            status, envelope = self.request("POST", "/v1/admin-networks/" + operation,
+                                            json.dumps({"workspaceId": self.worker_id}))
+            self.assertEqual(status, 200)
+            self.assertEqual(envelope["metadata"]["workspaceId"], self.worker_id)
+        self.assertEqual([operation for operation, _ in self.admin_calls], ["ensure", "inspect"])
+        self.assertEqual(self.calls + self.host_calls + self.account_calls, [])
+        for payload in ({"workspaceId": self.worker_id, "network": "workers"}, {"userId": "owner"}, []):
+            status, _ = self.request("POST", "/v1/admin-networks/ensure", json.dumps(payload))
+            self.assertEqual(status, 409)
+        status, _ = self.request("POST", "/v1/admin-networks/remove", json.dumps({"workspaceId": self.worker_id}))
+        self.assertEqual(status, 404)
+
+    def test_admin_network_routes_are_disabled_without_pinned_host_adapter(self):
+        self.start_server(self.host_mounts)
+        status, _ = self.request("POST", "/v1/admin-networks/ensure", json.dumps({"workspaceId": self.worker_id}))
+        self.assertEqual(status, 503)
+        self.assertEqual(self.admin_calls, [])
+
+    def context(self, identity="client"):
+        context = ssl.create_default_context(cafile=self.root / "server.crt")
+        if identity:
+            context.load_cert_chain(self.root / (identity + ".crt"), self.root / (identity + ".key"))
+        return context
+
+    def request(self, method="GET", path="/v1/managed-networks/readiness", body=None,
+                identity="client", headers=None):
+        connection = http.client.HTTPSConnection("localhost", self.port, timeout=2, context=self.context(identity))
+        try:
+            connection.request(method, path, body, headers or {})
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+    def test_exact_mtls_identity_readiness_and_bounded_operations(self):
+        self.assertEqual(self.request()[1]["metadata"]["ready"], True)
+        payload = {"userId": "owner", "networkId": str(uuid.uuid4())}
+        status, result = self.request("POST", "/v1/managed-networks/ensure?project=agentor", json.dumps(payload))
+        self.assertEqual(status, 200)
+        self.assertEqual(result["metadata"], {"name": "owned-bridge"})
+        self.assertEqual(self.calls, [payload])
+        status, result = self.request("POST", "/v1/managed-networks/inspect?project=agentor", json.dumps(payload))
+        self.assertEqual(status, 200)
+        self.assertEqual(result["metadata"], {"name": "owned-bridge"})
+        self.assertEqual(self.calls, [payload, payload])
+        self.assertEqual(self.request(identity="other")[0], 409)
+        with self.assertRaises((ssl.SSLError, OSError, http.client.HTTPException)):
+            self.request(identity=None)
+
+    def test_no_generic_proxy_project_or_body_authority(self):
+        for path in ("/1.0/instances", "/v1/managed-networks/readiness?project=default",
+                     "/v1/managed-networks/readiness?project=agentor&project=agentor"):
+            self.assertGreaterEqual(self.request(path=path)[0], 400)
+        for endpoint in ("ensure", "inspect"):
+            for body in (b"x" * 4097, b"not-json", json.dumps({"path": "/etc"}).encode()):
+                self.assertGreaterEqual(self.request("POST", f"/v1/managed-networks/{endpoint}", body)[0], 400)
+        self.assertEqual(self.calls, [])
+
+    def test_host_mount_endpoints_forward_only_selected_catalog_identity(self):
+        payload = {"pathId": self.path_id}
+        for endpoint in ("ensure", "inspect"):
+            status, result = self.request("POST", f"/v1/host-mounts/{endpoint}?project=agentor", json.dumps(payload))
+            self.assertEqual(status, 200)
+            self.assertEqual(result["metadata"], self.selected_source)
+        self.assertEqual(self.host_calls, [("ensure", payload), ("inspect", payload)])
+        self.assertEqual(self.calls, [])
+
+    def test_host_mount_endpoints_cannot_accept_raw_source_project_or_commands(self):
+        for endpoint in ("ensure", "inspect"):
+            for payload in ({}, {"pathId": "unknown"}, [self.path_id],
+                            {"source": "/etc"}, {"pathId": self.path_id, "source": "/etc"},
+                            {"pathId": self.path_id, "project": "default"},
+                            {"pathId": self.path_id, "command": ["sh", "-c", "true"]},
+                            {"pathId": self.path_id, "readOnly": False}):
+                self.assertGreaterEqual(self.request("POST", f"/v1/host-mounts/{endpoint}", json.dumps(payload))[0], 400)
+            for body in (b"x" * 4097, b"not-json"):
+                self.assertGreaterEqual(self.request("POST", f"/v1/host-mounts/{endpoint}", body)[0], 400)
+            for query in ("?project=default", "?project=agentor&project=agentor", "?command=true"):
+                self.assertGreaterEqual(self.request("POST", f"/v1/host-mounts/{endpoint}{query}",
+                                                    json.dumps({"pathId": self.path_id}))[0], 400)
+        self.assertEqual(self.host_calls, [])
+        self.assertEqual(self.calls, [])
+
+    def test_host_mount_endpoints_retain_exact_mtls_fence(self):
+        for endpoint in ("ensure", "inspect"):
+            self.assertEqual(self.request("POST", f"/v1/host-mounts/{endpoint}",
+                                          json.dumps({"pathId": self.path_id}), identity="other")[0], 409)
+            with self.assertRaises((ssl.SSLError, OSError, http.client.HTTPException)):
+                self.request("POST", f"/v1/host-mounts/{endpoint}",
+                             json.dumps({"pathId": self.path_id}), identity=None)
+        self.assertEqual(self.host_calls, [])
+        self.assertEqual(self.calls, [])
+
+    def test_absent_optional_host_mount_policy_fails_closed_without_network_dispatch(self):
+        self.start_server(None)
+        for endpoint in ("ensure", "inspect"):
+            self.assertEqual(self.request("POST", f"/v1/host-mounts/{endpoint}",
+                                          json.dumps({"pathId": self.path_id}))[0], 503)
+        # Optional compatibility does not affect existing network transport.
+        self.assertEqual(self.request()[0], 200)
+        self.assertEqual(self.host_calls, [])
+        self.assertEqual(self.calls, [])
+
+    def test_account_endpoint_retains_exact_mtls_identity_and_bounded_id_only_body(self):
+        payload = {"userId": "owner", "workerId": self.worker_id}
+        status, result = self.request("POST", "/v1/account-shares/ensure?project=agentor", json.dumps(payload))
+        self.assertEqual(status, 200)
+        self.assertEqual(result["metadata"], {"installation": self.installation, "project": "agentor", **payload,
+                                             "sourcePaths": ["/fixed/credentials", "/fixed/kilo/config", "/fixed/kilo/data"]})
+        for invalid in ({}, [], {**payload, "paths": ["/etc"]}, {**payload, "project": "default"},
+                        {**payload, "command": ["sh"]}, {**payload, "workerId": str(uuid.uuid4())}):
+            self.assertGreaterEqual(self.request("POST", "/v1/account-shares/ensure", json.dumps(invalid))[0], 400)
+        for body in (b"x" * 4097, b"not-json"):
+            self.assertGreaterEqual(self.request("POST", "/v1/account-shares/ensure", body)[0], 400)
+        self.assertEqual(self.request("POST", "/v1/account-shares/ensure?project=default", json.dumps(payload))[0], 409)
+        self.assertEqual(self.request("POST", "/v1/account-shares/ensure", json.dumps(payload), identity="other")[0], 409)
+        with self.assertRaises((ssl.SSLError, OSError, http.client.HTTPException)):
+            self.request("POST", "/v1/account-shares/ensure", json.dumps(payload), identity=None)
+        self.assertEqual(self.account_calls, [payload]); self.assertEqual(self.calls, []); self.assertEqual(self.host_calls, [])
+
+    def test_missing_account_policy_fails_closed_without_dispatch_or_generic_routes(self):
+        self.start_server(None)
+        self.assertEqual(self.request("POST", "/v1/account-shares/ensure", json.dumps({"userId": "owner", "workerId": self.worker_id}))[0], 503)
+        self.assertEqual(self.request("POST", "/v1/account-shares/remove", json.dumps({"userId": "owner", "workerId": self.worker_id}))[0], 404)
+        self.assertEqual(self.account_calls, []); self.assertEqual(self.calls, [])
+
+    def test_unverified_handshake_stall_is_bounded(self):
+        with socket.create_connection(("127.0.0.1", self.port), timeout=2) as stalled:
+            # Trigger no TLS handshake. The next authenticated request still
+            # finishes within its two-second bound on this serialized server.
+            self.assertEqual(self.request()[0], 200)
+            self.assertEqual(stalled.recv(1), b"")
+
+    def test_authenticated_partial_body_stall_and_duplicate_lengths_are_bounded(self):
+        def connect():
+            return self.context().wrap_socket(socket.create_connection(("127.0.0.1", self.port), timeout=2),
+                                              server_hostname="localhost")
+
+        with connect() as stalled:
+            stalled.sendall(b"POST /v1/managed-networks/ensure HTTP/1.1\r\nHost: localhost\r\n"
+                            b"Content-Length: 100\r\n\r\n{")
+            self.assertEqual(self.request()[0], 200)
+        with connect() as duplicate:
+            duplicate.sendall(b"POST /v1/managed-networks/ensure HTTP/1.1\r\nHost: localhost\r\n"
+                              b"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}")
+            self.assertIn(b"400", duplicate.recv(4096).split(b"\r\n", 1)[0])
+        self.assertEqual(self.calls, [])
+
+
+@unittest.skipUnless(os.environ.get("INCUS_NETWORK_HOST_TEST") == "true",
+                     "Explicit root-only disposable Incus host gate")
+class NativePolicyLiveTests(unittest.TestCase):
+    def test_native_lifecycle_allowlist_mtls_and_exact_cleanup(self):
+        # Run serially as root on the disposable host, never against production.
+        self.assertEqual(os.geteuid(), 0)
+        scratch = Path(tempfile.mkdtemp(prefix="agentor-native-network-"))
+        installation, network_id, owner = str(uuid.uuid4()), str(uuid.uuid4()), "network-service-live"
+        (scratch / "backup-installation-id").write_text(installation)
+        (scratch / "users" / owner).mkdir(parents=True)
+        (scratch / "users" / owner / "managed-networks.json").write_text(json.dumps([
+            {"id": network_id, "userId": owner, "dockerName": "agentor-managed-" + network_id}]))
+        request = MODULE.incus_request("/var/lib/incus/unix.socket")
+        policy = MODULE.POLICY.ManagedNetworkPolicy(str(scratch), installation,
+            os.environ["INCUS_HOST_PROJECT"], os.environ["INCUS_HOST_PRIMARY"], request)
+        original, _ = request("GET", "/1.0/projects/" + policy.project)
+        payload = {"userId": owner, "networkId": network_id}
+        _, _, name = policy.identity(payload)
+        server, thread = None, None
+        completed = False
+        print("Exact native service fixture:", scratch, name, installation, network_id, flush=True)
+        try:
+            for identity in ("server", "client"):
+                subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", str(scratch / (identity + ".key")), "-out", str(scratch / (identity + ".crt")),
+                    "-days", "1", "-subj", "/CN=" + ("localhost" if identity == "server" else identity),
+                    "-addext", "subjectAltName=DNS:localhost"], check=True,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                (scratch / (identity + ".key")).chmod(0o600)
+            tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            tls.load_cert_chain(scratch / "server.crt", scratch / "server.key")
+            tls.load_verify_locations(cafile=scratch / "client.crt")
+            tls.verify_mode = ssl.CERT_REQUIRED
+            fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert((scratch / "client.crt").read_text())).hexdigest()
+            server = MODULE.TlsPolicyServer(("127.0.0.1", 0), MODULE.handler(policy, fingerprint), tls)
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            thread.start()
+            client_tls = ssl.create_default_context(cafile=scratch / "server.crt")
+            client_tls.load_cert_chain(scratch / "client.crt", scratch / "client.key")
+
+            def call(method, path, body=None):
+                connection = http.client.HTTPSConnection("localhost", server.server_address[1],
+                                                        timeout=45, context=client_tls)
+                try:
+                    connection.request(method, path, None if body is None else json.dumps(body))
+                    response = connection.getresponse()
+                    result = json.loads(response.read())
+                    self.assertEqual(response.status, 200, result)
+                    return result["metadata"]
+                finally:
+                    connection.close()
+
+            self.assertTrue(call("GET", "/v1/managed-networks/readiness")["ready"])
+            result = call("POST", "/v1/managed-networks/ensure", payload)
+            self.assertEqual(result["name"], name)
+            self.assertEqual(call("POST", "/v1/managed-networks/ensure", payload), result)
+            network, _ = request("GET", "/1.0/networks/" + name)
+            self.assertEqual(network["config"]["user.agentor.installation"], installation)
+            self.assertTrue(network["config"]["ipv4.dhcp.ranges"].endswith(".254"))
+            current, _ = request("GET", "/1.0/projects/" + policy.project)
+            self.assertIn(name, current["config"]["restricted.networks.access"].split(","))
+            for key, value in original["config"].items():
+                if key != "restricted.networks.access":
+                    self.assertEqual(current["config"][key], value)
+            call("POST", "/v1/managed-networks/remove", payload)
+            call("POST", "/v1/managed-networks/remove", payload)
+            with self.assertRaises(MODULE.IncusRejected) as absent:
+                request("GET", "/1.0/networks/" + name)
+            self.assertEqual(absent.exception.status_code, 404)
+            restored, _ = request("GET", "/1.0/projects/" + policy.project)
+            self.assertEqual(restored["config"], original["config"])
+            completed = True
+        finally:
+            if server:
+                server.shutdown()
+                server.server_close()
+            if thread:
+                thread.join(2)
+            if not completed:
+                # Exact-owned cleanup only; a policy mismatch retains all
+                # diagnostic metadata rather than bypassing native fences.
+                policy.remove(payload)
+                print("Failed fixture metadata retained:", scratch, flush=True)
+            else:
+                import shutil
+                shutil.rmtree(scratch)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -4,10 +4,12 @@ import { goToDashboard } from '../helpers/ui-helpers';
 
 async function mock(page: Page) {
   let jobs:any[]=[]; let backups:any[]=[{id:'backup-1',workspaceIds:['worker-1','worker-2'],provider:'fake',createdAt:'2026-01-01T00:00:00Z',sizeBytes:4096,integrityVerified:true,missingSecrets:['API_TOKEN']}];
+  await page.route('**/api/backups/recovery-key', r => r.fulfill({ json: { keys: [] } }));
+  await page.route('**/api/backups/remote', r => r.fulfill({ json: [] }));
   await page.route('**/api/backup-providers',r=>r.fulfill({json:[{id:'fake',type:'fake',connected:true},{id:'google',type:'google-drive',connected:false}]}));
   await page.route('**/api/admin/backup-providers/google-oauth',async r=>r.fulfill({json:r.request().method()==='PUT'?{configured:true,source:'installation',clientId:'dashboard-client',redirectUri:'https://dash.example/api/backup-providers/google/oauth/callback',clientSecretConfigured:true}:{configured:false,source:'none',clientSecretConfigured:false}}));
   await page.route('**/api/backup-settings',async r=>r.fulfill({json:r.request().method()==='PUT'?await r.request().postDataJSON():{providerId:'fake',enabled:false,selection:'all',workspaceIds:[],intervalMinutes:1440,retentionCount:7,nextRunAt:null}}));
-  await page.route('**/api/containers',r=>r.fulfill({json:[
+  await page.route(/\/api\/(?:containers|backups\/workspaces)$/,r=>r.fulfill({json:[
     {id:'worker-1',userId:'test-user',displayName:'Alpha worker',status:'running'},
     {id:'worker-2',userId:'test-user',displayName:'Beta worker',status:'stopped'},
   ]}));
@@ -53,6 +55,42 @@ test('saves draft settings and uses the selected provider when backing up immedi
   await expect.poll(()=>saved?.providerId).toBe('google-drive');
   await expect.poll(()=>started?.providerId).toBe('google-drive');
 });
+test('waits for canonical settings and workspace names before enabling draft edits', async ({ page }) => {
+  let releaseNames!: () => void;
+  const namesReady = new Promise<void>(resolve => { releaseNames = resolve; });
+  await page.route(/\/api\/(?:containers|backups\/workspaces)$/, async route => {
+    await namesReady;
+    await route.fulfill({ json: [{ id: 'worker-1', userId: 'test-user', displayName: 'Alpha', status: 'running' }] });
+  });
+  const m = await open(page);
+  try {
+    await expect(m.getByLabel('Provider')).toBeDisabled();
+    await expect(m.getByRole('button', { name: 'Save schedule' })).toBeDisabled();
+    releaseNames();
+    await expect(m.getByLabel('Provider')).toBeEnabled();
+    await m.getByLabel('Provider').selectOption('google-drive');
+    const saving = page.waitForRequest(request => request.url().endsWith('/api/backup-settings') && request.method() === 'PUT');
+    await m.getByRole('button', { name: 'Save schedule' }).click();
+    expect((await saving).postDataJSON().providerId).toBe('google-drive');
+  } finally { releaseNames(); }
+});
+test('removes an unavailable archived selection while retaining independent path and schedule settings', async ({ page }) => {
+  let stored: any = { providerId: 'fake', enabled: false, selection: 'selected', workspaceIds: ['archived-old', 'worker-1'],
+    selectedPathsByWorkspace: { 'archived-old': ['/opt/retained'], 'worker-1': ['/workspace'] },
+    persistSelectedDirectories: true, intervalMinutes: 53, retentionCount: 9, nextRunAt: null };
+  await page.route('**/api/backup-settings', async route => {
+    if (route.request().method() === 'PUT') stored = await route.request().postDataJSON();
+    await route.fulfill({ json: stored });
+  });
+  const m = await open(page);
+  await expect(m.getByTestId('backup-path-settings')).toContainText('archived-old');
+  await selectWorkspace(page, m, 'archived-old', /archived-old.*unavailable/i);
+  await m.getByRole('button', { name: 'Save schedule' }).click();
+  await expect.poll(() => stored.workspaceIds).toEqual(['worker-1']);
+  expect(stored).toMatchObject({ intervalMinutes: 53, retentionCount: 9, persistSelectedDirectories: true,
+    selectedPathsByWorkspace: { 'archived-old': ['/opt/retained'], 'worker-1': ['/workspace'] } });
+  await expect(m.getByTestId('backup-path-settings')).not.toContainText('archived-old');
+});
 test('selects files and any browsed directory including root from a picker rooted at workspace', async ({ page }) => {
   const m = await open(page);
   await m.getByLabel('Selected workspaces').check();
@@ -71,7 +109,7 @@ test('selects files and any browsed directory including root from a picker roote
   await picker.getByRole('button', { name: 'Done' }).click();
   await expect(m).toContainText('2 additional');
 });
-test('warns precisely which retained and detached data can change when persistence is deselected', async ({ page }) => {
+test('warns that removing backup coverage preserves persistent volumes and attachments', async ({ page }) => {
   const m = await open(page);
   await m.getByLabel('Selected workspaces').check();
   await selectWorkspace(page,m,'worker-1',/Alpha worker.*worker-1/i);
@@ -92,10 +130,8 @@ test('warns precisely which retained and detached data can change when persisten
   let warning = '';
   page.once('dialog', async dialog => { warning = dialog.message(); await dialog.accept(); });
   await saveButton.click();
-  await expect.poll(() => warning).toContain('No persisted data is deleted now');
-  expect(warning).toContain('changes made there are lost by another rebuild');
-  expect(warning).toContain('current same-named files overwrite their older persisted versions');
-  expect(warning).toContain('other old and new files are kept');
+  await expect.poll(() => warning).toContain('Existing local persistent volumes and their attachments are unchanged');
+  expect(warning).toContain('Manage local persistence separately in Worker Settings');
 });
 test('restores safely into a new or lock-protected original worker without retaining its password',async({page})=>{
   const lockPassword='UI_BACKUP_LOCK_DO_NOT_RENDER';let restoreBody:any;
@@ -378,4 +414,29 @@ test('only offers definition recovery for a server-marked recipe and surfaces a 
   await reopened.getByRole('button', { name: 'Restore' }).click();
   await reopened.getByTestId('restore-image-dependencies').getByRole('button', { name: 'Recover definition & build' }).click();
   await expect(reopened).toContainText('The recovered definition cannot be built yet.');
+});
+
+
+test('keeps the configured global admin ID and default canonical selection across its runtime namespace change', async ({ page }) => {
+  const adminId = '8b5c936e-a859-4039-873a-6f7af0960b61';
+  let stored: any = { providerId: 'google-drive', enabled: true, selection: 'selected', workspaceIds: [adminId, 'worker-1'],
+    selectedPathsByWorkspace: { 'worker-1': ['/opt/project'] }, persistSelectedDirectories: true,
+    intervalMinutes: 1440, retentionCount: 7, nextRunAt: null };
+  await page.route('**/api/backup-settings', async route => {
+    if (route.request().method() === 'PUT') stored = await route.request().postDataJSON();
+    await route.fulfill({ json: stored });
+  });
+  await page.route('**/api/backups/workspaces', route => route.fulfill({ json: [
+    { id: adminId, administrativeKind: 'platform', displayName: 'ADMIN / ORCHESTRATOR', status: 'stopped' },
+    { id: 'worker-1', displayName: 'Alpha worker', status: 'running' },
+  ] }));
+  const modal = await open(page);
+  await expect(modal.getByTestId('backup-path-settings')).toContainText('ADMIN / ORCHESTRATOR');
+  await modal.getByTestId('backup-workspace-selector').click();
+  await expect(page.getByRole('option', { name: /ADMIN \/ ORCHESTRATOR.*Global admin.*stopped/ })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await modal.getByRole('button', { name: 'Save schedule' }).click();
+  await expect.poll(() => stored.workspaceIds).toEqual([adminId, 'worker-1']);
+  expect(stored.selectedPathsByWorkspace[adminId]).toBeUndefined();
+  expect(stored.intervalMinutes).toBe(1440);
 });
