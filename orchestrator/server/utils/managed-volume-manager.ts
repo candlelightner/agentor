@@ -627,10 +627,15 @@ export class ManagedVolumeManager {
     for (const v of this.store.list()) workers.set(v.workerId, v.userId);
     for (const journal of this.recreations.list()) workers.set(journal.workerId, journal.userId);
     for (const [workerId, userId] of workers) {
-      try { await withOwnerWorkerLifecycleMutation(userId, workerId, () => this.recoverWorker(userId, workerId)); }
+      let administrative: boolean | undefined;
+      try { await withOwnerWorkerLifecycleMutation(userId, workerId, async () => {
+        administrative = await this.isAdministrativeWorkspace(userId, workerId);
+        await this.recoverWorkerStorage(userId, workerId, administrative);
+      }); }
       catch {
         this.recoveryFailures.add(workerId);
-        for (const v of this.store.forWorker(userId, workerId)) {
+        // Dedicated receipts, and rows with unreadable authority, must survive retry.
+        if (administrative === false) for (const v of this.store.forWorker(userId, workerId)) {
           v.state = "failed";
           v.operation = { id: v.operation?.id ?? randomUUID(), mode: v.operation?.mode ?? "deferred", stage: "failed",
             error: "Storage recovery needs attention. Data and runtime state were retained. Restore missing storage, then retry application or restart." };
@@ -642,16 +647,25 @@ export class ManagedVolumeManager {
     }
   }
 
+  private async isAdministrativeWorkspace(userId: string, workerId: string) {
+    const [{ useAdminWorkspaceStore }, { useWorkerGroupStore }, { isAdministrativeWorkspaceId }] = await Promise.all([
+      import('./admin-workspace-store'), import('./services'), import('./ordinary-worker-identity')]);
+    await Promise.all([useAdminWorkspaceStore().init(), useWorkerGroupStore().init()]);
+    return isAdministrativeWorkspaceId(workerId, userId);
+  }
+
   /** Explicit retries use the same recovery as boot, under the worker fence. */
   async recoverWorker(userId: string, workerId: string) {
     await this.init();
+    return this.recoverWorkerStorage(userId, workerId, await this.isAdministrativeWorkspace(userId, workerId));
+  }
+
+  private async recoverWorkerStorage(userId: string, workerId: string, administrative: boolean) {
     // Administrative storage belongs to its dedicated runtime, even when an
     // archived ordinary WorkerRecord shares the workspace ID.
-    const [{ useAdminWorkspaceStore }, { useWorkerGroupStore, useAdministrativeWorkspaceRuntime },
-      { isAdministrativeWorkspaceId }, { readAdministrativeRuntimeRecord, administrativeRuntimeOwner }] = await Promise.all([
-      import('./admin-workspace-store'), import('./services'), import('./ordinary-worker-identity'), import('./admin-native-authority')]);
-    await Promise.all([useAdminWorkspaceStore().init(), useWorkerGroupStore().init()]);
-    if (isAdministrativeWorkspaceId(workerId, userId)) {
+    if (administrative) {
+      const [{ useAdministrativeWorkspaceRuntime }, { readAdministrativeRuntimeRecord, administrativeRuntimeOwner }] = await Promise.all([
+        import('./services'), import('./admin-native-authority')]);
       const records = this.store.forWorker(userId, workerId);
       if (records.length) {
         const record = await readAdministrativeRuntimeRecord(workerId);

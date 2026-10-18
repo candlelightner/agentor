@@ -634,3 +634,5 @@ Socket-name source checkpoint: 234 affected module cases passed / four existing 
 Default workspace-only native imports without runtime-source metadata use the same short-lived principal/nonce-scoped resolver as custom/native-source imports. `incus-worker-import.spec.ts` adds one configured-seed regression through actual ContainerManager/default image authority, proves the ordinary resolver still denies the incomplete marker, and retains mocked compute/extraction ACKs.
 
 `native-worker-update.spec.ts` adds six native source-retention cases: absent/matching/conflicting tag, lost/failed ACK and unavailable daemon, plus the real Apply mock records exact old-OCI retention before alias/default publication. Product dangling prune remains unchanged; no live prune was run.
+
+`api/admin-native-runtime.spec.ts` covers byte-preserving startup quarantine and fresh retry after transient Incus failure or corrected foreign references, pending lifecycle receipt recovery, unreadable authority without interrupting ordinary durable quarantine, and preservation of originally failed selections. Source validation pending; these additions have not been executed.

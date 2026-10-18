@@ -1498,3 +1498,5 @@ Startup managed-storage recovery resolves administrative workspace IDs through d
 Default workspace-only native imports without runtime-source metadata use the same short-lived principal/nonce-scoped resolver as custom/native-source imports. `incus-worker-import.spec.ts` adds one configured-seed regression through actual ContainerManager/default image authority, proves the ordinary resolver still denies the incomplete marker, and retains mocked compute/extraction ACKs.
 
 Native default promotion preserves the verified previous OCI with an immutable source tag before changing the default, so ordinary dangling-image pruning retains original rebuild bytes. Conflicting/unknown retention targets fail closed, and lost ACKs use readback only.
+
+Dedicated administrative startup validation failures retain managed rows and native receipts unchanged, including when authority cannot be read. Recovery stays blocked until fresh dedicated validation succeeds; ordinary worker failures retain their existing durable quarantine.

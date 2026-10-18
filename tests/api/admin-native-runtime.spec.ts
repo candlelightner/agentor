@@ -922,11 +922,17 @@ for (const kind of ['platform', 'group'] as const) {
             attached.config['user.agentor.owner'] = f.owner.userId;
             detached.used_by = ['/1.0/instances/foreign?project=' + f.config.incusProject];
             const physical = structuredClone([...f.volumes]);
+            const path = join(f.config.dataDir, 'users', f.owner.userId, 'managed-volumes.v1.json'), bytes = await readFile(path);
             await f.manager.recoverStartup();
             expect(f.manager.isRecoveryBlocked(f.owner.id)).toBe(true);
-            expect(f.manager.store.forWorker(f.owner.userId, f.owner.id).every(v => v.state === 'failed')).toBe(true);
+            expect(await readFile(path)).toEqual(bytes);
             expect([...f.volumes]).toEqual(physical);
-            await expect(f.runtime.inspectManagedStorage(f.record)).rejects.toThrow('explicit recovery');
+            await expect(f.manager.recoverWorker(f.owner.userId, f.owner.id)).rejects.toThrow('ownership');
+            expect(f.manager.isRecoveryBlocked(f.owner.id)).toBe(true);
+            detached.used_by = [];
+            await f.manager.recoverWorker(f.owner.userId, f.owner.id);
+            expect(f.manager.isRecoveryBlocked(f.owner.id)).toBe(false);
+            expect(await readFile(path)).toEqual(bytes);
         } finally { await f.cleanup(); }
     });
 }
@@ -943,5 +949,82 @@ test('startup accepts only stopped owned restored admin storage before fresh com
         expect(f.manager.isRecoveryBlocked(f.owner.id)).toBe(false);
         f.client.getInstance = async () => structuredClone(f.instance);
         await expect(f.runtime.inspectManagedStorage(f.record)).rejects.toThrow('uncaptured');
+    } finally { await f.cleanup(); }
+});
+
+for (const kind of ['platform', 'group'] as const) test(`${kind} startup retains settled selections through a transient Incus failure and fresh retry`, async () => {
+    const f = await startupStorageFixture(kind);
+    try {
+        const path = join(f.config.dataDir, 'users', f.owner.userId, 'managed-volumes.v1.json'), bytes = await readFile(path);
+        const record = structuredClone(f.record), physical = structuredClone([...f.volumes]), events = [...f.events];
+        const getInstance = f.client.getInstance;
+        f.client.getInstance = async () => { throw Object.assign(Error('Incus listener unavailable'), { code: 'ECONNREFUSED' }); };
+        await f.manager.recoverStartup();
+        expect(f.manager.isRecoveryBlocked(f.owner.id)).toBe(true);
+        expect(await readFile(path)).toEqual(bytes);
+        expect(f.record).toEqual(record); expect([...f.volumes]).toEqual(physical);
+        f.client.getInstance = getInstance;
+        await f.manager.recoverWorker(f.owner.userId, f.owner.id);
+        expect(f.manager.isRecoveryBlocked(f.owner.id)).toBe(false);
+        expect(await readFile(path)).toEqual(bytes);
+        expect(f.record).toEqual(record); expect([...f.volumes]).toEqual(physical);
+        expect(f.events.slice(events.length).every(event => event === 'network')).toBe(true);
+    } finally { await f.cleanup(); }
+});
+
+test('startup preserves native lifecycle receipts and selected rows for acknowledged recovery', async () => {
+    const f = await startupStorageFixture('platform');
+    try {
+        f.record.nativeRuntime!.pending = { kind: 'stop', operation: '/1.0/operations/' + randomUUID() };
+        const record = structuredClone(f.record);
+        const path = join(f.config.dataDir, 'users', f.owner.userId, 'managed-volumes.v1.json'), bytes = await readFile(path);
+        await f.manager.recoverStartup();
+        expect(f.manager.isRecoveryBlocked(f.owner.id)).toBe(true);
+        expect(f.record).toEqual(record); expect(await readFile(path)).toEqual(bytes);
+        f.client.request = async () => ({ status: 'Success', status_code: 200 });
+        await f.runtime.settlePending(f.record, f.ack);
+        expect(f.record.nativeRuntime!.pending).toBeUndefined();
+        await f.manager.recoverWorker(f.owner.userId, f.owner.id);
+        expect(f.manager.isRecoveryBlocked(f.owner.id)).toBe(false);
+        expect(await readFile(path)).toEqual(bytes);
+    } finally { await f.cleanup(); }
+});
+
+test('unreadable administrative authority preserves rows while ordinary startup failures retain durable quarantine', async () => {
+    const f = await startupStorageFixture('platform');
+    const { useWorkerGroupStore } = await import('../../orchestrator/server/utils/services');
+    const groups = useWorkerGroupStore(), listForUser = groups.listForUser;
+    try {
+        const unrelatedOwner = randomUUID(), unrelatedWorker = randomUUID();
+        const unrelated = await f.manager.store.create(unrelatedOwner, unrelatedWorker, '/opt/unrelated', undefined, 'incus-vm');
+        await f.manager.store.save({ ...unrelated, seeded: true, state: 'ready' });
+        f.manager.incusRuntime.ensureVolume = async () => { throw Error('Ordinary volume unavailable'); };
+        const path = join(f.config.dataDir, 'users', f.owner.userId, 'managed-volumes.v1.json'), bytes = await readFile(path);
+        groups.listForUser = userId => {
+            if (userId === f.owner.userId) throw Error('Administrative owner partition unreadable');
+            return [];
+        };
+        await f.manager.recoverStartup();
+        expect(f.manager.isRecoveryBlocked(f.owner.id)).toBe(true);
+        expect(await readFile(path)).toEqual(bytes);
+        expect(f.manager.isRecoveryBlocked(unrelatedWorker)).toBe(true);
+        expect(f.manager.store.get(unrelatedOwner, unrelated.id)).toMatchObject({ state: 'failed', operation: { stage: 'failed' } });
+        groups.listForUser = listForUser;
+        await f.manager.recoverWorker(f.owner.userId, f.owner.id);
+        expect(f.manager.isRecoveryBlocked(f.owner.id)).toBe(false);
+        expect(await readFile(path)).toEqual(bytes);
+    } finally { groups.listForUser = listForUser; await f.cleanup(); }
+});
+
+test('startup and retry never reset an originally failed administrative selection', async () => {
+    const f = await startupStorageFixture('platform');
+    try {
+        await f.manager.store.save({ ...f.rows[0]!, state: 'failed', operation: { id: randomUUID(), mode: 'recreate', stage: 'failed', error: 'Original failure' } });
+        const path = join(f.config.dataDir, 'users', f.owner.userId, 'managed-volumes.v1.json'), bytes = await readFile(path);
+        await f.manager.recoverStartup();
+        expect(f.manager.isRecoveryBlocked(f.owner.id)).toBe(true);
+        await expect(f.manager.recoverWorker(f.owner.userId, f.owner.id)).rejects.toThrow('explicit recovery');
+        expect(f.manager.isRecoveryBlocked(f.owner.id)).toBe(true);
+        expect(await readFile(path)).toEqual(bytes);
     } finally { await f.cleanup(); }
 });
