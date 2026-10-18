@@ -1077,3 +1077,43 @@ test('existing admin policy rejection never starts compute or issues a credentia
         expect(f.events.slice(events.length)).not.toContain('credential-write');
     } finally { await f.cleanup(); }
 });
+
+for (const kind of ['administrative', 'group-administrative'] as const) test(`${kind} memory changes stay pending until explicit rebuild and survive stop/start`, async () => {
+    const f = await fixture();
+    try {
+        if (kind === 'group-administrative') Object.assign(f.record, { kind, groupId: 'memory-group', ownerId: 'memory-owner', services: ['terminal'] });
+        await f.prepare();
+        await f.runtime.ensure(f.record, f.ack);
+        expect(f.instance.config['limits.memory']).toBe('4GiB');
+        const volumes = [...f.volumes.keys()].sort(), original = f.instance.config['volatile.uuid'];
+        f.record.memoryLimit = '8GiB';
+        f.events.length = 0;
+        await f.runtime.ensure(f.record, f.ack);
+        expect(f.instance.config['limits.memory']).toBe('4GiB');
+        expect(f.events).not.toContain('vm-stop');
+        expect(f.events).not.toContain('vm-create');
+        await f.prepare();
+        await f.runtime.rebuild(f.record, f.ack);
+        expect(f.instance.config['limits.memory']).toBe('8GiB');
+        expect(f.instance.config['volatile.uuid']).not.toBe(original);
+        expect([...f.volumes.keys()].sort()).toEqual(volumes);
+        expect(f.record.nativeRuntime!.memoryLimit).toBe('8GiB');
+        await f.runtime.stop(f.record, f.ack);
+        f.record.status = 'stopped';
+        await f.prepare();
+        await f.runtime.start(f.record, f.ack);
+        expect(f.instance.config['limits.memory']).toBe('8GiB');
+    } finally { await f.cleanup(); }
+});
+
+test('a configured memory limit applies on first creation and does not relax runtime ownership checks', async () => {
+    const f = await fixture();
+    try {
+        f.record.memoryLimit = '6GiB';
+        f.record.status = 'stopped';
+        await f.runtime.ensure(f.record, f.ack);
+        expect(f.instance.config['limits.memory']).toBe('6GiB');
+        f.instance.config['limits.memory'] = '12GiB';
+        await expect(f.runtime.assertOwned(f.record)).rejects.toThrow('ownership or incarnation');
+    } finally { await f.cleanup(); }
+});

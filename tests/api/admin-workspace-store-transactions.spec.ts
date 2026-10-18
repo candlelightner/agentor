@@ -310,12 +310,13 @@ test("global admin retries stay fenced until an aborted Docker mutation settles"
   await expect(store.setStatus("running")).rejects.toMatchObject({
     code: "DOCKER_OPERATION_TIMEOUT",
   });
-  const retry = store.setStatus("running");
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  await expect(store.setStatus("running")).rejects.toMatchObject({ statusCode: 409 });
+  await expect(store.getStatus()).rejects.toMatchObject({ statusCode: 503 });
   expect(startCalls).toBe(1);
 
   releaseDocker();
-  await expect(retry).resolves.toMatchObject({ status: "running" });
+  await expect.poll(async () => (await store.getStatus().catch(() => null))?.status).toBe('stopped');
+  await expect(store.setStatus("running")).resolves.toMatchObject({ status: "running" });
   expect(startCalls).toBe(2);
 });
 
@@ -494,4 +495,37 @@ test("read-only admin status distinguishes absence without provisioning", async 
   fake.records.set(group.id, group);
   const scoped = new GroupAdminWorkspaceStore(fake as any);
   await expect(scoped.getStatus(group.id)).rejects.toMatchObject({ statusCode: 404 });
+});
+
+
+test("global admin status and duplicate actions return promptly while a lifecycle action is delayed", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const store = new AdminWorkspaceStore("/unused", async () => {});
+  store.setRuntimeAdapter(runtime({ stop: () => gate }));
+  await store.ensure();
+  const stopping = store.setStatus("stopped");
+  try {
+    await expect(store.getStatus()).rejects.toMatchObject({ statusCode: 503 });
+    await expect(store.setStatus("running")).rejects.toMatchObject({ statusCode: 409 });
+  } finally { release(); await stopping; }
+  await expect(store.getStatus()).resolves.toMatchObject({ status: "stopped" });
+});
+
+for (const scoped of [false, true]) test(`${scoped ? 'group' : 'platform'} admin memory settings reject unbounded values, persist desired limits and do not mutate runtime`, async () => {
+  const global = new AdminWorkspaceStore('/unused', async () => {});
+  global.setRuntimeAdapter(runtime());
+  await global.ensure();
+  const fake = new FakeGroups(), { group } = groupRecord('memory-owner', 'memory-group');
+  group.adminWorkspace!.runtimeKind = 'incus-vm';
+  fake.records.set(group.id, group);
+  const groups = new GroupAdminWorkspaceStore(fake as any);
+  const get = () => scoped ? groups.getResources(group.id) : global.getResources();
+  const set = (value: unknown) => scoped ? groups.setResources(group.id, value) : global.setResources(value);
+  expect(await get()).toEqual({ memoryLimit: '4GiB', appliedMemoryLimit: '4GiB', pendingRebuild: false });
+  for (const invalid of ['', '0', '0GiB', '-1GiB', '50%', 'unlimited', 'InfinityGiB', '9007199254740992GiB', 8, null])
+    await expect(set(invalid)).rejects.toMatchObject({ statusCode: 400 });
+  expect(await set('8GiB')).toEqual({ memoryLimit: '8GiB', appliedMemoryLimit: '4GiB', pendingRebuild: true });
+  expect(await get()).toEqual({ memoryLimit: '8GiB', appliedMemoryLimit: '4GiB', pendingRebuild: true });
+  expect(scoped ? fake.findById(group.id)?.adminWorkspace?.memoryLimit : global.getRecord()?.memoryLimit).toBe('8GiB');
 });

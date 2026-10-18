@@ -1,3 +1,4 @@
+import { adminMemorySettings, validateAdminMemoryLimit } from '../../shared/admin-workspace-memory';
 import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from "node:crypto";
 import { withWorkerRuntimeSetup, withWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
@@ -385,6 +386,34 @@ export class GroupAdminWorkspaceStore {
         | undefined;
       if (record?.id === workspaceId) return structuredClone(record);
     }
+  }
+  async getResources(groupId: string, authorize?: () => void) {
+    return this.withGroup(groupId, false, async () => {
+      authorize?.();
+      const record = this.record(groupId);
+      if (this.running.has(groupId) || this.pendingCommits.has(groupId) || record?.nativeRuntime?.pending ||
+          record?.nativeRuntime?.deleting || record?.nativeRuntime?.selectedOperation ||
+          record?.nativeMigration && record.nativeMigration.phase !== 'retained')
+        throw Object.assign(new Error('Administrative workspace operation is in progress'), { statusCode: 503 });
+      if (!record) throw Object.assign(new Error('Group administrative workspace not provisioned'), { statusCode: 404 });
+      return adminMemorySettings(record);
+    });
+  }
+  async setResources(groupId: string, value: unknown, authorize?: () => void) {
+    const memoryLimit = validateAdminMemoryLimit(value);
+    return this.run(groupId, () => this.withGroup(groupId, true, async () => {
+      authorize?.();
+      const record = this.record(groupId);
+      if (this.pendingCommits.has(groupId) || record?.nativeRuntime?.pending || record?.nativeRuntime?.deleting || record?.nativeRuntime?.selectedOperation ||
+          record?.nativeMigration && record.nativeMigration.phase !== 'retained')
+        throw Object.assign(new Error('Administrative workspace operation is not settled'), { statusCode: 503 });
+      if (!record) throw Object.assign(new Error('Group administrative workspace not provisioned'), { statusCode: 404 });
+      if (record.runtimeKind !== 'incus-vm') throw Object.assign(new Error('Migrate the administrative workspace to a native VM before changing memory'), { statusCode: 409 });
+      record.memoryLimit = memoryLimit;
+      record.updatedAt = new Date().toISOString();
+      await this.save(record);
+      return adminMemorySettings(record);
+    }));
   }
   async getStartupScript(groupId: string, authorize?: () => void) {
     return this.withGroup(groupId, false, async () => {

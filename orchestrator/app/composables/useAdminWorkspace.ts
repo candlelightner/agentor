@@ -44,22 +44,23 @@ export function useAdminWorkspace() {
   const loading = ref(false);
   const action = ref<"ensure" | "start" | "stop" | "rebuild" | "">("");
   const error = ref("");
+  let refreshSequence = 0;
 
   async function request(
     operation: Exclude<typeof action.value, "">,
     path: string,
     method: "GET" | "POST",
   ) {
+    refreshSequence++;
+    loading.value = false;
     action.value = operation;
     error.value = "";
     try {
-      workspace.value = await $fetch<AdminWorkspace>(path, { method });
+      workspace.value = await $fetch<AdminWorkspace>(path, { method, timeout: 120_000, retry: 0 });
       return workspace.value;
     } catch (cause) {
-      error.value = adminError(
-        cause,
-        "Administrative workspace operation failed.",
-      );
+      error.value = 'The operation has no confirmed outcome and may still complete. Refresh status before retrying. ' +
+        adminError(cause, "Administrative workspace operation failed.");
       throw cause;
     } finally {
       action.value = "";
@@ -67,19 +68,22 @@ export function useAdminWorkspace() {
   }
 
   async function refresh() {
+    if (action.value) return workspace.value;
+    const sequence = ++refreshSequence;
     loading.value = true;
     error.value = "";
     try {
-      workspace.value = await $fetch<AdminWorkspace | null>("/api/admin/workspace");
-      return workspace.value;
+      const result = await $fetch<AdminWorkspace | null>("/api/admin/workspace", { timeout: 15_000, retry: 0 });
+      if (sequence === refreshSequence) workspace.value = result;
+      return result;
     } catch (cause) {
-      error.value = adminError(
+      if (sequence === refreshSequence) error.value = adminError(
         cause,
         "Could not load the administrative workspace.",
       );
       throw cause;
     } finally {
-      loading.value = false;
+      if (sequence === refreshSequence) loading.value = false;
     }
   }
 

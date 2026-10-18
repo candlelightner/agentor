@@ -244,6 +244,11 @@ function serviceIcon(service: string) {
               ></template
             >
           </div>
+          <AdminMemoryEditor
+            v-if="entry.group.adminWorkspace"
+            class="mt-3"
+            :endpoint="`/api/worker-groups/${entry.group.id}/admin-workspace/resources`"
+          />
           <AdminStartupScriptEditor
             v-if="entry.group.adminWorkspace"
             class="mt-3"

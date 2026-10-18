@@ -1,3 +1,4 @@
+import { adminMemorySettings } from '../../shared/admin-workspace-memory';
 import { sameIncusDevices } from './incus-device-layout';
 import { administrativeNativeOverlay, administrativeNativeOverlaySha256 } from './incus-admin-overlay';
 export { administrativeNativeOverlay, administrativeNativeOverlaySha256 } from './incus-admin-overlay';
@@ -139,7 +140,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         validateAdminNativeState(record);
         const current = await (this.dependencies.readRecord ?? readAdministrativeRuntimeRecord)(record.id);
         const fields = (r: Readonly<AdministrativeWorkspaceRecord>) => ({ id: r.id, kind: r.kind, trusted: r.trusted, ownerId: r.ownerId,
-            groupId: (r as any).groupId, status: r.status, startupScript: r.startupScript, startupScriptRevision: r.startupScriptRevision,
+            groupId: (r as any).groupId, status: r.status, memoryLimit: r.memoryLimit, startupScript: r.startupScript, startupScriptRevision: r.startupScriptRevision,
             runtimeKind: r.runtimeKind, nativeRuntime: r.nativeRuntime, nativeMigration: r.nativeMigration });
         if (record.runtimeKind !== 'incus-vm' || !isDeepStrictEqual(fields(current), fields(record)) ||
             current.nativeMigration && current.nativeMigration.phase !== 'retained')
@@ -278,7 +279,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
             c['user.agentor.owner'] !== owner.userId || c['user.agentor.administrative'] !== owner.kind ||
             !matchesIncusAdminConfig(c, { 'user.agentor.admin-group': owner.groupId ?? '' }) || c['user.agentor.admin-nonce'] !== native.nonce ||
             c['volatile.base_image'] !== native.image.fingerprint || c['boot.autostart'] !== 'false' ||
-            c['user.agentor.admin-overlay-sha256'] !== native.overlaySha256 || c['limits.memory'] !== '4GiB' || c['limits.cpu'] !== '2' ||
+            c['user.agentor.admin-overlay-sha256'] !== native.overlaySha256 || c['limits.memory'] !== adminMemorySettings(record).appliedMemoryLimit || c['limits.cpu'] !== '2' ||
             incarnation && c['volatile.uuid'] !== incarnation || Object.keys(c).some(k => k.startsWith('raw.')) ||
             Object.keys(instance.expanded_config ?? {}).some(k => k.startsWith('raw.')))
             throw failure('Administrative VM ownership or incarnation is ambiguous');
@@ -317,7 +318,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         if (!record.nativeRuntime) {
             const image = await this.image(record);
             await ack({ version: 1, name: adminNativeInstanceName(record), installationId: await this.installation(), nonce: randomUUID(), image,
-                overlayVersion: '6', overlaySha256: administrativeNativeOverlaySha256(record) });
+                overlayVersion: '6', overlaySha256: administrativeNativeOverlaySha256(record), memoryLimit: adminMemorySettings(record).memoryLimit });
         }
         await this.image(record);
         const native = record.nativeRuntime!, owner = administrativeRuntimeOwner(record);
@@ -332,6 +333,8 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         if (!instance) {
             if (native.incarnation)
                 throw failure('Administrative compute is missing; explicit recovery is required');
+            if (native.memoryLimit !== adminMemorySettings(record).memoryLimit)
+                await ack({ ...record.nativeRuntime!, memoryLimit: adminMemorySettings(record).memoryLimit });
             await this.storage.verifySelectedBeforeMount(record, () => this.validateAuthority(record));
             await this.storage.selectedDevices(record);
             const network = await this.network.boundary(record, 'ensure');
@@ -342,7 +345,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
                 source: { type: 'image', fingerprint: native.image.fingerprint }, config: { 'user.agentor.installation': native.installationId,
                     'user.agentor.id': owner.id, 'user.agentor.owner': owner.userId, 'user.agentor.administrative': owner.kind,
                     'user.agentor.admin-group': owner.groupId ?? '', 'user.agentor.admin-nonce': native.nonce,
-                    'user.agentor.admin-overlay-sha256': native.overlaySha256, 'security.secureboot': 'false', 'boot.autostart': 'false', 'limits.memory': '4GiB', 'limits.cpu': '2' },
+                    'user.agentor.admin-overlay-sha256': native.overlaySha256, 'security.secureboot': 'false', 'boot.autostart': 'false', 'limits.memory': adminMemorySettings(record).appliedMemoryLimit, 'limits.cpu': '2' },
                 devices: { ...devices, root: { type: 'disk', path: '/', pool: this.config.incusStoragePool }, eth0: this.network.device(network) } }, onAccepted).then(async (created) => {
                 if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(created.config['volatile.uuid'] ?? ''))
                     throw failure('Administrative VM incarnation is unavailable');
@@ -503,7 +506,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         const selected = await this.image(record, true);
         if (present)
             await this.mutation(record, 'delete', ack, accepted => this.client.deleteInstance(record.nativeRuntime!.name, accepted));
-        await ack({ ...record.nativeRuntime!, incarnation: undefined, image: selected });
+        await ack({ ...record.nativeRuntime!, incarnation: undefined, image: selected, memoryLimit: adminMemorySettings(record).memoryLimit });
         return this.ensureRecord(record, acknowledge, true, true);
     }
     private async register(record: Readonly<AdministrativeWorkspaceRecord>): Promise<AdminWorkspaceRuntimeImage> {

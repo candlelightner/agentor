@@ -32,7 +32,7 @@ test('OSC 52 ignores clipboard queries and unsupported selections and rejects ma
   expect(fixture.errors.join(' ')).not.toContain('not base64');
 });
 
-test('real isolated tmux forwards application clipboard requests and attachment setup stays idempotent', async () => {
+test('real linked tmux forwards wrapped clipboard requests and attachment setup stays idempotent', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'agentor-copy-tmux-'));
   try {
     const script = String.raw`
@@ -43,16 +43,17 @@ env.pop('TMUX',None)
 def tmux(*args): return subprocess.run(['tmux',*args],env=env,check=True,stdout=subprocess.PIPE).stdout
 pid=None
 try:
- tmux('new-session','-d','-s','main','bash --noprofile --norc')
+ tmux('-f','/dev/null','new-session','-d','-s','main','bash --noprofile --norc')
  subprocess.run(['sh','-ec',setup+'true'],env=env,check=True)
  before=tmux('show-option','-sv','terminal-features')
  subprocess.run(['sh','-ec',setup+'true'],env=env,check=True)
  assert before==tmux('show-option','-sv','terminal-features')
+ tmux('new-session','-d','-t','=main','-s','web')
  pid,fd=pty.fork()
- if pid==0: os.execvpe('tmux',['tmux','attach-session','-t','main'],env)
+ if pid==0: os.execvpe('tmux',['tmux','attach-session','-t','web'],env)
  time.sleep(.2)
  text='known tmux response\nmultiline é'
- command=r"printf '\033]52;c;%s\007' '"+base64.b64encode(text.encode()).decode()+"'"
+ command=r"printf '\033Ptmux;\033\033]52;c;%s\007\033\\' '"+base64.b64encode(text.encode()).decode()+"'"
  tmux('send-keys','-t','main','-l',command)
  tmux('send-keys','-t','main','Enter')
  output=b'';deadline=time.monotonic()+3

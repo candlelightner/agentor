@@ -1,3 +1,7 @@
+Administrative workspace status reads return a prompt busy response while lifecycle work or an unresolved operation is active. Duplicate platform-admin mutations fail with 409, and status/lifecycle UI requests use explicit timeouts without automatic retries. A failed or lost mutation response is treated as an unknown outcome: lifecycle controls stay blocked until an explicit status refresh succeeds. Reopening reconciles status before enabling actions; older status responses cannot overwrite a newer refresh.
+
+Platform and group administrative VMs expose persistent finite positive memory limits through their existing privileged panels and `GET`/`PUT .../admin-workspace/resources` (platform: `/api/admin/workspace/resources`). The default remains 4GiB; configured and applied limits are shown separately. Saving never restarts a VM. An explicit **Rebuild** applies a pending limit to new disposable compute while retaining canonical data, ownership, private networking and exact runtime-identity checks. Start/Stop retain the applied limit until Rebuild.
+
 # Agentor — Comprehensive Feature List
 
 Native administrative terminal, files, editor/desktop proxy, plugin transport, journal and resource calls use fresh dedicated global/group records plus the current VM UUID, trusted role and lifecycle generation. Private plugin-self identity requires the fixed host-controlled administrative NIC and a running service; ordinary worker-self cannot grant an administrative role. Administrative streams and WebSocket proxies recheck authority while open. Selecting a VM or beginning migration withdraws a retained Docker projection and revokes captured command/proxy handles; it cannot become a fallback for a new administrative VM.
@@ -830,7 +834,7 @@ An optional, additive **Workspace Files** popup (`WorkspaceFilesModal.vue`) open
 
 ## 20a. Terminal response copy
 
-- Agent CLI clipboard-output requests prompt an explicit **Copy response** action; long/multiline UTF-8 text is preserved up to 1 MiB, with selectable-text fallback for blocked/unavailable clipboard APIs.
+- Linked terminal sessions forward DCS-wrapped OSC 52 clipboard requests, including Codex fallback when no client is attached to its original tmux session. Agent CLI clipboard-output requests prompt an explicit **Copy response** action; long/multiline UTF-8 text is preserved up to 1 MiB, with selectable-text fallback for blocked/unavailable clipboard APIs.
 - Typed slash commands remain transparent to the CLI. Pending text clears on dismissal, disconnect, and disposal; clipboard queries are ignored and no host clipboard read is sent to a worker.
 - Legacy Docker and Incus tmux attachments enable application clipboard forwarding idempotently. Installed Codex 0.163.0 `/copy` is verified through its own Whole response picker, real isolated tmux/WebSocket, actual TerminalPane/xterm, and browser clipboard, with a synthetic local provider and private home. A temporary Xvfb run proves successful native copying also forwards to the browser; other CLI versions remain unverified.
 
