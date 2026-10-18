@@ -174,3 +174,20 @@ test("edits the platform-admin startup script without interrupting the workspace
   await expect(editor).toContainText("desired revision 1");
   await expect(modal).toContainText("running");
 });
+
+test('failed status offers retry without claiming the admin workspace is unprovisioned', async ({ page }) => {
+  let failed = true, provisions = 0;
+  await page.route('**/api/admin/workspace', async route => {
+    if (route.request().method() === 'POST') provisions++;
+    if (failed) await route.fulfill({ status: 409, json: { message: 'Administrative network policy unavailable' } });
+    else await route.fulfill({ json: workspace });
+  });
+  const modal = await openAdminWorkspace(page);
+  await expect(modal.getByText('Administrative workspace status could not be loaded.')).toBeVisible();
+  await expect(modal.getByText('The administrative workspace has not been provisioned.')).toBeHidden();
+  await expect(modal.getByRole('button', { name: 'Provision trusted workspace' })).toBeHidden();
+  failed = false;
+  await modal.getByRole('button', { name: 'Retry status' }).click();
+  await expect(modal.getByText(workspace.id, { exact: true })).toBeVisible();
+  expect(provisions).toBe(0);
+});

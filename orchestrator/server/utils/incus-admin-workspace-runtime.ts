@@ -174,6 +174,8 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         if (record.nativeRuntime?.pending || record.nativeRuntime?.selectedOperation || record.nativeRuntime?.deleting)
             return;
         if (record.nativeRuntime?.incarnation) {
+            // Re-admit the exact dedicated identity after host firewall state is lost.
+            await this.network.boundary(record, 'ensure');
             let instance: IncusInstance;
             try {
                 instance = await this.assertOwned(record);
@@ -349,6 +351,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
             instance = await this.client.getInstance(native.name);
             await ack({ ...record.nativeRuntime!, incarnation: instance.config['volatile.uuid'] });
         }
+        else await this.network.boundary(record, 'ensure');
         await this.assertOwned(record);
         if (!record.nativeRuntime!.incarnation)
             await ack({ ...record.nativeRuntime!, incarnation: instance.config['volatile.uuid'] });

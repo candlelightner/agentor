@@ -1028,3 +1028,52 @@ test('startup and retry never reset an originally failed administrative selectio
         expect(await readFile(path)).toEqual(bytes);
     } finally { await f.cleanup(); }
 });
+
+for (const kind of ['platform', 'group'] as const) test(`${kind} existing admin re-admits missing host policy before status and start validation`, async () => {
+    const f = await fixture();
+    try {
+        f.record.status = 'stopped';
+        if (kind === 'group') Object.assign(f.record, { kind: 'group-administrative', ownerId: 'fixture-owner', groupId: 'fixture-group' });
+        await f.runtime.ensure(f.record, f.ack);
+        const record = structuredClone(f.record), volumes = structuredClone([...f.volumes]), incarnation = f.record.nativeRuntime!.incarnation;
+        const boundary = f.boundary.boundary, actions: string[] = [];
+        let admitted = false;
+        f.boundary.boundary = async (captured: AdministrativeWorkspaceRecord, action: 'ensure' | 'inspect') => {
+            actions.push(action);
+            if (action === 'ensure') admitted = true;
+            if (!admitted) throw Error('Private firewall is missing');
+            return boundary(captured, action);
+        };
+        await f.runtime.ensure(f.record, f.ack);
+        expect(actions[0]).toBe('ensure');
+        expect(f.record).toEqual(record); expect([...f.volumes]).toEqual(volumes);
+        expect(f.instance.status).toBe('Stopped');
+        admitted = false; actions.length = 0;
+        await f.prepare();
+        expect(actions[0]).toBe('ensure');
+        expect(f.record).toEqual(record); expect([...f.volumes]).toEqual(volumes);
+        await f.runtime.start(f.record, f.ack);
+        expect(f.instance.status).toBe('Running');
+        expect(f.record.nativeRuntime!.incarnation).toBe(incarnation);
+        expect([...f.volumes]).toEqual(volumes);
+        expect(f.events.filter(event => event === 'vm-create')).toHaveLength(1);
+        expect(f.events).not.toContain('vm-delete');
+    } finally { await f.cleanup(); }
+});
+
+test('existing admin policy rejection never starts compute or issues a credential', async () => {
+    const f = await fixture();
+    try {
+        f.record.status = 'stopped';
+        await f.runtime.ensure(f.record, f.ack);
+        const record = structuredClone(f.record), volumes = structuredClone([...f.volumes]), events = [...f.events];
+        f.boundary.boundary = async () => { throw Error('Private firewall differs; retain existing policy'); };
+        await expect(f.runtime.ensure(f.record, f.ack)).rejects.toThrow('Private firewall differs');
+        await expect(f.prepare()).rejects.toThrow('Private firewall differs');
+        expect(f.record).toEqual(record); expect([...f.volumes]).toEqual(volumes);
+        expect(f.instance.status).toBe('Stopped');
+        expect(f.events.slice(events.length)).not.toContain('vm-start');
+        expect(f.events.slice(events.length)).not.toContain('credential-issue');
+        expect(f.events.slice(events.length)).not.toContain('credential-write');
+    } finally { await f.cleanup(); }
+});

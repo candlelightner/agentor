@@ -1500,3 +1500,5 @@ Default workspace-only native imports without runtime-source metadata use the sa
 Native default promotion preserves the verified previous OCI with an immutable source tag before changing the default, so ordinary dangling-image pruning retains original rebuild bytes. Conflicting/unknown retention targets fail closed, and lost ACKs use readback only.
 
 Dedicated administrative startup validation failures retain managed rows and native receipts unchanged, including when authority cannot be read. Recovery stays blocked until fresh dedicated validation succeeds; ordinary worker failures retain their existing durable quarantine.
+
+Existing native administrative status/start preparation re-admits exact host policy before inspection after reboot, retaining compute incarnation and storage; policy rejection still blocks credential issuance and start. A failed admin status request offers Retry without claiming an absent workspace or offering Provision.
