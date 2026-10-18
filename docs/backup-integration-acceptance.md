@@ -213,9 +213,14 @@ the pure hook tests. Default runs still build both images.
 
 For the reviewed historical Docker baseline, application source `497d7e0c`
 differs from `a7f180fe` only in the two settled legacy reader stop grace periods;
-worker source and backup/restore routes are unchanged. Use config ID `e7ed…`
-after `docker load`, not the export host's manifest/list ID `390b…`. This remains
-the historical Docker gate, not acceptance of native-default admins.
+worker source and backup/restore routes are unchanged. These pins are the image
+**config IDs**, identified by each saved archive's `manifest.json` `Config`
+member, then verified by the classic fixture daemon after `docker load`.
+The approved worker archive loads as config ID `e64f…`; its source-system OCI
+identity and native-VM provenance remain `58fd…`. The orchestrator similarly
+loads as config ID `e7ed…`, rather than source manifest/list ID `390b…`.
+Do not change native OCI provenance to match this test-only daemon representation.
+This remains the historical Docker gate, not acceptance of native-default admins.
 
 After the operator has copied the committed test source to
 `/opt/agentor-backup-source` and these two 0600 root-owned export files into the
@@ -249,7 +254,7 @@ def fresh_prebuilt(suite, guest_nonce):
         volume['labels'] = {'agentor.backup-vm.nonce': guest_nonce}
     service['environment'].update({
         'AGENTOR_TEST_PREBUILT_IMAGES': 'true',
-        'AGENTOR_TEST_PREBUILT_WORKER_ID': 'sha256:58fd7a3811dca2ee58fd066024df0857c541ac14fa0b1f9dccab665153ba7b3c',
+        'AGENTOR_TEST_PREBUILT_WORKER_ID': 'sha256:e64f61be2cb41717941977f9a91bd7244e17556bc392140c7476773262a991f3',
         'AGENTOR_TEST_PREBUILT_WORKER_SHA256': 'a36e14ecc081c846e456edfffff7107b53791df54f54e33a0b7a8fad5631c4e2',
         'AGENTOR_TEST_PREBUILT_ORCHESTRATOR_ID': 'sha256:e7ed7c7fdbb8f9a6a3a0c932a5ded16243ee50c3fdbde4e4d616de7dce83c8bd',
         'AGENTOR_TEST_PREBUILT_ORCHESTRATOR_SHA256': 'ba8f4bc5045d25cd81f4525efddcf80891bb653eeeb827a09281991d5852d98d',
@@ -272,7 +277,9 @@ The unchanged instance command is
 `api/instance-backup-docker-live.spec.ts --project=api --workers=1 --retries=0`.
 Inspect and retain the new `compose.json`, `runner.log`, `result.json` and reports
 before any further attempt. A failed/partially loaded daemon is not retried or
-adopted by this opt-in path. Archive hashes/config IDs must be reviewed again
+adopted by this opt-in path. Docker failures include only the fixed command,
+exit status/error code and JSON-escaped stderr capped at 4,096 characters; full
+error objects, stdout and environment are not printed. Archive hashes/config IDs must be reviewed again
 for any different export; no image is pulled or built as a fallback.
 
 Pure checks (no Docker calls):

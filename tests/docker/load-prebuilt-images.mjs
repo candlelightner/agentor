@@ -54,7 +54,12 @@ function docker(args, fd) {
       encoding: 'utf8', timeout: 15 * 60_000, maxBuffer: 1024 * 1024,
       stdio: [fd ?? 'ignore', 'pipe', 'pipe'],
     }).trim();
-  } catch { fail('local Docker command failed; do not reuse this attempt'); }
+  } catch (error) {
+    const status = Number.isInteger(error?.status) ? error.status : 'unknown';
+    const code = String(error?.code ?? error?.signal ?? 'unknown').slice(0, 80);
+    const raw = String(error?.stderr ?? ''), stderr = raw.slice(0, 4096);
+    fail(`local Docker command ${JSON.stringify(['docker', '--host', SOCKET, ...args])} failed (status=${status}, code=${JSON.stringify(code)}); stderr=${JSON.stringify(stderr)}${raw.length > stderr.length ? ' (truncated)' : ''}; do not reuse this attempt`);
+  }
 }
 export function main() {
   const images = pins(process.env), opened = [];

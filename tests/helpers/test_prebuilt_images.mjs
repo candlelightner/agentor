@@ -93,7 +93,7 @@ test('complete pinned load/tag flow; corrupt second archive prevents every Docke
     fs.writeFileSync(file, bytes, { mode: 0o600 }); paths.set(image.path, file);
     fixtureEnv[`AGENTOR_TEST_PREBUILT_${image.role}_SHA256`] = crypto.createHash('sha256').update(bytes).digest('hex');
   }
-  const commands = [];
+  const commands = []; let failLoad = false;
   fs.openSync = (file, ...args) => originals.open(paths.get(file) ?? file, ...args);
   fs.readFileSync = (file, ...args) => file === '/proc/self/cgroup' ? '0::/init\n'
     : file === '/proc/self/mountinfo' ? pins(fixtureEnv).map(({ path }) => `1 2 0:1 /file ${path} ro - ext4 /dev/vda rw`).join('\n')
@@ -103,7 +103,11 @@ test('complete pinned load/tag flow; corrupt second archive prevents every Docke
     assert.equal(options.env.DOCKER_CONTEXT, undefined);
     const operation = args.slice(2); commands.push(operation);
     if (operation[0] === 'info') return JSON.stringify({ ID: 'fresh', Name: os.hostname(), DockerRootDir: '/var/lib/docker', Driver: 'overlay2' });
-    if (operation[0] === 'load') { assert.ok(fs.readFileSync(options.stdio[0]).length); return 'Loaded'; }
+    if (operation[0] === 'load') {
+      if (failLoad) throw Object.assign(new Error('unreported generic error'), {
+        status: 23, code: 'ERR_TEST_LOAD', stderr: Buffer.from('known load reason\n' + 'x'.repeat(10_000)) });
+      assert.ok(fs.readFileSync(options.stdio[0]).length); return 'Loaded';
+    }
     if (operation[1] === 'inspect') return JSON.stringify([{ Id: operation[2], Os: 'linux', Architecture: 'amd64' }]);
     if (operation.includes('--no-trunc')) return pins(fixtureEnv).map(({ id }) => id).join('\n');
     return '';
@@ -113,6 +117,17 @@ test('complete pinned load/tag flow; corrupt second archive prevents every Docke
     process.env.AGENTOR_TEST_PREBUILT_ORCHESTRATOR_SHA256 = sha256;
     assert.throws(() => main(), /SHA256 mismatch/); assert.equal(commands.length, 0);
     Object.assign(process.env, fixtureEnv);
+    failLoad = true;
+    assert.throws(() => main(), (error) => {
+      assert.match(error.message, /local Docker command.*"load"/);
+      assert.match(error.message, /status=23/); assert.match(error.message, /ERR_TEST_LOAD/);
+      assert.match(error.message, /known load reason/); assert.match(error.message, /truncated/);
+      assert.match(error.message, /do not reuse this attempt/);
+      assert.ok(error.message.length < 5000); assert.ok(!error.message.includes('unreported generic error'));
+      return true;
+    });
+    assert.equal(commands.filter(([op]) => op === 'load').length, 1);
+    commands.length = 0; failLoad = false;
     main();
     assert.equal(commands.filter(([op]) => op === 'load').length, 2);
     assert.deepEqual(commands.filter(([op]) => op === 'tag'), pins(fixtureEnv).map(({ id, tag }) => ['tag', id, tag]));
