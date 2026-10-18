@@ -1502,3 +1502,5 @@ Native default promotion preserves the verified previous OCI with an immutable s
 Dedicated administrative startup validation failures retain managed rows and native receipts unchanged, including when authority cannot be read. Recovery stays blocked until fresh dedicated validation succeeds; ordinary worker failures retain their existing durable quarantine.
 
 Existing native administrative status/start preparation re-admits exact host policy before inspection after reboot, retaining compute incarnation and storage; policy rejection still blocks credential issuance and start. A failed admin status request offers Retry without claiming an absent workspace or offering Provision.
+
+Codex MCP subprocess endpoint allowlists are reconciled for canonical management and worker-self commands, including existing sections and existing account profiles, without replacing user configuration or persisting credentials/endpoint values.

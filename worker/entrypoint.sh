@@ -401,6 +401,79 @@ EOF
       "${AGENTOR_MANAGEMENT_MCP_URL:-http://agentor-orchestrator:3099/mcp}"
 fi
 
+# Codex filters MCP child environments. Amend only Agentor's canonical commands,
+# including existing sections, without persisting endpoint values or credentials.
+python3 - /home/agent/.codex/config.toml "${CODEX_HOME:-/home/agent/.codex}/config.toml" /home/agent/.agent-data/.codex-account/config.toml <<'CODEX_MCP_ENV' || echo "[agent] Warning: managed Codex MCP environment reconciliation failed" >&2
+import copy, json, os, re, stat, sys, tempfile, tomllib
+from pathlib import Path
+
+def reconcile(text):
+    for name, command, variables in (
+        ('agentor-management', '/usr/local/bin/agentor-management-mcp', ['AGENTOR_MANAGEMENT_MCP_URL']),
+        ('agentor-worker', '/usr/local/bin/agentor-worker-mcp', ['AGENTOR_WORKER_MCP_URL', 'ORCHESTRATOR_URL']),
+    ):
+        parsed = tomllib.loads(text)
+        section = parsed.get('mcp_servers', {}).get(name, {})
+        if not isinstance(section, dict) or section.get('command') != command:
+            continue
+        existing = section.get('env_vars', [])
+        if not isinstance(existing, list) or any(not isinstance(value, str) for value in existing):
+            raise ValueError('Invalid managed MCP environment allowlist')
+        merged = existing + [value for value in variables if value not in existing]
+        if merged == existing:
+            continue
+        expected = copy.deepcopy(parsed)
+        expected['mcp_servers'][name]['env_vars'] = merged
+        header = re.search(r'(?m)^[ \t]*\[mcp_servers\.' + re.escape(name) + r'\][ \t]*(?:#[^\n]*)?(?:\n|$)', text)
+        if not header:
+            raise ValueError('Managed MCP section is not a canonical table')
+        assignment = 'env_vars = ' + json.dumps(merged) + '\n'
+        if 'env_vars' not in section:
+            candidate = text[:header.end()] + assignment + text[header.end():]
+        else:
+            field = re.search(r'(?m)^[ \t]*env_vars[ \t]*=', text[header.end():])
+            if not field:
+                raise ValueError('Managed MCP allowlist assignment is not canonical')
+            start = header.end() + field.start()
+            # Validate each possible multiline-array end instead of parsing TOML syntax ourselves.
+            for end in [match.end() for match in re.finditer(r'\n|$', text) if match.end() > start]:
+                candidate = text[:start] + assignment + text[end:]
+                try:
+                    if tomllib.loads(candidate) == expected:
+                        break
+                except tomllib.TOMLDecodeError:
+                    pass
+            else:
+                raise ValueError('Managed MCP allowlist cannot be updated without other changes')
+        if tomllib.loads(candidate) != expected:
+            raise ValueError('Managed MCP update changed unrelated configuration')
+        text = candidate
+    return text
+
+for path in dict.fromkeys(Path(value).resolve() for value in sys.argv[1:]):
+    if not path.exists():
+        continue
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError('Codex configuration is not a regular file')
+    before = path.read_text()
+    after = reconcile(before)
+    if after == before:
+        continue
+    descriptor, stage = tempfile.mkstemp(prefix=path.name + '.agentor-mcp-', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'w') as output:
+            os.fchown(output.fileno(), info.st_uid, info.st_gid)
+            os.fchmod(output.fileno(), stat.S_IMODE(info.st_mode))
+            output.write(after); output.flush(); os.fsync(output.fileno())
+        if path.read_text() != before:
+            raise ValueError('Codex configuration changed during reconciliation')
+        os.replace(stage, path)
+    finally:
+        if os.path.exists(stage):
+            os.unlink(stage)
+CODEX_MCP_ENV
+
 _done agents "Agent setup"
 _log "Agent setup: done"
 

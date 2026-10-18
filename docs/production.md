@@ -297,3 +297,14 @@ Explicit stop/device update/start or rebuild is required for existing VMs; the
 application does not change their cache policy automatically. Account Kilo shares,
 host exports and managed selections retain their existing cache mode and may not
 support SQLite WAL. `metadata` alone still uses direct I/O and does not fix WAL.
+
+Codex filters the environment of stdio MCP subprocesses. Worker startup reconciles
+Agentor's canonical MCP commands with explicit `env_vars`: management forwards
+`AGENTOR_MANAGEMENT_MCP_URL`; worker-self forwards `AGENTOR_WORKER_MCP_URL` and
+`ORCHESTRATOR_URL`. Existing allowlists, required flags and unrelated configuration
+are preserved; endpoint values and workload credentials are not written to config.
+Existing custom account homes are amended only when they already contain a
+canonical Agentor MCP command. This startup correction is part of the canonical
+VM bootstrap recipe; fresh native images must be derived from the updated inputs.
+Existing pinned VM images remain retained and existing configurations can be
+reconciled without rebuilding compute.
