@@ -6,7 +6,7 @@ import { PassThrough } from 'node:stream';
 import { useConfig, useContainerManager, useDockerService, useAdministrativeWorkspaceRuntime, useWorkerGroupStore } from '../../orchestrator/server/utils/services';
 import { useGroupAdminWorkspaceStore } from '../../orchestrator/server/utils/group-admin-workspace-store';
 import { useAdminWorkspaceStore } from '../../orchestrator/server/utils/admin-workspace-store';
-import { readAdministrativeRuntimeRecord, administrativeRuntimeOwner } from '../../orchestrator/server/utils/admin-native-authority';
+import { readAdministrativeRuntimeRecord, administrativeRuntimeOwner, adminNativeInstanceName } from '../../orchestrator/server/utils/admin-native-authority';
 import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
 import { requirePluginSelf, requireWorkerSelf } from '../../orchestrator/server/utils/worker-auth';
 import { withOwnerWorkerLifecycleMutation } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
@@ -14,12 +14,13 @@ import type { AdministrativeWorkspaceRecord } from '../../orchestrator/server/ut
 
 (globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, debug() {}, error() {} });
 const platformId = randomUUID(), owner = randomUUID(), stamp = new Date(0).toISOString();
-const nativeIdentity = (name: string) => ({ version: 1 as const, name, installationId: randomUUID(), nonce: randomUUID(),
+const nativeIdentity = (record: AdministrativeWorkspaceRecord) => ({ version: 1 as const, name: adminNativeInstanceName(record), installationId: randomUUID(), nonce: randomUUID(),
   incarnation: randomUUID(), overlayVersion: '6' as const, overlaySha256: 'a'.repeat(64), storageReady: true as const, storageInitialized: true as const,
   image: { version: 1 as const, fingerprint: 'b'.repeat(64), sourceImageId: 'sha256:'+'c'.repeat(64), recipeId: 'd'.repeat(64),
     architecture: 'amd64' as const, converterVersion: 'v0.4.0', bootstrapGeneration: '3' as const } });
-const platform = { schemaVersion: 1 as const, id: platformId, kind: 'administrative' as const, trusted: true as const,
-  status: 'running' as const, runtimeKind: 'incus-vm' as const, nativeRuntime: nativeIdentity('agentor-admin-'+platformId), createdAt: stamp, updatedAt: stamp };
+const platform: AdministrativeWorkspaceRecord = { schemaVersion: 1 as const, id: platformId, kind: 'administrative' as const, trusted: true as const,
+  status: 'running' as const, runtimeKind: 'incus-vm' as const, createdAt: stamp, updatedAt: stamp };
+platform.nativeRuntime = nativeIdentity(platform);
 
 let restoreSingletons: (() => Promise<void>) | undefined;
 test.beforeAll(async () => {
@@ -56,7 +57,8 @@ async function fixture(kind: 'platform' | 'group' = 'platform') {
   if (kind === 'group') {
     const group = await groups.create(owner, 'Private native caller fixture'), id = randomUUID();
     record = { schemaVersion: 1, id, kind: 'group-administrative', trusted: true, ownerId: owner, groupId: group.id,
-      status: 'running', runtimeKind: 'incus-vm', nativeRuntime: nativeIdentity('agentor-admin-'+id), createdAt: stamp, updatedAt: stamp } as any;
+      status: 'running', runtimeKind: 'incus-vm', createdAt: stamp, updatedAt: stamp } as any;
+    record.nativeRuntime = nativeIdentity(record);
     await groups.update(owner, group.id, { adminWorkspace: record } as any);
   }
   const identity = administrativeRuntimeOwner(record), native = useAdministrativeWorkspaceRuntime().native;
