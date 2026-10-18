@@ -219,7 +219,6 @@ docker ps -aq --filter "label=agentor.managed=traefik" | xargs -r docker rm -f >
 # Phase 2: build agentor images inside inner dockerd
 # Cached on the persistent /var/lib/docker volume — fast on subsequent runs.
 # ---------------------------------------------------------------------------
-log "Building agentor images (cached after first run)..."
 
 # Retry wrapper — first builds need to pull base images from docker.io,
 # and the inner-DinD network path to that registry can be slow enough to
@@ -241,9 +240,14 @@ build_with_retry() {
     return 1
 }
 
-build_with_retry agentor-worker:latest /src/worker
-build_with_retry agentor-orchestrator:latest /src -f /src/orchestrator/Dockerfile
-log "Images built."
+if [[ "${AGENTOR_TEST_PREBUILT_IMAGES:-false}" == "true" ]]; then
+    node /usr/local/lib/agentor-load-prebuilt-images.mjs
+else
+    log "Building agentor images (cached after first run)..."
+    build_with_retry agentor-worker:latest /src/worker
+    build_with_retry agentor-orchestrator:latest /src -f /src/orchestrator/Dockerfile
+    log "Images built."
+fi
 
 # Exercise the exact production sizing-helper ceilings before starting the
 # stack. A daemon that accepts ordinary containers but cannot apply one of

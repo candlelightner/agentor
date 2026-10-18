@@ -1468,3 +1468,5 @@ Fresh native global administration accepts a valid dedicated DATA root before an
 - Legacy Docker-to-Incus RAW capture readers stop with one-second grace only after GNU exec settlement; exact helper identity, fifteen-second API deadline, confirmed termination and retained uncertainty safeguards remain mandatory.
 
 Historical Docker admin DR fidelity checks include every portable persistent file, directory and link, omit Unix sockets without opening them, and continue to reject other special types with relative-path diagnostics. No source entries are removed or changed to satisfy the fixture.
+
+The test-only prebuilt-image Phase 2 opt-in accepts exactly two fixed read-only root-private archives with full SHA256/config-ID pins, fresh empty private DinD marker/cgroup/daemon proof and Linux/amd64 image checks. Default builds and all sizing-helper/stack/API/UI/report phases remain unchanged. It is a reviewed historical Docker acceptance shortcut, not native-default acceptance; no host launcher or fallback is added.
