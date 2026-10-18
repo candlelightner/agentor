@@ -40,6 +40,9 @@ export class AdministrativeWorkspaceRuntime implements AdminWorkspaceRuntimeAdap
             await this.listener?.(await this.legacy.managementAddress(names.managementNetwork));
         return { name: record.imageName ?? '', digest: container.Image };
     }
+    async observeStatus(record: Readonly<AdministrativeWorkspaceRecord>) {
+        return this.isNative(record) ? this.native.observeStatus(record) : record.status;
+    }
     async start(record: Readonly<AdministrativeWorkspaceRecord>, ack?: AdminNativeAcknowledge) { if (!this.isNative(record))
         return this.migrationRequired(); return this.native.start(record, ack); }
     async stop(record: Readonly<AdministrativeWorkspaceRecord>, ack?: AdminNativeAcknowledge) { return this.isNative(record) ? this.native.stop(record, ack) : this.legacy.stop(record); }

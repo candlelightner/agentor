@@ -262,6 +262,12 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         }
         await ack({ ...record.nativeRuntime!, pending: undefined });
     }
+    async observeStatus(record: Readonly<AdministrativeWorkspaceRecord>): Promise<'running' | 'stopped'> {
+        const instance = await this.assertOwned(record);
+        if (instance.status !== 'Running' && instance.status !== 'Stopped')
+            throw failure('Administrative runtime status is not settled; refresh status');
+        return instance.status === 'Running' ? 'running' : 'stopped';
+    }
     async assertOwned(record: Readonly<AdministrativeWorkspaceRecord>, incarnation = record.nativeRuntime?.incarnation): Promise<IncusInstance> {
         return this.inspectOwned(record, incarnation);
     }

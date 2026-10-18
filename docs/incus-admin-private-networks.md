@@ -40,3 +40,18 @@ Selected persistent paths are derived from `nativeRuntime.selectedVolumeIds` and
 A durable `selectedOperation` binds one selected volume, copy operation and VM incarnation. Read-only network inspection permits its exact staging mount at `/run/agentor-volume-seed/<volume-id>` (or its absence during attachment/removal). The final canonical target is permitted only for a seeded volume, a stopped VM, and the explicit seed-only `canonical: true` receipt; both sides of that exact transition are checked. Device acknowledgements distinguish unknown, accepted and settled mutations, without replaying any operation. Network ensure/start is denied until the receipt settles, and while deletion is in progress. Every existing authority recheck also rereads selected records. No arbitrary source, host path, NIC, mount option or caller-provided device is accepted. Detached-volume migration/backup preservation belongs to the storage workflow; this host policy neither attaches nor deletes detached volumes.
 
 Selected-volume policy tests use private temporary authority files and stubbed transports. Actual guest copy, Kilo-link content proof, migration/restore fidelity and host firewall/network acceptance remain separate integration checks.
+
+## Administrative VM memory changes and host policy updates
+
+The host policy checks the applied `nativeRuntime.memoryLimit`, with `4GiB` for older records. A saved desired `memoryLimit` never changes admission for existing compute. An explicit rebuild persists the new applied limit before creating the replacement VM; memory, ownership, storage and NIC checks remain exact.
+
+Updating the orchestrator image does **not** update the separately installed root host policy. From the trusted checkout containing this fix, on the actual host, update the existing installation's helper using its private operator config:
+
+```sh
+sudo scripts/setup-incus-host.sh --update-policy \
+  --config /etc/agentor/incus/<installation-uuid>/config.json
+```
+
+This copies the trusted host scripts and restarts their existing policy service, preserving the installed config, certificates, VM instances, canonical data and network resources. It skips package installation, image conversion and routing reconciliation. Use the actual installation UUID locally; do not publish the config or diagnostics. Update the orchestrator too, then refresh administrative status before deciding whether Start or Rebuild is needed. Do not remove storage or weaken identity/network checks to clear a rejection.
+
+Status reads inspect the owned native VM without starting it or changing desired state. An unavailable or rejected identity produces an explicit error instead of reporting the saved desired `running` state. Admin cards open the confirmed administration controls rather than ordinary worker lifecycle endpoints. Docker/Incus identity quarantine is separate and remains enforced; it never authorizes deleting or adopting retained Docker containers.

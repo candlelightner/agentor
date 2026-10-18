@@ -134,6 +134,25 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(reads.count("/1.0/certificates?recursion=1"), 2)
                 self.assertEqual(len([args for args in calls if args[0] == "incus"]), 1)
 
+    def test_update_policy_uses_installed_config_without_provisioning_or_conversion(self):
+        config = {**self.config(), 'listen': '172.25.0.1', 'policyPort': 8444}
+        path = Path('/etc/agentor/incus') / INSTALLATION / 'config.json'
+        info = types.SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0, st_size=1024)
+        with patch.object(sys, 'argv', ['installer', '--update-policy', '--config', str(path)]), \
+             patch.object(SETUP.os, 'geteuid', return_value=0), patch.object(SETUP.os, 'umask'), \
+             patch.object(SETUP.SOURCES, 'directory_identity'), patch.object(Path, 'lstat', return_value=info), \
+             patch.object(Path, 'read_text', return_value=json.dumps(config)), \
+             patch.object(SETUP, 'installation_id', return_value=INSTALLATION), \
+             patch.object(SETUP, 'install_units') as install, patch.object(SETUP, 'routing') as routing, \
+             patch.object(SETUP, 'resource_setup') as resources, patch.object(SETUP, 'bootstrap_default_image') as images:
+            SETUP.main()
+            install.assert_called_once_with(config, path.parent, Path('/usr/local/lib/agentor-incus') / INSTALLATION)
+            routing.assert_not_called(); resources.assert_not_called(); images.assert_not_called()
+            with patch.object(SETUP, 'installation_id', return_value='foreign'):
+                with self.assertRaisesRegex(ValueError, 'Installation identity changed'):
+                    SETUP.main()
+            self.assertEqual(install.call_count, 1)
+
     def test_help_is_available_without_root_or_host_mutation(self):
         result = subprocess.run(["bash", str(SCRIPT), "--help"], text=True, capture_output=True, check=True)
         self.assertIn("--install-lts", result.stdout); self.assertIn("never migrates", result.stdout)

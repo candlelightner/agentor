@@ -77,10 +77,10 @@ export function useAdminWorkspace() {
       if (sequence === refreshSequence) workspace.value = result;
       return result;
     } catch (cause) {
-      if (sequence === refreshSequence) error.value = adminError(
-        cause,
-        "Could not load the administrative workspace.",
-      );
+      if (sequence === refreshSequence) {
+        workspace.value = null;
+        error.value = adminError(cause, "Could not load the administrative workspace.");
+      }
       throw cause;
     } finally {
       if (sequence === refreshSequence) loading.value = false;

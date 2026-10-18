@@ -17,6 +17,7 @@ const props = defineProps<{
   metricFor: (id: string) => any;
 }>();
 const emit = defineEmits<{
+  manageAdministration: [kind: "platform" | "group"];
   openTerminal: [id: string]; openDesktop: [id: string]; openApps: [id: string]; openEditor: [id: string];
   stopContainer: [id: string]; restartContainer: [id: string]; recoverContainer: [id: string]; rebuildContainer: [id: string]; removeContainer: [id: string]; archiveContainer: [id: string]; downloadWorkspace: [id: string];
   updateContainer: [id: string, patch: UpdateContainerSettingsRequest, rebuild: boolean, complete: (error?: string) => void];
@@ -108,6 +109,7 @@ function active(id: string) {
         :is-active="active(worker.id)" :metric="metricFor(worker.id)"
         @open-terminal="(id) => emit('openTerminal', id)" @open-desktop="(id) => emit('openDesktop', id)"
         @open-apps="(id) => emit('openApps', id)" @open-editor="(id) => emit('openEditor', id)"
+        @manage-administration="(kind) => emit('manageAdministration', kind)"
         @stop="(id) => emit('stopContainer', id)" @restart="(id) => emit('restartContainer', id)"
         @recover="(id) => emit('recoverContainer', id)"
         @rebuild="(id) => emit('rebuildContainer', id)" @remove="(id) => emit('removeContainer', id)"
@@ -120,6 +122,7 @@ function active(id: string) {
         :active-tab-id="activeTabId" :metric-for="metricFor"
         @open-terminal="(id) => emit('openTerminal', id)" @open-desktop="(id) => emit('openDesktop', id)"
         @open-apps="(id) => emit('openApps', id)" @open-editor="(id) => emit('openEditor', id)"
+        @manage-administration="(kind) => emit('manageAdministration', kind)"
         @stop-container="(id) => emit('stopContainer', id)" @restart-container="(id) => emit('restartContainer', id)"
         @recover-container="(id) => emit('recoverContainer', id)"
         @rebuild-container="(id) => emit('rebuildContainer', id)" @remove-container="(id) => emit('removeContainer', id)"

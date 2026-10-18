@@ -5,6 +5,7 @@ The serialized mTLS service owns these operations. No arbitrary host command,
 network, address, device, Docker container, or Incus path crosses its API.
 """
 import hashlib
+from fractions import Fraction
 import importlib.util
 import ipaddress
 import json
@@ -144,6 +145,10 @@ class AdminNetworkPolicy:
                 and isinstance(native.get("overlaySha256"), str)
                 and re.fullmatch(r"[0-9a-f]{64}", native["overlaySha256"]) is not None
                 and native.get("overlayVersion") == "6", "Durable native administrative intent is unavailable")
+        memory = native.get("memoryLimit", "4GiB")
+        match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(B|KiB|MiB|GiB)", memory) if isinstance(memory, str) and len(memory) <= 64 else None
+        require(match is not None and 1 <= int(Fraction(match[1]) * 1024 ** {"B": 0, "KiB": 1, "MiB": 2, "GiB": 3}[match[2]]) <= 2**53 - 1,
+                "Applied administrative memory limit is invalid")
         require(len(f"/var/lib/incus/devices/{self.project}_{native['name']}/virtio-fs.workspace.sock".encode()) <= 107,
                 "Administrative virtiofs socket path exceeds 107 bytes; use a shorter Incus project")
         key = hashlib.sha256(f"{self.installation}:{owner}:{group}:{workspace}".encode()).hexdigest()[:12]
@@ -302,7 +307,7 @@ class AdminNetworkPolicy:
         labels = {**self.labels(identity), "user.agentor.admin-nonce": native["nonce"],
                   "user.agentor.admin-overlay-sha256": native["overlaySha256"],
                   "boot.autostart": "false", "security.secureboot": "false",
-                  "limits.memory": "4GiB", "limits.cpu": "2"}
+                  "limits.memory": native.get("memoryLimit", "4GiB"), "limits.cpu": "2"}
         require(instance.get("name") == native["name"] and instance.get("type") == "virtual-machine"
                 and instance.get("profiles") == [] and matches_incus_config(config, labels)
                 and all(key in labels or key.startswith(("volatile.", "image.")) for key in config),

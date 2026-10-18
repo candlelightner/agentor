@@ -1117,3 +1117,40 @@ test('a configured memory limit applies on first creation and does not relax run
         await expect(f.runtime.assertOwned(f.record)).rejects.toThrow('ownership or incarnation');
     } finally { await f.cleanup(); }
 });
+
+test('admin status observes compute without starting or registering it and rejects unverified state', async () => {
+    const f = await fixture();
+    try {
+        f.record.status = 'stopped';
+        await f.runtime.ensure(f.record, f.ack);
+        f.events.length = 0;
+        await expect(f.runtime.observeStatus(f.record)).resolves.toBe('stopped');
+        f.instance.status = 'Running';
+        await expect(f.runtime.observeStatus(f.record)).resolves.toBe('running');
+        expect(f.events).not.toContain('vm-start');
+        expect(f.events).not.toContain('register');
+        f.instance.status = 'Starting';
+        await expect(f.runtime.observeStatus(f.record)).rejects.toThrow('not settled');
+        f.instance.config['limits.memory'] = '6GiB';
+        await expect(f.runtime.observeStatus(f.record)).rejects.toThrow('ownership');
+    } finally { await f.cleanup(); }
+});
+
+test('admin host policy rejection provides actionable redacted feedback without retrying admission', async () => {
+    const f = await fixture();
+    try {
+        f.record.status = 'stopped';
+        await f.runtime.ensure(f.record, f.ack);
+        let calls = 0;
+        const boundary = new IncusAdminNetworkBoundary(f.config, { request: async () => {
+            calls++; throw new IncusRequestRejected('private transport detail', 409);
+        } } as any);
+        await expect(boundary.boundary(f.record, 'ensure')).rejects.toMatchObject({ statusCode: 409,
+            statusMessage: 'Administrative host policy rejected the VM identity. Verify the installed Incus host policy and VM identity before retrying.' });
+        expect(calls).toBe(1);
+    } finally { await f.cleanup(); }
+});
+for (const helper of ['test_incus_admin_network_policy.py', 'test_setup_incus_host.py']) test(`operator host helper regression: ${helper}`, () => {
+    const result = spawnSync('python3', [new URL('../helpers/' + helper, import.meta.url).pathname], { encoding: 'utf8', timeout: 20_000 });
+    expect(result.status, result.stderr + result.stdout).toBe(0);
+});

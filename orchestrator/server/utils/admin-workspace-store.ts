@@ -83,6 +83,7 @@ export type AdminWorkspaceIdentityMaterializer = (
  * request.
  */
 export interface AdminWorkspaceRuntimeAdapter {
+  observeStatus?(record: Readonly<AdministrativeWorkspaceRecord>): Promise<"running" | "stopped">;
   ensure(
     record: Readonly<AdministrativeWorkspaceRecord>,
     acknowledge?: AdminNativeAcknowledge,
@@ -285,7 +286,11 @@ export class AdminWorkspaceStore {
     if (this.pendingOperations) throw Object.assign(
       new Error('Administrative workspace operation is in progress or awaiting settlement. Refresh status before retrying.'), { statusCode: 503 });
     const record = this.readSettledRecord();
-    return record ? this.publicRecord(record) : null;
+    if (!record) return null;
+    const status = await this.runtime?.observeStatus?.(record) ?? record.status;
+    if (this.pendingOperations || !isDeepStrictEqual(record, this.readSettledRecord()))
+      throw Object.assign(new Error('Administrative workspace changed during status inspection; refresh status'), { statusCode: 503 });
+    return { ...this.publicRecord(record), status };
   }
   private readSettledRecord() {
     const record = this.getRecord();

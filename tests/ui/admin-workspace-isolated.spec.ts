@@ -123,3 +123,13 @@ test('a response from before reopening cannot overwrite a newer settled status',
   await expect(page.getByRole('button', { name: 'Start admin workspace', exact: true })).toBeEnabled();
   await expect(page.getByRole('button', { name: 'Stop admin workspace', exact: true })).toHaveCount(0);
 });
+
+test('a rejected authoritative status inspection clears the stale running display', async ({ page }) => {
+  await page.goto(url);
+  await expect(page.getByRole('button', { name: 'Stop admin workspace', exact: true })).toBeVisible();
+  await page.route('**/api/admin/workspace', route => route.fulfill({ status: 409, json: { statusMessage: 'Host policy rejected inspection' } }));
+  await page.evaluate(() => (window as any).showAdmin(false));
+  await page.evaluate(() => (window as any).showAdmin(true));
+  await expect(page.getByText('Host policy rejected inspection')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Stop admin workspace', exact: true })).toHaveCount(0);
+});
