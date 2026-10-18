@@ -4,6 +4,8 @@ This is source for a real acceptance test, not a completed live result or a VM l
 
 `tests/api/admin-native-encrypted-dr-live.spec.ts` is disabled unless `INCUS_ADMIN_INSTANCE_DR_TEST=true`. The existing root-private native fixture receipt must match the guest's current boot ID, machine ID and `agentor.native_dr_fixture=<nonce>` kernel argument. Default Playwright global setup rejects the flag before authentication/network setup; use the modules config. An enabled but missing/invalid receipt or phase fails. No historical SSH, host endpoint or credential fallback exists.
 
+The one-off approved-asset bootstrap sequence is in [administrative-native-dr-bootstrap-20261018.md](administrative-native-dr-bootstrap-20261018.md); it reuses existing installer leaves and policy services without converting the base again.
+
 ## Manual fixture contract
 
 Use the exact `/run/agentor-native-dr/fixture.json` schema in `tests/helpers/private-native-dr-fixture.ts`. This already pins the local HTTPS Incus endpoint, private project, pool, image alias, TLS files and `/var/lib/agentor-native-dr/<nonce>` root. All receipt/TLS files are root-owned `0600`, containing directories `0700`, with no symlinks. Create the additional `recovery` directory under that root even for capture. The suite does not provision daemons, bridges, images, accounts or source data.
