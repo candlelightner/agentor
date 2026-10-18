@@ -582,37 +582,43 @@ test('native admin removal retries selected-volume cleanup without retargeting r
         await f.cleanup();
     }
 });
-test('backup settings dispatch native admins through dedicated store transactions without ordinary managed adoption', async () => {
+test('backup settings dispatch authorized human selections through dedicated native transactions without ordinary managed adoption', async () => {
     const f = await fixture();
     const { useAdminWorkspaceStore } = await import('../../orchestrator/server/utils/admin-workspace-store');
-    const { useWorkerGroupStore, useAdministrativeWorkspaceRuntime } = await import('../../orchestrator/server/utils/services');
+    const { useConfig, useAdministrativeWorkspaceRuntime } = await import('../../orchestrator/server/utils/services');
+    const { migrateAuth, getAuthDb } = await import('../../orchestrator/server/utils/auth');
     const { useManagedVolumeManager } = await import('../../orchestrator/server/utils/managed-volume-manager');
     const { PersistentBackupPathManager } = await import('../../orchestrator/server/utils/persistent-backup-paths');
-    const store = useAdminWorkspaceStore(), groups = useWorkerGroupStore(), runtime = useAdministrativeWorkspaceRuntime(), managed = useManagedVolumeManager();
-    const original = { init: store.init, get: store.getRecord, transaction: store.withNativeRuntimeTransaction, groupInit: groups.init, adopt: runtime.native.adoptSelections, ordinary: managed.adoptIncusSelections };
+    const dataDir = useConfig().dataDir; expect(dataDir).toMatch(/^\/tmp\/agentor-incus-acceptance-/);
+    const path = join(dataDir, 'admin', 'workspace.v1.json');
+    const previousBytes = await readFile(path).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    const store = useAdminWorkspaceStore(), runtime = useAdministrativeWorkspaceRuntime(), managed = useManagedVolumeManager();
+    const original = { init: store.init, get: store.getRecord, transaction: store.withNativeRuntimeTransaction, adopt: runtime.native.adoptSelections, ordinary: managed.adoptIncusSelections };
+    const owner = randomUUID(); f.record.ownerId = owner;
     try {
-        await f.prepare();
-        await f.runtime.ensure(f.record, f.ack);
-        store.init = async () => { };
-        store.getRecord = () => structuredClone(f.record);
-        groups.init = async () => { };
+        await f.prepare(); await f.runtime.ensure(f.record, f.ack);
+        await mkdir(join(dataDir, 'admin'), { recursive: true }); await writeFile(path, JSON.stringify(f.record));
+        await migrateAuth(); getAuthDb().prepare('INSERT INTO user (id,name,email,emailVerified,createdAt,updatedAt,role) VALUES (?,?,?,?,?,?,?)')
+            .run(owner, 'Fixture', owner+'@invalid.test', 0, Date.now(), Date.now(), 'admin');
+        store.init = async () => {}; store.getRecord = () => structuredClone(f.record);
         let transactions = 0;
-        store.withNativeRuntimeTransaction = async (operation) => { transactions++; return operation(structuredClone(f.record), f.ack); };
+        store.withNativeRuntimeTransaction = async operation => {
+            transactions++;
+            const current = structuredClone(f.record);
+            return operation(current, async patch => { await f.ack(patch); applyAdminNativePatch(current, patch); await writeFile(path, JSON.stringify(f.record)); }, async () => {});
+        };
         runtime.native.adoptSelections = (record, paths, ack) => f.runtime.adoptSelections(record, paths, ack);
         managed.adoptIncusSelections = async () => { throw Error('ordinary authority must not be used'); };
         const manager = new PersistentBackupPathManager(f.config, () => ({ id: f.record.id, userId: '__agentor_admin__', runtimeKind: 'incus-vm', administrativeKind: 'platform' } as any), async () => true);
-        await manager.reconcileSelections('__agentor_admin__', { [f.record.id]: ['/home/agent/projects'] });
-        expect(transactions).toBe(1);
-        expect(f.record.nativeRuntime!.selectedVolumeIds).toHaveLength(1);
+        await manager.reconcileSelections(owner, { [f.record.id]: ['/home/agent/projects'] });
+        expect(transactions).toBe(1); expect(f.record.nativeRuntime!.selectedVolumeIds).toHaveLength(1);
         await expect(manager.reconcileSelections('foreign', { [f.record.id]: ['/home/agent/other'] })).rejects.toMatchObject({ statusCode: 404 });
-    }
-    finally {
-        store.init = original.init;
-        store.getRecord = original.get;
-        store.withNativeRuntimeTransaction = original.transaction;
-        groups.init = original.groupInit;
-        runtime.native.adoptSelections = original.adopt;
-        managed.adoptIncusSelections = original.ordinary;
+        await expect(manager.reconcileSelections('__agentor_admin__', { [f.record.id]: ['/home/agent/other'] })).rejects.toMatchObject({ statusCode: 404 });
+    } finally {
+        store.init = original.init; store.getRecord = original.get;
+        store.withNativeRuntimeTransaction = original.transaction; runtime.native.adoptSelections = original.adopt; managed.adoptIncusSelections = original.ordinary;
+        if (previousBytes) await writeFile(path, previousBytes); else await rm(path, { force: true });
+        getAuthDb().prepare('DELETE FROM user WHERE id=?').run(owner);
         await f.cleanup();
     }
 });

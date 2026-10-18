@@ -45,7 +45,8 @@ if len(sys.argv)!=3: raise ValueError('Invalid selected archive request')
 selected=sys.argv[1];spec=json.loads(sys.argv[2])
 if not selected.startswith('/') or selected=='/' or os.path.normpath(selected)!=selected or '\0' in selected:
     raise ValueError('Invalid selected archive path')
-if not isinstance(spec,dict) or set(spec)!={'mounts','credentials'} or not isinstance(spec['credentials'],bool) or \
+if not isinstance(spec,dict) or set(spec) not in ({'mounts','credentials'},{'mounts','credentials','wrapper'}) or \
+    'wrapper' in spec and spec['wrapper']!='volume' or not isinstance(spec['credentials'],bool) or \
     not isinstance(spec['mounts'],list) or len(spec['mounts'])>1024:
     raise ValueError('Invalid selected archive source proof')
 for path in spec['mounts']:
@@ -101,7 +102,12 @@ excluded.update(('/proc','/sys','/dev','/run','/var/lib/docker','/var/lib/contai
 basename=os.path.basename(source);wrapper=os.path.basename(selected)
 command=['/usr/bin/tar','--format=pax','--numeric-owner','--xattrs','--xattrs-include=*','--acls',
     '--no-recursion','--null','--verbatim-files-from','-C',os.path.dirname(source)]
-if basename!=wrapper:
+if spec.get('wrapper')=='volume':
+    # Server-only managed payload namespace. Escape GNU BRE literals; preserve
+    # RAW/PAX metadata and hardlink names without changing symlink values.
+    pattern=''.join('\\'+c if c in '\\.^$[*#' else c for c in basename)
+    command+=['--transform=flags=rh;s#^'+pattern+r'\(/\|$\)#volume\1#']
+elif basename!=wrapper:
     # Only the fixed Kilo aliases above change their basename. Transform
     # member/hardlink names, never symlink values or user-controlled patterns.
     if wrapper!='kilo' or basename not in ('config','shared-data','state','cache'):

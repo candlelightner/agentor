@@ -4,7 +4,7 @@ import { chmod, link, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, un
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { INCUS_SELECTED_ALIASES, INCUS_SELECTED_ARCHIVE_SCRIPT, nativeSelectedBackupPath } from '../../orchestrator/server/utils/incus-selected-archive';
-import { validateIncusSelectedRestoreArchive } from '../../orchestrator/server/utils/portable-managed-volume-archive';
+import { validatePortableManagedVolumeArchive, validateIncusSelectedRestoreArchive } from '../../orchestrator/server/utils/portable-managed-volume-archive';
 
 const escapeMount = (path: string) => path.replaceAll('\\', '\\134').replaceAll(' ', '\\040');
 const mountLine = (path: string, id = 2) => `${id} 1 0:${id} / ${escapeMount(path)} rw - virtiofs fixture rw\n`;
@@ -177,5 +177,28 @@ test('guest source guards reject malformed proofs, nonportable aliases and inval
     await writeFile(f.mountinfo, Buffer.alloc(1024 * 1024 + 1, 32));
     const tooLarge = f.execute(); expect(tooLarge.status).not.toBe(0); expect(tooLarge.stdout.length).toBe(0);
     expect(tooLarge.stderr.toString()).toContain('exceeds limit');
+  });
+});
+
+
+test('server-fixed volume wrapper preserves GNU hardlinks, symlink text and literal BRE characters without widening selected paths', async () => {
+  await fixture(async f => {
+    const source = join(f.root, 'data [literal]*.$^#(name)'); await mkdir(source);
+    await writeFile(join(source, 'data'), 'retained'); await link(join(source, 'data'), join(source, 'hard'));
+    await symlink('data [literal]*.$^#(name)/data', join(source, 'link'));
+    const result = f.execute(source, { mounts: ['/'], credentials: false, wrapper: 'volume' });
+    expect(result.status, result.stderr.toString()).toBe(0);
+    const archive = join(f.root, 'managed.tar'); await writeFile(archive, result.stdout);
+    await expect(validatePortableManagedVolumeArchive(archive, { target: '/opt/data', requirePosixUstar: true })).resolves.toEqual({ entries: 4, expandedBytes: 8 });
+    const names = spawnSync('python3', ['-c', 'import json,sys,tarfile;print(json.dumps([(m.name,m.linkname) for m in tarfile.open(sys.argv[1])]))', archive], { encoding: 'utf8' });
+    expect(names.status, names.stderr).toBe(0);
+    expect(JSON.parse(names.stdout)).toEqual([['volume', ''], ['volume/data', ''], ['volume/hard', 'volume/data'], ['volume/link', 'data [literal]*.$^#(name)/data']]);
+    for (const wrapper of ['other', '../volume', null]) {
+      const denied = f.execute(source, { mounts: ['/'], credentials: false, wrapper });
+      expect(denied.status).not.toBe(0); expect(denied.stdout.length).toBe(0);
+    }
+    await symlink(source, join(f.root, 'ancestor'));
+    const traversal = f.execute(join(f.root, 'ancestor', 'data'), { mounts: ['/'], credentials: false, wrapper: 'volume' });
+    expect(traversal.status).not.toBe(0); expect(traversal.stdout.length).toBe(0);
   });
 });

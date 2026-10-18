@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from "node:crypto";
 import { withWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
 import { applyAdminNativePatch, type AdminNativeAcknowledge } from './admin-native-authority';
@@ -173,14 +174,38 @@ export class GroupAdminWorkspaceStore {
     };
   }
   async withNativeRuntimeTransaction<T>(groupId: string,
-    operation: (record: GroupAdministrativeWorkspaceRecord, acknowledge: AdminNativeAcknowledge) => Promise<T>, authorize?: () => void): Promise<T> {
+    operation: (record: GroupAdministrativeWorkspaceRecord, acknowledge: AdminNativeAcknowledge, refreshRunningIdentity: () => Promise<void>) => Promise<T>, authorize?: () => void): Promise<T> {
     return this.run(groupId, () => this.withGroup(groupId, false, async () => {
       authorize?.();
       await this.flushPendingCommit(groupId, 'native-runtime');
       const record = this.record(groupId);
       if (!record) throw Object.assign(new Error('Group administrative workspace is not provisioned'), { statusCode: 404 });
-      return operation(record, this.nativeAcknowledge(record));
+      let active = true, refresh: Promise<void> | undefined;
+      const refreshRunningIdentity = () => {
+        if (!active || record.runtimeKind !== 'incus-vm' || record.status !== 'running' || record.nativeRuntime?.pending || record.nativeRuntime?.deleting || record.nativeRuntime?.selectedOperation || !this.identityMaterializer)
+          return Promise.reject(Object.assign(new Error('Group administrative running identity refresh is unavailable'), { statusCode: 503 }));
+        this.requireRuntime();
+        return refresh ??= this.identityMaterializer(structuredClone(record), 'refresh-running').finally(() => { refresh = undefined; });
+      };
+      try { return await operation(record, this.nativeAcknowledge(record), refreshRunningIdentity); }
+      finally { active = false; await refresh?.catch(() => {}); }
     }));
+  }
+  /** Credential-only refresh: no owner network lock or provisioning. */
+  async refreshRunningIdentity(groupId: string) {
+    this.requireRuntime();
+    const before = this.record(groupId);
+    if (!before || before.runtimeKind !== 'incus-vm') throw Object.assign(new Error('Native group administrative identity is unavailable'), { statusCode: 409 });
+    return withWorkerLifecycleMutation(before.id, async () => {
+      const record = this.record(groupId);
+      if (!record || !isDeepStrictEqual(record, before) || this.pendingCommits.has(groupId) ||
+          record.nativeRuntime?.pending || record.nativeRuntime?.deleting || record.nativeRuntime?.selectedOperation)
+        throw Object.assign(new Error('Group administrative identity changed'), { statusCode: 409 });
+      if (record.status !== 'running') return;
+      if (!this.identityMaterializer) throw Object.assign(new Error('Group administrative identity materializer is unavailable'), { statusCode: 503 });
+      await this.identityMaterializer(structuredClone(record), 'refresh-running');
+      if (!isDeepStrictEqual(this.record(groupId), record)) throw Object.assign(new Error('Group administrative identity changed'), { statusCode: 409 });
+    });
   }
   async ensure(groupId: string, _ownerId?: string, authorize?: () => void) {
     return this.run(groupId, () =>

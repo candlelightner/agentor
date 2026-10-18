@@ -1,8 +1,9 @@
+import { isDeepStrictEqual } from 'node:util';
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { useContainerManager } from "./services";
-import { withOwnerWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
+import { withWorkerLifecycleMutation, withOwnerWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
 import { applyAdminNativePatch, validateAdminNativeState, type AdminNativeRuntimeIdentity,
   type AdminNativeMigration, type AdminNativeAcknowledge } from './admin-native-authority';
 import {
@@ -233,13 +234,37 @@ export class AdminWorkspaceStore {
     };
   }
   /** Dedicated migration/restore hook; caller cannot enter ordinary-worker lifecycle. */
-  async withNativeRuntimeTransaction<T>(operation: (record: AdministrativeWorkspaceRecord, acknowledge: AdminNativeAcknowledge) => Promise<T>): Promise<T> {
+  async withNativeRuntimeTransaction<T>(operation: (record: AdministrativeWorkspaceRecord, acknowledge: AdminNativeAcknowledge, refreshRunningIdentity: () => Promise<void>) => Promise<T>): Promise<T> {
     return this.exclusive(async () => {
       await this.init();
       await this.flushPendingCommit('native-runtime');
       if (!this.record) throw Object.assign(new Error('Administrative workspace is not provisioned'), { statusCode: 404 });
       const record = structuredClone(this.record);
-      return operation(record, this.nativeAcknowledge(record));
+      let active = true, refresh: Promise<void> | undefined;
+      const refreshRunningIdentity = () => {
+        if (!active || record.runtimeKind !== 'incus-vm' || record.status !== 'running' || record.nativeRuntime?.pending || record.nativeRuntime?.deleting || record.nativeRuntime?.selectedOperation || !this.identityMaterializer)
+          return Promise.reject(Object.assign(new Error('Administrative running identity refresh is unavailable'), { statusCode: 503 }));
+        this.requireRuntime();
+        return refresh ??= this.identityMaterializer(structuredClone(record), 'refresh-running').finally(() => { refresh = undefined; });
+      };
+      try { return await operation(record, this.nativeAcknowledge(record), refreshRunningIdentity); }
+      finally { active = false; await refresh?.catch(() => {}); }
+    });
+  }
+  /** Credential-only refresh: keep the existing per-workspace fence. */
+  async refreshRunningIdentity() {
+    this.requireRuntime(); await this.init();
+    const before = this.getRecord();
+    if (!before || before.runtimeKind !== 'incus-vm') throw Object.assign(new Error('Native administrative identity is unavailable'), { statusCode: 409 });
+    return withWorkerLifecycleMutation(before.id, async () => {
+      const record = this.getRecord();
+      if (!record || !isDeepStrictEqual(record, before) || this.pendingCommit ||
+          record.nativeRuntime?.pending || record.nativeRuntime?.deleting || record.nativeRuntime?.selectedOperation)
+        throw Object.assign(new Error('Administrative identity changed'), { statusCode: 409 });
+      if (record.status !== 'running') return;
+      if (!this.identityMaterializer) throw Object.assign(new Error('Administrative identity materializer is unavailable'), { statusCode: 503 });
+      await this.identityMaterializer(structuredClone(record), 'refresh-running');
+      if (!isDeepStrictEqual(this.getRecord(), record)) throw Object.assign(new Error('Administrative identity changed'), { statusCode: 409 });
     });
   }
   async ensure() {

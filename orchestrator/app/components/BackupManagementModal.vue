@@ -458,11 +458,10 @@ async function refreshWorkspaceNames() {
   try {
     const workers = await $fetch<Array<{
       id: string;
-      userId: string;
       displayName?: string;
       status?: string;
       administrativeKind?: "platform" | "group";
-    }>>("/api/containers");
+    }>>("/api/backups/workspaces");
     workspaceOptions.value = workers
       .map((worker) => {
         const displayName = worker.displayName || worker.id;

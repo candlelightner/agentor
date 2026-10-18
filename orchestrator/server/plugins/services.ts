@@ -367,20 +367,24 @@ export default defineNitroPlugin(async (nitroApp) => {
   await adminRuntime.initializeBoundary();
 
   let adminIdentityTimer: NodeJS.Timeout | undefined;
-  const refreshAdminIdentity = async () => {
+  const adminIdentityRefreshes = new Map<string, Promise<void>>();
+  const refreshAdminIdentity = async (identityOnly = false) => {
     if (instanceSnapshotActive()) return;
     await refreshAdministrativeWorkspaceIdentities(
-      () => adminWorkspace.ensure(),
+      () => identityOnly && adminWorkspace.getRecord()?.runtimeKind === 'incus-vm'
+        ? adminWorkspace.refreshRunningIdentity() : adminWorkspace.ensure(),
       () => useWorkerGroupStore().list(),
-      (groupId) => groupAdminWorkspaces.ensure(groupId),
+      (groupId) => identityOnly && useWorkerGroupStore().findById(groupId)?.adminWorkspace?.runtimeKind === 'incus-vm'
+        ? groupAdminWorkspaces.refreshRunningIdentity(groupId) : groupAdminWorkspaces.ensure(groupId),
       (error) => logger.error(
         `[agentor] administrative workspace identity refresh failed: ${error instanceof Error ? error.message : error}`,
       ),
+      adminIdentityRefreshes,
     );
   };
   if (!instanceRecoveryMode) {
     await refreshAdminIdentity();
-    adminIdentityTimer = setInterval(() => void refreshAdminIdentity(), 45_000);
+    adminIdentityTimer = setInterval(() => void refreshAdminIdentity(true), 45_000);
     adminIdentityTimer.unref?.();
   }
 

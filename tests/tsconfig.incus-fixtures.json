@@ -4,6 +4,7 @@
     "lib": ["ESNext", "DOM", "DOM.Iterable"] },
   "include": [
     "api/admin-native-proxy.spec.ts",
+    "api/admin-native-portable-backup.spec.ts",
     "api/admin-native-callers.spec.ts",
     "api/admin-native-instance.spec.ts",
     "api/instance-backup-native.spec.ts",

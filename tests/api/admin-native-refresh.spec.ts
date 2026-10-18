@@ -127,3 +127,53 @@ test('failed deletion rollback of an ordinary group never creates a new administ
     expect(await readFile(path,'utf8')).toBe(before);
   } finally {await rm(directory,{recursive:true,force:true});}
 });
+
+
+test('a held global ensure never starves healthy groups or accumulates duplicate ensures across refresh ticks', async () => {
+  let release!: () => void, globals = 0, groups = 0;
+  const held = new Promise<void>(resolve => { release = resolve; }), inFlight = new Map<string, Promise<void>>();
+  const refresh = () => refreshAdministrativeWorkspaceIdentities(async () => { globals++; await held; },
+    () => [{ id: 'healthy', adminWorkspace: {} }], async () => { groups++; }, error => { throw error; }, inFlight);
+  const first = refresh(); await expect.poll(() => groups).toBe(1);
+  const second = refresh(); await expect.poll(() => groups).toBe(2);
+  expect(globals).toBe(1); expect(inFlight.has('global')).toBe(true);
+  release(); await Promise.all([first, second]); expect(inFlight.size).toBe(0);
+});
+
+for (const grouped of [false, true]) test(`${grouped ? 'group' : 'global'} held transaction exposes only scoped running identity materialization`, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'admin-held-identity-')), calls: string[] = [];
+  const groups = new WorkerGroupStore(root), store = grouped ? new GroupAdminWorkspaceStore(groups, async (_owner, operation) => operation()) : new AdminWorkspaceStore(root);
+  const runtime = boundRuntime(calls); store.setRuntimeAdapter(runtime);
+  try {
+    let groupId = '';
+    if (grouped) groupId = (await groups.create('owner', 'held fixture')).id;
+    const record = grouped ? await (store as GroupAdminWorkspaceStore).ensure(groupId) : await (store as AdminWorkspaceStore).ensure();
+    const materializations: string[] = []; store.setIdentityMaterializer(async (_record, intent) => { materializations.push(intent); });
+    let escaped!: () => Promise<void>;
+    const operation = async (_record: unknown, _ack: unknown, refresh: () => Promise<void>) => { escaped = refresh; await refresh(); await refresh(); };
+    const before = [...calls];
+    if (grouped) await (store as GroupAdminWorkspaceStore).withNativeRuntimeTransaction(groupId, operation);
+    else await (store as AdminWorkspaceStore).withNativeRuntimeTransaction(operation);
+    expect(materializations).toEqual(['refresh-running', 'refresh-running']); expect(calls).toEqual(before);
+    await expect(escaped()).rejects.toMatchObject({ statusCode: 503 }); expect(materializations).toHaveLength(2);
+    expect(record.status).toBe('running');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+
+test('same-owner group identity refresh progresses while another group holds the owner network and lifecycle transaction', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'admin-same-owner-refresh-')), groups = new WorkerGroupStore(root), store = new GroupAdminWorkspaceStore(groups);
+  const calls: string[] = []; store.setRuntimeAdapter(boundRuntime(calls));
+  try {
+    const first = await groups.create('shared-owner', 'held'), second = await groups.create('shared-owner', 'healthy');
+    await store.ensure(first.id); await store.ensure(second.id);
+    let entered!: () => void, release!: () => void, healthy = 0;
+    const admitted = new Promise<void>(resolve => { entered = resolve; }), held = new Promise<void>(resolve => { release = resolve; });
+    store.setIdentityMaterializer(async record => { if ((record as any).groupId === second.id) healthy++; });
+    const transaction = store.withNativeRuntimeTransaction(first.id, async () => { entered(); await held; });
+    await admitted;
+    const before = [...calls];
+    try { await store.refreshRunningIdentity(second.id); expect(healthy).toBe(1); expect(calls).toEqual(before); }
+    finally { release(); await transaction; }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
