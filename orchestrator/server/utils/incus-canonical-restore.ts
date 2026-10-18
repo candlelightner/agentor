@@ -69,7 +69,7 @@ if managed:
     ROOTS[role]="/restore/managed/"+managed.group(1)+"/volume"
 mode=sys.argv[2] if len(sys.argv)==3 else "extract"
 if role not in ROOTS or mode not in ("extract","empty","account-parents","legacy-source") or \
-    mode in ("empty","legacy-source") and managed or mode=="account-parents" and role!="agents":
+    mode=="empty" and managed or mode=="account-parents" and role!="agents":
     raise ValueError("Invalid canonical restore role")
 root=ROOTS[role]
 parents=("/restore/managed",os.path.dirname(root)) if managed else ()

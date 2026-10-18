@@ -462,6 +462,8 @@ async function prepareNativeRestore(injectedAdapter) {
     await assertRegularNoFollow(join(context.preparedData, 'worker-config.key'), 1024);
   const adminNames = new Set(administrative.flatMap(group => [group.core.workspace.name, ...(group.core.agents ? [group.core.agents.name] : []),
     ...group.managed.map(item => item.descriptor.name)]));
+  const legacySelectedTargets = new Map(administrative.filter(group => group.legacySourceWrapper)
+    .flatMap(group => group.managed.map(item => [item.descriptor.name, item.record.target])));
   const configStore = new adapter.WorkerConfigStore(config);
   const archives = new Map(), prepared = [];
   const scratch = join(context.stage, 'native-archives');
@@ -473,7 +475,7 @@ async function prepareNativeRestore(injectedAdapter) {
         volume.archive !== join(context.stage, 'unpacked', adapter.instanceBundleFilename(descriptor.archive)))
       throw new SafeRestoreError('Native payload does not match its authenticated descriptor', 'INSTANCE_RESTORE_INVALID_PLAN');
     const raw = !descriptor.runtime && adminNames.has(volume.name)
-      ? await adapter.prepareInstanceLegacyAdministrativeVolumeArchive(volume.archive, descriptor, scratch)
+      ? await adapter.prepareInstanceLegacyAdministrativeVolumeArchive(volume.archive, descriptor, scratch, {}, legacySelectedTargets.get(volume.name))
       : await adapter.prepareInstanceNativeVolumeArchive(volume.archive, descriptor, scratch);
     archives.set(volume.name, raw.archivePath);
   }

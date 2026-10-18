@@ -24,6 +24,7 @@ import { administrativeWorkspaceResourceNames } from './admin-workspace-resource
 import { readBackupInstallationId } from './backup-installation';
 import { incusManagedRestoreDevices } from './incus-managed-volume-runtime';
 import { restoreAdministrativeArchives } from './incus-admin-restore';
+import { prepareLegacyManagedMigration } from './legacy-incus-managed-migration';
 
 const durable = <T>(value: T): T => JSON.parse(JSON.stringify(value));
 const safe = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
@@ -107,24 +108,32 @@ export function planInstanceAdministrativeRestore(manifestValue: unknown, record
         manifest.options.includeAgentData && !core.agents) throw new Error('Administrative canonical data is missing from the instance backup');
     const selected = managed.filter(volume => volume.workerId === owner.id);
     const entries: InstanceAdministrativeRestoreGroup['managed'] = [];
+    // Historical global data belonged to its recorded human owner; only the
+    // fresh destination uses the dedicated native administrative namespace.
+    const sourceOwner = native ? owner.userId : record.ownerId;
+    if (!native && selected.length && !safe(sourceOwner)) throw new Error('Historical administrative selected storage has no recorded owner');
+    const legacyLayout = !native && selected.length ? prepareLegacyManagedMigration({ id: owner.id, userId: sourceOwner! }, selected) : [];
     for (const volume of selected) {
       assertIncusLiveResolved(volume);
       if (volume.userId === owner.userId && volume.storageRuntimeKind === 'incus-vm' && !volume.attached && !volume.seeded &&
           ['pending', 'detached'].includes(volume.state) && !volume.operation && !volume.incusLive && !volume.liveContainerId) continue;
-      if (!native || volume.userId !== owner.userId || volume.storageRuntimeKind !== 'incus-vm' || !volume.seeded ||
+      if (volume.userId !== sourceOwner || native && volume.storageRuntimeKind !== 'incus-vm' || !volume.seeded ||
           volume.state !== (volume.attached ? 'ready' : 'detached') || volume.incusLive || volume.liveContainerId ||
           volume.previousRestartPolicy || volume.operation && volume.operation.stage !== 'complete')
         throw new Error('Administrative selected storage is incomplete or has legacy authority');
       const descriptor = manifest.volumes.find(item => item.name === volume.dockerName), runtime = descriptor?.runtime;
-      if (!descriptor || !runtime || !('administrative' in runtime) || runtime.role !== 'managed' ||
+      if (!descriptor || (native ? !runtime || !('administrative' in runtime) || runtime.role !== 'managed' ||
           runtime.administrative.workspaceId !== owner.id || runtime.administrative.kind !== owner.kind || runtime.administrative.groupId !== owner.groupId ||
-          descriptor.ownerId !== owner.userId || runtime.managedVolumeId !== volume.id || runtime.target !== volume.target)
+          descriptor.ownerId !== owner.userId || runtime.managedVolumeId !== volume.id || runtime.target !== volume.target
+          : runtime !== undefined || descriptor.kind !== 'persistent-path' || descriptor.ownerId !== sourceOwner ||
+            descriptor.workerId !== owner.id || descriptor.groupId !== undefined))
         throw new Error('Administrative selected data is missing or mismatched');
       entries.push({ record: structuredClone(volume), descriptor }); consumed.add(descriptor.name);
     }
     if (native && !isDeepStrictEqual([...(record.nativeRuntime!.selectedVolumeIds ?? [])].sort(), selected.filter(v => v.attached).map(v => v.id).sort()))
       throw new Error('Administrative selected references differ from staged storage');
-    const layout = entries.map(item => ({ ...item.record, operation: undefined }));
+    const layout = native ? entries.map(item => ({ ...item.record, operation: undefined }))
+      : legacyLayout.map(volume => ({ ...volume, userId: owner.userId }));
     incusManagedRestoreDevices({ id: owner.id, userId: owner.userId }, '', layout.filter(v => v.attached), layout.filter(v => !v.attached));
     const source = core.workspace.runtime && 'source' in core.workspace.runtime ? core.workspace.runtime.source : undefined;
     if (core.agents?.runtime && 'source' in core.agents.runtime && !isDeepStrictEqual(source, core.agents.runtime.source))
@@ -135,7 +144,7 @@ export function planInstanceAdministrativeRestore(manifestValue: unknown, record
       legacySourceWrapper: !native, source });
   }
   if (manifest.volumes.some(volume => (volume.kind === 'admin-workspace' || volume.kind === 'admin-agent-data' ||
-      volume.runtime && 'administrative' in volume.runtime) && !consumed.has(volume.name)))
+      volume.runtime && 'administrative' in volume.runtime || volume.kind === 'persistent-path' && volume.workerId && ids.has(volume.workerId)) && !consumed.has(volume.name)))
     throw new Error('Administrative descriptor has no unique dedicated trusted record');
   return result;
 }
@@ -214,7 +223,7 @@ export function freshInstanceAdministrativeRestore(group: InstanceAdministrative
   const owner = administrativeRuntimeOwner(group.record), stamp = new Date().toISOString();
   return { nonce: randomUUID(), managed: group.managed.map(({ record }) => {
     const id = randomUUID();
-    return { ...structuredClone(record), id, userId: owner.userId, workerId: owner.id, dockerName: 'agentor-persist-' + id,
+    return { ...structuredClone(record), id, userId: owner.userId, workerId: owner.id, dockerName: 'agentor-persist-' + id, purpose: 'persistent-path' as const, storageRuntimeKind: 'incus-vm' as const,
       operation: undefined, seeded: false, state: 'pending' as const, createdAt: stamp, updatedAt: stamp };
   }) };
 }
@@ -264,7 +273,8 @@ export async function applyInstanceAdministrativeRestore(input: { config: Config
   receipt.unsettled = true;
   await (input.restore ?? restoreAdministrativeArchives)(config, client, { ...record, nativeRuntime: { ...native, pending: undefined } }, {
     workspace: payload(group.core.workspace)!, agents: payload(group.core.agents), legacySourceWrapper: group.legacySourceWrapper || undefined,
-    managed: fresh.managed.map((record, i) => ({ record, archivePath: payload(group.managed[i]!.descriptor)! })) }, validate);
+    managed: fresh.managed.map((record, i) => ({ record, archivePath: payload(group.managed[i]!.descriptor)!,
+      legacySourceWrapper: group.legacySourceWrapper || undefined })) }, validate);
   receipt.unsettled = false;
   for (const record of fresh.managed) await managed.save({ ...record, seeded: true, state: record.attached ? 'ready' : 'detached' });
   receipt.managed = durable(managed.forWorker(owner.userId, owner.id));

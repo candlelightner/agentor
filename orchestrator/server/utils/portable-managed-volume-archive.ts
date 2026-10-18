@@ -89,12 +89,12 @@ export async function validateIncusCanonicalRestoreArchive(
 /** Historical instance-volume wrapper only. GNU receives unchanged PAX bytes;
  * the trusted administrative writer transforms member/hardlink names only. */
 export function validateIncusLegacyAdministrativeRestoreArchive(archivePath: string,
-  limits: { maxEntries?: number; maxExpandedBytes?: number; signal?: AbortSignal } = {}) {
-  return validateCanonicalRootArchive(archivePath, 'source/', limits);
+  limits: { maxEntries?: number; maxExpandedBytes?: number; signal?: AbortSignal } = {}, managedTarget?: string) {
+  return validateCanonicalRootArchive(archivePath, 'source/', limits, managedTarget);
 }
 
 async function validateCanonicalRootArchive(archivePath: string, root: string,
-  limits: { maxEntries?: number; maxExpandedBytes?: number; signal?: AbortSignal }) {
+  limits: { maxEntries?: number; maxExpandedBytes?: number; signal?: AbortSignal }, managedTarget?: string) {
   throwIfAborted(limits.signal);
   const scan = await scanRawTar(archivePath, {
     maxEntries: Math.min(limits.maxEntries ?? MAX_PORTABLE_MANAGED_VOLUME_ARCHIVE_ENTRIES,
@@ -105,7 +105,8 @@ async function validateCanonicalRootArchive(archivePath: string, root: string,
     requirePosixUstar: true,
     signal: limits.signal,
   });
-  validateNativeRootEntries(scan.entries, root, limits.signal);
+  if (managedTarget !== undefined) validateInnerEntries(scan.entries, managedTarget, root);
+  else validateNativeRootEntries(scan.entries, root, limits.signal);
   return { entries: scan.entries.length, expandedBytes: scan.expandedBytes };
 }
 
@@ -619,27 +620,27 @@ async function scanRawTar(
   }
 }
 
-function validateInnerEntries(entries: RawTarEntry[], target?: string): void {
+function validateInnerEntries(entries: RawTarEntry[], target?: string, root = PORTABLE_MANAGED_VOLUME_ROOT): void {
   const paths = new Map<string, RawTarEntry["type"]>();
   const regularFiles = new Set<string>();
   let rootSeen = false, kiloSeen = false;
   for (const entry of entries) {
-    const name = canonicalInnerName(entry.name, entry.type);
+    const name = canonicalInnerName(entry.name, entry.type, root);
     const bareName = stripDirectorySlash(name);
     if (paths.has(bareName)) throw invalidArchive("archive contains a duplicate or type-conflicting path");
     paths.set(bareName, entry.type);
-    if (name === PORTABLE_MANAGED_VOLUME_ROOT) {
+    if (name === root) {
       if (entry.type !== "directory") throw invalidArchive("volume root must be a directory");
       rootSeen = true;
     }
-    if (target === MANAGED_KILO_PARENT && bareName === 'volume/kilo') {
+    if (target === MANAGED_KILO_PARENT && bareName === stripDirectorySlash(root) + '/kilo') {
       if (entry.type !== 'symlink' || entry.linkName !== MANAGED_KILO_LINK)
         throw invalidArchive('managed XDG parent requires the exact canonical Kilo symlink');
       kiloSeen = true;
     } else if (entry.type === "symlink") {
-      validateSymlink(name, entry.linkName!, target);
+      validateSymlink(name, entry.linkName!, target, root);
     } else if (entry.type === "hardlink") {
-      const target = canonicalLinkTarget(entry.linkName!);
+      const target = canonicalLinkTarget(entry.linkName!, root);
       if (!regularFiles.has(target))
         throw invalidArchive("hardlink must target an earlier regular file");
     } else if (entry.type === "file") {
@@ -683,7 +684,7 @@ function canonicalInnerName(name: string, type: RawTarEntry["type"], root = PORT
   return canonical;
 }
 
-function validateSymlink(name: string, linkTarget: string, mountTarget?: string): void {
+function validateSymlink(name: string, linkTarget: string, mountTarget?: string, root = PORTABLE_MANAGED_VOLUME_ROOT): void {
   if (!linkTarget || linkTarget.includes("\0") || linkTarget.includes("\\") ||
       Buffer.byteLength(linkTarget) > MAX_PORTABLE_TAR_PATH_BYTES)
     throw invalidArchive("archive contains an unsafe symlink");
@@ -694,7 +695,7 @@ function validateSymlink(name: string, linkTarget: string, mountTarget?: string)
     return;
   }
   const resolved = posix.normalize(posix.join(posix.dirname(stripDirectorySlash(name)), linkTarget));
-  if (resolved !== "volume" && !resolved.startsWith("volume/"))
+  if (resolved !== stripDirectorySlash(root) && !resolved.startsWith(root))
     throw invalidArchive("archive symlink escapes volume/");
 }
 

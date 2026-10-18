@@ -9,6 +9,7 @@ import { administrativeNativeOverlaySha256 } from '../../orchestrator/server/uti
 import { validateInstanceManifest, instanceVolumeArchiveName } from '../../orchestrator/server/utils/instance-backup-bundle';
 import { planInstanceAdministrativeRestore, freshInstanceAdministrativeRestore, readInstanceAdministrativeRecords,
   preflightInstanceAdministrativeRestore } from '../../orchestrator/server/utils/instance-restore-administrative';
+import { persistentPathVolumeName } from '../../orchestrator/server/utils/persistent-backup-paths';
 import { IncusError } from '../../orchestrator/server/utils/incus-client';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import { WorkerGroupStore } from '../../orchestrator/server/utils/worker-group-store';
@@ -47,6 +48,8 @@ function selected(record: AdministrativeWorkspaceRecord, attached = true): Store
 }
 function managedDescriptor(record: AdministrativeWorkspaceRecord, volume: StoredManagedVolume): InstanceBackupVolumeManifest {
   const owner = administrativeRuntimeOwner(record);
+  if (record.runtimeKind !== 'incus-vm') return { name: volume.dockerName, kind: 'persistent-path', ownerId: volume.userId, workerId: record.id,
+    archive: instanceVolumeArchiveName(volume.dockerName), sha256: 'd'.repeat(64), size: 100 };
   return { name: volume.dockerName, kind: 'persistent-path', ownerId: owner.userId, workerId: owner.id,
     ...(owner.groupId ? { groupId: owner.groupId } : {}), archive: instanceVolumeArchiveName(volume.dockerName), sha256: 'd'.repeat(64), size: 100,
     runtime: { kind: 'incus-vm', role: 'managed', target: volume.target, managedVolumeId: volume.id,
@@ -148,8 +151,16 @@ async function applyFixture(legacy: boolean, options: { group?: boolean; selecte
   let groupId: string | undefined;
   if (options.group) { const created = await groups.create('account-owner', 'Administrative restore fixture'); groupId = created.id; (r as any).groupId = groupId; }
   const managed = new ManagedVolumeStore(root);
-  if (options.selected) { await managed.save(selected(r)); await managed.save(selected(r, false)); }
-  const selectedRecords = managed.forWorker(administrativeRuntimeOwner(r).userId, r.id);
+  if (options.selected) {
+    for (const attached of [true, false]) {
+      const volume = selected(r, attached);
+      if (legacy) Object.assign(volume, { userId: r.ownerId!, storageRuntimeKind: 'legacy-docker',
+        ...(!attached ? { purpose: 'legacy-backup-path', dockerName: persistentPathVolumeName(r.id, volume.target) } : {}) });
+      if (legacy && !attached) delete volume.storageRuntimeKind; // Historical adoptLegacy omitted the Docker selector.
+      await managed.save(volume);
+    }
+  }
+  const selectedRecords = managed.forWorker(legacy ? r.ownerId! : administrativeRuntimeOwner(r).userId, r.id);
   if (r.nativeRuntime) r.nativeRuntime.selectedVolumeIds = selectedRecords.filter(v => v.attached).map(v => v.id);
   if (groupId) await groups.update('account-owner', groupId, { adminWorkspace: r });
   else await writeFile(join(root, 'admin', 'workspace.v1.json'), JSON.stringify(r));
@@ -225,8 +236,8 @@ test('known settled rollback deletes only exact acknowledged fresh admin storage
 });
 
 import { IncusAdminWorkspaceStorage } from '../../orchestrator/server/utils/incus-admin-workspace-storage';
-for (const group of [false,true]) test(`controlled ${group ? 'group' : 'global'} apply restores fresh selected IDs and preserves detached data outside active references`, async () => {
-  const f = await applyFixture(false, { group, selected: true }); try {
+for (const group of [false,true]) for (const legacy of [false,true]) test(`controlled ${group ? 'group' : 'global'} ${legacy ? 'historical' : 'native'} apply restores fresh selected IDs and preserves detached data outside active references`, async () => {
+  const f = await applyFixture(legacy, { group, selected: true }); try {
     await f.run(); expect(f.volumes.size).toBe(4);
     await completeInstanceAdministrativeRestore(f.config, f.receipt);
     const r = (await readInstanceAdministrativeRecords(f.root))[0]!, owner = administrativeRuntimeOwner(r);
@@ -241,4 +252,21 @@ for (const group of [false,true]) test(`controlled ${group ? 'group' : 'global'}
     expect(sources).not.toContain(selected.find(v => !v.attached)!.dockerName);
     expect(r.status).toBe('stopped'); expect(r.nativeRuntime!.incarnation).toBeUndefined();
   } finally { await f.cleanup(); }
+});
+
+
+for (const group of [false,true]) test(`historical ${group ? 'group' : 'global'} selected roles require exact old owner, records and known legacy naming`, () => {
+  const r = record(group,false), volume = { ...selected(r), userId: r.ownerId!, storageRuntimeKind: 'legacy-docker' as const };
+  const descriptor = managedDescriptor(r, volume), m = manifest([core(r,'workspace'),core(r,'agents'),descriptor],1);
+  expect(planInstanceAdministrativeRestore(m,[r],[volume])[0]!.managed[0]!.record).toEqual(volume);
+  for (const broken of [{...volume,userId:'foreign'}, {...volume,dockerName:'agentor-persist-foreign'}, {...volume,liveContainerId:'foreign'},
+      {...volume,operation:{id:randomUUID(),mode:'deferred',stage:'queued'}}, {...volume,storageRuntimeKind:'incus-vm'}])
+    expect(() => planInstanceAdministrativeRestore(m,[r],[broken as any])).toThrow();
+  for (const changed of [{...descriptor,ownerId:'foreign'}, {...descriptor,workerId:randomUUID()}, {...descriptor,groupId:'invented'}])
+    expect(() => planInstanceAdministrativeRestore(manifest([core(r,'workspace'),core(r,'agents'),changed],1),[r],[volume])).toThrow();
+  expect(() => planInstanceAdministrativeRestore(m,[r],[])).toThrow('no unique');
+  expect(() => planInstanceAdministrativeRestore(m,[r],[volume,volume])).toThrow();
+  expect(() => planInstanceAdministrativeRestore(m,[r],[{...volume,target:'/etc'}])).toThrow();
+  if(!group) expect(() => planInstanceAdministrativeRestore(m,[{...r,ownerId:undefined}],[volume])).toThrow('recorded owner');
+  expect(() => planInstanceAdministrativeRestore({...m,volumes:m.volumes.slice(0,2)},[r],[volume])).toThrow('missing');
 });

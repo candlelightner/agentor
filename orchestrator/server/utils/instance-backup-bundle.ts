@@ -368,13 +368,13 @@ export async function prepareInstanceNativeVolumeArchive(
 }
 
 export function prepareInstanceLegacyAdministrativeVolumeArchive(payloadPath: string, volume: InstanceBackupVolumeManifest,
-  privateWorkDir: string, options: { signal?: AbortSignal; maxRawBytes?: number } = {}) {
-  return prepareInstanceRoleArchive(payloadPath, volume, privateWorkDir, options, true);
+  privateWorkDir: string, options: { signal?: AbortSignal; maxRawBytes?: number } = {}, managedTarget?: string) {
+  return prepareInstanceRoleArchive(payloadPath, volume, privateWorkDir, options, true, managedTarget);
 }
 
 async function prepareInstanceRoleArchive(payloadPath: string, volume: InstanceBackupVolumeManifest, privateWorkDir: string,
-  options: { signal?: AbortSignal; maxRawBytes?: number }, legacyAdministrative: boolean) {
-  if (legacyAdministrative ? !validVolume(volume, 1) || volume.runtime || !['admin-workspace', 'admin-agent-data'].includes(volume.kind)
+  options: { signal?: AbortSignal; maxRawBytes?: number }, legacyAdministrative: boolean, managedTarget?: string) {
+  if (legacyAdministrative ? !validVolume(volume, 1) || volume.runtime || !(managedTarget !== undefined ? volume.kind === 'persistent-path' : ['admin-workspace', 'admin-agent-data'].includes(volume.kind))
       : !validVolume(volume, 2) || !volume.runtime) throw new Error('Invalid native instance volume descriptor');
   const requested = options.maxRawBytes ?? MAX_PORTABLE_MANAGED_VOLUME_PAYLOAD_BYTES;
   if (!Number.isSafeInteger(requested) || requested <= 0)
@@ -401,7 +401,7 @@ async function prepareInstanceRoleArchive(payloadPath: string, volume: InstanceB
     } });
     await pipeline(input.createReadStream(), createGunzip(), bounded, output.createWriteStream(), { signal: options.signal });
     const runtime = volume.runtime!, limits = { maxExpandedBytes: maxRawBytes, signal: options.signal };
-    const summary = legacyAdministrative ? await validateIncusLegacyAdministrativeRestoreArchive(archivePath, limits)
+    const summary = legacyAdministrative ? await validateIncusLegacyAdministrativeRestoreArchive(archivePath, limits, managedTarget)
       : runtime.role === 'managed'
       ? await validatePortableManagedVolumeArchive(archivePath, { ...limits, target: runtime.target, requirePosixUstar: true })
       : runtime.role === 'docker' ? await validateIncusDockerRestoreArchive(archivePath, limits)

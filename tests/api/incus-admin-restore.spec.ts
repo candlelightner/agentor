@@ -5,9 +5,9 @@ import { mkdtemp, mkdir, readFile, rm, stat, readlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { INCUS_CANONICAL_RESTORE_SCRIPT } from '../../orchestrator/server/utils/incus-canonical-restore';
-import { validateIncusLegacyAdministrativeRestoreArchive, validateIncusCanonicalRestoreArchive } from '../../orchestrator/server/utils/portable-managed-volume-archive';
+import { validateIncusLegacyAdministrativeRestoreArchive, validateIncusCanonicalRestoreArchive, validatePortableManagedVolumeArchive } from '../../orchestrator/server/utils/portable-managed-volume-archive';
 
-for (const role of ['workspace', 'agents'] as const) test(`legacy ${role} inverse preserves original GNU PAX bytes, root metadata, binary xattrs, hardlinks and symlink text`, async () => {
+for (const role of ['workspace', 'agents', 'managed'] as const) test(`legacy ${role} inverse preserves original GNU PAX bytes, root metadata, binary xattrs, hardlinks and symlink text`, async () => {
   const root = await mkdtemp(join(tmpdir(), 'agentor-admin-legacy-inverse-'));
   try {
     const source = join(root, 'capture'), target = join(root, 'restore'), archive = join(root, 'source.tar');
@@ -23,20 +23,25 @@ os.chown(root+'/source',1063,1064);os.utime(root+'/source',(1234567890,123456789
 `, source]);
     execFileSync('tar', ['--format=pax', '--numeric-owner', '--xattrs', '--xattrs-include=*', '--acls', '-C', source, '-cf', archive, 'source']);
     const raw = await readFile(archive), digest = createHash('sha256').update(raw).digest('hex');
-    await expect(validateIncusLegacyAdministrativeRestoreArchive(archive)).resolves.toMatchObject({ entries: 4 });
-    await expect(validateIncusCanonicalRestoreArchive(archive, role)).rejects.toThrow('outside');
-    const roots = { workspace: join(target, 'workspace'), agents: join(target, '.agent-data') };
-    let script = INCUS_CANONICAL_RESTORE_SCRIPT.replace('ROOTS={"workspace":"/restore/workspace","agents":"/restore/.agent-data"}', 'ROOTS=' + JSON.stringify(roots));
+    await expect(validateIncusLegacyAdministrativeRestoreArchive(archive, {}, role === 'managed' ? '/srv/legacy' : undefined)).resolves.toMatchObject({ entries: 4 });
+    if (role === 'managed') await expect(validatePortableManagedVolumeArchive(archive, { target: '/srv/legacy', requirePosixUstar: true })).rejects.toThrow('outside');
+    else await expect(validateIncusCanonicalRestoreArchive(archive, role)).rejects.toThrow('outside');
+    const managedId = '11111111-2222-3333-4444-555555555555';
+    const roots = { workspace: join(target, 'workspace'), agents: join(target, '.agent-data'), managed: join(target, 'managed', managedId, 'volume') };
+    if (role === 'managed') await mkdir(roots.managed, { recursive: true });
+    let script = INCUS_CANONICAL_RESTORE_SCRIPT.replace('ROOTS={"workspace":"/restore/workspace","agents":"/restore/.agent-data"}', 'ROOTS=' + JSON.stringify({ workspace: roots.workspace, agents: roots.agents }));
+    script = script.replace('ROOTS[role]="/restore/managed/"+managed.group(1)+"/volume"', 'ROOTS[role]=' + JSON.stringify(roots.managed));
+    script = script.replace('parents=("/restore/managed",os.path.dirname(root)) if managed else ()', 'parents=tuple(' + JSON.stringify([join(target,'managed'),join(target,'managed',managedId)]) + ') if managed else ()');
     script = script.replace('("/restore",)+parents', '(' + JSON.stringify(target) + ',)+parents');
     const fixture = String.raw`
 import builtins,io,os,subprocess,types
 real_open=builtins.open
-mounts=` + JSON.stringify(Object.values(roots).map(path => `1 0 0:1 / ${path} rw - ext4 fixture rw\n`).join('')) + String.raw`
+mounts=` + JSON.stringify((role === 'managed' ? Object.values(roots) : [roots.workspace, roots.agents]).map(path => `1 0 0:1 / ${path} rw - ext4 fixture rw\n`).join('')) + String.raw`
 builtins.open=lambda path,*a,**k:io.BytesIO(mounts.encode()) if path=='/proc/self/mountinfo' else real_open(path,*a,**k)
 os.path.lexists=lambda path:False
 subprocess.run=lambda *a,**k:types.SimpleNamespace(returncode=3)
 `;
-    execFileSync('python3', ['-c', fixture + script, role, 'legacy-source'], { input: raw });
+    execFileSync('python3', ['-c', fixture + script, role === 'managed' ? 'managed:' + managedId : role, 'legacy-source'], { input: raw });
     const destination = roots[role], info = await stat(destination), file = await stat(join(destination, 'data'));
     expect(info.uid).toBe(1063); expect(info.gid).toBe(1064); expect(info.mode & 0o777).toBe(0o751); expect(info.mtimeMs).toBe(1234567890000);
     expect(file.uid).toBe(1061); expect(file.gid).toBe(1062); expect(file.mode & 0o777).toBe(0o640);
@@ -124,4 +129,25 @@ test('failed administrative extraction cannot publish initialized storage or all
     expect(f.record.nativeRuntime?.storageInitialized).toBeUndefined(); expect(f.record.nativeRuntime?.incarnation).toBeUndefined();
     expect(f.calls.filter(call => call.command)).toHaveLength(1);
   } finally { await f.cleanup(); }
+});
+
+
+test('legacy selected source-root validation keeps target-contained links and Kilo-parent admission strict', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'admin-legacy-selected-codec-'));
+  try {
+    const source = join(root,'source'), archive = join(root,'source.tar'); await mkdir(source);
+    for (const [link, allowed] of [['/foreign/data',false],['../../escape',false],['/srv/legacy/data',true]] as const) {
+      await rm(join(source,'link'),{force:true});
+      execFileSync('python3',['-c','import os,sys;os.symlink(sys.argv[2],sys.argv[1])',join(source,'link'),link]);
+      execFileSync('tar',['--format=pax','-C',root,'-cf',archive,'source']);
+      const check=validateIncusLegacyAdministrativeRestoreArchive(archive,{},'/srv/legacy');
+      if(allowed) await expect(check).resolves.toMatchObject({entries:2});else await expect(check).rejects.toThrow('symlink');
+    }
+    await rm(join(source,'link'));
+    execFileSync('tar',['--format=pax','-C',root,'-cf',archive,'source']);
+    await expect(validateIncusLegacyAdministrativeRestoreArchive(archive,{},'/home/agent/.local/share')).rejects.toThrow('canonical Kilo');
+    execFileSync('python3',['-c',"import os,sys;os.symlink('/home/agent/.agent-data/.kilo/shared-data',sys.argv[1])",join(source,'kilo')]);
+    execFileSync('tar',['--format=pax','-C',root,'-cf',archive,'source']);
+    await expect(validateIncusLegacyAdministrativeRestoreArchive(archive,{},'/home/agent/.local/share')).resolves.toMatchObject({entries:2});
+  } finally { await rm(root,{recursive:true,force:true}); }
 });

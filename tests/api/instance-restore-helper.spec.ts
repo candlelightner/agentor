@@ -863,9 +863,10 @@ import { IncusError } from '../../orchestrator/server/utils/incus-client';
 import { WorkerGroupStore } from '../../orchestrator/server/utils/worker-group-store';
 import { adminNativeInstanceName } from '../../orchestrator/server/utils/admin-native-identity';
 import { administrativeNativeOverlaySha256 } from '../../orchestrator/server/utils/incus-admin-overlay';
+import { persistentPathVolumeName } from '../../orchestrator/server/utils/persistent-backup-paths';
 import { administrativeWorkspaceResourceNames } from '../../orchestrator/server/utils/admin-workspace-resources';
 
-for (const group of [false,true]) for (const legacy of [false,true]) test(`controlled helper restores ${group ? 'group' : 'global'} ${legacy ? 'historical' : 'tagged native'} admin bytes into fresh native authority and preserves ordinary shadows`, async () => {
+for (const group of [false,true]) for (const legacy of [false,true]) for (const selected of legacy ? [false,true] : [false]) test(`controlled helper restores ${group ? 'group' : 'global'} ${legacy ? 'historical' : 'tagged native'} admin bytes${selected ? ' and selected history' : ''} into fresh native authority and preserves ordinary shadows`, async () => {
   const root = await mkdtemp(join(tmpdir(), 'admin-native-controlled-helper-')), savedKey = process.env.WORKER_CONFIG_ENCRYPTION_KEY;
   delete process.env.WORKER_CONFIG_ENCRYPTION_KEY;
   try {
@@ -887,6 +888,17 @@ for (const group of [false,true]) for (const legacy of [false,true]) test(`contr
     const workers = new nativeAdapter.WorkerStore(sourceDir); await workers.upsert({id,userId:'source-owner',displayName:'Historical duplicate',status:'archived',
       importedImage:'sha256:'+'d'.repeat(64),createdAt:stamp,updatedAt:stamp});
     const shadow=JSON.parse(JSON.stringify(workers.get('source-owner',id)));
+    const sourceSelected: any[] = [];
+    if (selected) {
+      const managed = new nativeAdapter.ManagedVolumeStore(sourceDir);
+      for (const attached of [true,false]) {
+        const volumeId=randomUUID(), target='/srv/' + volumeId;
+        const volume={id:volumeId,userId:'source-owner',workerId:id,target,name:'Historical selected',purpose:attached?'persistent-path':'legacy-backup-path',
+          ...(attached?{storageRuntimeKind:'legacy-docker'}:{}),attached,seeded:true,state:attached?'ready':'detached',createdAt:stamp,updatedAt:stamp,
+          dockerName:attached?'agentor-persist-'+volumeId:persistentPathVolumeName(id,target)};
+        await managed.save(volume as any);sourceSelected.push(volume);
+      }
+    }
     const options={includeWorkers:true,includeAgentData:true,includeDockerVolumes:true,includeLogs:false,includeLocalBackups:false};
     const data=await createInstanceDataArchive({dataDir:sourceDir,authSnapshotPath:join(sourceDir,'auth.db'),output:f.plan.dataArchive,options});
     const names=administrativeWorkspaceResourceNames(record), descriptors:any[]=[];
@@ -898,6 +910,11 @@ for (const group of [false,true]) for (const legacy of [false,true]) test(`contr
         kind:role==='workspace'?'admin-workspace':'admin-agent-data',...(group?{ownerId:'source-owner',groupId:record.groupId}:{}),
         ...(!legacy?{ownerId:group?'source-owner':'__agentor_admin__',workerId:id,runtime:{kind:'incus-vm',role,source,
           administrative:{kind:record.kind,workspaceId:id,...(group?{groupId:record.groupId}:{})}}}:{})});
+    }
+    for(const volume of sourceSelected){
+      const archive=instanceVolumeArchiveName(volume.dockerName),path=join(f.unpacked,nativeAdapter.instanceBundleFilename(archive));
+      await writeTarGzip(path,[{name:'source',type:'directory'},{name:'source/bytes',body:'selected-known-'+volume.id}]);
+      descriptors.push({name:volume.dockerName,archive,sha256:await sha256File(path),size:100,kind:'persistent-path',ownerId:volume.userId,workerId:id});
     }
     const manifest=validateInstanceManifest({kind:'agentor-instance-backup',formatVersion:legacy?1:2,backupId:'admin-helper-fixture',sourceInstallationId:installation,
       createdByUserId:f.plan.restoredOwnerId,createdAt:stamp,agentorVersion:'test',storage:{mode:'volume',containerPrefix:'agentor-worker'},options,
@@ -927,7 +944,16 @@ for (const group of [false,true]) for (const legacy of [false,true]) test(`contr
     expect(restored.runtimeKind).toBe('incus-vm');expect(restored.status).toBe('stopped');expect(restored.nativeRuntime!.storageInitialized).toBe(true);
     expect(restored.nativeRuntime!.incarnation).toBeUndefined();expect(restored.nativeRuntime!.pending).toBeUndefined();expect(restored.nativeRuntime!.nonce).not.toBe(record.nativeRuntime?.nonce);
     const restoredWorkers=new nativeAdapter.WorkerStore(f.dataDir);await restoredWorkers.loadUser('source-owner');expect(restoredWorkers.get('source-owner',id)).toEqual(shadow);
-    expect(volumes.size).toBe(2);expect(Buffer.concat(inputs).includes(Buffer.from('admin-fixture-known-workspace'))).toBe(true);
+    expect(volumes.size).toBe(selected?4:2);
+    if(selected){
+      const managed=new nativeAdapter.ManagedVolumeStore(f.dataDir);await managed.init();
+      const owner=group?'source-owner':'__agentor_admin__', restoredSelected=managed.forWorker(owner,id);
+      expect(restoredSelected).toHaveLength(2);expect(restoredSelected.every(v=>v.seeded&&v.storageRuntimeKind==='incus-vm'&&v.purpose==='persistent-path')).toBe(true);
+      expect(restoredSelected.every(v=>!sourceSelected.some(old=>old.id===v.id))).toBe(true);
+      expect(restored.nativeRuntime!.selectedVolumeIds).toEqual(restoredSelected.filter(v=>v.attached).map(v=>v.id));
+      expect(Buffer.concat(inputs).includes(Buffer.from('selected-known-'))).toBe(true);
+    }
+    expect(Buffer.concat(inputs).includes(Buffer.from('admin-fixture-known-workspace'))).toBe(true);
     await expect(readFile(join(f.dataDir,'worker-config.key'))).rejects.toMatchObject({code:'ENOENT'});
   } finally {if(savedKey===undefined)delete process.env.WORKER_CONFIG_ENCRYPTION_KEY;else process.env.WORKER_CONFIG_ENCRYPTION_KEY=savedKey;await rm(root,{recursive:true,force:true});}
 });

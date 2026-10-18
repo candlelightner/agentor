@@ -17,7 +17,7 @@ export interface AdministrativeRestorePayloads {
   agents?: string;
   /** Internal historical instance codec; never a request-selected tar transform. */
   legacySourceWrapper?: true;
-  managed: Array<{ record: StoredManagedVolume; archivePath: string }>;
+  managed: Array<{ record: StoredManagedVolume; archivePath: string; legacySourceWrapper?: true }>;
 }
 
 /** Shared inverse for the controlled instance helper and explicit legacy mover.
@@ -60,7 +60,9 @@ export async function restoreAdministrativeArchives(config: Config, client: Incu
         !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(v.id) || v.dockerName !== 'agentor-persist-' + v.id ||
         v.seeded || v.state !== 'pending' || v.operation || sources.managed[v.id])
       throw new Error('Administrative selected restore authority is invalid');
-    await validatePortableManagedVolumeArchive(item.archivePath, { target: v.target, requirePosixUstar: true });
+    if (item.legacySourceWrapper !== undefined && item.legacySourceWrapper !== true) throw new Error('Invalid administrative selected archive codec');
+    if (item.legacySourceWrapper) await validateIncusLegacyAdministrativeRestoreArchive(item.archivePath, {}, v.target);
+    else await validatePortableManagedVolumeArchive(item.archivePath, { target: v.target, requirePosixUstar: true });
     await capture(v.dockerName, { 'user.agentor.installation': native.installationId, 'user.agentor.owner': owner.userId,
       'user.agentor.id': owner.id, 'user.agentor.volume-id': v.id, 'user.agentor.target': v.target });
     sources.managed[v.id] = v.dockerName;
@@ -85,10 +87,12 @@ export async function restoreAdministrativeArchives(config: Config, client: Incu
   await helper.withGuest(administrativeArchiveHelperOwner(record), { administrativeRestore: sources }, assertSource, signal,
     async (name, assertHelper) => {
       for (const item of [{ role: 'workspace', archivePath: payloads.workspace }, { role: 'agents', archivePath: payloads.agents },
-        ...payloads.managed.map(item => ({ role: 'managed:' + item.record.id, archivePath: item.archivePath }))]) {
+        ...payloads.managed.map(item => ({ role: 'managed:' + item.record.id, archivePath: item.archivePath, legacySourceWrapper: item.legacySourceWrapper }))]) {
         await assertHelper(); await assertSource(name);
+        const legacy = item.role.startsWith('managed:') ? 'legacySourceWrapper' in item && item.legacySourceWrapper : payloads.legacySourceWrapper;
+        const mode = item.archivePath ? legacy ? ['legacy-source'] : [] : ['empty'];
         const session = await client.execStream(name, ['/usr/bin/python3', '-c', INCUS_CANONICAL_RESTORE_SCRIPT, item.role,
-          ...(item.archivePath ? payloads.legacySourceWrapper && !item.role.startsWith('managed:') ? ['legacy-source'] : [] : ['empty'])], { command: [], user: 0, group: 0, cwd: '/', signal, timeoutMs: 60 * 60_000 });
+          ...mode], { command: [], user: 0, group: 0, cwd: '/', signal, timeoutMs: 60 * 60_000 });
         session.stdout.resume(); session.stderr.resume();
         try {
           const result = session.result.then(code => { if (code !== 0) throw new Error('Administrative canonical extraction failed'); });
