@@ -346,12 +346,15 @@ export class ManagedVolumeManager {
       try { validatePersistenceTarget(target); }
       catch (error) { if ((error as { statusCode?: number }).statusCode === 400) continue; throw error; }
       const actual = await this.incusRuntime.inspect(worker.userId, worker.id, worker.containerId);
+      const disks = Object.values(actual.expanded_devices ?? actual.devices);
+      // Lifecycle preparation already retains the canonical workspace root.
+      // Other paths still need the guest's no-symlink-ancestor classification.
+      if (!stage && target === '/workspace' && disks.some(device => device.type === 'disk' && device.path === target)) continue;
       // Saving new selections requires present readable source. Lifecycle
       // preparation may encounter a backup-only file removed since selection;
       // there is no directory data at that path to preserve.
       if (!await this.incusRuntime.isSelectionDirectory(worker.userId, worker.id, worker.containerId, target, !stage)) continue;
-      if (Object.values(actual.expanded_devices ?? actual.devices).some(device =>
-        device.type === 'disk' && device.path && device.path !== '/' &&
+      if (disks.some(device => device.type === 'disk' && device.path && device.path !== '/' &&
         (device.path === target || isParentPath(device.path, target)))) continue;
       await this.incusRuntime.validateTarget(worker.userId, worker.id, worker.containerId, target);
       const v = await this.store.create(worker.userId, worker.id, target, undefined, 'incus-vm');

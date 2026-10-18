@@ -571,6 +571,40 @@ test('Incus selection classification keeps files, root, protected and already-ba
   });
 });
 
+test('stopped retained VM canonical selections need no guest probe while other paths still require classification', async () => {
+  await selectionFixture(async (manager, worker, calls, state) => {
+    const managed = await manager.store.create(worker.userId, worker.id, '/opt/imported-parent', undefined, 'incus-vm');
+    await manager.store.save({ ...managed, target: '/home/agent/.local/share', seeded: true, state: 'ready' });
+    const before = structuredClone(manager.store.forWorker(worker.userId, worker.id));
+    state.devices = {
+      root: { type: 'disk', path: '/', pool: 'default' },
+      workspace: { type: 'disk', path: '/workspace', pool: 'default', source: 'workspace' },
+      agents: { type: 'disk', path: '/home/agent/.agent-data', pool: 'default', source: 'agents' },
+      selected: { type: 'disk', path: '/home/agent/.local/share', pool: 'default', source: managed.dockerName },
+      extra: { type: 'disk', path: '/opt/existing', pool: 'default', source: 'existing' },
+    };
+    // The actual runtime refuses guest probes on stopped compute. Coverage
+    // must be decided before reaching that check, without booting anything.
+    const runtime = manager.incusRuntime;
+    (runtime as any).isSelectionDirectory = IncusManagedVolumeRuntime.prototype.isSelectionDirectory.bind({
+      inspect: async () => ({ status: 'Stopped' }),
+      worker: { client: { exec: async () => { throw new Error('Stopped guest must not execute'); } } },
+    });
+    await manager.adoptIncusSelections(worker, ['/workspace', '/home/agent/.agent-data', '/home/agent/.local/share']);
+    await expect(manager.adoptIncusSelections(worker, ['/workspace'], true)).rejects.toThrow('Start the retained VM');
+    expect(manager.store.forWorker(worker.userId, worker.id)).toEqual(before);
+    expect(calls).toEqual([]);
+    // Rootfs is not persistence coverage; an unbacked selection still fails
+    // before adopting metadata or throwing away its possible directory data.
+    for (const target of ['/opt/unrecorded', '/workspace/project', '/opt/existing', '/opt/existing/possible-symlink', '/home/agent/.local/share/FreeCAD']) {
+      await expect(manager.adoptIncusSelections(worker, [target])).rejects.toThrow('Start the retained VM');
+    }
+    delete state.devices.workspace;
+    await expect(manager.adoptIncusSelections(worker, ['/workspace'])).rejects.toThrow('Start the retained VM');
+    expect(manager.store.forWorker(worker.userId, worker.id)).toEqual(before);
+  });
+});
+
 test('durable live intent quarantines provisioning, recreation, snapshots and deletion even before startup recovery', async () => {
   await selectionFixture(async (manager, worker, calls) => {
     (manager.incusRuntime as any).recoverLive = async (v: any) => { assertIncusLiveResolved(v); };
