@@ -24,7 +24,8 @@ export class UpdateChecker {
   private pollInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: Config) {
-    this.docker = new Docker({ socketPath: '/var/run/docker.sock' });
+    // Match the private administrative network service's endpoint-MAC contract.
+    this.docker = new Docker({ socketPath: '/var/run/docker.sock', version: config.incusEnabled ? 'v1.54' : undefined });
     this.config = config;
     this.status = {
       orchestrator: null,
@@ -382,14 +383,15 @@ export class UpdateChecker {
       HostConfig: info.HostConfig,
     };
 
-    // Reconstruct network config
+    // Copy requested endpoint settings, not Docker's allocated endpoint/DNS IDs.
+    // Static IPs are allocated only when the replacement starts after the old peer exits.
     const networks = info.NetworkSettings?.Networks;
     if (networks && Object.keys(networks).length > 0) {
-      const endpointsConfig: Record<string, { Aliases?: string[] }> = {};
+      const endpointsConfig: Record<string, Docker.EndpointSettings & { GwPriority?: number }> = {};
       for (const [netName, netConfig] of Object.entries(networks)) {
-        endpointsConfig[netName] = {
-          Aliases: (netConfig as { Aliases?: string[] }).Aliases,
-        };
+        const { NetworkID, IPAMConfig, MacAddress, Aliases, Links, DriverOpts, GwPriority } =
+          netConfig as Docker.EndpointSettings & { GwPriority?: number };
+        endpointsConfig[netName] = { NetworkID, IPAMConfig, MacAddress, Aliases, Links, DriverOpts, GwPriority };
       }
       createOpts.NetworkingConfig = { EndpointsConfig: endpointsConfig };
     }
@@ -407,28 +409,32 @@ export class UpdateChecker {
     // We can't do this in-process because stopping our own container kills this process.
     const swapScript = [
       'const http = require("http");',
-      'function api(method, path) {',
+      'function api(method, path, allowNotModified = false) {',
       '  return new Promise((resolve, reject) => {',
-      '    const req = http.request({ socketPath: "/var/run/docker.sock", method, path }, (res) => {',
+      `    const req = http.request({ socketPath: "/var/run/docker.sock", method, path: ${JSON.stringify(this.config.incusEnabled ? '/v1.54' : '')} + path }, (res) => {`,
       '      let d = ""; res.on("data", c => d += c);',
-      '      res.on("end", () => resolve({ status: res.statusCode, data: d }));',
+      '      res.on("error", reject);',
+      '      res.on("end", () => {',
+      '        if ((res.statusCode >= 200 && res.statusCode < 300) || (allowNotModified && res.statusCode === 304)) resolve({ status: res.statusCode, data: d });',
+      '        else reject(new Error(`Docker update ${method} failed (HTTP ${res.statusCode})`));',
+      '      });',
       '    });',
       '    req.on("error", reject);',
+      '    req.setTimeout(90000, () => req.destroy(new Error("Docker update request timed out")));',
       '    req.end();',
       '  });',
       '}',
       '(async () => {',
       `  console.log("[swapper] stopping ${containerName}...");`,
-      `  await api("POST", "/containers/${containerName}/stop?t=30");`,
-      `  await api("POST", "/containers/${containerName}/wait");`,
+      `  await api("POST", "/containers/${info.Id}/stop?t=30", true);`,
+      `  await api("POST", "/containers/${info.Id}/wait");`,
       `  console.log("[swapper] removing old container...");`,
-      `  await api("DELETE", "/containers/${containerName}");`,
+      `  await api("DELETE", "/containers/${info.Id}");`,
       `  console.log("[swapper] renaming ${tempName} -> ${containerName}...");`,
       `  await api("POST", "/containers/${newContainer.id}/rename?name=${containerName}");`,
       `  console.log("[swapper] starting new orchestrator...");`,
-      `  const r = await api("POST", "/containers/${newContainer.id}/start");`,
-      '  if (r.status < 300) console.log("[swapper] orchestrator replaced successfully");',
-      '  else { console.error("[swapper] start failed:", r.status, r.data); process.exit(1); }',
+      `  await api("POST", "/containers/${newContainer.id}/start", true);`,
+      '  console.log("[swapper] orchestrator replaced successfully");',
       '})().catch(e => { console.error("[swapper] fatal:", e.message || e); process.exit(1); });',
     ].join('\n');
 

@@ -14,6 +14,18 @@ Automatic image update detection and per-image or bulk updates for production de
 2. Traefik: pull new image → recreate Traefik container (via `TraefikManager.forceRecreate()`) → TLS certs persist on named volume
 3. Orchestrator: pull new image → create replacement container with temp name (`-next`) → spawn a one-shot swapper container (`-swapper`, `AutoRemove: true`) that uses the Docker socket to stop→remove→rename→start the replacement → UI polls `/api/health` until server returns. The swapper is needed because stopping the orchestrator's own container kills the Node.js process, so the remaining steps (remove, create, start) can't run in-process.
 
+Orchestrator replacement retains each network's configured IPAM addresses, MAC,
+network ID, aliases, links, driver options and gateway priority. Docker allocates
+these endpoints only when the replacement starts, after the old container has
+stopped and been removed; private administrative peers therefore retain their
+required addresses without relaxing host-policy checks. Incus-enabled installs
+use [Docker API 1.54](https://docs.docker.com/reference/api/engine/version-history/#v154-api-changes) (Engine 29.3+) for updater reads and writes, matching the
+private administrative networking requirement. Unsupported daemons fail before
+replacement allocation. The swapper uses inspected container IDs, checks every
+Docker response, and uses a 90-second socket timeout for each request. This remains a
+stop/remove/start update: it does not roll back a replacement that fails to
+become healthy. Retain the previous image and configuration for operator recovery.
+
 **Per-image updates:** The apply endpoint accepts an optional `{ images: UpdatableImage[] }` body to pull only specific images. The `UpdatableImage` type (`'orchestrator' | 'worker' | 'traefik'`) is defined in `shared/types.ts`.
 
 **No version numbers** — only image digest hashes (sha256) are compared and displayed. Workers are NOT automatically restarted; they pick up the new image when next created or unarchived.

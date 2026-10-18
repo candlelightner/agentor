@@ -3,6 +3,7 @@
   "compilerOptions": { "noEmit": true, "rootDir": "..", "esModuleInterop": true,
     "lib": ["ESNext", "DOM", "DOM.Iterable"] },
   "include": [
+    "api/orchestrator-update-network.spec.ts",
     "api/admin-native-encrypted-dr-live.spec.ts",
     "api/private-admin-native-dr-fixture.spec.ts",
     "api/admin-native-proxy.spec.ts",
