@@ -347,6 +347,8 @@ export interface ImageUpdateInfo {
   remoteDigest: string;
   updateAvailable: boolean;
   lastChecked: string;
+  /** OCI may be current while the native bootstrap still needs Apply. */
+  nativeUpdateRequired?: boolean;
   error?: string;
 }
 
@@ -362,6 +364,8 @@ export interface UpdateStatus {
 export interface ApplyResult {
   orchestratorPulled: boolean;
   workerPulled: boolean;
+  /** Apply All prepares the worker under the new orchestrator package. */
+  workerDeferred?: boolean;
   traefikPulled: boolean;
   orchestratorRestarting: boolean;
   errors: string[];
@@ -506,6 +510,8 @@ export interface WorkerMetrics {
   blkReadBytesPerSec: number;
   blkWriteBytesPerSec: number;
   lastChecked: string;
+  /** OCI may be current while the native bootstrap still needs Apply. */
+  nativeUpdateRequired?: boolean;
   error?: string;
 }
 

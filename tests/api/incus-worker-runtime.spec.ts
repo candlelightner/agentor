@@ -2,7 +2,7 @@ import { MANAGED_KILO_PARENT, MANAGED_KILO_PARENT_CHECK } from '../../orchestrat
 import { HardwareDeviceStore } from "../../orchestrator/server/utils/hardware-device-store";
 import { test, expect } from "@playwright/test";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm, writeFile, readFile, symlink, link } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, readFile, symlink, link } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -11,6 +11,10 @@ import { IncusClient } from "../../orchestrator/server/utils/incus-client";
 import { ContainerManager } from "../../orchestrator/server/utils/container";
 import { WorkerStore } from "../../orchestrator/server/utils/worker-store";
 import { cleanupWorkerMappings, useWorkerGroupStore } from "../../orchestrator/server/utils/services";
+import { ImageCatalogCore } from '../../orchestrator/server/utils/image-catalog-core';
+import { resolveDefaultIncusImage } from '../../orchestrator/server/utils/incus-default-image';
+import { incusConversionRecipeId, readCanonicalIncusBootstrap } from '../../orchestrator/server/utils/incus-image-converter';
+import { snapshotIncusWorkerBackupRuntime } from '../../orchestrator/server/utils/worker-backup-runtime';
 import { IncusWorkerImageManager } from '../../orchestrator/server/utils/incus-worker-image-manager';
 import { zeroUserEnvVars } from "../../orchestrator/server/utils/user-env-store";
 import type { Config } from "../../orchestrator/server/utils/config";
@@ -337,6 +341,50 @@ test('explicit rebuild refreshes only the VM recipe for default and custom bases
   }
 });
 
+test('approved default A survives promotion to OCI B through actual rebuild allocation and captured-source restore', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'native-old-default-')), assets = join(root, 'assets');
+  execFileSync(process.execPath, ['../orchestrator/build-incus-worker-assets.mjs', assets]);
+  const cfg = { ...config, dataDir: root }, fake = fakeClient(), runtime = new IncusWorkerRuntime(cfg, fake.client as any), opts = options();
+  try {
+    await runtime.create({ ...opts, start: false });
+    const oldRaw = await fake.client.getImage('a'.repeat(64)), old = incusImageIdentity(oldRaw);
+    const recipe = incusConversionRecipeId(old.sourceImageId, await readCanonicalIncusBootstrap(assets));
+    const refreshedRaw = { ...oldRaw, fingerprint: 'd'.repeat(64), properties: { ...oldRaw.properties, recipe_id: recipe } };
+    const nextRaw = { ...oldRaw, fingerprint: 'e'.repeat(64), properties: { ...oldRaw.properties, source_image_id: 'sha256:' + 'f'.repeat(64) } };
+    const images = [oldRaw, refreshedRaw, nextRaw];
+    const catalog = new ImageCatalogCore(join(root, 'image-catalog'));
+    await catalog.rememberApprovedDefaultImage(old, async () => {});
+    const wire = (target: IncusWorkerRuntime, client: any) => {
+      client.getImageAlias = async () => ({ target: nextRaw.fingerprint, type: 'virtual-machine' });
+      client.getImage = async (fingerprint: string) => images.find(image => image.fingerprint === fingerprint)!;
+      client.listImages = async () => images;
+      target.setImageResolver(async (_opts, stored, described, refresh) => resolveDefaultIncusImage(cfg, client,
+        { getImage: () => { throw new Error('Historical default must not resolve current OCI B'); } } as any,
+        catalog, assets, async () => {}, stored, described, refresh));
+    };
+    wire(runtime, fake.client); fake.events.length = 0;
+    const before = await runtime.preflightRecreation(opts, false, true);
+    expect(before).toMatchObject({ fingerprint: refreshedRaw.fingerprint, bootstrapRefresh: { previous: old } });
+    await runtime.create({ ...opts, start: false }, before);
+    expect(fake.events.find(event => event.operation === 'create')!.args[0].source.fingerprint).toBe(refreshedRaw.fingerprint);
+    expect(await (new IncusWorkerStorage(fake.client as any, cfg, await backupInstallationId(root))).imageIdentity(opts))
+      .toMatchObject({ sourceImageId: old.sourceImageId, recipeId: recipe });
+    const destination = fakeClient(), restored = new IncusWorkerRuntime(cfg, destination.client as any);
+    wire(restored, destination.client);
+    destination.client.getInstance = async () => { throw Object.assign(new Error('Absent destination'), { statusCode: 404 }); };
+    const id = randomUUID(), restoreOptions = { ...opts, id, containerName: cfg.containerPrefix + '-' + id, recreationNonce: randomUUID(), start: false };
+    await restored.preflightCanonicalRestore(restoreOptions, snapshotIncusWorkerBackupRuntime(old).source);
+    await restored.createCanonicalRestore(restoreOptions, snapshotIncusWorkerBackupRuntime(old).source);
+    expect(destination.events.find(event => event.operation === 'create')!.args[0].source.fingerprint).toBe(old.fingerprint);
+    expect(destination.events.some(event => event.operation === 'start')).toBe(false);
+    const denied = new IncusWorkerRuntime(cfg, destination.client as any);
+    denied.setImageResolver(async () => incusImageIdentity(nextRaw)); destination.events.length = 0;
+    await expect(denied.preflightCanonicalRestore(restoreOptions, snapshotIncusWorkerBackupRuntime(old).source))
+      .rejects.toThrow('immutable restore OCI source');
+    expect(destination.events.some(event => ['create', 'volume-create', 'start', 'stop'].includes(event.operation))).toBe(false);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('explicit bootstrap refresh rejects another OCI base before mutation and rechecks the exact selected image before allocation', async () => {
   const fake = fakeClient(), runtime = new IncusWorkerRuntime(config, fake.client as any), opts = options();
   const oldRaw = await fake.client.getImage('a'.repeat(64));
@@ -366,6 +414,36 @@ test('bootstrap refresh requires an unchanged previous storage identity and neve
   await storage.recordImageIdentity(opts, next, old);
   expect(await storage.imageIdentity(opts)).toEqual(next);
   await expect(storage.recordImageIdentity(opts, old, old)).rejects.toThrow('changed after preflight');
+});
+
+test('production default resolver checks the durable owner and lifecycle across asynchronous image proof', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'default-image-wiring-')), previousCwd = process.cwd();
+  const assets = join(root, '.output/server/incus-bootstrap');
+  await mkdir(join(root, '.output/server'), { recursive: true });
+  execFileSync(process.execPath, [join(previousCwd, '../orchestrator/build-incus-worker-assets.mjs'), assets]);
+  const cfg = { ...config, dataDir: root, incusConverterSeedFingerprint: 'd'.repeat(64) }, fake = fakeClient();
+  const runtime = new IncusWorkerRuntime(cfg, fake.client as any), opts = options(), workers = new WorkerStore(root);
+  await workers.init();
+  const record = { id: opts.id, userId: opts.userId, displayName: 'Default image', runtimeKind: 'incus-vm' as const,
+    status: 'active' as const, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString() };
+  await workers.upsert(record);
+  let mutate = false;
+  const image = incusImageIdentity(await fake.client.getImage('a'.repeat(64)));
+  const manager = new ContainerManager({ workerOciImage: () => ({ inspect: async () => {
+    if (mutate) await workers.upsert({ ...record, incusRecreation: { nonce: randomUUID() } });
+    return { Id: image.sourceImageId, Architecture: 'amd64' };
+  } }) } as any, cfg);
+  manager.setWorkerStore(workers); manager.setIncusRuntime(runtime);
+  const resolve = (runtime as any).imageResolver as Parameters<IncusWorkerRuntime['setImageResolver']>[0];
+  try {
+    process.chdir(root);
+    expect(await resolve(opts, image)).toEqual(image);
+    // Force a fresh current-default proof rather than a cached historical permission.
+    const changed = { ...image, recipeId: 'f'.repeat(64) };
+    mutate = true;
+    await expect(resolve(opts, changed)).rejects.toThrow('lifecycle');
+    expect(fake.events.some(event => ['create', 'start', 'remove', 'volume-create'].includes(event.operation))).toBe(false);
+  } finally { process.chdir(previousCwd); await rm(root, { recursive: true, force: true }); }
 });
 
 test('production image callback rechecks durable tuple, lifecycle nonce and group hierarchy after asynchronous authorization', async () => {

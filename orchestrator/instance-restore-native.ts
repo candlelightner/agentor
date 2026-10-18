@@ -35,6 +35,7 @@ import type { Config } from './server/utils/config';
 import type { IncusCustomVolume } from './server/utils/incus-client';
 import { ImageCatalogCore } from './server/utils/image-catalog-core';
 import { IncusWorkerImageManager } from './server/utils/incus-worker-image-manager';
+import { resolveDefaultIncusImage } from './server/utils/incus-default-image';
 import { sameIncusImageSource } from './server/utils/incus-worker-image';
 import { WorkerGroupStore } from './server/utils/worker-group-store';
 import { WorkerGroupHierarchy } from './server/utils/worker-group-hierarchy';
@@ -48,7 +49,25 @@ import { fileURLToPath } from 'node:url';
 export function configureInstanceNativeImageRestore(runtime: IncusWorkerRuntime, config: Config,
   options: IncusWorkerOptions, worker: WorkerRecord | undefined, validateJob: () => Promise<void>): void {
   const hasSelection = worker && [worker.imageDefinitionId, worker.imageVersion, worker.imageDigest, worker.imageRuntimeReference].some(Boolean);
-  if (!hasSelection && !options.image) return;
+  if (!hasSelection && !options.image) {
+    const catalog = new ImageCatalogCore(join(config.dataDir, 'image-catalog'));
+    runtime.setImageResolver(async (actual, stored, described, refresh) => {
+      const current = async () => {
+        await validateJob();
+        const workers = new WorkerStore(config.dataDir); await workers.loadUser(options.userId);
+        const record = workers.get(options.userId, options.id);
+        if (actual.id !== options.id || actual.userId !== options.userId || actual.containerName !== options.containerName ||
+            actual.image || actual.imageSelection || Boolean(record) !== Boolean(worker) ||
+            record && (record.runtimeKind !== 'incus-vm' || record.deletionPending || record.imageDefinitionId ||
+              record.imageVersion || record.imageDigest || record.imageRuntimeReference))
+          throw new Error('Controlled default restore identity or image authority changed');
+      };
+      await current();
+      return resolveDefaultIncusImage(config, runtime.client, new Docker({ socketPath: '/var/run/docker.sock' }), catalog,
+        fileURLToPath(new URL('../incus-bootstrap', import.meta.url)), current, stored, described, refresh);
+    });
+    return;
+  }
   const selection = options.imageSelection;
   if (!worker || !selection || !config.incusConverterSeedFingerprint || options.image !== selection.digest ||
       worker.imageDefinitionId !== selection.definitionId || worker.imageVersion !== selection.version ||

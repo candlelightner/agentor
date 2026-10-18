@@ -3,7 +3,7 @@ import type { Readable } from 'node:stream';
 import type { Config } from './config';
 import type { ImageUpdateInfo, UpdateStatus, ApplyResult, UpdatableImage, PruneResult } from '../../shared/types';
 import { withOperationDeadline } from './operation-deadline';
-import { promoteNativeWorkerUpdate } from './native-worker-update';
+import { promoteNativeWorkerUpdate, nativeWorkerUpdateStatus } from './native-worker-update';
 
 interface ImageRef {
   registry: string;
@@ -121,6 +121,10 @@ export class UpdateChecker {
     }
 
     const results = await Promise.all(checks);
+    if (this.config.incusEnabled && hasPrefix && results[1]) {
+      const { useIncusClient } = await import('./services');
+      results[1] = await nativeWorkerUpdateStatus(this.config, results[1], this.docker, useIncusClient());
+    }
 
     // Preserve existing local-only entries for images not checked remotely
     this.status = {
@@ -316,7 +320,7 @@ export class UpdateChecker {
     if (!validateAuthority) throw new Error('Native worker Apply requires current platform administrator authority');
     const { useIncusClient } = await import('./services');
     const { useImageCatalogManager } = await import('./image-catalog');
-    await promoteNativeWorkerUpdate(this.config, this.status.worker!.remoteDigest, this.docker,
+    await promoteNativeWorkerUpdate(this.config, this.status.worker!.remoteDigest || this.status.worker!.localDigest, this.docker,
       useIncusClient(), useImageCatalogManager(), image => this.pullImage(image), validateAuthority);
   }
 
@@ -340,8 +344,12 @@ export class UpdateChecker {
     const shouldUpdate = (key: UpdatableImage) => !images || images.includes(key);
     const prefix = this.config.workerImagePrefix;
 
-    // Publish the complete worker default if an update is available
-    if (hasPrefix && shouldUpdate('worker') && this.status.worker?.updateAvailable) {
+    // A new package owns the new bootstrap. Do not derive with old assets
+    // immediately before replacing this process during Apply All.
+    const deferWorker = this.config.incusEnabled && shouldUpdate('orchestrator') && this.status.orchestrator?.updateAvailable;
+    if (deferWorker && shouldUpdate('worker') && this.status.worker?.updateAvailable) result.workerDeferred = true;
+    // Publish the complete worker default if an update is available.
+    if (!deferWorker && hasPrefix && shouldUpdate('worker') && this.status.worker?.updateAvailable) {
       try {
         if (this.config.incusEnabled) {
           if (!validateWorkerAuthority) throw new Error('Native worker Apply requires current platform administrator authority');

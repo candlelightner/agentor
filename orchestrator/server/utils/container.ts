@@ -74,6 +74,7 @@ import type {
   WorkerRuntimeKind,
 } from "../../shared/types";
 import { normalizeWorkerRuntimeKind } from "../../shared/types";
+import { resolveDefaultIncusImage } from './incus-default-image';
 import { IncusWorkerRuntime, incusWorkerStatus, type IncusWorkerOptions } from "./incus-worker-runtime";
 import { IncusWorkerImageManager } from './incus-worker-image-manager';
 import { IncusRequestRejected } from './incus-client';
@@ -642,7 +643,28 @@ export class ContainerManager {
     migrationAuthority?: () => Promise<void>): void {
     runtime.setHardwareDiscovery?.(opts => this.dockerService.discoverIncusHardwareDevices(opts.id));
     if (!this.config.incusConverterSeedFingerprint) return;
-    runtime.setImageResolver(async (opts, stored, restoreSource) => {
+    runtime.setImageResolver(async (opts, stored, restoreSource, refreshBootstrap) => {
+      if (!opts.image) {
+        const initial = this.workerStore?.get(opts.userId, opts.id);
+        const tuple = (record: typeof initial) => record && [record.runtimeKind, record.status, record.imageDefinitionId,
+          record.imageVersion, record.imageDigest, record.imageRuntimeReference, record.incusRecreation?.nonce];
+        const baseline = tuple(initial);
+        const current = async () => {
+          await restoreAuthority?.(); await migrationAuthority?.();
+          const record = this.workerStore?.get(opts.userId, opts.id), recovery = record?.incusRecreation;
+          const validRuntime = migrationAuthority
+            ? record?.runtimeKind === 'legacy-docker' && !!record.incusMigration && record.incusMigration.nonce === opts.recreationNonce &&
+              !['retained', 'recovery-required'].includes(record.incusMigration.phase)
+            : record?.runtimeKind === 'incus-vm';
+          const validImport = !recovery?.importIncomplete || restoreAuthority && recovery.initialCreate && recovery.nonce === opts.recreationNonce;
+          if (!record || !validRuntime || record.deletionPending || !validImport || record.imageDefinitionId ||
+              record.imageVersion || record.imageDigest || record.imageRuntimeReference || !isDeepStrictEqual(tuple(record), baseline))
+            throw new Error('Default image owner, lifecycle or immutable selection authority changed');
+        };
+        await current();
+        return resolveDefaultIncusImage(this.config, runtime.client, { getImage: id => this.dockerService.workerOciImage(id) },
+          useImageCatalogManager(), join(process.cwd(), '.output/server/incus-bootstrap'), current, stored, restoreSource, refreshBootstrap);
+      }
       const selection = opts.imageSelection;
       if (!selection || opts.image !== selection.digest || !this.workerStore)
         throw new Error('Custom Incus images require the authoritative durable catalog selection');
@@ -6511,7 +6533,7 @@ for p in sys.argv[1:]:
       }
       let importRuntime = this.incusRuntime;
       const restoreSource = !imageResolution && manifest.runtime?.kind === 'incus-vm' ? manifest.runtime.source : undefined;
-      if (options.image) {
+      if (options.image || restoreSource) {
         // Keep the ordinary callback's importIncomplete rejection intact. Only
         // this short-lived import runtime receives the exact principal/nonce
         // validation closure, never JSON-supplied authority or a global waiver.

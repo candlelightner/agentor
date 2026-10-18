@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
-import { promoteNativeWorkerUpdate } from '../../orchestrator/server/utils/native-worker-update';
+import { promoteNativeWorkerUpdate, nativeWorkerUpdateStatus } from '../../orchestrator/server/utils/native-worker-update';
 import { UpdateChecker } from '../../orchestrator/server/utils/update-checker';
 import { IncusClient, type IncusImageAlias } from '../../orchestrator/server/utils/incus-client';
 import { ImageCatalogCore, type NativeImageContext } from '../../orchestrator/server/utils/image-catalog-core';
@@ -61,7 +61,10 @@ async function fixture() {
     },
   }) } as unknown as Parameters<typeof promoteNativeWorkerUpdate>[2];
   client.getImageAlias = async () => ({ name: config.incusWorkerImage, target: aliasTarget, description: 'Approved base', type: 'virtual-machine' });
-  client.getImage = async requested => { expect(requested).toBe(fingerprint); return {
+  client.getImage = async requested => {
+    if (requested === previousFingerprint) return { fingerprint: previousFingerprint, architecture: 'x86_64', type: 'virtual-machine', size: 1,
+      aliases: [], properties: { source_image_id: oldId, recipe_id: incusConversionRecipeId(oldId, files), source_architecture: 'amd64', bootstrap_generation: '3', converter_version: 'v0.4.0' } };
+    expect(requested).toBe(fingerprint); return {
     fingerprint, architecture: 'x86_64', type: 'virtual-machine', size: 1, aliases: [], properties: {
       source_image_id: sourceId, recipe_id: recipeDrift ? '0'.repeat(64) : context.recipeId,
       source_architecture: 'amd64', bootstrap_generation: '3', converter_version: 'v0.4.0',
@@ -235,4 +238,33 @@ test('native concurrent Apply shares promotion while every joining caller retain
   revoked = true; release(); expect((await first).workerPulled).toBe(true);
   expect((await second).errors.join()).toContain('Joining administrator revoked'); expect(calls).toBe(1);
   expect((await checker.applyUpdates(['worker'])).errors.join()).toContain('current platform administrator'); expect(calls).toBe(1);
+});
+
+for (const scenario of ['ready', 'new-bootstrap', 'wrong-source'] as const) test(`native readiness remains actionable with an unchanged OCI tag: ${scenario}`, async () => {
+  const f = await fixture(); try {
+    const original = f.client.getImage.bind(f.client);
+    f.client.getImageAlias = async () => ({ name: 'approved', target: fingerprint, type: 'virtual-machine', description: '' });
+    f.client.getImage = async value => { const image = await original(value);
+      return scenario === 'new-bootstrap' ? { ...image, properties: { ...image.properties, recipe_id: '0'.repeat(64) } }
+        : scenario === 'wrong-source' ? { ...image, properties: { ...image.properties, source_image_id: oldId } } : image;
+    };
+    const info = { name: 'worker', localDigest: remote, remoteDigest: remote, updateAvailable: false, lastChecked: new Date().toISOString() };
+    const docker = { getImage: () => ({ inspect: async () => ({ Id: sourceId, Architecture: 'amd64' }) }) } as unknown as Parameters<typeof nativeWorkerUpdateStatus>[2];
+    const result = await nativeWorkerUpdateStatus(f.config, info, docker, f.client, join(f.root, 'assets'));
+    expect(result.updateAvailable).toBe(scenario !== 'ready'); expect(result.nativeUpdateRequired).toBe(scenario !== 'ready');
+  } finally { await f.cleanup(); }
+});
+
+test('Apply All defers native worker preparation until the updated orchestrator owns the bootstrap', async () => {
+  const checker = new UpdateChecker({ workerImagePrefix: 'registry/', workerImage: 'worker:latest', orchestratorImage: 'orchestrator:latest', baseDomains: [], incusEnabled: true } as unknown as Config);
+  const internal = checker as unknown as { status: { worker: { updateAvailable: boolean }; orchestrator: { updateAvailable: boolean } };
+    updateWorkerImage: () => Promise<void>; pullImage: (name: string) => Promise<void> };
+  internal.status.worker = { updateAvailable: true }; internal.status.orchestrator = { updateAvailable: true };
+  const calls: string[] = [];
+  internal.updateWorkerImage = async () => { calls.push('native'); }; internal.pullImage = async reference => { calls.push(reference); };
+  const result = await checker.applyUpdates(undefined, noOp);
+  expect(result).toMatchObject({ workerDeferred: true, workerPulled: false, orchestratorPulled: true });
+  expect(calls).toEqual(['registry/orchestrator:latest']);
+  internal.status.orchestrator.updateAvailable = false;
+  const next = await checker.applyUpdates(['worker'], noOp); expect(next.workerPulled).toBe(true); expect(calls).toEqual(['registry/orchestrator:latest', 'native']);
 });

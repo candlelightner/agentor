@@ -6,7 +6,7 @@ import { pack } from "tar-stream";
 import type { Readable } from "node:stream";
 import type { PluginCommand } from "./plugin-manifest";
 import type { IncusImageConverterReceipt } from './incus-image-converter';
-import { validateIncusImageIdentity, type IncusWorkerImageIdentity } from './incus-worker-image';
+import { validateIncusImageIdentity, sameIncusImageSource, type IncusWorkerImageIdentity } from './incus-worker-image';
 import { isDeepStrictEqual } from 'node:util';
 
 export type ImageBuildStatus =
@@ -288,7 +288,8 @@ interface State {
    * authorization. Portable/catalog recovery never populates this map. */
   nativeBindings: Record<string, NativeImageBinding>;
   /** Local server-approved upstream source; never a custom catalog selection. */
-  platformDefaultSource?: NativeImageSource;
+  platformDefaultSources: Record<string, NativeImageSource>;
+  approvedDefaultImages: IncusWorkerImageIdentity[];
 }
 interface ImageDeletion {
   id: string;
@@ -534,6 +535,8 @@ export class ImageCatalogCore {
     faults: {},
     deletions: [],
     nativeBindings: {},
+    platformDefaultSources: {},
+    approvedDefaultImages: [],
   };
   private initialized?: Promise<void>;
   private mutationChain = Promise.resolve();
@@ -677,7 +680,8 @@ export class ImageCatalogCore {
     this.state.faults = structuredClone(previous.faults);
     this.state.deletions = structuredClone(previous.deletions);
     this.state.nativeBindings = structuredClone(previous.nativeBindings);
-    this.state.platformDefaultSource = structuredClone(previous.platformDefaultSource);
+    this.state.platformDefaultSources = structuredClone(previous.platformDefaultSources);
+    this.state.approvedDefaultImages = structuredClone(previous.approvedDefaultImages);
   }
 
   list(ownerId: string, admin: boolean) {
@@ -869,7 +873,7 @@ export class ImageCatalogCore {
     return this.mutate(async () => {
       await validateAuthority();
       if (!NATIVE_OCI.test(sourceImageId)) throw new Error('Platform default requires an immutable OCI source');
-      const previous = this.state.platformDefaultSource;
+      const previous = this.state.platformDefaultSources[sourceImageId];
       if (previous?.sourceImageId === sourceImageId) return structuredClone(previous);
       if (this.state.builds.some(build => build.nativeDerivation?.source.scope === 'platform-default' &&
           (build.status === 'running' || build.status === 'queued' ||
@@ -880,15 +884,33 @@ export class ImageCatalogCore {
         definitionOwnerId: PLATFORM_DEFAULT_OWNER, definitionId: PLATFORM_DEFAULT_DEFINITION,
         version: 'default', sourceBuildId: randomUUID(), sourceImageId, createdAt: now(), scope: 'platform-default' };
       validateNativeSource(source);
-      this.state.platformDefaultSource = source;
+      if (Object.keys(this.state.platformDefaultSources).length >= 4096) throw new Error('Platform default source inventory exceeds limit');
+      this.state.platformDefaultSources[sourceImageId] = source;
       return structuredClone(source);
     });
+  }
+
+  async rememberApprovedDefaultImage(identity: IncusWorkerImageIdentity, validateAuthority: () => Promise<void>): Promise<void> {
+    identity = validateIncusImageIdentity(identity);
+    await this.init();
+    await this.mutate(async () => {
+      await validateAuthority();
+      if (this.state.approvedDefaultImages.some(value => sameIncusImageSource(value, identity))) return;
+      if (this.state.approvedDefaultImages.length >= 4096) throw new Error('Approved default image inventory exceeds limit');
+      this.state.approvedDefaultImages.push(identity);
+    });
+  }
+
+  async hasApprovedDefaultImage(source: Omit<IncusWorkerImageIdentity, 'version' | 'fingerprint'>,
+    validateAuthority: () => Promise<void>): Promise<boolean> {
+    await this.init();
+    return this.nativeAuthorityRead(validateAuthority, () => this.state.approvedDefaultImages.some(value => sameIncusImageSource(value, source)));
   }
 
   private assertNativeSource(source: NativeImageSource): void {
     validateNativeSource(source);
     if (source.scope === 'platform-default') {
-      if (!isDeepStrictEqual(source, this.state.platformDefaultSource))
+      if (!isDeepStrictEqual(source, this.state.platformDefaultSources[source.sourceImageId]))
         throw new Error('Platform default source acknowledgement changed');
       return;
     }
@@ -3374,14 +3396,22 @@ function normalizeState(value: any): State {
       }))
     : [];
   for (const build of builds) if (build.nativeDerivation !== undefined) validateNativeDerivation(build.nativeDerivation, build);
-  if (value?.platformDefaultSource !== undefined) {
-    validateNativeSource(value.platformDefaultSource);
-    if (value.platformDefaultSource.scope !== 'platform-default') throw new Error('Platform default source scope is invalid');
+  const platformDefaultSources = value?.platformDefaultSources ??
+    (value?.platformDefaultSource ? { [value.platformDefaultSource.sourceImageId]: value.platformDefaultSource } : {});
+  if (!platformDefaultSources || typeof platformDefaultSources !== 'object' || Array.isArray(platformDefaultSources) ||
+      Object.keys(platformDefaultSources).length > 4096) throw new Error('Platform default source inventory is invalid');
+  for (const [id, source] of Object.entries(platformDefaultSources)) {
+    validateNativeSource(source as NativeImageSource);
+    if ((source as NativeImageSource).scope !== 'platform-default' || (source as NativeImageSource).sourceImageId !== id)
+      throw new Error('Platform default source scope is invalid');
   }
+  const approvedDefaultImages = value?.approvedDefaultImages ?? [];
+  if (!Array.isArray(approvedDefaultImages) || approvedDefaultImages.length > 4096) throw new Error('Approved default image inventory is invalid');
   return {
     definitions,
     builds,
-    platformDefaultSource: value?.platformDefaultSource,
+    platformDefaultSources,
+    approvedDefaultImages: approvedDefaultImages.map(validateIncusImageIdentity),
     userDefaults:
       value?.userDefaults && typeof value.userDefaults === "object"
         ? value.userDefaults

@@ -6,6 +6,8 @@ import { IncusWorkerImageManager } from './incus-worker-image-manager';
 import type { ImageCatalogCore } from './image-catalog-core';
 import { incusImageIdentity } from './incus-worker-image';
 import { incusConversionRecipeId, readCanonicalIncusBootstrap } from './incus-image-converter';
+import { resolveAdministrativeNativeBase } from './admin-native-image';
+import type { ImageUpdateInfo } from '../../shared/types';
 import { withOperationDeadline } from './operation-deadline';
 
 /** Publish only a completely converted upstream default. Pulling by digest
@@ -27,6 +29,12 @@ export async function promoteNativeWorkerUpdate(config: Config, remoteDigest: st
   await validateAuthority();
   const previousAlias = await client.getImageAlias(config.incusWorkerImage);
   const previousImage = await inspect(reference);
+  const previousNative = incusImageIdentity(await client.getImage(previousAlias.target));
+  if (previousNative.fingerprint !== previousAlias.target) throw new Error('Configured native default alias changed');
+  // A prior failed tag publication may already have promoted the alias. Only
+  // matching configured OCI/native pairs grant historical default approval.
+  if (previousNative.sourceImageId === previousImage.Id && previousImage.Architecture === 'amd64')
+    await catalog.rememberApprovedDefaultImage(previousNative, validateAuthority);
   await pull(staged);
   const source = await inspect(staged);
   if (!/^sha256:[a-f0-9]{64}$/.test(source.Id) || source.Architecture !== 'amd64')
@@ -62,4 +70,18 @@ export async function promoteNativeWorkerUpdate(config: Config, remoteDigest: st
     if (!observed) throw error; // No automatic tag retry or compensating mutation.
   }
   if (!await published()) throw new Error('Worker update default publication was not observed');
+  await catalog.rememberApprovedDefaultImage(actual, validateAuthority);
+}
+
+/** Readiness is part of update status: an orchestrator-only bootstrap change
+ * still needs explicit native preparation even if the OCI registry tag agrees. */
+export async function nativeWorkerUpdateStatus(config: Config, info: ImageUpdateInfo, docker: Pick<Docker, 'getImage'>,
+  client: IncusClient, bootstrapDirectory = join(process.cwd(), '.output/server/incus-bootstrap')): Promise<ImageUpdateInfo> {
+  try {
+    const source = await withOperationDeadline(docker.getImage(config.workerImagePrefix + config.workerImage).inspect(), 8_000, 'Native update readiness OCI inspection');
+    await resolveAdministrativeNativeBase(config, client, source.Id, bootstrapDirectory);
+    return { ...info, nativeUpdateRequired: false };
+  } catch {
+    return { ...info, updateAvailable: true, nativeUpdateRequired: true };
+  }
 }

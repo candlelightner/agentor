@@ -1491,3 +1491,5 @@ Native admin compute names are bounded to 44 bytes (short valid literal IDs, oth
 Orchestrator CI build and validation filters include the canonical VM bootstrap, worker entrypoint, image builder/canary scripts and root Docker context exclusions copied into its image. Worker image filtering remains independent.
 
 Docker CI's diagnostic group-volume MCP authorization fixture uses an explicit stopped legacy group principal in its fresh private DinD DATA volume. It cold-inserts only that exact new group binding and removes it before ordinary cleanup; metadata is never used to provision administrative compute. Future admin creation remains native-only, and all real HTTP, volume, membership and mutation-scope assertions remain required.
+
+- Worker default updates retain exact private historical approvals for immutable rebuild/restore, keep the preflight-selected artifact through allocation, defer native preparation until the new orchestrator package is running, and expose native-bootstrap readiness even with unchanged OCI digests. The update notice refreshes status after reconnecting. Source/mocked checks cover these paths; live acceptance remains pending.
