@@ -1457,3 +1457,5 @@ Long running administrative captures renew the already-bound short management id
 Periodic native administrative identity refresh serializes with lifecycle work without advancing its generation, so healthy terminal/proxy/journal handles are retained; real lifecycle mutations preserve their revocation behavior.
 
 Pending native administrative path selections do not block portable backup of already seeded data. They remain excluded until applied; whole-instance snapshot readiness is unchanged.
+
+Native administrative encrypted DR has an explicit private-system-VM capture/restore/lifecycle gate. It drives actual HTTP encryption/import/controlled-helper restore, verifies fresh stopped authority and all canonical/selected sample metadata, and keeps source data. Live acceptance remains unverified; same-daemon two-project round trips exclude private-network lifecycle.

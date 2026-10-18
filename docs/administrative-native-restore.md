@@ -41,3 +41,5 @@ The existing complete workspace and instance API/UI suites remain required. Nati
 5. Repeat recovery with a historical format 1 backup containing dedicated global/group Docker admin canonical descriptors plus attached/detached selected history with exact managed metadata. Verify the same native result without creating Docker admin compute or requiring the missing historical image.
 
 No administrative Archive operation is introduced. Ordinary archive/restore acceptance remains in its existing suites. Private test accounts, source data and credentials must belong only to the disposable installation.
+
+The source-only executable gate and exact disposable fixture contract are in [administrative-native-dr-acceptance.md](administrative-native-dr-acceptance.md). Its capture/restore and lifecycle phases remain separate acceptance results; no live pass is asserted by adding the test.

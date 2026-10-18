@@ -4,7 +4,7 @@ import type { Config } from '../../orchestrator/server/utils/config';
 
 export const PRIVATE_NATIVE_DR_RECEIPT = '/run/agentor-native-dr/fixture.json';
 export const NATIVE_DR_LIVE_FLAGS = ['INCUS_INSTANCE_BACKUP_TEST', 'INCUS_INSTANCE_PREFLIGHT_TEST',
-  'INCUS_INSTANCE_DETACHED_RESTORE_TEST', 'INCUS_INSTANCE_HELPER_PROCESS_TEST'] as const;
+  'INCUS_INSTANCE_DETACHED_RESTORE_TEST', 'INCUS_INSTANCE_HELPER_PROCESS_TEST', 'INCUS_ADMIN_INSTANCE_DR_TEST'] as const;
 
 /** Default setup authenticates against BASE_URL before test bodies execute.
  * Native gates must use the module config, which has no HTTP global setup. */

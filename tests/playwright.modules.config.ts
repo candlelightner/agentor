@@ -16,7 +16,7 @@ if (!process.env.DATA_DIR) {
       process.env.INCUS_MANAGED_IMPORT_TEST !== 'true' && process.env.INCUS_SELECTED_BACKUP_TEST !== 'true' &&
       process.env.INCUS_SELECTED_IMPORT_TEST !== 'true' && process.env.INCUS_DOCKER_ARCHIVE_PROOF_TEST !== 'true' &&
       process.env.INCUS_DOCKER_IMPORT_TEST !== 'true' && process.env.INCUS_INSTANCE_BACKUP_TEST !== 'true' &&
-      process.env.INCUS_BACKUP_CAPTURE_TEST !== 'true')
+      process.env.INCUS_BACKUP_CAPTURE_TEST !== 'true' && process.env.INCUS_ADMIN_INSTANCE_DR_TEST !== 'true')
     process.once("exit", () => rmSync(fixtureData, { recursive: true, force: true }));
 }
 
@@ -64,6 +64,7 @@ export default defineConfig({
     "api/container-store-quarantine.spec.ts",
     "api/instance-backup-*.spec.ts",
     "api/private-native-dr-fixture.spec.ts",
+    "api/private-admin-native-dr-fixture.spec.ts",
     "api/instance-native-apply.spec.ts",
     "api/instance-native-helper-process.spec.ts",
     "api/legacy-incus-migration-capture-live.spec.ts",
