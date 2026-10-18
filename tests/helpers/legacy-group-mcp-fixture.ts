@@ -17,6 +17,29 @@ export function validateLegacyGroupFixtureSource(source: any) {
     throw Error('Legacy MCP principal requires the exact private Docker CI fixture');
 }
 
+/** Traefik reads DATA configuration; only the orchestrator may write it. */
+export async function validateLegacyGroupFixtureConsumers(docker: (...args: string[]) => Promise<string>, source: any, volumeSource: string) {
+  const refuse = () => { throw Error('Fixture DATA has an unexpected or writable consumer'); };
+  if (typeof volumeSource !== 'string' || !volumeSource.startsWith('/')) refuse();
+  const ids = (await docker('ps', '-aq', '--no-trunc', '--filter', 'volume=' + DATA)).split(/\s+/);
+  if (!ids.includes(source.Id) || new Set(ids).size !== ids.length || ids.some(id => !/^[a-f0-9]{64}$/.test(id))) refuse();
+  const consumers = JSON.parse(await docker('inspect', ...ids));
+  if (!Array.isArray(consumers) || consumers.length !== ids.length || new Set(consumers.map((item: any) => item.Id)).size !== ids.length) refuse();
+  for (const consumer of consumers) {
+    if (!ids.includes(consumer.Id) || !Array.isArray(consumer.Mounts)) refuse();
+    const mounts = consumer.Mounts.filter((mount: any) => mount.Name === DATA || typeof mount.Source === 'string' &&
+      (mount.Source === volumeSource || mount.Source.startsWith(volumeSource + '/') || volumeSource.startsWith(mount.Source + '/')));
+    const mount = mounts[0];
+    if (mounts.length !== 1 || mount.Type !== 'volume' || mount.Name !== DATA || mount.Source !== volumeSource || mount.Destination !== '/data') refuse();
+    if (consumer.Id === source.Id) {
+      validateLegacyGroupFixtureSource(consumer);
+      if (consumer.Image !== source.Image || !consumer.State?.Running) refuse();
+    } else if (consumer.Name !== '/agentor-traefik' || consumer.Config?.Labels?.['agentor.managed'] !== 'traefik' ||
+      !/^sha256:[a-f0-9]{64}$/.test(consumer.Image ?? '') || consumer.HostConfig?.Privileged ||
+      consumer.HostConfig?.Devices?.length || consumer.HostConfig?.NetworkMode === 'host' || consumer.HostConfig?.PidMode === 'host' || mount.RW !== false) refuse();
+  }
+}
+
 // Only a diagnostic principal is seeded; no administrative runtime is created.
 export const LEGACY_GROUP_PRINCIPAL_CAS = String.raw`
 const fs=require('node:fs'),assert=require('node:assert/strict'),{isDeepStrictEqual}=require('node:util'),{randomUUID}=require('node:crypto');
@@ -62,7 +85,7 @@ export async function legacyGroupMcpPrincipal(request: APIRequestContext, ownerI
     if (volume.Driver !== 'local' || Object.keys(volume.Options ?? {}).length ||
         volume.Labels?.['com.docker.compose.project'] !== 'agentor-test' || volume.Labels?.['com.docker.compose.volume'] !== 'agentor-data')
       throw Error('Fixture DATA ownership changed');
-    if (await currentDocker('ps', '-aq', '--no-trunc', '--filter', 'volume=' + DATA) !== source.Id) throw Error('Fixture DATA has another consumer');
+    await validateLegacyGroupFixtureConsumers(currentDocker, current, volume.Mountpoint);
     await currentDocker('stop', '--time', '10', source.Id);
     const stopped = JSON.parse(await currentDocker('inspect', source.Id))[0];
     validateLegacyGroupFixtureSource(stopped);
