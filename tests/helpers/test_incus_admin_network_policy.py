@@ -657,6 +657,38 @@ class AdminNetworkTests(unittest.TestCase):
         self.assertEqual(self.mutations(), [])
         self.assertIn('d' * 64, self.wrapper['Containers'])
 
+    def test_named_volume_controller_uses_exact_pinned_data_and_keeps_readonly_inspect(self):
+        self.controller['Mounts'] = [{'Type': 'volume', 'Name': 'agentor-data', 'Driver': 'local',
+            'Source': str(self.root), 'Destination': '/data', 'RW': True, 'Mode': 'rw', 'Propagation': ''}]
+        result = self.policy.ensure(self.payload)
+        self.assertEqual(result['ownerId'], '__agentor_admin__')
+        self.calls.clear()
+        self.assertEqual(self.policy.inspect(self.payload), result)
+        self.assertEqual(self.mutations(), [])
+        self.assertEqual(self.policy.ensure(self.payload), result)
+        self.assertEqual(self.mutations(), [])
+
+    def test_controller_data_mount_rejects_foreign_ambiguous_readonly_and_other_types(self):
+        original = copy.deepcopy(self.controller)
+        for kind in ('bind', 'volume'):
+            mount = {'Type': kind, 'Name': 'agentor-data', 'Source': str(self.root), 'Destination': '/data', 'RW': True}
+            variants = [[{**mount, 'Source': str(self.root / 'foreign')}], [{**mount, 'RW': False}],
+                        [{**mount, 'RW': 'true'}], [mount, mount], [], [{**mount, 'Destination': '/elsewhere'}]]
+            for invalid in ('tmpfs', 'npipe', 'cluster', None): variants.append([{**mount, 'Type': invalid}])
+            for mounts in variants:
+                with self.subTest(kind=kind, mounts=mounts):
+                    self.controller = {**copy.deepcopy(original), 'Mounts': copy.deepcopy(mounts)}
+                    self.calls.clear()
+                    with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+                    self.assertEqual(self.mutations(), [])
+        for field, value in (('Name', '/foreign-controller'), ('Id', 'not-a-container-id'), ('State', {'Running': False})):
+            self.controller = copy.deepcopy(original)
+            self.controller['Mounts'][0]['Type'] = 'volume'
+            self.controller[field] = value
+            self.calls.clear()
+            with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
+            self.assertEqual(self.mutations(), [])
+
     def test_controller_replacement_and_loopback_bridge_are_rejected(self):
         self.policy.ensure(self.payload)
         self.controller['Id'] = 'd' * 64

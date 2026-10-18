@@ -342,7 +342,7 @@ class AdminNetworkPolicy:
                 and container.get("State", {}).get("Running") is True,
                 "Pinned orchestrator container is unavailable")
         mounts = [mount for mount in container.get("Mounts", []) if mount.get("Destination") == "/data"]
-        require(len(mounts) == 1 and mounts[0].get("Type") == "bind" and mounts[0].get("RW") is True
+        require(len(mounts) == 1 and mounts[0].get("Type") in ("bind", "volume") and mounts[0].get("RW") is True
                 and mounts[0].get("Source") == self.data_dir, "Pinned orchestrator data authority differs")
         return container
 

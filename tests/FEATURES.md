@@ -1476,3 +1476,5 @@ Stopped retained Incus workers can rebuild with canonical workspace backup selec
 Native global administration accepts Incus readback with the empty `user.agentor.admin-group` key omitted, including private bridges, VM ownership, canonical storage and controlled restore. Group administration still requires its exact group ID; global foreign/null labels remain rejected. Docker labels and authored native metadata remain unchanged.
 
 Prebuilt fixture failures retain bounded fixed-command/status/code/stderr diagnostics without retrying or relaxing archive/config-ID checks. Documented classic-daemon config IDs are separate from unchanged native/source OCI provenance.
+
+Private administrative networking admits the pinned running orchestrator with either a bind or Docker named-volume `/data` mount, matching the host installer and supported compose storage modes. Both require one writable mount whose resolved Docker source exactly equals the installer-pinned host DATA path; volume names/options do not grant additional authority.
