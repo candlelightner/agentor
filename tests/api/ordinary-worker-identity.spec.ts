@@ -26,7 +26,10 @@ test.beforeAll(async () => {
   await writeFile(join(dataDir, 'admin/workspace.v1.json'), JSON.stringify({ schemaVersion: 1,
     id: platformId, kind: 'administrative', trusted: true, status: 'stopped', ownerId: owner,
     createdAt: stamp, updatedAt: stamp }));
-  await useAdminWorkspaceStore().init();
+  // Another module may have bootstrapped the empty singleton before this fixture writes its authority.
+  const admin = useAdminWorkspaceStore();
+  Object.assign(admin, new AdminWorkspaceStore(dataDir));
+  await admin.init();
   const groups = useWorkerGroupStore(); await groups.init();
   const group = await groups.create(owner, 'Real authoritative group');
   await groups.update(owner, group.id, { adminWorkspace: { schemaVersion: 1, id: groupId,
