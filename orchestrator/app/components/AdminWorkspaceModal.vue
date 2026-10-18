@@ -110,7 +110,7 @@ function openService(service: string) {
             class="rounded border border-red-400 p-5 text-center"
           >
             <p class="mb-3">Administrative workspace status could not be loaded.</p>
-            <UButton color="neutral" @click="admin.refresh().catch(() => undefined)">
+            <UButton color="neutral" @click="void admin.refresh().catch(() => undefined)">
               Retry status
             </UButton>
           </div>
