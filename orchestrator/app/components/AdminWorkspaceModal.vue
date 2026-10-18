@@ -105,6 +105,9 @@ function openService(service: string) {
               Refresh status
             </UButton>
           </p>
+          <p v-if="admin.action.value" role="status" class="text-sm">
+            Administrative workspace {{ admin.action.value }} request is in progress…
+          </p>
           <div v-if="admin.loading.value" class="py-12 text-center">
             Loading administrative workspace…
           </div>

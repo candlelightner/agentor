@@ -103,3 +103,23 @@ test('memory editor shows desired and applied limits without a lifecycle request
   await expect(page.getByTestId('admin-memory-editor')).toContainText('Applied: 4GiB');
   expect(saved).toBe('8GiB'); expect(lifecycle).toEqual([]);
 });
+
+
+test('a response from before reopening cannot overwrite a newer settled status', async ({ page }) => {
+  let first: any, reads = 0;
+  await page.route('**/api/admin/workspace', async route => {
+    if (++reads === 1) first = route;
+    else await route.fulfill({ json: { ...workspace, status: 'stopped' } });
+  });
+  await page.goto(url);
+  await expect(page.getByText('Loading administrative workspace…')).toBeVisible();
+  await page.getByRole('button', { name: 'Close administrative workspace' }).click();
+  await page.evaluate(() => (window as any).showAdmin(true));
+  await expect(page.getByRole('button', { name: 'Start admin workspace', exact: true })).toBeEnabled();
+  const late = page.waitForResponse(response => response.url().endsWith('/api/admin/workspace'));
+  await first.fulfill({ json: workspace });
+  await late;
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await expect(page.getByRole('button', { name: 'Start admin workspace', exact: true })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Stop admin workspace', exact: true })).toHaveCount(0);
+});
