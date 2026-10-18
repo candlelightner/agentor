@@ -93,7 +93,16 @@ jobs:
 
       - name: Run no-server module and helper tests
         working-directory: tests
-        run: npm run test:modules
+        run: npm run test:modules -- --grep-invert 'api/(incus-admin-restore|incus-derived-image|incus-docker-restore-archive|managed-kilo-parent|portable-pax-size)\.spec\.ts'
+
+      - name: Run root-owned archive metadata fixtures
+        working-directory: tests
+        run: >-
+          sudo -- "$(command -v node)" ./node_modules/@playwright/test/cli.js test
+          --config=playwright.modules.config.ts
+          api/incus-admin-restore.spec.ts api/incus-derived-image.spec.ts
+          api/incus-docker-restore-archive.spec.ts api/managed-kilo-parent.spec.ts
+          api/portable-pax-size.spec.ts
 
   docker_regression:
     name: Isolated Docker API and UI regression

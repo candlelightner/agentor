@@ -43,7 +43,7 @@ async function conversionCliFixture(run: (f: { invoke: (args: string[], cached?:
   const source = 'sha256:' + 'a'.repeat(64);
   const recipe = execFileSync('bash', ['-c',
     `{ printf '%s\\n' '${source}' amd64 3 v0.4.0 8G; sha256sum scripts/build-incus-worker-image.sh worker/entrypoint.sh worker/vm/*; } | sha256sum | cut -d' ' -f1`],
-    { cwd: repo, encoding: 'utf8' }).trim();
+    { cwd: repo, encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } }).trim();
   const script = join(root, 'convert.sh');
   await writeFile(script, (await readFile(join(repo, 'scripts/build-incus-worker-image.sh'), 'utf8'))
     .replace('REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"', 'REPO_ROOT="$FIXTURE_REPO"')
