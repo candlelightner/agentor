@@ -11,15 +11,15 @@ const ts = require('typescript');
 
 // Execute the actual handler with bounded auth/runtime doubles, without
 // starting an auth database or touching either Docker or Incus.
-async function handlerFixture(status: string, role = 'user', owner = 'owner', authenticated = true) {
+async function handlerFixture(status: string, role = 'user', owner = 'owner', authenticated = true, attachReady?: Promise<void>) {
   const source = await readFile(new URL('../../orchestrator/server/utils/terminal-handler.ts', import.meta.url), 'utf8');
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS,
     target: ts.ScriptTarget.ES2022 } }).outputText;
   const stream = new PassThrough();
-  const calls = { attach: 0, failures: 0, close: 0, lookup: 0 };
+  const calls = { attach: 0, failures: 0, close: 0, lookup: 0 }, resizes: number[][] = [];
   const manager = {
     get: () => { calls.lookup++; return { userId: owner, status }; },
-    attachTerminal: async () => { calls.attach++; return { stream, resize() {}, close() { calls.close++; } }; },
+    attachTerminal: async () => { calls.attach++; await attachReady; return { stream, resize(cols: number, rows: number) { resizes.push([cols, rows]); }, close() { calls.close++; } }; },
     reportRuntimeFailure: () => { calls.failures++; },
   };
   const exports: any = {};
@@ -33,7 +33,7 @@ async function handlerFixture(status: string, role = 'user', owner = 'owner', au
   let closed = false;
   const peer = { id: 'terminal-test', request: { url: '/ws/terminal/worker/0' },
     send: (value: unknown) => { messages.push(String(value)); }, close: () => { closed = true; } };
-  return { handler: exports.terminalWsHandler, peer, calls, stream, messages, closed: () => closed };
+  return { handler: exports.terminalWsHandler, peer, calls, resizes, stream, messages, closed: () => closed };
 }
 
 for (const kind of ['legacy-docker', 'incus-vm'] as const) test(`${kind} manager rejects unknown shell without runtime dispatch`, async () => {
@@ -86,6 +86,43 @@ test('disconnect during authentication does not start a shell', async () => {
     await new Promise(resolve => setImmediate(resolve));
     expect(f.calls.attach).toBe(0);
   } finally { f.stream.destroy(); }
+});
+
+test('delayed terminal attachment applies only the latest valid early resize and discards early keystrokes', async () => {
+  let release!: () => void;
+  const ready = new Promise<void>(resolve => { release = resolve; });
+  const f = await handlerFixture('running', 'admin', 'owner', true, ready);
+  try {
+    f.handler.open(f.peer);
+    f.handler.message(f.peer, JSON.stringify({ type: 'resize', cols: 100, rows: 30 }));
+    f.handler.message(f.peer, JSON.stringify({ type: 'resize', cols: 132, rows: 42 }));
+    f.handler.message(f.peer, JSON.stringify({ type: 'resize', cols: 20000, rows: 50 }));
+    f.handler.message(f.peer, 'early-keystrokes');
+    await expect.poll(() => f.calls.attach).toBe(1);
+    expect(f.resizes).toEqual([]);
+    release();
+    await expect.poll(() => f.resizes).toEqual([[132, 42]]);
+    expect(f.messages.join('')).not.toContain('early-keystrokes');
+    f.handler.message(f.peer, JSON.stringify({ type: 'resize', cols: 160, rows: 50 }));
+    expect(f.resizes).toEqual([[132, 42], [160, 50]]);
+    f.handler.message(f.peer, 'ready-keystrokes');
+    expect(f.messages.join('')).toContain('ready-keystrokes');
+  } finally { release(); f.handler.close(f.peer); f.stream.destroy(); }
+});
+
+test('disconnect during delayed terminal attachment discards the pending resize and closes the late session', async () => {
+  let release!: () => void;
+  const ready = new Promise<void>(resolve => { release = resolve; });
+  const f = await handlerFixture('running', 'user', 'owner', true, ready);
+  try {
+    f.handler.open(f.peer);
+    f.handler.message(f.peer, JSON.stringify({ type: 'resize', cols: 132, rows: 42 }));
+    await expect.poll(() => f.calls.attach).toBe(1);
+    f.handler.close(f.peer);
+    release();
+    await expect.poll(() => f.calls.close).toBe(1);
+    expect(f.resizes).toEqual([]);
+  } finally { release(); f.handler.close(f.peer); f.stream.destroy(); }
 });
 
 test('real Vue pane never mounts a restored unknown terminal and disconnects on status loss', async () => {

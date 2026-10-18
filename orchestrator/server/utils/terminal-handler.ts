@@ -8,6 +8,7 @@ interface TerminalContext {
   stream?: Duplex;
   resize?: (cols: number, rows: number) => void;
   close?: () => void;
+  pendingResize?: { cols: number; rows: number };
   closed: boolean;
 }
 
@@ -117,6 +118,11 @@ function handleTerminalOpen(peer: Peer): void {
         cleanupTerminal(ctx, peer);
         try { peer.close(); } catch {}
       });
+
+      if (!ctx.closed && ctx.pendingResize) {
+        resize(ctx.pendingResize.cols, ctx.pendingResize.rows);
+        delete ctx.pendingResize;
+      }
     })
     .catch((err) => {
       useContainerManager().reportRuntimeFailure(
@@ -137,7 +143,7 @@ function handleTerminalOpen(peer: Peer): void {
 
 function handleTerminalMessage(peer: Peer, message: unknown): void {
   const ctx = getTerminalContext(peer);
-  if (ctx.closed || !ctx.stream) return;
+  if (ctx.closed) return;
 
   // Try to detect JSON resize messages
   let text: string | undefined;
@@ -162,12 +168,15 @@ function handleTerminalMessage(peer: Peer, message: unknown): void {
       const parsed = JSON.parse(text);
       if (parsed.type === 'resize' && Number.isInteger(parsed.cols) && Number.isInteger(parsed.rows) &&
           parsed.cols > 0 && parsed.rows > 0 && parsed.cols <= 16384 && parsed.rows <= 16384) {
-        ctx.resize?.(parsed.cols, parsed.rows);
+        if (ctx.resize) ctx.resize(parsed.cols, parsed.rows);
+        else ctx.pendingResize = { cols: parsed.cols, rows: parsed.rows };
         return;
       }
     } catch {}
   }
 
+  // Keystrokes received before authenticated attachment remain discarded.
+  if (!ctx.stream) return;
   const raw = toBuffer(message);
   if (raw) ctx.stream.write(raw);
 }

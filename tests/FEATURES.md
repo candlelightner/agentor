@@ -1504,3 +1504,5 @@ Dedicated administrative startup validation failures retain managed rows and nat
 Existing native administrative status/start preparation re-admits exact host policy before inspection after reboot, retaining compute incarnation and storage; policy rejection still blocks credential issuance and start. A failed admin status request offers Retry without claiming an absent workspace or offering Provision.
 
 Codex MCP subprocess endpoint allowlists are reconciled for canonical management and worker-self commands, including existing sections and existing account profiles, without replacing user configuration or persisting credentials/endpoint values.
+
+Terminal WebSocket attachment preserves only the latest validated early resize across authentication/runtime setup; early keystrokes remain discarded and disconnect cancels pending resize delivery. The shared handler covers ordinary and administrative terminals.
