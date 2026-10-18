@@ -105,6 +105,7 @@ export default defineConfig({
     "api/managed-volume-sizing.spec.ts",
     "api/management-image-backup-domain.spec.ts",
     "api/management-worker-domain.spec.ts",
+    "api/management-console-runtime.spec.ts",
     "api/provider-http.spec.ts",
     "api/resource-monitor-lifecycle.spec.ts",
     "api/worker-self-access-policy.spec.ts",

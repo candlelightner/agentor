@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Duplex } from "node:stream";
-import { useContainerManager, useDockerService } from "./services";
+import { useContainerManager } from "./services";
 import {
   redactManagedBufferSlice,
   workerOutputRedactionValues,
@@ -11,8 +11,7 @@ interface ConsoleSession {
   /** Management workspace which created this linked tmux session. */
   workspaceId: string;
   workerId: string;
-  dockerContainerId: string;
-  tmuxSession: string;
+  closeRuntime: () => void;
   stream: Duplex;
   output: Buffer;
   offset: number;
@@ -26,14 +25,14 @@ interface ConsoleSession {
 const MAX_OUTPUT = 1024 * 1024;
 const MAX_SESSIONS = 16;
 const IDLE_MS = 15 * 60_000;
-/** Docker exec/attach calls can wait forever when a worker is being rebuilt.
+/** Runtime attach calls can wait forever when a worker is being rebuilt.
  * Keep MCP requests bounded so stale workers produce a useful error. */
-const DOCKER_OPERATION_TIMEOUT_MS = 15_000;
+const RUNTIME_OPERATION_TIMEOUT_MS = 15_000;
 
 async function withTimeout<T>(
   operation: Promise<T>,
   message: string,
-  timeoutMs = DOCKER_OPERATION_TIMEOUT_MS,
+  timeoutMs = RUNTIME_OPERATION_TIMEOUT_MS,
 ): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try {
@@ -64,16 +63,19 @@ export class ManagementConsoleStore {
       throw statusError(409, "Target worker is not running");
     if (!Number.isSafeInteger(windowIndex) || windowIndex < 0)
       throw statusError(400, "windowIndex must be a non-negative integer");
-    let attached: Awaited<ReturnType<ReturnType<typeof useDockerService>["execAttachTmuxWindow"]>>;
+    const opening = useContainerManager().attachTerminal(workerId, windowIndex);
+    let attached: Awaited<typeof opening>;
     try {
       attached = await withTimeout(
-        useDockerService().execAttachTmuxWindow(worker.containerId, windowIndex),
+        opening,
         "Opening console session timed out; verify the worker is running and retry.",
       );
     } catch (error) {
+      // A timed-out attach can still succeed; close its exact captured backend.
+      void opening.then(terminal => { try { terminal.close(); } catch {} }, () => {});
       useContainerManager().reportRuntimeFailure(
         workerId,
-        "Docker management console attach",
+        "Worker management console attach",
         error,
       );
       throw error;
@@ -82,8 +84,7 @@ export class ManagementConsoleStore {
       id: randomUUID(),
       workspaceId,
       workerId,
-      dockerContainerId: worker.containerId,
-      tmuxSession: attached.tmuxSession,
+      closeRuntime: attached.close,
       stream: attached.stream,
       output: Buffer.alloc(0),
       offset: 0,
@@ -94,6 +95,9 @@ export class ManagementConsoleStore {
     this.sessions.set(session.id, session);
     this.touch(session);
     attached.stream.on("data", (chunk: Buffer) => this.append(session, chunk));
+    attached.stream.on("close", () => {
+      void this.finish(session, "closed");
+    });
     attached.stream.on("end", () => {
       void this.finish(session, "closed");
     });
@@ -158,15 +162,7 @@ export class ManagementConsoleStore {
     this.sessions.delete(id);
     if (session.idleTimer) clearTimeout(session.idleTimer);
     session.state = "closed";
-    session.stream.end();
-    await withTimeout(
-      useDockerService().killTmuxSession(
-        session.dockerContainerId,
-        session.tmuxSession,
-      ),
-      "Closing console session timed out; it may already be stale.",
-      5_000,
-    ).catch(() => undefined);
+    try { session.closeRuntime(); } catch {}
     return { id, workerId: session.workerId, state: "closed" as const };
   }
 
@@ -226,9 +222,7 @@ export class ManagementConsoleStore {
     if (!this.sessions.delete(session.id)) return;
     if (session.idleTimer) clearTimeout(session.idleTimer);
     session.state = state;
-    await useDockerService()
-      .killTmuxSession(session.dockerContainerId, session.tmuxSession)
-      .catch(() => {});
+    try { session.closeRuntime(); } catch {}
   }
 
   private public(session: ConsoleSession) {
