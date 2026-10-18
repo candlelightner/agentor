@@ -3,6 +3,7 @@ import type { Readable } from 'node:stream';
 import type { Config } from './config';
 import type { ImageUpdateInfo, UpdateStatus, ApplyResult, UpdatableImage, PruneResult } from '../../shared/types';
 import { withOperationDeadline } from './operation-deadline';
+import { promoteNativeWorkerUpdate } from './native-worker-update';
 
 interface ImageRef {
   registry: string;
@@ -21,6 +22,7 @@ export class UpdateChecker {
   private docker: Docker;
   private config: Config;
   private status: UpdateStatus;
+  private workerUpdate?: Promise<void>;
   private pollInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: Config) {
@@ -309,7 +311,16 @@ export class UpdateChecker {
     });
   }
 
-  async applyUpdates(images?: UpdatableImage[]): Promise<ApplyResult> {
+  private async updateWorkerImage(validateAuthority?: () => Promise<void>): Promise<void> {
+    if (!this.config.incusEnabled) return this.pullImage(this.config.workerImagePrefix + this.config.workerImage);
+    if (!validateAuthority) throw new Error('Native worker Apply requires current platform administrator authority');
+    const { useIncusClient } = await import('./services');
+    const { useImageCatalogManager } = await import('./image-catalog');
+    await promoteNativeWorkerUpdate(this.config, this.status.worker!.remoteDigest, this.docker,
+      useIncusClient(), useImageCatalogManager(), image => this.pullImage(image), validateAuthority);
+  }
+
+  async applyUpdates(images?: UpdatableImage[], validateWorkerAuthority?: () => Promise<void>): Promise<ApplyResult> {
     const result: ApplyResult = {
       orchestratorPulled: false,
       workerPulled: false,
@@ -329,13 +340,23 @@ export class UpdateChecker {
     const shouldUpdate = (key: UpdatableImage) => !images || images.includes(key);
     const prefix = this.config.workerImagePrefix;
 
-    // Pull worker image if update available
+    // Publish the complete worker default if an update is available
     if (hasPrefix && shouldUpdate('worker') && this.status.worker?.updateAvailable) {
       try {
-        await this.pullImage(prefix + this.config.workerImage);
+        if (this.config.incusEnabled) {
+          if (!validateWorkerAuthority) throw new Error('Native worker Apply requires current platform administrator authority');
+          await validateWorkerAuthority();
+        }
+        if (!this.workerUpdate) {
+          const execution = this.updateWorkerImage(validateWorkerAuthority);
+          this.workerUpdate = execution;
+          void execution.finally(() => { if (this.workerUpdate === execution) this.workerUpdate = undefined; }).catch(() => {});
+        }
+        await this.workerUpdate;
+        if (this.config.incusEnabled) await validateWorkerAuthority!();
         result.workerPulled = true;
       } catch (err: unknown) {
-        result.errors.push(`Worker pull failed: ${err instanceof Error ? err.message : String(err)}`);
+        result.errors.push(`Worker update failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 

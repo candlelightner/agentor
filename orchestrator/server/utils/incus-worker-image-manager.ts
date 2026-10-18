@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { Config } from './config';
 import { IncusClient, IncusError } from './incus-client';
 import { backupInstallationId } from './backup-installation';
-import type { ImageCatalogCore, NativeImageContext, NativeImageBinding } from './image-catalog-core';
+import type { ImageCatalogCore, NativeImageContext, NativeImageBinding, NativeImageSource } from './image-catalog-core';
 import { IncusImageConverter, incusConversionRecipeId, readCanonicalIncusBootstrap } from './incus-image-converter';
 import { normalizeAndImportIncusImage } from './incus-image-artifact';
 import { incusImageIdentity, sameIncusImageSource } from './incus-worker-image';
@@ -29,6 +29,20 @@ export class IncusWorkerImageManager {
     restoreSource = restoreSource && structuredClone(restoreSource);
     const active = async () => { signal?.throwIfAborted(); await validateAuthority(); signal?.throwIfAborted(); };
     const source = await this.catalog.authorizeNativeImageSource(requesterId, selection, active);
+    return this.ensureSource(source, active, signal, restoreSource);
+  }
+
+  async ensurePlatformDefault(sourceImageId: string, validateAuthority: () => Promise<void>, signal?: AbortSignal): Promise<NativeImageBinding> {
+    if (!/^[a-f0-9]{64}$/.test(this.seedFingerprint))
+      throw new Error('Default Incus conversion requires an operator-pinned converter seed fingerprint');
+    const active = async () => { signal?.throwIfAborted(); await validateAuthority(); signal?.throwIfAborted(); };
+    const source = await this.catalog.authorizePlatformDefaultImageSource(sourceImageId, active);
+    return this.ensureSource(source, active, signal);
+  }
+
+  private async ensureSource(source: NativeImageSource, active: () => Promise<void>, signal?: AbortSignal,
+    restoreSource?: WorkerBackupRuntimeSource): Promise<NativeImageBinding> {
+    const requesterId = source.requesterId;
     if (restoreSource) {
       parseWorkerBackupRuntime({ version: 1, kind: 'incus-vm', source: restoreSource });
       if (restoreSource.sourceImageId !== source.sourceImageId || restoreSource.converterVersion !== 'v0.4.0')

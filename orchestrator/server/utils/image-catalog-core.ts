@@ -190,7 +190,7 @@ export interface NativeImageContext {
 export interface NativeImageSource {
   requesterId: string; definitionId: string; definitionOwnerId: string; groupId?: string;
   version: string; sourceBuildId: string; sourceImageId: string; createdAt: string;
-  scope: 'own' | 'group' | 'system-default';
+  scope: 'own' | 'group' | 'system-default' | 'platform-default';
 }
 interface NativeImageDerivation {
   context: NativeImageContext; source: NativeImageSource; converter?: IncusImageConverterReceipt;
@@ -200,6 +200,8 @@ export interface NativeImageBinding {
   context: NativeImageContext; identity: IncusWorkerImageIdentity; buildId: string;
   capability: 'agentor-storage-ownership-v1';
 }
+const PLATFORM_DEFAULT_OWNER = 'agentor-platform-updater';
+const PLATFORM_DEFAULT_DEFINITION = '00000000-0000-4000-8000-000000000001';
 const NATIVE_UUID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 const NATIVE_HASH = /^[a-f0-9]{64}$/;
 const NATIVE_OCI = /^sha256:[a-f0-9]{64}$/;
@@ -227,7 +229,10 @@ function validateNativeSource(source: NativeImageSource): void {
       !nativeText(source.requesterId) || !NATIVE_UUID.test(source.definitionId) || !nativeText(source.definitionOwnerId) ||
       source.groupId !== undefined && !nativeText(source.groupId) || !nativeText(source.version) ||
       !NATIVE_UUID.test(source.sourceBuildId) || !NATIVE_OCI.test(source.sourceImageId) || !Number.isFinite(Date.parse(source.createdAt)) ||
-      !['own', 'group', 'system-default'].includes(source.scope)) throw new Error('Private native source is malformed');
+      !['own', 'group', 'system-default', 'platform-default'].includes(source.scope)) throw new Error('Private native source is malformed');
+  if (source.scope === 'platform-default' && (source.requesterId !== PLATFORM_DEFAULT_OWNER ||
+      source.definitionOwnerId !== PLATFORM_DEFAULT_OWNER || source.definitionId !== PLATFORM_DEFAULT_DEFINITION ||
+      source.groupId !== undefined || source.version !== 'default')) throw new Error('Platform default source is malformed');
 }
 function validateNativeDerivation(value: NativeImageDerivation, build: Pick<ImageBuild, 'id' | 'ownerId' | 'definitionId' | 'version' | 'digest'>): void {
   if (!nativeKeys(value, ['context', 'source', 'converter', 'imageImport'])) throw new Error('Private native derivation is malformed');
@@ -282,6 +287,8 @@ interface State {
   /** Reconstructable physical hints, usable only after fresh source/caller
    * authorization. Portable/catalog recovery never populates this map. */
   nativeBindings: Record<string, NativeImageBinding>;
+  /** Local server-approved upstream source; never a custom catalog selection. */
+  platformDefaultSource?: NativeImageSource;
 }
 interface ImageDeletion {
   id: string;
@@ -670,6 +677,7 @@ export class ImageCatalogCore {
     this.state.faults = structuredClone(previous.faults);
     this.state.deletions = structuredClone(previous.deletions);
     this.state.nativeBindings = structuredClone(previous.nativeBindings);
+    this.state.platformDefaultSource = structuredClone(previous.platformDefaultSource);
   }
 
   list(ownerId: string, admin: boolean) {
@@ -852,8 +860,38 @@ export class ImageCatalogCore {
     });
   }
 
+  /** Only the platform updater calls this after inspecting its configured,
+   * immutable upstream OCI. Reuse the native journal without inventing a
+   * controlled Docker build or making this source selectable by workers. */
+  async authorizePlatformDefaultImageSource(sourceImageId: string,
+    validateAuthority: () => Promise<void>): Promise<NativeImageSource> {
+    await this.init();
+    return this.mutate(async () => {
+      await validateAuthority();
+      if (!NATIVE_OCI.test(sourceImageId)) throw new Error('Platform default requires an immutable OCI source');
+      const previous = this.state.platformDefaultSource;
+      if (previous?.sourceImageId === sourceImageId) return structuredClone(previous);
+      if (this.state.builds.some(build => build.nativeDerivation?.source.scope === 'platform-default' &&
+          (build.status === 'running' || build.status === 'queued' ||
+            build.nativeDerivation.converter && !build.nativeDerivation.converter.removed ||
+            build.nativeDerivation.imageImport?.pending)))
+        throw new Error('Previous platform default conversion is unsettled; retain its exact acknowledgement');
+      const source: NativeImageSource = { requesterId: PLATFORM_DEFAULT_OWNER,
+        definitionOwnerId: PLATFORM_DEFAULT_OWNER, definitionId: PLATFORM_DEFAULT_DEFINITION,
+        version: 'default', sourceBuildId: randomUUID(), sourceImageId, createdAt: now(), scope: 'platform-default' };
+      validateNativeSource(source);
+      this.state.platformDefaultSource = source;
+      return structuredClone(source);
+    });
+  }
+
   private assertNativeSource(source: NativeImageSource): void {
     validateNativeSource(source);
+    if (source.scope === 'platform-default') {
+      if (!isDeepStrictEqual(source, this.state.platformDefaultSource))
+        throw new Error('Platform default source acknowledgement changed');
+      return;
+    }
     const definition = this.definition(source.definitionId, source.requesterId, source.scope === 'system-default');
     if (definition.ownerId !== source.definitionOwnerId || definition.groupId !== source.groupId ||
         source.scope === 'own' && definition.groupId || source.scope === 'group' && !definition.groupId ||
@@ -3336,9 +3374,14 @@ function normalizeState(value: any): State {
       }))
     : [];
   for (const build of builds) if (build.nativeDerivation !== undefined) validateNativeDerivation(build.nativeDerivation, build);
+  if (value?.platformDefaultSource !== undefined) {
+    validateNativeSource(value.platformDefaultSource);
+    if (value.platformDefaultSource.scope !== 'platform-default') throw new Error('Platform default source scope is invalid');
+  }
   return {
     definitions,
     builds,
+    platformDefaultSource: value?.platformDefaultSource,
     userDefaults:
       value?.userDefaults && typeof value.userDefaults === "object"
         ? value.userDefaults

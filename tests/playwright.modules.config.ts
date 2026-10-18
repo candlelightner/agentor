@@ -130,6 +130,7 @@ export default defineConfig({
     "api/incus-converted-image-boot-live.spec.ts",
     "api/incus-image-artifact.spec.ts",
     "api/incus-worker-image-manager.spec.ts",
+    "api/native-worker-update.spec.ts",
     "api/catalog-native-binding.spec.ts",
     "api/image-catalog-hierarchy.spec.ts",
     "api/incus-exec-transport.spec.ts",

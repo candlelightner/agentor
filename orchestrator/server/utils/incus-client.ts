@@ -1373,6 +1373,31 @@ export class IncusClient {
     return this.request<IncusImageAlias>('GET', `/1.0/images/aliases/${encodeURIComponent(alias)}`);
   }
 
+  /** Update an existing approved alias only against its exact snapshot. A
+   * lost PUT response is observed, never retried automatically. */
+  async promoteImageAlias(alias: string, expected: IncusImageAlias, fingerprint: string): Promise<void> {
+    if (!/^[a-f0-9]{64}$/.test(fingerprint)) throw new IncusError('Native default fingerprint is invalid');
+    const path = `/1.0/images/aliases/${encodeURIComponent(alias)}`;
+    const snapshot = await this.rawRequest('GET', path);
+    const envelope = JSON.parse(snapshot.body.toString('utf8')) as IncusResponse<IncusImageAlias>;
+    if (snapshot.statusCode >= 400 || envelope.type !== 'sync' || !envelope.metadata)
+      throw new IncusError('Native default alias snapshot is unavailable', snapshot.statusCode);
+    const current = envelope.metadata;
+    if (current.target === fingerprint) return; // An explicit Apply retry observes prior publication.
+    if (!isDeepStrictEqual(current, expected) || typeof snapshot.headers.etag !== 'string' || !snapshot.headers.etag)
+      throw new IncusError('Native default alias changed; no promotion was submitted');
+    try {
+      await this.request('PUT', path, { target: fingerprint, description: current.description }, { 'If-Match': snapshot.headers.etag });
+    } catch (error) {
+      // A positive readback of this exact target proves publication despite a
+      // lost acknowledgement. Any other outcome stays unresolved to the caller.
+      try { if ((await this.getImageAlias(alias)).target === fingerprint) return; } catch { /* Retain original failure. */ }
+      throw error;
+    }
+    if ((await this.getImageAlias(alias)).target !== fingerprint)
+      throw new IncusError('Native default alias promotion was not observed');
+  }
+
   async hasImageAlias(alias: string): Promise<boolean> {
     try {
       await this.getImageAlias(alias);

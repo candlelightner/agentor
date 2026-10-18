@@ -41,9 +41,10 @@ defineRouteMeta({
 import type { UpdatableImage } from '../../../shared/types';
 import { useUpdateChecker, useTraefikManager } from '../../utils/services';
 import { requireAdmin } from '../../utils/auth-helpers';
+import { isPlatformAdminUser } from '../../utils/auth';
 
 export default defineEventHandler(async (event) => {
-  requireAdmin(event);
+  const principal = requireAdmin(event);
   const checker = useUpdateChecker();
   const status = checker.getStatus();
 
@@ -62,7 +63,9 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 400, statusMessage: 'No updates available' });
   }
 
-  const result = await checker.applyUpdates(images);
+  const result = await checker.applyUpdates(images, async () => {
+    if (!isPlatformAdminUser(principal.user.id)) throw createError({ statusCode: 403, statusMessage: 'Platform administrator authority changed' });
+  });
 
   // Force-recreate Traefik container with new image if pulled
   if (result.traefikPulled) {
