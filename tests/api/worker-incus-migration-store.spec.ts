@@ -4,6 +4,13 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WorkerStore, type WorkerRecord, type WorkerIncusMigration } from '../../orchestrator/server/utils/worker-store';
+import { ContainerManager } from '../../orchestrator/server/utils/container';
+import { WorkerConfigStore, useWorkerConfigStore } from '../../orchestrator/server/utils/worker-config-store';
+import { zeroUserEnvVars } from '../../orchestrator/server/utils/user-env-store';
+import type { Config } from '../../orchestrator/server/utils/config';
+import type { ContainerInfo } from '../../orchestrator/shared/types';
+
+(globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, error() {}, debug() {} });
 
 const stamp = '2026-10-08T12:00:00.000000000Z';
 class FixtureStore extends WorkerStore {
@@ -13,7 +20,7 @@ class FixtureStore extends WorkerStore {
     return super.persistUser(userId);
   }
 }
-async function fixture(run: (f: { store: FixtureStore; record: WorkerRecord; marker: WorkerIncusMigration; path: string }) => Promise<void>) {
+async function fixture(run: (f: { store: FixtureStore; record: WorkerRecord; marker: WorkerIncusMigration; path: string; root: string }) => Promise<void>) {
   const root = await mkdtemp(join(tmpdir(), 'worker-incus-migration-store-'));
   const store = new FixtureStore(root); await store.init();
   const record: WorkerRecord = { id: randomUUID(), userId: 'migration-owner', status: 'active', displayName: 'Migration source',
@@ -24,7 +31,7 @@ async function fixture(run: (f: { store: FixtureStore; record: WorkerRecord; mar
   await store.upsert(record);
   const marker: WorkerIncusMigration = { nonce: randomUUID(), phase: 'preparing',
     source: { containerId: 'a'.repeat(64), createdAt: stamp, imageId: 'sha256:' + 'b'.repeat(64), wasRunning: true } };
-  try { await run({ store, record, marker, path: join(root, 'users', record.userId, 'workers.json') }); }
+  try { await run({ store, record, marker, root, path: join(root, 'users', record.userId, 'workers.json') }); }
   finally { await rm(root, { recursive: true, force: true }); }
 }
 
@@ -193,5 +200,89 @@ for (const stage of ['preparing', 'cutover'] as const) test(`queued ordinary set
       if (setter.name === 'mounts') { expect(current.mounts).toBeUndefined(); expect(current.hostMountsRevoked).toBe(true); }
       if (setter.name === 'devices') { expect(current.hardwareDeviceIds).toBeUndefined(); expect(current.hardwareDevicesRevoked).toBe(true); }
     }
+  });
+});
+
+for (const change of ['none', 'local', 'record', 'hardware', 'image', 'account', 'unavailable', 'applied-failure', 'worker-write-failure', 'revoked'] as const)
+test(`applied migration completion ${change} preserves captured configuration and retained authority`, async () => {
+  await fixture(async ({ store, record, marker, root, path }) => {
+    const config = { dataDir: root } as Config, manager = new ContainerManager({} as any, config);
+    manager.setWorkerStore(store);
+    const local = new WorkerConfigStore(config), singleton = useWorkerConfigStore(), markApplied = singleton.markApplied;
+    await local.replace(record.userId, record.id, [{ kind: 'variable', key: 'COLOR', value: 'blue' }]);
+    const selected = await local.resolveDesiredRevision(record.userId, record.id);
+    const opened = await store.transitionIncusMigration(record.userId, record.id, undefined, marker);
+    const validated = await store.transitionIncusMigration(record.userId, record.id, opened.incusMigration!,
+      { ...opened.incusMigration!, phase: 'validated', destinationIncarnation: randomUUID() });
+    const retained = await store.cutoverIncusMigration(record.userId, record.id, validated.incusMigration!);
+    const native = { ...retained, status: 'stopped', containerId: 'incus:' + retained.incusMigration!.destinationIncarnation,
+      containerName: 'agentor-worker-' + record.id, imageId: 'native', imageName: 'approved' } as ContainerInfo;
+    manager.registerExternal(native);
+    const options = { id: record.id, userId: record.userId, containerName: native.containerName,
+      cpuLimit: 2, memoryLimit: '4GiB', dockerEnabled: false, userEnv: zeroUserEnvVars(record.userId),
+      environmentJson: { dockerEnabled: false, networkMode: 'full', allowedDomains: [], setupScript: '', envVars: 'PREFIX=applied', exposeApis: {} },
+      workerJson: { id: record.id, displayName: record.displayName, repos: [], initScript: record.initScript, gitName: '', gitEmail: '' },
+      capabilitiesJson: [], instructionsJson: [], workerConfig: selected.values, configurationRevision: selected.revision };
+    let applied = false;
+    singleton.markApplied = async (...args) => {
+      expect(store.get(record.userId, record.id)?.pendingRebuild).toBe(true);
+      if (change === 'applied-failure') throw new Error('Applied snapshot failed');
+      await local.markApplied(...args); applied = true;
+    };
+    (manager as any).incusOptionsForWorker = async (current: ContainerInfo, useApplied: boolean, handle: string) => {
+      expect(applied).toBe(true); expect(useApplied).toBe(false); expect(handle).toBe(native.containerId);
+      if (change === 'unavailable') throw new Error('Desired state unavailable');
+      const desired = await local.resolveDesiredRevision(record.userId, record.id);
+      return { ...options, configurationRevision: desired.revision, workerConfig: desired.values,
+        workerJson: { ...options.workerJson, initScript: current.initScript },
+        environmentJson: { ...options.environmentJson, envVars: change === 'account' ? 'PREFIX=new' : options.environmentJson.envVars } };
+    };
+    try {
+      if (change === 'local') await local.replace(record.userId, record.id, [{ kind: 'variable', key: 'COLOR', value: 'green' }]);
+      if (change === 'record') await store.upsert({ ...retained, initScript: 'Edited after native bootstrap' });
+      if (change === 'hardware') await store.updateHardwareDeviceAccess(record.userId, record.id, [randomUUID()], false);
+      if (change === 'image') await store.upsert({ ...retained, imageVersion: 'v2' });
+      if (change === 'revoked') await store.updateHardwareDeviceAccess(record.userId, record.id, [], true);
+      if (change === 'worker-write-failure') store.fail = true;
+      const finish = (manager as any).completeIncusMigrationConfiguration(native, options, retained);
+      if (['applied-failure', 'worker-write-failure', 'revoked'].includes(change)) {
+        await expect(finish).rejects.toThrow();
+        expect(store.get(record.userId, record.id)?.pendingRebuild).toBe(true);
+        expect(native.pendingRebuild).toBe(true);
+      } else {
+        await finish;
+        expect(store.get(record.userId, record.id)?.pendingRebuild).toBe(change !== 'none');
+        expect(manager.get(record.id)?.pendingRebuild).toBe(change !== 'none');
+        expect(native.status).toBe('stopped');
+        const persisted = JSON.parse(await readFile(path, 'utf8')).find((value: WorkerRecord) => value.id === record.id);
+        expect(persisted.pendingRebuild).toBe(change !== 'none');
+        const snapshot = await local.resolveAppliedBootstrap(record.userId, record.id);
+        expect(snapshot).toMatchObject({ memoryLimit: '4GiB', environmentJson: { envVars: 'PREFIX=applied' }, workerJson: { initScript: record.initScript } });
+        expect(await local.resolveAppliedValues(record.userId, record.id)).toEqual(selected.values);
+        if (change === 'local') expect((await local.resolveValues(record.userId, record.id))[0]!.value).toBe('green');
+        if (change === 'record') expect(native.initScript).toBe('Edited after native bootstrap');
+      }
+      expect(store.get(record.userId, record.id)?.runtimeKind).toBe('incus-vm');
+      expect(store.get(record.userId, record.id)?.incusMigration).toEqual(retained.incusMigration);
+    } finally { singleton.markApplied = markApplied; store.fail = false; }
+  });
+});
+
+test('queued pending marker after migration completion is preserved rather than overwritten', async () => {
+  await fixture(async ({ store, record, marker }) => {
+    const opened = await store.transitionIncusMigration(record.userId, record.id, undefined, marker);
+    const validated = await store.transitionIncusMigration(record.userId, record.id, opened.incusMigration!,
+      { ...opened.incusMigration!, phase: 'validated', destinationIncarnation: randomUUID() });
+    const retained = await store.cutoverIncusMigration(record.userId, record.id, validated.incusMigration!);
+    let release!: () => void, entered!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; }), ready = new Promise<void>(resolve => { entered = resolve; });
+    const completion = store.completeIncusMigrationConfiguration(record.userId, record.id, retained.incusMigration!, async () => {
+      entered(); await hold; return false;
+    });
+    await ready;
+    const edited = store.markPendingRebuild(record.userId, record.id);
+    release(); await completion; await edited;
+    expect(store.get(record.userId, record.id)?.pendingRebuild).toBe(true);
+    expect(store.get(record.userId, record.id)?.incusMigration).toEqual(retained.incusMigration);
   });
 });

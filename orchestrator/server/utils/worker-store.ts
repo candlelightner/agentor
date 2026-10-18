@@ -239,6 +239,21 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     });
   }
 
+  /** Applied bootstrap publication follows native cutover; keep later desired edits pending. */
+  async completeIncusMigrationConfiguration(userId: string, id: string, expected: WorkerIncusMigration,
+    pendingAfterCompletion: (current: WorkerRecord) => Promise<boolean>): Promise<WorkerRecord> {
+    expected = cloneMigration(expected);
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId), previous = map?.get(id);
+      if (!map || !previous || previous.runtimeKind !== 'incus-vm' || previous.status !== 'active' ||
+          previous.deletionPending || previous.incusRecreation || previous.hostMountsRevoked || previous.hardwareDevicesRevoked ||
+          expected.phase !== 'retained' || !isDeepStrictEqual(previous.incusMigration, expected))
+        throw new Error('Applied migration configuration authority changed');
+      const pendingRebuild = await pendingAfterCompletion(structuredClone(previous));
+      return this.persistMigration(userId, id, map, previous, { ...previous, pendingRebuild });
+    });
+  }
+
   async clearIncusMigration(userId: string, id: string, expected: WorkerIncusMigration): Promise<WorkerRecord> {
     expected = cloneMigration(expected);
     return this.withUserMutation(userId, async () => {

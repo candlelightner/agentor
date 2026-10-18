@@ -1000,7 +1000,7 @@ export class ContainerManager {
         const resolved = await this.workerStore!.cutoverIncusMigration(record.userId, id, marker);
         cutover = true; native.status = desired; native.desiredRuntimeStatus = desired; native.updatedAt = resolved.updatedAt;
         this.containers.set(id, native); this.runtimeObservations.delete(id);
-        await useWorkerConfigStore().markApplied(record.userId, id, this.appliedIncusBootstrap(options, native), options.configurationRevision);
+        await this.completeIncusMigrationConfiguration(native, options, resolved);
         await rm(scratch, { recursive: true });
         useLogCollector().attach(native.containerName, native.containerId, 'worker', native.displayName).catch(() => {});
         return { ...native };
@@ -1486,6 +1486,24 @@ export class ContainerManager {
       userEnv: opts.userEnv, environmentJson: opts.environmentJson, capabilitiesJson: opts.capabilitiesJson,
       instructionsJson: opts.instructionsJson, workerJson: opts.workerJson,
       excludedGlobalEnvVarKeys: info.excludedGlobalEnvVarKeys ?? [], excludedGroupEnvVarKeys: info.excludedGroupEnvVarKeys ?? [] };
+  }
+
+  private async completeIncusMigrationConfiguration(native: ContainerInfo, options: IncusWorkerOptions,
+    committed: WorkerRecord): Promise<void> {
+    if (!this.workerStore) throw new Error('Migration worker store is unavailable');
+    await useWorkerConfigStore().markApplied(native.userId, native.id,
+      this.appliedIncusBootstrap(options, native), options.configurationRevision);
+    const completed = await this.workerStore.completeIncusMigrationConfiguration(native.userId, native.id, committed.incusMigration!, async current => {
+      if (!isDeepStrictEqual({ ...current, updatedAt: committed.updatedAt }, committed)) return true;
+      const desiredInfo = { ...native, ...current, status: native.status };
+      try {
+        const wanted = await this.incusOptionsForWorker(desiredInfo, false, native.containerId);
+        return !isDeepStrictEqual(wanted.configurationRevision, options.configurationRevision) ||
+          !isDeepStrictEqual(this.appliedIncusBootstrap(wanted, desiredInfo), this.appliedIncusBootstrap(options, native)) ||
+          !isDeepStrictEqual(wanted.workerConfig, options.workerConfig);
+      } catch { return true; /* Unavailable desired state cannot be claimed as applied. */ }
+    });
+    Object.assign(native, completed, { status: native.status });
   }
 
   private static readonly STATE_MAP: Record<string, ContainerStatus> = {
