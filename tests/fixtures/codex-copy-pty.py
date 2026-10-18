@@ -86,9 +86,10 @@ try:
     command = shlex.join([binary, '--no-daemon', '--no-alt-screen', '-C', str(work), 'Produce the fixture response.'])
     tmux('-f', '/dev/null', 'new-session', '-d', '-s', 'main', command)
     subprocess.run(['sh', '-ec', setup + 'true'], env=env, check=True)
+    tmux('new-session', '-d', '-t', '=main', '-s', 'web')
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 120, 0, 0))
-    process = subprocess.Popen(['tmux', 'attach-session', '-t', 'main'], stdin=slave, stdout=slave, stderr=slave,
+    process = subprocess.Popen(['tmux', 'attach-session', '-t', 'web'], stdin=slave, stdout=slave, stderr=slave,
                                env=env, start_new_session=True,
                                preexec_fn=lambda: fcntl.ioctl(slave, termios.TIOCSCTTY, 0))
     os.close(slave)
