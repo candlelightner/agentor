@@ -1653,7 +1653,13 @@ export class ContainerManager {
         continue;
       }
       if (normalizeWorkerRuntimeKind(worker.runtimeKind) !== "legacy-docker") {
-        useLogger().error(`[container] quarantined Docker runtime with Incus worker identity ${labelId}`);
+        const retained = worker.incusMigration;
+        const observation = observations.get(dc.Id);
+        // Retained migration sources stay excluded; only verified stopped rollback evidence is expected.
+        if (retained?.phase !== 'retained' || retained.source.containerId !== dc.Id ||
+            retained.source.imageId !== dc.ImageID || dc.State !== 'exited' ||
+            observation?.status !== 'stopped' || observation.lifecycleStale)
+          useLogger().error(`[container] quarantined Docker runtime with Incus worker identity ${labelId}`);
         continue;
       }
 

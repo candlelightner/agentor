@@ -72,6 +72,47 @@ function dockerWorker() {
   };
 }
 
+test('native inventory quietly excludes only exact verified stopped retained migration sources', async () => {
+  const logger = (globalThis as any).useLogger;
+  try {
+    for (const scenario of ['retained', 'wrong-id', 'wrong-image', 'running', 'unavailable', 'no-receipt'] as const) {
+      const errors: string[] = [];
+      (globalThis as any).useLogger = () => ({ error(message: string) { errors.push(message); }, warn() {}, info() {}, debug() {} });
+      const source = { containerId: 'a'.repeat(64), imageId: 'sha256:' + 'c'.repeat(64),
+        createdAt: '2026-01-01T00:00:00.000Z', wasRunning: false };
+      const record = { ...workerRecord(), runtimeKind: 'incus-vm' as const,
+        incusMigration: scenario === 'no-receipt' ? undefined : { nonce: '11111111-1111-4111-8111-111111111111',
+          phase: 'retained' as const, source, destinationIncarnation: '22222222-2222-4222-8222-222222222222' } };
+      const before = structuredClone(record), writes: string[] = [];
+      const docker = { ...dockerWorker(), Id: scenario === 'wrong-id' ? 'b'.repeat(64) : source.containerId,
+        ImageID: scenario === 'wrong-image' ? 'sha256:' + 'd'.repeat(64) : source.imageId,
+        State: scenario === 'running' ? 'running' : 'exited' };
+      const manager = new ContainerManager({
+        listContainers: async () => [docker],
+        inspectContainerRuntime: async () => {
+          if (scenario === 'unavailable') throw Error('Docker observation unavailable');
+          return { status: docker.State, running: scenario === 'running' };
+        },
+        probeContainerTask: async () => undefined,
+      } as any, { containerPrefix: 'agentor-worker' } as any);
+      manager.setWorkerStore({
+        list: () => [record], findById: () => record,
+        get: (owner: string, id: string) => owner === record.userId && id === record.id ? record : undefined,
+        upsert: async () => { writes.push('upsert'); },
+        setDesiredRuntimeStatus: async () => { writes.push('desired'); },
+      } as any);
+      await manager.sync();
+      expect(errors, scenario).toEqual(scenario === 'retained' ? [] : [
+        `[container] quarantined Docker runtime with Incus worker identity ${record.id}`,
+      ]);
+      expect(manager.get(record.id), scenario).toMatchObject({ runtimeKind: 'incus-vm',
+        containerId: 'agentor-worker-worker-1', status: 'unknown' });
+      expect(record, scenario).toEqual(before);
+      expect(writes, scenario).toEqual([]);
+    }
+  } finally { (globalThis as any).useLogger = logger; }
+});
+
 test('a late runtime probe overlapping recreation cannot repopulate the stale status cache', async () => {
   let finish!: (value: unknown) => void;
   let calls = 0;
