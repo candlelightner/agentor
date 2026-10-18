@@ -201,19 +201,22 @@ test('root image context uses explicit source rules and late known-secret exclus
     'instance-restore-helper.mjs', 'volume-mount-helper.py', 'incus-volume-live-helper.py'].map(name => '!orchestrator/' + name),
     '!orchestrator/app/', '!orchestrator/app/**', '!orchestrator/server/', '!orchestrator/server/**',
     '!orchestrator/shared/', '!orchestrator/shared/**', '!worker/', '!worker/vm/', '!worker/vm/**',
-    '!worker/entrypoint.sh', '!scripts/', '!scripts/build-incus-worker-image.sh', '!scripts/incus-canary.mjs']);
+    '!worker/entrypoint.sh', '!scripts/', '!scripts/build-incus-worker-image.sh', '!scripts/incus-canary.mjs',
+    '!orchestrator/server/api/backups/', '!orchestrator/server/api/backups/**/', '!orchestrator/server/api/backups/**/*.ts']);
   // Docker ignore has no knowledge of Git tracking. These rules protect the
   // named secret/data categories, not arbitrary untracked source-like files;
   // clean CI/scoped private build context remains a separate requirement.
   const lastAllow = Math.max(...allowed.map(rule => rules.indexOf(rule)));
   for (const rule of ['**/.git', '**/node_modules', '**/.output', '**/.env', '**/.env.*', '**/*.key', '**/*.pem', '**/*.crt',
     '**/data', '**/.claude', '**/.codex', '**/.gemini', '**/.agents', '**/.agent-data', '**/.aws', '**/.config', '**/auth.db*',
-    '**/auth.secret', '**/secrets.json', '**/backup-objects', '**/backups', '**/instance-backup-staging', '**/instance-restore-staging',
+    '**/auth.secret', '**/secrets.json', '**/backup-objects', '**/instance-backup-staging', '**/instance-restore-staging',
     '**/*.backup']) expect(rules.indexOf(rule)).toBeGreaterThan(lastAllow);
+  expect(rules.indexOf('**/backups')).toBeGreaterThan(rules.indexOf('!orchestrator/server/**'));
+  expect(rules.indexOf('**/backups')).toBeLessThan(rules.indexOf('!orchestrator/server/api/backups/'));
   const dockerfile = await readFile('../orchestrator/Dockerfile', 'utf8');
   expect(dockerfile).not.toMatch(/^COPY\s+\.\s+/m);
   expect(dockerfile).toContain('worker/entrypoint.sh'); expect(dockerfile).toContain('worker/vm/');
-  expect(dockerfile).toContain('scripts/build-incus-worker-image.sh'); expect(dockerfile).toContain('RUN npm run build');
+  expect(dockerfile).toContain('scripts/build-incus-worker-image.sh'); expect(dockerfile.replace(/\\\r?\n\s*/g, ' ')).toMatch(/^RUN\s+(?:[^\n]*&&\s+)?npm run build\s*$/m);
   const packageJson = JSON.parse(await readFile('../orchestrator/package.json', 'utf8')) as { scripts: { build: string } };
   expect(packageJson.scripts.build).toContain('build-incus-worker-assets.mjs');
   const ci = await readFile('../.github/workflows/docker-build.yml', 'utf8');

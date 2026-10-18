@@ -21,9 +21,11 @@ test('standalone native helper adapter imports isolated locked dependencies with
     const result = JSON.parse(stdout.trim());
     expect(result.externalPackages).toEqual(['dockerode', 'h3', 'tar-stream', 'ws']);
     expect(result.dependencyFiles).toBeGreaterThan(0); expect(result.dependencyFiles).toBeLessThan(2000);
-    // Catalog, memory and hardware policy share the standalone adapter; bound
-    // their combined size while retaining the exact dependency graph checks.
-    expect(result.bundleBytes).toBeLessThan(850_000);
+    // Native admin recovery joins the catalog, memory and hardware policy in
+    // this bounded adapter; the dependency and application-isolation checks remain strict.
+    expect(result.bundleBytes).toBeLessThan(1_000_000);
+    expect(result.bundledInputs).toContain('server/utils/instance-restore-administrative.ts');
+    expect(result.bundledInputs).toContain('server/utils/incus-admin-restore.ts');
     expect(result.bundledInputs).toContain('server/utils/incus-worker-runtime.ts');
     expect(result.bundledInputs).toContain('server/utils/worker-config-store-core.ts');
     expect(result.bundledInputs).toContain('server/utils/image-catalog-core.ts');
@@ -101,7 +103,7 @@ test('production build invokes adapter only after Nuxt, copying no builder depen
     expect(lock.packages['node_modules/' + dependency].version).toBe(version);
   }
   const dockerfile = await readFile(join(dirname(buildScript), 'Dockerfile'), 'utf8');
-  expect(dockerfile).toContain('RUN npm run build');
+  expect(dockerfile.replace(/\\\r?\n\s*/g, ' ')).toMatch(/^RUN\s+(?:[^\n]*&&\s+)?npm run build\s*$/m);
   expect(dockerfile).toContain('COPY --from=builder /app/orchestrator/.output/ .output/');
   expect(dockerfile).not.toMatch(/COPY[^\n]*\/app\/(?:orchestrator\/)?node_modules/);
   const helper = await readFile(join(dirname(buildScript), 'instance-restore-helper.mjs'), 'utf8');
