@@ -117,21 +117,30 @@ test('a missing populated volume is never silently replaced by empty storage', a
 test('startup quarantines only the worker whose storage recovery fails', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'agentor-volume-quarantine-'));
   try {
-    const manager = new ManagedVolumeManager(dir, {} as any); await manager.init();
+    const visited: string[] = [], sources = new Map<string, { id: string; userId: string; workerId: string }>();
+    const manager = new ManagedVolumeManager(dir, {
+      getVolume: (name: string) => ({ inspect: async () => {
+        const source = sources.get(name)!;
+        visited.push(source.workerId);
+        if (source.workerId === 'broken-worker') throw new Error('internal detail must not escape');
+        return { Name: name, Driver: 'local', Labels: { 'agentor.volume-id': source.id,
+          'agentor.owner-id': source.userId, 'agentor.worker-id': source.workerId } };
+      } }),
+      createVolume: async () => { throw new Error('Seeded storage must never be replaced'); },
+    } as any); await manager.init();
     const broken = await manager.store.create('owner-a', 'broken-worker', '/opt/models');
     const healthy = await manager.store.create('owner-a', 'healthy-worker', '/opt/models');
-    const visited: string[] = [];
-    manager.recoverWorker = async (_owner, worker) => {
-      visited.push(worker);
-      if (worker === 'broken-worker') throw new Error('internal detail must not escape');
-    };
+    for (const source of [broken, healthy]) {
+      sources.set(source.dockerName, source);
+      await manager.store.save({ ...source, seeded: true, state: 'ready' });
+    }
     await manager.recoverStartup();
     expect(visited).toEqual(expect.arrayContaining(['broken-worker', 'healthy-worker']));
     expect(manager.isRecoveryBlocked('broken-worker')).toBe(true);
     expect(manager.isRecoveryBlocked('healthy-worker')).toBe(false);
     expect(manager.store.get('owner-a', broken.id)).toMatchObject({ state: 'failed' });
     expect(JSON.stringify(publicVolume(manager.store.get('owner-a', broken.id)!))).not.toContain('internal detail');
-    expect(manager.store.get('owner-a', healthy.id)).toMatchObject({ state: 'pending' });
+    expect(manager.store.get('owner-a', healthy.id)).toMatchObject({ state: 'ready', seeded: true });
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
