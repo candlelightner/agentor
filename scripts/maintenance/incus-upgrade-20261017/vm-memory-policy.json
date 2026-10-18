@@ -1,7 +1,0 @@
-{
-  "previouslyUncappedVmWorkerMemoryLimit": "4g",
-  "preserveExplicitMemoryLimits": true,
-  "changeRetainedDockerWorkerEnvironments": false,
-  "sharedEnvironmentHandling": "Clone environments when retained Docker workers also use them",
-  "reason": "An absent Docker cap otherwise becomes Incus's implicit 1 GiB VM allocation, which caused measured memory and IO pressure with the desktop browser and package installation."
-}

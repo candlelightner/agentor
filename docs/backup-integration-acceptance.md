@@ -211,76 +211,15 @@ The sizing-helper smoke, real stack, global setup, complete API/UI arguments,
 reports and cleanup are unchanged. No live image load or suite is claimed by
 the pure hook tests. Default runs still build both images.
 
-For the reviewed historical Docker baseline, application source `497d7e0c`
-differs from `a7f180fe` only in the two settled legacy reader stop grace periods;
-worker source and backup/restore routes are unchanged. These pins are the image
-**config IDs**, identified by each saved archive's `manifest.json` `Config`
-member, then verified by the classic fixture daemon after `docker load`.
-The approved worker archive loads as config ID `e64f…`; its source-system OCI
-identity and native-VM provenance remain `58fd…`. The orchestrator similarly
-loads as config ID `e7ed…`, rather than source manifest/list ID `390b…`.
-Do not change native OCI provenance to match this test-only daemon representation.
-This remains the historical Docker gate, not acceptance of native-default admins.
+Use the runner's reviewed prebuilt-image inputs with operator-provided archive
+paths, SHA256 values and Docker config IDs. Read config IDs from each archive's
+`manifest.json` and verify them after loading; OCI source digests and classic
+Docker config IDs are distinct identities and must not be interchanged.
 
-After the operator has copied the committed test source to
-`/opt/agentor-backup-source` and these two 0600 root-owned export files into the
-**owned guest**, this exact one-off Python invocation reuses `inside_guest`'s
-VM/DMI checks, daemon pinning, fresh-resource checks, complete suite, evidence
-and cleanup. It creates a fresh attempt UUID/results directory without adopting
-an earlier attempt or stopping the outer VM. Run it only via that guest's
-already pinned SSH session, never on the production host. `VM_NONCE` is the
-existing guest's genuine DMI UUID from its root-private provisioning receipt;
-it is not a new attempt nonce. No socket or host/device bind is added.
-
-```bash
-sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
-  VM_NONCE=1cf75b31-f685-4833-b5c3-5cbf4089563a python3 - <<'PY'
-import importlib.util, os, uuid
-from pathlib import Path
-source = Path('/opt/agentor-backup-source')
-spec = importlib.util.spec_from_file_location('backup_vm', source / 'scripts/test-backup-integration-vm.py')
-vm = importlib.util.module_from_spec(spec); spec.loader.exec_module(vm)
-nonce = os.environ['VM_NONCE']
-vm.assert_guest(nonce)  # Before any Docker operation.
-attempt = str(uuid.uuid4())
-vm.GUEST_RESULTS = Path('/var/log/agentor-backup-prebuilt-' + attempt)
-original = vm.guest_plan
-
-def fresh_prebuilt(suite, guest_nonce):
-    plan = original(suite, attempt)  # Fresh names for all three volumes/runner.
-    service = plan['override']['services']['test-runner']
-    service['labels'] = {'agentor.backup-vm.nonce': guest_nonce}
-    for volume in plan['override']['volumes'].values():
-        volume['labels'] = {'agentor.backup-vm.nonce': guest_nonce}
-    service['environment'].update({
-        'AGENTOR_TEST_PREBUILT_IMAGES': 'true',
-        'AGENTOR_TEST_PREBUILT_WORKER_ID': 'sha256:e64f61be2cb41717941977f9a91bd7244e17556bc392140c7476773262a991f3',
-        'AGENTOR_TEST_PREBUILT_WORKER_SHA256': 'a36e14ecc081c846e456edfffff7107b53791df54f54e33a0b7a8fad5631c4e2',
-        'AGENTOR_TEST_PREBUILT_ORCHESTRATOR_ID': 'sha256:e7ed7c7fdbb8f9a6a3a0c932a5ded16243ee50c3fdbde4e4d616de7dce83c8bd',
-        'AGENTOR_TEST_PREBUILT_ORCHESTRATOR_SHA256': 'ba8f4bc5045d25cd81f4525efddcf80891bb653eeeb827a09281991d5852d98d',
-    })
-    for name, export in [('worker', 'approved-worker-58fd7.tar'),
-                         ('orchestrator', 'orchestrator-reader-stop-497d7e0c.tar')]:
-        service['volumes'].append({'type': 'bind',
-            'source': '/opt/agentor-native-dr-assets/' + export,
-            'target': '/run/agentor-prebuilt-' + name + '.tar', 'read_only': True,
-            'bind': {'create_host_path': False}})
-    return plan
-
-vm.guest_plan = fresh_prebuilt
-print('Fresh prebuilt attempt reports: ' + str(vm.GUEST_RESULTS), flush=True)
-raise SystemExit(vm.inside_guest(nonce, 'instance'))
-PY
-```
-
-The unchanged instance command is
-`api/instance-backup-docker-live.spec.ts --project=api --workers=1 --retries=0`.
-Inspect and retain the new `compose.json`, `runner.log`, `result.json` and reports
-before any further attempt. A failed/partially loaded daemon is not retried or
-adopted by this opt-in path. Docker failures include only the fixed command,
-exit status/error code and JSON-escaped stderr capped at 4,096 characters; full
-error objects, stdout and environment are not printed. Archive hashes/config IDs must be reviewed again
-for any different export; no image is pulled or built as a fallback.
+The guest nonce must come from that disposable VM's private provisioning receipt.
+Keep nonce values, archive inventories, local paths and attempt results private;
+do not copy an earlier deployment's identifiers or example checksums. Unknown
+or partially completed image loads require inspection rather than blind replay.
 
 Pure checks (no Docker calls):
 `sudo -n node --test tests/helpers/test_prebuilt_images.mjs` and

@@ -1,1 +1,0 @@
-UUID=17b446d6-0931-49a9-84a9-f5edac5a723f /mnt/agentor-vm-ssd ext4 defaults,noatime,nofail,x-systemd.device-timeout=30s 0 2

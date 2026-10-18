@@ -74,8 +74,8 @@ else:
     group_record, = [r for r in evidence['state']['records'] if r['kind'] == 'group-administrative']
 assert global_record['kind'] == 'administrative' and global_record.get('ownerId') in (None, owner)
 assert group_record['kind'] == 'group-administrative' and group_record['ownerId'] == owner
-worker = 'sha256:58fd7a3811dca2ee58fd066024df0857c541ac14fa0b1f9dccab665153ba7b3c'
-fingerprint = '6e9bd852e1a6490c091ea56027baa44bd33140a5cba04a5cac9dcbac43535296'
+worker = os.environ['DR_WORKER_OCI']
+fingerprint = os.environ['DR_NATIVE_FINGERPRINT']
 for record in (global_record, group_record):
     assert record['trusted'] is True and record['runtimeKind'] == 'incus-vm'
     assert record['nativeRuntime']['image']['fingerprint'] == fingerprint

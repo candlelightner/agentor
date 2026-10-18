@@ -186,9 +186,8 @@ failed/cancelled offline size helpers on available directory pools. The original
 receipt must already contain the helper UUID and applicable copy acknowledgement.
 Uncaptured identities, active/imported images, workspace writers, remaining or
 orphaned helper disks, unavailable sources, pool mismatch and changed evidence
-are rejected. The historical c3a671a9 and 567f930b incidents are **not** authorized
-by this command; missing original acknowledgements/unavailable storage remain
-unresolved.
+are rejected. Missing original acknowledgements or unavailable source storage remain
+unresolved; matching names or later observations do not grant recovery authority.
 
 1. Pause submissions. Explicitly stop the configured Orchestrator and **all**
    other DATA writers, disable their automatic restart, and keep them offline

@@ -526,11 +526,7 @@ The disposable VM log fixture additionally proves suite-stage cancellation, time
 Administrative identity fault coverage includes nine platform-authority real-file cases in `ordinary-worker-identity.spec.ts`: invalid schema/kind/ID, empty/unsafe IDs, JSON corruption, directory/dangling-link authority, and legitimate ENOENT. Actual ordinary list/unarchive/delete/migration and dedicated ensure/start/rebuild all fail closed with 503 and unchanged bytes/zero runtime calls for existing invalid authority; a genuinely absent file remains absent until explicit ensure.
 
 Ten further real-file cases cover malformed nested group-admin schema/kind/ID/owner/group identity (including null), historical ordinary-shadow lifecycle denial, legacy IDs without services, and mixed healthy/quarantined-owner startup reconciliation (26 identity cases total). Invalid group files retain their exact bytes and expose no partial owner authority; invalid updates retain the last valid identity. Reconciliation continues for healthy owners while leaving quarantined Docker and Incus records unchanged with zero compute/storage calls; direct requests remain denied with 503. These checks use private temporary metadata and mocked runtimes, not production API/UI or native VM acceptance.
-Operational archived-worker migration: run `python3 -m unittest -v test_migrate_archived_worker.py`
-from `scripts/maintenance/incus-upgrade-20261017`. Sixteen isolated tests cover admission,
-immutable custom images, environment equivalence, private receipts, bounded sample exclusions,
-mocked lifecycle success/ambiguity, retained-source identity, native acceptance, legacy managed
-shape refusal, same-worker editor redirects, guarded post-unarchive continuation and normal execution delegation. These tests do not execute production migration.
+
 
 
 `api/admin-native-authority.spec.ts` adds seven module cases covering native-before-provision global/group records, private durable acknowledgements, dedicated legacy cutover, acknowledgement failure before side effects, malformed metadata quarantine preserving bytes, and identity-preserving runtime patches. Existing 13 administrative store transaction cases pass.

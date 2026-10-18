@@ -10,7 +10,7 @@ Use the current reviewed checkout containing `docs/administrative-native-dr-acce
 
 ## 1. Identities and immutable inputs
 
-Set `DR_REPO` to the trusted checkout, `DR_ASSETS` to the copied export directory, `DR_NONCE` to the parent's fresh VM UUID/kernel nonce, and `DR_APP_IMAGE` to the full immutable Docker ID of the actual 09a-or-newer reviewed application image. Transfer/load that application archive separately and verify its parent's receipt. Do not substitute the worker OCI below for the current application.
+Set `DR_REPO` to the trusted checkout, `DR_ASSETS` to the copied export directory, `DR_NONCE` to the parent's fresh VM UUID/kernel nonce, and `DR_APP_IMAGE` to the full immutable Docker ID of the current reviewed application image. Transfer/load that application archive separately and verify its parent's receipt. Do not substitute the worker OCI below for the current application.
 
 Before writes, require root, the exact DMI UUID, exactly one `agentor.native_dr_fixture=$DR_NONCE` kernel argument, nested `/dev/kvm`, an empty Incus installation and the expected guest disk. These are guest checks; no physical-host commands are part of the sequence. Define:
 
@@ -21,15 +21,12 @@ Before writes, require root, the exact DMI UUID, exactly one `agentor.native_dr_
 - Shared **guest directory-backed** pool `${DR_BASE}p`; alias `${DR_BASE}-worker` in each project.
 - One new fixture installation UUID `DR_INSTALLATION`, persisted in each otherwise independent DATA root as `backup-installation-id`. This deliberately restores the same installation identity; accounts, files and projects are independent. It lets the existing installer enforce one pool ownership label. Do not copy any source auth, runtime record or credential into the initially empty recovery DATA. A separate destination VM uses the source artifact's installation UUID instead of minting a different value.
 
-Create `/run/agentor-native-dr`, `$DR_ROOT`, its `control`, `control/users`, `recovery`, `recovery/users`, `tls`, `work` directories as root `0700`; files/receipts/env files are `0600`. Create both `users` directories before starting policy/apps: the private policy enumerates that directory even before the first account exists. Refuse existing conflicting paths/receipts. The exported immutable inputs are:
-
-| File | Bytes | SHA256 |
-| --- | ---: | --- |
-| `approved-native` | 420 | `c60342361d6031dfcc5799e12042e37fa68056100dbd21c01b7e7af0452edcf7` |
-| `approved-native.root` | 2882994176 | `dad8e19dbaaecea83ed6637f1537f04779ee1678c025e661515f3bf8edd69c53` |
-| `approved-worker-58fd7.tar` | 2512668160 | `a36e14ecc081c846e456edfffff7107b53791df54f54e33a0b7a8fad5631c4e2` |
-
-Expected worker OCI: `sha256:58fd7a3811dca2ee58fd066024df0857c541ac14fa0b1f9dccab665153ba7b3c`; native fingerprint: `6e9bd852e1a6490c091ea56027baa44bd33140a5cba04a5cac9dcbac43535296`; recipe: `71695a417d32a7a400ef8d2b8b2649b7df6f21c816c140446696d667e91d29de`. Check sizes and hashes before import. `docker load --input "$DR_ASSETS/approved-worker-58fd7.tar"`, then inspect the exact OCI ID/amd64. Preserve exports; no conversion or d2vm invocation is needed.
+Create `/run/agentor-native-dr`, `$DR_ROOT`, its `control`, `control/users`, `recovery`, `recovery/users`, `tls`, `work` directories as root `0700`; files/receipts/env files are `0600`. Create both `users` directories before starting policy/apps: the private policy enumerates that directory even before the first account exists. Refuse existing conflicting paths/receipts. Export the approved native metadata/root pair and its matching worker OCI archive.
+Keep their paths, sizes and hashes in a private operator receipt. Verify those
+inputs before import and load the archive as `approved-worker.tar`. Supply
+`DR_WORKER_OCI`, `DR_NATIVE_FINGERPRINT` and `DR_RECIPE` from that verified receipt;
+never reuse another installation's recorded values or manufacture provenance.
+Preserve the exports; an already approved image pair needs no new conversion.
 
 ## 2. Reuse the installer leaves, not its conversion main
 
@@ -70,7 +67,7 @@ This retains the installer's restricted managed-NIC policy, private custom volum
 
 ## 3. Acknowledge imported images without manufacturing provenance
 
-Before importing, require `setup['default_recipe'](the_exact_worker_OCI)` to equal the pinned recipe above. This hashes the current trusted canonical bootstrap; disagreement means stop and reconcile the source/image pair. Do not rewrite image properties to make it pass.
+Before importing, require `setup['default_recipe'](the_exact_worker_OCI)` to equal the privately verified `DR_RECIPE`. This hashes the current trusted canonical bootstrap; disagreement means stop and reconcile the source/image pair. Do not rewrite image properties to make it pass.
 
 For each empty project, import exactly the verified pair:
 
@@ -78,7 +75,7 @@ For each empty project, import exactly the verified pair:
 incus --force-local --project "$DR_PROJECT" image import "$DR_ASSETS/approved-native" "$DR_ASSETS/approved-native.root"
 ```
 
-Require successful command completion and query the exact expected fingerprint in that project. Verify `type=virtual-machine`, amd64/x86_64 and properties `source_image_id=<worker OCI>`, `recipe_id=<recipe>`, `source_architecture=amd64`, `bootstrap_generation=3`, `converter_version=v0.4.0`. Only then create the absent alias with `incus --force-local --project "$DR_PROJECT" image alias create "${DR_BASE}-worker" <fingerprint>`, and query it back to confirm the same VM fingerprint. Save project/fingerprint/properties/alias acknowledgements privately. If an import/alias command is ambiguous, inspect that exact fingerprint/alias before any retry; never replace an unexpected alias. No catalog job, converter receipt or `defaultImage.phase=ready` record needs to be invented: this explicit exported-image import is proved directly by the runtime's existing immutable alias/source/recipe validation.
+Require successful command completion and query the privately verified fingerprint in that project. Verify `type=virtual-machine`, amd64/x86_64 and properties `source_image_id=<worker OCI>`, `recipe_id=<recipe>`, `source_architecture=amd64`, `bootstrap_generation=3`, `converter_version=v0.4.0`. Only then create the absent alias with `incus --force-local --project "$DR_PROJECT" image alias create "${DR_BASE}-worker" <fingerprint>`, and query it back to confirm the same VM fingerprint. Save project/fingerprint/properties/alias acknowledgements privately. If an import/alias command is ambiguous, inspect that exact fingerprint/alias before any retry; never replace an unexpected alias. No catalog job, converter receipt or `defaultImage.phase=ready` record needs to be invented: this explicit exported-image import is proved directly by the runtime's existing immutable alias/source/recipe validation.
 
 ## 4. TLS and the two narrow listeners
 
@@ -151,7 +148,7 @@ Only this source policy is active in same-guest `roundtrip`; recovery remains in
 
 ## 6. Containers, accounts and source data
 
-Create root-private env files using the exact fields in `administrative-native-dr-acceptance.md`; additionally set `WORKER_IMAGE_PREFIX=` and `INCUS_DOCKER_VOLUME_SIZE=1GiB`, and a fresh disposable `BETTER_AUTH_SECRET`. Set current `ORCHESTRATOR_IMAGE=$DR_APP_IMAGE`. Both apps point to the approved 58fd worker OCI, current fixture alias, pinned TLS and guest host-gateway services. The source has recovery mode `false`; destination has `true`. No GPU/USB setting is enabled.
+Create root-private env files using the exact fields in `administrative-native-dr-acceptance.md`; additionally set `WORKER_IMAGE_PREFIX=` and `INCUS_DOCKER_VOLUME_SIZE=1GiB`, and a fresh disposable `BETTER_AUTH_SECRET`. Set current `ORCHESTRATOR_IMAGE=$DR_APP_IMAGE`. Both apps point to the privately verified `DR_WORKER_OCI`, current fixture alias, pinned TLS and guest host-gateway services. The source has recovery mode `false`; destination has `true`. No GPU/USB setting is enabled.
 
 Start each app without privilege, devices, host PID or host networking. The exact container arguments are:
 
