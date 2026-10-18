@@ -178,3 +178,24 @@ Neither acceptance stack has been started. The real whole-instance UI/API spec a
 
 
 The inner test entrypoint verifies `0::/` before cgroup delegation and moves its root processes into `/init` before starting dockerd and Playwright. Consequently, the destructive instance fixture requires the exact later `/proc/self/cgroup` value `0::/init`, together with the fresh private marker and matching local daemon identity. Namespace root, descendant, host and hybrid/v1 cgroups are rejected; this does not alter the disposable-VM requirement or admit the blocked outer Docker runner.
+
+
+## Historical Docker fixture and native defaults
+
+The `instance` Docker gate is a historical baseline proof. Its fresh source has
+no ordinary workers but does have exactly one automatically provisioned trusted
+platform admin. The scenario checks the dedicated record, exact Docker identity,
+labels and canonical named-volume mounts, seeds its roots, and uses the dedicated
+Stop API before capture. Both complete bounded admin volume-tree snapshots and
+the exact stopped dedicated record must survive backup and restore; the manifest
+must contain both admin volumes. They join the exact allowlist for same-daemon
+handoff only after the encrypted artifact is verified. Only the captured stopped
+admin compute is retired; recovery mode must suppress all replacement compute.
+Unknown admins, ordinary workers, foreign mounts and native records fail closed.
+
+This Docker-only baseline must not be used as acceptance for the final product's
+mandatory native-VM admin default. A final native-default installation requires
+the separate guarded native administrative encrypted DR/lifecycle fixture; it
+must not silently provision a Docker admin merely to make this gate pass. The
+Docker baseline does not prove native administration or historical-admin-to-VM
+restore and makes no such acceptance claim.

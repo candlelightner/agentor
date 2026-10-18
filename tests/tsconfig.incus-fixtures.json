@@ -13,6 +13,8 @@
     "api/instance-restore-helper.spec.ts",
     "api/admin-native-owner-remap.spec.ts",
     "api/incus-admin-restore.spec.ts",
+    "api/instance-backup-docker-fixture.spec.ts",
+    "api/instance-backup-docker-live.spec.ts",
     "api/incus-hardware.spec.ts",
     "api/hardware-device-store.spec.ts",
     "api/worker-export-format.spec.ts",

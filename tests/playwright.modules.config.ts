@@ -65,6 +65,8 @@ export default defineConfig({
     "api/instance-backup-*.spec.ts",
     "api/private-native-dr-fixture.spec.ts",
     "api/private-admin-native-dr-fixture.spec.ts",
+    "api/instance-backup-docker-fixture.spec.ts",
+    "api/instance-backup-docker-live.spec.ts",
     "api/instance-native-apply.spec.ts",
     "api/instance-native-helper-process.spec.ts",
     "api/legacy-incus-migration-capture-live.spec.ts",

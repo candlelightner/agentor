@@ -1459,3 +1459,5 @@ Periodic native administrative identity refresh serializes with lifecycle work w
 Pending native administrative path selections do not block portable backup of already seeded data. They remain excluded until applied; whole-instance snapshot readiness is unchanged.
 
 Native administrative encrypted DR has an explicit private-system-VM capture/restore/lifecycle gate. It drives actual HTTP encryption/import/controlled-helper restore, verifies fresh stopped authority and all canonical/selected sample metadata, and keeps source data. Live acceptance remains unverified; same-daemon two-project round trips exclude private-network lifecycle.
+
+The historical Docker whole-instance acceptance gate includes the automatically created trusted platform admin and both persistent volumes. Ordinary source/destination emptiness remains strict; native-default admin creation and native DR require their separate private native gate.

@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { privateTestDocker } from '../helpers/private-test-docker';
+import { historicalDockerAdmin, HISTORICAL_ADMIN_VOLUMES, INSPECT_ADMIN_VOLUME } from '../helpers/instance-docker-admin';
 import { createWorker } from '../helpers/worker-lifecycle';
 import { TEST_ADMIN_EMAIL, TEST_ADMIN_NAME, TEST_ADMIN_PASSWORD } from '../global-setup';
 
@@ -55,8 +56,11 @@ test('private Docker whole-instance UI backup produces an encrypted multi-volume
   const source = JSON.parse(await docker('inspect', 'agentor-orchestrator'))[0];
   expect(source.Config.Labels['com.docker.compose.project']).toBe('agentor-test');
   expect(source.Mounts.find((mount: any) => mount.Destination === '/data')).toMatchObject({ Type: 'volume', Name: 'agentor-test_agentor-data' });
-  expect((await request.get('/api/containers')).ok()).toBe(true);
-  expect(await (await request.get('/api/containers')).json()).toEqual([]);
+  const readAdmin = async (containerId: string) => JSON.parse(await docker('exec', containerId, 'node', '-e',
+    "const f=require('node:fs'),p='/data/admin/workspace.v1.json';try{const d=f.openSync(p,f.constants.O_RDONLY|f.constants.O_NOFOLLOW);try{const s=f.fstatSync(d);if(!s.isFile()||s.size>65536)throw Error('Invalid fixture admin');console.log(f.readFileSync(d,'utf8'))}finally{f.closeSync(d)}}catch(e){if(e.code!=='ENOENT')throw e;console.log('null')}"));
+  const containers = await request.get('/api/containers'); expect(containers.status()).toBe(200);
+  const sourceAdmin = historicalDockerAdmin(await containers.json(), await readAdmin(source.Id),
+    JSON.parse(await docker('inspect', 'agentor-admin-workspace'))[0]);
   expect(await (await request.get('/api/archived')).json()).toEqual([]);
 
   const nonce = randomUUID(), destinationName = 'agentor-backup-recovery-' + nonce;
@@ -69,8 +73,22 @@ test('private Docker whole-instance UI backup produces an encrypted multi-volume
   let sourceStopped = false;
   let capturedVolumes: string[] = [];
   const sourceWorkers: Array<{ id: string; containerId: string; containerName: string }> = [];
-  const expected = new Map<string, string>();
+  const expected = new Map<string, string>(), expectedAdmin = new Map<string, string>();
+  let stoppedAdmin: any;
+  const inspectAdmin = async (name: string) => docker('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'DAC_READ_SEARCH',
+    '--security-opt', 'no-new-privileges:true', '--user', '0:0', '--mount', 'type=volume,src=' + name + ',dst=/volume,readonly',
+    '--entrypoint', 'python3', source.Image, '-c', INSPECT_ADMIN_VOLUME, '/volume');
   try {
+    // This historical baseline bootstraps a dedicated admin automatically. Its
+    // existing data is part of the snapshot, never an ordinary worker exemption.
+    for (const [role, root] of [['workspace', '/workspace'], ['agents', '/home/agent/.agent-data']])
+      await docker('exec', '--user', '0:0', sourceAdmin.containerId, 'python3', '-c', seedScript, root + '/whole-instance-fixture', 'admin-' + role);
+    const stoppingAdmin = await request.post('/api/admin/workspace/stop'); expect(stoppingAdmin.status()).toBe(200);
+    expect(await stoppingAdmin.json()).toMatchObject({ id: sourceAdmin.id, status: 'stopped', trusted: true });
+    stoppedAdmin = await readAdmin(source.Id);
+    const stoppedProjection = (await (await request.get('/api/containers')).json()).filter((value: any) => value.administrativeKind);
+    historicalDockerAdmin(stoppedProjection, stoppedAdmin, JSON.parse(await docker('inspect', sourceAdmin.containerId))[0]);
+    for (const name of HISTORICAL_ADMIN_VOLUMES) expectedAdmin.set(name, await inspectAdmin(name));
     const environment = await request.post('/api/environments', { data: { name: 'Whole-instance fixture ' + nonce,
       dockerEnabled: false, networkMode: 'full', enabledCapabilityIds: [], enabledInstructionIds: [], setupScript: '' } });
     expect(environment.status()).toBe(201);
@@ -110,7 +128,12 @@ test('private Docker whole-instance UI backup produces an encrypted multi-volume
     expect(sourceArtifact.manifest.formatVersion).toBe(1);
     capturedVolumes = sourceArtifact.manifest.volumes.map((volume: any) => volume.name);
     for (const name of expected.keys()) expect(capturedVolumes).toContain(name);
-    const allowedNames = new Set([...expected.keys(), 'agentor-traefik-certs']);
+    for (const [index, name] of HISTORICAL_ADMIN_VOLUMES.entries())
+      expect(sourceArtifact.manifest.volumes.find((volume: any) => volume.name === name)).toMatchObject({ kind: index ? 'admin-agent-data' : 'admin-workspace' });
+    expect(await readAdmin(source.Id)).toEqual(stoppedAdmin);
+    expect(JSON.parse(await docker('inspect', sourceAdmin.containerId))[0].State.Running).toBe(false);
+    for (const [name, baseline] of expectedAdmin) expect(JSON.parse(await inspectAdmin(name)), name).toEqual(JSON.parse(baseline));
+    const allowedNames = new Set([...expected.keys(), ...expectedAdmin.keys(), 'agentor-traefik-certs']);
     expect(capturedVolumes.every(name => allowedNames.has(name))).toBe(true);
     const download = await fetch(`${sourceURL}/api/admin/instance-backups/artifacts/${capture.jobId}/download`, { headers: { Cookie: await cookies(request) } });
     expect(download.status).toBe(200);
@@ -131,6 +154,9 @@ test('private Docker whole-instance UI backup produces an encrypted multi-volume
         await docker('rm', '-f', id);
       }
     }
+    const retiringAdmin = JSON.parse(await docker('inspect', sourceAdmin.containerId))[0];
+    historicalDockerAdmin(stoppedProjection, stoppedAdmin, retiringAdmin);
+    await docker('rm', sourceAdmin.containerId); // Exact stopped fixture compute; data remains in the verified artifact.
     for (const id of (await docker('ps', '-aq', '--filter', 'label=agentor.managed=traefik')).split(/\s+/).filter(Boolean)) {
       const info = JSON.parse(await docker('inspect', id))[0];
       expect(info.Mounts.some((mount: any) => mount.Name === 'agentor-traefik-certs')).toBe(true);
@@ -155,6 +181,10 @@ test('private Docker whole-instance UI backup produces an encrypted multi-volume
     expect((await destinationRequest.post('/api/setup/create-admin', { data: { email: TEST_ADMIN_EMAIL,
       password: TEST_ADMIN_PASSWORD, name: TEST_ADMIN_NAME } })).ok()).toBe(true);
     expect((await destinationRequest.post('/api/auth/sign-in/email', { data: { email: TEST_ADMIN_EMAIL, password: TEST_ADMIN_PASSWORD } })).ok()).toBe(true);
+    // Recovery mode must suppress automatic admin provisioning even after setup.
+    expect(await (await destinationRequest.get('/api/containers')).json()).toEqual([]);
+    expect(await (await destinationRequest.get('/api/archived')).json()).toEqual([]);
+    expect(await readAdmin(JSON.parse(await docker('inspect', destinationName))[0].Id)).toBeNull();
     expect((await destinationRequest.post('/api/backups/recovery-key/import', { data: { kit: keyMaterial } })).ok()).toBe(true);
     const uploaded = await fetch(destinationURL + '/api/admin/instance-backups/import', { method: 'POST',
       headers: { Cookie: await cookies(destinationRequest), Origin: destinationURL, 'Content-Type': 'application/octet-stream',
@@ -197,6 +227,10 @@ test('private Docker whole-instance UI backup produces an encrypted multi-volume
     for (const worker of sourceWorkers) expect(await docker('ps', '-q', '--filter', 'label=agentor.id=' + worker.id)).toBe('');
     const archived = await (await destinationRequest.get('/api/archived')).json();
     expect(archived.some((worker: any) => worker.id === sourceWorkers[1]!.id)).toBe(true);
+    expect(await readAdmin(JSON.parse(await docker('inspect', destinationName))[0].Id)).toEqual(stoppedAdmin);
+    expect(await (await destinationRequest.get('/api/containers')).json()).toEqual([]);
+    expect(await docker('ps', '-aq', '--filter', 'label=agentor.admin.workspace-id=' + sourceAdmin.id)).toBe('');
+    for (const [name, baseline] of expectedAdmin) expect(JSON.parse(await inspectAdmin(name)), name).toEqual(JSON.parse(baseline));
     for (const [name, baseline] of expected) {
       expect(JSON.parse(await docker('volume', 'inspect', name))[0].Name).toBe(name);
       const actual = await docker('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'DAC_READ_SEARCH',
