@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:http';
 import { HardwareDeviceStore } from '../../orchestrator/server/utils/hardware-device-store';
 import { WorkerStore, type WorkerRecord } from '../../orchestrator/server/utils/worker-store';
 import { WorkerGroupStore } from '../../orchestrator/server/utils/worker-group-store';
@@ -285,4 +286,65 @@ test('GPU guest setup rejects missing/denied render access and configures only g
     await writeFile(runner, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
     expect(() => execFileSync('bash', ['-ec', script], options)).toThrow();
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+
+async function dockerProbeLogs(logs: string, exitCode: number, run: (docker: DockerService, calls: string[]) => Promise<void>) {
+  const directory = await mkdtemp(join(tmpdir(), 'agentor-hardware-probe-logs-'));
+  const socket = join(directory, 'docker.sock'), calls: string[] = [], id = 'a'.repeat(64);
+  const server = createServer(async (request, response) => {
+    const path = request.url!.split('?')[0];
+    calls.push(`${request.method} ${path}`);
+    const reply = (status: number, value?: unknown) => {
+      response.writeHead(status, { 'Content-Type': 'application/json' });
+      response.end(value === undefined ? undefined : JSON.stringify(value));
+    };
+    if (request.method === 'GET' && path === '/images/worker:fixture/json') return reply(200, { Id: 'sha256:' + 'b'.repeat(64) });
+    if (request.method === 'POST' && path === '/containers/create') {
+      const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      expect(JSON.parse(Buffer.concat(chunks).toString())).toMatchObject({ Tty: true,
+        HostConfig: { NetworkMode: 'none', ReadonlyRootfs: true, Binds: ['/dev:/host/dev:ro', '/sys:/host/sys:ro'] } });
+      return reply(201, { Id: id, Warnings: [] });
+    }
+    if (request.method === 'POST' && path === `/containers/${id}/start`) return reply(204);
+    if (request.method === 'POST' && path === `/containers/${id}/wait`) return reply(200, { StatusCode: exitCode });
+    if (request.method === 'GET' && path === `/containers/${id}/logs`) {
+      response.writeHead(200, { 'Content-Type': 'application/vnd.docker.raw-stream' });
+      response.end(logs); return;
+    }
+    if (request.method === 'DELETE' && path === `/containers/${id}`) return reply(204);
+    reply(500, { message: 'Unexpected fixture request' });
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(socket, resolve); });
+  const docker = new DockerService({ workerImagePrefix: '', workerImage: 'worker:fixture' } as Config);
+  // Exercise actual Dockerode decoding against an owned socket, never a daemon.
+  (docker as any).docker.modem.socketPath = socket;
+  try { await run(docker, calls); }
+  finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+test('actual Dockerode JSON log decoding preserves hardware inventory and probe cleanup', async () => {
+  await dockerProbeLogs(JSON.stringify([gpu]) + '\n', 0, async (docker, calls) => {
+    expect(await docker.discoverHardwareDevices()).toContainEqual(gpu);
+    expect(calls.at(-1)).toBe('DELETE /containers/' + 'a'.repeat(64));
+  });
+});
+
+test('failed hardware probe rejects before decoding its output and still removes its helper', async () => {
+  await dockerProbeLogs('probe failed\n', 2, async (docker, calls) => {
+    await expect(docker.discoverHardwareDevices()).rejects.toThrow('Host hardware probe failed');
+    expect(calls.at(-1)).toBe('DELETE /containers/' + 'a'.repeat(64));
+  });
+});
+
+test('shared Docker log reader retains raw buffers and parsed strings without changing their text', async () => {
+  for (const [logs, expected] of [['plain worker output\r\nsecond line\n', 'plain worker output\r\nsecond line\n'],
+    ['"quoted worker output"\n', 'quoted worker output'], ['null\n', 'null\n']]) {
+    await dockerProbeLogs(logs!, 0, async docker => {
+      expect(await docker.getLogs('a'.repeat(64))).toBe(expected);
+    });
+  }
 });

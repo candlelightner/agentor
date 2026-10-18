@@ -675,7 +675,8 @@ export class DockerService {
       DOCKER_READ_TIMEOUT_MS,
       'Docker worker log read',
     );
-    return logs.toString();
+    // Dockerode parses JSON log bodies; their original formatting is unavailable here.
+    return typeof logs === 'string' || Buffer.isBuffer(logs) ? logs.toString() : JSON.stringify(logs);
   }
 
   async stopContainer(containerId: string): Promise<void> {
