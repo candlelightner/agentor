@@ -368,23 +368,25 @@ export default defineNitroPlugin(async (nitroApp) => {
 
   let adminIdentityTimer: NodeJS.Timeout | undefined;
   const adminIdentityRefreshes = new Map<string, Promise<void>>();
-  const refreshAdminIdentity = async (identityOnly = false) => {
+  const initializedAdminIdentities = new Set<string>();
+  const refreshAdminIdentity = async () => {
     if (instanceSnapshotActive()) return;
     await refreshAdministrativeWorkspaceIdentities(
-      () => identityOnly && adminWorkspace.getRecord()?.runtimeKind === 'incus-vm'
+      (initialized) => initialized && adminWorkspace.getRecord()?.runtimeKind === 'incus-vm'
         ? adminWorkspace.refreshRunningIdentity() : adminWorkspace.ensure(),
       () => useWorkerGroupStore().list(),
-      (groupId) => identityOnly && useWorkerGroupStore().findById(groupId)?.adminWorkspace?.runtimeKind === 'incus-vm'
+      (groupId, initialized) => initialized && useWorkerGroupStore().findById(groupId)?.adminWorkspace?.runtimeKind === 'incus-vm'
         ? groupAdminWorkspaces.refreshRunningIdentity(groupId) : groupAdminWorkspaces.ensure(groupId),
       (error) => logger.error(
         `[agentor] administrative workspace identity refresh failed: ${error instanceof Error ? error.message : error}`,
       ),
       adminIdentityRefreshes,
+      initializedAdminIdentities,
     );
   };
   if (!instanceRecoveryMode) {
     await refreshAdminIdentity();
-    adminIdentityTimer = setInterval(() => void refreshAdminIdentity(true), 45_000);
+    adminIdentityTimer = setInterval(() => void refreshAdminIdentity(), 45_000);
     adminIdentityTimer.unref?.();
   }
 

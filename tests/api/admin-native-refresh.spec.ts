@@ -5,6 +5,7 @@ import { AdminWorkspaceStore, type AdminWorkspaceRuntimeAdapter } from '../../or
 import { GroupAdminWorkspaceStore } from '../../orchestrator/server/utils/group-admin-workspace-store';
 import { WorkerGroupStore } from '../../orchestrator/server/utils/worker-group-store';
 import { test, expect } from '@playwright/test';
+import { workerLifecycleGeneration } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
 import { refreshAdministrativeWorkspaceIdentities } from '../../orchestrator/server/utils/admin-workspace-refresh';
 
 test('global admin failure still refreshes every existing group admin and reports the original failure', async () => {
@@ -131,12 +132,14 @@ test('failed deletion rollback of an ordinary group never creates a new administ
 
 test('a held global ensure never starves healthy groups or accumulates duplicate ensures across refresh ticks', async () => {
   let release!: () => void, globals = 0, groups = 0;
+  const initialized = new Set<string>(), groupModes: boolean[] = [];
   const held = new Promise<void>(resolve => { release = resolve; }), inFlight = new Map<string, Promise<void>>();
-  const refresh = () => refreshAdministrativeWorkspaceIdentities(async () => { globals++; await held; },
-    () => [{ id: 'healthy', adminWorkspace: {} }], async () => { groups++; }, error => { throw error; }, inFlight);
+  const refresh = () => refreshAdministrativeWorkspaceIdentities(async ready => { expect(ready).toBe(false); globals++; await held; },
+    () => [{ id: 'healthy', adminWorkspace: {} }], async (_id, ready) => { groups++; groupModes.push(ready); }, error => { throw error; }, inFlight, initialized);
   const first = refresh(); await expect.poll(() => groups).toBe(1);
   const second = refresh(); await expect.poll(() => groups).toBe(2);
   expect(globals).toBe(1); expect(inFlight.has('global')).toBe(true);
+  expect(groupModes).toEqual([false, true]);
   release(); await Promise.all([first, second]); expect(inFlight.size).toBe(0);
 });
 
@@ -175,5 +178,61 @@ test('same-owner group identity refresh progresses while another group holds the
     const before = [...calls];
     try { await store.refreshRunningIdentity(second.id); expect(healthy).toBe(1); expect(calls).toEqual(before); }
     finally { release(); await transaction; }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+
+test('each native admin retries failed initialization once ready, then only refreshes identity without revoking healthy or stopped runtimes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'admin-initialization-retry-'));
+  const global = new AdminWorkspaceStore(root), groups = new WorkerGroupStore(root);
+  const scoped = new GroupAdminWorkspaceStore(groups, async (_owner, operation) => operation());
+  const setup: string[] = [];
+  global.setRuntimeAdapter(boundRuntime(setup)); scoped.setRuntimeAdapter(boundRuntime(setup));
+  try {
+    await global.ensure();
+    const healthy = await groups.create('owner', 'healthy'), delayed = await groups.create('owner', 'delayed'), stopped = await groups.create('owner', 'stopped');
+    for (const group of [healthy, delayed, stopped]) await scoped.ensure(group.id);
+    await scoped.setStatus(stopped.id, 'stopped');
+    const ensures = new Map<string, number>(), identities: string[] = [], errors: unknown[] = [];
+    const adapter = { ...boundRuntime([]), ensure: async (record: any) => {
+      const count = (ensures.get(record.id) ?? 0) + 1; ensures.set(record.id, count);
+      if (record.id === global.getRecord()!.id || record.id === groups.findById(delayed.id)!.adminWorkspace!.id)
+        if (count === 1) throw new Error('Incus HTTPS not listening');
+      if ((record as any).groupId === stopped.id) expect(record.status).toBe('stopped');
+    }, start: async () => { throw Error('Refresh must not explicitly start a stopped admin'); } };
+    global.setRuntimeAdapter(adapter); scoped.setRuntimeAdapter(adapter);
+    let failIdentity = false;
+    const materialize = async (record: any, intent: string) => {
+      expect(record.status).toBe('running'); identities.push(intent + ':' + record.id);
+      if (failIdentity && record.groupId === healthy.id) { failIdentity = false; throw Error('Transient identity failure'); }
+    };
+    global.setIdentityMaterializer(materialize); scoped.setIdentityMaterializer(materialize);
+    const inFlight = new Map<string, Promise<void>>(), initialized = new Set<string>();
+    const refresh = () => refreshAdministrativeWorkspaceIdentities(
+      ready => ready ? global.refreshRunningIdentity() : global.ensure(),
+      () => groups.list(),
+      (id, ready) => ready ? scoped.refreshRunningIdentity(id) : scoped.ensure(id),
+      error => errors.push(error), inFlight, initialized,
+    );
+    await refresh();
+    expect(errors).toHaveLength(2); expect(initialized).toEqual(new Set(['group:' + healthy.id, 'group:' + stopped.id]));
+    const healthyId = groups.findById(healthy.id)!.adminWorkspace!.id;
+    const stoppedId = groups.findById(stopped.id)!.adminWorkspace!.id;
+    const healthyGeneration = workerLifecycleGeneration(healthyId), stoppedGeneration = workerLifecycleGeneration(stoppedId);
+    await refresh();
+    expect(initialized.size).toBe(4);
+    expect(workerLifecycleGeneration(healthyId)).toBe(healthyGeneration);
+    expect(workerLifecycleGeneration(stoppedId)).toBe(stoppedGeneration);
+    const counts = [...ensures], generations = [global.getRecord()!.id, healthyId, groups.findById(delayed.id)!.adminWorkspace!.id, stoppedId]
+      .map(id => [id, workerLifecycleGeneration(id)] as const);
+    identities.length = 0; failIdentity = true;
+    await refresh(); await refresh();
+    expect(errors).toHaveLength(3); expect([...ensures]).toEqual(counts);
+    expect(identities.every(intent => intent.startsWith('refresh-running:'))).toBe(true);
+    expect(identities.some(intent => intent.endsWith(':' + stoppedId))).toBe(false);
+    for (const [id, generation] of generations) expect(workerLifecycleGeneration(id)).toBe(generation);
+    expect(global.getRecord()!.status).toBe('running');
+    expect(groups.findById(stopped.id)!.adminWorkspace!.status).toBe('stopped');
+    expect(inFlight.size).toBe(0);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
