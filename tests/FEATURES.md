@@ -1478,3 +1478,5 @@ Native global administration accepts Incus readback with the empty `user.agentor
 Prebuilt fixture failures retain bounded fixed-command/status/code/stderr diagnostics without retrying or relaxing archive/config-ID checks. Documented classic-daemon config IDs are separate from unchanged native/source OCI provenance.
 
 Private administrative networking admits the pinned running orchestrator with either a bind or Docker named-volume `/data` mount, matching the host installer and supported compose storage modes. Both require one writable mount whose resolved Docker source exactly equals the installer-pinned host DATA path; volume names/options do not grant additional authority.
+
+Administrative private firewall generation follows nftables JSON readback: chain declarations precede the ordered rules, and typed ip/arp/tcp/udp payloads supply their implicit protocol dependencies without redundant explicit checks. Existing owned tables compare exactly and are retained; any other policy mismatch still rejects without replacement. See the upstream [protocol dependency explanation](https://wiki.nftables.org/wiki-nftables/index.php/Ruleset_debug/VM_code_analysis).

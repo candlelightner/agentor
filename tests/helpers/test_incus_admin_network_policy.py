@@ -689,6 +689,29 @@ class AdminNetworkTests(unittest.TestCase):
             with self.assertRaises(MODULE.PolicyError): self.policy.ensure(self.payload)
             self.assertEqual(self.mutations(), [])
 
+    def test_actual_nft_readback_settles_before_peer_and_reinspect_has_no_mutations(self):
+        captured = json.loads((Path(__file__).resolve().parents[1] / 'fixtures/incus-admin-nft-readback.json').read_text())
+        original = self.host_run
+        self.routes = [route for route in self.routes if route.get('dst') != '80.90.0.0/24']
+        def readback(*args, data=None):
+            if args[:4] != ('nft', '-j', 'list', 'table'):
+                return original(*args, data=data)
+            self.calls.append(('host', *args, data))
+            identity = self.policy.authority(self.payload)
+            text = json.dumps(captured[args[4]])
+            for old, new in [('11111111-2222-4333-8444-555555555555', self.installation),
+                             ('012345678901', identity['key']), ('02:01:23:45:67:89', '02:' + ':'.join(identity['key'][i:i+2] for i in range(0,10,2))),
+                             ('06:01:23:45:67:89', '06:' + ':'.join(identity['key'][i:i+2] for i in range(0,10,2)))]:
+                text = text.replace(old, new)
+            return json.dumps({'nftables': json.loads(text)}).encode()
+        self.policy.run = readback
+        result = self.policy.ensure(self.payload)
+        self.assertIsNotNone(self.wrapper)
+        self.calls.clear()
+        self.assertEqual(self.policy.inspect(self.payload), result)
+        self.assertEqual(self.policy.ensure(self.payload), result)
+        self.assertEqual(self.mutations(), [])
+
     def test_controller_replacement_and_loopback_bridge_are_rejected(self):
         self.policy.ensure(self.payload)
         self.controller['Id'] = 'd' * 64
@@ -777,7 +800,12 @@ class FirewallSemanticsTests(unittest.TestCase):
                 match = expr['match']
                 left = match['left']
                 kind, key = next(iter(left.items()))
-                if kind == 'payload': actual = packet.get(key['protocol'] + '.' + key['field'])
+                if kind == 'payload':
+                    protocol = key['protocol']
+                    # nft inserts protocol dependencies even when readback omits them.
+                    if protocol in ('tcp', 'udp'): matches &= packet.get('meta.l4proto') == protocol
+                    if family == 'bridge' and protocol in ('ip', 'arp'): matches &= packet.get('ether.type') == protocol
+                    actual = packet.get(protocol + '.' + key['field'])
                 elif kind == 'fib': actual = packet.get('fib.type')
                 else: actual = packet.get(kind + '.' + key['key'])
                 expected = match['right']
@@ -786,6 +814,35 @@ class FirewallSemanticsTests(unittest.TestCase):
                     matches &= actual is not None and ipaddress.ip_address(actual) in ipaddress.ip_network(f"{prefix['addr']}/{prefix['len']}")
                 else: matches &= actual == expected
         return 'accept'  # Unrelated host traffic is outside this table's authority.
+
+    def test_captured_nft_readback_is_exact_and_rule_changes_remain_rejected(self):
+        captured = json.loads((Path(__file__).resolve().parents[1] / 'fixtures/incus-admin-nft-readback.json').read_text())
+        self.result['installation'] = '11111111-2222-4333-8444-555555555555'
+        blocked = sorted(['0.0.0.0/8','10.0.0.0/8','100.64.0.0/10','127.0.0.0/8','169.254.0.0/16',
+            '172.16.0.0/12','192.0.0.0/24','192.0.2.0/24','192.168.0.0/16','198.18.0.0/15',
+            '198.51.100.0/24','203.0.113.0/24','224.0.0.0/4','240.0.0.0/4'])
+        expected = MODULE.firewall_objects({'key':'012345678901'}, self.result, 'eth0', blocked)
+        for family, raw in captured.items():
+            desired = [entry for entry in expected if next(iter(entry.values()))['family'] == family]
+            observed = MODULE.without_handles(raw)
+            self.assertEqual(observed, desired)
+            for change in ('verdict','order','extra-rule','missing-match','protocol','address','port','comment','priority'):
+                with self.subTest(family=family, change=change):
+                    altered = copy.deepcopy(observed)
+                    rules = [i for i, entry in enumerate(altered) if 'rule' in entry]
+                    first = altered[rules[0]]['rule']
+                    if change == 'verdict': first['expr'][-1] = {'drop':None}
+                    elif change == 'order': altered[rules[0]], altered[rules[1]] = altered[rules[1]], altered[rules[0]]
+                    elif change == 'extra-rule': altered.append(copy.deepcopy(altered[rules[0]]))
+                    elif change == 'missing-match': first['expr'].pop(1)
+                    elif change == 'comment': first['comment'] = 'foreign'
+                    elif change == 'priority': next(entry['chain'] for entry in altered if 'chain' in entry)['prio'] = 0
+                    else:
+                        match = next(expr['match'] for i in rules for expr in altered[i]['rule']['expr']
+                                     if expr.get('match', {}).get('left', {}).get('payload', {}).get('field') == ('dport' if change == 'port' else 'saddr'))
+                        if change == 'protocol': match['left']['payload']['protocol'] = 'ip6'
+                        else: match['right'] = 22 if change == 'port' else '10.210.19.4'
+                    self.assertNotEqual(MODULE.without_handles(altered), desired)
 
     def outgoing(self, **changes):
         return {'meta.iifname': self.result['network'], 'meta.oifname': 'eth0', 'ip.saddr': self.result['guestAddress'],
@@ -812,6 +869,17 @@ class FirewallSemanticsTests(unittest.TestCase):
         self.assertEqual(self.verdict('inet', 'input', dhcp), 'accept')
         self.assertEqual(self.verdict('inet', 'input', {**dhcp, 'udp.sport': 67, 'udp.dport': 68}), 'drop')
 
+    def test_payload_protocol_dependencies_reject_mismatched_transport_and_arp(self):
+        dns = self.outgoing(**{'ip.daddr': self.result['gateway'], 'tcp.dport':53})
+        self.assertEqual(self.verdict('inet', 'input', dns), 'accept')
+        for protocol in ('udp', 'icmp', None):
+            self.assertEqual(self.verdict('inet', 'input', {**dns, 'meta.l4proto':protocol}), 'drop')
+        arp = {'meta.ibrname':self.result['network'], 'meta.obrname':self.result['network'],
+               'ether.type':'arp', 'ether.saddr':self.result['guestMac'], 'arp.saddr ip':self.result['guestAddress']}
+        self.assertEqual(self.verdict('bridge', 'forward', arp), 'accept')
+        for protocol in ('ip', 'ip6', None):
+            self.assertEqual(self.verdict('bridge', 'forward', {**arp, 'ether.type':protocol}), 'drop')
+
     def test_same_bridge_management_only_and_established_controller_replies(self):
         packet = {'meta.ibrname': self.result['network'], 'meta.obrname': self.result['network'],
                   'ether.type': 'ip', 'ether.saddr': self.result['guestMac'], 'ip.saddr': self.result['guestAddress'],
@@ -819,7 +887,7 @@ class FirewallSemanticsTests(unittest.TestCase):
         for port in (3000, 3099):
             self.assertEqual(self.verdict('bridge', 'forward', {**packet, 'tcp.dport': port}), 'accept')
         for change in ({'tcp.dport': 22}, {'tcp.dport': 8443}, {'tcp.dport': 2375}, {'ether.type': 'ip6'},
-                       {'ether.saddr': '02:ff:ff:ff:ff:ff'}, {'ip.saddr': '10.210.19.4'}, {'ip.daddr': '10.210.19.4'}):
+                       {'meta.l4proto': 'udp'}, {'meta.l4proto': None}, {'ether.saddr': '02:ff:ff:ff:ff:ff'}, {'ip.saddr': '10.210.19.4'}, {'ip.daddr': '10.210.19.4'}):
             self.assertEqual(self.verdict('bridge', 'forward', {**packet, 'tcp.dport': 3000, **change}), 'drop')
         self.assertEqual(self.verdict('bridge', 'forward', {**packet, 'tcp.dport': 43210, 'ct.state': 'established'}), 'accept')
         controller = {**packet, 'ether.saddr': '06' + self.result['guestMac'][2:], 'ip.saddr': self.result['managementAddress'],

@@ -521,7 +521,7 @@ def without_handles(entries):
 
 
 def firewall_objects(identity, result, uplink, blocked):
-    """libnftables JSON is also the read-back contract; no textual rule guessing."""
+    """Emit nft's readback form: payloads imply their protocol dependencies."""
     table = "agentor_admin_" + identity["key"]
     marker = "agentor-admin-" + result["installation"] + "-" + identity["key"]
     objects = []
@@ -546,18 +546,18 @@ def firewall_objects(identity, result, uplink, blocked):
     source, destination = payload("ip", "saddr", guest), payload("ip", "daddr", guest)
     chains("inet", ("input", "forward"))
     for protocol in ("udp", "tcp"):
-        rule("inet", "input", [incoming, source, payload("ip", "daddr", gateway), meta("l4proto", protocol),
+        rule("inet", "input", [incoming, source, payload("ip", "daddr", gateway),
                                payload(protocol, "dport", 53)], "accept")
     for address in ("0.0.0.0", guest):
         for destination_ip in ("255.255.255.255", gateway):
             rule("inet", "input", [incoming, payload("ip", "saddr", address), payload("ip", "daddr", destination_ip),
-                                   meta("l4proto", "udp"), payload("udp", "sport", 68), payload("udp", "dport", 67)], "accept")
+                                   payload("udp", "sport", 68), payload("udp", "dport", 67)], "accept")
     rule("inet", "input", [incoming], "drop")
     # Same-bridge packets may also traverse inet when br_netfilter is enabled.
     for state_name in ("established", "related"):
         rule("inet", "forward", [incoming, outgoing, source, payload("ip", "daddr", peer), state(state_name)], "accept")
     for port in (3000, 3099):
-        rule("inet", "forward", [incoming, outgoing, source, payload("ip", "daddr", peer), meta("l4proto", "tcp"),
+        rule("inet", "forward", [incoming, outgoing, source, payload("ip", "daddr", peer),
                                  payload("tcp", "dport", port)], "accept")
     rule("inet", "forward", [incoming, outgoing, payload("ip", "saddr", peer), destination], "accept")
     for cidr in blocked:
@@ -572,26 +572,17 @@ def firewall_objects(identity, result, uplink, blocked):
     chains("bridge", ("forward",))
     inside = [meta("ibrname", bridge), meta("obrname", bridge)]
     for address, mac in ((guest, result["guestMac"]), (peer, "06" + result["guestMac"][2:])):
-        rule("bridge", "forward", [*inside, payload("ether", "type", "arp"), payload("ether", "saddr", mac),
+        rule("bridge", "forward", [*inside, payload("ether", "saddr", mac),
                                    payload("arp", "saddr ip", address)], "accept")
-    guest_flow = [*inside, payload("ether", "type", "ip"), payload("ether", "saddr", result["guestMac"]),
+    guest_flow = [*inside, payload("ether", "saddr", result["guestMac"]),
                   source, payload("ip", "daddr", peer)]
     for state_name in ("established", "related"):
         rule("bridge", "forward", [*guest_flow, state(state_name)], "accept")
     for port in (3000, 3099):
-        rule("bridge", "forward", [*guest_flow, meta("l4proto", "tcp"), payload("tcp", "dport", port)], "accept")
-    rule("bridge", "forward", [*inside, payload("ether", "type", "ip"), payload("ether", "saddr", "06" + result["guestMac"][2:]),
+        rule("bridge", "forward", [*guest_flow, payload("tcp", "dport", port)], "accept")
+    rule("bridge", "forward", [*inside, payload("ether", "saddr", "06" + result["guestMac"][2:]),
                                payload("ip", "saddr", peer), destination], "accept")
     rule("bridge", "forward", [meta("ibrname", bridge)], "drop")
     rule("bridge", "forward", [meta("obrname", bridge)], "drop")
-    # Kernel listings group each chain with its rules, rather than all chains first.
-    ordered = []
-    for family in ("inet", "bridge"):
-        ordered.extend(entry for entry in objects if entry.get("table", {}).get("family") == family)
-        for entry in objects:
-            chain = entry.get("chain")
-            if chain and chain["family"] == family:
-                ordered.append(entry)
-                ordered.extend(rule for rule in objects if rule.get("rule", {}).get("family") == family
-                               and rule["rule"]["chain"] == chain["name"])
-    return ordered
+    # nft lists each table's chain declarations before its ordered rules.
+    return objects
