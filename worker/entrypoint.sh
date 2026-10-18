@@ -403,7 +403,7 @@ fi
 
 # Codex filters MCP child environments. Amend only Agentor's canonical commands,
 # including existing sections, without persisting endpoint values or credentials.
-python3 - /home/agent/.codex/config.toml "${CODEX_HOME:-/home/agent/.codex}/config.toml" /home/agent/.agent-data/.codex-account/config.toml <<'CODEX_MCP_ENV' || echo "[agent] Warning: managed Codex MCP environment reconciliation failed" >&2
+python3 - /home/agent/.codex/config.toml "${CODEX_HOME:-/home/agent/.codex}/config.toml" <<'CODEX_MCP_ENV' || echo "[agent] Warning: managed Codex MCP environment reconciliation failed" >&2
 import copy, json, os, re, stat, sys, tempfile, tomllib
 from pathlib import Path
 
