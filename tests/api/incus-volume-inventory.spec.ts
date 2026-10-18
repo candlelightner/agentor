@@ -11,7 +11,7 @@ import { backupInstallationId } from '../../orchestrator/server/utils/backup-ins
 import type { Config } from '../../orchestrator/server/utils/config';
 import { IncusClient } from '../../orchestrator/server/utils/incus-client';
 import { managedVolumeInventory, resolveManagedVolumeSizingResource, resolveManagedVolumeControlTarget } from '../../orchestrator/server/utils/managed-volume-inventory';
-import { useConfig, useWorkerStore, useContainerManager } from '../../orchestrator/server/utils/services';
+import { useConfig, useWorkerStore, useContainerManager, useWorkerGroupStore } from '../../orchestrator/server/utils/services';
 import { useManagedVolumeManager } from '../../orchestrator/server/utils/managed-volume-manager';
 import { useManagedVolumeSizingManager, ManagedVolumeSizingManager, INCUS_LIVE_VOLUME_SIZE_SCANNER, INCUS_PATH_VOLUME_SIZE_SCANNER } from '../../orchestrator/server/utils/managed-volume-sizing';
 import { readBackupInstallationId } from '../../orchestrator/server/utils/backup-installation';
@@ -155,6 +155,8 @@ async function integratedFixture(run: (f: any) => Promise<void>) {
   await fixture(async f => {
     const config = useConfig(), workers = useWorkerStore(), manager = useManagedVolumeManager();
     useContainerManager();
+    // Capture suite DATA before this fixture temporarily overrides config.
+    useWorkerGroupStore();
     const sizing = useManagedVolumeSizingManager();
     const original = { config: { ...config }, workerList: workers.list, init: manager.init,
       list: manager.store.list, forWorker: manager.store.forWorker, workerGet: workers.get, incus: (manager as any).incus, docker: manager.runtime.docker,
