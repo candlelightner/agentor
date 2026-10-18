@@ -621,11 +621,33 @@ async function prepareDataArchive(input) {
     if (!result.authDb)
       throw new SafeRestoreError("The instance data archive has no authentication database", "INSTANCE_RESTORE_INVALID_ARCHIVE");
     await verifySqliteHeader(join(input.preparedData, "auth.db"));
+    if (input.plan.formatVersion !== 2) await assertLegacyRestoreHasNoAdministrativeAuthority(input.preparedData);
     if (!input.plan.restoreHostMountPolicies)
       await omitHostMountPolicies(input.preparedData);
   } catch (error) {
     await rm(input.preparedData, { recursive: true, force: true }).catch(() => undefined);
     throw error;
+  }
+}
+
+// A v1 control-plane-only snapshot has no native plan/manifest. Do not
+// publish dedicated admin authority when its canonical data cannot be restored.
+async function assertLegacyRestoreHasNoAdministrativeAuthority(dataDir) {
+  const missingPlan = () => new SafeRestoreError(
+    "Administrative snapshot data requires a native filesystem restore plan with canonical payloads",
+    "INSTANCE_RESTORE_INVALID_PLAN");
+  for (const directory of ["admin", "users"]) {
+    try { await assertDirectoryNoFollow(join(dataDir, directory)); }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+  }
+  if (await readOptionalBoundedJson(join(dataDir, "admin", "workspace.v1.json"), MAX_STORE_BYTES, "staged administrative store") !== undefined)
+    throw missingPlan();
+  const users = await readdir(join(dataDir, "users")).catch(error => { if (error.code === "ENOENT") return []; throw error; });
+  for (const user of users) {
+    if (!safeId(user)) throw missingPlan();
+    await assertDirectoryNoFollow(join(dataDir, "users", user));
+    const groups = await readOptionalBoundedJson(join(dataDir, "users", user, "worker-groups.json"), MAX_STORE_BYTES, "staged worker-group store");
+    if (groups !== undefined && (!Array.isArray(groups) || groups.some(group => group?.adminWorkspace !== undefined))) throw missingPlan();
   }
 }
 

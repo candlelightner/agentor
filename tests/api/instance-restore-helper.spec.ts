@@ -957,3 +957,38 @@ for (const group of [false,true]) for (const legacy of [false,true]) for (const 
     await expect(readFile(join(f.dataDir,'worker-config.key'))).rejects.toMatchObject({code:'ENOENT'});
   } finally {if(savedKey===undefined)delete process.env.WORKER_CONFIG_ENCRYPTION_KEY;else process.env.WORKER_CONFIG_ENCRYPTION_KEY=savedKey;await rm(root,{recursive:true,force:true});}
 });
+
+
+for (const group of [false,true]) test(`historical control-plane-only ${group ? 'group' : 'global'} admin metadata rejects before Docker contact when canonical native plan is absent`, async () => {
+  const root=await mkdtemp(join(tmpdir(),'admin-missing-native-plan-'));
+  try {
+    const f=await fixture(root), marker='private-staged-record-value', record={schemaVersion:1,id:randomUUID(),trusted:true,status:'stopped',
+      kind:group?'group-administrative':'administrative',ownerId:'source-owner',...(group?{groupId:'legacy-group'}:{}),privateMarker:marker};
+    await writeTarGzip(f.plan.dataArchive,[{name:'auth.db',body:Buffer.concat([Buffer.from('SQLite format 3\0'),Buffer.from('new')])},
+      {name:group?'users/source-owner/worker-groups.json':'admin/workspace.v1.json',
+        body:JSON.stringify(group?[{id:'legacy-group',userId:'source-owner',name:'Group',adminWorkspace:record}]:record)}]);
+    let contacted=false;
+    const docker={getContainer(){contacted=true;throw Error('Docker must not be contacted');}};
+    const result=await runInjected(f,docker);
+    expect(result).toMatchObject({status:'failed',code:'INSTANCE_RESTORE_INVALID_PLAN'});expect(contacted).toBe(false);
+    expect(result.message).not.toContain(marker);
+    expect((await readFile(join(f.dataDir,'auth.db'))).subarray(16).toString()).toBe('old');
+    await expect(readFile(join(f.stage,'prepared-data','auth.db'))).rejects.toMatchObject({code:'ENOENT'});
+  } finally {await rm(root,{recursive:true,force:true});}
+});
+
+
+test('metadata-only admin-plan guard refuses staged authority parent symlinks before traversing aliases', async () => {
+  for(const directory of ['admin','users']) {
+    const root=await mkdtemp(join(tmpdir(),'admin-plan-parent-link-'));
+    try {
+      const f=await fixture(root);
+      await writeTarGzip(f.plan.dataArchive,[{name:'auth.db',body:Buffer.concat([Buffer.from('SQLite format 3\0'),Buffer.from('new')])},
+        {name:'alias',type:'directory'},{name:directory,type:'symlink',linkname:'alias'}]);
+      let contacted=false;
+      const result=await runInjected(f,{getContainer(){contacted=true;throw Error('Docker must not be contacted');}});
+      expect(result).toMatchObject({status:'failed',code:'INSTANCE_RESTORE_INVALID_CONTEXT'});expect(contacted).toBe(false);
+      expect((await readFile(join(f.dataDir,'auth.db'))).subarray(16).toString()).toBe('old');
+    }finally{await rm(root,{recursive:true,force:true});}
+  }
+});
