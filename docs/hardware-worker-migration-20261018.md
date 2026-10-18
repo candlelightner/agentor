@@ -1,6 +1,6 @@
 # Remaining hardware worker migration — 2026-10-18
 
-This is a reviewed maintenance proposal, not an executed host change. The required outcome is `bachelorarbeit` in an Incus VM with working Intel Vulkan acceleration. Retained Docker compute is rollback material, not the completed outcome.
+This runbook records the reviewed maintenance sequence and the preparation checkpoint below; the GPU trial has not booted. The required outcome is `bachelorarbeit` in an Incus VM with working Intel Vulkan acceleration. Retained Docker compute is rollback material, not the completed outcome.
 
 The owner subsequently retired the JMicron worker from this migration: leave it archived, preserve its workspace/agent/Docker data, plugin, catalog entries and grants, and do not evacuate the SSD, remap its serial or attach its devices. No deletion was requested. This supersedes the earlier requirement to migrate both hardware workers.
 

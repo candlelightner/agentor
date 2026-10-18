@@ -5,9 +5,13 @@ handoff is complete. The final full browser/routing/IP-change gate passed on
 2026-10-17 (8.3 minutes), resolving
 [issue #5](https://github.com/candlelightner/agentor/issues/5). Accepted evidence
 and remaining deferred stability items are recorded in `incus-vm-status.md`.
-The deployed production canary below still precedes any production worker migration.
-The Admin Workspace stays on Docker. Existing ordinary workers remain on Docker
-until a platform administrator explicitly migrates them.
+The canary evidence below records the stage before the initial production migration.
+New and rebuilt global/group administrative workspaces require Incus and use
+dedicated VMs; unavailable native provisioning fails closed. Retained Docker
+admins may be inspected/stopped, while Start/Rebuild requires an operator transfer
+of their dedicated records and data;
+never migrate their ordinary-worker shadows. Existing ordinary workers remain on
+Docker until a platform administrator explicitly migrates them.
 
 ## Prepare and deploy
 
