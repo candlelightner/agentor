@@ -73,7 +73,7 @@ test('default builds and every downstream phase remain after the opt-in branch',
   const source = fs.readFileSync(new URL('../docker/test-entrypoint.sh', import.meta.url), 'utf8');
   const branch = source.indexOf('if [[ "${AGENTOR_TEST_PREBUILT_IMAGES:-false}"');
   const end = source.indexOf('\nfi', branch);
-  assert.match(source.slice(branch, end), /else\n    log[^]*build_with_retry agentor-worker:latest \/src\/worker\n    build_with_retry agentor-orchestrator:latest \/src -f \/src\/orchestrator\/Dockerfile/);
+  assert.match(source.slice(branch, end), /else\n    log[^]*build_with_retry agentor-worker:latest \/src\/worker\n    log "Worker image built\."\n    build_with_retry agentor-orchestrator:latest \/src -f \/src\/orchestrator\/Dockerfile/);
   let previous = end;
   for (const phase of ['Validating constrained volume-size helper', '# Phase 3:', '# Phase 4:', '# Phase 5:', '# Phase 6:']) {
     const at = source.indexOf(phase); assert.ok(at > previous, phase); previous = at;

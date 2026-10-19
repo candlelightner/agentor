@@ -224,19 +224,49 @@ docker ps -aq --filter "label=agentor.managed=traefik" | xargs -r docker rm -f >
 # and the inner-DinD network path to that registry can be slow enough to
 # trip dockerd's TLS handshake timeout (20s+ has been observed). On the
 # subsequent retry, BuildKit usually picks up from where it left off.
+cleanup_build_cache() {
+    if [[ "${AGENTOR_TEST_GHA_CACHE:-false}" == "true" ]]; then
+        # --load duplicates layers in this builder and Docker's image store.
+        if ! timeout --signal=TERM --kill-after=10s 60s docker buildx prune \
+            --builder agentor-test-builder --all --force > /dev/null; then
+            err "CI builder cache cleanup failed; refusing to continue with duplicate layer storage."
+            return 1
+        fi
+    fi
+}
+
 build_with_retry() {
     local img=$1
     local ctx=$2
     shift 2
+    local cache_args=()
+    if [[ "${AGENTOR_TEST_GHA_CACHE:-false}" == "true" ]]; then
+        local scope
+        case "$img" in
+            agentor-worker:latest) scope=agentor-test-worker-amd64 ;;
+            agentor-orchestrator:latest) scope=agentor-test-orchestrator-amd64 ;;
+            *) err "Unknown CI cache image: $img"; return 1 ;;
+        esac
+        cache_args=(--cache-from "type=gha,version=2,scope=$scope,timeout=2m"
+            --cache-to "type=gha,version=2,scope=$scope,mode=max,timeout=2m,ignore-error=true")
+    fi
     local attempt
     for attempt in 1 2 3 4; do
-        if docker build -t "$img" "$@" "$ctx"; then
+        if "${BUILD_COMMAND[@]}" -t "$img" "${cache_args[@]}" "$@" "$ctx"; then
+            cleanup_build_cache || return 1
             return 0
         fi
-        log "Build of $img failed (attempt $attempt/4) — retrying in 5s..."
-        sleep 5
+        if (( ${#cache_args[@]} > 0 )); then
+            log "Cached build failed; remaining attempts build the same source without the remote cache."
+            cache_args=()
+        fi
+        if (( attempt < 4 )); then
+            log "Build of $img failed (attempt $attempt/4) — retrying in 5s..."
+            sleep 5
+        fi
     done
     err "Build of $img failed after 4 attempts"
+    cleanup_build_cache || true
     return 1
 }
 
@@ -244,7 +274,19 @@ if [[ "${AGENTOR_TEST_PREBUILT_IMAGES:-false}" == "true" ]]; then
     node /usr/local/lib/agentor-load-prebuilt-images.mjs
 else
     log "Building agentor images (cached after first run)..."
+    BUILD_COMMAND=(docker build)
+    if [[ "${AGENTOR_TEST_GHA_CACHE:-false}" == "true" ]]; then
+        if [[ "${CI:-}" != "true" || -z "${ACTIONS_RUNTIME_TOKEN:-}" || -z "${ACTIONS_RESULTS_URL:-}" ]]; then
+            err "CI build cache requires CI=true and GitHub Actions runtime credentials."
+            exit 1
+        fi
+        # Cache only source-keyed image layers, never the private daemon's state.
+        docker buildx create --name agentor-test-builder --driver docker-container \
+            --driver-opt image=moby/buildkit:buildx-stable-1 --use
+        BUILD_COMMAND=(docker buildx build --builder agentor-test-builder --load)
+    fi
     build_with_retry agentor-worker:latest /src/worker
+    log "Worker image built."
     build_with_retry agentor-orchestrator:latest /src -f /src/orchestrator/Dockerfile
     log "Images built."
 fi

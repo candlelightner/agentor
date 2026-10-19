@@ -28,6 +28,7 @@ export default defineConfig({
     "api/orchestrator-update-network.spec.ts",
     "api/legacy-group-mcp-fixture.spec.ts",
     "api/docker-build-filter.spec.ts",
+    "api/docker-build-cache.spec.ts",
     "api/portable-pax-size.spec.ts",
     "api/incus-admin-restore.spec.ts",
     "api/worker-memory-policy.spec.ts",
