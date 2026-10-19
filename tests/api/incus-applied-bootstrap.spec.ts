@@ -198,6 +198,12 @@ test('restart uses applied environment/account/local values and exclusions but l
     expect(opts.workerConfig.map((e: any) => e.value)).toEqual(['live-group', 'old-local']);
     expect(opts.credentialBinds).toEqual(['live-bind']); expect(opts.sshAuthorizedKeys).toBe('live-ssh');
     expect(info.pendingRebuild).toBe(true);
+    manager.setIncusRuntime({ client: { getCpuCapacity: async () => 8 } } as any);
+    info.vcpuCount = 4;
+    const resized = await (manager as any).incusOptionsForWorker(info, true);
+    expect(resized).toEqual({ ...opts, cpuLimit: 4 });
+    expect(info.pendingRebuild).toBe(true);
+    expect(await singleton.resolveAppliedBootstrap('owner', 'worker')).toEqual(bootstrap());
     singleton.resolveAppliedBootstrap = async () => undefined;
     await expect((manager as any).incusOptionsForWorker(info, true)).rejects.toThrow('explicit rebuild is required');
   } finally {

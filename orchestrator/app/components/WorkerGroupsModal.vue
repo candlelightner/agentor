@@ -249,6 +249,11 @@ function serviceIcon(service: string) {
             class="mt-3"
             :endpoint="`/api/worker-groups/${entry.group.id}/admin-workspace/resources`"
           />
+          <VcpuEditor
+            v-if="entry.group.adminWorkspace?.runtimeKind === 'incus-vm'"
+            class="mt-3"
+            :endpoint="`/api/worker-groups/${entry.group.id}/admin-workspace/cpu`"
+          />
           <AdminStartupScriptEditor
             v-if="entry.group.adminWorkspace"
             class="mt-3"

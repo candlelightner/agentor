@@ -444,6 +444,9 @@ const formattedCreatedAt = computed(() => {
             </div>
           </section>
 
+          <VcpuEditor v-if="open && container.runtimeKind === 'incus-vm' && !container.administrativeKind" :key="container.id"
+            :endpoint="`/api/containers/${container.id}/cpu`" :lock-password="lockCurrentPassword" />
+
           <section class="space-y-3">
             <h3 class="text-[10px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider">Worker-local variables and secrets</h3>
             <WorkerConfigurationEditor :worker-id="container.id" />

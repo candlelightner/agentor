@@ -21,7 +21,7 @@ Host filtering is explicit rather than inferred from NAT:
 
 The fixed response contains installation, workspace/owner/kind (and group when applicable), network/subnet/gateway, guest address/MAC, and the private management address. The core runtime must bind management MCP **only** to that address on 3099 and use the returned `http://<peer>:3000` and `http://<peer>:3099/mcp` URLs. It must re-admit before create/start and validate fresh ownership/lease/incarnation before trusting guest traffic. Host admission permits no profiles, raw configuration, extra NICs, or disks beyond the pinned pool's canonical root/workspace/agent-data volumes. The core remains responsible for canonical volume ownership and image provenance.
 
-The server-owned admin profile requires `limits.memory=4GiB`, `limits.cpu=2`, and `boot.autostart=false`; callers cannot override these through network admission. Existing native ensure and start preparation re-admit the dedicated identity before read-only boundary checks, so missing host firewall state after reboot can be recreated through the same exact ownership/device/controller checks. Changed or foreign policy still fails closed. Host firewall state is not a substitute for runtime startup admission after reboot or daemon replacement. Host uplink/public-LAN changes require stopping affected admin compute and explicit policy reconciliation; changed rules fail inspection. Empty owned networks, endpoint wrappers, and firewall policy are retained on compute deletion or partial failures. There is no automatic destructive cleanup. Deployment that retains an old orchestrator endpoint must settle that exact endpoint before the replacement can be admitted.
+The server-owned admin profile requires the durable applied memory and vCPU count (`4GiB` and two vCPUs for older records), plus `boot.autostart=false`; callers cannot override these through network admission. Existing native ensure and start preparation re-admit the dedicated identity before read-only boundary checks, so missing host firewall state after reboot can be recreated through the same exact ownership/device/controller checks. Changed or foreign policy still fails closed. Host firewall state is not a substitute for runtime startup admission after reboot or daemon replacement. Host uplink/public-LAN changes require stopping affected admin compute and explicit policy reconciliation; changed rules fail inspection. Empty owned networks, endpoint wrappers, and firewall policy are retained on compute deletion or partial failures. There is no automatic destructive cleanup. Deployment that retains an old orchestrator endpoint must settle that exact endpoint before the replacement can be admitted.
 
 The existing operator setup installs the helper and pins its storage pool and orchestrator container in the policy unit. This source change does not execute setup, alter boot/kernel settings, or modify any live host.
 
@@ -55,3 +55,36 @@ sudo scripts/setup-incus-host.sh --update-policy \
 This copies the trusted host scripts and restarts their existing policy service, preserving the installed config, certificates, VM instances, canonical data and network resources. It skips package installation, image conversion and routing reconciliation. Use the actual installation UUID locally; do not publish the config or diagnostics. Update the orchestrator too, then refresh administrative status before deciding whether Start or Rebuild is needed. Do not remove storage or weaken identity/network checks to clear a rejection.
 
 Status reads inspect the owned native VM without starting it or changing desired state. An unavailable or rejected identity produces an explicit error instead of reporting the saved desired `running` state. Admin cards open the confirmed administration controls rather than ordinary worker lifecycle endpoints. Docker/Incus identity quarantine is separate and remains enforced; it never authorizes deleting or adopting retained Docker containers.
+
+## Administrative vCPU changes and installed-policy compatibility
+
+Stop the administrative VM before changing its vCPU count. The dedicated CPU
+settings API updates only its existing Incus definition; Start boots that count
+without rebuilding the image or replacing persistent data. Both platform and
+group administration use their own authorization and optional protection lock.
+The count must be a positive integer within the authenticated Incus CPU capacity.
+
+The applied `nativeRuntime.vcpuCount` controls runtime and root-policy identity
+checks; legacy records retain two vCPUs. A CPU intent records the captured VM
+incarnation, previous/requested counts, the remaining definition fingerprint and
+native acknowledgement. Read-only CPU settings expose its actual count and
+pending target. Explicit reconciliation submits no new mutation: a terminal
+successful acknowledgement and matching stopped definition commit the desired
+and applied counts together. A proven rejection or terminal failure with the
+unchanged previous definition clears the intent and reports the failure. Missing
+acknowledgements and changed definitions remain fenced for operator recovery.
+Start and generic Rebuild cannot settle a CPU intent.
+
+The root policy permits read-only inspection of only the captured stopped VM at
+its exact previous or requested count during that intent. All other configuration,
+volume, NIC and owner checks remain exact; network creation/start admission stays
+blocked. The helper advertises `cpuCountUpdates: true` in its verified response.
+CPU mutation requires that capability **before** persisting intent or submitting
+an Incus update. An older separately installed helper produces an actionable
+error; updating the orchestrator image alone does not update that helper.
+
+Use the bounded `setup-incus-host.sh --update-policy --config ...` procedure above
+from the trusted updated checkout on the authorized host. No package install,
+image conversion, storage deletion, new network allocation or identity bypass is
+needed for this policy update. Refresh CPU settings afterward. This source change
+does not run the operator procedure or modify a deployed host policy.

@@ -130,6 +130,8 @@ export default defineConfig({
     "api/worker-lifecycle-coordinator.spec.ts",
     "api/worker-emergency-stop.spec.ts",
     "api/incus-client.spec.ts",
+    "api/incus-vcpu.spec.ts",
+    "api/vcpu-count.spec.ts",
     "api/incus-image-import.spec.ts",
     "api/incus-image-import-live.spec.ts",
     "api/incus-image-converter.spec.ts",

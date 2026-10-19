@@ -1,6 +1,7 @@
 import { computed, ref } from 'vue';
 import { useWorkerMetrics as useRealWorkerMetrics } from '../../../../orchestrator/app/composables/useWorkerMetrics';
 export { formatBytes, formatRate } from '../../../../orchestrator/app/utils/format';
+export { useAdminWorkspace } from '../../../../orchestrator/app/composables/useAdminWorkspace';
 
 const state = ref({ sidebar: { activeTab: 'workers' } });
 

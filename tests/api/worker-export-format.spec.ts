@@ -56,6 +56,17 @@ async function withBundle(entries: Entry[], action: (bundle: string, destination
 }
 
 test.describe('Worker export root filesystem format compatibility', () => {
+  test('portable guest CPU overrides retain positive integers and reject malformed counts', async () => {
+    const original = JSON.parse(manifest(WORKER_EXPORT_VERSION, false).toString());
+    for (const value of [undefined, 4, 0, -1, 1.5, '4']) {
+      const data = { ...original, worker: { ...original.worker, ...(value === undefined ? {} : { vcpuCount: value }) } };
+      await withBundle([{ name: BUNDLE_FILES.manifest, body: Buffer.from(JSON.stringify(data)) }], async (bundle, destination) => {
+        if (value === undefined || value === 4) expect((await extractBundle(bundle, destination)).manifest.worker.vcpuCount).toBe(value);
+        else await expect(extractBundle(bundle, destination)).rejects.toThrow('vCPU count');
+      });
+    }
+  });
+
   test('old manifests keep runtime absent and portable runtime descriptions strip native authority', async () => {
     const original = JSON.parse(manifest(WORKER_EXPORT_VERSION, false).toString());
     const source = { sourceImageId: 'sha256:' + 'a'.repeat(64), recipeId: 'b'.repeat(64),

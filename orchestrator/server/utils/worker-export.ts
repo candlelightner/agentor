@@ -11,6 +11,7 @@ import type { Environment } from './environments';
 import type { PortMapping } from './port-mapping-store';
 import type { DomainMapping } from './domain-mapping-store';
 import type { RepoConfig, MountConfig, WorkerSelfApiAccess } from '../../shared/types';
+import { validateVcpuCount } from '../../shared/vcpu-count';
 import { AGENT_CREDENTIAL_MAPPINGS } from './user-credentials';
 import { SHARED_DIRECTORY_MOUNT_POINTS } from './storage';
 import type { PortablePluginConfiguration } from './plugin-portability';
@@ -160,6 +161,7 @@ export interface WorkerExportManifest {
     initScript: string;
     /** Orchestrator-side access policy. Missing legacy values inherit. */
     workerSelfApiAccess?: WorkerSelfApiAccess;
+    vcpuCount?: number;
   };
   /** Full environment definition, embedded so the worker restores on a machine
    * that does not have the same environment. Matched/created on import. */
@@ -826,6 +828,7 @@ function assertValidManifest(value: unknown): asserts value is WorkerExportManif
   if (!isRecord(worker) || !isString(worker.displayName) || !isString(worker.initScript) || !Array.isArray(worker.repos) || !Array.isArray(worker.mounts)) {
     throw new Error('Invalid worker export: manifest.worker is invalid');
   }
+  if (worker.vcpuCount !== undefined) validateVcpuCount(worker.vcpuCount);
   if (
     worker.workerSelfApiAccess !== undefined &&
     !['inherit', 'allow', 'deny'].includes(String(worker.workerSelfApiAccess))

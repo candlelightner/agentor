@@ -1,4 +1,5 @@
 import { validateAdminMemoryLimit } from '../../shared/admin-workspace-memory';
+import { validateVcpuCount } from '../../shared/vcpu-count';
 import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
 import type { AdministrativeWorkspaceRecord } from './admin-workspace-store';
@@ -20,8 +21,10 @@ export interface AdminNativeRuntimeIdentity {
   selectedVolumeIds?: string[];
   selectedOperation?: { volumeId: string; operationId: string; incarnation: string; kind: 'snapshot' | 'seed'; canonical?: true; device?: { state: 'unknown' | 'accepted' | 'settled'; operation?: string } };
   memoryLimit?: string;
+  vcpuCount?: number;
   appliedStartupScriptRevision?: number;
-  pending?: { kind: 'create' | 'start' | 'stop' | 'delete'; operation?: string };
+  pending?: { kind: 'create' | 'start' | 'stop' | 'delete' | 'cpu'; operation?: string;
+    cpu?: { previousCount: number; vcpuCount: number; definitionFingerprint: string; acknowledged?: true; rejected?: true } };
 }
 export interface AdminNativeMigration {
   version: 1;
@@ -30,6 +33,7 @@ export interface AdminNativeMigration {
   source: { containerId: string; imageId: string; createdAt: string; wasRunning?: boolean };
 }
 export interface AdminNativeRuntimePatch {
+  vcpuCount?: number;
   status?: 'running' | 'stopped';
   runtimeKind: 'legacy-docker' | 'incus-vm';
   nativeRuntime?: AdminNativeRuntimeIdentity;
@@ -57,6 +61,8 @@ export function adminNativeInstanceName(record: Readonly<AdministrativeWorkspace
     : `agentor-admin-${createHash('sha256').update(record.id).digest('hex').slice(0,30)}`;
 }
 export function validateAdminNativeState(record: Readonly<AdministrativeWorkspaceRecord>): void {
+  if (record.vcpuCount !== undefined) validateVcpuCount(record.vcpuCount);
+  if (record.nativeRuntime?.vcpuCount !== undefined) validateVcpuCount(record.nativeRuntime.vcpuCount);
   if (record.memoryLimit !== undefined) validateAdminMemoryLimit(record.memoryLimit);
   if (record.nativeRuntime?.memoryLimit !== undefined) validateAdminMemoryLimit(record.nativeRuntime.memoryLimit);
   if (record.runtimeKind === undefined) {
@@ -76,9 +82,21 @@ export function validateAdminNativeState(record: Readonly<AdministrativeWorkspac
         v.storageInitialized !== undefined && v.storageInitialized !== true ||
         v.deleting !== undefined && v.deleting !== true ||
         v.appliedStartupScriptRevision !== undefined && (!Number.isSafeInteger(v.appliedStartupScriptRevision) || v.appliedStartupScriptRevision < 0) ||
-        v.pending !== undefined && (!v.pending || !['create', 'start', 'stop', 'delete'].includes(v.pending.kind) ||
+        v.pending !== undefined && (!v.pending || !['create', 'start', 'stop', 'delete', 'cpu'].includes(v.pending.kind) ||
           v.pending.operation !== undefined && !/^\/1\.0\/operations\/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}(?:\?project=[A-Za-z0-9_-]+)?$/.test(v.pending.operation)))
       throw new Error('Administrative native runtime identity is invalid');
+    const cpu = v.pending?.cpu;
+    if (v.pending?.kind === 'cpu') {
+      if (!v.incarnation || !cpu || typeof cpu !== 'object' || Array.isArray(cpu) ||
+          Object.keys(v.pending).some(key => !['kind', 'operation', 'cpu'].includes(key)) ||
+          Object.keys(cpu).some(key => !['previousCount', 'vcpuCount', 'definitionFingerprint', 'acknowledged', 'rejected'].includes(key)) ||
+          typeof cpu.definitionFingerprint !== 'string' || !hex.test(cpu.definitionFingerprint) || cpu.acknowledged !== undefined && cpu.acknowledged !== true ||
+          cpu.rejected !== undefined && (cpu.rejected !== true || cpu.acknowledged !== undefined || v.pending.operation !== undefined) ||
+          v.pending.operation !== undefined && cpu.acknowledged !== true)
+        throw new Error('Administrative CPU update intent is invalid');
+      validateVcpuCount(cpu.previousCount); validateVcpuCount(cpu.vcpuCount);
+      if (cpu.previousCount !== (v.vcpuCount ?? 2)) throw new Error('Administrative CPU update source changed');
+    } else if (cpu !== undefined) throw new Error('Administrative CPU update intent is invalid');
     if (v.selectedVolumeIds !== undefined && (!Array.isArray(v.selectedVolumeIds) || v.selectedVolumeIds.length > 32 ||
         new Set(v.selectedVolumeIds).size !== v.selectedVolumeIds.length || v.selectedVolumeIds.some(id => typeof id !== 'string' || !ADMIN_NATIVE_UUID.test(id))))
       throw new Error('Administrative selected storage references are invalid');
@@ -108,7 +126,8 @@ export function validateAdminNativeState(record: Readonly<AdministrativeWorkspac
 }
 export function applyAdminNativePatch(record: AdministrativeWorkspaceRecord, patch: AdminNativeRuntimePatch): boolean {
   if (patch.status !== undefined && !['running','stopped'].includes(patch.status)) throw new Error('Administrative runtime status acknowledgement is invalid');
-  const next = { ...record, ...(patch.status !== undefined ? {status:patch.status} : {}), runtimeKind: patch.runtimeKind, nativeRuntime: patch.nativeRuntime && structuredClone(patch.nativeRuntime),
+  const next = { ...record, ...(patch.status !== undefined ? {status:patch.status} : {}),
+    ...(patch.vcpuCount !== undefined ? { vcpuCount: patch.vcpuCount } : {}), runtimeKind: patch.runtimeKind, nativeRuntime: patch.nativeRuntime && structuredClone(patch.nativeRuntime),
     nativeMigration: patch.nativeMigration && structuredClone(patch.nativeMigration) };
   validateAdminNativeState(next);
   if (isDeepStrictEqual(record, next)) return false;

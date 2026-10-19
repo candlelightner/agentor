@@ -329,7 +329,7 @@ Incus worker migration is in progress: durable runtime kind preserves legacy Doc
 
 ## 5. Worker Settings Modal
 
-The worker "detail" view is a fully editable **Worker Settings modal** (no more read-only view). It shows only worker-related settings — environment-specific settings (CPU/memory, network, Docker, capabilities, instructions, setup script, env vars, exposed APIs) live in the Environments modal, not here.
+The worker detail view is an editable **Worker Settings modal**. Environment defaults live in the Environments modal. Existing native VMs also expose a per-VM guest vCPU count in worker settings.
 
 ### 5.1 Content
 - Header: `<displayName> — Settings` + status badge (color-coded) + an amber `Rebuild pending` badge when there are unapplied rebuild-requiring edits
@@ -357,6 +357,12 @@ The worker "detail" view is a fully editable **Worker Settings modal** (no more 
 - Opens when clicking the worker name or the Settings pencil (§4.1a)
 - Close via Escape key or clicking the overlay
 - Re-openable; the form re-initialises from the worker each time it opens
+
+### 5.5 Existing VM vCPU count
+- Ordinary VM settings and platform/group administrative management include **Virtual CPU cores**. The editor reads the assigned count and authenticated backend maximum.
+- Stop the VM, refresh, save a positive integer, then start normally. The definition changes in place and storage is retained. Protected changes require the current lock password.
+- Unknown operations remain fenced and expose an explicit **Reconcile pending CPU change** action for their recorded target. No automatic resubmission or compute rebuild is used for recovery.
+- CPU overrides persist across restart, rebuild, archive/unarchive and portable export/import. See [VM vCPU changes](../docs/vm-vcpu-changes.md) for API behavior and administrative host-policy compatibility.
 
 ---
 
@@ -600,7 +606,7 @@ The worker "detail" view is a fully editable **Worker Settings modal** (no more 
 - Section collapse/expand
 - Timestamps update every 30 seconds
 
-> There is no whole-host/system metrics card — host CPU/RAM/disk are inherently OS- and runtime-dependent, so only per-worker metrics are surfaced (see §4.1b), computed entirely through the Docker API.
+> Only per-worker resource metrics are surfaced (see §4.1b), using Docker stats or Incus guest telemetry according to runtime.
 
 ---
 
@@ -1418,7 +1424,7 @@ Nested group administrative identities are validated before their owner partitio
 Native administrative runtime authority now marks newly persisted global/group identities as Incus before provisioning, preserves legacy selectors until an explicit dedicated transaction, persists bounded runtime acknowledgements, and quarantines malformed native metadata. Runtime/network/proxy/DR integration remains in progress.
 
 
-Native administrative core (fixed 4 GiB RAM / 2 vCPU profile) now binds fresh global/group workspaces to Incus only, with no Docker provisioning fallback; preserves retained Docker sources pending explicit migration; owns canonical private volumes, approved-native/OCI image identity and server-generated overlay6; persists lifecycle acknowledgements/UUIDs, gates service start on a fresh tmpfs credential, and validates the dedicated network before boot and guest access. Existing control representation and startup revision behavior are shared across transports. Private host policy, proxy/plugin dispatch, complete native admin migration/DR and real VM acceptance remain separate integration gates.
+Native administrative core (default 4 GiB RAM / 2 vCPU profile with explicit resource settings) now binds fresh global/group workspaces to Incus only, with no Docker provisioning fallback; preserves retained Docker sources pending explicit migration; owns canonical private volumes, approved-native/OCI image identity and server-generated overlay6; persists lifecycle acknowledgements/UUIDs, gates service start on a fresh tmpfs credential, and validates the dedicated network before boot and guest access. Existing control representation and startup revision behavior are shared across transports. Private host policy, proxy/plugin dispatch, complete native admin migration/DR and real VM acceptance remain separate integration gates.
 
 Native admin authority preserves bounded legacy IDs through deterministic DNS-safe native names. Group-store bootstrap is singleflight/once-only; explicit per-owner reload/recovery remains available. Fresh empty canonical root initialization and subsequent ownership-preservation markers protect restored numeric metadata from the ordinary VM bootstrap chown.
 

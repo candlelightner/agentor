@@ -43,6 +43,14 @@ export class AdministrativeWorkspaceRuntime implements AdminWorkspaceRuntimeAdap
     async observeStatus(record: Readonly<AdministrativeWorkspaceRecord>) {
         return this.isNative(record) ? this.native.observeStatus(record) : record.status;
     }
+    async getCpuSettings(record: Readonly<AdministrativeWorkspaceRecord>) {
+        if (!this.isNative(record)) return this.migrationRequired();
+        return this.native.getCpuSettings(record);
+    }
+    async setCpuCount(record: Readonly<AdministrativeWorkspaceRecord>, count: number, ack: AdminNativeAcknowledge) {
+        if (!this.isNative(record)) return this.migrationRequired();
+        return this.native.setCpuCount(record, count, ack);
+    }
     async start(record: Readonly<AdministrativeWorkspaceRecord>, ack?: AdminNativeAcknowledge) { if (!this.isNative(record))
         return this.migrationRequired(); return this.native.start(record, ack); }
     async stop(record: Readonly<AdministrativeWorkspaceRecord>, ack?: AdminNativeAcknowledge, force = false) { return this.isNative(record) ? this.native.stop(record, ack, force) : this.legacy.stop(record, ack, force); }

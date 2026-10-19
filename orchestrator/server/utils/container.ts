@@ -77,7 +77,8 @@ import { normalizeWorkerRuntimeKind } from "../../shared/types";
 import { resolveDefaultIncusImage } from './incus-default-image';
 import { IncusWorkerRuntime, incusWorkerStatus, type IncusWorkerOptions } from "./incus-worker-runtime";
 import { IncusWorkerImageManager } from './incus-worker-image-manager';
-import { IncusRequestRejected } from './incus-client';
+import { IncusRequestRejected, incusCpuDefinitionFingerprint } from './incus-client';
+import { validateVcpuCount, type VcpuSettings } from '../../shared/vcpu-count';
 import { legacyMigrationMountIdentity } from './legacy-incus-migration-capture';
 import { assertOrdinaryWorkerIdentity, isAdministrativeWorkspaceId } from './ordinary-worker-identity';
 import { readAdministrativeRuntimeRecord, administrativeRuntimeOwner } from './admin-native-authority';
@@ -160,7 +161,7 @@ import {
   DEFAULT_ENVIRONMENT_ID,
 } from "./environments";
 import type { EnvironmentStore, Environment } from "./environments";
-import type { WorkerStore, WorkerRecord, WorkerIncusMigration } from "./worker-store";
+import type { WorkerStore, WorkerRecord, WorkerIncusMigration, WorkerIncusCpuResize } from "./worker-store";
 import { isWorkerSelfApiAccess } from "./worker-self-access";
 import type { UserCredentialManager } from "./user-credentials";
 import type { UserEnvVarStore } from "./user-env-store";
@@ -545,7 +546,7 @@ export class ContainerManager {
     const check = () => {
       const current = this.get(info.id), record = this.workerStore!.get(info.userId, info.id);
       if (current?.containerId !== info.containerId || current.userId !== info.userId ||
-          !record || record.status !== 'active' || record.deletionPending || record.incusRecreation ||
+          !record || record.status !== 'active' || record.deletionPending || record.incusRecreation || record.incusCpuResize ||
           normalizeWorkerRuntimeKind(record.runtimeKind) !== normalizeWorkerRuntimeKind(info.runtimeKind))
         throw new Error('Managed hostname runtime authority changed');
     };
@@ -771,7 +772,7 @@ export class ContainerManager {
       assertOrdinaryWorkerIdentity(id, snapshot.userId);
       const record = this.workerStore!.get(snapshot.userId, id), original = this.containers.get(id);
       if (!record || !original || original.administrativeKind || record.runtimeKind !== 'legacy-docker' ||
-          record.status !== 'active' || record.deletionPending || record.incusMigration || record.incusRecreation ||
+          record.status !== 'active' || record.deletionPending || record.incusMigration || record.incusRecreation || record.incusCpuResize ||
           record.hostMountsRevoked || record.hardwareDevicesRevoked ||
           !this.storageManager)
         throw Object.assign(new Error('Migration requires a settled ordinary legacy worker and its configured OCI source'), { statusCode: 409 });
@@ -1081,7 +1082,7 @@ export class ContainerManager {
       await assertPrincipal();
       const record = this.workerStore!.get(snapshot.userId, id), marker = record?.incusMigration;
       if (!record || record.runtimeKind !== 'incus-vm' || !marker || marker.phase !== 'retained' ||
-          record.incusRecreation || record.deletionPending)
+          record.incusRecreation || record.incusCpuResize || record.deletionPending)
         throw Object.assign(new Error('Finalization requires a settled validated Incus migration'), { statusCode: 409 });
       const owner = { id, userId: record.userId, containerName: this.buildContainerName(id) };
       const info = this.containers.get(id);
@@ -1466,6 +1467,7 @@ export class ContainerManager {
       userId: info.userId, id: info.id, containerName: info.containerName,
       ...(bootstrap ? { cpuLimit: bootstrap.cpuLimit, memoryLimit: bootstrap.memoryLimit, dockerEnabled: bootstrap.dockerEnabled }
         : this.deriveLimits(environment)),
+      ...(info.vcpuCount === undefined ? {} : { cpuLimit: validateVcpuCount(info.vcpuCount, await this.incusRuntime.client.getCpuCapacity()) }),
       environmentJson: environment.environmentJson,
       capabilitiesJson: environment.capabilitiesJson, instructionsJson: environment.instructionsJson,
       workerJson: bootstrap?.workerJson ?? { id: info.id, displayName: info.displayName,
@@ -1779,7 +1781,8 @@ export class ContainerManager {
         containerName: instance.name, displayName: worker.displayName || instance.name,
         imageName: instance.config["image.source_image"] || this.config.incusWorkerImage,
         imageId: instance.config["volatile.base_image"] || "",
-        status: worker.incusRecreation ? 'error' : incusWorkerStatus(instance),
+        status: worker.incusRecreation || worker.incusCpuResize ? 'error' : incusWorkerStatus(instance),
+        ...(worker.incusCpuResize ? { runtimeDiagnostic: { code: 'INCUS_CPU_UPDATE_PENDING', operation: 'VM CPU change', message: 'Reconcile the pending change in VM CPU settings before changing its lifecycle.', retryable: true, observedAt: new Date().toISOString() } } : {}),
         ...(worker.incusRecreation ? { runtimeDiagnostic: {
           code: 'INCUS_RECREATION_RECOVERY_REQUIRED', operation: 'Incus inventory',
           message: 'Interrupted VM recreation is quarantined until ownership-safe rollback succeeds.',
@@ -1849,6 +1852,8 @@ export class ContainerManager {
   private assertOrdinaryMutation(info: ContainerInfo) {
     assertOrdinaryWorkerIdentity(info.id, info.userId);
     this.assertMigrationSettled(info);
+    if (this.workerStore?.get(info.userId, info.id)?.incusCpuResize)
+      throw Object.assign(new Error('VM CPU change requires reconciliation in CPU settings before lifecycle changes.'), { statusCode: 409 });
     if (info.runtimeKind === 'incus-vm' && this.workerStore?.get(info.userId, info.id)?.incusRecreation)
       throw new Error('Interrupted Incus recreation requires explicit recovery before lifecycle mutation');
     if (info.administrativeKind || info.userId === "__agentor_admin__") {
@@ -1918,6 +1923,111 @@ export class ContainerManager {
     });
   }
 
+  private cpuWorker(id: string) {
+    const info = this.containers.get(id), record = info && this.workerStore?.get(info.userId, id);
+    if (!info || !record) throw Object.assign(new Error('Worker not found'), { statusCode: 404 });
+    assertOrdinaryWorkerIdentity(id, info.userId);
+    this.assertMigrationSettled(info);
+    if (info.administrativeKind || info.runtimeKind !== 'incus-vm' || record.runtimeKind !== 'incus-vm' ||
+        record.status !== 'active' || record.deletionPending || record.incusRecreation)
+      throw Object.assign(new Error('CPU settings require an existing ordinary native VM.'), { statusCode: 409 });
+    return { info, record, owner: { id, userId: info.userId, containerName: info.containerName },
+      incarnation: this.capturedIncusIncarnation(info) };
+  }
+
+  async getVcpuSettings(id: string): Promise<VcpuSettings> {
+    if (isWorkerLifecycleMutationPending(id))
+      throw Object.assign(new Error('VM operation is in progress; refresh CPU settings after it settles.'), { statusCode: 409 });
+    const target = this.cpuWorker(id), generation = workerLifecycleGeneration(id);
+    const observed = await this.incusRuntime.inspectCpu(target.owner, target.incarnation);
+    const maximum = await this.incusRuntime.client.getCpuCapacity();
+    const fresh = this.cpuWorker(id);
+    if (fresh.incarnation !== target.incarnation || fresh.info.userId !== target.info.userId ||
+        workerLifecycleGeneration(id) !== generation || isWorkerLifecycleMutationPending(id))
+      throw Object.assign(new Error('VM CPU settings changed; refresh before retrying.'), { statusCode: 409 });
+    const pending = fresh.record.incusCpuResize;
+    if (pending && (pending.incarnation !== target.incarnation ||
+        pending.fingerprint !== incusCpuDefinitionFingerprint(observed.instance)))
+      throw Object.assign(new Error('VM CPU change identity differs; preserve the VM for operator recovery.'), { statusCode: 409 });
+    return { vcpuCount: observed.vcpuCount, maxVcpuCount: maximum,
+      status: observed.instance.status === 'Running' ? 'running' : 'stopped', pending: !!pending,
+      ...(pending ? { pendingVcpuCount: pending.targetCount } : {}) };
+  }
+
+  async setVcpuCount(id: string, value: unknown): Promise<VcpuSettings> {
+    const count = validateVcpuCount(value), initial = this.cpuWorker(id);
+    return withOwnerWorkerLifecycleMutation(initial.info.userId, id, async () => {
+      await this.assertOwnerExists(initial.info.userId);
+      const target = this.cpuWorker(id);
+      if (target.info.userId !== initial.info.userId || target.incarnation !== initial.incarnation)
+        throw Object.assign(new Error('VM CPU identity changed; refresh before retrying.'), { statusCode: 409 });
+      await this.incusRuntime.assertWorkspaceReplacementSettled(target.owner);
+      const observed = await this.incusRuntime.inspectCpu(target.owner, target.incarnation);
+      const maximum = await this.incusRuntime.client.getCpuCapacity();
+      if (observed.instance.status !== 'Stopped')
+        throw Object.assign(new Error('Stop the VM before changing its vCPU count. The change applies at next start.'), { statusCode: 409 });
+      const fingerprint = incusCpuDefinitionFingerprint(observed.instance);
+      const publish = async (expected: WorkerIncusCpuResize, applied?: number) => {
+        const saved = await this.workerStore!.transitionIncusCpuResize(target.info.userId, id, expected, undefined, applied);
+        target.info.vcpuCount = saved.vcpuCount;
+        target.info.updatedAt = saved.updatedAt;
+        target.info.status = 'stopped';
+        target.info.runtimeDiagnostic = undefined;
+      };
+      const pending = target.record.incusCpuResize;
+      if (pending) {
+        if (count !== pending.targetCount || pending.incarnation !== target.incarnation || pending.fingerprint !== fingerprint)
+          throw Object.assign(new Error('Reconcile the existing CPU change using its recorded target; VM identity must remain unchanged.'), { statusCode: 409 });
+        await this.incusRuntime.client.assertInstanceMutationSettled(target.info.containerName);
+        let success = pending.accepted === true && !pending.operation;
+        let failed = pending.rejected === true;
+        if (pending.operation) {
+          const operation = await this.incusRuntime.client.request<{ status: string; status_code: number }>('GET', pending.operation);
+          success = operation.status === 'Success' && operation.status_code === 200;
+          failed = ['Failure', 'Cancelled'].includes(operation.status);
+        }
+        const verified = await this.incusRuntime.inspectCpu(target.owner, target.incarnation);
+        if (verified.instance.status !== 'Stopped' || incusCpuDefinitionFingerprint(verified.instance) !== fingerprint)
+          throw Object.assign(new Error('VM changed during CPU reconciliation; preserve it for operator recovery.'), { statusCode: 409 });
+        if (success && verified.vcpuCount === pending.targetCount) await publish(pending, pending.targetCount);
+        else if (failed && verified.vcpuCount === pending.previousCount) {
+          await publish(pending);
+          throw Object.assign(new Error('The backend rejected the recorded CPU operation. Its previous count was preserved; refresh before retrying.'), { statusCode: 409 });
+        } else throw Object.assign(new Error('CPU operation has no confirmed terminal outcome; preserve this VM and reconcile after backend recovery.'), { statusCode: 409 });
+        return { vcpuCount: pending.targetCount, maxVcpuCount: maximum, status: 'stopped', pending: false };
+      }
+      validateVcpuCount(count, maximum);
+      if (count === observed.vcpuCount)
+        return { vcpuCount: count, maxVcpuCount: maximum, status: 'stopped', pending: false };
+      let intent: WorkerIncusCpuResize = { incarnation: target.incarnation, previousCount: observed.vcpuCount, targetCount: count, fingerprint };
+      await this.workerStore!.transitionIncusCpuResize(target.info.userId, id, undefined, intent);
+      try {
+        await this.incusRuntime.client.updateInstanceCpuCount(target.info.containerName, count, async operation => {
+          const next = { ...intent, accepted: true as const, ...(operation ? { operation } : {}) };
+          await this.workerStore!.transitionIncusCpuResize(target.info.userId, id, intent, next);
+          intent = next;
+        }, observed.instance);
+        const verified = await this.incusRuntime.inspectCpu(target.owner, target.incarnation);
+        if (verified.instance.status !== 'Stopped' || verified.vcpuCount !== count ||
+            incusCpuDefinitionFingerprint(verified.instance) !== fingerprint)
+          throw new Error('VM CPU change readback is unproven; reconcile before starting this VM.');
+        await publish(intent, count);
+      } catch (error) {
+        if (error instanceof IncusRequestRejected) {
+          const rejected = { ...intent, rejected: true as const };
+          await this.workerStore!.transitionIncusCpuResize(target.info.userId, id, intent, rejected);
+          intent = rejected;
+          await this.incusRuntime.client.assertInstanceMutationSettled(target.info.containerName);
+          const unchanged = await this.incusRuntime.inspectCpu(target.owner, target.incarnation);
+          if (unchanged.instance.status === 'Stopped' && unchanged.vcpuCount === intent.previousCount &&
+              incusCpuDefinitionFingerprint(unchanged.instance) === fingerprint) await publish(intent);
+        }
+        throw error;
+      }
+      return { vcpuCount: count, maxVcpuCount: maximum, status: 'stopped', pending: false };
+    });
+  }
+
   /** Authenticated original restore is not a runtime migration or rebuild.
    * One existing owner→worker admission covers every destructive leaf. */
   async replaceOriginalWorkspaceFromBackup(userId: string, id: string, archivePath: string,
@@ -1982,7 +2092,7 @@ export class ContainerManager {
   private async setIncusManagedNetworkFenced(id: string, networkId: string, attach: boolean): Promise<void> {
       const info = this.get(id)!, record = this.workerStore?.get(info.userId, id);
       if (!record || record.status !== 'active' || record.runtimeKind !== 'incus-vm' || record.deletionPending ||
-          record.incusRecreation || info.runtimeKind !== 'incus-vm')
+          record.incusRecreation || record.incusCpuResize || info.runtimeKind !== 'incus-vm')
         throw new Error('Incus worker is not authoritative for managed network mutation');
       // A network PUT includes the whole device map: do not touch it while
       // existing managed-storage authority is unsettled. Read/fence only; no
@@ -2003,7 +2113,7 @@ export class ContainerManager {
       const current = this.get(id), record = userId && this.workerStore?.get(userId, id);
       if (!info || !current || current.userId !== userId || current.containerId !== containerId ||
           current.runtimeKind !== 'incus-vm' || !record || record.runtimeKind !== 'incus-vm' ||
-          record.status !== 'active' || record.deletionPending || record.incusRecreation ||
+          record.status !== 'active' || record.deletionPending || record.incusRecreation || record.incusCpuResize ||
           isWorkerLifecycleMutationPending(id) || workerLifecycleGeneration(id) !== generation)
         throw new Error('Incus worker changed or is unavailable during managed network observation');
     };
@@ -2734,7 +2844,7 @@ for p in sys.argv[1:]:
     const info = this.get(id), record = this.workerStore?.findById(id);
     if (!info || info.runtimeKind !== 'incus-vm' || info.status !== 'running' ||
         !record || record.userId !== info.userId || record.runtimeKind !== 'incus-vm' || record.status !== 'active' ||
-        record.deletionPending || record.incusRecreation || record.hostMountsRevoked || !isWorkerLifecycleMutationPending(id))
+        record.deletionPending || record.incusRecreation || record.incusCpuResize || record.hostMountsRevoked || !isWorkerLifecycleMutationPending(id))
       throw Object.assign(new Error('Explicit native backup requires settled running worker authority and lifecycle admission'), { statusCode: 409 });
     const incarnation = this.capturedIncusIncarnation(info), generation = workerLifecycleGeneration(id);
     const capturedRecord = structuredClone(record), capturedMounts = structuredClone(info.mounts ?? []), handle = info.containerId;
@@ -2763,7 +2873,7 @@ for p in sys.argv[1:]:
   async captureOfflineDockerBackupWithLifecycleFenceHeld(id: string, archivePath: string, signal?: AbortSignal) {
     const record = this.workerStore?.findById(id), info = this.get(id);
     const archived = record?.status === 'archived' && !info;
-    if (!record || record.runtimeKind !== 'incus-vm' || record.deletionPending || record.incusRecreation ||
+    if (!record || record.runtimeKind !== 'incus-vm' || record.deletionPending || record.incusRecreation || record.incusCpuResize ||
         record.hostMountsRevoked || !isWorkerLifecycleMutationPending(id) ||
         !archived && (record.status !== 'active' || !info || info.runtimeKind !== 'incus-vm' ||
           info.userId !== record.userId || info.status !== 'stopped'))
@@ -2794,7 +2904,7 @@ for p in sys.argv[1:]:
   private async instanceBackupSourceWithLifecycleFenceHeld(id: string) {
     const record = this.workerStore?.findById(id), info = this.get(id);
     const archived = record?.status === 'archived' && !info;
-    if (!instanceSnapshotActive() || !record || record.runtimeKind !== 'incus-vm' || record.deletionPending || record.incusRecreation ||
+    if (!instanceSnapshotActive() || !record || record.runtimeKind !== 'incus-vm' || record.deletionPending || record.incusRecreation || record.incusCpuResize ||
         !isWorkerLifecycleMutationPending(id) || !archived && (record.status !== 'active' || !info ||
           info.runtimeKind !== 'incus-vm' || info.userId !== record.userId || info.status !== 'stopped'))
       throw Object.assign(new Error('Instance backup requires settled stopped/archived native worker authority'), { statusCode: 409 });
@@ -5087,7 +5197,7 @@ for p in sys.argv[1:]:
     await this.incusRuntime.assertWorkspaceReplacementSettled(snapshot);
     if (!this.workerStore) throw new Error('WorkerStore is required for Incus recreation');
     const record = this.workerStore.get(snapshot.userId, snapshot.id);
-    if (!record || record.runtimeKind !== 'incus-vm' || record.deletionPending || record.incusRecreation ||
+    if (!record || record.runtimeKind !== 'incus-vm' || record.deletionPending || record.incusRecreation || record.incusCpuResize ||
         record.status !== (original || applied ? 'active' : 'archived'))
       throw new Error('Incus recreation requires matching durable authority and no unresolved replacement');
     if (applied && (record.hostMountsRevoked || record.hardwareDevicesRevoked))
@@ -5574,7 +5684,7 @@ for p in sys.argv[1:]:
         if ((!archivedNative && (!current || current.containerId !== capturedHandle || current.userId !== info.userId ||
             current.status !== captureStatus)) || (archivedNative && current) ||
             !record || record.status !== (archivedNative ? 'archived' : 'active') ||
-            record.runtimeKind !== 'incus-vm' || record.deletionPending || record.incusRecreation ||
+            record.runtimeKind !== 'incus-vm' || record.deletionPending || record.incusRecreation || record.incusCpuResize ||
             workerLifecycleGeneration(id) !== capturedGeneration || !isWorkerLifecycleMutationPending(id))
           throw new Error('Incus export canonical runtime authority changed');
       };
@@ -5697,6 +5807,7 @@ for p in sys.argv[1:]:
           hardwareDeviceIds: info.hardwareDeviceIds?.length ? [...info.hardwareDeviceIds] : undefined,
           initScript: info.initScript ?? "",
           workerSelfApiAccess: info.workerSelfApiAccess ?? "inherit",
+          ...(native && info.vcpuCount !== undefined ? { vcpuCount: info.vcpuCount } : {}),
         },
         // Environment values can contain API keys and other credentials. The
         // portable definition retains non-secret behavior but never exports
@@ -6089,6 +6200,7 @@ for p in sys.argv[1:]:
           containerId: containerName, containerName, displayName,
           imageName: resolvedImage.imageRuntimeReference || this.config.incusWorkerImage,
           imageId: '', status: 'creating', desiredRuntimeStatus: 'stopped', environmentId,
+          ...(manifest.worker.vcpuCount === undefined ? {} : { vcpuCount: validateVcpuCount(manifest.worker.vcpuCount) }),
           repos: repos.length ? repos : undefined, mounts: mounts.length ? mounts : undefined, hardwareDeviceIds,
           initScript: initScript || undefined, workerSelfApiAccess, pendingRebuild: false, ...resolvedImage,
         }, canonicalPayloads, manifest, pluginConfiguration, opts.imageResolution, assertRuntimePrincipal, nativeManagedPayloads, additionalPaths);
@@ -6987,9 +7099,9 @@ for p in sys.argv[1:]:
     }
   }
 
-  listArchived(): Omit<WorkerRecord, 'importCreatedEnvironmentId' | 'incusRecreation' | 'incusMigration'>[] {
+  listArchived(): Omit<WorkerRecord, 'importCreatedEnvironmentId' | 'incusRecreation' | 'incusMigration' | 'incusCpuResize'>[] {
     return (this.workerStore?.listArchived() ?? []).filter(record => !isAdministrativeWorkspaceId(record.id, record.userId)).map((record) => {
-      const { importCreatedEnvironmentId: _internal, incusRecreation: _recovery, incusMigration: _migration, ...publicRecord } = record;
+      const { importCreatedEnvironmentId: _internal, incusRecreation: _recovery, incusMigration: _migration, incusCpuResize: _cpu, ...publicRecord } = record;
       return publicRecord;
     });
   }
@@ -7177,14 +7289,14 @@ for p in sys.argv[1:]:
       }
     }
     for (const snapshot of this.workerStore?.listActive() ?? []) {
-      if (!this.canReconcileOrdinaryWorker(snapshot) || snapshot.runtimeKind !== 'incus-vm' || snapshot.deletionPending || snapshot.incusRecreation) continue;
+      if (!this.canReconcileOrdinaryWorker(snapshot) || snapshot.runtimeKind !== 'incus-vm' || snapshot.deletionPending || snapshot.incusRecreation || snapshot.incusCpuResize) continue;
       let observedHandle: string | undefined, observedGeneration: number | undefined;
       if (!this.get(snapshot.id)?.containerId.startsWith('incus:')) {
         try {
           await withOwnerWorkerLifecycleMutation(snapshot.userId, snapshot.id, async () => {
             const record = this.workerStore?.get(snapshot.userId, snapshot.id);
             if (!record || record.status !== 'active' || record.runtimeKind !== 'incus-vm' || record.deletionPending ||
-                record.incusRecreation || record.desiredRuntimeStatus !== 'running' ||
+                record.incusRecreation || record.incusCpuResize || record.desiredRuntimeStatus !== 'running' ||
                 this.get(record.id)?.containerId.startsWith('incus:')) return;
             await this.assertOwnerExists(record.userId);
             const name = this.buildContainerName(record.id);
@@ -7202,7 +7314,7 @@ for p in sys.argv[1:]:
       const inspect = async () => {
         const record = this.workerStore?.get(snapshot.userId, snapshot.id), info = this.get(snapshot.id);
         if (!record || record.status !== 'active' || record.runtimeKind !== 'incus-vm' || record.deletionPending ||
-            record.incusRecreation || !info || info.userId !== record.userId || info.runtimeKind !== 'incus-vm') return;
+            record.incusRecreation || record.incusCpuResize || !info || info.userId !== record.userId || info.runtimeKind !== 'incus-vm') return;
         const { useManagedVolumeManager } = await import('./managed-volume-manager');
         const volumes = useManagedVolumeManager(); await volumes.init();
         volumes.assertLiveRecoveryResolved(record.userId, record.id);
@@ -7291,8 +7403,8 @@ for p in sys.argv[1:]:
   /** Project the runtime ContainerInfo down to the minimal persisted record —
    * dropping everything Docker can re-discover (containerId, containerName,
    * imageName, imageId) and keeping only the worker's identity + config. */
-  private workerRuntimeRecord(record: WorkerRecord): Omit<WorkerRecord, 'incusMigration'> {
-    const { incusMigration: _migration, ...runtimeRecord } = record;
+  private workerRuntimeRecord(record: WorkerRecord): Omit<WorkerRecord, 'incusMigration' | 'incusCpuResize'> {
+    const { incusMigration: _migration, incusCpuResize: _cpu, ...runtimeRecord } = record;
     return runtimeRecord;
   }
 
@@ -7309,6 +7421,7 @@ for p in sys.argv[1:]:
         ? { desiredRuntimeStatus: info.desiredRuntimeStatus }
         : {}),
       environmentId: info.environmentId,
+      vcpuCount: info.vcpuCount,
       excludedGlobalEnvVarKeys: info.excludedGlobalEnvVarKeys ?? [],
       excludedGroupEnvVarKeys: info.excludedGroupEnvVarKeys ?? [],
       workerSelfApiAccess: info.workerSelfApiAccess,
@@ -7327,6 +7440,7 @@ for p in sys.argv[1:]:
       imageRuntimeReference: info.imageRuntimeReference,
       incusRecreation: this.workerStore?.get(info.userId, info.id)?.incusRecreation,
       incusMigration: this.workerStore?.get(info.userId, info.id)?.incusMigration,
+      incusCpuResize: this.workerStore?.get(info.userId, info.id)?.incusCpuResize,
     };
   }
 

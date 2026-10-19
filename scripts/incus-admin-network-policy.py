@@ -149,6 +149,24 @@ class AdminNetworkPolicy:
         match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(B|KiB|MiB|GiB)", memory) if isinstance(memory, str) and len(memory) <= 64 else None
         require(match is not None and 1 <= int(Fraction(match[1]) * 1024 ** {"B": 0, "KiB": 1, "MiB": 2, "GiB": 3}[match[2]]) <= 2**53 - 1,
                 "Applied administrative memory limit is invalid")
+        for source in (record, native):
+            require("vcpuCount" not in source or type(source["vcpuCount"]) is int and 1 <= source["vcpuCount"] <= 2**53 - 1,
+                    "Administrative vCPU count is invalid")
+        pending = native.get("pending")
+        if isinstance(pending, dict) and pending.get("kind") == "cpu":
+            cpu = pending.get("cpu")
+            require(set(pending) <= {"kind", "operation", "cpu"} and isinstance(cpu, dict)
+                    and set(cpu) <= {"previousCount", "vcpuCount", "definitionFingerprint", "acknowledged", "rejected"}
+                    and type(cpu.get("previousCount")) is int and cpu["previousCount"] == native.get("vcpuCount", 2)
+                    and type(cpu.get("vcpuCount")) is int and 1 <= cpu["vcpuCount"] <= 2**53 - 1
+                    and isinstance(native.get("incarnation"), str) and re.fullmatch(UUID, native["incarnation"])
+                    and isinstance(cpu.get("definitionFingerprint"), str) and re.fullmatch(r"[0-9a-f]{64}", cpu["definitionFingerprint"])
+                    and ("acknowledged" not in cpu or cpu["acknowledged"] is True)
+                    and ("rejected" not in cpu or cpu["rejected"] is True and "acknowledged" not in cpu and "operation" not in pending)
+                    and ("operation" not in pending or cpu.get("acknowledged") is True
+                         and isinstance(pending["operation"], str)
+                         and re.fullmatch(r"/1\.0/operations/" + UUID + r"(?:\?project=[A-Za-z0-9_-]+)?", pending["operation"])),
+                    "Administrative CPU update intent is invalid")
         require(len(f"/var/lib/incus/devices/{self.project}_{native['name']}/virtio-fs.workspace.sock".encode()) <= 107,
                 "Administrative virtiofs socket path exceeds 107 bytes; use a shorter Incus project")
         key = hashlib.sha256(f"{self.installation}:{owner}:{group}:{workspace}".encode()).hexdigest()[:12]
@@ -285,7 +303,7 @@ class AdminNetworkPolicy:
         subnet = interface.network
         mac = "02:" + ":".join(identity["key"][index:index + 2] for index in range(0, 10, 2))
         peer = str(subnet.network_address + 2)
-        result = {"installation": self.installation, "workspaceId": identity["record"]["id"],
+        result = {"cpuCountUpdates": True, "installation": self.installation, "workspaceId": identity["record"]["id"],
                   "ownerId": identity["owner"], "kind": identity["record"]["kind"],
                   "network": identity["name"], "subnet": str(subnet), "gateway": str(interface.ip),
                   "managementAddress": peer, "guestAddress": str(subnet.network_address + 3), "guestMac": mac,
@@ -304,10 +322,17 @@ class AdminNetworkPolicy:
             raise
         require(isinstance(instance, dict) and isinstance(instance.get("config"), dict), "Native admin metadata is unavailable")
         config = instance["config"]
+        cpu_count = native.get("vcpuCount", 2)
+        pending = native.get("pending")
+        if isinstance(pending, dict) and pending.get("kind") == "cpu":
+            require(instance.get("status") == "Stopped" and config.get("volatile.uuid") == native["incarnation"]
+                    and config.get("limits.cpu") in (str(pending["cpu"]["previousCount"]), str(pending["cpu"]["vcpuCount"])),
+                    "Pending administrative CPU update requires the captured stopped VM")
+            cpu_count = int(config["limits.cpu"])
         labels = {**self.labels(identity), "user.agentor.admin-nonce": native["nonce"],
                   "user.agentor.admin-overlay-sha256": native["overlaySha256"],
                   "boot.autostart": "false", "security.secureboot": "false",
-                  "limits.memory": native.get("memoryLimit", "4GiB"), "limits.cpu": "2"}
+                  "limits.memory": native.get("memoryLimit", "4GiB"), "limits.cpu": str(cpu_count)}
         require(instance.get("name") == native["name"] and instance.get("type") == "virtual-machine"
                 and instance.get("profiles") == [] and matches_incus_config(config, labels)
                 and all(key in labels or key.startswith(("volatile.", "image.")) for key in config),

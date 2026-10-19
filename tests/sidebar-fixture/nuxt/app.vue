@@ -1,5 +1,6 @@
 <script setup lang="ts">
 const query = new URLSearchParams(window.location.search);
+const showAdminCpu = ref(false);
 const role = query.get('role') === 'ordinary' ? 'ordinary' : 'admin';
 const adminStatus = query.get('adminStatus') === 'stopped' ? 'stopped' : 'running';
 const width = query.get('width') === 'narrow' ? 200 : 420;
@@ -38,7 +39,14 @@ useHead({ title: 'Sidebar QA fixture' });
         @open-admin-workspace="record('openAdminWorkspace')"
         @manage-worker-groups="record('manageWorkerGroups')"
       />
-      <section class="flex-1 p-8 bg-gray-100 dark:bg-gray-950 text-gray-500">Sidebar style QA fixture</section>
+      <section class="flex-1 p-8 bg-gray-100 dark:bg-gray-950 text-gray-500">
+        <VcpuEditor v-if="query.has('vcpu')" endpoint="/api/fixture-cpu" />
+        <template v-else-if="query.has('adminCpu')">
+          <UButton @click="showAdminCpu = true">Open administrative CPU recovery</UButton>
+          <AdminWorkspaceModal v-model:open="showAdminCpu" />
+        </template>
+        <span v-else>Sidebar style QA fixture</span>
+      </section>
     </main>
   </UApp>
 </template>

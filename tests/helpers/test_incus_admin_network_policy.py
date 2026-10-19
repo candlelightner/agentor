@@ -321,6 +321,67 @@ class AdminNetworkTests(unittest.TestCase):
         with self.assertRaises(MODULE.PolicyError):
             self.policy.inspect(self.payload)
 
+    def test_applied_cpu_count_and_pending_cpu_transition_keep_exact_admission(self):
+        result = self.policy.ensure(self.payload)
+        self.assertTrue(result['cpuCountUpdates'])
+        self.instance = self.owned_instance(result)
+        self.record['vcpuCount'] = 4
+        self.save()
+        self.policy.inspect(self.payload)  # Desired alone cannot change applied authority.
+        self.instance['config']['limits.cpu'] = '4'
+        with self.assertRaises(MODULE.PolicyError):
+            self.policy.inspect(self.payload)
+        self.record['nativeRuntime']['vcpuCount'] = 4
+        self.save()
+        self.policy.inspect(self.payload)
+        incarnation = str(uuid.uuid4())
+        self.record['nativeRuntime']['incarnation'] = incarnation
+        self.instance['config']['volatile.uuid'] = incarnation
+        self.instance['status'] = 'Stopped'
+        self.record['nativeRuntime']['pending'] = {'kind': 'cpu', 'cpu': {
+            'previousCount': 4, 'vcpuCount': 1, 'definitionFingerprint': 'a' * 64}}
+        self.save()
+        self.policy.inspect(self.payload)
+        self.instance['config']['limits.cpu'] = '1'
+        self.policy.inspect(self.payload)
+        with self.assertRaisesRegex(MODULE.PolicyError, 'pending'):
+            self.policy.ensure(self.payload)
+        for change in ('running', 'wrong-cpu', 'wrong-uuid'):
+            with self.subTest(change=change):
+                before = copy.deepcopy(self.instance)
+                if change == 'running': self.instance['status'] = 'Running'
+                if change == 'wrong-cpu': self.instance['config']['limits.cpu'] = '3'
+                if change == 'wrong-uuid': self.instance['config']['volatile.uuid'] = str(uuid.uuid4())
+                with self.assertRaises(MODULE.PolicyError): self.policy.inspect(self.payload)
+                self.instance = before
+        self.record['nativeRuntime']['vcpuCount'] = 1
+        self.record['vcpuCount'] = 1
+        del self.record['nativeRuntime']['pending']
+        self.save()
+        self.policy.inspect(self.payload)
+
+    def test_invalid_cpu_counts_and_pending_intents_reject_before_host_calls(self):
+        for count in (0, -1, 1.5, True, None, '2', 2**53):
+            with self.subTest(count=count):
+                self.record['nativeRuntime']['vcpuCount'] = count
+                self.save(); self.calls.clear()
+                with self.assertRaisesRegex(MODULE.PolicyError, 'vCPU'): self.policy.inspect(self.payload)
+                self.assertEqual(self.calls, [])
+        del self.record['nativeRuntime']['vcpuCount']
+        self.record['nativeRuntime']['incarnation'] = str(uuid.uuid4())
+        valid = {'kind': 'cpu', 'cpu': {'previousCount': 2, 'vcpuCount': 1, 'definitionFingerprint': 'a' * 64}}
+        invalid = [dict(valid, operation='/1.0/operations/' + str(uuid.uuid4())),
+                   {'kind': 'cpu', 'cpu': dict(valid['cpu'], previousCount=3)},
+                   {'kind': 'cpu', 'cpu': dict(valid['cpu'], acknowledged=False)},
+                   {'kind': 'cpu', 'cpu': dict(valid['cpu'], rejected=True, acknowledged=True)},
+                   {'kind': 'cpu', 'cpu': dict(valid['cpu'], vcpuCount=True)},
+                   {'kind': 'cpu', 'cpu': dict(valid['cpu'], definitionFingerprint='bad')}]
+        for pending in invalid:
+            self.record['nativeRuntime']['pending'] = pending
+            self.save(); self.calls.clear()
+            with self.assertRaisesRegex(MODULE.PolicyError, 'CPU update'): self.policy.inspect(self.payload)
+            self.assertEqual(self.calls, [])
+
     def test_absent_read_only_inspection_does_not_allocate(self):
         self.assertIsNone(self.policy.inspect(self.payload))
         self.assertEqual(self.mutations(), [])
