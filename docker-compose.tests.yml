@@ -46,6 +46,10 @@ services:
       # serially by default. Independent focused suites may opt into parallelism.
       - TEST_WORKERS=${TEST_WORKERS:-1}
       - CI=${CI:-}
+      # CI opts into source-keyed BuildKit layers; local DinD storage stays private.
+      - AGENTOR_TEST_GHA_CACHE=${AGENTOR_TEST_GHA_CACHE:-false}
+      - ACTIONS_RUNTIME_TOKEN=${ACTIONS_RUNTIME_TOKEN:-}
+      - ACTIONS_RESULTS_URL=${ACTIONS_RESULTS_URL:-}
       # Opt-in live-package reference acceptance; unset for deterministic CI.
       - RUN_REFERENCE_WORKFLOW=${RUN_REFERENCE_WORKFLOW:-}
 

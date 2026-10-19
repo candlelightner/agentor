@@ -47,6 +47,9 @@ jobs:
               - 'worker/**'
               - 'scripts/build-incus-worker-image.sh'
               - 'scripts/incus-canary.mjs'
+              - 'scripts/incus-admin-network-policy.py'
+              - 'scripts/setup-incus-host.sh'
+              - 'scripts/profile-ci-workflow.py'
               - '.dockerignore'
               - 'tests/**'
               - 'docker-compose.tests.yml'
@@ -104,6 +107,9 @@ jobs:
         working-directory: tests
         run: npm run test:modules -- --grep-invert 'api/(incus-admin-restore|incus-derived-image|incus-docker-restore-archive|incus-selected-restore|managed-kilo-parent|portable-pax-size)\.spec\.ts'
 
+      - name: Verify CI profiler
+        run: python3 scripts/profile-ci-workflow.py --self-test
+
       - name: Run root-owned archive metadata fixtures
         working-directory: tests
         run: >-
@@ -129,17 +135,35 @@ jobs:
           df -h /
           docker system df
           available_kib=$(df --output=avail / | tail -n 1)
-          # A measured warm run occupies about 12.5 GiB across the outer
-          # runner image and nested-Docker volume. Require another ~3.5 GiB
-          # for cold-build transient layers, npm installs, and artifacts.
-          minimum_kib=$((16 * 1024 * 1024))
+          # The previous Docker-only warm footprint was about 12.5 GiB.
+          # Allow extra space for BuildKit's temporary image/load copies.
+          # Record sampled headroom below; this is a conservative admission
+          # requirement, not a claim about measured peak usage.
+          minimum_kib=$((24 * 1024 * 1024))
           if (( available_kib < minimum_kib )); then
-            echo "At least 16 GiB of free disk is required for the isolated DinD build and tests." >&2
+            echo "At least 24 GiB of free disk is required for the isolated DinD build and tests." >&2
             exit 1
           fi
+          # Keep sampling across source builds, regression, and cleanup steps.
+          export AGENTOR_DISK_SAMPLES="$RUNNER_TEMP/agentor-ci-disk-kib.txt"
+          nohup bash -c 'while true; do df --output=avail / | tail -n 1 >> "$AGENTOR_DISK_SAMPLES"; sleep 10; done' </dev/null >/dev/null 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/agentor-ci-disk-sampler.pid"
+
+      - name: Export masked runtime cache credentials
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const name of ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RESULTS_URL']) {
+              const value = process.env[name];
+              if (!value) throw new Error(`Missing Actions runtime variable: ${name}`);
+              if (name === 'ACTIONS_RUNTIME_TOKEN') core.setSecret(value);
+              core.exportVariable(name, value);
+            }
 
       - name: Run bounded isolated regression suite
         working-directory: tests
+        env:
+          AGENTOR_TEST_GHA_CACHE: 'true'
         run: npm run test:docker:ci
 
       - name: Upload Playwright failure artifacts
@@ -156,6 +180,18 @@ jobs:
       - name: Remove isolated test state
         if: always()
         run: docker compose -f docker-compose.tests.yml down -v --remove-orphans
+
+      - name: Report sampled disk headroom
+        if: always()
+        shell: bash
+        run: |
+          pid_file="$RUNNER_TEMP/agentor-ci-disk-sampler.pid"
+          samples="$RUNNER_TEMP/agentor-ci-disk-kib.txt"
+          if [[ -f "$pid_file" ]]; then
+            kill "$(cat "$pid_file")" 2>/dev/null || true
+            df --output=avail / | tail -n 1 >> "$samples"
+            awk 'NR == 1 || $1 < minimum { minimum = $1 } END { printf "Minimum sampled available disk: %.2f GiB (10s samples)\n", minimum / 1048576 }' "$samples"
+          fi
 
   test_gate:
     name: CI test gate
