@@ -44,6 +44,8 @@ import { createReadStream, createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { isDeepStrictEqual } from 'node:util';
 import { openIncusDockerArchive, INCUS_OFFLINE_DOCKER_ARCHIVE_SCRIPT } from './incus-docker-archive';
+import { readIncusGuestMemory, INCUS_GUEST_MEMORY_TIMEOUT_MS } from './incus-guest-memory';
+import { withOperationDeadline } from './operation-deadline';
 
 /** Ubuntu's Incus virtiofs sockets include the project, instance and device key. */
 export function assertIncusWorkerSocketPath(project: string, instanceName: string): void {
@@ -698,21 +700,27 @@ export class IncusWorkerRuntime {
   }
 
   /** Telemetry is diagnostic only. It never supplies routing/worker identity. */
-  async inspectState(owner: IncusStorageOwner, incarnation: string) {
-    const check = async () => {
-      const instance = await this.assertOwned(owner.containerName, owner.id);
-      if (instance.config['user.agentor.owner'] !== owner.userId || !incarnation ||
-          instance.config['volatile.uuid'] !== incarnation)
-        throw new Error('Incus observation target ownership or incarnation changed');
-      return instance;
-    };
-    const instance = await check();
-    const state = await this.client.getInstanceState(owner.containerName);
-    await check();
-    const limit = (instance.expanded_config ?? instance.config)['limits.cpu'] ?? '1';
-    const nic = (instance.expanded_devices ?? instance.devices).eth0;
-    return { state, cpuCount: /^[1-9][0-9]*$/.test(limit) ? Number(limit) : 0,
-      primaryMac: nic?.hwaddr ?? instance.config['volatile.eth0.hwaddr'] };
+  async inspectState(owner: IncusStorageOwner, incarnation: string, signal?: AbortSignal) {
+    return withOperationDeadline(async sampleSignal => {
+      const check = async () => {
+        const instance = await this.assertOwned(owner.containerName, owner.id);
+        sampleSignal.throwIfAborted();
+        if (instance.config['user.agentor.owner'] !== owner.userId || !incarnation ||
+            instance.config['volatile.uuid'] !== incarnation)
+          throw new Error('Incus observation target ownership or incarnation changed');
+        return instance;
+      };
+      const instance = await check();
+      const state = await this.client.getInstanceState(owner.containerName);
+      sampleSignal.throwIfAborted();
+      await check();
+      const guestMemory = await readIncusGuestMemory(this.client, owner.containerName, sampleSignal);
+      await check();
+      const limit = (instance.expanded_config ?? instance.config)['limits.cpu'] ?? '1';
+      const nic = (instance.expanded_devices ?? instance.devices).eth0;
+      return { state, guestMemory, cpuCount: /^[1-9][0-9]*$/.test(limit) ? Number(limit) : 0,
+        primaryMac: nic?.hwaddr ?? instance.config['volatile.eth0.hwaddr'] };
+    }, INCUS_GUEST_MEMORY_TIMEOUT_MS, 'Incus guest metrics', signal);
   }
 
   /** Read the journal without requiring provisioned /run config. This remains

@@ -127,7 +127,9 @@ function sanitizeUsage(statusValue: AgentUsageStatus): AgentUsageStatus {
 function sanitizeMetric(metric: WorkerMetrics): WorkerMetrics {
   return {
     workerId: safeString(metric.workerId), containerName: safeString(metric.containerName), displayName: safeString(metric.displayName), status: metric.status,
-    cpuUtilization: safeNumber(metric.cpuUtilization), memoryUsedBytes: safeNumber(metric.memoryUsedBytes), memoryLimitBytes: safeNumber(metric.memoryLimitBytes), memoryUtilization: safeNumber(metric.memoryUtilization), diskUsedBytes: safeNumber(metric.diskUsedBytes), netRxBytesPerSec: safeNumber(metric.netRxBytesPerSec), netTxBytesPerSec: safeNumber(metric.netTxBytesPerSec), blkReadBytesPerSec: safeNumber(metric.blkReadBytesPerSec), blkWriteBytesPerSec: safeNumber(metric.blkWriteBytesPerSec), lastChecked: safeString(metric.lastChecked),
+    cpuUtilization: safeNumber(metric.cpuUtilization), memoryUsedBytes: safeNumber(metric.memoryUsedBytes), memoryLimitBytes: safeNumber(metric.memoryLimitBytes), memoryUtilization: safeNumber(metric.memoryUtilization), diskUsedBytes: safeNumber(metric.diskUsedBytes), netRxBytesPerSec: safeNumber(metric.netRxBytesPerSec), netTxBytesPerSec: safeNumber(metric.netTxBytesPerSec), blkReadBytesPerSec: safeNumber(metric.blkReadBytesPerSec), blkWriteBytesPerSec: safeNumber(metric.blkWriteBytesPerSec), lastChecked: metric.lastChecked === null ? null : safeString(metric.lastChecked),
+    ...(metric.cpuCapacity === 'host' || metric.cpuCapacity === 'worker' ? { cpuCapacity: metric.cpuCapacity } : {}),
+    ...(metric.memoryAccounting === 'guest-htop' ? { memoryAccounting: metric.memoryAccounting } : {}),
     ...(metric.error ? { error: "Metric sampling is currently unavailable" } : {}),
   };
 }

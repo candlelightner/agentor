@@ -147,6 +147,7 @@ import {
   workerLifecycleSequence,
 } from "./worker-lifecycle-coordinator";
 import { instanceSnapshotActive } from "./instance-snapshot-gate";
+import { readIncusGuestMemory, INCUS_GUEST_MEMORY_TIMEOUT_MS } from './incus-guest-memory';
 import {
   operationSettlement,
   withOperationDeadline,
@@ -7376,21 +7377,30 @@ for p in sys.argv[1:]:
   }
 
   async incusWorkerMetrics(id: string) {
-    const info = this.containers.get(id);
-    if (info?.runtimeKind === 'incus-vm' && info.administrativeKind) {
-      const target = this.administrativeNativeTarget(info);
-      const { instance } = await target.validate();
-      const state = await target.native.client.getInstanceState(info.containerName);
-      await target.validate();
-      const limit = (instance.expanded_config ?? instance.config)['limits.cpu'] ?? '1';
-      const nic = (instance.expanded_devices ?? instance.devices).eth0;
-      return { state, cpuCount: /^[1-9][0-9]*$/.test(limit) ? Number(limit) : 0,
-        primaryMac: nic?.hwaddr ?? instance.config['volatile.eth0.hwaddr'] };
-    }
-    const target = this.incusObservationTarget(id);
-    const result = await this.incusRuntime.inspectState(target.owner, target.incarnation);
-    target.validate();
-    return result;
+    return withOperationDeadline(async signal => {
+      const info = this.containers.get(id);
+      if (info?.runtimeKind === 'incus-vm' && info.administrativeKind) {
+        const target = this.administrativeNativeTarget(info);
+        const { instance } = await target.validate();
+        signal.throwIfAborted();
+        const state = await target.native.client.getInstanceState(info.containerName);
+        signal.throwIfAborted();
+        await target.validate();
+        signal.throwIfAborted();
+        const guestMemory = await readIncusGuestMemory(target.native.client, info.containerName, signal);
+        await target.validate();
+        signal.throwIfAborted();
+        const limit = (instance.expanded_config ?? instance.config)['limits.cpu'] ?? '1';
+        const nic = (instance.expanded_devices ?? instance.devices).eth0;
+        return { state, guestMemory, cpuCount: /^[1-9][0-9]*$/.test(limit) ? Number(limit) : 0,
+          primaryMac: nic?.hwaddr ?? instance.config['volatile.eth0.hwaddr'] };
+      }
+      const target = this.incusObservationTarget(id);
+      const result = await this.incusRuntime.inspectState(target.owner, target.incarnation, signal);
+      signal.throwIfAborted();
+      target.validate();
+      return result;
+    }, INCUS_GUEST_MEMORY_TIMEOUT_MS, 'Incus guest metrics');
   }
 
   async incusWorkerDiskUsageBytes(id: string): Promise<number> {

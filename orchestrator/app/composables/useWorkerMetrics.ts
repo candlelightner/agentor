@@ -1,15 +1,19 @@
 import type { WorkerMetrics, WorkerMetricsStatus } from '~/types';
+import { ref } from 'vue';
+import { withWorkerMetricFreshness } from '../../shared/worker-metrics';
+import { usePolling } from './usePolling';
 
 // Module-level singleton — every ContainerCard reads from one poll.
 const workers = ref<WorkerMetrics[]>([]);
 let initialized = false;
 
 async function fetchWorkerMetrics() {
+  workers.value = workers.value.map((metric) => withWorkerMetricFreshness(metric));
   try {
-    const status = await $fetch<WorkerMetricsStatus>('/api/worker-metrics');
-    workers.value = status.workers;
+    const status = await $fetch<WorkerMetricsStatus>('/api/worker-metrics', { timeout: 10_000 });
+    workers.value = status.workers.map((metric) => withWorkerMetricFreshness(metric));
   } catch {
-    // Keep the last good sample on a transient failure.
+    workers.value = workers.value.map((metric) => withWorkerMetricFreshness(metric));
   }
 }
 

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { ContainerInfo, UpdateContainerSettingsRequest, WorkerMetrics } from '~/types';
+import { isWorkerMetricAvailable } from '../../shared/worker-metrics';
 
 const props = defineProps<{
   container: ContainerInfo;
@@ -138,11 +139,12 @@ function onHScrollWheel(e: WheelEvent) {
 
     <!-- Per-worker live metrics: non-wrapping, scrollable when the card is narrow -->
     <div
-      v-if="isRunning && metric"
+      v-if="isRunning"
       class="card-metrics flex items-center gap-3 mb-2 text-[10px] font-mono"
       data-testid="worker-metrics"
       @wheel="onHScrollWheel"
     >
+      <template v-if="metric && isWorkerMetricAvailable(metric)">
       <span
         class="flex items-center gap-1 flex-shrink-0 whitespace-nowrap"
         :class="metricColor(metric.cpuUtilization)"
@@ -153,9 +155,9 @@ function onHScrollWheel(e: WheelEvent) {
       <span
         class="flex items-center gap-1 flex-shrink-0 whitespace-nowrap"
         :class="metricColor(metric.memoryUtilization)"
-        :title="`Memory used${metric.memoryLimitBytes ? ` of ${formatBytes(metric.memoryLimitBytes)}` : ''}`"
+        :title="`${metric.memoryAccounting === 'guest-htop' ? 'Guest RAM used (htop accounting; excludes buffers and reclaimable cache)' : 'Memory used'}${metric.memoryLimitBytes ? ` of ${formatBytes(metric.memoryLimitBytes, metric.memoryAccounting === 'guest-htop')}` : ''}; sampled ${metric.lastChecked}`"
       >
-        <UIcon name="i-lucide-memory-stick" class="size-3" />{{ formatBytes(metric.memoryUsedBytes) }}
+        <UIcon name="i-lucide-memory-stick" class="size-3" />{{ formatBytes(metric.memoryUsedBytes, metric.memoryAccounting === 'guest-htop') }}
       </span>
       <span class="flex items-center gap-1 flex-shrink-0 whitespace-nowrap text-gray-500 dark:text-gray-400" title="Disk used (container filesystem + /workspace + agent data)">
         <UIcon name="i-lucide-hard-drive" class="size-3" />{{ formatBytes(metric.diskUsedBytes) }}
@@ -164,6 +166,8 @@ function onHScrollWheel(e: WheelEvent) {
         <UIcon name="i-lucide-arrow-down" class="size-3" />{{ formatRate(metric.netRxBytesPerSec) }}
         <UIcon name="i-lucide-arrow-up" class="size-3 ml-0.5" />{{ formatRate(metric.netTxBytesPerSec) }}
       </span>
+      </template>
+      <span v-else class="text-gray-500 dark:text-gray-400" :title="metric?.error || 'Awaiting a fresh resource sample'" data-testid="worker-metrics-unavailable">Metrics unavailable</span>
     </div>
 
     <!-- Actions: all left-aligned, grouped with dividers, scrollable when narrow -->

@@ -71,7 +71,10 @@ test.describe('Per-worker metrics API', () => {
     expect(typeof body.memoryUtilization).toBe('number');
     expect(typeof body.diskUsedBytes).toBe('number');
     expect(typeof body.netRxBytesPerSec).toBe('number');
-    expect(typeof body.lastChecked).toBe('string');
+    if (body.lastChecked === null) {
+      expect(body.status).toBe('unknown');
+      expect(body.error).toContain('not been sampled');
+    } else expect(typeof body.lastChecked).toBe('string');
   });
 
   test('worker durable disk usage is non-zero after a forced sample', async ({ request }) => {

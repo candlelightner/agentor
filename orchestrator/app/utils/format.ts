@@ -1,7 +1,7 @@
 /** Human-readable byte size (e.g. 1536 → "1.5 KB"). */
-export function formatBytes(n: number): string {
+export function formatBytes(n: number, iec = false): string {
   if (!n || n < 0 || !Number.isFinite(n)) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  const units = iec ? ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'] : ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
   let value = n;
   let i = 0;
   while (value >= 1024 && i < units.length - 1) {
