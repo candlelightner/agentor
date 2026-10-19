@@ -1,3 +1,5 @@
+import { onMounted, onUnmounted } from 'vue';
+
 export function usePolling(callback: () => void, intervalMs: number) {
   let timer: ReturnType<typeof setInterval> | null = null;
 

@@ -284,11 +284,10 @@ Incus worker migration is in progress: durable runtime kind preserves legacy Doc
 - Clicking name/status area opens detail modal
 
 ### 4.1b Per-worker live metrics
-- All per-worker metrics are derived **entirely through the Docker API** (no host `/proc`/`statfs`), so they behave identically across OSes and runtimes (Docker Desktop, Linux, etc.).
-- When the worker is running, a compact metrics row (`data-testid="worker-metrics"`) shows live **CPU %** (of total host, from `docker stats`), **RAM** used bytes (limit in the tooltip — no percentage), **Disk** used bytes (the container's writable filesystem layer + its `/workspace` + agent data), and network throughput (↓ down / ↑ up). CPU/RAM colorize green/amber/red by threshold (<50 / 50-79 / ≥80).
-- Sampled once in the sidebar via `useWorkerMetrics()` (one 10s poll → `GET /api/worker-metrics`) and passed to each card as a `metric` prop (no per-card polling). cpu/mem/net come from bounded `container.stats` calls on a 3s server cadence. Durable disk is sampled server-side on a slower (60s) cadence with a bounded in-worker `du` of `/workspace` plus agent data. Docker `SizeRw`, disposable rootfs changes, and DinD storage are intentionally excluded so an expensive storage-driver walk cannot obstruct lifecycle recovery. 0 until first sampled; `POST /api/worker-metrics/refresh` forces an immediate sample.
-- Hidden when the worker is not running or has not been sampled yet.
-- Failed or timed-out Docker stats samples report unavailable metrics and log the error without changing worker lifecycle state; sampling can resume on the next poll.
+- Docker workers use Docker stats; VMs use Incus CPU/NIC counters and bounded guest memory sampling. Guest telemetry never supplies routing or worker identity.
+- Running workers show CPU %, RAM bytes, durable disk bytes and network throughput. VM CPU uses allocated vCPU capacity; Docker CPU uses host capacity. VM RAM follows htop's numeric meter in IEC units, excluding buffers/reclaimable cache while including shared memory. Its total is guest MemTotal, separate from allocation and host overhead. See [guest RAM accounting](../docs/vm-resource-metrics.md).
+- One sidebar poll runs every 10s; CPU/RAM/network sample server-side every 3s. Durable disk uses bounded in-worker `du` every 60s. Docker SizeRw, disposable rootfs and DinD storage are excluded. `POST /api/worker-metrics/refresh` forces sampling.
+- Stopped workers hide metrics. Missing, failed or older-than-30s readings show **Metrics unavailable**. API/MCP retain an error and original timestamp (null before any sample), so historical/placeholder numbers do not imply current usage. Telemetry failure does not change worker lifecycle state.
 
 ### 4.1a Settings Pencil
 - A "Settings" pencil button (icon `i-lucide-pencil`, wrapped in `<UTooltip text="Settings">`) sits in the card's action button row
@@ -1139,11 +1138,11 @@ See §20b for the bridge. The endpoint sets the worker's X11 CLIPBOARD selection
 - `GET /api/usage` — agent usage status (per-agent auth type, windows, timestamps)
 - `POST /api/usage/refresh` — trigger immediate refresh
 
-### 24.13a Resource Metrics (per-worker, via the Docker API)
-- There are NO system/host metrics endpoints — host metrics are OS/runtime-dependent and were removed deliberately. Only per-worker metrics exist, all sourced from the Docker API.
+### 24.13a Resource Metrics (per-worker)
+- Only per-worker metrics exist. Docker and Incus guest sampling follow the runtime-specific accounting in §4.1b.
 - `GET /api/worker-metrics` — `{ workers: WorkerMetrics[] }` for every running worker the caller owns (admins see all). A worker appears after the next ~3s sample tick. Auth-gated (401 unauth).
 - `POST /api/worker-metrics/refresh` — force an immediate re-sample (cpu/mem/net + disk) and return the same shape. Auth-gated.
-- `GET /api/containers/:id/metrics` — a single worker's `WorkerMetrics` (see §24.2). `WorkerMetrics` = `{ workerId, containerName, displayName, status, cpuUtilization (0-100 of host, from docker stats), memoryUsedBytes, memoryLimitBytes, memoryUtilization, diskUsedBytes (bounded durable /workspace + agent-data du; 60s cadence), netRx/TxBytesPerSec, blkRead/WriteBytesPerSec, lastChecked, error? }`.
+- `GET /api/containers/:id/metrics` — a single worker's `WorkerMetrics` (see §24.2). `WorkerMetrics` = `{ workerId, containerName, displayName, status, cpuUtilization (0-100), cpuCapacity?, memoryUsedBytes, memoryLimitBytes, memoryUtilization, memoryAccounting?, diskUsedBytes (bounded durable /workspace + agent-data du; 60s cadence), netRx/TxBytesPerSec, blkRead/WriteBytesPerSec, lastChecked (sample timestamp or null), error? }`. Unavailable/stale values require checking status/error; reads never refresh sample age.
 
 ### 24.14 GitHub
 - `GET /api/github/repos` — list repos + orgs. `{ repos, tokenConfigured, username, orgs, error? }`. No token → `tokenConfigured:false`, empty repos. A configured-but-failing token (bad/missing scopes/rate-limited/network) → `tokenConfigured:true` **with** an `error` string (no longer masquerades as no-token, which previously hid the cause and left the autocomplete silently empty).

@@ -24,6 +24,7 @@ operator storage.
 
 See the [rollout guide](incus-rollout.md), [hardware permissions](hardware-devices.md),
 [administrative networking](incus-admin-private-networks.md),
+[guest RAM accounting and sample freshness](vm-resource-metrics.md),
 [instance recovery](instance-disaster-recovery.md) and
 [native update behavior](production.md#native-worker-image-updates).
 

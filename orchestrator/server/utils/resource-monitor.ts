@@ -2,6 +2,7 @@ import type { DockerService, RawContainerStats } from './docker';
 import type { ContainerManager } from './container';
 import type { ContainerInfo, WorkerMetrics, WorkerMetricsStatus } from '../../shared/types';
 import { isWorkerLifecycleMutationActive, workerLifecycleGeneration } from './worker-lifecycle-coordinator';
+import { withWorkerMetricFreshness } from '../../shared/worker-metrics';
 
 /** How often per-worker cpu/mem/net is sampled via the Docker stats API. Short
  * so the dashboard feels live; an overlap guard keeps a slow sample from
@@ -107,13 +108,13 @@ export class ResourceMonitor {
   }
 
   getWorkerMetricsStatus(): WorkerMetricsStatus {
-    return { workers: Array.from(this.workers.values()).filter((m) => this.currentMetric(m)).map((m) => this.withLatestDisk(m)) };
+    return { workers: Array.from(this.workers.values()).filter((m) => this.currentMetric(m)).map((m) => withWorkerMetricFreshness(this.withLatestDisk(m))) };
   }
 
   /** Per-worker metrics for one worker, by its UUID `id`. */
   getWorkerMetric(workerId: string): WorkerMetrics | undefined {
     for (const m of this.workers.values()) {
-      if (m.workerId === workerId && this.currentMetric(m)) return this.withLatestDisk(m);
+      if (m.workerId === workerId && this.currentMetric(m)) return withWorkerMetricFreshness(this.withLatestDisk(m));
     }
     return undefined;
   }
@@ -200,11 +201,11 @@ export class ResourceMonitor {
           if (stale()) return;
           // Telemetry failures are not evidence that the worker stopped.
           useLogger().warn(`[resource-monitor] stats(${c.containerName}) failed: ${err instanceof Error ? err.message : err}`);
+          const previous = this.workers.get(c.containerName);
           this.workers.set(c.containerName, {
             workerId: c.id,
             containerName: c.containerName,
             displayName: c.displayName,
-            status: 'unknown',
             cpuUtilization: 0,
             memoryUsedBytes: 0,
             memoryLimitBytes: 0,
@@ -214,7 +215,9 @@ export class ResourceMonitor {
             netTxBytesPerSec: 0,
             blkReadBytesPerSec: 0,
             blkWriteBytesPerSec: 0,
-            lastChecked: now,
+            ...previous,
+            status: 'unknown',
+            lastChecked: previous?.lastChecked ?? null,
             error:
               'Worker runtime metrics are unavailable. Retry the request.',
           });
@@ -290,10 +293,11 @@ export class ResourceMonitor {
   }
 
   private computeIncusMetrics(c: ContainerInfo, sample: Awaited<ReturnType<ContainerManager['incusWorkerMetrics']>>, now: string): WorkerMetrics {
-    const { state, cpuCount, primaryMac } = sample;
-    const cpu = state.cpu?.usage, memory = state.memory;
+    const { state, cpuCount, primaryMac, guestMemory: memory } = sample;
+    const cpu = state.cpu?.usage;
     if (state.status !== 'Running' || state.processes === -1 || !Number.isFinite(cpu) || cpu! < 0 ||
-        !memory || !Number.isFinite(memory.usage) || memory.usage < 0 || !Number.isFinite(memory.total) || memory.total <= 0 ||
+        !memory || !Number.isSafeInteger(memory.usedBytes) || memory.usedBytes < 0 ||
+        !Number.isSafeInteger(memory.totalBytes) || memory.totalBytes <= 0 || memory.usedBytes > memory.totalBytes ||
         !Number.isFinite(cpuCount) || cpuCount < 1)
       throw new Error('Incus guest metrics are unavailable');
     const interfaces = Object.values(state.network ?? {}).filter((nic) =>
@@ -307,8 +311,9 @@ export class ResourceMonitor {
     const cpuUtilization = valid ? this.clampPct((cpu! - prev.cpu!) / (dt * 1e9 * cpuCount) * 100) : 0;
     const rates = this.counterRates(c, { cpu, cpuCount, rx, tx, blkRead: 0, blkWrite: 0 });
     return { workerId: c.id, containerName: c.containerName, displayName: c.displayName, status: c.status,
-      cpuUtilization, cpuCapacity: 'worker', memoryUsedBytes: memory.usage, memoryLimitBytes: memory.total,
-      memoryUtilization: this.clampPct(memory.usage / memory.total * 100), diskUsedBytes: this.diskBytes(c),
+      cpuUtilization, cpuCapacity: 'worker', memoryAccounting: 'guest-htop',
+      memoryUsedBytes: memory.usedBytes, memoryLimitBytes: memory.totalBytes,
+      memoryUtilization: this.clampPct(memory.usedBytes / memory.totalBytes * 100), diskUsedBytes: this.diskBytes(c),
       ...rates, lastChecked: now };
   }
 

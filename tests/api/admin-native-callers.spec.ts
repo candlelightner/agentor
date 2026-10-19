@@ -80,7 +80,10 @@ async function fixture(kind: 'platform' | 'group' = 'platform') {
   native.client.getInstanceState = async () => ({ status: 'Running', memory: { usage: 4, total: 8 } }) as any;
   native.client.execStream = async (_name, command) => {
     calls.push(command); const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
-    stdout.end('fixture-output'); stderr.end();
+    stdout.end(command[0] === '/usr/bin/python3'
+      ? JSON.stringify({ meminfo: 'MemTotal: 512 kB\nMemFree: 128 kB\nBuffers: 32 kB\nCached: 64 kB\nSReclaimable: 64 kB\nShmem: 32 kB\n' })
+      : 'fixture-output');
+    stderr.end();
     return { stdin, stdout, stderr, result: Promise.resolve(0), operationId: randomUUID(), sendSignal() {}, close() { stdin.destroy(); stdout.destroy(); stderr.destroy(); } };
   };
   return { cm, native, info, record, calls, address, probes: () => probes,

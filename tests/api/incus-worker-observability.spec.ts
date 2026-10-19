@@ -23,7 +23,7 @@ function worker() {
     containerName: 'agentor-worker-observability', containerId: 'incus:fixture-incarnation', displayName: 'Observability' };
 }
 function sample() {
-  return { cpuCount: 2, primaryMac: mac, state: { status: 'Running', processes: 4, cpu: { usage: 1e9 },
+  return { cpuCount: 2, primaryMac: mac, guestMemory: { usedBytes: 128, totalBytes: 512 }, state: { status: 'Running', processes: 4, cpu: { usage: 1e9 },
     memory: { usage: 128, total: 512 }, network: {
       eth0: { hwaddr: mac, counters: { bytes_received: 100, bytes_sent: 200 } },
       docker0: { hwaddr: '10:00:00:00:00:01', counters: { bytes_received: 99999, bytes_sent: 99999 } },
@@ -69,7 +69,7 @@ for (const failure of ['agent-absent', 'negative-cpu', 'missing-cpu', 'zero-allo
     if (failure === 'negative-cpu') data.state.cpu.usage = -1;
     if (failure === 'missing-cpu') delete data.state.cpu;
     if (failure === 'zero-allocation') data.cpuCount = 0;
-    if (failure === 'zero-memory') data.state.memory.total = 0;
+    if (failure === 'zero-memory') data.guestMemory.totalBytes = 0;
     if (failure === 'missing-nic') data.primaryMac = 'foreign';
     await f.monitor.refresh();
     expect(f.c.status).toBe('running');
@@ -94,7 +94,7 @@ test('guest reboot counter reset and runtime replacement discard rate and durabl
 test('late and out-of-order stats/disk samples cannot overwrite replacement or newer readings', async () => {
   const stats = deferred<any>(), f = monitorFixture(() => stats.promise);
   const first = (f.monitor as any).pollWorkers();
-  f.manager.incusWorkerMetrics = async () => ({ ...sample(), state: { ...sample().state, memory: { usage: 256, total: 512 } } });
+  f.manager.incusWorkerMetrics = async () => ({ ...sample(), guestMemory: { usedBytes: 256, totalBytes: 512 } });
   await (f.monitor as any).pollWorkers();
   stats.resolve(sample()); await first;
   expect(f.monitor.getWorkerMetric(f.c.id)?.memoryUsedBytes).toBe(256);
@@ -184,15 +184,28 @@ test('runtime observations/journal enforce owner, incarnation and record authori
       'volatile.uuid': 'fixture-uuid', 'limits.cpu': '2', 'volatile.eth0.hwaddr': mac,
     }, devices: { eth0: { type: 'nic' } } };
     const calls: any[] = [], session = journal();
-    let reads = 0, replaced = false, authority = true;
+    let reads = 0, replaced = false, replaceAfterProbe = false, authority = true;
     const client = { getInstance: async () => {
       reads++; return structuredClone({ ...instance, config: { ...instance.config, ...(replaced && reads > 1 ? { 'volatile.uuid': 'other' } : {}) } });
     }, getInstanceState: async () => sample().state,
-      execStream: async (...args: any[]) => { calls.push(args); return session; } };
+      execStream: async (...args: any[]) => {
+        if (args[1][0] === '/usr/bin/python3') {
+          const memory = journal();
+          memory.stdout.end(JSON.stringify({ meminfo: 'MemTotal: 512 kB\nMemFree: 128 kB\nBuffers: 32 kB\nCached: 64 kB\nSReclaimable: 64 kB\nShmem: 32 kB\n' }));
+          memory.stderr.end(); memory.done.resolve(0);
+          if (replaceAfterProbe) replaced = true;
+          return memory;
+        }
+        calls.push(args); return session;
+      } };
     const runtime = new IncusWorkerRuntime({ dataDir: dir, containerPrefix: 'agentor-worker' } as Config, client as any);
-    expect(await runtime.inspectState(owner, 'fixture-uuid')).toMatchObject({ cpuCount: 2, primaryMac: mac });
+    expect(await runtime.inspectState(owner, 'fixture-uuid')).toMatchObject({ cpuCount: 2, primaryMac: mac,
+      guestMemory: { usedBytes: 256 * 1024, totalBytes: 512 * 1024 }, state: { memory: { usage: 128, total: 512 } } });
     reads = 0; replaced = true;
     await expect(runtime.inspectState(owner, 'fixture-uuid')).rejects.toThrow('incarnation');
+    reads = 0; replaced = false; replaceAfterProbe = true;
+    await expect(runtime.inspectState(owner, 'fixture-uuid')).rejects.toThrow('incarnation');
+    replaceAfterProbe = false;
     replaced = false;
     await expect(runtime.openJournal({ ...owner, userId: 'foreign' }, 'fixture-uuid', () => {})).rejects.toThrow('ownership');
     expect(calls).toHaveLength(0);

@@ -484,9 +484,8 @@ export interface InitScriptInfo {
   updatedAt: string;
 }
 
-/** Live resource metrics for a single worker container, sampled via the Docker
- * stats API. CPU is expressed as a percentage of the whole host (0-100 across
- * all cores); network/disk are live byte rates. */
+/** Resource samples from the selected runtime. CPU capacity and VM RAM
+ * accounting are explicit; timestamps/errors distinguish current readings. */
 export interface WorkerMetrics {
   /** The worker's UUID `id`. */
   workerId: string;
@@ -497,8 +496,10 @@ export interface WorkerMetrics {
   /** 0-100; legacy workers use total host capacity, VMs allocated vCPU capacity. */
   cpuUtilization: number;
   cpuCapacity?: 'host' | 'worker';
+  /** Raw bytes; guest-htop excludes buffers and reclaimable guest cache. */
   memoryUsedBytes: number;
-  /** The worker's memory limit (cgroup limit; equals host memory when uncapped). */
+  memoryAccounting?: 'guest-htop';
+  /** Guest MemTotal for VMs; cgroup limit (host memory when uncapped) for Docker. */
   memoryLimitBytes: number;
   /** 0-100. */
   memoryUtilization: number;
@@ -509,7 +510,8 @@ export interface WorkerMetrics {
   netTxBytesPerSec: number;
   blkReadBytesPerSec: number;
   blkWriteBytesPerSec: number;
-  lastChecked: string;
+  /** Sampling time; null when no sample exists. Reads never refresh this timestamp. */
+  lastChecked: string | null;
   /** OCI may be current while the native bootstrap still needs Apply. */
   nativeUpdateRequired?: boolean;
   error?: string;

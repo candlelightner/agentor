@@ -3,7 +3,7 @@ defineRouteMeta({
     tags: ['Metrics'],
     summary: 'Get a single worker\'s metrics',
     description:
-      'Returns live resource metrics for one worker. Returns a zeroed snapshot (no error) when the worker is not running or has not been sampled yet.',
+      'Returns resource metrics for one worker. Unavailable or stale samples carry an error; an unsampled worker has lastChecked=null. Numeric placeholders are not current usage.',
     operationId: 'getWorkerMetrics',
     parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' }, description: 'Worker UUID' }],
     responses: {
@@ -30,12 +30,12 @@ export default defineEventHandler((event): WorkerMetrics => {
   const metric = useResourceMonitor().getWorkerMetric(id);
   if (metric) return metric;
 
-  // Not running / not yet sampled — return a zeroed snapshot the UI can render.
+  // Preserve numeric compatibility while making the absence of a sample explicit.
   return {
     workerId: info!.id,
     containerName: info!.containerName,
     displayName: info!.displayName,
-    status: info!.status,
+    status: info!.status === 'running' ? 'unknown' : info!.status,
     cpuUtilization: 0,
     memoryUsedBytes: 0,
     memoryLimitBytes: 0,
@@ -45,6 +45,7 @@ export default defineEventHandler((event): WorkerMetrics => {
     netTxBytesPerSec: 0,
     blkReadBytesPerSec: 0,
     blkWriteBytesPerSec: 0,
-    lastChecked: new Date().toISOString(),
+    lastChecked: null,
+    error: 'Worker metrics have not been sampled or the worker is not running.',
   };
 });

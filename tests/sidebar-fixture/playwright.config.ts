@@ -16,7 +16,7 @@ const launchOptions = existsSync(bundledBrowser)
 
 export default defineConfig({
   testDir: '.',
-  testMatch: ['sidebar.spec.ts', 'emergency-stop.spec.ts'],
+  testMatch: ['sidebar.spec.ts', 'emergency-stop.spec.ts', 'worker-metrics.spec.ts'],
   reporter: [['list']],
   retries: 0,
   use: {
