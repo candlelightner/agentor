@@ -1561,3 +1561,62 @@ test('real production-manager archive retains canonical volumes, source and pend
     // Never remove the singleton DATA_DIR or another fixture's records.
   }
 });
+
+test('emergency stop reaches captured native runtime even with stale stopped health and persists intent first', async () => {
+  await fixture(async (manager, store, calls, info) => {
+    info.status = 'stopped';
+    (manager as any).incusRuntime.stop = async (owner: any, uuid: string, _timeout: number, force: boolean) => {
+      expect(owner.id).toBe(info.id); expect(uuid).toBe('original-uuid'); expect(force).toBe(true);
+      expect(store.get(info.userId, info.id)?.desiredRuntimeStatus).toBe('stopped');
+      calls.push('forced-stop');
+    };
+    await manager.emergencyStop(info.id);
+    expect(calls).toEqual(['forced-stop']);
+    expect(info.status).toBe('stopped');
+  });
+});
+
+test('emergency stop rejects a pending lifecycle request promptly and retains its fence', async () => {
+  await fixture(async (manager, _store, calls, info) => {
+    let release!: () => void, admitted!: () => void;
+    const entered = new Promise<void>(resolve => { admitted = resolve; });
+    const settlement = new Promise<void>(resolve => { release = resolve; });
+    const mutation = withOwnerWorkerLifecycleMutation(info.userId, info.id, async () => {
+      admitted(); await settlement;
+    });
+    try {
+      await entered;
+      await expect(manager.emergencyStop(info.id)).rejects.toMatchObject({ statusCode: 409 });
+      expect(calls).toEqual([]); expect(isWorkerLifecycleMutationPending(info.id)).toBe(true);
+    } finally { release(); await mutation; }
+  });
+});
+
+test('ordinary Docker emergency stop dispatches SIGKILL without graceful stop and keeps intent stopped', async () => {
+  await fixture(async (manager, store, calls, info) => {
+    info.runtimeKind = 'legacy-docker'; info.containerId = 'immutable-docker-id'; info.status = 'unknown';
+    await store.upsert({ ...store.get(info.userId, info.id)!, runtimeKind: 'legacy-docker' });
+    (manager as any).dockerService = {
+      killContainer: async (id: string) => {
+        expect(id).toBe('immutable-docker-id');
+        expect(store.get(info.userId, info.id)?.desiredRuntimeStatus).toBe('stopped'); calls.push('SIGKILL');
+      },
+      stopContainer: async () => { throw Error('Must bypass graceful stop'); },
+    };
+    await manager.emergencyStop(info.id);
+    expect(calls).toEqual(['SIGKILL']); expect(info.status).toBe('stopped');
+  });
+});
+
+test('emergency stop cannot bypass a timed-out request whose native mutation has not settled', async () => {
+  await fixture(async (manager, _store, calls, info) => {
+    let release!: () => void;
+    const settlement = new Promise<void>(resolve => { release = resolve; });
+    const error = Object.assign(Error('request timed out'), { [operationSettlement]: settlement });
+    try {
+      await expect(withOwnerWorkerLifecycleMutation(info.userId, info.id, async () => { throw error; })).rejects.toThrow('timed out');
+      await expect(manager.emergencyStop(info.id)).rejects.toMatchObject({ statusCode: 409 });
+      expect(isWorkerLifecycleMutationPending(info.id)).toBe(true); expect(calls).toEqual([]);
+    } finally { release(); await settlement; }
+  });
+});

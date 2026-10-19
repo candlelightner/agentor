@@ -109,28 +109,31 @@ function onHScrollWheel(e: WheelEvent) {
   >
     <!-- Name + image ID + status (clickable for settings): non-wrapping,
          scrollable when the card is narrow -->
-    <div class="card-header flex items-center gap-2 mb-2" @wheel="onHScrollWheel">
-      <h3
-        class="text-sm font-semibold text-gray-900 dark:text-white whitespace-nowrap flex-shrink-0 cursor-pointer hover:opacity-80 transition-opacity"
-        :title="displayLabel"
-        @click="container.administrativeKind ? emit('manageAdministration', container.administrativeKind) : showDetail = true"
-      >
-        {{ displayLabel }}
-      </h3>
-      <div class="flex items-center gap-1.5 flex-shrink-0">
-        <UTooltip v-if="container.pendingRebuild" text="Settings changed — rebuild to apply">
-          <UBadge color="warning" variant="subtle" size="xs">rebuild pending</UBadge>
-        </UTooltip>
-        <span v-if="shortImageId" class="text-[10px] text-gray-400 dark:text-gray-500 font-mono">
-          {{ shortImageId }}
-        </span>
-        <UBadge :color="statusColor" variant="subtle" size="xs">
-          {{ container.status }}
-        </UBadge>
-        <UTooltip v-if="container.runtimeDiagnostic" :text="container.runtimeDiagnostic.message">
-          <UIcon name="i-lucide-triangle-alert" class="size-3.5 text-amber-500" aria-label="Runtime state could not be verified" />
-        </UTooltip>
+    <div class="flex items-center gap-2 mb-2">
+      <div class="card-header min-w-0 flex-1 flex items-center gap-2" @wheel="onHScrollWheel">
+        <h3
+          class="text-sm font-semibold text-gray-900 dark:text-white whitespace-nowrap flex-shrink-0 cursor-pointer hover:opacity-80 transition-opacity"
+          :title="displayLabel"
+          @click="container.administrativeKind ? emit('manageAdministration', container.administrativeKind) : showDetail = true"
+        >
+          {{ displayLabel }}
+        </h3>
+        <div class="flex items-center gap-1.5 flex-shrink-0">
+          <UTooltip v-if="container.pendingRebuild" text="Settings changed — rebuild to apply">
+            <UBadge color="warning" variant="subtle" size="xs">rebuild pending</UBadge>
+          </UTooltip>
+          <span v-if="shortImageId" class="text-[10px] text-gray-400 dark:text-gray-500 font-mono">
+            {{ shortImageId }}
+          </span>
+          <UBadge :color="statusColor" variant="subtle" size="xs">
+            {{ container.status }}
+          </UBadge>
+          <UTooltip v-if="container.runtimeDiagnostic" :text="container.runtimeDiagnostic.message">
+            <UIcon name="i-lucide-triangle-alert" class="size-3.5 text-amber-500" aria-label="Runtime state could not be verified" />
+          </UTooltip>
+        </div>
       </div>
+      <WorkerRuntimeIcon :runtime-kind="container.runtimeKind" />
     </div>
 
     <!-- Per-worker live metrics: non-wrapping, scrollable when the card is narrow -->
@@ -248,6 +251,7 @@ function onHScrollWheel(e: WheelEvent) {
         </UTooltip>
       </div>
       </template>
+      <WorkerEmergencyStopButton :worker-id="container.id" :worker-name="displayLabel" :administrative="Boolean(container.administrativeKind)" compact />
     </div>
 
     <div v-if="isRunning && cardPluginActions.length" class="card-plugin-actions mt-2 flex items-center gap-1.5 overflow-x-auto" data-testid="worker-plugin-actions" @wheel="onHScrollWheel">

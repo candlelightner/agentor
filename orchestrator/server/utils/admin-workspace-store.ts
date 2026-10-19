@@ -92,7 +92,7 @@ export interface AdminWorkspaceRuntimeAdapter {
     record: Readonly<AdministrativeWorkspaceRecord>,
     acknowledge?: AdminNativeAcknowledge,
   ): Promise<AdminWorkspaceRuntimeImage | void>;
-  stop(record: Readonly<AdministrativeWorkspaceRecord>, acknowledge?: AdminNativeAcknowledge): Promise<void>;
+  stop(record: Readonly<AdministrativeWorkspaceRecord>, acknowledge?: AdminNativeAcknowledge, force?: boolean): Promise<void>;
   rebuild(
     record: Readonly<AdministrativeWorkspaceRecord>,
     acknowledge?: AdminNativeAcknowledge,
@@ -351,14 +351,18 @@ export class AdminWorkspaceStore {
     }
     return this.publicRecord(candidate);
   }
-  async setStatus(status: "running" | "stopped") {
+  async setStatus(status: "running" | "stopped", force = false, expectedId?: string) {
     return this.exclusive(async () => {
       this.requireRuntime();
       await this.init();
-      const operation = `status:${status}`;
+      if (expectedId && this.record?.id !== expectedId)
+        throw Object.assign(new Error("Administrative workspace identity changed"), { statusCode: 409 });
+      const operation = force ? "emergency-stop" : `status:${status}`;
       if (await this.flushPendingCommit(operation)) return this.publicRecord();
       // Lifecycle calls on an existing workspace must reach the runtime
       // operation directly. Provision only when no durable identity exists.
+      if (!this.record && force)
+        throw Object.assign(new Error("Administrative workspace is not provisioned"), { statusCode: 404 });
       if (!this.record) await this.ensureLocked();
       const candidate = structuredClone(this.record!);
       if (this.runtime) {
@@ -376,7 +380,7 @@ export class AdminWorkspaceStore {
             structuredClone(candidate),
             "refresh-running",
           );
-        } else await this.runtime.stop(structuredClone(candidate), this.nativeAcknowledge(candidate));
+        } else await this.runtime.stop(structuredClone(candidate), this.nativeAcknowledge(candidate), force);
       }
       candidate.status = status;
       candidate.updatedAt = new Date().toISOString();

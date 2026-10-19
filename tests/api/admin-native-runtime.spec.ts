@@ -1154,3 +1154,23 @@ for (const helper of ['test_incus_admin_network_policy.py', 'test_setup_incus_ho
     const result = spawnSync('python3', [new URL('../helpers/' + helper, import.meta.url).pathname], { encoding: 'utf8', timeout: 20_000 });
     expect(result.status, result.stderr + result.stdout).toBe(0);
 });
+
+test('emergency administrative stop forces frozen compute and preserves native operation acknowledgement', async () => {
+    const f = await fixture();
+    try {
+        await f.prepare(); await f.runtime.ensure(f.record, f.ack);
+        f.instance.status = 'Frozen';
+        const original = f.client.stopInstance, calls: unknown[] = [];
+        f.client.stopInstance = async (name: string, options: unknown, accepted: any) => {
+            expect(f.record.nativeRuntime?.pending?.kind).toBe('stop');
+            calls.push(options); await original(name, options, accepted);
+        };
+        await f.runtime.stop(f.record, f.ack, true);
+        expect(calls).toEqual([{ force: true, timeout: 0 }]);
+        expect(f.record.nativeRuntime?.pending).toBeUndefined();
+        expect(f.instance.status).toBe('Stopped');
+        f.record.nativeRuntime!.pending = { kind: 'start' };
+        await expect(f.runtime.stop(f.record, f.ack, true)).rejects.toThrow();
+        expect(calls).toHaveLength(1);
+    } finally { await f.cleanup(); }
+});

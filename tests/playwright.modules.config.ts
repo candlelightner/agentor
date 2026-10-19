@@ -126,6 +126,7 @@ export default defineConfig({
     "api/worker-export-format.spec.ts",
     "api/worker-reconstruction.spec.ts",
     "api/worker-lifecycle-coordinator.spec.ts",
+    "api/worker-emergency-stop.spec.ts",
     "api/incus-client.spec.ts",
     "api/incus-image-import.spec.ts",
     "api/incus-image-import-live.spec.ts",

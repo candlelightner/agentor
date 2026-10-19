@@ -33,5 +33,6 @@ const formattedDate = computed(() => {
         <UButton size="xs" color="error" variant="subtle" icon="i-lucide-trash-2" :aria-label="worker.deletionPending ? 'Retry cleanup' : 'Delete'" @click="emit('delete', worker.id)" />
       </UTooltip>
     </div>
+    <WorkerRuntimeIcon :runtime-kind="worker.runtimeKind" class="self-start" />
   </div>
 </template>

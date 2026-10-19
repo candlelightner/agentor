@@ -554,3 +554,31 @@ for (const scoped of [false, true]) test(`${scoped ? 'group' : 'platform'} admin
   release('running');
   await expect(stale).rejects.toMatchObject({ statusCode: 503 });
 });
+
+test('emergency stops never provision absent administrative workspaces and pass force through existing stores', async () => {
+  const stopCalls: boolean[] = [];
+  const adapter = runtime({
+    ensure: async () => { throw Error('Emergency stop must never provision compute'); },
+    stop: async (_record, _ack, force) => { stopCalls.push(force!); },
+  });
+  const platform = new AdminWorkspaceStore(`/tmp/agentor-emergency-absent-${Date.now()}`, async () => {});
+  platform.setRuntimeAdapter(adapter);
+  await expect(platform.setStatus('stopped', true)).rejects.toMatchObject({ statusCode: 404 });
+  const stamp = new Date(0).toISOString();
+  (platform as any).record = { schemaVersion: 1, id: 'existing-admin', kind: 'administrative', trusted: true,
+    status: 'running', createdAt: stamp, updatedAt: stamp };
+  await expect(platform.setStatus('stopped', true, 'different-workspace')).rejects.toMatchObject({ statusCode: 409 });
+  expect(stopCalls).toEqual([]);
+  const fake = new FakeGroups(), groupId = `emergency-group-${Date.now()}`;
+  const { group, workspace } = groupRecord('emergency-owner', groupId);
+  delete group.adminWorkspace;
+  fake.records.set(groupId, group);
+  const groups = new GroupAdminWorkspaceStore(fake as any);
+  groups.setRuntimeAdapter(adapter);
+  await expect(groups.setStatus(groupId, 'stopped', undefined, true)).rejects.toMatchObject({ statusCode: 404 });
+  fake.records.get(groupId)!.adminWorkspace = workspace;
+  await expect(groups.setStatus(groupId, 'stopped', undefined, true, 'different-workspace')).rejects.toMatchObject({ statusCode: 409 });
+  await groups.setStatus(groupId, 'stopped', undefined, true, workspace.id);
+  expect(stopCalls).toEqual([true]);
+  expect(fake.findById(groupId)?.adminWorkspace?.status).toBe('stopped');
+});

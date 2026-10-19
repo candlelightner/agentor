@@ -3,14 +3,16 @@ const query = new URLSearchParams(window.location.search);
 const role = query.get('role') === 'ordinary' ? 'ordinary' : 'admin';
 const adminStatus = query.get('adminStatus') === 'stopped' ? 'stopped' : 'running';
 const width = query.get('width') === 'narrow' ? 200 : 420;
-const containers = [
-  { id: 'ordinary-fixture', displayName: 'Research worker', status: 'running', imageId: 'sha256:1234567890abcdef' },
-  { id: 'nested-fixture', displayName: 'Nested worker', status: 'running', imageId: 'sha256:67890abcdef12345' },
-  ...(query.has('groupAdmin') ? [{ id: 'group-admin-fixture', displayName: 'Group admin', status: adminStatus, administrativeKind: 'group', imageId: 'sha256:abcdef1234567890' }] : []),
-  ...(role === 'admin' ? [{ id: 'platform-fixture', displayName: 'Platform admin', status: adminStatus, administrativeKind: 'platform', imageId: 'sha256:abcdef1234567890' }] : []),
-];
+const { data: workerStatuses } = useFetch<Record<string, string>>('/api/fixture-worker-status', { key: 'workers', default: () => ({}) });
+const containers = computed(() => [
+  { id: 'ordinary-fixture', displayName: 'Research worker', status: workerStatuses.value['ordinary-fixture'] || query.get('workerStatus') || 'running', runtimeKind: 'incus-vm', dockerEnabled: true, imageId: 'sha256:1234567890abcdef' },
+  { id: 'nested-fixture', displayName: 'Nested worker', status: workerStatuses.value['nested-fixture'] || 'running', runtimeKind: 'legacy-docker', imageId: 'sha256:67890abcdef12345' },
+  ...(query.has('groupAdmin') ? [{ id: 'group-admin-fixture', displayName: 'Group admin', status: workerStatuses.value['group-admin-fixture'] || adminStatus, runtimeKind: 'incus-vm', administrativeKind: 'group', imageId: 'sha256:abcdef1234567890' }] : []),
+  ...(role === 'admin' ? [{ id: 'platform-fixture', displayName: 'Platform admin', status: workerStatuses.value['platform-fixture'] || adminStatus, runtimeKind: 'legacy-docker', administrativeKind: 'platform', imageId: 'sha256:abcdef1234567890' }] : []),
+]);
 const archivedWorkers = [
-  { id: 'archived-fixture', displayName: 'Archived worker', archivedAt: '2026-09-01T00:00:00Z', createdAt: '2026-08-01T00:00:00Z' },
+  ...(query.has('mixedArchives') ? [{ id: 'archived-docker-fixture', displayName: 'Archived Docker worker', archivedAt: '2026-09-01T00:00:00Z', createdAt: '2026-08-01T00:00:00Z' }] : []),
+  { id: 'archived-fixture', displayName: 'Archived worker', runtimeKind: 'incus-vm', archivedAt: '2026-09-01T00:00:00Z', createdAt: '2026-08-01T00:00:00Z' },
 ];
 const tabs = [
   { id: 'ordinary-tab', containerId: 'ordinary-fixture', containerName: 'Research worker', type: 'terminal' },

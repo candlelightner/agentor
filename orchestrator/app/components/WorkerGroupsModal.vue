@@ -7,7 +7,7 @@ import type {
 const open = defineModel<boolean>("open", { default: false });
 const props = defineProps<{ containers: ContainerInfo[] }>();
 const emit = defineEmits<{ service: [workspaceId: string, service: string] }>();
-const { groups, create, update, remove, assignWorker, adminAction } = useWorkerGroups();
+const { groups, refresh: refreshGroups, create, update, remove, assignWorker, adminAction } = useWorkerGroups();
 const name = ref("");
 const createParentId = ref("");
 const createWorkerSelfApiAccess = ref<import("~/types").WorkerSelfApiAccess>("inherit");
@@ -241,7 +241,7 @@ function serviceIcon(service: string) {
                 ><UButton size="xs" color="neutral" variant="subtle" icon="i-lucide-folder-tree" aria-label="Files" :disabled="entry.group.adminWorkspace.status !== 'running'" @click="openFiles(entry.group.adminWorkspace)" /></UTooltip
               ><UTooltip v-for="service in entry.group.adminWorkspace.services" :key="service" :text="`Open ${service}`"
                 ><UButton size="xs" color="neutral" variant="subtle" :icon="serviceIcon(service)" :aria-label="`Open ${service}`" @click="openService(entry.group.adminWorkspace!, service)" /></UTooltip
-              ></template
+              ><WorkerEmergencyStopButton :worker-id="entry.group.adminWorkspace.id" :worker-name="`${entry.group.name} group administrator`" administrative @settled="run(`admin-${entry.group.id}-refresh`, refreshGroups)" /></template
             >
           </div>
           <AdminMemoryEditor

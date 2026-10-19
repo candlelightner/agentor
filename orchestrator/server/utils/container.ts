@@ -3474,6 +3474,12 @@ for p in sys.argv[1:]:
     );
   }
 
+  async emergencyStop(id: string): Promise<void> {
+    if (isWorkerLifecycleMutationPending(id))
+      throw Object.assign(new Error("Worker lifecycle operation is still pending; refresh status before retrying emergency stop"), { statusCode: 409 });
+    return this.withExistingWorkerLifecycleMutation(id, () => this.stopUnlocked(id, false, true));
+  }
+
   /** Apply a lifecycle action to all ordinary workers directly contained in a
    * group and its descendants. Locks are preflighted for the complete live
    * target set before the first mutation. The ordering is owner fence, group
@@ -3573,7 +3579,7 @@ for p in sys.argv[1:]:
     }
   }
 
-  private async stopUnlocked(id: string, verifyRevokedIncus = false): Promise<void> {
+  private async stopUnlocked(id: string, verifyRevokedIncus = false, force = false): Promise<void> {
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
@@ -3589,10 +3595,11 @@ for p in sys.argv[1:]:
       await stopWorkerContainerIdempotently(
         info,
         () => info.runtimeKind === "incus-vm"
-          ? this.incusRuntime.stop(info, incarnation)
-          : this.dockerService.stopContainer(info.containerId),
+          ? this.incusRuntime.stop(info, incarnation, 30, force)
+          : force ? this.dockerService.killContainer(info.containerId)
+            : this.dockerService.stopContainer(info.containerId),
         true,
-        verifyRevokedIncus && info.runtimeKind === 'incus-vm',
+        force || verifyRevokedIncus && info.runtimeKind === 'incus-vm',
       );
       // A list refresh may otherwise reuse the pre-stop task observation for
       // up to five seconds and overwrite the accurate in-memory `stopped`

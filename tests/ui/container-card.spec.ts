@@ -121,9 +121,9 @@ test.describe.serial('Container Card', () => {
     // Desktop, Upload, etc.) are hidden (v-if="isRunning") but action buttons remain
     const iconButtons = card.locator('button');
     const count = await iconButtons.count();
-    // 6 buttons remain: Settings, Export, Restart, Rebuild, Archive, Remove.
+    // 7 buttons remain: Settings, Export, Restart, Rebuild, Archive, Remove, Emergency stop.
     // Export remains available for stopped workers; live view actions do not.
-    expect(count).toBe(6);
+    expect(count).toBe(7);
   });
 
   test('Restart button appears when stopped', async ({ page }) => {
