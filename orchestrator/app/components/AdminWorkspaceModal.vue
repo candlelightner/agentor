@@ -48,6 +48,10 @@ async function ensureWorkspace() {
   const result = await admin.ensure().catch(() => undefined);
   if (result) emit("changed", result);
 }
+async function onEmergencySettled() {
+  const result = await admin.refresh().catch(() => undefined);
+  if (result) emit("changed", result);
+}
 function openService(service: string) {
   if (admin.workspace.value) emit("service", admin.workspace.value.id, service);
 }
@@ -188,6 +192,12 @@ function openService(service: string) {
                     @click="requestAction('rebuild')"
                     >Rebuild trusted image</UButton
                   >
+                  <WorkerEmergencyStopButton
+                    :worker-id="admin.workspace.value.id"
+                    worker-name="ADMIN / ORCHESTRATOR"
+                    administrative
+                    @settled="onEmergencySettled"
+                  />
                 </div>
               </div>
 

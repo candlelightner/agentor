@@ -1,4 +1,5 @@
 import { resolve } from 'node:path';
+import { realpathSync } from 'node:fs';
 
 const orchestrator = resolve(__dirname, '../../../orchestrator');
 
@@ -11,11 +12,11 @@ export default defineNuxtConfig({
   colorMode: { preference: 'dark' },
   components: [
     { path: resolve(orchestrator, 'app/components'), pathPrefix: false, pattern: [
-      'AppSidebar.vue', 'ThemeToggle.vue', 'ContainerCard.vue',
+      'AppSidebar.vue', 'ThemeToggle.vue', 'ContainerCard.vue', 'WorkerRuntimeIcon.vue', 'WorkerEmergencyStopButton.vue',
       'WorkerGroupSidebarNode.vue', 'ArchivedWorkerGroupSidebarNode.vue', 'ArchivedWorkerCard.vue',
     ] },
     { path: resolve(__dirname, 'components'), pathPrefix: false },
   ],
-  vite: { server: { fs: { allow: [orchestrator, __dirname] } } },
+  vite: { server: { fs: { allow: [orchestrator, __dirname, realpathSync(resolve(orchestrator, 'node_modules'))] } } },
   compatibilityDate: '2025-01-01',
 });

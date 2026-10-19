@@ -293,12 +293,16 @@ export class GroupAdminWorkspaceStore {
     groupId: string,
     status: "running" | "stopped",
     authorize?: () => void,
+    force = false,
+    expectedId?: string,
   ) {
     return this.run(groupId, () =>
       this.withGroup(groupId, false, async (group) => {
         authorize?.();
         this.requireRuntime();
-        const operation = `status:${status}`;
+        if (expectedId && this.record(groupId)?.id !== expectedId)
+          throw Object.assign(new Error("Group administrative workspace identity changed"), { statusCode: 409 });
+        const operation = force ? "emergency-stop" : `status:${status}`;
         const pending = await this.flushPendingCommit(groupId, operation);
         if (pending?.matched) {
           if (status === "running" && this.identityMaterializer)
@@ -310,6 +314,8 @@ export class GroupAdminWorkspaceStore {
         }
         // Avoid public ensure(): this operation already owns both lifecycle
         // and hierarchy serialization boundaries.
+        if (!this.record(groupId) && force)
+          throw Object.assign(new Error("Group administrative workspace is not provisioned"), { statusCode: 404 });
         if (!this.record(groupId)) await this.ensureLocked(group);
         const record = this.record(groupId)!;
         if (this.runtime) {
@@ -327,7 +333,7 @@ export class GroupAdminWorkspaceStore {
               structuredClone(record),
               "refresh-running",
             );
-          } else await this.runtime.stop(structuredClone(record), this.nativeAcknowledge(record));
+          } else await this.runtime.stop(structuredClone(record), this.nativeAcknowledge(record), force);
         }
         record.status = status;
         record.updatedAt = new Date().toISOString();

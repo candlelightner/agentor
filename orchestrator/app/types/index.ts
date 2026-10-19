@@ -207,6 +207,7 @@ export interface ArchivedWorker {
   /** Worker UUID `id` — used to unarchive / delete. */
   id: string;
   userId: string;
+  runtimeKind?: import('../../shared/types').WorkerRuntimeKind;
   displayName: string;
   status: 'active' | 'archived';
   createdAt: string;

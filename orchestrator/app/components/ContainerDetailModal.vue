@@ -287,6 +287,9 @@ const formattedCreatedAt = computed(() => {
               <dt class="text-gray-500 dark:text-gray-400">Created</dt>
               <dd class="text-gray-900 dark:text-white text-xs">{{ formattedCreatedAt }}</dd>
             </dl>
+            <div class="mt-3">
+              <WorkerEmergencyStopButton :worker-id="container.id" :worker-name="displayLabel" />
+            </div>
           </section>
 
           <!-- Editable settings -->
@@ -431,7 +434,7 @@ const formattedCreatedAt = computed(() => {
               <h3 class="text-[10px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider">Protection lock</h3>
               <UBadge :color="protection.protected ? 'warning' : 'neutral'" variant="subtle" size="xs">{{ protection.protected ? 'protected' : 'off' }}</UBadge>
             </div>
-            <p class="text-xs text-gray-500">A protected worker requires its separate lock password before settings, configuration, archive, rebuild, or deletion. Start and stop stay available. Enter it here before saving settings. The password cannot be recovered; an Agentor administrator may remove the lock only by supplying it.</p>
+            <p class="text-xs text-gray-500">A protected worker requires its separate lock password before settings, configuration, archive, rebuild, deletion, or emergency stop. Enter it here before saving settings. The password cannot be recovered; an Agentor administrator may remove the lock only by supplying it.</p>
             <UInput v-if="protection.protected" v-model="lockCurrentPassword" type="password" placeholder="current lock password" aria-label="Current lock password" />
             <UInput v-else v-model="lockPassword" type="password" placeholder="new lock password (8+ characters)" aria-label="New lock password" />
             <p v-if="lockError" class="text-xs text-red-500">{{ lockError }}</p>

@@ -1943,12 +1943,12 @@ export class IncusWorkerRuntime {
     await this.client.pushFile(name, "/run/agentor/provisioned", "agentor-runtime-v1\n", { mode: 0o600, uid: 0, gid: 0 });
   }
 
-  async stop(target: string | IncusStorageOwner, incarnation?: string, timeout = 30): Promise<void> {
+  async stop(target: string | IncusStorageOwner, incarnation?: string, timeout = 30, force = false): Promise<void> {
     const name = typeof target === 'string' ? target : target.containerName;
-    await this.assertOwned(name, typeof target === 'string' ? undefined : target.id,
+    const instance = await this.assertOwned(name, typeof target === 'string' ? undefined : target.id,
       typeof target === 'string' ? undefined : target.userId, incarnation);
-    const state = await this.client.getInstanceState(name);
-    if (state.status !== "Stopped") await this.client.stopInstance(name, { timeout });
+    const state = force ? instance : await this.client.getInstanceState(name);
+    if (state.status !== "Stopped") await this.client.stopInstance(name, force ? { force: true, timeout: 0 } : { timeout });
   }
 
   async refreshSshKeys(owner: IncusStorageOwner, content: string): Promise<void> {

@@ -27,6 +27,7 @@ defineRouteMeta({
             properties: {
               id: { type: 'string', description: 'Worker UUID — used to unarchive / delete' },
               userId: { type: 'string' },
+              runtimeKind: { type: 'string', enum: ['legacy-docker', 'incus-vm'] },
               displayName: { type: 'string' },
               status: { type: 'string', enum: ['active', 'archived'] },
               createdAt: { type: 'string', format: 'date-time' },

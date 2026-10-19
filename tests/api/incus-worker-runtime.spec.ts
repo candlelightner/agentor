@@ -1490,3 +1490,20 @@ test('normal startup accepts existing and SQLite-capable canonical shares but re
   await expect(runtime.start(opts, 'original-uuid')).rejects.toThrow('persistent layout');
   expect(events.slice(before).some(event => ['start', 'file', 'exec'].includes(event.operation))).toBe(false);
 });
+
+test('forced native stop sends no grace period and refuses a replaced incarnation', async () => {
+  const { client } = fakeClient();
+  const runtime = new IncusWorkerRuntime(config, client as any), opts = options();
+  await runtime.create({ ...opts, start: false });
+  const instance = await client.getInstance(opts.containerName), uuid = instance.config['volatile.uuid'];
+  const calls: unknown[] = [];
+  instance.status = 'Frozen';
+  client.getInstanceState = async () => { throw Error('Emergency stop must not wait for guest telemetry'); };
+  client.stopInstance = async (...args: unknown[]) => { calls.push(args); };
+  await runtime.stop(opts, uuid, 30, true);
+  expect(calls).toEqual([[opts.containerName, { force: true, timeout: 0 }]]);
+  calls.length = 0;
+  instance.config['volatile.uuid'] = randomUUID();
+  await expect(runtime.stop(opts, uuid, 30, true)).rejects.toThrow();
+  expect(calls).toEqual([]);
+});

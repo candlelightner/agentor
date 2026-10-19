@@ -446,10 +446,10 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
     async start(record: Readonly<AdministrativeWorkspaceRecord>, acknowledge?: AdminNativeAcknowledge) {
         return this.ensureRecord(record, acknowledge, true, true);
     }
-    async stop(input: Readonly<AdministrativeWorkspaceRecord>, acknowledge?: AdminNativeAcknowledge) {
+    async stop(input: Readonly<AdministrativeWorkspaceRecord>, acknowledge?: AdminNativeAcknowledge, force = false) {
         const record = structuredClone(input), ack = this.patch(record, acknowledge), instance = await this.assertOwned(record);
-        if (instance.status === 'Running')
-            await this.mutation(record, 'stop', ack, accepted => this.client.stopInstance(instance.name, { timeout: 15 }, accepted));
+        if (instance.status === 'Running' || force && instance.status !== 'Stopped')
+            await this.mutation(record, 'stop', ack, accepted => this.client.stopInstance(instance.name, force ? { force: true, timeout: 0 } : { timeout: 15 }, accepted));
         await this.register(record);
     }
     /** Explicit recovery may settle only an acknowledged terminal operation

@@ -6,6 +6,7 @@ import { hostname } from "node:os";
 import { PassThrough } from "node:stream";
 import { pack } from "tar-stream";
 import type { Config } from "./config";
+import type { AdminNativeAcknowledge } from "./admin-native-authority";
 import type { ContainerInfo, UserEnvVars } from "../../shared/types";
 import {
   useContainerManager,
@@ -529,16 +530,28 @@ export class DockerAdminWorkspaceRuntime
     }
   }
 
-  async stop(_record: Readonly<AdministrativeWorkspaceRecord>): Promise<void> {
+  async stop(_record: Readonly<AdministrativeWorkspaceRecord>, _acknowledge?: AdminNativeAcknowledge, force = false): Promise<void> {
     try {
       const container = this.docker.getContainer(
         this.resources(_record).container,
       );
-      if ((await this.read("admin workspace inspect", container.inspect())).State.Running)
-        await this.lifecycle("admin workspace stop", container.stop({ t: 15 }));
+      const inspection = await this.read("admin workspace inspect", container.inspect());
+      if (force) {
+        const names = this.resources(_record), labels = inspection.Config?.Labels ?? {};
+        if (inspection.Name !== `/${names.container}` || labels['agentor.administrative'] !== 'true' ||
+            labels['agentor.admin.workspace-id'] !== _record.id || labels['agentor.admin.group-id'] !== names.groupId ||
+            _record.imageDigest && inspection.Image !== _record.imageDigest)
+          throw Object.assign(new Error("Administrative Docker ownership changed"), { statusCode: 409 });
+      }
+      if (inspection.State.Running)
+        await this.lifecycle("admin workspace stop", force
+          ? this.docker.getContainer(inspection.Id).kill({ signal: 'SIGKILL' })
+          : container.stop({ t: 15 }));
       await this.registerServices(_record, container);
     } catch (error: any) {
-      if (error?.statusCode !== 404 && error?.statusCode !== 304) throw error;
+      if (error?.statusCode !== 404 && error?.statusCode !== 304 &&
+          !(force && error?.statusCode === 409 && /container .* is not running/i.test(error.message ?? '')))
+        throw error;
     }
   }
 

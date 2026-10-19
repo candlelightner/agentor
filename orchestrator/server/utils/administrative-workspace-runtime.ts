@@ -45,7 +45,7 @@ export class AdministrativeWorkspaceRuntime implements AdminWorkspaceRuntimeAdap
     }
     async start(record: Readonly<AdministrativeWorkspaceRecord>, ack?: AdminNativeAcknowledge) { if (!this.isNative(record))
         return this.migrationRequired(); return this.native.start(record, ack); }
-    async stop(record: Readonly<AdministrativeWorkspaceRecord>, ack?: AdminNativeAcknowledge) { return this.isNative(record) ? this.native.stop(record, ack) : this.legacy.stop(record); }
+    async stop(record: Readonly<AdministrativeWorkspaceRecord>, ack?: AdminNativeAcknowledge, force = false) { return this.isNative(record) ? this.native.stop(record, ack, force) : this.legacy.stop(record, ack, force); }
     async rebuild(record: Readonly<AdministrativeWorkspaceRecord>, ack?: AdminNativeAcknowledge) { if (!this.isNative(record))
         return this.migrationRequired(); return this.native.rebuild(record, ack); }
     async remove(record: Readonly<AdministrativeWorkspaceRecord>, ack?: AdminNativeAcknowledge) { return this.isNative(record) ? this.native.remove(record, ack) : this.legacy.remove(record); }

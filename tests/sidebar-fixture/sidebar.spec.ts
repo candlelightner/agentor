@@ -122,7 +122,7 @@ for (const status of ['running', 'stopped']) test(`admin ${status} card uses con
   if (status === 'stopped') await page.locator('aside [data-tab-id="stopped"]').click();
   const card = page.locator('.sidebar-worker-card-admin');
   await expect(card).toBeVisible();
-  await expect(card.getByRole('button')).toHaveCount(status === 'stopped' ? 1 : 9);
+  await expect(card.getByRole('button')).toHaveCount(status === 'stopped' ? 2 : 10);
   await card.getByRole('button', { name: 'Manage administrative workspace', exact: true }).click();
   expect(await page.evaluate(() => (window as any).__lastAction)).toBe('openAdminWorkspace');
 });
@@ -135,3 +135,51 @@ for (const status of ['running', 'stopped']) test(`nested group admin ${status} 
   await card.getByRole('button', { name: 'Manage administrative workspace', exact: true }).click();
   expect(await page.evaluate(() => (window as any).__lastAction)).toBe('manageWorkerGroups');
 });
+
+for (const theme of ['light', 'dark'] as const) {
+  test(`${theme} runtime icons follow each worker and remain visible on narrow cards`, async ({ page }, testInfo) => {
+    await page.goto(`/?theme=${theme}&role=admin&groupAdmin=1&width=narrow`);
+    const research = page.locator('.sidebar-worker-card').filter({ hasText: 'Research worker' });
+    const nested = page.locator('.sidebar-worker-card').filter({ hasText: 'Nested worker' });
+    const groupAdmin = page.locator('.sidebar-worker-card').filter({ hasText: 'Group admin' });
+    const platformAdmin = page.locator('.sidebar-worker-card-admin');
+    for (const [card, runtime] of [[research, 'Incus virtual machine'], [nested, 'Docker container'], [groupAdmin, 'Incus virtual machine'], [platformAdmin, 'Docker container']] as const) {
+      const icon = card.getByRole('img', { name: runtime, exact: true });
+      await expect(icon).toBeVisible();
+      await expect(icon.locator('.iconify')).toHaveCount(1);
+      const withinRightEdge = await icon.evaluate(el => {
+        const card = el.closest('.sidebar-worker-card')!.getBoundingClientRect();
+        const icon = el.getBoundingClientRect();
+        return icon.right <= card.right && card.right - icon.right < 20;
+      });
+      expect(withinRightEdge).toBe(true);
+    }
+    const vmIcon = research.getByRole('img', { name: 'Incus virtual machine', exact: true });
+    await vmIcon.hover();
+    await expect(page.locator('[data-reka-popper-content-wrapper]').getByText('Incus virtual machine', { exact: true }).first()).toBeVisible();
+    await page.mouse.move(1100, 1000);
+    await expect(page.locator('[data-reka-popper-content-wrapper]').getByText('Incus virtual machine', { exact: true }).first()).toBeHidden();
+    await vmIcon.focus();
+    await expect(vmIcon).toBeFocused();
+    await expect(page.locator('[data-reka-popper-content-wrapper]').getByText('Incus virtual machine', { exact: true }).first()).toBeVisible();
+    await capture(page, testInfo, `${theme}-narrow-runtime-icons`);
+  });
+
+  test(`${theme} stopped and archived cards retain runtime metadata and legacy fallback`, async ({ page }, testInfo) => {
+    await page.goto(`/?theme=${theme}&role=admin&workerStatus=stopped&adminStatus=stopped&groupAdmin=1&mixedArchives=1`);
+    await page.locator('aside [data-tab-id="stopped"]').click();
+    const research = page.locator('.sidebar-worker-card').filter({ hasText: 'Research worker' });
+    await expect(research.getByRole('img', { name: 'Incus virtual machine', exact: true })).toBeVisible();
+    const platform = page.locator('.sidebar-worker-card-admin');
+    await expect(platform.getByRole('img', { name: 'Docker container', exact: true })).toBeVisible();
+    await page.locator('aside [data-tab-id="archived"]').click();
+    const archivedVm = page.locator('.sidebar-archived-card').filter({ hasText: 'Archived worker' });
+    const archivedDocker = page.locator('.sidebar-archived-card').filter({ hasText: 'Archived Docker worker' });
+    await expect(archivedVm.getByRole('img', { name: 'Incus virtual machine', exact: true })).toBeVisible();
+    const icon = archivedDocker.getByRole('img', { name: 'Docker container', exact: true });
+    await expect(icon).toBeVisible();
+    await icon.focus();
+    await expect(page.locator('[data-reka-popper-content-wrapper]').getByText('Docker container', { exact: true }).first()).toBeVisible();
+    await capture(page, testInfo, `${theme}-archived-runtime-icons`);
+  });
+}
