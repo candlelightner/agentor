@@ -118,24 +118,15 @@ disk figures in published comparisons.
 
 ## Candidate changes, ranked
 
-1. **Cache exact-source images for the private regression daemon.** This addresses
-   the measured 335–451s repeated image-build cost. Keep isolated Docker state,
-   the production sizing-helper smoke check, and image identity validation.
-   Cache import/export, image transfer/load, and cache misses have costs; the
-   gross build opportunity is not a measured net saving.
-2. **Overlap unpublished architecture builds with validation if still needed.**
-   The current post-gate tail is 108–123s. Publishing and tag promotion must
-   continue to require passing tests. Measure extra contention and avoid granting
-   publication access to pull requests.
-3. **Cache the outer test-runner build if material afterward.** Its whole phase
-   costs 54–72s, some of which is startup rather than cacheable build work. Large
-   browser layers can make cache export/restore expensive.
-4. **Keep the current browser setup and test coverage.** Quality's Chromium
-   installation is only 14–16s and runs in parallel. It is not today's critical
-   path. Shared-state regression sharding adds complexity to a 64–112s test phase
-   while most time is still spent building images.
+| Rank | Candidate | Effort | Decision and measured benefit or constraint |
+| --- | --- | --- | --- |
+| 1 | Inner image caching | Medium | Implemented; selected-path inner phase is 141–183s versus baseline 335–451s; loading images remains material |
+| 2 | Read-only release cache seed | Low | Implemented; first main reused 51 layers despite new dedicated test scopes; quota/eviction can still cause misses |
+| 3 | Overlap architecture builds, retain publication gate | Medium | Deferred; old native tail was 108–123s, selected cache-hit main tail is 33–38s before manifests, so remaining benefit is smaller |
+| 4 | Outer runner caching | Low | Rejected; action alone took 342s cold and 163s warm versus old complete runner/bootstrap phase of 54–72s |
+| 5 | Browser setup optimization | Low | Deferred; only 14–16s in a parallel noncritical job, with little end-to-end opportunity |
 
-## Selected strategy awaiting final-path measurement
+## Selected strategy
 
 Keep the ordinary Compose build for the outer test-runner. An explicit outer
 BuildKit cache was tested and rejected: its action took 342s cold and 163s warm,
@@ -167,9 +158,9 @@ not an honest per-image size measurement. Read-only release imports avoid a new
 write destination but do not eliminate storage used by dedicated test exports.
 
 Inner caching still adds import/export, builder startup, image load, and cleanup
-costs. The selected path requires fresh PR validation plus main cold/warm
-measurements. The completed two-cache experiment below is evidence for choosing
-the path; it is not a benchmark of this final selection.
+costs. The selected-path PR and two main attempts passed; their measurements are
+recorded below. The earlier two-cache experiment is retained separately to explain
+why outer caching was rejected.
 
 ### Experimental cold hosted result
 
@@ -188,14 +179,6 @@ including a 6.2s Docker import; cache export took 58.1s. Do not sum nested image
 export/import intervals. Cache import stages took only 0.1–0.2s and had no hits.
 The test-case interval was 76.6s. Minimum sampled available disk was 62.61 GiB.
 The logs do not separately attribute every compression and transfer sub-operation.
-
-| Candidate | Effort | Benefit constrained by evidence |
-| --- | --- | --- |
-| Inner image caching | Medium; implemented | Targets 335–451s repeated builds; cold export/load overhead is substantial; warm inner phase fell to 175s |
-| Import existing release scopes as read-only seed | Low | Could reduce first-build misses; exact-source keys preserve correctness, actual hits and quota impact require a run |
-| Outer runner caching | Low; implemented | Old whole phase was 54–72s; cold export alone took 251s, so the action was rejected even after a warm rerun |
-| Overlap architecture builds while retaining publication gate | Medium | Old post-gate tail 108–123s; extra contention may reduce the benefit |
-| Browser setup optimization | Low | Only 14–16s in a parallel noncritical job; little end-to-end opportunity |
 
 ### Experimental warm hosted result
 
@@ -222,14 +205,10 @@ cache reuse; it does not establish that every future change will run in 9m03s.
 The rejected outer action still exceeded the old complete outer phase, supporting
 the selected ordinary Compose runner build.
 
-## Experiment comparison and final acceptance
+## Experiment comparison
 
-Both two-cache experimental runs passed.
-The table measures that experiment, including the rejected outer-cache action.
-Do not claim a measured speedup for the selected path until new runs validate it. Record commit/run links, cache state, test count/results,
-regression preparation/build/test durations, architecture/manifest times,
-disk low-water mark, and total time through the last successful job. Compare
-ordinary runs separately from retries and external download/registry failures.
+Both two-cache experimental runs passed. This table includes the rejected outer
+cache action and must not be presented as the selected-path benchmark.
 
 | Measurement | Old workflow | Experimental cold run | Experimental warm run |
 | --- | --- | --- | --- |
@@ -242,7 +221,64 @@ ordinary runs separately from retries and external download/registry failures.
 | Minimum sampled free disk during job | Not sampled | 62.61 GiB; 10s samples | 70.65 GiB; 10s samples |
 | End-to-end attempt elapsed without registry retry | 660–807s | 1442s | 543s |
 
-Final selected-path acceptance remains pending: fresh PR CI, a main run, and a
-second warm main run must establish passing coverage, actual cache hits, whole-job
-and per-attempt elapsed time, export/load overhead, and sampled disk headroom.
-Keep cold misses, cache seeding, and external failures distinct in that comparison.
+## Selected-path validation and publication
+
+The final path at main commit `8773e6e` passed PR validation, first-main publication,
+and an exact-source warm main rerun. Each ran all 35 isolated regression tests
+successfully, with 51 cached layers (35 worker, 16 orchestrator), no image-build
+retry, passing module/type checks, and native amd64/arm64 builds for both images.
+Runtime Docker state stayed fresh. The cache labels matter:
+
+- [Selected PR 39297141661](https://github.com/candlelightner/agentor/actions/runs/39297141661)
+  reused dedicated caches already populated by the experiments on the same PR.
+- [Main 39298193747, attempt 1](https://github.com/candlelightner/agentor/actions/runs/39298193747/attempts/1)
+  had new dedicated test scopes on main and warm release-cache seeds. This is
+  **not fully cold**: release imports supplied all 51 cached layers.
+- [Main attempt 2](https://github.com/candlelightner/agentor/actions/runs/39298193747/attempts/2)
+  reused warm main caches at exactly the same source commit. Its elapsed time
+  starts at 18:05:25 UTC, excluding the first attempt and manual rerun delay.
+
+| Measurement | Selected PR | First main: release-seeded | Warm main: same source |
+| --- | ---: | ---: | ---: |
+| End-to-end attempt elapsed | 386s (6m26s) | 439s (7m19s) | 476s (7m56s) |
+| Entire isolated regression job | 337s | 366s | 389s |
+| Bounded regression step | 313s | 342s | 370s |
+| Outer runner + daemon bootstrap | 56.0s | 60.9s | 61.4s |
+| Inner worker build/load/cache/cleanup | 129.8s | 168.8s | 145.2s |
+| Inner orchestrator build/load/cache/cleanup | 11.3s | 13.8s | 14.9s |
+| Test-case interval | 91.7s | 68.1s | 108.2s |
+| Cache export: worker / orchestrator | 3.6s / 1.6s | 4.2s / 2.2s | 5.0s / 2.7s |
+| Minimum sampled available disk | 71.85 GiB | 72.18 GiB | 71.85 GiB |
+| Native architecture job range | 18–25s | 21–29s | 24–34s |
+| Manifest job: orchestrator / worker | PR does not publish | 15s / 20s | 17s / 20s |
+
+Cache manifest import stages took 0.2–0.5s. Worker Docker image export/load remains
+the largest cached build cost: 120.5s on the PR, 157.0s on first main, and 134.4s
+on warm main, including overlapping Docker imports of 72.9s, 78.6s, and 70.3s.
+Orchestrator Docker export took 8.3–10.2s, including overlapping 5.8–6.5s imports.
+Do not add those nested intervals. Every selected run started with about 86 GiB
+free disk; the ten-second sampled minima above do not capture every short peak.
+
+The warm main run was 37s slower overall than first main even though its inner
+builds were 22.5s faster. Its test-case interval was 40.1s longer, illustrating
+ordinary runner/test variation. Across these selected runs, regression jobs were
+337–389s versus the old 525–668s range. Both selected main attempts finished sooner
+than the ordinary historical main examples (742s and 807s), but the datasets are
+small, source changes differ, and cache-hit architecture builds shorten the tail.
+These are observed timings, not a promise for future source or dependency changes.
+
+Both main attempts completed native publication and manifest promotion for
+`sha-8773e6e`, `main`, and `latest` on worker and orchestrator images. The first
+main finished at 18:02:30 UTC; the warm rerun finished at 18:13:21. Publication
+logs show each tag set receiving its image's generated multiarchitecture manifest;
+the first publication's registry tags and amd64/arm64 coverage were also checked.
+Tests remained prerequisites for all publication jobs. No registry retry or other
+external failure affected these two selected main samples.
+
+The selected path with **all caches absent** was not benchmarked. The earlier
+24m02s experimental run records a real no-cache seeding penalty, but includes the
+removed outer cache and omits the selected release seed, so it cannot substitute
+for that missing case. Cache eviction, unavailable release seeds, or changed base,
+source, platform, and dependency inputs can cause misses and reduce the gain.
+Configured cache API timeouts do not cap an entire export stage. Keep subsequent
+cold/miss runs separate from these cache-hit samples when evaluating regressions.
