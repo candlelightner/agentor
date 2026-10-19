@@ -22,7 +22,7 @@ python3 scripts/profile-ci-workflow.py --repo candlelightner/agentor \
 Underlying commands, for examining a particular public job privately:
 
 ```sh
-gh run view RUN_ID --repo OWNER/REPO --json jobs,createdAt,event,conclusion,attempt
+gh run view RUN_ID --repo OWNER/REPO --json jobs,createdAt,startedAt,event,conclusion,attempt
 gh run view RUN_ID --repo OWNER/REPO --job JOB_ID --log
 ```
 
@@ -32,8 +32,11 @@ Use `--input-dir DIR` instead of `--repo` to analyze previously downloaded
 `RUN_ID.json`, `RUN_ID-regression.log`, and `RUN_ID-amd64.log` privately.
 Do not commit raw logs. The script's synthetic parser check requires no network.
 
-Durations come from job/step start and completion timestamps. A run finishes at
-its last job completion: `updatedAt` can change afterward. Initial dispatch delay
+Durations come from job/step start and completion timestamps. Each attempt's
+elapsed time starts at its own `startedAt` and ends at its last job completion;
+reruns exclude the previous attempt and manual delay. Saved rerun metadata must
+include `startedAt`; the profiler refuses to guess from the original creation
+time. `updatedAt` can change after completion. Initial dispatch delay
 includes scheduling and runner provisioning; it is **not** an exact queue-only
 measurement. Delay between dependent jobs also includes dispatch overhead.
 Missing phase markers produce `null`, not a fabricated duration. Inner worker
@@ -132,42 +135,114 @@ disk figures in published comparisons.
    path. Shared-state regression sharding adds complexity to a 64–112s test phase
    while most time is still spent building images.
 
-## Implemented strategy awaiting measurement
+## Selected strategy awaiting final-path measurement
 
-The proposed workflow now builds the outer test-runner explicitly with the Docker
-build action, loads it into the runner's Docker daemon, and imports/exports its
-own GitHub Actions BuildKit cache. Inside the private regression daemon, worker
-and orchestrator builds use separate GHA cache scopes and load the current source
-builds into that daemon. This caches image layers; live Docker volumes, container
-state, credentials, and test outputs are not cache artifacts. The production
-sizing-helper smoke check and regression coverage remain in the execution path.
+Keep the ordinary Compose build for the outer test-runner. An explicit outer
+BuildKit cache was tested and rejected: its action took 342s cold and 163s warm,
+versus the old complete runner/bootstrap phase of 54–72s. The timing domains
+are not identical, but the cached build action alone exceeded the previous whole
+phase in both samples. Moving that cost out of the bounded regression step is
+not a speed improvement.
 
-Cache transfers have bounded timeouts; cache export errors do not fail a source
-build. Failed cache-backed builds retry from the same source without remote cache
-arguments. The inner builder prunes duplicate build layers after each loaded image;
-cleanup failure stops the run rather than proceeding with unknown disk headroom.
-The outer cache and inner caches can all be cold on the first run. This strategy
-retains the existing publication gate and architecture-build ordering.
+Inside the private regression daemon, worker and orchestrator builds use separate
+GHA cache scopes and load current source builds into that daemon. Existing
+`worker-amd64` and `orchestrator-amd64` release scopes are additional import-only
+seeds; exports remain in dedicated test scopes. BuildKit checks Dockerfile,
+source, platform, and build inputs, so cache reuse cannot skip changed source.
+This caches image layers; live Docker volumes, container state, credentials, and
+test outputs are not cache artifacts. The production sizing-helper smoke check
+and regression coverage remain in the execution path.
 
-Both cache levels add import/export, builder startup, image load, and cleanup
-costs. No new-path speedup or disk-footprint claim is established until hosted
-cold and warm measurements finish.
+Cache API transfers have configured timeouts; these do not bound the entire
+export stage (the experimental cold worker export took 298s despite `timeout=2m`).
+Cache export errors do not fail a source build. Failed cache-backed builds retry
+from the same source without remote cache arguments. The inner builder prunes
+duplicate build layers after each loaded image; cleanup failure stops the run
+rather than proceeding with unknown disk headroom. Publication and native
+architecture-build ordering retain the test gate.
 
-## Before/after acceptance
+The existing release scopes were observed using cache API v2. Public cache-list
+metadata cannot attribute content-addressed shared blobs to one scope, so it is
+not an honest per-image size measurement. Read-only release imports avoid a new
+write destination but do not eliminate storage used by dedicated test exports.
 
-New-path cold and warm hosted runs are pending. Do not claim a measured speedup
-until both complete. Record commit/run links, cache state, test count/results,
+Inner caching still adds import/export, builder startup, image load, and cleanup
+costs. The selected path requires fresh PR validation plus main cold/warm
+measurements. The completed two-cache experiment below is evidence for choosing
+the path; it is not a benchmark of this final selection.
+
+### Experimental cold hosted result
+
+[PR #30, run 39291752872, attempt 1](https://github.com/candlelightner/agentor/actions/runs/39291752872/attempts/1)
+passed all validation and native image builds. The same 35 isolated regression
+tests passed, with no image-build retry and no cached layers. This first run took
+**24m02s**, versus the baseline's 11m00s–13m27s without registry retry. It is a
+measured cold regression, not an established speed improvement.
+
+The entire isolated regression job took 23m07s. Outer-runner preparation took
+342s, including a 251.1s cache export. The bounded regression step took 1015s:
+worker build/load/cache/cleanup consumed 742.2s and orchestrator consumed 159.2s.
+Worker Docker image export took 174.2s, including an overlapping 71.9s import into
+Docker; cache export then took 298.0s. Orchestrator Docker export took 9.4s,
+including a 6.2s Docker import; cache export took 58.1s. Do not sum nested image
+export/import intervals. Cache import stages took only 0.1–0.2s and had no hits.
+The test-case interval was 76.6s. Minimum sampled available disk was 62.61 GiB.
+The logs do not separately attribute every compression and transfer sub-operation.
+
+| Candidate | Effort | Benefit constrained by evidence |
+| --- | --- | --- |
+| Inner image caching | Medium; implemented | Targets 335–451s repeated builds; cold export/load overhead is substantial; warm inner phase fell to 175s |
+| Import existing release scopes as read-only seed | Low | Could reduce first-build misses; exact-source keys preserve correctness, actual hits and quota impact require a run |
+| Outer runner caching | Low; implemented | Old whole phase was 54–72s; cold export alone took 251s, so the action was rejected even after a warm rerun |
+| Overlap architecture builds while retaining publication gate | Medium | Old post-gate tail 108–123s; extra contention may reduce the benefit |
+| Browser setup optimization | Low | Only 14–16s in a parallel noncritical job; little end-to-end opportunity |
+
+### Experimental warm hosted result
+
+[The same run, attempt 2](https://github.com/candlelightner/agentor/actions/runs/39291752872/attempts/2)
+passed all jobs in **9m03s**, measured from its own 17:34:06 UTC start through
+17:43:09 completion. The isolated regression job took 490s; its bounded step took
+300s, including an 82.3s test-case interval.
+All 35 regression tests passed again, with no image-build retry. There were 57
+cached layers: six outer-runner, 35 worker, and 16 orchestrator. Minimum sampled
+available disk was 70.65 GiB.
+
+The warm outer action took 163s, including a 158.4s Docker image export with an
+overlapping 26.9s Docker import. Worker build/load/cache/cleanup took 158.8s:
+Docker image export took 147.9s (including a 71.8s Docker import), followed by a
+5.0s cache export. Orchestrator took 16.2s, including 11.3s Docker export (6.7s
+Docker import) and 3.0s cache export. Outer cache export took 1.9s. Cache manifest
+imports took 0.4–0.5s. Image materialization now dominates cached build time.
+
+The experimental warm regression job was 35–178s shorter than the baseline's
+525–668s range. Its total was also shorter than the historical 660–807s range,
+but this is an unchanged-commit rerun with already seeded caches and cached
+architecture builds, not a matched changed-source benchmark. It demonstrates
+cache reuse; it does not establish that every future change will run in 9m03s.
+The rejected outer action still exceeded the old complete outer phase, supporting
+the selected ordinary Compose runner build.
+
+## Experiment comparison and final acceptance
+
+Both two-cache experimental runs passed.
+The table measures that experiment, including the rejected outer-cache action.
+Do not claim a measured speedup for the selected path until new runs validate it. Record commit/run links, cache state, test count/results,
 regression preparation/build/test durations, architecture/manifest times,
 disk low-water mark, and total time through the last successful job. Compare
 ordinary runs separately from retries and external download/registry failures.
 
-| Measurement | Old workflow | New cold run | New warm run |
+| Measurement | Old workflow | Experimental cold run | Experimental warm run |
 | --- | --- | --- | --- |
-| Entire isolated regression job | 525–668s across the sample | Pending | Pending |
-| Bounded regression step | 493–632s, including outer build | Pending; outer build separate | Pending; outer build separate |
-| Explicit outer-runner build action | Bundled into regression step | Pending | Pending |
-| Inner image builds | 335–451s | Pending | Pending |
-| Test cases | 64–112s | Pending | Pending |
-| Pre-build free disk | About 86 GiB | Pending | Pending |
-| Minimum sampled free disk during job | Not sampled | Pending; 10s samples | Pending; 10s samples |
-| End-to-end elapsed without registry retry | 660–807s | Pending | Pending |
+| Entire isolated regression job | 525–668s across the sample | 1387s | 490s |
+| Bounded regression step | 493–632s, including outer build | 1015s; outer build separate | 300s; outer build separate |
+| Explicit outer-runner build action | Bundled into regression step | 342s | 163s |
+| Inner image build/load/cache/cleanup | 335–451s | 901.4s | 175.0s |
+| Test cases | 64–112s | 76.6s; 35 passed | 82.3s; 35 passed |
+| Pre-build free disk | About 86 GiB | About 86 GiB | About 86 GiB |
+| Minimum sampled free disk during job | Not sampled | 62.61 GiB; 10s samples | 70.65 GiB; 10s samples |
+| End-to-end attempt elapsed without registry retry | 660–807s | 1442s | 543s |
+
+Final selected-path acceptance remains pending: fresh PR CI, a main run, and a
+second warm main run must establish passing coverage, actual cache hits, whole-job
+and per-attempt elapsed time, export/load overhead, and sampled disk headroom.
+Keep cold misses, cache seeding, and external failures distinct in that comparison.

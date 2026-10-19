@@ -47,6 +47,9 @@ jobs:
               - 'worker/**'
               - 'scripts/build-incus-worker-image.sh'
               - 'scripts/incus-canary.mjs'
+              - 'scripts/incus-admin-network-policy.py'
+              - 'scripts/setup-incus-host.sh'
+              - 'scripts/profile-ci-workflow.py'
               - '.dockerignore'
               - 'tests/**'
               - 'docker-compose.tests.yml'
@@ -104,6 +107,9 @@ jobs:
         working-directory: tests
         run: npm run test:modules -- --grep-invert 'api/(incus-admin-restore|incus-derived-image|incus-docker-restore-archive|incus-selected-restore|managed-kilo-parent|portable-pax-size)\.spec\.ts'
 
+      - name: Verify CI profiler
+        run: python3 scripts/profile-ci-workflow.py --self-test
+
       - name: Run root-owned archive metadata fixtures
         working-directory: tests
         run: >-
@@ -138,21 +144,10 @@ jobs:
             echo "At least 24 GiB of free disk is required for the isolated DinD build and tests." >&2
             exit 1
           fi
-          # Keep sampling across build-action, regression, and cleanup steps.
+          # Keep sampling across source builds, regression, and cleanup steps.
           export AGENTOR_DISK_SAMPLES="$RUNNER_TEMP/agentor-ci-disk-kib.txt"
           nohup bash -c 'while true; do df --output=avail / | tail -n 1 >> "$AGENTOR_DISK_SAMPLES"; sleep 10; done' </dev/null >/dev/null 2>&1 &
           echo "$!" > "$RUNNER_TEMP/agentor-ci-disk-sampler.pid"
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Build cached isolated test runner
-        uses: docker/build-push-action@v6
-        with:
-          context: ./tests/docker
-          load: true
-          tags: agentor-test-runner:latest
-          cache-from: type=gha,version=2,scope=agentor-test-runner-amd64,timeout=2m
-          cache-to: type=gha,version=2,scope=agentor-test-runner-amd64,mode=max,timeout=2m,ignore-error=true
 
       - name: Export masked runtime cache credentials
         uses: actions/github-script@v7

@@ -69,11 +69,17 @@ def regression_phases(log, step_start, completed):
 def summarize(run, regression_log='', amd64_log=''):
     jobs = [job for job in run['jobs'] if job['conclusion'] != 'skipped']
     completed = max(job['completedAt'] for job in jobs)
+    if run['attempt'] > 1 and not run.get('startedAt'):
+        raise ValueError('Rerun metadata requires startedAt to measure the current attempt.')
+    attempt_start = run.get('startedAt') or run['createdAt']
+    first_job = min(j['startedAt'] for j in jobs)
     result = {
         'event': run['event'], 'attempt': run['attempt'], 'conclusion': run['conclusion'],
-        'elapsed_to_last_job_s': seconds(run['createdAt'], completed),
+        'attempt_started_at': attempt_start,
+        'elapsed_to_last_job_s': seconds(attempt_start, completed),
         # Includes dispatch/provisioning: Jobs API startedAt is not a queue-only metric.
-        'initial_dispatch_delay_s': seconds(run['createdAt'], min(j['startedAt'] for j in jobs)),
+        'attempt_dispatch_delay_s': seconds(attempt_start, first_job),
+        'initial_dispatch_delay_s': seconds(run['createdAt'], first_job) if run['attempt'] == 1 else None,
         'jobs': [{
             'name': job['name'], 'conclusion': job['conclusion'],
             'started_at': job['startedAt'], 'completed_at': job['completedAt'],
@@ -138,6 +144,17 @@ def self_test():
     assert summary['elapsed_to_last_job_s'] == 60
     assert summary['initial_dispatch_delay_s'] == 3
     assert 'synthetic private log text' not in json.dumps(summary)
+    rerun = {**run, 'attempt': 2, 'startedAt': '2026-01-01T00:00:02Z'}
+    summary = summarize(rerun)
+    assert summary['elapsed_to_last_job_s'] == 58
+    assert summary['attempt_dispatch_delay_s'] == 1
+    assert summary['initial_dispatch_delay_s'] is None
+    try:
+        summarize({**run, 'attempt': 2})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('Missing rerun start must not include the previous attempt.')
     regression = run['jobs'][0]
     regression['name'] = 'Isolated Docker API and UI regression'
     regression['steps'] = [
@@ -177,7 +194,7 @@ def main():
             base = ['run', 'view', str(run_id), '--repo', args.repo]
             if args.attempt is not None:
                 base += ['--attempt', str(args.attempt)]
-            run = json.loads(gh(*base, '--json', 'jobs,createdAt,event,conclusion,attempt'))
+            run = json.loads(gh(*base, '--json', 'jobs,createdAt,startedAt,event,conclusion,attempt'))
             logs = {}
             for kind, name in [('regression', 'Isolated Docker API and UI regression'),
                                ('amd64', 'build-orchestrator (ubuntu-latest, linux/amd64, amd64)')]:

@@ -95,19 +95,22 @@ It receives no application credentials; fork pull requests use read-only
 repository and pull-request permissions. This bounded gate is representative,
 not a replacement for the full Dockerized suite required for feature sign-off.
 
-CI opts into GitHub Actions v2 build-layer caching for the outer test runner and
-the two images built from current source inside the private daemon. The inner
+CI opts into GitHub Actions v2 build-layer caching for the two images built from
+current source inside the private daemon. The outer runner uses ordinary Docker
+builds: measured cache transfer/load overhead outweighed its benefit. The inner
 builder loads images into that same daemon and prunes only its own build cache
 after each image. Containers, volumes, credentials, and test results are never
 restored from a cache. Local builds retain the ordinary Docker path. Cache
-exports have a two-minute timeout and cannot turn a successful build into a
-failure. The runtime cache token is masked and passed only to the test runner;
+I/O uses the two-minute backend timeout setting; complete export stages can take
+longer. Export errors cannot turn a successful build into a failure. The private
+test caches also import existing publication layers without writing their scopes.
+The runtime cache token is masked and passed only to the test runner;
 no repository write token is passed into the isolated stack.
 
 See [CI performance measurements](testing-ci-performance.md) for reproducible
 baseline profiling and cold/warm acceptance measurements. The 24 GiB requirement
 allows for temporary BuildKit/load duplication; CI samples free space every ten
-seconds during the inner builds and tests to assess actual headroom.
+seconds during builds, tests and cleanup to assess actual headroom.
 
 ## Default Failure Artifacts
 

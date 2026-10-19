@@ -241,13 +241,14 @@ build_with_retry() {
     shift 2
     local cache_args=()
     if [[ "${AGENTOR_TEST_GHA_CACHE:-false}" == "true" ]]; then
-        local scope
+        local scope release_scope
         case "$img" in
-            agentor-worker:latest) scope=agentor-test-worker-amd64 ;;
-            agentor-orchestrator:latest) scope=agentor-test-orchestrator-amd64 ;;
+            agentor-worker:latest) scope=agentor-test-worker-amd64; release_scope=worker-amd64 ;;
+            agentor-orchestrator:latest) scope=agentor-test-orchestrator-amd64; release_scope=orchestrator-amd64 ;;
             *) err "Unknown CI cache image: $img"; return 1 ;;
         esac
         cache_args=(--cache-from "type=gha,version=2,scope=$scope,timeout=2m"
+            --cache-from "type=gha,version=2,scope=$release_scope,timeout=2m"
             --cache-to "type=gha,version=2,scope=$scope,mode=max,timeout=2m,ignore-error=true")
     fi
     local attempt

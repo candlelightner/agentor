@@ -65,8 +65,9 @@ test('CI caches source builds with distinct bounded v2 scopes and loads into the
     const call = builds[index]!;
     expect(call.slice(0, 9)).toEqual(['docker', 'buildx', 'build', '--builder', 'agentor-test-builder', '--load', '-t', `agentor-${role}:latest`, '--cache-from']);
     expect(call[9]).toBe(`type=gha,version=2,scope=agentor-test-${role}-amd64,timeout=2m`);
-    expect(call.slice(10, 12)).toEqual(['--cache-to', `type=gha,version=2,scope=agentor-test-${role}-amd64,mode=max,timeout=2m,ignore-error=true`]);
-    expect(call.slice(12)).toEqual(role === 'worker' ? ['/src/worker'] : ['-f', '/src/orchestrator/Dockerfile', '/src']);
+    expect(call.slice(10, 12)).toEqual(['--cache-from', `type=gha,version=2,scope=${role}-amd64,timeout=2m`]);
+    expect(call.slice(12, 14)).toEqual(['--cache-to', `type=gha,version=2,scope=agentor-test-${role}-amd64,mode=max,timeout=2m,ignore-error=true`]);
+    expect(call.slice(14)).toEqual(role === 'worker' ? ['/src/worker'] : ['-f', '/src/orchestrator/Dockerfile', '/src']);
   }
   expect(result.calls.filter(call => call[0] === 'timeout')).toEqual(Array(2).fill([
     'timeout', '--signal=TERM', '--kill-after=10s', '60s', 'docker', 'buildx', 'prune', '--builder', 'agentor-test-builder', '--all', '--force',

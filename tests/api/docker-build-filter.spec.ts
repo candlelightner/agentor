@@ -28,19 +28,18 @@ test('dependency detection stays narrow and preserves independent worker builds'
   for (const path of ['docs/testing.md', 'scripts/unrelated-helper.sh'])
     for (const scope of ['orchestrator', 'validation']) expect(config[scope]!.some(pattern => matchesGlob(path, pattern))).toBe(false);
   expect(config.worker).toEqual(['worker/**', '.github/workflows/docker-build.yml']);
+  for (const path of ['scripts/incus-admin-network-policy.py', 'scripts/setup-incus-host.sh', 'scripts/profile-ci-workflow.py']) {
+    expect(config.validation!.some(pattern => matchesGlob(path, pattern))).toBe(true);
+    expect(config.orchestrator!.some(pattern => matchesGlob(path, pattern))).toBe(false);
+  }
 });
 
-test('cached regression runner uses current source and publication still requires validation', async () => {
+test('regression runner uses current source and publication still requires validation', async () => {
   const workflow = parse(await readFile(new URL('../../.github/workflows/docker-build.yml', import.meta.url), 'utf8'));
   const compose = parse(await readFile(new URL('../../docker-compose.tests.yml', import.meta.url), 'utf8'));
   const steps = workflow.jobs.docker_regression.steps;
-  const build = steps.find((step: any) => step.name === 'Build cached isolated test runner');
-  expect(build.with.context).toBe('./tests/docker');
-  expect(build.with.load).toBe(true);
-  expect(build.with.tags).toBe(compose.services['test-runner'].image);
-  expect(build.with['cache-from']).toContain('scope=agentor-test-runner-amd64');
-  expect(build.with['cache-to']).toContain('ignore-error=true');
-  expect(build.with['build-args']).toBeUndefined();
+  expect(compose.services['test-runner'].build).toBe('./tests/docker');
+  expect(steps.some((step: any) => step.name === 'Build cached isolated test runner')).toBe(false);
   const credentials = steps.find((step: any) => step.name === 'Export masked runtime cache credentials');
   expect(credentials.with.script).toContain('core.setSecret(value)');
   expect(credentials.with.script).not.toContain('GITHUB_TOKEN');
