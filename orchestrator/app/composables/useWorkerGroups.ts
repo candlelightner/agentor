@@ -3,6 +3,7 @@ export interface GroupAdminWorkspace {
   groupId: string;
   userId: string;
   status: "running" | "stopped";
+  runtimeKind?: 'legacy-docker' | 'incus-vm';
   services: string[];
   startupScriptStatus?: {
     configured: boolean;

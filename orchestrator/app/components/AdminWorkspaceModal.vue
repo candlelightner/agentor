@@ -123,6 +123,7 @@ function openService(service: string) {
             <UButton color="neutral" @click="void admin.refresh().catch(() => undefined)">
               Retry status
             </UButton>
+            <VcpuEditor class="mt-4 text-left" endpoint="/api/admin/workspace/cpu" />
           </div>
           <div
             v-else-if="!admin.workspace.value"
@@ -280,6 +281,7 @@ function openService(service: string) {
             </section>
 
             <AdminMemoryEditor endpoint="/api/admin/workspace/resources" />
+            <VcpuEditor v-if="admin.workspace.value.runtimeKind === 'incus-vm'" endpoint="/api/admin/workspace/cpu" />
             <AdminStartupScriptEditor
               endpoint="/api/admin/workspace/startup-script"
               label="Platform-admin startup script"

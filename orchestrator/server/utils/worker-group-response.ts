@@ -25,6 +25,7 @@ export function workerGroupsWithMemberCounts(
 ): WorkerGroupResponse[] {
   const workersById = new Map(workers.map((worker) => [worker.id, worker]));
   return groups.map((group) => {
+    const { nativeRuntime: _native, nativeMigration: _migration, ...adminWorkspace } = group.adminWorkspace ?? {};
     let active = 0;
     let archived = 0;
     for (const workerId of group.workerIds) {
@@ -34,6 +35,7 @@ export function workerGroupsWithMemberCounts(
     }
     return {
       ...group,
+      ...(group.adminWorkspace ? { adminWorkspace } : {}),
       memberCounts: {
         total: group.workerIds.length,
         active,

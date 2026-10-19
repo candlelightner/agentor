@@ -12,7 +12,7 @@ export default defineNuxtConfig({
   colorMode: { preference: 'dark' },
   components: [
     { path: resolve(orchestrator, 'app/components'), pathPrefix: false, pattern: [
-      'AppSidebar.vue', 'ThemeToggle.vue', 'ContainerCard.vue', 'WorkerRuntimeIcon.vue', 'WorkerEmergencyStopButton.vue',
+      'AppSidebar.vue', 'ThemeToggle.vue', 'ContainerCard.vue', 'WorkerRuntimeIcon.vue', 'WorkerEmergencyStopButton.vue', 'VcpuEditor.vue', 'AdminWorkspaceModal.vue',
       'WorkerGroupSidebarNode.vue', 'ArchivedWorkerGroupSidebarNode.vue', 'ArchivedWorkerCard.vue',
     ] },
     { path: resolve(__dirname, 'components'), pathPrefix: false },

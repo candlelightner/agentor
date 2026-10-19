@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { ManagementWorkerDomain, withinManagementFailFastDeadline } from '../../orchestrator/server/utils/management-worker-domain';
+import { workerGroupsWithMemberCounts, workerGroupWithMemberCounts } from '../../orchestrator/server/utils/worker-group-response';
 
 test('management worker domain declares bounded worker, configuration, group, and lock tools', () => {
   const tools = new ManagementWorkerDomain().tools();
@@ -80,4 +81,26 @@ test('recursive management fail-fast deadline returns a structured timeout error
 test('recursive management tools reject invalid timeout switches before work', async () => {
   await expect(new ManagementWorkerDomain().execute('groups.list', { timeoutSeconds:0 }))
     .rejects.toMatchObject({ statusCode:400, message:expect.stringContaining('timeoutSeconds') });
+});
+
+test('public group projections retain administrative CPU settings without native authority or pending receipts', () => {
+  const group: any = { id: 'public-group-fixture', userId: 'fixture-owner', name: 'Public group', workerIds: [],
+    createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(),
+    adminWorkspace: { id: 'fixture-admin', kind: 'group-administrative', runtimeKind: 'incus-vm', status: 'stopped',
+      vcpuCount: 3, services: ['terminal', 'editor', 'desktop'],
+      nativeRuntime: { pending: { kind: 'cpu', cpu: { previousCount: 2, vcpuCount: 3, definitionFingerprint: 'synthetic-private-receipt' } } },
+      nativeMigration: { phase: 'retained', nonce: 'synthetic-private-migration' } } };
+  const before = structuredClone(group);
+  const list = workerGroupsWithMemberCounts([group], []);
+  const single = workerGroupWithMemberCounts(group, [], [group]);
+  const fallback = workerGroupWithMemberCounts(group, [], []);
+  for (const response of [list[0]!, single, fallback]) {
+    expect(response.adminWorkspace).toEqual({ id: 'fixture-admin', kind: 'group-administrative', runtimeKind: 'incus-vm',
+      status: 'stopped', vcpuCount: 3, services: ['terminal', 'editor', 'desktop'] });
+    expect(JSON.stringify(response)).not.toContain('synthetic-private');
+    expect(response.memberCounts).toEqual({ total: 0, active: 0, archived: 0 });
+  }
+  expect(group).toEqual(before);
+  const { adminWorkspace: _admin, ...ordinary } = group;
+  expect(workerGroupsWithMemberCounts([ordinary], [])[0]).not.toHaveProperty('adminWorkspace');
 });

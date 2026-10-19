@@ -1,4 +1,5 @@
 import { adminMemorySettings, validateAdminMemoryLimit } from '../../shared/admin-workspace-memory';
+import { validateVcpuCount, type VcpuSettings } from '../../shared/vcpu-count';
 import { isDeepStrictEqual } from 'node:util';
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -31,6 +32,8 @@ export interface AdministrativeWorkspaceRecord {
   ownerId?: string;
   /** Desired VM memory, applied only on explicit rebuild. */
   memoryLimit?: string;
+  /** Effective guest CPU count, committed with the native definition update. */
+  vcpuCount?: number;
   /** User-authored, non-secret shell launched in the admin tmux pane. */
   startupScript?: string;
   /** Monotonic desired/applied revisions keep Docker's immutable Env explicit. */
@@ -83,6 +86,8 @@ export type AdminWorkspaceIdentityMaterializer = (
  * request.
  */
 export interface AdminWorkspaceRuntimeAdapter {
+  getCpuSettings?(record: Readonly<AdministrativeWorkspaceRecord>): Promise<VcpuSettings>;
+  setCpuCount?(record: Readonly<AdministrativeWorkspaceRecord>, count: number, acknowledge: AdminNativeAcknowledge): Promise<VcpuSettings>;
   observeStatus?(record: Readonly<AdministrativeWorkspaceRecord>): Promise<"running" | "stopped">;
   ensure(
     record: Readonly<AdministrativeWorkspaceRecord>,
@@ -458,6 +463,27 @@ export class AdminWorkspaceStore {
     const record = this.readSettledRecord();
     if (!record) throw Object.assign(new Error('Administrative workspace not provisioned'), { statusCode: 404 });
     return adminMemorySettings(record);
+  }
+  async getCpuSettings(): Promise<VcpuSettings> {
+    await this.init(); this.requireRuntime();
+    const record = this.getRecord();
+    if (!record) throw Object.assign(new Error('Administrative workspace not provisioned'), { statusCode: 404 });
+    if (this.pendingOperations || this.pendingCommit || !this.runtime!.getCpuSettings)
+      throw Object.assign(new Error('Administrative CPU settings are unavailable; refresh before retrying'), { statusCode: 503 });
+    const result = await this.runtime!.getCpuSettings(record);
+    if (this.pendingOperations || this.pendingCommit || !isDeepStrictEqual(record, this.getRecord()))
+      throw Object.assign(new Error('Administrative workspace changed; refresh CPU settings'), { statusCode: 503 });
+    return result;
+  }
+  async setCpuCount(value: unknown, expectedWorkspaceId?: string): Promise<VcpuSettings> {
+    const count = validateVcpuCount(value);
+    return this.withNativeRuntimeTransaction(async (record, acknowledge) => {
+      if (expectedWorkspaceId !== undefined && record.id !== expectedWorkspaceId)
+        throw Object.assign(new Error('Administrative workspace changed; refresh before retrying'), { statusCode: 409 });
+      this.requireRuntime();
+      if (!this.runtime!.setCpuCount) throw Object.assign(new Error('Administrative CPU settings are unavailable'), { statusCode: 503 });
+      return this.runtime!.setCpuCount(record, count, acknowledge);
+    });
   }
   async setResources(value: unknown) {
     const memoryLimit = validateAdminMemoryLimit(value);

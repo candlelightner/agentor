@@ -9,6 +9,17 @@ import type {
 import { normalizeWorkerRuntimeKind } from "../../shared/types";
 import { isDeepStrictEqual } from "node:util";
 import { posix } from "node:path";
+import { validateVcpuCount } from '../../shared/vcpu-count';
+
+export interface WorkerIncusCpuResize {
+  incarnation: string;
+  previousCount: number;
+  targetCount: number;
+  fingerprint: string;
+  accepted?: true;
+  rejected?: true;
+  operation?: string;
+}
 
 export interface WorkerIncusMigration {
   nonce: string;
@@ -32,6 +43,10 @@ export interface WorkerIncusMigration {
 export interface WorkerRecord extends UserOwnedResource {
   /** Worker compute runtime technology: legacy Docker container vs Incus VM. */
   runtimeKind?: WorkerRuntimeKind;
+  /** Explicit guest CPU override; independent from the shared environment. */
+  vcpuCount?: number;
+  /** Private write-ahead intent; never portable or public runtime authority. */
+  incusCpuResize?: WorkerIncusCpuResize;
   /** Server-only bounded offline migration/source-retention authority. Never a
    * portable import grant, current IP or preservation of disposable rootfs. */
   incusMigration?: WorkerIncusMigration;
@@ -108,7 +123,7 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
   }
 
   constructor(dataDir: string) {
-    super(dataDir, "workers.json", (w) => { assertImportIncompleteMarker(w); assertIncusMigration(w); return w.id; });
+    super(dataDir, "workers.json", (w) => { assertImportIncompleteMarker(w); assertIncusMigration(w); assertCpuResize(w); return w.id; });
   }
 
   override get(userId: string, key: string): WorkerRecord | undefined {
@@ -176,11 +191,14 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     });
     assertImportIncompleteMarker(normalized);
     assertIncusMigration(normalized);
+    assertCpuResize(normalized);
     const isNew = !this.has(normalized.userId, normalized.id);
     await this.withUserMutation(normalized.userId, async () => {
       let map = this.items.get(normalized.userId);
       const created = !map;
       const previous = map?.get(normalized.id);
+      if (previous?.incusCpuResize && !isDeepStrictEqual(previous.incusCpuResize, normalized.incusCpuResize))
+        throw new Error('Incus CPU intent requires its exact guarded transition');
       if (previous?.incusMigration && (!isDeepStrictEqual(previous.incusMigration, normalized.incusMigration) ||
           normalizeWorkerRuntimeKind(previous.runtimeKind) !== normalized.runtimeKind))
         throw new Error('Incus migration authority requires its exact guarded transition');
@@ -285,6 +303,20 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     try { await this.persistUser(userId); }
     catch (error) { map.set(id, previous); throw error; }
     return structuredClone(next);
+  }
+
+  async transitionIncusCpuResize(userId: string, id: string, expected: WorkerIncusCpuResize | undefined,
+    next: WorkerIncusCpuResize | undefined, vcpuCount?: number): Promise<WorkerRecord> {
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId), previous = map?.get(id);
+      if (!map || !previous || previous.runtimeKind !== 'incus-vm' || previous.status !== 'active' ||
+          previous.deletionPending || previous.incusRecreation || previous.incusMigration && previous.incusMigration.phase !== 'retained' ||
+          !isDeepStrictEqual(previous.incusCpuResize, expected))
+        throw new Error('Incus CPU intent authority changed');
+      const candidate = { ...previous, incusCpuResize: next && structuredClone(next), ...(vcpuCount === undefined ? {} : { vcpuCount }) };
+      assertCpuResize(candidate);
+      return this.persistMigration(userId, id, map, previous, candidate);
+    });
   }
 
   /** Atomically mark an existing worker for rebuild without ever creating it.
@@ -443,6 +475,20 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     }
     this.storeLogger().info(`[worker-store] deleted worker ${userId}/${id}`);
   }
+}
+
+function assertCpuResize(record: WorkerRecord): void {
+  if (record.vcpuCount !== undefined) validateVcpuCount(record.vcpuCount);
+  const intent = record.incusCpuResize;
+  if (!intent) return;
+  validateVcpuCount(intent.previousCount); validateVcpuCount(intent.targetCount);
+  if (record.runtimeKind !== 'incus-vm' || record.status !== 'active' ||
+      !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(intent.incarnation) ||
+      intent.previousCount === intent.targetCount || !/^[a-f0-9]{64}$/.test(intent.fingerprint) ||
+      intent.accepted !== undefined && intent.accepted !== true ||
+      intent.rejected !== undefined && (intent.rejected !== true || intent.accepted !== undefined) ||
+      intent.operation !== undefined && (!intent.accepted || !/^\/1\.0\/operations\/[a-zA-Z0-9-]+$/.test(intent.operation)))
+    throw new Error('Invalid durable Incus CPU resize intent');
 }
 
 function assertImportIncompleteMarker(record: WorkerRecord): void {

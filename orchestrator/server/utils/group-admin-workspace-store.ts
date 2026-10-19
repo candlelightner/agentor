@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from "node:crypto";
 import { withWorkerRuntimeSetup, withWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
 import { applyAdminNativePatch, type AdminNativeAcknowledge } from './admin-native-authority';
+import { validateVcpuCount, type VcpuSettings } from '../../shared/vcpu-count';
 import type {
   AdminWorkspaceIdentityMaterializationIntent,
   AdminWorkspaceRuntimeAdapter,
@@ -408,6 +409,31 @@ export class GroupAdminWorkspaceStore {
       if (!record) throw Object.assign(new Error('Group administrative workspace not provisioned'), { statusCode: 404 });
       return adminMemorySettings(record);
     });
+  }
+  async getCpuSettings(groupId: string, authorize?: () => void): Promise<VcpuSettings> {
+    return this.withGroup(groupId, false, async () => {
+      authorize?.(); this.requireRuntime();
+      const record = this.record(groupId);
+      if (!record) throw Object.assign(new Error('Group administrative workspace not provisioned'), { statusCode: 404 });
+      if (this.running.has(groupId) || this.pendingCommits.has(groupId) || !this.runtime!.getCpuSettings)
+        throw Object.assign(new Error('Group administrative CPU settings are unavailable; refresh before retrying'), { statusCode: 503 });
+      const result = await this.runtime!.getCpuSettings(record);
+      authorize?.();
+      if (this.running.has(groupId) || this.pendingCommits.has(groupId) || !isDeepStrictEqual(record, this.record(groupId)))
+        throw Object.assign(new Error('Group administrative workspace changed; refresh CPU settings'), { statusCode: 503 });
+      return result;
+    });
+  }
+  async setCpuCount(groupId: string, value: unknown, authorize?: () => void, expectedWorkspaceId?: string): Promise<VcpuSettings> {
+    const count = validateVcpuCount(value);
+    return this.withNativeRuntimeTransaction(groupId, async (record, acknowledge) => {
+      if (expectedWorkspaceId !== undefined && record.id !== expectedWorkspaceId)
+        throw Object.assign(new Error('Group administrative workspace changed; refresh before retrying'), { statusCode: 409 });
+      this.requireRuntime();
+      if (!this.runtime!.setCpuCount) throw Object.assign(new Error('Group administrative CPU settings are unavailable'), { statusCode: 503 });
+      authorize?.();
+      return this.runtime!.setCpuCount(record, count, acknowledge);
+    }, authorize);
   }
   async setResources(groupId: string, value: unknown, authorize?: () => void) {
     const memoryLimit = validateAdminMemoryLimit(value);

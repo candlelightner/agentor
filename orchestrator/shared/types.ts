@@ -249,6 +249,8 @@ export interface ContainerInfo extends UserOwnedResource {
    * live from the EnvironmentStore by this id when the container is built. The
    * git identity is likewise resolved live from the owning `userId`. */
   environmentId?: string;
+  /** Explicit VM guest vCPU override; absent means the assigned environment. */
+  vcpuCount?: number;
   /** Account-level custom variable names intentionally not inherited by this worker. */
   excludedGlobalEnvVarKeys?: string[];
   /** Effective inherited worker-group variable names intentionally omitted. */
@@ -287,8 +289,8 @@ export interface CreateContainerRequest {
   mounts?: MountConfig[];
   hardwareDeviceIds?: string[];
   /** Foreign key to the environment whose config (incl. CPU/memory limits) the
-   * worker is built with. Resource limits are an environment property — there is
-   * no per-worker limit override. */
+   * worker is built with. Existing native VMs may later set a guest vCPU override
+   * through their dedicated CPU settings. */
   environmentId?: string;
   excludedGlobalEnvVarKeys?: string[];
   excludedGroupEnvVarKeys?: string[];

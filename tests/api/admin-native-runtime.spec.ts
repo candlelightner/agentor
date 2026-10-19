@@ -27,8 +27,13 @@ async function fixture() {
     await managed.init();
     const events: string[] = [], files = new Map<string, string>(), volumes = new Map<string, any>();
     let instance: any, failCredential = false, unknownStart = false;
-    const boundary: any = { boundary: async () => { events.push('network'); return { network: 'aa123', managementAddress: '10.88.0.2', gatewayUrl: 'http://10.88.0.2:3000', mcpUrl: 'http://10.88.0.2:3099/mcp', guestAddress: '10.88.0.3' }; }, device: () => ({ type: 'nic', network: 'aa123', name: 'eth0', hwaddr: '02:00:00:00:00:01', 'ipv4.address': '10.88.0.3', 'security.mac_filtering': 'true', 'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' }) };
+    const boundary: any = { boundary: async () => { events.push('network'); return { cpuCountUpdates: true, network: 'aa123', managementAddress: '10.88.0.2', gatewayUrl: 'http://10.88.0.2:3000', mcpUrl: 'http://10.88.0.2:3099/mcp', guestAddress: '10.88.0.3' }; }, device: () => ({ type: 'nic', network: 'aa123', name: 'eth0', hwaddr: '02:00:00:00:00:01', 'ipv4.address': '10.88.0.3', 'security.mac_filtering': 'true', 'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' }) };
     const client: any = { endpoint: 'https://invalid.example', project: 'agentor',
+        getCpuCapacity: async () => 8,
+        assertInstanceMutationSettled: async () => {},
+        updateInstanceCpuCount: async (_name: string, count: number, accepted: any) => {
+            events.push('cpu-update'); await accepted?.('/1.0/operations/' + randomUUID()); instance.config['limits.cpu'] = String(count);
+        },
         getCustomVolume: async (_pool: string, name: string) => {
             if (!volumes.has(name))
                 throw Object.assign(Error('absent'), { statusCode: 404 });
@@ -1172,5 +1177,126 @@ test('emergency administrative stop forces frozen compute and preserves native o
         f.record.nativeRuntime!.pending = { kind: 'start' };
         await expect(f.runtime.stop(f.record, f.ack, true)).rejects.toThrow();
         expect(calls).toHaveLength(1);
+    } finally { await f.cleanup(); }
+});
+
+for (const kind of ['administrative', 'group-administrative'] as const) test(`${kind} stopped CPU update persists effective count without replacing compute or data`, async () => {
+    const f = await fixture();
+    try {
+        f.record.status = 'stopped';
+        if (kind === 'group-administrative') Object.assign(f.record, { kind, groupId: 'cpu-group', ownerId: 'cpu-owner' });
+        await f.runtime.ensure(f.record, f.ack);
+        const before = structuredClone(f.instance), volumes = structuredClone(f.volumes);
+        f.events.length = 0;
+        expect(await f.runtime.getCpuSettings(f.record)).toEqual({ vcpuCount: 2, maxVcpuCount: 8, status: 'stopped', pending: false });
+        expect(await f.runtime.setCpuCount(f.record, 3, f.ack)).toEqual({ vcpuCount: 3, maxVcpuCount: 8, status: 'stopped', pending: false });
+        expect(f.record).toMatchObject({ vcpuCount: 3, nativeRuntime: { vcpuCount: 3 } });
+        expect(f.record.nativeRuntime!.pending).toBeUndefined();
+        expect(f.instance).toEqual({ ...before, config: { ...before.config, 'limits.cpu': '3' } });
+        expect(f.volumes).toEqual(volumes);
+        expect(f.events.filter(event => event.startsWith('vm-') || event === 'cpu-update')).toEqual(['cpu-update']);
+        await f.runtime.ensure(f.record, f.ack);
+        expect((await f.runtime.getCpuSettings(f.record)).vcpuCount).toBe(3);
+        f.instance.status = 'Running'; f.record.status = 'running';
+        await expect(f.runtime.setCpuCount(f.record, 4, f.ack)).rejects.toMatchObject({ statusCode: 409 });
+        expect(f.instance.config['limits.cpu']).toBe('3');
+    } finally { await f.cleanup(); }
+});
+
+test('admin CPU validation and old installed host policy reject before durable intent or update', async () => {
+    const f = await fixture();
+    try {
+        f.record.status = 'stopped'; await f.runtime.ensure(f.record, f.ack);
+        for (const count of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 9])
+            await expect(f.runtime.setCpuCount(f.record, count, f.ack)).rejects.toMatchObject({ statusCode: 400 });
+        const boundary = f.boundary.boundary;
+        f.boundary.boundary = async (...args: any[]) => { const value = await boundary(...args); delete value.cpuCountUpdates; return value; };
+        await expect(f.runtime.setCpuCount(f.record, 3, f.ack)).rejects.toThrow('--update-policy');
+        expect(f.record.nativeRuntime!.pending).toBeUndefined();
+        expect(f.events).not.toContain('cpu-update');
+        await expect(f.runtime.setCpuCount(f.record, 3, async () => { throw Error('intent disk write failed'); })).rejects.toThrow('--update-policy');
+        f.boundary.boundary = boundary;
+        await expect(f.runtime.setCpuCount(f.record, 3, async () => { throw Error('intent disk write failed'); })).rejects.toThrow('intent disk write failed');
+        expect(f.events).not.toContain('cpu-update');
+    } finally { await f.cleanup(); }
+});
+
+for (const terminal of ['Success', 'Failure', 'Cancelled']) test(`admin pending CPU ${terminal} reconciles only its acknowledged exact definition without resubmission`, async () => {
+    const f = await fixture();
+    try {
+        f.record.status = 'stopped'; await f.runtime.ensure(f.record, f.ack);
+        let submissions = 0;
+        f.client.updateInstanceCpuCount = async (_name: string, count: number, accepted: any) => {
+            submissions++; await accepted('/1.0/operations/' + randomUUID());
+            if (terminal === 'Success') f.instance.config['limits.cpu'] = String(count);
+            throw Error('lost completion response');
+        };
+        await expect(f.runtime.setCpuCount(f.record, 3, f.ack)).rejects.toThrow('lost completion response');
+        const pending = structuredClone(f.record.nativeRuntime!.pending);
+        expect(pending).toMatchObject({ kind: 'cpu', cpu: { previousCount: 2, vcpuCount: 3, acknowledged: true } });
+        expect(await f.runtime.getCpuSettings(f.record)).toMatchObject({ pending: true, pendingVcpuCount: 3, vcpuCount: terminal === 'Success' ? 3 : 2 });
+        expect(f.record.nativeRuntime!.pending).toEqual(pending);
+        await expect(f.runtime.setCpuCount(f.record, 4, f.ack)).rejects.toMatchObject({ statusCode: 409 });
+        await expect(f.runtime.rebuild(f.record, f.ack)).rejects.toThrow('CPU settings');
+        f.client.request = async () => ({ status: terminal, status_code: terminal === 'Success' ? 200 : 400 });
+        f.client.getCpuCapacity = async () => 1; // Reconciliation allocates nothing after host capacity shrinks.
+        if (terminal === 'Success') {
+            expect(await f.runtime.setCpuCount(f.record, 3, f.ack)).toMatchObject({ vcpuCount: 3, maxVcpuCount: 1, pending: false });
+            expect(f.record.vcpuCount).toBe(3);
+        } else {
+            await expect(f.runtime.setCpuCount(f.record, 3, f.ack)).rejects.toMatchObject({ statusCode: 409 });
+            expect(f.record.vcpuCount).toBeUndefined(); expect(f.instance.config['limits.cpu']).toBe('2');
+        }
+        expect(f.record.nativeRuntime!.pending).toBeUndefined(); expect(submissions).toBe(1);
+    } finally { await f.cleanup(); }
+});
+
+test('admin CPU missing acknowledgement, changed definition and lost durable completion stay fenced', async () => {
+    const f = await fixture();
+    try {
+        f.record.status = 'stopped'; await f.runtime.ensure(f.record, f.ack);
+        f.client.updateInstanceCpuCount = async () => { throw Error('submission unknown'); };
+        await expect(f.runtime.setCpuCount(f.record, 3, f.ack)).rejects.toThrow('submission unknown');
+        await expect(f.runtime.setCpuCount(f.record, 3, f.ack)).rejects.toThrow('operator recovery');
+        const pending = f.record.nativeRuntime!.pending!;
+        pending.cpu!.acknowledged = true;
+        f.client.request = async () => ({ status: 'Success', status_code: 200 });
+        f.instance.config['limits.cpu'] = '3'; f.instance.description = 'externally changed';
+        await expect(f.runtime.setCpuCount(f.record, 3, f.ack)).rejects.toThrow('CPU update authority');
+        delete f.instance.description;
+        await expect(f.runtime.setCpuCount(f.record, 3, async () => { throw Error('completion disk write failed'); })).rejects.toThrow('completion disk write failed');
+        expect(f.record.nativeRuntime!.pending).toBeDefined(); expect(f.record.vcpuCount).toBeUndefined();
+        expect(f.instance.config['limits.cpu']).toBe('3');
+        expect(await f.runtime.setCpuCount(f.record, 3, f.ack)).toMatchObject({ vcpuCount: 3, pending: false });
+    } finally { await f.cleanup(); }
+});
+
+test('admin definitive CPU rejection clears intent and preserves the previous definition', async () => {
+    const f = await fixture();
+    try {
+        f.record.status = 'stopped'; await f.runtime.ensure(f.record, f.ack);
+        f.client.updateInstanceCpuCount = async () => { throw new IncusRequestRejected('backend rejected', 409); };
+        await expect(f.runtime.setCpuCount(f.record, 3, f.ack)).rejects.toThrow('backend rejected');
+        expect(f.record.nativeRuntime!.pending).toBeUndefined(); expect(f.record.vcpuCount).toBeUndefined();
+        expect(f.instance.config['limits.cpu']).toBe('2');
+    } finally { await f.cleanup(); }
+});
+
+test('known admin CPU rejection remains durably reconcilable when follow-up proof is temporarily unavailable', async () => {
+    const f = await fixture();
+    try {
+        f.record.status = 'stopped'; await f.runtime.ensure(f.record, f.ack);
+        let submitted = 0;
+        f.client.updateInstanceCpuCount = async () => { submitted++; throw new IncusRequestRejected('CPU preflight capacity unavailable', 503); };
+        let checks = 0;
+        f.client.assertInstanceMutationSettled = async () => { if (++checks > 1) throw Error('proof temporarily unavailable'); };
+        await expect(f.runtime.setCpuCount(f.record, 3, f.ack)).rejects.toThrow('CPU preflight capacity unavailable');
+        expect(f.record.nativeRuntime!.pending).toMatchObject({ kind: 'cpu', cpu: { rejected: true, previousCount: 2, vcpuCount: 3 } });
+        expect(f.record.nativeRuntime!.pending!.cpu!.acknowledged).toBeUndefined();
+        f.client.assertInstanceMutationSettled = async () => {};
+        expect(await f.runtime.getCpuSettings(f.record)).toMatchObject({ vcpuCount: 2, pending: true, pendingVcpuCount: 3 });
+        await expect(f.runtime.setCpuCount(f.record, 3, f.ack)).rejects.toMatchObject({ statusCode: 409 });
+        expect(f.record.nativeRuntime!.pending).toBeUndefined(); expect(f.record.vcpuCount).toBeUndefined();
+        expect(f.instance.config['limits.cpu']).toBe('2'); expect(submitted).toBe(1);
     } finally { await f.cleanup(); }
 });

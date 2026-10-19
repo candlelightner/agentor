@@ -4,6 +4,7 @@ import { IncusClient, IncusError, type IncusDevice } from './incus-client';
 import type { AdministrativeWorkspaceRecord } from './admin-workspace-store';
 import { administrativeRuntimeOwner } from './admin-native-authority';
 export interface AdminNativeNetwork {
+    cpuCountUpdates?: true;
     installation: string;
     workspaceId: string;
     ownerId: string;
@@ -36,7 +37,7 @@ export class IncusAdminNetworkBoundary {
             throw Object.assign(new Error(message), { statusCode: 409, statusMessage: message });
         }
         const prefix = v?.gateway?.split('.').slice(0, 3).join('.');
-        if (!v || v.installation !== native.installationId || v.workspaceId !== record.id || v.ownerId !== owner.userId ||
+        if (!v || v.cpuCountUpdates !== undefined && v.cpuCountUpdates !== true || v.installation !== native.installationId || v.workspaceId !== record.id || v.ownerId !== owner.userId ||
             v.kind !== record.kind || v.groupId !== owner.groupId || !/^[A-Za-z0-9_-]{1,15}$/.test(v.network) ||
             ![v.gateway, v.managementAddress, v.guestAddress].every(a => isIP(a) === 4) ||
             v.gateway !== prefix + '.1' || v.managementAddress !== prefix + '.2' || v.guestAddress !== prefix + '.3' || v.subnet !== prefix + '.0/24' ||

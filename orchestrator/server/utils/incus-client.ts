@@ -2,7 +2,8 @@ import https from 'node:https';
 import http, { type IncomingHttpHeaders } from 'node:http';
 import { readFile, open, type FileHandle } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
+import { validateVcpuCount } from '../../shared/vcpu-count';
 import WebSocket from 'ws';
 import { PassThrough, Writable, Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -21,9 +22,18 @@ export class IncusError extends Error {
   }
 }
 
-/** Only an explicit error envelope proves that a mutation was rejected.
- * Transport failures/invalid responses/timeouts leave submission ambiguous. */
+/** An explicit error envelope or CPU preflight failure proves no mutation.
+ * Transport failures after submission/invalid responses/timeouts are ambiguous. */
 export class IncusRequestRejected extends IncusError {}
+
+/** CPU intent retains the exact remaining definition without persisting config. */
+export function incusCpuDefinitionFingerprint(instance: IncusInstance): string {
+  const config = { ...instance.config }; delete config['limits.cpu'];
+  const stable = (value: any): any => Array.isArray(value) ? value.map(stable)
+    : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, stable(value[key])])) : value;
+  return createHash('sha256').update(JSON.stringify(stable({ name: instance.name, type: instance.type,
+    config, devices: instance.devices, profiles: instance.profiles, description: instance.description ?? '' }))).digest('hex');
+}
 
 export interface IncusResponse<T = unknown> {
   type: 'sync' | 'async' | 'error';
@@ -632,6 +642,29 @@ export class IncusClient {
     return this.request<IncusNetworkLease[]>('GET', `/1.0/networks/${encodeURIComponent(name)}/leases`);
   }
 
+  async getCpuCapacity(): Promise<number> {
+    const resources = await this.request<{ cpu?: { total?: number } }>('GET', '/1.0/resources');
+    if (!Number.isSafeInteger(resources?.cpu?.total) || resources.cpu!.total! < 1)
+      throw new IncusError('Incus host CPU capacity is unavailable');
+    return resources.cpu!.total!;
+  }
+
+  async updateInstanceCpuCount(name: string, count: number,
+    onAccepted?: (operationPath: string | undefined) => Promise<void>, expected?: IncusInstance): Promise<void> {
+    let submitted = false;
+    try {
+      validateVcpuCount(count);
+      validateVcpuCount(count, await this.getCpuCapacity());
+      if (!expected) throw new IncusError('CPU update requires the captured stopped VM definition');
+      await this.updateInstanceDefinition(name, expected.devices, onAccepted, expected, undefined, count, () => { submitted = true; });
+    } catch (error) {
+      if (!submitted && !(error instanceof IncusRequestRejected))
+        throw new IncusRequestRejected(error instanceof Error ? error.message : 'CPU update was not submitted',
+          (error as { statusCode?: number })?.statusCode || 409);
+      throw error;
+    }
+  }
+
   /** A live storage caller can persist the accepted operation before waiting.
    * A failed observer is NOT cancellation: the daemon may still complete it.
    * Never retry this mutation implicitly or start writers on an unknown result.
@@ -639,6 +672,10 @@ export class IncusClient {
   async updateInstanceDevices(name: string, devices: Record<string, IncusDevice>,
     onAccepted?: (operationPath: string | undefined) => Promise<void>, expected?: IncusInstance,
     completeCanonicalRestore?: { nonce: string; hostMountMetadata?: string }): Promise<void> {
+    return this.updateInstanceDefinition(name, devices, onAccepted, expected, completeCanonicalRestore);
+  }
+
+  async assertInstanceMutationSettled(name: string): Promise<void> {
     // A previous device PUT can outlive its observer. Incus serializes native
     // instance updates and checks ETag AFTER taking that lock. Do not queue a
     // stale full-device map behind an unsettled mutation, or pair it with a
@@ -663,6 +700,13 @@ export class IncusClient {
           throw new IncusError('Incus instance mutation is still unsettled; retry after the native operation completes');
       }
     }
+  }
+
+  private async updateInstanceDefinition(name: string, devices: Record<string, IncusDevice>,
+    onAccepted?: (operationPath: string | undefined) => Promise<void>, expected?: IncusInstance,
+    completeCanonicalRestore?: { nonce: string; hostMountMetadata?: string }, cpuCount?: number, onSubmit?: () => void): Promise<void> {
+    await this.assertInstanceMutationSettled(name);
+    const path = `/1.0/instances/${encodeURIComponent(name)}`;
     const snapshot = await this.rawRequest('GET', path);
     const envelope = JSON.parse(snapshot.body.toString('utf8')) as IncusResponse<IncusInstance>;
     if (snapshot.statusCode >= 400 || envelope.type === 'error')
@@ -674,6 +718,14 @@ export class IncusClient {
     if (expected && !isDeepStrictEqual(fields(expected), fields(current)))
       throw new IncusError('Incus instance changed since the caller device snapshot; no update was submitted');
     const config = { ...current.config };
+    if (cpuCount !== undefined) {
+      if (!expected || current.name !== name || expected.name !== name ||
+          current.type !== 'virtual-machine' || expected.type !== 'virtual-machine' ||
+          current.status !== 'Stopped' || expected.status !== 'Stopped' ||
+          !expected.config['volatile.uuid'] || current.config['volatile.uuid'] !== expected.config['volatile.uuid'])
+        throw new IncusError('CPU update requires the same captured stopped VM incarnation');
+      config['limits.cpu'] = String(cpuCount);
+    }
     if (completeCanonicalRestore) {
       const managedLayout = (devices: Record<string, IncusDevice>) => {
         if (devices.docker && (devices.docker.type !== 'disk' ||
@@ -706,12 +758,15 @@ export class IncusClient {
       delete config['user.agentor.restore'];
       if (host !== undefined) config['user.agentor.host-mounts'] = host;
     }
+    onSubmit?.();
     const raw = await this.rawRequest('PUT', path, {
       config, profiles: current.profiles, description: current.description, devices,
     }, { 'If-Match': etag });
     const json = JSON.parse(raw.body.toString('utf-8')) as IncusResponse<any>;
     if (json.type === 'error' || raw.statusCode >= 400)
-      throw new IncusError(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code);
+      throw cpuCount !== undefined && json.type === 'error'
+        ? new IncusRequestRejected(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code)
+        : new IncusError(json.error || `HTTP ${raw.statusCode}`, raw.statusCode, json.error_code);
     if (json.type === 'async') {
       if (!json.operation) throw new IncusError('Incus accepted device update without an operation identity');
       const operation = this.buildUrl(json.operation);

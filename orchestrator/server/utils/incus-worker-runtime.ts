@@ -46,6 +46,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { openIncusDockerArchive, INCUS_OFFLINE_DOCKER_ARCHIVE_SCRIPT } from './incus-docker-archive';
 import { readIncusGuestMemory, INCUS_GUEST_MEMORY_TIMEOUT_MS } from './incus-guest-memory';
 import { withOperationDeadline } from './operation-deadline';
+import { validateVcpuCount } from '../../shared/vcpu-count';
 
 /** Ubuntu's Incus virtiofs sockets include the project, instance and device key. */
 export function assertIncusWorkerSocketPath(project: string, instanceName: string): void {
@@ -697,6 +698,17 @@ export class IncusWorkerRuntime {
     await this.checkedExec(owner.containerName, ['python3', '-c', MANAGED_NETWORK_HOSTS_SCRIPT,
       'apply', JSON.stringify(normalizeManagedNetworkHosts(entries))]);
     await check();
+  }
+
+  /** Host definition only: no guest command or lifecycle action. */
+  async inspectCpu(owner: IncusStorageOwner, incarnation: string) {
+    const instance = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    if (instance.type !== 'virtual-machine' || !['Running', 'Stopped'].includes(instance.status))
+      throw Object.assign(new Error('VM CPU settings require a settled running or stopped VM.'), { statusCode: 409 });
+    const value = (instance.expanded_config ?? instance.config)['limits.cpu'] ?? '1';
+    if (!/^[1-9][0-9]*$/.test(value))
+      throw Object.assign(new Error('VM CPU affinity is unsupported; use an integer guest vCPU count.'), { statusCode: 409 });
+    return { instance, vcpuCount: validateVcpuCount(Number(value)) };
   }
 
   /** Telemetry is diagnostic only. It never supplies routing/worker identity. */

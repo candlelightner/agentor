@@ -1,3 +1,5 @@
+import { ref } from 'vue';
+
 export type AdminWorkspaceStatus = "running" | "stopped";
 
 export interface AdminWorkspace {
@@ -5,6 +7,7 @@ export interface AdminWorkspace {
   kind: "administrative";
   trusted: true;
   status: AdminWorkspaceStatus;
+  runtimeKind?: 'legacy-docker' | 'incus-vm';
   createdAt: string;
   updatedAt: string;
   image: {
