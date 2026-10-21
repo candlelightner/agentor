@@ -1,10 +1,12 @@
 import { PREDEFINED_ENV_VAR_KEYS, type CreateContainerRequest, type UpdateContainerSettingsRequest } from "../../shared/types";
 import {
   useContainerManager,
+  useHardwareDeviceStore,
   useWorkerGroupStore,
   useWorkerStore,
   useUserEnvStore,
 } from "./services";
+import { isPhysicalGpuDevice } from "./hardware-device-store";
 import { useImageCatalogManager } from "./image-catalog";
 import { useWorkerConfigStore } from "./worker-config-store";
 import { workerConfigurationResponse } from "./worker-config-response";
@@ -249,7 +251,8 @@ export class ManagementWorkerDomain {
       const memberships=useWorkerGroupStore().listForUser(worker.userId).filter(group=>group.workerIds.includes(worker.id));
       if(memberships.length>1)throw status(409,"Source worker has conflicting group memberships");
       const targetWorkerGroupId=memberships[0]?.id;
-      const clone = await cm.create({ userId: worker.userId, displayName: optionalString(args.displayName) || `${worker.displayName || "worker"} copy`, repos: worker.repos, mounts: worker.mounts, hardwareDeviceIds: worker.hardwareDeviceIds, targetWorkerGroupId, environmentId: worker.environmentId, workerSelfApiAccess: worker.workerSelfApiAccess, initScript: worker.initScript, workerConfiguration:{variables} });
+      const hardwareDeviceIds = worker.hardwareDeviceIds?.filter(deviceId => !isPhysicalGpuDevice(useHardwareDeviceStore().getDevice(deviceId)));
+      const clone = await cm.create({ userId: worker.userId, displayName: optionalString(args.displayName) || `${worker.displayName || "worker"} copy`, repos: worker.repos, mounts: worker.mounts, hardwareDeviceIds, targetWorkerGroupId, environmentId: worker.environmentId, workerSelfApiAccess: worker.workerSelfApiAccess, initScript: worker.initScript, workerConfiguration:{variables} });
       try {
         if(targetWorkerGroupId)await addWorkerToGroupWithNetworks(worker.userId,targetWorkerGroupId,clone.id);
         const workspace = await findWorkspaceInventory(workerId, true);

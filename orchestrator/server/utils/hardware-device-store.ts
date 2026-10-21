@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type {
   HardwareDevice,
   HardwareDeviceCandidate,
@@ -14,6 +14,34 @@ import { WorkerGroupHierarchy } from "./worker-group-hierarchy";
 import type { WorkerStore } from "./worker-store";
 
 const PLATFORM_FILE = "admin/hardware-devices.v1.json";
+const catalogWrites = new Map<string, Promise<void>>();
+
+export function isPhysicalGpuDevice(device: Pick<HardwareDevice, 'kind' | 'selector'> | undefined): boolean {
+  return device?.kind === 'gpu' && device.selector.startsWith('pci-gpu:');
+}
+
+export function isNvidiaPhysicalGpuDevice(device: Pick<HardwareDevice, 'kind' | 'selector' | 'vendor'> | undefined): boolean {
+  return isPhysicalGpuDevice(device) && device?.vendor === '10de' && device.selector.startsWith('pci-gpu:10de:');
+}
+
+export async function physicalGpuIdentityReceipts(dataDir: string | undefined) {
+  if (!dataDir) return [];
+  let catalog: HardwareDevice[];
+  try { catalog = JSON.parse(await readFile(join(dataDir, PLATFORM_FILE), 'utf8')); }
+  catch (error: any) { if (error?.code === 'ENOENT') return []; throw error; }
+  if (!Array.isArray(catalog)) throw new Error('Invalid hardware identity catalog');
+  for (const item of catalog) validatePersistedDevice(item);
+  const receipts = catalog.filter(item => item.physicalIdentity).map(({ selector, physicalIdentity }) => ({ selector, physicalIdentity }));
+  if (JSON.stringify(receipts).length > 65536) throw new Error('Hardware identity evidence exceeds probe input bound');
+  return receipts;
+}
+
+function validPhysicalIdentity(identity: HardwareDevice['physicalIdentity']) {
+  return !!identity && typeof identity.bootId === 'string' && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(identity.bootId) &&
+    typeof identity.deviceInode === 'string' && /^[1-9][0-9]{0,19}$/.test(identity.deviceInode) &&
+    (identity.deviceNodes === undefined || Array.isArray(identity.deviceNodes) && identity.deviceNodes.length <= 128 &&
+      identity.deviceNodes.every(node => typeof node === 'string' && /^\/dev\/(?:dri\/(?:card|renderD)|nvidia)[0-9]+$/.test(node)));
+}
 
 export interface HardwareDeviceRevocation {
   deviceIds: string[];
@@ -29,7 +57,8 @@ function validateCandidate(input: HardwareDeviceCandidate) {
       !Array.isArray(input.deviceNodes) || (!input.deviceNodes.length &&
         !(input.kind === 'gpu' && input.selector.startsWith('pci-gpu:'))) ||
       input.deviceNodes.some((node) => !node.startsWith("/dev/")) ||
-      !Array.isArray(input.groupIds) || input.groupIds.some((gid) => !Number.isInteger(gid) || gid < 0))
+      !Array.isArray(input.groupIds) || input.groupIds.some((gid) => !Number.isInteger(gid) || gid < 0) ||
+      (input.physicalIdentity !== undefined && !validPhysicalIdentity(input.physicalIdentity)))
     throw statusError(503, "Host hardware discovery returned an invalid device");
   return input;
 }
@@ -48,7 +77,6 @@ export function hardwareDeviceSelector(device: Pick<HardwareDevice, 'kind' | 'se
 /** Persistent platform device catalog plus owner-partitioned entitlements and assignments. */
 export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDeviceGrant> {
   private catalog = new Map<string, HardwareDevice>();
-  private catalogWrites = Promise.resolve();
   private catalogUnavailable = false;
 
   constructor(
@@ -80,6 +108,45 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
     return item ? structuredClone(item) : undefined;
   }
 
+  /** Only the authenticated platform assignment domain calls this method.
+   * A single catalog write makes cross-account authority indivisible. Native
+   * release must be confirmed before clearing a binding or selecting a peer. */
+  async setPhysicalGpuAssignment(deviceId: string, target?: HardwareDevice['physicalAssignment'],
+    expected?: HardwareDevice['physicalAssignment']) {
+    let updated!: HardwareDevice;
+    await this.mutateCatalog(catalog => {
+      const current = catalog.get(deviceId);
+      if (!isNvidiaPhysicalGpuDevice(current)) throw statusError(400, 'Direct physical GPU assignment supports NVIDIA devices only');
+      if (!target && current!.physicalAssignment && (!expected ||
+          current!.physicalAssignment.userId !== expected.userId || current!.physicalAssignment.workerId !== expected.workerId ||
+          expected.incarnation !== undefined && current!.physicalAssignment.incarnation !== expected.incarnation))
+        throw statusError(409, 'Physical GPU release authority changed; preserve the current assignment');
+      if (target) {
+        const worker = this.workers.get(target.userId, target.workerId);
+        if (!worker || worker.runtimeKind !== 'incus-vm' || worker.status !== 'active' || worker.deletionPending)
+          throw statusError(409, 'Physical GPU assignment requires an existing ordinary Incus worker');
+        if (current!.physicalAssignment &&
+            (current!.physicalAssignment.userId !== target.userId || current!.physicalAssignment.workerId !== target.workerId))
+          throw statusError(409, 'Release the existing physical GPU assignment before selecting another VM');
+        if ([...catalog.values()].some(device => device.id !== deviceId && device.physicalAssignment?.userId === target.userId &&
+            device.physicalAssignment.workerId === target.workerId))
+          throw statusError(409, 'This VM already has a physical GPU assignment');
+      }
+      updated = { ...current!, physicalAssignment: target && { ...target }, updatedAt: new Date().toISOString() };
+      validatePersistedDevice(updated);
+      catalog.set(deviceId, updated);
+    });
+    return structuredClone(updated);
+  }
+
+  assertPhysicalGpuSelection(userId: string, workerId: string, deviceIds: string[] | undefined) {
+    const selected = [...new Set(deviceIds ?? [])].filter(id => isPhysicalGpuDevice(this.getDevice(id))).sort();
+    const assigned = this.listCatalog().filter(device => isPhysicalGpuDevice(device) &&
+      device.physicalAssignment?.userId === userId && device.physicalAssignment.workerId === workerId).map(device => device.id).sort();
+    if (JSON.stringify(selected) !== JSON.stringify(assigned))
+      throw statusError(403, 'Only a platform administrator may change a physical GPU assignment');
+  }
+
   listEntitledDevices(userId: string) {
     const entitled = new Set(
       this.listForUser(userId)
@@ -90,7 +157,7 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
         )
         .map((grant) => grant.deviceId),
     );
-    return this.listCatalog().filter((path) => entitled.has(path.id));
+    return this.listCatalog().filter((path) => entitled.has(path.id) || path.physicalAssignment?.userId === userId);
   }
 
   listGrants(userId: string, includeEntitlements = false) {
@@ -101,7 +168,16 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
 
   async listDiscoveredDevices() {
     const candidates = await this.discoverHardware();
-    return candidates.map((candidate) => structuredClone(validateCandidate(candidate)));
+    const validated = candidates.map((candidate) => structuredClone(validateCandidate(candidate)));
+    const refreshed = validated.filter(candidate => candidate.physicalIdentity &&
+      validated.filter(other => other.selector === candidate.selector).length === 1 &&
+      [...this.catalog.values()].some(item => item.selector === candidate.selector &&
+        JSON.stringify(item.physicalIdentity) !== JSON.stringify(candidate.physicalIdentity)));
+    if (refreshed.length) await this.mutateCatalog(catalog => {
+      for (const candidate of refreshed) for (const [id, item] of catalog)
+        if (item.selector === candidate.selector) catalog.set(id, { ...item, physicalIdentity: candidate.physicalIdentity });
+    });
+    return validated;
   }
 
   async approveDevice(input: { selector: unknown; name?: unknown }) {
@@ -122,6 +198,7 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
       vendor: candidate.vendor,
       product: candidate.product,
       serial: candidate.serial,
+      ...(candidate.physicalIdentity ? { physicalIdentity: candidate.physicalIdentity } : {}),
       createdAt: now,
       updatedAt: now,
     };
@@ -134,20 +211,23 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
   }
 
   async updateDevice(deviceId: string, patch: { name?: unknown }) {
-    const current = this.getDevice(deviceId);
-    if (!current) throw statusError(404, "Approved hardware device not found");
-    const updated: HardwareDevice = {
-      ...current,
-      ...(patch.name !== undefined ? { name: normalizeName(patch.name) } : {}),
-      updatedAt: new Date().toISOString(),
-    };
-    await this.mutateCatalog((catalog) => catalog.set(deviceId, updated));
+    let updated!: HardwareDevice;
+    await this.mutateCatalog((catalog) => {
+      const current = catalog.get(deviceId);
+      if (!current) throw statusError(404, "Approved hardware device not found");
+      updated = { ...current, ...(patch.name !== undefined ? { name: normalizeName(patch.name) } : {}), updatedAt: new Date().toISOString() };
+      catalog.set(deviceId, updated);
+    });
     return structuredClone(updated);
   }
 
   async deleteDevice(deviceId: string): Promise<HardwareDeviceRevocation> {
     if (!this.getDevice(deviceId)) throw statusError(404, "Approved hardware device not found");
-    await this.mutateCatalog((catalog) => catalog.delete(deviceId));
+    await this.mutateCatalog((catalog) => {
+      if (catalog.get(deviceId)?.physicalAssignment)
+        throw statusError(409, 'Release the physical GPU assignment before deleting its catalog entry');
+      catalog.delete(deviceId);
+    });
     const removed = this.list().filter((grant) => grant.deviceId === deviceId);
     await this.removeWhere((grant) => grant.deviceId === deviceId);
     return { deviceIds: [deviceId], removedGrantIds: removed.map((grant) => grant.id) };
@@ -197,6 +277,7 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
     input: { deviceId: string; targetType: HardwareDeviceGrantTarget; targetId?: string },
   ) {
     return this.withUserMutation(userId, async () => {
+      this.assertNotPhysicalGpu(input.deviceId);
       this.assertEntitled(userId, input.deviceId);
       if (!(["all", "group", "worker"] as string[]).includes(input.targetType))
         throw statusError(400, "Owner grants must target all workers, one group, or one worker");
@@ -227,6 +308,7 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
     input: { deviceId: string; targetType: "group" | "worker"; targetId: string },
   ) {
     return this.withUserMutation(userId, async () => {
+      this.assertNotPhysicalGpu(input.deviceId);
       if (!(["group", "worker"] as string[]).includes(input.targetType))
         throw statusError(
           400,
@@ -278,6 +360,7 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
     const grant = this.get(userId, grantId);
     if (!grant || grant.targetType === "entitlement")
       throw statusError(404, "Hardware device assignment not found");
+    this.assertNotPhysicalGpu(grant.deviceId);
     if (
       authorityGroupId &&
       (grant.grantorType !== "group" || grant.grantorGroupId !== authorityGroupId)
@@ -293,6 +376,7 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
     deviceIds: string[] | undefined,
     directGroupId?: string,
   ): string[] | undefined {
+    this.assertPhysicalGpuSelection(userId, workerId, deviceIds);
     if (!deviceIds?.length) return undefined;
     const unique = [...new Set(deviceIds)];
     if (unique.some((id) => typeof id !== "string" || !id))
@@ -340,7 +424,11 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
     deviceId: string,
     directGroupId = this.directGroupId(userId, workerId),
   ) {
-    if (!this.getDevice(deviceId) || !this.isEntitled(userId, deviceId)) return false;
+    const device = this.getDevice(deviceId);
+    if (!device) return false;
+    if (isPhysicalGpuDevice(device)) return isNvidiaPhysicalGpuDevice(device) &&
+      device.physicalAssignment?.userId === userId && device.physicalAssignment.workerId === workerId;
+    if (!this.isEntitled(userId, deviceId)) return false;
     return this.listForUser(userId).some((grant) => {
       if (grant.deviceId !== deviceId || grant.targetType === "entitlement") return false;
       if (!this.isGrantActive(userId, grant)) return false;
@@ -351,7 +439,7 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
   }
 
   effectiveDevicesForWorker(userId: string, workerId: string, directGroupId?: string) {
-    return this.listEntitledDevices(userId).filter((path) =>
+    return this.listCatalog().filter((path) =>
       this.canWorkerUseDevice(userId, workerId, path.id, directGroupId),
     );
   }
@@ -375,7 +463,7 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
   devicesForNewWorker(userId: string, targetGroupId?: string) {
     const syntheticWorkerId = "__new_worker__";
     return this.listEntitledDevices(userId).filter((path) =>
-      this.canWorkerUseDevice(userId, syntheticWorkerId, path.id, targetGroupId),
+      !isPhysicalGpuDevice(path) && this.canWorkerUseDevice(userId, syntheticWorkerId, path.id, targetGroupId),
     );
   }
 
@@ -397,10 +485,16 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
       );
   }
 
+  private assertNotPhysicalGpu(deviceId: string) {
+    if (isPhysicalGpuDevice(this.getDevice(deviceId)))
+      throw statusError(403, 'Physical GPUs require a platform-admin assignment to one explicit VM');
+  }
+
   private isGrantActive(userId: string, grant: HardwareDeviceGrant, seen = new Set<string>()): boolean {
     if (seen.has(grant.id) || !this.catalog.has(grant.deviceId)) return false;
     seen.add(grant.id);
     if (grant.targetType === "entitlement") return grant.grantorType === "platform";
+    if (isPhysicalGpuDevice(this.getDevice(grant.deviceId))) return false;
     if (!this.isEntitled(userId, grant.deviceId)) return false;
     if (grant.grantorType === "owner") return true;
     if (
@@ -549,15 +643,17 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
       this.catalog = next;
       this.catalogUnavailable = false;
     } catch (error: any) {
-      if (error?.code === "ENOENT") return;
+      if (error?.code === "ENOENT") { this.catalog = new Map(); this.catalogUnavailable = false; return; }
       this.catalogUnavailable = true;
       throw error;
     }
   }
 
   private mutateCatalog(operation: (catalog: Map<string, HardwareDevice>) => void) {
-    const result = this.catalogWrites.then(async () => {
+    const path = resolve(this.catalogPath());
+    const result = (catalogWrites.get(path) ?? Promise.resolve()).then(async () => {
       this.assertCatalogAvailable();
+      await this.loadCatalog();
       const previous = this.catalog;
       const next = new Map(
         [...previous].map(([id, item]) => [id, structuredClone(item)]),
@@ -571,7 +667,9 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
         throw error;
       }
     });
-    this.catalogWrites = result.then(() => undefined, () => undefined);
+    const settled = result.then(() => undefined, () => undefined);
+    catalogWrites.set(path, settled);
+    void settled.then(() => { if (catalogWrites.get(path) === settled) catalogWrites.delete(path); });
     return result;
   }
 
@@ -625,6 +723,13 @@ function validatePersistedDevice(input: unknown): asserts input is HardwareDevic
       (item.vendor !== undefined && typeof item.vendor !== "string") ||
       (item.product !== undefined && typeof item.product !== "string") ||
       (item.serial !== undefined && typeof item.serial !== "string") ||
+      (item.physicalIdentity !== undefined && !validPhysicalIdentity(item.physicalIdentity)) ||
+      (item.physicalAssignment !== undefined && (!isNvidiaPhysicalGpuDevice(item) || !item.physicalAssignment ||
+        typeof item.physicalAssignment.userId !== 'string' || !item.physicalAssignment.userId ||
+        typeof item.physicalAssignment.workerId !== 'string' || !item.physicalAssignment.workerId ||
+        item.physicalAssignment.incarnation !== undefined && (typeof item.physicalAssignment.incarnation !== 'string' ||
+          !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(item.physicalAssignment.incarnation)) ||
+        Object.keys(item.physicalAssignment).some(key => !['userId', 'workerId', 'incarnation'].includes(key)))) ||
       typeof item.createdAt !== "string" || typeof item.updatedAt !== "string")
     throw new Error("Invalid persisted hardware device");
 }

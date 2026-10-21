@@ -1,13 +1,18 @@
 import { useHardwareDeviceStore } from "./services";
-import { enforceHardwareDeviceRevocation } from "./hardware-device-revocation";
+import { assertPhysicalGpuPolicyRemovalSafe, enforceHardwareDeviceRevocation } from "./hardware-device-revocation";
 import { getUserById } from "./auth";
+import { publicHardwareDevice } from "./hardware-device-response";
+import { listPhysicalGpuAssignments, setPhysicalGpuAssignment } from "./physical-gpu-management";
 
-type Authority = { scope: "platform" | "group"; ownerId?: string; groupId?: string };
+type Authority = { scope: "platform" | "group"; ownerId?: string; groupId?: string; reauthorize?: () => Promise<void> };
 const read = { readOnlyHint: true, idempotentHint: true, openWorldHint: false };
 const mutate = { readOnlyHint: false, idempotentHint: false, openWorldHint: false };
 
 export class ManagementHardwareDeviceDomain {
   tools() { return [
+    tool("hardware-devices.gpu.list", "List approved physical NVIDIA GPUs, their assigned ordinary worker VM, availability and stopped-VM requirements. Platform administrators only.", {}, read),
+    tool("hardware-devices.gpu.assign", "Assign a physical NVIDIA GPU to one explicit stopped ordinary Incus worker. No running VM or host driver is interrupted. Platform administrators only.", { deviceId: stringSchema(), workerId: stringSchema(), lockPassword: { ...stringSchema(), writeOnly: true } }, mutate, ["deviceId", "workerId"]),
+    tool("hardware-devices.gpu.release", "Release a physical NVIDIA GPU from its stopped ordinary worker VM. Platform administrators only.", { deviceId: stringSchema(), lockPassword: { ...stringSchema(), writeOnly: true } }, { ...mutate, destructiveHint: true }, ["deviceId"]),
     tool("hardware-devices.discover", "Discover host GPUs and USB devices and show whether each is already approved. Platform administration only.", {}, read),
     tool("hardware-devices.catalog.list", "List globally approved hardware devices and their current availability. Platform administration only.", {}, read),
     tool("hardware-devices.catalog.approve", "Approve one currently discovered hardware device by stable selector.", { selector: stringSchema(), name: stringSchema() }, mutate, ["selector"]),
@@ -25,24 +30,40 @@ export class ManagementHardwareDeviceDomain {
 
   async execute(name: string, args: Record<string, any>, authority?: Authority): Promise<{ handled: boolean; result?: unknown }> {
     if (!name.startsWith("hardware-devices.")) return { handled: false };
-    if (!authority) throw failure(401, "Administrative identity required");
+    if (!authority || !["platform", "group"].includes(authority.scope)) throw failure(401, "Administrative identity required");
+    if (authority.scope === "group" && (!authority.ownerId || !authority.groupId)) throw failure(403, "Group administrative identity is incomplete");
     const store = useHardwareDeviceStore();
     const groupTool = name.startsWith("hardware-devices.delegations.");
     if (authority.scope === "group" && !groupTool) throw failure(403, "Group administrators cannot approve host devices or create account-wide assignments. Ask the account owner or platform administrator to grant a device to this group first.");
     if (authority.scope === "platform" && groupTool) throw failure(400, "Group delegation tools require a group administrative workspace");
+    if (name.startsWith("hardware-devices.gpu.")) {
+      const authorize = async () => {
+        if (authority.scope !== "platform" || !authority.reauthorize) throw failure(403, "Live platform administrator authority required");
+        await authority.reauthorize();
+      };
+      await authorize();
+      if (name === "hardware-devices.gpu.list") return handled(await listPhysicalGpuAssignments());
+      if (name === "hardware-devices.gpu.assign") return handled(await setPhysicalGpuAssignment(args.deviceId, args.workerId, authorize, args.lockPassword));
+      if (name === "hardware-devices.gpu.release") return handled(await setPhysicalGpuAssignment(args.deviceId, null, authorize, args.lockPassword));
+      throw failure(404, "Unknown physical GPU operation");
+    }
     if (name === "hardware-devices.discover") {
       const approved = new Set(store.listCatalog().map((item) => item.selector));
-      return handled((await store.listDiscoveredDevices()).map((item) => ({ ...item, approved: approved.has(item.selector) })));
+      return handled((await store.listDiscoveredDevices()).map(item => ({ ...publicHardwareDevice(item), approved: approved.has(item.selector) })));
     }
     if (name === "hardware-devices.catalog.list") {
       const live = new Set((await store.listDiscoveredDevices()).map((item) => item.selector));
-      return handled(store.listCatalog().map((item) => ({ ...item, available: live.has(item.selector) })));
+      return handled(store.listCatalog().map(item => ({ ...publicHardwareDevice(item), available: live.has(item.selector) })));
     }
-    if (name === "hardware-devices.catalog.approve") return handled(await store.approveDevice({ selector: args.selector, name: args.name }));
-    if (name === "hardware-devices.catalog.update") return handled(await store.updateDevice(args.deviceId, { name: args.name }));
-    if (name === "hardware-devices.catalog.delete") { const removed = await store.deleteDevice(args.deviceId); return handled({ deleted: true, ...removed, enforcement: await enforceHardwareDeviceRevocation() }); }
-    if (name === "hardware-devices.entitlements.list") { assertOwner(args.ownerId); const entitled = new Set(store.listEntitledDevices(args.ownerId).map((item) => item.id)); return handled({ ownerId: args.ownerId, catalog: store.listCatalog().map((item) => ({ ...item, entitled: entitled.has(item.id) })) }); }
-    if (name === "hardware-devices.entitlements.set") { assertOwner(args.ownerId); const changed = await store.setEntitlement(args.ownerId, args.deviceId, args.enabled); return handled({ ...changed, enforcement: args.enabled ? undefined : await enforceHardwareDeviceRevocation(args.ownerId) }); }
+    if (name === "hardware-devices.catalog.approve") {
+      return handled(publicHardwareDevice(await store.approveDevice({ selector: args.selector, name: args.name })));
+    }
+    if (name === "hardware-devices.catalog.update") {
+      return handled(publicHardwareDevice(await store.updateDevice(args.deviceId, { name: args.name })));
+    }
+    if (name === "hardware-devices.catalog.delete") { assertPhysicalGpuPolicyRemovalSafe(args.deviceId); const removed = await store.deleteDevice(args.deviceId); return handled({ deleted: true, ...removed, enforcement: await enforceHardwareDeviceRevocation() }); }
+    if (name === "hardware-devices.entitlements.list") { assertOwner(args.ownerId); const entitled = new Set(store.listEntitledDevices(args.ownerId).map((item) => item.id)); return handled({ ownerId: args.ownerId, catalog: store.listCatalog().map(item => ({ ...publicHardwareDevice(item), entitled: entitled.has(item.id) })) }); }
+    if (name === "hardware-devices.entitlements.set") { assertOwner(args.ownerId); if (args.enabled === false) assertPhysicalGpuPolicyRemovalSafe(args.deviceId); const changed = await store.setEntitlement(args.ownerId, args.deviceId, args.enabled); return handled({ ...changed, enforcement: args.enabled ? undefined : await enforceHardwareDeviceRevocation(args.ownerId) }); }
     if (name === "hardware-devices.grants.list") { assertOwner(args.ownerId); return handled({ ownerId: args.ownerId, grants: store.listGrants(args.ownerId) }); }
     if (name === "hardware-devices.grants.create") { assertOwner(args.ownerId); return handled(await store.createOwnerGrant(args.ownerId, args as any)); }
     if (name === "hardware-devices.grants.delete") { assertOwner(args.ownerId); const removed = await store.deleteGrant(args.ownerId, args.grantId); return handled({ deleted: true, ...removed, enforcement: await enforceHardwareDeviceRevocation(args.ownerId) }); }

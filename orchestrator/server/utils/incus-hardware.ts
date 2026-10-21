@@ -28,7 +28,10 @@ export function incusHardwareDevices(resolved: ResolvedHardwareDevice[], gpuProf
             candidate.selector.split(':')[1] !== candidate.vendor || candidate.selector.split(':')[2] !== candidate.product ||
             candidate.selector.split(':')[5] !== candidate.serial || !pci || !/^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$/.test(pci) ||
             !/^\d+$/.test(evidence?.iommuGroup ?? '') || evidence?.bootVga !== false ||
-            !['', 'vfio-pci'].includes(evidence?.driver ?? 'unknown') || !isDeepStrictEqual(evidence?.iommuMembers, [pci]))
+            !['', 'vfio-pci'].includes(evidence?.driver ?? 'unknown') ||
+            evidence?.resetMethods?.includes('bus') && evidence.resetDomainSafe !== true ||
+            !(evidence?.iommuBridges ?? []).every(bridge => bridge !== pci && /^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$/.test(bridge)) ||
+            !isDeepStrictEqual(evidence?.iommuMembers, [pci, ...(evidence?.iommuBridges ?? [])].sort()))
           fail('Physical GPU requires stable identity, an isolated IOMMU group and explicit host release to unbound or VFIO ownership');
         devices[key] = { type: 'gpu', gputype: 'physical', pci };
         continue;

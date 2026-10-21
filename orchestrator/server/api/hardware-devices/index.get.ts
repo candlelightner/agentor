@@ -1,5 +1,6 @@
 defineRouteMeta({ openAPI: { tags: ["Hardware devices"], summary: "List discovered and approved hardware devices", operationId: "listHardwareDevices" } });
 import { hardwareDeviceSelector } from "../../utils/hardware-device-store";
+import { publicHardwareDevice } from "../../utils/hardware-device-response";
 import { requireAuth } from "../../utils/auth-helpers";
 import { getUserById } from "../../utils/auth";
 import { useConfig, useHardwareDeviceStore, useWorkerGroupStore, useWorkerStore } from "../../utils/services";
@@ -15,7 +16,8 @@ export default defineEventHandler(async (event) => {
   const discovered = await store.listDiscoveredDevices();
   const liveSelectors = new Set(discovered.map((item) => item.selector));
   const entitled = new Set(store.listEntitledDevices(ownerId).map((item) => item.id));
-  const baseCatalog = user.role === "admin" ? store.listCatalog() : store.listEntitledDevices(ownerId);
+  const baseCatalog = user.role === "admin" ? store.listCatalog() : store.listCatalog().filter(item =>
+    entitled.has(item.id) || item.physicalAssignment?.userId === ownerId);
   const workerId = typeof query.workerId === "string" ? query.workerId : undefined;
   const groupId = typeof query.groupId === "string" ? query.groupId : undefined;
   if (workerId && groupId) throw createError({ statusCode: 400, statusMessage: "Choose workerId or groupId, not both" });
@@ -31,14 +33,15 @@ export default defineEventHandler(async (event) => {
     incusUsbEnabled: useConfig().incusUsbEnabled === true,
     incusGpuMdevProfile: useConfig().incusGpuMdevProfile || undefined,
     incusGpuPhysicalEnabled: useConfig().incusGpuPhysicalEnabled === true,
-    catalog: baseCatalog.map((item) => {
+    catalog: baseCatalog.map(device => {
+      const { physicalAssignment, ...item } = publicHardwareDevice(device);
       const occupants = useWorkerStore().list().filter(worker => worker.status !== 'archived' && worker.hardwareDeviceIds?.includes(item.id));
-      return { ...item, entitled: entitled.has(item.id), available: liveSelectors.has(hardwareDeviceSelector(item)),
+      return { ...item, ...(user.role === 'admin' && physicalAssignment ? { physicalAssignment } : {}), entitled: entitled.has(item.id), available: liveSelectors.has(hardwareDeviceSelector(item)),
         incus: discovered.find(candidate => candidate.selector === hardwareDeviceSelector(item))?.incus,
         reserved: occupants.length > 0,
         reservedWorkerIds: occupants.filter(worker => user.role === 'admin' || worker.userId === ownerId).map(worker => worker.id) };
     }),
-    discovered: user.role === "admin" ? discovered.filter((item) => !approvedSelectors.has(item.selector)) : [],
+    discovered: user.role === "admin" ? discovered.filter((item) => !approvedSelectors.has(item.selector)).map(({ physicalIdentity: _physicalIdentity, ...item }) => item) : [],
     grants: store.listGrants(ownerId),
     effectiveDeviceIds: effective.map((item) => item.id),
     groups: useWorkerGroupStore().listForUser(ownerId).map(({ id, name, parentId }) => ({ id, name, parentId })),

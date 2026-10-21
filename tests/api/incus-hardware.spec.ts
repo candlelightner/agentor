@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
-import { HardwareDeviceStore } from '../../orchestrator/server/utils/hardware-device-store';
+import { HardwareDeviceStore, isPhysicalGpuDevice } from '../../orchestrator/server/utils/hardware-device-store';
 import { WorkerStore, type WorkerRecord } from '../../orchestrator/server/utils/worker-store';
 import { WorkerGroupStore } from '../../orchestrator/server/utils/worker-group-store';
 import { resolveIncusHardware, incusHardwareDevices, assertIncusHardwareLayout, assertIncusHardwareExclusive, INCUS_MDEV_GUEST_SETUP, type IncusHardwareOptions } from '../../orchestrator/server/utils/incus-hardware';
@@ -32,7 +32,8 @@ async function fixture(initial: HardwareDeviceCandidate = candidate) {
   const device = await hardware.approveDevice({ selector: initial.selector });
   record.hardwareDeviceIds = [device.id]; await workers.upsert(record);
   await hardware.setEntitlement(record.userId, device.id, true);
-  await hardware.createOwnerGrant(record.userId, { deviceId: device.id, targetType: 'all' });
+  if (isPhysicalGpuDevice(device)) await hardware.setPhysicalGpuAssignment(device.id, { userId: record.userId, workerId: record.id });
+  else await hardware.createOwnerGrant(record.userId, { deviceId: device.id, targetType: 'all' });
   const opts: IncusHardwareOptions = { id: record.id, userId: record.userId, containerName: 'agentor-worker-' + record.id,
     hardwareDevices: [{ deviceId: device.id, deviceNodes: ['/dev/forged'], groupIds: [] }] };
   return { dataDir, config, workers, record, hardware, device, opts, discover,
@@ -183,7 +184,7 @@ const gpu: HardwareDeviceCandidate = { kind: 'gpu', name: 'Intel GPU', selector:
     bootVga: true, mediatedProfiles: [gpuProfile], mediatedAvailable: { [gpuProfile]: 1 }, mediatedInstances: {} } } };
 
 const physicalGpu: HardwareDeviceCandidate = { kind: 'gpu', name: 'Dedicated GPU',
-  selector: 'pci-gpu:1234:5678:1234:abcd:fixture-serial', vendor: '1234', product: '5678', serial: 'fixture-serial',
+  selector: 'pci-gpu:10de:5678:1234:abcd:fixture-serial', vendor: '10de', product: '5678', serial: 'fixture-serial',
   deviceNodes: [], groupIds: [], incus: { supported: true, mode: 'gpu-physical', reason: 'Isolated physical GPU',
     evidence: { pciAddress: '0000:04:00.0', driver: 'vfio-pci', bootVga: false, iommuGroup: '24', iommuMembers: ['0000:04:00.0'] } } };
 
@@ -226,6 +227,12 @@ test('physical GPU admission refuses host ownership, boot display, unknown isola
     expect(() => incusHardwareDevices([{ ...input, candidate: { ...physicalGpu, ...change } }])).toThrow('Physical GPU');
   expect(Object.values(incusHardwareDevices([{ ...input, candidate: { ...physicalGpu, incus: { ...physicalGpu.incus!,
     evidence: { ...physicalGpu.incus!.evidence!, driver: '' } } } }]))).toEqual([{ type: 'gpu', gputype: 'physical', pci: '0000:04:00.0' }]);
+  const bridgeEvidence = { ...physicalGpu.incus!.evidence!, iommuMembers: ['0000:03:00.0', '0000:04:00.0'],
+    iommuBridges: ['0000:03:00.0'] };
+  expect(Object.values(incusHardwareDevices([{ ...input, candidate: { ...physicalGpu,
+    incus: { ...physicalGpu.incus!, evidence: bridgeEvidence } } }]))).toEqual([{ type: 'gpu', gputype: 'physical', pci: '0000:04:00.0' }]);
+  expect(() => incusHardwareDevices([{ ...input, candidate: { ...physicalGpu,
+    incus: { ...physicalGpu.incus!, evidence: { ...bridgeEvidence, iommuMembers: [...bridgeEvidence.iommuMembers, '0000:05:00.0'] } } } }])).toThrow('Physical GPU');
 });
 
 test('physical GPU reuses exclusive stopped-worker reservations and revocation/recreation incarnation fences', async () => {
@@ -250,7 +257,9 @@ test('physical GPU reuses exclusive stopped-worker reservations and revocation/r
       { config: { 'volatile.uuid': randomUUID() } } as any)).rejects.toThrow('captured replacement');
     await resolveIncusHardware(f.config, f.opts, f.discover, 'attach', { config: { 'volatile.uuid': replacementIncarnation } } as any);
     await f.hardware.setEntitlement('owner', f.device.id, false);
-    await expect(resolveIncusHardware(f.config, f.opts, f.discover, 'preflight')).rejects.toThrow('not assigned');
+    await resolveIncusHardware(f.config, f.opts, f.discover, 'preflight');
+    await f.hardware.setPhysicalGpuAssignment(f.device.id, undefined, { userId: 'owner', workerId: f.record.id });
+    await expect(resolveIncusHardware(f.config, f.opts, f.discover, 'preflight')).rejects.toThrow('platform administrator');
   } finally { await f.cleanup(); }
 });
 
@@ -397,7 +406,8 @@ async function dockerProbeLogs(logs: string, exitCode: number, run: (docker: Doc
       expect(query.get('name')).toMatch(/^agentor-hardware-probe-/);
       const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
       expect(JSON.parse(Buffer.concat(chunks).toString())).toMatchObject({ Tty: true,
-        HostConfig: { NetworkMode: 'none', ReadonlyRootfs: true, Binds: ['/dev:/host/dev:ro', '/sys:/host/sys:ro'] } });
+        Env: ['AGENTOR_GPU_IDENTITIES=[]'], HostConfig: { NetworkMode: 'none', ReadonlyRootfs: true,
+          Binds: ['/dev:/host/dev:ro', '/sys:/host/sys:ro', '/proc/sys/kernel/random/boot_id:/host/boot_id:ro'] } });
       return reply(201, { Id: id, Warnings: [] });
     }
     if (request.method === 'POST' && path === `/containers/${id}/start`) return reply(204);

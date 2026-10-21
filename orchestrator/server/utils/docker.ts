@@ -1,4 +1,5 @@
 import { HARDWARE_DEVICE_PROBE } from "./hardware-device-probe";
+import { physicalGpuIdentityReceipts } from './hardware-device-store';
 import { TMUX_TERMINAL_CLIPBOARD_SETUP } from './tmux-terminal-clipboard';
 import Docker from 'dockerode';
 import { assertBackupRestoreRuntimePrincipal, type BackupRestoreRuntimePrincipal } from './backup-restore-runtime-authority';
@@ -423,6 +424,7 @@ export class DockerService {
    * orchestrator container broad /dev access. The short-lived probe is isolated,
    * read-only, networkless, and has no Linux capabilities. */
   async discoverHardwareDevices(): Promise<HardwareDeviceCandidate[]> {
+    const identities = await physicalGpuIdentityReceipts(this.config.dataDir);
     const image = this.config.workerImagePrefix + this.config.workerImage;
     await this.ensureImage(image);
     const name = `agentor-hardware-probe-${randomUUID()}`;
@@ -437,11 +439,12 @@ export class DockerService {
           User: '0:0',
           Entrypoint: ['python3', '-c'],
           Cmd: [HARDWARE_DEVICE_PROBE],
+          Env: ['AGENTOR_GPU_IDENTITIES=' + JSON.stringify(identities)],
           Tty: true,
           NetworkDisabled: true,
           HostConfig: {
             NetworkMode: 'none',
-            Binds: ['/dev:/host/dev:ro', '/sys:/host/sys:ro'],
+            Binds: ['/dev:/host/dev:ro', '/sys:/host/sys:ro', '/proc/sys/kernel/random/boot_id:/host/boot_id:ro'],
             ReadonlyRootfs: true,
             CapDrop: ['ALL'],
             SecurityOpt: ['no-new-privileges:true'],

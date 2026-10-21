@@ -1,4 +1,5 @@
 defineRouteMeta({ openAPI: { tags: ["Hardware devices"], summary: "Approve a discovered host hardware device", operationId: "approveHardwareDevice" } });
+import { publicHardwareDevice } from "../../utils/hardware-device-response";
 import { requireAdmin } from "../../utils/auth-helpers";
 import { useHardwareDeviceStore } from "../../utils/services";
 export default defineEventHandler(async (event) => {
@@ -6,5 +7,5 @@ export default defineEventHandler(async (event) => {
   const body = await readBody(event);
   const device = await useHardwareDeviceStore().approveDevice({ selector: body?.selector, name: body?.name });
   setResponseStatus(event, 201);
-  return device;
+  return publicHardwareDevice(device);
 });
