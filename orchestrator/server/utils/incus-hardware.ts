@@ -22,6 +22,17 @@ export function incusHardwareDevices(resolved: ResolvedHardwareDevice[], gpuProf
     const key = 'hw' + createHash('sha256').update(value.deviceId).digest('hex').slice(0, 12);
     if (devices[key]) fail('Duplicate hardware device identity');
     if (candidate?.kind === 'gpu') {
+      if (candidate.incus?.mode === 'gpu-physical') {
+        const evidence = candidate.incus.evidence, pci = evidence?.pciAddress;
+        if (!candidate.incus.supported || !/^pci-gpu:[0-9a-f]{4}:[0-9a-f]{4}:[0-9a-f]{4}:[0-9a-f]{4}:[A-Za-z0-9._-]{1,128}$/.test(candidate.selector) ||
+            candidate.selector.split(':')[1] !== candidate.vendor || candidate.selector.split(':')[2] !== candidate.product ||
+            candidate.selector.split(':')[5] !== candidate.serial || !pci || !/^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$/.test(pci) ||
+            !/^\d+$/.test(evidence?.iommuGroup ?? '') || evidence?.bootVga !== false ||
+            !['', 'vfio-pci'].includes(evidence?.driver ?? 'unknown') || !isDeepStrictEqual(evidence?.iommuMembers, [pci]))
+          fail('Physical GPU requires stable identity, an isolated IOMMU group and explicit host release to unbound or VFIO ownership');
+        devices[key] = { type: 'gpu', gputype: 'physical', pci };
+        continue;
+      }
       if (!candidate.incus?.supported) fail(candidate.incus?.reason || 'Intel mediated GPU host capability is unavailable');
       if (!gpuProfile || !/^i915-GVTg_V[0-9]+_[0-9]+$/.test(gpuProfile))
         fail('Intel mediated GPU requires an explicit INCUS_GPU_MDEV_PROFILE selected from current host profiles');
@@ -57,8 +68,8 @@ export async function resolveIncusHardware(config: Config, opts: IncusHardwareOp
 ): Promise<Record<string, IncusDevice>> {
   const requested = (opts.hardwareDevices ?? []).map(device => device.deviceId).sort();
   if (!requested.length) return {};
-  if (!config.incusUsbEnabled && !config.incusGpuMdevProfile)
-    fail('Incus hardware is disabled; explicit operator USB or mediated GPU setup is required');
+  if (!config.incusUsbEnabled && !config.incusGpuMdevProfile && !config.incusGpuPhysicalEnabled)
+    fail('Incus hardware is disabled; explicit operator USB or GPU setup is required');
   // Probe first: slow host discovery must not precede a stale authorization snapshot.
   const inventory = await discover();
   const workers = new WorkerStore(config.dataDir), groups = new WorkerGroupStore(config.dataDir);
@@ -99,6 +110,8 @@ export async function resolveIncusHardware(config: Config, opts: IncusHardwareOp
   }
   if (resolved?.some(value => value.candidate?.kind === 'usb') && !config.incusUsbEnabled)
     fail('Incus USB passthrough is disabled; operator host setup and INCUS_USB_ENABLED=true are required');
+  if (resolved?.some(value => value.candidate?.incus?.mode === 'gpu-physical') && !config.incusGpuPhysicalEnabled)
+    fail('Incus physical GPU passthrough is disabled; operator host release and INCUS_GPU_PHYSICAL_ENABLED=true are required');
   return incusHardwareDevices(resolved ?? [], config.incusGpuMdevProfile, instance);
 }
 

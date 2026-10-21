@@ -159,11 +159,12 @@ export class IncusWorkerRuntime {
     const devices = await resolveIncusHardware(this.config, opts, () => this.hardwareDiscovery!(opts), operation, instance);
     const project = await this.client.request<{ config: Record<string, string> }>('GET', `/1.0/projects/${encodeURIComponent(this.config.incusProject)}`);
     if (project.config.restricted !== 'true' || (project.config['restricted.devices.usb'] ?? 'block') !== (this.config.incusUsbEnabled ? 'allow' : 'block') ||
-        (project.config['restricted.devices.gpu'] ?? 'block') !== (this.config.incusGpuMdevProfile ? 'allow' : 'block') ||
+        (project.config['restricted.devices.gpu'] ?? 'block') !== (this.config.incusGpuMdevProfile || this.config.incusGpuPhysicalEnabled ? 'allow' : 'block') ||
         (project.config['user.agentor.gpu-mdev-profile'] ?? '') !== (this.config.incusGpuMdevProfile ?? '') ||
+        (project.config['user.agentor.gpu-physical'] ?? '') !== (this.config.incusGpuPhysicalEnabled ? 'true' : '') ||
         (project.config['restricted.virtual-machines.lowlevel'] ?? 'block') !== 'block' ||
         ['pci', 'unix-char', 'unix-block', 'unix-hotplug'].some(kind => (project.config['restricted.devices.' + kind] ?? 'block') !== 'block'))
-      throw new Error('Incus hardware requires explicit USB/mdev-only restricted project policy');
+      throw new Error('Incus hardware requires explicit restricted project USB/GPU policy');
     assertIncusHardwareExclusive(opts.containerName, devices, await this.client.listInstances());
     return devices;
   }
@@ -1864,7 +1865,7 @@ export class IncusWorkerRuntime {
       for (const device of Object.values(hostMounts.devices))
         await this.checkedExec(name, ['timeout', '15', 'mountpoint', '-q', '--', device.path!]);
       await this.checkedExec(name, ["systemctl", "stop", "agentor-worker.service"]);
-      if (Object.values(hardware).some(device => device.type === 'gpu'))
+      if (Object.values(hardware).some(device => device.type === 'gpu' && device.gputype === 'mdev'))
         await this.checkedExec(name, ['timeout', '30', 'bash', '-ec', INCUS_MDEV_GUEST_SETUP]);
       await this.reprovisionManagedNetworks(opts, instance.config['volatile.uuid']!);
       if (Object.keys(account).length) {

@@ -134,9 +134,9 @@ test('runtime checks explicit restricted USB policy before allowing hardware', a
     const project = { config: { restricted: 'true', 'restricted.devices.usb': 'block' } as Record<string, string> };
     const runtime = new IncusWorkerRuntime(f.config, { request: async () => project, listInstances: async () => [] } as any);
     runtime.setHardwareDiscovery(f.discover);
-    await expect(runtime.preflightHardware(f.opts)).rejects.toThrow('USB/mdev-only');
+    await expect(runtime.preflightHardware(f.opts)).rejects.toThrow('restricted project');
     project.config['restricted.devices.usb'] = 'allow'; await runtime.preflightHardware(f.opts);
-    project.config['restricted.devices.pci'] = 'allow'; await expect(runtime.preflightHardware(f.opts)).rejects.toThrow('USB/mdev-only');
+    project.config['restricted.devices.pci'] = 'allow'; await expect(runtime.preflightHardware(f.opts)).rejects.toThrow('restricted project');
   } finally { await f.cleanup(); }
 });
 
@@ -181,6 +181,97 @@ const gpu: HardwareDeviceCandidate = { kind: 'gpu', name: 'Intel GPU', selector:
   vendor: '8086', product: '5917', deviceNodes: ['/dev/dri/card0', '/dev/dri/renderD128'], groupIds: [44],
   incus: { supported: true, mode: 'gpu-mdev', reason: 'GVT-g profile', evidence: { driver: 'i915', gvtEnabled: true,
     bootVga: true, mediatedProfiles: [gpuProfile], mediatedAvailable: { [gpuProfile]: 1 }, mediatedInstances: {} } } };
+
+const physicalGpu: HardwareDeviceCandidate = { kind: 'gpu', name: 'Dedicated GPU',
+  selector: 'pci-gpu:1234:5678:1234:abcd:fixture-serial', vendor: '1234', product: '5678', serial: 'fixture-serial',
+  deviceNodes: [], groupIds: [], incus: { supported: true, mode: 'gpu-physical', reason: 'Isolated physical GPU',
+    evidence: { pciAddress: '0000:04:00.0', driver: 'vfio-pci', bootVga: false, iommuGroup: '24', iommuMembers: ['0000:04:00.0'] } } };
+
+test('legacy Docker creation rejects a physical GPU selection before touching a daemon', async () => {
+  const docker = new DockerService({} as Config);
+  (docker as any).docker = new Proxy({}, { get() { throw new Error('Docker must not be contacted'); } });
+  await expect(docker.createWorkerContainer({ hardwareDevices: [{ deviceId: randomUUID(), candidate: physicalGpu,
+    deviceNodes: [], groupIds: [] }] } as any)).rejects.toThrow('requires an Incus VM');
+});
+
+test('physical GPU needs opt-in and resolves current BDF from fresh serial identity, never worker-supplied paths', async () => {
+  const f = await fixture(physicalGpu); try {
+    await expect(f.resolve()).rejects.toThrow('INCUS_GPU_PHYSICAL_ENABLED');
+    f.config.incusUsbEnabled = false; f.config.incusGpuPhysicalEnabled = true;
+    const devices = await f.resolve();
+    expect(Object.values(devices)).toEqual([{ type: 'gpu', gputype: 'physical', pci: '0000:04:00.0' }]);
+    const moved = { ...physicalGpu, incus: { ...physicalGpu.incus!, evidence: { ...physicalGpu.incus!.evidence!,
+      pciAddress: '0000:07:00.0', iommuMembers: ['0000:07:00.0'] } } };
+    f.inventory([moved]);
+    expect(Object.values(await f.resolve())).toEqual([{ type: 'gpu', gputype: 'physical', pci: '0000:07:00.0' }]);
+    expect(() => assertIncusHardwareLayout({ devices, profiles: [], config: {} } as any, incusHardwareDevices([
+      { deviceId: f.device.id, candidate: moved, deviceNodes: [], groupIds: [] }]))).toThrow('rebuild');
+    // Existing stopped compute must be rebuilt; never silently hot-switch a stale PCI layout.
+    for (const inventory of [[], [physicalGpu, physicalGpu], [{ ...physicalGpu, selector: physicalGpu.selector + '-replacement' }]]) {
+      f.inventory(inventory); await expect(f.resolve()).rejects.toThrow();
+    }
+    expect(f.workers.get('owner', f.record.id)?.hardwareDeviceIds).toEqual([f.device.id]);
+    expect(JSON.stringify(f.workers.get('owner', f.record.id))).not.toContain('0000:');
+  } finally { await f.cleanup(); }
+});
+
+test('physical GPU admission refuses host ownership, boot display, unknown isolation and forged discovery identity', () => {
+  const input = { deviceId: randomUUID(), candidate: physicalGpu, deviceNodes: ['/dev/forged'], groupIds: [] };
+  for (const evidence of [{ driver: 'nvidia' }, { driver: 'nouveau' }, { driver: undefined }, { bootVga: true },
+    { bootVga: undefined }, { iommuGroup: '' }, { iommuMembers: undefined }, { iommuMembers: ['0000:04:00.0', '0000:04:00.1'] },
+    { pciAddress: '../../dev/mem' }, { pciAddress: '0000:05:00.0' }])
+    expect(() => incusHardwareDevices([{ ...input, candidate: { ...physicalGpu,
+      incus: { ...physicalGpu.incus!, evidence: { ...physicalGpu.incus!.evidence!, ...evidence } } } }])).toThrow('Physical GPU');
+  for (const change of [{ serial: 'different' }, { vendor: 'abcd' }, { selector: 'drm:pci:0000:04:00.0' }])
+    expect(() => incusHardwareDevices([{ ...input, candidate: { ...physicalGpu, ...change } }])).toThrow('Physical GPU');
+  expect(Object.values(incusHardwareDevices([{ ...input, candidate: { ...physicalGpu, incus: { ...physicalGpu.incus!,
+    evidence: { ...physicalGpu.incus!.evidence!, driver: '' } } } }]))).toEqual([{ type: 'gpu', gputype: 'physical', pci: '0000:04:00.0' }]);
+});
+
+test('physical GPU reuses exclusive stopped-worker reservations and revocation/recreation incarnation fences', async () => {
+  const f = await fixture(physicalGpu); try {
+    f.config.incusGpuPhysicalEnabled = true;
+    const peer = { ...f.record, id: randomUUID(), userId: 'other-owner', desiredRuntimeStatus: 'stopped' as const };
+    await f.workers.upsert(peer); await expect(f.resolve()).rejects.toThrow('exclusively reserved');
+    await f.workers.archive(peer.userId, peer.id); await f.resolve();
+    await f.workers.unarchive(peer.userId, peer.id); await expect(f.resolve()).rejects.toThrow('exclusively reserved');
+    await f.workers.archive(peer.userId, peer.id);
+    const devices = await f.resolve();
+    for (const device of [{ type: 'gpu' }, Object.values(devices)[0], { type: 'pci', address: '0000:04:00.0' },
+      { type: 'gpu', gputype: 'mdev', pci: '0000:04:00.0', mdev: gpuProfile }])
+      expect(() => assertIncusHardwareExclusive(f.opts.containerName, devices,
+        [{ name: 'foreign', status: 'Stopped', devices: { device } } as any])).toThrow('GPU');
+    await f.workers.upsert({ ...f.record, hardwareDevicesRevoked: true });
+    await expect(f.resolve()).rejects.toThrow('durable worker');
+    const nonce = randomUUID(), replacementIncarnation = randomUUID();
+    await f.workers.upsert({ ...f.record, hardwareDevicesRevoked: true, incusRecreation: { nonce, replacementIncarnation } });
+    f.opts.recreationNonce = nonce;
+    await expect(resolveIncusHardware(f.config, f.opts, f.discover, 'attach',
+      { config: { 'volatile.uuid': randomUUID() } } as any)).rejects.toThrow('captured replacement');
+    await resolveIncusHardware(f.config, f.opts, f.discover, 'attach', { config: { 'volatile.uuid': replacementIncarnation } } as any);
+    await f.hardware.setEntitlement('owner', f.device.id, false);
+    await expect(resolveIncusHardware(f.config, f.opts, f.discover, 'preflight')).rejects.toThrow('not assigned');
+  } finally { await f.cleanup(); }
+});
+
+test('physical GPU runtime requires exact operator project permission and rejects peer ownership before activation', async () => {
+  const f = await fixture(physicalGpu); try {
+    f.config.incusUsbEnabled = false; f.config.incusGpuPhysicalEnabled = true;
+    const project = { config: { restricted: 'true', 'restricted.devices.gpu': 'allow',
+      'user.agentor.gpu-physical': 'true' } as Record<string, string> };
+    let peers: any[] = [];
+    const runtime = new IncusWorkerRuntime(f.config, { request: async () => project, listInstances: async () => peers } as any);
+    runtime.setHardwareDiscovery(f.discover); await runtime.preflightHardware(f.opts);
+    for (const [field, value] of [['user.agentor.gpu-physical', 'false'], ['restricted.devices.gpu', 'block'],
+      ['restricted.devices.pci', 'allow'], ['restricted.virtual-machines.lowlevel', 'allow'], ['restricted.devices.unix-char', 'allow']]) {
+      const old = project.config[field!]; project.config[field!] = value!;
+      await expect(runtime.preflightHardware(f.opts)).rejects.toThrow('restricted project');
+      if (old === undefined) delete project.config[field!]; else project.config[field!] = old;
+    }
+    peers = [{ name: 'foreign', status: 'Stopped', devices: { gpu: { type: 'gpu', pci: '0000:04:00.0' } } }];
+    await expect(runtime.preflightHardware(f.opts)).rejects.toThrow('another Incus instance');
+  } finally { await f.cleanup(); }
+});
 
 test('Intel mdev requires exact operator profile and fresh GPU grant; physical passthrough is never selected', async () => {
   const f = await fixture(gpu); try {
@@ -301,6 +392,9 @@ async function dockerProbeLogs(logs: string, exitCode: number, run: (docker: Doc
     };
     if (request.method === 'GET' && path === '/images/worker:fixture/json') return reply(200, { Id: 'sha256:' + 'b'.repeat(64) });
     if (request.method === 'POST' && path === '/containers/create') {
+      const query = new URL(request.url!, 'http://fixture.invalid').searchParams;
+      expect([...query.keys()]).toEqual(['name']);
+      expect(query.get('name')).toMatch(/^agentor-hardware-probe-/);
       const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
       expect(JSON.parse(Buffer.concat(chunks).toString())).toMatchObject({ Tty: true,
         HostConfig: { NetworkMode: 'none', ReadonlyRootfs: true, Binds: ['/dev:/host/dev:ro', '/sys:/host/sys:ro'] } });

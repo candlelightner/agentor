@@ -26,7 +26,8 @@ function statusError(statusCode: number, message: string) {
 
 function validateCandidate(input: HardwareDeviceCandidate) {
   if (!input || !["gpu", "usb"].includes(input.kind) || !input.selector ||
-      !Array.isArray(input.deviceNodes) || !input.deviceNodes.length ||
+      !Array.isArray(input.deviceNodes) || (!input.deviceNodes.length &&
+        !(input.kind === 'gpu' && input.selector.startsWith('pci-gpu:'))) ||
       input.deviceNodes.some((node) => !node.startsWith("/dev/")) ||
       !Array.isArray(input.groupIds) || input.groupIds.some((gid) => !Number.isInteger(gid) || gid < 0))
     throw statusError(503, "Host hardware discovery returned an invalid device");

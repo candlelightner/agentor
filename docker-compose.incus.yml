@@ -40,6 +40,7 @@ services:
       INCUS_DEFAULT_MEMORY_LIMIT: ${INCUS_DEFAULT_MEMORY_LIMIT:-4GiB}
       INCUS_USB_ENABLED: ${INCUS_USB_ENABLED:-false}
       INCUS_GPU_MDEV_PROFILE: ${INCUS_GPU_MDEV_PROFILE:-}
+      INCUS_GPU_PHYSICAL_ENABLED: ${INCUS_GPU_PHYSICAL_ENABLED:-false}
       INCUS_ENDPOINT: ${INCUS_ENDPOINT:?Use the setup HTTPS endpoint}
       INCUS_PROJECT: ${INCUS_PROJECT:?Use the dedicated restricted project}
       INCUS_NETWORK: ${INCUS_NETWORK:?Use the setup managed worker network}

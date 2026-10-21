@@ -42,9 +42,9 @@ export interface HostMountGrant {
 
 export type HardwareDeviceKind = "gpu" | "usb";
 
-/** A host device discovered by a hardened, read-only Docker probe. `selector`
- * is stable across device-node renumbering; live node paths are resolved again
- * immediately before Docker creates a worker. */
+/** A host device discovered by a hardened, read-only probe. `selector` is stable
+ * across node renumbering (and PCI renumbering for serial-identified physical
+ * GPUs); live paths/addresses are resolved again before runtime activation. */
 export interface HardwareDevice {
   schemaVersion: 1;
   id: string;
@@ -60,10 +60,11 @@ export interface HardwareDevice {
 
 export interface IncusHardwareCapability {
   supported: boolean;
-  mode: "usb-exclusive" | "gpu-mdev" | "unsupported";
+  mode: "usb-exclusive" | "gpu-mdev" | "gpu-physical" | "unsupported";
   reason: string;
   evidence?: { driver?: string; iommuGroup?: string; mediatedProfiles?: string[]; sriovTotalVfs?: number; bootVga?: boolean; gvtEnabled?: boolean;
-    mediatedAvailable?: Record<string, number>; mediatedInstances?: Record<string, string[]> };
+    mediatedAvailable?: Record<string, number>; mediatedInstances?: Record<string, string[]>;
+    pciAddress?: string; iommuMembers?: string[] };
 }
 
 export interface HardwareDeviceCandidate {

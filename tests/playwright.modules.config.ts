@@ -33,6 +33,7 @@ export default defineConfig({
     "api/incus-admin-restore.spec.ts",
     "api/worker-memory-policy.spec.ts",
     "api/incus-hardware.spec.ts",
+    "api/hardware-device-probe.spec.ts",
     "api/hardware-device-store.spec.ts",
     "api/terminal-copy.spec.ts",
     "api/management-logs-domain.spec.ts",

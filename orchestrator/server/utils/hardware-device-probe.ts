@@ -1,5 +1,5 @@
 /** Runs in the existing networkless, read-only /dev + /sys discovery helper.
- * No node is opened, driver rebound, module loaded or host mount inspected.
+ * No /dev node is opened, driver rebound, module loaded or host mount inspected.
  * Refusing ALL storage/hubs also protects unmounted backups, swap and controllers. */
 export const HARDWARE_DEVICE_PROBE = String.raw`
 import json, os, re, stat
@@ -15,10 +15,41 @@ def link(path):
     except OSError: return None
 def unsupported(reason, evidence=None):
     return dict(supported=False, mode='unsupported', reason=reason, **({'evidence':evidence} if evidence else {}))
+def gpu_serial(sys):
+    serial = read(sys/'serial')
+    if re.fullmatch(r'[A-Za-z0-9._-]{1,128}', serial): return serial
+    try:
+        with (sys/'vpd').open('rb') as stream: data = stream.read(4097)
+    except OSError: return ''
+    if len(data) > 4096: return ''
+    offset, serials = 0, []
+    while offset < len(data):
+        tag = data[offset]; offset += 1
+        if tag == 0x78: break
+        if tag & 0x80:
+            if offset + 2 > len(data): return ''
+            length = int.from_bytes(data[offset:offset+2], 'little'); offset += 2
+        else: length = tag & 7
+        end = offset + length
+        if end > len(data): return ''
+        if tag == 0x90:
+            while offset < end:
+                if offset + 3 > end: return ''
+                key, size = data[offset:offset+2], data[offset+2]; offset += 3
+                if offset + size > end: return ''
+                if key == b'SN':
+                    value = data[offset:offset+size].decode('ascii', errors='replace').strip()
+                    if not re.fullmatch(r'[A-Za-z0-9._-]{1,128}', value): return ''
+                    serials.append(value)
+                offset += size
+        offset = end
+    return serials[0] if len(serials) == 1 else ''
 result = []
+drm_devices = set()
 for node in sorted((root/'dev/dri').glob('renderD*')):
     sys = link(root/'sys/class/drm'/node.name/'device')
     if not sys: continue
+    drm_devices.add(sys)
     nodes = [root/'dev/dri'/p.name for p in (root/'sys/class/drm').iterdir()
              if re.fullmatch(r'(card|renderD)\d+', p.name) and link(p/'device') == sys and (root/'dev/dri'/p.name).exists()]
     driver, iommu = link(sys/'driver'), link(sys/'iommu_group')
@@ -52,6 +83,34 @@ for node in sorted((root/'dev/dri').glob('renderD*')):
     result.append(dict(kind='gpu', selector='drm:pci:'+sys.name, name='GPU '+vendor+':'+product+' ('+sys.name+')',
                        vendor=vendor, product=product, deviceNodes=[str(p).removeprefix('/host') for p in nodes],
                        groupIds=sorted(set(p.stat().st_gid for p in nodes)), incus=capability))
+for entry in sorted((root/'sys/bus/pci/devices').glob('*')):
+    sys = link(entry)
+    if not sys or sys in drm_devices or not re.fullmatch(r'[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]', entry.name): continue
+    gpu_class = read(sys/'class')
+    if not re.fullmatch(r'0x03[0-9a-f]{4}', gpu_class): continue
+    ids = [read(sys/name).removeprefix('0x') for name in ['vendor', 'device', 'subsystem_vendor', 'subsystem_device']]
+    serial = gpu_serial(sys)
+    driver, iommu = link(sys/'driver'), link(sys/'iommu_group')
+    members = sorted(p.name for p in (iommu/'devices').glob('*')) if iommu else []
+    boot = read(sys/'boot_vga')
+    nonboot = boot == '0' or (not (sys/'boot_vga').exists() and not (sys/'boot_vga').is_symlink() and re.fullmatch(r'0x03(?:02|80)[0-9a-f]{2}', gpu_class))
+    evidence = dict(pciAddress=entry.name, driver=driver.name if driver else '',
+                    iommuGroup=iommu.name if iommu else '', iommuMembers=members, bootVga=not nonboot)
+    reason = ''
+    if not serial or not all(re.fullmatch(r'[0-9a-f]{4}', value) for value in ids):
+        reason = 'Physical GPU requires a stable serial number and complete PCI identity; missing identity cannot authorize passthrough.'
+    elif not nonboot:
+        reason = 'Physical GPU must be explicitly identified as a non-boot device; host boot GPUs are protected.'
+    elif not iommu or not iommu.name.isdigit() or members != [entry.name] or link(iommu/'devices'/entry.name) != sys:
+        reason = 'Physical GPU requires an isolated single-device IOMMU group; group isolation could not be established.'
+    elif (driver and driver.name != 'vfio-pci') or (not driver and (sys/'driver').is_symlink()):
+        reason = 'Physical GPU is owned by a host driver or its ownership is unknown; operator maintenance must release it before assignment.'
+    capability = unsupported(reason, evidence) if reason else dict(supported=True, mode='gpu-physical',
+        reason='Exclusive physical GPU passthrough; current identity, isolation and ownership are checked before start.', evidence=evidence)
+    # shortcut: GPUs without serial evidence stay unsupported; add identity sources only when independently trustworthy.
+    selector = 'pci-gpu:'+':'.join(ids)+':'+serial if serial and all(re.fullmatch(r'[0-9a-f]{4}', value) for value in ids) else 'pci-gpu:unavailable:'+entry.name
+    result.append(dict(kind='gpu', selector=selector, name='GPU '+ids[0]+':'+ids[1]+' ('+entry.name+')',
+                       vendor=ids[0], product=ids[1], serial=serial or None, deviceNodes=[], groupIds=[], incus=capability))
 for sys in sorted((root/'sys/bus/usb/devices').glob('*')):
     vendor, product = read(sys/'idVendor'), read(sys/'idProduct')
     if not vendor or not product: continue

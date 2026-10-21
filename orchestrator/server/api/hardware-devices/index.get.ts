@@ -30,6 +30,7 @@ export default defineEventHandler(async (event) => {
     canManageCatalog: user.role === "admin",
     incusUsbEnabled: useConfig().incusUsbEnabled === true,
     incusGpuMdevProfile: useConfig().incusGpuMdevProfile || undefined,
+    incusGpuPhysicalEnabled: useConfig().incusGpuPhysicalEnabled === true,
     catalog: baseCatalog.map((item) => {
       const occupants = useWorkerStore().list().filter(worker => worker.status !== 'archived' && worker.hardwareDeviceIds?.includes(item.id));
       return { ...item, entitled: entitled.has(item.id), available: liveSelectors.has(hardwareDeviceSelector(item)),

@@ -237,6 +237,8 @@ def resource_setup(config, paths):
     if config.get("usbEnabled") is True: desired["restricted.devices.usb"] = "allow"
     if config.get("gpuMdevProfile"):
         desired.update({"restricted.devices.gpu": "allow", "user.agentor.gpu-mdev-profile": config["gpuMdevProfile"]})
+    if config.get("gpuPhysicalEnabled") is True:
+        desired.update({"restricted.devices.gpu": "allow", "user.agentor.gpu-physical": "true"})
     existing = resource("/1.0/projects", project)
     if existing is None:
         settings = {**desired, "restricted.networks.access": network, "restricted.devices.disk.paths": ",".join(paths)}
@@ -244,11 +246,17 @@ def resource_setup(config, paths):
     existing = resource("/1.0/projects", project); owned(existing, installation, project)
     # Widen only after all existing installation/export policy is verified.
     enable_usb = config.get("usbEnabled") is True and existing["config"].get("restricted.devices.usb", "block") == "block"
-    enable_gpu = bool(config.get("gpuMdevProfile")) and existing["config"].get("restricted.devices.gpu", "block") == "block"
+    gpu_updates = {key: value for key, value in desired.items() if key.startswith("user.agentor.gpu-") and not existing["config"].get(key)}
+    enable_gpu = desired["restricted.devices.gpu"] == "allow" and existing["config"].get("restricted.devices.gpu", "block") == "block"
     if enable_gpu:
-        require(not existing["config"].get("user.agentor.gpu-mdev-profile"), "Existing GPU profile is ambiguous; preserve it")
+        require(not any(existing["config"].get(key) for key in ("user.agentor.gpu-mdev-profile", "user.agentor.gpu-physical")), "Existing GPU policy is ambiguous; preserve it")
+    if gpu_updates:
+        require(enable_gpu or bool(config.get("gpuMdevProfile")) and existing["config"].get("user.agentor.gpu-mdev-profile") == config["gpuMdevProfile"]
+                or config.get("gpuPhysicalEnabled") is True and existing["config"].get("user.agentor.gpu-physical") == "true", "Existing GPU permission is ambiguous; preserve it")
+    for key in ("user.agentor.gpu-mdev-profile", "user.agentor.gpu-physical"):
+        require(key in desired or not existing["config"].get(key), "Existing GPU policy differs; preserve it")
     require(all(existing["config"].get(key, "block" if key == "restricted.virtual-machines.lowlevel" or key.startswith("restricted.devices.") and key not in ("restricted.devices.nic", "restricted.devices.disk") else None) == value
-                for key, value in desired.items() if not (enable_usb and key == "restricted.devices.usb" or enable_gpu and key in ("restricted.devices.gpu", "user.agentor.gpu-mdev-profile"))), "Owned project restrictions differ; preserve and resolve manually")
+                for key, value in desired.items() if not (enable_usb and key == "restricted.devices.usb" or enable_gpu and key == "restricted.devices.gpu" or key in gpu_updates)), "Owned project restrictions differ; preserve and resolve manually")
     require(network in existing["config"].get("restricted.networks.access", "").split(","), "Owned project's primary allowlist differs")
     old = [SOURCES.canonical(path) for path in existing["config"].get("restricted.devices.disk.paths", "").split(",") if path]
     roots = json.loads(existing["config"].get("user.agentor.host-mount-roots", '{"installation":"' + installation + '","sources":[]}'))
@@ -257,7 +265,7 @@ def resource_setup(config, paths):
     updated = sorted(set(old) | set(paths))
     if updated != sorted(old): incus("project", "set", project, "restricted.devices.disk.paths=" + ",".join(updated))
     if enable_usb: incus("project", "set", project, "restricted.devices.usb=allow")
-    if enable_gpu: incus("project", "set", project, "restricted.devices.gpu=allow", "user.agentor.gpu-mdev-profile=" + config["gpuMdevProfile"])
+    if enable_gpu or gpu_updates: incus("project", "set", project, "restricted.devices.gpu=allow", *[key + "=" + value for key, value in gpu_updates.items()])
     return interface
 
 
@@ -531,7 +539,8 @@ def portainer_environment(config, directory, interface, default_image):
 
 def main():
     parser = argparse.ArgumentParser(description="Operator-root Ubuntu24/amd64 Incus setup. Preserves canonical DATA/legacy workers; never migrates or resets unrelated resources.")
-    parser.add_argument("--enable-usb", action="store_true", help="Explicitly allow serial-numbered, non-storage USB VM grants; GPU requires a separate explicit mdev profile; PCI remains blocked")
+    parser.add_argument("--enable-usb", action="store_true", help="Explicitly allow serial-numbered, non-storage USB VM grants; GPU requires separate opt-in; PCI remains blocked")
+    parser.add_argument("--enable-physical-gpu", action="store_true", help="Explicitly allow physical GPU VM grants through Incus GPU devices; never changes host drivers or power policy; raw PCI remains blocked")
     parser.add_argument("--gpu-mdev-profile", default="", help="Explicit Intel GVT-g profile currently exposed with free capacity; never changes kernel/modules or creates mdevs")
     parser.add_argument("--install-lts", action="store_true", help="Explicitly offer fingerprint-pinned signed Zabbly Incus 6.0 LTS packages")
     parser.add_argument("--update-policy", action="store_true", help="Update installed host policy/scripts using --config; no resource provisioning, image conversion or routing changes")
@@ -578,12 +587,12 @@ def main():
     prior = json.loads((directory / "config.json").read_text()) if (directory / "config.json").exists() else {}
     work = SOURCES.canonical(args.image_work_dir or prior.get("imageWorkDir") or str(directory / "image-work"))
     require(not SOURCES.overlaps(work, data), "Image conversion scratch must not modify canonical DATA or its ancestors")
-    config = {"usbEnabled": args.enable_usb, "gpuMdevProfile": args.gpu_mdev_profile, "installation": installation, "dataDir": data, "project": args.project, "network": network, "pool": pool, "container": args.orchestrator_container,
+    config = {"usbEnabled": args.enable_usb, "gpuMdevProfile": args.gpu_mdev_profile, "gpuPhysicalEnabled": args.enable_physical_gpu, "installation": installation, "dataDir": data, "project": args.project, "network": network, "pool": pool, "container": args.orchestrator_container,
               "dockerNetwork": docker_network, "tlsName": args.tls_name, "httpsPort": args.https_port, "policyPort": args.policy_port, "internalPort": args.internal_port,
               "listen": gateway, "sourceTable": "agentor_source_" + short, "imageWorkDir": work}
     if (directory / "config.json").exists():
-        require(all(prior.get(key, value if key == "imageWorkDir" else False if key == "usbEnabled" else "" if key == "gpuMdevProfile" else None) == value
-                    or key in ("usbEnabled", "gpuMdevProfile") and not prior.get(key) and bool(value)
+        require(all(prior.get(key, value if key == "imageWorkDir" else False if key in ("usbEnabled", "gpuPhysicalEnabled") else "" if key == "gpuMdevProfile" else None) == value
+                    or key in ("usbEnabled", "gpuMdevProfile", "gpuPhysicalEnabled") and not prior.get(key) and bool(value)
                     for key, value in config.items()), "Installed operator configuration differs; preserve and reconcile manually")
         if "defaultImage" in prior: config["defaultImage"] = prior["defaultImage"]
     install_packages(args.install_lts, directory)
@@ -602,6 +611,7 @@ def main():
     for key, value in portainer_environment(config, directory, interface, default_image).items(): print(key + "=" + value)
     print("INCUS_USB_ENABLED=" + str(config.get("usbEnabled") is True).lower())
     print("INCUS_GPU_MDEV_PROFILE=" + config.get("gpuMdevProfile", ""))
+    print("INCUS_GPU_PHYSICAL_ENABLED=" + str(config.get("gpuPhysicalEnabled") is True).lower())
     print("Set AGENTOR_INCUS_ORCHESTRATOR_IMAGE separately to the operator-approved updated control-plane image.")
     print("Read-only TLS file mounts (do NOT mount the whole credential directory or any Incus Unix socket):")
     for file, variable in (("client.crt", "INCUS_CLIENT_CERT_PATH"), ("client.key", "INCUS_CLIENT_KEY_PATH"), ("server.crt", "INCUS_SERVER_CERT_PATH"), ("policy.crt", "INCUS_NETWORK_HOST_SERVER_CERT_PATH")):
